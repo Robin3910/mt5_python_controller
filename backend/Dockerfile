@@ -5,7 +5,8 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-RUN sed -i 's|https://mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources \
+RUN sed -i 's|http://deb.debian.org|https://mirrors.aliyun.com|g' \
+    /etc/apt/sources.list.d/debian.sources \
  && apt-get update \
  && apt-get install -y --no-install-recommends \
       gcc \
