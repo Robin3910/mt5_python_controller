@@ -102,11 +102,12 @@ class NodeClient:
     async def _authenticate(self, ws) -> bool:
         """首包发送 auth（token + MT5 登录号），等待 auth_ok；成功后再上报 hello。"""
         acct = await self._exec(self.mt5.account_info)
-        login = acct.get("login") or settings.mt5_login or None
+        login = acct.get("login")  or None
         await ws.send(json.dumps({
             "type": "auth",
             "data": {"token": settings.node_token, "mt5_login": login},
         }))
+        logger.info("user_info: %s", acct)
         try:
             msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=settings.auth_timeout))
         except Exception as e:  # noqa: BLE001
