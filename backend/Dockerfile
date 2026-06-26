@@ -5,9 +5,13 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends gcc build-essential curl \
-    && rm -rf /var/lib/apt/lists/*
+RUN sed -i 's|https://mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      gcc \
+      build-essential \
+      curl \
+ && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
