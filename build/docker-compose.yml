@@ -3,7 +3,8 @@
 # ---------------------------------------------------------------------
 # 拓扑：mysql + redis + backend + nginx 全部跑在 Docker 里；
 # MT5 节点端在各自主机上原生运行。
-# 本文件 nginx 固定发布 80/443；Windows 开发机请用 docker-compose.windows.yml。
+# 本文件 nginx 端口可通过 .env 的 HTTP_PORT/HTTPS_PORT 覆盖（默认 80/443）。
+# Windows 开发机若 80/443 被占用，请用 docker-compose.windows.yml（默认 8080/8443）。
 #
 # 前置条件：
 #   1. 安装 Docker Desktop（建议使用 WSL2 后端）。
@@ -20,7 +21,7 @@
 # 项目名称（影响容器/网络/卷前缀，默认 mt5hub-server）：
 #   本文件顶部 name 字段；或在 .env 设 COMPOSE_PROJECT_NAME=你的名称
 #
-# 默认访问入口：
+# 默认访问入口（端口可在 .env 用 HTTP_PORT/HTTPS_PORT 调整，默认 80/443）：
 #   管理后台 / API / Webhook ：http://localhost/
 #   节点接入                 ：ws://<本机IP>/ws/node
 # =====================================================================
@@ -80,8 +81,8 @@ services:
       context: ..
       dockerfile: deploy/nginx/Dockerfile
     ports:
-      - "80:80"
-      - "443:443"
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
     volumes:
       - ../deploy/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
       - ../deploy/nginx/certs:/etc/nginx/certs:ro
