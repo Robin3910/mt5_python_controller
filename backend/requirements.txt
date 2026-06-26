@@ -1,7 +1,7 @@
 fastapi>=0.115
 uvicorn[standard]>=0.30
 redis>=5.0
-SQLAlchemy==2.0.41
+SQLAlchemy==2.0.51
 greenlet>=3.1.1
 aiosqlite>=0.20
 asyncmy>=0.2.9
