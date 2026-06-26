@@ -1,0 +1,16 @@
+# Frontend: npm ci runs in the image; skip host copies
+frontend/node_modules
+frontend/dist
+
+# Backend has its own context (.dockerignore in backend/)
+backend/
+
+# Not needed for nginx build
+node_client/
+.git
+.gitignore
+**/__pycache__
+**/*.pyc
+.env
+.env.*
+*.md
