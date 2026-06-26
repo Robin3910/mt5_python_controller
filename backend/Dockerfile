@@ -15,6 +15,10 @@ RUN sed -i 's|http://deb.debian.org|https://mirrors.aliyun.com|g' \
  && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
+
+ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ENV PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
