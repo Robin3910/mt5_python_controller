@@ -1,0 +1,240 @@
+"""MT5 节点客户端：WebSocket 连接 / 鉴权 / 心跳 / 账户上报 / 执行命令。
+
+运行：python node_client.py
+配置见 .env（参考 .env.example）。设置 MT5_MOCK=true 可在无终端时用模拟器联调。
+
+设计要点：
+- MetaTrader5 的调用是阻塞式的，统一丢到线程池(run_in_executor)，不阻塞事件循环；
+- 断线自动重连（指数退避）；
+- 三个并发任务：账户上报 / 心跳 / 接收命令，任一结束即重建连接。
+"""
+import asyncio
+import json
+import logging
+
+import websockets
+
+from config import get_settings
+
+settings = get_settings()
+logging.basicConfig(
+    level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
+logger = logging.getLogger("node")
+
+
+def make_client():
+    """按配置选择真实 MT5 客户端或模拟客户端。"""
+    if settings.mt5_mock:
+        from mock_mt5 import MockMT5Client
+
+        return MockMT5Client(
+            settings.mt5_login, settings.mt5_password, settings.mt5_server,
+            settings.mt5_path, settings.default_slippage, settings.default_magic,
+        )
+    from mt5_client import MT5Client
+
+    return MT5Client(
+        settings.mt5_login, settings.mt5_password, settings.mt5_server,
+        settings.mt5_path, settings.default_slippage, settings.default_magic,
+    )
+
+
+class NodeClient:
+    def __init__(self) -> None:
+        self.mt5 = make_client()
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self._stop = False
+
+    async def run(self) -> None:
+        """主入口：先连 MT5，再进入“连接-鉴权-服务”的自动重连循环。"""
+        self.loop = asyncio.get_running_loop()
+        await self._connect_mt5()
+        backoff = settings.reconnect_min
+        while not self._stop:
+            try:
+                async with websockets.connect(
+                    settings.manager_ws_url, ping_interval=20, ping_timeout=20, max_queue=128
+                ) as ws:
+                    if not await self._authenticate(ws):
+                        # 鉴权/登录被拒绝：退避后重试（如重复登录，待对端下线后可接入）
+                        await asyncio.sleep(backoff)
+                        backoff = min(backoff * 2, settings.reconnect_max)
+                        continue
+                    backoff = settings.reconnect_min  # 鉴权成功，重置退避
+                    await self._serve(ws)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("ws connection error: %s", e)
+            if self._stop:
+                break
+            # 断线后指数退避重连
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, settings.reconnect_max)
+
+    # ---------------------- MT5 辅助 ----------------------
+    async def _exec(self, fn, *args):
+        """把阻塞式 MT5 调用放到线程池执行，避免阻塞事件循环。"""
+        return await self.loop.run_in_executor(None, lambda: fn(*args))
+
+    async def _connect_mt5(self) -> None:
+        try:
+            ok = await self._exec(self.mt5.connect)
+            if not ok:
+                logger.error("MT5 connect failed (will keep reporting empty until available)")
+        except Exception as e:  # noqa: BLE001
+            logger.error("MT5 connect error: %s", e)
+
+    async def _snapshot(self) -> dict:
+        """采集一次账户快照（账户信息 + 持仓 + 观察列表报价）。"""
+        try:
+            quotes = await self._exec(self.mt5.quotes, settings.watchlist)
+            return {
+                "account": await self._exec(self.mt5.account_info),
+                "positions": await self._exec(self.mt5.positions),
+                "quotes": quotes,
+                "prices": {sym: q["mid"] for sym, q in quotes.items()},
+            }
+        except Exception as e:  # noqa: BLE001
+            logger.debug("snapshot error: %s", e)
+            return {"account": {}, "positions": [], "prices": {}, "quotes": {}}
+
+    # ----------------------- 协议 ------------------------
+    async def _authenticate(self, ws) -> bool:
+        """首包发送 auth（token + MT5 登录号），等待 auth_ok；成功后再上报 hello。"""
+        acct = await self._exec(self.mt5.account_info)
+        login = acct.get("login") or settings.mt5_login or None
+        await ws.send(json.dumps({
+            "type": "auth",
+            "data": {"token": settings.node_token, "mt5_login": login},
+        }))
+        try:
+            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=settings.auth_timeout))
+        except Exception as e:  # noqa: BLE001
+            logger.error("auth handshake failed: %s", e)
+            return False
+        if msg.get("type") == "auth_ok":
+            logger.info("authenticated as node %s", (msg.get("data") or {}).get("node_id"))
+            acct = await self._exec(self.mt5.account_info)
+            await ws.send(json.dumps(
+                {"type": "hello", "data": {"login": acct.get("login"), "server": acct.get("server")}}
+            ))
+            return True
+        # 鉴权失败：解析并显示后端给出的拒绝原因
+        data = msg.get("data") or {}
+        reason = data.get("reason") or msg.get("type") or "unknown"
+        reason_text = {
+            "invalid_token": "令牌无效或节点未注册",
+            "already_online": "该节点已有在线连接，本次登录被拒绝（同一节点同一时刻只允许一个在线）",
+            "disabled": "节点已被禁用，无法接入",
+            "not_found": "节点不存在或已被删除",
+            "mt5_login_not_configured": "节点未配置 MT5 账户登录号，请在管理后台编辑节点",
+            "missing_mt5_login": "鉴权包缺少 MT5 账户登录号",
+            "mt5_login_mismatch": data.get("message") or "MT5 账户登录号与后台配置不一致",
+        }.get(reason, data.get("message") or reason)
+        logger.error("登录被拒绝：%s", reason_text)
+        return False
+
+    async def _serve(self, ws) -> None:
+        """并发跑三个任务；任一退出(通常是断线)即取消其余，触发外层重连。"""
+        tasks = [
+            asyncio.create_task(self._reporter(ws)),
+            asyncio.create_task(self._heartbeat(ws)),
+            asyncio.create_task(self._receiver(ws)),
+        ]
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in tasks:
+                t.cancel()
+
+    async def _reporter(self, ws) -> None:
+        """定时上报账户快照。"""
+        while True:
+            await ws.send(json.dumps({"type": "account", "data": await self._snapshot()}))
+            await asyncio.sleep(settings.account_report_interval)
+
+    async def _heartbeat(self, ws) -> None:
+        """定时心跳，维持服务端在线标记。"""
+        while True:
+            await ws.send(json.dumps({"type": "heartbeat", "data": {}}))
+            await asyncio.sleep(settings.heartbeat_interval)
+
+    async def _receiver(self, ws) -> None:
+        """接收服务端下发的命令。"""
+        async for raw in ws:
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            await self._handle(ws, msg)
+
+    async def _handle(self, ws, msg: dict) -> None:
+        """按命令类型分派：open / close / pong。"""
+        cmd = msg.get("cmd")
+        if cmd == "open":
+            await self._do_open(ws, msg)
+        elif cmd == "close":
+            await self._do_close(ws, msg)
+        elif msg.get("type") == "pong":
+            pass  # 心跳应答，忽略
+        else:
+            logger.debug("ignored message: %s", msg)
+
+    async def _do_open(self, ws, msg: dict) -> None:
+        """执行开仓并回报结果（带 signal_id/symbol 供服务端关联与释放锁）。"""
+        res = await self._exec(
+            self.mt5.place_market_order,
+            msg["symbol"], msg["action"], msg["volume"],
+            msg.get("stop_loss"), msg.get("take_profit"),
+            msg.get("comment", ""), msg.get("magic"),
+        )
+        res["signal_id"] = msg.get("signal_id")
+        res.setdefault("symbol", msg.get("symbol"))
+        await ws.send(json.dumps({"type": "trade_result", "data": res}))
+        logger.info("open result: %s", res)
+
+    async def _do_close(self, ws, msg: dict) -> None:
+        """执行平仓（按订单/按品种/全平）并回报结果。"""
+        target = msg.get("close_target", "all")
+        if target == "ticket" and msg.get("close_ticket"):
+            res = await self._exec(self.mt5.close_ticket, msg["close_ticket"])
+        elif target == "symbol" and msg.get("close_symbol"):
+            res = await self._exec(self.mt5.close_symbol, msg["close_symbol"])
+        else:
+            res = await self._exec(self.mt5.close_all)
+        res["signal_id"] = msg.get("signal_id")
+        res.setdefault("action", "CLOSE")
+        res.setdefault("symbol", msg.get("close_symbol"))
+        res["detail"] = self._close_detail(msg, res)
+        await ws.send(json.dumps({"type": "trade_result", "data": res}))
+        logger.info("close result: %s", res)
+
+    @staticmethod
+    def _close_detail(msg: dict, res: dict) -> str:
+        target = msg.get("close_target", "all")
+        ticket = res.get("ticket") or msg.get("close_ticket")
+        symbol = res.get("symbol") or msg.get("close_symbol")
+        closed = int(res.get("closed") or (1 if res.get("success") and target == "ticket" else 0))
+        if target == "ticket" and ticket:
+            parts = [f"订单 #{ticket}"]
+            if symbol:
+                parts.append(symbol)
+            if res.get("volume"):
+                parts.append(f"{res['volume']} 手")
+            return " · ".join(parts)
+        if target == "symbol" and symbol:
+            return f"品种 {symbol}" + (f" · {closed} 笔" if closed > 1 else "")
+        if target == "all":
+            return f"全平 {closed} 笔"
+        return ""
+
+
+async def main() -> None:
+    await NodeClient().run()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("node stopped")

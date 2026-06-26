@@ -1,0 +1,235 @@
+"""节点 WebSocket 网关：首包鉴权、心跳、账户上报、成交回报。
+
+鉴权采用“连接建立后首包必须是 auth”的方式（而非把 token 放到 URL 上），
+避免 token 出现在日志/代理访问记录中。详见文档 6.3。
+"""
+import asyncio
+import logging
+import time
+
+from fastapi import APIRouter, WebSocket
+from starlette.websockets import WebSocketDisconnect
+
+from . import persist, results
+from .connections import manager
+from .security import hash_token
+from .settings import settings
+from .state import state
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+
+def _parse_mt5_login(data: dict) -> int | None:
+    """从 auth 数据解析 MT5 登录号（正整数）。"""
+    raw = data.get("mt5_login")
+    if raw is None:
+        return None
+    try:
+        login = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return login if login > 0 else None
+
+
+@router.websocket("/ws/node")
+async def node_ws(ws: WebSocket):
+    await ws.accept()
+    store = state.store
+
+    # ---- 首包必须是 auth，并设超时，避免未鉴权的空连接占用资源（6.3）----
+    try:
+        msg = await asyncio.wait_for(
+            ws.receive_json(), timeout=settings.auth_first_packet_timeout
+        )
+    except Exception:
+        await ws.close(code=4400)  # 握手超时 / 格式错误
+        return
+
+    if not isinstance(msg, dict) or msg.get("type") != "auth":
+        await ws.close(code=4401)
+        return
+
+    # token 仅存哈希；用哈希反查 node_id
+    token = (msg.get("data") or {}).get("token", "")
+    node_id = await store.node_by_token(hash_token(token)) if store else None
+    if not node_id:
+        await ws.send_json({"type": "auth_fail", "data": {"reason": "invalid_token"}})
+        await ws.close(code=4401)  # 未注册 / token 非法
+        return
+
+    node = await store.get_node(node_id)
+    if not node:
+        await ws.send_json({"type": "auth_fail", "data": {"reason": "not_found", "message": "节点不存在或已被删除"}})
+        await ws.close(code=4403)
+        return
+    if not node.get("enabled", True):
+        await ws.send_json({"type": "auth_fail", "data": {"reason": "disabled", "message": "节点已被禁用，无法接入"}})
+        await ws.close(code=4403)  # 节点被禁用
+        return
+
+    expected_login = node.get("mt5_login")
+    if not expected_login:
+        await ws.send_json({
+            "type": "auth_fail",
+            "data": {
+                "reason": "mt5_login_not_configured",
+                "message": "节点未配置 MT5 账户登录号，请在管理后台编辑节点",
+            },
+        })
+        await ws.close(code=4401)
+        return
+
+    client_login = _parse_mt5_login(msg.get("data") or {})
+    if client_login is None:
+        await ws.send_json({
+            "type": "auth_fail",
+            "data": {
+                "reason": "missing_mt5_login",
+                "message": "鉴权包缺少 MT5 账户登录号",
+            },
+        })
+        await ws.close(code=4401)
+        return
+
+    if client_login != int(expected_login):
+        logger.warning(
+            "node %s mt5_login mismatch: expected=%s got=%s",
+            node_id, expected_login, client_login,
+        )
+        await ws.send_json({
+            "type": "auth_fail",
+            "data": {
+                "reason": "mt5_login_mismatch",
+                "message": f"MT5 账户登录号不匹配（期望 {expected_login}，实际 {client_login}）",
+                "expected_mt5_login": int(expected_login),
+                "actual_mt5_login": client_login,
+            },
+        })
+        await manager.broadcast_admin(
+            {"type": "node_rejected", "data": {"node_id": node_id, "reason": "mt5_login_mismatch"}}
+        )
+        await ws.close(code=4401)
+        return
+
+    # 同一节点同一时刻只允许一个在线：已有存活连接时拒绝本次登录并说明原因
+    if manager.is_node_online(node_id) and await manager.is_connection_alive(node_id):
+        logger.warning("node %s duplicate login rejected (already online) from %s", node_id, ws.client)
+        await ws.send_json({
+            "type": "auth_fail",
+            "data": {
+                "reason": "already_online",
+                "message": "该节点已有在线连接，同一节点同一时刻只允许一个在线",
+            },
+        })
+        await manager.broadcast_admin(
+            {"type": "node_rejected", "data": {"node_id": node_id, "reason": "already_online"}}
+        )
+        await ws.close(code=4409)  # 4409：重复连接被拒绝
+        return
+
+    # 先登记连接再回 auth_ok，确保节点收到确认时即可被路由（消除竞态）
+    await manager.register_node(node_id, ws)
+    await store.touch_online(node_id)
+    await ws.send_json(
+        {"type": "auth_ok", "data": {"node_id": node_id, "heartbeat": settings.heartbeat_interval}}
+    )
+    await manager.broadcast_admin({"type": "node_status", "data": {"node_id": node_id, "status": "online"}})
+
+    try:
+        await _session(node_id, ws)
+    except WebSocketDisconnect:
+        pass
+    except Exception:  # noqa: BLE001
+        logger.exception("node session error: %s", node_id)
+    finally:
+        # 无论何种原因断开，都要清理连接与在线标记，并通知后台
+        manager.unregister_node(node_id, ws)
+        await store.set_offline(node_id)
+        await manager.broadcast_admin(
+            {"type": "node_status", "data": {"node_id": node_id, "status": "offline"}}
+        )
+
+
+async def _session(node_id: str, ws: WebSocket) -> None:
+    """已鉴权连接的消息主循环：按 type 分派处理。"""
+    store = state.store
+    while True:
+        msg = await ws.receive_json()
+        if not isinstance(msg, dict):
+            continue
+        mtype = msg.get("type")
+        data = msg.get("data") or {}
+
+        if mtype in ("heartbeat", "ping"):
+            # 心跳：续期在线 TTL；若心跳里捎带了账户快照也一并保存
+            await store.touch_online(node_id)
+            if data.get("account") or data.get("positions"):
+                await _save_account(node_id, data)
+            await ws.send_json({"type": "pong", "data": {"ts": time.time()}})
+
+        elif mtype == "account":
+            # 账户快照上报
+            await store.touch_online(node_id)
+            await _save_account(node_id, data)
+
+        elif mtype == "trade_result":
+            # 成交回报
+            await _on_trade_result(node_id, data)
+
+        elif mtype == "hello":
+            # 节点上线自报 MT5 登录信息
+            await _update_node_mt5(node_id, data)
+
+        else:
+            logger.debug("node %s unknown msg type=%s", node_id, mtype)
+
+
+async def _save_account(node_id: str, data: dict) -> None:
+    """把节点上报的账户/持仓/报价整理成标准快照，存 Redis 并推送后台。"""
+    store = state.store
+    acct = dict(data.get("account") or {})
+    snapshot = {
+        "node_id": node_id,
+        "login": acct.get("login") or data.get("login"),
+        "server": acct.get("server") or data.get("server"),
+        "balance": acct.get("balance", 0),
+        "equity": acct.get("equity", 0),
+        "margin": acct.get("margin", 0),
+        "free_margin": acct.get("free_margin", acct.get("margin_free", 0)),
+        "leverage": acct.get("leverage", 0),
+        "positions": data.get("positions", []),
+        "prices": data.get("prices", {}),  # 供区间过滤取价
+        "quotes": data.get("quotes", {}),
+        "updated_at": time.time(),
+    }
+    await store.save_account(node_id, snapshot)
+    await manager.broadcast_admin({"type": "account", "data": snapshot})
+
+
+async def _on_trade_result(node_id: str, data: dict) -> None:
+    """处理成交回报：唤醒轮询等待者、释放执行锁、落库、推送后台。"""
+    store = state.store
+    signal_id = data.get("signal_id", "")
+    symbol = data.get("symbol", "")
+    # 轮询模式正等待该回报，唤醒对应 future
+    results.resolve(signal_id, node_id, data)
+    if symbol:
+        await store.release_exec_lock(node_id, symbol)
+    status = "done" if data.get("success") else "failed"
+    await persist.update_dispatch_result(signal_id, node_id, status, data)
+    await manager.broadcast_admin(
+        {"type": "trade_result", "data": {"node_id": node_id, **data}}
+    )
+
+
+async def _update_node_mt5(node_id: str, data: dict) -> None:
+    """更新节点缓存里的 MT5 服务器（来自 hello 消息；登录号以管理后台配置为准）。"""
+    store = state.store
+    node = await store.get_node(node_id)
+    if not node:
+        return
+    server = data.get("server")
+    if server:
+        node["mt5_server"] = server
+        await store.cache_node(node)

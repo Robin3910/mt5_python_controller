@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.db
+scripts/
+test-screenshots/
+
+# Env / secrets
+.env
+backend/.env
+node_client/.env
+node_client/dist/
+node_client/build/
+node_client/__pycache__/
+
+docs/
+
+
+# TLS certs (keep the dir via .gitkeep, never commit key material)
+deploy/nginx/certs/*.pem
+deploy/nginx/certs/*.key
+deploy/nginx/certs/*.crt
+
+# Node / frontend
+node_modules/
+frontend/dist/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.cursor/
+data/
+test/
+.idea/

@@ -1,0 +1,7 @@
+websockets>=12.0
+pydantic>=2.7
+pydantic-settings>=2.3
+python-dotenv>=1.0
+numpy>=1.7
+# Windows only — install on the MT5 host:
+MetaTrader5>=5.0.45 ; platform_system == "Windows"

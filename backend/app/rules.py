@@ -1,0 +1,155 @@
+"""纯分发规则——不含任何 I/O，可单独做单元测试。
+
+对应技术方案文档第 9 章的决策逻辑：
+- 手数计算（全局 / 固定 / 信号）          -> 9.4
+- 持仓过滤（按品种 / 按账户）             -> 9.3（与参考仓库一致）
+- 多区间方向过滤                          -> 9.2
+"""
+from __future__ import annotations
+
+import re
+from typing import Optional
+
+from .config import Config
+
+
+def base_symbol(s: str) -> str:
+    """去掉券商后缀/标点，便于品种比较（如 XAUUSD.m -> XAUUSD）。"""
+    return re.sub(r"[^A-Z0-9]", "", (s or "").upper())
+
+
+def symbol_match(a: str, b: str) -> bool:
+    """判断两个品种是否“同一品种”，兼容券商后缀差异。"""
+    ba, bb = base_symbol(a), base_symbol(b)
+    if not ba or not bb:
+        return False
+    # 完全相等，或一方是另一方的前缀（覆盖 XAUUSD 与 XAUUSD.m 这类情况）
+    return ba == bb or ba.startswith(bb) or bb.startswith(ba)
+
+
+def resolve_volume(node: dict, signal_volume: float, global_lot: dict) -> float:
+    """9.4——按节点的手数策略决定实际手数，并以 MAX_LOT_SIZE 封顶。
+
+    - fixed ：使用节点配置的固定手数
+    - global：全局手数开启时用全局值，否则回退信号手数
+    - signal：直接用信号里的手数
+    """
+    mode = node.get("lot_mode", "global")
+    if mode == "fixed" and node.get("lot"):
+        vol = float(node["lot"])
+    elif mode == "global" and global_lot.get("enabled"):
+        vol = float(global_lot.get("value", Config.DEFAULT_LOT))
+    else:
+        vol = float(signal_volume)
+    return min(max(vol, 0.0), Config.MAX_LOT_SIZE)
+
+
+def position_gate(
+    action: str,
+    allow_position: bool,
+    positions: list[dict],
+    symbol: str,
+    scope: str = "symbol",
+) -> tuple[bool, Optional[str]]:
+    """9.3——持仓过滤，返回 (是否放行, 拦截原因)。
+
+    规则：
+    - CLOSE 永远放行（平仓不受持仓限制）；
+    - allow_position=True 时强制放行（覆盖过滤）；
+    - scope=symbol：仅当“同品种”无持仓才放行；
+    - scope=account：账户存在任意持仓即拦截。
+
+    被拦截时返回的 reason 是一句中文说明，明确写出是哪条持仓规则
+    （按品种 / 按账户）以及当前持仓数，直接展示在后台「跳过原因」。
+    """
+    if action not in ("BUY", "SELL"):
+        return True, None
+    if allow_position:
+        return True, None
+    held = positions or []
+    if scope == "symbol":
+        held = [p for p in held if symbol_match(p.get("symbol", ""), symbol)]
+    if len(held) == 0:
+        return True, None
+    if scope == "symbol":
+        return False, f"持仓过滤：已持有同品种{symbol}仓位({len(held)}笔)，按品种过滤跳过"
+    return False, f"持仓过滤：账户已有持仓({len(held)}笔)，按账户过滤跳过"
+
+
+def effective_filters(node: dict, global_filters: dict) -> dict:
+    """9.2——节点级过滤覆盖全局；节点未配置的品种回退全局规则。"""
+    merged = dict(global_filters or {})
+    node_filters = node.get("filters") or {}
+    if isinstance(node_filters, dict):
+        merged.update(node_filters)  # 节点级同名品种覆盖全局
+    return merged
+
+
+def pick_price(account: Optional[dict], symbol: str) -> Optional[float]:
+    """从节点最近一次账户快照里，取该品种“尽量准确”的参考价。
+
+    优先级：实时报价表 prices > 该品种已有持仓的 price_current；都没有则返回 None。
+    """
+    if not account:
+        return None
+    prices = account.get("prices") or {}
+    for k, v in prices.items():
+        if symbol_match(k, symbol):
+            return float(v)
+    # 兜底：用该品种持仓的当前价
+    for p in account.get("positions") or []:
+        if symbol_match(p.get("symbol", ""), symbol) and p.get("price_current"):
+            return float(p["price_current"])
+    return None
+
+
+def _fmt_num(x: object) -> str:
+    """把价格/区间端点格式化为紧凑字符串（去掉多余的 0，且不使用科学计数法）。"""
+    try:
+        f = float(x)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return str(x)
+    s = f"{f:.6f}".rstrip("0").rstrip(".")
+    return s or "0"
+
+
+def interval_filter(
+    action: str,
+    symbol: str,
+    price: Optional[float],
+    filters_cfg: dict,
+) -> tuple[bool, Optional[str]]:
+    """9.2——多区间方向过滤，返回 (是否放行, 拦截原因)。CLOSE 不过滤。
+
+    逻辑：
+    - 该品种未配置或被禁用 -> 放行；
+    - 无可用价格 -> 放行（避免在拿不到价时误拦截）；
+    - 命中某区间：方向在该区间 allow 列表内则放行，否则拦截；
+    - 不在任何区间：按 default_action（block 拦截 / pass 放行）。
+
+    被拦截时返回的 reason 是一句可直接展示给运营的中文说明，明确写出
+    “不符合哪条规则”（命中的区间、该区间允许的方向、或默认动作），
+    会落库到分发明细的 skip_reason 并显示在后台「跳过原因」。
+    """
+    if action not in ("BUY", "SELL"):
+        return True, None
+    sf = filters_cfg.get(symbol) or filters_cfg.get(base_symbol(symbol))
+    if not sf or not sf.get("enabled"):
+        return True, None
+    if price is None:
+        return True, None
+    for iv in sf.get("intervals", []):
+        if float(iv["low"]) <= price <= float(iv["high"]):
+            allow = [a.upper() for a in iv.get("allow", [])]
+            if action in allow:
+                return True, None
+            allowed_txt = "/".join(allow) if allow else "无"
+            return False, (
+                f"区间方向过滤：价格{_fmt_num(price)}命中区间"
+                f"[{_fmt_num(iv['low'])},{_fmt_num(iv['high'])}]，"
+                f"该区间仅允许{allowed_txt}，{action}被拦截"
+            )
+    # 落在所有配置区间之外
+    if sf.get("default_action", "block") == "pass":
+        return True, None
+    return False, f"区间默认过滤：价格{_fmt_num(price)}不在任何配置区间内，默认动作拦截(block)"
