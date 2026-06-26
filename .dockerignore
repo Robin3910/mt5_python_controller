@@ -11,6 +11,4 @@ node_client/
 .gitignore
 **/__pycache__
 **/*.pyc
-.env
-.env.*
 *.md
