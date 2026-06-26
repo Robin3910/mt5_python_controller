@@ -12,7 +12,7 @@
 #   2. 复制并按需修改环境变量：copy .env.example .env
 #      （前端会在 docker compose build 时自动 npm ci && npm run build）
 #
-# 启动 / 运维（PowerShell 或 CMD）：
+# 启动 / 运维（在 build/ 目录下，或从仓库根目录加 -f build/docker-compose.windows.yml）：
 #   docker compose -f docker-compose.windows.yml up -d --build
 #   docker compose -f docker-compose.windows.yml ps
 #   docker compose -f docker-compose.windows.yml logs -f backend
@@ -73,7 +73,7 @@ services:
     restart: unless-stopped
 
   backend:
-    build: ./backend
+    build: ../backend
     env_file: .env
     environment:
       MYSQL_DSN: mysql+asyncmy://${MYSQL_USER:-mt5}:${MYSQL_PASSWORD:-mt5pwd}@mysql:3306/${MYSQL_DATABASE:-mt5hub}
@@ -89,15 +89,15 @@ services:
 
   nginx:
     build:
-      context: .
+      context: ..
       dockerfile: deploy/nginx/Dockerfile
     # Windows 上 80/443 常被占用/保留，默认发布到 8080/8443（可在 .env 覆盖）。
     ports:
       - "${HTTP_PORT:-8080}:80"
       - "${HTTPS_PORT:-8443}:443"
     volumes:
-      - ./deploy/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./deploy/nginx/certs:/etc/nginx/certs:ro
+      - ../deploy/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ../deploy/nginx/certs:/etc/nginx/certs:ro
     depends_on:
       - backend
     restart: unless-stopped
