@@ -1,3 +1,43 @@
+# =====================================================================
+# MT5 多节点跟单系统 · Windows 部署版（Docker Desktop for Windows）
+# ---------------------------------------------------------------------
+# 拓扑与 Linux 版完全一致：mysql + redis + backend + nginx 全部跑在
+# Docker（Linux 容器）里；MT5 节点端在各自的 Windows 主机上原生运行。
+# 容器内部都是 Linux 镜像，宿主是 Windows 不影响其行为；与 Windows 真正
+# 相关的只有「对外端口」和「绑定挂载」两类，因此本文件相对 Linux 版仅把
+# nginx 的发布端口参数化（默认 8080/8443，绕开 Windows 常见的 80/443 占用）。
+#
+# 前置条件：
+#   1. 安装 Docker Desktop（建议使用 WSL2 后端）。
+#   2. 复制并按需修改环境变量：copy .env.example .env
+#      （前端会在 docker compose build 时自动 npm ci && npm run build）
+#
+# 启动 / 运维（PowerShell 或 CMD）：
+#   docker compose -f docker-compose.windows.yml up -d --build
+#   docker compose -f docker-compose.windows.yml ps
+#   docker compose -f docker-compose.windows.yml logs -f backend
+#   docker compose -f docker-compose.windows.yml exec backend alembic upgrade head
+#   docker compose -f docker-compose.windows.yml down
+#
+# 项目名称（影响容器/网络/卷前缀，默认 mt5hub-server）：
+#   本文件顶部 name 字段；或在 .env 设 COMPOSE_PROJECT_NAME=你的名称
+#
+# 默认访问入口（端口可在 .env 用 HTTP_PORT/HTTPS_PORT 调整）：
+#   管理后台 / API / Webhook ：http://localhost:8080/
+#   节点接入                 ：ws://<本机IP>:8080/ws/node
+#
+# Windows 小贴士：
+#   - 端口占用：80/443 常被 IIS、HTTP.sys、"World Wide Web Publishing
+#     Service" 等保留。本文件默认改用 8080/8443；若要用 80/443，在 .env
+#     里设 HTTP_PORT=80 / HTTPS_PORT=443，并先确保端口空闲
+#     （netstat -ano | findstr :80）。
+#   - 磁盘共享：WSL2 后端无需手动共享盘符；若用 Hyper-V 后端，需在
+#     Docker Desktop → Settings → Resources → File Sharing 勾选项目所在盘符。
+#   - 换行符：deploy/nginx/default.conf 建议保持 LF。nginx 通常能容忍
+#     CRLF，但若启动报配置解析错误，请把该文件转为 LF 后重启 nginx。
+# =====================================================================
+name: ${COMPOSE_PROJECT_NAME:-mt5hub-server}
+
 services:
   mysql:
     image: mysql:8.0
@@ -9,6 +49,8 @@ services:
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-mt5pwd}
     volumes:
       - mysql_data:/var/lib/mysql
+    expose:
+      - 3306
     ports:
       - 3306:3306
     healthcheck:
@@ -17,11 +59,9 @@ services:
       timeout: 5s
       retries: 10
     restart: unless-stopped
-    expose:
-      - 3306
 
   redis:
-    image: redis:7-alpine
+    image: redis:8.2.7
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis_data:/data
@@ -51,9 +91,10 @@ services:
     build:
       context: .
       dockerfile: deploy/nginx/Dockerfile
+    # Windows 上 80/443 常被占用/保留，默认发布到 8080/8443（可在 .env 覆盖）。
     ports:
-      - "80:80"
-      - "443:443"
+      - "${HTTP_PORT:-8080}:80"
+      - "${HTTPS_PORT:-8443}:443"
     volumes:
       - ./deploy/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
       - ./deploy/nginx/certs:/etc/nginx/certs:ro
