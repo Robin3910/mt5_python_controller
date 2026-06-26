@@ -1,0 +1,4 @@
+# Keep env templates and shell scripts LF-only (CRLF breaks Linux/docker compose).
+*.env.example text eol=lf
+build/build-docker text eol=lf
+*.sh text eol=lf
