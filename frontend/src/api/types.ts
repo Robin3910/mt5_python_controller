@@ -63,6 +63,27 @@ export interface DispatchConfig {
   position_scope: 'symbol' | 'account'
 }
 
+/** 区间方向过滤：单条价格区间允许的开仓方向 */
+export type FilterDirection = 'BUY' | 'SELL'
+
+/** 价格不在任何区间时的默认处理 */
+export type DefaultFilterAction = 'block' | 'pass'
+
+export interface FilterInterval {
+  low: number
+  high: number
+  allow: FilterDirection[]
+}
+
+/** 单个品种的区间过滤规则（键为品种代码，如 XAUUSD） */
+export interface SymbolFilterRule {
+  enabled: boolean
+  default_action: DefaultFilterAction
+  intervals: FilterInterval[]
+}
+
+export type FilterRulesConfig = Record<string, SymbolFilterRule>
+
 // 全局节点接入令牌（所有节点共享，存于「账户设置」）
 export interface NodeTokenInfo {
   token: string

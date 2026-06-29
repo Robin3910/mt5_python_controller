@@ -5,6 +5,7 @@ import type {
   CloseRequest,
   CloseBatchResult,
   DispatchConfig,
+  FilterRulesConfig,
   HubEvent,
   LotConfig,
   NodeCreatePayload,
@@ -22,7 +23,7 @@ interface HubState {
   statuses: Record<string, string>          // node_id -> 在线状态（实时 WS 更新）
   lot: LotConfig                            // 全局手数
   dispatch: DispatchConfig                  // 分发模式 / 持仓范围
-  filters: Record<string, unknown>          // 区间过滤
+  filters: FilterRulesConfig          // 区间过滤
   events: HubEvent[]                        // 实时事件流（用于总览页展示）
   nodeFeed: Record<string, NodeFeedItem[]>  // node_id -> 实时分发/回报（详情页“成交回报”用）
 }
@@ -104,7 +105,7 @@ export const useHubStore = defineStore('hub', {
     async saveDispatch(cfg: DispatchConfig): Promise<void> {
       this.dispatch = (await api.put('/api/config/dispatch', cfg)).data
     },
-    async saveFilters(cfg: Record<string, unknown>): Promise<void> {
+    async saveFilters(cfg: FilterRulesConfig): Promise<void> {
       this.filters = (await api.put('/api/config/filters', cfg)).data
     },
     // ---- 全局节点接入令牌（账户设置）----

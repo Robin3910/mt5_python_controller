@@ -4,6 +4,9 @@ import { onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useHubStore } from '@/stores/hub'
+import FilterRulesEditor from '@/components/FilterRulesEditor.vue'
+import type { FilterRulesConfig } from '@/api/types'
+import { parseFilterRules, serializeFilterRules, validateFilterRules } from '@/utils/filterRules'
 
 const hub = useHubStore()
 const auth = useAuthStore()
@@ -18,7 +21,7 @@ const tabs: { key: ConfigTab; label: string }[] = [
 
 const lot = reactive({ enabled: false, value: 0.1 })
 const dispatch = reactive({ mode: 'sync' as 'sync' | 'poll', position_scope: 'symbol' as 'symbol' | 'account' })
-const filtersText = ref('{}')
+const filters = ref<FilterRulesConfig>({})
 const filtersError = ref('')
 const savedFlag = ref('')
 
@@ -39,24 +42,13 @@ const nodeTokenShow = ref(false)
 const nodeTokenLoading = ref(false)
 const nodeTokenError = ref('')
 
-const FILTER_EXAMPLE = `{
-  "XAUUSD": {
-    "enabled": true,
-    "default_action": "block",
-    "intervals": [
-      { "low": 2300, "high": 2350, "allow": ["BUY"] },
-      { "low": 2350, "high": 2400, "allow": ["SELL"] }
-    ]
-  }
-}`
-
 onMounted(async () => {
   await hub.fetchConfig()
   lot.enabled = hub.lot.enabled
   lot.value = hub.lot.value
   dispatch.mode = hub.dispatch.mode
   dispatch.position_scope = hub.dispatch.position_scope
-  filtersText.value = JSON.stringify(hub.filters ?? {}, null, 2)
+  filters.value = parseFilterRules(hub.filters)
   await load2faStatus()
   await loadNodeToken()
 })
@@ -233,18 +225,15 @@ async function saveDispatch(): Promise<void> {
 }
 async function saveFilters(): Promise<void> {
   filtersError.value = ''
-  let parsed: Record<string, unknown>
-  try {
-    parsed = JSON.parse(filtersText.value || '{}')
-  } catch {
-    filtersError.value = 'JSON 格式错误，请检查'
+  const payload = serializeFilterRules(filters.value)
+  const errors = validateFilterRules(payload)
+  if (errors.length) {
+    filtersError.value = errors[0]
     return
   }
-  await hub.saveFilters(parsed)
+  await hub.saveFilters(payload)
+  filters.value = parseFilterRules(hub.filters)
   flash('区间过滤规则已保存')
-}
-function loadExample(): void {
-  filtersText.value = FILTER_EXAMPLE
 }
 
 async function changePassword(): Promise<void> {
@@ -338,16 +327,11 @@ async function changePassword(): Promise<void> {
     </div>
 
     <div class="card card-pad span-full">
-      <div class="row between">
-        <strong>多区间方向过滤</strong>
-        <button class="btn-sm btn-ghost" @click="loadExample">载入示例</button>
+      <strong>多区间方向过滤</strong>
+      <div style="margin-top: 12px">
+        <FilterRulesEditor v-model="filters" />
       </div>
-      <p class="muted" style="font-size: 12px">
-        以品种为键配置价格区间允许的方向。<code>default_action</code> 为不在任何区间时的处理（block 拦截 / pass 放行）。
-        留空 <code>{}</code> 表示不过滤。
-      </p>
-      <textarea v-model="filtersText" rows="14" style="font-family: ui-monospace, monospace"></textarea>
-      <div v-if="filtersError" style="color: var(--red); font-size: 12px; margin-top: 6px">{{ filtersError }}</div>
+      <div v-if="filtersError" style="color: var(--red); font-size: 12px; margin-top: 10px">{{ filtersError }}</div>
       <div class="row" style="margin-top: 12px"><button class="btn-primary" @click="saveFilters">保存过滤规则</button></div>
     </div>
   </div>
