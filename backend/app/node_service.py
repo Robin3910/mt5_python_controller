@@ -1,4 +1,7 @@
-"""节点持久化：MySQL/SQLite 为权威，Redis 作缓存 + token 映射。
+"""节点持久化：MySQL/SQLite 为权威，Redis 作缓存 + mt5_login 反查映射。
+
+自 v0.2 起鉴权令牌改为全局共享（见 system_settings），节点本身不再持有 token；
+节点的业务唯一键升级为 mt5_login。
 
 所有写操作都遵循“先写库、再刷新缓存”的顺序，保证重启后能从库里恢复全部状态。
 """
@@ -11,7 +14,7 @@ from .db import SessionLocal
 from .models import NodeCreate, NodeUpdate
 from .orm import Node
 from .redis_store import RedisStore
-from .security import gen_token, hash_token, make_node_id
+from .security import make_node_id
 
 
 def node_row_to_dict(row: Node) -> dict:
@@ -19,7 +22,6 @@ def node_row_to_dict(row: Node) -> dict:
     return {
         "node_id": row.node_id,
         "name": row.name,
-        "token_hash": row.token_hash,
         "enabled": row.enabled,
         "lot_mode": row.lot_mode,
         "lot": row.lot,
@@ -34,26 +36,46 @@ def node_row_to_dict(row: Node) -> dict:
 
 
 async def warm_cache(store: RedisStore) -> int:
-    """启动时把库里的节点全部预热进 Redis（含 token 映射）。"""
+    """启动时把库里的节点全部预热进 Redis（含 mt5_login 反查索引）。"""
     async with SessionLocal() as s:
         rows = (await s.execute(select(Node))).scalars().all()
     for row in rows:
-        d = node_row_to_dict(row)
-        await store.cache_node(d)
-        await store.set_token(row.token_hash, row.node_id)
+        await store.cache_node(node_row_to_dict(row))
     return len(rows)
 
 
-async def create_node(store: RedisStore, payload: NodeCreate) -> tuple[dict, str]:
-    """创建节点：生成 token（只此一次返回明文），写库后刷新缓存。"""
+# 节点自动注册时使用的默认配置（与管理后台「+ 新建节点」表单的图示一致）
+AUTO_NODE_DEFAULTS = {
+    "lot_mode": "fixed",
+    "lot": 0.01,
+    "follow_sync": True,
+    "follow_poll": True,
+    "poll_order": 0,
+    "filters": None,
+}
+
+
+def _default_name(mt5_login: int) -> str:
+    return f"node-{mt5_login}"
+
+
+async def find_by_mt5_login(mt5_login: int) -> Optional[dict]:
+    """按 MT5 登录号在库中查找节点（不走缓存，用于 WS 握手时的权威判定）。"""
+    async with SessionLocal() as s:
+        row = (
+            await s.execute(select(Node).where(Node.mt5_login == int(mt5_login)))
+        ).scalar_one_or_none()
+        return node_row_to_dict(row) if row else None
+
+
+async def create_node(store: RedisStore, payload: NodeCreate) -> dict:
+    """创建节点：写库 + 刷新缓存。mt5_login 重复会触发 IntegrityError，由路由层捕获。"""
+    name = (payload.name or "").strip() or _default_name(payload.mt5_login)
     node_id = make_node_id()
-    token = gen_token()
-    th = hash_token(token)
     async with SessionLocal() as s:
         row = Node(
             node_id=node_id,
-            name=payload.name,
-            token_hash=th,
+            name=name,
             enabled=True,
             lot_mode=payload.lot_mode,
             lot=payload.lot,
@@ -68,8 +90,23 @@ async def create_node(store: RedisStore, payload: NodeCreate) -> tuple[dict, str
         await s.refresh(row)
         d = node_row_to_dict(row)
     await store.cache_node(d)
-    await store.set_token(th, node_id)
-    return d, token
+    return d
+
+
+async def auto_register(store: RedisStore, mt5_login: int) -> dict:
+    """node_client 登录时按 mt5_login 自动注册节点（默认配置见 AUTO_NODE_DEFAULTS）。
+
+    若已存在则直接返回现有节点（幂等）；不存在则用默认配置入库。
+    """
+    existing = await find_by_mt5_login(mt5_login)
+    if existing:
+        return existing
+    payload = NodeCreate(
+        name=_default_name(mt5_login),
+        mt5_login=mt5_login,
+        **AUTO_NODE_DEFAULTS,
+    )
+    return await create_node(store, payload)
 
 
 async def update_node(store: RedisStore, node_id: str, patch: NodeUpdate) -> Optional[dict]:
@@ -89,26 +126,6 @@ async def update_node(store: RedisStore, node_id: str, patch: NodeUpdate) -> Opt
         d = node_row_to_dict(row)
     await store.cache_node(d)
     return d
-
-
-async def rotate_token(store: RedisStore, node_id: str) -> Optional[str]:
-    """重置令牌：旧 token 映射立即失效，返回新明文 token。"""
-    token = gen_token()
-    th = hash_token(token)
-    async with SessionLocal() as s:
-        row = await s.get(Node, node_id)
-        if not row:
-            return None
-        old_hash = row.token_hash
-        row.token_hash = th
-        await s.commit()
-    await store.del_token(old_hash)
-    await store.set_token(th, node_id)
-    n = await store.get_node(node_id)
-    if n:
-        n["token_hash"] = th
-        await store.cache_node(n)
-    return token
 
 
 async def delete_node(store: RedisStore, node_id: str) -> bool:

@@ -7,10 +7,10 @@ import type {
   DispatchConfig,
   HubEvent,
   LotConfig,
-  NodeCreated,
   NodeCreatePayload,
   NodeFeedItem,
   NodeOut,
+  NodeTokenInfo,
   NodeUpdatePayload,
   PaginatedNodeDispatches,
 } from '@/api/types'
@@ -84,7 +84,7 @@ export const useHubStore = defineStore('hub', {
       }
     },
     // ---- 节点增删改 ----
-    async createNode(payload: NodeCreatePayload): Promise<NodeCreated> {
+    async createNode(payload: NodeCreatePayload): Promise<NodeOut> {
       const created = (await api.post('/api/nodes', payload)).data
       await this.fetchNodes()
       return created
@@ -97,9 +97,6 @@ export const useHubStore = defineStore('hub', {
       await api.delete(`/api/nodes/${id}`)
       await this.fetchNodes()
     },
-    async rotateToken(id: string): Promise<NodeCreated> {
-      return (await api.post(`/api/nodes/${id}/rotate-token`)).data
-    },
     // ---- 配置保存 ----
     async saveLot(cfg: LotConfig): Promise<void> {
       this.lot = (await api.put('/api/config/lot', cfg)).data
@@ -109,6 +106,13 @@ export const useHubStore = defineStore('hub', {
     },
     async saveFilters(cfg: Record<string, unknown>): Promise<void> {
       this.filters = (await api.put('/api/config/filters', cfg)).data
+    },
+    // ---- 全局节点接入令牌（账户设置）----
+    async fetchNodeToken(): Promise<NodeTokenInfo> {
+      return (await api.get('/api/config/node-token')).data
+    },
+    async rotateNodeToken(): Promise<NodeTokenInfo> {
+      return (await api.post('/api/config/node-token/rotate')).data
     },
     // ---- 远程平仓 ----
     async closeNode(id: string, body: CloseRequest): Promise<void> {
@@ -163,6 +167,14 @@ export const useHubStore = defineStore('hub', {
         }
         const why = reasonText[d.reason as string] || (d.reason as string) || '未知原因'
         this.pushEvent(`节点 ${d.node_id} 重复登录被拒绝（${why}）`, 'warn')
+      } else if (t === 'node_registered') {
+        // 新节点首次登录被自动注册入库
+        this.pushEvent(
+          `节点 ${d.name || d.node_id} (MT5: ${d.mt5_login}) 已自动注册`,
+          'ok',
+        )
+        // 拉取最新节点列表，让侧栏/列表实时刷新
+        this.fetchNodes().catch(() => {})
       } else if (t === 'account') {
         // 账户快照更新
         this.accounts[d.node_id as string] = d as unknown as AccountSnapshot

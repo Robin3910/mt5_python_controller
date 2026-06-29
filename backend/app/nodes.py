@@ -1,10 +1,11 @@
 """节点管理 API（需管理员鉴权）。"""
 from fastapi import APIRouter, Depends, HTTPException, Request
+from sqlalchemy.exc import IntegrityError
 
 from . import node_service, persist
 from .connections import manager
 from .deps import client_ip, get_current_admin, get_store
-from .models import LotBatch, NodeCreate, NodeCreated, NodeOut, NodeUpdate, PaginatedNodeDispatches
+from .models import LotBatch, NodeCreate, NodeOut, NodeUpdate, PaginatedNodeDispatches
 from .redis_store import RedisStore
 
 router = APIRouter(prefix="/api/nodes", tags=["nodes"])
@@ -39,17 +40,29 @@ async def list_nodes(store: RedisStore = Depends(get_store), _: str = Depends(ge
     return [await _to_node_out(store, n) for n in nodes]
 
 
-@router.post("", response_model=NodeCreated, status_code=201)
+@router.post("", response_model=NodeOut, status_code=201)
 async def create_node(
     body: NodeCreate,
     request: Request,
     store: RedisStore = Depends(get_store),
     admin: str = Depends(get_current_admin),
 ):
-    """创建节点，返回一次性明文令牌。"""
-    d, token = await node_service.create_node(store, body)
-    await persist.audit(admin, "create_node", d["node_id"], {"name": body.name}, "ok", client_ip(request))
-    return NodeCreated(node_id=d["node_id"], token=token)
+    """创建节点（管理员手动）。鉴权令牌为全局共享，见账户设置 → 节点令牌。
+
+    mt5_login 全局唯一；若已存在同 MT5 登录号的节点则返回 409。
+    """
+    try:
+        d = await node_service.create_node(store, body)
+    except IntegrityError:
+        raise HTTPException(
+            status_code=409,
+            detail=f"node with mt5_login={body.mt5_login} already exists",
+        )
+    await persist.audit(
+        admin, "create_node", d["node_id"],
+        {"name": d["name"], "mt5_login": d["mt5_login"]}, "ok", client_ip(request),
+    )
+    return await _to_node_out(store, d)
 
 
 @router.get("/{node_id}", response_model=NodeOut)
@@ -102,21 +115,6 @@ async def delete_node(
         raise HTTPException(status_code=404, detail="node not found")
     await persist.audit(admin, "delete_node", node_id, None, "ok", client_ip(request))
     return {"status": "deleted", "node_id": node_id}
-
-
-@router.post("/{node_id}/rotate-token", response_model=NodeCreated)
-async def rotate_token(
-    node_id: str,
-    request: Request,
-    store: RedisStore = Depends(get_store),
-    admin: str = Depends(get_current_admin),
-):
-    """重置节点令牌（旧令牌立即失效）。"""
-    token = await node_service.rotate_token(store, node_id)
-    if not token:
-        raise HTTPException(status_code=404, detail="node not found")
-    await persist.audit(admin, "rotate_token", node_id, None, "ok", client_ip(request))
-    return NodeCreated(node_id=node_id, token=token)
 
 
 @router.post("/lot")

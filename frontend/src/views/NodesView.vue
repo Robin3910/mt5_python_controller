@@ -19,19 +19,20 @@ const showForm = ref(false)
 const formMode = ref<'create' | 'edit'>('create')
 const editingId = ref('')
 const saving = ref(false)
+const createError = ref('')
 
+// 默认值与「自动注册」保持一致：固定手数 0.01、参与同步/轮询、轮询序 0、启用
 const form = reactive({
   name: '',
   mt5_login: null as number | null,
-  lot_mode: 'global' as 'global' | 'fixed' | 'signal',
-  lot: 0.1 as number | null,
+  lot_mode: 'fixed' as 'global' | 'fixed' | 'signal',
+  lot: 0.01 as number | null,
   follow_sync: true,
   follow_poll: true,
   poll_order: 0,
   enabled: true,
 })
 
-const tokenModal = reactive({ show: false, token: '', title: '' })
 const selectedIds = ref<Set<string>>(new Set())
 const closing = ref(false)
 
@@ -98,18 +99,20 @@ async function closeSelected(): Promise<void> {
 function openCreate(): void {
   formMode.value = 'create'
   editingId.value = ''
-  Object.assign(form, { name: '', mt5_login: null, lot_mode: 'global', lot: 0.1, follow_sync: true, follow_poll: true, poll_order: 0, enabled: true })
+  createError.value = ''
+  Object.assign(form, { name: '', mt5_login: null, lot_mode: 'fixed', lot: 0.01, follow_sync: true, follow_poll: true, poll_order: 0, enabled: true })
   showForm.value = true
 }
 
 function openEdit(n: NodeOut): void {
   formMode.value = 'edit'
   editingId.value = n.node_id
+  createError.value = ''
   Object.assign(form, {
     name: n.name,
     mt5_login: n.mt5_login,
     lot_mode: n.lot_mode,
-    lot: n.lot ?? 0.1,
+    lot: n.lot ?? 0.01,
     follow_sync: n.follow_sync,
     follow_poll: n.follow_poll,
     poll_order: n.poll_order,
@@ -120,6 +123,7 @@ function openEdit(n: NodeOut): void {
 
 async function save(): Promise<void> {
   saving.value = true
+  createError.value = ''
   try {
     const payload = {
       name: form.name,
@@ -131,10 +135,17 @@ async function save(): Promise<void> {
     }
     if (formMode.value === 'create') {
       if (!form.mt5_login) return
-      const created = await hub.createNode({ ...payload, mt5_login: form.mt5_login })
-      tokenModal.token = created.token
-      tokenModal.title = '节点创建成功 — 请保存令牌（只显示一次）'
-      tokenModal.show = true
+      try {
+        await hub.createNode({ ...payload, mt5_login: form.mt5_login })
+      } catch (e: unknown) {
+        const err = e as { response?: { status?: number; data?: { detail?: string } } }
+        if (err?.response?.status === 409) {
+          createError.value = `已存在 MT5 登录号为 ${form.mt5_login} 的节点`
+          return
+        }
+        createError.value = err?.response?.data?.detail || '创建失败，请稍后重试'
+        return
+      }
     } else {
       await hub.updateNode(editingId.value, { ...payload, enabled: form.enabled })
     }
@@ -149,20 +160,8 @@ async function remove(n: NodeOut): Promise<void> {
   await hub.deleteNode(n.node_id)
 }
 
-async function doRotate(n: NodeOut): Promise<void> {
-  if (!confirm(`重置节点「${n.name}」的令牌？旧令牌将立即失效。`)) return
-  const res = await hub.rotateToken(n.node_id)
-  tokenModal.token = res.token
-  tokenModal.title = '新令牌（只显示一次）'
-  tokenModal.show = true
-}
-
 async function toggleEnabled(n: NodeOut): Promise<void> {
   await hub.updateNode(n.node_id, { enabled: !n.enabled })
-}
-
-function copyToken(): void {
-  navigator.clipboard?.writeText(tokenModal.token)
 }
 </script>
 
@@ -236,7 +235,6 @@ function copyToken(): void {
       <div class="list-card-actions">
         <button class="btn-sm btn-ghost" @click="goDetail(n)">详情</button>
         <button class="btn-sm btn-ghost" @click="openEdit(n)">编辑</button>
-        <button class="btn-sm btn-ghost" @click="doRotate(n)">令牌</button>
         <button class="btn-sm btn-danger" @click="remove(n)">删除</button>
       </div>
     </div>
@@ -289,7 +287,6 @@ function copyToken(): void {
           <td class="right">
             <button class="btn-sm btn-ghost" @click="goDetail(n)">详情</button>
             <button class="btn-sm btn-ghost" @click="openEdit(n)">编辑</button>
-            <button class="btn-sm btn-ghost" @click="doRotate(n)">令牌</button>
             <button class="btn-sm btn-danger" @click="remove(n)">删除</button>
           </td>
         </tr>
@@ -302,10 +299,13 @@ function copyToken(): void {
   <div v-if="showForm" class="modal-mask" @click.self="showForm = false">
     <div class="card card-pad modal">
       <div class="h1">{{ formMode === 'create' ? '新建节点' : '编辑节点' }}</div>
+      <p v-if="formMode === 'create'" class="muted" style="font-size: 12px; margin: 4px 0 10px">
+        提示：若 node_client 用同一 MT5 登录号首次连接，系统会自动注册（默认配置同此表单），通常无需在此手动新建。
+      </p>
       <div class="form-grid">
         <div>
           <FormLabel field-id="node-name" text="名称" :help="NODE_FORM_FIELD_HELP.name" />
-          <input id="node-name" v-model="form.name" placeholder="例如：东京-VPS-01" />
+          <input id="node-name" v-model="form.name" :placeholder="form.mt5_login ? `留空将自动生成：node-${form.mt5_login}` : '留空将自动生成 node-{mt5_login}'" />
         </div>
         <div v-if="formMode === 'create'">
           <FormLabel field-id="node-mt5-login" text="MT5 账户登录号" :help="NODE_FORM_FIELD_HELP.mt5_login" />
@@ -348,27 +348,15 @@ function copyToken(): void {
           <FormLabel field-id="node-enabled" text="启用状态" :help="NODE_FORM_FIELD_HELP.enabled" />
           <select id="node-enabled" v-model="form.enabled"><option :value="true">启用</option><option :value="false">禁用</option></select>
         </div>
+        <div v-if="createError" style="color: var(--red); font-size: 13px">{{ createError }}</div>
         <div class="row between" style="margin-top: 6px">
           <button class="btn-ghost" @click="showForm = false">取消</button>
           <button
             class="btn-primary"
-            :disabled="saving || !form.name || (formMode === 'create' && !form.mt5_login)"
+            :disabled="saving || (formMode === 'create' && !form.mt5_login)"
             @click="save"
           >{{ saving ? '保存中…' : '保存' }}</button>
         </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- token modal -->
-  <div v-if="tokenModal.show" class="modal-mask" @click.self="tokenModal.show = false">
-    <div class="card card-pad modal">
-      <div class="h1">{{ tokenModal.title }}</div>
-      <p class="muted" style="font-size: 12px">将此令牌填入对应节点的 <code>.env</code> 的 <code>NODE_TOKEN</code>。</p>
-      <div class="token-box">{{ tokenModal.token }}</div>
-      <div class="row between" style="margin-top: 14px">
-        <button class="btn-ghost" @click="copyToken">复制</button>
-        <button class="btn-primary" @click="tokenModal.show = false">我已保存</button>
       </div>
     </div>
   </div>

@@ -33,6 +33,12 @@ const twofaPwd = ref('')
 const twofaError = ref('')
 const twofaLoading = ref(false)
 
+// 节点令牌（全局共享 NODE_TOKEN）
+const nodeToken = reactive({ value: '', updated_at: 0 })
+const nodeTokenShow = ref(false)
+const nodeTokenLoading = ref(false)
+const nodeTokenError = ref('')
+
 const FILTER_EXAMPLE = `{
   "XAUUSD": {
     "enabled": true,
@@ -52,7 +58,46 @@ onMounted(async () => {
   dispatch.position_scope = hub.dispatch.position_scope
   filtersText.value = JSON.stringify(hub.filters ?? {}, null, 2)
   await load2faStatus()
+  await loadNodeToken()
 })
+
+async function loadNodeToken(): Promise<void> {
+  try {
+    const t = await hub.fetchNodeToken()
+    nodeToken.value = t.token
+    nodeToken.updated_at = t.updated_at
+  } catch {
+    nodeTokenError.value = '无法加载节点令牌'
+  }
+}
+
+function copyNodeToken(): void {
+  if (!nodeToken.value) return
+  navigator.clipboard?.writeText(nodeToken.value)
+  flash('节点令牌已复制到剪贴板')
+}
+
+async function rotateNodeToken(): Promise<void> {
+  if (!confirm('重置全局节点令牌？所有节点的 .env 都需更新后才能继续接入，请确认。')) return
+  nodeTokenLoading.value = true
+  nodeTokenError.value = ''
+  try {
+    const t = await hub.rotateNodeToken()
+    nodeToken.value = t.token
+    nodeToken.updated_at = t.updated_at
+    nodeTokenShow.value = true
+    flash('节点令牌已重置，请尽快同步到所有节点 .env')
+  } catch {
+    nodeTokenError.value = '重置失败，请稍后重试'
+  } finally {
+    nodeTokenLoading.value = false
+  }
+}
+
+function fmtTokenUpdatedAt(): string {
+  if (!nodeToken.updated_at) return '—'
+  return new Date(nodeToken.updated_at * 1000).toLocaleString()
+}
 
 async function load2faStatus(): Promise<void> {
   try {
@@ -308,6 +353,40 @@ async function changePassword(): Promise<void> {
   </div>
 
   <div v-else class="grid layout-config">
+    <div class="card card-pad span-full">
+      <div class="row between">
+        <strong>节点令牌 (NODE_TOKEN)</strong>
+        <span class="muted" style="font-size: 12px">最近更新：{{ fmtTokenUpdatedAt() }}</span>
+      </div>
+      <p class="muted" style="font-size: 12px">
+        所有 node_client 共享此令牌进行接入鉴权。将其填入每个节点 <code>.env</code> 的
+        <code>NODE_TOKEN</code>。点击「重置」会立即作废旧令牌，所有节点必须更新后才能重新接入。
+      </p>
+      <div class="form-grid">
+        <div>
+          <label>当前令牌</label>
+          <div class="row" style="gap: 8px; align-items: center">
+            <input
+              :value="nodeToken.value"
+              :type="nodeTokenShow ? 'text' : 'password'"
+              readonly
+              style="flex: 1; font-family: ui-monospace, monospace"
+            />
+            <button class="btn-sm btn-ghost" type="button" @click="nodeTokenShow = !nodeTokenShow">
+              {{ nodeTokenShow ? '隐藏' : '显示' }}
+            </button>
+            <button class="btn-sm btn-ghost" type="button" :disabled="!nodeToken.value" @click="copyNodeToken">复制</button>
+          </div>
+        </div>
+        <div v-if="nodeTokenError" style="color: var(--red); font-size: 13px">{{ nodeTokenError }}</div>
+        <div class="row" style="gap: 8px">
+          <button class="btn-danger btn-sm" :disabled="nodeTokenLoading" @click="rotateNodeToken">
+            {{ nodeTokenLoading ? '重置中…' : '重置令牌' }}
+          </button>
+        </div>
+      </div>
+    </div>
+
     <div class="card card-pad">
       <strong>修改密码</strong>
       <p class="muted" style="font-size: 12px">修改管理员登录密码；成功后需使用新密码重新登录。</p>

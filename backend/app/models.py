@@ -10,10 +10,10 @@ from pydantic import BaseModel, Field
 # ----------------------------- 节点 -----------------------------
 class NodeCreate(BaseModel):
     """创建节点的入参。"""
-    name: str
-    mt5_login: int = Field(gt=0, description="绑定的 MT5 账户登录号")
-    lot_mode: str = "global"  # 手数策略：global / fixed / signal
-    lot: Optional[float] = None
+    name: Optional[str] = None  # 留空则自动生成 "node-{mt5_login}"
+    mt5_login: int = Field(gt=0, description="绑定的 MT5 账户登录号（全局唯一）")
+    lot_mode: str = "fixed"  # 手数策略：global / fixed / signal（默认 fixed）
+    lot: Optional[float] = 0.01
     follow_sync: bool = True   # 是否参与“全员同步”分发
     follow_poll: bool = True   # 是否参与“轮询领取”分发
     poll_order: int = 0        # 轮询顺序（越小越先）
@@ -49,10 +49,10 @@ class NodeOut(BaseModel):
     last_seen: Optional[float] = None
 
 
-class NodeCreated(BaseModel):
-    """创建/重置令牌时返回；明文 token 只在此刻返回一次。"""
-    node_id: str
+class NodeTokenInfo(BaseModel):
+    """全局节点接入令牌（所有节点共享）。明文存储，便于管理员复制到各节点 .env。"""
     token: str
+    updated_at: float = 0
 
 
 class LotBatch(BaseModel):

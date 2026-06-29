@@ -15,13 +15,14 @@ from .settings import settings
 
 # ---- Redis key 模板（集中管理，避免散落各处拼字符串）----
 K_NODE = "node:{}"               # 节点元数据缓存（JSON）
-K_TOKEN = "node:token:{}"        # token 哈希 -> node_id
+K_NODE_BY_LOGIN = "node:by_login:{}"  # mt5_login -> node_id（用于 WS 握手快速反查）
 K_NODES = "nodes"                # 所有 node_id 的集合
 K_ONLINE = "node:online:{}"      # 在线标记（带 TTL）
 K_ACCOUNT = "node:account:{}"    # 账户快照（JSON）
 K_LOT_GLOBAL = "config:lot:global"   # 全局手数配置
 K_FILTERS = "config:filters"     # 多区间方向过滤配置
 K_DISPATCH = "config:dispatch"   # 分发模式 / 持仓判定范围
+K_NODE_TOKEN = "config:node_token"   # 全局节点接入令牌（明文）
 K_DEDUP = "dedup:{}"             # 信号去重指纹（带 TTL）
 K_EXEC_LOCK = "lock:exec:{}:{}"  # (node, symbol) 执行锁
 K_POLL_PENDING = "signal:poll:pending"  # 轮询待处理队列（List）
@@ -45,10 +46,13 @@ class RedisStore:
 
     # ----------------- 节点元数据缓存 -----------------
     async def cache_node(self, node: dict) -> None:
-        """写入/更新节点缓存，并登记到节点集合。"""
+        """写入/更新节点缓存，并登记到节点集合 + mt5_login 反查索引。"""
         nid = node["node_id"]
         await self.r.set(K_NODE.format(nid), json.dumps(node))
         await self.r.sadd(K_NODES, nid)
+        login = node.get("mt5_login")
+        if login:
+            await self.r.set(K_NODE_BY_LOGIN.format(int(login)), nid)
 
     async def get_node(self, node_id: str) -> Optional[dict]:
         raw = await self.r.get(K_NODE.format(node_id))
@@ -64,25 +68,26 @@ class RedisStore:
         return out
 
     async def delete_node(self, node_id: str) -> None:
-        """删除节点时，连带清理 token 映射、账户快照、在线标记。"""
+        """删除节点时，连带清理 mt5_login 反查索引、账户快照、在线标记。"""
         n = await self.get_node(node_id)
-        if n and n.get("token_hash"):
-            await self.r.delete(K_TOKEN.format(n["token_hash"]))
+        if n and n.get("mt5_login"):
+            await self.r.delete(K_NODE_BY_LOGIN.format(int(n["mt5_login"])))
         await self.r.delete(K_NODE.format(node_id))
         await self.r.delete(K_ACCOUNT.format(node_id))
         await self.r.delete(K_ONLINE.format(node_id))
         await self.r.srem(K_NODES, node_id)
 
-    # ----------------- token 映射 -----------------
-    async def set_token(self, token_hash: str, node_id: str) -> None:
-        await self.r.set(K_TOKEN.format(token_hash), node_id)
+    # ----------------- mt5_login 反查 -----------------
+    async def node_by_mt5_login(self, mt5_login: int) -> Optional[str]:
+        """WS 握手用 MT5 登录号反查节点 ID（O(1)）。"""
+        return await self.r.get(K_NODE_BY_LOGIN.format(int(mt5_login)))
 
-    async def del_token(self, token_hash: str) -> None:
-        await self.r.delete(K_TOKEN.format(token_hash))
+    # ----------------- 全局节点令牌（缓存） -----------------
+    async def get_node_token(self) -> Optional[str]:
+        return await self.r.get(K_NODE_TOKEN)
 
-    async def node_by_token(self, token_hash: str) -> Optional[str]:
-        """WS 握手时用 token 哈希反查节点（O(1)）。"""
-        return await self.r.get(K_TOKEN.format(token_hash))
+    async def set_node_token(self, token: str) -> None:
+        await self.r.set(K_NODE_TOKEN, token)
 
     # ----------------- 在线状态 / 心跳 -----------------
     async def touch_online(self, node_id: str) -> None:

@@ -2,6 +2,9 @@
 
 鉴权采用“连接建立后首包必须是 auth”的方式（而非把 token 放到 URL 上），
 避免 token 出现在日志/代理访问记录中。详见文档 6.3。
+
+自 v0.2 起：所有节点共享全局 NODE_TOKEN（见 system_settings），节点身份由 mt5_login
+唯一标识；若 mt5_login 不在库中则按默认配置自动注册（见 node_service.auto_register）。
 """
 import asyncio
 import logging
@@ -10,9 +13,9 @@ import time
 from fastapi import APIRouter, WebSocket
 from starlette.websockets import WebSocketDisconnect
 
-from . import persist, results
+from . import node_service, persist, results, system_settings
 from .connections import manager
-from .security import hash_token
+from .security import compare_secret
 from .settings import settings
 from .state import state
 
@@ -50,37 +53,18 @@ async def node_ws(ws: WebSocket):
         await ws.close(code=4401)
         return
 
-    # token 仅存哈希；用哈希反查 node_id
-    token = (msg.get("data") or {}).get("token", "")
-    node_id = await store.node_by_token(hash_token(token)) if store else None
-    if not node_id:
+    data = msg.get("data") or {}
+    token = data.get("token", "")
+
+    # ---- 1. 校验全局节点令牌（所有节点共享同一 NODE_TOKEN）----
+    expected_token, _ = await system_settings.get_node_token(store) if store else ("", 0)
+    if not expected_token or not compare_secret(token, expected_token):
         await ws.send_json({"type": "auth_fail", "data": {"reason": "invalid_token"}})
-        await ws.close(code=4401)  # 未注册 / token 非法
-        return
-
-    node = await store.get_node(node_id)
-    if not node:
-        await ws.send_json({"type": "auth_fail", "data": {"reason": "not_found", "message": "节点不存在或已被删除"}})
-        await ws.close(code=4403)
-        return
-    if not node.get("enabled", True):
-        await ws.send_json({"type": "auth_fail", "data": {"reason": "disabled", "message": "节点已被禁用，无法接入"}})
-        await ws.close(code=4403)  # 节点被禁用
-        return
-
-    expected_login = node.get("mt5_login")
-    if not expected_login:
-        await ws.send_json({
-            "type": "auth_fail",
-            "data": {
-                "reason": "mt5_login_not_configured",
-                "message": "节点未配置 MT5 账户登录号，请在管理后台编辑节点",
-            },
-        })
         await ws.close(code=4401)
         return
 
-    client_login = _parse_mt5_login(msg.get("data") or {})
+    # ---- 2. 解析 MT5 登录号 ----
+    client_login = _parse_mt5_login(data)
     if client_login is None:
         await ws.send_json({
             "type": "auth_fail",
@@ -92,24 +76,38 @@ async def node_ws(ws: WebSocket):
         await ws.close(code=4401)
         return
 
-    if client_login != int(expected_login):
-        logger.warning(
-            "node %s mt5_login mismatch: expected=%s got=%s",
-            node_id, expected_login, client_login,
-        )
-        await ws.send_json({
-            "type": "auth_fail",
-            "data": {
-                "reason": "mt5_login_mismatch",
-                "message": f"MT5 账户登录号不匹配（期望 {expected_login}，实际 {client_login}）",
-                "expected_mt5_login": int(expected_login),
-                "actual_mt5_login": client_login,
-            },
+    # ---- 3. 按 mt5_login 查找节点；不存在则自动注册（默认配置见 node_service）----
+    node_id = await store.node_by_mt5_login(client_login) if store else None
+    node = await store.get_node(node_id) if node_id else None
+
+    if not node:
+        # 兜底走 DB 直查（避免缓存未同步时误判为不存在）
+        node = await node_service.find_by_mt5_login(client_login)
+
+    if not node:
+        try:
+            node = await node_service.auto_register(store, client_login)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("auto register failed for mt5_login=%s: %s", client_login, e)
+            await ws.send_json({
+                "type": "auth_fail",
+                "data": {"reason": "auto_register_failed", "message": "节点自动注册失败"},
+            })
+            await ws.close(code=4500)
+            return
+        await manager.broadcast_admin({
+            "type": "node_registered",
+            "data": {"node_id": node["node_id"], "mt5_login": client_login, "name": node["name"]},
         })
-        await manager.broadcast_admin(
-            {"type": "node_rejected", "data": {"node_id": node_id, "reason": "mt5_login_mismatch"}}
+        logger.info(
+            "auto-registered node %s for mt5_login=%s with defaults",
+            node["node_id"], client_login,
         )
-        await ws.close(code=4401)
+
+    node_id = node["node_id"]
+    if not node.get("enabled", True):
+        await ws.send_json({"type": "auth_fail", "data": {"reason": "disabled", "message": "节点已被禁用，无法接入"}})
+        await ws.close(code=4403)  # 节点被禁用
         return
 
     # 同一节点同一时刻只允许一个在线：已有存活连接时拒绝本次登录并说明原因

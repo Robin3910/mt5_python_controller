@@ -124,13 +124,11 @@ class NodeClient:
         data = msg.get("data") or {}
         reason = data.get("reason") or msg.get("type") or "unknown"
         reason_text = {
-            "invalid_token": "令牌无效或节点未注册",
-            "already_online": "该节点已有在线连接，本次登录被拒绝（同一节点同一时刻只允许一个在线）",
-            "disabled": "节点已被禁用，无法接入",
-            "not_found": "节点不存在或已被删除",
-            "mt5_login_not_configured": "节点未配置 MT5 账户登录号，请在管理后台编辑节点",
-            "missing_mt5_login": "鉴权包缺少 MT5 账户登录号",
-            "mt5_login_mismatch": data.get("message") or "MT5 账户登录号与后台配置不一致",
+            "invalid_token": "全局节点令牌无效；请到管理后台「账户设置 → 节点令牌」查看/重置后更新本机 .env",
+            "already_online": "该 MT5 账户已有在线连接，本次登录被拒绝（同一账户同一时刻只允许一个在线）",
+            "disabled": "节点已被管理员禁用，无法接入",
+            "missing_mt5_login": "鉴权包缺少 MT5 账户登录号（请检查 .env 中的 MT5_LOGIN）",
+            "auto_register_failed": "节点自动注册失败，请联系管理员排查后台日志",
         }.get(reason, data.get("message") or reason)
         logger.error("登录被拒绝：%s", reason_text)
         return False

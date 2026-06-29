@@ -1,12 +1,13 @@
-"""运行期配置 API：全局手数、区间过滤、分发模式/范围（需管理员鉴权）。
+"""运行期配置 API：全局手数、区间过滤、分发模式/范围、全局节点令牌（需管理员鉴权）。
 
 这些配置存于 Redis（运行期实时态），下发分发时即时读取生效。
+节点令牌为持久化配置（MySQL/SQLite + Redis 缓存，见 system_settings）。
 """
 from fastapi import APIRouter, Depends, Request
 
-from . import persist
+from . import persist, system_settings
 from .deps import client_ip, get_current_admin, get_store
-from .models import DispatchConfig, LotConfig
+from .models import DispatchConfig, LotConfig, NodeTokenInfo
 from .redis_store import RedisStore
 
 router = APIRouter(prefix="/api/config", tags=["config"])
@@ -64,3 +65,26 @@ async def set_dispatch(
     await store.set_dispatch(body.model_dump())
     await persist.audit(admin, "set_dispatch", None, body.model_dump(), "ok", client_ip(request))
     return body
+
+
+# ----------------- 全局节点接入令牌 -----------------
+@router.get("/node-token", response_model=NodeTokenInfo)
+async def get_node_token(
+    store: RedisStore = Depends(get_store),
+    _: str = Depends(get_current_admin),
+):
+    """获取当前全局节点接入令牌（所有节点共享）。"""
+    token, updated_at = await system_settings.get_node_token(store)
+    return NodeTokenInfo(token=token, updated_at=updated_at)
+
+
+@router.post("/node-token/rotate", response_model=NodeTokenInfo)
+async def rotate_node_token(
+    request: Request,
+    store: RedisStore = Depends(get_store),
+    admin: str = Depends(get_current_admin),
+):
+    """重置全局节点接入令牌：旧令牌立即失效，所有节点需要更新 .env 后重连。"""
+    token, updated_at = await system_settings.rotate_node_token(store)
+    await persist.audit(admin, "rotate_node_token", None, None, "ok", client_ip(request))
+    return NodeTokenInfo(token=token, updated_at=updated_at)

@@ -2,7 +2,7 @@
 // 节点详情页：Tab + 列表展示单个节点上报的数据
 // （概览 / 持仓 / 报价 / 成交回报）。账户与持仓走 WS 实时刷新，
 // 成交回报 = 持久化历史 + 本会话实时回报合并。
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useHubStore } from '@/stores/hub'
 import type { AccountSnapshot, NodeDispatchRecord, NodeFeedItem, NodeOut } from '@/api/types'
@@ -31,7 +31,6 @@ const historyPage = ref(1)
 const historyPageSize = ref(20)
 const historyTotal = ref(0)
 const loadingHistory = ref(false)
-const tokenModal = reactive({ show: false, token: '', title: '' })
 
 const historyTotalPages = computed(() =>
   Math.max(1, Math.ceil(historyTotal.value / historyPageSize.value)),
@@ -203,13 +202,6 @@ async function toggleEnabled(): Promise<void> {
   if (!node.value) return
   await hub.updateNode(id.value, { enabled: !node.value.enabled })
 }
-async function doRotate(): Promise<void> {
-  if (!confirm('重置该节点令牌？旧令牌将立即失效。')) return
-  const res = await hub.rotateToken(id.value)
-  tokenModal.token = res.token
-  tokenModal.title = '新令牌（只显示一次）'
-  tokenModal.show = true
-}
 async function closeNodeAll(): Promise<void> {
   if (!confirm('确认平掉该节点的全部持仓？')) return
   await hub.closeNode(id.value, { target: 'all' })
@@ -217,9 +209,6 @@ async function closeNodeAll(): Promise<void> {
 async function closeTicket(ticket: number): Promise<void> {
   if (!confirm(`平掉订单 #${ticket}？`)) return
   await hub.closeNode(id.value, { target: 'ticket', ticket })
-}
-function copyToken(): void {
-  navigator.clipboard?.writeText(tokenModal.token)
 }
 </script>
 
@@ -245,7 +234,6 @@ function copyToken(): void {
         <button class="btn-sm" :class="node.enabled ? 'btn-ghost' : 'btn-danger'" @click="toggleEnabled">
           {{ node.enabled ? '已启用' : '已禁用' }}
         </button>
-        <button class="btn-sm btn-ghost" @click="doRotate">令牌</button>
         <button class="btn-sm btn-danger" :disabled="!positions.length" @click="closeNodeAll">平掉全部</button>
       </div>
     </div>
@@ -672,18 +660,5 @@ function copyToken(): void {
         </div>
       </div>
     </template>
-
-    <!-- token modal -->
-    <div v-if="tokenModal.show" class="modal-mask" @click.self="tokenModal.show = false">
-      <div class="card card-pad modal">
-        <div class="h1">{{ tokenModal.title }}</div>
-        <p class="muted" style="font-size: 12px">将此令牌填入对应节点的 <code>.env</code> 的 <code>NODE_TOKEN</code>。</p>
-        <div class="token-box">{{ tokenModal.token }}</div>
-        <div class="row between" style="margin-top: 14px">
-          <button class="btn-ghost" @click="copyToken">复制</button>
-          <button class="btn-primary" @click="tokenModal.show = false">我已保存</button>
-        </div>
-      </div>
-    </div>
   </div>
 </template>

@@ -44,9 +44,26 @@ def _migrate_dispatch_price_column(sync_conn) -> None:
         sync_conn.execute(text("ALTER TABLE signal_dispatch ADD COLUMN price FLOAT"))
 
 
+def _drop_legacy_nodes_table(sync_conn) -> None:
+    """v0.2 迁移：旧表带 `token_hash` 列（一节点一令牌）；新方案改为全局共享令牌，
+    且 `mt5_login` 升级为 UNIQUE NOT NULL，无法平滑 ALTER —— 直接丢弃旧表，由
+    `create_all` 重建为新结构。已选择「清空所有节点重建」策略。
+    """
+    inspector = inspect(sync_conn)
+    if "nodes" not in inspector.get_table_names():
+        return
+    cols = {c["name"] for c in inspector.get_columns("nodes")}
+    if "token_hash" in cols:
+        logger.warning(
+            "legacy `nodes` table detected (token_hash column present); dropping for v0.2 schema reset"
+        )
+        sync_conn.execute(text("DROP TABLE nodes"))
+
+
 async def init_db() -> None:
     """不存在则建表。生产环境建议改用 Alembic 迁移而非 create_all。"""
     async with engine.begin() as conn:
+        await conn.run_sync(_drop_legacy_nodes_table)
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_migrate_user_totp_columns)
         await conn.run_sync(_migrate_dispatch_price_column)

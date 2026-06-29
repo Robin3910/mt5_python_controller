@@ -17,6 +17,7 @@ from . import (
     config_api,
     node_service,
     nodes,
+    system_settings,
     user_service,
     webhook,
     ws_gateway,
@@ -51,6 +52,9 @@ async def lifespan(app: FastAPI):
     count = await node_service.warm_cache(store)
     logger.info("warmed %d node(s) into cache", count)
     await user_service.seed_default_admin(store)
+    # 保证全局节点接入令牌存在；首次启动自动生成（管理员可在「账户设置」页面查看/重置）
+    token = await system_settings.ensure_node_token(store)
+    logger.info("global node token ready (length=%d)", len(token))
 
     state.store = store
     state.dispatcher = Dispatcher(store)

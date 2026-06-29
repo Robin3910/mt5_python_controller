@@ -63,13 +63,15 @@ export interface DispatchConfig {
   position_scope: 'symbol' | 'account'
 }
 
-export interface NodeCreated {
-  node_id: string
+// 全局节点接入令牌（所有节点共享，存于「账户设置」）
+export interface NodeTokenInfo {
   token: string
+  updated_at: number
 }
 
 export interface NodeCreatePayload {
-  name: string
+  // 留空时后端会自动生成 "node-{mt5_login}"
+  name?: string
   mt5_login: number
   lot_mode?: string
   lot?: number | null

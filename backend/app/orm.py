@@ -23,12 +23,14 @@ class Base(DeclarativeBase):
 
 
 class Node(Base):
-    """节点账本（权威数据源；Redis 仅作缓存）。"""
+    """节点账本（权威数据源；Redis 仅作缓存）。
+
+    自 v0.2 起鉴权令牌改为全局共享（见 SystemSetting），节点身份用 mt5_login 唯一标识。
+    """
     __tablename__ = "nodes"
 
     node_id: Mapped[str] = mapped_column(String(32), primary_key=True)
     name: Mapped[str] = mapped_column(String(64))
-    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)  # 仅存哈希
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     lot_mode: Mapped[str] = mapped_column(String(16), default="global")
     lot: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -36,9 +38,24 @@ class Node(Base):
     follow_poll: Mapped[bool] = mapped_column(Boolean, default=True)
     poll_order: Mapped[int] = mapped_column(Integer, default=0)
     filters_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # 节点级过滤
-    mt5_login: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # mt5_login 自 v0.2 起作为节点的业务唯一键（不可为空、全局唯一）
+    mt5_login: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
     mt5_server: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class SystemSetting(Base):
+    """系统级 key/value 配置（持久化）。
+
+    当前用途：`node_token` — 所有节点共享的接入令牌（明文，便于管理员复制到各节点 .env）。
+    """
+    __tablename__ = "system_setting"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
     )
