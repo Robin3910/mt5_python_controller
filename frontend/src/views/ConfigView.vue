@@ -7,6 +7,7 @@ import { useHubStore } from '@/stores/hub'
 import FilterRulesEditor from '@/components/FilterRulesEditor.vue'
 import type { FilterRulesConfig } from '@/api/types'
 import { parseFilterRules, serializeFilterRules, validateFilterRules } from '@/utils/filterRules'
+import { copyToClipboard } from '@/utils/clipboard'
 
 const hub = useHubStore()
 const auth = useAuthStore()
@@ -63,10 +64,16 @@ async function loadNodeToken(): Promise<void> {
   }
 }
 
-function copyNodeToken(): void {
+async function copyNodeToken(): Promise<void> {
   if (!nodeToken.value) return
-  navigator.clipboard?.writeText(nodeToken.value)
-  flash('节点令牌已复制到剪贴板')
+  nodeTokenError.value = ''
+  const ok = await copyToClipboard(nodeToken.value)
+  if (ok) {
+    flash('节点令牌已复制到剪贴板')
+    return
+  }
+  nodeTokenShow.value = true
+  nodeTokenError.value = '自动复制失败，请手动选中上方令牌后 Ctrl+C'
 }
 
 async function rotateNodeToken(): Promise<void> {
