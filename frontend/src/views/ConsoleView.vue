@@ -1,0 +1,101 @@
+<script setup lang="ts">
+// 中控台：系统配置（全局手数 / 分发策略 / 区间过滤）
+import { onMounted, reactive, ref } from 'vue'
+import { useHubStore } from '@/stores/hub'
+import FilterRulesEditor from '@/components/FilterRulesEditor.vue'
+import type { FilterRulesConfig } from '@/api/types'
+import { parseFilterRules, serializeFilterRules, validateFilterRules } from '@/utils/filterRules'
+
+const hub = useHubStore()
+
+const lot = reactive({ enabled: false, value: 0.1 })
+const dispatch = reactive({ mode: 'sync' as 'sync' | 'poll', position_scope: 'symbol' as 'symbol' | 'account' })
+const filters = ref<FilterRulesConfig>({})
+const filtersError = ref('')
+const savedFlag = ref('')
+
+onMounted(async () => {
+  await hub.fetchConfig()
+  lot.enabled = hub.lot.enabled
+  lot.value = hub.lot.value
+  dispatch.mode = hub.dispatch.mode
+  dispatch.position_scope = hub.dispatch.position_scope
+  filters.value = parseFilterRules(hub.filters)
+})
+
+function flash(msg: string): void {
+  savedFlag.value = msg
+  setTimeout(() => (savedFlag.value = ''), 1800)
+}
+
+async function saveLot(): Promise<void> {
+  await hub.saveLot({ enabled: lot.enabled, value: lot.value })
+  flash('全局手数已保存')
+}
+async function saveDispatch(): Promise<void> {
+  await hub.saveDispatch({ mode: dispatch.mode, position_scope: dispatch.position_scope })
+  flash('分发策略已保存')
+}
+async function saveFilters(): Promise<void> {
+  filtersError.value = ''
+  const payload = serializeFilterRules(filters.value)
+  const errors = validateFilterRules(payload)
+  if (errors.length) {
+    filtersError.value = errors[0]
+    return
+  }
+  await hub.saveFilters(payload)
+  filters.value = parseFilterRules(hub.filters)
+  flash('区间过滤规则已保存')
+}
+</script>
+
+<template>
+  <div class="row between page-header">
+    <div class="h1">中控台</div>
+    <span v-if="savedFlag" class="tag green">{{ savedFlag }}</span>
+  </div>
+
+  <div class="grid layout-config">
+    <div class="card card-pad">
+      <strong>全局手数</strong>
+      <p class="muted" style="font-size: 12px">开启后，所有「跟随全局」策略的节点统一使用该手数。</p>
+      <div class="form-grid">
+        <div>
+          <label>启用全局手数</label>
+          <select v-model="lot.enabled"><option :value="true">启用</option><option :value="false">关闭</option></select>
+        </div>
+        <div><label>手数</label><input v-model.number="lot.value" type="number" step="0.01" :disabled="!lot.enabled" /></div>
+        <button class="btn-primary" @click="saveLot">保存</button>
+      </div>
+    </div>
+
+    <div class="card card-pad">
+      <strong>分发策略</strong>
+      <p class="muted" style="font-size: 12px">同步模式：所有节点并发执行；轮询模式：按顺序依次领取执行。</p>
+      <div class="form-grid">
+        <div>
+          <label>分发模式</label>
+          <select v-model="dispatch.mode"><option value="sync">全员同步</option><option value="poll">轮询领取</option></select>
+        </div>
+        <div>
+          <label>持仓判定范围</label>
+          <select v-model="dispatch.position_scope">
+            <option value="symbol">按品种（同品种无持仓才开）</option>
+            <option value="account">按账户（账户无任何持仓才开）</option>
+          </select>
+        </div>
+        <button class="btn-primary" @click="saveDispatch">保存</button>
+      </div>
+    </div>
+
+    <div class="card card-pad span-full">
+      <strong>多区间方向过滤</strong>
+      <div style="margin-top: 12px">
+        <FilterRulesEditor v-model="filters" />
+      </div>
+      <div v-if="filtersError" style="color: var(--red); font-size: 12px; margin-top: 10px">{{ filtersError }}</div>
+      <div class="row" style="margin-top: 12px"><button class="btn-primary" @click="saveFilters">保存过滤规则</button></div>
+    </div>
+  </div>
+</template>

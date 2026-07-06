@@ -33,6 +33,7 @@ function logout(): void {
       <nav class="nav">
         <RouterLink to="/">总览</RouterLink>
         <RouterLink to="/nodes">节点</RouterLink>
+        <RouterLink to="/console">中控台</RouterLink>
         <RouterLink to="/config">配置</RouterLink>
       </nav>
       <div class="spacer"></div>

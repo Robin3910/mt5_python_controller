@@ -1,29 +1,15 @@
 <script setup lang="ts">
-// 配置页：系统配置 / 账户设置（Tab）
+// 配置页：账户设置
 import { onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useHubStore } from '@/stores/hub'
-import FilterRulesEditor from '@/components/FilterRulesEditor.vue'
-import type { FilterRulesConfig } from '@/api/types'
-import { parseFilterRules, serializeFilterRules, validateFilterRules } from '@/utils/filterRules'
 import { copyToClipboard } from '@/utils/clipboard'
 
 const hub = useHubStore()
 const auth = useAuthStore()
 const router = useRouter()
 
-type ConfigTab = 'system' | 'account'
-const tab = ref<ConfigTab>('system')
-const tabs: { key: ConfigTab; label: string }[] = [
-  { key: 'system', label: '系统配置' },
-  { key: 'account', label: '账户设置' },
-]
-
-const lot = reactive({ enabled: false, value: 0.1 })
-const dispatch = reactive({ mode: 'sync' as 'sync' | 'poll', position_scope: 'symbol' as 'symbol' | 'account' })
-const filters = ref<FilterRulesConfig>({})
-const filtersError = ref('')
 const savedFlag = ref('')
 
 const pwd = reactive({ current: '', new: '', confirm: '' })
@@ -37,19 +23,12 @@ const twofaPwd = ref('')
 const twofaError = ref('')
 const twofaLoading = ref(false)
 
-// 节点令牌（全局共享 NODE_TOKEN）
 const nodeToken = reactive({ value: '', updated_at: 0 })
 const nodeTokenShow = ref(false)
 const nodeTokenLoading = ref(false)
 const nodeTokenError = ref('')
 
 onMounted(async () => {
-  await hub.fetchConfig()
-  lot.enabled = hub.lot.enabled
-  lot.value = hub.lot.value
-  dispatch.mode = hub.dispatch.mode
-  dispatch.position_scope = hub.dispatch.position_scope
-  filters.value = parseFilterRules(hub.filters)
   await load2faStatus()
   await loadNodeToken()
 })
@@ -222,27 +201,6 @@ function flash(msg: string): void {
   setTimeout(() => (savedFlag.value = ''), 1800)
 }
 
-async function saveLot(): Promise<void> {
-  await hub.saveLot({ enabled: lot.enabled, value: lot.value })
-  flash('全局手数已保存')
-}
-async function saveDispatch(): Promise<void> {
-  await hub.saveDispatch({ mode: dispatch.mode, position_scope: dispatch.position_scope })
-  flash('分发策略已保存')
-}
-async function saveFilters(): Promise<void> {
-  filtersError.value = ''
-  const payload = serializeFilterRules(filters.value)
-  const errors = validateFilterRules(payload)
-  if (errors.length) {
-    filtersError.value = errors[0]
-    return
-  }
-  await hub.saveFilters(payload)
-  filters.value = parseFilterRules(hub.filters)
-  flash('区间过滤规则已保存')
-}
-
 async function changePassword(): Promise<void> {
   pwdError.value = ''
   if (!pwd.current || !pwd.new) {
@@ -287,63 +245,7 @@ async function changePassword(): Promise<void> {
     <span v-if="savedFlag" class="tag green">{{ savedFlag }}</span>
   </div>
 
-  <div class="tabs">
-    <button
-      v-for="t in tabs"
-      :key="t.key"
-      type="button"
-      class="tab"
-      :class="{ active: tab === t.key }"
-      @click="tab = t.key"
-    >
-      {{ t.label }}
-    </button>
-  </div>
-
-  <div v-if="tab === 'system'" class="grid layout-config">
-    <div class="card card-pad">
-      <strong>全局手数</strong>
-      <p class="muted" style="font-size: 12px">开启后，所有「跟随全局」策略的节点统一使用该手数。</p>
-      <div class="form-grid">
-        <div>
-          <label>启用全局手数</label>
-          <select v-model="lot.enabled"><option :value="true">启用</option><option :value="false">关闭</option></select>
-        </div>
-        <div><label>手数</label><input v-model.number="lot.value" type="number" step="0.01" :disabled="!lot.enabled" /></div>
-        <button class="btn-primary" @click="saveLot">保存</button>
-      </div>
-    </div>
-
-    <div class="card card-pad">
-      <strong>分发策略</strong>
-      <p class="muted" style="font-size: 12px">同步模式：所有节点并发执行；轮询模式：按顺序依次领取执行。</p>
-      <div class="form-grid">
-        <div>
-          <label>分发模式</label>
-          <select v-model="dispatch.mode"><option value="sync">全员同步</option><option value="poll">轮询领取</option></select>
-        </div>
-        <div>
-          <label>持仓判定范围</label>
-          <select v-model="dispatch.position_scope">
-            <option value="symbol">按品种（同品种无持仓才开）</option>
-            <option value="account">按账户（账户无任何持仓才开）</option>
-          </select>
-        </div>
-        <button class="btn-primary" @click="saveDispatch">保存</button>
-      </div>
-    </div>
-
-    <div class="card card-pad span-full">
-      <strong>多区间方向过滤</strong>
-      <div style="margin-top: 12px">
-        <FilterRulesEditor v-model="filters" />
-      </div>
-      <div v-if="filtersError" style="color: var(--red); font-size: 12px; margin-top: 10px">{{ filtersError }}</div>
-      <div class="row" style="margin-top: 12px"><button class="btn-primary" @click="saveFilters">保存过滤规则</button></div>
-    </div>
-  </div>
-
-  <div v-else class="grid layout-config">
+  <div class="grid layout-config">
     <div class="card card-pad span-full">
       <div class="row between">
         <strong>节点令牌 (NODE_TOKEN)</strong>
