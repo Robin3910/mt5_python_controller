@@ -134,7 +134,8 @@ watch(
       </div>
     </div>
 
-    <div v-if="items.length" class="list-cards mobile-only">
+    <template v-if="items.length">
+    <div class="list-cards mobile-only">
       <div
         v-for="row in items"
         :key="row.signal_id"
@@ -188,8 +189,8 @@ watch(
       </div>
     </div>
 
-    <div v-if="items.length" class="events-table-wrap desktop-only">
-    <table v-if="items.length" class="events-table">
+    <div class="events-table-wrap desktop-only">
+    <table class="events-table">
       <thead>
         <tr>
           <th class="col-expand"></th>
@@ -229,18 +230,19 @@ watch(
           </tr>
           <tr v-if="isExpanded(row.signal_id)" class="detail-row">
             <td colspan="9">
-              <div style="padding: 8px 0 4px">
-                <div class="grid cols-2" style="gap: 12px; margin-bottom: 12px">
-                  <div class="kv"><span class="k">信号 ID</span><span class="v" style="font-size: 12px">{{ row.signal_id }}</span></div>
+              <div class="events-detail">
+                <div class="grid cols-2 events-detail-kv" style="gap: 12px; margin-bottom: 12px">
+                  <div class="kv"><span class="k">信号 ID</span><span class="v events-break">{{ row.signal_id }}</span></div>
                   <div class="kv"><span class="k">分发模式</span><span class="v">{{ row.dispatch_mode || '—' }}</span></div>
                   <div class="kv"><span class="k">SL</span><span class="v">{{ row.sl ?? '—' }}</span></div>
                   <div class="kv"><span class="k">TP</span><span class="v">{{ row.tp ?? '—' }}</span></div>
-                  <div class="kv"><span class="k">备注</span><span class="v" style="font-size: 12px">{{ row.comment || '—' }}</span></div>
+                  <div class="kv"><span class="k">备注</span><span class="v events-break">{{ row.comment || '—' }}</span></div>
                 </div>
                 <div class="muted" style="font-size: 12px; margin-bottom: 6px">原始 Webhook 参数</div>
-                <pre class="token-box" style="font-size: 12px; white-space: pre-wrap; margin-bottom: 16px">{{ fmtPayload(row.raw_payload) }}</pre>
+                <pre class="token-box events-payload">{{ fmtPayload(row.raw_payload) }}</pre>
                 <div class="muted" style="font-size: 12px; margin-bottom: 8px">各节点处理情况</div>
-                <table v-if="row.dispatches.length">
+                <div v-if="row.dispatches.length" class="events-detail-wrap">
+                <table class="events-detail-table">
                   <thead>
                     <tr>
                       <th>节点</th><th>状态</th><th>闸门</th><th class="right">决策手数</th>
@@ -253,14 +255,15 @@ watch(
                       <td><span class="tag" :class="dispatchTag(d.status).cls">{{ dispatchTag(d.status).text }}</span></td>
                       <td>{{ d.gate_result === 'skipped' ? '被过滤' : '通过' }}</td>
                       <td class="right">{{ d.decided_vol ?? '—' }}</td>
-                      <td class="muted" style="font-size: 12px; max-width: 220px">{{ d.skip_reason || '—' }}</td>
+                      <td class="muted events-break">{{ d.skip_reason || '—' }}</td>
                       <td>{{ d.order ?? '—' }}</td>
-                      <td class="muted" style="font-size: 12px">{{ d.error || '—' }}</td>
-                      <td class="muted" style="font-size: 12px">{{ fmtTime(d.dispatched_at) }}</td>
-                      <td class="muted" style="font-size: 12px">{{ fmtTime(d.finished_at) }}</td>
+                      <td class="muted events-break">{{ d.error || '—' }}</td>
+                      <td class="muted col-time">{{ fmtTime(d.dispatched_at) }}</td>
+                      <td class="muted col-time">{{ fmtTime(d.finished_at) }}</td>
                     </tr>
                   </tbody>
                 </table>
+                </div>
                 <div v-else class="muted" style="font-size: 13px">该信号未产生节点分发明细。</div>
               </div>
             </td>
@@ -268,6 +271,8 @@ watch(
         </template>
       </tbody>
     </table>
+    </div>
+    </template>
 
     <div v-else-if="!loading" class="muted" style="font-size: 13px; padding: 8px 0">暂无 Webhook 信号记录。</div>
     <div v-else class="muted" style="font-size: 13px; padding: 8px 0">加载中…</div>
@@ -280,4 +285,98 @@ watch(
       </div>
     </div>
   </div>
+  </div>
 </template>
+
+<style scoped>
+.events-page {
+  width: 100%;
+  min-width: 0;
+}
+
+.events-panel {
+  width: 100%;
+  min-width: 0;
+}
+
+.events-table-wrap {
+  width: 100%;
+  min-width: 0;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.events-table,
+.events-detail-table {
+  width: 100%;
+  min-width: 0;
+  table-layout: fixed;
+}
+
+.events-table th,
+.events-table td,
+.events-detail-table th,
+.events-detail-table td {
+  white-space: normal;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  vertical-align: top;
+  font-size: 12px;
+}
+
+.events-table .col-expand { width: 28px; white-space: nowrap; }
+.events-table .col-time { width: 11%; white-space: nowrap; }
+.events-table .col-action { width: 7%; white-space: nowrap; }
+.events-table .col-symbol { width: 9%; }
+.events-table .col-volume { width: 6%; white-space: nowrap; }
+.events-table .col-parse { width: 7%; white-space: nowrap; }
+.events-table .col-status { width: 8%; white-space: nowrap; }
+.events-table .col-summary { width: auto; }
+.events-table .col-ip { width: 10%; }
+
+.events-detail {
+  padding: 8px 0 4px;
+  min-width: 0;
+}
+
+.events-detail-kv {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
+}
+
+.events-detail-wrap {
+  width: 100%;
+  min-width: 0;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.events-detail-table .col-time {
+  white-space: nowrap;
+}
+
+.events-payload {
+  width: 100%;
+  max-width: 100%;
+  margin-bottom: 16px;
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+
+.events-break {
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 1100px) {
+  .events-table .col-time { width: 14%; }
+  .events-table .col-ip { width: 12%; }
+}
+
+@media (max-width: 900px) {
+  .events-table,
+  .events-detail-table {
+    table-layout: auto;
+  }
+}
+</style>
