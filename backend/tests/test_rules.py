@@ -31,6 +31,21 @@ def test_resolve_volume_capped():
     assert rules.resolve_volume(node, 99, {"enabled": False}, SYMBOL) == 1.0  # MAX_LOT_SIZE
 
 
+def test_node_has_symbol_config():
+    assert rules.node_has_symbol_config({"filters": {"EURUSD": {"lot_mode": "fixed"}}}, "EURUSD")
+    assert rules.node_has_symbol_config({"filters": {"EURUSD.m": {"lot_mode": "fixed"}}}, "EURUSD")
+    assert not rules.node_has_symbol_config({"filters": None}, "EURUSD")
+    assert not rules.node_has_symbol_config({"filters": {}}, "EURUSD")
+    assert not rules.node_has_symbol_config({}, "EURUSD")
+    assert not rules.node_has_symbol_config({"filters": {"GBPUSD": {"lot_mode": "fixed"}}}, "EURUSD")
+
+
+def test_node_symbol_not_configured_reason():
+    reason = rules.node_symbol_not_configured_reason("XAUUSD.m")
+    assert "XAUUSD" in reason
+    assert "拒收" in reason
+
+
 def test_resolve_volume_fallback_node_defaults():
     node = {"lot_mode": "fixed", "lot": 0.08}
     assert rules.resolve_volume(node, 0.5, {"enabled": True, "value": 0.2}, SYMBOL) == 0.08

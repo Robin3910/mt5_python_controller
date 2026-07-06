@@ -5,6 +5,7 @@ import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useHubStore } from '@/stores/hub'
 import { copyToClipboard } from '@/utils/clipboard'
+import { confirmAction } from '@/utils/confirm'
 
 const hub = useHubStore()
 const auth = useAuthStore()
@@ -56,7 +57,7 @@ async function copyNodeToken(): Promise<void> {
 }
 
 async function rotateNodeToken(): Promise<void> {
-  if (!confirm('重置全局节点令牌？所有节点的 .env 都需更新后才能继续接入，请确认。')) return
+  if (!(await confirmAction('重置全局节点令牌？\n\n所有节点的 .env 都需更新后才能继续接入。', '确认重置令牌'))) return
   nodeTokenLoading.value = true
   nodeTokenError.value = ''
   try {
@@ -97,6 +98,7 @@ function map2faError(detail?: string): string {
 }
 
 async function start2faSetup(): Promise<void> {
+  if (!(await confirmAction('确认开始绑定双因素认证？\n\n将生成新的验证器密钥。', '确认绑定 2FA'))) return
   twofaError.value = ''
   twofaLoading.value = true
   try {
@@ -118,6 +120,7 @@ async function confirm2faBind(): Promise<void> {
     twofaError.value = '请输入验证码'
     return
   }
+  if (!(await confirmAction('确认绑定验证器并开启双因素认证？', '确认开启 2FA'))) return
   twofaLoading.value = true
   try {
     await auth.confirm2fa(twofaCode.value.trim())
@@ -139,6 +142,7 @@ async function enable2fa(): Promise<void> {
     twofaError.value = '请输入验证码以开启 2FA'
     return
   }
+  if (!(await confirmAction('确认开启双因素认证？\n\n登录时将需要额外输入验证码。', '确认开启 2FA'))) return
   twofaLoading.value = true
   try {
     await auth.enable2fa(twofaCode.value.trim())
@@ -159,6 +163,7 @@ async function disable2fa(): Promise<void> {
     twofaError.value = '请输入当前密码'
     return
   }
+  if (!(await confirmAction('确认关闭双因素认证？\n\n关闭后登录将不再需要验证码。', '确认关闭 2FA'))) return
   twofaLoading.value = true
   try {
     await auth.disable2fa(twofaPwd.value, twofa.enabled ? twofaCode.value.trim() : undefined)
@@ -180,6 +185,7 @@ async function reset2fa(): Promise<void> {
     twofaError.value = '请输入当前密码'
     return
   }
+  if (!(await confirmAction('确认重置双因素认证绑定？\n\n需重新扫码绑定验证器。', '确认重置 2FA'))) return
   twofaLoading.value = true
   try {
     await auth.reset2fa(twofaPwd.value, twofa.enabled ? twofaCode.value.trim() : undefined)
@@ -215,6 +221,7 @@ async function changePassword(): Promise<void> {
     pwdError.value = '两次输入的新密码不一致'
     return
   }
+  if (!(await confirmAction('确认修改管理员密码？\n\n修改成功后需使用新密码重新登录。', '确认修改密码'))) return
   pwdLoading.value = true
   try {
     await auth.changePassword(pwd.current, pwd.new)

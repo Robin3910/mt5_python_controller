@@ -36,6 +36,20 @@ def _node_symbol_rule(node: dict, symbol: str) -> Optional[dict]:
     return None
 
 
+def node_has_symbol_config(node: dict, symbol: str) -> bool:
+    """节点 filters 中是否已为该品种配置按币种条目（非空 dict 且能匹配到 symbol）。"""
+    node_filters = node.get("filters") or {}
+    if not isinstance(node_filters, dict) or not node_filters:
+        return False
+    return _lookup_symbol_config(node_filters, symbol) is not None
+
+
+def node_symbol_not_configured_reason(symbol: str) -> str:
+    """节点未配置该品种时的拒收说明（落库 skip_reason / 节点信号日志）。"""
+    sym = base_symbol(symbol) or symbol
+    return f"节点未配置：{sym}未在节点按币种配置中，拒收"
+
+
 def resolve_volume(node: dict, signal_volume: float, global_lot: dict, symbol: str) -> float:
     """9.4——按节点该品种的手数策略决定实际手数，并以 MAX_LOT_SIZE 封顶。"""
     sf = _node_symbol_rule(node, symbol)

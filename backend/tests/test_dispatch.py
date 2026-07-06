@@ -33,6 +33,12 @@ def patch_side_effects(monkeypatch):
     manager.admins.clear()
 
 
+def node_symbol_filters(symbol="EURUSD", **extra):
+    rule = {"lot_mode": "signal", "follow_sync": True, "follow_poll": True}
+    rule.update(extra)
+    return {symbol: rule}
+
+
 def mk_node(node_id, **kw):
     d = {
         "node_id": node_id,
@@ -41,7 +47,7 @@ def mk_node(node_id, **kw):
         "lot_mode": "signal",
         "lot": None,
         "poll_order": 0,
-        "filters": None,
+        "filters": node_symbol_filters(),
         "created_at": 0,
     }
     d.update(kw)
@@ -194,6 +200,37 @@ async def test_close_signal_sends_close_to_online_nodes(store, monkeypatch):
     assert res["mode"] == "close"
     assert all(s[1]["cmd"] == "close" for s in sent)
     assert {s[0] for s in sent} == {"nd_a", "nd_b"}
+
+
+async def test_node_without_symbol_config_skipped(store, monkeypatch):
+    dispatches = []
+
+    async def capture_dispatch(*args, **kwargs):
+        dispatches.append(args)
+
+    monkeypatch.setattr(persist, "record_dispatch", capture_dispatch)
+
+    await _online(store, mk_node("nd_a", filters=None))
+    await set_symbol_filters(store, "EURUSD", mode="sync")
+    sent = []
+
+    async def fake_send(node_id, msg):
+        sent.append((node_id, msg))
+        return True
+
+    monkeypatch.setattr(manager, "send_to_node", fake_send)
+
+    d = Dispatcher(store)
+    res = await d.dispatch(TradingSignal(action="BUY", symbol="EURUSD", volume=0.1), "sig_no_cfg")
+
+    assert res["mode"] == "sync"
+    assert res["targets"] == 0
+    assert sent == []
+    assert len(dispatches) == 1
+    assert dispatches[0][1] == "nd_a"
+    assert dispatches[0][3] == "skipped"
+    assert "节点未配置" in (dispatches[0][4] or "")
+    assert "拒收" in (dispatches[0][4] or "")
 
 
 async def test_unconfigured_symbol_rejected(store):

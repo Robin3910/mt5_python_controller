@@ -16,6 +16,7 @@ import {
   createEmptySymbolRule,
   exampleFilterRules,
 } from '@/utils/filterRules'
+import { confirmAction } from '@/utils/confirm'
 
 const props = withDefaults(defineProps<{ mode?: 'global' | 'node' }>(), { mode: 'global' })
 
@@ -53,21 +54,23 @@ function updateNodeRule(symbol: string, patch: Partial<NodeSymbolDispatchRule>):
   model.value = { ...cfg, [symbol]: { ...cur, ...patch } }
 }
 
-function removeSymbol(symbol: string): void {
+async function removeSymbol(symbol: string): Promise<void> {
   const label = isGlobal.value ? '过滤规则' : '分发配置'
-  if (!confirm(`删除品种 ${symbol} 的${label}？`)) return
+  if (!(await confirmAction(`确认删除品种 ${symbol} 的${label}？`, '确认删除'))) return
   const next = { ...model.value }
   delete next[symbol]
   model.value = next
 }
 
-function confirmAddSymbol(): void {
+async function confirmAddSymbol(): Promise<void> {
   const key = newSymbol.value.trim().toUpperCase()
   if (!key) return
   if (model.value[key]) {
     alert(`品种 ${key} 已存在`)
     return
   }
+  const label = isGlobal.value ? '过滤规则' : '分发配置'
+  if (!(await confirmAction(`确认添加品种 ${key} 的${label}？`, '确认添加'))) return
   if (isGlobal.value) {
     model.value = { ...(model.value as FilterRulesConfig), [key]: createEmptySymbolRule() }
   } else {
@@ -110,15 +113,16 @@ function toggleDirection(symbol: string, index: number, dir: FilterDirection, ch
   updateInterval(symbol, index, { allow: [...allow] })
 }
 
-function removeInterval(symbol: string, index: number): void {
+async function removeInterval(symbol: string, index: number): Promise<void> {
   const rule = (model.value as FilterRulesConfig)[symbol]
   if (!rule) return
+  if (!(await confirmAction(`确认删除品种 ${symbol} 的第 ${index + 1} 条价格区间？`, '确认删除'))) return
   updateRule(symbol, { intervals: rule.intervals.filter((_, i) => i !== index) })
 }
 
-function loadExample(): void {
+async function loadExample(): Promise<void> {
   if (!isGlobal.value) return
-  if (Object.keys(model.value).length && !confirm('载入示例将覆盖当前配置，是否继续？')) return
+  if (Object.keys(model.value).length && !(await confirmAction('载入示例将覆盖当前配置，是否继续？', '确认载入示例'))) return
   model.value = exampleFilterRules()
 }
 

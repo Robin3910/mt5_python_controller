@@ -5,6 +5,7 @@ import { useHubStore } from '@/stores/hub'
 import FilterRulesEditor from '@/components/FilterRulesEditor.vue'
 import type { FilterRulesConfig } from '@/api/types'
 import { parseFilterRules, serializeFilterRules, validateFilterRules } from '@/utils/filterRules'
+import { confirmAction } from '@/utils/confirm'
 
 const hub = useHubStore()
 
@@ -26,6 +27,8 @@ function flash(msg: string): void {
 }
 
 async function saveLot(): Promise<void> {
+  const state = lot.enabled ? `启用，手数 ${lot.value}` : '关闭'
+  if (!(await confirmAction(`确认保存全局手数配置？\n\n当前：${state}`))) return
   await hub.saveLot({ enabled: lot.enabled, value: lot.value })
   flash('全局手数已保存')
 }
@@ -37,6 +40,8 @@ async function saveFilters(): Promise<void> {
     filtersError.value = errors[0]
     return
   }
+  const count = Object.keys(payload).length
+  if (!(await confirmAction(`确认保存过滤规则？\n\n共 ${count} 个品种，保存后立即影响信号准入与分发。`))) return
   await hub.saveFilters(payload)
   filters.value = parseFilterRules(hub.filters)
   flash('过滤规则已保存')

@@ -8,6 +8,7 @@ import { NODE_FORM_FIELD_HELP } from '@/constants/nodeFormHelp'
 import { useHubStore } from '@/stores/hub'
 import type { NodeDispatchFiltersConfig, NodeOut } from '@/api/types'
 import { parseNodeDispatchFilters, serializeNodeDispatchFilters, validateNodeDispatchFilters } from '@/utils/filterRules'
+import { confirmAction } from '@/utils/confirm'
 
 const hub = useHubStore()
 const router = useRouter()
@@ -73,7 +74,7 @@ async function closeSelected(): Promise<void> {
   const nodes = hub.nodes.filter((n) => selectedIds.value.has(n.node_id))
   if (!nodes.length) return
   const names = nodes.map((n) => `· ${n.name} (${n.node_id})`).join('\n')
-  if (!confirm(`确认对以下 ${nodes.length} 个节点执行全部平仓？\n\n${names}\n\n此操作不可撤销。`)) return
+  if (!(await confirmAction(`确认对以下 ${nodes.length} 个节点执行全部平仓？\n\n${names}\n\n此操作不可撤销。`, '确认平仓'))) return
   closing.value = true
   try {
     const res = await hub.closeBatch(
@@ -136,6 +137,8 @@ async function save(): Promise<void> {
     }
     if (formMode.value === 'create') {
       if (!form.mt5_login) return
+      const login = form.mt5_login
+      if (!(await confirmAction(`确认创建节点？\n\nMT5 登录号：${login}`))) return
       try {
         await hub.createNode({ ...payload, mt5_login: form.mt5_login })
       } catch (e: unknown) {
@@ -148,6 +151,9 @@ async function save(): Promise<void> {
         return
       }
     } else {
+      const label = form.name || editingId.value
+      const enabledText = form.enabled ? '启用' : '禁用'
+      if (!(await confirmAction(`确认更新节点「${label}」？\n\n启用状态：${enabledText}`))) return
       await hub.updateNode(editingId.value, { ...payload, enabled: form.enabled })
     }
     showForm.value = false
@@ -157,11 +163,13 @@ async function save(): Promise<void> {
 }
 
 async function remove(n: NodeOut): Promise<void> {
-  if (!confirm(`确认删除节点「${n.name}」？该操作不可恢复。`)) return
+  if (!(await confirmAction(`确认删除节点「${n.name}」？\n\n该操作不可恢复。`, '确认删除'))) return
   await hub.deleteNode(n.node_id)
 }
 
 async function toggleEnabled(n: NodeOut): Promise<void> {
+  const next = n.enabled ? '禁用' : '启用'
+  if (!(await confirmAction(`确认${next}节点「${n.name}」？\n\n${next}后将${n.enabled ? '无法接入且不参与分发' : '恢复正常跟单'}。`))) return
   await hub.updateNode(n.node_id, { enabled: !n.enabled })
 }
 </script>

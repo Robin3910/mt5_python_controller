@@ -38,14 +38,24 @@ class Dispatcher:
     def __init__(self, store: RedisStore) -> None:
         self.store = store
 
-    async def _eligible_nodes(self, follow: str, symbol: str, filters: dict) -> list[dict]:
-        """筛选“可参与本次分发”的节点：已启用 + 在线 + 该币种参与对应分发模式。"""
+    async def _eligible_nodes(
+        self, follow: str, symbol: str, filters: dict, signal_id: str,
+    ) -> list[dict]:
+        """筛选“可参与本次分发”的节点：已启用 + 在线 + 已配按币种 + 参与对应分发模式。
+
+        中控台已配但节点未配该品种时，对该节点拒收并写入节点信号日志（skipped）。
+        """
         nodes = await self.store.all_nodes()
         out: list[dict] = []
         for n in nodes:
             if not n.get("enabled", True):
                 continue
             if not manager.is_node_online(n["node_id"]):
+                continue
+            if not rules.node_has_symbol_config(n, symbol):
+                await self._skip(
+                    signal_id, n["node_id"], rules.node_symbol_not_configured_reason(symbol),
+                )
                 continue
             if not rules.node_participates(n, symbol, follow, filters):
                 continue
@@ -89,7 +99,7 @@ class Dispatcher:
     ) -> int:
         """9.5 全员同步：对所有目标节点并发下发（fire-and-forget）。"""
         global_lot = await self.store.get_lot_global()
-        targets = await self._eligible_nodes("sync", signal.symbol, filters)
+        targets = await self._eligible_nodes("sync", signal.symbol, filters, signal_id)
         # 并发执行；单个节点异常不影响其它节点
         await asyncio.gather(
             *[
@@ -104,7 +114,7 @@ class Dispatcher:
         self, signal: TradingSignal, signal_id: str, scope: str, filters: dict,
     ) -> int:
         """9.6 轮询领取：固定节点顺序 + 进度写入 Redis，再把 signal_id 入队。"""
-        targets = await self._eligible_nodes("poll", signal.symbol, filters)
+        targets = await self._eligible_nodes("poll", signal.symbol, filters, signal_id)
         # 排序规则：poll_order 小者优先，其次按创建时间
         targets.sort(
             key=lambda n: (rules.node_poll_order(n, signal.symbol), n.get("created_at", 0)),

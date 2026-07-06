@@ -7,6 +7,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { useHubStore } from '@/stores/hub'
 import type { AccountSnapshot, NodeDispatchRecord, NodeFeedItem, NodeOut } from '@/api/types'
 import { parseNodeDispatchFilters } from '@/utils/filterRules'
+import { confirmAction } from '@/utils/confirm'
 
 const route = useRoute()
 const router = useRouter()
@@ -203,14 +204,16 @@ function feedDetail(row: NodeFeedItem): string {
 // ---- 操作 ----
 async function toggleEnabled(): Promise<void> {
   if (!node.value) return
+  const next = node.value.enabled ? '禁用' : '启用'
+  if (!(await confirmAction(`确认${next}节点「${node.value.name}」？`, `确认${next}`))) return
   await hub.updateNode(id.value, { enabled: !node.value.enabled })
 }
 async function closeNodeAll(): Promise<void> {
-  if (!confirm('确认平掉该节点的全部持仓？')) return
+  if (!(await confirmAction('确认平掉该节点的全部持仓？', '确认平仓'))) return
   await hub.closeNode(id.value, { target: 'all' })
 }
 async function closeTicket(ticket: number): Promise<void> {
-  if (!confirm(`平掉订单 #${ticket}？`)) return
+  if (!(await confirmAction(`确认平掉订单 #${ticket}？`, '确认平仓'))) return
   await hub.closeNode(id.value, { target: 'ticket', ticket })
 }
 </script>

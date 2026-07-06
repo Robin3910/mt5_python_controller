@@ -3,6 +3,7 @@
 import { computed, onMounted } from 'vue'
 import { useHubStore } from '@/stores/hub'
 import type { AccountSnapshot, NodeOut } from '@/api/types'
+import { confirmAction } from '@/utils/confirm'
 
 const hub = useHubStore()
 
@@ -26,11 +27,11 @@ const totalPositions = computed(() =>
 )
 
 async function closeNodeAll(n: NodeOut): Promise<void> {
-  if (!confirm(`确认平掉节点「${n.name}」的全部持仓？`)) return
+  if (!(await confirmAction(`确认平掉节点「${n.name}」的全部持仓？`, '确认平仓'))) return
   await hub.closeNode(n.node_id, { target: 'all' })
 }
 async function closeTicket(n: NodeOut, ticket: number): Promise<void> {
-  if (!confirm(`平掉订单 #${ticket}？`)) return
+  if (!(await confirmAction(`确认平掉订单 #${ticket}？`, '确认平仓'))) return
   await hub.closeNode(n.node_id, { target: 'ticket', ticket })
 }
 </script>
