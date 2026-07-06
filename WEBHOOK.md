@@ -238,7 +238,27 @@ SYMBOL=GBPUSD long LOT=0.1
 {"status": "duplicate", "action": "BUY", "symbol": "EURUSD"}
 ```
 
-### 9.3 错误响应
+### 9.3 品种未登记 `200`（拒收，不分发）
+
+解析成功，但 `symbol` **未在中控台**（`GET/PUT /api/config/filters`）登记时返回：
+
+```json
+{
+  "status": "rejected",
+  "signal_id": "sig_18f...",
+  "action": "BUY",
+  "symbol": "EURUSD",
+  "volume": 0.1,
+  "mode": "rejected",
+  "targets": 0,
+  "reason": "品种未配置：EURUSD未在中控台配置，信号拒收"
+}
+```
+
+- HTTP 仍为 `200`（与 `duplicate` 相同）；TradingView 若只校验 2xx 会显示投递成功，需在管理端核对。
+- 处理：Web「中控台」→ 添加该品种 → 保存过滤规则。
+
+### 9.4 错误响应
 
 | 状态码 | body | 触发条件 |
 | --- | --- | --- |
@@ -285,6 +305,7 @@ SYMBOL=GBPUSD long LOT=0.1
 | 纯文本 `SYMBOL=US30 buy` | ⚠️ 解析出 `symbol="SYMBOL"` | `US` 仅 2 字母不满足标签正则，「SYMBOL」一词被裸 6 字母规则误命中（见 §5 坑位） |
 | `{"action":"buy","symbol":"EURUSD","allow_position":"true"}` | ⚠️ `allow_position=false` | `"true"` 是字符串，`int("true")` 抛错；只有能转非零整数的值才生效（见 §4.3） |
 | `{"action":"buy","symbol":"EURUSD","allow_position":2}` | ⚠️ `allow_position=true` | 任意非零整数都为 `true`，不止 `1`（见 §4.3） |
+| `{"action":"buy","symbol":"NZDUSD"}`（中控台未登记 NZDUSD） | ⚠️ `status: rejected` | 解析成功但品种未在中控台登记，不分发（见 §9.3） |
 
 ---
 
@@ -359,7 +380,7 @@ curl -X POST http://localhost:8000/webhook \
 >
 > 全场景回归测试：
 > - `backend/tests/test_parser.py` —— 纯解析层（动作/品种/手数/止盈止损/`allow_position` 精确规则/文本模式坑位/格式三回退/校验规则）。
-> - `backend/tests/test_webhook.py` —— HTTP 端到端（token 4 种传入方式、IP 白名单与 `X-Forwarded-For`、白名单→鉴权→解析的顺序、三种请求体形态、去重、各类 400/401/403、响应字段）。
+> - `backend/tests/test_webhook.py` —— HTTP 端到端（token 4 种传入方式、IP 白名单与 `X-Forwarded-For`、白名单→鉴权→解析的顺序、三种请求体形态、去重、**未登记品种 rejected**、各类 400/401/403、响应字段）。
 > - `backend/tests/test_api.py` —— 含 webhook→分发→节点回报的全链路冒烟。
 >
 > 运行：`cd backend && python -m pytest tests/test_parser.py tests/test_webhook.py -q`

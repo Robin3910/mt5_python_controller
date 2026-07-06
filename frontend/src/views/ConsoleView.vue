@@ -50,6 +50,15 @@ async function saveFilters(): Promise<void> {
   </div>
 
   <div class="grid layout-config">
+    <div class="card card-pad span-full">
+      <strong>多区间方向过滤</strong>
+      <div style="margin-top: 12px">
+        <FilterRulesEditor v-model="filters" mode="global" />
+      </div>
+      <div v-if="filtersError" style="color: var(--red); font-size: 12px; margin-top: 10px">{{ filtersError }}</div>
+      <div class="row" style="margin-top: 12px"><button class="btn-primary" @click="saveFilters">保存过滤规则</button></div>
+    </div>
+
     <div class="card card-pad">
       <strong>全局手数</strong>
       <p class="muted" style="font-size: 12px">开启后，所有「跟随全局」策略的节点统一使用该手数。</p>
@@ -61,15 +70,6 @@ async function saveFilters(): Promise<void> {
         <div><label>手数</label><input v-model.number="lot.value" type="number" step="0.01" :disabled="!lot.enabled" /></div>
         <button class="btn-primary" @click="saveLot">保存</button>
       </div>
-    </div>
-
-    <div class="card card-pad span-full">
-      <strong>多区间方向过滤</strong>
-      <div style="margin-top: 12px">
-        <FilterRulesEditor v-model="filters" mode="global" />
-      </div>
-      <div v-if="filtersError" style="color: var(--red); font-size: 12px; margin-top: 10px">{{ filtersError }}</div>
-      <div class="row" style="margin-top: 12px"><button class="btn-primary" @click="saveFilters">保存过滤规则</button></div>
     </div>
   </div>
 </template>
