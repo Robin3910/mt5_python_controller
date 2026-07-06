@@ -71,17 +71,23 @@ class Dispatcher:
         ]
 
     async def dispatch(self, signal: TradingSignal, signal_id: str,
-                       source_ip: Optional[str] = None) -> dict:
+                       source_ip: Optional[str] = None,
+                       raw_payload: Optional[str] = None) -> dict:
         """分发入口：按信号品种的分发配置选择 sync / poll，CLOSE 走专用广播。"""
         filters = await self.store.get_filters()
         mode, scope, reject_reason = rules.resolve_dispatch_config(signal.symbol, filters)
         if reject_reason:
-            await persist.record_signal(signal_id, signal, source_ip, True, None, status="rejected")
+            await persist.record_signal(
+                signal_id, signal, source_ip, True, None, status="rejected",
+                raw_payload=raw_payload,
+            )
             logger.info("signal rejected: %s", reject_reason)
             return {"mode": "rejected", "targets": 0, "reason": reject_reason}
 
         # 先落库一条信号历史（best-effort，不阻塞交易）
-        await persist.record_signal(signal_id, signal, source_ip, True, mode)
+        await persist.record_signal(
+            signal_id, signal, source_ip, True, mode, raw_payload=raw_payload,
+        )
 
         if signal.action == "CLOSE":
             n = await self._dispatch_close(signal, signal_id)

@@ -35,6 +35,7 @@ function logout(): void {
         <RouterLink to="/nodes">节点</RouterLink>
         <RouterLink to="/console">中控台</RouterLink>
         <RouterLink to="/config">配置</RouterLink>
+        <RouterLink to="/events">事件</RouterLink>
       </nav>
       <div class="spacer"></div>
       <span class="pill">在线 {{ hub.onlineCount }}/{{ hub.nodes.length }}</span>

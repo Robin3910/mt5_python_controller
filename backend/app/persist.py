@@ -7,7 +7,7 @@ from dataclasses import asdict
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 
 from .db import SessionLocal
 from .orm import AuditLog, SignalDispatch, SignalHistory
@@ -16,15 +16,19 @@ logger = logging.getLogger(__name__)
 
 
 async def record_signal(signal_id, signal, source_ip=None, parsed_ok=True,
-                        dispatch_mode=None, status="dispatching") -> None:
+                        dispatch_mode=None, status="dispatching",
+                        raw_payload: Optional[str] = None) -> None:
     """落库一条信号历史。"""
+    payload_str = raw_payload
+    if payload_str is None and signal is not None:
+        payload_str = str(asdict(signal))
     try:
         async with SessionLocal() as s:
             s.add(
                 SignalHistory(
                     signal_id=signal_id,
                     source_ip=source_ip,
-                    raw_payload=str(asdict(signal)) if signal else None,
+                    raw_payload=payload_str,
                     action=getattr(signal, "action", None),
                     symbol=getattr(signal, "symbol", None),
                     volume=getattr(signal, "volume", None),
@@ -170,6 +174,99 @@ def _dispatch_rows(rows) -> list[dict]:
         }
         for d, sig in rows
     ]
+
+
+def _webhook_signal_filter():
+    """排除手动平仓等非 Webhook 来源的信号历史。"""
+    return or_(SignalHistory.dispatch_mode.is_(None), SignalHistory.dispatch_mode != "manual")
+
+
+def _signal_event_row(sig: SignalHistory, dispatches: list[dict]) -> dict:
+    return {
+        "signal_id": sig.signal_id,
+        "received_at": sig.received_at.timestamp() if sig.received_at else None,
+        "source_ip": sig.source_ip,
+        "raw_payload": sig.raw_payload,
+        "action": sig.action,
+        "symbol": sig.symbol,
+        "volume": sig.volume,
+        "sl": sig.sl,
+        "tp": sig.tp,
+        "comment": sig.comment,
+        "parsed_ok": sig.parsed_ok,
+        "dispatch_mode": sig.dispatch_mode,
+        "status": sig.status,
+        "dispatches": dispatches,
+    }
+
+
+def _signal_dispatch_row(d: SignalDispatch, node_name: Optional[str]) -> dict:
+    return {
+        "id": d.id,
+        "node_id": d.node_id,
+        "node_name": node_name,
+        "decided_vol": d.decided_vol,
+        "gate_result": d.gate_result,
+        "skip_reason": d.skip_reason,
+        "status": d.status,
+        "retcode": d.retcode,
+        "order": d.order_ticket,
+        "deal": d.deal,
+        "price": d.price,
+        "error": d.error,
+        "dispatched_at": d.dispatched_at.timestamp() if d.dispatched_at else None,
+        "finished_at": d.finished_at.timestamp() if d.finished_at else None,
+    }
+
+
+async def recent_webhook_events(page: int = 1, page_size: int = 20,
+                                node_names: Optional[dict[str, str]] = None) -> dict:
+    """分页读取 Webhook 信号事件（含各节点后续处理明细）。"""
+    page = max(1, page)
+    page_size = max(1, min(page_size, 100))
+    offset = (page - 1) * page_size
+    names = node_names or {}
+    try:
+        async with SessionLocal() as s:
+            filt = _webhook_signal_filter()
+            total = (
+                await s.execute(select(func.count()).select_from(SignalHistory).where(filt))
+            ).scalar_one()
+
+            rows = (
+                await s.execute(
+                    select(SignalHistory)
+                    .where(filt)
+                    .order_by(SignalHistory.received_at.desc())
+                    .offset(offset)
+                    .limit(page_size)
+                )
+            ).scalars().all()
+
+            signal_ids = [r.signal_id for r in rows]
+            dispatch_map: dict[str, list[dict]] = {sid: [] for sid in signal_ids}
+            if signal_ids:
+                disp_rows = (
+                    await s.execute(
+                        select(SignalDispatch)
+                        .where(SignalDispatch.signal_id.in_(signal_ids))
+                        .order_by(SignalDispatch.id.asc())
+                    )
+                ).scalars().all()
+                for d in disp_rows:
+                    dispatch_map.setdefault(d.signal_id, []).append(
+                        _signal_dispatch_row(d, names.get(d.node_id))
+                    )
+
+            return {
+                "items": [_signal_event_row(sig, dispatch_map.get(sig.signal_id, [])) for sig in rows],
+                "total": total,
+                "page": page,
+                "page_size": page_size,
+            }
+    except Exception as e:  # noqa: BLE001
+        logger.warning("recent_webhook_events failed: %s", e)
+        return {"items": [], "total": 0, "page": page, "page_size": page_size}
 
 
 async def recent_dispatches(node_id: str, page: int = 1, page_size: int = 20) -> dict:

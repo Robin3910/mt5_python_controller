@@ -27,6 +27,15 @@ def _new_signal_id() -> str:
     return "sig_" + format(int(time.time() * 1000), "x") + secrets.token_hex(3)
 
 
+def _serialize_raw(data, text: str) -> str:
+    """保留 Webhook 原始请求体（JSON 或纯文本）。"""
+    if isinstance(data, dict):
+        return json.dumps(data, ensure_ascii=False)
+    if text:
+        return text
+    return str(data) if data is not None else ""
+
+
 def _extract_token(request: Request, data) -> str:
     """从多处提取鉴权 token：请求头 / 查询参数 / JSON 字段 / Bearer。"""
     token = request.headers.get("x-auth-token") or request.query_params.get("token")
@@ -66,10 +75,15 @@ async def webhook(
             logger.warning("webhook rejected (bad token) from %s", ip)
             raise HTTPException(status_code=401, detail="invalid token")
 
+    raw_payload = _serialize_raw(data, text)
+
     # 解析 + 校验
     signal = parser.parse(data)
     if signal is None:
-        await persist.record_signal(_new_signal_id(), None, ip, parsed_ok=False, status="rejected")
+        await persist.record_signal(
+            _new_signal_id(), None, ip, parsed_ok=False, status="rejected",
+            raw_payload=raw_payload,
+        )
         raise HTTPException(status_code=400, detail="cannot parse signal")
 
     ok, err = parser.validate_signal(signal)
@@ -84,7 +98,7 @@ async def webhook(
 
     # 正式分发
     signal_id = _new_signal_id()
-    result = await dispatcher.dispatch(signal, signal_id, source_ip=ip)
+    result = await dispatcher.dispatch(signal, signal_id, source_ip=ip, raw_payload=raw_payload)
     if result.get("mode") == "rejected":
         return {
             "status": "rejected",

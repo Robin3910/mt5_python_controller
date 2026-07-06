@@ -44,13 +44,34 @@ async def warm_cache(store: RedisStore) -> int:
     return len(rows)
 
 
+# 节点自动注册时，每个品种的按币种默认条目（与节点详情表单默认一致）
+DEFAULT_NODE_SYMBOL_RULE = {
+    "follow_sync": True,
+    "follow_poll": True,
+    "lot_mode": "fixed",
+    "lot": 0.01,
+    "poll_order": 0,
+}
+
 # 节点自动注册时使用的默认配置（与管理后台「+ 新建节点」表单的图示一致）
 AUTO_NODE_DEFAULTS = {
     "lot_mode": "fixed",
     "lot": 0.01,
     "poll_order": 0,
-    "filters": None,
 }
+
+
+def default_node_filters_from_global(global_filters: dict) -> dict:
+    """从中控台「多区间方向过滤」已有品种，生成节点按币种默认配置。"""
+    out: dict = {}
+    for sym, rule in (global_filters or {}).items():
+        if not isinstance(rule, dict):
+            continue
+        key = str(sym).strip().upper()
+        if not key:
+            continue
+        out[key] = dict(DEFAULT_NODE_SYMBOL_RULE)
+    return out
 
 
 def _default_name(mt5_login: int) -> str:
@@ -92,15 +113,18 @@ async def create_node(store: RedisStore, payload: NodeCreate) -> dict:
 async def auto_register(store: RedisStore, mt5_login: int) -> dict:
     """node_client 登录时按 mt5_login 自动注册节点（默认配置见 AUTO_NODE_DEFAULTS）。
 
+    按币种配置：从中控台多区间方向过滤已有品种自动生成（参与 sync/poll、固定手数 0.01、轮询序 0）。
     若已存在则直接返回现有节点（幂等）；不存在则用默认配置入库。
     """
     existing = await find_by_mt5_login(mt5_login)
     if existing:
         return existing
+    global_filters = await store.get_filters()
+    filters = default_node_filters_from_global(global_filters)
     payload = NodeCreate(
         name=_default_name(mt5_login),
         mt5_login=mt5_login,
-        **AUTO_NODE_DEFAULTS,
+        filters=filters or None,
     )
     return await create_node(store, payload)
 

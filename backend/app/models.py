@@ -85,6 +85,50 @@ class PaginatedNodeDispatches(BaseModel):
     page_size: int
 
 
+class SignalEventDispatch(BaseModel):
+    """单条 Webhook 信号在某节点上的处理明细。"""
+    id: int
+    node_id: str
+    node_name: Optional[str] = None
+    decided_vol: Optional[float] = None
+    gate_result: str = "passed"
+    skip_reason: Optional[str] = None
+    status: str = "pending"
+    retcode: Optional[int] = None
+    order: Optional[int] = None
+    deal: Optional[int] = None
+    price: Optional[float] = None
+    error: Optional[str] = None
+    dispatched_at: Optional[float] = None
+    finished_at: Optional[float] = None
+
+
+class SignalEventRecord(BaseModel):
+    """Webhook 信号事件（原始参数 + 各节点处理情况）。"""
+    signal_id: str
+    received_at: Optional[float] = None
+    source_ip: Optional[str] = None
+    raw_payload: Optional[str] = None
+    action: Optional[str] = None
+    symbol: Optional[str] = None
+    volume: Optional[float] = None
+    sl: Optional[float] = None
+    tp: Optional[float] = None
+    comment: Optional[str] = None
+    parsed_ok: bool = False
+    dispatch_mode: Optional[str] = None
+    status: str = "pending"
+    dispatches: list[SignalEventDispatch] = Field(default_factory=list)
+
+
+class PaginatedSignalEvents(BaseModel):
+    """Webhook 信号事件分页结果。"""
+    items: list[SignalEventRecord]
+    total: int
+    page: int
+    page_size: int
+
+
 # --------------------------- 账户 ---------------------------
 class Position(BaseModel):
     """单个持仓。"""

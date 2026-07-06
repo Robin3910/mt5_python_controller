@@ -13,6 +13,7 @@ import type {
   NodeTokenInfo,
   NodeUpdatePayload,
   PaginatedNodeDispatches,
+  PaginatedSignalEvents,
 } from '@/api/types'
 
 // 业务总线 store：集中保存节点、账户、配置与实时事件
@@ -73,6 +74,17 @@ export const useHubStore = defineStore('hub', {
       try {
         return (
           await api.get(`/api/nodes/${id}/dispatches`, {
+            params: { page, page_size: pageSize },
+          })
+        ).data
+      } catch {
+        return { items: [], total: 0, page, page_size: pageSize }
+      }
+    },
+    async fetchSignalEvents(page = 1, pageSize = 20): Promise<PaginatedSignalEvents> {
+      try {
+        return (
+          await api.get('/api/events/signals', {
             params: { page, page_size: pageSize },
           })
         ).data

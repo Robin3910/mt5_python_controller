@@ -221,9 +221,31 @@ def test_missing_mt5_login_rejected(client):
         assert msg["data"]["reason"] == "missing_mt5_login"
 
 
+from app.node_service import default_node_filters_from_global
+
+
+def test_default_node_filters_from_global():
+    cfg = default_node_filters_from_global(
+        {
+            "EURUSD": {"enabled": True},
+            "xauusd.m": {"enabled": True},
+            "bad": "not-a-dict",
+        }
+    )
+    assert set(cfg.keys()) == {"EURUSD", "XAUUSD.M"}
+    assert cfg["EURUSD"] == {
+        "follow_sync": True,
+        "follow_poll": True,
+        "lot_mode": "fixed",
+        "lot": 0.01,
+        "poll_order": 0,
+    }
+    assert default_node_filters_from_global({}) == {}
+
+
 def test_auto_register_on_first_login(client):
     """node_client 用未注册的 mt5_login 登录时，后端按默认配置自动入库。"""
-    h = _auth(client)
+    h = seed_default_filters(client)
     token = _node_token(client, h)
 
     # 库中不存在该 mt5_login
@@ -236,13 +258,20 @@ def test_auto_register_on_first_login(client):
         assert ack["type"] == "auth_ok"
         new_node_id = ack["data"]["node_id"]
 
-    # 自动注册的节点应使用默认配置（与「+ 新建节点」表单图示一致）
+    # 自动注册的节点应使用默认配置，并按中控台已有品种生成按币种配置
     r = client.get("/api/nodes", headers=h)
     created = next(n for n in r.json() if n["mt5_login"] == 8001)
     assert created["node_id"] == new_node_id
     assert created["name"] == "node-8001"
     assert created["enabled"] is True
-    assert created.get("filters") in (None, {})
+    filters = created.get("filters") or {}
+    assert set(filters.keys()) == {"EURUSD", "XAUUSD", "GBPUSD"}
+    for sym in filters.values():
+        assert sym["follow_sync"] is True
+        assert sym["follow_poll"] is True
+        assert sym["lot_mode"] == "fixed"
+        assert sym["lot"] == 0.01
+        assert sym["poll_order"] == 0
 
 
 def test_create_node_duplicate_mt5_login_returns_409(client):
@@ -297,6 +326,24 @@ def test_webhook_duplicate_suppressed(client):
 def test_webhook_rejects_unparseable(client):
     r = client.post("/webhook", json={"foo": "bar"})
     assert r.status_code == 400
+
+
+def test_list_signal_events(client):
+    h = seed_default_filters(client)
+    payload = {"action": "buy", "symbol": "EURUSD", "volume": 0.1, "sl": 1.05}
+    wh = client.post("/webhook", json=payload)
+    assert wh.status_code == 200, wh.text
+
+    r = client.get("/api/events/signals", headers=h, params={"page": 1, "page_size": 10})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["total"] >= 1
+    latest = body["items"][0]
+    assert latest["symbol"] == "EURUSD"
+    assert latest["action"] == "BUY"
+    assert latest["parsed_ok"] is True
+    assert '"action"' in (latest.get("raw_payload") or "")
+    assert "buy" in (latest.get("raw_payload") or "").lower()
 
 
 def test_2fa_login_flow(client):

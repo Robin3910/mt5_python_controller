@@ -169,6 +169,48 @@ export interface PaginatedNodeDispatches {
   page: number
   page_size: number
 }
+
+export interface SignalEventDispatch {
+  id: number
+  node_id: string
+  node_name: string | null
+  decided_vol: number | null
+  gate_result: string
+  skip_reason: string | null
+  status: string
+  retcode: number | null
+  order: number | null
+  deal: number | null
+  price: number | null
+  error: string | null
+  dispatched_at: number | null
+  finished_at: number | null
+}
+
+export interface SignalEventRecord {
+  signal_id: string
+  received_at: number | null
+  source_ip: string | null
+  raw_payload: string | null
+  action: string | null
+  symbol: string | null
+  volume: number | null
+  sl: number | null
+  tp: number | null
+  comment: string | null
+  parsed_ok: boolean
+  dispatch_mode: string | null
+  status: string
+  dispatches: SignalEventDispatch[]
+}
+
+export interface PaginatedSignalEvents {
+  items: SignalEventRecord[]
+  total: number
+  page: number
+  page_size: number
+}
+
 export interface NodeFeedItem {
   signal_id: string
   ts: number
