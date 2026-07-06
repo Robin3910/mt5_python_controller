@@ -43,7 +43,6 @@ async def admin_ws(ws: WebSocket, token: str = Query(default="")):
                 "type": "snapshot",
                 "data": {
                     "nodes": snapshot,
-                    "dispatch": await store.get_dispatch() if store else {},
                     "lot": await store.get_lot_global() if store else {},
                 },
             }

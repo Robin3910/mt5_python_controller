@@ -48,8 +48,6 @@ async def warm_cache(store: RedisStore) -> int:
 AUTO_NODE_DEFAULTS = {
     "lot_mode": "fixed",
     "lot": 0.01,
-    "follow_sync": True,
-    "follow_poll": True,
     "poll_order": 0,
     "filters": None,
 }
@@ -77,11 +75,9 @@ async def create_node(store: RedisStore, payload: NodeCreate) -> dict:
             node_id=node_id,
             name=name,
             enabled=True,
-            lot_mode=payload.lot_mode,
-            lot=payload.lot,
-            follow_sync=payload.follow_sync,
-            follow_poll=payload.follow_poll,
-            poll_order=payload.poll_order,
+            lot_mode=AUTO_NODE_DEFAULTS["lot_mode"],
+            lot=AUTO_NODE_DEFAULTS["lot"],
+            poll_order=AUTO_NODE_DEFAULTS["poll_order"],
             filters_json=payload.filters,
             mt5_login=payload.mt5_login,
         )
@@ -115,7 +111,7 @@ async def update_node(store: RedisStore, node_id: str, patch: NodeUpdate) -> Opt
         row = await s.get(Node, node_id)
         if not row:
             return None
-        for f in ("name", "enabled", "lot_mode", "lot", "follow_sync", "follow_poll", "poll_order"):
+        for f in ("name", "enabled"):
             v = getattr(patch, f, None)
             if v is not None:
                 setattr(row, f, v)

@@ -40,14 +40,28 @@ def mk_node(node_id, **kw):
         "enabled": True,
         "lot_mode": "signal",
         "lot": None,
-        "follow_sync": True,
-        "follow_poll": True,
         "poll_order": 0,
         "filters": None,
         "created_at": 0,
     }
     d.update(kw)
     return d
+
+
+async def set_symbol_filters(store, symbol, *, mode="sync", scope="symbol"):
+    await store.set_filters(
+        {
+            symbol: {
+                "enabled": True,
+                "allow_buy": True,
+                "allow_sell": True,
+                "dispatch_mode": mode,
+                "position_scope": scope,
+                "default_action": "pass",
+                "intervals": [],
+            }
+        }
+    )
 
 
 async def _online(store, *nodes):
@@ -59,7 +73,7 @@ async def _online(store, *nodes):
 
 async def test_sync_broadcasts_to_all_online(store, monkeypatch):
     await _online(store, mk_node("nd_a"), mk_node("nd_b"))
-    await store.set_dispatch({"mode": "sync", "position_scope": "symbol"})
+    await set_symbol_filters(store, "EURUSD", mode="sync")
     sent = []
 
     async def fake_send(node_id, msg):
@@ -76,10 +90,30 @@ async def test_sync_broadcasts_to_all_online(store, monkeypatch):
     assert all(s[1]["cmd"] == "open" and s[1]["volume"] == 0.1 for s in sent)
 
 
+async def test_node_symbol_follow_sync_excludes_node(store, monkeypatch):
+    await _online(
+        store,
+        mk_node("nd_a"),
+        mk_node("nd_b", filters={"EURUSD": {"follow_sync": False}}),
+    )
+    await set_symbol_filters(store, "EURUSD", mode="sync")
+    sent = []
+
+    async def fake_send(node_id, msg):
+        sent.append((node_id, msg))
+        return True
+
+    monkeypatch.setattr(manager, "send_to_node", fake_send)
+
+    d = Dispatcher(store)
+    await d.dispatch(TradingSignal(action="BUY", symbol="EURUSD", volume=0.1), "sig1b")
+    assert {s[0] for s in sent} == {"nd_a"}
+
+
 async def test_position_gate_skips_node_with_position(store, monkeypatch):
     await _online(store, mk_node("nd_a"))
     await store.save_account("nd_a", {"positions": [{"symbol": "EURUSD"}], "prices": {}})
-    await store.set_dispatch({"mode": "sync", "position_scope": "symbol"})
+    await set_symbol_filters(store, "EURUSD", mode="sync")
     sent = []
 
     async def fake_send(node_id, msg):
@@ -94,8 +128,11 @@ async def test_position_gate_skips_node_with_position(store, monkeypatch):
 
 
 async def test_global_lot_overrides_volume(store, monkeypatch):
-    await _online(store, mk_node("nd_a", lot_mode="global"))
-    await store.set_dispatch({"mode": "sync", "position_scope": "symbol"})
+    await _online(
+        store,
+        mk_node("nd_a", filters={"EURUSD": {"lot_mode": "global"}}),
+    )
+    await set_symbol_filters(store, "EURUSD", mode="sync")
     await store.set_lot_global({"enabled": True, "value": 0.25})
     sent = []
 
@@ -113,7 +150,7 @@ async def test_global_lot_overrides_volume(store, monkeypatch):
 
 async def test_poll_sequential_consumes_all_nodes(store, monkeypatch):
     await _online(store, mk_node("nd_a"), mk_node("nd_b"))
-    await store.set_dispatch({"mode": "poll", "position_scope": "symbol"})
+    await set_symbol_filters(store, "EURUSD", mode="poll")
     sent = []
 
     async def fake_send(node_id, msg):
@@ -138,8 +175,12 @@ async def test_poll_sequential_consumes_all_nodes(store, monkeypatch):
 
 
 async def test_close_signal_sends_close_to_online_nodes(store, monkeypatch):
-    await _online(store, mk_node("nd_a"), mk_node("nd_b"))
-    await store.set_dispatch({"mode": "sync", "position_scope": "symbol"})
+    await set_symbol_filters(store, "EURUSD", mode="sync")
+    await _online(
+        store,
+        mk_node("nd_a"),
+        mk_node("nd_b", filters={"EURUSD": {"follow_sync": False}}),
+    )
     sent = []
 
     async def fake_send(node_id, msg):
@@ -153,3 +194,10 @@ async def test_close_signal_sends_close_to_online_nodes(store, monkeypatch):
     assert res["mode"] == "close"
     assert all(s[1]["cmd"] == "close" for s in sent)
     assert {s[0] for s in sent} == {"nd_a", "nd_b"}
+
+
+async def test_unconfigured_symbol_rejected(store):
+    d = Dispatcher(store)
+    res = await d.dispatch(TradingSignal(action="BUY", symbol="GBPUSD", volume=0.1), "sigx")
+    assert res["mode"] == "rejected"
+    assert "未配置" in (res.get("reason") or "")

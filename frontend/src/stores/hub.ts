@@ -4,7 +4,6 @@ import type {
   AccountSnapshot,
   CloseRequest,
   CloseBatchResult,
-  DispatchConfig,
   FilterRulesConfig,
   HubEvent,
   LotConfig,
@@ -22,7 +21,6 @@ interface HubState {
   accounts: Record<string, AccountSnapshot> // node_id -> 最新账户快照（实时 WS 更新）
   statuses: Record<string, string>          // node_id -> 在线状态（实时 WS 更新）
   lot: LotConfig                            // 全局手数
-  dispatch: DispatchConfig                  // 分发模式 / 持仓范围
   filters: FilterRulesConfig          // 区间过滤
   events: HubEvent[]                        // 实时事件流（用于总览页展示）
   nodeFeed: Record<string, NodeFeedItem[]>  // node_id -> 实时分发/回报（详情页“成交回报”用）
@@ -34,7 +32,6 @@ export const useHubStore = defineStore('hub', {
     accounts: {},
     statuses: {},
     lot: { enabled: false, value: 0.1 },
-    dispatch: { mode: 'sync', position_scope: 'symbol' },
     filters: {},
     events: [],
     nodeFeed: {},
@@ -57,7 +54,6 @@ export const useHubStore = defineStore('hub', {
     },
     async fetchConfig(): Promise<void> {
       this.lot = (await api.get('/api/config/lot')).data
-      this.dispatch = (await api.get('/api/config/dispatch')).data
       this.filters = (await api.get('/api/config/filters')).data
     },
     // 拉取单节点最新账户快照（详情页兜底；之后由 WS 实时刷新）
@@ -101,9 +97,6 @@ export const useHubStore = defineStore('hub', {
     // ---- 配置保存 ----
     async saveLot(cfg: LotConfig): Promise<void> {
       this.lot = (await api.put('/api/config/lot', cfg)).data
-    },
-    async saveDispatch(cfg: DispatchConfig): Promise<void> {
-      this.dispatch = (await api.put('/api/config/dispatch', cfg)).data
     },
     async saveFilters(cfg: FilterRulesConfig): Promise<void> {
       this.filters = (await api.put('/api/config/filters', cfg)).data
@@ -154,7 +147,6 @@ export const useHubStore = defineStore('hub', {
           if (n.account) this.accounts[id] = n.account as AccountSnapshot
         }
         if (d.lot) this.lot = d.lot as LotConfig
-        if (d.dispatch) this.dispatch = d.dispatch as DispatchConfig
       } else if (t === 'node_status') {
         // 节点上下线
         const id = d.node_id as string

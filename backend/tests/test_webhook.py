@@ -50,10 +50,28 @@ def _enable_ip_whitelist(monkeypatch, ips):
     monkeypatch.setattr(settings, "whitelisted_ips", ips)
 
 
+from tests.test_helpers import seed_default_filters
+
+
 # =====================================================================
 # 1. 入参形态（格式一 JSON / 格式二 文本 / 格式三 内嵌文本）
 # =====================================================================
+def test_rejects_unconfigured_symbol(client):
+    r = client.post("/webhook", json={"action": "buy", "symbol": "EURUSD", "volume": 0.1})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "rejected"
+    assert body["signal_id"].startswith("sig_")
+    assert body["action"] == "BUY"
+    assert body["symbol"] == "EURUSD"
+    assert body["volume"] == 0.1
+    assert body["mode"] == "rejected"
+    assert "未配置" in (body.get("reason") or "")
+    assert body["targets"] == 0
+
+
 def test_accepted_json_response_shape(client):
+    seed_default_filters(client)
     r = client.post("/webhook", json={"action": "buy", "symbol": "EURUSD", "volume": 0.1})
     assert r.status_code == 200, r.text
     body = r.json()
@@ -62,11 +80,12 @@ def test_accepted_json_response_shape(client):
     assert body["action"] == "BUY"
     assert body["symbol"] == "EURUSD"
     assert body["volume"] == 0.1
-    assert body["mode"] == "sync"      # 无 K_DISPATCH 时回退 settings.dispatch_mode
-    assert body["targets"] == 0        # 无在线节点
+    assert body["mode"] == "sync"
+    assert body["targets"] == 0
 
 
 def test_accepted_plain_text_body(client):
+    seed_default_filters(client)
     r = client.post("/webhook", content="close XAUUSD")
     assert r.status_code == 200, r.text
     body = r.json()
@@ -77,6 +96,7 @@ def test_accepted_plain_text_body(client):
 
 
 def test_accepted_json_text_field(client):
+    seed_default_filters(client)
     r = client.post("/webhook", json={"text": "buy EURUSD"})
     assert r.status_code == 200, r.text
     body = r.json()
@@ -85,6 +105,7 @@ def test_accepted_json_text_field(client):
 
 
 def test_close_action_reports_mode_close(client):
+    seed_default_filters(client)
     r = client.post("/webhook", json={"action": "close", "symbol": "EURUSD"})
     assert r.status_code == 200, r.text
     assert r.json()["mode"] == "close"
@@ -118,6 +139,7 @@ def test_unparseable_returns_400(client, kwargs):
 # 3. 去重（DEDUP_WINDOW 内相同指纹）
 # =====================================================================
 def test_duplicate_suppressed_within_window(client):
+    seed_default_filters(client)
     payload = {"action": "sell", "symbol": "XAUUSD", "volume": 0.1}
     r1 = client.post("/webhook", json=payload)
     assert r1.json()["status"] == "accepted"
@@ -131,6 +153,7 @@ def test_duplicate_suppressed_within_window(client):
 
 
 def test_distinct_volume_not_deduped(client):
+    seed_default_filters(client)
     a = client.post("/webhook", json={"action": "buy", "symbol": "EURUSD", "volume": 0.1})
     b = client.post("/webhook", json={"action": "buy", "symbol": "EURUSD", "volume": 0.2})
     assert a.json()["status"] == "accepted"
@@ -166,6 +189,7 @@ def test_auth_wrong_token_401(client, monkeypatch):
 @pytest.mark.parametrize("channel", ["header", "query", "json_token", "json_auth_token", "bearer"])
 def test_auth_valid_token_all_channels(client, monkeypatch, channel):
     """token 的 4 类传入方式都应被接受（header / query / JSON 字段 / Bearer）。"""
+    seed_default_filters(client)
     _enable_auth(monkeypatch)
     url = "/webhook"
     headers = {}
@@ -200,6 +224,7 @@ def test_auth_header_takes_precedence_over_body(client, monkeypatch):
 
 def test_auth_text_body_with_header_token(client, monkeypatch):
     """纯文本体无法携带 JSON token，但可用 header 传 token。"""
+    seed_default_filters(client)
     _enable_auth(monkeypatch)
     r = client.post("/webhook", content="buy EURUSD", headers={"X-Auth-Token": TOKEN})
     assert r.status_code == 200, r.text

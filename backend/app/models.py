@@ -12,23 +12,13 @@ class NodeCreate(BaseModel):
     """创建节点的入参。"""
     name: Optional[str] = None  # 留空则自动生成 "node-{mt5_login}"
     mt5_login: int = Field(gt=0, description="绑定的 MT5 账户登录号（全局唯一）")
-    lot_mode: str = "fixed"  # 手数策略：global / fixed / signal（默认 fixed）
-    lot: Optional[float] = 0.01
-    follow_sync: bool = True   # 是否参与“全员同步”分发
-    follow_poll: bool = True   # 是否参与“轮询领取”分发
-    poll_order: int = 0        # 轮询顺序（越小越先）
-    filters: Optional[dict] = None  # 节点级区间过滤（可覆盖全局）
+    filters: Optional[dict] = None  # 节点级按币种配置（分发参与、手数策略、轮询顺序）
 
 
 class NodeUpdate(BaseModel):
     """更新节点的入参（全部可选，仅更新提供的字段；mt5_login 创建后不可改）。"""
     name: Optional[str] = None
     enabled: Optional[bool] = None
-    lot_mode: Optional[str] = None
-    lot: Optional[float] = None
-    follow_sync: Optional[bool] = None
-    follow_poll: Optional[bool] = None
-    poll_order: Optional[int] = None
     filters: Optional[dict] = None
 
 
@@ -38,11 +28,7 @@ class NodeOut(BaseModel):
     name: str
     enabled: bool = True
     status: str = "offline"  # online / offline
-    lot_mode: str = "global"
-    lot: Optional[float] = None
-    follow_sync: bool = True
-    follow_poll: bool = True
-    poll_order: int = 0
+    filters: Optional[dict] = None
     mt5_login: Optional[int] = None
     mt5_server: Optional[str] = None
     created_at: float = 0
@@ -155,16 +141,23 @@ class IntervalRule(BaseModel):
 
 
 class SymbolFilter(BaseModel):
-    """某品种的多区间过滤配置。"""
+    """某品种的多区间过滤与分发配置（全局 filters 键值）。"""
     enabled: bool = True
+    allow_buy: bool = True
+    allow_sell: bool = True
+    dispatch_mode: str = "sync"  # sync / poll
+    position_scope: str = "symbol"  # symbol / account
     default_action: str = "block"  # 不在任何区间时：block 拦截 / pass 放行
     intervals: list[IntervalRule] = Field(default_factory=list)
 
 
-class DispatchConfig(BaseModel):
-    """分发配置。"""
-    mode: str = "sync"  # sync / poll
-    position_scope: str = "symbol"  # symbol / account
+class NodeSymbolDispatchRule(BaseModel):
+    """节点 filters 中单个品种的配置。"""
+    follow_sync: bool = True
+    follow_poll: bool = True
+    lot_mode: str = "fixed"  # global / fixed / signal
+    lot: Optional[float] = 0.01
+    poll_order: int = 0
 
 
 # ------------------------- 平仓请求 -----------------------

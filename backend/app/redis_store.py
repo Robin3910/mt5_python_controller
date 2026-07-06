@@ -21,7 +21,6 @@ K_ONLINE = "node:online:{}"      # 在线标记（带 TTL）
 K_ACCOUNT = "node:account:{}"    # 账户快照（JSON）
 K_LOT_GLOBAL = "config:lot:global"   # 全局手数配置
 K_FILTERS = "config:filters"     # 多区间方向过滤配置
-K_DISPATCH = "config:dispatch"   # 分发模式 / 持仓判定范围
 K_NODE_TOKEN = "config:node_token"   # 全局节点接入令牌（明文）
 K_DEDUP = "dedup:{}"             # 信号去重指纹（带 TTL）
 K_EXEC_LOCK = "lock:exec:{}:{}"  # (node, symbol) 执行锁
@@ -122,16 +121,6 @@ class RedisStore:
 
     async def set_filters(self, cfg: dict) -> None:
         await self.r.set(K_FILTERS, json.dumps(cfg))
-
-    async def get_dispatch(self) -> dict:
-        raw = await self.r.get(K_DISPATCH)
-        if raw:
-            return json.loads(raw)
-        # 未配置时回退到环境默认
-        return {"mode": settings.dispatch_mode, "position_scope": settings.position_scope}
-
-    async def set_dispatch(self, cfg: dict) -> None:
-        await self.r.set(K_DISPATCH, json.dumps(cfg))
 
     # ----------------- 幂等 / 锁 -----------------
     async def seen_signal(self, fingerprint: str) -> bool:

@@ -3,9 +3,11 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import FormLabel from '@/components/FormLabel.vue'
+import FilterRulesEditor from '@/components/FilterRulesEditor.vue'
 import { NODE_FORM_FIELD_HELP } from '@/constants/nodeFormHelp'
 import { useHubStore } from '@/stores/hub'
-import type { NodeOut } from '@/api/types'
+import type { NodeDispatchFiltersConfig, NodeOut } from '@/api/types'
+import { parseNodeDispatchFilters, serializeNodeDispatchFilters, validateNodeDispatchFilters } from '@/utils/filterRules'
 
 const hub = useHubStore()
 const router = useRouter()
@@ -21,17 +23,18 @@ const editingId = ref('')
 const saving = ref(false)
 const createError = ref('')
 
-// 默认值与「自动注册」保持一致：固定手数 0.01、参与同步/轮询、轮询序 0、启用
+// 默认值与「自动注册」保持一致：启用；按币种配置见 filters
 const form = reactive({
   name: '',
   mt5_login: null as number | null,
-  lot_mode: 'fixed' as 'global' | 'fixed' | 'signal',
-  lot: 0.01 as number | null,
-  follow_sync: true,
-  follow_poll: true,
-  poll_order: 0,
   enabled: true,
+  filters: {} as NodeDispatchFiltersConfig,
 })
+
+function filterSymbolCount(n: NodeOut): string {
+  const count = Object.keys(parseNodeDispatchFilters(n.filters)).length
+  return count ? `${count} 个品种` : '—'
+}
 
 const selectedIds = ref<Set<string>>(new Set())
 const closing = ref(false)
@@ -100,7 +103,7 @@ function openCreate(): void {
   formMode.value = 'create'
   editingId.value = ''
   createError.value = ''
-  Object.assign(form, { name: '', mt5_login: null, lot_mode: 'fixed', lot: 0.01, follow_sync: true, follow_poll: true, poll_order: 0, enabled: true })
+  Object.assign(form, { name: '', mt5_login: null, enabled: true, filters: {} })
   showForm.value = true
 }
 
@@ -111,12 +114,8 @@ function openEdit(n: NodeOut): void {
   Object.assign(form, {
     name: n.name,
     mt5_login: n.mt5_login,
-    lot_mode: n.lot_mode,
-    lot: n.lot ?? 0.01,
-    follow_sync: n.follow_sync,
-    follow_poll: n.follow_poll,
-    poll_order: n.poll_order,
     enabled: n.enabled,
+    filters: parseNodeDispatchFilters(n.filters),
   })
   showForm.value = true
 }
@@ -125,13 +124,15 @@ async function save(): Promise<void> {
   saving.value = true
   createError.value = ''
   try {
+    const filtersPayload = serializeNodeDispatchFilters(form.filters)
+    const filterErrors = validateNodeDispatchFilters(filtersPayload)
+    if (filterErrors.length) {
+      createError.value = filterErrors[0]
+      return
+    }
     const payload = {
       name: form.name,
-      lot_mode: form.lot_mode,
-      lot: form.lot_mode === 'fixed' ? form.lot : null,
-      follow_sync: form.follow_sync,
-      follow_poll: form.follow_poll,
-      poll_order: form.poll_order,
+      filters: Object.keys(filtersPayload).length ? filtersPayload : null,
     }
     if (formMode.value === 'create') {
       if (!form.mt5_login) return
@@ -209,21 +210,7 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
       <div class="list-field"><span class="k">节点 ID</span><span class="v muted" style="font-weight: 500; font-size: 12px">{{ n.node_id }}</span></div>
       <div class="list-field"><span class="k">MT5 账号</span><span class="v">{{ n.mt5_login || '—' }}</span></div>
       <div class="list-field"><span class="k">MT5 服务器</span><span class="v">{{ n.mt5_server || '—' }}</span></div>
-      <div class="list-field">
-        <span class="k">手数策略</span>
-        <span class="v">
-          <span class="tag blue">{{ n.lot_mode }}</span>
-          <span v-if="n.lot_mode === 'fixed'"> {{ n.lot }}</span>
-        </span>
-      </div>
-      <div class="list-field">
-        <span class="k">跟单</span>
-        <span class="v">
-          <span class="tag" :class="n.follow_sync ? 'green' : ''">同步</span>
-          <span class="tag" :class="n.follow_poll ? 'green' : ''">轮询</span>
-        </span>
-      </div>
-      <div class="list-field"><span class="k">轮询顺序</span><span class="v">{{ n.poll_order }}</span></div>
+      <div class="list-field"><span class="k">分发配置</span><span class="v muted">{{ filterSymbolCount(n) }}</span></div>
       <div class="list-field">
         <span class="k">启用</span>
         <span class="v">
@@ -252,7 +239,7 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
               @change="toggleSelectAll(($event.target as HTMLInputElement).checked)"
             />
           </th>
-          <th>状态</th><th>名称</th><th>MT5</th><th>手数策略</th><th>跟单</th><th>轮询序</th><th>启用</th><th class="right">操作</th>
+          <th>状态</th><th>名称</th><th>MT5</th><th>币种配置</th><th>启用</th><th class="right">操作</th>
         </tr>
       </thead>
       <tbody>
@@ -270,15 +257,7 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
             <div class="muted" style="font-size: 11px">{{ n.node_id }}</div>
           </td>
           <td class="muted" style="font-size: 12px">{{ n.mt5_login || '—' }}<br />{{ n.mt5_server || '' }}</td>
-          <td>
-            <span class="tag blue">{{ n.lot_mode }}</span>
-            <span v-if="n.lot_mode === 'fixed'"> {{ n.lot }}</span>
-          </td>
-          <td>
-            <span class="tag" :class="n.follow_sync ? 'green' : ''">同步</span>
-            <span class="tag" :class="n.follow_poll ? 'green' : ''">轮询</span>
-          </td>
-          <td>{{ n.poll_order }}</td>
+          <td class="muted" style="font-size: 12px">{{ filterSymbolCount(n) }}</td>
           <td>
             <button class="btn-sm" :class="n.enabled ? 'btn-ghost' : 'btn-danger'" @click="toggleEnabled(n)">
               {{ n.enabled ? '已启用' : '已禁用' }}
@@ -290,7 +269,7 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
             <button class="btn-sm btn-danger" @click="remove(n)">删除</button>
           </td>
         </tr>
-        <tr v-if="!hub.nodes.length"><td colspan="9" class="muted" style="padding: 18px">暂无节点</td></tr>
+        <tr v-if="!hub.nodes.length"><td colspan="7" class="muted" style="padding: 18px">暂无节点</td></tr>
       </tbody>
     </table>
   </div>
@@ -316,33 +295,9 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
           <input id="node-mt5-login-readonly" :value="form.mt5_login ?? ''" type="number" disabled />
           <p class="muted" style="font-size: 12px; margin: 6px 0 0">创建后不可修改</p>
         </div>
-        <div class="form-grid two">
-          <div>
-            <FormLabel field-id="node-lot-mode" text="手数策略" :help="NODE_FORM_FIELD_HELP.lot_mode" />
-            <select id="node-lot-mode" v-model="form.lot_mode">
-              <option value="global">跟随全局</option>
-              <option value="fixed">固定手数</option>
-              <option value="signal">跟随信号</option>
-            </select>
-          </div>
-          <div>
-            <FormLabel field-id="node-lot" text="固定手数" :help="NODE_FORM_FIELD_HELP.lot" />
-            <input id="node-lot" v-model.number="form.lot" type="number" step="0.01" :disabled="form.lot_mode !== 'fixed'" />
-          </div>
-        </div>
-        <div class="form-grid two">
-          <div>
-            <FormLabel field-id="node-follow-sync" text="跟随同步模式" :help="NODE_FORM_FIELD_HELP.follow_sync" />
-            <select id="node-follow-sync" v-model="form.follow_sync"><option :value="true">是</option><option :value="false">否</option></select>
-          </div>
-          <div>
-            <FormLabel field-id="node-follow-poll" text="跟随轮询模式" :help="NODE_FORM_FIELD_HELP.follow_poll" />
-            <select id="node-follow-poll" v-model="form.follow_poll"><option :value="true">是</option><option :value="false">否</option></select>
-          </div>
-        </div>
-        <div>
-          <FormLabel field-id="node-poll-order" text="轮询顺序（越小越先）" :help="NODE_FORM_FIELD_HELP.poll_order" />
-          <input id="node-poll-order" v-model.number="form.poll_order" type="number" />
+        <div class="span-full">
+          <FormLabel text="按币种配置" :help="NODE_FORM_FIELD_HELP.filters" />
+          <FilterRulesEditor v-model="form.filters" mode="node" />
         </div>
         <div v-if="formMode === 'edit'">
           <FormLabel field-id="node-enabled" text="启用状态" :help="NODE_FORM_FIELD_HELP.enabled" />

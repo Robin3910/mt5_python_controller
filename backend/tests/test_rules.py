@@ -2,30 +2,44 @@
 from app import rules
 
 
+SYMBOL = "EURUSD"
+
+
 # ----------------------------- lot -----------------------------
 def test_resolve_volume_global_enabled():
-    node = {"lot_mode": "global"}
-    assert rules.resolve_volume(node, 0.5, {"enabled": True, "value": 0.2}) == 0.2
+    node = {"filters": {SYMBOL: {"lot_mode": "global"}}}
+    assert rules.resolve_volume(node, 0.5, {"enabled": True, "value": 0.2}, SYMBOL) == 0.2
 
 
 def test_resolve_volume_global_disabled_uses_signal():
-    node = {"lot_mode": "global"}
-    assert rules.resolve_volume(node, 0.5, {"enabled": False, "value": 0.2}) == 0.5
+    node = {"filters": {SYMBOL: {"lot_mode": "global"}}}
+    assert rules.resolve_volume(node, 0.5, {"enabled": False, "value": 0.2}, SYMBOL) == 0.5
 
 
 def test_resolve_volume_fixed():
-    node = {"lot_mode": "fixed", "lot": 0.3}
-    assert rules.resolve_volume(node, 0.5, {"enabled": True, "value": 0.2}) == 0.3
+    node = {"filters": {SYMBOL: {"lot_mode": "fixed", "lot": 0.3}}}
+    assert rules.resolve_volume(node, 0.5, {"enabled": True, "value": 0.2}, SYMBOL) == 0.3
 
 
 def test_resolve_volume_signal_mode():
-    node = {"lot_mode": "signal"}
-    assert rules.resolve_volume(node, 0.42, {"enabled": True, "value": 0.2}) == 0.42
+    node = {"filters": {SYMBOL: {"lot_mode": "signal"}}}
+    assert rules.resolve_volume(node, 0.42, {"enabled": True, "value": 0.2}, SYMBOL) == 0.42
 
 
 def test_resolve_volume_capped():
-    node = {"lot_mode": "signal"}
-    assert rules.resolve_volume(node, 99, {"enabled": False}) == 1.0  # MAX_LOT_SIZE
+    node = {"filters": {SYMBOL: {"lot_mode": "signal"}}}
+    assert rules.resolve_volume(node, 99, {"enabled": False}, SYMBOL) == 1.0  # MAX_LOT_SIZE
+
+
+def test_resolve_volume_fallback_node_defaults():
+    node = {"lot_mode": "fixed", "lot": 0.08}
+    assert rules.resolve_volume(node, 0.5, {"enabled": True, "value": 0.2}, SYMBOL) == 0.08
+
+
+def test_node_poll_order_per_symbol():
+    node = {"poll_order": 9, "filters": {SYMBOL: {"poll_order": 2}}}
+    assert rules.node_poll_order(node, SYMBOL) == 2
+    assert rules.node_poll_order(node, "GBPUSD") == 9
 
 
 # ------------------------- position gate ------------------------

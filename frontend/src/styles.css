@@ -206,6 +206,7 @@ th { color: var(--muted); font-weight: 600; }
 .login-card { width: 100%; max-width: 360px; }
 
 .form-grid { display: grid; gap: 12px; }
+.form-grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .two { grid-template-columns: 1fr 1fr; }
 
 @media (max-width: 768px) {

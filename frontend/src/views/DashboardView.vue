@@ -44,7 +44,6 @@ async function closeTicket(n: NodeOut, ticket: number): Promise<void> {
     <div class="card card-pad stat"><span class="k">在线节点</span><span class="v">{{ hub.onlineCount }} / {{ hub.nodes.length }}</span></div>
     <div class="card card-pad stat"><span class="k">合计净值</span><span class="v">{{ fmt(totalEquity) }}</span></div>
     <div class="card card-pad stat"><span class="k">合计持仓</span><span class="v">{{ totalPositions }}</span></div>
-    <div class="card card-pad stat"><span class="k">分发模式</span><span class="v" style="text-transform: uppercase">{{ hub.dispatch.mode }}</span></div>
   </div>
 
   <div class="grid layout-split">

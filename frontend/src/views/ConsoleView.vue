@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 中控台：系统配置（全局手数 / 分发策略 / 区间过滤）
+// 中控台：系统配置（全局手数 / 区间过滤与按币种分发策略）
 import { onMounted, reactive, ref } from 'vue'
 import { useHubStore } from '@/stores/hub'
 import FilterRulesEditor from '@/components/FilterRulesEditor.vue'
@@ -9,7 +9,6 @@ import { parseFilterRules, serializeFilterRules, validateFilterRules } from '@/u
 const hub = useHubStore()
 
 const lot = reactive({ enabled: false, value: 0.1 })
-const dispatch = reactive({ mode: 'sync' as 'sync' | 'poll', position_scope: 'symbol' as 'symbol' | 'account' })
 const filters = ref<FilterRulesConfig>({})
 const filtersError = ref('')
 const savedFlag = ref('')
@@ -18,8 +17,6 @@ onMounted(async () => {
   await hub.fetchConfig()
   lot.enabled = hub.lot.enabled
   lot.value = hub.lot.value
-  dispatch.mode = hub.dispatch.mode
-  dispatch.position_scope = hub.dispatch.position_scope
   filters.value = parseFilterRules(hub.filters)
 })
 
@@ -32,10 +29,6 @@ async function saveLot(): Promise<void> {
   await hub.saveLot({ enabled: lot.enabled, value: lot.value })
   flash('全局手数已保存')
 }
-async function saveDispatch(): Promise<void> {
-  await hub.saveDispatch({ mode: dispatch.mode, position_scope: dispatch.position_scope })
-  flash('分发策略已保存')
-}
 async function saveFilters(): Promise<void> {
   filtersError.value = ''
   const payload = serializeFilterRules(filters.value)
@@ -46,7 +39,7 @@ async function saveFilters(): Promise<void> {
   }
   await hub.saveFilters(payload)
   filters.value = parseFilterRules(hub.filters)
-  flash('区间过滤规则已保存')
+  flash('过滤规则已保存')
 }
 </script>
 
@@ -70,29 +63,10 @@ async function saveFilters(): Promise<void> {
       </div>
     </div>
 
-    <div class="card card-pad">
-      <strong>分发策略</strong>
-      <p class="muted" style="font-size: 12px">同步模式：所有节点并发执行；轮询模式：按顺序依次领取执行。</p>
-      <div class="form-grid">
-        <div>
-          <label>分发模式</label>
-          <select v-model="dispatch.mode"><option value="sync">全员同步</option><option value="poll">轮询领取</option></select>
-        </div>
-        <div>
-          <label>持仓判定范围</label>
-          <select v-model="dispatch.position_scope">
-            <option value="symbol">按品种（同品种无持仓才开）</option>
-            <option value="account">按账户（账户无任何持仓才开）</option>
-          </select>
-        </div>
-        <button class="btn-primary" @click="saveDispatch">保存</button>
-      </div>
-    </div>
-
     <div class="card card-pad span-full">
       <strong>多区间方向过滤</strong>
       <div style="margin-top: 12px">
-        <FilterRulesEditor v-model="filters" />
+        <FilterRulesEditor v-model="filters" mode="global" />
       </div>
       <div v-if="filtersError" style="color: var(--red); font-size: 12px; margin-top: 10px">{{ filtersError }}</div>
       <div class="row" style="margin-top: 12px"><button class="btn-primary" @click="saveFilters">保存过滤规则</button></div>

@@ -11,6 +11,7 @@ import re
 from typing import Optional
 
 from .config import Config
+from .settings import settings
 
 
 def base_symbol(s: str) -> str:
@@ -27,21 +28,37 @@ def symbol_match(a: str, b: str) -> bool:
     return ba == bb or ba.startswith(bb) or bb.startswith(ba)
 
 
-def resolve_volume(node: dict, signal_volume: float, global_lot: dict) -> float:
-    """9.4——按节点的手数策略决定实际手数，并以 MAX_LOT_SIZE 封顶。
+def _node_symbol_rule(node: dict, symbol: str) -> Optional[dict]:
+    """读取节点 filters 中某品种的配置。"""
+    node_filters = node.get("filters") or {}
+    if isinstance(node_filters, dict):
+        return _lookup_symbol_config(node_filters, symbol)
+    return None
 
-    - fixed ：使用节点配置的固定手数
-    - global：全局手数开启时用全局值，否则回退信号手数
-    - signal：直接用信号里的手数
-    """
-    mode = node.get("lot_mode", "global")
-    if mode == "fixed" and node.get("lot"):
-        vol = float(node["lot"])
+
+def resolve_volume(node: dict, signal_volume: float, global_lot: dict, symbol: str) -> float:
+    """9.4——按节点该品种的手数策略决定实际手数，并以 MAX_LOT_SIZE 封顶。"""
+    sf = _node_symbol_rule(node, symbol)
+    mode = (sf.get("lot_mode") if sf else None) or node.get("lot_mode", "global")
+    fixed_lot = sf.get("lot") if sf and sf.get("lot") is not None else node.get("lot")
+    if mode == "fixed" and fixed_lot is not None:
+        vol = float(fixed_lot)
     elif mode == "global" and global_lot.get("enabled"):
         vol = float(global_lot.get("value", Config.DEFAULT_LOT))
     else:
         vol = float(signal_volume)
     return min(max(vol, 0.0), Config.MAX_LOT_SIZE)
+
+
+def node_poll_order(node: dict, symbol: str) -> int:
+    """节点在某品种轮询分发中的顺序（越小越先）。"""
+    sf = _node_symbol_rule(node, symbol)
+    if sf and sf.get("poll_order") is not None:
+        try:
+            return int(sf["poll_order"])
+        except (TypeError, ValueError):
+            pass
+    return int(node.get("poll_order", 0))
 
 
 def position_gate(
@@ -76,12 +93,68 @@ def position_gate(
     return False, f"持仓过滤：账户已有持仓({len(held)}笔)，按账户过滤跳过"
 
 
+def _lookup_symbol_config(filters_cfg: dict, symbol: str) -> Optional[dict]:
+    """按品种 / base_symbol / 券商后缀兼容查找配置项。"""
+    if not filters_cfg or not symbol:
+        return None
+    sf = filters_cfg.get(symbol) or filters_cfg.get(base_symbol(symbol))
+    if isinstance(sf, dict):
+        return sf
+    for key, rule in filters_cfg.items():
+        if isinstance(rule, dict) and symbol_match(str(key), symbol):
+            return rule
+    return None
+
+
+def resolve_dispatch_config(
+    symbol: str, global_filters: dict,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """按币种解析分发模式与持仓判定范围。
+
+    返回 (mode, scope, reject_reason)。reject_reason 非空时表示该品种未在中控台配置，应拒收信号。
+    """
+    sf = _lookup_symbol_config(global_filters or {}, symbol)
+    if not sf:
+        sym = base_symbol(symbol) or symbol
+        return None, None, f"品种未配置：{sym}未在中控台配置，信号拒收"
+    mode = sf.get("dispatch_mode", settings.dispatch_mode)
+    scope = sf.get("position_scope", settings.position_scope)
+    if mode not in ("sync", "poll"):
+        mode = "sync"
+    if scope not in ("symbol", "account"):
+        scope = "symbol"
+    return mode, scope, None
+
+
+def node_participates(node: dict, symbol: str, mode: str, global_filters: dict) -> bool:
+    """节点是否参与该币种在指定分发模式下的分发（读节点 filters 中的 per-symbol 开关）。"""
+    node_filters = node.get("filters") or {}
+    sf = _lookup_symbol_config(node_filters, symbol) if isinstance(node_filters, dict) else None
+    if mode == "sync":
+        return sf.get("follow_sync", True) if sf else True
+    if mode == "poll":
+        return sf.get("follow_poll", True) if sf else True
+    return True
+
+
 def effective_filters(node: dict, global_filters: dict) -> dict:
-    """9.2——节点级过滤覆盖全局；节点未配置的品种回退全局规则。"""
-    merged = dict(global_filters or {})
+    """9.2——节点级过滤覆盖全局；同品种字段级合并，节点未配置的品种回退全局规则。"""
+    merged: dict = {}
+    for sym, rule in (global_filters or {}).items():
+        if isinstance(rule, dict):
+            merged[sym] = dict(rule)
     node_filters = node.get("filters") or {}
     if isinstance(node_filters, dict):
-        merged.update(node_filters)  # 节点级同名品种覆盖全局
+        for sym, nr in node_filters.items():
+            if not isinstance(nr, dict):
+                continue
+            key = str(sym).strip().upper()
+            if not key:
+                continue
+            base = merged.get(key) or merged.get(base_symbol(key)) or {}
+            if not isinstance(base, dict):
+                base = {}
+            merged[key] = {**base, **nr}
     return merged
 
 
@@ -133,7 +206,7 @@ def interval_filter(
     """
     if action not in ("BUY", "SELL"):
         return True, None
-    sf = filters_cfg.get(symbol) or filters_cfg.get(base_symbol(symbol))
+    sf = _lookup_symbol_config(filters_cfg, symbol)
     if not sf or not sf.get("enabled"):
         return True, None
     if action == "BUY" and sf.get("allow_buy", True) is False:

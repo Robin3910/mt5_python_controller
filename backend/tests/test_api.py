@@ -32,6 +32,9 @@ def client(monkeypatch):
         pass
 
 
+from tests.test_helpers import seed_default_filters
+
+
 def _auth(client) -> dict:
     r = client.post("/api/login", json={"username": "admin", "password": "admin123"})
     assert r.status_code == 200, r.text
@@ -104,7 +107,18 @@ def test_full_flow(client):
     # 管理员预先创建节点（也可省略；node_client 首次登录会自动注册）
     r = client.post(
         "/api/nodes",
-        json={"name": "node-1", "lot_mode": "signal", "mt5_login": 5001},
+        json={
+            "name": "node-1",
+            "mt5_login": 5001,
+            "filters": {
+                "EURUSD": {
+                    "follow_sync": True,
+                    "follow_poll": True,
+                    "lot_mode": "signal",
+                    "poll_order": 0,
+                }
+            },
+        },
         headers=h,
     )
     assert r.status_code == 201, r.text
@@ -127,6 +141,8 @@ def test_full_flow(client):
                 },
             }
         )
+
+        seed_default_filters(client)
 
         # webhook signal -> sync dispatch -> node receives an open command
         r = client.post("/webhook", json={"action": "buy", "symbol": "EURUSD", "volume": 0.1})
@@ -160,7 +176,7 @@ def test_duplicate_node_login_rejected(client):
     token = _node_token(client, h)
     r = client.post(
         "/api/nodes",
-        json={"name": "dup", "lot_mode": "global", "mt5_login": 6001},
+        json={"name": "dup", "mt5_login": 6001},
         headers=h,
     )
     assert r.status_code == 201, r.text
@@ -225,12 +241,8 @@ def test_auto_register_on_first_login(client):
     created = next(n for n in r.json() if n["mt5_login"] == 8001)
     assert created["node_id"] == new_node_id
     assert created["name"] == "node-8001"
-    assert created["lot_mode"] == "fixed"
-    assert created["lot"] == 0.01
-    assert created["follow_sync"] is True
-    assert created["follow_poll"] is True
-    assert created["poll_order"] == 0
     assert created["enabled"] is True
+    assert created.get("filters") in (None, {})
 
 
 def test_create_node_duplicate_mt5_login_returns_409(client):
@@ -273,6 +285,7 @@ def test_node_token_rotate(client):
 
 
 def test_webhook_duplicate_suppressed(client):
+    seed_default_filters(client)
     _auth(client)
     p = {"action": "sell", "symbol": "XAUUSD", "volume": 0.1}
     r1 = client.post("/webhook", json=p)

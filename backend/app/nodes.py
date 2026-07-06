@@ -20,11 +20,7 @@ async def _to_node_out(store: RedisStore, d: dict) -> NodeOut:
         enabled=d.get("enabled", True),
         # 在线状态以“当前进程内是否有活动连接”为准（单实例下最实时）
         status="online" if manager.is_node_online(d["node_id"]) else "offline",
-        lot_mode=d.get("lot_mode", "global"),
-        lot=d.get("lot"),
-        follow_sync=d.get("follow_sync", True),
-        follow_poll=d.get("follow_poll", True),
-        poll_order=d.get("poll_order", 0),
+        filters=d.get("filters"),
         mt5_login=d.get("mt5_login"),
         mt5_server=d.get("mt5_server") or acct.get("server"),
         created_at=d.get("created_at", 0),
@@ -36,7 +32,7 @@ async def _to_node_out(store: RedisStore, d: dict) -> NodeOut:
 async def list_nodes(store: RedisStore = Depends(get_store), _: str = Depends(get_current_admin)):
     """节点列表（按轮询顺序、创建时间排序）。"""
     nodes = await store.all_nodes()
-    nodes.sort(key=lambda n: (n.get("poll_order", 0), n.get("created_at", 0)))
+    nodes.sort(key=lambda n: n.get("created_at", 0))
     return [await _to_node_out(store, n) for n in nodes]
 
 

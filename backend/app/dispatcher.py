@@ -38,8 +38,8 @@ class Dispatcher:
     def __init__(self, store: RedisStore) -> None:
         self.store = store
 
-    async def _eligible_nodes(self, follow: str) -> list[dict]:
-        """筛选“可参与本次分发”的节点：已启用 + 在线 + 跟随对应模式。"""
+    async def _eligible_nodes(self, follow: str, symbol: str, filters: dict) -> list[dict]:
+        """筛选“可参与本次分发”的节点：已启用 + 在线 + 该币种参与对应分发模式。"""
         nodes = await self.store.all_nodes()
         out: list[dict] = []
         for n in nodes:
@@ -47,19 +47,29 @@ class Dispatcher:
                 continue
             if not manager.is_node_online(n["node_id"]):
                 continue
-            if follow == "sync" and not n.get("follow_sync", True):
-                continue
-            if follow == "poll" and not n.get("follow_poll", True):
+            if not rules.node_participates(n, symbol, follow, filters):
                 continue
             out.append(n)
         return out
 
+    async def _online_enabled_nodes(self) -> list[dict]:
+        """所有已启用且在线的节点（用于 CLOSE 广播）。"""
+        nodes = await self.store.all_nodes()
+        return [
+            n for n in nodes
+            if n.get("enabled", True) and manager.is_node_online(n["node_id"])
+        ]
+
     async def dispatch(self, signal: TradingSignal, signal_id: str,
                        source_ip: Optional[str] = None) -> dict:
-        """分发入口：按全局分发配置选择 sync / poll，CLOSE 走专用广播。"""
-        dcfg = await self.store.get_dispatch()
-        mode = dcfg.get("mode", "sync")
-        scope = dcfg.get("position_scope", "symbol")
+        """分发入口：按信号品种的分发配置选择 sync / poll，CLOSE 走专用广播。"""
+        filters = await self.store.get_filters()
+        mode, scope, reject_reason = rules.resolve_dispatch_config(signal.symbol, filters)
+        if reject_reason:
+            await persist.record_signal(signal_id, signal, source_ip, True, None, status="rejected")
+            logger.info("signal rejected: %s", reject_reason)
+            return {"mode": "rejected", "targets": 0, "reason": reject_reason}
+
         # 先落库一条信号历史（best-effort，不阻塞交易）
         await persist.record_signal(signal_id, signal, source_ip, True, mode)
 
@@ -68,17 +78,18 @@ class Dispatcher:
             return {"mode": "close", "targets": n}
 
         if mode == "poll":
-            n = await self._enqueue_poll(signal, signal_id, scope)
+            n = await self._enqueue_poll(signal, signal_id, scope, filters)
             return {"mode": "poll", "targets": n}
 
-        n = await self._dispatch_sync(signal, signal_id, scope)
+        n = await self._dispatch_sync(signal, signal_id, scope, filters)
         return {"mode": "sync", "targets": n}
 
-    async def _dispatch_sync(self, signal: TradingSignal, signal_id: str, scope: str) -> int:
+    async def _dispatch_sync(
+        self, signal: TradingSignal, signal_id: str, scope: str, filters: dict,
+    ) -> int:
         """9.5 全员同步：对所有目标节点并发下发（fire-and-forget）。"""
         global_lot = await self.store.get_lot_global()
-        filters = await self.store.get_filters()
-        targets = await self._eligible_nodes("sync")
+        targets = await self._eligible_nodes("sync", signal.symbol, filters)
         # 并发执行；单个节点异常不影响其它节点
         await asyncio.gather(
             *[
@@ -89,11 +100,15 @@ class Dispatcher:
         )
         return len(targets)
 
-    async def _enqueue_poll(self, signal: TradingSignal, signal_id: str, scope: str) -> int:
+    async def _enqueue_poll(
+        self, signal: TradingSignal, signal_id: str, scope: str, filters: dict,
+    ) -> int:
         """9.6 轮询领取：固定节点顺序 + 进度写入 Redis，再把 signal_id 入队。"""
-        targets = await self._eligible_nodes("poll")
+        targets = await self._eligible_nodes("poll", signal.symbol, filters)
         # 排序规则：poll_order 小者优先，其次按创建时间
-        targets.sort(key=lambda n: (n.get("poll_order", 0), n.get("created_at", 0)))
+        targets.sort(
+            key=lambda n: (rules.node_poll_order(n, signal.symbol), n.get("created_at", 0)),
+        )
         progress = {
             "signal": signal_to_dict(signal),
             "signal_id": signal_id,
@@ -141,7 +156,7 @@ class Dispatcher:
             await self._skip(signal_id, node_id, reason)
             return {"status": "skipped", "reason": reason}
 
-        vol = rules.resolve_volume(node, signal.volume, global_lot)
+        vol = rules.resolve_volume(node, signal.volume, global_lot, signal.symbol)
         cmd = build_open_command(
             signal_id, signal.action, signal.symbol, vol,
             signal.stop_loss, signal.take_profit, signal.comment,
@@ -196,8 +211,8 @@ class Dispatcher:
         )
 
     async def _dispatch_close(self, signal: TradingSignal, signal_id: str) -> int:
-        """CLOSE 信号：通知每个在线节点各自平掉该品种（不做过滤）。"""
-        targets = await self._eligible_nodes("sync")
+        """CLOSE 信号：通知每个在线节点各自平掉该品种（不受分发模式开关限制）。"""
+        targets = await self._online_enabled_nodes()
         cmd = build_close_command(signal_id, "symbol", signal.symbol)
         count = 0
         for node in targets:

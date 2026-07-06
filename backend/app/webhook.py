@@ -85,6 +85,16 @@ async def webhook(
     # 正式分发
     signal_id = _new_signal_id()
     result = await dispatcher.dispatch(signal, signal_id, source_ip=ip)
+    if result.get("mode") == "rejected":
+        return {
+            "status": "rejected",
+            "signal_id": signal_id,
+            "action": signal.action,
+            "symbol": signal.symbol,
+            "volume": signal.volume,
+            "reason": result.get("reason"),
+            **result,
+        }
     return {
         "status": "accepted",
         "signal_id": signal_id,

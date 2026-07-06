@@ -5,11 +5,7 @@ export interface NodeOut {
   name: string
   enabled: boolean
   status: 'online' | 'offline'
-  lot_mode: 'global' | 'fixed' | 'signal'
-  lot: number | null
-  follow_sync: boolean
-  follow_poll: boolean
-  poll_order: number
+  filters?: NodeDispatchFiltersConfig | null
   mt5_login: number | null
   mt5_server: string | null
   created_at: number
@@ -58,11 +54,6 @@ export interface LotConfig {
   value: number
 }
 
-export interface DispatchConfig {
-  mode: 'sync' | 'poll'
-  position_scope: 'symbol' | 'account'
-}
-
 /** 区间方向过滤：单条价格区间允许的开仓方向 */
 export type FilterDirection = 'BUY' | 'SELL'
 
@@ -75,18 +66,33 @@ export interface FilterInterval {
   allow: FilterDirection[]
 }
 
-/** 单个品种的区间过滤规则（键为品种代码，如 XAUUSD） */
+/** 单个品种的区间过滤与分发规则（键为品种代码，如 XAUUSD，全局 filters） */
 export interface SymbolFilterRule {
   enabled: boolean
   /** 是否允许接收做多 (BUY) 信号，默认 true */
   allow_buy: boolean
   /** 是否允许接收做空 (SELL) 信号，默认 true */
   allow_sell: boolean
+  /** 该币种信号的分发模式，默认 sync */
+  dispatch_mode: 'sync' | 'poll'
+  /** 持仓判定范围，默认 symbol */
+  position_scope: 'symbol' | 'account'
   default_action: DefaultFilterAction
   intervals: FilterInterval[]
 }
 
 export type FilterRulesConfig = Record<string, SymbolFilterRule>
+
+/** 节点 filters：按币种配置分发参与、手数策略与轮询顺序 */
+export interface NodeSymbolDispatchRule {
+  follow_sync: boolean
+  follow_poll: boolean
+  lot_mode: 'global' | 'fixed' | 'signal'
+  lot: number | null
+  poll_order: number
+}
+
+export type NodeDispatchFiltersConfig = Record<string, NodeSymbolDispatchRule>
 
 // 全局节点接入令牌（所有节点共享，存于「账户设置」）
 export interface NodeTokenInfo {
@@ -98,23 +104,13 @@ export interface NodeCreatePayload {
   // 留空时后端会自动生成 "node-{mt5_login}"
   name?: string
   mt5_login: number
-  lot_mode?: string
-  lot?: number | null
-  follow_sync?: boolean
-  follow_poll?: boolean
-  poll_order?: number
-  filters?: Record<string, unknown> | null
+  filters?: NodeDispatchFiltersConfig | null
 }
 
 export interface NodeUpdatePayload {
   name?: string
   enabled?: boolean
-  lot_mode?: string
-  lot?: number | null
-  follow_sync?: boolean
-  follow_poll?: boolean
-  poll_order?: number
-  filters?: Record<string, unknown> | null
+  filters?: NodeDispatchFiltersConfig | null
 }
 
 export interface CloseRequest {

@@ -6,6 +6,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useHubStore } from '@/stores/hub'
 import type { AccountSnapshot, NodeDispatchRecord, NodeFeedItem, NodeOut } from '@/api/types'
+import { parseNodeDispatchFilters } from '@/utils/filterRules'
 
 const route = useRoute()
 const router = useRouter()
@@ -13,6 +14,8 @@ const hub = useHubStore()
 
 const id = computed(() => String(route.params.id))
 const node = computed<NodeOut | undefined>(() => hub.nodes.find((n) => n.node_id === id.value))
+const nodeDispatchFilters = computed(() => parseNodeDispatchFilters(node.value?.filters))
+const nodeDispatchSymbols = computed(() => Object.keys(nodeDispatchFilters.value).sort())
 const acct = computed<AccountSnapshot | undefined>(() => hub.accounts[id.value])
 const statusOf = computed(() => hub.statuses[id.value] || node.value?.status || 'offline')
 
@@ -273,18 +276,28 @@ async function closeTicket(ticket: number): Promise<void> {
         <div class="card card-pad">
           <strong>节点配置</strong>
           <div class="kv-grid" style="margin-top: 12px">
-            <div class="kv">
-              <span class="k">手数策略</span>
-              <span class="v">
-                <span class="tag blue">{{ node.lot_mode }}</span>
-                <span v-if="node.lot_mode === 'fixed'"> {{ node.lot }}</span>
-              </span>
-            </div>
-            <div class="kv"><span class="k">跟随同步模式</span><span class="v">{{ node.follow_sync ? '是' : '否' }}</span></div>
-            <div class="kv"><span class="k">跟随轮询模式</span><span class="v">{{ node.follow_poll ? '是' : '否' }}</span></div>
-            <div class="kv"><span class="k">轮询顺序</span><span class="v">{{ node.poll_order }}</span></div>
             <div class="kv"><span class="k">启用</span><span class="v">{{ node.enabled ? '是' : '否' }}</span></div>
             <div class="kv"><span class="k">创建时间</span><span class="v" style="font-size: 12px">{{ fmtTime((node.created_at || 0) * 1000) }}</span></div>
+          </div>
+          <div style="margin-top: 14px">
+            <strong style="font-size: 13px">按币种配置</strong>
+            <div v-if="!nodeDispatchSymbols.length" class="muted" style="font-size: 12px; margin-top: 8px">
+              未单独配置（回退默认：固定手数 0.01、轮询序 0、全部参与同步与轮询）
+            </div>
+            <div v-else class="kv-grid" style="margin-top: 8px">
+              <div v-for="sym in nodeDispatchSymbols" :key="sym" class="kv span-full">
+                <span class="k">{{ sym }}</span>
+                <span class="v" style="display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end">
+                  <span class="tag" :class="nodeDispatchFilters[sym]?.follow_sync ? 'green' : ''">同步</span>
+                  <span class="tag" :class="nodeDispatchFilters[sym]?.follow_poll ? 'green' : ''">轮询</span>
+                  <span class="tag blue">{{ nodeDispatchFilters[sym]?.lot_mode }}</span>
+                  <span v-if="nodeDispatchFilters[sym]?.lot_mode === 'fixed'" class="muted" style="font-size: 12px">
+                    {{ nodeDispatchFilters[sym]?.lot }}
+                  </span>
+                  <span class="muted" style="font-size: 12px">序 {{ nodeDispatchFilters[sym]?.poll_order ?? 0 }}</span>
+                </span>
+              </div>
+            </div>
           </div>
         </div>
       </div>
