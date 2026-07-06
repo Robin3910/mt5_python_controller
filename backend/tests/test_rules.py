@@ -113,3 +113,41 @@ def test_interval_disabled_passes():
 def test_interval_no_price_passes():
     ok, _ = rules.interval_filter("SELL", "EURUSD", None, FILTERS)
     assert ok is True
+
+
+def test_interval_master_switch_blocks_buy():
+    cfg = {
+        "EURUSD": {
+            "enabled": True,
+            "allow_buy": False,
+            "allow_sell": True,
+            "default_action": "pass",
+            "intervals": [{"low": 1.05, "high": 1.10, "allow": ["BUY"]}],
+        }
+    }
+    ok, reason = rules.interval_filter("BUY", "EURUSD", 1.07, cfg)
+    assert ok is False
+    assert reason is not None and "方向总开关" in reason and "BUY" in reason
+
+
+def test_interval_master_switch_blocks_sell():
+    cfg = {
+        "EURUSD": {
+            "enabled": True,
+            "allow_buy": True,
+            "allow_sell": False,
+            "default_action": "pass",
+            "intervals": [{"low": 1.05, "high": 1.10, "allow": ["SELL"]}],
+        }
+    }
+    ok, reason = rules.interval_filter("SELL", "EURUSD", 1.07, cfg)
+    assert ok is False
+    assert reason is not None and "方向总开关" in reason and "SELL" in reason
+
+
+def test_interval_master_switch_defaults_open():
+    cfg = {"EURUSD": {"enabled": True, "default_action": "pass", "intervals": []}}
+    ok, _ = rules.interval_filter("BUY", "EURUSD", 1.07, cfg)
+    assert ok is True
+    ok, _ = rules.interval_filter("SELL", "EURUSD", 1.07, cfg)
+    assert ok is True

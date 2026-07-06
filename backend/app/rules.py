@@ -136,6 +136,10 @@ def interval_filter(
     sf = filters_cfg.get(symbol) or filters_cfg.get(base_symbol(symbol))
     if not sf or not sf.get("enabled"):
         return True, None
+    if action == "BUY" and sf.get("allow_buy", True) is False:
+        return False, f"方向总开关：该品种已禁止接收做多(BUY)信号"
+    if action == "SELL" and sf.get("allow_sell", True) is False:
+        return False, f"方向总开关：该品种已禁止接收做空(SELL)信号"
     if price is None:
         return True, None
     for iv in sf.get("intervals", []):

@@ -11,13 +11,15 @@ export function createEmptyInterval(): FilterInterval {
 }
 
 export function createEmptySymbolRule(): SymbolFilterRule {
-  return { enabled: true, default_action: 'block', intervals: [] }
+  return { enabled: true, allow_buy: true, allow_sell: true, default_action: 'block', intervals: [] }
 }
 
 export function exampleFilterRules(): FilterRulesConfig {
   return {
     XAUUSD: {
       enabled: true,
+      allow_buy: true,
+      allow_sell: true,
       default_action: 'block',
       intervals: [
         { low: 2300, high: 2350, allow: ['BUY'] },
@@ -54,6 +56,8 @@ function normalizeSymbolRule(raw: unknown): SymbolFilterRule {
     .filter((iv): iv is FilterInterval => iv !== null)
   return {
     enabled: o.enabled !== false,
+    allow_buy: o.allow_buy !== false,
+    allow_sell: o.allow_sell !== false,
     default_action: defaultAction,
     intervals,
   }
@@ -79,6 +83,8 @@ export function serializeFilterRules(rules: FilterRulesConfig): FilterRulesConfi
     if (!key) continue
     out[key] = {
       enabled: rule.enabled !== false,
+      allow_buy: rule.allow_buy !== false,
+      allow_sell: rule.allow_sell !== false,
       default_action: rule.default_action === 'pass' ? 'pass' : 'block',
       intervals: (rule.intervals ?? []).map((iv) => ({
         low: Number(iv.low),

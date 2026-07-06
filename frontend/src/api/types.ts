@@ -78,6 +78,10 @@ export interface FilterInterval {
 /** 单个品种的区间过滤规则（键为品种代码，如 XAUUSD） */
 export interface SymbolFilterRule {
   enabled: boolean
+  /** 是否允许接收做多 (BUY) 信号，默认 true */
+  allow_buy: boolean
+  /** 是否允许接收做空 (SELL) 信号，默认 true */
+  allow_sell: boolean
   default_action: DefaultFilterAction
   intervals: FilterInterval[]
 }

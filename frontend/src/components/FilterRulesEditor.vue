@@ -1,5 +1,8 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import { ElSwitch } from 'element-plus'
+import 'element-plus/es/components/switch/style/css'
+import 'element-plus/theme-chalk/dark/css-vars.css'
 import type { FilterDirection, FilterRulesConfig, SymbolFilterRule } from '@/api/types'
 import {
   createEmptyInterval,
@@ -92,6 +95,14 @@ function loadExample(): void {
   model.value = exampleFilterRules()
 }
 
+function setAllowBuy(symbol: string, value: string | number | boolean): void {
+  updateRule(symbol, { allow_buy: Boolean(value) })
+}
+
+function setAllowSell(symbol: string, value: string | number | boolean): void {
+  updateRule(symbol, { allow_sell: Boolean(value) })
+}
+
 defineExpose({ loadExample })
 </script>
 
@@ -99,7 +110,7 @@ defineExpose({ loadExample })
   <div class="filter-editor">
     <div class="row between filter-toolbar">
       <p class="muted filter-hint">
-        按品种设置价格区间与允许方向。价格落在区间内时只允许勾选的方向开仓；不在任何区间时按「默认动作」处理。
+        按品种设置价格区间与允许方向。可单独关闭某品种的做多/做空总开关；价格落在区间内时只允许勾选的方向开仓；不在任何区间时按「默认动作」处理。
       </p>
       <div class="row filter-toolbar-actions">
         <button type="button" class="btn-sm btn-ghost" @click="loadExample">载入示例</button>
@@ -130,7 +141,7 @@ defineExpose({ loadExample })
 
     <div v-for="{ symbol, rule } in symbolList" :key="symbol" class="filter-symbol-card card card-pad">
       <div class="row between filter-symbol-head">
-        <div class="row" style="gap: 10px">
+        <div class="row filter-symbol-switches" style="gap: 10px; flex-wrap: wrap">
           <strong class="filter-symbol-name">{{ symbol }}</strong>
           <label class="filter-enabled">
             <input
@@ -140,6 +151,20 @@ defineExpose({ loadExample })
             />
             启用
           </label>
+          <div class="filter-dir-switch">
+            <span class="filter-switch-label">允许做多 (BUY)</span>
+            <el-switch
+              :model-value="rule.allow_buy"
+              @change="setAllowBuy(symbol, $event)"
+            />
+          </div>
+          <div class="filter-dir-switch">
+            <span class="filter-switch-label">允许做空 (SELL)</span>
+            <el-switch
+              :model-value="rule.allow_sell"
+              @change="setAllowSell(symbol, $event)"
+            />
+          </div>
         </div>
         <button type="button" class="btn-sm btn-ghost" @click="removeSymbol(symbol)">删除品种</button>
       </div>
@@ -293,6 +318,21 @@ defineExpose({ loadExample })
 }
 .filter-symbol-card { background: var(--bg-soft); }
 .filter-symbol-name { font-size: 15px; letter-spacing: 0.3px; }
+.filter-symbol-switches { align-items: center; }
+.filter-dir-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.filter-switch-label {
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+:deep(.el-switch.is-checked .el-switch__core) {
+  background-color: var(--primary);
+  border-color: var(--primary);
+}
 .filter-enabled {
   display: inline-flex;
   align-items: center;
