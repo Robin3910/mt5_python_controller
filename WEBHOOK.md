@@ -1,5 +1,7 @@
 # Webhook 入参文档
 
+> **最后更新：2026-07-06 21:10**
+
 TradingView → MT5 跟单系统的信号接收接口说明。本文档描述的是**代码的真实行为**（以 `backend/app/webhook.py` + `backend/app/parser.py` + `backend/app/config.py` 为准），而非 README 的宣传性描述。
 
 ---
@@ -258,7 +260,11 @@ SYMBOL=GBPUSD long LOT=0.1
 - HTTP 仍为 `200`（与 `duplicate` 相同）；TradingView 若只校验 2xx 会显示投递成功，需在管理端核对。
 - 处理：Web「中控台」→ 添加该品种 → 保存过滤规则。
 
-### 9.4 错误响应
+### 9.4 持久化与查询（v0.4）
+
+每次 Webhook 请求（含解析失败）都会尽力写入 `signal_history.raw_payload`（原始 JSON 或纯文本），供管理端 **「事件」页**（`GET /api/events/signals`）与节点详情 Tab 追溯。解析失败时 `parsed_ok=false`、`status=rejected`，仍保留原始体。
+
+### 9.5 错误响应
 
 | 状态码 | body | 触发条件 |
 | --- | --- | --- |
@@ -376,11 +382,11 @@ curl -X POST http://localhost:8000/webhook \
 
 ---
 
-> 行为基准：`backend/app/parser.py`（解析）、`backend/app/webhook.py`（鉴权/去重/响应）、`backend/app/config.py`（品种与关键字）、`backend/app/settings.py`（环境变量）。
+> 行为基准：`backend/app/webhook.py`（鉴权/去重/响应/**raw_payload 持久化**）、`backend/app/parser.py`（解析）、`backend/app/config.py`（品种与关键字）、`backend/app/settings.py`（环境变量）、`backend/app/persist.py`（`recent_webhook_events`）。
 >
 > 全场景回归测试：
 > - `backend/tests/test_parser.py` —— 纯解析层（动作/品种/手数/止盈止损/`allow_position` 精确规则/文本模式坑位/格式三回退/校验规则）。
 > - `backend/tests/test_webhook.py` —— HTTP 端到端（token 4 种传入方式、IP 白名单与 `X-Forwarded-For`、白名单→鉴权→解析的顺序、三种请求体形态、去重、**未登记品种 rejected**、各类 400/401/403、响应字段）。
-> - `backend/tests/test_api.py` —— 含 webhook→分发→节点回报的全链路冒烟。
+> - `backend/tests/test_api.py` —— 含 webhook→分发→节点回报的全链路冒烟，以及 **`GET /api/events/signals`** 分页与 `raw_payload` 断言。
 >
 > 运行：`cd backend && python -m pytest tests/test_parser.py tests/test_webhook.py -q`
