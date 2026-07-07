@@ -11,6 +11,15 @@ from .redis_store import RedisStore
 router = APIRouter(prefix="/api/nodes", tags=["nodes"])
 
 
+def _node_matches_search(node: dict, term: str) -> bool:
+    """按节点名称（忽略大小写）或 MT5 账号（子串）模糊匹配。"""
+    q = term.lower()
+    if q in (node.get("name") or "").lower():
+        return True
+    mt5 = node.get("mt5_login")
+    return mt5 is not None and term in str(mt5)
+
+
 async def _to_node_out(store: RedisStore, d: dict) -> NodeOut:
     """把缓存里的节点 dict 组装成对外的 NodeOut（合并在线状态与账户登录信息）。"""
     acct = await store.get_account(d["node_id"]) or {}
@@ -29,9 +38,15 @@ async def _to_node_out(store: RedisStore, d: dict) -> NodeOut:
 
 
 @router.get("", response_model=list[NodeOut])
-async def list_nodes(store: RedisStore = Depends(get_store), _: str = Depends(get_current_admin)):
-    """节点列表（按轮询顺序、创建时间排序）。"""
+async def list_nodes(
+    q: str | None = None,
+    store: RedisStore = Depends(get_store),
+    _: str = Depends(get_current_admin),
+):
+    """节点列表（按创建时间排序）；可选 q 按名称 / MT5 账号模糊搜索。"""
     nodes = await store.all_nodes()
+    if q and (term := q.strip()):
+        nodes = [n for n in nodes if _node_matches_search(n, term)]
     nodes.sort(key=lambda n: n.get("created_at", 0))
     return [await _to_node_out(store, n) for n in nodes]
 

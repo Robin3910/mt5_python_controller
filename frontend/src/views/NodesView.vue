@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // 节点管理页：创建/编辑/删除节点、启停、重置令牌、批量全平（令牌仅创建时显示一次）
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import FormLabel from '@/components/FormLabel.vue'
 import FilterRulesEditor from '@/components/FilterRulesEditor.vue'
@@ -12,7 +12,38 @@ import { confirmAction } from '@/utils/confirm'
 
 const hub = useHubStore()
 const router = useRouter()
-onMounted(() => hub.fetchNodes())
+
+const searchQuery = ref('')
+const appliedQuery = ref('')
+const searching = ref(false)
+
+function currentSearchOptions(): { q?: string } {
+  return appliedQuery.value ? { q: appliedQuery.value } : {}
+}
+
+async function loadNodes(): Promise<void> {
+  searching.value = true
+  try {
+    await hub.fetchNodes(currentSearchOptions())
+  } finally {
+    searching.value = false
+  }
+}
+
+async function runSearch(): Promise<void> {
+  appliedQuery.value = searchQuery.value.trim()
+  await loadNodes()
+}
+
+onMounted(() => {
+  void loadNodes()
+})
+
+onUnmounted(() => {
+  if (appliedQuery.value) {
+    void hub.fetchNodes()
+  }
+})
 
 function goDetail(n: NodeOut): void {
   router.push(`/nodes/${n.node_id}`)
@@ -67,7 +98,12 @@ function toggleSelect(id: string, checked: boolean): void {
 }
 
 function toggleSelectAll(checked: boolean): void {
-  selectedIds.value = checked ? new Set(hub.nodes.map((n) => n.node_id)) : new Set()
+  if (!checked) {
+    const visible = new Set(hub.nodes.map((n) => n.node_id))
+    selectedIds.value = new Set([...selectedIds.value].filter((id) => !visible.has(id)))
+    return
+  }
+  selectedIds.value = new Set([...selectedIds.value, ...hub.nodes.map((n) => n.node_id)])
 }
 
 async function closeSelected(): Promise<void> {
@@ -140,7 +176,7 @@ async function save(): Promise<void> {
       const login = form.mt5_login
       if (!(await confirmAction(`确认创建节点？\n\nMT5 登录号：${login}`))) return
       try {
-        await hub.createNode({ ...payload, mt5_login: form.mt5_login })
+        await hub.createNode({ ...payload, mt5_login: form.mt5_login }, currentSearchOptions())
       } catch (e: unknown) {
         const err = e as { response?: { status?: number; data?: { detail?: string } } }
         if (err?.response?.status === 409) {
@@ -154,7 +190,7 @@ async function save(): Promise<void> {
       const label = form.name || editingId.value
       const enabledText = form.enabled ? '启用' : '禁用'
       if (!(await confirmAction(`确认更新节点「${label}」？\n\n启用状态：${enabledText}`))) return
-      await hub.updateNode(editingId.value, { ...payload, enabled: form.enabled })
+      await hub.updateNode(editingId.value, { ...payload, enabled: form.enabled }, currentSearchOptions())
     }
     showForm.value = false
   } finally {
@@ -164,13 +200,13 @@ async function save(): Promise<void> {
 
 async function remove(n: NodeOut): Promise<void> {
   if (!(await confirmAction(`确认删除节点「${n.name}」？\n\n该操作不可恢复。`, '确认删除'))) return
-  await hub.deleteNode(n.node_id)
+  await hub.deleteNode(n.node_id, currentSearchOptions())
 }
 
 async function toggleEnabled(n: NodeOut): Promise<void> {
   const next = n.enabled ? '禁用' : '启用'
   if (!(await confirmAction(`确认${next}节点「${n.name}」？\n\n${next}后将${n.enabled ? '无法接入且不参与分发' : '恢复正常跟单'}。`))) return
-  await hub.updateNode(n.node_id, { enabled: !n.enabled })
+  await hub.updateNode(n.node_id, { enabled: !n.enabled }, currentSearchOptions())
 }
 </script>
 
@@ -190,6 +226,29 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
       </button>
       <button class="btn-primary" @click="openCreate">+ 新建节点</button>
     </div>
+  </div>
+
+  <div class="card card-pad node-search-bar" style="margin-bottom: 12px">
+    <div class="row" style="gap: 8px">
+      <input
+        v-model="searchQuery"
+        type="search"
+        placeholder="搜索节点名称或 MT5 账号…"
+        aria-label="搜索节点名称或 MT5 账号"
+        :disabled="searching"
+        style="width: 25%"
+        @keydown.enter="runSearch"
+      />
+      <button class="btn-primary btn-sm" :disabled="searching" @click="runSearch">
+        {{ searching ? '搜索中…' : '搜索' }}
+      </button>
+    </div>
+    <p v-if="appliedQuery && !hub.nodes.length" class="muted" style="font-size: 12px; margin: 8px 0 0">
+      无匹配节点
+    </p>
+    <p v-else-if="appliedQuery" class="muted" style="font-size: 12px; margin: 8px 0 0">
+      找到 {{ hub.nodes.length }} 个节点
+    </p>
   </div>
 
   <div v-if="hub.nodes.length" class="row mobile-only" style="margin-bottom: 10px">
@@ -233,7 +292,9 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
         <button class="btn-sm btn-danger" @click="remove(n)">删除</button>
       </div>
     </div>
-    <div v-if="!hub.nodes.length" class="card card-pad muted">暂无节点</div>
+    <div v-if="!hub.nodes.length && !searching" class="card card-pad muted">
+      {{ appliedQuery ? '无匹配节点' : '暂无节点' }}
+    </div>
   </div>
 
   <div class="card table-scroll desktop-only">
@@ -277,7 +338,11 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
             <button class="btn-sm btn-danger" @click="remove(n)">删除</button>
           </td>
         </tr>
-        <tr v-if="!hub.nodes.length"><td colspan="7" class="muted" style="padding: 18px">暂无节点</td></tr>
+        <tr v-if="!hub.nodes.length && !searching">
+          <td colspan="7" class="muted" style="padding: 18px">
+            {{ appliedQuery ? '无匹配节点' : '暂无节点' }}
+          </td>
+        </tr>
       </tbody>
     </table>
   </div>

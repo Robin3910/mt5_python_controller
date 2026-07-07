@@ -47,8 +47,10 @@ export const useHubStore = defineStore('hub', {
   },
   actions: {
     // ---- REST 拉取 ----
-    async fetchNodes(): Promise<void> {
-      this.nodes = (await api.get('/api/nodes')).data
+    async fetchNodes(options?: { q?: string }): Promise<void> {
+      const q = options?.q?.trim()
+      const params = q ? { q } : undefined
+      this.nodes = (await api.get('/api/nodes', { params })).data
       for (const n of this.nodes) {
         if (!(n.node_id in this.statuses)) this.statuses[n.node_id] = n.status
       }
@@ -93,18 +95,18 @@ export const useHubStore = defineStore('hub', {
       }
     },
     // ---- 节点增删改 ----
-    async createNode(payload: NodeCreatePayload): Promise<NodeOut> {
+    async createNode(payload: NodeCreatePayload, options?: { q?: string }): Promise<NodeOut> {
       const created = (await api.post('/api/nodes', payload)).data
-      await this.fetchNodes()
+      await this.fetchNodes(options)
       return created
     },
-    async updateNode(id: string, patch: NodeUpdatePayload): Promise<void> {
+    async updateNode(id: string, patch: NodeUpdatePayload, options?: { q?: string }): Promise<void> {
       await api.patch(`/api/nodes/${id}`, patch)
-      await this.fetchNodes()
+      await this.fetchNodes(options)
     },
-    async deleteNode(id: string): Promise<void> {
+    async deleteNode(id: string, options?: { q?: string }): Promise<void> {
       await api.delete(`/api/nodes/${id}`)
-      await this.fetchNodes()
+      await this.fetchNodes(options)
     },
     // ---- 配置保存 ----
     async saveLot(cfg: LotConfig): Promise<void> {

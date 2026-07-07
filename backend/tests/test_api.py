@@ -292,6 +292,26 @@ def test_create_node_duplicate_mt5_login_returns_409(client):
     assert "9001" in r2.json()["detail"]
 
 
+def test_list_nodes_search_by_name_and_mt5_login(client):
+    h = _auth(client)
+    client.post("/api/nodes", json={"name": "Alpha VPS", "mt5_login": 60108484}, headers=h)
+    client.post("/api/nodes", json={"name": "Beta Server", "mt5_login": 70001234}, headers=h)
+
+    by_name = client.get("/api/nodes", params={"q": "alpha"}, headers=h)
+    assert by_name.status_code == 200
+    assert len(by_name.json()) == 1
+    assert by_name.json()[0]["name"] == "Alpha VPS"
+
+    by_login = client.get("/api/nodes", params={"q": "1234"}, headers=h)
+    assert by_login.status_code == 200
+    assert len(by_login.json()) == 1
+    assert by_login.json()[0]["mt5_login"] == 70001234
+
+    empty = client.get("/api/nodes", params={"q": "missing-node"}, headers=h)
+    assert empty.status_code == 200
+    assert empty.json() == []
+
+
 def test_node_token_rotate(client):
     """重置令牌后，旧令牌应失效，新令牌可用。"""
     h = _auth(client)
