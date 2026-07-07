@@ -1,6 +1,6 @@
 <script setup lang="ts">
-// 中控台：系统配置（全局手数 / 区间过滤与按币种分发策略）
-import { onMounted, reactive, ref } from 'vue'
+// 中控台：系统配置（区间过滤与按币种分发策略）
+import { onMounted, ref } from 'vue'
 import { useHubStore } from '@/stores/hub'
 import FilterRulesEditor from '@/components/FilterRulesEditor.vue'
 import type { FilterRulesConfig } from '@/api/types'
@@ -9,15 +9,12 @@ import { confirmAction } from '@/utils/confirm'
 
 const hub = useHubStore()
 
-const lot = reactive({ enabled: false, value: 0.1 })
 const filters = ref<FilterRulesConfig>({})
 const filtersError = ref('')
 const savedFlag = ref('')
 
 onMounted(async () => {
   await hub.fetchConfig()
-  lot.enabled = hub.lot.enabled
-  lot.value = hub.lot.value
   filters.value = parseFilterRules(hub.filters)
 })
 
@@ -26,12 +23,6 @@ function flash(msg: string): void {
   setTimeout(() => (savedFlag.value = ''), 1800)
 }
 
-async function saveLot(): Promise<void> {
-  const state = lot.enabled ? `启用，手数 ${lot.value}` : '关闭'
-  if (!(await confirmAction(`确认保存全局手数配置？\n\n当前：${state}`))) return
-  await hub.saveLot({ enabled: lot.enabled, value: lot.value })
-  flash('全局手数已保存')
-}
 async function saveFilters(): Promise<void> {
   filtersError.value = ''
   const payload = serializeFilterRules(filters.value)
@@ -62,19 +53,6 @@ async function saveFilters(): Promise<void> {
       </div>
       <div v-if="filtersError" style="color: var(--red); font-size: 12px; margin-top: 10px">{{ filtersError }}</div>
       <div class="row" style="margin-top: 12px"><button class="btn-primary" @click="saveFilters">保存过滤规则</button></div>
-    </div>
-
-    <div class="card card-pad">
-      <strong>全局手数</strong>
-      <p class="muted" style="font-size: 12px">开启后，所有「跟随全局」策略的节点统一使用该手数。</p>
-      <div class="form-grid">
-        <div>
-          <label>启用全局手数</label>
-          <select v-model="lot.enabled"><option :value="true">启用</option><option :value="false">关闭</option></select>
-        </div>
-        <div><label>手数</label><input v-model.number="lot.value" type="number" step="0.01" :disabled="!lot.enabled" /></div>
-        <button class="btn-primary" @click="saveLot">保存</button>
-      </div>
     </div>
   </div>
 </template>

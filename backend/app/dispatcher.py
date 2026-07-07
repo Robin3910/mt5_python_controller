@@ -104,12 +104,11 @@ class Dispatcher:
         self, signal: TradingSignal, signal_id: str, scope: str, filters: dict,
     ) -> int:
         """9.5 全员同步：对所有目标节点并发下发（fire-and-forget）。"""
-        global_lot = await self.store.get_lot_global()
         targets = await self._eligible_nodes("sync", signal.symbol, filters, signal_id)
         # 并发执行；单个节点异常不影响其它节点
         await asyncio.gather(
             *[
-                self.try_open(n, signal, signal_id, scope, global_lot, filters, wait=False)
+                self.try_open(n, signal, signal_id, scope, filters, wait=False)
                 for n in targets
             ],
             return_exceptions=True,
@@ -139,7 +138,7 @@ class Dispatcher:
         return len(targets)
 
     async def try_open(self, node: dict, signal: TradingSignal, signal_id: str,
-                       scope: str, global_lot: dict, filters: dict,
+                       scope: str, filters: dict,
                        wait: bool = False, timeout: int = 15) -> dict:
         """对单个节点执行“开仓”决策与下发。
 
@@ -172,7 +171,7 @@ class Dispatcher:
             await self._skip(signal_id, node_id, reason)
             return {"status": "skipped", "reason": reason}
 
-        vol = rules.resolve_volume(node, signal.volume, global_lot, signal.symbol)
+        vol = rules.resolve_volume(node, signal.volume, filters, signal.symbol)
         cmd = build_open_command(
             signal_id, signal.action, signal.symbol, vol,
             signal.stop_loss, signal.take_profit, signal.comment,

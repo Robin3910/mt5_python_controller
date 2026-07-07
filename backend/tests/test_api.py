@@ -312,6 +312,38 @@ def test_list_nodes_search_by_name_and_mt5_login(client):
     assert empty.json() == []
 
 
+def test_create_node_global_lot_requires_console_lot_enabled(client):
+    h = _auth(client)
+    client.put(
+        "/api/config/filters",
+        json={
+            "EURUSD": {
+                "enabled": True,
+                "allow_buy": True,
+                "allow_sell": True,
+                "dispatch_mode": "sync",
+                "position_scope": "symbol",
+                "default_action": "pass",
+                "lot_enabled": False,
+                "lot": 0.01,
+                "intervals": [],
+            }
+        },
+        headers=h,
+    )
+    r = client.post(
+        "/api/nodes",
+        json={
+            "name": "bad-lot",
+            "mt5_login": 91001,
+            "filters": {"EURUSD": {"lot_mode": "global", "follow_sync": True, "follow_poll": True}},
+        },
+        headers=h,
+    )
+    assert r.status_code == 400
+    assert "未启用全局手数" in r.json()["detail"]
+
+
 def test_node_token_rotate(client):
     """重置令牌后，旧令牌应失效，新令牌可用。"""
     h = _auth(client)

@@ -149,7 +149,7 @@ defineExpose({ loadExample })
   <div class="filter-editor">
     <div class="row between filter-toolbar">
       <p v-if="isGlobal" class="muted filter-hint">
-        按品种设置分发策略、价格区间与允许方向。未在中控台配置的品种信号将被直接拒收；可单独关闭某品种的做多/做空总开关；价格落在区间内时只允许勾选的方向开仓；不在任何区间时按「默认动作」处理。
+        按品种设置分发策略、价格区间、允许方向与全局手数。未在中控台配置的品种信号将被直接拒收；节点手数策略为「跟随中控台」时使用此处配置的手数。
       </p>
       <p v-else class="muted filter-hint">
         按品种配置该节点的分发参与、手数策略与轮询顺序。未配置品种将回退节点默认策略（固定 0.01、轮询序 0）。
@@ -232,6 +232,27 @@ defineExpose({ loadExample })
               <option value="block">拦截 (block)</option>
               <option value="pass">放行 (pass)</option>
             </select>
+          </div>
+          <div>
+            <label>启用全局手数</label>
+            <select
+              :value="rule.lot_enabled ? 'true' : 'false'"
+              @change="updateRule(symbol, { lot_enabled: ($event.target as HTMLSelectElement).value === 'true' })"
+            >
+              <option value="false">关闭</option>
+              <option value="true">启用</option>
+            </select>
+          </div>
+          <div>
+            <label>全局手数</label>
+            <input
+              :value="rule.lot"
+              type="number"
+              step="0.01"
+              min="0.01"
+              :disabled="!rule.lot_enabled"
+              @input="updateRule(symbol, { lot: Number(($event.target as HTMLInputElement).value) })"
+            />
           </div>
         </div>
 
@@ -380,7 +401,7 @@ defineExpose({ loadExample })
               :value="rule.lot_mode"
               @change="updateNodeRule(symbol, { lot_mode: ($event.target as HTMLSelectElement).value as 'global' | 'fixed' | 'signal' })"
             >
-              <option value="global">跟随全局</option>
+              <option value="global">跟随中控台</option>
               <option value="fixed">固定手数</option>
               <option value="signal">跟随信号</option>
             </select>

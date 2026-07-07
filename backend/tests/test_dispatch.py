@@ -138,8 +138,21 @@ async def test_global_lot_overrides_volume(store, monkeypatch):
         store,
         mk_node("nd_a", filters={"EURUSD": {"lot_mode": "global"}}),
     )
-    await set_symbol_filters(store, "EURUSD", mode="sync")
-    await store.set_lot_global({"enabled": True, "value": 0.25})
+    await store.set_filters(
+        {
+            "EURUSD": {
+                "enabled": True,
+                "allow_buy": True,
+                "allow_sell": True,
+                "dispatch_mode": "sync",
+                "position_scope": "symbol",
+                "default_action": "pass",
+                "lot_enabled": True,
+                "lot": 0.25,
+                "intervals": [],
+            }
+        }
+    )
     sent = []
 
     async def fake_send(node_id, msg):

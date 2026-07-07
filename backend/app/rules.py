@@ -50,15 +50,19 @@ def node_symbol_not_configured_reason(symbol: str) -> str:
     return f"节点未配置：{sym}未在节点按币种配置中，拒收"
 
 
-def resolve_volume(node: dict, signal_volume: float, global_lot: dict, symbol: str) -> float:
+def resolve_volume(node: dict, signal_volume: float, global_filters: dict, symbol: str) -> float:
     """9.4——按节点该品种的手数策略决定实际手数，并以 MAX_LOT_SIZE 封顶。"""
     sf = _node_symbol_rule(node, symbol)
     mode = (sf.get("lot_mode") if sf else None) or node.get("lot_mode", "global")
     fixed_lot = sf.get("lot") if sf and sf.get("lot") is not None else node.get("lot")
     if mode == "fixed" and fixed_lot is not None:
         vol = float(fixed_lot)
-    elif mode == "global" and global_lot.get("enabled"):
-        vol = float(global_lot.get("value", Config.DEFAULT_LOT))
+    elif mode == "global":
+        gf = _lookup_symbol_config(global_filters or {}, symbol)
+        if gf and gf.get("lot_enabled"):
+            vol = float(gf.get("lot", Config.DEFAULT_LOT))
+        else:
+            vol = float(signal_volume)
     else:
         vol = float(signal_volume)
     return min(max(vol, 0.0), Config.MAX_LOT_SIZE)
@@ -244,3 +248,21 @@ def interval_filter(
     if sf.get("default_action", "block") == "pass":
         return True, None
     return False, f"区间默认过滤：价格{_fmt_num(price)}不在任何配置区间内，默认动作拦截(block)"
+
+
+def validate_node_global_lot_mode(node_filters: dict, global_filters: dict) -> Optional[str]:
+    """节点 filters 中 lot_mode=global 时，中控台对应品种须已启用全局手数。"""
+    if not node_filters or not isinstance(node_filters, dict):
+        return None
+    for sym, rule in node_filters.items():
+        if not isinstance(rule, dict) or rule.get("lot_mode") != "global":
+            continue
+        key = base_symbol(str(sym)) or str(sym).strip().upper()
+        if not key:
+            continue
+        gf = _lookup_symbol_config(global_filters or {}, key)
+        if not gf or not gf.get("lot_enabled"):
+            return (
+                f"{key}：手数策略为「跟随中控台」，但中控台该品种未启用全局手数，无法保存"
+            )
+    return None

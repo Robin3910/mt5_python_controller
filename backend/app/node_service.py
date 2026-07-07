@@ -14,6 +14,7 @@ from .db import SessionLocal
 from .models import NodeCreate, NodeUpdate
 from .orm import Node
 from .redis_store import RedisStore
+from .rules import validate_node_global_lot_mode
 from .security import make_node_id
 
 
@@ -89,6 +90,12 @@ async def find_by_mt5_login(mt5_login: int) -> Optional[dict]:
 
 async def create_node(store: RedisStore, payload: NodeCreate) -> dict:
     """创建节点：写库 + 刷新缓存。mt5_login 重复会触发 IntegrityError，由路由层捕获。"""
+    if payload.filters is not None:
+        err = validate_node_global_lot_mode(
+            payload.filters, await store.get_filters()
+        )
+        if err:
+            raise ValueError(err)
     name = (payload.name or "").strip() or _default_name(payload.mt5_login)
     node_id = make_node_id()
     async with SessionLocal() as s:
@@ -131,6 +138,12 @@ async def auto_register(store: RedisStore, mt5_login: int) -> dict:
 
 async def update_node(store: RedisStore, node_id: str, patch: NodeUpdate) -> Optional[dict]:
     """更新节点：仅写入“非空”字段；成功后刷新缓存。"""
+    if patch.filters is not None:
+        err = validate_node_global_lot_mode(
+            patch.filters, await store.get_filters()
+        )
+        if err:
+            raise ValueError(err)
     async with SessionLocal() as s:
         row = await s.get(Node, node_id)
         if not row:

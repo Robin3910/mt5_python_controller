@@ -171,12 +171,6 @@ class AccountSnapshot(BaseModel):
 
 
 # ---------------------------- 配置 ---------------------------
-class LotConfig(BaseModel):
-    """全局手数配置。"""
-    enabled: bool = False
-    value: float = 0.1
-
-
 class IntervalRule(BaseModel):
     """单条价格区间规则：在 [low, high] 内允许哪些方向。"""
     low: float
@@ -192,6 +186,8 @@ class SymbolFilter(BaseModel):
     dispatch_mode: str = "sync"  # sync / poll
     position_scope: str = "symbol"  # symbol / account
     default_action: str = "block"  # 不在任何区间时：block 拦截 / pass 放行
+    lot_enabled: bool = False  # 是否启用该品种的全局手数
+    lot: float = 0.01  # 该品种全局手数（lot_enabled 时生效）
     intervals: list[IntervalRule] = Field(default_factory=list)
 
 

@@ -8,27 +8,29 @@ SYMBOL = "EURUSD"
 # ----------------------------- lot -----------------------------
 def test_resolve_volume_global_enabled():
     node = {"filters": {SYMBOL: {"lot_mode": "global"}}}
-    assert rules.resolve_volume(node, 0.5, {"enabled": True, "value": 0.2}, SYMBOL) == 0.2
+    filters = {SYMBOL: {"lot_enabled": True, "lot": 0.2}}
+    assert rules.resolve_volume(node, 0.5, filters, SYMBOL) == 0.2
 
 
 def test_resolve_volume_global_disabled_uses_signal():
     node = {"filters": {SYMBOL: {"lot_mode": "global"}}}
-    assert rules.resolve_volume(node, 0.5, {"enabled": False, "value": 0.2}, SYMBOL) == 0.5
+    filters = {SYMBOL: {"lot_enabled": False, "lot": 0.2}}
+    assert rules.resolve_volume(node, 0.5, filters, SYMBOL) == 0.5
 
 
 def test_resolve_volume_fixed():
     node = {"filters": {SYMBOL: {"lot_mode": "fixed", "lot": 0.3}}}
-    assert rules.resolve_volume(node, 0.5, {"enabled": True, "value": 0.2}, SYMBOL) == 0.3
+    assert rules.resolve_volume(node, 0.5, {}, SYMBOL) == 0.3
 
 
 def test_resolve_volume_signal_mode():
     node = {"filters": {SYMBOL: {"lot_mode": "signal"}}}
-    assert rules.resolve_volume(node, 0.42, {"enabled": True, "value": 0.2}, SYMBOL) == 0.42
+    assert rules.resolve_volume(node, 0.42, {SYMBOL: {"lot_enabled": True, "lot": 0.2}}, SYMBOL) == 0.42
 
 
 def test_resolve_volume_capped():
     node = {"filters": {SYMBOL: {"lot_mode": "signal"}}}
-    assert rules.resolve_volume(node, 99, {"enabled": False}, SYMBOL) == 1.0  # MAX_LOT_SIZE
+    assert rules.resolve_volume(node, 99, {}, SYMBOL) == 1.0  # MAX_LOT_SIZE
 
 
 def test_node_has_symbol_config():
@@ -48,7 +50,7 @@ def test_node_symbol_not_configured_reason():
 
 def test_resolve_volume_fallback_node_defaults():
     node = {"lot_mode": "fixed", "lot": 0.08}
-    assert rules.resolve_volume(node, 0.5, {"enabled": True, "value": 0.2}, SYMBOL) == 0.08
+    assert rules.resolve_volume(node, 0.5, {}, SYMBOL) == 0.08
 
 
 def test_node_poll_order_per_symbol():
@@ -180,3 +182,16 @@ def test_interval_master_switch_defaults_open():
     assert ok is True
     ok, _ = rules.interval_filter("SELL", "EURUSD", 1.07, cfg)
     assert ok is True
+
+
+def test_validate_node_global_lot_mode_requires_console_lot():
+    global_filters = {"EURUSD": {"lot_enabled": False, "lot": 0.1}}
+    node_filters = {"EURUSD": {"lot_mode": "global"}}
+    err = rules.validate_node_global_lot_mode(node_filters, global_filters)
+    assert err is not None and "EURUSD" in err and "未启用全局手数" in err
+
+
+def test_validate_node_global_lot_mode_passes_when_enabled():
+    global_filters = {"EURUSD": {"lot_enabled": True, "lot": 0.1}}
+    node_filters = {"EURUSD": {"lot_mode": "global"}}
+    assert rules.validate_node_global_lot_mode(node_filters, global_filters) is None

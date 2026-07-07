@@ -67,7 +67,6 @@ class PollWorker:
         nodes: list[str] = progress["nodes"]
         cursor: int = progress.get("cursor", 0)
 
-        global_lot = await self.store.get_lot_global()
         filters = await self.store.get_filters()
         nodemap = {n["node_id"]: n for n in await self.store.all_nodes()}
 
@@ -77,7 +76,7 @@ class PollWorker:
             node = nodemap.get(node_id)
             # 节点需仍然存在、启用且在线，否则跳过（不重试）
             if node and node.get("enabled", True) and manager.is_node_online(node_id):
-                await self._run_with_retry(node, signal, signal_id, scope, global_lot, filters)
+                await self._run_with_retry(node, signal, signal_id, scope, filters)
             else:
                 logger.info("poll skip offline/disabled node %s", node_id)
             # 每处理完一个节点就推进并持久化游标，保证可断点续跑
@@ -87,12 +86,12 @@ class PollWorker:
 
         logger.info("poll done %s (%d nodes)", signal_id, len(nodes))
 
-    async def _run_with_retry(self, node, signal, signal_id, scope, global_lot, filters) -> str:
+    async def _run_with_retry(self, node, signal, signal_id, scope, filters) -> str:
         """对单节点执行开仓并等待回报；失败/超时按指数退避重试，超过上限则跳过。"""
         attempts = 0
         while attempts <= settings.poll_max_retry:
             res = await self.dispatcher.try_open(
-                node, signal, signal_id, scope, global_lot, filters,
+                node, signal, signal_id, scope, filters,
                 wait=True, timeout=settings.poll_ack_timeout,
             )
             status = res.get("status")

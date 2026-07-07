@@ -1,4 +1,4 @@
-"""运行期配置 API：全局手数、区间过滤、全局节点令牌（需管理员鉴权）。
+"""运行期配置 API：区间过滤、全局节点令牌（需管理员鉴权）。
 
 这些配置存于 Redis（运行期实时态），下发分发时即时读取生效。
 节点令牌为持久化配置（MySQL/SQLite + Redis 缓存，见 system_settings）。
@@ -7,28 +7,10 @@ from fastapi import APIRouter, Depends, Request
 
 from . import persist, system_settings
 from .deps import client_ip, get_current_admin, get_store
-from .models import LotConfig, NodeTokenInfo
+from .models import NodeTokenInfo
 from .redis_store import RedisStore
 
 router = APIRouter(prefix="/api/config", tags=["config"])
-
-
-@router.get("/lot", response_model=LotConfig)
-async def get_lot(store: RedisStore = Depends(get_store), _: str = Depends(get_current_admin)):
-    return LotConfig(**await store.get_lot_global())
-
-
-@router.put("/lot", response_model=LotConfig)
-async def set_lot(
-    body: LotConfig,
-    request: Request,
-    store: RedisStore = Depends(get_store),
-    admin: str = Depends(get_current_admin),
-):
-    """设置全局手数（影响所有“跟随全局”策略的节点）。"""
-    await store.set_lot_global(body.model_dump())
-    await persist.audit(admin, "set_lot_global", None, body.model_dump(), "ok", client_ip(request))
-    return body
 
 
 @router.get("/filters")

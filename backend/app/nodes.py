@@ -64,6 +64,8 @@ async def create_node(
     """
     try:
         d = await node_service.create_node(store, body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except IntegrityError:
         raise HTTPException(
             status_code=409,
@@ -107,7 +109,10 @@ async def update_node(
     admin: str = Depends(get_current_admin),
 ):
     """更新节点配置（手数策略、跟随开关、轮询顺序、启用状态等）。"""
-    d = await node_service.update_node(store, node_id, body)
+    try:
+        d = await node_service.update_node(store, node_id, body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     if not d:
         raise HTTPException(status_code=404, detail="node not found")
     await persist.audit(admin, "update_node", node_id, body.model_dump(exclude_none=True), "ok", client_ip(request))

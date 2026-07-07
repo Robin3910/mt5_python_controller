@@ -20,6 +20,8 @@ export function createEmptySymbolRule(): SymbolFilterRule {
     dispatch_mode: 'sync',
     position_scope: 'symbol',
     default_action: 'block',
+    lot_enabled: false,
+    lot: 0.01,
     intervals: [],
   }
 }
@@ -43,6 +45,8 @@ export function exampleFilterRules(): FilterRulesConfig {
       dispatch_mode: 'sync',
       position_scope: 'symbol',
       default_action: 'block',
+      lot_enabled: true,
+      lot: 0.01,
       intervals: [
         { low: 2300, high: 2350, allow: ['BUY'] },
         { low: 2350, high: 2400, allow: ['SELL'] },
@@ -84,6 +88,11 @@ function normalizeSymbolRule(raw: unknown): SymbolFilterRule {
   const intervals = intervalsRaw
     .map(normalizeInterval)
     .filter((iv): iv is FilterInterval => iv !== null)
+  const lotRaw = o.lot
+  const lot =
+    lotRaw === null || lotRaw === undefined || lotRaw === ''
+      ? 0.01
+      : Number(lotRaw)
   return {
     enabled: o.enabled !== false,
     allow_buy: o.allow_buy !== false,
@@ -91,6 +100,8 @@ function normalizeSymbolRule(raw: unknown): SymbolFilterRule {
     dispatch_mode: normalizeDispatchMode(o.dispatch_mode),
     position_scope: normalizePositionScope(o.position_scope),
     default_action: defaultAction,
+    lot_enabled: o.lot_enabled === true,
+    lot: Number.isFinite(lot) && lot > 0 ? lot : 0.01,
     intervals,
   }
 }
@@ -155,6 +166,8 @@ export function serializeFilterRules(rules: FilterRulesConfig): FilterRulesConfi
       dispatch_mode: rule.dispatch_mode === 'poll' ? 'poll' : 'sync',
       position_scope: rule.position_scope === 'account' ? 'account' : 'symbol',
       default_action: rule.default_action === 'pass' ? 'pass' : 'block',
+      lot_enabled: rule.lot_enabled === true,
+      lot: Number(rule.lot ?? 0.01),
       intervals: (rule.intervals ?? []).map((iv) => ({
         low: Number(iv.low),
         high: Number(iv.high),
@@ -199,6 +212,10 @@ export function validateFilterRules(rules: FilterRulesConfig): string[] {
     }
     seen.add(key)
 
+    if (rule.lot_enabled && (!Number.isFinite(rule.lot) || rule.lot <= 0)) {
+      errors.push(`${key}：启用全局手数时请填写有效手数`)
+    }
+
     rule.intervals.forEach((iv, idx) => {
       const label = `${key} 第 ${idx + 1} 条区间`
       if (!Number.isFinite(iv.low) || !Number.isFinite(iv.high)) {
@@ -233,6 +250,39 @@ export function validateNodeDispatchFilters(rules: NodeDispatchFiltersConfig): s
     seen.add(key)
     if (rule.lot_mode === 'fixed' && (!Number.isFinite(rule.lot) || (rule.lot ?? 0) <= 0)) {
       errors.push(`${key}：固定手数模式下请填写有效手数`)
+    }
+  }
+  return errors
+}
+
+function lookupGlobalSymbolRule(
+  globalRules: FilterRulesConfig,
+  symbol: string,
+): SymbolFilterRule | undefined {
+  const key = symbol.trim().toUpperCase()
+  if (globalRules[key]) return globalRules[key]
+  const base = key.replace(/[^A-Z0-9]/g, '')
+  if (base && globalRules[base]) return globalRules[base]
+  for (const [k, rule] of Object.entries(globalRules)) {
+    const kb = k.replace(/[^A-Z0-9]/g, '')
+    if (!kb || !base) continue
+    if (kb === base || kb.startsWith(base) || base.startsWith(kb)) return rule
+  }
+  return undefined
+}
+
+/** 节点 lot_mode=global 时，中控台对应品种须已启用全局手数。 */
+export function validateNodeGlobalLotMode(
+  rules: NodeDispatchFiltersConfig,
+  globalRules: FilterRulesConfig,
+): string[] {
+  const errors: string[] = []
+  for (const [symbol, rule] of Object.entries(rules)) {
+    if (rule.lot_mode !== 'global') continue
+    const key = symbol.trim().toUpperCase()
+    const gf = lookupGlobalSymbolRule(globalRules, key)
+    if (!gf?.lot_enabled) {
+      errors.push(`${key}：手数策略为「跟随中控台」，但中控台该品种未启用全局手数，无法保存`)
     }
   }
   return errors

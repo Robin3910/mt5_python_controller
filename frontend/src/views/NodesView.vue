@@ -7,7 +7,7 @@ import FilterRulesEditor from '@/components/FilterRulesEditor.vue'
 import { NODE_FORM_FIELD_HELP } from '@/constants/nodeFormHelp'
 import { useHubStore } from '@/stores/hub'
 import type { NodeDispatchFiltersConfig, NodeOut } from '@/api/types'
-import { parseNodeDispatchFilters, serializeNodeDispatchFilters, validateNodeDispatchFilters } from '@/utils/filterRules'
+import { parseFilterRules, parseNodeDispatchFilters, serializeNodeDispatchFilters, validateNodeDispatchFilters, validateNodeGlobalLotMode } from '@/utils/filterRules'
 import { confirmAction } from '@/utils/confirm'
 
 const hub = useHubStore()
@@ -136,12 +136,19 @@ async function closeSelected(): Promise<void> {
   }
 }
 
+async function ensureGlobalFiltersLoaded(): Promise<void> {
+  if (!Object.keys(hub.filters).length) {
+    await hub.fetchConfig()
+  }
+}
+
 function openCreate(): void {
   formMode.value = 'create'
   editingId.value = ''
   createError.value = ''
   Object.assign(form, { name: '', mt5_login: null, enabled: true, filters: {} })
   showForm.value = true
+  void ensureGlobalFiltersLoaded()
 }
 
 function openEdit(n: NodeOut): void {
@@ -155,14 +162,20 @@ function openEdit(n: NodeOut): void {
     filters: parseNodeDispatchFilters(n.filters),
   })
   showForm.value = true
+  void ensureGlobalFiltersLoaded()
 }
 
 async function save(): Promise<void> {
   saving.value = true
   createError.value = ''
   try {
+    await ensureGlobalFiltersLoaded()
     const filtersPayload = serializeNodeDispatchFilters(form.filters)
-    const filterErrors = validateNodeDispatchFilters(filtersPayload)
+    const globalRules = parseFilterRules(hub.filters)
+    const filterErrors = [
+      ...validateNodeDispatchFilters(filtersPayload),
+      ...validateNodeGlobalLotMode(filtersPayload, globalRules),
+    ]
     if (filterErrors.length) {
       createError.value = filterErrors[0]
       return

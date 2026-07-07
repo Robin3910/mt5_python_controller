@@ -49,11 +49,6 @@ export interface AccountSnapshot {
   updated_at: number
 }
 
-export interface LotConfig {
-  enabled: boolean
-  value: number
-}
-
 /** 区间方向过滤：单条价格区间允许的开仓方向 */
 export type FilterDirection = 'BUY' | 'SELL'
 
@@ -78,6 +73,10 @@ export interface SymbolFilterRule {
   /** 持仓判定范围，默认 symbol */
   position_scope: 'symbol' | 'account'
   default_action: DefaultFilterAction
+  /** 是否启用该品种的全局手数（节点手数策略为「跟随中控台」时生效） */
+  lot_enabled: boolean
+  /** 该品种全局手数 */
+  lot: number
   intervals: FilterInterval[]
 }
 
