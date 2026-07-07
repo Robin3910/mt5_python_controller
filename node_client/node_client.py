@@ -1,7 +1,8 @@
 """MT5 节点客户端：WebSocket 连接 / 鉴权 / 心跳 / 账户上报 / 执行命令。
 
 运行：python node_client.py
-配置见 .env（参考 .env.example）。设置 MT5_MOCK=true 可在无终端时用模拟器联调。
+配置见 .env（参考 .env.example）；MT5 账号/密码/服务器/路径在启动时手动输入。
+设置 MT5_MOCK=true 可在无终端时用模拟器联调。
 
 设计要点：
 - MetaTrader5 的调用是阻塞式的，统一丢到线程池(run_in_executor)，不阻塞事件循环；
@@ -15,6 +16,7 @@ import logging
 import websockets
 
 from config import get_settings
+from mt5_prompt import prompt_mt5_credentials
 
 settings = get_settings()
 logging.basicConfig(
@@ -23,26 +25,38 @@ logging.basicConfig(
 logger = logging.getLogger("node")
 
 
-def make_client():
+def make_client(
+    mt5_login: int,
+    mt5_password: str,
+    mt5_server: str,
+    mt5_path: str,
+):
     """按配置选择真实 MT5 客户端或模拟客户端。"""
     if settings.mt5_mock:
         from mock_mt5 import MockMT5Client
 
         return MockMT5Client(
-            settings.mt5_login, settings.mt5_password, settings.mt5_server,
-            settings.mt5_path, settings.default_slippage, settings.default_magic,
+            mt5_login, mt5_password, mt5_server,
+            mt5_path, settings.default_slippage, settings.default_magic,
         )
     from mt5_client import MT5Client
 
     return MT5Client(
-        settings.mt5_login, settings.mt5_password, settings.mt5_server,
-        settings.mt5_path, settings.default_slippage, settings.default_magic,
+        mt5_login, mt5_password, mt5_server,
+        mt5_path, settings.default_slippage, settings.default_magic,
     )
 
 
 class NodeClient:
-    def __init__(self) -> None:
-        self.mt5 = make_client()
+    def __init__(
+        self,
+        *,
+        mt5_login: int = 90000001,
+        mt5_password: str = "",
+        mt5_server: str = "MockServer",
+        mt5_path: str = "",
+    ) -> None:
+        self.mt5 = make_client(mt5_login, mt5_password, mt5_server, mt5_path)
         self.loop: asyncio.AbstractEventLoop | None = None
         self._stop = False
 
@@ -127,7 +141,7 @@ class NodeClient:
             "invalid_token": "全局节点令牌无效；请到管理后台「账户设置 → 节点令牌」查看/重置后更新本机 .env",
             "already_online": "该 MT5 账户已有在线连接，本次登录被拒绝（同一账户同一时刻只允许一个在线）",
             "disabled": "节点已被管理员禁用，无法接入",
-            "missing_mt5_login": "鉴权包缺少 MT5 账户登录号（请检查 .env 中的 MT5_LOGIN）",
+            "missing_mt5_login": "鉴权包缺少 MT5 账户登录号（请确认启动时输入的 MT5 账号正确且已成功登录终端）",
             "auto_register_failed": "节点自动注册失败，请联系管理员排查后台日志",
         }.get(reason, data.get("message") or reason)
         logger.error("登录被拒绝：%s", reason_text)
@@ -229,7 +243,8 @@ class NodeClient:
 
 
 async def main() -> None:
-    await NodeClient().run()
+    creds = prompt_mt5_credentials()
+    await NodeClient(**creds).run()
 
 
 if __name__ == "__main__":

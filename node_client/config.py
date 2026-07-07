@@ -22,11 +22,6 @@ class NodeSettings(BaseSettings):
     manager_ws_url: str = "ws://localhost:8000/ws/node"
     node_token: str = ""  # 后端 POST /api/nodes 返回的一次性令牌
 
-    # MT5 登录信息（运行本客户端的 Windows 主机上）
-    mt5_login: int = 0
-    mt5_password: str = ""
-    mt5_server: str = ""
-    mt5_path: str = ""      # 可选：terminal64.exe 路径
     mt5_mock: bool = False  # true 时用内存模拟，免装 MT5
 
     # 各类时间间隔（秒）
