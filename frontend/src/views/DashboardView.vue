@@ -38,7 +38,10 @@ async function closeTicket(n: NodeOut, ticket: number): Promise<void> {
 
 <template>
   <div class="page-header">
-    <div class="h1">实时总览</div>
+    <div>
+      <div class="h1">实时总览</div>
+      <p class="muted page-desc">多节点账户净值、持仓与事件流实时监控</p>
+    </div>
   </div>
 
   <div class="grid cols-auto" style="margin-bottom: 16px">

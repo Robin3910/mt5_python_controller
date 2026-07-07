@@ -70,40 +70,94 @@ function backToCredentials(): void {
 
 <template>
   <div class="login-wrap">
-    <div class="card card-pad login-card">
-      <div class="h1">登录管理后台</div>
+    <div class="login-hero">
+      <div class="login-brand">
+        <span class="brand-icon brand-icon-lg" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" stroke-linejoin="round" />
+          </svg>
+        </span>
+        <h1 class="login-title">MT5 多节点管理</h1>
+        <p class="login-subtitle">企业级交易节点管控平台</p>
+      </div>
+
+      <div class="security-features">
+        <div class="security-item">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+          <span>端到端加密</span>
+        </div>
+        <div class="security-item">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          <span>双因素认证</span>
+        </div>
+        <div class="security-item">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+          <span>实时审计</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card card-pad login-card glass-card">
+      <div class="login-card-header">
+        <div class="login-shield" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+            <path d="M9 12l2 2 4-4" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <div>
+          <div class="h1 login-h1">{{ step === 'credentials' ? '安全登录' : '身份验证' }}</div>
+          <p class="muted login-hint">
+            {{ step === 'credentials' ? '请输入管理员凭据以访问控制台' : '请输入验证器 App 中的 6 位验证码' }}
+          </p>
+        </div>
+      </div>
 
       <form v-if="step === 'credentials'" class="form-grid" @submit.prevent="submitCredentials">
-        <div>
+        <div class="input-group">
           <label>用户名</label>
-          <input v-model="username" autocomplete="username" />
+          <input v-model="username" autocomplete="username" placeholder="admin" />
         </div>
-        <div>
+        <div class="input-group">
           <label>密码</label>
-          <input v-model="password" type="password" autocomplete="current-password" />
+          <input v-model="password" type="password" autocomplete="current-password" placeholder="••••••••" />
         </div>
-        <div v-if="error" style="color: var(--red); font-size: 13px">{{ error }}</div>
-        <button class="btn-primary" :disabled="loading">{{ loading ? '登录中…' : '登录' }}</button>
+        <div v-if="error" class="alert alert-error">{{ error }}</div>
+        <button class="btn-primary btn-block" :disabled="loading">
+          <svg v-if="!loading" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          {{ loading ? '登录中…' : '安全登录' }}
+        </button>
       </form>
 
       <form v-else class="form-grid" @submit.prevent="submit2fa">
-        <p class="muted" style="font-size: 13px">已开启双因素认证，请输入验证器 App 中的 6 位验证码。</p>
-        <div>
+        <div class="twofa-badge">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+          2FA 已启用 — 额外安全层保护
+        </div>
+        <div class="input-group">
           <label>验证码</label>
           <input
             v-model="totpCode"
+            class="totp-input"
             inputmode="numeric"
             autocomplete="one-time-code"
             maxlength="6"
             placeholder="000000"
           />
         </div>
-        <div v-if="error" style="color: var(--red); font-size: 13px">{{ error }}</div>
-        <div class="row" style="gap: 8px">
+        <div v-if="error" class="alert alert-error">{{ error }}</div>
+        <div class="row login-actions">
           <button class="btn-primary" :disabled="loading">{{ loading ? '验证中…' : '验证并登录' }}</button>
           <button class="btn-ghost" type="button" @click="backToCredentials">返回</button>
         </div>
       </form>
+
+      <div class="login-footer">
+        <span class="secure-badge secure-badge-sm">
+          <span class="secure-dot"></span>
+          TLS 加密传输
+        </span>
+      </div>
     </div>
   </div>
 </template>
