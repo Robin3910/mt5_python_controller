@@ -151,6 +151,25 @@ def node_participates(node: dict, symbol: str, mode: str, global_filters: dict) 
     return True
 
 
+def poll_participant_ids(nodes: list[dict], symbol: str, global_filters: dict) -> list[str]:
+    """9.6 轮询轮转的“参与节点”静态资格集合，返回按轮转初始顺序排好的 node_id 列表。
+
+    资格 = 已启用 + 已配置该品种（按币种条目）+ 参与 poll（follow_poll）。
+    排序 = poll_order 升序，其次 created_at 升序（与队列初始顺序一致）。
+
+    注意：不含在线判断——在线是动态状态，由 worker 在“领取”时对队首实时判定，
+    离线节点仍保留在轮转顺序中以维持其轮转位置。
+    """
+    parts = [
+        n for n in nodes
+        if n.get("enabled", True)
+        and node_has_symbol_config(n, symbol)
+        and node_participates(n, symbol, "poll", global_filters)
+    ]
+    parts.sort(key=lambda n: (node_poll_order(n, symbol), n.get("created_at", 0)))
+    return [n["node_id"] for n in parts]
+
+
 def effective_filters(node: dict, global_filters: dict) -> dict:
     """9.2——节点级过滤覆盖全局；同品种字段级合并，节点未配置的品种回退全局规则。"""
     merged: dict = {}

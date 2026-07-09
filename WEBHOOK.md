@@ -231,8 +231,8 @@ SYMBOL=GBPUSD long LOT=0.1
 }
 ```
 
-- `mode`：`sync`（全员同步）/ `poll`（轮询领取）/ `close`（平仓广播）。
-- `targets`：本次分发命中的在线节点数。
+- `mode`：`sync`（全员同步）/ `poll`（轮询轮转）/ `close`（平仓广播）。
+- `targets`：`sync`/`close` 为本次命中的在线节点数；`poll` 为参与该品种轮转的候选节点数（实际只会由其中 1 个节点领取消费）。
 
 ### 9.2 重复信号 `200`（被去重抑制）
 
