@@ -25,6 +25,7 @@ K_DEDUP = "dedup:{}"             # 信号去重指纹（带 TTL）
 K_EXEC_LOCK = "lock:exec:{}:{}"  # (node, symbol) 执行锁
 K_POLL_PENDING = "signal:poll:pending"  # 轮询待处理队列（List）
 K_POLL_PROGRESS = "signal:poll:{}"      # 单条轮询信号的进度（JSON）
+K_POLL_ROTATION = "signal:poll:rotation:{}"  # 按品种的轮转顺序（JSON list[node_id]）
 
 
 class RedisStore:
@@ -146,3 +147,13 @@ class RedisStore:
     async def get_poll_progress(self, signal_id: str) -> Optional[dict]:
         raw = await self.r.get(K_POLL_PROGRESS.format(signal_id))
         return json.loads(raw) if raw else None
+
+    # ----------------- 轮询轮转顺序（按品种） -----------------
+    async def get_poll_rotation(self, symbol: str) -> list[str]:
+        """读取某品种的轮转顺序（node_id 有序列表）；不存在则返回空列表。"""
+        raw = await self.r.get(K_POLL_ROTATION.format(symbol))
+        return json.loads(raw) if raw else []
+
+    async def save_poll_rotation(self, symbol: str, order: list[str]) -> None:
+        """持久化某品种的轮转顺序（领取成功后把消费节点移到队尾，重启后仍延续轮转）。"""
+        await self.r.set(K_POLL_ROTATION.format(symbol), json.dumps(order))

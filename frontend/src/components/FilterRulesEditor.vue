@@ -210,7 +210,7 @@ defineExpose({ loadExample })
               @change="updateRule(symbol, { dispatch_mode: ($event.target as HTMLSelectElement).value as 'sync' | 'poll' })"
             >
               <option value="sync">全员同步</option>
-              <option value="poll">轮询领取</option>
+              <option value="poll">轮询轮转（单节点领取）</option>
             </select>
           </div>
           <div>
@@ -417,7 +417,7 @@ defineExpose({ loadExample })
             />
           </div>
           <div>
-            <label>轮询顺序（越小越先）</label>
+            <label>轮询初始顺序（越小越先轮到）</label>
             <input
               :value="rule.poll_order"
               type="number"

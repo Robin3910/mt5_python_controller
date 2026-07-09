@@ -2,7 +2,9 @@
 
 分发模式：
 - sync（全员同步）：所有符合条件的在线节点并发执行，不等待回报；
-- poll（轮询领取）：信号入队，由 PollWorker 按顺序逐节点串行执行（见 poll_queue.py）。
+- poll（轮询轮转）：信号入队，由 PollWorker 从该品种的轮转队列中挑选“队首第一个
+  可成交的节点”领取消费——一个信号只由一个节点开仓；领取成功后该节点移到队尾，
+  其余节点保持原序等待下次新信号，如此循环轮转（见 poll_queue.py）。
 
 CLOSE 信号特殊处理：不走过滤，直接广播给所有在线节点各自平掉对应品种。
 """
@@ -95,6 +97,7 @@ class Dispatcher:
 
         if mode == "poll":
             n = await self._enqueue_poll(signal, signal_id, scope, filters)
+            # targets 表示当前该品种参与轮转的候选节点数（实际只会有 1 个领取消费）
             return {"mode": "poll", "targets": n}
 
         n = await self._dispatch_sync(signal, signal_id, scope, filters)
@@ -118,24 +121,25 @@ class Dispatcher:
     async def _enqueue_poll(
         self, signal: TradingSignal, signal_id: str, scope: str, filters: dict,
     ) -> int:
-        """9.6 轮询领取：固定节点顺序 + 进度写入 Redis，再把 signal_id 入队。"""
-        targets = await self._eligible_nodes("poll", signal.symbol, filters, signal_id)
-        # 排序规则：poll_order 小者优先，其次按创建时间
-        targets.sort(
-            key=lambda n: (rules.node_poll_order(n, signal.symbol), n.get("created_at", 0)),
-        )
+        """9.6 轮询轮转：只做入队 + 最小进度记录，真正“选人领取”发生在 PollWorker。
+
+        选人延后到处理时进行，才能用节点最新的在线状态/账户快照实时判定（9.2/9.3）。
+        返回值为当前该品种参与轮转的候选节点数，仅供 Webhook 响应展示。
+        """
+        nodes = await self.store.all_nodes()
+        candidates = rules.poll_participant_ids(nodes, signal.symbol, filters)
         progress = {
             "signal": signal_to_dict(signal),
             "signal_id": signal_id,
             "scope": scope,
-            "nodes": [n["node_id"] for n in targets],
-            "cursor": 0,  # 已处理到第几个节点（持久化，支持重启续跑）
-            "status": {},
+            "symbol": signal.symbol,
+            "status": "pending",   # pending -> done（被某节点领取）/ unconsumed（无人可领取）
+            "consumer": None,      # 最终领取消费该信号的 node_id
         }
         await self.store.save_poll_progress(signal_id, progress)
         await self.store.poll_enqueue(signal_id)
-        logger.info("poll enqueued %s -> %d nodes", signal_id, len(targets))
-        return len(targets)
+        logger.info("poll enqueued %s (%d candidate node(s))", signal_id, len(candidates))
+        return len(candidates)
 
     async def try_open(self, node: dict, signal: TradingSignal, signal_id: str,
                        scope: str, filters: dict,

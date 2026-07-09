@@ -167,30 +167,118 @@ async def test_global_lot_overrides_volume(store, monkeypatch):
     assert sent[0][1]["volume"] == 0.25
 
 
-async def test_poll_sequential_consumes_all_nodes(store, monkeypatch):
-    await _online(store, mk_node("nd_a"), mk_node("nd_b"))
-    await set_symbol_filters(store, "EURUSD", mode="poll")
-    sent = []
+def _ack_open_sender(sent):
+    """构造一个 send_to_node stub：记录下发并对 open 命令立即模拟成功回报。"""
 
     async def fake_send(node_id, msg):
         sent.append((node_id, msg))
         if msg.get("cmd") == "open":
-            # simulate node ACK so the sequential waiter proceeds
             results.resolve(msg["signal_id"], node_id, {"success": True, "symbol": msg["symbol"]})
         return True
 
-    monkeypatch.setattr(manager, "send_to_node", fake_send)
+    return fake_send
+
+
+async def test_poll_rotation_single_node_consumes_and_rotates(store, monkeypatch):
+    """轮询轮转：每条信号只由队首一个节点领取，领取者移到队尾，依次轮转。"""
+    await _online(
+        store,
+        mk_node("nd_a", poll_order=0),
+        mk_node("nd_b", poll_order=1),
+        mk_node("nd_c", poll_order=2),
+    )
+    await set_symbol_filters(store, "EURUSD", mode="poll")
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", _ack_open_sender(sent))
 
     d = Dispatcher(store)
-    res = await d.dispatch(TradingSignal(action="BUY", symbol="EURUSD", volume=0.1), "sigp")
-    assert res["mode"] == "poll" and res["targets"] == 2
-
     worker = PollWorker(store, d)
-    await worker.process("sigp")
 
-    progress = await store.get_poll_progress("sigp")
-    assert progress["cursor"] == 2
-    assert {s[0] for s in sent} == {"nd_a", "nd_b"}
+    # 第 1 条：队首 a 领取，a -> 队尾
+    res = await d.dispatch(TradingSignal(action="BUY", symbol="EURUSD", volume=0.1), "sig1")
+    assert res["mode"] == "poll" and res["targets"] == 3
+    await worker.process("sig1")
+    assert [s[0] for s in sent] == ["nd_a"]
+    p1 = await store.get_poll_progress("sig1")
+    assert p1["consumer"] == "nd_a" and p1["status"] == "done"
+    assert await store.get_poll_rotation("EURUSD") == ["nd_b", "nd_c", "nd_a"]
+
+    # 第 2 条：轮到 b
+    sent.clear()
+    await d.dispatch(TradingSignal(action="BUY", symbol="EURUSD", volume=0.1), "sig2")
+    await worker.process("sig2")
+    assert [s[0] for s in sent] == ["nd_b"]
+    assert await store.get_poll_rotation("EURUSD") == ["nd_c", "nd_a", "nd_b"]
+
+    # 第 3 条：轮到 c，一轮结束回到初始顺序
+    sent.clear()
+    await d.dispatch(TradingSignal(action="BUY", symbol="EURUSD", volume=0.1), "sig3")
+    await worker.process("sig3")
+    assert [s[0] for s in sent] == ["nd_c"]
+    assert await store.get_poll_rotation("EURUSD") == ["nd_a", "nd_b", "nd_c"]
+
+    # 第 4 条：又回到 a（循环轮转）
+    sent.clear()
+    await d.dispatch(TradingSignal(action="BUY", symbol="EURUSD", volume=0.1), "sig4")
+    await worker.process("sig4")
+    assert [s[0] for s in sent] == ["nd_a"]
+
+
+async def test_poll_rotation_falls_through_filtered_head(store, monkeypatch):
+    """队首节点被持仓过滤跳过时顺延给下一个节点；只有真正成交的节点移到队尾。"""
+    await _online(store, mk_node("nd_a", poll_order=0), mk_node("nd_b", poll_order=1))
+    # a 已持有同品种仓位 → 9.3 持仓过滤跳过 a
+    await store.save_account("nd_a", {"positions": [{"symbol": "EURUSD"}], "prices": {}})
+    await set_symbol_filters(store, "EURUSD", mode="poll", scope="symbol")
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", _ack_open_sender(sent))
+
+    d = Dispatcher(store)
+    worker = PollWorker(store, d)
+    await d.dispatch(TradingSignal(action="BUY", symbol="EURUSD", volume=0.1), "sigf")
+    await worker.process("sigf")
+
+    # a 被过滤，b 领取；a 保持队首（下次仍先轮到它），只有 b 参与“移到队尾”
+    assert [s[0] for s in sent] == ["nd_b"]
+    p = await store.get_poll_progress("sigf")
+    assert p["consumer"] == "nd_b"
+    assert await store.get_poll_rotation("EURUSD") == ["nd_a", "nd_b"]
+
+
+async def test_poll_rotation_skips_offline_head(store, monkeypatch):
+    """队首节点离线时顺延给下一个在线节点，离线节点保留其轮转位置。"""
+    await _online(store, mk_node("nd_a", poll_order=0), mk_node("nd_b", poll_order=1))
+    # a 掉线（从连接管理器移除），但仍是静态参与节点
+    manager.nodes.pop("nd_a", None)
+    await set_symbol_filters(store, "EURUSD", mode="poll")
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", _ack_open_sender(sent))
+
+    d = Dispatcher(store)
+    worker = PollWorker(store, d)
+    await d.dispatch(TradingSignal(action="BUY", symbol="EURUSD", volume=0.1), "sigo")
+    await worker.process("sigo")
+
+    assert [s[0] for s in sent] == ["nd_b"]
+    assert await store.get_poll_rotation("EURUSD") == ["nd_a", "nd_b"]
+
+
+async def test_poll_rotation_unconsumed_when_none_available(store, monkeypatch):
+    """无任何在线可成交节点时，信号标记为 unconsumed，不下发任何命令。"""
+    await _online(store, mk_node("nd_a", poll_order=0))
+    manager.nodes.pop("nd_a", None)  # 唯一候选离线
+    await set_symbol_filters(store, "EURUSD", mode="poll")
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", _ack_open_sender(sent))
+
+    d = Dispatcher(store)
+    worker = PollWorker(store, d)
+    await d.dispatch(TradingSignal(action="BUY", symbol="EURUSD", volume=0.1), "sigu")
+    await worker.process("sigu")
+
+    assert sent == []
+    p = await store.get_poll_progress("sigu")
+    assert p["status"] == "unconsumed" and p["consumer"] is None
 
 
 async def test_close_signal_sends_close_to_online_nodes(store, monkeypatch):
