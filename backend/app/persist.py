@@ -47,7 +47,7 @@ async def record_signal(signal_id, signal, source_ip=None, parsed_ok=True,
 
 async def record_dispatch(signal_id, node_id, decided_vol, gate_result,
                           skip_reason, status) -> None:
-    """落库一条分发明细（pending / skipped）。"""
+    """落库一条分发明细（pending / skipped），终态时尝试收口信号整体状态。"""
     try:
         async with SessionLocal() as s:
             s.add(
@@ -61,13 +61,78 @@ async def record_dispatch(signal_id, node_id, decided_vol, gate_result,
                     dispatched_at=datetime.now(),
                 )
             )
+            if status in _DISPATCH_TERMINAL:
+                await s.flush()
+                await _refresh_signal_status(s, signal_id)
             await s.commit()
     except Exception as e:  # noqa: BLE001
         logger.warning("record_dispatch failed: %s", e)
 
 
+# 分发明细终态；仍在途的不计入整体收口
+_DISPATCH_TERMINAL = frozenset({"done", "failed", "skipped"})
+_DISPATCH_PENDING = frozenset({"pending", "sent"})
+
+
+def _aggregate_signal_status(dispatch_statuses: list[str]) -> Optional[str]:
+    """根据各节点分发明细汇总信号整体状态。
+
+    - 仍有 pending/sent → 继续 dispatching（返回 None 表示暂不改）
+    - 既有成功又有失败 → partial
+    - 任一成功（无失败）→ done
+    - 全部失败 → failed
+    - 全部跳过 → done（处理已结束，只是无人成交）
+    """
+    if not dispatch_statuses:
+        return None
+    if any(st in _DISPATCH_PENDING for st in dispatch_statuses):
+        return None
+    has_done = any(st == "done" for st in dispatch_statuses)
+    has_failed = any(st == "failed" for st in dispatch_statuses)
+    if has_done and has_failed:
+        return "partial"
+    if has_done:
+        return "done"
+    if has_failed:
+        return "failed"
+    if all(st in _DISPATCH_TERMINAL for st in dispatch_statuses):
+        return "done"
+    return None
+
+
+async def _refresh_signal_status(session, signal_id: str) -> None:
+    """按当前分发明细收口 SignalHistory.status（仅在全部明细终态时更新）。"""
+    rows = (
+        await session.execute(
+            select(SignalDispatch.status).where(SignalDispatch.signal_id == signal_id)
+        )
+    ).scalars().all()
+    new_status = _aggregate_signal_status(list(rows))
+    if not new_status:
+        return
+    await session.execute(
+        update(SignalHistory)
+        .where(SignalHistory.signal_id == signal_id)
+        .values(status=new_status)
+    )
+
+
+async def update_signal_status(signal_id: str, status: str) -> None:
+    """显式更新信号整体状态（如轮询无人领取 → failed）。"""
+    try:
+        async with SessionLocal() as s:
+            await s.execute(
+                update(SignalHistory)
+                .where(SignalHistory.signal_id == signal_id)
+                .values(status=status)
+            )
+            await s.commit()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("update_signal_status failed: %s", e)
+
+
 async def update_dispatch_result(signal_id, node_id, status, result: Optional[dict] = None) -> None:
-    """根据节点回报更新分发明细的最终结果。"""
+    """根据节点回报更新分发明细的最终结果，并尝试收口信号整体状态。"""
     result = result or {}
     try:
         async with SessionLocal() as s:
@@ -100,6 +165,7 @@ async def update_dispatch_result(signal_id, node_id, status, result: Optional[di
                     .where(SignalHistory.signal_id == signal_id)
                     .values(**hist_vals)
                 )
+            await _refresh_signal_status(s, signal_id)
             await s.commit()
     except Exception as e:  # noqa: BLE001
         logger.warning("update_dispatch_result failed: %s", e)

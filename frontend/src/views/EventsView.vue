@@ -66,6 +66,8 @@ function signalTag(status: string): { cls: string; text: string } {
     rejected: { cls: 'red', text: '已拒收' },
     duplicate: { cls: 'amber', text: '重复' },
     done: { cls: 'green', text: '完成' },
+    partial: { cls: 'amber', text: '部分成功' },
+    failed: { cls: 'red', text: '失败' },
   }
   return m[status] || { cls: '', text: status }
 }

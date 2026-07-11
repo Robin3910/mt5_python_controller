@@ -19,6 +19,7 @@ import logging
 from typing import Optional
 
 from . import rules
+from . import persist
 from .connections import manager
 from .dispatcher import Dispatcher, dict_to_signal
 from .redis_store import RedisStore
@@ -111,6 +112,8 @@ class PollWorker:
             logger.info("poll rotation: signal %s consumed by %s", signal_id, consumer)
         else:
             progress["status"] = "unconsumed"
+            # 无人领取时收口信号整体状态（分发明细可能全是 skipped/failed，或完全无明细）
+            await persist.update_signal_status(signal_id, "failed")
             logger.warning("poll rotation: signal %s not consumed by any node", signal_id)
 
         # 持久化轮转顺序（同时清理掉已失效的节点）与本条信号的最终状态
