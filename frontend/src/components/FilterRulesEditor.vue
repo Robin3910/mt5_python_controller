@@ -499,16 +499,11 @@ defineExpose({ loadExample })
   position: sticky;
   top: 0;
   z-index: 5;
-  padding: 8px 0;
-  margin: -8px 0 0;
-  background: linear-gradient(
-    to bottom,
-    var(--panel) 0%,
-    var(--panel) 78%,
-    rgba(14, 22, 40, 0.55) 100%
-  );
-  backdrop-filter: blur(var(--blur)) saturate(1.3);
-  -webkit-backdrop-filter: blur(var(--blur)) saturate(1.3);
+  padding: 10px 14px 12px;
+  /* 实心背景，避免 sticky 时下方卡片透视重叠；border + shadow 与内容分层 */
+  background: var(--bg-soft);
+  border-bottom: 1px solid var(--glass-border);
+  box-shadow: 0 6px 10px -8px rgba(0, 0, 0, 0.45);
 }
 .filter-toolbar-actions { flex-shrink: 0; }
 

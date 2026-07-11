@@ -387,7 +387,9 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
         </div>
         <div class="span-full">
           <FormLabel text="按币种配置" :help="NODE_FORM_FIELD_HELP.filters" />
-          <FilterRulesEditor v-model="form.filters" mode="node" />
+          <div class="node-filter-scroll">
+            <FilterRulesEditor v-model="form.filters" mode="node" />
+          </div>
         </div>
         <div v-if="createError" class="span-full" style="color: var(--red); font-size: 13px">{{ createError }}</div>
         <div class="row between span-full" style="margin-top: 6px">
@@ -402,3 +404,17 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
     </div>
   </div>
 </template>
+
+<style scoped>
+/* 编辑节点弹窗内：策略列表外层限高 + 可滚动，多品种时不撑破 modal */
+.node-filter-scroll {
+  max-height: clamp(260px, 55vh, 520px);
+  overflow-y: auto;
+  margin-top: 4px;
+}
+@media (max-width: 768px) {
+  .node-filter-scroll {
+    max-height: 50vh;
+  }
+}
+</style>
