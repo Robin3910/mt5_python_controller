@@ -25,20 +25,47 @@ const model = defineModel<FilterRulesConfig | NodeDispatchFiltersConfig>({ requi
 const isGlobal = computed(() => props.mode === 'global')
 const addingSymbol = ref(false)
 const newSymbol = ref('')
+const filterKeyword = ref('')
 
-const globalSymbolList = computed(() => {
+const globalSymbolListAll = computed(() => {
   const cfg = model.value as FilterRulesConfig
   return Object.entries(cfg)
     .map(([symbol, rule]) => ({ symbol, rule }))
     .sort((a, b) => a.symbol.localeCompare(b.symbol))
 })
 
-const nodeSymbolList = computed(() => {
+const nodeSymbolListAll = computed(() => {
   const cfg = model.value as NodeDispatchFiltersConfig
   return Object.entries(cfg)
     .map(([symbol, rule]) => ({ symbol, rule }))
     .sort((a, b) => a.symbol.localeCompare(b.symbol))
 })
+
+const totalSymbolCount = computed(() =>
+  isGlobal.value ? globalSymbolListAll.value.length : nodeSymbolListAll.value.length,
+)
+
+const globalSymbolList = computed(() => {
+  const kw = filterKeyword.value.trim().toUpperCase()
+  if (!kw) return globalSymbolListAll.value
+  return globalSymbolListAll.value.filter((it) => it.symbol.toUpperCase().includes(kw))
+})
+
+const nodeSymbolList = computed(() => {
+  const kw = filterKeyword.value.trim().toUpperCase()
+  if (!kw) return nodeSymbolListAll.value
+  return nodeSymbolListAll.value.filter((it) => it.symbol.toUpperCase().includes(kw))
+})
+
+const visibleSymbolCount = computed(() =>
+  isGlobal.value ? globalSymbolList.value.length : nodeSymbolList.value.length,
+)
+
+const hasKeyword = computed(() => filterKeyword.value.trim().length > 0)
+
+function clearFilterKeyword(): void {
+  filterKeyword.value = ''
+}
 
 function updateRule(symbol: string, patch: Partial<SymbolFilterRule>): void {
   const cfg = model.value as FilterRulesConfig
@@ -155,6 +182,29 @@ defineExpose({ loadExample })
         按品种配置该节点的分发参与、手数策略与轮询顺序。未配置品种将回退节点默认策略（固定 0.01、轮询序 0）。
       </p>
       <div class="row filter-toolbar-actions">
+        <div v-if="totalSymbolCount > 0" class="filter-symbol-search">
+          <svg class="filter-symbol-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <circle cx="11" cy="11" r="7" />
+            <path d="m20 20-3.5-3.5" stroke-linecap="round" />
+          </svg>
+          <input
+            v-model="filterKeyword"
+            class="filter-symbol-search-input"
+            type="search"
+            :placeholder="`筛选品种（共 ${totalSymbolCount}）`"
+            @keyup.esc="clearFilterKeyword"
+          />
+          <button
+            v-if="hasKeyword"
+            type="button"
+            class="filter-symbol-search-clear"
+            aria-label="清除筛选"
+            @click="clearFilterKeyword"
+          >×</button>
+          <span v-if="hasKeyword" class="filter-symbol-search-count">
+            {{ visibleSymbolCount }} / {{ totalSymbolCount }}
+          </span>
+        </div>
         <button v-if="isGlobal" type="button" class="btn-sm btn-ghost" @click="loadExample">载入示例</button>
         <button type="button" class="btn-sm btn-primary" @click="addingSymbol = true">+ 添加品种</button>
       </div>
@@ -174,8 +224,12 @@ defineExpose({ loadExample })
     </div>
 
     <template v-if="isGlobal">
-      <div v-if="!globalSymbolList.length" class="filter-empty muted">
+      <div v-if="!totalSymbolCount" class="filter-empty muted">
         尚未配置任何品种。点击「添加品种」开始，或「载入示例」查看 XAUUSD 示范。
+      </div>
+      <div v-else-if="!globalSymbolList.length" class="filter-empty muted">
+        无匹配「{{ filterKeyword }}」的品种。
+        <button type="button" class="btn-sm btn-ghost" style="margin-left: 8px" @click="clearFilterKeyword">清除筛选</button>
       </div>
 
       <div v-for="{ symbol, rule } in globalSymbolList" :key="symbol" class="filter-symbol-card card card-pad">
@@ -375,8 +429,12 @@ defineExpose({ loadExample })
     </template>
 
     <template v-else>
-      <div v-if="!nodeSymbolList.length" class="filter-empty muted">
+      <div v-if="!totalSymbolCount" class="filter-empty muted">
         尚未配置任何品种。点击「添加品种」为该节点设置各币种的分发、手数与轮询顺序。
+      </div>
+      <div v-else-if="!nodeSymbolList.length" class="filter-empty muted">
+        无匹配「{{ filterKeyword }}」的品种。
+        <button type="button" class="btn-sm btn-ghost" style="margin-left: 8px" @click="clearFilterKeyword">清除筛选</button>
       </div>
 
       <div v-for="{ symbol, rule } in nodeSymbolList" :key="symbol" class="filter-symbol-card card card-pad">
@@ -434,8 +492,87 @@ defineExpose({ loadExample })
 <style scoped>
 .filter-editor { display: flex; flex-direction: column; gap: 12px; }
 .filter-hint { font-size: 12px; margin: 0; flex: 1; min-width: 200px; }
-.filter-toolbar { align-items: flex-start; gap: 12px; }
+/* 工具栏 sticky 到滚动容器顶部；无滚动容器时也无副作用 */
+.filter-toolbar {
+  align-items: flex-start;
+  gap: 12px;
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  padding: 8px 0;
+  margin: -8px 0 0;
+  background: linear-gradient(
+    to bottom,
+    var(--panel) 0%,
+    var(--panel) 78%,
+    rgba(14, 22, 40, 0.55) 100%
+  );
+  backdrop-filter: blur(var(--blur)) saturate(1.3);
+  -webkit-backdrop-filter: blur(var(--blur)) saturate(1.3);
+}
 .filter-toolbar-actions { flex-shrink: 0; }
+
+/* 品种筛选输入框 */
+.filter-symbol-search {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  min-width: 200px;
+}
+.filter-symbol-search-icon {
+  position: absolute;
+  left: 10px;
+  width: 14px;
+  height: 14px;
+  color: var(--muted);
+  pointer-events: none;
+}
+.filter-symbol-search-input {
+  width: 100%;
+  padding: 6px 60px 6px 30px;
+  font-size: 12px;
+  border-radius: var(--radius-sm);
+  background: rgba(6, 10, 18, 0.5);
+  border: 1px solid var(--border);
+  color: var(--text);
+  transition: border-color var(--transition), box-shadow var(--transition);
+}
+.filter-symbol-search-input:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px rgba(0, 212, 170, 0.12);
+}
+.filter-symbol-search-input::-webkit-search-cancel-button { display: none; }
+.filter-symbol-search-clear {
+  position: absolute;
+  right: 6px;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border-radius: 50%;
+  background: var(--glass);
+  border: 1px solid var(--glass-border);
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.filter-symbol-search-clear:hover {
+  color: var(--text);
+  border-color: var(--glass-highlight);
+}
+.filter-symbol-search-count {
+  position: absolute;
+  right: 32px;
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--muted);
+  pointer-events: none;
+  white-space: nowrap;
+}
+
 .filter-add-symbol { background: var(--bg-soft); }
 .filter-empty {
   padding: 24px 16px;
@@ -485,6 +622,7 @@ defineExpose({ loadExample })
 }
 @media (max-width: 768px) {
   .filter-toolbar { flex-direction: column; }
-  .filter-toolbar-actions { width: 100%; justify-content: flex-end; }
+  .filter-toolbar-actions { width: 100%; justify-content: flex-end; flex-wrap: wrap; }
+  .filter-symbol-search { flex: 1 1 100%; min-width: 0; }
 }
 </style>
