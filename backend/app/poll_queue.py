@@ -62,7 +62,7 @@ class PollWorker:
             except asyncio.CancelledError:
                 break
             except Exception:  # noqa: BLE001
-                # 单条处理异常不应让整个 worker 退出
+                # 单条处理异常不应让整个 worker 退出（已出队信号需人工/运维补入队）
                 logger.exception("poll worker loop error")
                 await asyncio.sleep(1)
 
@@ -95,7 +95,7 @@ class PollWorker:
                 logger.info("poll rotation skip offline/disabled node %s", node_id)
                 continue
             status = await self._run_with_retry(
-                node, signal, signal_id, scope, global_lot, filters,
+                node, signal, signal_id, scope, filters,
             )
             if status == "done":
                 consumer = node_id
@@ -134,7 +134,7 @@ class PollWorker:
                 seen.add(nid)
         return merged
 
-    async def _run_with_retry(self, node, signal, signal_id, scope, global_lot, filters) -> str:
+    async def _run_with_retry(self, node, signal, signal_id, scope, filters) -> str:
         """对单节点执行开仓并等待回报，返回该节点的最终状态：
 
         - "done"：成功开仓（调用方据此判定该节点领取了本信号）；
