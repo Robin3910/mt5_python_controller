@@ -362,12 +362,12 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
 
   <!-- create / edit modal -->
   <div v-if="showForm" class="modal-mask" @click.self="showForm = false">
-    <div class="card card-pad modal">
+    <div class="card card-pad modal modal-lg">
       <div class="h1">{{ formMode === 'create' ? '新建节点' : '编辑节点' }}</div>
       <p v-if="formMode === 'create'" class="muted" style="font-size: 12px; margin: 4px 0 10px">
         提示：若 node_client 用同一 MT5 登录号首次连接，系统会自动注册（默认配置同此表单），通常无需在此手动新建。
       </p>
-      <div class="form-grid">
+      <div class="form-grid two">
         <div>
           <FormLabel field-id="node-name" text="名称" :help="NODE_FORM_FIELD_HELP.name" />
           <input id="node-name" v-model="form.name" :placeholder="form.mt5_login ? `留空将自动生成：node-${form.mt5_login}` : '留空将自动生成 node-{mt5_login}'" />
@@ -381,16 +381,16 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
           <input id="node-mt5-login-readonly" :value="form.mt5_login ?? ''" type="number" disabled />
           <p class="muted" style="font-size: 12px; margin: 6px 0 0">创建后不可修改</p>
         </div>
-        <div class="span-full">
-          <FormLabel text="按币种配置" :help="NODE_FORM_FIELD_HELP.filters" />
-          <FilterRulesEditor v-model="form.filters" mode="node" />
-        </div>
         <div v-if="formMode === 'edit'">
           <FormLabel field-id="node-enabled" text="启用状态" :help="NODE_FORM_FIELD_HELP.enabled" />
           <select id="node-enabled" v-model="form.enabled"><option :value="true">启用</option><option :value="false">禁用</option></select>
         </div>
-        <div v-if="createError" style="color: var(--red); font-size: 13px">{{ createError }}</div>
-        <div class="row between" style="margin-top: 6px">
+        <div class="span-full">
+          <FormLabel text="按币种配置" :help="NODE_FORM_FIELD_HELP.filters" />
+          <FilterRulesEditor v-model="form.filters" mode="node" />
+        </div>
+        <div v-if="createError" class="span-full" style="color: var(--red); font-size: 13px">{{ createError }}</div>
+        <div class="row between span-full" style="margin-top: 6px">
           <button class="btn-ghost" @click="showForm = false">取消</button>
           <button
             class="btn-primary"
