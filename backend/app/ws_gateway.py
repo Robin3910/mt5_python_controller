@@ -13,7 +13,7 @@ import time
 from fastapi import APIRouter, WebSocket
 from starlette.websockets import WebSocketDisconnect
 
-from . import node_service, persist, results, system_settings
+from . import mt5_identity, node_service, persist, results, system_settings
 from .connections import manager
 from .security import compare_secret
 from .settings import settings
@@ -23,16 +23,58 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+class LoginMismatchError(Exception):
+    """会话中检测到终端账号与节点绑定不符，应结束该连接。"""
+
+
 def _parse_mt5_login(data: dict) -> int | None:
     """从 auth 数据解析 MT5 登录号（正整数）。"""
-    raw = data.get("mt5_login")
-    if raw is None:
-        return None
+    return mt5_identity.parse_login(data.get("mt5_login"))
+
+
+async def _reject_login_mismatch(
+    node_id: str, ws: WebSocket, expected, reported,
+) -> None:
+    """通知节点与管理端后关闭连接，并抛出 LoginMismatchError。"""
+    reason = mt5_identity.login_mismatch_reason(expected, reported)
+    logger.warning(
+        "node %s mt5_login mismatch: bound=%s reported=%s",
+        node_id, expected, reported,
+    )
+    await ws.send_json({
+        "type": "auth_fail",
+        "data": {
+            "reason": "mt5_login_mismatch",
+            "message": reason or "MT5 登录号与节点绑定不符",
+            "expected": mt5_identity.parse_login(expected),
+            "reported": mt5_identity.parse_login(reported),
+        },
+    })
+    await manager.broadcast_admin({
+        "type": "node_rejected",
+        "data": {
+            "node_id": node_id,
+            "reason": "mt5_login_mismatch",
+            "expected": mt5_identity.parse_login(expected),
+            "reported": mt5_identity.parse_login(reported),
+        },
+    })
     try:
-        login = int(raw)
-    except (TypeError, ValueError):
-        return None
-    return login if login > 0 else None
+        await ws.close(code=4401)
+    except Exception:  # noqa: BLE001
+        pass
+    raise LoginMismatchError(reason or "mt5_login_mismatch")
+
+
+async def _enforce_login_match(node_id: str, ws: WebSocket, reported) -> None:
+    """若上报 login 与节点绑定冲突则拒绝并断开。"""
+    store = state.store
+    node = await store.get_node(node_id) if store else None
+    if not node:
+        return
+    expected = node.get("mt5_login")
+    if mt5_identity.is_mt5_login_mismatch(expected, reported):
+        await _reject_login_mismatch(node_id, ws, expected, reported)
 
 
 @router.websocket("/ws/node")
@@ -136,7 +178,7 @@ async def node_ws(ws: WebSocket):
 
     try:
         await _session(node_id, ws)
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, LoginMismatchError):
         pass
     except Exception:  # noqa: BLE001
         logger.exception("node session error: %s", node_id)
@@ -163,28 +205,34 @@ async def _session(node_id: str, ws: WebSocket) -> None:
             # 心跳：续期在线 TTL；若心跳里捎带了账户快照也一并保存
             await store.touch_online(node_id)
             if data.get("account") or data.get("positions"):
-                await _save_account(node_id, data)
+                await _save_account(node_id, ws, data)
             await ws.send_json({"type": "pong", "data": {"ts": time.time()}})
 
         elif mtype == "account":
             # 账户快照上报
             await store.touch_online(node_id)
-            await _save_account(node_id, data)
+            await _save_account(node_id, ws, data)
 
         elif mtype == "trade_result":
             # 成交回报
             await _on_trade_result(node_id, data)
 
         elif mtype == "hello":
-            # 节点上线自报 MT5 登录信息
-            await _update_node_mt5(node_id, data)
+            # 节点上线自报 MT5 登录信息（含登录号一致性校验）
+            await _update_node_mt5(node_id, ws, data)
 
         else:
             logger.debug("node %s unknown msg type=%s", node_id, mtype)
 
 
-async def _save_account(node_id: str, data: dict) -> None:
-    """把节点上报的账户/持仓/报价整理成标准快照，存 Redis 并推送后台。"""
+async def _save_account(node_id: str, ws: WebSocket, data: dict) -> None:
+    """把节点上报的账户/持仓/报价整理成标准快照，存 Redis 并推送后台。
+
+    若上报 login 与节点绑定不符，拒绝入库并断开连接。
+    """
+    reported = mt5_identity.extract_reported_login(data)
+    await _enforce_login_match(node_id, ws, reported)
+
     store = state.store
     acct = dict(data.get("account") or {})
     snapshot = {
@@ -221,8 +269,11 @@ async def _on_trade_result(node_id: str, data: dict) -> None:
     )
 
 
-async def _update_node_mt5(node_id: str, data: dict) -> None:
-    """更新节点缓存里的 MT5 服务器（来自 hello 消息；登录号以管理后台配置为准）。"""
+async def _update_node_mt5(node_id: str, ws: WebSocket, data: dict) -> None:
+    """处理 hello：校验登录号，并回填 MT5 服务器（登录号以节点绑定为准）。"""
+    reported = mt5_identity.extract_reported_login(data)
+    await _enforce_login_match(node_id, ws, reported)
+
     store = state.store
     node = await store.get_node(node_id)
     if not node:

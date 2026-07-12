@@ -104,3 +104,53 @@ async def test_snapshot_shape():
     assert "EURUSD" in snap["quotes"]
     assert set(snap["quotes"]["EURUSD"].keys()) == {"bid", "ask", "mid", "change"}
     assert snap["account"]["login"]
+
+
+async def test_check_login_allows_match_and_empty():
+    n = _node()
+    n._check_login({"login": 90000001})
+    n._check_login({})
+    n._check_login({"login": None})
+
+
+async def test_check_login_rejects_mismatch():
+    n = _node()
+    try:
+        n._check_login({"login": 11111})
+        assert False, "expected LoginMismatchError"
+    except nc.LoginMismatchError as e:
+        assert "11111" in str(e)
+        assert "90000001" in str(e)
+
+
+async def test_open_blocked_when_terminal_switched():
+    n = _node()
+    await n._exec(n.mt5.connect)
+    n.mt5.login = 11111  # 模拟终端换号
+    ws = FakeWS()
+    try:
+        await n._handle(
+            ws,
+            {"cmd": "open", "signal_id": "s1", "action": "BUY", "symbol": "EURUSD",
+             "volume": 0.1, "stop_loss": None, "take_profit": None, "comment": "", "magic": None},
+        )
+        assert False, "expected LoginMismatchError"
+    except nc.LoginMismatchError:
+        pass
+    tr = [m for m in ws.sent if m["type"] == "trade_result"]
+    assert tr and tr[0]["data"]["success"] is False
+    assert tr[0]["data"]["signal_id"] == "s1"
+    assert len(n.mt5.positions()) == 0
+
+
+async def test_handle_server_login_mismatch():
+    n = _node()
+    ws = FakeWS()
+    try:
+        await n._handle(
+            ws,
+            {"type": "auth_fail", "data": {"reason": "mt5_login_mismatch", "message": "换号"}},
+        )
+        assert False, "expected LoginMismatchError"
+    except nc.LoginMismatchError as e:
+        assert "换号" in str(e)

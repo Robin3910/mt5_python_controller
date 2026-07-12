@@ -159,13 +159,13 @@ export const useHubStore = defineStore('hub', {
         this.statuses[id] = d.status as string
         this.pushEvent(`节点 ${id} ${d.status === 'online' ? '上线' : '下线'}`, d.status === 'online' ? 'ok' : 'warn')
       } else if (t === 'node_rejected') {
-        // 重复登录被拒绝（同一节点同一时刻只允许一个在线）
+        // 节点被拒绝（重复在线 / 登录号不符等）
         const reasonText: Record<string, string> = {
           already_online: '已有在线连接',
-          mt5_login_mismatch: 'MT5 登录号不匹配',
+          mt5_login_mismatch: 'MT5 登录号不匹配（终端换号）',
         }
         const why = reasonText[d.reason as string] || (d.reason as string) || '未知原因'
-        this.pushEvent(`节点 ${d.node_id} 重复登录被拒绝（${why}）`, 'warn')
+        this.pushEvent(`节点 ${d.node_id} 接入被拒绝（${why}）`, 'warn')
       } else if (t === 'node_registered') {
         // 新节点首次登录被自动注册入库
         this.pushEvent(

@@ -7,7 +7,8 @@
 设计要点：
 - MetaTrader5 的调用是阻塞式的，统一丢到线程池(run_in_executor)，不阻塞事件循环；
 - 断线自动重连（指数退避）；
-- 三个并发任务：账户上报 / 心跳 / 接收命令，任一结束即重建连接。
+- 三个并发任务：账户上报 / 心跳 / 接收命令，任一结束即重建连接；
+- 启动时绑定的 MT5 登录号与终端实时 account_info.login 不一致时主动停交易并断线。
 """
 import asyncio
 import json
@@ -23,6 +24,10 @@ logging.basicConfig(
     level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
 logger = logging.getLogger("node")
+
+
+class LoginMismatchError(RuntimeError):
+    """终端当前登录号与启动时绑定账号不符。"""
 
 
 def make_client(
@@ -56,6 +61,7 @@ class NodeClient:
         mt5_server: str = "MockServer",
         mt5_path: str = "",
     ) -> None:
+        self.expected_mt5_login = int(mt5_login)
         self.mt5 = make_client(mt5_login, mt5_password, mt5_server, mt5_path)
         self.loop: asyncio.AbstractEventLoop | None = None
         self._stop = False
@@ -77,6 +83,10 @@ class NodeClient:
                         continue
                     backoff = settings.reconnect_min  # 鉴权成功，重置退避
                     await self._serve(ws)
+            except LoginMismatchError as e:
+                logger.error("%s", e)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, settings.reconnect_max)
             except Exception as e:  # noqa: BLE001
                 logger.warning("ws connection error: %s", e)
             if self._stop:
@@ -98,6 +108,23 @@ class NodeClient:
         except Exception as e:  # noqa: BLE001
             logger.error("MT5 connect error: %s", e)
 
+    def _check_login(self, acct: dict) -> None:
+        """终端实时登录号须与启动绑定账号一致；缺失则跳过（避免暂空误杀）。"""
+        raw = (acct or {}).get("login")
+        if raw is None or raw == "":
+            return
+        try:
+            got = int(raw)
+        except (TypeError, ValueError):
+            return
+        if got <= 0:
+            return
+        if got != self.expected_mt5_login:
+            raise LoginMismatchError(
+                f"MT5 登录号不符：终端当前={got}，启动绑定={self.expected_mt5_login}；"
+                "请切回正确账号或重启节点客户端"
+            )
+
     async def _snapshot(self) -> dict:
         """采集一次账户快照（账户信息 + 持仓 + 观察列表报价）。"""
         try:
@@ -116,7 +143,13 @@ class NodeClient:
     async def _authenticate(self, ws) -> bool:
         """首包发送 auth（token + MT5 登录号），等待 auth_ok；成功后再上报 hello。"""
         acct = await self._exec(self.mt5.account_info)
-        login = acct.get("login")  or None
+        try:
+            self._check_login(acct)
+        except LoginMismatchError as e:
+            logger.error("%s", e)
+            return False
+        # 身份以启动绑定账号为准，避免终端已漂移时挂到错误节点
+        login = self.expected_mt5_login
         await ws.send(json.dumps({
             "type": "auth",
             "data": {"token": settings.node_token, "mt5_login": login},
@@ -130,6 +163,11 @@ class NodeClient:
         if msg.get("type") == "auth_ok":
             logger.info("authenticated as node %s", (msg.get("data") or {}).get("node_id"))
             acct = await self._exec(self.mt5.account_info)
+            try:
+                self._check_login(acct)
+            except LoginMismatchError as e:
+                logger.error("%s", e)
+                return False
             await ws.send(json.dumps(
                 {"type": "hello", "data": {"login": acct.get("login"), "server": acct.get("server")}}
             ))
@@ -143,6 +181,7 @@ class NodeClient:
             "disabled": "节点已被管理员禁用，无法接入",
             "missing_mt5_login": "鉴权包缺少 MT5 账户登录号（请确认启动时输入的 MT5 账号正确且已成功登录终端）",
             "auto_register_failed": "节点自动注册失败，请联系管理员排查后台日志",
+            "mt5_login_mismatch": "终端当前 MT5 账号与节点绑定账号不符，连接被拒绝",
         }.get(reason, data.get("message") or reason)
         logger.error("登录被拒绝：%s", reason_text)
         return False
@@ -155,15 +194,23 @@ class NodeClient:
             asyncio.create_task(self._receiver(ws)),
         ]
         try:
-            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for t in done:
+                if t.cancelled():
+                    continue
+                exc = t.exception()
+                if isinstance(exc, LoginMismatchError):
+                    raise exc
         finally:
             for t in tasks:
                 t.cancel()
 
     async def _reporter(self, ws) -> None:
-        """定时上报账户快照。"""
+        """定时上报账户快照；发现换号则抛错结束会话。"""
         while True:
-            await ws.send(json.dumps({"type": "account", "data": await self._snapshot()}))
+            snap = await self._snapshot()
+            self._check_login(snap.get("account") or {})
+            await ws.send(json.dumps({"type": "account", "data": snap}))
             await asyncio.sleep(settings.account_report_interval)
 
     async def _heartbeat(self, ws) -> None:
@@ -182,7 +229,18 @@ class NodeClient:
             await self._handle(ws, msg)
 
     async def _handle(self, ws, msg: dict) -> None:
-        """按命令类型分派：open / close / pong。"""
+        """按命令类型分派：open / close / pong；处理服务端登录号拒绝。"""
+        if msg.get("type") == "auth_fail":
+            data = msg.get("data") or {}
+            reason = data.get("reason") or "unknown"
+            if reason == "mt5_login_mismatch":
+                raise LoginMismatchError(
+                    data.get("message")
+                    or "终端当前 MT5 账号与节点绑定账号不符，连接被拒绝"
+                )
+            logger.error("服务端拒绝：%s", data.get("message") or reason)
+            raise LoginMismatchError(data.get("message") or reason)
+
         cmd = msg.get("cmd")
         if cmd == "open":
             await self._do_open(ws, msg)
@@ -195,6 +253,22 @@ class NodeClient:
 
     async def _do_open(self, ws, msg: dict) -> None:
         """执行开仓并回报结果（带 signal_id/symbol 供服务端关联与释放锁）。"""
+        acct = await self._exec(self.mt5.account_info)
+        try:
+            self._check_login(acct)
+        except LoginMismatchError as e:
+            await ws.send(json.dumps({
+                "type": "trade_result",
+                "data": {
+                    "success": False,
+                    "error": str(e),
+                    "signal_id": msg.get("signal_id"),
+                    "symbol": msg.get("symbol"),
+                    "action": msg.get("action"),
+                },
+            }))
+            raise
+
         res = await self._exec(
             self.mt5.place_market_order,
             msg["symbol"], msg["action"], msg["volume"],

@@ -202,6 +202,67 @@ def test_duplicate_node_login_rejected(client):
         assert "pong" in types
 
 
+def test_hello_login_mismatch_disconnects(client):
+    """hello 上报的终端账号与节点绑定账号不符时断开连接。"""
+    h = _auth(client)
+    token = _node_token(client, h)
+    r = client.post("/api/nodes", json={"name": "mm", "mt5_login": 6101}, headers=h)
+    assert r.status_code == 201, r.text
+
+    with client.websocket_connect("/ws/node") as ws:
+        ws.send_json({"type": "auth", "data": {"token": token, "mt5_login": 6101}})
+        assert ws.receive_json()["type"] == "auth_ok"
+
+        ws.send_json({"type": "hello", "data": {"login": 9999, "server": "Demo"}})
+        msg = ws.receive_json()
+        assert msg["type"] == "auth_fail"
+        assert msg["data"]["reason"] == "mt5_login_mismatch"
+
+
+def test_account_login_mismatch_disconnects(client):
+    """账户快照中的 login 与节点绑定不符时断开；空 login / 一致 login 不误杀。"""
+    h = _auth(client)
+    token = _node_token(client, h)
+    r = client.post("/api/nodes", json={"name": "mm2", "mt5_login": 6102}, headers=h)
+    assert r.status_code == 201, r.text
+
+    with client.websocket_connect("/ws/node") as ws:
+        ws.send_json({"type": "auth", "data": {"token": token, "mt5_login": 6102}})
+        assert ws.receive_json()["type"] == "auth_ok"
+
+        # 空 login：放行
+        ws.send_json({"type": "account", "data": {"account": {}, "positions": []}})
+        ws.send_json({"type": "heartbeat", "data": {}})
+        types = set()
+        for _ in range(3):
+            types.add(ws.receive_json()["type"])
+            if "pong" in types:
+                break
+        assert "pong" in types
+
+        # 一致 login：放行
+        ws.send_json({
+            "type": "account",
+            "data": {"account": {"login": 6102, "balance": 100}, "positions": []},
+        })
+        ws.send_json({"type": "heartbeat", "data": {}})
+        types = set()
+        for _ in range(3):
+            types.add(ws.receive_json()["type"])
+            if "pong" in types:
+                break
+        assert "pong" in types
+
+        # 漂移：拒绝
+        ws.send_json({
+            "type": "account",
+            "data": {"account": {"login": 8888, "balance": 100}, "positions": []},
+        })
+        msg = ws.receive_json()
+        assert msg["type"] == "auth_fail"
+        assert msg["data"]["reason"] == "mt5_login_mismatch"
+
+
 def test_invalid_global_token_rejected(client):
     """非法全局令牌：直接拒绝，不暴露节点是否存在。"""
     with client.websocket_connect("/ws/node") as ws:

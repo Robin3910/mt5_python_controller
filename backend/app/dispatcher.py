@@ -15,7 +15,7 @@ import dataclasses
 import logging
 from typing import Optional
 
-from . import persist, results, rules
+from . import mt5_identity, persist, results, rules
 from .config import Config
 from .connections import manager
 from .models import build_close_command, build_open_command
@@ -152,6 +152,14 @@ class Dispatcher:
         node_id = node["node_id"]
         account = await self.store.get_account(node_id) or {}
         positions = account.get("positions", [])
+
+        # 登录号一致性：快照 login 与节点绑定不符则跳过（防换号窗口内误下单）
+        mismatch = mt5_identity.login_mismatch_reason(
+            node.get("mt5_login"), account.get("login"),
+        )
+        if mismatch:
+            await self._skip(signal_id, node_id, mismatch)
+            return {"status": "skipped", "reason": mismatch}
 
         # 9.2 多区间方向过滤
         eff = rules.effective_filters(node, filters)
