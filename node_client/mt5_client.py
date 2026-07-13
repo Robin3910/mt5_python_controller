@@ -32,15 +32,45 @@ class MT5Error(RuntimeError):
     pass
 
 
+def peek_logged_in_account(path: str) -> dict | None:
+    """尝试附着终端并读取当前已登录账户；未登录返回 None。用完会 shutdown。"""
+    if mt5 is None:
+        raise MT5Error("MetaTrader5 package not available on this host")
+    if not path:
+        raise MT5Error("未指定 MT5 终端路径")
+    if not mt5.initialize(path=path):
+        raise MT5Error(f"无法初始化 MT5 终端：{mt5.last_error()}")
+    try:
+        ai = mt5.account_info()
+        if ai is None or not getattr(ai, "login", None):
+            return None
+        return {
+            "login": int(ai.login),
+            "server": str(getattr(ai, "server", "") or ""),
+        }
+    finally:
+        mt5.shutdown()
+
+
 class MT5Client:
-    def __init__(self, login: int, password: str, server: str, path: str = "",
-                 slippage: int = 20, magic: int = 20240615) -> None:
+    def __init__(
+        self,
+        login: int,
+        password: str,
+        server: str,
+        path: str = "",
+        slippage: int = 20,
+        magic: int = 20240615,
+        *,
+        reuse_terminal_session: bool = False,
+    ) -> None:
         self.login = int(login)
         self.password = password
         self.server = server
-        self.path = path            # 可选：terminal64.exe 路径
+        self.path = path            # terminal64.exe / terminal.exe 完整路径（真实模式必填）
         self.slippage = slippage    # 默认滑点（deviation）
         self.magic = magic          # 默认魔术号
+        self.reuse_terminal_session = reuse_terminal_session
         self.connected = False
 
     # ----------------------- 连接 -----------------------
@@ -48,13 +78,34 @@ class MT5Client:
         """初始化并登录 MT5 终端；任一步失败返回 False。"""
         if mt5 is None:
             raise MT5Error("MetaTrader5 package not available on this host")
-        kwargs = {"path": self.path} if self.path else {}
-        if not mt5.initialize(**kwargs):
+        if not self.path:
+            raise MT5Error(
+                "未指定 MT5 终端路径；请将本程序放入 MetaTrader 5 安装目录后启动"
+            )
+        if not mt5.initialize(path=self.path):
             logger.error("mt5.initialize failed: %s", mt5.last_error())
             return False
-        if self.login:
+        if self.reuse_terminal_session:
+            ai = mt5.account_info()
+            if ai is None or not getattr(ai, "login", None):
+                logger.error("终端未登录，无法复用会话")
+                mt5.shutdown()
+                return False
+            got = int(ai.login)
+            if self.login and got != self.login:
+                logger.error(
+                    "终端登录号不符：当前=%s 期望=%s", got, self.login,
+                )
+                mt5.shutdown()
+                return False
+            self.login = got
+            self.server = str(getattr(ai, "server", "") or self.server)
+        elif self.login:
             if not mt5.login(self.login, password=self.password, server=self.server):
-                logger.error("mt5.login failed for %s@%s: %s", self.login, self.server, mt5.last_error())
+                logger.error(
+                    "mt5.login failed for %s@%s: %s",
+                    self.login, self.server, mt5.last_error(),
+                )
                 mt5.shutdown()
                 return False
         self.connected = True

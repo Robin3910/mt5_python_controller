@@ -1,7 +1,8 @@
 """MT5 节点客户端：WebSocket 连接 / 鉴权 / 心跳 / 账户上报 / 执行命令。
 
 运行：python node_client.py
-配置见 .env（参考 .env.example）；MT5 账号/密码/服务器/路径在启动时手动输入。
+配置见 .env（参考 .env.example）。请将本程序放在 MT5 安装目录；
+若终端已登录则自动复用账号，否则启动时输入账号/密码/服务器。
 设置 MT5_MOCK=true 可在无终端时用模拟器联调。
 
 设计要点：
@@ -35,6 +36,8 @@ def make_client(
     mt5_password: str,
     mt5_server: str,
     mt5_path: str,
+    *,
+    reuse_terminal_session: bool = False,
 ):
     """按配置选择真实 MT5 客户端或模拟客户端。"""
     if settings.mt5_mock:
@@ -49,6 +52,7 @@ def make_client(
     return MT5Client(
         mt5_login, mt5_password, mt5_server,
         mt5_path, settings.default_slippage, settings.default_magic,
+        reuse_terminal_session=reuse_terminal_session,
     )
 
 
@@ -60,9 +64,13 @@ class NodeClient:
         mt5_password: str = "",
         mt5_server: str = "MockServer",
         mt5_path: str = "",
+        reuse_terminal_session: bool = False,
     ) -> None:
         self.expected_mt5_login = int(mt5_login)
-        self.mt5 = make_client(mt5_login, mt5_password, mt5_server, mt5_path)
+        self.mt5 = make_client(
+            mt5_login, mt5_password, mt5_server, mt5_path,
+            reuse_terminal_session=reuse_terminal_session,
+        )
         self.loop: asyncio.AbstractEventLoop | None = None
         self._stop = False
 
@@ -317,7 +325,18 @@ class NodeClient:
 
 
 async def main() -> None:
-    creds = prompt_mt5_credentials()
+    try:
+        creds = prompt_mt5_credentials()
+    except FileNotFoundError as e:
+        logger.error("%s", e)
+        raise SystemExit(1) from e
+    except Exception as e:
+        from mt5_client import MT5Error
+
+        if isinstance(e, MT5Error):
+            logger.error("%s", e)
+            raise SystemExit(1) from e
+        raise
     await NodeClient(**creds).run()
 
 
