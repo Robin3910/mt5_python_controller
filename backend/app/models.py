@@ -180,7 +180,7 @@ class IntervalRule(BaseModel):
 
 class SymbolFilter(BaseModel):
     """某品种的多区间过滤与分发配置（全局 filters 键值）。"""
-    enabled: bool = True
+    enabled: bool = True  # False：拒收该品种全部信号（含 Webhook CLOSE；手动平仓除外）
     allow_buy: bool = True
     allow_sell: bool = True
     dispatch_mode: str = "sync"  # sync / poll

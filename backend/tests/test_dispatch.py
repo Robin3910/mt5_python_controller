@@ -339,3 +339,37 @@ async def test_unconfigured_symbol_rejected(store):
     res = await d.dispatch(TradingSignal(action="BUY", symbol="GBPUSD", volume=0.1), "sigx")
     assert res["mode"] == "rejected"
     assert "未配置" in (res.get("reason") or "")
+
+
+async def test_disabled_symbol_rejected_including_close(store, monkeypatch):
+    await store.set_filters(
+        {
+            "EURUSD": {
+                "enabled": False,
+                "allow_buy": True,
+                "allow_sell": True,
+                "dispatch_mode": "sync",
+                "position_scope": "symbol",
+                "default_action": "pass",
+                "intervals": [],
+            }
+        }
+    )
+    sent = []
+
+    async def fake_send(node_id, msg):
+        sent.append((node_id, msg))
+        return True
+
+    monkeypatch.setattr(manager, "send_to_node", fake_send)
+    await _online(store, mk_node("nd_a"))
+
+    d = Dispatcher(store)
+    buy = await d.dispatch(TradingSignal(action="BUY", symbol="EURUSD", volume=0.1), "sig_dis_buy")
+    assert buy["mode"] == "rejected"
+    assert "已禁用" in (buy.get("reason") or "")
+
+    close = await d.dispatch(TradingSignal(action="CLOSE", symbol="EURUSD", volume=0.1), "sig_dis_close")
+    assert close["mode"] == "rejected"
+    assert "已禁用" in (close.get("reason") or "")
+    assert sent == []

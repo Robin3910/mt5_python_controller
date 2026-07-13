@@ -135,10 +135,28 @@ def test_interval_default_pass_outside_range():
     assert ok is True
 
 
-def test_interval_disabled_passes():
-    cfg = {"EURUSD": {"enabled": False, "intervals": []}}
-    ok, _ = rules.interval_filter("SELL", "EURUSD", 1.07, cfg)
+def test_interval_no_config_passes():
+    ok, _ = rules.interval_filter("SELL", "EURUSD", 1.07, {})
     assert ok is True
+
+
+def test_resolve_dispatch_rejects_unconfigured():
+    mode, scope, reason = rules.resolve_dispatch_config("GBPUSD", {})
+    assert mode is None and scope is None
+    assert reason is not None and "未配置" in reason
+
+
+def test_resolve_dispatch_rejects_disabled():
+    cfg = {"EURUSD": {"enabled": False, "dispatch_mode": "sync", "position_scope": "symbol"}}
+    mode, scope, reason = rules.resolve_dispatch_config("EURUSD", cfg)
+    assert mode is None and scope is None
+    assert reason is not None and "已禁用" in reason
+
+
+def test_resolve_dispatch_ok_when_enabled():
+    cfg = {"EURUSD": {"enabled": True, "dispatch_mode": "poll", "position_scope": "account"}}
+    mode, scope, reason = rules.resolve_dispatch_config("EURUSD", cfg)
+    assert mode == "poll" and scope == "account" and reason is None
 
 
 def test_interval_no_price_passes():

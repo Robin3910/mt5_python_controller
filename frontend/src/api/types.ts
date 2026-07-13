@@ -63,6 +63,7 @@ export interface FilterInterval {
 
 /** 单个品种的区间过滤与分发规则（键为品种代码，如 XAUUSD，全局 filters） */
 export interface SymbolFilterRule {
+  /** false：拒收该品种全部信号（含 Webhook 平仓；后台手动平仓除外） */
   enabled: boolean
   /** 是否允许接收做多 (BUY) 信号，默认 true */
   allow_buy: boolean

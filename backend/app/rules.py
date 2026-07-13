@@ -129,12 +129,15 @@ def resolve_dispatch_config(
 ) -> tuple[Optional[str], Optional[str], Optional[str]]:
     """按币种解析分发模式与持仓判定范围。
 
-    返回 (mode, scope, reject_reason)。reject_reason 非空时表示该品种未在中控台配置，应拒收信号。
+    返回 (mode, scope, reject_reason)。reject_reason 非空时表示应拒收信号
+   （未登记，或中控台已取消「启用」——含开仓与 Webhook 平仓；手动平仓不受影响）。
     """
     sf = _lookup_symbol_config(global_filters or {}, symbol)
+    sym = base_symbol(symbol) or symbol
     if not sf:
-        sym = base_symbol(symbol) or symbol
         return None, None, f"品种未配置：{sym}未在中控台配置，信号拒收"
+    if sf.get("enabled", True) is False:
+        return None, None, f"品种已禁用：{sym}在中控台未启用，信号拒收"
     mode = sf.get("dispatch_mode", settings.dispatch_mode)
     scope = sf.get("position_scope", settings.position_scope)
     if mode not in ("sync", "poll"):
@@ -232,7 +235,8 @@ def interval_filter(
     """9.2——多区间方向过滤，返回 (是否放行, 拦截原因)。CLOSE 不过滤。
 
     逻辑：
-    - 该品种未配置或被禁用 -> 放行；
+    - 该品种未配置 -> 放行（准入拒收由 resolve_dispatch_config 负责；
+      中控台取消「启用」亦在该处拒收，含 CLOSE）；
     - 无可用价格 -> 放行（避免在拿不到价时误拦截）；
     - 命中某区间：方向在该区间 allow 列表内则放行，否则拦截；
     - 不在任何区间：按 default_action（block 拦截 / pass 放行）。
@@ -244,7 +248,7 @@ def interval_filter(
     if action not in ("BUY", "SELL"):
         return True, None
     sf = _lookup_symbol_config(filters_cfg, symbol)
-    if not sf or not sf.get("enabled"):
+    if not sf:
         return True, None
     if action == "BUY" and sf.get("allow_buy", True) is False:
         return False, f"方向总开关：该品种已禁止接收做多(BUY)信号"

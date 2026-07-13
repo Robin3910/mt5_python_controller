@@ -176,7 +176,7 @@ defineExpose({ loadExample })
   <div class="filter-editor">
     <div class="row between filter-toolbar">
       <p v-if="isGlobal" class="muted filter-hint">
-        按品种设置分发策略、价格区间、允许方向与全局手数。未在中控台配置的品种信号将被直接拒收；节点手数策略为「跟随中控台」时使用此处配置的手数。
+        按品种设置分发策略、价格区间、允许方向与全局手数。未登记或取消「启用」的品种信号将被直接拒收（含平仓）；后台手动平仓不受影响。节点手数策略为「跟随中控台」时使用此处配置的手数。
       </p>
       <p v-else class="muted filter-hint">
         按品种配置该节点的分发参与、手数策略与轮询顺序。未配置品种将回退节点默认策略（固定 0.01、轮询序 0）。
