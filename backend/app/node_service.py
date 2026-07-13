@@ -54,8 +54,9 @@ DEFAULT_NODE_SYMBOL_RULE = {
     "poll_order": 0,
 }
 
-# 节点自动注册时使用的默认配置（与管理后台「+ 新建节点」表单的图示一致）
+# 节点自动注册时使用的默认配置（启用状态与手动新建不同：自动入库默认禁用，需管理员启用后才可接入）
 AUTO_NODE_DEFAULTS = {
+    "enabled": False,
     "lot_mode": "fixed",
     "lot": 0.01,
     "poll_order": 0,
@@ -88,8 +89,13 @@ async def find_by_mt5_login(mt5_login: int) -> Optional[dict]:
         return node_row_to_dict(row) if row else None
 
 
-async def create_node(store: RedisStore, payload: NodeCreate) -> dict:
-    """创建节点：写库 + 刷新缓存。mt5_login 重复会触发 IntegrityError，由路由层捕获。"""
+async def create_node(
+    store: RedisStore, payload: NodeCreate, *, enabled: bool = True,
+) -> dict:
+    """创建节点：写库 + 刷新缓存。mt5_login 重复会触发 IntegrityError，由路由层捕获。
+
+    enabled 默认 True（管理端手动新建）；自动注册传入 AUTO_NODE_DEFAULTS["enabled"]=False。
+    """
     if payload.filters is not None:
         err = validate_node_global_lot_mode(
             payload.filters, await store.get_filters()
@@ -102,7 +108,7 @@ async def create_node(store: RedisStore, payload: NodeCreate) -> dict:
         row = Node(
             node_id=node_id,
             name=name,
-            enabled=True,
+            enabled=enabled,
             lot_mode=AUTO_NODE_DEFAULTS["lot_mode"],
             lot=AUTO_NODE_DEFAULTS["lot"],
             poll_order=AUTO_NODE_DEFAULTS["poll_order"],
@@ -121,6 +127,7 @@ async def auto_register(store: RedisStore, mt5_login: int) -> dict:
     """node_client 登录时按 mt5_login 自动注册节点（默认配置见 AUTO_NODE_DEFAULTS）。
 
     按币种配置：从中控台多区间方向过滤已有品种自动生成（参与 sync/poll、固定手数 0.01、轮询序 0）。
+    默认 enabled=False：入库后须管理员启用才可接入；本次连接会在鉴权阶段被拒（4403）。
     若已存在则直接返回现有节点（幂等）；不存在则用默认配置入库。
     """
     existing = await find_by_mt5_login(mt5_login)
@@ -133,7 +140,9 @@ async def auto_register(store: RedisStore, mt5_login: int) -> dict:
         mt5_login=mt5_login,
         filters=filters or None,
     )
-    return await create_node(store, payload)
+    return await create_node(
+        store, payload, enabled=AUTO_NODE_DEFAULTS["enabled"],
+    )
 
 
 async def update_node(store: RedisStore, node_id: str, patch: NodeUpdate) -> Optional[dict]:

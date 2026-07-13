@@ -305,7 +305,7 @@ def test_default_node_filters_from_global():
 
 
 def test_auto_register_on_first_login(client):
-    """node_client 用未注册的 mt5_login 登录时，后端按默认配置自动入库。"""
+    """node_client 用未注册的 mt5_login 登录时，后端按默认配置自动入库（默认禁用）。"""
     h = seed_default_filters(client)
     token = _node_token(client, h)
 
@@ -316,15 +316,15 @@ def test_auto_register_on_first_login(client):
     with client.websocket_connect("/ws/node") as ws:
         ws.send_json({"type": "auth", "data": {"token": token, "mt5_login": 8001}})
         ack = ws.receive_json()
-        assert ack["type"] == "auth_ok"
-        new_node_id = ack["data"]["node_id"]
+        # 自动注册默认 enabled=false，入库后本轮鉴权仍拒绝接入
+        assert ack["type"] == "auth_fail"
+        assert ack["data"]["reason"] == "disabled"
 
     # 自动注册的节点应使用默认配置，并按中控台已有品种生成按币种配置
     r = client.get("/api/nodes", headers=h)
     created = next(n for n in r.json() if n["mt5_login"] == 8001)
-    assert created["node_id"] == new_node_id
     assert created["name"] == "node-8001"
-    assert created["enabled"] is True
+    assert created["enabled"] is False
     filters = created.get("filters") or {}
     assert set(filters.keys()) == {"EURUSD", "XAUUSD", "GBPUSD"}
     for sym in filters.values():
@@ -420,10 +420,14 @@ def test_node_token_rotate(client):
         ws.send_json({"type": "auth", "data": {"token": old_token, "mt5_login": 10001}})
         assert ws.receive_json()["data"]["reason"] == "invalid_token"
 
-    # 新令牌可正常接入并触发自动注册
+    # 新令牌可通过鉴权并触发自动注册（默认禁用，故本轮仍为 auth_fail/disabled）
     with client.websocket_connect("/ws/node") as ws:
         ws.send_json({"type": "auth", "data": {"token": new_token, "mt5_login": 10001}})
-        assert ws.receive_json()["type"] == "auth_ok"
+        ack = ws.receive_json()
+        assert ack["type"] == "auth_fail"
+        assert ack["data"]["reason"] == "disabled"
+    nodes = client.get("/api/nodes", headers=h).json()
+    assert any(n["mt5_login"] == 10001 and n["enabled"] is False for n in nodes)
 
 
 def test_webhook_duplicate_suppressed(client):

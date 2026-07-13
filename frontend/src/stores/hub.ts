@@ -169,7 +169,7 @@ export const useHubStore = defineStore('hub', {
       } else if (t === 'node_registered') {
         // 新节点首次登录被自动注册入库
         this.pushEvent(
-          `节点 ${d.name || d.node_id} (MT5: ${d.mt5_login}) 已自动注册`,
+          `节点 ${d.name || d.node_id} (MT5: ${d.mt5_login}) 已自动注册（默认禁用，请启用后接入）`,
           'ok',
         )
         // 拉取最新节点列表，让侧栏/列表实时刷新

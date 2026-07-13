@@ -55,7 +55,7 @@ const editingId = ref('')
 const saving = ref(false)
 const createError = ref('')
 
-// 默认值与「自动注册」保持一致：启用；按币种配置见 filters
+// 手动新建默认启用；自动注册默认禁用（入库后需管理员启用）
 const form = reactive({
   name: '',
   mt5_login: null as number | null,
@@ -365,7 +365,7 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
     <div class="card card-pad modal modal-lg">
       <div class="h1">{{ formMode === 'create' ? '新建节点' : '编辑节点' }}</div>
       <p v-if="formMode === 'create'" class="muted" style="font-size: 12px; margin: 4px 0 10px">
-        提示：若 node_client 用同一 MT5 登录号首次连接，系统会自动注册（默认配置同此表单），通常无需在此手动新建。
+        提示：若 node_client 用同一 MT5 登录号首次连接，系统会自动注册（默认禁用，需在此启用后才会上线）；手动新建默认启用。
       </p>
       <div class="form-grid two">
         <div>
