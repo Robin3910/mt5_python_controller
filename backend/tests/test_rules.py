@@ -159,9 +159,12 @@ def test_resolve_dispatch_ok_when_enabled():
     assert mode == "poll" and scope == "account" and reason is None
 
 
-def test_interval_no_price_passes():
-    ok, _ = rules.interval_filter("SELL", "EURUSD", None, FILTERS)
-    assert ok is True
+def test_interval_no_price_blocks():
+    """无可用参考价时拦截，避免绕过区间方向过滤误开仓。"""
+    ok, reason = rules.interval_filter("SELL", "EURUSD", None, FILTERS)
+    assert ok is False
+    assert reason is not None and "无可用价格" in reason
+    assert "EURUSD" in reason
 
 
 def test_interval_master_switch_blocks_buy():

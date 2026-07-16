@@ -237,7 +237,7 @@ def interval_filter(
     逻辑：
     - 该品种未配置 -> 放行（准入拒收由 resolve_dispatch_config 负责；
       中控台取消「启用」亦在该处拒收，含 CLOSE）；
-    - 无可用价格 -> 放行（避免在拿不到价时误拦截）；
+    - 无可用价格 -> 拦截（避免拿不到价时绕过区间方向过滤误开仓）；
     - 命中某区间：方向在该区间 allow 列表内则放行，否则拦截；
     - 不在任何区间：按 default_action（block 拦截 / pass 放行）。
 
@@ -255,7 +255,11 @@ def interval_filter(
     if action == "SELL" and sf.get("allow_sell", True) is False:
         return False, f"方向总开关：该品种已禁止接收做空(SELL)信号"
     if price is None:
-        return True, None
+        sym = base_symbol(symbol) or symbol
+        return False, (
+            f"区间方向过滤：{sym}无可用价格（节点未上报报价且无持仓价），"
+            f"无法判定区间，{action}被拦截"
+        )
     for iv in sf.get("intervals", []):
         if float(iv["low"]) <= price <= float(iv["high"]):
             allow = [a.upper() for a in iv.get("allow", [])]
