@@ -167,6 +167,18 @@ def test_interval_no_price_blocks():
     assert "EURUSD" in reason
 
 
+def test_filter_watch_symbols():
+    cfg = {
+        "btcust": {"enabled": True, "intervals": []},
+        "XAUUSD": {"enabled": True, "intervals": []},
+        "": {"enabled": True},
+        "skip": "not-a-dict",
+    }
+    assert rules.filter_watch_symbols(cfg) == ["BTCUST", "XAUUSD"]
+    assert rules.filter_watch_symbols({}) == []
+    assert rules.filter_watch_symbols(None) == []
+
+
 def test_interval_master_switch_blocks_buy():
     cfg = {
         "EURUSD": {

@@ -73,6 +73,8 @@ class NodeClient:
         )
         self.loop: asyncio.AbstractEventLoop | None = None
         self._stop = False
+        # 中控台全局 filters 品种（auth_ok / watch_symbols 下发），与本地 WATCH_SYMBOLS 合并取价
+        self.hub_symbols: set[str] = set()
 
     async def run(self) -> None:
         """主入口：先连 MT5，再进入“连接-鉴权-服务”的自动重连循环。"""
@@ -133,13 +135,31 @@ class NodeClient:
                 "请切回正确账号或重启节点客户端"
             )
 
+    def apply_hub_symbols(self, symbols) -> None:
+        """接收中控台下发的观察品种列表。"""
+        self.hub_symbols = {
+            str(s).strip().upper() for s in (symbols or []) if str(s).strip()
+        }
+        logger.info("hub watch symbols (%d): %s", len(self.hub_symbols), sorted(self.hub_symbols))
+
+    def effective_watchlist(self, positions: list | None = None) -> list[str]:
+        """本地 WATCH_SYMBOLS ∪ 中控台品种 ∪ 当前持仓品种。"""
+        out: set[str] = {s.strip().upper() for s in settings.watchlist if s.strip()}
+        out |= self.hub_symbols
+        for p in positions or []:
+            sym = str((p or {}).get("symbol") or "").strip().upper()
+            if sym:
+                out.add(sym)
+        return sorted(out)
+
     async def _snapshot(self) -> dict:
         """采集一次账户快照（账户信息 + 持仓 + 观察列表报价）。"""
         try:
-            quotes = await self._exec(self.mt5.quotes, settings.watchlist)
+            positions = await self._exec(self.mt5.positions)
+            quotes = await self._exec(self.mt5.quotes, self.effective_watchlist(positions))
             return {
                 "account": await self._exec(self.mt5.account_info),
-                "positions": await self._exec(self.mt5.positions),
+                "positions": positions,
                 "quotes": quotes,
                 "prices": {sym: q["mid"] for sym, q in quotes.items()},
             }
@@ -169,7 +189,9 @@ class NodeClient:
             logger.error("auth handshake failed: %s", e)
             return False
         if msg.get("type") == "auth_ok":
-            logger.info("authenticated as node %s", (msg.get("data") or {}).get("node_id"))
+            data = msg.get("data") or {}
+            logger.info("authenticated as node %s", data.get("node_id"))
+            self.apply_hub_symbols(data.get("watch_symbols"))
             acct = await self._exec(self.mt5.account_info)
             try:
                 self._check_login(acct)
@@ -237,8 +259,9 @@ class NodeClient:
             await self._handle(ws, msg)
 
     async def _handle(self, ws, msg: dict) -> None:
-        """按命令类型分派：open / close / pong；处理服务端登录号拒绝。"""
-        if msg.get("type") == "auth_fail":
+        """按命令类型分派：open / close / pong / watch_symbols；处理服务端登录号拒绝。"""
+        mtype = msg.get("type")
+        if mtype == "auth_fail":
             data = msg.get("data") or {}
             reason = data.get("reason") or "unknown"
             if reason == "mt5_login_mismatch":
@@ -249,13 +272,17 @@ class NodeClient:
             logger.error("服务端拒绝：%s", data.get("message") or reason)
             raise LoginMismatchError(data.get("message") or reason)
 
+        if mtype == "watch_symbols":
+            self.apply_hub_symbols((msg.get("data") or {}).get("symbols"))
+            return
+        if mtype in ("pong", "ping"):
+            return  # 心跳应答 / 探活，忽略
+
         cmd = msg.get("cmd")
         if cmd == "open":
             await self._do_open(ws, msg)
         elif cmd == "close":
             await self._do_close(ws, msg)
-        elif msg.get("type") == "pong":
-            pass  # 心跳应答，忽略
         else:
             logger.debug("ignored message: %s", msg)
 

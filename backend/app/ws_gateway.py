@@ -13,7 +13,7 @@ import time
 from fastapi import APIRouter, WebSocket
 from starlette.websockets import WebSocketDisconnect
 
-from . import mt5_identity, node_service, persist, results, system_settings
+from . import mt5_identity, node_service, persist, results, rules, system_settings
 from .connections import manager
 from .security import compare_secret
 from .settings import settings
@@ -171,8 +171,16 @@ async def node_ws(ws: WebSocket):
     # 先登记连接再回 auth_ok，确保节点收到确认时即可被路由（消除竞态）
     await manager.register_node(node_id, ws)
     await store.touch_online(node_id)
+    watch_symbols = rules.filter_watch_symbols(await store.get_filters())
     await ws.send_json(
-        {"type": "auth_ok", "data": {"node_id": node_id, "heartbeat": settings.heartbeat_interval}}
+        {
+            "type": "auth_ok",
+            "data": {
+                "node_id": node_id,
+                "heartbeat": settings.heartbeat_interval,
+                "watch_symbols": watch_symbols,
+            },
+        }
     )
     await manager.broadcast_admin({"type": "node_status", "data": {"node_id": node_id, "status": "online"}})
 

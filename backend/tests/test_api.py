@@ -130,6 +130,8 @@ def test_full_flow(client):
         ack = ws.receive_json()
         assert ack["type"] == "auth_ok"
         assert ack["data"]["node_id"] == node_id
+        assert "watch_symbols" in ack["data"]
+        assert isinstance(ack["data"]["watch_symbols"], list)
 
         ws.send_json(
             {
@@ -143,6 +145,10 @@ def test_full_flow(client):
         )
 
         seed_default_filters(client)
+        # 保存 filters 后应向在线节点推送 watch_symbols
+        pushed = ws.receive_json()
+        assert pushed["type"] == "watch_symbols"
+        assert "EURUSD" in pushed["data"]["symbols"]
 
         # webhook signal -> sync dispatch -> node receives an open command
         r = client.post("/webhook", json={"action": "buy", "symbol": "EURUSD", "volume": 0.1})

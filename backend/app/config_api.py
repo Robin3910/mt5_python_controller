@@ -5,12 +5,23 @@
 """
 from fastapi import APIRouter, Depends, Request
 
-from . import persist, system_settings
+from . import persist, rules, system_settings
+from .connections import manager
 from .deps import client_ip, get_current_admin, get_store
 from .models import NodeTokenInfo
 from .redis_store import RedisStore
 
 router = APIRouter(prefix="/api/config", tags=["config"])
+
+
+async def push_watch_symbols_to_nodes(filters_cfg: dict) -> None:
+    """把中控台 filters 品种列表推给所有在线节点，供其合并进观察报价列表。"""
+    msg = {
+        "type": "watch_symbols",
+        "data": {"symbols": rules.filter_watch_symbols(filters_cfg)},
+    }
+    for node_id in manager.online_node_ids():
+        await manager.send_to_node(node_id, msg)
 
 
 @router.get("/filters")
@@ -27,6 +38,7 @@ async def set_filters(
 ):
     """设置多区间方向过滤（以品种为键的对象，结构见前端配置页说明）。"""
     await store.set_filters(body)
+    await push_watch_symbols_to_nodes(body)
     await persist.audit(admin, "set_filters", None, body, "ok", client_ip(request))
     return body
 

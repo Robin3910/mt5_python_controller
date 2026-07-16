@@ -30,12 +30,41 @@ async def test_authenticate_ok():
     n = _node()
     await n._exec(n.mt5.connect)
     ws = FakeWS()
-    ws.feed({"type": "auth_ok", "data": {"node_id": "nd_x"}})
+    ws.feed({
+        "type": "auth_ok",
+        "data": {"node_id": "nd_x", "watch_symbols": ["btcust", "XAUUSD"]},
+    })
     assert await n._authenticate(ws) is True
     assert ws.sent[0]["type"] == "auth"
     assert ws.sent[0]["data"]["token"] == "test-token"
     assert ws.sent[0]["data"]["mt5_login"] == 90000001
     assert any(m["type"] == "hello" for m in ws.sent)
+    assert n.hub_symbols == {"BTCUST", "XAUUSD"}
+
+
+async def test_effective_watchlist_unions_sources():
+    n = _node()
+    n.apply_hub_symbols(["BTCUST"])
+    wl = n.effective_watchlist([{"symbol": "AUDUSD"}])
+    assert "BTCUST" in wl
+    assert "AUDUSD" in wl
+    assert "EURUSD" in wl  # from default WATCH_SYMBOLS in test env
+
+
+async def test_snapshot_includes_hub_symbols():
+    n = _node()
+    await n._exec(n.mt5.connect)
+    n.apply_hub_symbols(["BTCUST"])
+    snap = await n._snapshot()
+    assert "BTCUST" in snap["prices"]
+    assert "EURUSD" in snap["prices"]
+
+
+async def test_handle_watch_symbols_updates():
+    n = _node()
+    ws = FakeWS()
+    await n._handle(ws, {"type": "watch_symbols", "data": {"symbols": ["btcust", "ethusd"]}})
+    assert n.hub_symbols == {"BTCUST", "ETHUSD"}
 
 
 async def test_authenticate_fail():

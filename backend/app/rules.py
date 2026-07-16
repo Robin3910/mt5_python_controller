@@ -19,6 +19,18 @@ def base_symbol(s: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", (s or "").upper())
 
 
+def filter_watch_symbols(filters_cfg: dict | None) -> list[str]:
+    """从中控台全局 filters 提取需节点上报报价的品种代码（大写、去重、排序）。"""
+    out: set[str] = set()
+    for sym, rule in (filters_cfg or {}).items():
+        if not isinstance(rule, dict):
+            continue
+        key = str(sym).strip().upper()
+        if key:
+            out.add(key)
+    return sorted(out)
+
+
 def symbol_match(a: str, b: str) -> bool:
     """判断两个品种是否“同一品种”，兼容券商后缀差异。"""
     ba, bb = base_symbol(a), base_symbol(b)
