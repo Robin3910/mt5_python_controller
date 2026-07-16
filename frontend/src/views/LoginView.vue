@@ -77,7 +77,7 @@ function backToCredentials(): void {
             <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" stroke-linejoin="round" />
           </svg>
         </span>
-        <h1 class="login-title">MT5 多节点管理</h1>
+        <h1 class="login-title">MT5 云端集控中枢</h1>
         <p class="login-subtitle">企业级交易节点管控平台</p>
       </div>
 

@@ -42,7 +42,7 @@ function logout(): void {
             <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" stroke-linejoin="round" />
           </svg>
         </span>
-        <span class="brand-text">MT5<span class="brand-sub">&nbsp;多节点管理</span></span>
+        <span class="brand-text">MT5<span class="brand-sub">&nbsp;云端集控中枢</span></span>
       </div>
 
       <nav class="nav">
