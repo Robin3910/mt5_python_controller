@@ -33,7 +33,11 @@ async def close_node(
     cmd = build_close_command(signal_id, body.target, body.symbol, body.ticket)
     await persist.record_manual_close(signal_id, node_id, body.target, body.symbol, body.ticket)
     sent = await manager.send_to_node(node_id, cmd)
-    await persist.audit(admin, "close_node", node_id, body.model_dump(), "ok" if sent else "offline", client_ip(request))
+    await persist.audit(
+        admin, "close_node", node_id, body.model_dump(), "ok" if sent else "offline",
+        client_ip(request),
+        category="node", before=None, after=body.model_dump(),
+    )
     if not sent:
         raise HTTPException(status_code=409, detail="node offline")
     return {"status": "sent", "node_id": node_id, **body.model_dump()}
@@ -54,7 +58,10 @@ async def close_all(
         await persist.record_manual_close(signal_id, nid, body.target, body.symbol, body.ticket)
         if await manager.send_to_node(nid, cmd):
             sent.append(nid)
-    await persist.audit(admin, "close_all", ",".join(sent), body.model_dump(), "ok", client_ip(request))
+    await persist.audit(
+        admin, "close_all", ",".join(sent), body.model_dump(), "ok", client_ip(request),
+        category="node", before=None, after={"sent": sent, **body.model_dump()},
+    )
     return {"status": "sent", "nodes": sent, **body.model_dump()}
 
 
@@ -90,6 +97,9 @@ async def close_batch(
         {"node_ids": body.node_ids, **body.model_dump(exclude={"node_ids"})},
         "ok" if sent else "fail",
         client_ip(request),
+        category="node",
+        before=None,
+        after={"sent": sent, "failed": failed, **body.model_dump()},
     )
     if not sent and failed:
         raise HTTPException(status_code=409, detail="no nodes online")

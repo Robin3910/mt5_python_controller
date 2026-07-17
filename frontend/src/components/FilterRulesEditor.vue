@@ -228,38 +228,30 @@ async function setLotMode(
   updateNodeRule(symbol, { lot_mode: mode })
 }
 
-// 手动触发信号：已启用全局手数 -> 二次确认；未启用 -> 弹窗输入手数。
+// 手动触发信号：弹窗确认并可自定义手数。
+// 已启用全局手数时默认填入该币种全局手数；未启用时默认填入配置中的 lot 字段。
 // 确认后 emit('trigger')，由父组件（中控台）调用后台手动触发接口。
 async function manualTrigger(symbol: string, action: 'BUY' | 'SELL'): Promise<void> {
   const cfg = model.value as FilterRulesConfig
   const rule = cfg[symbol]
   if (!rule) return
+  const defaultLot = Number(rule.lot) > 0 ? Number(rule.lot) : 0.01
+  const hint = rule.lot_enabled
+    ? `确认手动触发 ${action} ${symbol}？\n\n默认手数为当前币种全局手数，可修改后触发。`
+    : `品种 ${symbol} 未启用全局手数，请输入本次手动触发 ${action} 的手数：`
   let volume: number
-  if (rule.lot_enabled) {
-    const ok = await confirmAction(
-      `确认手动触发 ${action} ${symbol}？\n\n手数：${rule.lot}（已启用全局手数）\n将立即经 /webhook 分发到符合条件的节点。`,
-      '确认手动触发',
-    )
-    if (!ok) return
-    volume = Number(rule.lot)
-  } else {
-    try {
-      const { value } = await ElMessageBox.prompt(
-        `品种 ${symbol} 未启用全局手数，请输入本次手动触发 ${action} 的手数：`,
-        '输入触发手数',
-        {
-          confirmButtonText: '确认触发',
-          cancelButtonText: '取消',
-          inputValue: String(rule.lot ?? 0.01),
-          inputPattern: /^\d*\.?\d+$/,
-          inputErrorMessage: '请输入大于 0 的手数',
-          closeOnClickModal: false,
-        },
-      )
-      volume = Number(value)
-    } catch {
-      return // 用户取消输入
-    }
+  try {
+    const { value } = await ElMessageBox.prompt(hint, '确认手动触发', {
+      confirmButtonText: '确认触发',
+      cancelButtonText: '取消',
+      inputValue: String(defaultLot),
+      inputPattern: /^\d*\.?\d+$/,
+      inputErrorMessage: '请输入大于 0 的手数',
+      closeOnClickModal: false,
+    })
+    volume = Number(value)
+  } catch {
+    return // 用户取消
   }
   if (!(volume > 0)) {
     alert('手数必须大于 0')

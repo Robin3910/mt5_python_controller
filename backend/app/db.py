@@ -54,6 +54,19 @@ def _migrate_signal_source_column(sync_conn) -> None:
         sync_conn.execute(text("ALTER TABLE signal_history ADD COLUMN source VARCHAR(16)"))
 
 
+def _migrate_audit_columns(sync_conn) -> None:
+    """为已存在的 audit_log 表补充分类与操作前后数据列。"""
+    inspector = inspect(sync_conn)
+    if "audit_log" not in inspector.get_table_names():
+        return
+    cols = {c["name"] for c in inspector.get_columns("audit_log")}
+    if "category" not in cols:
+        sync_conn.execute(text("ALTER TABLE audit_log ADD COLUMN category VARCHAR(16)"))
+    if "before_json" not in cols:
+        sync_conn.execute(text("ALTER TABLE audit_log ADD COLUMN before_json JSON"))
+    if "after_json" not in cols:
+        sync_conn.execute(text("ALTER TABLE audit_log ADD COLUMN after_json JSON"))
+
 def _drop_legacy_nodes_table(sync_conn) -> None:
     """v0.2 迁移：旧表带 `token_hash` 列（一节点一令牌）；新方案改为全局共享令牌，
     且 `mt5_login` 升级为 UNIQUE NOT NULL，无法平滑 ALTER —— 直接丢弃旧表，由
@@ -78,4 +91,5 @@ async def init_db() -> None:
         await conn.run_sync(_migrate_user_totp_columns)
         await conn.run_sync(_migrate_dispatch_price_column)
         await conn.run_sync(_migrate_signal_source_column)
+        await conn.run_sync(_migrate_audit_columns)
     logger.info("Database initialized (%s)", engine.url.render_as_string(hide_password=True))

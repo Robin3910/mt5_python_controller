@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from . import (
     accounts,
     admin_ws,
+    audit_api,
     auth,
     close,
     config_api,
@@ -92,6 +93,7 @@ for r in (
     config_api.router,
     console_api.router,
     events.router,
+    audit_api.router,
     accounts.router,
     close.router,
     admin_ws.router,

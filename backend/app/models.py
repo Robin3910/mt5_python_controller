@@ -130,6 +130,29 @@ class PaginatedSignalEvents(BaseModel):
     page_size: int
 
 
+class AuditRecord(BaseModel):
+    """操作审计记录（含操作前后数据）。"""
+    id: int
+    ts: Optional[float] = None
+    operator: str
+    action: str
+    target: Optional[str] = None
+    params: Optional[dict] = None
+    result: str = "ok"
+    ip: Optional[str] = None
+    category: Optional[str] = None  # console / node / system
+    before: Optional[Any] = None
+    after: Optional[Any] = None
+
+
+class PaginatedAudits(BaseModel):
+    """操作审计分页结果。"""
+    items: list[AuditRecord]
+    total: int
+    page: int
+    page_size: int
+
+
 # --------------------------- 账户 ---------------------------
 class Position(BaseModel):
     """单个持仓。"""

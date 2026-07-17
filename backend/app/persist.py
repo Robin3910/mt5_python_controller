@@ -383,8 +383,23 @@ async def recent_dispatches(node_id: str, page: int = 1, page_size: int = 20) ->
         return {"items": [], "total": 0, "page": page, "page_size": page_size}
 
 
-async def audit(operator, action, target=None, params=None, result="ok", ip=None) -> None:
-    """写一条操作审计。"""
+async def audit(
+    operator,
+    action,
+    target=None,
+    params=None,
+    result="ok",
+    ip=None,
+    *,
+    category: Optional[str] = None,
+    before=None,
+    after=None,
+) -> None:
+    """写一条操作审计。
+
+    category：console（中控台）/ node（节点）/ system（其它）
+    before / after：操作前后数据快照（dict 或可 JSON 序列化对象）。
+    """
     try:
         async with SessionLocal() as s:
             s.add(
@@ -395,8 +410,63 @@ async def audit(operator, action, target=None, params=None, result="ok", ip=None
                     params_json=params,
                     result=result,
                     ip=ip,
+                    category=category,
+                    before_json=before,
+                    after_json=after,
                 )
             )
             await s.commit()
     except Exception as e:  # noqa: BLE001
         logger.warning("audit failed: %s", e)
+
+
+def _audit_row(row: AuditLog) -> dict:
+    return {
+        "id": row.id,
+        "ts": row.ts.timestamp() if row.ts else None,
+        "operator": row.operator,
+        "action": row.action,
+        "target": row.target,
+        "params": row.params_json,
+        "result": row.result,
+        "ip": row.ip,
+        "category": row.category,
+        "before": row.before_json,
+        "after": row.after_json,
+    }
+
+
+async def recent_audits(
+    page: int = 1,
+    page_size: int = 20,
+    categories: Optional[list[str]] = None,
+) -> dict:
+    """分页读取操作审计（默认中控台 + 节点）。"""
+    page = max(1, page)
+    page_size = max(1, min(page_size, 100))
+    offset = (page - 1) * page_size
+    cats = categories or ["console", "node"]
+    try:
+        async with SessionLocal() as s:
+            filt = AuditLog.category.in_(cats)
+            total = (
+                await s.execute(select(func.count()).select_from(AuditLog).where(filt))
+            ).scalar_one()
+            rows = (
+                await s.execute(
+                    select(AuditLog)
+                    .where(filt)
+                    .order_by(AuditLog.id.desc())
+                    .offset(offset)
+                    .limit(page_size)
+                )
+            ).scalars().all()
+            return {
+                "items": [_audit_row(r) for r in rows],
+                "total": total,
+                "page": page,
+                "page_size": page_size,
+            }
+    except Exception as e:  # noqa: BLE001
+        logger.warning("recent_audits failed: %s", e)
+        return {"items": [], "total": 0, "page": page, "page_size": page_size}

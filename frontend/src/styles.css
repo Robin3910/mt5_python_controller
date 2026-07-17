@@ -201,6 +201,26 @@ input:focus, select:focus, textarea:focus {
   border-color: var(--primary);
   box-shadow: 0 0 0 3px rgba(0, 212, 170, 0.12);
 }
+
+/* Element Plus MessageBox：避免全局 input 边框/焦点样式叠在 .el-input 外包一层上造成双边框 */
+.el-message-box__input .el-input__inner,
+.el-message-box__input input {
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  padding: 0;
+  width: 100%;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+.el-message-box__input .el-input__inner:focus,
+.el-message-box__input input:focus {
+  border: none;
+  box-shadow: none;
+  outline: none;
+}
+
 label {
   display: block;
   color: var(--muted);

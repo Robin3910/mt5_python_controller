@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // 中控台：系统配置（区间过滤与按币种分发策略）
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
 import 'element-plus/es/components/message-box/style/css'
@@ -20,18 +20,32 @@ const hub = useHubStore()
 const filters = ref<FilterRulesConfig>({})
 const filtersError = ref('')
 const savedFlag = ref('')
+/** 最近一次成功加载/保存后的序列化快照，用于判定未保存修改 */
+const savedSnapshot = ref('')
 
 onMounted(async () => {
   await Promise.all([hub.fetchConfig(), hub.fetchNodes()])
   filters.value = parseFilterRules(hub.filters)
+  markClean()
 })
+
+function snapshotOf(cfg: FilterRulesConfig): string {
+  return JSON.stringify(serializeFilterRules(cfg))
+}
+
+function markClean(): void {
+  savedSnapshot.value = snapshotOf(filters.value)
+}
+
+const isDirty = computed(() => snapshotOf(filters.value) !== savedSnapshot.value)
 
 function flash(msg: string): void {
   savedFlag.value = msg
   setTimeout(() => (savedFlag.value = ''), 1800)
 }
 
-async function saveFilters(): Promise<void> {
+/** 保存过滤规则。返回是否保存成功（校验失败 / 取消 / 请求失败均返回 false）。 */
+async function saveFilters(options?: { skipConfirm?: boolean }): Promise<boolean> {
   filtersError.value = ''
   const payload = serializeFilterRules(filters.value)
   // 保存前刷新节点列表，确保「关闭全局手数」校验用的是最新节点配置
@@ -43,29 +57,64 @@ async function saveFilters(): Promise<void> {
   if (errors.length) {
     filtersError.value = errors[0]
     await ElMessageBox.alert(errors[0], '无法保存', { type: 'warning', confirmButtonText: '知道了' })
-    return
+    return false
   }
   const count = Object.keys(payload).length
-  if (!(await confirmAction(`确认保存过滤规则？\n\n共 ${count} 个品种，保存后立即影响信号准入与分发。`))) return
+  if (!options?.skipConfirm) {
+    if (!(await confirmAction(`确认保存过滤规则？\n\n共 ${count} 个品种，保存后立即影响信号准入与分发。`))) {
+      return false
+    }
+  }
   try {
     await hub.saveFilters(payload)
     filters.value = parseFilterRules(hub.filters)
+    markClean()
     flash('过滤规则已保存')
+    return true
   } catch (e) {
     const err = e as { response?: { data?: { detail?: string } }; message?: string }
     const detail = err?.response?.data?.detail || err?.message || '保存失败'
     filtersError.value = detail
     await ElMessageBox.alert(detail, '无法保存', { type: 'warning', confirmButtonText: '知道了' })
+    return false
   }
 }
 
+/**
+ * 有未保存修改时中断当前动作，弹窗引导进入保存流程。
+ * 返回 true 表示已干净（本就无改动，或保存成功），可继续原动作。
+ */
+async function ensureSavedOrInterrupt(actionHint: string): Promise<boolean> {
+  if (!isDirty.value) return true
+  try {
+    await ElMessageBox.confirm(
+      `中控台配置尚未保存。\n\n${actionHint}将按后台已保存的规则执行，请先保存当前修改。`,
+      '配置未保存',
+      {
+        confirmButtonText: '保存并继续',
+        cancelButtonText: '取消',
+        type: 'warning',
+        closeOnClickModal: false,
+      },
+    )
+  } catch {
+    return false
+  }
+  return saveFilters({ skipConfirm: true })
+}
+
 // 手动触发信号：由 FilterRulesEditor 的 BUY/SELL 按钮确认后 emit，调用后台复用 /webhook 流程。
-// 触发依据后台“已保存”的中控台配置，请先保存修改再触发。
+// 触发依据后台“已保存”的中控台配置；有未保存修改时先打断并引导保存。
 async function onManualTrigger(payload: {
   symbol: string
   action: 'BUY' | 'SELL'
   volume: number
 }): Promise<void> {
+  const ok = await ensureSavedOrInterrupt(
+    `手动触发 ${payload.action} ${payload.symbol}`,
+  )
+  if (!ok) return
+
   try {
     const res = await hub.triggerManualSignal(payload)
     if (res.status === 'accepted') {
@@ -90,7 +139,10 @@ async function onManualTrigger(payload: {
   <div class="console-page">
     <div class="row between page-header">
       <div class="h1">中控台</div>
-      <span v-if="savedFlag" class="tag green">{{ savedFlag }}</span>
+      <div class="row" style="gap: 8px">
+        <span v-if="isDirty" class="tag amber">未保存</span>
+        <span v-if="savedFlag" class="tag green">{{ savedFlag }}</span>
+      </div>
     </div>
 
     <div class="grid layout-config console-body">
@@ -104,7 +156,7 @@ async function onManualTrigger(payload: {
         <div class="console-card-foot">
           <div v-if="filtersError" class="console-card-error">{{ filtersError }}</div>
           <div class="row">
-            <button class="btn-primary" @click="saveFilters">保存过滤规则</button>
+            <button class="btn-primary" @click="saveFilters()">保存过滤规则</button>
           </div>
         </div>
       </div>

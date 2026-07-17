@@ -44,9 +44,13 @@ async def set_filters(
     err = rules.validate_disable_global_lot(body or {}, nodes)
     if err:
         raise HTTPException(status_code=400, detail=err)
+    before = await store.get_filters()
     await store.set_filters(body)
     await push_watch_symbols_to_nodes(body)
-    await persist.audit(admin, "set_filters", None, body, "ok", client_ip(request))
+    await persist.audit(
+        admin, "set_filters", None, None, "ok", client_ip(request),
+        category="console", before=before or {}, after=body or {},
+    )
     return body
 
 

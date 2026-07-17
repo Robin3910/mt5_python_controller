@@ -11,6 +11,20 @@ from .redis_store import RedisStore
 router = APIRouter(prefix="/api/nodes", tags=["nodes"])
 
 
+def _node_audit_snapshot(d: dict | None) -> dict | None:
+    """节点审计快照：只保留配置相关字段。"""
+    if not d:
+        return None
+    return {
+        "node_id": d.get("node_id"),
+        "name": d.get("name"),
+        "enabled": d.get("enabled", True),
+        "filters": d.get("filters"),
+        "mt5_login": d.get("mt5_login"),
+        "mt5_server": d.get("mt5_server"),
+    }
+
+
 def _node_matches_search(node: dict, term: str) -> bool:
     """按节点名称（忽略大小写）或 MT5 账号（子串）模糊匹配。"""
     q = term.lower()
@@ -72,8 +86,8 @@ async def create_node(
             detail=f"node with mt5_login={body.mt5_login} already exists",
         )
     await persist.audit(
-        admin, "create_node", d["node_id"],
-        {"name": d["name"], "mt5_login": d["mt5_login"]}, "ok", client_ip(request),
+        admin, "create_node", d["node_id"], None, "ok", client_ip(request),
+        category="node", before=None, after=_node_audit_snapshot(d),
     )
     return await _to_node_out(store, d)
 
@@ -109,13 +123,18 @@ async def update_node(
     admin: str = Depends(get_current_admin),
 ):
     """更新节点配置（手数策略、跟随开关、轮询顺序、启用状态等）。"""
+    before = _node_audit_snapshot(await store.get_node(node_id))
     try:
         d = await node_service.update_node(store, node_id, body)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     if not d:
         raise HTTPException(status_code=404, detail="node not found")
-    await persist.audit(admin, "update_node", node_id, body.model_dump(exclude_none=True), "ok", client_ip(request))
+    await persist.audit(
+        admin, "update_node", node_id, body.model_dump(exclude_none=True), "ok",
+        client_ip(request),
+        category="node", before=before, after=_node_audit_snapshot(d),
+    )
     return await _to_node_out(store, d)
 
 
@@ -126,10 +145,14 @@ async def delete_node(
     store: RedisStore = Depends(get_store),
     admin: str = Depends(get_current_admin),
 ):
+    before = _node_audit_snapshot(await store.get_node(node_id))
     ok = await node_service.delete_node(store, node_id)
     if not ok:
         raise HTTPException(status_code=404, detail="node not found")
-    await persist.audit(admin, "delete_node", node_id, None, "ok", client_ip(request))
+    await persist.audit(
+        admin, "delete_node", node_id, None, "ok", client_ip(request),
+        category="node", before=before, after=None,
+    )
     return {"status": "deleted", "node_id": node_id}
 
 
@@ -148,5 +171,8 @@ async def batch_lot(
         )
         if d:
             updated.append(nid)
-    await persist.audit(admin, "batch_lot", ",".join(updated), body.model_dump(), "ok", client_ip(request))
+    await persist.audit(
+        admin, "batch_lot", ",".join(updated), body.model_dump(), "ok", client_ip(request),
+        category="node", before=None, after=body.model_dump(),
+    )
     return {"status": "ok", "updated": updated}

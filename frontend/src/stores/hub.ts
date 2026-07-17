@@ -13,6 +13,7 @@ import type {
   NodeOut,
   NodeTokenInfo,
   NodeUpdatePayload,
+  PaginatedAudits,
   PaginatedNodeDispatches,
   PaginatedSignalEvents,
 } from '@/api/types'
@@ -86,6 +87,25 @@ export const useHubStore = defineStore('hub', {
         return (
           await api.get('/api/events/signals', {
             params: { page, page_size: pageSize },
+          })
+        ).data
+      } catch {
+        return { items: [], total: 0, page, page_size: pageSize }
+      }
+    },
+    async fetchAudits(
+      page = 1,
+      pageSize = 20,
+      category?: string | null,
+    ): Promise<PaginatedAudits> {
+      try {
+        return (
+          await api.get('/api/audits', {
+            params: {
+              page,
+              page_size: pageSize,
+              ...(category ? { category } : {}),
+            },
           })
         ).data
       } catch {

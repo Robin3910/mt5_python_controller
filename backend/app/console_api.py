@@ -32,5 +32,17 @@ async def manual_signal(
     result = await process_signal(
         data, source_ip=ip, source="manual", store=store, dispatcher=dispatcher,
     )
-    await persist.audit(admin, "manual_signal", body.symbol, data, result.get("status", "ok"), ip)
+    await persist.audit(
+        admin, "manual_signal", body.symbol, data, result.get("status", "ok"), ip,
+        category="console", before=None, after={
+            "request": data,
+            "result": {
+                "status": result.get("status"),
+                "signal_id": result.get("signal_id"),
+                "mode": result.get("mode"),
+                "targets": result.get("targets"),
+                "reason": result.get("reason"),
+            },
+        },
+    )
     return result

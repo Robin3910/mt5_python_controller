@@ -232,6 +232,27 @@ export interface PaginatedSignalEvents {
   page_size: number
 }
 
+export interface AuditRecord {
+  id: number
+  ts: number | null
+  operator: string
+  action: string
+  target: string | null
+  params: Record<string, unknown> | null
+  result: string
+  ip: string | null
+  category: string | null
+  before: unknown
+  after: unknown
+}
+
+export interface PaginatedAudits {
+  items: AuditRecord[]
+  total: number
+  page: number
+  page_size: number
+}
+
 export interface NodeFeedItem {
   signal_id: string
   ts: number
