@@ -287,3 +287,56 @@ export function validateNodeGlobalLotMode(
   }
   return errors
 }
+
+function lookupNodeSymbolRule(
+  nodeFilters: NodeDispatchFiltersConfig | null | undefined,
+  symbol: string,
+): NodeSymbolDispatchRule | undefined {
+  if (!nodeFilters) return undefined
+  const key = symbol.trim().toUpperCase()
+  if (nodeFilters[key]) return nodeFilters[key]
+  const base = key.replace(/[^A-Z0-9]/g, '')
+  if (base && nodeFilters[base]) return nodeFilters[base]
+  for (const [k, rule] of Object.entries(nodeFilters)) {
+    const kb = k.replace(/[^A-Z0-9]/g, '')
+    if (!kb || !base) continue
+    if (kb === base || kb.startsWith(base) || base.startsWith(kb)) return rule
+  }
+  return undefined
+}
+
+/** 查找将该品种手数策略设为「跟随中控台」的节点名称。 */
+export function nodesFollowingGlobalLot(
+  nodes: Array<{ name?: string; node_id?: string; filters?: NodeDispatchFiltersConfig | null }>,
+  symbol: string,
+): string[] {
+  const names: string[] = []
+  for (const n of nodes) {
+    const rule = lookupNodeSymbolRule(n.filters, symbol)
+    if (rule?.lot_mode === 'global') {
+      names.push(n.name || n.node_id || '?')
+    }
+  }
+  return names
+}
+
+/** 中控台关闭某品种全局手数时，不得仍有节点跟随中控台。 */
+export function validateDisableGlobalLot(
+  rules: FilterRulesConfig,
+  nodes: Array<{ name?: string; node_id?: string; filters?: NodeDispatchFiltersConfig | null }>,
+): string[] {
+  const errors: string[] = []
+  for (const [symbol, rule] of Object.entries(rules)) {
+    if (rule.lot_enabled) continue
+    const key = symbol.trim().toUpperCase()
+    const dependents = nodesFollowingGlobalLot(nodes, key)
+    if (!dependents.length) continue
+    const shown = dependents.slice(0, 5).join('、')
+    const suffix =
+      dependents.length > 5
+        ? `（${shown} 等共 ${dependents.length} 个节点）`
+        : `（${shown}）`
+    errors.push(`${key}：以下节点手数策略为「跟随中控台」，无法关闭全局手数${suffix}`)
+  }
+  return errors
+}

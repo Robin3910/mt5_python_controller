@@ -2,6 +2,8 @@
 // 节点管理页：创建/编辑/删除节点、启停、重置令牌、批量全平（令牌仅创建时显示一次）
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
+import { ElMessageBox } from 'element-plus'
+import 'element-plus/es/components/message-box/style/css'
 import FormLabel from '@/components/FormLabel.vue'
 import FilterRulesEditor from '@/components/FilterRulesEditor.vue'
 import { NODE_FORM_FIELD_HELP } from '@/constants/nodeFormHelp'
@@ -178,6 +180,10 @@ async function save(): Promise<void> {
     ]
     if (filterErrors.length) {
       createError.value = filterErrors[0]
+      await ElMessageBox.alert(filterErrors[0], '无法保存', {
+        type: 'warning',
+        confirmButtonText: '知道了',
+      })
       return
     }
     const payload = {
@@ -197,13 +203,31 @@ async function save(): Promise<void> {
           return
         }
         createError.value = err?.response?.data?.detail || '创建失败，请稍后重试'
+        if (err?.response?.status === 400 && createError.value) {
+          await ElMessageBox.alert(createError.value, '无法保存', {
+            type: 'warning',
+            confirmButtonText: '知道了',
+          })
+        }
         return
       }
     } else {
       const label = form.name || editingId.value
       const enabledText = form.enabled ? '启用' : '禁用'
       if (!(await confirmAction(`确认更新节点「${label}」？\n\n启用状态：${enabledText}`))) return
-      await hub.updateNode(editingId.value, { ...payload, enabled: form.enabled }, currentSearchOptions())
+      try {
+        await hub.updateNode(editingId.value, { ...payload, enabled: form.enabled }, currentSearchOptions())
+      } catch (e: unknown) {
+        const err = e as { response?: { status?: number; data?: { detail?: string } } }
+        createError.value = err?.response?.data?.detail || '更新失败，请稍后重试'
+        if (err?.response?.status === 400 && createError.value) {
+          await ElMessageBox.alert(createError.value, '无法保存', {
+            type: 'warning',
+            confirmButtonText: '知道了',
+          })
+        }
+        return
+      }
     }
     showForm.value = false
   } finally {

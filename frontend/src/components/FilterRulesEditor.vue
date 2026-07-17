@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { ElSwitch } from 'element-plus'
+import { ElMessageBox, ElSwitch } from 'element-plus'
 import 'element-plus/es/components/switch/style/css'
+import 'element-plus/es/components/message-box/style/css'
 import 'element-plus/theme-chalk/dark/css-vars.css'
 import type {
   FilterDirection,
@@ -15,12 +16,20 @@ import {
   createEmptyNodeSymbolRule,
   createEmptySymbolRule,
   exampleFilterRules,
+  nodesFollowingGlobalLot,
+  parseFilterRules,
 } from '@/utils/filterRules'
 import { confirmAction } from '@/utils/confirm'
+import { useHubStore } from '@/stores/hub'
 
 const props = withDefaults(defineProps<{ mode?: 'global' | 'node' }>(), { mode: 'global' })
 
+const emit = defineEmits<{
+  trigger: [payload: { symbol: string; action: 'BUY' | 'SELL'; volume: number }]
+}>()
+
 const model = defineModel<FilterRulesConfig | NodeDispatchFiltersConfig>({ required: true })
+const hub = useHubStore()
 
 const isGlobal = computed(() => props.mode === 'global')
 const addingSymbol = ref(false)
@@ -161,12 +170,102 @@ function setAllowSell(symbol: string, value: string | number | boolean): void {
   updateRule(symbol, { allow_sell: Boolean(value) })
 }
 
+/** 关闭「启用全局手数」前检查是否有节点仍跟随中控台。 */
+async function setLotEnabled(symbol: string, enabled: boolean): Promise<void> {
+  if (!enabled) {
+    if (!hub.nodes.length) await hub.fetchNodes()
+    const dependents = nodesFollowingGlobalLot(hub.nodes, symbol)
+    if (dependents.length) {
+      const shown = dependents.slice(0, 5).join('、')
+      const suffix =
+        dependents.length > 5
+          ? `（${shown} 等共 ${dependents.length} 个节点）`
+          : `（${shown}）`
+      await ElMessageBox.alert(
+        `${symbol}：以下节点手数策略为「跟随中控台」，无法关闭全局手数${suffix}\n\n请先将这些节点改为「固定手数」或「跟随信号」后再关闭。`,
+        '无法关闭全局手数',
+        { type: 'warning', confirmButtonText: '知道了' },
+      )
+      return
+    }
+  }
+  updateRule(symbol, { lot_enabled: enabled })
+}
+
 function setFollowSync(symbol: string, value: string | number | boolean): void {
   updateNodeRule(symbol, { follow_sync: Boolean(value) })
 }
 
 function setFollowPoll(symbol: string, value: string | number | boolean): void {
   updateNodeRule(symbol, { follow_poll: Boolean(value) })
+}
+
+/** 节点手数策略改为「跟随中控台」前检查中控台是否已启用全局手数。 */
+async function setLotMode(
+  symbol: string,
+  mode: 'global' | 'fixed' | 'signal',
+): Promise<void> {
+  if (mode === 'global') {
+    if (!Object.keys(hub.filters).length) await hub.fetchConfig()
+    const globalRules = parseFilterRules(hub.filters)
+    const gf =
+      globalRules[symbol] ||
+      globalRules[symbol.replace(/[^A-Z0-9]/g, '')] ||
+      Object.entries(globalRules).find(([k]) => {
+        const kb = k.replace(/[^A-Z0-9]/g, '')
+        const base = symbol.replace(/[^A-Z0-9]/g, '')
+        return kb && base && (kb === base || kb.startsWith(base) || base.startsWith(kb))
+      })?.[1]
+    if (!gf?.lot_enabled) {
+      await ElMessageBox.alert(
+        `${symbol}：中控台该品种未启用全局手数，无法将手数策略设为「跟随中控台」。\n\n请先到中控台开启该品种的「启用全局手数」。`,
+        '无法设置跟随中控台',
+        { type: 'warning', confirmButtonText: '知道了' },
+      )
+      return
+    }
+  }
+  updateNodeRule(symbol, { lot_mode: mode })
+}
+
+// 手动触发信号：已启用全局手数 -> 二次确认；未启用 -> 弹窗输入手数。
+// 确认后 emit('trigger')，由父组件（中控台）调用后台手动触发接口。
+async function manualTrigger(symbol: string, action: 'BUY' | 'SELL'): Promise<void> {
+  const cfg = model.value as FilterRulesConfig
+  const rule = cfg[symbol]
+  if (!rule) return
+  let volume: number
+  if (rule.lot_enabled) {
+    const ok = await confirmAction(
+      `确认手动触发 ${action} ${symbol}？\n\n手数：${rule.lot}（已启用全局手数）\n将立即经 /webhook 分发到符合条件的节点。`,
+      '确认手动触发',
+    )
+    if (!ok) return
+    volume = Number(rule.lot)
+  } else {
+    try {
+      const { value } = await ElMessageBox.prompt(
+        `品种 ${symbol} 未启用全局手数，请输入本次手动触发 ${action} 的手数：`,
+        '输入触发手数',
+        {
+          confirmButtonText: '确认触发',
+          cancelButtonText: '取消',
+          inputValue: String(rule.lot ?? 0.01),
+          inputPattern: /^\d*\.?\d+$/,
+          inputErrorMessage: '请输入大于 0 的手数',
+          closeOnClickModal: false,
+        },
+      )
+      volume = Number(value)
+    } catch {
+      return // 用户取消输入
+    }
+  }
+  if (!(volume > 0)) {
+    alert('手数必须大于 0')
+    return
+  }
+  emit('trigger', { symbol, action, volume })
 }
 
 defineExpose({ loadExample })
@@ -253,7 +352,12 @@ defineExpose({ loadExample })
               <el-switch :model-value="rule.allow_sell" @change="setAllowSell(symbol, $event)" />
             </div>
           </div>
-          <button type="button" class="btn-sm btn-ghost" @click="removeSymbol(symbol)">删除品种</button>
+          <div class="row filter-symbol-actions">
+            <span class="filter-manual-label">手动触发</span>
+            <button type="button" class="btn-sm btn-manual btn-manual-buy" @click="manualTrigger(symbol, 'BUY')">BUY</button>
+            <button type="button" class="btn-sm btn-manual btn-manual-sell" @click="manualTrigger(symbol, 'SELL')">SELL</button>
+            <button type="button" class="btn-sm btn-ghost" @click="removeSymbol(symbol)">删除品种</button>
+          </div>
         </div>
 
         <div class="form-grid two" style="margin-top: 12px">
@@ -291,7 +395,7 @@ defineExpose({ loadExample })
             <label>启用全局手数</label>
             <select
               :value="rule.lot_enabled ? 'true' : 'false'"
-              @change="updateRule(symbol, { lot_enabled: ($event.target as HTMLSelectElement).value === 'true' })"
+              @change="setLotEnabled(symbol, ($event.target as HTMLSelectElement).value === 'true')"
             >
               <option value="false">关闭</option>
               <option value="true">启用</option>
@@ -457,7 +561,7 @@ defineExpose({ loadExample })
             <label>手数策略</label>
             <select
               :value="rule.lot_mode"
-              @change="updateNodeRule(symbol, { lot_mode: ($event.target as HTMLSelectElement).value as 'global' | 'fixed' | 'signal' })"
+              @change="setLotMode(symbol, ($event.target as HTMLSelectElement).value as 'global' | 'fixed' | 'signal')"
             >
               <option value="global">跟随中控台</option>
               <option value="fixed">固定手数</option>
@@ -578,7 +682,21 @@ defineExpose({ loadExample })
 }
 .filter-symbol-card { background: var(--bg-soft); }
 .filter-symbol-name { font-size: 15px; letter-spacing: 0.3px; }
+.filter-symbol-head { flex-wrap: wrap; gap: 10px; }
 .filter-symbol-switches { align-items: center; }
+.filter-symbol-actions { align-items: center; gap: 8px; flex-shrink: 0; }
+.filter-manual-label { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.btn-manual {
+  min-width: 52px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  color: #fff;
+  border: 1px solid transparent;
+}
+.btn-manual-buy { background: var(--green); }
+.btn-manual-buy:hover { filter: brightness(1.08); }
+.btn-manual-sell { background: var(--red); }
+.btn-manual-sell:hover { filter: brightness(1.08); }
 .filter-dir-switch {
   display: inline-flex;
   align-items: center;

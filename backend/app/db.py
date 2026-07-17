@@ -44,6 +44,16 @@ def _migrate_dispatch_price_column(sync_conn) -> None:
         sync_conn.execute(text("ALTER TABLE signal_dispatch ADD COLUMN price FLOAT"))
 
 
+def _migrate_signal_source_column(sync_conn) -> None:
+    """为已存在的 signal_history 表补充信号来源列（create_all 不会改已存在的表）。"""
+    inspector = inspect(sync_conn)
+    if "signal_history" not in inspector.get_table_names():
+        return
+    cols = {c["name"] for c in inspector.get_columns("signal_history")}
+    if "source" not in cols:
+        sync_conn.execute(text("ALTER TABLE signal_history ADD COLUMN source VARCHAR(16)"))
+
+
 def _drop_legacy_nodes_table(sync_conn) -> None:
     """v0.2 迁移：旧表带 `token_hash` 列（一节点一令牌）；新方案改为全局共享令牌，
     且 `mt5_login` 升级为 UNIQUE NOT NULL，无法平滑 ALTER —— 直接丢弃旧表，由
@@ -67,4 +77,5 @@ async def init_db() -> None:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_migrate_user_totp_columns)
         await conn.run_sync(_migrate_dispatch_price_column)
+        await conn.run_sync(_migrate_signal_source_column)
     logger.info("Database initialized (%s)", engine.url.render_as_string(hide_password=True))

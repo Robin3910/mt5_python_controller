@@ -228,3 +228,26 @@ def test_validate_node_global_lot_mode_passes_when_enabled():
     global_filters = {"EURUSD": {"lot_enabled": True, "lot": 0.1}}
     node_filters = {"EURUSD": {"lot_mode": "global"}}
     assert rules.validate_node_global_lot_mode(node_filters, global_filters) is None
+
+
+def test_validate_disable_global_lot_blocks_when_nodes_follow():
+    global_filters = {"EURUSD": {"lot_enabled": False, "lot": 0.1}}
+    nodes = [
+        {"node_id": "nd_a", "name": "Alpha", "filters": {"EURUSD": {"lot_mode": "global"}}},
+        {"node_id": "nd_b", "name": "Beta", "filters": {"EURUSD": {"lot_mode": "fixed"}}},
+    ]
+    err = rules.validate_disable_global_lot(global_filters, nodes)
+    assert err is not None and "EURUSD" in err and "跟随中控台" in err and "Alpha" in err
+
+
+def test_validate_disable_global_lot_passes_when_enabled_or_no_followers():
+    nodes = [
+        {"node_id": "nd_a", "name": "Alpha", "filters": {"EURUSD": {"lot_mode": "global"}}},
+    ]
+    assert rules.validate_disable_global_lot(
+        {"EURUSD": {"lot_enabled": True, "lot": 0.1}}, nodes,
+    ) is None
+    assert rules.validate_disable_global_lot(
+        {"EURUSD": {"lot_enabled": False, "lot": 0.1}},
+        [{"node_id": "nd_b", "name": "Beta", "filters": {"EURUSD": {"lot_mode": "fixed"}}}],
+    ) is None

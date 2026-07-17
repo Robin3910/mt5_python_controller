@@ -6,6 +6,8 @@ import type {
   CloseBatchResult,
   FilterRulesConfig,
   HubEvent,
+  ManualSignalPayload,
+  ManualSignalResult,
   NodeCreatePayload,
   NodeFeedItem,
   NodeOut,
@@ -107,6 +109,10 @@ export const useHubStore = defineStore('hub', {
     // ---- 配置保存 ----
     async saveFilters(cfg: FilterRulesConfig): Promise<void> {
       this.filters = (await api.put('/api/config/filters', cfg)).data
+    },
+    // ---- 中控台手动触发信号（复用 Webhook 分发流程）----
+    async triggerManualSignal(payload: ManualSignalPayload): Promise<ManualSignalResult> {
+      return (await api.post('/api/console/manual-signal', payload)).data
     },
     // ---- 全局节点接入令牌（账户设置）----
     async fetchNodeToken(): Promise<NodeTokenInfo> {

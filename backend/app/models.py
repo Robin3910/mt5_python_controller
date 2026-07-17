@@ -118,6 +118,7 @@ class SignalEventRecord(BaseModel):
     parsed_ok: bool = False
     dispatch_mode: Optional[str] = None
     status: str = "pending"
+    source: Optional[str] = None  # tradingview（外部 Webhook）/ manual（中控台手动触发）
     dispatches: list[SignalEventDispatch] = Field(default_factory=list)
 
 
@@ -211,6 +212,14 @@ class CloseRequest(BaseModel):
 class CloseBatchRequest(CloseRequest):
     """对指定节点批量平仓。"""
     node_ids: list[str] = Field(min_length=1)
+
+
+# ----------------------- 中控台手动触发 -----------------------
+class ManualSignalRequest(BaseModel):
+    """中控台手动触发的开仓信号（复用 Webhook 分发流程）。"""
+    symbol: str = Field(min_length=1)
+    action: str  # BUY / SELL
+    volume: float = Field(gt=0)
 
 
 # ----------------------------- 鉴权 ----------------------------

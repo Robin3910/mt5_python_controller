@@ -47,6 +47,67 @@ def _extract_token(request: Request, data) -> str:
     return token or ""
 
 
+async def process_signal(
+    data,
+    *,
+    source_ip: str | None,
+    source: str,
+    store: RedisStore,
+    dispatcher: Dispatcher,
+    raw_payload: str | None = None,
+) -> dict:
+    """信号处理共享流程：解析 -> 校验 -> 去重 -> 分发 -> 响应。
+
+    供 `/webhook`（source=tradingview）与中控台手动触发（source=manual）复用，
+    保证两条入口的解析规则、幂等去重与分发决策完全一致。解析/校验失败抛 HTTPException。
+    """
+    if raw_payload is None:
+        raw_payload = _serialize_raw(data, data if isinstance(data, str) else "")
+
+    # 解析 + 校验
+    signal = parser.parse(data)
+    if signal is None:
+        await persist.record_signal(
+            _new_signal_id(), None, source_ip, parsed_ok=False, status="rejected",
+            raw_payload=raw_payload, source=source,
+        )
+        raise HTTPException(status_code=400, detail="cannot parse signal")
+
+    ok, err = parser.validate_signal(signal)
+    if not ok:
+        raise HTTPException(status_code=400, detail=f"invalid signal: {err}")
+
+    # 9.7 幂等：在 DEDUP_WINDOW 秒内，相同(动作/品种/手数/止盈止损)的信号视为重复
+    fp = f"{signal.action}:{signal.symbol}:{signal.volume}:{signal.stop_loss}:{signal.take_profit}"
+    if await store.seen_signal(fp):
+        logger.info("duplicate signal suppressed: %s", fp)
+        return {"status": "duplicate", "action": signal.action, "symbol": signal.symbol}
+
+    # 正式分发
+    signal_id = _new_signal_id()
+    result = await dispatcher.dispatch(
+        signal, signal_id, source_ip=source_ip, raw_payload=raw_payload, source=source,
+    )
+    if result.get("mode") == "rejected":
+        return {
+            "status": "rejected",
+            "signal_id": signal_id,
+            "action": signal.action,
+            "symbol": signal.symbol,
+            "volume": signal.volume,
+            "reason": result.get("reason"),
+            **result,
+        }
+    return {
+        "status": "accepted",
+        "signal_id": signal_id,
+        "action": signal.action,
+        "symbol": signal.symbol,
+        "volume": signal.volume,
+        **result,
+    }
+
+
 @router.post("/webhook")
 async def webhook(
     request: Request,
@@ -76,44 +137,7 @@ async def webhook(
             raise HTTPException(status_code=401, detail="invalid token")
 
     raw_payload = _serialize_raw(data, text)
-
-    # 解析 + 校验
-    signal = parser.parse(data)
-    if signal is None:
-        await persist.record_signal(
-            _new_signal_id(), None, ip, parsed_ok=False, status="rejected",
-            raw_payload=raw_payload,
-        )
-        raise HTTPException(status_code=400, detail="cannot parse signal")
-
-    ok, err = parser.validate_signal(signal)
-    if not ok:
-        raise HTTPException(status_code=400, detail=f"invalid signal: {err}")
-
-    # 9.7 幂等：在 DEDUP_WINDOW 秒内，相同(动作/品种/手数/止盈止损)的信号视为重复
-    fp = f"{signal.action}:{signal.symbol}:{signal.volume}:{signal.stop_loss}:{signal.take_profit}"
-    if await store.seen_signal(fp):
-        logger.info("duplicate signal suppressed: %s", fp)
-        return {"status": "duplicate", "action": signal.action, "symbol": signal.symbol}
-
-    # 正式分发
-    signal_id = _new_signal_id()
-    result = await dispatcher.dispatch(signal, signal_id, source_ip=ip, raw_payload=raw_payload)
-    if result.get("mode") == "rejected":
-        return {
-            "status": "rejected",
-            "signal_id": signal_id,
-            "action": signal.action,
-            "symbol": signal.symbol,
-            "volume": signal.volume,
-            "reason": result.get("reason"),
-            **result,
-        }
-    return {
-        "status": "accepted",
-        "signal_id": signal_id,
-        "action": signal.action,
-        "symbol": signal.symbol,
-        "volume": signal.volume,
-        **result,
-    }
+    return await process_signal(
+        data, source_ip=ip, source="tradingview",
+        store=store, dispatcher=dispatcher, raw_payload=raw_payload,
+    )

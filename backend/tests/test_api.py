@@ -411,6 +411,63 @@ def test_create_node_global_lot_requires_console_lot_enabled(client):
     assert "未启用全局手数" in r.json()["detail"]
 
 
+def test_disable_console_global_lot_blocked_when_node_follows(client):
+    """中控台关闭全局手数时，若有节点仍跟随中控台则拒收。"""
+    h = _auth(client)
+    # 先启用全局手数，再创建跟随节点
+    client.put(
+        "/api/config/filters",
+        json={
+            "EURUSD": {
+                "enabled": True,
+                "allow_buy": True,
+                "allow_sell": True,
+                "dispatch_mode": "sync",
+                "position_scope": "symbol",
+                "default_action": "pass",
+                "lot_enabled": True,
+                "lot": 0.01,
+                "intervals": [],
+            }
+        },
+        headers=h,
+    )
+    created = client.post(
+        "/api/nodes",
+        json={
+            "name": "follow-lot",
+            "mt5_login": 91002,
+            "filters": {"EURUSD": {"lot_mode": "global", "follow_sync": True, "follow_poll": True}},
+        },
+        headers=h,
+    )
+    assert created.status_code in (200, 201), created.text
+
+    # 尝试关闭全局手数 → 应被拒
+    r = client.put(
+        "/api/config/filters",
+        json={
+            "EURUSD": {
+                "enabled": True,
+                "allow_buy": True,
+                "allow_sell": True,
+                "dispatch_mode": "sync",
+                "position_scope": "symbol",
+                "default_action": "pass",
+                "lot_enabled": False,
+                "lot": 0.01,
+                "intervals": [],
+            }
+        },
+        headers=h,
+    )
+    assert r.status_code == 400
+    detail = r.json()["detail"]
+    assert "跟随中控台" in detail
+    assert "无法关闭全局手数" in detail
+    assert "follow-lot" in detail
+
+
 def test_node_token_rotate(client):
     """重置令牌后，旧令牌应失效，新令牌可用。"""
     h = _auth(client)

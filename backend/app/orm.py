@@ -109,6 +109,8 @@ class SignalHistory(Base):
     parsed_ok: Mapped[bool] = mapped_column(Boolean, default=False)
     dispatch_mode: Mapped[str | None] = mapped_column(String(8), nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="pending")
+    # 信号来源：tradingview（外部 Webhook）/ manual（中控台手动触发）；历史为空按 tradingview 展示
+    source: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
 
 class SignalDispatch(Base):

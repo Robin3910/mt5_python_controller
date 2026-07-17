@@ -17,8 +17,12 @@ logger = logging.getLogger(__name__)
 
 async def record_signal(signal_id, signal, source_ip=None, parsed_ok=True,
                         dispatch_mode=None, status="dispatching",
-                        raw_payload: Optional[str] = None) -> None:
-    """落库一条信号历史。"""
+                        raw_payload: Optional[str] = None,
+                        source: str = "tradingview") -> None:
+    """落库一条信号历史。
+
+    source：信号来源，tradingview（外部 Webhook）/ manual（中控台手动触发）。
+    """
     payload_str = raw_payload
     if payload_str is None and signal is not None:
         payload_str = str(asdict(signal))
@@ -38,6 +42,7 @@ async def record_signal(signal_id, signal, source_ip=None, parsed_ok=True,
                     parsed_ok=parsed_ok,
                     dispatch_mode=dispatch_mode,
                     status=status,
+                    source=source,
                 )
             )
             await s.commit()
@@ -262,6 +267,7 @@ def _signal_event_row(sig: SignalHistory, dispatches: list[dict]) -> dict:
         "parsed_ok": sig.parsed_ok,
         "dispatch_mode": sig.dispatch_mode,
         "status": sig.status,
+        "source": sig.source,
         "dispatches": dispatches,
     }
 

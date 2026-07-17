@@ -3,7 +3,7 @@
 这些配置存于 Redis（运行期实时态），下发分发时即时读取生效。
 节点令牌为持久化配置（MySQL/SQLite + Redis 缓存，见 system_settings）。
 """
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from . import persist, rules, system_settings
 from .connections import manager
@@ -36,7 +36,14 @@ async def set_filters(
     store: RedisStore = Depends(get_store),
     admin: str = Depends(get_current_admin),
 ):
-    """设置多区间方向过滤（以品种为键的对象，结构见前端配置页说明）。"""
+    """设置多区间方向过滤（以品种为键的对象，结构见前端配置页说明）。
+
+    关闭某品种「启用全局手数」时，若仍有节点将该品种手数策略设为「跟随中控台」，则拒收。
+    """
+    nodes = await store.all_nodes()
+    err = rules.validate_disable_global_lot(body or {}, nodes)
+    if err:
+        raise HTTPException(status_code=400, detail=err)
     await store.set_filters(body)
     await push_watch_symbols_to_nodes(body)
     await persist.audit(admin, "set_filters", None, body, "ok", client_ip(request))

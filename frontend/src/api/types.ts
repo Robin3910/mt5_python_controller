@@ -126,6 +126,25 @@ export interface CloseBatchResult {
   target: string
 }
 
+// 中控台手动触发的开仓信号（复用 Webhook 分发流程）
+export interface ManualSignalPayload {
+  symbol: string
+  action: 'BUY' | 'SELL'
+  volume: number
+}
+
+// 手动触发接口返回（与 /webhook 响应同构，字段视 status 而定）
+export interface ManualSignalResult {
+  status: string // accepted / duplicate / rejected
+  signal_id?: string
+  action?: string
+  symbol?: string
+  volume?: number
+  mode?: string
+  targets?: number
+  reason?: string
+}
+
 export interface HubEvent {
   ts: number
   text: string
@@ -201,6 +220,8 @@ export interface SignalEventRecord {
   parsed_ok: boolean
   dispatch_mode: string | null
   status: string
+  /** 信号来源：tradingview（外部 Webhook）/ manual（中控台手动触发）；空按 TradingView 展示 */
+  source: string | null
   dispatches: SignalEventDispatch[]
 }
 

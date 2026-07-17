@@ -305,3 +305,44 @@ def validate_node_global_lot_mode(node_filters: dict, global_filters: dict) -> O
                 f"{key}：手数策略为「跟随中控台」，但中控台该品种未启用全局手数，无法保存"
             )
     return None
+
+
+def nodes_following_global_lot(nodes: list[dict], symbol: str) -> list[str]:
+    """返回将该品种手数策略设为「跟随中控台」(lot_mode=global) 的节点名称列表。"""
+    key = base_symbol(symbol) or (symbol or "").strip().upper()
+    if not key:
+        return []
+    names: list[str] = []
+    for n in nodes or []:
+        nf = n.get("filters") or {}
+        if not isinstance(nf, dict):
+            continue
+        sf = _lookup_symbol_config(nf, key)
+        if sf and sf.get("lot_mode") == "global":
+            names.append(str(n.get("name") or n.get("node_id") or "?"))
+    return names
+
+
+def validate_disable_global_lot(global_filters: dict, nodes: list[dict]) -> Optional[str]:
+    """中控台关闭某品种全局手数时，不得仍有节点将该品种手数策略设为跟随中控台。"""
+    if not global_filters or not isinstance(global_filters, dict):
+        return None
+    for sym, rule in global_filters.items():
+        if not isinstance(rule, dict) or rule.get("lot_enabled"):
+            continue
+        key = base_symbol(str(sym)) or str(sym).strip().upper()
+        if not key:
+            continue
+        dependents = nodes_following_global_lot(nodes, key)
+        if not dependents:
+            continue
+        shown = "、".join(dependents[:5])
+        suffix = (
+            f"（{shown} 等共 {len(dependents)} 个节点）"
+            if len(dependents) > 5
+            else f"（{shown}）"
+        )
+        return (
+            f"{key}：以下节点手数策略为「跟随中控台」，无法关闭全局手数{suffix}"
+        )
+    return None

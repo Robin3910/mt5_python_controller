@@ -72,6 +72,12 @@ function signalTag(status: string): { cls: string; text: string } {
   return m[status] || { cls: '', text: status }
 }
 
+// 信号来源：manual = 中控台手动触发；其余（含历史空值）按 TradingView 展示
+function sourceTag(source: string | null): { cls: string; text: string } {
+  if (source === 'manual') return { cls: 'amber', text: '手动触发' }
+  return { cls: '', text: 'TradingView' }
+}
+
 function dispatchTag(status: string): { cls: string; text: string } {
   const m: Record<string, { cls: string; text: string }> = {
     done: { cls: 'green', text: '成功' },
@@ -164,6 +170,12 @@ watch(
           </span>
         </div>
         <div class="list-field">
+          <span class="k">来源</span>
+          <span class="v">
+            <span class="tag" :class="sourceTag(row.source).cls">{{ sourceTag(row.source).text }}</span>
+          </span>
+        </div>
+        <div class="list-field">
           <span class="k">整体状态</span>
           <span class="v">
             <span class="tag" :class="signalTag(row.status).cls">{{ signalTag(row.status).text }}</span>
@@ -198,6 +210,7 @@ watch(
           <th class="col-expand"></th>
           <th class="col-time">时间</th>
           <th class="col-action">动作</th>
+          <th class="col-source">来源</th>
           <th class="col-symbol">品种</th>
           <th class="col-volume right">手数</th>
           <th class="col-parse">解析</th>
@@ -219,6 +232,9 @@ watch(
               >{{ row.action }}</span>
               <span v-else class="muted">—</span>
             </td>
+            <td class="col-source">
+              <span class="tag" :class="sourceTag(row.source).cls">{{ sourceTag(row.source).text }}</span>
+            </td>
             <td class="col-symbol">{{ row.symbol || '—' }}</td>
             <td class="col-volume right">{{ row.volume ?? '—' }}</td>
             <td class="col-parse">
@@ -231,7 +247,7 @@ watch(
             <td class="muted col-ip">{{ row.source_ip || '—' }}</td>
           </tr>
           <tr v-if="isExpanded(row.signal_id)" class="detail-row">
-            <td colspan="9">
+            <td colspan="10">
               <div class="events-detail">
                 <div class="grid cols-2 events-detail-kv" style="gap: 12px; margin-bottom: 12px">
                   <div class="kv"><span class="k">信号 ID</span><span class="v events-break">{{ row.signal_id }}</span></div>
@@ -329,6 +345,7 @@ watch(
 .events-table .col-expand { width: 28px; white-space: nowrap; }
 .events-table .col-time { width: 11%; white-space: nowrap; }
 .events-table .col-action { width: 7%; white-space: nowrap; }
+.events-table .col-source { width: 10%; white-space: nowrap; }
 .events-table .col-symbol { width: 9%; }
 .events-table .col-volume { width: 6%; white-space: nowrap; }
 .events-table .col-parse { width: 7%; white-space: nowrap; }
