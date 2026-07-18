@@ -384,61 +384,81 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
     </table>
   </div>
 
-  <!-- create / edit modal -->
+  <!-- create / edit modal：头/身/底三段，底部操作栏固定，避免 iPhone Safari 底栏遮挡 -->
   <div v-if="showForm" class="modal-mask" @click.self="showForm = false">
-    <div class="card card-pad modal modal-lg">
-      <div class="h1">{{ formMode === 'create' ? '新建节点' : '编辑节点' }}</div>
-      <p v-if="formMode === 'create'" class="muted" style="font-size: 12px; margin: 4px 0 10px">
-        提示：若 node_client 用同一 MT5 登录号首次连接，系统会自动注册（默认禁用，需在此启用后才会上线）；手动新建默认启用。
-      </p>
-      <div class="form-grid two">
-        <div>
-          <FormLabel field-id="node-name" text="名称" :help="NODE_FORM_FIELD_HELP.name" />
-          <input id="node-name" v-model="form.name" :placeholder="form.mt5_login ? `留空将自动生成：node-${form.mt5_login}` : '留空将自动生成 node-{mt5_login}'" />
-        </div>
-        <div v-if="formMode === 'create'">
-          <FormLabel field-id="node-mt5-login" text="MT5 账户登录号" :help="NODE_FORM_FIELD_HELP.mt5_login" />
-          <input id="node-mt5-login" v-model.number="form.mt5_login" type="number" step="1" min="1" placeholder="例如：60108484" />
-        </div>
-        <div v-else>
-          <FormLabel field-id="node-mt5-login-readonly" text="MT5 账户登录号" :help="NODE_FORM_FIELD_HELP.mt5_login" />
-          <input id="node-mt5-login-readonly" :value="form.mt5_login ?? ''" type="number" disabled />
-          <p class="muted" style="font-size: 12px; margin: 6px 0 0">创建后不可修改</p>
-        </div>
-        <div v-if="formMode === 'edit'">
-          <FormLabel field-id="node-enabled" text="启用状态" :help="NODE_FORM_FIELD_HELP.enabled" />
-          <select id="node-enabled" v-model="form.enabled"><option :value="true">启用</option><option :value="false">禁用</option></select>
-        </div>
-        <div class="span-full">
-          <FormLabel text="按币种配置" :help="NODE_FORM_FIELD_HELP.filters" />
-          <div class="node-filter-scroll">
-            <FilterRulesEditor v-model="form.filters" mode="node" />
+    <div class="card card-pad modal modal-lg node-form-modal">
+      <div class="modal-header">
+        <div class="h1">{{ formMode === 'create' ? '新建节点' : '编辑节点' }}</div>
+        <p v-if="formMode === 'create'" class="muted" style="font-size: 12px; margin: 4px 0 0">
+          提示：若 node_client 用同一 MT5 登录号首次连接，系统会自动注册（默认禁用，需在此启用后才会上线）；手动新建默认启用。
+        </p>
+      </div>
+      <div class="modal-body">
+        <div class="form-grid two">
+          <div>
+            <FormLabel field-id="node-name" text="名称" :help="NODE_FORM_FIELD_HELP.name" />
+            <input id="node-name" v-model="form.name" :placeholder="form.mt5_login ? `留空将自动生成：node-${form.mt5_login}` : '留空将自动生成 node-{mt5_login}'" />
           </div>
+          <div v-if="formMode === 'create'">
+            <FormLabel field-id="node-mt5-login" text="MT5 账户登录号" :help="NODE_FORM_FIELD_HELP.mt5_login" />
+            <input id="node-mt5-login" v-model.number="form.mt5_login" type="number" step="1" min="1" placeholder="例如：60108484" />
+          </div>
+          <div v-else>
+            <FormLabel field-id="node-mt5-login-readonly" text="MT5 账户登录号" :help="NODE_FORM_FIELD_HELP.mt5_login" />
+            <input id="node-mt5-login-readonly" :value="form.mt5_login ?? ''" type="number" disabled />
+            <p class="muted" style="font-size: 12px; margin: 6px 0 0">创建后不可修改</p>
+          </div>
+          <div v-if="formMode === 'edit'">
+            <FormLabel field-id="node-enabled" text="启用状态" :help="NODE_FORM_FIELD_HELP.enabled" />
+            <select id="node-enabled" v-model="form.enabled"><option :value="true">启用</option><option :value="false">禁用</option></select>
+          </div>
+          <div class="span-full">
+            <FormLabel text="按币种配置" :help="NODE_FORM_FIELD_HELP.filters" />
+            <div class="node-filter-scroll">
+              <FilterRulesEditor v-model="form.filters" mode="node" />
+            </div>
+          </div>
+          <div v-if="createError" class="span-full" style="color: var(--red); font-size: 13px">{{ createError }}</div>
         </div>
-        <div v-if="createError" class="span-full" style="color: var(--red); font-size: 13px">{{ createError }}</div>
-        <div class="row between span-full" style="margin-top: 6px">
-          <button class="btn-ghost" @click="showForm = false">取消</button>
-          <button
-            class="btn-primary"
-            :disabled="saving || (formMode === 'create' && !form.mt5_login)"
-            @click="save"
-          >{{ saving ? '保存中…' : '保存' }}</button>
-        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-ghost" @click="showForm = false">取消</button>
+        <button
+          class="btn-primary"
+          :disabled="saving || (formMode === 'create' && !form.mt5_login)"
+          @click="save"
+        >{{ saving ? '保存中…' : '保存' }}</button>
       </div>
     </div>
   </div>
 </template>
 
 <style scoped>
-/* 编辑节点弹窗内：策略列表外层限高 + 可滚动，多品种时不撑破 modal */
+/* 币种配置区随弹窗 body 滚动；桌面仍可限高，手机交给 modal-body */
 .node-filter-scroll {
-  max-height: clamp(260px, 55vh, 520px);
-  overflow-y: auto;
   margin-top: 4px;
 }
-@media (max-width: 768px) {
+@media (min-width: 769px) {
   .node-filter-scroll {
-    max-height: 50vh;
+    max-height: clamp(260px, 45vh, 480px);
+    overflow-y: auto;
+  }
+}
+@media (max-width: 768px) {
+  .node-form-modal {
+    width: 100%;
+    max-width: 100%;
+    max-height: calc(100dvh - 24px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+    border-radius: 16px;
+  }
+  .node-filter-scroll {
+    max-height: none;
+    overflow: visible;
+  }
+  .modal-footer .btn-ghost,
+  .modal-footer .btn-primary {
+    flex: 1;
+    min-height: 44px;
   }
 }
 </style>

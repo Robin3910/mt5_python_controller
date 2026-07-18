@@ -574,18 +574,55 @@ td:first-child, th:first-child { font-family: var(--font); }
 .right { text-align: right; }
 
 .modal-mask {
-  position: fixed; inset: 0;
+  position: fixed;
+  inset: 0;
   background: rgba(4, 8, 18, 0.75);
   backdrop-filter: blur(6px);
   -webkit-backdrop-filter: blur(6px);
-  display: flex; align-items: center; justify-content: center;
-  z-index: 50; padding: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+  /* 兼顾 iPhone Safari 动态底栏与安全区，避免按钮被遮挡 */
+  padding:
+    max(16px, env(safe-area-inset-top, 0px))
+    max(16px, env(safe-area-inset-right, 0px))
+    max(16px, env(safe-area-inset-bottom, 0px))
+    max(16px, env(safe-area-inset-left, 0px));
+  box-sizing: border-box;
 }
 .modal { width: 100%; max-width: 460px; }
 .modal-lg {
   max-width: min(920px, calc(100vw - 32px));
+  /* dvh 适配 Safari 动态视口；回退 100vh */
   max-height: calc(100vh - 32px);
+  max-height: calc(100dvh - 32px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.modal-header {
+  flex-shrink: 0;
+  padding-bottom: 8px;
+}
+.modal-body {
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.modal-footer {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--glass-border);
+  /* 再垫一层底边，避免贴边被 Safari 工具栏挡住 */
+  padding-bottom: max(0px, env(safe-area-inset-bottom, 0px));
 }
 .token-box {
   font-family: var(--mono);
