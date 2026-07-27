@@ -26,6 +26,12 @@ K_EXEC_LOCK = "lock:exec:{}:{}"  # (node, symbol) 执行锁
 K_POLL_PENDING = "signal:poll:pending"  # 轮询待处理队列（List）
 K_POLL_PROGRESS = "signal:poll:{}"      # 单条轮询信号的进度（JSON）
 K_POLL_ROTATION = "signal:poll:rotation:{}"  # 按品种的轮转顺序（JSON list[node_id]）
+# ---- strategy 分组链路（与上面按币种的 key 命名空间完全分离）----
+K_GROUP = "group:{}"                    # 分组元数据缓存（JSON，含成员 node_id 列表）
+K_GROUPS = "groups"                     # 所有 group_id 的集合
+K_GROUP_ROTATION = "group:poll:rotation:{}"  # 分组内轮询轮转顺序（JSON list[node_id]）
+K_STRATEGY = "strategy:{}"              # 策略实例缓存（JSON）
+K_STRATEGIES = "strategies"             # 所有 strategy_id 的集合
 
 
 class RedisStore:
@@ -157,3 +163,61 @@ class RedisStore:
     async def save_poll_rotation(self, symbol: str, order: list[str]) -> None:
         """持久化某品种的轮转顺序（领取成功后把消费节点移到队尾，重启后仍延续轮转）。"""
         await self.r.set(K_POLL_ROTATION.format(symbol), json.dumps(order))
+
+    # ----------------- 分组（strategy 链路） -----------------
+    async def cache_group(self, group: dict) -> None:
+        """写入/更新分组缓存，并登记到分组集合。"""
+        gid = group["group_id"]
+        await self.r.set(K_GROUP.format(gid), json.dumps(group))
+        await self.r.sadd(K_GROUPS, gid)
+
+    async def get_group(self, group_id: str) -> Optional[dict]:
+        raw = await self.r.get(K_GROUP.format(group_id))
+        return json.loads(raw) if raw else None
+
+    async def all_groups(self) -> list[dict]:
+        ids = await self.r.smembers(K_GROUPS)
+        out: list[dict] = []
+        for gid in ids:
+            g = await self.get_group(gid)
+            if g:
+                out.append(g)
+        return out
+
+    async def delete_group(self, group_id: str) -> None:
+        """删除分组时连带清理其轮转顺序。"""
+        await self.r.delete(K_GROUP.format(group_id))
+        await self.r.delete(K_GROUP_ROTATION.format(group_id))
+        await self.r.srem(K_GROUPS, group_id)
+
+    async def get_group_rotation(self, group_id: str) -> list[str]:
+        """读取分组内的轮转顺序（node_id 有序列表）；不存在则返回空列表。"""
+        raw = await self.r.get(K_GROUP_ROTATION.format(group_id))
+        return json.loads(raw) if raw else []
+
+    async def save_group_rotation(self, group_id: str, order: list[str]) -> None:
+        """持久化分组轮转顺序（领取成功后把消费节点移到队尾，重启后仍延续轮转）。"""
+        await self.r.set(K_GROUP_ROTATION.format(group_id), json.dumps(order))
+
+    # ----------------- 策略实例 -----------------
+    async def cache_strategy(self, strategy: dict) -> None:
+        sid = strategy["strategy_id"]
+        await self.r.set(K_STRATEGY.format(sid), json.dumps(strategy))
+        await self.r.sadd(K_STRATEGIES, sid)
+
+    async def get_strategy(self, strategy_id: str) -> Optional[dict]:
+        raw = await self.r.get(K_STRATEGY.format(strategy_id))
+        return json.loads(raw) if raw else None
+
+    async def all_strategies(self) -> list[dict]:
+        ids = await self.r.smembers(K_STRATEGIES)
+        out: list[dict] = []
+        for sid in ids:
+            s = await self.get_strategy(sid)
+            if s:
+                out.append(s)
+        return out
+
+    async def delete_strategy(self, strategy_id: str) -> None:
+        await self.r.delete(K_STRATEGY.format(strategy_id))
+        await self.r.srem(K_STRATEGIES, strategy_id)

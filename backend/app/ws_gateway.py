@@ -13,7 +13,16 @@ import time
 from fastapi import APIRouter, WebSocket
 from starlette.websockets import WebSocketDisconnect
 
-from . import mt5_identity, node_service, persist, results, rules, system_settings
+from . import (
+    group_persist,
+    group_rules,
+    mt5_identity,
+    node_service,
+    persist,
+    results,
+    rules,
+    system_settings,
+)
 from .connections import manager
 from .security import compare_secret
 from .settings import settings
@@ -262,7 +271,12 @@ async def _save_account(node_id: str, ws: WebSocket, data: dict) -> None:
 
 
 async def _on_trade_result(node_id: str, data: dict) -> None:
-    """处理成交回报：唤醒轮询等待者、释放执行锁、落库、推送后台。"""
+    """处理成交回报：唤醒轮询等待者、释放执行锁、落库、推送后台。
+
+    strategy 分组链路的回报只更新 group_task_dispatch；命中后不再走 normal 链路的
+    signal_dispatch，两张明细表互不写入。任务号优先取回报里的 task_id / magic，
+    没有时按 signal_id 回退匹配，兼容尚未上报魔术号的旧版节点客户端。
+    """
     store = state.store
     signal_id = data.get("signal_id", "")
     symbol = data.get("symbol", "")
@@ -270,8 +284,14 @@ async def _on_trade_result(node_id: str, data: dict) -> None:
     results.resolve(signal_id, node_id, data)
     if symbol:
         await store.release_exec_lock(node_id, symbol)
-    status = "done" if data.get("success") else "failed"
-    await persist.update_dispatch_result(signal_id, node_id, status, data)
+
+    task_id = data.get("task_id") or group_rules.task_id_from_magic(data.get("magic"))
+    handled_by_group = await group_persist.update_dispatch_result(
+        node_id=node_id, result=data, task_id=task_id, signal_id=signal_id,
+    )
+    if not handled_by_group:
+        status = "done" if data.get("success") else "failed"
+        await persist.update_dispatch_result(signal_id, node_id, status, data)
     await manager.broadcast_admin(
         {"type": "trade_result", "data": {"node_id": node_id, **data}}
     )

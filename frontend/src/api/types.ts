@@ -131,6 +131,157 @@ export interface ManualSignalPayload {
   symbol: string
   action: 'BUY' | 'SELL'
   volume: number
+  /** 处理模型：normal（按币种分发，默认）/ strategy（按分组分发） */
+  model?: SignalModel
+}
+
+/** Webhook model 字段：normal = 按币种分发（默认），strategy = 按分组分发 */
+export type SignalModel = 'normal' | 'strategy'
+
+/** 分组分发模式：与中控台一致的两种模式，但作用于整个分组而非单个币种 */
+export type GroupDispatchMode = 'sync' | 'poll'
+
+/** 分组成员节点（含在线状态） */
+export interface GroupNodeRef {
+  node_id: string
+  name: string | null
+  mt5_login: number | null
+  enabled: boolean
+  status: 'online' | 'offline'
+  sort_order: number
+}
+
+export interface GroupOut {
+  group_id: string
+  name: string
+  enabled: boolean
+  dispatch_mode: GroupDispatchMode
+  remark: string | null
+  created_at: number
+  nodes: GroupNodeRef[]
+  node_count: number
+  /** 有效节点数（已启用 + 在线） */
+  online_node_count: number
+  /** 该分组已处理的信号主任务数 */
+  signal_count: number
+}
+
+export interface GroupCreatePayload {
+  name: string
+  enabled?: boolean
+  dispatch_mode?: GroupDispatchMode
+  remark?: string | null
+  node_ids?: string[]
+}
+
+export interface GroupUpdatePayload {
+  name?: string
+  enabled?: boolean
+  dispatch_mode?: GroupDispatchMode
+  remark?: string | null
+  /** 传入即整体替换成员列表 */
+  node_ids?: string[]
+}
+
+/** 策略加仓规则：1=逆势加仓，2=顺势加仓 */
+export interface StrategyRule {
+  type: number
+  /** 0=关闭，1=启用 */
+  status: number
+  /** 监控方向 all | buy | sell */
+  action: string
+  point: number
+  lot_times: number
+  extra_lot: number
+  max_allow_num: number
+}
+
+export interface StrategyTemplateOut {
+  template_id: string
+  name: string
+  description: string
+  rules: StrategyRule[]
+}
+
+export interface StrategyOut {
+  strategy_id: string
+  name: string
+  template_id: string
+  template_name: string
+  symbol: string
+  enabled: boolean
+  rules: StrategyRule[]
+  remark: string | null
+  created_at: number
+}
+
+export interface StrategyCreatePayload {
+  template_id: string
+  name: string
+  symbol: string
+  enabled?: boolean
+  remark?: string | null
+  /** 自定义规则；不传则使用模版默认值 */
+  rules?: StrategyRule[]
+}
+
+export interface StrategyUpdatePayload {
+  name?: string
+  symbol?: string
+  enabled?: boolean
+  remark?: string | null
+  rules?: StrategyRule[]
+}
+
+/** 主任务在单个节点上的下发与完成情况 */
+export interface GroupTaskDispatchRecord {
+  id: number
+  node_id: string
+  node_name: string | null
+  decided_vol: number | null
+  status: string
+  skip_reason: string | null
+  retcode: number | null
+  order: number | null
+  deal: number | null
+  price: number | null
+  error: string | null
+  magic: number | null
+  dispatched_at: number | null
+  finished_at: number | null
+}
+
+/** 分组信号主任务（信号信息 + 下发数据 + 各节点处理情况） */
+export interface GroupSignalTaskRecord {
+  task_id: number
+  magic: number | null
+  signal_id: string
+  group_id: string
+  group_name: string | null
+  created_at: number | null
+  action: string | null
+  symbol: string | null
+  volume: number | null
+  sl: number | null
+  tp: number | null
+  comment: string | null
+  source_ip: string | null
+  raw_payload: string | null
+  dispatch_mode: GroupDispatchMode
+  payload: Record<string, unknown> | null
+  node_ids: string[]
+  node_count: number
+  status: string
+  skip_reason: string | null
+  finished_at: number | null
+  dispatches: GroupTaskDispatchRecord[]
+}
+
+export interface PaginatedGroupSignals {
+  items: GroupSignalTaskRecord[]
+  total: number
+  page: number
+  page_size: number
 }
 
 // 手动触发接口返回（与 /webhook 响应同构，字段视 status 而定）
@@ -222,6 +373,8 @@ export interface SignalEventRecord {
   status: string
   /** 信号来源：tradingview（外部 Webhook）/ manual（中控台手动触发）；空按 TradingView 展示 */
   source: string | null
+  /** 处理模型：normal（按币种分发）/ strategy（按分组分发）；空按 normal 展示 */
+  model: string | null
   dispatches: SignalEventDispatch[]
 }
 

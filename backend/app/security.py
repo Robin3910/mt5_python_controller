@@ -15,6 +15,16 @@ def make_node_id() -> str:
     return "nd_" + secrets.token_hex(8)
 
 
+def make_group_id() -> str:
+    """生成分组 ID（带可读前缀，便于日志辨识）。"""
+    return "grp_" + secrets.token_hex(8)
+
+
+def make_strategy_id() -> str:
+    """生成策略 ID（带可读前缀，便于日志辨识）。"""
+    return "sty_" + secrets.token_hex(8)
+
+
 def gen_token() -> str:
     """生成节点接入令牌（明文，仅创建/重置时返回一次）。"""
     return secrets.token_urlsafe(32)

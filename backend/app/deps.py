@@ -4,6 +4,7 @@ from typing import Optional
 from fastapi import Header, HTTPException, Request
 
 from .dispatcher import Dispatcher
+from .group_dispatcher import GroupDispatcher
 from .redis_store import RedisStore
 from .security import verify_jwt
 from .state import state
@@ -17,10 +18,17 @@ def get_store() -> RedisStore:
 
 
 def get_dispatcher() -> Dispatcher:
-    """注入分发引擎。"""
+    """注入分发引擎（model=normal，按币种分发）。"""
     if state.dispatcher is None:
         raise HTTPException(status_code=503, detail="service not ready")
     return state.dispatcher
+
+
+def get_group_dispatcher() -> GroupDispatcher:
+    """注入分组分发引擎（model=strategy，按分组分发）。"""
+    if state.group_dispatcher is None:
+        raise HTTPException(status_code=503, detail="service not ready")
+    return state.group_dispatcher
 
 
 async def get_current_admin(authorization: Optional[str] = Header(default=None)) -> str:

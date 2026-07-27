@@ -2,13 +2,15 @@
 from typing import Optional
 
 from .dispatcher import Dispatcher
+from .group_dispatcher import GroupDispatcher
 from .poll_queue import PollWorker
 from .redis_store import RedisStore
 
 
 class AppState:
     store: Optional[RedisStore] = None        # Redis 访问层
-    dispatcher: Optional[Dispatcher] = None   # 分发引擎
+    dispatcher: Optional[Dispatcher] = None   # 分发引擎（model=normal，按币种）
+    group_dispatcher: Optional[GroupDispatcher] = None  # 分发引擎（model=strategy，按分组）
     poll_worker: Optional[PollWorker] = None  # 轮询后台 worker
 
 

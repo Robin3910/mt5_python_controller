@@ -78,6 +78,12 @@ function sourceTag(source: string | null): { cls: string; text: string } {
   return { cls: '', text: 'TradingView' }
 }
 
+// 处理模型：strategy = 按分组分发；其余（含历史空值）按 normal（按币种分发）展示
+function modelTag(model: string | null): { cls: string; text: string } {
+  if (model === 'strategy') return { cls: 'blue', text: '分组' }
+  return { cls: '', text: '币种' }
+}
+
 function dispatchTag(status: string): { cls: string; text: string } {
   const m: Record<string, { cls: string; text: string }> = {
     done: { cls: 'green', text: '成功' },
@@ -92,7 +98,12 @@ function dispatchTag(status: string): { cls: string; text: string } {
 
 function dispatchSummary(row: SignalEventRecord): string {
   const n = row.dispatches.length
-  if (!n) return row.status === 'rejected' ? '全局拒收' : '无节点处理'
+  if (!n) {
+    if (row.status === 'rejected') return '全局拒收'
+    // strategy 信号的节点明细挂在分组主任务上，见「分组管理 → 信号」
+    if (row.model === 'strategy') return '按分组分发，详见分组管理'
+    return '无节点处理'
+  }
   const done = row.dispatches.filter((d) => d.status === 'done').length
   const skipped = row.dispatches.filter((d) => d.status === 'skipped').length
   const failed = row.dispatches.filter((d) => d.status === 'failed').length
@@ -101,6 +112,13 @@ function dispatchSummary(row: SignalEventRecord): string {
   if (skipped) parts.push(`${skipped} 跳过`)
   if (failed) parts.push(`${failed} 失败`)
   return parts.join(' · ')
+}
+
+function emptyDispatchHint(row: SignalEventRecord): string {
+  if (row.model === 'strategy') {
+    return '该信号按分组分发，节点处理明细请在「分组管理 → 信号」中查看。'
+  }
+  return '该信号未产生节点分发明细。'
 }
 
 onMounted(loadEvents)
@@ -176,6 +194,12 @@ watch(
           </span>
         </div>
         <div class="list-field">
+          <span class="k">处理模型</span>
+          <span class="v">
+            <span class="tag" :class="modelTag(row.model).cls">{{ modelTag(row.model).text }}</span>
+          </span>
+        </div>
+        <div class="list-field">
           <span class="k">整体状态</span>
           <span class="v">
             <span class="tag" :class="signalTag(row.status).cls">{{ signalTag(row.status).text }}</span>
@@ -198,7 +222,7 @@ watch(
               <div class="list-field"><span class="k">跳过原因</span><span class="v muted" style="font-size: 12px">{{ d.skip_reason || '—' }}</span></div>
             </div>
           </div>
-          <div v-else class="muted" style="font-size: 13px">该信号未产生节点分发明细。</div>
+          <div v-else class="muted" style="font-size: 13px">{{ emptyDispatchHint(row) }}</div>
         </div>
       </div>
     </div>
@@ -211,6 +235,7 @@ watch(
           <th class="col-time">时间</th>
           <th class="col-action">动作</th>
           <th class="col-source">来源</th>
+          <th class="col-model">处理模型</th>
           <th class="col-symbol">品种</th>
           <th class="col-volume right">手数</th>
           <th class="col-parse">解析</th>
@@ -235,6 +260,9 @@ watch(
             <td class="col-source">
               <span class="tag" :class="sourceTag(row.source).cls">{{ sourceTag(row.source).text }}</span>
             </td>
+            <td class="col-model">
+              <span class="tag" :class="modelTag(row.model).cls">{{ modelTag(row.model).text }}</span>
+            </td>
             <td class="col-symbol">{{ row.symbol || '—' }}</td>
             <td class="col-volume right">{{ row.volume ?? '—' }}</td>
             <td class="col-parse">
@@ -247,11 +275,12 @@ watch(
             <td class="muted col-ip">{{ row.source_ip || '—' }}</td>
           </tr>
           <tr v-if="isExpanded(row.signal_id)" class="detail-row">
-            <td colspan="10">
+            <td colspan="11">
               <div class="events-detail">
                 <div class="grid cols-2 events-detail-kv" style="gap: 12px; margin-bottom: 12px">
                   <div class="kv"><span class="k">信号 ID</span><span class="v events-break">{{ row.signal_id }}</span></div>
                   <div class="kv"><span class="k">分发模式</span><span class="v">{{ row.dispatch_mode || '—' }}</span></div>
+                  <div class="kv"><span class="k">处理模型</span><span class="v">{{ row.model || 'normal' }}</span></div>
                   <div class="kv"><span class="k">SL</span><span class="v">{{ row.sl ?? '—' }}</span></div>
                   <div class="kv"><span class="k">TP</span><span class="v">{{ row.tp ?? '—' }}</span></div>
                   <div class="kv"><span class="k">备注</span><span class="v events-break">{{ row.comment || '—' }}</span></div>
@@ -282,7 +311,7 @@ watch(
                   </tbody>
                 </table>
                 </div>
-                <div v-else class="muted" style="font-size: 13px">该信号未产生节点分发明细。</div>
+                <div v-else class="muted" style="font-size: 13px">{{ emptyDispatchHint(row) }}</div>
               </div>
             </td>
           </tr>
@@ -346,6 +375,7 @@ watch(
 .events-table .col-time { width: 11%; white-space: nowrap; }
 .events-table .col-action { width: 7%; white-space: nowrap; }
 .events-table .col-source { width: 10%; white-space: nowrap; }
+.events-table .col-model { width: 8%; white-space: nowrap; }
 .events-table .col-symbol { width: 9%; }
 .events-table .col-volume { width: 6%; white-space: nowrap; }
 .events-table .col-parse { width: 7%; white-space: nowrap; }

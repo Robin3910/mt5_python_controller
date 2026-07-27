@@ -11,6 +11,9 @@ class Config:
     DEFAULT_LOT = float(os.getenv("DEFAULT_LOT", "0.1"))            # 默认手数
     DEFAULT_SLIPPAGE = int(os.getenv("DEFAULT_SLIPPAGE", "10"))      # 默认滑点（点）
     DEFAULT_MAGIC_NUMBER = int(os.getenv("DEFAULT_MAGIC_NUMBER", "20240615"))  # 订单魔术号
+    # strategy 分组链路的魔术号基数：实际魔术号 = 基数 + 主任务号，保证与 normal 链路
+    # 的固定魔术号不冲突，且能从 MT5 订单反查到具体的分组主任务。
+    GROUP_TASK_MAGIC_BASE = int(os.getenv("GROUP_TASK_MAGIC_BASE", "900000000"))
 
     # —— 风控 ——
     MAX_LOT_SIZE = float(os.getenv("MAX_LOT_SIZE", "1.0"))          # 单笔最大手数

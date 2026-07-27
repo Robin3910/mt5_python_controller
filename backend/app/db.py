@@ -1,7 +1,7 @@
 """异步数据库引擎 / 会话（SQLAlchemy 2.0）。"""
 import logging
 
-from sqlalchemy import inspect, text
+from sqlalchemy import event, inspect, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from .orm import Base
@@ -9,8 +9,26 @@ from .settings import settings
 
 logger = logging.getLogger(__name__)
 
+_IS_SQLITE = settings.mysql_dsn.startswith("sqlite")
+
 # pool_pre_ping：取连接前先 ping，避免使用到已被服务端关闭的死连接
-engine = create_async_engine(settings.mysql_dsn, pool_pre_ping=True, future=True)
+# SQLite（本地开发 / 测试）：整库只有一把写锁，timeout 让并发写等待而不是立刻报
+# "database is locked"；MySQL 不需要该参数。
+engine = create_async_engine(
+    settings.mysql_dsn,
+    pool_pre_ping=True,
+    future=True,
+    **({"connect_args": {"timeout": 30}} if _IS_SQLITE else {}),
+)
+
+if _IS_SQLITE:
+    @event.listens_for(engine.sync_engine, "connect")
+    def _sqlite_pragmas(dbapi_conn, _record) -> None:
+        """WAL 模式允许「一写多读」并发，避免多节点回报同时落库时互相阻塞。"""
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL")
+        cur.execute("PRAGMA busy_timeout=30000")
+        cur.close()
 # expire_on_commit=False：提交后对象仍可读，省去额外刷新
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
@@ -45,13 +63,15 @@ def _migrate_dispatch_price_column(sync_conn) -> None:
 
 
 def _migrate_signal_source_column(sync_conn) -> None:
-    """为已存在的 signal_history 表补充信号来源列（create_all 不会改已存在的表）。"""
+    """为已存在的 signal_history 表补充信号来源与处理模型列（create_all 不会改已存在的表）。"""
     inspector = inspect(sync_conn)
     if "signal_history" not in inspector.get_table_names():
         return
     cols = {c["name"] for c in inspector.get_columns("signal_history")}
     if "source" not in cols:
         sync_conn.execute(text("ALTER TABLE signal_history ADD COLUMN source VARCHAR(16)"))
+    if "model" not in cols:
+        sync_conn.execute(text("ALTER TABLE signal_history ADD COLUMN model VARCHAR(16)"))
 
 
 def _migrate_audit_columns(sync_conn) -> None:

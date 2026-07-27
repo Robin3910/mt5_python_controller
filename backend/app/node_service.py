@@ -10,6 +10,7 @@ from typing import Optional
 
 from sqlalchemy import select
 
+from . import group_service
 from .db import SessionLocal
 from .models import NodeCreate, NodeUpdate
 from .orm import Node
@@ -171,7 +172,7 @@ async def update_node(store: RedisStore, node_id: str, patch: NodeUpdate) -> Opt
 
 
 async def delete_node(store: RedisStore, node_id: str) -> bool:
-    """删除节点：先删库，再清理 Redis 缓存/快照/在线标记。"""
+    """删除节点：先删库，再清理 Redis 缓存/快照/在线标记与分组成员关联。"""
     async with SessionLocal() as s:
         row = await s.get(Node, node_id)
         if not row:
@@ -179,4 +180,5 @@ async def delete_node(store: RedisStore, node_id: str) -> bool:
         await s.delete(row)
         await s.commit()
     await store.delete_node(node_id)
+    await group_service.remove_node_from_all_groups(store, node_id)
     return True

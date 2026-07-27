@@ -6,8 +6,15 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from . import persist
-from .deps import client_ip, get_current_admin, get_dispatcher, get_store
+from .deps import (
+    client_ip,
+    get_current_admin,
+    get_dispatcher,
+    get_group_dispatcher,
+    get_store,
+)
 from .dispatcher import Dispatcher
+from .group_dispatcher import GroupDispatcher
 from .models import ManualSignalRequest
 from .redis_store import RedisStore
 from .webhook import process_signal
@@ -21,6 +28,7 @@ async def manual_signal(
     request: Request,
     store: RedisStore = Depends(get_store),
     dispatcher: Dispatcher = Depends(get_dispatcher),
+    group_dispatcher: GroupDispatcher = Depends(get_group_dispatcher),
     admin: str = Depends(get_current_admin),
 ):
     """手动触发一条开仓信号（BUY / SELL），走与 Webhook 完全一致的分发流程。"""
@@ -28,9 +36,12 @@ async def manual_signal(
     if action not in ("BUY", "SELL"):
         raise HTTPException(status_code=400, detail="action must be BUY or SELL")
     data = {"action": action, "symbol": body.symbol, "volume": body.volume}
+    if body.model:
+        data["model"] = body.model
     ip = client_ip(request)
     result = await process_signal(
         data, source_ip=ip, source="manual", store=store, dispatcher=dispatcher,
+        group_dispatcher=group_dispatcher,
     )
     await persist.audit(
         admin, "manual_signal", body.symbol, data, result.get("status", "ok"), ip,
@@ -39,6 +50,7 @@ async def manual_signal(
             "result": {
                 "status": result.get("status"),
                 "signal_id": result.get("signal_id"),
+                "model": result.get("model"),
                 "mode": result.get("mode"),
                 "targets": result.get("targets"),
                 "reason": result.get("reason"),

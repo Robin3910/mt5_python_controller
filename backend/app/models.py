@@ -119,6 +119,7 @@ class SignalEventRecord(BaseModel):
     dispatch_mode: Optional[str] = None
     status: str = "pending"
     source: Optional[str] = None  # tradingview（外部 Webhook）/ manual（中控台手动触发）
+    model: Optional[str] = None   # normal（按币种分发）/ strategy（按分组分发）
     dispatches: list[SignalEventDispatch] = Field(default_factory=list)
 
 
@@ -128,6 +129,163 @@ class PaginatedSignalEvents(BaseModel):
     total: int
     page: int
     page_size: int
+
+
+# ----------------------------- 分组 -----------------------------
+# Webhook 新增字段 model 的取值：normal（默认，按币种分发）/ strategy（按分组分发）
+SIGNAL_MODEL_NORMAL = "normal"
+SIGNAL_MODEL_STRATEGY = "strategy"
+SIGNAL_MODELS = (SIGNAL_MODEL_NORMAL, SIGNAL_MODEL_STRATEGY)
+
+# 分组分发模式（与中控台一致的两种模式，但作用于整个分组而非单个币种）
+GROUP_DISPATCH_MODES = ("sync", "poll")
+
+
+class GroupNodeRef(BaseModel):
+    """分组内的成员节点（合并了在线状态，供分组列表展示）。"""
+    node_id: str
+    name: Optional[str] = None
+    mt5_login: Optional[int] = None
+    enabled: bool = True
+    status: str = "offline"  # online / offline
+    sort_order: int = 0
+
+
+class GroupCreate(BaseModel):
+    """创建分组的入参。"""
+    name: str = Field(min_length=1, max_length=64)
+    enabled: bool = True
+    dispatch_mode: str = "sync"  # sync / poll
+    remark: Optional[str] = None
+    node_ids: list[str] = Field(default_factory=list)
+
+
+class GroupUpdate(BaseModel):
+    """更新分组的入参（全部可选，仅更新提供的字段）。"""
+    name: Optional[str] = None
+    enabled: Optional[bool] = None
+    dispatch_mode: Optional[str] = None
+    remark: Optional[str] = None
+    node_ids: Optional[list[str]] = None  # 传入即整体替换成员列表
+
+
+class GroupOut(BaseModel):
+    """分组对外展示对象（含成员节点与信号计数）。"""
+    group_id: str
+    name: str
+    enabled: bool = True
+    dispatch_mode: str = "sync"
+    remark: Optional[str] = None
+    created_at: float = 0
+    nodes: list[GroupNodeRef] = Field(default_factory=list)
+    node_count: int = 0
+    online_node_count: int = 0   # 有效节点数（已启用 + 在线）
+    signal_count: int = 0        # 该分组已处理的信号主任务数
+
+
+class GroupTaskDispatchRecord(BaseModel):
+    """主任务在单个节点上的下发与完成情况。"""
+    id: int
+    node_id: str
+    node_name: Optional[str] = None
+    decided_vol: Optional[float] = None
+    status: str = "pending"
+    skip_reason: Optional[str] = None
+    retcode: Optional[int] = None
+    order: Optional[int] = None
+    deal: Optional[int] = None
+    price: Optional[float] = None
+    error: Optional[str] = None
+    magic: Optional[int] = None
+    dispatched_at: Optional[float] = None
+    finished_at: Optional[float] = None
+
+
+class GroupSignalTaskRecord(BaseModel):
+    """分组信号主任务（信号信息 + 下发数据 + 各节点处理情况）。"""
+    task_id: int
+    magic: Optional[int] = None
+    signal_id: str
+    group_id: str
+    group_name: Optional[str] = None
+    created_at: Optional[float] = None
+    action: Optional[str] = None
+    symbol: Optional[str] = None
+    volume: Optional[float] = None
+    sl: Optional[float] = None
+    tp: Optional[float] = None
+    comment: Optional[str] = None
+    source_ip: Optional[str] = None
+    raw_payload: Optional[str] = None
+    dispatch_mode: str = "sync"
+    payload: Optional[dict] = None
+    node_ids: list[str] = Field(default_factory=list)
+    node_count: int = 0
+    status: str = "pending"
+    skip_reason: Optional[str] = None
+    finished_at: Optional[float] = None
+    dispatches: list[GroupTaskDispatchRecord] = Field(default_factory=list)
+
+
+class PaginatedGroupSignals(BaseModel):
+    """分组信号主任务分页结果。"""
+    items: list[GroupSignalTaskRecord]
+    total: int
+    page: int
+    page_size: int
+
+
+# ----------------------------- 策略管理 ----------------------------
+class StrategyRule(BaseModel):
+    """单条加仓规则（逆势 / 顺势）。"""
+    type: int = Field(description="1=逆势加仓，2=顺势加仓")
+    status: int = Field(description="0=关闭，1=启用")
+    action: str = Field(default="all", description="监控方向 all|buy|sell")
+    point: float = Field(default=100, ge=0)
+    lot_times: float = Field(default=1.0, ge=0)
+    extra_lot: float = Field(default=0.0, ge=0)
+    max_allow_num: int = Field(default=5, ge=0)
+
+
+class StrategyTemplateOut(BaseModel):
+    """策略模版（只读）。"""
+    template_id: str
+    name: str
+    description: str = ""
+    rules: list[StrategyRule] = Field(default_factory=list)
+
+
+class StrategyCreate(BaseModel):
+    """新建策略：选择模版 + 名称 + 绑定品种；可选覆盖模版默认规则。"""
+    template_id: str = Field(min_length=1, max_length=32)
+    name: str = Field(min_length=1, max_length=64)
+    symbol: str = Field(min_length=1, max_length=32)
+    enabled: bool = True
+    remark: Optional[str] = None
+    # 传入则用自定义规则覆盖模版默认值；不传则复制模版默认规则
+    rules: Optional[list[StrategyRule]] = None
+
+
+class StrategyUpdate(BaseModel):
+    """更新策略（全部可选）。"""
+    name: Optional[str] = None
+    symbol: Optional[str] = None
+    enabled: Optional[bool] = None
+    remark: Optional[str] = None
+    rules: Optional[list[StrategyRule]] = None
+
+
+class StrategyOut(BaseModel):
+    """策略对外展示对象。"""
+    strategy_id: str
+    name: str
+    template_id: str
+    template_name: str
+    symbol: str
+    enabled: bool = True
+    rules: list[StrategyRule] = Field(default_factory=list)
+    remark: Optional[str] = None
+    created_at: float = 0
 
 
 class AuditRecord(BaseModel):
@@ -243,6 +401,7 @@ class ManualSignalRequest(BaseModel):
     symbol: str = Field(min_length=1)
     action: str  # BUY / SELL
     volume: float = Field(gt=0)
+    model: Optional[str] = None  # normal（默认）/ strategy
 
 
 # ----------------------------- 鉴权 ----------------------------

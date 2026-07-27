@@ -5,6 +5,9 @@ import type {
   CloseRequest,
   CloseBatchResult,
   FilterRulesConfig,
+  GroupCreatePayload,
+  GroupOut,
+  GroupUpdatePayload,
   HubEvent,
   ManualSignalPayload,
   ManualSignalResult,
@@ -14,13 +17,20 @@ import type {
   NodeTokenInfo,
   NodeUpdatePayload,
   PaginatedAudits,
+  PaginatedGroupSignals,
   PaginatedNodeDispatches,
   PaginatedSignalEvents,
+  StrategyCreatePayload,
+  StrategyOut,
+  StrategyTemplateOut,
+  StrategyUpdatePayload,
 } from '@/api/types'
 
 // 业务总线 store：集中保存节点、账户、配置与实时事件
 interface HubState {
   nodes: NodeOut[]                          // 节点列表（来自 REST，字段最全）
+  groups: GroupOut[]                        // 分组列表（strategy 信号的分发单元）
+  strategies: StrategyOut[]                 // 策略实例列表（基于模版创建）
   accounts: Record<string, AccountSnapshot> // node_id -> 最新账户快照（实时 WS 更新）
   statuses: Record<string, string>          // node_id -> 在线状态（实时 WS 更新）
   filters: FilterRulesConfig          // 区间过滤
@@ -31,6 +41,8 @@ interface HubState {
 export const useHubStore = defineStore('hub', {
   state: (): HubState => ({
     nodes: [],
+    groups: [],
+    strategies: [],
     accounts: {},
     statuses: {},
     filters: {},
@@ -126,6 +138,74 @@ export const useHubStore = defineStore('hub', {
       await api.delete(`/api/nodes/${id}`)
       await this.fetchNodes(options)
     },
+    // ---- 分组增删改查（strategy 信号链路）----
+    async fetchGroups(options?: { q?: string }): Promise<void> {
+      const q = options?.q?.trim()
+      const params = q ? { q } : undefined
+      this.groups = (await api.get('/api/groups', { params })).data
+    },
+    async createGroup(payload: GroupCreatePayload, options?: { q?: string }): Promise<GroupOut> {
+      const created = (await api.post('/api/groups', payload)).data
+      await this.fetchGroups(options)
+      return created
+    },
+    async updateGroup(
+      id: string,
+      patch: GroupUpdatePayload,
+      options?: { q?: string },
+    ): Promise<void> {
+      await api.patch(`/api/groups/${id}`, patch)
+      await this.fetchGroups(options)
+    },
+    async deleteGroup(id: string, options?: { q?: string }): Promise<void> {
+      await api.delete(`/api/groups/${id}`)
+      await this.fetchGroups(options)
+    },
+    // ---- 策略增删改查（基于模版的加仓规则实例）----
+    async fetchStrategyTemplates(): Promise<StrategyTemplateOut[]> {
+      return (await api.get('/api/strategies/templates')).data
+    },
+    async fetchStrategies(options?: { q?: string }): Promise<void> {
+      const q = options?.q?.trim()
+      const params = q ? { q } : undefined
+      this.strategies = (await api.get('/api/strategies', { params })).data
+    },
+    async createStrategy(
+      payload: StrategyCreatePayload,
+      options?: { q?: string },
+    ): Promise<StrategyOut> {
+      const created = (await api.post('/api/strategies', payload)).data
+      await this.fetchStrategies(options)
+      return created
+    },
+    async updateStrategy(
+      id: string,
+      patch: StrategyUpdatePayload,
+      options?: { q?: string },
+    ): Promise<void> {
+      await api.patch(`/api/strategies/${id}`, patch)
+      await this.fetchStrategies(options)
+    },
+    async deleteStrategy(id: string, options?: { q?: string }): Promise<void> {
+      await api.delete(`/api/strategies/${id}`)
+      await this.fetchStrategies(options)
+    },
+    // 分组已处理的信号明细（主任务 + 各节点处理过程）
+    async fetchGroupSignals(
+      id: string,
+      page = 1,
+      pageSize = 20,
+    ): Promise<PaginatedGroupSignals> {
+      try {
+        return (
+          await api.get(`/api/groups/${id}/signals`, {
+            params: { page, page_size: pageSize },
+          })
+        ).data
+      } catch {
+        return { items: [], total: 0, page, page_size: pageSize }
+      }
+    },
     // ---- 配置保存 ----
     async saveFilters(cfg: FilterRulesConfig): Promise<void> {
       this.filters = (await api.put('/api/config/filters', cfg)).data
@@ -218,6 +298,13 @@ export const useHubStore = defineStore('hub', {
           tp: d.tp as number | undefined,
           reason: d.reason as string | undefined,
         })
+      } else if (t === 'group_dispatch') {
+        // strategy 分组分发：一条主任务向某个节点的下发结果
+        const reason = d.reason ? `(${d.reason})` : ''
+        this.pushEvent(
+          `分组 ${d.group_name || d.group_id} 任务 #${d.task_id} ${d.symbol || ''} ${d.action || ''} → ${d.node_id} ${d.status}${reason}`,
+          d.status === 'offline' ? 'warn' : 'info',
+        )
       } else if (t === 'trade_result') {
         // 成交回报
         const ok = !!d.success

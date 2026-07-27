@@ -18,8 +18,12 @@ from . import (
     config_api,
     console_api,
     events,
+    group_service,
+    groups,
     node_service,
     nodes,
+    strategies,
+    strategy_service,
     system_settings,
     user_service,
     webhook,
@@ -29,6 +33,7 @@ from . import (
 from .connections import manager
 from .db import init_db
 from .dispatcher import Dispatcher
+from .group_dispatcher import GroupDispatcher
 from .poll_queue import PollWorker
 from .redis_store import RedisStore
 from .settings import settings
@@ -54,6 +59,10 @@ async def lifespan(app: FastAPI):
         logger.warning("redis ping failed (%s) — running degraded", e)
     count = await node_service.warm_cache(store)
     logger.info("warmed %d node(s) into cache", count)
+    group_count = await group_service.warm_cache(store)
+    logger.info("warmed %d group(s) into cache", group_count)
+    strategy_count = await strategy_service.warm_cache(store)
+    logger.info("warmed %d strateg(y/ies) into cache", strategy_count)
     await user_service.seed_default_admin(store)
     # 保证全局节点接入令牌存在；首次启动自动生成（管理员可在「账户设置」页面查看/重置）
     token = await system_settings.ensure_node_token(store)
@@ -61,6 +70,7 @@ async def lifespan(app: FastAPI):
 
     state.store = store
     state.dispatcher = Dispatcher(store)
+    state.group_dispatcher = GroupDispatcher(store)
     state.poll_worker = PollWorker(store, state.dispatcher)
     state.poll_worker.start()
     logger.info("MT5 hub ready")
@@ -90,6 +100,8 @@ for r in (
     webhook.router,
     ws_gateway.router,
     nodes.router,
+    groups.router,
+    strategies.router,
     config_api.router,
     console_api.router,
     events.router,
