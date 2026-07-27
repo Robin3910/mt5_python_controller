@@ -240,9 +240,9 @@ SYMBOL=GBPUSD long LOT=0.1
 {"status": "duplicate", "action": "BUY", "symbol": "EURUSD"}
 ```
 
-### 9.3 品种未登记 `200`（拒收，不分发）
+### 9.3 品种未登记 / 已禁用 `200`（拒收，不分发）
 
-解析成功，但 `symbol` **未在中控台**（`GET/PUT /api/config/filters`）登记时返回：
+解析成功，但 `symbol` **未在中控台**（`GET/PUT /api/config/filters`）登记，或已登记但 **`enabled=false`**（取消「启用」）时返回；开仓与平仓（CLOSE）均拒收（后台手动平仓不受影响）：
 
 ```json
 {
@@ -257,8 +257,10 @@ SYMBOL=GBPUSD long LOT=0.1
 }
 ```
 
+禁用时 `reason` 形如：`品种已禁用：EURUSD在中控台未启用，信号拒收`。
+
 - HTTP 仍为 `200`（与 `duplicate` 相同）；TradingView 若只校验 2xx 会显示投递成功，需在管理端核对。
-- 处理：Web「中控台」→ 添加该品种 → 保存过滤规则。
+- 处理：Web「中控台」→ 添加该品种并勾选「启用」→ 保存过滤规则。
 
 ### 9.4 持久化与查询（v0.4）
 
@@ -312,6 +314,7 @@ SYMBOL=GBPUSD long LOT=0.1
 | `{"action":"buy","symbol":"EURUSD","allow_position":"true"}` | ⚠️ `allow_position=false` | `"true"` 是字符串，`int("true")` 抛错；只有能转非零整数的值才生效（见 §4.3） |
 | `{"action":"buy","symbol":"EURUSD","allow_position":2}` | ⚠️ `allow_position=true` | 任意非零整数都为 `true`，不止 `1`（见 §4.3） |
 | `{"action":"buy","symbol":"NZDUSD"}`（中控台未登记 NZDUSD） | ⚠️ `status: rejected` | 解析成功但品种未在中控台登记，不分发（见 §9.3） |
+| `{"action":"close","symbol":"EURUSD"}`（中控台已取消启用 EURUSD） | ⚠️ `status: rejected` | 品种已禁用，开仓/平仓均不分发（见 §9.3；手动平仓除外） |
 
 ---
 

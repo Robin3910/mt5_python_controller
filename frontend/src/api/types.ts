@@ -49,11 +49,6 @@ export interface AccountSnapshot {
   updated_at: number
 }
 
-export interface LotConfig {
-  enabled: boolean
-  value: number
-}
-
 /** 区间方向过滤：单条价格区间允许的开仓方向 */
 export type FilterDirection = 'BUY' | 'SELL'
 
@@ -68,6 +63,7 @@ export interface FilterInterval {
 
 /** 单个品种的区间过滤与分发规则（键为品种代码，如 XAUUSD，全局 filters） */
 export interface SymbolFilterRule {
+  /** false：拒收该品种全部信号（含 Webhook 平仓；后台手动平仓除外） */
   enabled: boolean
   /** 是否允许接收做多 (BUY) 信号，默认 true */
   allow_buy: boolean
@@ -78,6 +74,10 @@ export interface SymbolFilterRule {
   /** 持仓判定范围，默认 symbol */
   position_scope: 'symbol' | 'account'
   default_action: DefaultFilterAction
+  /** 是否启用该品种的全局手数（节点手数策略为「跟随中控台」时生效） */
+  lot_enabled: boolean
+  /** 该品种全局手数 */
+  lot: number
   intervals: FilterInterval[]
 }
 
@@ -124,6 +124,25 @@ export interface CloseBatchResult {
   sent: string[]
   failed: Array<{ node_id: string; reason: string }>
   target: string
+}
+
+// 中控台手动触发的开仓信号（复用 Webhook 分发流程）
+export interface ManualSignalPayload {
+  symbol: string
+  action: 'BUY' | 'SELL'
+  volume: number
+}
+
+// 手动触发接口返回（与 /webhook 响应同构，字段视 status 而定）
+export interface ManualSignalResult {
+  status: string // accepted / duplicate / rejected
+  signal_id?: string
+  action?: string
+  symbol?: string
+  volume?: number
+  mode?: string
+  targets?: number
+  reason?: string
 }
 
 export interface HubEvent {
@@ -201,11 +220,34 @@ export interface SignalEventRecord {
   parsed_ok: boolean
   dispatch_mode: string | null
   status: string
+  /** 信号来源：tradingview（外部 Webhook）/ manual（中控台手动触发）；空按 TradingView 展示 */
+  source: string | null
   dispatches: SignalEventDispatch[]
 }
 
 export interface PaginatedSignalEvents {
   items: SignalEventRecord[]
+  total: number
+  page: number
+  page_size: number
+}
+
+export interface AuditRecord {
+  id: number
+  ts: number | null
+  operator: string
+  action: string
+  target: string | null
+  params: Record<string, unknown> | null
+  result: string
+  ip: string | null
+  category: string | null
+  before: unknown
+  after: unknown
+}
+
+export interface PaginatedAudits {
+  items: AuditRecord[]
   total: number
   page: number
   page_size: number

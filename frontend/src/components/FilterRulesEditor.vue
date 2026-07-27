@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { ElSwitch } from 'element-plus'
+import { ElMessageBox, ElSwitch } from 'element-plus'
 import 'element-plus/es/components/switch/style/css'
+import 'element-plus/es/components/message-box/style/css'
 import 'element-plus/theme-chalk/dark/css-vars.css'
 import type {
   FilterDirection,
@@ -15,30 +16,65 @@ import {
   createEmptyNodeSymbolRule,
   createEmptySymbolRule,
   exampleFilterRules,
+  nodesFollowingGlobalLot,
+  parseFilterRules,
 } from '@/utils/filterRules'
 import { confirmAction } from '@/utils/confirm'
+import { useHubStore } from '@/stores/hub'
 
 const props = withDefaults(defineProps<{ mode?: 'global' | 'node' }>(), { mode: 'global' })
 
+const emit = defineEmits<{
+  trigger: [payload: { symbol: string; action: 'BUY' | 'SELL'; volume: number }]
+}>()
+
 const model = defineModel<FilterRulesConfig | NodeDispatchFiltersConfig>({ required: true })
+const hub = useHubStore()
 
 const isGlobal = computed(() => props.mode === 'global')
 const addingSymbol = ref(false)
 const newSymbol = ref('')
+const filterKeyword = ref('')
 
-const globalSymbolList = computed(() => {
+const globalSymbolListAll = computed(() => {
   const cfg = model.value as FilterRulesConfig
   return Object.entries(cfg)
     .map(([symbol, rule]) => ({ symbol, rule }))
     .sort((a, b) => a.symbol.localeCompare(b.symbol))
 })
 
-const nodeSymbolList = computed(() => {
+const nodeSymbolListAll = computed(() => {
   const cfg = model.value as NodeDispatchFiltersConfig
   return Object.entries(cfg)
     .map(([symbol, rule]) => ({ symbol, rule }))
     .sort((a, b) => a.symbol.localeCompare(b.symbol))
 })
+
+const totalSymbolCount = computed(() =>
+  isGlobal.value ? globalSymbolListAll.value.length : nodeSymbolListAll.value.length,
+)
+
+const globalSymbolList = computed(() => {
+  const kw = filterKeyword.value.trim().toUpperCase()
+  if (!kw) return globalSymbolListAll.value
+  return globalSymbolListAll.value.filter((it) => it.symbol.toUpperCase().includes(kw))
+})
+
+const nodeSymbolList = computed(() => {
+  const kw = filterKeyword.value.trim().toUpperCase()
+  if (!kw) return nodeSymbolListAll.value
+  return nodeSymbolListAll.value.filter((it) => it.symbol.toUpperCase().includes(kw))
+})
+
+const visibleSymbolCount = computed(() =>
+  isGlobal.value ? globalSymbolList.value.length : nodeSymbolList.value.length,
+)
+
+const hasKeyword = computed(() => filterKeyword.value.trim().length > 0)
+
+function clearFilterKeyword(): void {
+  filterKeyword.value = ''
+}
 
 function updateRule(symbol: string, patch: Partial<SymbolFilterRule>): void {
   const cfg = model.value as FilterRulesConfig
@@ -134,12 +170,94 @@ function setAllowSell(symbol: string, value: string | number | boolean): void {
   updateRule(symbol, { allow_sell: Boolean(value) })
 }
 
+/** 关闭「启用全局手数」前检查是否有节点仍跟随中控台。 */
+async function setLotEnabled(symbol: string, enabled: boolean): Promise<void> {
+  if (!enabled) {
+    if (!hub.nodes.length) await hub.fetchNodes()
+    const dependents = nodesFollowingGlobalLot(hub.nodes, symbol)
+    if (dependents.length) {
+      const shown = dependents.slice(0, 5).join('、')
+      const suffix =
+        dependents.length > 5
+          ? `（${shown} 等共 ${dependents.length} 个节点）`
+          : `（${shown}）`
+      await ElMessageBox.alert(
+        `${symbol}：以下节点手数策略为「跟随中控台」，无法关闭全局手数${suffix}\n\n请先将这些节点改为「固定手数」或「跟随信号」后再关闭。`,
+        '无法关闭全局手数',
+        { type: 'warning', confirmButtonText: '知道了' },
+      )
+      return
+    }
+  }
+  updateRule(symbol, { lot_enabled: enabled })
+}
+
 function setFollowSync(symbol: string, value: string | number | boolean): void {
   updateNodeRule(symbol, { follow_sync: Boolean(value) })
 }
 
 function setFollowPoll(symbol: string, value: string | number | boolean): void {
   updateNodeRule(symbol, { follow_poll: Boolean(value) })
+}
+
+/** 节点手数策略改为「跟随中控台」前检查中控台是否已启用全局手数。 */
+async function setLotMode(
+  symbol: string,
+  mode: 'global' | 'fixed' | 'signal',
+): Promise<void> {
+  if (mode === 'global') {
+    if (!Object.keys(hub.filters).length) await hub.fetchConfig()
+    const globalRules = parseFilterRules(hub.filters)
+    const gf =
+      globalRules[symbol] ||
+      globalRules[symbol.replace(/[^A-Z0-9]/g, '')] ||
+      Object.entries(globalRules).find(([k]) => {
+        const kb = k.replace(/[^A-Z0-9]/g, '')
+        const base = symbol.replace(/[^A-Z0-9]/g, '')
+        return kb && base && (kb === base || kb.startsWith(base) || base.startsWith(kb))
+      })?.[1]
+    if (!gf?.lot_enabled) {
+      await ElMessageBox.alert(
+        `${symbol}：中控台该品种未启用全局手数，无法将手数策略设为「跟随中控台」。\n\n请先到中控台开启该品种的「启用全局手数」。`,
+        '无法设置跟随中控台',
+        { type: 'warning', confirmButtonText: '知道了' },
+      )
+      return
+    }
+  }
+  updateNodeRule(symbol, { lot_mode: mode })
+}
+
+// 手动触发信号：弹窗确认并可自定义手数。
+// 已启用全局手数时默认填入该币种全局手数；未启用时默认填入配置中的 lot 字段。
+// 确认后 emit('trigger')，由父组件（中控台）调用后台手动触发接口。
+async function manualTrigger(symbol: string, action: 'BUY' | 'SELL'): Promise<void> {
+  const cfg = model.value as FilterRulesConfig
+  const rule = cfg[symbol]
+  if (!rule) return
+  const defaultLot = Number(rule.lot) > 0 ? Number(rule.lot) : 0.01
+  const hint = rule.lot_enabled
+    ? `确认手动触发 ${action} ${symbol}？\n\n默认手数为当前币种全局手数，可修改后触发。`
+    : `品种 ${symbol} 未启用全局手数，请输入本次手动触发 ${action} 的手数：`
+  let volume: number
+  try {
+    const { value } = await ElMessageBox.prompt(hint, '确认手动触发', {
+      confirmButtonText: '确认触发',
+      cancelButtonText: '取消',
+      inputValue: String(defaultLot),
+      inputPattern: /^\d*\.?\d+$/,
+      inputErrorMessage: '请输入大于 0 的手数',
+      closeOnClickModal: false,
+    })
+    volume = Number(value)
+  } catch {
+    return // 用户取消
+  }
+  if (!(volume > 0)) {
+    alert('手数必须大于 0')
+    return
+  }
+  emit('trigger', { symbol, action, volume })
 }
 
 defineExpose({ loadExample })
@@ -149,12 +267,35 @@ defineExpose({ loadExample })
   <div class="filter-editor">
     <div class="row between filter-toolbar">
       <p v-if="isGlobal" class="muted filter-hint">
-        按品种设置分发策略、价格区间与允许方向。未在中控台配置的品种信号将被直接拒收；可单独关闭某品种的做多/做空总开关；价格落在区间内时只允许勾选的方向开仓；不在任何区间时按「默认动作」处理。
+        按品种设置分发策略、价格区间、允许方向与全局手数。未登记或取消「启用」的品种信号将被直接拒收（含平仓）；后台手动平仓不受影响。节点手数策略为「跟随中控台」时使用此处配置的手数。
       </p>
       <p v-else class="muted filter-hint">
         按品种配置该节点的分发参与、手数策略与轮询顺序。未配置品种将回退节点默认策略（固定 0.01、轮询序 0）。
       </p>
       <div class="row filter-toolbar-actions">
+        <div v-if="totalSymbolCount > 0" class="filter-symbol-search">
+          <svg class="filter-symbol-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <circle cx="11" cy="11" r="7" />
+            <path d="m20 20-3.5-3.5" stroke-linecap="round" />
+          </svg>
+          <input
+            v-model="filterKeyword"
+            class="filter-symbol-search-input"
+            type="search"
+            :placeholder="`筛选品种（共 ${totalSymbolCount}）`"
+            @keyup.esc="clearFilterKeyword"
+          />
+          <button
+            v-if="hasKeyword"
+            type="button"
+            class="filter-symbol-search-clear"
+            aria-label="清除筛选"
+            @click="clearFilterKeyword"
+          >×</button>
+          <span v-if="hasKeyword" class="filter-symbol-search-count">
+            {{ visibleSymbolCount }} / {{ totalSymbolCount }}
+          </span>
+        </div>
         <button v-if="isGlobal" type="button" class="btn-sm btn-ghost" @click="loadExample">载入示例</button>
         <button type="button" class="btn-sm btn-primary" @click="addingSymbol = true">+ 添加品种</button>
       </div>
@@ -174,8 +315,12 @@ defineExpose({ loadExample })
     </div>
 
     <template v-if="isGlobal">
-      <div v-if="!globalSymbolList.length" class="filter-empty muted">
+      <div v-if="!totalSymbolCount" class="filter-empty muted">
         尚未配置任何品种。点击「添加品种」开始，或「载入示例」查看 XAUUSD 示范。
+      </div>
+      <div v-else-if="!globalSymbolList.length" class="filter-empty muted">
+        无匹配「{{ filterKeyword }}」的品种。
+        <button type="button" class="btn-sm btn-ghost" style="margin-left: 8px" @click="clearFilterKeyword">清除筛选</button>
       </div>
 
       <div v-for="{ symbol, rule } in globalSymbolList" :key="symbol" class="filter-symbol-card card card-pad">
@@ -199,7 +344,12 @@ defineExpose({ loadExample })
               <el-switch :model-value="rule.allow_sell" @change="setAllowSell(symbol, $event)" />
             </div>
           </div>
-          <button type="button" class="btn-sm btn-ghost" @click="removeSymbol(symbol)">删除品种</button>
+          <div class="row filter-symbol-actions">
+            <span class="filter-manual-label">手动触发</span>
+            <button type="button" class="btn-sm btn-manual btn-manual-buy" @click="manualTrigger(symbol, 'BUY')">BUY</button>
+            <button type="button" class="btn-sm btn-manual btn-manual-sell" @click="manualTrigger(symbol, 'SELL')">SELL</button>
+            <button type="button" class="btn-sm btn-ghost" @click="removeSymbol(symbol)">删除品种</button>
+          </div>
         </div>
 
         <div class="form-grid two" style="margin-top: 12px">
@@ -232,6 +382,27 @@ defineExpose({ loadExample })
               <option value="block">拦截 (block)</option>
               <option value="pass">放行 (pass)</option>
             </select>
+          </div>
+          <div>
+            <label>启用全局手数</label>
+            <select
+              :value="rule.lot_enabled ? 'true' : 'false'"
+              @change="setLotEnabled(symbol, ($event.target as HTMLSelectElement).value === 'true')"
+            >
+              <option value="false">关闭</option>
+              <option value="true">启用</option>
+            </select>
+          </div>
+          <div>
+            <label>全局手数</label>
+            <input
+              :value="rule.lot"
+              type="number"
+              step="0.01"
+              min="0.01"
+              :disabled="!rule.lot_enabled"
+              @input="updateRule(symbol, { lot: Number(($event.target as HTMLInputElement).value) })"
+            />
           </div>
         </div>
 
@@ -354,8 +525,12 @@ defineExpose({ loadExample })
     </template>
 
     <template v-else>
-      <div v-if="!nodeSymbolList.length" class="filter-empty muted">
+      <div v-if="!totalSymbolCount" class="filter-empty muted">
         尚未配置任何品种。点击「添加品种」为该节点设置各币种的分发、手数与轮询顺序。
+      </div>
+      <div v-else-if="!nodeSymbolList.length" class="filter-empty muted">
+        无匹配「{{ filterKeyword }}」的品种。
+        <button type="button" class="btn-sm btn-ghost" style="margin-left: 8px" @click="clearFilterKeyword">清除筛选</button>
       </div>
 
       <div v-for="{ symbol, rule } in nodeSymbolList" :key="symbol" class="filter-symbol-card card card-pad">
@@ -378,9 +553,9 @@ defineExpose({ loadExample })
             <label>手数策略</label>
             <select
               :value="rule.lot_mode"
-              @change="updateNodeRule(symbol, { lot_mode: ($event.target as HTMLSelectElement).value as 'global' | 'fixed' | 'signal' })"
+              @change="setLotMode(symbol, ($event.target as HTMLSelectElement).value as 'global' | 'fixed' | 'signal')"
             >
-              <option value="global">跟随全局</option>
+              <option value="global">跟随中控台</option>
               <option value="fixed">固定手数</option>
               <option value="signal">跟随信号</option>
             </select>
@@ -413,8 +588,82 @@ defineExpose({ loadExample })
 <style scoped>
 .filter-editor { display: flex; flex-direction: column; gap: 12px; }
 .filter-hint { font-size: 12px; margin: 0; flex: 1; min-width: 200px; }
-.filter-toolbar { align-items: flex-start; gap: 12px; }
+/* 工具栏 sticky 到滚动容器顶部；无滚动容器时也无副作用 */
+.filter-toolbar {
+  align-items: flex-start;
+  gap: 12px;
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  padding: 10px 14px 12px;
+  /* 实心背景，避免 sticky 时下方卡片透视重叠；border + shadow 与内容分层 */
+  background: var(--bg-soft);
+  border-bottom: 1px solid var(--glass-border);
+  box-shadow: 0 6px 10px -8px rgba(0, 0, 0, 0.45);
+}
 .filter-toolbar-actions { flex-shrink: 0; }
+
+/* 品种筛选输入框 */
+.filter-symbol-search {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  min-width: 200px;
+}
+.filter-symbol-search-icon {
+  position: absolute;
+  left: 10px;
+  width: 14px;
+  height: 14px;
+  color: var(--muted);
+  pointer-events: none;
+}
+.filter-symbol-search-input {
+  width: 100%;
+  padding: 6px 60px 6px 30px;
+  font-size: 12px;
+  border-radius: var(--radius-sm);
+  background: rgba(6, 10, 18, 0.5);
+  border: 1px solid var(--border);
+  color: var(--text);
+  transition: border-color var(--transition), box-shadow var(--transition);
+}
+.filter-symbol-search-input:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px rgba(0, 212, 170, 0.12);
+}
+.filter-symbol-search-input::-webkit-search-cancel-button { display: none; }
+.filter-symbol-search-clear {
+  position: absolute;
+  right: 6px;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border-radius: 50%;
+  background: var(--glass);
+  border: 1px solid var(--glass-border);
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.filter-symbol-search-clear:hover {
+  color: var(--text);
+  border-color: var(--glass-highlight);
+}
+.filter-symbol-search-count {
+  position: absolute;
+  right: 32px;
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--muted);
+  pointer-events: none;
+  white-space: nowrap;
+}
+
 .filter-add-symbol { background: var(--bg-soft); }
 .filter-empty {
   padding: 24px 16px;
@@ -425,7 +674,21 @@ defineExpose({ loadExample })
 }
 .filter-symbol-card { background: var(--bg-soft); }
 .filter-symbol-name { font-size: 15px; letter-spacing: 0.3px; }
+.filter-symbol-head { flex-wrap: wrap; gap: 10px; }
 .filter-symbol-switches { align-items: center; }
+.filter-symbol-actions { align-items: center; gap: 8px; flex-shrink: 0; }
+.filter-manual-label { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.btn-manual {
+  min-width: 52px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  color: #fff;
+  border: 1px solid transparent;
+}
+.btn-manual-buy { background: var(--green); }
+.btn-manual-buy:hover { filter: brightness(1.08); }
+.btn-manual-sell { background: var(--red); }
+.btn-manual-sell:hover { filter: brightness(1.08); }
 .filter-dir-switch {
   display: inline-flex;
   align-items: center;
@@ -464,6 +727,7 @@ defineExpose({ loadExample })
 }
 @media (max-width: 768px) {
   .filter-toolbar { flex-direction: column; }
-  .filter-toolbar-actions { width: 100%; justify-content: flex-end; }
+  .filter-toolbar-actions { width: 100%; justify-content: flex-end; flex-wrap: wrap; }
+  .filter-symbol-search { flex: 1 1 100%; min-width: 0; }
 }
 </style>

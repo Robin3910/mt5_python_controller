@@ -15,7 +15,7 @@ import dataclasses
 import logging
 from typing import Optional
 
-from . import persist, results, rules
+from . import mt5_identity, persist, results, rules
 from .config import Config
 from .connections import manager
 from .models import build_close_command, build_open_command
@@ -74,14 +74,18 @@ class Dispatcher:
 
     async def dispatch(self, signal: TradingSignal, signal_id: str,
                        source_ip: Optional[str] = None,
-                       raw_payload: Optional[str] = None) -> dict:
-        """分发入口：按信号品种的分发配置选择 sync / poll，CLOSE 走专用广播。"""
+                       raw_payload: Optional[str] = None,
+                       source: str = "tradingview") -> dict:
+        """分发入口：按信号品种的分发配置选择 sync / poll，CLOSE 走专用广播。
+
+        source：信号来源，tradingview（外部 Webhook）/ manual（中控台手动触发）。
+        """
         filters = await self.store.get_filters()
         mode, scope, reject_reason = rules.resolve_dispatch_config(signal.symbol, filters)
         if reject_reason:
             await persist.record_signal(
                 signal_id, signal, source_ip, True, None, status="rejected",
-                raw_payload=raw_payload,
+                raw_payload=raw_payload, source=source,
             )
             logger.info("signal rejected: %s", reject_reason)
             return {"mode": "rejected", "targets": 0, "reason": reject_reason}
@@ -89,6 +93,7 @@ class Dispatcher:
         # 先落库一条信号历史（best-effort，不阻塞交易）
         await persist.record_signal(
             signal_id, signal, source_ip, True, mode, raw_payload=raw_payload,
+            source=source,
         )
 
         if signal.action == "CLOSE":
@@ -107,12 +112,11 @@ class Dispatcher:
         self, signal: TradingSignal, signal_id: str, scope: str, filters: dict,
     ) -> int:
         """9.5 全员同步：对所有目标节点并发下发（fire-and-forget）。"""
-        global_lot = await self.store.get_lot_global()
         targets = await self._eligible_nodes("sync", signal.symbol, filters, signal_id)
         # 并发执行；单个节点异常不影响其它节点
         await asyncio.gather(
             *[
-                self.try_open(n, signal, signal_id, scope, global_lot, filters, wait=False)
+                self.try_open(n, signal, signal_id, scope, filters, wait=False)
                 for n in targets
             ],
             return_exceptions=True,
@@ -143,7 +147,7 @@ class Dispatcher:
         return len(candidates)
 
     async def try_open(self, node: dict, signal: TradingSignal, signal_id: str,
-                       scope: str, global_lot: dict, filters: dict,
+                       scope: str, filters: dict,
                        wait: bool = False, timeout: int = 15) -> dict:
         """对单个节点执行“开仓”决策与下发。
 
@@ -153,6 +157,14 @@ class Dispatcher:
         node_id = node["node_id"]
         account = await self.store.get_account(node_id) or {}
         positions = account.get("positions", [])
+
+        # 登录号一致性：快照 login 与节点绑定不符则跳过（防换号窗口内误下单）
+        mismatch = mt5_identity.login_mismatch_reason(
+            node.get("mt5_login"), account.get("login"),
+        )
+        if mismatch:
+            await self._skip(signal_id, node_id, mismatch)
+            return {"status": "skipped", "reason": mismatch}
 
         # 9.2 多区间方向过滤
         eff = rules.effective_filters(node, filters)
@@ -176,7 +188,7 @@ class Dispatcher:
             await self._skip(signal_id, node_id, reason)
             return {"status": "skipped", "reason": reason}
 
-        vol = rules.resolve_volume(node, signal.volume, global_lot, signal.symbol)
+        vol = rules.resolve_volume(node, signal.volume, filters, signal.symbol)
         cmd = build_open_command(
             signal_id, signal.action, signal.symbol, vol,
             signal.stop_loss, signal.take_profit, signal.comment,

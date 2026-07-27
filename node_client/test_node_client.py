@@ -30,12 +30,41 @@ async def test_authenticate_ok():
     n = _node()
     await n._exec(n.mt5.connect)
     ws = FakeWS()
-    ws.feed({"type": "auth_ok", "data": {"node_id": "nd_x"}})
+    ws.feed({
+        "type": "auth_ok",
+        "data": {"node_id": "nd_x", "watch_symbols": ["btcust", "XAUUSD"]},
+    })
     assert await n._authenticate(ws) is True
     assert ws.sent[0]["type"] == "auth"
     assert ws.sent[0]["data"]["token"] == "test-token"
     assert ws.sent[0]["data"]["mt5_login"] == 90000001
     assert any(m["type"] == "hello" for m in ws.sent)
+    assert n.hub_symbols == {"BTCUST", "XAUUSD"}
+
+
+async def test_effective_watchlist_unions_sources():
+    n = _node()
+    n.apply_hub_symbols(["BTCUST"])
+    wl = n.effective_watchlist([{"symbol": "AUDUSD"}])
+    assert "BTCUST" in wl
+    assert "AUDUSD" in wl
+    assert "EURUSD" in wl  # from default WATCH_SYMBOLS in test env
+
+
+async def test_snapshot_includes_hub_symbols():
+    n = _node()
+    await n._exec(n.mt5.connect)
+    n.apply_hub_symbols(["BTCUST"])
+    snap = await n._snapshot()
+    assert "BTCUST" in snap["prices"]
+    assert "EURUSD" in snap["prices"]
+
+
+async def test_handle_watch_symbols_updates():
+    n = _node()
+    ws = FakeWS()
+    await n._handle(ws, {"type": "watch_symbols", "data": {"symbols": ["btcust", "ethusd"]}})
+    assert n.hub_symbols == {"BTCUST", "ETHUSD"}
 
 
 async def test_authenticate_fail():
@@ -104,3 +133,53 @@ async def test_snapshot_shape():
     assert "EURUSD" in snap["quotes"]
     assert set(snap["quotes"]["EURUSD"].keys()) == {"bid", "ask", "mid", "change"}
     assert snap["account"]["login"]
+
+
+async def test_check_login_allows_match_and_empty():
+    n = _node()
+    n._check_login({"login": 90000001})
+    n._check_login({})
+    n._check_login({"login": None})
+
+
+async def test_check_login_rejects_mismatch():
+    n = _node()
+    try:
+        n._check_login({"login": 11111})
+        assert False, "expected LoginMismatchError"
+    except nc.LoginMismatchError as e:
+        assert "11111" in str(e)
+        assert "90000001" in str(e)
+
+
+async def test_open_blocked_when_terminal_switched():
+    n = _node()
+    await n._exec(n.mt5.connect)
+    n.mt5.login = 11111  # 模拟终端换号
+    ws = FakeWS()
+    try:
+        await n._handle(
+            ws,
+            {"cmd": "open", "signal_id": "s1", "action": "BUY", "symbol": "EURUSD",
+             "volume": 0.1, "stop_loss": None, "take_profit": None, "comment": "", "magic": None},
+        )
+        assert False, "expected LoginMismatchError"
+    except nc.LoginMismatchError:
+        pass
+    tr = [m for m in ws.sent if m["type"] == "trade_result"]
+    assert tr and tr[0]["data"]["success"] is False
+    assert tr[0]["data"]["signal_id"] == "s1"
+    assert len(n.mt5.positions()) == 0
+
+
+async def test_handle_server_login_mismatch():
+    n = _node()
+    ws = FakeWS()
+    try:
+        await n._handle(
+            ws,
+            {"type": "auth_fail", "data": {"reason": "mt5_login_mismatch", "message": "换号"}},
+        )
+        assert False, "expected LoginMismatchError"
+    except nc.LoginMismatchError as e:
+        assert "换号" in str(e)

@@ -17,8 +17,12 @@ logger = logging.getLogger(__name__)
 
 async def record_signal(signal_id, signal, source_ip=None, parsed_ok=True,
                         dispatch_mode=None, status="dispatching",
-                        raw_payload: Optional[str] = None) -> None:
-    """落库一条信号历史。"""
+                        raw_payload: Optional[str] = None,
+                        source: str = "tradingview") -> None:
+    """落库一条信号历史。
+
+    source：信号来源，tradingview（外部 Webhook）/ manual（中控台手动触发）。
+    """
     payload_str = raw_payload
     if payload_str is None and signal is not None:
         payload_str = str(asdict(signal))
@@ -38,6 +42,7 @@ async def record_signal(signal_id, signal, source_ip=None, parsed_ok=True,
                     parsed_ok=parsed_ok,
                     dispatch_mode=dispatch_mode,
                     status=status,
+                    source=source,
                 )
             )
             await s.commit()
@@ -47,7 +52,7 @@ async def record_signal(signal_id, signal, source_ip=None, parsed_ok=True,
 
 async def record_dispatch(signal_id, node_id, decided_vol, gate_result,
                           skip_reason, status) -> None:
-    """落库一条分发明细（pending / skipped）。"""
+    """落库一条分发明细（pending / skipped），终态时尝试收口信号整体状态。"""
     try:
         async with SessionLocal() as s:
             s.add(
@@ -61,13 +66,78 @@ async def record_dispatch(signal_id, node_id, decided_vol, gate_result,
                     dispatched_at=datetime.now(),
                 )
             )
+            if status in _DISPATCH_TERMINAL:
+                await s.flush()
+                await _refresh_signal_status(s, signal_id)
             await s.commit()
     except Exception as e:  # noqa: BLE001
         logger.warning("record_dispatch failed: %s", e)
 
 
+# 分发明细终态；仍在途的不计入整体收口
+_DISPATCH_TERMINAL = frozenset({"done", "failed", "skipped"})
+_DISPATCH_PENDING = frozenset({"pending", "sent"})
+
+
+def _aggregate_signal_status(dispatch_statuses: list[str]) -> Optional[str]:
+    """根据各节点分发明细汇总信号整体状态。
+
+    - 仍有 pending/sent → 继续 dispatching（返回 None 表示暂不改）
+    - 既有成功又有失败 → partial
+    - 任一成功（无失败）→ done
+    - 全部失败 → failed
+    - 全部跳过 → done（处理已结束，只是无人成交）
+    """
+    if not dispatch_statuses:
+        return None
+    if any(st in _DISPATCH_PENDING for st in dispatch_statuses):
+        return None
+    has_done = any(st == "done" for st in dispatch_statuses)
+    has_failed = any(st == "failed" for st in dispatch_statuses)
+    if has_done and has_failed:
+        return "partial"
+    if has_done:
+        return "done"
+    if has_failed:
+        return "failed"
+    if all(st in _DISPATCH_TERMINAL for st in dispatch_statuses):
+        return "done"
+    return None
+
+
+async def _refresh_signal_status(session, signal_id: str) -> None:
+    """按当前分发明细收口 SignalHistory.status（仅在全部明细终态时更新）。"""
+    rows = (
+        await session.execute(
+            select(SignalDispatch.status).where(SignalDispatch.signal_id == signal_id)
+        )
+    ).scalars().all()
+    new_status = _aggregate_signal_status(list(rows))
+    if not new_status:
+        return
+    await session.execute(
+        update(SignalHistory)
+        .where(SignalHistory.signal_id == signal_id)
+        .values(status=new_status)
+    )
+
+
+async def update_signal_status(signal_id: str, status: str) -> None:
+    """显式更新信号整体状态（如轮询无人领取 → failed）。"""
+    try:
+        async with SessionLocal() as s:
+            await s.execute(
+                update(SignalHistory)
+                .where(SignalHistory.signal_id == signal_id)
+                .values(status=status)
+            )
+            await s.commit()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("update_signal_status failed: %s", e)
+
+
 async def update_dispatch_result(signal_id, node_id, status, result: Optional[dict] = None) -> None:
-    """根据节点回报更新分发明细的最终结果。"""
+    """根据节点回报更新分发明细的最终结果，并尝试收口信号整体状态。"""
     result = result or {}
     try:
         async with SessionLocal() as s:
@@ -100,6 +170,7 @@ async def update_dispatch_result(signal_id, node_id, status, result: Optional[di
                     .where(SignalHistory.signal_id == signal_id)
                     .values(**hist_vals)
                 )
+            await _refresh_signal_status(s, signal_id)
             await s.commit()
     except Exception as e:  # noqa: BLE001
         logger.warning("update_dispatch_result failed: %s", e)
@@ -196,6 +267,7 @@ def _signal_event_row(sig: SignalHistory, dispatches: list[dict]) -> dict:
         "parsed_ok": sig.parsed_ok,
         "dispatch_mode": sig.dispatch_mode,
         "status": sig.status,
+        "source": sig.source,
         "dispatches": dispatches,
     }
 
@@ -311,8 +383,23 @@ async def recent_dispatches(node_id: str, page: int = 1, page_size: int = 20) ->
         return {"items": [], "total": 0, "page": page, "page_size": page_size}
 
 
-async def audit(operator, action, target=None, params=None, result="ok", ip=None) -> None:
-    """写一条操作审计。"""
+async def audit(
+    operator,
+    action,
+    target=None,
+    params=None,
+    result="ok",
+    ip=None,
+    *,
+    category: Optional[str] = None,
+    before=None,
+    after=None,
+) -> None:
+    """写一条操作审计。
+
+    category：console（中控台）/ node（节点）/ system（其它）
+    before / after：操作前后数据快照（dict 或可 JSON 序列化对象）。
+    """
     try:
         async with SessionLocal() as s:
             s.add(
@@ -323,8 +410,63 @@ async def audit(operator, action, target=None, params=None, result="ok", ip=None
                     params_json=params,
                     result=result,
                     ip=ip,
+                    category=category,
+                    before_json=before,
+                    after_json=after,
                 )
             )
             await s.commit()
     except Exception as e:  # noqa: BLE001
         logger.warning("audit failed: %s", e)
+
+
+def _audit_row(row: AuditLog) -> dict:
+    return {
+        "id": row.id,
+        "ts": row.ts.timestamp() if row.ts else None,
+        "operator": row.operator,
+        "action": row.action,
+        "target": row.target,
+        "params": row.params_json,
+        "result": row.result,
+        "ip": row.ip,
+        "category": row.category,
+        "before": row.before_json,
+        "after": row.after_json,
+    }
+
+
+async def recent_audits(
+    page: int = 1,
+    page_size: int = 20,
+    categories: Optional[list[str]] = None,
+) -> dict:
+    """分页读取操作审计（默认中控台 + 节点）。"""
+    page = max(1, page)
+    page_size = max(1, min(page_size, 100))
+    offset = (page - 1) * page_size
+    cats = categories or ["console", "node"]
+    try:
+        async with SessionLocal() as s:
+            filt = AuditLog.category.in_(cats)
+            total = (
+                await s.execute(select(func.count()).select_from(AuditLog).where(filt))
+            ).scalar_one()
+            rows = (
+                await s.execute(
+                    select(AuditLog)
+                    .where(filt)
+                    .order_by(AuditLog.id.desc())
+                    .offset(offset)
+                    .limit(page_size)
+                )
+            ).scalars().all()
+            return {
+                "items": [_audit_row(r) for r in rows],
+                "total": total,
+                "page": page,
+                "page_size": page_size,
+            }
+    except Exception as e:  # noqa: BLE001
+        logger.warning("recent_audits failed: %s", e)
+        return {"items": [], "total": 0, "page": page, "page_size": page_size}

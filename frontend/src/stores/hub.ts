@@ -6,12 +6,14 @@ import type {
   CloseBatchResult,
   FilterRulesConfig,
   HubEvent,
-  LotConfig,
+  ManualSignalPayload,
+  ManualSignalResult,
   NodeCreatePayload,
   NodeFeedItem,
   NodeOut,
   NodeTokenInfo,
   NodeUpdatePayload,
+  PaginatedAudits,
   PaginatedNodeDispatches,
   PaginatedSignalEvents,
 } from '@/api/types'
@@ -21,7 +23,6 @@ interface HubState {
   nodes: NodeOut[]                          // 节点列表（来自 REST，字段最全）
   accounts: Record<string, AccountSnapshot> // node_id -> 最新账户快照（实时 WS 更新）
   statuses: Record<string, string>          // node_id -> 在线状态（实时 WS 更新）
-  lot: LotConfig                            // 全局手数
   filters: FilterRulesConfig          // 区间过滤
   events: HubEvent[]                        // 实时事件流（用于总览页展示）
   nodeFeed: Record<string, NodeFeedItem[]>  // node_id -> 实时分发/回报（详情页“成交回报”用）
@@ -32,7 +33,6 @@ export const useHubStore = defineStore('hub', {
     nodes: [],
     accounts: {},
     statuses: {},
-    lot: { enabled: false, value: 0.1 },
     filters: {},
     events: [],
     nodeFeed: {},
@@ -47,14 +47,15 @@ export const useHubStore = defineStore('hub', {
   },
   actions: {
     // ---- REST 拉取 ----
-    async fetchNodes(): Promise<void> {
-      this.nodes = (await api.get('/api/nodes')).data
+    async fetchNodes(options?: { q?: string }): Promise<void> {
+      const q = options?.q?.trim()
+      const params = q ? { q } : undefined
+      this.nodes = (await api.get('/api/nodes', { params })).data
       for (const n of this.nodes) {
         if (!(n.node_id in this.statuses)) this.statuses[n.node_id] = n.status
       }
     },
     async fetchConfig(): Promise<void> {
-      this.lot = (await api.get('/api/config/lot')).data
       this.filters = (await api.get('/api/config/filters')).data
     },
     // 拉取单节点最新账户快照（详情页兜底；之后由 WS 实时刷新）
@@ -92,26 +93,46 @@ export const useHubStore = defineStore('hub', {
         return { items: [], total: 0, page, page_size: pageSize }
       }
     },
+    async fetchAudits(
+      page = 1,
+      pageSize = 20,
+      category?: string | null,
+    ): Promise<PaginatedAudits> {
+      try {
+        return (
+          await api.get('/api/audits', {
+            params: {
+              page,
+              page_size: pageSize,
+              ...(category ? { category } : {}),
+            },
+          })
+        ).data
+      } catch {
+        return { items: [], total: 0, page, page_size: pageSize }
+      }
+    },
     // ---- 节点增删改 ----
-    async createNode(payload: NodeCreatePayload): Promise<NodeOut> {
+    async createNode(payload: NodeCreatePayload, options?: { q?: string }): Promise<NodeOut> {
       const created = (await api.post('/api/nodes', payload)).data
-      await this.fetchNodes()
+      await this.fetchNodes(options)
       return created
     },
-    async updateNode(id: string, patch: NodeUpdatePayload): Promise<void> {
+    async updateNode(id: string, patch: NodeUpdatePayload, options?: { q?: string }): Promise<void> {
       await api.patch(`/api/nodes/${id}`, patch)
-      await this.fetchNodes()
+      await this.fetchNodes(options)
     },
-    async deleteNode(id: string): Promise<void> {
+    async deleteNode(id: string, options?: { q?: string }): Promise<void> {
       await api.delete(`/api/nodes/${id}`)
-      await this.fetchNodes()
+      await this.fetchNodes(options)
     },
     // ---- 配置保存 ----
-    async saveLot(cfg: LotConfig): Promise<void> {
-      this.lot = (await api.put('/api/config/lot', cfg)).data
-    },
     async saveFilters(cfg: FilterRulesConfig): Promise<void> {
       this.filters = (await api.put('/api/config/filters', cfg)).data
+    },
+    // ---- 中控台手动触发信号（复用 Webhook 分发流程）----
+    async triggerManualSignal(payload: ManualSignalPayload): Promise<ManualSignalResult> {
+      return (await api.post('/api/console/manual-signal', payload)).data
     },
     // ---- 全局节点接入令牌（账户设置）----
     async fetchNodeToken(): Promise<NodeTokenInfo> {
@@ -158,24 +179,23 @@ export const useHubStore = defineStore('hub', {
           this.statuses[id] = n.status as string
           if (n.account) this.accounts[id] = n.account as AccountSnapshot
         }
-        if (d.lot) this.lot = d.lot as LotConfig
       } else if (t === 'node_status') {
         // 节点上下线
         const id = d.node_id as string
         this.statuses[id] = d.status as string
         this.pushEvent(`节点 ${id} ${d.status === 'online' ? '上线' : '下线'}`, d.status === 'online' ? 'ok' : 'warn')
       } else if (t === 'node_rejected') {
-        // 重复登录被拒绝（同一节点同一时刻只允许一个在线）
+        // 节点被拒绝（重复在线 / 登录号不符等）
         const reasonText: Record<string, string> = {
           already_online: '已有在线连接',
-          mt5_login_mismatch: 'MT5 登录号不匹配',
+          mt5_login_mismatch: 'MT5 登录号不匹配（终端换号）',
         }
         const why = reasonText[d.reason as string] || (d.reason as string) || '未知原因'
-        this.pushEvent(`节点 ${d.node_id} 重复登录被拒绝（${why}）`, 'warn')
+        this.pushEvent(`节点 ${d.node_id} 接入被拒绝（${why}）`, 'warn')
       } else if (t === 'node_registered') {
         // 新节点首次登录被自动注册入库
         this.pushEvent(
-          `节点 ${d.name || d.node_id} (MT5: ${d.mt5_login}) 已自动注册`,
+          `节点 ${d.name || d.node_id} (MT5: ${d.mt5_login}) 已自动注册（默认禁用，请启用后接入）`,
           'ok',
         )
         // 拉取最新节点列表，让侧栏/列表实时刷新

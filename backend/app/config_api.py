@@ -1,34 +1,27 @@
-"""运行期配置 API：全局手数、区间过滤、全局节点令牌（需管理员鉴权）。
+"""运行期配置 API：区间过滤、全局节点令牌（需管理员鉴权）。
 
 这些配置存于 Redis（运行期实时态），下发分发时即时读取生效。
 节点令牌为持久化配置（MySQL/SQLite + Redis 缓存，见 system_settings）。
 """
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
-from . import persist, system_settings
+from . import persist, rules, system_settings
+from .connections import manager
 from .deps import client_ip, get_current_admin, get_store
-from .models import LotConfig, NodeTokenInfo
+from .models import NodeTokenInfo
 from .redis_store import RedisStore
 
 router = APIRouter(prefix="/api/config", tags=["config"])
 
 
-@router.get("/lot", response_model=LotConfig)
-async def get_lot(store: RedisStore = Depends(get_store), _: str = Depends(get_current_admin)):
-    return LotConfig(**await store.get_lot_global())
-
-
-@router.put("/lot", response_model=LotConfig)
-async def set_lot(
-    body: LotConfig,
-    request: Request,
-    store: RedisStore = Depends(get_store),
-    admin: str = Depends(get_current_admin),
-):
-    """设置全局手数（影响所有“跟随全局”策略的节点）。"""
-    await store.set_lot_global(body.model_dump())
-    await persist.audit(admin, "set_lot_global", None, body.model_dump(), "ok", client_ip(request))
-    return body
+async def push_watch_symbols_to_nodes(filters_cfg: dict) -> None:
+    """把中控台 filters 品种列表推给所有在线节点，供其合并进观察报价列表。"""
+    msg = {
+        "type": "watch_symbols",
+        "data": {"symbols": rules.filter_watch_symbols(filters_cfg)},
+    }
+    for node_id in manager.online_node_ids():
+        await manager.send_to_node(node_id, msg)
 
 
 @router.get("/filters")
@@ -43,9 +36,21 @@ async def set_filters(
     store: RedisStore = Depends(get_store),
     admin: str = Depends(get_current_admin),
 ):
-    """设置多区间方向过滤（以品种为键的对象，结构见前端配置页说明）。"""
+    """设置多区间方向过滤（以品种为键的对象，结构见前端配置页说明）。
+
+    关闭某品种「启用全局手数」时，若仍有节点将该品种手数策略设为「跟随中控台」，则拒收。
+    """
+    nodes = await store.all_nodes()
+    err = rules.validate_disable_global_lot(body or {}, nodes)
+    if err:
+        raise HTTPException(status_code=400, detail=err)
+    before = await store.get_filters()
     await store.set_filters(body)
-    await persist.audit(admin, "set_filters", None, body, "ok", client_ip(request))
+    await push_watch_symbols_to_nodes(body)
+    await persist.audit(
+        admin, "set_filters", None, None, "ok", client_ip(request),
+        category="console", before=before or {}, after=body or {},
+    )
     return body
 
 

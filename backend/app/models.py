@@ -118,12 +118,36 @@ class SignalEventRecord(BaseModel):
     parsed_ok: bool = False
     dispatch_mode: Optional[str] = None
     status: str = "pending"
+    source: Optional[str] = None  # tradingview（外部 Webhook）/ manual（中控台手动触发）
     dispatches: list[SignalEventDispatch] = Field(default_factory=list)
 
 
 class PaginatedSignalEvents(BaseModel):
     """Webhook 信号事件分页结果。"""
     items: list[SignalEventRecord]
+    total: int
+    page: int
+    page_size: int
+
+
+class AuditRecord(BaseModel):
+    """操作审计记录（含操作前后数据）。"""
+    id: int
+    ts: Optional[float] = None
+    operator: str
+    action: str
+    target: Optional[str] = None
+    params: Optional[dict] = None
+    result: str = "ok"
+    ip: Optional[str] = None
+    category: Optional[str] = None  # console / node / system
+    before: Optional[Any] = None
+    after: Optional[Any] = None
+
+
+class PaginatedAudits(BaseModel):
+    """操作审计分页结果。"""
+    items: list[AuditRecord]
     total: int
     page: int
     page_size: int
@@ -171,12 +195,6 @@ class AccountSnapshot(BaseModel):
 
 
 # ---------------------------- 配置 ---------------------------
-class LotConfig(BaseModel):
-    """全局手数配置。"""
-    enabled: bool = False
-    value: float = 0.1
-
-
 class IntervalRule(BaseModel):
     """单条价格区间规则：在 [low, high] 内允许哪些方向。"""
     low: float
@@ -186,12 +204,14 @@ class IntervalRule(BaseModel):
 
 class SymbolFilter(BaseModel):
     """某品种的多区间过滤与分发配置（全局 filters 键值）。"""
-    enabled: bool = True
+    enabled: bool = True  # False：拒收该品种全部信号（含 Webhook CLOSE；手动平仓除外）
     allow_buy: bool = True
     allow_sell: bool = True
     dispatch_mode: str = "sync"  # sync / poll
     position_scope: str = "symbol"  # symbol / account
     default_action: str = "block"  # 不在任何区间时：block 拦截 / pass 放行
+    lot_enabled: bool = False  # 是否启用该品种的全局手数
+    lot: float = 0.01  # 该品种全局手数（lot_enabled 时生效）
     intervals: list[IntervalRule] = Field(default_factory=list)
 
 
@@ -215,6 +235,14 @@ class CloseRequest(BaseModel):
 class CloseBatchRequest(CloseRequest):
     """对指定节点批量平仓。"""
     node_ids: list[str] = Field(min_length=1)
+
+
+# ----------------------- 中控台手动触发 -----------------------
+class ManualSignalRequest(BaseModel):
+    """中控台手动触发的开仓信号（复用 Webhook 分发流程）。"""
+    symbol: str = Field(min_length=1)
+    action: str  # BUY / SELL
+    volume: float = Field(gt=0)
 
 
 # ----------------------------- 鉴权 ----------------------------

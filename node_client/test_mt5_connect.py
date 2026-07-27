@@ -14,7 +14,7 @@ print("=== MT5 Connection Test ===")
 print(f"MT5_MOCK: {settings.mt5_mock}")
 print(f"Login:  {creds['mt5_login']}")
 print(f"Server: {creds['mt5_server']}")
-print(f"Path:   {creds['mt5_path'] or '(default)'}")
+print(f"Path:   {creds['mt5_path'] or '(mock / not required)'}")
 print()
 
 if settings.mt5_mock:

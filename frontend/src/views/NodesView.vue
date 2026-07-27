@@ -1,18 +1,51 @@
 <script setup lang="ts">
 // 节点管理页：创建/编辑/删除节点、启停、重置令牌、批量全平（令牌仅创建时显示一次）
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
+import { ElMessageBox } from 'element-plus'
+import 'element-plus/es/components/message-box/style/css'
 import FormLabel from '@/components/FormLabel.vue'
 import FilterRulesEditor from '@/components/FilterRulesEditor.vue'
 import { NODE_FORM_FIELD_HELP } from '@/constants/nodeFormHelp'
 import { useHubStore } from '@/stores/hub'
 import type { NodeDispatchFiltersConfig, NodeOut } from '@/api/types'
-import { parseNodeDispatchFilters, serializeNodeDispatchFilters, validateNodeDispatchFilters } from '@/utils/filterRules'
+import { parseFilterRules, parseNodeDispatchFilters, serializeNodeDispatchFilters, validateNodeDispatchFilters, validateNodeGlobalLotMode } from '@/utils/filterRules'
 import { confirmAction } from '@/utils/confirm'
 
 const hub = useHubStore()
 const router = useRouter()
-onMounted(() => hub.fetchNodes())
+
+const searchQuery = ref('')
+const appliedQuery = ref('')
+const searching = ref(false)
+
+function currentSearchOptions(): { q?: string } {
+  return appliedQuery.value ? { q: appliedQuery.value } : {}
+}
+
+async function loadNodes(): Promise<void> {
+  searching.value = true
+  try {
+    await hub.fetchNodes(currentSearchOptions())
+  } finally {
+    searching.value = false
+  }
+}
+
+async function runSearch(): Promise<void> {
+  appliedQuery.value = searchQuery.value.trim()
+  await loadNodes()
+}
+
+onMounted(() => {
+  void loadNodes()
+})
+
+onUnmounted(() => {
+  if (appliedQuery.value) {
+    void hub.fetchNodes()
+  }
+})
 
 function goDetail(n: NodeOut): void {
   router.push(`/nodes/${n.node_id}`)
@@ -24,7 +57,7 @@ const editingId = ref('')
 const saving = ref(false)
 const createError = ref('')
 
-// 默认值与「自动注册」保持一致：启用；按币种配置见 filters
+// 手动新建默认启用；自动注册默认禁用（入库后需管理员启用）
 const form = reactive({
   name: '',
   mt5_login: null as number | null,
@@ -67,7 +100,12 @@ function toggleSelect(id: string, checked: boolean): void {
 }
 
 function toggleSelectAll(checked: boolean): void {
-  selectedIds.value = checked ? new Set(hub.nodes.map((n) => n.node_id)) : new Set()
+  if (!checked) {
+    const visible = new Set(hub.nodes.map((n) => n.node_id))
+    selectedIds.value = new Set([...selectedIds.value].filter((id) => !visible.has(id)))
+    return
+  }
+  selectedIds.value = new Set([...selectedIds.value, ...hub.nodes.map((n) => n.node_id)])
 }
 
 async function closeSelected(): Promise<void> {
@@ -100,12 +138,19 @@ async function closeSelected(): Promise<void> {
   }
 }
 
+async function ensureGlobalFiltersLoaded(): Promise<void> {
+  if (!Object.keys(hub.filters).length) {
+    await hub.fetchConfig()
+  }
+}
+
 function openCreate(): void {
   formMode.value = 'create'
   editingId.value = ''
   createError.value = ''
   Object.assign(form, { name: '', mt5_login: null, enabled: true, filters: {} })
   showForm.value = true
+  void ensureGlobalFiltersLoaded()
 }
 
 function openEdit(n: NodeOut): void {
@@ -119,16 +164,26 @@ function openEdit(n: NodeOut): void {
     filters: parseNodeDispatchFilters(n.filters),
   })
   showForm.value = true
+  void ensureGlobalFiltersLoaded()
 }
 
 async function save(): Promise<void> {
   saving.value = true
   createError.value = ''
   try {
+    await ensureGlobalFiltersLoaded()
     const filtersPayload = serializeNodeDispatchFilters(form.filters)
-    const filterErrors = validateNodeDispatchFilters(filtersPayload)
+    const globalRules = parseFilterRules(hub.filters)
+    const filterErrors = [
+      ...validateNodeDispatchFilters(filtersPayload),
+      ...validateNodeGlobalLotMode(filtersPayload, globalRules),
+    ]
     if (filterErrors.length) {
       createError.value = filterErrors[0]
+      await ElMessageBox.alert(filterErrors[0], '无法保存', {
+        type: 'warning',
+        confirmButtonText: '知道了',
+      })
       return
     }
     const payload = {
@@ -140,7 +195,7 @@ async function save(): Promise<void> {
       const login = form.mt5_login
       if (!(await confirmAction(`确认创建节点？\n\nMT5 登录号：${login}`))) return
       try {
-        await hub.createNode({ ...payload, mt5_login: form.mt5_login })
+        await hub.createNode({ ...payload, mt5_login: form.mt5_login }, currentSearchOptions())
       } catch (e: unknown) {
         const err = e as { response?: { status?: number; data?: { detail?: string } } }
         if (err?.response?.status === 409) {
@@ -148,13 +203,31 @@ async function save(): Promise<void> {
           return
         }
         createError.value = err?.response?.data?.detail || '创建失败，请稍后重试'
+        if (err?.response?.status === 400 && createError.value) {
+          await ElMessageBox.alert(createError.value, '无法保存', {
+            type: 'warning',
+            confirmButtonText: '知道了',
+          })
+        }
         return
       }
     } else {
       const label = form.name || editingId.value
       const enabledText = form.enabled ? '启用' : '禁用'
       if (!(await confirmAction(`确认更新节点「${label}」？\n\n启用状态：${enabledText}`))) return
-      await hub.updateNode(editingId.value, { ...payload, enabled: form.enabled })
+      try {
+        await hub.updateNode(editingId.value, { ...payload, enabled: form.enabled }, currentSearchOptions())
+      } catch (e: unknown) {
+        const err = e as { response?: { status?: number; data?: { detail?: string } } }
+        createError.value = err?.response?.data?.detail || '更新失败，请稍后重试'
+        if (err?.response?.status === 400 && createError.value) {
+          await ElMessageBox.alert(createError.value, '无法保存', {
+            type: 'warning',
+            confirmButtonText: '知道了',
+          })
+        }
+        return
+      }
     }
     showForm.value = false
   } finally {
@@ -164,13 +237,13 @@ async function save(): Promise<void> {
 
 async function remove(n: NodeOut): Promise<void> {
   if (!(await confirmAction(`确认删除节点「${n.name}」？\n\n该操作不可恢复。`, '确认删除'))) return
-  await hub.deleteNode(n.node_id)
+  await hub.deleteNode(n.node_id, currentSearchOptions())
 }
 
 async function toggleEnabled(n: NodeOut): Promise<void> {
   const next = n.enabled ? '禁用' : '启用'
   if (!(await confirmAction(`确认${next}节点「${n.name}」？\n\n${next}后将${n.enabled ? '无法接入且不参与分发' : '恢复正常跟单'}。`))) return
-  await hub.updateNode(n.node_id, { enabled: !n.enabled })
+  await hub.updateNode(n.node_id, { enabled: !n.enabled }, currentSearchOptions())
 }
 </script>
 
@@ -190,6 +263,29 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
       </button>
       <button class="btn-primary" @click="openCreate">+ 新建节点</button>
     </div>
+  </div>
+
+  <div class="card card-pad node-search-bar" style="margin-bottom: 12px">
+    <div class="row" style="gap: 8px">
+      <input
+        v-model="searchQuery"
+        type="search"
+        placeholder="搜索节点名称或 MT5 账号…"
+        aria-label="搜索节点名称或 MT5 账号"
+        :disabled="searching"
+        style="width: 25%"
+        @keydown.enter="runSearch"
+      />
+      <button class="btn-primary btn-sm" :disabled="searching" @click="runSearch">
+        {{ searching ? '搜索中…' : '搜索' }}
+      </button>
+    </div>
+    <p v-if="appliedQuery && !hub.nodes.length" class="muted" style="font-size: 12px; margin: 8px 0 0">
+      无匹配节点
+    </p>
+    <p v-else-if="appliedQuery" class="muted" style="font-size: 12px; margin: 8px 0 0">
+      找到 {{ hub.nodes.length }} 个节点
+    </p>
   </div>
 
   <div v-if="hub.nodes.length" class="row mobile-only" style="margin-bottom: 10px">
@@ -233,7 +329,9 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
         <button class="btn-sm btn-danger" @click="remove(n)">删除</button>
       </div>
     </div>
-    <div v-if="!hub.nodes.length" class="card card-pad muted">暂无节点</div>
+    <div v-if="!hub.nodes.length && !searching" class="card card-pad muted">
+      {{ appliedQuery ? '无匹配节点' : '暂无节点' }}
+    </div>
   </div>
 
   <div class="card table-scroll desktop-only">
@@ -277,50 +375,90 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
             <button class="btn-sm btn-danger" @click="remove(n)">删除</button>
           </td>
         </tr>
-        <tr v-if="!hub.nodes.length"><td colspan="7" class="muted" style="padding: 18px">暂无节点</td></tr>
+        <tr v-if="!hub.nodes.length && !searching">
+          <td colspan="7" class="muted" style="padding: 18px">
+            {{ appliedQuery ? '无匹配节点' : '暂无节点' }}
+          </td>
+        </tr>
       </tbody>
     </table>
   </div>
 
-  <!-- create / edit modal -->
+  <!-- create / edit modal：头/身/底三段，底部操作栏固定，避免 iPhone Safari 底栏遮挡 -->
   <div v-if="showForm" class="modal-mask" @click.self="showForm = false">
-    <div class="card card-pad modal">
-      <div class="h1">{{ formMode === 'create' ? '新建节点' : '编辑节点' }}</div>
-      <p v-if="formMode === 'create'" class="muted" style="font-size: 12px; margin: 4px 0 10px">
-        提示：若 node_client 用同一 MT5 登录号首次连接，系统会自动注册（默认配置同此表单），通常无需在此手动新建。
-      </p>
-      <div class="form-grid">
-        <div>
-          <FormLabel field-id="node-name" text="名称" :help="NODE_FORM_FIELD_HELP.name" />
-          <input id="node-name" v-model="form.name" :placeholder="form.mt5_login ? `留空将自动生成：node-${form.mt5_login}` : '留空将自动生成 node-{mt5_login}'" />
+    <div class="card card-pad modal modal-lg node-form-modal">
+      <div class="modal-header">
+        <div class="h1">{{ formMode === 'create' ? '新建节点' : '编辑节点' }}</div>
+        <p v-if="formMode === 'create'" class="muted" style="font-size: 12px; margin: 4px 0 0">
+          提示：若 node_client 用同一 MT5 登录号首次连接，系统会自动注册（默认禁用，需在此启用后才会上线）；手动新建默认启用。
+        </p>
+      </div>
+      <div class="modal-body">
+        <div class="form-grid two">
+          <div>
+            <FormLabel field-id="node-name" text="名称" :help="NODE_FORM_FIELD_HELP.name" />
+            <input id="node-name" v-model="form.name" :placeholder="form.mt5_login ? `留空将自动生成：node-${form.mt5_login}` : '留空将自动生成 node-{mt5_login}'" />
+          </div>
+          <div v-if="formMode === 'create'">
+            <FormLabel field-id="node-mt5-login" text="MT5 账户登录号" :help="NODE_FORM_FIELD_HELP.mt5_login" />
+            <input id="node-mt5-login" v-model.number="form.mt5_login" type="number" step="1" min="1" placeholder="例如：60108484" />
+          </div>
+          <div v-else>
+            <FormLabel field-id="node-mt5-login-readonly" text="MT5 账户登录号" :help="NODE_FORM_FIELD_HELP.mt5_login" />
+            <input id="node-mt5-login-readonly" :value="form.mt5_login ?? ''" type="number" disabled />
+            <p class="muted" style="font-size: 12px; margin: 6px 0 0">创建后不可修改</p>
+          </div>
+          <div v-if="formMode === 'edit'">
+            <FormLabel field-id="node-enabled" text="启用状态" :help="NODE_FORM_FIELD_HELP.enabled" />
+            <select id="node-enabled" v-model="form.enabled"><option :value="true">启用</option><option :value="false">禁用</option></select>
+          </div>
+          <div class="span-full">
+            <FormLabel text="按币种配置" :help="NODE_FORM_FIELD_HELP.filters" />
+            <div class="node-filter-scroll">
+              <FilterRulesEditor v-model="form.filters" mode="node" />
+            </div>
+          </div>
+          <div v-if="createError" class="span-full" style="color: var(--red); font-size: 13px">{{ createError }}</div>
         </div>
-        <div v-if="formMode === 'create'">
-          <FormLabel field-id="node-mt5-login" text="MT5 账户登录号" :help="NODE_FORM_FIELD_HELP.mt5_login" />
-          <input id="node-mt5-login" v-model.number="form.mt5_login" type="number" step="1" min="1" placeholder="例如：60108484" />
-        </div>
-        <div v-else>
-          <FormLabel field-id="node-mt5-login-readonly" text="MT5 账户登录号" :help="NODE_FORM_FIELD_HELP.mt5_login" />
-          <input id="node-mt5-login-readonly" :value="form.mt5_login ?? ''" type="number" disabled />
-          <p class="muted" style="font-size: 12px; margin: 6px 0 0">创建后不可修改</p>
-        </div>
-        <div class="span-full">
-          <FormLabel text="按币种配置" :help="NODE_FORM_FIELD_HELP.filters" />
-          <FilterRulesEditor v-model="form.filters" mode="node" />
-        </div>
-        <div v-if="formMode === 'edit'">
-          <FormLabel field-id="node-enabled" text="启用状态" :help="NODE_FORM_FIELD_HELP.enabled" />
-          <select id="node-enabled" v-model="form.enabled"><option :value="true">启用</option><option :value="false">禁用</option></select>
-        </div>
-        <div v-if="createError" style="color: var(--red); font-size: 13px">{{ createError }}</div>
-        <div class="row between" style="margin-top: 6px">
-          <button class="btn-ghost" @click="showForm = false">取消</button>
-          <button
-            class="btn-primary"
-            :disabled="saving || (formMode === 'create' && !form.mt5_login)"
-            @click="save"
-          >{{ saving ? '保存中…' : '保存' }}</button>
-        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-ghost" @click="showForm = false">取消</button>
+        <button
+          class="btn-primary"
+          :disabled="saving || (formMode === 'create' && !form.mt5_login)"
+          @click="save"
+        >{{ saving ? '保存中…' : '保存' }}</button>
       </div>
     </div>
   </div>
 </template>
+
+<style scoped>
+/* 币种配置区随弹窗 body 滚动；桌面仍可限高，手机交给 modal-body */
+.node-filter-scroll {
+  margin-top: 4px;
+}
+@media (min-width: 769px) {
+  .node-filter-scroll {
+    max-height: clamp(260px, 45vh, 480px);
+    overflow-y: auto;
+  }
+}
+@media (max-width: 768px) {
+  .node-form-modal {
+    width: 100%;
+    max-width: 100%;
+    max-height: calc(100dvh - 24px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+    border-radius: 16px;
+  }
+  .node-filter-scroll {
+    max-height: none;
+    overflow: visible;
+  }
+  .modal-footer .btn-ghost,
+  .modal-footer .btn-primary {
+    flex: 1;
+    min-height: 44px;
+  }
+}
+</style>

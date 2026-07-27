@@ -19,6 +19,18 @@ def base_symbol(s: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", (s or "").upper())
 
 
+def filter_watch_symbols(filters_cfg: dict | None) -> list[str]:
+    """从中控台全局 filters 提取需节点上报报价的品种代码（大写、去重、排序）。"""
+    out: set[str] = set()
+    for sym, rule in (filters_cfg or {}).items():
+        if not isinstance(rule, dict):
+            continue
+        key = str(sym).strip().upper()
+        if key:
+            out.add(key)
+    return sorted(out)
+
+
 def symbol_match(a: str, b: str) -> bool:
     """判断两个品种是否“同一品种”，兼容券商后缀差异。"""
     ba, bb = base_symbol(a), base_symbol(b)
@@ -50,15 +62,19 @@ def node_symbol_not_configured_reason(symbol: str) -> str:
     return f"节点未配置：{sym}未在节点按币种配置中，拒收"
 
 
-def resolve_volume(node: dict, signal_volume: float, global_lot: dict, symbol: str) -> float:
+def resolve_volume(node: dict, signal_volume: float, global_filters: dict, symbol: str) -> float:
     """9.4——按节点该品种的手数策略决定实际手数，并以 MAX_LOT_SIZE 封顶。"""
     sf = _node_symbol_rule(node, symbol)
     mode = (sf.get("lot_mode") if sf else None) or node.get("lot_mode", "global")
     fixed_lot = sf.get("lot") if sf and sf.get("lot") is not None else node.get("lot")
     if mode == "fixed" and fixed_lot is not None:
         vol = float(fixed_lot)
-    elif mode == "global" and global_lot.get("enabled"):
-        vol = float(global_lot.get("value", Config.DEFAULT_LOT))
+    elif mode == "global":
+        gf = _lookup_symbol_config(global_filters or {}, symbol)
+        if gf and gf.get("lot_enabled"):
+            vol = float(gf.get("lot", Config.DEFAULT_LOT))
+        else:
+            vol = float(signal_volume)
     else:
         vol = float(signal_volume)
     return min(max(vol, 0.0), Config.MAX_LOT_SIZE)
@@ -125,12 +141,15 @@ def resolve_dispatch_config(
 ) -> tuple[Optional[str], Optional[str], Optional[str]]:
     """按币种解析分发模式与持仓判定范围。
 
-    返回 (mode, scope, reject_reason)。reject_reason 非空时表示该品种未在中控台配置，应拒收信号。
+    返回 (mode, scope, reject_reason)。reject_reason 非空时表示应拒收信号
+   （未登记，或中控台已取消「启用」——含开仓与 Webhook 平仓；手动平仓不受影响）。
     """
     sf = _lookup_symbol_config(global_filters or {}, symbol)
+    sym = base_symbol(symbol) or symbol
     if not sf:
-        sym = base_symbol(symbol) or symbol
         return None, None, f"品种未配置：{sym}未在中控台配置，信号拒收"
+    if sf.get("enabled", True) is False:
+        return None, None, f"品种已禁用：{sym}在中控台未启用，信号拒收"
     mode = sf.get("dispatch_mode", settings.dispatch_mode)
     scope = sf.get("position_scope", settings.position_scope)
     if mode not in ("sync", "poll"):
@@ -228,8 +247,9 @@ def interval_filter(
     """9.2——多区间方向过滤，返回 (是否放行, 拦截原因)。CLOSE 不过滤。
 
     逻辑：
-    - 该品种未配置或被禁用 -> 放行；
-    - 无可用价格 -> 放行（避免在拿不到价时误拦截）；
+    - 该品种未配置 -> 放行（准入拒收由 resolve_dispatch_config 负责；
+      中控台取消「启用」亦在该处拒收，含 CLOSE）；
+    - 无可用价格 -> 拦截（避免拿不到价时绕过区间方向过滤误开仓）；
     - 命中某区间：方向在该区间 allow 列表内则放行，否则拦截；
     - 不在任何区间：按 default_action（block 拦截 / pass 放行）。
 
@@ -240,14 +260,18 @@ def interval_filter(
     if action not in ("BUY", "SELL"):
         return True, None
     sf = _lookup_symbol_config(filters_cfg, symbol)
-    if not sf or not sf.get("enabled"):
+    if not sf:
         return True, None
     if action == "BUY" and sf.get("allow_buy", True) is False:
         return False, f"方向总开关：该品种已禁止接收做多(BUY)信号"
     if action == "SELL" and sf.get("allow_sell", True) is False:
         return False, f"方向总开关：该品种已禁止接收做空(SELL)信号"
     if price is None:
-        return True, None
+        sym = base_symbol(symbol) or symbol
+        return False, (
+            f"区间方向过滤：{sym}无可用价格（节点未上报报价且无持仓价），"
+            f"无法判定区间，{action}被拦截"
+        )
     for iv in sf.get("intervals", []):
         if float(iv["low"]) <= price <= float(iv["high"]):
             allow = [a.upper() for a in iv.get("allow", [])]
@@ -263,3 +287,62 @@ def interval_filter(
     if sf.get("default_action", "block") == "pass":
         return True, None
     return False, f"区间默认过滤：价格{_fmt_num(price)}不在任何配置区间内，默认动作拦截(block)"
+
+
+def validate_node_global_lot_mode(node_filters: dict, global_filters: dict) -> Optional[str]:
+    """节点 filters 中 lot_mode=global 时，中控台对应品种须已启用全局手数。"""
+    if not node_filters or not isinstance(node_filters, dict):
+        return None
+    for sym, rule in node_filters.items():
+        if not isinstance(rule, dict) or rule.get("lot_mode") != "global":
+            continue
+        key = base_symbol(str(sym)) or str(sym).strip().upper()
+        if not key:
+            continue
+        gf = _lookup_symbol_config(global_filters or {}, key)
+        if not gf or not gf.get("lot_enabled"):
+            return (
+                f"{key}：手数策略为「跟随中控台」，但中控台该品种未启用全局手数，无法保存"
+            )
+    return None
+
+
+def nodes_following_global_lot(nodes: list[dict], symbol: str) -> list[str]:
+    """返回将该品种手数策略设为「跟随中控台」(lot_mode=global) 的节点名称列表。"""
+    key = base_symbol(symbol) or (symbol or "").strip().upper()
+    if not key:
+        return []
+    names: list[str] = []
+    for n in nodes or []:
+        nf = n.get("filters") or {}
+        if not isinstance(nf, dict):
+            continue
+        sf = _lookup_symbol_config(nf, key)
+        if sf and sf.get("lot_mode") == "global":
+            names.append(str(n.get("name") or n.get("node_id") or "?"))
+    return names
+
+
+def validate_disable_global_lot(global_filters: dict, nodes: list[dict]) -> Optional[str]:
+    """中控台关闭某品种全局手数时，不得仍有节点将该品种手数策略设为跟随中控台。"""
+    if not global_filters or not isinstance(global_filters, dict):
+        return None
+    for sym, rule in global_filters.items():
+        if not isinstance(rule, dict) or rule.get("lot_enabled"):
+            continue
+        key = base_symbol(str(sym)) or str(sym).strip().upper()
+        if not key:
+            continue
+        dependents = nodes_following_global_lot(nodes, key)
+        if not dependents:
+            continue
+        shown = "、".join(dependents[:5])
+        suffix = (
+            f"（{shown} 等共 {len(dependents)} 个节点）"
+            if len(dependents) > 5
+            else f"（{shown}）"
+        )
+        return (
+            f"{key}：以下节点手数策略为「跟随中控台」，无法关闭全局手数{suffix}"
+        )
+    return None

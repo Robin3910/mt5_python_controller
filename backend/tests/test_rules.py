@@ -8,27 +8,29 @@ SYMBOL = "EURUSD"
 # ----------------------------- lot -----------------------------
 def test_resolve_volume_global_enabled():
     node = {"filters": {SYMBOL: {"lot_mode": "global"}}}
-    assert rules.resolve_volume(node, 0.5, {"enabled": True, "value": 0.2}, SYMBOL) == 0.2
+    filters = {SYMBOL: {"lot_enabled": True, "lot": 0.2}}
+    assert rules.resolve_volume(node, 0.5, filters, SYMBOL) == 0.2
 
 
 def test_resolve_volume_global_disabled_uses_signal():
     node = {"filters": {SYMBOL: {"lot_mode": "global"}}}
-    assert rules.resolve_volume(node, 0.5, {"enabled": False, "value": 0.2}, SYMBOL) == 0.5
+    filters = {SYMBOL: {"lot_enabled": False, "lot": 0.2}}
+    assert rules.resolve_volume(node, 0.5, filters, SYMBOL) == 0.5
 
 
 def test_resolve_volume_fixed():
     node = {"filters": {SYMBOL: {"lot_mode": "fixed", "lot": 0.3}}}
-    assert rules.resolve_volume(node, 0.5, {"enabled": True, "value": 0.2}, SYMBOL) == 0.3
+    assert rules.resolve_volume(node, 0.5, {}, SYMBOL) == 0.3
 
 
 def test_resolve_volume_signal_mode():
     node = {"filters": {SYMBOL: {"lot_mode": "signal"}}}
-    assert rules.resolve_volume(node, 0.42, {"enabled": True, "value": 0.2}, SYMBOL) == 0.42
+    assert rules.resolve_volume(node, 0.42, {SYMBOL: {"lot_enabled": True, "lot": 0.2}}, SYMBOL) == 0.42
 
 
 def test_resolve_volume_capped():
     node = {"filters": {SYMBOL: {"lot_mode": "signal"}}}
-    assert rules.resolve_volume(node, 99, {"enabled": False}, SYMBOL) == 1.0  # MAX_LOT_SIZE
+    assert rules.resolve_volume(node, 99, {}, SYMBOL) == 1.0  # MAX_LOT_SIZE
 
 
 def test_node_has_symbol_config():
@@ -48,7 +50,7 @@ def test_node_symbol_not_configured_reason():
 
 def test_resolve_volume_fallback_node_defaults():
     node = {"lot_mode": "fixed", "lot": 0.08}
-    assert rules.resolve_volume(node, 0.5, {"enabled": True, "value": 0.2}, SYMBOL) == 0.08
+    assert rules.resolve_volume(node, 0.5, {}, SYMBOL) == 0.08
 
 
 def test_node_poll_order_per_symbol():
@@ -133,15 +135,48 @@ def test_interval_default_pass_outside_range():
     assert ok is True
 
 
-def test_interval_disabled_passes():
-    cfg = {"EURUSD": {"enabled": False, "intervals": []}}
-    ok, _ = rules.interval_filter("SELL", "EURUSD", 1.07, cfg)
+def test_interval_no_config_passes():
+    ok, _ = rules.interval_filter("SELL", "EURUSD", 1.07, {})
     assert ok is True
 
 
-def test_interval_no_price_passes():
-    ok, _ = rules.interval_filter("SELL", "EURUSD", None, FILTERS)
-    assert ok is True
+def test_resolve_dispatch_rejects_unconfigured():
+    mode, scope, reason = rules.resolve_dispatch_config("GBPUSD", {})
+    assert mode is None and scope is None
+    assert reason is not None and "未配置" in reason
+
+
+def test_resolve_dispatch_rejects_disabled():
+    cfg = {"EURUSD": {"enabled": False, "dispatch_mode": "sync", "position_scope": "symbol"}}
+    mode, scope, reason = rules.resolve_dispatch_config("EURUSD", cfg)
+    assert mode is None and scope is None
+    assert reason is not None and "已禁用" in reason
+
+
+def test_resolve_dispatch_ok_when_enabled():
+    cfg = {"EURUSD": {"enabled": True, "dispatch_mode": "poll", "position_scope": "account"}}
+    mode, scope, reason = rules.resolve_dispatch_config("EURUSD", cfg)
+    assert mode == "poll" and scope == "account" and reason is None
+
+
+def test_interval_no_price_blocks():
+    """无可用参考价时拦截，避免绕过区间方向过滤误开仓。"""
+    ok, reason = rules.interval_filter("SELL", "EURUSD", None, FILTERS)
+    assert ok is False
+    assert reason is not None and "无可用价格" in reason
+    assert "EURUSD" in reason
+
+
+def test_filter_watch_symbols():
+    cfg = {
+        "btcust": {"enabled": True, "intervals": []},
+        "XAUUSD": {"enabled": True, "intervals": []},
+        "": {"enabled": True},
+        "skip": "not-a-dict",
+    }
+    assert rules.filter_watch_symbols(cfg) == ["BTCUST", "XAUUSD"]
+    assert rules.filter_watch_symbols({}) == []
+    assert rules.filter_watch_symbols(None) == []
 
 
 def test_interval_master_switch_blocks_buy():
@@ -180,3 +215,39 @@ def test_interval_master_switch_defaults_open():
     assert ok is True
     ok, _ = rules.interval_filter("SELL", "EURUSD", 1.07, cfg)
     assert ok is True
+
+
+def test_validate_node_global_lot_mode_requires_console_lot():
+    global_filters = {"EURUSD": {"lot_enabled": False, "lot": 0.1}}
+    node_filters = {"EURUSD": {"lot_mode": "global"}}
+    err = rules.validate_node_global_lot_mode(node_filters, global_filters)
+    assert err is not None and "EURUSD" in err and "未启用全局手数" in err
+
+
+def test_validate_node_global_lot_mode_passes_when_enabled():
+    global_filters = {"EURUSD": {"lot_enabled": True, "lot": 0.1}}
+    node_filters = {"EURUSD": {"lot_mode": "global"}}
+    assert rules.validate_node_global_lot_mode(node_filters, global_filters) is None
+
+
+def test_validate_disable_global_lot_blocks_when_nodes_follow():
+    global_filters = {"EURUSD": {"lot_enabled": False, "lot": 0.1}}
+    nodes = [
+        {"node_id": "nd_a", "name": "Alpha", "filters": {"EURUSD": {"lot_mode": "global"}}},
+        {"node_id": "nd_b", "name": "Beta", "filters": {"EURUSD": {"lot_mode": "fixed"}}},
+    ]
+    err = rules.validate_disable_global_lot(global_filters, nodes)
+    assert err is not None and "EURUSD" in err and "跟随中控台" in err and "Alpha" in err
+
+
+def test_validate_disable_global_lot_passes_when_enabled_or_no_followers():
+    nodes = [
+        {"node_id": "nd_a", "name": "Alpha", "filters": {"EURUSD": {"lot_mode": "global"}}},
+    ]
+    assert rules.validate_disable_global_lot(
+        {"EURUSD": {"lot_enabled": True, "lot": 0.1}}, nodes,
+    ) is None
+    assert rules.validate_disable_global_lot(
+        {"EURUSD": {"lot_enabled": False, "lot": 0.1}},
+        [{"node_id": "nd_b", "name": "Beta", "filters": {"EURUSD": {"lot_mode": "fixed"}}}],
+    ) is None

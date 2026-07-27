@@ -79,7 +79,7 @@ class User(Base):
 
 
 class AuditLog(Base):
-    """操作审计：谁、在何时、对什么、做了什么、结果如何。"""
+    """操作审计：谁、在何时、对什么、做了什么、结果如何；可附带操作前后数据。"""
     __tablename__ = "audit_log"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -90,6 +90,10 @@ class AuditLog(Base):
     params_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     result: Mapped[str] = mapped_column(String(16))
     ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
+    # console（中控台）/ node（节点）/ system（其它）
+    category: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    before_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # 操作前数据
+    after_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)   # 操作后数据
 
 
 class SignalHistory(Base):
@@ -109,6 +113,8 @@ class SignalHistory(Base):
     parsed_ok: Mapped[bool] = mapped_column(Boolean, default=False)
     dispatch_mode: Mapped[str | None] = mapped_column(String(8), nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="pending")
+    # 信号来源：tradingview（外部 Webhook）/ manual（中控台手动触发）；历史为空按 tradingview 展示
+    source: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
 
 class SignalDispatch(Base):

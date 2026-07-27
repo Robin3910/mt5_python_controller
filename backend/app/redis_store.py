@@ -19,7 +19,6 @@ K_NODE_BY_LOGIN = "node:by_login:{}"  # mt5_login -> node_id（用于 WS 握手�
 K_NODES = "nodes"                # 所有 node_id 的集合
 K_ONLINE = "node:online:{}"      # 在线标记（带 TTL）
 K_ACCOUNT = "node:account:{}"    # 账户快照（JSON）
-K_LOT_GLOBAL = "config:lot:global"   # 全局手数配置
 K_FILTERS = "config:filters"     # 多区间方向过滤配置
 K_NODE_TOKEN = "config:node_token"   # 全局节点接入令牌（明文）
 K_DEDUP = "dedup:{}"             # 信号去重指纹（带 TTL）
@@ -109,13 +108,6 @@ class RedisStore:
         return json.loads(raw) if raw else None
 
     # ----------------- 运行期配置 -----------------
-    async def get_lot_global(self) -> dict:
-        raw = await self.r.get(K_LOT_GLOBAL)
-        return json.loads(raw) if raw else {"enabled": False, "value": 0.1}
-
-    async def set_lot_global(self, cfg: dict) -> None:
-        await self.r.set(K_LOT_GLOBAL, json.dumps(cfg))
-
     async def get_filters(self) -> dict:
         raw = await self.r.get(K_FILTERS)
         return json.loads(raw) if raw else {}

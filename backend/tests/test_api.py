@@ -130,6 +130,8 @@ def test_full_flow(client):
         ack = ws.receive_json()
         assert ack["type"] == "auth_ok"
         assert ack["data"]["node_id"] == node_id
+        assert "watch_symbols" in ack["data"]
+        assert isinstance(ack["data"]["watch_symbols"], list)
 
         ws.send_json(
             {
@@ -143,6 +145,10 @@ def test_full_flow(client):
         )
 
         seed_default_filters(client)
+        # 保存 filters 后应向在线节点推送 watch_symbols
+        pushed = ws.receive_json()
+        assert pushed["type"] == "watch_symbols"
+        assert "EURUSD" in pushed["data"]["symbols"]
 
         # webhook signal -> sync dispatch -> node receives an open command
         r = client.post("/webhook", json={"action": "buy", "symbol": "EURUSD", "volume": 0.1})
@@ -202,6 +208,67 @@ def test_duplicate_node_login_rejected(client):
         assert "pong" in types
 
 
+def test_hello_login_mismatch_disconnects(client):
+    """hello 上报的终端账号与节点绑定账号不符时断开连接。"""
+    h = _auth(client)
+    token = _node_token(client, h)
+    r = client.post("/api/nodes", json={"name": "mm", "mt5_login": 6101}, headers=h)
+    assert r.status_code == 201, r.text
+
+    with client.websocket_connect("/ws/node") as ws:
+        ws.send_json({"type": "auth", "data": {"token": token, "mt5_login": 6101}})
+        assert ws.receive_json()["type"] == "auth_ok"
+
+        ws.send_json({"type": "hello", "data": {"login": 9999, "server": "Demo"}})
+        msg = ws.receive_json()
+        assert msg["type"] == "auth_fail"
+        assert msg["data"]["reason"] == "mt5_login_mismatch"
+
+
+def test_account_login_mismatch_disconnects(client):
+    """账户快照中的 login 与节点绑定不符时断开；空 login / 一致 login 不误杀。"""
+    h = _auth(client)
+    token = _node_token(client, h)
+    r = client.post("/api/nodes", json={"name": "mm2", "mt5_login": 6102}, headers=h)
+    assert r.status_code == 201, r.text
+
+    with client.websocket_connect("/ws/node") as ws:
+        ws.send_json({"type": "auth", "data": {"token": token, "mt5_login": 6102}})
+        assert ws.receive_json()["type"] == "auth_ok"
+
+        # 空 login：放行
+        ws.send_json({"type": "account", "data": {"account": {}, "positions": []}})
+        ws.send_json({"type": "heartbeat", "data": {}})
+        types = set()
+        for _ in range(3):
+            types.add(ws.receive_json()["type"])
+            if "pong" in types:
+                break
+        assert "pong" in types
+
+        # 一致 login：放行
+        ws.send_json({
+            "type": "account",
+            "data": {"account": {"login": 6102, "balance": 100}, "positions": []},
+        })
+        ws.send_json({"type": "heartbeat", "data": {}})
+        types = set()
+        for _ in range(3):
+            types.add(ws.receive_json()["type"])
+            if "pong" in types:
+                break
+        assert "pong" in types
+
+        # 漂移：拒绝
+        ws.send_json({
+            "type": "account",
+            "data": {"account": {"login": 8888, "balance": 100}, "positions": []},
+        })
+        msg = ws.receive_json()
+        assert msg["type"] == "auth_fail"
+        assert msg["data"]["reason"] == "mt5_login_mismatch"
+
+
 def test_invalid_global_token_rejected(client):
     """非法全局令牌：直接拒绝，不暴露节点是否存在。"""
     with client.websocket_connect("/ws/node") as ws:
@@ -244,7 +311,7 @@ def test_default_node_filters_from_global():
 
 
 def test_auto_register_on_first_login(client):
-    """node_client 用未注册的 mt5_login 登录时，后端按默认配置自动入库。"""
+    """node_client 用未注册的 mt5_login 登录时，后端按默认配置自动入库（默认禁用）。"""
     h = seed_default_filters(client)
     token = _node_token(client, h)
 
@@ -255,15 +322,15 @@ def test_auto_register_on_first_login(client):
     with client.websocket_connect("/ws/node") as ws:
         ws.send_json({"type": "auth", "data": {"token": token, "mt5_login": 8001}})
         ack = ws.receive_json()
-        assert ack["type"] == "auth_ok"
-        new_node_id = ack["data"]["node_id"]
+        # 自动注册默认 enabled=false，入库后本轮鉴权仍拒绝接入
+        assert ack["type"] == "auth_fail"
+        assert ack["data"]["reason"] == "disabled"
 
     # 自动注册的节点应使用默认配置，并按中控台已有品种生成按币种配置
     r = client.get("/api/nodes", headers=h)
     created = next(n for n in r.json() if n["mt5_login"] == 8001)
-    assert created["node_id"] == new_node_id
     assert created["name"] == "node-8001"
-    assert created["enabled"] is True
+    assert created["enabled"] is False
     filters = created.get("filters") or {}
     assert set(filters.keys()) == {"EURUSD", "XAUUSD", "GBPUSD"}
     for sym in filters.values():
@@ -292,6 +359,115 @@ def test_create_node_duplicate_mt5_login_returns_409(client):
     assert "9001" in r2.json()["detail"]
 
 
+def test_list_nodes_search_by_name_and_mt5_login(client):
+    h = _auth(client)
+    client.post("/api/nodes", json={"name": "Alpha VPS", "mt5_login": 60108484}, headers=h)
+    client.post("/api/nodes", json={"name": "Beta Server", "mt5_login": 70001234}, headers=h)
+
+    by_name = client.get("/api/nodes", params={"q": "alpha"}, headers=h)
+    assert by_name.status_code == 200
+    assert len(by_name.json()) == 1
+    assert by_name.json()[0]["name"] == "Alpha VPS"
+
+    by_login = client.get("/api/nodes", params={"q": "1234"}, headers=h)
+    assert by_login.status_code == 200
+    assert len(by_login.json()) == 1
+    assert by_login.json()[0]["mt5_login"] == 70001234
+
+    empty = client.get("/api/nodes", params={"q": "missing-node"}, headers=h)
+    assert empty.status_code == 200
+    assert empty.json() == []
+
+
+def test_create_node_global_lot_requires_console_lot_enabled(client):
+    h = _auth(client)
+    client.put(
+        "/api/config/filters",
+        json={
+            "EURUSD": {
+                "enabled": True,
+                "allow_buy": True,
+                "allow_sell": True,
+                "dispatch_mode": "sync",
+                "position_scope": "symbol",
+                "default_action": "pass",
+                "lot_enabled": False,
+                "lot": 0.01,
+                "intervals": [],
+            }
+        },
+        headers=h,
+    )
+    r = client.post(
+        "/api/nodes",
+        json={
+            "name": "bad-lot",
+            "mt5_login": 91001,
+            "filters": {"EURUSD": {"lot_mode": "global", "follow_sync": True, "follow_poll": True}},
+        },
+        headers=h,
+    )
+    assert r.status_code == 400
+    assert "未启用全局手数" in r.json()["detail"]
+
+
+def test_disable_console_global_lot_blocked_when_node_follows(client):
+    """中控台关闭全局手数时，若有节点仍跟随中控台则拒收。"""
+    h = _auth(client)
+    # 先启用全局手数，再创建跟随节点
+    client.put(
+        "/api/config/filters",
+        json={
+            "EURUSD": {
+                "enabled": True,
+                "allow_buy": True,
+                "allow_sell": True,
+                "dispatch_mode": "sync",
+                "position_scope": "symbol",
+                "default_action": "pass",
+                "lot_enabled": True,
+                "lot": 0.01,
+                "intervals": [],
+            }
+        },
+        headers=h,
+    )
+    created = client.post(
+        "/api/nodes",
+        json={
+            "name": "follow-lot",
+            "mt5_login": 91002,
+            "filters": {"EURUSD": {"lot_mode": "global", "follow_sync": True, "follow_poll": True}},
+        },
+        headers=h,
+    )
+    assert created.status_code in (200, 201), created.text
+
+    # 尝试关闭全局手数 → 应被拒
+    r = client.put(
+        "/api/config/filters",
+        json={
+            "EURUSD": {
+                "enabled": True,
+                "allow_buy": True,
+                "allow_sell": True,
+                "dispatch_mode": "sync",
+                "position_scope": "symbol",
+                "default_action": "pass",
+                "lot_enabled": False,
+                "lot": 0.01,
+                "intervals": [],
+            }
+        },
+        headers=h,
+    )
+    assert r.status_code == 400
+    detail = r.json()["detail"]
+    assert "跟随中控台" in detail
+    assert "无法关闭全局手数" in detail
+    assert "follow-lot" in detail
+
+
 def test_node_token_rotate(client):
     """重置令牌后，旧令牌应失效，新令牌可用。"""
     h = _auth(client)
@@ -307,10 +483,14 @@ def test_node_token_rotate(client):
         ws.send_json({"type": "auth", "data": {"token": old_token, "mt5_login": 10001}})
         assert ws.receive_json()["data"]["reason"] == "invalid_token"
 
-    # 新令牌可正常接入并触发自动注册
+    # 新令牌可通过鉴权并触发自动注册（默认禁用，故本轮仍为 auth_fail/disabled）
     with client.websocket_connect("/ws/node") as ws:
         ws.send_json({"type": "auth", "data": {"token": new_token, "mt5_login": 10001}})
-        assert ws.receive_json()["type"] == "auth_ok"
+        ack = ws.receive_json()
+        assert ack["type"] == "auth_fail"
+        assert ack["data"]["reason"] == "disabled"
+    nodes = client.get("/api/nodes", headers=h).json()
+    assert any(n["mt5_login"] == 10001 and n["enabled"] is False for n in nodes)
 
 
 def test_webhook_duplicate_suppressed(client):

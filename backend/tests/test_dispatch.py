@@ -24,6 +24,7 @@ def patch_side_effects(monkeypatch):
     monkeypatch.setattr(persist, "record_signal", noop)
     monkeypatch.setattr(persist, "record_dispatch", noop)
     monkeypatch.setattr(persist, "update_dispatch_result", noop)
+    monkeypatch.setattr(persist, "update_signal_status", noop)
     monkeypatch.setattr(persist, "audit", noop)
     monkeypatch.setattr(manager, "broadcast_admin", noop)
     manager.nodes.clear()
@@ -70,10 +71,14 @@ async def set_symbol_filters(store, symbol, *, mode="sync", scope="symbol"):
     )
 
 
+# 开仓信号会走区间过滤，无可用价格会被拦截；测试账户默认给 EURUSD 报价。
+_DEFAULT_PRICES = {"EURUSD": 1.1000}
+
+
 async def _online(store, *nodes):
     for n in nodes:
         await store.cache_node(n)
-        await store.save_account(n["node_id"], {"positions": [], "prices": {}})
+        await store.save_account(n["node_id"], {"positions": [], "prices": dict(_DEFAULT_PRICES)})
         manager.nodes[n["node_id"]] = object()
 
 
@@ -118,7 +123,9 @@ async def test_node_symbol_follow_sync_excludes_node(store, monkeypatch):
 
 async def test_position_gate_skips_node_with_position(store, monkeypatch):
     await _online(store, mk_node("nd_a"))
-    await store.save_account("nd_a", {"positions": [{"symbol": "EURUSD"}], "prices": {}})
+    await store.save_account(
+        "nd_a", {"positions": [{"symbol": "EURUSD"}], "prices": dict(_DEFAULT_PRICES)},
+    )
     await set_symbol_filters(store, "EURUSD", mode="sync")
     sent = []
 
@@ -138,8 +145,21 @@ async def test_global_lot_overrides_volume(store, monkeypatch):
         store,
         mk_node("nd_a", filters={"EURUSD": {"lot_mode": "global"}}),
     )
-    await set_symbol_filters(store, "EURUSD", mode="sync")
-    await store.set_lot_global({"enabled": True, "value": 0.25})
+    await store.set_filters(
+        {
+            "EURUSD": {
+                "enabled": True,
+                "allow_buy": True,
+                "allow_sell": True,
+                "dispatch_mode": "sync",
+                "position_scope": "symbol",
+                "default_action": "pass",
+                "lot_enabled": True,
+                "lot": 0.25,
+                "intervals": [],
+            }
+        }
+    )
     sent = []
 
     async def fake_send(node_id, msg):
@@ -215,7 +235,9 @@ async def test_poll_rotation_falls_through_filtered_head(store, monkeypatch):
     """队首节点被持仓过滤跳过时顺延给下一个节点；只有真正成交的节点移到队尾。"""
     await _online(store, mk_node("nd_a", poll_order=0), mk_node("nd_b", poll_order=1))
     # a 已持有同品种仓位 → 9.3 持仓过滤跳过 a
-    await store.save_account("nd_a", {"positions": [{"symbol": "EURUSD"}], "prices": {}})
+    await store.save_account(
+        "nd_a", {"positions": [{"symbol": "EURUSD"}], "prices": dict(_DEFAULT_PRICES)},
+    )
     await set_symbol_filters(store, "EURUSD", mode="poll", scope="symbol")
     sent = []
     monkeypatch.setattr(manager, "send_to_node", _ack_open_sender(sent))
@@ -326,3 +348,37 @@ async def test_unconfigured_symbol_rejected(store):
     res = await d.dispatch(TradingSignal(action="BUY", symbol="GBPUSD", volume=0.1), "sigx")
     assert res["mode"] == "rejected"
     assert "未配置" in (res.get("reason") or "")
+
+
+async def test_disabled_symbol_rejected_including_close(store, monkeypatch):
+    await store.set_filters(
+        {
+            "EURUSD": {
+                "enabled": False,
+                "allow_buy": True,
+                "allow_sell": True,
+                "dispatch_mode": "sync",
+                "position_scope": "symbol",
+                "default_action": "pass",
+                "intervals": [],
+            }
+        }
+    )
+    sent = []
+
+    async def fake_send(node_id, msg):
+        sent.append((node_id, msg))
+        return True
+
+    monkeypatch.setattr(manager, "send_to_node", fake_send)
+    await _online(store, mk_node("nd_a"))
+
+    d = Dispatcher(store)
+    buy = await d.dispatch(TradingSignal(action="BUY", symbol="EURUSD", volume=0.1), "sig_dis_buy")
+    assert buy["mode"] == "rejected"
+    assert "已禁用" in (buy.get("reason") or "")
+
+    close = await d.dispatch(TradingSignal(action="CLOSE", symbol="EURUSD", volume=0.1), "sig_dis_close")
+    assert close["mode"] == "rejected"
+    assert "已禁用" in (close.get("reason") or "")
+    assert sent == []
