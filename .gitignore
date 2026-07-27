@@ -17,7 +17,7 @@ node_client/build/
 node_client/__pycache__/
 
 docs/
-
+AGENTS.md
 
 # TLS certs (keep the dir via .gitkeep, never commit key material)
 deploy/nginx/certs/*.pem
