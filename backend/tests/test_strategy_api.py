@@ -52,11 +52,21 @@ def test_list_templates_contains_template_1(client):
     assert len(tpl["rules"]) == 2
     types = {rule["type"] for rule in tpl["rules"]}
     assert types == {1, 2}  # 逆势 + 顺势
-    for rule in tpl["rules"]:
-        assert rule["status"] == 1
-        assert rule["action"] == "all"
-        assert rule["lot_times"] == 1
-        assert rule["extra_lot"] == 0
+    by_type = {rule["type"]: rule for rule in tpl["rules"]}
+    assert by_type[1]["status"] == 1
+    assert by_type[1]["action"] == "all"
+    assert by_type[1]["lot_times"] == 1.1
+    assert by_type[1]["extra_lot"] == 0
+    assert by_type[1]["max_allow_num"] == 3
+    assert by_type[1]["batch_enabled"] is True
+    assert by_type[1]["batch_count"] == 3
+    assert by_type[1]["total_lot_limit"] == 10
+    assert len(by_type[1]["batch_levels"]) == 3
+    assert by_type[2]["status"] == 1
+    assert by_type[2]["action"] == "all"
+    assert by_type[2]["lot_times"] == 1
+    assert by_type[2]["extra_lot"] == 0
+    assert by_type[2]["batch_enabled"] is False
 
 
 def test_create_strategy_from_template(client):

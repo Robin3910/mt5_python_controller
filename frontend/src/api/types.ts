@@ -183,7 +183,18 @@ export interface GroupUpdatePayload {
   node_ids?: string[]
 }
 
-/** 策略加仓规则：1=逆势加仓，2=顺势加仓 */
+/** 分批加仓档位：持仓笔数区间内的点数 / 倍数 */
+export interface StrategyBatchLevel {
+  pos_from: number
+  pos_to: number
+  /** point=点数 */
+  calc_type: string
+  point: number
+  lot_times: number
+  extra_lot: number
+}
+
+/** 策略加仓规则：1=逆势加仓，2=顺势加仓（与后端独立模型字段对齐） */
 export interface StrategyRule {
   type: number
   /** 0=关闭，1=启用 */
@@ -194,6 +205,13 @@ export interface StrategyRule {
   lot_times: number
   extra_lot: number
   max_allow_num: number
+  /** 是否启用分批加仓 */
+  batch_enabled?: boolean
+  /** 分批批数 */
+  batch_count?: number
+  /** 总手数上限，0=不限制 */
+  total_lot_limit?: number
+  batch_levels?: StrategyBatchLevel[]
 }
 
 export interface StrategyTemplateOut {

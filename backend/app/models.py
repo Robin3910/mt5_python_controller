@@ -236,8 +236,18 @@ class PaginatedGroupSignals(BaseModel):
 
 
 # ----------------------------- 策略管理 ----------------------------
+class StrategyBatchLevel(BaseModel):
+    """分批加仓档位：持仓笔数区间内的点数 / 倍数。"""
+    pos_from: int = Field(default=2, ge=0)
+    pos_to: int = Field(default=4, ge=0)
+    calc_type: str = Field(default="point", description="计算方式：point=点数")
+    point: float = Field(default=100, ge=0)
+    lot_times: float = Field(default=1.0, ge=0)
+    extra_lot: float = Field(default=0.0, ge=0)
+
+
 class StrategyRule(BaseModel):
-    """单条加仓规则（逆势 / 顺势）。"""
+    """单条加仓规则（逆势 type=1 / 顺势 type=2，结构对齐独立模型）。"""
     type: int = Field(description="1=逆势加仓，2=顺势加仓")
     status: int = Field(description="0=关闭，1=启用")
     action: str = Field(default="all", description="监控方向 all|buy|sell")
@@ -245,6 +255,10 @@ class StrategyRule(BaseModel):
     lot_times: float = Field(default=1.0, ge=0)
     extra_lot: float = Field(default=0.0, ge=0)
     max_allow_num: int = Field(default=5, ge=0)
+    batch_enabled: bool = Field(default=False, description="是否启用分批加仓")
+    batch_count: int = Field(default=0, ge=0, description="分批批数")
+    total_lot_limit: float = Field(default=0.0, ge=0, description="总手数上限，0=不限制")
+    batch_levels: list[StrategyBatchLevel] = Field(default_factory=list)
 
 
 class StrategyTemplateOut(BaseModel):

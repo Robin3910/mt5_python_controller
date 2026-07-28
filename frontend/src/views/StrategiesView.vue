@@ -90,6 +90,10 @@ function cloneRules(rules: StrategyRule[]): StrategyRule[] {
     lot_times: r.lot_times,
     extra_lot: r.extra_lot,
     max_allow_num: r.max_allow_num,
+    batch_enabled: r.batch_enabled ?? false,
+    batch_count: r.batch_count ?? 0,
+    total_lot_limit: r.total_lot_limit ?? 0,
+    batch_levels: (r.batch_levels || []).map((lv) => ({ ...lv })),
   }))
 }
 
