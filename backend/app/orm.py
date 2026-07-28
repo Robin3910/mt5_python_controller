@@ -254,7 +254,7 @@ class TradingStrategy(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     # 规则列表：逆势/顺势各一条，含可选分批档位 batch_levels
     # [{type, status, action, point, lot_times, extra_lot, max_allow_num,
-    #   batch_enabled, batch_count, total_lot_limit, batch_levels}, ...]
+    #   batch_enabled, batch_action, batch_count, total_lot_limit, batch_levels}, ...]
     config_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
     remark: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

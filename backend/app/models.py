@@ -256,6 +256,7 @@ class StrategyRule(BaseModel):
     extra_lot: float = Field(default=0.0, ge=0)
     max_allow_num: int = Field(default=5, ge=0)
     batch_enabled: bool = Field(default=False, description="是否启用分批加仓")
+    batch_action: str = Field(default="all", description="分批监控方向 all|buy|sell")
     batch_count: int = Field(default=0, ge=0, description="分批批数")
     total_lot_limit: float = Field(default=0.0, ge=0, description="总手数上限，0=不限制")
     batch_levels: list[StrategyBatchLevel] = Field(default_factory=list)

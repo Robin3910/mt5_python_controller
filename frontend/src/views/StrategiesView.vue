@@ -91,6 +91,7 @@ function cloneRules(rules: StrategyRule[]): StrategyRule[] {
     extra_lot: r.extra_lot,
     max_allow_num: r.max_allow_num,
     batch_enabled: r.batch_enabled ?? false,
+    batch_action: r.batch_action ?? 'all',
     batch_count: r.batch_count ?? 0,
     total_lot_limit: r.total_lot_limit ?? 0,
     batch_levels: (r.batch_levels || []).map((lv) => ({ ...lv })),
@@ -143,6 +144,9 @@ function validateRules(rules: StrategyRule[]): string | null {
     if (r.max_allow_num < 0) return `${label}：最大加仓次数不能为负`
     if (!['all', 'buy', 'sell'].includes(String(r.action || '').toLowerCase())) {
       return `${label}：监控方向非法`
+    }
+    if (r.batch_action != null && !['all', 'buy', 'sell'].includes(String(r.batch_action).toLowerCase())) {
+      return `${label}：分批监控方向非法`
     }
   }
   return null

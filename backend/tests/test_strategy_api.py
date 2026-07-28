@@ -59,14 +59,17 @@ def test_list_templates_contains_template_1(client):
     assert by_type[1]["extra_lot"] == 0
     assert by_type[1]["max_allow_num"] == 3
     assert by_type[1]["batch_enabled"] is True
+    assert by_type[1]["batch_action"] == "all"
     assert by_type[1]["batch_count"] == 3
     assert by_type[1]["total_lot_limit"] == 10
     assert len(by_type[1]["batch_levels"]) == 3
     assert by_type[2]["status"] == 1
     assert by_type[2]["action"] == "all"
-    assert by_type[2]["lot_times"] == 1
+    assert by_type[2]["lot_times"] == 0.8
     assert by_type[2]["extra_lot"] == 0
+    assert by_type[2]["max_allow_num"] == 10
     assert by_type[2]["batch_enabled"] is False
+    assert by_type[2]["batch_action"] == "all"
 
 
 def test_create_strategy_from_template(client):

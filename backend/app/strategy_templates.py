@@ -48,15 +48,16 @@ class BatchLevel:
 
 @dataclass
 class CounterTrendRule:
-    """逆势加仓规则（独立模型）。"""
+    """逆势加仓规则（独立模型，对齐 MTcommander「逆势」）。"""
     status: int = 1
     action: str = "all"
     point: float = 100.0
     lot_times: float = 1.1
     extra_lot: float = 0.0
     max_allow_num: int = 3
-    # 分批加仓
+    # 分批加仓（对齐「逆势分批加」）
     batch_enabled: bool = True
+    batch_action: str = "all"  # 分批独立监控方向
     batch_count: int = 3
     total_lot_limit: float = 10.0
     batch_levels: list[BatchLevel] = field(default_factory=list)
@@ -75,6 +76,7 @@ class CounterTrendRule:
             "extra_lot": self.extra_lot,
             "max_allow_num": self.max_allow_num,
             "batch_enabled": self.batch_enabled,
+            "batch_action": self.batch_action,
             "batch_count": self.batch_count,
             "total_lot_limit": self.total_lot_limit,
             "batch_levels": [lv.to_dict() for lv in self.batch_levels],
@@ -83,15 +85,16 @@ class CounterTrendRule:
 
 @dataclass
 class TrendFollowRule:
-    """顺势加仓规则（独立模型）。"""
+    """顺势加仓规则（独立模型，对齐 MTcommander「顺势」）。"""
     status: int = 1
     action: str = "all"
     point: float = 100.0
-    lot_times: float = 1.0
+    lot_times: float = 0.8
     extra_lot: float = 0.0
-    max_allow_num: int = 5
-    # 分批加仓（结构与逆势对齐，默认关闭）
+    max_allow_num: int = 10
+    # 分批加仓（结构与逆势对齐，截图未启用则默认关闭）
     batch_enabled: bool = False
+    batch_action: str = "all"
     batch_count: int = 0
     total_lot_limit: float = 0.0
     batch_levels: list[BatchLevel] = field(default_factory=list)
@@ -110,6 +113,7 @@ class TrendFollowRule:
             "extra_lot": self.extra_lot,
             "max_allow_num": self.max_allow_num,
             "batch_enabled": self.batch_enabled,
+            "batch_action": self.batch_action,
             "batch_count": self.batch_count,
             "total_lot_limit": self.total_lot_limit,
             "batch_levels": [lv.to_dict() for lv in self.batch_levels],
@@ -137,7 +141,7 @@ def _default_counter_batch_levels() -> list[BatchLevel]:
 
 
 def default_counter_rule() -> CounterTrendRule:
-    """策略模版1 · 逆势默认参数。"""
+    """策略模版1 · 逆势默认参数（对齐 MTcommander 截图）。"""
     return CounterTrendRule(
         status=1,
         action="all",
@@ -146,6 +150,7 @@ def default_counter_rule() -> CounterTrendRule:
         extra_lot=0.0,
         max_allow_num=3,
         batch_enabled=True,
+        batch_action="all",
         batch_count=3,
         total_lot_limit=10.0,
         batch_levels=_default_counter_batch_levels(),
@@ -153,15 +158,16 @@ def default_counter_rule() -> CounterTrendRule:
 
 
 def default_trend_rule() -> TrendFollowRule:
-    """策略模版1 · 顺势默认参数。"""
+    """策略模版1 · 顺势默认参数（对齐 MTcommander 截图）。"""
     return TrendFollowRule(
         status=1,
         action="all",
         point=100.0,
-        lot_times=1.0,
+        lot_times=0.8,
         extra_lot=0.0,
-        max_allow_num=5,
+        max_allow_num=10,
         batch_enabled=False,
+        batch_action="all",
         batch_count=0,
         total_lot_limit=0.0,
         batch_levels=[],
@@ -287,6 +293,10 @@ def normalize_rule(raw: dict) -> dict[str, Any]:
     if action not in RULE_ACTIONS:
         action = defaults["action"]
 
+    batch_action = str(raw.get("batch_action") or defaults.get("batch_action") or action).strip().lower()
+    if batch_action not in RULE_ACTIONS:
+        batch_action = defaults.get("batch_action") or "all"
+
     batch_enabled = bool(raw.get("batch_enabled", defaults["batch_enabled"]))
     batch_count = max(0, _as_int(raw.get("batch_count", defaults["batch_count"]), defaults["batch_count"]))
     total_lot_limit = max(
@@ -304,6 +314,7 @@ def normalize_rule(raw: dict) -> dict[str, Any]:
         "extra_lot": max(0.0, _as_float(raw.get("extra_lot", defaults["extra_lot"]), defaults["extra_lot"])),
         "max_allow_num": max(0, _as_int(raw.get("max_allow_num", defaults["max_allow_num"]), defaults["max_allow_num"])),
         "batch_enabled": batch_enabled,
+        "batch_action": batch_action,
         "batch_count": batch_count,
         "total_lot_limit": total_lot_limit,
         "batch_levels": batch_levels,
@@ -345,6 +356,7 @@ def rules_to_rule_set(rules: object) -> TemplateRuleSet:
                     extra_lot=normalized["extra_lot"],
                     max_allow_num=normalized["max_allow_num"],
                     batch_enabled=normalized["batch_enabled"],
+                    batch_action=normalized["batch_action"],
                     batch_count=normalized["batch_count"],
                     total_lot_limit=normalized["total_lot_limit"],
                     batch_levels=levels,
@@ -358,6 +370,7 @@ def rules_to_rule_set(rules: object) -> TemplateRuleSet:
                     extra_lot=normalized["extra_lot"],
                     max_allow_num=normalized["max_allow_num"],
                     batch_enabled=normalized["batch_enabled"],
+                    batch_action=normalized["batch_action"],
                     batch_count=normalized["batch_count"],
                     total_lot_limit=normalized["total_lot_limit"],
                     batch_levels=levels,

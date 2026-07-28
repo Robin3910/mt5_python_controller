@@ -207,6 +207,8 @@ export interface StrategyRule {
   max_allow_num: number
   /** 是否启用分批加仓 */
   batch_enabled?: boolean
+  /** 分批监控方向 all | buy | sell */
+  batch_action?: string
   /** 分批批数 */
   batch_count?: number
   /** 总手数上限，0=不限制 */
