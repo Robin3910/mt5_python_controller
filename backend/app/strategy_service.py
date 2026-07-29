@@ -114,6 +114,8 @@ async def update_strategy(
 
 
 async def delete_strategy(store: RedisStore, strategy_id: str) -> bool:
+    from . import group_service
+
     async with SessionLocal() as s:
         row = await s.get(TradingStrategy, strategy_id)
         if not row:
@@ -121,4 +123,5 @@ async def delete_strategy(store: RedisStore, strategy_id: str) -> bool:
         await s.delete(row)
         await s.commit()
     await store.delete_strategy(strategy_id)
+    await group_service.clear_strategy_bindings(store, strategy_id)
     return True

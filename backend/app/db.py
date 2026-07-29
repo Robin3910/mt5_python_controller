@@ -87,6 +87,31 @@ def _migrate_audit_columns(sync_conn) -> None:
     if "after_json" not in cols:
         sync_conn.execute(text("ALTER TABLE audit_log ADD COLUMN after_json JSON"))
 
+
+def _migrate_node_group_strategy_id(sync_conn) -> None:
+    """为已存在的 node_group 表补充一对一策略绑定列（create_all 不会改已存在的表）。"""
+    inspector = inspect(sync_conn)
+    if "node_group" not in inspector.get_table_names():
+        return
+    cols = {c["name"] for c in inspector.get_columns("node_group")}
+    if "strategy_id" in cols:
+        return
+    dialect = sync_conn.engine.dialect.name
+    sync_conn.execute(text("ALTER TABLE node_group ADD COLUMN strategy_id VARCHAR(32)"))
+    # 唯一索引：同一策略只能绑定一个分组；多行 NULL 在 MySQL/SQLite 均允许
+    if dialect == "mysql":
+        sync_conn.execute(
+            text("CREATE UNIQUE INDEX uq_node_group_strategy_id ON node_group (strategy_id)")
+        )
+    else:
+        sync_conn.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_node_group_strategy_id "
+                "ON node_group (strategy_id)"
+            )
+        )
+
+
 def _drop_legacy_nodes_table(sync_conn) -> None:
     """v0.2 迁移：旧表带 `token_hash` 列（一节点一令牌）；新方案改为全局共享令牌，
     且 `mt5_login` 升级为 UNIQUE NOT NULL，无法平滑 ALTER —— 直接丢弃旧表，由
@@ -112,4 +137,5 @@ async def init_db() -> None:
         await conn.run_sync(_migrate_dispatch_price_column)
         await conn.run_sync(_migrate_signal_source_column)
         await conn.run_sync(_migrate_audit_columns)
+        await conn.run_sync(_migrate_node_group_strategy_id)
     logger.info("Database initialized (%s)", engine.url.render_as_string(hide_password=True))

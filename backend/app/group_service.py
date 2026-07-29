@@ -2,6 +2,7 @@
 
 分组是 strategy 信号（model=strategy）的分发单元：分组自带 sync/poll 分发模式，
 成员节点通过 node_group_member 关联，一个节点可同时属于多个分组。
+每个分组最多绑定一个交易策略（一对一）；同一策略不可挂到多个分组。
 
 所有写操作都遵循“先写库、再刷新缓存”，保证重启后能从库里恢复全部状态。
 """
@@ -10,12 +11,12 @@ from __future__ import annotations
 import time
 from typing import Optional
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 
 from .db import SessionLocal
 from .group_rules import normalize_dispatch_mode
 from .models import GroupCreate, GroupUpdate
-from .orm import NodeGroup, NodeGroupMember
+from .orm import NodeGroup, NodeGroupMember, TradingStrategy
 from .redis_store import RedisStore
 from .security import make_group_id
 
@@ -28,6 +29,7 @@ def group_row_to_dict(row: NodeGroup, members: list[NodeGroupMember]) -> dict:
         "name": row.name,
         "enabled": row.enabled,
         "dispatch_mode": row.dispatch_mode,
+        "strategy_id": row.strategy_id,
         "remark": row.remark,
         "created_at": row.created_at.timestamp() if row.created_at else time.time(),
         "members": [
@@ -73,11 +75,39 @@ def _dedup_node_ids(node_ids: Optional[list[str]]) -> list[str]:
     return out
 
 
+def _normalize_strategy_id(raw: Optional[str]) -> Optional[str]:
+    sid = (raw or "").strip()
+    return sid or None
+
+
 async def validate_node_ids(store: RedisStore, node_ids: list[str]) -> Optional[str]:
     """校验成员节点均存在；返回错误说明或 None。"""
     for nid in node_ids:
         if not await store.get_node(nid):
             return f"节点不存在：{nid}"
+    return None
+
+
+async def validate_strategy_binding(
+    strategy_id: Optional[str],
+    *,
+    exclude_group_id: Optional[str] = None,
+) -> Optional[str]:
+    """校验策略存在且未被其它分组占用；返回错误说明或 None。"""
+    if not strategy_id:
+        return None
+    async with SessionLocal() as s:
+        sty = await s.get(TradingStrategy, strategy_id)
+        if not sty:
+            return f"策略不存在：{strategy_id}"
+        stmt = select(NodeGroup.group_id, NodeGroup.name).where(
+            NodeGroup.strategy_id == strategy_id
+        )
+        if exclude_group_id:
+            stmt = stmt.where(NodeGroup.group_id != exclude_group_id)
+        occupied = (await s.execute(stmt)).first()
+        if occupied:
+            return f"策略已被分组「{occupied.name}」绑定（一对一）"
     return None
 
 
@@ -105,6 +135,10 @@ async def create_group(store: RedisStore, payload: GroupCreate) -> dict:
     err = await validate_node_ids(store, node_ids)
     if err:
         raise ValueError(err)
+    strategy_id = _normalize_strategy_id(payload.strategy_id)
+    err = await validate_strategy_binding(strategy_id)
+    if err:
+        raise ValueError(err)
     group_id = make_group_id()
     async with SessionLocal() as s:
         s.add(
@@ -113,6 +147,7 @@ async def create_group(store: RedisStore, payload: GroupCreate) -> dict:
                 name=payload.name.strip(),
                 enabled=payload.enabled,
                 dispatch_mode=normalize_dispatch_mode(payload.dispatch_mode),
+                strategy_id=strategy_id,
                 remark=(payload.remark or "").strip() or None,
             )
         )
@@ -131,6 +166,15 @@ async def update_group(store: RedisStore, group_id: str, patch: GroupUpdate) -> 
         err = await validate_node_ids(store, node_ids)
         if err:
             raise ValueError(err)
+
+    update_strategy = "strategy_id" in patch.model_fields_set
+    strategy_id: Optional[str] = None
+    if update_strategy:
+        strategy_id = _normalize_strategy_id(patch.strategy_id)
+        err = await validate_strategy_binding(strategy_id, exclude_group_id=group_id)
+        if err:
+            raise ValueError(err)
+
     async with SessionLocal() as s:
         row = await s.get(NodeGroup, group_id)
         if not row:
@@ -143,6 +187,8 @@ async def update_group(store: RedisStore, group_id: str, patch: GroupUpdate) -> 
             row.dispatch_mode = normalize_dispatch_mode(patch.dispatch_mode)
         if patch.remark is not None:
             row.remark = patch.remark.strip() or None
+        if update_strategy:
+            row.strategy_id = strategy_id
         if node_ids is not None:
             await _replace_members(s, group_id, node_ids)
         await s.commit()
@@ -162,6 +208,31 @@ async def delete_group(store: RedisStore, group_id: str) -> bool:
         await s.commit()
     await store.delete_group(group_id)
     return True
+
+
+async def clear_strategy_bindings(store: RedisStore, strategy_id: str) -> list[str]:
+    """策略被删除时，解除所有分组对该策略的绑定；返回受影响的分组 ID。"""
+    sid = _normalize_strategy_id(strategy_id)
+    if not sid:
+        return []
+    async with SessionLocal() as s:
+        rows = (
+            await s.execute(
+                select(NodeGroup.group_id).where(NodeGroup.strategy_id == sid)
+            )
+        ).scalars().all()
+        affected = sorted(set(rows))
+        if not affected:
+            return []
+        await s.execute(
+            update(NodeGroup).where(NodeGroup.strategy_id == sid).values(strategy_id=None)
+        )
+        await s.commit()
+        for gid in affected:
+            d = await _load_group(s, gid)
+            if d:
+                await store.cache_group(d)
+    return affected
 
 
 async def remove_node_from_all_groups(store: RedisStore, node_id: str) -> list[str]:

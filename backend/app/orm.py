@@ -155,6 +155,7 @@ class NodeGroup(Base):
 
     分组自带分发模式（sync / poll），不按币种区分——这是与中控台按币种配置的
     根本差别，也是 strategy 与 normal 两条链路隔离的关键。
+    每个分组最多绑定一个交易策略（一对一）；strategy_id 为空表示未绑定。
     """
     __tablename__ = "node_group"
 
@@ -163,6 +164,8 @@ class NodeGroup(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     # sync（全员同步）/ poll（组内轮转，一个信号只由一个节点领取）
     dispatch_mode: Mapped[str] = mapped_column(String(8), default="sync")
+    # 一对一绑定 TradingStrategy；unique 保证同一策略不能挂到多个分组
+    strategy_id: Mapped[str | None] = mapped_column(String(32), nullable=True, unique=True, index=True)
     remark: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(

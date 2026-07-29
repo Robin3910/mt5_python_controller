@@ -12,6 +12,7 @@ import type {
   GroupOut,
   GroupSignalTaskRecord,
   NodeOut,
+  StrategyOut,
 } from '@/api/types'
 import { confirmAction } from '@/utils/confirm'
 
@@ -41,7 +42,7 @@ async function runSearch(): Promise<void> {
 }
 
 onMounted(async () => {
-  await Promise.all([loadGroups(), hub.fetchNodes()])
+  await Promise.all([loadGroups(), hub.fetchNodes(), hub.fetchStrategies()])
 })
 
 const DISPATCH_MODE_LABEL: Record<GroupDispatchMode, string> = {
@@ -55,6 +56,9 @@ const FIELD_HELP = {
     '禁用后该分组不再接收任何 strategy 信号；已下发的历史任务不受影响。',
   dispatch_mode:
     '分组级分发模式，作用于整个分组、不区分币种：全员同步 = 组内所有有效节点并发下发；轮询轮转 = 一条信号只交给组内队首的一个有效节点，成功后该节点移到队尾。',
+  strategy:
+    '一对一绑定交易策略。每个分组最多绑定一个策略，同一策略也不能挂到多个分组。' +
+    '未绑定不影响分组本身的信号分发；可稍后在编辑中补绑或换绑。',
   remark: '备注，仅用于后台展示。',
   nodes:
     '加入本分组的节点。信号进入时只有「已启用且在线」的成员才算有效节点；勾选顺序即轮询轮转的初始顺序。',
@@ -71,9 +75,34 @@ const form = reactive({
   name: '',
   enabled: true,
   dispatch_mode: 'sync' as GroupDispatchMode,
+  strategy_id: '' as string,
   remark: '',
   node_ids: [] as string[],
 })
+
+/** 已被其它分组占用的策略 ID（当前编辑分组自己的绑定除外） */
+const occupiedStrategyIds = computed(() => {
+  const taken = new Set<string>()
+  for (const g of hub.groups) {
+    if (!g.strategy_id) continue
+    if (formMode.value === 'edit' && g.group_id === editingId.value) continue
+    taken.add(g.strategy_id)
+  }
+  return taken
+})
+
+/** 可选策略：未占用的 + 当前已绑定的 */
+const selectableStrategies = computed<StrategyOut[]>(() => {
+  const taken = occupiedStrategyIds.value
+  return hub.strategies.filter(
+    (s) => !taken.has(s.strategy_id) || s.strategy_id === form.strategy_id,
+  )
+})
+
+function strategyLabel(s: StrategyOut): string {
+  const status = s.enabled ? '' : '（已禁用）'
+  return `${s.name} · ${s.symbol}${status}`
+}
 
 // 成员选择：已选节点按选择顺序排列（即轮询顺序），其余节点排在后面
 const memberNodes = computed<NodeOut[]>(() =>
@@ -107,9 +136,11 @@ function openCreate(): void {
     name: '',
     enabled: true,
     dispatch_mode: 'sync' as GroupDispatchMode,
+    strategy_id: '',
     remark: '',
     node_ids: [],
   })
+  void hub.fetchStrategies()
   showForm.value = true
 }
 
@@ -121,9 +152,11 @@ function openEdit(g: GroupOut): void {
     name: g.name,
     enabled: g.enabled,
     dispatch_mode: g.dispatch_mode,
+    strategy_id: g.strategy_id || '',
     remark: g.remark || '',
     node_ids: g.nodes.map((n) => n.node_id),
   })
+  void hub.fetchStrategies()
   showForm.value = true
 }
 
@@ -136,14 +169,23 @@ async function save(): Promise<void> {
   saving.value = true
   formError.value = ''
   try {
+    const strategyId = form.strategy_id.trim() || null
     const payload = {
       name,
       enabled: form.enabled,
       dispatch_mode: form.dispatch_mode,
+      strategy_id: strategyId,
       remark: form.remark.trim() || null,
       node_ids: form.node_ids,
     }
-    const summary = `分发模式：${DISPATCH_MODE_LABEL[form.dispatch_mode]}\n成员节点：${form.node_ids.length} 个`
+    const styName =
+      selectableStrategies.value.find((s) => s.strategy_id === strategyId)?.name
+      || strategyId
+      || '未绑定'
+    const summary =
+      `分发模式：${DISPATCH_MODE_LABEL[form.dispatch_mode]}\n` +
+      `绑定策略：${styName}\n` +
+      `成员节点：${form.node_ids.length} 个`
     const verb = formMode.value === 'create' ? '创建' : '更新'
     if (!(await confirmAction(`确认${verb}分组「${name}」？\n\n${summary}`))) return
     try {
@@ -336,6 +378,10 @@ function dispatchSummary(row: GroupSignalTaskRecord): string {
         </div>
         <div class="list-field"><span class="k">分组 ID</span><span class="v muted" style="font-size: 12px; font-weight: 500">{{ g.group_id }}</span></div>
         <div class="list-field">
+          <span class="k">绑定策略</span>
+          <span class="v">{{ g.strategy_name || '未绑定' }}</span>
+        </div>
+        <div class="list-field">
           <span class="k">分发模式</span>
           <span class="v"><span class="tag blue">{{ DISPATCH_MODE_LABEL[g.dispatch_mode] }}</span></span>
         </div>
@@ -366,9 +412,15 @@ function dispatchSummary(row: GroupSignalTaskRecord): string {
       <table>
         <thead>
           <tr>
-            <th>名称</th><th>分发模式</th><th class="right">成员节点</th>
-            <th class="right">有效节点</th><th class="right">信号</th>
-            <th>备注</th><th>启用</th><th class="right">操作</th>
+            <th>名称</th>
+            <th>绑定策略</th>
+            <th>分发模式</th>
+            <th class="right">成员节点</th>
+            <th class="right">有效节点</th>
+            <th class="right">信号</th>
+            <th>备注</th>
+            <th>启用</th>
+            <th class="right">操作</th>
           </tr>
         </thead>
         <tbody>
@@ -376,6 +428,13 @@ function dispatchSummary(row: GroupSignalTaskRecord): string {
             <td>
               {{ g.name }}
               <div class="muted" style="font-size: 11px">{{ g.group_id }}</div>
+            </td>
+            <td>
+              <template v-if="g.strategy_name">
+                {{ g.strategy_name }}
+                <div v-if="g.strategy_id" class="muted" style="font-size: 11px">{{ g.strategy_id }}</div>
+              </template>
+              <span v-else class="muted">未绑定</span>
             </td>
             <td><span class="tag blue">{{ DISPATCH_MODE_LABEL[g.dispatch_mode] }}</span></td>
             <td class="right">{{ g.node_count }}</td>
@@ -395,7 +454,7 @@ function dispatchSummary(row: GroupSignalTaskRecord): string {
             </td>
           </tr>
           <tr v-if="!hub.groups.length && !loading">
-            <td colspan="8" class="muted" style="padding: 18px">
+            <td colspan="9" class="muted" style="padding: 18px">
               {{ appliedQuery ? '无匹配分组' : '暂无分组，点击右上角「新建分组」开始配置' }}
             </td>
           </tr>
@@ -409,7 +468,7 @@ function dispatchSummary(row: GroupSignalTaskRecord): string {
         <div class="modal-header">
           <div class="h1">{{ formMode === 'create' ? '新建分组' : '编辑分组' }}</div>
           <p class="muted" style="font-size: 12px; margin: 4px 0 0">
-            分组的分发模式作用于整个分组、不区分币种；信号进入时只有「已启用且在线」的成员节点才会被下发。
+            可一对一绑定交易策略；分发模式作用于整个分组、不区分币种；信号进入时只有「已启用且在线」的成员节点才会被下发。
           </p>
         </div>
         <div class="modal-body">
@@ -417,6 +476,24 @@ function dispatchSummary(row: GroupSignalTaskRecord): string {
             <div>
               <FormLabel field-id="group-name" text="分组名称" :help="FIELD_HELP.name" />
               <input id="group-name" v-model="form.name" placeholder="例如：黄金策略组" />
+            </div>
+            <div>
+              <FormLabel field-id="group-strategy" text="绑定策略" :help="FIELD_HELP.strategy" />
+              <select id="group-strategy" v-model="form.strategy_id">
+                <option value="">不绑定</option>
+                <option
+                  v-for="s in selectableStrategies"
+                  :key="s.strategy_id"
+                  :value="s.strategy_id"
+                >
+                  {{ strategyLabel(s) }}
+                </option>
+              </select>
+              <p v-if="!hub.strategies.length" class="muted" style="font-size: 12px; margin-top: 6px">
+                暂无策略，可先到
+                <button type="button" class="btn-sm btn-ghost" @click="router.push('/strategies')">策略管理</button>
+                创建
+              </p>
             </div>
             <div>
               <FormLabel field-id="group-mode" text="分发模式" :help="FIELD_HELP.dispatch_mode" />
@@ -432,7 +509,7 @@ function dispatchSummary(row: GroupSignalTaskRecord): string {
                 <option :value="false">禁用</option>
               </select>
             </div>
-            <div>
+            <div class="span-full">
               <FormLabel field-id="group-remark" text="备注" :help="FIELD_HELP.remark" />
               <input id="group-remark" v-model="form.remark" placeholder="选填" />
             </div>

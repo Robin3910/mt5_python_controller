@@ -31,6 +31,7 @@ def _group_audit_snapshot(d: dict | None) -> dict | None:
         "name": d.get("name"),
         "enabled": d.get("enabled", True),
         "dispatch_mode": d.get("dispatch_mode"),
+        "strategy_id": d.get("strategy_id"),
         "remark": d.get("remark"),
         "node_ids": group_rules.member_ids(d),
     }
@@ -65,11 +66,18 @@ async def _to_group_out(store: RedisStore, d: dict, signal_count: int = 0) -> Gr
                 sort_order=member.get("sort_order", 0),
             )
         )
+    strategy_id = d.get("strategy_id") or None
+    strategy_name = None
+    if strategy_id:
+        sty = await store.get_strategy(strategy_id) or {}
+        strategy_name = sty.get("name") or strategy_id
     return GroupOut(
         group_id=d["group_id"],
         name=d["name"],
         enabled=d.get("enabled", True),
         dispatch_mode=d.get("dispatch_mode", "sync"),
+        strategy_id=strategy_id,
+        strategy_name=strategy_name,
         remark=d.get("remark"),
         created_at=d.get("created_at", 0),
         nodes=nodes,
@@ -156,7 +164,7 @@ async def update_group(
     store: RedisStore = Depends(get_store),
     admin: str = Depends(get_current_admin),
 ):
-    """更新分组（名称 / 启用状态 / 分发模式 / 备注 / 成员节点）。"""
+    """更新分组（名称 / 启用状态 / 分发模式 / 绑定策略 / 备注 / 成员节点）。"""
     _validate_dispatch_mode(body.dispatch_mode)
     if body.name is not None and (name := body.name.strip()):
         if await group_service.name_exists(name, exclude_group_id=group_id):

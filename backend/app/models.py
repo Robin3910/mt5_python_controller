@@ -157,6 +157,8 @@ class GroupCreate(BaseModel):
     enabled: bool = True
     dispatch_mode: str = "sync"  # sync / poll
     remark: Optional[str] = None
+    # 一对一绑定交易策略；空 / null = 不绑定
+    strategy_id: Optional[str] = Field(default=None, max_length=32)
     node_ids: list[str] = Field(default_factory=list)
 
 
@@ -166,6 +168,8 @@ class GroupUpdate(BaseModel):
     enabled: Optional[bool] = None
     dispatch_mode: Optional[str] = None
     remark: Optional[str] = None
+    # 传入空字符串或 null 表示解除绑定；省略字段则不改
+    strategy_id: Optional[str] = Field(default=None, max_length=32)
     node_ids: Optional[list[str]] = None  # 传入即整体替换成员列表
 
 
@@ -175,6 +179,8 @@ class GroupOut(BaseModel):
     name: str
     enabled: bool = True
     dispatch_mode: str = "sync"
+    strategy_id: Optional[str] = None
+    strategy_name: Optional[str] = None
     remark: Optional[str] = None
     created_at: float = 0
     nodes: list[GroupNodeRef] = Field(default_factory=list)

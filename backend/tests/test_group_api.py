@@ -106,6 +106,90 @@ def test_create_group_response_shape(client):
     assert g["nodes"][0]["mt5_login"] == 5101
     assert g["nodes"][0]["status"] == "offline"
     assert g["nodes"][0]["sort_order"] == 0
+    assert g.get("strategy_id") in (None, "")
+    assert g.get("strategy_name") in (None, "")
+
+
+def _mk_strategy(client, headers, name: str = "测试策略", symbol: str = "XAUUSD") -> dict:
+    from app.strategy_templates import TEMPLATE_1_ID
+    r = client.post(
+        "/api/strategies",
+        json={"template_id": TEMPLATE_1_ID, "name": name, "symbol": symbol},
+        headers=headers,
+    )
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def test_create_group_with_strategy_binding(client):
+    h = auth_headers(client)
+    sty = _mk_strategy(client, h, name="黄金逆势")
+    g = _mk_group(client, h, name="绑定策略组", strategy_id=sty["strategy_id"])
+    assert g["strategy_id"] == sty["strategy_id"]
+    assert g["strategy_name"] == "黄金逆势"
+
+
+def test_create_group_unknown_strategy_returns_400(client):
+    h = auth_headers(client)
+    r = client.post(
+        "/api/groups",
+        json={"name": "坏策略组", "strategy_id": "sty_not_exist"},
+        headers=h,
+    )
+    assert r.status_code == 400
+    assert "策略不存在" in r.json()["detail"]
+
+
+def test_strategy_one_to_one_binding(client):
+    """同一策略不可绑定到两个分组。"""
+    h = auth_headers(client)
+    sty = _mk_strategy(client, h, name="独占策略")
+    _mk_group(client, h, name="组A", strategy_id=sty["strategy_id"])
+    r = client.post(
+        "/api/groups",
+        json={"name": "组B", "strategy_id": sty["strategy_id"]},
+        headers=h,
+    )
+    assert r.status_code == 400
+    assert "一对一" in r.json()["detail"]
+
+
+def test_update_group_strategy_bind_and_unbind(client):
+    h = auth_headers(client)
+    sty = _mk_strategy(client, h, name="可换绑策略")
+    g = _mk_group(client, h, name="换绑组")
+    gid = g["group_id"]
+
+    bound = client.patch(
+        f"/api/groups/{gid}", json={"strategy_id": sty["strategy_id"]}, headers=h,
+    )
+    assert bound.status_code == 200, bound.text
+    assert bound.json()["strategy_id"] == sty["strategy_id"]
+    assert bound.json()["strategy_name"] == "可换绑策略"
+
+    # 局部更新其它字段时，不应清掉策略绑定
+    keep = client.patch(f"/api/groups/{gid}", json={"remark": "仍绑定"}, headers=h)
+    assert keep.status_code == 200
+    assert keep.json()["strategy_id"] == sty["strategy_id"]
+    assert keep.json()["remark"] == "仍绑定"
+
+    unbound = client.patch(f"/api/groups/{gid}", json={"strategy_id": None}, headers=h)
+    assert unbound.status_code == 200, unbound.text
+    assert unbound.json()["strategy_id"] in (None, "")
+
+
+def test_delete_strategy_clears_group_binding(client):
+    h = auth_headers(client)
+    sty = _mk_strategy(client, h, name="将被删除")
+    g = _mk_group(client, h, name="跟随解绑组", strategy_id=sty["strategy_id"])
+    assert g["strategy_id"] == sty["strategy_id"]
+
+    deleted = client.delete(f"/api/strategies/{sty['strategy_id']}", headers=h)
+    assert deleted.status_code == 200, deleted.text
+
+    refreshed = client.get(f"/api/groups/{g['group_id']}", headers=h)
+    assert refreshed.status_code == 200
+    assert refreshed.json()["strategy_id"] in (None, "")
 def test_create_group_defaults_to_sync(client):
     h = auth_headers(client)
     g = _mk_group(client, h, name="默认模式组")

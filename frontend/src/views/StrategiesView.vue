@@ -6,7 +6,12 @@ import { ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/message-box/style/css'
 import FormLabel from '@/components/FormLabel.vue'
 import { useHubStore } from '@/stores/hub'
-import type { StrategyOut, StrategyRule, StrategyTemplateOut } from '@/api/types'
+import type {
+  StrategyBatchLevel,
+  StrategyOut,
+  StrategyRule,
+  StrategyTemplateOut,
+} from '@/api/types'
 import { confirmAction } from '@/utils/confirm'
 
 const hub = useHubStore()
@@ -51,11 +56,11 @@ const RULE_TYPE_LABEL: Record<number, string> = {
 
 const RULE_TYPE_HELP: Record<number, string> = {
   1:
-    '逆势加仓：以监控方向最近一笔订单为基准，价格朝不利方向偏离达到 point × Point() 后触发加仓。' +
-    '实际手数 = lot_times × 基础订单手数 + extra_lot。',
+    '逆势加仓：以监控方向最近一笔订单为基准，价格朝不利方向偏离达到「点数 × Point()」后触发加仓。' +
+    '实际手数 = 倍数 × 基础订单手数 + 额外手数。',
   2:
-    '顺势加仓：以监控方向最近一笔订单为基准，价格朝有利方向偏离达到 point × Point() 后触发加仓。' +
-    '实际手数 = lot_times × 基础订单手数 + extra_lot。',
+    '顺势加仓：以监控方向最近一笔订单为基准，价格朝有利方向偏离达到「点数 × Point()」后触发加仓。' +
+    '实际手数 = 倍数 × 基础订单手数 + 额外手数。',
 }
 
 const FIELD_HELP = {
@@ -64,24 +69,48 @@ const FIELD_HELP = {
   symbol: '绑定品种代码，如 XAUUSD。策略规则仅作用于该品种。',
   rules:
     '每条规则独立配置。关闭「启用」后该规则不会执行。' +
-    '实际加仓手数 = lot_times × 基础订单手数 + extra_lot；触发距离 = point × Point()。',
+    '实际加仓手数 = 倍数 × 基础订单手数 + 额外手数；触发距离 = 点数 × Point()。',
   status:
-    '0=关闭，1=启用。关闭后本条规则不会参与监控与加仓；已产生的历史订单不受影响。',
+    '关闭后本条规则不会参与监控与加仓；已产生的历史订单不受影响。',
   action:
-    '监控方向：all=多空都监控，buy=只监控多单，sell=只监控空单。' +
+    '监控方向：全部=多空都监控，多单=只监控多单，空单=只监控空单。' +
     '系统会按该方向取最近一笔订单作为加仓基准。',
   point:
-    '点差倍数。实时以监控方向最近订单为基准，价格偏离达到 point × Point() 后开始执行加仓。' +
+    '加仓触发点数。实时以监控方向最近订单为基准，价格偏离达到「点数 × Point()」后开始执行加仓。' +
     'Point() 为品种最小价格变动单位。',
   lot_times:
-    '加仓倍率，默认 1。以监控方向最近订单的手数为基准，参与计算：lot_times × 基础手数。',
+    '加仓倍数。以监控方向最近订单的手数为基准，参与计算：倍数 × 基础手数。',
   extra_lot:
-    '额外手数，默认 0。加在倍率结果之后：实际手数 = lot_times × 基础手数 + extra_lot。',
+    '额外手数，默认 0。加在倍率结果之后：实际手数 = 倍数 × 基础手数 + 额外手数。',
   max_allow_num:
     '最大允许加仓次数。达到次数上限后，本条规则不再继续加仓。',
+  batch_enabled:
+    '开启后按当前持仓笔数命中下方档位，使用该档的点数 / 倍数 / 额外手数，' +
+    '覆盖上方基础参数。档位由批数与总手数自动生成，不可手动增删。',
+  batch_action:
+    '分批加仓独立的监控方向：全部=多空都监控，多单=只监控多单，空单=只监控空单。' +
+    '可与上方基础监控方向不同。',
+  batch_count:
+    '分批批数。修改后会按「第 2 笔 ~ 总手数」自动均分生成对应档位区间，不可手动添加档位。',
+  total_lot_limit:
+    '分批总手数上限，同时作为档位末笔上限。' +
+    '系统会把第 2 笔到该上限均分到各档；达到上限后不再继续分批加仓。',
+  batch_level:
+    '持仓笔数区间由批数与总手数自动计算，只读。' +
+    '命中区间时：触发距离 = 点数 × Point()，手数 = 倍数 × 基础手数 + 额外手数。',
+  calc_type: '档位距离计算方式。当前仅支持「点数」。',
 }
 
-function cloneRules(rules: StrategyRule[]): StrategyRule[] {
+/** 表单内规则：分批字段均已填充，便于直接 v-model 绑定 */
+type EditableRule = StrategyRule & {
+  batch_enabled: boolean
+  batch_action: string
+  batch_count: number
+  total_lot_limit: number
+  batch_levels: StrategyBatchLevel[]
+}
+
+function cloneRules(rules: StrategyRule[]): EditableRule[] {
   return rules.map((r) => ({
     type: r.type,
     status: r.status,
@@ -98,20 +127,103 @@ function cloneRules(rules: StrategyRule[]): StrategyRule[] {
   }))
 }
 
-// ---- 新建 ----
+/** 分批档位从第 2 笔起算（第 1 笔为首单） */
+const BATCH_POS_START = 2
+
+/** 将 [2, limit] 均分为 count 段，对齐 MTcommander「批数 × 总手数」切档 */
+function splitBatchRanges(
+  limit: number,
+  count: number,
+): Array<{ pos_from: number; pos_to: number }> {
+  const end = Math.max(BATCH_POS_START, Math.floor(limit) || BATCH_POS_START)
+  const total = end - BATCH_POS_START + 1
+  const n = Math.max(1, Math.min(Math.floor(count) || 1, total))
+  const base = Math.floor(total / n)
+  const rem = total % n
+  const ranges: Array<{ pos_from: number; pos_to: number }> = []
+  let cur = BATCH_POS_START
+  for (let i = 0; i < n; i++) {
+    const size = base + (i < rem ? 1 : 0)
+    const to = cur + size - 1
+    ranges.push({ pos_from: cur, pos_to: to })
+    cur = to + 1
+  }
+  return ranges
+}
+
+function defaultLevelParams(
+  index: number,
+  prev?: StrategyBatchLevel,
+): Pick<StrategyBatchLevel, 'calc_type' | 'point' | 'lot_times' | 'extra_lot'> {
+  if (prev) {
+    return {
+      calc_type: prev.calc_type || 'point',
+      point: prev.point,
+      lot_times: prev.lot_times,
+      extra_lot: prev.extra_lot,
+    }
+  }
+  return {
+    calc_type: 'point',
+    point: 100 + index * 100,
+    lot_times: Number((1.1 + index * 0.1).toFixed(2)),
+    extra_lot: 0,
+  }
+}
+
+/** 按 batch_count + total_lot_limit 重建档位；保留已有档的点/倍/手参数 */
+function rebuildBatchLevels(r: EditableRule): void {
+  const limit = Math.max(BATCH_POS_START, Math.floor(Number(r.total_lot_limit) || BATCH_POS_START))
+  r.total_lot_limit = limit
+  const maxCount = limit - BATCH_POS_START + 1
+  let count = Math.max(1, Math.floor(Number(r.batch_count) || 1))
+  if (count > maxCount) count = maxCount
+  r.batch_count = count
+
+  const old = r.batch_levels
+  r.batch_levels = splitBatchRanges(limit, count).map((range, i) => ({
+    ...range,
+    ...defaultLevelParams(i, old[i]),
+  }))
+}
+
+function setBatchEnabled(r: EditableRule, enabled: boolean): void {
+  r.batch_enabled = enabled
+  if (!enabled) return
+  if (!r.batch_count) r.batch_count = 3
+  if (!r.total_lot_limit || r.total_lot_limit < BATCH_POS_START) r.total_lot_limit = 10
+  rebuildBatchLevels(r)
+}
+
+function onBatchMetaChange(r: EditableRule): void {
+  if (!r.batch_enabled) return
+  rebuildBatchLevels(r)
+}
+
+// ---- 新建 / 编辑 ----
 const showForm = ref(false)
+const formMode = ref<'create' | 'edit'>('create')
+const editingId = ref('')
+const editingTemplateName = ref('')
 const saving = ref(false)
 const formError = ref('')
 const form = reactive({
   template_id: '',
   name: '',
   symbol: '',
-  rules: [] as StrategyRule[],
+  rules: [] as EditableRule[],
 })
+
+const isEditMode = computed(() => formMode.value === 'edit')
 
 const selectedTemplate = computed(() =>
   templates.value.find((t) => t.template_id === form.template_id) || null,
 )
+
+const formTemplateLabel = computed(() => {
+  if (selectedTemplate.value) return selectedTemplate.value.name
+  return editingTemplateName.value || form.template_id || '—'
+})
 
 function loadRulesFromTemplate(templateId: string): void {
   const tpl = templates.value.find((t) => t.template_id === templateId)
@@ -121,11 +233,15 @@ function loadRulesFromTemplate(templateId: string): void {
 watch(
   () => form.template_id,
   (id) => {
-    if (showForm.value && id) loadRulesFromTemplate(id)
+    // 仅新建时切换模版会重载默认规则；编辑不允许改模版
+    if (showForm.value && !isEditMode.value && id) loadRulesFromTemplate(id)
   },
 )
 
 function openCreate(): void {
+  formMode.value = 'create'
+  editingId.value = ''
+  editingTemplateName.value = ''
   formError.value = ''
   form.template_id = templates.value[0]?.template_id || ''
   form.name = ''
@@ -134,19 +250,50 @@ function openCreate(): void {
   showForm.value = true
 }
 
-function validateRules(rules: StrategyRule[]): string | null {
+function openEdit(s: StrategyOut): void {
+  formMode.value = 'edit'
+  editingId.value = s.strategy_id
+  editingTemplateName.value = s.template_name || ''
+  formError.value = ''
+  form.template_id = s.template_id
+  form.name = s.name
+  form.symbol = s.symbol
+  form.rules = cloneRules(s.rules || [])
+  showForm.value = true
+}
+
+function validateRules(rules: EditableRule[]): string | null {
   if (!rules.length) return '请至少配置一条规则'
   for (const r of rules) {
     const label = RULE_TYPE_LABEL[r.type] || `类型${r.type}`
-    if (r.point < 0) return `${label}：point 不能为负`
-    if (r.lot_times < 0) return `${label}：加仓倍率不能为负`
-    if (r.extra_lot < 0) return `${label}：额外手数不能为负`
-    if (r.max_allow_num < 0) return `${label}：最大加仓次数不能为负`
+    if (r.point < 0) return `${label}：点数不能为负`
+    if (r.lot_times < 0) return `${label}：倍数不能为负`
+    if (r.extra_lot < 0) return `${label}：手数不能为负`
+    if (r.max_allow_num < 0) return `${label}：次数不能为负`
     if (!['all', 'buy', 'sell'].includes(String(r.action || '').toLowerCase())) {
       return `${label}：监控方向非法`
     }
-    if (r.batch_action != null && !['all', 'buy', 'sell'].includes(String(r.batch_action).toLowerCase())) {
+    if (!r.batch_enabled) continue
+    if (!['all', 'buy', 'sell'].includes(String(r.batch_action || '').toLowerCase())) {
       return `${label}：分批监控方向非法`
+    }
+    if (r.batch_count < 1) return `${label}：分批批数至少为 1`
+    if (r.total_lot_limit < BATCH_POS_START) {
+      return `${label}：总手数上限需 ≥ ${BATCH_POS_START}（档位从第 ${BATCH_POS_START} 笔起）`
+    }
+    if (!r.batch_levels.length) return `${label}：启用分批加仓后至少需要一个档位`
+    const last = r.batch_levels[r.batch_levels.length - 1]
+    if (r.batch_levels.length !== r.batch_count) {
+      return `${label}：档位数与批数不一致，请调整总手数或批数后重试`
+    }
+    if (last.pos_to !== Math.floor(r.total_lot_limit)) {
+      return `${label}：档位末笔需等于总手数上限`
+    }
+    for (const [i, lv] of r.batch_levels.entries()) {
+      const at = `${label} 档位 ${i + 1}`
+      if (lv.point < 0) return `${at}：点数不能为负`
+      if (lv.lot_times < 0) return `${at}：倍数不能为负`
+      if (lv.extra_lot < 0) return `${at}：手数不能为负`
     }
   }
   return null
@@ -167,7 +314,10 @@ async function save(): Promise<void> {
     formError.value = '请填写绑定品种'
     return
   }
-  const rulesErr = validateRules(form.rules)
+  const rulesErr = validateRules(form.rules.map((r) => {
+    if (r.batch_enabled) rebuildBatchLevels(r)
+    return r
+  }))
   if (rulesErr) {
     formError.value = rulesErr
     return
@@ -175,28 +325,38 @@ async function save(): Promise<void> {
   saving.value = true
   formError.value = ''
   try {
-    const tplName = selectedTemplate.value?.name || form.template_id
+    const tplName = formTemplateLabel.value
     const enabledCount = form.rules.filter((r) => r.status === 1).length
+    const actionLabel = isEditMode.value ? '保存' : '创建'
     if (
       !(await confirmAction(
-        `确认创建策略「${name}」？\n\n模版：${tplName}\n绑定品种：${symbol}\n启用规则：${enabledCount} / ${form.rules.length}`,
+        `确认${actionLabel}策略「${name}」？\n\n模版：${tplName}\n绑定品种：${symbol}\n启用规则：${enabledCount} / ${form.rules.length}`,
       ))
     ) {
       return
     }
     try {
-      await hub.createStrategy(
-        {
-          template_id: form.template_id,
-          name,
-          symbol,
-          rules: cloneRules(form.rules),
-        },
-        currentSearchOptions(),
-      )
+      const rules = cloneRules(form.rules)
+      if (isEditMode.value) {
+        await hub.updateStrategy(
+          editingId.value,
+          { name, symbol, rules },
+          currentSearchOptions(),
+        )
+      } else {
+        await hub.createStrategy(
+          {
+            template_id: form.template_id,
+            name,
+            symbol,
+            rules,
+          },
+          currentSearchOptions(),
+        )
+      }
     } catch (e: unknown) {
       const err = e as { response?: { data?: { detail?: string } } }
-      formError.value = err?.response?.data?.detail || '创建失败，请稍后重试'
+      formError.value = err?.response?.data?.detail || `${actionLabel}失败，请稍后重试`
       await ElMessageBox.alert(formError.value, '无法保存', {
         type: 'warning',
         confirmButtonText: '知道了',
@@ -224,7 +384,13 @@ function ruleSummary(rules: StrategyRule[]): string {
   if (!rules.length) return '—'
   const enabled = rules.filter((r) => r.status === 1)
   if (!enabled.length) return '全部关闭'
-  return enabled.map((r) => RULE_TYPE_LABEL[r.type] || `类型${r.type}`).join(' · ')
+  return enabled
+    .map((r) => {
+      const label = RULE_TYPE_LABEL[r.type] || `类型${r.type}`
+      const levels = r.batch_levels?.length ?? 0
+      return r.batch_enabled && levels ? `${label}（分批 ${levels} 档）` : label
+    })
+    .join(' · ')
 }
 
 function fmtTime(sec: number | null | undefined): string {
@@ -286,6 +452,7 @@ function resetRuleToTemplate(idx: number): void {
         <div class="list-field"><span class="k">规则</span><span class="v">{{ ruleSummary(s.rules) }}</span></div>
         <div class="list-field"><span class="k">创建时间</span><span class="v muted" style="font-size: 12px">{{ fmtTime(s.created_at) }}</span></div>
         <div class="list-card-actions">
+          <button class="btn-sm btn-ghost" @click="openEdit(s)">编辑</button>
           <button class="btn-sm" :class="s.enabled ? 'btn-ghost' : 'btn-danger'" @click="toggleEnabled(s)">
             {{ s.enabled ? '禁用' : '启用' }}
           </button>
@@ -327,7 +494,10 @@ function resetRuleToTemplate(idx: number): void {
               </button>
             </td>
             <td class="right">
-              <button class="btn-sm btn-danger" @click="remove(s)">删除</button>
+              <div class="row" style="gap: 6px; justify-content: flex-end">
+                <button class="btn-sm btn-ghost" @click="openEdit(s)">编辑</button>
+                <button class="btn-sm btn-danger" @click="remove(s)">删除</button>
+              </div>
             </td>
           </tr>
           <tr v-if="!hub.strategies.length && !loading">
@@ -339,13 +509,17 @@ function resetRuleToTemplate(idx: number): void {
       </table>
     </div>
 
-    <!-- 新增策略弹窗 -->
+    <!-- 新建 / 编辑策略弹窗 -->
     <div v-if="showForm" class="modal-mask" @click.self="showForm = false">
       <div class="card modal modal-lg strategy-form-modal">
         <div class="modal-header card-pad" style="padding-bottom: 0">
-          <div class="h1">新增策略</div>
+          <div class="h1">{{ isEditMode ? '编辑策略' : '新增策略' }}</div>
           <p class="muted" style="font-size: 12px; margin: 4px 0 0">
-            选择策略模版 → 填写名称 / 品种 → 自定义规则参数后创建
+            {{
+              isEditMode
+                ? '可修改名称、绑定品种与规则参数；模版创建后不可更换'
+                : '选择策略模版 → 填写名称 / 品种 → 自定义规则参数后创建'
+            }}
           </p>
         </div>
 
@@ -353,14 +527,27 @@ function resetRuleToTemplate(idx: number): void {
           <div class="form-grid">
             <div class="field">
               <FormLabel field-id="strategy-template" text="策略模版" :help="FIELD_HELP.template" />
-              <select id="strategy-template" v-model="form.template_id">
+              <select
+                id="strategy-template"
+                v-model="form.template_id"
+                :disabled="isEditMode"
+              >
                 <option disabled value="">请选择模版</option>
                 <option v-for="t in templates" :key="t.template_id" :value="t.template_id">
                   {{ t.name }}
                 </option>
+                <option
+                  v-if="isEditMode && form.template_id && !selectedTemplate"
+                  :value="form.template_id"
+                >
+                  {{ formTemplateLabel }}
+                </option>
               </select>
               <p v-if="selectedTemplate" class="muted" style="font-size: 12px; margin-top: 6px">
                 {{ selectedTemplate.description }}
+              </p>
+              <p v-else-if="isEditMode" class="muted" style="font-size: 12px; margin-top: 6px">
+                当前模版：{{ formTemplateLabel }}
               </p>
             </div>
 
@@ -385,7 +572,9 @@ function resetRuleToTemplate(idx: number): void {
           <div v-if="form.rules.length" class="rules-editor">
             <div class="rules-editor-head">
               <FormLabel text="规则参数" :help="FIELD_HELP.rules" />
-              <span class="muted" style="font-size: 12px">切换模版会重新载入默认值</span>
+              <span class="muted" style="font-size: 12px">
+                {{ isEditMode ? '可按需调整规则；「恢复默认」将回退到模版默认值' : '切换模版会重新载入默认值' }}
+              </span>
             </div>
 
             <div v-for="(r, idx) in form.rules" :key="`${r.type}-${idx}`" class="rule-panel">
@@ -413,31 +602,162 @@ function resetRuleToTemplate(idx: number): void {
                 <div class="field">
                   <FormLabel :field-id="`rule-${idx}-action`" text="监控方向" :help="FIELD_HELP.action" />
                   <select :id="`rule-${idx}-action`" v-model="r.action">
-                    <option value="all">all（全部）</option>
-                    <option value="buy">buy（只监控多单）</option>
-                    <option value="sell">sell（只监控空单）</option>
+                    <option value="all">全部</option>
+                    <option value="buy">多单</option>
+                    <option value="sell">空单</option>
                   </select>
                 </div>
                 <div class="field">
-                  <FormLabel :field-id="`rule-${idx}-point`" text="point" :help="FIELD_HELP.point" />
+                  <FormLabel :field-id="`rule-${idx}-point`" text="点数" :help="FIELD_HELP.point" />
                   <input :id="`rule-${idx}-point`" v-model.number="r.point" type="number" min="0" step="1" />
                 </div>
                 <div class="field">
-                  <FormLabel :field-id="`rule-${idx}-lot-times`" text="lot_times" :help="FIELD_HELP.lot_times" />
+                  <FormLabel :field-id="`rule-${idx}-lot-times`" text="倍数" :help="FIELD_HELP.lot_times" />
                   <input :id="`rule-${idx}-lot-times`" v-model.number="r.lot_times" type="number" min="0" step="0.01" />
                 </div>
                 <div class="field">
-                  <FormLabel :field-id="`rule-${idx}-extra-lot`" text="extra_lot" :help="FIELD_HELP.extra_lot" />
+                  <FormLabel :field-id="`rule-${idx}-extra-lot`" text="手数" :help="FIELD_HELP.extra_lot" />
                   <input :id="`rule-${idx}-extra-lot`" v-model.number="r.extra_lot" type="number" min="0" step="0.01" />
                 </div>
                 <div class="field">
-                  <FormLabel :field-id="`rule-${idx}-max-allow`" text="max_allow_num" :help="FIELD_HELP.max_allow_num" />
+                  <FormLabel :field-id="`rule-${idx}-max-allow`" text="次数" :help="FIELD_HELP.max_allow_num" />
                   <input :id="`rule-${idx}-max-allow`" v-model.number="r.max_allow_num" type="number" min="0" step="1" />
                 </div>
               </div>
               <p class="rule-hint">
                 手数 = {{ r.lot_times }} × 基础手数 + {{ r.extra_lot }}；触发 = {{ r.point }} × Point()
               </p>
+
+              <div class="batch-block">
+                <div class="batch-head">
+                  <div class="rule-enable-wrap">
+                    <FormLabel text="分批加仓" :help="FIELD_HELP.batch_enabled" />
+                    <input
+                      type="checkbox"
+                      :checked="r.batch_enabled"
+                      :aria-label="`启用${RULE_TYPE_LABEL[r.type] || '本条规则'}分批加仓`"
+                      @change="setBatchEnabled(r, ($event.target as HTMLInputElement).checked)"
+                    />
+                  </div>
+                  <span v-if="r.batch_enabled" class="muted batch-count-hint">
+                    共 {{ r.batch_count }} 批
+                  </span>
+                </div>
+
+                <template v-if="r.batch_enabled">
+                  <div class="batch-top-grid">
+                    <div class="field">
+                      <FormLabel
+                        :field-id="`rule-${idx}-batch-action`"
+                        text="分批方向"
+                        :help="FIELD_HELP.batch_action"
+                      />
+                      <select :id="`rule-${idx}-batch-action`" v-model="r.batch_action">
+                        <option value="all">全部</option>
+                        <option value="buy">多单</option>
+                        <option value="sell">空单</option>
+                      </select>
+                    </div>
+                    <div class="field">
+                      <FormLabel
+                        :field-id="`rule-${idx}-batch-count`"
+                        text="批数"
+                        :help="FIELD_HELP.batch_count"
+                      />
+                      <input
+                        :id="`rule-${idx}-batch-count`"
+                        v-model.number="r.batch_count"
+                        type="number"
+                        min="1"
+                        step="1"
+                        @change="onBatchMetaChange(r)"
+                      />
+                    </div>
+                    <div class="field">
+                      <FormLabel
+                        :field-id="`rule-${idx}-total-lot`"
+                        text="总手数"
+                        :help="FIELD_HELP.total_lot_limit"
+                      />
+                      <input
+                        :id="`rule-${idx}-total-lot`"
+                        v-model.number="r.total_lot_limit"
+                        type="number"
+                        :min="BATCH_POS_START"
+                        step="1"
+                        @change="onBatchMetaChange(r)"
+                      />
+                    </div>
+                  </div>
+
+                  <div class="batch-levels">
+                    <div v-for="(lv, li) in r.batch_levels" :key="li" class="batch-level">
+                      <span class="batch-level-no">└{{ li + 1 }}</span>
+                      <div class="field batch-range">
+                        <FormLabel text="持仓笔数" :help="FIELD_HELP.batch_level" />
+                        <div class="batch-range-value" title="由批数与总手数自动生成">
+                          {{ lv.pos_from }} ~ {{ lv.pos_to }}
+                        </div>
+                      </div>
+                      <div class="field">
+                        <FormLabel
+                          :field-id="`rule-${idx}-lv-${li}-calc`"
+                          text="计算方式"
+                          :help="FIELD_HELP.calc_type"
+                        />
+                        <select :id="`rule-${idx}-lv-${li}-calc`" v-model="lv.calc_type">
+                          <option value="point">点数</option>
+                        </select>
+                      </div>
+                      <div class="field">
+                        <FormLabel
+                          :field-id="`rule-${idx}-lv-${li}-point`"
+                          text="点数"
+                          :help="FIELD_HELP.point"
+                        />
+                        <input
+                          :id="`rule-${idx}-lv-${li}-point`"
+                          v-model.number="lv.point"
+                          type="number"
+                          min="0"
+                          step="1"
+                        />
+                      </div>
+                      <div class="field">
+                        <FormLabel
+                          :field-id="`rule-${idx}-lv-${li}-times`"
+                          text="倍数"
+                          :help="FIELD_HELP.lot_times"
+                        />
+                        <input
+                          :id="`rule-${idx}-lv-${li}-times`"
+                          v-model.number="lv.lot_times"
+                          type="number"
+                          min="0"
+                          step="0.01"
+                        />
+                      </div>
+                      <div class="field">
+                        <FormLabel
+                          :field-id="`rule-${idx}-lv-${li}-extra`"
+                          text="手数"
+                          :help="FIELD_HELP.extra_lot"
+                        />
+                        <input
+                          :id="`rule-${idx}-lv-${li}-extra`"
+                          v-model.number="lv.extra_lot"
+                          type="number"
+                          min="0"
+                          step="0.01"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                  <p class="rule-hint">
+                    档位区间由批数 × 总手数自动切分（第 {{ BATCH_POS_START }} 笔 ~ 第 {{ Math.floor(r.total_lot_limit) }} 笔），不可手动添加
+                  </p>
+                </template>
+              </div>
             </div>
           </div>
 
@@ -449,7 +769,7 @@ function resetRuleToTemplate(idx: number): void {
           <div class="row" style="gap: 8px">
             <button class="btn-ghost" :disabled="saving" @click="showForm = false">取消</button>
             <button class="btn-primary" :disabled="saving" @click="save">
-              {{ saving ? '保存中…' : '创建' }}
+              {{ saving ? '保存中…' : isEditMode ? '保存' : '创建' }}
             </button>
           </div>
         </div>
@@ -540,7 +860,6 @@ function resetRuleToTemplate(idx: number): void {
 }
 
 .rule-grid :deep(.form-label-row) {
-  font-family: var(--mono);
   white-space: nowrap;
 }
 
@@ -565,9 +884,117 @@ function resetRuleToTemplate(idx: number): void {
   color: var(--muted);
 }
 
+.batch-block {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--glass-border);
+}
+
+.batch-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.batch-count-hint {
+  font-size: 12px;
+}
+
+.batch-top-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px 12px;
+  align-items: start;
+  margin-top: 12px;
+  max-width: 640px;
+}
+
+.batch-levels {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.batch-level {
+  display: grid;
+  grid-template-columns: 28px minmax(88px, 0.9fr) repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  align-items: end;
+}
+
+.batch-level-no {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--muted);
+  padding-bottom: 8px;
+}
+
+.batch-range-value {
+  display: flex;
+  align-items: center;
+  min-height: 34px;
+  padding: 0 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--glass-border);
+  background: color-mix(in srgb, var(--bg-soft) 70%, transparent);
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--muted);
+  user-select: none;
+}
+
+.batch-top-grid .field,
+.batch-level .field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.batch-top-grid :deep(.form-label-wrap),
+.batch-level :deep(.form-label-wrap) {
+  margin-bottom: 0;
+}
+
+.batch-top-grid :deep(.form-label-row),
+.batch-level :deep(.form-label-row) {
+  white-space: nowrap;
+}
+
+.batch-top-grid :deep(.field-help-popover),
+.batch-level :deep(.field-help-popover) {
+  position: absolute;
+  z-index: 5;
+  left: 0;
+  right: auto;
+  min-width: 220px;
+  max-width: min(320px, 70vw);
+}
+
+.batch-top-grid input,
+.batch-top-grid select,
+.batch-level input,
+.batch-level select {
+  width: 100%;
+  min-width: 0;
+}
+
 @media (max-width: 900px) {
   .rule-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+  .batch-top-grid {
+    grid-template-columns: 1fr 1fr;
+    max-width: none;
+  }
+  .batch-level {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .batch-level-no {
+    grid-column: 1 / -1;
+    padding-bottom: 0;
   }
 }
 
@@ -583,6 +1010,13 @@ function resetRuleToTemplate(idx: number): void {
   }
   .rules-editor-head {
     flex-wrap: wrap;
+  }
+  .batch-top-grid {
+    grid-template-columns: 1fr;
+    max-width: none;
+  }
+  .batch-level {
+    grid-template-columns: 1fr 1fr;
   }
 }
 </style>
