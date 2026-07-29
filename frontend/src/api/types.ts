@@ -262,6 +262,7 @@ export interface StrategyUpdatePayload {
 }
 
 /** 主任务在单个节点上的下发与完成情况 */
+/** 子节点信号任务：pending/sent/opened/running/closing/done/failed/skipped/offline */
 export interface GroupTaskDispatchRecord {
   id: number
   node_id: string
@@ -275,7 +276,17 @@ export interface GroupTaskDispatchRecord {
   price: number | null
   error: string | null
   magic: number | null
+  /** 当前该魔术号的持仓笔数 */
+  position_count: number
+  /** 已加仓次数 */
+  add_count: number
+  total_orders: number
+  total_volume: number
+  realized_profit: number
+  finish_reason: string | null
   dispatched_at: number | null
+  opened_at: number | null
+  last_report_at: number | null
   finished_at: number | null
 }
 
@@ -295,12 +306,21 @@ export interface GroupSignalTaskRecord {
   comment: string | null
   source_ip: string | null
   raw_payload: string | null
+  /** 触发时绑定的策略 */
+  strategy_id: string | null
+  strategy_name: string | null
   dispatch_mode: GroupDispatchMode
   payload: Record<string, unknown> | null
   node_ids: string[]
   node_count: number
+  /** pending/dispatching/running/done/partial/failed/skipped */
   status: string
   skip_reason: string | null
+  /** 策略托管汇总（各子任务累加） */
+  total_orders: number
+  total_volume: number
+  realized_profit: number
+  opened_at: number | null
   finished_at: number | null
   dispatches: GroupTaskDispatchRecord[]
 }

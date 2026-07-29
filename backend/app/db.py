@@ -112,6 +112,49 @@ def _migrate_node_group_strategy_id(sync_conn) -> None:
         )
 
 
+def _migrate_group_task_strategy_columns(sync_conn) -> None:
+    """为已存在的分组任务表补充策略托管所需列（create_all 不会改已存在的表）。"""
+    inspector = inspect(sync_conn)
+    tables = set(inspector.get_table_names())
+    dialect = sync_conn.engine.dialect.name
+    json_type = "JSON" if dialect == "mysql" else "TEXT"
+
+    if "group_signal_task" in tables:
+        cols = {c["name"] for c in inspector.get_columns("group_signal_task")}
+        additions = {
+            "strategy_id": "VARCHAR(32)",
+            "strategy_name": "VARCHAR(64)",
+            "strategy_snapshot_json": json_type,
+            "opened_at": "DATETIME",
+            "total_orders": "INTEGER NOT NULL DEFAULT 0",
+            "total_volume": "FLOAT NOT NULL DEFAULT 0",
+            "realized_profit": "FLOAT NOT NULL DEFAULT 0",
+        }
+        for name, ddl in additions.items():
+            if name not in cols:
+                sync_conn.execute(
+                    text(f"ALTER TABLE group_signal_task ADD COLUMN {name} {ddl}")
+                )
+
+    if "group_task_dispatch" in tables:
+        cols = {c["name"] for c in inspector.get_columns("group_task_dispatch")}
+        additions = {
+            "position_count": "INTEGER NOT NULL DEFAULT 0",
+            "add_count": "INTEGER NOT NULL DEFAULT 0",
+            "total_orders": "INTEGER NOT NULL DEFAULT 0",
+            "total_volume": "FLOAT NOT NULL DEFAULT 0",
+            "realized_profit": "FLOAT NOT NULL DEFAULT 0",
+            "finish_reason": "VARCHAR(64)",
+            "opened_at": "DATETIME",
+            "last_report_at": "DATETIME",
+        }
+        for name, ddl in additions.items():
+            if name not in cols:
+                sync_conn.execute(
+                    text(f"ALTER TABLE group_task_dispatch ADD COLUMN {name} {ddl}")
+                )
+
+
 def _drop_legacy_nodes_table(sync_conn) -> None:
     """v0.2 迁移：旧表带 `token_hash` 列（一节点一令牌）；新方案改为全局共享令牌，
     且 `mt5_login` 升级为 UNIQUE NOT NULL，无法平滑 ALTER —— 直接丢弃旧表，由
@@ -138,4 +181,5 @@ async def init_db() -> None:
         await conn.run_sync(_migrate_signal_source_column)
         await conn.run_sync(_migrate_audit_columns)
         await conn.run_sync(_migrate_node_group_strategy_id)
+        await conn.run_sync(_migrate_group_task_strategy_columns)
     logger.info("Database initialized (%s)", engine.url.render_as_string(hide_password=True))

@@ -115,6 +115,23 @@ class MockMT5Client:
             "closed": 1,
         }
 
+    def positions_by_magic(self, magic: int) -> list[dict]:
+        target = int(magic)
+        return [dict(p) for p in self._positions if int(p.get("magic") or 0) == target]
+
+    def close_by_magic(self, magic: int) -> dict:
+        target = int(magic)
+        closed = sum(1 for p in self._positions if int(p.get("magic") or 0) == target)
+        self._positions = [
+            p for p in self._positions if int(p.get("magic") or 0) != target
+        ]
+        return {"success": True, "action": "CLOSE", "magic": target, "closed": closed}
+
+    def symbol_point(self, symbol: str) -> float:
+        mid = float(self.prices_map.get(symbol.upper(), 1.0))
+        # 与常见券商一致：五位报价品种 0.00001，金/指数类 0.01
+        return 0.01 if mid >= 100 else 0.00001
+
     def close_symbol(self, symbol: str) -> dict:
         base = symbol.upper().replace("/", "")
         keep, closed = [], 0

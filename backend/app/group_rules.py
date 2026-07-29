@@ -46,6 +46,25 @@ def resolve_volume(signal_volume: float) -> float:
     return min(max(vol, 0.0), Config.MAX_LOT_SIZE)
 
 
+def normalize_symbol_key(symbol: object) -> str:
+    """品种归一化：去掉非字母数字并大写，便于跨券商比较。"""
+    text = str(symbol or "").upper()
+    return "".join(ch for ch in text if ch.isalnum())
+
+
+def symbol_match(strategy_symbol: object, signal_symbol: object) -> bool:
+    """策略绑定品种与信号品种是否同一标的。
+
+    不同券商对同一标的会加后缀（XAUUSD / XAUUSDm / XAUUSD.pro），因此归一化后
+    只要互为前缀即视为匹配，与节点侧 resolve_symbol 的宽松口径保持一致。
+    """
+    a = normalize_symbol_key(strategy_symbol)
+    b = normalize_symbol_key(signal_symbol)
+    if not a or not b:
+        return False
+    return a.startswith(b) or b.startswith(a)
+
+
 def task_magic(task_id: int) -> int:
     """主任务号 -> MT5 魔术号（基数 + 任务号）。"""
     return Config.GROUP_TASK_MAGIC_BASE + int(task_id)
@@ -108,11 +127,23 @@ def reconcile_rotation(order: list[str], participants: list[str]) -> list[str]:
     return merged
 
 
-def aggregate_task_status(dispatch_statuses: list[str]) -> str:
-    """按各节点明细汇总主任务状态。
+# 子任务在途状态：命令已投递但策略尚未收口
+SUBTASK_PENDING = ("pending", "sent")
+# 子任务运行态：首单已成交，节点正在按策略监控与加仓
+SUBTASK_RUNNING = ("opened", "running", "closing")
+# 子任务终态：不再变化，可参与主任务收口
+SUBTASK_TERMINAL = ("done", "failed", "skipped", "offline")
 
-    - 无明细 -> skipped（没有任何节点被下发）
-    - 仍有 pending/sent -> dispatching
+# 主任务未收口状态：分组互斥锁据此判断「有进行中的任务」
+TASK_ACTIVE = ("pending", "dispatching", "running")
+
+
+def aggregate_task_status(dispatch_statuses: list[str]) -> str:
+    """按各子任务状态汇总主任务状态。
+
+    - 无子任务 -> skipped（没有任何节点被下发）
+    - 仍有 pending/sent -> dispatching（还没确认首单）
+    - 有 opened/running/closing -> running（策略在跑）
     - 既有成功又有失败 -> partial
     - 任一成功（无失败）-> done
     - 全部失败 -> failed
@@ -120,7 +151,9 @@ def aggregate_task_status(dispatch_statuses: list[str]) -> str:
     """
     if not dispatch_statuses:
         return "skipped"
-    if any(st in ("pending", "sent") for st in dispatch_statuses):
+    if any(st in SUBTASK_RUNNING for st in dispatch_statuses):
+        return "running"
+    if any(st in SUBTASK_PENDING for st in dispatch_statuses):
         return "dispatching"
     has_done = any(st == "done" for st in dispatch_statuses)
     has_failed = any(st in ("failed", "offline") for st in dispatch_statuses)
@@ -131,3 +164,16 @@ def aggregate_task_status(dispatch_statuses: list[str]) -> str:
     if has_failed:
         return "failed"
     return "skipped"
+
+
+def strategy_rules_snapshot(strategy: Optional[dict]) -> Optional[dict]:
+    """把绑定策略压成随任务下发的快照，运行期不再受策略后续编辑影响。"""
+    if not strategy:
+        return None
+    return {
+        "strategy_id": strategy.get("strategy_id"),
+        "name": strategy.get("name"),
+        "symbol": strategy.get("symbol"),
+        "template_id": strategy.get("template_id"),
+        "rules": [dict(r) for r in (strategy.get("rules") or []) if isinstance(r, dict)],
+    }

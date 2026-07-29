@@ -64,9 +64,18 @@ def _wait_task_status(client, headers, group_id: str, expected: str, tries: int 
     return page
 
 
-def _mk_group(client, headers, **body) -> dict:
+def _mk_group(client, headers, *, symbol="XAUUSD", **body) -> dict:
+    """建分组；默认自动绑定一条同品种策略（strategy 信号只进已绑策略的分组）。
+
+    显式传 strategy_id=None 表示不绑定。
+    """
     payload = {"name": "组一", "enabled": True, "dispatch_mode": "sync", "node_ids": []}
     payload.update(body)
+    if "strategy_id" not in payload:
+        sty = _mk_strategy(
+            client, headers, name=f"策略-{payload['name']}", symbol=symbol,
+        )
+        payload["strategy_id"] = sty["strategy_id"]
     r = client.post("/api/groups", json=payload, headers=headers)
     assert r.status_code == 201, r.text
     return r.json()
@@ -91,7 +100,7 @@ def test_create_group_response_shape(client):
     node_id = _mk_node(client, h, 5101, "节点A")
 
     g = _mk_group(client, h, name="黄金策略组", dispatch_mode="poll",
-                  remark="测试组", node_ids=[node_id])
+                  remark="测试组", node_ids=[node_id], strategy_id=None)
 
     assert g["group_id"].startswith("grp_")
     assert g["name"] == "黄金策略组"
@@ -437,7 +446,7 @@ def test_strategy_without_group_is_rejected(client):
 def test_strategy_ignores_symbol_config(client):
     """规则隔离：品种完全没在中控台配置，strategy 信号仍进入分组链路。"""
     h = auth_headers(client)
-    _mk_group(client, h, name="隔离验证组")
+    _mk_group(client, h, name="隔离验证组", symbol="USDJPY")
     r = client.post(
         "/webhook",
         json={"action": "buy", "symbol": "USDJPY", "volume": 0.1, "model": "strategy"},
@@ -455,7 +464,7 @@ def test_normal_and_strategy_not_deduped_against_each_other(client):
     """去重指纹带 model：同一笔行情的两种模型信号互不误判为重复。"""
     h = auth_headers(client)
     seed_default_filters(client)
-    _mk_group(client, h, name="去重验证组")
+    _mk_group(client, h, name="去重验证组", symbol="EURUSD")
     payload = {"action": "buy", "symbol": "EURUSD", "volume": 0.1}
 
     first = client.post("/webhook", json=payload).json()
@@ -521,15 +530,17 @@ def test_strategy_end_to_end_sync(client):
         cmd1 = ws1.receive_json()
         cmd2 = ws2.receive_json()
         for cmd in (cmd1, cmd2):
-            assert cmd["cmd"] == "open"
-            assert cmd["action"] == "BUY"
-            assert cmd["symbol"] == "XAUUSD"
-            assert cmd["volume"] == 0.2
+            assert cmd["cmd"] == "strategy_start"
+            assert cmd["entry"]["action"] == "BUY"
+            assert cmd["entry"]["symbol"] == "XAUUSD"
+            assert cmd["entry"]["volume"] == 0.2
             assert cmd["model"] == "strategy"
             assert cmd["group_id"] == gid
             assert cmd["task_id"] == task["task_id"]
             # MT5 下单用的魔术号即主任务号换算值
             assert cmd["magic"] == task["magic"]
+            # 策略规则随命令下发，节点据此常驻加仓
+            assert cmd["strategy"]["symbol"] == "XAUUSD"
 
         ws1.send_json({"type": "trade_result", "data": {
             "signal_id": cmd1["signal_id"], "magic": cmd1["magic"],
@@ -539,7 +550,15 @@ def test_strategy_end_to_end_sync(client):
             "signal_id": cmd2["signal_id"], "magic": cmd2["magic"],
             "symbol": "XAUUSD", "success": False, "error": "no money",
         }})
-        # 一成一败 -> 主任务收口为 partial（连接保持打开，等回报处理完）
+        # n1 首单成交进入 opened，主任务处于 running（策略仍在跑）
+        _wait_task_status(client, h, gid, "running")
+
+        # n1 上报持仓已全平 -> 一成一败，主任务收口为 partial
+        ws1.send_json({"type": "strategy_finished", "data": {
+            "task_id": task["task_id"], "magic": cmd1["magic"],
+            "status": "done", "reason": "positions_cleared",
+            "total_orders": 2, "total_volume": 0.42, "realized_profit": 8.0,
+        }})
         page = _wait_task_status(client, h, gid, "partial")
 
     assert page["total"] == 1
@@ -554,14 +573,17 @@ def test_strategy_end_to_end_sync(client):
     assert item["dispatch_mode"] == "sync"
     assert item["node_count"] == 2
     assert set(item["node_ids"]) == {n1, n2}
-    assert item["payload"]["cmd"] == "open"
+    assert item["payload"]["cmd"] == "strategy_start"
     assert item["status"] == "partial"      # 一成一败
+    assert item["total_orders"] == 2
+    assert item["realized_profit"] == 8.0
 
     by_node = {d["node_id"]: d for d in item["dispatches"]}
     assert by_node[n1]["status"] == "done"
     assert by_node[n1]["node_name"] == "节点甲"
     assert by_node[n1]["order"] == 7001
     assert by_node[n1]["price"] == 2400.5
+    assert by_node[n1]["finish_reason"] == "positions_cleared"
     assert by_node[n1]["magic"] == task["magic"]
     assert by_node[n2]["status"] == "failed"
     assert by_node[n2]["error"] == "no money"
@@ -592,14 +614,20 @@ def test_strategy_end_to_end_poll_only_one_node(client):
         }).json()
         assert first["targets"] == 1
         cmd1 = ws1.receive_json()          # 队首节点领取
-        assert cmd1["cmd"] == "open"
+        assert cmd1["cmd"] == "strategy_start"
+
+        # 分组互斥：第一条任务收口后才能接收下一条
+        ws1.send_json({"type": "strategy_finished", "data": {
+            "task_id": cmd1["task_id"], "magic": cmd1["magic"], "status": "done",
+        }})
+        _wait_task_status(client, h, gid, "done")
 
         second = client.post("/webhook", json={
             "action": "buy", "symbol": "XAUUSD", "volume": 0.3, "model": "strategy",
         }).json()
         assert second["targets"] == 1
         cmd2 = ws2.receive_json()          # 轮转到下一个节点
-        assert cmd2["volume"] == 0.3
+        assert cmd2["entry"]["volume"] == 0.3
         assert cmd2["task_id"] != cmd1["task_id"]
 
     page = client.get(f"/api/groups/{gid}/signals", headers=h).json()
@@ -610,13 +638,14 @@ def test_strategy_end_to_end_poll_only_one_node(client):
         assert len(item["dispatches"]) == 1
 
 
-def test_strategy_close_broadcasts_in_group(client):
+def test_strategy_close_terminates_running_task(client):
+    """CLOSE 是终止指令：绕过互斥，让在跑的节点平掉该魔术号持仓。"""
     h = auth_headers(client)
     token = _node_token(client, h)
     n1 = _mk_node(client, h, 5221)
     n2 = _mk_node(client, h, 5222)
     gid = _mk_group(
-        client, h, name="平仓端到端组", dispatch_mode="poll", node_ids=[n1, n2],
+        client, h, name="平仓端到端组", dispatch_mode="sync", node_ids=[n1, n2],
     )["group_id"]
 
     with client.websocket_connect("/ws/node") as ws1, \
@@ -626,22 +655,35 @@ def test_strategy_close_broadcasts_in_group(client):
         ws2.send_json({"type": "auth", "data": {"token": token, "mt5_login": 5222}})
         assert ws2.receive_json()["type"] == "auth_ok"
 
+        client.post("/webhook", json={
+            "action": "buy", "symbol": "XAUUSD", "volume": 0.1, "model": "strategy",
+        })
+        start1 = ws1.receive_json()
+        start2 = ws2.receive_json()
+        assert start1["cmd"] == "strategy_start"
+        for ws, cmd in ((ws1, start1), (ws2, start2)):
+            ws.send_json({"type": "trade_result", "data": {
+                "signal_id": cmd["signal_id"], "magic": cmd["magic"],
+                "symbol": "XAUUSD", "success": True, "order": 1,
+            }})
+        _wait_task_status(client, h, gid, "running")
+
         r = client.post("/webhook", json={
             "action": "close", "symbol": "XAUUSD", "model": "strategy",
         }).json()
-        assert r["mode"] == "group"
-        assert r["targets"] == 2            # CLOSE 不受 poll 限制，组内全员平仓
+        assert r["mode"] == "group_close"
+        assert r["targets"] == 2            # 在跑的节点全部收到终止指令
 
         for ws in (ws1, ws2):
             cmd = ws.receive_json()
-            assert cmd["cmd"] == "close"
-            assert cmd["close_target"] == "symbol"
-            assert cmd["close_symbol"] == "XAUUSD"
+            assert cmd["cmd"] == "strategy_stop"
+            assert cmd["magic"] == start1["magic"]
             assert cmd["group_id"] == gid
             assert cmd["model"] == "strategy"
 
     page = client.get(f"/api/groups/{gid}/signals", headers=h).json()
-    assert page["items"][0]["action"] == "CLOSE"
+    assert page["total"] == 1               # CLOSE 不新建主任务
+    assert page["items"][0]["action"] == "BUY"
 def test_disabled_group_receives_nothing(client):
     h = auth_headers(client)
     token = _node_token(client, h)
@@ -663,7 +705,7 @@ def test_disabled_group_receives_nothing(client):
         }).json()
         assert r["groups"] == 1
         assert r["targets"] == 1
-        assert ws1.receive_json()["cmd"] == "open"
+        assert ws1.receive_json()["cmd"] == "strategy_start"
 
     assert client.get(f"/api/groups/{on_gid}/signals", headers=h).json()["total"] == 1
     assert client.get(f"/api/groups/{off_gid}/signals", headers=h).json()["total"] == 0
@@ -694,7 +736,7 @@ def test_strategy_skips_disabled_node_in_group(client):
             "action": "buy", "symbol": "XAUUSD", "volume": 0.1, "model": "strategy",
         }).json()
         assert r["targets"] == 1
-        assert ws1.receive_json()["cmd"] == "open"
+        assert ws1.receive_json()["cmd"] == "strategy_start"
 
     page = client.get(f"/api/groups/{gid}/signals", headers=h).json()
     assert page["items"][0]["node_ids"] == [n1]

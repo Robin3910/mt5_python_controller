@@ -387,6 +387,32 @@ class MT5Client:
                 return self.close_position(p)
         return {"success": False, "action": "CLOSE", "ticket": ticket, "error": f"position not found: {ticket}"}
 
+    def positions_by_magic(self, magic: int) -> list[dict]:
+        """按魔术号筛选持仓：策略托管任务据此判断自己是否已全平。"""
+        target = int(magic)
+        return [p for p in self.positions() if int(p.get("magic") or 0) == target]
+
+    def close_by_magic(self, magic: int) -> dict:
+        """平掉某魔术号的全部持仓（只动本任务的单，不影响同品种其它持仓）。"""
+        results = [self.close_position(p) for p in self.positions_by_magic(magic)]
+        ok = all(r.get("success") for r in results) if results else True
+        return {
+            "success": ok,
+            "action": "CLOSE",
+            "magic": int(magic),
+            "closed": len(results),
+            "results": results,
+        }
+
+    def symbol_point(self, symbol: str) -> float:
+        """品种最小价格变动单位；解析不到时返回 0（调用方据此跳过判定）。"""
+        self.ensure()
+        resolved = self.resolve_symbol(symbol)
+        if not resolved:
+            return 0.0
+        info = mt5.symbol_info(resolved)
+        return float(getattr(info, "point", 0.0) or 0.0) if info else 0.0
+
     def close_symbol(self, symbol: str) -> dict:
         """平掉某品种的所有持仓（兼容券商后缀）。"""
         base = symbol.upper().replace("/", "")

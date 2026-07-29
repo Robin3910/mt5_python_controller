@@ -190,6 +190,11 @@ class GroupSignalTask(Base):
 
     task_id 即“任务号”，下发到节点执行 MT5 操作时用作魔术号（见 magic 列），
     便于按魔术号从 MT5 订单反查是哪条信号、哪个分组下发的。
+    同一主任务下所有节点共用一个魔术号——各节点是独立 MT5 账户，
+    magic 在单账户内已足以圈定本次任务的首单与全部加仓单。
+
+    主任务是长周期的：绑定策略后由节点持续监控加仓，直到该 magic 的持仓全部平掉，
+    因此 status 增加了 running（策略运行中）这一中间态。
     """
     __tablename__ = "group_signal_task"
 
@@ -208,19 +213,33 @@ class GroupSignalTask(Base):
     comment: Mapped[str | None] = mapped_column(String(128), nullable=True)
     source_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
     raw_payload: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # —— 绑定策略（触发时快照，运行期不受策略后续编辑影响）——
+    strategy_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    strategy_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    strategy_snapshot_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # —— 分组信息与下发数据 ——
     dispatch_mode: Mapped[str] = mapped_column(String(8), default="sync")
     payload_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)   # 实际下发给节点的命令
     node_ids_json: Mapped[list | None] = mapped_column(JSON, nullable=True)  # 下发节点 ID 列表
     node_count: Mapped[int] = mapped_column(Integer, default=0)
-    # pending / dispatching / done / partial / failed / skipped
+    # pending / dispatching / running / done / partial / failed / skipped
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
     skip_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # —— 策略运行期汇总（各子任务累加）——
+    opened_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    total_orders: Mapped[int] = mapped_column(Integer, default=0)
+    total_volume: Mapped[float] = mapped_column(Float, default=0.0)
+    realized_profit: Mapped[float] = mapped_column(Float, default=0.0)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class GroupTaskDispatch(Base):
-    """主任务 × 节点：单个节点对某条主任务的下发与完成情况。"""
+    """子节点信号任务：主任务 × 节点，一对多。
+
+    生命周期：pending -> sent -> opened -> running -> closing -> done。
+    完成判定是「该节点上 magic 关联的持仓全部平掉」，由节点主动上报，
+    服务端再用账户快照对账兜底（见 group_persist.reconcile_*）。
+    """
     __tablename__ = "group_task_dispatch"
 
     id: Mapped[int] = mapped_column(AutoPK, primary_key=True, autoincrement=True)
@@ -230,7 +249,7 @@ class GroupTaskDispatch(Base):
     node_id: Mapped[str] = mapped_column(String(32), index=True)
     magic: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
     decided_vol: Mapped[float | None] = mapped_column(Float, nullable=True)
-    # pending / sent / done / failed / skipped / offline
+    # pending / sent / opened / running / closing / done / failed / skipped / offline
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
     skip_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
     retcode: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -238,8 +257,44 @@ class GroupTaskDispatch(Base):
     deal: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     price: Mapped[float | None] = mapped_column(Float, nullable=True)
     error: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # —— 策略运行期实时快照 ——
+    position_count: Mapped[int] = mapped_column(Integer, default=0)   # 当前 magic 持仓笔数
+    add_count: Mapped[int] = mapped_column(Integer, default=0)        # 已加仓次数
+    total_orders: Mapped[int] = mapped_column(Integer, default=0)     # 累计下单笔数
+    total_volume: Mapped[float] = mapped_column(Float, default=0.0)   # 累计手数
+    realized_profit: Mapped[float] = mapped_column(Float, default=0.0)
+    finish_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
     dispatched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    opened_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_report_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class GroupTaskEvent(Base):
+    """子任务的策略执行事件流：开仓 / 加仓 / 平仓 / 异常。
+
+    只记录状态变更事件；纯行情心跳不落库（只更新子任务的实时快照字段），
+    否则长周期任务会把表写爆。
+    """
+    __tablename__ = "group_task_event"
+
+    id: Mapped[int] = mapped_column(AutoPK, primary_key=True, autoincrement=True)
+    task_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    node_id: Mapped[str] = mapped_column(String(32), index=True)
+    magic: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
+    # open / add_counter / add_trend / close_partial / close_all / error / resume
+    event_type: Mapped[str] = mapped_column(String(16), index=True)
+    symbol: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    action: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    volume: Mapped[float | None] = mapped_column(Float, nullable=True)
+    price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    order_ticket: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    position_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_volume: Mapped[float | None] = mapped_column(Float, nullable=True)
+    profit: Mapped[float | None] = mapped_column(Float, nullable=True)
+    message: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    detail_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
 # ===================== 策略管理（加仓规则实例） =====================

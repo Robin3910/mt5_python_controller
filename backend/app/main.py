@@ -18,6 +18,7 @@ from . import (
     config_api,
     console_api,
     events,
+    group_persist,
     group_service,
     groups,
     node_service,
@@ -30,6 +31,7 @@ from . import (
     ws_gateway,
     twofa,
 )
+from .config import Config
 from .connections import manager
 from .db import init_db
 from .dispatcher import Dispatcher
@@ -63,6 +65,13 @@ async def lifespan(app: FastAPI):
     logger.info("warmed %d group(s) into cache", group_count)
     strategy_count = await strategy_service.warm_cache(store)
     logger.info("warmed %d strateg(y/ies) into cache", strategy_count)
+    # Redis 是易失的：重启后按库里未收口的主任务重建分组互斥占位，
+    # 否则同一分组会在任务仍在跑时又接收新的策略信号。
+    busy = await group_persist.active_group_ids()
+    for group_id, task_id in busy.items():
+        await store.set_group_busy(group_id, str(task_id), Config.GROUP_BUSY_TTL)
+    if busy:
+        logger.info("restored %d group busy marker(s)", len(busy))
     await user_service.seed_default_admin(store)
     # 保证全局节点接入令牌存在；首次启动自动生成（管理员可在「账户设置」页面查看/重置）
     token = await system_settings.ensure_node_token(store)

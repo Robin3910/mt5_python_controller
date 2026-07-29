@@ -14,6 +14,10 @@ class Config:
     # strategy 分组链路的魔术号基数：实际魔术号 = 基数 + 主任务号，保证与 normal 链路
     # 的固定魔术号不冲突，且能从 MT5 订单反查到具体的分组主任务。
     GROUP_TASK_MAGIC_BASE = int(os.getenv("GROUP_TASK_MAGIC_BASE", "900000000"))
+    # 分组互斥占位的兜底 TTL（秒）：节点永久离线时避免分组被锁死，到期自动放行
+    GROUP_BUSY_TTL = int(os.getenv("GROUP_BUSY_TTL", str(24 * 3600)))
+    # 节点上报策略执行快照的间隔（秒），随 strategy_start 下发
+    STRATEGY_REPORT_INTERVAL = int(os.getenv("STRATEGY_REPORT_INTERVAL", "5"))
 
     # —— 风控 ——
     MAX_LOT_SIZE = float(os.getenv("MAX_LOT_SIZE", "1.0"))          # 单笔最大手数

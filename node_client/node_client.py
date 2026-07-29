@@ -19,6 +19,7 @@ import websockets
 
 from config import get_settings
 from mt5_prompt import prompt_mt5_credentials
+from strategy_runner import StrategyRunner
 
 settings = get_settings()
 logging.basicConfig(
@@ -75,6 +76,8 @@ class NodeClient:
         self._stop = False
         # 中控台全局 filters 品种（auth_ok / watch_symbols 下发），与本地 WATCH_SYMBOLS 合并取价
         self.hub_symbols: set[str] = set()
+        # 策略托管任务：task_id -> StrategyRunner，断线时取消、重连后由服务端下发恢复
+        self.runners: dict[int, StrategyRunner] = {}
 
     async def run(self) -> None:
         """主入口：先连 MT5，再进入“连接-鉴权-服务”的自动重连循环。"""
@@ -234,6 +237,7 @@ class NodeClient:
         finally:
             for t in tasks:
                 t.cancel()
+            self._cancel_runners()
 
     async def _reporter(self, ws) -> None:
         """定时上报账户快照；发现换号则抛错结束会话。"""
@@ -283,8 +287,67 @@ class NodeClient:
             await self._do_open(ws, msg)
         elif cmd == "close":
             await self._do_close(ws, msg)
+        elif cmd == "strategy_start":
+            await self._do_strategy_start(ws, msg, resume=False)
+        elif cmd == "strategy_resume":
+            await self._do_strategy_start(ws, msg, resume=True)
+        elif cmd == "strategy_stop":
+            await self._do_strategy_stop(msg)
         else:
             logger.debug("ignored message: %s", msg)
+
+    # ---------------------- 策略托管 ----------------------
+    async def _do_strategy_start(self, ws, msg: dict, *, resume: bool) -> None:
+        """启动（或恢复）一个分组策略任务的常驻监控。"""
+        task_id = msg.get("task_id")
+        magic = msg.get("magic")
+        if not task_id or not magic:
+            logger.warning("strategy_start missing task_id/magic: %s", msg)
+            return
+        task_id = int(task_id)
+        existing = self.runners.get(task_id)
+        if existing and not existing.done:
+            logger.info("task %s already running, ignore duplicate start", task_id)
+            return
+
+        async def send(payload: dict) -> None:
+            await ws.send(json.dumps(payload))
+
+        runner = StrategyRunner(
+            task_id=task_id,
+            magic=int(magic),
+            group_id=msg.get("group_id") or "",
+            signal_id=msg.get("signal_id") or "",
+            entry=msg.get("entry") or {},
+            strategy=msg.get("strategy") or {},
+            exec_fn=self._exec,
+            send_fn=send,
+            report_interval=msg.get("report_interval") or 5,
+        )
+        self.runners[task_id] = runner
+        runner.start(self.mt5, resume=resume)
+        logger.info(
+            "strategy task %s %s (magic=%s symbol=%s)",
+            task_id, "resumed" if resume else "started", magic, (msg.get("entry") or {}).get("symbol"),
+        )
+
+    async def _do_strategy_stop(self, msg: dict) -> None:
+        """终止指令：平掉该任务魔术号的全部持仓并结束监控。"""
+        task_id = msg.get("task_id")
+        if not task_id:
+            return
+        runner = self.runners.get(int(task_id))
+        if not runner:
+            logger.info("strategy_stop for unknown task %s, ignored", task_id)
+            return
+        runner.request_stop(msg.get("reason") or "stop_command")
+        logger.info("strategy task %s stop requested", task_id)
+
+    def _cancel_runners(self) -> None:
+        """断线时取消本地监控循环；MT5 持仓保留，等重连后由服务端下发恢复。"""
+        for runner in self.runners.values():
+            runner.cancel()
+        self.runners.clear()
 
     async def _do_open(self, ws, msg: dict) -> None:
         """执行开仓并回报结果（带 signal_id/symbol 供服务端关联与释放锁）。"""

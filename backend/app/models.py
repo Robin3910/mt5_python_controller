@@ -190,7 +190,7 @@ class GroupOut(BaseModel):
 
 
 class GroupTaskDispatchRecord(BaseModel):
-    """主任务在单个节点上的下发与完成情况。"""
+    """子节点信号任务：主任务在单个节点上的下发、策略运行与完成情况。"""
     id: int
     node_id: str
     node_name: Optional[str] = None
@@ -203,7 +203,16 @@ class GroupTaskDispatchRecord(BaseModel):
     price: Optional[float] = None
     error: Optional[str] = None
     magic: Optional[int] = None
+    # —— 策略托管运行期快照 ——
+    position_count: int = 0
+    add_count: int = 0
+    total_orders: int = 0
+    total_volume: float = 0.0
+    realized_profit: float = 0.0
+    finish_reason: Optional[str] = None
     dispatched_at: Optional[float] = None
+    opened_at: Optional[float] = None
+    last_report_at: Optional[float] = None
     finished_at: Optional[float] = None
 
 
@@ -223,12 +232,19 @@ class GroupSignalTaskRecord(BaseModel):
     comment: Optional[str] = None
     source_ip: Optional[str] = None
     raw_payload: Optional[str] = None
+    strategy_id: Optional[str] = None
+    strategy_name: Optional[str] = None
     dispatch_mode: str = "sync"
     payload: Optional[dict] = None
     node_ids: list[str] = Field(default_factory=list)
     node_count: int = 0
     status: str = "pending"
     skip_reason: Optional[str] = None
+    # —— 策略托管汇总（各子任务累加）——
+    total_orders: int = 0
+    total_volume: float = 0.0
+    realized_profit: float = 0.0
+    opened_at: Optional[float] = None
     finished_at: Optional[float] = None
     dispatches: list[GroupTaskDispatchRecord] = Field(default_factory=list)
 

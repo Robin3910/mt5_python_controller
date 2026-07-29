@@ -18,12 +18,12 @@ from sqlalchemy import func, select, update
 
 from . import group_rules
 from .db import SessionLocal
-from .orm import GroupSignalTask, GroupTaskDispatch, SignalHistory
+from .orm import GroupSignalTask, GroupTaskDispatch, GroupTaskEvent, SignalHistory
 
 logger = logging.getLogger(__name__)
 
-# 明细终态；仍在途的不参与主任务收口
-_TERMINAL = frozenset({"done", "failed", "skipped", "offline"})
+# 子任务终态；仍在途的不参与主任务收口
+_TERMINAL = frozenset(group_rules.SUBTASK_TERMINAL)
 
 
 async def create_task(
@@ -34,6 +34,8 @@ async def create_task(
     dispatch_mode: str,
     source_ip: Optional[str] = None,
     raw_payload: Optional[str] = None,
+    strategy: Optional[dict] = None,
+    strategy_snapshot: Optional[dict] = None,
 ) -> Optional[dict]:
     """在下发节点之前创建一条分组主任务，返回 {task_id, magic}。
 
@@ -54,6 +56,9 @@ async def create_task(
                 comment=getattr(signal, "comment", None),
                 source_ip=source_ip,
                 raw_payload=raw_payload,
+                strategy_id=(strategy or {}).get("strategy_id"),
+                strategy_name=(strategy or {}).get("name"),
+                strategy_snapshot_json=strategy_snapshot,
                 dispatch_mode=dispatch_mode,
                 status="pending",
             )
@@ -66,6 +71,144 @@ async def create_task(
     except Exception as e:  # noqa: BLE001
         logger.warning("create_task failed: %s", e)
         return None
+
+
+async def active_task(group_id: str) -> Optional[dict]:
+    """分组当前进行中的主任务（互斥判定的权威来源）；没有则返回 None。"""
+    try:
+        async with SessionLocal() as s:
+            row = (
+                await s.execute(
+                    select(GroupSignalTask)
+                    .where(
+                        GroupSignalTask.group_id == group_id,
+                        GroupSignalTask.status.in_(group_rules.TASK_ACTIVE),
+                    )
+                    .order_by(GroupSignalTask.task_id.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if not row:
+                return None
+            return {
+                "task_id": row.task_id,
+                "magic": row.magic,
+                "group_id": row.group_id,
+                "signal_id": row.signal_id,
+                "status": row.status,
+                "symbol": row.symbol,
+                "action": row.action,
+                "volume": row.volume,
+                "dispatch_mode": row.dispatch_mode,
+                "strategy_snapshot": row.strategy_snapshot_json,
+            }
+    except Exception as e:  # noqa: BLE001
+        logger.warning("active_task failed: %s", e)
+        return None
+
+
+async def active_group_ids() -> dict[str, int]:
+    """所有存在进行中任务的分组 -> 任务号（服务端重启后重建互斥占位）。"""
+    try:
+        async with SessionLocal() as s:
+            rows = (
+                await s.execute(
+                    select(GroupSignalTask.group_id, GroupSignalTask.task_id)
+                    .where(GroupSignalTask.status.in_(group_rules.TASK_ACTIVE))
+                    .order_by(GroupSignalTask.task_id.asc())
+                )
+            ).all()
+            return {gid: tid for gid, tid in rows}
+    except Exception as e:  # noqa: BLE001
+        logger.warning("active_group_ids failed: %s", e)
+        return {}
+
+
+async def task_status(task_id: int) -> Optional[str]:
+    """主任务当前状态。"""
+    try:
+        async with SessionLocal() as s:
+            return (
+                await s.execute(
+                    select(GroupSignalTask.status).where(
+                        GroupSignalTask.task_id == task_id
+                    )
+                )
+            ).scalar_one_or_none()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("task_status failed: %s", e)
+        return None
+
+
+async def task_group_id(task_id: int) -> Optional[str]:
+    """主任务所属分组（释放互斥占位时用）。"""
+    try:
+        async with SessionLocal() as s:
+            return (
+                await s.execute(
+                    select(GroupSignalTask.group_id).where(
+                        GroupSignalTask.task_id == task_id
+                    )
+                )
+            ).scalar_one_or_none()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("task_group_id failed: %s", e)
+        return None
+
+
+async def running_node_ids(task_id: int) -> list[str]:
+    """某主任务下仍未收口的子任务节点列表。"""
+    try:
+        async with SessionLocal() as s:
+            rows = (
+                await s.execute(
+                    select(GroupTaskDispatch.node_id).where(
+                        GroupTaskDispatch.task_id == task_id,
+                        GroupTaskDispatch.status.notin_(tuple(_TERMINAL)),
+                    )
+                )
+            ).scalars().all()
+            return sorted(set(rows))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("running_node_ids failed: %s", e)
+        return []
+
+
+async def resumable_tasks(node_id: str) -> list[dict]:
+    """某节点上仍在运行的策略子任务（重连后据此重建监控）。"""
+    try:
+        async with SessionLocal() as s:
+            rows = (
+                await s.execute(
+                    select(GroupTaskDispatch, GroupSignalTask)
+                    .join(
+                        GroupSignalTask,
+                        GroupSignalTask.task_id == GroupTaskDispatch.task_id,
+                    )
+                    .where(
+                        GroupTaskDispatch.node_id == node_id,
+                        GroupTaskDispatch.status.notin_(tuple(_TERMINAL)),
+                        GroupSignalTask.status.in_(group_rules.TASK_ACTIVE),
+                    )
+                    .order_by(GroupTaskDispatch.task_id.asc())
+                )
+            ).all()
+            return [
+                {
+                    "task_id": t.task_id,
+                    "magic": t.magic,
+                    "group_id": t.group_id,
+                    "signal_id": t.signal_id,
+                    "action": t.action,
+                    "symbol": t.symbol,
+                    "volume": d.decided_vol if d.decided_vol is not None else t.volume,
+                    "strategy_snapshot": t.strategy_snapshot_json,
+                }
+                for d, t in rows
+            ]
+    except Exception as e:  # noqa: BLE001
+        logger.warning("resumable_tasks failed: %s", e)
+        return []
 
 
 async def mark_task_dispatched(
@@ -146,8 +289,12 @@ async def update_dispatch_result(
 
     task_id 优先（回报带 magic 时可精确定位）；否则按 signal_id 回退匹配该节点
     仍在途的明细，兼容尚未上报魔术号的旧版节点客户端。
+
+    注意：下单成功不等于任务完成。策略托管下首单成交只是进入 opened，
+    真正的完成要等 magic 持仓全平后由 finish_subtask 收口；只有下单失败才直接终态。
     """
-    status = "done" if result.get("success") else "failed"
+    success = bool(result.get("success"))
+    now = datetime.now()
     try:
         async with SessionLocal() as s:
             stmt = select(GroupTaskDispatch).where(GroupTaskDispatch.node_id == node_id)
@@ -156,7 +303,7 @@ async def update_dispatch_result(
             elif signal_id:
                 stmt = stmt.where(
                     GroupTaskDispatch.signal_id == signal_id,
-                    GroupTaskDispatch.status.in_(("pending", "sent")),
+                    GroupTaskDispatch.status.in_(group_rules.SUBTASK_PENDING),
                 )
             else:
                 return False
@@ -164,16 +311,27 @@ async def update_dispatch_result(
             if not rows:
                 return False
             for row in rows:
-                row.status = status
+                if row.status in _TERMINAL:
+                    continue
                 row.retcode = result.get("retcode")
                 row.order_ticket = result.get("order") or result.get("ticket")
                 row.deal = result.get("deal")
                 row.price = result.get("price")
                 row.error = result.get("error")
-                row.finished_at = datetime.now()
+                if success:
+                    row.status = "opened"
+                    row.opened_at = row.opened_at or now
+                    row.total_orders = max(row.total_orders, 1)
+                    row.position_count = max(row.position_count, 1)
+                    row.last_report_at = now
+                else:
+                    row.status = "failed"
+                    row.finish_reason = "open_failed"
+                    row.finished_at = now
             await s.flush()
             for tid in {row.task_id for row in rows}:
                 await _refresh_task_status(s, tid)
+                await _refresh_task_totals(s, tid)
             for sid in {row.signal_id for row in rows}:
                 await _refresh_signal_status(s, sid)
             await s.commit()
@@ -183,8 +341,310 @@ async def update_dispatch_result(
         return False
 
 
+async def mark_subtasks_closing(task_id: int, node_ids: list[str]) -> None:
+    """收到终止指令后把在途子任务标为 closing（等节点回报平仓完成）。"""
+    if not node_ids:
+        return
+    try:
+        async with SessionLocal() as s:
+            await s.execute(
+                update(GroupTaskDispatch)
+                .where(
+                    GroupTaskDispatch.task_id == task_id,
+                    GroupTaskDispatch.node_id.in_(node_ids),
+                    GroupTaskDispatch.status.notin_(tuple(_TERMINAL)),
+                )
+                .values(status="closing")
+            )
+            await s.flush()
+            await _refresh_task_status(s, task_id)
+            await s.commit()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("mark_subtasks_closing failed: %s", e)
+
+
+async def record_strategy_progress(
+    *, node_id: str, task_id: int, data: dict,
+) -> bool:
+    """节点策略执行上报：更新子任务实时快照，状态变更事件另外落事件流。
+
+    纯行情心跳（event 为空或 heartbeat）只刷新快照字段，不写事件表，
+    避免长周期任务把 group_task_event 写爆。
+    """
+    event_type = str(data.get("event") or "").strip()
+    try:
+        async with SessionLocal() as s:
+            row = (
+                await s.execute(
+                    select(GroupTaskDispatch).where(
+                        GroupTaskDispatch.task_id == task_id,
+                        GroupTaskDispatch.node_id == node_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if not row:
+                return False
+
+            now = datetime.now()
+            row.last_report_at = now
+            phase = str(data.get("phase") or "").strip()
+            if phase in group_rules.SUBTASK_RUNNING and row.status not in _TERMINAL:
+                row.status = phase
+            if _num(data.get("position_count")) is not None:
+                row.position_count = int(data["position_count"])
+            if _num(data.get("add_count")) is not None:
+                row.add_count = int(data["add_count"])
+            if _num(data.get("total_orders")) is not None:
+                row.total_orders = int(data["total_orders"])
+            if _num(data.get("total_volume")) is not None:
+                row.total_volume = float(data["total_volume"])
+            if _num(data.get("profit")) is not None:
+                row.realized_profit = float(data["profit"])
+            if event_type == "open" and row.opened_at is None:
+                row.opened_at = now
+                order = data.get("last_order") or {}
+                row.order_ticket = order.get("ticket") or row.order_ticket
+                row.price = order.get("price") if order.get("price") is not None else row.price
+
+            if event_type and event_type != "heartbeat":
+                order = data.get("last_order") or {}
+                s.add(
+                    GroupTaskEvent(
+                        task_id=task_id,
+                        node_id=node_id,
+                        magic=row.magic,
+                        event_type=event_type[:16],
+                        symbol=data.get("symbol"),
+                        action=data.get("action"),
+                        volume=_num(order.get("volume")) or _num(data.get("volume")),
+                        price=_num(order.get("price")),
+                        order_ticket=order.get("ticket"),
+                        position_count=_int_or_none(data.get("position_count")),
+                        total_volume=_num(data.get("total_volume")),
+                        profit=_num(data.get("profit")),
+                        message=(data.get("message") or None),
+                    )
+                )
+
+            await s.flush()
+            await _refresh_task_status(s, task_id)
+            await _refresh_task_totals(s, task_id)
+            await s.commit()
+            return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("record_strategy_progress failed: %s", e)
+        return False
+
+
+async def finish_subtask(
+    *, node_id: str, task_id: int, data: dict,
+) -> Optional[str]:
+    """节点上报策略结束（magic 持仓已全平）。返回收口后的主任务状态。"""
+    status = str(data.get("status") or "done").strip().lower()
+    if status not in _TERMINAL:
+        status = "done"
+    try:
+        async with SessionLocal() as s:
+            row = (
+                await s.execute(
+                    select(GroupTaskDispatch).where(
+                        GroupTaskDispatch.task_id == task_id,
+                        GroupTaskDispatch.node_id == node_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if not row:
+                return None
+            now = datetime.now()
+            row.status = status
+            row.finish_reason = (data.get("reason") or "positions_cleared")[:64]
+            row.finished_at = now
+            row.last_report_at = now
+            row.position_count = 0
+            if _num(data.get("total_orders")) is not None:
+                row.total_orders = int(data["total_orders"])
+            if _num(data.get("total_volume")) is not None:
+                row.total_volume = float(data["total_volume"])
+            if _num(data.get("realized_profit")) is not None:
+                row.realized_profit = float(data["realized_profit"])
+            if data.get("error"):
+                row.error = str(data["error"])[:255]
+
+            s.add(
+                GroupTaskEvent(
+                    task_id=task_id,
+                    node_id=node_id,
+                    magic=row.magic,
+                    event_type="close_all",
+                    symbol=data.get("symbol"),
+                    position_count=0,
+                    total_volume=row.total_volume,
+                    profit=row.realized_profit,
+                    message=row.finish_reason,
+                )
+            )
+
+            await s.flush()
+            await _refresh_task_status(s, task_id)
+            await _refresh_task_totals(s, task_id)
+            task_status = (
+                await s.execute(
+                    select(GroupSignalTask.status).where(GroupSignalTask.task_id == task_id)
+                )
+            ).scalar_one_or_none()
+            await _refresh_signal_status(s, row.signal_id)
+            await s.commit()
+            return task_status
+    except Exception as e:  # noqa: BLE001
+        logger.warning("finish_subtask failed: %s", e)
+        return None
+
+
+async def reconcile_node_positions(
+    node_id: str, magics: set[int],
+) -> list[tuple[int, str]]:
+    """账户快照对账：节点上已无持仓的运行中子任务，判定为已平仓并收口。
+
+    这是 strategy_finished 的兜底——上报丢包或节点在监控启动前就平了仓时，
+    单靠节点主动上报会让子任务永远停在 running，进而把分组锁死。
+    只处理已经开过仓（opened_at 非空）的子任务，避免把刚下发还没成交的误判为完成。
+    返回 [(task_id, 主任务状态)]，供调用方决定是否释放分组占位。
+    """
+    finished: list[tuple[int, str]] = []
+    try:
+        async with SessionLocal() as s:
+            rows = (
+                await s.execute(
+                    select(GroupTaskDispatch).where(
+                        GroupTaskDispatch.node_id == node_id,
+                        GroupTaskDispatch.status.in_(group_rules.SUBTASK_RUNNING),
+                        GroupTaskDispatch.opened_at.is_not(None),
+                    )
+                )
+            ).scalars().all()
+            if not rows:
+                return []
+            now = datetime.now()
+            touched: set[int] = set()
+            for row in rows:
+                if row.magic is None or int(row.magic) in magics:
+                    continue
+                row.status = "done"
+                row.finish_reason = "reconciled_no_position"
+                row.position_count = 0
+                row.finished_at = now
+                row.last_report_at = now
+                s.add(
+                    GroupTaskEvent(
+                        task_id=row.task_id,
+                        node_id=node_id,
+                        magic=row.magic,
+                        event_type="close_all",
+                        position_count=0,
+                        message="账户快照中已无该魔术号持仓，自动收口",
+                    )
+                )
+                touched.add(row.task_id)
+            if not touched:
+                return []
+            await s.flush()
+            for tid in touched:
+                await _refresh_task_status(s, tid)
+                await _refresh_task_totals(s, tid)
+            task_rows = (
+                await s.execute(
+                    select(GroupSignalTask.task_id, GroupSignalTask.status,
+                           GroupSignalTask.signal_id)
+                    .where(GroupSignalTask.task_id.in_(touched))
+                )
+            ).all()
+            for _tid, _status, sid in task_rows:
+                await _refresh_signal_status(s, sid)
+            await s.commit()
+            finished = [(tid, st) for tid, st, _sid in task_rows]
+    except Exception as e:  # noqa: BLE001
+        logger.warning("reconcile_node_positions failed: %s", e)
+        return []
+    return finished
+
+
+async def force_finish_task(task_id: int, *, reason: str) -> Optional[str]:
+    """强制收口主任务：把所有在途子任务标记为终态（节点全离线 / 人工终止）。"""
+    try:
+        async with SessionLocal() as s:
+            now = datetime.now()
+            await s.execute(
+                update(GroupTaskDispatch)
+                .where(
+                    GroupTaskDispatch.task_id == task_id,
+                    GroupTaskDispatch.status.notin_(tuple(_TERMINAL)),
+                )
+                .values(
+                    status="failed", finish_reason=reason[:64],
+                    finished_at=now, position_count=0,
+                )
+            )
+            await s.flush()
+            await _refresh_task_status(s, task_id)
+            await _refresh_task_totals(s, task_id)
+            row = (
+                await s.execute(
+                    select(GroupSignalTask).where(GroupSignalTask.task_id == task_id)
+                )
+            ).scalar_one_or_none()
+            if row:
+                row.skip_reason = reason[:255]
+                await _refresh_signal_status(s, row.signal_id)
+            await s.commit()
+            return row.status if row else None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("force_finish_task failed: %s", e)
+        return None
+
+
+def _num(value: object) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _int_or_none(value: object) -> Optional[int]:
+    n = _num(value)
+    return int(n) if n is not None else None
+
+
+async def _refresh_task_totals(session, task_id: int) -> None:
+    """把各子任务的下单数 / 手数 / 盈亏汇总到主任务。"""
+    row = (
+        await session.execute(
+            select(
+                func.coalesce(func.sum(GroupTaskDispatch.total_orders), 0),
+                func.coalesce(func.sum(GroupTaskDispatch.total_volume), 0.0),
+                func.coalesce(func.sum(GroupTaskDispatch.realized_profit), 0.0),
+                func.min(GroupTaskDispatch.opened_at),
+            ).where(GroupTaskDispatch.task_id == task_id)
+        )
+    ).first()
+    if not row:
+        return
+    orders, volume, profit, opened_at = row
+    values: dict = {
+        "total_orders": int(orders or 0),
+        "total_volume": float(volume or 0.0),
+        "realized_profit": float(profit or 0.0),
+    }
+    if opened_at is not None:
+        values["opened_at"] = opened_at
+    await session.execute(
+        update(GroupSignalTask).where(GroupSignalTask.task_id == task_id).values(**values)
+    )
+
+
 async def _refresh_task_status(session, task_id: int) -> None:
-    """按当前节点明细收口主任务状态。"""
+    """按当前子任务状态收口主任务状态。"""
     statuses = (
         await session.execute(
             select(GroupTaskDispatch.status).where(GroupTaskDispatch.task_id == task_id)
@@ -192,7 +652,7 @@ async def _refresh_task_status(session, task_id: int) -> None:
     ).scalars().all()
     new_status = group_rules.aggregate_task_status(list(statuses))
     values: dict = {"status": new_status}
-    if new_status != "dispatching":
+    if new_status not in group_rules.TASK_ACTIVE:
         values["finished_at"] = datetime.now()
     await session.execute(
         update(GroupSignalTask).where(GroupSignalTask.task_id == task_id).values(**values)
@@ -208,7 +668,7 @@ async def _refresh_signal_status(session, signal_id: str) -> None:
     ).scalars().all()
     if not statuses:
         return
-    if any(st in ("pending", "dispatching") for st in statuses):
+    if any(st in group_rules.TASK_ACTIVE for st in statuses):
         return
     # partial 本身就是“部分成功”，信号整体也应是 partial，不能被计为全成
     has_partial = any(st == "partial" for st in statuses)
@@ -241,7 +701,15 @@ def _dispatch_row(d: GroupTaskDispatch, node_name: Optional[str]) -> dict:
         "price": d.price,
         "error": d.error,
         "magic": d.magic,
+        "position_count": d.position_count,
+        "add_count": d.add_count,
+        "total_orders": d.total_orders,
+        "total_volume": d.total_volume,
+        "realized_profit": d.realized_profit,
+        "finish_reason": d.finish_reason,
         "dispatched_at": d.dispatched_at.timestamp() if d.dispatched_at else None,
+        "opened_at": d.opened_at.timestamp() if d.opened_at else None,
+        "last_report_at": d.last_report_at.timestamp() if d.last_report_at else None,
         "finished_at": d.finished_at.timestamp() if d.finished_at else None,
     }
 
@@ -262,12 +730,18 @@ def _task_row(t: GroupSignalTask, dispatches: list[dict]) -> dict:
         "comment": t.comment,
         "source_ip": t.source_ip,
         "raw_payload": t.raw_payload,
+        "strategy_id": t.strategy_id,
+        "strategy_name": t.strategy_name,
         "dispatch_mode": t.dispatch_mode,
         "payload": t.payload_json,
         "node_ids": t.node_ids_json or [],
         "node_count": t.node_count,
         "status": t.status,
         "skip_reason": t.skip_reason,
+        "total_orders": t.total_orders,
+        "total_volume": t.total_volume,
+        "realized_profit": t.realized_profit,
+        "opened_at": t.opened_at.timestamp() if t.opened_at else None,
         "finished_at": t.finished_at.timestamp() if t.finished_at else None,
         "dispatches": dispatches,
     }

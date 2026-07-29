@@ -301,6 +301,7 @@ function taskTag(status: string): { cls: string; text: string } {
   const m: Record<string, { cls: string; text: string }> = {
     pending: { cls: 'blue', text: '待处理' },
     dispatching: { cls: 'blue', text: '分发中' },
+    running: { cls: 'amber', text: '策略运行中' },
     done: { cls: 'green', text: '完成' },
     partial: { cls: 'amber', text: '部分成功' },
     failed: { cls: 'red', text: '失败' },
@@ -311,14 +312,22 @@ function taskTag(status: string): { cls: string; text: string } {
 
 function dispatchTag(status: string): { cls: string; text: string } {
   const m: Record<string, { cls: string; text: string }> = {
-    done: { cls: 'green', text: '成功' },
+    done: { cls: 'green', text: '完成' },
     failed: { cls: 'red', text: '失败' },
     offline: { cls: 'red', text: '离线' },
     skipped: { cls: '', text: '跳过' },
     sent: { cls: 'blue', text: '已下发' },
     pending: { cls: 'blue', text: '等待' },
+    opened: { cls: 'amber', text: '已开仓' },
+    running: { cls: 'amber', text: '加仓监控中' },
+    closing: { cls: 'amber', text: '平仓中' },
   }
   return m[status] || { cls: 'blue', text: status }
+}
+
+/** 任务是否仍在跑（用于提示分组此时不接收新信号） */
+function isTaskActive(status: string): boolean {
+  return ['pending', 'dispatching', 'running'].includes(status)
 }
 
 function dispatchSummary(row: GroupSignalTaskRecord): string {
@@ -326,8 +335,12 @@ function dispatchSummary(row: GroupSignalTaskRecord): string {
   if (!n) return row.skip_reason || '无节点处理'
   const done = row.dispatches.filter((d) => d.status === 'done').length
   const failed = row.dispatches.filter((d) => d.status === 'failed' || d.status === 'offline').length
+  const running = row.dispatches.filter((d) =>
+    ['opened', 'running', 'closing'].includes(d.status),
+  ).length
   const parts: string[] = [`${n} 节点`]
-  if (done) parts.push(`${done} 成功`)
+  if (running) parts.push(`${running} 运行中`)
+  if (done) parts.push(`${done} 完成`)
   if (failed) parts.push(`${failed} 失败`)
   return parts.join(' · ')
 }
@@ -615,14 +628,24 @@ function dispatchSummary(row: GroupSignalTaskRecord): string {
                     <td colspan="9">
                       <div class="kv-grid" style="margin: 6px 0 10px">
                         <div class="kv"><span class="k">信号 ID</span><span class="v" style="font-size: 12px">{{ t.signal_id }}</span></div>
+                        <div class="kv"><span class="k">绑定策略</span><span class="v" style="font-size: 12px">{{ t.strategy_name || '—' }}</span></div>
                         <div class="kv"><span class="k">来源 IP</span><span class="v" style="font-size: 12px">{{ t.source_ip || '—' }}</span></div>
                         <div class="kv"><span class="k">SL</span><span class="v">{{ t.sl ?? '—' }}</span></div>
                         <div class="kv"><span class="k">TP</span><span class="v">{{ t.tp ?? '—' }}</span></div>
                         <div class="kv"><span class="k">备注</span><span class="v" style="font-size: 12px">{{ t.comment || '—' }}</span></div>
                         <div class="kv"><span class="k">下发节点数</span><span class="v">{{ t.node_count }}</span></div>
+                        <div class="kv"><span class="k">累计下单</span><span class="v">{{ t.total_orders }} 笔 / {{ t.total_volume }} 手</span></div>
+                        <div class="kv"><span class="k">已实现盈亏</span><span class="v">{{ t.realized_profit }}</span></div>
+                        <div class="kv"><span class="k">开仓时间</span><span class="v" style="font-size: 12px">{{ fmtTime(t.opened_at) }}</span></div>
                         <div class="kv"><span class="k">完成时间</span><span class="v" style="font-size: 12px">{{ fmtTime(t.finished_at) }}</span></div>
                         <div v-if="t.skip_reason" class="kv span-full">
                           <span class="k">未下发原因</span><span class="v" style="font-size: 12px">{{ t.skip_reason }}</span>
+                        </div>
+                        <div v-if="isTaskActive(t.status)" class="kv span-full">
+                          <span class="k">提示</span>
+                          <span class="v" style="font-size: 12px">
+                            任务进行中，本分组暂不接收新的策略信号；发送 CLOSE 信号可终止
+                          </span>
                         </div>
                       </div>
 
@@ -637,8 +660,10 @@ function dispatchSummary(row: GroupSignalTaskRecord): string {
                         <table class="group-detail-table">
                           <thead>
                             <tr>
-                              <th>节点</th><th>状态</th><th class="right">下发手数</th>
-                              <th>跳过原因</th><th>返回码</th><th>订单</th><th class="right">成交价</th>
+                              <th>节点</th><th>状态</th><th class="right">首单手数</th>
+                              <th class="right">持仓</th><th class="right">加仓</th><th class="right">累计手数</th>
+                              <th class="right">盈亏</th><th>结束原因</th>
+                              <th>订单</th><th class="right">成交价</th>
                               <th>错误</th><th>下发时间</th><th>完成时间</th>
                             </tr>
                           </thead>
@@ -647,8 +672,11 @@ function dispatchSummary(row: GroupSignalTaskRecord): string {
                               <td>{{ d.node_name || d.node_id }}</td>
                               <td><span class="tag" :class="dispatchTag(d.status).cls">{{ dispatchTag(d.status).text }}</span></td>
                               <td class="right">{{ d.decided_vol ?? '—' }}</td>
-                              <td class="muted group-break">{{ d.skip_reason || '—' }}</td>
-                              <td>{{ d.retcode ?? '—' }}</td>
+                              <td class="right">{{ d.position_count }}</td>
+                              <td class="right">{{ d.add_count }}</td>
+                              <td class="right">{{ d.total_volume }}</td>
+                              <td class="right">{{ d.realized_profit }}</td>
+                              <td class="muted group-break">{{ d.finish_reason || d.skip_reason || '—' }}</td>
                               <td>{{ d.order ?? '—' }}</td>
                               <td class="right">{{ d.price ?? '—' }}</td>
                               <td class="muted group-break">{{ d.error || '—' }}</td>
