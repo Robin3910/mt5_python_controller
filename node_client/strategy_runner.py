@@ -1,10 +1,13 @@
-"""策略托管执行器：一个分组任务一个实例，常驻监控直到魔术号持仓全平。
+"""策略托管执行器：一个分组任务一个实例，事件驱动，直到魔术号持仓全平。
 
 职责：
 1. 收到 strategy_start 后下首单（魔术号 = 服务端下发的任务魔术号）；
-2. 循环监控该魔术号的持仓与行情，按策略规则触发逆势 / 顺势加仓；
-3. 持仓归零即上报 strategy_finished，服务端据此收口子任务与主任务；
+2. 订阅 MarketHub 事件，在持仓构成或价格变化时按策略规则触发逆势 / 顺势加仓；
+3. 收到 GONE（已确认该魔术号持仓归零）即上报 strategy_finished，服务端据此收口；
 4. strategy_stop 时平掉该魔术号全部持仓后结束。
+
+执行器自己不读行情与持仓，也没有轮询循环——监控数据由 MarketHub 统一采样后以
+事件送达（见 market_hub.py）；下单与平仓仍由执行器直接调用 MT5。
 
 完成判定放在节点侧：只有节点能实时看到 MT5 持仓。服务端另有账户快照对账兜底，
 所以这里即使漏报一次，最终也不会让分组永久卡住。
@@ -16,12 +19,17 @@ import logging
 import time
 from typing import Callable, Optional
 
+from market_hub import GONE, STALE, MarketEvent, MarketHub, Subscription
 from strategy_rules import PositionCtx, evaluate
 
 logger = logging.getLogger("node.strategy")
 
-# 监控轮询间隔（秒）：足够跟上加仓节奏，又不至于把 MT5 调用压满
-POLL_INTERVAL = 1.0
+
+def _as_float(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
 
 
 class StrategyRunner:
@@ -36,6 +44,8 @@ class StrategyRunner:
         signal_id: str,
         entry: dict,
         strategy: dict,
+        mt5,
+        hub: MarketHub,
         exec_fn: Callable,
         send_fn: Callable,
         report_interval: float = 5.0,
@@ -46,31 +56,39 @@ class StrategyRunner:
         self.signal_id = signal_id
         self.entry = entry or {}
         self.strategy = strategy or {}
+        self._mt5 = mt5
+        self._hub = hub
         self._exec = exec_fn      # async (fn, *args) -> result，把阻塞 MT5 调用丢线程池
         self._send = send_fn      # async (dict) -> None，向服务端发消息
         self.report_interval = max(1.0, float(report_interval or 5.0))
 
         self.symbol = str(self.entry.get("symbol") or "")
         self.direction = str(self.entry.get("action") or "BUY").upper()
-        self.base_volume = float(self.entry.get("volume") or 0.0)
+        self.base_volume = _as_float(self.entry.get("volume"))
         self.add_count = 0
         self.total_orders = 0
         self.total_volume = 0.0
         self._opened = False
         self._stopping = False
         self._stop_reason = "positions_cleared"
+        self._finished = False
+        self._seed_pending = False
         self._task: Optional[asyncio.Task] = None
+        self._sub: Optional[Subscription] = None
         self._last_report = 0.0
 
     # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
-    def start(self, mt5, *, resume: bool = False) -> None:
-        self._task = asyncio.create_task(self._run(mt5, resume=resume))
+    def start(self, *, resume: bool = False) -> None:
+        self._task = asyncio.create_task(self._run(resume=resume))
 
     def request_stop(self, reason: str = "stop_command") -> None:
+        """请求终止；立刻唤醒事件等待，不必等下一轮采样。"""
         self._stopping = True
         self._stop_reason = reason
+        if self._sub is not None:
+            self._sub.wake()
 
     def cancel(self) -> None:
         """连接断开时只取消本地循环，不上报结束——持仓还在，等重连后恢复。"""
@@ -82,40 +100,112 @@ class StrategyRunner:
         return self._task is None or self._task.done()
 
     # ------------------------------------------------------------------
-    # 主循环
+    # 事件循环
     # ------------------------------------------------------------------
-    async def _run(self, mt5, *, resume: bool) -> None:
+    async def _run(self, *, resume: bool) -> None:
+        sub = self._hub.subscribe(
+            symbol=self.symbol, magic=self.magic, direction=self.direction,
+        )
+        self._sub = sub
         try:
             if not resume:
-                if not await self._open_first(mt5):
+                if not await self._open_first():
                     return
             else:
-                # 恢复场景：首单早已成交，按现有持仓续跑
+                # 恢复场景：首单早已成交，按现有持仓续跑，计数待首个事件重建
                 self._opened = True
+                self._seed_pending = True
                 await self._emit_progress("resume", phase="running")
 
             while True:
                 if self._stopping:
-                    await self._close_all(mt5)
+                    await self._close_all()
                     return
-                positions = await self._positions(mt5)
-                if self._opened and not positions:
-                    await self._finish("done", self._stop_reason)
+                event = await sub.next_event()
+                if event is None:
+                    logger.info("task %s subscription closed, monitor exits", self.task_id)
                     return
-                if positions:
-                    await self._tick(mt5, positions)
-                await asyncio.sleep(POLL_INTERVAL)
+                if self._stopping:
+                    await self._close_all()
+                    return
+                if await self._on_event(event):
+                    return
         except asyncio.CancelledError:
             logger.info("task %s monitor cancelled (will resume on reconnect)", self.task_id)
             raise
         except Exception as e:  # noqa: BLE001
             logger.exception("task %s runner crashed: %s", self.task_id, e)
             await self._finish("failed", f"runner_error: {e}")
+        finally:
+            self._hub.unsubscribe(sub)
+            self._sub = None
 
-    async def _open_first(self, mt5) -> bool:
+    async def _on_event(self, event: MarketEvent) -> bool:
+        """处理一个事件；返回 True 表示任务已收口。"""
+        if event.kind == STALE:
+            # 这一轮读不到持仓：绝不能据此判定已全平，等下次成功采样
+            logger.debug("task %s positions unreadable, hold judgement", self.task_id)
+            return False
+        if event.kind == GONE:
+            if not self._opened:
+                return False
+            await self._finish("done", self._stop_reason)
+            return True
+
+        positions = list(event.positions)
+        if not positions:
+            return False
+        if self._seed_pending:
+            self._seed_from_positions(positions)
+
+        decision = evaluate(self.strategy.get("rules") or [], self._ctx(event, positions))
+        if decision is not None:
+            await self._add_position(decision, positions)
+            return False
+
+        if time.time() - self._last_report >= self.report_interval:
+            await self._emit_progress("heartbeat", phase="running", positions=positions)
+        return False
+
+    def _ctx(self, event: MarketEvent, positions: list[dict]) -> PositionCtx:
+        """加仓判定上下文：偏离基准取最近一笔订单的开仓价。"""
+        latest = max(positions, key=lambda p: (p.get("time") or 0, p.get("ticket") or 0))
+        return PositionCtx(
+            direction=self.direction,
+            position_count=len(positions),
+            base_volume=self.base_volume,
+            base_price=_as_float(latest.get("price_open")),
+            price=event.price,
+            point=event.point,
+            add_count=self.add_count,
+        )
+
+    def _seed_from_positions(self, positions: list[dict]) -> None:
+        """恢复后按真实持仓重建计数。
+
+        断线时节点内存里的计数已丢失，若从 0 重新计，非分批规则的 max_allow_num
+        会失效而超额加仓。这里以当前持仓笔数反推：首单 1 笔，其余都是加仓。
+        """
+        self._seed_pending = False
+        count = len(positions)
+        if count <= 0:
+            return
+        self.add_count = max(self.add_count, count - 1)
+        self.total_orders = max(self.total_orders, count)
+        volume = round(sum(_as_float(p.get("volume")) for p in positions), 4)
+        self.total_volume = max(self.total_volume, volume)
+        logger.info(
+            "task %s resumed with %d position(s): add_count=%s total_volume=%s",
+            self.task_id, count, self.add_count, self.total_volume,
+        )
+
+    # ------------------------------------------------------------------
+    # 交易动作
+    # ------------------------------------------------------------------
+    async def _open_first(self) -> bool:
         """下首单；失败直接结束子任务（服务端会据此收口）。"""
         res = await self._exec(
-            mt5.place_market_order,
+            self._mt5.place_market_order,
             self.symbol, self.direction, self.base_volume,
             self.entry.get("stop_loss"), self.entry.get("take_profit"),
             self.entry.get("comment") or "", self.magic,
@@ -144,32 +234,9 @@ class StrategyRunner:
         )
         return True
 
-    async def _tick(self, mt5, positions: list[dict]) -> None:
-        """一轮监控：判定是否加仓，并按间隔上报快照。"""
-        price = await self._price(mt5, positions)
-        point = await self._point(mt5)
-        latest = max(positions, key=lambda p: (p.get("time") or 0, p.get("ticket") or 0))
-        ctx = PositionCtx(
-            direction=self.direction,
-            position_count=len(positions),
-            base_volume=self.base_volume,
-            base_price=float(latest.get("price_open") or 0.0),
-            price=price,
-            point=point,
-            add_count=self.add_count,
-        )
-        decision = evaluate(self.strategy.get("rules") or [], ctx)
-        if decision is not None:
-            await self._add_position(mt5, decision, positions)
-            return
-
-        now = time.time()
-        if now - self._last_report >= self.report_interval:
-            await self._emit_progress("heartbeat", phase="running", positions=positions)
-
-    async def _add_position(self, mt5, decision, positions: list[dict]) -> None:
+    async def _add_position(self, decision, positions: list[dict]) -> None:
         res = await self._exec(
-            mt5.place_market_order,
+            self._mt5.place_market_order,
             self.symbol, decision.action, decision.volume,
             None, None, f"add#{self.add_count + 1}", self.magic,
         )
@@ -199,44 +266,15 @@ class StrategyRunner:
             message=f"level={decision.level_index} dev={decision.deviation:.1f}",
         )
 
-    async def _close_all(self, mt5) -> None:
+    async def _close_all(self) -> None:
         """终止指令：平掉该魔术号的全部持仓后收口。"""
-        res = await self._exec(mt5.close_by_magic, self.magic)
+        res = await self._exec(self._mt5.close_by_magic, self.magic)
         res = dict(res or {})
         ok = bool(res.get("success", True))
         await self._finish(
             "done" if ok else "failed",
             self._stop_reason if ok else f"close_failed: {res.get('error')}",
         )
-
-    # ------------------------------------------------------------------
-    # MT5 访问
-    # ------------------------------------------------------------------
-    async def _positions(self, mt5) -> list[dict]:
-        try:
-            return await self._exec(mt5.positions_by_magic, self.magic)
-        except Exception as e:  # noqa: BLE001
-            logger.debug("task %s read positions failed: %s", self.task_id, e)
-            return []
-
-    async def _price(self, mt5, positions: list[dict]) -> float:
-        """取当前价：优先用行情，取不到时回落到持仓的 price_current。"""
-        try:
-            quotes = await self._exec(mt5.quotes, [self.symbol])
-            q = quotes.get(self.symbol) or next(iter(quotes.values()), None)
-            if q:
-                # 多单看买价（平仓价），空单看卖价，与偏离方向口径一致
-                return float(q["bid"] if self.direction == "BUY" else q["ask"])
-        except Exception:  # noqa: BLE001
-            pass
-        latest = positions[-1] if positions else {}
-        return float(latest.get("price_current") or latest.get("price_open") or 0.0)
-
-    async def _point(self, mt5) -> float:
-        try:
-            return float(await self._exec(mt5.symbol_point, self.symbol))
-        except Exception:  # noqa: BLE001
-            return 0.0
 
     # ------------------------------------------------------------------
     # 上报
@@ -248,7 +286,7 @@ class StrategyRunner:
             "add_count": self.add_count,
             "total_orders": self.total_orders,
             "total_volume": round(self.total_volume, 4),
-            "profit": round(sum(float(p.get("profit") or 0.0) for p in pos), 2),
+            "profit": round(sum(_as_float(p.get("profit")) for p in pos), 2),
         }
 
     async def _emit_progress(
@@ -276,6 +314,9 @@ class StrategyRunner:
         await self._send({"type": "strategy_progress", "data": data})
 
     async def _finish(self, status: str, reason: str) -> None:
+        if self._finished:
+            return
+        self._finished = True
         logger.info("task %s finished: %s (%s)", self.task_id, status, reason)
         await self._send({
             "type": "strategy_finished",

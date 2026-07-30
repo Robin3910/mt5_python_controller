@@ -3,8 +3,9 @@
 覆盖 strategy 链路的核心行为：
 - 所有启用分组各自处理同一条信号；禁用分组不参与；
 - 有效节点口径 = 已启用 + 在线；
-- 下发前生成主任务、任务号换算出的魔术号随命令下发；
-- 主任务与各节点明细落库，节点回报按魔术号回填并收口状态；
+- 每个节点子任务自持魔术号（由子任务号派生），随命令下发；
+- 互斥粒度是 (分组, 节点)：同分组内一个节点只跑一个子任务，跨分组各自独立；
+- 主任务与各节点子任务落库，节点回报按魔术号回填并收口状态；
 - 分组 sync / poll 两种分发模式；
 - 与 normal 链路的规则隔离（不受中控台品种配置、区间/持仓过滤、节点按币种配置影响）。
 """
@@ -31,7 +32,7 @@ from app.parser import TradingSignal
 from app.redis_store import RedisStore
 from app.strategy_templates import TEMPLATE_1_ID, TEMPLATE_1_NAME
 
-# 分组链路必须真实落库（主任务号由数据库自增，是魔术号的来源），
+# 分组链路必须真实落库（子任务号由数据库自增，是魔术号的来源），
 # 所以这里不像 test_dispatch.py 那样 mock 掉持久化，只用 conftest 里的 SQLite 测试库。
 _TABLES = (
     GroupTaskEvent,
@@ -184,17 +185,26 @@ async def open_first_orders(task_id, node_ids, *, success=True):
         )
 
 
+async def release_locks(store, result):
+    """按持久化层回传的信息释放组内节点占位（ws_gateway 在真实链路里做这件事）。"""
+    for group_id, node_id in (result or {}).get("released", []):
+        await store.release_group_node_busy(group_id, node_id)
+
+
 async def finish_task(store, task_id, node_ids, *, status="done"):
-    """模拟任务全流程收口：首单成交 -> 持仓平掉 -> 释放分组占位。"""
+    """模拟任务全流程收口：首单成交 -> 持仓平掉 -> 释放节点占位。"""
     await open_first_orders(task_id, node_ids)
     for node_id in node_ids:
-        await group_persist.finish_subtask(
+        res = await group_persist.finish_subtask(
             node_id=node_id, task_id=task_id,
             data={"status": status, "reason": "positions_cleared"},
         )
-    group_id = await group_persist.task_group_id(task_id)
-    if group_id and (await group_persist.task_status(task_id)) not in group_rules.TASK_ACTIVE:
-        await store.release_group_busy(group_id)
+        await release_locks(store, res)
+
+
+async def magics_of(task_id):
+    """某主任务下各节点子任务的魔术号。"""
+    return {r.node_id: r.magic for r in await fetch_dispatches(task_id)}
 
 
 # =====================================================================
@@ -215,12 +225,14 @@ async def test_every_enabled_group_processes_signal(store, monkeypatch):
     assert res["groups"] == 2
     assert res["targets"] == 2
     assert {s[0] for s in sent} == {"nd_a", "nd_b"}
-    # 两个分组各生成一条主任务，且任务号/魔术号互不相同
+    # 两个分组各生成一条主任务，任务号互不相同
     tasks = await fetch_tasks("sig_g1")
     assert len(tasks) == 2
     assert {t.group_name for t in tasks} == {"组一", "组二"}
     assert len({t.task_id for t in tasks}) == 2
-    assert len({t.magic for t in tasks}) == 2
+    # 魔术号在子任务上，每个节点各持一个且互不相同
+    magics = [m for t in tasks for m in (await magics_of(t.task_id)).values()]
+    assert len(set(magics)) == 2
 
 
 async def test_disabled_group_is_not_processed(store, monkeypatch):
@@ -303,8 +315,8 @@ async def test_symbol_match_tolerates_broker_suffix(store, monkeypatch):
     assert [s[0] for s in sent] == ["nd_a"]
 
 
-async def test_group_busy_rejects_second_signal(store, monkeypatch):
-    """分组存在进行中的任务时，不接收新的策略信号。"""
+async def test_busy_node_is_skipped_on_second_signal(store, monkeypatch):
+    """同一分组内该节点已有进行中的子任务时，新信号在该节点上被跳过。"""
     await online(store, mk_node("nd_a"))
     await mk_group(store, "互斥组", ["nd_a"])
     sent = []
@@ -319,16 +331,23 @@ async def test_group_busy_rejects_second_signal(store, monkeypatch):
     second = await dispatcher.dispatch(
         TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_busy2",
     )
-    assert second["tasks"][0]["status"] == "rejected"
-    assert "进行中的任务" in second["tasks"][0]["reason"]
+    assert second["targets"] == 0
+    assert second["tasks"][0]["status"] == "skipped"
+    assert "均有进行中的任务" in second["tasks"][0]["reason"]
     assert len(sent) == 1  # 第二条没有下发
-    assert await fetch_tasks("sig_busy2") == []
+    # 主任务仍留痕，子任务记为 skipped 且不分配魔术号
+    task2 = (await fetch_tasks("sig_busy2"))[0]
+    rows = await fetch_dispatches(task2.task_id)
+    assert [r.status for r in rows] == ["skipped"]
+    assert rows[0].magic is None
+    assert "进行中的子任务" in rows[0].skip_reason
 
 
-async def test_group_accepts_new_signal_after_task_finished(store, monkeypatch):
-    """任务收口并释放占位后，分组能接收下一条信号。"""
+async def test_node_accepts_new_signal_after_subtask_finished(store, monkeypatch):
+    """子任务收口并释放占位后，该节点在本分组内能接收下一条信号。"""
     await online(store, mk_node("nd_a"))
     group = await mk_group(store, "释放组", ["nd_a"])
+    gid = group["group_id"]
     sent = []
     monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
     dispatcher = GroupDispatcher(store)
@@ -338,13 +357,82 @@ async def test_group_accepts_new_signal_after_task_finished(store, monkeypatch):
     )
     task = (await fetch_tasks("sig_free1"))[0]
     await finish_task(store, task.task_id, ["nd_a"])
+    assert await store.get_group_node_busy(gid, "nd_a") is None
 
     res = await dispatcher.dispatch(
         TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_free2",
     )
     assert res["tasks"][0]["status"] == "dispatching"
     assert len(await fetch_tasks("sig_free2")) == 1
-    assert await store.get_group_busy(group["group_id"]) is not None
+    assert await store.get_group_node_busy(gid, "nd_a") is not None
+
+
+async def test_same_node_serves_multiple_groups_in_parallel(store, monkeypatch):
+    """互斥按 (分组, 节点)：同一节点可以同时承接多个分组的任务。"""
+    await online(store, mk_node("nd_a"))
+    gold = await mk_group(store, "黄金组", ["nd_a"], symbol="XAUUSD")
+    euro = await mk_group(store, "欧美组", ["nd_a"], symbol="EURUSD")
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    dispatcher = GroupDispatcher(store)
+
+    first = await dispatcher.dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_par1",
+    )
+    second = await dispatcher.dispatch(
+        TradingSignal(action="BUY", symbol="EURUSD", volume=0.1), "sig_par2",
+    )
+
+    assert first["targets"] == 1
+    assert second["targets"] == 1
+    assert len(sent) == 2
+    assert await store.get_group_node_busy(gold["group_id"], "nd_a") is not None
+    assert await store.get_group_node_busy(euro["group_id"], "nd_a") is not None
+
+
+async def test_second_group_same_symbol_also_dispatches(store, monkeypatch):
+    """两个分组绑同品种策略、成员相同：各自独立下发。
+
+    这是 (分组, 节点) 粒度的直接后果——同一账户同品种会持有两笔独立持仓
+    （魔术号不同、各按自己那份策略参数加仓）。
+    """
+    await online(store, mk_node("nd_a"), mk_node("nd_b"))
+    await mk_group(store, "模板一组", ["nd_a", "nd_b"], symbol="XAUUSD")
+    await mk_group(store, "模板二组", ["nd_a", "nd_b"], symbol="XAUUSD")
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+
+    res = await GroupDispatcher(store).dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_two_groups",
+    )
+
+    assert res["groups"] == 2
+    assert res["targets"] == 4
+    assert [t["status"] for t in res["tasks"]] == ["dispatching", "dispatching"]
+    # 每个节点收到两条命令，魔术号互不相同
+    assert len(sent) == 4
+    assert len({m["magic"] for _n, m in sent}) == 4
+    per_node: dict[str, int] = {}
+    for node_id, _msg in sent:
+        per_node[node_id] = per_node.get(node_id, 0) + 1
+    assert per_node == {"nd_a": 2, "nd_b": 2}
+
+
+async def test_different_nodes_across_groups_both_run(store, monkeypatch):
+    """成员不重叠时，两个分组的同品种任务互不阻塞。"""
+    await online(store, mk_node("nd_a"), mk_node("nd_b"))
+    await mk_group(store, "甲组", ["nd_a"], symbol="XAUUSD")
+    await mk_group(store, "乙组", ["nd_b"], symbol="XAUUSD")
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+
+    res = await GroupDispatcher(store).dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_disjoint",
+    )
+
+    assert res["targets"] == 2
+    assert [t["status"] for t in res["tasks"]] == ["dispatching", "dispatching"]
+    assert {s[0] for s in sent} == {"nd_a", "nd_b"}
 
 
 # =====================================================================
@@ -389,22 +477,24 @@ async def test_only_effective_members_receive_command(store, monkeypatch):
 
 
 # =====================================================================
-# 3. 主任务号即魔术号，随命令下发
+# 3. 子任务号即魔术号，随命令下发
 # =====================================================================
-async def test_task_id_is_used_as_magic_number(store, monkeypatch):
+async def test_subtask_id_is_used_as_magic_number(store, monkeypatch):
     await online(store, mk_node("nd_a"))
     await mk_group(store, "魔术号组", ["nd_a"])
     sent = []
     monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
 
-    res = await GroupDispatcher(store).dispatch(
+    await GroupDispatcher(store).dispatch(
         TradingSignal(action="BUY", symbol="XAUUSD", volume=0.3), "sig_g6",
     )
 
     task = (await fetch_tasks("sig_g6"))[0]
+    row = (await fetch_dispatches(task.task_id))[0]
     cmd = sent[0][1]
     assert cmd["cmd"] == "strategy_start"
-    assert cmd["magic"] == task.magic == group_rules.task_magic(task.task_id)
+    assert cmd["magic"] == row.magic == group_rules.subtask_magic(row.id)
+    assert cmd["dispatch_id"] == row.id
     assert cmd["task_id"] == task.task_id
     assert cmd["group_id"] == task.group_id
     assert cmd["model"] == "strategy"
@@ -412,26 +502,47 @@ async def test_task_id_is_used_as_magic_number(store, monkeypatch):
     assert cmd["entry"]["action"] == "BUY"
     # 策略规则随命令快照下发，节点据此常驻加仓
     assert cmd["strategy"]["strategy_id"] == task.strategy_id
-    assert res["tasks"][0]["magic"] == task.magic
-    # 下发数据完整落库，便于事后追溯
-    assert task.payload_json["magic"] == task.magic
+    # 主任务落的是公共下发数据，魔术号按节点各自不同，故不在其中
+    assert task.payload_json["cmd"] == "strategy_start"
+    assert "magic" not in task.payload_json
 
 
-async def test_task_created_before_dispatch(store, monkeypatch):
-    """下发到节点时主任务必须已经存在（任务号是魔术号的来源）。"""
+async def test_each_node_gets_its_own_magic(store, monkeypatch):
+    """sync 模式下每个节点持有独立魔术号，互不共用。"""
+    await online(store, mk_node("nd_a"), mk_node("nd_b"))
+    await mk_group(store, "独立魔术号组", ["nd_a", "nd_b"])
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+
+    await GroupDispatcher(store).dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_magic_each",
+    )
+
+    task = (await fetch_tasks("sig_magic_each"))[0]
+    by_node = await magics_of(task.task_id)
+    assert len(set(by_node.values())) == 2
+    # 下发的命令里带的就是各自那一个
+    for node_id, msg in sent:
+        assert msg["magic"] == by_node[node_id]
+
+
+async def test_subtask_created_before_dispatch(store, monkeypatch):
+    """下发到节点时子任务必须已经落库（子任务号是魔术号的来源）。"""
     await online(store, mk_node("nd_a"))
     await mk_group(store, "顺序组", ["nd_a"])
     seen_at_send = {}
 
     async def fake_send(node_id, msg):
-        seen_at_send["tasks"] = await fetch_tasks("sig_g7")
+        task = (await fetch_tasks("sig_g7"))[0]
+        seen_at_send["rows"] = await fetch_dispatches(task.task_id)
         return True
 
     monkeypatch.setattr(manager, "send_to_node", fake_send)
     await GroupDispatcher(store).dispatch(
         TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_g7",
     )
-    assert len(seen_at_send["tasks"]) == 1
+    assert len(seen_at_send["rows"]) == 1
+    assert seen_at_send["rows"][0].magic is not None
 
 
 # =====================================================================
@@ -450,8 +561,8 @@ async def test_dispatch_rows_recorded_per_node(store, monkeypatch):
     rows = await fetch_dispatches(task.task_id)
     assert {r.node_id for r in rows} == {"nd_a", "nd_b"}
     assert all(r.status == "sent" for r in rows)
-    assert all(r.magic == task.magic for r in rows)
     assert all(r.decided_vol == 0.15 for r in rows)
+    assert all(r.symbol == "XAUUSD" for r in rows)
     assert task.status == "dispatching"
 
 
@@ -484,11 +595,11 @@ async def test_trade_result_by_magic_updates_task_and_signal(store, monkeypatch)
     handled = await group_persist.update_dispatch_result(
         node_id="nd_a",
         result={"success": True, "order": 8801, "price": 2401.5, "retcode": 10009},
-        task_id=group_rules.task_id_from_magic(magic),
+        dispatch_id=group_rules.subtask_id_from_magic(magic),
         signal_id="sig_g10",
     )
 
-    assert handled is True
+    assert handled is not None
     task = (await fetch_tasks("sig_g10"))[0]
     rows = await fetch_dispatches(task.task_id)
     # 首单成交只是进入 opened：要等魔术号持仓全平才算完成
@@ -504,7 +615,8 @@ async def test_trade_result_by_magic_updates_task_and_signal(store, monkeypatch)
         data={"status": "done", "reason": "positions_cleared",
               "total_orders": 3, "total_volume": 0.36, "realized_profit": 12.5},
     )
-    assert finished == "done"
+    assert finished["task_status"] == "done"
+    assert finished["released"] == [(task.group_id, "nd_a")]
     task = (await fetch_tasks("sig_g10"))[0]
     rows = await fetch_dispatches(task.task_id)
     assert rows[0].status == "done"
@@ -535,8 +647,9 @@ async def test_trade_result_falls_back_to_signal_id(store, monkeypatch):
         task_id=None, signal_id="sig_g11",
     )
 
-    assert handled is True
     task = (await fetch_tasks("sig_g11"))[0]
+    # 首单失败直接收口，并回传要释放的组内节点占位
+    assert handled["released"] == [(task.group_id, "nd_a")]
     rows = await fetch_dispatches(task.task_id)
     assert rows[0].status == "failed"
     assert rows[0].error == "no money"
@@ -548,7 +661,7 @@ async def test_trade_result_of_normal_signal_not_handled_by_group(store):
     handled = await group_persist.update_dispatch_result(
         node_id="nd_a", result={"success": True}, task_id=None, signal_id="sig_normal",
     )
-    assert handled is False
+    assert handled is None
 
 
 async def test_partial_status_when_mixed_results(store, monkeypatch):
@@ -738,8 +851,8 @@ async def test_poll_rotation_survives_member_change(store, monkeypatch):
 # =====================================================================
 # 6. CLOSE 与规则隔离
 # =====================================================================
-async def test_close_signal_terminates_running_task(store, monkeypatch):
-    """CLOSE 是终止指令：绕过互斥，通知在跑的节点平掉该魔术号的持仓。"""
+async def test_close_signal_terminates_running_subtasks(store, monkeypatch):
+    """CLOSE 是终止指令：绕过互斥，让每个在跑节点平掉自己魔术号的持仓。"""
     await online(store, mk_node("nd_a"), mk_node("nd_b"))
     await mk_group(store, "平仓组", ["nd_a", "nd_b"], mode="sync")
     sent = []
@@ -749,6 +862,7 @@ async def test_close_signal_terminates_running_task(store, monkeypatch):
     await d.dispatch(TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_c0")
     task = (await fetch_tasks("sig_c0"))[0]
     await open_first_orders(task.task_id, ["nd_a", "nd_b"])
+    by_node = await magics_of(task.task_id)
     sent.clear()
 
     res = await d.dispatch(
@@ -759,10 +873,37 @@ async def test_close_signal_terminates_running_task(store, monkeypatch):
     assert res["targets"] == 2
     assert {s[0] for s in sent} == {"nd_a", "nd_b"}
     assert all(s[1]["cmd"] == "strategy_stop" for s in sent)
-    assert all(s[1]["magic"] == task.magic for s in sent)
+    # 每个节点收到的是自己那个魔术号
+    for node_id, msg in sent:
+        assert msg["magic"] == by_node[node_id]
     # 子任务转入 closing，等节点回报平仓完成
     rows = await fetch_dispatches(task.task_id)
     assert {r.status for r in rows} == {"closing"}
+
+
+async def test_close_signal_force_finishes_offline_node(store, monkeypatch):
+    """目标节点离线时无人平仓：强制收口子任务并放开占位，避免被永久锁死。"""
+    await online(store, mk_node("nd_a"))
+    group = await mk_group(store, "离线平仓组", ["nd_a"])
+    gid = group["group_id"]
+    monkeypatch.setattr(manager, "send_to_node", capture_sender([]))
+    d = GroupDispatcher(store)
+
+    await d.dispatch(TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_c3")
+    task = (await fetch_tasks("sig_c3"))[0]
+    await open_first_orders(task.task_id, ["nd_a"])
+    assert await store.get_group_node_busy(gid, "nd_a") is not None
+
+    monkeypatch.setattr(manager, "send_to_node", capture_sender([], ok=False))
+    res = await d.dispatch(
+        TradingSignal(action="CLOSE", symbol="XAUUSD", volume=0.1), "sig_c4",
+    )
+
+    assert res["tasks"][0]["status"] == "failed"
+    rows = await fetch_dispatches(task.task_id)
+    assert rows[0].status == "failed"
+    assert rows[0].finish_reason == "close_signal_node_offline"
+    assert await store.get_group_node_busy(gid, "nd_a") is None
 
 
 async def test_close_signal_without_active_task_is_skipped(store, monkeypatch):
@@ -869,12 +1010,15 @@ async def test_recent_group_signals_pagination_and_shape(store, monkeypatch):
     item = page1["items"][0]
     assert item["group_id"] == gid
     assert item["symbol"] == "XAUUSD"
-    assert item["magic"] == group_rules.task_magic(item["task_id"])
+    assert "magic" not in item  # 魔术号在子任务上
     assert item["node_ids"] == ["nd_a"]
     assert item["payload"]["cmd"] == "strategy_start"
     assert item["strategy_id"]
-    assert item["dispatches"][0]["node_name"] == "节点A"
-    assert item["dispatches"][0]["status"] == "done"
+    detail = item["dispatches"][0]
+    assert detail["node_name"] == "节点A"
+    assert detail["status"] == "done"
+    assert detail["symbol"] == "XAUUSD"
+    assert detail["magic"] == group_rules.subtask_magic(detail["id"])
 
     page2 = await group_persist.recent_group_signals(gid, 2, 2)
     assert [i["signal_id"] for i in page2["items"]] == ["sig_q0"]

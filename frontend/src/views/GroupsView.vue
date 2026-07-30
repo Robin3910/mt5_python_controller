@@ -596,7 +596,7 @@ function dispatchSummary(row: GroupSignalTaskRecord): string {
               <thead>
                 <tr>
                   <th style="width: 22px"></th>
-                  <th>时间</th><th>任务号</th><th>魔术号</th><th>动作</th><th>品种</th>
+                  <th>时间</th><th>任务号</th><th>动作</th><th>品种</th>
                   <th class="right">手数</th><th>分发模式</th><th>任务状态</th><th>节点处理</th>
                 </tr>
               </thead>
@@ -606,7 +606,6 @@ function dispatchSummary(row: GroupSignalTaskRecord): string {
                     <td class="muted">{{ isExpanded(t.task_id) ? '▾' : '▸' }}</td>
                     <td class="muted" style="font-size: 12px">{{ fmtTime(t.created_at) }}</td>
                     <td>#{{ t.task_id }}</td>
-                    <td class="muted" style="font-size: 12px">{{ t.magic ?? '—' }}</td>
                     <td>
                       <span
                         v-if="t.action"
@@ -625,7 +624,7 @@ function dispatchSummary(row: GroupSignalTaskRecord): string {
                   </tr>
                   <tr v-if="isExpanded(t.task_id)" class="detail-row">
                     <td></td>
-                    <td colspan="9">
+                    <td colspan="8">
                       <div class="kv-grid" style="margin: 6px 0 10px">
                         <div class="kv"><span class="k">信号 ID</span><span class="v" style="font-size: 12px">{{ t.signal_id }}</span></div>
                         <div class="kv"><span class="k">绑定策略</span><span class="v" style="font-size: 12px">{{ t.strategy_name || '—' }}</span></div>
@@ -644,7 +643,7 @@ function dispatchSummary(row: GroupSignalTaskRecord): string {
                         <div v-if="isTaskActive(t.status)" class="kv span-full">
                           <span class="k">提示</span>
                           <span class="v" style="font-size: 12px">
-                            任务进行中，本分组暂不接收新的策略信号；发送 CLOSE 信号可终止
+                            任务进行中，下方运行中的节点该品种暂不接收新的策略信号；发送 CLOSE 信号可终止
                           </span>
                         </div>
                       </div>
@@ -660,7 +659,7 @@ function dispatchSummary(row: GroupSignalTaskRecord): string {
                         <table class="group-detail-table">
                           <thead>
                             <tr>
-                              <th>节点</th><th>状态</th><th class="right">首单手数</th>
+                              <th>节点</th><th>魔术号</th><th>状态</th><th class="right">首单手数</th>
                               <th class="right">持仓</th><th class="right">加仓</th><th class="right">累计手数</th>
                               <th class="right">盈亏</th><th>结束原因</th>
                               <th>订单</th><th class="right">成交价</th>
@@ -670,6 +669,7 @@ function dispatchSummary(row: GroupSignalTaskRecord): string {
                           <tbody>
                             <tr v-for="d in t.dispatches" :key="d.id">
                               <td>{{ d.node_name || d.node_id }}</td>
+                              <td class="muted" style="font-size: 12px">{{ d.magic ?? '—' }}</td>
                               <td><span class="tag" :class="dispatchTag(d.status).cls">{{ dispatchTag(d.status).text }}</span></td>
                               <td class="right">{{ d.decided_vol ?? '—' }}</td>
                               <td class="right">{{ d.position_count }}</td>

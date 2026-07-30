@@ -6,7 +6,6 @@
 3) strategy 信号端到端：分组下发 -> 节点收到带任务号魔术号的命令 -> 回报 ->
    /api/groups/{id}/signals 能看到主任务与各节点处理过程。
 """
-import asyncio
 import pathlib
 import time
 
@@ -24,20 +23,22 @@ def client(monkeypatch):
     def fake_from_url(cls, url=None):
         return RedisStore(fakeredis.FakeAsyncRedis(decode_responses=True))
 
+    reset_test_db(_TEST_DB)
     monkeypatch.setattr(RedisStore, "from_url", classmethod(fake_from_url))
     from app.main import app
 
     with TestClient(app) as c:
         yield c
-
-    asyncio.run(__import__("app.db", fromlist=["engine"]).engine.dispose())
-    try:
-        _TEST_DB.unlink()
-    except (FileNotFoundError, PermissionError):
-        pass
+    # 连接池由 app 的 lifespan 在自己的事件循环里释放，这里只清文件
+    drop_test_db(_TEST_DB)
 
 
-from tests.test_helpers import auth_headers, seed_default_filters
+from tests.test_helpers import (
+    auth_headers,
+    drop_test_db,
+    reset_test_db,
+    seed_default_filters,
+)
 def _node_token(client, headers) -> str:
     r = client.get("/api/config/node-token", headers=headers)
     assert r.status_code == 200, r.text
@@ -496,7 +497,7 @@ def test_manual_signal_supports_strategy_model(client):
 # 6. strategy 信号端到端
 # =====================================================================
 def test_strategy_end_to_end_sync(client):
-    """分组 sync：两个在线节点都收到带任务号魔术号的开仓命令，回报后明细收口。"""
+    """分组 sync：两个在线节点各收到自己魔术号的开仓命令，回报后子任务收口。"""
     h = auth_headers(client)
     token = _node_token(client, h)
     n1 = _mk_node(client, h, 5201, "节点甲")
@@ -525,7 +526,7 @@ def test_strategy_end_to_end_sync(client):
         task = body["tasks"][0]
         assert task["group_id"] == gid
         assert task["dispatch_mode"] == "sync"
-        assert task["magic"] == Config.GROUP_TASK_MAGIC_BASE + task["task_id"]
+        assert "magic" not in task  # 魔术号在各节点子任务上
 
         cmd1 = ws1.receive_json()
         cmd2 = ws2.receive_json()
@@ -537,10 +538,12 @@ def test_strategy_end_to_end_sync(client):
             assert cmd["model"] == "strategy"
             assert cmd["group_id"] == gid
             assert cmd["task_id"] == task["task_id"]
-            # MT5 下单用的魔术号即主任务号换算值
-            assert cmd["magic"] == task["magic"]
+            # MT5 下单用的魔术号即该节点子任务号换算值
+            assert cmd["magic"] == Config.NODE_TASK_MAGIC_BASE + cmd["dispatch_id"]
             # 策略规则随命令下发，节点据此常驻加仓
             assert cmd["strategy"]["symbol"] == "XAUUSD"
+        # 两个节点各持一个魔术号，互不共用
+        assert cmd1["magic"] != cmd2["magic"]
 
         ws1.send_json({"type": "trade_result", "data": {
             "signal_id": cmd1["signal_id"], "magic": cmd1["magic"],
@@ -564,7 +567,6 @@ def test_strategy_end_to_end_sync(client):
     assert page["total"] == 1
     item = page["items"][0]
     assert item["task_id"] == task["task_id"]
-    assert item["magic"] == task["magic"]
     assert item["signal_id"] == body["signal_id"]
     assert item["group_name"] == "端到端组"
     assert item["symbol"] == "XAUUSD"
@@ -584,9 +586,11 @@ def test_strategy_end_to_end_sync(client):
     assert by_node[n1]["order"] == 7001
     assert by_node[n1]["price"] == 2400.5
     assert by_node[n1]["finish_reason"] == "positions_cleared"
-    assert by_node[n1]["magic"] == task["magic"]
+    assert by_node[n1]["magic"] == cmd1["magic"]
+    assert by_node[n1]["symbol"] == "XAUUSD"
     assert by_node[n2]["status"] == "failed"
     assert by_node[n2]["error"] == "no money"
+    assert by_node[n2]["magic"] == cmd2["magic"]
 
     # 分组列表的信号数随之增长
     assert client.get(f"/api/groups/{gid}", headers=h).json()["signal_count"] == 1
@@ -616,7 +620,7 @@ def test_strategy_end_to_end_poll_only_one_node(client):
         cmd1 = ws1.receive_json()          # 队首节点领取
         assert cmd1["cmd"] == "strategy_start"
 
-        # 分组互斥：第一条任务收口后才能接收下一条
+        # 节点互斥：领取者收口后其占位才放开（这里轮转到另一个节点，本不受阻）
         ws1.send_json({"type": "strategy_finished", "data": {
             "task_id": cmd1["task_id"], "magic": cmd1["magic"], "status": "done",
         }})
@@ -638,8 +642,59 @@ def test_strategy_end_to_end_poll_only_one_node(client):
         assert len(item["dispatches"]) == 1
 
 
+def test_node_busy_then_released_end_to_end(client):
+    """组内节点互斥全链路：运行中的节点跳过本分组新信号，收口后重新可用。"""
+    h = auth_headers(client)
+    token = _node_token(client, h)
+    n1 = _mk_node(client, h, 5241, "互斥甲")
+    gid = _mk_group(client, h, name="互斥端到端组", node_ids=[n1])["group_id"]
+
+    with client.websocket_connect("/ws/node") as ws1:
+        ws1.send_json({"type": "auth", "data": {"token": token, "mt5_login": 5241}})
+        assert ws1.receive_json()["type"] == "auth_ok"
+
+        client.post("/webhook", json={
+            "action": "buy", "symbol": "XAUUSD", "volume": 0.1, "model": "strategy",
+        })
+        start = ws1.receive_json()
+        ws1.send_json({"type": "trade_result", "data": {
+            "signal_id": start["signal_id"], "magic": start["magic"],
+            "symbol": "XAUUSD", "success": True, "order": 1,
+        }})
+        _wait_task_status(client, h, gid, "running")
+
+        # 该节点在本分组内已被占：第二条信号进得来但无节点可发
+        # （手数换一个值，避开 5 秒内的重复信号去重）
+        busy = client.post("/webhook", json={
+            "action": "buy", "symbol": "XAUUSD", "volume": 0.2, "model": "strategy",
+        }).json()
+        assert busy["targets"] == 0
+        assert busy["tasks"][0]["status"] == "skipped"
+        assert "均有进行中的任务" in busy["tasks"][0]["reason"]
+
+        # 收口后占位释放，同节点同品种重新接单
+        ws1.send_json({"type": "strategy_finished", "data": {
+            "task_id": start["task_id"], "magic": start["magic"], "status": "done",
+        }})
+        _wait_task_status(client, h, gid, "done")
+
+        again = client.post("/webhook", json={
+            "action": "buy", "symbol": "XAUUSD", "volume": 0.3, "model": "strategy",
+        }).json()
+        assert again["targets"] == 1
+        resumed = ws1.receive_json()
+        assert resumed["cmd"] == "strategy_start"
+        assert resumed["magic"] != start["magic"]   # 新子任务 -> 新魔术号
+
+        # 收尾：把最后这条也收口，避免退出时还有落库在途影响后续用例
+        ws1.send_json({"type": "strategy_finished", "data": {
+            "task_id": resumed["task_id"], "magic": resumed["magic"], "status": "done",
+        }})
+        _wait_task_status(client, h, gid, "done")
+
+
 def test_strategy_close_terminates_running_task(client):
-    """CLOSE 是终止指令：绕过互斥，让在跑的节点平掉该魔术号持仓。"""
+    """CLOSE 是终止指令：绕过互斥，让每个在跑节点平掉自己魔术号的持仓。"""
     h = auth_headers(client)
     token = _node_token(client, h)
     n1 = _mk_node(client, h, 5221)
@@ -674,10 +729,12 @@ def test_strategy_close_terminates_running_task(client):
         assert r["mode"] == "group_close"
         assert r["targets"] == 2            # 在跑的节点全部收到终止指令
 
-        for ws in (ws1, ws2):
+        for ws, start in ((ws1, start1), (ws2, start2)):
             cmd = ws.receive_json()
             assert cmd["cmd"] == "strategy_stop"
-            assert cmd["magic"] == start1["magic"]
+            # 各节点收到的是自己那个魔术号，不是共用的
+            assert cmd["magic"] == start["magic"]
+            assert cmd["dispatch_id"] == start["dispatch_id"]
             assert cmd["group_id"] == gid
             assert cmd["model"] == "strategy"
 

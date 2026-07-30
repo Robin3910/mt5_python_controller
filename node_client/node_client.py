@@ -9,6 +9,8 @@
 - MetaTrader5 的调用是阻塞式的，统一丢到线程池(run_in_executor)，不阻塞事件循环；
 - 断线自动重连（指数退避）；
 - 三个并发任务：账户上报 / 心跳 / 接收命令，任一结束即重建连接；
+- 策略托管任务由 MarketHub 统一采样并派发事件驱动（见 market_hub.py），
+  采样协程与连接无关、常驻整个进程生命周期；
 - 启动时绑定的 MT5 登录号与终端实时 account_info.login 不一致时主动停交易并断线。
 """
 import asyncio
@@ -18,6 +20,7 @@ import logging
 import websockets
 
 from config import get_settings
+from market_hub import MarketHub
 from mt5_prompt import prompt_mt5_credentials
 from strategy_runner import StrategyRunner
 
@@ -78,11 +81,22 @@ class NodeClient:
         self.hub_symbols: set[str] = set()
         # 策略托管任务：task_id -> StrategyRunner，断线时取消、重连后由服务端下发恢复
         self.runners: dict[int, StrategyRunner] = {}
+        # 策略监控的事件源：全节点共用一个采样器，MT5 调用次数与任务数无关
+        self.hub: MarketHub | None = None
 
     async def run(self) -> None:
         """主入口：先连 MT5，再进入“连接-鉴权-服务”的自动重连循环。"""
         self.loop = asyncio.get_running_loop()
         await self._connect_mt5()
+        self._ensure_hub()
+        try:
+            await self._connect_loop()
+        finally:
+            if self.hub is not None:
+                await self.hub.close()
+                self.hub = None
+
+    async def _connect_loop(self) -> None:
         backoff = settings.reconnect_min
         while not self._stop:
             try:
@@ -107,6 +121,18 @@ class NodeClient:
             # 断线后指数退避重连
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, settings.reconnect_max)
+
+    def _ensure_hub(self) -> MarketHub:
+        """取（必要时创建）策略监控事件源；采样协程幂等启动。"""
+        if self.hub is None:
+            self.hub = MarketHub(
+                self.mt5, self._exec,
+                interval=settings.strategy_sample_interval,
+                idle_interval=settings.strategy_idle_interval,
+                empty_confirm=settings.strategy_empty_confirm,
+            )
+        self.hub.start()
+        return self.hub
 
     # ---------------------- MT5 辅助 ----------------------
     async def _exec(self, fn, *args):
@@ -320,12 +346,14 @@ class NodeClient:
             signal_id=msg.get("signal_id") or "",
             entry=msg.get("entry") or {},
             strategy=msg.get("strategy") or {},
+            mt5=self.mt5,
+            hub=self._ensure_hub(),
             exec_fn=self._exec,
             send_fn=send,
             report_interval=msg.get("report_interval") or 5,
         )
         self.runners[task_id] = runner
-        runner.start(self.mt5, resume=resume)
+        runner.start(resume=resume)
         logger.info(
             "strategy task %s %s (magic=%s symbol=%s)",
             task_id, "resumed" if resume else "started", magic, (msg.get("entry") or {}).get("symbol"),

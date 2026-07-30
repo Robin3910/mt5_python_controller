@@ -11,11 +11,14 @@ class Config:
     DEFAULT_LOT = float(os.getenv("DEFAULT_LOT", "0.1"))            # 默认手数
     DEFAULT_SLIPPAGE = int(os.getenv("DEFAULT_SLIPPAGE", "10"))      # 默认滑点（点）
     DEFAULT_MAGIC_NUMBER = int(os.getenv("DEFAULT_MAGIC_NUMBER", "20240615"))  # 订单魔术号
-    # strategy 分组链路的魔术号基数：实际魔术号 = 基数 + 主任务号，保证与 normal 链路
-    # 的固定魔术号不冲突，且能从 MT5 订单反查到具体的分组主任务。
-    GROUP_TASK_MAGIC_BASE = int(os.getenv("GROUP_TASK_MAGIC_BASE", "900000000"))
-    # 分组互斥占位的兜底 TTL（秒）：节点永久离线时避免分组被锁死，到期自动放行
-    GROUP_BUSY_TTL = int(os.getenv("GROUP_BUSY_TTL", str(24 * 3600)))
+    # strategy 链路的魔术号基数：实际魔术号 = 基数 + 子任务号（group_task_dispatch.id），
+    # 保证与 normal 链路的固定魔术号不冲突。每个节点持有自己的魔术号，因此一个魔术号
+    # 全局唯一地对应「哪个节点上的哪次执行」，可由 MT5 订单直接反查到子任务。
+    NODE_TASK_MAGIC_BASE = int(
+        os.getenv("NODE_TASK_MAGIC_BASE", os.getenv("GROUP_TASK_MAGIC_BASE", "900000000"))
+    )
+    # 节点互斥占位的兜底 TTL（秒）：节点永久离线时避免该品种被锁死，到期自动放行
+    NODE_BUSY_TTL = int(os.getenv("NODE_BUSY_TTL", os.getenv("GROUP_BUSY_TTL", str(24 * 3600))))
     # 节点上报策略执行快照的间隔（秒），随 strategy_start 下发
     STRATEGY_REPORT_INTERVAL = int(os.getenv("STRATEGY_REPORT_INTERVAL", "5"))
 

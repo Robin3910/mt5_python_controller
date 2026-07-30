@@ -6,7 +6,6 @@
 使用 fakeredis + SQLite，无需任何外部服务。settings 为进程内单例，测试通过
 monkeypatch 直接改其属性来开关鉴权/白名单（webhook 处理器在请求期读取，故生效）。
 """
-import asyncio
 import pathlib
 
 import fakeredis
@@ -27,17 +26,14 @@ def client(monkeypatch):
     def fake_from_url(cls, url=None):
         return RedisStore(fakeredis.FakeAsyncRedis(decode_responses=True))
 
+    reset_test_db(_TEST_DB)
     monkeypatch.setattr(RedisStore, "from_url", classmethod(fake_from_url))
     from app.main import app
 
     with TestClient(app) as c:
         yield c
-
-    asyncio.run(__import__("app.db", fromlist=["engine"]).engine.dispose())
-    try:
-        _TEST_DB.unlink()
-    except (FileNotFoundError, PermissionError):
-        pass
+    # 连接池由 app 的 lifespan 在自己的事件循环里释放，这里只清文件
+    drop_test_db(_TEST_DB)
 
 
 def _enable_auth(monkeypatch, token=TOKEN):
@@ -50,7 +46,7 @@ def _enable_ip_whitelist(monkeypatch, ips):
     monkeypatch.setattr(settings, "whitelisted_ips", ips)
 
 
-from tests.test_helpers import seed_default_filters
+from tests.test_helpers import drop_test_db, reset_test_db, seed_default_filters
 
 
 # =====================================================================

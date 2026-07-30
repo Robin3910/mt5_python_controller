@@ -289,76 +289,91 @@ async def _reconcile_strategy_tasks(node_id: str, positions: list) -> None:
             magics.add(int((pos or {}).get("magic") or 0))
         except (TypeError, ValueError):
             continue
-    for task_id, task_status in await group_persist.reconcile_node_positions(node_id, magics):
-        logger.info("task %s reconciled from account snapshot of %s", task_id, node_id)
-        if task_status and task_status not in group_rules.TASK_ACTIVE:
-            await _release_group_busy(task_id)
+    for done in await group_persist.reconcile_node_positions(node_id, magics):
+        logger.info(
+            "task %s reconciled from account snapshot of %s", done.get("task_id"), node_id,
+        )
+        await _release_node_busy(done)
 
 
 async def _on_trade_result(node_id: str, data: dict) -> None:
     """处理成交回报：唤醒轮询等待者、释放执行锁、落库、推送后台。
 
     strategy 分组链路的回报只更新 group_task_dispatch；命中后不再走 normal 链路的
-    signal_dispatch，两张明细表互不写入。任务号优先取回报里的 task_id / magic，
-    没有时按 signal_id 回退匹配，兼容尚未上报魔术号的旧版节点客户端。
+    signal_dispatch，两张明细表互不写入。子任务号优先由回报里的 magic 反查（最精确），
+    其次按 task_id / signal_id 回退，兼容尚未上报魔术号的旧版节点客户端。
     """
     store = state.store
     signal_id = data.get("signal_id", "")
     symbol = data.get("symbol", "")
     # 轮询模式正等待该回报，唤醒对应 future
     results.resolve(signal_id, node_id, data)
-    if symbol:
+    dispatch_id = group_rules.subtask_id_from_magic(data.get("magic"))
+    # normal 链路的执行锁只对 normal 回报有意义；strategy 回报不能去动它，
+    # 否则会把同节点同品种正在途的 normal 订单的保护提前解除
+    if symbol and dispatch_id is None:
         await store.release_exec_lock(node_id, symbol)
 
-    task_id = data.get("task_id") or group_rules.task_id_from_magic(data.get("magic"))
-    handled_by_group = await group_persist.update_dispatch_result(
-        node_id=node_id, result=data, task_id=task_id, signal_id=signal_id,
+    handled = await group_persist.update_dispatch_result(
+        node_id=node_id, result=data, dispatch_id=dispatch_id,
+        task_id=data.get("task_id"), signal_id=signal_id,
     )
-    if not handled_by_group:
+    if handled is None:
         status = "done" if data.get("success") else "failed"
         await persist.update_dispatch_result(signal_id, node_id, status, data)
-    elif task_id and not data.get("success"):
-        # 首单失败可能让整个主任务直接收口，此时要放开分组占位
-        status = await group_persist.task_status(int(task_id))
-        if status and status not in group_rules.TASK_ACTIVE:
-            await _release_group_busy(int(task_id))
+    else:
+        # 首单失败会让子任务直接收口，此时要放开该节点该品种的占位
+        await _release_node_busy(handled)
     await manager.broadcast_admin(
         {"type": "trade_result", "data": {"node_id": node_id, **data}}
     )
 
 
 async def _resume_strategy_tasks(node_id: str, ws: WebSocket) -> None:
-    """节点重连后重建仍在运行的策略监控（不重复下首单）。
+    """节点重连后重建仍未收口的策略监控（不重复下首单）。
 
     MT5 持仓在节点掉线期间依然存在，若不恢复监控就没人负责加仓与平仓判定，
-    分组也会因为主任务一直不收口而被互斥锁卡住。
+    该节点该品种也会因为子任务一直不收口而被互斥占位卡住。
     """
     try:
-        tasks = await group_persist.resumable_tasks(node_id)
+        subtasks = await group_persist.resumable_tasks(node_id)
     except Exception:  # noqa: BLE001
         logger.exception("load resumable tasks failed for %s", node_id)
         return
-    for task in tasks:
+    for subtask in subtasks:
         try:
-            await ws.send_json(group_dispatcher.build_strategy_resume_command(task))
-            logger.info("node %s resume strategy task %s", node_id, task.get("task_id"))
+            await ws.send_json(group_dispatcher.build_strategy_resume_command(subtask))
+            logger.info(
+                "node %s resume strategy subtask %s (magic=%s)",
+                node_id, subtask.get("dispatch_id"), subtask.get("magic"),
+            )
         except Exception:  # noqa: BLE001
-            logger.warning("send resume for task %s to %s failed", task.get("task_id"), node_id)
+            logger.warning(
+                "send resume for subtask %s to %s failed", subtask.get("dispatch_id"), node_id,
+            )
             return
 
 
-def _task_id_of(data: dict) -> int | None:
-    return data.get("task_id") or group_rules.task_id_from_magic(data.get("magic"))
+def _locator(data: dict) -> tuple[int | None, int | None]:
+    """从回报里解出定位子任务用的 (子任务号, 主任务号)。"""
+    dispatch_id = data.get("dispatch_id") or group_rules.subtask_id_from_magic(
+        data.get("magic")
+    )
+    task_id = data.get("task_id")
+    return (
+        int(dispatch_id) if dispatch_id else None,
+        int(task_id) if task_id else None,
+    )
 
 
 async def _on_strategy_progress(node_id: str, data: dict) -> None:
     """策略运行期上报：刷新子任务快照，状态变更事件入事件流。"""
-    task_id = _task_id_of(data)
-    if not task_id:
-        logger.debug("strategy_progress without task_id from %s", node_id)
+    dispatch_id, task_id = _locator(data)
+    if dispatch_id is None and task_id is None:
+        logger.debug("strategy_progress without locator from %s", node_id)
         return
     await group_persist.record_strategy_progress(
-        node_id=node_id, task_id=int(task_id), data=data,
+        node_id=node_id, data=data, dispatch_id=dispatch_id, task_id=task_id,
     )
     await manager.broadcast_admin(
         {"type": "strategy_progress", "data": {"node_id": node_id, **data}}
@@ -366,34 +381,28 @@ async def _on_strategy_progress(node_id: str, data: dict) -> None:
 
 
 async def _on_strategy_finished(node_id: str, data: dict) -> None:
-    """策略结束上报：子任务收口；主任务全部收口后释放分组互斥占位。"""
-    task_id = _task_id_of(data)
-    if not task_id:
-        logger.debug("strategy_finished without task_id from %s", node_id)
+    """策略结束上报：子任务收口并释放该节点该品种的互斥占位。"""
+    dispatch_id, task_id = _locator(data)
+    if dispatch_id is None and task_id is None:
+        logger.debug("strategy_finished without locator from %s", node_id)
         return
-    task_status = await group_persist.finish_subtask(
-        node_id=node_id, task_id=int(task_id), data=data,
+    finished = await group_persist.finish_subtask(
+        node_id=node_id, data=data, dispatch_id=dispatch_id, task_id=task_id,
     )
-    if task_status and task_status not in group_rules.TASK_ACTIVE:
-        await _release_group_busy(int(task_id))
+    await _release_node_busy(finished)
     await manager.broadcast_admin(
         {"type": "strategy_finished", "data": {"node_id": node_id, **data}}
     )
 
 
-async def _release_group_busy(task_id: int) -> None:
-    """主任务收口后释放分组占位，让分组能接收下一条策略信号。"""
+async def _release_node_busy(result: dict | None) -> None:
+    """释放持久化层回传的组内节点占位，让该节点能接收本分组的下一条策略信号。"""
     store = state.store
-    if not store:
+    if not store or not result:
         return
-    active = await group_persist.task_group_id(task_id)
-    if not active:
-        return
-    marker = await store.get_group_busy(active)
-    # 占位可能已被下一条信号抢占，只清理属于本任务的那一份
-    if marker is None or str(marker) == str(task_id) or marker == "pending":
-        await store.release_group_busy(active)
-        logger.info("group %s released by task %s", active, task_id)
+    for group_id, node_id in result.get("released", []):
+        await store.release_group_node_busy(group_id, node_id)
+        logger.info("group %s node %s released", group_id, node_id)
 
 
 async def _update_node_mt5(node_id: str, ws: WebSocket, data: dict) -> None:

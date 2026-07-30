@@ -261,12 +261,13 @@ export interface StrategyUpdatePayload {
   rules?: StrategyRule[]
 }
 
-/** 主任务在单个节点上的下发与完成情况 */
-/** 子节点信号任务：pending/sent/opened/running/closing/done/failed/skipped/offline */
+/** 节点信号任务：策略执行的实际单元，自持魔术号 */
+/** 状态流转：pending/sent/opened/running/closing/done/failed/skipped/offline */
 export interface GroupTaskDispatchRecord {
   id: number
   node_id: string
   node_name: string | null
+  symbol: string | null
   decided_vol: number | null
   status: string
   skip_reason: string | null
@@ -290,10 +291,9 @@ export interface GroupTaskDispatchRecord {
   finished_at: number | null
 }
 
-/** 分组信号主任务（信号信息 + 下发数据 + 各节点处理情况） */
+/** 分组信号主任务：分发记录；魔术号在各节点子任务上，主任务不持有 */
 export interface GroupSignalTaskRecord {
   task_id: number
-  magic: number | null
   signal_id: string
   group_id: string
   group_name: string | null

@@ -190,9 +190,10 @@ class GroupOut(BaseModel):
 
 
 class GroupTaskDispatchRecord(BaseModel):
-    """子节点信号任务：主任务在单个节点上的下发、策略运行与完成情况。"""
+    """节点信号任务：策略执行的实际单元，自持魔术号。"""
     id: int
     node_id: str
+    symbol: Optional[str] = None
     node_name: Optional[str] = None
     decided_vol: Optional[float] = None
     status: str = "pending"
@@ -217,9 +218,11 @@ class GroupTaskDispatchRecord(BaseModel):
 
 
 class GroupSignalTaskRecord(BaseModel):
-    """分组信号主任务（信号信息 + 下发数据 + 各节点处理情况）。"""
+    """分组信号主任务：分发记录（信号信息 + 下发数据 + 各节点子任务）。
+
+    魔术号在子任务上（各节点独立），主任务本身不持有。
+    """
     task_id: int
-    magic: Optional[int] = None
     signal_id: str
     group_id: str
     group_name: Optional[str] = None

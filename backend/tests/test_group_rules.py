@@ -68,21 +68,27 @@ def test_resolve_volume_floors_at_zero(raw):
 
 
 # =====================================================================
-# 任务号 <-> 魔术号
+# 子任务号 <-> 魔术号（魔术号绑在节点子任务上，不是分组主任务）
 # =====================================================================
-def test_task_magic_round_trip():
-    magic = group_rules.task_magic(42)
-    assert magic == Config.GROUP_TASK_MAGIC_BASE + 42
-    assert group_rules.task_id_from_magic(magic) == 42
+def test_subtask_magic_round_trip():
+    magic = group_rules.subtask_magic(42)
+    assert magic == Config.NODE_TASK_MAGIC_BASE + 42
+    assert group_rules.subtask_id_from_magic(magic) == 42
 
 
-def test_task_magic_never_collides_with_normal_magic():
-    assert group_rules.task_magic(1) != Config.DEFAULT_MAGIC_NUMBER
+def test_subtask_magic_never_collides_with_normal_magic():
+    assert group_rules.subtask_magic(1) != Config.DEFAULT_MAGIC_NUMBER
+
+
+def test_subtask_magics_are_unique_per_node():
+    """不同子任务号派生出的魔术号必须互不相同。"""
+    magics = {group_rules.subtask_magic(i) for i in range(1, 50)}
+    assert len(magics) == 49
 
 
 @pytest.mark.parametrize("magic", [None, "", "abc", Config.DEFAULT_MAGIC_NUMBER, 0])
-def test_task_id_from_magic_rejects_out_of_range(magic):
-    assert group_rules.task_id_from_magic(magic) is None
+def test_subtask_id_from_magic_rejects_out_of_range(magic):
+    assert group_rules.subtask_id_from_magic(magic) is None
 
 
 # =====================================================================

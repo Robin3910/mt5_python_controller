@@ -5,8 +5,12 @@
 - 本模块只读写 group_signal_task / group_task_dispatch（strategy 链路），
   并在明细收口时同步刷新 signal_history 的整体状态。
 
-主任务号 task_id 由数据库自增生成，`magic = GROUP_TASK_MAGIC_BASE + task_id`，
-下发给节点后会作为 MT5 订单魔术号写入，便于从成交单反查主任务。
+魔术号绑在节点子任务上：`magic = NODE_TASK_MAGIC_BASE + group_task_dispatch.id`，
+每个节点独立持有，因此一个魔术号全局唯一地对应一次节点执行。分组主任务
+（group_signal_task）退化为分发记录，只汇总一条信号在该分组内命中了哪些节点。
+
+组内节点互斥占位存在 Redis 里，本模块不碰 Redis：凡是让子任务进入终态的函数都会
+把需要释放的 (group_id, node_id) 回传给调用方，由调用方去释放。
 """
 from __future__ import annotations
 
@@ -36,11 +40,11 @@ async def create_task(
     raw_payload: Optional[str] = None,
     strategy: Optional[dict] = None,
     strategy_snapshot: Optional[dict] = None,
-) -> Optional[dict]:
-    """在下发节点之前创建一条分组主任务，返回 {task_id, magic}。
+) -> Optional[int]:
+    """在下发节点之前创建一条分组主任务（分发记录），返回 task_id。
 
-    落库失败时返回 None——调用方据此放弃该分组的下发（没有任务号就没有魔术号，
-    无法把 MT5 订单关联回主任务，宁可不发也不发一条无法追溯的单）。
+    落库失败时返回 None——调用方据此放弃该分组的下发：主任务是子任务的归属，
+    没有它就无法把节点执行归拢回这条信号。
     """
     try:
         async with SessionLocal() as s:
@@ -64,64 +68,109 @@ async def create_task(
             )
             s.add(row)
             await s.flush()
-            magic = group_rules.task_magic(row.task_id)
-            row.magic = magic
+            task_id = row.task_id
             await s.commit()
-            return {"task_id": row.task_id, "magic": magic}
+            return task_id
     except Exception as e:  # noqa: BLE001
         logger.warning("create_task failed: %s", e)
         return None
 
 
-async def active_task(group_id: str) -> Optional[dict]:
-    """分组当前进行中的主任务（互斥判定的权威来源）；没有则返回 None。"""
+async def create_dispatch(
+    *,
+    task_id: int,
+    signal_id: str,
+    group_id: str,
+    node_id: str,
+    symbol: Optional[str],
+    decided_vol: Optional[float],
+) -> Optional[dict]:
+    """创建一条节点子任务并分配魔术号，返回 {dispatch_id, magic}。
+
+    必须在下发命令之前落库：魔术号由自增主键派生，而且节点的回报可能在下发流程
+    还没走完时就到达，先有记录才不会丢报。
+
+    这里只做插入，不刷新主任务与信号状态——紧随其后的 set_dispatch_status 会刷，
+    多个节点并发下发时少一轮读写能明显减少写锁竞争。
+    """
     try:
         async with SessionLocal() as s:
-            row = (
-                await s.execute(
-                    select(GroupSignalTask)
-                    .where(
-                        GroupSignalTask.group_id == group_id,
-                        GroupSignalTask.status.in_(group_rules.TASK_ACTIVE),
-                    )
-                    .order_by(GroupSignalTask.task_id.desc())
-                    .limit(1)
-                )
-            ).scalar_one_or_none()
-            if not row:
-                return None
-            return {
-                "task_id": row.task_id,
-                "magic": row.magic,
-                "group_id": row.group_id,
-                "signal_id": row.signal_id,
-                "status": row.status,
-                "symbol": row.symbol,
-                "action": row.action,
-                "volume": row.volume,
-                "dispatch_mode": row.dispatch_mode,
-                "strategy_snapshot": row.strategy_snapshot_json,
-            }
+            row = GroupTaskDispatch(
+                task_id=task_id,
+                signal_id=signal_id,
+                group_id=group_id,
+                node_id=node_id,
+                symbol=symbol,
+                decided_vol=decided_vol,
+                status="pending",
+                dispatched_at=datetime.now(),
+            )
+            s.add(row)
+            await s.flush()
+            magic = group_rules.subtask_magic(row.id)
+            row.magic = magic
+            dispatch_id = row.id
+            await s.commit()
+            return {"dispatch_id": dispatch_id, "magic": magic}
     except Exception as e:  # noqa: BLE001
-        logger.warning("active_task failed: %s", e)
+        logger.warning("create_dispatch failed: %s", e)
         return None
 
 
-async def active_group_ids() -> dict[str, int]:
-    """所有存在进行中任务的分组 -> 任务号（服务端重启后重建互斥占位）。"""
+async def active_subtasks(group_id: str) -> list[dict]:
+    """分组下仍未收口的节点子任务（CLOSE 终止指令的目标）。"""
     try:
         async with SessionLocal() as s:
             rows = (
                 await s.execute(
-                    select(GroupSignalTask.group_id, GroupSignalTask.task_id)
-                    .where(GroupSignalTask.status.in_(group_rules.TASK_ACTIVE))
-                    .order_by(GroupSignalTask.task_id.asc())
+                    select(GroupTaskDispatch)
+                    .where(
+                        GroupTaskDispatch.group_id == group_id,
+                        GroupTaskDispatch.status.notin_(tuple(_TERMINAL)),
+                    )
+                    .order_by(GroupTaskDispatch.id.asc())
+                )
+            ).scalars().all()
+            return [
+                {
+                    "dispatch_id": r.id,
+                    "task_id": r.task_id,
+                    "signal_id": r.signal_id,
+                    "node_id": r.node_id,
+                    "symbol": r.symbol,
+                    "magic": r.magic,
+                    "status": r.status,
+                }
+                for r in rows
+            ]
+    except Exception as e:  # noqa: BLE001
+        logger.warning("active_subtasks failed: %s", e)
+        return []
+
+
+async def active_node_locks() -> list[dict]:
+    """仍持有组内节点占位的子任务（服务端重启后据此重建 Redis 占位）。"""
+    try:
+        async with SessionLocal() as s:
+            rows = (
+                await s.execute(
+                    select(
+                        GroupTaskDispatch.id,
+                        GroupTaskDispatch.group_id,
+                        GroupTaskDispatch.node_id,
+                    )
+                    .where(GroupTaskDispatch.status.in_(group_rules.SUBTASK_HOLDS_LOCK))
+                    .order_by(GroupTaskDispatch.id.asc())
                 )
             ).all()
-            return {gid: tid for gid, tid in rows}
+            return [
+                {"dispatch_id": did, "group_id": gid, "node_id": nid}
+                for did, gid, nid in rows
+                if gid and nid
+            ]
     except Exception as e:  # noqa: BLE001
-        logger.warning("active_group_ids failed: %s", e)
-        return {}
+        logger.warning("active_node_locks failed: %s", e)
+        return []
 
 
 async def task_status(task_id: int) -> Optional[str]:
@@ -140,42 +189,11 @@ async def task_status(task_id: int) -> Optional[str]:
         return None
 
 
-async def task_group_id(task_id: int) -> Optional[str]:
-    """主任务所属分组（释放互斥占位时用）。"""
-    try:
-        async with SessionLocal() as s:
-            return (
-                await s.execute(
-                    select(GroupSignalTask.group_id).where(
-                        GroupSignalTask.task_id == task_id
-                    )
-                )
-            ).scalar_one_or_none()
-    except Exception as e:  # noqa: BLE001
-        logger.warning("task_group_id failed: %s", e)
-        return None
-
-
-async def running_node_ids(task_id: int) -> list[str]:
-    """某主任务下仍未收口的子任务节点列表。"""
-    try:
-        async with SessionLocal() as s:
-            rows = (
-                await s.execute(
-                    select(GroupTaskDispatch.node_id).where(
-                        GroupTaskDispatch.task_id == task_id,
-                        GroupTaskDispatch.status.notin_(tuple(_TERMINAL)),
-                    )
-                )
-            ).scalars().all()
-            return sorted(set(rows))
-    except Exception as e:  # noqa: BLE001
-        logger.warning("running_node_ids failed: %s", e)
-        return []
-
-
 async def resumable_tasks(node_id: str) -> list[dict]:
-    """某节点上仍在运行的策略子任务（重连后据此重建监控）。"""
+    """某节点上仍未收口的策略子任务（重连后据此重建监控）。
+
+    magic 取子任务自己的，不再是分组主任务的——这是节点级执行单元的关键。
+    """
     try:
         async with SessionLocal() as s:
             rows = (
@@ -188,19 +206,19 @@ async def resumable_tasks(node_id: str) -> list[dict]:
                     .where(
                         GroupTaskDispatch.node_id == node_id,
                         GroupTaskDispatch.status.notin_(tuple(_TERMINAL)),
-                        GroupSignalTask.status.in_(group_rules.TASK_ACTIVE),
                     )
-                    .order_by(GroupTaskDispatch.task_id.asc())
+                    .order_by(GroupTaskDispatch.id.asc())
                 )
             ).all()
             return [
                 {
-                    "task_id": t.task_id,
-                    "magic": t.magic,
-                    "group_id": t.group_id,
-                    "signal_id": t.signal_id,
+                    "dispatch_id": d.id,
+                    "task_id": d.task_id,
+                    "magic": d.magic,
+                    "group_id": d.group_id,
+                    "signal_id": d.signal_id,
                     "action": t.action,
-                    "symbol": t.symbol,
+                    "symbol": d.symbol or t.symbol,
                     "volume": d.decided_vol if d.decided_vol is not None else t.volume,
                     "strategy_snapshot": t.strategy_snapshot_json,
                 }
@@ -246,18 +264,21 @@ async def mark_task_skipped(task_id: int, reason: Optional[str]) -> None:
         logger.warning("mark_task_skipped failed: %s", e)
 
 
-async def record_dispatch(
+async def record_skipped_dispatch(
     *,
     task_id: int,
     signal_id: str,
     group_id: str,
     node_id: str,
-    magic: Optional[int],
+    symbol: Optional[str],
     decided_vol: Optional[float],
     status: str,
     skip_reason: Optional[str] = None,
 ) -> None:
-    """落库一条主任务节点明细，并在终态时收口主任务与信号整体状态。"""
+    """落库一条未真正执行的节点明细（节点忙 / 连接断开）。
+
+    这类子任务不分配魔术号——它没有也不会有 MT5 订单，留个记录只为可追溯。
+    """
     try:
         async with SessionLocal() as s:
             s.add(
@@ -266,11 +287,12 @@ async def record_dispatch(
                     signal_id=signal_id,
                     group_id=group_id,
                     node_id=node_id,
-                    magic=magic,
+                    symbol=symbol,
                     decided_vol=decided_vol,
                     status=status,
                     skip_reason=skip_reason,
                     dispatched_at=datetime.now(),
+                    finished_at=datetime.now(),
                 )
             )
             await s.flush()
@@ -278,17 +300,47 @@ async def record_dispatch(
             await _refresh_signal_status(s, signal_id)
             await s.commit()
     except Exception as e:  # noqa: BLE001
-        logger.warning("group record_dispatch failed: %s", e)
+        logger.warning("record_skipped_dispatch failed: %s", e)
+
+
+async def set_dispatch_status(
+    dispatch_id: int, status: str, *, skip_reason: Optional[str] = None,
+) -> Optional[dict]:
+    """更新子任务状态（下发成功 / 失败）。终态时回传需要释放的节点占位。"""
+    try:
+        async with SessionLocal() as s:
+            row = await s.get(GroupTaskDispatch, dispatch_id)
+            if not row:
+                return None
+            row.status = status
+            if skip_reason:
+                row.skip_reason = skip_reason
+            terminal = status in _TERMINAL
+            if terminal:
+                row.finished_at = datetime.now()
+            await s.flush()
+            await _refresh_task_status(s, row.task_id)
+            # 信号整体状态只在子任务收口时才可能变化，非终态不必回查
+            if terminal:
+                await _refresh_signal_status(s, row.signal_id)
+            await s.commit()
+            return {
+                "task_id": row.task_id,
+                "released": _released(row) if terminal else [],
+            }
+    except Exception as e:  # noqa: BLE001
+        logger.warning("set_dispatch_status failed: %s", e)
+        return None
 
 
 async def update_dispatch_result(
-    *, node_id: str, result: dict, task_id: Optional[int] = None,
-    signal_id: Optional[str] = None,
-) -> bool:
-    """按节点回报更新明细；命中返回 True。
+    *, node_id: str, result: dict, dispatch_id: Optional[int] = None,
+    task_id: Optional[int] = None, signal_id: Optional[str] = None,
+) -> Optional[dict]:
+    """按节点回报更新子任务；未命中返回 None，命中返回 {released, task_ids}。
 
-    task_id 优先（回报带 magic 时可精确定位）；否则按 signal_id 回退匹配该节点
-    仍在途的明细，兼容尚未上报魔术号的旧版节点客户端。
+    定位优先级：子任务号（由回报里的 magic 反查，最精确）-> (主任务号, 节点) ->
+    (信号号, 节点) 且仍在途，后两者兼容未上报魔术号的旧版节点客户端。
 
     注意：下单成功不等于任务完成。策略托管下首单成交只是进入 opened，
     真正的完成要等 magic 持仓全平后由 finish_subtask 收口；只有下单失败才直接终态。
@@ -298,7 +350,9 @@ async def update_dispatch_result(
     try:
         async with SessionLocal() as s:
             stmt = select(GroupTaskDispatch).where(GroupTaskDispatch.node_id == node_id)
-            if task_id is not None:
+            if dispatch_id is not None:
+                stmt = stmt.where(GroupTaskDispatch.id == dispatch_id)
+            elif task_id is not None:
                 stmt = stmt.where(GroupTaskDispatch.task_id == task_id)
             elif signal_id:
                 stmt = stmt.where(
@@ -306,10 +360,11 @@ async def update_dispatch_result(
                     GroupTaskDispatch.status.in_(group_rules.SUBTASK_PENDING),
                 )
             else:
-                return False
+                return None
             rows = (await s.execute(stmt.order_by(GroupTaskDispatch.id.asc()))).scalars().all()
             if not rows:
-                return False
+                return None
+            released: list[tuple[str, str]] = []
             for row in rows:
                 if row.status in _TERMINAL:
                     continue
@@ -328,43 +383,64 @@ async def update_dispatch_result(
                     row.status = "failed"
                     row.finish_reason = "open_failed"
                     row.finished_at = now
+                    released.extend(_released(row))
             await s.flush()
-            for tid in {row.task_id for row in rows}:
+            task_ids = {row.task_id for row in rows}
+            for tid in task_ids:
                 await _refresh_task_status(s, tid)
                 await _refresh_task_totals(s, tid)
             for sid in {row.signal_id for row in rows}:
                 await _refresh_signal_status(s, sid)
             await s.commit()
-            return True
+            return {"released": released, "task_ids": sorted(task_ids)}
     except Exception as e:  # noqa: BLE001
         logger.warning("group update_dispatch_result failed: %s", e)
-        return False
+        return None
 
 
-async def mark_subtasks_closing(task_id: int, node_ids: list[str]) -> None:
-    """收到终止指令后把在途子任务标为 closing（等节点回报平仓完成）。"""
-    if not node_ids:
+async def mark_dispatches_closing(dispatch_ids: list[int]) -> None:
+    """收到终止指令后把这些子任务标为 closing（等节点回报平仓完成）。"""
+    if not dispatch_ids:
         return
     try:
         async with SessionLocal() as s:
-            await s.execute(
-                update(GroupTaskDispatch)
-                .where(
-                    GroupTaskDispatch.task_id == task_id,
-                    GroupTaskDispatch.node_id.in_(node_ids),
-                    GroupTaskDispatch.status.notin_(tuple(_TERMINAL)),
+            rows = (
+                await s.execute(
+                    select(GroupTaskDispatch).where(
+                        GroupTaskDispatch.id.in_(dispatch_ids),
+                        GroupTaskDispatch.status.notin_(tuple(_TERMINAL)),
+                    )
                 )
-                .values(status="closing")
-            )
+            ).scalars().all()
+            for row in rows:
+                row.status = "closing"
             await s.flush()
-            await _refresh_task_status(s, task_id)
+            for tid in {row.task_id for row in rows}:
+                await _refresh_task_status(s, tid)
             await s.commit()
     except Exception as e:  # noqa: BLE001
-        logger.warning("mark_subtasks_closing failed: %s", e)
+        logger.warning("mark_dispatches_closing failed: %s", e)
+
+
+async def _locate_dispatch(
+    session, *, node_id: str, dispatch_id: Optional[int], task_id: Optional[int],
+):
+    """按子任务号（优先）或 (主任务号, 节点) 定位子任务行。"""
+    stmt = select(GroupTaskDispatch).where(GroupTaskDispatch.node_id == node_id)
+    if dispatch_id is not None:
+        stmt = stmt.where(GroupTaskDispatch.id == dispatch_id)
+    elif task_id is not None:
+        stmt = stmt.where(GroupTaskDispatch.task_id == task_id)
+    else:
+        return None
+    return (
+        await session.execute(stmt.order_by(GroupTaskDispatch.id.asc()).limit(1))
+    ).scalar_one_or_none()
 
 
 async def record_strategy_progress(
-    *, node_id: str, task_id: int, data: dict,
+    *, node_id: str, data: dict,
+    dispatch_id: Optional[int] = None, task_id: Optional[int] = None,
 ) -> bool:
     """节点策略执行上报：更新子任务实时快照，状态变更事件另外落事件流。
 
@@ -374,16 +450,12 @@ async def record_strategy_progress(
     event_type = str(data.get("event") or "").strip()
     try:
         async with SessionLocal() as s:
-            row = (
-                await s.execute(
-                    select(GroupTaskDispatch).where(
-                        GroupTaskDispatch.task_id == task_id,
-                        GroupTaskDispatch.node_id == node_id,
-                    )
-                )
-            ).scalar_one_or_none()
+            row = await _locate_dispatch(
+                s, node_id=node_id, dispatch_id=dispatch_id, task_id=task_id,
+            )
             if not row:
                 return False
+            task_id = row.task_id
 
             now = datetime.now()
             row.last_report_at = now
@@ -437,24 +509,25 @@ async def record_strategy_progress(
 
 
 async def finish_subtask(
-    *, node_id: str, task_id: int, data: dict,
-) -> Optional[str]:
-    """节点上报策略结束（magic 持仓已全平）。返回收口后的主任务状态。"""
+    *, node_id: str, data: dict,
+    dispatch_id: Optional[int] = None, task_id: Optional[int] = None,
+) -> Optional[dict]:
+    """节点上报策略结束（magic 持仓已全平）。
+
+    返回 {task_id, task_status, released}，released 是需要释放的节点占位。
+    """
     status = str(data.get("status") or "done").strip().lower()
     if status not in _TERMINAL:
         status = "done"
     try:
         async with SessionLocal() as s:
-            row = (
-                await s.execute(
-                    select(GroupTaskDispatch).where(
-                        GroupTaskDispatch.task_id == task_id,
-                        GroupTaskDispatch.node_id == node_id,
-                    )
-                )
-            ).scalar_one_or_none()
+            row = await _locate_dispatch(
+                s, node_id=node_id, dispatch_id=dispatch_id, task_id=task_id,
+            )
             if not row:
                 return None
+            task_id = row.task_id
+            released = _released(row)
             now = datetime.now()
             row.status = status
             row.finish_reason = (data.get("reason") or "positions_cleared")[:64]
@@ -494,7 +567,11 @@ async def finish_subtask(
             ).scalar_one_or_none()
             await _refresh_signal_status(s, row.signal_id)
             await s.commit()
-            return task_status
+            return {
+                "task_id": task_id,
+                "task_status": task_status,
+                "released": released,
+            }
     except Exception as e:  # noqa: BLE001
         logger.warning("finish_subtask failed: %s", e)
         return None
@@ -502,15 +579,15 @@ async def finish_subtask(
 
 async def reconcile_node_positions(
     node_id: str, magics: set[int],
-) -> list[tuple[int, str]]:
+) -> list[dict]:
     """账户快照对账：节点上已无持仓的运行中子任务，判定为已平仓并收口。
 
     这是 strategy_finished 的兜底——上报丢包或节点在监控启动前就平了仓时，
-    单靠节点主动上报会让子任务永远停在 running，进而把分组锁死。
+    单靠节点主动上报会让子任务永远停在 running，进而把该节点该品种锁死。
     只处理已经开过仓（opened_at 非空）的子任务，避免把刚下发还没成交的误判为完成。
-    返回 [(task_id, 主任务状态)]，供调用方决定是否释放分组占位。
+    返回 [{task_id, task_status, released}]，供调用方释放节点占位。
     """
-    finished: list[tuple[int, str]] = []
+    finished: list[dict] = []
     try:
         async with SessionLocal() as s:
             rows = (
@@ -525,7 +602,7 @@ async def reconcile_node_positions(
             if not rows:
                 return []
             now = datetime.now()
-            touched: set[int] = set()
+            touched: dict[int, list[tuple[str, str]]] = {}
             for row in rows:
                 if row.magic is None or int(row.magic) in magics:
                     continue
@@ -544,7 +621,7 @@ async def reconcile_node_positions(
                         message="账户快照中已无该魔术号持仓，自动收口",
                     )
                 )
-                touched.add(row.task_id)
+                touched.setdefault(row.task_id, []).extend(_released(row))
             if not touched:
                 return []
             await s.flush()
@@ -555,51 +632,68 @@ async def reconcile_node_positions(
                 await s.execute(
                     select(GroupSignalTask.task_id, GroupSignalTask.status,
                            GroupSignalTask.signal_id)
-                    .where(GroupSignalTask.task_id.in_(touched))
+                    .where(GroupSignalTask.task_id.in_(touched.keys()))
                 )
             ).all()
             for _tid, _status, sid in task_rows:
                 await _refresh_signal_status(s, sid)
             await s.commit()
-            finished = [(tid, st) for tid, st, _sid in task_rows]
+            finished = [
+                {"task_id": tid, "task_status": st, "released": touched.get(tid, [])}
+                for tid, st, _sid in task_rows
+            ]
     except Exception as e:  # noqa: BLE001
         logger.warning("reconcile_node_positions failed: %s", e)
         return []
     return finished
 
 
-async def force_finish_task(task_id: int, *, reason: str) -> Optional[str]:
-    """强制收口主任务：把所有在途子任务标记为终态（节点全离线 / 人工终止）。"""
+async def force_finish_subtasks(
+    dispatch_ids: list[int], *, reason: str,
+) -> Optional[dict]:
+    """强制收口指定子任务（目标节点离线、无人平仓 / 人工终止）。
+
+    返回 {released, task_ids}；released 是需要释放的节点占位。
+    """
+    if not dispatch_ids:
+        return {"released": [], "task_ids": []}
     try:
         async with SessionLocal() as s:
             now = datetime.now()
-            await s.execute(
-                update(GroupTaskDispatch)
-                .where(
-                    GroupTaskDispatch.task_id == task_id,
-                    GroupTaskDispatch.status.notin_(tuple(_TERMINAL)),
-                )
-                .values(
-                    status="failed", finish_reason=reason[:64],
-                    finished_at=now, position_count=0,
-                )
-            )
-            await s.flush()
-            await _refresh_task_status(s, task_id)
-            await _refresh_task_totals(s, task_id)
-            row = (
+            rows = (
                 await s.execute(
-                    select(GroupSignalTask).where(GroupSignalTask.task_id == task_id)
+                    select(GroupTaskDispatch).where(
+                        GroupTaskDispatch.id.in_(dispatch_ids),
+                        GroupTaskDispatch.status.notin_(tuple(_TERMINAL)),
+                    )
                 )
-            ).scalar_one_or_none()
-            if row:
-                row.skip_reason = reason[:255]
-                await _refresh_signal_status(s, row.signal_id)
+            ).scalars().all()
+            released: list[tuple[str, str]] = []
+            for row in rows:
+                released.extend(_released(row))
+                row.status = "failed"
+                row.finish_reason = reason[:64]
+                row.finished_at = now
+                row.position_count = 0
+            await s.flush()
+            task_ids = {row.task_id for row in rows}
+            for tid in task_ids:
+                await _refresh_task_status(s, tid)
+                await _refresh_task_totals(s, tid)
+            for sid in {row.signal_id for row in rows}:
+                await _refresh_signal_status(s, sid)
             await s.commit()
-            return row.status if row else None
+            return {"released": released, "task_ids": sorted(task_ids)}
     except Exception as e:  # noqa: BLE001
-        logger.warning("force_finish_task failed: %s", e)
+        logger.warning("force_finish_subtasks failed: %s", e)
         return None
+
+
+def _released(row: GroupTaskDispatch) -> list[tuple[str, str]]:
+    """子任务进入终态后需要释放的 (分组, 节点) 占位。"""
+    if row.group_id and row.node_id:
+        return [(row.group_id, row.node_id)]
+    return []
 
 
 def _num(value: object) -> Optional[float]:
@@ -692,6 +786,7 @@ def _dispatch_row(d: GroupTaskDispatch, node_name: Optional[str]) -> dict:
         "id": d.id,
         "node_id": d.node_id,
         "node_name": node_name,
+        "symbol": d.symbol,
         "decided_vol": d.decided_vol,
         "status": d.status,
         "skip_reason": d.skip_reason,
@@ -717,7 +812,6 @@ def _dispatch_row(d: GroupTaskDispatch, node_name: Optional[str]) -> dict:
 def _task_row(t: GroupSignalTask, dispatches: list[dict]) -> dict:
     return {
         "task_id": t.task_id,
-        "magic": t.magic,
         "signal_id": t.signal_id,
         "group_id": t.group_id,
         "group_name": t.group_name,

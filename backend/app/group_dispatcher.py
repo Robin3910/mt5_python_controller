@@ -7,15 +7,18 @@
 - 只有「已启用 + 绑定了启用中策略 + 策略品种与信号品种一致」的分组才参与；
 - 每个入选分组独立处理同一条信号，分组的 sync / poll 模式由分组自身决定；
 - 有效节点口径固定为「节点已启用 + 当前在线」；
-- 下发前先为每个分组生成一条主任务（group_signal_task），任务号换算出的魔术号
-  随命令下发，节点在 MT5 下单时写入该魔术号，从而能由成交单反查主任务；
-- 明细写 group_task_dispatch（子节点信号任务），不写 normal 链路的 signal_dispatch。
+- 明细写 group_task_dispatch（节点子任务），不写 normal 链路的 signal_dispatch。
+
+执行单元是**节点子任务**：每个节点各自持有一个魔术号（由子任务自增号派生），
+在 MT5 下单时写入，因此一个魔术号全局唯一地对应「哪个节点上的哪次执行」。
+分组主任务（group_signal_task）只记录这条信号在该分组内的分发情况。
 
 策略托管：开仓信号下发的是 `strategy_start`，携带首单参数与策略规则快照，
 节点据此持续监控加仓，直到该魔术号的持仓全部平掉才算完成。
 
-并发控制：一个分组同时只允许存在一个进行中的主任务（Redis 占位 + DB 权威校验）。
-CLOSE 信号是终止指令，绕过互斥直接结束分组当前任务。
+并发控制的粒度是「分组 + 节点」：同一分组内一个节点同时只允许一个策略任务
+（Redis 占位 + 落库的子任务状态双保险）；不同分组各自独立，同一节点可以同时承接
+多个分组的任务。CLOSE 信号是终止指令，绕过互斥直接结束相关子任务。
 """
 from __future__ import annotations
 
@@ -26,7 +29,7 @@ from typing import Optional
 from . import group_persist, group_rules, persist
 from .config import Config
 from .connections import manager
-from .models import SIGNAL_MODEL_STRATEGY, build_open_command
+from .models import SIGNAL_MODEL_STRATEGY
 from .parser import TradingSignal
 from .redis_store import RedisStore
 
@@ -36,29 +39,18 @@ logger = logging.getLogger(__name__)
 SIGNAL_DISPATCH_MODE = "group"
 
 
-def build_group_open_command(
-    signal_id: str, signal: TradingSignal, volume: float,
-    task_id: int, magic: int, group_id: str,
-) -> dict:
-    """分组开仓命令：在标准开仓命令上附带主任务号与分组信息。"""
-    cmd = build_open_command(
-        signal_id, signal.action, signal.symbol, volume,
-        signal.stop_loss, signal.take_profit, signal.comment, magic,
-    )
-    cmd.update({"model": SIGNAL_MODEL_STRATEGY, "task_id": task_id, "group_id": group_id})
-    return cmd
-
-
 def build_strategy_start_command(
     signal_id: str, signal: TradingSignal, volume: float,
-    task_id: int, magic: int, group_id: str, strategy_snapshot: dict,
+    task_id: int, group_id: str, strategy_snapshot: dict,
 ) -> dict:
-    """策略托管开仓命令：首单参数 + 策略规则快照，节点据此常驻监控加仓。"""
+    """策略托管开仓命令的公共部分：首单参数 + 策略规则快照。
+
+    魔术号与子任务号按节点各不相同，下发前用 `for_node` 补齐。
+    """
     return {
         "cmd": "strategy_start",
         "signal_id": signal_id,
         "task_id": task_id,
-        "magic": magic,
         "group_id": group_id,
         "model": SIGNAL_MODEL_STRATEGY,
         "entry": {
@@ -74,15 +66,21 @@ def build_strategy_start_command(
     }
 
 
+def for_node(command: dict, *, dispatch_id: int, magic: int) -> dict:
+    """给公共命令补上该节点自己的子任务号与魔术号。"""
+    return {**command, "dispatch_id": dispatch_id, "magic": magic}
+
+
 def build_strategy_stop_command(
-    signal_id: str, task_id: int, magic: int, group_id: str,
-    symbol: Optional[str], reason: str = "close_signal",
+    signal_id: str, task_id: int, dispatch_id: int, magic: Optional[int],
+    group_id: str, symbol: Optional[str], reason: str = "close_signal",
 ) -> dict:
     """策略终止命令：平掉该魔术号的全部持仓并结束节点侧监控。"""
     return {
         "cmd": "strategy_stop",
         "signal_id": signal_id,
         "task_id": task_id,
+        "dispatch_id": dispatch_id,
         "magic": magic,
         "group_id": group_id,
         "symbol": symbol,
@@ -91,21 +89,22 @@ def build_strategy_stop_command(
     }
 
 
-def build_strategy_resume_command(task: dict) -> dict:
+def build_strategy_resume_command(subtask: dict) -> dict:
     """策略恢复命令：节点重连后据此重建监控（不重复下首单）。"""
     return {
         "cmd": "strategy_resume",
-        "signal_id": task.get("signal_id"),
-        "task_id": task.get("task_id"),
-        "magic": task.get("magic"),
-        "group_id": task.get("group_id"),
+        "signal_id": subtask.get("signal_id"),
+        "task_id": subtask.get("task_id"),
+        "dispatch_id": subtask.get("dispatch_id"),
+        "magic": subtask.get("magic"),
+        "group_id": subtask.get("group_id"),
         "model": SIGNAL_MODEL_STRATEGY,
         "entry": {
-            "action": task.get("action"),
-            "symbol": task.get("symbol"),
-            "volume": task.get("volume"),
+            "action": subtask.get("action"),
+            "symbol": subtask.get("symbol"),
+            "volume": subtask.get("volume"),
         },
-        "strategy": task.get("strategy_snapshot") or {},
+        "strategy": subtask.get("strategy_snapshot") or {},
         "report_interval": Config.STRATEGY_REPORT_INTERVAL,
     }
 
@@ -207,9 +206,9 @@ class GroupDispatcher:
         self, signal: TradingSignal, signal_id: str, *,
         source_ip: Optional[str], raw_payload: Optional[str], source: str,
     ) -> dict:
-        """CLOSE 信号：结束匹配分组当前进行中的任务，平掉对应魔术号的持仓。
+        """CLOSE 信号：结束匹配分组下所有进行中的子任务，平掉各自魔术号的持仓。
 
-        不建新主任务、不受互斥锁限制——它本身就是用来解锁的。
+        不建新任务、不受互斥限制——它本身就是用来解锁的。
         """
         matched, reasons = await self._candidate_groups(signal)
         if not matched:
@@ -238,30 +237,40 @@ class GroupDispatcher:
 
     async def _close_group(self, group: dict, signal: TradingSignal, signal_id: str) -> dict:
         group_id = group["group_id"]
-        active = await group_persist.active_task(group_id)
-        if not active:
-            logger.info("group %s has no active task, CLOSE ignored", group_id)
-            return self._result(group, group.get("dispatch_mode", "sync"), 0,
-                                "skipped", "分组没有进行中的任务")
+        mode = group_rules.normalize_dispatch_mode(group.get("dispatch_mode"))
+        subtasks = await group_persist.active_subtasks(group_id)
+        if not subtasks:
+            logger.info("group %s has no active subtask, CLOSE ignored", group_id)
+            return self._result(group, mode, 0, "skipped", "分组没有进行中的任务")
 
-        task_id, magic = active["task_id"], active["magic"]
-        node_ids = await group_persist.running_node_ids(task_id)
-        cmd = build_strategy_stop_command(
-            signal_id, task_id, magic, group_id, active.get("symbol") or signal.symbol,
-        )
-        sent = [nid for nid in node_ids if await manager.send_to_node(nid, cmd)]
-        await group_persist.mark_subtasks_closing(task_id, sent)
-        # 目标节点全部离线时无人能平仓，强制收口避免分组被永久锁死
-        if not sent:
-            await group_persist.force_finish_task(
-                task_id, reason="close_signal_all_nodes_offline",
+        closing: list[int] = []
+        offline: list[int] = []
+        for sub in subtasks:
+            cmd = build_strategy_stop_command(
+                signal_id, sub["task_id"], sub["dispatch_id"], sub["magic"],
+                group_id, sub.get("symbol") or signal.symbol,
             )
-            await self.store.release_group_busy(group_id)
-            return self._result(group, active.get("dispatch_mode", "sync"), 0,
-                                "failed", "目标节点均不在线，已强制结束任务", task_id, magic)
-        logger.info("group %s CLOSE -> task %s, %d node(s)", group_id, task_id, len(sent))
-        return self._result(group, active.get("dispatch_mode", "sync"), len(sent),
-                            "closing", None, task_id, magic)
+            if await manager.send_to_node(sub["node_id"], cmd):
+                closing.append(sub["dispatch_id"])
+            else:
+                offline.append(sub["dispatch_id"])
+
+        await group_persist.mark_dispatches_closing(closing)
+        # 目标节点离线时无人能平仓，强制收口并放开占位，避免该节点该品种被永久锁死
+        if offline:
+            res = await group_persist.force_finish_subtasks(
+                offline, reason="close_signal_node_offline",
+            )
+            await self._release(res)
+
+        task_id = subtasks[0]["task_id"]
+        if not closing:
+            return self._result(group, mode, 0, "failed",
+                                "目标节点均不在线，已强制结束子任务", task_id)
+        logger.info(
+            "group %s CLOSE -> %d subtask(s) closing, %d forced", group_id, len(closing), len(offline),
+        )
+        return self._result(group, mode, len(closing), "closing", None, task_id)
 
     # ------------------------------------------------------------------
     # 单分组开仓
@@ -271,183 +280,229 @@ class GroupDispatcher:
         nodemap: dict[str, dict], online_ids: set[str],
         *, source_ip: Optional[str], raw_payload: Optional[str],
     ) -> dict:
-        """单个分组的处理：抢互斥 -> 建主任务 -> 选节点 -> 下发策略 -> 落子任务。"""
-        group_id = group["group_id"]
+        """单个分组的处理：建主任务 -> 选节点 -> 逐节点抢占位并下发。"""
         mode = group_rules.normalize_dispatch_mode(group.get("dispatch_mode"))
         effective = group_rules.effective_node_ids(group, nodemap, online_ids)
 
-        busy = await self._check_busy(group_id)
-        if busy:
-            logger.info("group %s busy: %s", group_id, busy)
-            return self._result(group, mode, 0, "rejected", busy)
-
         snapshot = group_rules.strategy_rules_snapshot(strategy)
-        task = await group_persist.create_task(
+        task_id = await group_persist.create_task(
             signal_id=signal_id, group=group, signal=signal, dispatch_mode=mode,
             source_ip=source_ip, raw_payload=raw_payload, strategy=strategy,
             strategy_snapshot=snapshot,
         )
-        if task is None:
-            await self.store.release_group_busy(group_id)
-            logger.warning("group %s task creation failed, skip dispatch", group_id)
+        if task_id is None:
+            logger.warning("group %s task creation failed, skip dispatch",
+                           group["group_id"])
             return self._result(group, mode, 0, "failed", "主任务创建失败，已放弃下发")
-
-        task_id, magic = task["task_id"], task["magic"]
-        await self.store.set_group_busy(group_id, str(task_id), Config.GROUP_BUSY_TTL)
 
         skip_reason = group_rules.group_skip_reason(group, effective)
         if skip_reason:
             await group_persist.mark_task_skipped(task_id, skip_reason)
-            await self.store.release_group_busy(group_id)
-            logger.info("group %s skipped: %s", group_id, skip_reason)
-            return self._result(group, mode, 0, "skipped", skip_reason, task_id, magic)
+            logger.info("group %s skipped: %s", group["group_id"], skip_reason)
+            return self._result(group, mode, 0, "skipped", skip_reason, task_id)
 
+        command = build_strategy_start_command(
+            signal_id, signal, group_rules.resolve_volume(signal.volume),
+            task_id, group["group_id"], snapshot,
+        )
         if mode == "poll":
-            sent = await self._send_poll(
-                group, signal, signal_id, task_id, magic, effective, snapshot,
-            )
+            outcomes = await self._send_poll(group, signal, task_id, effective, command)
         else:
-            sent = await self._send_sync(
-                group, signal, signal_id, task_id, magic, effective, snapshot,
-            )
+            outcomes = await self._send_sync(group, signal, task_id, effective, command)
+
+        sent = [o for o in outcomes if o["status"] == "sent"]
+        await group_persist.mark_task_dispatched(
+            task_id, payload=command, node_ids=[o["node_id"] for o in sent],
+        )
+        for outcome in outcomes:
+            await self._broadcast(group, signal, signal_id, task_id, outcome)
 
         if not sent:
-            reason = "下发失败：目标节点连接均不可用"
+            status, reason = self._no_target(outcomes)
             await group_persist.mark_task_skipped(task_id, reason)
-            await self.store.release_group_busy(group_id)
-            return self._result(group, mode, 0, "failed", reason, task_id, magic)
-        return self._result(group, mode, len(sent), "dispatching", None, task_id, magic)
+            return self._result(group, mode, 0, status, reason, task_id)
+        return self._result(group, mode, len(sent), "dispatching", None, task_id)
 
-    async def _check_busy(self, group_id: str) -> Optional[str]:
-        """分组互斥：抢不到占位说明有任务在跑。DB 为权威，用于清理过期占位。"""
-        got = await self.store.acquire_group_busy(
-            group_id, "pending", Config.GROUP_BUSY_TTL,
+    @staticmethod
+    def _no_target(outcomes: list[dict]) -> tuple[str, str]:
+        """一个节点都没发出去时的 (状态, 原因)：区分节点忙与连接不可用。"""
+        if outcomes and all(o["status"] == "skipped" for o in outcomes):
+            return "skipped", "目标节点在本分组内均有进行中的任务"
+        return "failed", "下发失败：目标节点连接均不可用"
+
+    # ------------------------------------------------------------------
+    # 逐节点下发
+    # ------------------------------------------------------------------
+    async def _send_sync(
+        self, group: dict, signal: TradingSignal, task_id: int,
+        effective: list[str], command: dict,
+    ) -> list[dict]:
+        """全员同步：分组内所有有效节点并发下发（各节点独立抢占位、独立魔术号）。"""
+        results = await asyncio.gather(
+            *[
+                self._dispatch_node(group, signal, task_id, nid, command)
+                for nid in effective
+            ],
+            return_exceptions=True,
         )
-        if got:
-            return None
-        active = await group_persist.active_task(group_id)
-        if active:
-            return (
-                f"分组存在进行中的任务 #{active['task_id']}"
-                f"（{active.get('status')}），本次信号不接收"
+        outcomes: list[dict] = []
+        for node_id, res in zip(effective, results):
+            if isinstance(res, dict):
+                outcomes.append(res)
+                continue
+            logger.warning("group %s node %s dispatch error: %s",
+                           group["group_id"], node_id, res)
+            outcomes.append(
+                {"node_id": node_id, "status": "offline", "magic": None,
+                 "volume": command["entry"]["volume"],
+                 "reason": "下发失败：节点处理异常"}
             )
-        # Redis 有占位但库里已收口（进程异常等），清掉后放行
-        logger.info("group %s stale busy marker cleared", group_id)
-        await self.store.release_group_busy(group_id)
-        if await self.store.acquire_group_busy(group_id, "pending", Config.GROUP_BUSY_TTL):
-            return None
-        return "分组占位竞争失败，本次信号不接收"
+        return outcomes
+
+    async def _send_poll(
+        self, group: dict, signal: TradingSignal, task_id: int,
+        effective: list[str], command: dict,
+    ) -> list[dict]:
+        """组内轮转：把任务交给队首第一个可下发的有效节点，成功后移到队尾。"""
+        group_id = group["group_id"]
+        order = group_rules.reconcile_rotation(
+            await self.store.get_group_rotation(group_id), group_rules.member_ids(group),
+        )
+        eligible = set(effective)
+        outcomes: list[dict] = []
+        consumer: Optional[str] = None
+        for node_id in order:
+            if node_id not in eligible:
+                continue
+            outcome = await self._dispatch_node(group, signal, task_id, node_id, command)
+            outcomes.append(outcome)
+            if outcome["status"] == "sent":
+                consumer = node_id
+                break
+            logger.info("group %s poll node %s unavailable (%s), fall through",
+                        group_id, node_id, outcome.get("reason"))
+
+        if consumer:
+            # 领取成功的节点移到队尾，其余保持原相对顺序，实现循环轮转
+            await self.store.save_group_rotation(
+                group_id, [nid for nid in order if nid != consumer] + [consumer],
+            )
+            logger.info("group %s poll: task %s consumed by %s", group_id, task_id, consumer)
+        return outcomes
+
+    async def _dispatch_node(
+        self, group: dict, signal: TradingSignal, task_id: int,
+        node_id: str, command: dict,
+    ) -> dict:
+        """单节点下发：抢组内节点占位 -> 建子任务拿魔术号 -> 发命令。
+
+        占位在「建子任务」之前抢、在「下发失败」时立即放开；下发成功后由子任务
+        收口（节点上报 / 快照对账 / CLOSE）负责释放。
+        """
+        group_id = group["group_id"]
+        volume = command["entry"]["volume"]
+        base = {
+            "task_id": task_id, "signal_id": command["signal_id"],
+            "group_id": group_id, "node_id": node_id,
+            "symbol": signal.symbol, "decided_vol": volume,
+        }
+
+        if not await self.store.acquire_group_node_busy(
+            group_id, node_id, "pending", Config.NODE_BUSY_TTL,
+        ):
+            reason = await self._busy_reason(group_id, node_id)
+            await group_persist.record_skipped_dispatch(
+                **base, status="skipped", skip_reason=reason,
+            )
+            logger.info("group %s node %s busy: %s", group_id, node_id, reason)
+            return {"node_id": node_id, "status": "skipped", "magic": None,
+                    "volume": volume, "reason": reason}
+
+        try:
+            return await self._dispatch_locked_node(base, command)
+        except Exception as e:  # noqa: BLE001
+            # 抢到占位后中途出错：立刻放开，否则要等 TTL 才能再下发
+            await self.store.release_group_node_busy(group_id, node_id)
+            logger.warning("group %s node %s dispatch failed: %s", group_id, node_id, e)
+            return {"node_id": node_id, "status": "offline", "magic": None,
+                    "volume": volume, "reason": "下发失败：节点处理异常"}
+
+    async def _dispatch_locked_node(self, base: dict, command: dict) -> dict:
+        """已持有组内节点占位后的下发：建子任务拿魔术号 -> 发命令。"""
+        node_id, group_id = base["node_id"], base["group_id"]
+        volume = base["decided_vol"]
+        created = await group_persist.create_dispatch(**base)
+        if created is None:
+            await self.store.release_group_node_busy(group_id, node_id)
+            reason = "子任务创建失败，已放弃该节点"
+            logger.warning("group %s node %s: %s", group_id, node_id, reason)
+            return {"node_id": node_id, "status": "offline", "magic": None,
+                    "volume": volume, "reason": reason}
+
+        dispatch_id, magic = created["dispatch_id"], created["magic"]
+        await self.store.set_group_node_busy(
+            group_id, node_id, str(dispatch_id), Config.NODE_BUSY_TTL,
+        )
+        cmd = for_node(command, dispatch_id=dispatch_id, magic=magic)
+        if await manager.send_to_node(node_id, cmd):
+            await group_persist.set_dispatch_status(dispatch_id, "sent")
+            return {"node_id": node_id, "status": "sent", "magic": magic,
+                    "dispatch_id": dispatch_id, "volume": volume, "reason": None}
+
+        reason = "下发失败：节点连接已断开"
+        await group_persist.set_dispatch_status(dispatch_id, "offline", skip_reason=reason)
+        await self.store.release_group_node_busy(group_id, node_id)
+        return {"node_id": node_id, "status": "offline", "magic": magic,
+                "dispatch_id": dispatch_id, "volume": volume, "reason": reason}
+
+    async def _busy_reason(self, group_id: str, node_id: str) -> str:
+        marker = await self.store.get_group_node_busy(group_id, node_id)
+        if marker and marker != "pending":
+            return f"该节点在本分组内已有进行中的子任务 #{marker}，本次跳过"
+        return "该节点在本分组内已有进行中的子任务，本次跳过"
+
+    # ------------------------------------------------------------------
+    # 辅助
+    # ------------------------------------------------------------------
+    async def _release(self, result: Optional[dict]) -> None:
+        """释放持久化层回传的组内节点占位。"""
+        for group_id, node_id in (result or {}).get("released", []):
+            await self.store.release_group_node_busy(group_id, node_id)
 
     @staticmethod
     def _result(group: dict, mode: str, targets: int, status: str,
                 reason: Optional[str] = None,
-                task_id: Optional[int] = None, magic: Optional[int] = None) -> dict:
+                task_id: Optional[int] = None) -> dict:
         return {
             "group_id": group["group_id"],
             "group_name": group.get("name"),
             "dispatch_mode": mode,
             "task_id": task_id,
-            "magic": magic,
             "targets": targets,
             "status": status,
             "reason": reason,
         }
 
-    async def _send_sync(
-        self, group: dict, signal: TradingSignal, signal_id: str,
-        task_id: int, magic: int, effective: list[str], snapshot: dict,
-    ) -> list[str]:
-        """全员同步：分组内所有有效节点并发下发策略任务。"""
-        volume = group_rules.resolve_volume(signal.volume)
-        cmd = build_strategy_start_command(
-            signal_id, signal, volume, task_id, magic, group["group_id"], snapshot,
-        )
-        results = await asyncio.gather(
-            *[manager.send_to_node(nid, cmd) for nid in effective],
-            return_exceptions=True,
-        )
-        sent = [nid for nid, ok in zip(effective, results) if ok is True]
-        failed = [nid for nid in effective if nid not in sent]
-        await group_persist.mark_task_dispatched(task_id, payload=cmd, node_ids=sent)
-        await self._record_nodes(
-            group, signal, signal_id, task_id, magic, sent, volume, "sent",
-        )
-        await self._record_nodes(
-            group, signal, signal_id, task_id, magic, failed, volume, "offline",
-            skip_reason="下发失败：节点连接已断开",
-        )
-        return sent
-
-    async def _send_poll(
-        self, group: dict, signal: TradingSignal, signal_id: str,
-        task_id: int, magic: int, effective: list[str], snapshot: dict,
-    ) -> list[str]:
-        """组内轮转：按轮转顺序把任务交给队首第一个可下发的有效节点，成功后移到队尾。"""
-        group_id = group["group_id"]
-        order = group_rules.reconcile_rotation(
-            await self.store.get_group_rotation(group_id), group_rules.member_ids(group),
-        )
-        volume = group_rules.resolve_volume(signal.volume)
-        cmd = build_strategy_start_command(
-            signal_id, signal, volume, task_id, magic, group_id, snapshot,
-        )
-
-        eligible = set(effective)
-        consumer: Optional[str] = None
-        offline: list[str] = []
-        for node_id in order:
-            if node_id not in eligible:
-                continue
-            if await manager.send_to_node(node_id, cmd):
-                consumer = node_id
-                break
-            offline.append(node_id)
-            logger.info("group %s poll node %s unreachable, fall through", group_id, node_id)
-
-        if offline:
-            await self._record_nodes(
-                group, signal, signal_id, task_id, magic, offline, volume, "offline",
-                skip_reason="下发失败：节点连接已断开",
-            )
-        if not consumer:
-            return []
-
-        await group_persist.mark_task_dispatched(task_id, payload=cmd, node_ids=[consumer])
-        await self._record_nodes(
-            group, signal, signal_id, task_id, magic, [consumer], volume, "sent",
-        )
-        # 领取成功的节点移到队尾，其余保持原相对顺序，实现循环轮转
-        await self.store.save_group_rotation(
-            group_id, [nid for nid in order if nid != consumer] + [consumer],
-        )
-        logger.info("group %s poll: task %s consumed by %s", group_id, task_id, consumer)
-        return [consumer]
-
-    async def _record_nodes(
-        self, group: dict, signal: TradingSignal, signal_id: str,
-        task_id: int, magic: int, node_ids: list[str],
-        volume: Optional[float], status: str, skip_reason: Optional[str] = None,
+    @staticmethod
+    async def _broadcast(
+        group: dict, signal: TradingSignal, signal_id: str,
+        task_id: int, outcome: dict,
     ) -> None:
-        """落库子任务并推送后台实时展示。"""
-        for node_id in node_ids:
-            await group_persist.record_dispatch(
-                task_id=task_id, signal_id=signal_id, group_id=group["group_id"],
-                node_id=node_id, magic=magic, decided_vol=volume,
-                status=status, skip_reason=skip_reason,
-            )
-            await manager.broadcast_admin({
-                "type": "group_dispatch",
-                "data": {
-                    "signal_id": signal_id,
-                    "task_id": task_id,
-                    "magic": magic,
-                    "group_id": group["group_id"],
-                    "group_name": group.get("name"),
-                    "node_id": node_id,
-                    "action": signal.action,
-                    "symbol": signal.symbol,
-                    "volume": volume,
-                    "status": status,
-                    "reason": skip_reason,
-                },
-            })
+        """把单节点的下发结果推给后台实时展示。"""
+        await manager.broadcast_admin({
+            "type": "group_dispatch",
+            "data": {
+                "signal_id": signal_id,
+                "task_id": task_id,
+                "dispatch_id": outcome.get("dispatch_id"),
+                "magic": outcome.get("magic"),
+                "group_id": group["group_id"],
+                "group_name": group.get("name"),
+                "node_id": outcome["node_id"],
+                "action": signal.action,
+                "symbol": signal.symbol,
+                "volume": outcome.get("volume"),
+                "status": outcome["status"],
+                "reason": outcome.get("reason"),
+            },
+        })

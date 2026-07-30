@@ -139,6 +139,8 @@ def _migrate_group_task_strategy_columns(sync_conn) -> None:
     if "group_task_dispatch" in tables:
         cols = {c["name"] for c in inspector.get_columns("group_task_dispatch")}
         additions = {
+            # 节点子任务自持魔术号后，品种冗余到子任务上，便于释放节点互斥占位
+            "symbol": "VARCHAR(32)",
             "position_count": "INTEGER NOT NULL DEFAULT 0",
             "add_count": "INTEGER NOT NULL DEFAULT 0",
             "total_orders": "INTEGER NOT NULL DEFAULT 0",

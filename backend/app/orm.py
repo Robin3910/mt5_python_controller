@@ -186,20 +186,16 @@ class NodeGroupMember(Base):
 
 
 class GroupSignalTask(Base):
-    """分组信号主任务：一条 strategy 信号在一个分组内的一次完整处理。
+    """分组信号主任务：一条 strategy 信号在一个分组内的**分发记录**。
 
-    task_id 即“任务号”，下发到节点执行 MT5 操作时用作魔术号（见 magic 列），
-    便于按魔术号从 MT5 订单反查是哪条信号、哪个分组下发的。
-    同一主任务下所有节点共用一个魔术号——各节点是独立 MT5 账户，
-    magic 在单账户内已足以圈定本次任务的首单与全部加仓单。
-
-    主任务是长周期的：绑定策略后由节点持续监控加仓，直到该 magic 的持仓全部平掉，
-    因此 status 增加了 running（策略运行中）这一中间态。
+    主任务本身不是执行单元、不持有魔术号、也不参与并发互斥——真正执行策略的是
+    下面的 GroupTaskDispatch（节点子任务），每个节点独立持有自己的魔术号。
+    这里只记录「这条信号在这个分组命中了哪些节点、整体进展如何」，status 由各
+    子任务状态汇总而来（见 group_rules.aggregate_task_status）。
     """
     __tablename__ = "group_signal_task"
 
     task_id: Mapped[int] = mapped_column(AutoPK, primary_key=True, autoincrement=True)
-    magic: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
     signal_id: Mapped[str] = mapped_column(String(32), index=True)
     group_id: Mapped[str] = mapped_column(String(32), index=True)
     group_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -234,11 +230,18 @@ class GroupSignalTask(Base):
 
 
 class GroupTaskDispatch(Base):
-    """子节点信号任务：主任务 × 节点，一对多。
+    """节点信号任务：主任务 × 节点，一对多，是策略执行的实际单元。
+
+    `magic = NODE_TASK_MAGIC_BASE + id`，即每个节点持有独立魔术号，因此一个魔术号
+    全局唯一地对应一次节点执行，MT5 订单可直接反查到本行（历史数据里存在多节点
+    共用魔术号的旧记录，所以 magic 上不加唯一索引）。
 
     生命周期：pending -> sent -> opened -> running -> closing -> done。
     完成判定是「该节点上 magic 关联的持仓全部平掉」，由节点主动上报，
     服务端再用账户快照对账兜底（见 group_persist.reconcile_*）。
+
+    并发互斥也落在这一层：子任务处于非终态时，(node_id, symbol) 会持有一个 Redis
+    占位，同一节点同品种不会被重复下发（不同品种可并行）。
     """
     __tablename__ = "group_task_dispatch"
 
@@ -247,6 +250,8 @@ class GroupTaskDispatch(Base):
     signal_id: Mapped[str] = mapped_column(String(32), index=True)
     group_id: Mapped[str] = mapped_column(String(32), index=True)
     node_id: Mapped[str] = mapped_column(String(32), index=True)
+    # 冗余存一份品种：释放节点互斥占位、按品种对账时不必回查主任务
+    symbol: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     magic: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
     decided_vol: Mapped[float | None] = mapped_column(Float, nullable=True)
     # pending / sent / opened / running / closing / done / failed / skipped / offline

@@ -172,6 +172,77 @@ async def test_open_blocked_when_terminal_switched():
     assert len(n.mt5.positions()) == 0
 
 
+async def _wait_positions(n, magic, expect, tries=100):
+    """等策略执行体把单子下出去（下单走线程池，需要真实等待）。"""
+    for _ in range(tries):
+        await asyncio.sleep(0.01)
+        if len(n.mt5.positions_by_magic(magic)) == expect:
+            return True
+    return False
+
+
+def _strategy_cmd(**over):
+    cmd = {
+        "cmd": "strategy_start", "signal_id": "s9", "task_id": 7, "magic": 900000007,
+        "group_id": "g1", "model": "strategy",
+        "entry": {"action": "BUY", "symbol": "EURUSD", "volume": 0.1},
+        "strategy": {"rules": []}, "report_interval": 5,
+    }
+    cmd.update(over)
+    return cmd
+
+
+async def test_strategy_start_wires_hub_and_places_first_order():
+    n = _node()
+    await n._exec(n.mt5.connect)
+    ws = FakeWS()
+
+    await n._handle(ws, _strategy_cmd())
+
+    assert 7 in n.runners
+    assert n.hub is not None
+    assert await _wait_positions(n, 900000007, 1)
+    tr = [m for m in ws.sent if m["type"] == "trade_result"]
+    assert tr and tr[0]["data"]["magic"] == 900000007
+    n._cancel_runners()
+    await n.hub.close()
+
+
+async def test_strategy_resume_does_not_reopen():
+    n = _node()
+    await n._exec(n.mt5.connect)
+    await n._exec(n.mt5.place_market_order, "EURUSD", "BUY", 0.1, None, None, "", 900000007)
+    ws = FakeWS()
+
+    await n._handle(ws, _strategy_cmd(cmd="strategy_resume"))
+    await asyncio.sleep(0.05)
+
+    assert len(n.mt5.positions_by_magic(900000007)) == 1  # 不重复下首单
+    assert not [m for m in ws.sent if m["type"] == "trade_result"]
+    resumed = [
+        m for m in ws.sent
+        if m["type"] == "strategy_progress" and m["data"]["event"] == "resume"
+    ]
+    assert resumed
+    n._cancel_runners()
+    await n.hub.close()
+
+
+async def test_strategy_stop_closes_magic_positions():
+    n = _node()
+    await n._exec(n.mt5.connect)
+    ws = FakeWS()
+    await n._handle(ws, _strategy_cmd())
+    assert await _wait_positions(n, 900000007, 1)
+
+    await n._handle(ws, {"cmd": "strategy_stop", "task_id": 7, "reason": "close_signal"})
+    assert await _wait_positions(n, 900000007, 0)
+
+    fin = [m for m in ws.sent if m["type"] == "strategy_finished"]
+    assert fin and fin[0]["data"]["reason"] == "close_signal"
+    await n.hub.close()
+
+
 async def test_handle_server_login_mismatch():
     n = _node()
     ws = FakeWS()

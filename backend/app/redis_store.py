@@ -30,7 +30,9 @@ K_POLL_ROTATION = "signal:poll:rotation:{}"  # 按品种的轮转顺序（JSON l
 K_GROUP = "group:{}"                    # 分组元数据缓存（JSON，含成员 node_id 列表）
 K_GROUPS = "groups"                     # 所有 group_id 的集合
 K_GROUP_ROTATION = "group:poll:rotation:{}"  # 分组内轮询轮转顺序（JSON list[node_id]）
-K_GROUP_BUSY = "group:busy:{}"          # 分组进行中的主任务号（互斥，带 TTL 兜底）
+# 节点级互斥：(分组, 节点) -> 进行中的子任务号。同一分组内一个节点只允许一个策略
+# 任务；不同分组各自独立，同一节点可以同时承接多个分组的任务。
+K_GROUP_NODE_BUSY = "group:node:busy:{}:{}"
 K_STRATEGY = "strategy:{}"              # 策略实例缓存（JSON）
 K_STRATEGIES = "strategies"             # 所有 strategy_id 的集合
 
@@ -186,31 +188,47 @@ class RedisStore:
         return out
 
     async def delete_group(self, group_id: str) -> None:
-        """删除分组时连带清理其轮转顺序与互斥标记。"""
+        """删除分组时连带清理其轮转顺序与组内各节点的互斥占位。"""
         await self.r.delete(K_GROUP.format(group_id))
         await self.r.delete(K_GROUP_ROTATION.format(group_id))
-        await self.r.delete(K_GROUP_BUSY.format(group_id))
+        await self.clear_group_node_busy(group_id)
         await self.r.srem(K_GROUPS, group_id)
 
-    # ----------------- 分组互斥（一个分组同时只跑一个策略任务） -----------------
-    async def acquire_group_busy(self, group_id: str, marker: str, ttl: int) -> bool:
-        """抢占分组占位。marker 先写占位串，拿到任务号后再用 set_group_busy 覆盖。
+    # ---- 组内节点互斥（同一分组内一个节点只跑一个策略任务，跨分组各自独立）----
+    async def acquire_group_node_busy(
+        self, group_id: str, node_id: str, marker: str, ttl: int,
+    ) -> bool:
+        """抢占组内节点占位。marker 先写占位串，拿到子任务号后再覆盖。
 
-        TTL 是兜底：节点永久离线时避免分组被永久锁死，到期后自动放行。
+        TTL 是兜底：节点永久离线时避免该位置被永久锁死，到期后自动放行。
         """
         return bool(
-            await self.r.set(K_GROUP_BUSY.format(group_id), marker, nx=True, ex=ttl)
+            await self.r.set(
+                K_GROUP_NODE_BUSY.format(group_id, node_id), marker, nx=True, ex=ttl,
+            )
         )
 
-    async def set_group_busy(self, group_id: str, marker: str, ttl: int) -> None:
-        """覆盖分组占位内容（抢占成功后写入真实任务号），保持原 TTL 语义。"""
-        await self.r.set(K_GROUP_BUSY.format(group_id), marker, ex=ttl)
+    async def set_group_node_busy(
+        self, group_id: str, node_id: str, marker: str, ttl: int,
+    ) -> None:
+        """覆盖占位内容（抢占成功后写入真实子任务号），保持原 TTL 语义。"""
+        await self.r.set(K_GROUP_NODE_BUSY.format(group_id, node_id), marker, ex=ttl)
 
-    async def get_group_busy(self, group_id: str) -> Optional[str]:
-        return await self.r.get(K_GROUP_BUSY.format(group_id))
+    async def get_group_node_busy(self, group_id: str, node_id: str) -> Optional[str]:
+        return await self.r.get(K_GROUP_NODE_BUSY.format(group_id, node_id))
 
-    async def release_group_busy(self, group_id: str) -> None:
-        await self.r.delete(K_GROUP_BUSY.format(group_id))
+    async def release_group_node_busy(self, group_id: str, node_id: str) -> None:
+        await self.r.delete(K_GROUP_NODE_BUSY.format(group_id, node_id))
+
+    async def clear_group_node_busy(self, group_id: str) -> None:
+        """清掉某分组下全部节点占位（分组被删除时）。"""
+        keys = [
+            key async for key in self.r.scan_iter(
+                match=K_GROUP_NODE_BUSY.format(group_id, "*")
+            )
+        ]
+        if keys:
+            await self.r.delete(*keys)
 
     async def get_group_rotation(self, group_id: str) -> list[str]:
         """读取分组内的轮转顺序（node_id 有序列表）；不存在则返回空列表。"""

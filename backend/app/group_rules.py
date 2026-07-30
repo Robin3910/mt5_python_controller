@@ -8,6 +8,9 @@
 - 手数直接采用信号手数（仅做单笔上限保护）。
 
 判定“有效节点”的口径固定为：节点已启用 且 当前在线。
+
+并发控制的粒度在**节点**上：真正的执行单元是「节点子任务」，各自持有独立魔术号；
+分组主任务只汇总一条信号在该分组内的分发情况，不参与互斥判定。
 """
 from __future__ import annotations
 
@@ -65,19 +68,23 @@ def symbol_match(strategy_symbol: object, signal_symbol: object) -> bool:
     return a.startswith(b) or b.startswith(a)
 
 
-def task_magic(task_id: int) -> int:
-    """主任务号 -> MT5 魔术号（基数 + 任务号）。"""
-    return Config.GROUP_TASK_MAGIC_BASE + int(task_id)
+def subtask_magic(dispatch_id: int) -> int:
+    """子任务号 -> MT5 魔术号（基数 + 子任务号）。
+
+    魔术号绑在「节点子任务」而不是分组主任务上：每个节点独立维护自己的执行单元，
+    所以一个魔术号全局唯一地对应一次节点执行，可由 MT5 订单直接反查到子任务。
+    """
+    return Config.NODE_TASK_MAGIC_BASE + int(dispatch_id)
 
 
-def task_id_from_magic(magic: object) -> Optional[int]:
-    """MT5 魔术号 -> 主任务号；不在分组魔术号区间内则返回 None。"""
+def subtask_id_from_magic(magic: object) -> Optional[int]:
+    """MT5 魔术号 -> 子任务号；不在 strategy 魔术号区间内则返回 None。"""
     try:
         value = int(magic)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
-    task_id = value - Config.GROUP_TASK_MAGIC_BASE
-    return task_id if task_id > 0 else None
+    dispatch_id = value - Config.NODE_TASK_MAGIC_BASE
+    return dispatch_id if dispatch_id > 0 else None
 
 
 def member_ids(group: dict) -> list[str]:
@@ -131,10 +138,12 @@ def reconcile_rotation(order: list[str], participants: list[str]) -> list[str]:
 SUBTASK_PENDING = ("pending", "sent")
 # 子任务运行态：首单已成交，节点正在按策略监控与加仓
 SUBTASK_RUNNING = ("opened", "running", "closing")
-# 子任务终态：不再变化，可参与主任务收口
+# 子任务终态：不再变化，可参与主任务收口，并触发节点占位释放
 SUBTASK_TERMINAL = ("done", "failed", "skipped", "offline")
+# 子任务占位态：持有节点互斥占位的状态集合（在途 + 运行中）
+SUBTASK_HOLDS_LOCK = SUBTASK_PENDING + SUBTASK_RUNNING
 
-# 主任务未收口状态：分组互斥锁据此判断「有进行中的任务」
+# 主任务未收口状态：仅用于展示与断线恢复筛选，不再承担互斥职责
 TASK_ACTIVE = ("pending", "dispatching", "running")
 
 

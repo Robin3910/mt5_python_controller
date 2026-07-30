@@ -1,0 +1,332 @@
+"""事件总线单测：变更检测、读取失败与全平判定、事件合并、采样开销。
+
+统一直接调用 `hub.sample()`，不启动采样协程，避免依赖定时器让断言不稳定。
+"""
+import asyncio
+
+import market_hub as mh
+from market_hub import MarketHub
+
+MAGIC = 900000001
+OTHER_MAGIC = 900000002
+
+
+class FakeMT5:
+    """可控的 MT5 替身：能注入读取失败，并统计调用次数。"""
+
+    def __init__(self) -> None:
+        self._positions: list[dict] = []
+        self.quote = {"bid": 2330.0, "ask": 2330.2, "mid": 2330.1, "change": 0.0}
+        self.point = 0.01
+        self.fail_positions = False
+        self.positions_calls = 0
+        self.quotes_calls = 0
+
+    def positions(self) -> list[dict]:
+        self.positions_calls += 1
+        if self.fail_positions:
+            raise RuntimeError("terminal unavailable")
+        return [dict(p) for p in self._positions]
+
+    def quotes(self, symbols) -> dict:
+        self.quotes_calls += 1
+        return {s: dict(self.quote) for s in symbols}
+
+    def symbol_point(self, symbol) -> float:
+        return self.point
+
+    def add(self, *, ticket: int, magic: int, price: float = 2330.0) -> None:
+        self._positions.append({
+            "ticket": ticket, "magic": magic, "symbol": "XAUUSD", "type": "BUY",
+            "volume": 0.1, "price_open": price, "price_current": price,
+            "profit": 0.0, "time": ticket,
+        })
+
+    def clear(self) -> None:
+        self._positions = []
+
+
+async def _exec(fn, *args):
+    return fn(*args)
+
+
+def _hub(mt5, **kw) -> MarketHub:
+    kw.setdefault("interval", 0.01)
+    kw.setdefault("idle_interval", 10.0)
+    kw.setdefault("empty_confirm", 2)
+    return MarketHub(mt5, _exec, **kw)
+
+
+async def _next_or_none(sub, timeout: float = 0.02):
+    """取下一个事件；超时返回 None，用于断言“这一轮没有派发”。"""
+    try:
+        return await asyncio.wait_for(sub.next_event(), timeout)
+    except asyncio.TimeoutError:
+        return None
+
+
+async def test_sample_emits_tick_with_price_and_point():
+    mt5 = FakeMT5()
+    mt5.add(ticket=1, magic=MAGIC)
+    hub = _hub(mt5)
+    sub = hub.subscribe(symbol="XAUUSD", magic=MAGIC, direction="BUY")
+
+    await hub.sample()
+    event = await sub.next_event()
+
+    assert event.kind == mh.TICK
+    assert event.price == 2330.0  # 多单看买价
+    assert event.point == 0.01
+    assert len(event.positions) == 1
+    assert event.positions[0]["ticket"] == 1
+
+
+async def test_sell_direction_uses_ask_price():
+    mt5 = FakeMT5()
+    mt5.add(ticket=1, magic=MAGIC)
+    hub = _hub(mt5)
+    sub = hub.subscribe(symbol="XAUUSD", magic=MAGIC, direction="SELL")
+
+    await hub.sample()
+
+    assert (await sub.next_event()).price == 2330.2
+
+
+async def test_price_falls_back_to_position_when_quote_missing():
+    mt5 = FakeMT5()
+    mt5.add(ticket=1, magic=MAGIC, price=2222.0)
+    mt5.quote = {}
+    hub = _hub(mt5)
+    sub = hub.subscribe(symbol="XAUUSD", magic=MAGIC, direction="BUY")
+
+    await hub.sample()
+
+    assert (await sub.next_event()).price == 2222.0
+
+
+async def test_unchanged_sample_emits_nothing():
+    mt5 = FakeMT5()
+    mt5.add(ticket=1, magic=MAGIC)
+    hub = _hub(mt5)
+    sub = hub.subscribe(symbol="XAUUSD", magic=MAGIC, direction="BUY")
+
+    await hub.sample()
+    assert (await sub.next_event()).kind == mh.TICK
+    await hub.sample()
+
+    assert await _next_or_none(sub) is None
+
+
+async def test_price_change_emits_tick():
+    mt5 = FakeMT5()
+    mt5.add(ticket=1, magic=MAGIC)
+    hub = _hub(mt5)
+    sub = hub.subscribe(symbol="XAUUSD", magic=MAGIC, direction="BUY")
+
+    await hub.sample()
+    await sub.next_event()
+    mt5.quote = {"bid": 2331.0, "ask": 2331.2, "mid": 2331.1, "change": 0.0}
+    await hub.sample()
+
+    event = await sub.next_event()
+    assert event.kind == mh.TICK
+    assert event.price == 2331.0
+
+
+async def test_new_position_emits_tick():
+    mt5 = FakeMT5()
+    mt5.add(ticket=1, magic=MAGIC)
+    hub = _hub(mt5)
+    sub = hub.subscribe(symbol="XAUUSD", magic=MAGIC, direction="BUY")
+
+    await hub.sample()
+    await sub.next_event()
+    mt5.add(ticket=2, magic=MAGIC)
+    await hub.sample()
+
+    event = await sub.next_event()
+    assert event.kind == mh.TICK
+    assert len(event.positions) == 2
+
+
+async def test_idle_keepalive_when_nothing_changes():
+    mt5 = FakeMT5()
+    mt5.add(ticket=1, magic=MAGIC)
+    # interval 有 50ms 下限，保活间隔不会低于它
+    hub = _hub(mt5, interval=0.05, idle_interval=0.05)
+    sub = hub.subscribe(symbol="XAUUSD", magic=MAGIC, direction="BUY")
+
+    await hub.sample()
+    assert (await sub.next_event()).kind == mh.TICK
+    await asyncio.sleep(0.07)
+    await hub.sample()
+
+    event = await sub.next_event()
+    assert event.kind == mh.IDLE
+    assert len(event.positions) == 1
+
+
+async def test_read_failure_emits_stale_not_gone():
+    mt5 = FakeMT5()
+    mt5.add(ticket=1, magic=MAGIC)
+    hub = _hub(mt5, interval=0.05, idle_interval=0.05)
+    sub = hub.subscribe(symbol="XAUUSD", magic=MAGIC, direction="BUY")
+
+    await hub.sample()
+    assert (await sub.next_event()).kind == mh.TICK
+
+    mt5.fail_positions = True
+    await asyncio.sleep(0.07)  # 越过 STALE 限流窗口
+    await hub.sample()
+
+    event = await sub.next_event()
+    assert event.kind == mh.STALE
+    assert sub.empty_hits == 0  # 读取失败不能计入空仓确认
+
+
+async def test_positions_cleared_needs_confirm_rounds():
+    mt5 = FakeMT5()
+    mt5.add(ticket=1, magic=MAGIC)
+    hub = _hub(mt5, empty_confirm=2)
+    sub = hub.subscribe(symbol="XAUUSD", magic=MAGIC, direction="BUY")
+
+    await hub.sample()
+    assert (await sub.next_event()).kind == mh.TICK
+
+    mt5.clear()
+    await hub.sample()
+    assert await _next_or_none(sub) is None  # 第一轮空仓不作数
+
+    await hub.sample()
+    assert (await sub.next_event()).kind == mh.GONE
+
+
+async def test_never_seen_positions_never_reports_gone():
+    """首单还没反映到终端时不能误判收口，漏报交给服务端快照对账兜底。"""
+    mt5 = FakeMT5()
+    hub = _hub(mt5, empty_confirm=1)
+    sub = hub.subscribe(symbol="XAUUSD", magic=MAGIC, direction="BUY")
+
+    for _ in range(5):
+        await hub.sample()
+
+    assert await _next_or_none(sub) is None
+    assert sub.seen is False
+
+
+async def test_one_sample_serves_all_subscribers():
+    mt5 = FakeMT5()
+    mt5.add(ticket=1, magic=MAGIC)
+    mt5.add(ticket=2, magic=OTHER_MAGIC)
+    hub = _hub(mt5)
+    first = hub.subscribe(symbol="XAUUSD", magic=MAGIC, direction="BUY")
+    second = hub.subscribe(symbol="XAUUSD", magic=OTHER_MAGIC, direction="BUY")
+
+    await hub.sample()
+
+    # MT5 调用次数与任务数无关：一轮各一次
+    assert mt5.positions_calls == 1
+    assert mt5.quotes_calls == 1
+    assert (await first.next_event()).positions[0]["ticket"] == 1
+    assert (await second.next_event()).positions[0]["ticket"] == 2
+
+
+async def test_point_is_cached_across_samples():
+    mt5 = FakeMT5()
+    mt5.add(ticket=1, magic=MAGIC)
+    hub = _hub(mt5)
+    hub.subscribe(symbol="XAUUSD", magic=MAGIC, direction="BUY")
+
+    await hub.sample()
+    mt5.point = 0.0  # 缓存命中后不应再取值
+    await hub.sample()
+
+    assert hub._points["XAUUSD"] == 0.01
+
+
+async def test_unsubscribed_sub_gets_no_events():
+    mt5 = FakeMT5()
+    mt5.add(ticket=1, magic=MAGIC)
+    hub = _hub(mt5)
+    sub = hub.subscribe(symbol="XAUUSD", magic=MAGIC, direction="BUY")
+    hub.unsubscribe(sub)
+
+    await hub.sample()
+
+    assert sub.closed is True
+    assert mt5.positions_calls == 0  # 没有订阅者时完全不碰 MT5
+
+
+async def test_pending_event_is_conflated_to_latest():
+    sub = mh.Subscription(symbol="XAUUSD", magic=MAGIC, direction="BUY")
+    sub.offer(mh.MarketEvent(kind=mh.TICK, symbol="XAUUSD", magic=MAGIC, price=1.0))
+    sub.offer(mh.MarketEvent(kind=mh.TICK, symbol="XAUUSD", magic=MAGIC, price=2.0))
+
+    assert (await sub.next_event()).price == 2.0
+    assert await _next_or_none(sub) is None
+
+
+async def test_gone_is_not_overwritten_by_stale():
+    sub = mh.Subscription(symbol="XAUUSD", magic=MAGIC, direction="BUY")
+    sub.offer(mh.MarketEvent(kind=mh.GONE, symbol="XAUUSD", magic=MAGIC))
+    sub.offer(mh.MarketEvent(kind=mh.STALE, symbol="XAUUSD", magic=MAGIC))
+
+    assert (await sub.next_event()).kind == mh.GONE
+
+
+async def test_wake_unblocks_waiter():
+    sub = mh.Subscription(symbol="XAUUSD", magic=MAGIC, direction="BUY")
+    waiter = asyncio.create_task(sub.next_event())
+    await asyncio.sleep(0)
+    sub.wake()
+
+    assert (await waiter).kind == mh.WAKE
+
+
+async def test_close_returns_none_to_waiter():
+    sub = mh.Subscription(symbol="XAUUSD", magic=MAGIC, direction="BUY")
+    waiter = asyncio.create_task(sub.next_event())
+    await asyncio.sleep(0)
+    sub.close()
+
+    assert await waiter is None
+
+
+async def test_loop_idles_without_subscribers():
+    mt5 = FakeMT5()
+    hub = _hub(mt5, interval=0.001, idle_interval=0.005)
+    hub.start()
+    await asyncio.sleep(0.03)
+
+    assert mt5.positions_calls == 0
+    await hub.close()
+
+
+async def test_loop_starts_sampling_after_subscribe():
+    mt5 = FakeMT5()
+    mt5.add(ticket=1, magic=MAGIC)
+    hub = _hub(mt5, interval=0.001, idle_interval=0.05)
+    hub.start()
+    sub = hub.subscribe(symbol="XAUUSD", magic=MAGIC, direction="BUY")
+
+    event = await asyncio.wait_for(sub.next_event(), timeout=2.0)
+
+    assert event.kind == mh.TICK
+    await hub.close()
+
+
+async def test_loop_survives_sample_error():
+    mt5 = FakeMT5()
+    mt5.add(ticket=1, magic=MAGIC)
+    hub = _hub(mt5, interval=0.001, idle_interval=0.05)
+    hub.start()
+    sub = hub.subscribe(symbol="XAUUSD", magic=MAGIC, direction="BUY")
+    mt5.fail_positions = True
+    await asyncio.sleep(0.02)
+    mt5.fail_positions = False
+
+    event = await asyncio.wait_for(sub.next_event(), timeout=2.0)
+
+    assert event.kind in (mh.STALE, mh.TICK)
+    assert hub._task is not None and not hub._task.done()
+    await hub.close()

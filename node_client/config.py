@@ -36,6 +36,11 @@ class NodeSettings(BaseSettings):
     default_slippage: int = 20          # 默认滑点
     default_magic: int = 20240615       # 默认魔术号
 
+    # 策略监控事件总线（MT5 无推送接口，事件由统一采样生成，见 market_hub.py）
+    strategy_sample_interval: float = 0.5   # 采样间隔，决定事件延迟上限
+    strategy_idle_interval: float = 5.0     # 无变化时的保活事件间隔
+    strategy_empty_confirm: int = 2         # 判定持仓已全平所需的连续确认轮数
+
     log_level: str = "INFO"
 
     @property
