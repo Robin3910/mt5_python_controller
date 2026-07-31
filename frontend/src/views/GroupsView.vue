@@ -1,16 +1,19 @@
 <script setup lang="ts">
 // 分组管理页：strategy 信号（Webhook model=strategy）的分发单元
-// 新建/编辑/删除分组、启停、维护成员节点、设置分组级分发模式，并查看该分组处理过的信号明细
+// 新建/编辑/删除分组、启停、维护成员节点、设置分组级分发模式；信号明细见 GroupSignalsView
 import { computed, onMounted, ref, reactive } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessageBox } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import 'element-plus/es/components/message/style/css'
 import 'element-plus/es/components/message-box/style/css'
 import FormLabel from '@/components/FormLabel.vue'
 import { useHubStore } from '@/stores/hub'
 import type {
   GroupDispatchMode,
   GroupOut,
-  GroupSignalTaskRecord,
+  ManualSignalAction,
+  ManualSignalPayload,
+  ManualSignalResult,
   NodeOut,
   StrategyOut,
 } from '@/api/types'
@@ -221,128 +224,212 @@ async function remove(g: GroupOut): Promise<void> {
   await hub.deleteGroup(g.group_id, currentSearchOptions())
 }
 
-// ---- 信号明细弹窗 ----
-const showSignals = ref(false)
-const signalGroup = ref<GroupOut | null>(null)
-const signals = ref<GroupSignalTaskRecord[]>([])
-const signalPage = ref(1)
-const signalPageSize = ref(20)
-const signalTotal = ref(0)
-const loadingSignals = ref(false)
-const expanded = ref<Record<string, boolean>>({})
+// ---- 手动触发策略信号 ----
+// 与 Webhook 的 model=strategy 走同一条分组分发链路，只是入口换成后台管理员操作。
+const showTrigger = ref(false)
+const triggering = ref(false)
+const triggerError = ref('')
+// 命中范围要按全部分组试算，不能用被搜索条件过滤过的列表
+const triggerGroups = ref<GroupOut[]>([])
+const loadingTriggerGroups = ref(false)
 
-const signalTotalPages = computed(() =>
-  Math.max(1, Math.ceil(signalTotal.value / signalPageSize.value)),
+const TRIGGER_HELP = {
+  symbol:
+    '信号品种。分组链路按「绑定策略的品种」匹配：只有已启用、且绑定了同品种启用策略的分组才会收到本信号。' +
+    '不同券商的后缀差异（XAUUSD / XAUUSDm / XAUUSD.pro）会自动归一化后匹配。',
+  action:
+    'BUY / SELL 触发策略托管开仓：命中分组的有效节点会收到首单参数与策略规则快照，之后由节点自主按规则加仓。' +
+    'CLOSE 是终止指令，平掉命中分组内进行中任务对应魔术号的持仓并结束节点侧监控。',
+  volume:
+    '首单手数。分组链路直接采用此手数（仅受单笔上限保护），不走节点的按币种手数策略。',
+  stop_loss: '首单止损价（绝对价格），留空表示不设。',
+  take_profit: '首单止盈价（绝对价格），留空表示不设。',
+  comment: '订单备注，会写入 MT5 订单的 comment 字段，便于对账。',
+}
+
+const triggerForm = reactive({
+  symbol: '',
+  action: 'BUY' as ManualSignalAction,
+  volume: 0.1 as number | null,
+  stop_loss: null as number | null,
+  take_profit: null as number | null,
+  comment: '',
+})
+
+const isCloseAction = computed(() => triggerForm.action === 'CLOSE')
+
+/** 品种归一化，与后端 group_rules.normalize_symbol_key 同口径 */
+function normalizeSymbolKey(symbol: string): string {
+  return (symbol || '').toUpperCase().replace(/[^A-Z0-9]/g, '')
+}
+
+/** 策略品种与信号品种是否同一标的（归一化后互为前缀即匹配） */
+function symbolMatch(strategySymbol: string, signalSymbol: string): boolean {
+  const a = normalizeSymbolKey(strategySymbol)
+  const b = normalizeSymbolKey(signalSymbol)
+  if (!a || !b) return false
+  return a.startsWith(b) || b.startsWith(a)
+}
+
+function strategyOf(g: GroupOut): StrategyOut | undefined {
+  return g.strategy_id ? hub.strategies.find((s) => s.strategy_id === g.strategy_id) : undefined
+}
+
+function groupStrategyLabel(g: GroupOut): string {
+  const sty = strategyOf(g)
+  return sty ? strategyLabel(sty) : '未绑定'
+}
+
+/** 已绑定到分组的策略品种（去重），供品种快捷选择 */
+const triggerSymbolOptions = computed<string[]>(() => {
+  const out: string[] = []
+  for (const g of triggerGroups.value) {
+    const symbol = strategyOf(g)?.symbol
+    if (symbol && !out.includes(symbol)) out.push(symbol)
+  }
+  return out
+})
+
+/** 命中分组预览：与后端 GroupDispatcher._candidate_groups 的入选条件同口径 */
+const matchedGroups = computed<GroupOut[]>(() => {
+  const symbol = triggerForm.symbol.trim()
+  if (!symbol) return []
+  return triggerGroups.value.filter((g) => {
+    if (!g.enabled) return false
+    const sty = strategyOf(g)
+    return !!sty && sty.enabled && symbolMatch(sty.symbol, symbol)
+  })
+})
+
+/** 命中分组里当前具备有效节点的数量（有效节点为 0 时信号会被记为未下发） */
+const readyGroupCount = computed(
+  () => matchedGroups.value.filter((g) => g.online_node_count > 0).length,
 )
 
-async function openSignals(g: GroupOut): Promise<void> {
-  signalGroup.value = g
-  showSignals.value = true
-  signalPage.value = 1
-  expanded.value = {}
-  await loadSignals()
-}
-
-async function loadSignals(): Promise<void> {
-  if (!signalGroup.value) return
-  loadingSignals.value = true
+async function openTrigger(): Promise<void> {
+  triggerError.value = ''
+  Object.assign(triggerForm, {
+    symbol: '',
+    action: 'BUY' as ManualSignalAction,
+    volume: 0.1,
+    stop_loss: null,
+    take_profit: null,
+    comment: '',
+  })
+  triggerGroups.value = []
+  showTrigger.value = true
+  loadingTriggerGroups.value = true
   try {
-    const res = await hub.fetchGroupSignals(
-      signalGroup.value.group_id,
-      signalPage.value,
-      signalPageSize.value,
-    )
-    signals.value = res.items
-    signalTotal.value = res.total
-    if (res.page !== signalPage.value) signalPage.value = res.page
+    const [groups] = await Promise.all([hub.listGroups(), hub.fetchStrategies()])
+    triggerGroups.value = groups
+  } catch {
+    // 读不到分组时预览会显示成「无匹配」，这里说明清楚，避免被误当成真实结果
+    triggerError.value = '读取分组失败，命中范围暂时无法预演；请关闭弹窗后重试'
+    return
   } finally {
-    loadingSignals.value = false
+    loadingTriggerGroups.value = false
   }
+  // 只有一个可选品种时直接填上，省一次输入
+  const options = triggerSymbolOptions.value
+  if (options.length === 1) triggerForm.symbol = options[0]
 }
 
-function goSignalPage(next: number): void {
-  const p = Math.min(Math.max(1, next), signalTotalPages.value)
-  if (p === signalPage.value) return
-  signalPage.value = p
-  loadSignals()
+function buildTriggerPayload(symbol: string): ManualSignalPayload {
+  const payload: ManualSignalPayload = { symbol, action: triggerForm.action, model: 'strategy' }
+  if (isCloseAction.value) return payload
+  payload.volume = Number(triggerForm.volume)
+  if (triggerForm.stop_loss) payload.stop_loss = triggerForm.stop_loss
+  if (triggerForm.take_profit) payload.take_profit = triggerForm.take_profit
+  const comment = triggerForm.comment.trim()
+  if (comment) payload.comment = comment
+  return payload
 }
 
-function onSignalPageSizeChange(): void {
-  signalPage.value = 1
-  loadSignals()
+function triggerSummary(payload: ManualSignalPayload): string {
+  const hit = matchedGroups.value
+  const groupText = hit.length
+    ? hit.map((g) => `· ${g.name}（有效节点 ${g.online_node_count}）`).join('\n')
+    : '· 无（当前没有匹配的分组，信号将被拒收）'
+  const lines = [`品种：${payload.symbol}`, `动作：${payload.action}`]
+  if (isCloseAction.value) {
+    lines.push('说明：平掉命中分组内进行中任务的持仓并结束策略监控')
+  } else {
+    lines.push(`手数：${payload.volume}`)
+    lines.push(`止损：${payload.stop_loss ?? '不设'}　止盈：${payload.take_profit ?? '不设'}`)
+    if (payload.comment) lines.push(`备注：${payload.comment}`)
+  }
+  return `${lines.join('\n')}\n\n预计命中分组：\n${groupText}`
 }
 
-function toggleRow(key: string | number): void {
-  const k = String(key)
-  expanded.value[k] = !expanded.value[k]
-}
-function isExpanded(key: string | number): boolean {
-  return !!expanded.value[String(key)]
-}
-
-// ---- 格式化 ----
-function fmtTime(sec: number | null | undefined): string {
-  return sec ? new Date(sec * 1000).toLocaleString() : '—'
-}
-
-function fmtPayload(raw: unknown): string {
-  if (raw == null) return '—'
-  if (typeof raw === 'string') {
-    try {
-      return JSON.stringify(JSON.parse(raw), null, 2)
-    } catch {
-      return raw
+/** 展示触发结果；返回 true 表示这次触发已经收口，可以关闭弹窗 */
+function reportTriggerResult(payload: ManualSignalPayload, res: ManualSignalResult): boolean {
+  const head = `${payload.action} ${payload.symbol}`
+  if (res.status === 'accepted') {
+    const groups = res.groups ?? 0
+    const targets = res.targets ?? 0
+    if (payload.action === 'CLOSE') {
+      if (targets > 0) {
+        ElMessage.success(`已下发终止指令：命中 ${groups} 个分组，${targets} 个节点任务开始平仓`)
+      } else {
+        ElMessage.warning(`命中 ${groups} 个分组，但没有进行中的策略任务需要终止`)
+      }
+      return true
     }
+    const detail = `命中 ${groups} 个分组，${targets} 个节点收到下发`
+    if (targets > 0) {
+      ElMessage.success(`已触发 ${head}：${detail}`)
+    } else {
+      ElMessage.warning(`${head} 已受理但未下发：${detail}（分组无有效节点，或节点在本组已有进行中的任务）`)
+    }
+    return true
   }
-  return JSON.stringify(raw, null, 2)
-}
-
-function taskTag(status: string): { cls: string; text: string } {
-  const m: Record<string, { cls: string; text: string }> = {
-    pending: { cls: 'blue', text: '待处理' },
-    dispatching: { cls: 'blue', text: '分发中' },
-    running: { cls: 'amber', text: '策略运行中' },
-    done: { cls: 'green', text: '完成' },
-    partial: { cls: 'amber', text: '部分成功' },
-    failed: { cls: 'red', text: '失败' },
-    skipped: { cls: '', text: '未下发' },
+  if (res.status === 'duplicate') {
+    ElMessage.warning(`重复信号被抑制：5 秒内已有相同参数的 ${head} 策略信号`)
+    return true
   }
-  return m[status] || { cls: '', text: status }
-}
-
-function dispatchTag(status: string): { cls: string; text: string } {
-  const m: Record<string, { cls: string; text: string }> = {
-    done: { cls: 'green', text: '完成' },
-    failed: { cls: 'red', text: '失败' },
-    offline: { cls: 'red', text: '离线' },
-    skipped: { cls: '', text: '跳过' },
-    sent: { cls: 'blue', text: '已下发' },
-    pending: { cls: 'blue', text: '等待' },
-    opened: { cls: 'amber', text: '已开仓' },
-    running: { cls: 'amber', text: '加仓监控中' },
-    closing: { cls: 'amber', text: '平仓中' },
+  if (res.status === 'rejected') {
+    triggerError.value = res.reason || '信号被拒收'
+    ElMessage.warning(`已拒收：${triggerError.value}`)
+    return false
   }
-  return m[status] || { cls: 'blue', text: status }
+  ElMessage.info(`已提交：${res.status}`)
+  return true
 }
 
-/** 任务是否仍在跑（用于提示分组此时不接收新信号） */
-function isTaskActive(status: string): boolean {
-  return ['pending', 'dispatching', 'running'].includes(status)
+async function submitTrigger(): Promise<void> {
+  const symbol = triggerForm.symbol.trim().toUpperCase()
+  if (!symbol) {
+    triggerError.value = '请填写信号品种'
+    return
+  }
+  if (!isCloseAction.value && !(Number(triggerForm.volume) > 0)) {
+    triggerError.value = '开仓信号必须填写大于 0 的手数'
+    return
+  }
+  const payload = buildTriggerPayload(symbol)
+  if (!(await confirmAction(`确认手动触发 strategy 信号？\n\n${triggerSummary(payload)}`, '确认触发信号'))) {
+    return
+  }
+
+  triggering.value = true
+  triggerError.value = ''
+  try {
+    const res = await hub.triggerManualSignal(payload)
+    const done = reportTriggerResult(payload, res)
+    // 只有真正受理才会新增主任务，列表的信号计数需要重取
+    if (res.status === 'accepted') await loadGroups()
+    if (done) showTrigger.value = false
+  } catch (e: unknown) {
+    const err = e as { response?: { data?: { detail?: string } }; message?: string }
+    triggerError.value = err?.response?.data?.detail || err?.message || '触发失败，请稍后重试'
+    ElMessage.error(`触发失败：${triggerError.value}`)
+  } finally {
+    triggering.value = false
+  }
 }
 
-function dispatchSummary(row: GroupSignalTaskRecord): string {
-  const n = row.dispatches.length
-  if (!n) return row.skip_reason || '无节点处理'
-  const done = row.dispatches.filter((d) => d.status === 'done').length
-  const failed = row.dispatches.filter((d) => d.status === 'failed' || d.status === 'offline').length
-  const running = row.dispatches.filter((d) =>
-    ['opened', 'running', 'closing'].includes(d.status),
-  ).length
-  const parts: string[] = [`${n} 节点`]
-  if (running) parts.push(`${running} 运行中`)
-  if (done) parts.push(`${done} 完成`)
-  if (failed) parts.push(`${failed} 失败`)
-  return parts.join(' · ')
+function openSignals(g: GroupOut): void {
+  router.push({ name: 'group-signals', params: { id: g.group_id } })
 }
 </script>
 
@@ -358,6 +445,7 @@ function dispatchSummary(row: GroupSignalTaskRecord): string {
       </div>
       <div class="row" style="gap: 8px">
         <button class="btn-ghost" @click="router.push('/strategies')">策略管理</button>
+        <button class="btn-ghost" @click="openTrigger">手动触发信号</button>
         <button class="btn-primary" @click="openCreate">+ 新建分组</button>
       </div>
     </div>
@@ -574,156 +662,135 @@ function dispatchSummary(row: GroupSignalTaskRecord): string {
       </div>
     </div>
 
-    <!-- 信号明细弹窗 -->
-    <div v-if="showSignals" class="modal-mask" @click.self="showSignals = false">
-      <div class="card card-pad modal modal-lg group-signal-modal">
+    <!-- 手动触发策略信号弹窗 -->
+    <div v-if="showTrigger" class="modal-mask" @click.self="showTrigger = false">
+      <div class="card card-pad modal modal-lg group-trigger-modal">
         <div class="modal-header">
-          <div class="row between">
-            <div>
-              <div class="h1">分组信号 · {{ signalGroup?.name }}</div>
-              <p class="muted" style="font-size: 12px; margin: 4px 0 0">
-                共 {{ signalTotal }} 条主任务 · 点击行展开信号明细与各节点处理过程
-              </p>
-            </div>
-            <button class="btn-sm btn-ghost" :disabled="loadingSignals" @click="loadSignals">
-              {{ loadingSignals ? '刷新中…' : '刷新' }}
-            </button>
-          </div>
+          <div class="h1">手动触发策略信号</div>
+          <p class="muted" style="font-size: 12px; margin: 4px 0 0">
+            等同于收到一条 <code>model=strategy</code> 的 Webhook：按品种匹配「已启用且绑定同品种启用策略」的分组，
+            各分组再按自己的分发模式下发给有效节点。不影响按币种分发（<code>model=normal</code>）的链路。
+          </p>
         </div>
         <div class="modal-body">
-          <div v-if="signals.length" class="table-scroll">
-            <table class="group-signal-table">
-              <thead>
-                <tr>
-                  <th style="width: 22px"></th>
-                  <th>时间</th><th>任务号</th><th>动作</th><th>品种</th>
-                  <th class="right">手数</th><th>分发模式</th><th>任务状态</th><th>节点处理</th>
-                </tr>
-              </thead>
-              <tbody>
-                <template v-for="t in signals" :key="t.task_id">
-                  <tr class="clickable" @click="toggleRow(t.task_id)">
-                    <td class="muted">{{ isExpanded(t.task_id) ? '▾' : '▸' }}</td>
-                    <td class="muted" style="font-size: 12px">{{ fmtTime(t.created_at) }}</td>
-                    <td>#{{ t.task_id }}</td>
-                    <td>
-                      <span
-                        v-if="t.action"
-                        class="tag"
-                        :class="t.action === 'BUY' ? 'green' : t.action === 'SELL' ? 'blue' : ''"
-                      >{{ t.action }}</span>
-                      <span v-else class="muted">—</span>
-                    </td>
-                    <td>{{ t.symbol || '—' }}</td>
-                    <td class="right">{{ t.volume ?? '—' }}</td>
-                    <td class="muted" style="font-size: 12px">
-                      {{ t.dispatch_mode === 'poll' ? '轮询轮转' : '全员同步' }}
-                    </td>
-                    <td><span class="tag" :class="taskTag(t.status).cls">{{ taskTag(t.status).text }}</span></td>
-                    <td class="muted" style="font-size: 12px">{{ dispatchSummary(t) }}</td>
-                  </tr>
-                  <tr v-if="isExpanded(t.task_id)" class="detail-row">
-                    <td></td>
-                    <td colspan="8">
-                      <div class="kv-grid" style="margin: 6px 0 10px">
-                        <div class="kv"><span class="k">信号 ID</span><span class="v" style="font-size: 12px">{{ t.signal_id }}</span></div>
-                        <div class="kv"><span class="k">绑定策略</span><span class="v" style="font-size: 12px">{{ t.strategy_name || '—' }}</span></div>
-                        <div class="kv"><span class="k">来源 IP</span><span class="v" style="font-size: 12px">{{ t.source_ip || '—' }}</span></div>
-                        <div class="kv"><span class="k">SL</span><span class="v">{{ t.sl ?? '—' }}</span></div>
-                        <div class="kv"><span class="k">TP</span><span class="v">{{ t.tp ?? '—' }}</span></div>
-                        <div class="kv"><span class="k">备注</span><span class="v" style="font-size: 12px">{{ t.comment || '—' }}</span></div>
-                        <div class="kv"><span class="k">下发节点数</span><span class="v">{{ t.node_count }}</span></div>
-                        <div class="kv"><span class="k">累计下单</span><span class="v">{{ t.total_orders }} 笔 / {{ t.total_volume }} 手</span></div>
-                        <div class="kv"><span class="k">已实现盈亏</span><span class="v">{{ t.realized_profit }}</span></div>
-                        <div class="kv"><span class="k">开仓时间</span><span class="v" style="font-size: 12px">{{ fmtTime(t.opened_at) }}</span></div>
-                        <div class="kv"><span class="k">完成时间</span><span class="v" style="font-size: 12px">{{ fmtTime(t.finished_at) }}</span></div>
-                        <div v-if="t.skip_reason" class="kv span-full">
-                          <span class="k">未下发原因</span><span class="v" style="font-size: 12px">{{ t.skip_reason }}</span>
-                        </div>
-                        <div v-if="isTaskActive(t.status)" class="kv span-full">
-                          <span class="k">提示</span>
-                          <span class="v" style="font-size: 12px">
-                            任务进行中，下方运行中的节点该品种暂不接收新的策略信号；发送 CLOSE 信号可终止
-                          </span>
-                        </div>
-                      </div>
-
-                      <div class="muted" style="font-size: 12px; margin-bottom: 6px">原始信号</div>
-                      <pre class="token-box group-payload">{{ fmtPayload(t.raw_payload) }}</pre>
-
-                      <div class="muted" style="font-size: 12px; margin-bottom: 6px">下发数据（发送给节点的命令）</div>
-                      <pre class="token-box group-payload">{{ fmtPayload(t.payload) }}</pre>
-
-                      <div class="muted" style="font-size: 12px; margin-bottom: 8px">各节点处理情况</div>
-                      <div v-if="t.dispatches.length" class="table-scroll">
-                        <table class="group-detail-table">
-                          <thead>
-                            <tr>
-                              <th>节点</th><th>魔术号</th><th>状态</th><th class="right">首单手数</th>
-                              <th class="right">持仓</th><th class="right">加仓</th><th class="right">累计手数</th>
-                              <th class="right">盈亏</th><th>结束原因</th>
-                              <th>订单</th><th class="right">成交价</th>
-                              <th>错误</th><th>下发时间</th><th>完成时间</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            <tr v-for="d in t.dispatches" :key="d.id">
-                              <td>{{ d.node_name || d.node_id }}</td>
-                              <td class="muted" style="font-size: 12px">{{ d.magic ?? '—' }}</td>
-                              <td><span class="tag" :class="dispatchTag(d.status).cls">{{ dispatchTag(d.status).text }}</span></td>
-                              <td class="right">{{ d.decided_vol ?? '—' }}</td>
-                              <td class="right">{{ d.position_count }}</td>
-                              <td class="right">{{ d.add_count }}</td>
-                              <td class="right">{{ d.total_volume }}</td>
-                              <td class="right">{{ d.realized_profit }}</td>
-                              <td class="muted group-break">{{ d.finish_reason || d.skip_reason || '—' }}</td>
-                              <td>{{ d.order ?? '—' }}</td>
-                              <td class="right">{{ d.price ?? '—' }}</td>
-                              <td class="muted group-break">{{ d.error || '—' }}</td>
-                              <td class="muted" style="white-space: nowrap">{{ fmtTime(d.dispatched_at) }}</td>
-                              <td class="muted" style="white-space: nowrap">{{ fmtTime(d.finished_at) }}</td>
-                            </tr>
-                          </tbody>
-                        </table>
-                      </div>
-                      <div v-else class="muted" style="font-size: 13px">该主任务未产生节点下发明细。</div>
-                    </td>
-                  </tr>
-                </template>
-              </tbody>
-            </table>
-          </div>
-          <div v-else-if="loadingSignals" class="muted" style="font-size: 13px; padding: 8px 0">加载中…</div>
-          <div v-else class="muted" style="font-size: 13px; padding: 8px 0">该分组暂无信号记录。</div>
-
-          <div v-if="signalTotal > 0" class="pagination" style="margin-top: 12px">
-            <span class="muted pagination-info">
-              共 {{ signalTotal }} 条 · 第 {{ signalPage }} / {{ signalTotalPages }} 页
-            </span>
-            <div class="row pagination-actions">
-              <select v-model.number="signalPageSize" class="pagination-size" @change="onSignalPageSizeChange">
-                <option :value="10">10 条/页</option>
-                <option :value="20">20 条/页</option>
-                <option :value="50">50 条/页</option>
+          <div class="form-grid two">
+            <div>
+              <FormLabel field-id="trigger-symbol" text="信号品种" :help="TRIGGER_HELP.symbol" />
+              <input id="trigger-symbol" v-model="triggerForm.symbol" placeholder="例如：XAUUSD" />
+              <div v-if="triggerSymbolOptions.length" class="symbol-picks">
+                <span class="muted">已配置：</span>
+                <button
+                  v-for="s in triggerSymbolOptions"
+                  :key="s"
+                  type="button"
+                  class="btn-sm btn-ghost"
+                  @click="triggerForm.symbol = s"
+                >
+                  {{ s }}
+                </button>
+              </div>
+            </div>
+            <div>
+              <FormLabel field-id="trigger-action" text="信号方向" :help="TRIGGER_HELP.action" />
+              <select id="trigger-action" v-model="triggerForm.action">
+                <option value="BUY">BUY（策略托管开多）</option>
+                <option value="SELL">SELL（策略托管开空）</option>
+                <option value="CLOSE">CLOSE（终止任务并平仓）</option>
               </select>
-              <button class="btn-sm btn-ghost" :disabled="loadingSignals || signalPage <= 1" @click="goSignalPage(signalPage - 1)">
-                上一页
-              </button>
-              <button
-                class="btn-sm btn-ghost"
-                :disabled="loadingSignals || signalPage >= signalTotalPages"
-                @click="goSignalPage(signalPage + 1)"
+            </div>
+
+            <template v-if="!isCloseAction">
+              <div>
+                <FormLabel field-id="trigger-volume" text="首单手数" :help="TRIGGER_HELP.volume" />
+                <input
+                  id="trigger-volume"
+                  v-model.number="triggerForm.volume"
+                  type="number"
+                  min="0.01"
+                  step="0.01"
+                />
+              </div>
+              <div>
+                <FormLabel field-id="trigger-comment" text="订单备注" :help="TRIGGER_HELP.comment" />
+                <input id="trigger-comment" v-model="triggerForm.comment" placeholder="选填" />
+              </div>
+              <div>
+                <FormLabel field-id="trigger-sl" text="止损价" :help="TRIGGER_HELP.stop_loss" />
+                <input
+                  id="trigger-sl"
+                  v-model.number="triggerForm.stop_loss"
+                  type="number"
+                  step="0.01"
+                  placeholder="留空表示不设"
+                />
+              </div>
+              <div>
+                <FormLabel field-id="trigger-tp" text="止盈价" :help="TRIGGER_HELP.take_profit" />
+                <input
+                  id="trigger-tp"
+                  v-model.number="triggerForm.take_profit"
+                  type="number"
+                  step="0.01"
+                  placeholder="留空表示不设"
+                />
+              </div>
+            </template>
+            <p v-else class="span-full trigger-warning">
+              CLOSE 会平掉命中分组内进行中任务对应魔术号的持仓并结束节点侧策略监控，不影响按币种分发链路的持仓。
+            </p>
+
+            <div class="span-full">
+              <FormLabel
+                text="预计命中分组"
+                help="按后台同一套规则试算：分组已启用 + 绑定的策略已启用 + 策略品种与信号品种一致。实际下发以触发时的分组状态为准。"
+              />
+              <div v-if="loadingTriggerGroups" class="muted" style="font-size: 12px">
+                正在读取全部分组…
+              </div>
+              <div v-else-if="!triggerForm.symbol.trim()" class="muted" style="font-size: 12px">
+                填写品种后，这里会列出将收到本信号的分组。
+              </div>
+              <div v-else-if="!matchedGroups.length" class="muted" style="font-size: 12px">
+                没有匹配的分组：该品种下没有「已启用且绑定同品种启用策略」的分组，信号会被拒收。
+              </div>
+              <div v-else class="member-list">
+                <div v-for="g in matchedGroups" :key="g.group_id" class="member-row">
+                  <span class="member-name">{{ g.name }}</span>
+                  <span class="muted member-meta">{{ groupStrategyLabel(g) }}</span>
+                  <span class="tag blue">{{ DISPATCH_MODE_LABEL[g.dispatch_mode] }}</span>
+                  <span class="tag" :class="g.online_node_count ? 'green' : 'red'">
+                    有效节点 {{ g.online_node_count }}
+                  </span>
+                </div>
+              </div>
+              <p
+                v-if="matchedGroups.length > readyGroupCount"
+                class="muted"
+                style="font-size: 12px; margin: 8px 0 0"
               >
-                下一页
-              </button>
+                其中 {{ matchedGroups.length - readyGroupCount }} 个分组当前没有有效节点（成员未启用或不在线），
+                会生成主任务但记为未下发。
+              </p>
+            </div>
+
+            <div v-if="triggerError" class="span-full" style="color: var(--red); font-size: 13px">
+              {{ triggerError }}
             </div>
           </div>
         </div>
         <div class="modal-footer">
-          <button class="btn-ghost" @click="showSignals = false">关闭</button>
+          <button class="btn-ghost" @click="showTrigger = false">取消</button>
+          <button
+            class="btn-primary"
+            :disabled="triggering || loadingTriggerGroups || !triggerForm.symbol.trim()"
+            @click="submitTrigger"
+          >
+            {{ triggering ? '触发中…' : '触发信号' }}
+          </button>
         </div>
       </div>
     </div>
+
   </div>
 </template>
 
@@ -769,41 +836,29 @@ function dispatchSummary(row: GroupSignalTaskRecord): string {
   gap: 6px;
 }
 
-.group-signal-modal .modal-body {
-  min-width: 0;
-}
-
-.group-signal-table,
-.group-detail-table {
-  width: 100%;
-  min-width: 0;
-}
-
-.group-signal-table th,
-.group-signal-table td,
-.group-detail-table th,
-.group-detail-table td {
+.symbol-picks {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
   font-size: 12px;
-  vertical-align: top;
 }
 
-.group-payload {
-  width: 100%;
-  max-width: 100%;
-  margin-bottom: 12px;
+.trigger-warning {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(245, 158, 11, 0.25);
+  border-radius: 8px;
+  background: rgba(245, 158, 11, 0.08);
+  color: #fbbf24;
   font-size: 12px;
-  white-space: pre-wrap;
-  overflow-x: auto;
-}
-
-.group-break {
-  word-break: break-word;
-  overflow-wrap: anywhere;
+  line-height: 1.6;
 }
 
 @media (max-width: 768px) {
   .group-form-modal,
-  .group-signal-modal {
+  .group-trigger-modal {
     width: 100%;
     max-width: 100%;
     max-height: calc(100dvh - 24px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));

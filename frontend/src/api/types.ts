@@ -126,13 +126,20 @@ export interface CloseBatchResult {
   target: string
 }
 
-// 中控台手动触发的开仓信号（复用 Webhook 分发流程）
+/** 手动触发的信号方向；CLOSE 仅 strategy 模型开放（终止分组内进行中的策略任务） */
+export type ManualSignalAction = 'BUY' | 'SELL' | 'CLOSE'
+
+// 后台手动触发的信号（复用 Webhook 分发流程）
 export interface ManualSignalPayload {
   symbol: string
-  action: 'BUY' | 'SELL'
-  volume: number
+  action: ManualSignalAction
+  /** 开仓（BUY / SELL）必填；CLOSE 不需要手数 */
+  volume?: number
   /** 处理模型：normal（按币种分发，默认）/ strategy（按分组分发） */
   model?: SignalModel
+  stop_loss?: number
+  take_profit?: number
+  comment?: string
 }
 
 /** Webhook model 字段：normal = 按币种分发（默认），strategy = 按分组分发 */
@@ -339,9 +346,27 @@ export interface ManualSignalResult {
   action?: string
   symbol?: string
   volume?: number
+  /** 处理模型：normal / strategy */
+  model?: SignalModel
+  /** normal：close / poll / sync；strategy：group / group_close / rejected */
   mode?: string
+  /** strategy 链路命中的分组数 */
+  groups?: number
   targets?: number
   reason?: string
+  /** strategy 链路各分组的处理结果 */
+  tasks?: ManualSignalGroupTask[]
+}
+
+/** strategy 链路中单个分组的下发结果 */
+export interface ManualSignalGroupTask {
+  group_id: string
+  group_name?: string | null
+  dispatch_mode?: GroupDispatchMode
+  task_id?: number | null
+  targets: number
+  status: string
+  reason?: string | null
 }
 
 export interface HubEvent {

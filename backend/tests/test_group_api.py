@@ -493,6 +493,81 @@ def test_manual_signal_supports_strategy_model(client):
     assert body["mode"] == "group"
 
 
+def test_manual_signal_passes_sl_tp_and_comment(client):
+    """手动触发的止损 / 止盈 / 备注按 Webhook 同名字段透传到分组主任务。"""
+    h = auth_headers(client)
+    gid = _mk_group(client, h, name="参数透传组")["group_id"]
+    r = client.post(
+        "/api/console/manual-signal",
+        json={
+            "symbol": "XAUUSD", "action": "SELL", "volume": 0.2, "model": "strategy",
+            "stop_loss": 2600.5, "take_profit": 2500.5, "comment": "手动开仓",
+        },
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "accepted"
+
+    task = client.get(f"/api/groups/{gid}/signals", headers=h).json()["items"][0]
+    assert (task["action"], task["volume"]) == ("SELL", 0.2)
+    assert (task["sl"], task["tp"]) == (2600.5, 2500.5)
+    assert task["comment"] == "手动开仓"
+
+
+def test_manual_open_requires_volume(client):
+    """开仓必须显式给手数，不静默回落到默认手数。"""
+    h = auth_headers(client)
+    _mk_group(client, h, name="手数校验组")
+    r = client.post(
+        "/api/console/manual-signal",
+        json={"symbol": "XAUUSD", "action": "BUY", "model": "strategy"},
+        headers=h,
+    )
+    assert r.status_code == 400
+    assert "手数" in r.json()["detail"]
+
+
+def test_manual_signal_rejects_unknown_action(client):
+    h = auth_headers(client)
+    r = client.post(
+        "/api/console/manual-signal",
+        json={"symbol": "XAUUSD", "action": "HOLD", "volume": 0.1},
+        headers=h,
+    )
+    assert r.status_code == 400
+    assert "动作非法" in r.json()["detail"]
+
+
+def test_manual_close_requires_strategy_model(client):
+    """CLOSE 只对 strategy 开放：normal 的 CLOSE 是全局按币种平仓，不从信号入口提供。"""
+    h = auth_headers(client)
+    seed_default_filters(client)
+    r = client.post(
+        "/api/console/manual-signal",
+        json={"symbol": "XAUUSD", "action": "CLOSE"},
+        headers=h,
+    )
+    assert r.status_code == 400
+    assert "CLOSE" in r.json()["detail"]
+
+
+def test_manual_close_goes_through_group_close(client):
+    """strategy 的 CLOSE 走分组终止链路；组内无进行中任务时不新建主任务。"""
+    h = auth_headers(client)
+    gid = _mk_group(client, h, name="手动终止组")["group_id"]
+    r = client.post(
+        "/api/console/manual-signal",
+        json={"symbol": "XAUUSD", "action": "CLOSE", "model": "strategy"},
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["model"] == "strategy"
+    assert body["mode"] == "group_close"
+    assert body["tasks"][0]["status"] == "skipped"
+    assert client.get(f"/api/groups/{gid}/signals", headers=h).json()["total"] == 0
+
+
 # =====================================================================
 # 6. strategy 信号端到端
 # =====================================================================

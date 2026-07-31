@@ -9,6 +9,11 @@ const router = createRouter({
     { path: '/nodes', name: 'nodes', component: () => import('@/views/NodesView.vue') },
     { path: '/nodes/:id', name: 'node-detail', component: () => import('@/views/NodeDetailView.vue') },
     { path: '/groups', name: 'groups', component: () => import('@/views/GroupsView.vue') },
+    {
+      path: '/groups/:id/signals',
+      name: 'group-signals',
+      component: () => import('@/views/GroupSignalsView.vue'),
+    },
     { path: '/strategies', name: 'strategies', component: () => import('@/views/StrategiesView.vue') },
     { path: '/events', name: 'events', component: () => import('@/views/EventsView.vue') },
     { path: '/audits', name: 'audits', component: () => import('@/views/AuditView.vue') },

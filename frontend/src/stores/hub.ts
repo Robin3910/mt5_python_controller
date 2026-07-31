@@ -161,6 +161,10 @@ export const useHubStore = defineStore('hub', {
       await api.delete(`/api/groups/${id}`)
       await this.fetchGroups(options)
     },
+    /** 取全量分组但不写入 state：供手动触发弹窗预演命中范围，不受列表搜索条件影响 */
+    async listGroups(): Promise<GroupOut[]> {
+      return (await api.get('/api/groups')).data
+    },
     // ---- 策略增删改查（基于模版的加仓规则实例）----
     async fetchStrategyTemplates(): Promise<StrategyTemplateOut[]> {
       return (await api.get('/api/strategies/templates')).data

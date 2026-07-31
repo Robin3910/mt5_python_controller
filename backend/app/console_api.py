@@ -5,7 +5,7 @@
 """
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from . import persist
+from . import group_rules, persist
 from .deps import (
     client_ip,
     get_current_admin,
@@ -15,11 +15,56 @@ from .deps import (
 )
 from .dispatcher import Dispatcher
 from .group_dispatcher import GroupDispatcher
-from .models import ManualSignalRequest
+from .models import SIGNAL_MODEL_STRATEGY, SIGNAL_MODELS, ManualSignalRequest
 from .redis_store import RedisStore
 from .webhook import process_signal
 
 router = APIRouter(prefix="/api/console", tags=["console"])
+
+MANUAL_ACTIONS = ("BUY", "SELL", "CLOSE")
+
+
+def _build_signal_payload(body: ManualSignalRequest) -> dict:
+    """把手动触发入参组装成 Webhook 同构的信号体。
+
+    CLOSE 只在 strategy 链路开放：normal 链路的 CLOSE 是「广播所有在线节点平掉该
+    品种全部持仓」的全局操作，中控台已有专门的远程平仓入口，不从信号入口重复提供；
+    strategy 链路的 CLOSE 只终止分组内进行中的策略任务，作用域明确、风险可控。
+    """
+    action = (body.action or "").strip().upper()
+    if action not in MANUAL_ACTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"动作非法：{body.action}（应为 {' / '.join(MANUAL_ACTIONS)}）",
+        )
+
+    model = group_rules.normalize_signal_model(body.model)
+    if model is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"处理模型非法：{body.model}（应为 {' / '.join(SIGNAL_MODELS)}）",
+        )
+    if action == "CLOSE" and model != SIGNAL_MODEL_STRATEGY:
+        raise HTTPException(
+            status_code=400,
+            detail="CLOSE 仅支持 strategy 模型（按分组终止策略任务）；"
+                   "按币种平仓请使用中控台的远程平仓功能",
+        )
+
+    # 开仓必须显式给手数，避免静默回落到默认手数下出意料之外的单
+    if action != "CLOSE" and not body.volume:
+        raise HTTPException(status_code=400, detail="开仓信号必须填写手数")
+
+    data: dict = {"action": action, "symbol": body.symbol, "model": model}
+    if body.volume:
+        data["volume"] = body.volume
+    if body.stop_loss:
+        data["sl"] = body.stop_loss
+    if body.take_profit:
+        data["tp"] = body.take_profit
+    if comment := (body.comment or "").strip():
+        data["comment"] = comment
+    return data
 
 
 @router.post("/manual-signal")
@@ -31,13 +76,8 @@ async def manual_signal(
     group_dispatcher: GroupDispatcher = Depends(get_group_dispatcher),
     admin: str = Depends(get_current_admin),
 ):
-    """手动触发一条开仓信号（BUY / SELL），走与 Webhook 完全一致的分发流程。"""
-    action = (body.action or "").strip().upper()
-    if action not in ("BUY", "SELL"):
-        raise HTTPException(status_code=400, detail="action must be BUY or SELL")
-    data = {"action": action, "symbol": body.symbol, "volume": body.volume}
-    if body.model:
-        data["model"] = body.model
+    """手动触发一条信号（BUY / SELL / CLOSE），走与 Webhook 完全一致的分发流程。"""
+    data = _build_signal_payload(body)
     ip = client_ip(request)
     result = await process_signal(
         data, source_ip=ip, source="manual", store=store, dispatcher=dispatcher,
@@ -52,6 +92,7 @@ async def manual_signal(
                 "signal_id": result.get("signal_id"),
                 "model": result.get("model"),
                 "mode": result.get("mode"),
+                "groups": result.get("groups"),
                 "targets": result.get("targets"),
                 "reason": result.get("reason"),
             },

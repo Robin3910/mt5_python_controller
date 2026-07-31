@@ -437,11 +437,18 @@ class CloseBatchRequest(CloseRequest):
 
 # ----------------------- 中控台手动触发 -----------------------
 class ManualSignalRequest(BaseModel):
-    """中控台手动触发的开仓信号（复用 Webhook 分发流程）。"""
+    """后台手动触发的信号（复用 Webhook 分发流程）。
+
+    volume 只有开仓（BUY / SELL）才必填，由接口层按 action 校验：CLOSE 是终止
+    指令，手数没有意义。stop_loss / take_profit / comment 对齐 Webhook 的同名字段。
+    """
     symbol: str = Field(min_length=1)
-    action: str  # BUY / SELL
-    volume: float = Field(gt=0)
+    action: str  # BUY / SELL / CLOSE（CLOSE 仅 strategy 链路开放）
+    volume: Optional[float] = Field(default=None, gt=0)
     model: Optional[str] = None  # normal（默认）/ strategy
+    stop_loss: Optional[float] = Field(default=None, gt=0)
+    take_profit: Optional[float] = Field(default=None, gt=0)
+    comment: Optional[str] = Field(default=None, max_length=64)
 
 
 # ----------------------------- 鉴权 ----------------------------
