@@ -260,6 +260,25 @@ class PaginatedGroupSignals(BaseModel):
     page_size: int
 
 
+class GroupTaskEventRecord(BaseModel):
+    """节点策略子任务的执行事件（开仓 / 加仓 / 平仓等关联订单）。"""
+    id: int
+    task_id: int
+    node_id: str
+    magic: Optional[int] = None
+    created_at: Optional[float] = None
+    event_type: str
+    symbol: Optional[str] = None
+    action: Optional[str] = None
+    volume: Optional[float] = None
+    price: Optional[float] = None
+    order_ticket: Optional[int] = None
+    position_count: Optional[int] = None
+    total_volume: Optional[float] = None
+    profit: Optional[float] = None
+    message: Optional[str] = None
+
+
 # ----------------------------- 策略管理 ----------------------------
 class StrategyBatchLevel(BaseModel):
     """分批加仓档位：持仓笔数区间内的点数 / 倍数。"""
@@ -449,6 +468,22 @@ class ManualSignalRequest(BaseModel):
     stop_loss: Optional[float] = Field(default=None, gt=0)
     take_profit: Optional[float] = Field(default=None, gt=0)
     comment: Optional[str] = Field(default=None, max_length=64)
+
+
+# 清空交易记录时前端/调用方必须原样提交的确认词
+PURGE_TRADE_LOGS_CONFIRM = "清空交易记录"
+
+
+class PurgeTradeLogsRequest(BaseModel):
+    """清空全部交易日志/记录表；需提交确认词防止误触。"""
+    confirm: str = Field(description=f"必须为「{PURGE_TRADE_LOGS_CONFIRM}」")
+
+
+class PurgeTradeLogsResult(BaseModel):
+    """清空交易记录的结果：各表删除行数与 Redis 运行态清理数。"""
+    deleted: dict[str, int]
+    redis_cleared: int
+    total_deleted: int
 
 
 # ----------------------------- 鉴权 ----------------------------

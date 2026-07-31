@@ -15,7 +15,14 @@ from .deps import (
 )
 from .dispatcher import Dispatcher
 from .group_dispatcher import GroupDispatcher
-from .models import SIGNAL_MODEL_STRATEGY, SIGNAL_MODELS, ManualSignalRequest
+from .models import (
+    PURGE_TRADE_LOGS_CONFIRM,
+    SIGNAL_MODEL_STRATEGY,
+    SIGNAL_MODELS,
+    ManualSignalRequest,
+    PurgeTradeLogsRequest,
+    PurgeTradeLogsResult,
+)
 from .redis_store import RedisStore
 from .webhook import process_signal
 
@@ -99,3 +106,37 @@ async def manual_signal(
         },
     )
     return result
+
+
+@router.post("/purge-trade-logs", response_model=PurgeTradeLogsResult)
+async def purge_trade_logs(
+    body: PurgeTradeLogsRequest,
+    request: Request,
+    store: RedisStore = Depends(get_store),
+    admin: str = Depends(get_current_admin),
+):
+    """清空全部交易日志表与记录表。
+
+    删除：signal_history / signal_dispatch / group_signal_task /
+    group_task_dispatch / group_task_event，并清理 Redis 交易运行态。
+    分组、策略、节点配置与操作审计保留。
+    """
+    if (body.confirm or "").strip() != PURGE_TRADE_LOGS_CONFIRM:
+        raise HTTPException(
+            status_code=400,
+            detail=f"确认词不正确，请输入「{PURGE_TRADE_LOGS_CONFIRM}」",
+        )
+    deleted = await persist.purge_trade_logs()
+    redis_cleared = await store.clear_trade_runtime()
+    total = sum(deleted.values())
+    await persist.audit(
+        admin, "purge_trade_logs", None, {"confirm": True}, "ok", client_ip(request),
+        category="console", before=None, after={
+            "deleted": deleted,
+            "redis_cleared": redis_cleared,
+            "total_deleted": total,
+        },
+    )
+    return PurgeTradeLogsResult(
+        deleted=deleted, redis_cleared=redis_cleared, total_deleted=total,
+    )

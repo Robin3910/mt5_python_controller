@@ -91,6 +91,7 @@ def test_group_endpoints_require_auth(client):
     assert client.patch("/api/groups/grp_x", json={"name": "y"}).status_code == 401
     assert client.delete("/api/groups/grp_x").status_code == 401
     assert client.get("/api/groups/grp_x/signals").status_code == 401
+    assert client.get("/api/groups/grp_x/dispatches/1/events").status_code == 401
 
 
 # =====================================================================
@@ -671,6 +672,66 @@ def test_strategy_end_to_end_sync(client):
     assert client.get(f"/api/groups/{gid}", headers=h).json()["signal_count"] == 1
 
 
+def test_dispatch_events_related_orders(client):
+    """点击节点子任务可查关联订单：首单回报补事件 + strategy_progress 加仓事件 + 收口。"""
+    h = auth_headers(client)
+    token = _node_token(client, h)
+    n1 = _mk_node(client, h, 5251, "订单节点")
+    gid = _mk_group(client, h, name="关联订单组", node_ids=[n1])["group_id"]
+
+    with client.websocket_connect("/ws/node") as ws1:
+        ws1.send_json({"type": "auth", "data": {"token": token, "mt5_login": 5251}})
+        assert ws1.receive_json()["type"] == "auth_ok"
+
+        client.post("/webhook", json={
+            "action": "buy", "symbol": "XAUUSD", "volume": 0.1, "model": "strategy",
+        })
+        start = ws1.receive_json()
+        assert start["cmd"] == "strategy_start"
+        did = start["dispatch_id"]
+
+        ws1.send_json({"type": "trade_result", "data": {
+            "signal_id": start["signal_id"], "magic": start["magic"],
+            "symbol": "XAUUSD", "success": True, "order": 88001, "price": 2401.2,
+        }})
+        _wait_task_status(client, h, gid, "running")
+
+        # trade_result 未写事件表时，接口仍应补出首单关联订单
+        ev1 = client.get(f"/api/groups/{gid}/dispatches/{did}/events", headers=h)
+        assert ev1.status_code == 200, ev1.text
+        items = ev1.json()
+        assert any(e["event_type"] == "open" and e["order_ticket"] == 88001 for e in items)
+
+        ws1.send_json({"type": "strategy_progress", "data": {
+            "task_id": start["task_id"], "dispatch_id": did, "magic": start["magic"],
+            "event": "add_counter", "symbol": "XAUUSD", "action": "BUY",
+            "phase": "running", "position_count": 2, "add_count": 1,
+            "total_orders": 2, "total_volume": 0.2, "profit": 1.5,
+            "last_order": {"ticket": 88002, "price": 2398.0, "volume": 0.1},
+        }})
+        time.sleep(0.05)
+
+        ws1.send_json({"type": "strategy_finished", "data": {
+            "task_id": start["task_id"], "magic": start["magic"],
+            "status": "done", "reason": "positions_cleared",
+            "total_orders": 2, "total_volume": 0.2, "realized_profit": 3.0,
+        }})
+        _wait_task_status(client, h, gid, "done")
+
+    ev2 = client.get(f"/api/groups/{gid}/dispatches/{did}/events", headers=h)
+    assert ev2.status_code == 200, ev2.text
+    types = [e["event_type"] for e in ev2.json()]
+    assert "open" in types
+    assert "add_counter" in types
+    assert "close_all" in types
+    add = next(e for e in ev2.json() if e["event_type"] == "add_counter")
+    assert add["order_ticket"] == 88002
+    assert add["price"] == 2398.0
+
+    assert client.get(f"/api/groups/{gid}/dispatches/999999/events", headers=h).status_code == 404
+    assert client.get("/api/groups/grp_missing/dispatches/1/events", headers=h).status_code == 404
+
+
 def test_strategy_end_to_end_poll_only_one_node(client):
     """分组 poll：一条信号只交给组内一个节点，第二条交给下一个节点。"""
     h = auth_headers(client)
@@ -889,3 +950,60 @@ def test_strategy_signal_appears_in_events_with_model(client):
     assert len(strategy) == 1
     assert strategy[0]["symbol"] == "XAUUSD"
     assert strategy[0]["dispatch_mode"] == "group"
+
+
+def test_purge_trade_logs_clears_tables_keeps_config(client):
+    """清空交易记录：五张运行表清空，分组/策略配置与审计保留。"""
+    h = auth_headers(client)
+    token = _node_token(client, h)
+    n1 = _mk_node(client, h, 5261, "清空节点")
+    g = _mk_group(client, h, name="清空交易记录组", node_ids=[n1])
+    gid = g["group_id"]
+    strategy_id = g["strategy_id"]
+
+    with client.websocket_connect("/ws/node") as ws1:
+        ws1.send_json({"type": "auth", "data": {"token": token, "mt5_login": 5261}})
+        assert ws1.receive_json()["type"] == "auth_ok"
+        client.post("/webhook", json={
+            "action": "buy", "symbol": "XAUUSD", "volume": 0.1, "model": "strategy",
+        })
+        start = ws1.receive_json()
+        ws1.send_json({"type": "trade_result", "data": {
+            "signal_id": start["signal_id"], "magic": start["magic"],
+            "symbol": "XAUUSD", "success": True, "order": 99001, "price": 2400.0,
+        }})
+        _wait_task_status(client, h, gid, "running")
+        ws1.send_json({"type": "strategy_finished", "data": {
+            "task_id": start["task_id"], "magic": start["magic"], "status": "done",
+        }})
+        _wait_task_status(client, h, gid, "done")
+
+    assert client.get(f"/api/groups/{gid}/signals", headers=h).json()["total"] >= 1
+    assert client.get("/api/events/signals", headers=h).json()["total"] >= 1
+
+    assert client.post("/api/console/purge-trade-logs", json={}).status_code == 401
+    bad = client.post(
+        "/api/console/purge-trade-logs", json={"confirm": "wrong"}, headers=h,
+    )
+    assert bad.status_code == 400
+
+    ok = client.post(
+        "/api/console/purge-trade-logs",
+        json={"confirm": "清空交易记录"},
+        headers=h,
+    )
+    assert ok.status_code == 200, ok.text
+    body = ok.json()
+    assert body["total_deleted"] >= 1
+    assert body["deleted"]["signal_history"] >= 1
+    assert body["deleted"]["group_signal_task"] >= 1
+
+    assert client.get(f"/api/groups/{gid}/signals", headers=h).json()["total"] == 0
+    assert client.get("/api/events/signals", headers=h).json()["total"] == 0
+    # 配置保留
+    assert client.get(f"/api/groups/{gid}", headers=h).status_code == 200
+    assert client.get(f"/api/strategies/{strategy_id}", headers=h).status_code == 200
+    assert client.get(f"/api/nodes/{n1}", headers=h).status_code == 200
+    # 操作本身写入审计
+    audits = client.get("/api/audits", params={"page_size": 50}, headers=h).json()["items"]
+    assert any(a["action"] == "purge_trade_logs" for a in audits)

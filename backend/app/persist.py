@@ -7,10 +7,17 @@ from dataclasses import asdict
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import delete, func, or_, select, update
 
 from .db import SessionLocal
-from .orm import AuditLog, SignalDispatch, SignalHistory
+from .orm import (
+    AuditLog,
+    GroupSignalTask,
+    GroupTaskDispatch,
+    GroupTaskEvent,
+    SignalDispatch,
+    SignalHistory,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -385,6 +392,28 @@ async def recent_dispatches(node_id: str, page: int = 1, page_size: int = 20) ->
     except Exception as e:  # noqa: BLE001
         logger.warning("recent_dispatches failed: %s", e)
         return {"items": [], "total": 0, "page": page, "page_size": page_size}
+
+
+async def purge_trade_logs() -> dict[str, int]:
+    """清空全部交易日志表与记录表（配置 / 审计保留）。
+
+    删除顺序：子任务事件 → 子任务 → 分组主任务 → normal 分发明细 → 信号台账。
+    返回各表删除行数。
+    """
+    tables = (
+        ("group_task_event", GroupTaskEvent),
+        ("group_task_dispatch", GroupTaskDispatch),
+        ("group_signal_task", GroupSignalTask),
+        ("signal_dispatch", SignalDispatch),
+        ("signal_history", SignalHistory),
+    )
+    deleted: dict[str, int] = {}
+    async with SessionLocal() as s:
+        for name, model in tables:
+            result = await s.execute(delete(model))
+            deleted[name] = int(result.rowcount or 0)
+        await s.commit()
+    return deleted
 
 
 async def audit(

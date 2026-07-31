@@ -224,6 +224,50 @@ async function remove(g: GroupOut): Promise<void> {
   await hub.deleteGroup(g.group_id, currentSearchOptions())
 }
 
+const PURGE_CONFIRM_TEXT = '清空交易记录'
+const purging = ref(false)
+
+async function purgeTradeLogs(): Promise<void> {
+  if (!(await confirmAction(
+    '确认清空全部交易记录？\n\n'
+      + '将删除：信号历史、按币种分发明细、分组策略主任务 / 节点子任务 / 事件流，并清理相关运行态缓存。\n'
+      + '分组、策略、节点配置与操作审计不受影响。\n\n'
+      + '此操作不可恢复。',
+    '清空交易记录',
+  ))) {
+    return
+  }
+  try {
+    const { value } = await ElMessageBox.prompt(
+      `请输入「${PURGE_CONFIRM_TEXT}」以确认`,
+      '二次确认',
+      {
+        confirmButtonText: '确认清空',
+        cancelButtonText: '取消',
+        inputPattern: new RegExp(`^${PURGE_CONFIRM_TEXT}$`),
+        inputErrorMessage: `请输入：${PURGE_CONFIRM_TEXT}`,
+        type: 'warning',
+        closeOnClickModal: false,
+      },
+    )
+    if (value !== PURGE_CONFIRM_TEXT) return
+  } catch {
+    return
+  }
+
+  purging.value = true
+  try {
+    const res = await hub.purgeTradeLogs(PURGE_CONFIRM_TEXT)
+    ElMessage.success(`已清空交易记录（共 ${res.total_deleted} 条）`)
+    await loadGroups()
+  } catch (e: unknown) {
+    const err = e as { response?: { data?: { detail?: string } }; message?: string }
+    ElMessage.error(err?.response?.data?.detail || err?.message || '清空失败，请稍后重试')
+  } finally {
+    purging.value = false
+  }
+}
+
 // ---- 手动触发策略信号 ----
 // 与 Webhook 的 model=strategy 走同一条分组分发链路，只是入口换成后台管理员操作。
 const showTrigger = ref(false)
@@ -446,6 +490,9 @@ function openSignals(g: GroupOut): void {
       <div class="row" style="gap: 8px">
         <button class="btn-ghost" @click="router.push('/strategies')">策略管理</button>
         <button class="btn-ghost" @click="openTrigger">手动触发信号</button>
+        <button class="btn-danger" :disabled="purging" @click="purgeTradeLogs">
+          {{ purging ? '清空中…' : '清空交易记录' }}
+        </button>
         <button class="btn-primary" @click="openCreate">+ 新建分组</button>
       </div>
     </div>

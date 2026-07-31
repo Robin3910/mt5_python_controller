@@ -909,3 +909,95 @@ async def count_by_group() -> dict[str, int]:
     except Exception as e:  # noqa: BLE001
         logger.warning("count_by_group failed: %s", e)
         return {}
+
+
+def _event_row(e: GroupTaskEvent) -> dict:
+    return {
+        "id": e.id,
+        "task_id": e.task_id,
+        "node_id": e.node_id,
+        "magic": e.magic,
+        "created_at": e.created_at.timestamp() if e.created_at else None,
+        "event_type": e.event_type,
+        "symbol": e.symbol,
+        "action": e.action,
+        "volume": e.volume,
+        "price": e.price,
+        "order_ticket": e.order_ticket,
+        "position_count": e.position_count,
+        "total_volume": e.total_volume,
+        "profit": e.profit,
+        "message": e.message,
+    }
+
+
+def _synthetic_open_event(d: GroupTaskDispatch) -> Optional[dict]:
+    """trade_result 只更新子任务快照、不写事件表；首单回报缺事件时补一条便于前端展示。"""
+    if not d.order_ticket and not d.error and not d.finish_reason:
+        return None
+    if d.status == "failed" or d.finish_reason == "open_failed":
+        event_type = "error"
+    else:
+        event_type = "open"
+    ts = d.opened_at or d.finished_at or d.dispatched_at
+    return {
+        "id": 0,
+        "task_id": d.task_id,
+        "node_id": d.node_id,
+        "magic": d.magic,
+        "created_at": ts.timestamp() if ts else None,
+        "event_type": event_type,
+        "symbol": d.symbol,
+        "action": None,
+        "volume": d.decided_vol,
+        "price": d.price,
+        "order_ticket": d.order_ticket,
+        "position_count": d.position_count if event_type == "open" else 0,
+        "total_volume": d.total_volume or None,
+        "profit": d.realized_profit if d.realized_profit else None,
+        "message": d.error or d.finish_reason,
+    }
+
+
+async def list_dispatch_events(group_id: str, dispatch_id: int) -> Optional[list[dict]]:
+    """读取某节点子任务的策略执行事件流（开仓 / 加仓 / 平仓等关联订单）。
+
+    子任务不属于该分组时返回 None；否则返回按时间升序的事件列表。
+    """
+    try:
+        async with SessionLocal() as s:
+            row = (
+                await s.execute(
+                    select(GroupTaskDispatch).where(
+                        GroupTaskDispatch.id == dispatch_id,
+                        GroupTaskDispatch.group_id == group_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if not row:
+                return None
+            events = (
+                await s.execute(
+                    select(GroupTaskEvent)
+                    .where(
+                        GroupTaskEvent.task_id == row.task_id,
+                        GroupTaskEvent.node_id == row.node_id,
+                    )
+                    .order_by(GroupTaskEvent.id.asc())
+                )
+            ).scalars().all()
+            items = [_event_row(e) for e in events]
+            tickets = {e.order_ticket for e in events if e.order_ticket}
+            # 首单回报若未进事件流，补一条（避免只有快照字段却看不到关联订单）
+            if row.order_ticket and row.order_ticket not in tickets:
+                syn = _synthetic_open_event(row)
+                if syn:
+                    items.insert(0, syn)
+            elif not items:
+                syn = _synthetic_open_event(row)
+                if syn:
+                    items.append(syn)
+            return items
+    except Exception as e:  # noqa: BLE001
+        logger.warning("list_dispatch_events failed: %s", e)
+        return []

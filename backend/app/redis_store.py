@@ -230,6 +230,32 @@ class RedisStore:
         if keys:
             await self.r.delete(*keys)
 
+    async def clear_trade_runtime(self) -> int:
+        """清空交易相关 Redis 运行态（轮询队列/进度、组内占位、去重、执行锁）。
+
+        节点 / 分组 / 策略 / 过滤配置与在线状态保留。返回删除的 key 数量。
+        """
+        patterns = (
+            K_POLL_PENDING,
+            "signal:poll:*",
+            "group:node:busy:*",
+            "dedup:*",
+            "lock:exec:*",
+        )
+        deleted = 0
+        seen: set[str] = set()
+        for pattern in patterns:
+            if "*" in pattern:
+                keys = [key async for key in self.r.scan_iter(match=pattern)]
+            else:
+                keys = [pattern] if await self.r.exists(pattern) else []
+            fresh = [k for k in keys if k not in seen]
+            if not fresh:
+                continue
+            seen.update(fresh)
+            deleted += int(await self.r.delete(*fresh) or 0)
+        return deleted
+
     async def get_group_rotation(self, group_id: str) -> list[str]:
         """读取分组内的轮转顺序（node_id 有序列表）；不存在则返回空列表。"""
         raw = await self.r.get(K_GROUP_ROTATION.format(group_id))

@@ -3,7 +3,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useHubStore } from '@/stores/hub'
-import type { GroupOut, GroupSignalTaskRecord } from '@/api/types'
+import type { GroupOut, GroupSignalTaskRecord, GroupTaskEventRecord } from '@/api/types'
 
 const route = useRoute()
 const router = useRouter()
@@ -19,6 +19,11 @@ const pageSize = ref(20)
 const total = ref(0)
 const loading = ref(false)
 const expanded = ref<Record<string, boolean>>({})
+
+/** 节点子任务展开：dispatch_id -> 关联订单事件 */
+const expandedDispatch = ref<Record<string, boolean>>({})
+const dispatchEvents = ref<Record<string, GroupTaskEventRecord[]>>({})
+const loadingDispatchEvents = ref<Record<string, boolean>>({})
 
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)))
 
@@ -49,6 +54,9 @@ async function loadSignals(): Promise<void> {
 async function reload(): Promise<void> {
   page.value = 1
   expanded.value = {}
+  expandedDispatch.value = {}
+  dispatchEvents.value = {}
+  loadingDispatchEvents.value = {}
   await loadGroup()
   await loadSignals()
 }
@@ -72,6 +80,24 @@ function toggleRow(key: string | number): void {
 
 function isExpanded(key: string | number): boolean {
   return !!expanded.value[String(key)]
+}
+
+function isDispatchExpanded(dispatchId: number): boolean {
+  return !!expandedDispatch.value[String(dispatchId)]
+}
+
+async function toggleDispatch(dispatchId: number): Promise<void> {
+  const k = String(dispatchId)
+  const next = !expandedDispatch.value[k]
+  expandedDispatch.value[k] = next
+  if (!next || !group.value) return
+  if (dispatchEvents.value[k]) return
+  loadingDispatchEvents.value[k] = true
+  try {
+    dispatchEvents.value[k] = await hub.fetchGroupDispatchEvents(group.value.group_id, dispatchId)
+  } finally {
+    loadingDispatchEvents.value[k] = false
+  }
 }
 
 function fmtTime(sec: number | null | undefined): string {
@@ -136,6 +162,19 @@ function dispatchSummary(row: GroupSignalTaskRecord): string {
   if (done) parts.push(`${done} 完成`)
   if (failed) parts.push(`${failed} 失败`)
   return parts.join(' · ')
+}
+
+function eventTag(eventType: string): { cls: string; text: string } {
+  const m: Record<string, { cls: string; text: string }> = {
+    open: { cls: 'green', text: '开仓' },
+    add_counter: { cls: 'amber', text: '逆势加仓' },
+    add_trend: { cls: 'amber', text: '顺势加仓' },
+    close_partial: { cls: 'blue', text: '部分平仓' },
+    close_all: { cls: 'blue', text: '全部平仓' },
+    error: { cls: 'red', text: '异常' },
+    resume: { cls: '', text: '恢复' },
+  }
+  return m[eventType] || { cls: '', text: eventType }
 }
 
 onMounted(reload)
@@ -230,11 +269,14 @@ watch(groupId, reload)
                     <pre class="token-box group-payload">{{ fmtPayload(t.payload) }}</pre>
                   </details>
 
-                  <div class="muted" style="font-size: 12px; margin-bottom: 8px">各节点处理情况</div>
+                  <div class="muted" style="font-size: 12px; margin-bottom: 8px">
+                    各节点处理情况 · 点击节点行展开本次策略任务关联订单
+                  </div>
                   <div v-if="t.dispatches.length" class="table-scroll">
                     <table class="group-detail-table">
                       <thead>
                         <tr>
+                          <th style="width: 22px"></th>
                           <th>节点</th><th>魔术号</th><th>状态</th><th class="right">首单手数</th>
                           <th class="right">持仓</th><th class="right">加仓</th><th class="right">累计手数</th>
                           <th class="right">盈亏</th><th>结束原因</th>
@@ -243,22 +285,79 @@ watch(groupId, reload)
                         </tr>
                       </thead>
                       <tbody>
-                        <tr v-for="d in t.dispatches" :key="d.id">
-                          <td>{{ d.node_name || d.node_id }}</td>
-                          <td class="muted" style="font-size: 12px">{{ d.magic ?? '—' }}</td>
-                          <td><span class="tag" :class="dispatchTag(d.status).cls">{{ dispatchTag(d.status).text }}</span></td>
-                          <td class="right">{{ d.decided_vol ?? '—' }}</td>
-                          <td class="right">{{ d.position_count }}</td>
-                          <td class="right">{{ d.add_count }}</td>
-                          <td class="right">{{ d.total_volume }}</td>
-                          <td class="right">{{ d.realized_profit }}</td>
-                          <td class="muted group-break">{{ d.finish_reason || d.skip_reason || '—' }}</td>
-                          <td>{{ d.order ?? '—' }}</td>
-                          <td class="right">{{ d.price ?? '—' }}</td>
-                          <td class="muted group-break">{{ d.error || '—' }}</td>
-                          <td class="muted" style="white-space: nowrap">{{ fmtTime(d.dispatched_at) }}</td>
-                          <td class="muted" style="white-space: nowrap">{{ fmtTime(d.finished_at) }}</td>
-                        </tr>
+                        <template v-for="d in t.dispatches" :key="d.id">
+                          <tr class="clickable" @click="toggleDispatch(d.id)">
+                            <td class="muted">{{ isDispatchExpanded(d.id) ? '▾' : '▸' }}</td>
+                            <td>{{ d.node_name || d.node_id }}</td>
+                            <td class="muted" style="font-size: 12px">{{ d.magic ?? '—' }}</td>
+                            <td><span class="tag" :class="dispatchTag(d.status).cls">{{ dispatchTag(d.status).text }}</span></td>
+                            <td class="right">{{ d.decided_vol ?? '—' }}</td>
+                            <td class="right">{{ d.position_count }}</td>
+                            <td class="right">{{ d.add_count }}</td>
+                            <td class="right">{{ d.total_volume }}</td>
+                            <td class="right">{{ d.realized_profit }}</td>
+                            <td class="muted group-break">{{ d.finish_reason || d.skip_reason || '—' }}</td>
+                            <td>{{ d.order ?? '—' }}</td>
+                            <td class="right">{{ d.price ?? '—' }}</td>
+                            <td class="muted group-break">{{ d.error || '—' }}</td>
+                            <td class="muted" style="white-space: nowrap">{{ fmtTime(d.dispatched_at) }}</td>
+                            <td class="muted" style="white-space: nowrap">{{ fmtTime(d.finished_at) }}</td>
+                          </tr>
+                          <tr v-if="isDispatchExpanded(d.id)" class="detail-row">
+                            <td></td>
+                            <td colspan="14">
+                              <div class="muted" style="font-size: 12px; margin-bottom: 6px">
+                                关联订单 · {{ d.node_name || d.node_id }}
+                                <template v-if="d.magic != null"> · 魔术号 {{ d.magic }}</template>
+                              </div>
+                              <div v-if="loadingDispatchEvents[String(d.id)]" class="muted" style="font-size: 13px">
+                                加载中…
+                              </div>
+                              <div
+                                v-else-if="(dispatchEvents[String(d.id)] || []).length"
+                                class="table-scroll"
+                              >
+                                <table class="group-event-table">
+                                  <thead>
+                                    <tr>
+                                      <th>时间</th>
+                                      <th>类型</th>
+                                      <th>动作</th>
+                                      <th class="right">手数</th>
+                                      <th class="right">成交价</th>
+                                      <th>订单号</th>
+                                      <th class="right">持仓</th>
+                                      <th class="right">累计手数</th>
+                                      <th class="right">盈亏</th>
+                                      <th>说明</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    <tr v-for="ev in dispatchEvents[String(d.id)]" :key="`${d.id}-${ev.id}-${ev.created_at}`">
+                                      <td class="muted" style="white-space: nowrap">{{ fmtTime(ev.created_at) }}</td>
+                                      <td>
+                                        <span class="tag" :class="eventTag(ev.event_type).cls">
+                                          {{ eventTag(ev.event_type).text }}
+                                        </span>
+                                      </td>
+                                      <td>{{ ev.action || '—' }}</td>
+                                      <td class="right">{{ ev.volume ?? '—' }}</td>
+                                      <td class="right">{{ ev.price ?? '—' }}</td>
+                                      <td>{{ ev.order_ticket ?? '—' }}</td>
+                                      <td class="right">{{ ev.position_count ?? '—' }}</td>
+                                      <td class="right">{{ ev.total_volume ?? '—' }}</td>
+                                      <td class="right">{{ ev.profit ?? '—' }}</td>
+                                      <td class="muted group-break">{{ ev.message || '—' }}</td>
+                                    </tr>
+                                  </tbody>
+                                </table>
+                              </div>
+                              <div v-else class="muted" style="font-size: 13px">
+                                该节点本次策略任务暂无关联订单记录。
+                              </div>
+                            </td>
+                          </tr>
+                        </template>
                       </tbody>
                     </table>
                   </div>
@@ -305,7 +404,8 @@ watch(groupId, reload)
 }
 
 .group-signal-table,
-.group-detail-table {
+.group-detail-table,
+.group-event-table {
   width: 100%;
   min-width: 0;
 }
@@ -313,9 +413,16 @@ watch(groupId, reload)
 .group-signal-table th,
 .group-signal-table td,
 .group-detail-table th,
-.group-detail-table td {
+.group-detail-table td,
+.group-event-table th,
+.group-event-table td {
   font-size: 12px;
   vertical-align: top;
+}
+
+.group-event-table {
+  margin-top: 2px;
+  background: rgba(255, 255, 255, 0.02);
 }
 
 .group-payload {

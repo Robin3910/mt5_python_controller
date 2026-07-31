@@ -339,6 +339,26 @@ export interface PaginatedGroupSignals {
   page_size: number
 }
 
+/** 节点策略子任务执行事件（开仓 / 加仓 / 平仓等关联订单） */
+export interface GroupTaskEventRecord {
+  id: number
+  task_id: number
+  node_id: string
+  magic: number | null
+  created_at: number | null
+  /** open / add_counter / add_trend / close_partial / close_all / error / resume */
+  event_type: string
+  symbol: string | null
+  action: string | null
+  volume: number | null
+  price: number | null
+  order_ticket: number | null
+  position_count: number | null
+  total_volume: number | null
+  profit: number | null
+  message: string | null
+}
+
 // 手动触发接口返回（与 /webhook 响应同构，字段视 status 而定）
 export interface ManualSignalResult {
   status: string // accepted / duplicate / rejected
@@ -356,6 +376,13 @@ export interface ManualSignalResult {
   reason?: string
   /** strategy 链路各分组的处理结果 */
   tasks?: ManualSignalGroupTask[]
+}
+
+/** 清空交易记录结果 */
+export interface PurgeTradeLogsResult {
+  deleted: Record<string, number>
+  redis_cleared: number
+  total_deleted: number
 }
 
 /** strategy 链路中单个分组的下发结果 */

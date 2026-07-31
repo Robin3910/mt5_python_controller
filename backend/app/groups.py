@@ -14,6 +14,7 @@ from .models import (
     GroupCreate,
     GroupNodeRef,
     GroupOut,
+    GroupTaskEventRecord,
     GroupUpdate,
     PaginatedGroupSignals,
 )
@@ -154,6 +155,25 @@ async def group_signals(
     nodes = await store.all_nodes()
     node_names = {n["node_id"]: n.get("name") or n["node_id"] for n in nodes}
     return await group_persist.recent_group_signals(group_id, page, page_size, node_names)
+
+
+@router.get(
+    "/{group_id}/dispatches/{dispatch_id}/events",
+    response_model=list[GroupTaskEventRecord],
+)
+async def group_dispatch_events(
+    group_id: str,
+    dispatch_id: int,
+    store: RedisStore = Depends(get_store),
+    _: str = Depends(get_current_admin),
+):
+    """节点策略子任务的关联订单/事件流：开仓、加仓、平仓等。"""
+    if not await store.get_group(group_id):
+        raise HTTPException(status_code=404, detail="group not found")
+    items = await group_persist.list_dispatch_events(group_id, dispatch_id)
+    if items is None:
+        raise HTTPException(status_code=404, detail="dispatch not found")
+    return items
 
 
 @router.patch("/{group_id}", response_model=GroupOut)

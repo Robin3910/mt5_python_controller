@@ -11,11 +11,13 @@ import type {
   HubEvent,
   ManualSignalPayload,
   ManualSignalResult,
+  PurgeTradeLogsResult,
   NodeCreatePayload,
   NodeFeedItem,
   NodeOut,
   NodeTokenInfo,
   NodeUpdatePayload,
+  GroupTaskEventRecord,
   PaginatedAudits,
   PaginatedGroupSignals,
   PaginatedNodeDispatches,
@@ -210,6 +212,19 @@ export const useHubStore = defineStore('hub', {
         return { items: [], total: 0, page, page_size: pageSize }
       }
     },
+    /** 节点策略子任务的关联订单/事件流 */
+    async fetchGroupDispatchEvents(
+      groupId: string,
+      dispatchId: number,
+    ): Promise<GroupTaskEventRecord[]> {
+      try {
+        return (
+          await api.get(`/api/groups/${groupId}/dispatches/${dispatchId}/events`)
+        ).data
+      } catch {
+        return []
+      }
+    },
     // ---- 配置保存 ----
     async saveFilters(cfg: FilterRulesConfig): Promise<void> {
       this.filters = (await api.put('/api/config/filters', cfg)).data
@@ -217,6 +232,10 @@ export const useHubStore = defineStore('hub', {
     // ---- 中控台手动触发信号（复用 Webhook 分发流程）----
     async triggerManualSignal(payload: ManualSignalPayload): Promise<ManualSignalResult> {
       return (await api.post('/api/console/manual-signal', payload)).data
+    },
+    /** 清空全部交易日志表与记录表（分组/策略/节点配置保留） */
+    async purgeTradeLogs(confirm: string): Promise<PurgeTradeLogsResult> {
+      return (await api.post('/api/console/purge-trade-logs', { confirm })).data
     },
     // ---- 全局节点接入令牌（账户设置）----
     async fetchNodeToken(): Promise<NodeTokenInfo> {
