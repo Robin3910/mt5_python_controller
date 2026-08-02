@@ -906,6 +906,53 @@ async def test_close_signal_force_finishes_offline_node(store, monkeypatch):
     assert await store.get_group_node_busy(gid, "nd_a") is None
 
 
+async def test_close_signal_queues_pending_stop_for_offline_node(store, monkeypatch):
+    """节点离线时终止指令入队，等其重连后补发，避免 MT5 持仓无人收口。"""
+    await online(store, mk_node("nd_a"))
+    await mk_group(store, "补发平仓组", ["nd_a"])
+    monkeypatch.setattr(manager, "send_to_node", capture_sender([]))
+    d = GroupDispatcher(store)
+
+    await d.dispatch(TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_c5")
+    task = (await fetch_tasks("sig_c5"))[0]
+    await open_first_orders(task.task_id, ["nd_a"])
+    magic = (await magics_of(task.task_id))["nd_a"]
+
+    monkeypatch.setattr(manager, "send_to_node", capture_sender([], ok=False))
+    await d.dispatch(TradingSignal(action="CLOSE", symbol="XAUUSD", volume=0.1), "sig_c6")
+
+    pending = await store.pop_pending_stops("nd_a")
+    assert len(pending) == 1
+    assert pending[0]["cmd"] == "strategy_stop"
+    assert pending[0]["magic"] == magic
+    # 取过一次即清空，节点重连只会收到一次
+    assert await store.pop_pending_stops("nd_a") == []
+
+
+async def test_dispatch_rechecks_db_when_busy_lock_expired(store, monkeypatch):
+    """占位 TTL 到期但子任务仍在跑：以库为准跳过，并把占位按真实子任务号续上。"""
+    await online(store, mk_node("nd_a"))
+    group = await mk_group(store, "占位过期组", ["nd_a"])
+    gid = group["group_id"]
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    d = GroupDispatcher(store)
+
+    await d.dispatch(TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_x1")
+    task = (await fetch_tasks("sig_x1"))[0]
+    await open_first_orders(task.task_id, ["nd_a"])
+    dispatch_id = (await fetch_dispatches(task.task_id))[0].id
+
+    await store.release_group_node_busy(gid, "nd_a")  # 模拟占位过期
+    sent.clear()
+
+    res = await d.dispatch(TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_x2")
+
+    assert res["tasks"][0]["status"] == "skipped"
+    assert sent == []
+    assert await store.get_group_node_busy(gid, "nd_a") == str(dispatch_id)
+
+
 async def test_close_signal_without_active_task_is_skipped(store, monkeypatch):
     """分组没有进行中的任务时，CLOSE 无事可做。"""
     await online(store, mk_node("nd_a"))

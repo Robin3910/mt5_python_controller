@@ -258,7 +258,13 @@ async function purgeTradeLogs(): Promise<void> {
   purging.value = true
   try {
     const res = await hub.purgeTradeLogs(PURGE_CONFIRM_TEXT)
-    ElMessage.success(`已清空交易记录（共 ${res.total_deleted} 条）`)
+    const parts = [`已清空交易记录（共 ${res.total_deleted} 条）`]
+    if (res.strategies_stopped) parts.push(`已终止 ${res.strategies_stopped} 个进行中的策略任务`)
+    if (res.strategies_unreachable) {
+      parts.push(`${res.strategies_unreachable} 个任务所在节点离线，请人工确认其 MT5 持仓`)
+    }
+    if (res.strategies_unreachable) ElMessage.warning(parts.join('；'))
+    else ElMessage.success(parts.join('；'))
     await loadGroups()
   } catch (e: unknown) {
     const err = e as { response?: { data?: { detail?: string } }; message?: string }

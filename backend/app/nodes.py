@@ -2,7 +2,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.exc import IntegrityError
 
-from . import node_service, persist
+from . import node_service, persist, risk_control
 from .connections import manager
 from .deps import client_ip, get_current_admin, get_store
 from .models import LotBatch, NodeCreate, NodeOut, NodeUpdate, PaginatedNodeDispatches
@@ -20,6 +20,7 @@ def _node_audit_snapshot(d: dict | None) -> dict | None:
         "name": d.get("name"),
         "enabled": d.get("enabled", True),
         "filters": d.get("filters"),
+        "risk": d.get("risk"),
         "mt5_login": d.get("mt5_login"),
         "mt5_server": d.get("mt5_server"),
     }
@@ -44,6 +45,7 @@ async def _to_node_out(store: RedisStore, d: dict) -> NodeOut:
         # 在线状态以“当前进程内是否有活动连接”为准（单实例下最实时）
         status="online" if manager.is_node_online(d["node_id"]) else "offline",
         filters=d.get("filters"),
+        risk=risk_control.normalize_risk(d.get("risk")),
         mt5_login=d.get("mt5_login"),
         mt5_server=d.get("mt5_server") or acct.get("server"),
         created_at=d.get("created_at", 0),
@@ -122,7 +124,7 @@ async def update_node(
     store: RedisStore = Depends(get_store),
     admin: str = Depends(get_current_admin),
 ):
-    """更新节点配置（手数策略、跟随开关、轮询顺序、启用状态等）。"""
+    """更新节点配置（手数策略、跟随开关、轮询顺序、启用状态、账户级风控等）。"""
     before = _node_audit_snapshot(await store.get_node(node_id))
     try:
         d = await node_service.update_node(store, node_id, body)
@@ -130,6 +132,9 @@ async def update_node(
         raise HTTPException(status_code=400, detail=str(e))
     if not d:
         raise HTTPException(status_code=404, detail="node not found")
+    # 风控配置变更：立即下发给在线节点（离线节点登录时从 auth_ok 拉取）
+    if body.risk is not None:
+        await risk_control.push_risk_config_to_node(node_id, d.get("risk"))
     await persist.audit(
         admin, "update_node", node_id, body.model_dump(exclude_none=True), "ok",
         client_ip(request),

@@ -1,11 +1,101 @@
 // 前后端共享的数据结构定义（与后端 Pydantic 模型一一对应）
 
+export type RiskMonitorMode = 'loop' | 'times'
+export type RiskOrderOp = 'any' | 'gt' | 'gte' | 'eq' | 'lte' | 'lt'
+export type RiskCloseAction = 'all' | 'buy' | 'sell' | 'hedge'
+export type RiskSideAction = 'all' | 'buy' | 'sell'
+
+/** 账户浮盈亏比风控规则 */
+export interface FloatPlRatioRule {
+  enabled: boolean
+  /** 触发比例（%），负数为浮亏侧，正数为浮盈侧 */
+  ratio: number
+  /** 触达后操作，目前仅清仓全部 */
+  action: 'close_all'
+  monitor_mode: RiskMonitorMode
+  max_times: number
+  remaining_times: number
+}
+
+/** 账户净值下限风控规则：净值低于 amount（USD）触发清仓 */
+export interface EquityMinRule {
+  enabled: boolean
+  amount: number
+  action: 'close_all'
+  monitor_mode: RiskMonitorMode
+  max_times: number
+  remaining_times: number
+}
+
+/** 品种盈亏金额 + 订单数条件（可多条） */
+export interface SymbolPlOrderItem {
+  id: string
+  enabled: boolean
+  symbol: string
+  /** 盈亏金额：正=盈利侧达阈值，负=亏损侧达阈值 */
+  pl_amount: number
+  order_op: RiskOrderOp
+  order_count: number
+  close_action: RiskCloseAction
+  monitor_mode: RiskMonitorMode
+  max_times: number
+  remaining_times: number
+}
+
+/** 品种浮盈亏保护（可多条）：先触达触发金额进入保护，再收窄到目标金额平仓 */
+export interface SymbolPlProtectItem {
+  id: string
+  enabled: boolean
+  symbol: string
+  trigger_amount: number
+  narrow_amount: number
+  monitor_mode: RiskMonitorMode
+  max_times: number
+  remaining_times: number
+}
+
+export interface LotPlTier {
+  min_lot: number
+  pl_amount: number
+}
+
+/** 按持仓手数分档 + 盈亏金额平仓 */
+export interface LotPlTiersRule {
+  enabled: boolean
+  batch_count: number
+  close_action: RiskSideAction
+  tiers: LotPlTier[]
+}
+
+/** 节点账户级风控配置 */
+export interface NodeRiskConfig {
+  float_pl_ratio: FloatPlRatioRule
+  equity_min: EquityMinRule
+  symbol_pl_orders: { items: SymbolPlOrderItem[] }
+  symbol_pl_protect: { items: SymbolPlProtectItem[] }
+  lot_pl_tiers: LotPlTiersRule
+}
+
+/** 节点风控执行回报（实时 WS） */
+export interface RiskFeedItem {
+  ts: number
+  rule?: string
+  event?: string
+  message: string
+  success: boolean
+  remaining_times?: number
+  disabled?: boolean
+  current_ratio?: number
+  ratio_threshold?: number
+}
+
 export interface NodeOut {
   node_id: string
   name: string
   enabled: boolean
   status: 'online' | 'offline'
   filters?: NodeDispatchFiltersConfig | null
+  risk?: NodeRiskConfig | null
   mt5_login: number | null
   mt5_server: string | null
   created_at: number
@@ -111,6 +201,7 @@ export interface NodeUpdatePayload {
   name?: string
   enabled?: boolean
   filters?: NodeDispatchFiltersConfig | null
+  risk?: NodeRiskConfig | null
 }
 
 export interface CloseRequest {
@@ -439,6 +530,10 @@ export interface PurgeTradeLogsResult {
   deleted: Record<string, number>
   redis_cleared: number
   total_deleted: number
+  /** 清空前已下发终止指令的策略子任务数 */
+  strategies_stopped: number
+  /** 因节点离线未能下发终止指令的子任务数（其 MT5 持仓需人工确认） */
+  strategies_unreachable: number
 }
 
 /** strategy 链路中单个分组的下发结果 */

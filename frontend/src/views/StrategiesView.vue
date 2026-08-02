@@ -443,6 +443,51 @@ function ruleSummary(rules: StrategyRule[]): string {
     .join(' · ')
 }
 
+const ACTION_LABEL: Record<string, string> = {
+  all: '全部',
+  buy: '多单',
+  sell: '空单',
+}
+
+const CALC_TYPE_LABEL: Record<BatchCalcType, string> = {
+  point: '点数',
+  price: '指定价',
+  atr: 'ATR',
+  range: '波幅',
+}
+
+const expandedIds = ref<Set<string>>(new Set())
+
+function toggleExpand(id: string): void {
+  const next = new Set(expandedIds.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  expandedIds.value = next
+}
+
+function isExpanded(id: string): boolean {
+  return expandedIds.value.has(id)
+}
+
+function actionLabel(action: string | undefined | null): string {
+  const key = String(action || '').toLowerCase()
+  return ACTION_LABEL[key] || action || '—'
+}
+
+function calcTypeLabel(calcType: BatchCalcType | string | undefined): string {
+  const key = (calcType || 'point') as BatchCalcType
+  return CALC_TYPE_LABEL[key] || String(calcType || '点数')
+}
+
+/** 档位间距摘要：按计算方式展示点数 / 价位 / ATR·波幅周期 */
+function levelSpacingText(lv: StrategyBatchLevel): string {
+  const kind = (lv.calc_type || 'point') as BatchCalcType
+  if (kind === 'price') return `价位 ${lv.price ?? 0}`
+  if (kind === 'atr') return `ATR(${lv.timeframe || 'M5'}×${BATCH_BAR_PERIOD})`
+  if (kind === 'range') return `波幅(${lv.timeframe || 'M5'}×${BATCH_BAR_PERIOD})`
+  return `${lv.point ?? 0} 点`
+}
+
 function fmtTime(sec: number | null | undefined): string {
   return sec ? new Date(sec * 1000).toLocaleString() : '—'
 }
@@ -491,9 +536,17 @@ function resetRuleToTemplate(idx: number): void {
 
     <!-- 移动端卡片 -->
     <div class="list-cards mobile-only">
-      <div v-for="s in hub.strategies" :key="s.strategy_id" class="list-card card">
+      <div
+        v-for="s in hub.strategies"
+        :key="s.strategy_id"
+        class="list-card card clickable"
+        @click="toggleExpand(s.strategy_id)"
+      >
         <div class="list-card-head row between">
-          <strong>{{ s.name }}</strong>
+          <strong>
+            <span class="muted" style="margin-right: 6px">{{ isExpanded(s.strategy_id) ? '▾' : '▸' }}</span>
+            {{ s.name }}
+          </strong>
           <span class="tag" :class="s.enabled ? 'green' : ''">{{ s.enabled ? '已启用' : '已禁用' }}</span>
         </div>
         <div class="list-field"><span class="k">策略 ID</span><span class="v muted" style="font-size: 12px">{{ s.strategy_id }}</span></div>
@@ -501,7 +554,54 @@ function resetRuleToTemplate(idx: number): void {
         <div class="list-field"><span class="k">绑定品种</span><span class="v"><code>{{ s.symbol }}</code></span></div>
         <div class="list-field"><span class="k">规则</span><span class="v">{{ ruleSummary(s.rules) }}</span></div>
         <div class="list-field"><span class="k">创建时间</span><span class="v muted" style="font-size: 12px">{{ fmtTime(s.created_at) }}</span></div>
-        <div class="list-card-actions">
+        <div v-if="isExpanded(s.strategy_id)" class="strategy-detail" @click.stop>
+          <div v-if="s.remark" class="muted" style="font-size: 12px; margin-bottom: 8px">备注：{{ s.remark }}</div>
+          <div v-if="!s.rules.length" class="muted" style="font-size: 12px">暂无规则</div>
+          <div v-for="(r, ri) in s.rules" :key="ri" class="strategy-rule-block">
+            <div class="row between" style="margin-bottom: 8px">
+              <strong style="font-size: 13px">{{ RULE_TYPE_LABEL[r.type] || `规则 ${ri + 1}` }}</strong>
+              <span class="tag" :class="r.status === 1 ? 'green' : ''">{{ r.status === 1 ? '启用' : '关闭' }}</span>
+            </div>
+            <div class="kv-grid" style="margin-bottom: 8px">
+              <div class="kv"><span class="k">监控方向</span><span class="v">{{ actionLabel(r.action) }}</span></div>
+              <div class="kv"><span class="k">触发点数</span><span class="v">{{ r.point }}</span></div>
+              <div class="kv"><span class="k">倍数</span><span class="v">{{ r.lot_times }}</span></div>
+              <div class="kv"><span class="k">额外手数</span><span class="v">{{ r.extra_lot }}</span></div>
+              <div class="kv"><span class="k">最大加仓次数</span><span class="v">{{ r.max_allow_num }}</span></div>
+            </div>
+            <template v-if="r.batch_enabled">
+              <div class="muted" style="font-size: 12px; margin-bottom: 6px">
+                分批加仓 · 方向 {{ actionLabel(r.batch_action) }} ·
+                {{ r.batch_count ?? 0 }} 批 · 总手数上限 {{ r.total_lot_limit ?? 0 }}
+              </div>
+              <div v-if="r.batch_levels?.length" class="table-scroll">
+                <table class="strategy-levels-table">
+                  <thead>
+                    <tr>
+                      <th>笔数</th>
+                      <th>计算</th>
+                      <th>间距</th>
+                      <th class="right">倍数</th>
+                      <th class="right">额外手数</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="(lv, li) in r.batch_levels" :key="li">
+                      <td>{{ lv.pos_from }}–{{ lv.pos_to }}</td>
+                      <td>{{ calcTypeLabel(lv.calc_type) }}</td>
+                      <td class="muted" style="font-size: 12px">{{ levelSpacingText(lv) }}</td>
+                      <td class="right">{{ lv.lot_times }}</td>
+                      <td class="right">{{ lv.extra_lot }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              <div v-else class="muted" style="font-size: 12px">暂无分批档位</div>
+            </template>
+            <div v-else class="muted" style="font-size: 12px">分批加仓：未启用</div>
+          </div>
+        </div>
+        <div class="list-card-actions" @click.stop>
           <button class="btn-sm btn-ghost" @click="openEdit(s)">编辑</button>
           <button class="btn-sm" :class="s.enabled ? 'btn-ghost' : 'btn-danger'" @click="toggleEnabled(s)">
             {{ s.enabled ? '禁用' : '启用' }}
@@ -519,6 +619,7 @@ function resetRuleToTemplate(idx: number): void {
       <table>
         <thead>
           <tr>
+            <th style="width: 28px"></th>
             <th>名称</th>
             <th>模版</th>
             <th>绑定品种</th>
@@ -529,29 +630,88 @@ function resetRuleToTemplate(idx: number): void {
           </tr>
         </thead>
         <tbody>
-          <tr v-for="s in hub.strategies" :key="s.strategy_id">
-            <td>
-              {{ s.name }}
-              <div class="muted" style="font-size: 11px">{{ s.strategy_id }}</div>
-            </td>
-            <td><span class="tag blue">{{ s.template_name }}</span></td>
-            <td><code>{{ s.symbol }}</code></td>
-            <td class="muted" style="font-size: 12px">{{ ruleSummary(s.rules) }}</td>
-            <td class="muted" style="font-size: 12px">{{ fmtTime(s.created_at) }}</td>
-            <td>
-              <button class="btn-sm" :class="s.enabled ? 'btn-ghost' : 'btn-danger'" @click="toggleEnabled(s)">
-                {{ s.enabled ? '已启用' : '已禁用' }}
-              </button>
-            </td>
-            <td class="right">
-              <div class="row" style="gap: 6px; justify-content: flex-end">
-                <button class="btn-sm btn-ghost" @click="openEdit(s)">编辑</button>
-                <button class="btn-sm btn-danger" @click="remove(s)">删除</button>
-              </div>
-            </td>
-          </tr>
+          <template v-for="s in hub.strategies" :key="s.strategy_id">
+            <tr class="clickable" @click="toggleExpand(s.strategy_id)">
+              <td class="muted">{{ isExpanded(s.strategy_id) ? '▾' : '▸' }}</td>
+              <td>
+                {{ s.name }}
+                <div class="muted" style="font-size: 11px">{{ s.strategy_id }}</div>
+              </td>
+              <td><span class="tag blue">{{ s.template_name }}</span></td>
+              <td><code>{{ s.symbol }}</code></td>
+              <td class="muted" style="font-size: 12px">{{ ruleSummary(s.rules) }}</td>
+              <td class="muted" style="font-size: 12px">{{ fmtTime(s.created_at) }}</td>
+              <td @click.stop>
+                <button class="btn-sm" :class="s.enabled ? 'btn-ghost' : 'btn-danger'" @click="toggleEnabled(s)">
+                  {{ s.enabled ? '已启用' : '已禁用' }}
+                </button>
+              </td>
+              <td class="right" @click.stop>
+                <div class="row" style="gap: 6px; justify-content: flex-end">
+                  <button class="btn-sm btn-ghost" @click="openEdit(s)">编辑</button>
+                  <button class="btn-sm btn-danger" @click="remove(s)">删除</button>
+                </div>
+              </td>
+            </tr>
+            <tr v-if="isExpanded(s.strategy_id)" class="detail-row">
+              <td></td>
+              <td colspan="7">
+                <div class="strategy-detail">
+                  <div v-if="s.remark" class="muted" style="font-size: 12px; margin-bottom: 10px">
+                    备注：{{ s.remark }}
+                  </div>
+                  <div v-if="!s.rules.length" class="muted" style="font-size: 12px">暂无规则</div>
+                  <div v-for="(r, ri) in s.rules" :key="ri" class="strategy-rule-block">
+                    <div class="row between" style="margin-bottom: 8px">
+                      <strong style="font-size: 13px">{{ RULE_TYPE_LABEL[r.type] || `规则 ${ri + 1}` }}</strong>
+                      <span class="tag" :class="r.status === 1 ? 'green' : ''">
+                        {{ r.status === 1 ? '启用' : '关闭' }}
+                      </span>
+                    </div>
+                    <div class="kv-grid" style="margin-bottom: 8px">
+                      <div class="kv"><span class="k">监控方向</span><span class="v">{{ actionLabel(r.action) }}</span></div>
+                      <div class="kv"><span class="k">触发点数</span><span class="v">{{ r.point }}</span></div>
+                      <div class="kv"><span class="k">倍数</span><span class="v">{{ r.lot_times }}</span></div>
+                      <div class="kv"><span class="k">额外手数</span><span class="v">{{ r.extra_lot }}</span></div>
+                      <div class="kv"><span class="k">最大加仓次数</span><span class="v">{{ r.max_allow_num }}</span></div>
+                    </div>
+                    <template v-if="r.batch_enabled">
+                      <div class="muted" style="font-size: 12px; margin-bottom: 6px">
+                        分批加仓 · 方向 {{ actionLabel(r.batch_action) }} ·
+                        {{ r.batch_count ?? 0 }} 批 · 总手数上限 {{ r.total_lot_limit ?? 0 }}
+                      </div>
+                      <div v-if="r.batch_levels?.length" class="table-scroll">
+                        <table class="strategy-levels-table">
+                          <thead>
+                            <tr>
+                              <th>笔数区间</th>
+                              <th>计算方式</th>
+                              <th>间距</th>
+                              <th class="right">倍数</th>
+                              <th class="right">额外手数</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            <tr v-for="(lv, li) in r.batch_levels" :key="li">
+                              <td>{{ lv.pos_from }}–{{ lv.pos_to }}</td>
+                              <td>{{ calcTypeLabel(lv.calc_type) }}</td>
+                              <td class="muted" style="font-size: 12px">{{ levelSpacingText(lv) }}</td>
+                              <td class="right">{{ lv.lot_times }}</td>
+                              <td class="right">{{ lv.extra_lot }}</td>
+                            </tr>
+                          </tbody>
+                        </table>
+                      </div>
+                      <div v-else class="muted" style="font-size: 12px">暂无分批档位</div>
+                    </template>
+                    <div v-else class="muted" style="font-size: 12px">分批加仓：未启用</div>
+                  </div>
+                </div>
+              </td>
+            </tr>
+          </template>
           <tr v-if="!hub.strategies.length && !loading">
-            <td colspan="7" class="muted" style="padding: 18px">
+            <td colspan="8" class="muted" style="padding: 18px">
               {{ appliedQuery ? '无匹配策略' : '暂无策略，点击右上角「新增策略」开始配置' }}
             </td>
           </tr>
@@ -560,7 +720,7 @@ function resetRuleToTemplate(idx: number): void {
     </div>
 
     <!-- 新建 / 编辑策略弹窗 -->
-    <div v-if="showForm" class="modal-mask" @click.self="showForm = false">
+    <div v-if="showForm" class="modal-mask">
       <div class="card modal modal-lg strategy-form-modal">
         <div class="modal-header card-pad" style="padding-bottom: 0">
           <div class="h1">{{ isEditMode ? '编辑策略' : '新增策略' }}</div>
@@ -1097,5 +1257,38 @@ function resetRuleToTemplate(idx: number): void {
   .batch-level {
     grid-template-columns: 1fr 1fr;
   }
+}
+
+.strategy-detail {
+  margin: 6px 0 4px;
+}
+
+.strategy-rule-block {
+  margin-bottom: 12px;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-soft);
+  border: 1px solid var(--glass-border);
+}
+
+.strategy-rule-block:last-child {
+  margin-bottom: 0;
+}
+
+.strategy-levels-table {
+  width: 100%;
+  margin-top: 4px;
+}
+
+.strategy-levels-table th,
+.strategy-levels-table td {
+  padding: 6px 8px;
+  font-size: 12px;
+}
+
+.list-card .strategy-detail {
+  margin: 10px 0;
+  padding-top: 8px;
+  border-top: 1px dashed var(--glass-border);
 }
 </style>

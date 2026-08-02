@@ -124,6 +124,43 @@ async def test_close_ticket_includes_symbol():
     assert str(ticket) in tr["data"]["detail"]
 
 
+async def test_strategy_stop_without_runner_closes_by_magic():
+    """服务端补发的终止指令：本地没有监控时按魔术号平掉残留持仓并回报。"""
+    n = _node()
+    await n._exec(n.mt5.connect)
+    await n._exec(
+        n.mt5.place_market_order, "XAUUSD", "BUY", 0.1, None, None, "", 900000123,
+    )
+    ws = FakeWS()
+
+    await n._handle(ws, {
+        "cmd": "strategy_stop", "task_id": 123, "magic": 900000123,
+        "group_id": "g1", "signal_id": "s1", "symbol": "XAUUSD",
+        "reason": "close_signal",
+    })
+
+    assert n.mt5.positions_by_magic(900000123) == []
+    fin = [m for m in ws.sent if m["type"] == "strategy_finished"]
+    assert len(fin) == 1
+    assert fin[0]["data"]["status"] == "done"
+    assert fin[0]["data"]["task_id"] == 123
+    # 不回传累计单量，避免把服务端已有统计覆盖成 0
+    assert "total_orders" not in fin[0]["data"]
+
+
+async def test_strategy_stop_without_magic_is_ignored():
+    """没有魔术号无从定位持仓，忽略而不是误平其它单。"""
+    n = _node()
+    await n._exec(n.mt5.connect)
+    await n._exec(n.mt5.place_market_order, "EURUSD", "BUY", 0.1)
+    ws = FakeWS()
+
+    await n._handle(ws, {"cmd": "strategy_stop", "task_id": 404})
+
+    assert len(n.mt5.positions()) == 1
+    assert ws.sent == []
+
+
 async def test_snapshot_shape():
     n = _node()
     await n._exec(n.mt5.connect)

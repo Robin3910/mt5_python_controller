@@ -1,11 +1,25 @@
 <script setup lang="ts">
 // 节点详情页：Tab + 列表展示单个节点上报的数据
-// （概览 / 持仓 / 报价 / 成交回报）。账户与持仓走 WS 实时刷新，
-// 成交回报 = 持久化历史 + 本会话实时回报合并。
-import { computed, onMounted, ref, watch } from 'vue'
+// （概览 / 账户级风控 / 持仓 / 报价 / 信号 / 成交回报）。
+// 账户与持仓走 WS 实时刷新；成交回报 = 持久化历史 + 本会话实时回报合并。
+// 账户级风控：保存后 PATCH 并经 WS 下发节点，节点本地监控后回报 risk_event。
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useHubStore } from '@/stores/hub'
-import type { AccountSnapshot, NodeDispatchRecord, NodeFeedItem, NodeOut } from '@/api/types'
+import type {
+  AccountSnapshot,
+  LotPlTiersRule,
+  NodeDispatchRecord,
+  NodeFeedItem,
+  NodeOut,
+  NodeRiskConfig,
+  RiskCloseAction,
+  RiskMonitorMode,
+  RiskOrderOp,
+  RiskSideAction,
+  SymbolPlOrderItem,
+  SymbolPlProtectItem,
+} from '@/api/types'
 import { parseNodeDispatchFilters } from '@/utils/filterRules'
 import { confirmAction } from '@/utils/confirm'
 
@@ -20,15 +34,347 @@ const nodeDispatchSymbols = computed(() => Object.keys(nodeDispatchFilters.value
 const acct = computed<AccountSnapshot | undefined>(() => hub.accounts[id.value])
 const statusOf = computed(() => hub.statuses[id.value] || node.value?.status || 'offline')
 
-type TabKey = 'overview' | 'positions' | 'prices' | 'signals' | 'feed'
+type TabKey = 'overview' | 'risk' | 'positions' | 'prices' | 'signals' | 'feed'
 const tab = ref<TabKey>('overview')
 const tabs: { key: TabKey; label: string }[] = [
   { key: 'overview', label: '概览' },
+  { key: 'risk', label: '账户级风控' },
   { key: 'positions', label: '持仓' },
   { key: 'prices', label: '报价' },
   { key: 'signals', label: '信号' },
   { key: 'feed', label: '成交回报' },
 ]
+
+function newRiskId(): string {
+  return Math.random().toString(16).slice(2, 14)
+}
+
+function cloneMonitorMode(mode: string | undefined): RiskMonitorMode {
+  return mode === 'times' ? 'times' : 'loop'
+}
+
+interface TimesFields {
+  enabled: boolean
+  monitor_mode: RiskMonitorMode
+  max_times: number
+  remaining_times: number
+}
+
+/** 保存时保留已消耗的剩余次数：只有重新启用、切到指定次数或改了总次数才重置 */
+function withTimesFields<T extends TimesFields>(
+  rule: T,
+  original?: T | null,
+): TimesFields {
+  const maxTimes = Math.max(1, Math.floor(Number(rule.max_times) || 1))
+  const mode = cloneMonitorMode(rule.monitor_mode)
+  const base = {
+    enabled: Boolean(rule.enabled),
+    monitor_mode: mode,
+    max_times: maxTimes,
+  }
+  if (!base.enabled || mode !== 'times') {
+    return { ...base, remaining_times: 0 }
+  }
+  const wasCounting = Boolean(original?.enabled) && original?.monitor_mode === 'times'
+  const sameMax = Math.max(1, Math.floor(Number(original?.max_times) || 1)) === maxTimes
+  const left = Math.max(0, Math.floor(Number(original?.remaining_times) || 0))
+  return {
+    ...base,
+    remaining_times: wasCounting && sameMax && left > 0 ? left : maxTimes,
+  }
+}
+
+function defaultSymbolPlOrder(): SymbolPlOrderItem {
+  return {
+    id: newRiskId(),
+    enabled: true,
+    symbol: '',
+    pl_amount: 100,
+    order_op: 'any',
+    order_count: 0,
+    close_action: 'all',
+    monitor_mode: 'loop',
+    max_times: 1,
+    remaining_times: 0,
+  }
+}
+
+function defaultSymbolPlProtect(): SymbolPlProtectItem {
+  return {
+    id: newRiskId(),
+    enabled: true,
+    symbol: '',
+    trigger_amount: -100,
+    narrow_amount: -50,
+    monitor_mode: 'loop',
+    max_times: 1,
+    remaining_times: 0,
+  }
+}
+
+function defaultLotPlTiers(): LotPlTiersRule {
+  return {
+    enabled: false,
+    batch_count: 2,
+    close_action: 'all',
+    tiers: [
+      { min_lot: 0.1, pl_amount: 50 },
+      { min_lot: 0.5, pl_amount: 100 },
+    ],
+  }
+}
+
+function rebuildLotTiers(count: number, prev: LotPlTiersRule['tiers']): LotPlTiersRule['tiers'] {
+  const n = Math.max(1, Math.min(10, Math.floor(count) || 2))
+  const tiers = []
+  for (let i = 0; i < n; i++) {
+    const old = prev[i]
+    tiers.push({
+      min_lot: Number(old?.min_lot ?? 0.1 * (i + 1)),
+      pl_amount: Number(old?.pl_amount ?? 50 * (i + 1)),
+    })
+  }
+  return tiers
+}
+
+function cloneRisk(src?: NodeRiskConfig | null): NodeRiskConfig {
+  const pl = src?.float_pl_ratio
+  const eq = src?.equity_min
+  const spo = src?.symbol_pl_orders?.items || []
+  const spp = src?.symbol_pl_protect?.items || []
+  const lpt = src?.lot_pl_tiers
+  const batchCount = Math.max(1, Math.min(10, Math.floor(Number(lpt?.batch_count) || 2)))
+  return {
+    float_pl_ratio: {
+      enabled: Boolean(pl?.enabled),
+      ratio: Number(pl?.ratio ?? -20),
+      action: 'close_all',
+      monitor_mode: cloneMonitorMode(pl?.monitor_mode),
+      max_times: Math.max(1, Math.floor(Number(pl?.max_times) || 1)),
+      remaining_times: Math.max(0, Math.floor(Number(pl?.remaining_times) || 0)),
+    },
+    equity_min: {
+      enabled: Boolean(eq?.enabled),
+      amount: Number(eq?.amount ?? 1000),
+      action: 'close_all',
+      monitor_mode: cloneMonitorMode(eq?.monitor_mode),
+      max_times: Math.max(1, Math.floor(Number(eq?.max_times) || 1)),
+      remaining_times: Math.max(0, Math.floor(Number(eq?.remaining_times) || 0)),
+    },
+    symbol_pl_orders: {
+      items: spo.map((it) => ({
+        id: String(it.id || newRiskId()),
+        enabled: Boolean(it.enabled),
+        symbol: String(it.symbol || '').toUpperCase(),
+        pl_amount: Number(it.pl_amount ?? 100),
+        order_op: (['any', 'gt', 'gte', 'eq', 'lte', 'lt'].includes(it.order_op)
+          ? it.order_op
+          : 'any') as RiskOrderOp,
+        order_count: Math.max(0, Math.floor(Number(it.order_count) || 0)),
+        close_action: (['all', 'buy', 'sell', 'hedge'].includes(it.close_action)
+          ? it.close_action
+          : 'all') as RiskCloseAction,
+        monitor_mode: cloneMonitorMode(it.monitor_mode),
+        max_times: Math.max(1, Math.floor(Number(it.max_times) || 1)),
+        remaining_times: Math.max(0, Math.floor(Number(it.remaining_times) || 0)),
+      })),
+    },
+    symbol_pl_protect: {
+      items: spp.map((it) => ({
+        id: String(it.id || newRiskId()),
+        enabled: Boolean(it.enabled),
+        symbol: String(it.symbol || '').toUpperCase(),
+        trigger_amount: Number(it.trigger_amount ?? -100),
+        narrow_amount: Number(it.narrow_amount ?? -50),
+        monitor_mode: cloneMonitorMode(it.monitor_mode),
+        max_times: Math.max(1, Math.floor(Number(it.max_times) || 1)),
+        remaining_times: Math.max(0, Math.floor(Number(it.remaining_times) || 0)),
+      })),
+    },
+    lot_pl_tiers: {
+      enabled: Boolean(lpt?.enabled),
+      batch_count: batchCount,
+      close_action: (['all', 'buy', 'sell'].includes(String(lpt?.close_action))
+        ? lpt!.close_action
+        : 'all') as RiskSideAction,
+      tiers: rebuildLotTiers(batchCount, lpt?.tiers || defaultLotPlTiers().tiers),
+    },
+  }
+}
+
+const riskForm = reactive<NodeRiskConfig>(cloneRisk())
+const riskSaving = ref(false)
+const riskError = ref('')
+const riskFeed = computed(() => hub.riskFeed[id.value] ?? [])
+
+function syncRiskFormFromNode(): void {
+  const next = cloneRisk(node.value?.risk)
+  riskForm.float_pl_ratio = { ...next.float_pl_ratio }
+  riskForm.equity_min = { ...next.equity_min }
+  riskForm.symbol_pl_orders = { items: next.symbol_pl_orders.items.map((x) => ({ ...x })) }
+  riskForm.symbol_pl_protect = { items: next.symbol_pl_protect.items.map((x) => ({ ...x })) }
+  riskForm.lot_pl_tiers = {
+    ...next.lot_pl_tiers,
+    tiers: next.lot_pl_tiers.tiers.map((t) => ({ ...t })),
+  }
+}
+
+watch(
+  () => node.value?.risk,
+  () => {
+    if (tab.value === 'risk' && !riskSaving.value) syncRiskFormFromNode()
+  },
+  { deep: true },
+)
+
+watch(tab, (key) => {
+  if (key === 'risk') syncRiskFormFromNode()
+})
+
+watch(
+  () => riskForm.lot_pl_tiers.batch_count,
+  (n) => {
+    const next = Math.max(1, Math.min(10, Math.floor(Number(n) || 2)))
+    if (next !== n) {
+      // 回写会再次触发本 watch，档位交给下一轮重建，避免重复计算
+      riskForm.lot_pl_tiers.batch_count = next
+      return
+    }
+    riskForm.lot_pl_tiers.tiers = rebuildLotTiers(next, riskForm.lot_pl_tiers.tiers)
+  },
+)
+
+const liveFloatRatio = computed(() => {
+  const bal = acct.value?.balance
+  const eq = acct.value?.equity
+  if (bal == null || eq == null || bal <= 0) return null
+  return ((eq - bal) / bal) * 100
+})
+
+function validateRiskForm(): string | null {
+  const r = riskForm.float_pl_ratio
+  if (!Number.isFinite(r.ratio) || r.ratio === 0) return '账户盈亏比比例不能为 0'
+  const e = riskForm.equity_min
+  if (!Number.isFinite(e.amount) || e.amount <= 0) return '账户净值金额必须大于 0'
+
+  for (let i = 0; i < riskForm.symbol_pl_orders.items.length; i++) {
+    const it = riskForm.symbol_pl_orders.items[i]
+    const label = `品种盈亏条件#${i + 1}`
+    if (it.enabled && !String(it.symbol || '').trim()) return `${label}请填写品种`
+    if (!Number.isFinite(it.pl_amount) || it.pl_amount === 0) return `${label}盈亏金额不能为 0`
+  }
+  for (let i = 0; i < riskForm.symbol_pl_protect.items.length; i++) {
+    const it = riskForm.symbol_pl_protect.items[i]
+    const label = `浮盈亏保护#${i + 1}`
+    if (it.enabled && !String(it.symbol || '').trim()) return `${label}请填写品种`
+    const t = Number(it.trigger_amount)
+    const n = Number(it.narrow_amount)
+    if (!Number.isFinite(t) || !Number.isFinite(n) || t === 0 || n === 0) {
+      return `${label}触发/收窄金额不能为 0`
+    }
+    if (t > 0 && n > 0) {
+      if (!(t > n)) return `${label}盈利保护要求：触发金额 > 收窄金额 > 0`
+    } else if (t < 0 && n < 0) {
+      if (!(t < n)) return `${label}亏损保护要求：触发金额 < 收窄金额 < 0`
+    } else {
+      return `${label}触发与收窄须同为正或同为负`
+    }
+  }
+  for (let i = 0; i < riskForm.lot_pl_tiers.tiers.length; i++) {
+    const tier = riskForm.lot_pl_tiers.tiers[i]
+    if (!Number.isFinite(tier.min_lot) || tier.min_lot < 0) return `分档批次#${i + 1}手数无效`
+    if (!Number.isFinite(tier.pl_amount) || tier.pl_amount === 0) {
+      return `分档批次#${i + 1}盈亏金额不能为 0`
+    }
+  }
+  return null
+}
+
+async function saveRisk(): Promise<void> {
+  const err = validateRiskForm()
+  if (err) {
+    riskError.value = err
+    return
+  }
+  // 以节点当前配置为基准判断次数是否需要重置，避免改一个字段就把
+  // 其它规则已经消耗掉的剩余次数恢复成满值
+  const saved = cloneRisk(node.value?.risk)
+  const savedOrders = new Map(saved.symbol_pl_orders.items.map((x) => [x.id, x]))
+  const savedProtect = new Map(saved.symbol_pl_protect.items.map((x) => [x.id, x]))
+
+  const payload: NodeRiskConfig = {
+    float_pl_ratio: {
+      ...riskForm.float_pl_ratio,
+      ...withTimesFields(riskForm.float_pl_ratio, saved.float_pl_ratio),
+      ratio: Number(riskForm.float_pl_ratio.ratio),
+      action: 'close_all',
+    },
+    equity_min: {
+      ...riskForm.equity_min,
+      ...withTimesFields(riskForm.equity_min, saved.equity_min),
+      amount: Number(riskForm.equity_min.amount),
+      action: 'close_all',
+    },
+    symbol_pl_orders: {
+      items: riskForm.symbol_pl_orders.items.map((it) => ({
+        ...it,
+        ...withTimesFields(it, savedOrders.get(it.id)),
+        id: it.id || newRiskId(),
+        symbol: String(it.symbol || '').trim().toUpperCase(),
+        pl_amount: Number(it.pl_amount),
+        order_count: Math.max(0, Math.floor(Number(it.order_count) || 0)),
+      })),
+    },
+    symbol_pl_protect: {
+      items: riskForm.symbol_pl_protect.items.map((it) => ({
+        ...it,
+        ...withTimesFields(it, savedProtect.get(it.id)),
+        id: it.id || newRiskId(),
+        symbol: String(it.symbol || '').trim().toUpperCase(),
+        trigger_amount: Number(it.trigger_amount),
+        narrow_amount: Number(it.narrow_amount),
+      })),
+    },
+    lot_pl_tiers: {
+      enabled: Boolean(riskForm.lot_pl_tiers.enabled),
+      batch_count: riskForm.lot_pl_tiers.batch_count,
+      close_action: riskForm.lot_pl_tiers.close_action,
+      tiers: riskForm.lot_pl_tiers.tiers.map((t) => ({
+        min_lot: Number(t.min_lot),
+        pl_amount: Number(t.pl_amount),
+      })),
+    },
+  }
+  if (!(await confirmAction('确认保存账户级风控配置？\n\n在线节点将立即下发并生效。', '确认保存'))) {
+    return
+  }
+  riskSaving.value = true
+  riskError.value = ''
+  try {
+    await hub.updateNode(id.value, { risk: payload })
+    syncRiskFormFromNode()
+  } catch (e: unknown) {
+    const ax = e as { response?: { data?: { detail?: string } } }
+    riskError.value = ax?.response?.data?.detail || '保存失败，请稍后重试'
+  } finally {
+    riskSaving.value = false
+  }
+}
+
+function addSymbolPlOrder(): void {
+  if (riskForm.symbol_pl_orders.items.length >= 20) return
+  riskForm.symbol_pl_orders.items.push(defaultSymbolPlOrder())
+}
+function removeSymbolPlOrder(idx: number): void {
+  riskForm.symbol_pl_orders.items.splice(idx, 1)
+}
+function addSymbolPlProtect(): void {
+  if (riskForm.symbol_pl_protect.items.length >= 20) return
+  riskForm.symbol_pl_protect.items.push(defaultSymbolPlProtect())
+}
+function removeSymbolPlProtect(idx: number): void {
+  riskForm.symbol_pl_protect.items.splice(idx, 1)
+}
 
 const history = ref<NodeDispatchRecord[]>([])
 const historyPage = ref(1)
@@ -300,6 +646,221 @@ async function closeTicket(ticket: number): Promise<void> {
                   <span class="muted" style="font-size: 12px">序 {{ nodeDispatchFilters[sym]?.poll_order ?? 0 }}</span>
                 </span>
               </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 账户级风控 -->
+      <div v-else-if="tab === 'risk'">
+        <div class="card card-pad" style="margin-bottom: 16px">
+          <div class="row between" style="margin-bottom: 12px; align-items: flex-start">
+            <div>
+              <strong>账户级风控</strong>
+              <p class="muted" style="font-size: 12px; margin: 4px 0 0">
+                多条规则共用下方「保存」；在线节点登录成功或保存后立即下发，由节点本地监控并回报执行结果
+              </p>
+            </div>
+            <button class="btn-primary btn-sm" :disabled="riskSaving" @click="saveRisk">
+              {{ riskSaving ? '保存中…' : '保存' }}
+            </button>
+          </div>
+          <p v-if="riskError" style="font-size: 12px; margin: 0 0 10px; color: #f87171">{{ riskError }}</p>
+
+          <div class="risk-rules">
+            <!-- 账户盈亏比 -->
+            <div class="risk-rule-row">
+              <label class="risk-switch">
+                <input v-model="riskForm.float_pl_ratio.enabled" type="checkbox" />
+                <span>账户盈亏比</span>
+              </label>
+              <input v-model.number="riskForm.float_pl_ratio.ratio" type="number" step="0.1" class="risk-ratio-input" />
+              <span class="muted" style="font-size: 13px">% ，清仓全部</span>
+              <select v-model="riskForm.float_pl_ratio.monitor_mode" class="risk-mode-select">
+                <option value="loop">循环</option>
+                <option value="times">指定次数</option>
+              </select>
+              <template v-if="riskForm.float_pl_ratio.monitor_mode === 'times'">
+                <input v-model.number="riskForm.float_pl_ratio.max_times" type="number" min="1" class="risk-times-input" />
+                <span class="muted" style="font-size: 12px">次</span>
+              </template>
+            </div>
+
+            <!-- 账户净值 -->
+            <div class="risk-rule-row">
+              <label class="risk-switch">
+                <input v-model="riskForm.equity_min.enabled" type="checkbox" />
+                <span>账户净值</span>
+              </label>
+              <span class="muted" style="font-size: 13px">小于</span>
+              <input v-model.number="riskForm.equity_min.amount" type="number" min="0.01" step="1" class="risk-ratio-input" />
+              <span class="muted" style="font-size: 13px">USD ，清仓全部</span>
+              <select v-model="riskForm.equity_min.monitor_mode" class="risk-mode-select">
+                <option value="loop">循环</option>
+                <option value="times">指定次数</option>
+              </select>
+              <template v-if="riskForm.equity_min.monitor_mode === 'times'">
+                <input v-model.number="riskForm.equity_min.max_times" type="number" min="1" class="risk-times-input" />
+                <span class="muted" style="font-size: 12px">次</span>
+              </template>
+            </div>
+
+            <!-- 品种盈亏 + 订单数 -->
+            <div class="risk-block">
+              <div class="row between" style="margin-bottom: 8px">
+                <strong style="font-size: 13px">品种盈亏条件</strong>
+                <button type="button" class="btn-sm btn-ghost" @click="addSymbolPlOrder">+ 添加</button>
+              </div>
+              <p class="muted" style="font-size: 12px; margin: 0 0 8px">
+                指定品种浮盈亏达到金额，且订单数满足条件时，按动作平仓（可多条）
+              </p>
+              <div v-if="!riskForm.symbol_pl_orders.items.length" class="muted" style="font-size: 12px">暂无条目</div>
+              <div
+                v-for="(it, idx) in riskForm.symbol_pl_orders.items"
+                :key="it.id"
+                class="risk-rule-row risk-rule-row-wrap"
+              >
+                <label class="risk-switch">
+                  <input v-model="it.enabled" type="checkbox" />
+                </label>
+                <input v-model="it.symbol" type="text" placeholder="品种" class="risk-symbol-input" />
+                <span class="muted" style="font-size: 12px">盈亏</span>
+                <input v-model.number="it.pl_amount" type="number" step="1" class="risk-ratio-input" />
+                <select v-model="it.order_op" class="risk-mode-select">
+                  <option value="any">订单不限</option>
+                  <option value="gt">订单 &gt;</option>
+                  <option value="gte">订单 &gt;=</option>
+                  <option value="eq">订单 =</option>
+                  <option value="lte">订单 &lt;=</option>
+                  <option value="lt">订单 &lt;</option>
+                </select>
+                <input
+                  v-model.number="it.order_count"
+                  type="number"
+                  min="0"
+                  class="risk-times-input"
+                  :disabled="it.order_op === 'any'"
+                />
+                <select v-model="it.close_action" class="risk-mode-select">
+                  <option value="all">全部平仓</option>
+                  <option value="buy">多单平仓</option>
+                  <option value="sell">空单平仓</option>
+                  <option value="hedge">锁单平仓</option>
+                </select>
+                <select v-model="it.monitor_mode" class="risk-mode-select">
+                  <option value="loop">循环</option>
+                  <option value="times">指定次数</option>
+                </select>
+                <template v-if="it.monitor_mode === 'times'">
+                  <input v-model.number="it.max_times" type="number" min="1" class="risk-times-input" />
+                  <span class="muted" style="font-size: 12px">次</span>
+                </template>
+                <button type="button" class="btn-sm btn-danger" @click="removeSymbolPlOrder(idx)">删除</button>
+              </div>
+            </div>
+
+            <!-- 浮盈亏保护 -->
+            <div class="risk-block">
+              <div class="row between" style="margin-bottom: 8px">
+                <strong style="font-size: 13px">浮盈亏保护</strong>
+                <button type="button" class="btn-sm btn-ghost" @click="addSymbolPlProtect">+ 添加</button>
+              </div>
+              <p class="muted" style="font-size: 12px; margin: 0 0 8px">
+                浮亏/浮盈先达到触发金额进入保护，之后收窄到目标金额则平仓（盈亏同套状态机，可多条）
+              </p>
+              <div v-if="!riskForm.symbol_pl_protect.items.length" class="muted" style="font-size: 12px">暂无条目</div>
+              <div
+                v-for="(it, idx) in riskForm.symbol_pl_protect.items"
+                :key="it.id"
+                class="risk-rule-row risk-rule-row-wrap"
+              >
+                <label class="risk-switch">
+                  <input v-model="it.enabled" type="checkbox" />
+                </label>
+                <input v-model="it.symbol" type="text" placeholder="品种" class="risk-symbol-input" />
+                <span class="muted" style="font-size: 12px">触发</span>
+                <input v-model.number="it.trigger_amount" type="number" step="1" class="risk-ratio-input" />
+                <span class="muted" style="font-size: 12px">收窄</span>
+                <input v-model.number="it.narrow_amount" type="number" step="1" class="risk-ratio-input" />
+                <select v-model="it.monitor_mode" class="risk-mode-select">
+                  <option value="loop">循环</option>
+                  <option value="times">指定次数</option>
+                </select>
+                <template v-if="it.monitor_mode === 'times'">
+                  <input v-model.number="it.max_times" type="number" min="1" class="risk-times-input" />
+                  <span class="muted" style="font-size: 12px">次</span>
+                </template>
+                <button type="button" class="btn-sm btn-danger" @click="removeSymbolPlProtect(idx)">删除</button>
+              </div>
+            </div>
+
+            <!-- 分档手数盈亏 -->
+            <div class="risk-block">
+              <div class="risk-rule-row risk-rule-row-wrap">
+                <label class="risk-switch">
+                  <input v-model="riskForm.lot_pl_tiers.enabled" type="checkbox" />
+                  <span>分档手数盈亏</span>
+                </label>
+                <span class="muted" style="font-size: 12px">批次</span>
+                <input
+                  v-model.number="riskForm.lot_pl_tiers.batch_count"
+                  type="number"
+                  min="1"
+                  max="10"
+                  class="risk-times-input"
+                />
+                <select v-model="riskForm.lot_pl_tiers.close_action" class="risk-mode-select">
+                  <option value="all">全部</option>
+                  <option value="buy">多单</option>
+                  <option value="sell">空单</option>
+                </select>
+              </div>
+              <div
+                v-for="(tier, idx) in riskForm.lot_pl_tiers.tiers"
+                :key="idx"
+                class="risk-rule-row"
+                style="margin-top: 8px"
+              >
+                <span class="muted" style="font-size: 12px; min-width: 52px">批次{{ idx + 1 }}</span>
+                <span class="muted" style="font-size: 12px">总 lot &gt;=</span>
+                <input v-model.number="tier.min_lot" type="number" min="0" step="0.01" class="risk-ratio-input" />
+                <span class="muted" style="font-size: 12px">盈亏金额 &gt;=</span>
+                <input v-model.number="tier.pl_amount" type="number" step="1" class="risk-ratio-input" />
+              </div>
+              <p class="muted" style="font-size: 12px; margin: 8px 0 0">
+                按所选方向统计总手数与浮盈亏；负的盈亏金额表示亏损侧达阈值。优先匹配更高批次。
+              </p>
+            </div>
+          </div>
+
+          <p class="muted" style="font-size: 12px; margin: 10px 0 0">
+            指定次数耗尽后自动关闭对应条目开关并清空剩余次数。保存后在线节点立即生效。
+          </p>
+          <p v-if="liveFloatRatio != null || acct" class="muted" style="font-size: 12px; margin: 6px 0 0">
+            <span v-if="liveFloatRatio != null">
+              当前浮盈亏比：
+              <span :style="{ color: liveFloatRatio < 0 ? 'var(--danger, #f66)' : 'var(--ok, #3c9)' }">
+                {{ liveFloatRatio.toFixed(2) }}%
+              </span>
+            </span>
+            <span v-if="acct" :style="liveFloatRatio != null ? 'margin-left: 12px' : ''">
+              当前净值：{{ fmt(acct.equity) }} USD
+            </span>
+          </p>
+        </div>
+
+        <div class="card card-pad">
+          <strong style="font-size: 13px">执行结果</strong>
+          <div v-if="!riskFeed.length" class="muted" style="font-size: 12px; margin-top: 8px">
+            暂无触发记录（节点触发后将实时显示）
+          </div>
+          <div v-else class="risk-feed-list">
+            <div v-for="(ev, i) in riskFeed" :key="i" class="risk-feed-item">
+              <div class="row between">
+                <span class="tag" :class="ev.success ? 'green' : 'red'">{{ ev.success ? '已执行' : '失败' }}</span>
+                <span class="muted" style="font-size: 11px">{{ fmtTime(ev.ts) }}</span>
+              </div>
+              <div style="font-size: 13px; margin-top: 6px">{{ ev.message }}</div>
             </div>
           </div>
         </div>
@@ -678,3 +1239,72 @@ async function closeTicket(ticket: number): Promise<void> {
     </template>
   </div>
 </template>
+
+<style scoped>
+.risk-rules {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.risk-rule-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-soft);
+  border: 1px solid var(--glass-border);
+}
+
+.risk-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+}
+
+.risk-ratio-input,
+.risk-times-input {
+  width: 88px;
+}
+
+.risk-symbol-input {
+  width: 96px;
+  text-transform: uppercase;
+}
+
+.risk-mode-select {
+  width: auto;
+  min-width: 110px;
+}
+
+.risk-block {
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-soft);
+  border: 1px solid var(--glass-border);
+}
+
+.risk-rule-row-wrap {
+  background: rgba(0, 0, 0, 0.12);
+}
+
+.risk-feed-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.risk-feed-item {
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-soft);
+  border: 1px solid var(--glass-border);
+}
+</style>

@@ -476,6 +476,23 @@ class MT5Client:
             "results": results,
         }
 
+    def close_positions(self, positions: list[dict]) -> dict:
+        """平掉给定持仓列表。"""
+        results = [self.close_position(p) for p in positions or []]
+        ok = all(r.get("success") for r in results) if results else True
+        symbol = None
+        if results:
+            syms = {str(r.get("symbol") or "") for r in results if r.get("symbol")}
+            if len(syms) == 1:
+                symbol = next(iter(syms))
+        return {
+            "success": ok,
+            "symbol": symbol,
+            "action": "CLOSE",
+            "closed": len(results),
+            "results": results,
+        }
+
     def close_all(self) -> dict:
         """平掉账户全部持仓。"""
         results = [self.close_position(p) for p in self.positions()]

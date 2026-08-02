@@ -20,6 +20,8 @@ class NodeUpdate(BaseModel):
     name: Optional[str] = None
     enabled: Optional[bool] = None
     filters: Optional[dict] = None
+    # 账户级风控（浮盈亏比等）；结构见 risk_control.normalize_risk
+    risk: Optional[dict] = None
 
 
 class NodeOut(BaseModel):
@@ -29,6 +31,7 @@ class NodeOut(BaseModel):
     enabled: bool = True
     status: str = "offline"  # online / offline
     filters: Optional[dict] = None
+    risk: Optional[dict] = None
     mt5_login: Optional[int] = None
     mt5_server: Optional[str] = None
     created_at: float = 0
@@ -495,6 +498,9 @@ class PurgeTradeLogsResult(BaseModel):
     deleted: dict[str, int]
     redis_cleared: int
     total_deleted: int
+    # 清空前已下发终止指令的策略子任务数，以及因节点离线未能下发的数量
+    strategies_stopped: int = 0
+    strategies_unreachable: int = 0
 
 
 # ----------------------------- 鉴权 ----------------------------

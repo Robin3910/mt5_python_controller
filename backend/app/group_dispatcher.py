@@ -244,7 +244,7 @@ class GroupDispatcher:
             return self._result(group, mode, 0, "skipped", "分组没有进行中的任务")
 
         closing: list[int] = []
-        offline: list[int] = []
+        offline: list[tuple[dict, dict]] = []
         for sub in subtasks:
             cmd = build_strategy_stop_command(
                 signal_id, sub["task_id"], sub["dispatch_id"], sub["magic"],
@@ -253,20 +253,27 @@ class GroupDispatcher:
             if await manager.send_to_node(sub["node_id"], cmd):
                 closing.append(sub["dispatch_id"])
             else:
-                offline.append(sub["dispatch_id"])
+                offline.append((sub, cmd))
 
         await group_persist.mark_dispatches_closing(closing)
-        # 目标节点离线时无人能平仓，强制收口并放开占位，避免该节点该品种被永久锁死
+        # 目标节点离线时无人能平仓：强制收口并放开占位，避免该节点该品种被永久锁死；
+        # 同时把终止指令暂存下来，等节点重连后补发，否则 MT5 里的持仓会一直留着
         if offline:
+            for sub, cmd in offline:
+                await self.store.push_pending_stop(
+                    sub["node_id"], cmd, Config.NODE_BUSY_TTL,
+                )
             res = await group_persist.force_finish_subtasks(
-                offline, reason="close_signal_node_offline",
+                [sub["dispatch_id"] for sub, _ in offline],
+                reason="close_signal_node_offline",
             )
             await self._release(res)
 
         task_id = subtasks[0]["task_id"]
         if not closing:
             return self._result(group, mode, 0, "failed",
-                                "目标节点均不在线，已强制结束子任务", task_id)
+                                "目标节点均不在线，已强制结束子任务，待其重连后补发平仓",
+                                task_id)
         logger.info(
             "group %s CLOSE -> %d subtask(s) closing, %d forced", group_id, len(closing), len(offline),
         )
@@ -415,6 +422,21 @@ class GroupDispatcher:
                 **base, status="skipped", skip_reason=reason,
             )
             logger.info("group %s node %s busy: %s", group_id, node_id, reason)
+            return {"node_id": node_id, "status": "skipped", "magic": None,
+                    "volume": volume, "reason": reason}
+
+        # 占位有 TTL 兜底，长期运行的子任务可能在占位过期后被再次抢到；
+        # 以库里的真实状态复核，命中则续上占位并跳过，避免同一节点跑两个任务
+        stale = await group_persist.active_subtask_id(group_id, node_id)
+        if stale is not None:
+            await self.store.set_group_node_busy(
+                group_id, node_id, str(stale), Config.NODE_BUSY_TTL,
+            )
+            reason = f"该节点在本分组内已有进行中的子任务 #{stale}，本次跳过"
+            await group_persist.record_skipped_dispatch(
+                **base, status="skipped", skip_reason=reason,
+            )
+            logger.info("group %s node %s busy (db): %s", group_id, node_id, reason)
             return {"node_id": node_id, "status": "skipped", "magic": None,
                     "volume": volume, "reason": reason}
 

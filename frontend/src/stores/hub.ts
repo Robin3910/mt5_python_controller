@@ -17,6 +17,7 @@ import type {
   NodeOut,
   NodeTokenInfo,
   NodeUpdatePayload,
+  RiskFeedItem,
   GroupTaskEventRecord,
   PaginatedAudits,
   PaginatedGroupSignals,
@@ -38,6 +39,7 @@ interface HubState {
   filters: FilterRulesConfig          // 区间过滤
   events: HubEvent[]                        // 实时事件流（用于总览页展示）
   nodeFeed: Record<string, NodeFeedItem[]>  // node_id -> 实时分发/回报（详情页“成交回报”用）
+  riskFeed: Record<string, RiskFeedItem[]>  // node_id -> 账户级风控执行回报
 }
 
 export const useHubStore = defineStore('hub', {
@@ -50,6 +52,7 @@ export const useHubStore = defineStore('hub', {
     filters: {},
     events: [],
     nodeFeed: {},
+    riskFeed: {},
   }),
   getters: {
     // 在线节点数（优先用实时状态，其次用 REST 字段）
@@ -344,6 +347,35 @@ export const useHubStore = defineStore('hub', {
           error: d.error as string | undefined,
           detail: d.detail as string | undefined,
         })
+      } else if (t === 'risk_event') {
+        // 账户级风控触发 / 状态回写
+        const nodeId = d.node_id as string
+        const ok = d.success !== false
+        const text = (d.message as string) || `风控 ${d.rule || ''} ${d.event || ''}`
+        this.pushEvent(`风控 ${nodeId} ${text}`, 'warn')
+        if (nodeId) {
+          const item: RiskFeedItem = {
+            ts: Date.now(),
+            rule: d.rule as string | undefined,
+            event: d.event as string | undefined,
+            message: text,
+            success: ok,
+            remaining_times: d.remaining_times as number | undefined,
+            disabled: d.disabled as boolean | undefined,
+            current_ratio: d.current_ratio as number | undefined,
+            ratio_threshold: d.ratio_threshold as number | undefined,
+          }
+          const list = this.riskFeed[nodeId] ? [item, ...this.riskFeed[nodeId]] : [item]
+          this.riskFeed[nodeId] = list.slice(0, 50)
+          if (d.risk) {
+            const idx = this.nodes.findIndex((n) => n.node_id === nodeId)
+            if (idx >= 0) {
+              const nodes = [...this.nodes]
+              nodes[idx] = { ...nodes[idx], risk: d.risk as NodeOut['risk'] }
+              this.nodes = nodes
+            }
+          }
+        }
       }
     },
   },

@@ -148,6 +148,60 @@ async def active_subtasks(group_id: str) -> list[dict]:
         return []
 
 
+async def all_active_subtasks() -> list[dict]:
+    """全库仍未收口的节点子任务（清空交易日志前需先通知节点停止）。"""
+    try:
+        async with SessionLocal() as s:
+            rows = (
+                await s.execute(
+                    select(GroupTaskDispatch)
+                    .where(GroupTaskDispatch.status.notin_(tuple(_TERMINAL)))
+                    .order_by(GroupTaskDispatch.id.asc())
+                )
+            ).scalars().all()
+            return [
+                {
+                    "dispatch_id": r.id,
+                    "task_id": r.task_id,
+                    "signal_id": r.signal_id,
+                    "group_id": r.group_id,
+                    "node_id": r.node_id,
+                    "symbol": r.symbol,
+                    "magic": r.magic,
+                    "status": r.status,
+                }
+                for r in rows
+            ]
+    except Exception as e:  # noqa: BLE001
+        logger.warning("all_active_subtasks failed: %s", e)
+        return []
+
+
+async def active_subtask_id(group_id: str, node_id: str) -> Optional[int]:
+    """该分组内该节点仍未收口的子任务号（无则 None）。
+
+    Redis 占位有 TTL 兜底，长时间运行的任务可能在占位过期后被重复下发；
+    下发前用库里的真实状态复核，DB 为准。
+    """
+    try:
+        async with SessionLocal() as s:
+            return (
+                await s.execute(
+                    select(GroupTaskDispatch.id)
+                    .where(
+                        GroupTaskDispatch.group_id == group_id,
+                        GroupTaskDispatch.node_id == node_id,
+                        GroupTaskDispatch.status.in_(group_rules.SUBTASK_HOLDS_LOCK),
+                    )
+                    .order_by(GroupTaskDispatch.id.asc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("active_subtask_id failed: %s", e)
+        return None
+
+
 async def active_node_locks() -> list[dict]:
     """仍持有组内节点占位的子任务（服务端重启后据此重建 Redis 占位）。"""
     try:

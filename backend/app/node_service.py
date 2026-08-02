@@ -12,6 +12,7 @@ from sqlalchemy import select
 
 from . import group_service
 from .db import SessionLocal
+from . import risk_control
 from .models import NodeCreate, NodeUpdate
 from .orm import Node
 from .redis_store import RedisStore
@@ -31,6 +32,7 @@ def node_row_to_dict(row: Node) -> dict:
         "follow_poll": row.follow_poll,
         "poll_order": row.poll_order,
         "filters": row.filters_json,
+        "risk": risk_control.normalize_risk(row.risk_json),
         "mt5_login": row.mt5_login,
         "mt5_server": row.mt5_server,
         "created_at": row.created_at.timestamp() if row.created_at else time.time(),
@@ -154,6 +156,12 @@ async def update_node(store: RedisStore, node_id: str, patch: NodeUpdate) -> Opt
         )
         if err:
             raise ValueError(err)
+    risk_norm: dict | None = None
+    if patch.risk is not None:
+        risk_norm = risk_control.normalize_risk(patch.risk)
+        err = risk_control.validate_risk(risk_norm)
+        if err:
+            raise ValueError(err)
     async with SessionLocal() as s:
         row = await s.get(Node, node_id)
         if not row:
@@ -164,6 +172,30 @@ async def update_node(store: RedisStore, node_id: str, patch: NodeUpdate) -> Opt
                 setattr(row, f, v)
         if patch.filters is not None:
             row.filters_json = patch.filters
+        if risk_norm is not None:
+            row.risk_json = risk_norm
+        await s.commit()
+        await s.refresh(row)
+        d = node_row_to_dict(row)
+    await store.cache_node(d)
+    return d
+
+
+async def apply_risk_state(store: RedisStore, node_id: str, risk: dict) -> Optional[dict]:
+    """节点回报触发后回写风控运行态（次数耗尽关闭开关等）。
+
+    只合并「开关 / 剩余次数」，其余字段以库为准：节点回报的是它上次收到的快照，
+    整份覆盖会把管理员在这期间保存的新配置冲掉。
+    """
+    async with SessionLocal() as s:
+        row = await s.get(Node, node_id)
+        if not row:
+            return None
+        merged = risk_control.merge_runtime_state(row.risk_json, risk)
+        err = risk_control.validate_risk(merged)
+        if err:
+            raise ValueError(err)
+        row.risk_json = merged
         await s.commit()
         await s.refresh(row)
         d = node_row_to_dict(row)

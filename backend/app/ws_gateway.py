@@ -21,6 +21,7 @@ from . import (
     node_service,
     persist,
     results,
+    risk_control,
     rules,
     system_settings,
 )
@@ -189,10 +190,13 @@ async def node_ws(ws: WebSocket):
                 "node_id": node_id,
                 "heartbeat": settings.heartbeat_interval,
                 "watch_symbols": watch_symbols,
+                # 登录成功即同步账户级风控，节点据此本地监控执行
+                "risk": risk_control.normalize_risk(node.get("risk")),
             },
         }
     )
     await manager.broadcast_admin({"type": "node_status", "data": {"node_id": node_id, "status": "online"}})
+    await _flush_pending_stops(node_id, ws)
     await _resume_strategy_tasks(node_id, ws)
 
     try:
@@ -247,6 +251,10 @@ async def _session(node_id: str, ws: WebSocket) -> None:
         elif mtype == "hello":
             # 节点上线自报 MT5 登录信息（含登录号一致性校验）
             await _update_node_mt5(node_id, ws, data)
+
+        elif mtype == "risk_event":
+            # 账户级风控触发 / 状态回写（如次数耗尽关闭开关）
+            await _on_risk_event(node_id, data)
 
         else:
             logger.debug("node %s unknown msg type=%s", node_id, mtype)
@@ -329,6 +337,45 @@ async def _on_trade_result(node_id: str, data: dict) -> None:
     )
 
 
+async def _on_risk_event(node_id: str, data: dict) -> None:
+    """处理账户级风控事件：可选回写配置（次数耗尽关闭），并广播管理端。"""
+    store = state.store
+    risk_payload = data.get("risk")
+    if isinstance(risk_payload, dict):
+        try:
+            updated = await node_service.apply_risk_state(store, node_id, risk_payload)
+            if updated is not None:
+                data = {**data, "risk": updated.get("risk")}
+        except ValueError as e:
+            logger.warning("risk state apply rejected for %s: %s", node_id, e)
+    await manager.broadcast_admin(
+        {"type": "risk_event", "data": {"node_id": node_id, **data}}
+    )
+
+
+async def _flush_pending_stops(node_id: str, ws: WebSocket) -> None:
+    """补发节点离线期间攒下的策略终止指令。
+
+    CLOSE 信号到达时若目标节点不在线，服务端会强制收口并放开占位，但 MT5 里的
+    持仓仍在。指令暂存在 Redis，节点一回来就补发，由节点按魔术号平掉残留持仓。
+    """
+    try:
+        commands = await state.store.pop_pending_stops(node_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("load pending stops failed for %s", node_id)
+        return
+    for cmd in commands:
+        try:
+            await ws.send_json(cmd)
+            logger.info(
+                "node %s pending strategy_stop resent (task=%s magic=%s)",
+                node_id, cmd.get("task_id"), cmd.get("magic"),
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("resend pending stop to %s failed", node_id)
+            return
+
+
 async def _resume_strategy_tasks(node_id: str, ws: WebSocket) -> None:
     """节点重连后重建仍未收口的策略监控（不重复下首单）。
 
@@ -354,16 +401,24 @@ async def _resume_strategy_tasks(node_id: str, ws: WebSocket) -> None:
             return
 
 
+def _as_id(value: object) -> int | None:
+    """把回报里的 id 字段安全转成正整数；非法值一律当作缺失。"""
+    try:
+        num = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return num or None
+
+
 def _locator(data: dict) -> tuple[int | None, int | None]:
-    """从回报里解出定位子任务用的 (子任务号, 主任务号)。"""
+    """从回报里解出定位子任务用的 (子任务号, 主任务号)。
+
+    字段来自节点上报，可能是任意类型；解析失败只当作缺失，不能让整条会话中断。
+    """
     dispatch_id = data.get("dispatch_id") or group_rules.subtask_id_from_magic(
         data.get("magic")
     )
-    task_id = data.get("task_id")
-    return (
-        int(dispatch_id) if dispatch_id else None,
-        int(task_id) if task_id else None,
-    )
+    return _as_id(dispatch_id), _as_id(data.get("task_id"))
 
 
 async def _on_strategy_progress(node_id: str, data: dict) -> None:

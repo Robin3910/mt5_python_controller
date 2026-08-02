@@ -3,9 +3,12 @@
 复用 /webhook 的解析与分发流程（webhook.process_signal），以管理员 JWT 鉴权，
 避免把 Webhook token / IP 白名单暴露到浏览器；来源标记为 manual，便于事件页区分。
 """
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from . import group_rules, persist
+from . import group_persist, group_rules, persist
+from .connections import manager
 from .deps import (
     client_ip,
     get_current_admin,
@@ -14,7 +17,7 @@ from .deps import (
     get_store,
 )
 from .dispatcher import Dispatcher
-from .group_dispatcher import GroupDispatcher
+from .group_dispatcher import GroupDispatcher, build_strategy_stop_command
 from .models import (
     PURGE_TRADE_LOGS_CONFIRM,
     SIGNAL_MODEL_STRATEGY,
@@ -25,6 +28,8 @@ from .models import (
 )
 from .redis_store import RedisStore
 from .webhook import process_signal
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/console", tags=["console"])
 
@@ -126,6 +131,9 @@ async def purge_trade_logs(
             status_code=400,
             detail=f"确认词不正确，请输入「{PURGE_TRADE_LOGS_CONFIRM}」",
         )
+    # 记录一并删除，节点侧监控不会自己停；先下发终止指令，避免节点继续按
+    # 已不存在的任务加仓，MT5 持仓也无人收口
+    stopped, unreachable = await _stop_all_running_strategies()
     deleted = await persist.purge_trade_logs()
     redis_cleared = await store.clear_trade_runtime()
     total = sum(deleted.values())
@@ -135,8 +143,35 @@ async def purge_trade_logs(
             "deleted": deleted,
             "redis_cleared": redis_cleared,
             "total_deleted": total,
+            "strategies_stopped": stopped,
+            "strategies_unreachable": unreachable,
         },
     )
     return PurgeTradeLogsResult(
         deleted=deleted, redis_cleared=redis_cleared, total_deleted=total,
+        strategies_stopped=stopped, strategies_unreachable=unreachable,
     )
+
+
+async def _stop_all_running_strategies() -> tuple[int, int]:
+    """给所有仍在跑的策略子任务下发终止指令，返回 (已下发, 节点离线)。"""
+    stopped = 0
+    unreachable = 0
+    for sub in await group_persist.all_active_subtasks():
+        node_id = sub.get("node_id")
+        if not node_id:
+            continue
+        cmd = build_strategy_stop_command(
+            sub.get("signal_id") or "", sub["task_id"], sub["dispatch_id"],
+            sub.get("magic"), sub.get("group_id") or "", sub.get("symbol"),
+            reason="purge_trade_logs",
+        )
+        if await manager.send_to_node(node_id, cmd):
+            stopped += 1
+        else:
+            unreachable += 1
+    if stopped or unreachable:
+        logger.warning(
+            "purge_trade_logs: %d strategy stop sent, %d node(s) offline", stopped, unreachable,
+        )
+    return stopped, unreachable

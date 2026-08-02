@@ -177,3 +177,22 @@ class MockMT5Client:
         symbol = self._positions[0]["symbol"] if closed == 1 else None
         self._positions = []
         return {"success": True, "symbol": symbol, "action": "CLOSE", "closed": closed}
+
+    def close_positions(self, positions: list[dict]) -> dict:
+        tickets = {int(p.get("ticket") or 0) for p in positions or []}
+        before = len(self._positions)
+        kept = []
+        closed_sym = None
+        for p in self._positions:
+            if int(p.get("ticket") or 0) in tickets:
+                closed_sym = p.get("symbol")
+            else:
+                kept.append(p)
+        self._positions = kept
+        closed = before - len(kept)
+        return {
+            "success": True,
+            "symbol": closed_sym if closed == 1 else None,
+            "action": "CLOSE",
+            "closed": closed,
+        }

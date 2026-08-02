@@ -16,9 +16,11 @@
 import asyncio
 import json
 import logging
+import time
 
 import websockets
 
+import account_risk
 from config import get_settings
 from market_hub import MarketHub
 from mt5_prompt import prompt_mt5_credentials
@@ -79,6 +81,12 @@ class NodeClient:
         self._stop = False
         # 中控台全局 filters 品种（auth_ok / watch_symbols 下发），与本地 WATCH_SYMBOLS 合并取价
         self.hub_symbols: set[str] = set()
+        # 账户级风控配置（auth_ok / risk_config 下发），节点本地监控执行
+        self.risk: dict = account_risk.default_risk()
+        # 触发后短暂冷却，避免循环模式下同一波行情连续清仓
+        self._risk_cooldown_until: float = 0.0
+        # 浮盈亏保护状态机：item_id -> 是否已进入保护
+        self._protect_armed: dict[str, bool] = {}
         # 策略托管任务：task_id -> StrategyRunner，断线时取消、重连后由服务端下发恢复
         self.runners: dict[int, StrategyRunner] = {}
         # 策略监控的事件源：全节点共用一个采样器，MT5 调用次数与任务数无关
@@ -171,6 +179,23 @@ class NodeClient:
         }
         logger.info("hub watch symbols (%d): %s", len(self.hub_symbols), sorted(self.hub_symbols))
 
+    def apply_risk_config(self, risk) -> None:
+        """接收账户级风控配置（登录 auth_ok 或保存后 risk_config）。"""
+        previous = self.risk
+        self.risk = account_risk.normalize_risk(risk if isinstance(risk, dict) else None)
+        # 保护进度只在条目消失、被关闭或保护方向反转时清除。重连会重新收到一次
+        # 配置，整体清零会让已进入保护的品种前功尽弃。
+        self._protect_armed = account_risk.prune_armed_map(
+            self.risk, self._protect_armed, previous=previous,
+        )
+        spo = len((self.risk.get(account_risk.RULE_SYMBOL_PL_ORDERS) or {}).get("items") or [])
+        spp = len((self.risk.get(account_risk.RULE_SYMBOL_PL_PROTECT) or {}).get("items") or [])
+        lpt = self.risk.get(account_risk.RULE_LOT_PL_TIERS) or {}
+        logger.info(
+            "hub risk config: spo=%d spp=%d lot_tiers enabled=%s batches=%s",
+            spo, spp, lpt.get("enabled"), lpt.get("batch_count"),
+        )
+
     def effective_watchlist(self, positions: list | None = None) -> list[str]:
         """本地 WATCH_SYMBOLS ∪ 中控台品种 ∪ 当前持仓品种。"""
         out: set[str] = {s.strip().upper() for s in settings.watchlist if s.strip()}
@@ -221,6 +246,7 @@ class NodeClient:
             data = msg.get("data") or {}
             logger.info("authenticated as node %s", data.get("node_id"))
             self.apply_hub_symbols(data.get("watch_symbols"))
+            self.apply_risk_config(data.get("risk"))
             acct = await self._exec(self.mt5.account_info)
             try:
                 self._check_login(acct)
@@ -266,11 +292,12 @@ class NodeClient:
             self._cancel_runners()
 
     async def _reporter(self, ws) -> None:
-        """定时上报账户快照；发现换号则抛错结束会话。"""
+        """定时上报账户快照；顺带检查账户级风控；发现换号则抛错结束会话。"""
         while True:
             snap = await self._snapshot()
             self._check_login(snap.get("account") or {})
             await ws.send(json.dumps({"type": "account", "data": snap}))
+            await self._check_account_risk(ws, snap)
             await asyncio.sleep(settings.account_report_interval)
 
     async def _heartbeat(self, ws) -> None:
@@ -305,6 +332,9 @@ class NodeClient:
         if mtype == "watch_symbols":
             self.apply_hub_symbols((msg.get("data") or {}).get("symbols"))
             return
+        if mtype == "risk_config":
+            self.apply_risk_config((msg.get("data") or {}).get("risk"))
+            return
         if mtype in ("pong", "ping"):
             return  # 心跳应答 / 探活，忽略
 
@@ -318,9 +348,164 @@ class NodeClient:
         elif cmd == "strategy_resume":
             await self._do_strategy_start(ws, msg, resume=True)
         elif cmd == "strategy_stop":
-            await self._do_strategy_stop(msg)
+            await self._do_strategy_stop(ws, msg)
         else:
             logger.debug("ignored message: %s", msg)
+
+    # ---------------------- 账户级风控 ----------------------
+    async def _execute_risk_close(self, hit: dict, positions: list) -> dict:
+        """按命中规则的动作执行平仓。"""
+        action = hit.get("close_action") or "account_all"
+        # 账户级规则与分档的「全部」都是整账户清仓
+        if action == "account_all" or (hit.get("scope_all_symbols") and action == "all"):
+            return await self._exec(self.mt5.close_all)
+        targets = account_risk.select_close_targets(
+            positions,
+            close_action=action,
+            # 分档按账户侧向平仓，不限定品种
+            symbol=None if hit.get("scope_all_symbols") else hit.get("symbol"),
+        )
+        if not targets:
+            # 判定阶段已排除这种情况；真发生说明快照与实际持仓不一致，
+            # 按失败处理让下一轮重新判定，不能白扣次数把规则关掉
+            return {"success": False, "closed": 0, "action": "CLOSE",
+                    "error": "没有符合该平仓动作的持仓"}
+        return await self._exec(self.mt5.close_positions, targets)
+
+    @staticmethod
+    def _close_action_label(action: str | None) -> str:
+        return {
+            "account_all": "清仓全部",
+            "all": "品种全平",
+            "buy": "多单平仓",
+            "sell": "空单平仓",
+            "hedge": "锁单平仓",
+        }.get(action or "", action or "平仓")
+
+    async def _check_account_risk(self, ws, snap: dict) -> None:
+        """账户级风控检查入口。
+
+        跑在账户上报循环里，任何异常都只记日志：抛出去会连带结束上报任务，
+        进而触发整条 WS 会话重连。
+        """
+        try:
+            await self._run_account_risk(ws, snap)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("account risk check failed: %s", e)
+
+    async def _run_account_risk(self, ws, snap: dict) -> None:
+        """检查各条风控规则；触达则按动作平仓并上报 risk_event。"""
+        acct = snap.get("account") or {}
+        positions = snap.get("positions") or []
+        hit, new_armed, armed_events = account_risk.find_triggered_rule(
+            self.risk,
+            balance=acct.get("balance", 0),
+            equity=acct.get("equity", 0),
+            positions=positions,
+            armed_map=self._protect_armed,
+        )
+        self._protect_armed = new_armed
+
+        for ev in armed_events:
+            await ws.send(json.dumps({
+                "type": "risk_event",
+                "data": {**ev, "success": True, "closed": 0},
+            }))
+            logger.info("account risk armed: %s", ev.get("message"))
+
+        if not hit:
+            return
+
+        # 冷却只挡「执行平仓」，上面的保护状态机照常推进，
+        # 否则刚触发过的这几轮里保护进度会整体停滞、错过收窄时机
+        now = time.time()
+        if now < self._risk_cooldown_until:
+            return
+
+        # 账户级全平或大范围平仓时停策略监控，避免继续加仓
+        if hit.get("close_action") in ("account_all", "all") or hit.get("scope_all_symbols"):
+            for runner in list(self.runners.values()):
+                if not runner.done:
+                    runner.request_stop("account_risk")
+
+        res = await self._execute_risk_close(hit, positions)
+        success = bool(res.get("success"))
+        new_risk, state = account_risk.apply_trigger_to_risk(
+            self.risk, hit["rule"], hit.get("item_id"),
+        )
+        if success and not state.get("matched", True):
+            # 配置在本轮判定与回写之间被改过：次数没能扣减，靠冷却避免连续触发
+            logger.warning(
+                "risk rule %s item %s vanished before state write-back",
+                hit["rule"], hit.get("item_id"),
+            )
+        if success:
+            self.risk = new_risk
+            # 保护规则触发后解除该条目 armed
+            if hit.get("item_id"):
+                self._protect_armed.pop(str(hit["item_id"]), None)
+            self._risk_cooldown_until = now + max(5.0, float(settings.account_report_interval) * 2)
+
+        remaining = state["remaining_times"] if success else hit.get("remaining_times", 0)
+        disabled = bool(state["disabled"]) if success else False
+        action_label = self._close_action_label(hit.get("close_action"))
+        msg_parts = [
+            hit.get("message_core") or hit["rule"],
+            f"已{action_label}" if success else f"平仓失败：{res.get('error') or 'unknown'}",
+        ]
+        if success and disabled:
+            msg_parts.append("指定次数已耗尽，规则已关闭")
+        elif success and hit.get("monitor_mode") == account_risk.MONITOR_TIMES:
+            msg_parts.append(f"剩余次数 {remaining}")
+
+        event = {
+            "rule": hit["rule"],
+            "item_id": hit.get("item_id"),
+            "event": "triggered",
+            "action": hit.get("close_action") or hit.get("action"),
+            "symbol": hit.get("symbol"),
+            "success": success,
+            "closed": int(res.get("closed") or 0),
+            "monitor_mode": hit.get("monitor_mode"),
+            "remaining_times": remaining,
+            "disabled": disabled,
+            "equity": hit.get("equity"),
+            "message": "；".join(msg_parts),
+            "error": res.get("error"),
+        }
+        if hit["rule"] == account_risk.RULE_FLOAT_PL_RATIO:
+            event.update({
+                "ratio_threshold": hit.get("threshold"),
+                "current_ratio": round(hit["current_ratio"], 4) if hit.get("current_ratio") is not None else None,
+                "floating_pl": round(hit["floating_pl"], 4) if hit.get("floating_pl") is not None else None,
+                "balance": hit.get("balance"),
+            })
+        elif hit["rule"] == account_risk.RULE_EQUITY_MIN:
+            event["amount_threshold"] = hit.get("amount")
+        elif hit["rule"] == account_risk.RULE_SYMBOL_PL_ORDERS:
+            event.update({
+                "pl_amount": hit.get("pl_amount"),
+                "current_pl": hit.get("current_pl"),
+                "order_count": hit.get("order_count"),
+            })
+        elif hit["rule"] == account_risk.RULE_SYMBOL_PL_PROTECT:
+            event.update({
+                "trigger_amount": hit.get("trigger_amount"),
+                "narrow_amount": hit.get("narrow_amount"),
+                "current_pl": hit.get("current_pl"),
+            })
+        elif hit["rule"] == account_risk.RULE_LOT_PL_TIERS:
+            event.update({
+                "tier_index": hit.get("tier_index"),
+                "min_lot": hit.get("min_lot"),
+                "pl_amount": hit.get("pl_amount"),
+                "current_lot": hit.get("current_lot"),
+                "current_pl": hit.get("current_pl"),
+            })
+        if success:
+            event["risk"] = self.risk
+        await ws.send(json.dumps({"type": "risk_event", "data": event}))
+        logger.warning("account risk: %s", event["message"])
 
     # ---------------------- 策略托管 ----------------------
     async def _do_strategy_start(self, ws, msg: dict, *, resume: bool) -> None:
@@ -359,17 +544,52 @@ class NodeClient:
             task_id, "resumed" if resume else "started", magic, (msg.get("entry") or {}).get("symbol"),
         )
 
-    async def _do_strategy_stop(self, msg: dict) -> None:
+    async def _do_strategy_stop(self, ws, msg: dict) -> None:
         """终止指令：平掉该任务魔术号的全部持仓并结束监控。"""
-        task_id = msg.get("task_id")
-        if not task_id:
+        try:
+            task_id = int(msg.get("task_id"))
+        except (TypeError, ValueError):
+            logger.warning("strategy_stop with invalid task_id: %s", msg)
             return
-        runner = self.runners.get(int(task_id))
-        if not runner:
-            logger.info("strategy_stop for unknown task %s, ignored", task_id)
+        runner = self.runners.get(task_id)
+        if runner:
+            runner.request_stop(msg.get("reason") or "stop_command")
+            logger.info("strategy task %s stop requested", task_id)
             return
-        runner.request_stop(msg.get("reason") or "stop_command")
-        logger.info("strategy task %s stop requested", task_id)
+        # 本地没有监控：节点重启过，或服务端补发了离线期间的终止指令。
+        # 此时按魔术号直接平掉残留持仓，否则这批仓位再也没人负责收口。
+        await self._close_orphan_strategy(ws, task_id, msg)
+
+    async def _close_orphan_strategy(self, ws, task_id: int, msg: dict) -> None:
+        """无本地监控时按魔术号平仓，并回报结果供服务端收口。"""
+        try:
+            magic = int(msg.get("magic"))
+        except (TypeError, ValueError):
+            logger.info("strategy_stop for unknown task %s without magic, ignored", task_id)
+            return
+        try:
+            res = await self._exec(self.mt5.close_by_magic, magic)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("strategy_stop close by magic %s failed: %s", magic, e)
+            return
+        closed = int(res.get("closed") or 0)
+        logger.warning(
+            "strategy task %s has no local runner, closed %d position(s) by magic %s",
+            task_id, closed, magic,
+        )
+        # 不带累计单量字段：服务端已有历史统计，这里回传 0 会把它覆盖掉
+        await ws.send(json.dumps({
+            "type": "strategy_finished",
+            "data": {
+                "task_id": task_id,
+                "magic": magic,
+                "group_id": msg.get("group_id") or "",
+                "signal_id": msg.get("signal_id") or "",
+                "symbol": msg.get("symbol"),
+                "status": "done" if res.get("success") else "failed",
+                "reason": msg.get("reason") or "stop_command",
+            },
+        }))
 
     def _cancel_runners(self) -> None:
         """断线时取消本地监控循环；MT5 持仓保留，等重连后由服务端下发恢复。"""

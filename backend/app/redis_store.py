@@ -33,6 +33,8 @@ K_GROUP_ROTATION = "group:poll:rotation:{}"  # 分组内轮询轮转顺序（JSO
 # 节点级互斥：(分组, 节点) -> 进行中的子任务号。同一分组内一个节点只允许一个策略
 # 任务；不同分组各自独立，同一节点可以同时承接多个分组的任务。
 K_GROUP_NODE_BUSY = "group:node:busy:{}:{}"
+# 节点离线期间攒下的策略终止指令（List[JSON]），重连鉴权后补发
+K_NODE_PENDING_STOP = "node:pending_stop:{}"
 K_STRATEGY = "strategy:{}"              # 策略实例缓存（JSON）
 K_STRATEGIES = "strategies"             # 所有 strategy_id 的集合
 
@@ -230,6 +232,31 @@ class RedisStore:
         if keys:
             await self.r.delete(*keys)
 
+    # ---- 离线节点的待补发终止指令 ----
+    async def push_pending_stop(self, node_id: str, command: dict, ttl: int) -> None:
+        """节点离线时暂存策略终止指令，等其重连后补发。
+
+        TTL 是兜底：节点长期不回来时自动过期，避免无限堆积。
+        """
+        key = K_NODE_PENDING_STOP.format(node_id)
+        await self.r.rpush(key, json.dumps(command))
+        await self.r.expire(key, ttl)
+
+    async def pop_pending_stops(self, node_id: str) -> list[dict]:
+        """取出并清空某节点的待补发终止指令。"""
+        key = K_NODE_PENDING_STOP.format(node_id)
+        raw = await self.r.lrange(key, 0, -1)
+        if not raw:
+            return []
+        await self.r.delete(key)
+        out: list[dict] = []
+        for item in raw:
+            try:
+                out.append(json.loads(item))
+            except (TypeError, ValueError):
+                continue
+        return out
+
     async def clear_trade_runtime(self) -> int:
         """清空交易相关 Redis 运行态（轮询队列/进度、组内占位、去重、执行锁）。
 
@@ -239,6 +266,7 @@ class RedisStore:
             K_POLL_PENDING,
             "signal:poll:*",
             "group:node:busy:*",
+            "node:pending_stop:*",
             "dedup:*",
             "lock:exec:*",
         )
