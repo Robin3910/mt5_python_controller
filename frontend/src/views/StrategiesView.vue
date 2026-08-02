@@ -7,12 +7,17 @@ import 'element-plus/es/components/message-box/style/css'
 import FormLabel from '@/components/FormLabel.vue'
 import { useHubStore } from '@/stores/hub'
 import type {
+  BatchCalcType,
+  BatchTimeframe,
   StrategyBatchLevel,
   StrategyOut,
   StrategyRule,
   StrategyTemplateOut,
 } from '@/api/types'
 import { confirmAction } from '@/utils/confirm'
+
+/** ATR / 波幅统计的已收盘 K 线根数，与后端 BATCH_BAR_PERIOD 一致，固定不可配 */
+const BATCH_BAR_PERIOD = 14
 
 const hub = useHubStore()
 const router = useRouter()
@@ -97,8 +102,19 @@ const FIELD_HELP = {
     '系统会把第 2 笔到该上限均分到各档；达到上限后不再继续分批加仓。',
   batch_level:
     '持仓笔数区间由批数与总手数自动计算，只读。' +
-    '命中区间时：触发距离 = 点数 × Point()，手数 = 倍数 × 基础手数 + 额外手数。',
-  calc_type: '档位距离计算方式。当前仅支持「点数」。',
+    '命中区间时按该档的间距判断是否加仓，手数 = 倍数 × 基础手数 + 额外手数。',
+  calc_type:
+    '本档加仓间距怎么算：\n' +
+    '点数 = 固定间距，偏离达到「点数 × Point()」触发；\n' +
+    '指定价 = 到价触发，多单要求价位低于参考价、空单要求高于参考价；\n' +
+    `ATR = 用 ${BATCH_BAR_PERIOD} 根已收盘 K 线的平均真实波幅作间距；\n` +
+    `波幅 = 用 ${BATCH_BAR_PERIOD} 根已收盘 K 线中最大的高低波幅作间距。`,
+  batch_price:
+    '本档的指定价位（绝对价格）。逆势时多单需低于参考价、空单需高于参考价；' +
+    '顺势方向相反。价位方向不符或留空时本档不会触发。',
+  batch_timeframe:
+    `统计 ATR / 波幅用的 K 线周期，固定取最近 ${BATCH_BAR_PERIOD} 根**已收盘** K 线（不含当前未走完的那根）。` +
+    '算出的价格距离会换算成点数，再与实际偏离比较。',
 }
 
 /** 表单内规则：分批字段均已填充，便于直接 v-model 绑定 */
@@ -130,6 +146,26 @@ function cloneRules(rules: StrategyRule[]): EditableRule[] {
 /** 分批档位从第 2 笔起算（第 1 笔为首单） */
 const BATCH_POS_START = 2
 
+/** 加仓间距的计算方式；与后端 strategy_templates.BATCH_CALC_TYPES 对齐 */
+const CALC_TYPE_OPTIONS: Array<{ value: BatchCalcType; label: string }> = [
+  { value: 'point', label: '点数' },
+  { value: 'price', label: '指定价' },
+  { value: 'atr', label: 'ATR' },
+  { value: 'range', label: '波幅' },
+]
+
+/** ATR / 波幅可选周期。不提供「当前图表周期」：节点是独立进程，没有图表上下文 */
+const TIMEFRAME_OPTIONS: BatchTimeframe[] = [
+  'M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1', 'MN',
+]
+
+/** 需要读 K 线才能算出间距的方式 */
+const BAR_CALC_TYPES: BatchCalcType[] = ['atr', 'range']
+
+function isBarCalc(calcType: BatchCalcType): boolean {
+  return BAR_CALC_TYPES.includes(calcType)
+}
+
 /** 将 [2, limit] 均分为 count 段，对齐 MTcommander「批数 × 总手数」切档 */
 function splitBatchRanges(
   limit: number,
@@ -151,14 +187,18 @@ function splitBatchRanges(
   return ranges
 }
 
-function defaultLevelParams(
-  index: number,
-  prev?: StrategyBatchLevel,
-): Pick<StrategyBatchLevel, 'calc_type' | 'point' | 'lot_times' | 'extra_lot'> {
+type LevelParams = Pick<
+  StrategyBatchLevel,
+  'calc_type' | 'point' | 'price' | 'timeframe' | 'lot_times' | 'extra_lot'
+>
+
+function defaultLevelParams(index: number, prev?: StrategyBatchLevel): LevelParams {
   if (prev) {
     return {
       calc_type: prev.calc_type || 'point',
       point: prev.point,
+      price: prev.price ?? 0,
+      timeframe: prev.timeframe || 'M5',
       lot_times: prev.lot_times,
       extra_lot: prev.extra_lot,
     }
@@ -166,6 +206,8 @@ function defaultLevelParams(
   return {
     calc_type: 'point',
     point: 100 + index * 100,
+    price: 0,
+    timeframe: 'M5',
     lot_times: Number((1.1 + index * 0.1).toFixed(2)),
     extra_lot: 0,
   }
@@ -291,6 +333,14 @@ function validateRules(rules: EditableRule[]): string | null {
     }
     for (const [i, lv] of r.batch_levels.entries()) {
       const at = `${label} 档位 ${i + 1}`
+      if (!CALC_TYPE_OPTIONS.some((o) => o.value === lv.calc_type)) {
+        return `${at}：计算方式非法`
+      }
+      if (lv.calc_type === 'point' && !(lv.point > 0)) return `${at}：点数需大于 0`
+      if (lv.calc_type === 'price' && !(lv.price > 0)) return `${at}：请填写指定价位`
+      if (isBarCalc(lv.calc_type) && !TIMEFRAME_OPTIONS.includes(lv.timeframe)) {
+        return `${at}：请选择 K 线周期`
+      }
       if (lv.point < 0) return `${at}：点数不能为负`
       if (lv.lot_times < 0) return `${at}：倍数不能为负`
       if (lv.extra_lot < 0) return `${at}：手数不能为负`
@@ -706,10 +756,38 @@ function resetRuleToTemplate(idx: number): void {
                           :help="FIELD_HELP.calc_type"
                         />
                         <select :id="`rule-${idx}-lv-${li}-calc`" v-model="lv.calc_type">
-                          <option value="point">点数</option>
+                          <option v-for="o in CALC_TYPE_OPTIONS" :key="o.value" :value="o.value">
+                            {{ o.label }}
+                          </option>
                         </select>
                       </div>
-                      <div class="field">
+                      <div v-if="lv.calc_type === 'price'" class="field">
+                        <FormLabel
+                          :field-id="`rule-${idx}-lv-${li}-price`"
+                          text="指定价"
+                          :help="FIELD_HELP.batch_price"
+                        />
+                        <input
+                          :id="`rule-${idx}-lv-${li}-price`"
+                          v-model.number="lv.price"
+                          type="number"
+                          min="0"
+                          step="0.00001"
+                        />
+                      </div>
+                      <div v-else-if="isBarCalc(lv.calc_type)" class="field">
+                        <FormLabel
+                          :field-id="`rule-${idx}-lv-${li}-tf`"
+                          text="K 线周期"
+                          :help="FIELD_HELP.batch_timeframe"
+                        />
+                        <select :id="`rule-${idx}-lv-${li}-tf`" v-model="lv.timeframe">
+                          <option v-for="tf in TIMEFRAME_OPTIONS" :key="tf" :value="tf">
+                            {{ tf }}
+                          </option>
+                        </select>
+                      </div>
+                      <div v-else class="field">
                         <FormLabel
                           :field-id="`rule-${idx}-lv-${li}-point`"
                           text="点数"
@@ -754,7 +832,8 @@ function resetRuleToTemplate(idx: number): void {
                     </div>
                   </div>
                   <p class="rule-hint">
-                    档位区间由批数 × 总手数自动切分（第 {{ BATCH_POS_START }} 笔 ~ 第 {{ Math.floor(r.total_lot_limit) }} 笔），不可手动添加
+                    档位区间由批数 × 总手数自动切分（第 {{ BATCH_POS_START }} 笔 ~ 第 {{ Math.floor(r.total_lot_limit) }} 笔），不可手动添加；
+                    每档的加仓间距可独立选择点数 / 指定价 / ATR / 波幅，ATR 与波幅取该周期最近 {{ BATCH_BAR_PERIOD }} 根已收盘 K 线
                   </p>
                 </template>
               </div>

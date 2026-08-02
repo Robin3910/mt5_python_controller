@@ -27,6 +27,24 @@ RET_TIMEOUT = 10012         # 超时
 RET_INVALID_FILL = 10030    # 不支持的填充模式
 TRANSIENT = {RET_REQUOTE, RET_PRICE_CHANGED, RET_PRICE_OFF, RET_TIMEOUT}  # 可重试的瞬时错误
 
+# 策略档位可选的 K 线周期 -> MT5 常量。模块导入时 MetaTrader5 可能不可用（非 Windows），
+# 那时留空字典，读 K 线的入口会因此直接返回空列表。
+TIMEFRAMES: dict[str, int] = (
+    {
+        "M1": mt5.TIMEFRAME_M1,
+        "M5": mt5.TIMEFRAME_M5,
+        "M15": mt5.TIMEFRAME_M15,
+        "M30": mt5.TIMEFRAME_M30,
+        "H1": mt5.TIMEFRAME_H1,
+        "H4": mt5.TIMEFRAME_H4,
+        "D1": mt5.TIMEFRAME_D1,
+        "W1": mt5.TIMEFRAME_W1,
+        "MN": mt5.TIMEFRAME_MN1,
+    }
+    if mt5 is not None
+    else {}
+)
+
 
 class MT5Error(RuntimeError):
     pass
@@ -412,6 +430,35 @@ class MT5Client:
             return 0.0
         info = mt5.symbol_info(resolved)
         return float(getattr(info, "point", 0.0) or 0.0) if info else 0.0
+
+    def closed_bars(self, symbol: str, timeframe: str, count: int) -> list[dict]:
+        """取最近 count 根**已收盘** K 线，按时间升序返回。
+
+        从 index 1 起取，跳过 index 0 的当前未收盘 K 线——ATR / 波幅这类统计要的
+        是稳定值，掺进走势未定的当前 K 线会让阈值在同一根 K 线内来回跳。
+        取不到时返回空列表，由调用方决定跳过判定。
+        """
+        self.ensure()
+        tf = TIMEFRAMES.get(str(timeframe or "").strip().upper())
+        if tf is None or count <= 0:
+            return []
+        resolved = self.resolve_symbol(symbol)
+        if not resolved:
+            return []
+        rates = mt5.copy_rates_from_pos(resolved, tf, 1, int(count))
+        if rates is None or len(rates) == 0:
+            logger.debug("no bars for %s %s: %s", resolved, timeframe, mt5.last_error())
+            return []
+        return [
+            {
+                "time": float(r["time"]),
+                "open": float(r["open"]),
+                "high": float(r["high"]),
+                "low": float(r["low"]),
+                "close": float(r["close"]),
+            }
+            for r in rates
+        ]
 
     def close_symbol(self, symbol: str) -> dict:
         """平掉某品种的所有持仓（兼容券商后缀）。"""

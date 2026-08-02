@@ -1,9 +1,14 @@
 <script setup lang="ts">
 // 分组信号页：展示某分组处理过的 strategy 主任务与各节点下发明细
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useHubStore } from '@/stores/hub'
-import type { GroupOut, GroupSignalTaskRecord, GroupTaskEventRecord } from '@/api/types'
+import type {
+  GroupOut,
+  GroupSignalTaskRecord,
+  GroupTaskEventDetail,
+  GroupTaskEventRecord,
+} from '@/api/types'
 
 const route = useRoute()
 const router = useRouter()
@@ -24,6 +29,13 @@ const expanded = ref<Record<string, boolean>>({})
 const expandedDispatch = ref<Record<string, boolean>>({})
 const dispatchEvents = ref<Record<string, GroupTaskEventRecord[]>>({})
 const loadingDispatchEvents = ref<Record<string, boolean>>({})
+/** 订单展开：展示该笔订单的开单原因与逐项计算参数 */
+const expandedEvent = ref<Record<string, boolean>>({})
+
+/** 自动刷新订单数据：默认关闭，开启后每秒静默刷新 */
+const autoRefresh = ref(false)
+let autoRefreshTimer: ReturnType<typeof setInterval> | undefined
+let autoRefreshInFlight = false
 
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)))
 
@@ -34,6 +46,18 @@ async function loadGroup(): Promise<void> {
   if (!group.value) loadError.value = '分组不存在或已被删除'
 }
 
+async function fetchSignalsPage(): Promise<void> {
+  if (!group.value) {
+    signals.value = []
+    total.value = 0
+    return
+  }
+  const res = await hub.fetchGroupSignals(group.value.group_id, page.value, pageSize.value)
+  signals.value = res.items
+  total.value = res.total
+  if (res.page !== page.value) page.value = res.page
+}
+
 async function loadSignals(): Promise<void> {
   if (!group.value) {
     signals.value = []
@@ -42,13 +66,52 @@ async function loadSignals(): Promise<void> {
   }
   loading.value = true
   try {
-    const res = await hub.fetchGroupSignals(group.value.group_id, page.value, pageSize.value)
-    signals.value = res.items
-    total.value = res.total
-    if (res.page !== page.value) page.value = res.page
+    await fetchSignalsPage()
   } finally {
     loading.value = false
   }
+}
+
+async function refreshExpandedDispatchEvents(): Promise<void> {
+  if (!group.value) return
+  const ids = Object.keys(expandedDispatch.value)
+    .filter((k) => expandedDispatch.value[k])
+    .map((k) => Number(k))
+    .filter((id) => Number.isFinite(id))
+  if (!ids.length) return
+  const gid = group.value.group_id
+  await Promise.all(
+    ids.map(async (dispatchId) => {
+      const k = String(dispatchId)
+      dispatchEvents.value[k] = await hub.fetchGroupDispatchEvents(gid, dispatchId)
+    }),
+  )
+}
+
+/** 静默刷新主任务列表与已展开节点的关联订单（不打断展开态、不闪加载文案） */
+async function refreshLiveData(): Promise<void> {
+  if (!group.value || autoRefreshInFlight) return
+  autoRefreshInFlight = true
+  try {
+    await fetchSignalsPage()
+    await refreshExpandedDispatchEvents()
+  } finally {
+    autoRefreshInFlight = false
+  }
+}
+
+function stopAutoRefresh(): void {
+  if (autoRefreshTimer !== undefined) {
+    clearInterval(autoRefreshTimer)
+    autoRefreshTimer = undefined
+  }
+}
+
+function startAutoRefresh(): void {
+  stopAutoRefresh()
+  autoRefreshTimer = setInterval(() => {
+    void refreshLiveData()
+  }, 1000)
 }
 
 async function reload(): Promise<void> {
@@ -57,6 +120,7 @@ async function reload(): Promise<void> {
   expandedDispatch.value = {}
   dispatchEvents.value = {}
   loadingDispatchEvents.value = {}
+  expandedEvent.value = {}
   await loadGroup()
   await loadSignals()
 }
@@ -98,6 +162,80 @@ async function toggleDispatch(dispatchId: number): Promise<void> {
   } finally {
     loadingDispatchEvents.value[k] = false
   }
+}
+
+function eventKey(dispatchId: number, ev: GroupTaskEventRecord): string {
+  return `${dispatchId}-${ev.id}-${ev.created_at}`
+}
+
+function isEventExpanded(dispatchId: number, ev: GroupTaskEventRecord): boolean {
+  return !!expandedEvent.value[eventKey(dispatchId, ev)]
+}
+
+function toggleEvent(dispatchId: number, ev: GroupTaskEventRecord): void {
+  if (!ev.detail) return
+  const k = eventKey(dispatchId, ev)
+  expandedEvent.value[k] = !expandedEvent.value[k]
+}
+
+const LIMIT_KIND_LABEL: Record<string, string> = {
+  total_lot_limit: '分批笔数上限',
+  max_allow_num: '最大加仓次数',
+}
+
+function limitText(detail: GroupTaskEventDetail): string {
+  if (!detail.limit_value) return '不限'
+  const label = LIMIT_KIND_LABEL[detail.limit_kind || ''] || detail.limit_kind || '上限'
+  return `${label} ${detail.limit_value}`
+}
+
+/** 把开单依据拆成可逐项展示的键值对；首单与加仓的参数集完全不同 */
+function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string }> {
+  const rows: Array<{ k: string; v: string }> = []
+  const push = (k: string, v: unknown): void => {
+    if (v === null || v === undefined || v === '') return
+    rows.push({ k, v: String(v) })
+  }
+  if (detail.kind === 'add') {
+    push('规则类型', detail.rule_type_label)
+    push('命中规则', detail.rule_index === undefined ? '' : `第 ${detail.rule_index + 1} 条`)
+    push('分批档位', detail.batch ? `第 ${(detail.level_index ?? 0) + 1} 档` : '未启用分批')
+    push('持仓方向', detail.direction)
+    push('基准价（最近一笔开仓价）', detail.base_price)
+    push('触发时市价', detail.price)
+    push('最小变动单位', detail.point)
+    push('实际偏离', detail.deviation === undefined ? '' : `${detail.deviation} 点`)
+    push('触发阈值', detail.threshold === undefined ? '' : `${detail.threshold} 点`)
+    push('手数公式', detail.volume_formula)
+    push('首单手数（倍率基准）', detail.base_volume)
+    push('倍数', detail.lot_times)
+    push('追加手数', detail.extra_lot)
+    push('本次手数', detail.volume)
+    push('触发前持仓', detail.position_count === undefined ? '' : `${detail.position_count} 笔`)
+    push('触发前加仓', detail.add_count === undefined ? '' : `${detail.add_count} 次`)
+    push('本次为第', detail.next_position_no === undefined ? '' : `${detail.next_position_no} 笔`)
+    push('生效上限', limitText(detail))
+    push('错误', detail.error)
+    return rows
+  }
+  push('来源信号', detail.signal_id)
+  push('品种', detail.symbol)
+  push('方向', detail.action)
+  push('首单手数', detail.volume)
+  push('止损', detail.stop_loss || '不设')
+  push('止盈', detail.take_profit || '不设')
+  push('信号备注', detail.signal_comment)
+  push('托管策略', detail.strategy_name)
+  push('策略 ID', detail.strategy_id)
+  push('策略模版', detail.template_id)
+  push(
+    '策略规则',
+    detail.rule_count === undefined
+      ? ''
+      : `${detail.enabled_rule_count ?? 0} / ${detail.rule_count} 条生效`,
+  )
+  push('魔术号', detail.magic)
+  return rows
 }
 
 function fmtTime(sec: number | null | undefined): string {
@@ -179,13 +317,24 @@ function eventTag(eventType: string): { cls: string; text: string } {
 
 onMounted(reload)
 watch(groupId, reload)
+
+watch(autoRefresh, (on) => {
+  if (on) {
+    void refreshLiveData()
+    startAutoRefresh()
+  } else {
+    stopAutoRefresh()
+  }
+})
+
+onUnmounted(stopAutoRefresh)
 </script>
 
 <template>
   <div class="group-signals-page">
-    <a class="node-link" style="font-size: 13px" @click="router.push('/groups')">← 返回分组列表</a>
+    <a class="node-link signals-back" @click="router.push('/groups')">← 返回分组列表</a>
 
-    <div class="row between page-header" style="margin-top: 12px">
+    <div class="row between page-header signals-header">
       <div>
         <div class="h1">分组信号{{ group ? ` · ${group.name}` : '' }}</div>
         <p class="muted" style="font-size: 13px; margin-top: 4px">
@@ -196,12 +345,20 @@ watch(groupId, reload)
           <template v-else>加载中…</template>
         </p>
       </div>
-      <button class="btn-sm btn-ghost" :disabled="loading || !group" @click="loadSignals">
-        {{ loading ? '刷新中…' : '刷新' }}
-      </button>
+      <div class="row signals-actions">
+        <label class="row muted auto-refresh-toggle" title="开启后每秒刷新主任务与已展开节点的关联订单">
+          <input v-model="autoRefresh" type="checkbox" :disabled="!group" />
+          <span>自动刷新</span>
+          <span v-if="autoRefresh" class="auto-refresh-hint">1s</span>
+        </label>
+        <button class="btn-sm btn-ghost" :disabled="loading || !group" @click="loadSignals">
+          {{ loading ? '刷新中…' : '刷新' }}
+        </button>
+      </div>
     </div>
 
-    <div v-if="group" class="card card-pad">
+    <div v-if="group" class="card card-pad signals-panel">
+      <div class="signals-scroll">
       <div v-if="signals.length" class="table-scroll">
         <table class="group-signal-table">
           <thead>
@@ -320,6 +477,7 @@ watch(groupId, reload)
                                 <table class="group-event-table">
                                   <thead>
                                     <tr>
+                                      <th style="width: 22px"></th>
                                       <th>时间</th>
                                       <th>类型</th>
                                       <th>动作</th>
@@ -329,26 +487,45 @@ watch(groupId, reload)
                                       <th class="right">持仓</th>
                                       <th class="right">累计手数</th>
                                       <th class="right">盈亏</th>
-                                      <th>说明</th>
+                                      <th>开单原因</th>
                                     </tr>
                                   </thead>
                                   <tbody>
-                                    <tr v-for="ev in dispatchEvents[String(d.id)]" :key="`${d.id}-${ev.id}-${ev.created_at}`">
-                                      <td class="muted" style="white-space: nowrap">{{ fmtTime(ev.created_at) }}</td>
-                                      <td>
-                                        <span class="tag" :class="eventTag(ev.event_type).cls">
-                                          {{ eventTag(ev.event_type).text }}
-                                        </span>
-                                      </td>
-                                      <td>{{ ev.action || '—' }}</td>
-                                      <td class="right">{{ ev.volume ?? '—' }}</td>
-                                      <td class="right">{{ ev.price ?? '—' }}</td>
-                                      <td>{{ ev.order_ticket ?? '—' }}</td>
-                                      <td class="right">{{ ev.position_count ?? '—' }}</td>
-                                      <td class="right">{{ ev.total_volume ?? '—' }}</td>
-                                      <td class="right">{{ ev.profit ?? '—' }}</td>
-                                      <td class="muted group-break">{{ ev.message || '—' }}</td>
-                                    </tr>
+                                    <template v-for="ev in dispatchEvents[String(d.id)]" :key="eventKey(d.id, ev)">
+                                      <tr :class="ev.detail ? 'clickable' : ''" @click="toggleEvent(d.id, ev)">
+                                        <td class="muted">
+                                          <template v-if="ev.detail">{{ isEventExpanded(d.id, ev) ? '▾' : '▸' }}</template>
+                                        </td>
+                                        <td class="muted" style="white-space: nowrap">{{ fmtTime(ev.created_at) }}</td>
+                                        <td>
+                                          <span class="tag" :class="eventTag(ev.event_type).cls">
+                                            {{ eventTag(ev.event_type).text }}
+                                          </span>
+                                        </td>
+                                        <td>{{ ev.action || '—' }}</td>
+                                        <td class="right">{{ ev.volume ?? '—' }}</td>
+                                        <td class="right">{{ ev.price ?? '—' }}</td>
+                                        <td>{{ ev.order_ticket ?? '—' }}</td>
+                                        <td class="right">{{ ev.position_count ?? '—' }}</td>
+                                        <td class="right">{{ ev.total_volume ?? '—' }}</td>
+                                        <td class="right">{{ ev.profit ?? '—' }}</td>
+                                        <td class="muted group-break">{{ ev.message || '—' }}</td>
+                                      </tr>
+                                      <tr v-if="ev.detail && isEventExpanded(d.id, ev)" class="detail-row">
+                                        <td></td>
+                                        <td colspan="10">
+                                          <div class="muted" style="font-size: 12px; margin-bottom: 6px">
+                                            计算依据 · 订单 {{ ev.order_ticket ?? '—' }}
+                                          </div>
+                                          <div class="kv-grid event-detail-grid">
+                                            <div v-for="row in detailRows(ev.detail)" :key="row.k" class="kv">
+                                              <span class="k">{{ row.k }}</span>
+                                              <span class="v">{{ row.v }}</span>
+                                            </div>
+                                          </div>
+                                        </td>
+                                      </tr>
+                                    </template>
                                   </tbody>
                                 </table>
                               </div>
@@ -370,8 +547,9 @@ watch(groupId, reload)
       </div>
       <div v-else-if="loading" class="muted" style="font-size: 13px; padding: 8px 0">加载中…</div>
       <div v-else class="muted" style="font-size: 13px; padding: 8px 0">该分组暂无信号记录。</div>
+      </div>
 
-      <div v-if="total > 0" class="pagination" style="margin-top: 12px">
+      <div v-if="total > 0" class="pagination signals-foot">
         <span class="muted pagination-info">
           共 {{ total }} 条 · 第 {{ page }} / {{ totalPages }} 页
         </span>
@@ -398,16 +576,103 @@ watch(groupId, reload)
 </template>
 
 <style scoped>
+/* 固定为浏览器可视高度：顶栏 60px + content 上下 padding 48px = 108px */
 .group-signals-page {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
   width: 100%;
   min-width: 0;
+  height: calc(100vh - 108px);
+  height: calc(100dvh - 108px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+  min-height: 0;
+  overflow: hidden;
+}
+
+.signals-back {
+  flex-shrink: 0;
+  font-size: 13px;
+}
+
+.signals-header {
+  flex-shrink: 0;
+  margin: 0;
+}
+
+.signals-actions {
+  gap: 12px;
+  flex-shrink: 0;
+}
+
+.auto-refresh-toggle {
+  gap: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.auto-refresh-toggle input {
+  width: auto;
+  margin: 0;
+  cursor: pointer;
+}
+
+.auto-refresh-toggle:has(input:disabled) {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.auto-refresh-hint {
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--primary);
+}
+
+.signals-panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.signals-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.signals-foot {
+  flex-shrink: 0;
+  margin-top: 12px;
+}
+
+@media (max-width: 640px) {
+  /* 小屏顶栏约 56px+、content padding 14*2 */
+  .group-signals-page {
+    height: calc(100vh - 84px);
+    height: calc(100dvh - 84px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+  }
 }
 
 .group-signal-table,
 .group-detail-table,
 .group-event-table {
   width: 100%;
-  min-width: 0;
+}
+
+/* 多列表格保持足够最小宽度，避免状态标签被挤成竖排 */
+.group-signal-table {
+  min-width: 860px;
+}
+
+.group-detail-table {
+  min-width: 1280px;
+}
+
+.group-event-table {
+  min-width: 960px;
 }
 
 .group-signal-table th,
@@ -417,12 +682,28 @@ watch(groupId, reload)
 .group-event-table th,
 .group-event-table td {
   font-size: 12px;
-  vertical-align: top;
+  vertical-align: middle;
+}
+
+.group-signal-table .tag,
+.group-detail-table .tag,
+.group-event-table .tag {
+  white-space: nowrap;
 }
 
 .group-event-table {
   margin-top: 2px;
   background: rgba(255, 255, 255, 0.02);
+}
+
+.event-detail-grid {
+  margin: 2px 0 8px;
+  gap: 10px 14px;
+}
+
+.event-detail-grid .v {
+  font-size: 12px;
+  word-break: break-word;
 }
 
 .group-payload {

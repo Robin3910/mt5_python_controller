@@ -497,6 +497,7 @@ label {
 .dot.offline { background: #4b5563; box-shadow: none; }
 
 .tag {
+  display: inline-block;
   font-size: 11px;
   font-weight: 600;
   padding: 3px 9px;
@@ -505,6 +506,9 @@ label {
   color: var(--muted);
   border: 1px solid var(--glass-border);
   letter-spacing: 0.02em;
+  white-space: nowrap;
+  word-break: keep-all;
+  vertical-align: middle;
 }
 .tag.green { background: rgba(16, 185, 129, 0.12); color: #34d399; border-color: rgba(16, 185, 129, 0.25); }
 .tag.blue { background: rgba(59, 130, 246, 0.12); color: #60a5fa; border-color: rgba(59, 130, 246, 0.25); }

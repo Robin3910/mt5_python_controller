@@ -198,13 +198,24 @@ export interface GroupUpdatePayload {
   node_ids?: string[]
 }
 
-/** 分批加仓档位：持仓笔数区间内的点数 / 倍数 */
+/** 分批档位的加仓间距计算方式 */
+export type BatchCalcType = 'point' | 'price' | 'atr' | 'range'
+
+/** ATR / 波幅可选的 K 线周期 */
+export type BatchTimeframe = 'M1' | 'M5' | 'M15' | 'M30' | 'H1' | 'H4' | 'D1' | 'W1' | 'MN'
+
+/** 分批加仓档位：持仓笔数区间内的加仓间距 / 倍数 */
 export interface StrategyBatchLevel {
   pos_from: number
   pos_to: number
-  /** point=点数 */
-  calc_type: string
+  /** 间距计算方式：point=点数 / price=指定价位 / atr=ATR / range=K线波幅 */
+  calc_type: BatchCalcType
+  /** calc_type=point 时的触发点数 */
   point: number
+  /** calc_type=price 时的绝对价位 */
+  price: number
+  /** calc_type=atr / range 时统计用的 K 线周期 */
+  timeframe: BatchTimeframe
   lot_times: number
   extra_lot: number
 }
@@ -356,7 +367,52 @@ export interface GroupTaskEventRecord {
   position_count: number | null
   total_volume: number | null
   profit: number | null
+  /** 开单原因：人读的一句话说明 */
   message: string | null
+  /** 计算依据明细：偏离点数、阈值、手数公式等逐项参数 */
+  detail: GroupTaskEventDetail | null
+}
+
+/** 事件的计算依据明细。首单为 kind=open，加仓为 kind=add，字段随之不同 */
+export interface GroupTaskEventDetail {
+  kind?: 'open' | 'add'
+  // —— 加仓（kind=add）——
+  rule_type?: number
+  rule_type_label?: string
+  rule_index?: number
+  level_index?: number | null
+  batch?: boolean
+  direction?: string
+  base_price?: number
+  price?: number
+  point?: number
+  deviation?: number
+  threshold?: number
+  base_volume?: number
+  lot_times?: number
+  extra_lot?: number
+  volume?: number
+  volume_formula?: string
+  position_count?: number
+  add_count?: number
+  next_position_no?: number
+  limit_kind?: string
+  limit_value?: number
+  error?: string
+  // —— 首单（kind=open）——
+  signal_id?: string
+  task_id?: number
+  magic?: number
+  symbol?: string
+  action?: string
+  stop_loss?: number | null
+  take_profit?: number | null
+  signal_comment?: string | null
+  strategy_id?: string
+  strategy_name?: string
+  template_id?: string
+  rule_count?: number
+  enabled_rule_count?: number
 }
 
 // 手动触发接口返回（与 /webhook 响应同构，字段视 status 而定）

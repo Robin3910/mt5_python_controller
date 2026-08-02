@@ -480,6 +480,7 @@ async def record_strategy_progress(
 
             if event_type and event_type != "heartbeat":
                 order = data.get("last_order") or {}
+                detail = data.get("detail")
                 s.add(
                     GroupTaskEvent(
                         task_id=task_id,
@@ -494,7 +495,9 @@ async def record_strategy_progress(
                         position_count=_int_or_none(data.get("position_count")),
                         total_volume=_num(data.get("total_volume")),
                         profit=_num(data.get("profit")),
-                        message=(data.get("message") or None),
+                        # 开单原因（人读）与计算依据（结构化）由节点在下单时一并上报
+                        message=(str(data["message"])[:255] if data.get("message") else None),
+                        detail_json=detail if isinstance(detail, dict) else None,
                     )
                 )
 
@@ -928,6 +931,7 @@ def _event_row(e: GroupTaskEvent) -> dict:
         "total_volume": e.total_volume,
         "profit": e.profit,
         "message": e.message,
+        "detail": e.detail_json,
     }
 
 
@@ -956,13 +960,14 @@ def _synthetic_open_event(d: GroupTaskDispatch) -> Optional[dict]:
         "total_volume": d.total_volume or None,
         "profit": d.realized_profit if d.realized_profit else None,
         "message": d.error or d.finish_reason,
+        "detail": None,
     }
 
 
 async def list_dispatch_events(group_id: str, dispatch_id: int) -> Optional[list[dict]]:
     """读取某节点子任务的策略执行事件流（开仓 / 加仓 / 平仓等关联订单）。
 
-    子任务不属于该分组时返回 None；否则返回按时间升序的事件列表。
+    子任务不属于该分组时返回 None；否则返回按时间倒序（最新在前）的事件列表。
     """
     try:
         async with SessionLocal() as s:
@@ -983,16 +988,16 @@ async def list_dispatch_events(group_id: str, dispatch_id: int) -> Optional[list
                         GroupTaskEvent.task_id == row.task_id,
                         GroupTaskEvent.node_id == row.node_id,
                     )
-                    .order_by(GroupTaskEvent.id.asc())
+                    .order_by(GroupTaskEvent.id.desc())
                 )
             ).scalars().all()
             items = [_event_row(e) for e in events]
             tickets = {e.order_ticket for e in events if e.order_ticket}
-            # 首单回报若未进事件流，补一条（避免只有快照字段却看不到关联订单）
+            # 首单回报若未进事件流，补一条挂到列表末尾（时间最早）
             if row.order_ticket and row.order_ticket not in tickets:
                 syn = _synthetic_open_event(row)
                 if syn:
-                    items.insert(0, syn)
+                    items.append(syn)
             elif not items:
                 syn = _synthetic_open_event(row)
                 if syn:

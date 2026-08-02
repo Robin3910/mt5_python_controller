@@ -22,7 +22,23 @@ RULE_TYPE_COUNTER = 1  # 逆势加仓
 RULE_TYPE_TREND = 2    # 顺势加仓
 
 RULE_ACTIONS = ("all", "buy", "sell")
-BATCH_CALC_TYPES = ("point",)  # 点数；预留扩展
+
+# 分批档位的加仓间距计算方式：
+# point 点数固定间距；price 指定绝对价位到价触发；
+# atr 用 ATR 的平均波动作间距；range 用已收盘 K 线的最大高低波幅作间距。
+BATCH_CALC_POINT = "point"
+BATCH_CALC_PRICE = "price"
+BATCH_CALC_ATR = "atr"
+BATCH_CALC_RANGE = "range"
+BATCH_CALC_TYPES = (BATCH_CALC_POINT, BATCH_CALC_PRICE, BATCH_CALC_ATR, BATCH_CALC_RANGE)
+# 需要读 K 线才能算出间距的方式
+BATCH_CALC_BAR_TYPES = (BATCH_CALC_ATR, BATCH_CALC_RANGE)
+
+# ATR / 波幅可选的 K 线周期（不提供「当前图表周期」：节点是独立进程，没有图表上下文）
+BATCH_TIMEFRAMES = ("M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1", "MN")
+DEFAULT_BATCH_TIMEFRAME = "M5"
+# ATR / 波幅统计的已收盘 K 线根数，固定不可配
+BATCH_BAR_PERIOD = 14
 
 TEMPLATE_1_ID = "tpl_1"
 TEMPLATE_1_NAME = "策略模版1"
@@ -34,11 +50,17 @@ TEMPLATE_1_NAME = "策略模版1"
 
 @dataclass
 class BatchLevel:
-    """分批加仓档位：在持仓笔数 [pos_from, pos_to] 内使用本组参数。"""
+    """分批加仓档位：在持仓笔数 [pos_from, pos_to] 内使用本组参数。
+
+    加仓间距由 calc_type 决定用哪个参数：point 用点数，price 用指定价位，
+    atr / range 用 timeframe 周期上的 K 线统计值（间距由行情实时算出）。
+    """
     pos_from: int = 2
     pos_to: int = 4
-    calc_type: str = "point"  # 点数
-    point: float = 100.0
+    calc_type: str = BATCH_CALC_POINT
+    point: float = 100.0            # calc_type=point：触发点数
+    price: float = 0.0              # calc_type=price：指定的绝对价位
+    timeframe: str = DEFAULT_BATCH_TIMEFRAME  # calc_type=atr / range：K 线周期
     lot_times: float = 1.1
     extra_lot: float = 0.0
 
@@ -134,9 +156,9 @@ class TemplateRuleSet:
 def _default_counter_batch_levels() -> list[BatchLevel]:
     """MTcommander 风格默认分批档位。"""
     return [
-        BatchLevel(pos_from=2, pos_to=4, calc_type="point", point=100.0, lot_times=1.1, extra_lot=0.0),
-        BatchLevel(pos_from=5, pos_to=7, calc_type="point", point=200.0, lot_times=1.2, extra_lot=0.0),
-        BatchLevel(pos_from=8, pos_to=10, calc_type="point", point=300.0, lot_times=1.3, extra_lot=0.0),
+        BatchLevel(pos_from=2, pos_to=4, point=100.0, lot_times=1.1, extra_lot=0.0),
+        BatchLevel(pos_from=5, pos_to=7, point=200.0, lot_times=1.2, extra_lot=0.0),
+        BatchLevel(pos_from=8, pos_to=10, point=300.0, lot_times=1.3, extra_lot=0.0),
     ]
 
 
@@ -247,10 +269,16 @@ def _as_float(value: object, default: float) -> float:
         return default
 
 
+def normalize_timeframe(value: object) -> str:
+    """规范化 K 线周期；非法值回落到默认周期。"""
+    tf = str(value or "").strip().upper()
+    return tf if tf in BATCH_TIMEFRAMES else DEFAULT_BATCH_TIMEFRAME
+
+
 def normalize_batch_level(raw: dict) -> dict[str, Any]:
-    calc_type = str(raw.get("calc_type") or "point").strip().lower()
+    calc_type = str(raw.get("calc_type") or BATCH_CALC_POINT).strip().lower()
     if calc_type not in BATCH_CALC_TYPES:
-        calc_type = "point"
+        calc_type = BATCH_CALC_POINT
     pos_from = max(0, _as_int(raw.get("pos_from", 1), 1))
     pos_to = max(pos_from, _as_int(raw.get("pos_to", pos_from), pos_from))
     return {
@@ -258,6 +286,9 @@ def normalize_batch_level(raw: dict) -> dict[str, Any]:
         "pos_to": pos_to,
         "calc_type": calc_type,
         "point": max(0.0, _as_float(raw.get("point", 100), 100.0)),
+        # 指定价位是绝对价格，允许为 0（表示未设置，节点侧据此跳过该档）
+        "price": max(0.0, _as_float(raw.get("price", 0.0), 0.0)),
+        "timeframe": normalize_timeframe(raw.get("timeframe")),
         "lot_times": max(0.0, _as_float(raw.get("lot_times", 1.0), 1.0)),
         "extra_lot": max(0.0, _as_float(raw.get("extra_lot", 0.0), 0.0)),
     }

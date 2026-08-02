@@ -19,6 +19,12 @@ _DEFAULT_PRICES = {
     "US100": 19000.0,
 }
 
+# 合成 K 线的周期秒数，仅用于让模拟数据的时间轴看起来合理
+_TIMEFRAME_SECONDS = {
+    "M1": 60, "M5": 300, "M15": 900, "M30": 1800,
+    "H1": 3600, "H4": 14400, "D1": 86400, "W1": 604800, "MN": 2592000,
+}
+
 
 class MockMT5Client:
     def __init__(self, login=0, password="", server="", path="", slippage=20, magic=20240615):
@@ -131,6 +137,29 @@ class MockMT5Client:
         mid = float(self.prices_map.get(symbol.upper(), 1.0))
         # 与常见券商一致：五位报价品种 0.00001，金/指数类 0.01
         return 0.01 if mid >= 100 else 0.00001
+
+    def closed_bars(self, symbol: str, timeframe: str, count: int) -> list[dict]:
+        """合成一段已收盘 K 线：围绕当前中间价做固定振幅，便于联调 ATR / 波幅。
+
+        振幅取 200 个 point，因此 ATR 与最大波幅都稳定等于该值，测试可直接断言。
+        """
+        tf = str(timeframe or "").strip().upper()
+        step = _TIMEFRAME_SECONDS.get(tf)
+        if step is None or count <= 0:
+            return []
+        mid = float(self.prices_map.get(symbol.upper(), 1.0))
+        span = self.symbol_point(symbol) * 200
+        now = time.time()
+        bars = []
+        for i in range(int(count), 0, -1):
+            bars.append({
+                "time": now - i * step,
+                "open": mid,
+                "high": mid + span / 2,
+                "low": mid - span / 2,
+                "close": mid,
+            })
+        return bars
 
     def close_symbol(self, symbol: str) -> dict:
         base = symbol.upper().replace("/", "")

@@ -20,7 +20,19 @@ import time
 from typing import Callable, Optional
 
 from market_hub import GONE, STALE, MarketEvent, MarketHub, Subscription
-from strategy_rules import PositionCtx, evaluate
+from strategy_rules import (
+    CALC_BAR_TYPES,
+    MT5_COMMENT_LIMIT,
+    PositionCtx,
+    decision_comment,
+    decision_detail,
+    describe_decision,
+    evaluate,
+    metric_key,
+)
+
+# 事件说明落库字段为 VARCHAR(255)，本地先截断，避免整条上报被后端丢弃
+MESSAGE_LIMIT = 255
 
 logger = logging.getLogger("node.strategy")
 
@@ -76,6 +88,7 @@ class StrategyRunner:
         self._task: Optional[asyncio.Task] = None
         self._sub: Optional[Subscription] = None
         self._last_report = 0.0
+        self._metric_specs: Optional[list[tuple[str, str]]] = None
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -158,7 +171,9 @@ class StrategyRunner:
         if self._seed_pending:
             self._seed_from_positions(positions)
 
-        decision = evaluate(self.strategy.get("rules") or [], self._ctx(event, positions))
+        ctx = self._ctx(event, positions)
+        ctx.bar_metrics = await self._read_bar_metrics()
+        decision = evaluate(self.strategy.get("rules") or [], ctx)
         if decision is not None:
             await self._add_position(decision, positions)
             return False
@@ -166,6 +181,42 @@ class StrategyRunner:
         if time.time() - self._last_report >= self.report_interval:
             await self._emit_progress("heartbeat", phase="running", positions=positions)
         return False
+
+    def _bar_metric_specs(self) -> list[tuple[str, str]]:
+        """扫策略快照，收集需要读 K 线的 (指标, 周期) 组合。
+
+        规则在任务期内不变，所以只解析一次；没有 ATR / 波幅档位时结果为空，
+        整条 K 线读取链路都不会被触发。
+        """
+        if self._metric_specs is not None:
+            return self._metric_specs
+        specs: list[tuple[str, str]] = []
+        for rule in self.strategy.get("rules") or []:
+            if not isinstance(rule, dict) or not rule.get("batch_enabled"):
+                continue
+            for level in rule.get("batch_levels") or []:
+                if not isinstance(level, dict):
+                    continue
+                calc_type = str(level.get("calc_type") or "").strip().lower()
+                if calc_type not in CALC_BAR_TYPES:
+                    continue
+                spec = (calc_type, str(level.get("timeframe") or "").strip().upper())
+                if spec[1] and spec not in specs:
+                    specs.append(spec)
+        self._metric_specs = specs
+        return specs
+
+    async def _read_bar_metrics(self) -> dict[str, float]:
+        """判定前预取 ATR / 波幅。取值走 MarketHub 的按周期缓存，不会每轮都读 K 线。"""
+        specs = self._bar_metric_specs()
+        if not specs:
+            return {}
+        metrics: dict[str, float] = {}
+        for metric, timeframe in specs:
+            value = await self._hub.bar_metric(self.symbol, timeframe, metric)
+            if value > 0:
+                metrics[metric_key(metric, timeframe)] = value
+        return metrics
 
     def _ctx(self, event: MarketEvent, positions: list[dict]) -> PositionCtx:
         """加仓判定上下文：偏离基准取最近一笔订单的开仓价。"""
@@ -208,7 +259,7 @@ class StrategyRunner:
             self._mt5.place_market_order,
             self.symbol, self.direction, self.base_volume,
             self.entry.get("stop_loss"), self.entry.get("take_profit"),
-            self.entry.get("comment") or "", self.magic,
+            self._open_comment(), self.magic,
         )
         res = dict(res or {})
         res["signal_id"] = self.signal_id
@@ -231,31 +282,32 @@ class StrategyRunner:
                 "price": res.get("price"),
                 "volume": self.base_volume,
             },
+            message=self._describe_open(),
+            detail=self._open_detail(),
         )
         return True
 
     async def _add_position(self, decision, positions: list[dict]) -> None:
+        reason = describe_decision(decision)
         res = await self._exec(
             self._mt5.place_market_order,
             self.symbol, decision.action, decision.volume,
-            None, None, f"add#{self.add_count + 1}", self.magic,
+            None, None, decision_comment(decision), self.magic,
         )
         res = dict(res or {})
         if not res.get("success"):
             logger.warning("task %s add failed: %s", self.task_id, res.get("error"))
+            # 失败也带上判定依据，便于对照「本该按什么规则加仓」排查
             await self._emit_progress(
                 "error", phase="running", positions=positions,
-                message=str(res.get("error") or "add order failed")[:200],
+                message=f"加仓失败：{res.get('error') or 'add order failed'}；{reason}",
+                detail={**decision_detail(decision), "error": str(res.get("error") or "")},
             )
             return
         self.add_count += 1
         self.total_orders += 1
         self.total_volume += decision.volume
-        logger.info(
-            "task %s add #%s %s %.2f (dev %.1f >= %.1f)",
-            self.task_id, self.add_count, decision.action,
-            decision.volume, decision.deviation, decision.threshold,
-        )
+        logger.info("task %s add #%s: %s", self.task_id, self.add_count, reason)
         await self._emit_progress(
             decision.event_type, phase="running",
             last_order={
@@ -263,8 +315,56 @@ class StrategyRunner:
                 "price": res.get("price"),
                 "volume": decision.volume,
             },
-            message=f"level={decision.level_index} dev={decision.deviation:.1f}",
+            message=reason,
+            detail=decision_detail(decision),
         )
+
+    # ------------------------------------------------------------------
+    # 首单的开单原因
+    # ------------------------------------------------------------------
+    def _strategy_name(self) -> str:
+        return str(self.strategy.get("name") or self.strategy.get("strategy_id") or "未命名策略")
+
+    def _open_comment(self) -> str:
+        """首单的 MT5 备注：信号自带备注优先，为空时回落到可反查任务的编码。"""
+        comment = str(self.entry.get("comment") or "").strip()
+        return (comment or f"S{self.task_id}")[:MT5_COMMENT_LIMIT]
+
+    def _describe_open(self) -> str:
+        """首单的开单原因：说明这一单来自哪条信号、按哪个策略托管。"""
+        parts = [
+            f"策略信号首单：{self.direction} {self.symbol} {self.base_volume} 手",
+            f"托管策略「{self._strategy_name()}」（{self._enabled_rule_count()} 条规则生效）",
+        ]
+        sl, tp = self.entry.get("stop_loss"), self.entry.get("take_profit")
+        parts.append(f"止损 {sl if sl else '不设'}，止盈 {tp if tp else '不设'}")
+        parts.append(f"信号 {self.signal_id or '—'}")
+        return "；".join(parts)
+
+    def _enabled_rule_count(self) -> int:
+        return sum(
+            1 for r in (self.strategy.get("rules") or [])
+            if isinstance(r, dict) and str(r.get("status") or "0") not in ("0", "False")
+        )
+
+    def _open_detail(self) -> dict:
+        return {
+            "kind": "open",
+            "signal_id": self.signal_id,
+            "task_id": self.task_id,
+            "magic": self.magic,
+            "symbol": self.symbol,
+            "action": self.direction,
+            "volume": self.base_volume,
+            "stop_loss": self.entry.get("stop_loss"),
+            "take_profit": self.entry.get("take_profit"),
+            "signal_comment": self.entry.get("comment") or None,
+            "strategy_id": self.strategy.get("strategy_id"),
+            "strategy_name": self.strategy.get("name"),
+            "template_id": self.strategy.get("template_id"),
+            "rule_count": len(self.strategy.get("rules") or []),
+            "enabled_rule_count": self._enabled_rule_count(),
+        }
 
     async def _close_all(self) -> None:
         """终止指令：平掉该魔术号的全部持仓后收口。"""
@@ -294,6 +394,7 @@ class StrategyRunner:
         positions: Optional[list[dict]] = None,
         last_order: Optional[dict] = None,
         message: Optional[str] = None,
+        detail: Optional[dict] = None,
     ) -> None:
         self._last_report = time.time()
         data = {
@@ -310,7 +411,9 @@ class StrategyRunner:
         if last_order:
             data["last_order"] = last_order
         if message:
-            data["message"] = message
+            data["message"] = message[:MESSAGE_LIMIT]
+        if detail:
+            data["detail"] = detail
         await self._send({"type": "strategy_progress", "data": data})
 
     async def _finish(self, status: str, reason: str) -> None:

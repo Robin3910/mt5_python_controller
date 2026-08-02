@@ -131,6 +131,80 @@ def test_create_strategy_with_custom_rules(client):
     assert by_type[2]["action"] == "sell"
 
 
+def _batch_rule(level: dict) -> dict:
+    """单档分批的逆势规则，用于验证档位字段的规范化。"""
+    return {
+        "type": 1, "status": 1, "action": "all",
+        "point": 100, "lot_times": 1.1, "extra_lot": 0, "max_allow_num": 3,
+        "batch_enabled": True, "batch_action": "all",
+        "batch_count": 1, "total_lot_limit": 10,
+        "batch_levels": [{"pos_from": 2, "pos_to": 10, "lot_times": 1.2, "extra_lot": 0, **level}],
+    }
+
+
+def _created_level(client, headers, name: str, level: dict) -> dict:
+    r = client.post(
+        "/api/strategies",
+        json={
+            "template_id": TEMPLATE_1_ID, "name": name, "symbol": "XAUUSD",
+            "rules": [_batch_rule(level)],
+        },
+        headers=headers,
+    )
+    assert r.status_code == 201, r.text
+    rule = next(x for x in r.json()["rules"] if x["type"] == 1)
+    return rule["batch_levels"][0]
+
+
+def test_batch_level_keeps_each_calc_type(client):
+    """四种加仓间距计算方式都要能原样存下来。"""
+    h = auth_headers(client)
+
+    price = _created_level(client, h, "指定价策略", {"calc_type": "price", "price": 2399.5})
+    assert (price["calc_type"], price["price"]) == ("price", 2399.5)
+
+    atr = _created_level(client, h, "ATR策略", {"calc_type": "atr", "timeframe": "H1"})
+    assert (atr["calc_type"], atr["timeframe"]) == ("atr", "H1")
+
+    rng = _created_level(client, h, "波幅策略", {"calc_type": "range", "timeframe": "M15"})
+    assert (rng["calc_type"], rng["timeframe"]) == ("range", "M15")
+
+    point = _created_level(client, h, "点数策略", {"calc_type": "point", "point": 250})
+    assert (point["calc_type"], point["point"]) == ("point", 250)
+
+
+def test_batch_level_normalizes_illegal_calc_and_timeframe(client):
+    """枚举类字段没法靠类型校验拦住，非法取值回落到默认，不把坏配置下发给节点。"""
+    h = auth_headers(client)
+    level = _created_level(
+        client, h, "非法取值策略", {"calc_type": "unknown", "timeframe": "M7"},
+    )
+    assert level["calc_type"] == "point"
+    assert level["timeframe"] == "M5"
+
+
+def test_batch_level_rejects_negative_price(client):
+    h = auth_headers(client)
+    r = client.post(
+        "/api/strategies",
+        json={
+            "template_id": TEMPLATE_1_ID, "name": "负价策略", "symbol": "XAUUSD",
+            "rules": [_batch_rule({"calc_type": "price", "price": -1})],
+        },
+        headers=h,
+    )
+    assert r.status_code == 422
+
+
+def test_batch_level_defaults_when_fields_absent(client):
+    """老配置没有新字段时要能补上默认值，不影响既有策略。"""
+    h = auth_headers(client)
+    level = _created_level(client, h, "老配置策略", {"point": 150})
+    assert level["calc_type"] == "point"
+    assert level["price"] == 0
+    assert level["timeframe"] == "M5"
+
+
 def test_create_strategy_duplicate_name_409(client):
     h = auth_headers(client)
     payload = {"template_id": TEMPLATE_1_ID, "name": "重名策略", "symbol": "EURUSD"}

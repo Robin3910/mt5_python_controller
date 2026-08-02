@@ -21,6 +21,10 @@ class FakeMT5:
         self.fail_positions = False
         self.positions_calls = 0
         self.quotes_calls = 0
+        self.bars_calls = 0
+        self.fail_bars = False
+        # 每根 K 线高低差固定 2.0，ATR 与最大波幅都等于 2.0
+        self.bar_span = 2.0
 
     def positions(self) -> list[dict]:
         self.positions_calls += 1
@@ -34,6 +38,17 @@ class FakeMT5:
 
     def symbol_point(self, symbol) -> float:
         return self.point
+
+    def closed_bars(self, symbol, timeframe, count) -> list[dict]:
+        self.bars_calls += 1
+        if self.fail_bars:
+            raise RuntimeError("no history")
+        mid = 2330.0
+        half = self.bar_span / 2
+        return [
+            {"time": float(i), "open": mid, "high": mid + half, "low": mid - half, "close": mid}
+            for i in range(int(count))
+        ]
 
     def add(self, *, ticket: int, magic: int, price: float = 2330.0) -> None:
         self._positions.append({
@@ -330,3 +345,46 @@ async def test_loop_survives_sample_error():
     assert event.kind in (mh.STALE, mh.TICK)
     assert hub._task is not None and not hub._task.done()
     await hub.close()
+
+
+# --------------------------- ATR / 波幅指标 ---------------------------
+async def test_bar_metric_computes_atr_and_range():
+    mt5 = FakeMT5()
+    hub = _hub(mt5)
+
+    assert await hub.bar_metric("XAUUSD", "M5", "atr") == 2.0
+    assert await hub.bar_metric("XAUUSD", "M5", "range") == 2.0
+
+
+async def test_bar_metric_is_cached_within_the_bar():
+    """采样每轮都会问指标，但同一根 K 线内不该重复读 K 线。"""
+    mt5 = FakeMT5()
+    hub = _hub(mt5)
+
+    for _ in range(5):
+        assert await hub.bar_metric("XAUUSD", "M5", "atr") == 2.0
+
+    assert mt5.bars_calls == 1
+
+
+async def test_bar_metric_caches_per_timeframe_and_metric():
+    mt5 = FakeMT5()
+    hub = _hub(mt5)
+
+    await hub.bar_metric("XAUUSD", "M5", "atr")
+    await hub.bar_metric("XAUUSD", "M15", "atr")     # 换周期要重新读
+    await hub.bar_metric("XAUUSD", "M5", "range")    # 换指标也要重新读
+    await hub.bar_metric("XAUUSD", "M5", "atr")      # 命中缓存
+
+    assert mt5.bars_calls == 3
+
+
+async def test_bar_metric_failure_is_not_cached():
+    """读不到就返回 0 让判定跳过，但不能把 0 缓存住，否则该档位会长期失效。"""
+    mt5 = FakeMT5()
+    mt5.fail_bars = True
+    hub = _hub(mt5)
+
+    assert await hub.bar_metric("XAUUSD", "M5", "atr") == 0.0
+    mt5.fail_bars = False
+    assert await hub.bar_metric("XAUUSD", "M5", "atr") == 2.0

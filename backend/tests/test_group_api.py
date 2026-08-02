@@ -65,6 +65,18 @@ def _wait_task_status(client, headers, group_id: str, expected: str, tries: int 
     return page
 
 
+def _wait_dispatch_event(client, headers, group_id: str, dispatch_id: int,
+                         event_type: str, tries: int = 100) -> dict | None:
+    """节点上报是异步落库，轮询等待目标事件出现后再断言。"""
+    url = f"/api/groups/{group_id}/dispatches/{dispatch_id}/events"
+    for _ in range(tries):
+        for event in client.get(url, headers=headers).json():
+            if event["event_type"] == event_type:
+                return event
+        time.sleep(0.02)
+    return None
+
+
 def _mk_group(client, headers, *, symbol="XAUUSD", **body) -> dict:
     """建分组；默认自动绑定一条同品种策略（strategy 信号只进已绑策略的分组）。
 
@@ -724,12 +736,89 @@ def test_dispatch_events_related_orders(client):
     assert "open" in types
     assert "add_counter" in types
     assert "close_all" in types
+    # 最新在前：收口 → 加仓 → 开仓
+    assert types.index("close_all") < types.index("add_counter") < types.index("open")
     add = next(e for e in ev2.json() if e["event_type"] == "add_counter")
     assert add["order_ticket"] == 88002
     assert add["price"] == 2398.0
 
     assert client.get(f"/api/groups/{gid}/dispatches/999999/events", headers=h).status_code == 404
     assert client.get("/api/groups/grp_missing/dispatches/1/events", headers=h).status_code == 404
+
+
+def test_dispatch_event_keeps_open_reason_and_calc_detail(client):
+    """节点上报的开单原因与计算依据要原样落库并回读，用于还原这一单为什么下。"""
+    h = auth_headers(client)
+    token = _node_token(client, h)
+    n1 = _mk_node(client, h, 5261, "原因节点")
+    gid = _mk_group(client, h, name="开单原因组", node_ids=[n1])["group_id"]
+    reason = (
+        "逆势加仓 · 规则#0：BUY 基准价 2400 → 现价 2399，逆向偏离 100 点 ≥ 阈值 100 点；"
+        "手数 = 首单 0.1 × 倍数 1.1 + 追加 0 = 0.11 手"
+    )
+    detail = {
+        "kind": "add", "rule_type": 1, "rule_type_label": "逆势加仓", "rule_index": 0,
+        "level_index": None, "batch": False, "direction": "BUY",
+        "base_price": 2400.0, "price": 2399.0, "point": 0.01,
+        "deviation": 100.0, "threshold": 100.0,
+        "base_volume": 0.1, "lot_times": 1.1, "extra_lot": 0.0, "volume": 0.11,
+        "volume_formula": "0.1 × 1.1 + 0 = 0.11",
+        "position_count": 1, "add_count": 0, "next_position_no": 2,
+        "limit_kind": "max_allow_num", "limit_value": 3,
+    }
+
+    with client.websocket_connect("/ws/node") as ws1:
+        ws1.send_json({"type": "auth", "data": {"token": token, "mt5_login": 5261}})
+        assert ws1.receive_json()["type"] == "auth_ok"
+
+        client.post("/webhook", json={
+            "action": "buy", "symbol": "XAUUSD", "volume": 0.1, "model": "strategy",
+        })
+        start = ws1.receive_json()
+        did = start["dispatch_id"]
+
+        ws1.send_json({"type": "strategy_progress", "data": {
+            "task_id": start["task_id"], "dispatch_id": did, "magic": start["magic"],
+            "event": "add_counter", "symbol": "XAUUSD", "action": "BUY",
+            "phase": "running", "position_count": 2, "add_count": 1,
+            "total_orders": 2, "total_volume": 0.21,
+            "last_order": {"ticket": 88010, "price": 2399.0, "volume": 0.11},
+            "message": reason, "detail": detail,
+        }})
+        add = _wait_dispatch_event(client, h, gid, did, "add_counter")
+
+    assert add is not None
+    assert add["message"] == reason
+    assert add["detail"] == detail
+
+
+def test_dispatch_event_truncates_overlong_reason(client):
+    """说明列是 VARCHAR(255)，超长文本必须截断而不是整条上报失败。"""
+    h = auth_headers(client)
+    token = _node_token(client, h)
+    n1 = _mk_node(client, h, 5262, "超长说明节点")
+    gid = _mk_group(client, h, name="超长说明组", node_ids=[n1])["group_id"]
+
+    with client.websocket_connect("/ws/node") as ws1:
+        ws1.send_json({"type": "auth", "data": {"token": token, "mt5_login": 5262}})
+        assert ws1.receive_json()["type"] == "auth_ok"
+
+        client.post("/webhook", json={
+            "action": "buy", "symbol": "XAUUSD", "volume": 0.1, "model": "strategy",
+        })
+        start = ws1.receive_json()
+        did = start["dispatch_id"]
+
+        ws1.send_json({"type": "strategy_progress", "data": {
+            "task_id": start["task_id"], "dispatch_id": did, "magic": start["magic"],
+            "event": "add_trend", "symbol": "XAUUSD", "action": "BUY", "phase": "running",
+            "message": "顺" * 400,
+        }})
+        add = _wait_dispatch_event(client, h, gid, did, "add_trend")
+
+    assert add is not None
+    assert len(add["message"]) == 255
+    assert add["detail"] is None
 
 
 def test_strategy_end_to_end_poll_only_one_node(client):

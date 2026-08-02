@@ -156,6 +156,14 @@ def _migrate_group_task_strategy_columns(sync_conn) -> None:
                     text(f"ALTER TABLE group_task_dispatch ADD COLUMN {name} {ddl}")
                 )
 
+    if "group_task_event" in tables:
+        # 开单原因的计算依据明细（偏离 / 阈值 / 手数公式等逐项参数）
+        cols = {c["name"] for c in inspector.get_columns("group_task_event")}
+        if "detail_json" not in cols:
+            sync_conn.execute(
+                text(f"ALTER TABLE group_task_event ADD COLUMN detail_json {json_type}")
+            )
+
 
 def _drop_legacy_nodes_table(sync_conn) -> None:
     """v0.2 迁移：旧表带 `token_hash` 列（一节点一令牌）；新方案改为全局共享令牌，

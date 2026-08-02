@@ -23,6 +23,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+import bar_metrics
+
 logger = logging.getLogger("node.hub")
 
 # —— 事件类型 ——
@@ -129,6 +131,8 @@ class MarketHub:
         self.empty_confirm = max(1, int(empty_confirm or 1))
         self._subs: list[Subscription] = []
         self._points: dict[str, float] = {}
+        # (symbol, timeframe, metric) -> (指标值, 过期时刻)
+        self._metrics: dict[tuple[str, str, str], tuple[float, float]] = {}
         self._task: Optional[asyncio.Task] = None
         self._closed = False
         self._awake = asyncio.Event()
@@ -297,6 +301,29 @@ class MarketHub:
         if point > 0:
             self._points[symbol] = point
         return point
+
+    async def bar_metric(self, symbol: str, timeframe: str, metric: str) -> float:
+        """ATR / 波幅指标（价格距离），按 K 线周期缓存。
+
+        采样每 0.5 秒一轮，但指标统计的是已收盘 K 线，同一根 K 线内不会变，
+        因此按周期缓存，避免把 MT5 的 K 线接口打满。与 point 一样只缓存有效值。
+        """
+        key = (symbol, str(timeframe or "").upper(), metric)
+        now = time.time()
+        cached = self._metrics.get(key)
+        if cached and cached[1] > now:
+            return cached[0]
+        try:
+            bars = await self._exec(
+                self._mt5.closed_bars, symbol, timeframe, bar_metrics.bars_needed(metric),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("hub read bars failed for %s %s: %s", symbol, timeframe, e)
+            return 0.0
+        value = bar_metrics.compute(metric, list(bars or []))
+        if value > 0:
+            self._metrics[key] = (value, now + bar_metrics.cache_seconds(timeframe))
+        return value
 
     @staticmethod
     def _pick_price(quotes: dict, sub: Subscription, held: list[dict]) -> float:

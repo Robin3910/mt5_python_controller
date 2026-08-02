@@ -276,16 +276,27 @@ class GroupTaskEventRecord(BaseModel):
     position_count: Optional[int] = None
     total_volume: Optional[float] = None
     profit: Optional[float] = None
-    message: Optional[str] = None
+    message: Optional[str] = None       # 开单原因（人读的一句话说明）
+    detail: Optional[dict] = None       # 计算依据明细：偏离 / 阈值 / 手数公式等逐项参数
 
 
 # ----------------------------- 策略管理 ----------------------------
 class StrategyBatchLevel(BaseModel):
-    """分批加仓档位：持仓笔数区间内的点数 / 倍数。"""
+    """分批加仓档位：持仓笔数区间内的加仓间距 / 倍数。
+
+    加仓间距由 calc_type 决定读哪个参数，四种方式最终都换算成触发所需的偏离点数。
+    """
     pos_from: int = Field(default=2, ge=0)
     pos_to: int = Field(default=4, ge=0)
-    calc_type: str = Field(default="point", description="计算方式：point=点数")
-    point: float = Field(default=100, ge=0)
+    calc_type: str = Field(
+        default="point",
+        description="间距计算方式：point=点数 / price=指定价位 / atr=ATR / range=K线波幅",
+    )
+    point: float = Field(default=100, ge=0, description="calc_type=point 时的触发点数")
+    price: float = Field(default=0.0, ge=0, description="calc_type=price 时的绝对价位")
+    timeframe: str = Field(
+        default="M5", description="calc_type=atr / range 时统计用的 K 线周期",
+    )
     lot_times: float = Field(default=1.0, ge=0)
     extra_lot: float = Field(default=0.0, ge=0)
 
