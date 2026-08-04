@@ -189,6 +189,14 @@ const FIELD_HELP = {
     '开启后启动时按「现价上方格位数 × 每格手数」市价买入底仓（复刻币安现货网格），' +
     '否则价格上涨时无货可卖、上半部分网格失效。',
   grid_total_lot_limit: '全部格位合计手数上限，0=不额外限制。初始建仓也会受此约束。',
+  trailing_up:
+    '向上追踪（复刻币安同名功能）：价格越过区间外沿时网格不停机，' +
+    '整个区间连同止损价 / 止盈价一起平移一格，继续在新区间吃差价。\n' +
+    '多头网格追涨（突破上限上移），空头网格追跌（跌破下限下移）。\n' +
+    '注意止盈价也会同步上移，所以开启追踪后止盈基本不会触发，两者通常只用其一。',
+  trailing_max:
+    '最多允许平移多少格，0 表示不限。\n' +
+    '不限时只要不触发止损，网格会一直跟着行情滚动。',
 }
 
 /** 补仓方向选项，与后端 ENTRY_DIRECTIONS 对齐 */
@@ -253,6 +261,8 @@ function cloneRules(rules: StrategyRule[]): EditableRule[] {
     stop_upper: r.stop_upper ?? 0,
     close_on_stop: r.close_on_stop ?? true,
     prefill_enabled: r.prefill_enabled ?? true,
+    trailing_up: r.trailing_up ?? false,
+    trailing_max: r.trailing_max ?? 0,
   }))
 }
 
@@ -459,7 +469,13 @@ function validateGrid(r: EditableRule, label: string): string | null {
   if (r.stop_upper > 0 && r.stop_upper <= r.price_upper) {
     return `${label}：止盈价须高于区间上限`
   }
+  if (r.trailing_max < 0) return `${label}：最大平移格数不能为负`
   return null
+}
+
+/** 去掉尾随零的定长格式化 */
+function trimNum(value: number, digits = 6): string {
+  return value.toFixed(digits).replace(/\.?0+$/, '')
 }
 
 /** 网格间距 / 预估占用手数提示 */
@@ -471,13 +487,32 @@ function gridHint(r: EditableRule): string {
   const gap =
     r.grid_mode === 'geometric'
       ? `${(((upper / lower) ** (1 / n) - 1) * 100).toFixed(4)}%`
-      : ((upper - lower) / n).toFixed(6).replace(/\.?0+$/, '')
+      : trimNum((upper - lower) / n)
   const lot = r.lot_per_grid || 0
   const maxLot = lot * n
   const modeLabel = GRID_MODE_OPTIONS.find((o) => o.value === r.grid_mode)?.label || r.grid_mode
   return (
-    `${modeLabel}间距 ≈ ${gap}；满仓约 ${maxLot.toFixed(4).replace(/\.?0+$/, '')} 手` +
+    `${modeLabel}间距 ≈ ${gap}；满仓约 ${trimNum(maxLot, 4)} 手` +
     (r.total_lot_limit > 0 ? `（上限 ${r.total_lot_limit}）` : '')
+  )
+}
+
+/** 向上追踪的效果预览：平移一格后的新区间 */
+function trailingHint(r: EditableRule): string {
+  const n = r.grid_count || 0
+  const lower = r.price_lower || 0
+  const upper = r.price_upper || 0
+  if (!(upper > lower) || n < 2) return '填好价格区间与网格数量后可预览平移效果'
+  const down = r.grid_side === 'short'
+  const geometric = r.grid_mode === 'geometric'
+  const ratio = (upper / lower) ** (1 / n)
+  const step = (upper - lower) / n
+  const move = (v: number): number =>
+    geometric ? (down ? v / ratio : v * ratio) : down ? v - step : v + step
+  return (
+    `${down ? '跌破下限' : '突破上限'}后网格${down ? '下移' : '上移'}一格 → ` +
+    `[${trimNum(move(lower))}, ${trimNum(move(upper))}]，止损 / 止盈同步；` +
+    (r.trailing_max > 0 ? `最多平移 ${r.trailing_max} 格` : '不限平移次数')
   )
 }
 
@@ -631,7 +666,8 @@ function ruleSummary(rules: StrategyRule[]): string {
       if (isGrid(r)) {
         const side = GRID_SIDE_OPTIONS.find((o) => o.value === r.grid_side)?.label || r.grid_side
         const mode = GRID_MODE_OPTIONS.find((o) => o.value === r.grid_mode)?.label || r.grid_mode
-        return `${label}（${r.grid_count ?? 0} 格${mode} · ${side} · 每格 ${r.lot_per_grid ?? 0}）`
+        const trailing = r.trailing_up ? ' · 追踪' : ''
+        return `${label}（${r.grid_count ?? 0} 格${mode} · ${side} · 每格 ${r.lot_per_grid ?? 0}${trailing}）`
       }
       const levels = r.batch_levels?.length ?? 0
       return r.batch_enabled && levels ? `${label}（分批 ${levels} 档）` : label
@@ -714,6 +750,10 @@ function ruleDetailRows(r: StrategyRule): Array<{ k: string; v: string }> {
       { k: '止损 / 止盈', v: `${r.stop_lower || '不设'} / ${r.stop_upper || '不设'}` },
       { k: '终止清仓', v: r.close_on_stop === false ? '否' : '是' },
       { k: '初始建仓', v: r.prefill_enabled === false ? '关闭' : '开启' },
+      {
+        k: '向上追踪',
+        v: r.trailing_up ? (r.trailing_max ? `开启 · 最多 ${r.trailing_max} 格` : '开启 · 不限') : '关闭',
+      },
     ]
   }
   return [
@@ -1378,6 +1418,37 @@ function resetRuleToTemplate(idx: number): void {
                   </div>
                   <p class="rule-hint">
                     空仓是正常运行态；任务只由止损价 / 止盈价 / 终止信号收口
+                  </p>
+                </div>
+
+                <div class="batch-block">
+                  <div class="batch-head">
+                    <FormLabel text="向上追踪" :help="FIELD_HELP.trailing_up" />
+                    <input
+                      type="checkbox"
+                      :checked="r.trailing_up"
+                      aria-label="启用向上追踪"
+                      @change="r.trailing_up = ($event.target as HTMLInputElement).checked"
+                    />
+                  </div>
+                  <div v-if="r.trailing_up" class="batch-top-grid">
+                    <div class="field">
+                      <FormLabel
+                        :field-id="`rule-${idx}-trailing-max`"
+                        text="最大平移格数"
+                        :help="FIELD_HELP.trailing_max"
+                      />
+                      <input
+                        :id="`rule-${idx}-trailing-max`"
+                        v-model.number="r.trailing_max"
+                        type="number"
+                        min="0"
+                        step="1"
+                      />
+                    </div>
+                  </div>
+                  <p v-if="r.trailing_up" class="rule-hint">
+                    {{ trailingHint(r) }}
                   </p>
                 </div>
               </template>

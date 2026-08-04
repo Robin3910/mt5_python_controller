@@ -31,11 +31,14 @@ from app.orm import (
 from app.parser import TradingSignal
 from app.redis_store import RedisStore
 from app.strategy_templates import (
+    RULE_TYPE_GRID,
     RULE_TYPE_RISK_SIZED,
     TEMPLATE_1_ID,
     TEMPLATE_1_NAME,
     TEMPLATE_2_ID,
     TEMPLATE_2_NAME,
+    TEMPLATE_3_ID,
+    TEMPLATE_3_NAME,
 )
 
 # 分组链路必须真实落库（子任务号由数据库自增，是魔术号的来源），
@@ -393,6 +396,99 @@ async def test_risk_sized_group_skipped_only_for_itself(store, monkeypatch):
 
     assert res["groups"] == 1
     assert [s[0] for s in sent] == ["nd_a"]
+
+
+async def mk_grid_group(store, name, node_ids, *, symbol="XAUUSD", **rule_over):
+    """建一个绑定模版3（网格交易）策略的分组。"""
+    rule = {
+        "type": RULE_TYPE_GRID, "status": 1, "action": "all",
+        "price_lower": 2300.0, "price_upper": 2400.0,
+        "grid_count": 10, "grid_mode": "arithmetic",
+        "grid_side": "long", "lot_per_grid": 0.01,
+        "total_lot_limit": 0.0, "trigger_price": 0.0,
+        "stop_lower": 0.0, "stop_upper": 0.0,
+        "close_on_stop": True, "prefill_enabled": True,
+        "trailing_up": False, "trailing_max": 0,
+    }
+    rule.update(rule_over)
+    strategy = await mk_strategy(
+        store, symbol=symbol, name=f"{name}策略", rules=[rule],
+        template_id=TEMPLATE_3_ID, template_name=TEMPLATE_3_NAME,
+    )
+    return await mk_group(store, name, node_ids, symbol=symbol, strategy=strategy)
+
+
+async def test_grid_signal_dispatches_with_rule_snapshot(store, monkeypatch):
+    """模版3：网格参数随 strategy_start 下发，节点靠它决定走网格执行路径。"""
+    await online(store, mk_node("nd_a"))
+    await mk_grid_group(store, "网格组", ["nd_a"], trailing_up=True, trailing_max=5)
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+
+    res = await GroupDispatcher(store).dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_grid_ok",
+    )
+
+    assert res["mode"] == "group"
+    assert res["targets"] == 1
+    cmd = sent[0][1]
+    assert cmd["cmd"] == "strategy_start"
+    assert cmd["strategy"]["template_id"] == TEMPLATE_3_ID
+    rule = cmd["strategy"]["rules"][0]
+    assert rule["type"] == RULE_TYPE_GRID
+    assert rule["price_lower"] == 2300.0
+    assert rule["price_upper"] == 2400.0
+    assert rule["grid_count"] == 10
+    assert rule["trailing_up"] is True
+    assert rule["trailing_max"] == 5
+
+
+async def test_grid_signal_needs_no_stop_loss(store, monkeypatch):
+    """网格不靠止损距离算手数，缺 sl 也照常下发（与模版2 相反）。"""
+    await online(store, mk_node("nd_a"))
+    await mk_grid_group(store, "无止损网格组", ["nd_a"])
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+
+    res = await GroupDispatcher(store).dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_grid_nosl",
+    )
+
+    assert res["mode"] == "group"
+    assert res["targets"] == 1
+
+
+async def test_grid_long_rejects_sell_signal(store, monkeypatch):
+    """只做多的网格收到 SELL 信号应在分发前挡下，落选原因写进信号记录。"""
+    await online(store, mk_node("nd_a"))
+    await mk_grid_group(store, "只做多网格组", ["nd_a"], grid_side="long")
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+
+    res = await GroupDispatcher(store).dispatch(
+        TradingSignal(action="SELL", symbol="XAUUSD", volume=0.1), "sig_grid_sell",
+    )
+
+    assert res["mode"] == "rejected"
+    assert "只做多" in res["reason"]
+    assert sent == []
+    assert await fetch_tasks("sig_grid_sell") == []
+
+
+async def test_grid_bad_range_is_rejected(store, monkeypatch):
+    """区间非法的网格跑不起来，不必让节点收到命令后再失败一次。"""
+    await online(store, mk_node("nd_a"))
+    await mk_grid_group(store, "坏区间网格组", ["nd_a"], price_lower=0.0, price_upper=0.0)
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+
+    res = await GroupDispatcher(store).dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_grid_badrange",
+    )
+
+    assert res["mode"] == "rejected"
+    assert "价格区间" in res["reason"]
+    assert sent == []
 
 
 async def test_symbol_match_tolerates_broker_suffix(store, monkeypatch):

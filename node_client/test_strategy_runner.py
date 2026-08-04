@@ -951,3 +951,134 @@ async def test_grid_stop_lower_terminates_and_closes():
     assert finished
     assert finished[0]["status"] == "done"
     assert mt5.positions_by_magic(MAGIC) == []
+
+
+async def test_grid_breakout_without_trailing_keeps_range():
+    """没开追踪时突破上限只是无格可卖，网格区间保持不变。"""
+    sent: list = []
+    runner, hub, mt5 = _grid_runner(
+        sent, prefill_enabled=False, grid_count=4,
+        price_lower=100.0, price_upper=110.0,
+    )
+    mt5.prices_map["XAUUSD"] = 106.0
+    runner.start()
+    await _settle()
+
+    _tick(hub, mt5.positions_by_magic(MAGIC), 111.0)
+    await _settle()
+
+    assert not _progress(sent, "grid_shift")
+    assert runner._grid_plan.levels[-1] == 110.0
+    runner.cancel()
+
+
+async def test_grid_trailing_up_shifts_range_on_breakout():
+    """开了向上追踪：突破上限不停机，网格整体上移一格继续跑。"""
+    sent: list = []
+    runner, hub, mt5 = _grid_runner(
+        sent, prefill_enabled=False, grid_count=4,
+        price_lower=100.0, price_upper=110.0, trailing_up=True,
+        stop_lower=95.0,
+    )
+    mt5.prices_map["XAUUSD"] = 106.0
+    runner.start()
+    await _settle()
+
+    _tick(hub, mt5.positions_by_magic(MAGIC), 111.0)
+    await _settle()
+
+    shifts = _progress(sent, "grid_shift")
+    assert shifts
+    detail = shifts[0]["detail"]
+    assert detail["kind"] == "grid_shift"
+    assert detail["steps"] == 1
+    assert detail["price_lower"] == 102.5
+    assert detail["price_upper"] == 112.5
+    assert detail["stop_lower"] == 97.5      # 止损同步上移
+    assert not runner.done
+    runner.cancel()
+
+
+async def test_grid_trailing_up_cashes_out_dropped_level():
+    """平移把最低格挤出网格时，该格持仓要被兑现而不是留在账上。"""
+    sent: list = []
+    runner, hub, mt5 = _grid_runner(
+        sent, prefill_enabled=True, grid_count=4,
+        price_lower=100.0, price_upper=110.0, trailing_up=True,
+    )
+    mt5.prices_map["XAUUSD"] = 106.0
+    runner.start()
+    await _settle()
+    # 预填了买线低于 106 的格位：0、1、2
+    assert set(runner._grid_plan.holdings) == {0, 1, 2}
+
+    _tick(hub, mt5.positions_by_magic(MAGIC), 111.0)
+    await _settle(10)
+
+    assert _progress(sent, "grid_shift")
+    # 上移一格：原格位 0 被兑现，1、2 顺移成 0、1
+    assert set(runner._grid_plan.holdings) == {0, 1}
+    assert len(mt5.positions_by_magic(MAGIC)) == 2
+    runner.cancel()
+
+
+async def test_grid_trailing_retries_failed_dropped_close():
+    """越界持仓当场没平成不能就此脱管，后续事件要继续重试兑现。"""
+    sent: list = []
+    runner, hub, mt5 = _grid_runner(
+        sent, prefill_enabled=True, grid_count=4,
+        price_lower=100.0, price_upper=110.0, trailing_up=True,
+    )
+    mt5.prices_map["XAUUSD"] = 106.0
+
+    real_close = mt5.close_ticket
+    calls = {"n": 0}
+
+    def flaky_close(ticket):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"success": False, "error": "requote"}
+        return real_close(ticket)
+
+    mt5.close_ticket = flaky_close
+
+    runner.start()
+    await _settle()
+    assert set(runner._grid_plan.holdings) == {0, 1, 2}
+
+    # 平移把格位 0 挤出网格，但这一笔平仓失败
+    _tick(hub, mt5.positions_by_magic(MAGIC), 111.0)
+    await _settle(10)
+    assert runner._grid_plan.shift_count == 1
+    assert len(runner._grid_orphans) == 1
+
+    # 下一轮事件重试成功
+    _tick(hub, mt5.positions_by_magic(MAGIC), 111.5)
+    await _settle(10)
+    assert runner._grid_orphans == set()
+    assert len(mt5.positions_by_magic(MAGIC)) == 2
+    runner.cancel()
+
+
+async def test_grid_trailing_comment_carries_absolute_level():
+    """平移后新买入的格位备注记绝对格位号，重连才对得上原来那一格。"""
+    sent: list = []
+    runner, hub, mt5 = _grid_runner(
+        sent, prefill_enabled=False, grid_count=4,
+        price_lower=100.0, price_upper=110.0, trailing_up=True,
+    )
+    mt5.prices_map["XAUUSD"] = 106.0
+    runner.start()
+    await _settle()
+
+    _tick(hub, [], 111.0)
+    await _settle()
+    assert runner._grid_plan.shift_count == 1
+
+    # 新区间 [102.5, 112.5]，跌破 110 → 买入相对格位 3，绝对格位 4
+    _tick(hub, [], 109.0)
+    await _settle()
+    held = mt5.positions_by_magic(MAGIC)
+    assert held
+    assert held[-1]["comment"] == "G4L4"
+    runner.cancel()

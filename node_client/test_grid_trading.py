@@ -11,6 +11,7 @@ def _cfg(**over) -> gt.GridConfig:
         "total_lot_limit": 0.0, "trigger_price": 0.0,
         "stop_lower": 0.0, "stop_upper": 0.0,
         "close_on_stop": True, "prefill_enabled": True,
+        "trailing_up": False, "trailing_max": 0,
     }
     raw.update(over)
     return gt.GridConfig.from_rule(raw)
@@ -109,11 +110,20 @@ def test_buy_sell_level_for_crossing_long():
 
 
 def test_terminate_reason():
-    cfg = _cfg(stop_lower=95.0, stop_upper=120.0)
-    assert gt.terminate_reason(cfg, 94.0, side="BUY") is not None
-    assert "止损" in (gt.terminate_reason(cfg, 94.0, side="BUY") or "")
-    assert "止盈" in (gt.terminate_reason(cfg, 121.0, side="BUY") or "")
-    assert gt.terminate_reason(cfg, 105.0, side="BUY") is None
+    plan = gt.plan_grid(
+        _cfg(stop_lower=95.0, stop_upper=120.0), signal_action="BUY", spec=_spec(),
+    )
+    assert "止损" in (gt.terminate_reason(plan, 94.0) or "")
+    assert "止盈" in (gt.terminate_reason(plan, 121.0) or "")
+    assert gt.terminate_reason(plan, 105.0) is None
+
+    # 空头网格的止损止盈方向相反
+    short = gt.plan_grid(
+        _cfg(grid_side="short", stop_lower=95.0, stop_upper=120.0),
+        signal_action="SELL", spec=_spec(),
+    )
+    assert "止损" in (gt.terminate_reason(short, 121.0) or "")
+    assert "止盈" in (gt.terminate_reason(short, 94.0) or "")
 
 
 def test_trigger_reached():
@@ -128,6 +138,121 @@ def test_grid_comment_roundtrip():
     assert gt.grid_comment(12) == "G4L12"
     assert gt.parse_grid_comment("G4L12") == 12
     assert gt.parse_grid_comment("other") is None
+    # 空头追跌会把绝对格位推成负数
+    assert gt.grid_comment(-3) == "G4L-3"
+    assert gt.parse_grid_comment("G4L-3") == -3
+
+
+# ---------------------------------------------------------------------------
+# 向上追踪
+# ---------------------------------------------------------------------------
+
+def _trailing_plan(**over) -> tuple[gt.GridConfig, gt.GridPlan]:
+    """区间 100~110 切 4 格（间距 2.5）的多头追踪网格。"""
+    cfg = _cfg(grid_count=4, trailing_up=True, **over)
+    action = "SELL" if cfg.grid_side == gt.GRID_SIDE_SHORT else "BUY"
+    return cfg, gt.plan_grid(cfg, signal_action=action, spec=_spec())
+
+
+def test_trailing_shift_skipped_when_disabled_or_inside_range():
+    cfg, plan = _trailing_plan()
+    assert gt.trailing_shift(plan, cfg, 105.0, digits=2) is None   # 区间内
+
+    off_cfg = _cfg(grid_count=4)
+    off_plan = gt.plan_grid(off_cfg, signal_action="BUY", spec=_spec())
+    assert gt.trailing_shift(off_plan, off_cfg, 200.0, digits=2) is None
+
+
+def test_trailing_shift_up_one_grid():
+    cfg, plan = _trailing_plan()
+    shift = gt.trailing_shift(plan, cfg, 111.0, digits=2)
+    assert shift is not None
+    assert shift.steps == 1
+    assert shift.direction == "up"
+    assert shift.levels == [102.5, 105.0, 107.5, 110.0, 112.5]
+
+    gt.apply_shift(plan, shift)
+    assert plan.shift_count == 1
+    assert plan.levels[-1] == 112.5
+    assert plan.grid_count == 4
+
+
+def test_trailing_shift_catches_up_on_gap():
+    """一次跳空跨多格时循环平移到区间重新盖住现价。"""
+    cfg, plan = _trailing_plan()
+    shift = gt.trailing_shift(plan, cfg, 116.0, digits=2)
+    assert shift.steps == 3
+    assert shift.levels == [107.5, 110.0, 112.5, 115.0, 117.5]
+
+
+def test_trailing_shift_respects_max():
+    cfg, plan = _trailing_plan(trailing_max=2)
+    shift = gt.trailing_shift(plan, cfg, 500.0, digits=2)
+    assert shift.steps == 2
+    gt.apply_shift(plan, shift)
+    # 额度耗尽后价格再高也不再平移
+    assert gt.trailing_shift(plan, cfg, 500.0, digits=2) is None
+
+
+def test_trailing_shift_moves_stops_together():
+    cfg, plan = _trailing_plan(stop_lower=95.0, stop_upper=120.0)
+    shift = gt.trailing_shift(plan, cfg, 111.0, digits=2)
+    assert shift.stop_lower == 97.5
+    assert shift.stop_upper == 122.5
+
+    gt.apply_shift(plan, shift)
+    # 止损跟着上移，等于锁住了平移这一格的利润
+    assert gt.terminate_reason(plan, 96.0) is not None
+    assert gt.terminate_reason(plan, 98.5) is None
+
+
+def test_trailing_shift_remaps_holdings_and_drops_outliers():
+    cfg, plan = _trailing_plan()
+    plan.holdings = {0: 1001, 2: 1003}
+    shift = gt.trailing_shift(plan, cfg, 111.0, digits=2)
+    assert shift.holdings == {1: 1003}       # 格位 2 上移后变成 1
+    assert shift.dropped == [(0, 1001)]      # 最低格被挤出网格，需兑现
+
+
+def test_trailing_shift_short_moves_down():
+    cfg, plan = _trailing_plan(grid_side="short")
+    assert plan.side == "SELL"
+    shift = gt.trailing_shift(plan, cfg, 99.0, digits=2)
+    assert shift.steps == -1
+    assert shift.direction == "down"
+    assert shift.levels == [97.5, 100.0, 102.5, 105.0, 107.5]
+
+
+def test_trailing_shift_geometric_keeps_ratio():
+    cfg = _cfg(
+        price_lower=100.0, price_upper=121.0, grid_count=2,
+        grid_mode="geometric", trailing_up=True,
+    )
+    plan = gt.plan_grid(cfg, signal_action="BUY", spec=_spec(digits=4))
+    shift = gt.trailing_shift(plan, cfg, 122.0, digits=4)
+    assert shift.steps == 1
+    # 公比 1.1：[100, 110, 121] → [110, 121, 133.1]
+    assert abs(shift.levels[0] - 110.0) < 0.01
+    assert abs(shift.levels[-1] - 133.1) < 0.01
+
+
+def test_absolute_index_survives_shift():
+    cfg, plan = _trailing_plan()
+    gt.apply_shift(plan, gt.trailing_shift(plan, cfg, 111.0, digits=2))
+    assert plan.absolute_index(0) == 1       # 平移后的第 0 格就是原来的第 1 格
+    assert plan.relative_index(1) == 0
+    assert plan.relative_index(0) is None    # 原第 0 格已被挤出
+
+
+def test_rebuild_holdings_after_shift_reports_orphans():
+    cfg, plan = _trailing_plan()
+    gt.apply_shift(plan, gt.trailing_shift(plan, cfg, 111.0, digits=2))
+    orphans = gt.rebuild_holdings(plan, [
+        {"ticket": 11, "comment": "G4L2", "price_open": 105.0},
+        {"ticket": 22, "comment": "G4L0", "price_open": 100.0},
+    ])
+    assert plan.holdings == {1: 11}
+    assert orphans == [22]
 
 
 def test_rebuild_holdings_from_comment_and_price():

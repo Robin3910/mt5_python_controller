@@ -309,7 +309,7 @@ class StrategyRule(BaseModel):
 
     type=1 逆势加仓 / type=2 顺势加仓（模版1）：point ~ batch_levels；
     type=3 以损定量趋势单（模版2）：risk_amount ~ breakeven_times；
-    type=4 网格交易（模版3）：price_lower ~ prefill_enabled。
+    type=4 网格交易（模版3）：price_lower ~ trailing_max。
 
     保持单一扁平模型是为了让 API 契约、前端类型与 config_json 落库格式都不变；
     服务端 `strategy_templates.normalize_rule` 会按 type 只保留该类型的字段，
@@ -360,6 +360,11 @@ class StrategyRule(BaseModel):
     prefill_enabled: bool = Field(
         default=True, description="是否按现价上方格位初始建仓（复刻币安现货网格）",
     )
+    trailing_up: bool = Field(
+        default=False,
+        description="向上追踪：价格越过区间外沿时网格连同止损止盈整体平移一格",
+    )
+    trailing_max: int = Field(default=0, ge=0, description="最大平移格数，0=不限")
 
 
 class StrategyTemplateOut(BaseModel):

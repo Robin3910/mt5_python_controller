@@ -134,6 +134,8 @@ class StrategyRunner:
         self._grid_plan: Optional[grid_trading.GridPlan] = None
         self._grid_spec: Optional[grid_trading.SymbolSpec] = None
         self._grid_prev_price: float = 0.0
+        # 平移后越界、但当时没平成的持仓：脱离了格位映射，只能逐轮重试兑现
+        self._grid_orphans: set[int] = set()
 
     @property
     def risk_sized(self) -> bool:
@@ -754,15 +756,31 @@ class StrategyRunner:
             )
             return
         plan.triggered = True
-        grid_trading.rebuild_holdings(plan, positions)
         self._grid_plan = plan
         self.direction = plan.side
         self.base_volume = plan.lot_per_grid
-        if positions:
+
+        price = await self._grid_quote()
+        if price <= 0 and positions:
             latest = max(positions, key=lambda p: (p.get("time") or 0, p.get("ticket") or 0))
-            self._grid_prev_price = _as_float(latest.get("price_current")) or _as_float(
-                latest.get("price_open"),
-            )
+            price = _as_float(latest.get("price_current")) or _as_float(latest.get("price_open"))
+
+        # 平移量不落库：按现价把网格追回断线前的位置，再拿 shift_count 去还原
+        # 备注里的绝对格位，否则整批持仓都会被当成已移出网格。
+        if cfg.trailing_up and price > 0:
+            shift = grid_trading.trailing_shift(plan, cfg, price, digits=spec.digits)
+            if shift is not None:
+                grid_trading.apply_shift(plan, shift)
+                logger.info(
+                    "task %s resume: grid shifted %s to [%s, %s]",
+                    self.task_id, shift.steps, plan.levels[0], plan.levels[-1],
+                )
+
+        for ticket in grid_trading.rebuild_holdings(plan, positions):
+            if not await self._grid_close_orphan(ticket, price, positions):
+                self._grid_orphans.add(ticket)
+        if price > 0:
+            self._grid_prev_price = price
 
     async def _grid_advance(self, event: MarketEvent, positions: list[dict]) -> bool:
         """推进网格：等触发 → 穿越买卖 → 止损止盈。返回 True 表示任务已收口。"""
@@ -782,6 +800,12 @@ class StrategyRunner:
         for lv in stale:
             plan.holdings.pop(lv, None)
 
+        # 越界持仓不在格位映射里，没人会再触发它的卖出，只能在这里重试
+        self._grid_orphans &= live_tickets
+        for ticket in sorted(self._grid_orphans):
+            if await self._grid_close_orphan(ticket, price, positions):
+                self._grid_orphans.discard(ticket)
+
         if not plan.triggered:
             if not grid_trading.trigger_reached(cfg, price, self._grid_prev_price):
                 self._grid_prev_price = price
@@ -790,10 +814,15 @@ class StrategyRunner:
             await self._grid_do_prefill(price)
             return False
 
-        reason = grid_trading.terminate_reason(cfg, price, side=plan.side)
+        reason = grid_trading.terminate_reason(plan, price)
         if reason:
             await self._grid_terminate(reason)
             return True
+
+        if await self._grid_apply_trailing(price, positions):
+            # 网格线整体换过了，旧的参考价不能再拿来判穿越
+            self._grid_prev_price = price
+            return False
 
         prev = self._grid_prev_price or price
         for crossing in grid_trading.crossings(plan, prev, price):
@@ -821,7 +850,7 @@ class StrategyRunner:
         res = dict(await self._exec(
             self._mt5.place_market_order,
             self.symbol, plan.side, plan.lot_per_grid,
-            None, None, grid_trading.grid_comment(level), self.magic,
+            None, None, grid_trading.grid_comment(plan.absolute_index(level)), self.magic,
         ) or {})
         detail = grid_trading.fill_detail(
             plan, level, price=price, action="BUY",
@@ -865,10 +894,20 @@ class StrategyRunner:
         ticket = plan.holdings.get(level)
         if not ticket:
             return
+        await self._grid_close_level(level, int(ticket), price, positions)
+
+    async def _grid_close_level(self, level: int, ticket: int, price: float,
+                                positions: list[dict], *, note: str = "") -> bool:
+        """平掉某一格的持仓并从格位映射里摘除。"""
+        plan = self._grid_plan
+        if plan is None:
+            return False
         spec = await self._grid_symbol_spec()
         reason = grid_trading.describe_fill(
             plan, level, price=price, action="CLOSE", spec=spec,
         )
+        if note:
+            reason = f"{note}；{reason}"
         res = dict(await self._exec(self._mt5.close_ticket, int(ticket)) or {})
         detail = grid_trading.fill_detail(
             plan, level, price=price, action="CLOSE", ticket=ticket,
@@ -882,7 +921,7 @@ class StrategyRunner:
                 message=f"网格卖出失败：{res.get('error') or 'close failed'}；{reason}",
                 detail={**detail, "error": str(res.get("error") or "")},
             )
-            return
+            return False
         plan.holdings.pop(level, None)
         logger.info("task %s grid sell L%s: %s", self.task_id, level, reason)
         await self._emit_progress(
@@ -895,6 +934,61 @@ class StrategyRunner:
             message=reason,
             detail=detail,
         )
+        return True
+
+    async def _grid_close_orphan(self, ticket: int, price: float,
+                                 positions: list[dict]) -> bool:
+        """兑现越界持仓：它的格位已被平移挤出网格，留着没人管。"""
+        res = dict(await self._exec(self._mt5.close_ticket, int(ticket)) or {})
+        ok = bool(res.get("success"))
+        logger.info(
+            "task %s close out-of-grid ticket %s: %s",
+            self.task_id, ticket, "ok" if ok else res.get("error"),
+        )
+        await self._emit_progress(
+            "close_partial" if ok else "error", phase="running", positions=positions,
+            message=(
+                f"网格已平移，兑现越界持仓 #{ticket}"
+                if ok else
+                f"越界持仓 #{ticket} 平仓失败：{res.get('error') or 'close failed'}"
+            ),
+            detail={
+                "kind": "grid_close",
+                "ticket": ticket,
+                "price": res.get("price") or price,
+                "out_of_grid": True,
+                "error": str(res.get("error") or ""),
+            },
+        )
+        return ok
+
+    async def _grid_apply_trailing(self, price: float, positions: list[dict]) -> bool:
+        """向上追踪：价格越过区间外沿时整体平移网格。返回是否发生了平移。"""
+        cfg, plan = self._grid_cfg, self._grid_plan
+        if cfg is None or plan is None:
+            return False
+        spec = await self._grid_symbol_spec()
+        shift = grid_trading.trailing_shift(plan, cfg, price, digits=spec.digits)
+        if shift is None:
+            return False
+
+        # 被挤出网格的格位先兑现：它们的卖出线已不在新区间内，不平就永远卖不掉。
+        # 这里平不掉的转入 orphans，由后续事件重试，避免持仓脱管到任务结束。
+        for level, ticket in shift.dropped:
+            if not await self._grid_close_level(
+                level, ticket, price, positions, note="网格平移移出",
+            ):
+                self._grid_orphans.add(ticket)
+        grid_trading.apply_shift(plan, shift)
+
+        message = grid_trading.describe_shift(plan, shift, price=price, spec=spec)
+        logger.info("task %s %s", self.task_id, message)
+        await self._emit_progress(
+            "grid_shift", phase="running", positions=positions,
+            message=message,
+            detail=grid_trading.shift_detail(plan, shift, price=price),
+        )
+        return True
 
     async def _grid_terminate(self, reason: str) -> None:
         """止损 / 止盈触发：按配置清仓后收口。"""

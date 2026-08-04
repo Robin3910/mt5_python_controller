@@ -64,6 +64,8 @@ GRID_SIDE_FOLLOW = "follow"
 GRID_SIDES = (GRID_SIDE_LONG, GRID_SIDE_SHORT, GRID_SIDE_FOLLOW)
 GRID_COUNT_MIN = 2
 GRID_COUNT_MAX = 200
+# 向上追踪的平移次数上限；0 表示不限，此处只防止配置写出天文数字
+GRID_TRAILING_MAX = 10000
 
 TEMPLATE_1_ID = "tpl_1"
 TEMPLATE_1_NAME = "策略模版1"
@@ -276,6 +278,10 @@ class GridTradingRule:
     lot_per_grid 是每格手数（MT5 原生口径，对应币安的「投资额」换算结果）。
     prefill_enabled 开启时，启动会先市价买入「现价上方格位数 × 每格手数」的底仓，
     否则价格上涨时无货可卖、网格上半部分失效。
+
+    trailing_up 对应币安的「向上追踪」：价格突破区间外沿时不停机，整个网格连同
+    止损止盈一起平移一格，继续在新区间运行。多头网格追涨（突破上限上移），空头
+    网格追跌（跌破下限下移）——本项目的空头网格是币安现货没有的扩展。
     """
     status: int = 1
     action: str = "all"                         # 保留字段，与其它规则对齐；实际方向看 grid_side
@@ -291,6 +297,8 @@ class GridTradingRule:
     stop_upper: float = 0.0                     # 止盈价（高于区间上限），0=不设
     close_on_stop: bool = True                  # 终止时是否清仓
     prefill_enabled: bool = True                # 是否按现价上方格位初始建仓
+    trailing_up: bool = False                   # 向上追踪：突破区间外沿时平移网格
+    trailing_max: int = 0                       # 最大平移格数，0=不限
 
     @property
     def type(self) -> int:
@@ -313,6 +321,8 @@ class GridTradingRule:
             "stop_upper": self.stop_upper,
             "close_on_stop": self.close_on_stop,
             "prefill_enabled": self.prefill_enabled,
+            "trailing_up": self.trailing_up,
+            "trailing_max": self.trailing_max,
         }
 
 
@@ -413,6 +423,8 @@ def default_grid_rule() -> GridTradingRule:
         stop_upper=0.0,
         close_on_stop=True,
         prefill_enabled=True,
+        trailing_up=False,
+        trailing_max=0,
     )
 
 
@@ -461,7 +473,8 @@ STRATEGY_TEMPLATES: dict[str, dict] = {
             "下跌穿越网格线买入、上涨穿越卖出对应格，反复吃差价。"
             "空仓是正常运行态，任务不会因持仓归零而结束；"
             "只由止损价 / 止盈价 / 终止信号收口。"
-            "可选初始建仓（按现价上方格位先买入），否则上涨时无货可卖。"
+            "可选初始建仓（按现价上方格位先买入），否则上涨时无货可卖；"
+            "可选向上追踪（价格突破区间外沿时整个网格连同止损止盈平移一格）。"
         ),
         "rule_set": _TPL3_RULES,
         "rules": _TPL3_RULES.to_rules(),
@@ -658,7 +671,7 @@ def _normalize_grid_rule(rule_type: int, raw: dict) -> dict[str, Any]:
 
     区间上下限必须满足 upper > lower > 0；等比模式同样要求 lower > 0。
     止损须低于区间下限、止盈须高于区间上限（为 0 表示不设）。
-    网格数量夹在 [2, 200]。
+    网格数量夹在 [2, 200]，向上追踪的平移上限夹在 [0, 10000]。
     """
     defaults = default_grid_rule().to_dict()
 
@@ -709,6 +722,11 @@ def _normalize_grid_rule(rule_type: int, raw: dict) -> dict[str, Any]:
         "stop_upper": stop_upper,
         "close_on_stop": bool(raw.get("close_on_stop", defaults["close_on_stop"])),
         "prefill_enabled": bool(raw.get("prefill_enabled", defaults["prefill_enabled"])),
+        "trailing_up": bool(raw.get("trailing_up", defaults["trailing_up"])),
+        "trailing_max": min(
+            GRID_TRAILING_MAX,
+            max(0, _as_int(raw.get("trailing_max", defaults["trailing_max"]), defaults["trailing_max"])),
+        ),
     }
 
 

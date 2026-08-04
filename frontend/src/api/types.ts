@@ -385,6 +385,10 @@ export interface StrategyRule {
   close_on_stop?: boolean
   /** 是否按现价上方格位初始建仓 */
   prefill_enabled?: boolean
+  /** 向上追踪：价格越过区间外沿时整个网格连同止损止盈平移一格 */
+  trailing_up?: boolean
+  /** 最大平移格数，0=不限 */
+  trailing_max?: number
 }
 
 export interface StrategyTemplateOut {
@@ -502,7 +506,10 @@ export interface GroupTaskEventRecord {
   node_id: string
   magic: number | null
   created_at: number | null
-  /** open / add_counter / add_trend / close_partial / close_all / error / resume */
+  /**
+   * open / add_counter / add_trend / grid_add / grid_shift /
+   * close_partial / close_all / error / resume
+   */
   event_type: string
   symbol: string | null
   action: string | null
@@ -530,6 +537,7 @@ export interface GroupTaskEventDetail {
     | 'grid_plan'
     | 'grid_fill'
     | 'grid_close'
+    | 'grid_shift'
   // —— 加仓（kind=add）——
   rule_type?: number
   rule_type_label?: string
@@ -606,6 +614,8 @@ export interface GroupTaskEventDetail {
   stop_upper?: number
   close_on_stop?: boolean
   prefill_enabled?: boolean
+  trailing_up?: boolean
+  trailing_max?: number | null
   levels?: number[]
   level_price?: number
   exit_price?: number
@@ -613,6 +623,18 @@ export interface GroupTaskEventDetail {
   prefill_levels?: number[]
   waiting_trigger?: boolean
   ticket?: number | null
+  // —— 网格平移（kind=grid_shift）——
+  /** 平移格数：正=上移 / 负=下移 */
+  steps?: number
+  /** 累计平移格数 */
+  shift_count?: number
+  /** 平移前的区间 */
+  from_lower?: number
+  from_upper?: number
+  /** 被挤出网格、已兑现的格位 */
+  dropped_levels?: number[]
+  /** 该持仓的格位已被平移挤出网格 */
+  out_of_grid?: boolean
 }
 
 // 手动触发接口返回（与 /webhook 响应同构，字段视 status 而定）

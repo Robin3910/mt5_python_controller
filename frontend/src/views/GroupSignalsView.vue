@@ -393,6 +393,7 @@ function eventTag(eventType: string): { cls: string; text: string } {
     add_counter: { cls: 'amber', text: '逆势加仓' },
     add_trend: { cls: 'amber', text: '顺势加仓' },
     grid_add: { cls: 'amber', text: '网格买入' },
+    grid_shift: { cls: 'blue', text: '网格平移' },
     breakeven: { cls: 'blue', text: '保本' },
     close_partial: { cls: 'blue', text: '部分平仓' },
     close_all: { cls: 'blue', text: '全部平仓' },

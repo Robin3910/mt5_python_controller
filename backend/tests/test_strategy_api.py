@@ -505,6 +505,7 @@ def _grid_rule(**over) -> dict:
         "total_lot_limit": 0.0, "trigger_price": 0.0,
         "stop_lower": 0.0, "stop_upper": 0.0,
         "close_on_stop": True, "prefill_enabled": True,
+        "trailing_up": False, "trailing_max": 0,
     }
     rule.update(over)
     return rule
@@ -522,6 +523,7 @@ def test_list_templates_contains_template_3(client):
     assert tpl["rules"][0]["grid_mode"] == "arithmetic"
     assert tpl["rules"][0]["grid_side"] == "long"
     assert tpl["rules"][0]["prefill_enabled"] is True
+    assert tpl["rules"][0]["trailing_up"] is False
 
 
 def test_create_strategy_from_template_3(client):
@@ -560,6 +562,43 @@ def test_normalize_grid_clamps_and_swaps_range():
     # 规范化只保留网格字段，不加仓 / 以损定量字段
     assert "point" not in out
     assert "risk_amount" not in out
+
+
+def test_normalize_grid_trailing():
+    from app import strategy_templates as tpl
+
+    out = tpl.normalize_rule(_grid_rule(trailing_up=1, trailing_max=-5))
+    assert out["trailing_up"] is True
+    assert out["trailing_max"] == 0        # 负数夹回不限
+
+    out = tpl.normalize_rule(_grid_rule(trailing_max=10**9))
+    assert out["trailing_max"] == tpl.GRID_TRAILING_MAX
+
+    # 历史规则没有这两个字段时回落到默认值（关闭）
+    legacy = _grid_rule()
+    legacy.pop("trailing_up")
+    legacy.pop("trailing_max")
+    out = tpl.normalize_rule(legacy)
+    assert out["trailing_up"] is False
+    assert out["trailing_max"] == 0
+
+
+def test_create_strategy_keeps_grid_trailing(client):
+    h = auth_headers(client)
+    r = client.post(
+        "/api/strategies",
+        json={
+            "template_id": TEMPLATE_3_ID,
+            "name": "追踪网格",
+            "symbol": "XAUUSD",
+            "rules": [_grid_rule(trailing_up=True, trailing_max=3)],
+        },
+        headers=h,
+    )
+    assert r.status_code == 201, r.text
+    rule = r.json()["rules"][0]
+    assert rule["trailing_up"] is True
+    assert rule["trailing_max"] == 3
 
 
 def test_pick_grid_rule():

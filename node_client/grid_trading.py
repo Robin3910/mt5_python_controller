@@ -13,9 +13,14 @@
 - stop_lower / stop_upper：止损 / 止盈价，0=不设
 - close_on_stop：终止时是否清仓
 - prefill_enabled：是否按现价上方格位初始建仓
+- trailing_up / trailing_max：向上追踪开关与最大平移格数
 
 核心循环：价格下跌穿越网格线 → 买入一格；上涨穿越 → 卖出对应格。空仓是正常
 运行态，任务不会因持仓归零而结束。
+
+开启向上追踪后，价格越过区间外沿不会停机，而是把整个网格连同止损止盈平移一格
+（多头追涨、空头追跌）。平移会丢弃最外侧一格，因此 MT5 备注里记的是**绝对格位
+号**（以初始区间为基准，不随平移变化），断线恢复时减去平移量即可还原当前格位。
 
 手数与价位计算需要品种规格（digits / volume_step），只有 MT5 能给，所以这一层
 放在节点侧；服务端只负责下发参数，与以损定量的分工一致。
@@ -39,6 +44,10 @@ GRID_SIDE_SHORT = "short"
 GRID_SIDE_FOLLOW = "follow"
 GRID_SIDES = (GRID_SIDE_LONG, GRID_SIDE_SHORT, GRID_SIDE_FOLLOW)
 
+# 单次 trailing_shift 调用的平移上限。只为兜住极端行情下的长循环——正常追踪一次
+# 只移几格，断线恢复时则要一次追回全部平移量，所以取值必须远大于网格格数。
+_MAX_SHIFT_PER_CALL = 1000
+
 GRID_MODE_LABEL = {
     GRID_MODE_ARITHMETIC: "等差",
     GRID_MODE_GEOMETRIC: "等比",
@@ -51,8 +60,9 @@ GRID_SIDE_LABEL = {
 
 # MT5 订单备注上限约 31 字符
 MT5_COMMENT_LIMIT = 31
-# 备注编码：G4L{index} —— G=网格，4=规则 type，L=格位，后接序号
-_COMMENT_RE = re.compile(r"^G4L(\d+)$")
+# 备注编码：G4L{index} —— G=网格，4=规则 type，L=格位，后接绝对格位号。
+# 绝对格位号可能因向下追踪变成负数，故允许前导负号。
+_COMMENT_RE = re.compile(r"^G4L(-?\d+)$")
 
 
 def _as_float(value: object, default: float = 0.0) -> float:
@@ -123,6 +133,8 @@ class GridConfig:
     stop_upper: float = 0.0
     close_on_stop: bool = True
     prefill_enabled: bool = True
+    trailing_up: bool = False
+    trailing_max: int = 0
 
     @classmethod
     def from_rule(cls, rule: dict) -> "GridConfig":
@@ -146,6 +158,8 @@ class GridConfig:
             stop_upper=max(0.0, _as_float(rule.get("stop_upper"))),
             close_on_stop=bool(rule.get("close_on_stop", True)),
             prefill_enabled=bool(rule.get("prefill_enabled", True)),
+            trailing_up=bool(rule.get("trailing_up", False)),
+            trailing_max=max(0, _as_int(rule.get("trailing_max"))),
         )
 
     @property
@@ -226,6 +240,11 @@ class GridPlan:
     prev_price: float = 0.0
     triggered: bool = False                 # 是否已过触发价 / 无需触发
     reject: str = ""
+    # 向上追踪的运行态：止损止盈随网格一起平移，所以判定要读这里而不是 cfg
+    stop_lower: float = 0.0
+    stop_upper: float = 0.0
+    # 累计平移格数，上移为正、下移为负；绝对格位 = 相对格位 + shift_count
+    shift_count: int = 0
 
     @property
     def ok(self) -> bool:
@@ -241,6 +260,15 @@ class GridPlan:
 
     def holding_count(self) -> int:
         return len(self.holdings)
+
+    def absolute_index(self, level: int) -> int:
+        """相对格位 → 绝对格位。写进 MT5 备注，平移后仍能反查回原格。"""
+        return int(level) + self.shift_count
+
+    def relative_index(self, absolute: int) -> Optional[int]:
+        """绝对格位 → 当前网格的相对格位；已被平移挤出网格返回 None。"""
+        level = int(absolute) - self.shift_count
+        return level if 0 <= level < self.grid_count else None
 
 
 def plan_grid(cfg: GridConfig, *, signal_action: object,
@@ -281,6 +309,8 @@ def plan_grid(cfg: GridConfig, *, signal_action: object,
     plan.levels = levels
     plan.lot_per_grid = lot
     plan.triggered = cfg.trigger_price <= 0
+    plan.stop_lower = cfg.stop_lower
+    plan.stop_upper = cfg.stop_upper
     return plan
 
 
@@ -445,35 +475,162 @@ def can_buy_more(plan: GridPlan, cfg: GridConfig) -> bool:
     return used + plan.lot_per_grid <= cfg.total_lot_limit + 1e-9
 
 
-def terminate_reason(cfg: GridConfig, price: float, *, side: str) -> Optional[str]:
-    """当前价是否触发止损 / 止盈；未触发返回 None。"""
-    if price <= 0:
+def terminate_reason(plan: GridPlan, price: float) -> Optional[str]:
+    """当前价是否触发止损 / 止盈；未触发返回 None。
+
+    读 plan 上的止损止盈而不是 cfg：开了向上追踪时它们会随网格一起平移。
+    """
+    if price <= 0 or not plan.ok:
         return None
-    is_long = str(side or "BUY").upper() == "BUY"
-    if is_long:
-        if cfg.stop_lower > 0 and price <= cfg.stop_lower:
-            return f"触发止损价 {cfg.stop_lower}"
-        if cfg.stop_upper > 0 and price >= cfg.stop_upper:
-            return f"触发止盈价 {cfg.stop_upper}"
+    if plan.is_long:
+        if plan.stop_lower > 0 and price <= plan.stop_lower:
+            return f"触发止损价 {plan.stop_lower}"
+        if plan.stop_upper > 0 and price >= plan.stop_upper:
+            return f"触发止盈价 {plan.stop_upper}"
     else:
-        if cfg.stop_upper > 0 and price >= cfg.stop_upper:
-            return f"触发止损价 {cfg.stop_upper}"
-        if cfg.stop_lower > 0 and price <= cfg.stop_lower:
-            return f"触发止盈价 {cfg.stop_lower}"
+        if plan.stop_upper > 0 and price >= plan.stop_upper:
+            return f"触发止损价 {plan.stop_upper}"
+        if plan.stop_lower > 0 and price <= plan.stop_lower:
+            return f"触发止盈价 {plan.stop_lower}"
     return None
+
+
+# ---------------------------------------------------------------------------
+# 向上追踪（币安「向上追踪」的复刻）
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TrailingShift:
+    """一次网格平移的计算结果，应用前调用方需先兑现 dropped 里的持仓。"""
+    steps: int                                          # 平移格数，正=上移 / 负=下移
+    levels: list[float] = field(default_factory=list)
+    stop_lower: float = 0.0
+    stop_upper: float = 0.0
+    holdings: dict[int, int] = field(default_factory=dict)      # 重映射后的格位→ticket
+    dropped: list[tuple[int, int]] = field(default_factory=list)  # 被挤出网格的 (原格位, ticket)
+    from_lower: float = 0.0                             # 平移前的区间，用于说明
+    from_upper: float = 0.0
+
+    @property
+    def direction(self) -> str:
+        return "up" if self.steps > 0 else "down"
+
+
+def _grid_spacing(levels: list[float]) -> tuple[float, float]:
+    """从现有网格线反推间距：(等差步长, 等比公比)。"""
+    n = len(levels) - 1
+    if n < 1 or levels[0] <= 0:
+        return 0.0, 1.0
+    step = (levels[-1] - levels[0]) / n
+    ratio = (levels[-1] / levels[0]) ** (1.0 / n)
+    return step, ratio
+
+
+def _shift_price(price: float, *, geometric: bool, step: float, ratio: float,
+                 up: bool, digits: int) -> float:
+    """把单个价位按网格间距平移一格；0（未设置）保持为 0。"""
+    if price <= 0:
+        return 0.0
+    if geometric:
+        moved = price * ratio if up else price / ratio
+    else:
+        moved = price + step if up else price - step
+    return round(max(moved, 0.0), digits)
+
+
+def trailing_shift(plan: GridPlan, cfg: GridConfig, price: float,
+                   *, digits: int = 5) -> Optional[TrailingShift]:
+    """价格越过区间外沿时把网格连同止损止盈整体平移；无需平移返回 None。
+
+    多头追涨（突破上限后上移）、空头追跌（跌破下限后下移），与币安「向上追踪」
+    一致：网格不停机，而是滚动到新区间继续吃差价，止损止盈同步跟随。
+
+    一次事件可能跳过多格，这里循环平移到区间重新覆盖现价为止；受 trailing_max
+    与 _MAX_SHIFT_PER_CALL 双重约束，避免极端行情下无限平移。
+    """
+    if not cfg.trailing_up or not plan.ok or price <= 0:
+        return None
+
+    budget = _MAX_SHIFT_PER_CALL
+    if cfg.trailing_max > 0:
+        budget = min(budget, cfg.trailing_max - abs(plan.shift_count))
+    if budget <= 0:
+        return None
+
+    geometric = cfg.grid_mode == GRID_MODE_GEOMETRIC
+    levels = list(plan.levels)
+    stop_lower, stop_upper = plan.stop_lower, plan.stop_upper
+    up = plan.is_long
+    steps = 0
+    while steps < budget:
+        if up:
+            if price <= levels[-1]:
+                break
+        elif price >= levels[0]:
+            break
+        step, ratio = _grid_spacing(levels)
+        # 只校验本模式真正用到的那个量：等差网格的公比可能因浮点精度贴近 1，
+        # 一并校验会把间距很小的高价品种误判成无法平移
+        if ratio <= 1.0 if geometric else step <= 0:
+            break
+        nxt = _shift_price(
+            levels[-1] if up else levels[0],
+            geometric=geometric, step=step, ratio=ratio, up=up, digits=digits,
+        )
+        if nxt <= 0 or (up and nxt <= levels[-1]) or (not up and nxt >= levels[0]):
+            break
+        levels = levels[1:] + [nxt] if up else [nxt] + levels[:-1]
+        stop_lower = _shift_price(
+            stop_lower, geometric=geometric, step=step, ratio=ratio, up=up, digits=digits,
+        )
+        stop_upper = _shift_price(
+            stop_upper, geometric=geometric, step=step, ratio=ratio, up=up, digits=digits,
+        )
+        steps += 1
+
+    if steps == 0:
+        return None
+
+    signed = steps if up else -steps
+    holdings: dict[int, int] = {}
+    dropped: list[tuple[int, int]] = []
+    for level, ticket in sorted(plan.holdings.items()):
+        moved = level - signed
+        if 0 <= moved < len(levels) - 1:
+            holdings[moved] = ticket
+        else:
+            dropped.append((level, ticket))
+    return TrailingShift(
+        steps=signed, levels=levels, stop_lower=stop_lower, stop_upper=stop_upper,
+        holdings=holdings, dropped=dropped,
+        from_lower=plan.levels[0], from_upper=plan.levels[-1],
+    )
+
+
+def apply_shift(plan: GridPlan, shift: TrailingShift) -> None:
+    """把平移结果写回计划。dropped 的持仓须由调用方先行平掉。"""
+    plan.levels = list(shift.levels)
+    plan.stop_lower = shift.stop_lower
+    plan.stop_upper = shift.stop_upper
+    plan.holdings = dict(shift.holdings)
+    plan.shift_count += shift.steps
 
 
 # ---------------------------------------------------------------------------
 # 备注编解码（断线恢复用）
 # ---------------------------------------------------------------------------
 
-def grid_comment(level_index: int) -> str:
-    """格位单写进 MT5 的紧凑备注：G4L{index}。"""
-    return f"G4L{int(level_index)}"[:MT5_COMMENT_LIMIT]
+def grid_comment(absolute_index: int) -> str:
+    """格位单写进 MT5 的紧凑备注：G4L{绝对格位号}。
+
+    存绝对格位而非当前格位——MT5 改不了已成交订单的备注，网格平移后只有绝对
+    格位才对得上原来那一格。
+    """
+    return f"G4L{int(absolute_index)}"[:MT5_COMMENT_LIMIT]
 
 
 def parse_grid_comment(comment: object) -> Optional[int]:
-    """从 MT5 备注解析格位号；解析失败返回 None。"""
+    """从 MT5 备注解析绝对格位号；解析失败返回 None。"""
     text = str(comment or "").strip()
     m = _COMMENT_RE.match(text)
     if not m:
@@ -493,20 +650,32 @@ def nearest_level_index(plan: GridPlan, price: float) -> Optional[int]:
     return best_i
 
 
-def rebuild_holdings(plan: GridPlan, positions: list[dict]) -> None:
-    """按持仓 comment（失败则按开仓价就近）还原格位→ticket 映射。"""
+def rebuild_holdings(plan: GridPlan, positions: list[dict]) -> list[int]:
+    """按持仓 comment（失败则按开仓价就近）还原格位→ticket 映射。
+
+    备注里存的是绝对格位号，网格平移过就要减掉 shift_count 才是当前格位。返回
+    「备注可识别、但格位已被平移挤出网格」的 ticket 列表：这些持仓的卖出线已不
+    在网格内，需要调用方平掉兑现，否则会一直挂到任务终止。
+    """
     plan.holdings.clear()
+    orphans: list[int] = []
     for pos in positions or []:
         ticket = _as_int(pos.get("ticket"))
         if ticket <= 0:
             continue
-        level = parse_grid_comment(pos.get("comment"))
-        if level is None:
+        absolute = parse_grid_comment(pos.get("comment"))
+        if absolute is not None:
+            level = plan.relative_index(absolute)
+            if level is None:
+                orphans.append(ticket)
+                continue
+        else:
             level = nearest_level_index(plan, _as_float(pos.get("price_open")))
         if level is None or level in plan.holdings:
             continue
         if 0 <= level < plan.grid_count:
             plan.holdings[level] = ticket
+    return orphans
 
 
 # ---------------------------------------------------------------------------
@@ -535,6 +704,11 @@ def describe_plan(plan: GridPlan, cfg: GridConfig, spec: SymbolSpec) -> str:
         f"每格 {_trim(plan.lot_per_grid, spec.volume_digits)} 手"
         + (f"，总量上限 {_trim(cfg.total_lot_limit, spec.volume_digits)}" if cfg.total_lot_limit else "")
         + ("；初始建仓开启" if cfg.prefill_enabled else "；不初始建仓")
+        + (
+            "；向上追踪开启"
+            + (f"（最多 {cfg.trailing_max} 格）" if cfg.trailing_max else "")
+            if cfg.trailing_up else ""
+        )
     )
 
 
@@ -557,9 +731,52 @@ def plan_detail(plan: GridPlan, cfg: GridConfig, spec: SymbolSpec) -> dict:
         "stop_upper": cfg.stop_upper or None,
         "close_on_stop": cfg.close_on_stop,
         "prefill_enabled": cfg.prefill_enabled,
+        "trailing_up": cfg.trailing_up,
+        "trailing_max": cfg.trailing_max or None,
+        "shift_count": plan.shift_count,
         "levels": list(plan.levels),
         "digits": spec.digits,
         "volume_step": spec.volume_step,
+    }
+
+
+def describe_shift(plan: GridPlan, shift: TrailingShift, *, price: float,
+                   spec: SymbolSpec) -> str:
+    """一次网格平移的原因说明（plan 须已应用该平移）。"""
+    arrow = "上移" if shift.steps > 0 else "下移"
+    text = (
+        f"向上追踪 · 网格{arrow} {abs(shift.steps)} 格："
+        f"现价 {_trim(price, spec.digits)} 越过原区间 "
+        f"[{_trim(shift.from_lower, spec.digits)}, {_trim(shift.from_upper, spec.digits)}]，"
+        f"新区间 [{_trim(plan.levels[0], spec.digits)}, {_trim(plan.levels[-1], spec.digits)}]"
+    )
+    if plan.stop_lower or plan.stop_upper:
+        text += (
+            f"，止损 / 止盈同步为 {_trim(plan.stop_lower, spec.digits) if plan.stop_lower else '不设'}"
+            f" / {_trim(plan.stop_upper, spec.digits) if plan.stop_upper else '不设'}"
+        )
+    if shift.dropped:
+        text += f"；{len(shift.dropped)} 格移出网格已兑现"
+    return text
+
+
+def shift_detail(plan: GridPlan, shift: TrailingShift, *, price: float) -> dict:
+    """一次网格平移的结构化明细。"""
+    return {
+        "kind": "grid_shift",
+        "direction": shift.direction,
+        "steps": shift.steps,
+        "shift_count": plan.shift_count,
+        "from_lower": shift.from_lower,
+        "from_upper": shift.from_upper,
+        "price_lower": plan.levels[0] if plan.levels else None,
+        "price_upper": plan.levels[-1] if plan.levels else None,
+        "stop_lower": plan.stop_lower or None,
+        "stop_upper": plan.stop_upper or None,
+        "price": price,
+        "dropped_levels": [lv for lv, _ in shift.dropped],
+        "holding_count": plan.holding_count(),
+        "grid_count": plan.grid_count,
     }
 
 
@@ -582,11 +799,7 @@ def describe_fill(plan: GridPlan, level: int, *, price: float,
 
 def fill_detail(plan: GridPlan, level: int, *, price: float,
                 action: str, ticket: Optional[int] = None) -> dict:
-    """一笔网格成交的结构化明细。"""
-    kind = "grid_fill" if str(action).upper() in ("BUY", "SELL", "GRID_ADD") else "grid_close"
-    if str(action).upper() in ("CLOSE", "GRID_CLOSE") or kind == "grid_close" and "卖" in str(action):
-        kind = "grid_close"
-    # 买入用 grid_fill，卖出用 grid_close
+    """一笔网格成交的结构化明细：买入记 grid_fill，卖出记 grid_close。"""
     is_buy = str(action).upper() in ("BUY", "GRID_ADD")
     return {
         "kind": "grid_fill" if is_buy else "grid_close",
