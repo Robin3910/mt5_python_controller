@@ -1,7 +1,7 @@
 """网格交易的纯计算逻辑（无 I/O，可单独单元测试）。
 
-对应后台「策略模版3」，规则字段随 strategy_start 的策略快照下发，复刻币安现货
-手动创建网格的行为：
+对应后台「策略模版3」，规则字段随 strategy_start 的策略快照下发，实现手动
+创建网格的行为：
 
 - price_lower / price_upper：价格区间
 - grid_count：网格数量（切成 N 格，N+1 条线）
@@ -317,7 +317,7 @@ def plan_grid(cfg: GridConfig, *, signal_action: object,
 def trigger_reached(cfg: GridConfig, price: float, prev_price: float = 0.0) -> bool:
     """当前价是否已触及触发价（未配置触发价视为已触发）。
 
-    与币安一致：最新价达到触发价时启动。用 prev→price 是否穿越 / 落到触发价判定，
+    最新价达到触发价时启动。用 prev→price 是否穿越 / 落到触发价判定，
     避免同一价位反复判断；首个 tick（prev=0）时，现价已在触发价上方也视为到价。
     """
     if cfg.trigger_price <= 0:
@@ -336,15 +336,15 @@ def prefill_indices(plan: GridPlan, price: float) -> list[int]:
 
     多头网格：现价上方的格位 i（levels[i] < price <= levels[i+1] 的上方）需要先买入，
     这样价格继续上涨时才有货可卖。具体：所有满足 levels[i+1] <= price 的格位 i
-    （即卖出价已在现价下方或等于现价的格）——币安逻辑是「买入现价以上所有网格的量」。
+    （即卖出价已在现价下方或等于现价的格）——即「买入现价以上所有网格的量」。
 
-    币安现货：创建时按「当前价上方的网格数量」市价买入。对应本模型：
+    创建时按「当前价上方的网格数量」市价买入。对应本模型：
     格位 i 的买入线是 levels[i]，卖出线是 levels[i+1]。
     现价上方的格 = 卖出线 > 现价 的格，即 levels[i+1] > price 且 levels[i] < price
     的那一格之上的所有格……更准确：买入所有 levels[i] < price 的格位
     （因为这些格的买入价已在现价下方，相当于「已经跌破买入线」的持仓）。
 
-    与币安一致的简化：买入所有买入线 < 现价 的格位（levels[i] < price）。
+    简化规则：买入所有买入线 < 现价 的格位（levels[i] < price）。
     """
     if not plan.ok or price <= 0:
         return []
@@ -496,7 +496,7 @@ def terminate_reason(plan: GridPlan, price: float) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# 向上追踪（币安「向上追踪」的复刻）
+# 向上追踪
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -542,8 +542,8 @@ def trailing_shift(plan: GridPlan, cfg: GridConfig, price: float,
                    *, digits: int = 5) -> Optional[TrailingShift]:
     """价格越过区间外沿时把网格连同止损止盈整体平移；无需平移返回 None。
 
-    多头追涨（突破上限后上移）、空头追跌（跌破下限后下移），与币安「向上追踪」
-    一致：网格不停机，而是滚动到新区间继续吃差价，止损止盈同步跟随。
+    多头追涨（突破上限后上移）、空头追跌（跌破下限后下移）：网格不停机，
+    而是滚动到新区间继续吃差价，止损止盈同步跟随。
 
     一次事件可能跳过多格，这里循环平移到区间重新覆盖现价为止；受 trailing_max
     与 _MAX_SHIFT_PER_CALL 双重约束，避免极端行情下无限平移。

@@ -364,7 +364,7 @@ export interface StrategyRule {
   breakeven_enabled?: boolean
   /** 浮盈达到止损距离 × 该倍数时把止损移到保本 */
   breakeven_times?: number
-  // --- type=4：网格交易（复刻币安现货手动网格） ---
+  // --- type=4：网格交易 ---
   /** 网格区间下限 */
   price_lower?: number
   /** 网格区间上限 */

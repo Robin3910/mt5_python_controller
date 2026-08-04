@@ -342,7 +342,7 @@ class StrategyRule(BaseModel):
     breakeven_times: float = Field(
         default=1.0, ge=0, description="浮盈达到止损距离 × 该倍数时把止损移到保本",
     )
-    # --- type=4：网格交易（复刻币安现货手动网格） ---
+    # --- type=4：网格交易 ---
     price_lower: float = Field(default=0.0, ge=0, description="网格区间下限")
     price_upper: float = Field(default=0.0, ge=0, description="网格区间上限")
     grid_count: int = Field(default=10, ge=2, le=200, description="网格数量（2-200）")
@@ -358,7 +358,7 @@ class StrategyRule(BaseModel):
     stop_upper: float = Field(default=0.0, ge=0, description="止盈价（须高于区间上限），0=不设")
     close_on_stop: bool = Field(default=True, description="终止时是否清仓")
     prefill_enabled: bool = Field(
-        default=True, description="是否按现价上方格位初始建仓（复刻币安现货网格）",
+        default=True, description="是否按现价上方格位初始建仓",
     )
     trailing_up: bool = Field(
         default=False,

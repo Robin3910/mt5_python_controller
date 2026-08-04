@@ -8,7 +8,7 @@
 - CounterTrendRule：逆势加仓（独立模型，模版1）
 - TrendFollowRule：顺势加仓（独立模型，模版1）
 - RiskSizedTrendRule：以损定量趋势单（独立模型，模版2）
-- GridTradingRule：网格交易（独立模型，模版3，复刻币安现货网格行为）
+- GridTradingRule：网格交易（独立模型，模版3）
 - TemplateRuleSet / RiskSizedRuleSet / GridRuleSet：各模版的规则集
 
 对外序列化仍为 rules 列表（带 type），兼容现有 API / 落库格式。各 type 的字段集合
@@ -53,7 +53,7 @@ ENTRY_PULLBACK = "pullback"
 ENTRY_BREAKOUT = "breakout"
 ENTRY_DIRECTIONS = (ENTRY_PULLBACK, ENTRY_BREAKOUT)
 
-# --- 模版3：网格交易（复刻币安现货手动网格） ---
+# --- 模版3：网格交易 ---
 GRID_MODE_ARITHMETIC = "arithmetic"   # 等差
 GRID_MODE_GEOMETRIC = "geometric"     # 等比
 GRID_MODES = (GRID_MODE_ARITHMETIC, GRID_MODE_GEOMETRIC)
@@ -268,20 +268,20 @@ class RiskSizedRuleSet:
 
 @dataclass
 class GridTradingRule:
-    """网格交易规则（独立模型，复刻币安现货手动创建网格的行为）。
+    """网格交易规则（独立模型）。
 
     在 [price_lower, price_upper] 区间按 grid_mode 切成 grid_count 格（grid_count+1
     条网格线）。价格下跌穿越网格线时买入一格、上涨穿越时卖出对应格，反复吃差价。
     空仓是正常运行态（价格涨出区间顶部时全部卖光，等回落再买），因此任务不会因
     持仓归零而收口，只由止损 / 止盈 / strategy_stop 结束。
 
-    lot_per_grid 是每格手数（MT5 原生口径，对应币安的「投资额」换算结果）。
+    lot_per_grid 是每格手数（MT5 原生口径）。
     prefill_enabled 开启时，启动会先市价买入「现价上方格位数 × 每格手数」的底仓，
     否则价格上涨时无货可卖、网格上半部分失效。
 
-    trailing_up 对应币安的「向上追踪」：价格突破区间外沿时不停机，整个网格连同
-    止损止盈一起平移一格，继续在新区间运行。多头网格追涨（突破上限上移），空头
-    网格追跌（跌破下限下移）——本项目的空头网格是币安现货没有的扩展。
+    trailing_up 开启时，价格突破区间外沿时不停机，整个网格连同止损止盈一起平移
+    一格，继续在新区间运行。多头网格追涨（突破上限上移），空头网格追跌（跌破下限
+    下移）。
     """
     status: int = 1
     action: str = "all"                         # 保留字段，与其它规则对齐；实际方向看 grid_side
@@ -407,7 +407,7 @@ def default_template_2_rules() -> RiskSizedRuleSet:
 
 
 def default_grid_rule() -> GridTradingRule:
-    """策略模版3 · 网格交易默认参数（对齐币安现货手动网格常见配置）。"""
+    """策略模版3 · 网格交易默认参数。"""
     return GridTradingRule(
         status=1,
         action="all",
@@ -469,7 +469,7 @@ STRATEGY_TEMPLATES: dict[str, dict] = {
         "template_id": TEMPLATE_3_ID,
         "name": TEMPLATE_3_NAME,
         "description": (
-            "网格交易（复刻币安现货手动网格）：在价格区间内按等差或等比切格，"
+            "网格交易：在价格区间内按等差或等比切格，"
             "下跌穿越网格线买入、上涨穿越卖出对应格，反复吃差价。"
             "空仓是正常运行态，任务不会因持仓归零而结束；"
             "只由止损价 / 止盈价 / 终止信号收口。"
