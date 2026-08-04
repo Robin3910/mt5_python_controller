@@ -26,7 +26,7 @@ import asyncio
 import logging
 from typing import Optional
 
-from . import group_persist, group_rules, persist
+from . import group_persist, group_rules, persist, strategy_templates
 from .config import Config
 from .connections import manager
 from .models import SIGNAL_MODEL_STRATEGY
@@ -149,7 +149,9 @@ class GroupDispatcher:
                     f"{name}：策略品种 {strategy.get('symbol')} 与信号 {signal.symbol} 不符"
                 )
                 continue
-            reject = group_rules.entry_reject_reason(strategy, signal.stop_loss)
+            reject = group_rules.entry_reject_reason(
+                strategy, signal.stop_loss, signal_action=signal.action,
+            )
             if reject:
                 reasons.append(f"{name}：{reject}")
                 continue
@@ -458,7 +460,14 @@ class GroupDispatcher:
         """已持有组内节点占位后的下发：建子任务拿魔术号 -> 发命令。"""
         node_id, group_id = base["node_id"], base["group_id"]
         volume = base["decided_vol"]
-        created = await group_persist.create_dispatch(**base)
+        # 网格等策略空仓是常态：建子任务时写入，对账热路径不必再解析策略快照
+        strategy_snap = command.get("strategy") or {}
+        hold_when_empty = strategy_templates.pick_grid_rule(
+            strategy_snap.get("rules"),
+        ) is not None
+        created = await group_persist.create_dispatch(
+            **base, hold_when_empty=hold_when_empty,
+        )
         if created is None:
             await self.store.release_group_node_busy(group_id, node_id)
             reason = "子任务创建失败，已放弃该节点"

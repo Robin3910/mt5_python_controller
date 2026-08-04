@@ -308,13 +308,14 @@ class StrategyRule(BaseModel):
     """单条策略规则，字段按 type 分组使用。
 
     type=1 逆势加仓 / type=2 顺势加仓（模版1）：point ~ batch_levels；
-    type=3 以损定量趋势单（模版2）：risk_amount ~ breakeven_times。
+    type=3 以损定量趋势单（模版2）：risk_amount ~ breakeven_times；
+    type=4 网格交易（模版3）：price_lower ~ prefill_enabled。
 
     保持单一扁平模型是为了让 API 契约、前端类型与 config_json 落库格式都不变；
     服务端 `strategy_templates.normalize_rule` 会按 type 只保留该类型的字段，
     因此传给别的 type 的字段不会被写进库。
     """
-    type: int = Field(description="1=逆势加仓，2=顺势加仓，3=以损定量趋势单")
+    type: int = Field(description="1=逆势加仓，2=顺势加仓，3=以损定量趋势单，4=网格交易")
     status: int = Field(description="0=关闭，1=启用")
     action: str = Field(default="all", description="监控方向 all|buy|sell")
     # --- type=1 / 2：加仓类 ---
@@ -340,6 +341,24 @@ class StrategyRule(BaseModel):
     breakeven_enabled: bool = Field(default=False, description="是否启用保本触发")
     breakeven_times: float = Field(
         default=1.0, ge=0, description="浮盈达到止损距离 × 该倍数时把止损移到保本",
+    )
+    # --- type=4：网格交易（复刻币安现货手动网格） ---
+    price_lower: float = Field(default=0.0, ge=0, description="网格区间下限")
+    price_upper: float = Field(default=0.0, ge=0, description="网格区间上限")
+    grid_count: int = Field(default=10, ge=2, le=200, description="网格数量（2-200）")
+    grid_mode: str = Field(
+        default="arithmetic", description="网格模式：arithmetic=等差 / geometric=等比",
+    )
+    grid_side: str = Field(
+        default="long", description="网格方向：long=只做多 / short=只做空 / follow=跟随信号",
+    )
+    lot_per_grid: float = Field(default=0.01, ge=0, description="每格手数")
+    trigger_price: float = Field(default=0.0, ge=0, description="触发价，0=立即启动")
+    stop_lower: float = Field(default=0.0, ge=0, description="止损价（须低于区间下限），0=不设")
+    stop_upper: float = Field(default=0.0, ge=0, description="止盈价（须高于区间上限），0=不设")
+    close_on_stop: bool = Field(default=True, description="终止时是否清仓")
+    prefill_enabled: bool = Field(
+        default=True, description="是否按现价上方格位初始建仓（复刻币安现货网格）",
     )
 
 

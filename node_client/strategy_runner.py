@@ -6,18 +6,21 @@
 3. 收到 GONE（已确认该魔术号持仓归零）即上报 strategy_finished，服务端据此收口；
 4. strategy_stop 时平掉该魔术号全部持仓后结束。
 
-按策略快照里的规则走两条互斥的执行路径（由 `risk_sizing.pick_risk_sized_rule` 判定）：
+按策略快照里的规则走三条互斥的执行路径：
 
 - 加仓路径（模版1）：首单手数用信号手数，之后按逆势 / 顺势规则加仓，判定见
   `strategy_rules.evaluate`；
 - 以损定量路径（模版2）：手数由「风险金额 ÷ 止损距离」反推，底仓市价成交后按间距
-  分批补齐，可选浮盈达标后移动止损保本，计算见 `risk_sizing`。
+  分批补齐，可选浮盈达标后移动止损保本，计算见 `risk_sizing`；
+- 网格路径（模版3）：复刻币安现货手动网格，区间内逐格买卖，空仓是正常运行态，
+  只由止损 / 止盈 / strategy_stop 收口，计算见 `grid_trading`。
 
 执行器自己不读行情与持仓，也没有轮询循环——监控数据由 MarketHub 统一采样后以
 事件送达（见 market_hub.py）；下单与平仓仍由执行器直接调用 MT5。
 
 完成判定放在节点侧：只有节点能实时看到 MT5 持仓。服务端另有账户快照对账兜底，
-所以这里即使漏报一次，最终也不会让分组永久卡住。
+所以这里即使漏报一次，最终也不会让分组永久卡住。网格任务因 hold_when_empty
+豁免「空仓即收口」。
 """
 from __future__ import annotations
 
@@ -26,6 +29,7 @@ import logging
 import time
 from typing import Callable, Optional
 
+import grid_trading
 import risk_sizing
 from market_hub import GONE, STALE, MarketEvent, MarketHub, Subscription
 from risk_sizing import EntryPlan, RiskSizedConfig, SymbolSpec
@@ -39,6 +43,11 @@ from strategy_rules import (
     evaluate,
     metric_key,
 )
+
+# 执行路径
+_MODE_ADD_ON = "add_on"
+_MODE_RISK_SIZED = "risk_sized"
+_MODE_GRID = "grid"
 
 # 事件说明落库字段为 VARCHAR(255)，本地先截断，避免整条上报被后端丢弃
 MESSAGE_LIMIT = 255
@@ -99,19 +108,42 @@ class StrategyRunner:
         self._last_report = 0.0
         self._metric_specs: Optional[list[tuple[str, str]]] = None
 
-        # 以损定量路径（模版2）：规则命中即启用，此后不走加仓判定
-        rule = risk_sizing.pick_risk_sized_rule(self.strategy.get("rules"))
+        # 三条互斥执行路径：网格 > 以损定量 > 加仓（按规则 type 优先级）
+        grid_rule = grid_trading.pick_grid_rule(self.strategy.get("rules"))
+        risk_rule = (
+            None if grid_rule
+            else risk_sizing.pick_risk_sized_rule(self.strategy.get("rules"))
+        )
+        if grid_rule:
+            self._mode = _MODE_GRID
+            self._grid_cfg: Optional[grid_trading.GridConfig] = (
+                grid_trading.GridConfig.from_rule(grid_rule)
+            )
+            self.direction = grid_trading.resolve_side(self._grid_cfg, self.direction)
+        else:
+            self._grid_cfg = None
+            self._mode = _MODE_RISK_SIZED if risk_rule else _MODE_ADD_ON
+
         self._risk_cfg: Optional[RiskSizedConfig] = (
-            RiskSizedConfig.from_rule(rule) if rule else None
+            RiskSizedConfig.from_rule(risk_rule) if risk_rule else None
         )
         self._risk_plan: Optional[EntryPlan] = None
         self._risk_spec: Optional[SymbolSpec] = None
         self._breakeven_done = False
 
+        self._grid_plan: Optional[grid_trading.GridPlan] = None
+        self._grid_spec: Optional[grid_trading.SymbolSpec] = None
+        self._grid_prev_price: float = 0.0
+
     @property
     def risk_sized(self) -> bool:
         """本任务是否走以损定量路径。"""
-        return self._risk_cfg is not None
+        return self._mode == _MODE_RISK_SIZED
+
+    @property
+    def is_grid(self) -> bool:
+        """本任务是否走网格路径。"""
+        return self._mode == _MODE_GRID
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -141,6 +173,7 @@ class StrategyRunner:
     async def _run(self, *, resume: bool) -> None:
         sub = self._hub.subscribe(
             symbol=self.symbol, magic=self.magic, direction=self.direction,
+            hold_when_empty=self.is_grid,
         )
         self._sub = sub
         try:
@@ -183,20 +216,28 @@ class StrategyRunner:
             logger.debug("task %s positions unreadable, hold judgement", self.task_id)
             return False
         if event.kind == GONE:
+            if self.is_grid:
+                # 网格空仓是常态；hub 已不会发 GONE，这里做双重保险
+                return False
             if not self._opened:
                 return False
             await self._finish("done", self._stop_reason)
             return True
 
         positions = list(event.positions)
-        if not positions:
-            return False
         if self._seed_pending:
             self._seed_from_positions(positions)
             if self.risk_sized:
                 await self._risk_rebuild_plan(positions, event.point)
+            elif self.is_grid:
+                await self._grid_rebuild(positions)
 
-        if self.risk_sized:
+        if self.is_grid:
+            if await self._grid_advance(event, positions):
+                return True
+        elif not positions:
+            return False
+        elif self.risk_sized:
             if await self._risk_advance(event, positions):
                 return False
         else:
@@ -286,7 +327,10 @@ class StrategyRunner:
         """下首单；失败直接结束子任务（服务端会据此收口）。
 
         以损定量路径先反推手数，因此首单手数、止盈都与信号自带的值无关。
+        网格路径可能先等触发价，再按现价上方格位初始建仓。
         """
+        if self.is_grid:
+            return await self._grid_open_first()
         if self.risk_sized:
             return await self._risk_open_base()
         res = await self._exec(
@@ -583,6 +627,283 @@ class StrategyRunner:
             risk_sizing.describe_plan(plan, cfg, spec),
             f"信号 {self.signal_id or '—'}",
         ])
+
+    # ------------------------------------------------------------------
+    # 网格路径（模版3）
+    # ------------------------------------------------------------------
+    async def _grid_symbol_spec(self) -> grid_trading.SymbolSpec:
+        """读一次品种规格并缓存。"""
+        if self._grid_spec is None:
+            raw = dict(await self._exec(self._mt5.symbol_spec, self.symbol) or {})
+            self._grid_spec = grid_trading.SymbolSpec(
+                point=_as_float(raw.get("point")),
+                digits=int(raw.get("digits") or 5),
+                volume_min=_as_float(raw.get("volume_min")),
+                volume_step=_as_float(raw.get("volume_step")),
+                volume_max=_as_float(raw.get("volume_max")),
+            )
+        return self._grid_spec
+
+    async def _grid_quote(self) -> float:
+        """取当前价：多头网格看 ask（买入）、空头看 bid。"""
+        quotes = dict(await self._exec(self._mt5.quotes, [self.symbol]) or {})
+        quote = quotes.get(self.symbol) or next(iter(quotes.values()), {})
+        key = "ask" if self.direction == "BUY" else "bid"
+        return _as_float(quote.get(key)) or _as_float(quote.get("mid"))
+
+    async def _grid_open_first(self) -> bool:
+        """网格启动：建计划 → 等触发价 → 可选初始建仓。"""
+        cfg = self._grid_cfg
+        assert cfg is not None
+        spec = await self._grid_symbol_spec()
+        plan = grid_trading.plan_grid(
+            cfg, signal_action=self.entry.get("action") or self.direction, spec=spec,
+        )
+        if not plan.ok:
+            logger.warning("task %s grid rejected: %s", self.task_id, plan.reject)
+            await self._emit_progress(
+                "error", phase="failed",
+                message=f"网格无法启动：{plan.reject}",
+                detail={"kind": "grid_plan", "reason": plan.reject},
+            )
+            await self._finish("failed", f"grid_rejected: {plan.reject}")
+            return False
+
+        self._grid_plan = plan
+        self.direction = plan.side
+        self.base_volume = plan.lot_per_grid
+
+        price = await self._grid_quote()
+        self._grid_prev_price = price
+        if not plan.triggered and not grid_trading.trigger_reached(
+            cfg, price, prev_price=0.0,
+        ):
+            # 未到触发价：进入事件循环等待，空仓存活靠 hold_when_empty
+            self._opened = True
+            await self._emit_progress(
+                "open", phase="running",
+                message=(
+                    f"网格等待触发价 {cfg.trigger_price}，现价 {price}；"
+                    + grid_trading.describe_plan(plan, cfg, spec)
+                ),
+                detail={
+                    **self._open_detail(),
+                    **grid_trading.plan_detail(plan, cfg, spec),
+                    "kind": "grid_plan",
+                    "waiting_trigger": True,
+                },
+            )
+            return True
+
+        plan.triggered = True
+        return await self._grid_do_prefill(price)
+
+    async def _grid_do_prefill(self, price: float) -> bool:
+        """按现价上方格位初始建仓（可关闭）。"""
+        cfg, plan = self._grid_cfg, self._grid_plan
+        assert cfg is not None and plan is not None
+        spec = await self._grid_symbol_spec()
+
+        if cfg.prefill_enabled and price > 0:
+            indices = grid_trading.capped_prefill(
+                plan, cfg, grid_trading.prefill_indices(plan, price),
+            )
+        else:
+            indices = []
+
+        opened_any = False
+        for level in indices:
+            ok = await self._grid_buy_level(level, price, positions=[])
+            if ok:
+                opened_any = True
+
+        self._opened = True
+        self._grid_prev_price = price
+        msg = grid_trading.describe_plan(plan, cfg, spec)
+        if indices:
+            msg = f"网格初始建仓 {len(indices)} 格；{msg}"
+        elif cfg.prefill_enabled:
+            msg = f"网格启动（现价下方无格可预填）；{msg}"
+        else:
+            msg = f"网格启动（未开启初始建仓）；{msg}"
+        await self._emit_progress(
+            "open", phase="opened" if opened_any else "running",
+            message=msg,
+            detail={
+                **self._open_detail(),
+                **grid_trading.plan_detail(plan, cfg, spec),
+                "kind": "grid_plan",
+                "prefill_levels": indices,
+            },
+        )
+        return True
+
+    async def _grid_rebuild(self, positions: list[dict]) -> None:
+        """恢复后按规则重建计划，并用持仓 comment / 开仓价还原格位映射。"""
+        cfg = self._grid_cfg
+        if cfg is None:
+            return
+        spec = await self._grid_symbol_spec()
+        plan = grid_trading.plan_grid(
+            cfg, signal_action=self.entry.get("action") or self.direction, spec=spec,
+        )
+        if not plan.ok:
+            logger.info(
+                "task %s resume without grid plan (%s): monitor only",
+                self.task_id, plan.reject,
+            )
+            return
+        plan.triggered = True
+        grid_trading.rebuild_holdings(plan, positions)
+        self._grid_plan = plan
+        self.direction = plan.side
+        self.base_volume = plan.lot_per_grid
+        if positions:
+            latest = max(positions, key=lambda p: (p.get("time") or 0, p.get("ticket") or 0))
+            self._grid_prev_price = _as_float(latest.get("price_current")) or _as_float(
+                latest.get("price_open"),
+            )
+
+    async def _grid_advance(self, event: MarketEvent, positions: list[dict]) -> bool:
+        """推进网格：等触发 → 穿越买卖 → 止损止盈。返回 True 表示任务已收口。"""
+        cfg, plan = self._grid_cfg, self._grid_plan
+        if cfg is None or plan is None or not plan.ok:
+            return False
+
+        price = event.price
+        if price <= 0:
+            return False
+
+        # 同步 holdings：外部平仓（止损单等）后清掉已不存在的 ticket
+        live_tickets = {
+            int(p.get("ticket") or 0) for p in positions if p.get("ticket")
+        }
+        stale = [lv for lv, tk in plan.holdings.items() if tk not in live_tickets]
+        for lv in stale:
+            plan.holdings.pop(lv, None)
+
+        if not plan.triggered:
+            if not grid_trading.trigger_reached(cfg, price, self._grid_prev_price):
+                self._grid_prev_price = price
+                return False
+            plan.triggered = True
+            await self._grid_do_prefill(price)
+            return False
+
+        reason = grid_trading.terminate_reason(cfg, price, side=plan.side)
+        if reason:
+            await self._grid_terminate(reason)
+            return True
+
+        prev = self._grid_prev_price or price
+        for crossing in grid_trading.crossings(plan, prev, price):
+            buy_lv = grid_trading.buy_level_for_crossing(plan, crossing)
+            if buy_lv is not None and grid_trading.can_buy_more(plan, cfg):
+                await self._grid_buy_level(buy_lv, price, positions)
+                continue
+            sell_lv = grid_trading.sell_level_for_crossing(plan, crossing)
+            if sell_lv is not None:
+                await self._grid_sell_level(sell_lv, price, positions)
+
+        self._grid_prev_price = price
+        return False
+
+    async def _grid_buy_level(self, level: int, price: float,
+                              positions: list[dict]) -> bool:
+        """买入一格并登记 ticket。"""
+        plan = self._grid_plan
+        if plan is None or level in plan.holdings:
+            return False
+        spec = await self._grid_symbol_spec()
+        reason = grid_trading.describe_fill(
+            plan, level, price=price, action="BUY", spec=spec,
+        )
+        res = dict(await self._exec(
+            self._mt5.place_market_order,
+            self.symbol, plan.side, plan.lot_per_grid,
+            None, None, grid_trading.grid_comment(level), self.magic,
+        ) or {})
+        detail = grid_trading.fill_detail(
+            plan, level, price=price, action="BUY",
+            ticket=res.get("order") or res.get("ticket"),
+        )
+        if not res.get("success"):
+            logger.warning(
+                "task %s grid buy L%s failed: %s", self.task_id, level, res.get("error"),
+            )
+            await self._emit_progress(
+                "error", phase="running", positions=positions,
+                message=f"网格买入失败：{res.get('error') or 'order failed'}；{reason}",
+                detail={**detail, "error": str(res.get("error") or "")},
+            )
+            return False
+        ticket = int(res.get("order") or res.get("ticket") or 0)
+        if ticket:
+            plan.holdings[level] = ticket
+        self.add_count += 1
+        self.total_orders += 1
+        self.total_volume += plan.lot_per_grid
+        logger.info("task %s grid buy L%s: %s", self.task_id, level, reason)
+        await self._emit_progress(
+            "grid_add", phase="running",
+            last_order={
+                "ticket": ticket or None,
+                "price": res.get("price"),
+                "volume": plan.lot_per_grid,
+            },
+            message=reason,
+            detail=detail,
+        )
+        return True
+
+    async def _grid_sell_level(self, level: int, price: float,
+                               positions: list[dict]) -> None:
+        """卖出（平掉）一格。"""
+        plan = self._grid_plan
+        if plan is None:
+            return
+        ticket = plan.holdings.get(level)
+        if not ticket:
+            return
+        spec = await self._grid_symbol_spec()
+        reason = grid_trading.describe_fill(
+            plan, level, price=price, action="CLOSE", spec=spec,
+        )
+        res = dict(await self._exec(self._mt5.close_ticket, int(ticket)) or {})
+        detail = grid_trading.fill_detail(
+            plan, level, price=price, action="CLOSE", ticket=ticket,
+        )
+        if not res.get("success"):
+            logger.warning(
+                "task %s grid sell L%s failed: %s", self.task_id, level, res.get("error"),
+            )
+            await self._emit_progress(
+                "error", phase="running", positions=positions,
+                message=f"网格卖出失败：{res.get('error') or 'close failed'}；{reason}",
+                detail={**detail, "error": str(res.get("error") or "")},
+            )
+            return
+        plan.holdings.pop(level, None)
+        logger.info("task %s grid sell L%s: %s", self.task_id, level, reason)
+        await self._emit_progress(
+            "close_partial", phase="running",
+            last_order={
+                "ticket": ticket,
+                "price": res.get("price") or price,
+                "volume": plan.lot_per_grid,
+            },
+            message=reason,
+            detail=detail,
+        )
+
+    async def _grid_terminate(self, reason: str) -> None:
+        """止损 / 止盈触发：按配置清仓后收口。"""
+        cfg = self._grid_cfg
+        self._stop_reason = reason
+        if cfg is not None and cfg.close_on_stop:
+            await self._close_all()
+            return
+        await self._finish("done", reason)
 
     # ------------------------------------------------------------------
     # 首单的开单原因

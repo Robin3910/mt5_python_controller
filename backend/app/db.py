@@ -155,6 +155,22 @@ def _migrate_group_task_strategy_columns(sync_conn) -> None:
                 sync_conn.execute(
                     text(f"ALTER TABLE group_task_dispatch ADD COLUMN {name} {ddl}")
                 )
+        # 布尔列需按方言区分：MySQL 用 TINYINT(1)，SQLite 用 BOOLEAN
+        if "hold_when_empty" not in cols:
+            if dialect == "mysql":
+                sync_conn.execute(
+                    text(
+                        "ALTER TABLE group_task_dispatch "
+                        "ADD COLUMN hold_when_empty TINYINT(1) NOT NULL DEFAULT 0"
+                    )
+                )
+            else:
+                sync_conn.execute(
+                    text(
+                        "ALTER TABLE group_task_dispatch "
+                        "ADD COLUMN hold_when_empty BOOLEAN NOT NULL DEFAULT 0"
+                    )
+                )
 
     if "group_task_event" in tables:
         # 开单原因的计算依据明细（偏离 / 阈值 / 手数公式等逐项参数）

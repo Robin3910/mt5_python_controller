@@ -21,8 +21,11 @@ class FakeHub:
         self.metrics: dict[tuple[str, str], float] = {}
         self.metric_calls: list[tuple[str, str, str]] = []
 
-    def subscribe(self, *, symbol, magic, direction) -> mh.Subscription:
-        self.sub = mh.Subscription(symbol=symbol, magic=magic, direction=direction)
+    def subscribe(self, *, symbol, magic, direction, hold_when_empty=False) -> mh.Subscription:
+        self.sub = mh.Subscription(
+            symbol=symbol, magic=magic, direction=direction,
+            hold_when_empty=bool(hold_when_empty),
+        )
         return self.sub
 
     def unsubscribe(self, sub) -> None:
@@ -815,3 +818,136 @@ async def test_add_on_strategy_is_not_treated_as_risk_sized():
     sent: list = []
     runner, _ = _runner(sent)
     assert runner.risk_sized is False
+
+
+# ---------------------------------------------------------------------------
+# 模版3：网格交易
+# ---------------------------------------------------------------------------
+
+GRID_LOWER = 2300.0
+GRID_UPPER = 2400.0
+GRID_PRICE = 2350.0
+
+
+def grid_rule(**over) -> dict:
+    rule = {
+        "type": 4, "status": 1, "action": "all",
+        "price_lower": GRID_LOWER, "price_upper": GRID_UPPER,
+        "grid_count": 10, "grid_mode": "arithmetic",
+        "grid_side": "long", "lot_per_grid": 0.01,
+        "total_lot_limit": 0.0, "trigger_price": 0.0,
+        "stop_lower": 0.0, "stop_upper": 0.0,
+        "close_on_stop": True, "prefill_enabled": True,
+    }
+    rule.update(over)
+    return rule
+
+
+def _grid_runner(sent: list, *, mt5=None, **rule_over):
+    client = mt5 or MockMT5Client()
+    client.prices_map["XAUUSD"] = GRID_PRICE
+    hub = FakeHub()
+
+    async def send(payload: dict) -> None:
+        sent.append(payload)
+
+    async def _exec(fn, *args):
+        return fn(*args)
+
+    runner = StrategyRunner(
+        task_id=1, magic=MAGIC, group_id="g1", signal_id="s1",
+        entry={"action": "BUY", "symbol": "XAUUSD", "volume": 0.1},
+        strategy={"name": "金网格", "template_id": "tpl_3",
+                  "rules": [grid_rule(**rule_over)]},
+        mt5=client, hub=hub, exec_fn=_exec, send_fn=send, report_interval=1.0,
+    )
+    return runner, hub, client
+
+
+async def test_grid_mode_and_hold_when_empty_subscribe():
+    sent: list = []
+    runner, hub, _ = _grid_runner(sent)
+    assert runner.is_grid is True
+    assert runner.risk_sized is False
+    runner.start()
+    await _settle()
+    assert hub.sub is not None
+    assert hub.sub.hold_when_empty is True
+    runner.cancel()
+
+
+async def test_grid_prefill_opens_levels_above_price():
+    """初始建仓：现价上方（买线已跌破）的格位先买入。"""
+    sent: list = []
+    runner, hub, mt5 = _grid_runner(sent)
+    runner.start()
+    await _settle()
+
+    opened = _progress(sent, "open")
+    assert opened
+    assert opened[0]["detail"]["kind"] == "grid_plan"
+    # 2350 在 2300~2400、10 格时，买线 < 2350 的格应被预填
+    assert runner.total_orders > 0
+    assert len(mt5.positions_by_magic(MAGIC)) == runner.total_orders
+    assert not runner.done
+    runner.cancel()
+
+
+async def test_grid_empty_positions_do_not_finish():
+    """空仓不收口：投递空持仓事件后任务继续存活。"""
+    sent: list = []
+    runner, hub, mt5 = _grid_runner(sent, prefill_enabled=False)
+    runner.start()
+    await _settle()
+    assert runner.total_orders == 0
+
+    _tick(hub, [], GRID_PRICE)
+    await _settle()
+    assert not _of_type(sent, "strategy_finished")
+    assert not runner.done
+    runner.cancel()
+
+
+async def test_grid_buy_on_down_cross_and_sell_on_up_cross():
+    sent: list = []
+    runner, hub, mt5 = _grid_runner(
+        sent, prefill_enabled=False, grid_count=4,
+        price_lower=100.0, price_upper=110.0,
+    )
+    mt5.prices_map["XAUUSD"] = 106.0
+    runner.start()
+    await _settle()
+
+    # 106 → 104：下跌穿越 105 → 买入格位 2（levels: 100,102.5,105,107.5,110）
+    _tick(hub, mt5.positions_by_magic(MAGIC), 104.0)
+    await _settle()
+    buys = _progress(sent, "grid_add")
+    assert buys
+    assert runner.total_orders >= 1
+    held = mt5.positions_by_magic(MAGIC)
+    assert held
+
+    # 104 → 108：上涨穿越 107.5 → 卖出格位 2
+    _tick(hub, held, 108.0)
+    await _settle()
+    closes = _progress(sent, "close_partial")
+    assert closes
+    runner.cancel()
+
+
+async def test_grid_stop_lower_terminates_and_closes():
+    sent: list = []
+    runner, hub, mt5 = _grid_runner(
+        sent, prefill_enabled=True, stop_lower=2290.0, close_on_stop=True,
+    )
+    runner.start()
+    await _settle()
+    assert runner.total_orders > 0
+
+    _tick(hub, mt5.positions_by_magic(MAGIC), 2285.0)
+    await _settle(10)
+
+    finished = _of_type(sent, "strategy_finished")
+    assert finished
+    assert finished[0]["status"] == "done"
+    assert mt5.positions_by_magic(MAGIC) == []

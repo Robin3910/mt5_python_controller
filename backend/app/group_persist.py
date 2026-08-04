@@ -84,11 +84,15 @@ async def create_dispatch(
     node_id: str,
     symbol: Optional[str],
     decided_vol: Optional[float],
+    hold_when_empty: bool = False,
 ) -> Optional[dict]:
     """创建一条节点子任务并分配魔术号，返回 {dispatch_id, magic}。
 
     必须在下发命令之前落库：魔术号由自增主键派生，而且节点的回报可能在下发流程
     还没走完时就到达，先有记录才不会丢报。
+
+    hold_when_empty：网格等策略空仓是常态，为 True 时账户快照对账不会因无持仓
+    强制收口。建子任务时按策略快照写入，对账热路径不必再解析 JSON。
 
     这里只做插入，不刷新主任务与信号状态——紧随其后的 set_dispatch_status 会刷，
     多个节点并发下发时少一轮读写能明显减少写锁竞争。
@@ -102,6 +106,7 @@ async def create_dispatch(
                 node_id=node_id,
                 symbol=symbol,
                 decided_vol=decided_vol,
+                hold_when_empty=bool(hold_when_empty),
                 status="pending",
                 dispatched_at=datetime.now(),
             )
@@ -653,6 +658,8 @@ async def reconcile_node_positions(
                         GroupTaskDispatch.node_id == node_id,
                         GroupTaskDispatch.status.in_(group_rules.SUBTASK_RUNNING),
                         GroupTaskDispatch.opened_at.is_not(None),
+                        # 网格空仓是常态，不据此收口
+                        GroupTaskDispatch.hold_when_empty.is_(False),
                     )
                 )
             ).scalars().all()

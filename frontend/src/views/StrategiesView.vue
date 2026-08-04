@@ -10,6 +10,8 @@ import type {
   BatchCalcType,
   BatchTimeframe,
   EntryDirection,
+  GridMode,
+  GridSide,
   StrategyBatchLevel,
   StrategyOut,
   StrategyRule,
@@ -24,6 +26,7 @@ const BATCH_BAR_PERIOD = 14
 const RULE_TYPE_COUNTER = 1
 const RULE_TYPE_TREND = 2
 const RULE_TYPE_RISK_SIZED = 3
+const RULE_TYPE_GRID = 4
 
 const hub = useHubStore()
 const router = useRouter()
@@ -64,6 +67,7 @@ const RULE_TYPE_LABEL: Record<number, string> = {
   [RULE_TYPE_COUNTER]: '逆势加仓',
   [RULE_TYPE_TREND]: '顺势加仓',
   [RULE_TYPE_RISK_SIZED]: '以损定量趋势单',
+  [RULE_TYPE_GRID]: '网格交易',
 }
 
 const RULE_TYPE_HELP: Record<number, string> = {
@@ -78,10 +82,18 @@ const RULE_TYPE_HELP: Record<number, string> = {
     '底仓先市价成交，剩余仓位按间距分批补齐。所有批次共用信号那一个止损价，' +
     '因此无论补进几批，打到止损的总亏损始终等于风险金额。' +
     '信号必须携带止损价（sl），否则本策略不参与分发。',
+  [RULE_TYPE_GRID]:
+    '网格交易（复刻币安现货手动网格）：在价格区间内按等差或等比切格，' +
+    '下跌穿越网格线买入、上涨穿越卖出对应格，反复吃差价。' +
+    '空仓是正常运行态，任务不会因持仓归零而结束；只由止损价 / 止盈价 / 终止信号收口。',
 }
 
 function isRiskSized(rule: { type: number }): boolean {
   return rule.type === RULE_TYPE_RISK_SIZED
+}
+
+function isGrid(rule: { type: number }): boolean {
+  return rule.type === RULE_TYPE_GRID
 }
 
 const FIELD_HELP = {
@@ -161,6 +173,22 @@ const FIELD_HELP = {
   breakeven_times:
     '保本触发的倍数 N：浮盈价格距离 ≥ 止损距离 × N 时移动止损。\n' +
     '例如止损距离 300 点、N=1，则浮盈 300 点后止损挪到均价。',
+  price_lower: '网格价格区间下限。须大于 0，且小于上限。',
+  price_upper: '网格价格区间上限。须大于下限。',
+  grid_count: '网格数量（2–200）。区间会被切成该数量的格子（N+1 条网格线）。',
+  grid_mode:
+    '分格方式：\n等差 = 每格价格间距相等；\n等比 = 每格涨跌幅比例相等（适合宽区间）。',
+  grid_side:
+    '网格方向：\n只做多 = 跌买涨卖（复刻币安现货）；\n只做空 = 涨卖跌买；\n跟随信号 = 按触发信号的 BUY/SELL 决定方向。',
+  lot_per_grid: '每一格买入/卖出的手数。对应币安网格的「投资额」换算结果。',
+  trigger_price: '触发价。填 0 表示信号到达后立即启动；否则等到价触及该价才建网格。',
+  stop_lower: '止损价，须低于区间下限；填 0 表示不设。多头网格跌破此价终止。',
+  stop_upper: '止盈价，须高于区间上限；填 0 表示不设。多头网格涨破此价终止。',
+  close_on_stop: '触发止损/止盈时是否清掉该任务全部持仓。关闭则只停止监控、保留持仓。',
+  prefill_enabled:
+    '开启后启动时按「现价上方格位数 × 每格手数」市价买入底仓（复刻币安现货网格），' +
+    '否则价格上涨时无货可卖、上半部分网格失效。',
+  grid_total_lot_limit: '全部格位合计手数上限，0=不额外限制。初始建仓也会受此约束。',
 }
 
 /** 补仓方向选项，与后端 ENTRY_DIRECTIONS 对齐 */
@@ -169,12 +197,26 @@ const ENTRY_DIRECTION_OPTIONS: Array<{ value: EntryDirection; label: string }> =
   { value: 'breakout', label: '突破加仓' },
 ]
 
+const GRID_MODE_OPTIONS: Array<{ value: GridMode; label: string }> = [
+  { value: 'arithmetic', label: '等差' },
+  { value: 'geometric', label: '等比' },
+]
+
+const GRID_SIDE_OPTIONS: Array<{ value: GridSide; label: string }> = [
+  { value: 'long', label: '只做多' },
+  { value: 'short', label: '只做空' },
+  { value: 'follow', label: '跟随信号' },
+]
+
 /**
  * 表单内规则：所有字段都已填充，便于直接 v-model 绑定。
- * 两组字段（加仓类 / 以损定量）都会补齐，提交后由后端按 type 只保留对应的一组。
+ * 各组字段都会补齐，提交后由后端按 type 只保留对应的一组。
  */
-type EditableRule = Required<Omit<StrategyRule, 'batch_levels'>> & {
+type EditableRule = Required<Omit<StrategyRule, 'batch_levels' | 'grid_mode' | 'grid_side' | 'entry_direction'>> & {
   batch_levels: StrategyBatchLevel[]
+  entry_direction: EntryDirection
+  grid_mode: GridMode
+  grid_side: GridSide
 }
 
 function cloneRules(rules: StrategyRule[]): EditableRule[] {
@@ -200,6 +242,17 @@ function cloneRules(rules: StrategyRule[]): EditableRule[] {
     max_total_lot: r.max_total_lot ?? 0,
     breakeven_enabled: r.breakeven_enabled ?? false,
     breakeven_times: r.breakeven_times ?? 1,
+    price_lower: r.price_lower ?? 0,
+    price_upper: r.price_upper ?? 0,
+    grid_count: r.grid_count ?? 10,
+    grid_mode: r.grid_mode ?? 'arithmetic',
+    grid_side: r.grid_side ?? 'long',
+    lot_per_grid: r.lot_per_grid ?? 0.01,
+    trigger_price: r.trigger_price ?? 0,
+    stop_lower: r.stop_lower ?? 0,
+    stop_upper: r.stop_upper ?? 0,
+    close_on_stop: r.close_on_stop ?? true,
+    prefill_enabled: r.prefill_enabled ?? true,
   }))
 }
 
@@ -383,6 +436,51 @@ function validateRiskSized(r: EditableRule, label: string): string | null {
   return null
 }
 
+/** 网格交易的参数校验 */
+function validateGrid(r: EditableRule, label: string): string | null {
+  if (!(r.price_lower > 0)) return `${label}：区间下限需大于 0`
+  if (!(r.price_upper > r.price_lower)) return `${label}：区间上限须大于下限`
+  if (r.grid_count < 2 || r.grid_count > 200) return `${label}：网格数量需在 2 ~ 200`
+  if (!GRID_MODE_OPTIONS.some((o) => o.value === r.grid_mode)) {
+    return `${label}：网格模式非法`
+  }
+  if (r.grid_mode === 'geometric' && !(r.price_lower > 0)) {
+    return `${label}：等比网格要求区间下限大于 0`
+  }
+  if (!GRID_SIDE_OPTIONS.some((o) => o.value === r.grid_side)) {
+    return `${label}：网格方向非法`
+  }
+  if (!(r.lot_per_grid > 0)) return `${label}：每格手数需大于 0`
+  if (r.total_lot_limit < 0) return `${label}：总手数上限不能为负`
+  if (r.trigger_price < 0) return `${label}：触发价不能为负`
+  if (r.stop_lower > 0 && r.stop_lower >= r.price_lower) {
+    return `${label}：止损价须低于区间下限`
+  }
+  if (r.stop_upper > 0 && r.stop_upper <= r.price_upper) {
+    return `${label}：止盈价须高于区间上限`
+  }
+  return null
+}
+
+/** 网格间距 / 预估占用手数提示 */
+function gridHint(r: EditableRule): string {
+  const n = r.grid_count || 0
+  const lower = r.price_lower || 0
+  const upper = r.price_upper || 0
+  if (!(upper > lower) || n < 2) return '请填写合法的价格区间与网格数量'
+  const gap =
+    r.grid_mode === 'geometric'
+      ? `${(((upper / lower) ** (1 / n) - 1) * 100).toFixed(4)}%`
+      : ((upper - lower) / n).toFixed(6).replace(/\.?0+$/, '')
+  const lot = r.lot_per_grid || 0
+  const maxLot = lot * n
+  const modeLabel = GRID_MODE_OPTIONS.find((o) => o.value === r.grid_mode)?.label || r.grid_mode
+  return (
+    `${modeLabel}间距 ≈ ${gap}；满仓约 ${maxLot.toFixed(4).replace(/\.?0+$/, '')} 手` +
+    (r.total_lot_limit > 0 ? `（上限 ${r.total_lot_limit}）` : '')
+  )
+}
+
 function validateRules(rules: EditableRule[]): string | null {
   if (!rules.length) return '请至少配置一条规则'
   for (const r of rules) {
@@ -392,6 +490,11 @@ function validateRules(rules: EditableRule[]): string | null {
     }
     if (isRiskSized(r)) {
       const err = validateRiskSized(r, label)
+      if (err) return err
+      continue
+    }
+    if (isGrid(r)) {
+      const err = validateGrid(r, label)
       if (err) return err
       continue
     }
@@ -449,7 +552,7 @@ async function save(): Promise<void> {
     return
   }
   const rulesErr = validateRules(form.rules.map((r) => {
-    if (!isRiskSized(r) && r.batch_enabled) rebuildBatchLevels(r)
+    if (!isRiskSized(r) && !isGrid(r) && r.batch_enabled) rebuildBatchLevels(r)
     return r
   }))
   if (rulesErr) {
@@ -525,6 +628,11 @@ function ruleSummary(rules: StrategyRule[]): string {
         const batches = r.add_batches ?? 0
         return `${label}（风险 ${r.risk_amount ?? 0} · 盈亏比 ${r.rr_ratio ?? 0}${batches ? ` · 分 ${batches} 批补仓` : ''}）`
       }
+      if (isGrid(r)) {
+        const side = GRID_SIDE_OPTIONS.find((o) => o.value === r.grid_side)?.label || r.grid_side
+        const mode = GRID_MODE_OPTIONS.find((o) => o.value === r.grid_mode)?.label || r.grid_mode
+        return `${label}（${r.grid_count ?? 0} 格${mode} · ${side} · 每格 ${r.lot_per_grid ?? 0}）`
+      }
       const levels = r.batch_levels?.length ?? 0
       return r.batch_enabled && levels ? `${label}（分批 ${levels} 档）` : label
     })
@@ -571,7 +679,7 @@ function entryDirectionLabel(direction: string | undefined): string {
   return ENTRY_DIRECTION_OPTIONS.find((o) => o.value === direction)?.label || direction || '—'
 }
 
-/** 规则详情的参数行；两种规则类型的字段集合不同，展示由此按 type 分派 */
+/** 规则详情的参数行；各规则类型的字段集合不同，展示由此按 type 分派 */
 function ruleDetailRows(r: StrategyRule): Array<{ k: string; v: string }> {
   if (isRiskSized(r)) {
     const batches = r.add_batches ?? 0
@@ -591,6 +699,21 @@ function ruleDetailRows(r: StrategyRule): Array<{ k: string; v: string }> {
         k: '保本触发',
         v: r.breakeven_enabled ? `止损距 × ${r.breakeven_times ?? 0} 倍` : '未启用',
       },
+    ]
+  }
+  if (isGrid(r)) {
+    const side = GRID_SIDE_OPTIONS.find((o) => o.value === r.grid_side)?.label || r.grid_side || '—'
+    const mode = GRID_MODE_OPTIONS.find((o) => o.value === r.grid_mode)?.label || r.grid_mode || '—'
+    return [
+      { k: '价格区间', v: `${r.price_lower ?? 0} ~ ${r.price_upper ?? 0}` },
+      { k: '网格', v: `${r.grid_count ?? 0} 格 · ${mode}` },
+      { k: '方向', v: side },
+      { k: '每格手数', v: String(r.lot_per_grid ?? 0) },
+      { k: '总手数上限', v: r.total_lot_limit ? String(r.total_lot_limit) : '不限' },
+      { k: '触发价', v: r.trigger_price ? String(r.trigger_price) : '立即启动' },
+      { k: '止损 / 止盈', v: `${r.stop_lower || '不设'} / ${r.stop_upper || '不设'}` },
+      { k: '终止清仓', v: r.close_on_stop === false ? '否' : '是' },
+      { k: '初始建仓', v: r.prefill_enabled === false ? '关闭' : '开启' },
     ]
   }
   return [
@@ -628,7 +751,7 @@ function resetRuleToTemplate(idx: number): void {
       <div>
         <div class="h1">策略管理</div>
         <p class="muted" style="font-size: 13px; margin-top: 4px">
-          基于策略模版创建实例并绑定品种；模版1 配逆势 / 顺势加仓，模版2 配以损定量趋势单
+          基于策略模版创建实例并绑定品种；模版1 配逆势 / 顺势加仓，模版2 配以损定量趋势单，模版3 配网格交易
         </p>
       </div>
       <div class="row" style="gap: 8px">
@@ -693,6 +816,11 @@ function resetRuleToTemplate(idx: number): void {
             <template v-if="isRiskSized(r)">
               <div class="muted" style="font-size: 12px">
                 手数由风险金额与信号止损价反推，各批共用同一止损
+              </div>
+            </template>
+            <template v-else-if="isGrid(r)">
+              <div class="muted" style="font-size: 12px">
+                网格空仓是正常运行态；只由止损 / 止盈 / 终止信号收口
               </div>
             </template>
             <template v-else-if="r.batch_enabled">
@@ -802,6 +930,11 @@ function resetRuleToTemplate(idx: number): void {
                     <template v-if="isRiskSized(r)">
                       <div class="muted" style="font-size: 12px">
                         手数由风险金额与信号止损价反推，各批共用同一止损；信号必须携带 sl
+                      </div>
+                    </template>
+                    <template v-else-if="isGrid(r)">
+                      <div class="muted" style="font-size: 12px">
+                        网格空仓是正常运行态；只由止损 / 止盈 / 终止信号收口
                       </div>
                     </template>
                     <template v-else-if="r.batch_enabled">
@@ -1100,6 +1233,151 @@ function resetRuleToTemplate(idx: number): void {
                   </div>
                   <p v-if="r.breakeven_enabled" class="rule-hint">
                     浮盈达到止损距离 × {{ r.breakeven_times }} 倍时，把该任务全部持仓的止损移到加权均价，只触发一次
+                  </p>
+                </div>
+              </template>
+
+              <!-- 网格交易（模版3）：复刻币安现货手动网格 -->
+              <template v-else-if="isGrid(r)">
+                <div class="rule-grid">
+                  <div class="field">
+                    <FormLabel :field-id="`rule-${idx}-price-lower`" text="区间下限" :help="FIELD_HELP.price_lower" />
+                    <input
+                      :id="`rule-${idx}-price-lower`"
+                      v-model.number="r.price_lower"
+                      type="number"
+                      min="0"
+                      step="any"
+                    />
+                  </div>
+                  <div class="field">
+                    <FormLabel :field-id="`rule-${idx}-price-upper`" text="区间上限" :help="FIELD_HELP.price_upper" />
+                    <input
+                      :id="`rule-${idx}-price-upper`"
+                      v-model.number="r.price_upper"
+                      type="number"
+                      min="0"
+                      step="any"
+                    />
+                  </div>
+                  <div class="field">
+                    <FormLabel :field-id="`rule-${idx}-grid-count`" text="网格数量" :help="FIELD_HELP.grid_count" />
+                    <input
+                      :id="`rule-${idx}-grid-count`"
+                      v-model.number="r.grid_count"
+                      type="number"
+                      min="2"
+                      max="200"
+                      step="1"
+                    />
+                  </div>
+                  <div class="field">
+                    <FormLabel :field-id="`rule-${idx}-grid-mode`" text="网格模式" :help="FIELD_HELP.grid_mode" />
+                    <select :id="`rule-${idx}-grid-mode`" v-model="r.grid_mode">
+                      <option v-for="o in GRID_MODE_OPTIONS" :key="o.value" :value="o.value">{{ o.label }}</option>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <FormLabel :field-id="`rule-${idx}-grid-side`" text="网格方向" :help="FIELD_HELP.grid_side" />
+                    <select :id="`rule-${idx}-grid-side`" v-model="r.grid_side">
+                      <option v-for="o in GRID_SIDE_OPTIONS" :key="o.value" :value="o.value">{{ o.label }}</option>
+                    </select>
+                  </div>
+                </div>
+                <p class="rule-hint">{{ gridHint(r) }}</p>
+
+                <div class="batch-block">
+                  <div class="batch-head">
+                    <FormLabel text="每格下单" :help="FIELD_HELP.lot_per_grid" />
+                  </div>
+                  <div class="batch-top-grid">
+                    <div class="field">
+                      <FormLabel :field-id="`rule-${idx}-lot-per-grid`" text="每格手数" :help="FIELD_HELP.lot_per_grid" />
+                      <input
+                        :id="`rule-${idx}-lot-per-grid`"
+                        v-model.number="r.lot_per_grid"
+                        type="number"
+                        min="0"
+                        step="0.01"
+                      />
+                    </div>
+                    <div class="field">
+                      <FormLabel
+                        :field-id="`rule-${idx}-grid-total-lot`"
+                        text="总手数上限"
+                        :help="FIELD_HELP.grid_total_lot_limit"
+                      />
+                      <input
+                        :id="`rule-${idx}-grid-total-lot`"
+                        v-model.number="r.total_lot_limit"
+                        type="number"
+                        min="0"
+                        step="0.01"
+                      />
+                    </div>
+                    <div class="field">
+                      <div class="rule-enable-wrap">
+                        <FormLabel text="初始建仓" :help="FIELD_HELP.prefill_enabled" />
+                        <input
+                          type="checkbox"
+                          :checked="r.prefill_enabled"
+                          aria-label="启用初始建仓"
+                          @change="r.prefill_enabled = ($event.target as HTMLInputElement).checked"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="batch-block">
+                  <div class="batch-head">
+                    <FormLabel text="启停条件" :help="FIELD_HELP.trigger_price" />
+                  </div>
+                  <div class="batch-top-grid">
+                    <div class="field">
+                      <FormLabel :field-id="`rule-${idx}-trigger`" text="触发价" :help="FIELD_HELP.trigger_price" />
+                      <input
+                        :id="`rule-${idx}-trigger`"
+                        v-model.number="r.trigger_price"
+                        type="number"
+                        min="0"
+                        step="any"
+                      />
+                    </div>
+                    <div class="field">
+                      <FormLabel :field-id="`rule-${idx}-stop-lower`" text="止损价" :help="FIELD_HELP.stop_lower" />
+                      <input
+                        :id="`rule-${idx}-stop-lower`"
+                        v-model.number="r.stop_lower"
+                        type="number"
+                        min="0"
+                        step="any"
+                      />
+                    </div>
+                    <div class="field">
+                      <FormLabel :field-id="`rule-${idx}-stop-upper`" text="止盈价" :help="FIELD_HELP.stop_upper" />
+                      <input
+                        :id="`rule-${idx}-stop-upper`"
+                        v-model.number="r.stop_upper"
+                        type="number"
+                        min="0"
+                        step="any"
+                      />
+                    </div>
+                    <div class="field">
+                      <div class="rule-enable-wrap">
+                        <FormLabel text="终止时清仓" :help="FIELD_HELP.close_on_stop" />
+                        <input
+                          type="checkbox"
+                          :checked="r.close_on_stop"
+                          aria-label="终止时清仓"
+                          @change="r.close_on_stop = ($event.target as HTMLInputElement).checked"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                  <p class="rule-hint">
+                    空仓是正常运行态；任务只由止损价 / 止盈价 / 终止信号收口
                   </p>
                 </div>
               </template>

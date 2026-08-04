@@ -1,4 +1,4 @@
-"""策略模版定义（内置「策略模版1」「策略模版2」）。
+"""策略模版定义（内置「策略模版1」「策略模版2」「策略模版3」）。
 
 模版本身不可通过 API 新建；新建策略时选择模版，会把模版默认规则复制到策略实例，
 之后可按实例独立调整（不影响模版）。
@@ -8,7 +8,8 @@
 - CounterTrendRule：逆势加仓（独立模型，模版1）
 - TrendFollowRule：顺势加仓（独立模型，模版1）
 - RiskSizedTrendRule：以损定量趋势单（独立模型，模版2）
-- TemplateRuleSet / RiskSizedRuleSet：各模版的规则集
+- GridTradingRule：网格交易（独立模型，模版3，复刻币安现货网格行为）
+- TemplateRuleSet / RiskSizedRuleSet / GridRuleSet：各模版的规则集
 
 对外序列化仍为 rules 列表（带 type），兼容现有 API / 落库格式。各 type 的字段集合
 不同，规范化按 type 分派到对应的 normalizer（见 _RULE_NORMALIZERS），因此新增模版
@@ -24,6 +25,7 @@ from typing import Any, Callable, Optional, Protocol
 RULE_TYPE_COUNTER = 1      # 逆势加仓（模版1）
 RULE_TYPE_TREND = 2        # 顺势加仓（模版1）
 RULE_TYPE_RISK_SIZED = 3   # 以损定量趋势单（模版2）
+RULE_TYPE_GRID = 4         # 网格交易（模版3）
 
 RULE_ACTIONS = ("all", "buy", "sell")
 
@@ -51,10 +53,24 @@ ENTRY_PULLBACK = "pullback"
 ENTRY_BREAKOUT = "breakout"
 ENTRY_DIRECTIONS = (ENTRY_PULLBACK, ENTRY_BREAKOUT)
 
+# --- 模版3：网格交易（复刻币安现货手动网格） ---
+GRID_MODE_ARITHMETIC = "arithmetic"   # 等差
+GRID_MODE_GEOMETRIC = "geometric"     # 等比
+GRID_MODES = (GRID_MODE_ARITHMETIC, GRID_MODE_GEOMETRIC)
+# 网格方向：long 只做多 / short 只做空 / follow 跟随信号方向
+GRID_SIDE_LONG = "long"
+GRID_SIDE_SHORT = "short"
+GRID_SIDE_FOLLOW = "follow"
+GRID_SIDES = (GRID_SIDE_LONG, GRID_SIDE_SHORT, GRID_SIDE_FOLLOW)
+GRID_COUNT_MIN = 2
+GRID_COUNT_MAX = 200
+
 TEMPLATE_1_ID = "tpl_1"
 TEMPLATE_1_NAME = "策略模版1"
 TEMPLATE_2_ID = "tpl_2"
 TEMPLATE_2_NAME = "策略模版2"
+TEMPLATE_3_ID = "tpl_3"
+TEMPLATE_3_NAME = "策略模版3"
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +264,67 @@ class RiskSizedRuleSet:
         return [self.risk_sized.to_dict()]
 
 
+@dataclass
+class GridTradingRule:
+    """网格交易规则（独立模型，复刻币安现货手动创建网格的行为）。
+
+    在 [price_lower, price_upper] 区间按 grid_mode 切成 grid_count 格（grid_count+1
+    条网格线）。价格下跌穿越网格线时买入一格、上涨穿越时卖出对应格，反复吃差价。
+    空仓是正常运行态（价格涨出区间顶部时全部卖光，等回落再买），因此任务不会因
+    持仓归零而收口，只由止损 / 止盈 / strategy_stop 结束。
+
+    lot_per_grid 是每格手数（MT5 原生口径，对应币安的「投资额」换算结果）。
+    prefill_enabled 开启时，启动会先市价买入「现价上方格位数 × 每格手数」的底仓，
+    否则价格上涨时无货可卖、网格上半部分失效。
+    """
+    status: int = 1
+    action: str = "all"                         # 保留字段，与其它规则对齐；实际方向看 grid_side
+    price_lower: float = 0.0                    # 区间下限
+    price_upper: float = 0.0                    # 区间上限
+    grid_count: int = 10                        # 网格数量（2-200）
+    grid_mode: str = GRID_MODE_ARITHMETIC       # arithmetic / geometric
+    grid_side: str = GRID_SIDE_LONG             # long / short / follow
+    lot_per_grid: float = 0.01                  # 每格手数
+    total_lot_limit: float = 0.0                # 总手数上限，0=不额外限制
+    trigger_price: float = 0.0                  # 触发价，0=立即启动
+    stop_lower: float = 0.0                     # 止损价（低于区间下限），0=不设
+    stop_upper: float = 0.0                     # 止盈价（高于区间上限），0=不设
+    close_on_stop: bool = True                  # 终止时是否清仓
+    prefill_enabled: bool = True                # 是否按现价上方格位初始建仓
+
+    @property
+    def type(self) -> int:
+        return RULE_TYPE_GRID
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": self.type,
+            "status": self.status,
+            "action": self.action,
+            "price_lower": self.price_lower,
+            "price_upper": self.price_upper,
+            "grid_count": self.grid_count,
+            "grid_mode": self.grid_mode,
+            "grid_side": self.grid_side,
+            "lot_per_grid": self.lot_per_grid,
+            "total_lot_limit": self.total_lot_limit,
+            "trigger_price": self.trigger_price,
+            "stop_lower": self.stop_lower,
+            "stop_upper": self.stop_upper,
+            "close_on_stop": self.close_on_stop,
+            "prefill_enabled": self.prefill_enabled,
+        }
+
+
+@dataclass
+class GridRuleSet:
+    """模版3 规则集：只有一条网格交易规则。"""
+    grid: GridTradingRule
+
+    def to_rules(self) -> list[dict[str, Any]]:
+        return [self.grid.to_dict()]
+
+
 def _default_counter_batch_levels() -> list[BatchLevel]:
     """MTcommander 风格默认分批档位。"""
     return [
@@ -319,12 +396,37 @@ def default_template_2_rules() -> RiskSizedRuleSet:
     return RiskSizedRuleSet(risk_sized=default_risk_sized_rule())
 
 
+def default_grid_rule() -> GridTradingRule:
+    """策略模版3 · 网格交易默认参数（对齐币安现货手动网格常见配置）。"""
+    return GridTradingRule(
+        status=1,
+        action="all",
+        price_lower=0.0,
+        price_upper=0.0,
+        grid_count=10,
+        grid_mode=GRID_MODE_ARITHMETIC,
+        grid_side=GRID_SIDE_LONG,
+        lot_per_grid=0.01,
+        total_lot_limit=0.0,
+        trigger_price=0.0,
+        stop_lower=0.0,
+        stop_upper=0.0,
+        close_on_stop=True,
+        prefill_enabled=True,
+    )
+
+
+def default_template_3_rules() -> GridRuleSet:
+    return GridRuleSet(grid=default_grid_rule())
+
+
 # ---------------------------------------------------------------------------
 # 模版注册表
 # ---------------------------------------------------------------------------
 
 _TPL1_RULES = default_template_1_rules()
 _TPL2_RULES = default_template_2_rules()
+_TPL3_RULES = default_template_3_rules()
 
 STRATEGY_TEMPLATES: dict[str, dict] = {
     TEMPLATE_1_ID: {
@@ -351,6 +453,19 @@ STRATEGY_TEMPLATES: dict[str, dict] = {
         "rule_set": _TPL2_RULES,
         "rules": _TPL2_RULES.to_rules(),
     },
+    TEMPLATE_3_ID: {
+        "template_id": TEMPLATE_3_ID,
+        "name": TEMPLATE_3_NAME,
+        "description": (
+            "网格交易（复刻币安现货手动网格）：在价格区间内按等差或等比切格，"
+            "下跌穿越网格线买入、上涨穿越卖出对应格，反复吃差价。"
+            "空仓是正常运行态，任务不会因持仓归零而结束；"
+            "只由止损价 / 止盈价 / 终止信号收口。"
+            "可选初始建仓（按现价上方格位先买入），否则上涨时无货可卖。"
+        ),
+        "rule_set": _TPL3_RULES,
+        "rules": _TPL3_RULES.to_rules(),
+    },
 }
 
 
@@ -370,6 +485,27 @@ def pick_risk_sized_rule(rules: object) -> Optional[dict]:
         return None
     for rule in rules:
         if is_risk_sized_rule(rule) and _as_int(rule.get("status"), 0):
+            return rule
+    return None
+
+
+def is_grid_rule(rule: object) -> bool:
+    """该条规则是否为网格交易。"""
+    if not isinstance(rule, dict):
+        return False
+    return _as_int(rule.get("type"), RULE_TYPE_COUNTER) == RULE_TYPE_GRID
+
+
+def pick_grid_rule(rules: object) -> Optional[dict]:
+    """从规则列表里取出启用中的网格交易规则；没有则返回 None。
+
+    模版3 只有一条规则，服务端与节点都靠它判断该走网格执行路径，
+    以及子任务是否应在空仓时继续存活（hold_when_empty）。
+    """
+    if not isinstance(rules, list):
+        return None
+    for rule in rules:
+        if is_grid_rule(rule) and _as_int(rule.get("status"), 0):
             return rule
     return None
 
@@ -517,11 +653,71 @@ def _normalize_risk_sized_rule(rule_type: int, raw: dict) -> dict[str, Any]:
     }
 
 
+def _normalize_grid_rule(rule_type: int, raw: dict) -> dict[str, Any]:
+    """规范化网格交易规则（模版3）。
+
+    区间上下限必须满足 upper > lower > 0；等比模式同样要求 lower > 0。
+    止损须低于区间下限、止盈须高于区间上限（为 0 表示不设）。
+    网格数量夹在 [2, 200]。
+    """
+    defaults = default_grid_rule().to_dict()
+
+    grid_mode = str(raw.get("grid_mode") or defaults["grid_mode"]).strip().lower()
+    if grid_mode not in GRID_MODES:
+        grid_mode = defaults["grid_mode"]
+
+    grid_side = str(raw.get("grid_side") or defaults["grid_side"]).strip().lower()
+    if grid_side not in GRID_SIDES:
+        grid_side = defaults["grid_side"]
+
+    price_lower = max(0.0, _as_float(raw.get("price_lower", defaults["price_lower"]), defaults["price_lower"]))
+    price_upper = max(0.0, _as_float(raw.get("price_upper", defaults["price_upper"]), defaults["price_upper"]))
+    # 上下限颠倒时交换，保证 upper >= lower；相等或未配留给准入校验拦下
+    if price_upper and price_lower and price_upper < price_lower:
+        price_lower, price_upper = price_upper, price_lower
+
+    grid_count = _as_int(raw.get("grid_count", defaults["grid_count"]), defaults["grid_count"])
+    grid_count = min(GRID_COUNT_MAX, max(GRID_COUNT_MIN, grid_count))
+
+    stop_lower = max(0.0, _as_float(raw.get("stop_lower", defaults["stop_lower"]), defaults["stop_lower"]))
+    stop_upper = max(0.0, _as_float(raw.get("stop_upper", defaults["stop_upper"]), defaults["stop_upper"]))
+    # 止损必须低于区间下限；止盈必须高于区间上限；否则清零视为未设
+    if stop_lower > 0 and price_lower > 0 and stop_lower >= price_lower:
+        stop_lower = 0.0
+    if stop_upper > 0 and price_upper > 0 and stop_upper <= price_upper:
+        stop_upper = 0.0
+
+    return {
+        "type": rule_type,
+        "status": _normalize_status(raw, defaults["status"]),
+        "action": _normalize_action(raw.get("action"), defaults["action"]),
+        "price_lower": price_lower,
+        "price_upper": price_upper,
+        "grid_count": grid_count,
+        "grid_mode": grid_mode,
+        "grid_side": grid_side,
+        "lot_per_grid": max(
+            0.0, _as_float(raw.get("lot_per_grid", defaults["lot_per_grid"]), defaults["lot_per_grid"]),
+        ),
+        "total_lot_limit": max(
+            0.0, _as_float(raw.get("total_lot_limit", defaults["total_lot_limit"]), defaults["total_lot_limit"]),
+        ),
+        "trigger_price": max(
+            0.0, _as_float(raw.get("trigger_price", defaults["trigger_price"]), defaults["trigger_price"]),
+        ),
+        "stop_lower": stop_lower,
+        "stop_upper": stop_upper,
+        "close_on_stop": bool(raw.get("close_on_stop", defaults["close_on_stop"])),
+        "prefill_enabled": bool(raw.get("prefill_enabled", defaults["prefill_enabled"])),
+    }
+
+
 # 各 type 的规范化实现。新增模版时在此登记，normalize_rule 无需再改。
 _RULE_NORMALIZERS: dict[int, Callable[[int, dict], dict[str, Any]]] = {
     RULE_TYPE_COUNTER: _normalize_add_on_rule,
     RULE_TYPE_TREND: _normalize_add_on_rule,
     RULE_TYPE_RISK_SIZED: _normalize_risk_sized_rule,
+    RULE_TYPE_GRID: _normalize_grid_rule,
 }
 
 

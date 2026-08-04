@@ -238,8 +238,9 @@ class GroupTaskDispatch(Base):
     共用魔术号的旧记录，所以 magic 上不加唯一索引）。
 
     生命周期：pending -> sent -> opened -> running -> closing -> done。
-    完成判定是「该节点上 magic 关联的持仓全部平掉」，由节点主动上报，
+    完成判定默认是「该节点上 magic 关联的持仓全部平掉」，由节点主动上报，
     服务端再用账户快照对账兜底（见 group_persist.reconcile_*）。
+    网格等策略空仓是常态时 hold_when_empty=True，对账不会因无持仓强制收口。
 
     并发互斥也落在这一层：子任务处于非终态时，(node_id, symbol) 会持有一个 Redis
     占位，同一节点同品种不会被重复下发（不同品种可并行）。
@@ -270,6 +271,8 @@ class GroupTaskDispatch(Base):
     total_volume: Mapped[float] = mapped_column(Float, default=0.0)   # 累计手数
     realized_profit: Mapped[float] = mapped_column(Float, default=0.0)
     finish_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 网格等策略空仓是常态：为 True 时账户快照对账不会因无持仓强制收口
+    hold_when_empty: Mapped[bool] = mapped_column(Boolean, default=False)
     dispatched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     opened_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_report_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

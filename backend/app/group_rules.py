@@ -14,7 +14,7 @@
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Callable, Optional
 
 from . import strategy_templates
 from .config import Config
@@ -189,15 +189,10 @@ def strategy_rules_snapshot(strategy: Optional[dict]) -> Optional[dict]:
     }
 
 
-def entry_reject_reason(strategy: dict, signal_stop_loss: object) -> Optional[str]:
-    """开仓前的策略级准入：策略跑不起来时给出人读的原因；可开仓返回 None。
-
-    以损定量趋势单的手数由「风险金额 ÷ 止损距离」反推，没有止损价就算不出手数。
-    与其让节点收到命令后再失败一次，不如在分发前挡住，落选原因直接写进信号记录。
-    """
-    rule = strategy_templates.pick_risk_sized_rule(strategy.get("rules"))
-    if rule is None:
-        return None
+def _reject_risk_sized(rule: dict, *, signal_stop_loss: object,
+                       signal_action: object = None) -> Optional[str]:
+    """以损定量趋势单准入：手数由风险金额 ÷ 止损距离反推，没有止损价就算不出手数。"""
+    del signal_action  # 本路径不看信号方向
     try:
         stop_loss = float(signal_stop_loss)  # type: ignore[arg-type]
     except (TypeError, ValueError):
@@ -206,4 +201,63 @@ def entry_reject_reason(strategy: dict, signal_stop_loss: object) -> Optional[st
         return "以损定量趋势单需要信号携带止损价（sl），本信号未提供"
     if float(rule.get("risk_amount") or 0) <= 0:
         return "以损定量趋势单的风险金额需大于 0"
+    return None
+
+
+def _reject_grid(rule: dict, *, signal_stop_loss: object,
+                 signal_action: object = None) -> Optional[str]:
+    """网格交易准入：区间合法、每格手数 > 0、方向与信号匹配。"""
+    del signal_stop_loss  # 网格不依赖信号止损
+    try:
+        lower = float(rule.get("price_lower") or 0)
+        upper = float(rule.get("price_upper") or 0)
+    except (TypeError, ValueError):
+        lower, upper = 0.0, 0.0
+    if lower <= 0 or upper <= 0 or upper <= lower:
+        return "网格交易需要合法的价格区间（上限须大于下限，且均大于 0）"
+    if float(rule.get("lot_per_grid") or 0) <= 0:
+        return "网格交易的每格手数需大于 0"
+    side = str(rule.get("grid_side") or strategy_templates.GRID_SIDE_LONG).strip().lower()
+    action = str(signal_action or "").strip().upper()
+    if side == strategy_templates.GRID_SIDE_LONG and action == "SELL":
+        return "网格方向为只做多（long），不接受 SELL 信号"
+    if side == strategy_templates.GRID_SIDE_SHORT and action == "BUY":
+        return "网格方向为只做空（short），不接受 BUY 信号"
+    return None
+
+
+# 各 type 的开仓准入实现。新增模版时在此登记，entry_reject_reason 无需再改。
+_ENTRY_REJECTORS: dict[int, Callable[..., Optional[str]]] = {
+    strategy_templates.RULE_TYPE_RISK_SIZED: _reject_risk_sized,
+    strategy_templates.RULE_TYPE_GRID: _reject_grid,
+}
+
+
+def entry_reject_reason(
+    strategy: dict,
+    signal_stop_loss: object,
+    signal_action: object = None,
+) -> Optional[str]:
+    """开仓前的策略级准入：策略跑不起来时给出人读的原因；可开仓返回 None。
+
+    与其让节点收到命令后再失败一次，不如在分发前挡住，落选原因直接写进信号记录。
+    按启用中规则的 type 分派到对应校验；未知 type 不拦截。
+    """
+    rules = strategy.get("rules")
+    if not isinstance(rules, list):
+        return None
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        if not int(rule.get("status") or 0):
+            continue
+        rule_type = int(rule.get("type") or 0)
+        rejector = _ENTRY_REJECTORS.get(rule_type)
+        if rejector is None:
+            continue
+        reason = rejector(
+            rule, signal_stop_loss=signal_stop_loss, signal_action=signal_action,
+        )
+        if reason:
+            return reason
     return None

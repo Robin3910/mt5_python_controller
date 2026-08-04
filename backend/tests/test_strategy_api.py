@@ -7,11 +7,14 @@ from fastapi.testclient import TestClient
 
 from app.redis_store import RedisStore
 from app.strategy_templates import (
+    RULE_TYPE_GRID,
     RULE_TYPE_RISK_SIZED,
     TEMPLATE_1_ID,
     TEMPLATE_1_NAME,
     TEMPLATE_2_ID,
     TEMPLATE_2_NAME,
+    TEMPLATE_3_ID,
+    TEMPLATE_3_NAME,
 )
 
 _TEST_DB = pathlib.Path(__file__).resolve().parent / "_test_api.db"
@@ -487,3 +490,106 @@ def test_list_search_toggle_delete_strategy(client):
 
     assert client.delete(f"/api/strategies/{sid}", headers=h).status_code == 200
     assert client.get(f"/api/strategies/{sid}", headers=h).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# 模版3：网格交易
+# ---------------------------------------------------------------------------
+
+def _grid_rule(**over) -> dict:
+    rule = {
+        "type": RULE_TYPE_GRID, "status": 1, "action": "all",
+        "price_lower": 100.0, "price_upper": 110.0,
+        "grid_count": 10, "grid_mode": "arithmetic",
+        "grid_side": "long", "lot_per_grid": 0.01,
+        "total_lot_limit": 0.0, "trigger_price": 0.0,
+        "stop_lower": 0.0, "stop_upper": 0.0,
+        "close_on_stop": True, "prefill_enabled": True,
+    }
+    rule.update(over)
+    return rule
+
+
+def test_list_templates_contains_template_3(client):
+    h = auth_headers(client)
+    r = client.get("/api/strategies/templates", headers=h)
+    assert r.status_code == 200, r.text
+    items = r.json()
+    tpl = next(t for t in items if t["template_id"] == TEMPLATE_3_ID)
+    assert tpl["name"] == TEMPLATE_3_NAME
+    assert len(tpl["rules"]) == 1
+    assert tpl["rules"][0]["type"] == RULE_TYPE_GRID
+    assert tpl["rules"][0]["grid_mode"] == "arithmetic"
+    assert tpl["rules"][0]["grid_side"] == "long"
+    assert tpl["rules"][0]["prefill_enabled"] is True
+
+
+def test_create_strategy_from_template_3(client):
+    h = auth_headers(client)
+    r = client.post(
+        "/api/strategies",
+        json={
+            "template_id": TEMPLATE_3_ID,
+            "name": "金网格",
+            "symbol": "XAUUSD",
+            "rules": [_grid_rule(price_lower=2300, price_upper=2400, grid_count=20)],
+        },
+        headers=h,
+    )
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["template_id"] == TEMPLATE_3_ID
+    assert body["rules"][0]["type"] == RULE_TYPE_GRID
+    assert body["rules"][0]["price_lower"] == 2300
+    assert body["rules"][0]["grid_count"] == 20
+    assert body["rules"][0]["grid_side"] == "long"
+    assert body["rules"][0]["lot_per_grid"] == 0.01
+
+
+def test_normalize_grid_clamps_and_swaps_range():
+    from app import strategy_templates as tpl
+
+    out = tpl.normalize_rule(_grid_rule(
+        price_lower=110, price_upper=100, grid_count=1, stop_lower=105, stop_upper=105,
+    ))
+    assert out["price_lower"] == 100
+    assert out["price_upper"] == 110
+    assert out["grid_count"] == 2          # 下限夹到 2
+    assert out["stop_lower"] == 0.0        # 不低于下限则清零
+    assert out["stop_upper"] == 0.0        # 不高于上限则清零
+    # 规范化只保留网格字段，不加仓 / 以损定量字段
+    assert "point" not in out
+    assert "risk_amount" not in out
+
+
+def test_pick_grid_rule():
+    from app import strategy_templates as tpl
+
+    assert tpl.pick_grid_rule([_grid_rule()]) is not None
+    assert tpl.pick_grid_rule([_grid_rule(status=0)]) is None
+    assert tpl.pick_grid_rule([{"type": 1, "status": 1}]) is None
+
+
+def test_entry_reject_grid_side_and_lot():
+    from app import group_rules
+
+    strategy = {"rules": [_grid_rule(grid_side="long")]}
+    assert group_rules.entry_reject_reason(strategy, None, signal_action="BUY") is None
+    assert "只做多" in (
+        group_rules.entry_reject_reason(strategy, None, signal_action="SELL") or ""
+    )
+
+    strategy = {"rules": [_grid_rule(grid_side="short")]}
+    assert "只做空" in (
+        group_rules.entry_reject_reason(strategy, None, signal_action="BUY") or ""
+    )
+
+    strategy = {"rules": [_grid_rule(lot_per_grid=0)]}
+    assert "每格手数" in (
+        group_rules.entry_reject_reason(strategy, None, signal_action="BUY") or ""
+    )
+
+    strategy = {"rules": [_grid_rule(price_lower=0, price_upper=0)]}
+    assert "价格区间" in (
+        group_rules.entry_reject_reason(strategy, None, signal_action="BUY") or ""
+    )

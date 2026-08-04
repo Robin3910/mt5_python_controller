@@ -189,7 +189,7 @@ function limitText(detail: GroupTaskEventDetail): string {
   return `${label} ${detail.limit_value}`
 }
 
-/** 把开单依据拆成可逐项展示的键值对；首单与加仓的参数集完全不同 */
+/** 把开单依据拆成可逐项展示的键值对；各 kind 的参数集不同 */
 function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string }> {
   const rows: Array<{ k: string; v: string }> = []
   const push = (k: string, v: unknown): void => {
@@ -215,6 +215,91 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
     push('触发前加仓', detail.add_count === undefined ? '' : `${detail.add_count} 次`)
     push('本次为第', detail.next_position_no === undefined ? '' : `${detail.next_position_no} 笔`)
     push('生效上限', limitText(detail))
+    push('错误', detail.error)
+    return rows
+  }
+  if (detail.kind === 'risk_sized_plan' || (detail.kind === 'open' && detail.risk_amount != null)) {
+    push('来源信号', detail.signal_id)
+    push('品种', detail.symbol)
+    push('方向', detail.direction || detail.action)
+    push('风险金额', detail.risk_amount)
+    push('实际风险', detail.risk_used)
+    push('手数公式', detail.lot_formula)
+    push('总手数', detail.total_lot)
+    push('底仓', detail.base_volume === undefined ? '' : `${detail.base_volume}（${detail.base_ratio ?? 0}%）`)
+    push(
+      '分批补仓',
+      detail.add_batches
+        ? `${detail.entry_direction_label || detail.entry_direction} ${detail.add_batches} 批 · 间距 ${detail.gap_points ?? 0} 点`
+        : '不分批',
+    )
+    push('止损', detail.stop_loss || '不设')
+    push('止盈', detail.take_profit || '不设')
+    push('止损距离', detail.sl_points === undefined ? '' : `${detail.sl_points} 点`)
+    push('托管策略', detail.strategy_name)
+    push('策略模版', detail.template_id)
+    push('魔术号', detail.magic)
+    push('错误', detail.error || detail.reason)
+    return rows
+  }
+  if (detail.kind === 'risk_sized_add') {
+    push('补仓批次', detail.batch_index === undefined ? '' : `第 ${(detail.batch_index ?? 0) + 1}/${detail.batch_total ?? '?'} 批`)
+    push('补仓方向', detail.entry_direction_label || detail.entry_direction)
+    push('首单开仓价', detail.entry_price)
+    push('触发价', detail.trigger_price)
+    push('现价', detail.price)
+    push('偏离', detail.gap_points === undefined ? '' : `${detail.gap_points} 点`)
+    push('本批手数', detail.volume)
+    push('总手数', detail.total_lot)
+    push('止损', detail.stop_loss || '不设')
+    push('止盈', detail.take_profit || '不设')
+    push('风险金额', detail.risk_amount)
+    push('实际风险', detail.risk_used)
+    push('错误', detail.error)
+    return rows
+  }
+  if (detail.kind === 'breakeven') {
+    push('均价', detail.avg_price)
+    push('现价', detail.price)
+    push('有利偏离', detail.favorable)
+    push('触发阈值', detail.threshold)
+    push('止损距倍数', detail.breakeven_times)
+    push('止损距离', detail.sl_distance)
+    push('新止损', detail.stop_loss)
+    push('持仓笔数', detail.position_count)
+    push('错误', detail.error)
+    return rows
+  }
+  if (detail.kind === 'grid_plan' || detail.kind === 'grid_fill' || detail.kind === 'grid_close') {
+    if (detail.kind === 'grid_plan') {
+      push('来源信号', detail.signal_id)
+      push('品种', detail.symbol)
+      push('方向', detail.side || detail.action)
+      push('网格方向', detail.grid_side_label || detail.grid_side)
+      push('网格模式', detail.grid_mode_label || detail.grid_mode)
+      push('价格区间', detail.price_lower == null ? '' : `${detail.price_lower} ~ ${detail.price_upper}`)
+      push('网格数量', detail.grid_count)
+      push('每格手数', detail.lot_per_grid)
+      push('总手数上限', detail.total_lot_limit || '不限')
+      push('触发价', detail.trigger_price || '立即启动')
+      push('止损 / 止盈', `${detail.stop_lower || '不设'} / ${detail.stop_upper || '不设'}`)
+      push('初始建仓', detail.prefill_enabled === false ? '关闭' : '开启')
+      push('等待触发', detail.waiting_trigger ? '是' : '')
+      push('预填格位', detail.prefill_levels?.length ? detail.prefill_levels.join(', ') : '')
+      push('托管策略', detail.strategy_name)
+      push('策略模版', detail.template_id)
+      push('魔术号', detail.magic)
+      push('错误', detail.error || detail.reason)
+      return rows
+    }
+    push('格位', detail.level_index)
+    push('买线', detail.level_price)
+    push('卖线', detail.exit_price)
+    push('方向', detail.side || detail.action)
+    push('现价', detail.price)
+    push('手数', detail.volume || detail.lot_per_grid)
+    push('持格', detail.holding_count === undefined ? '' : `${detail.holding_count}/${detail.grid_count ?? '?'}`)
+    push('订单号', detail.ticket)
     push('错误', detail.error)
     return rows
   }
@@ -307,6 +392,8 @@ function eventTag(eventType: string): { cls: string; text: string } {
     open: { cls: 'green', text: '开仓' },
     add_counter: { cls: 'amber', text: '逆势加仓' },
     add_trend: { cls: 'amber', text: '顺势加仓' },
+    grid_add: { cls: 'amber', text: '网格买入' },
+    breakeven: { cls: 'blue', text: '保本' },
     close_partial: { cls: 'blue', text: '部分平仓' },
     close_all: { cls: 'blue', text: '全部平仓' },
     error: { cls: 'red', text: '异常' },

@@ -314,9 +314,16 @@ export interface StrategyBatchLevel {
 /** 以损定量的补仓方向：pullback 回撤补仓 / breakout 突破加仓 */
 export type EntryDirection = 'pullback' | 'breakout'
 
+/** 网格模式：arithmetic 等差 / geometric 等比 */
+export type GridMode = 'arithmetic' | 'geometric'
+
+/** 网格方向：long 只做多 / short 只做空 / follow 跟随信号 */
+export type GridSide = 'long' | 'short' | 'follow'
+
 /**
  * 策略规则，字段按 type 分组使用（与后端独立模型对齐）：
- * type=1 逆势加仓 / type=2 顺势加仓（模版1）；type=3 以损定量趋势单（模版2）。
+ * type=1 逆势加仓 / type=2 顺势加仓（模版1）；type=3 以损定量趋势单（模版2）；
+ * type=4 网格交易（模版3）。
  * 后端会按 type 只保留该类型的字段，因此另一组字段可以留空。
  */
 export interface StrategyRule {
@@ -357,6 +364,27 @@ export interface StrategyRule {
   breakeven_enabled?: boolean
   /** 浮盈达到止损距离 × 该倍数时把止损移到保本 */
   breakeven_times?: number
+  // --- type=4：网格交易（复刻币安现货手动网格） ---
+  /** 网格区间下限 */
+  price_lower?: number
+  /** 网格区间上限 */
+  price_upper?: number
+  /** 网格数量（2-200） */
+  grid_count?: number
+  grid_mode?: GridMode
+  grid_side?: GridSide
+  /** 每格手数 */
+  lot_per_grid?: number
+  /** 触发价，0=立即启动 */
+  trigger_price?: number
+  /** 止损价（须低于区间下限），0=不设 */
+  stop_lower?: number
+  /** 止盈价（须高于区间上限），0=不设 */
+  stop_upper?: number
+  /** 终止时是否清仓 */
+  close_on_stop?: boolean
+  /** 是否按现价上方格位初始建仓 */
+  prefill_enabled?: boolean
 }
 
 export interface StrategyTemplateOut {
@@ -490,9 +518,18 @@ export interface GroupTaskEventRecord {
   detail: GroupTaskEventDetail | null
 }
 
-/** 事件的计算依据明细。首单为 kind=open，加仓为 kind=add，字段随之不同 */
+/** 事件的计算依据明细。字段随 kind 不同 */
 export interface GroupTaskEventDetail {
-  kind?: 'open' | 'add'
+  kind?:
+    | 'open'
+    | 'add'
+    | 'risk_sized_plan'
+    | 'risk_sized_add'
+    | 'risk_sized_reject'
+    | 'breakeven'
+    | 'grid_plan'
+    | 'grid_fill'
+    | 'grid_close'
   // —— 加仓（kind=add）——
   rule_type?: number
   rule_type_label?: string
@@ -530,6 +567,52 @@ export interface GroupTaskEventDetail {
   template_id?: string
   rule_count?: number
   enabled_rule_count?: number
+  // —— 以损定量 / 保本 / 网格（共用扩展字段）——
+  risk_amount?: number
+  risk_used?: number
+  rr_ratio?: number
+  sl_distance?: number
+  sl_points?: number
+  loss_per_lot?: number
+  total_lot?: number
+  lot_formula?: string
+  base_ratio?: number
+  add_batches?: number
+  entry_direction?: string
+  entry_direction_label?: string
+  gap_points?: number
+  gap_capped?: boolean
+  breakeven_enabled?: boolean
+  breakeven_times?: number
+  batch_index?: number
+  batch_total?: number
+  trigger_price?: number
+  entry_price?: number
+  avg_price?: number
+  favorable?: number
+  reason?: string
+  // —— 网格 ——
+  side?: string
+  grid_side?: string
+  grid_side_label?: string
+  grid_mode?: string
+  grid_mode_label?: string
+  price_lower?: number
+  price_upper?: number
+  grid_count?: number
+  lot_per_grid?: number
+  total_lot_limit?: number
+  stop_lower?: number
+  stop_upper?: number
+  close_on_stop?: boolean
+  prefill_enabled?: boolean
+  levels?: number[]
+  level_price?: number
+  exit_price?: number
+  holding_count?: number
+  prefill_levels?: number[]
+  waiting_trigger?: boolean
+  ticket?: number | null
 }
 
 // 手动触发接口返回（与 /webhook 响应同构，字段视 status 而定）

@@ -388,3 +388,41 @@ async def test_bar_metric_failure_is_not_cached():
     assert await hub.bar_metric("XAUUSD", "M5", "atr") == 0.0
     mt5.fail_bars = False
     assert await hub.bar_metric("XAUUSD", "M5", "atr") == 2.0
+
+
+async def test_hold_when_empty_emits_price_ticks_instead_of_gone():
+    """网格空仓是常态：hold_when_empty=True 时不发 GONE，继续派发价格事件。"""
+    mt5 = FakeMT5()
+    hub = _hub(mt5, empty_confirm=1)
+    sub = hub.subscribe(
+        symbol="XAUUSD", magic=MAGIC, direction="BUY", hold_when_empty=True,
+    )
+
+    await hub.sample()
+    event = await sub.next_event()
+    assert event.kind == mh.TICK
+    assert event.positions == ()
+    assert event.price == 2330.0
+
+    mt5.quote = {"bid": 2331.0, "ask": 2331.2, "mid": 2331.1, "change": 0.0}
+    await hub.sample()
+    event = await sub.next_event()
+    assert event.kind == mh.TICK
+    assert event.price == 2331.0
+
+
+async def test_hold_when_empty_false_still_emits_gone():
+    """默认行为不变：见过持仓后清空仍发 GONE。"""
+    mt5 = FakeMT5()
+    mt5.add(ticket=1, magic=MAGIC)
+    hub = _hub(mt5, empty_confirm=1)
+    sub = hub.subscribe(
+        symbol="XAUUSD", magic=MAGIC, direction="BUY", hold_when_empty=False,
+    )
+
+    await hub.sample()
+    assert (await sub.next_event()).kind == mh.TICK
+
+    mt5.clear()
+    await hub.sample()
+    assert (await sub.next_event()).kind == mh.GONE

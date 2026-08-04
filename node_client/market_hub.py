@@ -64,10 +64,14 @@ class Subscription:
 
     只保留最新一份未消费事件：订阅方在下单等耗时操作上阻塞时，堆积的旧行情已无
     意义，合并成最新一份既省内存又避免拿着过期价格做判定。
+
+    hold_when_empty：网格等策略空仓是常态（等待触发价 / 全部卖出后等回落），
+    为 True 时不派发 GONE，继续按价格变化派发 TICK / IDLE。
     """
     symbol: str
     magic: int
     direction: str
+    hold_when_empty: bool = False
 
     # —— 变更检测状态（仅 MarketHub 读写）——
     signature: tuple = ()
@@ -159,10 +163,14 @@ class MarketHub:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
 
-    def subscribe(self, *, symbol: str, magic: int, direction: str) -> Subscription:
+    def subscribe(
+        self, *, symbol: str, magic: int, direction: str,
+        hold_when_empty: bool = False,
+    ) -> Subscription:
         sub = Subscription(
             symbol=str(symbol or ""), magic=int(magic),
             direction=str(direction or "BUY").upper(),
+            hold_when_empty=bool(hold_when_empty),
         )
         self._subs.append(sub)
         self._awake.set()  # 采样协程可能正在空转等待，唤醒它开始工作
@@ -236,11 +244,25 @@ class MarketHub:
                 MarketEvent(kind=STALE, symbol=sub.symbol, magic=sub.magic, ts=now)
             )
 
+    def _price_event(
+        self, sub: Subscription, signature: tuple, price: float, now: float,
+    ) -> Optional[str]:
+        """持仓签名或价格变化 → TICK；长时间无变化 → IDLE；否则不派发。"""
+        if signature != sub.signature or price != sub.price:
+            sub.signature, sub.price = signature, price
+            return TICK
+        if now - sub.published_at >= self.idle_interval:
+            return IDLE
+        return None
+
     def _classify(
         self, sub: Subscription, held: list[dict], price: float, now: float,
     ) -> Optional[str]:
         """判断这一轮要不要给该订阅者派发事件，以及派发哪一种。"""
         if not held:
+            if sub.hold_when_empty:
+                # 网格：空仓是常态（等待触发价 / 全部卖出后等回落），继续按价格变化派发
+                return self._price_event(sub, (0, ()), price, now)
             if not sub.seen:
                 # 从未观察到过持仓：首单可能还没反映到终端，此时判全平会误收口，
                 # 真正的漏报交给服务端账户快照对账兜底
@@ -257,12 +279,7 @@ class MarketHub:
             len(held),
             tuple(sorted(_as_int(p.get("ticket")) or 0 for p in held)),
         )
-        if signature != sub.signature or price != sub.price:
-            sub.signature, sub.price = signature, price
-            return TICK
-        if now - sub.published_at >= self.idle_interval:
-            return IDLE
-        return None
+        return self._price_event(sub, signature, price, now)
 
     # ------------------------------------------------------------------
     # MT5 访问
