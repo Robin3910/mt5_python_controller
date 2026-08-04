@@ -35,6 +35,7 @@ class MockMT5Client:
         self.connected = False
         self._tickets = itertools.count(1000)   # 自增订单号
         self._positions: list[dict] = []         # 内存持仓
+        self._realized_by_magic: dict[int, float] = {}  # 按魔术号累计已实现盈亏
         self.prices_map = dict(_DEFAULT_PRICES)
 
     def connect(self) -> bool:
@@ -110,7 +111,11 @@ class MockMT5Client:
             return {"success": False, "action": "CLOSE", "ticket": ticket, "error": f"position not found: {ticket}"}
         symbol = pos["symbol"]
         volume = float(pos["volume"])
+        profit = float(pos.get("profit") or 0.0)
+        magic = int(pos.get("magic") or self.magic)
         self._positions = [p for p in self._positions if p["ticket"] != ticket]
+        self._realized_by_magic[magic] = self._realized_by_magic.get(magic, 0.0) + profit
+        self.balance += profit
         return {
             "success": True,
             "ticket": ticket,
@@ -119,6 +124,7 @@ class MockMT5Client:
             "volume": volume,
             "position_type": pos["type"],
             "closed": 1,
+            "profit": profit,
         }
 
     def positions_by_magic(self, magic: int) -> list[dict]:
@@ -127,11 +133,24 @@ class MockMT5Client:
 
     def close_by_magic(self, magic: int) -> dict:
         target = int(magic)
-        closed = sum(1 for p in self._positions if int(p.get("magic") or 0) == target)
+        matched = [p for p in self._positions if int(p.get("magic") or 0) == target]
+        profit = sum(float(p.get("profit") or 0.0) for p in matched)
         self._positions = [
             p for p in self._positions if int(p.get("magic") or 0) != target
         ]
-        return {"success": True, "action": "CLOSE", "magic": target, "closed": closed}
+        self._realized_by_magic[target] = self._realized_by_magic.get(target, 0.0) + profit
+        self.balance += profit
+        return {
+            "success": True,
+            "action": "CLOSE",
+            "magic": target,
+            "closed": len(matched),
+            "profit": round(profit, 2),
+        }
+
+    def realized_profit_by_magic(self, magic: int, since_ts: float | None = None) -> float:
+        """与真实 MT5Client 同口径：返回该魔术号累计已实现盈亏。"""
+        return round(float(self._realized_by_magic.get(int(magic), 0.0)), 2)
 
     def symbol_point(self, symbol: str) -> float:
         mid = float(self.prices_map.get(symbol.upper(), 1.0))
@@ -207,18 +226,30 @@ class MockMT5Client:
 
     def close_symbol(self, symbol: str) -> dict:
         base = symbol.upper().replace("/", "")
-        keep, closed = [], 0
+        keep, closed, profit = [], 0, 0.0
         for p in self._positions:
             if p["symbol"].startswith(base) or base.startswith(p["symbol"]):
                 closed += 1
+                mag = int(p.get("magic") or self.magic)
+                pl = float(p.get("profit") or 0.0)
+                profit += pl
+                self._realized_by_magic[mag] = self._realized_by_magic.get(mag, 0.0) + pl
             else:
                 keep.append(p)
         self._positions = keep
+        self.balance += profit
         return {"success": True, "symbol": symbol.upper(), "action": "CLOSE", "closed": closed}
 
     def close_all(self) -> dict:
         closed = len(self._positions)
         symbol = self._positions[0]["symbol"] if closed == 1 else None
+        profit = 0.0
+        for p in self._positions:
+            mag = int(p.get("magic") or self.magic)
+            pl = float(p.get("profit") or 0.0)
+            profit += pl
+            self._realized_by_magic[mag] = self._realized_by_magic.get(mag, 0.0) + pl
+        self.balance += profit
         self._positions = []
         return {"success": True, "symbol": symbol, "action": "CLOSE", "closed": closed}
 
@@ -227,12 +258,18 @@ class MockMT5Client:
         before = len(self._positions)
         kept = []
         closed_sym = None
+        profit = 0.0
         for p in self._positions:
             if int(p.get("ticket") or 0) in tickets:
                 closed_sym = p.get("symbol")
+                mag = int(p.get("magic") or self.magic)
+                pl = float(p.get("profit") or 0.0)
+                profit += pl
+                self._realized_by_magic[mag] = self._realized_by_magic.get(mag, 0.0) + pl
             else:
                 kept.append(p)
         self._positions = kept
+        self.balance += profit
         closed = before - len(kept)
         return {
             "success": True,

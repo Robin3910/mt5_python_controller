@@ -2,13 +2,17 @@
 // 分组信号页：展示某分组处理过的 strategy 主任务与各节点下发明细
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
+import 'element-plus/es/components/message/style/css'
 import { useHubStore } from '@/stores/hub'
 import type {
   GroupOut,
   GroupSignalTaskRecord,
+  GroupTaskDispatchRecord,
   GroupTaskEventDetail,
   GroupTaskEventRecord,
 } from '@/api/types'
+import { confirmAction } from '@/utils/confirm'
 
 const route = useRoute()
 const router = useRouter()
@@ -226,15 +230,16 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
     push('实际风险', detail.risk_used)
     push('手数公式', detail.lot_formula)
     push('总手数', detail.total_lot)
-    push('底仓', detail.base_volume === undefined ? '' : `${detail.base_volume}（${detail.base_ratio ?? 0}%）`)
+    push('底仓', detail.base_volume === undefined ? '' : `${detail.base_volume}（${detail.base_ratio ?? 0}% · TP=0）`)
     push(
-      '分批补仓',
+      '分散仓',
       detail.add_batches
-        ? `${detail.entry_direction_label || detail.entry_direction} ${detail.add_batches} 批 · 间距 ${detail.gap_points ?? 0} 点`
-        : '不分批',
+        ? `${detail.distribute_volume ?? ''} 手 · 分 ${detail.add_batches} 单` +
+          (detail.order_count ? ` · 共 ${detail.order_count} 单` : '')
+        : '无（底仓即全仓）',
     )
     push('止损', detail.stop_loss || '不设')
-    push('止盈', detail.take_profit || '不设')
+    push('分散仓止盈', detail.take_profit || '不设')
     push('止损距离', detail.sl_points === undefined ? '' : `${detail.sl_points} 点`)
     push('托管策略', detail.strategy_name)
     push('策略模版', detail.template_id)
@@ -242,14 +247,11 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
     push('错误', detail.error || detail.reason)
     return rows
   }
-  if (detail.kind === 'risk_sized_add') {
-    push('补仓批次', detail.batch_index === undefined ? '' : `第 ${(detail.batch_index ?? 0) + 1}/${detail.batch_total ?? '?'} 批`)
-    push('补仓方向', detail.entry_direction_label || detail.entry_direction)
+  if (detail.kind === 'risk_sized_distribute' || detail.kind === 'risk_sized_add') {
+    push('分散仓', detail.batch_index === undefined ? '' : `第 ${detail.batch_index}/${detail.batch_total ?? '?'} 单`)
     push('首单开仓价', detail.entry_price)
-    push('触发价', detail.trigger_price)
     push('现价', detail.price)
-    push('偏离', detail.gap_points === undefined ? '' : `${detail.gap_points} 点`)
-    push('本批手数', detail.volume)
+    push('本单手数', detail.volume)
     push('总手数', detail.total_lot)
     push('止损', detail.stop_loss || '不设')
     push('止盈', detail.take_profit || '不设')
@@ -259,6 +261,7 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
     return rows
   }
   if (detail.kind === 'breakeven') {
+    push('监控方式', detail.breakeven_mode_label || detail.breakeven_mode)
     push('均价', detail.avg_price)
     push('现价', detail.price)
     push('有利偏离', detail.favorable)
@@ -370,6 +373,47 @@ function dispatchTag(status: string): { cls: string; text: string } {
 /** 任务是否仍在跑（用于提示分组此时不接收新信号） */
 function isTaskActive(status: string): boolean {
   return ['pending', 'dispatching', 'running'].includes(status)
+}
+
+/** 子任务是否可手动下发平仓终止（未终态即可；平仓中允许重试） */
+function isDispatchCloseable(status: string): boolean {
+  return !['done', 'failed', 'skipped', 'offline'].includes(status)
+}
+
+const closingDispatchIds = ref<Record<string, boolean>>({})
+
+async function closeDispatch(d: GroupTaskDispatchRecord): Promise<void> {
+  if (!group.value || !isDispatchCloseable(d.status)) return
+  const name = d.node_name || d.node_id
+  const magic = d.magic != null ? ` · 魔术号 ${d.magic}` : ''
+  if (
+    !(await confirmAction(
+      `确认对节点「${name}」下发平仓终止？\n将平掉该子任务对应魔术号的持仓并结束策略监控${magic}。`,
+      '确认平仓',
+    ))
+  ) {
+    return
+  }
+  const key = String(d.id)
+  closingDispatchIds.value = { ...closingDispatchIds.value, [key]: true }
+  try {
+    const res = await hub.closeGroupDispatch(group.value.group_id, d.id)
+    if (res.status === 'closing') {
+      ElMessage.success(`已向 ${name} 下发平仓终止`)
+    } else {
+      ElMessage.warning(res.reason || `节点 ${name} 离线，已强制结束子任务，待重连后补发平仓`)
+    }
+    await refreshLiveData()
+  } catch (e: unknown) {
+    const detail =
+      (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail ||
+      '平仓下发失败'
+    ElMessage.error(typeof detail === 'string' ? detail : '平仓下发失败')
+  } finally {
+    const next = { ...closingDispatchIds.value }
+    delete next[key]
+    closingDispatchIds.value = next
+  }
 }
 
 function dispatchSummary(row: GroupSignalTaskRecord): string {
@@ -499,7 +543,7 @@ onUnmounted(stopAutoRefresh)
                     <div v-if="isTaskActive(t.status)" class="kv span-full">
                       <span class="k">提示</span>
                       <span class="v" style="font-size: 12px">
-                        任务进行中，下方运行中的节点该品种暂不接收新的策略信号；发送 CLOSE 信号可终止
+                        任务进行中，下方运行中的节点该品种暂不接收新的策略信号；可在节点行点击「平仓」单独终止，或发送 CLOSE 信号终止全部
                       </span>
                     </div>
                   </div>
@@ -522,6 +566,7 @@ onUnmounted(stopAutoRefresh)
                       <thead>
                         <tr>
                           <th style="width: 22px"></th>
+                          <th>操作</th>
                           <th>节点</th><th>魔术号</th><th>状态</th><th class="right">首单手数</th>
                           <th class="right">持仓</th><th class="right">加仓</th><th class="right">累计手数</th>
                           <th class="right">盈亏</th><th>结束原因</th>
@@ -533,6 +578,18 @@ onUnmounted(stopAutoRefresh)
                         <template v-for="d in t.dispatches" :key="d.id">
                           <tr class="clickable" @click="toggleDispatch(d.id)">
                             <td class="muted">{{ isDispatchExpanded(d.id) ? '▾' : '▸' }}</td>
+                            <td @click.stop>
+                              <button
+                                v-if="isDispatchCloseable(d.status)"
+                                type="button"
+                                class="btn-sm btn-danger"
+                                :disabled="!!closingDispatchIds[String(d.id)]"
+                                @click="closeDispatch(d)"
+                              >
+                                {{ closingDispatchIds[String(d.id)] ? '下发中…' : '平仓' }}
+                              </button>
+                              <span v-else class="muted" style="font-size: 12px">—</span>
+                            </td>
                             <td>{{ d.node_name || d.node_id }}</td>
                             <td class="muted" style="font-size: 12px">{{ d.magic ?? '—' }}</td>
                             <td><span class="tag" :class="dispatchTag(d.status).cls">{{ dispatchTag(d.status).text }}</span></td>
@@ -550,7 +607,7 @@ onUnmounted(stopAutoRefresh)
                           </tr>
                           <tr v-if="isDispatchExpanded(d.id)" class="detail-row">
                             <td></td>
-                            <td colspan="14">
+                            <td colspan="15">
                               <div class="muted" style="font-size: 12px; margin-bottom: 6px">
                                 关联订单 · {{ d.node_name || d.node_id }}
                                 <template v-if="d.magic != null"> · 魔术号 {{ d.magic }}</template>

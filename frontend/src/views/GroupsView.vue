@@ -118,7 +118,10 @@ const availableNodes = computed<NodeOut[]>(() =>
 )
 
 function addMember(nodeId: string): void {
-  if (nodeId && !form.node_ids.includes(nodeId)) form.node_ids.push(nodeId)
+  const id = (nodeId || '').trim()
+  if (!id || form.node_ids.includes(id)) return
+  // 重新赋值，保证列表与下拉「可选节点」立刻同步刷新
+  form.node_ids = [...form.node_ids, id]
 }
 function removeMember(nodeId: string): void {
   form.node_ids = form.node_ids.filter((id) => id !== nodeId)
@@ -671,12 +674,14 @@ function openSignals(g: GroupOut): void {
             <div class="span-full">
               <FormLabel text="成员节点" :help="FIELD_HELP.nodes" />
               <div class="row" style="gap: 8px; margin-bottom: 10px">
+                <!-- 占位项不可 disabled，否则浏览器会预选第一个节点且不再触发 change -->
                 <select
+                  :key="`member-pick-${form.node_ids.join(',')}`"
                   :value="''"
                   :disabled="!availableNodes.length"
                   @change="addMember(($event.target as HTMLSelectElement).value)"
                 >
-                  <option value="" disabled>
+                  <option value="">
                     {{ availableNodes.length ? '选择要加入的节点…' : '所有节点均已加入' }}
                   </option>
                   <option v-for="n in availableNodes" :key="n.node_id" :value="n.node_id">

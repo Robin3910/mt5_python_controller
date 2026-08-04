@@ -577,6 +577,19 @@ class NodeClient:
             "strategy task %s has no local runner, closed %d position(s) by magic %s",
             task_id, closed, magic,
         )
+        realized = 0.0
+        try:
+            if hasattr(self.mt5, "realized_profit_by_magic"):
+                # 孤儿收口没有精确任务起点，取最近一天成交汇总
+                realized = float(
+                    await self._exec(
+                        self.mt5.realized_profit_by_magic, magic, time.time() - 86400,
+                    )
+                    or 0.0
+                )
+        except Exception:  # noqa: BLE001
+            logger.debug("orphan realized_profit lookup failed", exc_info=True)
+            realized = float(res.get("profit") or 0.0)
         # 不带累计单量字段：服务端已有历史统计，这里回传 0 会把它覆盖掉
         await ws.send(json.dumps({
             "type": "strategy_finished",
@@ -588,6 +601,7 @@ class NodeClient:
                 "symbol": msg.get("symbol"),
                 "status": "done" if res.get("success") else "failed",
                 "reason": msg.get("reason") or "stop_command",
+                "realized_profit": round(realized, 2),
             },
         }))
 

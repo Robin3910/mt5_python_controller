@@ -311,7 +311,7 @@ export interface StrategyBatchLevel {
   extra_lot: number
 }
 
-/** 以损定量的补仓方向：pullback 回撤补仓 / breakout 突破加仓 */
+/** 以损定量的补仓方向（历史字段，模版2 已改为分散仓市价） */
 export type EntryDirection = 'pullback' | 'breakout'
 
 /** 网格模式：arithmetic 等差 / geometric 等比 */
@@ -349,21 +349,20 @@ export interface StrategyRule {
   // --- type=3：以损定量趋势单 ---
   /** 风险金额（账户货币） */
   risk_amount?: number
-  /** 盈亏比：止盈距离 = 止损距离 × 该值 */
+  /** 盈亏比：止盈距离 = 止损距离 × 该值（挂在分散仓） */
   rr_ratio?: number
-  /** 底仓占总手数的百分比 */
+  /** 底仓占总手数的百分比（底仓止盈为 0） */
   base_ratio?: number
-  /** 剩余仓位的补仓批数，0=底仓即全仓 */
+  /** 分散仓单数，0=底仓即全仓 */
   add_batches?: number
-  entry_direction?: EntryDirection
-  /** 相邻批次的触发间距（点） */
-  batch_gap_points?: number
   /** 总手数上限，0=只受单笔上限约束 */
   max_total_lot?: number
   /** 是否启用保本触发 */
   breakeven_enabled?: boolean
   /** 浮盈达到止损距离 × 该倍数时把止损移到保本 */
   breakeven_times?: number
+  /** 保本监控：once=按次 / loop=循环 */
+  breakeven_mode?: 'once' | 'loop'
   // --- type=4：网格交易 ---
   /** 网格区间下限 */
   price_lower?: number
@@ -532,6 +531,7 @@ export interface GroupTaskEventDetail {
     | 'add'
     | 'risk_sized_plan'
     | 'risk_sized_add'
+    | 'risk_sized_distribute'
     | 'risk_sized_reject'
     | 'breakeven'
     | 'grid_plan'
@@ -585,13 +585,17 @@ export interface GroupTaskEventDetail {
   total_lot?: number
   lot_formula?: string
   base_ratio?: number
+  distribute_volume?: number
   add_batches?: number
+  order_count?: number
   entry_direction?: string
   entry_direction_label?: string
   gap_points?: number
   gap_capped?: boolean
   breakeven_enabled?: boolean
   breakeven_times?: number
+  breakeven_mode?: string
+  breakeven_mode_label?: string
   batch_index?: number
   batch_total?: number
   trigger_price?: number

@@ -10,8 +10,9 @@
 
 - 加仓路径（模版1）：首单手数用信号手数，之后按逆势 / 顺势规则加仓，判定见
   `strategy_rules.evaluate`；
-- 以损定量路径（模版2）：手数由「风险金额 ÷ 止损距离」反推，底仓市价成交后按间距
-  分批补齐，可选浮盈达标后移动止损保本，计算见 `risk_sizing`；
+- 以损定量路径（模版2）：手数由「风险金额 ÷ 止损距离」反推，底仓市价成交（TP=0）
+  后立即拆开分散仓市价单（按盈亏比挂止盈），可选浮盈达标后移动止损保本，计算见
+  `risk_sizing`；
 - 网格路径（模版3）：区间内逐格买卖的手动网格，空仓是正常运行态，
   只由止损 / 止盈 / strategy_stop 收口，计算见 `grid_trading`。
 
@@ -106,6 +107,8 @@ class StrategyRunner:
         self._task: Optional[asyncio.Task] = None
         self._sub: Optional[Subscription] = None
         self._last_report = 0.0
+        self._started_at = time.time()
+        self._last_floating_profit = 0.0
         self._metric_specs: Optional[list[tuple[str, str]]] = None
 
         # 三条互斥执行路径：网格 > 以损定量 > 加仓（按规则 type 优先级）
@@ -420,8 +423,8 @@ class StrategyRunner:
     async def _risk_entry_quote(self) -> float:
         """下底仓前的预估开仓价：多单取 ask、空单取 bid。
 
-        手数必须在下单前算出来，所以只能用当前报价预估；成交后再用真实成交价把
-        止盈与补仓触发价重挂一次（见 risk_sizing.anchor_to_fill）。
+        手数必须在下单前算出来，所以只能用当前报价预估；底仓成交后再用真实成交价
+        把分散仓止盈重挂一次（见 risk_sizing.anchor_to_fill）。
         """
         quotes = dict(await self._exec(self._mt5.quotes, [self.symbol]) or {})
         quote = quotes.get(self.symbol) or next(iter(quotes.values()), {})
@@ -429,7 +432,7 @@ class StrategyRunner:
         return _as_float(quote.get(key)) or _as_float(quote.get("mid"))
 
     async def _risk_open_base(self) -> bool:
-        """以损定量首单：反推总手数后按底仓比例市价成交。"""
+        """以损定量开仓：反推总手数 → 底仓市价（TP=0）→ 立即开齐分散仓。"""
         cfg = self._risk_cfg
         assert cfg is not None
         spec = await self._risk_symbol_spec()
@@ -452,11 +455,11 @@ class StrategyRunner:
 
         self._risk_plan = plan
         self.base_volume = plan.base_volume
-        planned_tp = plan.take_profit
+        # 底仓按截图语义：市价 + 止损 + 止盈为 0
         res = dict(await self._exec(
             self._mt5.place_market_order,
             self.symbol, self.direction, plan.base_volume,
-            plan.stop_loss, planned_tp or None,
+            plan.stop_loss, None,
             self._open_comment(), self.magic,
         ) or {})
         res["signal_id"] = self.signal_id
@@ -470,7 +473,6 @@ class StrategyRunner:
             return False
 
         risk_sizing.anchor_to_fill(plan, cfg, _as_float(res.get("price")), spec)
-        await self._risk_fix_base_target(res, plan, planned_tp)
         self._opened = True
         self.total_orders += 1
         self.total_volume += plan.base_volume
@@ -488,36 +490,32 @@ class StrategyRunner:
                 "kind": "open",
             },
         )
+        # 底仓成交后立即市价开齐分散仓（对齐「订单数量 = 1 + N」）
+        await self._risk_open_pending_distribute(
+            quote=_as_float(res.get("price")) or await self._risk_entry_quote(),
+        )
         return True
 
-    async def _risk_fix_base_target(self, res: dict, plan: EntryPlan,
-                                    planned_tp: float) -> None:
-        """底仓成交后把止盈校正到按真实成交价算出的价位。
-
-        下单时只能用预估价算止盈——带着它下单是为了万一后续改单失败也有保护。滑点会
-        让这个值偏掉，而补仓单用的是重挂后的止盈：不校正的话同一笔交易里会出现两个
-        止盈价，盈亏比也不再是配置值。
-        """
-        if not plan.take_profit or plan.take_profit == planned_tp:
-            return
-        ticket = res.get("order") or res.get("ticket")
-        if not ticket:
-            return
-        fixed = dict(await self._exec(
-            self._mt5.modify_position_sl, int(ticket), plan.stop_loss, plan.take_profit,
-        ) or {})
-        if not fixed.get("success"):
-            logger.warning(
-                "task %s base take-profit not corrected (%s -> %s): %s",
-                self.task_id, planned_tp, plan.take_profit, fixed.get("error"),
-            )
+    async def _risk_open_pending_distribute(self, *, quote: float,
+                                           positions: Optional[list[dict]] = None) -> int:
+        """把尚未开出的分散仓一次打齐。返回成功笔数。"""
+        cfg, plan = self._risk_cfg, self._risk_plan
+        if cfg is None or plan is None or not plan.ok:
+            return 0
+        opened = 0
+        for batch in risk_sizing.pending_batches(plan, filled=self.total_orders):
+            ok = await self._risk_add_batch(batch, plan, cfg, quote, positions or [])
+            if not ok:
+                break
+            opened += 1
+        return opened
 
     async def _risk_rebuild_plan(self, positions: list[dict], point: float) -> None:
         """恢复后按真实持仓重建建仓计划。
 
         断线时计划已随进程丢失，而持仓上还挂着当初写进 MT5 的止损：用最早一笔的
         开仓价与止损价就能把计划还原出来。若止损已被保本移动过（不在不利侧），
-        plan_entries 会拒绝重建，此时降级为只监控到全平，不再补仓也不再动止损。
+        plan_entries 会拒绝重建，此时降级为只监控到全平，不再补开分散仓也不再动止损。
         """
         cfg = self._risk_cfg
         if cfg is None or not positions:
@@ -540,51 +538,57 @@ class StrategyRunner:
             return
         self._risk_plan = plan
         self.base_volume = plan.base_volume
+        # 用当前持仓笔数对齐已开单量，剩余分散仓在 advance 时补开
+        self.total_orders = max(self.total_orders, len(positions))
 
     async def _risk_advance(self, event: MarketEvent, positions: list[dict]) -> bool:
-        """推进以损定量任务：先补仓，再看保本。返回 True 表示本轮已有动作。"""
+        """推进以损定量任务：先补齐未开的分散仓，再看保本。返回 True 表示本轮已有动作。"""
         cfg, plan = self._risk_cfg, self._risk_plan
         if cfg is None or plan is None or not plan.ok:
             return False
-        batch = risk_sizing.next_batch(plan, cfg, filled=self.total_orders, price=event.price)
-        if batch is not None:
-            await self._risk_add_batch(batch, plan, cfg, event.price, positions)
-            return True
-        if self._breakeven_done:
+        pending = risk_sizing.pending_batches(plan, filled=self.total_orders)
+        if pending:
+            opened = await self._risk_open_pending_distribute(
+                quote=event.price, positions=positions,
+            )
+            if opened:
+                return True
+        # 按次模式触发过后不再看；循环模式持续监控（改单本身会跳过已到位的止损）
+        if self._breakeven_done and not cfg.breakeven_is_loop:
             return False
         move = risk_sizing.breakeven_move(
             cfg, plan, positions=positions, price=event.price,
             digits=(self._risk_spec.digits if self._risk_spec else 5),
         )
         if move is not None:
-            await self._risk_move_breakeven(move, positions)
+            await self._risk_move_breakeven(move, positions, cfg=cfg)
             return True
         return False
 
     async def _risk_add_batch(self, batch, plan: EntryPlan, cfg: RiskSizedConfig,
-                              price: float, positions: list[dict]) -> None:
-        """补进一批仓位；沿用同一组止损止盈，总风险因此保持不变。"""
+                              price: float, positions: list[dict]) -> bool:
+        """开一笔分散仓；共用信号止损，按盈亏比挂止盈。成功返回 True。"""
         spec = await self._risk_symbol_spec()
         reason = risk_sizing.describe_batch(plan, cfg, batch, spec, price)
         res = dict(await self._exec(
             self._mt5.place_market_order,
             self.symbol, self.direction, batch.volume,
-            plan.stop_loss, plan.take_profit or None,
+            plan.stop_loss, batch.take_profit or None,
             risk_sizing.batch_comment(batch), self.magic,
         ) or {})
         detail = risk_sizing.batch_detail(plan, cfg, batch, spec, price)
         if not res.get("success"):
-            logger.warning("task %s batch %s failed: %s", self.task_id, batch.index, res.get("error"))
+            logger.warning("task %s distribute %s failed: %s", self.task_id, batch.index, res.get("error"))
             await self._emit_progress(
                 "error", phase="running", positions=positions,
-                message=f"补仓失败：{res.get('error') or 'batch order failed'}；{reason}",
+                message=f"分散仓失败：{res.get('error') or 'distribute order failed'}；{reason}",
                 detail={**detail, "error": str(res.get("error") or "")},
             )
-            return
+            return False
         self.add_count += 1
         self.total_orders += 1
         self.total_volume += batch.volume
-        logger.info("task %s batch %s filled: %s", self.task_id, batch.index, reason)
+        logger.info("task %s distribute %s filled: %s", self.task_id, batch.index, reason)
         await self._emit_progress(
             "add_trend", phase="running",
             last_order={
@@ -595,8 +599,10 @@ class StrategyRunner:
             message=reason,
             detail=detail,
         )
+        return True
 
-    async def _risk_move_breakeven(self, move, positions: list[dict]) -> None:
+    async def _risk_move_breakeven(self, move, positions: list[dict], *,
+                                   cfg: RiskSizedConfig) -> None:
         """浮盈达标：把该魔术号全部持仓的止损挪到加权均价。"""
         digits = self._risk_spec.digits if self._risk_spec else 5
         reason = move.describe(digits)
@@ -611,8 +617,9 @@ class StrategyRunner:
                 detail={**move.detail(), "error": "modify_sl_failed"},
             )
             return
-        # 只成功一次即置位：反复改单没有意义，还会把日志和事件流刷满
-        self._breakeven_done = True
+        # 按次：成功一次即置位；循环：保持监控，下次止损被拉回或均价变化时可再移
+        if not cfg.breakeven_is_loop:
+            self._breakeven_done = True
         logger.info("task %s breakeven: %s", self.task_id, reason)
         await self._emit_progress(
             "breakeven", phase="running", positions=positions,
@@ -1048,6 +1055,14 @@ class StrategyRunner:
 
     async def _close_all(self) -> None:
         """终止指令：平掉该魔术号的全部持仓后收口。"""
+        # 平仓前先记下浮盈，成交历史查询失败时作为回退
+        try:
+            held = await self._exec(self._mt5.positions_by_magic, self.magic)
+            self._last_floating_profit = round(
+                sum(_as_float(p.get("profit")) for p in (held or [])), 2,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("task %s snapshot floating profit failed", self.task_id, exc_info=True)
         res = await self._exec(self._mt5.close_by_magic, self.magic)
         res = dict(res or {})
         ok = bool(res.get("success", True))
@@ -1061,13 +1076,40 @@ class StrategyRunner:
     # ------------------------------------------------------------------
     def _snapshot(self, positions: Optional[list[dict]] = None) -> dict:
         pos = positions or []
+        profit = round(sum(_as_float(p.get("profit")) for p in pos), 2)
+        if pos:
+            self._last_floating_profit = profit
         return {
             "position_count": len(pos),
             "add_count": self.add_count,
             "total_orders": self.total_orders,
             "total_volume": round(self.total_volume, 4),
-            "profit": round(sum(_as_float(p.get("profit")) for p in pos), 2),
+            "profit": profit,
         }
+
+    async def _resolve_realized_profit(self) -> float:
+        """收口时的已实现盈亏：成交历史优先；历史仍为 0 时回退平仓前浮盈快照。
+
+        网格等路径会在任务中途平仓，成交历史能累计全程盈亏；刚平完时历史库可能
+        尚未写入，此时用平仓前浮盈避免把盈亏上报成 0。
+        """
+        floating = round(_as_float(self._last_floating_profit), 2)
+        since = self._started_at or (time.time() - 86400)
+        try:
+            if hasattr(self._mt5, "realized_profit_by_magic"):
+                val = await self._exec(
+                    self._mt5.realized_profit_by_magic, self.magic, since,
+                )
+                if val is not None:
+                    hist = round(float(val), 2)
+                    if hist == 0.0 and floating != 0.0:
+                        return floating
+                    return hist
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "task %s realized_profit_by_magic failed", self.task_id, exc_info=True,
+            )
+        return floating
 
     async def _emit_progress(
         self, event: str, *, phase: str,
@@ -1100,7 +1142,11 @@ class StrategyRunner:
         if self._finished:
             return
         self._finished = True
-        logger.info("task %s finished: %s (%s)", self.task_id, status, reason)
+        realized = await self._resolve_realized_profit()
+        logger.info(
+            "task %s finished: %s (%s) realized_profit=%s",
+            self.task_id, status, reason, realized,
+        )
         await self._send({
             "type": "strategy_finished",
             "data": {
@@ -1113,6 +1159,6 @@ class StrategyRunner:
                 "reason": reason,
                 "total_orders": self.total_orders,
                 "total_volume": round(self.total_volume, 4),
-                "realized_profit": 0.0,
+                "realized_profit": realized,
             },
         })

@@ -9,7 +9,6 @@ import { useHubStore } from '@/stores/hub'
 import type {
   BatchCalcType,
   BatchTimeframe,
-  EntryDirection,
   GridMode,
   GridSide,
   StrategyBatchLevel,
@@ -79,8 +78,8 @@ const RULE_TYPE_HELP: Record<number, string> = {
     '实际手数 = 倍数 × 基础订单手数 + 额外手数。',
   [RULE_TYPE_RISK_SIZED]:
     '以损定量趋势单：不使用信号手数，而是按「风险金额 ÷ 止损距离」反推总手数，' +
-    '底仓先市价成交，剩余仓位按间距分批补齐。所有批次共用信号那一个止损价，' +
-    '因此无论补进几批，打到止损的总亏损始终等于风险金额。' +
+    '底仓先市价成交（止盈为 0），剩余仓位拆成多笔分散仓市价单并按盈亏比挂止盈。' +
+    '所有订单共用信号那一个止损价，因此打到止损的总亏损始终等于风险金额。' +
     '信号必须携带止损价（sl），否则本策略不参与分发。',
   [RULE_TYPE_GRID]:
     '网格交易：在价格区间内按等差或等比切格，' +
@@ -148,31 +147,28 @@ const FIELD_HELP = {
     '总手数 = 风险金额 ÷ 每手止损亏损，其中每手止损亏损由止损距离与品种合约规格算出。\n' +
     '手数按品种步长向下取整，因此实际风险只会小于该值，不会超出。',
   rr_ratio:
-    '盈亏比。止盈距离 = 止损距离 × 该值，止盈价由节点在底仓成交后按真实成交价挂出。\n' +
-    '填 0 表示不设止盈，仅靠止损与人工干预出场。',
+    '盈亏比。止盈距离 = 止损距离 × 该值，止盈价只挂在分散仓上（底仓止盈为 0）。\n' +
+    '填 0 表示分散仓也不设止盈，仅靠止损与人工干预出场。',
   base_ratio:
-    '底仓占总手数的百分比，底仓以市价立即成交。\n' +
-    '剩余仓位交给下方的补仓批数分批补齐；补仓批数为 0 时底仓即全仓。',
+    '底仓占总手数的百分比，底仓以市价立即成交，止盈为 0。\n' +
+    '剩余仓位交给下方的分散仓单数拆开；分散仓单数为 0 时底仓即全仓。',
   add_batches:
-    '剩余仓位分几批补齐。0 表示不分批，总手数一次性由底仓成交。\n' +
-    '若剩余手数不足以让每批都达到品种最小手数，节点会自动减少批数。',
-  entry_direction:
-    '补仓的价格方向：\n' +
-    '回撤补仓 = 价格朝不利方向走时补齐，摊低持仓均价（常规用法）；\n' +
-    '突破加仓 = 价格朝有利方向走时补齐，顺势追势。',
-  batch_gap_points:
-    '相邻批次的触发间距（点），以底仓实际成交价为起点逐批累加。\n' +
-    '回撤补仓的触发价必须留在止损之内、突破加仓必须留在止盈之内，' +
-    '所以间距超出可用区间时节点会自动压缩，避免最远那批永远不成交。',
+    '剩余仓位拆成几笔分散仓市价单。0 表示不拆分，总手数一次性由底仓成交。\n' +
+    '开仓时与底仓一并市价打出（订单数 = 1 + 分散仓单数）。\n' +
+    '若剩余手数不足以让每笔都达到品种最小手数，节点会自动减少单数。',
   max_total_lot:
     '总手数硬上限，0 表示不额外限制（仍受品种最大手数约束）。\n' +
     '被上限截断时实际风险会小于风险金额。',
   breakeven_enabled:
     '开启后，浮盈达到「止损距离 × 倍数」时把该任务全部持仓的止损移到持仓加权均价，' +
-    '此后这笔交易最差打平。只会触发一次。',
+    '此后这笔交易最差打平。',
   breakeven_times:
     '保本触发的倍数 N：浮盈价格距离 ≥ 止损距离 × N 时移动止损。\n' +
-    '例如止损距离 300 点、N=1，则浮盈 300 点后止损挪到均价。',
+    '例如止损距离 300 点、N=2，则浮盈 600 点后止损挪到均价。',
+  breakeven_mode:
+    '保本监控方式：\n' +
+    '按次 = 达标移动一次后不再监控；\n' +
+    '循环 = 持续监控，若止损被拉回或均价变化导致尚未到位，可再次移动到新的加权均价。',
   price_lower: '网格价格区间下限。须大于 0，且小于上限。',
   price_upper: '网格价格区间上限。须大于下限。',
   grid_count: '网格数量（2–200）。区间会被切成该数量的格子（N+1 条网格线）。',
@@ -199,10 +195,10 @@ const FIELD_HELP = {
     '不限时只要不触发止损，网格会一直跟着行情滚动。',
 }
 
-/** 补仓方向选项，与后端 ENTRY_DIRECTIONS 对齐 */
-const ENTRY_DIRECTION_OPTIONS: Array<{ value: EntryDirection; label: string }> = [
-  { value: 'pullback', label: '回撤补仓' },
-  { value: 'breakout', label: '突破加仓' },
+/** 保本监控方式，与后端 BREAKEVEN_MODES 对齐 */
+const BREAKEVEN_MODE_OPTIONS: Array<{ value: 'once' | 'loop'; label: string }> = [
+  { value: 'once', label: '按次' },
+  { value: 'loop', label: '循环' },
 ]
 
 const GRID_MODE_OPTIONS: Array<{ value: GridMode; label: string }> = [
@@ -220,11 +216,13 @@ const GRID_SIDE_OPTIONS: Array<{ value: GridSide; label: string }> = [
  * 表单内规则：所有字段都已填充，便于直接 v-model 绑定。
  * 各组字段都会补齐，提交后由后端按 type 只保留对应的一组。
  */
-type EditableRule = Required<Omit<StrategyRule, 'batch_levels' | 'grid_mode' | 'grid_side' | 'entry_direction'>> & {
+type EditableRule = Required<
+  Omit<StrategyRule, 'batch_levels' | 'grid_mode' | 'grid_side' | 'breakeven_mode'>
+> & {
   batch_levels: StrategyBatchLevel[]
-  entry_direction: EntryDirection
   grid_mode: GridMode
   grid_side: GridSide
+  breakeven_mode: 'once' | 'loop'
 }
 
 function cloneRules(rules: StrategyRule[]): EditableRule[] {
@@ -241,15 +239,14 @@ function cloneRules(rules: StrategyRule[]): EditableRule[] {
     batch_count: r.batch_count ?? 0,
     total_lot_limit: r.total_lot_limit ?? 0,
     batch_levels: (r.batch_levels || []).map((lv) => ({ ...lv })),
-    risk_amount: r.risk_amount ?? 300,
+    risk_amount: r.risk_amount ?? 100,
     rr_ratio: r.rr_ratio ?? 2.5,
     base_ratio: r.base_ratio ?? 30,
-    add_batches: r.add_batches ?? 2,
-    entry_direction: r.entry_direction ?? 'pullback',
-    batch_gap_points: r.batch_gap_points ?? 100,
+    add_batches: r.add_batches ?? 10,
     max_total_lot: r.max_total_lot ?? 0,
-    breakeven_enabled: r.breakeven_enabled ?? false,
-    breakeven_times: r.breakeven_times ?? 1,
+    breakeven_enabled: r.breakeven_enabled ?? true,
+    breakeven_times: r.breakeven_times ?? 2,
+    breakeven_mode: r.breakeven_mode === 'loop' ? 'loop' : 'once',
     price_lower: r.price_lower ?? 0,
     price_upper: r.price_upper ?? 0,
     grid_count: r.grid_count ?? 10,
@@ -432,16 +429,14 @@ function validateRiskSized(r: EditableRule, label: string): string | null {
   if (!(r.risk_amount > 0)) return `${label}：风险金额需大于 0`
   if (r.rr_ratio < 0) return `${label}：盈亏比不能为负`
   if (!(r.base_ratio > 0) || r.base_ratio > 100) return `${label}：底仓比例需在 1 ~ 100 之间`
-  if (r.add_batches < 0) return `${label}：补仓批数不能为负`
-  if (!ENTRY_DIRECTION_OPTIONS.some((o) => o.value === r.entry_direction)) {
-    return `${label}：补仓方向非法`
-  }
-  if (r.add_batches > 0 && !(r.batch_gap_points > 0)) {
-    return `${label}：分批补仓需填写大于 0 的批次间距`
-  }
+  if (r.add_batches < 0) return `${label}：分散仓单数不能为负`
+  if (r.add_batches > 50) return `${label}：分散仓单数不能超过 50`
   if (r.max_total_lot < 0) return `${label}：总手数上限不能为负`
   if (r.breakeven_enabled && !(r.breakeven_times > 0)) {
     return `${label}：保本触发倍数需大于 0`
+  }
+  if (r.breakeven_enabled && !BREAKEVEN_MODE_OPTIONS.some((o) => o.value === r.breakeven_mode)) {
+    return `${label}：保本监控方式非法`
   }
   return null
 }
@@ -661,7 +656,7 @@ function ruleSummary(rules: StrategyRule[]): string {
       const label = RULE_TYPE_LABEL[r.type] || `类型${r.type}`
       if (isRiskSized(r)) {
         const batches = r.add_batches ?? 0
-        return `${label}（风险 ${r.risk_amount ?? 0} · 盈亏比 ${r.rr_ratio ?? 0}${batches ? ` · 分 ${batches} 批补仓` : ''}）`
+        return `${label}（风险 ${r.risk_amount ?? 0} · 盈亏比 ${r.rr_ratio ?? 0}${batches ? ` · 分散 ${batches} 单` : ''}）`
       }
       if (isGrid(r)) {
         const side = GRID_SIDE_OPTIONS.find((o) => o.value === r.grid_side)?.label || r.grid_side
@@ -711,10 +706,6 @@ function calcTypeLabel(calcType: BatchCalcType | string | undefined): string {
   return CALC_TYPE_LABEL[key] || String(calcType || '点数')
 }
 
-function entryDirectionLabel(direction: string | undefined): string {
-  return ENTRY_DIRECTION_OPTIONS.find((o) => o.value === direction)?.label || direction || '—'
-}
-
 /** 规则详情的参数行；各规则类型的字段集合不同，展示由此按 type 分派 */
 function ruleDetailRows(r: StrategyRule): Array<{ k: string; v: string }> {
   if (isRiskSized(r)) {
@@ -723,17 +714,17 @@ function ruleDetailRows(r: StrategyRule): Array<{ k: string; v: string }> {
       { k: '监控方向', v: actionLabel(r.action) },
       { k: '风险金额', v: String(r.risk_amount ?? 0) },
       { k: '盈亏比', v: String(r.rr_ratio ?? 0) },
-      { k: '底仓', v: `${batches ? (r.base_ratio ?? 0) : 100}%` },
+      { k: '底仓', v: `${batches ? (r.base_ratio ?? 0) : 100}%（市价 · TP=0）` },
       {
-        k: '分批补仓',
-        v: batches
-          ? `${entryDirectionLabel(r.entry_direction)} ${batches} 批 · 间距 ${r.batch_gap_points ?? 0} 点`
-          : '不分批',
+        k: '分散仓',
+        v: batches ? `剩余拆 ${batches} 单市价（按盈亏比挂止盈）` : '无（底仓即全仓）',
       },
       { k: '总手数上限', v: r.max_total_lot ? String(r.max_total_lot) : '不限' },
       {
         k: '保本触发',
-        v: r.breakeven_enabled ? `止损距 × ${r.breakeven_times ?? 0} 倍` : '未启用',
+        v: r.breakeven_enabled
+          ? `止损距 × ${r.breakeven_times ?? 0} 倍 · ${r.breakeven_mode === 'loop' ? '循环' : '按次'}`
+          : '未启用',
       },
     ]
   }
@@ -855,7 +846,7 @@ function resetRuleToTemplate(idx: number): void {
             </div>
             <template v-if="isRiskSized(r)">
               <div class="muted" style="font-size: 12px">
-                手数由风险金额与信号止损价反推，各批共用同一止损
+                手数由风险金额与信号止损价反推；底仓 TP=0，分散仓按盈亏比挂止盈
               </div>
             </template>
             <template v-else-if="isGrid(r)">
@@ -969,7 +960,7 @@ function resetRuleToTemplate(idx: number): void {
                     </div>
                     <template v-if="isRiskSized(r)">
                       <div class="muted" style="font-size: 12px">
-                        手数由风险金额与信号止损价反推，各批共用同一止损；信号必须携带 sl
+                        手数由风险金额与信号止损价反推；底仓 TP=0，分散仓市价开齐；信号必须携带 sl
                       </div>
                     </template>
                     <template v-else-if="isGrid(r)">
@@ -1178,15 +1169,15 @@ function resetRuleToTemplate(idx: number): void {
                 </div>
                 <p class="rule-hint">
                   总手数 = 风险金额 {{ r.risk_amount }} ÷ 每手止损亏损（由信号止损价与品种规格算出）；
-                  止盈距离 = 止损距离 × {{ r.rr_ratio }}；底仓
-                  {{ r.add_batches ? r.base_ratio : 100 }}% 市价成交
+                  止盈距离 = 止损距离 × {{ r.rr_ratio }}（只挂在分散仓）；底仓
+                  {{ r.add_batches ? r.base_ratio : 100 }}% 市价成交（TP=0）
                 </p>
 
                 <div class="batch-block">
                   <div class="batch-head">
-                    <FormLabel text="分批补仓" :help="FIELD_HELP.add_batches" />
+                    <FormLabel text="分散仓" :help="FIELD_HELP.add_batches" />
                     <span v-if="r.add_batches" class="muted batch-count-hint">
-                      剩余 {{ 100 - r.base_ratio }}% 分 {{ r.add_batches }} 批
+                      剩余 {{ 100 - r.base_ratio }}% 拆 {{ r.add_batches }} 单 · 共 {{ 1 + r.add_batches }} 单
                     </span>
                     <span v-else class="muted batch-count-hint">底仓即全仓</span>
                   </div>
@@ -1194,7 +1185,7 @@ function resetRuleToTemplate(idx: number): void {
                     <div class="field">
                       <FormLabel
                         :field-id="`rule-${idx}-add-batches`"
-                        text="补仓批数"
+                        text="分散仓单数"
                         :help="FIELD_HELP.add_batches"
                       />
                       <input
@@ -1202,44 +1193,13 @@ function resetRuleToTemplate(idx: number): void {
                         v-model.number="r.add_batches"
                         type="number"
                         min="0"
+                        max="50"
                         step="1"
-                      />
-                    </div>
-                    <div class="field">
-                      <FormLabel
-                        :field-id="`rule-${idx}-entry-direction`"
-                        text="补仓方向"
-                        :help="FIELD_HELP.entry_direction"
-                      />
-                      <select
-                        :id="`rule-${idx}-entry-direction`"
-                        v-model="r.entry_direction"
-                        :disabled="!r.add_batches"
-                      >
-                        <option v-for="o in ENTRY_DIRECTION_OPTIONS" :key="o.value" :value="o.value">
-                          {{ o.label }}
-                        </option>
-                      </select>
-                    </div>
-                    <div class="field">
-                      <FormLabel
-                        :field-id="`rule-${idx}-gap-points`"
-                        text="批次间距"
-                        :help="FIELD_HELP.batch_gap_points"
-                      />
-                      <input
-                        :id="`rule-${idx}-gap-points`"
-                        v-model.number="r.batch_gap_points"
-                        type="number"
-                        min="0"
-                        step="10"
-                        :disabled="!r.add_batches"
                       />
                     </div>
                   </div>
                   <p class="rule-hint">
-                    各批共用信号那一个止损价，所以补进几批都不会改变总风险；
-                    触发价超出止损（回撤）或止盈（突破）区间时，节点会自动压缩间距
+                    开仓时与底仓一并市价打出；各单共用信号止损价，分散仓按盈亏比挂止盈，底仓止盈为 0
                   </p>
                 </div>
 
@@ -1270,9 +1230,22 @@ function resetRuleToTemplate(idx: number): void {
                         step="0.5"
                       />
                     </div>
+                    <div class="field">
+                      <FormLabel
+                        :field-id="`rule-${idx}-breakeven-mode`"
+                        text="监控方式"
+                        :help="FIELD_HELP.breakeven_mode"
+                      />
+                      <select :id="`rule-${idx}-breakeven-mode`" v-model="r.breakeven_mode">
+                        <option v-for="o in BREAKEVEN_MODE_OPTIONS" :key="o.value" :value="o.value">
+                          {{ o.label }}
+                        </option>
+                      </select>
+                    </div>
                   </div>
                   <p v-if="r.breakeven_enabled" class="rule-hint">
-                    浮盈达到止损距离 × {{ r.breakeven_times }} 倍时，把该任务全部持仓的止损移到加权均价，只触发一次
+                    浮盈达到止损距离 × {{ r.breakeven_times }} 倍时，把该任务全部持仓的止损移到加权均价；
+                    {{ r.breakeven_mode === 'loop' ? '循环监控，止损未到位时可再次移动' : '按次监控，触发一次后停止' }}
                   </p>
                 </div>
               </template>

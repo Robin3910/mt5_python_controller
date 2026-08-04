@@ -228,6 +228,13 @@ export const useHubStore = defineStore('hub', {
         return []
       }
     },
+    /** 手动终止单个节点策略子任务（下发 strategy_stop） */
+    async closeGroupDispatch(
+      groupId: string,
+      dispatchId: number,
+    ): Promise<{ status: string; node_id?: string; reason?: string }> {
+      return (await api.post(`/api/groups/${groupId}/dispatches/${dispatchId}/close`)).data
+    },
     // ---- 配置保存 ----
     async saveFilters(cfg: FilterRulesConfig): Promise<void> {
       this.filters = (await api.put('/api/config/filters', cfg)).data

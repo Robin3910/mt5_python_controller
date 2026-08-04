@@ -83,6 +83,7 @@ function actionLabel(action: string): string {
     close_node: '单节点平仓',
     close_all: '全局平仓',
     close_batch: '批量平仓',
+    close_group_dispatch: '策略子任务平仓',
   }
   return m[action] || action
 }

@@ -1,27 +1,25 @@
 """以损定量趋势单的纯计算逻辑（无 I/O，可单独单元测试）。
 
-对应后台「策略模版2」，规则字段随 strategy_start 的策略快照下发：
+对应后台「策略模版2」，对齐 MTcommander「以损定量趋势单」：
 
 - risk_amount：本次交易愿意承担的亏损金额（账户货币）
-- rr_ratio：盈亏比，止盈距离 = 止损距离 × rr_ratio
-- base_ratio：底仓占总手数的百分比，底仓市价成交
-- add_batches：剩余仓位分几批补齐，0 表示底仓即全仓
-- entry_direction：补仓方向，pullback 回撤补仓 / breakout 突破加仓
-- batch_gap_points：相邻批次的触发间距（点）
+- rr_ratio：盈亏比，止盈距离 = 止损距离 × rr_ratio（仅挂在分散仓上）
+- base_ratio：底仓占总手数的百分比，底仓市价成交、止盈为 0
+- add_batches：剩余仓位拆成几笔「分散仓」市价单，0 = 底仓即全仓
 - max_total_lot：总手数上限，0 表示不额外限制
 - breakeven_enabled / breakeven_times：浮盈达到止损距离 × N 倍时把止损移到保本
+- breakeven_mode：once=按次（触发一次后停止）/ loop=循环（止损未到位时可反复移动）
 
 核心是「先定亏多少，再算开多少手」：
 
     每手止损亏损 = 止损距离 / tick_size × tick_value
     总手数       = risk_amount / 每手止损亏损
 
-所有批次共用信号那一个止损价，因此无论补进几批，打到止损的总亏损始终等于
-risk_amount——这也是为什么补仓触发价必须落在止损之内（见 _effective_gap）：
-触发价越过止损的批次永远不会成交，实际风险就会小于设定值、仓位也补不齐。
+开仓时一次下齐：1 笔底仓（TP=0）+ N 笔分散仓（共用止损、按盈亏比挂止盈）。
+所有订单共用信号那一个止损价，因此打到止损的总亏损始终等于 risk_amount。
 
 手数计算需要品种的报价与手数规格（tick_value / volume_step 等），只有 MT5 能给，
-所以这一层放在节点侧；服务端只负责下发风险参数，与 ATR / 波幅的分工一致。
+所以这一层放在节点侧；服务端只负责下发风险参数。
 """
 from __future__ import annotations
 
@@ -32,13 +30,13 @@ from typing import Optional
 # 规则 type，与后台 strategy_templates.RULE_TYPE_RISK_SIZED 对齐
 RULE_TYPE_RISK_SIZED = 3
 
-ENTRY_PULLBACK = "pullback"
-ENTRY_BREAKOUT = "breakout"
+# 分散仓单数硬上限，防止配置写成天文数字一次打爆终端
+DISTRIBUTE_COUNT_MAX = 50
 
-ENTRY_DIRECTION_LABEL = {
-    ENTRY_PULLBACK: "回撤补仓",
-    ENTRY_BREAKOUT: "突破加仓",
-}
+# 保本监控模式（与后台 strategy_templates.BREAKEVEN_* 对齐）
+BREAKEVEN_ONCE = "once"
+BREAKEVEN_LOOP = "loop"
+BREAKEVEN_MODES = (BREAKEVEN_ONCE, BREAKEVEN_LOOP)
 
 # MT5 订单备注上限约 31 字符
 MT5_COMMENT_LIMIT = 31
@@ -111,38 +109,40 @@ class RiskSizedConfig:
     risk_amount: float = 0.0
     rr_ratio: float = 0.0
     base_ratio: float = 100.0
-    add_batches: int = 0
-    entry_direction: str = ENTRY_PULLBACK
-    batch_gap_points: float = 0.0
+    add_batches: int = 0          # 分散仓单数；0 = 底仓即全仓
     max_total_lot: float = 0.0
     breakeven_enabled: bool = False
     breakeven_times: float = 0.0
+    breakeven_mode: str = BREAKEVEN_ONCE
     action: str = "all"
 
     @classmethod
     def from_rule(cls, rule: dict) -> "RiskSizedConfig":
-        entry_direction = str(rule.get("entry_direction") or ENTRY_PULLBACK).strip().lower()
-        if entry_direction not in (ENTRY_PULLBACK, ENTRY_BREAKOUT):
-            entry_direction = ENTRY_PULLBACK
-        add_batches = max(0, _as_int(rule.get("add_batches"), 0))
+        add_batches = max(0, min(DISTRIBUTE_COUNT_MAX, _as_int(rule.get("add_batches"), 0)))
         base_ratio = _as_float(rule.get("base_ratio"), 100.0)
         base_ratio = min(100.0, max(0.0, base_ratio)) or 100.0
+        mode = str(rule.get("breakeven_mode") or BREAKEVEN_ONCE).strip().lower()
+        if mode not in BREAKEVEN_MODES:
+            mode = BREAKEVEN_ONCE
         return cls(
             risk_amount=max(0.0, _as_float(rule.get("risk_amount"))),
             rr_ratio=max(0.0, _as_float(rule.get("rr_ratio"))),
             base_ratio=100.0 if not add_batches else base_ratio,
             add_batches=add_batches,
-            entry_direction=entry_direction,
-            batch_gap_points=max(0.0, _as_float(rule.get("batch_gap_points"))),
             max_total_lot=max(0.0, _as_float(rule.get("max_total_lot"))),
             breakeven_enabled=bool(rule.get("breakeven_enabled")),
             breakeven_times=max(0.0, _as_float(rule.get("breakeven_times"))),
+            breakeven_mode=mode,
             action=str(rule.get("action") or "all").strip().lower(),
         )
 
     @property
-    def entry_direction_label(self) -> str:
-        return ENTRY_DIRECTION_LABEL.get(self.entry_direction, self.entry_direction)
+    def breakeven_is_loop(self) -> bool:
+        return self.breakeven_mode == BREAKEVEN_LOOP
+
+    @property
+    def breakeven_mode_label(self) -> str:
+        return "循环" if self.breakeven_is_loop else "按次"
 
 
 def pick_risk_sized_rule(rules: object) -> Optional[dict]:
@@ -173,15 +173,18 @@ def action_matches(rule_action: object, direction: str) -> bool:
 
 @dataclass
 class Batch:
-    """建仓计划里的一笔：底仓 index=0 市价成交，其余到价补仓。"""
+    """建仓计划里的一笔：全部市价；底仓 TP=0，分散仓挂盈亏比止盈。"""
     index: int
     volume: float
-    trigger_price: float = 0.0      # 0 表示市价（底仓）
-    gap_points: float = 0.0         # 相对首单开仓价的偏离点数
+    take_profit: float = 0.0    # 0 表示不设止盈（底仓）
 
     @property
     def is_base(self) -> bool:
         return self.index == 0
+
+    @property
+    def is_distribute(self) -> bool:
+        return self.index > 0
 
 
 @dataclass
@@ -190,15 +193,12 @@ class EntryPlan:
     direction: str = "BUY"
     entry_price: float = 0.0
     stop_loss: float = 0.0
-    take_profit: float = 0.0
-    sl_distance: float = 0.0        # 止损距离（价格）
-    sl_points: float = 0.0          # 止损距离（点）
-    loss_per_lot: float = 0.0       # 一手打到止损的亏损（账户货币）
+    take_profit: float = 0.0    # 分散仓共用的盈亏比止盈；底仓为 0
+    sl_distance: float = 0.0
+    sl_points: float = 0.0
+    loss_per_lot: float = 0.0
     total_lot: float = 0.0
-    risk_used: float = 0.0          # 取整后的实际风险敞口
-    gap_price: float = 0.0          # 实际生效的批次间距（价格）
-    gap_points: float = 0.0         # 实际生效的批次间距（点）
-    gap_capped: bool = False        # 间距是否因越过止损 / 止盈被压缩
+    risk_used: float = 0.0
     batches: list[Batch] = field(default_factory=list)
     reject: str = ""
 
@@ -211,8 +211,16 @@ class EntryPlan:
         return self.batches[0].volume if self.batches else 0.0
 
     @property
+    def distribute_volume(self) -> float:
+        return round(sum(b.volume for b in self.batches if b.is_distribute), 8)
+
+    @property
     def add_batch_count(self) -> int:
         return max(0, len(self.batches) - 1)
+
+    @property
+    def order_count(self) -> int:
+        return len(self.batches)
 
     def batch_at(self, index: int) -> Optional[Batch]:
         for b in self.batches:
@@ -231,11 +239,10 @@ def _favorable_sign(direction: object) -> int:
 
 
 def _split_lots(total_lot: float, cfg: RiskSizedConfig, spec: SymbolSpec) -> list[float]:
-    """把总手数切成「底仓 + 各补仓批」。
+    """把总手数切成「底仓 + 各分散仓」。
 
-    每批都不能低于 volume_min，否则那一批根本下不出去；批数因此可能少于配置值。
-    最后一批直接吃掉全部剩余，保证各批之和精确等于总手数——总手数才是风险的锚点，
-    逐批取整累积的误差不能落在总量上。
+    每笔都不能低于 volume_min；单数因此可能少于配置值。
+    最后一笔吃掉全部剩余，保证各笔之和精确等于总手数。
     """
     base = spec.floor_lot(total_lot * cfg.base_ratio / 100.0)
     if base < spec.volume_min:
@@ -245,7 +252,6 @@ def _split_lots(total_lot: float, cfg: RiskSizedConfig, spec: SymbolSpec) -> lis
 
     rest = round(total_lot - base, spec.volume_digits)
     if cfg.add_batches <= 0 or rest < spec.volume_min:
-        # 补不出一笔合法手数：剩余并回底仓，避免留下永远补不进来的仓位
         return [total_lot]
 
     count = min(cfg.add_batches, int(math.floor((rest + 1e-9) / spec.volume_min)))
@@ -257,7 +263,6 @@ def _split_lots(total_lot: float, cfg: RiskSizedConfig, spec: SymbolSpec) -> lis
     for i in range(count):
         volume = round(total_lot - used, spec.volume_digits) if i == count - 1 else per
         if volume < spec.volume_min:
-            # 前面几批取整偏大，已经吃掉了剩余额度：就此收尾
             lots[-1] = round(lots[-1] + volume, spec.volume_digits)
             break
         lots.append(volume)
@@ -265,29 +270,11 @@ def _split_lots(total_lot: float, cfg: RiskSizedConfig, spec: SymbolSpec) -> lis
     return lots
 
 
-def _effective_gap(cfg: RiskSizedConfig, plan_batches: int, sl_distance: float,
-                   tp_distance: float, spec: SymbolSpec) -> tuple[float, bool]:
-    """算出实际生效的批次间距（价格），以及是否被压缩过。
-
-    回撤补仓的触发价必须留在止损之内，突破加仓的触发价必须留在止盈之内，否则最远
-    那一批会落在出场价之外、永远不成交。把可用区间按批数均分即为间距上限。
-    """
-    configured = cfg.batch_gap_points * spec.point
-    if plan_batches <= 0:
-        return configured, False
-    room = sl_distance if cfg.entry_direction == ENTRY_PULLBACK else tp_distance
-    ceiling = room / (plan_batches + 1)
-    if configured <= 0:
-        return ceiling, True
-    return (ceiling, True) if configured > ceiling else (configured, False)
-
-
 def plan_entries(cfg: RiskSizedConfig, *, direction: str, entry_price: float,
                  stop_loss: float, spec: SymbolSpec) -> EntryPlan:
-    """按风险金额与止损价反推总手数，并切分成底仓 + 各补仓批。
+    """按风险金额与止损价反推总手数，并切分成底仓 + 分散仓。
 
-    任何一步算不出可执行的结果都返回带 reject 的计划，由调用方上报后放弃本次任务：
-    宁可不开，也不要在参数不完整时凭默认值下单。
+    任何一步算不出可执行的结果都返回带 reject 的计划，由调用方上报后放弃本次任务。
     """
     plan = EntryPlan(direction=str(direction or "BUY").upper(), entry_price=entry_price,
                      stop_loss=stop_loss)
@@ -307,7 +294,6 @@ def plan_entries(cfg: RiskSizedConfig, *, direction: str, entry_price: float,
         plan.reject = "品种规格不完整（point / tick / 手数步长），无法反推手数"
         return plan
 
-    # 止损必须在持仓的不利侧，否则这一单开出来就已经触发止损
     sign = _favorable_sign(plan.direction)
     if (stop_loss - entry_price) * sign >= 0:
         plan.reject = (
@@ -338,25 +324,17 @@ def plan_entries(cfg: RiskSizedConfig, *, direction: str, entry_price: float,
     plan.total_lot = total
     plan.risk_used = round(total * plan.loss_per_lot, 2)
     tp_distance = plan.sl_distance * cfg.rr_ratio
-    plan.take_profit = round(entry_price + sign * tp_distance, spec.digits) if cfg.rr_ratio > 0 else 0.0
+    # 分散仓止盈；底仓按截图语义 TP=0
+    plan.take_profit = (
+        round(entry_price + sign * tp_distance, spec.digits) if cfg.rr_ratio > 0 else 0.0
+    )
 
     lots = _split_lots(total, cfg, spec)
-    plan.gap_price, plan.gap_capped = _effective_gap(
-        cfg, len(lots) - 1, plan.sl_distance, tp_distance, spec,
-    )
-    plan.gap_points = plan.gap_price / spec.point if spec.point > 0 else 0.0
-
-    # 回撤补仓朝不利方向挂，突破加仓朝有利方向挂
-    step_sign = -sign if cfg.entry_direction == ENTRY_PULLBACK else sign
     plan.batches = [
         Batch(
             index=i,
             volume=volume,
-            trigger_price=(
-                0.0 if i == 0
-                else round(entry_price + step_sign * plan.gap_price * i, spec.digits)
-            ),
-            gap_points=0.0 if i == 0 else plan.gap_points * i,
+            take_profit=0.0 if i == 0 else plan.take_profit,
         )
         for i, volume in enumerate(lots)
     ]
@@ -365,11 +343,10 @@ def plan_entries(cfg: RiskSizedConfig, *, direction: str, entry_price: float,
 
 def anchor_to_fill(plan: EntryPlan, cfg: RiskSizedConfig, fill_price: float,
                    spec: SymbolSpec) -> EntryPlan:
-    """底仓实际成交后，把止盈与各批触发价重挂到成交价上；手数保持不变。
+    """底仓实际成交后，按真实成交价重算分散仓止盈；手数保持不变。
 
     手数是按下单前的预估价算的，成交价会有滑点。手数不能再动（底仓已经成交），
-    但止盈与补仓触发价必须以真实成交价为锚，否则整套价位都会偏移一个滑点，
-    盈亏比与「触发价留在止损内」的前提也就不再成立。
+    但分散仓止盈必须以真实成交价为锚，否则盈亏比不再是配置值。
     """
     if not plan.ok or fill_price <= 0 or fill_price == plan.entry_price:
         return plan
@@ -382,18 +359,11 @@ def anchor_to_fill(plan: EntryPlan, cfg: RiskSizedConfig, fill_price: float,
     )
     plan.risk_used = round(plan.total_lot * plan.loss_per_lot, 2)
     tp_distance = plan.sl_distance * cfg.rr_ratio
-    plan.take_profit = round(fill_price + sign * tp_distance, spec.digits) if cfg.rr_ratio > 0 else 0.0
-
-    plan.gap_price, plan.gap_capped = _effective_gap(
-        cfg, plan.add_batch_count, plan.sl_distance, tp_distance, spec,
+    plan.take_profit = (
+        round(fill_price + sign * tp_distance, spec.digits) if cfg.rr_ratio > 0 else 0.0
     )
-    plan.gap_points = plan.gap_price / spec.point if spec.point > 0 else 0.0
-    step_sign = -sign if cfg.entry_direction == ENTRY_PULLBACK else sign
     for batch in plan.batches:
-        if batch.is_base:
-            continue
-        batch.trigger_price = round(fill_price + step_sign * plan.gap_price * batch.index, spec.digits)
-        batch.gap_points = plan.gap_points * batch.index
+        batch.take_profit = 0.0 if batch.is_base else plan.take_profit
     return plan
 
 
@@ -401,26 +371,27 @@ def anchor_to_fill(plan: EntryPlan, cfg: RiskSizedConfig, fill_price: float,
 # 运行期判定
 # ---------------------------------------------------------------------------
 
-def reached(plan: EntryPlan, batch: Batch, price: float, *, entry_direction: str) -> bool:
-    """当前价是否已经走到该批的触发价。"""
-    if batch.is_base or batch.trigger_price <= 0 or price <= 0:
-        return False
-    toward_up = (entry_direction == ENTRY_BREAKOUT) == _is_buy(plan.direction)
-    return price >= batch.trigger_price if toward_up else price <= batch.trigger_price
-
-
 def next_batch(plan: EntryPlan, cfg: RiskSizedConfig, *, filled: int,
-               price: float) -> Optional[Batch]:
-    """取下一批待补的仓位；未到价或已补完返回 None。
+               price: float = 0.0) -> Optional[Batch]:
+    """取下一笔待开的分散仓；已开完返回 None。
 
-    filled 是已成交的笔数（含底仓），也就是下一批的 index。
+    分散仓全部市价，price 参数保留仅为兼容旧调用方，不再参与判定。
+    filled 是已成交笔数（含底仓），也就是下一批的 index。
     """
+    del cfg, price  # 市价分散，不依赖规则间距与现价
     if not plan.ok or filled <= 0:
         return None
     batch = plan.batch_at(filled)
-    if batch is None:
+    if batch is None or batch.is_base:
         return None
-    return batch if reached(plan, batch, price, entry_direction=cfg.entry_direction) else None
+    return batch
+
+
+def pending_batches(plan: EntryPlan, *, filled: int) -> list[Batch]:
+    """尚未开出的分散仓列表（用于开仓时一次打齐 / 恢复补开）。"""
+    if not plan.ok or filled < 0:
+        return []
+    return [b for b in plan.batches if b.index >= filled and b.is_distribute]
 
 
 @dataclass
@@ -429,102 +400,123 @@ class BreakevenMove:
     stop_loss: float
     avg_price: float
     price: float
-    favorable: float        # 当前浮盈的价格距离
-    threshold: float        # 触发所需的价格距离
+    favorable: float
+    threshold: float
     times: float
-    sl_distance: float
-    position_count: int = 0
+    mode: str = BREAKEVEN_ONCE
 
     def describe(self, digits: int) -> str:
+        mode_label = "循环" if self.mode == BREAKEVEN_LOOP else "按次"
         return (
-            f"保本触发：均价 {_trim(self.avg_price, digits)} → 现价 "
-            f"{_trim(self.price, digits)}，有利偏离 {_trim(self.favorable, digits)}"
-            f" ≥ 止损距离 {_trim(self.sl_distance, digits)} × {_trim(self.times, 2)}"
-            f" = {_trim(self.threshold, digits)}；"
-            f"{self.position_count} 笔持仓止损移到均价 {_trim(self.stop_loss, digits)}"
+            f"保本触发（{mode_label}）：均价 {_trim(self.avg_price, digits)} → 现价 "
+            f"{_trim(self.price, digits)}，有利偏离 {_trim(self.favorable, digits)} "
+            f"≥ 止损距 × {_trim(self.times, 2)} = {_trim(self.threshold, digits)}；"
+            f"止损移至 {_trim(self.stop_loss, digits)}"
         )
 
     def detail(self) -> dict:
         return {
             "kind": "breakeven",
-            "stop_loss": self.stop_loss,
             "avg_price": self.avg_price,
             "price": self.price,
-            "favorable": round(self.favorable, 8),
-            "threshold": round(self.threshold, 8),
-            "breakeven_times": self.times,
-            "sl_distance": round(self.sl_distance, 8),
-            "position_count": self.position_count,
+            "favorable": self.favorable,
+            "threshold": self.threshold,
+            "times": self.times,
+            "stop_loss": self.stop_loss,
+            "breakeven_mode": self.mode,
+            "breakeven_mode_label": "循环" if self.mode == BREAKEVEN_LOOP else "按次",
         }
 
 
 def weighted_avg_price(positions: list[dict]) -> float:
     """持仓的加权平均开仓价——保本止损要挪到这里，而不是首单价。"""
-    total = 0.0
+    total_vol = 0.0
     weighted = 0.0
-    for p in positions or []:
-        volume = _as_float(p.get("volume"))
-        price = _as_float(p.get("price_open"))
-        if volume <= 0 or price <= 0:
+    for pos in positions:
+        vol = _as_float(pos.get("volume"))
+        price = _as_float(pos.get("price_open"))
+        if vol <= 0 or price <= 0:
             continue
-        total += volume
-        weighted += volume * price
-    return weighted / total if total > 0 else 0.0
+        total_vol += vol
+        weighted += vol * price
+    return weighted / total_vol if total_vol > 0 else 0.0
+
+
+def _worst_stop_loss(positions: list[dict], *, direction: str) -> float:
+    """当前持仓里最「差」的止损价（多单取最小、空单取最大）；无止损则返回 0。"""
+    stops = [_as_float(p.get("sl")) for p in positions if _as_float(p.get("sl")) > 0]
+    if not stops:
+        return 0.0
+    return min(stops) if _is_buy(direction) else max(stops)
+
+
+def _stop_already_at_or_better(current_sl: float, target: float, *, direction: str,
+                               digits: int) -> bool:
+    """止损是否已经在目标均价或更优一侧（避免循环模式下反复改同一价）。"""
+    if current_sl <= 0 or target <= 0:
+        return False
+    eps = 10 ** (-max(digits, 0)) / 2
+    if _is_buy(direction):
+        return current_sl + eps >= target
+    return current_sl - eps <= target
 
 
 def breakeven_move(cfg: RiskSizedConfig, plan: EntryPlan, *, positions: list[dict],
-                   price: float, digits: int) -> Optional[BreakevenMove]:
-    """浮盈是否已达标、该把止损挪到哪里；未达标返回 None。"""
-    if not cfg.breakeven_enabled or cfg.breakeven_times <= 0:
+                   price: float, digits: int = 5) -> Optional[BreakevenMove]:
+    """浮盈是否达到保本阈值；达标则返回要把止损挪到的均价。
+
+    若当前止损已经在均价或更优一侧，不再重复改单（按次 / 循环都适用）。
+    """
+    if not cfg.breakeven_enabled or cfg.breakeven_times <= 0 or not plan.ok:
         return None
-    if plan.sl_distance <= 0 or price <= 0:
+    if price <= 0 or not positions:
         return None
     avg = weighted_avg_price(positions)
     if avg <= 0:
         return None
-    favorable = (price - avg) * _favorable_sign(plan.direction)
+    target = round(avg, digits)
+    current_sl = _worst_stop_loss(positions, direction=plan.direction)
+    if _stop_already_at_or_better(current_sl, target, direction=plan.direction, digits=digits):
+        return None
+    sign = _favorable_sign(plan.direction)
+    favorable = (price - avg) * sign
     threshold = plan.sl_distance * cfg.breakeven_times
-    if favorable < threshold:
+    if favorable + 1e-12 < threshold:
         return None
     return BreakevenMove(
-        stop_loss=round(avg, digits),
-        avg_price=avg,
+        stop_loss=target,
+        avg_price=target,
         price=price,
-        favorable=favorable,
-        threshold=threshold,
+        favorable=round(favorable, digits),
+        threshold=round(threshold, digits),
         times=cfg.breakeven_times,
-        sl_distance=plan.sl_distance,
-        position_count=len(positions or []),
+        mode=cfg.breakeven_mode,
     )
 
 
 # ---------------------------------------------------------------------------
 # 开单原因与计算规则的说明生成
-#
-# 以损定量的手数是节点算出来的，后台看不到中间过程。这里把计划与每批的判定还原成
-# 人读的说明、结构化明细，以及能塞进 MT5 备注的紧凑编码，随上报一起送回后台。
 # ---------------------------------------------------------------------------
 
 def describe_plan(plan: EntryPlan, cfg: RiskSizedConfig, spec: SymbolSpec) -> str:
-    """建仓计划的一句话说明：手数是怎么反推出来的、仓位怎么分批。"""
+    """建仓计划的一句话说明：手数是怎么反推出来的、仓位怎么拆。"""
     vd = spec.volume_digits
     parts = [
         f"以损定量：风险金额 {_trim(cfg.risk_amount, 2)} ÷ 每手止损亏损 "
         f"{_trim(plan.loss_per_lot, 2)}（止损距离 {_trim(plan.sl_points, 1)} 点）"
         f" = 总手数 {_trim(plan.total_lot, vd)}，实际风险 {_trim(plan.risk_used, 2)}",
-        f"底仓 {_trim(cfg.base_ratio, 1)}% = {_trim(plan.base_volume, vd)} 手市价成交",
+        f"底仓 {_trim(cfg.base_ratio, 1)}% = {_trim(plan.base_volume, vd)} 手市价（TP=0）",
     ]
     if plan.add_batch_count:
         parts.append(
-            f"剩余分 {plan.add_batch_count} 批{cfg.entry_direction_label}，间距 "
-            f"{_trim(plan.gap_points, 1)} 点" + ("（已压缩至止损内）" if plan.gap_capped else "")
+            f"分散仓 {_trim(plan.distribute_volume, vd)} 手分 {plan.add_batch_count} 单市价"
+            + (f"（止盈 {_trim(plan.take_profit, spec.digits)}，盈亏比 {_trim(cfg.rr_ratio, 2)}）"
+               if plan.take_profit else "（不设止盈）")
         )
     else:
-        parts.append("不分批补仓")
+        parts.append("无分散仓，底仓即全仓")
     parts.append(
-        f"共用止损 {_trim(plan.stop_loss, spec.digits)}，止盈 "
-        + (f"{_trim(plan.take_profit, spec.digits)}（盈亏比 {_trim(cfg.rr_ratio, 2)}）"
-           if plan.take_profit else "不设")
+        f"共用止损 {_trim(plan.stop_loss, spec.digits)}，共 {plan.order_count} 单"
     )
     return "；".join(parts)
 
@@ -550,13 +542,13 @@ def plan_detail(plan: EntryPlan, cfg: RiskSizedConfig, spec: SymbolSpec) -> dict
         ),
         "base_ratio": cfg.base_ratio,
         "base_volume": plan.base_volume,
+        "distribute_volume": plan.distribute_volume,
         "add_batches": plan.add_batch_count,
-        "entry_direction": cfg.entry_direction,
-        "entry_direction_label": cfg.entry_direction_label,
-        "gap_points": round(plan.gap_points, 2),
-        "gap_capped": plan.gap_capped,
+        "order_count": plan.order_count,
         "breakeven_enabled": cfg.breakeven_enabled,
         "breakeven_times": cfg.breakeven_times if cfg.breakeven_enabled else None,
+        "breakeven_mode": cfg.breakeven_mode if cfg.breakeven_enabled else None,
+        "breakeven_mode_label": cfg.breakeven_mode_label if cfg.breakeven_enabled else None,
         "tick_value": spec.tick_value,
         "tick_size": spec.tick_size,
         "volume_step": spec.volume_step,
@@ -564,8 +556,8 @@ def plan_detail(plan: EntryPlan, cfg: RiskSizedConfig, spec: SymbolSpec) -> dict
             {
                 "index": b.index,
                 "volume": b.volume,
-                "trigger_price": b.trigger_price or None,
-                "gap_points": round(b.gap_points, 2) or None,
+                "take_profit": b.take_profit or None,
+                "role": "base" if b.is_base else "distribute",
             }
             for b in plan.batches
         ],
@@ -574,15 +566,14 @@ def plan_detail(plan: EntryPlan, cfg: RiskSizedConfig, spec: SymbolSpec) -> dict
 
 def describe_batch(plan: EntryPlan, cfg: RiskSizedConfig, batch: Batch,
                    spec: SymbolSpec, price: float) -> str:
-    """一笔补仓的开单原因。"""
+    """一笔分散仓的开单原因。"""
+    del cfg  # 说明里用 plan / batch 即可
     return (
-        f"以损定量补仓 · 第 {batch.index + 1}/{len(plan.batches)} 批："
-        f"{cfg.entry_direction_label} 触发价 {_trim(batch.trigger_price, spec.digits)}"
-        f"（首单 {_trim(plan.entry_price, spec.digits)} 偏离 "
-        f"{_trim(batch.gap_points, 1)} 点）已到价，现价 {_trim(price, spec.digits)}；"
-        f"本批 {_trim(batch.volume, spec.volume_digits)} 手，"
+        f"以损定量分散仓 · 第 {batch.index}/{plan.add_batch_count} 单："
+        f"市价 {_trim(batch.volume, spec.volume_digits)} 手"
+        f"（现价 {_trim(price, spec.digits)}）；"
         f"共用止损 {_trim(plan.stop_loss, spec.digits)}，止盈 "
-        + (f"{_trim(plan.take_profit, spec.digits)}" if plan.take_profit else "不设")
+        + (f"{_trim(batch.take_profit, spec.digits)}" if batch.take_profit else "不设")
         + f"；总手数 {_trim(plan.total_lot, spec.volume_digits)}，"
         f"风险仍为 {_trim(plan.risk_used, 2)}"
     )
@@ -590,30 +581,26 @@ def describe_batch(plan: EntryPlan, cfg: RiskSizedConfig, batch: Batch,
 
 def batch_detail(plan: EntryPlan, cfg: RiskSizedConfig, batch: Batch,
                  spec: SymbolSpec, price: float) -> dict:
-    """一笔补仓的结构化明细。"""
+    """一笔分散仓的结构化明细。"""
     return {
-        "kind": "risk_sized_add",
+        "kind": "risk_sized_distribute",
         "batch_index": batch.index,
-        "batch_total": len(plan.batches),
+        "batch_total": plan.add_batch_count,
+        "order_count": plan.order_count,
         "direction": plan.direction,
-        "entry_direction": cfg.entry_direction,
-        "entry_direction_label": cfg.entry_direction_label,
         "entry_price": plan.entry_price,
-        "trigger_price": batch.trigger_price,
         "price": price,
-        "gap_points": round(batch.gap_points, 2),
         "volume": batch.volume,
         "total_lot": plan.total_lot,
         "stop_loss": plan.stop_loss,
-        "take_profit": plan.take_profit or None,
+        "take_profit": batch.take_profit or None,
         "risk_amount": cfg.risk_amount,
         "risk_used": plan.risk_used,
+        "role": "distribute",
     }
 
 
 def batch_comment(batch: Batch) -> str:
-    """补仓单写进 MT5 的紧凑备注：R3=以损定量，B=批次序号。
-
-    MT5 备注只有约 31 字符，这里只保留能反查到批次的最小信息。
-    """
-    return f"R{RULE_TYPE_RISK_SIZED}B{batch.index}"[:MT5_COMMENT_LIMIT]
+    """分散仓写进 MT5 的紧凑备注：R3=以损定量，B=序号。"""
+    text = f"R3B{batch.index}"
+    return text[:MT5_COMMENT_LIMIT]

@@ -227,11 +227,10 @@ def _risk_sized_rule(**over) -> dict:
         "rr_ratio": 3,
         "base_ratio": 40,
         "add_batches": 3,
-        "entry_direction": "pullback",
-        "batch_gap_points": 150,
         "max_total_lot": 2,
         "breakeven_enabled": True,
         "breakeven_times": 1.5,
+        "breakeven_mode": "loop",
     }
     rule.update(over)
     return rule
@@ -263,15 +262,16 @@ def test_list_templates_contains_template_2(client):
     assert rule["type"] == RULE_TYPE_RISK_SIZED
     assert rule["status"] == 1
     assert rule["action"] == "all"
-    assert rule["risk_amount"] == 300
+    assert rule["risk_amount"] == 100
     assert rule["rr_ratio"] == 2.5
     assert rule["base_ratio"] == 30
-    assert rule["add_batches"] == 2
-    assert rule["entry_direction"] == "pullback"
-    assert rule["batch_gap_points"] == 100
+    assert rule["add_batches"] == 10
     assert rule["max_total_lot"] == 0
-    assert rule["breakeven_enabled"] is False
-    assert rule["breakeven_times"] == 1
+    assert rule["breakeven_enabled"] is True
+    assert rule["breakeven_times"] == 2
+    assert rule["breakeven_mode"] == "once"
+    assert "entry_direction" not in rule
+    assert "batch_gap_points" not in rule
 
 
 def test_create_strategy_from_template_2(client):
@@ -295,32 +295,42 @@ def test_risk_sized_rule_keeps_custom_values(client):
     assert rule["rr_ratio"] == 3
     assert rule["base_ratio"] == 40
     assert rule["add_batches"] == 3
-    assert rule["batch_gap_points"] == 150
     assert rule["max_total_lot"] == 2
     assert rule["breakeven_enabled"] is True
     assert rule["breakeven_times"] == 1.5
+    assert rule["breakeven_mode"] == "loop"
 
 
-def test_risk_sized_full_base_when_not_batching(client):
-    """不分批时底仓必须是全仓，否则剩下的仓位永远补不进来。"""
+def test_risk_sized_full_base_when_not_distributing(client):
+    """无分散仓时底仓必须是全仓，否则剩下的仓位永远开不进来。"""
     rule = _created_risk_rule(
-        client, auth_headers(client), "不分批以损定量", add_batches=0, base_ratio=30,
+        client, auth_headers(client), "无分散仓以损定量", add_batches=0, base_ratio=30,
     )
     assert rule["add_batches"] == 0
     assert rule["base_ratio"] == 100
 
 
-def test_risk_sized_normalizes_illegal_entry_direction(client):
+def test_risk_sized_strips_legacy_entry_fields(client):
+    """旧的补仓方向 / 间距字段不再落库。"""
     rule = _created_risk_rule(
-        client, auth_headers(client), "非法补仓方向", entry_direction="sideways",
+        client, auth_headers(client), "剥离旧字段",
+        entry_direction="sideways", batch_gap_points=999,
     )
-    assert rule["entry_direction"] == "pullback"
+    assert "entry_direction" not in rule
+    assert "batch_gap_points" not in rule
+
+
+def test_risk_sized_normalizes_illegal_breakeven_mode(client):
+    rule = _created_risk_rule(
+        client, auth_headers(client), "非法保本模式", breakeven_mode="always",
+    )
+    assert rule["breakeven_mode"] == "once"
 
 
 def test_risk_sized_rejects_out_of_range_values(client):
     h = auth_headers(client)
     for over in ({"risk_amount": -1}, {"base_ratio": 101}, {"rr_ratio": -0.5},
-                 {"add_batches": -1}, {"breakeven_times": -1}):
+                 {"add_batches": -1}, {"breakeven_times": -1}, {"add_batches": 51}):
         r = client.post(
             "/api/strategies",
             json={
@@ -383,11 +393,12 @@ def test_normalize_keeps_only_risk_sized_fields():
         # 混入加仓类字段：不属于本 type，不应落库
         "point": 200, "lot_times": 9, "extra_lot": 1, "max_allow_num": 7,
         "batch_enabled": True, "batch_count": 5, "batch_levels": [{"pos_from": 2}],
+        "entry_direction": "pullback", "batch_gap_points": 100,
     })
     assert set(out) == {
         "type", "status", "action", "risk_amount", "rr_ratio", "base_ratio",
-        "add_batches", "entry_direction", "batch_gap_points", "max_total_lot",
-        "breakeven_enabled", "breakeven_times",
+        "add_batches", "max_total_lot", "breakeven_enabled", "breakeven_times",
+        "breakeven_mode",
     }
 
 

@@ -315,8 +315,8 @@ async def mk_risk_sized_group(store, name, node_ids, *, symbol="XAUUSD", **rule_
     rule = {
         "type": RULE_TYPE_RISK_SIZED, "status": 1, "action": "all",
         "risk_amount": 300.0, "rr_ratio": 2.5, "base_ratio": 30.0,
-        "add_batches": 2, "entry_direction": "pullback", "batch_gap_points": 100.0,
-        "max_total_lot": 0.0, "breakeven_enabled": False, "breakeven_times": 1.0,
+        "add_batches": 2, "max_total_lot": 0.0,
+        "breakeven_enabled": False, "breakeven_times": 1.0,
     }
     rule.update(rule_over)
     strategy = await mk_strategy(
@@ -1070,6 +1070,55 @@ async def test_close_signal_terminates_running_subtasks(store, monkeypatch):
     # 子任务转入 closing，等节点回报平仓完成
     rows = await fetch_dispatches(task.task_id)
     assert {r.status for r in rows} == {"closing"}
+
+
+async def test_manual_close_subtask_only_stops_one_node(store, monkeypatch):
+    """手动平仓只终止指定子任务，不影响同任务其它节点。"""
+    await online(store, mk_node("nd_a"), mk_node("nd_b"))
+    group = await mk_group(store, "单节点平仓组", ["nd_a", "nd_b"], mode="sync")
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    d = GroupDispatcher(store)
+
+    await d.dispatch(TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_mc0")
+    task = (await fetch_tasks("sig_mc0"))[0]
+    await open_first_orders(task.task_id, ["nd_a", "nd_b"])
+    rows = await fetch_dispatches(task.task_id)
+    target = next(r for r in rows if r.node_id == "nd_a")
+    peer = next(r for r in rows if r.node_id == "nd_b")
+    sent.clear()
+
+    outcome = await d.close_subtask(group["group_id"], target.id)
+
+    assert outcome["status"] == "closing"
+    assert outcome["node_id"] == "nd_a"
+    assert len(sent) == 1
+    assert sent[0][0] == "nd_a"
+    assert sent[0][1]["cmd"] == "strategy_stop"
+    assert sent[0][1]["dispatch_id"] == target.id
+    assert sent[0][1]["reason"] == "manual_close"
+
+    refreshed = await fetch_dispatches(task.task_id)
+    by_id = {r.id: r for r in refreshed}
+    assert by_id[target.id].status == "closing"
+    assert by_id[peer.id].status in ("opened", "running")
+    assert by_id[peer.id].status != "closing"
+
+
+async def test_manual_close_subtask_rejects_terminal(store, monkeypatch):
+    """已结束的子任务不可再平仓。"""
+    await online(store, mk_node("nd_a"))
+    group = await mk_group(store, "终态平仓组", ["nd_a"])
+    monkeypatch.setattr(manager, "send_to_node", capture_sender([]))
+    d = GroupDispatcher(store)
+
+    await d.dispatch(TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_mc1")
+    task = (await fetch_tasks("sig_mc1"))[0]
+    await finish_task(store, task.task_id, ["nd_a"])
+    row = (await fetch_dispatches(task.task_id))[0]
+
+    with pytest.raises(ValueError, match="已结束"):
+        await d.close_subtask(group["group_id"], row.id)
 
 
 async def test_close_signal_force_finishes_offline_node(store, monkeypatch):

@@ -250,41 +250,80 @@ class GroupDispatcher:
             logger.info("group %s has no active subtask, CLOSE ignored", group_id)
             return self._result(group, mode, 0, "skipped", "分组没有进行中的任务")
 
-        closing: list[int] = []
-        offline: list[tuple[dict, dict]] = []
-        for sub in subtasks:
-            cmd = build_strategy_stop_command(
-                signal_id, sub["task_id"], sub["dispatch_id"], sub["magic"],
-                group_id, sub.get("symbol") or signal.symbol,
-            )
-            if await manager.send_to_node(sub["node_id"], cmd):
-                closing.append(sub["dispatch_id"])
-            else:
-                offline.append((sub, cmd))
-
-        await group_persist.mark_dispatches_closing(closing)
-        # 目标节点离线时无人能平仓：强制收口并放开占位，避免该节点该品种被永久锁死；
-        # 同时把终止指令暂存下来，等节点重连后补发，否则 MT5 里的持仓会一直留着
-        if offline:
-            for sub, cmd in offline:
-                await self.store.push_pending_stop(
-                    sub["node_id"], cmd, Config.NODE_BUSY_TTL,
-                )
-            res = await group_persist.force_finish_subtasks(
-                [sub["dispatch_id"] for sub, _ in offline],
-                reason="close_signal_node_offline",
-            )
-            await self._release(res)
-
+        closing = 0
+        forced = 0
         task_id = subtasks[0]["task_id"]
+        for sub in subtasks:
+            outcome = await self._stop_subtask(
+                sub, signal_id=signal_id, reason="close_signal",
+            )
+            if outcome["status"] == "closing":
+                closing += 1
+            elif outcome["status"] == "forced":
+                forced += 1
+
         if not closing:
             return self._result(group, mode, 0, "failed",
                                 "目标节点均不在线，已强制结束子任务，待其重连后补发平仓",
                                 task_id)
         logger.info(
-            "group %s CLOSE -> %d subtask(s) closing, %d forced", group_id, len(closing), len(offline),
+            "group %s CLOSE -> %d subtask(s) closing, %d forced", group_id, closing, forced,
         )
-        return self._result(group, mode, len(closing), "closing", None, task_id)
+        return self._result(group, mode, closing, "closing", None, task_id)
+
+    async def close_subtask(
+        self, group_id: str, dispatch_id: int, *, reason: str = "manual_close",
+    ) -> dict:
+        """手动终止单个节点子任务：下发 strategy_stop，在线标 closing，离线强制收口并排队补发。"""
+        sub = await group_persist.get_subtask(group_id, dispatch_id)
+        if not sub:
+            raise ValueError("子任务不存在或不属于该分组")
+        if sub["status"] in group_rules.SUBTASK_TERMINAL:
+            raise ValueError(f"子任务已结束（{sub['status']}），无需平仓")
+        signal_id = sub.get("signal_id") or f"mclose_{dispatch_id}"
+        outcome = await self._stop_subtask(sub, signal_id=signal_id, reason=reason)
+        logger.info(
+            "group %s dispatch #%s manual close -> %s (node %s)",
+            group_id, dispatch_id, outcome["status"], sub["node_id"],
+        )
+        return outcome
+
+    async def _stop_subtask(
+        self, sub: dict, *, signal_id: str, reason: str,
+    ) -> dict:
+        """对单个子任务下发终止指令；返回 status=closing|forced。"""
+        dispatch_id = sub["dispatch_id"]
+        node_id = sub["node_id"]
+        cmd = build_strategy_stop_command(
+            signal_id, sub["task_id"], dispatch_id, sub["magic"],
+            sub.get("group_id") or "", sub.get("symbol"),
+            reason=reason,
+        )
+        if await manager.send_to_node(node_id, cmd):
+            await group_persist.mark_dispatches_closing([dispatch_id])
+            return {
+                "status": "closing",
+                "dispatch_id": dispatch_id,
+                "node_id": node_id,
+                "task_id": sub["task_id"],
+                "magic": sub.get("magic"),
+            }
+
+        # 目标节点离线：强制收口并放开占位，终止指令入队等重连补发
+        await self.store.push_pending_stop(node_id, cmd, Config.NODE_BUSY_TTL)
+        res = await group_persist.force_finish_subtasks(
+            [dispatch_id],
+            reason=f"{reason}_node_offline"[:64],
+        )
+        await self._release(res)
+        return {
+            "status": "forced",
+            "dispatch_id": dispatch_id,
+            "node_id": node_id,
+            "task_id": sub["task_id"],
+            "magic": sub.get("magic"),
+            "reason": "目标节点不在线，已强制结束子任务，待其重连后补发平仓",
+        }
 
     # ------------------------------------------------------------------
     # 单分组开仓

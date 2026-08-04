@@ -8,7 +8,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from . import group_persist, group_rules, group_service, persist
 from .connections import manager
-from .deps import client_ip, get_current_admin, get_store
+from .deps import client_ip, get_current_admin, get_group_dispatcher, get_store
+from .group_dispatcher import GroupDispatcher
 from .models import (
     GROUP_DISPATCH_MODES,
     GroupCreate,
@@ -174,6 +175,35 @@ async def group_dispatch_events(
     if items is None:
         raise HTTPException(status_code=404, detail="dispatch not found")
     return items
+
+
+@router.post("/{group_id}/dispatches/{dispatch_id}/close")
+async def close_group_dispatch(
+    group_id: str,
+    dispatch_id: int,
+    request: Request,
+    store: RedisStore = Depends(get_store),
+    group_dispatcher: GroupDispatcher = Depends(get_group_dispatcher),
+    admin: str = Depends(get_current_admin),
+):
+    """手动终止单个节点策略子任务：下发 strategy_stop，平掉该魔术号持仓并结束监控。
+
+    与 Webhook CLOSE（按品种命中全部分组全部子任务）不同，这里只作用于指定子任务。
+    """
+    if not await store.get_group(group_id):
+        raise HTTPException(status_code=404, detail="group not found")
+    try:
+        outcome = await group_dispatcher.close_subtask(group_id, dispatch_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    result = "ok" if outcome.get("status") == "closing" else "offline"
+    await persist.audit(
+        admin, "close_group_dispatch", group_id,
+        {"dispatch_id": dispatch_id, "node_id": outcome.get("node_id")},
+        result, client_ip(request),
+        category="console", before=None, after=outcome,
+    )
+    return outcome
 
 
 @router.patch("/{group_id}", response_model=GroupOut)

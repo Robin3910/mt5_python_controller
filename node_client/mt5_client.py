@@ -422,6 +422,32 @@ class MT5Client:
             "results": results,
         }
 
+    def realized_profit_by_magic(self, magic: int, since_ts: float | None = None) -> float:
+        """汇总某魔术号在时间窗内的已实现盈亏（成交 profit + swap + commission）。
+
+        用于策略任务收口时上报 realized_profit；时间窗默认最近 7 天。
+        """
+        self.ensure()
+        from datetime import datetime, timedelta
+
+        end = datetime.now()
+        if since_ts:
+            start = datetime.fromtimestamp(float(since_ts)) - timedelta(minutes=1)
+        else:
+            start = end - timedelta(days=7)
+        deals = mt5.history_deals_get(start, end)
+        if not deals:
+            return 0.0
+        target = int(magic)
+        total = 0.0
+        for d in deals:
+            if int(getattr(d, "magic", 0) or 0) != target:
+                continue
+            total += float(getattr(d, "profit", 0) or 0)
+            total += float(getattr(d, "swap", 0) or 0)
+            total += float(getattr(d, "commission", 0) or 0)
+        return round(total, 2)
+
     def symbol_point(self, symbol: str) -> float:
         """品种最小价格变动单位；解析不到时返回 0（调用方据此跳过判定）。"""
         self.ensure()

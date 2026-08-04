@@ -47,11 +47,12 @@ DEFAULT_BATCH_TIMEFRAME = "M5"
 BATCH_BAR_PERIOD = 14
 
 # --- 模版2：以损定量趋势单 ---
-# 补仓方向：pullback 价格朝不利方向回撤时补齐剩余仓位（摊低成本）；
-# breakout 价格朝有利方向突破时补齐剩余仓位（追势）。
-ENTRY_PULLBACK = "pullback"
-ENTRY_BREAKOUT = "breakout"
-ENTRY_DIRECTIONS = (ENTRY_PULLBACK, ENTRY_BREAKOUT)
+# 分散仓单数硬上限（与节点 risk_sizing.DISTRIBUTE_COUNT_MAX 对齐）
+DISTRIBUTE_COUNT_MAX = 50
+# 保本监控：once=按次（触发一次后停止）/ loop=循环（达标且止损未到位时可反复移动）
+BREAKEVEN_ONCE = "once"
+BREAKEVEN_LOOP = "loop"
+BREAKEVEN_MODES = (BREAKEVEN_ONCE, BREAKEVEN_LOOP)
 
 # --- 模版3：网格交易 ---
 GRID_MODE_ARITHMETIC = "arithmetic"   # 等差
@@ -68,11 +69,11 @@ GRID_COUNT_MAX = 200
 GRID_TRAILING_MAX = 10000
 
 TEMPLATE_1_ID = "tpl_1"
-TEMPLATE_1_NAME = "策略模版1"
+TEMPLATE_1_NAME = "顺势逆势加仓策略"
 TEMPLATE_2_ID = "tpl_2"
-TEMPLATE_2_NAME = "策略模版2"
+TEMPLATE_2_NAME = "趋势策略"
 TEMPLATE_3_ID = "tpl_3"
-TEMPLATE_3_NAME = "策略模版3"
+TEMPLATE_3_NAME = "网络策略"
 
 
 # ---------------------------------------------------------------------------
@@ -205,25 +206,25 @@ class RiskSizedTrendRule:
 
         总手数 = risk_amount / (止损距离 × 每手每点价值)
 
-    底仓按 base_ratio 立即市价成交，剩余仓位分 add_batches 批、每批相隔
-    batch_gap_points 点补齐。所有批次共用信号那一个止损价，所以无论补进几批，
-    整笔交易打到止损的亏损始终等于 risk_amount——这是「以损定量」的关键。
+    底仓按 base_ratio 立即市价成交（止盈为 0）；剩余仓位拆成 add_batches 笔
+    「分散仓」市价单，按盈亏比挂止盈。所有订单共用信号那一个止损价，所以打到
+    止损的总亏损始终等于 risk_amount——这是「以损定量」的关键。
 
-    止盈按盈亏比给出：止盈距离 = 止损距离 × rr_ratio。
+    止盈距离 = 止损距离 × rr_ratio（只挂在分散仓上）。
     breakeven_enabled 开启后，浮盈达到「止损距离 × breakeven_times」时把止损
-    移到持仓的加权均价（保本）。
+    移到持仓的加权均价（保本）。breakeven_mode=once 只触发一次；loop 在止损
+    尚未到位时可持续监控并再次移动。
     """
     status: int = 1
     action: str = "all"                     # 监控方向 all|buy|sell
-    risk_amount: float = 300.0              # 风险金额（账户货币）
+    risk_amount: float = 100.0              # 风险金额（账户货币）
     rr_ratio: float = 2.5                   # 盈亏比
     base_ratio: float = 30.0                # 底仓占总手数的百分比
-    add_batches: int = 2                    # 剩余仓位的补仓批数，0=底仓即全仓
-    entry_direction: str = ENTRY_PULLBACK   # 补仓方向
-    batch_gap_points: float = 100.0         # 相邻批次的触发间距（点）
+    add_batches: int = 10                   # 分散仓单数，0=底仓即全仓
     max_total_lot: float = 0.0              # 总手数上限，0=只受单笔上限约束
-    breakeven_enabled: bool = False          # 保本触发
-    breakeven_times: float = 1.0            # 浮盈达到止损距离 × N 倍时移动止损到保本
+    breakeven_enabled: bool = True          # 保本触发
+    breakeven_times: float = 2.0            # 浮盈达到止损距离 × N 倍时移动止损到保本
+    breakeven_mode: str = BREAKEVEN_ONCE    # once=按次 / loop=循环
 
     @property
     def type(self) -> int:
@@ -238,11 +239,10 @@ class RiskSizedTrendRule:
             "rr_ratio": self.rr_ratio,
             "base_ratio": self.base_ratio,
             "add_batches": self.add_batches,
-            "entry_direction": self.entry_direction,
-            "batch_gap_points": self.batch_gap_points,
             "max_total_lot": self.max_total_lot,
             "breakeven_enabled": self.breakeven_enabled,
             "breakeven_times": self.breakeven_times,
+            "breakeven_mode": self.breakeven_mode,
         }
 
 
@@ -390,15 +390,14 @@ def default_risk_sized_rule() -> RiskSizedTrendRule:
     return RiskSizedTrendRule(
         status=1,
         action="all",
-        risk_amount=300.0,
+        risk_amount=100.0,
         rr_ratio=2.5,
         base_ratio=30.0,
-        add_batches=2,
-        entry_direction=ENTRY_PULLBACK,
-        batch_gap_points=100.0,
+        add_batches=10,
         max_total_lot=0.0,
-        breakeven_enabled=False,
-        breakeven_times=1.0,
+        breakeven_enabled=True,
+        breakeven_times=2.0,
+        breakeven_mode=BREAKEVEN_ONCE,
     )
 
 
@@ -458,8 +457,8 @@ STRATEGY_TEMPLATES: dict[str, dict] = {
         "name": TEMPLATE_2_NAME,
         "description": (
             "以损定量趋势单：按风险金额与信号止损价反推总手数（不使用信号手数），"
-            "底仓先市价成交，剩余仓位按间距分批补齐，全部批次共用信号止损价，"
-            "止盈距离 = 止损距离 × 盈亏比；可选浮盈达标后自动移动止损保本。"
+            "底仓市价成交（止盈为 0），剩余仓位拆成多笔分散仓市价单并按盈亏比挂止盈，"
+            "全部订单共用信号止损价；可选浮盈达标后自动移动止损保本。"
             "信号必须携带止损价，否则该策略不参与分发。"
         ),
         "rule_set": _TPL2_RULES,
@@ -628,20 +627,21 @@ def _normalize_add_on_rule(rule_type: int, raw: dict) -> dict[str, Any]:
 def _normalize_risk_sized_rule(rule_type: int, raw: dict) -> dict[str, Any]:
     """规范化以损定量趋势单（模版2）。
 
-    底仓比例夹在 (0, 100] 内：0 会导致底仓无手数、首单无从下手；不分批时底仓
-    必须是全仓，否则剩下的仓位永远补不进来、实际风险小于设定的风险金额。
+    底仓比例夹在 (0, 100] 内：0 会导致底仓无手数、首单无从下手；无分散仓时底仓
+    必须是全仓，否则剩下的仓位永远开不进来、实际风险小于设定的风险金额。
     """
     defaults = default_risk_sized_rule().to_dict()
 
-    entry_direction = str(raw.get("entry_direction") or defaults["entry_direction"]).strip().lower()
-    if entry_direction not in ENTRY_DIRECTIONS:
-        entry_direction = defaults["entry_direction"]
-
     add_batches = max(0, _as_int(raw.get("add_batches", defaults["add_batches"]), defaults["add_batches"]))
+    add_batches = min(DISTRIBUTE_COUNT_MAX, add_batches)
     base_ratio = _as_float(raw.get("base_ratio", defaults["base_ratio"]), defaults["base_ratio"])
     base_ratio = min(100.0, max(0.0, base_ratio)) or defaults["base_ratio"]
     if not add_batches:
         base_ratio = 100.0
+
+    breakeven_mode = str(raw.get("breakeven_mode") or defaults["breakeven_mode"]).strip().lower()
+    if breakeven_mode not in BREAKEVEN_MODES:
+        breakeven_mode = defaults["breakeven_mode"]
 
     return {
         "type": rule_type,
@@ -651,11 +651,6 @@ def _normalize_risk_sized_rule(rule_type: int, raw: dict) -> dict[str, Any]:
         "rr_ratio": max(0.0, _as_float(raw.get("rr_ratio", defaults["rr_ratio"]), defaults["rr_ratio"])),
         "base_ratio": base_ratio,
         "add_batches": add_batches,
-        "entry_direction": entry_direction,
-        "batch_gap_points": max(
-            0.0,
-            _as_float(raw.get("batch_gap_points", defaults["batch_gap_points"]), defaults["batch_gap_points"]),
-        ),
         "max_total_lot": max(
             0.0, _as_float(raw.get("max_total_lot", defaults["max_total_lot"]), defaults["max_total_lot"]),
         ),
@@ -663,6 +658,7 @@ def _normalize_risk_sized_rule(rule_type: int, raw: dict) -> dict[str, Any]:
         "breakeven_times": max(
             0.0, _as_float(raw.get("breakeven_times", defaults["breakeven_times"]), defaults["breakeven_times"]),
         ),
+        "breakeven_mode": breakeven_mode,
     }
 
 

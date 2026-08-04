@@ -329,18 +329,18 @@ class StrategyRule(BaseModel):
     total_lot_limit: float = Field(default=0.0, ge=0, description="总手数上限，0=不限制")
     batch_levels: list[StrategyBatchLevel] = Field(default_factory=list)
     # --- type=3：以损定量趋势单 ---
-    risk_amount: float = Field(default=300.0, ge=0, description="风险金额（账户货币）")
-    rr_ratio: float = Field(default=2.5, ge=0, description="盈亏比：止盈距离 = 止损距离 × 该值")
-    base_ratio: float = Field(default=30.0, ge=0, le=100, description="底仓占总手数的百分比")
-    add_batches: int = Field(default=2, ge=0, description="剩余仓位的补仓批数，0=底仓即全仓")
-    entry_direction: str = Field(
-        default="pullback", description="补仓方向：pullback=回撤补仓 / breakout=突破加仓",
-    )
-    batch_gap_points: float = Field(default=100.0, ge=0, description="相邻批次的触发间距（点）")
+    risk_amount: float = Field(default=100.0, ge=0, description="风险金额（账户货币）")
+    rr_ratio: float = Field(default=2.5, ge=0, description="盈亏比：止盈距离 = 止损距离 × 该值（挂在分散仓）")
+    base_ratio: float = Field(default=30.0, ge=0, le=100, description="底仓占总手数的百分比（底仓止盈为 0）")
+    add_batches: int = Field(default=10, ge=0, le=50, description="分散仓单数，0=底仓即全仓")
     max_total_lot: float = Field(default=0.0, ge=0, description="总手数上限，0=只受单笔上限约束")
-    breakeven_enabled: bool = Field(default=False, description="是否启用保本触发")
+    breakeven_enabled: bool = Field(default=True, description="是否启用保本触发")
     breakeven_times: float = Field(
-        default=1.0, ge=0, description="浮盈达到止损距离 × 该倍数时把止损移到保本",
+        default=2.0, ge=0, description="浮盈达到止损距离 × 该倍数时把止损移到保本",
+    )
+    breakeven_mode: str = Field(
+        default="once",
+        description="保本监控：once=按次（触发一次后停止）/ loop=循环（可持续监控）",
     )
     # --- type=4：网格交易 ---
     price_lower: float = Field(default=0.0, ge=0, description="网格区间下限")

@@ -122,6 +122,33 @@ async def create_dispatch(
         return None
 
 
+def _subtask_dict(r: GroupTaskDispatch) -> dict:
+    """子任务 ORM 行 -> 终止/补发指令用的精简 dict。"""
+    return {
+        "dispatch_id": r.id,
+        "task_id": r.task_id,
+        "signal_id": r.signal_id,
+        "group_id": r.group_id,
+        "node_id": r.node_id,
+        "symbol": r.symbol,
+        "magic": r.magic,
+        "status": r.status,
+    }
+
+
+async def get_subtask(group_id: str, dispatch_id: int) -> Optional[dict]:
+    """按分组 + 子任务号读取一条节点子任务；不存在或不属于该分组时返回 None。"""
+    try:
+        async with SessionLocal() as s:
+            row = await s.get(GroupTaskDispatch, dispatch_id)
+            if not row or row.group_id != group_id:
+                return None
+            return _subtask_dict(row)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("get_subtask failed: %s", e)
+        return None
+
+
 async def active_subtasks(group_id: str) -> list[dict]:
     """分组下仍未收口的节点子任务（CLOSE 终止指令的目标）。"""
     try:
@@ -136,18 +163,7 @@ async def active_subtasks(group_id: str) -> list[dict]:
                     .order_by(GroupTaskDispatch.id.asc())
                 )
             ).scalars().all()
-            return [
-                {
-                    "dispatch_id": r.id,
-                    "task_id": r.task_id,
-                    "signal_id": r.signal_id,
-                    "node_id": r.node_id,
-                    "symbol": r.symbol,
-                    "magic": r.magic,
-                    "status": r.status,
-                }
-                for r in rows
-            ]
+            return [_subtask_dict(r) for r in rows]
     except Exception as e:  # noqa: BLE001
         logger.warning("active_subtasks failed: %s", e)
         return []
@@ -164,19 +180,7 @@ async def all_active_subtasks() -> list[dict]:
                     .order_by(GroupTaskDispatch.id.asc())
                 )
             ).scalars().all()
-            return [
-                {
-                    "dispatch_id": r.id,
-                    "task_id": r.task_id,
-                    "signal_id": r.signal_id,
-                    "group_id": r.group_id,
-                    "node_id": r.node_id,
-                    "symbol": r.symbol,
-                    "magic": r.magic,
-                    "status": r.status,
-                }
-                for r in rows
-            ]
+            return [_subtask_dict(r) for r in rows]
     except Exception as e:  # noqa: BLE001
         logger.warning("all_active_subtasks failed: %s", e)
         return []
