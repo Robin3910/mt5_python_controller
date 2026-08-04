@@ -138,6 +138,50 @@ class MockMT5Client:
         # 与常见券商一致：五位报价品种 0.00001，金/指数类 0.01
         return 0.01 if mid >= 100 else 0.00001
 
+    def symbol_spec(self, symbol: str) -> dict:
+        """模拟品种规格：tick_size = point，tick_value 取一手一 point 的常见量级。"""
+        point = self.symbol_point(symbol)
+        mid = float(self.prices_map.get(symbol.upper(), 1.0))
+        return {
+            "symbol": symbol.upper(),
+            "point": point,
+            "digits": 2 if mid >= 100 else 5,
+            "tick_size": point,
+            "tick_value": 1.0 if mid >= 100 else 1.0,
+            "volume_min": 0.01,
+            "volume_step": 0.01,
+            "volume_max": 100.0,
+        }
+
+    def modify_position_sl(self, ticket: int, sl: float, tp=None) -> dict:
+        target = int(ticket)
+        pos = next((p for p in self._positions if int(p["ticket"]) == target), None)
+        if not pos:
+            return {"success": False, "ticket": target, "error": f"position not found: {target}"}
+        pos["sl"] = float(sl)
+        if tp is not None:
+            pos["tp"] = float(tp)
+        return {
+            "success": True,
+            "ticket": target,
+            "symbol": pos["symbol"],
+            "sl": pos["sl"],
+            "tp": pos["tp"],
+        }
+
+    def modify_sl_by_magic(self, magic: int, sl: float) -> dict:
+        results = [
+            self.modify_position_sl(int(p["ticket"]), sl)
+            for p in self.positions_by_magic(magic)
+        ]
+        return {
+            "success": all(r.get("success") for r in results) if results else False,
+            "magic": int(magic),
+            "sl": float(sl),
+            "modified": sum(1 for r in results if r.get("success")),
+            "results": results,
+        }
+
     def closed_bars(self, symbol: str, timeframe: str, count: int) -> list[dict]:
         """合成一段已收盘 K 线：围绕当前中间价做固定振幅，便于联调 ATR / 波幅。
 

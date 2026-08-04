@@ -6,7 +6,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.redis_store import RedisStore
-from app.strategy_templates import TEMPLATE_1_ID, TEMPLATE_1_NAME
+from app.strategy_templates import (
+    RULE_TYPE_RISK_SIZED,
+    TEMPLATE_1_ID,
+    TEMPLATE_1_NAME,
+    TEMPLATE_2_ID,
+    TEMPLATE_2_NAME,
+)
 
 _TEST_DB = pathlib.Path(__file__).resolve().parent / "_test_api.db"
 
@@ -203,6 +209,242 @@ def test_batch_level_defaults_when_fields_absent(client):
     assert level["calc_type"] == "point"
     assert level["price"] == 0
     assert level["timeframe"] == "M5"
+
+
+# ---------------------------------------------------------------------------
+# 策略模版2：以损定量趋势单
+# ---------------------------------------------------------------------------
+
+def _risk_sized_rule(**over) -> dict:
+    rule = {
+        "type": RULE_TYPE_RISK_SIZED,
+        "status": 1,
+        "action": "all",
+        "risk_amount": 500,
+        "rr_ratio": 3,
+        "base_ratio": 40,
+        "add_batches": 3,
+        "entry_direction": "pullback",
+        "batch_gap_points": 150,
+        "max_total_lot": 2,
+        "breakeven_enabled": True,
+        "breakeven_times": 1.5,
+    }
+    rule.update(over)
+    return rule
+
+
+def _created_risk_rule(client, headers, name: str, **over) -> dict:
+    r = client.post(
+        "/api/strategies",
+        json={
+            "template_id": TEMPLATE_2_ID, "name": name, "symbol": "BTCUSD",
+            "rules": [_risk_sized_rule(**over)],
+        },
+        headers=headers,
+    )
+    assert r.status_code == 201, r.text
+    rules = r.json()["rules"]
+    assert len(rules) == 1
+    return rules[0]
+
+
+def test_list_templates_contains_template_2(client):
+    h = auth_headers(client)
+    items = client.get("/api/strategies/templates", headers=h).json()
+    tpl = next(t for t in items if t["template_id"] == TEMPLATE_2_ID)
+    assert tpl["name"] == TEMPLATE_2_NAME
+    assert "止损价" in tpl["description"]
+    assert len(tpl["rules"]) == 1
+    rule = tpl["rules"][0]
+    assert rule["type"] == RULE_TYPE_RISK_SIZED
+    assert rule["status"] == 1
+    assert rule["action"] == "all"
+    assert rule["risk_amount"] == 300
+    assert rule["rr_ratio"] == 2.5
+    assert rule["base_ratio"] == 30
+    assert rule["add_batches"] == 2
+    assert rule["entry_direction"] == "pullback"
+    assert rule["batch_gap_points"] == 100
+    assert rule["max_total_lot"] == 0
+    assert rule["breakeven_enabled"] is False
+    assert rule["breakeven_times"] == 1
+
+
+def test_create_strategy_from_template_2(client):
+    h = auth_headers(client)
+    r = client.post(
+        "/api/strategies",
+        json={"template_id": TEMPLATE_2_ID, "name": "BTC以损定量", "symbol": "btcusd"},
+        headers=h,
+    )
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["template_id"] == TEMPLATE_2_ID
+    assert body["template_name"] == TEMPLATE_2_NAME
+    assert body["symbol"] == "BTCUSD"
+    assert [rule["type"] for rule in body["rules"]] == [RULE_TYPE_RISK_SIZED]
+
+
+def test_risk_sized_rule_keeps_custom_values(client):
+    rule = _created_risk_rule(client, auth_headers(client), "自定义以损定量")
+    assert rule["risk_amount"] == 500
+    assert rule["rr_ratio"] == 3
+    assert rule["base_ratio"] == 40
+    assert rule["add_batches"] == 3
+    assert rule["batch_gap_points"] == 150
+    assert rule["max_total_lot"] == 2
+    assert rule["breakeven_enabled"] is True
+    assert rule["breakeven_times"] == 1.5
+
+
+def test_risk_sized_full_base_when_not_batching(client):
+    """不分批时底仓必须是全仓，否则剩下的仓位永远补不进来。"""
+    rule = _created_risk_rule(
+        client, auth_headers(client), "不分批以损定量", add_batches=0, base_ratio=30,
+    )
+    assert rule["add_batches"] == 0
+    assert rule["base_ratio"] == 100
+
+
+def test_risk_sized_normalizes_illegal_entry_direction(client):
+    rule = _created_risk_rule(
+        client, auth_headers(client), "非法补仓方向", entry_direction="sideways",
+    )
+    assert rule["entry_direction"] == "pullback"
+
+
+def test_risk_sized_rejects_out_of_range_values(client):
+    h = auth_headers(client)
+    for over in ({"risk_amount": -1}, {"base_ratio": 101}, {"rr_ratio": -0.5},
+                 {"add_batches": -1}, {"breakeven_times": -1}):
+        r = client.post(
+            "/api/strategies",
+            json={
+                "template_id": TEMPLATE_2_ID, "name": f"越界{over}", "symbol": "BTCUSD",
+                "rules": [_risk_sized_rule(**over)],
+            },
+            headers=h,
+        )
+        assert r.status_code == 422, (over, r.text)
+
+
+def test_risk_sized_rule_survives_update(client):
+    h = auth_headers(client)
+    created = client.post(
+        "/api/strategies",
+        json={"template_id": TEMPLATE_2_ID, "name": "待改以损定量", "symbol": "BTCUSD"},
+        headers=h,
+    ).json()
+    r = client.patch(
+        f"/api/strategies/{created['strategy_id']}",
+        json={"rules": [_risk_sized_rule(risk_amount=800, add_batches=1)]},
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    rule = r.json()["rules"][0]
+    assert rule["type"] == RULE_TYPE_RISK_SIZED
+    assert rule["risk_amount"] == 800
+    assert rule["add_batches"] == 1
+
+
+def test_unknown_rule_type_still_falls_back_to_counter(client):
+    """未知 type 一律按逆势加仓处理，保持历史行为。"""
+    h = auth_headers(client)
+    r = client.post(
+        "/api/strategies",
+        json={
+            "template_id": TEMPLATE_1_ID, "name": "未知类型策略", "symbol": "XAUUSD",
+            "rules": [{"type": 99, "status": 1, "action": "all"}],
+        },
+        headers=h,
+    )
+    assert r.status_code == 201, r.text
+    rule = r.json()["rules"][0]
+    assert rule["type"] == 1
+    assert rule["point"] == 100     # 逆势默认值
+
+
+# ---------------------------------------------------------------------------
+# 规则规范化（纯函数，无需 API）
+#
+# API 响应走 Pydantic 模型，两种 type 的字段都会带默认值输出；真正要保证的是落库
+# 只写该 type 自己的字段，所以这一段直接测归一化函数。
+# ---------------------------------------------------------------------------
+
+def test_normalize_keeps_only_risk_sized_fields():
+    from app import strategy_templates as tpl
+
+    out = tpl.normalize_rule({
+        **_risk_sized_rule(),
+        # 混入加仓类字段：不属于本 type，不应落库
+        "point": 200, "lot_times": 9, "extra_lot": 1, "max_allow_num": 7,
+        "batch_enabled": True, "batch_count": 5, "batch_levels": [{"pos_from": 2}],
+    })
+    assert set(out) == {
+        "type", "status", "action", "risk_amount", "rr_ratio", "base_ratio",
+        "add_batches", "entry_direction", "batch_gap_points", "max_total_lot",
+        "breakeven_enabled", "breakeven_times",
+    }
+
+
+def test_normalize_keeps_only_add_on_fields():
+    from app import strategy_templates as tpl
+
+    out = tpl.normalize_rule({
+        "type": 1, "status": 1, "action": "all",
+        # 混入以损定量字段：不属于本 type，不应落库
+        "risk_amount": 500, "rr_ratio": 3, "breakeven_enabled": True,
+    })
+    assert "risk_amount" not in out
+    assert "breakeven_enabled" not in out
+    assert out["point"] == 100
+
+
+def test_normalize_risk_sized_clamps_ratios():
+    from app import strategy_templates as tpl
+
+    out = tpl.normalize_rule(_risk_sized_rule(base_ratio=0))
+    assert out["base_ratio"] == 30      # 0 无法开出底仓，回落到默认
+
+
+def test_rules_to_rule_set_ignores_risk_sized():
+    """模版1 的还原函数遇到模版2 规则应直接跳过，不能崩。"""
+    from app import strategy_templates as tpl
+
+    rule_set = tpl.rules_to_rule_set([_risk_sized_rule()])
+    assert rule_set.counter.point == 100
+    assert rule_set.trend.point == 100
+
+
+def test_pick_risk_sized_rule():
+    from app import strategy_templates as tpl
+
+    assert tpl.pick_risk_sized_rule([_risk_sized_rule()]) is not None
+    assert tpl.pick_risk_sized_rule([_risk_sized_rule(status=0)]) is None
+    assert tpl.pick_risk_sized_rule([{"type": 1, "status": 1}]) is None
+    assert tpl.pick_risk_sized_rule(None) is None
+
+
+# ---------------------------------------------------------------------------
+# 开仓准入
+# ---------------------------------------------------------------------------
+
+def test_entry_reject_requires_stop_loss_for_risk_sized():
+    from app import group_rules
+
+    strategy = {"rules": [_risk_sized_rule()]}
+    assert group_rules.entry_reject_reason(strategy, 62246.36) is None
+    assert "止损价" in (group_rules.entry_reject_reason(strategy, None) or "")
+    assert "止损价" in (group_rules.entry_reject_reason(strategy, 0) or "")
+
+
+def test_entry_reject_ignores_add_on_strategies():
+    """模版1 首单手数来自信号，没有止损也能开，准入不应拦它。"""
+    from app import group_rules
+
+    strategy = {"rules": [{"type": 1, "status": 1, "action": "all"}]}
+    assert group_rules.entry_reject_reason(strategy, None) is None
 
 
 def test_create_strategy_duplicate_name_409(client):

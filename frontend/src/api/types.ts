@@ -311,17 +311,25 @@ export interface StrategyBatchLevel {
   extra_lot: number
 }
 
-/** 策略加仓规则：1=逆势加仓，2=顺势加仓（与后端独立模型字段对齐） */
+/** 以损定量的补仓方向：pullback 回撤补仓 / breakout 突破加仓 */
+export type EntryDirection = 'pullback' | 'breakout'
+
+/**
+ * 策略规则，字段按 type 分组使用（与后端独立模型对齐）：
+ * type=1 逆势加仓 / type=2 顺势加仓（模版1）；type=3 以损定量趋势单（模版2）。
+ * 后端会按 type 只保留该类型的字段，因此另一组字段可以留空。
+ */
 export interface StrategyRule {
   type: number
   /** 0=关闭，1=启用 */
   status: number
   /** 监控方向 all | buy | sell */
   action: string
-  point: number
-  lot_times: number
-  extra_lot: number
-  max_allow_num: number
+  // --- type=1 / 2：加仓类 ---
+  point?: number
+  lot_times?: number
+  extra_lot?: number
+  max_allow_num?: number
   /** 是否启用分批加仓 */
   batch_enabled?: boolean
   /** 分批监控方向 all | buy | sell */
@@ -331,6 +339,24 @@ export interface StrategyRule {
   /** 总手数上限，0=不限制 */
   total_lot_limit?: number
   batch_levels?: StrategyBatchLevel[]
+  // --- type=3：以损定量趋势单 ---
+  /** 风险金额（账户货币） */
+  risk_amount?: number
+  /** 盈亏比：止盈距离 = 止损距离 × 该值 */
+  rr_ratio?: number
+  /** 底仓占总手数的百分比 */
+  base_ratio?: number
+  /** 剩余仓位的补仓批数，0=底仓即全仓 */
+  add_batches?: number
+  entry_direction?: EntryDirection
+  /** 相邻批次的触发间距（点） */
+  batch_gap_points?: number
+  /** 总手数上限，0=只受单笔上限约束 */
+  max_total_lot?: number
+  /** 是否启用保本触发 */
+  breakeven_enabled?: boolean
+  /** 浮盈达到止损距离 × 该倍数时把止损移到保本 */
+  breakeven_times?: number
 }
 
 export interface StrategyTemplateOut {

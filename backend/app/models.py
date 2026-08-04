@@ -305,10 +305,19 @@ class StrategyBatchLevel(BaseModel):
 
 
 class StrategyRule(BaseModel):
-    """单条加仓规则（逆势 type=1 / 顺势 type=2，结构对齐独立模型）。"""
-    type: int = Field(description="1=逆势加仓，2=顺势加仓")
+    """单条策略规则，字段按 type 分组使用。
+
+    type=1 逆势加仓 / type=2 顺势加仓（模版1）：point ~ batch_levels；
+    type=3 以损定量趋势单（模版2）：risk_amount ~ breakeven_times。
+
+    保持单一扁平模型是为了让 API 契约、前端类型与 config_json 落库格式都不变；
+    服务端 `strategy_templates.normalize_rule` 会按 type 只保留该类型的字段，
+    因此传给别的 type 的字段不会被写进库。
+    """
+    type: int = Field(description="1=逆势加仓，2=顺势加仓，3=以损定量趋势单")
     status: int = Field(description="0=关闭，1=启用")
     action: str = Field(default="all", description="监控方向 all|buy|sell")
+    # --- type=1 / 2：加仓类 ---
     point: float = Field(default=100, ge=0)
     lot_times: float = Field(default=1.0, ge=0)
     extra_lot: float = Field(default=0.0, ge=0)
@@ -318,6 +327,20 @@ class StrategyRule(BaseModel):
     batch_count: int = Field(default=0, ge=0, description="分批批数")
     total_lot_limit: float = Field(default=0.0, ge=0, description="总手数上限，0=不限制")
     batch_levels: list[StrategyBatchLevel] = Field(default_factory=list)
+    # --- type=3：以损定量趋势单 ---
+    risk_amount: float = Field(default=300.0, ge=0, description="风险金额（账户货币）")
+    rr_ratio: float = Field(default=2.5, ge=0, description="盈亏比：止盈距离 = 止损距离 × 该值")
+    base_ratio: float = Field(default=30.0, ge=0, le=100, description="底仓占总手数的百分比")
+    add_batches: int = Field(default=2, ge=0, description="剩余仓位的补仓批数，0=底仓即全仓")
+    entry_direction: str = Field(
+        default="pullback", description="补仓方向：pullback=回撤补仓 / breakout=突破加仓",
+    )
+    batch_gap_points: float = Field(default=100.0, ge=0, description="相邻批次的触发间距（点）")
+    max_total_lot: float = Field(default=0.0, ge=0, description="总手数上限，0=只受单笔上限约束")
+    breakeven_enabled: bool = Field(default=False, description="是否启用保本触发")
+    breakeven_times: float = Field(
+        default=1.0, ge=0, description="浮盈达到止损距离 × 该倍数时把止损移到保本",
+    )
 
 
 class StrategyTemplateOut(BaseModel):

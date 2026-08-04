@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+from . import strategy_templates
 from .config import Config
 from .models import GROUP_DISPATCH_MODES, SIGNAL_MODEL_NORMAL, SIGNAL_MODELS
 
@@ -186,3 +187,23 @@ def strategy_rules_snapshot(strategy: Optional[dict]) -> Optional[dict]:
         "template_id": strategy.get("template_id"),
         "rules": [dict(r) for r in (strategy.get("rules") or []) if isinstance(r, dict)],
     }
+
+
+def entry_reject_reason(strategy: dict, signal_stop_loss: object) -> Optional[str]:
+    """开仓前的策略级准入：策略跑不起来时给出人读的原因；可开仓返回 None。
+
+    以损定量趋势单的手数由「风险金额 ÷ 止损距离」反推，没有止损价就算不出手数。
+    与其让节点收到命令后再失败一次，不如在分发前挡住，落选原因直接写进信号记录。
+    """
+    rule = strategy_templates.pick_risk_sized_rule(strategy.get("rules"))
+    if rule is None:
+        return None
+    try:
+        stop_loss = float(signal_stop_loss)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        stop_loss = 0.0
+    if stop_loss <= 0:
+        return "以损定量趋势单需要信号携带止损价（sl），本信号未提供"
+    if float(rule.get("risk_amount") or 0) <= 0:
+        return "以损定量趋势单的风险金额需大于 0"
+    return None

@@ -119,7 +119,8 @@ class GroupDispatcher:
     async def _candidate_groups(self, signal: TradingSignal) -> tuple[list[tuple[dict, dict]], list[str]]:
         """挑出该信号应当进入的分组。
 
-        入选条件：分组启用 + 绑定了策略 + 策略启用 + 策略品种与信号品种一致。
+        入选条件：分组启用 + 绑定了策略 + 策略启用 + 策略品种与信号品种一致 +
+        通过策略自身的开仓准入（如以损定量趋势单要求信号带止损价）。
         返回 (入选的 (group, strategy) 列表, 落选原因说明)。
         """
         groups = sorted(
@@ -147,6 +148,10 @@ class GroupDispatcher:
                 reasons.append(
                     f"{name}：策略品种 {strategy.get('symbol')} 与信号 {signal.symbol} 不符"
                 )
+                continue
+            reject = group_rules.entry_reject_reason(strategy, signal.stop_loss)
+            if reject:
+                reasons.append(f"{name}：{reject}")
                 continue
             matched.append((group, strategy))
         return matched, reasons

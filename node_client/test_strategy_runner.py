@@ -452,3 +452,366 @@ async def test_subscription_close_exits_monitor_quietly():
 
     assert not _of_type(sent, "strategy_finished")
     assert runner.done
+
+
+# ---------------------------------------------------------------------------
+# 以损定量趋势单（策略模版2）
+#
+# mock 的黄金规格：point=tick_size=0.01、tick_value=1.0，即一手一美元价差值 100。
+# 测试统一把价格钉在 2400、止损放 2397（距离 3 美元 = 300 点 -> 一手亏 300）。
+# ---------------------------------------------------------------------------
+
+ENTRY_PRICE = 2400.0
+STOP_LOSS = 2397.0
+
+
+def risk_rule(**over) -> dict:
+    rule = {
+        "type": 3, "status": 1, "action": "all",
+        "risk_amount": 300.0, "rr_ratio": 2.5, "base_ratio": 30.0,
+        "add_batches": 2, "entry_direction": "pullback", "batch_gap_points": 50.0,
+        "max_total_lot": 0.0, "breakeven_enabled": False, "breakeven_times": 1.0,
+    }
+    rule.update(over)
+    return rule
+
+
+def _risk_runner(sent: list, *, mt5=None, stop_loss=STOP_LOSS,
+                 **rule_over) -> tuple[StrategyRunner, FakeHub, MockMT5Client]:
+    client = mt5 or MockMT5Client()
+    client.prices_map["XAUUSD"] = ENTRY_PRICE
+    hub = FakeHub()
+
+    async def send(payload: dict) -> None:
+        sent.append(payload)
+
+    async def _exec(fn, *args):
+        return fn(*args)
+
+    runner = StrategyRunner(
+        task_id=1, magic=MAGIC, group_id="g1", signal_id="s1",
+        # volume 故意给一个不该被采用的值：模版2 的手数只由风险金额决定
+        entry={"action": "BUY", "symbol": "XAUUSD", "volume": 0.1,
+               "stop_loss": stop_loss},
+        strategy={"name": "BTC以损定量", "template_id": "tpl_2",
+                  "rules": [risk_rule(**rule_over)]},
+        mt5=client, hub=hub, exec_fn=_exec, send_fn=send, report_interval=1.0,
+    )
+    return runner, hub, client
+
+
+def _tick(hub: FakeHub, positions, price: float) -> None:
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(positions), price=price, point=0.01,
+    ))
+
+
+async def test_risk_sized_base_order_ignores_signal_volume():
+    """底仓手数来自「风险金额 ÷ 每手止损亏损」，与信号 volume 无关。"""
+    sent: list = []
+    runner, hub, mt5 = _risk_runner(sent)
+    runner.start()
+    await _settle()
+
+    held = mt5.positions_by_magic(MAGIC)
+    assert len(held) == 1
+    # ask 略高于 2400 -> 总手数 0.98，底仓 30% 取整为 0.29
+    assert held[0]["volume"] == 0.29
+    assert held[0]["volume"] != 0.1
+    assert runner.risk_sized is True
+    runner.cancel()
+
+
+async def test_risk_sized_base_order_carries_stop_and_target():
+    """所有批次共用信号止损；止盈按盈亏比从真实成交价挂出。"""
+    sent: list = []
+    runner, hub, mt5 = _risk_runner(sent)
+    runner.start()
+    await _settle()
+
+    held = mt5.positions_by_magic(MAGIC)[0]
+    assert held["sl"] == STOP_LOSS
+    assert held["tp"] == 2407.5      # 2400 + 3.0 × 2.5
+    runner.cancel()
+
+
+async def test_risk_sized_open_reports_lot_formula():
+    sent: list = []
+    runner, hub, mt5 = _risk_runner(sent)
+    runner.start()
+    await _settle()
+
+    opened = _progress(sent, "open")[0]
+    assert "以损定量" in opened["message"]
+    assert "底仓 30%" in opened["message"]
+    detail = opened["detail"]
+    assert detail["kind"] == "open"
+    assert detail["total_lot"] == 0.98
+    assert detail["risk_amount"] == 300.0
+    assert detail["risk_used"] <= 300.0
+    assert detail["stop_loss"] == STOP_LOSS
+    assert len(detail["batches"]) == 3      # 底仓 + 2 批
+    runner.cancel()
+
+
+async def test_risk_sized_without_stop_loss_fails_fast():
+    """算不出手数就不该下单，直接收口让服务端看到失败原因。"""
+    sent: list = []
+    runner, hub, mt5 = _risk_runner(sent, stop_loss=0.0)
+    runner.start()
+    await _settle()
+
+    assert mt5.positions_by_magic(MAGIC) == []
+    assert not _of_type(sent, "trade_result")
+    errors = _progress(sent, "error")
+    assert errors and "止损价" in errors[0]["message"]
+    finished = _of_type(sent, "strategy_finished")
+    assert finished and finished[0]["status"] == "failed"
+    assert runner.done
+
+
+async def test_risk_sized_stop_on_wrong_side_fails_fast():
+    sent: list = []
+    runner, hub, mt5 = _risk_runner(sent, stop_loss=2403.0)
+    runner.start()
+    await _settle()
+
+    errors = _progress(sent, "error")
+    assert errors and "不利方向" in errors[0]["message"]
+    assert runner.done
+
+
+async def test_risk_sized_adds_batch_when_price_pulls_back():
+    sent: list = []
+    runner, hub, mt5 = _risk_runner(sent)
+    runner.start()
+    await _settle()
+
+    held = mt5.positions_by_magic(MAGIC)
+    _tick(hub, held, 2399.5)      # 回撤 50 点，第 1 批触发价
+    await _settle()
+
+    assert len(mt5.positions_by_magic(MAGIC)) == 2
+    assert runner.add_count == 1
+    add = _progress(sent, "add_trend")[0]
+    assert "补仓" in add["message"] and "回撤补仓" in add["message"]
+    assert add["detail"]["batch_index"] == 1
+    runner.cancel()
+
+
+async def test_risk_sized_batch_shares_the_same_stop_and_target():
+    """补仓单沿用同一组止损止盈，总风险因此保持不变。"""
+    sent: list = []
+    runner, hub, mt5 = _risk_runner(sent)
+    runner.start()
+    await _settle()
+
+    _tick(hub, mt5.positions_by_magic(MAGIC), 2399.5)
+    await _settle()
+
+    added = mt5.positions_by_magic(MAGIC)[-1]
+    assert added["sl"] == STOP_LOSS
+    assert added["tp"] == 2407.5
+    assert added["comment"] == "R3B1"
+    runner.cancel()
+
+
+async def test_risk_sized_does_not_add_before_trigger_price():
+    sent: list = []
+    runner, hub, mt5 = _risk_runner(sent)
+    runner.start()
+    await _settle()
+
+    _tick(hub, mt5.positions_by_magic(MAGIC), 2399.9)   # 还没走到 2399.5
+    await _settle()
+
+    assert len(mt5.positions_by_magic(MAGIC)) == 1
+    assert runner.add_count == 0
+    runner.cancel()
+
+
+async def test_risk_sized_batches_fill_in_order_and_sum_to_total():
+    sent: list = []
+    runner, hub, mt5 = _risk_runner(sent)
+    runner.start()
+    await _settle()
+
+    _tick(hub, mt5.positions_by_magic(MAGIC), 2399.5)
+    await _settle()
+    _tick(hub, mt5.positions_by_magic(MAGIC), 2399.0)
+    await _settle()
+
+    held = mt5.positions_by_magic(MAGIC)
+    assert len(held) == 3
+    assert round(sum(p["volume"] for p in held), 2) == 0.98
+    # 补完最后一批后不再加仓
+    _tick(hub, held, 2398.0)
+    await _settle()
+    assert len(mt5.positions_by_magic(MAGIC)) == 3
+    runner.cancel()
+
+
+async def test_risk_sized_no_batching_puts_everything_in_base():
+    sent: list = []
+    runner, hub, mt5 = _risk_runner(sent, add_batches=0)
+    runner.start()
+    await _settle()
+
+    held = mt5.positions_by_magic(MAGIC)
+    assert len(held) == 1
+    assert held[0]["volume"] == 0.98
+    _tick(hub, held, 2398.0)
+    await _settle()
+    assert len(mt5.positions_by_magic(MAGIC)) == 1
+    runner.cancel()
+
+
+async def test_risk_sized_breakeven_moves_stop_to_average_price():
+    sent: list = []
+    runner, hub, mt5 = _risk_runner(sent, breakeven_enabled=True, breakeven_times=1.0)
+    runner.start()
+    await _settle()
+
+    held = mt5.positions_by_magic(MAGIC)
+    _tick(hub, held, 2403.0)      # 浮盈 300 点 = 止损距离 × 1
+    await _settle()
+
+    moved = _progress(sent, "breakeven")
+    assert moved and "保本触发" in moved[0]["message"]
+    assert mt5.positions_by_magic(MAGIC)[0]["sl"] == ENTRY_PRICE
+    # 保本改单不能顺手抹掉已挂的止盈
+    assert mt5.positions_by_magic(MAGIC)[0]["tp"] == 2407.5
+    runner.cancel()
+
+
+async def test_risk_sized_breakeven_only_triggers_once():
+    sent: list = []
+    runner, hub, mt5 = _risk_runner(sent, breakeven_enabled=True, breakeven_times=1.0)
+    runner.start()
+    await _settle()
+
+    for _ in range(3):
+        _tick(hub, mt5.positions_by_magic(MAGIC), 2404.0)
+        await _settle()
+
+    assert len(_progress(sent, "breakeven")) == 1
+    runner.cancel()
+
+
+async def test_risk_sized_breakeven_waits_for_threshold():
+    sent: list = []
+    runner, hub, mt5 = _risk_runner(sent, breakeven_enabled=True, breakeven_times=1.0)
+    runner.start()
+    await _settle()
+
+    _tick(hub, mt5.positions_by_magic(MAGIC), 2402.0)   # 浮盈 200 点，未达 300
+    await _settle()
+
+    assert not _progress(sent, "breakeven")
+    assert mt5.positions_by_magic(MAGIC)[0]["sl"] == STOP_LOSS
+    runner.cancel()
+
+
+async def test_risk_sized_breakeven_disabled_never_moves_stop():
+    sent: list = []
+    runner, hub, mt5 = _risk_runner(sent, breakeven_enabled=False)
+    runner.start()
+    await _settle()
+
+    _tick(hub, mt5.positions_by_magic(MAGIC), 2450.0)
+    await _settle()
+
+    assert not _progress(sent, "breakeven")
+    assert mt5.positions_by_magic(MAGIC)[0]["sl"] == STOP_LOSS
+    runner.cancel()
+
+
+async def test_risk_sized_resume_rebuilds_plan_from_positions():
+    """恢复后用持仓上的开仓价与止损把建仓计划还原出来，继续补剩余批次。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.prices_map["XAUUSD"] = ENTRY_PRICE
+    mt5.place_market_order("XAUUSD", "BUY", 0.29, STOP_LOSS, 2407.5, "S1", MAGIC)
+
+    runner, hub, mt5 = _risk_runner(sent, mt5=mt5)
+    runner.start(resume=True)
+    await _settle()
+    assert not _of_type(sent, "trade_result")
+
+    _tick(hub, mt5.positions_by_magic(MAGIC), 2399.5)
+    await _settle()
+
+    assert len(mt5.positions_by_magic(MAGIC)) == 2
+    assert runner.add_count == 1
+    runner.cancel()
+
+
+async def test_risk_sized_resume_degrades_when_stop_already_moved():
+    """止损已被保本挪走时无法还原计划，降级为只监控，不再补仓也不再动止损。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.prices_map["XAUUSD"] = ENTRY_PRICE
+    # 止损已挪到开仓价（保本后的状态）
+    mt5.place_market_order("XAUUSD", "BUY", 0.29, ENTRY_PRICE, 2407.5, "S1", MAGIC)
+
+    runner, hub, mt5 = _risk_runner(sent, mt5=mt5, breakeven_enabled=True)
+    runner.start(resume=True)
+    await _settle()
+
+    _tick(hub, mt5.positions_by_magic(MAGIC), 2399.5)
+    await _settle()
+
+    assert len(mt5.positions_by_magic(MAGIC)) == 1
+    assert not _progress(sent, "breakeven")
+    assert not runner.done          # 仍在监控，等持仓归零才收口
+    runner.cancel()
+
+
+async def test_risk_sized_batch_failure_reports_error_and_keeps_running():
+    class BaseOnlyMT5(MockMT5Client):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def place_market_order(self, *a, **kw):
+            self.calls += 1
+            if self.calls == 1:
+                return super().place_market_order(*a, **kw)
+            return {"success": False, "error": "requote"}
+
+    sent: list = []
+    runner, hub, mt5 = _risk_runner(sent, mt5=BaseOnlyMT5())
+    runner.start()
+    await _settle()
+
+    _tick(hub, mt5.positions_by_magic(MAGIC), 2399.5)
+    await _settle()
+
+    errors = _progress(sent, "error")
+    assert errors and "补仓失败" in errors[0]["message"]
+    assert runner.add_count == 0
+    assert not runner.done
+    runner.cancel()
+
+
+async def test_risk_sized_never_evaluates_add_on_rules():
+    """模版2 走独立执行路径，不该触碰加仓判定，也不该读 K 线。"""
+    sent: list = []
+    runner, hub, mt5 = _risk_runner(sent)
+    runner.start()
+    await _settle()
+
+    _tick(hub, mt5.positions_by_magic(MAGIC), 2399.5)
+    await _settle()
+
+    assert hub.metric_calls == []
+    assert not _progress(sent, "add_counter")
+    runner.cancel()
+
+
+async def test_add_on_strategy_is_not_treated_as_risk_sized():
+    """模版1 的执行路径不受新分支影响。"""
+    sent: list = []
+    runner, _ = _runner(sent)
+    assert runner.risk_sized is False

@@ -431,6 +431,89 @@ class MT5Client:
         info = mt5.symbol_info(resolved)
         return float(getattr(info, "point", 0.0) or 0.0) if info else 0.0
 
+    def symbol_spec(self, symbol: str) -> dict:
+        """品种的报价与手数规格，供以损定量反推手数。
+
+        trade_tick_value 是「一手波动一个 tick 的账户货币价值」，配合 trade_tick_size
+        就能把价格距离折算成金额，这是唯一能跨品种通用的换算口径（外汇、金属、指数、
+        加密的合约规格与计价货币各不相同，用 contract_size 自己算需要汇率）。
+        解析不到品种时返回空字典，调用方据此放弃计算。
+        """
+        self.ensure()
+        resolved = self.resolve_symbol(symbol)
+        if not resolved:
+            return {}
+        info = mt5.symbol_info(resolved)
+        if info is None:
+            return {}
+        return {
+            "symbol": resolved,
+            "point": float(getattr(info, "point", 0.0) or 0.0),
+            "digits": int(getattr(info, "digits", 5) or 5),
+            "tick_size": float(getattr(info, "trade_tick_size", 0.0) or 0.0),
+            "tick_value": float(getattr(info, "trade_tick_value", 0.0) or 0.0),
+            "volume_min": float(getattr(info, "volume_min", 0.0) or 0.0),
+            "volume_step": float(getattr(info, "volume_step", 0.0) or 0.0),
+            "volume_max": float(getattr(info, "volume_max", 0.0) or 0.0),
+        }
+
+    def modify_position_sl(self, ticket: int, sl: float,
+                           tp: Optional[float] = None) -> dict:
+        """改单：只动止损止盈，不动手数（TRADE_ACTION_SLTP）。
+
+        tp 传 None 表示沿用持仓上的现值；MT5 的 SLTP 请求会用请求里的值整体覆盖，
+        所以必须把当前止盈一起带上，否则会把已设的止盈抹掉。
+        """
+        self.ensure()
+        target = int(ticket)
+        pos = next((p for p in self.positions() if int(p.get("ticket") or 0) == target), None)
+        if pos is None:
+            return {"success": False, "ticket": target, "error": f"position not found: {target}"}
+        resolved = pos["symbol"]
+        take_profit = float(tp) if tp is not None else float(pos.get("tp") or 0.0)
+        request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "symbol": resolved,
+            "position": target,
+            "sl": float(sl),
+            "tp": take_profit,
+            "magic": int(pos.get("magic") or self.magic),
+        }
+        result = mt5.order_send(request)
+        if result is None:
+            return {"success": False, "ticket": target, "error": str(mt5.last_error())}
+        if result.retcode in (RET_DONE, RET_DONE_PARTIAL):
+            return {
+                "success": True,
+                "ticket": target,
+                "symbol": pos["symbol"],
+                "sl": float(sl),
+                "tp": take_profit,
+                "retcode": result.retcode,
+            }
+        return {
+            "success": False,
+            "ticket": target,
+            "symbol": pos["symbol"],
+            "retcode": result.retcode,
+            "error": result.comment,
+        }
+
+    def modify_sl_by_magic(self, magic: int, sl: float) -> dict:
+        """把某魔术号下全部持仓的止损改到同一价位（保本触发用）。"""
+        results = [
+            self.modify_position_sl(int(p["ticket"]), sl)
+            for p in self.positions_by_magic(magic)
+        ]
+        ok = all(r.get("success") for r in results) if results else False
+        return {
+            "success": ok,
+            "magic": int(magic),
+            "sl": float(sl),
+            "modified": sum(1 for r in results if r.get("success")),
+            "results": results,
+        }
+
     def closed_bars(self, symbol: str, timeframe: str, count: int) -> list[dict]:
         """取最近 count 根**已收盘** K 线，按时间升序返回。
 

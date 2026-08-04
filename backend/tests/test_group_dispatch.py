@@ -30,7 +30,13 @@ from app.orm import (
 )
 from app.parser import TradingSignal
 from app.redis_store import RedisStore
-from app.strategy_templates import TEMPLATE_1_ID, TEMPLATE_1_NAME
+from app.strategy_templates import (
+    RULE_TYPE_RISK_SIZED,
+    TEMPLATE_1_ID,
+    TEMPLATE_1_NAME,
+    TEMPLATE_2_ID,
+    TEMPLATE_2_NAME,
+)
 
 # 分组链路必须真实落库（子任务号由数据库自增，是魔术号的来源），
 # 所以这里不像 test_dispatch.py 那样 mock 掉持久化，只用 conftest 里的 SQLite 测试库。
@@ -95,14 +101,15 @@ async def offline_node(store, *nodes):
 _strategy_seq = iter(range(1, 10_000))
 
 
-async def mk_strategy(store, *, symbol="XAUUSD", name=None, enabled=True, rules=None):
+async def mk_strategy(store, *, symbol="XAUUSD", name=None, enabled=True, rules=None,
+                      template_id=TEMPLATE_1_ID, template_name=TEMPLATE_1_NAME):
     """建一条可绑定的策略（分组必须绑定策略才会参与 strategy 信号分发）。"""
     sid = f"sty_t{next(_strategy_seq)}"
     row = {
         "strategy_id": sid,
         "name": name or f"策略{sid}",
-        "template_id": TEMPLATE_1_ID,
-        "template_name": TEMPLATE_1_NAME,
+        "template_id": template_id,
+        "template_name": template_name,
         "symbol": symbol,
         "enabled": enabled,
         "rules": rules if rules is not None else [],
@@ -114,8 +121,8 @@ async def mk_strategy(store, *, symbol="XAUUSD", name=None, enabled=True, rules=
             TradingStrategy(
                 strategy_id=sid,
                 name=row["name"],
-                template_id=TEMPLATE_1_ID,
-                template_name=TEMPLATE_1_NAME,
+                template_id=template_id,
+                template_name=template_name,
                 symbol=symbol,
                 enabled=enabled,
                 config_json=row["rules"],
@@ -298,6 +305,94 @@ async def test_group_with_other_symbol_strategy_is_skipped(store, monkeypatch):
     assert res["mode"] == "rejected"
     assert "不符" in res["reason"]
     assert sent == []
+
+
+async def mk_risk_sized_group(store, name, node_ids, *, symbol="XAUUSD", **rule_over):
+    """建一个绑定模版2（以损定量趋势单）策略的分组。"""
+    rule = {
+        "type": RULE_TYPE_RISK_SIZED, "status": 1, "action": "all",
+        "risk_amount": 300.0, "rr_ratio": 2.5, "base_ratio": 30.0,
+        "add_batches": 2, "entry_direction": "pullback", "batch_gap_points": 100.0,
+        "max_total_lot": 0.0, "breakeven_enabled": False, "breakeven_times": 1.0,
+    }
+    rule.update(rule_over)
+    strategy = await mk_strategy(
+        store, symbol=symbol, name=f"{name}策略", rules=[rule],
+        template_id=TEMPLATE_2_ID, template_name=TEMPLATE_2_NAME,
+    )
+    return await mk_group(store, name, node_ids, symbol=symbol, strategy=strategy)
+
+
+async def test_risk_sized_signal_with_stop_loss_is_dispatched(store, monkeypatch):
+    """模版2：信号带止损价时正常下发，规则快照随命令一起送到节点。"""
+    await online(store, mk_node("nd_a"))
+    await mk_risk_sized_group(store, "以损定量组", ["nd_a"])
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+
+    res = await GroupDispatcher(store).dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1, stop_loss=2397.0),
+        "sig_risk_ok",
+    )
+
+    assert res["mode"] == "group"
+    assert res["targets"] == 1
+    cmd = sent[0][1]
+    assert cmd["cmd"] == "strategy_start"
+    assert cmd["entry"]["stop_loss"] == 2397.0
+    assert cmd["strategy"]["template_id"] == TEMPLATE_2_ID
+    rule = cmd["strategy"]["rules"][0]
+    assert rule["type"] == RULE_TYPE_RISK_SIZED
+    assert rule["risk_amount"] == 300.0
+    assert rule["rr_ratio"] == 2.5
+
+
+async def test_risk_sized_signal_without_stop_loss_is_rejected(store, monkeypatch):
+    """模版2 的手数靠止损距离反推，没有止损就在分发前挡住，不让节点白跑一趟。"""
+    await online(store, mk_node("nd_a"))
+    await mk_risk_sized_group(store, "缺止损组", ["nd_a"])
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+
+    res = await GroupDispatcher(store).dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_risk_nosl",
+    )
+
+    assert res["mode"] == "rejected"
+    assert "止损价" in res["reason"]
+    assert sent == []
+    assert await fetch_tasks("sig_risk_nosl") == []
+
+
+async def test_add_on_strategy_still_dispatches_without_stop_loss(store, monkeypatch):
+    """模版1 首单手数来自信号，没有止损也照常下发——新准入不能影响它。"""
+    await online(store, mk_node("nd_a"))
+    await mk_group(store, "加仓组", ["nd_a"])
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+
+    res = await GroupDispatcher(store).dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_addon_nosl",
+    )
+
+    assert res["mode"] == "group"
+    assert res["targets"] == 1
+
+
+async def test_risk_sized_group_skipped_only_for_itself(store, monkeypatch):
+    """缺止损时只有模版2 的分组落选，同品种的模版1 分组照常入选。"""
+    await online(store, mk_node("nd_a"), mk_node("nd_b"))
+    await mk_group(store, "混合-加仓组", ["nd_a"])
+    await mk_risk_sized_group(store, "混合-以损定量组", ["nd_b"])
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+
+    res = await GroupDispatcher(store).dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_mixed_nosl",
+    )
+
+    assert res["groups"] == 1
+    assert [s[0] for s in sent] == ["nd_a"]
 
 
 async def test_symbol_match_tolerates_broker_suffix(store, monkeypatch):

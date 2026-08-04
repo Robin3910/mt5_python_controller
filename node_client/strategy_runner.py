@@ -2,9 +2,16 @@
 
 职责：
 1. 收到 strategy_start 后下首单（魔术号 = 服务端下发的任务魔术号）；
-2. 订阅 MarketHub 事件，在持仓构成或价格变化时按策略规则触发逆势 / 顺势加仓；
+2. 订阅 MarketHub 事件，在持仓构成或价格变化时按策略规则推进仓位；
 3. 收到 GONE（已确认该魔术号持仓归零）即上报 strategy_finished，服务端据此收口；
 4. strategy_stop 时平掉该魔术号全部持仓后结束。
+
+按策略快照里的规则走两条互斥的执行路径（由 `risk_sizing.pick_risk_sized_rule` 判定）：
+
+- 加仓路径（模版1）：首单手数用信号手数，之后按逆势 / 顺势规则加仓，判定见
+  `strategy_rules.evaluate`；
+- 以损定量路径（模版2）：手数由「风险金额 ÷ 止损距离」反推，底仓市价成交后按间距
+  分批补齐，可选浮盈达标后移动止损保本，计算见 `risk_sizing`。
 
 执行器自己不读行情与持仓，也没有轮询循环——监控数据由 MarketHub 统一采样后以
 事件送达（见 market_hub.py）；下单与平仓仍由执行器直接调用 MT5。
@@ -19,7 +26,9 @@ import logging
 import time
 from typing import Callable, Optional
 
+import risk_sizing
 from market_hub import GONE, STALE, MarketEvent, MarketHub, Subscription
+from risk_sizing import EntryPlan, RiskSizedConfig, SymbolSpec
 from strategy_rules import (
     CALC_BAR_TYPES,
     MT5_COMMENT_LIMIT,
@@ -89,6 +98,20 @@ class StrategyRunner:
         self._sub: Optional[Subscription] = None
         self._last_report = 0.0
         self._metric_specs: Optional[list[tuple[str, str]]] = None
+
+        # 以损定量路径（模版2）：规则命中即启用，此后不走加仓判定
+        rule = risk_sizing.pick_risk_sized_rule(self.strategy.get("rules"))
+        self._risk_cfg: Optional[RiskSizedConfig] = (
+            RiskSizedConfig.from_rule(rule) if rule else None
+        )
+        self._risk_plan: Optional[EntryPlan] = None
+        self._risk_spec: Optional[SymbolSpec] = None
+        self._breakeven_done = False
+
+    @property
+    def risk_sized(self) -> bool:
+        """本任务是否走以损定量路径。"""
+        return self._risk_cfg is not None
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -170,13 +193,19 @@ class StrategyRunner:
             return False
         if self._seed_pending:
             self._seed_from_positions(positions)
+            if self.risk_sized:
+                await self._risk_rebuild_plan(positions, event.point)
 
-        ctx = self._ctx(event, positions)
-        ctx.bar_metrics = await self._read_bar_metrics()
-        decision = evaluate(self.strategy.get("rules") or [], ctx)
-        if decision is not None:
-            await self._add_position(decision, positions)
-            return False
+        if self.risk_sized:
+            if await self._risk_advance(event, positions):
+                return False
+        else:
+            ctx = self._ctx(event, positions)
+            ctx.bar_metrics = await self._read_bar_metrics()
+            decision = evaluate(self.strategy.get("rules") or [], ctx)
+            if decision is not None:
+                await self._add_position(decision, positions)
+                return False
 
         if time.time() - self._last_report >= self.report_interval:
             await self._emit_progress("heartbeat", phase="running", positions=positions)
@@ -254,7 +283,12 @@ class StrategyRunner:
     # 交易动作
     # ------------------------------------------------------------------
     async def _open_first(self) -> bool:
-        """下首单；失败直接结束子任务（服务端会据此收口）。"""
+        """下首单；失败直接结束子任务（服务端会据此收口）。
+
+        以损定量路径先反推手数，因此首单手数、止盈都与信号自带的值无关。
+        """
+        if self.risk_sized:
+            return await self._risk_open_base()
         res = await self._exec(
             self._mt5.place_market_order,
             self.symbol, self.direction, self.base_volume,
@@ -318,6 +352,237 @@ class StrategyRunner:
             message=reason,
             detail=decision_detail(decision),
         )
+
+    # ------------------------------------------------------------------
+    # 以损定量路径（模版2）
+    # ------------------------------------------------------------------
+    async def _risk_symbol_spec(self) -> SymbolSpec:
+        """读一次品种规格并缓存——任务期内合约规格不会变。"""
+        if self._risk_spec is None:
+            raw = dict(await self._exec(self._mt5.symbol_spec, self.symbol) or {})
+            self._risk_spec = SymbolSpec(
+                point=_as_float(raw.get("point")),
+                digits=int(raw.get("digits") or 5),
+                tick_size=_as_float(raw.get("tick_size")),
+                tick_value=_as_float(raw.get("tick_value")),
+                volume_min=_as_float(raw.get("volume_min")),
+                volume_step=_as_float(raw.get("volume_step")),
+                volume_max=_as_float(raw.get("volume_max")),
+            )
+        return self._risk_spec
+
+    async def _risk_entry_quote(self) -> float:
+        """下底仓前的预估开仓价：多单取 ask、空单取 bid。
+
+        手数必须在下单前算出来，所以只能用当前报价预估；成交后再用真实成交价把
+        止盈与补仓触发价重挂一次（见 risk_sizing.anchor_to_fill）。
+        """
+        quotes = dict(await self._exec(self._mt5.quotes, [self.symbol]) or {})
+        quote = quotes.get(self.symbol) or next(iter(quotes.values()), {})
+        key = "ask" if self.direction == "BUY" else "bid"
+        return _as_float(quote.get(key)) or _as_float(quote.get("mid"))
+
+    async def _risk_open_base(self) -> bool:
+        """以损定量首单：反推总手数后按底仓比例市价成交。"""
+        cfg = self._risk_cfg
+        assert cfg is not None
+        spec = await self._risk_symbol_spec()
+        plan = risk_sizing.plan_entries(
+            cfg,
+            direction=self.direction,
+            entry_price=await self._risk_entry_quote(),
+            stop_loss=_as_float(self.entry.get("stop_loss")),
+            spec=spec,
+        )
+        if not plan.ok:
+            logger.warning("task %s risk sizing rejected: %s", self.task_id, plan.reject)
+            await self._emit_progress(
+                "error", phase="failed",
+                message=f"以损定量无法开仓：{plan.reject}",
+                detail={"kind": "risk_sized_reject", "reason": plan.reject},
+            )
+            await self._finish("failed", f"risk_sizing_rejected: {plan.reject}")
+            return False
+
+        self._risk_plan = plan
+        self.base_volume = plan.base_volume
+        planned_tp = plan.take_profit
+        res = dict(await self._exec(
+            self._mt5.place_market_order,
+            self.symbol, self.direction, plan.base_volume,
+            plan.stop_loss, planned_tp or None,
+            self._open_comment(), self.magic,
+        ) or {})
+        res["signal_id"] = self.signal_id
+        res["task_id"] = self.task_id
+        res["magic"] = self.magic
+        res.setdefault("symbol", self.symbol)
+        await self._send({"type": "trade_result", "data": res})
+
+        if not res.get("success"):
+            logger.warning("task %s base order failed: %s", self.task_id, res.get("error"))
+            return False
+
+        risk_sizing.anchor_to_fill(plan, cfg, _as_float(res.get("price")), spec)
+        await self._risk_fix_base_target(res, plan, planned_tp)
+        self._opened = True
+        self.total_orders += 1
+        self.total_volume += plan.base_volume
+        await self._emit_progress(
+            "open", phase="opened",
+            last_order={
+                "ticket": res.get("order") or res.get("ticket"),
+                "price": res.get("price"),
+                "volume": plan.base_volume,
+            },
+            message=self._risk_describe_open(plan, cfg, spec),
+            detail={
+                **self._open_detail(),
+                **risk_sizing.plan_detail(plan, cfg, spec),
+                "kind": "open",
+            },
+        )
+        return True
+
+    async def _risk_fix_base_target(self, res: dict, plan: EntryPlan,
+                                    planned_tp: float) -> None:
+        """底仓成交后把止盈校正到按真实成交价算出的价位。
+
+        下单时只能用预估价算止盈——带着它下单是为了万一后续改单失败也有保护。滑点会
+        让这个值偏掉，而补仓单用的是重挂后的止盈：不校正的话同一笔交易里会出现两个
+        止盈价，盈亏比也不再是配置值。
+        """
+        if not plan.take_profit or plan.take_profit == planned_tp:
+            return
+        ticket = res.get("order") or res.get("ticket")
+        if not ticket:
+            return
+        fixed = dict(await self._exec(
+            self._mt5.modify_position_sl, int(ticket), plan.stop_loss, plan.take_profit,
+        ) or {})
+        if not fixed.get("success"):
+            logger.warning(
+                "task %s base take-profit not corrected (%s -> %s): %s",
+                self.task_id, planned_tp, plan.take_profit, fixed.get("error"),
+            )
+
+    async def _risk_rebuild_plan(self, positions: list[dict], point: float) -> None:
+        """恢复后按真实持仓重建建仓计划。
+
+        断线时计划已随进程丢失，而持仓上还挂着当初写进 MT5 的止损：用最早一笔的
+        开仓价与止损价就能把计划还原出来。若止损已被保本移动过（不在不利侧），
+        plan_entries 会拒绝重建，此时降级为只监控到全平，不再补仓也不再动止损。
+        """
+        cfg = self._risk_cfg
+        if cfg is None or not positions:
+            return
+        earliest = min(positions, key=lambda p: (p.get("time") or 0, p.get("ticket") or 0))
+        spec = await self._risk_symbol_spec()
+        plan = risk_sizing.plan_entries(
+            cfg,
+            direction=self.direction,
+            entry_price=_as_float(earliest.get("price_open")),
+            stop_loss=_as_float(earliest.get("sl")),
+            spec=spec,
+        )
+        if not plan.ok:
+            logger.info(
+                "task %s resume without risk plan (%s): monitor only",
+                self.task_id, plan.reject,
+            )
+            self._breakeven_done = True
+            return
+        self._risk_plan = plan
+        self.base_volume = plan.base_volume
+
+    async def _risk_advance(self, event: MarketEvent, positions: list[dict]) -> bool:
+        """推进以损定量任务：先补仓，再看保本。返回 True 表示本轮已有动作。"""
+        cfg, plan = self._risk_cfg, self._risk_plan
+        if cfg is None or plan is None or not plan.ok:
+            return False
+        batch = risk_sizing.next_batch(plan, cfg, filled=self.total_orders, price=event.price)
+        if batch is not None:
+            await self._risk_add_batch(batch, plan, cfg, event.price, positions)
+            return True
+        if self._breakeven_done:
+            return False
+        move = risk_sizing.breakeven_move(
+            cfg, plan, positions=positions, price=event.price,
+            digits=(self._risk_spec.digits if self._risk_spec else 5),
+        )
+        if move is not None:
+            await self._risk_move_breakeven(move, positions)
+            return True
+        return False
+
+    async def _risk_add_batch(self, batch, plan: EntryPlan, cfg: RiskSizedConfig,
+                              price: float, positions: list[dict]) -> None:
+        """补进一批仓位；沿用同一组止损止盈，总风险因此保持不变。"""
+        spec = await self._risk_symbol_spec()
+        reason = risk_sizing.describe_batch(plan, cfg, batch, spec, price)
+        res = dict(await self._exec(
+            self._mt5.place_market_order,
+            self.symbol, self.direction, batch.volume,
+            plan.stop_loss, plan.take_profit or None,
+            risk_sizing.batch_comment(batch), self.magic,
+        ) or {})
+        detail = risk_sizing.batch_detail(plan, cfg, batch, spec, price)
+        if not res.get("success"):
+            logger.warning("task %s batch %s failed: %s", self.task_id, batch.index, res.get("error"))
+            await self._emit_progress(
+                "error", phase="running", positions=positions,
+                message=f"补仓失败：{res.get('error') or 'batch order failed'}；{reason}",
+                detail={**detail, "error": str(res.get("error") or "")},
+            )
+            return
+        self.add_count += 1
+        self.total_orders += 1
+        self.total_volume += batch.volume
+        logger.info("task %s batch %s filled: %s", self.task_id, batch.index, reason)
+        await self._emit_progress(
+            "add_trend", phase="running",
+            last_order={
+                "ticket": res.get("order") or res.get("ticket"),
+                "price": res.get("price"),
+                "volume": batch.volume,
+            },
+            message=reason,
+            detail=detail,
+        )
+
+    async def _risk_move_breakeven(self, move, positions: list[dict]) -> None:
+        """浮盈达标：把该魔术号全部持仓的止损挪到加权均价。"""
+        digits = self._risk_spec.digits if self._risk_spec else 5
+        reason = move.describe(digits)
+        res = dict(await self._exec(
+            self._mt5.modify_sl_by_magic, self.magic, move.stop_loss,
+        ) or {})
+        if not res.get("success"):
+            logger.warning("task %s breakeven failed: %s", self.task_id, res)
+            await self._emit_progress(
+                "error", phase="running", positions=positions,
+                message=f"保本止损设置失败；{reason}",
+                detail={**move.detail(), "error": "modify_sl_failed"},
+            )
+            return
+        # 只成功一次即置位：反复改单没有意义，还会把日志和事件流刷满
+        self._breakeven_done = True
+        logger.info("task %s breakeven: %s", self.task_id, reason)
+        await self._emit_progress(
+            "breakeven", phase="running", positions=positions,
+            message=reason,
+            detail={**move.detail(), "modified": res.get("modified")},
+        )
+
+    def _risk_describe_open(self, plan: EntryPlan, cfg: RiskSizedConfig,
+                            spec: SymbolSpec) -> str:
+        """以损定量首单的开单原因：信号来源 + 手数是怎么反推出来的。"""
+        return "；".join([
+            f"策略信号底仓：{self.direction} {self.symbol} "
+            f"{plan.base_volume} 手（托管策略「{self._strategy_name()}」）",
+            risk_sizing.describe_plan(plan, cfg, spec),
+            f"信号 {self.signal_id or '—'}",
+        ])
 
     # ------------------------------------------------------------------
     # 首单的开单原因

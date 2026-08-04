@@ -9,6 +9,7 @@ import { useHubStore } from '@/stores/hub'
 import type {
   BatchCalcType,
   BatchTimeframe,
+  EntryDirection,
   StrategyBatchLevel,
   StrategyOut,
   StrategyRule,
@@ -18,6 +19,11 @@ import { confirmAction } from '@/utils/confirm'
 
 /** ATR / 波幅统计的已收盘 K 线根数，与后端 BATCH_BAR_PERIOD 一致，固定不可配 */
 const BATCH_BAR_PERIOD = 14
+
+/** 规则 type，与后端 strategy_templates 对齐 */
+const RULE_TYPE_COUNTER = 1
+const RULE_TYPE_TREND = 2
+const RULE_TYPE_RISK_SIZED = 3
 
 const hub = useHubStore()
 const router = useRouter()
@@ -55,17 +61,27 @@ onMounted(async () => {
 })
 
 const RULE_TYPE_LABEL: Record<number, string> = {
-  1: '逆势加仓',
-  2: '顺势加仓',
+  [RULE_TYPE_COUNTER]: '逆势加仓',
+  [RULE_TYPE_TREND]: '顺势加仓',
+  [RULE_TYPE_RISK_SIZED]: '以损定量趋势单',
 }
 
 const RULE_TYPE_HELP: Record<number, string> = {
-  1:
+  [RULE_TYPE_COUNTER]:
     '逆势加仓：以监控方向最近一笔订单为基准，价格朝不利方向偏离达到「点数 × Point()」后触发加仓。' +
     '实际手数 = 倍数 × 基础订单手数 + 额外手数。',
-  2:
+  [RULE_TYPE_TREND]:
     '顺势加仓：以监控方向最近一笔订单为基准，价格朝有利方向偏离达到「点数 × Point()」后触发加仓。' +
     '实际手数 = 倍数 × 基础订单手数 + 额外手数。',
+  [RULE_TYPE_RISK_SIZED]:
+    '以损定量趋势单：不使用信号手数，而是按「风险金额 ÷ 止损距离」反推总手数，' +
+    '底仓先市价成交，剩余仓位按间距分批补齐。所有批次共用信号那一个止损价，' +
+    '因此无论补进几批，打到止损的总亏损始终等于风险金额。' +
+    '信号必须携带止损价（sl），否则本策略不参与分发。',
+}
+
+function isRiskSized(rule: { type: number }): boolean {
+  return rule.type === RULE_TYPE_RISK_SIZED
 }
 
 const FIELD_HELP = {
@@ -115,14 +131,49 @@ const FIELD_HELP = {
   batch_timeframe:
     `统计 ATR / 波幅用的 K 线周期，固定取最近 ${BATCH_BAR_PERIOD} 根**已收盘** K 线（不含当前未走完的那根）。` +
     '算出的价格距离会换算成点数，再与实际偏离比较。',
+  risk_amount:
+    '本次交易愿意承担的亏损金额（账户货币，通常是美元）。\n' +
+    '总手数 = 风险金额 ÷ 每手止损亏损，其中每手止损亏损由止损距离与品种合约规格算出。\n' +
+    '手数按品种步长向下取整，因此实际风险只会小于该值，不会超出。',
+  rr_ratio:
+    '盈亏比。止盈距离 = 止损距离 × 该值，止盈价由节点在底仓成交后按真实成交价挂出。\n' +
+    '填 0 表示不设止盈，仅靠止损与人工干预出场。',
+  base_ratio:
+    '底仓占总手数的百分比，底仓以市价立即成交。\n' +
+    '剩余仓位交给下方的补仓批数分批补齐；补仓批数为 0 时底仓即全仓。',
+  add_batches:
+    '剩余仓位分几批补齐。0 表示不分批，总手数一次性由底仓成交。\n' +
+    '若剩余手数不足以让每批都达到品种最小手数，节点会自动减少批数。',
+  entry_direction:
+    '补仓的价格方向：\n' +
+    '回撤补仓 = 价格朝不利方向走时补齐，摊低持仓均价（常规用法）；\n' +
+    '突破加仓 = 价格朝有利方向走时补齐，顺势追势。',
+  batch_gap_points:
+    '相邻批次的触发间距（点），以底仓实际成交价为起点逐批累加。\n' +
+    '回撤补仓的触发价必须留在止损之内、突破加仓必须留在止盈之内，' +
+    '所以间距超出可用区间时节点会自动压缩，避免最远那批永远不成交。',
+  max_total_lot:
+    '总手数硬上限，0 表示不额外限制（仍受品种最大手数约束）。\n' +
+    '被上限截断时实际风险会小于风险金额。',
+  breakeven_enabled:
+    '开启后，浮盈达到「止损距离 × 倍数」时把该任务全部持仓的止损移到持仓加权均价，' +
+    '此后这笔交易最差打平。只会触发一次。',
+  breakeven_times:
+    '保本触发的倍数 N：浮盈价格距离 ≥ 止损距离 × N 时移动止损。\n' +
+    '例如止损距离 300 点、N=1，则浮盈 300 点后止损挪到均价。',
 }
 
-/** 表单内规则：分批字段均已填充，便于直接 v-model 绑定 */
-type EditableRule = StrategyRule & {
-  batch_enabled: boolean
-  batch_action: string
-  batch_count: number
-  total_lot_limit: number
+/** 补仓方向选项，与后端 ENTRY_DIRECTIONS 对齐 */
+const ENTRY_DIRECTION_OPTIONS: Array<{ value: EntryDirection; label: string }> = [
+  { value: 'pullback', label: '回撤补仓' },
+  { value: 'breakout', label: '突破加仓' },
+]
+
+/**
+ * 表单内规则：所有字段都已填充，便于直接 v-model 绑定。
+ * 两组字段（加仓类 / 以损定量）都会补齐，提交后由后端按 type 只保留对应的一组。
+ */
+type EditableRule = Required<Omit<StrategyRule, 'batch_levels'>> & {
   batch_levels: StrategyBatchLevel[]
 }
 
@@ -131,15 +182,24 @@ function cloneRules(rules: StrategyRule[]): EditableRule[] {
     type: r.type,
     status: r.status,
     action: r.action,
-    point: r.point,
-    lot_times: r.lot_times,
-    extra_lot: r.extra_lot,
-    max_allow_num: r.max_allow_num,
+    point: r.point ?? 100,
+    lot_times: r.lot_times ?? 1,
+    extra_lot: r.extra_lot ?? 0,
+    max_allow_num: r.max_allow_num ?? 5,
     batch_enabled: r.batch_enabled ?? false,
     batch_action: r.batch_action ?? 'all',
     batch_count: r.batch_count ?? 0,
     total_lot_limit: r.total_lot_limit ?? 0,
     batch_levels: (r.batch_levels || []).map((lv) => ({ ...lv })),
+    risk_amount: r.risk_amount ?? 300,
+    rr_ratio: r.rr_ratio ?? 2.5,
+    base_ratio: r.base_ratio ?? 30,
+    add_batches: r.add_batches ?? 2,
+    entry_direction: r.entry_direction ?? 'pullback',
+    batch_gap_points: r.batch_gap_points ?? 100,
+    max_total_lot: r.max_total_lot ?? 0,
+    breakeven_enabled: r.breakeven_enabled ?? false,
+    breakeven_times: r.breakeven_times ?? 1,
   }))
 }
 
@@ -304,17 +364,41 @@ function openEdit(s: StrategyOut): void {
   showForm.value = true
 }
 
+/** 以损定量趋势单的参数校验 */
+function validateRiskSized(r: EditableRule, label: string): string | null {
+  if (!(r.risk_amount > 0)) return `${label}：风险金额需大于 0`
+  if (r.rr_ratio < 0) return `${label}：盈亏比不能为负`
+  if (!(r.base_ratio > 0) || r.base_ratio > 100) return `${label}：底仓比例需在 1 ~ 100 之间`
+  if (r.add_batches < 0) return `${label}：补仓批数不能为负`
+  if (!ENTRY_DIRECTION_OPTIONS.some((o) => o.value === r.entry_direction)) {
+    return `${label}：补仓方向非法`
+  }
+  if (r.add_batches > 0 && !(r.batch_gap_points > 0)) {
+    return `${label}：分批补仓需填写大于 0 的批次间距`
+  }
+  if (r.max_total_lot < 0) return `${label}：总手数上限不能为负`
+  if (r.breakeven_enabled && !(r.breakeven_times > 0)) {
+    return `${label}：保本触发倍数需大于 0`
+  }
+  return null
+}
+
 function validateRules(rules: EditableRule[]): string | null {
   if (!rules.length) return '请至少配置一条规则'
   for (const r of rules) {
     const label = RULE_TYPE_LABEL[r.type] || `类型${r.type}`
+    if (!['all', 'buy', 'sell'].includes(String(r.action || '').toLowerCase())) {
+      return `${label}：监控方向非法`
+    }
+    if (isRiskSized(r)) {
+      const err = validateRiskSized(r, label)
+      if (err) return err
+      continue
+    }
     if (r.point < 0) return `${label}：点数不能为负`
     if (r.lot_times < 0) return `${label}：倍数不能为负`
     if (r.extra_lot < 0) return `${label}：手数不能为负`
     if (r.max_allow_num < 0) return `${label}：次数不能为负`
-    if (!['all', 'buy', 'sell'].includes(String(r.action || '').toLowerCase())) {
-      return `${label}：监控方向非法`
-    }
     if (!r.batch_enabled) continue
     if (!['all', 'buy', 'sell'].includes(String(r.batch_action || '').toLowerCase())) {
       return `${label}：分批监控方向非法`
@@ -365,7 +449,7 @@ async function save(): Promise<void> {
     return
   }
   const rulesErr = validateRules(form.rules.map((r) => {
-    if (r.batch_enabled) rebuildBatchLevels(r)
+    if (!isRiskSized(r) && r.batch_enabled) rebuildBatchLevels(r)
     return r
   }))
   if (rulesErr) {
@@ -437,6 +521,10 @@ function ruleSummary(rules: StrategyRule[]): string {
   return enabled
     .map((r) => {
       const label = RULE_TYPE_LABEL[r.type] || `类型${r.type}`
+      if (isRiskSized(r)) {
+        const batches = r.add_batches ?? 0
+        return `${label}（风险 ${r.risk_amount ?? 0} · 盈亏比 ${r.rr_ratio ?? 0}${batches ? ` · 分 ${batches} 批补仓` : ''}）`
+      }
       const levels = r.batch_levels?.length ?? 0
       return r.batch_enabled && levels ? `${label}（分批 ${levels} 档）` : label
     })
@@ -479,6 +567,41 @@ function calcTypeLabel(calcType: BatchCalcType | string | undefined): string {
   return CALC_TYPE_LABEL[key] || String(calcType || '点数')
 }
 
+function entryDirectionLabel(direction: string | undefined): string {
+  return ENTRY_DIRECTION_OPTIONS.find((o) => o.value === direction)?.label || direction || '—'
+}
+
+/** 规则详情的参数行；两种规则类型的字段集合不同，展示由此按 type 分派 */
+function ruleDetailRows(r: StrategyRule): Array<{ k: string; v: string }> {
+  if (isRiskSized(r)) {
+    const batches = r.add_batches ?? 0
+    return [
+      { k: '监控方向', v: actionLabel(r.action) },
+      { k: '风险金额', v: String(r.risk_amount ?? 0) },
+      { k: '盈亏比', v: String(r.rr_ratio ?? 0) },
+      { k: '底仓', v: `${batches ? (r.base_ratio ?? 0) : 100}%` },
+      {
+        k: '分批补仓',
+        v: batches
+          ? `${entryDirectionLabel(r.entry_direction)} ${batches} 批 · 间距 ${r.batch_gap_points ?? 0} 点`
+          : '不分批',
+      },
+      { k: '总手数上限', v: r.max_total_lot ? String(r.max_total_lot) : '不限' },
+      {
+        k: '保本触发',
+        v: r.breakeven_enabled ? `止损距 × ${r.breakeven_times ?? 0} 倍` : '未启用',
+      },
+    ]
+  }
+  return [
+    { k: '监控方向', v: actionLabel(r.action) },
+    { k: '触发点数', v: String(r.point ?? 0) },
+    { k: '倍数', v: String(r.lot_times ?? 0) },
+    { k: '额外手数', v: String(r.extra_lot ?? 0) },
+    { k: '最大加仓次数', v: String(r.max_allow_num ?? 0) },
+  ]
+}
+
 /** 档位间距摘要：按计算方式展示点数 / 价位 / ATR·波幅周期 */
 function levelSpacingText(lv: StrategyBatchLevel): string {
   const kind = (lv.calc_type || 'point') as BatchCalcType
@@ -505,7 +628,7 @@ function resetRuleToTemplate(idx: number): void {
       <div>
         <div class="h1">策略管理</div>
         <p class="muted" style="font-size: 13px; margin-top: 4px">
-          基于策略模版创建实例并绑定品种；选模版后可自定义逆势 / 顺势加仓参数
+          基于策略模版创建实例并绑定品种；模版1 配逆势 / 顺势加仓，模版2 配以损定量趋势单
         </p>
       </div>
       <div class="row" style="gap: 8px">
@@ -563,13 +686,16 @@ function resetRuleToTemplate(idx: number): void {
               <span class="tag" :class="r.status === 1 ? 'green' : ''">{{ r.status === 1 ? '启用' : '关闭' }}</span>
             </div>
             <div class="kv-grid" style="margin-bottom: 8px">
-              <div class="kv"><span class="k">监控方向</span><span class="v">{{ actionLabel(r.action) }}</span></div>
-              <div class="kv"><span class="k">触发点数</span><span class="v">{{ r.point }}</span></div>
-              <div class="kv"><span class="k">倍数</span><span class="v">{{ r.lot_times }}</span></div>
-              <div class="kv"><span class="k">额外手数</span><span class="v">{{ r.extra_lot }}</span></div>
-              <div class="kv"><span class="k">最大加仓次数</span><span class="v">{{ r.max_allow_num }}</span></div>
+              <div v-for="kv in ruleDetailRows(r)" :key="kv.k" class="kv">
+                <span class="k">{{ kv.k }}</span><span class="v">{{ kv.v }}</span>
+              </div>
             </div>
-            <template v-if="r.batch_enabled">
+            <template v-if="isRiskSized(r)">
+              <div class="muted" style="font-size: 12px">
+                手数由风险金额与信号止损价反推，各批共用同一止损
+              </div>
+            </template>
+            <template v-else-if="r.batch_enabled">
               <div class="muted" style="font-size: 12px; margin-bottom: 6px">
                 分批加仓 · 方向 {{ actionLabel(r.batch_action) }} ·
                 {{ r.batch_count ?? 0 }} 批 · 总手数上限 {{ r.total_lot_limit ?? 0 }}
@@ -669,13 +795,16 @@ function resetRuleToTemplate(idx: number): void {
                       </span>
                     </div>
                     <div class="kv-grid" style="margin-bottom: 8px">
-                      <div class="kv"><span class="k">监控方向</span><span class="v">{{ actionLabel(r.action) }}</span></div>
-                      <div class="kv"><span class="k">触发点数</span><span class="v">{{ r.point }}</span></div>
-                      <div class="kv"><span class="k">倍数</span><span class="v">{{ r.lot_times }}</span></div>
-                      <div class="kv"><span class="k">额外手数</span><span class="v">{{ r.extra_lot }}</span></div>
-                      <div class="kv"><span class="k">最大加仓次数</span><span class="v">{{ r.max_allow_num }}</span></div>
+                      <div v-for="kv in ruleDetailRows(r)" :key="kv.k" class="kv">
+                        <span class="k">{{ kv.k }}</span><span class="v">{{ kv.v }}</span>
+                      </div>
                     </div>
-                    <template v-if="r.batch_enabled">
+                    <template v-if="isRiskSized(r)">
+                      <div class="muted" style="font-size: 12px">
+                        手数由风险金额与信号止损价反推，各批共用同一止损；信号必须携带 sl
+                      </div>
+                    </template>
+                    <template v-else-if="r.batch_enabled">
                       <div class="muted" style="font-size: 12px; margin-bottom: 6px">
                         分批加仓 · 方向 {{ actionLabel(r.batch_action) }} ·
                         {{ r.batch_count ?? 0 }} 批 · 总手数上限 {{ r.total_lot_limit ?? 0 }}
@@ -808,6 +937,174 @@ function resetRuleToTemplate(idx: number): void {
                 </div>
               </div>
 
+              <!-- 以损定量趋势单（模版2）：手数由风险金额反推，没有加仓倍数与档位 -->
+              <template v-if="isRiskSized(r)">
+                <div class="rule-grid">
+                  <div class="field">
+                    <FormLabel :field-id="`rule-${idx}-action`" text="监控方向" :help="FIELD_HELP.action" />
+                    <select :id="`rule-${idx}-action`" v-model="r.action">
+                      <option value="all">全部</option>
+                      <option value="buy">多单</option>
+                      <option value="sell">空单</option>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <FormLabel
+                      :field-id="`rule-${idx}-risk-amount`"
+                      text="风险金额"
+                      :help="FIELD_HELP.risk_amount"
+                    />
+                    <input
+                      :id="`rule-${idx}-risk-amount`"
+                      v-model.number="r.risk_amount"
+                      type="number"
+                      min="0"
+                      step="10"
+                    />
+                  </div>
+                  <div class="field">
+                    <FormLabel :field-id="`rule-${idx}-rr`" text="盈亏比" :help="FIELD_HELP.rr_ratio" />
+                    <input
+                      :id="`rule-${idx}-rr`"
+                      v-model.number="r.rr_ratio"
+                      type="number"
+                      min="0"
+                      step="0.1"
+                    />
+                  </div>
+                  <div class="field">
+                    <FormLabel
+                      :field-id="`rule-${idx}-base-ratio`"
+                      text="底仓 %"
+                      :help="FIELD_HELP.base_ratio"
+                    />
+                    <input
+                      :id="`rule-${idx}-base-ratio`"
+                      v-model.number="r.base_ratio"
+                      type="number"
+                      min="1"
+                      max="100"
+                      step="5"
+                      :disabled="!r.add_batches"
+                    />
+                  </div>
+                  <div class="field">
+                    <FormLabel
+                      :field-id="`rule-${idx}-max-total-lot`"
+                      text="总手数上限"
+                      :help="FIELD_HELP.max_total_lot"
+                    />
+                    <input
+                      :id="`rule-${idx}-max-total-lot`"
+                      v-model.number="r.max_total_lot"
+                      type="number"
+                      min="0"
+                      step="0.01"
+                    />
+                  </div>
+                </div>
+                <p class="rule-hint">
+                  总手数 = 风险金额 {{ r.risk_amount }} ÷ 每手止损亏损（由信号止损价与品种规格算出）；
+                  止盈距离 = 止损距离 × {{ r.rr_ratio }}；底仓
+                  {{ r.add_batches ? r.base_ratio : 100 }}% 市价成交
+                </p>
+
+                <div class="batch-block">
+                  <div class="batch-head">
+                    <FormLabel text="分批补仓" :help="FIELD_HELP.add_batches" />
+                    <span v-if="r.add_batches" class="muted batch-count-hint">
+                      剩余 {{ 100 - r.base_ratio }}% 分 {{ r.add_batches }} 批
+                    </span>
+                    <span v-else class="muted batch-count-hint">底仓即全仓</span>
+                  </div>
+                  <div class="batch-top-grid">
+                    <div class="field">
+                      <FormLabel
+                        :field-id="`rule-${idx}-add-batches`"
+                        text="补仓批数"
+                        :help="FIELD_HELP.add_batches"
+                      />
+                      <input
+                        :id="`rule-${idx}-add-batches`"
+                        v-model.number="r.add_batches"
+                        type="number"
+                        min="0"
+                        step="1"
+                      />
+                    </div>
+                    <div class="field">
+                      <FormLabel
+                        :field-id="`rule-${idx}-entry-direction`"
+                        text="补仓方向"
+                        :help="FIELD_HELP.entry_direction"
+                      />
+                      <select
+                        :id="`rule-${idx}-entry-direction`"
+                        v-model="r.entry_direction"
+                        :disabled="!r.add_batches"
+                      >
+                        <option v-for="o in ENTRY_DIRECTION_OPTIONS" :key="o.value" :value="o.value">
+                          {{ o.label }}
+                        </option>
+                      </select>
+                    </div>
+                    <div class="field">
+                      <FormLabel
+                        :field-id="`rule-${idx}-gap-points`"
+                        text="批次间距"
+                        :help="FIELD_HELP.batch_gap_points"
+                      />
+                      <input
+                        :id="`rule-${idx}-gap-points`"
+                        v-model.number="r.batch_gap_points"
+                        type="number"
+                        min="0"
+                        step="10"
+                        :disabled="!r.add_batches"
+                      />
+                    </div>
+                  </div>
+                  <p class="rule-hint">
+                    各批共用信号那一个止损价，所以补进几批都不会改变总风险；
+                    触发价超出止损（回撤）或止盈（突破）区间时，节点会自动压缩间距
+                  </p>
+                </div>
+
+                <div class="batch-block">
+                  <div class="batch-head">
+                    <div class="rule-enable-wrap">
+                      <FormLabel text="保本触发" :help="FIELD_HELP.breakeven_enabled" />
+                      <input
+                        type="checkbox"
+                        :checked="r.breakeven_enabled"
+                        aria-label="启用保本触发"
+                        @change="r.breakeven_enabled = ($event.target as HTMLInputElement).checked"
+                      />
+                    </div>
+                  </div>
+                  <div v-if="r.breakeven_enabled" class="batch-top-grid">
+                    <div class="field">
+                      <FormLabel
+                        :field-id="`rule-${idx}-breakeven-times`"
+                        text="止损距倍数"
+                        :help="FIELD_HELP.breakeven_times"
+                      />
+                      <input
+                        :id="`rule-${idx}-breakeven-times`"
+                        v-model.number="r.breakeven_times"
+                        type="number"
+                        min="0"
+                        step="0.5"
+                      />
+                    </div>
+                  </div>
+                  <p v-if="r.breakeven_enabled" class="rule-hint">
+                    浮盈达到止损距离 × {{ r.breakeven_times }} 倍时，把该任务全部持仓的止损移到加权均价，只触发一次
+                  </p>
+                </div>
+              </template>
+
+              <template v-else>
               <div class="rule-grid">
                 <div class="field">
                   <FormLabel :field-id="`rule-${idx}-action`" text="监控方向" :help="FIELD_HELP.action" />
@@ -997,6 +1294,7 @@ function resetRuleToTemplate(idx: number): void {
                   </p>
                 </template>
               </div>
+              </template>
             </div>
           </div>
 
