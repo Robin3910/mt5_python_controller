@@ -47,7 +47,9 @@ def _validate_dispatch_mode(mode: str | None) -> None:
         )
 
 
-async def _to_group_out(store: RedisStore, d: dict, signal_count: int = 0) -> GroupOut:
+async def _to_group_out(
+    store: RedisStore, d: dict, signal_count: int = 0, active_task_count: int = 0,
+) -> GroupOut:
     """把缓存里的分组 dict 组装成对外的 GroupOut（合并成员节点的在线状态）。"""
     nodes: list[GroupNodeRef] = []
     online = 0
@@ -86,6 +88,7 @@ async def _to_group_out(store: RedisStore, d: dict, signal_count: int = 0) -> Gr
         node_count=len(nodes),
         online_node_count=online,
         signal_count=signal_count,
+        active_task_count=active_task_count,
     )
 
 
@@ -103,7 +106,13 @@ async def list_groups(
     # created_at 只到秒，同秒创建的按名称兜底，避免列表顺序在刷新之间跳动
     groups.sort(key=lambda g: (g.get("created_at", 0), g.get("name") or ""))
     counts = await group_persist.count_by_group()
-    return [await _to_group_out(store, g, counts.get(g["group_id"], 0)) for g in groups]
+    active_counts = await group_persist.count_active_by_group()
+    return [
+        await _to_group_out(
+            store, g, counts.get(g["group_id"], 0), active_counts.get(g["group_id"], 0),
+        )
+        for g in groups
+    ]
 
 
 @router.post("", response_model=GroupOut, status_code=201)
@@ -139,7 +148,10 @@ async def get_group(
     if not d:
         raise HTTPException(status_code=404, detail="group not found")
     counts = await group_persist.count_by_group()
-    return await _to_group_out(store, d, counts.get(group_id, 0))
+    active_counts = await group_persist.count_active_by_group()
+    return await _to_group_out(
+        store, d, counts.get(group_id, 0), active_counts.get(group_id, 0),
+    )
 
 
 @router.get("/{group_id}/signals", response_model=PaginatedGroupSignals)
@@ -147,15 +159,23 @@ async def group_signals(
     group_id: str,
     page: int = 1,
     page_size: int = 20,
+    status: str | None = None,
     store: RedisStore = Depends(get_store),
     _: str = Depends(get_current_admin),
 ):
-    """分组信号明细分页：主任务（信号 + 下发数据）与各节点的处理过程。"""
+    """分组信号明细分页：主任务（信号 + 下发数据）与各节点的处理过程。
+
+    status=active 时仅返回进行中主任务（pending/dispatching/running）。
+    """
+    if status is not None and status != "active":
+        raise HTTPException(status_code=400, detail="status 仅支持 active")
     if not await store.get_group(group_id):
         raise HTTPException(status_code=404, detail="group not found")
     nodes = await store.all_nodes()
     node_names = {n["node_id"]: n.get("name") or n["node_id"] for n in nodes}
-    return await group_persist.recent_group_signals(group_id, page, page_size, node_names)
+    return await group_persist.recent_group_signals(
+        group_id, page, page_size, node_names, status=status,
+    )
 
 
 @router.get(

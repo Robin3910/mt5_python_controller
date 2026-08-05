@@ -124,6 +124,7 @@ def test_create_group_response_shape(client):
     assert g["node_count"] == 1
     assert g["online_node_count"] == 0     # 节点尚未建立 WS 连接
     assert g["signal_count"] == 0
+    assert g["active_task_count"] == 0
     assert g["nodes"][0]["node_id"] == node_id
     assert g["nodes"][0]["name"] == "节点A"
     assert g["nodes"][0]["mt5_login"] == 5101
@@ -682,6 +683,69 @@ def test_strategy_end_to_end_sync(client):
 
     # 分组列表的信号数随之增长
     assert client.get(f"/api/groups/{gid}", headers=h).json()["signal_count"] == 1
+    assert client.get(f"/api/groups/{gid}", headers=h).json()["active_task_count"] == 0
+
+
+def test_active_task_count_and_signals_status_filter(client):
+    """分组列表展示进行中主任务数；signals?status=active 仅返回活跃主任务。"""
+    h = auth_headers(client)
+    token = _node_token(client, h)
+    n1 = _mk_node(client, h, 5271, "进行中节点")
+    gid = _mk_group(client, h, name="进行中计数组", node_ids=[n1])["group_id"]
+
+    listed = client.get("/api/groups", headers=h).json()
+    hit = next(g for g in listed if g["group_id"] == gid)
+    assert hit["active_task_count"] == 0
+    assert hit["signal_count"] == 0
+
+    with client.websocket_connect("/ws/node") as ws1:
+        ws1.send_json({"type": "auth", "data": {"token": token, "mt5_login": 5271}})
+        assert ws1.receive_json()["type"] == "auth_ok"
+
+        client.post("/webhook", json={
+            "action": "buy", "symbol": "XAUUSD", "volume": 0.1, "model": "strategy",
+        })
+        start = ws1.receive_json()
+        assert start["cmd"] == "strategy_start"
+        ws1.send_json({"type": "trade_result", "data": {
+            "signal_id": start["signal_id"], "magic": start["magic"],
+            "symbol": "XAUUSD", "success": True, "order": 91001, "price": 2400.0,
+        }})
+        _wait_task_status(client, h, gid, "running")
+
+        out = client.get(f"/api/groups/{gid}", headers=h).json()
+        assert out["signal_count"] == 1
+        assert out["active_task_count"] == 1
+
+        active = client.get(
+            f"/api/groups/{gid}/signals", params={"status": "active"}, headers=h,
+        ).json()
+        assert active["total"] == 1
+        assert active["items"][0]["status"] == "running"
+
+        all_page = client.get(f"/api/groups/{gid}/signals", headers=h).json()
+        assert all_page["total"] == 1
+
+        bad = client.get(
+            f"/api/groups/{gid}/signals", params={"status": "running"}, headers=h,
+        )
+        assert bad.status_code == 400
+
+        ws1.send_json({"type": "strategy_finished", "data": {
+            "task_id": start["task_id"], "magic": start["magic"],
+            "status": "done", "reason": "positions_cleared",
+            "total_orders": 1, "total_volume": 0.1, "realized_profit": 0.0,
+        }})
+        _wait_task_status(client, h, gid, "done")
+
+    done_out = client.get(f"/api/groups/{gid}", headers=h).json()
+    assert done_out["signal_count"] == 1
+    assert done_out["active_task_count"] == 0
+    active2 = client.get(
+        f"/api/groups/{gid}/signals", params={"status": "active"}, headers=h,
+    ).json()
+    assert active2["total"] == 0
+    assert active2["items"] == []
 
 
 def test_dispatch_events_related_orders(client):

@@ -190,6 +190,7 @@ class GroupOut(BaseModel):
     node_count: int = 0
     online_node_count: int = 0   # 有效节点数（已启用 + 在线）
     signal_count: int = 0        # 该分组已处理的信号主任务数
+    active_task_count: int = 0   # 进行中主任务数（pending/dispatching/running）
 
 
 class GroupTaskDispatchRecord(BaseModel):

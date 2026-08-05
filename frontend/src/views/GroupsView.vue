@@ -546,6 +546,14 @@ async function submitTrigger(): Promise<void> {
 function openSignals(g: GroupOut): void {
   router.push({ name: 'group-signals', params: { id: g.group_id } })
 }
+
+function openActiveSignals(g: GroupOut): void {
+  router.push({
+    name: 'group-signals',
+    params: { id: g.group_id },
+    query: { status: 'active' },
+  })
+}
 </script>
 
 <template>
@@ -612,6 +620,17 @@ function openSignals(g: GroupOut): void {
             <button class="btn-sm btn-ghost" @click="openSignals(g)">{{ g.signal_count }} 条</button>
           </span>
         </div>
+        <div class="list-field">
+          <span class="k">进行中</span>
+          <span class="v">
+            <button
+              v-if="g.active_task_count > 0"
+              class="btn-sm btn-ghost"
+              @click="openActiveSignals(g)"
+            >{{ g.active_task_count }} 条</button>
+            <span v-else class="muted">—</span>
+          </span>
+        </div>
         <div class="list-field"><span class="k">备注</span><span class="v muted" style="font-size: 12px; font-weight: 500">{{ g.remark || '—' }}</span></div>
         <div class="list-card-actions">
           <button class="btn-sm" :class="g.enabled ? 'btn-ghost' : 'btn-danger'" @click="toggleEnabled(g)">
@@ -637,6 +656,7 @@ function openSignals(g: GroupOut): void {
             <th class="right">成员节点</th>
             <th class="right">有效节点</th>
             <th class="right">信号</th>
+            <th class="right">进行中</th>
             <th>备注</th>
             <th>启用</th>
             <th class="right">操作</th>
@@ -661,6 +681,14 @@ function openSignals(g: GroupOut): void {
             <td class="right">
               <button class="btn-sm btn-ghost" @click="openSignals(g)">{{ g.signal_count }} 条</button>
             </td>
+            <td class="right">
+              <button
+                v-if="g.active_task_count > 0"
+                class="btn-sm btn-ghost"
+                @click="openActiveSignals(g)"
+              >{{ g.active_task_count }} 条</button>
+              <span v-else class="muted">—</span>
+            </td>
             <td class="muted" style="font-size: 12px">{{ g.remark || '—' }}</td>
             <td>
               <button class="btn-sm" :class="g.enabled ? 'btn-ghost' : 'btn-danger'" @click="toggleEnabled(g)">
@@ -673,7 +701,7 @@ function openSignals(g: GroupOut): void {
             </td>
           </tr>
           <tr v-if="!hub.groups.length && !loading">
-            <td colspan="9" class="muted" style="padding: 18px">
+            <td colspan="10" class="muted" style="padding: 18px">
               {{ appliedQuery ? '无匹配分组' : '暂无分组，点击右上角「新建分组」开始配置' }}
             </td>
           </tr>

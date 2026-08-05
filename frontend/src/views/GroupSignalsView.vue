@@ -22,6 +22,9 @@ const groupId = computed(() => String(route.params.id))
 const group = ref<GroupOut | null>(null)
 const loadError = ref('')
 
+/** 仅看进行中主任务（URL ?status=active） */
+const activeOnly = computed(() => route.query.status === 'active')
+
 const signals = ref<GroupSignalTaskRecord[]>([])
 const page = ref(1)
 const pageSize = ref(20)
@@ -56,7 +59,12 @@ async function fetchSignalsPage(): Promise<void> {
     total.value = 0
     return
   }
-  const res = await hub.fetchGroupSignals(group.value.group_id, page.value, pageSize.value)
+  const res = await hub.fetchGroupSignals(
+    group.value.group_id,
+    page.value,
+    pageSize.value,
+    activeOnly.value ? 'active' : undefined,
+  )
   signals.value = res.items
   total.value = res.total
   if (res.page !== page.value) page.value = res.page
@@ -127,6 +135,16 @@ async function reload(): Promise<void> {
   expandedEvent.value = {}
   await loadGroup()
   await loadSignals()
+}
+
+function setActiveFilter(onlyActive: boolean): void {
+  const query = { ...route.query }
+  if (onlyActive) {
+    query.status = 'active'
+  } else {
+    delete query.status
+  }
+  router.replace({ name: 'group-signals', params: { id: groupId.value }, query })
 }
 
 function goPage(next: number): void {
@@ -473,6 +491,15 @@ function eventTag(eventType: string): { cls: string; text: string } {
 
 onMounted(reload)
 watch(groupId, reload)
+watch(activeOnly, () => {
+  page.value = 1
+  expanded.value = {}
+  expandedDispatch.value = {}
+  dispatchEvents.value = {}
+  loadingDispatchEvents.value = {}
+  expandedEvent.value = {}
+  void loadSignals()
+})
 
 watch(autoRefresh, (on) => {
   if (on) {
@@ -495,13 +522,27 @@ onUnmounted(stopAutoRefresh)
         <div class="h1">分组信号{{ group ? ` · ${group.name}` : '' }}</div>
         <p class="muted" style="font-size: 13px; margin-top: 4px">
           <template v-if="group">
-            共 {{ total }} 条主任务 · 点击行展开信号明细与各节点处理过程
+            {{ activeOnly ? '进行中' : '全部' }}共 {{ total }} 条主任务 · 点击行展开信号明细与各节点处理过程
           </template>
           <template v-else-if="loadError">{{ loadError }}</template>
           <template v-else>加载中…</template>
         </p>
       </div>
       <div class="row signals-actions">
+        <div class="row" style="gap: 4px">
+          <button
+            class="btn-sm"
+            :class="activeOnly ? 'btn-ghost' : 'btn-primary'"
+            :disabled="!group"
+            @click="setActiveFilter(false)"
+          >全部</button>
+          <button
+            class="btn-sm"
+            :class="activeOnly ? 'btn-primary' : 'btn-ghost'"
+            :disabled="!group"
+            @click="setActiveFilter(true)"
+          >仅进行中</button>
+        </div>
         <label class="row muted auto-refresh-toggle" title="开启后每秒刷新主任务与已展开节点的关联订单">
           <input v-model="autoRefresh" type="checkbox" :disabled="!group" />
           <span>自动刷新</span>

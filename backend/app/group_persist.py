@@ -915,25 +915,32 @@ def _task_row(t: GroupSignalTask, dispatches: list[dict]) -> dict:
 async def recent_group_signals(
     group_id: str, page: int = 1, page_size: int = 20,
     node_names: Optional[dict[str, str]] = None,
+    status: Optional[str] = None,
 ) -> dict:
-    """分页读取某分组的信号主任务（含各节点处理明细）。"""
+    """分页读取某分组的信号主任务（含各节点处理明细）。
+
+    status=\"active\" 时仅返回进行中主任务（pending/dispatching/running）。
+    """
     page = max(1, page)
     page_size = max(1, min(page_size, 100))
     offset = (page - 1) * page_size
     names = node_names or {}
+    filters = [GroupSignalTask.group_id == group_id]
+    if status == "active":
+        filters.append(GroupSignalTask.status.in_(group_rules.TASK_ACTIVE))
     try:
         async with SessionLocal() as s:
             total = (
                 await s.execute(
                     select(func.count())
                     .select_from(GroupSignalTask)
-                    .where(GroupSignalTask.group_id == group_id)
+                    .where(*filters)
                 )
             ).scalar_one()
             rows = (
                 await s.execute(
                     select(GroupSignalTask)
-                    .where(GroupSignalTask.group_id == group_id)
+                    .where(*filters)
                     .order_by(GroupSignalTask.task_id.desc())
                     .offset(offset)
                     .limit(page_size)
@@ -979,6 +986,23 @@ async def count_by_group() -> dict[str, int]:
             return {gid: int(cnt) for gid, cnt in rows}
     except Exception as e:  # noqa: BLE001
         logger.warning("count_by_group failed: %s", e)
+        return {}
+
+
+async def count_active_by_group() -> dict[str, int]:
+    """各分组进行中的主任务数（pending/dispatching/running）。"""
+    try:
+        async with SessionLocal() as s:
+            rows = (
+                await s.execute(
+                    select(GroupSignalTask.group_id, func.count())
+                    .where(GroupSignalTask.status.in_(group_rules.TASK_ACTIVE))
+                    .group_by(GroupSignalTask.group_id)
+                )
+            ).all()
+            return {gid: int(cnt) for gid, cnt in rows}
+    except Exception as e:  # noqa: BLE001
+        logger.warning("count_active_by_group failed: %s", e)
         return {}
 
 

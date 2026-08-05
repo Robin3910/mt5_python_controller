@@ -204,12 +204,13 @@ export const useHubStore = defineStore('hub', {
       id: string,
       page = 1,
       pageSize = 20,
+      status?: string,
     ): Promise<PaginatedGroupSignals> {
       try {
+        const params: Record<string, string | number> = { page, page_size: pageSize }
+        if (status) params.status = status
         return (
-          await api.get(`/api/groups/${id}/signals`, {
-            params: { page, page_size: pageSize },
-          })
+          await api.get(`/api/groups/${id}/signals`, { params })
         ).data
       } catch {
         return { items: [], total: 0, page, page_size: pageSize }

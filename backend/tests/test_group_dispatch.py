@@ -1608,3 +1608,14 @@ async def test_count_by_group(store, monkeypatch):
     counts = await group_persist.count_by_group()
     assert counts[g1["group_id"]] == 2
     assert counts[g2["group_id"]] == 2
+
+    active = await group_persist.count_active_by_group()
+    # sig_n1 已收口，sig_n2 仍在进行中
+    assert active[g1["group_id"]] == 1
+    assert active[g2["group_id"]] == 1
+
+    page_active = await group_persist.recent_group_signals(
+        g1["group_id"], status="active",
+    )
+    assert page_active["total"] == 1
+    assert page_active["items"][0]["signal_id"] == "sig_n2"

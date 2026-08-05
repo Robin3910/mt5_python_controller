@@ -270,6 +270,8 @@ export interface GroupOut {
   online_node_count: number
   /** 该分组已处理的信号主任务数 */
   signal_count: number
+  /** 进行中主任务数（pending/dispatching/running） */
+  active_task_count: number
 }
 
 export interface GroupCreatePayload {
