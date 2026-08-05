@@ -313,6 +313,49 @@ def test_template_ids_not_supported_in_text_mode():
     assert parser.parse("buy EURUSD tpl_1").template_ids == []
 
 
+# ---------------------------- group_ids（分组定向）----------------------------
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (["grp_1", "grp_2"], ["grp_1", "grp_2"]),
+        ("grp_1", ["grp_1"]),                        # 单个字符串
+        ("grp_1,grp_3", ["grp_1", "grp_3"]),         # 逗号分隔
+        (" GRP_1 , grp_2 ", ["grp_1", "grp_2"]),     # 去空白 + 转小写
+        (["grp_1", "grp_1", "", None], ["grp_1"]),   # 去重并丢弃空值
+        ([], []),
+        ("", []),
+        (None, []),
+    ],
+)
+def test_group_ids_normalization(value, expected):
+    sig = parser.parse({"action": "buy", "symbol": "EURUSD", "group_ids": value})
+    assert sig.group_ids == expected
+
+
+@pytest.mark.parametrize("field", ["group_ids", "groupids", "group_id", "groupid"])
+def test_group_ids_field_aliases(field):
+    sig = parser.parse({"action": "buy", "symbol": "EURUSD", field: ["grp_2"]})
+    assert sig.group_ids == ["grp_2"]
+
+
+def test_group_ids_default_empty():
+    assert parser.parse({"action": "buy", "symbol": "EURUSD"}).group_ids == []
+
+
+def test_group_ids_not_supported_in_text_mode():
+    """纯文本告警没有承载 group_ids 的位置，一律为空（不限制分组）。"""
+    assert parser.parse("buy EURUSD grp_1").group_ids == []
+
+
+def test_two_targeting_fields_are_independent():
+    sig = parser.parse({
+        "action": "buy", "symbol": "EURUSD",
+        "template_ids": ["tpl_1"], "group_ids": ["grp_9"],
+    })
+    assert sig.template_ids == ["tpl_1"]
+    assert sig.group_ids == ["grp_9"]
+
+
 # ---------------------------- 纯文本（格式二）----------------------------
 def test_text_action_symbol_either_order():
     assert parser.parse("buy EURUSD").action == "BUY"

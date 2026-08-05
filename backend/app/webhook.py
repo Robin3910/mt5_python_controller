@@ -7,8 +7,9 @@ model 字段（可选，枚举 normal / strategy）决定走哪条分发链路�
 - 缺失 / 空 / normal：按币种分发（Dispatcher，项目原有默认行为）；
 - strategy：按分组分发（GroupDispatcher，规则与 normal 链路完全隔离）。
 
-template_ids 字段（可选，策略模版 ID 数组）给 strategy 信号再加一层定向：只有绑定了
-其中某个模版的分组才接收本信号；缺省或空数组表示不限制。
+strategy 信号还可带两个定向字段（缺省或空数组表示不限制，同时给出时取交集）：
+- template_ids：只有绑定了其中某个策略模版的分组才接收；
+- group_ids：只有 ID 在其中的分组才接收。
 """
 import json
 import logging
@@ -76,19 +77,23 @@ def _resolve_model(data) -> str:
     return model
 
 
-def _validate_template_ids(signal: TradingSignal, model: str) -> None:
-    """校验策略模版定向字段：只在 strategy 链路可用，且必须是已登记的模版。
+def _validate_targeting(signal: TradingSignal, model: str) -> None:
+    """校验定向字段（template_ids / group_ids）：只在 strategy 链路可用。
 
-    带了 template_ids 却没写 model=strategy，几乎都是漏配：此时按 normal 链路广播
-    下单会产生调用方并不期望的交易，因此直接拒收，而不是默默忽略这个字段。
+    带了定向字段却没写 model=strategy，几乎都是漏配：此时按 normal 链路广播下单会
+    产生调用方并不期望的交易，因此直接拒收，而不是默默忽略这些字段。
+
+    模版是代码里的封闭注册表，写错的 ID 一律拒收；分组是可随时增删的业务数据，
+    点名了不存在的分组只在分发时记为落选（响应仍是 200 + rejected），不在这里拦。
     """
-    if not signal.template_ids:
-        return
-    if model != SIGNAL_MODEL_STRATEGY:
-        raise HTTPException(
-            status_code=400,
-            detail=f"template_ids 仅适用于 model={SIGNAL_MODEL_STRATEGY} 的信号",
-        )
+    for field_name, values in (
+        ("template_ids", signal.template_ids), ("group_ids", signal.group_ids),
+    ):
+        if values and model != SIGNAL_MODEL_STRATEGY:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{field_name} 仅适用于 model={SIGNAL_MODEL_STRATEGY} 的信号",
+            )
     unknown = group_rules.unknown_template_ids(signal.template_ids)
     if unknown:
         raise HTTPException(
@@ -129,13 +134,14 @@ async def process_signal(
     if not ok:
         raise HTTPException(status_code=400, detail=f"invalid signal: {err}")
 
-    _validate_template_ids(signal, model)
+    _validate_targeting(signal, model)
 
     # 9.7 幂等：在 DEDUP_WINDOW 秒内，相同(处理模型/动作/品种/手数/止盈止损)的信号视为重复；
-    # 指纹带上 model 与模版定向，避免面向不同分组的信号互相误判为重复。
+    # 指纹带上 model 与两个定向字段，避免面向不同分组的信号互相误判为重复。
     fp = (
         f"{model}:{signal.action}:{signal.symbol}:{signal.volume}"
-        f":{signal.stop_loss}:{signal.take_profit}:{','.join(signal.template_ids)}"
+        f":{signal.stop_loss}:{signal.take_profit}"
+        f":{','.join(signal.template_ids)}:{','.join(signal.group_ids)}"
     )
     if await store.seen_signal(fp):
         logger.info("duplicate signal suppressed: %s", fp)

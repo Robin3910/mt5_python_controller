@@ -8,7 +8,7 @@
 import time
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from . import group_service
 from .db import SessionLocal
@@ -79,8 +79,15 @@ def default_node_filters_from_global(global_filters: dict) -> dict:
     return out
 
 
-def _default_name(mt5_login: int) -> str:
-    return f"node-{mt5_login}"
+def _default_name(seq: int, mt5_login: int) -> str:
+    """默认显示名：`{序号}-{mt5_login}`，序号按节点位置从 1 起递增。"""
+    return f"{seq}-{mt5_login}"
+
+
+async def _next_node_seq(session) -> int:
+    """下一节点序号 = 当前节点数 + 1（列表按创建顺序，新节点位于末尾）。"""
+    count = (await session.execute(select(func.count()).select_from(Node))).scalar_one()
+    return int(count) + 1
 
 
 async def find_by_mt5_login(mt5_login: int) -> Optional[dict]:
@@ -105,9 +112,12 @@ async def create_node(
         )
         if err:
             raise ValueError(err)
-    name = (payload.name or "").strip() or _default_name(payload.mt5_login)
+    explicit_name = (payload.name or "").strip()
     node_id = make_node_id()
     async with SessionLocal() as s:
+        name = explicit_name or _default_name(
+            await _next_node_seq(s), payload.mt5_login,
+        )
         row = Node(
             node_id=node_id,
             name=name,
@@ -139,7 +149,7 @@ async def auto_register(store: RedisStore, mt5_login: int) -> dict:
     global_filters = await store.get_filters()
     filters = default_node_filters_from_global(global_filters)
     payload = NodeCreate(
-        name=_default_name(mt5_login),
+        name=None,  # 留空由 create_node 按「序号-mt5_login」生成
         mt5_login=mt5_login,
         filters=filters or None,
     )

@@ -191,7 +191,7 @@ export interface NodeTokenInfo {
 }
 
 export interface NodeCreatePayload {
-  // 留空时后端会自动生成 "node-{mt5_login}"
+  // 留空时后端会自动生成 "{序号}-{mt5_login}"（序号从 1 起按节点位置递增）
   name?: string
   mt5_login: number
   filters?: NodeDispatchFiltersConfig | null
@@ -233,6 +233,8 @@ export interface ManualSignalPayload {
   comment?: string
   /** 策略模版定向（仅 strategy 模型）：只发给绑定了这些模版的分组；省略或空数组 = 不限制 */
   template_ids?: string[]
+  /** 分组定向（仅 strategy 模型）：只发给 ID 在列表内的分组；省略或空数组 = 不限制 */
+  group_ids?: string[]
 }
 
 /** Webhook model 字段：normal = 按币种分发（默认），strategy = 按分组分发 */

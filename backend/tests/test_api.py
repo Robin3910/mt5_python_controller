@@ -306,6 +306,29 @@ def test_default_node_filters_from_global():
     assert default_node_filters_from_global({}) == {}
 
 
+def test_create_node_default_name_uses_seq_and_mt5_login(client):
+    """名称留空时按「序号-mt5_login」生成，序号从 1 起随节点位置递增。"""
+    h = _auth(client)
+
+    r1 = client.post("/api/nodes", json={"mt5_login": 8101}, headers=h)
+    assert r1.status_code == 201, r1.text
+    assert r1.json()["name"] == "1-8101"
+
+    r2 = client.post("/api/nodes", json={"name": "  ", "mt5_login": 8102}, headers=h)
+    assert r2.status_code == 201, r2.text
+    assert r2.json()["name"] == "2-8102"
+
+    r3 = client.post(
+        "/api/nodes", json={"name": "custom", "mt5_login": 8103}, headers=h,
+    )
+    assert r3.status_code == 201, r3.text
+    assert r3.json()["name"] == "custom"
+
+    r4 = client.post("/api/nodes", json={"mt5_login": 8104}, headers=h)
+    assert r4.status_code == 201, r4.text
+    assert r4.json()["name"] == "4-8104"
+
+
 def test_auto_register_on_first_login(client):
     """node_client 用未注册的 mt5_login 登录时，后端按默认配置自动入库（默认禁用）。"""
     h = seed_default_filters(client)
@@ -325,7 +348,7 @@ def test_auto_register_on_first_login(client):
     # 自动注册的节点应使用默认配置，并按中控台已有品种生成按币种配置
     r = client.get("/api/nodes", headers=h)
     created = next(n for n in r.json() if n["mt5_login"] == 8001)
-    assert created["name"] == "node-8001"
+    assert created["name"] == f"{len(nodes_before) + 1}-8001"
     assert created["enabled"] is False
     filters = created.get("filters") or {}
     assert set(filters.keys()) == {"EURUSD", "XAUUSD", "GBPUSD"}

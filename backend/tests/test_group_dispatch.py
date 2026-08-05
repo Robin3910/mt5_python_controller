@@ -717,6 +717,149 @@ async def test_close_signal_only_stops_targeted_templates(store, monkeypatch):
     assert sent[0][1]["cmd"] == "strategy_stop"
 
 
+# ------------------------ 分组定向（group_ids）------------------------
+async def test_group_ids_only_dispatches_to_named_groups(store, monkeypatch):
+    """信号带 group_ids 时，只有被点名的分组接收。"""
+    await online(store, mk_node("nd_a"), mk_node("nd_b"), mk_node("nd_c"))
+    await mk_group(store, "甲组", ["nd_a"])
+    lucky = await mk_group(store, "乙组", ["nd_b"])
+    await mk_group(store, "丙组", ["nd_c"])
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+
+    res = await GroupDispatcher(store).dispatch(
+        TradingSignal(
+            action="BUY", symbol="XAUUSD", volume=0.1, group_ids=[lucky["group_id"]],
+        ),
+        "sig_grp_pick",
+    )
+
+    assert res["mode"] == "group"
+    assert res["groups"] == 1
+    assert [s[0] for s in sent] == ["nd_b"]
+    assert [t.group_name for t in await fetch_tasks("sig_grp_pick")] == ["乙组"]
+
+
+async def test_empty_group_ids_keeps_all_groups(store, monkeypatch):
+    """不带 group_ids（或空数组）时行为不变：所有匹配分组照常接收。"""
+    await online(store, mk_node("nd_a"), mk_node("nd_b"))
+    await mk_group(store, "甲组", ["nd_a"])
+    await mk_group(store, "乙组", ["nd_b"])
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+
+    res = await GroupDispatcher(store).dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1, group_ids=[]),
+        "sig_grp_all",
+    )
+
+    assert res["groups"] == 2
+    assert {s[0] for s in sent} == {"nd_a", "nd_b"}
+
+
+async def test_group_ids_and_template_ids_are_intersected(store, monkeypatch):
+    """两个定向字段是「与」：点名的分组还必须命中模版定向。"""
+    await online(store, mk_node("nd_1"), mk_node("nd_3"))
+    plain = await mk_group(store, "模版一组", ["nd_1"])
+    grid = await mk_grid_group(store, "模版三组", ["nd_3"])
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+
+    res = await GroupDispatcher(store).dispatch(
+        TradingSignal(
+            action="BUY", symbol="XAUUSD", volume=0.1,
+            group_ids=[plain["group_id"], grid["group_id"]],
+            template_ids=[TEMPLATE_3_ID],
+        ),
+        "sig_grp_tpl",
+    )
+
+    assert res["groups"] == 1
+    assert [s[0] for s in sent] == ["nd_3"]
+
+
+async def test_unknown_group_id_is_named_in_reason(store, monkeypatch):
+    """点名了不存在的分组：整条信号拒收，原因里点出是哪个 ID。"""
+    await online(store, mk_node("nd_a"))
+    await mk_group(store, "甲组", ["nd_a"])
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+
+    res = await GroupDispatcher(store).dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1, group_ids=["grp_none"]),
+        "sig_grp_miss",
+    )
+
+    assert res["mode"] == "rejected"
+    assert "指定的分组不存在：grp_none" in res["reason"]
+    assert sent == []
+    assert await fetch_tasks("sig_grp_miss") == []
+
+
+async def test_targeted_disabled_group_is_explained(store, monkeypatch):
+    """点名了已禁用的分组：不能只回一句「无匹配分组」，要说清是被禁用了。"""
+    await online(store, mk_node("nd_a"))
+    group = await mk_group(store, "停用组", ["nd_a"], enabled=False)
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+
+    res = await GroupDispatcher(store).dispatch(
+        TradingSignal(
+            action="BUY", symbol="XAUUSD", volume=0.1, group_ids=[group["group_id"]],
+        ),
+        "sig_grp_disabled",
+    )
+
+    assert res["mode"] == "rejected"
+    assert "停用组：分组已禁用" in res["reason"]
+    assert sent == []
+
+
+async def test_untargeted_groups_stay_out_of_reason(store, monkeypatch):
+    """落选说明只讲被点名的分组，否则一条定向信号会带回一堆无关原因。"""
+    await online(store, mk_node("nd_a"), mk_node("nd_b"))
+    await mk_group(store, "黄金组", ["nd_a"], symbol="XAUUSD")
+    euro = await mk_group(store, "欧美组", ["nd_b"], symbol="EURUSD")
+    monkeypatch.setattr(manager, "send_to_node", capture_sender([]))
+
+    res = await GroupDispatcher(store).dispatch(
+        TradingSignal(
+            action="BUY", symbol="XAUUSD", volume=0.1, group_ids=[euro["group_id"]],
+        ),
+        "sig_grp_quiet",
+    )
+
+    assert res["mode"] == "rejected"
+    assert "欧美组" in res["reason"] and "不符" in res["reason"]
+    assert "黄金组" not in res["reason"]
+
+
+async def test_close_signal_only_stops_named_groups(store, monkeypatch):
+    """CLOSE 同样受分组定向约束：只终止被点名分组里的任务。"""
+    await online(store, mk_node("nd_a"), mk_node("nd_b"))
+    await mk_group(store, "甲组", ["nd_a"])
+    target = await mk_group(store, "乙组", ["nd_b"])
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    d = GroupDispatcher(store)
+
+    await d.dispatch(TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_grp_open")
+    for task in await fetch_tasks("sig_grp_open"):
+        await open_first_orders(task.task_id, [r.node_id for r in await fetch_dispatches(task.task_id)])
+    sent.clear()
+
+    res = await d.dispatch(
+        TradingSignal(
+            action="CLOSE", symbol="XAUUSD", volume=0.1, group_ids=[target["group_id"]],
+        ),
+        "sig_grp_close",
+    )
+
+    assert res["mode"] == "group_close"
+    assert [s[0] for s in sent] == ["nd_b"]
+    assert sent[0][1]["cmd"] == "strategy_stop"
+
+
 # =====================================================================
 # 2. 有效节点 = 已启用 + 在线
 # =====================================================================

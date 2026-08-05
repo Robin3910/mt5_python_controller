@@ -1,6 +1,6 @@
 """分组纯规则单元测试（无 I/O）——与 test_rules.py（normal 链路）配套。
 
-锁定 strategy 链路的判定口径：model 字段规范化、策略模版定向、分组分发模式、
+锁定 strategy 链路的判定口径：model 字段规范化、模版与分组两种定向、分组分发模式、
 有效节点、组内轮转对齐、主任务号 <-> 魔术号换算、主任务状态汇总。
 """
 import pytest
@@ -68,6 +68,30 @@ def test_unknown_template_ids_lists_only_unregistered():
 @pytest.mark.parametrize("template_ids", [None, [], [TEMPLATE_1_ID, TEMPLATE_2_ID]])
 def test_unknown_template_ids_empty_for_known(template_ids):
     assert group_rules.unknown_template_ids(template_ids) == []
+
+
+# =====================================================================
+# group_ids（分组定向）
+# =====================================================================
+@pytest.mark.parametrize("group_ids", [None, [], ["grp_a"], ["grp_b", "grp_a"]])
+def test_group_targeted_when_unrestricted_or_hit(group_ids):
+    """缺省 / 空数组 = 不限制；ID 命中数组同样放行。"""
+    assert group_rules.group_targeted({"group_id": "grp_a"}, group_ids) is True
+
+
+def test_group_targeted_excludes_others():
+    assert group_rules.group_targeted({"group_id": "grp_a"}, ["grp_b"]) is False
+    assert group_rules.group_targeted({}, ["grp_b"]) is False
+
+
+def test_missing_group_ids_lists_only_absent():
+    groups = [{"group_id": "grp_a"}, {"group_id": "grp_b"}]
+    assert group_rules.missing_group_ids(groups, ["grp_a", "grp_x"]) == ["grp_x"]
+
+
+@pytest.mark.parametrize("group_ids", [None, [], ["grp_a"]])
+def test_missing_group_ids_empty_when_all_known(group_ids):
+    assert group_rules.missing_group_ids([{"group_id": "grp_a"}], group_ids) == []
 
 
 # =====================================================================

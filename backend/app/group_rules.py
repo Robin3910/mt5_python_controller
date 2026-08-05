@@ -59,6 +59,21 @@ def template_reject_reason(
     return f"策略模版 {label} 不在信号指定的 template_ids（{'、'.join(template_ids)}）内"
 
 
+def group_targeted(group: dict, group_ids: Optional[list[str]]) -> bool:
+    """分组定向：信号是否点名了这个分组；group_ids 为空表示不限制（全部视为被点名）。"""
+    if not group_ids:
+        return True
+    return str(group.get("group_id") or "").strip().lower() in group_ids
+
+
+def missing_group_ids(groups: list[dict], group_ids: Optional[list[str]]) -> list[str]:
+    """信号点名了、但当前并不存在的分组 ID，供落选说明指出是哪几个写错或已删除。"""
+    if not group_ids:
+        return []
+    known = {str(g.get("group_id") or "").strip().lower() for g in groups}
+    return [gid for gid in group_ids if gid not in known]
+
+
 def normalize_dispatch_mode(value: object) -> str:
     """规范化分组分发模式；非法值回落到 sync。"""
     mode = str(value or "").strip().lower()

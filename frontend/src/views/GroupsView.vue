@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // 分组管理页：strategy 信号（Webhook model=strategy）的分发单元
 // 新建/编辑/删除分组、启停、维护成员节点、设置分组级分发模式；信号明细见 GroupSignalsView
-import { computed, onMounted, ref, reactive } from 'vue'
+import { computed, onMounted, ref, reactive, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
@@ -301,6 +301,9 @@ const TRIGGER_HELP = {
   template_ids:
     '策略模版定向（信号的 template_ids 字段）：勾选后，只有绑定了这些模版的分组才会收到本信号，' +
     '在品种匹配之上再加一层筛选。一个都不勾表示不限制模版。',
+  group_ids:
+    '分组定向（信号的 group_ids 字段）：勾选后，只有勾中的分组会收到本信号。' +
+    '一个都不勾表示下面列出的分组全部收到。',
 }
 
 const triggerForm = reactive({
@@ -311,6 +314,7 @@ const triggerForm = reactive({
   take_profit: null as number | null,
   comment: '',
   template_ids: [] as string[],
+  group_ids: [] as string[],
 })
 
 const isCloseAction = computed(() => triggerForm.action === 'CLOSE')
@@ -364,8 +368,8 @@ function toggleTriggerTemplate(templateId: string, checked: boolean): void {
   triggerForm.template_ids = checked ? [...kept, templateId] : kept
 }
 
-/** 命中分组预览：与后端 GroupDispatcher._candidate_groups 的入选条件同口径 */
-const matchedGroups = computed<GroupOut[]>(() => {
+/** 候选分组：与后端 GroupDispatcher._candidate_groups 的入选条件同口径（尚未按分组定向收窄） */
+const candidateGroups = computed<GroupOut[]>(() => {
   const symbol = triggerForm.symbol.trim()
   if (!symbol) return []
   const templates = triggerForm.template_ids
@@ -375,6 +379,27 @@ const matchedGroups = computed<GroupOut[]>(() => {
     if (!sty || !sty.enabled || !symbolMatch(sty.symbol, symbol)) return false
     return !templates.length || templates.includes(sty.template_id)
   })
+})
+
+/** 实际命中分组：候选分组再按分组定向收窄；一个都没勾表示候选分组全收 */
+const matchedGroups = computed<GroupOut[]>(() => {
+  const picked = triggerForm.group_ids
+  if (!picked.length) return candidateGroups.value
+  return candidateGroups.value.filter((g) => picked.includes(g.group_id))
+})
+
+function toggleTriggerGroup(groupId: string, checked: boolean): void {
+  const kept = triggerForm.group_ids.filter((id) => id !== groupId)
+  triggerForm.group_ids = checked ? [...kept, groupId] : kept
+}
+
+// 改品种 / 改模版定向会换掉候选分组，勾选里的失效 ID 必须同步剔除，
+// 否则提交时带着一批已不在候选内的 ID，后端会把整条信号判成无匹配分组。
+watch(candidateGroups, (list) => {
+  if (!triggerForm.group_ids.length) return
+  const ids = new Set(list.map((g) => g.group_id))
+  const kept = triggerForm.group_ids.filter((id) => ids.has(id))
+  if (kept.length !== triggerForm.group_ids.length) triggerForm.group_ids = kept
 })
 
 /** 命中分组里当前具备有效节点的数量（有效节点为 0 时信号会被记为未下发） */
@@ -392,6 +417,7 @@ async function openTrigger(): Promise<void> {
     take_profit: null,
     comment: '',
     template_ids: [] as string[],
+    group_ids: [] as string[],
   })
   triggerGroups.value = []
   showTrigger.value = true
@@ -413,8 +439,9 @@ async function openTrigger(): Promise<void> {
 
 function buildTriggerPayload(symbol: string): ManualSignalPayload {
   const payload: ManualSignalPayload = { symbol, action: triggerForm.action, model: 'strategy' }
-  // 模版定向对 CLOSE 同样生效（只终止指定模版分组内的任务），所以放在 CLOSE 早返回之前
+  // 两个定向字段对 CLOSE 同样生效（只终止被点名分组内的任务），所以放在 CLOSE 早返回之前
   if (triggerForm.template_ids.length) payload.template_ids = [...triggerForm.template_ids]
+  if (triggerForm.group_ids.length) payload.group_ids = [...triggerForm.group_ids]
   if (isCloseAction.value) return payload
   payload.volume = Number(triggerForm.volume)
   if (triggerForm.stop_loss) payload.stop_loss = triggerForm.stop_loss
@@ -435,6 +462,9 @@ function triggerSummary(payload: ManualSignalPayload): string {
       (id) => triggerTemplateOptions.value.find((t) => t.id === id)?.name || id,
     )
     lines.push(`模版定向：${names.join('、')}`)
+  }
+  if (payload.group_ids?.length) {
+    lines.push(`分组定向：只发给勾选的 ${payload.group_ids.length} 个分组`)
   }
   if (isCloseAction.value) {
     lines.push('说明：平掉命中分组内进行中任务的持仓并结束策略监控')
@@ -848,7 +878,7 @@ function openSignals(g: GroupOut): void {
             <div class="span-full">
               <FormLabel
                 text="预计命中分组"
-                help="按后台同一套规则试算：分组已启用 + 绑定的策略已启用 + 策略品种与信号品种一致 + 命中所选模版定向。实际下发以触发时的分组状态为准。"
+                :help="TRIGGER_HELP.group_ids"
               />
               <div v-if="loadingTriggerGroups" class="muted" style="font-size: 12px">
                 正在读取全部分组…
@@ -856,20 +886,37 @@ function openSignals(g: GroupOut): void {
               <div v-else-if="!triggerForm.symbol.trim()" class="muted" style="font-size: 12px">
                 填写品种后，这里会列出将收到本信号的分组。
               </div>
-              <div v-else-if="!matchedGroups.length" class="muted" style="font-size: 12px">
+              <div v-else-if="!candidateGroups.length" class="muted" style="font-size: 12px">
                 没有匹配的分组：该品种下没有「已启用且绑定同品种启用策略」<template
                   v-if="triggerForm.template_ids.length"
                 >且模版在定向范围内</template>的分组，信号会被拒收。
               </div>
               <div v-else class="member-list">
-                <div v-for="g in matchedGroups" :key="g.group_id" class="member-row">
+                <label
+                  v-for="g in candidateGroups"
+                  :key="g.group_id"
+                  class="member-row group-pick"
+                  :class="{ 'group-pick-off': triggerForm.group_ids.length && !triggerForm.group_ids.includes(g.group_id) }"
+                >
+                  <input
+                    type="checkbox"
+                    :checked="triggerForm.group_ids.includes(g.group_id)"
+                    :aria-label="`只发给分组 ${g.name}`"
+                    @change="toggleTriggerGroup(g.group_id, ($event.target as HTMLInputElement).checked)"
+                  />
                   <span class="member-name">{{ g.name }}</span>
                   <span class="muted member-meta">{{ groupStrategyLabel(g) }}</span>
                   <span class="tag blue">{{ DISPATCH_MODE_LABEL[g.dispatch_mode] }}</span>
                   <span class="tag" :class="g.online_node_count ? 'green' : 'red'">
                     有效节点 {{ g.online_node_count }}
                   </span>
-                </div>
+                </label>
+                <p class="muted" style="font-size: 12px; margin: 0">
+                  <template v-if="triggerForm.group_ids.length">
+                    已定向到勾选的 {{ matchedGroups.length }} 个分组（信号带 group_ids），其余分组不会收到。
+                  </template>
+                  <template v-else>上面 {{ candidateGroups.length }} 个分组都会收到；勾选后只发给勾中的分组。</template>
+                </p>
               </div>
               <p
                 v-if="matchedGroups.length > readyGroupCount"
@@ -971,6 +1018,15 @@ function openSignals(g: GroupOut): void {
 
 .template-pick code {
   color: var(--muted);
+}
+
+.group-pick {
+  cursor: pointer;
+}
+
+/* 已做分组定向时，没被勾中的分组淡化，一眼看出本次不会收到信号 */
+.group-pick-off {
+  opacity: 0.45;
 }
 
 .trigger-warning {

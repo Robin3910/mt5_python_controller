@@ -2,7 +2,7 @@
 
 行为逐条对齐参考仓库 `mt5_python_connector/tradingview_parser.py`，以保证“信号
 接收规则 / 解析逻辑”与原项目完全一致；相对原文件的改动只有两处：`Config` 的 import
-路径，以及本项目扩展的 `template_ids`（策略模版定向，仅结构化 JSON 支持）。
+路径，以及本项目扩展的定向字段 `template_ids` / `group_ids`（仅结构化 JSON 支持）。
 
 支持三种入参形态：
 1. 结构化 JSON（含 action/symbol 等字段）；
@@ -36,6 +36,8 @@ class TradingSignal:
     allow_position: bool = False  # 是否允许“已有持仓时”继续开仓（覆盖持仓过滤）
     # 策略模版定向（仅 strategy 链路使用）：只有绑定了这些模版的分组才接收本信号；空 = 不限制
     template_ids: List[str] = field(default_factory=list)
+    # 分组定向（仅 strategy 链路使用）：只有 ID 在列表内的分组才接收本信号；空 = 不限制
+    group_ids: List[str] = field(default_factory=list)
 
 
 class TradingViewParser:
@@ -108,6 +110,7 @@ class TradingViewParser:
         order_type = str(order_type).lower() if order_type else "market"
         allow_position = self._extract_allow_position(normalized)
         template_ids = self._extract_template_ids(normalized)
+        group_ids = self._extract_group_ids(normalized)
 
         return TradingSignal(
             action=action,
@@ -119,6 +122,7 @@ class TradingViewParser:
             comment=comment,
             allow_position=allow_position,
             template_ids=template_ids,
+            group_ids=group_ids,
         )
 
     def _parse_text(self, text: str) -> Optional[TradingSignal]:
@@ -317,27 +321,38 @@ class TradingViewParser:
         except (ValueError, TypeError):
             return False
 
-    def _extract_template_ids(self, data: Dict[str, Any]) -> List[str]:
-        """解析策略模版定向字段，得到去重后的模版 ID 列表；缺省返回空列表。
+    def _extract_id_list(self, data: Dict[str, Any], *field_names: str) -> List[str]:
+        """从若干别名字段里取定向 ID 列表：取第一个非空字段并归一，缺省返回空列表。
 
         接受数组（["tpl_1", "tpl_2"]）与逗号分隔字符串（"tpl_1,tpl_2"）两种写法；
-        这里只做形态归一（去空白 + 转小写 + 去重），模版是否存在由分组链路判定。
+        这里只做形态归一（去空白 + 转小写 + 去重），ID 是否存在由分组链路判定。
         """
-        raw = (
-            data.get("template_ids")
-            or data.get("templateids")
-            or data.get("template_id")
-            or data.get("templateid")
-        )
+        raw: Any = None
+        for name in field_names:
+            raw = data.get(name)
+            if raw:
+                break
         if not raw:
             return []
         items = raw if isinstance(raw, (list, tuple)) else str(raw).split(",")
         result: List[str] = []
         for item in items:
-            template_id = str(item).strip().lower() if item else ""
-            if template_id and template_id not in result:
-                result.append(template_id)
+            value = str(item).strip().lower() if item else ""
+            if value and value not in result:
+                result.append(value)
         return result
+
+    def _extract_template_ids(self, data: Dict[str, Any]) -> List[str]:
+        """策略模版定向：本信号只发给绑定了这些模版的分组。"""
+        return self._extract_id_list(
+            data, "template_ids", "templateids", "template_id", "templateid",
+        )
+
+    def _extract_group_ids(self, data: Dict[str, Any]) -> List[str]:
+        """分组定向：本信号只发给 ID 在列表内的分组。"""
+        return self._extract_id_list(
+            data, "group_ids", "groupids", "group_id", "groupid",
+        )
 
     def validate_signal(self, signal: TradingSignal) -> Tuple[bool, Optional[str]]:
         """对解析结果做基本校验，返回 (是否合法, 错误原因)。"""

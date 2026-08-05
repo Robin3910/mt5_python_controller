@@ -206,6 +206,44 @@ def test_known_template_ids_pass_validation(client):
 
 
 # =====================================================================
+# 3.2 group_ids（分组定向）
+# =====================================================================
+def test_group_ids_requires_strategy_model(client):
+    """带分组定向却没写 model=strategy：拒收而不是当成普通信号广播下单。"""
+    seed_default_filters(client)
+    r = client.post(
+        "/webhook",
+        json={"action": "buy", "symbol": "EURUSD", "volume": 0.1, "group_ids": ["grp_1"]},
+    )
+    assert r.status_code == 400
+    assert "group_ids" in r.json()["detail"]
+
+
+def test_unknown_group_id_is_rejected_not_400(client):
+    """分组是可增删的业务数据：点名了不存在的分组照常 200，原因里说明。"""
+    r = client.post(
+        "/webhook",
+        json={"model": "strategy", "action": "buy", "symbol": "XAUUSD",
+              "volume": 0.1, "group_ids": ["grp_none"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "rejected"
+    assert "指定的分组不存在：grp_none" in body["reason"]
+
+
+def test_distinct_group_ids_not_deduped(client):
+    """指纹含分组定向：发往不同分组的同一笔信号不能互相当成重复。"""
+    base = {"model": "strategy", "action": "buy", "symbol": "XAUUSD", "volume": 0.1}
+    a = client.post("/webhook", json={**base, "group_ids": ["grp_a"]})
+    b = client.post("/webhook", json={**base, "group_ids": ["grp_b"]})
+    c = client.post("/webhook", json={**base, "group_ids": ["grp_a"]})
+    assert a.json()["status"] == "rejected"
+    assert b.json()["status"] == "rejected"
+    assert c.json()["status"] == "duplicate"
+
+
+# =====================================================================
 # 4. Token 鉴权（ENABLE_AUTH）
 # =====================================================================
 def test_auth_disabled_accepts_without_token(client):

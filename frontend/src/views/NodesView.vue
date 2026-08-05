@@ -397,7 +397,7 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
         <div class="form-grid two">
           <div>
             <FormLabel field-id="node-name" text="名称" :help="NODE_FORM_FIELD_HELP.name" />
-            <input id="node-name" v-model="form.name" :placeholder="form.mt5_login ? `留空将自动生成：node-${form.mt5_login}` : '留空将自动生成 node-{mt5_login}'" />
+            <input id="node-name" v-model="form.name" :placeholder="form.mt5_login ? `留空将自动生成：${hub.nodes.length + 1}-${form.mt5_login}` : '留空将自动生成 {序号}-{mt5_login}'" />
           </div>
           <div v-if="formMode === 'create'">
             <FormLabel field-id="node-mt5-login" text="MT5 账户登录号" :help="NODE_FORM_FIELD_HELP.mt5_login" />

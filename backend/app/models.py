@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 # ----------------------------- 节点 -----------------------------
 class NodeCreate(BaseModel):
     """创建节点的入参。"""
-    name: Optional[str] = None  # 留空则自动生成 "node-{mt5_login}"
+    name: Optional[str] = None  # 留空则自动生成 "{序号}-{mt5_login}"（序号从 1 起按节点位置递增）
     mt5_login: int = Field(gt=0, description="绑定的 MT5 账户登录号（全局唯一）")
     filters: Optional[dict] = None  # 节点级按币种配置（分发参与、手数策略、轮询顺序）
 
@@ -531,6 +531,8 @@ class ManualSignalRequest(BaseModel):
     comment: Optional[str] = Field(default=None, max_length=64)
     # 策略模版定向（仅 strategy 链路）：只发给绑定了这些模版的分组；空 = 不限制
     template_ids: list[str] = Field(default_factory=list)
+    # 分组定向（仅 strategy 链路）：只发给 ID 在列表内的分组；空 = 不限制
+    group_ids: list[str] = Field(default_factory=list)
 
 
 # 清空交易记录时前端/调用方必须原样提交的确认词
