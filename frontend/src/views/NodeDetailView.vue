@@ -586,7 +586,7 @@ async function closeTicket(ticket: number): Promise<void> {
         <button class="btn-sm" :class="node.enabled ? 'btn-ghost' : 'btn-danger'" @click="toggleEnabled">
           {{ node.enabled ? '已启用' : '已禁用' }}
         </button>
-        <button class="btn-sm btn-danger" :disabled="!positions.length" @click="closeNodeAll">平掉全部</button>
+        <button class="btn-sm btn-ghost" :disabled="!positions.length" @click="closeNodeAll">平掉全部</button>
       </div>
     </div>
 

@@ -255,7 +255,7 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
     </div>
     <div class="row">
       <button
-        class="btn-danger btn-sm"
+        class="btn-sm btn-ghost"
         :disabled="!someSelected || closing"
         @click="closeSelected"
       >

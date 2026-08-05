@@ -261,7 +261,7 @@ async function closeTicket(n: NodeOut, ticket: number): Promise<void> {
               <span v-else></span>
               <button
                 type="button"
-                class="btn-sm btn-danger"
+                class="btn-sm btn-ghost"
                 :disabled="!acct(n.node_id)?.positions?.length"
                 @click="closeNodeAll(n)"
               >平掉该节点全部</button>

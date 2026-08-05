@@ -674,7 +674,7 @@ onUnmounted(stopAutoRefresh)
                               <button
                                 v-if="isDispatchCloseable(d.status)"
                                 type="button"
-                                class="btn-sm btn-danger"
+                                class="btn-sm btn-ghost"
                                 :disabled="!!closingDispatchIds[String(d.id)]"
                                 @click="closeDispatch(d)"
                               >
