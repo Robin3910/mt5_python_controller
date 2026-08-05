@@ -68,6 +68,9 @@ def _build_signal_payload(body: ManualSignalRequest) -> dict:
         raise HTTPException(status_code=400, detail="开仓信号必须填写手数")
 
     data: dict = {"action": action, "symbol": body.symbol, "model": model}
+    # 模版定向的合法性（仅 strategy 链路 + 模版须存在）由 process_signal 统一把关
+    if body.template_ids:
+        data["template_ids"] = body.template_ids
     if body.volume:
         data["volume"] = body.volume
     if body.stop_loss:

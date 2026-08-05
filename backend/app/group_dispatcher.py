@@ -4,7 +4,8 @@
 
 - 分发单元是「分组」而不是「币种」：不读中控台 filters，不做币种准入、多区间方向
   过滤、持仓过滤，也不读节点的按币种配置；
-- 只有「已启用 + 绑定了启用中策略 + 策略品种与信号品种一致」的分组才参与；
+- 只有「已启用 + 绑定了启用中策略 + 策略品种与信号品种一致」的分组才参与；信号带
+  `template_ids` 时再叠加一层定向：只有绑定了指定策略模版的分组才接收；
 - 每个入选分组独立处理同一条信号，分组的 sync / poll 模式由分组自身决定；
 - 有效节点口径固定为「节点已启用 + 当前在线」；
 - 明细写 group_task_dispatch（节点子任务），不写 normal 链路的 signal_dispatch。
@@ -119,7 +120,8 @@ class GroupDispatcher:
     async def _candidate_groups(self, signal: TradingSignal) -> tuple[list[tuple[dict, dict]], list[str]]:
         """挑出该信号应当进入的分组。
 
-        入选条件：分组启用 + 绑定了策略 + 策略启用 + 策略品种与信号品种一致 +
+        入选条件：分组启用 + 绑定了策略 + 策略启用 + 命中信号的策略模版定向
+        （template_ids，为空则不限制）+ 策略品种与信号品种一致 +
         通过策略自身的开仓准入（如以损定量趋势单要求信号带止损价）。
         返回 (入选的 (group, strategy) 列表, 落选原因说明)。
         """
@@ -143,6 +145,10 @@ class GroupDispatcher:
                 continue
             if not strategy.get("enabled", True):
                 reasons.append(f"{name}：绑定策略已禁用（{strategy.get('name')}）")
+                continue
+            off_target = group_rules.template_reject_reason(strategy, signal.template_ids)
+            if off_target:
+                reasons.append(f"{name}：{off_target}")
                 continue
             if not group_rules.symbol_match(strategy.get("symbol"), signal.symbol):
                 reasons.append(

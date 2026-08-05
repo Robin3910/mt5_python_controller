@@ -1,7 +1,8 @@
 """TradingView 信号解析器。
 
 行为逐条对齐参考仓库 `mt5_python_connector/tradingview_parser.py`，以保证“信号
-接收规则 / 解析逻辑”与原项目完全一致；相对原文件唯一的改动是 `Config` 的 import 路径。
+接收规则 / 解析逻辑”与原项目完全一致；相对原文件的改动只有两处：`Config` 的 import
+路径，以及本项目扩展的 `template_ids`（策略模版定向，仅结构化 JSON 支持）。
 
 支持三种入参形态：
 1. 结构化 JSON（含 action/symbol 等字段）；
@@ -13,8 +14,8 @@
 """
 import logging
 import re
-from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
 from .config import Config
 
@@ -33,6 +34,8 @@ class TradingSignal:
     order_type: Optional[str] = None  # 订单类型：market / limit / stop
     comment: str = ""  # 订单备注
     allow_position: bool = False  # 是否允许“已有持仓时”继续开仓（覆盖持仓过滤）
+    # 策略模版定向（仅 strategy 链路使用）：只有绑定了这些模版的分组才接收本信号；空 = 不限制
+    template_ids: List[str] = field(default_factory=list)
 
 
 class TradingViewParser:
@@ -104,6 +107,7 @@ class TradingViewParser:
         order_type = normalized.get("type") or normalized.get("ordertype") or "market"
         order_type = str(order_type).lower() if order_type else "market"
         allow_position = self._extract_allow_position(normalized)
+        template_ids = self._extract_template_ids(normalized)
 
         return TradingSignal(
             action=action,
@@ -114,6 +118,7 @@ class TradingViewParser:
             order_type=order_type,
             comment=comment,
             allow_position=allow_position,
+            template_ids=template_ids,
         )
 
     def _parse_text(self, text: str) -> Optional[TradingSignal]:
@@ -311,6 +316,28 @@ class TradingViewParser:
             return bool(int(value)) == 1
         except (ValueError, TypeError):
             return False
+
+    def _extract_template_ids(self, data: Dict[str, Any]) -> List[str]:
+        """解析策略模版定向字段，得到去重后的模版 ID 列表；缺省返回空列表。
+
+        接受数组（["tpl_1", "tpl_2"]）与逗号分隔字符串（"tpl_1,tpl_2"）两种写法；
+        这里只做形态归一（去空白 + 转小写 + 去重），模版是否存在由分组链路判定。
+        """
+        raw = (
+            data.get("template_ids")
+            or data.get("templateids")
+            or data.get("template_id")
+            or data.get("templateid")
+        )
+        if not raw:
+            return []
+        items = raw if isinstance(raw, (list, tuple)) else str(raw).split(",")
+        result: List[str] = []
+        for item in items:
+            template_id = str(item).strip().lower() if item else ""
+            if template_id and template_id not in result:
+                result.append(template_id)
+        return result
 
     def validate_signal(self, signal: TradingSignal) -> Tuple[bool, Optional[str]]:
         """对解析结果做基本校验，返回 (是否合法, 错误原因)。"""

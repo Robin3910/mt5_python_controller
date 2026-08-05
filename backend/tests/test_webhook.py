@@ -156,6 +156,55 @@ def test_distinct_volume_not_deduped(client):
     assert b.json()["status"] == "accepted"   # 指纹含 volume，不同则不去重
 
 
+def test_distinct_template_ids_not_deduped(client):
+    """指纹含模版定向：面向不同模版分组的同一笔信号不能互相当成重复。"""
+    base = {"model": "strategy", "action": "buy", "symbol": "XAUUSD", "volume": 0.1}
+    a = client.post("/webhook", json={**base, "template_ids": ["tpl_1"]})
+    b = client.post("/webhook", json={**base, "template_ids": ["tpl_2"]})
+    c = client.post("/webhook", json={**base, "template_ids": ["tpl_1"]})
+    # 环境里没有分组，两条都会被拒收，但都必须真正走过一次分发决策
+    assert a.json()["status"] == "rejected"
+    assert b.json()["status"] == "rejected"
+    assert c.json()["status"] == "duplicate"  # 与 a 完全相同才算重复
+
+
+# =====================================================================
+# 3.1 template_ids（策略模版定向）
+# =====================================================================
+def test_template_ids_requires_strategy_model(client):
+    """带模版定向却没写 model=strategy：拒收而不是当成普通信号广播下单。"""
+    seed_default_filters(client)
+    r = client.post(
+        "/webhook",
+        json={"action": "buy", "symbol": "EURUSD", "volume": 0.1, "template_ids": ["tpl_1"]},
+    )
+    assert r.status_code == 400
+    assert "template_ids" in r.json()["detail"]
+
+
+def test_unknown_template_id_returns_400(client):
+    r = client.post(
+        "/webhook",
+        json={"model": "strategy", "action": "buy", "symbol": "XAUUSD",
+              "volume": 0.1, "template_ids": ["tpl_1", "tpl_x"]},
+    )
+    assert r.status_code == 400
+    assert r.json()["detail"] == "unknown template_ids: tpl_x"
+
+
+def test_known_template_ids_pass_validation(client):
+    """已登记的模版通过入口校验，后续由分组链路决定命中与否。"""
+    r = client.post(
+        "/webhook",
+        json={"model": "strategy", "action": "buy", "symbol": "XAUUSD",
+              "volume": 0.1, "template_ids": ["tpl_1"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "rejected"    # 测试环境没有任何分组
+    assert "无匹配分组" in body["reason"]
+
+
 # =====================================================================
 # 4. Token 鉴权（ENABLE_AUTH）
 # =====================================================================

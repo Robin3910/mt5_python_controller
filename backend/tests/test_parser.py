@@ -279,6 +279,40 @@ def test_allow_position_default_false():
     assert parser.parse({"action": "buy", "symbol": "EURUSD"}).allow_position is False
 
 
+# ---------------------------- template_ids（策略模版定向）----------------------------
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (["tpl_1", "tpl_2"], ["tpl_1", "tpl_2"]),
+        ("tpl_1", ["tpl_1"]),                        # 单个字符串
+        ("tpl_1,tpl_3", ["tpl_1", "tpl_3"]),         # 逗号分隔
+        (" TPL_1 , tpl_2 ", ["tpl_1", "tpl_2"]),     # 去空白 + 转小写
+        (["tpl_1", "tpl_1", "", None], ["tpl_1"]),   # 去重并丢弃空值
+        ([], []),
+        ("", []),
+        (None, []),
+    ],
+)
+def test_template_ids_normalization(value, expected):
+    sig = parser.parse({"action": "buy", "symbol": "EURUSD", "template_ids": value})
+    assert sig.template_ids == expected
+
+
+@pytest.mark.parametrize("field", ["template_ids", "templateids", "template_id", "templateid"])
+def test_template_ids_field_aliases(field):
+    sig = parser.parse({"action": "buy", "symbol": "EURUSD", field: ["tpl_2"]})
+    assert sig.template_ids == ["tpl_2"]
+
+
+def test_template_ids_default_empty():
+    assert parser.parse({"action": "buy", "symbol": "EURUSD"}).template_ids == []
+
+
+def test_template_ids_not_supported_in_text_mode():
+    """纯文本告警没有承载 template_ids 的位置，一律为空（不限制模版）。"""
+    assert parser.parse("buy EURUSD tpl_1").template_ids == []
+
+
 # ---------------------------- 纯文本（格式二）----------------------------
 def test_text_action_symbol_either_order():
     assert parser.parse("buy EURUSD").action == "BUY"

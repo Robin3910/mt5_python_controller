@@ -529,6 +529,8 @@ class ManualSignalRequest(BaseModel):
     stop_loss: Optional[float] = Field(default=None, gt=0)
     take_profit: Optional[float] = Field(default=None, gt=0)
     comment: Optional[str] = Field(default=None, max_length=64)
+    # 策略模版定向（仅 strategy 链路）：只发给绑定了这些模版的分组；空 = 不限制
+    template_ids: list[str] = Field(default_factory=list)
 
 
 # 清空交易记录时前端/调用方必须原样提交的确认词

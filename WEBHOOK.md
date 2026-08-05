@@ -83,6 +83,7 @@ TradingView → MT5 跟单系统的信号接收接口说明。本文档描述的
 | 含义 | 接受的字段名 | 默认值 / 规则 |
 | --- | --- | --- |
 | 处理模型 `model` | `model` | `normal`（默认，按币种分发）/ `strategy`（按分组分发，见 [§4.5](#45-策略信号-modelstrategy)）；缺省或空 → `normal`；其它取值 → `400` |
+| 策略模版定向 `template_ids` | `template_ids` / `templateids` / `template_id` / `templateid` | 策略模版 ID 数组，只有绑定了其中某个模版的分组才接收本信号（见 [§4.5](#45-策略信号-modelstrategy)）；缺省或空数组 → 不限制；**仅 `model=strategy` 可用**，其它情况 → `400` |
 | 手数 `volume` | `volume` / `lotsize` / `lot` / `v` / `q` | 缺省或 ≤0 或非法 → `DEFAULT_LOT`（默认 `0.1`）；超过 `MAX_LOT_SIZE`（默认 `1.0`）则封顶 |
 | 止损 `stop_loss` | `sl` / `stoploss` / `stop_loss` / `stop` | 解析为正浮点；`0`/空/非法 → 不设（`null`） |
 | 止盈 `take_profit` | `tp` / `takeprofit` / `take_profit` / `target` | 解析为正浮点；`0`/空/非法 → 不设（`null`） |
@@ -92,7 +93,7 @@ TradingView → MT5 跟单系统的信号接收接口说明。本文档描述的
 
 > 注：这里的 `volume` 仅是「信号携带手数」。最终每个节点实际下单手数还取决于该节点的手数策略（跟随全局 / 固定 / 跟随信号），见节点配置。**策略模版2 与模版3 是例外**：前者按风险金额反推手数、后者按每格手数下单，都不使用信号 `volume`。
 
-> `model` 只能通过结构化 JSON 传入。纯文本告警（格式二）没有携带它的位置，一律按 `normal` 处理。
+> `model` 与 `template_ids` 只能通过结构化 JSON 传入。纯文本告警（格式二）没有携带它们的位置，一律按 `normal`、不限制模版处理。
 
 > ⚠️ `allow_position` 的真实判定是 `bool(int(value)) == 1`（取值非空时），即「`int(value)` 能成功且结果非 0」才为 `true`。这与直觉上的「等于 1」并不完全一致：
 
@@ -132,7 +133,7 @@ TradingView → MT5 跟单系统的信号接收接口说明。本文档描述的
 
 带 `"model": "strategy"` 的信号走**分组分发**链路（`group_dispatcher.py`），与默认的按币种分发完全隔离：不读中控台品种配置，不做区间方向 / 持仓过滤，也不读节点的按币种手数策略。
 
-入选条件是「分组已启用 + 绑定了启用中的策略 + 策略绑定品种与信号品种一致」。命中的每个分组各自下发一条 `strategy_start` 给组内有效节点（已启用 + 在线），由节点按策略规则托管到持仓全平；`CLOSE` 信号则是终止指令，平掉对应魔术号的全部持仓。
+入选条件是「分组已启用 + 绑定了启用中的策略 + 策略绑定品种与信号品种一致」，信号带 `template_ids` 时再加一层模版定向（见下）。命中的每个分组各自下发一条 `strategy_start` 给组内有效节点（已启用 + 在线），由节点按策略规则托管到持仓全平；`CLOSE` 信号则是终止指令，平掉对应魔术号的全部持仓。
 
 策略实例基于**策略模版**创建，不同模版对信号的要求不同：
 
@@ -143,6 +144,31 @@ TradingView → MT5 跟单系统的信号接收接口说明。本文档描述的
 | 策略模版3（网格交易） | 规则里的每格手数，**忽略信号 `volume`** | 方向须与网格方向相容（见下） |
 
 无论哪个模版，信号本身只提供「品种 + 方向」，策略参数一律来自后台配置的规则快照——**不能通过 Webhook 传网格区间、风险金额之类的参数**。分组与策略为一对一绑定；管理端也可通过「中控台 → 手动发信号」触发同一条链路。
+
+#### 按策略模版定向：`template_ids`
+
+同一个品种下往往同时挂着多种模版的分组（例如一个趋势单分组、一个网格分组）。默认情况下它们会**同时**收到该品种的每条策略信号；如果某条信号只想让特定玩法接收，就在信号里带上 `template_ids`：
+
+```json
+{"model": "strategy", "action": "buy", "symbol": "XAUUSD", "template_ids": ["tpl_3"]}
+```
+
+上例只会下发给「绑定了模版3（网格交易）策略」的分组，同品种的模版1 / 模版2 分组一律落选（落选原因写进信号记录）。
+
+| 模版 ID | 对应模版 |
+| --- | --- |
+| `tpl_1` | 策略模版1：顺势 / 逆势加仓 |
+| `tpl_2` | 策略模版2：以损定量趋势单 |
+| `tpl_3` | 策略模版3：网格交易 |
+
+规则要点：
+
+- **数组内是「或」的关系**：分组绑定的策略只要命中其中任意一个模版就接收。
+- **缺省或空数组 = 不限制**，行为与本功能上线前完全一致。
+- 写法上支持数组 `["tpl_1","tpl_2"]` 与逗号分隔字符串 `"tpl_1,tpl_2"`；取值会去空白并转小写。
+- **模版定向只是叠加的一层筛选**，品种匹配、策略启用、模版自身的开仓准入（模版2 要 `sl`、模版3 要方向相容）都照旧生效。
+- `CLOSE` 信号同样受它约束：只终止指定模版分组内进行中的任务。
+- 出现不存在的模版 ID → `400 unknown template_ids: xxx`；没写 `model=strategy` 却带了 `template_ids` → `400`（避免误按币种链路广播下单）。
 
 #### 模版2：以损定量趋势单
 
@@ -325,6 +351,9 @@ SYMBOL=GBPUSD long LOT=0.1
 | --- | --- | --- |
 | `400` | `{"detail":"cannot parse signal"}` | 无法解析出有效信号（解析器返回 `None`） |
 | `400` | `{"detail":"invalid signal: ..."}` | 解析成功但校验不通过（见 §11，**默认配置下基本不会触发**） |
+| `400` | `{"detail":"invalid model: ..."}` | `model` 不是 `normal` / `strategy` |
+| `400` | `{"detail":"template_ids 仅适用于 model=strategy 的信号"}` | 带了 `template_ids` 却不是策略信号（见 §4.5） |
+| `400` | `{"detail":"unknown template_ids: ..."}` | `template_ids` 里有未登记的模版 ID（见 §4.5） |
 | `401` | `{"detail":"invalid token"}` | 开启鉴权且 token 不匹配 |
 | `403` | `{"detail":"ip not allowed"}` | 开启白名单且来源 IP 不在名单 |
 
@@ -336,7 +365,9 @@ SYMBOL=GBPUSD long LOT=0.1
 
 在 `DEDUP_WINDOW` 秒（默认 `5`）内，指纹完全相同的信号视为重复，直接返回 `duplicate` 不再分发。
 
-指纹 = `action : symbol : volume : stop_loss : take_profit`。
+指纹 = `model : action : symbol : volume : stop_loss : take_profit : template_ids`。
+
+> 指纹带上 `model` 与 `template_ids`：同一笔行情面向不同链路、不同模版分组的信号是各自独立的指令，不能互相当成重复抑制掉。
 
 ---
 
@@ -366,6 +397,8 @@ SYMBOL=GBPUSD long LOT=0.1
 | 纯文本 `SYMBOL=US30 buy` | ⚠️ 解析出 `symbol="SYMBOL"` | `US` 仅 2 字母不满足标签正则，「SYMBOL」一词被裸 6 字母规则误命中（见 §5 坑位） |
 | `{"action":"buy","symbol":"EURUSD","allow_position":"true"}` | ⚠️ `allow_position=false` | `"true"` 是字符串，`int("true")` 抛错；只有能转非零整数的值才生效（见 §4.3） |
 | `{"action":"buy","symbol":"EURUSD","allow_position":2}` | ⚠️ `allow_position=true` | 任意非零整数都为 `true`，不止 `1`（见 §4.3） |
+| `{"action":"buy","symbol":"XAUUSD","template_ids":["tpl_3"]}`（漏写 `model`） | ❌ `400` | `template_ids` 只对策略信号有意义；漏写 `model=strategy` 直接拒收，避免误按币种链路广播下单（见 §4.5） |
+| `{"model":"strategy","action":"buy","symbol":"XAUUSD","template_ids":["tpl_3"]}`（无 tpl_3 分组） | ⚠️ `status: rejected` | 模版定向没命中任何分组，落选原因写进信号记录（见 §4.5） |
 | `{"action":"buy","symbol":"NZDUSD"}`（中控台未登记 NZDUSD） | ⚠️ `status: rejected` | 解析成功但品种未在中控台登记，不分发（见 §9.3） |
 | `{"action":"close","symbol":"EURUSD"}`（中控台已取消启用 EURUSD） | ⚠️ `status: rejected` | 品种已禁用，开仓/平仓均不分发（见 §9.3；手动平仓除外） |
 
@@ -441,8 +474,8 @@ curl -X POST http://localhost:8000/webhook \
 > 行为基准：`backend/app/webhook.py`（鉴权/去重/响应/**raw_payload 持久化**）、`backend/app/parser.py`（解析）、`backend/app/config.py`（品种与关键字）、`backend/app/settings.py`（环境变量）、`backend/app/persist.py`（`recent_webhook_events`）。
 >
 > 全场景回归测试：
-> - `backend/tests/test_parser.py` —— 纯解析层（动作/品种/手数/止盈止损/`allow_position` 精确规则/文本模式坑位/格式三回退/校验规则）。
-> - `backend/tests/test_webhook.py` —— HTTP 端到端（token 4 种传入方式、IP 白名单与 `X-Forwarded-For`、白名单→鉴权→解析的顺序、三种请求体形态、去重、**未登记品种 rejected**、各类 400/401/403、响应字段）。
+> - `backend/tests/test_parser.py` —— 纯解析层（动作/品种/手数/止盈止损/`allow_position` 精确规则/`template_ids` 归一化/文本模式坑位/格式三回退/校验规则）。
+> - `backend/tests/test_webhook.py` —— HTTP 端到端（token 4 种传入方式、IP 白名单与 `X-Forwarded-For`、白名单→鉴权→解析的顺序、三种请求体形态、去重、**未登记品种 rejected**、`template_ids` 校验、各类 400/401/403、响应字段）。
 > - `backend/tests/test_api.py` —— 含 webhook→分发→节点回报的全链路冒烟，以及 **`GET /api/events/signals`** 分页与 `raw_payload` 断言。
 >
 > 运行：`cd backend && python -m pytest tests/test_parser.py tests/test_webhook.py -q`

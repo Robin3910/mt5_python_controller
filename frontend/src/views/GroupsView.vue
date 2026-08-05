@@ -298,6 +298,9 @@ const TRIGGER_HELP = {
   stop_loss: '首单止损价（绝对价格），留空表示不设。',
   take_profit: '首单止盈价（绝对价格），留空表示不设。',
   comment: '订单备注，会写入 MT5 订单的 comment 字段，便于对账。',
+  template_ids:
+    '策略模版定向（信号的 template_ids 字段）：勾选后，只有绑定了这些模版的分组才会收到本信号，' +
+    '在品种匹配之上再加一层筛选。一个都不勾表示不限制模版。',
 }
 
 const triggerForm = reactive({
@@ -307,6 +310,7 @@ const triggerForm = reactive({
   stop_loss: null as number | null,
   take_profit: null as number | null,
   comment: '',
+  template_ids: [] as string[],
 })
 
 const isCloseAction = computed(() => triggerForm.action === 'CLOSE')
@@ -343,14 +347,33 @@ const triggerSymbolOptions = computed<string[]>(() => {
   return out
 })
 
+/** 分组已绑定策略用到的模版（去重），供模版定向勾选 */
+const triggerTemplateOptions = computed<Array<{ id: string; name: string }>>(() => {
+  const out: Array<{ id: string; name: string }> = []
+  for (const g of triggerGroups.value) {
+    const sty = strategyOf(g)
+    if (sty && !out.some((t) => t.id === sty.template_id)) {
+      out.push({ id: sty.template_id, name: sty.template_name })
+    }
+  }
+  return out
+})
+
+function toggleTriggerTemplate(templateId: string, checked: boolean): void {
+  const kept = triggerForm.template_ids.filter((id) => id !== templateId)
+  triggerForm.template_ids = checked ? [...kept, templateId] : kept
+}
+
 /** 命中分组预览：与后端 GroupDispatcher._candidate_groups 的入选条件同口径 */
 const matchedGroups = computed<GroupOut[]>(() => {
   const symbol = triggerForm.symbol.trim()
   if (!symbol) return []
+  const templates = triggerForm.template_ids
   return triggerGroups.value.filter((g) => {
     if (!g.enabled) return false
     const sty = strategyOf(g)
-    return !!sty && sty.enabled && symbolMatch(sty.symbol, symbol)
+    if (!sty || !sty.enabled || !symbolMatch(sty.symbol, symbol)) return false
+    return !templates.length || templates.includes(sty.template_id)
   })
 })
 
@@ -368,6 +391,7 @@ async function openTrigger(): Promise<void> {
     stop_loss: null,
     take_profit: null,
     comment: '',
+    template_ids: [] as string[],
   })
   triggerGroups.value = []
   showTrigger.value = true
@@ -389,6 +413,8 @@ async function openTrigger(): Promise<void> {
 
 function buildTriggerPayload(symbol: string): ManualSignalPayload {
   const payload: ManualSignalPayload = { symbol, action: triggerForm.action, model: 'strategy' }
+  // 模版定向对 CLOSE 同样生效（只终止指定模版分组内的任务），所以放在 CLOSE 早返回之前
+  if (triggerForm.template_ids.length) payload.template_ids = [...triggerForm.template_ids]
   if (isCloseAction.value) return payload
   payload.volume = Number(triggerForm.volume)
   if (triggerForm.stop_loss) payload.stop_loss = triggerForm.stop_loss
@@ -404,6 +430,12 @@ function triggerSummary(payload: ManualSignalPayload): string {
     ? hit.map((g) => `· ${g.name}（有效节点 ${g.online_node_count}）`).join('\n')
     : '· 无（当前没有匹配的分组，信号将被拒收）'
   const lines = [`品种：${payload.symbol}`, `动作：${payload.action}`]
+  if (payload.template_ids?.length) {
+    const names = payload.template_ids.map(
+      (id) => triggerTemplateOptions.value.find((t) => t.id === id)?.name || id,
+    )
+    lines.push(`模版定向：${names.join('、')}`)
+  }
   if (isCloseAction.value) {
     lines.push('说明：平掉命中分组内进行中任务的持仓并结束策略监控')
   } else {
@@ -797,10 +829,26 @@ function openSignals(g: GroupOut): void {
               CLOSE 会平掉命中分组内进行中任务对应魔术号的持仓并结束节点侧策略监控，不影响按币种分发链路的持仓。
             </p>
 
+            <div v-if="triggerTemplateOptions.length" class="span-full">
+              <FormLabel text="策略模版定向" :help="TRIGGER_HELP.template_ids" />
+              <div class="template-picks">
+                <label v-for="t in triggerTemplateOptions" :key="t.id" class="template-pick">
+                  <input
+                    type="checkbox"
+                    :checked="triggerForm.template_ids.includes(t.id)"
+                    @change="toggleTriggerTemplate(t.id, ($event.target as HTMLInputElement).checked)"
+                  />
+                  <span>{{ t.name }}</span>
+                  <code>{{ t.id }}</code>
+                </label>
+                <span v-if="!triggerForm.template_ids.length" class="muted">不限制模版</span>
+              </div>
+            </div>
+
             <div class="span-full">
               <FormLabel
                 text="预计命中分组"
-                help="按后台同一套规则试算：分组已启用 + 绑定的策略已启用 + 策略品种与信号品种一致。实际下发以触发时的分组状态为准。"
+                help="按后台同一套规则试算：分组已启用 + 绑定的策略已启用 + 策略品种与信号品种一致 + 命中所选模版定向。实际下发以触发时的分组状态为准。"
               />
               <div v-if="loadingTriggerGroups" class="muted" style="font-size: 12px">
                 正在读取全部分组…
@@ -809,7 +857,9 @@ function openSignals(g: GroupOut): void {
                 填写品种后，这里会列出将收到本信号的分组。
               </div>
               <div v-else-if="!matchedGroups.length" class="muted" style="font-size: 12px">
-                没有匹配的分组：该品种下没有「已启用且绑定同品种启用策略」的分组，信号会被拒收。
+                没有匹配的分组：该品种下没有「已启用且绑定同品种启用策略」<template
+                  v-if="triggerForm.template_ids.length"
+                >且模版在定向范围内</template>的分组，信号会被拒收。
               </div>
               <div v-else class="member-list">
                 <div v-for="g in matchedGroups" :key="g.group_id" class="member-row">
@@ -901,6 +951,26 @@ function openSignals(g: GroupOut): void {
   gap: 6px;
   margin-top: 8px;
   font-size: 12px;
+}
+
+.template-picks {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin-top: 6px;
+  font-size: 12px;
+}
+
+.template-pick {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.template-pick code {
+  color: var(--muted);
 }
 
 .trigger-warning {

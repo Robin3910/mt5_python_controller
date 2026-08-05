@@ -35,6 +35,30 @@ def normalize_signal_model(value: object) -> Optional[str]:
     return text if text in SIGNAL_MODELS else None
 
 
+def unknown_template_ids(template_ids: Optional[list[str]]) -> list[str]:
+    """信号 template_ids 里不存在于模版注册表的项，供入口层拒收明显的配置错误。"""
+    return [
+        tid for tid in (template_ids or [])
+        if tid not in strategy_templates.STRATEGY_TEMPLATES
+    ]
+
+
+def template_reject_reason(
+    strategy: dict, template_ids: Optional[list[str]],
+) -> Optional[str]:
+    """策略模版定向：信号指定 template_ids 时，只有绑定这些模版的策略才接收。
+
+    template_ids 缺省 / 为空表示不限制；可接收时返回 None，否则返回人读的落选原因。
+    """
+    if not template_ids:
+        return None
+    template_id = str(strategy.get("template_id") or "").strip().lower()
+    if template_id in template_ids:
+        return None
+    label = strategy.get("template_name") or template_id or "未知模版"
+    return f"策略模版 {label} 不在信号指定的 template_ids（{'、'.join(template_ids)}）内"
+
+
 def normalize_dispatch_mode(value: object) -> str:
     """规范化分组分发模式；非法值回落到 sync。"""
     mode = str(value or "").strip().lower()

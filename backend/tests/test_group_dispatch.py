@@ -626,6 +626,97 @@ async def test_different_nodes_across_groups_both_run(store, monkeypatch):
     assert {s[0] for s in sent} == {"nd_a", "nd_b"}
 
 
+# ---------------------- 策略模版定向（template_ids）----------------------
+async def prepare_template_groups(store, monkeypatch):
+    """同品种下各建一个模版1 / 模版2 / 模版3 的分组，返回下发记录列表。"""
+    await online(store, mk_node("nd_1"), mk_node("nd_2"), mk_node("nd_3"))
+    await mk_group(store, "模版一组", ["nd_1"])                       # tpl_1
+    await mk_risk_sized_group(store, "模版二组", ["nd_2"])            # tpl_2
+    await mk_grid_group(store, "模版三组", ["nd_3"])                  # tpl_3
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    return sent
+
+
+async def test_template_ids_only_dispatches_to_bound_templates(store, monkeypatch):
+    """信号带 template_ids 时，只有绑定了这些模版的分组接收。"""
+    sent = await prepare_template_groups(store, monkeypatch)
+
+    res = await GroupDispatcher(store).dispatch(
+        TradingSignal(
+            action="BUY", symbol="XAUUSD", volume=0.1, stop_loss=2397.0,
+            template_ids=[TEMPLATE_2_ID, TEMPLATE_3_ID],
+        ),
+        "sig_tpl_pick",
+    )
+
+    assert res["mode"] == "group"
+    assert res["groups"] == 2
+    assert {s[0] for s in sent} == {"nd_2", "nd_3"}
+    assert {t.group_name for t in await fetch_tasks("sig_tpl_pick")} == {"模版二组", "模版三组"}
+
+
+async def test_empty_template_ids_keeps_all_groups(store, monkeypatch):
+    """不带 template_ids（或空数组）时行为不变：所有匹配分组照常接收。"""
+    sent = await prepare_template_groups(store, monkeypatch)
+
+    res = await GroupDispatcher(store).dispatch(
+        TradingSignal(
+            action="BUY", symbol="XAUUSD", volume=0.1, stop_loss=2397.0, template_ids=[],
+        ),
+        "sig_tpl_all",
+    )
+
+    assert res["groups"] == 3
+    assert {s[0] for s in sent} == {"nd_1", "nd_2", "nd_3"}
+
+
+async def test_template_ids_matching_nothing_is_rejected(store, monkeypatch):
+    """指定的模版在本环境没有对应分组：整条信号拒收，落选原因写明模版不符。"""
+    await online(store, mk_node("nd_a"))
+    await mk_group(store, "模版一组", ["nd_a"])
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+
+    res = await GroupDispatcher(store).dispatch(
+        TradingSignal(
+            action="BUY", symbol="XAUUSD", volume=0.1, template_ids=[TEMPLATE_3_ID],
+        ),
+        "sig_tpl_miss",
+    )
+
+    assert res["mode"] == "rejected"
+    assert TEMPLATE_1_NAME in res["reason"] and TEMPLATE_3_ID in res["reason"]
+    assert sent == []
+    assert await fetch_tasks("sig_tpl_miss") == []
+
+
+async def test_close_signal_only_stops_targeted_templates(store, monkeypatch):
+    """CLOSE 同样受模版定向约束：只终止指定模版分组里的任务。"""
+    await online(store, mk_node("nd_1"), mk_node("nd_3"))
+    await mk_group(store, "模版一组", ["nd_1"])
+    await mk_grid_group(store, "模版三组", ["nd_3"])
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    d = GroupDispatcher(store)
+
+    await d.dispatch(TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_tpl_open")
+    for task in await fetch_tasks("sig_tpl_open"):
+        await open_first_orders(task.task_id, [r.node_id for r in await fetch_dispatches(task.task_id)])
+    sent.clear()
+
+    res = await d.dispatch(
+        TradingSignal(
+            action="CLOSE", symbol="XAUUSD", volume=0.1, template_ids=[TEMPLATE_3_ID],
+        ),
+        "sig_tpl_close",
+    )
+
+    assert res["mode"] == "group_close"
+    assert [s[0] for s in sent] == ["nd_3"]
+    assert sent[0][1]["cmd"] == "strategy_stop"
+
+
 # =====================================================================
 # 2. 有效节点 = 已启用 + 在线
 # =====================================================================

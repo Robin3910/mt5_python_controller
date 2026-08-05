@@ -6,6 +6,9 @@
 model 字段（可选，枚举 normal / strategy）决定走哪条分发链路：
 - 缺失 / 空 / normal：按币种分发（Dispatcher，项目原有默认行为）；
 - strategy：按分组分发（GroupDispatcher，规则与 normal 链路完全隔离）。
+
+template_ids 字段（可选，策略模版 ID 数组）给 strategy 信号再加一层定向：只有绑定了
+其中某个模版的分组才接收本信号；缺省或空数组表示不限制。
 """
 import json
 import logging
@@ -19,7 +22,7 @@ from .deps import client_ip, get_dispatcher, get_group_dispatcher, get_store
 from .dispatcher import Dispatcher
 from .group_dispatcher import GroupDispatcher
 from .models import SIGNAL_MODELS, SIGNAL_MODEL_STRATEGY
-from .parser import TradingViewParser
+from .parser import TradingSignal, TradingViewParser
 from .redis_store import RedisStore
 from .settings import settings
 
@@ -73,6 +76,26 @@ def _resolve_model(data) -> str:
     return model
 
 
+def _validate_template_ids(signal: TradingSignal, model: str) -> None:
+    """校验策略模版定向字段：只在 strategy 链路可用，且必须是已登记的模版。
+
+    带了 template_ids 却没写 model=strategy，几乎都是漏配：此时按 normal 链路广播
+    下单会产生调用方并不期望的交易，因此直接拒收，而不是默默忽略这个字段。
+    """
+    if not signal.template_ids:
+        return
+    if model != SIGNAL_MODEL_STRATEGY:
+        raise HTTPException(
+            status_code=400,
+            detail=f"template_ids 仅适用于 model={SIGNAL_MODEL_STRATEGY} 的信号",
+        )
+    unknown = group_rules.unknown_template_ids(signal.template_ids)
+    if unknown:
+        raise HTTPException(
+            status_code=400, detail=f"unknown template_ids: {', '.join(unknown)}",
+        )
+
+
 async def process_signal(
     data,
     *,
@@ -106,11 +129,13 @@ async def process_signal(
     if not ok:
         raise HTTPException(status_code=400, detail=f"invalid signal: {err}")
 
+    _validate_template_ids(signal, model)
+
     # 9.7 幂等：在 DEDUP_WINDOW 秒内，相同(处理模型/动作/品种/手数/止盈止损)的信号视为重复；
-    # 指纹带上 model，避免同一笔行情的 normal 与 strategy 信号互相误判为重复。
+    # 指纹带上 model 与模版定向，避免面向不同分组的信号互相误判为重复。
     fp = (
         f"{model}:{signal.action}:{signal.symbol}:{signal.volume}"
-        f":{signal.stop_loss}:{signal.take_profit}"
+        f":{signal.stop_loss}:{signal.take_profit}:{','.join(signal.template_ids)}"
     )
     if await store.seen_signal(fp):
         logger.info("duplicate signal suppressed: %s", fp)

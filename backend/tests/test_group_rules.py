@@ -1,12 +1,17 @@
 """分组纯规则单元测试（无 I/O）——与 test_rules.py（normal 链路）配套。
 
-锁定 strategy 链路的判定口径：model 字段规范化、分组分发模式、有效节点、
-组内轮转对齐、主任务号 <-> 魔术号换算、主任务状态汇总。
+锁定 strategy 链路的判定口径：model 字段规范化、策略模版定向、分组分发模式、
+有效节点、组内轮转对齐、主任务号 <-> 魔术号换算、主任务状态汇总。
 """
 import pytest
 
 from app import group_rules
 from app.config import Config
+from app.strategy_templates import (
+    TEMPLATE_1_ID,
+    TEMPLATE_1_NAME,
+    TEMPLATE_2_ID,
+)
 
 
 # =====================================================================
@@ -31,6 +36,38 @@ def test_normalize_signal_model_accepts_enum_and_blank(raw, expected):
 @pytest.mark.parametrize("raw", ["group", "abc", "0", "1", "normal2", "strategyy"])
 def test_normalize_signal_model_rejects_unknown(raw):
     assert group_rules.normalize_signal_model(raw) is None
+
+
+# =====================================================================
+# template_ids（策略模版定向）
+# =====================================================================
+def _strategy(template_id=TEMPLATE_1_ID, template_name=TEMPLATE_1_NAME):
+    return {"template_id": template_id, "template_name": template_name}
+
+
+@pytest.mark.parametrize("template_ids", [None, [], ["tpl_1"], ["tpl_2", "tpl_1"]])
+def test_template_reject_reason_accepts_when_unrestricted_or_hit(template_ids):
+    """缺省 / 空数组 = 不限制；命中数组内的模版同样放行。"""
+    assert group_rules.template_reject_reason(_strategy(), template_ids) is None
+
+
+def test_template_reject_reason_blocks_other_templates():
+    reason = group_rules.template_reject_reason(_strategy(), ["tpl_2", "tpl_3"])
+    assert reason is not None
+    assert TEMPLATE_1_NAME in reason and "tpl_2、tpl_3" in reason
+
+
+def test_template_reject_reason_blocks_strategy_without_template():
+    assert group_rules.template_reject_reason({}, ["tpl_1"]) is not None
+
+
+def test_unknown_template_ids_lists_only_unregistered():
+    assert group_rules.unknown_template_ids([TEMPLATE_1_ID, "tpl_x"]) == ["tpl_x"]
+
+
+@pytest.mark.parametrize("template_ids", [None, [], [TEMPLATE_1_ID, TEMPLATE_2_ID]])
+def test_unknown_template_ids_empty_for_known(template_ids):
+    assert group_rules.unknown_template_ids(template_ids) == []
 
 
 # =====================================================================

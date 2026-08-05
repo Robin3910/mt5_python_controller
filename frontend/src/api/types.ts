@@ -231,6 +231,8 @@ export interface ManualSignalPayload {
   stop_loss?: number
   take_profit?: number
   comment?: string
+  /** 策略模版定向（仅 strategy 模型）：只发给绑定了这些模版的分组；省略或空数组 = 不限制 */
+  template_ids?: string[]
 }
 
 /** Webhook model 字段：normal = 按币种分发（默认），strategy = 按分组分发 */
