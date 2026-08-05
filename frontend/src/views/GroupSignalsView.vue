@@ -306,6 +306,30 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
     push('错误', detail.error)
     return rows
   }
+  if (detail.kind === 'account_risk') {
+    push('风控规则', detail.rule_label || detail.rule)
+    push('触发说明', detail.message_core)
+    push('平仓动作', detail.close_action_label || detail.close_action)
+    push('品种', detail.symbol)
+    push('监控模式', detail.monitor_mode)
+    push('比例阈值', detail.ratio_threshold === undefined ? '' : `${detail.ratio_threshold}%`)
+    push('当前比例', detail.current_ratio === undefined ? '' : `${Number(detail.current_ratio).toFixed(2)}%`)
+    push('浮动盈亏', detail.floating_pl)
+    push('余额', detail.balance)
+    push('净值', detail.equity)
+    push('净值阈值', detail.amount_threshold)
+    push('盈亏阈值', detail.pl_amount)
+    push('当前盈亏', detail.current_pl)
+    push('订单数', detail.order_count)
+    push('拟平笔数', detail.close_count)
+    push('保护触发额', detail.trigger_amount)
+    push('收窄目标', detail.narrow_amount)
+    push('分档', detail.tier_index === undefined ? '' : `#${detail.tier_index + 1}`)
+    push('手数门槛', detail.min_lot)
+    push('当前手数', detail.current_lot)
+    push('规则条目', detail.item_id)
+    return rows
+  }
   push('来源信号', detail.signal_id)
   push('品种', detail.symbol)
   push('方向', detail.action)

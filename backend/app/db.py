@@ -146,7 +146,7 @@ def _migrate_group_task_strategy_columns(sync_conn) -> None:
             "total_orders": "INTEGER NOT NULL DEFAULT 0",
             "total_volume": "FLOAT NOT NULL DEFAULT 0",
             "realized_profit": "FLOAT NOT NULL DEFAULT 0",
-            "finish_reason": "VARCHAR(64)",
+            "finish_reason": "VARCHAR(255)",
             "opened_at": "DATETIME",
             "last_report_at": "DATETIME",
         }
@@ -155,6 +155,14 @@ def _migrate_group_task_strategy_columns(sync_conn) -> None:
                 sync_conn.execute(
                     text(f"ALTER TABLE group_task_dispatch ADD COLUMN {name} {ddl}")
                 )
+        # 账户风控结束原因含规则名与参数，需从历史 VARCHAR(64) 放宽
+        if "finish_reason" in cols and dialect == "mysql":
+            sync_conn.execute(
+                text(
+                    "ALTER TABLE group_task_dispatch "
+                    "MODIFY COLUMN finish_reason VARCHAR(255) NULL"
+                )
+            )
         # 布尔列需按方言区分：MySQL 用 TINYINT(1)，SQLite 用 BOOLEAN
         if "hold_when_empty" not in cols:
             if dialect == "mysql":

@@ -270,7 +270,7 @@ class GroupTaskDispatch(Base):
     total_orders: Mapped[int] = mapped_column(Integer, default=0)     # 累计下单笔数
     total_volume: Mapped[float] = mapped_column(Float, default=0.0)   # 累计手数
     realized_profit: Mapped[float] = mapped_column(Float, default=0.0)
-    finish_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    finish_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # 网格等策略空仓是常态：为 True 时账户快照对账不会因无持仓强制收口
     hold_when_empty: Mapped[bool] = mapped_column(Boolean, default=False)
     dispatched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

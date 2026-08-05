@@ -1058,6 +1058,55 @@ async def test_trade_result_by_magic_updates_task_and_signal(store, monkeypatch)
     assert sig.dispatch_mode == "group"
 
 
+async def test_finish_subtask_keeps_account_risk_reason_and_detail(store, monkeypatch):
+    """账户风控收口：结束原因与触发参数要落到 close_all 事件，供开单原因展示。"""
+    await online(store, mk_node("nd_a"))
+    await mk_group(store, "风控原因组", ["nd_a"])
+    monkeypatch.setattr(manager, "send_to_node", capture_sender([]))
+    await GroupDispatcher(store).dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_risk_reason",
+    )
+    task = (await fetch_tasks("sig_risk_reason"))[0]
+    await open_first_orders(task.task_id, ["nd_a"])
+    reason = (
+        "账户风控·手数分档盈亏：分档#2 总手数 0.6>=0.5 且盈亏 26.40 达 20；动作 全部平仓"
+    )
+    detail = {
+        "kind": "account_risk",
+        "rule": "lot_pl_tiers",
+        "rule_label": "手数分档盈亏",
+        "min_lot": 0.5,
+        "pl_amount": 20,
+        "current_lot": 0.6,
+        "current_pl": 26.4,
+    }
+    finished = await group_persist.finish_subtask(
+        node_id="nd_a", task_id=task.task_id,
+        data={
+            "status": "done",
+            "reason": reason,
+            "detail": detail,
+            "total_orders": 1,
+            "total_volume": 0.6,
+            "realized_profit": 26.4,
+        },
+    )
+    assert finished["task_status"] == "done"
+    rows = await fetch_dispatches(task.task_id)
+    assert rows[0].finish_reason == reason
+    async with SessionLocal() as s:
+        ev = (
+            await s.execute(
+                select(GroupTaskEvent).where(
+                    GroupTaskEvent.task_id == task.task_id,
+                    GroupTaskEvent.event_type == "close_all",
+                )
+            )
+        ).scalar_one()
+    assert ev.message == reason
+    assert ev.detail_json == detail
+
+
 async def test_trade_result_falls_back_to_signal_id(store, monkeypatch):
     """节点未上报魔术号时，按 signal_id 匹配该节点在途的明细。"""
     await online(store, mk_node("nd_a"))

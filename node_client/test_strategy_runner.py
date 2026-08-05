@@ -403,6 +403,32 @@ async def test_stop_request_closes_positions_and_finishes():
     assert runner.done
 
 
+async def test_stop_request_forwards_account_risk_detail():
+    """账户风控停策略时，结束原因与触发参数要一并上报，供后台展示。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, _hub = _runner(sent, mt5=mt5)
+    runner.start()
+    await _settle()
+
+    detail = {
+        "kind": "account_risk",
+        "rule": "lot_pl_tiers",
+        "rule_label": "手数分档盈亏",
+        "min_lot": 0.5,
+        "pl_amount": 20,
+        "current_lot": 0.6,
+        "current_pl": 26.4,
+    }
+    reason = "账户风控·手数分档盈亏：分档#2 总手数 0.6>=0.5 且盈亏 26.40 达 20；动作 全部平仓"
+    runner.request_stop(reason, detail=detail)
+    await _settle()
+
+    finished = _of_type(sent, "strategy_finished")
+    assert finished and finished[0]["reason"] == reason
+    assert finished[0]["detail"] == detail
+
+
 async def test_add_failure_reports_error_and_keeps_running():
     class HalfFailingMT5(MockMT5Client):
         def __init__(self) -> None:

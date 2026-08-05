@@ -422,11 +422,14 @@ class NodeClient:
         if now < self._risk_cooldown_until:
             return
 
-        # 账户级全平或大范围平仓时停策略监控，避免继续加仓
+        # 账户级全平或大范围平仓时停策略监控，避免继续加仓；
+        # 结束原因写清规则名与触发参数，供后台「开单原因」展示。
+        stop_reason = account_risk.describe_trigger(hit)
+        stop_detail = account_risk.trigger_detail(hit)
         if hit.get("close_action") in ("account_all", "all") or hit.get("scope_all_symbols"):
             for runner in list(self.runners.values()):
                 if not runner.done:
-                    runner.request_stop("account_risk")
+                    runner.request_stop(stop_reason, detail=stop_detail)
 
         res = await self._execute_risk_close(hit, positions)
         success = bool(res.get("success"))

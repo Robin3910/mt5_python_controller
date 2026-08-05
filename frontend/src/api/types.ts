@@ -542,6 +542,7 @@ export interface GroupTaskEventDetail {
     | 'grid_fill'
     | 'grid_close'
     | 'grid_shift'
+    | 'account_risk'
   // —— 加仓（kind=add）——
   rule_type?: number
   rule_type_label?: string
@@ -607,6 +608,28 @@ export interface GroupTaskEventDetail {
   avg_price?: number
   favorable?: number
   reason?: string
+  // —— 账户风控平仓（kind=account_risk）——
+  rule?: string
+  rule_label?: string
+  close_action?: string
+  close_action_label?: string
+  message_core?: string
+  monitor_mode?: string
+  item_id?: string
+  ratio_threshold?: number
+  current_ratio?: number
+  floating_pl?: number
+  balance?: number
+  equity?: number
+  amount_threshold?: number
+  pl_amount?: number
+  current_pl?: number
+  close_count?: number
+  trigger_amount?: number
+  narrow_amount?: number
+  tier_index?: number
+  min_lot?: number
+  current_lot?: number
   // —— 网格 ——
   side?: string
   grid_side?: string

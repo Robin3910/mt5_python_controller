@@ -102,6 +102,7 @@ class StrategyRunner:
         self._opened = False
         self._stopping = False
         self._stop_reason = "positions_cleared"
+        self._stop_detail: Optional[dict] = None
         self._finished = False
         self._seed_pending = False
         self._task: Optional[asyncio.Task] = None
@@ -156,10 +157,14 @@ class StrategyRunner:
     def start(self, *, resume: bool = False) -> None:
         self._task = asyncio.create_task(self._run(resume=resume))
 
-    def request_stop(self, reason: str = "stop_command") -> None:
+    def request_stop(
+        self, reason: str = "stop_command", *, detail: Optional[dict] = None,
+    ) -> None:
         """请求终止；立刻唤醒事件等待，不必等下一轮采样。"""
         self._stopping = True
         self._stop_reason = reason
+        if detail is not None:
+            self._stop_detail = detail
         if self._sub is not None:
             self._sub.wake()
 
@@ -1147,18 +1152,18 @@ class StrategyRunner:
             "task %s finished: %s (%s) realized_profit=%s",
             self.task_id, status, reason, realized,
         )
-        await self._send({
-            "type": "strategy_finished",
-            "data": {
-                "task_id": self.task_id,
-                "magic": self.magic,
-                "group_id": self.group_id,
-                "signal_id": self.signal_id,
-                "symbol": self.symbol,
-                "status": status,
-                "reason": reason,
-                "total_orders": self.total_orders,
-                "total_volume": round(self.total_volume, 4),
-                "realized_profit": realized,
-            },
-        })
+        data: dict = {
+            "task_id": self.task_id,
+            "magic": self.magic,
+            "group_id": self.group_id,
+            "signal_id": self.signal_id,
+            "symbol": self.symbol,
+            "status": status,
+            "reason": str(reason or "")[:MESSAGE_LIMIT],
+            "total_orders": self.total_orders,
+            "total_volume": round(self.total_volume, 4),
+            "realized_profit": realized,
+        }
+        if self._stop_detail:
+            data["detail"] = self._stop_detail
+        await self._send({"type": "strategy_finished", "data": data})

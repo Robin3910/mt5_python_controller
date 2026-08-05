@@ -27,6 +27,23 @@ CLOSE_ACTIONS_SIDE = ("all", "buy", "sell")
 MAX_LIST_ITEMS = 20
 MAX_TIERS = 10
 
+# 人读标签：落库到策略结束原因 / 平仓事件「开单原因」
+RULE_LABELS: dict[str, str] = {
+    RULE_FLOAT_PL_RATIO: "浮盈亏比例",
+    RULE_EQUITY_MIN: "净值下限",
+    RULE_SYMBOL_PL_ORDERS: "品种盈亏+订单数",
+    RULE_SYMBOL_PL_PROTECT: "浮盈亏保护",
+    RULE_LOT_PL_TIERS: "手数分档盈亏",
+}
+CLOSE_ACTION_LABELS: dict[str, str] = {
+    "account_all": "账户全部平仓",
+    "all": "全部平仓",
+    "buy": "多单平仓",
+    "sell": "空单平仓",
+    "hedge": "锁单平仓",
+}
+REASON_LIMIT = 255
+
 DEFAULT_FLOAT_PL_RATIO: dict[str, Any] = {
     "enabled": False,
     "ratio": -20.0,
@@ -620,6 +637,74 @@ def should_trigger_lot_pl_tiers(
             ),
         }
     return None
+
+
+def describe_trigger(hit: dict | None) -> str:
+    """把命中的风控规则写成一句可落库展示的原因（含规则名、参数、动作）。"""
+    if not isinstance(hit, dict):
+        return "账户风控"
+    rule = str(hit.get("rule") or "")
+    label = RULE_LABELS.get(rule, rule or "账户风控")
+    core = str(hit.get("message_core") or "").strip() or label
+    action = hit.get("close_action") or hit.get("action") or ""
+    action_label = CLOSE_ACTION_LABELS.get(str(action), str(action) or "平仓")
+    text = f"账户风控·{label}：{core}；动作 {action_label}"
+    return text[:REASON_LIMIT]
+
+
+def trigger_detail(hit: dict | None) -> dict | None:
+    """结构化触发参数，供前端「计算依据」展开。"""
+    if not isinstance(hit, dict):
+        return None
+    rule = str(hit.get("rule") or "")
+    detail: dict[str, Any] = {
+        "kind": "account_risk",
+        "rule": rule or None,
+        "rule_label": RULE_LABELS.get(rule) or rule or None,
+        "close_action": hit.get("close_action") or hit.get("action"),
+        "close_action_label": CLOSE_ACTION_LABELS.get(
+            str(hit.get("close_action") or hit.get("action") or ""),
+        ),
+        "symbol": hit.get("symbol"),
+        "message_core": hit.get("message_core"),
+        "monitor_mode": hit.get("monitor_mode"),
+        "item_id": hit.get("item_id"),
+    }
+    if rule == RULE_FLOAT_PL_RATIO:
+        detail.update({
+            "ratio_threshold": hit.get("threshold"),
+            "current_ratio": hit.get("current_ratio"),
+            "floating_pl": hit.get("floating_pl"),
+            "balance": hit.get("balance"),
+            "equity": hit.get("equity"),
+        })
+    elif rule == RULE_EQUITY_MIN:
+        detail.update({
+            "amount_threshold": hit.get("amount"),
+            "equity": hit.get("equity"),
+        })
+    elif rule == RULE_SYMBOL_PL_ORDERS:
+        detail.update({
+            "pl_amount": hit.get("pl_amount"),
+            "current_pl": hit.get("current_pl"),
+            "order_count": hit.get("order_count"),
+            "close_count": hit.get("close_count"),
+        })
+    elif rule == RULE_SYMBOL_PL_PROTECT:
+        detail.update({
+            "trigger_amount": hit.get("trigger_amount"),
+            "narrow_amount": hit.get("narrow_amount"),
+            "current_pl": hit.get("current_pl"),
+        })
+    elif rule == RULE_LOT_PL_TIERS:
+        detail.update({
+            "tier_index": hit.get("tier_index"),
+            "min_lot": hit.get("min_lot"),
+            "pl_amount": hit.get("pl_amount"),
+            "current_lot": hit.get("current_lot"),
+            "current_pl": hit.get("current_pl"),
+        })
+    return detail
 
 
 def find_triggered_rule(

@@ -251,3 +251,51 @@ def test_select_close_targets():
     assert len(hedge) == 2
     all_buy = ar.select_close_targets(positions, close_action="buy")
     assert len(all_buy) == 2
+
+
+def test_describe_trigger_includes_rule_and_params():
+    hit = ar.should_trigger_lot_pl_tiers(
+        {
+            "lot_pl_tiers": {
+                "enabled": True,
+                "batch_count": 2,
+                "close_action": "all",
+                "tiers": [
+                    {"min_lot": 0.1, "pl_amount": 50},
+                    {"min_lot": 0.5, "pl_amount": 20},
+                ],
+            }
+        },
+        positions=[
+            {"symbol": "XAUUSD", "type": "BUY", "volume": 0.6, "profit": 26.4},
+        ],
+    )
+    assert hit is not None
+    text = ar.describe_trigger(hit)
+    assert "手数分档盈亏" in text
+    assert "0.6" in text and "0.5" in text
+    assert "26.40" in text or "26.4" in text
+    assert "账户全部平仓" in text or "全部平仓" in text
+
+    detail = ar.trigger_detail(hit)
+    assert detail["kind"] == "account_risk"
+    assert detail["rule"] == ar.RULE_LOT_PL_TIERS
+    assert detail["min_lot"] == 0.5
+    assert detail["pl_amount"] == 20
+    assert detail["current_lot"] == 0.6
+
+
+def test_describe_trigger_float_pl_ratio():
+    hit = {
+        "rule": ar.RULE_FLOAT_PL_RATIO,
+        "close_action": "account_all",
+        "threshold": -20,
+        "current_ratio": -21.5,
+        "message_core": "浮盈亏比 -21.50% 达到阈值 -20%",
+    }
+    text = ar.describe_trigger(hit)
+    assert text.startswith("账户风控·浮盈亏比例：")
+    assert "-21.50%" in text and "-20%" in text
+    detail = ar.trigger_detail(hit)
+    assert detail["ratio_threshold"] == -20
+    assert detail["current_ratio"] == -21.5

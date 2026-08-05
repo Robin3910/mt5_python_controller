@@ -596,7 +596,8 @@ async def finish_subtask(
             released = _released(row)
             now = datetime.now()
             row.status = status
-            row.finish_reason = (data.get("reason") or "positions_cleared")[:64]
+            reason = str(data.get("reason") or "positions_cleared")[:255]
+            row.finish_reason = reason
             row.finished_at = now
             row.last_report_at = now
             row.position_count = 0
@@ -608,6 +609,7 @@ async def finish_subtask(
                 row.realized_profit = float(data["realized_profit"])
             if data.get("error"):
                 row.error = str(data["error"])[:255]
+            detail = data.get("detail")
 
             s.add(
                 GroupTaskEvent(
@@ -619,7 +621,8 @@ async def finish_subtask(
                     position_count=0,
                     total_volume=row.total_volume,
                     profit=row.realized_profit,
-                    message=row.finish_reason,
+                    message=reason,
+                    detail_json=detail if isinstance(detail, dict) else None,
                 )
             )
 
@@ -740,7 +743,7 @@ async def force_finish_subtasks(
             for row in rows:
                 released.extend(_released(row))
                 row.status = "failed"
-                row.finish_reason = reason[:64]
+                row.finish_reason = reason[:255]
                 row.finished_at = now
                 row.position_count = 0
             await s.flush()
