@@ -247,18 +247,29 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
     push('风险金额', detail.risk_amount)
     push('实际风险', detail.risk_used)
     push('手数公式', detail.lot_formula)
-    push('总手数', detail.total_lot)
+    push(
+      '总手数',
+      detail.dropped_lot
+        ? `${detail.total_lot}（反推 ${detail.planned_lot}，余 ${detail.dropped_lot} 不开）`
+        : detail.total_lot,
+    )
     push('底仓', detail.base_volume === undefined ? '' : `${detail.base_volume}（${detail.base_ratio ?? 0}% · TP=0）`)
     push(
       '分散仓',
       detail.add_batches
-        ? `${detail.distribute_volume ?? ''} 手 · 分 ${detail.add_batches} 单` +
+        ? `${detail.distribute_volume ?? ''} 手 · 等分 ${detail.add_batches} 单` +
           (detail.order_count ? ` · 共 ${detail.order_count} 单` : '')
         : '无（底仓即全仓）',
     )
     push('止损', detail.stop_loss || '不设')
-    push('分散仓止盈', detail.take_profit || '不设')
+    push(
+      '阶梯止盈',
+      detail.take_profit
+        ? `末档 ${detail.take_profit}` + (detail.tp_step ? ` · 步长 ${detail.tp_step}` : '')
+        : '不设',
+    )
     push('止损距离', detail.sl_points === undefined ? '' : `${detail.sl_points} 点`)
+    push('触发侧报价', detail.spread ? `${detail.risk_price}（点差 ${detail.spread}）` : '')
     push('托管策略', detail.strategy_name)
     push('策略模版', detail.template_id)
     push('魔术号', detail.magic)
@@ -266,13 +277,18 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
     return rows
   }
   if (detail.kind === 'risk_sized_distribute' || detail.kind === 'risk_sized_add') {
-    push('分散仓', detail.batch_index === undefined ? '' : `第 ${detail.batch_index}/${detail.batch_total ?? '?'} 单`)
+    push('分散仓', detail.batch_index === undefined ? '' : `第 ${detail.batch_index}/${detail.batch_total ?? '?'} 档`)
     push('首单开仓价', detail.entry_price)
     push('现价', detail.price)
     push('本单手数', detail.volume)
     push('总手数', detail.total_lot)
     push('止损', detail.stop_loss || '不设')
-    push('止盈', detail.take_profit || '不设')
+    push(
+      '本档止盈',
+      detail.take_profit
+        ? `${detail.take_profit}` + (detail.tp_full ? ` · 末档 ${detail.tp_full}` : '')
+        : '不设',
+    )
     push('风险金额', detail.risk_amount)
     push('实际风险', detail.risk_used)
     push('错误', detail.error)
@@ -289,6 +305,17 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
     push('新止损', detail.stop_loss)
     push('持仓笔数', detail.position_count)
     push('错误', detail.error)
+    return rows
+  }
+  if (detail.kind === 'close_reason') {
+    push('说明', detail.message)
+    push('止损笔数', detail.sl)
+    push('止盈笔数', detail.tp)
+    push('Stop Out', detail.so)
+    push('人工', detail.manual)
+    push('程序', detail.expert)
+    push('其他', detail.other)
+    push('出场合计', detail.total)
     return rows
   }
   if (detail.kind === 'grid_plan' || detail.kind === 'grid_fill' || detail.kind === 'grid_close') {

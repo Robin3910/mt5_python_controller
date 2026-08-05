@@ -355,7 +355,7 @@ export interface StrategyRule {
   // --- type=3：以损定量趋势单 ---
   /** 风险金额（账户货币） */
   risk_amount?: number
-  /** 盈亏比：止盈距离 = 止损距离 × 该值（挂在分散仓） */
+  /** 盈亏比：止盈距离 = 止损距离 × 该值；分散仓按等分阶梯挂，末档才吃满 */
   rr_ratio?: number
   /** 底仓占总手数的百分比（底仓止盈为 0） */
   base_ratio?: number
@@ -545,6 +545,7 @@ export interface GroupTaskEventDetail {
     | 'grid_close'
     | 'grid_shift'
     | 'account_risk'
+    | 'close_reason'
   // —— 加仓（kind=add）——
   rule_type?: number
   rule_type_label?: string
@@ -589,12 +590,23 @@ export interface GroupTaskEventDetail {
   sl_distance?: number
   sl_points?: number
   loss_per_lot?: number
+  /** 按风险金额反推的总手数；等分后实下可能略少 */
+  planned_lot?: number
   total_lot?: number
+  /** 分散仓等分除不尽、放弃不开的手数 */
+  dropped_lot?: number | null
   lot_formula?: string
   base_ratio?: number
   distribute_volume?: number
   add_batches?: number
   order_count?: number
+  /** 止损触发侧报价（多单 bid / 空单 ask），止损距离以此为准 */
+  risk_price?: number
+  spread?: number | null
+  /** 阶梯止盈相邻两档的间隔 */
+  tp_step?: number | null
+  /** 阶梯最远一档（吃满盈亏比） */
+  tp_full?: number | null
   entry_direction?: string
   entry_direction_label?: string
   gap_points?: number
@@ -610,6 +622,15 @@ export interface GroupTaskEventDetail {
   avg_price?: number
   favorable?: number
   reason?: string
+  // —— 被动平仓原因（kind=close_reason）——
+  message?: string
+  sl?: number
+  tp?: number
+  so?: number
+  manual?: number
+  expert?: number
+  other?: number
+  total?: number
   // —— 账户风控平仓（kind=account_risk）——
   rule?: string
   rule_label?: string

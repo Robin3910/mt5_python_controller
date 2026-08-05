@@ -1,6 +1,8 @@
 """Tests for the node client protocol logic using a fake websocket + mock MT5."""
 import asyncio
 import json
+import threading
+import time
 
 import node_client as nc
 
@@ -278,6 +280,31 @@ async def test_strategy_stop_closes_magic_positions():
     fin = [m for m in ws.sent if m["type"] == "strategy_finished"]
     assert fin and fin[0]["data"]["reason"] == "close_signal"
     await n.hub.close()
+
+
+async def test_exec_serializes_mt5_calls():
+    """MT5 API 非线程安全：并发提交的调用必须排队，否则风控清仓与策略收口
+    会同时对同一批持仓发单，后到的那笔被券商拒掉而误报平仓失败。"""
+    n = _node()
+    running = 0
+    peak = 0
+    guard = threading.Lock()
+
+    def blocking() -> bool:
+        nonlocal running, peak
+        with guard:
+            running += 1
+            peak = max(peak, running)
+        time.sleep(0.02)
+        with guard:
+            running -= 1
+        return True
+
+    try:
+        await asyncio.gather(*(n._exec(blocking) for _ in range(5)))
+    finally:
+        n._mt5_executor.shutdown(wait=False)
+    assert peak == 1
 
 
 async def test_handle_server_login_mismatch():

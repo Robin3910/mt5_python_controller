@@ -6,7 +6,8 @@
 设置 MT5_MOCK=true 可在无终端时用模拟器联调。
 
 设计要点：
-- MetaTrader5 的调用是阻塞式的，统一丢到线程池(run_in_executor)，不阻塞事件循环；
+- MetaTrader5 的调用是阻塞式且非线程安全的，统一丢到专用单线程执行器排队，
+  既不阻塞事件循环，也保证同一时刻只有一路在操作终端；
 - 断线自动重连（指数退避）；
 - 三个并发任务：账户上报 / 心跳 / 接收命令，任一结束即重建连接；
 - 策略托管任务由 MarketHub 统一采样并派发事件驱动（见 market_hub.py），
@@ -17,6 +18,7 @@ import asyncio
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import websockets
 
@@ -78,6 +80,9 @@ class NodeClient:
             reuse_terminal_session=reuse_terminal_session,
         )
         self.loop: asyncio.AbstractEventLoop | None = None
+        # MT5 的 Python API 非线程安全：所有阻塞调用固定在这一个线程里排队，
+        # 否则风控清仓与策略收口会并发对同一批持仓发单，后到的那笔必被拒
+        self._mt5_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mt5")
         self._stop = False
         # 中控台全局 filters 品种（auth_ok / watch_symbols 下发），与本地 WATCH_SYMBOLS 合并取价
         self.hub_symbols: set[str] = set()
@@ -103,6 +108,8 @@ class NodeClient:
             if self.hub is not None:
                 await self.hub.close()
                 self.hub = None
+            # 不等在途调用：退出路径上别把事件循环卡在 MT5 的阻塞请求里
+            self._mt5_executor.shutdown(wait=False)
 
     async def _connect_loop(self) -> None:
         backoff = settings.reconnect_min
@@ -144,8 +151,8 @@ class NodeClient:
 
     # ---------------------- MT5 辅助 ----------------------
     async def _exec(self, fn, *args):
-        """把阻塞式 MT5 调用放到线程池执行，避免阻塞事件循环。"""
-        return await self.loop.run_in_executor(None, lambda: fn(*args))
+        """把阻塞式 MT5 调用放到专用单线程执行：不阻塞事件循环，且彼此串行。"""
+        return await self.loop.run_in_executor(self._mt5_executor, lambda: fn(*args))
 
     async def _connect_mt5(self) -> None:
         try:

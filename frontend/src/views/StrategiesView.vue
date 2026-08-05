@@ -145,9 +145,12 @@ const FIELD_HELP = {
   risk_amount:
     '本次交易愿意承担的亏损金额（账户货币，通常是美元）。\n' +
     '总手数 = 风险金额 ÷ 每手止损亏损，其中每手止损亏损由止损距离与品种合约规格算出。\n' +
+    '止损距离按止损触发侧的报价算（多单看买价、空单看卖价）。\n' +
     '手数按品种步长向下取整，因此实际风险只会小于该值，不会超出。',
   rr_ratio:
-    '盈亏比。止盈距离 = 止损距离 × 该值，止盈价只挂在分散仓上（底仓止盈为 0）。\n' +
+    '盈亏比。止盈距离 = 止损距离 × 该值，止盈只挂在分散仓上（底仓止盈为 0）。\n' +
+    '分散仓按等分阶梯逐档兑现：第 i 单止盈 = 开仓价 + 止盈距离 × i ÷ 分散仓单数，\n' +
+    '只有最远一档吃满该盈亏比，前面各档按比例提前落袋。\n' +
     '填 0 表示分散仓也不设止盈，仅靠止损与人工干预出场。',
   base_ratio:
     '底仓占总手数的百分比，底仓以市价立即成交，止盈为 0。\n' +
@@ -155,6 +158,7 @@ const FIELD_HELP = {
   add_batches:
     '剩余仓位拆成几笔分散仓市价单。0 表示不拆分，总手数一次性由底仓成交。\n' +
     '开仓时与底仓一并市价打出（订单数 = 1 + 分散仓单数）。\n' +
+    '分散仓严格等手数，除不尽的余量不下单，因此实下总手数可能略少于反推值。\n' +
     '若剩余手数不足以让每笔都达到品种最小手数，节点会自动减少单数。',
   max_total_lot:
     '总手数硬上限，0 表示不额外限制（仍受品种最大手数约束）。\n' +
@@ -717,7 +721,9 @@ function ruleDetailRows(r: StrategyRule): Array<{ k: string; v: string }> {
       { k: '底仓', v: `${batches ? (r.base_ratio ?? 0) : 100}%（市价 · TP=0）` },
       {
         k: '分散仓',
-        v: batches ? `剩余拆 ${batches} 单市价（按盈亏比挂止盈）` : '无（底仓即全仓）',
+        v: batches
+          ? `剩余等分 ${batches} 单市价（阶梯止盈，末档吃满盈亏比）`
+          : '无（底仓即全仓）',
       },
       { k: '总手数上限', v: r.max_total_lot ? String(r.max_total_lot) : '不限' },
       {
@@ -1168,16 +1174,17 @@ function resetRuleToTemplate(idx: number): void {
                   </div>
                 </div>
                 <p class="rule-hint">
-                  总手数 = 风险金额 {{ r.risk_amount }} ÷ 每手止损亏损（由信号止损价与品种规格算出）；
-                  止盈距离 = 止损距离 × {{ r.rr_ratio }}（只挂在分散仓）；底仓
-                  {{ r.add_batches ? r.base_ratio : 100 }}% 市价成交（TP=0）
+                  总手数 = 风险金额 {{ r.risk_amount }} ÷ 每手止损亏损（由信号止损价与品种规格算出）；底仓
+                  {{ r.add_batches ? r.base_ratio : 100 }}% 市价成交（TP=0）；分散仓第 i 单止盈 = 开仓价 +
+                  止损距离 × {{ r.rr_ratio }} × i ÷ {{ r.add_batches || 1 }}
                 </p>
 
                 <div class="batch-block">
                   <div class="batch-head">
                     <FormLabel text="分散仓" :help="FIELD_HELP.add_batches" />
                     <span v-if="r.add_batches" class="muted batch-count-hint">
-                      剩余 {{ 100 - r.base_ratio }}% 拆 {{ r.add_batches }} 单 · 共 {{ 1 + r.add_batches }} 单
+                      剩余 {{ 100 - r.base_ratio }}% 等分 {{ r.add_batches }} 单 · 共
+                      {{ 1 + r.add_batches }} 单 · 阶梯止盈
                     </span>
                     <span v-else class="muted batch-count-hint">底仓即全仓</span>
                   </div>

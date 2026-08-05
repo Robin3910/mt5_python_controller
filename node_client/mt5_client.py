@@ -70,6 +70,11 @@ def peek_logged_in_account(path: str) -> dict | None:
         mt5.shutdown()
 
 
+def _closed_count(results: list[dict]) -> int:
+    """实际平掉的笔数：失败的不计入，避免把尝试笔数当成已平笔数上报。"""
+    return sum(1 for r in results if r.get("success"))
+
+
 class MT5Client:
     def __init__(
         self,
@@ -418,15 +423,12 @@ class MT5Client:
             "success": ok,
             "action": "CLOSE",
             "magic": int(magic),
-            "closed": len(results),
+            "closed": _closed_count(results),
             "results": results,
         }
 
-    def realized_profit_by_magic(self, magic: int, since_ts: float | None = None) -> float:
-        """汇总某魔术号在时间窗内的已实现盈亏（成交 profit + swap + commission）。
-
-        用于策略任务收口时上报 realized_profit；时间窗默认最近 7 天。
-        """
+    def _history_deals(self, since_ts: float | None = None):
+        """取时间窗内的成交历史；失败或空返回空元组。"""
         self.ensure()
         from datetime import datetime, timedelta
 
@@ -435,9 +437,14 @@ class MT5Client:
             start = datetime.fromtimestamp(float(since_ts)) - timedelta(minutes=1)
         else:
             start = end - timedelta(days=7)
-        deals = mt5.history_deals_get(start, end)
-        if not deals:
-            return 0.0
+        return mt5.history_deals_get(start, end) or ()
+
+    def realized_profit_by_magic(self, magic: int, since_ts: float | None = None) -> float:
+        """汇总某魔术号在时间窗内的已实现盈亏（成交 profit + swap + commission）。
+
+        用于策略任务收口时上报 realized_profit；时间窗默认最近 7 天。
+        """
+        deals = self._history_deals(since_ts)
         target = int(magic)
         total = 0.0
         for d in deals:
@@ -447,6 +454,36 @@ class MT5Client:
             total += float(getattr(d, "swap", 0) or 0)
             total += float(getattr(d, "commission", 0) or 0)
         return round(total, 2)
+
+    def exit_deals_by_magic(self, magic: int, since_ts: float | None = None) -> list[dict]:
+        """某魔术号在时间窗内的出场成交，供收口时区分止损 / 止盈 / 人工等。
+
+        每项含 entry / reason / profit / volume / price / ticket；只返回出场类 entry。
+        """
+        # DEAL_ENTRY_*：包不可用时回退到文档常量
+        entry_out = getattr(mt5, "DEAL_ENTRY_OUT", 1) if mt5 else 1
+        entry_inout = getattr(mt5, "DEAL_ENTRY_INOUT", 2) if mt5 else 2
+        entry_out_by = getattr(mt5, "DEAL_ENTRY_OUT_BY", 3) if mt5 else 3
+        out_entries = {int(entry_out), int(entry_inout), int(entry_out_by)}
+
+        deals = self._history_deals(since_ts)
+        target = int(magic)
+        out: list[dict] = []
+        for d in deals:
+            if int(getattr(d, "magic", 0) or 0) != target:
+                continue
+            entry = int(getattr(d, "entry", -1) or -1)
+            if entry not in out_entries:
+                continue
+            out.append({
+                "ticket": int(getattr(d, "ticket", 0) or 0),
+                "entry": entry,
+                "reason": int(getattr(d, "reason", -1) if getattr(d, "reason", None) is not None else -1),
+                "volume": float(getattr(d, "volume", 0) or 0),
+                "price": float(getattr(d, "price", 0) or 0),
+                "profit": float(getattr(d, "profit", 0) or 0),
+            })
+        return out
 
     def symbol_point(self, symbol: str) -> float:
         """品种最小价格变动单位；解析不到时返回 0（调用方据此跳过判定）。"""
@@ -581,7 +618,7 @@ class MT5Client:
             "success": ok,
             "symbol": symbol.upper(),
             "action": "CLOSE",
-            "closed": len(results),
+            "closed": _closed_count(results),
             "results": results,
         }
 
@@ -598,7 +635,7 @@ class MT5Client:
             "success": ok,
             "symbol": symbol,
             "action": "CLOSE",
-            "closed": len(results),
+            "closed": _closed_count(results),
             "results": results,
         }
 
@@ -611,6 +648,6 @@ class MT5Client:
             "success": ok,
             "symbol": symbol,
             "action": "CLOSE",
-            "closed": len(results),
+            "closed": _closed_count(results),
             "results": results,
         }

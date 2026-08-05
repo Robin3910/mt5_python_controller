@@ -36,6 +36,7 @@ class MockMT5Client:
         self._tickets = itertools.count(1000)   # 自增订单号
         self._positions: list[dict] = []         # 内存持仓
         self._realized_by_magic: dict[int, float] = {}  # 按魔术号累计已实现盈亏
+        self._exit_deals: list[dict] = []         # 出场成交（供收口原因汇总）
         self.prices_map = dict(_DEFAULT_PRICES)
 
     def connect(self) -> bool:
@@ -105,6 +106,19 @@ class MockMT5Client:
         return {"success": True, "symbol": symbol, "retcode": 10009,
                 "order": tk, "deal": tk, "volume": float(volume), "price": price}
 
+    def _record_exit(self, pos: dict, *, reason: int, profit: float) -> None:
+        """记下出场成交；reason 对齐 MT5 DEAL_REASON（4=SL / 5=TP / 3=EXPERT…）。"""
+        self._exit_deals.append({
+            "ticket": int(pos.get("ticket") or 0),
+            "magic": int(pos.get("magic") or self.magic),
+            "entry": 1,  # DEAL_ENTRY_OUT
+            "reason": int(reason),
+            "volume": float(pos.get("volume") or 0),
+            "price": float(pos.get("price_current") or pos.get("price_open") or 0),
+            "profit": float(profit),
+            "time": time.time(),
+        })
+
     def close_ticket(self, ticket: int) -> dict:
         pos = next((p for p in self._positions if p["ticket"] == ticket), None)
         if not pos:
@@ -113,6 +127,7 @@ class MockMT5Client:
         volume = float(pos["volume"])
         profit = float(pos.get("profit") or 0.0)
         magic = int(pos.get("magic") or self.magic)
+        self._record_exit(pos, reason=3, profit=profit)  # EXPERT / 程序平仓
         self._positions = [p for p in self._positions if p["ticket"] != ticket]
         self._realized_by_magic[magic] = self._realized_by_magic.get(magic, 0.0) + profit
         self.balance += profit
@@ -135,6 +150,8 @@ class MockMT5Client:
         target = int(magic)
         matched = [p for p in self._positions if int(p.get("magic") or 0) == target]
         profit = sum(float(p.get("profit") or 0.0) for p in matched)
+        for pos in matched:
+            self._record_exit(pos, reason=3, profit=float(pos.get("profit") or 0.0))
         self._positions = [
             p for p in self._positions if int(p.get("magic") or 0) != target
         ]
@@ -148,9 +165,31 @@ class MockMT5Client:
             "profit": round(profit, 2),
         }
 
+    def clear_by_magic_with_reason(self, magic: int, reason: int = 4) -> int:
+        """测试用：按 DEAL_REASON 清空持仓（默认 4=止损），模拟终端自动打掉。"""
+        target = int(magic)
+        matched = [p for p in self._positions if int(p.get("magic") or 0) == target]
+        profit = 0.0
+        for pos in matched:
+            pl = float(pos.get("profit") or 0.0)
+            profit += pl
+            self._record_exit(pos, reason=reason, profit=pl)
+        self._positions = [
+            p for p in self._positions if int(p.get("magic") or 0) != target
+        ]
+        self._realized_by_magic[target] = self._realized_by_magic.get(target, 0.0) + profit
+        self.balance += profit
+        return len(matched)
+
     def realized_profit_by_magic(self, magic: int, since_ts: float | None = None) -> float:
         """与真实 MT5Client 同口径：返回该魔术号累计已实现盈亏。"""
         return round(float(self._realized_by_magic.get(int(magic), 0.0)), 2)
+
+    def exit_deals_by_magic(self, magic: int, since_ts: float | None = None) -> list[dict]:
+        """与真实 MT5Client 同口径：返回该魔术号出场成交。"""
+        del since_ts  # mock 不按时间窗裁剪
+        target = int(magic)
+        return [dict(d) for d in self._exit_deals if int(d.get("magic") or 0) == target]
 
     def symbol_point(self, symbol: str) -> float:
         mid = float(self.prices_map.get(symbol.upper(), 1.0))

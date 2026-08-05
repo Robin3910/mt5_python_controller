@@ -25,6 +25,12 @@ GOLD = SymbolSpec(
     volume_min=0.01, volume_step=0.01, volume_max=100.0,
 )
 
+# BTC 类规格：合约规模 1，一手一美元价差值 1 美元（用于复现 MTcommander 实盘样本）
+BTC = SymbolSpec(
+    point=0.01, digits=2, tick_size=0.01, tick_value=0.01,
+    volume_min=0.01, volume_step=0.01, volume_max=100.0,
+)
+
 
 def rule(**over) -> dict:
     base = {
@@ -97,21 +103,22 @@ def test_wider_stop_gives_smaller_lot_at_same_risk():
 
 def test_lot_is_floored_to_volume_step_and_never_exceeds_risk():
     plan = plan_entries(cfg(), direction="BUY", entry_price=2400.0, stop_loss=2396.67, spec=GOLD)
-    assert plan.total_lot == pytest.approx(0.9)
+    assert plan.planned_lot == pytest.approx(0.9)
+    assert plan.total_lot <= plan.planned_lot
     assert plan.risk_used <= 300.0
 
 
 def test_max_total_lot_caps_the_result():
     plan = plan_entries(cfg(max_total_lot=0.5), direction="BUY", entry_price=2400.0,
                         stop_loss=2397.0, spec=GOLD)
-    assert plan.total_lot == pytest.approx(0.5)
+    assert plan.planned_lot == pytest.approx(0.5)
 
 
 def test_volume_max_caps_the_result():
     spec = SymbolSpec(point=0.01, digits=2, tick_size=0.01, tick_value=1.0,
                       volume_min=0.01, volume_step=0.01, volume_max=0.3)
     plan = plan_entries(cfg(), direction="BUY", entry_price=2400.0, stop_loss=2397.0, spec=spec)
-    assert plan.total_lot == pytest.approx(0.3)
+    assert plan.planned_lot == pytest.approx(0.3)
 
 
 def test_sell_direction_uses_stop_above_entry():
@@ -119,6 +126,32 @@ def test_sell_direction_uses_stop_above_entry():
     assert plan.ok
     assert plan.total_lot == pytest.approx(1.0)
     assert plan.take_profit == pytest.approx(2392.5)  # 2400 - 3 × 2.5
+
+
+# ---------------------------------------------------------------------------
+# 止损距离的基准价：止损触发侧（BUY=bid / SELL=ask）
+# ---------------------------------------------------------------------------
+
+def test_risk_price_measures_stop_distance_from_the_trigger_side():
+    """多单在 ask 成交、止损由 bid 触发：距离按 bid 算，阶梯锚在 ask。"""
+    plan = plan_entries(cfg(), direction="BUY", entry_price=2400.06,
+                        stop_loss=2397.0, spec=GOLD, risk_price=2399.94)
+    assert plan.spread == pytest.approx(0.12)
+    assert plan.sl_distance == pytest.approx(2.94)
+    assert plan.take_profit == pytest.approx(2400.06 + 2.94 * 2.5)
+
+
+def test_sell_risk_price_sits_above_entry():
+    plan = plan_entries(cfg(), direction="SELL", entry_price=2399.94,
+                        stop_loss=2403.0, spec=GOLD, risk_price=2400.06)
+    assert plan.sl_distance == pytest.approx(2.94)
+    assert plan.take_profit == pytest.approx(2399.94 - 2.94 * 2.5)
+
+
+def test_risk_price_falls_back_to_entry_price():
+    plan = plan_entries(cfg(), direction="BUY", entry_price=2400.0, stop_loss=2397.0, spec=GOLD)
+    assert plan.risk_price == pytest.approx(2400.0)
+    assert plan.spread == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +206,18 @@ def test_batches_sum_to_total_lot():
     plan = plan_entries(cfg(), direction="BUY", entry_price=2400.0, stop_loss=2397.0, spec=GOLD)
     assert len(plan.batches) == 3           # 底仓 + 2 分散
     assert sum(b.volume for b in plan.batches) == pytest.approx(plan.total_lot)
+    assert plan.total_lot <= plan.planned_lot
+
+
+def test_distribute_lots_are_equal_and_remainder_is_dropped():
+    """分散仓严格等手数；除不尽的余量宁可不开，也不并到末笔上。"""
+    plan = plan_entries(cfg(max_total_lot=0.5), direction="BUY", entry_price=2400.0,
+                        stop_loss=2397.0, spec=GOLD)
+    assert plan.planned_lot == pytest.approx(0.5)
+    assert plan.base_volume == pytest.approx(0.15)      # ⌊0.5 × 30%⌋
+    assert [b.volume for b in plan.batches[1:]] == [0.17, 0.17]
+    assert plan.total_lot == pytest.approx(0.49)
+    assert plan.dropped_lot == pytest.approx(0.01)
 
 
 def test_base_volume_follows_base_ratio():
@@ -197,14 +242,13 @@ def test_distribute_count_shrinks_when_rest_cannot_fill_every_order():
     assert sum(b.volume for b in plan.batches) == pytest.approx(0.03)
 
 
-def test_base_has_no_take_profit_distribute_shares_rr_target():
-    """对齐截图：底仓 TP=0，分散仓挂盈亏比止盈。"""
+def test_base_has_no_take_profit_distribute_climbs_the_ladder():
+    """对齐截图：底仓 TP=0，分散仓按等分阶梯逐档挂止盈。"""
     plan = plan_entries(cfg(), direction="BUY", entry_price=2400.0, stop_loss=2397.0, spec=GOLD)
     assert plan.batches[0].take_profit == 0.0
     assert plan.batches[0].is_base
-    for batch in plan.batches[1:]:
-        assert batch.is_distribute
-        assert batch.take_profit == pytest.approx(2407.5)
+    assert [b.take_profit for b in plan.batches[1:]] == pytest.approx([2403.75, 2407.5])
+    assert plan.tp_step == pytest.approx(3.75)
 
 
 def test_ten_distribute_orders_match_screenshot_shape():
@@ -220,20 +264,45 @@ def test_ten_distribute_orders_match_screenshot_shape():
 # 止盈与成交价重挂
 # ---------------------------------------------------------------------------
 
-def test_take_profit_follows_risk_reward_ratio():
+def test_full_risk_reward_ratio_lands_on_the_last_rung():
     plan = plan_entries(cfg(rr_ratio=2.5), direction="BUY", entry_price=2400.0,
                         stop_loss=2397.0, spec=GOLD)
-    assert plan.take_profit == pytest.approx(2407.5)   # 2400 + 3 × 2.5
+    assert plan.take_profit == pytest.approx(2407.5)             # 2400 + 3 × 2.5
+    assert plan.batches[-1].take_profit == pytest.approx(2407.5)
+
+
+def test_ladder_is_evenly_spaced_and_strictly_increasing():
+    plan = plan_entries(cfg(risk_amount=3000, add_batches=5), direction="BUY",
+                        entry_price=2400.0, stop_loss=2397.0, spec=GOLD)
+    tps = [b.take_profit for b in plan.batches[1:]]
+    assert len(tps) == 5
+    assert tps == pytest.approx([2401.5, 2403.0, 2404.5, 2406.0, 2407.5])
+    assert plan.tp_step == pytest.approx(1.5)                    # 3 × 2.5 ÷ 5
+
+
+def test_ladder_divides_by_the_actual_distribute_count():
+    """单数被最小手数削减时，最远一档仍要吃满配置的盈亏比。"""
+    plan = plan_entries(cfg(risk_amount=9, base_ratio=30, add_batches=5),
+                        direction="BUY", entry_price=2400.0, stop_loss=2397.0, spec=GOLD)
+    assert plan.add_batch_count == 2
+    assert [b.take_profit for b in plan.batches[1:]] == pytest.approx([2403.75, 2407.5])
+
+
+def test_sell_ladder_steps_downwards():
+    plan = plan_entries(cfg(), direction="SELL", entry_price=2400.0,
+                        stop_loss=2403.0, spec=GOLD)
+    assert [b.take_profit for b in plan.batches[1:]] == pytest.approx([2396.25, 2392.5])
 
 
 def test_zero_ratio_means_no_take_profit():
     plan = plan_entries(cfg(rr_ratio=0), direction="BUY", entry_price=2400.0,
                         stop_loss=2397.0, spec=GOLD)
     assert plan.take_profit == 0.0
+    assert plan.tp_step == 0.0
     assert all(b.take_profit == 0.0 for b in plan.batches)
 
 
-def test_anchor_to_fill_shifts_tp_but_keeps_lots_and_base_tp_zero():
+def test_anchor_to_fill_shifts_the_ladder_but_keeps_lots_and_base_tp_zero():
     c = cfg()
     plan = plan_entries(c, direction="BUY", entry_price=2400.0, stop_loss=2397.0, spec=GOLD)
     lots = [b.volume for b in plan.batches]
@@ -243,7 +312,19 @@ def test_anchor_to_fill_shifts_tp_but_keeps_lots_and_base_tp_zero():
     assert plan.sl_distance == pytest.approx(3.5)
     assert plan.take_profit == pytest.approx(2409.25)   # 2400.5 + 3.5 × 2.5
     assert plan.batches[0].take_profit == 0.0
-    assert all(b.take_profit == pytest.approx(2409.25) for b in plan.batches[1:])
+    assert plan.batches[1].take_profit == pytest.approx(2404.875, abs=0.01)
+    assert plan.batches[2].take_profit == pytest.approx(2409.25)
+
+
+def test_anchor_to_fill_carries_the_spread_along():
+    """重锚时点差随开仓价平移，止损距离仍按触发侧算。"""
+    c = cfg()
+    plan = plan_entries(c, direction="BUY", entry_price=2400.06, stop_loss=2397.0,
+                        spec=GOLD, risk_price=2399.94)
+    anchor_to_fill(plan, c, 2400.5, GOLD)
+    assert plan.risk_price == pytest.approx(2400.38)    # 2400.5 - 0.12
+    assert plan.sl_distance == pytest.approx(3.38)
+    assert plan.take_profit == pytest.approx(2400.5 + 3.38 * 2.5)
 
 
 def test_anchor_to_fill_is_noop_without_fill_price():
@@ -251,6 +332,45 @@ def test_anchor_to_fill_is_noop_without_fill_price():
     plan = plan_entries(c, direction="BUY", entry_price=2400.0, stop_loss=2397.0, spec=GOLD)
     anchor_to_fill(plan, c, 0.0, GOLD)
     assert plan.entry_price == pytest.approx(2400.0)
+
+
+# ---------------------------------------------------------------------------
+# MTcommander 实盘样本复现（BTCUSD，风险 100 / 盈亏比 2.5 / 底仓 30% / 分散 10 单）
+# ---------------------------------------------------------------------------
+
+def test_reproduces_mtcommander_sample_one():
+    """截图样本：bid 64427.40 / ask 64439.40，止损 64270.60 -> 0.18 + 0.04 × 10。"""
+    c = cfg(risk_amount=100, rr_ratio=2.5, base_ratio=30, add_batches=10)
+    plan = plan_entries(c, direction="BUY", entry_price=64439.40, stop_loss=64270.60,
+                        spec=BTC, risk_price=64427.40)
+    assert plan.sl_distance == pytest.approx(156.80)
+    assert plan.planned_lot == pytest.approx(0.63)
+    assert plan.base_volume == pytest.approx(0.18)
+    assert [b.volume for b in plan.batches[1:]] == [0.04] * 10
+    assert plan.total_lot == pytest.approx(0.58)
+    assert plan.dropped_lot == pytest.approx(0.05)
+    assert plan.tp_step == pytest.approx(39.2)
+    assert [b.take_profit for b in plan.batches[1:]] == pytest.approx([
+        64478.60, 64517.80, 64557.00, 64596.20, 64635.40,
+        64674.60, 64713.80, 64753.00, 64792.20, 64831.40,
+    ])
+
+
+def test_reproduces_mtcommander_sample_two():
+    """截图样本：bid 64274.20 / ask 64286.20，止损 63986.99 -> 0.1 + 0.02 × 10。"""
+    c = cfg(risk_amount=100, rr_ratio=2.5, base_ratio=30, add_batches=10)
+    plan = plan_entries(c, direction="BUY", entry_price=64286.20, stop_loss=63986.99,
+                        spec=BTC, risk_price=64274.20)
+    assert plan.planned_lot == pytest.approx(0.34)
+    assert plan.base_volume == pytest.approx(0.10)
+    assert [b.volume for b in plan.batches[1:]] == [0.02] * 10
+    assert plan.total_lot == pytest.approx(0.30)
+    # 这组报价是从截图的止盈阶梯反解出来的（本身已被券商取整到分），
+    # 加上 MT5 四舍五入、Python 银行家舍入，个别档位允许差两分
+    assert [b.take_profit for b in plan.batches[1:]] == pytest.approx([
+        64358.00, 64429.81, 64501.61, 64573.41, 64645.21,
+        64717.02, 64788.82, 64860.62, 64932.42, 65004.23,
+    ], abs=0.02)
 
 
 # ---------------------------------------------------------------------------

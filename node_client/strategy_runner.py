@@ -11,8 +11,8 @@
 - 加仓路径（模版1）：首单手数用信号手数，之后按逆势 / 顺势规则加仓，判定见
   `strategy_rules.evaluate`；
 - 以损定量路径（模版2）：手数由「风险金额 ÷ 止损距离」反推，底仓市价成交（TP=0）
-  后立即拆开分散仓市价单（按盈亏比挂止盈），可选浮盈达标后移动止损保本，计算见
-  `risk_sizing`；
+  后立即拆开等手数分散仓市价单（按等分阶梯挂止盈），可选浮盈达标后移动止损保本，
+  计算见 `risk_sizing`；
 - 网格路径（模版3）：区间内逐格买卖的手动网格，空仓是正常运行态，
   只由止损 / 止盈 / strategy_stop 收口，计算见 `grid_trading`。
 
@@ -34,6 +34,7 @@ import grid_trading
 import risk_sizing
 from market_hub import GONE, STALE, MarketEvent, MarketHub, Subscription
 from risk_sizing import EntryPlan, RiskSizedConfig, SymbolSpec
+import close_reason
 from strategy_rules import (
     CALC_BAR_TYPES,
     MT5_COMMENT_LIMIT,
@@ -231,6 +232,9 @@ class StrategyRunner:
                 return False
             if not self._opened:
                 return False
+            # 默认 positions_cleared 时查成交历史，区分止损 / 止盈 / 人工
+            if self._stop_reason == close_reason.DEFAULT_CLEAR_REASON:
+                await self._resolve_passive_close_reason()
             await self._finish("done", self._stop_reason)
             return True
 
@@ -425,28 +429,33 @@ class StrategyRunner:
             )
         return self._risk_spec
 
-    async def _risk_entry_quote(self) -> float:
-        """下底仓前的预估开仓价：多单取 ask、空单取 bid。
+    async def _risk_quote_pair(self) -> tuple[float, float]:
+        """下底仓前的报价对：(开仓侧, 止损触发侧)。
 
-        手数必须在下单前算出来，所以只能用当前报价预估；底仓成交后再用真实成交价
-        把分散仓止盈重挂一次（见 risk_sizing.anchor_to_fill）。
+        多单在 ask 成交、止损由 bid 触发，空单相反；止损距离要按触发侧算，阶梯止盈
+        则锚在开仓侧，两者差一个点差。手数必须在下单前算出来，所以只能用当前报价
+        预估；底仓成交后再用真实成交价把阶梯重锚一次（见 risk_sizing.anchor_to_fill）。
         """
         quotes = dict(await self._exec(self._mt5.quotes, [self.symbol]) or {})
         quote = quotes.get(self.symbol) or next(iter(quotes.values()), {})
-        key = "ask" if self.direction == "BUY" else "bid"
-        return _as_float(quote.get(key)) or _as_float(quote.get("mid"))
+        mid = _as_float(quote.get("mid"))
+        bid = _as_float(quote.get("bid")) or mid
+        ask = _as_float(quote.get("ask")) or mid
+        return (ask, bid) if self.direction == "BUY" else (bid, ask)
 
     async def _risk_open_base(self) -> bool:
         """以损定量开仓：反推总手数 → 底仓市价（TP=0）→ 立即开齐分散仓。"""
         cfg = self._risk_cfg
         assert cfg is not None
         spec = await self._risk_symbol_spec()
+        entry_quote, risk_quote = await self._risk_quote_pair()
         plan = risk_sizing.plan_entries(
             cfg,
             direction=self.direction,
-            entry_price=await self._risk_entry_quote(),
+            entry_price=entry_quote,
             stop_loss=_as_float(self.entry.get("stop_loss")),
             spec=spec,
+            risk_price=risk_quote,
         )
         if not plan.ok:
             logger.warning("task %s risk sizing rejected: %s", self.task_id, plan.reject)
@@ -497,7 +506,7 @@ class StrategyRunner:
         )
         # 底仓成交后立即市价开齐分散仓（对齐「订单数量 = 1 + N」）
         await self._risk_open_pending_distribute(
-            quote=_as_float(res.get("price")) or await self._risk_entry_quote(),
+            quote=_as_float(res.get("price")) or entry_quote,
         )
         return True
 
@@ -519,20 +528,26 @@ class StrategyRunner:
         """恢复后按真实持仓重建建仓计划。
 
         断线时计划已随进程丢失，而持仓上还挂着当初写进 MT5 的止损：用最早一笔的
-        开仓价与止损价就能把计划还原出来。若止损已被保本移动过（不在不利侧），
-        plan_entries 会拒绝重建，此时降级为只监控到全平，不再补开分散仓也不再动止损。
+        开仓价与止损价就能把计划还原出来。当初的点差已无从查起，用当前点差近似。
+        若止损已被保本移动过（不在不利侧），plan_entries 会拒绝重建，此时降级为
+        只监控到全平，不再补开分散仓也不再动止损。
         """
         cfg = self._risk_cfg
         if cfg is None or not positions:
             return
         earliest = min(positions, key=lambda p: (p.get("time") or 0, p.get("ticket") or 0))
         spec = await self._risk_symbol_spec()
+        entry_quote, risk_quote = await self._risk_quote_pair()
+        spread = abs(entry_quote - risk_quote)
+        sign = 1 if self.direction == "BUY" else -1
+        entry_price = _as_float(earliest.get("price_open"))
         plan = risk_sizing.plan_entries(
             cfg,
             direction=self.direction,
-            entry_price=_as_float(earliest.get("price_open")),
+            entry_price=entry_price,
             stop_loss=_as_float(earliest.get("sl")),
             spec=spec,
+            risk_price=entry_price - sign * spread,
         )
         if not plan.ok:
             logger.info(
@@ -572,7 +587,7 @@ class StrategyRunner:
 
     async def _risk_add_batch(self, batch, plan: EntryPlan, cfg: RiskSizedConfig,
                               price: float, positions: list[dict]) -> bool:
-        """开一笔分散仓；共用信号止损，按盈亏比挂止盈。成功返回 True。"""
+        """开一笔分散仓；共用信号止损，挂阶梯上属于自己的那一档止盈。成功返回 True。"""
         spec = await self._risk_symbol_spec()
         reason = risk_sizing.describe_batch(plan, cfg, batch, spec, price)
         res = dict(await self._exec(
@@ -1142,6 +1157,28 @@ class StrategyRunner:
         if detail:
             data["detail"] = detail
         await self._send({"type": "strategy_progress", "data": data})
+
+    async def _resolve_passive_close_reason(self) -> None:
+        """被动全平（终端止损/止盈/人工）时，用成交历史把默认码换成中文原因。
+
+        主动 stop（strategy_stop / 账户风控）已写过 _stop_reason，不会走进这里。
+        """
+        if not hasattr(self._mt5, "exit_deals_by_magic"):
+            return
+        since = self._started_at or (time.time() - 86400)
+        try:
+            deals = await self._exec(self._mt5.exit_deals_by_magic, self.magic, since)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "task %s exit_deals_by_magic failed", self.task_id, exc_info=True,
+            )
+            return
+        message, detail = close_reason.summarize_exit_deals(list(deals or []))
+        if message == close_reason.DEFAULT_CLEAR_REASON:
+            return
+        self._stop_reason = message
+        if detail is not None and self._stop_detail is None:
+            self._stop_detail = detail
 
     async def _finish(self, status: str, reason: str) -> None:
         if self._finished:

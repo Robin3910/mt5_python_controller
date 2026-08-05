@@ -126,8 +126,50 @@ async def test_gone_event_finishes_task():
 
     finished = _of_type(sent, "strategy_finished")
     assert finished and finished[0]["status"] == "done"
+    # 无出场成交历史时仍退回默认码
     assert finished[0]["reason"] == "positions_cleared"
     assert runner.done
+
+
+async def test_gone_event_reports_stop_loss_reason_from_deals():
+    """被动全平：从成交历史识别止损打掉，不再只报 positions_cleared。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub = _runner(sent, mt5=mt5)
+    runner.start()
+    await _settle()
+
+    # 终端止损打掉：持仓清空并留下 DEAL_REASON_SL 出场记录
+    mt5.clear_by_magic_with_reason(MAGIC, reason=4)
+    hub.sub.offer(mh.MarketEvent(kind=mh.GONE, symbol="XAUUSD", magic=MAGIC))
+    await _settle()
+
+    finished = _of_type(sent, "strategy_finished")
+    assert finished and finished[0]["status"] == "done"
+    assert finished[0]["reason"].startswith("止损打掉")
+    assert finished[0]["detail"]["kind"] == "close_reason"
+    assert finished[0]["detail"]["sl"] >= 1
+    assert runner.done
+
+
+async def test_gone_keeps_explicit_stop_reason():
+    """主动 stop 已写过原因时，不被成交历史覆盖。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub = _runner(sent, mt5=mt5)
+    runner.start()
+    await _settle()
+
+    runner.request_stop("账户风控·净值下限：净值 900 < 1000；动作 全部平仓")
+    mt5.clear_by_magic_with_reason(MAGIC, reason=4)
+    hub.sub.offer(mh.MarketEvent(kind=mh.GONE, symbol="XAUUSD", magic=MAGIC))
+    await _settle(10)
+
+    finished = _of_type(sent, "strategy_finished")
+    assert finished
+    assert "账户风控" in finished[0]["reason"]
+    assert "止损打掉" not in finished[0]["reason"]
+    runner.cancel()
     assert hub.unsubscribed is True
 
 
@@ -493,11 +535,16 @@ async def test_subscription_close_exits_monitor_quietly():
 # 以损定量趋势单（策略模版2）
 #
 # mock 的黄金规格：point=tick_size=0.01、tick_value=1.0，即一手一美元价差值 100。
-# 测试统一把价格钉在 2400、止损放 2397（距离 3 美元 = 300 点 -> 一手亏 300）。
+# 测试统一把中间价钉在 2400、止损放 2397；mock 的点差是 0.12，于是 bid=2399.94、
+# ask=2400.06，多单按触发侧 bid 算止损距离 2.94（一手亏 294）-> 总手数 1.02。
+# mock 的市价单固定按中间价 2400 成交，底仓成交后阶梯会重锚到 2400（距离 2.88）。
 # ---------------------------------------------------------------------------
 
 ENTRY_PRICE = 2400.0
 STOP_LOSS = 2397.0
+TOTAL_LOT = 1.02
+# 重锚到成交价 2400 后：止损距 2.88，满档 = 2400 + 2.88 × 2.5，两单阶梯等分
+LADDER = [2403.6, 2407.2]
 
 
 def risk_rule(**over) -> dict:
@@ -550,16 +597,16 @@ async def test_risk_sized_base_order_ignores_signal_volume():
     await _settle()
 
     held = mt5.positions_by_magic(MAGIC)
-    # ask 略高于 2400 -> 总手数 0.98；开仓时底仓 + 2 分散仓一次打齐
+    # 总手数 1.02，底仓 30%；开仓时底仓 + 2 分散仓一次打齐
     assert len(held) == 3
-    assert held[0]["volume"] == 0.29
+    assert held[0]["volume"] == 0.3
     assert held[0]["volume"] != 0.1
     assert runner.risk_sized is True
     runner.cancel()
 
 
-async def test_risk_sized_base_has_no_tp_distribute_carries_rr_target():
-    """底仓 TP=0；分散仓共用信号止损并按盈亏比挂止盈。"""
+async def test_risk_sized_base_has_no_tp_distribute_climbs_the_ladder():
+    """底仓 TP=0；分散仓共用信号止损，按等分阶梯逐档挂止盈。"""
     sent: list = []
     runner, hub, mt5 = _risk_runner(sent)
     runner.start()
@@ -568,9 +615,21 @@ async def test_risk_sized_base_has_no_tp_distribute_carries_rr_target():
     held = mt5.positions_by_magic(MAGIC)
     assert held[0]["sl"] == STOP_LOSS
     assert not held[0].get("tp")
-    for pos in held[1:]:
-        assert pos["sl"] == STOP_LOSS
-        assert pos["tp"] == 2407.5      # 2400 + 3.0 × 2.5
+    assert [p["sl"] for p in held[1:]] == [STOP_LOSS, STOP_LOSS]
+    assert [p["tp"] for p in held[1:]] == LADDER
+    runner.cancel()
+
+
+async def test_risk_sized_distribute_lots_are_equal():
+    """分散仓严格等手数，余量不并到末笔。"""
+    sent: list = []
+    runner, hub, mt5 = _risk_runner(sent, add_batches=4)
+    runner.start()
+    await _settle()
+
+    volumes = [p["volume"] for p in mt5.positions_by_magic(MAGIC)[1:]]
+    assert len(volumes) == 4
+    assert len(set(volumes)) == 1
     runner.cancel()
 
 
@@ -585,10 +644,11 @@ async def test_risk_sized_open_reports_lot_formula():
     assert "底仓 30%" in opened["message"]
     detail = opened["detail"]
     assert detail["kind"] == "open"
-    assert detail["total_lot"] == 0.98
+    assert detail["total_lot"] == TOTAL_LOT
     assert detail["risk_amount"] == 300.0
     assert detail["risk_used"] <= 300.0
     assert detail["stop_loss"] == STOP_LOSS
+    assert detail["tp_step"] == 3.6
     assert detail["order_count"] == 3
     assert len(detail["batches"]) == 3      # 底仓 + 2 分散
     assert runner.add_count == 2
@@ -631,7 +691,7 @@ async def test_risk_sized_opens_all_distribute_immediately():
 
     held = mt5.positions_by_magic(MAGIC)
     assert len(held) == 3
-    assert round(sum(p["volume"] for p in held), 2) == 0.98
+    assert round(sum(p["volume"] for p in held), 2) == TOTAL_LOT
     assert runner.add_count == 2
     distribute = _progress(sent, "add_trend")
     assert len(distribute) == 2
@@ -646,9 +706,9 @@ async def test_risk_sized_distribute_shares_the_same_stop():
     runner.start()
     await _settle()
 
-    for pos in mt5.positions_by_magic(MAGIC)[1:]:
+    for pos, tp in zip(mt5.positions_by_magic(MAGIC)[1:], LADDER):
         assert pos["sl"] == STOP_LOSS
-        assert pos["tp"] == 2407.5
+        assert pos["tp"] == tp
         assert pos["comment"].startswith("R3B")
     runner.cancel()
 
@@ -661,7 +721,7 @@ async def test_risk_sized_no_distribute_puts_everything_in_base():
 
     held = mt5.positions_by_magic(MAGIC)
     assert len(held) == 1
-    assert held[0]["volume"] == 0.98
+    assert held[0]["volume"] == TOTAL_LOT
     assert not held[0].get("tp")
     runner.cancel()
 
@@ -680,7 +740,7 @@ async def test_risk_sized_breakeven_moves_stop_to_average_price():
     assert moved and "保本触发" in moved[0]["message"]
     assert mt5.positions_by_magic(MAGIC)[0]["sl"] == ENTRY_PRICE
     # 保本改单不能顺手抹掉已挂的止盈（分散仓）
-    assert mt5.positions_by_magic(MAGIC)[1]["tp"] == 2407.5
+    assert mt5.positions_by_magic(MAGIC)[1]["tp"] == LADDER[0]
     runner.cancel()
 
 
