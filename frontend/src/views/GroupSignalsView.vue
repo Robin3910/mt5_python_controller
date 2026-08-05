@@ -39,8 +39,8 @@ const loadingDispatchEvents = ref<Record<string, boolean>>({})
 /** 订单展开：展示该笔订单的开单原因与逐项计算参数 */
 const expandedEvent = ref<Record<string, boolean>>({})
 
-/** 自动刷新订单数据：默认关闭，开启后每秒静默刷新 */
-const autoRefresh = ref(false)
+/** 自动刷新订单数据：默认开启，每秒静默刷新 */
+const autoRefresh = ref(true)
 let autoRefreshTimer: ReturnType<typeof setInterval> | undefined
 let autoRefreshInFlight = false
 
@@ -68,6 +68,10 @@ async function fetchSignalsPage(): Promise<void> {
   signals.value = res.items
   total.value = res.total
   if (res.page !== page.value) page.value = res.page
+  // 「仅进行中」无数据时自动切回「全部」
+  if (activeOnly.value && res.total === 0) {
+    setActiveFilter(false)
+  }
 }
 
 async function loadSignals(): Promise<void> {
@@ -528,14 +532,18 @@ watch(activeOnly, () => {
   void loadSignals()
 })
 
-watch(autoRefresh, (on) => {
-  if (on) {
-    void refreshLiveData()
-    startAutoRefresh()
-  } else {
-    stopAutoRefresh()
-  }
-})
+watch(
+  autoRefresh,
+  (on) => {
+    if (on) {
+      void refreshLiveData()
+      startAutoRefresh()
+    } else {
+      stopAutoRefresh()
+    }
+  },
+  { immediate: true },
+)
 
 onUnmounted(stopAutoRefresh)
 </script>
