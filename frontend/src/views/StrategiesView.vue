@@ -182,8 +182,22 @@ const FIELD_HELP = {
     '网格方向：\n只做多 = 跌买涨卖；\n只做空 = 涨卖跌买；\n跟随信号 = 按触发信号的 BUY/SELL 决定方向。',
   lot_per_grid: '每一格买入/卖出的手数。',
   trigger_price: '触发价。填 0 表示信号到达后立即启动；否则等到价触及该价才建网格。',
-  stop_lower: '止损价，须低于区间下限；填 0 表示不设。多头网格跌破此价终止。',
-  stop_upper: '止盈价，须高于区间上限；填 0 表示不设。多头网格涨破此价终止。',
+  stop_lower:
+    '下沿终止价，须低于区间下限；填 0 表示不设。' +
+    '多头 / 跟随信号做多时为止损；空头时为止盈。',
+  stop_upper:
+    '上沿终止价，须高于区间上限；填 0 表示不设。' +
+    '多头 / 跟随信号做多时为止盈；空头时为止损。',
+  stop_loss_long: '止损价，须低于区间下限；填 0 表示不设。多头网格跌破此价终止。',
+  stop_profit_long: '止盈价，须高于区间上限；填 0 表示不设。多头网格涨破此价终止。',
+  stop_loss_short: '止损价，须高于区间上限；填 0 表示不设。空头网格涨破此价终止。',
+  stop_profit_short: '止盈价，须低于区间下限；填 0 表示不设。空头网格跌破此价终止。',
+  stop_bound_lower:
+    '下沿终止价，须低于区间下限；填 0 表示不设。' +
+    '实际方向由信号决定：做多时为止损，做空时为止盈。',
+  stop_bound_upper:
+    '上沿终止价，须高于区间上限；填 0 表示不设。' +
+    '实际方向由信号决定：做多时为止盈，做空时为止损。',
   close_on_stop: '触发止损/止盈时是否清掉该任务全部持仓。关闭则只停止监控、保留持仓。',
   prefill_enabled:
     '开启后启动时按「现价上方格位数 × 每格手数」市价买入底仓，' +
@@ -445,6 +459,53 @@ function validateRiskSized(r: EditableRule, label: string): string | null {
   return null
 }
 
+/** 网格止损/止盈表单项：字段按价格上下沿存储，文案随方向切换。 */
+function gridStopFields(side: GridSide | undefined | null): {
+  slKey: 'stop_lower' | 'stop_upper'
+  tpKey: 'stop_lower' | 'stop_upper'
+  slLabel: string
+  tpLabel: string
+  slHelp: string
+  tpHelp: string
+  lowerName: string
+  upperName: string
+} {
+  if (side === 'short') {
+    return {
+      slKey: 'stop_upper',
+      tpKey: 'stop_lower',
+      slLabel: '止损价',
+      tpLabel: '止盈价',
+      slHelp: FIELD_HELP.stop_loss_short,
+      tpHelp: FIELD_HELP.stop_profit_short,
+      lowerName: '止盈价',
+      upperName: '止损价',
+    }
+  }
+  if (side === 'follow') {
+    return {
+      slKey: 'stop_lower',
+      tpKey: 'stop_upper',
+      slLabel: '下沿价',
+      tpLabel: '上沿价',
+      slHelp: FIELD_HELP.stop_bound_lower,
+      tpHelp: FIELD_HELP.stop_bound_upper,
+      lowerName: '下沿价',
+      upperName: '上沿价',
+    }
+  }
+  return {
+    slKey: 'stop_lower',
+    tpKey: 'stop_upper',
+    slLabel: '止损价',
+    tpLabel: '止盈价',
+    slHelp: FIELD_HELP.stop_loss_long,
+    tpHelp: FIELD_HELP.stop_profit_long,
+    lowerName: '止损价',
+    upperName: '止盈价',
+  }
+}
+
 /** 网格交易的参数校验 */
 function validateGrid(r: EditableRule, label: string): string | null {
   if (!(r.price_lower > 0)) return `${label}：区间下限需大于 0`
@@ -462,11 +523,13 @@ function validateGrid(r: EditableRule, label: string): string | null {
   if (!(r.lot_per_grid > 0)) return `${label}：每格手数需大于 0`
   if (r.total_lot_limit < 0) return `${label}：总手数上限不能为负`
   if (r.trigger_price < 0) return `${label}：触发价不能为负`
+  const stops = gridStopFields(r.grid_side)
+  // 几何约束与方向无关：下沿价 < 区间下限，上沿价 > 区间上限
   if (r.stop_lower > 0 && r.stop_lower >= r.price_lower) {
-    return `${label}：止损价须低于区间下限`
+    return `${label}：${stops.lowerName}须低于区间下限`
   }
   if (r.stop_upper > 0 && r.stop_upper <= r.price_upper) {
-    return `${label}：止盈价须高于区间上限`
+    return `${label}：${stops.upperName}须高于区间上限`
   }
   if (r.trailing_max < 0) return `${label}：最大平移格数不能为负`
   return null
@@ -737,6 +800,9 @@ function ruleDetailRows(r: StrategyRule): Array<{ k: string; v: string }> {
   if (isGrid(r)) {
     const side = GRID_SIDE_OPTIONS.find((o) => o.value === r.grid_side)?.label || r.grid_side || '—'
     const mode = GRID_MODE_OPTIONS.find((o) => o.value === r.grid_mode)?.label || r.grid_mode || '—'
+    const stops = gridStopFields(r.grid_side)
+    const sl = r[stops.slKey] || 0
+    const tp = r[stops.tpKey] || 0
     return [
       { k: '价格区间', v: `${r.price_lower ?? 0} ~ ${r.price_upper ?? 0}` },
       { k: '网格', v: `${r.grid_count ?? 0} 格 · ${mode}` },
@@ -744,7 +810,10 @@ function ruleDetailRows(r: StrategyRule): Array<{ k: string; v: string }> {
       { k: '每格手数', v: String(r.lot_per_grid ?? 0) },
       { k: '总手数上限', v: r.total_lot_limit ? String(r.total_lot_limit) : '不限' },
       { k: '触发价', v: r.trigger_price ? String(r.trigger_price) : '立即启动' },
-      { k: '止损 / 止盈', v: `${r.stop_lower || '不设'} / ${r.stop_upper || '不设'}` },
+      {
+        k: r.grid_side === 'follow' ? '下沿 / 上沿' : '止损 / 止盈',
+        v: `${sl || '不设'} / ${tp || '不设'}`,
+      },
       { k: '终止清仓', v: r.close_on_stop === false ? '否' : '是' },
       { k: '初始建仓', v: r.prefill_enabled === false ? '关闭' : '开启' },
       {
@@ -1365,20 +1434,28 @@ function resetRuleToTemplate(idx: number): void {
                       />
                     </div>
                     <div class="field">
-                      <FormLabel :field-id="`rule-${idx}-stop-lower`" text="止损价" :help="FIELD_HELP.stop_lower" />
+                      <FormLabel
+                        :field-id="`rule-${idx}-stop-sl`"
+                        :text="gridStopFields(r.grid_side).slLabel"
+                        :help="gridStopFields(r.grid_side).slHelp"
+                      />
                       <input
-                        :id="`rule-${idx}-stop-lower`"
-                        v-model.number="r.stop_lower"
+                        :id="`rule-${idx}-stop-sl`"
+                        v-model.number="r[gridStopFields(r.grid_side).slKey]"
                         type="number"
                         min="0"
                         step="any"
                       />
                     </div>
                     <div class="field">
-                      <FormLabel :field-id="`rule-${idx}-stop-upper`" text="止盈价" :help="FIELD_HELP.stop_upper" />
+                      <FormLabel
+                        :field-id="`rule-${idx}-stop-tp`"
+                        :text="gridStopFields(r.grid_side).tpLabel"
+                        :help="gridStopFields(r.grid_side).tpHelp"
+                      />
                       <input
-                        :id="`rule-${idx}-stop-upper`"
-                        v-model.number="r.stop_upper"
+                        :id="`rule-${idx}-stop-tp`"
+                        v-model.number="r[gridStopFields(r.grid_side).tpKey]"
                         type="number"
                         min="0"
                         step="any"

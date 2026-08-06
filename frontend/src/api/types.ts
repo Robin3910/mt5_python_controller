@@ -382,9 +382,9 @@ export interface StrategyRule {
   lot_per_grid?: number
   /** 触发价，0=立即启动 */
   trigger_price?: number
-  /** 止损价（须低于区间下限），0=不设 */
+  /** 下沿终止价（须低于区间下限），0=不设；多头为止损、空头为止盈 */
   stop_lower?: number
-  /** 止盈价（须高于区间上限），0=不设 */
+  /** 上沿终止价（须高于区间上限），0=不设；多头为止盈、空头为止损 */
   stop_upper?: number
   /** 终止时是否清仓 */
   close_on_stop?: boolean

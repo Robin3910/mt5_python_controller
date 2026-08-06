@@ -575,6 +575,31 @@ def test_normalize_grid_clamps_and_swaps_range():
     assert "risk_amount" not in out
 
 
+def test_normalize_grid_short_keeps_directional_stops():
+    """空头网格：上沿价为止损、下沿价为止盈；几何合法值应保留。"""
+    from app import strategy_templates as tpl
+
+    out = tpl.normalize_rule(_grid_rule(
+        grid_side="short",
+        price_lower=4152, price_upper=4167,
+        stop_lower=4140,   # 空头止盈
+        stop_upper=4170,   # 空头止损
+    ))
+    assert out["grid_side"] == "short"
+    assert out["stop_lower"] == 4140
+    assert out["stop_upper"] == 4170
+
+    # 几何非法仍清零（与方向无关）
+    bad = tpl.normalize_rule(_grid_rule(
+        grid_side="short",
+        price_lower=4152, price_upper=4167,
+        stop_lower=4155,   # 未低于下限
+        stop_upper=4160,   # 未高于上限
+    ))
+    assert bad["stop_lower"] == 0.0
+    assert bad["stop_upper"] == 0.0
+
+
 def test_normalize_grid_trailing():
     from app import strategy_templates as tpl
 

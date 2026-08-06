@@ -334,7 +334,14 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
       push('每格手数', detail.lot_per_grid)
       push('总手数上限', detail.total_lot_limit || '不限')
       push('触发价', detail.trigger_price || '立即启动')
-      push('止损 / 止盈', `${detail.stop_lower || '不设'} / ${detail.stop_upper || '不设'}`)
+      {
+        const side = String(detail.grid_side || '').toLowerCase()
+        const short = side === 'short'
+        const sl = short ? detail.stop_upper : detail.stop_lower
+        const tp = short ? detail.stop_lower : detail.stop_upper
+        const title = side === 'follow' ? '下沿 / 上沿' : '止损 / 止盈'
+        push(title, `${sl || '不设'} / ${tp || '不设'}`)
+      }
       push('初始建仓', detail.prefill_enabled === false ? '关闭' : '开启')
       push('等待触发', detail.waiting_trigger ? '是' : '')
       push('预填格位', detail.prefill_levels?.length ? detail.prefill_levels.join(', ') : '')

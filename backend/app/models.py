@@ -355,8 +355,14 @@ class StrategyRule(BaseModel):
     )
     lot_per_grid: float = Field(default=0.01, ge=0, description="每格手数")
     trigger_price: float = Field(default=0.0, ge=0, description="触发价，0=立即启动")
-    stop_lower: float = Field(default=0.0, ge=0, description="止损价（须低于区间下限），0=不设")
-    stop_upper: float = Field(default=0.0, ge=0, description="止盈价（须高于区间上限），0=不设")
+    stop_lower: float = Field(
+        default=0.0, ge=0,
+        description="下沿终止价（须低于区间下限；多头为止损、空头为止盈），0=不设",
+    )
+    stop_upper: float = Field(
+        default=0.0, ge=0,
+        description="上沿终止价（须高于区间上限；多头为止盈、空头为止损），0=不设",
+    )
     close_on_stop: bool = Field(default=True, description="终止时是否清仓")
     prefill_enabled: bool = Field(
         default=True, description="是否按现价上方格位初始建仓",

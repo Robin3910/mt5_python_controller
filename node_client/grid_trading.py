@@ -10,7 +10,8 @@
 - lot_per_grid：每格手数
 - total_lot_limit：总手数上限，0=不额外限制
 - trigger_price：触发价，0=立即启动
-- stop_lower / stop_upper：止损 / 止盈价，0=不设
+- stop_lower / stop_upper：下沿 / 上沿终止价，0=不设
+  （多头：下沿=止损、上沿=止盈；空头相反）
 - close_on_stop：终止时是否清仓
 - prefill_enabled：是否按现价上方格位初始建仓
 - trailing_up / trailing_max：向上追踪开关与最大平移格数
@@ -479,6 +480,8 @@ def terminate_reason(plan: GridPlan, price: float) -> Optional[str]:
     """当前价是否触发止损 / 止盈；未触发返回 None。
 
     读 plan 上的止损止盈而不是 cfg：开了向上追踪时它们会随网格一起平移。
+    多头：跌破 stop_lower 为止损、涨破 stop_upper 为止盈；
+    空头：涨破 stop_upper 为止损、跌破 stop_lower 为止盈。
     """
     if price <= 0 or not plan.ok:
         return None

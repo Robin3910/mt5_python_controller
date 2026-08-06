@@ -293,8 +293,8 @@ class GridTradingRule:
     lot_per_grid: float = 0.01                  # 每格手数
     total_lot_limit: float = 0.0                # 总手数上限，0=不额外限制
     trigger_price: float = 0.0                  # 触发价，0=立即启动
-    stop_lower: float = 0.0                     # 止损价（低于区间下限），0=不设
-    stop_upper: float = 0.0                     # 止盈价（高于区间上限），0=不设
+    stop_lower: float = 0.0                     # 下沿终止价（多头止损 / 空头止盈），0=不设
+    stop_upper: float = 0.0                     # 上沿终止价（多头止盈 / 空头止损），0=不设
     close_on_stop: bool = True                  # 终止时是否清仓
     prefill_enabled: bool = True                # 是否按现价上方格位初始建仓
     trailing_up: bool = False                   # 向上追踪：突破区间外沿时平移网格
@@ -666,7 +666,8 @@ def _normalize_grid_rule(rule_type: int, raw: dict) -> dict[str, Any]:
     """规范化网格交易规则（模版3）。
 
     区间上下限必须满足 upper > lower > 0；等比模式同样要求 lower > 0。
-    止损须低于区间下限、止盈须高于区间上限（为 0 表示不设）。
+    stop_lower 须低于区间下限、stop_upper 须高于区间上限（几何约束，与方向无关；
+    为 0 表示不设）。运行时语义：多头 stop_lower=止损 / stop_upper=止盈；空头相反。
     网格数量夹在 [2, 200]，向上追踪的平移上限夹在 [0, 10000]。
     """
     defaults = default_grid_rule().to_dict()
@@ -690,7 +691,7 @@ def _normalize_grid_rule(rule_type: int, raw: dict) -> dict[str, Any]:
 
     stop_lower = max(0.0, _as_float(raw.get("stop_lower", defaults["stop_lower"]), defaults["stop_lower"]))
     stop_upper = max(0.0, _as_float(raw.get("stop_upper", defaults["stop_upper"]), defaults["stop_upper"]))
-    # 止损必须低于区间下限；止盈必须高于区间上限；否则清零视为未设
+    # 几何约束：下沿价须低于区间下限，上沿价须高于区间上限；否则清零视为未设
     if stop_lower > 0 and price_lower > 0 and stop_lower >= price_lower:
         stop_lower = 0.0
     if stop_upper > 0 and price_upper > 0 and stop_upper <= price_upper:
