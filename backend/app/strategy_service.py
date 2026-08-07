@@ -65,6 +65,9 @@ async def create_strategy(store: RedisStore, payload: StrategyCreate) -> dict:
             raise ValueError("请至少配置一条规则")
     else:
         rules = templates.normalize_rules(tpl.get("rules") or [])
+    bad = templates.validate_rules_for_template(tpl["template_id"], rules)
+    if bad:
+        raise ValueError(bad)
     async with SessionLocal() as s:
         s.add(
             TradingStrategy(
@@ -104,9 +107,13 @@ async def update_strategy(
         if patch.remark is not None:
             row.remark = patch.remark.strip() or None
         if patch.rules is not None:
-            row.config_json = templates.normalize_rules(
+            rules = templates.normalize_rules(
                 [r.model_dump() for r in patch.rules]
             )
+            bad = templates.validate_rules_for_template(row.template_id, rules)
+            if bad:
+                raise ValueError(bad)
+            row.config_json = rules
         await s.commit()
         d = strategy_row_to_dict(row)
     await store.cache_strategy(d)

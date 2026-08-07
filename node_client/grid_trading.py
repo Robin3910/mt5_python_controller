@@ -301,10 +301,25 @@ def plan_grid(cfg: GridConfig, *, signal_action: object,
         return plan
     if spec.volume_max > 0 and lot > spec.volume_max:
         lot = spec.floor_lot(spec.volume_max)
+    if cfg.total_lot_limit > 0 and cfg.total_lot_limit + 1e-9 < lot:
+        # 一格都开不出来：放行只会让任务空跑到底，白占节点互斥占位
+        plan.reject = (
+            f"总手数上限 {_trim(cfg.total_lot_limit, spec.volume_digits)} 小于单格手数 "
+            f"{_trim(lot, spec.volume_digits)}，网格无法开仓"
+        )
+        return plan
 
     levels = build_levels(cfg, digits=spec.digits)
     if len(levels) < 3:
         plan.reject = "网格数量过少，无法切出有效格位"
+        return plan
+    if any(levels[i + 1] <= levels[i] for i in range(len(levels) - 1)):
+        # 区间太窄 / 格数太多时，四舍五入会把多条线压到同一个价位，
+        # 一次穿越就会连开好几格
+        plan.reject = (
+            f"网格线在 {spec.digits} 位报价精度下无法区分（相邻格位价格相同），"
+            "请调宽区间或减少格数"
+        )
         return plan
 
     plan.levels = levels
@@ -318,8 +333,9 @@ def plan_grid(cfg: GridConfig, *, signal_action: object,
 def trigger_reached(cfg: GridConfig, price: float, prev_price: float = 0.0) -> bool:
     """当前价是否已触及触发价（未配置触发价视为已触发）。
 
-    最新价达到触发价时启动。用 prev→price 是否穿越 / 落到触发价判定，
-    避免同一价位反复判断；首个 tick（prev=0）时，现价已在触发价上方也视为到价。
+    「触及」与方向无关：首个报价只用来确定现价在触发价的哪一侧，之后价格从这一侧
+    穿越 / 落到触发价才算到价。因此触发价在现价下方时等回落触及，在上方时等上涨
+    触及——空头网格与「等回调再启动」的配置都能按字面语义工作。
     """
     if cfg.trigger_price <= 0:
         return True
@@ -327,40 +343,35 @@ def trigger_reached(cfg: GridConfig, price: float, prev_price: float = 0.0) -> b
         return False
     t = cfg.trigger_price
     if prev_price <= 0:
-        return price >= t
+        # 首个报价：正好落在触发价上才算到价，否则只记下所处一侧
+        return price == t
     # 穿越或落到触发价：两端乘积 ≤ 0
     return (prev_price - t) * (price - t) <= 0
 
 
 def prefill_indices(plan: GridPlan, price: float) -> list[int]:
-    """初始建仓应买入的格位下标列表（现价上方的空闲格）。
+    """初始建仓应持有的格位下标列表（退出线还在现价盈利侧的格）。
 
-    多头网格：现价上方的格位 i（levels[i] < price <= levels[i+1] 的上方）需要先买入，
-    这样价格继续上涨时才有货可卖。具体：所有满足 levels[i+1] <= price 的格位 i
-    （即卖出价已在现价下方或等于现价的格）——即「买入现价以上所有网格的量」。
+    格位 i 用两条线描述：多头在 levels[i] 买入、levels[i+1] 卖出；空头在 levels[i+1]
+    开空、levels[i] 平空。初始建仓走的是**市价**，成本就是现价，所以只有退出线仍在
+    现价的盈利侧，这一格将来才可能兑现收益：
 
-    创建时按「当前价上方的网格数量」市价买入。对应本模型：
-    格位 i 的买入线是 levels[i]，卖出线是 levels[i+1]。
-    现价上方的格 = 卖出线 > 现价 的格，即 levels[i+1] > price 且 levels[i] < price
-    的那一格之上的所有格……更准确：买入所有 levels[i] < price 的格位
-    （因为这些格的买入价已在现价下方，相当于「已经跌破买入线」的持仓）。
+    - 多头：卖出线 levels[i+1] > 现价；
+    - 空头：平仓线 levels[i] < 现价。
 
-    简化规则：买入所有买入线 < 现价 的格位（levels[i] < price）。
+    这正是「按现价上方（空头为下方）的网格数量建底仓」：价格继续朝有利方向走时每穿
+    一条线兑现一格；不预填则那半边网格无货可卖。反过来若把退出线已在现价不利侧的格
+    也买进来，等于开仓即锁定亏损。
     """
     if not plan.ok or price <= 0:
         return []
     indices: list[int] = []
-    # 格位 0..N-1：买入线 levels[i]，卖出线 levels[i+1]
     for i in range(plan.grid_count):
-        buy_line = plan.levels[i]
         if plan.is_long:
-            # 多头：买入线已在现价下方 → 视为应持有
-            if buy_line < price:
+            if plan.levels[i + 1] > price:
                 indices.append(i)
         else:
-            # 空头：卖出线（对称）已在现价上方 → 视为应持有
-            sell_line = plan.levels[i + 1]
-            if sell_line > price:
+            if plan.levels[i] < price:
                 indices.append(i)
     return indices
 
@@ -372,12 +383,13 @@ def capped_prefill(plan: GridPlan, cfg: GridConfig, indices: list[int]) -> list[
     max_grids = int(math.floor((cfg.total_lot_limit + 1e-9) / plan.lot_per_grid))
     if max_grids <= 0:
         return []
-    # 多头优先保留靠近现价的格（列表末尾）；空头同理取靠近现价的
+    # 优先保留退出线离现价最近的格（最先能兑现的那几格）：
+    # 多头的卖出线随下标递增，取列表头部；空头的平仓线同样递增，取尾部
     if len(indices) <= max_grids:
         return indices
     if plan.is_long:
-        return indices[-max_grids:]
-    return indices[:max_grids]
+        return indices[:max_grids]
+    return indices[-max_grids:]
 
 
 # ---------------------------------------------------------------------------

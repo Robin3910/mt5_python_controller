@@ -149,6 +149,10 @@ def _migrate_group_task_strategy_columns(sync_conn) -> None:
             "finish_reason": "VARCHAR(255)",
             "opened_at": "DATETIME",
             "last_report_at": "DATETIME",
+            # 停止交易后仍未平掉的持仓笔数，以及供节点重连恢复的策略运行态
+            "residual_positions": "INTEGER NOT NULL DEFAULT 0",
+            "runtime_json": json_type,
+            "stop_requested_at": "DATETIME",
         }
         for name, ddl in additions.items():
             if name not in cols:

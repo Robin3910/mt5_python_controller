@@ -668,3 +668,64 @@ def test_entry_reject_grid_side_and_lot():
     assert "价格区间" in (
         group_rules.entry_reject_reason(strategy, None, signal_action="BUY") or ""
     )
+
+    strategy = {"rules": [_grid_rule(lot_per_grid=0.02, total_lot_limit=0.01)]}
+    assert "总手数上限" in (
+        group_rules.entry_reject_reason(strategy, None, signal_action="BUY") or ""
+    )
+
+    strategy = {"rules": [_grid_rule(status=0)], "template_id": "tpl_3"}
+    assert "启用中的规则" in (
+        group_rules.entry_reject_reason(strategy, None, signal_action="BUY") or ""
+    ) or "网格规则" in (
+        group_rules.entry_reject_reason(strategy, None, signal_action="BUY") or ""
+    )
+
+
+def test_validate_rules_for_template_rejects_mismatch_and_empty():
+    from app import strategy_templates as tpl
+
+    assert tpl.validate_rules_for_template(TEMPLATE_3_ID, [_grid_rule()]) is None
+    assert "不允许规则类型" in (
+        tpl.validate_rules_for_template(TEMPLATE_3_ID, [{"type": 1, "status": 1}]) or ""
+    )
+    assert "至少启用" in (
+        tpl.validate_rules_for_template(TEMPLATE_3_ID, [_grid_rule(status=0)]) or ""
+    )
+    assert "价格区间" in (
+        tpl.validate_rules_for_template(
+            TEMPLATE_3_ID, [_grid_rule(price_lower=0, price_upper=0)],
+        ) or ""
+    )
+
+
+def test_create_grid_strategy_rejects_disabled_rule(client):
+    h = auth_headers(client)
+    r = client.post(
+        "/api/strategies",
+        json={
+            "template_id": TEMPLATE_3_ID,
+            "name": "全关网格",
+            "symbol": "XAUUSD",
+            "rules": [_grid_rule(status=0)],
+        },
+        headers=h,
+    )
+    assert r.status_code == 400, r.text
+    assert "启用" in r.json()["detail"]
+
+
+def test_create_grid_strategy_rejects_wrong_type(client):
+    h = auth_headers(client)
+    r = client.post(
+        "/api/strategies",
+        json={
+            "template_id": TEMPLATE_3_ID,
+            "name": "错配模版",
+            "symbol": "XAUUSD",
+            "rules": [{"type": 1, "status": 1, "action": "all", "point": 100}],
+        },
+        headers=h,
+    )
+    assert r.status_code == 400, r.text
+    assert "不允许规则类型" in r.json()["detail"]

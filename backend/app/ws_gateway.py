@@ -381,6 +381,9 @@ async def _resume_strategy_tasks(node_id: str, ws: WebSocket) -> None:
 
     MT5 持仓在节点掉线期间依然存在，若不恢复监控就没人负责加仓与平仓判定，
     该节点该品种也会因为子任务一直不收口而被互斥占位卡住。
+
+    已进入终止流程（closing / stop_requested_at）的子任务改发 strategy_stop，
+    避免把「决定要停」的任务又恢复成继续跑。
     """
     try:
         subtasks = await group_persist.resumable_tasks(node_id)
@@ -389,6 +392,24 @@ async def _resume_strategy_tasks(node_id: str, ws: WebSocket) -> None:
         return
     for subtask in subtasks:
         try:
+            status = str(subtask.get("status") or "")
+            stop_requested = subtask.get("stop_requested_at") is not None
+            if status == "closing" or stop_requested:
+                cmd = group_dispatcher.build_strategy_stop_command(
+                    subtask.get("signal_id") or f"resume_stop_{subtask.get('dispatch_id')}",
+                    subtask.get("task_id"),
+                    subtask.get("dispatch_id"),
+                    subtask.get("magic"),
+                    subtask.get("group_id") or "",
+                    subtask.get("symbol"),
+                    reason="resume_pending_stop",
+                )
+                await ws.send_json(cmd)
+                logger.info(
+                    "node %s pending stop resent on resume (dispatch=%s magic=%s)",
+                    node_id, subtask.get("dispatch_id"), subtask.get("magic"),
+                )
+                continue
             await ws.send_json(group_dispatcher.build_strategy_resume_command(subtask))
             logger.info(
                 "node %s resume strategy subtask %s (magic=%s)",

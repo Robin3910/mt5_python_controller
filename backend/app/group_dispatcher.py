@@ -92,7 +92,7 @@ def build_strategy_stop_command(
 
 def build_strategy_resume_command(subtask: dict) -> dict:
     """策略恢复命令：节点重连后据此重建监控（不重复下首单）。"""
-    return {
+    cmd = {
         "cmd": "strategy_resume",
         "signal_id": subtask.get("signal_id"),
         "task_id": subtask.get("task_id"),
@@ -108,6 +108,10 @@ def build_strategy_resume_command(subtask: dict) -> dict:
         "strategy": subtask.get("strategy_snapshot") or {},
         "report_interval": Config.STRATEGY_REPORT_INTERVAL,
     }
+    runtime = subtask.get("runtime")
+    if isinstance(runtime, dict) and runtime:
+        cmd["runtime"] = runtime
+    return cmd
 
 
 class GroupDispatcher:
@@ -229,28 +233,38 @@ class GroupDispatcher:
         self, signal: TradingSignal, signal_id: str, *,
         source_ip: Optional[str], raw_payload: Optional[str], source: str,
     ) -> dict:
-        """CLOSE 信号：结束匹配分组下所有进行中的子任务，平掉各自魔术号的持仓。
+        """CLOSE 信号：结束匹配的活动子任务，平掉各自魔术号的持仓。
 
         不建新任务、不受互斥限制——它本身就是用来解锁的。
+        候选按「活动子任务 + 开仓快照」筛选，不复用开仓 `_candidate_groups`：
+        分组/策略后来被禁用、或规则已改到通不过准入时，仍应能终止在跑任务。
         """
-        matched, reasons = await self._candidate_groups(signal)
-        if not matched:
+        overview = await group_persist.active_subtasks_overview()
+        matched_subs, reasons = self._close_candidates(signal, overview)
+        if not matched_subs:
             await persist.record_signal(
                 signal_id, signal, source_ip, True, None, status="rejected",
                 raw_payload=raw_payload, source=source, model=SIGNAL_MODEL_STRATEGY,
             )
-            detail = "；".join(reasons) if reasons else "没有已启用且绑定该品种策略的分组"
+            detail = "；".join(reasons) if reasons else "没有进行中的匹配子任务"
             return {"mode": "rejected", "targets": 0, "groups": 0,
-                    "reason": f"无匹配分组：{detail}", "tasks": []}
+                    "reason": f"无匹配任务：{detail}", "tasks": []}
 
         await persist.record_signal(
             signal_id, signal, source_ip, True, SIGNAL_DISPATCH_MODE,
             raw_payload=raw_payload, source=source, model=SIGNAL_MODEL_STRATEGY,
         )
 
+        by_group: dict[str, list[dict]] = {}
+        for sub in matched_subs:
+            by_group.setdefault(str(sub.get("group_id") or ""), []).append(sub)
+
         results = []
-        for group, _strategy in matched:
-            results.append(await self._close_group(group, signal, signal_id))
+        for group_id, subs in by_group.items():
+            group = await self.store.get_group(group_id) or {
+                "group_id": group_id, "name": group_id,
+            }
+            results.append(await self._close_group_subs(group, signal_id, subs))
         return {
             "mode": "group_close",
             "groups": len(results),
@@ -258,17 +272,57 @@ class GroupDispatcher:
             "tasks": results,
         }
 
-    async def _close_group(self, group: dict, signal: TradingSignal, signal_id: str) -> dict:
+    @staticmethod
+    def _close_candidates(
+        signal: TradingSignal, overview: list[dict],
+    ) -> tuple[list[dict], list[str]]:
+        """CLOSE 候选：按 group_ids / template_ids（快照）/ 品种过滤活动子任务。"""
+        reasons: list[str] = []
+        if not overview:
+            return [], ["当前没有进行中的策略子任务"]
+
+        wanted_groups = {
+            str(g).strip().lower() for g in (signal.group_ids or []) if str(g).strip()
+        }
+        if wanted_groups:
+            present = {str(s.get("group_id") or "").strip().lower() for s in overview}
+            missing = sorted(wanted_groups - present)
+            if missing:
+                reasons.append(f"指定的分组没有活动子任务：{'、'.join(missing)}")
+
+        matched: list[dict] = []
+        for sub in overview:
+            gid = str(sub.get("group_id") or "").strip().lower()
+            if wanted_groups and gid not in wanted_groups:
+                continue
+            if not group_rules.symbol_match(sub.get("symbol"), signal.symbol):
+                continue
+            # template_ids 对快照里的 template_id 做定向；空则不限制
+            fake_strategy = {"template_id": sub.get("template_id")}
+            off = group_rules.template_reject_reason(fake_strategy, signal.template_ids)
+            if off:
+                continue
+            matched.append(sub)
+
+        if not matched and not reasons:
+            reasons.append(
+                f"没有与品种 {signal.symbol} 匹配的活动子任务"
+                + ("（含分组/模版定向）" if (signal.group_ids or signal.template_ids) else "")
+            )
+        return matched, reasons
+
+    async def _close_group_subs(
+        self, group: dict, signal_id: str, subtasks: list[dict],
+    ) -> dict:
+        """对同一分组下已筛选的子任务下发终止。"""
         group_id = group["group_id"]
         mode = group_rules.normalize_dispatch_mode(group.get("dispatch_mode"))
-        subtasks = await group_persist.active_subtasks(group_id)
         if not subtasks:
-            logger.info("group %s has no active subtask, CLOSE ignored", group_id)
             return self._result(group, mode, 0, "skipped", "分组没有进行中的任务")
 
         closing = 0
         forced = 0
-        task_id = subtasks[0]["task_id"]
+        task_id = subtasks[0].get("task_id")
         for sub in subtasks:
             outcome = await self._stop_subtask(
                 sub, signal_id=signal_id, reason="close_signal",
@@ -286,6 +340,12 @@ class GroupDispatcher:
             "group %s CLOSE -> %d subtask(s) closing, %d forced", group_id, closing, forced,
         )
         return self._result(group, mode, closing, "closing", None, task_id)
+
+    async def _close_group(self, group: dict, signal: TradingSignal, signal_id: str) -> dict:
+        """兼容旧调用：按分组拉活动子任务后终止（手动场景仍可用）。"""
+        del signal  # 品种已在上层筛过；此处只按分组收口
+        subtasks = await group_persist.active_subtasks(group["group_id"])
+        return await self._close_group_subs(group, signal_id, subtasks)
 
     async def close_subtask(
         self, group_id: str, dispatch_id: int, *, reason: str = "manual_close",

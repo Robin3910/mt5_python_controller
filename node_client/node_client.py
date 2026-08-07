@@ -546,6 +546,7 @@ class NodeClient:
             exec_fn=self._exec,
             send_fn=send,
             report_interval=msg.get("report_interval") or 5,
+            runtime=msg.get("runtime") if isinstance(msg.get("runtime"), dict) else None,
         )
         self.runners[task_id] = runner
         runner.start(resume=resume)

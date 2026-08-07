@@ -511,7 +511,18 @@ function dispatchSummary(row: GroupSignalTaskRecord): string {
   return parts.join(' · ')
 }
 
-function eventTag(eventType: string): { cls: string; text: string } {
+function eventTag(
+  eventType: string,
+  detail?: GroupTaskEventDetail | null,
+): { cls: string; text: string } {
+  // tpl_2 分散仓复用 add_trend（库字段长度限制），用 detail.kind 区分展示
+  const kind = detail && typeof detail === 'object' ? String(detail.kind || '') : ''
+  if (
+    eventType === 'add_trend'
+    && (kind === 'risk_sized_distribute' || kind === 'risk_sized_add')
+  ) {
+    return { cls: 'amber', text: '分散仓' }
+  }
   const m: Record<string, { cls: string; text: string }> = {
     open: { cls: 'green', text: '开仓' },
     add_counter: { cls: 'amber', text: '逆势加仓' },
@@ -750,8 +761,8 @@ onUnmounted(stopAutoRefresh)
                                         </td>
                                         <td class="muted" style="white-space: nowrap">{{ fmtTime(ev.created_at) }}</td>
                                         <td>
-                                          <span class="tag" :class="eventTag(ev.event_type).cls">
-                                            {{ eventTag(ev.event_type).text }}
+                                          <span class="tag" :class="eventTag(ev.event_type, ev.detail).cls">
+                                            {{ eventTag(ev.event_type, ev.detail).text }}
                                           </span>
                                         </td>
                                         <td>{{ ev.action || '—' }}</td>

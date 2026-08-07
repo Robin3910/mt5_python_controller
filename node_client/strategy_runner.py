@@ -51,8 +51,22 @@ _MODE_ADD_ON = "add_on"
 _MODE_RISK_SIZED = "risk_sized"
 _MODE_GRID = "grid"
 
+# 模版 -> 期望执行路径。快照里找不到对应规则时必须失败退出而不是回退到加仓路径：
+# 加仓路径会用信号自带的手数与止损直接开一笔市价单，与网格 / 以损定量的语义完全不同。
+_TEMPLATE_MODES = {
+    "tpl_2": _MODE_RISK_SIZED,
+    "tpl_3": _MODE_GRID,
+}
+
 # 事件说明落库字段为 VARCHAR(255)，本地先截断，避免整条上报被后端丢弃
 MESSAGE_LIMIT = 255
+
+# 真正的终态：服务端收到后会清零持仓数、释放节点占位。
+# stop_failed / detached / faulted 表示「已停止交易但魔术号下仍有持仓」，
+# 属于非终态，服务端据此保留占位，不会把这批仓位当成已经平掉。
+_TERMINAL_STATUSES = ("done", "failed")
+# 一次停止流程内的「读持仓 -> 平仓」轮次；平仓本身在 mt5_client 层已有瞬时错误重试
+_CLOSE_ALL_ATTEMPTS = 3
 
 logger = logging.getLogger("node.strategy")
 
@@ -81,6 +95,7 @@ class StrategyRunner:
         exec_fn: Callable,
         send_fn: Callable,
         report_interval: float = 5.0,
+        runtime: Optional[dict] = None,
     ) -> None:
         self.task_id = int(task_id)
         self.magic = int(magic)
@@ -88,6 +103,8 @@ class StrategyRunner:
         self.signal_id = signal_id
         self.entry = entry or {}
         self.strategy = strategy or {}
+        # 服务端落库的网格运行态：重连 resume 时优先按它还原，而不是靠现价猜平移量
+        self._resume_runtime = dict(runtime) if isinstance(runtime, dict) else {}
         self._mt5 = mt5
         self._hub = hub
         self._exec = exec_fn      # async (fn, *args) -> result，把阻塞 MT5 调用丢线程池
@@ -141,6 +158,23 @@ class StrategyRunner:
         self._grid_prev_price: float = 0.0
         # 平移后越界、但当时没平成的持仓：脱离了格位映射，只能逐轮重试兑现
         self._grid_orphans: set[int] = set()
+        # 卖出失败的格位：价格不会再穿越同一条线，不重试这一格就永远卖不掉
+        self._grid_pending_sells: set[int] = set()
+        # 已停止网格交易但持仓仍保留（close_on_stop=False）
+        self._grid_detached = False
+        self._reported_stuck: Optional[tuple[str, int]] = None
+        self._mode_reject = self._template_mode_reject()
+
+    def _template_mode_reject(self) -> Optional[str]:
+        """模版与快照规则对不上时的拒绝原因；一致或未知模版返回 None。"""
+        template_id = str(self.strategy.get("template_id") or "").strip().lower()
+        expected = _TEMPLATE_MODES.get(template_id)
+        if expected is None or expected == self._mode:
+            return None
+        return (
+            f"策略模版 {template_id} 需要 {expected} 执行路径，"
+            f"但快照里没有启用中的对应规则"
+        )
 
     @property
     def risk_sized(self) -> bool:
@@ -182,6 +216,15 @@ class StrategyRunner:
     # 事件循环
     # ------------------------------------------------------------------
     async def _run(self, *, resume: bool) -> None:
+        if self._mode_reject:
+            logger.warning("task %s strategy mismatch: %s", self.task_id, self._mode_reject)
+            await self._emit_progress(
+                "error", phase="failed",
+                message=f"策略无法执行：{self._mode_reject}",
+                detail={"kind": "strategy_rule_missing", "reason": self._mode_reject},
+            )
+            await self._finish("failed", f"strategy_rule_missing: {self._mode_reject}")
+            return
         sub = self._hub.subscribe(
             symbol=self.symbol, magic=self.magic, direction=self.direction,
             hold_when_empty=self.is_grid,
@@ -198,16 +241,15 @@ class StrategyRunner:
                 await self._emit_progress("resume", phase="running")
 
             while True:
-                if self._stopping:
-                    await self._close_all()
+                if self._stopping and await self._close_all():
                     return
                 event = await sub.next_event()
                 if event is None:
                     logger.info("task %s subscription closed, monitor exits", self.task_id)
                     return
                 if self._stopping:
-                    await self._close_all()
-                    return
+                    # 停止流程还没平干净：回到开头重试，期间不再交易
+                    continue
                 if await self._on_event(event):
                     return
         except asyncio.CancelledError:
@@ -215,7 +257,12 @@ class StrategyRunner:
             raise
         except Exception as e:  # noqa: BLE001
             logger.exception("task %s runner crashed: %s", self.task_id, e)
-            await self._finish("failed", f"runner_error: {e}")
+            held = await self._magic_positions()
+            if held:
+                # 持仓还在就不能报终态，否则服务端会释放占位、这批仓位再没人负责
+                await self._finish("faulted", f"runner_error: {e}", residual=len(held))
+            else:
+                await self._finish("failed", f"runner_error: {e}")
         finally:
             self._hub.unsubscribe(sub)
             self._sub = None
@@ -505,6 +552,8 @@ class StrategyRunner:
             },
         )
         # 底仓成交后立即市价开齐分散仓（对齐「订单数量 = 1 + N」）
+        if self._stopping:
+            return True
         await self._risk_open_pending_distribute(
             quote=_as_float(res.get("price")) or entry_quote,
         )
@@ -518,6 +567,9 @@ class StrategyRunner:
             return 0
         opened = 0
         for batch in risk_sizing.pending_batches(plan, filled=self.total_orders):
+            # stop 到达后立刻停手，余下分散仓不再打；外层循环会去平仓
+            if self._stopping:
+                break
             ok = await self._risk_add_batch(batch, plan, cfg, quote, positions or [])
             if not ok:
                 break
@@ -531,7 +583,11 @@ class StrategyRunner:
         开仓价与止损价就能把计划还原出来。当初的点差已无从查起，用当前点差近似。
         若止损已被保本移动过（不在不利侧），plan_entries 会拒绝重建，此时降级为
         只监控到全平，不再补开分散仓也不再动止损。
+
+        已开档位按 R3B* 备注还原，不能用持仓笔数——中间档止盈离场后笔数会变少，
+        误当「未开完」会重复开分散仓、突破 risk_amount。
         """
+        del point  # 点差改由当前买卖价差近似，保留参数兼容调用方
         cfg = self._risk_cfg
         if cfg is None or not positions:
             return
@@ -558,8 +614,14 @@ class StrategyRunner:
             return
         self._risk_plan = plan
         self.base_volume = plan.base_volume
-        # 用当前持仓笔数对齐已开单量，剩余分散仓在 advance 时补开
-        self.total_orders = max(self.total_orders, len(positions))
+        filled = risk_sizing.filled_orders_from_positions(positions)
+        self.total_orders = max(self.total_orders, filled)
+        self.add_count = max(self.add_count, max(0, filled - 1))
+        logger.info(
+            "task %s risk resume: filled=%s positions=%s pending=%s",
+            self.task_id, filled, len(positions),
+            len(risk_sizing.pending_batches(plan, filled=filled)),
+        )
 
     async def _risk_advance(self, event: MarketEvent, positions: list[dict]) -> bool:
         """推进以损定量任务：先补齐未开的分散仓，再看保本。返回 True 表示本轮已有动作。"""
@@ -673,29 +735,55 @@ class StrategyRunner:
             )
         return self._grid_spec
 
-    async def _grid_quote(self) -> float:
-        """取当前价：多头网格看 ask（买入）、空头看 bid。"""
+    async def _grid_quote(self, *, entry: bool = False) -> float:
+        """取当前价。
+
+        默认与 MarketHub 的口径一致（多头 bid / 空头 ask），保证 `_grid_prev_price`
+        与事件价在点差的同一侧，否则光是启动那一下就能造出一次假穿越。
+        entry=True 取真实入场价（多头 ask / 空头 bid），用于判断预填会不会开仓即亏。
+        """
         quotes = dict(await self._exec(self._mt5.quotes, [self.symbol]) or {})
         quote = quotes.get(self.symbol) or next(iter(quotes.values()), {})
-        key = "ask" if self.direction == "BUY" else "bid"
+        if entry:
+            key = "ask" if self.direction == "BUY" else "bid"
+        else:
+            key = "bid" if self.direction == "BUY" else "ask"
         return _as_float(quote.get(key)) or _as_float(quote.get("mid"))
+
+    async def _grid_account_reject(self) -> Optional[str]:
+        """网格按「一格一笔持仓 + comment 记格位」运行，净持仓账户会把仓位合并。"""
+        try:
+            acct = dict(await self._exec(self._mt5.account_info) or {})
+        except Exception:  # noqa: BLE001
+            logger.debug("task %s read account_info failed", self.task_id, exc_info=True)
+            return None
+        mode = str(acct.get("margin_mode") or "").strip().lower()
+        # 读不到模式的旧节点 / 模拟环境不拦截，只拦明确的非对冲账户
+        if not mode or mode == "hedging":
+            return None
+        return f"账户为 {mode} 模式，网格需要对冲（hedging）账户才能逐格持仓"
 
     async def _grid_open_first(self) -> bool:
         """网格启动：建计划 → 等触发价 → 可选初始建仓。"""
         cfg = self._grid_cfg
         assert cfg is not None
         spec = await self._grid_symbol_spec()
-        plan = grid_trading.plan_grid(
-            cfg, signal_action=self.entry.get("action") or self.direction, spec=spec,
-        )
-        if not plan.ok:
-            logger.warning("task %s grid rejected: %s", self.task_id, plan.reject)
+        reject = await self._grid_account_reject()
+        if reject is None:
+            plan = grid_trading.plan_grid(
+                cfg, signal_action=self.entry.get("action") or self.direction, spec=spec,
+            )
+            reject = plan.reject if not plan.ok else None
+        else:
+            plan = grid_trading.GridPlan(side=self.direction, reject=reject)
+        if reject:
+            logger.warning("task %s grid rejected: %s", self.task_id, reject)
             await self._emit_progress(
                 "error", phase="failed",
-                message=f"网格无法启动：{plan.reject}",
-                detail={"kind": "grid_plan", "reason": plan.reject},
+                message=f"网格无法启动：{reject}",
+                detail={"kind": "grid_plan", "reason": reject},
             )
-            await self._finish("failed", f"grid_rejected: {plan.reject}")
+            await self._finish("failed", f"grid_rejected: {reject}")
             return False
 
         self._grid_plan = plan
@@ -734,8 +822,10 @@ class StrategyRunner:
         spec = await self._grid_symbol_spec()
 
         if cfg.prefill_enabled and price > 0:
+            # 预填是市价成交，成本是入场价那一侧，按它判断哪些格位还能盈利兑现
+            entry_price = await self._grid_quote(entry=True) or price
             indices = grid_trading.capped_prefill(
-                plan, cfg, grid_trading.prefill_indices(plan, price),
+                plan, cfg, grid_trading.prefill_indices(plan, entry_price),
             )
         else:
             indices = []
@@ -767,8 +857,52 @@ class StrategyRunner:
         )
         return True
 
+    def _grid_runtime_payload(self) -> Optional[dict]:
+        """网格运行态快照：触发 / 平移 / 当前网格线，供服务端落库与重连还原。"""
+        plan = self._grid_plan
+        if plan is None or not plan.ok:
+            return None
+        return {
+            "triggered": bool(plan.triggered),
+            "shift_count": int(plan.shift_count),
+            "levels": list(plan.levels),
+            "stop_lower": plan.stop_lower or 0.0,
+            "stop_upper": plan.stop_upper or 0.0,
+            "side": plan.side,
+            "lot_per_grid": plan.lot_per_grid,
+            "total_orders": self.total_orders,
+            "total_volume": round(self.total_volume, 4),
+            "started_at": self._started_at,
+        }
+
+    def _apply_grid_runtime(self, plan: "grid_trading.GridPlan", runtime: dict) -> bool:
+        """用落库的 runtime 还原网格线与触发态；字段齐全返回 True。"""
+        levels = runtime.get("levels")
+        if not isinstance(levels, list) or len(levels) < 3:
+            return False
+        try:
+            restored = [float(x) for x in levels]
+        except (TypeError, ValueError):
+            return False
+        if any(restored[i + 1] <= restored[i] for i in range(len(restored) - 1)):
+            return False
+        plan.levels = restored
+        plan.triggered = bool(runtime.get("triggered", True))
+        try:
+            plan.shift_count = int(runtime.get("shift_count") or 0)
+        except (TypeError, ValueError):
+            plan.shift_count = 0
+        plan.stop_lower = _as_float(runtime.get("stop_lower"))
+        plan.stop_upper = _as_float(runtime.get("stop_upper"))
+        if runtime.get("started_at"):
+            try:
+                self._started_at = float(runtime["started_at"])
+            except (TypeError, ValueError):
+                pass
+        return True
+
     async def _grid_rebuild(self, positions: list[dict]) -> None:
-        """恢复后按规则重建计划，并用持仓 comment / 开仓价还原格位映射。"""
+        """恢复后按规则重建计划，优先用 runtime 还原，否则用持仓 / 现价猜测。"""
         cfg = self._grid_cfg
         if cfg is None:
             return
@@ -782,6 +916,7 @@ class StrategyRunner:
                 self.task_id, plan.reject,
             )
             return
+        # 默认假定已触发；若 runtime 明确写了未触发，下面会覆盖
         plan.triggered = True
         self._grid_plan = plan
         self.direction = plan.side
@@ -792,9 +927,17 @@ class StrategyRunner:
             latest = max(positions, key=lambda p: (p.get("time") or 0, p.get("ticket") or 0))
             price = _as_float(latest.get("price_current")) or _as_float(latest.get("price_open"))
 
-        # 平移量不落库：按现价把网格追回断线前的位置，再拿 shift_count 去还原
-        # 备注里的绝对格位，否则整批持仓都会被当成已移出网格。
-        if cfg.trailing_up and price > 0:
+        runtime = self._resume_runtime
+        restored = bool(runtime) and self._apply_grid_runtime(plan, runtime)
+        if restored:
+            logger.info(
+                "task %s resume from runtime: shift=%s levels=[%s, %s] triggered=%s",
+                self.task_id, plan.shift_count,
+                plan.levels[0], plan.levels[-1], plan.triggered,
+            )
+        elif cfg.trailing_up and price > 0:
+            # 无 runtime 时的旧路径：按现价把网格追回断线前的位置，
+            # 再拿 shift_count 去还原备注里的绝对格位
             shift = grid_trading.trailing_shift(plan, cfg, price, digits=spec.digits)
             if shift is not None:
                 grid_trading.apply_shift(plan, shift)
@@ -808,12 +951,20 @@ class StrategyRunner:
                 self._grid_orphans.add(ticket)
         if price > 0:
             self._grid_prev_price = price
+        # 止损止盈由同 tick 的 _grid_advance 立刻判定，这里只还原状态
 
     async def _grid_advance(self, event: MarketEvent, positions: list[dict]) -> bool:
         """推进网格：等触发 → 穿越买卖 → 止损止盈。返回 True 表示任务已收口。"""
         cfg, plan = self._grid_cfg, self._grid_plan
         if cfg is None or plan is None or not plan.ok:
             return False
+
+        if self._grid_detached:
+            # 已停止网格交易但持仓保留：只等这批仓位被外部平光后收口
+            if positions:
+                return False
+            await self._finish("done", self._stop_reason)
+            return True
 
         price = event.price
         if price <= 0:
@@ -833,6 +984,11 @@ class StrategyRunner:
             if await self._grid_close_orphan(ticket, price, positions):
                 self._grid_orphans.discard(ticket)
 
+        # 上一轮卖失败的格位同理：价格不会再穿越同一条线，只能逐轮重试
+        self._grid_pending_sells &= set(plan.holdings)
+        for level in sorted(self._grid_pending_sells):
+            await self._grid_sell_level(level, price, positions)
+
         if not plan.triggered:
             if not grid_trading.trigger_reached(cfg, price, self._grid_prev_price):
                 self._grid_prev_price = price
@@ -843,14 +999,10 @@ class StrategyRunner:
 
         reason = grid_trading.terminate_reason(plan, price)
         if reason:
-            await self._grid_terminate(reason)
-            return True
+            return await self._grid_terminate(reason)
 
-        if await self._grid_apply_trailing(price, positions):
-            # 网格线整体换过了，旧的参考价不能再拿来判穿越
-            self._grid_prev_price = price
-            return False
-
+        # 先按当前网格兑现本轮穿越，再平移：突破外沿的那一根 tick 往往同时穿过卖出线，
+        # 反过来先平移会把这一整根的成交连同格位映射一起丢掉
         prev = self._grid_prev_price or price
         for crossing in grid_trading.crossings(plan, prev, price):
             buy_lv = grid_trading.buy_level_for_crossing(plan, crossing)
@@ -861,6 +1013,7 @@ class StrategyRunner:
             if sell_lv is not None:
                 await self._grid_sell_level(sell_lv, price, positions)
 
+        await self._grid_apply_trailing(price, positions)
         self._grid_prev_price = price
         return False
 
@@ -913,15 +1066,20 @@ class StrategyRunner:
         return True
 
     async def _grid_sell_level(self, level: int, price: float,
-                               positions: list[dict]) -> None:
-        """卖出（平掉）一格。"""
+                               positions: list[dict]) -> bool:
+        """卖出（平掉）一格；失败的格位登记下来由后续事件重试。"""
         plan = self._grid_plan
         if plan is None:
-            return
+            return False
         ticket = plan.holdings.get(level)
         if not ticket:
-            return
-        await self._grid_close_level(level, int(ticket), price, positions)
+            self._grid_pending_sells.discard(level)
+            return False
+        if await self._grid_close_level(level, int(ticket), price, positions):
+            self._grid_pending_sells.discard(level)
+            return True
+        self._grid_pending_sells.add(level)
+        return False
 
     async def _grid_close_level(self, level: int, ticket: int, price: float,
                                 positions: list[dict], *, note: str = "") -> bool:
@@ -1007,6 +1165,10 @@ class StrategyRunner:
             ):
                 self._grid_orphans.add(ticket)
         grid_trading.apply_shift(plan, shift)
+        # 格位号整体平移了，待重试的卖出格位要跟着重新映射（被挤出网格的转 orphans）
+        self._grid_pending_sells = {
+            lv - shift.steps for lv in self._grid_pending_sells
+        } & set(plan.holdings)
 
         message = grid_trading.describe_shift(plan, shift, price=price, spec=spec)
         logger.info("task %s %s", self.task_id, message)
@@ -1017,14 +1179,26 @@ class StrategyRunner:
         )
         return True
 
-    async def _grid_terminate(self, reason: str) -> None:
-        """止损 / 止盈触发：按配置清仓后收口。"""
-        cfg = self._grid_cfg
+    async def _grid_terminate(self, reason: str) -> bool:
+        """止损 / 止盈触发。返回 True 表示任务已收口、监控可以退出。
+
+        close_on_stop=True 时把清仓交给主循环的停止分支，平不干净会逐轮重试。
+        close_on_stop=False 时只停止网格交易、持仓原样留着，这时不能上报终态：
+        服务端会清零持仓数并释放节点占位，这批仓位就再没人负责了。改报非终态
+        detached，等持仓被外部平掉或管理端 CLOSE 再真正收口。
+        """
         self._stop_reason = reason
-        if cfg is not None and cfg.close_on_stop:
-            await self._close_all()
-            return
+        cfg = self._grid_cfg
+        if cfg is None or cfg.close_on_stop:
+            self._stopping = True
+            return False
+        self._grid_detached = True
+        held = await self._magic_positions()
+        if held:
+            await self._finish("detached", reason, residual=len(held))
+            return False
         await self._finish("done", reason)
+        return True
 
     # ------------------------------------------------------------------
     # 首单的开单原因
@@ -1073,23 +1247,45 @@ class StrategyRunner:
             "enabled_rule_count": self._enabled_rule_count(),
         }
 
-    async def _close_all(self) -> None:
-        """终止指令：平掉该魔术号的全部持仓后收口。"""
-        # 平仓前先记下浮盈，成交历史查询失败时作为回退
+    async def _magic_positions(self) -> Optional[list[dict]]:
+        """读该魔术号当前持仓；读失败返回 None——「读不到」不等于「已平光」。"""
         try:
-            held = await self._exec(self._mt5.positions_by_magic, self.magic)
-            self._last_floating_profit = round(
-                sum(_as_float(p.get("profit")) for p in (held or [])), 2,
-            )
+            rows = await self._exec(self._mt5.positions_by_magic, self.magic)
         except Exception:  # noqa: BLE001
-            logger.debug("task %s snapshot floating profit failed", self.task_id, exc_info=True)
-        res = await self._exec(self._mt5.close_by_magic, self.magic)
-        res = dict(res or {})
-        ok = bool(res.get("success", True))
+            logger.debug("task %s read positions failed", self.task_id, exc_info=True)
+            return None
+        return None if rows is None else list(rows)
+
+    async def _close_all(self) -> bool:
+        """终止指令：平掉该魔术号的全部持仓。返回是否已确认无持仓并收口。
+
+        必须复查确认确实平干净了才能上报终态：服务端收到终态会把持仓数清零并释放
+        节点占位，此时若还有残仓，这批仓位就再也没人负责了。
+        """
+        error = ""
+        left = 0
+        for attempt in range(_CLOSE_ALL_ATTEMPTS):
+            held = await self._magic_positions()
+            if held is not None:
+                left = len(held)
+                if not held:
+                    await self._finish("done", self._stop_reason)
+                    return True
+                # 平仓前先记下浮盈，成交历史查询失败时作为回退
+                self._last_floating_profit = round(
+                    sum(_as_float(p.get("profit")) for p in held), 2,
+                )
+            if attempt + 1 >= _CLOSE_ALL_ATTEMPTS:
+                break
+            res = dict(await self._exec(self._mt5.close_by_magic, self.magic) or {})
+            if not res.get("success", True):
+                error = str(res.get("error") or "close failed")
         await self._finish(
-            "done" if ok else "failed",
-            self._stop_reason if ok else f"close_failed: {res.get('error')}",
+            "stop_failed",
+            f"close_failed: {error or '平仓后仍有持仓'}",
+            residual=left,
         )
+        return False
 
     # ------------------------------------------------------------------
     # 上报
@@ -1156,6 +1352,11 @@ class StrategyRunner:
             data["message"] = message[:MESSAGE_LIMIT]
         if detail:
             data["detail"] = detail
+        # 非心跳附带网格运行态，服务端落 runtime_json，重连可原样恢复
+        if event != "heartbeat" and self.is_grid:
+            runtime = self._grid_runtime_payload()
+            if runtime is not None:
+                data["runtime"] = runtime
         await self._send({"type": "strategy_progress", "data": data})
 
     async def _resolve_passive_close_reason(self) -> None:
@@ -1180,10 +1381,23 @@ class StrategyRunner:
         if detail is not None and self._stop_detail is None:
             self._stop_detail = detail
 
-    async def _finish(self, status: str, reason: str) -> None:
+    async def _finish(self, status: str, reason: str, *, residual: int = 0) -> None:
+        """上报收口结果。
+
+        residual > 0 时 status 必须是非终态：持仓还在，服务端要继续持有节点占位。
+        非终态可能被反复触发（每轮重试都会走到这里），同一状态只上报一次。
+        """
         if self._finished:
             return
-        self._finished = True
+        if status in _TERMINAL_STATUSES:
+            self._finished = True
+        elif self._reported_stuck == (status, residual):
+            return
+        else:
+            self._reported_stuck = (status, residual)
+            logger.warning(
+                "task %s %s: %s (residual=%s)", self.task_id, status, reason, residual,
+            )
         realized = await self._resolve_realized_profit()
         logger.info(
             "task %s finished: %s (%s) realized_profit=%s",
@@ -1200,6 +1414,7 @@ class StrategyRunner:
             "total_orders": self.total_orders,
             "total_volume": round(self.total_volume, 4),
             "realized_profit": realized,
+            "residual_positions": residual,
         }
         if self._stop_detail:
             data["detail"] = self._stop_detail

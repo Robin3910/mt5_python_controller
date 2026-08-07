@@ -242,6 +242,9 @@ class GroupTaskDispatch(Base):
     服务端再用账户快照对账兜底（见 group_persist.reconcile_*）。
     网格等策略空仓是常态时 hold_when_empty=True，对账不会因无持仓强制收口。
 
+    节点停止交易但持仓没平干净时会落 stop_failed / detached / faulted，
+    这些都**不是终态**：持仓仍在，占位继续持有，直到确认清空才收口。
+
     并发互斥也落在这一层：子任务处于非终态时，(node_id, symbol) 会持有一个 Redis
     占位，同一节点同品种不会被重复下发（不同品种可并行）。
     """
@@ -273,6 +276,13 @@ class GroupTaskDispatch(Base):
     finish_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # 网格等策略空仓是常态：为 True 时账户快照对账不会因无持仓强制收口
     hold_when_empty: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 节点已停止交易但魔术号下仍有持仓的笔数（stop_failed / detached / faulted）
+    residual_positions: Mapped[int] = mapped_column(Integer, default=0)
+    # 策略运行态（网格的触发状态、平移量、当前网格线与止损止盈等），
+    # 供节点重连后原样恢复；结构由节点定义，服务端只负责透传
+    runtime_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # 终止意图落库时刻：跨服务重启也不会把 closing 的子任务又恢复成继续跑
+    stop_requested_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     dispatched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     opened_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_report_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

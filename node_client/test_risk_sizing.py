@@ -3,6 +3,7 @@ import pytest
 
 from risk_sizing import (
     RULE_TYPE_RISK_SIZED,
+    Batch,
     RiskSizedConfig,
     SymbolSpec,
     anchor_to_fill,
@@ -11,7 +12,9 @@ from risk_sizing import (
     breakeven_move,
     describe_batch,
     describe_plan,
+    filled_orders_from_positions,
     next_batch,
+    parse_batch_comment,
     pending_batches,
     pick_risk_sized_rule,
     plan_detail,
@@ -401,6 +404,28 @@ def test_next_batch_needs_base_filled_first():
     c = cfg()
     plan = plan_entries(c, direction="BUY", entry_price=2400.0, stop_loss=2397.0, spec=GOLD)
     assert next_batch(plan, c, filled=0, price=2398.0) is None
+
+
+def test_batch_comment_roundtrip():
+    assert batch_comment(Batch(index=1, volume=0.1)) == "R3B1"
+    assert batch_comment(Batch(index=12, volume=0.1)) == "R3B12"
+    assert parse_batch_comment("R3B12") == 12
+    assert parse_batch_comment("S1") is None
+    assert parse_batch_comment("R3B") is None
+
+
+def test_filled_orders_from_positions_uses_max_batch_not_count():
+    """中间档止盈离场后，仍按最大 R3B 序号推断已开完，避免重开。"""
+    positions = [
+        {"comment": "S1", "volume": 0.3},
+        {"comment": "R3B2", "volume": 0.35},
+    ]
+    assert filled_orders_from_positions(positions) == 3
+    assert filled_orders_from_positions([{"comment": "S1"}]) == 1
+    assert filled_orders_from_positions([
+        {"comment": "S1"}, {"comment": "R3B1"},
+    ]) == 2
+    assert filled_orders_from_positions([]) == 0
 
 
 # ---------------------------------------------------------------------------

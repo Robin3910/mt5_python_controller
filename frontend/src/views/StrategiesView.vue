@@ -181,7 +181,7 @@ const FIELD_HELP = {
   grid_side:
     '网格方向：\n只做多 = 跌买涨卖；\n只做空 = 涨卖跌买；\n跟随信号 = 按触发信号的 BUY/SELL 决定方向。',
   lot_per_grid: '每一格买入/卖出的手数。',
-  trigger_price: '触发价。填 0 表示信号到达后立即启动；否则等到价触及该价才建网格。',
+  trigger_price: '触发价。填 0 表示信号到达后立即启动；否则等现价触及（穿越或落到）该价才建网格，与多空方向无关。',
   stop_lower:
     '下沿终止价，须低于区间下限；填 0 表示不设。' +
     '多头 / 跟随信号做多时为止损；空头时为止盈。',
@@ -198,11 +198,17 @@ const FIELD_HELP = {
   stop_bound_upper:
     '上沿终止价，须高于区间上限；填 0 表示不设。' +
     '实际方向由信号决定：做多时为止盈，做空时为止损。',
-  close_on_stop: '触发止损/止盈时是否清掉该任务全部持仓。关闭则只停止监控、保留持仓。',
+  close_on_stop:
+    '触发止损/止盈或收到终止指令时是否清掉该任务全部持仓。\n' +
+    '关闭后：停止网格交易与监控推进，但保留已有持仓；任务进入「已脱离」非终态，' +
+    '占位不释放，直到这批仓位被外部平光才真正收口。',
   prefill_enabled:
-    '开启后启动时按「现价上方格位数 × 每格手数」市价买入底仓，' +
-    '否则价格上涨时无货可卖、上半部分网格失效。',
-  grid_total_lot_limit: '全部格位合计手数上限，0=不额外限制。初始建仓也会受此约束。',
+    '开启后启动时按「仍有盈利空间的格位 × 每格手数」市价建底仓：\n' +
+    '多头买入卖出价仍高于现价的格；空头开空平仓价仍低于现价的格。\n' +
+    '关闭则只挂网格、等穿越再开仓；多头上涨时可能无货可卖。',
+  grid_total_lot_limit:
+    '全部格位合计手数上限，0=不额外限制。初始建仓也会受此约束。\n' +
+    '若填写，须不小于每格手数，否则策略无法保存 / 无法参与分发。',
   trailing_up:
     '向上追踪：价格越过区间外沿时网格不停机，' +
     '整个区间连同止损价 / 止盈价一起平移一格，继续在新区间吃差价。\n' +
@@ -522,6 +528,9 @@ function validateGrid(r: EditableRule, label: string): string | null {
   }
   if (!(r.lot_per_grid > 0)) return `${label}：每格手数需大于 0`
   if (r.total_lot_limit < 0) return `${label}：总手数上限不能为负`
+  if (r.total_lot_limit > 0 && r.total_lot_limit < r.lot_per_grid) {
+    return `${label}：总手数上限须不小于每格手数`
+  }
   if (r.trigger_price < 0) return `${label}：触发价不能为负`
   const stops = gridStopFields(r.grid_side)
   // 几何约束与方向无关：下沿价 < 区间下限，上沿价 > 区间上限
@@ -580,6 +589,7 @@ function trailingHint(r: EditableRule): string {
 
 function validateRules(rules: EditableRule[]): string | null {
   if (!rules.length) return '请至少配置一条规则'
+  if (!rules.some((r) => r.status === 1)) return '请至少启用一条规则'
   for (const r of rules) {
     const label = RULE_TYPE_LABEL[r.type] || `类型${r.type}`
     if (!['all', 'buy', 'sell'].includes(String(r.action || '').toLowerCase())) {

@@ -56,6 +56,25 @@ def test_plan_grid_rejects_bad_range():
     assert "上限" in plan.reject
 
 
+def test_plan_grid_rejects_collapsed_levels():
+    """区间太窄时多条网格线会被四舍五入到同一价位，一次穿越能连开好几格。"""
+    plan = gt.plan_grid(
+        _cfg(price_lower=100.0, price_upper=100.01, grid_count=10),
+        signal_action="BUY", spec=_spec(),
+    )
+    assert not plan.ok
+    assert "精度" in plan.reject
+
+
+def test_plan_grid_rejects_total_lot_below_one_grid():
+    """一格都开不出来的配置直接拒绝，否则任务只会空跑着占用节点。"""
+    plan = gt.plan_grid(
+        _cfg(lot_per_grid=0.1, total_lot_limit=0.05), signal_action="BUY", spec=_spec(),
+    )
+    assert not plan.ok
+    assert "总手数上限" in plan.reject
+
+
 def test_resolve_side():
     assert gt.resolve_side(_cfg(grid_side="long"), "SELL") == "BUY"
     assert gt.resolve_side(_cfg(grid_side="short"), "BUY") == "SELL"
@@ -65,19 +84,49 @@ def test_resolve_side():
 
 def test_prefill_indices_long():
     plan = gt.plan_grid(_cfg(grid_count=4), signal_action="BUY", spec=_spec())
-    # levels: 100, 102.5, 105, 107.5, 110；现价 106 → 买线 < 106 的格：0,1,2
+    # levels: 100, 102.5, 105, 107.5, 110；现价 106 是市价成本，
+    # 只有卖出线仍高于 106 的格能盈利兑现：格 2（卖 107.5）、格 3（卖 110）
+    assert gt.prefill_indices(plan, 106.0) == [2, 3]
+
+
+def test_prefill_indices_short():
+    plan = gt.plan_grid(
+        _cfg(grid_side="short", grid_count=4), signal_action="SELL", spec=_spec(),
+    )
+    # 现价 106 市价开空，只有平仓线仍低于 106 的格能盈利兑现
     assert gt.prefill_indices(plan, 106.0) == [0, 1, 2]
 
 
-def test_capped_prefill():
-    plan = gt.plan_grid(
-        _cfg(grid_count=4, lot_per_grid=0.1, total_lot_limit=0.2),
-        signal_action="BUY", spec=_spec(),
+def test_prefill_never_locks_in_a_loss():
+    """预填的每一格，退出线都必须在现价的盈利侧。"""
+    price = 106.0
+    long_plan = gt.plan_grid(_cfg(grid_count=4), signal_action="BUY", spec=_spec())
+    for i in gt.prefill_indices(long_plan, price):
+        assert long_plan.levels[i + 1] > price
+
+    short_plan = gt.plan_grid(
+        _cfg(grid_side="short", grid_count=4), signal_action="SELL", spec=_spec(),
     )
-    indices = gt.prefill_indices(plan, 106.0)
-    capped = gt.capped_prefill(plan, _cfg(lot_per_grid=0.1, total_lot_limit=0.2), indices)
-    assert len(capped) == 2
-    assert capped == indices[-2:]
+    for i in gt.prefill_indices(short_plan, price):
+        assert short_plan.levels[i] < price
+
+
+def test_capped_prefill():
+    cfg = _cfg(grid_count=4, lot_per_grid=0.1, total_lot_limit=0.2)
+    plan = gt.plan_grid(cfg, signal_action="BUY", spec=_spec())
+    indices = gt.prefill_indices(plan, 101.0)
+    assert indices == [0, 1, 2, 3]
+    # 0.2 / 0.1 = 2 格；多头留卖出线离现价最近的两格
+    assert gt.capped_prefill(plan, cfg, indices) == [0, 1]
+
+    short_cfg = _cfg(
+        grid_side="short", grid_count=4, lot_per_grid=0.1, total_lot_limit=0.2,
+    )
+    short_plan = gt.plan_grid(short_cfg, signal_action="SELL", spec=_spec())
+    short_indices = gt.prefill_indices(short_plan, 109.0)
+    assert short_indices == [0, 1, 2, 3]
+    # 空头留平仓线离现价最近的两格
+    assert gt.capped_prefill(short_plan, short_cfg, short_indices) == [2, 3]
 
 
 def test_crossings_down_then_up_no_repeat():
@@ -126,11 +175,17 @@ def test_terminate_reason():
     assert "止盈" in (gt.terminate_reason(short, 94.0) or "")
 
 
-def test_trigger_reached():
+def test_trigger_reached_is_direction_agnostic():
     cfg = _cfg(trigger_price=105.0)
-    assert gt.trigger_reached(cfg, 106.0, prev_price=0.0) is True
+    # 首个报价只用来确定所处一侧，正好落在触发价上才算到价
+    assert gt.trigger_reached(cfg, 106.0, prev_price=0.0) is False
     assert gt.trigger_reached(cfg, 104.0, prev_price=0.0) is False
+    assert gt.trigger_reached(cfg, 105.0, prev_price=0.0) is True
+    # 之后从任一侧触及都算：上涨触及、回落触及
     assert gt.trigger_reached(cfg, 105.0, prev_price=104.0) is True
+    assert gt.trigger_reached(cfg, 104.5, prev_price=106.0) is True
+    # 同侧移动不算
+    assert gt.trigger_reached(cfg, 106.5, prev_price=106.0) is False
     assert gt.trigger_reached(_cfg(trigger_price=0), 1.0) is True
 
 

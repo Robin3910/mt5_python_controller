@@ -18,7 +18,7 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 
 from . import group_rules
 from .db import SessionLocal
@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 
 # 子任务终态；仍在途的不参与主任务收口
 _TERMINAL = frozenset(group_rules.SUBTASK_TERMINAL)
+# 已停手但仍有持仓：非终态，继续持有节点占位
+_STUCK = frozenset(group_rules.SUBTASK_STUCK)
 
 
 async def create_task(
@@ -186,6 +188,39 @@ async def all_active_subtasks() -> list[dict]:
         return []
 
 
+async def active_subtasks_overview() -> list[dict]:
+    """全库活动子任务 + 主任务品种 / 模版快照，供 CLOSE 独立候选。
+
+    CLOSE 不能复用开仓 `_candidate_groups`：分组或策略后来被禁用时，仍要能终止
+    已在跑的任务。筛选依据是子任务自身与开仓时落库的策略快照，而不是当前配置。
+    """
+    try:
+        async with SessionLocal() as s:
+            rows = (
+                await s.execute(
+                    select(GroupTaskDispatch, GroupSignalTask)
+                    .join(
+                        GroupSignalTask,
+                        GroupSignalTask.task_id == GroupTaskDispatch.task_id,
+                    )
+                    .where(GroupTaskDispatch.status.notin_(tuple(_TERMINAL)))
+                    .order_by(GroupTaskDispatch.id.asc())
+                )
+            ).all()
+            out: list[dict] = []
+            for d, t in rows:
+                snap = t.strategy_snapshot_json if isinstance(t.strategy_snapshot_json, dict) else {}
+                item = _subtask_dict(d)
+                item["symbol"] = d.symbol or t.symbol
+                item["template_id"] = snap.get("template_id")
+                item["action"] = t.action
+                out.append(item)
+            return out
+    except Exception as e:  # noqa: BLE001
+        logger.warning("active_subtasks_overview failed: %s", e)
+        return []
+
+
 async def active_subtask_id(group_id: str, node_id: str) -> Optional[int]:
     """该分组内该节点仍未收口的子任务号（无则 None）。
 
@@ -284,6 +319,12 @@ async def resumable_tasks(node_id: str) -> list[dict]:
                     "symbol": d.symbol or t.symbol,
                     "volume": d.decided_vol if d.decided_vol is not None else t.volume,
                     "strategy_snapshot": t.strategy_snapshot_json,
+                    "status": d.status,
+                    "stop_requested_at": (
+                        d.stop_requested_at.timestamp()
+                        if d.stop_requested_at is not None else None
+                    ),
+                    "runtime": d.runtime_json,
                 }
                 for d, t in rows
             ]
@@ -462,11 +503,16 @@ async def update_dispatch_result(
 
 
 async def mark_dispatches_closing(dispatch_ids: list[int]) -> None:
-    """收到终止指令后把这些子任务标为 closing（等节点回报平仓完成）。"""
+    """收到终止指令后把这些子任务标为 closing（等节点回报平仓完成）。
+
+    终止意图同时落 stop_requested_at：服务重启或节点重连后据此补发终止指令，
+    而不是把一个已经决定要停的子任务又恢复成继续跑。
+    """
     if not dispatch_ids:
         return
     try:
         async with SessionLocal() as s:
+            now = datetime.now()
             rows = (
                 await s.execute(
                     select(GroupTaskDispatch).where(
@@ -477,6 +523,7 @@ async def mark_dispatches_closing(dispatch_ids: list[int]) -> None:
             ).scalars().all()
             for row in rows:
                 row.status = "closing"
+                row.stop_requested_at = row.stop_requested_at or now
             await s.flush()
             for tid in {row.task_id for row in rows}:
                 await _refresh_task_status(s, tid)
@@ -523,7 +570,7 @@ async def record_strategy_progress(
             now = datetime.now()
             row.last_report_at = now
             phase = str(data.get("phase") or "").strip()
-            if phase in group_rules.SUBTASK_RUNNING and row.status not in _TERMINAL:
+            if group_rules.can_apply_phase(row.status, phase):
                 row.status = phase
             if _num(data.get("position_count")) is not None:
                 row.position_count = int(data["position_count"])
@@ -540,6 +587,11 @@ async def record_strategy_progress(
                 order = data.get("last_order") or {}
                 row.order_ticket = order.get("ticket") or row.order_ticket
                 row.price = order.get("price") if order.get("price") is not None else row.price
+            # 网格运行态只在非心跳事件里落库：触发状态 / 平移量 / 当前网格线，
+            # 供节点重连后原样恢复；心跳不写，避免把库打爆
+            runtime = data.get("runtime")
+            if event_type and event_type != "heartbeat" and isinstance(runtime, dict):
+                row.runtime_json = runtime
 
             if event_type and event_type != "heartbeat":
                 order = data.get("last_order") or {}
@@ -578,13 +630,22 @@ async def finish_subtask(
     *, node_id: str, data: dict,
     dispatch_id: Optional[int] = None, task_id: Optional[int] = None,
 ) -> Optional[dict]:
-    """节点上报策略结束（magic 持仓已全平）。
+    """节点上报策略结束。
+
+    只有确认 magic 名下已无持仓才算收口。节点报回 stop_failed / detached / faulted
+    或带上 residual_positions 时，说明持仓还在：落非终态、保留节点占位，等它真正
+    平干净（或被账户快照对账确认已无持仓）再释放。
 
     返回 {task_id, task_status, released}，released 是需要释放的节点占位。
     """
     status = str(data.get("status") or "done").strip().lower()
-    if status not in _TERMINAL:
+    residual = _int_or_none(data.get("residual_positions")) or 0
+    if status not in _TERMINAL and status not in _STUCK:
         status = "done"
+    if status in _TERMINAL and residual > 0:
+        # 自报终态却还留着持仓：以持仓为准，按未收口处理
+        status = "stop_failed"
+    stuck = status in _STUCK
     try:
         async with SessionLocal() as s:
             row = await _locate_dispatch(
@@ -593,14 +654,18 @@ async def finish_subtask(
             if not row:
                 return None
             task_id = row.task_id
-            released = _released(row)
+            released = [] if stuck else _released(row)
             now = datetime.now()
             row.status = status
             reason = str(data.get("reason") or "positions_cleared")[:255]
             row.finish_reason = reason
-            row.finished_at = now
             row.last_report_at = now
-            row.position_count = 0
+            row.residual_positions = residual
+            if stuck:
+                row.position_count = residual
+            else:
+                row.finished_at = now
+                row.position_count = 0
             if _num(data.get("total_orders")) is not None:
                 row.total_orders = int(data["total_orders"])
             if _num(data.get("total_volume")) is not None:
@@ -616,12 +681,15 @@ async def finish_subtask(
                     task_id=task_id,
                     node_id=node_id,
                     magic=row.magic,
-                    event_type="close_all",
+                    event_type="error" if stuck else "close_all",
                     symbol=data.get("symbol"),
-                    position_count=0,
+                    position_count=residual,
                     total_volume=row.total_volume,
                     profit=row.realized_profit,
-                    message=reason,
+                    message=(
+                        f"[{status}] 仍有 {residual} 笔持仓未平掉：{reason}"[:255]
+                        if stuck else reason
+                    ),
                     detail_json=detail if isinstance(detail, dict) else None,
                 )
             )
@@ -654,6 +722,9 @@ async def reconcile_node_positions(
     这是 strategy_finished 的兜底——上报丢包或节点在监控启动前就平了仓时，
     单靠节点主动上报会让子任务永远停在 running，进而把该节点该品种锁死。
     只处理已经开过仓（opened_at 非空）的子任务，避免把刚下发还没成交的误判为完成。
+
+    网格空仓是常态，正常运行时不据此收口；但已经停手、只等残仓被处理掉的子任务
+    （STUCK）反过来必须靠这里收口，否则占位会一直挂着。
     返回 [{task_id, task_status, released}]，供调用方释放节点占位。
     """
     finished: list[dict] = []
@@ -663,10 +734,14 @@ async def reconcile_node_positions(
                 await s.execute(
                     select(GroupTaskDispatch).where(
                         GroupTaskDispatch.node_id == node_id,
-                        GroupTaskDispatch.status.in_(group_rules.SUBTASK_RUNNING),
+                        GroupTaskDispatch.status.in_(
+                            group_rules.SUBTASK_RUNNING + group_rules.SUBTASK_STUCK
+                        ),
                         GroupTaskDispatch.opened_at.is_not(None),
-                        # 网格空仓是常态，不据此收口
-                        GroupTaskDispatch.hold_when_empty.is_(False),
+                        or_(
+                            GroupTaskDispatch.hold_when_empty.is_(False),
+                            GroupTaskDispatch.status.in_(group_rules.SUBTASK_STUCK),
+                        ),
                     )
                 )
             ).scalars().all()
@@ -680,6 +755,7 @@ async def reconcile_node_positions(
                 row.status = "done"
                 row.finish_reason = "reconciled_no_position"
                 row.position_count = 0
+                row.residual_positions = 0
                 row.finished_at = now
                 row.last_report_at = now
                 s.add(

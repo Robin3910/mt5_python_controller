@@ -29,6 +29,7 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -45,6 +46,9 @@ BREAKEVEN_MODES = (BREAKEVEN_ONCE, BREAKEVEN_LOOP)
 
 # MT5 订单备注上限约 31 字符
 MT5_COMMENT_LIMIT = 31
+
+# 分散仓备注：R3B{index}（断线恢复靠它判断已开过哪些档，勿用持仓笔数）
+_BATCH_COMMENT_RE = re.compile(r"^R3B(\d+)$")
 
 
 def _as_float(value: object, default: float = 0.0) -> float:
@@ -647,3 +651,34 @@ def batch_comment(batch: Batch) -> str:
     """分散仓写进 MT5 的紧凑备注：R3=以损定量，B=序号。"""
     text = f"R3B{batch.index}"
     return text[:MT5_COMMENT_LIMIT]
+
+
+def parse_batch_comment(comment: object) -> Optional[int]:
+    """从 MT5 备注解析分散仓批次号；解析失败返回 None。"""
+    text = str(comment or "").strip()
+    m = _BATCH_COMMENT_RE.match(text)
+    if not m:
+        return None
+    return int(m.group(1))
+
+
+def filled_orders_from_positions(positions: list[dict]) -> int:
+    """按持仓备注推断已开过的订单数（含底仓），供 pending_batches(filled=...) 使用。
+
+    中间档被阶梯止盈平掉后，持仓笔数会少于真实已开档数；若仍用 len(positions)
+    当 filled，会把已平掉的档再开一遍。见过 R3B{n} 时取 max(n)+1（底仓必已开过）；
+    只有底仓备注（S* / 信号备注）时回退到持仓笔数。
+    """
+    if not positions:
+        return 0
+    max_idx = -1
+    saw_distribute = False
+    for pos in positions:
+        idx = parse_batch_comment(pos.get("comment"))
+        if idx is None:
+            continue
+        saw_distribute = True
+        max_idx = max(max_idx, idx)
+    if not saw_distribute:
+        return len(positions)
+    return max(max_idx, 0) + 1

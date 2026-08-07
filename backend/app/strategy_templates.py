@@ -73,7 +73,15 @@ TEMPLATE_1_NAME = "顺势逆势加仓策略"
 TEMPLATE_2_ID = "tpl_2"
 TEMPLATE_2_NAME = "趋势策略"
 TEMPLATE_3_ID = "tpl_3"
-TEMPLATE_3_NAME = "网络策略"
+TEMPLATE_3_NAME = "网格策略"
+
+
+# 各模版允许的规则 type；创建/更新策略时据此拒收错配与空启用集
+TEMPLATE_RULE_TYPES: dict[str, frozenset[int]] = {
+    TEMPLATE_1_ID: frozenset({RULE_TYPE_COUNTER, RULE_TYPE_TREND}),
+    TEMPLATE_2_ID: frozenset({RULE_TYPE_RISK_SIZED}),
+    TEMPLATE_3_ID: frozenset({RULE_TYPE_GRID}),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -754,6 +762,52 @@ def normalize_rules(rules: object) -> list[dict[str, Any]]:
     if not isinstance(rules, list):
         return []
     return [normalize_rule(r) for r in rules if isinstance(r, dict)]
+
+
+def validate_rules_for_template(template_id: str, rules: list[dict]) -> Optional[str]:
+    """模版与规则一致性校验；通过返回 None，否则返回人读的拒收原因。
+
+    - 规则 type 必须落在该模版允许集合内；
+    - 至少一条启用中的规则；
+    - 模版3 启用规则还要过区间 / 手数等基础合法性（与分发准入对齐）。
+    """
+    allowed = TEMPLATE_RULE_TYPES.get(str(template_id or "").strip())
+    if allowed is None:
+        return None
+    if not rules:
+        return "请至少配置一条规则"
+    active = 0
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        rule_type = _as_int(rule.get("type"), 0)
+        if rule_type not in allowed:
+            return f"策略模版 {template_id} 不允许规则类型 {rule_type}"
+        if not _as_int(rule.get("status"), 0):
+            continue
+        active += 1
+        if rule_type == RULE_TYPE_GRID:
+            reason = _validate_grid_rule_fields(rule)
+            if reason:
+                return reason
+    if active <= 0:
+        return "请至少启用一条规则"
+    return None
+
+
+def _validate_grid_rule_fields(rule: dict) -> Optional[str]:
+    """网格规则字段合法性（不依赖信号方向）。"""
+    lower = _as_float(rule.get("price_lower"), 0.0)
+    upper = _as_float(rule.get("price_upper"), 0.0)
+    if lower <= 0 or upper <= 0 or upper <= lower:
+        return "网格交易需要合法的价格区间（上限须大于下限，且均大于 0）"
+    lot = _as_float(rule.get("lot_per_grid"), 0.0)
+    if lot <= 0:
+        return "网格交易的每格手数需大于 0"
+    limit = _as_float(rule.get("total_lot_limit"), 0.0)
+    if limit > 0 and limit < lot:
+        return "网格交易的总手数上限须不小于每格手数"
+    return None
 
 
 def rules_to_rule_set(rules: object) -> TemplateRuleSet:

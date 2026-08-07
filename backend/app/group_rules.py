@@ -178,13 +178,32 @@ def reconcile_rotation(order: list[str], participants: list[str]) -> list[str]:
 SUBTASK_PENDING = ("pending", "sent")
 # 子任务运行态：首单已成交，节点正在按策略监控与加仓
 SUBTASK_RUNNING = ("opened", "running", "closing")
+# 节点已停止交易、但魔术号下仍有持仓：
+# stop_failed 平仓没平干净 / detached 按配置保留持仓 / faulted 执行器异常退出。
+# 这些都不是终态——持仓还在就必须继续持有占位，不能让下一条信号叠上来。
+SUBTASK_STUCK = ("stop_failed", "detached", "faulted")
 # 子任务终态：不再变化，可参与主任务收口，并触发节点占位释放
 SUBTASK_TERMINAL = ("done", "failed", "skipped", "offline")
-# 子任务占位态：持有节点互斥占位的状态集合（在途 + 运行中）
-SUBTASK_HOLDS_LOCK = SUBTASK_PENDING + SUBTASK_RUNNING
+# 子任务占位态：持有节点互斥占位的状态集合（在途 + 运行中 + 残仓待处理）
+SUBTASK_HOLDS_LOCK = SUBTASK_PENDING + SUBTASK_RUNNING + SUBTASK_STUCK
 
 # 主任务未收口状态：仅用于展示与断线恢复筛选，不再承担互斥职责
 TASK_ACTIVE = ("pending", "dispatching", "running")
+
+
+def can_apply_phase(current: str, phase: str) -> bool:
+    """节点上报的运行阶段能否覆盖当前子任务状态。
+
+    状态只允许前向流动：已进入终止流程（closing）或已停手待处理残仓（STUCK）的
+    子任务，不能被一条迟到的运行心跳改回 running，否则终止意图会凭空丢掉。
+    """
+    if phase not in SUBTASK_RUNNING:
+        return False
+    if current in SUBTASK_TERMINAL or current in SUBTASK_STUCK:
+        return False
+    if current == "closing" and phase != "closing":
+        return False
+    return True
 
 
 def aggregate_task_status(dispatch_statuses: list[str]) -> str:
@@ -192,7 +211,7 @@ def aggregate_task_status(dispatch_statuses: list[str]) -> str:
 
     - 无子任务 -> skipped（没有任何节点被下发）
     - 仍有 pending/sent -> dispatching（还没确认首单）
-    - 有 opened/running/closing -> running（策略在跑）
+    - 有 opened/running/closing 或残仓待处理 -> running（还没了结）
     - 既有成功又有失败 -> partial
     - 任一成功（无失败）-> done
     - 全部失败 -> failed
@@ -200,7 +219,7 @@ def aggregate_task_status(dispatch_statuses: list[str]) -> str:
     """
     if not dispatch_statuses:
         return "skipped"
-    if any(st in SUBTASK_RUNNING for st in dispatch_statuses):
+    if any(st in SUBTASK_RUNNING or st in SUBTASK_STUCK for st in dispatch_statuses):
         return "running"
     if any(st in SUBTASK_PENDING for st in dispatch_statuses):
         return "dispatching"
@@ -256,12 +275,41 @@ def _reject_grid(rule: dict, *, signal_stop_loss: object,
         return "网格交易需要合法的价格区间（上限须大于下限，且均大于 0）"
     if float(rule.get("lot_per_grid") or 0) <= 0:
         return "网格交易的每格手数需大于 0"
+    try:
+        lot_limit = float(rule.get("total_lot_limit") or 0)
+        lot = float(rule.get("lot_per_grid") or 0)
+    except (TypeError, ValueError):
+        lot_limit, lot = 0.0, 0.0
+    if lot_limit > 0 and lot > 0 and lot_limit < lot:
+        return "网格交易的总手数上限须不小于每格手数"
     side = str(rule.get("grid_side") or strategy_templates.GRID_SIDE_LONG).strip().lower()
     action = str(signal_action or "").strip().upper()
     if side == strategy_templates.GRID_SIDE_LONG and action == "SELL":
         return "网格方向为只做多（long），不接受 SELL 信号"
     if side == strategy_templates.GRID_SIDE_SHORT and action == "BUY":
         return "网格方向为只做空（short），不接受 BUY 信号"
+    return None
+
+
+def no_active_rule_reason(strategy: dict) -> Optional[str]:
+    """策略规则启用态拒收原因；可开仓返回 None。
+
+    - 规则列表为空：视为「仅首单、无加仓规则」的旧口径，不在此拦截；
+    - 有规则但全部关闭：拒收；
+    - 模版2/3 还必须有对应 type 的启用规则（否则节点无法走对执行路径）。
+    """
+    rules = strategy.get("rules")
+    if not isinstance(rules, list) or not rules:
+        return None
+    if not any(isinstance(r, dict) and int(r.get("status") or 0) for r in rules):
+        return "策略没有启用中的规则"
+    template_id = str(strategy.get("template_id") or "").strip().lower()
+    if template_id == strategy_templates.TEMPLATE_3_ID:
+        if strategy_templates.pick_grid_rule(rules) is None:
+            return "网格策略没有启用中的网格规则"
+    if template_id == strategy_templates.TEMPLATE_2_ID:
+        if strategy_templates.pick_risk_sized_rule(rules) is None:
+            return "趋势策略没有启用中的以损定量规则"
     return None
 
 
@@ -280,8 +328,11 @@ def entry_reject_reason(
     """开仓前的策略级准入：策略跑不起来时给出人读的原因；可开仓返回 None。
 
     与其让节点收到命令后再失败一次，不如在分发前挡住，落选原因直接写进信号记录。
-    按启用中规则的 type 分派到对应校验；未知 type 不拦截。
+    先拦启用态 / 模版必备规则，再按启用中规则的 type 分派到对应校验；未知 type 不拦截。
     """
+    empty = no_active_rule_reason(strategy)
+    if empty:
+        return empty
     rules = strategy.get("rules")
     if not isinstance(rules, list):
         return None

@@ -442,6 +442,88 @@ async def test_grid_signal_dispatches_with_rule_snapshot(store, monkeypatch):
     assert rule["trailing_up"] is True
     assert rule["trailing_max"] == 5
 
+    rows = await fetch_dispatches((await fetch_tasks("sig_grid_ok"))[0].task_id)
+    assert rows[0].hold_when_empty is True
+
+
+async def test_grid_short_and_follow_admission(store, monkeypatch):
+    """空头网格拒收 BUY；follow 网格 BUY/SELL 均可。"""
+    await online(store, mk_node("nd_s"), mk_node("nd_f"))
+    await mk_grid_group(store, "空头网格", ["nd_s"], grid_side="short")
+    await mk_grid_group(store, "跟随网格", ["nd_f"], grid_side="follow")
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    d = GroupDispatcher(store)
+
+    await d.dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_grid_short_buy",
+    )
+    # short 分组落选；follow 分组仍可接 BUY
+    assert any(s[0] == "nd_f" for s in sent)
+    assert not any(s[0] == "nd_s" for s in sent)
+    sent.clear()
+
+    ok = await d.dispatch(
+        TradingSignal(action="SELL", symbol="XAUUSD", volume=0.1), "sig_grid_short_sell",
+    )
+    assert ok["mode"] == "group"
+    # follow 节点可能仍被上一笔占用；这里只断言空头网格能接 SELL
+    assert any(s[0] == "nd_s" for s in sent)
+
+async def test_progress_runtime_roundtrip_and_stuck_finish(store, monkeypatch):
+    """非心跳 progress 落 runtime_json；残仓 finish 落 STUCK 且不释放占位。"""
+    from app.group_dispatcher import build_strategy_resume_command
+
+    await online(store, mk_node("nd_a"))
+    await mk_grid_group(store, "运行态组", ["nd_a"])
+    monkeypatch.setattr(manager, "send_to_node", capture_sender([]))
+    d = GroupDispatcher(store)
+    await d.dispatch(TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_rt")
+    task = (await fetch_tasks("sig_rt"))[0]
+    await open_first_orders(task.task_id, ["nd_a"])
+    row = (await fetch_dispatches(task.task_id))[0]
+
+    ok = await group_persist.record_strategy_progress(
+        node_id="nd_a", dispatch_id=row.id, task_id=task.task_id,
+        data={
+            "event": "grid_shift", "phase": "running",
+            "position_count": 1, "total_orders": 2, "total_volume": 0.02,
+            "runtime": {
+                "triggered": True, "shift_count": 2,
+                "levels": [2305.0, 2315.0, 2325.0],
+            },
+        },
+    )
+    assert ok is True
+    row = (await fetch_dispatches(task.task_id))[0]
+    assert row.runtime_json and row.runtime_json["shift_count"] == 2
+
+    # closing ← running 被单调化拒绝
+    await group_persist.mark_dispatches_closing([row.id])
+    await group_persist.record_strategy_progress(
+        node_id="nd_a", dispatch_id=row.id, task_id=task.task_id,
+        data={"event": "heartbeat", "phase": "running", "position_count": 1},
+    )
+    row = (await fetch_dispatches(task.task_id))[0]
+    assert row.status == "closing"
+    assert row.stop_requested_at is not None
+
+    stuck = await group_persist.finish_subtask(
+        node_id="nd_a", dispatch_id=row.id, task_id=task.task_id,
+        data={"status": "stop_failed", "reason": "close_failed", "residual_positions": 1},
+    )
+    assert stuck["released"] == []
+    row = (await fetch_dispatches(task.task_id))[0]
+    assert row.status == "stop_failed"
+    assert row.residual_positions == 1
+    assert row.position_count == 1
+
+    resume = await group_persist.resumable_tasks("nd_a")
+    assert resume and resume[0]["runtime"]["shift_count"] == 2
+    assert resume[0]["stop_requested_at"] is not None
+    cmd = build_strategy_resume_command(resume[0])
+    assert cmd["runtime"]["shift_count"] == 2
+
 
 async def test_grid_signal_needs_no_stop_loss(store, monkeypatch):
     """网格不靠止损距离算手数，缺 sl 也照常下发（与模版2 相反）。"""
@@ -1477,7 +1559,7 @@ async def test_dispatch_rechecks_db_when_busy_lock_expired(store, monkeypatch):
 
 
 async def test_close_signal_without_active_task_is_skipped(store, monkeypatch):
-    """分组没有进行中的任务时，CLOSE 无事可做。"""
+    """没有进行中的子任务时，CLOSE 拒收且不新建主任务。"""
     await online(store, mk_node("nd_a"))
     await mk_group(store, "空闲组", ["nd_a"])
     sent = []
@@ -1487,10 +1569,40 @@ async def test_close_signal_without_active_task_is_skipped(store, monkeypatch):
         TradingSignal(action="CLOSE", symbol="XAUUSD", volume=0.1), "sig_c2",
     )
 
-    assert res["mode"] == "group_close"
+    assert res["mode"] == "rejected"
     assert res["targets"] == 0
-    assert res["tasks"][0]["status"] == "skipped"
+    assert "无匹配任务" in res["reason"]
     assert sent == []
+    assert await fetch_tasks("sig_c2") == []
+
+
+async def test_close_signal_works_after_strategy_disabled(store, monkeypatch):
+    """分组/策略后来禁用：CLOSE 仍按活动子任务与开仓快照终止，不走开仓准入。"""
+    await online(store, mk_node("nd_a"))
+    group = await mk_grid_group(store, "禁用后仍可关", ["nd_a"])
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    d = GroupDispatcher(store)
+
+    await d.dispatch(TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_dis_open")
+    task = (await fetch_tasks("sig_dis_open"))[0]
+    await open_first_orders(task.task_id, ["nd_a"])
+    sent.clear()
+
+    # 禁用分组与策略：开仓候选会落选，但 CLOSE 必须仍能停掉在跑任务
+    await group_service.update_group(
+        store, group["group_id"], GroupUpdate(enabled=False),
+    )
+    strategy = await store.get_strategy(group["strategy_id"])
+    strategy["enabled"] = False
+    await store.cache_strategy(strategy)
+
+    res = await d.dispatch(
+        TradingSignal(action="CLOSE", symbol="XAUUSD", volume=0.1), "sig_dis_close",
+    )
+    assert res["mode"] == "group_close"
+    assert res["targets"] == 1
+    assert sent and sent[0][1]["cmd"] == "strategy_stop"
 
 
 async def test_group_dispatch_ignores_console_symbol_config(store, monkeypatch):

@@ -38,6 +38,8 @@ class MockMT5Client:
         self._realized_by_magic: dict[int, float] = {}  # 按魔术号累计已实现盈亏
         self._exit_deals: list[dict] = []         # 出场成交（供收口原因汇总）
         self.prices_map = dict(_DEFAULT_PRICES)
+        # 逐笔持仓的对冲账户；改成 netting 可模拟网格被拒的场景
+        self.margin_mode = "hedging"
 
     def connect(self) -> bool:
         self.connected = True
@@ -59,6 +61,7 @@ class MockMT5Client:
             "free_margin": self.balance + floating,
             "leverage": 100,
             "currency": "USD",
+            "margin_mode": self.margin_mode,
         }
 
     def positions(self) -> list[dict]:

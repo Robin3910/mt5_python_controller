@@ -566,7 +566,7 @@ def test_manual_close_requires_strategy_model(client):
 
 
 def test_manual_close_goes_through_group_close(client):
-    """strategy 的 CLOSE 走分组终止链路；组内无进行中任务时不新建主任务。"""
+    """strategy 的 CLOSE 走分组终止链路；无活动子任务时拒收且不新建主任务。"""
     h = auth_headers(client)
     gid = _mk_group(client, h, name="手动终止组")["group_id"]
     r = client.post(
@@ -577,8 +577,8 @@ def test_manual_close_goes_through_group_close(client):
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["model"] == "strategy"
-    assert body["mode"] == "group_close"
-    assert body["tasks"][0]["status"] == "skipped"
+    assert body["mode"] == "rejected"
+    assert "无匹配任务" in body["reason"]
     assert client.get(f"/api/groups/{gid}/signals", headers=h).json()["total"] == 0
 
 

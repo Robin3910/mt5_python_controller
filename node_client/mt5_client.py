@@ -46,6 +46,11 @@ TIMEFRAMES: dict[str, int] = (
 )
 
 
+# 账户保证金模式。网格「一格一笔持仓」的模型只在对冲账户成立，净持仓账户会把
+# 同品种仓位合并成一笔，格位与 comment 全部对不上。
+ACCOUNT_MARGIN_MODES = {0: "netting", 1: "exchange", 2: "hedging"}
+
+
 class MT5Error(RuntimeError):
     pass
 
@@ -161,6 +166,9 @@ class MT5Client:
             "free_margin": ai.margin_free,
             "leverage": ai.leverage,
             "currency": ai.currency,
+            "margin_mode": ACCOUNT_MARGIN_MODES.get(
+                getattr(ai, "margin_mode", None), ""
+            ),
         }
 
     def positions(self) -> list[dict]:
@@ -348,32 +356,62 @@ class MT5Client:
             "error": getattr(last, "comment", "order failed after retries"),
         }
 
-    def close_position(self, pos: dict) -> dict:
-        """平掉单个持仓：下反方向 deal，并通过 position=ticket 指定要平的仓位。"""
+    def close_position(self, pos: dict, max_retry: int = 3) -> dict:
+        """平掉单个持仓：下反方向 deal，并通过 position=ticket 指定要平的仓位。
+
+        与开仓同样处理填充模式切换与瞬时错误重试：平仓失败留下的是无人管的持仓，
+        比开仓失败更危险，不能一遇到 requote 就放弃。
+        """
         self.ensure()
         resolved = pos["symbol"]
-        tick = mt5.symbol_info_tick(resolved)
-        if tick is None:
-            return {"success": False, "error": "no tick", "ticket": pos["ticket"]}
         is_buy = pos["type"] == "BUY"
         close_type = mt5.ORDER_TYPE_SELL if is_buy else mt5.ORDER_TYPE_BUY  # 反向平仓
-        price = tick.bid if is_buy else tick.ask
-        for fill in self.filling_modes(resolved):
+        fillings = self.filling_modes(resolved)
+        fill_idx = 0     # 当前尝试的填充模式下标
+        attempt = 0      # 瞬时错误重试计数
+        last = None
+
+        def _fail(error: str, retcode: Optional[int] = None) -> dict:
+            out = {
+                "success": False,
+                "ticket": pos["ticket"],
+                "symbol": pos["symbol"],
+                "action": "CLOSE",
+                "volume": float(pos["volume"]),
+                "position_type": pos["type"],
+                "error": error,
+            }
+            if retcode is not None:
+                out["retcode"] = retcode
+            return out
+
+        while attempt <= max_retry and fill_idx < len(fillings):
+            # 每次都重新取价（重试时价格可能已变）
+            tick = mt5.symbol_info_tick(resolved)
+            if tick is None:
+                return _fail("no tick")
             request = {
                 "action": mt5.TRADE_ACTION_DEAL,
                 "symbol": resolved,
                 "volume": float(pos["volume"]),
                 "type": close_type,
                 "position": pos["ticket"],
-                "price": price,
+                "price": tick.bid if is_buy else tick.ask,
                 "deviation": self.slippage,
                 "magic": int(pos.get("magic") or self.magic),
                 "comment": "close",
                 "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": fill,
+                "type_filling": fillings[fill_idx],
             }
             result = mt5.order_send(request)
-            if result is not None and result.retcode in (RET_DONE, RET_DONE_PARTIAL):
+            last = result
+            if result is None:
+                logger.error("close order_send returned None: %s", mt5.last_error())
+                attempt += 1
+                continue
+
+            rc = result.retcode
+            if rc in (RET_DONE, RET_DONE_PARTIAL):
                 return {
                     "success": True,
                     "ticket": pos["ticket"],
@@ -381,27 +419,21 @@ class MT5Client:
                     "action": "CLOSE",
                     "volume": float(pos["volume"]),
                     "position_type": pos["type"],
-                    "retcode": result.retcode,
+                    "retcode": rc,
                 }
-            # 仅在“填充模式不支持”时换下一种，其它错误直接返回
-            if result is not None and result.retcode != RET_INVALID_FILL:
-                return {
-                    "success": False,
-                    "ticket": pos["ticket"],
-                    "symbol": pos["symbol"],
-                    "action": "CLOSE",
-                    "volume": float(pos["volume"]),
-                    "position_type": pos["type"],
-                    "retcode": result.retcode,
-                    "error": result.comment,
-                }
-        return {
-            "success": False,
-            "ticket": pos["ticket"],
-            "symbol": pos["symbol"],
-            "action": "CLOSE",
-            "error": "close failed",
-        }
+            if rc == RET_INVALID_FILL:
+                fill_idx += 1  # 换下一种填充模式（不消耗重试次数）
+                continue
+            if rc in TRANSIENT:
+                attempt += 1
+                time.sleep(min(0.3 * attempt, 1.5))
+                continue
+            return _fail(result.comment, rc)
+
+        return _fail(
+            getattr(last, "comment", "close failed after retries"),
+            getattr(last, "retcode", None),
+        )
 
     def close_ticket(self, ticket: int) -> dict:
         """按订单号平仓。"""
