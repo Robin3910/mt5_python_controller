@@ -17,7 +17,8 @@ node_client/.env
 node_client/dist/
 node_client/build/
 node_client/__pycache__/
-
+.vscode/
+.opencode/
 docs/
 AGENTS.md
 
