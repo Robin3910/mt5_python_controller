@@ -5,6 +5,7 @@ from strategy_rules import (
     RULE_TYPE_TREND,
     PositionCtx,
     action_matches,
+    counter_anchor_price,
     decision_comment,
     decision_detail,
     describe_decision,
@@ -13,6 +14,7 @@ from strategy_rules import (
     evaluate_rule,
     metric_key,
     pick_batch_level,
+    rule_base_price,
 )
 
 POINT = 0.01  # 黄金类品种
@@ -169,6 +171,61 @@ def test_batch_action_can_differ_from_base_action():
     assert evaluate_rule(
         rule, ctx(position_count=1, price=2401.0, direction="SELL")
     ) is not None
+
+
+# --------------------------- 逆势 / 顺势基准价 ---------------------------
+def test_counter_anchor_is_adverse_extreme():
+    assert counter_anchor_price("BUY", [4260.0, 4261.5]) == 4260.0
+    assert counter_anchor_price("BUY", [4260.0, 4259.0, 4261.5]) == 4259.0
+    assert counter_anchor_price("SELL", [2400.0, 2399.0]) == 2400.0
+    assert counter_anchor_price("SELL", [2400.0, 2401.0, 2399.0]) == 2401.0
+
+
+def test_rule_base_price_splits_by_type():
+    c = ctx(base_price=4261.5, counter_base_price=4260.0)
+    assert rule_base_price(RULE_TYPE_COUNTER, c) == 4260.0
+    assert rule_base_price(RULE_TYPE_TREND, c) == 4261.5
+
+
+def test_counter_ignores_trend_add_as_base():
+    """先顺势加在更高价后，小幅回撤不得相对顺势仓触发逆势；须相对首仓跌够阈值。"""
+    # 最近一笔=顺势仓 4261.5；逆势锚=首仓 4260；阈值 100 点=1.0
+    # 从顺势仓回撤 100 点到 4260.5，仍高于首仓——旧逻辑会误触发
+    assert evaluate_rule(counter_rule(), ctx(
+        base_price=4261.5, counter_base_price=4260.0,
+        position_count=2, add_count=1, price=4260.5,
+    )) is None
+    # 相对首仓逆向偏离满 100 点才触发，且决策记录的基准是首仓价
+    d = evaluate_rule(counter_rule(), ctx(
+        base_price=4261.5, counter_base_price=4260.0,
+        position_count=2, add_count=1, price=4259.0,
+    ))
+    assert d is not None
+    assert d.base_price == 4260.0
+    assert d.deviation == 100
+
+
+def test_counter_next_add_spaces_from_deeper_counter():
+    """已有逆势仓后，下一笔逆势间距从最深逆势仓递进，而不是又回到首仓同一阈值。"""
+    # 首仓 2400，逆势仓 2399；再往下加须相对 2399 再偏 100 点
+    assert evaluate_rule(counter_rule(), ctx(
+        base_price=2399.0, counter_base_price=2399.0,
+        position_count=2, add_count=1, price=2398.5,
+    )) is None
+    d = evaluate_rule(counter_rule(), ctx(
+        base_price=2399.0, counter_base_price=2399.0,
+        position_count=2, add_count=1, price=2398.0,
+    ))
+    assert d is not None and d.base_price == 2399.0
+
+
+def test_trend_still_uses_latest_base():
+    trend = counter_rule(type=RULE_TYPE_TREND, lot_times=0.8)
+    d = evaluate_rule(trend, ctx(
+        base_price=4261.0, counter_base_price=4260.0, price=4262.0,
+    ))
+    assert d is not None
+    assert d.base_price == 4261.0
 
 
 # --------------------------- 多规则协同 ---------------------------

@@ -227,7 +227,10 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
     push('命中规则', detail.rule_index === undefined ? '' : `第 ${detail.rule_index + 1} 条`)
     push('分批档位', detail.batch ? `第 ${(detail.level_index ?? 0) + 1} 档` : '未启用分批')
     push('持仓方向', detail.direction)
-    push('基准价（最近一笔开仓价）', detail.base_price)
+    push(
+      detail.rule_type === 1 ? '基准价（逆势锚点）' : '基准价（最近一笔开仓价）',
+      detail.base_price,
+    )
     push('触发时市价', detail.price)
     push('最小变动单位', detail.point)
     push('实际偏离', detail.deviation === undefined ? '' : `${detail.deviation} 点`)

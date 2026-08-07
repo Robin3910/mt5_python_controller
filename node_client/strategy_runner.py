@@ -39,6 +39,7 @@ from strategy_rules import (
     CALC_BAR_TYPES,
     MT5_COMMENT_LIMIT,
     PositionCtx,
+    counter_anchor_price,
     decision_comment,
     decision_detail,
     describe_decision,
@@ -350,13 +351,15 @@ class StrategyRunner:
         return metrics
 
     def _ctx(self, event: MarketEvent, positions: list[dict]) -> PositionCtx:
-        """加仓判定上下文：偏离基准取最近一笔订单的开仓价。"""
+        """加仓判定上下文：顺势取最近一笔；逆势取不利方向最深开仓价（通常即首仓）。"""
         latest = max(positions, key=lambda p: (p.get("time") or 0, p.get("ticket") or 0))
+        opens = [_as_float(p.get("price_open")) for p in positions]
         return PositionCtx(
             direction=self.direction,
             position_count=len(positions),
             base_volume=self.base_volume,
             base_price=_as_float(latest.get("price_open")),
+            counter_base_price=counter_anchor_price(self.direction, opens),
             price=event.price,
             point=event.point,
             add_count=self.add_count,

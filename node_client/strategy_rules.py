@@ -13,11 +13,17 @@
 
 逆势 = 价格朝持仓不利方向偏离后同向加仓；顺势 = 朝有利方向偏离后同向加仓。
 两者都只加与原持仓同方向的仓位。
+
+偏离基准按规则类型分开：
+- 顺势：最近一笔开仓价（继续沿有利方向铺仓）；
+- 逆势：持仓中不利方向最深的开仓价（多单取最低、空单取最高）。
+  尚未出现更深逆势仓时即首仓价——顺势加在更高/更低价后，
+  必须先回到首仓不利侧达到阈值，才会触发逆势加仓。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Sequence
 
 from bar_metrics import BAR_PERIOD
 
@@ -50,13 +56,19 @@ class PositionCtx:
     direction: str          # 本次任务持仓方向：BUY / SELL
     position_count: int     # 当前该魔术号的持仓笔数
     base_volume: float      # 首单手数（倍率的基准）
-    base_price: float       # 最近一笔订单的开仓价（偏离的基准）
+    base_price: float       # 最近一笔开仓价（顺势偏离基准）
     price: float            # 当前市价
     point: float            # 品种最小价格变动单位
     add_count: int = 0      # 已加仓次数
     # ATR / 波幅的预取值（键见 metric_key，值是价格距离）。
     # 判定层不做 I/O，读 K 线由执行器在判定前完成。
     bar_metrics: dict = field(default_factory=dict)
+    # 逆势偏离基准；未显式传入时回退为 base_price（单测可只填一个价）
+    counter_base_price: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if self.counter_base_price is None:
+            self.counter_base_price = self.base_price
 
 
 @dataclass
@@ -79,7 +91,7 @@ class AddDecision:
     target_price: float = 0.0       # 指定价模式配置的价位
     rule_index: int = 0         # 规则在策略快照 rules 中的原始下标
     direction: str = ""         # 持仓方向（判定基准）
-    base_price: float = 0.0     # 偏离基准价：最近一笔持仓的开仓价
+    base_price: float = 0.0     # 本次规则实际使用的偏离基准价
     price: float = 0.0          # 触发时的市价
     point: float = 0.0          # 品种最小价格变动单位
     base_volume: float = 0.0    # 首单手数（倍率基准）
@@ -124,6 +136,26 @@ def action_matches(rule_action: object, direction: str) -> bool:
     if act == "all":
         return True
     return act == str(direction or "").strip().lower()
+
+
+def counter_anchor_price(direction: str, open_prices: Sequence[float]) -> float:
+    """逆势偏离锚点：多单取最低开仓价，空单取最高开仓价。
+
+    尚未出现更深的逆势仓时，结果等于首仓开仓价；已有逆势仓时取最深一笔，
+    以便后续逆势加仓仍按档位间距递进，而不会被中间的顺势加仓抬高/压低锚点。
+    """
+    prices = [float(p) for p in open_prices]
+    if not prices:
+        return 0.0
+    is_buy = str(direction or "").strip().upper() == "BUY"
+    return min(prices) if is_buy else max(prices)
+
+
+def rule_base_price(rule_type: int, ctx: PositionCtx) -> float:
+    """按规则类型选取偏离基准价。"""
+    if rule_type == RULE_TYPE_COUNTER:
+        return float(ctx.counter_base_price if ctx.counter_base_price is not None else ctx.base_price)
+    return ctx.base_price
 
 
 def pick_batch_level(rule: dict, next_position_no: int) -> tuple[Optional[dict], Optional[int]]:
@@ -185,7 +217,8 @@ def resolve_threshold(rule_type: int, level: dict, ctx: PositionCtx) -> Threshol
         target = _as_float(level.get("price"), 0.0)
         if target <= 0:
             return Threshold(0.0, calc_type)
-        points = deviation_points(rule_type, ctx.direction, ctx.base_price, target, ctx.point)
+        base = rule_base_price(rule_type, ctx)
+        points = deviation_points(rule_type, ctx.direction, base, target, ctx.point)
         return Threshold(max(points, 0.0), calc_type, target_price=target)
 
     if calc_type in CALC_BAR_TYPES:
@@ -241,7 +274,8 @@ def evaluate_rule(rule: dict, ctx: PositionCtx, rule_index: int = 0) -> Optional
     threshold = gap.points
     if threshold <= 0:
         return None
-    moved = deviation_points(rule_type, ctx.direction, ctx.base_price, ctx.price, ctx.point)
+    base = rule_base_price(rule_type, ctx)
+    moved = deviation_points(rule_type, ctx.direction, base, ctx.price, ctx.point)
     if moved < threshold:
         return None
 
@@ -261,7 +295,7 @@ def evaluate_rule(rule: dict, ctx: PositionCtx, rule_index: int = 0) -> Optional
         target_price=gap.target_price,
         rule_index=rule_index,
         direction=str(ctx.direction).upper(),
-        base_price=ctx.base_price,
+        base_price=base,
         price=ctx.price,
         point=ctx.point,
         base_volume=ctx.base_volume,

@@ -210,6 +210,64 @@ async def test_tick_beyond_threshold_adds_position():
     runner.cancel()
 
 
+async def test_counter_does_not_use_trend_add_as_anchor():
+    """复现用户反馈：先顺势加仓后，不得在顺势仓回撤点误触发逆势；须跌破首仓再计阈值。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    strategy = {
+        "rules": [
+            counter_rule(point=100.0, lot_times=1.0, max_allow_num=5),
+            {
+                "type": 2, "status": 1, "action": "all",
+                "point": 100.0, "lot_times": 1.0, "extra_lot": 0.0,
+                "max_allow_num": 10, "batch_enabled": False, "batch_levels": [],
+            },
+        ],
+    }
+    runner, hub = _runner(sent, mt5=mt5, strategy=strategy)
+    runner.start()
+    await _settle()
+
+    first_px = mt5.positions_by_magic(MAGIC)[0]["price_open"]
+    trend_px = first_px + 1.0  # 100 点（point=0.01）
+
+    # 顺势：报价抬到更高价再投递，Mock 成交价才会与判定价一致
+    mt5.prices_map["XAUUSD"] = trend_px
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(mt5.positions_by_magic(MAGIC)),
+        price=trend_px, point=0.01,
+    ))
+    await _settle()
+    assert runner.add_count == 1
+    assert _progress(sent, "add_trend")
+    held = mt5.positions_by_magic(MAGIC)
+    assert len(held) == 2
+    assert max(p["price_open"] for p in held) == trend_px
+
+    # 从顺势仓回撤约 100 点，但仍高于首仓——不得触发逆势
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(held), price=trend_px - 1.0, point=0.01,
+    ))
+    await _settle()
+    assert runner.add_count == 1
+    assert not _progress(sent, "add_counter")
+
+    # 相对首仓再逆向偏离 100 点，才应逆势加仓，且说明里基准为首仓价
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(mt5.positions_by_magic(MAGIC)),
+        price=first_px - 1.0, point=0.01,
+    ))
+    await _settle()
+    assert runner.add_count == 2
+    counter_ev = _progress(sent, "add_counter")
+    assert counter_ev
+    assert counter_ev[0]["detail"]["base_price"] == first_px
+    runner.cancel()
+
+
 async def test_add_reports_reason_detail_and_compact_mt5_comment():
     """加仓单要能还原开单原因：上报带说明与逐项计算依据，MT5 备注带紧凑编码。"""
     sent: list = []
