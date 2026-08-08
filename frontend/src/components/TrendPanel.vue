@@ -441,6 +441,76 @@ onBeforeUnmount(() => {
       <p v-else-if="error" class="trend-warn">{{ error }}</p>
     </div>
 
+    <!-- 参数 -->
+    <div class="card card-pad" style="margin-bottom: 16px">
+      <div class="row between" style="align-items: flex-start; margin-bottom: 12px">
+        <div>
+          <strong>参数</strong>
+          <p class="muted trend-hint" style="margin: 4px 0 0">
+            改动即时生效于本次查看；点「保存」写入该节点配置，下次打开与其他管理员都沿用
+          </p>
+        </div>
+        <div class="row" style="gap: 8px">
+          <button class="btn-sm btn-ghost" @click="resetToDefaults">恢复默认</button>
+          <button class="btn-primary btn-sm" :disabled="saving" @click="save">
+            {{ saving ? '保存中…' : '保存' }}
+          </button>
+        </div>
+      </div>
+      <p v-if="savedTip" class="trend-saved">{{ savedTip }}</p>
+
+      <div class="trend-form">
+        <label class="trend-field">
+          <span class="trend-field-k">EMA 周期</span>
+          <input v-model.number="form.ema_period" type="number" min="2" max="400" class="trend-input" />
+        </label>
+        <label class="trend-field">
+          <span class="trend-field-k">RSI 周期</span>
+          <input v-model.number="form.rsi_period" type="number" min="2" max="100" class="trend-input" />
+        </label>
+        <label class="trend-field">
+          <span class="trend-field-k">EMA 权重</span>
+          <input v-model.number="form.ema_weight" type="number" min="0" max="1" step="0.05" class="trend-input" />
+        </label>
+        <label class="trend-field">
+          <span class="trend-field-k">RSI 权重（自动）</span>
+          <input :value="form.rsi_weight" type="number" class="trend-input" disabled />
+        </label>
+        <label class="trend-field">
+          <span class="trend-field-k">满分偏离 %</span>
+          <input v-model.number="form.ema_full_scale_pct" type="number" min="0.01" max="10" step="0.05" class="trend-input" />
+        </label>
+        <label class="trend-field">
+          <span class="trend-field-k">多头阈值</span>
+          <input v-model.number="form.bullish" type="number" min="0" max="99" class="trend-input" />
+        </label>
+        <label class="trend-field">
+          <span class="trend-field-k">空头阈值</span>
+          <input v-model.number="form.bearish" type="number" min="-99" max="0" class="trend-input" />
+        </label>
+        <label class="trend-field">
+          <span class="trend-field-k">RSI 偏多起始</span>
+          <input v-model.number="form.rsi_bull" type="number" min="50" max="99" class="trend-input" />
+        </label>
+        <label class="trend-field">
+          <span class="trend-field-k">RSI 偏空起始</span>
+          <input v-model.number="form.rsi_bear" type="number" min="1" max="50" class="trend-input" />
+        </label>
+        <label class="trend-field">
+          <span class="trend-field-k">RSI 超买</span>
+          <input v-model.number="form.rsi_overbought" type="number" min="50" max="100" class="trend-input" />
+        </label>
+        <label class="trend-field">
+          <span class="trend-field-k">RSI 超卖</span>
+          <input v-model.number="form.rsi_oversold" type="number" min="0" max="50" class="trend-input" />
+        </label>
+        <label class="trend-field">
+          <span class="trend-field-k">显示 K 线根数</span>
+          <input v-model.number="form.bars" type="number" min="30" max="500" step="10" class="trend-input" />
+        </label>
+      </div>
+    </div>
+
     <!-- 趋势总览 -->
     <div class="card card-pad" style="margin-bottom: 16px">
       <div class="row between" style="align-items: flex-start">
@@ -545,76 +615,6 @@ onBeforeUnmount(() => {
       </div>
       <div ref="chartEl" class="trend-chart"></div>
       <p v-if="!data?.bars?.length" class="muted trend-hint">暂无 K 线数据。</p>
-    </div>
-
-    <!-- 参数 -->
-    <div class="card card-pad">
-      <div class="row between" style="align-items: flex-start; margin-bottom: 12px">
-        <div>
-          <strong>参数</strong>
-          <p class="muted trend-hint" style="margin: 4px 0 0">
-            改动即时生效于本次查看；点「保存」写入该节点配置，下次打开与其他管理员都沿用
-          </p>
-        </div>
-        <div class="row" style="gap: 8px">
-          <button class="btn-sm btn-ghost" @click="resetToDefaults">恢复默认</button>
-          <button class="btn-primary btn-sm" :disabled="saving" @click="save">
-            {{ saving ? '保存中…' : '保存' }}
-          </button>
-        </div>
-      </div>
-      <p v-if="savedTip" class="trend-saved">{{ savedTip }}</p>
-
-      <div class="trend-form">
-        <label class="trend-field">
-          <span class="trend-field-k">EMA 周期</span>
-          <input v-model.number="form.ema_period" type="number" min="2" max="400" class="trend-input" />
-        </label>
-        <label class="trend-field">
-          <span class="trend-field-k">RSI 周期</span>
-          <input v-model.number="form.rsi_period" type="number" min="2" max="100" class="trend-input" />
-        </label>
-        <label class="trend-field">
-          <span class="trend-field-k">EMA 权重</span>
-          <input v-model.number="form.ema_weight" type="number" min="0" max="1" step="0.05" class="trend-input" />
-        </label>
-        <label class="trend-field">
-          <span class="trend-field-k">RSI 权重（自动）</span>
-          <input :value="form.rsi_weight" type="number" class="trend-input" disabled />
-        </label>
-        <label class="trend-field">
-          <span class="trend-field-k">满分偏离 %</span>
-          <input v-model.number="form.ema_full_scale_pct" type="number" min="0.01" max="10" step="0.05" class="trend-input" />
-        </label>
-        <label class="trend-field">
-          <span class="trend-field-k">多头阈值</span>
-          <input v-model.number="form.bullish" type="number" min="0" max="99" class="trend-input" />
-        </label>
-        <label class="trend-field">
-          <span class="trend-field-k">空头阈值</span>
-          <input v-model.number="form.bearish" type="number" min="-99" max="0" class="trend-input" />
-        </label>
-        <label class="trend-field">
-          <span class="trend-field-k">RSI 偏多起始</span>
-          <input v-model.number="form.rsi_bull" type="number" min="50" max="99" class="trend-input" />
-        </label>
-        <label class="trend-field">
-          <span class="trend-field-k">RSI 偏空起始</span>
-          <input v-model.number="form.rsi_bear" type="number" min="1" max="50" class="trend-input" />
-        </label>
-        <label class="trend-field">
-          <span class="trend-field-k">RSI 超买</span>
-          <input v-model.number="form.rsi_overbought" type="number" min="50" max="100" class="trend-input" />
-        </label>
-        <label class="trend-field">
-          <span class="trend-field-k">RSI 超卖</span>
-          <input v-model.number="form.rsi_oversold" type="number" min="0" max="50" class="trend-input" />
-        </label>
-        <label class="trend-field">
-          <span class="trend-field-k">显示 K 线根数</span>
-          <input v-model.number="form.bars" type="number" min="30" max="500" step="10" class="trend-input" />
-        </label>
-      </div>
     </div>
   </div>
 </template>
