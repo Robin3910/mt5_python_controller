@@ -308,14 +308,22 @@ async def test_exec_serializes_mt5_calls():
 
 
 async def _probe(n, ws, **over) -> dict:
-    """发一条行情探针命令并取回结果数据。"""
+    """发一条行情探针命令并取回结果数据。
+
+    探针在接收循环里是后台任务，所以这里要等到回包出现，而不是假定
+    `_handle` 返回时结果已经写进 ws.sent。
+    """
     cmd = {"cmd": "market_probe", "req_id": "r1", "symbol": "EURUSD",
            "timeframe": "M15", "count": 60}
     cmd.update(over)
+    before = sum(1 for m in ws.sent if m["type"] == "market_probe_result")
     await n._handle(ws, cmd)
-    results = [m for m in ws.sent if m["type"] == "market_probe_result"]
-    assert results, "探针必须回包，否则服务端只能干等到超时"
-    return results[-1]["data"]
+    for _ in range(200):
+        results = [m for m in ws.sent if m["type"] == "market_probe_result"]
+        if len(results) > before:
+            return results[-1]["data"]
+        await asyncio.sleep(0.01)
+    assert False, "探针必须回包，否则服务端只能干等到超时"
 
 
 async def test_market_probe_returns_bars_and_quote():
@@ -354,6 +362,56 @@ async def test_market_probe_caps_bar_count():
     data = await _probe(n, ws, count=99999)
 
     assert len(data["bars"]) == nc.MAX_PROBE_BARS
+
+
+async def test_market_probe_caps_monthly_bars():
+    """月线不能按全局 1000 根上限去要：终端补历史会卡住并拖垮会话。"""
+    n = _node()
+    await n._exec(n.mt5.connect)
+    ws = FakeWS()
+
+    data = await _probe(n, ws, timeframe="MN", count=99999)
+
+    assert "error" not in data
+    assert len(data["bars"]) == nc.PROBE_BAR_CAPS["MN"]
+
+
+async def test_market_probe_does_not_block_receiver():
+    """探针进行中接收循环仍须能处理其它消息（否则心跳应答会被堵住）。"""
+    n = _node()
+    await n._exec(n.mt5.connect)
+    ws = FakeWS()
+    # MT5 在专用线程里跑，跨线程同步用 threading.Event
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_bars(*_a, **_kw):
+        started.set()
+        release.wait(timeout=5)
+        return [{"time": 1.0, "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0}]
+
+    n.mt5.closed_bars = slow_bars
+    handle_task = asyncio.create_task(n._handle(ws, {
+        "cmd": "market_probe", "req_id": "slow", "symbol": "EURUSD",
+        "timeframe": "M15", "count": 10,
+    }))
+    # _handle 应立刻返回（探针已丢到后台），不能等 MT5 读完
+    await asyncio.wait_for(handle_task, timeout=0.5)
+    for _ in range(200):
+        if started.is_set():
+            break
+        await asyncio.sleep(0.01)
+    else:
+        assert False, "探针应已进入 MT5 线程"
+    # 接收循环此时空闲；再派一条 ping 不应被探针堵住
+    await asyncio.wait_for(n._handle(ws, {"type": "ping"}), timeout=0.5)
+    release.set()
+    for _ in range(200):
+        if any(m.get("type") == "market_probe_result" for m in ws.sent):
+            break
+        await asyncio.sleep(0.01)
+    else:
+        assert False, "慢探针最终仍须回包"
 
 
 async def test_market_probe_reports_empty_history():

@@ -41,6 +41,23 @@ class LoginMismatchError(RuntimeError):
 
 # 单次行情探针最多回传的 K 线根数：护住回包体积与终端查询开销（服务端同样有上限）
 MAX_PROBE_BARS = 1000
+# 高周期历史下载容易卡住 MetaTrader5 C 扩展（持 GIL），心跳发不出就会被服务端判离线。
+# 与后端 trend_indicators.TIMEFRAME_BAR_CAPS 对齐，节点侧再挡一道。
+PROBE_BAR_CAPS: dict[str, int] = {
+    "M1": 1000, "M5": 1000, "M15": 1000, "M30": 1000,
+    "H1": 800, "H4": 500, "D1": 400, "W1": 150, "MN": 80,
+}
+
+
+def probe_bar_limit(timeframe: str, count: object) -> int:
+    """把探针根数夹到该周期的安全上限内。"""
+    tf = str(timeframe or "").strip().upper()
+    try:
+        n = int(count or 0)
+    except (TypeError, ValueError):
+        n = 0
+    cap = PROBE_BAR_CAPS.get(tf, MAX_PROBE_BARS)
+    return max(1, min(n, cap, MAX_PROBE_BARS))
 
 
 def make_client(
@@ -356,7 +373,9 @@ class NodeClient:
         elif cmd == "close":
             await self._do_close(ws, msg)
         elif cmd == "market_probe":
-            await self._do_market_probe(ws, msg)
+            # 拉高周期历史可能卡住终端调用；丢到后台，别堵死接收循环
+            # （否则心跳排不上，服务端 ping 超时会把节点判离线）
+            asyncio.create_task(self._safe_market_probe(ws, msg))
         elif cmd == "strategy_start":
             await self._do_strategy_start(ws, msg, resume=False)
         elif cmd == "strategy_resume":
@@ -674,6 +693,13 @@ class NodeClient:
         await ws.send(json.dumps({"type": "trade_result", "data": res}))
         logger.info("close result: %s", res)
 
+    async def _safe_market_probe(self, ws, msg: dict) -> None:
+        """后台任务包装：探针异常不得变成未捕获 Task 异常。"""
+        try:
+            await self._do_market_probe(ws, msg)
+        except Exception:  # noqa: BLE001
+            logger.exception("market probe task failed")
+
     async def _do_market_probe(self, ws, msg: dict) -> None:
         """回传一段已收盘 K 线与当前报价（供后台趋势面板等只读视图）。
 
@@ -683,11 +709,7 @@ class NodeClient:
         req_id = str(msg.get("req_id") or "")
         symbol = str(msg.get("symbol") or "").strip().upper()
         timeframe = str(msg.get("timeframe") or "M15").strip().upper()
-        try:
-            count = int(msg.get("count") or 0)
-        except (TypeError, ValueError):
-            count = 0
-        count = max(1, min(count, MAX_PROBE_BARS))
+        count = probe_bar_limit(timeframe, msg.get("count"))
 
         data: dict = {"req_id": req_id, "symbol": symbol, "timeframe": timeframe}
         if not symbol:

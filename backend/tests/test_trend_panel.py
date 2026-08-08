@@ -148,6 +148,18 @@ def test_bars_needed_quantized_and_capped():
     assert big == trend_indicators.MAX_BARS
 
 
+def test_bars_needed_caps_high_timeframes():
+    """月线/周线不能按分钟线那套去要几百根，否则终端补历史会卡死节点。"""
+    mn = trend_indicators.bars_needed(trend_indicators.normalize_config({"timeframe": "MN"}))
+    assert mn == trend_indicators.TIMEFRAME_BAR_CAPS["MN"]
+    assert mn >= int(trend_indicators.DEFAULTS["ema_period"])  # 仍够算出默认 EMA
+    w1 = trend_indicators.bars_needed(trend_indicators.normalize_config({"timeframe": "W1"}))
+    assert w1 == trend_indicators.TIMEFRAME_BAR_CAPS["W1"]
+    # 低周期不受该上限影响（仍走量子化后的常规值）
+    m15 = trend_indicators.bars_needed(trend_indicators.normalize_config({"timeframe": "M15"}))
+    assert m15 >= 200
+
+
 # ------------------------------ EMA ------------------------------
 def test_ema_series_matches_manual_recursion():
     series = trend_indicators.ema_series([1.0, 2.0, 3.0, 4.0], 3)

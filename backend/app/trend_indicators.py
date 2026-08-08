@@ -35,6 +35,12 @@ MAX_VIEW_BARS = 500
 MAX_BARS = 1000
 # 计算所需根数向上取整到该倍数，让微调周期时仍能落回同一个行情缓存键
 BARS_QUANTUM = 50
+# 高周期历史往往不全，MT5 为补齐会同步拉服务器数据并卡住 Python GIL；
+# 心跳发不出 → WS ping 超时 → 节点被判离线。按周期收紧探针根数上限。
+TIMEFRAME_BAR_CAPS: dict[str, int] = {
+    "M1": 1000, "M5": 1000, "M15": 1000, "M30": 1000,
+    "H1": 800, "H4": 500, "D1": 400, "W1": 150, "MN": 80,
+}
 
 DEFAULTS: dict[str, float | int | str] = {
     "timeframe": "M15",
@@ -145,14 +151,17 @@ def bars_needed(cfg: dict) -> int:
     """算这份配置要向节点取多少根已收盘 K 线。
 
     EMA 与 RSI 都是递归指标，种子值的影响需要若干个周期才衰减到可忽略，因此取远
-    多于周期本身的根数；面板要显示的根数也要一并覆盖。
+    多于周期本身的根数；面板要显示的根数也要一并覆盖。高周期另受 TIMEFRAME_BAR_CAPS
+    约束，避免向终端索取几十年月线/周线把节点卡死。
     """
     ema_period = int(cfg.get("ema_period") or DEFAULTS["ema_period"])
     rsi_period = int(cfg.get("rsi_period") or DEFAULTS["rsi_period"])
     view = int(cfg.get("bars") or DEFAULTS["bars"])
+    timeframe = str(cfg.get("timeframe") or DEFAULTS["timeframe"]).upper()
     need = max(ema_period * 4, (rsi_period + 1) * 5, view)
     need = math.ceil(need / BARS_QUANTUM) * BARS_QUANTUM
-    return int(min(need, MAX_BARS))
+    tf_cap = TIMEFRAME_BAR_CAPS.get(timeframe, MAX_BARS)
+    return int(min(need, tf_cap, MAX_BARS))
 
 
 def closes_of(bars: list[dict]) -> list[float]:
