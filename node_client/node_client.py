@@ -39,6 +39,10 @@ class LoginMismatchError(RuntimeError):
     """终端当前登录号与启动时绑定账号不符。"""
 
 
+# 单次行情探针最多回传的 K 线根数：护住回包体积与终端查询开销（服务端同样有上限）
+MAX_PROBE_BARS = 1000
+
+
 def make_client(
     mt5_login: int,
     mt5_password: str,
@@ -323,7 +327,8 @@ class NodeClient:
             await self._handle(ws, msg)
 
     async def _handle(self, ws, msg: dict) -> None:
-        """按命令类型分派：open / close / pong / watch_symbols；处理服务端登录号拒绝。"""
+        """按命令类型分派：open / close / market_probe / pong / watch_symbols；
+        处理服务端登录号拒绝。"""
         mtype = msg.get("type")
         if mtype == "auth_fail":
             data = msg.get("data") or {}
@@ -350,6 +355,8 @@ class NodeClient:
             await self._do_open(ws, msg)
         elif cmd == "close":
             await self._do_close(ws, msg)
+        elif cmd == "market_probe":
+            await self._do_market_probe(ws, msg)
         elif cmd == "strategy_start":
             await self._do_strategy_start(ws, msg, resume=False)
         elif cmd == "strategy_resume":
@@ -666,6 +673,42 @@ class NodeClient:
         res["detail"] = self._close_detail(msg, res)
         await ws.send(json.dumps({"type": "trade_result", "data": res}))
         logger.info("close result: %s", res)
+
+    async def _do_market_probe(self, ws, msg: dict) -> None:
+        """回传一段已收盘 K 线与当前报价（供后台趋势面板等只读视图）。
+
+        纯读操作，不碰持仓也不下单。失败一律回一条带 error 的结果：让请求方立刻
+        看到原因（品种不存在、历史未下载等），而不是干等到服务端超时。
+        """
+        req_id = str(msg.get("req_id") or "")
+        symbol = str(msg.get("symbol") or "").strip().upper()
+        timeframe = str(msg.get("timeframe") or "M15").strip().upper()
+        try:
+            count = int(msg.get("count") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        count = max(1, min(count, MAX_PROBE_BARS))
+
+        data: dict = {"req_id": req_id, "symbol": symbol, "timeframe": timeframe}
+        if not symbol:
+            data["error"] = "缺少品种"
+        else:
+            try:
+                bars = await self._exec(self.mt5.closed_bars, symbol, timeframe, count)
+                quotes = await self._exec(self.mt5.quotes, [symbol])
+            except Exception as e:  # noqa: BLE001
+                logger.warning("market probe failed for %s %s: %s", symbol, timeframe, e)
+                data["error"] = f"读取行情失败：{e}"
+            else:
+                bars = list(bars or [])
+                if not bars:
+                    data["error"] = (
+                        f"{symbol} {timeframe} 无可用 K 线（品种不存在、周期无效或历史未下载）"
+                    )
+                else:
+                    data["bars"] = bars
+                    data["quote"] = (quotes or {}).get(symbol) or {}
+        await ws.send(json.dumps({"type": "market_probe_result", "data": data}))
 
     @staticmethod
     def _close_detail(msg: dict, res: dict) -> str:

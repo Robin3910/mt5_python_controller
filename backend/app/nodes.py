@@ -2,7 +2,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.exc import IntegrityError
 
-from . import node_service, persist, risk_control
+from . import node_service, persist, risk_control, trend_indicators
 from .connections import manager
 from .deps import client_ip, get_current_admin, get_store
 from .models import LotBatch, NodeCreate, NodeOut, NodeUpdate, PaginatedNodeDispatches
@@ -21,6 +21,7 @@ def _node_audit_snapshot(d: dict | None) -> dict | None:
         "enabled": d.get("enabled", True),
         "filters": d.get("filters"),
         "risk": d.get("risk"),
+        "trend": d.get("trend"),
         "mt5_login": d.get("mt5_login"),
         "mt5_server": d.get("mt5_server"),
     }
@@ -46,6 +47,7 @@ async def _to_node_out(store: RedisStore, d: dict) -> NodeOut:
         status="online" if manager.is_node_online(d["node_id"]) else "offline",
         filters=d.get("filters"),
         risk=risk_control.normalize_risk(d.get("risk")),
+        trend=trend_indicators.normalize_config(d.get("trend")),
         mt5_login=d.get("mt5_login"),
         mt5_server=d.get("mt5_server") or acct.get("server"),
         created_at=d.get("created_at", 0),

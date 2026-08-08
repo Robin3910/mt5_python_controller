@@ -206,6 +206,19 @@ def _migrate_node_risk_json(sync_conn) -> None:
     sync_conn.execute(text(f"ALTER TABLE nodes ADD COLUMN risk_json {json_type}"))
 
 
+def _migrate_node_trend_json(sync_conn) -> None:
+    """nodes.trend_json：趋势面板参数（EMA/RSI 周期、权重与阈值）。"""
+    inspector = inspect(sync_conn)
+    if "nodes" not in inspector.get_table_names():
+        return
+    cols = {c["name"] for c in inspector.get_columns("nodes")}
+    if "trend_json" in cols:
+        return
+    dialect = sync_conn.dialect.name
+    json_type = "JSON" if dialect == "mysql" else "TEXT"
+    sync_conn.execute(text(f"ALTER TABLE nodes ADD COLUMN trend_json {json_type}"))
+
+
 def _drop_legacy_nodes_table(sync_conn) -> None:
     """v0.2 迁移：旧表带 `token_hash` 列（一节点一令牌）；新方案改为全局共享令牌，
     且 `mt5_login` 升级为 UNIQUE NOT NULL，无法平滑 ALTER —— 直接丢弃旧表，由
@@ -234,4 +247,5 @@ async def init_db() -> None:
         await conn.run_sync(_migrate_node_group_strategy_id)
         await conn.run_sync(_migrate_group_task_strategy_columns)
         await conn.run_sync(_migrate_node_risk_json)
+        await conn.run_sync(_migrate_node_trend_json)
     logger.info("Database initialized (%s)", engine.url.render_as_string(hide_password=True))

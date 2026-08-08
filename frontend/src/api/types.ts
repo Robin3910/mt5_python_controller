@@ -89,6 +89,91 @@ export interface RiskFeedItem {
   ratio_threshold?: number
 }
 
+/** 趋势面板可选 K 线周期（与节点侧 MT5 周期一一对应） */
+export type TrendTimeframe = 'M1' | 'M5' | 'M15' | 'M30' | 'H1' | 'H4' | 'D1' | 'W1' | 'MN'
+
+/**
+ * 趋势面板参数（权威存库，见后端 trend_indicators.normalize_config）。
+ * 只影响趋势得分的展示口径，不参与任何下单与过滤决策。
+ */
+export interface TrendConfig {
+  timeframe: TrendTimeframe
+  ema_period: number
+  rsi_period: number
+  ema_weight: number
+  rsi_weight: number
+  /** 价格偏离 EMA 达到该百分比即视为方向满分 */
+  ema_full_scale_pct: number
+  rsi_bull: number
+  rsi_bear: number
+  rsi_overbought: number
+  rsi_oversold: number
+  bullish: number
+  bearish: number
+  /** 面板展示的 K 线根数（计算用的根数由后端按周期自行放大） */
+  bars: number
+}
+
+export type TrendVerdict = 'bullish' | 'bearish' | 'neutral' | 'unknown'
+export type RsiState = TrendVerdict | 'overbought' | 'oversold'
+
+export interface TrendBar {
+  time: number
+  open: number
+  high: number
+  low: number
+  close: number
+}
+
+export interface TrendEmaDetail {
+  period: number
+  value: number | null
+  /** 加权前的原始分（-100 ~ +100） */
+  raw: number
+  /** 计入权重后的得分 */
+  score: number
+  /** 该指标的最高贡献（= 权重 × 100） */
+  max_score?: number
+  deviation_pct: number
+  position: 'above' | 'below' | 'equal' | 'unknown'
+}
+
+export interface TrendRsiDetail {
+  period: number
+  value: number | null
+  raw: number
+  score: number
+  max_score?: number
+  state: RsiState
+}
+
+/** GET /api/nodes/{id}/trend 的响应 */
+export interface TrendPanelData {
+  node_id: string
+  symbol: string
+  config: TrendConfig
+  /** false 表示 K 线不足、算不出指标（区别于「中性」） */
+  ready: boolean
+  score: number
+  trend: TrendVerdict
+  price: number
+  /** quote：用的是实时报价；close：报价读不到，回落到最后一根收盘价 */
+  price_source: 'quote' | 'close'
+  last_close: number
+  ema: TrendEmaDetail
+  rsi: TrendRsiDetail
+  bars: TrendBar[]
+  ema_series: Array<number | null>
+  rsi_series: Array<number | null>
+  bar_time: number
+  bar_count: number
+  quote?: Partial<QuoteInfo>
+  /** true 表示命中后端行情缓存，未重新惊动节点终端 */
+  cached: boolean
+  fetched_at: number
+  updated_at: number
+}
+
 export interface NodeOut {
   node_id: string
   name: string
@@ -96,6 +181,7 @@ export interface NodeOut {
   status: 'online' | 'offline'
   filters?: NodeDispatchFiltersConfig | null
   risk?: NodeRiskConfig | null
+  trend?: TrendConfig | null
   mt5_login: number | null
   mt5_server: string | null
   created_at: number
@@ -202,6 +288,7 @@ export interface NodeUpdatePayload {
   enabled?: boolean
   filters?: NodeDispatchFiltersConfig | null
   risk?: NodeRiskConfig | null
+  trend?: TrendConfig | null
 }
 
 export interface CloseRequest {

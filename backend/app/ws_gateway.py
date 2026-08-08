@@ -17,6 +17,7 @@ from . import (
     group_dispatcher,
     group_persist,
     group_rules,
+    market_probe,
     mt5_identity,
     node_service,
     persist,
@@ -255,6 +256,10 @@ async def _session(node_id: str, ws: WebSocket) -> None:
         elif mtype == "risk_event":
             # 账户级风控触发 / 状态回写（如次数耗尽关闭开关）
             await _on_risk_event(node_id, data)
+
+        elif mtype == "market_probe_result":
+            # 只读行情探针回包（趋势面板），按 req_id 唤醒等待中的请求
+            market_probe.resolve(data.get("req_id"), data)
 
         else:
             logger.debug("node %s unknown msg type=%s", node_id, mtype)

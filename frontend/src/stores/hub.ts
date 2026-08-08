@@ -27,6 +27,8 @@ import type {
   StrategyOut,
   StrategyTemplateOut,
   StrategyUpdatePayload,
+  TrendConfig,
+  TrendPanelData,
 } from '@/api/types'
 
 // 业务总线 store：集中保存节点、账户、配置与实时事件
@@ -98,6 +100,22 @@ export const useHubStore = defineStore('hub', {
       } catch {
         return { items: [], total: 0, page, page_size: pageSize }
       }
+    },
+    /**
+     * 某节点某品种的实时趋势快照（趋势面板）。
+     * overrides 省略时后端沿用该节点已保存的参数；错误向上抛，由面板显示具体原因
+     * （节点离线、品种无 K 线等），不能静默成空面板。
+     */
+    async fetchNodeTrend(
+      id: string,
+      symbol: string,
+      overrides?: Partial<TrendConfig>,
+    ): Promise<TrendPanelData> {
+      return (
+        await api.get(`/api/nodes/${id}/trend`, {
+          params: { symbol, ...(overrides || {}) },
+        })
+      ).data
     },
     async fetchSignalEvents(page = 1, pageSize = 20): Promise<PaginatedSignalEvents> {
       try {

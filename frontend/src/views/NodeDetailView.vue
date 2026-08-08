@@ -1,9 +1,9 @@
 <script setup lang="ts">
 // 节点详情页：Tab + 列表展示单个节点上报的数据
-// （概览 / 账户级风控 / 持仓 / 报价 / 信号 / 成交回报）。
+// （概览 / 账户级风控 / 趋势面板 / 持仓 / 报价 / 信号 / 成交回报）。
 // 账户与持仓走 WS 实时刷新；成交回报 = 持久化历史 + 本会话实时回报合并。
 // 账户级风控：保存后 PATCH 并经 WS 下发节点，节点本地监控后回报 risk_event。
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useHubStore } from '@/stores/hub'
 import type {
@@ -22,6 +22,8 @@ import type {
 } from '@/api/types'
 import { parseNodeDispatchFilters } from '@/utils/filterRules'
 import { confirmAction } from '@/utils/confirm'
+// 趋势面板带 echarts，异步加载让图表库不进节点详情页首屏 chunk（只在打开该 tab 时拉取）
+const TrendPanel = defineAsyncComponent(() => import('@/components/TrendPanel.vue'))
 
 const route = useRoute()
 const router = useRouter()
@@ -34,16 +36,28 @@ const nodeDispatchSymbols = computed(() => Object.keys(nodeDispatchFilters.value
 const acct = computed<AccountSnapshot | undefined>(() => hub.accounts[id.value])
 const statusOf = computed(() => hub.statuses[id.value] || node.value?.status || 'offline')
 
-type TabKey = 'overview' | 'risk' | 'positions' | 'prices' | 'signals' | 'feed'
+type TabKey = 'overview' | 'risk' | 'trend' | 'positions' | 'prices' | 'signals' | 'feed'
 const tab = ref<TabKey>('overview')
 const tabs: { key: TabKey; label: string }[] = [
   { key: 'overview', label: '概览' },
   { key: 'risk', label: '账户级风控' },
+  { key: 'trend', label: '趋势面板' },
   { key: 'positions', label: '持仓' },
   { key: 'prices', label: '报价' },
   { key: 'signals', label: '信号' },
   { key: 'feed', label: '成交回报' },
 ]
+
+// 趋势面板的候选品种：节点上报的报价 / 当前持仓 / 按币种配置三者并集
+const trendSymbols = computed<string[]>(() => {
+  const found = new Set<string>()
+  for (const sym of Object.keys(acct.value?.quotes || {})) found.add(sym.toUpperCase())
+  for (const pos of acct.value?.positions || []) {
+    if (pos.symbol) found.add(pos.symbol.toUpperCase())
+  }
+  for (const sym of nodeDispatchSymbols.value) found.add(sym.toUpperCase())
+  return [...found].sort()
+})
 
 function newRiskId(): string {
   return Math.random().toString(16).slice(2, 14)
@@ -865,6 +879,15 @@ async function closeTicket(ticket: number): Promise<void> {
           </div>
         </div>
       </div>
+
+      <!-- 趋势面板 -->
+      <TrendPanel
+        v-else-if="tab === 'trend'"
+        :node-id="id"
+        :trend-config="node.trend"
+        :symbol-options="trendSymbols"
+        :online="statusOf === 'online'"
+      />
 
       <!-- 持仓 -->
       <div v-else-if="tab === 'positions'">

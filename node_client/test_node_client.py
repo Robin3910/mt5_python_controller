@@ -307,6 +307,93 @@ async def test_exec_serializes_mt5_calls():
     assert peak == 1
 
 
+async def _probe(n, ws, **over) -> dict:
+    """发一条行情探针命令并取回结果数据。"""
+    cmd = {"cmd": "market_probe", "req_id": "r1", "symbol": "EURUSD",
+           "timeframe": "M15", "count": 60}
+    cmd.update(over)
+    await n._handle(ws, cmd)
+    results = [m for m in ws.sent if m["type"] == "market_probe_result"]
+    assert results, "探针必须回包，否则服务端只能干等到超时"
+    return results[-1]["data"]
+
+
+async def test_market_probe_returns_bars_and_quote():
+    n = _node()
+    await n._exec(n.mt5.connect)
+    ws = FakeWS()
+
+    data = await _probe(n, ws)
+
+    assert data["req_id"] == "r1"  # 服务端靠 req_id 配对等待者
+    assert data["symbol"] == "EURUSD"
+    assert data["timeframe"] == "M15"
+    assert "error" not in data
+    assert len(data["bars"]) == 60
+    assert set(data["bars"][0]) == {"time", "open", "high", "low", "close"}
+    assert data["quote"]["mid"] > 0
+
+
+async def test_market_probe_normalizes_symbol_case():
+    n = _node()
+    await n._exec(n.mt5.connect)
+    ws = FakeWS()
+
+    data = await _probe(n, ws, symbol="eurusd", timeframe="m15")
+
+    assert data["symbol"] == "EURUSD"
+    assert data["timeframe"] == "M15"
+    assert data["bars"]
+
+
+async def test_market_probe_caps_bar_count():
+    n = _node()
+    await n._exec(n.mt5.connect)
+    ws = FakeWS()
+
+    data = await _probe(n, ws, count=99999)
+
+    assert len(data["bars"]) == nc.MAX_PROBE_BARS
+
+
+async def test_market_probe_reports_empty_history():
+    """周期无效 / 历史缺失时要给出原因，而不是回一份空 K 线让面板显示空白。"""
+    n = _node()
+    await n._exec(n.mt5.connect)
+    ws = FakeWS()
+
+    data = await _probe(n, ws, timeframe="M7")
+
+    assert "无可用 K 线" in data["error"]
+    assert "bars" not in data
+
+
+async def test_market_probe_requires_symbol():
+    n = _node()
+    ws = FakeWS()
+
+    data = await _probe(n, ws, symbol="  ")
+
+    assert data["error"] == "缺少品种"
+
+
+async def test_market_probe_survives_terminal_error():
+    """读 K 线抛错不能让会话断掉：回一条带原因的结果即可。"""
+    n = _node()
+    await n._exec(n.mt5.connect)
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("terminal unavailable")
+
+    n.mt5.closed_bars = boom
+    ws = FakeWS()
+
+    data = await _probe(n, ws)
+
+    assert "读取行情失败" in data["error"]
+    assert "terminal unavailable" in data["error"]
+
+
 async def test_handle_server_login_mismatch():
     n = _node()
     ws = FakeWS()
