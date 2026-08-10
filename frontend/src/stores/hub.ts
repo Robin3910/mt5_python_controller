@@ -39,6 +39,7 @@ interface HubState {
   accounts: Record<string, AccountSnapshot> // node_id -> 最新账户快照（实时 WS 更新）
   statuses: Record<string, string>          // node_id -> 在线状态（实时 WS 更新）
   filters: FilterRulesConfig          // 区间过滤
+  trendConfig: TrendConfig | null     // 趋势面板全局参数（全后台共享）
   events: HubEvent[]                        // 实时事件流（用于总览页展示）
   nodeFeed: Record<string, NodeFeedItem[]>  // node_id -> 实时分发/回报（详情页“成交回报”用）
   riskFeed: Record<string, RiskFeedItem[]>  // node_id -> 账户级风控执行回报
@@ -52,6 +53,7 @@ export const useHubStore = defineStore('hub', {
     accounts: {},
     statuses: {},
     filters: {},
+    trendConfig: null,
     events: [],
     nodeFeed: {},
     riskFeed: {},
@@ -76,6 +78,18 @@ export const useHubStore = defineStore('hub', {
     },
     async fetchConfig(): Promise<void> {
       this.filters = (await api.get('/api/config/filters')).data
+    },
+    /** 拉取全局趋势面板参数（全后台共享，落库） */
+    async fetchTrendConfig(): Promise<TrendConfig> {
+      const cfg = (await api.get('/api/config/trend')).data as TrendConfig
+      this.trendConfig = cfg
+      return cfg
+    },
+    /** 保存全局趋势面板参数 */
+    async saveTrendConfig(cfg: TrendConfig): Promise<TrendConfig> {
+      const saved = (await api.put('/api/config/trend', cfg)).data as TrendConfig
+      this.trendConfig = saved
+      return saved
     },
     // 拉取单节点最新账户快照（详情页兜底；之后由 WS 实时刷新）
     async fetchNodeAccount(id: string): Promise<void> {
@@ -103,7 +117,7 @@ export const useHubStore = defineStore('hub', {
     },
     /**
      * 某节点某品种的实时趋势快照（趋势面板）。
-     * overrides 省略时后端沿用该节点已保存的参数；错误向上抛，由面板显示具体原因
+     * overrides 省略时后端沿用全局已保存参数；错误向上抛，由面板显示具体原因
      * （节点离线、品种无 K 线等），不能静默成空面板。
      */
     async fetchNodeTrend(

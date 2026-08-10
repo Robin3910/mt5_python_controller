@@ -402,7 +402,7 @@ const historyTotalPages = computed(() =>
 
 async function reload(): Promise<void> {
   if (!hub.nodes.length) await hub.fetchNodes()
-  await hub.fetchNodeAccount(id.value)
+  await Promise.all([hub.fetchNodeAccount(id.value), hub.fetchTrendConfig()])
   historyPage.value = 1
   await loadHistory()
 }
@@ -884,7 +884,7 @@ async function closeTicket(ticket: number): Promise<void> {
       <TrendPanel
         v-else-if="tab === 'trend'"
         :node-id="id"
-        :trend-config="node.trend"
+        :trend-config="hub.trendConfig"
         :symbol-options="trendSymbols"
         :online="statusOf === 'online'"
       />

@@ -1,21 +1,29 @@
 """系统级 key/value 配置（持久化）。
 
-当前职责：全局节点接入令牌 NODE_TOKEN —— 所有节点共享同一令牌（明文存 DB，
-Redis 作缓存，便于管理员在「账户设置」页查看/复制/重置）。
+当前职责：
+- 全局节点接入令牌 NODE_TOKEN —— 所有节点共享同一令牌（明文存 DB，
+  Redis 作缓存，便于管理员在「账户设置」页查看/复制/重置）；
+- 趋势面板参数 trend_config —— 全后台共享一份（JSON 落库，不分节点/币种）。
 """
 from __future__ import annotations
 
+import json
+import logging
 import time
 from typing import Optional
 
 from sqlalchemy import select
 
+from . import trend_indicators
 from .db import SessionLocal
-from .orm import SystemSetting
+from .orm import Node, SystemSetting
 from .redis_store import RedisStore
 from .security import gen_token
 
+logger = logging.getLogger(__name__)
+
 KEY_NODE_TOKEN = "node_token"
+KEY_TREND_CONFIG = "trend_config"
 
 
 async def _get_setting(key: str) -> Optional[SystemSetting]:
@@ -72,3 +80,50 @@ async def ensure_node_token(store: RedisStore) -> str:
     await _upsert_setting(KEY_NODE_TOKEN, token)
     await store.set_node_token(token)
     return token
+
+
+async def _legacy_node_trend() -> dict | None:
+    """兼容：若全局尚未落库，尝试从旧的 nodes.trend_json 取一份作种子。"""
+    async with SessionLocal() as s:
+        row = (
+            await s.execute(
+                select(Node).where(Node.trend_json.is_not(None)).limit(1)
+            )
+        ).scalar_one_or_none()
+        if row is None or not isinstance(row.trend_json, dict):
+            return None
+        return dict(row.trend_json)
+
+
+async def get_trend_config() -> dict:
+    """读取全局趋势面板参数（规范化后的完整字典）。"""
+    row = await _get_setting(KEY_TREND_CONFIG)
+    raw: dict | None = None
+    if row and row.value:
+        try:
+            parsed = json.loads(row.value)
+            if isinstance(parsed, dict):
+                raw = parsed
+        except json.JSONDecodeError:
+            logger.warning("trend_config JSON 损坏，回落默认值")
+    if raw is None:
+        legacy = await _legacy_node_trend()
+        if legacy is not None:
+            # 一次性迁到全局键，之后不再读节点列
+            normalized = trend_indicators.normalize_config(legacy)
+            await _upsert_setting(
+                KEY_TREND_CONFIG,
+                json.dumps(normalized, ensure_ascii=False, separators=(",", ":")),
+            )
+            return normalized
+    return trend_indicators.normalize_config(raw)
+
+
+async def set_trend_config(cfg: dict | None) -> dict:
+    """写入全局趋势面板参数；越界值由 normalize_config 夹回。"""
+    normalized = trend_indicators.normalize_config(cfg)
+    await _upsert_setting(
+        KEY_TREND_CONFIG,
+        json.dumps(normalized, ensure_ascii=False, separators=(",", ":")),
+    )
+    return normalized

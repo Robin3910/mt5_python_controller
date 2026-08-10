@@ -4,8 +4,8 @@
 纯函数算出 EMA、RSI 与综合趋势得分。本模块只做鉴权、参数合并与编排，不含任何
 指标算法，也不参与下单与过滤。
 
-参数优先级：查询串 > 节点已保存配置（nodes.trend_json）> 内置默认。这样面板上
-可以边调边看，确认合适后再走 PATCH /api/nodes/{id} 存成该节点的常用配置。
+参数优先级：查询串 > 全局已保存配置（system_setting.trend_config）> 内置默认。
+面板上可以边调边看，确认合适后再走 PUT /api/config/trend 落成全后台共用配置。
 """
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import time
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from . import market_probe, trend_indicators
+from . import market_probe, system_settings, trend_indicators
 from .deps import get_current_admin, get_store
 from .redis_store import RedisStore
 
@@ -83,7 +83,7 @@ async def node_trend(
     if not _SYMBOL_RE.match(sym):
         raise HTTPException(status_code=400, detail="品种代码无效")
 
-    saved = trend_indicators.normalize_config(node.get("trend"))
+    saved = await system_settings.get_trend_config()
     cfg = trend_indicators.normalize_config({**saved, **overrides})
 
     try:

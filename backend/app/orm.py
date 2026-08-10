@@ -45,7 +45,8 @@ class Node(Base):
     poll_order: Mapped[int] = mapped_column(Integer, default=0)
     filters_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # 节点级过滤
     risk_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # 账户级风控
-    trend_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # 趋势面板参数
+    # 旧版按节点存的趋势参数；权威已迁到 system_setting.trend_config，此列仅作迁移种子
+    trend_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # mt5_login 自 v0.2 起作为节点的业务唯一键（不可为空、全局唯一）
     mt5_login: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
     mt5_server: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -58,7 +59,9 @@ class Node(Base):
 class SystemSetting(Base):
     """系统级 key/value 配置（持久化）。
 
-    当前用途：`node_token` — 所有节点共享的接入令牌（明文，便于管理员复制到各节点 .env）。
+    当前用途：
+    - `node_token` — 所有节点共享的接入令牌（明文，便于管理员复制到各节点 .env）
+    - `trend_config` — 趋势面板全局参数（JSON 文本）
     """
     __tablename__ = "system_setting"
 

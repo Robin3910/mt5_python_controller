@@ -181,7 +181,6 @@ export interface NodeOut {
   status: 'online' | 'offline'
   filters?: NodeDispatchFiltersConfig | null
   risk?: NodeRiskConfig | null
-  trend?: TrendConfig | null
   mt5_login: number | null
   mt5_server: string | null
   created_at: number
@@ -288,7 +287,6 @@ export interface NodeUpdatePayload {
   enabled?: boolean
   filters?: NodeDispatchFiltersConfig | null
   risk?: NodeRiskConfig | null
-  trend?: TrendConfig | null
 }
 
 export interface CloseRequest {

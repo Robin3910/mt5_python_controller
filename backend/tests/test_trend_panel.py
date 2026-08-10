@@ -416,53 +416,64 @@ def test_trend_config_change_does_not_refetch(client, monkeypatch):
     assert tuned.json()["score"] < base.json()["score"]
 
 
-# --------------------------- 参数持久化 ---------------------------
-def test_patch_node_trend_persists(client):
+# --------------------------- 参数持久化（全局） ---------------------------
+def test_put_config_trend_persists(client):
     h = _auth(client)
-    node_id = _mk_node(client, h, 88308)
-    r = client.patch(
-        f"/api/nodes/{node_id}",
-        json={"trend": {"timeframe": "H1", "ema_period": 30, "ema_weight": 0.6,
-                        "rsi_weight": 0.4, "bullish": 25, "bearish": -25}},
+    r = client.put(
+        "/api/config/trend",
+        json={"timeframe": "H1", "ema_period": 30, "ema_weight": 0.6,
+              "rsi_weight": 0.4, "bullish": 25, "bearish": -25},
         headers=h,
     )
     assert r.status_code == 200, r.text
-    trend = r.json()["trend"]
+    trend = r.json()
     assert trend["timeframe"] == "H1"
     assert trend["ema_period"] == 30
     assert trend["ema_weight"] == 0.6
     assert trend["rsi_weight"] == 0.4
     assert trend["bullish"] == 25.0
 
-    again = client.get(f"/api/nodes/{node_id}", headers=h)
-    assert again.json()["trend"]["ema_period"] == 30
+    again = client.get("/api/config/trend", headers=h)
+    assert again.json()["ema_period"] == 30
 
 
-def test_patch_node_trend_clamps_instead_of_failing(client):
+def test_put_config_trend_clamps_instead_of_failing(client):
     h = _auth(client)
-    node_id = _mk_node(client, h, 88309)
-    r = client.patch(
-        f"/api/nodes/{node_id}", json={"trend": {"ema_period": 9999, "bars": 1}}, headers=h,
+    r = client.put(
+        "/api/config/trend", json={"ema_period": 9999, "bars": 1}, headers=h,
     )
     assert r.status_code == 200, r.text
-    assert r.json()["trend"]["ema_period"] == 400
-    assert r.json()["trend"]["bars"] == trend_indicators.MIN_VIEW_BARS
+    assert r.json()["ema_period"] == 400
+    assert r.json()["bars"] == trend_indicators.MIN_VIEW_BARS
 
 
-def test_new_node_carries_default_trend_config(client):
+def test_get_config_trend_defaults(client):
     h = _auth(client)
-    node_id = _mk_node(client, h, 88310)
-    r = client.get(f"/api/nodes/{node_id}", headers=h)
-    assert r.json()["trend"] == trend_indicators.normalize_config(None)
+    r = client.get("/api/config/trend", headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json() == trend_indicators.normalize_config(None)
 
 
 def test_saved_trend_config_applies_without_query(client, monkeypatch):
     h = _auth(client)
     node_id = _mk_node(client, h, 88311)
-    client.patch(f"/api/nodes/{node_id}", json={"trend": {"timeframe": "H4", "bars": 50}},
-                 headers=h)
+    client.put("/api/config/trend", json={"timeframe": "H4", "bars": 50}, headers=h)
     sent = _stub_node(monkeypatch, bars=_bars(_rising()), quote={"mid": 220.0})
     r = client.get(f"/api/nodes/{node_id}/trend", params={"symbol": "XAUUSD"}, headers=h)
     assert r.status_code == 200, r.text
     assert r.json()["config"]["timeframe"] == "H4"
     assert sent[0]["timeframe"] == "H4"
+
+
+def test_trend_config_is_global_across_nodes(client, monkeypatch):
+    """保存一次后，任意节点的趋势接口都沿用同一份全局参数。"""
+    h = _auth(client)
+    a = _mk_node(client, h, 88312)
+    b = _mk_node(client, h, 88313)
+    client.put("/api/config/trend", json={"timeframe": "D1", "ema_period": 21}, headers=h)
+    _stub_node(monkeypatch, bars=_bars(_rising()), quote={"mid": 220.0})
+    ra = client.get(f"/api/nodes/{a}/trend", params={"symbol": "XAUUSD"}, headers=h)
+    rb = client.get(f"/api/nodes/{b}/trend", params={"symbol": "XAUUSD"}, headers=h)
+    assert ra.status_code == 200 and rb.status_code == 200
+    assert ra.json()["config"]["timeframe"] == "D1"
+    assert rb.json()["config"]["ema_period"] == 21

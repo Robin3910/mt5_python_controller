@@ -3,7 +3,7 @@
 // 面板只负责选品种、调参数与展示；指标算法、权重换算与多空判定全在后端
 // （trend_indicators），前端不承载任何交易决策。
 // 打开面板后按选定间隔轮询 GET /api/nodes/{id}/trend；改参数会立刻带覆盖项重取一次
-// （后端行情缓存会拦住重复的终端查询），点保存才写入该节点配置。
+// （后端行情缓存会拦住重复的终端查询），点保存才写入全局配置（全后台共用）。
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import * as echarts from 'echarts/core'
 import { CandlestickChart, LineChart } from 'echarts/charts'
@@ -41,7 +41,7 @@ echarts.use([
 
 const props = defineProps<{
   nodeId: string
-  /** 节点已保存的趋势参数（表单初值） */
+  /** 全局已保存的趋势参数（表单初值；全后台共享） */
   trendConfig?: TrendConfig | null
   /** 候选品种：节点报价 / 持仓 / 按币种配置的并集，由父页面汇总 */
   symbolOptions?: string[]
@@ -180,8 +180,9 @@ function resetToDefaults(): void {
 async function save(): Promise<void> {
   saving.value = true
   try {
-    await hub.updateNode(props.nodeId, { trend: { ...form } })
-    savedTip.value = '已保存为该节点默认参数'
+    const saved = await hub.saveTrendConfig({ ...form })
+    Object.assign(form, toTrendForm(saved))
+    savedTip.value = '已保存为全局默认参数（所有节点共用）'
     setTimeout(() => (savedTip.value = ''), 2500)
   } catch (e) {
     error.value = extractError(e)
@@ -462,7 +463,7 @@ onBeforeUnmount(() => {
         <div>
           <strong>参数</strong>
           <p class="muted trend-hint" style="margin: 4px 0 0">
-            改动即时生效于本次查看；点「保存」写入该节点配置，下次打开与其他管理员都沿用
+            改动即时生效于本次查看；点「保存」写入全局配置（不分节点/币种），下次打开与其他管理员都沿用
           </p>
         </div>
         <div class="row" style="gap: 8px">

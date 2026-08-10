@@ -12,7 +12,7 @@ from sqlalchemy import func, select
 
 from . import group_service
 from .db import SessionLocal
-from . import risk_control, trend_indicators
+from . import risk_control
 from .models import NodeCreate, NodeUpdate
 from .orm import Node
 from .redis_store import RedisStore
@@ -33,7 +33,6 @@ def node_row_to_dict(row: Node) -> dict:
         "poll_order": row.poll_order,
         "filters": row.filters_json,
         "risk": risk_control.normalize_risk(row.risk_json),
-        "trend": trend_indicators.normalize_config(row.trend_json),
         "mt5_login": row.mt5_login,
         "mt5_server": row.mt5_server,
         "created_at": row.created_at.timestamp() if row.created_at else time.time(),
@@ -173,10 +172,6 @@ async def update_node(store: RedisStore, node_id: str, patch: NodeUpdate) -> Opt
         err = risk_control.validate_risk(risk_norm)
         if err:
             raise ValueError(err)
-    trend_norm: dict | None = None
-    if patch.trend is not None:
-        # 趋势参数只影响展示口径，规范化已把越界值夹回合法区间，无需再单独校验
-        trend_norm = trend_indicators.normalize_config(patch.trend)
     async with SessionLocal() as s:
         row = await s.get(Node, node_id)
         if not row:
@@ -189,8 +184,6 @@ async def update_node(store: RedisStore, node_id: str, patch: NodeUpdate) -> Opt
             row.filters_json = patch.filters
         if risk_norm is not None:
             row.risk_json = risk_norm
-        if trend_norm is not None:
-            row.trend_json = trend_norm
         await s.commit()
         await s.refresh(row)
         d = node_row_to_dict(row)

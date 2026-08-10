@@ -1,7 +1,7 @@
-"""运行期配置 API：区间过滤、全局节点令牌（需管理员鉴权）。
+"""运行期配置 API：区间过滤、全局节点令牌、趋势面板参数（需管理员鉴权）。
 
 这些配置存于 Redis（运行期实时态），下发分发时即时读取生效。
-节点令牌为持久化配置（MySQL/SQLite + Redis 缓存，见 system_settings）。
+节点令牌与趋势面板参数为持久化配置（MySQL/SQLite，见 system_settings）。
 """
 from fastapi import APIRouter, Depends, HTTPException, Request
 
@@ -75,3 +75,26 @@ async def rotate_node_token(
     token, updated_at = await system_settings.rotate_node_token(store)
     await persist.audit(admin, "rotate_node_token", None, None, "ok", client_ip(request))
     return NodeTokenInfo(token=token, updated_at=updated_at)
+
+
+# ----------------- 趋势面板参数（全局共享，不分节点/币种）-----------------
+@router.get("/trend")
+async def get_trend_config(_: str = Depends(get_current_admin)):
+    """获取全局趋势面板参数（EMA/RSI 周期、权重、阈值等）。"""
+    return await system_settings.get_trend_config()
+
+
+@router.put("/trend")
+async def set_trend_config(
+    body: dict,
+    request: Request,
+    admin: str = Depends(get_current_admin),
+):
+    """保存全局趋势面板参数；越界值会被夹回合法区间。"""
+    before = await system_settings.get_trend_config()
+    after = await system_settings.set_trend_config(body or {})
+    await persist.audit(
+        admin, "set_trend_config", None, None, "ok", client_ip(request),
+        category="console", before=before, after=after,
+    )
+    return after

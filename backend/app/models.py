@@ -22,8 +22,6 @@ class NodeUpdate(BaseModel):
     filters: Optional[dict] = None
     # 账户级风控（浮盈亏比等）；结构见 risk_control.normalize_risk
     risk: Optional[dict] = None
-    # 趋势面板参数（只影响展示口径）；结构见 trend_indicators.normalize_config
-    trend: Optional[dict] = None
 
 
 class NodeOut(BaseModel):
@@ -34,7 +32,6 @@ class NodeOut(BaseModel):
     status: str = "offline"  # online / offline
     filters: Optional[dict] = None
     risk: Optional[dict] = None
-    trend: Optional[dict] = None
     mt5_login: Optional[int] = None
     mt5_server: Optional[str] = None
     created_at: float = 0

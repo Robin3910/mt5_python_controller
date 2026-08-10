@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // 管理后台顶栏「趋势面板」：跨节点查看趋势，复用节点详情里的 TrendPanel。
-// 默认选中第一个在线节点、默认品种 XAUUSD；参数仍按所选节点落库。
+// 默认选中第一个在线节点、默认品种 XAUUSD；参数为全局共享并落库。
 import { computed, defineAsyncComponent, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useHubStore } from '@/stores/hub'
 import type { AccountSnapshot, NodeOut } from '@/api/types'
@@ -92,7 +92,7 @@ onMounted(async () => {
   document.addEventListener('click', onDocClick)
   loading.value = true
   try {
-    await hub.fetchNodes()
+    await Promise.all([hub.fetchNodes(), hub.fetchTrendConfig()])
     selectedNodeId.value = pickDefaultNodeId()
     if (selectedNodeId.value && !hub.accounts[selectedNodeId.value]) {
       await hub.fetchNodeAccount(selectedNodeId.value)
@@ -160,7 +160,7 @@ onUnmounted(() => {
       v-else
       :key="selectedNodeId"
       :node-id="selectedNodeId"
-      :trend-config="selectedNode?.trend"
+      :trend-config="hub.trendConfig"
       :symbol-options="symbolOptions"
       :default-symbol="DEFAULT_SYMBOL"
       symbol-storage-prefix="trend:hub:symbol"
