@@ -8,6 +8,7 @@ const router = createRouter({
     { path: '/', name: 'dashboard', component: () => import('@/views/DashboardView.vue') },
     { path: '/nodes', name: 'nodes', component: () => import('@/views/NodesView.vue') },
     { path: '/nodes/:id', name: 'node-detail', component: () => import('@/views/NodeDetailView.vue') },
+    { path: '/trend', name: 'trend', component: () => import('@/views/TrendView.vue') },
     { path: '/groups', name: 'groups', component: () => import('@/views/GroupsView.vue') },
     {
       path: '/groups/:id/signals',

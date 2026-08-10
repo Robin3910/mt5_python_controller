@@ -446,11 +446,11 @@ async def test_grid_signal_dispatches_with_rule_snapshot(store, monkeypatch):
     assert rows[0].hold_when_empty is True
 
 
-async def test_grid_short_and_follow_admission(store, monkeypatch):
-    """空头网格拒收 BUY；follow 网格 BUY/SELL 均可。"""
-    await online(store, mk_node("nd_s"), mk_node("nd_f"))
+async def test_grid_short_admission(store, monkeypatch):
+    """空头网格拒收 BUY、接受 SELL；只做多网格对称。"""
+    await online(store, mk_node("nd_s"), mk_node("nd_l"))
     await mk_grid_group(store, "空头网格", ["nd_s"], grid_side="short")
-    await mk_grid_group(store, "跟随网格", ["nd_f"], grid_side="follow")
+    await mk_grid_group(store, "只做多网格", ["nd_l"], grid_side="long")
     sent = []
     monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
     d = GroupDispatcher(store)
@@ -458,8 +458,8 @@ async def test_grid_short_and_follow_admission(store, monkeypatch):
     await d.dispatch(
         TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_grid_short_buy",
     )
-    # short 分组落选；follow 分组仍可接 BUY
-    assert any(s[0] == "nd_f" for s in sent)
+    # short 分组落选；long 分组接 BUY
+    assert any(s[0] == "nd_l" for s in sent)
     assert not any(s[0] == "nd_s" for s in sent)
     sent.clear()
 
@@ -467,7 +467,7 @@ async def test_grid_short_and_follow_admission(store, monkeypatch):
         TradingSignal(action="SELL", symbol="XAUUSD", volume=0.1), "sig_grid_short_sell",
     )
     assert ok["mode"] == "group"
-    # follow 节点可能仍被上一笔占用；这里只断言空头网格能接 SELL
+    # long 节点可能仍被上一笔占用；这里只断言空头网格能接 SELL
     assert any(s[0] == "nd_s" for s in sent)
 
 async def test_progress_runtime_roundtrip_and_stuck_finish(store, monkeypatch):

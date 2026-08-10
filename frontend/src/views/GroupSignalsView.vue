@@ -342,8 +342,7 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
         const short = side === 'short'
         const sl = short ? detail.stop_upper : detail.stop_lower
         const tp = short ? detail.stop_lower : detail.stop_upper
-        const title = side === 'follow' ? '下沿 / 上沿' : '止损 / 止盈'
-        push(title, `${sl || '不设'} / ${tp || '不设'}`)
+        push('止损 / 止盈', `${sl || '不设'} / ${tp || '不设'}`)
       }
       push('初始建仓', detail.prefill_enabled === false ? '关闭' : '开启')
       push('等待触发', detail.waiting_trigger ? '是' : '')

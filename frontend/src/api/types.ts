@@ -410,8 +410,8 @@ export type EntryDirection = 'pullback' | 'breakout'
 /** 网格模式：arithmetic 等差 / geometric 等比 */
 export type GridMode = 'arithmetic' | 'geometric'
 
-/** 网格方向：long 只做多 / short 只做空 / follow 跟随信号 */
-export type GridSide = 'long' | 'short' | 'follow'
+/** 网格方向：long 只做多 / short 只做空 */
+export type GridSide = 'long' | 'short'
 
 /**
  * 策略规则，字段按 type 分组使用（与后端独立模型对齐）：

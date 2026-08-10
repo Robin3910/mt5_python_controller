@@ -6,7 +6,7 @@
 - price_lower / price_upper：价格区间
 - grid_count：网格数量（切成 N 格，N+1 条线）
 - grid_mode：arithmetic 等差 / geometric 等比
-- grid_side：long 只做多 / short 只做空 / follow 跟随信号方向
+- grid_side：long 只做多 / short 只做空（历史 follow 仍可解析，按信号定方向）
 - lot_per_grid：每格手数
 - total_lot_limit：总手数上限，0=不额外限制
 - trigger_price：触发价，0=立即启动

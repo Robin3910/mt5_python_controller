@@ -354,7 +354,7 @@ class StrategyRule(BaseModel):
         default="arithmetic", description="网格模式：arithmetic=等差 / geometric=等比",
     )
     grid_side: str = Field(
-        default="long", description="网格方向：long=只做多 / short=只做空 / follow=跟随信号",
+        default="long", description="网格方向：long=只做多 / short=只做空",
     )
     lot_per_grid: float = Field(default=0.01, ge=0, description="每格手数")
     trigger_price: float = Field(default=0.0, ge=0, description="触发价，0=立即启动")

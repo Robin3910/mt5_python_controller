@@ -45,6 +45,13 @@ const props = defineProps<{
   trendConfig?: TrendConfig | null
   /** 候选品种：节点报价 / 持仓 / 按币种配置的并集，由父页面汇总 */
   symbolOptions?: string[]
+  /** 无本地记忆时的默认品种（如全局趋势页固定 XAUUSD） */
+  defaultSymbol?: string
+  /**
+   * 品种本地记忆的键前缀。节点详情默认 `trend:symbol`；
+   * 顶栏全局页可传独立前缀，避免与详情页上次选中的品种互相覆盖。
+   */
+  symbolStoragePrefix?: string
   online?: boolean
 }>()
 
@@ -65,7 +72,9 @@ const emaWeightPct = computed(() => Math.round(cfg.value.ema_weight * 100))
 const rsiWeightPct = computed(() => Math.round(cfg.value.rsi_weight * 100))
 
 // ---------------------------- 品种 ----------------------------
-const storageKey = computed(() => `trend:symbol:${props.nodeId}`)
+const storageKey = computed(
+  () => `${props.symbolStoragePrefix || 'trend:symbol'}:${props.nodeId}`,
+)
 
 function readStoredSymbol(): string {
   try {
@@ -158,7 +167,9 @@ watch(
 watch(
   () => props.symbolOptions,
   (options) => {
-    if (!symbol.value && options?.length) pickSymbol(options[0])
+    if (symbol.value) return
+    const fallback = (props.defaultSymbol || '').trim().toUpperCase() || options?.[0]
+    if (fallback) pickSymbol(fallback)
   },
 )
 
@@ -364,7 +375,11 @@ watch(data, (next) => {
 })
 
 onMounted(() => {
-  const initial = readStoredSymbol() || props.symbolOptions?.[0] || ''
+  const initial =
+    readStoredSymbol()
+    || (props.defaultSymbol || '').trim().toUpperCase()
+    || props.symbolOptions?.[0]
+    || ''
   if (initial) pickSymbol(initial)
   if (chartEl.value) {
     chart = echarts.init(chartEl.value)

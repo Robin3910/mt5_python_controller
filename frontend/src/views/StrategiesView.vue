@@ -180,25 +180,19 @@ const FIELD_HELP = {
   grid_mode:
     '分格方式：\n等差 = 每格价格间距相等；\n等比 = 每格涨跌幅比例相等（适合宽区间）。',
   grid_side:
-    '网格方向：\n只做多 = 跌买涨卖；\n只做空 = 涨卖跌买；\n跟随信号 = 按触发信号的 BUY/SELL 决定方向。',
+    '网格方向：\n只做多 = 跌买涨卖；\n只做空 = 涨卖跌买。',
   lot_per_grid: '每一格买入/卖出的手数。',
   trigger_price: '触发价。填 0 表示信号到达后立即启动；否则等现价触及（穿越或落到）该价才建网格，与多空方向无关。',
   stop_lower:
     '下沿终止价，须低于区间下限；填 0 表示不设。' +
-    '多头 / 跟随信号做多时为止损；空头时为止盈。',
+    '多头时为止损；空头时为止盈。',
   stop_upper:
     '上沿终止价，须高于区间上限；填 0 表示不设。' +
-    '多头 / 跟随信号做多时为止盈；空头时为止损。',
+    '多头时为止盈；空头时为止损。',
   stop_loss_long: '止损价，须低于区间下限；填 0 表示不设。多头网格跌破此价终止。',
   stop_profit_long: '止盈价，须高于区间上限；填 0 表示不设。多头网格涨破此价终止。',
   stop_loss_short: '止损价，须高于区间上限；填 0 表示不设。空头网格涨破此价终止。',
   stop_profit_short: '止盈价，须低于区间下限；填 0 表示不设。空头网格跌破此价终止。',
-  stop_bound_lower:
-    '下沿终止价，须低于区间下限；填 0 表示不设。' +
-    '实际方向由信号决定：做多时为止损，做空时为止盈。',
-  stop_bound_upper:
-    '上沿终止价，须高于区间上限；填 0 表示不设。' +
-    '实际方向由信号决定：做多时为止盈，做空时为止损。',
   close_on_stop:
     '触发止损/止盈或收到终止指令时是否清掉该任务全部持仓。\n' +
     '关闭后：停止网格交易与监控推进，但保留已有持仓；任务进入「已脱离」非终态，' +
@@ -234,7 +228,6 @@ const GRID_MODE_OPTIONS: Array<{ value: GridMode; label: string }> = [
 const GRID_SIDE_OPTIONS: Array<{ value: GridSide; label: string }> = [
   { value: 'long', label: '只做多' },
   { value: 'short', label: '只做空' },
-  { value: 'follow', label: '跟随信号' },
 ]
 
 /**
@@ -276,7 +269,8 @@ function cloneRules(rules: StrategyRule[]): EditableRule[] {
     price_upper: r.price_upper ?? 0,
     grid_count: r.grid_count ?? 10,
     grid_mode: r.grid_mode ?? 'arithmetic',
-    grid_side: r.grid_side ?? 'long',
+    // 旧配置若仍为 follow，编辑时回落到只做多（选项已移除）
+    grid_side: r.grid_side === 'short' ? 'short' : 'long',
     lot_per_grid: r.lot_per_grid ?? 0.01,
     trigger_price: r.trigger_price ?? 0,
     stop_lower: r.stop_lower ?? 0,
@@ -487,18 +481,6 @@ function gridStopFields(side: GridSide | undefined | null): {
       tpHelp: FIELD_HELP.stop_profit_short,
       lowerName: '止盈价',
       upperName: '止损价',
-    }
-  }
-  if (side === 'follow') {
-    return {
-      slKey: 'stop_lower',
-      tpKey: 'stop_upper',
-      slLabel: '下沿价',
-      tpLabel: '上沿价',
-      slHelp: FIELD_HELP.stop_bound_lower,
-      tpHelp: FIELD_HELP.stop_bound_upper,
-      lowerName: '下沿价',
-      upperName: '上沿价',
     }
   }
   return {
@@ -822,7 +804,7 @@ function ruleDetailRows(r: StrategyRule): Array<{ k: string; v: string }> {
       { k: '总手数上限', v: r.total_lot_limit ? String(r.total_lot_limit) : '不限' },
       { k: '触发价', v: r.trigger_price ? String(r.trigger_price) : '立即启动' },
       {
-        k: r.grid_side === 'follow' ? '下沿 / 上沿' : '止损 / 止盈',
+        k: '止损 / 止盈',
         v: `${sl || '不设'} / ${tp || '不设'}`,
       },
       { k: '终止清仓', v: r.close_on_stop === false ? '否' : '是' },

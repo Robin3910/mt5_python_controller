@@ -575,6 +575,14 @@ def test_normalize_grid_clamps_and_swaps_range():
     assert "risk_amount" not in out
 
 
+def test_normalize_grid_follow_falls_back_to_long():
+    """历史 follow 已废弃，规范化回落到只做多。"""
+    from app import strategy_templates as tpl
+
+    out = tpl.normalize_rule(_grid_rule(grid_side="follow"))
+    assert out["grid_side"] == "long"
+
+
 def test_normalize_grid_short_keeps_directional_stops():
     """空头网格：上沿价为止损、下沿价为止盈；几何合法值应保留。"""
     from app import strategy_templates as tpl

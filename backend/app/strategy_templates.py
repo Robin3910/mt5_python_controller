@@ -58,11 +58,12 @@ BREAKEVEN_MODES = (BREAKEVEN_ONCE, BREAKEVEN_LOOP)
 GRID_MODE_ARITHMETIC = "arithmetic"   # 等差
 GRID_MODE_GEOMETRIC = "geometric"     # 等比
 GRID_MODES = (GRID_MODE_ARITHMETIC, GRID_MODE_GEOMETRIC)
-# 网格方向：long 只做多 / short 只做空 / follow 跟随信号方向
+# 网格方向：long 只做多 / short 只做空
 GRID_SIDE_LONG = "long"
 GRID_SIDE_SHORT = "short"
+# 历史值 follow（跟随信号）已废弃；规范化时回落到默认 long
 GRID_SIDE_FOLLOW = "follow"
-GRID_SIDES = (GRID_SIDE_LONG, GRID_SIDE_SHORT, GRID_SIDE_FOLLOW)
+GRID_SIDES = (GRID_SIDE_LONG, GRID_SIDE_SHORT)
 GRID_COUNT_MIN = 2
 GRID_COUNT_MAX = 200
 # 向上追踪的平移次数上限；0 表示不限，此处只防止配置写出天文数字
@@ -297,7 +298,7 @@ class GridTradingRule:
     price_upper: float = 0.0                    # 区间上限
     grid_count: int = 10                        # 网格数量（2-200）
     grid_mode: str = GRID_MODE_ARITHMETIC       # arithmetic / geometric
-    grid_side: str = GRID_SIDE_LONG             # long / short / follow
+    grid_side: str = GRID_SIDE_LONG             # long / short
     lot_per_grid: float = 0.01                  # 每格手数
     total_lot_limit: float = 0.0                # 总手数上限，0=不额外限制
     trigger_price: float = 0.0                  # 触发价，0=立即启动
