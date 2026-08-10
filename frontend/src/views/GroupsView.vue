@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // 分组管理页：strategy 信号（Webhook model=strategy）的分发单元
 // 新建/编辑/删除分组、启停、维护成员节点、设置分组级分发模式；信号明细见 GroupSignalsView
-import { computed, onMounted, ref, reactive, watch } from 'vue'
+import { computed, defineAsyncComponent, onMounted, ref, reactive, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
@@ -18,6 +18,8 @@ import type {
   StrategyOut,
 } from '@/api/types'
 import { confirmAction } from '@/utils/confirm'
+
+const StrategyFormModal = defineAsyncComponent(() => import('@/components/StrategyFormModal.vue'))
 
 const hub = useHubStore()
 const router = useRouter()
@@ -459,6 +461,22 @@ function buildTriggerPayload(symbol: string): ManualSignalPayload {
   return payload
 }
 
+/** 与后端 console_api._build_signal_payload / Webhook 解析同构的信号体 */
+function buildWebhookSignalPayload(payload: ManualSignalPayload): Record<string, unknown> {
+  const data: Record<string, unknown> = {
+    action: payload.action,
+    symbol: payload.symbol,
+    model: payload.model ?? 'strategy',
+  }
+  if (payload.template_ids?.length) data.template_ids = [...payload.template_ids]
+  if (payload.group_ids?.length) data.group_ids = [...payload.group_ids]
+  if (payload.volume != null) data.volume = payload.volume
+  if (payload.stop_loss) data.sl = payload.stop_loss
+  if (payload.take_profit) data.tp = payload.take_profit
+  if (payload.comment) data.comment = payload.comment
+  return data
+}
+
 function triggerSummary(payload: ManualSignalPayload): string {
   const hit = matchedGroups.value
   const groupText = hit.length
@@ -482,6 +500,37 @@ function triggerSummary(payload: ManualSignalPayload): string {
     if (payload.comment) lines.push(`备注：${payload.comment}`)
   }
   return `${lines.join('\n')}\n\n预计命中分组：\n${groupText}`
+}
+
+const showTriggerConfirm = ref(false)
+const pendingTriggerPayload = ref<ManualSignalPayload | null>(null)
+const triggerCopyTip = ref('')
+const triggerPayloadExpanded = ref(false)
+
+const pendingTriggerPayloadJson = computed(() => {
+  if (!pendingTriggerPayload.value) return ''
+  return JSON.stringify(buildWebhookSignalPayload(pendingTriggerPayload.value), null, 2)
+})
+
+async function copyPendingTriggerPayload(): Promise<void> {
+  const text = pendingTriggerPayloadJson.value
+  if (!text) return
+  try {
+    await navigator.clipboard.writeText(text)
+    triggerCopyTip.value = '已复制'
+    window.setTimeout(() => {
+      triggerCopyTip.value = ''
+    }, 2000)
+  } catch {
+    triggerCopyTip.value = '复制失败'
+  }
+}
+
+function cancelTriggerConfirm(): void {
+  showTriggerConfirm.value = false
+  pendingTriggerPayload.value = null
+  triggerCopyTip.value = ''
+  triggerPayloadExpanded.value = false
 }
 
 /** 展示触发结果；返回 true 表示这次触发已经收口，可以关闭弹窗 */
@@ -529,10 +578,16 @@ async function submitTrigger(): Promise<void> {
     triggerError.value = '开仓信号必须填写大于 0 的手数'
     return
   }
-  const payload = buildTriggerPayload(symbol)
-  if (!(await confirmAction(`确认手动触发 strategy 信号？\n\n${triggerSummary(payload)}`, '确认触发信号'))) {
-    return
-  }
+  pendingTriggerPayload.value = buildTriggerPayload(symbol)
+  triggerCopyTip.value = ''
+  triggerPayloadExpanded.value = false
+  showTriggerConfirm.value = true
+}
+
+async function confirmSubmitTrigger(): Promise<void> {
+  const payload = pendingTriggerPayload.value
+  if (!payload) return
+  showTriggerConfirm.value = false
 
   triggering.value = true
   triggerError.value = ''
@@ -548,6 +603,8 @@ async function submitTrigger(): Promise<void> {
     ElMessage.error(`触发失败：${triggerError.value}`)
   } finally {
     triggering.value = false
+    pendingTriggerPayload.value = null
+    triggerPayloadExpanded.value = false
   }
 }
 
@@ -561,6 +618,22 @@ function openActiveSignals(g: GroupOut): void {
     params: { id: g.group_id },
     query: { status: 'active' },
   })
+}
+
+const showStrategyForm = ref(false)
+const editingStrategyId = ref('')
+
+function openGroupStrategyEdit(g: GroupOut): void {
+  if (!g.strategy_id) {
+    ElMessage.warning('该分组未绑定策略')
+    return
+  }
+  editingStrategyId.value = g.strategy_id
+  showStrategyForm.value = true
+}
+
+async function onStrategyFormSaved(): Promise<void> {
+  await Promise.all([hub.fetchStrategies(), loadGroups()])
 }
 </script>
 
@@ -628,12 +701,18 @@ function openActiveSignals(g: GroupOut): void {
             </span>
           </span>
         </div>
+        <div v-if="g.strategy_id" class="list-field">
+          <span class="k">策略</span>
+          <span class="v">
+            <button class="btn-sm btn-success" @click="openGroupStrategyEdit(g)">编辑策略</button>
+          </span>
+        </div>
         <div class="list-field"><span class="k">成员节点</span><span class="v">{{ g.node_count }}</span></div>
         <div class="list-field"><span class="k">有效节点</span><span class="v">{{ g.online_node_count }}</span></div>
         <div class="list-field">
           <span class="k">信号</span>
           <span class="v">
-            <button class="btn-sm btn-ghost" @click="openSignals(g)">{{ g.signal_count }} 条</button>
+            <button class="btn-sm btn-success" @click="openSignals(g)">{{ g.signal_count }} 条</button>
           </span>
         </div>
         <div class="list-field">
@@ -641,7 +720,7 @@ function openActiveSignals(g: GroupOut): void {
           <span class="v">
             <button
               v-if="g.active_task_count > 0"
-              class="btn-sm btn-ghost"
+              class="btn-sm btn-success"
               @click="openActiveSignals(g)"
             >{{ g.active_task_count }} 条</button>
             <span v-else class="muted">—</span>
@@ -649,7 +728,7 @@ function openActiveSignals(g: GroupOut): void {
         </div>
         <div class="list-field"><span class="k">备注</span><span class="v muted" style="font-size: 12px; font-weight: 500">{{ g.remark || '—' }}</span></div>
         <div class="list-card-actions">
-          <button class="btn-sm" :class="g.enabled ? 'btn-ghost' : 'btn-danger'" @click="toggleEnabled(g)">
+          <button class="btn-sm" :class="g.enabled ? 'btn-success' : 'btn-danger'" @click="toggleEnabled(g)">
             {{ g.enabled ? '禁用' : '启用' }}
           </button>
           <button class="btn-sm btn-ghost" @click="openEdit(g)">编辑</button>
@@ -670,6 +749,7 @@ function openActiveSignals(g: GroupOut): void {
             <th>绑定策略</th>
             <th>分发模式</th>
             <th>趋势风控</th>
+            <th>策略</th>
             <th class="right">成员节点</th>
             <th class="right">有效节点</th>
             <th class="right">信号</th>
@@ -698,22 +778,30 @@ function openActiveSignals(g: GroupOut): void {
                 {{ g.trend_risk_enabled ? '开启' : '关闭' }}
               </span>
             </td>
+            <td>
+              <button
+                v-if="g.strategy_id"
+                class="btn-sm btn-success"
+                @click="openGroupStrategyEdit(g)"
+              >编辑策略</button>
+              <span v-else class="muted">—</span>
+            </td>
             <td class="right">{{ g.node_count }}</td>
             <td class="right" :class="g.online_node_count ? '' : 'muted'">{{ g.online_node_count }}</td>
             <td class="right">
-              <button class="btn-sm btn-ghost" @click="openSignals(g)">{{ g.signal_count }} 条</button>
+              <button class="btn-sm btn-success" @click="openSignals(g)">{{ g.signal_count }} 条</button>
             </td>
             <td class="right">
               <button
                 v-if="g.active_task_count > 0"
-                class="btn-sm btn-ghost"
+                class="btn-sm btn-success"
                 @click="openActiveSignals(g)"
               >{{ g.active_task_count }} 条</button>
               <span v-else class="muted">—</span>
             </td>
             <td class="muted" style="font-size: 12px">{{ g.remark || '—' }}</td>
             <td>
-              <button class="btn-sm" :class="g.enabled ? 'btn-ghost' : 'btn-danger'" @click="toggleEnabled(g)">
+              <button class="btn-sm" :class="g.enabled ? 'btn-success' : 'btn-danger'" @click="toggleEnabled(g)">
                 {{ g.enabled ? '已启用' : '已禁用' }}
               </button>
             </td>
@@ -723,7 +811,7 @@ function openActiveSignals(g: GroupOut): void {
             </td>
           </tr>
           <tr v-if="!hub.groups.length && !loading">
-            <td colspan="10" class="muted" style="padding: 18px">
+            <td colspan="11" class="muted" style="padding: 18px">
               {{ appliedQuery ? '无匹配分组' : '暂无分组，点击右上角「新建分组」开始配置' }}
             </td>
           </tr>
@@ -1003,6 +1091,53 @@ function openActiveSignals(g: GroupOut): void {
       </div>
     </div>
 
+    <!-- 触发前二次确认：摘要 + Webhook 同构 JSON（可复制） -->
+    <div v-if="showTriggerConfirm && pendingTriggerPayload" class="modal-mask trigger-confirm-mask" @click.self="cancelTriggerConfirm">
+      <div class="card card-pad modal trigger-confirm-modal">
+        <div class="modal-header">
+          <div class="h1">确认触发信号</div>
+          <p class="muted" style="font-size: 12px; margin: 4px 0 0">
+            确认手动触发 strategy 信号？可展开查看 Webhook 同构 JSON。
+          </p>
+        </div>
+        <div class="modal-body">
+          <pre class="trigger-summary">{{ triggerSummary(pendingTriggerPayload) }}</pre>
+          <div class="trigger-payload-section">
+            <button
+              type="button"
+              class="trigger-payload-toggle"
+              :aria-expanded="triggerPayloadExpanded"
+              @click="triggerPayloadExpanded = !triggerPayloadExpanded"
+            >
+              <span class="muted" aria-hidden="true">{{ triggerPayloadExpanded ? '▾' : '▸' }}</span>
+              <strong>信号原始请求参数</strong>
+            </button>
+            <template v-if="triggerPayloadExpanded">
+              <div class="trigger-payload-head row between">
+                <span class="muted" style="font-size: 12px">Webhook 同构 JSON，与手动触发经后端转换后的信号体一致</span>
+                <button type="button" class="btn-sm btn-ghost" @click.stop="copyPendingTriggerPayload">
+                  {{ triggerCopyTip || '复制 JSON' }}
+                </button>
+              </div>
+              <pre class="trigger-payload-json">{{ pendingTriggerPayloadJson }}</pre>
+            </template>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn-ghost" :disabled="triggering" @click="cancelTriggerConfirm">取消</button>
+          <button class="btn-primary" :disabled="triggering" @click="confirmSubmitTrigger">
+            {{ triggering ? '触发中…' : '确认' }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <StrategyFormModal
+      v-model="showStrategyForm"
+      mode="edit"
+      :strategy-id="editingStrategyId"
+      @saved="onStrategyFormSaved"
+    />
   </div>
 </template>
 
@@ -1095,6 +1230,78 @@ function openActiveSignals(g: GroupOut): void {
   color: #fbbf24;
   font-size: 12px;
   line-height: 1.6;
+}
+
+.trigger-confirm-mask {
+  z-index: 60;
+}
+
+.trigger-confirm-modal {
+  width: min(560px, calc(100vw - 32px));
+  max-height: calc(100dvh - 48px);
+  display: flex;
+  flex-direction: column;
+}
+
+.trigger-confirm-modal .modal-body {
+  overflow: auto;
+}
+
+.trigger-summary {
+  margin: 0 0 14px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--glass-border);
+  background: rgba(6, 10, 18, 0.45);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  color: var(--text);
+}
+
+.trigger-payload-section {
+  margin-top: 4px;
+}
+
+.trigger-payload-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 0;
+  background: none;
+  border: none;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.trigger-payload-toggle:hover strong {
+  color: var(--primary);
+}
+
+.trigger-payload-head {
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.trigger-payload-json {
+  margin: 0;
+  padding: 12px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--glass-border);
+  background: rgba(6, 10, 18, 0.65);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: #a5f3fc;
+  user-select: all;
+  max-height: 220px;
+  overflow: auto;
 }
 
 @media (max-width: 768px) {

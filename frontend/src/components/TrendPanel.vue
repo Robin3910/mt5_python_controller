@@ -402,6 +402,112 @@ onBeforeUnmount(() => {
 
 <template>
   <div>
+    <!-- 趋势总览 -->
+    <div class="card card-pad" style="margin-bottom: 16px">
+      <div class="row between" style="align-items: flex-start">
+        <div>
+          <strong>{{ data?.symbol || symbol || '—' }}</strong>
+          <span class="muted trend-sub">{{ timeframeLabel(cfg.timeframe) }}</span>
+        </div>
+        <div class="right">
+          <div class="trend-price">{{ fmtPrice(data?.price) }}</div>
+          <div class="muted trend-sub">
+            当前价<template v-if="data?.price_source === 'close'">（报价缺失，取收盘价）</template>
+          </div>
+        </div>
+      </div>
+
+      <div v-if="data && data.ready" class="trend-score-wrap">
+        <div class="row" style="gap: 10px">
+          <span class="trend-score" :class="scoreClass(data.score)">{{ fmtSigned(data.score) }}</span>
+          <span class="tag" :class="trendTagClass(data.trend)">{{ trendLabel(data.trend) }}</span>
+        </div>
+        <div class="trend-scale">
+          <div class="trend-scale-track">
+            <span class="trend-zone bear" :style="{ width: scale.bear }"></span>
+            <span class="trend-zone neutral" :style="{ width: scale.neutral }"></span>
+            <span class="trend-zone bull" :style="{ width: scale.bull }"></span>
+          </div>
+          <span class="trend-marker" :style="{ left: scale.marker }"></span>
+        </div>
+        <div class="trend-scale-legend muted">
+          <span>-100</span>
+          <span>空头 &lt; {{ scale.bearish }}</span>
+          <span>中性</span>
+          <span>多头 &gt; {{ scale.bullish }}</span>
+          <span>+100</span>
+        </div>
+      </div>
+      <p v-else-if="data" class="muted trend-hint">
+        已收盘 K 线只有 {{ data.bar_count }} 根，不足以算出 EMA({{ cfg.ema_period }}) 与
+        RSI({{ cfg.rsi_period }})，请缩短周期或减小指标周期。
+      </p>
+      <p v-else class="muted trend-hint">选择品种后显示趋势得分。</p>
+
+      <div class="trend-foot muted">
+        <span>权重：EMA {{ emaWeightPct }}% + RSI {{ rsiWeightPct }}%</span>
+        <span>阈值：多头 &gt; {{ cfg.bullish }} ｜ 中性 {{ cfg.bearish }}~{{ cfg.bullish }} ｜ 空头 &lt; {{ cfg.bearish }}</span>
+        <span>最后更新：{{ fmtTime(data?.updated_at) }}</span>
+        <span>K 线时间：{{ fmtTime(data?.bar_time) }}</span>
+      </div>
+    </div>
+
+    <!-- 指标详情 -->
+    <div v-if="data && data.ready" class="trend-metrics">
+      <div class="card card-pad trend-metric">
+        <div class="row between">
+          <strong>EMA({{ data.ema.period }})</strong>
+          <span class="tag blue">权重 {{ emaWeightPct }}%</span>
+        </div>
+        <div class="trend-metric-score" :class="scoreClass(data.ema.score)">
+          {{ fmtSigned(data.ema.score) }}
+        </div>
+        <div class="muted trend-sub">最高贡献 ±{{ data.ema.max_score ?? emaWeightPct }}</div>
+        <div class="trend-metric-rows">
+          <div class="trend-kv"><span class="muted">当前价</span><span>{{ fmtPrice(data.price) }}</span></div>
+          <div class="trend-kv"><span class="muted">EMA</span><span>{{ fmtPrice(data.ema.value) }}</span></div>
+          <div class="trend-kv">
+            <span class="muted">偏离</span>
+            <span :class="scoreClass(data.ema.deviation_pct)">{{ fmtSigned(data.ema.deviation_pct, 3) }}%</span>
+          </div>
+          <div class="trend-kv"><span class="muted">满分偏离</span><span>{{ cfg.ema_full_scale_pct }}%</span></div>
+        </div>
+        <div class="trend-metric-note" :class="scoreClass(data.ema.score)">{{ positionLabel }}</div>
+      </div>
+
+      <div class="card card-pad trend-metric">
+        <div class="row between">
+          <strong>RSI({{ data.rsi.period }})</strong>
+          <span class="tag blue">权重 {{ rsiWeightPct }}%</span>
+        </div>
+        <div class="trend-metric-score" :class="scoreClass(data.rsi.score)">
+          {{ fmtSigned(data.rsi.score) }}
+        </div>
+        <div class="muted trend-sub">最高贡献 ±{{ data.rsi.max_score ?? rsiWeightPct }}</div>
+        <div class="trend-metric-rows">
+          <div class="trend-kv"><span class="muted">当前值</span><span>{{ data.rsi.value?.toFixed(2) ?? '—' }}</span></div>
+          <div class="trend-kv"><span class="muted">状态</span><span>{{ rsiStateLabel(data.rsi.state) }}</span></div>
+          <div class="trend-kv"><span class="muted">偏多 / 偏空</span><span>{{ cfg.rsi_bull }} / {{ cfg.rsi_bear }}</span></div>
+          <div class="trend-kv"><span class="muted">超买 / 超卖</span><span>{{ cfg.rsi_overbought }} / {{ cfg.rsi_oversold }}</span></div>
+        </div>
+        <div class="trend-metric-note muted">
+          {{ cfg.rsi_bear }}~{{ cfg.rsi_bull }} 为中性区，此区间内 RSI 不贡献得分
+        </div>
+      </div>
+    </div>
+
+    <!-- K 线与指标走势 -->
+    <div class="card card-pad trend-chart-card">
+      <div class="row between" style="margin-bottom: 8px">
+        <strong style="font-size: 13px">K 线与指标</strong>
+        <span class="muted trend-sub">
+          上：K 线 + EMA ｜ 下：RSI（虚线为超买超卖，点线为偏多偏空）
+        </span>
+      </div>
+      <div ref="chartEl" class="trend-chart"></div>
+      <p v-if="!data?.bars?.length" class="muted trend-hint">暂无 K 线数据。</p>
+    </div>
+
     <!-- 品种 / 周期 / 刷新 -->
     <div class="card card-pad" style="margin-bottom: 16px">
       <div class="row between" style="align-items: flex-start">
@@ -525,112 +631,6 @@ onBeforeUnmount(() => {
           <input v-model.number="form.bars" type="number" min="30" max="500" step="10" class="trend-input" />
         </label>
       </div>
-    </div>
-
-    <!-- 趋势总览 -->
-    <div class="card card-pad" style="margin-bottom: 16px">
-      <div class="row between" style="align-items: flex-start">
-        <div>
-          <strong>{{ data?.symbol || symbol || '—' }}</strong>
-          <span class="muted trend-sub">{{ timeframeLabel(cfg.timeframe) }}</span>
-        </div>
-        <div class="right">
-          <div class="trend-price">{{ fmtPrice(data?.price) }}</div>
-          <div class="muted trend-sub">
-            当前价<template v-if="data?.price_source === 'close'">（报价缺失，取收盘价）</template>
-          </div>
-        </div>
-      </div>
-
-      <div v-if="data && data.ready" class="trend-score-wrap">
-        <div class="row" style="gap: 10px">
-          <span class="trend-score" :class="scoreClass(data.score)">{{ fmtSigned(data.score) }}</span>
-          <span class="tag" :class="trendTagClass(data.trend)">{{ trendLabel(data.trend) }}</span>
-        </div>
-        <div class="trend-scale">
-          <div class="trend-scale-track">
-            <span class="trend-zone bear" :style="{ width: scale.bear }"></span>
-            <span class="trend-zone neutral" :style="{ width: scale.neutral }"></span>
-            <span class="trend-zone bull" :style="{ width: scale.bull }"></span>
-          </div>
-          <span class="trend-marker" :style="{ left: scale.marker }"></span>
-        </div>
-        <div class="trend-scale-legend muted">
-          <span>-100</span>
-          <span>空头 &lt; {{ scale.bearish }}</span>
-          <span>中性</span>
-          <span>多头 &gt; {{ scale.bullish }}</span>
-          <span>+100</span>
-        </div>
-      </div>
-      <p v-else-if="data" class="muted trend-hint">
-        已收盘 K 线只有 {{ data.bar_count }} 根，不足以算出 EMA({{ cfg.ema_period }}) 与
-        RSI({{ cfg.rsi_period }})，请缩短周期或减小指标周期。
-      </p>
-      <p v-else class="muted trend-hint">选择品种后显示趋势得分。</p>
-
-      <div class="trend-foot muted">
-        <span>权重：EMA {{ emaWeightPct }}% + RSI {{ rsiWeightPct }}%</span>
-        <span>阈值：多头 &gt; {{ cfg.bullish }} ｜ 中性 {{ cfg.bearish }}~{{ cfg.bullish }} ｜ 空头 &lt; {{ cfg.bearish }}</span>
-        <span>最后更新：{{ fmtTime(data?.updated_at) }}</span>
-        <span>K 线时间：{{ fmtTime(data?.bar_time) }}</span>
-      </div>
-    </div>
-
-    <!-- 指标详情 -->
-    <div v-if="data && data.ready" class="trend-metrics">
-      <div class="card card-pad trend-metric">
-        <div class="row between">
-          <strong>EMA({{ data.ema.period }})</strong>
-          <span class="tag blue">权重 {{ emaWeightPct }}%</span>
-        </div>
-        <div class="trend-metric-score" :class="scoreClass(data.ema.score)">
-          {{ fmtSigned(data.ema.score) }}
-        </div>
-        <div class="muted trend-sub">最高贡献 ±{{ data.ema.max_score ?? emaWeightPct }}</div>
-        <div class="trend-metric-rows">
-          <div class="trend-kv"><span class="muted">当前价</span><span>{{ fmtPrice(data.price) }}</span></div>
-          <div class="trend-kv"><span class="muted">EMA</span><span>{{ fmtPrice(data.ema.value) }}</span></div>
-          <div class="trend-kv">
-            <span class="muted">偏离</span>
-            <span :class="scoreClass(data.ema.deviation_pct)">{{ fmtSigned(data.ema.deviation_pct, 3) }}%</span>
-          </div>
-          <div class="trend-kv"><span class="muted">满分偏离</span><span>{{ cfg.ema_full_scale_pct }}%</span></div>
-        </div>
-        <div class="trend-metric-note" :class="scoreClass(data.ema.score)">{{ positionLabel }}</div>
-      </div>
-
-      <div class="card card-pad trend-metric">
-        <div class="row between">
-          <strong>RSI({{ data.rsi.period }})</strong>
-          <span class="tag blue">权重 {{ rsiWeightPct }}%</span>
-        </div>
-        <div class="trend-metric-score" :class="scoreClass(data.rsi.score)">
-          {{ fmtSigned(data.rsi.score) }}
-        </div>
-        <div class="muted trend-sub">最高贡献 ±{{ data.rsi.max_score ?? rsiWeightPct }}</div>
-        <div class="trend-metric-rows">
-          <div class="trend-kv"><span class="muted">当前值</span><span>{{ data.rsi.value?.toFixed(2) ?? '—' }}</span></div>
-          <div class="trend-kv"><span class="muted">状态</span><span>{{ rsiStateLabel(data.rsi.state) }}</span></div>
-          <div class="trend-kv"><span class="muted">偏多 / 偏空</span><span>{{ cfg.rsi_bull }} / {{ cfg.rsi_bear }}</span></div>
-          <div class="trend-kv"><span class="muted">超买 / 超卖</span><span>{{ cfg.rsi_overbought }} / {{ cfg.rsi_oversold }}</span></div>
-        </div>
-        <div class="trend-metric-note muted">
-          {{ cfg.rsi_bear }}~{{ cfg.rsi_bull }} 为中性区，此区间内 RSI 不贡献得分
-        </div>
-      </div>
-    </div>
-
-    <!-- K 线与指标走势 -->
-    <div class="card card-pad trend-chart-card">
-      <div class="row between" style="margin-bottom: 8px">
-        <strong style="font-size: 13px">K 线与指标</strong>
-        <span class="muted trend-sub">
-          上：K 线 + EMA ｜ 下：RSI（虚线为超买超卖，点线为偏多偏空）
-        </span>
-      </div>
-      <div ref="chartEl" class="trend-chart"></div>
-      <p v-if="!data?.bars?.length" class="muted trend-hint">暂无 K 线数据。</p>
     </div>
   </div>
 </template>

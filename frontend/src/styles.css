@@ -168,6 +168,16 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
   font-weight: 600;
 }
 .btn-danger:hover { background: linear-gradient(135deg, #f87171 0%, #ef4444 100%); }
+.btn-success {
+  background: rgba(16, 185, 129, 0.14);
+  color: #34d399;
+  border: 1px solid rgba(16, 185, 129, 0.28);
+  font-weight: 600;
+}
+.btn-success:hover {
+  background: rgba(16, 185, 129, 0.22);
+  border-color: rgba(16, 185, 129, 0.42);
+}
 .btn-ghost {
   background: var(--glass);
   border: 1px solid var(--glass-border);
