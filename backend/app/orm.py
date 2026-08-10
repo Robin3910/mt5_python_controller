@@ -169,6 +169,8 @@ class NodeGroup(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     # sync（全员同步）/ poll（组内轮转，一个信号只由一个节点领取）
     dispatch_mode: Mapped[str] = mapped_column(String(8), default="sync")
+    # 趋势风控：开仓前按全局趋势参数对各节点算信号品种趋势，仅顺势放行（默认关）
+    trend_risk_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     # 一对一绑定 TradingStrategy；unique 保证同一策略不能挂到多个分组
     strategy_id: Mapped[str | None] = mapped_column(String(32), nullable=True, unique=True, index=True)
     remark: Mapped[str | None] = mapped_column(String(255), nullable=True)

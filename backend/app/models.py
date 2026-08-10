@@ -159,6 +159,8 @@ class GroupCreate(BaseModel):
     name: str = Field(min_length=1, max_length=64)
     enabled: bool = True
     dispatch_mode: str = "sync"  # sync / poll
+    # 趋势风控：开仓前按全局趋势参数对各节点算信号品种趋势（默认关）
+    trend_risk_enabled: bool = False
     remark: Optional[str] = None
     # 一对一绑定交易策略；空 / null = 不绑定
     strategy_id: Optional[str] = Field(default=None, max_length=32)
@@ -170,6 +172,7 @@ class GroupUpdate(BaseModel):
     name: Optional[str] = None
     enabled: Optional[bool] = None
     dispatch_mode: Optional[str] = None
+    trend_risk_enabled: Optional[bool] = None
     remark: Optional[str] = None
     # 传入空字符串或 null 表示解除绑定；省略字段则不改
     strategy_id: Optional[str] = Field(default=None, max_length=32)
@@ -182,6 +185,7 @@ class GroupOut(BaseModel):
     name: str
     enabled: bool = True
     dispatch_mode: str = "sync"
+    trend_risk_enabled: bool = False
     strategy_id: Optional[str] = None
     strategy_name: Optional[str] = None
     remark: Optional[str] = None

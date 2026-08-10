@@ -343,6 +343,8 @@ export interface GroupOut {
   name: string
   enabled: boolean
   dispatch_mode: GroupDispatchMode
+  /** 趋势风控：开仓前按全局趋势参数对各节点算信号品种趋势（默认关） */
+  trend_risk_enabled: boolean
   /** 一对一绑定的策略 ID；未绑定为 null */
   strategy_id?: string | null
   /** 绑定策略名称（展示用） */
@@ -363,6 +365,7 @@ export interface GroupCreatePayload {
   name: string
   enabled?: boolean
   dispatch_mode?: GroupDispatchMode
+  trend_risk_enabled?: boolean
   remark?: string | null
   /** 一对一绑定策略；空 / null = 不绑定 */
   strategy_id?: string | null
@@ -373,6 +376,7 @@ export interface GroupUpdatePayload {
   name?: string
   enabled?: boolean
   dispatch_mode?: GroupDispatchMode
+  trend_risk_enabled?: boolean
   remark?: string | null
   /** 传入空字符串或 null 表示解除绑定 */
   strategy_id?: string | null

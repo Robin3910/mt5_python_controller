@@ -29,6 +29,7 @@ def group_row_to_dict(row: NodeGroup, members: list[NodeGroupMember]) -> dict:
         "name": row.name,
         "enabled": row.enabled,
         "dispatch_mode": row.dispatch_mode,
+        "trend_risk_enabled": bool(getattr(row, "trend_risk_enabled", False)),
         "strategy_id": row.strategy_id,
         "remark": row.remark,
         "created_at": row.created_at.timestamp() if row.created_at else time.time(),
@@ -147,6 +148,7 @@ async def create_group(store: RedisStore, payload: GroupCreate) -> dict:
                 name=payload.name.strip(),
                 enabled=payload.enabled,
                 dispatch_mode=normalize_dispatch_mode(payload.dispatch_mode),
+                trend_risk_enabled=bool(payload.trend_risk_enabled),
                 strategy_id=strategy_id,
                 remark=(payload.remark or "").strip() or None,
             )
@@ -185,6 +187,8 @@ async def update_group(store: RedisStore, group_id: str, patch: GroupUpdate) -> 
             row.enabled = patch.enabled
         if patch.dispatch_mode is not None:
             row.dispatch_mode = normalize_dispatch_mode(patch.dispatch_mode)
+        if patch.trend_risk_enabled is not None:
+            row.trend_risk_enabled = bool(patch.trend_risk_enabled)
         if patch.remark is not None:
             row.remark = patch.remark.strip() or None
         if update_strategy:

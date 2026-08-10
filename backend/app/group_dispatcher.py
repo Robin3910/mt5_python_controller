@@ -27,7 +27,15 @@ import asyncio
 import logging
 from typing import Optional
 
-from . import group_persist, group_rules, persist, strategy_templates
+from . import (
+    group_persist,
+    group_rules,
+    market_probe,
+    persist,
+    strategy_templates,
+    system_settings,
+    trend_indicators,
+)
 from .config import Config
 from .connections import manager
 from .models import SIGNAL_MODEL_STRATEGY
@@ -562,6 +570,14 @@ class GroupDispatcher:
             return {"node_id": node_id, "status": "skipped", "magic": None,
                     "volume": volume, "reason": reason}
 
+        # 趋势风控：占位已抢到、建子任务前，按该节点终端行情做顺势门禁
+        if group.get("trend_risk_enabled"):
+            blocked = await self._trend_risk_block(
+                group_id, node_id, signal, base, volume,
+            )
+            if blocked is not None:
+                return blocked
+
         try:
             return await self._dispatch_locked_node(base, command)
         except Exception as e:  # noqa: BLE001
@@ -570,6 +586,59 @@ class GroupDispatcher:
             logger.warning("group %s node %s dispatch failed: %s", group_id, node_id, e)
             return {"node_id": node_id, "status": "offline", "magic": None,
                     "volume": volume, "reason": "下发失败：节点处理异常"}
+
+    async def _trend_risk_block(
+        self,
+        group_id: str,
+        node_id: str,
+        signal: TradingSignal,
+        base: dict,
+        volume: float,
+    ) -> Optional[dict]:
+        """开启趋势风控时：探针 + 判定；需拦截则释放占位并记 skipped，返回 outcome。
+
+        放行时返回 None，由调用方继续建子任务下发。
+        """
+        reason: Optional[str] = None
+        try:
+            cfg = await system_settings.get_trend_config()
+            market = await market_probe.fetch(
+                node_id,
+                str(signal.symbol or "").strip().upper(),
+                str(cfg["timeframe"]),
+                trend_indicators.bars_needed(cfg),
+            )
+            result = trend_indicators.evaluate(
+                market.get("bars") or [],
+                market_probe.quote_price(market.get("quote")),
+                cfg,
+            )
+            reason = group_rules.trend_risk_reject_reason(
+                signal.action,
+                str(result.get("trend") or ""),
+                ready=bool(result.get("ready")),
+                score=result.get("score"),
+            )
+        except market_probe.ProbeError as e:
+            reason = f"趋势风控：读取行情失败：{e}"
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "group %s node %s trend risk probe failed: %s", group_id, node_id, e,
+            )
+            reason = f"趋势风控：读取行情失败：{e}"
+
+        if not reason:
+            return None
+
+        await self.store.release_group_node_busy(group_id, node_id)
+        await group_persist.record_skipped_dispatch(
+            **base, status="skipped", skip_reason=reason,
+        )
+        logger.info("group %s node %s trend risk skip: %s", group_id, node_id, reason)
+        return {
+            "node_id": node_id, "status": "skipped", "magic": None,
+            "volume": volume, "reason": reason,
+        }
 
     async def _dispatch_locked_node(self, base: dict, command: dict) -> dict:
         """已持有组内节点占位后的下发：建子任务拿魔术号 -> 发命令。"""

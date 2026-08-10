@@ -268,3 +268,44 @@ def test_reconcile_rotation_from_empty_uses_member_order():
 )
 def test_aggregate_task_status(statuses, expected):
     assert group_rules.aggregate_task_status(statuses) == expected
+
+
+# =====================================================================
+# 趋势风控门禁（顺势放行 / fail-closed）
+# =====================================================================
+@pytest.mark.parametrize(
+    "action,verdict,ready,expect_block",
+    [
+        ("BUY", "bullish", True, False),
+        ("SELL", "bearish", True, False),
+        ("BUY", "bearish", True, True),
+        ("SELL", "bullish", True, True),
+        ("BUY", "neutral", True, True),
+        ("SELL", "neutral", True, True),
+        ("BUY", "unknown", True, True),
+        ("SELL", "unknown", True, True),
+        ("BUY", "bullish", False, True),   # ready=false 一律拦
+        ("SELL", "bearish", False, True),
+        ("CLOSE", "bearish", True, False),  # CLOSE 不参与
+        ("buy", "bullish", True, False),    # 大小写不敏感
+    ],
+)
+def test_trend_risk_reject_reason_gate(action, verdict, ready, expect_block):
+    reason = group_rules.trend_risk_reject_reason(
+        action, verdict, ready=ready, score=12.5,
+    )
+    if expect_block:
+        assert reason is not None
+        assert "趋势风控" in reason
+        assert action.upper() in reason or action == "CLOSE"
+    else:
+        assert reason is None
+
+
+def test_trend_risk_reject_reason_includes_score_and_label():
+    reason = group_rules.trend_risk_reject_reason(
+        "BUY", "bearish", ready=True, score=-35.2,
+    )
+    assert reason is not None
+    assert "空头" in reason
+    assert "-35.2" in reason

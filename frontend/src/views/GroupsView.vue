@@ -59,6 +59,9 @@ const FIELD_HELP = {
     '禁用后该分组不再接收任何 strategy 信号；已下发的历史任务不受影响。',
   dispatch_mode:
     '分组级分发模式，作用于整个分组、不区分币种：全员同步 = 组内所有有效节点并发下发；轮询轮转 = 一条信号只交给组内队首的一个有效节点，成功后该节点移到队尾。',
+  trend_risk:
+    '开启后，开仓信号进入各节点前会按「趋势面板」全局参数计算该节点上信号品种的趋势：' +
+    'BUY 仅多头放行、SELL 仅空头放行；中性、数据不足或行情读取失败一律拦截并记入子任务跳过原因。CLOSE 不受影响。默认关闭。',
   strategy:
     '一对一绑定交易策略。每个分组最多绑定一个策略，同一策略也不能挂到多个分组。' +
     '未绑定不影响分组本身的信号分发；可稍后在编辑中补绑或换绑。',
@@ -78,6 +81,7 @@ const form = reactive({
   name: '',
   enabled: true,
   dispatch_mode: 'sync' as GroupDispatchMode,
+  trend_risk_enabled: false,
   strategy_id: '' as string,
   remark: '',
   node_ids: [] as string[],
@@ -142,6 +146,7 @@ function openCreate(): void {
     name: '',
     enabled: true,
     dispatch_mode: 'sync' as GroupDispatchMode,
+    trend_risk_enabled: false,
     strategy_id: '',
     remark: '',
     node_ids: [],
@@ -158,6 +163,7 @@ function openEdit(g: GroupOut): void {
     name: g.name,
     enabled: g.enabled,
     dispatch_mode: g.dispatch_mode,
+    trend_risk_enabled: Boolean(g.trend_risk_enabled),
     strategy_id: g.strategy_id || '',
     remark: g.remark || '',
     node_ids: g.nodes.map((n) => n.node_id),
@@ -180,6 +186,7 @@ async function save(): Promise<void> {
       name,
       enabled: form.enabled,
       dispatch_mode: form.dispatch_mode,
+      trend_risk_enabled: form.trend_risk_enabled,
       strategy_id: strategyId,
       remark: form.remark.trim() || null,
       node_ids: form.node_ids,
@@ -190,6 +197,7 @@ async function save(): Promise<void> {
       || '未绑定'
     const summary =
       `分发模式：${DISPATCH_MODE_LABEL[form.dispatch_mode]}\n` +
+      `趋势风控：${form.trend_risk_enabled ? '开启' : '关闭'}\n` +
       `绑定策略：${styName}\n` +
       `成员节点：${form.node_ids.length} 个`
     const verb = formMode.value === 'create' ? '创建' : '更新'
@@ -612,6 +620,14 @@ function openActiveSignals(g: GroupOut): void {
           <span class="k">分发模式</span>
           <span class="v"><span class="tag blue">{{ DISPATCH_MODE_LABEL[g.dispatch_mode] }}</span></span>
         </div>
+        <div class="list-field">
+          <span class="k">趋势风控</span>
+          <span class="v">
+            <span class="tag" :class="g.trend_risk_enabled ? 'green' : ''">
+              {{ g.trend_risk_enabled ? '已开启' : '已关闭' }}
+            </span>
+          </span>
+        </div>
         <div class="list-field"><span class="k">成员节点</span><span class="v">{{ g.node_count }}</span></div>
         <div class="list-field"><span class="k">有效节点</span><span class="v">{{ g.online_node_count }}</span></div>
         <div class="list-field">
@@ -653,6 +669,7 @@ function openActiveSignals(g: GroupOut): void {
             <th>名称</th>
             <th>绑定策略</th>
             <th>分发模式</th>
+            <th>趋势风控</th>
             <th class="right">成员节点</th>
             <th class="right">有效节点</th>
             <th class="right">信号</th>
@@ -676,6 +693,11 @@ function openActiveSignals(g: GroupOut): void {
               <span v-else class="muted">未绑定</span>
             </td>
             <td><span class="tag blue">{{ DISPATCH_MODE_LABEL[g.dispatch_mode] }}</span></td>
+            <td>
+              <span class="tag" :class="g.trend_risk_enabled ? 'green' : ''">
+                {{ g.trend_risk_enabled ? '开启' : '关闭' }}
+              </span>
+            </td>
             <td class="right">{{ g.node_count }}</td>
             <td class="right" :class="g.online_node_count ? '' : 'muted'">{{ g.online_node_count }}</td>
             <td class="right">
@@ -754,6 +776,13 @@ function openActiveSignals(g: GroupOut): void {
               <select id="group-enabled" v-model="form.enabled">
                 <option :value="true">启用</option>
                 <option :value="false">禁用</option>
+              </select>
+            </div>
+            <div>
+              <FormLabel field-id="group-trend-risk" text="趋势风控" :help="FIELD_HELP.trend_risk" />
+              <select id="group-trend-risk" v-model="form.trend_risk_enabled">
+                <option :value="false">关闭</option>
+                <option :value="true">开启</option>
               </select>
             </div>
             <div class="span-full">

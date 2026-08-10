@@ -120,6 +120,7 @@ def test_create_group_response_shape(client):
     assert g["name"] == "黄金策略组"
     assert g["enabled"] is True
     assert g["dispatch_mode"] == "poll"
+    assert g["trend_risk_enabled"] is False  # 趋势风控默认关闭
     assert g["remark"] == "测试组"
     assert g["node_count"] == 1
     assert g["online_node_count"] == 0     # 节点尚未建立 WS 连接
@@ -1230,3 +1231,185 @@ def test_purge_trade_logs_clears_tables_keeps_config(client):
     # 操作本身写入审计
     audits = client.get("/api/audits", params={"page_size": 50}, headers=h).json()["items"]
     assert any(a["action"] == "purge_trade_logs" for a in audits)
+
+
+# =====================================================================
+# 7. 分组趋势风控
+# =====================================================================
+def _rising_bars(count: int = 200, start: float = 100.0, step: float = 1.0) -> list[dict]:
+    closes = [start + i * step for i in range(count)]
+    return [
+        {"time": 1_700_000_000 + i * 900, "open": c, "high": c + 0.5, "low": c - 0.5, "close": c}
+        for i, c in enumerate(closes)
+    ]
+
+
+def _falling_bars(count: int = 200, start: float = 300.0, step: float = 1.0) -> list[dict]:
+    closes = [start - i * step for i in range(count)]
+    return [
+        {"time": 1_700_000_000 + i * 900, "open": c, "high": c + 0.5, "low": c - 0.5, "close": c}
+        for i, c in enumerate(closes)
+    ]
+
+
+def _stub_probe(monkeypatch, *, bars=None, error: str | None = None) -> list[dict]:
+    """用固定 K 线替代向节点问行情；收集 fetch 参数便于断言。"""
+    from app import market_probe
+
+    market_probe.reset()
+    calls: list[dict] = []
+
+    async def fake_fetch(node_id, symbol, timeframe, count):
+        calls.append({
+            "node_id": node_id, "symbol": symbol,
+            "timeframe": timeframe, "count": count,
+        })
+        if error:
+            raise market_probe.ProbeError(error)
+        quote_mid = float((bars or [{}])[-1].get("close") or 100.0)
+        return {
+            "symbol": symbol, "timeframe": timeframe,
+            "bars": bars or [], "quote": {"mid": quote_mid},
+            "fetched_at": time.time(), "cached": False,
+        }
+
+    monkeypatch.setattr(market_probe, "fetch", fake_fetch)
+    return calls
+
+
+def test_patch_group_trend_risk_enabled(client):
+    h = auth_headers(client)
+    gid = _mk_group(client, h, name="趋势风控开关组", strategy_id=None)["group_id"]
+    assert client.get(f"/api/groups/{gid}", headers=h).json()["trend_risk_enabled"] is False
+
+    r = client.patch(f"/api/groups/{gid}", json={"trend_risk_enabled": True}, headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["trend_risk_enabled"] is True
+    assert client.get(f"/api/groups/{gid}", headers=h).json()["trend_risk_enabled"] is True
+
+
+def test_trend_risk_off_does_not_probe(client, monkeypatch):
+    """开关关闭时开仓不受趋势门禁影响，也不去问节点行情。"""
+    h = auth_headers(client)
+    token = _node_token(client, h)
+    n1 = _mk_node(client, h, 5301)
+    gid = _mk_group(
+        client, h, name="风控关闭组", node_ids=[n1], trend_risk_enabled=False,
+    )["group_id"]
+    calls = _stub_probe(monkeypatch, bars=_rising_bars())
+
+    with client.websocket_connect("/ws/node") as ws1:
+        ws1.send_json({"type": "auth", "data": {"token": token, "mt5_login": 5301}})
+        assert ws1.receive_json()["type"] == "auth_ok"
+        r = client.post("/webhook", json={
+            "action": "buy", "symbol": "XAUUSD", "volume": 0.1, "model": "strategy",
+        })
+        assert r.status_code == 200, r.text
+        assert ws1.receive_json()["cmd"] == "strategy_start"
+
+    assert calls == []
+    page = client.get(f"/api/groups/{gid}/signals", headers=h).json()
+    assert page["items"][0]["dispatches"][0]["status"] in ("sent", "opened", "running")
+
+
+def test_trend_risk_allows_buy_on_bullish(client, monkeypatch):
+    h = auth_headers(client)
+    token = _node_token(client, h)
+    n1 = _mk_node(client, h, 5302)
+    _mk_group(client, h, name="顺势放行组", node_ids=[n1], trend_risk_enabled=True)
+    calls = _stub_probe(monkeypatch, bars=_rising_bars())
+
+    with client.websocket_connect("/ws/node") as ws1:
+        ws1.send_json({"type": "auth", "data": {"token": token, "mt5_login": 5302}})
+        assert ws1.receive_json()["type"] == "auth_ok"
+        r = client.post("/webhook", json={
+            "action": "buy", "symbol": "XAUUSD", "volume": 0.1, "model": "strategy",
+        })
+        assert r.status_code == 200, r.text
+        assert ws1.receive_json()["cmd"] == "strategy_start"
+
+    assert len(calls) == 1
+    assert calls[0]["symbol"] == "XAUUSD"
+    assert calls[0]["node_id"]
+
+
+def test_trend_risk_blocks_buy_on_bearish(client, monkeypatch):
+    h = auth_headers(client)
+    token = _node_token(client, h)
+    n1 = _mk_node(client, h, 5303)
+    gid = _mk_group(
+        client, h, name="逆势拦截组", node_ids=[n1], trend_risk_enabled=True,
+    )["group_id"]
+    _stub_probe(monkeypatch, bars=_falling_bars())
+
+    with client.websocket_connect("/ws/node") as ws1:
+        ws1.send_json({"type": "auth", "data": {"token": token, "mt5_login": 5303}})
+        assert ws1.receive_json()["type"] == "auth_ok"
+        r = client.post("/webhook", json={
+            "action": "buy", "symbol": "XAUUSD", "volume": 0.1, "model": "strategy",
+        })
+        assert r.status_code == 200, r.text
+
+    page = client.get(f"/api/groups/{gid}/signals", headers=h).json()
+    assert page["total"] == 1
+    d = page["items"][0]["dispatches"][0]
+    assert d["status"] == "skipped"
+    assert "趋势风控" in (d.get("skip_reason") or "")
+    assert "BUY" in (d.get("skip_reason") or "")
+
+
+def test_trend_risk_blocks_on_probe_error(client, monkeypatch):
+    h = auth_headers(client)
+    token = _node_token(client, h)
+    n1 = _mk_node(client, h, 5304)
+    gid = _mk_group(
+        client, h, name="探针失败组", node_ids=[n1], trend_risk_enabled=True,
+    )["group_id"]
+    _stub_probe(monkeypatch, error="节点当前离线，无法读取行情")
+
+    with client.websocket_connect("/ws/node") as ws1:
+        ws1.send_json({"type": "auth", "data": {"token": token, "mt5_login": 5304}})
+        assert ws1.receive_json()["type"] == "auth_ok"
+        r = client.post("/webhook", json={
+            "action": "sell", "symbol": "XAUUSD", "volume": 0.1, "model": "strategy",
+        })
+        assert r.status_code == 200, r.text
+
+    d = client.get(f"/api/groups/{gid}/signals", headers=h).json()["items"][0]["dispatches"][0]
+    assert d["status"] == "skipped"
+    assert "读取行情失败" in (d.get("skip_reason") or "")
+
+
+def test_trend_risk_close_bypasses_gate(client, monkeypatch):
+    """CLOSE 绕过趋势风控：即使探针失败也能下发 strategy_stop。"""
+    h = auth_headers(client)
+    token = _node_token(client, h)
+    n1 = _mk_node(client, h, 5305)
+    gid = _mk_group(
+        client, h, name="CLOSE绕过组", node_ids=[n1], trend_risk_enabled=True,
+    )["group_id"]
+    # 开仓阶段顺势放行
+    _stub_probe(monkeypatch, bars=_rising_bars())
+
+    with client.websocket_connect("/ws/node") as ws1:
+        ws1.send_json({"type": "auth", "data": {"token": token, "mt5_login": 5305}})
+        assert ws1.receive_json()["type"] == "auth_ok"
+        client.post("/webhook", json={
+            "action": "buy", "symbol": "XAUUSD", "volume": 0.1, "model": "strategy",
+        })
+        start = ws1.receive_json()
+        assert start["cmd"] == "strategy_start"
+        ws1.send_json({"type": "trade_result", "data": {
+            "signal_id": start["signal_id"], "magic": start["magic"],
+            "symbol": "XAUUSD", "success": True, "order": 1,
+        }})
+        _wait_task_status(client, h, gid, "running")
+
+        # 之后探针一律失败：CLOSE 仍须能停
+        _stub_probe(monkeypatch, error="故意失败")
+        client.post("/webhook", json={
+            "action": "close", "symbol": "XAUUSD", "model": "strategy",
+        })
+        stop = ws1.receive_json()
+        assert stop["cmd"] == "strategy_stop"
+        assert stop["dispatch_id"] == start["dispatch_id"]

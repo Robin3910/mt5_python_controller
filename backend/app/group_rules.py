@@ -16,9 +16,16 @@ from __future__ import annotations
 
 from typing import Callable, Optional
 
-from . import strategy_templates
+from . import strategy_templates, trend_indicators
 from .config import Config
 from .models import GROUP_DISPATCH_MODES, SIGNAL_MODEL_NORMAL, SIGNAL_MODELS
+
+_TREND_VERDICT_LABELS = {
+    trend_indicators.TREND_BULLISH: "多头",
+    trend_indicators.TREND_BEARISH: "空头",
+    trend_indicators.TREND_NEUTRAL: "中性",
+    trend_indicators.TREND_UNKNOWN: "数据不足",
+}
 
 
 def normalize_signal_model(value: object) -> Optional[str]:
@@ -156,6 +163,51 @@ def group_skip_reason(group: dict, effective: list[str]) -> Optional[str]:
     if not effective:
         return f"分组无有效节点：{group.get('name') or group.get('group_id')}（成员均未启用或不在线）"
     return None
+
+
+def trend_verdict_label(verdict: str) -> str:
+    """趋势结论的中文标签（供 skip_reason / 日志展示）。"""
+    return _TREND_VERDICT_LABELS.get(str(verdict or "").strip().lower(), str(verdict or "未知"))
+
+
+def trend_risk_reject_reason(
+    action: str,
+    verdict: str,
+    *,
+    ready: bool,
+    score: float | None = None,
+) -> Optional[str]:
+    """趋势风控门禁：顺势才放行；返回拦截原因，放行时返回 None。
+
+    口径（分组开关开启时）：
+    - BUY 仅多头放行，SELL 仅空头放行；
+    - 中性 / 数据不足 / ready=false 一律拦截；
+    - CLOSE 与其它非开仓动作不参与判定（返回 None）。
+    """
+    act = str(action or "").strip().upper()
+    if act not in ("BUY", "SELL"):
+        return None
+
+    score_part = ""
+    if score is not None:
+        try:
+            score_part = f"（得分 {float(score):+.1f}）"
+        except (TypeError, ValueError):
+            score_part = ""
+
+    if not ready:
+        return f"趋势风控：信号 {act}，当前趋势为数据不足{score_part}，已拦截"
+
+    v = str(verdict or "").strip().lower()
+    if v == trend_indicators.TREND_UNKNOWN or not v:
+        return f"趋势风控：信号 {act}，当前趋势为数据不足{score_part}，已拦截"
+
+    label = trend_verdict_label(v)
+    if act == "BUY" and v == trend_indicators.TREND_BULLISH:
+        return None
+    if act == "SELL" and v == trend_indicators.TREND_BEARISH:
+        return None
+    return f"趋势风控：信号 {act}，当前趋势为{label}{score_part}，已拦截"
 
 
 def reconcile_rotation(order: list[str], participants: list[str]) -> list[str]:
