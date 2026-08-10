@@ -1,8 +1,8 @@
 # Webhook 入参文档
 
-> **最后更新：2026-08-04 15:30**
+> **最后更新：2026-08-10**（对齐 v0.6.7：策略响应形态、分组趋势风控、品种拒收范围）
 
-TradingView → MT5 跟单系统的信号接收接口说明。本文档描述的是**代码的真实行为**（以 `backend/app/webhook.py` + `backend/app/parser.py` + `backend/app/config.py` 为准），而非 README 的宣传性描述。
+TradingView → MT5 跟单系统的信号接收接口说明。本文档描述的是**代码的真实行为**（以 `backend/app/webhook.py` + `backend/app/parser.py` + `backend/app/config.py` + `backend/app/group_dispatcher.py` 为准），而非 README 的宣传性描述。
 
 ---
 
@@ -132,9 +132,11 @@ TradingView → MT5 跟单系统的信号接收接口说明。本文档描述的
 
 ### 4.5 策略信号（`model=strategy`）
 
-带 `"model": "strategy"` 的信号走**分组分发**链路（`group_dispatcher.py`），与默认的按币种分发完全隔离：不读中控台品种配置，不做区间方向 / 持仓过滤，也不读节点的按币种手数策略。
+带 `"model": "strategy"` 的信号走**分组分发**链路（`group_dispatcher.py`），与默认的按币种分发完全隔离：不读中控台品种配置（**不走 §9.3 的「品种未登记 / 已禁用」拒收**），不做区间方向 / 持仓过滤，也不读节点的按币种手数策略。
 
 入选条件是「分组已启用 + 绑定了启用中的策略 + 策略绑定品种与信号品种一致」，信号带 `template_ids` / `group_ids` 时再加一层定向（见下）。命中的每个分组各自下发一条 `strategy_start` 给组内有效节点（已启用 + 在线），由节点按策略规则托管到持仓全平；`CLOSE` 信号则是终止指令，平掉对应魔术号的全部持仓。
+
+可选的**分组趋势风控**（管理端「分组」页按组开启，默认关）：开启后，开仓信号在该节点抢到占位、建子任务前，会按「趋势面板」**全局参数**读取该节点终端行情并算趋势——`BUY` 仅多头放行、`SELL` 仅空头放行；中性、数据不足或行情读取失败一律拦截，子任务记为 `skipped` 并写中文 `skip_reason`。`CLOSE` / 停策略**绕过**该门禁。组内 `poll` 模式下被拦节点会顺延下一节点。Webhook 本身无额外字段；是否拦截取决于分组配置，不写进信号体。
 
 策略实例基于**策略模版**创建，不同模版对信号的要求不同：
 
@@ -305,12 +307,15 @@ SYMBOL=GBPUSD long LOT=0.1
 
 ## 9. 响应格式
 
-### 9.1 接收成功 `200`
+成功 / 拒收 / 去重响应都会带 `model`（`normal` 或 `strategy`），表示本条信号走的是哪条分发链路。`mode` 的取值因链路而异，不要用 normal 的 `sync`/`poll`/`close` 去解读 strategy 响应。
+
+### 9.1 接收成功 `200`（`model=normal`）
 
 ```json
 {
   "status": "accepted",
   "signal_id": "sig_18f...",
+  "model": "normal",
   "action": "BUY",
   "symbol": "EURUSD",
   "volume": 0.1,
@@ -322,20 +327,61 @@ SYMBOL=GBPUSD long LOT=0.1
 - `mode`：`sync`（全员同步）/ `poll`（轮询轮转）/ `close`（平仓广播）。
 - `targets`：`sync`/`close` 为本次命中的在线节点数；`poll` 为参与该品种轮转的候选节点数（实际只会由其中 1 个节点领取消费）。
 
+### 9.1.1 接收成功 `200`（`model=strategy`）
+
+策略开仓分发成功时顶层 `mode` 固定为 `group`（不是组内的 `sync`/`poll`）；组内分发模式写在 `tasks[].dispatch_mode`：
+
+```json
+{
+  "status": "accepted",
+  "signal_id": "sig_18f...",
+  "model": "strategy",
+  "action": "BUY",
+  "symbol": "XAUUSD",
+  "volume": 0.1,
+  "mode": "group",
+  "groups": 1,
+  "targets": 2,
+  "tasks": [
+    {
+      "group_id": "grp_3f2a9c1b8d7e6054",
+      "group_name": "金网格组",
+      "dispatch_mode": "sync",
+      "task_id": 42,
+      "targets": 2,
+      "status": "dispatching",
+      "reason": null
+    }
+  ]
+}
+```
+
+- `groups`：本次实际处理的分组数（每组一条主任务摘要）。
+- `targets`：各分组 `tasks[].targets` 之和（成功下发到节点的次数合计）。
+- `tasks[].status` 常见值：`dispatching`（已下发）/ `skipped`（组内无有效节点、节点均忙等）/ `failed`（主任务创建失败或连接不可用等）。
+- 开启了分组趋势风控时，被拦节点记为子任务 `skipped`（中文 `skip_reason`）；Webhook 顶层仍可能是 `accepted`（其它节点或其它分组已发出），需在分组信号页核对。
+
+策略 `CLOSE` 终止成功时顶层 `mode` 为 `group_close`，结构同样含 `groups` / `targets` / `tasks`（任务侧多为 `closing`）。
+
+无匹配分组（开仓）或无匹配活动子任务（CLOSE）时返回 §9.3.1 的 `rejected`，而不是本节的 `accepted`。
+
 ### 9.2 重复信号 `200`（被去重抑制）
 
 ```json
-{"status": "duplicate", "action": "BUY", "symbol": "EURUSD"}
+{"status": "duplicate", "model": "normal", "action": "BUY", "symbol": "EURUSD"}
 ```
 
-### 9.3 品种未登记 / 已禁用 `200`（拒收，不分发）
+### 9.3 品种未登记 / 已禁用 `200`（拒收，**仅 `model=normal`**）
 
-解析成功，但 `symbol` **未在中控台**（`GET/PUT /api/config/filters`）登记，或已登记但 **`enabled=false`**（取消「启用」）时返回；开仓与平仓（CLOSE）均拒收（后台手动平仓不受影响）：
+**仅按币种链路**会做此校验。解析成功，但 `symbol` **未在中控台**（`GET/PUT /api/config/filters`）登记，或已登记但 **`enabled=false`**（取消「启用」）时返回；开仓与平仓（CLOSE）均拒收（后台手动平仓不受影响）。
+
+`model=strategy` **不读**中控台品种清单：未登记的品种只要有匹配分组仍可分发；策略侧的拒收见 §9.3.1。
 
 ```json
 {
   "status": "rejected",
   "signal_id": "sig_18f...",
+  "model": "normal",
   "action": "BUY",
   "symbol": "EURUSD",
   "volume": 0.1,
@@ -349,6 +395,28 @@ SYMBOL=GBPUSD long LOT=0.1
 
 - HTTP 仍为 `200`（与 `duplicate` 相同）；TradingView 若只校验 2xx 会显示投递成功，需在管理端核对。
 - 处理：Web「中控台」→ 添加该品种并勾选「启用」→ 保存过滤规则。
+
+### 9.3.1 策略无匹配 `200`（拒收，`model=strategy`）
+
+开仓找不到入选分组，或 CLOSE 找不到匹配的活动子任务时：
+
+```json
+{
+  "status": "rejected",
+  "signal_id": "sig_18f...",
+  "model": "strategy",
+  "action": "BUY",
+  "symbol": "XAUUSD",
+  "volume": 0.1,
+  "mode": "rejected",
+  "targets": 0,
+  "groups": 0,
+  "reason": "无匹配分组：…",
+  "tasks": []
+}
+```
+
+`reason` 会串联落选说明（如指定分组不存在、模版定向未命中、模版2 缺 `sl`、模版3 方向不相容等）。HTTP 仍为 `200`。
 
 ### 9.4 持久化与查询（v0.4）
 
@@ -366,6 +434,7 @@ SYMBOL=GBPUSD long LOT=0.1
 | `400` | `{"detail":"unknown template_ids: ..."}` | `template_ids` 里有未登记的模版 ID（见 §4.5；`group_ids` 不做此校验） |
 | `401` | `{"detail":"invalid token"}` | 开启鉴权且 token 不匹配 |
 | `403` | `{"detail":"ip not allowed"}` | 开启白名单且来源 IP 不在名单 |
+| `503` | `{"detail":"service not ready"}` | `model=strategy` 但分组分发引擎尚未就绪（进程启动中等短暂状态） |
 
 > 关于 `invalid signal`：解析器自身已经保证 `action`/`symbol` 非空、`volume` 回退到 `DEFAULT_LOT`（>0）、`sl`/`tp` 只会是 `None` 或正数。因此**只要 `DEFAULT_LOT>0`（默认 0.1），解析器产出的信号必然通过校验**，这条 400 实际是一道安全网（仅当把 `DEFAULT_LOT` 配成 0 之类的极端情况才可能命中）。
 
@@ -411,8 +480,8 @@ SYMBOL=GBPUSD long LOT=0.1
 | `{"action":"buy","symbol":"XAUUSD","group_ids":["grp_..."]}`（漏写 `model`） | ❌ `400` | 同上 |
 | `{"model":"strategy","action":"buy","symbol":"XAUUSD","template_ids":["tpl_3"]}`（无 tpl_3 分组） | ⚠️ `status: rejected` | 模版定向没命中任何分组，落选原因写进信号记录（见 §4.5） |
 | `{"model":"strategy","action":"buy","symbol":"XAUUSD","group_ids":["grp_已删除"]}` | ⚠️ `status: rejected` | 分组不存在不算 400，原因写成「指定的分组不存在」（见 §4.5） |
-| `{"action":"buy","symbol":"NZDUSD"}`（中控台未登记 NZDUSD） | ⚠️ `status: rejected` | 解析成功但品种未在中控台登记，不分发（见 §9.3） |
-| `{"action":"close","symbol":"EURUSD"}`（中控台已取消启用 EURUSD） | ⚠️ `status: rejected` | 品种已禁用，开仓/平仓均不分发（见 §9.3；手动平仓除外） |
+| `{"action":"buy","symbol":"NZDUSD"}`（中控台未登记 NZDUSD） | ⚠️ `status: rejected` | **仅 `model=normal`**：解析成功但品种未在中控台登记，不分发（见 §9.3） |
+| `{"action":"close","symbol":"EURUSD"}`（中控台已取消启用 EURUSD） | ⚠️ `status: rejected` | **仅 `model=normal`**：品种已禁用，开仓/平仓均不分发（见 §9.3；手动平仓除外） |
 
 ---
 
@@ -483,11 +552,12 @@ curl -X POST http://localhost:8000/webhook \
 
 ---
 
-> 行为基准：`backend/app/webhook.py`（鉴权/去重/响应/**raw_payload 持久化**）、`backend/app/parser.py`（解析）、`backend/app/config.py`（品种与关键字）、`backend/app/settings.py`（环境变量）、`backend/app/persist.py`（`recent_webhook_events`）。
+> 行为基准：`backend/app/webhook.py`（鉴权/去重/响应/**raw_payload 持久化**）、`backend/app/parser.py`（解析）、`backend/app/config.py`（品种与关键字）、`backend/app/settings.py`（环境变量）、`backend/app/persist.py`（`recent_webhook_events`）、`backend/app/group_dispatcher.py`（`model=strategy` 分发与趋势风控挂点）。
 >
 > 全场景回归测试：
 > - `backend/tests/test_parser.py` —— 纯解析层（动作/品种/手数/止盈止损/`allow_position` 精确规则/`template_ids` 与 `group_ids` 归一化/文本模式坑位/格式三回退/校验规则）。
 > - `backend/tests/test_webhook.py` —— HTTP 端到端（token 4 种传入方式、IP 白名单与 `X-Forwarded-For`、白名单→鉴权→解析的顺序、三种请求体形态、去重、**未登记品种 rejected**、定向字段校验、各类 400/401/403、响应字段）。
+> - `backend/tests/test_group_dispatch.py` —— 策略链路分发、模版准入、定向落选、趋势风控跳过等。
 > - `backend/tests/test_api.py` —— 含 webhook→分发→节点回报的全链路冒烟，以及 **`GET /api/events/signals`** 分页与 `raw_payload` 断言。
 >
-> 运行：`cd backend && python -m pytest tests/test_parser.py tests/test_webhook.py -q`
+> 运行：`cd backend && python -m pytest tests/test_parser.py tests/test_webhook.py tests/test_group_dispatch.py -q`
