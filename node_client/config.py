@@ -43,6 +43,10 @@ class NodeSettings(BaseSettings):
 
     log_level: str = "INFO"
 
+    # 本机运维面板状态口（仅 loopback；PORT=0 关闭）
+    local_status_host: str = "127.0.0.1"
+    local_status_port: int = 0
+
     @property
     def watchlist(self) -> list[str]:
         """逗号分隔 -> 列表。"""

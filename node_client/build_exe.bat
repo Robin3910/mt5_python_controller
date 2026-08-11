@@ -45,10 +45,14 @@ if not exist "%OUT%\.env" (
     echo Keeping existing %OUT%\.env
 )
 
+python -c "from version import VERSION; open('version.txt','w',encoding='utf-8').write(VERSION+chr(10))"
+copy /Y version.txt "%OUT%\version.txt"
+
 echo.
 echo Build successful.
 echo   Executable: %EXE%
 echo   Config:     %OUT%\.env
+echo   Version:    %OUT%\version.txt
 echo.
 echo Place .env next to the exe and run:
 echo   cd %OUT%

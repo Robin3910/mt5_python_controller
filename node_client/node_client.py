@@ -17,6 +17,7 @@
 import asyncio
 import json
 import logging
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -24,9 +25,11 @@ import websockets
 
 import account_risk
 from config import get_settings
+from local_status import LocalStatusServer
 from market_hub import MarketHub
 from mt5_prompt import prompt_mt5_credentials
 from strategy_runner import StrategyRunner
+from version import get_version
 
 settings = get_settings()
 logging.basicConfig(
@@ -105,6 +108,12 @@ class NodeClient:
         # 否则风控清仓与策略收口会并发对同一批持仓发单，后到的那笔必被拒
         self._mt5_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mt5")
         self._stop = False
+        self.started_at = time.time()
+        self.node_id: int | None = None
+        self.ws_connected = False
+        self.ws_state = "starting"  # starting|connecting|authenticated|reconnecting|stopping
+        self._current_ws = None
+        self._status_server: LocalStatusServer | None = None
         # 中控台全局 filters 品种（auth_ok / watch_symbols 下发），与本地 WATCH_SYMBOLS 合并取价
         self.hub_symbols: set[str] = set()
         # 账户级风控配置（auth_ok / risk_config 下发），节点本地监控执行
@@ -118,14 +127,47 @@ class NodeClient:
         # 策略监控的事件源：全节点共用一个采样器，MT5 调用次数与任务数无关
         self.hub: MarketHub | None = None
 
+    def status_snapshot(self) -> dict:
+        """本机 /health|/status 用的只读快照。"""
+        return {
+            "ok": True,
+            "process": "alive",
+            "pid": os.getpid(),
+            "version": get_version(),
+            "ws_state": self.ws_state,
+            "ws_connected": self.ws_connected,
+            "uptime_s": round(time.time() - self.started_at, 1),
+            "node_id": self.node_id,
+            "mt5_login": self.expected_mt5_login,
+            "runners": [r.status_dict() for r in self.runners.values()],
+        }
+
+    def request_shutdown(self) -> None:
+        """面板 POST /stop：置停止标志并关闭当前 WS，使主循环退出。"""
+        self.ws_state = "stopping"
+        self._stop = True
+        ws = self._current_ws
+        if ws is not None and self.loop is not None:
+            self.loop.create_task(ws.close())
+
     async def run(self) -> None:
         """主入口：先连 MT5，再进入“连接-鉴权-服务”的自动重连循环。"""
         self.loop = asyncio.get_running_loop()
         await self._connect_mt5()
         self._ensure_hub()
+        self._status_server = LocalStatusServer(
+            host=settings.local_status_host,
+            port=settings.local_status_port,
+            status_provider=self.status_snapshot,
+            on_stop=self.request_shutdown,
+        )
         try:
+            await self._status_server.start()
             await self._connect_loop()
         finally:
+            if self._status_server is not None:
+                await self._status_server.close()
+                self._status_server = None
             if self.hub is not None:
                 await self.hub.close()
                 self.hub = None
@@ -135,16 +177,19 @@ class NodeClient:
     async def _connect_loop(self) -> None:
         backoff = settings.reconnect_min
         while not self._stop:
+            self.ws_state = "connecting" if self.ws_state != "reconnecting" else "reconnecting"
             try:
                 async with websockets.connect(
                     settings.manager_ws_url, ping_interval=20, ping_timeout=20, max_queue=128
                 ) as ws:
+                    self._current_ws = ws
                     if not await self._authenticate(ws):
                         # 鉴权/登录被拒绝：退避后重试（如重复登录，待对端下线后可接入）
                         await asyncio.sleep(backoff)
                         backoff = min(backoff * 2, settings.reconnect_max)
                         continue
                     backoff = settings.reconnect_min  # 鉴权成功，重置退避
+                    self.ws_state = "authenticated"
                     await self._serve(ws)
             except LoginMismatchError as e:
                 logger.error("%s", e)
@@ -152,8 +197,12 @@ class NodeClient:
                 backoff = min(backoff * 2, settings.reconnect_max)
             except Exception as e:  # noqa: BLE001
                 logger.warning("ws connection error: %s", e)
+            finally:
+                self._current_ws = None
+                self.ws_connected = False
             if self._stop:
                 break
+            self.ws_state = "reconnecting"
             # 断线后指数退避重连
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, settings.reconnect_max)
@@ -272,6 +321,11 @@ class NodeClient:
             return False
         if msg.get("type") == "auth_ok":
             data = msg.get("data") or {}
+            raw_id = data.get("node_id")
+            try:
+                self.node_id = int(raw_id) if raw_id is not None else None
+            except (TypeError, ValueError):
+                self.node_id = None
             logger.info("authenticated as node %s", data.get("node_id"))
             self.apply_hub_symbols(data.get("watch_symbols"))
             self.apply_risk_config(data.get("risk"))
@@ -301,6 +355,7 @@ class NodeClient:
 
     async def _serve(self, ws) -> None:
         """并发跑三个任务；任一退出(通常是断线)即取消其余，触发外层重连。"""
+        self.ws_connected = True
         tasks = [
             asyncio.create_task(self._reporter(ws)),
             asyncio.create_task(self._heartbeat(ws)),
@@ -315,6 +370,7 @@ class NodeClient:
                 if isinstance(exc, LoginMismatchError):
                     raise exc
         finally:
+            self.ws_connected = False
             for t in tasks:
                 t.cancel()
             self._cancel_runners()
@@ -753,6 +809,7 @@ class NodeClient:
 
 
 async def main() -> None:
+    logger.info("node_client version %s", get_version())
     try:
         creds = prompt_mt5_credentials()
     except FileNotFoundError as e:

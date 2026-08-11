@@ -17,6 +17,11 @@ node_client/.env
 node_client/dist/
 node_client/build/
 node_client/__pycache__/
+nodel_client_dashboard/dist/
+nodel_client_dashboard/build/
+nodel_client_dashboard/logs/
+nodel_client_dashboard/instances.json
+nodel_client_dashboard/.dashboard.lock
 .vscode/
 .opencode/
 docs/

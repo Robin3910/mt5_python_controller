@@ -213,6 +213,28 @@ class StrategyRunner:
     def done(self) -> bool:
         return self._task is None or self._task.done()
 
+    def status_dict(self) -> dict:
+        """供本机 /status 只读快照；不触发交易逻辑。"""
+        return {
+            "task_id": self.task_id,
+            "magic": self.magic,
+            "group_id": self.group_id,
+            "signal_id": self.signal_id,
+            "symbol": self.symbol,
+            "direction": self.direction,
+            "mode": self._mode,
+            "stopping": self._stopping,
+            "finished": self._finished,
+            "grid_detached": self._grid_detached,
+            "opened": self._opened,
+            "add_count": self.add_count,
+            "total_orders": self.total_orders,
+            "total_volume": self.total_volume,
+            "done": self.done,
+            "started_at": self._started_at,
+            "template_id": str((self.strategy or {}).get("template_id") or ""),
+        }
+
     # ------------------------------------------------------------------
     # 事件循环
     # ------------------------------------------------------------------

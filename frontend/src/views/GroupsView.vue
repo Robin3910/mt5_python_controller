@@ -232,6 +232,19 @@ async function toggleEnabled(g: GroupOut): Promise<void> {
   await hub.updateGroup(g.group_id, { enabled: !g.enabled }, currentSearchOptions())
 }
 
+async function toggleTrendRisk(g: GroupOut): Promise<void> {
+  const next = g.trend_risk_enabled ? '关闭' : '开启'
+  const effect = g.trend_risk_enabled
+    ? '开仓信号不再按趋势面板全局参数拦截'
+    : '开仓信号将按趋势面板全局参数对各节点算趋势：BUY 仅多头放行、SELL 仅空头放行；中性/数据不足/行情失败一律拦截。CLOSE 不受影响'
+  if (!(await confirmAction(`确认${next}分组「${g.name}」的趋势风控？\n\n${next}后：${effect}。`))) return
+  await hub.updateGroup(
+    g.group_id,
+    { trend_risk_enabled: !g.trend_risk_enabled },
+    currentSearchOptions(),
+  )
+}
+
 async function remove(g: GroupOut): Promise<void> {
   if (!(await confirmAction(`确认删除分组「${g.name}」？\n\n该操作不可恢复（历史信号任务记录会保留）。`, '确认删除'))) return
   await hub.deleteGroup(g.group_id, currentSearchOptions())
@@ -696,9 +709,14 @@ async function onStrategyFormSaved(): Promise<void> {
         <div class="list-field">
           <span class="k">趋势风控</span>
           <span class="v">
-            <span class="tag" :class="g.trend_risk_enabled ? 'green' : ''">
+            <button
+              class="btn-sm"
+              :class="g.trend_risk_enabled ? 'btn-success' : 'btn-danger'"
+              :title="FIELD_HELP.trend_risk"
+              @click="toggleTrendRisk(g)"
+            >
               {{ g.trend_risk_enabled ? '已开启' : '已关闭' }}
-            </span>
+            </button>
           </span>
         </div>
         <div v-if="g.strategy_id" class="list-field">
@@ -774,9 +792,14 @@ async function onStrategyFormSaved(): Promise<void> {
             </td>
             <td><span class="tag blue">{{ DISPATCH_MODE_LABEL[g.dispatch_mode] }}</span></td>
             <td>
-              <span class="tag" :class="g.trend_risk_enabled ? 'green' : ''">
+              <button
+                class="btn-sm"
+                :class="g.trend_risk_enabled ? 'btn-success' : 'btn-danger'"
+                :title="FIELD_HELP.trend_risk"
+                @click="toggleTrendRisk(g)"
+              >
                 {{ g.trend_risk_enabled ? '开启' : '关闭' }}
-              </span>
+              </button>
             </td>
             <td>
               <button
