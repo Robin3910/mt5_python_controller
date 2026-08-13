@@ -232,10 +232,13 @@ class ConnectionConfigDialog(ctk.CTkToplevel):
         def worker():
             try:
                 data = vs.fetch_current_version(target)
+            # 必须先取出消息：except 块结束时 e 会被解绑，延迟执行的 lambda 里读不到它
             except vs.VersionServiceError as e:
-                self.after(0, lambda: self.status.configure(text=str(e), text_color=DANGER))
+                msg = str(e)
+                self.after(0, lambda: self.status.configure(text=msg, text_color=DANGER))
             except Exception as e:  # noqa: BLE001
-                self.after(0, lambda: messagebox.showerror("测试连接", str(e), parent=self))
+                msg = str(e)
+                self.after(0, lambda: messagebox.showerror("测试连接", msg, parent=self))
             else:
                 def done():
                     if data:

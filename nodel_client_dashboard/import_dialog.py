@@ -298,10 +298,13 @@ class ImportNodeDialog(ctk.CTkToplevel):
         def worker():
             try:
                 fn()
+            # 必须先取出消息：except 块结束时 e 会被解绑，延迟执行的 lambda 里读不到它
             except vs.VersionServiceError as e:
-                self.after(0, lambda: self.status.configure(text=str(e), text_color=DANGER))
+                msg = str(e)
+                self.after(0, lambda: self.status.configure(text=msg, text_color=DANGER))
             except Exception as e:  # noqa: BLE001
-                self.after(0, lambda: messagebox.showerror(label, str(e), parent=self))
+                msg = str(e)
+                self.after(0, lambda: messagebox.showerror(label, msg, parent=self))
             finally:
                 self.after(0, lambda: setattr(self, "_busy", False))
 

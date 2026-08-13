@@ -1083,7 +1083,9 @@ class DashboardApp(ctk.CTk):
             try:
                 fn()
             except Exception as e:  # noqa: BLE001
-                self.after(0, lambda: messagebox.showerror(label, str(e)))
+                # 必须先取出消息：except 块结束时 e 会被解绑，延迟执行的 lambda 里读不到它
+                msg = str(e)
+                self.after(0, lambda: messagebox.showerror(label, msg))
             finally:
                 self.after(0, self._safe_refresh)
 

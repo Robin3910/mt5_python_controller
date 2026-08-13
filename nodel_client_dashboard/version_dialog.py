@@ -292,10 +292,13 @@ class VersionUpdateDialog(ctk.CTkToplevel):
         def worker():
             try:
                 fn()
+            # 必须先取出消息：except 块结束时 e 会被解绑，延迟执行的 lambda 里读不到它
             except vs.VersionServiceError as e:
-                self.after(0, lambda: self.status.configure(text=str(e), text_color=DANGER))
+                msg = str(e)
+                self.after(0, lambda: self.status.configure(text=msg, text_color=DANGER))
             except Exception as e:  # noqa: BLE001
-                self.after(0, lambda: messagebox.showerror(label, str(e), parent=self))
+                msg = str(e)
+                self.after(0, lambda: messagebox.showerror(label, msg, parent=self))
             finally:
                 self.after(0, lambda: self._set_busy(False))
                 self.after(0, self._refresh_rows)
@@ -396,24 +399,33 @@ class VersionUpdateDialog(ctk.CTkToplevel):
         )
 
     def _update_to_specific(self) -> None:
-        """更新到手工指定的版本号（服务端已上传即可，不必是当前发布版本）。"""
+        """从后端可下载版本清单里挑一个目标版本（不必是当前发布版本）。"""
         rows = self._selected_rows()
         if not rows:
             messagebox.showinfo("提示", "请先勾选要更新的实例", parent=self)
-            return
-        dlg = ctk.CTkInputDialog(text="输入目标版本号（例如 1.1.0）", title="更新到指定版本")
-        version = (dlg.get_input() or "").strip().lstrip("vV")
-        if not version:
-            return
-        if not self._precheck(rows, version, "更新"):
             return
         target = self._target()
         if not target.ready:
             messagebox.showinfo("提示", "尚未配置后端地址或节点令牌", parent=self)
             return
-        # 指定版本的校验和不在手上（未必是当前发布版本），跳过完整性校验
+
+        from version_picker import VersionPickerDialog
+
+        picker = VersionPickerDialog(self, target)
+        self.wait_window(picker)
+        # 子窗口的 grab_set 顶掉了本窗口的，关掉它之后要把输入权收回来
+        try:
+            self.grab_set()
+        except tk.TclError:
+            pass
+
+        version, sha = picker.selected, picker.selected_sha256
+        if not version:
+            return
+        if not self._precheck(rows, version, "更新"):
+            return
         self._run_async(
-            "更新", lambda: self._download_and_apply(target, version, "", rows, "指定版本更新结果")
+            "更新", lambda: self._download_and_apply(target, version, sha, rows, "指定版本更新结果")
         )
 
     def _precheck(self, rows: list[_Row], version: str, action: str) -> bool:
