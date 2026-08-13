@@ -409,17 +409,9 @@ class VersionUpdateDialog(ctk.CTkToplevel):
             messagebox.showinfo("提示", "尚未配置后端地址或节点令牌", parent=self)
             return
 
-        from version_picker import VersionPickerDialog
+        from version_picker import ask_backend_version
 
-        picker = VersionPickerDialog(self, target)
-        self.wait_window(picker)
-        # 子窗口的 grab_set 顶掉了本窗口的，关掉它之后要把输入权收回来
-        try:
-            self.grab_set()
-        except tk.TclError:
-            pass
-
-        version, sha = picker.selected, picker.selected_sha256
+        version, sha = ask_backend_version(self, target)
         if not version:
             return
         if not self._precheck(rows, version, "更新"):
@@ -483,16 +475,11 @@ class VersionUpdateDialog(ctk.CTkToplevel):
             )
             return
 
-        options = sorted(common, reverse=True)
-        dlg = ctk.CTkInputDialog(
-            text=f"输入要回滚到的版本号：\n\n可用备份：{', '.join(options)}",
-            title="回滚到本机备份",
-        )
-        version = (dlg.get_input() or "").strip().lstrip("vV")
+        from version_picker import ask_local_backup
+
+        # 候选项就是各实例的共同备份，选出来的必然可用，不必再校验一遍
+        version = ask_local_backup(self, sorted(common, reverse=True))
         if not version:
-            return
-        if version not in common:
-            messagebox.showerror("版本不可用", f"所选实例没有版本 {version} 的共同备份", parent=self)
             return
 
         lines = [f"将把以下 {len(rows)} 个实例回滚到本机备份 v{version}：", ""]
