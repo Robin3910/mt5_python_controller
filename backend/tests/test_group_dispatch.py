@@ -367,6 +367,77 @@ async def test_risk_sized_signal_without_stop_loss_is_rejected(store, monkeypatc
     assert await fetch_tasks("sig_risk_nosl") == []
 
 
+async def test_limit_entry_carries_entry_price_to_node(store, monkeypatch):
+    """限价开仓的挂单价只能来自信号，必须一路透到下发命令里，节点才知道挂在哪。"""
+    await online(store, mk_node("nd_a"))
+    await mk_risk_sized_group(store, "限价组", ["nd_a"], entry_mode="limit")
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+
+    res = await GroupDispatcher(store).dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1,
+                      stop_loss=2380.0, entry_price=2390.0),
+        "sig_limit_ok",
+    )
+
+    assert res["mode"] == "group"
+    cmd = sent[0][1]
+    assert cmd["entry"]["entry_price"] == 2390.0
+    assert cmd["entry"]["stop_loss"] == 2380.0
+    assert cmd["strategy"]["rules"][0]["entry_mode"] == "limit"
+
+
+async def test_limit_entry_rejected_without_entry_price(store, monkeypatch):
+    """限价策略缺入场价：分发前挡下，不必让节点收到命令后再失败一次。"""
+    await online(store, mk_node("nd_a"))
+    await mk_risk_sized_group(store, "限价缺价组", ["nd_a"], entry_mode="limit")
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+
+    res = await GroupDispatcher(store).dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1, stop_loss=2380.0),
+        "sig_limit_noprice",
+    )
+
+    assert res["mode"] == "rejected"
+    assert "入场价" in res["reason"]
+    assert sent == []
+
+
+async def test_limit_entry_rejected_when_price_beyond_stop(store, monkeypatch):
+    """入场价挂在止损之外：一成交就已越过止损，等于开仓即止损。"""
+    await online(store, mk_node("nd_a"))
+    await mk_risk_sized_group(store, "限价反向组", ["nd_a"], entry_mode="limit")
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+
+    res = await GroupDispatcher(store).dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1,
+                      stop_loss=2400.0, entry_price=2390.0),
+        "sig_limit_badside",
+    )
+
+    assert res["mode"] == "rejected"
+    assert "入场价" in res["reason"]
+    assert sent == []
+
+
+async def test_market_entry_ignores_entry_price(store, monkeypatch):
+    """市价策略照常按现价成交：信号带不带入场价都不影响，字段只是透传。"""
+    await online(store, mk_node("nd_a"))
+    await mk_risk_sized_group(store, "市价组", ["nd_a"])
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+
+    res = await GroupDispatcher(store).dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1, stop_loss=2397.0),
+        "sig_market_noprice",
+    )
+
+    assert res["mode"] == "group"
+    assert sent[0][1]["entry"]["entry_price"] is None
+
+
 async def test_add_on_strategy_still_dispatches_without_stop_loss(store, monkeypatch):
     """模版1 首单手数来自信号，没有止损也照常下发——新准入不能影响它。"""
     await online(store, mk_node("nd_a"))

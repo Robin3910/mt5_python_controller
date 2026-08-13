@@ -16,6 +16,11 @@ const router = createRouter({
       component: () => import('@/views/GroupSignalsView.vue'),
     },
     { path: '/strategies', name: 'strategies', component: () => import('@/views/StrategiesView.vue') },
+    {
+      path: '/client-versions',
+      name: 'client-versions',
+      component: () => import('@/views/ClientVersionsView.vue'),
+    },
     { path: '/events', name: 'events', component: () => import('@/views/EventsView.vue') },
     { path: '/audits', name: 'audits', component: () => import('@/views/AuditView.vue') },
     { path: '/console', name: 'console', component: () => import('@/views/ConsoleView.vue') },

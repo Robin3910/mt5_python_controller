@@ -2,6 +2,10 @@
 
 通过 MT5_MOCK=true 启用。接口与 MT5Client 完全一致（node_client 无需区分）。
 开仓即在内存中新增一笔持仓，平仓即移除，账户净值随浮盈联动。
+
+挂单同样是内存态：`place_pending_order` 只登记不成交，之后每次读持仓 / 读挂单时
+按 prices_map 的现价判定是否触及挂单价，触及就转成持仓——真实终端也是在后台这样
+撮合的，联调时改 prices_map 即可走完「挂上 → 成交 → 收口」的完整链路。
 """
 import itertools
 import logging
@@ -35,11 +39,14 @@ class MockMT5Client:
         self.connected = False
         self._tickets = itertools.count(1000)   # 自增订单号
         self._positions: list[dict] = []         # 内存持仓
+        self._pending: list[dict] = []           # 内存挂单（未成交）
         self._realized_by_magic: dict[int, float] = {}  # 按魔术号累计已实现盈亏
         self._exit_deals: list[dict] = []         # 出场成交（供收口原因汇总）
         self.prices_map = dict(_DEFAULT_PRICES)
         # 逐笔持仓的对冲账户；改成 netting 可模拟网格被拒的场景
         self.margin_mode = "hedging"
+        # 现价触及挂单价时自动成交；置 False 可让测试完全手工驱动成交时点
+        self.auto_fill_pending = True
 
     def connect(self) -> bool:
         self.connected = True
@@ -65,6 +72,7 @@ class MockMT5Client:
         }
 
     def positions(self) -> list[dict]:
+        self._settle_pending()
         return [dict(p) for p in self._positions]
 
     def quotes(self, symbols: list[str]) -> dict[str, dict]:
@@ -109,6 +117,127 @@ class MockMT5Client:
         return {"success": True, "symbol": symbol, "retcode": 10009,
                 "order": tk, "deal": tk, "volume": float(volume), "price": price}
 
+    # ----------------------- 挂单 -----------------------
+    def check_pending_price(self, symbol, action, price, kind="limit"):
+        """只校验方向，不校验最小距离（mock 的 stops_level 恒为 0）。"""
+        mid = float(self.prices_map.get(symbol.upper(), 1.0))
+        if price <= 0:
+            return "挂单价需大于 0"
+        want_below = (action == "BUY") == (kind == "limit")
+        if (price < mid) != want_below:
+            side = "低于" if want_below else "高于"
+            return f"{action} {kind} 挂单价 {price} 必须{side}现价 {mid}"
+        return None
+
+    def place_pending_order(self, symbol, action, volume, price, sl=None, tp=None,
+                            comment="", magic=None, kind="limit", max_retry=3) -> dict:
+        kind = str(kind or "limit").strip().lower()
+        reject = self.check_pending_price(symbol, action, float(price), kind)
+        if reject:
+            return {"success": False, "symbol": symbol, "error": reject}
+        tk = next(self._tickets)
+        self._pending.append(
+            {
+                "ticket": tk,
+                "symbol": symbol.upper(),
+                "type": action,
+                "pending_kind": kind,
+                "volume": float(volume),
+                "price_open": float(price),
+                "price_current": float(self.prices_map.get(symbol.upper(), 1.0)),
+                "sl": float(sl) if sl else 0.0,
+                "tp": float(tp) if tp else 0.0,
+                "magic": int(magic or self.magic),
+                "comment": comment,
+                "time": time.time(),
+            }
+        )
+        logger.info(
+            "MOCK pending %s %s %s %.2f @ %.5f -> ticket %s",
+            action, kind, symbol, volume, price, tk,
+        )
+        return {"success": True, "pending": True, "symbol": symbol, "action": action,
+                "pending_kind": kind, "retcode": 10009, "order": tk,
+                "volume": float(volume), "price": float(price)}
+
+    def _touched(self, order: dict) -> bool:
+        """现价是否已触及挂单价。"""
+        mid = float(self.prices_map.get(str(order.get("symbol") or "").upper(), 0.0))
+        if mid <= 0:
+            return False
+        price = float(order.get("price_open") or 0.0)
+        # BUY LIMIT / SELL STOP 等回落，SELL LIMIT / BUY STOP 等上涨
+        want_below = (order.get("type") == "BUY") == (order.get("pending_kind") == "limit")
+        return mid <= price if want_below else mid >= price
+
+    def _settle_pending(self) -> int:
+        """把已被现价触及的挂单转成持仓，返回成交笔数。"""
+        if not self.auto_fill_pending or not self._pending:
+            return 0
+        filled = [o for o in self._pending if self._touched(o)]
+        for order in filled:
+            self._fill(order)
+        return len(filled)
+
+    def _fill(self, order: dict) -> None:
+        """挂单成交：从挂单列表移除，按挂单价建仓（挂单没有滑点）。"""
+        self._pending = [o for o in self._pending if o["ticket"] != order["ticket"]]
+        price = float(order["price_open"])
+        self._positions.append(
+            {
+                "ticket": order["ticket"],
+                "symbol": order["symbol"],
+                "type": order["type"],
+                "volume": float(order["volume"]),
+                "price_open": price,
+                "price_current": price,
+                "sl": float(order.get("sl") or 0.0),
+                "tp": float(order.get("tp") or 0.0),
+                "profit": 0.0,
+                "magic": int(order.get("magic") or self.magic),
+                "comment": order.get("comment", ""),
+                "time": time.time(),
+            }
+        )
+        logger.info("MOCK pending filled: ticket %s @ %.5f", order["ticket"], price)
+
+    def fill_pending_order(self, ticket: int) -> bool:
+        """测试用：不看价格，强制成交某张挂单。"""
+        order = next((o for o in self._pending if int(o["ticket"]) == int(ticket)), None)
+        if order is None:
+            return False
+        self._fill(order)
+        return True
+
+    def pending_orders(self) -> list[dict]:
+        self._settle_pending()
+        return [dict(o) for o in self._pending]
+
+    def pending_orders_by_magic(self, magic: int) -> list[dict]:
+        target = int(magic)
+        return [o for o in self.pending_orders() if int(o.get("magic") or 0) == target]
+
+    def cancel_order(self, ticket: int, max_retry: int = 3) -> dict:
+        target = int(ticket)
+        before = len(self._pending)
+        self._pending = [o for o in self._pending if int(o["ticket"]) != target]
+        if len(self._pending) == before:
+            return {"success": False, "action": "CANCEL", "ticket": target,
+                    "error": f"order not found: {target}"}
+        return {"success": True, "action": "CANCEL", "ticket": target, "retcode": 10009}
+
+    def cancel_orders_by_magic(self, magic: int) -> dict:
+        results = [
+            self.cancel_order(int(o["ticket"])) for o in self.pending_orders_by_magic(magic)
+        ]
+        return {
+            "success": all(r.get("success") for r in results) if results else True,
+            "action": "CANCEL",
+            "magic": int(magic),
+            "cancelled": sum(1 for r in results if r.get("success")),
+            "results": results,
+        }
+
     def _record_exit(self, pos: dict, *, reason: int, profit: float) -> None:
         """记下出场成交；reason 对齐 MT5 DEAL_REASON（4=SL / 5=TP / 3=EXPERT…）。"""
         self._exit_deals.append({
@@ -147,10 +276,11 @@ class MockMT5Client:
 
     def positions_by_magic(self, magic: int) -> list[dict]:
         target = int(magic)
-        return [dict(p) for p in self._positions if int(p.get("magic") or 0) == target]
+        return [p for p in self.positions() if int(p.get("magic") or 0) == target]
 
     def close_by_magic(self, magic: int) -> dict:
         target = int(magic)
+        cancelled = self.cancel_orders_by_magic(target).get("cancelled", 0)
         matched = [p for p in self._positions if int(p.get("magic") or 0) == target]
         profit = sum(float(p.get("profit") or 0.0) for p in matched)
         for pos in matched:
@@ -165,6 +295,7 @@ class MockMT5Client:
             "action": "CLOSE",
             "magic": target,
             "closed": len(matched),
+            "cancelled": cancelled,
             "profit": round(profit, 2),
         }
 
@@ -212,6 +343,7 @@ class MockMT5Client:
             "volume_min": 0.01,
             "volume_step": 0.01,
             "volume_max": 100.0,
+            "stops_level": 0,
         }
 
     def modify_position_sl(self, ticket: int, sl: float, tp=None) -> dict:
@@ -268,6 +400,11 @@ class MockMT5Client:
 
     def close_symbol(self, symbol: str) -> dict:
         base = symbol.upper().replace("/", "")
+        cancels = [
+            self.cancel_order(int(o["ticket"]))
+            for o in self.pending_orders()
+            if str(o["symbol"]).startswith(base) or base.startswith(str(o["symbol"]))
+        ]
         keep, closed, profit = [], 0, 0.0
         for p in self._positions:
             if p["symbol"].startswith(base) or base.startswith(p["symbol"]):
@@ -280,9 +417,12 @@ class MockMT5Client:
                 keep.append(p)
         self._positions = keep
         self.balance += profit
-        return {"success": True, "symbol": symbol.upper(), "action": "CLOSE", "closed": closed}
+        return {"success": True, "symbol": symbol.upper(), "action": "CLOSE",
+                "closed": closed, "cancelled": sum(1 for r in cancels if r.get("success"))}
 
     def close_all(self) -> dict:
+        cancelled = len(self._pending)
+        self._pending = []
         closed = len(self._positions)
         symbol = self._positions[0]["symbol"] if closed == 1 else None
         profit = 0.0
@@ -293,7 +433,8 @@ class MockMT5Client:
             self._realized_by_magic[mag] = self._realized_by_magic.get(mag, 0.0) + pl
         self.balance += profit
         self._positions = []
-        return {"success": True, "symbol": symbol, "action": "CLOSE", "closed": closed}
+        return {"success": True, "symbol": symbol, "action": "CLOSE",
+                "closed": closed, "cancelled": cancelled}
 
     def close_positions(self, positions: list[dict]) -> dict:
         tickets = {int(p.get("ticket") or 0) for p in positions or []}

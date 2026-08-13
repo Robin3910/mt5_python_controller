@@ -9,8 +9,11 @@ import { useHubStore } from '@/stores/hub'
 import type {
   BatchCalcType,
   BatchTimeframe,
+  EntryMode,
   GridMode,
   GridSide,
+  GridSizingData,
+  NodeOut,
   StrategyBatchLevel,
   StrategyOut,
   StrategyRule,
@@ -149,10 +152,20 @@ const FIELD_HELP = {
   batch_timeframe:
     `统计 ATR / 波幅用的 K 线周期，固定取最近 ${BATCH_BAR_PERIOD} 根**已收盘** K 线（不含当前未走完的那根）。` +
     '算出的价格距离会换算成点数，再与实际偏离比较。',
+  entry_mode:
+    '开仓方式：\n' +
+    '市价 = 信号一到，底仓与分散仓全部市价打齐，各单开仓价相同；\n' +
+    '限价 = 底仓挂在信号给的入场价，分散仓在「入场价 → 止损价」之间等分挂阶梯限价，' +
+    '挂上后一直等到成交（GTC）。\n' +
+    '限价模式要求信号携带入场价（limit_price / price 字段），否则该策略不参与分发。\n' +
+    '限价下各档开仓价不同、止损价共用，总手数改按加权平均止损距离反推，' +
+    '同一份配置通常会开出更大的手数；风险金额的含义也随之变成' +
+    '「全部档位都成交时的最坏亏损」，只成交前几档就止损的话实际亏损更小。',
   risk_amount:
     '本次交易愿意承担的亏损金额（账户货币，通常是美元）。\n' +
     '总手数 = 风险金额 ÷ 每手止损亏损，其中每手止损亏损由止损距离与品种合约规格算出。\n' +
-    '止损距离按止损触发侧的报价算（多单看买价、空单看卖价）。\n' +
+    '市价模式下止损距离按止损触发侧的报价算（多单看买价、空单看卖价）；\n' +
+    '限价模式下按各档挂单价到止损价的距离，按仓位比例加权。\n' +
     '手数按品种步长向下取整，因此实际风险只会小于该值，不会超出。',
   rr_ratio:
     '盈亏比。止盈距离 = 止损距离 × 该值，止盈只挂在分散仓上（底仓止盈为 0）。\n' +
@@ -160,11 +173,13 @@ const FIELD_HELP = {
     '只有最远一档吃满该盈亏比，前面各档按比例提前落袋。\n' +
     '填 0 表示分散仓也不设止盈，仅靠止损与人工干预出场。',
   base_ratio:
-    '底仓占总手数的百分比，底仓以市价立即成交，止盈为 0。\n' +
+    '底仓占总手数的百分比，止盈为 0。\n' +
+    '市价模式立即成交；限价模式挂在信号给的入场价。\n' +
     '剩余仓位交给下方的分散仓单数拆开；分散仓单数为 0 时底仓即全仓。',
   add_batches:
-    '剩余仓位拆成几笔分散仓市价单。0 表示不拆分，总手数一次性由底仓成交。\n' +
-    '开仓时与底仓一并市价打出（订单数 = 1 + 分散仓单数）。\n' +
+    '剩余仓位拆成几笔分散仓。0 表示不拆分，总手数一次性由底仓成交。\n' +
+    '市价模式与底仓一并市价打出；限价模式在「入场价 → 止损价」之间等分挂阶梯限价' +
+    '（分母取单数+1，所以末档不会正好落在止损价上）。订单数 = 1 + 分散仓单数。\n' +
     '分散仓严格等手数，除不尽的余量不下单，因此实下总手数可能略少于反推值。\n' +
     '若剩余手数不足以让每笔都达到品种最小手数，节点会自动减少单数。',
   max_total_lot:
@@ -215,6 +230,25 @@ const FIELD_HELP = {
     '整个区间连同止损价 / 止盈价一起平移一格，继续在新区间吃差价。\n' +
     '多头网格追涨（突破上限上移），空头网格追跌（跌破下限下移）。\n' +
     '注意止盈价也会同步上移，所以开启追踪后止盈基本不会触发，两者通常只用其一。',
+  assist_enabled:
+    '按 ATR 与风险预算试算网格数量与每格手数。\n' +
+    '只在配置时算一次，结果需点「应用建议」才写入上方字段；网格运行时不读这组参数。\n' +
+    '关闭后已填的试算参数会保留，只是不再校验与试算。',
+  assist_node:
+    'ATR 与合约规格从哪台节点的 MT5 终端读取。节点只作行情源，不会写进策略配置；\n' +
+    '换节点可能因券商后缀、历史深度与计价货币不同而算出略有差异的建议值。',
+  assist_timeframe:
+    `试算 ATR 用的 K 线周期，固定取最近 ${BATCH_BAR_PERIOD} 根**已收盘** K 线。\n` +
+    '网格格距要反映区间级别的波动，通常比加仓档位取更大的周期。',
+  assist_atr_mult:
+    '格距 = ATR × 该倍数。倍数越小格子越密、单格利润越薄，满仓手数也越大。\n' +
+    '改动倍数会清空下面的「格距」，让 ATR 重新决定。',
+  assist_spacing:
+    '实际用于推算格数的格距。取行情后会自动填入 ATR × 倍数的结果，可手改；\n' +
+    '非 0 时以此处为准（不再看 ATR 倍数），改完重新试算即按改后的值算格数与手数。',
+  assist_max_loss:
+    '满仓被打到止损时最多可接受的亏损金额（账户货币），用于反推每格手数。\n' +
+    '必须先设好本方向的止损价：多头看区间下沿、空头看区间上沿。',
   trailing_max:
     '最多允许平移多少格，0 表示不限。\n' +
     '不限时只要不触发止损，网格会一直跟着行情滚动。',
@@ -226,6 +260,11 @@ const BREAKEVEN_MODE_OPTIONS: Array<{ value: 'once' | 'loop'; label: string }> =
   { value: 'loop', label: '循环' },
 ]
 
+const ENTRY_MODE_OPTIONS: Array<{ value: EntryMode; label: string }> = [
+  { value: 'market', label: '市价' },
+  { value: 'limit', label: '限价' },
+]
+
 const GRID_MODE_OPTIONS: Array<{ value: GridMode; label: string }> = [
   { value: 'arithmetic', label: '等差' },
   { value: 'geometric', label: '等比' },
@@ -235,6 +274,9 @@ const GRID_SIDE_OPTIONS: Array<{ value: GridSide; label: string }> = [
   { value: 'long', label: '只做多' },
   { value: 'short', label: '只做空' },
 ]
+
+/** 网格试算默认周期，与后端 GRID_ASSIST_TIMEFRAME 一致 */
+const GRID_ASSIST_TIMEFRAME: BatchTimeframe = 'H1'
 
 /**
  * 表单内规则：所有字段都已填充，便于直接 v-model 绑定。
@@ -271,6 +313,8 @@ function cloneRules(rules: StrategyRule[]): EditableRule[] {
     breakeven_enabled: r.breakeven_enabled ?? true,
     breakeven_times: r.breakeven_times ?? 2,
     breakeven_mode: r.breakeven_mode === 'loop' ? 'loop' : 'once',
+    // 缺字段的历史配置一律按市价，保证旧策略行为不变
+    entry_mode: r.entry_mode === 'limit' ? 'limit' : 'market',
     price_lower: r.price_lower ?? 0,
     price_upper: r.price_upper ?? 0,
     grid_count: r.grid_count ?? 10,
@@ -285,6 +329,11 @@ function cloneRules(rules: StrategyRule[]): EditableRule[] {
     prefill_enabled: r.prefill_enabled ?? true,
     trailing_up: r.trailing_up ?? false,
     trailing_max: r.trailing_max ?? 0,
+    assist_enabled: r.assist_enabled ?? false,
+    assist_timeframe: r.assist_timeframe ?? GRID_ASSIST_TIMEFRAME,
+    assist_atr_mult: r.assist_atr_mult ?? 1,
+    assist_spacing: r.assist_spacing ?? 0,
+    assist_max_loss: r.assist_max_loss ?? 0,
   }))
 }
 
@@ -390,6 +439,7 @@ function onBatchMetaChange(r: EditableRule): void {
 function loadRulesFromTemplate(templateId: string): void {
   const tpl = templates.value.find((t) => t.template_id === templateId)
   form.rules = tpl ? cloneRules(tpl.rules) : []
+  resetSizing()  // 换模版后规则整组换掉，之前的试算结果不再对应任何规则
 }
 
 function resetCreateForm(): void {
@@ -431,11 +481,20 @@ async function loadEditForm(): Promise<void> {
 }
 
 async function onOpen(): Promise<void> {
+  resetSizing()
   templates.value = await hub.fetchStrategyTemplates()
   if (props.mode === 'create') {
     resetCreateForm()
   } else {
     await loadEditForm()
+  }
+  // 试算的行情源节点选择器需要节点列表；策略页可能还没拉过
+  if (!hub.nodes.length) {
+    try {
+      await hub.fetchNodes()
+    } catch {
+      /* 拉不到就只是选不了行情源，不影响其它表单项 */
+    }
   }
 }
 
@@ -471,6 +530,9 @@ function validateRiskSized(r: EditableRule, label: string): string | null {
   }
   if (r.breakeven_enabled && !BREAKEVEN_MODE_OPTIONS.some((o) => o.value === r.breakeven_mode)) {
     return `${label}：保本监控方式非法`
+  }
+  if (!ENTRY_MODE_OPTIONS.some((o) => o.value === r.entry_mode)) {
+    return `${label}：开仓方式非法`
   }
   return null
 }
@@ -539,6 +601,32 @@ function validateGrid(r: EditableRule, label: string): string | null {
     return `${label}：${stops.upperName}须高于区间上限`
   }
   if (r.trailing_max < 0) return `${label}：最大平移格数不能为负`
+  return validateGridAssist(r, label)
+}
+
+/**
+ * 试算助手的参数校验。只在开关开启时生效，避免存量规则与不用助手的用户被拦。
+ * 其中止损价是硬前提：没有止损就无从反推手数，此时给出的任何手数都是假的。
+ */
+function validateGridAssist(r: EditableRule, label: string): string | null {
+  if (r.assist_atr_mult < 0) return `${label}：ATR 倍数不能为负`
+  if (r.assist_spacing < 0) return `${label}：格距不能为负`
+  if (r.assist_max_loss < 0) return `${label}：最大可接受亏损不能为负`
+  if (!r.assist_enabled) return null
+  if (!TIMEFRAME_OPTIONS.includes(r.assist_timeframe)) return `${label}：试算周期非法`
+  if (!(r.assist_atr_mult > 0) && !(r.assist_spacing > 0)) {
+    return `${label}：试算需要 ATR 倍数或手填格距`
+  }
+  if (r.assist_spacing > 0 && r.assist_spacing >= r.price_upper - r.price_lower) {
+    return `${label}：格距需小于区间宽度，否则切不出 2 格`
+  }
+  if (!(r.assist_max_loss > 0)) {
+    return `${label}：试算需要最大可接受亏损金额（或关闭试算开关）`
+  }
+  const stops = gridStopFields(r.grid_side)
+  if (!(r[stops.slKey] > 0)) {
+    return `${label}：试算需要先设置${stops.slLabel}（或关闭试算开关）`
+  }
   return null
 }
 
@@ -583,6 +671,159 @@ function trailingHint(r: EditableRule): string {
     `[${trimNum(move(lower))}, ${trimNum(move(upper))}]，止损 / 止盈同步；` +
     (r.trailing_max > 0 ? `最多平移 ${r.trailing_max} 格` : '不限平移次数')
   )
+}
+
+/**
+ * 网格试算的会话态：按规则下标存放。
+ * 建议值只是展示，点「应用建议」才写进 grid_count / lot_per_grid；行情源节点也只留
+ * 在这里，不随策略落库（策略绑的是分组，不该被某台节点绑死）。
+ */
+interface SizingState {
+  nodeId: string
+  loading: boolean
+  error: string
+  data: GridSizingData | null
+  /** 算出该结果时的参数指纹，与当前不一致即视为结果已过期 */
+  signature: string
+}
+
+const sizing = reactive<Record<number, SizingState>>({})
+
+function sizingState(idx: number): SizingState {
+  if (!sizing[idx]) {
+    sizing[idx] = { nodeId: '', loading: false, error: '', data: null, signature: '' }
+  }
+  return sizing[idx]
+}
+
+function resetSizing(): void {
+  for (const key of Object.keys(sizing)) delete sizing[Number(key)]
+}
+
+/** 可作行情源的节点：只有在线节点能回 K 线与合约规格 */
+const onlineNodes = computed(() =>
+  hub.nodes.filter((n) => hub.statuses[n.node_id] === 'online' || n.status === 'online'),
+)
+
+function nodeLabel(n: NodeOut): string {
+  const name = n.name || n.node_id
+  return n.mt5_login ? `${name} · ${n.mt5_login}` : name
+}
+
+/** 试算所需的前置条件；返回原因表示还不能试算 */
+function sizingBlocker(r: EditableRule): string {
+  if (!(r.price_lower > 0) || !(r.price_upper > r.price_lower)) return '请先填写合法的价格区间'
+  const stops = gridStopFields(r.grid_side)
+  if (!(r[stops.slKey] > 0)) return `请先填写${stops.slLabel}，否则无法反推每格手数`
+  if (!(r.assist_max_loss > 0)) return '请填写最大可接受亏损金额'
+  return ''
+}
+
+/**
+ * 会影响试算结果的字段指纹。
+ * 用指纹比对而不是「改动即打标记」，是因为试算成功后要把算出的格距回填给用户微调，
+ * 那次回填本身也会改动参数，用监听的写法会把刚出的结果立刻判成过期。
+ */
+function sizingSignature(r: EditableRule): string {
+  return [
+    r.price_lower,
+    r.price_upper,
+    r.grid_mode,
+    r.grid_side,
+    r.stop_lower,
+    r.stop_upper,
+    r.prefill_enabled,
+    r.close_on_stop,
+    r.trailing_up,
+    r.total_lot_limit,
+    r.assist_timeframe,
+    r.assist_atr_mult,
+    r.assist_spacing,
+    r.assist_max_loss,
+  ].join('|')
+}
+
+/**
+ * 结果是否已过期：区间、止损、方向乃至预填开关一改，之前算出的数字就不再对应当前
+ * 配置。过期只拦住「应用」，不清掉结果——让用户仍看得见基于旧参数的那组数字。
+ */
+function sizingStale(idx: number, r: EditableRule): boolean {
+  const state = sizing[idx]
+  return !!state?.data && state.signature !== sizingSignature(r)
+}
+
+async function runSizing(idx: number, r: EditableRule): Promise<void> {
+  const state = sizingState(idx)
+  const symbol = form.symbol.trim().toUpperCase()
+  if (!symbol) {
+    state.error = '请先填写策略绑定的品种'
+    return
+  }
+  if (!state.nodeId) {
+    state.error = '请选择一台在线节点作为行情源'
+    return
+  }
+  const blocker = sizingBlocker(r)
+  if (blocker) {
+    state.error = blocker
+    return
+  }
+  state.loading = true
+  state.error = ''
+  try {
+    const data = await hub.fetchGridSizing(state.nodeId, symbol, {
+      timeframe: r.assist_timeframe,
+      atr_mult: r.assist_atr_mult,
+      spacing: r.assist_spacing,
+      max_loss: r.assist_max_loss,
+      price_lower: r.price_lower,
+      price_upper: r.price_upper,
+      grid_mode: r.grid_mode,
+      grid_side: r.grid_side,
+      stop_lower: r.stop_lower,
+      stop_upper: r.stop_upper,
+      prefill_enabled: r.prefill_enabled,
+      close_on_stop: r.close_on_stop,
+      trailing_up: r.trailing_up,
+      total_lot_limit: r.total_lot_limit,
+    })
+    state.data = data
+    // 把算出的格距回填成可编辑值，用户可直接微调后重算；改 ATR 倍数会把它清回 0，
+    // 否则回填值会一直盖住新的倍数
+    if (data.spacing > 0) r.assist_spacing = data.spacing
+    state.signature = sizingSignature(r)
+  } catch (e: unknown) {
+    const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+    state.error = detail || '试算失败，请确认节点在线且该品种可读'
+    state.data = null
+  } finally {
+    state.loading = false
+  }
+}
+
+function applySizing(idx: number, r: EditableRule): void {
+  const data = sizing[idx]?.data
+  if (!data?.ready || sizingStale(idx, r)) return
+  if (data.grid_count >= 2) r.grid_count = data.grid_count
+  if (data.lot_per_grid > 0) r.lot_per_grid = data.lot_per_grid
+  ElMessage.success('已应用建议值，可继续手动微调')
+}
+
+/** 试算结果概览：一行说清算出了什么 */
+function sizingSummary(data: GridSizingData): string {
+  const parts = [
+    `ATR(${data.timeframe},${BATCH_BAR_PERIOD}) = ${trimNum(data.atr)}`,
+    `格距 ${trimNum(data.spacing)}${data.spacing_source === 'manual' ? '（手改）' : ''}`,
+    `${data.grid_count} 格`,
+  ]
+  if (data.lot_per_grid > 0) {
+    parts.push(
+      `每格 ${trimNum(data.lot_per_grid, 4)} 手`,
+      `满仓 ${trimNum(data.worst_lot, 4)} 手`,
+      `最坏亏损 ≈ ${trimNum(data.worst_loss, 2)}`,
+    )
+  }
+  return parts.join(' · ')
 }
 
 function validateRules(rules: EditableRule[]): string | null {
@@ -716,6 +957,7 @@ function resetRuleToTemplate(idx: number): void {
   const tplRule = selectedTemplate.value?.rules?.[idx]
   if (!tplRule || !form.rules[idx]) return
   Object.assign(form.rules[idx], cloneRules([tplRule])[0])
+  delete sizing[idx]
 }
 </script>
 
@@ -821,6 +1063,18 @@ function resetRuleToTemplate(idx: number): void {
                 </div>
                 <div class="field">
                   <FormLabel
+                    :field-id="`rule-${idx}-entry-mode`"
+                    text="开仓方式"
+                    :help="FIELD_HELP.entry_mode"
+                  />
+                  <select :id="`rule-${idx}-entry-mode`" v-model="r.entry_mode">
+                    <option v-for="o in ENTRY_MODE_OPTIONS" :key="o.value" :value="o.value">
+                      {{ o.label }}
+                    </option>
+                  </select>
+                </div>
+                <div class="field">
+                  <FormLabel
                     :field-id="`rule-${idx}-risk-amount`"
                     text="风险金额"
                     :help="FIELD_HELP.risk_amount"
@@ -876,8 +1130,15 @@ function resetRuleToTemplate(idx: number): void {
               </div>
               <p class="rule-hint">
                 总手数 = 风险金额 {{ r.risk_amount }} ÷ 每手止损亏损（由信号止损价与品种规格算出）；底仓
-                {{ r.add_batches ? r.base_ratio : 100 }}% 市价成交（TP=0）；分散仓第 i 单止盈 = 开仓价 +
-                止损距离 × {{ r.rr_ratio }} × i ÷ {{ r.add_batches || 1 }}
+                {{ r.add_batches ? r.base_ratio : 100 }}%
+                {{ r.entry_mode === 'limit' ? '挂在信号入场价' : '市价成交' }}（TP=0）；分散仓第 i 单止盈 =
+                开仓价 + 止损距离 × {{ r.rr_ratio }} × i ÷ {{ r.add_batches || 1 }}
+              </p>
+              <p v-if="r.entry_mode === 'limit'" class="rule-hint warn">
+                限价开仓：信号必须携带入场价（limit_price / price），否则本策略不参与分发；
+                挂单一直等到成交（GTC），期间该节点该品种不接新信号。
+                各档止损距离不同，手数改按加权平均止损距离反推，通常比市价模式更大；
+                风险金额此时是「全部档位都成交」的最坏亏损。
               </p>
 
               <div class="batch-block">
@@ -907,7 +1168,11 @@ function resetRuleToTemplate(idx: number): void {
                   </div>
                 </div>
                 <p class="rule-hint">
-                  开仓时与底仓一并市价打出；各单共用信号止损价，分散仓按盈亏比挂止盈，底仓止盈为 0
+                  {{
+                    r.entry_mode === 'limit'
+                      ? '在「入场价 → 止损价」之间等分挂阶梯限价，与底仓一并挂出'
+                      : '开仓时与底仓一并市价打出'
+                  }}；各单共用信号止损价，分散仓按盈亏比挂止盈，底仓止盈为 0
                 </p>
               </div>
 
@@ -1139,6 +1404,130 @@ function resetRuleToTemplate(idx: number): void {
                 <p v-if="r.trailing_up" class="rule-hint">
                   {{ trailingHint(r) }}
                 </p>
+              </div>
+
+              <div class="batch-block">
+                <div class="batch-head">
+                  <FormLabel text="试算网格" :help="FIELD_HELP.assist_enabled" />
+                  <input
+                    type="checkbox"
+                    :checked="r.assist_enabled"
+                    aria-label="启用网格试算"
+                    @change="r.assist_enabled = ($event.target as HTMLInputElement).checked"
+                  />
+                </div>
+                <template v-if="r.assist_enabled">
+                  <div class="batch-top-grid">
+                    <div class="field">
+                      <FormLabel
+                        :field-id="`rule-${idx}-assist-node`"
+                        text="行情源节点"
+                        :help="FIELD_HELP.assist_node"
+                      />
+                      <select :id="`rule-${idx}-assist-node`" v-model="sizingState(idx).nodeId">
+                        <option value="">请选择在线节点</option>
+                        <option v-for="n in onlineNodes" :key="n.node_id" :value="n.node_id">
+                          {{ nodeLabel(n) }}
+                        </option>
+                      </select>
+                    </div>
+                    <div class="field">
+                      <FormLabel
+                        :field-id="`rule-${idx}-assist-tf`"
+                        text="K线周期"
+                        :help="FIELD_HELP.assist_timeframe"
+                      />
+                      <select :id="`rule-${idx}-assist-tf`" v-model="r.assist_timeframe">
+                        <option v-for="tf in TIMEFRAME_OPTIONS" :key="tf" :value="tf">{{ tf }}</option>
+                      </select>
+                    </div>
+                    <div class="field">
+                      <FormLabel
+                        :field-id="`rule-${idx}-assist-mult`"
+                        text="ATR 倍数"
+                        :help="FIELD_HELP.assist_atr_mult"
+                      />
+                      <input
+                        :id="`rule-${idx}-assist-mult`"
+                        v-model.number="r.assist_atr_mult"
+                        type="number"
+                        min="0"
+                        step="0.1"
+                        @change="r.assist_spacing = 0"
+                      />
+                    </div>
+                    <div class="field">
+                      <FormLabel
+                        :field-id="`rule-${idx}-assist-spacing`"
+                        text="格距"
+                        :help="FIELD_HELP.assist_spacing"
+                      />
+                      <input
+                        :id="`rule-${idx}-assist-spacing`"
+                        v-model.number="r.assist_spacing"
+                        type="number"
+                        min="0"
+                        step="any"
+                      />
+                    </div>
+                    <div class="field">
+                      <FormLabel
+                        :field-id="`rule-${idx}-assist-loss`"
+                        text="最大可接受亏损"
+                        :help="FIELD_HELP.assist_max_loss"
+                      />
+                      <input
+                        :id="`rule-${idx}-assist-loss`"
+                        v-model.number="r.assist_max_loss"
+                        type="number"
+                        min="0"
+                        step="any"
+                      />
+                    </div>
+                  </div>
+
+                  <div class="assist-actions">
+                    <button
+                      type="button"
+                      class="btn-sm btn-ghost"
+                      :disabled="sizingState(idx).loading"
+                      @click="runSizing(idx, r)"
+                    >
+                      {{ sizingState(idx).loading ? '试算中…' : '取行情并试算' }}
+                    </button>
+                    <button
+                      type="button"
+                      class="btn-sm btn-ghost"
+                      :disabled="!sizingState(idx).data?.ready || sizingStale(idx, r)"
+                      @click="applySizing(idx, r)"
+                    >
+                      应用建议
+                    </button>
+                  </div>
+
+                  <p v-if="sizingState(idx).error" class="rule-hint warn">
+                    {{ sizingState(idx).error }}
+                  </p>
+                  <template v-else-if="sizingState(idx).data">
+                    <p class="rule-hint">
+                      {{ sizingSummary(sizingState(idx).data!) }}
+                    </p>
+                    <p v-if="sizingStale(idx, r)" class="rule-hint warn">
+                      参数已改动，请重新试算后再应用
+                    </p>
+                    <p
+                      v-for="w in sizingState(idx).data!.warnings"
+                      :key="w.code + w.message"
+                      class="rule-hint"
+                      :class="{ warn: w.level === 'warn' }"
+                    >
+                      {{ w.message }}
+                    </p>
+                  </template>
+                  <p v-else class="rule-hint">
+                    {{ sizingBlocker(r) || '选好行情源节点后点「取行情并试算」' }}
+                  </p>
+                </template>
               </div>
             </template>
 
@@ -1445,6 +1834,17 @@ function resetRuleToTemplate(idx: number): void {
   margin: 10px 0 0;
   font-size: 11px;
   color: var(--muted);
+}
+
+.rule-hint.warn {
+  color: var(--red);
+}
+
+.assist-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+  flex-wrap: wrap;
 }
 
 .batch-block {

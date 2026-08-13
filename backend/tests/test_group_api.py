@@ -529,6 +529,30 @@ def test_manual_signal_passes_sl_tp_and_comment(client):
     assert task["comment"] == "手动开仓"
 
 
+def test_manual_signal_passes_entry_price_as_limit_price(client):
+    """手动触发的入场价按 Webhook 的 limit_price 透传，限价开仓才触发得起来。"""
+    from app.console_api import _build_signal_payload
+    from app.models import ManualSignalRequest
+
+    data = _build_signal_payload(ManualSignalRequest(
+        symbol="XAUUSD", action="BUY", volume=0.1, model="strategy",
+        stop_loss=2380.0, entry_price=2390.0,
+    ))
+    assert data["limit_price"] == 2390.0
+    assert data["sl"] == 2380.0
+
+
+def test_manual_signal_omits_entry_price_when_absent(client):
+    """不填入场价时不带该键：市价策略的信号体保持与改动前一致。"""
+    from app.console_api import _build_signal_payload
+    from app.models import ManualSignalRequest
+
+    data = _build_signal_payload(ManualSignalRequest(
+        symbol="XAUUSD", action="BUY", volume=0.1, model="strategy",
+    ))
+    assert "limit_price" not in data
+
+
 def test_manual_open_requires_volume(client):
     """开仓必须显式给手数，不静默回落到默认手数。"""
     h = auth_headers(client)

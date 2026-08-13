@@ -398,8 +398,31 @@ def test_normalize_keeps_only_risk_sized_fields():
     assert set(out) == {
         "type", "status", "action", "risk_amount", "rr_ratio", "base_ratio",
         "add_batches", "max_total_lot", "breakeven_enabled", "breakeven_times",
-        "breakeven_mode",
+        "breakeven_mode", "entry_mode",
     }
+
+
+def test_normalize_entry_mode_defaults_to_market():
+    """缺字段的历史配置必须按市价，否则升级后旧策略会突然改成挂单开仓。"""
+    from app import strategy_templates as tpl
+
+    out = tpl.normalize_rule(_risk_sized_rule())
+    assert out["entry_mode"] == "market"
+
+
+@pytest.mark.parametrize("raw", ["limit", "LIMIT", " Limit "])
+def test_normalize_entry_mode_accepts_limit(raw):
+    from app import strategy_templates as tpl
+
+    assert tpl.normalize_rule(_risk_sized_rule(entry_mode=raw))["entry_mode"] == "limit"
+
+
+@pytest.mark.parametrize("raw", ["stop", "", None, 3])
+def test_normalize_entry_mode_rejects_unknown(raw):
+    """未知开仓方式回落市价：挂单能力只对明确配置的策略开放。"""
+    from app import strategy_templates as tpl
+
+    assert tpl.normalize_rule(_risk_sized_rule(entry_mode=raw))["entry_mode"] == "market"
 
 
 def test_normalize_keeps_only_add_on_fields():
@@ -459,6 +482,63 @@ def test_entry_reject_ignores_add_on_strategies():
 
     strategy = {"rules": [{"type": 1, "status": 1, "action": "all"}]}
     assert group_rules.entry_reject_reason(strategy, None) is None
+
+
+def test_entry_reject_market_mode_ignores_entry_price():
+    """市价开仓按现价成交，信号带不带入场价都不影响准入。"""
+    from app import group_rules
+
+    strategy = {"rules": [_risk_sized_rule(entry_mode="market")]}
+    assert group_rules.entry_reject_reason(
+        strategy, 2397.0, signal_action="BUY", signal_entry_price=None,
+    ) is None
+
+
+def test_entry_reject_limit_mode_requires_entry_price():
+    """限价开仓的挂单价只能来自信号，缺了就算不出挂在哪，必须在分发前挡住。"""
+    from app import group_rules
+
+    strategy = {"rules": [_risk_sized_rule(entry_mode="limit")]}
+    assert group_rules.entry_reject_reason(
+        strategy, 2397.0, signal_action="BUY", signal_entry_price=2400.0,
+    ) is None
+    assert "入场价" in (
+        group_rules.entry_reject_reason(
+            strategy, 2397.0, signal_action="BUY", signal_entry_price=None,
+        ) or ""
+    )
+    assert "入场价" in (
+        group_rules.entry_reject_reason(
+            strategy, 2397.0, signal_action="BUY", signal_entry_price=0,
+        ) or ""
+    )
+
+
+@pytest.mark.parametrize(
+    "action,entry,stop",
+    [("BUY", 2400.0, 2405.0), ("BUY", 2400.0, 2400.0), ("SELL", 2400.0, 2395.0)],
+)
+def test_entry_reject_limit_price_must_sit_on_profit_side_of_stop(action, entry, stop):
+    """挂在止损之外的单一旦成交就已越过止损，等于开仓即止损。"""
+    from app import group_rules
+
+    strategy = {"rules": [_risk_sized_rule(entry_mode="limit")]}
+    reason = group_rules.entry_reject_reason(
+        strategy, stop, signal_action=action, signal_entry_price=entry,
+    ) or ""
+    assert "入场价" in reason
+
+
+def test_entry_reject_limit_still_requires_stop_loss():
+    """限价模式同样要有止损价：手数还是靠止损距离反推的。"""
+    from app import group_rules
+
+    strategy = {"rules": [_risk_sized_rule(entry_mode="limit")]}
+    assert "止损价" in (
+        group_rules.entry_reject_reason(
+            strategy, None, signal_action="BUY", signal_entry_price=2400.0,
+        ) or ""
+    )
 
 
 def test_create_strategy_duplicate_name_409(client):
@@ -625,6 +705,72 @@ def test_normalize_grid_trailing():
     out = tpl.normalize_rule(legacy)
     assert out["trailing_up"] is False
     assert out["trailing_max"] == 0
+
+
+def test_normalize_grid_assist_defaults_off():
+    """试算助手默认关闭；存量规则没有这组字段时不受影响。"""
+    from app import strategy_templates as tpl
+
+    out = tpl.normalize_rule(_grid_rule())
+    assert out["assist_enabled"] is False
+    assert out["assist_timeframe"] == tpl.GRID_ASSIST_TIMEFRAME
+    assert out["assist_atr_mult"] == 1.0
+    assert out["assist_spacing"] == 0.0
+    assert out["assist_max_loss"] == 0.0
+
+
+def test_normalize_grid_assist_clamps_and_keeps_values():
+    from app import strategy_templates as tpl
+
+    out = tpl.normalize_rule(_grid_rule(
+        assist_enabled=1,
+        assist_timeframe="h4",
+        assist_atr_mult=10**6,
+        assist_spacing=-3,
+        assist_max_loss=500,
+    ))
+    assert out["assist_enabled"] is True
+    assert out["assist_timeframe"] == "H4"
+    assert out["assist_atr_mult"] == tpl.GRID_ASSIST_MULT_MAX
+    assert out["assist_spacing"] == 0.0
+    assert out["assist_max_loss"] == 500.0
+
+    # 非法周期回落默认；倍数为 0 视为未配
+    out = tpl.normalize_rule(_grid_rule(assist_timeframe="X9", assist_atr_mult=0))
+    assert out["assist_timeframe"] == tpl.GRID_ASSIST_TIMEFRAME
+    assert out["assist_atr_mult"] == 1.0
+
+    # 开关关闭时仍保留已填参数（与 trailing_max 的处理一致，避免误关就丢数据）
+    out = tpl.normalize_rule(_grid_rule(
+        assist_enabled=False, assist_spacing=12.5, assist_max_loss=800,
+    ))
+    assert out["assist_enabled"] is False
+    assert out["assist_spacing"] == 12.5
+    assert out["assist_max_loss"] == 800.0
+
+
+def test_create_strategy_keeps_grid_assist(client):
+    h = auth_headers(client)
+    r = client.post(
+        "/api/strategies",
+        json={
+            "template_id": TEMPLATE_3_ID,
+            "name": "试算网格",
+            "symbol": "XAUUSD",
+            "rules": [_grid_rule(
+                assist_enabled=True, assist_timeframe="H4",
+                assist_atr_mult=1.5, assist_spacing=8.0, assist_max_loss=600.0,
+            )],
+        },
+        headers=h,
+    )
+    assert r.status_code == 201, r.text
+    rule = r.json()["rules"][0]
+    assert rule["assist_enabled"] is True
+    assert rule["assist_timeframe"] == "H4"
+    assert rule["assist_atr_mult"] == 1.5
+    assert rule["assist_spacing"] == 8.0
+    assert rule["assist_max_loss"] == 600.0
 
 
 def test_create_strategy_keeps_grid_trailing(client):

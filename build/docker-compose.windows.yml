@@ -78,6 +78,10 @@ services:
     environment:
       MYSQL_DSN: mysql+asyncmy://${MYSQL_USER:-mt5}:${MYSQL_PASSWORD:-mt5pwd}@mysql:3306/${MYSQL_DATABASE:-mt5hub}
       REDIS_URL: redis://redis:6379/0
+      # 客户端安装包落在挂载卷里，否则重建镜像后已上传的包会全部丢失
+      CLIENT_PACKAGE_DIR: /app/data/client_packages
+    volumes:
+      - backend_data:/app/data
     depends_on:
       mysql:
         condition: service_healthy
@@ -105,3 +109,4 @@ services:
 volumes:
   mysql_data:
   redis_data:
+  backend_data:

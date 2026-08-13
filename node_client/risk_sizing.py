@@ -4,24 +4,43 @@
 
 - risk_amount：本次交易愿意承担的亏损金额（账户货币）
 - rr_ratio：盈亏比，止盈距离 = 止损距离 × rr_ratio，只有阶梯最远一档吃满
-- base_ratio：底仓占总手数的百分比，底仓市价成交、止盈为 0
-- add_batches：剩余仓位拆成几笔「分散仓」市价单，0 = 底仓即全仓
+- base_ratio：底仓占总手数的百分比，底仓止盈为 0
+- add_batches：剩余仓位拆成几笔「分散仓」，0 = 底仓即全仓
 - max_total_lot：总手数上限，0 表示不额外限制
 - breakeven_enabled / breakeven_times：浮盈达到止损距离 × N 倍时把止损移到保本
 - breakeven_mode：once=按次（触发一次后停止）/ loop=循环（止损未到位时可反复移动）
+- entry_mode：market=市价打齐 / limit=挂阶梯限价等成交
 
 核心是「先定亏多少，再算开多少手」：
 
     每手止损亏损 = 止损距离 / tick_size × tick_value
     总手数       = risk_amount / 每手止损亏损
 
+## 市价模式（entry_mode=market）
+
 止损距离按「止损触发侧」的报价算（BUY 由 bid 触发、SELL 由 ask 触发），阶梯止盈
 则以开仓侧报价为锚，两者差一个点差。开仓时一次下齐：1 笔底仓（TP=0）+ N 笔等手数
 分散仓，第 i 笔止盈 = 开仓价 + 盈亏比 × 止损距离 × i / N——满盈亏比只落在最远一档，
-前面各档按比例提前兑现。所有订单共用信号那一个止损价。
+前面各档按比例提前兑现。所有订单共用信号那一个止损价，各单开仓价相同，止损距离
+是单值，打到止损的总亏损恰好等于 risk_amount。
+
+## 限价模式（entry_mode=limit）
+
+底仓挂在信号给的入场价，分散仓在「入场价 → 止损价」之间等分挂阶梯限价（分母取
+档数+1，末档因此不会正好落在止损价上）。各档开仓价不同、止损价共用，止损距离
+就成了一组递减的值，总手数改按仓位比例加权的平均止损距离反推：
+
+    加权止损距离 = Σ(该档仓位占比 × 该档止损距离)
+
+由此带来一个必须知道的语义变化：risk_amount 从「确定亏损」变成「全部档位都成交
+时的最坏亏损」。只成交了前几档就打到止损的话，实际亏损小于 risk_amount。
+
+## 手数切分
 
 剩余仓位按 ⌊剩余 ÷ 单数⌋ 等分，除不尽的余量宁可不开：阶梯下最远档最难兑现，
-把余量并到末笔等于把最重的仓压在最难到达的那一档上。
+把余量并到末笔等于把最重的仓压在最难到达的那一档上。切完之后一律按实际仓位分布
+复核一次风险——向下取整与最小手数托底会让实际分布偏离配置比例，限价模式下这个
+偏离不保证有利，超预算就收缩总手数重切。
 
 手数计算需要品种的报价与手数规格（tick_value / volume_step 等），只有 MT5 能给，
 所以这一层放在节点侧；服务端只负责下发风险参数。
@@ -43,6 +62,14 @@ DISTRIBUTE_COUNT_MAX = 50
 BREAKEVEN_ONCE = "once"
 BREAKEVEN_LOOP = "loop"
 BREAKEVEN_MODES = (BREAKEVEN_ONCE, BREAKEVEN_LOOP)
+
+# 开仓方式（与后台 strategy_templates.ENTRY_MODE_* 对齐）
+ENTRY_MODE_MARKET = "market"
+ENTRY_MODE_LIMIT = "limit"
+ENTRY_MODES = (ENTRY_MODE_MARKET, ENTRY_MODE_LIMIT)
+
+# 按实际仓位分布复核风险时，最多收缩几轮总手数
+_RISK_FIT_ROUNDS = 4
 
 # MT5 订单备注上限约 31 字符
 MT5_COMMENT_LIMIT = 31
@@ -124,6 +151,7 @@ class RiskSizedConfig:
     breakeven_times: float = 0.0
     breakeven_mode: str = BREAKEVEN_ONCE
     action: str = "all"
+    entry_mode: str = ENTRY_MODE_MARKET
 
     @classmethod
     def from_rule(cls, rule: dict) -> "RiskSizedConfig":
@@ -133,6 +161,9 @@ class RiskSizedConfig:
         mode = str(rule.get("breakeven_mode") or BREAKEVEN_ONCE).strip().lower()
         if mode not in BREAKEVEN_MODES:
             mode = BREAKEVEN_ONCE
+        entry_mode = str(rule.get("entry_mode") or ENTRY_MODE_MARKET).strip().lower()
+        if entry_mode not in ENTRY_MODES:
+            entry_mode = ENTRY_MODE_MARKET
         return cls(
             risk_amount=max(0.0, _as_float(rule.get("risk_amount"))),
             rr_ratio=max(0.0, _as_float(rule.get("rr_ratio"))),
@@ -143,6 +174,7 @@ class RiskSizedConfig:
             breakeven_times=max(0.0, _as_float(rule.get("breakeven_times"))),
             breakeven_mode=mode,
             action=str(rule.get("action") or "all").strip().lower(),
+            entry_mode=entry_mode,
         )
 
     @property
@@ -152,6 +184,14 @@ class RiskSizedConfig:
     @property
     def breakeven_mode_label(self) -> str:
         return "循环" if self.breakeven_is_loop else "按次"
+
+    @property
+    def is_limit_entry(self) -> bool:
+        return self.entry_mode == ENTRY_MODE_LIMIT
+
+    @property
+    def entry_mode_label(self) -> str:
+        return "限价" if self.is_limit_entry else "市价"
 
 
 def pick_risk_sized_rule(rules: object) -> Optional[dict]:
@@ -182,10 +222,12 @@ def action_matches(rule_action: object, direction: str) -> bool:
 
 @dataclass
 class Batch:
-    """建仓计划里的一笔：全部市价；底仓 TP=0，分散仓挂阶梯上属于自己的那一档。"""
+    """建仓计划里的一笔：底仓 TP=0，分散仓挂阶梯上属于自己的那一档。"""
     index: int
     volume: float
     take_profit: float = 0.0    # 0 表示不设止盈（底仓）
+    price: float = 0.0          # 限价模式的挂单价；0 = 市价成交
+    sl_distance: float = 0.0    # 该档开仓价到止损价的距离（市价模式各档相同）
 
     @property
     def is_base(self) -> bool:
@@ -195,25 +237,36 @@ class Batch:
     def is_distribute(self) -> bool:
         return self.index > 0
 
+    @property
+    def is_pending(self) -> bool:
+        return self.price > 0
+
 
 @dataclass
 class EntryPlan:
     """一次以损定量建仓的完整计划。reject 非空表示不可执行。"""
     direction: str = "BUY"
-    entry_price: float = 0.0    # 开仓侧报价（BUY=ask / SELL=bid），阶梯止盈的锚点
+    entry_price: float = 0.0    # 开仓价：市价=开仓侧报价 / 限价=底仓挂单价，阶梯止盈的锚点
     risk_price: float = 0.0     # 止损触发侧报价（BUY=bid / SELL=ask），止损距离的基准
     spread: float = 0.0
     stop_loss: float = 0.0
     take_profit: float = 0.0    # 阶梯最远一档（吃满盈亏比）；底仓为 0
     tp_step: float = 0.0        # 相邻两档的价格间隔
-    sl_distance: float = 0.0
+    sl_distance: float = 0.0    # 底仓的止损距离；限价模式下各分散仓档更小
     sl_points: float = 0.0
+    # 每手止损亏损。限价模式下是按仓位比例加权的平均值，不是某一档的值
     loss_per_lot: float = 0.0
     planned_lot: float = 0.0    # 按风险金额反推的总手数
     total_lot: float = 0.0      # 等分后实际下单的总手数（≤ planned_lot）
     risk_used: float = 0.0
+    entry_mode: str = ENTRY_MODE_MARKET
+    ladder_step: float = 0.0    # 限价模式下相邻两档挂单价的间隔
     batches: list[Batch] = field(default_factory=list)
     reject: str = ""
+
+    @property
+    def is_limit_entry(self) -> bool:
+        return self.entry_mode == ENTRY_MODE_LIMIT
 
     @property
     def dropped_lot(self) -> float:
@@ -283,6 +336,58 @@ def _split_lots(total_lot: float, cfg: RiskSizedConfig, spec: SymbolSpec) -> lis
     return [base] + [per] * count
 
 
+def _limit_ladder(entry_price: float, stop_loss: float, count: int, digits: int) -> list[float]:
+    """限价阶梯挂单价：index 0 是底仓（挂在入场价），1..count 依次向止损方向等分推进。
+
+    分母取 count+1 而不是 count：末档若正好落在止损价上，一成交就已经触及止损。
+    """
+    span = abs(entry_price - stop_loss)
+    toward_stop = -1 if entry_price > stop_loss else 1
+    return [
+        round(entry_price + toward_stop * span * i / (count + 1), digits)
+        for i in range(count + 1)
+    ]
+
+
+def _risk_of(lots: list[float], distances: list[float], spec: SymbolSpec) -> float:
+    """这组仓位全部成交后打到止损的总亏损。"""
+    if spec.tick_size <= 0:
+        return 0.0
+    paired = sum(lot * dist for lot, dist in zip(lots, distances))
+    return paired / spec.tick_size * spec.tick_value
+
+
+def _planned_weights(cfg: RiskSizedConfig, count: int) -> list[float]:
+    """各档的理论仓位占比：底仓 base_ratio%，剩余在分散仓之间等分。"""
+    if count <= 0:
+        return [1.0]
+    base = min(1.0, max(0.0, cfg.base_ratio / 100.0))
+    return [base] + [(1.0 - base) / count] * count
+
+
+def _fit_lots(cfg: RiskSizedConfig, spec: SymbolSpec, distances: list[float],
+              budget: float, planned: float) -> tuple[list[float], float]:
+    """在风险预算内切分手数，返回 (各档手数, 实际风险)；切不出来返回 ([], 0)。
+
+    切完必须按实际分布复核：向下取整与最小手数托底会让实际仓位偏离配置比例（比如
+    总手数太小时底仓被顶到 volume_min），市价模式下各档止损距离相同，偏离不会放大
+    风险；但限价模式下越靠前的档止损距离越大，偏向前档就会超出预算。
+    """
+    for _ in range(_RISK_FIT_ROUNDS):
+        lots = _split_lots(planned, cfg, spec)
+        risk = _risk_of(lots, distances, spec)
+        if risk <= budget + 1e-9:
+            return lots, risk
+        # 按超出比例收缩；取整可能让结果原地不动，此时强制退一个步长避免空转
+        shrunk = spec.floor_lot(planned * budget / risk) if risk > 0 else 0.0
+        if shrunk >= planned:
+            shrunk = spec.floor_lot(planned - spec.volume_step)
+        planned = shrunk
+        if planned < spec.volume_min:
+            return [], 0.0
+    return [], 0.0
+
+
 def _apply_ladder(plan: EntryPlan, cfg: RiskSizedConfig, spec: SymbolSpec) -> None:
     """给分散仓铺等分阶梯止盈：第 i 档 = 开仓价 + 盈亏比 × 止损距离 × i / 分散仓单数。
 
@@ -309,25 +414,36 @@ def _apply_ladder(plan: EntryPlan, cfg: RiskSizedConfig, spec: SymbolSpec) -> No
 
 
 def plan_entries(cfg: RiskSizedConfig, *, direction: str, entry_price: float,
-                 stop_loss: float, spec: SymbolSpec, risk_price: float = 0.0) -> EntryPlan:
+                 stop_loss: float, spec: SymbolSpec, risk_price: float = 0.0,
+                 limit_price: float = 0.0) -> EntryPlan:
     """按风险金额与止损价反推总手数，切成底仓 + 等手数分散仓，并铺阶梯止盈。
 
-    entry_price 是开仓侧报价（BUY=ask / SELL=bid），阶梯止盈以它为锚；risk_price 是
-    止损触发侧报价（BUY=bid / SELL=ask），止损距离以它为准。拿不到点差时 risk_price
-    留空，两者退化为同一个价。
+    市价模式下 entry_price 是开仓侧报价（BUY=ask / SELL=bid），阶梯止盈以它为锚；
+    risk_price 是止损触发侧报价（BUY=bid / SELL=ask），止损距离以它为准；拿不到
+    点差时 risk_price 留空，两者退化为同一个价。
+
+    限价模式下 limit_price 是信号给的底仓挂单价，它同时充当开仓价与止损距离基准
+    ——挂单按挂单价成交，没有点差与滑点，因此不需要区分开仓侧与止损触发侧。
 
     任何一步算不出可执行的结果都返回带 reject 的计划，由调用方上报后放弃本次任务。
     """
     plan = EntryPlan(direction=str(direction or "BUY").upper(), entry_price=entry_price,
-                     stop_loss=stop_loss)
+                     stop_loss=stop_loss, entry_mode=cfg.entry_mode)
     plan.risk_price = risk_price if risk_price > 0 else entry_price
+    if cfg.is_limit_entry:
+        if limit_price <= 0:
+            plan.reject = "限价开仓需要信号携带入场价"
+            return plan
+        # 挂单成交价就是挂单价，开仓侧与止损触发侧退化为同一个价
+        plan.entry_price = limit_price
+        plan.risk_price = limit_price
     if not action_matches(cfg.action, plan.direction):
         plan.reject = f"规则监控方向为 {cfg.action}，与信号方向 {plan.direction} 不符"
         return plan
     if cfg.risk_amount <= 0:
         plan.reject = "风险金额需大于 0"
         return plan
-    if entry_price <= 0:
+    if plan.entry_price <= 0:
         plan.reject = "无法取得开仓价"
         return plan
     if stop_loss <= 0:
@@ -344,10 +460,20 @@ def plan_entries(cfg: RiskSizedConfig, *, direction: str, entry_price: float,
         )
         return plan
 
-    plan.spread = round(abs(entry_price - plan.risk_price), spec.digits)
+    plan.spread = round(abs(plan.entry_price - plan.risk_price), spec.digits)
     plan.sl_distance = abs(plan.risk_price - stop_loss)
     plan.sl_points = plan.sl_distance / spec.point
-    plan.loss_per_lot = plan.sl_distance / spec.tick_size * spec.tick_value
+
+    # 各档的开仓价与止损距离：市价模式各档同价，限价模式按阶梯递进
+    prices = _limit_ladder(
+        plan.entry_price, stop_loss, cfg.add_batches, spec.digits,
+    ) if cfg.is_limit_entry else []
+    distances = (
+        [abs(p - stop_loss) for p in prices]
+        if prices else [plan.sl_distance] * (cfg.add_batches + 1)
+    )
+    weights = _planned_weights(cfg, cfg.add_batches)
+    plan.loss_per_lot = _risk_of(weights, distances, spec)
     if plan.loss_per_lot <= 0:
         plan.reject = "每手止损亏损算得 0，无法反推手数"
         return plan
@@ -365,11 +491,27 @@ def plan_entries(cfg: RiskSizedConfig, *, direction: str, entry_price: float,
         )
         return plan
 
-    lots = _split_lots(planned, cfg, spec)
+    lots, risk_used = _fit_lots(cfg, spec, distances, cfg.risk_amount, planned)
+    if not lots:
+        plan.reject = (
+            f"按风险金额 {_trim(cfg.risk_amount, 2)} 切不出满足预算的仓位分布，"
+            f"请调大风险金额或减少分散仓单数"
+        )
+        return plan
+
     plan.planned_lot = planned
     plan.total_lot = round(sum(lots), spec.volume_digits)
-    plan.risk_used = round(plan.total_lot * plan.loss_per_lot, 2)
-    plan.batches = [Batch(index=i, volume=volume) for i, volume in enumerate(lots)]
+    plan.risk_used = round(risk_used, 2)
+    plan.batches = [
+        Batch(
+            index=i, volume=volume,
+            price=prices[i] if i < len(prices) else 0.0,
+            sl_distance=distances[i] if i < len(distances) else plan.sl_distance,
+        )
+        for i, volume in enumerate(lots)
+    ]
+    if plan.is_limit_entry and len(prices) > 1:
+        plan.ladder_step = round(abs(prices[0] - prices[1]), spec.digits)
     _apply_ladder(plan, cfg, spec)
     return plan
 
@@ -381,8 +523,13 @@ def anchor_to_fill(plan: EntryPlan, cfg: RiskSizedConfig, fill_price: float,
     手数是按下单前的预估价算的，成交价会有滑点。手数不能再动（底仓已经成交），
     但阶梯必须以真实成交价为锚，否则盈亏比不再是配置值。点差随开仓价一起平移，
     止损距离仍按止损触发侧计。
+
+    限价模式不重锚：挂单按挂单价成交，计划里的价位本来就是最终成交价，拿终端回报
+    的价格再算一遍只会引入取整噪声。
     """
-    if not plan.ok or fill_price <= 0 or fill_price == plan.entry_price:
+    if not plan.ok or plan.is_limit_entry:
+        return plan
+    if fill_price <= 0 or fill_price == plan.entry_price:
         return plan
     sign = _favorable_sign(plan.direction)
     plan.entry_price = fill_price
@@ -537,15 +684,31 @@ def describe_plan(plan: EntryPlan, cfg: RiskSizedConfig, spec: SymbolSpec) -> st
             f"（实下 {_trim(plan.total_lot, vd)}，"
             f"余 {_trim(plan.dropped_lot, vd)} 不开）"
         )
+    limit = plan.is_limit_entry
+    distance_text = (
+        f"加权止损距离 {_trim(plan.sl_points, 1)} 点起"
+        if limit else f"止损距离 {_trim(plan.sl_points, 1)} 点"
+    )
+    base_text = (
+        f"底仓 {_trim(cfg.base_ratio, 1)}% = {_trim(plan.base_volume, vd)} 手"
+        + (f"限价 @{_trim(plan.entry_price, pd)}（TP=0）" if limit else "市价（TP=0）")
+    )
     parts = [
-        f"以损定量：风险金额 {_trim(cfg.risk_amount, 2)} ÷ 每手止损亏损 "
-        f"{_trim(plan.loss_per_lot, 2)}（止损距离 {_trim(plan.sl_points, 1)} 点）"
+        f"以损定量（{cfg.entry_mode_label}开仓）：风险金额 {_trim(cfg.risk_amount, 2)}"
+        f" ÷ 每手止损亏损 {_trim(plan.loss_per_lot, 2)}（{distance_text}）"
         f" = {lot_text}，实际风险 {_trim(plan.risk_used, 2)}",
-        f"底仓 {_trim(cfg.base_ratio, 1)}% = {_trim(plan.base_volume, vd)} 手市价（TP=0）",
+        base_text,
     ]
     if plan.add_batch_count:
+        last = plan.batches[-1]
+        ladder = (
+            f"阶梯限价 @{_trim(plan.batches[1].price, pd)} → {_trim(last.price, pd)}"
+            f"（步长 {_trim(plan.ladder_step, pd)}）"
+            if limit else "市价"
+        )
         parts.append(
-            f"分散仓 {_trim(plan.distribute_volume, vd)} 手等分 {plan.add_batch_count} 单市价"
+            f"分散仓 {_trim(plan.distribute_volume, vd)} 手等分 "
+            f"{plan.add_batch_count} 单{ladder}"
             + (f"（阶梯止盈 {_trim(plan.batches[1].take_profit, pd)} → "
                f"{_trim(plan.take_profit, pd)}，步长 {_trim(plan.tp_step, pd)}，"
                f"满档盈亏比 {_trim(cfg.rr_ratio, 2)}）"
@@ -556,6 +719,8 @@ def describe_plan(plan: EntryPlan, cfg: RiskSizedConfig, spec: SymbolSpec) -> st
     parts.append(
         f"共用止损 {_trim(plan.stop_loss, spec.digits)}，共 {plan.order_count} 单"
     )
+    if limit:
+        parts.append("风险金额按全部档位成交计；只成交前几档就止损的话实际亏损更小")
     return "；".join(parts)
 
 
@@ -564,6 +729,9 @@ def plan_detail(plan: EntryPlan, cfg: RiskSizedConfig, spec: SymbolSpec) -> dict
     return {
         "kind": "risk_sized_plan",
         "direction": plan.direction,
+        "entry_mode": plan.entry_mode,
+        "entry_mode_label": cfg.entry_mode_label,
+        "ladder_step": plan.ladder_step or None,
         "entry_price": plan.entry_price,
         "risk_price": plan.risk_price,
         "spread": plan.spread or None,
@@ -600,6 +768,8 @@ def plan_detail(plan: EntryPlan, cfg: RiskSizedConfig, spec: SymbolSpec) -> dict
                 "index": b.index,
                 "volume": b.volume,
                 "take_profit": b.take_profit or None,
+                "price": b.price or None,
+                "sl_distance": round(b.sl_distance, 8) or None,
                 "role": "base" if b.is_base else "distribute",
             }
             for b in plan.batches
@@ -611,10 +781,14 @@ def describe_batch(plan: EntryPlan, cfg: RiskSizedConfig, batch: Batch,
                    spec: SymbolSpec, price: float) -> str:
     """一笔分散仓的开单原因。"""
     del cfg  # 说明里用 plan / batch 即可
+    way = (
+        f"限价 {_trim(batch.volume, spec.volume_digits)} 手 @{_trim(batch.price, spec.digits)}"
+        if batch.is_pending
+        else f"市价 {_trim(batch.volume, spec.volume_digits)} 手"
+    )
     return (
         f"以损定量分散仓 · 第 {batch.index}/{plan.add_batch_count} 档："
-        f"市价 {_trim(batch.volume, spec.volume_digits)} 手"
-        f"（现价 {_trim(price, spec.digits)}）；"
+        f"{way}（现价 {_trim(price, spec.digits)}）；"
         f"共用止损 {_trim(plan.stop_loss, spec.digits)}，阶梯止盈 "
         + (f"{_trim(batch.take_profit, spec.digits)}"
            f"（满档 {_trim(plan.take_profit, spec.digits)}）"
@@ -633,7 +807,9 @@ def batch_detail(plan: EntryPlan, cfg: RiskSizedConfig, batch: Batch,
         "batch_total": plan.add_batch_count,
         "order_count": plan.order_count,
         "direction": plan.direction,
+        "entry_mode": plan.entry_mode,
         "entry_price": plan.entry_price,
+        "limit_price": batch.price or None,
         "price": price,
         "volume": batch.volume,
         "total_lot": plan.total_lot,

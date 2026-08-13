@@ -3,8 +3,13 @@
 - 品种解析：自动尝试券商后缀并 symbol_select 选入行情；
 - 填充模式：探测 FOK/IOC/RETURN，遇到 10030(不支持填充模式)自动切换；
 - 市价单：TRADE_ACTION_DEAL，带 deviation(滑点)/magic(魔术号)/comment；
+- 挂单：TRADE_ACTION_PENDING，价格由调用方给定，撤单走 TRADE_ACTION_REMOVE；
 - 平仓：用反方向 deal + position(订单号) 在当前价平掉；
 - 重试：对瞬时错误(requote/价格变动等)刷新价格后重试。
+
+「平掉某魔术号 / 某品种 / 全部」这三个收口口径一律连挂单一起撤：只平持仓会把未成交
+的挂单留在终端里，等策略任务收口、监控停掉之后它仍可能成交，变成没有止盈止损也没有
+保本监控的孤儿仓。
 """
 import logging
 import time
@@ -24,8 +29,33 @@ RET_REQUOTE = 10004         # 重新报价
 RET_PRICE_CHANGED = 10020   # 价格已变
 RET_PRICE_OFF = 10021       # 无报价/价格关闭
 RET_TIMEOUT = 10012         # 超时
+RET_INVALID_PRICE = 10015   # 价格非法
+RET_INVALID_STOPS = 10016   # 止损/挂单价距现价太近（低于 stops_level）
 RET_INVALID_FILL = 10030    # 不支持的填充模式
 TRANSIENT = {RET_REQUOTE, RET_PRICE_CHANGED, RET_PRICE_OFF, RET_TIMEOUT}  # 可重试的瞬时错误
+
+# 挂单方向。limit = 等价格回到更有利处成交；stop = 等价格突破后成交。
+PENDING_LIMIT = "limit"
+PENDING_STOP = "stop"
+PENDING_KINDS = (PENDING_LIMIT, PENDING_STOP)
+
+# (方向, 挂单类型) -> MT5 订单类型。与 TIMEFRAMES 同样做导入守卫：非 Windows 上
+# MetaTrader5 不可用时留空，下挂单的入口会因此直接返回失败而不是抛 AttributeError。
+PENDING_ORDER_TYPES: dict[tuple[str, str], int] = (
+    {
+        ("BUY", PENDING_LIMIT): mt5.ORDER_TYPE_BUY_LIMIT,
+        ("SELL", PENDING_LIMIT): mt5.ORDER_TYPE_SELL_LIMIT,
+        ("BUY", PENDING_STOP): mt5.ORDER_TYPE_BUY_STOP,
+        ("SELL", PENDING_STOP): mt5.ORDER_TYPE_SELL_STOP,
+    }
+    if mt5 is not None
+    else {}
+)
+
+# MT5 订单类型 -> (方向, 挂单类型)，读 orders_get 时把数字还原成可读字段
+_PENDING_TYPE_NAMES: dict[int, tuple[str, str]] = {
+    v: k for k, v in PENDING_ORDER_TYPES.items()
+}
 
 # 策略档位可选的 K 线周期 -> MT5 常量。模块导入时 MetaTrader5 可能不可用（非 Windows），
 # 那时留空字典，读 K 线的入口会因此直接返回空列表。
@@ -77,6 +107,11 @@ def peek_logged_in_account(path: str) -> dict | None:
 
 def _closed_count(results: list[dict]) -> int:
     """实际平掉的笔数：失败的不计入，避免把尝试笔数当成已平笔数上报。"""
+    return sum(1 for r in results if r.get("success"))
+
+
+def _cancelled_count(results: list[dict]) -> int:
+    """实际撤掉的挂单笔数，口径同 _closed_count。"""
     return sum(1 for r in results if r.get("success"))
 
 
@@ -194,6 +229,44 @@ class MT5Client:
             )
         return out
 
+    def pending_orders(self) -> list[dict]:
+        """返回当前所有未成交挂单（字段口径对齐 positions，方便上层同构处理）。
+
+        `volume` 取 volume_current（剩余待成交量）而不是 volume_initial：部分成交
+        后剩下的才是还挂在盘上的量。
+        """
+        self.ensure()
+        out = []
+        for o in mt5.orders_get() or []:
+            otype = int(getattr(o, "type", -1))
+            direction, kind = _PENDING_TYPE_NAMES.get(otype, ("", ""))
+            if not direction:
+                continue  # 市价单在 orders_get 里只是瞬时态，不纳入挂单口径
+            out.append(
+                {
+                    "ticket": o.ticket,
+                    "symbol": o.symbol,
+                    "type": direction,
+                    "pending_kind": kind,
+                    "volume": float(
+                        getattr(o, "volume_current", 0) or getattr(o, "volume_initial", 0) or 0
+                    ),
+                    "price_open": float(getattr(o, "price_open", 0) or 0),
+                    "price_current": float(getattr(o, "price_current", 0) or 0),
+                    "sl": float(getattr(o, "sl", 0) or 0),
+                    "tp": float(getattr(o, "tp", 0) or 0),
+                    "magic": int(getattr(o, "magic", 0) or 0),
+                    "comment": getattr(o, "comment", "") or "",
+                    "time": getattr(o, "time_setup", 0),
+                }
+            )
+        return out
+
+    def pending_orders_by_magic(self, magic: int) -> list[dict]:
+        """按魔术号筛选挂单：策略任务据此判断自己名下还有没有在途的单。"""
+        target = int(magic)
+        return [o for o in self.pending_orders() if int(o.get("magic") or 0) == target]
+
     def _daily_change_pct(self, info, mid: float) -> float:
         """日涨跌幅 %，与 MT5 Market Watch「Daily Change」列一致（SYMBOL_PRICE_CHANGE，相对昨收）。"""
         if info is not None:
@@ -263,8 +336,19 @@ class MT5Client:
         logger.warning("symbol not resolved: %s", symbol)
         return None
 
-    def filling_modes(self, symbol: str) -> list[int]:
-        """返回该品种可尝试的填充模式顺序（优先用品种支持的，再补全兜底项）。"""
+    def filling_modes(self, symbol: str, *, pending: bool = False) -> list[int]:
+        """返回该品种可尝试的填充模式顺序（优先用品种支持的，再补全兜底项）。
+
+        挂单要单独排序：挂单在成交前一直留在盘上，语义上就是 RETURN（未成交部分
+        保留），多数券商对 TRADE_ACTION_PENDING 只接受它，而 symbol_info.filling_mode
+        这个位掩码描述的是市价成交能力，照搬过来会让首选项必然吃到 10030。
+        """
+        if pending:
+            return [
+                mt5.ORDER_FILLING_RETURN,
+                mt5.ORDER_FILLING_IOC,
+                mt5.ORDER_FILLING_FOK,
+            ]
         info = mt5.symbol_info(symbol)
         order = []
         if info is not None:
@@ -354,6 +438,172 @@ class MT5Client:
             "symbol": symbol,
             "retcode": getattr(last, "retcode", None),
             "error": getattr(last, "comment", "order failed after retries"),
+        }
+
+    def check_pending_price(self, symbol: str, action: str, price: float,
+                            kind: str = PENDING_LIMIT) -> Optional[str]:
+        """校验挂单价是否落在合法一侧且离现价足够远；合法返回 None，否则返回原因。
+
+        单独抽出来是为了让上层能在真正下单前批量预检一整组阶梯价：挂单被券商拒掉
+        （10015 价格非法 / 10016 距离太近）不像市价单那样重试就能好，只能改价，
+        所以宁可在下第一笔之前就发现整组都不可行。
+        """
+        resolved = self.resolve_symbol(symbol)
+        if not resolved:
+            return f"symbol not found: {symbol}"
+        if price <= 0:
+            return "挂单价需大于 0"
+        tick = mt5.symbol_info_tick(resolved)
+        if tick is None:
+            return "no tick"
+        info = mt5.symbol_info(resolved)
+        point = float(getattr(info, "point", 0.0) or 0.0) if info else 0.0
+        digits = int(getattr(info, "digits", 5) or 5) if info else 5
+        stops = int(getattr(info, "trade_stops_level", 0) or 0) if info else 0
+        # 挂单成交侧：BUY 用 ask、SELL 用 bid，与该方向真正的成交价口径一致
+        market = float(tick.ask if action == "BUY" else tick.bid)
+        if market <= 0:
+            return "no tick"
+        below = price < market
+        # BUY LIMIT 挂在现价下方等回落，SELL LIMIT 挂在上方等反弹；STOP 单方向相反
+        want_below = (action == "BUY") == (kind == PENDING_LIMIT)
+        if below != want_below:
+            side = "低于" if want_below else "高于"
+            return (
+                f"{action} {kind} 挂单价 {round(price, digits)} 必须{side}现价 "
+                f"{round(market, digits)}"
+            )
+        if stops > 0 and point > 0 and abs(price - market) < stops * point:
+            return (
+                f"挂单价距现价 {round(abs(price - market) / point)} 点，"
+                f"低于券商要求的 {stops} 点"
+            )
+        return None
+
+    def place_pending_order(self, symbol: str, action: str, volume: float, price: float,
+                            sl: Optional[float] = None, tp: Optional[float] = None,
+                            comment: str = "", magic: Optional[int] = None,
+                            kind: str = PENDING_LIMIT, max_retry: int = 3) -> dict:
+        """挂限价 / 止损单。成功返回 pending=True，此时只是挂上了，并未成交。
+
+        与市价单的关键差别：价格由调用方给定，不刷新、不重取，因此瞬时错误重试也
+        不会改价；请求里没有 deviation（挂单按挂单价成交，没有滑点容忍的概念）。
+        """
+        self.ensure()
+        resolved = self.resolve_symbol(symbol)
+        if not resolved:
+            return {"success": False, "error": f"symbol not found: {symbol}"}
+        kind = str(kind or PENDING_LIMIT).strip().lower()
+        order_type = PENDING_ORDER_TYPES.get((action, kind))
+        if order_type is None:
+            return {"success": False, "symbol": symbol,
+                    "error": f"unsupported pending order: {action} {kind}"}
+        reject = self.check_pending_price(symbol, action, float(price), kind)
+        if reject:
+            return {"success": False, "symbol": symbol, "error": reject}
+
+        fillings = self.filling_modes(resolved, pending=True)
+        fill_idx = 0
+        attempt = 0
+        last = None
+
+        while attempt <= max_retry and fill_idx < len(fillings):
+            request = {
+                "action": mt5.TRADE_ACTION_PENDING,
+                "symbol": resolved,
+                "volume": float(volume),
+                "type": order_type,
+                "price": float(price),
+                "magic": int(magic if magic is not None else self.magic),
+                "comment": comment or "tv-signal",
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": fillings[fill_idx],
+            }
+            if sl:
+                request["sl"] = float(sl)
+            if tp:
+                request["tp"] = float(tp)
+
+            result = mt5.order_send(request)
+            last = result
+            if result is None:
+                logger.error("pending order_send returned None: %s", mt5.last_error())
+                attempt += 1
+                continue
+
+            rc = result.retcode
+            if rc in (RET_DONE, RET_DONE_PARTIAL):
+                return {
+                    "success": True,
+                    "pending": True,
+                    "symbol": symbol,
+                    "action": action,
+                    "pending_kind": kind,
+                    "retcode": rc,
+                    "order": result.order,
+                    "volume": float(volume),
+                    "price": float(price),
+                }
+            if rc == RET_INVALID_FILL:
+                fill_idx += 1
+                continue
+            if rc in TRANSIENT:
+                attempt += 1
+                time.sleep(min(0.3 * attempt, 1.5))
+                continue
+            return {"success": False, "symbol": symbol, "retcode": rc, "error": result.comment}
+
+        return {
+            "success": False,
+            "symbol": symbol,
+            "retcode": getattr(last, "retcode", None),
+            "error": getattr(last, "comment", "pending order failed after retries"),
+        }
+
+    def cancel_order(self, ticket: int, max_retry: int = 3) -> dict:
+        """撤掉一张挂单（TRADE_ACTION_REMOVE）。
+
+        撤单失败留下的是无人管的在途单，和平仓失败一样危险，所以同样对瞬时错误重试。
+        """
+        self.ensure()
+        target = int(ticket)
+        attempt = 0
+        last = None
+        while attempt <= max_retry:
+            result = mt5.order_send({"action": mt5.TRADE_ACTION_REMOVE, "order": target})
+            last = result
+            if result is None:
+                logger.error("cancel order_send returned None: %s", mt5.last_error())
+                attempt += 1
+                continue
+            rc = result.retcode
+            if rc in (RET_DONE, RET_DONE_PARTIAL):
+                return {"success": True, "action": "CANCEL", "ticket": target, "retcode": rc}
+            if rc in TRANSIENT:
+                attempt += 1
+                time.sleep(min(0.3 * attempt, 1.5))
+                continue
+            return {"success": False, "action": "CANCEL", "ticket": target,
+                    "retcode": rc, "error": result.comment}
+        return {
+            "success": False,
+            "action": "CANCEL",
+            "ticket": target,
+            "retcode": getattr(last, "retcode", None),
+            "error": getattr(last, "comment", "cancel failed after retries"),
+        }
+
+    def cancel_orders_by_magic(self, magic: int) -> dict:
+        """撤掉某魔术号名下的全部挂单（只动本任务的单）。"""
+        results = [
+            self.cancel_order(int(o["ticket"])) for o in self.pending_orders_by_magic(magic)
+        ]
+        return {
+            "success": all(r.get("success") for r in results) if results else True,
+            "action": "CANCEL",
+            "magic": int(magic),
+            "cancelled": _cancelled_count(results),
+            "results": results,
         }
 
     def close_position(self, pos: dict, max_retry: int = 3) -> dict:
@@ -448,15 +698,24 @@ class MT5Client:
         return [p for p in self.positions() if int(p.get("magic") or 0) == target]
 
     def close_by_magic(self, magic: int) -> dict:
-        """平掉某魔术号的全部持仓（只动本任务的单，不影响同品种其它持仓）。"""
+        """平掉某魔术号的全部持仓并撤掉其挂单（只动本任务的单）。
+
+        先撤单再平仓：反过来的话，平仓到撤单之间价格若正好触及挂单价，会当场成交
+        出一笔新持仓，收口完成时账上反而又有仓了。
+        """
+        cancels = [
+            self.cancel_order(int(o["ticket"])) for o in self.pending_orders_by_magic(magic)
+        ]
         results = [self.close_position(p) for p in self.positions_by_magic(magic)]
-        ok = all(r.get("success") for r in results) if results else True
+        ok = all(r.get("success") for r in results + cancels) if results or cancels else True
         return {
             "success": ok,
             "action": "CLOSE",
             "magic": int(magic),
             "closed": _closed_count(results),
+            "cancelled": _cancelled_count(cancels),
             "results": results,
+            "cancel_results": cancels,
         }
 
     def _history_deals(self, since_ts: float | None = None):
@@ -550,6 +809,8 @@ class MT5Client:
             "volume_min": float(getattr(info, "volume_min", 0.0) or 0.0),
             "volume_step": float(getattr(info, "volume_step", 0.0) or 0.0),
             "volume_max": float(getattr(info, "volume_max", 0.0) or 0.0),
+            # 挂单价与止损价距现价的最小点数，0 = 券商不限制
+            "stops_level": int(getattr(info, "trade_stops_level", 0) or 0),
         }
 
     def modify_position_sl(self, ticket: int, sl: float,
@@ -639,19 +900,28 @@ class MT5Client:
         ]
 
     def close_symbol(self, symbol: str) -> dict:
-        """平掉某品种的所有持仓（兼容券商后缀）。"""
+        """平掉某品种的所有持仓并撤掉其挂单（兼容券商后缀）。"""
         base = symbol.upper().replace("/", "")
-        results = []
-        for p in self.positions():
-            if p["symbol"].upper().startswith(base) or base.startswith(p["symbol"].upper()):
-                results.append(self.close_position(p))
-        ok = all(r.get("success") for r in results) if results else True
+
+        def _match(name: str) -> bool:
+            name = name.upper()
+            return name.startswith(base) or base.startswith(name)
+
+        cancels = [
+            self.cancel_order(int(o["ticket"]))
+            for o in self.pending_orders() if _match(str(o.get("symbol") or ""))
+        ]
+        results = [p for p in self.positions() if _match(str(p.get("symbol") or ""))]
+        results = [self.close_position(p) for p in results]
+        ok = all(r.get("success") for r in results + cancels) if results or cancels else True
         return {
             "success": ok,
             "symbol": symbol.upper(),
             "action": "CLOSE",
             "closed": _closed_count(results),
+            "cancelled": _cancelled_count(cancels),
             "results": results,
+            "cancel_results": cancels,
         }
 
     def close_positions(self, positions: list[dict]) -> dict:
@@ -672,14 +942,20 @@ class MT5Client:
         }
 
     def close_all(self) -> dict:
-        """平掉账户全部持仓。"""
+        """平掉账户全部持仓并撤掉全部挂单。
+
+        这是账户级风控清仓的落点，留着挂单等于清完仓又埋了一颗重新开仓的雷。
+        """
+        cancels = [self.cancel_order(int(o["ticket"])) for o in self.pending_orders()]
         results = [self.close_position(p) for p in self.positions()]
-        ok = all(r.get("success") for r in results) if results else True
+        ok = all(r.get("success") for r in results + cancels) if results or cancels else True
         symbol = results[0]["symbol"] if len(results) == 1 else None
         return {
             "success": ok,
             "symbol": symbol,
             "action": "CLOSE",
             "closed": _closed_count(results),
+            "cancelled": _cancelled_count(cancels),
             "results": results,
+            "cancel_results": cancels,
         }

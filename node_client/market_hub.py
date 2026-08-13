@@ -11,8 +11,13 @@ MQL5 EA 主动推送，只需换掉本模块的采样实现，执行器不必改
 两条关键约定，都是为了不把「读不到」当成「没有」：
 - 持仓读取失败派发 STALE 而不是空持仓，订阅方据此区分「确实已全平」与「这一轮
   没读到」，避免查询异常被误判为任务完成；
-- 只有在曾经观察到过该魔术号的持仓之后，才可能派发 GONE。首单尚未反映到终端时
-  不会误报收口，这种漏报由服务端的账户快照对账兜底。
+- 只有在曾经观察到过该魔术号在终端上的痕迹（持仓或挂单）之后，才可能派发 GONE。
+  首单尚未反映到终端时不会误报收口，这种漏报由服务端的账户快照对账兜底。
+
+挂单（限价开仓）只对 track_orders 的订阅采样：市价链路一笔挂单都不会有，每轮多调
+一次 orders_get 纯属浪费。对这类订阅，「无持仓」不再等于「已收口」——挂单还在盘上
+就说明任务仍在途，此时派发 TICK 而不是 GONE，否则任务会在挂单成交前就被判完成，
+留下一张没人监控的孤儿单。
 """
 from __future__ import annotations
 
@@ -46,6 +51,28 @@ def _as_int(value: object) -> Optional[int]:
         return None
 
 
+def _group_by_magic(rows: list[dict]) -> dict[int, list[dict]]:
+    """把持仓 / 挂单按魔术号分桶，无魔术号的丢弃（不属于任何策略任务）。"""
+    out: dict[int, list[dict]] = {}
+    for row in rows:
+        magic = _as_int((row or {}).get("magic"))
+        if magic is None:
+            continue
+        out.setdefault(magic, []).append(row)
+    return out
+
+
+def _signature(held: list[dict], resting: list[dict]) -> tuple:
+    """持仓与挂单的构成签名，变化即说明有单成交 / 被平 / 被撤，需要重新判定。
+
+    两者分开记：挂单成交后持仓票号通常沿用原挂单票号，合成一个集合会看不出变化。
+    """
+    return (
+        tuple(sorted(_as_int(p.get("ticket")) or 0 for p in held)),
+        tuple(sorted(_as_int(o.get("ticket")) or 0 for o in resting)),
+    )
+
+
 @dataclass(frozen=True)
 class MarketEvent:
     """派发给订阅者的一次事件快照。"""
@@ -56,6 +83,8 @@ class MarketEvent:
     price: float = 0.0
     point: float = 0.0
     ts: float = 0.0
+    # 该魔术号名下未成交的挂单；仅 track_orders 的订阅会被填充
+    orders: tuple[dict, ...] = ()
 
 
 @dataclass
@@ -67,11 +96,15 @@ class Subscription:
 
     hold_when_empty：网格等策略空仓是常态（等待触发价 / 全部卖出后等回落），
     为 True 时不派发 GONE，继续按价格变化派发 TICK / IDLE。
+
+    track_orders：限价开仓的任务在成交前只有挂单没有持仓，置 True 后本订阅会带上
+    该魔术号的挂单，且挂单还在时不判 GONE。
     """
     symbol: str
     magic: int
     direction: str
     hold_when_empty: bool = False
+    track_orders: bool = False
 
     # —— 变更检测状态（仅 MarketHub 读写）——
     signature: tuple = ()
@@ -165,12 +198,13 @@ class MarketHub:
 
     def subscribe(
         self, *, symbol: str, magic: int, direction: str,
-        hold_when_empty: bool = False,
+        hold_when_empty: bool = False, track_orders: bool = False,
     ) -> Subscription:
         sub = Subscription(
             symbol=str(symbol or ""), magic=int(magic),
             direction=str(direction or "BUY").upper(),
             hold_when_empty=bool(hold_when_empty),
+            track_orders=bool(track_orders),
         )
         self._subs.append(sub)
         self._awake.set()  # 采样协程可能正在空转等待，唤醒它开始工作
@@ -211,19 +245,23 @@ class MarketHub:
             self._offer_stale(subs, now)
             return
 
-        by_magic: dict[int, list[dict]] = {}
-        for pos in positions:
-            magic = _as_int((pos or {}).get("magic"))
-            if magic is None:
-                continue
-            by_magic.setdefault(magic, []).append(pos)
+        by_magic = _group_by_magic(positions)
+        # 只要有一个订阅在跟挂单就读一轮；市价链路全程不会走到这里
+        orders_by_magic: dict[int, list[dict]] = {}
+        if any(s.track_orders for s in subs):
+            ok_orders, orders = await self._read_orders()
+            if not ok_orders:
+                self._offer_stale(subs, now)
+                return
+            orders_by_magic = _group_by_magic(orders)
 
         quotes = await self._read_quotes([s.symbol for s in subs])
         for sub in subs:
             held = by_magic.get(sub.magic, [])
+            resting = orders_by_magic.get(sub.magic, []) if sub.track_orders else []
             price = self._pick_price(quotes, sub, held)
             point = await self._point(sub.symbol)
-            kind = self._classify(sub, held, price, now)
+            kind = self._classify(sub, held, resting, price, now)
             if kind is None:
                 continue
             sub.published_at = now
@@ -231,6 +269,7 @@ class MarketHub:
                 MarketEvent(
                     kind=kind, symbol=sub.symbol, magic=sub.magic,
                     positions=tuple(held), price=price, point=point, ts=now,
+                    orders=tuple(resting),
                 )
             )
 
@@ -256,15 +295,21 @@ class MarketHub:
         return None
 
     def _classify(
-        self, sub: Subscription, held: list[dict], price: float, now: float,
+        self, sub: Subscription, held: list[dict], resting: list[dict],
+        price: float, now: float,
     ) -> Optional[str]:
         """判断这一轮要不要给该订阅者派发事件，以及派发哪一种。"""
+        if resting:
+            # 挂单还在盘上，任务就还在途：即使一笔持仓都没有也不能判收口
+            sub.seen = True
+            sub.empty_hits = 0
+            return self._price_event(sub, _signature(held, resting), price, now)
         if not held:
             if sub.hold_when_empty:
                 # 网格：空仓是常态（等待触发价 / 全部卖出后等回落），继续按价格变化派发
-                return self._price_event(sub, (0, ()), price, now)
+                return self._price_event(sub, _signature([], []), price, now)
             if not sub.seen:
-                # 从未观察到过持仓：首单可能还没反映到终端，此时判全平会误收口，
+                # 从未观察到过持仓或挂单：首单可能还没反映到终端，此时判全平会误收口，
                 # 真正的漏报交给服务端账户快照对账兜底
                 return None
             sub.empty_hits += 1
@@ -275,11 +320,7 @@ class MarketHub:
 
         sub.seen = True
         sub.empty_hits = 0
-        signature = (
-            len(held),
-            tuple(sorted(_as_int(p.get("ticket")) or 0 for p in held)),
-        )
-        return self._price_event(sub, signature, price, now)
+        return self._price_event(sub, _signature(held, resting), price, now)
 
     # ------------------------------------------------------------------
     # MT5 访问
@@ -290,6 +331,24 @@ class MarketHub:
             rows = await self._exec(self._mt5.positions)
         except Exception as e:  # noqa: BLE001
             logger.debug("hub read positions failed: %s", e)
+            return False, []
+        if rows is None:
+            return False, []
+        return True, list(rows)
+
+    async def _read_orders(self) -> tuple[bool, list[dict]]:
+        """读全部未成交挂单，口径与 _read_positions 一致。
+
+        读失败时整轮退化为 STALE：把「没读到挂单」当成「挂单已消失」，会让还在
+        等成交的任务被判收口。
+        """
+        reader = getattr(self._mt5, "pending_orders", None)
+        if reader is None:
+            return True, []  # 旧版客户端没有挂单能力，等价于没有挂单
+        try:
+            rows = await self._exec(reader)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("hub read pending orders failed: %s", e)
             return False, []
         if rows is None:
             return False, []

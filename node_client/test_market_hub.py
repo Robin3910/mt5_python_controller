@@ -16,10 +16,13 @@ class FakeMT5:
 
     def __init__(self) -> None:
         self._positions: list[dict] = []
+        self._orders: list[dict] = []
         self.quote = {"bid": 2330.0, "ask": 2330.2, "mid": 2330.1, "change": 0.0}
         self.point = 0.01
         self.fail_positions = False
+        self.fail_orders = False
         self.positions_calls = 0
+        self.orders_calls = 0
         self.quotes_calls = 0
         self.bars_calls = 0
         self.fail_bars = False
@@ -31,6 +34,12 @@ class FakeMT5:
         if self.fail_positions:
             raise RuntimeError("terminal unavailable")
         return [dict(p) for p in self._positions]
+
+    def pending_orders(self) -> list[dict]:
+        self.orders_calls += 1
+        if self.fail_orders:
+            raise RuntimeError("terminal unavailable")
+        return [dict(o) for o in self._orders]
 
     def quotes(self, symbols) -> dict:
         self.quotes_calls += 1
@@ -57,8 +66,18 @@ class FakeMT5:
             "profit": 0.0, "time": ticket,
         })
 
+    def add_order(self, *, ticket: int, magic: int, price: float = 2320.0) -> None:
+        self._orders.append({
+            "ticket": ticket, "magic": magic, "symbol": "XAUUSD", "type": "BUY",
+            "pending_kind": "limit", "volume": 0.1, "price_open": price,
+            "price_current": price, "sl": 2300.0, "tp": 0.0, "time": ticket,
+        })
+
     def clear(self) -> None:
         self._positions = []
+
+    def clear_orders(self) -> None:
+        self._orders = []
 
 
 async def _exec(fn, *args):
@@ -426,3 +445,130 @@ async def test_hold_when_empty_false_still_emits_gone():
     mt5.clear()
     await hub.sample()
     assert (await sub.next_event()).kind == mh.GONE
+
+
+# ---------------------------------------------------------------------------
+# 挂单可见性：限价开仓在成交前只有挂单，误判收口会留下孤儿单
+# ---------------------------------------------------------------------------
+
+async def test_orders_not_read_unless_tracked():
+    """市价链路一笔挂单都不会有，每轮多调一次 orders_get 纯属浪费。"""
+    mt5 = FakeMT5()
+    mt5.add(ticket=1, magic=MAGIC)
+    hub = _hub(mt5)
+    hub.subscribe(symbol="XAUUSD", magic=MAGIC, direction="BUY")
+
+    await hub.sample()
+    assert mt5.orders_calls == 0
+
+
+async def test_tracked_subscription_reads_orders_once_per_round():
+    mt5 = FakeMT5()
+    mt5.add_order(ticket=51, magic=MAGIC)
+    hub = _hub(mt5)
+    hub.subscribe(symbol="XAUUSD", magic=MAGIC, direction="BUY", track_orders=True)
+    hub.subscribe(symbol="XAUUSD", magic=OTHER_MAGIC, direction="BUY", track_orders=True)
+
+    await hub.sample()
+    assert mt5.orders_calls == 1  # 一轮一次，覆盖全部订阅者
+
+
+async def test_resting_order_blocks_gone():
+    """挂单还在盘上就说明任务在途：此时判收口会让挂单变成没人监控的孤儿单。"""
+    mt5 = FakeMT5()
+    mt5.add_order(ticket=51, magic=MAGIC)
+    hub = _hub(mt5, empty_confirm=1)
+    sub = hub.subscribe(symbol="XAUUSD", magic=MAGIC, direction="BUY", track_orders=True)
+
+    for _ in range(5):
+        await hub.sample()
+
+    event = await sub.next_event()
+    assert event.kind == mh.TICK
+    assert event.positions == ()
+    assert len(event.orders) == 1
+    assert sub.empty_hits == 0
+
+
+async def test_gone_after_order_cancelled_without_fill():
+    """挂单被撤又没成交：见过挂单就算见过痕迹，此后空仓要能正常收口，否则占位泄漏。"""
+    mt5 = FakeMT5()
+    mt5.add_order(ticket=51, magic=MAGIC)
+    hub = _hub(mt5, empty_confirm=1)
+    sub = hub.subscribe(symbol="XAUUSD", magic=MAGIC, direction="BUY", track_orders=True)
+
+    await hub.sample()
+    assert (await sub.next_event()).kind == mh.TICK
+    assert sub.seen is True
+
+    mt5.clear_orders()
+    await hub.sample()
+    assert (await sub.next_event()).kind == mh.GONE
+
+
+async def test_order_fill_changes_signature_and_emits_tick():
+    """挂单成交后票号从挂单挪到持仓，签名必须变，否则订阅方看不到进场。"""
+    mt5 = FakeMT5()
+    mt5.add_order(ticket=51, magic=MAGIC)
+    hub = _hub(mt5, empty_confirm=1)
+    sub = hub.subscribe(symbol="XAUUSD", magic=MAGIC, direction="BUY", track_orders=True)
+
+    await hub.sample()
+    assert (await sub.next_event()).kind == mh.TICK
+
+    mt5.clear_orders()
+    mt5.add(ticket=51, magic=MAGIC)
+    await hub.sample()
+    event = await sub.next_event()
+    assert event.kind == mh.TICK
+    assert len(event.positions) == 1
+    assert event.orders == ()
+
+
+async def test_order_read_failure_emits_stale_not_gone():
+    """读不到挂单不等于挂单没了：整轮退化为 STALE，绝不据此收口。"""
+    mt5 = FakeMT5()
+    mt5.add(ticket=1, magic=MAGIC)
+    hub = _hub(mt5, interval=0.05, idle_interval=0.05, empty_confirm=1)
+    sub = hub.subscribe(symbol="XAUUSD", magic=MAGIC, direction="BUY", track_orders=True)
+
+    await hub.sample()
+    assert (await sub.next_event()).kind == mh.TICK
+
+    mt5.fail_orders = True
+    mt5.clear()
+    await asyncio.sleep(0.07)  # 越过 STALE 限流窗口
+    await hub.sample()
+    assert (await sub.next_event()).kind == mh.STALE
+    assert sub.empty_hits == 0
+
+
+async def test_other_magic_orders_do_not_keep_task_alive():
+    """别的策略的挂单不能替本任务续命，否则收口永远等不到。"""
+    mt5 = FakeMT5()
+    mt5.add(ticket=1, magic=MAGIC)
+    mt5.add_order(ticket=51, magic=OTHER_MAGIC)
+    hub = _hub(mt5, empty_confirm=1)
+    sub = hub.subscribe(symbol="XAUUSD", magic=MAGIC, direction="BUY", track_orders=True)
+
+    await hub.sample()
+    assert (await sub.next_event()).kind == mh.TICK
+
+    mt5.clear()
+    await hub.sample()
+    assert (await sub.next_event()).kind == mh.GONE
+
+
+async def test_missing_pending_orders_api_degrades_to_empty():
+    """旧版客户端没有挂单能力：等价于没有挂单，不能整条链路报错。"""
+
+    class Legacy(FakeMT5):
+        pending_orders = None  # type: ignore[assignment]
+
+    mt5 = Legacy()
+    mt5.add(ticket=1, magic=MAGIC)
+    hub = _hub(mt5, empty_confirm=1)
+    sub = hub.subscribe(symbol="XAUUSD", magic=MAGIC, direction="BUY", track_orders=True)
+
+    await hub.sample()
+    assert (await sub.next_event()).kind == mh.TICK

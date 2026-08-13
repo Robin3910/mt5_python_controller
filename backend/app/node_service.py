@@ -6,6 +6,7 @@
 所有写操作都遵循“先写库、再刷新缓存”的顺序，保证重启后能从库里恢复全部状态。
 """
 import time
+from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import func, select
@@ -35,6 +36,10 @@ def node_row_to_dict(row: Node) -> dict:
         "risk": risk_control.normalize_risk(row.risk_json),
         "mt5_login": row.mt5_login,
         "mt5_server": row.mt5_server,
+        "client_version": row.client_version,
+        "client_version_at": (
+            row.client_version_at.timestamp() if row.client_version_at else None
+        ),
         "created_at": row.created_at.timestamp() if row.created_at else time.time(),
     }
 
@@ -206,6 +211,30 @@ async def apply_risk_state(store: RedisStore, node_id: str, risk: dict) -> Optio
         if err:
             raise ValueError(err)
         row.risk_json = merged
+        await s.commit()
+        await s.refresh(row)
+        d = node_row_to_dict(row)
+    await store.cache_node(d)
+    return d
+
+
+async def report_client_version(
+    store: RedisStore, node_id: str, version: str
+) -> Optional[dict]:
+    """记录节点鉴权时上报的客户端版本（写库 + 刷新缓存）。
+
+    版本没变就不落库：节点每次断线重连都会上报，否则每次重连都白写一次。
+    因此 client_version_at 的语义是「该版本首次上报的时间」。
+    """
+    v = (version or "").strip()[:32]
+    if not v:
+        return None
+    async with SessionLocal() as s:
+        row = await s.get(Node, node_id)
+        if row is None or row.client_version == v:
+            return None
+        row.client_version = v
+        row.client_version_at = datetime.now()
         await s.commit()
         await s.refresh(row)
         d = node_row_to_dict(row)

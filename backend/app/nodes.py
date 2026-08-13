@@ -48,6 +48,8 @@ async def _to_node_out(store: RedisStore, d: dict) -> NodeOut:
         risk=risk_control.normalize_risk(d.get("risk")),
         mt5_login=d.get("mt5_login"),
         mt5_server=d.get("mt5_server") or acct.get("server"),
+        client_version=d.get("client_version"),
+        client_version_at=d.get("client_version_at"),
         created_at=d.get("created_at", 0),
         last_seen=acct.get("updated_at"),
     )

@@ -153,6 +153,8 @@ class StrategyRunner:
         self._risk_plan: Optional[EntryPlan] = None
         self._risk_spec: Optional[SymbolSpec] = None
         self._breakeven_done = False
+        # 限价开仓：本轮采样看到的在途挂单笔数，供上报与残留判定
+        self._pending_orders = 0
 
         self._grid_plan: Optional[grid_trading.GridPlan] = None
         self._grid_spec: Optional[grid_trading.SymbolSpec] = None
@@ -186,6 +188,11 @@ class StrategyRunner:
     def is_grid(self) -> bool:
         """本任务是否走网格路径。"""
         return self._mode == _MODE_GRID
+
+    @property
+    def limit_entry(self) -> bool:
+        """本任务是否走限价开仓（挂单在成交前只有挂单没有持仓）。"""
+        return bool(self.risk_sized and self._risk_cfg and self._risk_cfg.is_limit_entry)
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -251,6 +258,7 @@ class StrategyRunner:
         sub = self._hub.subscribe(
             symbol=self.symbol, magic=self.magic, direction=self.direction,
             hold_when_empty=self.is_grid,
+            track_orders=self.limit_entry,
         )
         self._sub = sub
         try:
@@ -280,10 +288,12 @@ class StrategyRunner:
             raise
         except Exception as e:  # noqa: BLE001
             logger.exception("task %s runner crashed: %s", self.task_id, e)
-            held = await self._magic_positions()
-            if held:
-                # 持仓还在就不能报终态，否则服务端会释放占位、这批仓位再没人负责
-                await self._finish("faulted", f"runner_error: {e}", residual=len(held))
+            residual = len(await self._magic_positions() or []) + len(
+                await self._magic_orders() or []
+            )
+            if residual:
+                # 持仓或挂单还在就不能报终态，否则服务端会释放占位、这批单再没人负责
+                await self._finish("faulted", f"runner_error: {e}", residual=residual)
             else:
                 await self._finish("failed", f"runner_error: {e}")
         finally:
@@ -309,7 +319,15 @@ class StrategyRunner:
             return True
 
         positions = list(event.positions)
-        if self._seed_pending:
+        self._pending_orders = len(event.orders)
+        if self.limit_entry and positions and not self._opened:
+            # 挂单成交了：此刻才算真正开仓，之后无持仓无挂单就可以判收口
+            self._opened = True
+            await self._emit_limit_filled(positions)
+
+        # 限价任务恢复时挂单可能还没成交，此刻没有持仓可供重建计划，
+        # 保留 seed 标记等真正进场后再重建，否则计划会永远缺失
+        if self._seed_pending and not (self.limit_entry and not positions):
             self._seed_from_positions(positions)
             if self.risk_sized:
                 await self._risk_rebuild_plan(positions, event.point)
@@ -320,6 +338,13 @@ class StrategyRunner:
             if await self._grid_advance(event, positions):
                 return True
         elif not positions:
+            if self.limit_entry:
+                # 挂单未成交期间也要把上次没挂上的档补齐，否则要等成交后才补
+                if await self._risk_advance(event, positions):
+                    return False
+                if time.time() - self._last_report >= self.report_interval:
+                    # 挂单还在等成交：照常心跳，让后台看得出任务在途而不是卡死
+                    await self._emit_progress("heartbeat", phase="running")
             return False
         elif self.risk_sized:
             if await self._risk_advance(event, positions):
@@ -516,7 +541,11 @@ class StrategyRunner:
         return (ask, bid) if self.direction == "BUY" else (bid, ask)
 
     async def _risk_open_base(self) -> bool:
-        """以损定量开仓：反推总手数 → 底仓市价（TP=0）→ 立即开齐分散仓。"""
+        """以损定量开仓：反推总手数 → 下底仓 → 铺开分散仓。
+
+        市价模式底仓立刻成交，随后市价开齐分散仓；限价模式把底仓与全部分散仓一次
+        挂成阶梯限价，成交与否交给后续采样判定。
+        """
         cfg = self._risk_cfg
         assert cfg is not None
         spec = await self._risk_symbol_spec()
@@ -528,6 +557,7 @@ class StrategyRunner:
             stop_loss=_as_float(self.entry.get("stop_loss")),
             spec=spec,
             risk_price=risk_quote,
+            limit_price=_as_float(self.entry.get("entry_price")),
         )
         if not plan.ok:
             logger.warning("task %s risk sizing rejected: %s", self.task_id, plan.reject)
@@ -541,12 +571,10 @@ class StrategyRunner:
 
         self._risk_plan = plan
         self.base_volume = plan.base_volume
-        # 底仓按截图语义：市价 + 止损 + 止盈为 0
-        res = dict(await self._exec(
-            self._mt5.place_market_order,
-            self.symbol, self.direction, plan.base_volume,
-            plan.stop_loss, None,
-            self._open_comment(), self.magic,
+        base = plan.batches[0]
+        # 底仓：止损跟信号，止盈为 0（留给保本与趋势）
+        res = dict(await self._risk_send_order(
+            base, plan.stop_loss, None, self._open_comment(),
         ) or {})
         res["signal_id"] = self.signal_id
         res["task_id"] = self.task_id
@@ -558,8 +586,14 @@ class StrategyRunner:
             logger.warning("task %s base order failed: %s", self.task_id, res.get("error"))
             return False
 
-        risk_sizing.anchor_to_fill(plan, cfg, _as_float(res.get("price")), spec)
-        self._opened = True
+        pending = bool(res.get("pending"))
+        if not pending:
+            risk_sizing.anchor_to_fill(plan, cfg, _as_float(res.get("price")), spec)
+            self._opened = True
+        else:
+            # 挂单只是挂上了：_opened 等真正成交时再置，否则一旦挂单被撤，
+            # 无持仓会立刻被判成「开过仓又平光了」而收口
+            self._pending_orders = 1
         self.total_orders += 1
         self.total_volume += plan.base_volume
         await self._emit_progress(
@@ -576,13 +610,48 @@ class StrategyRunner:
                 "kind": "open",
             },
         )
-        # 底仓成交后立即市价开齐分散仓（对齐「订单数量 = 1 + N」）
+        # 分散仓紧接着铺开（对齐「订单数量 = 1 + N」）
         if self._stopping:
             return True
         await self._risk_open_pending_distribute(
             quote=_as_float(res.get("price")) or entry_quote,
         )
         return True
+
+    async def _risk_send_order(self, batch, stop_loss: float,
+                               take_profit: Optional[float], comment: str) -> dict:
+        """按计划里这一档的开仓方式下单：有挂单价就挂限价，否则市价。"""
+        if batch.is_pending:
+            return dict(await self._exec(
+                self._mt5.place_pending_order,
+                self.symbol, self.direction, batch.volume, batch.price,
+                stop_loss, take_profit, comment, self.magic,
+            ) or {})
+        return dict(await self._exec(
+            self._mt5.place_market_order,
+            self.symbol, self.direction, batch.volume,
+            stop_loss, take_profit, comment, self.magic,
+        ) or {})
+
+    async def _emit_limit_filled(self, positions: list[dict]) -> None:
+        """限价挂单首次成交：单独记一笔事件，后台能看出等了多久才进场。"""
+        digits = self._risk_spec.digits if self._risk_spec else 5
+        filled = min(positions, key=lambda p: (p.get("time") or 0, p.get("ticket") or 0))
+        price = _as_float(filled.get("price_open"))
+        waited = max(0, int(time.time() - self._started_at))
+        await self._emit_progress(
+            "open", phase="running", positions=positions,
+            message=(
+                f"限价单成交：{len(positions)} 笔进场，首笔 @{round(price, digits)}，"
+                f"挂单等待 {waited} 秒"
+            ),
+            detail={
+                "kind": "risk_sized_limit_filled",
+                "price": price,
+                "position_count": len(positions),
+                "waited_seconds": waited,
+            },
+        )
 
     async def _risk_open_pending_distribute(self, *, quote: float,
                                            positions: Optional[list[dict]] = None) -> int:
@@ -629,6 +698,8 @@ class StrategyRunner:
             stop_loss=_as_float(earliest.get("sl")),
             spec=spec,
             risk_price=entry_price - sign * spread,
+            # 限价模式：成交价就是当初的挂单价，用它还原阶梯与手数
+            limit_price=entry_price if cfg.is_limit_entry else 0.0,
         )
         if not plan.ok:
             logger.info(
@@ -677,12 +748,10 @@ class StrategyRunner:
         """开一笔分散仓；共用信号止损，挂阶梯上属于自己的那一档止盈。成功返回 True。"""
         spec = await self._risk_symbol_spec()
         reason = risk_sizing.describe_batch(plan, cfg, batch, spec, price)
-        res = dict(await self._exec(
-            self._mt5.place_market_order,
-            self.symbol, self.direction, batch.volume,
-            plan.stop_loss, batch.take_profit or None,
-            risk_sizing.batch_comment(batch), self.magic,
-        ) or {})
+        res = await self._risk_send_order(
+            batch, plan.stop_loss, batch.take_profit or None,
+            risk_sizing.batch_comment(batch),
+        )
         detail = risk_sizing.batch_detail(plan, cfg, batch, spec, price)
         if not res.get("success"):
             logger.warning("task %s distribute %s failed: %s", self.task_id, batch.index, res.get("error"))
@@ -695,7 +764,12 @@ class StrategyRunner:
         self.add_count += 1
         self.total_orders += 1
         self.total_volume += batch.volume
-        logger.info("task %s distribute %s filled: %s", self.task_id, batch.index, reason)
+        if res.get("pending"):
+            self._pending_orders += 1
+        logger.info(
+            "task %s distribute %s %s: %s",
+            self.task_id, batch.index, "placed" if res.get("pending") else "filled", reason,
+        )
         await self._emit_progress(
             "add_trend", phase="running",
             last_order={
@@ -1281,19 +1355,34 @@ class StrategyRunner:
             return None
         return None if rows is None else list(rows)
 
+    async def _magic_orders(self) -> Optional[list[dict]]:
+        """读该魔术号在途挂单；口径同 _magic_positions，读失败返回 None。"""
+        reader = getattr(self._mt5, "pending_orders_by_magic", None)
+        if reader is None:
+            return []
+        try:
+            rows = await self._exec(reader, self.magic)
+        except Exception:  # noqa: BLE001
+            logger.debug("task %s read pending orders failed", self.task_id, exc_info=True)
+            return None
+        return None if rows is None else list(rows)
+
     async def _close_all(self) -> bool:
-        """终止指令：平掉该魔术号的全部持仓。返回是否已确认无持仓并收口。
+        """终止指令：平掉该魔术号的全部持仓并撤掉挂单。返回是否已确认干净并收口。
 
         必须复查确认确实平干净了才能上报终态：服务端收到终态会把持仓数清零并释放
-        节点占位，此时若还有残仓，这批仓位就再也没人负责了。
+        节点占位，此时若还有残仓，这批仓位就再也没人负责了。挂单同样要算进残留
+        ——留在盘上的限价单随时可能成交，收口后就没有监控它的人了。
         """
         error = ""
         left = 0
         for attempt in range(_CLOSE_ALL_ATTEMPTS):
             held = await self._magic_positions()
-            if held is not None:
-                left = len(held)
-                if not held:
+            resting = await self._magic_orders()
+            if held is not None and resting is not None:
+                left = len(held) + len(resting)
+                self._pending_orders = len(resting)
+                if not left:
                     await self._finish("done", self._stop_reason)
                     return True
                 # 平仓前先记下浮盈，成交历史查询失败时作为回退
@@ -1307,7 +1396,7 @@ class StrategyRunner:
                 error = str(res.get("error") or "close failed")
         await self._finish(
             "stop_failed",
-            f"close_failed: {error or '平仓后仍有持仓'}",
+            f"close_failed: {error or '平仓后仍有持仓或挂单'}",
             residual=left,
         )
         return False
@@ -1322,6 +1411,7 @@ class StrategyRunner:
             self._last_floating_profit = profit
         return {
             "position_count": len(pos),
+            "pending_orders": self._pending_orders,
             "add_count": self.add_count,
             "total_orders": self.total_orders,
             "total_volume": round(self.total_volume, 4),

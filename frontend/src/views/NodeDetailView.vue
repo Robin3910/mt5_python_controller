@@ -625,7 +625,7 @@ async function closeTicket(ticket: number): Promise<void> {
       <div v-if="tab === 'overview'">
         <div class="card card-pad" style="margin-bottom: 16px">
           <strong>账户</strong>
-          <div v-if="acct" class="kv-grid" style="margin-top: 12px">
+          <div v-if="acct" class="kv-grid kv-grid-metrics" style="margin-top: 12px">
             <div class="kv"><span class="k">余额</span><span class="v">{{ fmt(acct.balance) }}</span></div>
             <div class="kv"><span class="k">净值</span><span class="v">{{ fmt(acct.equity) }}</span></div>
             <div class="kv"><span class="k">占用保证金</span><span class="v">{{ fmt(acct.margin) }}</span></div>
@@ -1037,7 +1037,7 @@ async function closeTicket(ticket: number): Promise<void> {
               <div class="list-field"><span class="k">错误</span><span class="v muted" style="font-size: 12px; font-weight: 500">{{ s.error || '—' }}</span></div>
               <div class="list-field"><span class="k">下发时间</span><span class="v muted" style="font-size: 12px; font-weight: 500">{{ fmtTime((s.dispatched_at || 0) * 1000) }}</span></div>
               <div class="list-field"><span class="k">完成时间</span><span class="v muted" style="font-size: 12px; font-weight: 500">{{ fmtTime((s.finished_at || 0) * 1000) }}</span></div>
-              <div v-if="s.raw_payload" class="list-field">
+              <div v-if="s.raw_payload" class="list-field list-field-block">
                 <span class="k">原始信号</span>
                 <span class="v"><div class="token-box" style="font-size: 12px; font-weight: 400">{{ s.raw_payload }}</div></span>
               </div>
@@ -1178,7 +1178,7 @@ async function closeTicket(ticket: number): Promise<void> {
             </div>
             <div class="list-field"><span class="k">详情</span><span class="v muted" style="font-size: 12px; font-weight: 500">{{ feedDetail(row) || '—' }}</span></div>
             <div v-if="isExpanded(row.signal_id)" class="list-card-detail">
-              <div v-if="row.raw_payload" class="list-field">
+              <div v-if="row.raw_payload" class="list-field list-field-block">
                 <span class="k">信号原始数据</span>
                 <span class="v"><div class="token-box" style="font-size: 12px; font-weight: 400">{{ row.raw_payload }}</div></span>
               </div>

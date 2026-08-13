@@ -124,7 +124,10 @@ function ruleSummary(rules: StrategyRule[]): string {
       const label = RULE_TYPE_LABEL[r.type] || `类型${r.type}`
       if (isRiskSized(r)) {
         const batches = r.add_batches ?? 0
-        return `${label}（风险 ${r.risk_amount ?? 0} · 盈亏比 ${r.rr_ratio ?? 0}${batches ? ` · 分散 ${batches} 单` : ''}）`
+        return (
+          `${label}（${entryModeLabel(r)} · 风险 ${r.risk_amount ?? 0}` +
+          ` · 盈亏比 ${r.rr_ratio ?? 0}${batches ? ` · 分散 ${batches} 单` : ''}）`
+        )
       }
       if (isGrid(r)) {
         const side = GRID_SIDE_OPTIONS.find((o) => o.value === r.grid_side)?.label || r.grid_side
@@ -174,19 +177,52 @@ function calcTypeLabel(calcType: BatchCalcType | string | undefined): string {
   return CALC_TYPE_LABEL[key] || String(calcType || '点数')
 }
 
+/** 开仓方式；缺字段的历史配置一律按市价，与后端归一化口径一致 */
+function isLimitEntry(r: StrategyRule): boolean {
+  return r.entry_mode === 'limit'
+}
+
+function entryModeLabel(r: StrategyRule): string {
+  return isLimitEntry(r) ? '限价' : '市价'
+}
+
+/** 以损定量的脚注：两种开仓方式对信号的要求与风险口径都不一样 */
+function riskSizedFootnote(r: StrategyRule): string {
+  if (isLimitEntry(r)) {
+    return (
+      '手数由风险金额与各档到止损价的加权距离反推；底仓 TP=0，' +
+      '挂单一直等到成交（GTC）；信号必须携带 sl 与入场价'
+    )
+  }
+  return '手数由风险金额与信号止损价反推；底仓 TP=0，分散仓市价开齐；信号必须携带 sl'
+}
+
 /** 规则详情的参数行；各规则类型的字段集合不同，展示由此按 type 分派 */
 function ruleDetailRows(r: StrategyRule): Array<{ k: string; v: string }> {
   if (isRiskSized(r)) {
     const batches = r.add_batches ?? 0
+    const limit = isLimitEntry(r)
     return [
       { k: '监控方向', v: actionLabel(r.action) },
-      { k: '风险金额', v: String(r.risk_amount ?? 0) },
+      {
+        k: '开仓方式',
+        v: limit ? '限价（挂在信号入场价，GTC 等成交）' : '市价（信号一到打齐）',
+      },
+      {
+        k: '风险金额',
+        v: `${r.risk_amount ?? 0}${limit && batches ? '（全档成交的最坏亏损）' : ''}`,
+      },
       { k: '盈亏比', v: String(r.rr_ratio ?? 0) },
-      { k: '底仓', v: `${batches ? (r.base_ratio ?? 0) : 100}%（市价 · TP=0）` },
+      {
+        k: '底仓',
+        v: `${batches ? (r.base_ratio ?? 0) : 100}%（${limit ? '挂信号入场价' : '市价'} · TP=0）`,
+      },
       {
         k: '分散仓',
         v: batches
-          ? `剩余等分 ${batches} 单市价（阶梯止盈，末档吃满盈亏比）`
+          ? limit
+            ? `剩余等分 ${batches} 单，在入场价与止损价之间挂阶梯限价（阶梯止盈，末档吃满盈亏比）`
+            : `剩余等分 ${batches} 单市价（阶梯止盈，末档吃满盈亏比）`
           : '无（底仓即全仓）',
       },
       { k: '总手数上限', v: r.max_total_lot ? String(r.max_total_lot) : '不限' },
@@ -204,6 +240,19 @@ function ruleDetailRows(r: StrategyRule): Array<{ k: string; v: string }> {
     const stops = gridStopFields(r.grid_side)
     const sl = r[stops.slKey] || 0
     const tp = r[stops.tpKey] || 0
+    // 试算只在开启过时展示，且写明「配置期」：格数与手数已经落进上面两行，
+    // 这一行只是留痕，避免被读成运行期还在按 ATR 算
+    const assist = r.assist_enabled
+      ? [
+          {
+            k: '试算来源',
+            v:
+              `配置期 · ATR(${r.assist_timeframe || 'H1'}) × ${r.assist_atr_mult ?? 0}` +
+              `${r.assist_spacing ? ` · 格距 ${r.assist_spacing}` : ''}` +
+              `${r.assist_max_loss ? ` · 预算 ${r.assist_max_loss}` : ''}`,
+          },
+        ]
+      : []
     return [
       { k: '价格区间', v: `${r.price_lower ?? 0} ~ ${r.price_upper ?? 0}` },
       { k: '网格', v: `${r.grid_count ?? 0} 格 · ${mode}` },
@@ -221,6 +270,7 @@ function ruleDetailRows(r: StrategyRule): Array<{ k: string; v: string }> {
         k: '向上追踪',
         v: r.trailing_up ? (r.trailing_max ? `开启 · 最多 ${r.trailing_max} 格` : '开启 · 不限') : '关闭',
       },
+      ...assist,
     ]
   }
   return [
@@ -316,7 +366,7 @@ function fmtTime(sec: number | null | undefined): string {
             </div>
             <template v-if="isRiskSized(r)">
               <div class="muted" style="font-size: 12px">
-                手数由风险金额与信号止损价反推；底仓 TP=0，分散仓按盈亏比挂止盈
+                {{ riskSizedFootnote(r) }}
               </div>
             </template>
             <template v-else-if="isGrid(r)">
@@ -430,7 +480,7 @@ function fmtTime(sec: number | null | undefined): string {
                     </div>
                     <template v-if="isRiskSized(r)">
                       <div class="muted" style="font-size: 12px">
-                        手数由风险金额与信号止损价反推；底仓 TP=0，分散仓市价开齐；信号必须携带 sl
+                        {{ riskSizedFootnote(r) }}
                       </div>
                     </template>
                     <template v-else-if="isGrid(r)">

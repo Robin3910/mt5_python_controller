@@ -1,8 +1,9 @@
 """TradingView 信号解析器。
 
 行为逐条对齐参考仓库 `mt5_python_connector/tradingview_parser.py`，以保证“信号
-接收规则 / 解析逻辑”与原项目完全一致；相对原文件的改动只有两处：`Config` 的 import
-路径，以及本项目扩展的定向字段 `template_ids` / `group_ids`（仅结构化 JSON 支持）。
+接收规则 / 解析逻辑”与原项目完全一致；相对原文件的改动只有三处：`Config` 的 import
+路径，本项目扩展的定向字段 `template_ids` / `group_ids`，以及限价开仓用的入场价
+`entry_price`（后两者仅结构化 JSON 支持）。
 
 支持三种入参形态：
 1. 结构化 JSON（含 action/symbol 等字段）；
@@ -32,6 +33,9 @@ class TradingSignal:
     stop_loss: Optional[float] = None  # 止损价
     take_profit: Optional[float] = None  # 止盈价
     order_type: Optional[str] = None  # 订单类型：market / limit / stop
+    # 限价开仓的挂单价（绝对价）。策略侧配成限价模式时必须由信号给出，
+    # 因为策略绑的是分组而不是价位，配置里写死绝对价每换一次行情就得改一次。
+    entry_price: Optional[float] = None
     comment: str = ""  # 订单备注
     allow_position: bool = False  # 是否允许“已有持仓时”继续开仓（覆盖持仓过滤）
     # 策略模版定向（仅 strategy 链路使用）：只有绑定了这些模版的分组才接收本信号；空 = 不限制
@@ -105,6 +109,17 @@ class TradingViewParser:
             or normalized.get("target")
         )
 
+        # 入场价：兼容 limit_price / entry_price / entry / price 等写法
+        entry_price = self._extract_price(
+            normalized.get("limit_price")
+            or normalized.get("limitprice")
+            or normalized.get("entry_price")
+            or normalized.get("entryprice")
+            or normalized.get("limit")
+            or normalized.get("entry")
+            or normalized.get("price")
+        )
+
         comment = str(normalized.get("comment", "") or "")
         order_type = normalized.get("type") or normalized.get("ordertype") or "market"
         order_type = str(order_type).lower() if order_type else "market"
@@ -119,6 +134,7 @@ class TradingViewParser:
             stop_loss=stop_loss,
             take_profit=take_profit,
             order_type=order_type,
+            entry_price=entry_price,
             comment=comment,
             allow_position=allow_position,
             template_ids=template_ids,

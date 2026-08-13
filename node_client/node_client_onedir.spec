@@ -7,6 +7,8 @@ block_cipher = None
 datas: list = []
 binaries: list = []
 hiddenimports: list = [
+    # 打包前由 build_version.py stamp 生成；version.py 在 try 里导入，缺它只会回落到数字版本号
+    "_build_info",
     "pydantic_settings",
     "dotenv",
     "websockets",

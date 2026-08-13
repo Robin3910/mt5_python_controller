@@ -284,19 +284,36 @@ class NodeClient:
         return sorted(out)
 
     async def _snapshot(self) -> dict:
-        """采集一次账户快照（账户信息 + 持仓 + 观察列表报价）。"""
+        """采集一次账户快照（账户信息 + 持仓 + 挂单 + 观察列表报价）。
+
+        挂单必须一起上报：服务端拿快照做兜底对账，只看持仓的话，限价开仓的任务在
+        挂单成交前会被判成「已无持仓」而提前收口。
+        """
         try:
             positions = await self._exec(self.mt5.positions)
+            orders = await self._pending_orders()
             quotes = await self._exec(self.mt5.quotes, self.effective_watchlist(positions))
             return {
                 "account": await self._exec(self.mt5.account_info),
                 "positions": positions,
+                "orders": orders,
                 "quotes": quotes,
                 "prices": {sym: q["mid"] for sym, q in quotes.items()},
             }
         except Exception as e:  # noqa: BLE001
             logger.debug("snapshot error: %s", e)
-            return {"account": {}, "positions": [], "prices": {}, "quotes": {}}
+            return {"account": {}, "positions": [], "orders": [], "prices": {}, "quotes": {}}
+
+    async def _pending_orders(self) -> list[dict]:
+        """读未成交挂单；读不到时返回空列表，不影响快照其余部分上报。"""
+        reader = getattr(self.mt5, "pending_orders", None)
+        if reader is None:
+            return []
+        try:
+            return list(await self._exec(reader) or [])
+        except Exception as e:  # noqa: BLE001
+            logger.debug("read pending orders failed: %s", e)
+            return []
 
     # ----------------------- 协议 ------------------------
     async def _authenticate(self, ws) -> bool:
@@ -311,7 +328,12 @@ class NodeClient:
         login = self.expected_mt5_login
         await ws.send(json.dumps({
             "type": "auth",
-            "data": {"token": settings.node_token, "mt5_login": login},
+            "data": {
+                "token": settings.node_token,
+                "mt5_login": login,
+                # 后台据此展示各节点实际运行版本；旧后端会忽略该字段
+                "client_version": get_version(),
+            },
         }))
         logger.info("user_info: %s", acct)
         try:
@@ -445,21 +467,50 @@ class NodeClient:
     async def _execute_risk_close(self, hit: dict, positions: list) -> dict:
         """按命中规则的动作执行平仓。"""
         action = hit.get("close_action") or "account_all"
-        # 账户级规则与分档的「全部」都是整账户清仓
+        # 账户级规则与分档的「全部」都是整账户清仓（close_all 内部已连挂单一起撤）
         if action == "account_all" or (hit.get("scope_all_symbols") and action == "all"):
             return await self._exec(self.mt5.close_all)
+        symbol = None if hit.get("scope_all_symbols") else hit.get("symbol")
         targets = account_risk.select_close_targets(
             positions,
             close_action=action,
             # 分档按账户侧向平仓，不限定品种
-            symbol=None if hit.get("scope_all_symbols") else hit.get("symbol"),
+            symbol=symbol,
         )
         if not targets:
             # 判定阶段已排除这种情况；真发生说明快照与实际持仓不一致，
             # 按失败处理让下一轮重新判定，不能白扣次数把规则关掉
             return {"success": False, "closed": 0, "action": "CLOSE",
                     "error": "没有符合该平仓动作的持仓"}
-        return await self._exec(self.mt5.close_positions, targets)
+        cancelled = await self._cancel_pending_for_risk(symbol)
+        res = dict(await self._exec(self.mt5.close_positions, targets) or {})
+        if cancelled:
+            res["cancelled"] = cancelled
+        return res
+
+    async def _cancel_pending_for_risk(self, symbol: str | None) -> int:
+        """风控降险时撤掉相关挂单，返回撤单笔数。
+
+        平了仓却留着挂单，等于刚清完风险又挂着一颗重新开仓的雷；方向上不做区分，
+        风控场景宁可多撤。
+        """
+        canceller = getattr(self.mt5, "cancel_order", None)
+        if canceller is None:
+            return 0
+        base = str(symbol or "").upper().replace("/", "")
+        cancelled = 0
+        for order in await self._pending_orders():
+            name = str(order.get("symbol") or "").upper()
+            if base and not (name.startswith(base) or base.startswith(name)):
+                continue
+            try:
+                res = await self._exec(canceller, int(order.get("ticket") or 0))
+            except Exception:  # noqa: BLE001
+                logger.debug("risk cancel pending failed", exc_info=True)
+                continue
+            if (res or {}).get("success"):
+                cancelled += 1
+        return cancelled
 
     @staticmethod
     def _close_action_label(action: str | None) -> str:
@@ -654,7 +705,7 @@ class NodeClient:
         await self._close_orphan_strategy(ws, task_id, msg)
 
     async def _close_orphan_strategy(self, ws, task_id: int, msg: dict) -> None:
-        """无本地监控时按魔术号平仓，并回报结果供服务端收口。"""
+        """无本地监控时按魔术号平仓并撤挂单，回报结果供服务端收口。"""
         try:
             magic = int(msg.get("magic"))
         except (TypeError, ValueError):
@@ -667,8 +718,9 @@ class NodeClient:
             return
         closed = int(res.get("closed") or 0)
         logger.warning(
-            "strategy task %s has no local runner, closed %d position(s) by magic %s",
-            task_id, closed, magic,
+            "strategy task %s has no local runner, closed %d position(s) and "
+            "cancelled %d order(s) by magic %s",
+            task_id, closed, int(res.get("cancelled") or 0), magic,
         )
         realized = 0.0
         try:
@@ -761,6 +813,10 @@ class NodeClient:
 
         纯读操作，不碰持仓也不下单。失败一律回一条带 error 的结果：让请求方立刻
         看到原因（品种不存在、历史未下载等），而不是干等到服务端超时。
+
+        另附品种合约规格（`spec`），供后台把价格距离折算成金额（网格试算）。它是
+        附加项：读不到只省略该字段，绝不升级成 error——同一条探针链路还担着 strategy
+        的趋势风控，那边探针失败是 fail-closed 拦开仓的。
         """
         req_id = str(msg.get("req_id") or "")
         symbol = str(msg.get("symbol") or "").strip().upper()
@@ -786,7 +842,18 @@ class NodeClient:
                 else:
                     data["bars"] = bars
                     data["quote"] = (quotes or {}).get(symbol) or {}
+                    spec = await self._probe_symbol_spec(symbol)
+                    if spec:
+                        data["spec"] = spec
         await ws.send(json.dumps({"type": "market_probe_result", "data": data}))
+
+    async def _probe_symbol_spec(self, symbol: str) -> dict:
+        """探针附带的合约规格；读不到返回空字典（调用方据此省略该字段）。"""
+        try:
+            return dict(await self._exec(self.mt5.symbol_spec, symbol) or {})
+        except Exception as e:  # noqa: BLE001
+            logger.debug("probe symbol spec failed for %s: %s", symbol, e)
+            return {}
 
     @staticmethod
     def _close_detail(msg: dict, res: dict) -> str:

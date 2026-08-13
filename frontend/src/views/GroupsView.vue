@@ -318,8 +318,15 @@ const TRIGGER_HELP = {
     'CLOSE 是终止指令，平掉命中分组内进行中任务对应魔术号的持仓并结束节点侧监控。',
   volume:
     '首单手数。分组链路直接采用此手数（仅受单笔上限保护），不走节点的按币种手数策略。',
-  stop_loss: '首单止损价（绝对价格），留空表示不设。',
+  stop_loss:
+    '首单止损价（绝对价格），留空表示不设。\n' +
+    '策略模版2（以损定量趋势单）必填：它的手数就是由风险金额与止损距离反推的，缺止损会被拒收。',
   take_profit: '首单止盈价（绝对价格），留空表示不设。',
+  entry_price:
+    '限价开仓的挂单价（对应 Webhook 的 limit_price 字段），留空表示不设。\n' +
+    '只有配成「限价」开仓的策略模版2 会用它：底仓挂在这个价，分散仓在「入场价 → 止损价」之间挂阶梯限价。\n' +
+    '这类策略缺了入场价会被拒收；配成「市价」的策略与其它模版忽略该字段。\n' +
+    '入场价必须落在止损价的盈利侧（多单高于止损、空单低于止损），否则挂单一成交就已越过止损。',
   comment: '订单备注，会写入 MT5 订单的 comment 字段，便于对账。',
   template_ids:
     '策略模版定向（信号的 template_ids 字段）：勾选后，只有绑定了这些模版的分组才会收到本信号，' +
@@ -335,6 +342,7 @@ const triggerForm = reactive({
   volume: 0.1 as number | null,
   stop_loss: null as number | null,
   take_profit: null as number | null,
+  entry_price: null as number | null,
   comment: '',
   template_ids: [] as string[],
   group_ids: [] as string[],
@@ -438,6 +446,7 @@ async function openTrigger(): Promise<void> {
     volume: 0.1,
     stop_loss: null,
     take_profit: null,
+    entry_price: null,
     comment: '',
     template_ids: [] as string[],
     group_ids: [] as string[],
@@ -469,6 +478,7 @@ function buildTriggerPayload(symbol: string): ManualSignalPayload {
   payload.volume = Number(triggerForm.volume)
   if (triggerForm.stop_loss) payload.stop_loss = triggerForm.stop_loss
   if (triggerForm.take_profit) payload.take_profit = triggerForm.take_profit
+  if (triggerForm.entry_price) payload.entry_price = triggerForm.entry_price
   const comment = triggerForm.comment.trim()
   if (comment) payload.comment = comment
   return payload
@@ -486,6 +496,7 @@ function buildWebhookSignalPayload(payload: ManualSignalPayload): Record<string,
   if (payload.volume != null) data.volume = payload.volume
   if (payload.stop_loss) data.sl = payload.stop_loss
   if (payload.take_profit) data.tp = payload.take_profit
+  if (payload.entry_price) data.limit_price = payload.entry_price
   if (payload.comment) data.comment = payload.comment
   return data
 }
@@ -510,6 +521,7 @@ function triggerSummary(payload: ManualSignalPayload): string {
   } else {
     lines.push(`手数：${payload.volume}`)
     lines.push(`止损：${payload.stop_loss ?? '不设'}　止盈：${payload.take_profit ?? '不设'}`)
+    if (payload.entry_price) lines.push(`入场价：${payload.entry_price}（限价开仓用）`)
     if (payload.comment) lines.push(`备注：${payload.comment}`)
   }
   return `${lines.join('\n')}\n\n预计命中分组：\n${groupText}`
@@ -1020,6 +1032,20 @@ async function onStrategyFormSaved(): Promise<void> {
                   type="number"
                   step="0.01"
                   placeholder="留空表示不设"
+                />
+              </div>
+              <div>
+                <FormLabel
+                  field-id="trigger-entry"
+                  text="入场价（限价开仓）"
+                  :help="TRIGGER_HELP.entry_price"
+                />
+                <input
+                  id="trigger-entry"
+                  v-model.number="triggerForm.entry_price"
+                  type="number"
+                  step="any"
+                  placeholder="仅限价开仓需要，留空表示不设"
                 />
               </div>
             </template>

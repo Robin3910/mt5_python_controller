@@ -626,6 +626,69 @@ class ProcessManager:
                 results.append((iid, name, False, str(e)))
         return results
 
+    def _select(self, instance_ids: list[str] | None) -> list[ManagedProcess]:
+        targets = list(self._items.values())
+        if instance_ids is None:
+            return targets
+        id_set = set(instance_ids)
+        return [m for m in targets if m.cfg.id in id_set]
+
+    def _swap(
+        self,
+        mp: ManagedProcess,
+        apply_fn: Callable[[Path], tuple[bool, str]],
+        *,
+        restart_if_was_running: bool,
+        ok_label: str,
+    ):
+        """单实例的「停 → 覆盖 → 按需重启」流程；apply_fn 负责实际写文件。"""
+        from client_deploy import ReplaceResult, read_version_near
+
+        old_ver = read_version_near(mp.cfg.exe_path) or mp.runtime.version
+        was_running = bool(
+            mp.runtime.process_alive
+            or (mp._proc is not None and mp._proc.poll() is None)
+            or mp._status_reachable(timeout=0.3)
+        )
+        if was_running:
+            mp.stop(graceful=True)
+            # 等文件句柄释放（Windows 上正在运行的 exe 无法覆盖）
+            time.sleep(0.4)
+
+        ok, msg = apply_fn(Path(mp.cfg.exe_path))
+        restarted = False
+        if ok:
+            mp._refresh_file_version()
+            if was_running and restart_if_was_running:
+                mp.start()
+                restarted = True
+        result = ReplaceResult(
+            instance_id=mp.cfg.id,
+            name=mp.cfg.name,
+            target=mp.cfg.exe_path,
+            ok=ok,
+            message=msg if not ok else (ok_label + ("并重启" if restarted else "")),
+            old_version=old_ver,
+            new_version=read_version_near(mp.cfg.exe_path),
+            was_running=was_running,
+            restarted=restarted,
+        )
+        mp._notify()
+        return result
+
+    def _busy_skip(self, mp: ManagedProcess):
+        """启停中的实例不参与替换，避免与 start/stop 抢同一个 exe 文件。"""
+        from client_deploy import ReplaceResult, read_version_near
+
+        return ReplaceResult(
+            instance_id=mp.cfg.id,
+            name=mp.cfg.name,
+            target=mp.cfg.exe_path,
+            ok=False,
+            message="忙碌中，已跳过",
+            old_version=read_version_near(mp.cfg.exe_path) or mp.runtime.version,
+        )
+
     def batch_replace(
         self,
         source_exe: str | Path,
@@ -634,50 +697,79 @@ class ProcessManager:
         restart_if_was_running: bool = True,
     ) -> list:
         """批量替换客户端 exe：停 → 备份覆盖 →（可选）再启。"""
-        from client_deploy import ReplaceResult, read_version_near, replace_exe_file
+        from client_deploy import replace_exe_file
 
         src = Path(source_exe)
-        new_ver = read_version_near(src)
-        targets = list(self._items.values())
-        if instance_ids is not None:
-            id_set = set(instance_ids)
-            targets = [m for m in targets if m.cfg.id in id_set]
-
-        results: list[ReplaceResult] = []
-        for mp in targets:
-            old_ver = read_version_near(mp.cfg.exe_path) or mp.runtime.version
-            was_running = bool(
-                mp.runtime.process_alive
-                or (mp._proc is not None and mp._proc.poll() is None)
-                or mp._status_reachable(timeout=0.3)
-            )
-            if was_running:
-                mp.stop(graceful=True)
-                # 等文件句柄释放
-                time.sleep(0.4)
-            ok, msg = replace_exe_file(
-                source_exe=src, target_exe=Path(mp.cfg.exe_path), backup=True
-            )
-            restarted = False
-            if ok:
-                mp._refresh_file_version()
-                if was_running and restart_if_was_running:
-                    mp.start()
-                    restarted = True
+        results = []
+        for mp in self._select(instance_ids):
+            if mp.runtime.busy:
+                results.append(self._busy_skip(mp))
+                continue
             results.append(
-                ReplaceResult(
-                    instance_id=mp.cfg.id,
-                    name=mp.cfg.name,
-                    target=mp.cfg.exe_path,
-                    ok=ok,
-                    message=msg if not ok else ("已替换" + ("并重启" if restarted else "")),
-                    old_version=old_ver,
-                    new_version=new_ver or read_version_near(mp.cfg.exe_path),
-                    was_running=was_running,
-                    restarted=restarted,
+                self._swap(
+                    mp,
+                    lambda target: replace_exe_file(
+                        source_exe=src, target_exe=target, backup=True
+                    ),
+                    restart_if_was_running=restart_if_was_running,
+                    ok_label="已替换",
                 )
             )
-            mp._notify()
+        return results
+
+    def batch_update(
+        self,
+        package_dir: str | Path,
+        *,
+        instance_ids: list[str] | None = None,
+        restart_if_was_running: bool = True,
+    ) -> list:
+        """用解压好的安装包目录批量更新：停 → 版本化备份 → 按文件树覆盖 → 按需再启。
+
+        与 batch_replace 的区别是覆盖粒度：这里按目录整体覆盖（onedir 形态也能更新），
+        并且保留 .env。
+        """
+        from client_deploy import apply_package
+
+        src = Path(package_dir)
+        results = []
+        for mp in self._select(instance_ids):
+            if mp.runtime.busy:
+                results.append(self._busy_skip(mp))
+                continue
+            results.append(
+                self._swap(
+                    mp,
+                    lambda target: apply_package(src, target, backup=True),
+                    restart_if_was_running=restart_if_was_running,
+                    ok_label="已更新",
+                )
+            )
+        return results
+
+    def batch_rollback(
+        self,
+        version: str,
+        *,
+        instance_ids: list[str] | None = None,
+        restart_if_was_running: bool = True,
+    ) -> list:
+        """从本机备份目录回滚到指定版本（不依赖网络）。"""
+        from client_deploy import restore_backup
+
+        results = []
+        for mp in self._select(instance_ids):
+            if mp.runtime.busy:
+                results.append(self._busy_skip(mp))
+                continue
+            results.append(
+                self._swap(
+                    mp,
+                    lambda target: restore_backup(target, version),
+                    restart_if_was_running=restart_if_was_running,
+                    ok_label=f"已回滚到 {version}",
+                )
+            )
         return results
 
     def shutdown_all(self) -> None:

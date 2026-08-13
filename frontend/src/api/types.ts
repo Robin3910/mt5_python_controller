@@ -183,6 +183,9 @@ export interface NodeOut {
   risk?: NodeRiskConfig | null
   mt5_login: number | null
   mt5_server: string | null
+  /** 节点鉴权时上报的客户端版本；旧版本客户端不上报，为空即未知 */
+  client_version: string | null
+  client_version_at: number | null
   created_at: number
   last_seen: number | null
 }
@@ -315,6 +318,8 @@ export interface ManualSignalPayload {
   model?: SignalModel
   stop_loss?: number
   take_profit?: number
+  /** 限价开仓的挂单价（对应 Webhook 的 limit_price）；只有配成限价的模版2 会用它 */
+  entry_price?: number
   comment?: string
   /** 策略模版定向（仅 strategy 模型）：只发给绑定了这些模版的分组；省略或空数组 = 不限制 */
   template_ids?: string[]
@@ -409,6 +414,12 @@ export interface StrategyBatchLevel {
 /** 以损定量的补仓方向（历史字段，模版2 已改为分散仓市价） */
 export type EntryDirection = 'pullback' | 'breakout'
 
+/**
+ * 以损定量的开仓方式：market 信号一到市价打齐 / limit 在信号入场价挂阶梯限价等成交。
+ * 限价模式要求信号携带入场价（limit_price / price）。
+ */
+export type EntryMode = 'market' | 'limit'
+
 /** 网格模式：arithmetic 等差 / geometric 等比 */
 export type GridMode = 'arithmetic' | 'geometric'
 
@@ -458,6 +469,12 @@ export interface StrategyRule {
   breakeven_times?: number
   /** 保本监控：once=按次 / loop=循环 */
   breakeven_mode?: 'once' | 'loop'
+  /**
+   * 开仓方式。limit 下底仓挂在信号入场价，分散仓在「入场价 → 止损价」之间等分挂
+   * 阶梯限价；各档止损距离不同，总手数改按加权平均止损距离反推，风险金额的含义
+   * 也随之变成「全部档位都成交时的最坏亏损」。
+   */
+  entry_mode?: EntryMode
   // --- type=4：网格交易 ---
   /** 网格区间下限 */
   price_lower?: number
@@ -483,6 +500,50 @@ export interface StrategyRule {
   trailing_up?: boolean
   /** 最大平移格数，0=不限 */
   trailing_max?: number
+  // --- type=4 的配置期试算助手：只记录建议值怎么算出来的，执行层不读 ---
+  /** 是否启用试算，默认关闭 */
+  assist_enabled?: boolean
+  /** 试算 ATR 所用的 K 线周期 */
+  assist_timeframe?: BatchTimeframe
+  /** 格距 = ATR × 该倍数 */
+  assist_atr_mult?: number
+  /** 手改后的格距，0=沿用 ATR × 倍数的结果 */
+  assist_spacing?: number
+  /** 试算用的最大可接受亏损（账户货币） */
+  assist_max_loss?: number
+}
+
+/** 试算提示：warn=需注意，info=仅说明口径 */
+export interface GridSizingWarning {
+  code: string
+  level: 'warn' | 'info'
+  message: string
+}
+
+/** GET /api/nodes/{id}/grid_sizing 的响应：网格数量与每格手数的建议值 */
+export interface GridSizingData {
+  node_id: string
+  symbol: string
+  timeframe: BatchTimeframe
+  quote: Record<string, number>
+  cached: boolean
+  fetched_at: number
+  updated_at: number
+  /** false 表示连网格数量都算不出（区间非法 / K 线不足），原因看 warnings */
+  ready: boolean
+  atr: number
+  spacing: number
+  /** 格距来源：atr=按倍数算 / manual=手改覆盖 */
+  spacing_source: 'atr' | 'manual'
+  grid_count: number
+  /** 0 表示手数算不出（缺合约规格 / 缺止损 / 低于最小手数），原因看 warnings */
+  lot_per_grid: number
+  /** 满仓打止损的估算亏损 */
+  worst_loss: number
+  /** 满仓总手数 */
+  worst_lot: number
+  levels: number[]
+  warnings: GridSizingWarning[]
 }
 
 export interface StrategyTemplateOut {
@@ -540,6 +601,8 @@ export interface GroupTaskDispatchRecord {
   magic: number | null
   /** 当前该魔术号的持仓笔数 */
   position_count: number
+  /** 当前该魔术号的未成交挂单笔数；限价开仓在成交前只有它 */
+  pending_orders: number
   /** 已加仓次数 */
   add_count: number
   total_orders: number
@@ -628,6 +691,7 @@ export interface GroupTaskEventDetail {
     | 'risk_sized_add'
     | 'risk_sized_distribute'
     | 'risk_sized_reject'
+    | 'risk_sized_limit_filled'
     | 'breakeven'
     | 'grid_plan'
     | 'grid_fill'
@@ -692,6 +756,15 @@ export interface GroupTaskEventDetail {
   /** 止损触发侧报价（多单 bid / 空单 ask），止损距离以此为准 */
   risk_price?: number
   spread?: number | null
+  /** 开仓方式：market 市价打齐 / limit 挂阶梯限价 */
+  entry_mode?: EntryMode
+  entry_mode_label?: string
+  /** 限价模式下相邻两档挂单价的间隔 */
+  ladder_step?: number | null
+  /** 该档的挂单价（限价模式的分散仓事件） */
+  limit_price?: number | null
+  /** 限价单成交后的等待时长（秒） */
+  waited_seconds?: number
   /** 阶梯止盈相邻两档的间隔 */
   tp_step?: number | null
   /** 阶梯最远一档（吃满盈亏比） */
@@ -946,4 +1019,35 @@ export interface NodeFeedItem {
   error?: string
   reason?: string
   detail?: string
+}
+
+// ----------------------------- 客户端版本管理 -----------------------------
+
+/** 客户端安装包版本条目 */
+export interface ClientVersionOut {
+  version: string
+  filename: string
+  size: number
+  sha256: string
+  notes: string | null
+  uploaded_by: string
+  created_at: number
+  /** 是否为当前发布版本 */
+  is_current: boolean
+  /** 已上报运行该版本的节点数 */
+  node_count: number
+}
+
+/** 当前发布指针；previous 是服务端回滚的落点 */
+export interface ClientReleaseOut {
+  version: string
+  previous: string
+  updated_at: number
+}
+
+export interface ClientVersionListOut {
+  items: ClientVersionOut[]
+  release: ClientReleaseOut
+  /** 未上报版本的节点数（旧客户端或从未上线） */
+  unknown_node_count: number
 }

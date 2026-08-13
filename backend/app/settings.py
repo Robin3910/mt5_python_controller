@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     poll_max_retry: int = 3             # 轮询模式单节点最大重试次数
     dedup_window: int = 5               # 信号去重窗口（秒）
 
+    # —— 客户端版本管理 ——
+    # 安装包落盘目录；Docker 部署必须挂卷持久化，否则重建镜像后已上传的包会丢
+    client_package_dir: str = "./data/client_packages"
+    client_package_max_mb: int = 300    # 单个安装包大小上限，超出即拒收
+
     log_level: str = "INFO"
 
     @property

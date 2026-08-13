@@ -300,9 +300,13 @@ def strategy_rules_snapshot(strategy: Optional[dict]) -> Optional[dict]:
 
 
 def _reject_risk_sized(rule: dict, *, signal_stop_loss: object,
-                       signal_action: object = None) -> Optional[str]:
-    """以损定量趋势单准入：手数由风险金额 ÷ 止损距离反推，没有止损价就算不出手数。"""
-    del signal_action  # 本路径不看信号方向
+                       signal_action: object = None,
+                       signal_entry_price: object = None) -> Optional[str]:
+    """以损定量趋势单准入：手数由风险金额 ÷ 止损距离反推，没有止损价就算不出手数。
+
+    限价开仓还要额外有入场价，且必须落在止损价的盈利侧——挂在止损之外的单一旦
+    成交就已经越过止损，等于开仓即止损。
+    """
     try:
         stop_loss = float(signal_stop_loss)  # type: ignore[arg-type]
     except (TypeError, ValueError):
@@ -311,13 +315,28 @@ def _reject_risk_sized(rule: dict, *, signal_stop_loss: object,
         return "以损定量趋势单需要信号携带止损价（sl），本信号未提供"
     if float(rule.get("risk_amount") or 0) <= 0:
         return "以损定量趋势单的风险金额需大于 0"
+    if not strategy_templates.is_limit_entry(rule):
+        return None  # 市价开仓不看入场价，方向也由节点按现价判定
+
+    try:
+        entry_price = float(signal_entry_price)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        entry_price = 0.0
+    if entry_price <= 0:
+        return "限价开仓需要信号携带入场价（limit_price / price），本信号未提供"
+    action = str(signal_action or "").strip().upper()
+    if action == "BUY" and entry_price <= stop_loss:
+        return f"限价开仓的入场价 {entry_price} 需高于止损价 {stop_loss}"
+    if action == "SELL" and entry_price >= stop_loss:
+        return f"限价开仓的入场价 {entry_price} 需低于止损价 {stop_loss}"
     return None
 
 
 def _reject_grid(rule: dict, *, signal_stop_loss: object,
-                 signal_action: object = None) -> Optional[str]:
+                 signal_action: object = None,
+                 signal_entry_price: object = None) -> Optional[str]:
     """网格交易准入：区间合法、每格手数 > 0、方向与信号匹配。"""
-    del signal_stop_loss  # 网格不依赖信号止损
+    del signal_stop_loss, signal_entry_price  # 网格不依赖信号止损与入场价
     try:
         lower = float(rule.get("price_lower") or 0)
         upper = float(rule.get("price_upper") or 0)
@@ -376,6 +395,7 @@ def entry_reject_reason(
     strategy: dict,
     signal_stop_loss: object,
     signal_action: object = None,
+    signal_entry_price: object = None,
 ) -> Optional[str]:
     """开仓前的策略级准入：策略跑不起来时给出人读的原因；可开仓返回 None。
 
@@ -399,6 +419,7 @@ def entry_reject_reason(
             continue
         reason = rejector(
             rule, signal_stop_loss=signal_stop_loss, signal_action=signal_action,
+            signal_entry_price=signal_entry_price,
         )
         if reason:
             return reason

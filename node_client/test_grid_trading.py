@@ -28,6 +28,21 @@ def test_build_levels_arithmetic():
     assert levels == [100.0, 102.5, 105.0, 107.5, 110.0]
 
 
+def test_config_ignores_config_period_assist_fields():
+    """assist_* 只是后台配置期的试算留痕，执行层必须原样忽略。"""
+    plain = _cfg()
+    assisted = _cfg(
+        assist_enabled=True, assist_timeframe="H4",
+        assist_atr_mult=1.5, assist_spacing=2.5, assist_max_loss=800.0,
+    )
+    assert assisted == plain
+
+    spec = _spec()
+    assert gt.plan_grid(assisted, signal_action="BUY", spec=spec).levels == (
+        gt.plan_grid(plain, signal_action="BUY", spec=spec).levels
+    )
+
+
 def test_build_levels_geometric():
     levels = gt.build_levels(
         _cfg(price_lower=100.0, price_upper=121.0, grid_count=2, grid_mode="geometric"),

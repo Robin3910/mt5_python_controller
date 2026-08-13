@@ -6,7 +6,15 @@ block_cipher = None
 
 datas: list = []
 binaries: list = []
-hiddenimports: list = ["customtkinter", "pystray", "PIL", "PIL.Image", "PIL.ImageDraw"]
+hiddenimports: list = [
+    # 打包前由 build_version.py stamp 生成；version.py 在 try 里导入，缺它只会回落到数字版本号
+    "_build_info",
+    "customtkinter",
+    "pystray",
+    "PIL",
+    "PIL.Image",
+    "PIL.ImageDraw",
+]
 
 try:
     pkg_datas, pkg_binaries, pkg_hidden = collect_all("customtkinter")

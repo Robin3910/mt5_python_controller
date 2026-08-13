@@ -1,12 +1,13 @@
 """FastAPI 依赖项（鉴权 + 共享服务注入）。"""
 from typing import Optional
 
-from fastapi import Header, HTTPException, Request
+from fastapi import Depends, Header, HTTPException, Request
 
+from . import system_settings
 from .dispatcher import Dispatcher
 from .group_dispatcher import GroupDispatcher
 from .redis_store import RedisStore
-from .security import verify_jwt
+from .security import compare_secret, verify_jwt
 from .state import state
 
 
@@ -39,6 +40,28 @@ async def get_current_admin(authorization: Optional[str] = Header(default=None))
     if not sub:
         raise HTTPException(status_code=401, detail="invalid or expired token")
     return sub
+
+
+async def get_node_token_auth(
+    x_node_token: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    store: RedisStore = Depends(get_store),
+) -> str:
+    """校验全局节点接入令牌（NODE_TOKEN），供节点端与本机运维面板调用。
+
+    面板手上只有节点 .env 里的 NODE_TOKEN，没有管理员 JWT。该令牌全局共享且以
+    明文分发到每台节点机，所以只授权「查发布版本」「下载安装包」这类只读接口；
+    上传、发布、降级、删除一律仍需管理员 JWT。
+    """
+    token = (x_node_token or "").strip()
+    if not token and authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="missing node token")
+    expected, _ = await system_settings.get_node_token(store)
+    if not expected or not compare_secret(token, expected):
+        raise HTTPException(status_code=401, detail="invalid node token")
+    return token
 
 
 def client_ip(request: Request) -> str:

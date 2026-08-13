@@ -50,6 +50,9 @@ class Node(Base):
     # mt5_login 自 v0.2 起作为节点的业务唯一键（不可为空、全局唯一）
     mt5_login: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
     mt5_server: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 节点鉴权首包上报的客户端版本；旧版本节点不带该字段，留空表示未知
+    client_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    client_version_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
@@ -62,6 +65,7 @@ class SystemSetting(Base):
     当前用途：
     - `node_token` — 所有节点共享的接入令牌（明文，便于管理员复制到各节点 .env）
     - `trend_config` — 趋势面板全局参数（JSON 文本）
+    - `client_release` — 当前发布的客户端版本指针（JSON 文本，含回滚用的 previous）
     """
     __tablename__ = "system_setting"
 
@@ -70,6 +74,23 @@ class SystemSetting(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
     )
+
+
+class ClientVersion(Base):
+    """客户端安装包版本清单。
+
+    包体本身落磁盘（settings.client_package_dir），此表只存元数据与校验和；
+    「当前发布哪个版本」不在这里，而是 system_setting.client_release 指针。
+    """
+    __tablename__ = "client_version"
+
+    version: Mapped[str] = mapped_column(String(32), primary_key=True)
+    filename: Mapped[str] = mapped_column(String(255))
+    size: Mapped[int] = mapped_column(BigInteger, default=0)
+    sha256: Mapped[str] = mapped_column(String(64))
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    uploaded_by: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
 class User(Base):
@@ -275,6 +296,8 @@ class GroupTaskDispatch(Base):
     error: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # —— 策略运行期实时快照 ——
     position_count: Mapped[int] = mapped_column(Integer, default=0)   # 当前 magic 持仓笔数
+    # 当前 magic 未成交挂单笔数；限价开仓在成交前只有它，是「在途但未持仓」的唯一凭据
+    pending_orders: Mapped[int] = mapped_column(Integer, default=0)
     add_count: Mapped[int] = mapped_column(Integer, default=0)        # 已加仓次数
     total_orders: Mapped[int] = mapped_column(Integer, default=0)     # 累计下单笔数
     total_volume: Mapped[float] = mapped_column(Float, default=0.0)   # 累计手数

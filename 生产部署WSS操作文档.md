@@ -181,6 +181,20 @@ server {
         proxy_send_timeout 3600s;
     }
 
+    # 客户端安装包上传/下载：包体几十 MB，只在这一段放宽体积与超时
+    # "^~" 不可省：否则下面的正则 location 会抢走本段，上传退回 1m 限制而报 413
+    location ^~ /api/client-versions {
+        proxy_pass http://mt5_backend;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        client_max_body_size 300m;           # 需 ≥ 后端 CLIENT_PACKAGE_MAX_MB
+        proxy_request_buffering off;         # 边收边转，避免大包先落 nginx 临时盘
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+    }
+
     # HTTP API / webhook / 健康检查 / 文档
     location ~ ^/(api|webhook|health|docs|redoc|openapi.json) {
         proxy_pass http://mt5_backend;
@@ -202,6 +216,7 @@ server {
 > - `/ws/` 段必须保留 `proxy_http_version 1.1` + `Upgrade`/`Connection` 头，否则 WebSocket 握手失败（返回 400/426）。
 > - `proxy_read_timeout 3600s` 防止节点长连接因空闲被 Nginx 断开（节点心跳间隔 15s，远小于此值）。
 > - `X-Forwarded-For` 必须透传，否则 Webhook 的 IP 白名单（`WHITELISTED_IPS`）会误判来源为 Nginx。
+> - `/api/client-versions` 段的 `^~` 不能删：Nginx 中正则 location 的优先级高于普通前缀 location，缺了 `^~` 会被下面的 `~ ^/(api|...)` 抢走，客户端安装包上传立刻返回 413。
 
 ---
 

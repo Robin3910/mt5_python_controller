@@ -34,6 +34,9 @@ class NodeOut(BaseModel):
     risk: Optional[dict] = None
     mt5_login: Optional[int] = None
     mt5_server: Optional[str] = None
+    # 节点鉴权首包上报的客户端版本；旧版本客户端不上报，为空即未知
+    client_version: Optional[str] = None
+    client_version_at: Optional[float] = None
     created_at: float = 0
     last_seen: Optional[float] = None
 
@@ -42,6 +45,38 @@ class NodeTokenInfo(BaseModel):
     """全局节点接入令牌（所有节点共享）。明文存储，便于管理员复制到各节点 .env。"""
     token: str
     updated_at: float = 0
+
+
+class ClientVersionOut(BaseModel):
+    """客户端安装包版本条目。"""
+    version: str
+    filename: str
+    size: int = 0
+    sha256: str = ""
+    notes: Optional[str] = None
+    uploaded_by: str = ""
+    created_at: float = 0
+    is_current: bool = False       # 是否为当前发布版本
+    node_count: int = 0            # 已上报运行该版本的节点数
+
+
+class ClientReleaseOut(BaseModel):
+    """当前发布指针；previous 是服务端回滚的落点。"""
+    version: str = ""
+    previous: str = ""
+    updated_at: float = 0
+
+
+class ClientVersionListOut(BaseModel):
+    """版本清单 + 发布指针 + 节点版本分布。"""
+    items: list[ClientVersionOut] = Field(default_factory=list)
+    release: ClientReleaseOut = Field(default_factory=ClientReleaseOut)
+    unknown_node_count: int = 0    # 未上报版本的节点数（旧客户端或从未上线）
+
+
+class ClientReleasePayload(BaseModel):
+    """发布某个版本；降级为高危动作，必须显式确认。"""
+    confirm_downgrade: bool = False
 
 
 class LotBatch(BaseModel):
@@ -214,6 +249,8 @@ class GroupTaskDispatchRecord(BaseModel):
     magic: Optional[int] = None
     # —— 策略托管运行期快照 ——
     position_count: int = 0
+    # 未成交挂单笔数；限价开仓在成交前只有它
+    pending_orders: int = 0
     add_count: int = 0
     total_orders: int = 0
     total_volume: float = 0.0
@@ -314,7 +351,7 @@ class StrategyRule(BaseModel):
 
     type=1 逆势加仓 / type=2 顺势加仓（模版1）：point ~ batch_levels；
     type=3 以损定量趋势单（模版2）：risk_amount ~ breakeven_times；
-    type=4 网格交易（模版3）：price_lower ~ trailing_max。
+    type=4 网格交易（模版3）：price_lower ~ assist_max_loss。
 
     保持单一扁平模型是为了让 API 契约、前端类型与 config_json 落库格式都不变；
     服务端 `strategy_templates.normalize_rule` 会按 type 只保留该类型的字段，
@@ -347,6 +384,10 @@ class StrategyRule(BaseModel):
         default="once",
         description="保本监控：once=按次（触发一次后停止）/ loop=循环（可持续监控）",
     )
+    entry_mode: str = Field(
+        default="market",
+        description="开仓方式：market=市价打齐 / limit=在信号入场价挂阶梯限价等成交",
+    )
     # --- type=4：网格交易 ---
     price_lower: float = Field(default=0.0, ge=0, description="网格区间下限")
     price_upper: float = Field(default=0.0, ge=0, description="网格区间上限")
@@ -376,6 +417,22 @@ class StrategyRule(BaseModel):
         description="向上追踪：价格越过区间外沿时网格连同止损止盈整体平移一格",
     )
     trailing_max: int = Field(default=0, ge=0, description="最大平移格数，0=不限")
+    # type=4 的配置期试算助手：只记录建议值是怎么算出来的，执行层不读
+    assist_enabled: bool = Field(
+        default=False, description="是否启用网格试算助手（仅配置期，默认关闭）",
+    )
+    assist_timeframe: str = Field(
+        default="H1", description="试算 ATR 所用的 K 线周期",
+    )
+    assist_atr_mult: float = Field(
+        default=1.0, ge=0, description="格距 = ATR × 该倍数",
+    )
+    assist_spacing: float = Field(
+        default=0.0, ge=0, description="手改后的格距，0=沿用 ATR × 倍数的结果",
+    )
+    assist_max_loss: float = Field(
+        default=0.0, ge=0, description="试算用的最大可接受亏损（账户货币）",
+    )
 
 
 class StrategyTemplateOut(BaseModel):
@@ -531,7 +588,8 @@ class ManualSignalRequest(BaseModel):
     """后台手动触发的信号（复用 Webhook 分发流程）。
 
     volume 只有开仓（BUY / SELL）才必填，由接口层按 action 校验：CLOSE 是终止
-    指令，手数没有意义。stop_loss / take_profit / comment 对齐 Webhook 的同名字段。
+    指令，手数没有意义。stop_loss / take_profit / entry_price / comment 对齐
+    Webhook 的同名字段。
     """
     symbol: str = Field(min_length=1)
     action: str  # BUY / SELL / CLOSE（CLOSE 仅 strategy 链路开放）
@@ -539,6 +597,8 @@ class ManualSignalRequest(BaseModel):
     model: Optional[str] = None  # normal（默认）/ strategy
     stop_loss: Optional[float] = Field(default=None, gt=0)
     take_profit: Optional[float] = Field(default=None, gt=0)
+    # 限价开仓的挂单价，对应 Webhook 的 limit_price；只有配成限价的模版2 会用它
+    entry_price: Optional[float] = Field(default=None, gt=0)
     comment: Optional[str] = Field(default=None, max_length=64)
     # 策略模版定向（仅 strategy 链路）：只发给绑定了这些模版的分组；空 = 不限制
     template_ids: list[str] = Field(default_factory=list)

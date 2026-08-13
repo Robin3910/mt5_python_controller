@@ -21,10 +21,12 @@ class FakeHub:
         self.metrics: dict[tuple[str, str], float] = {}
         self.metric_calls: list[tuple[str, str, str]] = []
 
-    def subscribe(self, *, symbol, magic, direction, hold_when_empty=False) -> mh.Subscription:
+    def subscribe(self, *, symbol, magic, direction, hold_when_empty=False,
+                  track_orders=False) -> mh.Subscription:
         self.sub = mh.Subscription(
             symbol=symbol, magic=magic, direction=direction,
             hold_when_empty=bool(hold_when_empty),
+            track_orders=bool(track_orders),
         )
         return self.sub
 
@@ -616,7 +618,7 @@ def risk_rule(**over) -> dict:
     return rule
 
 
-def _risk_runner(sent: list, *, mt5=None, stop_loss=STOP_LOSS,
+def _risk_runner(sent: list, *, mt5=None, stop_loss=STOP_LOSS, entry_price=0.0,
                  **rule_over) -> tuple[StrategyRunner, FakeHub, MockMT5Client]:
     client = mt5 or MockMT5Client()
     client.prices_map["XAUUSD"] = ENTRY_PRICE
@@ -628,11 +630,13 @@ def _risk_runner(sent: list, *, mt5=None, stop_loss=STOP_LOSS,
     async def _exec(fn, *args):
         return fn(*args)
 
+    entry = {"action": "BUY", "symbol": "XAUUSD", "volume": 0.1, "stop_loss": stop_loss}
+    if entry_price:
+        entry["entry_price"] = entry_price
     runner = StrategyRunner(
         task_id=1, magic=MAGIC, group_id="g1", signal_id="s1",
         # volume 故意给一个不该被采用的值：模版2 的手数只由风险金额决定
-        entry={"action": "BUY", "symbol": "XAUUSD", "volume": 0.1,
-               "stop_loss": stop_loss},
+        entry=entry,
         strategy={"name": "BTC以损定量", "template_id": "tpl_2",
                   "rules": [risk_rule(**rule_over)]},
         mt5=client, hub=hub, exec_fn=_exec, send_fn=send, report_interval=1.0,
@@ -640,10 +644,11 @@ def _risk_runner(sent: list, *, mt5=None, stop_loss=STOP_LOSS,
     return runner, hub, client
 
 
-def _tick(hub: FakeHub, positions, price: float) -> None:
+def _tick(hub: FakeHub, positions, price: float, orders=()) -> None:
     hub.sub.offer(mh.MarketEvent(
         kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
         positions=tuple(positions), price=price, point=0.01,
+        orders=tuple(orders),
     ))
 
 
@@ -1036,6 +1041,232 @@ async def test_risk_sized_never_evaluates_add_on_rules():
 
     assert hub.metric_calls == []
     assert not _progress(sent, "add_counter")
+    runner.cancel()
+
+
+# ---------------------------------------------------------------------------
+# 限价开仓（模版2 · entry_mode=limit）
+#
+# 现价钉在 2400，限价挂 2390、止损 2380：BUY LIMIT 挂在现价下方等回落，
+# mock 不会自动成交，正好用来验证「挂单在途」这段状态。
+# ---------------------------------------------------------------------------
+
+LIMIT_PRICE = 2390.0
+LIMIT_STOP = 2380.0
+
+
+def _limit_runner(sent: list, *, mt5=None, **rule_over):
+    return _risk_runner(
+        sent, mt5=mt5, stop_loss=LIMIT_STOP, entry_price=LIMIT_PRICE,
+        entry_mode="limit", **rule_over,
+    )
+
+
+async def test_limit_entry_places_pending_orders_not_positions():
+    """限价开仓：底仓与分散仓一次全挂上，一笔持仓都不该有。"""
+    sent: list = []
+    runner, hub, mt5 = _limit_runner(sent)
+    runner.start()
+    await _settle()
+
+    assert mt5.positions_by_magic(MAGIC) == []
+    orders = mt5.pending_orders_by_magic(MAGIC)
+    assert len(orders) == 3                      # 底仓 + 2 分散仓
+    assert all(o["pending_kind"] == "limit" for o in orders)
+    assert runner.limit_entry is True
+    runner.cancel()
+
+
+async def test_limit_ladder_prices_descend_toward_stop():
+    """底仓挂在信号入场价，分散仓向止损方向等分推进，且都不落在止损上。"""
+    sent: list = []
+    runner, hub, mt5 = _limit_runner(sent)
+    runner.start()
+    await _settle()
+
+    prices = [o["price_open"] for o in mt5.pending_orders_by_magic(MAGIC)]
+    assert prices[0] == LIMIT_PRICE
+    assert prices == sorted(prices, reverse=True)
+    assert all(p > LIMIT_STOP for p in prices)
+    runner.cancel()
+
+
+async def test_limit_orders_share_signal_stop_and_ladder_tp():
+    sent: list = []
+    runner, hub, mt5 = _limit_runner(sent)
+    runner.start()
+    await _settle()
+
+    orders = mt5.pending_orders_by_magic(MAGIC)
+    assert all(o["sl"] == LIMIT_STOP for o in orders)
+    assert not orders[0]["tp"]                   # 底仓不设止盈
+    assert all(o["tp"] > LIMIT_PRICE for o in orders[1:])
+    runner.cancel()
+
+
+async def test_limit_trade_result_marks_pending():
+    """回报要带 pending，否则服务端会把「挂上了」当成「成交了」记进持仓数。"""
+    sent: list = []
+    runner, hub, mt5 = _limit_runner(sent)
+    runner.start()
+    await _settle()
+
+    results = _of_type(sent, "trade_result")
+    assert results and results[0]["success"] is True
+    assert results[0]["pending"] is True
+    runner.cancel()
+
+
+async def test_limit_not_opened_until_filled():
+    """挂单未成交前 _opened 保持 False：一旦挂单被撤，空仓不该被当成「开过又平光」。"""
+    sent: list = []
+    runner, hub, mt5 = _limit_runner(sent)
+    runner.start()
+    await _settle()
+
+    assert runner._opened is False
+    orders = mt5.pending_orders_by_magic(MAGIC)
+    _tick(hub, [], LIMIT_PRICE + 5, orders=orders)
+    await _settle()
+
+    assert runner.done is False
+    runner.cancel()
+
+
+async def test_limit_gone_before_fill_does_not_finish():
+    """挂单在途期间即便收到 GONE 也不能收口——首单还没成交过。"""
+    sent: list = []
+    runner, hub, mt5 = _limit_runner(sent)
+    runner.start()
+    await _settle()
+
+    hub.sub.offer(mh.MarketEvent(kind=mh.GONE, symbol="XAUUSD", magic=MAGIC))
+    await _settle()
+
+    assert runner.done is False
+    assert not _of_type(sent, "strategy_finished")
+    runner.cancel()
+
+
+async def test_limit_fill_marks_opened_and_reports_event():
+    """挂单成交那一刻才算真正进场，单独记一笔事件供后台追溯等待时长。"""
+    sent: list = []
+    runner, hub, mt5 = _limit_runner(sent)
+    runner.start()
+    await _settle()
+
+    # 价格回落到挂单价，mock 自动撮合
+    mt5.prices_map["XAUUSD"] = LIMIT_PRICE - 5
+    held = mt5.positions_by_magic(MAGIC)
+    assert held                                   # 至少底仓已成交
+    _tick(hub, held, LIMIT_PRICE - 5, orders=mt5.pending_orders_by_magic(MAGIC))
+    await _settle()
+
+    assert runner._opened is True
+    filled = [
+        e for e in _progress(sent, "open")
+        if (e.get("detail") or {}).get("kind") == "risk_sized_limit_filled"
+    ]
+    assert filled and "限价单成交" in filled[0]["message"]
+    runner.cancel()
+
+
+async def test_limit_finishes_after_fill_then_close():
+    """成交后再全平，收口链路与市价模式一致。"""
+    sent: list = []
+    runner, hub, mt5 = _limit_runner(sent)
+    runner.start()
+    await _settle()
+
+    mt5.prices_map["XAUUSD"] = LIMIT_PRICE - 5
+    held = mt5.positions_by_magic(MAGIC)
+    _tick(hub, held, LIMIT_PRICE - 5)
+    await _settle()
+    assert runner._opened is True
+
+    mt5.close_by_magic(MAGIC)
+    hub.sub.offer(mh.MarketEvent(kind=mh.GONE, symbol="XAUUSD", magic=MAGIC))
+    await _settle()
+
+    finished = _of_type(sent, "strategy_finished")
+    assert finished and finished[0]["status"] == "done"
+
+
+async def test_limit_stop_cancels_resting_orders():
+    """终止时必须连挂单一起撤：留在盘上的限价单收口后就没人监控了。"""
+    sent: list = []
+    runner, hub, mt5 = _limit_runner(sent)
+    runner.start()
+    await _settle()
+    assert len(mt5.pending_orders_by_magic(MAGIC)) == 3
+
+    runner.request_stop("close_signal")
+    await _settle()
+
+    assert mt5.pending_orders_by_magic(MAGIC) == []
+    finished = _of_type(sent, "strategy_finished")
+    assert finished and finished[0]["status"] == "done"
+
+
+async def test_limit_reports_pending_order_count():
+    """在途挂单笔数要上报，后台才看得出任务是在等成交而不是空转。"""
+    sent: list = []
+    runner, hub, mt5 = _limit_runner(sent)
+    runner.start()
+    await _settle()
+
+    opened = _progress(sent, "open")[0]
+    assert opened["pending_orders"] >= 1
+    assert opened["position_count"] == 0
+    runner.cancel()
+
+
+async def test_limit_sizing_uses_weighted_distance():
+    """限价手数按加权止损距离反推，且最坏亏损不超风险金额。"""
+    sent: list = []
+    runner, hub, mt5 = _limit_runner(sent)
+    runner.start()
+    await _settle()
+
+    detail = _progress(sent, "open")[0]["detail"]
+    assert detail["entry_mode"] == "limit"
+    assert detail["risk_used"] <= 300.0
+    # 加权距离小于底仓那一档，所以每手亏损比单值口径小、手数更大
+    assert detail["loss_per_lot"] < abs(LIMIT_PRICE - LIMIT_STOP) / 0.01
+    orders = mt5.pending_orders_by_magic(MAGIC)
+    worst = sum(
+        o["volume"] * abs(o["price_open"] - LIMIT_STOP) for o in orders
+    ) / 0.01
+    assert worst <= 300.0 + 1e-6
+    runner.cancel()
+
+
+async def test_limit_without_entry_price_fails_fast():
+    """限价模式缺入场价：算不出挂在哪，直接收口而不是退回市价。"""
+    sent: list = []
+    runner, hub, mt5 = _risk_runner(
+        sent, stop_loss=LIMIT_STOP, entry_mode="limit",
+    )
+    runner.start()
+    await _settle()
+
+    assert mt5.pending_orders_by_magic(MAGIC) == []
+    assert mt5.positions_by_magic(MAGIC) == []
+    errors = _progress(sent, "error")
+    assert errors and "入场价" in errors[0]["message"]
+    assert runner.done
+
+
+async def test_market_mode_places_no_pending_orders():
+    """市价模式一张挂单都不该有，挂单能力只对显式配置的策略开放。"""
+    sent: list = []
+    runner, hub, mt5 = _risk_runner(sent)
+    runner.start()
+    await _settle()
+
+    assert mt5.pending_orders_by_magic(MAGIC) == []
+    assert len(mt5.positions_by_magic(MAGIC)) == 3
+    assert runner.limit_entry is False
     runner.cancel()
 
 

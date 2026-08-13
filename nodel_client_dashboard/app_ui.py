@@ -11,10 +11,13 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
+import version_service as vs
+from client_deploy import count_pending_upgrades, read_version_near
 from models import InstanceConfig, default_label_from_path, shorten_path
 from process_manager import ProcessManager
-from store import load_instances, save_instances
+from store import load_instances, load_panel_config, save_instances
 from tray_icon import TrayController, tray_available
+from version import get_version
 from theme import (
     ACCENT,
     ACCENT_DIM,
@@ -50,6 +53,16 @@ from viewmodels import (
     build_list,
     list_order,
 )
+
+
+# 顶栏「版本更新」按钮：无更新时的常态文案与宽度
+_VERSION_BTN_IDLE = "版本更新"
+_VERSION_BTN_W = 100
+_VERSION_BTN_W_ALERT = 190
+
+# 后端发布版本的复检周期；只是个提示，不必查得勤
+_VERSION_CHECK_INTERVAL_MS = 30 * 60 * 1000
+_VERSION_CHECK_FIRST_MS = 3000
 
 
 @dataclass
@@ -237,7 +250,7 @@ class DashboardApp(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         apply_theme()
-        self.title("节点运维面板")
+        self.title(f"节点运维面板 v{get_version()}")
         self.geometry("1200x760")
         self.minsize(980, 640)
         self.configure(fg_color=BG)
@@ -257,6 +270,7 @@ class DashboardApp(ctk.CTk):
         self._tray: TrayController | None = None
         self._tray_hide_job: str | None = None
         self._restore_repair_job: str | None = None
+        self._remote_version = ""
 
         self._build_layout()
         self._bind_list()
@@ -267,6 +281,7 @@ class DashboardApp(ctk.CTk):
         self.bind("<Map>", self._on_map)
         self.after(1000, self._tick_ui)
         self.after(200, self._setup_tray)
+        self.after(_VERSION_CHECK_FIRST_MS, self._check_remote_version)
 
     def _build_layout(self) -> None:
         self.grid_columnconfigure(0, weight=1)
@@ -291,6 +306,13 @@ class DashboardApp(ctk.CTk):
 
         badges = ctk.CTkFrame(header, fg_color="transparent")
         badges.grid(row=0, column=2, padx=20, pady=14, sticky="e")
+        self.version_btn = ghost_btn(
+            badges, _VERSION_BTN_IDLE, self._open_version_update, width=_VERSION_BTN_W
+        )
+        self.version_btn.pack(side="left", padx=(0, 8))
+        ghost_btn(badges, "连接配置", self._open_connection_config, width=100).pack(
+            side="left", padx=(0, 12)
+        )
         status_chip(badges, "仅本机回环", ACCENT).pack(side="left", padx=4)
         status_chip(badges, "禁止公网绑定", CYAN).pack(side="left", padx=4)
         status_chip(badges, "支持 TLS/WS", TEXT_MUTED).pack(side="left", padx=4)
@@ -324,10 +346,19 @@ class DashboardApp(ctk.CTk):
 
         btn_row = ctk.CTkFrame(left, fg_color="transparent")
         btn_row.grid(row=3, column=0, sticky="ew", padx=12, pady=(4, 4))
-        primary_btn(btn_row, "添加", self._add_instance, width=72).pack(side="left", padx=2)
-        ghost_btn(btn_row, "编辑", self._edit_instance, width=72).pack(side="left", padx=2)
-        ghost_btn(btn_row, "批量替换", self._batch_replace, width=88).pack(side="left", padx=2)
-        danger_btn(btn_row, "移除", self._remove_instance, width=72).pack(side="left", padx=2)
+        primary_btn(btn_row, "导入节点", self._import_node, width=120).pack(
+            side="left", padx=2, fill="x", expand=True
+        )
+
+        # 本地文件操作：不经后端，直接用本机已有的 exe
+        btn_row0 = ctk.CTkFrame(left, fg_color="transparent")
+        btn_row0.grid(row=6, column=0, sticky="ew", padx=12, pady=(0, 14))
+        ghost_btn(btn_row0, "手工添加", self._add_instance, width=120).pack(
+            side="left", padx=2
+        )
+        ghost_btn(btn_row0, "手工替换全部", self._batch_replace, width=120).pack(
+            side="left", padx=2
+        )
 
         btn_row2 = ctk.CTkFrame(left, fg_color="transparent")
         btn_row2.grid(row=4, column=0, sticky="ew", padx=12, pady=(0, 4))
@@ -339,7 +370,7 @@ class DashboardApp(ctk.CTk):
         )
 
         btn_row3 = ctk.CTkFrame(left, fg_color="transparent")
-        btn_row3.grid(row=5, column=0, sticky="ew", padx=12, pady=(0, 14))
+        btn_row3.grid(row=5, column=0, sticky="ew", padx=12, pady=(0, 4))
         ghost_btn(btn_row3, "全部开守护", self._batch_daemon_on, width=120).pack(
             side="left", padx=2
         )
@@ -383,6 +414,7 @@ class DashboardApp(ctk.CTk):
         self.btn_start.pack(side="left", padx=4)
         self.btn_stop = danger_btn(actions, "停止", self._stop, width=92)
         self.btn_stop.pack(side="left", padx=4)
+        ghost_btn(actions, "节点配置", self._edit_node_env, width=100).pack(side="left", padx=4)
         ghost_btn(actions, "刷新健康", self._refresh_health, width=100).pack(side="left", padx=4)
         ghost_btn(actions, "打开目录", self._open_cwd, width=100).pack(side="left", padx=4)
         self.daemon_var = ctk.BooleanVar(value=False)
@@ -510,6 +542,25 @@ class DashboardApp(ctk.CTk):
                 _bind(child, iid)
 
         _bind(card)
+        # 编辑/移除放在列表项内；放在 _bind 之后，避免覆盖按钮自身点击。
+        actions = ctk.CTkFrame(inner, fg_color="transparent")
+        actions.pack(fill="x", pady=(6, 0))
+        ghost_btn(
+            actions,
+            "编辑",
+            lambda iid=vm.id: self._edit_instance(iid),
+            width=56,
+            height=26,
+            font=font(12),
+        ).pack(side="left", padx=(0, 4))
+        danger_btn(
+            actions,
+            "移除",
+            lambda iid=vm.id: self._remove_instance(iid),
+            width=56,
+            height=26,
+            font=font(12),
+        ).pack(side="left")
         return _ListRow(card=card, title=title, dot=dot, path=path, status=status, snapshot=vm)
 
     def _apply_list_row(self, row: _ListRow, vm: ListItemVM) -> None:
@@ -728,10 +779,13 @@ class DashboardApp(ctk.CTk):
         self._selected_id = cfg.id
         self._refresh_list()
         self._update_detail()
+        self._refresh_version_badge()
         self._edit_instance()
 
-    def _edit_instance(self) -> None:
-        mp = self._selected()
+    def _edit_instance(self, instance_id: str | None = None) -> None:
+        if instance_id and instance_id != self._selected_id:
+            self._select(instance_id)
+        mp = self.manager.get(instance_id) if instance_id else self._selected()
         if mp is None:
             messagebox.showinfo("提示", "请先选择一个实例")
             return
@@ -822,6 +876,133 @@ class DashboardApp(ctk.CTk):
 
         self._run_async(title, job)
 
+    def _open_connection_config(self) -> None:
+        """配置后端 API 地址与节点令牌（供版本更新等功能访问后端）。"""
+        from connection_dialog import ConnectionConfigDialog
+
+        # 改完地址或令牌，原来查不通的后端可能就通了，立刻复检一次
+        ConnectionConfigDialog(
+            self, self.manager, on_saved=lambda: self._check_remote_version(repeat=False)
+        )
+
+    def _import_node(self) -> None:
+        """选 MT5 目录 + 指定版本，从后端拉客户端部署成新实例。"""
+        from import_dialog import ImportNodeDialog
+
+        def on_created(cfg: InstanceConfig) -> None:
+            self._persist()
+            self._selected_id = cfg.id
+            self._refresh_list()
+            self._update_detail()
+            self._refresh_version_badge()
+
+        ImportNodeDialog(self, self.manager, on_done=on_created)
+
+    def _edit_node_env(self) -> None:
+        """编辑选中实例的 node_client .env。"""
+        mp = self._selected()
+        if mp is None:
+            messagebox.showinfo("提示", "请先选择一个实例")
+            return
+        from env_dialog import EnvConfigDialog
+
+        dialog = EnvConfigDialog(self, mp.cfg)
+        self.wait_window(dialog)
+        if not dialog.saved:
+            return
+        # 配置在 node_client 进程内是一次性加载的，改完必须重启才生效
+        alive = mp.runtime.process_alive or mp._status_reachable(timeout=0.3)
+        if alive and messagebox.askyesno(
+            "重启实例",
+            f"「{mp.cfg.name}」正在运行，新配置需要重启后才生效。\n\n现在重启吗？",
+        ):
+            iid = mp.cfg.id
+
+            def job():
+                self.manager.stop(iid)
+                self.manager.start(iid)
+
+            self._run_async("重启", job)
+
+    def _open_version_update(self) -> None:
+        """打开版本更新对话框：从后端检测版本、批量更新 / 降级 / 本机回滚。"""
+        if not self.manager.configs():
+            messagebox.showinfo("提示", "请先添加至少一个实例")
+            return
+        from version_dialog import VersionUpdateDialog
+
+        def on_done() -> None:
+            self._persist()
+            self._refresh_version_badge()
+
+        VersionUpdateDialog(self, self.manager, on_done=on_done)
+
+    # ------------------------------------------------------------ 版本更新提示
+
+    def _check_remote_version(self, *, repeat: bool = True) -> None:
+        """查后端当前发布版本，把「有新版可装」标到顶栏按钮上。
+
+        静默失败：这只是个提示，后端不可达或没配令牌时不该弹窗打断本机运维。
+        """
+        if repeat:
+            self.after(_VERSION_CHECK_INTERVAL_MS, self._check_remote_version)
+
+        configs = self.manager.configs()
+        if not configs:
+            self._render_version_badge("", 0)
+            return
+
+        # 后端入口在主线程解析后再交给后台线程：Tcl 解释器不是线程安全的
+        target = vs.resolve_backend(
+            load_panel_config(),
+            [c.cwd or str(Path(c.exe_path).parent) for c in configs],
+        )
+        if not target.ready:
+            self._render_version_badge("", 0)
+            return
+
+        def worker() -> None:
+            try:
+                data = vs.fetch_current_version(target)
+            except vs.VersionServiceError:
+                return
+            version = str((data or {}).get("version") or "")
+            self.after(0, lambda: self._on_remote_version(version))
+
+        threading.Thread(target=worker, name="version-check", daemon=True).start()
+
+    def _on_remote_version(self, version: str) -> None:
+        self._remote_version = version
+        self._refresh_version_badge()
+
+    def _refresh_version_badge(self) -> None:
+        """用已知的后端版本重算本机待更新数；不发请求，供装完/增删实例后调用。"""
+        configs = self.manager.configs()
+        pending = count_pending_upgrades(
+            (read_version_near(c.exe_path) for c in configs), self._remote_version
+        )
+        self._render_version_badge(self._remote_version, pending)
+
+    def _render_version_badge(self, version: str, pending: int) -> None:
+        alert = bool(version) and pending > 0
+        try:
+            if alert:
+                self.version_btn.configure(
+                    text=f"有新版 v{version}（{pending}）",
+                    width=_VERSION_BTN_W_ALERT,
+                    text_color=WARNING,
+                    border_color=WARNING,
+                )
+            else:
+                self.version_btn.configure(
+                    text=_VERSION_BTN_IDLE,
+                    width=_VERSION_BTN_W,
+                    text_color=TEXT,
+                    border_color=GLASS_BORDER,
+                )
+        except tk.TclError:
+            pass
+
     def _batch_replace(self) -> None:
         configs = self.manager.configs()
         if not configs:
@@ -840,7 +1021,7 @@ class DashboardApp(ctk.CTk):
 
         new_ver = read_version_near(source) or "(未知)"
         lines = [
-            f"将用以下程序批量替换全部 {len(configs)} 个实例：",
+            f"本次将替换全部 {len(configs)} 个实例（不能只选其中几个）：",
             f"源文件: {source}",
             f"源版本: {new_ver}",
             "",
@@ -852,9 +1033,10 @@ class DashboardApp(ctk.CTk):
         lines.extend([
             "",
             "规则：运行中的实例会先停止 → 备份原 exe 为 .bak → 覆盖 → 再自动启动。",
+            "只想更新部分实例、或需要可回滚的版本化备份，请改用顶栏「版本更新」。",
             "是否继续？",
         ])
-        if not messagebox.askyesno("批量替换确认", "\n".join(lines)):
+        if not messagebox.askyesno("手工替换全部 · 确认", "\n".join(lines)):
             return
 
         def job():
@@ -870,25 +1052,28 @@ class DashboardApp(ctk.CTk):
                 )
             text = "\n".join(summary)
             if fail:
-                self.after(0, lambda: messagebox.showwarning("批量替换结果", text))
+                self.after(0, lambda: messagebox.showwarning("手工替换结果", text))
             else:
-                self.after(0, lambda: messagebox.showinfo("批量替换结果", text))
+                self.after(0, lambda: messagebox.showinfo("手工替换结果", text))
             self.after(0, self._persist)
+            self.after(0, self._refresh_version_badge)
 
-        self._run_async("批量替换", job)
+        self._run_async("手工替换", job)
 
-    def _remove_instance(self) -> None:
-        mp = self._selected()
+    def _remove_instance(self, instance_id: str | None = None) -> None:
+        mp = self.manager.get(instance_id) if instance_id else self._selected()
         if mp is None:
             return
         if not messagebox.askyesno("确认", f"移除实例「{mp.cfg.name}」？若在运行将先停止。"):
             return
         iid = mp.cfg.id
-        self._selected_id = None
+        if self._selected_id == iid:
+            self._selected_id = None
 
         def job():
             self.manager.remove(iid)
             self.after(0, self._persist)
+            self.after(0, self._refresh_version_badge)
 
         self._run_async("移除", job)
 

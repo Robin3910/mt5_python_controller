@@ -3,7 +3,8 @@
 当前职责：
 - 全局节点接入令牌 NODE_TOKEN —— 所有节点共享同一令牌（明文存 DB，
   Redis 作缓存，便于管理员在「账户设置」页查看/复制/重置）；
-- 趋势面板参数 trend_config —— 全后台共享一份（JSON 落库，不分节点/币种）。
+- 趋势面板参数 trend_config —— 全后台共享一份（JSON 落库，不分节点/币种）；
+- 客户端发布指针 client_release —— 当前发布的客户端版本及回滚落点。
 """
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ from typing import Optional
 from sqlalchemy import select
 
 from . import trend_indicators
+from .client_version import RELEASE_KEY as KEY_CLIENT_RELEASE
 from .db import SessionLocal
 from .orm import Node, SystemSetting
 from .redis_store import RedisStore
@@ -127,3 +129,26 @@ async def set_trend_config(cfg: dict | None) -> dict:
         json.dumps(normalized, ensure_ascii=False, separators=(",", ":")),
     )
     return normalized
+
+
+async def get_client_release() -> dict:
+    """读取当前客户端发布指针；从未发布过返回空字典。"""
+    row = await _get_setting(KEY_CLIENT_RELEASE)
+    if not row or not row.value:
+        return {}
+    try:
+        parsed = json.loads(row.value)
+    except json.JSONDecodeError:
+        logger.warning("client_release JSON 损坏，按「未发布」处理")
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+async def set_client_release(release: dict | None) -> dict:
+    """写入客户端发布指针；传空表示撤销发布。"""
+    payload = release or {}
+    await _upsert_setting(
+        KEY_CLIENT_RELEASE,
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+    )
+    return payload

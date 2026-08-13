@@ -53,6 +53,10 @@ DISTRIBUTE_COUNT_MAX = 50
 BREAKEVEN_ONCE = "once"
 BREAKEVEN_LOOP = "loop"
 BREAKEVEN_MODES = (BREAKEVEN_ONCE, BREAKEVEN_LOOP)
+# 开仓方式：market=信号到达即市价打齐 / limit=在信号给的入场价挂限价单等成交
+ENTRY_MODE_MARKET = "market"
+ENTRY_MODE_LIMIT = "limit"
+ENTRY_MODES = (ENTRY_MODE_MARKET, ENTRY_MODE_LIMIT)
 
 # --- 模版3：网格交易 ---
 GRID_MODE_ARITHMETIC = "arithmetic"   # 等差
@@ -68,6 +72,13 @@ GRID_COUNT_MIN = 2
 GRID_COUNT_MAX = 200
 # 向上追踪的平移次数上限；0 表示不限，此处只防止配置写出天文数字
 GRID_TRAILING_MAX = 10000
+# 试算助手：只在配置期把「ATR × 倍数」折成格距、再按最大亏损反推每格手数，
+# 结果落到 grid_count / lot_per_grid 两个既有字段，网格执行不读这组参数。
+# 周期复用分批档位那套（BATCH_TIMEFRAMES），默认比加仓档位大一档：网格格距要反映的
+# 是区间级别的波动结构。
+GRID_ASSIST_TIMEFRAME = "H1"
+GRID_ASSIST_MULT_MIN = 0.05
+GRID_ASSIST_MULT_MAX = 50.0
 
 TEMPLATE_1_ID = "tpl_1"
 TEMPLATE_1_NAME = "顺势逆势加仓策略"
@@ -215,9 +226,16 @@ class RiskSizedTrendRule:
 
         总手数 = risk_amount / (止损距离 × 每手每点价值)
 
-    底仓按 base_ratio 立即市价成交（止盈为 0）；剩余仓位拆成 add_batches 笔
-    「分散仓」市价单，按盈亏比挂止盈。所有订单共用信号那一个止损价，所以打到
-    止损的总亏损始终等于 risk_amount——这是「以损定量」的关键。
+    底仓按 base_ratio 成交（止盈为 0）；剩余仓位拆成 add_batches 笔「分散仓」，
+    按盈亏比挂止盈。所有订单共用信号那一个止损价，所以打到止损的总亏损始终等于
+    risk_amount——这是「以损定量」的关键。
+
+    entry_mode 决定这批单怎么进场：
+    - market：信号一到全部市价打齐，各单开仓价相同，止损距离是单值；
+    - limit：底仓挂在信号给的入场价，分散仓在「入场价 → 止损价」之间等分挂阶梯
+      限价，各单止损距离不同，总手数改按仓位比例加权的平均止损距离反推。此时
+      risk_amount 的语义从「确定亏损」变成「全部档位都成交时的最坏亏损」，只成交
+      了前几档就打到止损的话实际亏损更小。
 
     止盈距离 = 止损距离 × rr_ratio（只挂在分散仓上）。
     breakeven_enabled 开启后，浮盈达到「止损距离 × breakeven_times」时把止损
@@ -234,6 +252,7 @@ class RiskSizedTrendRule:
     breakeven_enabled: bool = True          # 保本触发
     breakeven_times: float = 2.0            # 浮盈达到止损距离 × N 倍时移动止损到保本
     breakeven_mode: str = BREAKEVEN_ONCE    # once=按次 / loop=循环
+    entry_mode: str = ENTRY_MODE_MARKET     # market=市价打齐 / limit=挂阶梯限价
 
     @property
     def type(self) -> int:
@@ -252,6 +271,7 @@ class RiskSizedTrendRule:
             "breakeven_enabled": self.breakeven_enabled,
             "breakeven_times": self.breakeven_times,
             "breakeven_mode": self.breakeven_mode,
+            "entry_mode": self.entry_mode,
         }
 
 
@@ -291,6 +311,10 @@ class GridTradingRule:
     trailing_up 开启时，价格突破区间外沿时不停机，整个网格连同止损止盈一起平移
     一格，继续在新区间运行。多头网格追涨（突破上限上移），空头网格追跌（跌破下限
     下移）。
+
+    assist_* 是配置期的试算参数（默认关闭）：把 ATR × 倍数折成格距推出格数，再按
+    最大可接受亏损反推每格手数。它们只是「这组格数与手数是怎么算出来的」的留痕，
+    执行层（node_client/grid_trading）不读，因此改动它们不会影响已在跑的网格。
     """
     status: int = 1
     action: str = "all"                         # 保留字段，与其它规则对齐；实际方向看 grid_side
@@ -308,6 +332,12 @@ class GridTradingRule:
     prefill_enabled: bool = True                # 是否按现价上方格位初始建仓
     trailing_up: bool = False                   # 向上追踪：突破区间外沿时平移网格
     trailing_max: int = 0                       # 最大平移格数，0=不限
+    # --- 试算助手（仅配置期，执行层不读）---
+    assist_enabled: bool = False                # 是否展开试算，默认关闭
+    assist_timeframe: str = GRID_ASSIST_TIMEFRAME   # 算 ATR 用的 K 线周期
+    assist_atr_mult: float = 1.0                # 格距 = ATR × 该倍数
+    assist_spacing: float = 0.0                 # 手改后的格距，0=用 ATR×倍数的结果
+    assist_max_loss: float = 0.0                # 最大可接受亏损（账户货币）
 
     @property
     def type(self) -> int:
@@ -332,6 +362,11 @@ class GridTradingRule:
             "prefill_enabled": self.prefill_enabled,
             "trailing_up": self.trailing_up,
             "trailing_max": self.trailing_max,
+            "assist_enabled": self.assist_enabled,
+            "assist_timeframe": self.assist_timeframe,
+            "assist_atr_mult": self.assist_atr_mult,
+            "assist_spacing": self.assist_spacing,
+            "assist_max_loss": self.assist_max_loss,
         }
 
 
@@ -407,6 +442,7 @@ def default_risk_sized_rule() -> RiskSizedTrendRule:
         breakeven_enabled=True,
         breakeven_times=2.0,
         breakeven_mode=BREAKEVEN_ONCE,
+        entry_mode=ENTRY_MODE_MARKET,
     )
 
 
@@ -433,6 +469,11 @@ def default_grid_rule() -> GridTradingRule:
         prefill_enabled=True,
         trailing_up=False,
         trailing_max=0,
+        assist_enabled=False,
+        assist_timeframe=GRID_ASSIST_TIMEFRAME,
+        assist_atr_mult=1.0,
+        assist_spacing=0.0,
+        assist_max_loss=0.0,
     )
 
 
@@ -466,8 +507,9 @@ STRATEGY_TEMPLATES: dict[str, dict] = {
         "name": TEMPLATE_2_NAME,
         "description": (
             "以损定量趋势单：按风险金额与信号止损价反推总手数（不使用信号手数），"
-            "底仓市价成交（止盈为 0），剩余仓位拆成多笔分散仓市价单并按盈亏比挂止盈，"
+            "底仓成交（止盈为 0），剩余仓位拆成多笔分散仓并按盈亏比挂止盈，"
             "全部订单共用信号止损价；可选浮盈达标后自动移动止损保本。"
+            "开仓方式可选市价打齐，或在信号给的入场价挂阶梯限价等成交。"
             "信号必须携带止损价，否则该策略不参与分发。"
         ),
         "rule_set": _TPL2_RULES,
@@ -508,6 +550,16 @@ def pick_risk_sized_rule(rules: object) -> Optional[dict]:
         if is_risk_sized_rule(rule) and _as_int(rule.get("status"), 0):
             return rule
     return None
+
+
+def is_limit_entry(rule: object) -> bool:
+    """该条以损定量规则是否配成了限价开仓。
+
+    只认显式的 limit，其余（含缺字段的历史配置）一律按市价，保证旧策略行为不变。
+    """
+    if not isinstance(rule, dict):
+        return False
+    return str(rule.get("entry_mode") or "").strip().lower() == ENTRY_MODE_LIMIT
 
 
 def is_grid_rule(rule: object) -> bool:
@@ -652,6 +704,10 @@ def _normalize_risk_sized_rule(rule_type: int, raw: dict) -> dict[str, Any]:
     if breakeven_mode not in BREAKEVEN_MODES:
         breakeven_mode = defaults["breakeven_mode"]
 
+    entry_mode = str(raw.get("entry_mode") or defaults["entry_mode"]).strip().lower()
+    if entry_mode not in ENTRY_MODES:
+        entry_mode = defaults["entry_mode"]
+
     return {
         "type": rule_type,
         "status": _normalize_status(raw, defaults["status"]),
@@ -668,6 +724,7 @@ def _normalize_risk_sized_rule(rule_type: int, raw: dict) -> dict[str, Any]:
             0.0, _as_float(raw.get("breakeven_times", defaults["breakeven_times"]), defaults["breakeven_times"]),
         ),
         "breakeven_mode": breakeven_mode,
+        "entry_mode": entry_mode,
     }
 
 
@@ -678,6 +735,9 @@ def _normalize_grid_rule(rule_type: int, raw: dict) -> dict[str, Any]:
     stop_lower 须低于区间下限、stop_upper 须高于区间上限（几何约束，与方向无关；
     为 0 表示不设）。运行时语义：多头 stop_lower=止损 / stop_upper=止盈；空头相反。
     网格数量夹在 [2, 200]，向上追踪的平移上限夹在 [0, 10000]。
+
+    assist_* 只是配置期试算的留痕：关闭开关时也照常夹取并保留已填的值（与
+    trailing_max 在追踪关闭时的处理一致），避免用户误关开关就把参数丢了。
     """
     defaults = default_grid_rule().to_dict()
 
@@ -706,6 +766,20 @@ def _normalize_grid_rule(rule_type: int, raw: dict) -> dict[str, Any]:
     if stop_upper > 0 and price_upper > 0 and stop_upper <= price_upper:
         stop_upper = 0.0
 
+    assist_timeframe = str(
+        raw.get("assist_timeframe") or defaults["assist_timeframe"],
+    ).strip().upper()
+    if assist_timeframe not in BATCH_TIMEFRAMES:
+        assist_timeframe = defaults["assist_timeframe"]
+    assist_atr_mult = _as_float(
+        raw.get("assist_atr_mult", defaults["assist_atr_mult"]), defaults["assist_atr_mult"],
+    )
+    assist_atr_mult = (
+        min(GRID_ASSIST_MULT_MAX, max(GRID_ASSIST_MULT_MIN, assist_atr_mult))
+        if assist_atr_mult > 0
+        else defaults["assist_atr_mult"]
+    )
+
     return {
         "type": rule_type,
         "status": _normalize_status(raw, defaults["status"]),
@@ -732,6 +806,15 @@ def _normalize_grid_rule(rule_type: int, raw: dict) -> dict[str, Any]:
         "trailing_max": min(
             GRID_TRAILING_MAX,
             max(0, _as_int(raw.get("trailing_max", defaults["trailing_max"]), defaults["trailing_max"])),
+        ),
+        "assist_enabled": bool(raw.get("assist_enabled", defaults["assist_enabled"])),
+        "assist_timeframe": assist_timeframe,
+        "assist_atr_mult": assist_atr_mult,
+        "assist_spacing": max(
+            0.0, _as_float(raw.get("assist_spacing", defaults["assist_spacing"]), defaults["assist_spacing"]),
+        ),
+        "assist_max_loss": max(
+            0.0, _as_float(raw.get("assist_max_loss", defaults["assist_max_loss"]), defaults["assist_max_loss"]),
         ),
     }
 

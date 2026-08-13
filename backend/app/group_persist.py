@@ -481,7 +481,12 @@ async def update_dispatch_result(
                     row.status = "opened"
                     row.opened_at = row.opened_at or now
                     row.total_orders = max(row.total_orders, 1)
-                    row.position_count = max(row.position_count, 1)
+                    # 挂单成功只是挂上了并未成交，此时记在途挂单而不是持仓；
+                    # 账户快照对账已把挂单计入存活判据，opened_at 照常写
+                    if result.get("pending"):
+                        row.pending_orders = max(row.pending_orders, 1)
+                    else:
+                        row.position_count = max(row.position_count, 1)
                     row.last_report_at = now
                 else:
                     row.status = "failed"
@@ -574,6 +579,8 @@ async def record_strategy_progress(
                 row.status = phase
             if _num(data.get("position_count")) is not None:
                 row.position_count = int(data["position_count"])
+            if _num(data.get("pending_orders")) is not None:
+                row.pending_orders = int(data["pending_orders"])
             if _num(data.get("add_count")) is not None:
                 row.add_count = int(data["add_count"])
             if _num(data.get("total_orders")) is not None:
@@ -666,6 +673,8 @@ async def finish_subtask(
             else:
                 row.finished_at = now
                 row.position_count = 0
+            # 收口路径已连挂单一起撤，不论是否 stuck，在途挂单都归零
+            row.pending_orders = 0
             if _num(data.get("total_orders")) is not None:
                 row.total_orders = int(data["total_orders"])
             if _num(data.get("total_volume")) is not None:
@@ -717,11 +726,14 @@ async def finish_subtask(
 async def reconcile_node_positions(
     node_id: str, magics: set[int],
 ) -> list[dict]:
-    """账户快照对账：节点上已无持仓的运行中子任务，判定为已平仓并收口。
+    """账户快照对账：节点上已无痕迹的运行中子任务，判定为已平仓并收口。
 
     这是 strategy_finished 的兜底——上报丢包或节点在监控启动前就平了仓时，
     单靠节点主动上报会让子任务永远停在 running，进而把该节点该品种锁死。
     只处理已经开过仓（opened_at 非空）的子任务，避免把刚下发还没成交的误判为完成。
+
+    `magics` 由调用方按「持仓 ∪ 未成交挂单」汇总：限价开仓的任务在成交前只有挂单，
+    漏掉挂单会让它在成交前就被收口。
 
     网格空仓是常态，正常运行时不据此收口；但已经停手、只等残仓被处理掉的子任务
     （STUCK）反过来必须靠这里收口，否则占位会一直挂着。
@@ -755,6 +767,7 @@ async def reconcile_node_positions(
                 row.status = "done"
                 row.finish_reason = "reconciled_no_position"
                 row.position_count = 0
+                row.pending_orders = 0
                 row.residual_positions = 0
                 row.finished_at = now
                 row.last_report_at = now
@@ -944,6 +957,7 @@ def _dispatch_row(d: GroupTaskDispatch, node_name: Optional[str]) -> dict:
         "error": d.error,
         "magic": d.magic,
         "position_count": d.position_count,
+        "pending_orders": d.pending_orders,
         "add_count": d.add_count,
         "total_orders": d.total_orders,
         "total_volume": d.total_volume,

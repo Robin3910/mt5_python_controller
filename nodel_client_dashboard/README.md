@@ -14,11 +14,11 @@ python main.py
 
 ## 使用
 
-1. 点击「添加…」选择 `node_client.exe`（工作目录默认取其同目录，需已有 `.env`）
+1. 点击「手工添加」选择 `node_client.exe`（工作目录默认取其同目录，需已有 `.env`）
 2. 「启动」会注入 `LOCAL_STATUS_PORT`，**无窗口后台**拉起节点；stdout/stderr **实时**写入 `logs/<节点标识符>/YYYY-MM-DD.log`（按天轮转；节点标识符 = 标签 + 实例 id 前 8 位）
 3. 「停止」优先 `POST /stop`，超时再 terminate/kill
 4. 打开「守护进程」后，子进程退出会按 `restart_delay_s`（默认 5s）自动拉起；可用「全部开守护 / 全部关守护」批量切换
-5. 「批量替换」用新 `node_client.exe`（建议带 `version.txt`）覆盖全部实例：停 → 备份 → 覆盖 → 再启
+5. 「手工替换全部」用新 `node_client.exe`（建议带 `version.txt`）覆盖全部实例：停 → 备份 → 覆盖 → 再启
 6. 右侧查看健康摘要、runners 任务表、版本与日志尾部（界面为快照差分绑定，刷新不整页重建）
 
 > 运维面板**仅允许单实例**：再次启动会提示并切到已有窗口。
@@ -37,7 +37,14 @@ python main.py
 build_exe.bat
 ```
 
-产物：`dist\node_client_dashboard.exe`（`instances.json` / `logs/` 写在 exe 同目录）。
+产物两份：
+
+- `dist\node_client_dashboard.exe`（`instances.json` / `panel_config.json` / `logs/` 运行时写在 exe 同目录）
+- `packages\node_client_dashboard-<版本>.zip` —— 拷到新机器解压即用的分发包
+
+版本号每次打包自动生成，规则 `${数字版本号}-${年月日时分秒}`（如 `1.0.0-20260813155913`）。数字版本号取 `version.py` 的 `BASE_VERSION`，只在发大版本时手工改；时间戳由构建脚本生成，所以同一天连打几次也不会撞号。版本号一式两份：`_build_info.py` 冻结进 exe，`version.txt` 写在产物目录旁，窗口标题会显示它。
+
+压缩包内部带一层 `node_client_dashboard-<版本>\` 目录，解压不会把文件铺一地。**面板的运行期数据绝不入包**：`panel_config.json` 存着 NODE_TOKEN、`instances.json` 记录本机每个实例的绝对路径，只要在 `dist\` 里跑过一次面板它们就会生成，跟着打包等于把令牌和本机拓扑一起发出去。打包完会自检一次，含主程序且不含这两个文件才算通过，否则删掉产物并让构建失败。
 
 ## 测试
 

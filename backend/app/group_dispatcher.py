@@ -68,6 +68,8 @@ def build_strategy_start_command(
             "volume": volume,
             "stop_loss": signal.stop_loss,
             "take_profit": signal.take_profit,
+            # 限价开仓的挂单价；市价链路为空，节点据此按现价成交
+            "entry_price": signal.entry_price,
             "comment": signal.comment or "",
         },
         "strategy": strategy_snapshot,
@@ -179,6 +181,7 @@ class GroupDispatcher:
                 continue
             reject = group_rules.entry_reject_reason(
                 strategy, signal.stop_loss, signal_action=signal.action,
+                signal_entry_price=signal.entry_price,
             )
             if reject:
                 reasons.append(f"{name}：{reject}")

@@ -180,6 +180,10 @@ async def node_ws(ws: WebSocket):
         await ws.close(code=4409)  # 4409：重复连接被拒绝
         return
 
+    # 客户端版本随鉴权首包上报（协议见 技术实现方案.md 的 auth.client_version）。
+    # 旧版本节点不带该字段，一律按「未知版本」放行，绝不因此拒绝接入。
+    await node_service.report_client_version(store, node_id, data.get("client_version") or "")
+
     # 先登记连接再回 auth_ok，确保节点收到确认时即可被路由（消除竞态）
     await manager.register_node(node_id, ws)
     await store.touch_online(node_id)
@@ -285,23 +289,38 @@ async def _save_account(node_id: str, ws: WebSocket, data: dict) -> None:
         "free_margin": acct.get("free_margin", acct.get("margin_free", 0)),
         "leverage": acct.get("leverage", 0),
         "positions": data.get("positions", []),
+        # 未成交挂单：限价开仓的任务在成交前只有它，对账必须看得见
+        "orders": data.get("orders", []),
         "prices": data.get("prices", {}),  # 供区间过滤取价
         "quotes": data.get("quotes", {}),
         "updated_at": time.time(),
     }
     await store.save_account(node_id, snapshot)
-    await _reconcile_strategy_tasks(node_id, snapshot.get("positions") or [])
+    await _reconcile_strategy_tasks(
+        node_id, snapshot.get("positions") or [], snapshot.get("orders") or [],
+    )
     await manager.broadcast_admin({"type": "account", "data": snapshot})
 
 
-async def _reconcile_strategy_tasks(node_id: str, positions: list) -> None:
-    """用账户快照兜底收口：快照里已经没有的魔术号，对应子任务判为已平仓。"""
-    magics: set[int] = set()
-    for pos in positions:
+def _magics_of(rows: list) -> set[int]:
+    out: set[int] = set()
+    for row in rows:
         try:
-            magics.add(int((pos or {}).get("magic") or 0))
+            out.add(int((row or {}).get("magic") or 0))
         except (TypeError, ValueError):
             continue
+    return out
+
+
+async def _reconcile_strategy_tasks(
+    node_id: str, positions: list, orders: list | None = None,
+) -> None:
+    """用账户快照兜底收口：快照里已经没有的魔术号，对应子任务判为已平仓。
+
+    判据是「持仓 ∪ 挂单」：只看持仓的话，限价开仓的任务在挂单成交前会被误判成
+    已平仓而提前收口、释放节点占位，那张挂单就成了没人监控的孤儿单。
+    """
+    magics = _magics_of(positions) | _magics_of(orders or [])
     for done in await group_persist.reconcile_node_positions(node_id, magics):
         logger.info(
             "task %s reconciled from account snapshot of %s", done.get("task_id"), node_id,

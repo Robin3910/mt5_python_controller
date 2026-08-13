@@ -79,6 +79,8 @@ def _build_signal_payload(body: ManualSignalRequest) -> dict:
         data["sl"] = body.stop_loss
     if body.take_profit:
         data["tp"] = body.take_profit
+    if body.entry_price:
+        data["limit_price"] = body.entry_price
     if comment := (body.comment or "").strip():
         data["comment"] = comment
     return data

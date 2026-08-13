@@ -44,6 +44,18 @@ async def test_authenticate_ok():
     assert n.hub_symbols == {"BTCUST", "XAUUSD"}
 
 
+async def test_authenticate_reports_client_version():
+    """后台靠鉴权首包里的 client_version 展示各节点实际运行版本。"""
+    from version import get_version
+
+    n = _node()
+    await n._exec(n.mt5.connect)
+    ws = FakeWS()
+    ws.feed({"type": "auth_ok", "data": {"node_id": "nd_x"}})
+    assert await n._authenticate(ws) is True
+    assert ws.sent[0]["data"]["client_version"] == get_version()
+
+
 async def test_effective_watchlist_unions_sources():
     n = _node()
     n.apply_hub_symbols(["BTCUST"])
@@ -167,7 +179,9 @@ async def test_snapshot_shape():
     n = _node()
     await n._exec(n.mt5.connect)
     snap = await n._snapshot()
-    assert set(snap.keys()) == {"account", "positions", "prices", "quotes"}
+    # orders 是限价开仓的存活凭据：服务端对账少了它会在挂单成交前就收口任务
+    assert set(snap.keys()) == {"account", "positions", "orders", "prices", "quotes"}
+    assert snap["orders"] == []
     assert "EURUSD" in snap["prices"]
     assert "EURUSD" in snap["quotes"]
     assert set(snap["quotes"]["EURUSD"].keys()) == {"bid", "ask", "mid", "change"}
@@ -433,6 +447,39 @@ async def test_market_probe_requires_symbol():
     data = await _probe(n, ws, symbol="  ")
 
     assert data["error"] == "缺少品种"
+
+
+async def test_market_probe_returns_symbol_spec():
+    """探针附带合约规格，后台才能把价格距离折成金额（网格试算）。"""
+    n = _node()
+    await n._exec(n.mt5.connect)
+    ws = FakeWS()
+
+    data = await _probe(n, ws)
+
+    spec = data["spec"]
+    assert spec["tick_size"] > 0
+    assert spec["tick_value"] > 0
+    assert spec["volume_min"] > 0
+    assert spec["volume_step"] > 0
+
+
+async def test_market_probe_spec_failure_keeps_bars():
+    """规格读不到只省略 spec：探针失败会让 strategy 的趋势风控 fail-closed 拦开仓。"""
+    n = _node()
+    await n._exec(n.mt5.connect)
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("no symbol info")
+
+    n.mt5.symbol_spec = boom
+    ws = FakeWS()
+
+    data = await _probe(n, ws)
+
+    assert "error" not in data
+    assert data["bars"]
+    assert "spec" not in data
 
 
 async def test_market_probe_survives_terminal_error():

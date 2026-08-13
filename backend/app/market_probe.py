@@ -1,4 +1,4 @@
-"""节点行情探针：按需向在线节点索取一段 K 线与当前报价。
+"""节点行情探针：按需向在线节点索取一段 K 线、当前报价与品种合约规格。
 
 账户上报只带观察品种的报价、且不含 K 线，所以「看任意品种任意周期」的只读视图
 （当前是趋势面板）需要一条请求-响应通道：下发 `market_probe` 命令并等节点回
@@ -91,6 +91,8 @@ async def _request(node_id: str, symbol: str, timeframe: str, count: int) -> dic
         "timeframe": timeframe,
         "bars": bars,
         "quote": payload.get("quote") if isinstance(payload.get("quote"), dict) else {},
+        # 合约规格是附加项：老节点或读不到规格时为空，调用方据此降级（只是算不了金额）
+        "spec": payload.get("spec") if isinstance(payload.get("spec"), dict) else {},
         "fetched_at": time.time(),
     }
 

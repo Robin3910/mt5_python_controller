@@ -132,6 +132,154 @@ def test_sell_direction_uses_stop_above_entry():
 
 
 # ---------------------------------------------------------------------------
+# 限价开仓：阶梯挂单价与加权止损距离
+# ---------------------------------------------------------------------------
+
+def limit_cfg(**over) -> RiskSizedConfig:
+    return cfg(entry_mode="limit", **over)
+
+
+def limit_plan(**over):
+    """底仓挂 2400、止损 2397 的多单限价计划（止损距离 3 美元 = 300 点）。"""
+    params = {"direction": "BUY", "entry_price": 2410.0, "stop_loss": 2397.0,
+              "spec": GOLD, "limit_price": 2400.0}
+    conf = over.pop("cfg", None) or limit_cfg(**over)
+    return plan_entries(conf, **params)
+
+
+def test_limit_entry_anchors_on_signal_price_not_market():
+    """挂单按挂单价成交，开仓价与止损基准都用信号入场价，不看现价。"""
+    plan = limit_plan()
+    assert plan.ok
+    assert plan.is_limit_entry
+    assert plan.entry_price == pytest.approx(2400.0)
+    assert plan.risk_price == pytest.approx(2400.0)
+    assert plan.spread == pytest.approx(0.0)  # 挂单没有点差概念
+    assert plan.sl_distance == pytest.approx(3.0)
+
+
+def test_limit_ladder_spreads_between_entry_and_stop():
+    """分散仓在「入场价 → 止损价」之间等分，分母取单数+1 所以末档不落在止损上。"""
+    plan = limit_plan(add_batches=2)
+    prices = [b.price for b in plan.batches]
+    # 3 美元跨度切成 3 段：2400 / 2399 / 2398，止损 2397 不被占用
+    assert prices == pytest.approx([2400.0, 2399.0, 2398.0])
+    assert all(p > plan.stop_loss for p in prices)
+
+
+def test_limit_ladder_for_sell_goes_upward():
+    plan = plan_entries(limit_cfg(add_batches=2), direction="SELL", entry_price=2390.0,
+                        stop_loss=2403.0, spec=GOLD, limit_price=2400.0)
+    assert [b.price for b in plan.batches] == pytest.approx([2400.0, 2401.0, 2402.0])
+
+
+def test_limit_batches_have_decreasing_stop_distance():
+    """越往不利方向挂，离止损越近；这正是手数要改按加权距离反推的原因。"""
+    plan = limit_plan(add_batches=2)
+    distances = [b.sl_distance for b in plan.batches]
+    assert distances == pytest.approx([3.0, 2.0, 1.0])
+    assert distances == sorted(distances, reverse=True)
+
+
+def test_limit_uses_weighted_stop_distance_for_sizing():
+    """加权止损距离 = Σ(该档仓位占比 × 该档止损距离)。
+
+    底仓 30% 距离 3、两档分散仓各 35% 距离 2 与 1：
+    0.3×3 + 0.35×2 + 0.35×1 = 1.95 美元 = 195 点，一手亏 195 美元。
+    """
+    plan = limit_plan(add_batches=2, base_ratio=30)
+    assert plan.loss_per_lot == pytest.approx(195.0)
+    assert plan.planned_lot == pytest.approx(1.53)  # floor(300 / 195) 到 0.01
+
+
+def test_limit_opens_bigger_position_than_market_at_same_risk():
+    """同一份配置改成限价后手数更大：挂单价更有利，加权止损距离更小。"""
+    market = plan_entries(cfg(add_batches=2), direction="BUY", entry_price=2400.0,
+                          stop_loss=2397.0, spec=GOLD)
+    limit = limit_plan(add_batches=2)
+    assert limit.total_lot > market.total_lot
+
+
+def test_limit_worst_case_loss_stays_within_risk_amount():
+    """全部档位都成交后打到止损，总亏损不超过风险金额——以损定量的立身之本。"""
+    plan = limit_plan(add_batches=2)
+    worst = sum(b.volume * b.sl_distance for b in plan.batches) / GOLD.tick_size * GOLD.tick_value
+    assert worst == pytest.approx(plan.risk_used)
+    assert worst <= 300.0 + 1e-9
+
+
+@pytest.mark.parametrize("batches", [0, 1, 3, 7, 20])
+@pytest.mark.parametrize("base_ratio", [10, 30, 50, 90])
+def test_limit_never_exceeds_risk_budget(batches, base_ratio):
+    """各种仓位分布下都不能超预算：最小手数托底会让实际分布偏离配置比例。"""
+    plan = limit_plan(add_batches=batches, base_ratio=base_ratio)
+    if not plan.ok:
+        return  # 切不出满足预算的分布时会拒绝，这也是正确行为
+    worst = sum(b.volume * b.sl_distance for b in plan.batches) / GOLD.tick_size * GOLD.tick_value
+    assert worst <= 300.0 + 1e-6
+
+
+def test_limit_partial_fill_loses_less_than_budget():
+    """只成交前几档就止损：实际亏损小于风险金额，这是限价模式的语义变化。"""
+    plan = limit_plan(add_batches=2)
+    base_only = plan.batches[0].volume * plan.batches[0].sl_distance / GOLD.tick_size
+    assert base_only * GOLD.tick_value < plan.risk_used
+
+
+def test_limit_requires_entry_price():
+    plan = plan_entries(limit_cfg(), direction="BUY", entry_price=2410.0,
+                        stop_loss=2397.0, spec=GOLD)
+    assert not plan.ok
+    assert "入场价" in plan.reject
+
+
+def test_limit_rejects_entry_on_wrong_side_of_stop():
+    """挂在止损之外的单一成交就已越过止损，等于开仓即止损。"""
+    plan = plan_entries(limit_cfg(), direction="BUY", entry_price=2410.0,
+                        stop_loss=2405.0, spec=GOLD, limit_price=2400.0)
+    assert not plan.ok
+    assert "不利方向" in plan.reject
+
+
+def test_limit_take_profit_still_anchors_on_base_price():
+    """阶梯止盈仍以底仓价为锚：各档开仓价更有利，实际盈亏比只会更高。"""
+    plan = limit_plan(add_batches=2)
+    assert plan.take_profit == pytest.approx(2400.0 + 3.0 * 2.5)
+
+
+def test_limit_batches_marked_as_pending():
+    plan = limit_plan(add_batches=2)
+    assert all(b.is_pending for b in plan.batches)
+
+
+def test_market_batches_have_no_limit_price():
+    """市价模式一个挂单价都不该有，否则会误走挂单下单路径。"""
+    plan = plan_entries(cfg(add_batches=2), direction="BUY", entry_price=2400.0,
+                        stop_loss=2397.0, spec=GOLD)
+    assert all(not b.is_pending for b in plan.batches)
+    assert plan.ladder_step == 0.0
+
+
+def test_anchor_to_fill_is_noop_for_limit():
+    """限价成交价就是挂单价，拿终端回报再算一遍只会引入取整噪声。"""
+    plan = limit_plan(add_batches=2)
+    before = [b.take_profit for b in plan.batches]
+    anchor_to_fill(plan, limit_cfg(add_batches=2), 2399.87, GOLD)
+    assert plan.entry_price == pytest.approx(2400.0)
+    assert [b.take_profit for b in plan.batches] == pytest.approx(before)
+
+
+def test_market_mode_sizing_unchanged_by_limit_support():
+    """限价改造不得动市价口径：单值止损距离下手数与风险与老行为一致。"""
+    plan = plan_entries(cfg(add_batches=2), direction="BUY", entry_price=2400.0,
+                        stop_loss=2397.0, spec=GOLD)
+    assert plan.loss_per_lot == pytest.approx(300.0)
+    assert plan.total_lot == pytest.approx(1.0)
+    assert plan.risk_used == pytest.approx(300.0)
+    assert all(b.sl_distance == pytest.approx(3.0) for b in plan.batches)
+
+
+# ---------------------------------------------------------------------------
 # 止损距离的基准价：止损触发侧（BUY=bid / SELL=ask）
 # ---------------------------------------------------------------------------
 

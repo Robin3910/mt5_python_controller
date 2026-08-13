@@ -251,8 +251,12 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
     push('来源信号', detail.signal_id)
     push('品种', detail.symbol)
     push('方向', detail.direction || detail.action)
+    push('开仓方式', detail.entry_mode_label || detail.entry_mode)
     push('风险金额', detail.risk_amount)
-    push('实际风险', detail.risk_used)
+    push(
+      detail.entry_mode === 'limit' && detail.add_batches ? '最坏亏损' : '实际风险',
+      detail.risk_used,
+    )
     push('手数公式', detail.lot_formula)
     push(
       '总手数',
@@ -265,9 +269,11 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
       '分散仓',
       detail.add_batches
         ? `${detail.distribute_volume ?? ''} 手 · 等分 ${detail.add_batches} 单` +
-          (detail.order_count ? ` · 共 ${detail.order_count} 单` : '')
+          (detail.order_count ? ` · 共 ${detail.order_count} 单` : '') +
+          (detail.ladder_step ? ` · 阶梯限价步长 ${detail.ladder_step}` : '')
         : '无（底仓即全仓）',
     )
+    push('底仓挂单价', detail.entry_mode === 'limit' ? detail.entry_price : '')
     push('止损', detail.stop_loss || '不设')
     push(
       '阶梯止盈',
@@ -283,9 +289,17 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
     push('错误', detail.error || detail.reason)
     return rows
   }
+  if (detail.kind === 'risk_sized_limit_filled') {
+    push('说明', detail.message)
+    push('成交价', detail.price)
+    push('成交笔数', detail.position_count)
+    push('挂单等待', detail.waited_seconds === undefined ? '' : `${detail.waited_seconds} 秒`)
+    return rows
+  }
   if (detail.kind === 'risk_sized_distribute' || detail.kind === 'risk_sized_add') {
     push('分散仓', detail.batch_index === undefined ? '' : `第 ${detail.batch_index}/${detail.batch_total ?? '?'} 档`)
     push('首单开仓价', detail.entry_price)
+    push('本档挂单价', detail.limit_price)
     push('现价', detail.price)
     push('本单手数', detail.volume)
     push('总手数', detail.total_lot)
@@ -688,7 +702,8 @@ onUnmounted(stopAutoRefresh)
                           <th style="width: 22px"></th>
                           <th>操作</th>
                           <th>节点</th><th>魔术号</th><th>状态</th><th class="right">首单手数</th>
-                          <th class="right">持仓</th><th class="right">加仓</th><th class="right">累计手数</th>
+                          <th class="right">持仓</th><th class="right">挂单</th>
+                          <th class="right">加仓</th><th class="right">累计手数</th>
                           <th class="right">盈亏</th><th>结束原因</th>
                           <th>订单</th><th class="right">成交价</th>
                           <th>错误</th><th>下发时间</th><th>完成时间</th>
@@ -715,6 +730,7 @@ onUnmounted(stopAutoRefresh)
                             <td><span class="tag" :class="dispatchTag(d.status).cls">{{ dispatchTag(d.status).text }}</span></td>
                             <td class="right">{{ d.decided_vol ?? '—' }}</td>
                             <td class="right">{{ d.position_count }}</td>
+                            <td class="right">{{ d.pending_orders || '—' }}</td>
                             <td class="right">{{ d.add_count }}</td>
                             <td class="right">{{ d.total_volume }}</td>
                             <td class="right">{{ d.realized_profit }}</td>
@@ -727,7 +743,7 @@ onUnmounted(stopAutoRefresh)
                           </tr>
                           <tr v-if="isDispatchExpanded(d.id)" class="detail-row">
                             <td></td>
-                            <td colspan="15">
+                            <td colspan="16">
                               <div class="muted" style="font-size: 12px; margin-bottom: 6px">
                                 关联订单 · {{ d.node_name || d.node_id }}
                                 <template v-if="d.magic != null"> · 魔术号 {{ d.magic }}</template>
