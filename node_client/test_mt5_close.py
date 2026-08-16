@@ -19,9 +19,10 @@ def _client(orders: list[dict] | None = None) -> mc.MT5Client:
     return client
 
 
-def _pos(ticket: int, symbol: str = "XAUUSD", magic: int = 900001) -> dict:
+def _pos(ticket: int, symbol: str = "XAUUSD", magic: int = 900001,
+         *, side: str = "BUY", volume: float = 0.1) -> dict:
     return {
-        "ticket": ticket, "symbol": symbol, "type": "BUY", "volume": 0.1, "magic": magic,
+        "ticket": ticket, "symbol": symbol, "type": side, "volume": volume, "magic": magic,
     }
 
 
@@ -46,7 +47,7 @@ def _stub_cancel(client, failed: set[int], monkeypatch) -> None:
 
 def _stub_close(client, failed: set[int], monkeypatch) -> None:
     """让指定 ticket 的平仓失败，其余成功。"""
-    def fake(pos: dict) -> dict:
+    def fake(pos: dict, max_retry: int = 3, **_kw) -> dict:
         ok = pos["ticket"] not in failed
         out = {
             "success": ok, "ticket": pos["ticket"],
@@ -187,8 +188,8 @@ def test_cancel_runs_before_close(monkeypatch):
     )
     monkeypatch.setattr(
         client, "close_position",
-        lambda pos, max_retry=3: (calls.append("close"),
-                                  {"success": True, "ticket": pos["ticket"]})[1],
+        lambda pos, max_retry=3, **_kw: (calls.append("close"),
+                                         {"success": True, "ticket": pos["ticket"]})[1],
     )
 
     client.close_by_magic(900001)
@@ -205,3 +206,125 @@ def test_close_paths_expose_cancelled_count(monkeypatch, method):
     args = {"close_by_magic": (900001,), "close_symbol": ("XAUUSD",)}.get(method, ())
     res = getattr(client, method)(*args)
     assert res["cancelled"] == 1
+
+
+# --------------------------- 爆发式连发 / 对冲对敲 ---------------------------
+def test_backoff_sleep_skipped_when_no_retry(monkeypatch):
+    """首轮 max_retry=0 失败后不能 sleep，否则后面的仓都要排队等。"""
+    slept: list[float] = []
+    monkeypatch.setattr(mc.time, "sleep", lambda s: slept.append(s))
+    mc._backoff_sleep(1, 0)
+    assert slept == []
+    mc._backoff_sleep(1, 3)
+    assert slept == [0.3]
+
+
+def test_too_many_requests_is_retryable():
+    """爆发式连发容易碰到 10024，必须进第二轮重试而不是当致命错误丢掉。"""
+    assert mc.RET_TOO_MANY_REQUESTS in mc.TRANSIENT
+    assert mc._retryable_batch_fail({"success": False, "retcode": mc.RET_TOO_MANY_REQUESTS})
+    assert not mc._retryable_batch_fail({"success": False, "retcode": 10019})  # NO_MONEY
+
+
+def test_pair_hedge_positions_prefers_equal_volume():
+    buy_small = _pos(1, volume=0.1)
+    buy_big = _pos(2, volume=0.2)
+    sell_big = _pos(3, side="SELL", volume=0.2)
+    sell_small = _pos(4, side="SELL", volume=0.1)
+    pairs = mc.pair_hedge_positions([buy_small, buy_big, sell_big, sell_small])
+    tickets = {(int(a["ticket"]), int(b["ticket"])) for a, b in pairs}
+    assert tickets == {(1, 4), (2, 3)}
+
+
+def test_pair_hedge_positions_does_not_cross_symbol():
+    pairs = mc.pair_hedge_positions([
+        _pos(1, "XAUUSD"), _pos(2, "EURUSD", side="SELL"),
+    ])
+    assert pairs == []
+
+
+def test_close_all_burst_then_retries_transient(monkeypatch):
+    """首轮把请求全部打出；requote 的那笔才进入带重试的第二轮。"""
+    client = _client()
+    monkeypatch.setattr(client, "positions", lambda: [_pos(11), _pos(22), _pos(33)])
+    calls: list[tuple[int, int]] = []
+
+    def fake(pos: dict, max_retry: int = 3, **_kw) -> dict:
+        calls.append((int(pos["ticket"]), max_retry))
+        if pos["ticket"] == 22 and max_retry == 0:
+            return {
+                "success": False, "ticket": 22, "symbol": "XAUUSD",
+                "action": "CLOSE", "retcode": mc.RET_REQUOTE,
+            }
+        return {"success": True, "ticket": pos["ticket"], "symbol": pos["symbol"], "action": "CLOSE"}
+
+    monkeypatch.setattr(client, "close_position", fake)
+    res = client.close_all()
+    assert calls == [(11, 0), (22, 0), (33, 0), (22, 3)]
+    assert res["success"] is True
+    assert res["closed"] == 3
+
+
+def test_close_all_does_not_retry_fatal(monkeypatch):
+    """市价关闭等致命错误第二轮再试也没用，不能拖住整波清仓。"""
+    client = _client()
+    monkeypatch.setattr(client, "positions", lambda: [_pos(11), _pos(22)])
+    calls: list[tuple[int, int]] = []
+
+    def fake(pos: dict, max_retry: int = 3, **_kw) -> dict:
+        calls.append((int(pos["ticket"]), max_retry))
+        if pos["ticket"] == 22:
+            return {
+                "success": False, "ticket": 22, "symbol": "XAUUSD",
+                "action": "CLOSE", "retcode": 10018, "error": "market closed",
+            }
+        return {"success": True, "ticket": pos["ticket"], "symbol": pos["symbol"], "action": "CLOSE"}
+
+    monkeypatch.setattr(client, "close_position", fake)
+    res = client.close_all()
+    assert calls == [(11, 0), (22, 0)]
+    assert res["success"] is False
+    assert res["closed"] == 1
+
+
+def test_close_all_close_by_then_market_leftover(monkeypatch):
+    """对冲账户：同品种多空先对敲，剩下一笔再市价平。"""
+    client = _client()
+    live = [_pos(11), _pos(22, side="SELL"), _pos(33)]
+
+    monkeypatch.setattr(client, "positions", lambda: list(live))
+    monkeypatch.setattr(client, "_hedge_close_by_available", lambda: True)
+
+    def fake_close_by(pos, pos_by, max_retry=0):
+        gone = {int(pos["ticket"]), int(pos_by["ticket"])}
+        live[:] = [p for p in live if int(p["ticket"]) not in gone]
+        return {"success": True, "action": "CLOSE_BY"}
+
+    monkeypatch.setattr(client, "_close_by_positions", fake_close_by)
+    _stub_close(client, set(), monkeypatch)
+
+    res = client.close_all()
+    assert res["success"] is True
+    assert res["closed"] == 3
+    assert sum(1 for r in res["results"] if r.get("close_by")) == 2
+    assert [r["ticket"] for r in res["results"] if not r.get("close_by")] == [33]
+
+
+def test_close_by_magic_does_not_use_close_by(monkeypatch):
+    """按魔术号收口不能 CLOSE_BY，否则可能误平另一条策略的反向仓。"""
+    client = _client()
+    monkeypatch.setattr(
+        client, "positions",
+        lambda: [_pos(11, magic=7), _pos(22, magic=7, side="SELL")],
+    )
+    monkeypatch.setattr(client, "_hedge_close_by_available", lambda: True)
+    called: list[int] = []
+    monkeypatch.setattr(
+        client, "_close_by_positions",
+        lambda *a, **k: called.append(1) or {"success": True},
+    )
+    _stub_close(client, set(), monkeypatch)
+
+    res = client.close_by_magic(7)
+    assert called == []
+    assert res["closed"] == 2

@@ -294,6 +294,8 @@ async def _save_account(node_id: str, ws: WebSocket, data: dict) -> None:
         "prices": data.get("prices", {}),  # 供区间过滤取价
         "quotes": data.get("quotes", {}),
         "updated_at": time.time(),
+        # 券商 MT5 服务器相对 UTC 的偏移（秒）；用于把后台 UTC 时间显示成终端订单时间
+        "server_time_offset": data.get("server_time_offset"),
     }
     await store.save_account(node_id, snapshot)
     await _reconcile_strategy_tasks(

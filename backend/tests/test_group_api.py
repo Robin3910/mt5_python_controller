@@ -1437,3 +1437,91 @@ def test_trend_risk_close_bypasses_gate(client, monkeypatch):
         stop = ws1.receive_json()
         assert stop["cmd"] == "strategy_stop"
         assert stop["dispatch_id"] == start["dispatch_id"]
+
+
+def test_close_node_all_stops_strategy_then_sends_close(client):
+    """总览全平：先对该节点所有策略子任务下发 strategy_stop，再下发 close。"""
+    h = auth_headers(client)
+    token = _node_token(client, h)
+    n1 = _mk_node(client, h, 5281)
+    n2 = _mk_node(client, h, 5282)
+    gid = _mk_group(
+        client, h, name="全平终止组", dispatch_mode="sync", node_ids=[n1, n2],
+    )["group_id"]
+
+    with client.websocket_connect("/ws/node") as ws1, \
+            client.websocket_connect("/ws/node") as ws2:
+        ws1.send_json({"type": "auth", "data": {"token": token, "mt5_login": 5281}})
+        assert ws1.receive_json()["type"] == "auth_ok"
+        ws2.send_json({"type": "auth", "data": {"token": token, "mt5_login": 5282}})
+        assert ws2.receive_json()["type"] == "auth_ok"
+
+        client.post("/webhook", json={
+            "action": "buy", "symbol": "XAUUSD", "volume": 0.1, "model": "strategy",
+        })
+        start1 = ws1.receive_json()
+        start2 = ws2.receive_json()
+        for ws, cmd in ((ws1, start1), (ws2, start2)):
+            ws.send_json({"type": "trade_result", "data": {
+                "signal_id": cmd["signal_id"], "magic": cmd["magic"],
+                "symbol": "XAUUSD", "success": True, "order": 1,
+            }})
+        _wait_task_status(client, h, gid, "running")
+
+        r = client.post(f"/api/nodes/{n1}/close", json={"target": "all"}, headers=h)
+        assert r.status_code == 200, r.text
+        assert r.json()["strategies"]["stopped"] == 1
+        assert r.json()["strategies"]["forced"] == 0
+
+        got = [ws1.receive_json(), ws1.receive_json()]
+        cmds = [m.get("cmd") for m in got]
+        assert cmds == ["strategy_stop", "close"]
+        assert got[0]["reason"] == "manual_close_all"
+        assert got[0]["magic"] == start1["magic"]
+        assert got[1]["close_target"] == "all"
+
+        page = client.get(f"/api/groups/{gid}/signals", headers=h).json()
+        by_node = {x["node_id"]: x for x in page["items"][0]["dispatches"]}
+        assert by_node[n1]["status"] == "closing"
+        assert by_node[n2]["status"] in ("opened", "running")
+
+        for ws, start in ((ws1, start1), (ws2, start2)):
+            ws.send_json({"type": "strategy_finished", "data": {
+                "task_id": start["task_id"], "magic": start["magic"], "status": "done",
+            }})
+
+
+def test_close_node_ticket_does_not_stop_strategy(client):
+    """按订单平仓不能顺带停掉该节点上的策略任务。"""
+    h = auth_headers(client)
+    token = _node_token(client, h)
+    n1 = _mk_node(client, h, 5283)
+    gid = _mk_group(client, h, name="单票平仓组", node_ids=[n1])["group_id"]
+
+    with client.websocket_connect("/ws/node") as ws:
+        ws.send_json({"type": "auth", "data": {"token": token, "mt5_login": 5283}})
+        assert ws.receive_json()["type"] == "auth_ok"
+        client.post("/webhook", json={
+            "action": "buy", "symbol": "XAUUSD", "volume": 0.1, "model": "strategy",
+        })
+        start = ws.receive_json()
+        ws.send_json({"type": "trade_result", "data": {
+            "signal_id": start["signal_id"], "magic": start["magic"],
+            "symbol": "XAUUSD", "success": True, "order": 1,
+        }})
+        _wait_task_status(client, h, gid, "running")
+
+        r = client.post(
+            f"/api/nodes/{n1}/close",
+            json={"target": "ticket", "ticket": 42},
+            headers=h,
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["strategies"]["total"] == 0
+        cmd = ws.receive_json()
+        assert cmd["cmd"] == "close"
+        assert cmd["close_target"] == "ticket"
+
+        page = client.get(f"/api/groups/{gid}/signals", headers=h).json()
+        assert page["items"][0]["dispatches"][0]["status"] in ("opened", "running")
+

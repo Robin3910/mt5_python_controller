@@ -538,6 +538,8 @@ class AccountSnapshot(BaseModel):
     prices: dict[str, float] = Field(default_factory=dict)  # 品种 -> 中间价（供区间过滤）
     quotes: dict[str, QuoteInfo] = Field(default_factory=dict)  # 品种 -> 完整报价
     updated_at: float = Field(default_factory=lambda: time.time())
+    # 券商 MT5 服务器相对真实 UTC 的偏移（秒）。IC Markets 夏令时约为 +10800。
+    server_time_offset: Optional[int] = None
 
 
 # ---------------------------- 配置 ---------------------------

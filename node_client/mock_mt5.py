@@ -47,6 +47,8 @@ class MockMT5Client:
         self.margin_mode = "hedging"
         # 现价触及挂单价时自动成交；置 False 可让测试完全手工驱动成交时点
         self.auto_fill_pending = True
+        # 模拟环境没有券商钟面偏移，与 time.time() 同一套 UTC
+        self._server_tz_offset = 0
 
     def connect(self) -> bool:
         self.connected = True
@@ -74,6 +76,10 @@ class MockMT5Client:
     def positions(self) -> list[dict]:
         self._settle_pending()
         return [dict(p) for p in self._positions]
+
+    def server_time_offset_sec(self) -> int:
+        """模拟终端与 UTC 无偏移。"""
+        return int(self._server_tz_offset)
 
     def quotes(self, symbols: list[str]) -> dict[str, dict]:
         out: dict[str, dict] = {}

@@ -5,11 +5,14 @@
 - 市价单：TRADE_ACTION_DEAL，带 deviation(滑点)/magic(魔术号)/comment；
 - 挂单：TRADE_ACTION_PENDING，价格由调用方给定，撤单走 TRADE_ACTION_REMOVE；
 - 平仓：用反方向 deal + position(订单号) 在当前价平掉；
-- 重试：对瞬时错误(requote/价格变动等)刷新价格后重试。
+- 批量平仓：先爆发式连发（不在失败单上睡眠），瞬时错误再带退避重试；对冲账户
+  全平/按品种平仓会先 TRADE_ACTION_CLOSE_BY 把同品种多空对敲（一笔锁两仓）；
+- 重试：对瞬时错误(requote/价格变动/请求过多等)刷新价格后重试。
 
 「平掉某魔术号 / 某品种 / 全部」这三个收口口径一律连挂单一起撤：只平持仓会把未成交
 的挂单留在终端里，等策略任务收口、监控停掉之后它仍可能成交，变成没有止盈止损也没有
-保本监控的孤儿仓。
+保本监控的孤儿仓。MetaTrader5 Python 包非线程安全，批量平仓仍在专用单线程上串行
+order_send，不靠多线程并行发单。
 """
 import logging
 import time
@@ -22,6 +25,31 @@ except Exception:  # noqa: BLE001
 
 logger = logging.getLogger("node.mt5")
 
+# 用 tick.time 反推券商服务器相对 UTC 的偏移时，只信「还在跳动」的报价。
+# 周末外汇 tick 会停在周五收盘，偏移会算出几十小时，必须丢掉。
+_OFFSET_TICK_MAX_AGE = 14 * 3600
+_OFFSET_CACHE_TTL = 60.0
+_OFFSET_PROBE_SYMBOLS = ("BTCUSD", "ETHUSD", "XAUUSD", "EURUSD")
+
+
+def infer_server_time_offset(tick_times: list[float], now: float) -> Optional[int]:
+    """由 MT5 tick.time 与真实 UTC 的差值，推断券商服务器时区偏移（秒）。
+
+    MetaTrader5 Python 的 `tick.time` 往往是「服务器钟面」按 UTC 编码的 Unix：
+    IC Markets 夏令时 GMT+3 时，BTCUSD 的 tick.time 会比 `time.time()` 快约 3 小时。
+    用这个偏移把后台真实 UTC 时间换算成终端里看到的下单时间。
+    没有足够新的 tick 时返回 None。
+    """
+    deltas = [float(t) - now for t in tick_times if abs(float(t) - now) <= _OFFSET_TICK_MAX_AGE]
+    if not deltas:
+        return None
+    deltas.sort()
+    mid = deltas[len(deltas) // 2]
+    hours = int(round(mid / 3600.0))
+    if hours < -12 or hours > 14:
+        return None
+    return hours * 3600
+
 # —— MT5 返回码(retcode)子集，分类见技术方案 10.7 ——
 RET_DONE = 10009            # 成交
 RET_DONE_PARTIAL = 10010    # 部分成交
@@ -29,10 +57,13 @@ RET_REQUOTE = 10004         # 重新报价
 RET_PRICE_CHANGED = 10020   # 价格已变
 RET_PRICE_OFF = 10021       # 无报价/价格关闭
 RET_TIMEOUT = 10012         # 超时
+RET_TOO_MANY_REQUESTS = 10024  # 请求过多（爆发式连发时券商常见）
 RET_INVALID_PRICE = 10015   # 价格非法
 RET_INVALID_STOPS = 10016   # 止损/挂单价距现价太近（低于 stops_level）
 RET_INVALID_FILL = 10030    # 不支持的填充模式
-TRANSIENT = {RET_REQUOTE, RET_PRICE_CHANGED, RET_PRICE_OFF, RET_TIMEOUT}  # 可重试的瞬时错误
+TRANSIENT = {
+    RET_REQUOTE, RET_PRICE_CHANGED, RET_PRICE_OFF, RET_TIMEOUT, RET_TOO_MANY_REQUESTS,
+}  # 可重试的瞬时错误
 
 # 挂单方向。limit = 等价格回到更有利处成交；stop = 等价格突破后成交。
 PENDING_LIMIT = "limit"
@@ -115,6 +146,57 @@ def _cancelled_count(results: list[dict]) -> int:
     return sum(1 for r in results if r.get("success"))
 
 
+def _backoff_sleep(attempt: int, max_retry: int) -> None:
+    """只有还会再试时才睡：爆发式首轮 max_retry=0 绝不能在失败单上卡住后面的仓。"""
+    if attempt <= max_retry:
+        time.sleep(min(0.3 * attempt, 1.5))
+
+
+def _retryable_batch_fail(res: dict) -> bool:
+    """爆发式首轮失败后，只有瞬时类错误才进入带退避的第二轮。"""
+    if res.get("success"):
+        return False
+    rc = res.get("retcode")
+    return rc is None or rc in TRANSIENT
+
+
+def pair_hedge_positions(positions: list[dict]) -> list[tuple[dict, dict]]:
+    """同品种多空配对，供 TRADE_ACTION_CLOSE_BY 一次锁两笔。
+
+    先配手数相同的，再把剩余多空一对一配上。手数不同时 CLOSE_BY 按较小手数对敲，
+    余量留给后续市价平。每个 ticket 只出现在一对里。
+    """
+    grouped: dict[str, dict[str, list[dict]]] = {}
+    for pos in positions or []:
+        side = str(pos.get("type") or "")
+        if side not in ("BUY", "SELL"):
+            continue
+        sym = str(pos.get("symbol") or "")
+        grouped.setdefault(sym, {"BUY": [], "SELL": []})[side].append(pos)
+
+    pairs: list[tuple[dict, dict]] = []
+    for buckets in grouped.values():
+        buys = list(buckets["BUY"])
+        sells = list(buckets["SELL"])
+        used_buy: set[int] = set()
+        used_sell: set[int] = set()
+        for i, buy in enumerate(buys):
+            bv = float(buy.get("volume") or 0)
+            for j, sell in enumerate(sells):
+                if j in used_sell:
+                    continue
+                if abs(float(sell.get("volume") or 0) - bv) < 1e-8:
+                    pairs.append((buy, sell))
+                    used_buy.add(i)
+                    used_sell.add(j)
+                    break
+        rest_buys = [b for i, b in enumerate(buys) if i not in used_buy]
+        rest_sells = [s for j, s in enumerate(sells) if j not in used_sell]
+        n = min(len(rest_buys), len(rest_sells))
+        pairs.extend(zip(rest_buys[:n], rest_sells[:n]))
+    return pairs
+
+
 class MT5Client:
     def __init__(
         self,
@@ -135,6 +217,10 @@ class MT5Client:
         self.magic = magic          # 默认魔术号
         self.reuse_terminal_session = reuse_terminal_session
         self.connected = False
+        # 某品种上次平仓成功的填充模式，批量平仓时避免每笔都从 FOK 试起
+        self._close_filling_by_symbol: dict[str, int] = {}
+        # (cached_at, offset_sec)：券商服务器时区偏移，避免每秒快照都去扫品种
+        self._server_tz_cache: tuple[float, Optional[int]] = (0.0, None)
 
     # ----------------------- 连接 -----------------------
     def connect(self) -> bool:
@@ -277,6 +363,33 @@ class MT5Client:
         if open_px:
             return round((mid - open_px) / open_px * 100, 4)
         return 0.0
+
+    def server_time_offset_sec(self) -> Optional[int]:
+        """券商 MT5 服务器时间相对真实 UTC 的偏移（秒）；推断不出时返回上次缓存或 None。"""
+        self.ensure()
+        now = time.time()
+        cached_at, cached = self._server_tz_cache
+        if cached_at and now - cached_at < _OFFSET_CACHE_TTL:
+            return cached
+        times: list[float] = []
+        for sym in _OFFSET_PROBE_SYMBOLS:
+            info = mt5.symbol_info(sym) if mt5 is not None else None
+            if info is None:
+                continue
+            if not info.visible:
+                mt5.symbol_select(sym, True)
+            tick = mt5.symbol_info_tick(sym)
+            t = float(getattr(tick, "time", 0) or 0) if tick is not None else 0.0
+            if t > 0:
+                times.append(t)
+        val = infer_server_time_offset(times, now)
+        if val is not None:
+            self._server_tz_cache = (now, val)
+            return val
+        if cached is not None:
+            return cached
+        self._server_tz_cache = (now, None)
+        return None
 
     def quotes(self, symbols: list[str]) -> dict[str, dict]:
         """批量取观察列表报价详情（买价/卖价/中间价/日变化）。"""
@@ -428,7 +541,7 @@ class MT5Client:
             if rc in TRANSIENT:
                 # 瞬时错误：退避后重试（下一轮会刷新价格）
                 attempt += 1
-                time.sleep(min(0.3 * attempt, 1.5))
+                _backoff_sleep(attempt, max_retry)
                 continue
             # 其余视为致命错误，直接返回
             return {"success": False, "symbol": symbol, "retcode": rc, "error": result.comment}
@@ -549,7 +662,7 @@ class MT5Client:
                 continue
             if rc in TRANSIENT:
                 attempt += 1
-                time.sleep(min(0.3 * attempt, 1.5))
+                _backoff_sleep(attempt, max_retry)
                 continue
             return {"success": False, "symbol": symbol, "retcode": rc, "error": result.comment}
 
@@ -581,7 +694,7 @@ class MT5Client:
                 return {"success": True, "action": "CANCEL", "ticket": target, "retcode": rc}
             if rc in TRANSIENT:
                 attempt += 1
-                time.sleep(min(0.3 * attempt, 1.5))
+                _backoff_sleep(attempt, max_retry)
                 continue
             return {"success": False, "action": "CANCEL", "ticket": target,
                     "retcode": rc, "error": result.comment}
@@ -617,6 +730,9 @@ class MT5Client:
         is_buy = pos["type"] == "BUY"
         close_type = mt5.ORDER_TYPE_SELL if is_buy else mt5.ORDER_TYPE_BUY  # 反向平仓
         fillings = self.filling_modes(resolved)
+        cached = self._close_filling_by_symbol.get(str(resolved))
+        if cached is not None and cached in fillings:
+            fillings = [cached] + [f for f in fillings if f != cached]
         fill_idx = 0     # 当前尝试的填充模式下标
         attempt = 0      # 瞬时错误重试计数
         last = None
@@ -662,6 +778,8 @@ class MT5Client:
 
             rc = result.retcode
             if rc in (RET_DONE, RET_DONE_PARTIAL):
+                filling = fillings[fill_idx]
+                self._close_filling_by_symbol[str(resolved)] = filling
                 return {
                     "success": True,
                     "ticket": pos["ticket"],
@@ -670,13 +788,14 @@ class MT5Client:
                     "volume": float(pos["volume"]),
                     "position_type": pos["type"],
                     "retcode": rc,
+                    "type_filling": filling,
                 }
             if rc == RET_INVALID_FILL:
                 fill_idx += 1  # 换下一种填充模式（不消耗重试次数）
                 continue
             if rc in TRANSIENT:
                 attempt += 1
-                time.sleep(min(0.3 * attempt, 1.5))
+                _backoff_sleep(attempt, max_retry)
                 continue
             return _fail(result.comment, rc)
 
@@ -684,6 +803,148 @@ class MT5Client:
             getattr(last, "comment", "close failed after retries"),
             getattr(last, "retcode", None),
         )
+
+    def _cancel_many(self, orders: list[dict]) -> list[dict]:
+        """撤一批挂单：先无睡眠连发，瞬时失败再带退避重试。"""
+        tickets = [int(o["ticket"]) for o in orders or [] if o.get("ticket") is not None]
+        if not tickets:
+            return []
+        by_ticket: dict[int, dict] = {}
+        retry: list[int] = []
+        for ticket in tickets:
+            res = self.cancel_order(ticket, max_retry=0)
+            if res.get("success"):
+                by_ticket[ticket] = res
+            elif _retryable_batch_fail(res):
+                retry.append(ticket)
+            else:
+                by_ticket[ticket] = res
+        for ticket in retry:
+            by_ticket[ticket] = self.cancel_order(ticket)
+        return [by_ticket[t] for t in tickets]
+
+    def _close_many(self, positions: list[dict]) -> list[dict]:
+        """市价平一批持仓：先无睡眠连发，瞬时失败再带退避重试。"""
+        rows = list(positions or [])
+        if not rows:
+            return []
+        by_ticket: dict[int, dict] = {}
+        retry: list[dict] = []
+        for pos in rows:
+            res = self.close_position(pos, max_retry=0)
+            ticket = int(pos["ticket"])
+            if res.get("success"):
+                by_ticket[ticket] = res
+            elif _retryable_batch_fail(res):
+                retry.append(pos)
+            else:
+                by_ticket[ticket] = res
+        for pos in retry:
+            by_ticket[int(pos["ticket"])] = self.close_position(pos)
+        return [by_ticket[int(p["ticket"])] for p in rows]
+
+    def _hedge_close_by_available(self) -> bool:
+        """CLOSE_BY 只在已连接的真实终端上试；未连接的单测走市价路径。"""
+        return bool(
+            mt5 is not None
+            and self.connected
+            and getattr(mt5, "TRADE_ACTION_CLOSE_BY", None) is not None
+        )
+
+    def _close_by_positions(self, pos: dict, pos_by: dict, max_retry: int = 0) -> dict:
+        """用 CLOSE_BY 把两笔反向持仓对敲。"""
+        self.ensure()
+        action = getattr(mt5, "TRADE_ACTION_CLOSE_BY", None)
+        if action is None:
+            return {"success": False, "error": "close_by unsupported"}
+        attempt = 0
+        last = None
+        while attempt <= max_retry:
+            result = mt5.order_send({
+                "action": action,
+                "position": int(pos["ticket"]),
+                "position_by": int(pos_by["ticket"]),
+                "magic": int(pos.get("magic") or self.magic),
+                "comment": "close_by",
+            })
+            last = result
+            if result is None:
+                logger.error("close_by order_send returned None: %s", mt5.last_error())
+                attempt += 1
+                continue
+            rc = result.retcode
+            if rc in (RET_DONE, RET_DONE_PARTIAL):
+                return {
+                    "success": True,
+                    "action": "CLOSE_BY",
+                    "ticket": pos["ticket"],
+                    "ticket_by": pos_by["ticket"],
+                    "retcode": rc,
+                }
+            if rc in TRANSIENT:
+                attempt += 1
+                _backoff_sleep(attempt, max_retry)
+                continue
+            return {
+                "success": False,
+                "action": "CLOSE_BY",
+                "ticket": pos["ticket"],
+                "ticket_by": pos_by["ticket"],
+                "retcode": rc,
+                "error": result.comment,
+            }
+        return {
+            "success": False,
+            "action": "CLOSE_BY",
+            "ticket": pos["ticket"],
+            "ticket_by": pos_by["ticket"],
+            "retcode": getattr(last, "retcode", None),
+            "error": getattr(last, "comment", "close_by failed after retries"),
+        }
+
+    def _close_hedges_burst(self, positions: list[dict]) -> list[dict]:
+        """对冲锁仓：爆发式 CLOSE_BY；已从账户消失的 ticket 记成功，残留交给市价平。
+
+        不按魔术号过滤——只用于全账户/按品种清仓。按魔术号收口若拿去对敲，
+        会误平另一条策略的反向仓。
+        """
+        if not self._hedge_close_by_available():
+            return []
+        pairs = pair_hedge_positions(positions)
+        if not pairs:
+            return []
+        retry_pairs: list[tuple[dict, dict]] = []
+        skip_rest = False
+        for a, b in pairs:
+            if skip_rest:
+                break
+            res = self._close_by_positions(a, b, max_retry=0)
+            if res.get("success"):
+                continue
+            if _retryable_batch_fail(res):
+                retry_pairs.append((a, b))
+            else:
+                # 券商不支持对敲或业务拒绝：余下全部改走市价，不再连发 CLOSE_BY
+                skip_rest = True
+        if not skip_rest:
+            for a, b in retry_pairs:
+                self._close_by_positions(a, b)
+        paired = {int(a["ticket"]) for a, b in pairs} | {int(b["ticket"]) for a, b in pairs}
+        remaining = {int(p["ticket"]) for p in self.positions()}
+        gone: list[dict] = []
+        for pos in positions:
+            ticket = int(pos["ticket"])
+            if ticket in paired and ticket not in remaining:
+                gone.append({
+                    "success": True,
+                    "ticket": pos["ticket"],
+                    "symbol": pos.get("symbol"),
+                    "action": "CLOSE",
+                    "volume": float(pos.get("volume") or 0),
+                    "position_type": pos.get("type"),
+                    "close_by": True,
+                })
+        return gone
 
     def close_ticket(self, ticket: int) -> dict:
         """按订单号平仓。"""
@@ -703,10 +964,9 @@ class MT5Client:
         先撤单再平仓：反过来的话，平仓到撤单之间价格若正好触及挂单价，会当场成交
         出一笔新持仓，收口完成时账上反而又有仓了。
         """
-        cancels = [
-            self.cancel_order(int(o["ticket"])) for o in self.pending_orders_by_magic(magic)
-        ]
-        results = [self.close_position(p) for p in self.positions_by_magic(magic)]
+        cancels = self._cancel_many(self.pending_orders_by_magic(magic))
+        # 不走 CLOSE_BY：对敲可能误平其它魔术号的反向仓
+        results = self._close_many(self.positions_by_magic(magic))
         ok = all(r.get("success") for r in results + cancels) if results or cancels else True
         return {
             "success": ok,
@@ -907,12 +1167,18 @@ class MT5Client:
             name = name.upper()
             return name.startswith(base) or base.startswith(name)
 
-        cancels = [
-            self.cancel_order(int(o["ticket"]))
-            for o in self.pending_orders() if _match(str(o.get("symbol") or ""))
+        cancels = self._cancel_many(
+            [o for o in self.pending_orders() if _match(str(o.get("symbol") or ""))]
+        )
+        snapshot = [p for p in self.positions() if _match(str(p.get("symbol") or ""))]
+        hedge = self._close_hedges_burst(snapshot)
+        closed_tickets = {int(r["ticket"]) for r in hedge if r.get("success")}
+        leftover_src = self.positions() if hedge else snapshot
+        leftover = [
+            p for p in leftover_src
+            if _match(str(p.get("symbol") or "")) and int(p["ticket"]) not in closed_tickets
         ]
-        results = [p for p in self.positions() if _match(str(p.get("symbol") or ""))]
-        results = [self.close_position(p) for p in results]
+        results = hedge + self._close_many(leftover)
         ok = all(r.get("success") for r in results + cancels) if results or cancels else True
         return {
             "success": ok,
@@ -926,7 +1192,7 @@ class MT5Client:
 
     def close_positions(self, positions: list[dict]) -> dict:
         """平掉给定持仓列表。"""
-        results = [self.close_position(p) for p in positions or []]
+        results = self._close_many(positions or [])
         ok = all(r.get("success") for r in results) if results else True
         symbol = None
         if results:
@@ -944,10 +1210,16 @@ class MT5Client:
     def close_all(self) -> dict:
         """平掉账户全部持仓并撤掉全部挂单。
 
+        爆发式连发 + 对冲对敲，尽量让终端在同一波请求里收完仓。
         这是账户级风控清仓的落点，留着挂单等于清完仓又埋了一颗重新开仓的雷。
         """
-        cancels = [self.cancel_order(int(o["ticket"])) for o in self.pending_orders()]
-        results = [self.close_position(p) for p in self.positions()]
+        cancels = self._cancel_many(self.pending_orders())
+        snapshot = self.positions()
+        hedge = self._close_hedges_burst(snapshot)
+        closed_tickets = {int(r["ticket"]) for r in hedge if r.get("success")}
+        leftover_src = self.positions() if hedge else snapshot
+        leftover = [p for p in leftover_src if int(p["ticket"]) not in closed_tickets]
+        results = hedge + self._close_many(leftover)
         ok = all(r.get("success") for r in results + cancels) if results or cancels else True
         symbol = results[0]["symbol"] if len(results) == 1 else None
         return {

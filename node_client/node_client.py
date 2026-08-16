@@ -293,16 +293,27 @@ class NodeClient:
             positions = await self._exec(self.mt5.positions)
             orders = await self._pending_orders()
             quotes = await self._exec(self.mt5.quotes, self.effective_watchlist(positions))
+            offset = None
+            probe = getattr(self.mt5, "server_time_offset_sec", None)
+            if callable(probe):
+                try:
+                    offset = await self._exec(probe)
+                except Exception:  # noqa: BLE001
+                    logger.debug("server_time_offset_sec failed", exc_info=True)
             return {
                 "account": await self._exec(self.mt5.account_info),
                 "positions": positions,
                 "orders": orders,
                 "quotes": quotes,
                 "prices": {sym: q["mid"] for sym, q in quotes.items()},
+                "server_time_offset": offset,
             }
         except Exception as e:  # noqa: BLE001
             logger.debug("snapshot error: %s", e)
-            return {"account": {}, "positions": [], "orders": [], "prices": {}, "quotes": {}}
+            return {
+                "account": {}, "positions": [], "orders": [], "prices": {}, "quotes": {},
+                "server_time_offset": None,
+            }
 
     async def _pending_orders(self) -> list[dict]:
         """读未成交挂单；读不到时返回空列表，不影响快照其余部分上报。"""
@@ -756,6 +767,12 @@ class NodeClient:
             runner.cancel()
         self.runners.clear()
 
+    def _stop_all_strategy_runners(self, reason: str) -> None:
+        """账户级全平前先停全部策略监控，避免平完仓网格/限价逻辑又补回来。"""
+        for runner in list(self.runners.values()):
+            if not runner.done:
+                runner.request_stop(reason)
+
     async def _do_open(self, ws, msg: dict) -> None:
         """执行开仓并回报结果（带 signal_id/symbol 供服务端关联与释放锁）。"""
         acct = await self._exec(self.mt5.account_info)
@@ -793,6 +810,8 @@ class NodeClient:
         elif target == "symbol" and msg.get("close_symbol"):
             res = await self._exec(self.mt5.close_symbol, msg["close_symbol"])
         else:
+            # 全平是账户级清仓：先停监控再打单，与账户风控全平同一顺序
+            self._stop_all_strategy_runners("manual_close_all")
             res = await self._exec(self.mt5.close_all)
         res["signal_id"] = msg.get("signal_id")
         res.setdefault("action", "CLOSE")

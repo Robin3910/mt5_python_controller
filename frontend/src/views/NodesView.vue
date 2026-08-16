@@ -112,7 +112,7 @@ async function closeSelected(): Promise<void> {
   const nodes = hub.nodes.filter((n) => selectedIds.value.has(n.node_id))
   if (!nodes.length) return
   const names = nodes.map((n) => `· ${n.name} (${n.node_id})`).join('\n')
-  if (!(await confirmAction(`确认对以下 ${nodes.length} 个节点执行全部平仓？\n\n${names}\n\n此操作不可撤销。`, '确认平仓'))) return
+  if (!(await confirmAction(`确认对以下 ${nodes.length} 个节点执行全部平仓？\n\n${names}\n\n将同时终止这些节点上所有进行中的策略任务。此操作不可撤销。`, '确认平仓'))) return
   closing.value = true
   try {
     const res = await hub.closeBatch(

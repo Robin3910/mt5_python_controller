@@ -138,6 +138,44 @@ async def test_close_ticket_includes_symbol():
     assert str(ticket) in tr["data"]["detail"]
 
 
+class _StopRecorder:
+    def __init__(self) -> None:
+        self.done = False
+        self.reasons: list[str] = []
+
+    def request_stop(self, reason: str = "stop_command", *, detail=None) -> None:
+        self.reasons.append(reason)
+
+
+async def test_close_all_stops_strategy_runners():
+    """账户级全平必须先停监控，否则网格/限价会在清仓后又补仓。"""
+    n = _node()
+    await n._exec(n.mt5.connect)
+    live = _StopRecorder()
+    finished = _StopRecorder()
+    finished.done = True
+    n.runners[1] = live
+    n.runners[2] = finished
+    ws = FakeWS()
+    await n._handle(ws, {"cmd": "close", "signal_id": "c3", "close_target": "all"})
+    assert live.reasons == ["manual_close_all"]
+    assert finished.reasons == []
+    assert [m["type"] for m in ws.sent] == ["trade_result"]
+
+
+async def test_close_symbol_does_not_stop_strategy_runners():
+    n = _node()
+    await n._exec(n.mt5.connect)
+    rec = _StopRecorder()
+    n.runners[1] = rec
+    ws = FakeWS()
+    await n._handle(
+        ws,
+        {"cmd": "close", "signal_id": "c4", "close_target": "symbol", "close_symbol": "EURUSD"},
+    )
+    assert rec.reasons == []
+
+
 async def test_strategy_stop_without_runner_closes_by_magic():
     """服务端补发的终止指令：本地没有监控时按魔术号平掉残留持仓并回报。"""
     n = _node()
@@ -180,8 +218,11 @@ async def test_snapshot_shape():
     await n._exec(n.mt5.connect)
     snap = await n._snapshot()
     # orders 是限价开仓的存活凭据：服务端对账少了它会在挂单成交前就收口任务
-    assert set(snap.keys()) == {"account", "positions", "orders", "prices", "quotes"}
+    assert set(snap.keys()) == {
+        "account", "positions", "orders", "prices", "quotes", "server_time_offset",
+    }
     assert snap["orders"] == []
+    assert snap["server_time_offset"] == 0
     assert "EURUSD" in snap["prices"]
     assert "EURUSD" in snap["quotes"]
     assert set(snap["quotes"]["EURUSD"].keys()) == {"bid", "ask", "mid", "change"}

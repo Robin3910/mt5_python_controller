@@ -225,6 +225,8 @@ export interface AccountSnapshot {
   prices: Record<string, number>
   quotes?: Record<string, QuoteInfo>
   updated_at: number
+  /** 券商 MT5 服务器相对真实 UTC 的偏移（秒）。用于把后台时间显示成终端订单时间。 */
+  server_time_offset?: number | null
 }
 
 /** 区间方向过滤：单条价格区间允许的开仓方向 */
@@ -303,6 +305,7 @@ export interface CloseBatchResult {
   sent: string[]
   failed: Array<{ node_id: string; reason: string }>
   target: string
+  strategies_total?: number
 }
 
 /** 手动触发的信号方向；CLOSE 仅 strategy 模型开放（终止分组内进行中的策略任务） */

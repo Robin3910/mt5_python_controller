@@ -138,7 +138,10 @@ const filteredEvents = computed(() => {
 })
 
 async function closeNodeAll(n: NodeOut): Promise<void> {
-  if (!(await confirmAction(`确认平掉节点「${n.name}」的全部持仓？`, '确认平仓'))) return
+  if (!(await confirmAction(
+    `确认平掉节点「${n.name}」的全部持仓？\n将同时终止该节点上所有进行中的策略任务。`,
+    '确认平仓',
+  ))) return
   await hub.closeNode(n.node_id, { target: 'all' })
 }
 async function closeTicket(n: NodeOut, ticket: number): Promise<void> {

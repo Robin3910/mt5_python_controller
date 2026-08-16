@@ -569,7 +569,10 @@ async function toggleEnabled(): Promise<void> {
   await hub.updateNode(id.value, { enabled: !node.value.enabled })
 }
 async function closeNodeAll(): Promise<void> {
-  if (!(await confirmAction('确认平掉该节点的全部持仓？', '确认平仓'))) return
+  if (!(await confirmAction(
+    '确认平掉该节点的全部持仓？\n将同时终止该节点上所有进行中的策略任务。',
+    '确认平仓',
+  ))) return
   await hub.closeNode(id.value, { target: 'all' })
 }
 async function closeTicket(ticket: number): Promise<void> {

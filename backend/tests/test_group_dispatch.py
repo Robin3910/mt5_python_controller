@@ -1802,3 +1802,38 @@ async def test_count_by_group(store, monkeypatch):
     )
     assert page_active["total"] == 1
     assert page_active["items"][0]["signal_id"] == "sig_n2"
+
+
+async def test_stop_all_on_node_stops_every_group_on_that_node(store, monkeypatch):
+    """账户级全平：同一节点上所有分组的未收口子任务都要 strategy_stop。"""
+    await online(store, mk_node("nd_1"), mk_node("nd_2"))
+    await mk_group(store, "甲组", ["nd_1", "nd_2"])
+    await mk_group(store, "乙组", ["nd_1"])
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    d = GroupDispatcher(store)
+
+    await d.dispatch(TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_n1")
+    for task in await fetch_tasks("sig_n1"):
+        nodes = [r.node_id for r in await fetch_dispatches(task.task_id)]
+        await open_first_orders(task.task_id, nodes)
+    sent.clear()
+
+    out = await d.stop_all_on_node("nd_1", signal_id="cls_test", reason="manual_close_all")
+    assert out["stopped"] == 2
+    assert out["forced"] == 0
+    assert out["total"] == 2
+    assert {s[0] for s in sent} == {"nd_1"}
+    assert all(s[1]["cmd"] == "strategy_stop" for s in sent)
+    assert all(s[1]["reason"] == "manual_close_all" for s in sent)
+
+    nd1_status = []
+    nd2_status = []
+    for task in await fetch_tasks("sig_n1"):
+        for row in await fetch_dispatches(task.task_id):
+            if row.node_id == "nd_1":
+                nd1_status.append(row.status)
+            else:
+                nd2_status.append(row.status)
+    assert nd1_status == ["closing", "closing"]
+    assert nd2_status == ["opened"]

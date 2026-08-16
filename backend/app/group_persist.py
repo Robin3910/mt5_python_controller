@@ -171,6 +171,31 @@ async def active_subtasks(group_id: str) -> list[dict]:
         return []
 
 
+async def active_subtasks_for_node(node_id: str) -> list[dict]:
+    """某节点上仍未收口的策略子任务（总览全平要连监控一起停）。
+
+    含所有分组：一个节点可以同时跑多个分组的任务，全平是账户级的，必须全部终止。
+    """
+    if not node_id:
+        return []
+    try:
+        async with SessionLocal() as s:
+            rows = (
+                await s.execute(
+                    select(GroupTaskDispatch)
+                    .where(
+                        GroupTaskDispatch.node_id == node_id,
+                        GroupTaskDispatch.status.notin_(tuple(_TERMINAL)),
+                    )
+                    .order_by(GroupTaskDispatch.id.asc())
+                )
+            ).scalars().all()
+            return [_subtask_dict(r) for r in rows]
+    except Exception as e:  # noqa: BLE001
+        logger.warning("active_subtasks_for_node failed: %s", e)
+        return []
+
+
 async def all_active_subtasks() -> list[dict]:
     """全库仍未收口的节点子任务（清空交易日志前需先通知节点停止）。"""
     try:

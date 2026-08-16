@@ -68,6 +68,10 @@ async function fetchSignalsPage(): Promise<void> {
   signals.value = res.items
   total.value = res.total
   if (res.page !== page.value) page.value = res.page
+  const nodeIds = [...new Set(res.items.flatMap((t) => t.dispatches.map((d) => d.node_id)))]
+  await Promise.all(
+    nodeIds.filter((id) => !hub.accounts[id]).map((id) => hub.fetchNodeAccount(id)),
+  )
   // 「仅进行中」无数据时自动切回「全部」
   if (activeOnly.value && res.total === 0) {
     setActiveFilter(false)
@@ -422,8 +426,53 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
   return rows
 }
 
-function fmtTime(sec: number | null | undefined): string {
-  return sec ? new Date(sec * 1000).toLocaleString() : '—'
+function lastSundayUtc(year: number, monthIndex: number): Date {
+  const d = new Date(Date.UTC(year, monthIndex + 1, 0))
+  d.setUTCDate(d.getUTCDate() - d.getUTCDay())
+  return d
+}
+
+/** 欧洲夏令时：三月最后一个周日 01:00 UTC 起，十月最后一个周日 01:00 UTC 止。 */
+function euDstOffsetSec(at: Date): number {
+  const y = at.getUTCFullYear()
+  const start = lastSundayUtc(y, 2)
+  start.setUTCHours(1, 0, 0, 0)
+  const end = lastSundayUtc(y, 9)
+  end.setUTCHours(1, 0, 0, 0)
+  return at >= start && at < end ? 3 * 3600 : 2 * 3600
+}
+
+function nodeOffsetSec(nodeId: string | undefined): number | null {
+  if (!nodeId) return null
+  const acct = hub.accounts[nodeId]
+  const off = acct?.server_time_offset
+  if (typeof off === 'number' && Number.isFinite(off)) return off
+  const server = String(acct?.server || '')
+  // 节点尚未上报偏移时，IC Markets 仍可按 EET/EEST 对齐终端
+  if (/icmarkets/i.test(server)) return euDstOffsetSec(new Date())
+  return null
+}
+
+function taskNodeId(t: GroupSignalTaskRecord): string | undefined {
+  return t.dispatches?.[0]?.node_id
+}
+
+/** 有券商偏移时按 MT5 服务器时间显示，否则北京时间。 */
+function fmtTime(sec: number | null | undefined, nodeId?: string): string {
+  if (!sec) return '—'
+  const offset = nodeOffsetSec(nodeId)
+  const shifted = offset == null ? sec : sec + offset
+  const tz = offset == null ? 'Asia/Shanghai' : 'UTC'
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).format(new Date(shifted * 1000)).replace(', ', ' ').replace(',', ' ')
 }
 
 function fmtPayload(raw: unknown): string {
@@ -638,7 +687,7 @@ onUnmounted(stopAutoRefresh)
             <template v-for="t in signals" :key="t.task_id">
               <tr class="clickable" @click="toggleRow(t.task_id)">
                 <td class="muted">{{ isExpanded(t.task_id) ? '▾' : '▸' }}</td>
-                <td class="muted" style="font-size: 12px">{{ fmtTime(t.created_at) }}</td>
+                <td class="muted" style="font-size: 12px">{{ fmtTime(t.created_at, taskNodeId(t)) }}</td>
                 <td>#{{ t.task_id }}</td>
                 <td>
                   <span
@@ -669,8 +718,8 @@ onUnmounted(stopAutoRefresh)
                     <div class="kv"><span class="k">下发节点数</span><span class="v">{{ t.node_count }}</span></div>
                     <div class="kv"><span class="k">累计下单</span><span class="v">{{ t.total_orders }} 笔 / {{ t.total_volume }} 手</span></div>
                     <div class="kv"><span class="k">已实现盈亏</span><span class="v">{{ t.realized_profit }}</span></div>
-                    <div class="kv"><span class="k">开仓时间</span><span class="v" style="font-size: 12px">{{ fmtTime(t.opened_at) }}</span></div>
-                    <div class="kv"><span class="k">完成时间</span><span class="v" style="font-size: 12px">{{ fmtTime(t.finished_at) }}</span></div>
+                    <div class="kv"><span class="k">开仓时间</span><span class="v" style="font-size: 12px">{{ fmtTime(t.opened_at, taskNodeId(t)) }}</span></div>
+                    <div class="kv"><span class="k">完成时间</span><span class="v" style="font-size: 12px">{{ fmtTime(t.finished_at, taskNodeId(t)) }}</span></div>
                     <div v-if="t.skip_reason" class="kv span-full">
                       <span class="k">未下发原因</span><span class="v" style="font-size: 12px">{{ t.skip_reason }}</span>
                     </div>
@@ -738,8 +787,8 @@ onUnmounted(stopAutoRefresh)
                             <td>{{ d.order ?? '—' }}</td>
                             <td class="right">{{ d.price ?? '—' }}</td>
                             <td class="muted group-break">{{ d.error || '—' }}</td>
-                            <td class="muted" style="white-space: nowrap">{{ fmtTime(d.dispatched_at) }}</td>
-                            <td class="muted" style="white-space: nowrap">{{ fmtTime(d.finished_at) }}</td>
+                            <td class="muted" style="white-space: nowrap">{{ fmtTime(d.dispatched_at, d.node_id) }}</td>
+                            <td class="muted" style="white-space: nowrap">{{ fmtTime(d.finished_at, d.node_id) }}</td>
                           </tr>
                           <tr v-if="isDispatchExpanded(d.id)" class="detail-row">
                             <td></td>
@@ -759,7 +808,7 @@ onUnmounted(stopAutoRefresh)
                                   <thead>
                                     <tr>
                                       <th style="width: 22px"></th>
-                                      <th>时间</th>
+                                      <th title="与 MT5 终端服务器时间对齐；拿不到券商时区时显示北京时间">时间</th>
                                       <th>类型</th>
                                       <th>动作</th>
                                       <th class="right">手数</th>
@@ -777,7 +826,7 @@ onUnmounted(stopAutoRefresh)
                                         <td class="muted">
                                           <template v-if="ev.detail">{{ isEventExpanded(d.id, ev) ? '▾' : '▸' }}</template>
                                         </td>
-                                        <td class="muted" style="white-space: nowrap">{{ fmtTime(ev.created_at) }}</td>
+                                        <td class="muted" style="white-space: nowrap">{{ fmtTime(ev.created_at, d.node_id) }}</td>
                                         <td>
                                           <span class="tag" :class="eventTag(ev.event_type, ev.detail).cls">
                                             {{ eventTag(ev.event_type, ev.detail).text }}

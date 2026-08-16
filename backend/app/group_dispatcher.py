@@ -375,6 +375,36 @@ class GroupDispatcher:
         )
         return outcome
 
+    async def stop_all_on_node(
+        self, node_id: str, *, signal_id: str, reason: str = "manual_close_all",
+    ) -> dict:
+        """终止该节点上所有未收口的策略子任务（复用单任务 strategy_stop）。
+
+        总览/节点全平是账户级清仓，不停监控的话网格会重新挂格、限价单会被补挂。
+        在线：下发 strategy_stop 并标 closing；离线：强制收口并排队等重连补发。
+        """
+        subs = await group_persist.active_subtasks_for_node(node_id)
+        closing = 0
+        forced = 0
+        for sub in subs:
+            if sub.get("status") in group_rules.SUBTASK_TERMINAL:
+                continue
+            outcome = await self._stop_subtask(sub, signal_id=signal_id, reason=reason)
+            if outcome["status"] == "closing":
+                closing += 1
+            elif outcome["status"] == "forced":
+                forced += 1
+        if subs:
+            logger.info(
+                "node %s close-all -> %d strategy task(s) closing, %d forced",
+                node_id, closing, forced,
+            )
+        return {
+            "stopped": closing,
+            "forced": forced,
+            "total": closing + forced,
+        }
+
     async def _stop_subtask(
         self, sub: dict, *, signal_id: str, reason: str,
     ) -> dict:
