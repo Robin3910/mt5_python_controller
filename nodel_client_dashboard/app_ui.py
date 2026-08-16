@@ -60,8 +60,8 @@ _VERSION_BTN_IDLE = "版本更新"
 _VERSION_BTN_W = 100
 _VERSION_BTN_W_ALERT = 190
 
-# 后端发布版本的复检周期；只是个提示，不必查得勤
-_VERSION_CHECK_INTERVAL_MS = 30 * 60 * 1000
+# 启动约 3 秒后查一次后端发布版本，之后每 1 分钟复检
+_VERSION_CHECK_INTERVAL_MS = 60 * 1000
 _VERSION_CHECK_FIRST_MS = 3000
 
 
