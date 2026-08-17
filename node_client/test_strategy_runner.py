@@ -1077,17 +1077,15 @@ async def test_limit_entry_places_pending_orders_not_positions():
     runner.cancel()
 
 
-async def test_limit_ladder_prices_descend_toward_stop():
-    """底仓挂在信号入场价，分散仓向止损方向等分推进，且都不落在止损上。"""
+async def test_limit_orders_stack_at_entry_price():
+    """底仓与分散仓全部挂在信号入场价，不朝止损方向铺开。"""
     sent: list = []
     runner, hub, mt5 = _limit_runner(sent)
     runner.start()
     await _settle()
 
     prices = [o["price_open"] for o in mt5.pending_orders_by_magic(MAGIC)]
-    assert prices[0] == LIMIT_PRICE
-    assert prices == sorted(prices, reverse=True)
-    assert all(p > LIMIT_STOP for p in prices)
+    assert prices == [LIMIT_PRICE] * 3
     runner.cancel()
 
 
@@ -1221,8 +1219,8 @@ async def test_limit_reports_pending_order_count():
     runner.cancel()
 
 
-async def test_limit_sizing_uses_weighted_distance():
-    """限价手数按加权止损距离反推，且最坏亏损不超风险金额。"""
+async def test_limit_sizing_uses_single_stop_distance():
+    """限价手数按入场价到止损价的单值距离反推，与市价同一口径。"""
     sent: list = []
     runner, hub, mt5 = _limit_runner(sent)
     runner.start()
@@ -1231,8 +1229,8 @@ async def test_limit_sizing_uses_weighted_distance():
     detail = _progress(sent, "open")[0]["detail"]
     assert detail["entry_mode"] == "limit"
     assert detail["risk_used"] <= 300.0
-    # 加权距离小于底仓那一档，所以每手亏损比单值口径小、手数更大
-    assert detail["loss_per_lot"] < abs(LIMIT_PRICE - LIMIT_STOP) / 0.01
+    sl_span = abs(LIMIT_PRICE - LIMIT_STOP)
+    assert detail["loss_per_lot"] == sl_span / 0.01
     orders = mt5.pending_orders_by_magic(MAGIC)
     worst = sum(
         o["volume"] * abs(o["price_open"] - LIMIT_STOP) for o in orders

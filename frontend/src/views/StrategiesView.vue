@@ -190,7 +190,7 @@ function entryModeLabel(r: StrategyRule): string {
 function riskSizedFootnote(r: StrategyRule): string {
   if (isLimitEntry(r)) {
     return (
-      '手数由风险金额与各档到止损价的加权距离反推；底仓 TP=0，' +
+      '手数由风险金额与入场价到止损价的距离反推；底仓 TP=0，' +
       '挂单一直等到成交（GTC）；信号必须携带 sl 与入场价'
     )
   }
@@ -210,7 +210,7 @@ function ruleDetailRows(r: StrategyRule): Array<{ k: string; v: string }> {
       },
       {
         k: '风险金额',
-        v: `${r.risk_amount ?? 0}${limit && batches ? '（全档成交的最坏亏损）' : ''}`,
+        v: `${r.risk_amount ?? 0}`,
       },
       { k: '盈亏比', v: String(r.rr_ratio ?? 0) },
       {
@@ -221,7 +221,7 @@ function ruleDetailRows(r: StrategyRule): Array<{ k: string; v: string }> {
         k: '分散仓',
         v: batches
           ? limit
-            ? `剩余等分 ${batches} 单，在入场价与止损价之间挂阶梯限价（阶梯止盈，末档吃满盈亏比）`
+            ? `剩余等分 ${batches} 单，全部挂在信号入场价（阶梯止盈，末档吃满盈亏比）`
             : `剩余等分 ${batches} 单市价（阶梯止盈，末档吃满盈亏比）`
           : '无（底仓即全仓）',
       },

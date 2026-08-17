@@ -257,10 +257,7 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
     push('方向', detail.direction || detail.action)
     push('开仓方式', detail.entry_mode_label || detail.entry_mode)
     push('风险金额', detail.risk_amount)
-    push(
-      detail.entry_mode === 'limit' && detail.add_batches ? '最坏亏损' : '实际风险',
-      detail.risk_used,
-    )
+    push('实际风险', detail.risk_used)
     push('手数公式', detail.lot_formula)
     push(
       '总手数',

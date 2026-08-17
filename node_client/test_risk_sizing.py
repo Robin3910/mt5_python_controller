@@ -132,7 +132,7 @@ def test_sell_direction_uses_stop_above_entry():
 
 
 # ---------------------------------------------------------------------------
-# 限价开仓：阶梯挂单价与加权止损距离
+# 限价开仓：全部挂在信号入场价，止损距离与市价同一口径
 # ---------------------------------------------------------------------------
 
 def limit_cfg(**over) -> RiskSizedConfig:
@@ -158,46 +158,43 @@ def test_limit_entry_anchors_on_signal_price_not_market():
     assert plan.sl_distance == pytest.approx(3.0)
 
 
-def test_limit_ladder_spreads_between_entry_and_stop():
-    """分散仓在「入场价 → 止损价」之间等分，分母取单数+1 所以末档不落在止损上。"""
+def test_limit_orders_stack_at_entry_price():
+    """底仓与分散仓全部挂在信号入场价，不朝止损方向铺开。"""
     plan = limit_plan(add_batches=2)
     prices = [b.price for b in plan.batches]
-    # 3 美元跨度切成 3 段：2400 / 2399 / 2398，止损 2397 不被占用
-    assert prices == pytest.approx([2400.0, 2399.0, 2398.0])
-    assert all(p > plan.stop_loss for p in prices)
+    assert prices == pytest.approx([2400.0, 2400.0, 2400.0])
+    assert plan.ladder_step == pytest.approx(0.0)
 
 
-def test_limit_ladder_for_sell_goes_upward():
+def test_limit_sell_also_stacks_at_entry_price():
     plan = plan_entries(limit_cfg(add_batches=2), direction="SELL", entry_price=2390.0,
                         stop_loss=2403.0, spec=GOLD, limit_price=2400.0)
-    assert [b.price for b in plan.batches] == pytest.approx([2400.0, 2401.0, 2402.0])
+    assert [b.price for b in plan.batches] == pytest.approx([2400.0, 2400.0, 2400.0])
+    assert all(b.sl_distance == pytest.approx(3.0) for b in plan.batches)
 
 
-def test_limit_batches_have_decreasing_stop_distance():
-    """越往不利方向挂，离止损越近；这正是手数要改按加权距离反推的原因。"""
+def test_limit_batches_share_the_same_stop_distance():
+    """同价入场后各档离止损一样远，手数因此与市价同一口径。"""
     plan = limit_plan(add_batches=2)
-    distances = [b.sl_distance for b in plan.batches]
-    assert distances == pytest.approx([3.0, 2.0, 1.0])
-    assert distances == sorted(distances, reverse=True)
+    assert all(b.sl_distance == pytest.approx(3.0) for b in plan.batches)
 
 
-def test_limit_uses_weighted_stop_distance_for_sizing():
-    """加权止损距离 = Σ(该档仓位占比 × 该档止损距离)。
-
-    底仓 30% 距离 3、两档分散仓各 35% 距离 2 与 1：
-    0.3×3 + 0.35×2 + 0.35×1 = 1.95 美元 = 195 点，一手亏 195 美元。
-    """
+def test_limit_uses_single_stop_distance_for_sizing():
+    """每手亏损按入场价到止损价的单值距离算：3 美元 = 300 点，一手亏 300。"""
     plan = limit_plan(add_batches=2, base_ratio=30)
-    assert plan.loss_per_lot == pytest.approx(195.0)
-    assert plan.planned_lot == pytest.approx(1.53)  # floor(300 / 195) 到 0.01
+    assert plan.loss_per_lot == pytest.approx(300.0)
+    assert plan.planned_lot == pytest.approx(1.0)  # floor(300 / 300) 到 0.01
 
 
-def test_limit_opens_bigger_position_than_market_at_same_risk():
-    """同一份配置改成限价后手数更大：挂单价更有利，加权止损距离更小。"""
+def test_limit_lot_matches_market_at_same_stop_distance():
+    """入场同价后，限价与市价的止损距离、手数、风险一致。"""
     market = plan_entries(cfg(add_batches=2), direction="BUY", entry_price=2400.0,
                           stop_loss=2397.0, spec=GOLD)
     limit = limit_plan(add_batches=2)
-    assert limit.total_lot > market.total_lot
+    assert limit.sl_distance == pytest.approx(market.sl_distance)
+    assert limit.loss_per_lot == pytest.approx(market.loss_per_lot)
+    assert limit.total_lot == pytest.approx(market.total_lot)
+    assert limit.risk_used == pytest.approx(market.risk_used)
 
 
 def test_limit_worst_case_loss_stays_within_risk_amount():
@@ -220,7 +217,7 @@ def test_limit_never_exceeds_risk_budget(batches, base_ratio):
 
 
 def test_limit_partial_fill_loses_less_than_budget():
-    """只成交前几档就止损：实际亏损小于风险金额，这是限价模式的语义变化。"""
+    """只成交部分档位时手数更少，亏损小于全仓风险金额。"""
     plan = limit_plan(add_batches=2)
     base_only = plan.batches[0].volume * plan.batches[0].sl_distance / GOLD.tick_size
     assert base_only * GOLD.tick_value < plan.risk_used
@@ -242,9 +239,11 @@ def test_limit_rejects_entry_on_wrong_side_of_stop():
 
 
 def test_limit_take_profit_still_anchors_on_base_price():
-    """阶梯止盈仍以底仓价为锚：各档开仓价更有利，实际盈亏比只会更高。"""
+    """阶梯止盈仍以入场价为锚：同价入场后与市价模式的止盈价位一致。"""
     plan = limit_plan(add_batches=2)
     assert plan.take_profit == pytest.approx(2400.0 + 3.0 * 2.5)
+    assert plan.batches[0].take_profit == 0.0
+    assert [b.take_profit for b in plan.batches[1:]] == pytest.approx([2403.75, 2407.5])
 
 
 def test_limit_batches_marked_as_pending():
@@ -653,6 +652,16 @@ def test_describe_plan_states_the_lot_formula():
     assert "300" in text and "总手数 1" in text
     assert "底仓 30%" in text
     assert "分散仓" in text and "TP=0" in text
+
+
+def test_describe_limit_plan_stacks_at_entry_price():
+    c = limit_cfg(add_batches=2)
+    plan = limit_plan(cfg=c)
+    text = describe_plan(plan, c, GOLD)
+    assert "限价开仓" in text
+    assert "限价 @2400" in text
+    assert "阶梯限价" not in text
+    assert "加权止损" not in text
 
 
 def test_plan_detail_exposes_every_input():

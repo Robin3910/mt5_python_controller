@@ -386,7 +386,7 @@ class StrategyRule(BaseModel):
     )
     entry_mode: str = Field(
         default="market",
-        description="开仓方式：market=市价打齐 / limit=在信号入场价挂阶梯限价等成交",
+        description="开仓方式：market=市价打齐 / limit=在信号入场价挂限价等成交",
     )
     # --- type=4：网格交易 ---
     price_lower: float = Field(default=0.0, ge=0, description="网格区间下限")

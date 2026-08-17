@@ -232,10 +232,8 @@ class RiskSizedTrendRule:
 
     entry_mode 决定这批单怎么进场：
     - market：信号一到全部市价打齐，各单开仓价相同，止损距离是单值；
-    - limit：底仓挂在信号给的入场价，分散仓在「入场价 → 止损价」之间等分挂阶梯
-      限价，各单止损距离不同，总手数改按仓位比例加权的平均止损距离反推。此时
-      risk_amount 的语义从「确定亏损」变成「全部档位都成交时的最坏亏损」，只成交
-      了前几档就打到止损的话实际亏损更小。
+    - limit：底仓与分散仓全部挂在信号给的入场价（同一点位），止损距离与手数
+      口径与市价相同；挂单一直等到成交（GTC）。
 
     止盈距离 = 止损距离 × rr_ratio（只挂在分散仓上）。
     breakeven_enabled 开启后，浮盈达到「止损距离 × breakeven_times」时把止损
@@ -252,7 +250,7 @@ class RiskSizedTrendRule:
     breakeven_enabled: bool = True          # 保本触发
     breakeven_times: float = 2.0            # 浮盈达到止损距离 × N 倍时移动止损到保本
     breakeven_mode: str = BREAKEVEN_ONCE    # once=按次 / loop=循环
-    entry_mode: str = ENTRY_MODE_MARKET     # market=市价打齐 / limit=挂阶梯限价
+    entry_mode: str = ENTRY_MODE_MARKET     # market=市价打齐 / limit=同价挂限价
 
     @property
     def type(self) -> int:
@@ -509,7 +507,7 @@ STRATEGY_TEMPLATES: dict[str, dict] = {
             "以损定量趋势单：按风险金额与信号止损价反推总手数（不使用信号手数），"
             "底仓成交（止盈为 0），剩余仓位拆成多笔分散仓并按盈亏比挂止盈，"
             "全部订单共用信号止损价；可选浮盈达标后自动移动止损保本。"
-            "开仓方式可选市价打齐，或在信号给的入场价挂阶梯限价等成交。"
+            "开仓方式可选市价打齐，或在信号给的入场价挂限价等成交（底仓与分散仓同价）。"
             "信号必须携带止损价，否则该策略不参与分发。"
         ),
         "rule_set": _TPL2_RULES,

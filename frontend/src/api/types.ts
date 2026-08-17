@@ -418,7 +418,7 @@ export interface StrategyBatchLevel {
 export type EntryDirection = 'pullback' | 'breakout'
 
 /**
- * 以损定量的开仓方式：market 信号一到市价打齐 / limit 在信号入场价挂阶梯限价等成交。
+ * 以损定量的开仓方式：market 信号一到市价打齐 / limit 在信号入场价挂限价等成交。
  * 限价模式要求信号携带入场价（limit_price / price）。
  */
 export type EntryMode = 'market' | 'limit'
@@ -473,9 +473,8 @@ export interface StrategyRule {
   /** 保本监控：once=按次 / loop=循环 */
   breakeven_mode?: 'once' | 'loop'
   /**
-   * 开仓方式。limit 下底仓挂在信号入场价，分散仓在「入场价 → 止损价」之间等分挂
-   * 阶梯限价；各档止损距离不同，总手数改按加权平均止损距离反推，风险金额的含义
-   * 也随之变成「全部档位都成交时的最坏亏损」。
+   * 开仓方式。limit 下底仓与分散仓全部挂在信号入场价（同一点位），止损距离与
+   * 手数口径与市价相同；挂单一直等到成交（GTC）。
    */
   entry_mode?: EntryMode
   // --- type=4：网格交易 ---
@@ -759,10 +758,10 @@ export interface GroupTaskEventDetail {
   /** 止损触发侧报价（多单 bid / 空单 ask），止损距离以此为准 */
   risk_price?: number
   spread?: number | null
-  /** 开仓方式：market 市价打齐 / limit 挂阶梯限价 */
+  /** 开仓方式：market 市价打齐 / limit 挂限价等成交 */
   entry_mode?: EntryMode
   entry_mode_label?: string
-  /** 限价模式下相邻两档挂单价的间隔 */
+  /** 限价模式下相邻两档挂单价的间隔；同价挂单后恒为空 */
   ladder_step?: number | null
   /** 该档的挂单价（限价模式的分散仓事件） */
   limit_price?: number | null
