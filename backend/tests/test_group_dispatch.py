@@ -1154,10 +1154,13 @@ async def test_offline_send_failure_marked_offline(store, monkeypatch):
     )
 
     assert res["targets"] == 0
+    assert res["tasks"][0]["status"] == "failed"
+    assert "连接已断开" in (res["tasks"][0].get("reason") or "")
     task = (await fetch_tasks("sig_g9"))[0]
     rows = await fetch_dispatches(task.task_id)
     assert [r.status for r in rows] == ["offline"]
     assert "连接已断开" in rows[0].skip_reason
+    assert "连接已断开" in (task.skip_reason or "")
 
 
 async def test_trade_result_by_magic_updates_task_and_signal(store, monkeypatch):

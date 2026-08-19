@@ -1373,10 +1373,17 @@ def test_trend_risk_blocks_buy_on_bearish(client, monkeypatch):
             "action": "buy", "symbol": "XAUUSD", "volume": 0.1, "model": "strategy",
         })
         assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["tasks"][0]["status"] == "skipped"
+        assert "趋势风控" in (body["tasks"][0].get("reason") or "")
+        assert "均有进行中的任务" not in (body["tasks"][0].get("reason") or "")
 
     page = client.get(f"/api/groups/{gid}/signals", headers=h).json()
     assert page["total"] == 1
-    d = page["items"][0]["dispatches"][0]
+    item = page["items"][0]
+    assert "趋势风控" in (item.get("skip_reason") or "")
+    assert "均有进行中的任务" not in (item.get("skip_reason") or "")
+    d = item["dispatches"][0]
     assert d["status"] == "skipped"
     assert "趋势风控" in (d.get("skip_reason") or "")
     assert "BUY" in (d.get("skip_reason") or "")
@@ -1398,8 +1405,14 @@ def test_trend_risk_blocks_on_probe_error(client, monkeypatch):
             "action": "sell", "symbol": "XAUUSD", "volume": 0.1, "model": "strategy",
         })
         assert r.status_code == 200, r.text
+        body = r.json()
+        assert "趋势风控" in (body["tasks"][0].get("reason") or "")
+        assert "读取行情失败" in (body["tasks"][0].get("reason") or "")
 
-    d = client.get(f"/api/groups/{gid}/signals", headers=h).json()["items"][0]["dispatches"][0]
+    item = client.get(f"/api/groups/{gid}/signals", headers=h).json()["items"][0]
+    assert "读取行情失败" in (item.get("skip_reason") or "")
+    assert "均有进行中的任务" not in (item.get("skip_reason") or "")
+    d = item["dispatches"][0]
     assert d["status"] == "skipped"
     assert "读取行情失败" in (d.get("skip_reason") or "")
 

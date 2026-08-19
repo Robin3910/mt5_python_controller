@@ -165,6 +165,76 @@ def group_skip_reason(group: dict, effective: list[str]) -> Optional[str]:
     return None
 
 
+# 主任务 skip_reason 与 GroupSignalTask.skip_reason 列宽对齐
+_TASK_SKIP_REASON_MAX = 255
+_BUSY_REASON = "目标节点在本分组内均有进行中的任务"
+_UNAVAILABLE_REASON = "下发失败：目标节点连接均不可用"
+_TREND_ALL_REASON = "本组有效节点均被趋势风控拦截"
+
+
+def _clip_skip_reason(text: str) -> str:
+    text = str(text or "").strip()
+    if len(text) <= _TASK_SKIP_REASON_MAX:
+        return text
+    return text[: _TASK_SKIP_REASON_MAX - 1] + "…"
+
+
+def _no_target_kind(outcome: dict) -> str:
+    """把零下发节点结果分成 trend / busy / skipped_other / unavailable。"""
+    reason = str(outcome.get("reason") or "").strip()
+    status = str(outcome.get("status") or "").strip()
+    if reason.startswith("趋势风控"):
+        return "trend"
+    if "进行中的子任务" in reason:
+        return "busy"
+    if status == "skipped":
+        return "skipped_other"
+    return "unavailable"
+
+
+def summarize_no_target(outcomes: list[dict]) -> tuple[str, str]:
+    """一个节点都没发出去时的 (状态, 原因)。
+
+    必须看各节点 `reason`：`skipped` 既可能是组内互斥，也可能是趋势风控。
+    全忙仍用「均有进行中的任务」；全趋势抄节点文案（多条不同则归并）；
+    混因用分号拼接，避免把趋势拦截写成节点忙或连接失败。
+    """
+    items = [o for o in outcomes if isinstance(o, dict)]
+    if not items:
+        return "failed", _UNAVAILABLE_REASON
+
+    kinds = [_no_target_kind(o) for o in items]
+    unique: list[str] = []
+    seen: set[str] = set()
+    for o in items:
+        reason = str(o.get("reason") or "").strip()
+        if reason and reason not in seen:
+            seen.add(reason)
+            unique.append(reason)
+
+    skip_kinds = {"trend", "busy", "skipped_other"}
+    all_skipped = all(k in skip_kinds for k in kinds)
+    status = "skipped" if all_skipped else "failed"
+    kind_set = set(kinds)
+
+    if kind_set == {"busy"}:
+        return "skipped", _BUSY_REASON
+    if kind_set == {"trend"}:
+        if len(unique) == 1:
+            return "skipped", _clip_skip_reason(unique[0])
+        return "skipped", _TREND_ALL_REASON
+    if kind_set == {"unavailable"}:
+        if len(unique) == 1:
+            return "failed", _clip_skip_reason(unique[0])
+        return "failed", _UNAVAILABLE_REASON
+
+    if len(unique) == 1:
+        return status, _clip_skip_reason(unique[0])
+    if unique:
+        return status, _clip_skip_reason("；".join(unique))
+    return status, _BUSY_REASON if all_skipped else _UNAVAILABLE_REASON
+
+
 def trend_verdict_label(verdict: str) -> str:
     """趋势结论的中文标签（供 skip_reason / 日志展示）。"""
     return _TREND_VERDICT_LABELS.get(str(verdict or "").strip().lower(), str(verdict or "未知"))

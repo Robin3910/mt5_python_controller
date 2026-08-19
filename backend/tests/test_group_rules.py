@@ -229,6 +229,85 @@ def test_group_skip_reason_none_when_dispatchable():
 
 
 # =====================================================================
+# 零下发主任务原因汇总（不能把趋势拦截写成节点忙）
+# =====================================================================
+_TREND_BUY = "趋势风控：信号 BUY，当前趋势为空头（得分 -75.1），已拦截"
+_BUSY_NODE = "该节点在本分组内已有进行中的子任务 #12，本次跳过"
+_OFFLINE = "下发失败：节点连接已断开"
+_CREATE_FAIL = "子任务创建失败，已放弃该节点"
+
+
+def test_summarize_no_target_all_busy_keeps_template():
+    status, reason = group_rules.summarize_no_target([
+        {"status": "skipped", "reason": _BUSY_NODE},
+        {"status": "skipped", "reason": "该节点在本分组内已有进行中的子任务 #13，本次跳过"},
+    ])
+    assert status == "skipped"
+    assert reason == "目标节点在本分组内均有进行中的任务"
+
+
+def test_summarize_no_target_copies_single_trend_reason():
+    status, reason = group_rules.summarize_no_target([
+        {"status": "skipped", "reason": _TREND_BUY},
+    ])
+    assert status == "skipped"
+    assert reason == _TREND_BUY
+    assert "进行中的任务" not in reason
+
+
+def test_summarize_no_target_merges_distinct_trend_reasons():
+    status, reason = group_rules.summarize_no_target([
+        {"status": "skipped", "reason": _TREND_BUY},
+        {"status": "skipped", "reason": "趋势风控：读取行情失败：节点当前离线，无法读取行情"},
+    ])
+    assert status == "skipped"
+    assert reason == "本组有效节点均被趋势风控拦截"
+
+
+def test_summarize_no_target_copies_single_unavailable_reason():
+    status, reason = group_rules.summarize_no_target([
+        {"status": "offline", "reason": _OFFLINE},
+    ])
+    assert status == "failed"
+    assert reason == _OFFLINE
+
+
+def test_summarize_no_target_mixed_keeps_both_reasons():
+    status, reason = group_rules.summarize_no_target([
+        {"status": "skipped", "reason": _TREND_BUY},
+        {"status": "offline", "reason": _OFFLINE},
+    ])
+    assert status == "failed"
+    assert _TREND_BUY in reason
+    assert _OFFLINE in reason
+    assert "进行中的任务" not in reason
+
+
+def test_summarize_no_target_busy_plus_trend_does_not_hide_trend():
+    status, reason = group_rules.summarize_no_target([
+        {"status": "skipped", "reason": _BUSY_NODE},
+        {"status": "skipped", "reason": _TREND_BUY},
+    ])
+    assert status == "skipped"
+    assert "进行中的子任务" in reason
+    assert "趋势风控" in reason
+
+
+def test_summarize_no_target_empty_is_unavailable():
+    status, reason = group_rules.summarize_no_target([])
+    assert status == "failed"
+    assert "连接均不可用" in reason
+
+
+def test_summarize_no_target_create_fail_is_not_connection_template():
+    status, reason = group_rules.summarize_no_target([
+        {"status": "offline", "reason": _CREATE_FAIL},
+    ])
+    assert status == "failed"
+    assert reason == _CREATE_FAIL
+
+
+# =====================================================================
 # 组内轮转顺序对齐
 # =====================================================================
 def test_reconcile_rotation_keeps_existing_order():

@@ -576,7 +576,7 @@ function reportTriggerResult(payload: ManualSignalPayload, res: ManualSignalResu
     if (targets > 0) {
       ElMessage.success(`已触发 ${head}：${detail}`)
     } else {
-      ElMessage.warning(`${head} 已受理但未下发：${detail}（分组无有效节点，或节点在本组已有进行中的任务）`)
+      ElMessage.warning(`${head} 已受理但未下发：${detail}（${acceptedButNotDispatchedHint(res)}）`)
     }
     return true
   }
@@ -591,6 +591,19 @@ function reportTriggerResult(payload: ManualSignalPayload, res: ManualSignalResu
   }
   ElMessage.info(`已提交：${res.status}`)
   return true
+}
+
+/** accepted 但 targets=0 时，用各分组真实未下发原因，避免把趋势拦截说成节点忙 */
+function acceptedButNotDispatchedHint(res: ManualSignalResult): string {
+  const reasons = [
+    ...new Set(
+      (res.tasks || [])
+        .map((t) => (t.reason || '').trim())
+        .filter(Boolean),
+    ),
+  ]
+  if (reasons.length) return reasons.join('；')
+  return '分组无有效节点，或未能下发到任何节点'
 }
 
 async function submitTrigger(): Promise<void> {

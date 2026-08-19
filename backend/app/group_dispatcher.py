@@ -495,10 +495,8 @@ class GroupDispatcher:
 
     @staticmethod
     def _no_target(outcomes: list[dict]) -> tuple[str, str]:
-        """一个节点都没发出去时的 (状态, 原因)：区分节点忙与连接不可用。"""
-        if outcomes and all(o["status"] == "skipped" for o in outcomes):
-            return "skipped", "目标节点在本分组内均有进行中的任务"
-        return "failed", "下发失败：目标节点连接均不可用"
+        """一个节点都没发出去时的 (状态, 原因)：按各节点真实 reason 汇总。"""
+        return group_rules.summarize_no_target(outcomes)
 
     # ------------------------------------------------------------------
     # 逐节点下发
