@@ -168,3 +168,32 @@ def test_build_initial_env_fills_address_and_token():
 def test_build_initial_env_without_template():
     out = ef.build_initial_env("", ws_url="ws://h/ws/node", node_token="t")
     assert ef.parse_env_text(out) == {"MANAGER_WS_URL": "ws://h/ws/node", "NODE_TOKEN": "t"}
+
+
+def test_write_import_env_creates_when_missing(tmp_path: Path):
+    overwritten = ef.write_import_env(
+        tmp_path, _SAMPLE, ws_url="wss://hub.example.com/ws/node", node_token="tok"
+    )
+    assert overwritten is False
+    _text, env = ef.read_env(tmp_path)
+    assert env["MANAGER_WS_URL"] == "wss://hub.example.com/ws/node"
+    assert env["NODE_TOKEN"] == "tok"
+    assert env["HEARTBEAT_INTERVAL"] == "15"
+
+
+def test_write_import_env_overwrites_existing(tmp_path: Path):
+    (tmp_path / ".env").write_text(
+        "MANAGER_WS_URL=ws://old/ws/node\nNODE_TOKEN=old-token\nOLD_ONLY_KEY=from-old-file\n",
+        encoding="utf-8",
+    )
+    overwritten = ef.write_import_env(
+        tmp_path, _SAMPLE, ws_url="wss://hub.example.com/ws/node", node_token="new-tok"
+    )
+    assert overwritten is True
+    text, env = ef.read_env(tmp_path)
+    assert env["MANAGER_WS_URL"] == "wss://hub.example.com/ws/node"
+    assert env["NODE_TOKEN"] == "new-tok"
+    assert env["HEARTBEAT_INTERVAL"] == "15"
+    assert "OLD_ONLY_KEY" not in env
+    assert "old-token" not in text
+    assert "# ============ 后端连接 ============" in text

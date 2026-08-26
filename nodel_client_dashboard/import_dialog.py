@@ -1,8 +1,8 @@
 """导入节点对话框：选 MT5 安装目录 + 选客户端版本，一键部署并加入实例列表。
 
 流程：校验目录里有 MT5 终端 → 从后端拉版本清单（默认选中当前发布版本）→ 下载、
-校验 sha256、解压覆盖到该目录 → 生成 `.env`（用面板的连接配置填地址与令牌，已存在
-则不动）→ 注册为实例。
+校验 sha256、解压覆盖到该目录 → 生成 `.env`（用面板的连接配置填地址与令牌；勾选
+自动写入时，已存在的 `.env` 也会整份覆盖）→ 注册为实例。
 
 客户端必须与 `terminal64.exe` 同目录，否则 node_client 启动时发现不到终端会直接退出，
 所以目录校验放在最前面，不合规不让往下走。
@@ -158,8 +158,8 @@ class ImportNodeDialog(ctk.CTkToplevel):
         ).pack(anchor="w", pady=(6, 0))
         ctk.CTkLabel(
             inner,
-            text="已存在的 .env 不会被覆盖；MT5 未登录时节点需要交互输入账号，"
-                 "首次建议先不自动启动。",
+            text="勾选自动写入时，目录里已有的 .env 会整份覆盖；想保留旧文件请取消勾选。"
+                 "MT5 未登录时节点需要交互输入账号，首次建议先不自动启动。",
             text_color=TEXT_DIM, font=font(11), anchor="w",
             justify="left", wraplength=680,
         ).pack(anchor="w", pady=(6, 0))
@@ -229,7 +229,7 @@ class ImportNodeDialog(ctk.CTkToplevel):
             existing = read_version_near(exe_path)
             note += f"　该目录已有客户端 v{existing or '未知'}（导入会先备份再覆盖）"
         if ef.env_path(directory).is_file():
-            note += "　已有 .env（不会被覆盖）"
+            note += "　已有 .env（勾选自动写入时将覆盖）"
         self.status.configure(text=note, text_color=TEXT_MUTED)
         return True
 
@@ -350,10 +350,16 @@ class ImportNodeDialog(ctk.CTkToplevel):
             f"实例标签：{name}",
             f"MT5 终端：{(ef.find_terminal(directory) or Path('?')).name}",
         ]
-        if write_env and not env_exists:
+        if write_env and env_exists:
+            lines += [
+                "",
+                "该目录已有 .env，将整份覆盖：",
+                f"  MANAGER_WS_URL={ws_url}",
+                "  NODE_TOKEN=（面板连接配置）",
+                "  其余项来自安装包 .env.example（旧文件中的自定义键不会保留）",
+            ]
+        elif write_env:
             lines += ["", "将自动生成 .env：", f"  MANAGER_WS_URL={ws_url}", "  NODE_TOKEN=（面板连接配置）"]
-        elif env_exists:
-            lines += ["", "该目录已有 .env，将保持原样不动。"]
         else:
             lines += ["", "不写入 .env —— 导入后需自行配置，否则节点无法接入。"]
         lines += ["", "是否继续？"]
@@ -407,20 +413,33 @@ class ImportNodeDialog(ctk.CTkToplevel):
                 template = example.read_text(encoding="utf-8-sig", errors="replace")
 
         env_written = False
-        if write_env and not ef.env_path(directory).is_file():
-            ef.write_env(
+        env_overwritten = False
+        if write_env:
+            env_overwritten = ef.write_import_env(
                 directory,
-                ef.build_initial_env(template, ws_url=ws_url, node_token=target.token),
+                template,
+                ws_url=ws_url,
+                node_token=target.token,
             )
             env_written = True
 
         # 注册实例必须回主线程：ProcessManager 与实例列表由 UI 线程持有
-        self.after(0, lambda: self._register_instance(directory, name, version, env_written))
+        self.after(
+            0,
+            lambda: self._register_instance(
+                directory, name, version, env_written, env_overwritten
+            ),
+        )
 
     # 不能叫 _register：tkinter.Misc._register 是内部方法，Toplevel 初始化时会用它
     # 注册 WM_DELETE_WINDOW 回调，重名会让整个对话框构造失败
     def _register_instance(
-        self, directory: Path, name: str, version: str, env_written: bool
+        self,
+        directory: Path,
+        name: str,
+        version: str,
+        env_written: bool,
+        env_overwritten: bool = False,
     ) -> None:
         exe_path = directory / "node_client.exe"
         cfg = InstanceConfig.create(
@@ -435,19 +454,26 @@ class ImportNodeDialog(ctk.CTkToplevel):
 
         installed = read_version_near(exe_path) or version
         parts = [f"已导入「{cfg.name}」，客户端 v{installed}"]
-        if env_written:
+        if env_overwritten:
+            parts.append(".env 已覆盖")
+        elif env_written:
             parts.append(".env 已生成")
         self.status.configure(text="　".join(parts), text_color=ACCENT)
 
         if self.start_after_var.get():
             self.manager.start(cfg.id)
 
+        if env_overwritten:
+            env_note = "已覆盖 .env（地址与令牌来自面板连接配置），可直接启动。"
+        elif env_written:
+            env_note = "已生成 .env，可直接启动。"
+        else:
+            env_note = "请确认 .env 已配置好后端地址与令牌，再启动实例。"
         messagebox.showinfo(
             "导入完成",
             f"实例「{cfg.name}」已加入列表。\n\n"
             f"客户端版本：v{installed}\n"
             f"目录：{directory}\n\n"
-            + ("已生成 .env，可直接启动。" if env_written
-               else "请确认 .env 已配置好后端地址与令牌，再启动实例。"),
+            + env_note,
             parent=self,
         )

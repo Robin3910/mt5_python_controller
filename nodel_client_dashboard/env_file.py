@@ -250,3 +250,23 @@ def build_initial_env(
         template_text or "",
         {"MANAGER_WS_URL": ws_url, "NODE_TOKEN": node_token},
     )
+
+
+def write_import_env(
+    cwd: str | Path,
+    template_text: str,
+    *,
+    ws_url: str,
+    node_token: str,
+) -> bool:
+    """导入时写入 .env：不存在则生成，已存在则整份覆盖为同一份初始内容。
+
+    覆盖内容与首次导入相同：以安装包 `.env.example` 为模板，填入面板的后端地址与令牌。
+    返回 True 表示覆盖了已有文件。版本更新路径仍不碰 `.env`（见 `client_deploy`）。
+    """
+    existed = env_path(cwd).is_file()
+    write_env(
+        cwd,
+        build_initial_env(template_text, ws_url=ws_url, node_token=node_token),
+    )
+    return existed
