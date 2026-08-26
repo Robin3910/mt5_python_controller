@@ -84,6 +84,7 @@ function actionLabel(action: string): string {
     close_all: '全局平仓',
     close_batch: '批量平仓',
     close_group_dispatch: '策略子任务平仓',
+    close_group: '分组一键平仓',
   }
   return m[action] || action
 }
@@ -91,6 +92,7 @@ function actionLabel(action: string): string {
 function resultTag(result: string): { cls: string; text: string } {
   if (result === 'ok') return { cls: 'green', text: '成功' }
   if (result === 'offline') return { cls: 'amber', text: '离线' }
+  if (result === 'skipped') return { cls: '', text: '跳过' }
   if (result === 'fail' || result === 'failed') return { cls: 'red', text: '失败' }
   return { cls: '', text: result }
 }

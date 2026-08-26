@@ -8,6 +8,7 @@ import type {
   GridSizingData,
   GroupCreatePayload,
   GroupOut,
+  GroupCloseResult,
   GroupUpdatePayload,
   HubEvent,
   ManualSignalPayload,
@@ -283,6 +284,10 @@ export const useHubStore = defineStore('hub', {
       dispatchId: number,
     ): Promise<{ status: string; node_id?: string; reason?: string }> {
       return (await api.post(`/api/groups/${groupId}/dispatches/${dispatchId}/close`)).data
+    },
+    /** 分组一键平仓：终止该分组全部未收口子任务并按魔术号平仓 */
+    async closeGroup(groupId: string): Promise<GroupCloseResult> {
+      return (await api.post(`/api/groups/${groupId}/close`)).data
     },
     // ---- 配置保存 ----
     async saveFilters(cfg: FilterRulesConfig): Promise<void> {

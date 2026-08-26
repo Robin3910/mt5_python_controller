@@ -250,6 +250,57 @@ async function remove(g: GroupOut): Promise<void> {
   await hub.deleteGroup(g.group_id, currentSearchOptions())
 }
 
+const closingGroupIds = ref<Record<string, boolean>>({})
+
+async function closeGroup(g: GroupOut): Promise<void> {
+  if (closingGroupIds.value[g.group_id]) return
+  const n = g.active_task_count
+  const taskHint = n > 0
+    ? `当前进行中主任务 ${n} 条。\n`
+    : '当前列表显示没有进行中主任务；若仍有未收口子任务也会一并终止。\n'
+  if (!(await confirmAction(
+    `确认对分组「${g.name}」一键平仓？\n\n`
+      + '将终止该分组全部未收口的策略任务，并平掉对应魔术号的持仓。\n'
+      + '不影响其它分组，也不会做账户级全平。\n'
+      + taskHint
+      + '此操作不可撤销。',
+    '确认平仓',
+  ))) {
+    return
+  }
+  closingGroupIds.value = { ...closingGroupIds.value, [g.group_id]: true }
+  try {
+    const res = await hub.closeGroup(g.group_id)
+    if (res.status === 'skipped') {
+      ElMessage.warning(res.reason || '该分组没有进行中的策略任务')
+      hub.pushEvent(`分组「${g.name}」一键平仓：无进行中任务`, 'warn')
+    } else if (res.status === 'closing') {
+      const forced = res.forced || 0
+      const msg = `已向 ${res.targets} 个节点任务下发平仓终止`
+      if (forced) {
+        ElMessage.warning(`${msg}；${forced} 个节点离线，已强制结束并排队待重连补发`)
+        hub.pushEvent(`分组「${g.name}」一键平仓：${msg}（${forced} 离线）`, 'warn')
+      } else {
+        ElMessage.success(msg)
+        hub.pushEvent(`分组「${g.name}」一键平仓：${msg}`, 'ok')
+      }
+    } else {
+      ElMessage.warning(res.reason || '目标节点均离线，已强制结束子任务，待重连后补发平仓')
+      hub.pushEvent(`分组「${g.name}」一键平仓：节点离线`, 'warn')
+    }
+    await loadGroups()
+  } catch (e: unknown) {
+    const detail =
+      (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+      || '平仓下发失败'
+    ElMessage.error(typeof detail === 'string' ? detail : '平仓下发失败')
+  } finally {
+    const next = { ...closingGroupIds.value }
+    delete next[g.group_id]
+    closingGroupIds.value = next
+  }
+}
+
 const PURGE_CONFIRM_TEXT = '清空交易记录'
 const purging = ref(false)
 
@@ -774,6 +825,13 @@ async function onStrategyFormSaved(): Promise<void> {
           <button class="btn-sm" :class="g.enabled ? 'btn-success' : 'btn-danger'" @click="toggleEnabled(g)">
             {{ g.enabled ? '禁用' : '启用' }}
           </button>
+          <button
+            class="btn-sm btn-danger"
+            :disabled="!!closingGroupIds[g.group_id]"
+            @click="closeGroup(g)"
+          >
+            {{ closingGroupIds[g.group_id] ? '下发中…' : '平仓' }}
+          </button>
           <button class="btn-sm btn-ghost" @click="openEdit(g)">编辑</button>
           <button class="btn-sm btn-danger" @click="remove(g)">删除</button>
         </div>
@@ -853,13 +911,20 @@ async function onStrategyFormSaved(): Promise<void> {
                 {{ g.enabled ? '已启用' : '已禁用' }}
               </button>
             </td>
-            <td class="right">
+            <td class="right nowrap">
+              <button
+                class="btn-sm btn-danger"
+                :disabled="!!closingGroupIds[g.group_id]"
+                @click="closeGroup(g)"
+              >
+                {{ closingGroupIds[g.group_id] ? '下发中…' : '平仓' }}
+              </button>
               <button class="btn-sm btn-ghost" @click="openEdit(g)">编辑</button>
               <button class="btn-sm btn-danger" @click="remove(g)">删除</button>
             </td>
           </tr>
           <tr v-if="!hub.groups.length && !loading">
-            <td colspan="11" class="muted" style="padding: 18px">
+            <td colspan="12" class="muted" style="padding: 18px">
               {{ appliedQuery ? '无匹配分组' : '暂无分组，点击右上角「新建分组」开始配置' }}
             </td>
           </tr>
@@ -1207,6 +1272,13 @@ async function onStrategyFormSaved(): Promise<void> {
 .groups-page {
   width: 100%;
   min-width: 0;
+}
+
+.nowrap {
+  white-space: nowrap;
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
 }
 
 .member-list {

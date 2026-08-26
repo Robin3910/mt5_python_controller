@@ -369,6 +369,21 @@ export interface GroupOut {
   active_task_count: number
 }
 
+/** 分组一键平仓结果：终止该分组未收口子任务并按魔术号平仓 */
+export interface GroupCloseResult {
+  group_id: string
+  group_name?: string | null
+  dispatch_mode?: string
+  task_id?: number | null
+  /** 已向在线节点下发 strategy_stop 的子任务数 */
+  targets: number
+  /** 离线强制收口并排队待重连补发的子任务数 */
+  forced?: number
+  /** closing=已下发；skipped=无任务；failed=目标均离线 */
+  status: string
+  reason?: string | null
+}
+
 export interface GroupCreatePayload {
   name: string
   enabled?: boolean

@@ -228,6 +228,39 @@ async def close_group_dispatch(
     return outcome
 
 
+@router.post("/{group_id}/close")
+async def close_group(
+    group_id: str,
+    request: Request,
+    store: RedisStore = Depends(get_store),
+    group_dispatcher: GroupDispatcher = Depends(get_group_dispatcher),
+    admin: str = Depends(get_current_admin),
+):
+    """分组一键平仓：终止该分组全部未收口子任务，平掉各自魔术号持仓并结束监控。
+
+    只作用于本分组，不做账户级全平，因此同一节点上其它分组的任务与持仓不受影响。
+    与 Webhook CLOSE 同一条 strategy_stop 路径；CLOSE 还按品种筛选，这里不限品种。
+    """
+    if not await store.get_group(group_id):
+        raise HTTPException(status_code=404, detail="group not found")
+    try:
+        outcome = await group_dispatcher.close_group(group_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    status = outcome.get("status")
+    if status == "closing":
+        result = "ok"
+    elif status == "skipped":
+        result = "skipped"
+    else:
+        result = "offline"
+    await persist.audit(
+        admin, "close_group", group_id, None, result, client_ip(request),
+        category="console", before=None, after=outcome,
+    )
+    return outcome
+
+
 @router.patch("/{group_id}", response_model=GroupOut)
 async def update_group(
     group_id: str,

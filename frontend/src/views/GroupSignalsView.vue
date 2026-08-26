@@ -723,7 +723,7 @@ onUnmounted(stopAutoRefresh)
                     <div v-if="isTaskActive(t.status)" class="kv span-full">
                       <span class="k">提示</span>
                       <span class="v" style="font-size: 12px">
-                        任务进行中，下方运行中的节点该品种暂不接收新的策略信号；可在节点行点击「平仓」单独终止，或发送 CLOSE 信号终止全部
+                        任务进行中，下方运行中的节点该品种暂不接收新的策略信号；可在节点行点击「平仓」单独终止，或返回分组列表点「平仓」一键结束全部
                       </span>
                     </div>
                   </div>

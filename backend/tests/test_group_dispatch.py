@@ -1544,6 +1544,64 @@ async def test_manual_close_subtask_only_stops_one_node(store, monkeypatch):
     assert by_id[peer.id].status != "closing"
 
 
+async def test_manual_close_group_stops_all_subs_of_that_group_only(store, monkeypatch):
+    """分组一键平仓：本分组全部未收口子任务 strategy_stop，其它分组不动。"""
+    await online(store, mk_node("nd_a"), mk_node("nd_b"))
+    g1 = await mk_group(store, "平仓组", ["nd_a", "nd_b"], mode="sync")
+    g2 = await mk_group(store, "旁观组", ["nd_a"])
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    d = GroupDispatcher(store)
+
+    await d.dispatch(TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_cg0")
+    for task in await fetch_tasks("sig_cg0"):
+        nodes = [r.node_id for r in await fetch_dispatches(task.task_id)]
+        await open_first_orders(task.task_id, nodes)
+    sent.clear()
+
+    outcome = await d.close_group(g1["group_id"])
+
+    assert outcome["status"] == "closing"
+    assert outcome["targets"] == 2
+    assert outcome["forced"] == 0
+    assert {s[0] for s in sent} == {"nd_a", "nd_b"}
+    assert all(s[1]["cmd"] == "strategy_stop" for s in sent)
+    assert all(s[1]["reason"] == "manual_close_group" for s in sent)
+    assert all(s[1]["group_id"] == g1["group_id"] for s in sent)
+
+    g1_status = []
+    g2_status = []
+    for task in await fetch_tasks("sig_cg0"):
+        for row in await fetch_dispatches(task.task_id):
+            if row.group_id == g1["group_id"]:
+                g1_status.append(row.status)
+            elif row.group_id == g2["group_id"]:
+                g2_status.append(row.status)
+    assert g1_status == ["closing", "closing"]
+    assert g2_status == ["opened"]
+
+
+async def test_manual_close_group_skipped_when_idle(store, monkeypatch):
+    """没有进行中任务时一键平仓应跳过，不向节点发命令。"""
+    await online(store, mk_node("nd_a"))
+    group = await mk_group(store, "空闲平仓组", ["nd_a"])
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    d = GroupDispatcher(store)
+
+    outcome = await d.close_group(group["group_id"])
+
+    assert outcome["status"] == "skipped"
+    assert outcome["targets"] == 0
+    assert sent == []
+
+
+async def test_manual_close_group_rejects_missing(store):
+    d = GroupDispatcher(store)
+    with pytest.raises(ValueError, match="分组不存在"):
+        await d.close_group("grp_missing")
+
+
 async def test_manual_close_subtask_rejects_terminal(store, monkeypatch):
     """已结束的子任务不可再平仓。"""
     await online(store, mk_node("nd_a"))

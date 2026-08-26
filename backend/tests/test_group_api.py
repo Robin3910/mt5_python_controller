@@ -65,6 +65,22 @@ def _wait_task_status(client, headers, group_id: str, expected: str, tries: int 
     return page
 
 
+def _wait_dispatches_status(
+    client, headers, group_id: str, allowed: set[str], tries: int = 150,
+) -> dict:
+    """等到最新主任务的全部子任务都进入 allowed 状态（主任务 running 时可能仍有 sent）。"""
+    page = {}
+    for _ in range(tries):
+        page = client.get(f"/api/groups/{group_id}/signals", headers=headers).json()
+        items = page.get("items") or []
+        if items:
+            ds = items[0].get("dispatches") or []
+            if ds and all(d.get("status") in allowed for d in ds):
+                return page
+        time.sleep(0.02)
+    return page
+
+
 def _wait_dispatch_event(client, headers, group_id: str, dispatch_id: int,
                          event_type: str, tries: int = 100) -> dict | None:
     """节点上报是异步落库，轮询等待目标事件出现后再断言。"""
@@ -104,6 +120,7 @@ def test_group_endpoints_require_auth(client):
     assert client.delete("/api/groups/grp_x").status_code == 401
     assert client.get("/api/groups/grp_x/signals").status_code == 401
     assert client.get("/api/groups/grp_x/dispatches/1/events").status_code == 401
+    assert client.post("/api/groups/grp_x/close").status_code == 401
 
 
 # =====================================================================
@@ -1085,8 +1102,7 @@ def test_manual_close_dispatch_stops_one_node(client):
                 "symbol": "XAUUSD", "success": True, "order": 1,
             }})
         _wait_task_status(client, h, gid, "running")
-
-        page = client.get(f"/api/groups/{gid}/signals", headers=h).json()
+        page = _wait_dispatches_status(client, h, gid, {"opened", "running"})
         d1 = next(x for x in page["items"][0]["dispatches"] if x["node_id"] == n1)
         d2 = next(x for x in page["items"][0]["dispatches"] if x["node_id"] == n2)
 
@@ -1123,6 +1139,82 @@ def test_manual_close_dispatch_stops_one_node(client):
         again = client.post(f"/api/groups/{gid}/dispatches/{d1['id']}/close", headers=h)
         assert again.status_code == 400
         assert "已结束" in again.json()["detail"]
+
+
+def test_manual_close_group_stops_all_running_subs(client):
+    """分组列表一键平仓：该分组全部未收口子任务收到 strategy_stop。"""
+    h = auth_headers(client)
+    token = _node_token(client, h)
+    n1 = _mk_node(client, h, 5251)
+    n2 = _mk_node(client, h, 5252)
+    gid = _mk_group(
+        client, h, name="分组一键平仓组", dispatch_mode="sync", node_ids=[n1, n2],
+    )["group_id"]
+
+    with client.websocket_connect("/ws/node") as ws1, \
+            client.websocket_connect("/ws/node") as ws2:
+        ws1.send_json({"type": "auth", "data": {"token": token, "mt5_login": 5251}})
+        assert ws1.receive_json()["type"] == "auth_ok"
+        ws2.send_json({"type": "auth", "data": {"token": token, "mt5_login": 5252}})
+        assert ws2.receive_json()["type"] == "auth_ok"
+
+        client.post("/webhook", json={
+            "action": "buy", "symbol": "XAUUSD", "volume": 0.1, "model": "strategy",
+        })
+        start1 = ws1.receive_json()
+        start2 = ws2.receive_json()
+        for ws, cmd in ((ws1, start1), (ws2, start2)):
+            ws.send_json({"type": "trade_result", "data": {
+                "signal_id": cmd["signal_id"], "magic": cmd["magic"],
+                "symbol": "XAUUSD", "success": True, "order": 1,
+            }})
+        _wait_task_status(client, h, gid, "running")
+        _wait_dispatches_status(client, h, gid, {"opened", "running"})
+
+        r = client.post(f"/api/groups/{gid}/close", headers=h)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["status"] == "closing"
+        assert body["targets"] == 2
+        assert body["group_id"] == gid
+
+        for ws, start in ((ws1, start1), (ws2, start2)):
+            cmd = ws.receive_json()
+            assert cmd["cmd"] == "strategy_stop"
+            assert cmd["reason"] == "manual_close_group"
+            assert cmd["magic"] == start["magic"]
+            assert cmd["dispatch_id"] == start["dispatch_id"]
+
+        page = client.get(f"/api/groups/{gid}/signals", headers=h).json()
+        statuses = {x["id"]: x["status"] for x in page["items"][0]["dispatches"]}
+        assert set(statuses.values()) == {"closing"}
+
+        audits = client.get("/api/audits", params={"page_size": 50}, headers=h).json()["items"]
+        assert any(a["action"] == "close_group" and a["target"] == gid for a in audits)
+
+        for ws, start in ((ws1, start1), (ws2, start2)):
+            ws.send_json({"type": "strategy_finished", "data": {
+                "task_id": start["task_id"], "dispatch_id": start["dispatch_id"],
+                "magic": start["magic"], "status": "done",
+            }})
+        _wait_task_status(client, h, gid, "done")
+
+
+def test_manual_close_group_skipped_when_idle(client):
+    h = auth_headers(client)
+    n1 = _mk_node(client, h, 5253)
+    gid = _mk_group(client, h, name="空闲一键平仓组", node_ids=[n1])["group_id"]
+    r = client.post(f"/api/groups/{gid}/close", headers=h)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "skipped"
+    assert body["targets"] == 0
+
+
+def test_manual_close_group_404(client):
+    h = auth_headers(client)
+    r = client.post("/api/groups/grp_missing/close", headers=h)
+    assert r.status_code == 404
 
 
 def test_disabled_group_receives_nothing(client):

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Optional
 
 from . import (
@@ -324,19 +325,22 @@ class GroupDispatcher:
 
     async def _close_group_subs(
         self, group: dict, signal_id: str, subtasks: list[dict],
+        *, reason: str = "close_signal",
     ) -> dict:
         """对同一分组下已筛选的子任务下发终止。"""
         group_id = group["group_id"]
         mode = group_rules.normalize_dispatch_mode(group.get("dispatch_mode"))
         if not subtasks:
-            return self._result(group, mode, 0, "skipped", "分组没有进行中的任务")
+            out = self._result(group, mode, 0, "skipped", "分组没有进行中的任务")
+            out["forced"] = 0
+            return out
 
         closing = 0
         forced = 0
         task_id = subtasks[0].get("task_id")
         for sub in subtasks:
             outcome = await self._stop_subtask(
-                sub, signal_id=signal_id, reason="close_signal",
+                sub, signal_id=signal_id, reason=reason,
             )
             if outcome["status"] == "closing":
                 closing += 1
@@ -344,19 +348,46 @@ class GroupDispatcher:
                 forced += 1
 
         if not closing:
-            return self._result(group, mode, 0, "failed",
-                                "目标节点均不在线，已强制结束子任务，待其重连后补发平仓",
-                                task_id)
+            out = self._result(
+                group, mode, 0, "failed",
+                "目标节点均不在线，已强制结束子任务，待其重连后补发平仓",
+                task_id,
+            )
+            out["forced"] = forced
+            return out
         logger.info(
             "group %s CLOSE -> %d subtask(s) closing, %d forced", group_id, closing, forced,
         )
-        return self._result(group, mode, closing, "closing", None, task_id)
+        out = self._result(group, mode, closing, "closing", None, task_id)
+        out["forced"] = forced
+        return out
 
     async def _close_group(self, group: dict, signal: TradingSignal, signal_id: str) -> dict:
         """兼容旧调用：按分组拉活动子任务后终止（手动场景仍可用）。"""
         del signal  # 品种已在上层筛过；此处只按分组收口
         subtasks = await group_persist.active_subtasks(group["group_id"])
         return await self._close_group_subs(group, signal_id, subtasks)
+
+    async def close_group(
+        self, group_id: str, *, reason: str = "manual_close_group",
+    ) -> dict:
+        """手动终止该分组全部未收口子任务：下发 strategy_stop，按魔术号平仓并结束监控。
+
+        只作用于本分组。同一节点上其它分组的任务与持仓不动（与账户级 close_all 不同）。
+        """
+        group = await self.store.get_group(group_id)
+        if not group:
+            raise ValueError("分组不存在")
+        subtasks = await group_persist.active_subtasks(group_id)
+        signal_id = f"mclose_grp_{format(int(time.time() * 1000), 'x')}"
+        outcome = await self._close_group_subs(
+            group, signal_id, subtasks, reason=reason,
+        )
+        logger.info(
+            "group %s manual close -> %s targets=%s forced=%s",
+            group_id, outcome.get("status"), outcome.get("targets"), outcome.get("forced"),
+        )
+        return outcome
 
     async def close_subtask(
         self, group_id: str, dispatch_id: int, *, reason: str = "manual_close",
