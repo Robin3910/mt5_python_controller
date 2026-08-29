@@ -265,6 +265,10 @@ async def _session(node_id: str, ws: WebSocket) -> None:
             # 只读行情探针回包（趋势面板），按 req_id 唤醒等待中的请求
             market_probe.resolve(data.get("req_id"), data)
 
+        elif mtype == "cancel_pending_result":
+            from . import limit_watch
+            limit_watch.resolve_cancel(data.get("req_id"), data)
+
         else:
             logger.debug("node %s unknown msg type=%s", node_id, mtype)
 
@@ -302,6 +306,16 @@ async def _save_account(node_id: str, ws: WebSocket, data: dict) -> None:
         node_id, snapshot.get("positions") or [], snapshot.get("orders") or [],
     )
     await manager.broadcast_admin({"type": "account", "data": snapshot})
+    asyncio.create_task(_run_limit_watch(node_id, snapshot.get("orders") or []))
+
+
+async def _run_limit_watch(node_id: str, orders: list) -> None:
+    """限价挂单监听不得挡住账户快照入库。"""
+    try:
+        from . import limit_watch
+        await limit_watch.handle_account_orders(node_id, orders)
+    except Exception:  # noqa: BLE001
+        logger.exception("limit_watch failed for node %s", node_id)
 
 
 def _magics_of(rows: list) -> set[int]:

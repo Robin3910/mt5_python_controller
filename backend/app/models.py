@@ -196,6 +196,9 @@ class GroupCreate(BaseModel):
     dispatch_mode: str = "sync"  # sync / poll
     # 趋势风控：开仓前按全局趋势参数对各节点算信号品种趋势（默认关）
     trend_risk_enabled: bool = False
+    # 限价挂单监听：仅绑定趋势策略的分组可开（默认关）；关键字默认 limit
+    limit_watch_enabled: bool = False
+    limit_watch_keyword: Optional[str] = Field(default=None, max_length=32)
     remark: Optional[str] = None
     # 一对一绑定交易策略；空 / null = 不绑定
     strategy_id: Optional[str] = Field(default=None, max_length=32)
@@ -208,6 +211,8 @@ class GroupUpdate(BaseModel):
     enabled: Optional[bool] = None
     dispatch_mode: Optional[str] = None
     trend_risk_enabled: Optional[bool] = None
+    limit_watch_enabled: Optional[bool] = None
+    limit_watch_keyword: Optional[str] = Field(default=None, max_length=32)
     remark: Optional[str] = None
     # 传入空字符串或 null 表示解除绑定；省略字段则不改
     strategy_id: Optional[str] = Field(default=None, max_length=32)
@@ -221,6 +226,8 @@ class GroupOut(BaseModel):
     enabled: bool = True
     dispatch_mode: str = "sync"
     trend_risk_enabled: bool = False
+    limit_watch_enabled: bool = False
+    limit_watch_keyword: str = "limit"
     strategy_id: Optional[str] = None
     strategy_name: Optional[str] = None
     remark: Optional[str] = None

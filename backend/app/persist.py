@@ -29,7 +29,8 @@ async def record_signal(signal_id, signal, source_ip=None, parsed_ok=True,
                         model: str = "normal") -> None:
     """落库一条信号历史。
 
-    source：信号来源，tradingview（外部 Webhook）/ manual（中控台手动触发）。
+    source：tradingview（外部 Webhook）/ manual（中控台手动触发）/
+    limit_watch（分组限价挂单监听）。
     model：处理模型，normal（按币种分发）/ strategy（按分组分发）。
     """
     payload_str = raw_payload

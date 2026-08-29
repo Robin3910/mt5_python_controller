@@ -125,6 +125,22 @@ def _migrate_node_group_trend_risk(sync_conn) -> None:
     sync_conn.execute(text(f"ALTER TABLE node_group ADD COLUMN trend_risk_enabled {col_type}"))
 
 
+def _migrate_node_group_limit_watch(sync_conn) -> None:
+    """node_group.limit_watch_enabled / limit_watch_keyword：限价挂单监听（默认关，关键字 limit）。"""
+    inspector = inspect(sync_conn)
+    if "node_group" not in inspector.get_table_names():
+        return
+    cols = {c["name"] for c in inspector.get_columns("node_group")}
+    dialect = sync_conn.engine.dialect.name
+    if "limit_watch_enabled" not in cols:
+        col_type = "TINYINT(1) NOT NULL DEFAULT 0" if dialect == "mysql" else "BOOLEAN NOT NULL DEFAULT 0"
+        sync_conn.execute(text(f"ALTER TABLE node_group ADD COLUMN limit_watch_enabled {col_type}"))
+    if "limit_watch_keyword" not in cols:
+        sync_conn.execute(
+            text("ALTER TABLE node_group ADD COLUMN limit_watch_keyword VARCHAR(32) NOT NULL DEFAULT 'limit'")
+        )
+
+
 def _migrate_group_task_strategy_columns(sync_conn) -> None:
     """为已存在的分组任务表补充策略托管所需列（create_all 不会改已存在的表）。"""
     inspector = inspect(sync_conn)
@@ -273,6 +289,7 @@ async def init_db() -> None:
         await conn.run_sync(_migrate_audit_columns)
         await conn.run_sync(_migrate_node_group_strategy_id)
         await conn.run_sync(_migrate_node_group_trend_risk)
+        await conn.run_sync(_migrate_node_group_limit_watch)
         await conn.run_sync(_migrate_group_task_strategy_columns)
         await conn.run_sync(_migrate_node_risk_json)
         await conn.run_sync(_migrate_node_trend_json)

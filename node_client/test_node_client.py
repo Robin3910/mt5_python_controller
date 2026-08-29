@@ -551,3 +551,32 @@ async def test_handle_server_login_mismatch():
         assert False, "expected LoginMismatchError"
     except nc.LoginMismatchError as e:
         assert "换号" in str(e)
+
+
+async def test_cancel_pending_removes_order():
+    n = _node()
+    await n._exec(n.mt5.connect)
+    placed = await n._exec(
+        n.mt5.place_pending_order,
+        "EURUSD", "BUY", 0.1, 1.05, 1.04, None, "open limit", None,
+    )
+    assert placed.get("success")
+    ticket = placed["order"]
+    assert n.mt5.pending_orders()
+    ws = FakeWS()
+    await n._handle(ws, {"cmd": "cancel_pending", "req_id": "c1", "ticket": ticket})
+    assert n.mt5.pending_orders() == []
+    msg = [m for m in ws.sent if m["type"] == "cancel_pending_result"][0]
+    assert msg["data"]["success"] is True
+    assert msg["data"]["req_id"] == "c1"
+    assert msg["data"]["ticket"] == ticket
+
+
+async def test_cancel_pending_missing_ticket():
+    n = _node()
+    await n._exec(n.mt5.connect)
+    ws = FakeWS()
+    await n._handle(ws, {"cmd": "cancel_pending", "req_id": "c2"})
+    msg = [m for m in ws.sent if m["type"] == "cancel_pending_result"][0]
+    assert msg["data"]["success"] is False
+    assert "订单号" in msg["data"]["error"]

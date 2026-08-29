@@ -192,6 +192,9 @@ class NodeGroup(Base):
     dispatch_mode: Mapped[str] = mapped_column(String(8), default="sync")
     # 趋势风控：开仓前按全局趋势参数对各节点算信号品种趋势，仅顺势放行（默认关）
     trend_risk_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 限价挂单监听：把节点 MT5 上手动挂的带关键字限价单转成 strategy 信号（默认关）
+    limit_watch_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    limit_watch_keyword: Mapped[str] = mapped_column(String(32), default="limit")
     # 一对一绑定 TradingStrategy；unique 保证同一策略不能挂到多个分组
     strategy_id: Mapped[str | None] = mapped_column(String(32), nullable=True, unique=True, index=True)
     remark: Mapped[str | None] = mapped_column(String(255), nullable=True)

@@ -433,7 +433,7 @@ class NodeClient:
             await self._handle(ws, msg)
 
     async def _handle(self, ws, msg: dict) -> None:
-        """按命令类型分派：open / close / market_probe / pong / watch_symbols；
+        """按命令类型分派：open / close / market_probe / cancel_pending / pong / watch_symbols；
         处理服务端登录号拒绝。"""
         mtype = msg.get("type")
         if mtype == "auth_fail":
@@ -471,6 +471,8 @@ class NodeClient:
             await self._do_strategy_start(ws, msg, resume=True)
         elif cmd == "strategy_stop":
             await self._do_strategy_stop(ws, msg)
+        elif cmd == "cancel_pending":
+            await self._do_cancel_pending(ws, msg)
         else:
             logger.debug("ignored message: %s", msg)
 
@@ -819,6 +821,35 @@ class NodeClient:
         res["detail"] = self._close_detail(msg, res)
         await ws.send(json.dumps({"type": "trade_result", "data": res}))
         logger.info("close result: %s", res)
+
+    async def _do_cancel_pending(self, ws, msg: dict) -> None:
+        """按 ticket 撤掉一张未成交挂单（供分组限价监听把触发单从盘上拿掉）。"""
+        req_id = str(msg.get("req_id") or "")
+        raw_ticket = msg.get("ticket")
+        data: dict = {"req_id": req_id, "ticket": raw_ticket, "success": False}
+        try:
+            ticket = int(raw_ticket)
+        except (TypeError, ValueError):
+            data["error"] = "缺少订单号"
+        else:
+            if ticket <= 0:
+                data["error"] = "缺少订单号"
+            else:
+                canceller = getattr(self.mt5, "cancel_order", None)
+                if canceller is None:
+                    data["error"] = "节点不支持撤销挂单"
+                else:
+                    try:
+                        res = dict(await self._exec(canceller, ticket) or {})
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("cancel pending %s failed: %s", ticket, e)
+                        data["error"] = str(e)
+                    else:
+                        data.update(res)
+                        data["ticket"] = ticket
+                        data.setdefault("success", False)
+        await ws.send(json.dumps({"type": "cancel_pending_result", "data": data}))
+        logger.info("cancel pending result: %s", data)
 
     async def _safe_market_probe(self, ws, msg: dict) -> None:
         """后台任务包装：探针异常不得变成未捕获 Task 异常。"""

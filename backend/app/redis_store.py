@@ -37,6 +37,10 @@ K_GROUP_NODE_BUSY = "group:node:busy:{}:{}"
 K_NODE_PENDING_STOP = "node:pending_stop:{}"
 K_STRATEGY = "strategy:{}"              # 策略实例缓存（JSON）
 K_STRATEGIES = "strategies"             # 所有 strategy_id 的集合
+# 限价挂单监听：按 (节点, ticket) 去重 / 锁定
+K_LIMIT_WATCH_LOCK = "limit_watch:lock:{}:{}"
+K_LIMIT_WATCH_DONE = "limit_watch:done:{}:{}"
+K_LIMIT_WATCH_REJECT = "limit_watch:reject:{}:{}"
 
 
 class RedisStore:
@@ -269,6 +273,7 @@ class RedisStore:
             "node:pending_stop:*",
             "dedup:*",
             "lock:exec:*",
+            "limit_watch:*",
         )
         deleted = 0
         seen: set[str] = set()
@@ -292,6 +297,33 @@ class RedisStore:
     async def save_group_rotation(self, group_id: str, order: list[str]) -> None:
         """持久化分组轮转顺序（领取成功后把消费节点移到队尾，重启后仍延续轮转）。"""
         await self.r.set(K_GROUP_ROTATION.format(group_id), json.dumps(order))
+
+    # ----------------- 限价挂单监听 -----------------
+    async def try_lock_limit_watch(self, node_id: str, ticket: int, ttl: int = 60) -> bool:
+        return bool(
+            await self.r.set(
+                K_LIMIT_WATCH_LOCK.format(node_id, ticket), "1", nx=True, ex=ttl,
+            )
+        )
+
+    async def release_limit_watch_lock(self, node_id: str, ticket: int) -> None:
+        await self.r.delete(K_LIMIT_WATCH_LOCK.format(node_id, ticket))
+
+    async def mark_limit_watch_done(self, node_id: str, ticket: int, ttl: int = 86400) -> None:
+        await self.r.set(K_LIMIT_WATCH_DONE.format(node_id, ticket), "1", ex=ttl)
+        await self.r.delete(K_LIMIT_WATCH_LOCK.format(node_id, ticket))
+
+    async def is_limit_watch_done(self, node_id: str, ticket: int) -> bool:
+        return bool(await self.r.get(K_LIMIT_WATCH_DONE.format(node_id, ticket)))
+
+    async def note_limit_watch_reject(
+        self, node_id: str, ticket: int, fingerprint: str, ttl: int = 300,
+    ) -> bool:
+        """同一张单同一原因只记一次。返回 True 表示这是新的拒绝（应写日志）。"""
+        key = K_LIMIT_WATCH_REJECT.format(node_id, ticket)
+        prev = await self.r.get(key)
+        await self.r.set(key, fingerprint, ex=ttl)
+        return prev != fingerprint
 
     # ----------------- 策略实例 -----------------
     async def cache_strategy(self, strategy: dict) -> None:

@@ -138,6 +138,8 @@ def test_create_group_response_shape(client):
     assert g["enabled"] is True
     assert g["dispatch_mode"] == "poll"
     assert g["trend_risk_enabled"] is False  # 趋势风控默认关闭
+    assert g["limit_watch_enabled"] is False  # 限价监听默认关闭
+    assert g["limit_watch_keyword"] == "limit"
     assert g["remark"] == "测试组"
     assert g["node_count"] == 1
     assert g["online_node_count"] == 0     # 节点尚未建立 WS 连接
@@ -1402,6 +1404,58 @@ def test_patch_group_trend_risk_enabled(client):
     assert r.status_code == 200, r.text
     assert r.json()["trend_risk_enabled"] is True
     assert client.get(f"/api/groups/{gid}", headers=h).json()["trend_risk_enabled"] is True
+
+
+def _mk_trend_strategy(client, headers, name: str = "趋势策略实例", symbol: str = "XAUUSD") -> dict:
+    from app.strategy_templates import TEMPLATE_2_ID
+    r = client.post(
+        "/api/strategies",
+        json={"template_id": TEMPLATE_2_ID, "name": name, "symbol": symbol},
+        headers=headers,
+    )
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def test_patch_group_limit_watch_only_for_trend_strategy(client):
+    h = auth_headers(client)
+    gid = _mk_group(client, h, name="非趋势监听组")["group_id"]
+    r = client.patch(f"/api/groups/{gid}", json={"limit_watch_enabled": True}, headers=h)
+    assert r.status_code == 400
+    assert "趋势策略" in r.json()["detail"]
+
+    sty = _mk_trend_strategy(client, h, name="可监听趋势")
+    gid2 = _mk_group(client, h, name="趋势监听组", strategy_id=sty["strategy_id"])["group_id"]
+    r = client.patch(
+        f"/api/groups/{gid2}",
+        json={"limit_watch_enabled": True, "limit_watch_keyword": "  SIGNAL  "},
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["limit_watch_enabled"] is True
+    assert body["limit_watch_keyword"] == "SIGNAL"
+
+    empty = client.patch(
+        f"/api/groups/{gid2}", json={"limit_watch_keyword": "  "}, headers=h,
+    )
+    assert empty.status_code == 200
+    assert empty.json()["limit_watch_keyword"] == "limit"
+
+
+def test_limit_watch_auto_off_when_unbinding_trend(client):
+    h = auth_headers(client)
+    sty = _mk_trend_strategy(client, h, name="将被换绑")
+    gid = _mk_group(client, h, name="换绑关监听", strategy_id=sty["strategy_id"])["group_id"]
+    assert client.patch(
+        f"/api/groups/{gid}", json={"limit_watch_enabled": True}, headers=h,
+    ).status_code == 200
+    other = _mk_strategy(client, h, name="模版一策略")
+    r = client.patch(
+        f"/api/groups/{gid}", json={"strategy_id": other["strategy_id"]}, headers=h,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["limit_watch_enabled"] is False
 
 
 def test_trend_risk_off_does_not_probe(client, monkeypatch):

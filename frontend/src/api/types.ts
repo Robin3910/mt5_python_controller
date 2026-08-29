@@ -353,6 +353,10 @@ export interface GroupOut {
   dispatch_mode: GroupDispatchMode
   /** 趋势风控：开仓前按全局趋势参数对各节点算信号品种趋势（默认关） */
   trend_risk_enabled: boolean
+  /** 限价挂单监听：把节点 MT5 上手动挂的带关键字限价单转成 strategy 信号（默认关） */
+  limit_watch_enabled: boolean
+  /** 订单注释包含该关键字即视为触发单；默认 limit */
+  limit_watch_keyword: string
   /** 一对一绑定的策略 ID；未绑定为 null */
   strategy_id?: string | null
   /** 绑定策略名称（展示用） */
@@ -389,6 +393,8 @@ export interface GroupCreatePayload {
   enabled?: boolean
   dispatch_mode?: GroupDispatchMode
   trend_risk_enabled?: boolean
+  limit_watch_enabled?: boolean
+  limit_watch_keyword?: string
   remark?: string | null
   /** 一对一绑定策略；空 / null = 不绑定 */
   strategy_id?: string | null
@@ -400,6 +406,8 @@ export interface GroupUpdatePayload {
   enabled?: boolean
   dispatch_mode?: GroupDispatchMode
   trend_risk_enabled?: boolean
+  limit_watch_enabled?: boolean
+  limit_watch_keyword?: string
   remark?: string | null
   /** 传入空字符串或 null 表示解除绑定 */
   strategy_id?: string | null
@@ -986,7 +994,7 @@ export interface SignalEventRecord {
   parsed_ok: boolean
   dispatch_mode: string | null
   status: string
-  /** 信号来源：tradingview（外部 Webhook）/ manual（中控台手动触发）；空按 TradingView 展示 */
+  /** 信号来源：tradingview / manual / limit_watch；空按 TradingView 展示 */
   source: string | null
   /** 处理模型：normal（按币种分发）/ strategy（按分组分发）；空按 normal 展示 */
   model: string | null

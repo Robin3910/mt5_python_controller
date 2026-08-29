@@ -76,6 +76,7 @@ function actionLabel(action: string): string {
   const m: Record<string, string> = {
     set_filters: '保存过滤规则',
     manual_signal: '手动触发信号',
+    limit_watch_signal: '限价监听触发',
     create_node: '创建节点',
     update_node: '更新节点',
     delete_node: '删除节点',
@@ -90,9 +91,11 @@ function actionLabel(action: string): string {
 }
 
 function resultTag(result: string): { cls: string; text: string } {
-  if (result === 'ok') return { cls: 'green', text: '成功' }
+  if (result === 'ok' || result === 'accepted') return { cls: 'green', text: '成功' }
   if (result === 'offline') return { cls: 'amber', text: '离线' }
   if (result === 'skipped') return { cls: '', text: '跳过' }
+  if (result === 'rejected') return { cls: 'amber', text: '拒绝' }
+  if (result === 'cancel_failed') return { cls: 'red', text: '撤单失败' }
   if (result === 'fail' || result === 'failed') return { cls: 'red', text: '失败' }
   return { cls: '', text: result }
 }

@@ -75,6 +75,7 @@ function signalTag(status: string): { cls: string; text: string } {
 // 信号来源：manual = 中控台手动触发；其余（含历史空值）按 TradingView 展示
 function sourceTag(source: string | null): { cls: string; text: string } {
   if (source === 'manual') return { cls: 'amber', text: '手动触发' }
+  if (source === 'limit_watch') return { cls: 'blue', text: '限价监听' }
   return { cls: '', text: 'TradingView' }
 }
 
@@ -138,7 +139,7 @@ watch(
   <div class="page-header">
     <div class="h1">Webhook 事件</div>
     <p class="muted" style="font-size: 13px; margin-top: 4px">
-      记录所有经 /webhook 接收的信号原始参数及各节点后续处理情况
+      记录收到的信号原始参数及处理情况（Webhook / 手动触发 / 限价监听）
     </p>
   </div>
 

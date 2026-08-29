@@ -64,6 +64,11 @@ const FIELD_HELP = {
   trend_risk:
     '开启后，开仓信号进入各节点前会按「趋势面板」全局参数计算该节点上信号品种的趋势：' +
     'BUY 仅多头放行、SELL 仅空头放行；中性、数据不足或行情读取失败一律拦截并记入子任务跳过原因。CLOSE 不受影响。默认关闭。',
+  limit_watch:
+    '仅绑定趋势策略（模版2）的分组可用，默认关闭。开启后监听组内节点 MT5 上手动挂的限价单：' +
+    '订单注释包含关键字（默认 limit）即视为触发单，参数须与「手动触发策略信号」的限价开仓规则一致（手数、止损、挂单价齐全），' +
+    '合格则撤掉该挂单并按手动触发同构发给本分组；同一节点命中多个已开监听的趋势分组时发给全部命中分组。' +
+    '策略托管单（带魔术号）不会被误撤。',
   strategy:
     '一对一绑定交易策略。每个分组最多绑定一个策略，同一策略也不能挂到多个分组。' +
     '未绑定不影响分组本身的信号分发；可稍后在编辑中补绑或换绑。',
@@ -84,6 +89,8 @@ const form = reactive({
   enabled: true,
   dispatch_mode: 'sync' as GroupDispatchMode,
   trend_risk_enabled: false,
+  limit_watch_enabled: false,
+  limit_watch_keyword: 'limit',
   strategy_id: '' as string,
   remark: '',
   node_ids: [] as string[],
@@ -112,6 +119,18 @@ function strategyLabel(s: StrategyOut): string {
   const status = s.enabled ? '' : '（已禁用）'
   return `${s.name} · ${s.symbol}${status}`
 }
+
+const formBoundStrategy = computed(() =>
+  hub.strategies.find((s) => s.strategy_id === form.strategy_id),
+)
+const formIsTrendStrategy = computed(() => formBoundStrategy.value?.template_id === 'tpl_2')
+
+watch(
+  () => form.strategy_id,
+  () => {
+    if (!formIsTrendStrategy.value) form.limit_watch_enabled = false
+  },
+)
 
 // 成员选择：已选节点按选择顺序排列（即轮询顺序），其余节点排在后面
 const memberNodes = computed<NodeOut[]>(() =>
@@ -149,6 +168,8 @@ function openCreate(): void {
     enabled: true,
     dispatch_mode: 'sync' as GroupDispatchMode,
     trend_risk_enabled: false,
+    limit_watch_enabled: false,
+    limit_watch_keyword: 'limit',
     strategy_id: '',
     remark: '',
     node_ids: [],
@@ -166,6 +187,8 @@ function openEdit(g: GroupOut): void {
     enabled: g.enabled,
     dispatch_mode: g.dispatch_mode,
     trend_risk_enabled: Boolean(g.trend_risk_enabled),
+    limit_watch_enabled: Boolean(g.limit_watch_enabled),
+    limit_watch_keyword: g.limit_watch_keyword || 'limit',
     strategy_id: g.strategy_id || '',
     remark: g.remark || '',
     node_ids: g.nodes.map((n) => n.node_id),
@@ -189,6 +212,8 @@ async function save(): Promise<void> {
       enabled: form.enabled,
       dispatch_mode: form.dispatch_mode,
       trend_risk_enabled: form.trend_risk_enabled,
+      limit_watch_enabled: formIsTrendStrategy.value ? form.limit_watch_enabled : false,
+      limit_watch_keyword: (form.limit_watch_keyword || '').trim() || 'limit',
       strategy_id: strategyId,
       remark: form.remark.trim() || null,
       node_ids: form.node_ids,
@@ -200,6 +225,9 @@ async function save(): Promise<void> {
     const summary =
       `分发模式：${DISPATCH_MODE_LABEL[form.dispatch_mode]}\n` +
       `趋势风控：${form.trend_risk_enabled ? '开启' : '关闭'}\n` +
+      (formIsTrendStrategy.value
+        ? `限价监听：${form.limit_watch_enabled ? `开启（关键字 ${form.limit_watch_keyword.trim() || 'limit'}）` : '关闭'}\n`
+        : '') +
       `绑定策略：${styName}\n` +
       `成员节点：${form.node_ids.length} 个`
     const verb = formMode.value === 'create' ? '创建' : '更新'
@@ -241,6 +269,32 @@ async function toggleTrendRisk(g: GroupOut): Promise<void> {
   await hub.updateGroup(
     g.group_id,
     { trend_risk_enabled: !g.trend_risk_enabled },
+    currentSearchOptions(),
+  )
+}
+
+function isTrendGroup(g: GroupOut): boolean {
+  const sty = g.strategy_id ? hub.strategies.find((s) => s.strategy_id === g.strategy_id) : undefined
+  return sty?.template_id === 'tpl_2'
+}
+
+async function toggleLimitWatch(g: GroupOut): Promise<void> {
+  if (!isTrendGroup(g)) {
+    await ElMessageBox.alert('限价单监听仅适用于绑定趋势策略的分组', '无法切换', {
+      type: 'warning',
+      confirmButtonText: '知道了',
+    })
+    return
+  }
+  const next = g.limit_watch_enabled ? '关闭' : '开启'
+  const keyword = g.limit_watch_keyword || 'limit'
+  const effect = g.limit_watch_enabled
+    ? '不再把组内节点 MT5 上手动挂的带关键字限价单转成策略信号'
+    : `将监听组内节点 MT5 上手动挂的限价单（注释含「${keyword}」），合格则撤单并按手动触发同构发给本分组`
+  if (!(await confirmAction(`确认${next}分组「${g.name}」的限价监听？\n\n${next}后：${effect}。`))) return
+  await hub.updateGroup(
+    g.group_id,
+    { limit_watch_enabled: !g.limit_watch_enabled },
     currentSearchOptions(),
   )
 }
@@ -795,6 +849,21 @@ async function onStrategyFormSaved(): Promise<void> {
             </button>
           </span>
         </div>
+        <div class="list-field">
+          <span class="k">限价监听</span>
+          <span class="v">
+            <button
+              v-if="isTrendGroup(g)"
+              class="btn-sm"
+              :class="g.limit_watch_enabled ? 'btn-success' : 'btn-danger'"
+              :title="FIELD_HELP.limit_watch"
+              @click="toggleLimitWatch(g)"
+            >
+              {{ g.limit_watch_enabled ? `已开启（${g.limit_watch_keyword || 'limit'}）` : '已关闭' }}
+            </button>
+            <span v-else class="muted">—</span>
+          </span>
+        </div>
         <div v-if="g.strategy_id" class="list-field">
           <span class="k">策略</span>
           <span class="v">
@@ -850,6 +919,7 @@ async function onStrategyFormSaved(): Promise<void> {
             <th>绑定策略</th>
             <th>分发模式</th>
             <th>趋势风控</th>
+            <th>限价监听</th>
             <th>策略</th>
             <th class="right">成员节点</th>
             <th class="right">有效节点</th>
@@ -883,6 +953,18 @@ async function onStrategyFormSaved(): Promise<void> {
               >
                 {{ g.trend_risk_enabled ? '开启' : '关闭' }}
               </button>
+            </td>
+            <td>
+              <button
+                v-if="isTrendGroup(g)"
+                class="btn-sm"
+                :class="g.limit_watch_enabled ? 'btn-success' : 'btn-danger'"
+                :title="FIELD_HELP.limit_watch"
+                @click="toggleLimitWatch(g)"
+              >
+                {{ g.limit_watch_enabled ? `开启（${g.limit_watch_keyword || 'limit'}）` : '关闭' }}
+              </button>
+              <span v-else class="muted">—</span>
             </td>
             <td>
               <button
@@ -924,7 +1006,7 @@ async function onStrategyFormSaved(): Promise<void> {
             </td>
           </tr>
           <tr v-if="!hub.groups.length && !loading">
-            <td colspan="12" class="muted" style="padding: 18px">
+            <td colspan="13" class="muted" style="padding: 18px">
               {{ appliedQuery ? '无匹配分组' : '暂无分组，点击右上角「新建分组」开始配置' }}
             </td>
           </tr>
@@ -985,6 +1067,26 @@ async function onStrategyFormSaved(): Promise<void> {
                 <option :value="false">关闭</option>
                 <option :value="true">开启</option>
               </select>
+            </div>
+            <div v-if="formIsTrendStrategy">
+              <FormLabel field-id="group-limit-watch" text="限价监听" :help="FIELD_HELP.limit_watch" />
+              <select id="group-limit-watch" v-model="form.limit_watch_enabled">
+                <option :value="false">关闭</option>
+                <option :value="true">开启</option>
+              </select>
+            </div>
+            <div v-if="formIsTrendStrategy">
+              <FormLabel
+                field-id="group-limit-watch-keyword"
+                text="监听关键字"
+                help="订单注释包含该关键字即视为触发单，大小写不敏感。留空则使用默认值 limit。"
+              />
+              <input
+                id="group-limit-watch-keyword"
+                v-model="form.limit_watch_keyword"
+                maxlength="32"
+                placeholder="limit"
+              />
             </div>
             <div class="span-full">
               <FormLabel field-id="group-remark" text="备注" :help="FIELD_HELP.remark" />

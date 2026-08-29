@@ -34,6 +34,8 @@ def _group_audit_snapshot(d: dict | None) -> dict | None:
         "enabled": d.get("enabled", True),
         "dispatch_mode": d.get("dispatch_mode"),
         "trend_risk_enabled": bool(d.get("trend_risk_enabled", False)),
+        "limit_watch_enabled": bool(d.get("limit_watch_enabled", False)),
+        "limit_watch_keyword": d.get("limit_watch_keyword") or "limit",
         "strategy_id": d.get("strategy_id"),
         "remark": d.get("remark"),
         "node_ids": group_rules.member_ids(d),
@@ -82,6 +84,8 @@ async def _to_group_out(
         enabled=d.get("enabled", True),
         dispatch_mode=d.get("dispatch_mode", "sync"),
         trend_risk_enabled=bool(d.get("trend_risk_enabled", False)),
+        limit_watch_enabled=bool(d.get("limit_watch_enabled", False)),
+        limit_watch_keyword=str(d.get("limit_watch_keyword") or "limit"),
         strategy_id=strategy_id,
         strategy_name=strategy_name,
         remark=d.get("remark"),
@@ -269,7 +273,7 @@ async def update_group(
     store: RedisStore = Depends(get_store),
     admin: str = Depends(get_current_admin),
 ):
-    """更新分组（名称 / 启用状态 / 分发模式 / 绑定策略 / 备注 / 成员节点）。"""
+    """更新分组（名称 / 启用状态 / 分发模式 / 趋势风控 / 限价监听 / 绑定策略 / 备注 / 成员节点）。"""
     _validate_dispatch_mode(body.dispatch_mode)
     if body.name is not None and (name := body.name.strip()):
         if await group_service.name_exists(name, exclude_group_id=group_id):

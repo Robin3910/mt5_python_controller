@@ -110,11 +110,13 @@ async def process_signal(
     dispatcher: Dispatcher,
     group_dispatcher: GroupDispatcher | None = None,
     raw_payload: str | None = None,
+    dedup_key: str | None = None,
 ) -> dict:
     """信号处理共享流程：解析 -> 校验 -> 选引擎 -> 去重 -> 分发 -> 响应。
 
-    供 `/webhook`（source=tradingview）与中控台手动触发（source=manual）复用，
-    保证两条入口的解析规则、幂等去重与分发决策完全一致。解析/校验失败抛 HTTPException。
+    供 `/webhook`（source=tradingview）、中控台手动触发（source=manual）与
+    限价挂单监听（source=limit_watch）复用，保证解析规则、幂等去重与分发决策一致。
+    解析/校验失败抛 HTTPException。
     """
     if raw_payload is None:
         raw_payload = _serialize_raw(data, data if isinstance(data, str) else "")
@@ -138,11 +140,14 @@ async def process_signal(
 
     # 9.7 幂等：在 DEDUP_WINDOW 秒内，相同(处理模型/动作/品种/手数/止盈止损)的信号视为重复；
     # 指纹带上 model 与两个定向字段，避免面向不同分组的信号互相误判为重复。
+    # dedup_key：限价监听按 ticket 加盐，避免两张同参数触发单互相吞掉。
     fp = (
         f"{model}:{signal.action}:{signal.symbol}:{signal.volume}"
         f":{signal.stop_loss}:{signal.take_profit}"
         f":{','.join(signal.template_ids)}:{','.join(signal.group_ids)}"
     )
+    if extra := (dedup_key or "").strip():
+        fp = f"{fp}:{extra}"
     if await store.seen_signal(fp):
         logger.info("duplicate signal suppressed: %s", fp)
         return {

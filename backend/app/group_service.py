@@ -15,10 +15,13 @@ from sqlalchemy import delete, select, update
 
 from .db import SessionLocal
 from .group_rules import normalize_dispatch_mode
+from .limit_watch import is_trend_strategy, normalize_keyword
 from .models import GroupCreate, GroupUpdate
 from .orm import NodeGroup, NodeGroupMember, TradingStrategy
 from .redis_store import RedisStore
 from .security import make_group_id
+
+_LIMIT_WATCH_ONLY_TREND = "限价单监听仅适用于绑定趋势策略（模版2）的分组"
 
 
 def group_row_to_dict(row: NodeGroup, members: list[NodeGroupMember]) -> dict:
@@ -30,6 +33,10 @@ def group_row_to_dict(row: NodeGroup, members: list[NodeGroupMember]) -> dict:
         "enabled": row.enabled,
         "dispatch_mode": row.dispatch_mode,
         "trend_risk_enabled": bool(getattr(row, "trend_risk_enabled", False)),
+        "limit_watch_enabled": bool(getattr(row, "limit_watch_enabled", False)),
+        "limit_watch_keyword": normalize_keyword(
+            getattr(row, "limit_watch_keyword", None),
+        ),
         "strategy_id": row.strategy_id,
         "remark": row.remark,
         "created_at": row.created_at.timestamp() if row.created_at else time.time(),
@@ -112,6 +119,32 @@ async def validate_strategy_binding(
     return None
 
 
+async def _strategy_dict(store: RedisStore, strategy_id: Optional[str]) -> Optional[dict]:
+    sid = _normalize_strategy_id(strategy_id)
+    if not sid:
+        return None
+    cached = await store.get_strategy(sid)
+    if cached:
+        return cached
+    async with SessionLocal() as s:
+        row = await s.get(TradingStrategy, sid)
+        if not row:
+            return None
+        return {"strategy_id": row.strategy_id, "template_id": row.template_id, "name": row.name}
+
+
+async def _require_trend_strategy(store: RedisStore, strategy_id: Optional[str]) -> None:
+    sty = await _strategy_dict(store, strategy_id)
+    if not is_trend_strategy(sty):
+        raise ValueError(_LIMIT_WATCH_ONLY_TREND)
+
+
+def _limit_watch_fields(payload: GroupCreate) -> tuple[bool, str]:
+    enabled = bool(payload.limit_watch_enabled)
+    keyword = normalize_keyword(payload.limit_watch_keyword)
+    return enabled, keyword
+
+
 async def _replace_members(session, group_id: str, node_ids: list[str]) -> None:
     """整体替换分组成员（传入顺序即组内轮询顺序）。"""
     await session.execute(
@@ -140,6 +173,9 @@ async def create_group(store: RedisStore, payload: GroupCreate) -> dict:
     err = await validate_strategy_binding(strategy_id)
     if err:
         raise ValueError(err)
+    watch_enabled, watch_keyword = _limit_watch_fields(payload)
+    if watch_enabled:
+        await _require_trend_strategy(store, strategy_id)
     group_id = make_group_id()
     async with SessionLocal() as s:
         s.add(
@@ -149,6 +185,8 @@ async def create_group(store: RedisStore, payload: GroupCreate) -> dict:
                 enabled=payload.enabled,
                 dispatch_mode=normalize_dispatch_mode(payload.dispatch_mode),
                 trend_risk_enabled=bool(payload.trend_risk_enabled),
+                limit_watch_enabled=watch_enabled,
+                limit_watch_keyword=watch_keyword,
                 strategy_id=strategy_id,
                 remark=(payload.remark or "").strip() or None,
             )
@@ -193,6 +231,19 @@ async def update_group(store: RedisStore, group_id: str, patch: GroupUpdate) -> 
             row.remark = patch.remark.strip() or None
         if update_strategy:
             row.strategy_id = strategy_id
+        final_sid = row.strategy_id
+        if "limit_watch_keyword" in patch.model_fields_set:
+            row.limit_watch_keyword = normalize_keyword(patch.limit_watch_keyword)
+        want_watch = bool(getattr(row, "limit_watch_enabled", False))
+        if patch.limit_watch_enabled is not None:
+            want_watch = bool(patch.limit_watch_enabled)
+        elif update_strategy:
+            sty = await _strategy_dict(store, final_sid)
+            if not is_trend_strategy(sty):
+                want_watch = False
+        if want_watch:
+            await _require_trend_strategy(store, final_sid)
+        row.limit_watch_enabled = want_watch
         if node_ids is not None:
             await _replace_members(s, group_id, node_ids)
         await s.commit()
@@ -229,7 +280,9 @@ async def clear_strategy_bindings(store: RedisStore, strategy_id: str) -> list[s
         if not affected:
             return []
         await s.execute(
-            update(NodeGroup).where(NodeGroup.strategy_id == sid).values(strategy_id=None)
+            update(NodeGroup).where(NodeGroup.strategy_id == sid).values(
+                strategy_id=None, limit_watch_enabled=False,
+            )
         )
         await s.commit()
         for gid in affected:
