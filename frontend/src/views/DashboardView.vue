@@ -1,7 +1,9 @@
 <script setup lang="ts">
-// 总览页：汇总统计 + 节点卡片（筛选/排序/分页）+ 远程平仓 + 事件流
+// 总览页：趋势观测 + 汇总统计 + 节点卡片（筛选/排序/分页）+ 远程平仓 + 事件流
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
+import HubTrendEmbed from '@/components/HubTrendEmbed.vue'
+import ManualStrategyTrigger from '@/components/ManualStrategyTrigger.vue'
 import { useHubStore } from '@/stores/hub'
 import type { AccountSnapshot, HubEvent, NodeOut, Position } from '@/api/types'
 import { confirmAction } from '@/utils/confirm'
@@ -152,12 +154,17 @@ async function closeTicket(n: NodeOut, ticket: number): Promise<void> {
 
 <template>
   <div class="dash-page">
-    <div class="page-header">
+    <div class="row between page-header">
       <div>
         <div class="h1">实时总览</div>
         <p class="muted page-desc">多节点账户净值、持仓与事件流实时监控</p>
       </div>
+      <div class="row" style="gap: 8px">
+        <ManualStrategyTrigger />
+      </div>
     </div>
+
+    <HubTrendEmbed compact class="dash-trend" />
 
     <div class="dash-summary">
       <div class="card card-pad dash-stat">

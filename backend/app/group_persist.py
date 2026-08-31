@@ -1031,10 +1031,12 @@ async def recent_group_signals(
     group_id: str, page: int = 1, page_size: int = 20,
     node_names: Optional[dict[str, str]] = None,
     status: Optional[str] = None,
+    signal_id: Optional[str] = None,
 ) -> dict:
     """分页读取某分组的信号主任务（含各节点处理明细）。
 
     status=\"active\" 时仅返回进行中主任务（pending/dispatching/running）。
+    signal_id 非空时再按信号编号精确过滤（监听日志跳转用）。
     """
     page = max(1, page)
     page_size = max(1, min(page_size, 100))
@@ -1043,6 +1045,9 @@ async def recent_group_signals(
     filters = [GroupSignalTask.group_id == group_id]
     if status == "active":
         filters.append(GroupSignalTask.status.in_(group_rules.TASK_ACTIVE))
+    sid = (signal_id or "").strip()
+    if sid:
+        filters.append(GroupSignalTask.signal_id == sid)
     try:
         async with SessionLocal() as s:
             total = (

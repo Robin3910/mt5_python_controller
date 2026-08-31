@@ -6,6 +6,7 @@ from risk_sizing import (
     Batch,
     RiskSizedConfig,
     SymbolSpec,
+    align_stop_to_tick,
     anchor_to_fill,
     batch_comment,
     batch_detail,
@@ -606,9 +607,39 @@ def test_breakeven_moves_stop_to_weighted_average():
     c = cfg(breakeven_enabled=True, breakeven_times=1.0)
     plan = plan_entries(c, direction="BUY", entry_price=2400.0, stop_loss=2397.0, spec=GOLD)
     pos = positions((0.3, 2400.0), (0.7, 2399.0))
-    move = breakeven_move(c, plan, positions=pos, price=2403.0, digits=2)
+    move = breakeven_move(c, plan, positions=pos, price=2403.0, digits=2, tick_size=0.01)
     assert move is not None
     assert move.stop_loss == pytest.approx(2399.3)
+
+
+def test_align_stop_to_tick_rounds_away_from_market():
+    assert align_stop_to_tick(77831.24, tick_size=0.1, digits=2, direction="BUY") == pytest.approx(77831.2)
+    assert align_stop_to_tick(77831.24, tick_size=0.1, digits=2, direction="SELL") == pytest.approx(77831.3)
+    assert align_stop_to_tick(2400.0, tick_size=0.01, digits=2, direction="BUY") == pytest.approx(2400.0)
+    assert align_stop_to_tick(77831.24, tick_size=0.0, digits=2, direction="SELL") == pytest.approx(77831.24)
+
+
+def test_breakeven_stop_snaps_to_tick():
+    """加权均价落到半个 tick 时，空单向上、多单向下对齐。"""
+    c = cfg(breakeven_enabled=True, breakeven_times=1.0)
+    # 0.3*2400.07 + 0.7*2399.01 = 2399.328 → digits=2 为 2399.33
+    pos = positions((0.3, 2400.07), (0.7, 2399.01), sl=2403.0)
+    sell = plan_entries(c, direction="SELL", entry_price=2400.0, stop_loss=2403.0, spec=GOLD)
+    sell_move = breakeven_move(
+        c, sell, positions=pos, price=2396.0, digits=2, tick_size=0.1,
+    )
+    assert sell_move is not None
+    assert sell_move.avg_price == pytest.approx(2399.33)
+    assert sell_move.stop_loss == pytest.approx(2399.4)
+    assert "按跳动取整" in sell_move.describe(2)
+
+    buy = plan_entries(c, direction="BUY", entry_price=2400.0, stop_loss=2397.0, spec=GOLD)
+    buy_pos = positions((0.3, 2400.07), (0.7, 2399.01), sl=2397.0)
+    buy_move = breakeven_move(
+        c, buy, positions=buy_pos, price=2403.0, digits=2, tick_size=0.1,
+    )
+    assert buy_move is not None
+    assert buy_move.stop_loss == pytest.approx(2399.3)
 
 
 def test_breakeven_times_scales_the_threshold():
@@ -697,6 +728,7 @@ def test_breakeven_description_and_detail():
     assert move is not None
     assert "保本触发" in move.describe(2)
     assert move.detail()["kind"] == "breakeven"
+    assert "按跳动取整" not in move.describe(2)
 
 
 def test_batch_comment_fits_mt5_limit():

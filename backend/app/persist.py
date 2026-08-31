@@ -15,6 +15,7 @@ from .orm import (
     GroupSignalTask,
     GroupTaskDispatch,
     GroupTaskEvent,
+    LimitWatchLog,
     SignalDispatch,
     SignalHistory,
 )
@@ -395,13 +396,157 @@ async def recent_dispatches(node_id: str, page: int = 1, page_size: int = 20) ->
         return {"items": [], "total": 0, "page": page, "page_size": page_size}
 
 
+def _clip(value: object, n: int) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value)
+    if not text:
+        return None
+    return text[:n]
+
+
+def _limit_watch_log_row(row: LimitWatchLog) -> dict:
+    return {
+        "id": row.id,
+        "ts": row.ts.timestamp() if row.ts else None,
+        "group_id": row.group_id,
+        "group_name": row.group_name,
+        "node_id": row.node_id,
+        "ticket": int(row.ticket or 0),
+        "symbol": row.symbol,
+        "action": row.action,
+        "volume": row.volume,
+        "price": row.price,
+        "sl": row.sl,
+        "tp": row.tp,
+        "comment": row.comment,
+        "event": row.event,
+        "message": row.message or "",
+        "detail": row.detail_json,
+    }
+
+
+LIMIT_WATCH_LOG_PREVIEW = 8
+
+
+async def record_limit_watch_log(
+    *,
+    group_id: str,
+    node_id: str,
+    event: str,
+    message: str,
+    group_name: Optional[str] = None,
+    ticket: int = 0,
+    symbol: Optional[str] = None,
+    action: Optional[str] = None,
+    volume: Optional[float] = None,
+    price: Optional[float] = None,
+    sl: Optional[float] = None,
+    tp: Optional[float] = None,
+    comment: Optional[str] = None,
+    detail: Optional[dict] = None,
+) -> Optional[dict]:
+    """落库一条限价监听日志；失败返回 None，不抛。"""
+    gid = str(group_id or "").strip()
+    if not gid:
+        return None
+    try:
+        async with SessionLocal() as s:
+            row = LimitWatchLog(
+                group_id=gid,
+                group_name=_clip(group_name, 64),
+                node_id=_clip(node_id, 32) or "",
+                ticket=int(ticket or 0),
+                symbol=_clip(symbol, 32),
+                action=_clip(action, 8),
+                volume=volume,
+                price=price,
+                sl=sl,
+                tp=tp,
+                comment=_clip(comment, 128),
+                event=_clip(event, 32) or "ok",
+                message=_clip(message, 512) or "",
+                detail_json=detail,
+            )
+            s.add(row)
+            await s.commit()
+            await s.refresh(row)
+            return _limit_watch_log_row(row)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("record_limit_watch_log failed: %s", e)
+        return None
+
+
+async def list_limit_watch_logs(
+    group_id: str, page: int = 1, page_size: int = 50,
+) -> dict:
+    """按分组倒序分页读取限价监听日志。"""
+    page = max(1, page)
+    page_size = max(1, min(page_size, 100))
+    offset = (page - 1) * page_size
+    gid = str(group_id or "").strip()
+    if not gid:
+        return {"items": [], "total": 0, "page": page, "page_size": page_size}
+    try:
+        async with SessionLocal() as s:
+            filt = LimitWatchLog.group_id == gid
+            total = (
+                await s.execute(select(func.count()).select_from(LimitWatchLog).where(filt))
+            ).scalar_one()
+            stmt = (
+                select(LimitWatchLog)
+                .where(filt)
+                .order_by(LimitWatchLog.id.desc())
+                .offset(offset)
+                .limit(page_size)
+            )
+            rows = (await s.execute(stmt)).scalars().all()
+            return {
+                "items": [_limit_watch_log_row(r) for r in rows],
+                "total": int(total or 0),
+                "page": page,
+                "page_size": page_size,
+            }
+    except Exception as e:  # noqa: BLE001
+        logger.warning("list_limit_watch_logs failed: %s", e)
+        return {"items": [], "total": 0, "page": page, "page_size": page_size}
+
+
+async def latest_limit_watch_logs(
+    group_ids: list[str], per_group: int = LIMIT_WATCH_LOG_PREVIEW,
+) -> dict[str, list[dict]]:
+    """每个分组最近若干条（新→旧），供分组列表预览。"""
+    ids = [str(g).strip() for g in group_ids if str(g or "").strip()]
+    per_group = max(1, min(int(per_group), 50))
+    out: dict[str, list[dict]] = {gid: [] for gid in ids}
+    if not ids:
+        return out
+    try:
+        async with SessionLocal() as s:
+            for gid in ids:
+                stmt = (
+                    select(LimitWatchLog)
+                    .where(LimitWatchLog.group_id == gid)
+                    .order_by(LimitWatchLog.id.desc())
+                    .limit(per_group)
+                )
+                rows = (await s.execute(stmt)).scalars().all()
+                out[gid] = [_limit_watch_log_row(r) for r in rows]
+        return out
+    except Exception as e:  # noqa: BLE001
+        logger.warning("latest_limit_watch_logs failed: %s", e)
+        return {gid: [] for gid in ids}
+
+
 async def purge_trade_logs() -> dict[str, int]:
     """清空全部交易日志表与记录表（配置 / 审计保留）。
 
-    删除顺序：子任务事件 → 子任务 → 分组主任务 → normal 分发明细 → 信号台账。
+    删除顺序：限价监听日志 → 子任务事件 → 子任务 → 分组主任务 →
+    normal 分发明细 → 信号台账。
     返回各表删除行数。
     """
     tables = (
+        ("limit_watch_log", LimitWatchLog),
         ("group_task_event", GroupTaskEvent),
         ("group_task_dispatch", GroupTaskDispatch),
         ("group_signal_task", GroupSignalTask),

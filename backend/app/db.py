@@ -126,7 +126,7 @@ def _migrate_node_group_trend_risk(sync_conn) -> None:
 
 
 def _migrate_node_group_limit_watch(sync_conn) -> None:
-    """node_group.limit_watch_enabled / limit_watch_keyword：限价挂单监听（默认关，关键字 limit）。"""
+    """node_group.limit_watch_enabled / limit_watch_keyword：限价挂单监听（默认关，关键字默认为 limit，允许空串）。"""
     inspector = inspect(sync_conn)
     if "node_group" not in inspector.get_table_names():
         return

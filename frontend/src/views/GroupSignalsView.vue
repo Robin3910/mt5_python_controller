@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // 分组信号页：展示某分组处理过的 strategy 主任务与各节点下发明细
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
@@ -24,6 +24,14 @@ const loadError = ref('')
 
 /** 仅看进行中主任务（URL ?status=active） */
 const activeOnly = computed(() => route.query.status === 'active')
+
+/** 监听日志跳转：URL ?signal_id= 精确定位某条主任务 */
+const focusSignalId = computed(() => {
+  const q = route.query.signal_id
+  if (typeof q === 'string') return q.trim()
+  if (Array.isArray(q) && typeof q[0] === 'string') return q[0].trim()
+  return ''
+})
 
 const signals = ref<GroupSignalTaskRecord[]>([])
 const page = ref(1)
@@ -53,17 +61,19 @@ async function loadGroup(): Promise<void> {
   if (!group.value) loadError.value = '分组不存在或已被删除'
 }
 
-async function fetchSignalsPage(): Promise<void> {
+async function fetchSignalsPage(opts?: { locate?: boolean }): Promise<void> {
   if (!group.value) {
     signals.value = []
     total.value = 0
     return
   }
+  const sid = focusSignalId.value
   const res = await hub.fetchGroupSignals(
     group.value.group_id,
     page.value,
     pageSize.value,
-    activeOnly.value ? 'active' : undefined,
+    !sid && activeOnly.value ? 'active' : undefined,
+    sid || undefined,
   )
   signals.value = res.items
   total.value = res.total
@@ -72,6 +82,21 @@ async function fetchSignalsPage(): Promise<void> {
   await Promise.all(
     nodeIds.filter((id) => !hub.accounts[id]).map((id) => hub.fetchNodeAccount(id)),
   )
+  if (sid) {
+    if (opts?.locate) {
+      for (const t of res.items) {
+        if (t.signal_id === sid) expanded.value[String(t.task_id)] = true
+      }
+      if (res.total === 0) {
+        ElMessage.warning('未找到该信号，可能已被清空')
+      } else {
+        await nextTick()
+        const el = document.querySelector(`[data-signal-id="${CSS.escape(sid)}"]`)
+        el?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+      }
+    }
+    return
+  }
   // 「仅进行中」无数据时自动切回「全部」
   if (activeOnly.value && res.total === 0) {
     setActiveFilter(false)
@@ -86,7 +111,7 @@ async function loadSignals(): Promise<void> {
   }
   loading.value = true
   try {
-    await fetchSignalsPage()
+    await fetchSignalsPage({ locate: true })
   } finally {
     loading.value = false
   }
@@ -152,6 +177,13 @@ function setActiveFilter(onlyActive: boolean): void {
   } else {
     delete query.status
   }
+  delete query.signal_id
+  router.replace({ name: 'group-signals', params: { id: groupId.value }, query })
+}
+
+function clearSignalFocus(): void {
+  const query = { ...route.query }
+  delete query.signal_id
   router.replace({ name: 'group-signals', params: { id: groupId.value }, query })
 }
 
@@ -423,45 +455,11 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
   return rows
 }
 
-function lastSundayUtc(year: number, monthIndex: number): Date {
-  const d = new Date(Date.UTC(year, monthIndex + 1, 0))
-  d.setUTCDate(d.getUTCDate() - d.getUTCDay())
-  return d
-}
-
-/** 欧洲夏令时：三月最后一个周日 01:00 UTC 起，十月最后一个周日 01:00 UTC 止。 */
-function euDstOffsetSec(at: Date): number {
-  const y = at.getUTCFullYear()
-  const start = lastSundayUtc(y, 2)
-  start.setUTCHours(1, 0, 0, 0)
-  const end = lastSundayUtc(y, 9)
-  end.setUTCHours(1, 0, 0, 0)
-  return at >= start && at < end ? 3 * 3600 : 2 * 3600
-}
-
-function nodeOffsetSec(nodeId: string | undefined): number | null {
-  if (!nodeId) return null
-  const acct = hub.accounts[nodeId]
-  const off = acct?.server_time_offset
-  if (typeof off === 'number' && Number.isFinite(off)) return off
-  const server = String(acct?.server || '')
-  // 节点尚未上报偏移时，IC Markets 仍可按 EET/EEST 对齐终端
-  if (/icmarkets/i.test(server)) return euDstOffsetSec(new Date())
-  return null
-}
-
-function taskNodeId(t: GroupSignalTaskRecord): string | undefined {
-  return t.dispatches?.[0]?.node_id
-}
-
-/** 有券商偏移时按 MT5 服务器时间显示，否则北京时间。 */
-function fmtTime(sec: number | null | undefined, nodeId?: string): string {
+/** 一律按东八区（北京时间）显示，不跟券商 MT5 钟面对齐。 */
+function fmtTime(sec: number | null | undefined): string {
   if (!sec) return '—'
-  const offset = nodeOffsetSec(nodeId)
-  const shifted = offset == null ? sec : sec + offset
-  const tz = offset == null ? 'Asia/Shanghai' : 'UTC'
   return new Intl.DateTimeFormat('en-CA', {
-    timeZone: tz,
+    timeZone: 'Asia/Shanghai',
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',
@@ -469,7 +467,7 @@ function fmtTime(sec: number | null | undefined, nodeId?: string): string {
     minute: '2-digit',
     second: '2-digit',
     hour12: false,
-  }).format(new Date(shifted * 1000)).replace(', ', ' ').replace(',', ' ')
+  }).format(new Date(sec * 1000)).replace(', ', ' ').replace(',', ' ')
 }
 
 function fmtPayload(raw: unknown): string {
@@ -611,6 +609,15 @@ watch(activeOnly, () => {
   expandedEvent.value = {}
   void loadSignals()
 })
+watch(focusSignalId, () => {
+  page.value = 1
+  expanded.value = {}
+  expandedDispatch.value = {}
+  dispatchEvents.value = {}
+  loadingDispatchEvents.value = {}
+  expandedEvent.value = {}
+  void loadSignals()
+})
 
 watch(
   autoRefresh,
@@ -636,7 +643,11 @@ onUnmounted(stopAutoRefresh)
       <div>
         <div class="h1">分组信号{{ group ? ` · ${group.name}` : '' }}</div>
         <p class="muted" style="font-size: 13px; margin-top: 4px">
-          <template v-if="group">
+          <template v-if="group && focusSignalId">
+            正在查看信号 {{ focusSignalId }}
+            <a class="node-link" style="margin-left: 8px" @click="clearSignalFocus">查看全部</a>
+          </template>
+          <template v-else-if="group">
             {{ activeOnly ? '进行中' : '全部' }}共 {{ total }} 条主任务 · 点击行展开信号明细与各节点处理过程
           </template>
           <template v-else-if="loadError">{{ loadError }}</template>
@@ -682,9 +693,14 @@ onUnmounted(stopAutoRefresh)
           </thead>
           <tbody>
             <template v-for="t in signals" :key="t.task_id">
-              <tr class="clickable" @click="toggleRow(t.task_id)">
+              <tr
+                class="clickable"
+                :class="{ 'signal-focus': focusSignalId === t.signal_id }"
+                :data-signal-id="t.signal_id"
+                @click="toggleRow(t.task_id)"
+              >
                 <td class="muted">{{ isExpanded(t.task_id) ? '▾' : '▸' }}</td>
-                <td class="muted" style="font-size: 12px">{{ fmtTime(t.created_at, taskNodeId(t)) }}</td>
+                <td class="muted" style="font-size: 12px">{{ fmtTime(t.created_at) }}</td>
                 <td>#{{ t.task_id }}</td>
                 <td>
                   <span
@@ -715,8 +731,8 @@ onUnmounted(stopAutoRefresh)
                     <div class="kv"><span class="k">下发节点数</span><span class="v">{{ t.node_count }}</span></div>
                     <div class="kv"><span class="k">累计下单</span><span class="v">{{ t.total_orders }} 笔 / {{ t.total_volume }} 手</span></div>
                     <div class="kv"><span class="k">已实现盈亏</span><span class="v">{{ t.realized_profit }}</span></div>
-                    <div class="kv"><span class="k">开仓时间</span><span class="v" style="font-size: 12px">{{ fmtTime(t.opened_at, taskNodeId(t)) }}</span></div>
-                    <div class="kv"><span class="k">完成时间</span><span class="v" style="font-size: 12px">{{ fmtTime(t.finished_at, taskNodeId(t)) }}</span></div>
+                    <div class="kv"><span class="k">开仓时间</span><span class="v" style="font-size: 12px">{{ fmtTime(t.opened_at) }}</span></div>
+                    <div class="kv"><span class="k">完成时间</span><span class="v" style="font-size: 12px">{{ fmtTime(t.finished_at) }}</span></div>
                     <div v-if="t.skip_reason" class="kv span-full">
                       <span class="k">未下发原因</span><span class="v" style="font-size: 12px">{{ t.skip_reason }}</span>
                     </div>
@@ -784,8 +800,8 @@ onUnmounted(stopAutoRefresh)
                             <td>{{ d.order ?? '—' }}</td>
                             <td class="right">{{ d.price ?? '—' }}</td>
                             <td class="muted group-break">{{ d.error || '—' }}</td>
-                            <td class="muted" style="white-space: nowrap">{{ fmtTime(d.dispatched_at, d.node_id) }}</td>
-                            <td class="muted" style="white-space: nowrap">{{ fmtTime(d.finished_at, d.node_id) }}</td>
+                            <td class="muted" style="white-space: nowrap">{{ fmtTime(d.dispatched_at) }}</td>
+                            <td class="muted" style="white-space: nowrap">{{ fmtTime(d.finished_at) }}</td>
                           </tr>
                           <tr v-if="isDispatchExpanded(d.id)" class="detail-row">
                             <td></td>
@@ -805,7 +821,7 @@ onUnmounted(stopAutoRefresh)
                                   <thead>
                                     <tr>
                                       <th style="width: 22px"></th>
-                                      <th title="与 MT5 终端服务器时间对齐；拿不到券商时区时显示北京时间">时间</th>
+                                      <th title="北京时间（东八区）">时间</th>
                                       <th>类型</th>
                                       <th>动作</th>
                                       <th class="right">手数</th>
@@ -823,7 +839,7 @@ onUnmounted(stopAutoRefresh)
                                         <td class="muted">
                                           <template v-if="ev.detail">{{ isEventExpanded(d.id, ev) ? '▾' : '▸' }}</template>
                                         </td>
-                                        <td class="muted" style="white-space: nowrap">{{ fmtTime(ev.created_at, d.node_id) }}</td>
+                                        <td class="muted" style="white-space: nowrap">{{ fmtTime(ev.created_at) }}</td>
                                         <td>
                                           <span class="tag" :class="eventTag(ev.event_type, ev.detail).cls">
                                             {{ eventTag(ev.event_type, ev.detail).text }}
@@ -873,7 +889,9 @@ onUnmounted(stopAutoRefresh)
         </table>
       </div>
       <div v-else-if="loading" class="muted" style="font-size: 13px; padding: 8px 0">加载中…</div>
-      <div v-else class="muted" style="font-size: 13px; padding: 8px 0">该分组暂无信号记录。</div>
+      <div v-else class="muted" style="font-size: 13px; padding: 8px 0">
+        {{ focusSignalId ? '未找到该信号，可能已被清空。' : '该分组暂无信号记录。' }}
+      </div>
       </div>
 
       <div v-if="total > 0" class="pagination signals-foot">
@@ -992,6 +1010,10 @@ onUnmounted(stopAutoRefresh)
 /* 多列表格保持足够最小宽度，避免状态标签被挤成竖排 */
 .group-signal-table {
   min-width: 860px;
+}
+
+.group-signal-table tr.signal-focus td {
+  background: rgba(0, 212, 170, 0.12);
 }
 
 .group-detail-table {

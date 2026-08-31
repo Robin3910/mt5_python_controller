@@ -3,17 +3,21 @@
 // 新建/编辑/删除分组、启停、维护成员节点、设置分组级分发模式；信号明细见 GroupSignalsView
 import { computed, defineAsyncComponent, onMounted, ref, reactive, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage, ElMessageBox, ElTable, ElTableColumn } from 'element-plus'
+import { vLoading } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
 import 'element-plus/es/components/message-box/style/css'
+import 'element-plus/es/components/table/style/css'
+import 'element-plus/es/components/loading/style/css'
+import 'element-plus/es/components/tooltip/style/css'
 import FormLabel from '@/components/FormLabel.vue'
+import LimitWatchLogCell from '@/components/LimitWatchLogCell.vue'
+import ManualStrategyTrigger from '@/components/ManualStrategyTrigger.vue'
 import { useHubStore } from '@/stores/hub'
 import type {
   GroupDispatchMode,
   GroupOut,
-  ManualSignalAction,
-  ManualSignalPayload,
-  ManualSignalResult,
+  LimitWatchLogOut,
   NodeOut,
   StrategyOut,
 } from '@/api/types'
@@ -66,9 +70,9 @@ const FIELD_HELP = {
     'BUY 仅多头放行、SELL 仅空头放行；中性、数据不足或行情读取失败一律拦截并记入子任务跳过原因。CLOSE 不受影响。默认关闭。',
   limit_watch:
     '仅绑定趋势策略（模版2）的分组可用，默认关闭。开启后监听组内节点 MT5 上手动挂的限价单：' +
-    '订单注释包含关键字（默认 limit）即视为触发单，参数须与「手动触发策略信号」的限价开仓规则一致（手数、止损、挂单价齐全），' +
+    '注释包含关键字即视为触发单（关键字可留空，表示不限注释）；参数须与「手动触发策略信号」的限价开仓规则一致（手数、止损、挂单价齐全），' +
     '合格则撤掉该挂单并按手动触发同构发给本分组；同一节点命中多个已开监听的趋势分组时发给全部命中分组。' +
-    '策略托管单（带魔术号）不会被误撤。',
+    '策略托管单（带魔术号）不会被误撤。留空时组内所有手工限价单都会被扫描，请谨慎。',
   strategy:
     '一对一绑定交易策略。每个分组最多绑定一个策略，同一策略也不能挂到多个分组。' +
     '未绑定不影响分组本身的信号分发；可稍后在编辑中补绑或换绑。',
@@ -188,7 +192,7 @@ function openEdit(g: GroupOut): void {
     dispatch_mode: g.dispatch_mode,
     trend_risk_enabled: Boolean(g.trend_risk_enabled),
     limit_watch_enabled: Boolean(g.limit_watch_enabled),
-    limit_watch_keyword: g.limit_watch_keyword || 'limit',
+    limit_watch_keyword: g.limit_watch_keyword ?? '',
     strategy_id: g.strategy_id || '',
     remark: g.remark || '',
     node_ids: g.nodes.map((n) => n.node_id),
@@ -213,7 +217,7 @@ async function save(): Promise<void> {
       dispatch_mode: form.dispatch_mode,
       trend_risk_enabled: form.trend_risk_enabled,
       limit_watch_enabled: formIsTrendStrategy.value ? form.limit_watch_enabled : false,
-      limit_watch_keyword: (form.limit_watch_keyword || '').trim() || 'limit',
+      limit_watch_keyword: (form.limit_watch_keyword || '').trim(),
       strategy_id: strategyId,
       remark: form.remark.trim() || null,
       node_ids: form.node_ids,
@@ -226,7 +230,7 @@ async function save(): Promise<void> {
       `分发模式：${DISPATCH_MODE_LABEL[form.dispatch_mode]}\n` +
       `趋势风控：${form.trend_risk_enabled ? '开启' : '关闭'}\n` +
       (formIsTrendStrategy.value
-        ? `限价监听：${form.limit_watch_enabled ? `开启（关键字 ${form.limit_watch_keyword.trim() || 'limit'}）` : '关闭'}\n`
+        ? `限价监听：${form.limit_watch_enabled ? `开启（${watchKeywordLabel(form.limit_watch_keyword)}）` : '关闭'}\n`
         : '') +
       `绑定策略：${styName}\n` +
       `成员节点：${form.node_ids.length} 个`
@@ -278,6 +282,167 @@ function isTrendGroup(g: GroupOut): boolean {
   return sty?.template_id === 'tpl_2'
 }
 
+function watchKeywordLabel(kw: string | null | undefined): string {
+  const text = String(kw ?? '').trim()
+  return text || '不限注释'
+}
+
+function limitWatchButtonTitle(g: GroupOut): string {
+  if (!g.limit_watch_enabled) return FIELD_HELP.limit_watch
+  return `已开启 · ${watchKeywordLabel(g.limit_watch_keyword)}`
+}
+
+const showWatchLogColumn = computed(() => hub.groups.some((g) => g.limit_watch_enabled))
+const emptyTableText = computed(() =>
+  appliedQuery.value ? '无匹配分组' : '暂无分组，点击右上角「新建分组」开始配置',
+)
+
+function asGroup(row: unknown): GroupOut {
+  return row as GroupOut
+}
+
+function watchLogsOf(g: GroupOut): LimitWatchLogOut[] {
+  return hub.limitWatchLogs[g.group_id] || g.limit_watch_logs || []
+}
+
+const watchLogGroup = ref<GroupOut | null>(null)
+const watchLogItems = ref<LimitWatchLogOut[]>([])
+const watchLogTotal = ref(0)
+const watchLogPage = ref(1)
+const watchLogPageSize = 50
+const watchLogLoading = ref(false)
+
+const expandedWatchLogId = ref<number | null>(null)
+
+function watchLogEventTag(event: string): { cls: string; text: string } {
+  const m: Record<string, { cls: string; text: string }> = {
+    ok: { cls: 'green', text: '已触发' },
+    rejected: { cls: 'red', text: '未通过' },
+    cancel_failed: { cls: 'red', text: '撤单失败' },
+    dispatch_rejected: { cls: 'amber', text: '未下发' },
+    duplicate: { cls: 'amber', text: '重复' },
+  }
+  return m[event] || { cls: '', text: event }
+}
+
+function fmtWatchTime(sec: number | null | undefined): string {
+  return sec ? new Date(sec * 1000).toLocaleString('zh-CN', { hour12: false }) : '—'
+}
+
+function fmtWatchNum(n: number | null | undefined): string {
+  if (n == null || Number.isNaN(Number(n))) return '—'
+  return String(n)
+}
+
+function watchLogNodeName(nodeId: string): string {
+  return hub.nodes.find((n) => n.node_id === nodeId)?.name || nodeId || '—'
+}
+
+function watchLogReason(row: LimitWatchLogOut): string {
+  const msg = (row.message || '').trim()
+  const idx = msg.indexOf('：')
+  if (idx >= 0) {
+    const rest = msg.slice(idx + 1).trim()
+    if (rest) return rest
+  }
+  return ''
+}
+
+function watchLogSummary(row: LimitWatchLogOut): string {
+  const reason = watchLogReason(row)
+  if (row.event === 'ok') return '挂单已转成策略信号'
+  if (row.event === 'rejected') return reason || '未通过检查，挂单仍保留'
+  if (row.event === 'cancel_failed') return reason || '没能撤掉这张挂单'
+  if (row.event === 'dispatch_rejected') return reason || '挂单已撤，信号没有发出'
+  if (row.event === 'duplicate') return '挂单已撤，相同信号刚发过，没有再发'
+  return reason || '—'
+}
+
+function watchLogSignalId(row: LimitWatchLogOut): string {
+  const sid = row.detail?.signal_id
+  if (typeof sid === 'string' && sid.trim()) return sid.trim()
+  return ''
+}
+
+function canJumpWatchLogSignal(row: LimitWatchLogOut): boolean {
+  return row.event === 'ok' && !!watchLogSignalId(row)
+}
+
+function openWatchLogSignal(row: LimitWatchLogOut, e?: Event): void {
+  e?.preventDefault()
+  e?.stopPropagation()
+  const sid = watchLogSignalId(row)
+  const gid = watchLogGroup.value?.group_id
+  if (!sid || !gid) return
+  closeWatchLogs()
+  void router.push({
+    name: 'group-signals',
+    params: { id: gid },
+    query: { signal_id: sid },
+  })
+}
+
+function toggleWatchLogRow(id: number): void {
+  expandedWatchLogId.value = expandedWatchLogId.value === id ? null : id
+}
+
+async function loadWatchLogs(): Promise<void> {
+  const g = watchLogGroup.value
+  if (!g) return
+  watchLogLoading.value = true
+  try {
+    const res = await hub.fetchLimitWatchLogs(g.group_id, watchLogPage.value, watchLogPageSize)
+    const live = hub.limitWatchLogs[g.group_id] || []
+    watchLogItems.value = watchLogPage.value === 1
+      ? hub.mergeLimitWatchLogItems(live, res.items)
+      : res.items
+    watchLogTotal.value = Math.max(res.total, watchLogItems.value.length)
+    if (res.page !== watchLogPage.value) watchLogPage.value = res.page
+  } finally {
+    watchLogLoading.value = false
+  }
+}
+
+function openWatchLogs(g: GroupOut): void {
+  watchLogGroup.value = g
+  watchLogPage.value = 1
+  expandedWatchLogId.value = null
+  void loadWatchLogs()
+}
+
+function closeWatchLogs(): void {
+  watchLogGroup.value = null
+  watchLogItems.value = []
+  watchLogTotal.value = 0
+  expandedWatchLogId.value = null
+}
+
+const watchLogTotalPages = computed(() =>
+  Math.max(1, Math.ceil(watchLogTotal.value / watchLogPageSize)),
+)
+
+function goWatchLogPage(next: number): void {
+  const p = Math.min(Math.max(1, next), watchLogTotalPages.value)
+  if (p === watchLogPage.value) return
+  watchLogPage.value = p
+  expandedWatchLogId.value = null
+  void loadWatchLogs()
+}
+
+watch(
+  () => {
+    const gid = watchLogGroup.value?.group_id
+    return gid ? hub.limitWatchLogs[gid] : undefined
+  },
+  (live) => {
+    if (!watchLogGroup.value || watchLogPage.value !== 1 || !live?.length) return
+    watchLogItems.value = hub.mergeLimitWatchLogItems(live, watchLogItems.value)
+    if (watchLogItems.value.length > watchLogTotal.value) {
+      watchLogTotal.value = watchLogItems.value.length
+    }
+  },
+)
+
 async function toggleLimitWatch(g: GroupOut): Promise<void> {
   if (!isTrendGroup(g)) {
     await ElMessageBox.alert('限价单监听仅适用于绑定趋势策略的分组', '无法切换', {
@@ -287,10 +452,10 @@ async function toggleLimitWatch(g: GroupOut): Promise<void> {
     return
   }
   const next = g.limit_watch_enabled ? '关闭' : '开启'
-  const keyword = g.limit_watch_keyword || 'limit'
+  const keywordHint = watchKeywordLabel(g.limit_watch_keyword)
   const effect = g.limit_watch_enabled
-    ? '不再把组内节点 MT5 上手动挂的带关键字限价单转成策略信号'
-    : `将监听组内节点 MT5 上手动挂的限价单（注释含「${keyword}」），合格则撤单并按手动触发同构发给本分组`
+    ? '不再把组内节点 MT5 上手动挂的限价单转成策略信号'
+    : `将监听组内节点 MT5 上手动挂的限价单（${keywordHint === '不限注释' ? '不限注释' : `注释含「${keywordHint}」`}），合格则撤单并按手动触发同构发给本分组`
   if (!(await confirmAction(`确认${next}分组「${g.name}」的限价监听？\n\n${next}后：${effect}。`))) return
   await hub.updateGroup(
     g.group_id,
@@ -361,7 +526,7 @@ const purging = ref(false)
 async function purgeTradeLogs(): Promise<void> {
   if (!(await confirmAction(
     '确认清空全部交易记录？\n\n'
-      + '将删除：信号历史、按币种分发明细、分组策略主任务 / 节点子任务 / 事件流，并清理相关运行态缓存。\n'
+      + '将删除：信号历史、按币种分发明细、分组策略主任务 / 节点子任务 / 事件流、限价监听日志，并清理相关运行态缓存。\n'
       + '分组、策略、节点配置与操作审计不受影响。\n\n'
       + '此操作不可恢复。',
     '清空交易记录',
@@ -402,352 +567,6 @@ async function purgeTradeLogs(): Promise<void> {
     ElMessage.error(err?.response?.data?.detail || err?.message || '清空失败，请稍后重试')
   } finally {
     purging.value = false
-  }
-}
-
-// ---- 手动触发策略信号 ----
-// 与 Webhook 的 model=strategy 走同一条分组分发链路，只是入口换成后台管理员操作。
-const showTrigger = ref(false)
-const triggering = ref(false)
-const triggerError = ref('')
-// 命中范围要按全部分组试算，不能用被搜索条件过滤过的列表
-const triggerGroups = ref<GroupOut[]>([])
-const loadingTriggerGroups = ref(false)
-
-const TRIGGER_HELP = {
-  symbol:
-    '信号品种。分组链路按「绑定策略的品种」匹配：只有已启用、且绑定了同品种启用策略的分组才会收到本信号。' +
-    '不同券商的后缀差异（XAUUSD / XAUUSDm / XAUUSD.pro）会自动归一化后匹配。',
-  action:
-    'BUY / SELL 触发策略托管开仓：命中分组的有效节点会收到首单参数与策略规则快照，之后由节点自主按规则加仓。' +
-    'CLOSE 是终止指令，平掉命中分组内进行中任务对应魔术号的持仓并结束节点侧监控。',
-  volume:
-    '首单手数。分组链路直接采用此手数（仅受单笔上限保护），不走节点的按币种手数策略。',
-  stop_loss:
-    '首单止损价（绝对价格），留空表示不设。\n' +
-    '策略模版2（以损定量趋势单）必填：它的手数就是由风险金额与止损距离反推的，缺止损会被拒收。',
-  take_profit: '首单止盈价（绝对价格），留空表示不设。',
-  entry_price:
-    '限价开仓的挂单价（对应 Webhook 的 limit_price 字段），留空表示不设。\n' +
-    '只有配成「限价」开仓的策略模版2 会用它：底仓与分散仓全部挂在这个价。\n' +
-    '这类策略缺了入场价会被拒收；配成「市价」的策略与其它模版忽略该字段。\n' +
-    '入场价必须落在止损价的盈利侧（多单高于止损、空单低于止损），否则挂单一成交就已越过止损。',
-  comment: '订单备注，会写入 MT5 订单的 comment 字段，便于对账。',
-  template_ids:
-    '策略模版定向（信号的 template_ids 字段）：勾选后，只有绑定了这些模版的分组才会收到本信号，' +
-    '在品种匹配之上再加一层筛选。一个都不勾表示不限制模版。',
-  group_ids:
-    '分组定向（信号的 group_ids 字段）：勾选后，只有勾中的分组会收到本信号。' +
-    '一个都不勾表示下面列出的分组全部收到。',
-}
-
-const triggerForm = reactive({
-  symbol: '',
-  action: 'BUY' as ManualSignalAction,
-  volume: 0.1 as number | null,
-  stop_loss: null as number | null,
-  take_profit: null as number | null,
-  entry_price: null as number | null,
-  comment: '',
-  template_ids: [] as string[],
-  group_ids: [] as string[],
-})
-
-const isCloseAction = computed(() => triggerForm.action === 'CLOSE')
-
-/** 品种归一化，与后端 group_rules.normalize_symbol_key 同口径 */
-function normalizeSymbolKey(symbol: string): string {
-  return (symbol || '').toUpperCase().replace(/[^A-Z0-9]/g, '')
-}
-
-/** 策略品种与信号品种是否同一标的（归一化后互为前缀即匹配） */
-function symbolMatch(strategySymbol: string, signalSymbol: string): boolean {
-  const a = normalizeSymbolKey(strategySymbol)
-  const b = normalizeSymbolKey(signalSymbol)
-  if (!a || !b) return false
-  return a.startsWith(b) || b.startsWith(a)
-}
-
-function strategyOf(g: GroupOut): StrategyOut | undefined {
-  return g.strategy_id ? hub.strategies.find((s) => s.strategy_id === g.strategy_id) : undefined
-}
-
-function groupStrategyLabel(g: GroupOut): string {
-  const sty = strategyOf(g)
-  return sty ? strategyLabel(sty) : '未绑定'
-}
-
-/** 已绑定到分组的策略品种（去重），供品种快捷选择 */
-const triggerSymbolOptions = computed<string[]>(() => {
-  const out: string[] = []
-  for (const g of triggerGroups.value) {
-    const symbol = strategyOf(g)?.symbol
-    if (symbol && !out.includes(symbol)) out.push(symbol)
-  }
-  return out
-})
-
-/** 分组已绑定策略用到的模版（去重），供模版定向勾选 */
-const triggerTemplateOptions = computed<Array<{ id: string; name: string }>>(() => {
-  const out: Array<{ id: string; name: string }> = []
-  for (const g of triggerGroups.value) {
-    const sty = strategyOf(g)
-    if (sty && !out.some((t) => t.id === sty.template_id)) {
-      out.push({ id: sty.template_id, name: sty.template_name })
-    }
-  }
-  return out
-})
-
-function toggleTriggerTemplate(templateId: string, checked: boolean): void {
-  const kept = triggerForm.template_ids.filter((id) => id !== templateId)
-  triggerForm.template_ids = checked ? [...kept, templateId] : kept
-}
-
-/** 候选分组：与后端 GroupDispatcher._candidate_groups 的入选条件同口径（尚未按分组定向收窄） */
-const candidateGroups = computed<GroupOut[]>(() => {
-  const symbol = triggerForm.symbol.trim()
-  if (!symbol) return []
-  const templates = triggerForm.template_ids
-  return triggerGroups.value.filter((g) => {
-    if (!g.enabled) return false
-    const sty = strategyOf(g)
-    if (!sty || !sty.enabled || !symbolMatch(sty.symbol, symbol)) return false
-    return !templates.length || templates.includes(sty.template_id)
-  })
-})
-
-/** 实际命中分组：候选分组再按分组定向收窄；一个都没勾表示候选分组全收 */
-const matchedGroups = computed<GroupOut[]>(() => {
-  const picked = triggerForm.group_ids
-  if (!picked.length) return candidateGroups.value
-  return candidateGroups.value.filter((g) => picked.includes(g.group_id))
-})
-
-function toggleTriggerGroup(groupId: string, checked: boolean): void {
-  const kept = triggerForm.group_ids.filter((id) => id !== groupId)
-  triggerForm.group_ids = checked ? [...kept, groupId] : kept
-}
-
-// 改品种 / 改模版定向会换掉候选分组，勾选里的失效 ID 必须同步剔除，
-// 否则提交时带着一批已不在候选内的 ID，后端会把整条信号判成无匹配分组。
-watch(candidateGroups, (list) => {
-  if (!triggerForm.group_ids.length) return
-  const ids = new Set(list.map((g) => g.group_id))
-  const kept = triggerForm.group_ids.filter((id) => ids.has(id))
-  if (kept.length !== triggerForm.group_ids.length) triggerForm.group_ids = kept
-})
-
-/** 命中分组里当前具备有效节点的数量（有效节点为 0 时信号会被记为未下发） */
-const readyGroupCount = computed(
-  () => matchedGroups.value.filter((g) => g.online_node_count > 0).length,
-)
-
-async function openTrigger(): Promise<void> {
-  triggerError.value = ''
-  Object.assign(triggerForm, {
-    symbol: '',
-    action: 'BUY' as ManualSignalAction,
-    volume: 0.1,
-    stop_loss: null,
-    take_profit: null,
-    entry_price: null,
-    comment: '',
-    template_ids: [] as string[],
-    group_ids: [] as string[],
-  })
-  triggerGroups.value = []
-  showTrigger.value = true
-  loadingTriggerGroups.value = true
-  try {
-    const [groups] = await Promise.all([hub.listGroups(), hub.fetchStrategies()])
-    triggerGroups.value = groups
-  } catch {
-    // 读不到分组时预览会显示成「无匹配」，这里说明清楚，避免被误当成真实结果
-    triggerError.value = '读取分组失败，命中范围暂时无法预演；请关闭弹窗后重试'
-    return
-  } finally {
-    loadingTriggerGroups.value = false
-  }
-  // 只有一个可选品种时直接填上，省一次输入
-  const options = triggerSymbolOptions.value
-  if (options.length === 1) triggerForm.symbol = options[0]
-}
-
-function buildTriggerPayload(symbol: string): ManualSignalPayload {
-  const payload: ManualSignalPayload = { symbol, action: triggerForm.action, model: 'strategy' }
-  // 两个定向字段对 CLOSE 同样生效（只终止被点名分组内的任务），所以放在 CLOSE 早返回之前
-  if (triggerForm.template_ids.length) payload.template_ids = [...triggerForm.template_ids]
-  if (triggerForm.group_ids.length) payload.group_ids = [...triggerForm.group_ids]
-  if (isCloseAction.value) return payload
-  payload.volume = Number(triggerForm.volume)
-  if (triggerForm.stop_loss) payload.stop_loss = triggerForm.stop_loss
-  if (triggerForm.take_profit) payload.take_profit = triggerForm.take_profit
-  if (triggerForm.entry_price) payload.entry_price = triggerForm.entry_price
-  const comment = triggerForm.comment.trim()
-  if (comment) payload.comment = comment
-  return payload
-}
-
-/** 与后端 console_api._build_signal_payload / Webhook 解析同构的信号体 */
-function buildWebhookSignalPayload(payload: ManualSignalPayload): Record<string, unknown> {
-  const data: Record<string, unknown> = {
-    action: payload.action,
-    symbol: payload.symbol,
-    model: payload.model ?? 'strategy',
-  }
-  if (payload.template_ids?.length) data.template_ids = [...payload.template_ids]
-  if (payload.group_ids?.length) data.group_ids = [...payload.group_ids]
-  if (payload.volume != null) data.volume = payload.volume
-  if (payload.stop_loss) data.sl = payload.stop_loss
-  if (payload.take_profit) data.tp = payload.take_profit
-  if (payload.entry_price) data.limit_price = payload.entry_price
-  if (payload.comment) data.comment = payload.comment
-  return data
-}
-
-function triggerSummary(payload: ManualSignalPayload): string {
-  const hit = matchedGroups.value
-  const groupText = hit.length
-    ? hit.map((g) => `· ${g.name}（有效节点 ${g.online_node_count}）`).join('\n')
-    : '· 无（当前没有匹配的分组，信号将被拒收）'
-  const lines = [`品种：${payload.symbol}`, `动作：${payload.action}`]
-  if (payload.template_ids?.length) {
-    const names = payload.template_ids.map(
-      (id) => triggerTemplateOptions.value.find((t) => t.id === id)?.name || id,
-    )
-    lines.push(`模版定向：${names.join('、')}`)
-  }
-  if (payload.group_ids?.length) {
-    lines.push(`分组定向：只发给勾选的 ${payload.group_ids.length} 个分组`)
-  }
-  if (isCloseAction.value) {
-    lines.push('说明：平掉命中分组内进行中任务的持仓并结束策略监控')
-  } else {
-    lines.push(`手数：${payload.volume}`)
-    lines.push(`止损：${payload.stop_loss ?? '不设'}　止盈：${payload.take_profit ?? '不设'}`)
-    if (payload.entry_price) lines.push(`入场价：${payload.entry_price}（限价开仓用）`)
-    if (payload.comment) lines.push(`备注：${payload.comment}`)
-  }
-  return `${lines.join('\n')}\n\n预计命中分组：\n${groupText}`
-}
-
-const showTriggerConfirm = ref(false)
-const pendingTriggerPayload = ref<ManualSignalPayload | null>(null)
-const triggerCopyTip = ref('')
-const triggerPayloadExpanded = ref(false)
-
-const pendingTriggerPayloadJson = computed(() => {
-  if (!pendingTriggerPayload.value) return ''
-  return JSON.stringify(buildWebhookSignalPayload(pendingTriggerPayload.value), null, 2)
-})
-
-async function copyPendingTriggerPayload(): Promise<void> {
-  const text = pendingTriggerPayloadJson.value
-  if (!text) return
-  try {
-    await navigator.clipboard.writeText(text)
-    triggerCopyTip.value = '已复制'
-    window.setTimeout(() => {
-      triggerCopyTip.value = ''
-    }, 2000)
-  } catch {
-    triggerCopyTip.value = '复制失败'
-  }
-}
-
-function cancelTriggerConfirm(): void {
-  showTriggerConfirm.value = false
-  pendingTriggerPayload.value = null
-  triggerCopyTip.value = ''
-  triggerPayloadExpanded.value = false
-}
-
-/** 展示触发结果；返回 true 表示这次触发已经收口，可以关闭弹窗 */
-function reportTriggerResult(payload: ManualSignalPayload, res: ManualSignalResult): boolean {
-  const head = `${payload.action} ${payload.symbol}`
-  if (res.status === 'accepted') {
-    const groups = res.groups ?? 0
-    const targets = res.targets ?? 0
-    if (payload.action === 'CLOSE') {
-      if (targets > 0) {
-        ElMessage.success(`已下发终止指令：命中 ${groups} 个分组，${targets} 个节点任务开始平仓`)
-      } else {
-        ElMessage.warning(`命中 ${groups} 个分组，但没有进行中的策略任务需要终止`)
-      }
-      return true
-    }
-    const detail = `命中 ${groups} 个分组，${targets} 个节点收到下发`
-    if (targets > 0) {
-      ElMessage.success(`已触发 ${head}：${detail}`)
-    } else {
-      ElMessage.warning(`${head} 已受理但未下发：${detail}（${acceptedButNotDispatchedHint(res)}）`)
-    }
-    return true
-  }
-  if (res.status === 'duplicate') {
-    ElMessage.warning(`重复信号被抑制：5 秒内已有相同参数的 ${head} 策略信号`)
-    return true
-  }
-  if (res.status === 'rejected') {
-    triggerError.value = res.reason || '信号被拒收'
-    ElMessage.warning(`已拒收：${triggerError.value}`)
-    return false
-  }
-  ElMessage.info(`已提交：${res.status}`)
-  return true
-}
-
-/** accepted 但 targets=0 时，用各分组真实未下发原因，避免把趋势拦截说成节点忙 */
-function acceptedButNotDispatchedHint(res: ManualSignalResult): string {
-  const reasons = [
-    ...new Set(
-      (res.tasks || [])
-        .map((t) => (t.reason || '').trim())
-        .filter(Boolean),
-    ),
-  ]
-  if (reasons.length) return reasons.join('；')
-  return '分组无有效节点，或未能下发到任何节点'
-}
-
-async function submitTrigger(): Promise<void> {
-  const symbol = triggerForm.symbol.trim().toUpperCase()
-  if (!symbol) {
-    triggerError.value = '请填写信号品种'
-    return
-  }
-  if (!isCloseAction.value && !(Number(triggerForm.volume) > 0)) {
-    triggerError.value = '开仓信号必须填写大于 0 的手数'
-    return
-  }
-  pendingTriggerPayload.value = buildTriggerPayload(symbol)
-  triggerCopyTip.value = ''
-  triggerPayloadExpanded.value = false
-  showTriggerConfirm.value = true
-}
-
-async function confirmSubmitTrigger(): Promise<void> {
-  const payload = pendingTriggerPayload.value
-  if (!payload) return
-  showTriggerConfirm.value = false
-
-  triggering.value = true
-  triggerError.value = ''
-  try {
-    const res = await hub.triggerManualSignal(payload)
-    const done = reportTriggerResult(payload, res)
-    // 只有真正受理才会新增主任务，列表的信号计数需要重取
-    if (res.status === 'accepted') await loadGroups()
-    if (done) showTrigger.value = false
-  } catch (e: unknown) {
-    const err = e as { response?: { data?: { detail?: string } }; message?: string }
-    triggerError.value = err?.response?.data?.detail || err?.message || '触发失败，请稍后重试'
-    ElMessage.error(`触发失败：${triggerError.value}`)
-  } finally {
-    triggering.value = false
-    pendingTriggerPayload.value = null
-    triggerPayloadExpanded.value = false
   }
 }
 
@@ -792,7 +611,7 @@ async function onStrategyFormSaved(): Promise<void> {
       </div>
       <div class="row" style="gap: 8px">
         <button class="btn-ghost" @click="router.push('/strategies')">策略管理</button>
-        <button class="btn-ghost" @click="openTrigger">手动触发信号</button>
+        <ManualStrategyTrigger @accepted="loadGroups" />
         <button class="btn-danger" :disabled="purging" @click="purgeTradeLogs">
           {{ purging ? '清空中…' : '清空交易记录' }}
         </button>
@@ -856,12 +675,18 @@ async function onStrategyFormSaved(): Promise<void> {
               v-if="isTrendGroup(g)"
               class="btn-sm"
               :class="g.limit_watch_enabled ? 'btn-success' : 'btn-danger'"
-              :title="FIELD_HELP.limit_watch"
+              :title="limitWatchButtonTitle(g)"
               @click="toggleLimitWatch(g)"
             >
-              {{ g.limit_watch_enabled ? `已开启（${g.limit_watch_keyword || 'limit'}）` : '已关闭' }}
+              {{ g.limit_watch_enabled ? '已开启' : '已关闭' }}
             </button>
             <span v-else class="muted">—</span>
+          </span>
+        </div>
+        <div v-if="g.limit_watch_enabled" class="list-field list-field-block">
+          <span class="k">监听日志</span>
+          <span class="v">
+            <LimitWatchLogCell :logs="watchLogsOf(g)" @open="openWatchLogs(g)" />
           </span>
         </div>
         <div v-if="g.strategy_id" class="list-field">
@@ -870,14 +695,14 @@ async function onStrategyFormSaved(): Promise<void> {
             <button class="btn-sm btn-success" @click="openGroupStrategyEdit(g)">编辑策略</button>
           </span>
         </div>
-        <div class="list-field"><span class="k">成员节点</span><span class="v">{{ g.node_count }}</span></div>
-        <div class="list-field"><span class="k">有效节点</span><span class="v">{{ g.online_node_count }}</span></div>
         <div class="list-field">
           <span class="k">信号</span>
           <span class="v">
             <button class="btn-sm btn-success" @click="openSignals(g)">{{ g.signal_count }} 条</button>
           </span>
         </div>
+        <div class="list-field"><span class="k">成员节点</span><span class="v">{{ g.node_count }}</span></div>
+        <div class="list-field"><span class="k">有效节点</span><span class="v">{{ g.online_node_count }}</span></div>
         <div class="list-field">
           <span class="k">进行中</span>
           <span class="v">
@@ -911,107 +736,364 @@ async function onStrategyFormSaved(): Promise<void> {
     </div>
 
     <!-- 桌面端表格 -->
-    <div class="card table-scroll desktop-only">
-      <table>
-        <thead>
-          <tr>
-            <th>名称</th>
-            <th>绑定策略</th>
-            <th>分发模式</th>
-            <th>趋势风控</th>
-            <th>限价监听</th>
-            <th>策略</th>
-            <th class="right">成员节点</th>
-            <th class="right">有效节点</th>
-            <th class="right">信号</th>
-            <th class="right">进行中</th>
-            <th>备注</th>
-            <th>启用</th>
-            <th class="right">操作</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="g in hub.groups" :key="g.group_id">
-            <td>
-              {{ g.name }}
-              <div class="muted" style="font-size: 11px">{{ g.group_id }}</div>
-            </td>
-            <td>
-              <template v-if="g.strategy_name">
-                {{ g.strategy_name }}
-                <div v-if="g.strategy_id" class="muted" style="font-size: 11px">{{ g.strategy_id }}</div>
-              </template>
-              <span v-else class="muted">未绑定</span>
-            </td>
-            <td><span class="tag blue">{{ DISPATCH_MODE_LABEL[g.dispatch_mode] }}</span></td>
-            <td>
-              <button
-                class="btn-sm"
-                :class="g.trend_risk_enabled ? 'btn-success' : 'btn-danger'"
-                :title="FIELD_HELP.trend_risk"
-                @click="toggleTrendRisk(g)"
-              >
-                {{ g.trend_risk_enabled ? '开启' : '关闭' }}
-              </button>
-            </td>
-            <td>
-              <button
-                v-if="isTrendGroup(g)"
-                class="btn-sm"
-                :class="g.limit_watch_enabled ? 'btn-success' : 'btn-danger'"
-                :title="FIELD_HELP.limit_watch"
-                @click="toggleLimitWatch(g)"
-              >
-                {{ g.limit_watch_enabled ? `开启（${g.limit_watch_keyword || 'limit'}）` : '关闭' }}
-              </button>
-              <span v-else class="muted">—</span>
-            </td>
-            <td>
-              <button
-                v-if="g.strategy_id"
-                class="btn-sm btn-success"
-                @click="openGroupStrategyEdit(g)"
-              >编辑策略</button>
-              <span v-else class="muted">—</span>
-            </td>
-            <td class="right">{{ g.node_count }}</td>
-            <td class="right" :class="g.online_node_count ? '' : 'muted'">{{ g.online_node_count }}</td>
-            <td class="right">
-              <button class="btn-sm btn-success" @click="openSignals(g)">{{ g.signal_count }} 条</button>
-            </td>
-            <td class="right">
-              <button
-                v-if="g.active_task_count > 0"
-                class="btn-sm btn-success"
-                @click="openActiveSignals(g)"
-              >{{ g.active_task_count }} 条</button>
-              <span v-else class="muted">—</span>
-            </td>
-            <td class="muted" style="font-size: 12px">{{ g.remark || '—' }}</td>
-            <td>
-              <button class="btn-sm" :class="g.enabled ? 'btn-success' : 'btn-danger'" @click="toggleEnabled(g)">
-                {{ g.enabled ? '已启用' : '已禁用' }}
-              </button>
-            </td>
-            <td class="right nowrap">
+    <div class="card groups-table-card desktop-only">
+      <el-table
+        :key="showWatchLogColumn ? 'watch' : 'plain'"
+        :data="hub.groups"
+        row-key="group_id"
+        size="small"
+        class="groups-table"
+        v-loading="loading"
+        :empty-text="emptyTableText"
+        style="width: 100%"
+      >
+        <el-table-column label="名称" min-width="150">
+          <template #default="{ row }">
+            {{ asGroup(row).name }}
+            <div class="muted" style="font-size: 11px">{{ asGroup(row).group_id }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="绑定策略" min-width="140">
+          <template #default="{ row }">
+            <template v-if="asGroup(row).strategy_name">
+              {{ asGroup(row).strategy_name }}
+              <div v-if="asGroup(row).strategy_id" class="muted" style="font-size: 11px">{{ asGroup(row).strategy_id }}</div>
+            </template>
+            <span v-else class="muted">未绑定</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="分发模式" min-width="160">
+          <template #default="{ row }">
+            <span class="tag blue">{{ DISPATCH_MODE_LABEL[asGroup(row).dispatch_mode] }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="趋势风控" width="88">
+          <template #default="{ row }">
+            <button
+              class="btn-sm"
+              :class="asGroup(row).trend_risk_enabled ? 'btn-success' : 'btn-danger'"
+              :title="FIELD_HELP.trend_risk"
+              @click="toggleTrendRisk(asGroup(row))"
+            >
+              {{ asGroup(row).trend_risk_enabled ? '开启' : '关闭' }}
+            </button>
+          </template>
+        </el-table-column>
+        <el-table-column label="限价监听" width="88">
+          <template #default="{ row }">
+            <button
+              v-if="isTrendGroup(asGroup(row))"
+              class="btn-sm"
+              :class="asGroup(row).limit_watch_enabled ? 'btn-success' : 'btn-danger'"
+              :title="limitWatchButtonTitle(asGroup(row))"
+              @click="toggleLimitWatch(asGroup(row))"
+            >
+              {{ asGroup(row).limit_watch_enabled ? '开启' : '关闭' }}
+            </button>
+            <span v-else class="muted">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column
+          v-if="showWatchLogColumn"
+          label="监听日志"
+          width="100"
+          align="right"
+        >
+          <template #default="{ row }">
+            <LimitWatchLogCell
+              v-if="asGroup(row).limit_watch_enabled"
+              :logs="watchLogsOf(asGroup(row))"
+              @open="openWatchLogs(asGroup(row))"
+            />
+            <span v-else class="muted">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="策略" min-width="110">
+          <template #default="{ row }">
+            <button
+              v-if="asGroup(row).strategy_id"
+              class="btn-sm btn-success"
+              @click="openGroupStrategyEdit(asGroup(row))"
+            >编辑策略</button>
+            <span v-else class="muted">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="信号" width="92" align="right">
+          <template #default="{ row }">
+            <button class="btn-sm btn-success" @click="openSignals(asGroup(row))">{{ asGroup(row).signal_count }} 条</button>
+          </template>
+        </el-table-column>
+        <el-table-column label="成员节点" width="92" align="right">
+          <template #default="{ row }">{{ asGroup(row).node_count }}</template>
+        </el-table-column>
+        <el-table-column label="有效节点" width="92" align="right">
+          <template #default="{ row }">
+            <span :class="asGroup(row).online_node_count ? '' : 'muted'">{{ asGroup(row).online_node_count }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="进行中" width="92" align="right">
+          <template #default="{ row }">
+            <button
+              v-if="asGroup(row).active_task_count > 0"
+              class="btn-sm btn-success"
+              @click="openActiveSignals(asGroup(row))"
+            >{{ asGroup(row).active_task_count }} 条</button>
+            <span v-else class="muted">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="备注" min-width="120" show-overflow-tooltip>
+          <template #default="{ row }">
+            <span class="muted" style="font-size: 12px">{{ asGroup(row).remark || '—' }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="启用" width="108">
+          <template #default="{ row }">
+            <button
+              class="btn-sm"
+              :class="asGroup(row).enabled ? 'btn-success' : 'btn-danger'"
+              @click="toggleEnabled(asGroup(row))"
+            >
+              {{ asGroup(row).enabled ? '已启用' : '已禁用' }}
+            </button>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="220" fixed="right" align="right">
+          <template #default="{ row }">
+            <div class="nowrap">
               <button
                 class="btn-sm btn-danger"
-                :disabled="!!closingGroupIds[g.group_id]"
-                @click="closeGroup(g)"
+                :disabled="!!closingGroupIds[asGroup(row).group_id]"
+                @click="closeGroup(asGroup(row))"
               >
-                {{ closingGroupIds[g.group_id] ? '下发中…' : '平仓' }}
+                {{ closingGroupIds[asGroup(row).group_id] ? '下发中…' : '平仓' }}
               </button>
-              <button class="btn-sm btn-ghost" @click="openEdit(g)">编辑</button>
-              <button class="btn-sm btn-danger" @click="remove(g)">删除</button>
-            </td>
-          </tr>
-          <tr v-if="!hub.groups.length && !loading">
-            <td colspan="13" class="muted" style="padding: 18px">
-              {{ appliedQuery ? '无匹配分组' : '暂无分组，点击右上角「新建分组」开始配置' }}
-            </td>
-          </tr>
-        </tbody>
-      </table>
+              <button class="btn-sm btn-ghost" @click="openEdit(asGroup(row))">编辑</button>
+              <button class="btn-sm btn-danger" @click="remove(asGroup(row))">删除</button>
+            </div>
+          </template>
+        </el-table-column>
+      </el-table>
+    </div>
+
+    <!-- 限价监听日志 -->
+    <div v-if="watchLogGroup" class="modal-mask" @click.self="closeWatchLogs">
+      <div class="card card-pad modal modal-lg watch-log-modal">
+        <div class="modal-header">
+          <div class="h1">监听日志 · {{ watchLogGroup.name }}</div>
+          <p class="muted" style="font-size: 12px; margin: 4px 0 0">
+            节点挂上符合监听条件的限价单后，这里记下处理结果。点一行可看细节；「挂单已转成策略信号」可点进对应主任务。
+          </p>
+        </div>
+        <div class="modal-body">
+          <p v-if="watchLogLoading && !watchLogItems.length" class="muted">加载中…</p>
+          <p v-else-if="!watchLogItems.length" class="muted">暂无监听记录</p>
+          <template v-else>
+            <p class="muted" style="font-size: 12px; margin: 0 0 8px">点击行查看细节；「挂单已转成策略信号」可跳到对应信号</p>
+            <div class="list-cards mobile-only">
+              <div
+                v-for="row in watchLogItems"
+                :key="row.id"
+                class="list-card card clickable"
+                @click="toggleWatchLogRow(row.id)"
+              >
+                <div class="list-card-head row between">
+                  <span class="tag" :class="watchLogEventTag(row.event).cls">
+                    {{ watchLogEventTag(row.event).text }}
+                  </span>
+                  <span class="muted" style="font-size: 12px">
+                    {{ expandedWatchLogId === row.id ? '▾' : '▸' }}
+                    {{ fmtWatchTime(row.ts) }}
+                  </span>
+                </div>
+                <div class="list-field">
+                  <span class="k">品种</span>
+                  <span class="v">{{ row.symbol || '—' }}</span>
+                </div>
+                <div class="list-field">
+                  <span class="k">方向</span>
+                  <span class="v">
+                    <span
+                      v-if="row.action"
+                      class="tag"
+                      :class="row.action === 'BUY' ? 'green' : row.action === 'SELL' ? 'blue' : ''"
+                    >{{ row.action }}</span>
+                    <span v-else class="muted">—</span>
+                  </span>
+                </div>
+                <div class="list-field">
+                  <span class="k">手数</span>
+                  <span class="v">{{ fmtWatchNum(row.volume) }}</span>
+                </div>
+                <div class="list-field">
+                  <span class="k">挂单价</span>
+                  <span class="v">{{ fmtWatchNum(row.price) }}</span>
+                </div>
+                <div class="list-field">
+                  <span class="k">说明</span>
+                  <button
+                    v-if="canJumpWatchLogSignal(row)"
+                    type="button"
+                    class="node-link watch-log-signal-link"
+                    title="查看对应信号"
+                    @click="openWatchLogSignal(row, $event)"
+                  >{{ watchLogSummary(row) }}</button>
+                  <span v-else class="v muted" style="font-size: 12px; font-weight: 500">{{ watchLogSummary(row) }}</span>
+                </div>
+                <div v-if="expandedWatchLogId === row.id" class="list-card-detail">
+                  <div class="list-field">
+                    <span class="k">节点</span>
+                    <span class="v">{{ watchLogNodeName(row.node_id) }}</span>
+                  </div>
+                  <div class="list-field">
+                    <span class="k">挂单号</span>
+                    <span class="v">{{ row.ticket || '—' }}</span>
+                  </div>
+                  <div class="list-field">
+                    <span class="k">止损价</span>
+                    <span class="v">{{ fmtWatchNum(row.sl) }}</span>
+                  </div>
+                  <div class="list-field">
+                    <span class="k">止盈价</span>
+                    <span class="v">{{ fmtWatchNum(row.tp) }}</span>
+                  </div>
+                  <div class="list-field">
+                    <span class="k">订单备注</span>
+                    <span class="v">{{ row.comment || '—' }}</span>
+                  </div>
+                  <div v-if="watchLogReason(row)" class="list-field">
+                    <span class="k">原因</span>
+                    <span class="v">{{ watchLogReason(row) }}</span>
+                  </div>
+                  <div v-if="watchLogSignalId(row)" class="list-field">
+                    <span class="k">信号编号</span>
+                    <button
+                      type="button"
+                      class="node-link watch-log-signal-link"
+                      title="查看对应信号"
+                      @click="openWatchLogSignal(row, $event)"
+                    >{{ watchLogSignalId(row) }}</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="watch-log-table-wrap desktop-only">
+              <table class="watch-log-table">
+                <thead>
+                  <tr>
+                    <th class="col-expand"></th>
+                    <th>时间</th>
+                    <th>结果</th>
+                    <th>品种</th>
+                    <th>方向</th>
+                    <th class="right">手数</th>
+                    <th class="right">挂单价</th>
+                    <th>说明</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template v-for="row in watchLogItems" :key="row.id">
+                    <tr class="clickable" @click="toggleWatchLogRow(row.id)">
+                      <td class="muted col-expand">{{ expandedWatchLogId === row.id ? '▾' : '▸' }}</td>
+                      <td class="muted col-time">{{ fmtWatchTime(row.ts) }}</td>
+                      <td>
+                        <span class="tag" :class="watchLogEventTag(row.event).cls">
+                          {{ watchLogEventTag(row.event).text }}
+                        </span>
+                      </td>
+                      <td>{{ row.symbol || '—' }}</td>
+                      <td>
+                        <span
+                          v-if="row.action"
+                          class="tag"
+                          :class="row.action === 'BUY' ? 'green' : row.action === 'SELL' ? 'blue' : ''"
+                        >{{ row.action }}</span>
+                        <span v-else class="muted">—</span>
+                      </td>
+                      <td class="right">{{ fmtWatchNum(row.volume) }}</td>
+                      <td class="right">{{ fmtWatchNum(row.price) }}</td>
+                      <td
+                        :class="{ 'watch-log-jump': canJumpWatchLogSignal(row) }"
+                        @click="canJumpWatchLogSignal(row) ? openWatchLogSignal(row, $event) : undefined"
+                      >
+                        <button
+                          v-if="canJumpWatchLogSignal(row)"
+                          type="button"
+                          class="node-link watch-log-signal-link"
+                          title="查看对应信号"
+                          @click="openWatchLogSignal(row, $event)"
+                        >{{ watchLogSummary(row) }}</button>
+                        <template v-else>{{ watchLogSummary(row) }}</template>
+                      </td>
+                    </tr>
+                    <tr v-if="expandedWatchLogId === row.id" class="watch-log-detail-row">
+                      <td colspan="8">
+                        <div class="watch-log-detail grid">
+                          <div class="kv">
+                            <span class="k">节点</span>
+                            <span class="v">{{ watchLogNodeName(row.node_id) }}</span>
+                          </div>
+                          <div class="kv">
+                            <span class="k">挂单号</span>
+                            <span class="v">{{ row.ticket || '—' }}</span>
+                          </div>
+                          <div class="kv">
+                            <span class="k">止损价</span>
+                            <span class="v">{{ fmtWatchNum(row.sl) }}</span>
+                          </div>
+                          <div class="kv">
+                            <span class="k">止盈价</span>
+                            <span class="v">{{ fmtWatchNum(row.tp) }}</span>
+                          </div>
+                          <div class="kv">
+                            <span class="k">订单备注</span>
+                            <span class="v">{{ row.comment || '—' }}</span>
+                          </div>
+                          <div v-if="watchLogReason(row)" class="kv">
+                            <span class="k">原因</span>
+                            <span class="v">{{ watchLogReason(row) }}</span>
+                          </div>
+                          <div v-if="watchLogSignalId(row)" class="kv">
+                            <span class="k">信号编号</span>
+                            <button
+                              type="button"
+                              class="node-link watch-log-signal-link"
+                              title="查看对应信号"
+                              @click="openWatchLogSignal(row, $event)"
+                            >{{ watchLogSignalId(row) }}</button>
+                          </div>
+                        </div>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+          </template>
+        </div>
+        <div class="modal-footer row between">
+          <span class="muted" style="font-size: 12px">
+            共 {{ watchLogTotal }} 条
+            <template v-if="watchLogTotalPages > 1">
+              · 第 {{ watchLogPage }} / {{ watchLogTotalPages }} 页
+            </template>
+          </span>
+          <div class="row" style="gap: 8px">
+            <button
+              v-if="watchLogTotalPages > 1"
+              class="btn-sm btn-ghost"
+              :disabled="watchLogPage <= 1 || watchLogLoading"
+              @click="goWatchLogPage(watchLogPage - 1)"
+            >上一页</button>
+            <button
+              v-if="watchLogTotalPages > 1"
+              class="btn-sm btn-ghost"
+              :disabled="watchLogPage >= watchLogTotalPages || watchLogLoading"
+              @click="goWatchLogPage(watchLogPage + 1)"
+            >下一页</button>
+            <button class="btn-ghost" @click="closeWatchLogs">关闭</button>
+          </div>
+        </div>
+      </div>
     </div>
 
     <!-- 新建 / 编辑弹窗 -->
@@ -1079,13 +1161,13 @@ async function onStrategyFormSaved(): Promise<void> {
               <FormLabel
                 field-id="group-limit-watch-keyword"
                 text="监听关键字"
-                help="订单注释包含该关键字即视为触发单，大小写不敏感。留空则使用默认值 limit。"
+                help="订单注释包含该关键字即视为触发单，大小写不敏感。留空表示不限注释（组内所有手工限价单都会被扫描）。"
               />
               <input
                 id="group-limit-watch-keyword"
                 v-model="form.limit_watch_keyword"
                 maxlength="32"
-                placeholder="limit"
+                placeholder="留空则不限注释"
               />
             </div>
             <div class="span-full">
@@ -1142,225 +1224,6 @@ async function onStrategyFormSaved(): Promise<void> {
       </div>
     </div>
 
-    <!-- 手动触发策略信号弹窗 -->
-    <div v-if="showTrigger" class="modal-mask" @click.self="showTrigger = false">
-      <div class="card card-pad modal modal-lg group-trigger-modal">
-        <div class="modal-header">
-          <div class="h1">手动触发策略信号</div>
-          <p class="muted" style="font-size: 12px; margin: 4px 0 0">
-            等同于收到一条 <code>model=strategy</code> 的 Webhook：按品种匹配「已启用且绑定同品种启用策略」的分组，
-            各分组再按自己的分发模式下发给有效节点。不影响按币种分发（<code>model=normal</code>）的链路。
-          </p>
-        </div>
-        <div class="modal-body">
-          <div class="form-grid two">
-            <div>
-              <FormLabel field-id="trigger-symbol" text="信号品种" :help="TRIGGER_HELP.symbol" />
-              <input id="trigger-symbol" v-model="triggerForm.symbol" placeholder="例如：XAUUSD" />
-              <div v-if="triggerSymbolOptions.length" class="symbol-picks">
-                <span class="muted">已配置：</span>
-                <button
-                  v-for="s in triggerSymbolOptions"
-                  :key="s"
-                  type="button"
-                  class="btn-sm btn-ghost"
-                  @click="triggerForm.symbol = s"
-                >
-                  {{ s }}
-                </button>
-              </div>
-            </div>
-            <div>
-              <FormLabel field-id="trigger-action" text="信号方向" :help="TRIGGER_HELP.action" />
-              <select id="trigger-action" v-model="triggerForm.action">
-                <option value="BUY">BUY（策略托管开多）</option>
-                <option value="SELL">SELL（策略托管开空）</option>
-                <option value="CLOSE">CLOSE（终止任务并平仓）</option>
-              </select>
-            </div>
-
-            <template v-if="!isCloseAction">
-              <div>
-                <FormLabel field-id="trigger-volume" text="首单手数" :help="TRIGGER_HELP.volume" />
-                <input
-                  id="trigger-volume"
-                  v-model.number="triggerForm.volume"
-                  type="number"
-                  min="0.01"
-                  step="0.01"
-                />
-              </div>
-              <div>
-                <FormLabel field-id="trigger-comment" text="订单备注" :help="TRIGGER_HELP.comment" />
-                <input id="trigger-comment" v-model="triggerForm.comment" placeholder="选填" />
-              </div>
-              <div>
-                <FormLabel field-id="trigger-sl" text="止损价" :help="TRIGGER_HELP.stop_loss" />
-                <input
-                  id="trigger-sl"
-                  v-model.number="triggerForm.stop_loss"
-                  type="number"
-                  step="0.01"
-                  placeholder="留空表示不设"
-                />
-              </div>
-              <div>
-                <FormLabel field-id="trigger-tp" text="止盈价" :help="TRIGGER_HELP.take_profit" />
-                <input
-                  id="trigger-tp"
-                  v-model.number="triggerForm.take_profit"
-                  type="number"
-                  step="0.01"
-                  placeholder="留空表示不设"
-                />
-              </div>
-              <div>
-                <FormLabel
-                  field-id="trigger-entry"
-                  text="入场价（限价开仓）"
-                  :help="TRIGGER_HELP.entry_price"
-                />
-                <input
-                  id="trigger-entry"
-                  v-model.number="triggerForm.entry_price"
-                  type="number"
-                  step="any"
-                  placeholder="仅限价开仓需要，留空表示不设"
-                />
-              </div>
-            </template>
-            <p v-else class="span-full trigger-warning">
-              CLOSE 会平掉命中分组内进行中任务对应魔术号的持仓并结束节点侧策略监控，不影响按币种分发链路的持仓。
-            </p>
-
-            <div v-if="triggerTemplateOptions.length" class="span-full">
-              <FormLabel text="策略模版定向" :help="TRIGGER_HELP.template_ids" />
-              <div class="template-picks">
-                <label v-for="t in triggerTemplateOptions" :key="t.id" class="template-pick">
-                  <input
-                    type="checkbox"
-                    :checked="triggerForm.template_ids.includes(t.id)"
-                    @change="toggleTriggerTemplate(t.id, ($event.target as HTMLInputElement).checked)"
-                  />
-                  <span>{{ t.name }}</span>
-                  <code>{{ t.id }}</code>
-                </label>
-                <span v-if="!triggerForm.template_ids.length" class="muted">不限制模版</span>
-              </div>
-            </div>
-
-            <div class="span-full">
-              <FormLabel
-                text="预计命中分组"
-                :help="TRIGGER_HELP.group_ids"
-              />
-              <div v-if="loadingTriggerGroups" class="muted" style="font-size: 12px">
-                正在读取全部分组…
-              </div>
-              <div v-else-if="!triggerForm.symbol.trim()" class="muted" style="font-size: 12px">
-                填写品种后，这里会列出将收到本信号的分组。
-              </div>
-              <div v-else-if="!candidateGroups.length" class="muted" style="font-size: 12px">
-                没有匹配的分组：该品种下没有「已启用且绑定同品种启用策略」<template
-                  v-if="triggerForm.template_ids.length"
-                >且模版在定向范围内</template>的分组，信号会被拒收。
-              </div>
-              <div v-else class="member-list">
-                <label
-                  v-for="g in candidateGroups"
-                  :key="g.group_id"
-                  class="member-row group-pick"
-                  :class="{ 'group-pick-off': triggerForm.group_ids.length && !triggerForm.group_ids.includes(g.group_id) }"
-                >
-                  <input
-                    type="checkbox"
-                    :checked="triggerForm.group_ids.includes(g.group_id)"
-                    :aria-label="`只发给分组 ${g.name}`"
-                    @change="toggleTriggerGroup(g.group_id, ($event.target as HTMLInputElement).checked)"
-                  />
-                  <span class="member-name">{{ g.name }}</span>
-                  <span class="muted member-meta">{{ groupStrategyLabel(g) }}</span>
-                  <span class="tag blue">{{ DISPATCH_MODE_LABEL[g.dispatch_mode] }}</span>
-                  <span class="tag" :class="g.online_node_count ? 'green' : 'red'">
-                    有效节点 {{ g.online_node_count }}
-                  </span>
-                </label>
-                <p class="muted" style="font-size: 12px; margin: 0">
-                  <template v-if="triggerForm.group_ids.length">
-                    已定向到勾选的 {{ matchedGroups.length }} 个分组（信号带 group_ids），其余分组不会收到。
-                  </template>
-                  <template v-else>上面 {{ candidateGroups.length }} 个分组都会收到；勾选后只发给勾中的分组。</template>
-                </p>
-              </div>
-              <p
-                v-if="matchedGroups.length > readyGroupCount"
-                class="muted"
-                style="font-size: 12px; margin: 8px 0 0"
-              >
-                其中 {{ matchedGroups.length - readyGroupCount }} 个分组当前没有有效节点（成员未启用或不在线），
-                会生成主任务但记为未下发。
-              </p>
-            </div>
-
-            <div v-if="triggerError" class="span-full" style="color: var(--red); font-size: 13px">
-              {{ triggerError }}
-            </div>
-          </div>
-        </div>
-        <div class="modal-footer">
-          <button class="btn-ghost" @click="showTrigger = false">取消</button>
-          <button
-            class="btn-primary"
-            :disabled="triggering || loadingTriggerGroups || !triggerForm.symbol.trim()"
-            @click="submitTrigger"
-          >
-            {{ triggering ? '触发中…' : '触发信号' }}
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <!-- 触发前二次确认：摘要 + Webhook 同构 JSON（可复制） -->
-    <div v-if="showTriggerConfirm && pendingTriggerPayload" class="modal-mask trigger-confirm-mask" @click.self="cancelTriggerConfirm">
-      <div class="card card-pad modal trigger-confirm-modal">
-        <div class="modal-header">
-          <div class="h1">确认触发信号</div>
-          <p class="muted" style="font-size: 12px; margin: 4px 0 0">
-            确认手动触发 strategy 信号？可展开查看 Webhook 同构 JSON。
-          </p>
-        </div>
-        <div class="modal-body">
-          <pre class="trigger-summary">{{ triggerSummary(pendingTriggerPayload) }}</pre>
-          <div class="trigger-payload-section">
-            <button
-              type="button"
-              class="trigger-payload-toggle"
-              :aria-expanded="triggerPayloadExpanded"
-              @click="triggerPayloadExpanded = !triggerPayloadExpanded"
-            >
-              <span class="muted" aria-hidden="true">{{ triggerPayloadExpanded ? '▾' : '▸' }}</span>
-              <strong>信号原始请求参数</strong>
-            </button>
-            <template v-if="triggerPayloadExpanded">
-              <div class="trigger-payload-head row between">
-                <span class="muted" style="font-size: 12px">Webhook 同构 JSON，与手动触发经后端转换后的信号体一致</span>
-                <button type="button" class="btn-sm btn-ghost" @click.stop="copyPendingTriggerPayload">
-                  {{ triggerCopyTip || '复制 JSON' }}
-                </button>
-              </div>
-              <pre class="trigger-payload-json">{{ pendingTriggerPayloadJson }}</pre>
-            </template>
-          </div>
-        </div>
-        <div class="modal-footer">
-          <button class="btn-ghost" :disabled="triggering" @click="cancelTriggerConfirm">取消</button>
-          <button class="btn-primary" :disabled="triggering" @click="confirmSubmitTrigger">
-            {{ triggering ? '触发中…' : '确认' }}
-          </button>
-        </div>
-      </div>
-    </div>
-
     <StrategyFormModal
       v-model="showStrategyForm"
       mode="edit"
@@ -1381,6 +1244,57 @@ async function onStrategyFormSaved(): Promise<void> {
   display: flex;
   justify-content: flex-end;
   gap: 6px;
+}
+
+.groups-table-card {
+  padding: 0;
+  overflow: hidden;
+}
+.groups-table {
+  --el-table-bg-color: transparent;
+  --el-table-tr-bg-color: transparent;
+  --el-table-header-bg-color: rgba(6, 10, 18, 0.55);
+  --el-table-header-text-color: var(--muted);
+  --el-table-text-color: var(--text);
+  --el-table-border-color: var(--glass-border);
+  --el-table-row-hover-bg-color: rgba(0, 212, 170, 0.05);
+  --el-table-current-row-bg-color: rgba(0, 212, 170, 0.05);
+  --el-fill-color-blank: #0e1628;
+  --el-table-fixed-box-shadow: -8px 0 12px rgba(0, 0, 0, 0.45);
+  width: 100%;
+  background: transparent;
+}
+.groups-table :deep(.el-table__inner-wrapper::before) {
+  display: none;
+}
+.groups-table :deep(.el-table__header th.el-table__cell) {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.groups-table :deep(.el-table__body td.el-table__cell) {
+  font-family: var(--mono);
+  font-size: 12px;
+  vertical-align: middle;
+}
+.groups-table :deep(.el-table__body td.el-table__cell:first-child) {
+  font-family: var(--font);
+}
+.groups-table :deep(.el-table__empty-text) {
+  color: var(--muted);
+}
+.groups-table :deep(.el-table__empty-block) {
+  background: transparent;
+}
+.groups-table :deep(.el-table-fixed-column--right) {
+  background: #0e1628 !important;
+}
+.groups-table :deep(th.el-table-fixed-column--right) {
+  background: #101a2e !important;
+}
+.groups-table :deep(.el-table__fixed-right-patch) {
+  background: #101a2e;
 }
 
 .member-list {
@@ -1419,130 +1333,70 @@ async function onStrategyFormSaved(): Promise<void> {
   gap: 6px;
 }
 
-.symbol-picks {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 8px;
-  font-size: 12px;
-}
-
-.template-picks {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 6px 14px;
-  margin-top: 6px;
-  font-size: 12px;
-}
-
-.template-pick {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  cursor: pointer;
-}
-
-.template-pick code {
-  color: var(--muted);
-}
-
-.group-pick {
-  cursor: pointer;
-}
-
-/* 已做分组定向时，没被勾中的分组淡化，一眼看出本次不会收到信号 */
-.group-pick-off {
-  opacity: 0.45;
-}
-
-.trigger-warning {
-  margin: 0;
-  padding: 10px 12px;
-  border: 1px solid rgba(245, 158, 11, 0.25);
-  border-radius: 8px;
-  background: rgba(245, 158, 11, 0.08);
-  color: #fbbf24;
-  font-size: 12px;
-  line-height: 1.6;
-}
-
-.trigger-confirm-mask {
-  z-index: 60;
-}
-
-.trigger-confirm-modal {
-  width: min(560px, calc(100vw - 32px));
-  max-height: calc(100dvh - 48px);
-  display: flex;
-  flex-direction: column;
-}
-
-.trigger-confirm-modal .modal-body {
+.watch-log-modal .modal-body {
   overflow: auto;
+  max-height: min(60vh, 480px);
 }
-
-.trigger-summary {
-  margin: 0 0 14px;
-  padding: 12px 14px;
-  border-radius: 8px;
-  border: 1px solid var(--glass-border);
-  background: rgba(6, 10, 18, 0.45);
-  font-family: inherit;
-  font-size: 13px;
-  line-height: 1.65;
-  white-space: pre-wrap;
-  color: var(--text);
-}
-
-.trigger-payload-section {
-  margin-top: 4px;
-}
-
-.trigger-payload-toggle {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+.watch-log-table-wrap {
   width: 100%;
-  padding: 8px 0;
+  min-width: 0;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.watch-log-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.watch-log-table th,
+.watch-log-table td {
+  padding: 8px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--glass-border);
+  vertical-align: middle;
+  word-break: break-word;
+}
+.watch-log-table th {
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+.watch-log-table .col-expand {
+  width: 28px;
+  white-space: nowrap;
+}
+.watch-log-table .col-time {
+  white-space: nowrap;
+}
+.watch-log-detail-row td {
+  background: rgba(6, 10, 18, 0.4);
+}
+.watch-log-detail {
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 10px 16px;
+  padding: 4px 8px 8px;
+}
+.watch-log-detail .kv .v {
+  font-size: 13px;
+}
+.watch-log-signal-link {
   background: none;
   border: none;
-  color: var(--text);
+  padding: 0;
   font: inherit;
   text-align: left;
-  cursor: pointer;
-}
-
-.trigger-payload-toggle:hover strong {
-  color: var(--primary);
-}
-
-.trigger-payload-head {
-  align-items: center;
-  margin-bottom: 8px;
-}
-
-.trigger-payload-json {
-  margin: 0;
-  padding: 12px 14px;
-  border-radius: 8px;
-  border: 1px solid var(--glass-border);
-  background: rgba(6, 10, 18, 0.65);
-  font-family: var(--mono);
   font-size: 12px;
-  line-height: 1.55;
-  white-space: pre-wrap;
-  word-break: break-all;
-  color: #a5f3fc;
-  user-select: all;
-  max-height: 220px;
-  overflow: auto;
+}
+.watch-log-table td.watch-log-jump {
+  cursor: pointer;
 }
 
 @media (max-width: 768px) {
   .group-form-modal,
-  .group-trigger-modal {
+  .watch-log-modal {
     width: 100%;
     max-width: 100%;
     max-height: calc(100dvh - 24px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));

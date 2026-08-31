@@ -79,6 +79,41 @@ def _as_float(value: object, default: float = 0.0) -> float:
         return default
 
 
+def _trade_error_text(res: object, *, fallback: str = "改单失败") -> str:
+    """从单笔或批量 order_send 回包抽出券商原文（comment + retcode）。
+
+    保本改止损是按魔术号逐笔改，全部成功才算成功；失败时界面原先只写
+    `modify_sl_failed`，看不到 Invalid stops 这类回报。
+    """
+    if not isinstance(res, dict):
+        return fallback
+    rows = [r for r in (res.get("results") or []) if isinstance(r, dict)]
+    failed = [r for r in rows if not r.get("success")] if rows else []
+    sources = failed if failed else [res]
+    parts: list[str] = []
+    seen: set[str] = set()
+    for row in sources:
+        if not isinstance(row, dict):
+            continue
+        err = str(row.get("error") or "").strip()
+        rc = row.get("retcode")
+        if err and rc is not None:
+            bit = err if str(rc) in err else f"{err} ({rc})"
+        elif err:
+            bit = err
+        elif rc is not None:
+            bit = f"retcode {rc}"
+        else:
+            continue
+        if bit not in seen:
+            seen.add(bit)
+            parts.append(bit)
+    body = "；".join(parts) if parts else fallback
+    if failed and rows and len(failed) < len(rows):
+        return f"{len(failed)}/{len(rows)} 笔失败：{body}"
+    return body
+
+
 class StrategyRunner:
     """单个分组任务在本节点上的执行体。"""
 
@@ -734,9 +769,11 @@ class StrategyRunner:
         # 按次模式触发过后不再看；循环模式持续监控（改单本身会跳过已到位的止损）
         if self._breakeven_done and not cfg.breakeven_is_loop:
             return False
+        spec = self._risk_spec
         move = risk_sizing.breakeven_move(
             cfg, plan, positions=positions, price=event.price,
-            digits=(self._risk_spec.digits if self._risk_spec else 5),
+            digits=(spec.digits if spec else 5),
+            tick_size=(spec.tick_size if spec else 0.0),
         )
         if move is not None:
             await self._risk_move_breakeven(move, positions, cfg=cfg)
@@ -791,11 +828,17 @@ class StrategyRunner:
             self._mt5.modify_sl_by_magic, self.magic, move.stop_loss,
         ) or {})
         if not res.get("success"):
+            err = _trade_error_text(res)
             logger.warning("task %s breakeven failed: %s", self.task_id, res)
             await self._emit_progress(
                 "error", phase="running", positions=positions,
-                message=f"保本止损设置失败；{reason}",
-                detail={**move.detail(), "error": "modify_sl_failed"},
+                message=f"保本止损设置失败：{err}；{reason}",
+                detail={
+                    **move.detail(),
+                    "error": err,
+                    "retcode": res.get("retcode"),
+                    "modified": res.get("modified"),
+                },
             )
             return
         # 按次：成功一次即置位；循环：保持监控，下次止损被拉回或均价变化时可再移

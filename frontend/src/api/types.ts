@@ -355,7 +355,7 @@ export interface GroupOut {
   trend_risk_enabled: boolean
   /** 限价挂单监听：把节点 MT5 上手动挂的带关键字限价单转成 strategy 信号（默认关） */
   limit_watch_enabled: boolean
-  /** 订单注释包含该关键字即视为触发单；默认 limit */
+  /** 订单注释包含该关键字即视为触发单；空字符串表示不限注释；未填时新建默认 limit */
   limit_watch_keyword: string
   /** 一对一绑定的策略 ID；未绑定为 null */
   strategy_id?: string | null
@@ -371,6 +371,42 @@ export interface GroupOut {
   signal_count: number
   /** 进行中主任务数（pending/dispatching/running） */
   active_task_count: number
+  /** 已开限价监听时附带的最近日志（新→旧）；未开启为空 */
+  limit_watch_logs?: LimitWatchLogOut[]
+}
+
+export type LimitWatchLogEvent =
+  | 'rejected'
+  | 'cancel_failed'
+  | 'ok'
+  | 'dispatch_rejected'
+  | 'duplicate'
+
+/** 分组限价监听日志（落库 + 后台 WS 实时推送） */
+export interface LimitWatchLogOut {
+  id: number
+  ts: number | null
+  group_id: string
+  group_name?: string | null
+  node_id: string
+  ticket: number
+  symbol?: string | null
+  action?: string | null
+  volume?: number | null
+  price?: number | null
+  sl?: number | null
+  tp?: number | null
+  comment?: string | null
+  event: LimitWatchLogEvent | string
+  message: string
+  detail?: Record<string, unknown> | null
+}
+
+export interface PaginatedLimitWatchLogs {
+  items: LimitWatchLogOut[]
+  total: number
+  page: number
+  page_size: number
 }
 
 /** 分组一键平仓结果：终止该分组未收口子任务并按魔术号平仓 */

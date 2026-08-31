@@ -21,8 +21,10 @@ import type {
   NodeUpdatePayload,
   RiskFeedItem,
   GroupTaskEventRecord,
+  LimitWatchLogOut,
   PaginatedAudits,
   PaginatedGroupSignals,
+  PaginatedLimitWatchLogs,
   PaginatedNodeDispatches,
   PaginatedSignalEvents,
   StrategyCreatePayload,
@@ -45,6 +47,7 @@ interface HubState {
   events: HubEvent[]                        // 实时事件流（用于总览页展示）
   nodeFeed: Record<string, NodeFeedItem[]>  // node_id -> 实时分发/回报（详情页“成交回报”用）
   riskFeed: Record<string, RiskFeedItem[]>  // node_id -> 账户级风控执行回报
+  limitWatchLogs: Record<string, LimitWatchLogOut[]>  // group_id -> 限价监听日志（新→旧）
 }
 
 export const useHubStore = defineStore('hub', {
@@ -59,6 +62,7 @@ export const useHubStore = defineStore('hub', {
     events: [],
     nodeFeed: {},
     riskFeed: {},
+    limitWatchLogs: {},
   }),
   getters: {
     // 在线节点数（优先用实时状态，其次用 REST 字段）
@@ -197,6 +201,7 @@ export const useHubStore = defineStore('hub', {
       const q = options?.q?.trim()
       const params = q ? { q } : undefined
       this.groups = (await api.get('/api/groups', { params })).data
+      this.mergeLimitWatchLogsFromGroups(this.groups)
     },
     async createGroup(payload: GroupCreatePayload, options?: { q?: string }): Promise<GroupOut> {
       const created = (await api.post('/api/groups', payload)).data
@@ -254,10 +259,12 @@ export const useHubStore = defineStore('hub', {
       page = 1,
       pageSize = 20,
       status?: string,
+      signalId?: string,
     ): Promise<PaginatedGroupSignals> {
       try {
         const params: Record<string, string | number> = { page, page_size: pageSize }
         if (status) params.status = status
+        if (signalId) params.signal_id = signalId
         return (
           await api.get(`/api/groups/${id}/signals`, { params })
         ).data
@@ -276,6 +283,22 @@ export const useHubStore = defineStore('hub', {
         ).data
       } catch {
         return []
+      }
+    },
+    /** 分组限价监听日志（落库分页；列表预览走 GroupOut.limit_watch_logs + WS） */
+    async fetchLimitWatchLogs(
+      groupId: string,
+      page = 1,
+      pageSize = 50,
+    ): Promise<PaginatedLimitWatchLogs> {
+      try {
+        return (
+          await api.get(`/api/groups/${groupId}/limit-watch-logs`, {
+            params: { page, page_size: pageSize },
+          })
+        ).data
+      } catch {
+        return { items: [], total: 0, page, page_size: pageSize }
       }
     },
     /** 手动终止单个节点策略子任务（下发 strategy_stop） */
@@ -299,7 +322,9 @@ export const useHubStore = defineStore('hub', {
     },
     /** 清空全部交易日志表与记录表（分组/策略/节点配置保留） */
     async purgeTradeLogs(confirm: string): Promise<PurgeTradeLogsResult> {
-      return (await api.post('/api/console/purge-trade-logs', { confirm })).data
+      const res = (await api.post('/api/console/purge-trade-logs', { confirm })).data
+      this.limitWatchLogs = {}
+      return res
     },
     // ---- 全局节点接入令牌（账户设置）----
     async fetchNodeToken(): Promise<NodeTokenInfo> {
@@ -333,6 +358,39 @@ export const useHubStore = defineStore('hub', {
       if (i >= 0) list[i] = { ...list[i], ...item }
       else list.unshift(item)
       this.nodeFeed[nodeId] = list.slice(0, 100)  // 每节点最多保留 100 条
+    },
+    mergeLimitWatchLogItems(
+      incoming: LimitWatchLogOut[],
+      existing: LimitWatchLogOut[] = [],
+    ): LimitWatchLogOut[] {
+      const byId = new Map<number, LimitWatchLogOut>()
+      for (const row of [...incoming, ...existing]) {
+        if (!row || typeof row.id !== 'number') continue
+        if (!byId.has(row.id)) byId.set(row.id, row)
+      }
+      return [...byId.values()].sort((a, b) => b.id - a.id).slice(0, 50)
+    },
+    mergeLimitWatchLogsFromGroups(groups: GroupOut[]): void {
+      const next = { ...this.limitWatchLogs }
+      for (const g of groups) {
+        if (g.limit_watch_enabled) {
+          next[g.group_id] = this.mergeLimitWatchLogItems(
+            g.limit_watch_logs || [],
+            next[g.group_id] || [],
+          )
+        } else if (g.group_id in next) {
+          delete next[g.group_id]
+        }
+      }
+      this.limitWatchLogs = next
+    },
+    prependLimitWatchLog(row: LimitWatchLogOut): void {
+      const gid = row?.group_id
+      if (!gid) return
+      this.limitWatchLogs = {
+        ...this.limitWatchLogs,
+        [gid]: this.mergeLimitWatchLogItems([row], this.limitWatchLogs[gid] || []),
+      }
     },
     // 处理来自后台 WS 的实时消息，按 type 分发更新本地状态
     applyWs(msg: { type: string; data?: Record<string, unknown> }): void {
@@ -437,6 +495,14 @@ export const useHubStore = defineStore('hub', {
             }
           }
         }
+      } else if (t === 'limit_watch_log') {
+        const row = d as unknown as LimitWatchLogOut
+        this.prependLimitWatchLog(row)
+        const name = (d.group_name as string) || (d.group_id as string) || ''
+        const text = (d.message as string) || '限价监听'
+        const ev = d.event as string
+        const kind = ev === 'ok' ? 'ok' : ev === 'rejected' || ev === 'cancel_failed' ? 'warn' : 'info'
+        this.pushEvent(`限价监听 ${name} ${text}`, kind)
       }
     },
   },

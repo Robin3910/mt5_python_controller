@@ -119,6 +119,7 @@ def test_group_endpoints_require_auth(client):
     assert client.patch("/api/groups/grp_x", json={"name": "y"}).status_code == 401
     assert client.delete("/api/groups/grp_x").status_code == 401
     assert client.get("/api/groups/grp_x/signals").status_code == 401
+    assert client.get("/api/groups/grp_x/limit-watch-logs").status_code == 401
     assert client.get("/api/groups/grp_x/dispatches/1/events").status_code == 401
     assert client.post("/api/groups/grp_x/close").status_code == 401
 
@@ -770,6 +771,17 @@ def test_active_task_count_and_signals_status_filter(client):
         all_page = client.get(f"/api/groups/{gid}/signals", headers=h).json()
         assert all_page["total"] == 1
 
+        sid = active["items"][0]["signal_id"]
+        by_id = client.get(
+            f"/api/groups/{gid}/signals", params={"signal_id": sid}, headers=h,
+        ).json()
+        assert by_id["total"] == 1
+        assert by_id["items"][0]["signal_id"] == sid
+        miss = client.get(
+            f"/api/groups/{gid}/signals", params={"signal_id": "sig_missing"}, headers=h,
+        ).json()
+        assert miss["total"] == 0
+
         bad = client.get(
             f"/api/groups/{gid}/signals", params={"status": "running"}, headers=h,
         )
@@ -1295,7 +1307,7 @@ def test_strategy_signal_appears_in_events_with_model(client):
 
 
 def test_purge_trade_logs_clears_tables_keeps_config(client):
-    """清空交易记录：五张运行表清空，分组/策略配置与审计保留。"""
+    """清空交易记录：运行表清空（含限价监听日志），分组/策略配置与审计保留。"""
     h = auth_headers(client)
     token = _node_token(client, h)
     n1 = _mk_node(client, h, 5261, "清空节点")
@@ -1339,6 +1351,7 @@ def test_purge_trade_logs_clears_tables_keeps_config(client):
     assert body["total_deleted"] >= 1
     assert body["deleted"]["signal_history"] >= 1
     assert body["deleted"]["group_signal_task"] >= 1
+    assert "limit_watch_log" in body["deleted"]
 
     assert client.get(f"/api/groups/{gid}/signals", headers=h).json()["total"] == 0
     assert client.get("/api/events/signals", headers=h).json()["total"] == 0
@@ -1440,7 +1453,7 @@ def test_patch_group_limit_watch_only_for_trend_strategy(client):
         f"/api/groups/{gid2}", json={"limit_watch_keyword": "  "}, headers=h,
     )
     assert empty.status_code == 200
-    assert empty.json()["limit_watch_keyword"] == "limit"
+    assert empty.json()["limit_watch_keyword"] == ""
 
 
 def test_limit_watch_auto_off_when_unbinding_trend(client):
@@ -1456,6 +1469,60 @@ def test_limit_watch_auto_off_when_unbinding_trend(client):
     )
     assert r.status_code == 200, r.text
     assert r.json()["limit_watch_enabled"] is False
+
+
+def test_limit_watch_logs_rejected_appear_in_group_list(client):
+    """不合格触发单落库监听日志，分组列表与分页接口都能读到。"""
+    h = auth_headers(client)
+    token = _node_token(client, h)
+    n1 = _mk_node(client, h, 5291, "监听日志节点")
+    sty = _mk_trend_strategy(client, h, name="监听日志趋势")
+    g = _mk_group(
+        client, h, name="监听日志组", strategy_id=sty["strategy_id"],
+        node_ids=[n1], limit_watch_enabled=True,
+    )
+    gid = g["group_id"]
+    assert g["limit_watch_enabled"] is True
+    assert g["limit_watch_logs"] == []
+    assert client.get("/api/groups/grp_missing/limit-watch-logs", headers=h).status_code == 404
+    empty = client.get(f"/api/groups/{gid}/limit-watch-logs", headers=h)
+    assert empty.status_code == 200
+    assert empty.json()["total"] == 0
+
+    items = []
+    with client.websocket_connect("/ws/node") as ws:
+        ws.send_json({"type": "auth", "data": {"token": token, "mt5_login": 5291}})
+        assert ws.receive_json()["type"] == "auth_ok"
+        ws.send_json({"type": "account", "data": {
+            "account": {"login": 5291, "balance": 1000, "equity": 1000},
+            "positions": [],
+            "orders": [{
+                "ticket": 77001,
+                "symbol": "XAUUSD",
+                "type": "BUY",
+                "pending_kind": "limit",
+                "volume": 0.1,
+                "price_open": 2390.0,
+                "sl": 0,
+                "tp": 0,
+                "magic": 0,
+                "comment": "open limit here",
+            }],
+        }})
+        for _ in range(80):
+            page = client.get(f"/api/groups/{gid}/limit-watch-logs", headers=h).json()
+            items = page.get("items") or []
+            if items:
+                break
+            time.sleep(0.03)
+    assert items, "expected rejected limit_watch log"
+    assert items[0]["event"] == "rejected"
+    assert "止损" in (items[0].get("message") or "")
+
+    listed = client.get("/api/groups", headers=h).json()
+    hit = next(x for x in listed if x["group_id"] == gid)
+    assert hit["limit_watch_logs"]
+    assert hit["limit_watch_logs"][0]["event"] == "rejected"
 
 
 def test_trend_risk_off_does_not_probe(client, monkeypatch):

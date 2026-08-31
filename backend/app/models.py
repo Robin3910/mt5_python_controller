@@ -196,7 +196,7 @@ class GroupCreate(BaseModel):
     dispatch_mode: str = "sync"  # sync / poll
     # 趋势风控：开仓前按全局趋势参数对各节点算信号品种趋势（默认关）
     trend_risk_enabled: bool = False
-    # 限价挂单监听：仅绑定趋势策略的分组可开（默认关）；关键字默认 limit
+    # 限价挂单监听：仅绑定趋势策略的分组可开（默认关）；关键字默认 limit，空串表示不按注释过滤
     limit_watch_enabled: bool = False
     limit_watch_keyword: Optional[str] = Field(default=None, max_length=32)
     remark: Optional[str] = None
@@ -219,6 +219,34 @@ class GroupUpdate(BaseModel):
     node_ids: Optional[list[str]] = None  # 传入即整体替换成员列表
 
 
+class LimitWatchLogRecord(BaseModel):
+    """分组限价监听日志（落库 + 后台 WS 实时推送）。"""
+    id: int
+    ts: Optional[float] = None
+    group_id: str
+    group_name: Optional[str] = None
+    node_id: str
+    ticket: int = 0
+    symbol: Optional[str] = None
+    action: Optional[str] = None
+    volume: Optional[float] = None
+    price: Optional[float] = None
+    sl: Optional[float] = None
+    tp: Optional[float] = None
+    comment: Optional[str] = None
+    event: str
+    message: str = ""
+    detail: Optional[dict] = None
+
+
+class PaginatedLimitWatchLogs(BaseModel):
+    """分组限价监听日志分页。"""
+    items: list[LimitWatchLogRecord]
+    total: int
+    page: int
+    page_size: int
+
+
 class GroupOut(BaseModel):
     """分组对外展示对象（含成员节点与信号计数）。"""
     group_id: str
@@ -227,6 +255,7 @@ class GroupOut(BaseModel):
     dispatch_mode: str = "sync"
     trend_risk_enabled: bool = False
     limit_watch_enabled: bool = False
+    # 空串 = 不按注释过滤；缺省展示仍是 limit
     limit_watch_keyword: str = "limit"
     strategy_id: Optional[str] = None
     strategy_name: Optional[str] = None
@@ -237,6 +266,8 @@ class GroupOut(BaseModel):
     online_node_count: int = 0   # 有效节点数（已启用 + 在线）
     signal_count: int = 0        # 该分组已处理的信号主任务数
     active_task_count: int = 0   # 进行中主任务数（pending/dispatching/running）
+    # 已开监听时附带最近若干条；未开启为空列表
+    limit_watch_logs: list[LimitWatchLogRecord] = Field(default_factory=list)
 
 
 class GroupTaskDispatchRecord(BaseModel):

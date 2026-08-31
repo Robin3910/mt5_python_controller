@@ -7,7 +7,7 @@ import asyncio
 
 import market_hub as mh
 from mock_mt5 import MockMT5Client
-from strategy_runner import StrategyRunner
+from strategy_runner import StrategyRunner, _trade_error_text
 
 MAGIC = 900000001
 
@@ -805,6 +805,54 @@ async def test_risk_sized_breakeven_moves_stop_to_average_price():
     # 保本改单不能顺手抹掉已挂的止盈（分散仓）
     assert mt5.positions_by_magic(MAGIC)[1]["tp"] == LADDER[0]
     runner.cancel()
+
+
+async def test_risk_sized_breakeven_failure_includes_broker_comment():
+    """改止损被拒时，进度里要带券商 comment / retcode，而不是笼统的 modify_sl_failed。"""
+    class RejectSL(MockMT5Client):
+        def modify_position_sl(self, ticket, sl, tp=None):
+            return {
+                "success": False,
+                "ticket": int(ticket),
+                "retcode": 10016,
+                "error": "Invalid stops",
+            }
+
+    sent: list = []
+    runner, hub, mt5 = _risk_runner(
+        sent, mt5=RejectSL(), breakeven_enabled=True, breakeven_times=1.0,
+    )
+    runner.start()
+    await _settle()
+
+    held = mt5.positions_by_magic(MAGIC)
+    _tick(hub, held, 2403.0)
+    await _settle()
+
+    errors = _progress(sent, "error")
+    assert errors
+    msg = errors[0]["message"]
+    assert "保本止损设置失败" in msg
+    assert "Invalid stops" in msg
+    assert "10016" in msg
+    assert errors[0]["detail"]["error"] == "Invalid stops (10016)"
+    assert mt5.positions_by_magic(MAGIC)[0]["sl"] == STOP_LOSS
+    runner.cancel()
+
+
+def test_trade_error_text_prefers_broker_comment_and_partial_count():
+    assert _trade_error_text({"success": False, "error": "Invalid stops", "retcode": 10016}) == (
+        "Invalid stops (10016)"
+    )
+    mixed = {
+        "success": False,
+        "results": [
+            {"success": True, "ticket": 1},
+            {"success": False, "ticket": 2, "error": "Invalid request", "retcode": 10013},
+        ],
+    }
+    assert _trade_error_text(mixed) == "1/2 笔失败：Invalid request (10013)"
+    assert _trade_error_text({}) == "改单失败"
 
 
 async def test_risk_sized_breakeven_only_triggers_once():

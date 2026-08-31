@@ -1837,6 +1837,13 @@ async def test_recent_group_signals_pagination_and_shape(store, monkeypatch):
     page2 = await group_persist.recent_group_signals(gid, 2, 2)
     assert [i["signal_id"] for i in page2["items"]] == ["sig_q0"]
 
+    by_id = await group_persist.recent_group_signals(gid, signal_id="sig_q1")
+    assert by_id["total"] == 1
+    assert by_id["items"][0]["signal_id"] == "sig_q1"
+    miss = await group_persist.recent_group_signals(gid, signal_id="sig_missing")
+    assert miss["total"] == 0
+    assert miss["items"] == []
+
 
 async def test_count_by_group(store, monkeypatch):
     await online(store, mk_node("nd_a"), mk_node("nd_b"))
