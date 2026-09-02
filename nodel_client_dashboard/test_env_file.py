@@ -99,6 +99,9 @@ def test_validate_required_and_types():
     assert ef.validate_field(_field("DEFAULT_SLIPPAGE"), "20") == ""
     assert ef.validate_field(_field("STRATEGY_SAMPLE_INTERVAL"), "0.5") == ""
     assert ef.validate_field(_field("STRATEGY_SAMPLE_INTERVAL"), "x") != ""
+    assert ef.validate_field(_field("ACCOUNT_REPORT_INTERVAL"), "0.5") == ""
+    assert ef.validate_field(_field("ACCOUNT_REPORT_INTERVAL"), "1") == ""
+    assert ef.validate_field(_field("ACCOUNT_REPORT_INTERVAL"), "x") != ""
     assert ef.validate_field(_field("LOG_LEVEL"), "info") == ""  # 大小写不敏感
     assert ef.validate_field(_field("LOG_LEVEL"), "VERBOSE") != ""
     # 非必填项留空不算错

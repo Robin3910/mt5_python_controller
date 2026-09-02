@@ -26,7 +26,7 @@ class NodeSettings(BaseSettings):
 
     # 各类时间间隔（秒）
     heartbeat_interval: int = 15        # 心跳间隔
-    account_report_interval: int = 5    # 账户上报间隔
+    account_report_interval: float = 5.0  # 账户上报间隔（支持小数，下限见 clamp）
     reconnect_min: int = 2              # 重连退避下限
     reconnect_max: int = 30             # 重连退避上限
     auth_timeout: int = 10             # 等待 auth_ok 的超时
@@ -51,6 +51,21 @@ class NodeSettings(BaseSettings):
     def watchlist(self) -> list[str]:
         """逗号分隔 -> 列表。"""
         return [s.strip() for s in self.watch_symbols.split(",") if s.strip()]
+
+
+ACCOUNT_REPORT_INTERVAL_MIN = 0.05
+ACCOUNT_REPORT_INTERVAL_DEFAULT = 5.0
+
+
+def clamp_account_report_interval(value) -> float:
+    """账户上报间隔（秒）：支持小数；空/非正回退默认 5，下限 0.05。"""
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        n = ACCOUNT_REPORT_INTERVAL_DEFAULT
+    if n <= 0:
+        n = ACCOUNT_REPORT_INTERVAL_DEFAULT
+    return max(ACCOUNT_REPORT_INTERVAL_MIN, n)
 
 
 @lru_cache

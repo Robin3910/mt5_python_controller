@@ -24,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 import websockets
 
 import account_risk
-from config import get_settings
+from config import clamp_account_report_interval, get_settings
 from local_status import LocalStatusServer
 from market_hub import MarketHub
 from mt5_prompt import prompt_mt5_credentials
@@ -415,7 +415,7 @@ class NodeClient:
             self._check_login(snap.get("account") or {})
             await ws.send(json.dumps({"type": "account", "data": snap}))
             await self._check_account_risk(ws, snap)
-            await asyncio.sleep(settings.account_report_interval)
+            await asyncio.sleep(clamp_account_report_interval(settings.account_report_interval))
 
     async def _heartbeat(self, ws) -> None:
         """定时心跳，维持服务端在线标记。"""
