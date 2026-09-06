@@ -59,6 +59,20 @@ const RULE_TYPE_LABEL: Record<number, string> = {
   [RULE_TYPE_GRID]: '网格交易',
 }
 
+/** 仅影响列表展示：顺势加仓在前，逆势加仓在后 */
+const RULE_DISPLAY_ORDER: Record<number, number> = {
+  [RULE_TYPE_TREND]: 0,
+  [RULE_TYPE_COUNTER]: 1,
+  [RULE_TYPE_RISK_SIZED]: 2,
+  [RULE_TYPE_GRID]: 3,
+}
+
+function displayRules(rules: StrategyRule[]): StrategyRule[] {
+  return [...rules].sort(
+    (a, b) => (RULE_DISPLAY_ORDER[a.type] ?? a.type) - (RULE_DISPLAY_ORDER[b.type] ?? b.type),
+  )
+}
+
 function isRiskSized(rule: { type: number }): boolean {
   return rule.type === RULE_TYPE_RISK_SIZED
 }
@@ -117,7 +131,7 @@ async function remove(s: StrategyOut): Promise<void> {
 
 function ruleSummary(rules: StrategyRule[]): string {
   if (!rules.length) return '—'
-  const enabled = rules.filter((r) => r.status === 1)
+  const enabled = displayRules(rules).filter((r) => r.status === 1)
   if (!enabled.length) return '全部关闭'
   return enabled
     .map((r) => {
@@ -302,7 +316,7 @@ function fmtTime(sec: number | null | undefined): string {
       <div>
         <div class="h1">策略管理</div>
         <p class="muted" style="font-size: 13px; margin-top: 4px">
-          基于策略模版创建实例并绑定品种；模版1 配逆势 / 顺势加仓，模版2 配以损定量趋势单，模版3 配网格交易
+          基于策略模版创建实例并绑定品种；AI智能加仓策略配顺势 / 逆势加仓，模版2 配以损定量趋势单，模版3 配网格交易
         </p>
       </div>
       <div class="row" style="gap: 8px">
@@ -354,7 +368,7 @@ function fmtTime(sec: number | null | undefined): string {
         <div v-if="isExpanded(s.strategy_id)" class="strategy-detail" @click.stop>
           <div v-if="s.remark" class="muted" style="font-size: 12px; margin-bottom: 8px">备注：{{ s.remark }}</div>
           <div v-if="!s.rules.length" class="muted" style="font-size: 12px">暂无规则</div>
-          <div v-for="(r, ri) in s.rules" :key="ri" class="strategy-rule-block">
+          <div v-for="(r, ri) in displayRules(s.rules)" :key="ri" class="strategy-rule-block">
             <div class="row between" style="margin-bottom: 8px">
               <strong style="font-size: 13px">{{ RULE_TYPE_LABEL[r.type] || `规则 ${ri + 1}` }}</strong>
               <span class="tag" :class="r.status === 1 ? 'green' : ''">{{ r.status === 1 ? '启用' : '关闭' }}</span>
@@ -466,7 +480,7 @@ function fmtTime(sec: number | null | undefined): string {
                     备注：{{ s.remark }}
                   </div>
                   <div v-if="!s.rules.length" class="muted" style="font-size: 12px">暂无规则</div>
-                  <div v-for="(r, ri) in s.rules" :key="ri" class="strategy-rule-block">
+                  <div v-for="(r, ri) in displayRules(s.rules)" :key="ri" class="strategy-rule-block">
                     <div class="row between" style="margin-bottom: 8px">
                       <strong style="font-size: 13px">{{ RULE_TYPE_LABEL[r.type] || `规则 ${ri + 1}` }}</strong>
                       <span class="tag" :class="r.status === 1 ? 'green' : ''">

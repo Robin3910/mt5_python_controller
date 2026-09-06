@@ -62,7 +62,13 @@ def template_reject_reason(
     template_id = str(strategy.get("template_id") or "").strip().lower()
     if template_id in template_ids:
         return None
-    label = strategy.get("template_name") or template_id or "未知模版"
+    label = (
+        strategy_templates.live_template_name(
+            template_id, strategy.get("template_name")
+        )
+        or template_id
+        or "未知模版"
+    )
     return f"策略模版 {label} 不在信号指定的 template_ids（{'、'.join(template_ids)}）内"
 
 

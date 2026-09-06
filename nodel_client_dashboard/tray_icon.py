@@ -1,8 +1,10 @@
 """系统托盘：最小化/关闭隐藏到托盘，菜单可还原与退出。"""
 from __future__ import annotations
 
+import sys
 import threading
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 try:
@@ -13,13 +15,59 @@ except ImportError:  # pragma: no cover
     Image = None  # type: ignore[assignment]
     ImageDraw = None  # type: ignore[assignment]
 
+LOGO_FILENAME = "logo.ico"
+
+
+def _bundle_dir() -> Path:
+    """打包资源目录：onefile 在 `_MEIPASS`，开发时在本包目录。"""
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return Path(meipass)
+    return Path(__file__).resolve().parent
+
+
+def logo_path() -> Path | None:
+    p = _bundle_dir() / LOGO_FILENAME
+    return p if p.is_file() else None
+
+
+def apply_window_icon(win, *, as_default: bool = False) -> None:
+    """给 Tk / CTk 窗口套上 logo.ico；缺文件或平台不支持时静默跳过。"""
+    path = logo_path()
+    if path is None:
+        return
+    s = str(path)
+    try:
+        win.iconbitmap(s)
+    except Exception:  # noqa: BLE001
+        return
+    if as_default:
+        try:
+            win.iconbitmap(default=s)
+        except Exception:  # noqa: BLE001
+            pass
+
 
 def tray_available() -> bool:
     return pystray is not None and Image is not None
 
 
 def build_tray_image(size: int = 64) -> Any:
-    """生成青绿圆形托盘图标（与面板主题一致）。"""
+    """优先用 logo.ico；读不到再画青绿圆形兜底。"""
+    assert Image is not None
+    path = logo_path()
+    if path is not None:
+        try:
+            img = Image.open(path).convert("RGBA")
+            if img.size != (size, size):
+                img = img.resize((size, size), Image.Resampling.LANCZOS)
+            return img
+        except Exception:  # noqa: BLE001
+            pass
+    return _fallback_tray_image(size)
+
+
+def _fallback_tray_image(size: int) -> Any:
     assert Image is not None and ImageDraw is not None
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
@@ -30,7 +78,6 @@ def build_tray_image(size: int = 64) -> Any:
         outline=(8, 20, 36, 255),
         width=2,
     )
-    # 简易「N」标记
     cx, cy = size // 2, size // 2
     draw.line(
         [(cx - 10, cy + 12), (cx - 10, cy - 12), (cx + 10, cy + 12), (cx + 10, cy - 12)],
@@ -49,7 +96,7 @@ class TrayController:
         schedule: Callable[[Callable[[], None]], None],
         on_show: Callable[[], None],
         on_quit: Callable[[], None],
-        title: str = "节点运维面板",
+        title: str = "节点控制台",
     ) -> None:
         self._schedule = schedule
         self._on_show = on_show

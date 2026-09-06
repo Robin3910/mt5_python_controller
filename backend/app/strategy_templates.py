@@ -81,7 +81,7 @@ GRID_ASSIST_MULT_MIN = 0.05
 GRID_ASSIST_MULT_MAX = 50.0
 
 TEMPLATE_1_ID = "tpl_1"
-TEMPLATE_1_NAME = "顺势逆势加仓策略"
+TEMPLATE_1_NAME = "AI智能加仓策略"
 TEMPLATE_2_ID = "tpl_2"
 TEMPLATE_2_NAME = "趋势策略"
 TEMPLATE_3_ID = "tpl_3"
@@ -147,7 +147,7 @@ class BatchLevel:
 @dataclass
 class CounterTrendRule:
     """逆势加仓规则（独立模型，对齐 MTcommander「逆势」）。"""
-    status: int = 1
+    status: int = 0
     action: str = "all"
     point: float = 100.0
     lot_times: float = 1.1
@@ -387,9 +387,9 @@ def _default_counter_batch_levels() -> list[BatchLevel]:
 
 
 def default_counter_rule() -> CounterTrendRule:
-    """策略模版1 · 逆势默认参数（对齐 MTcommander 截图）。"""
+    """策略模版1 · 逆势默认参数：关闭，需手动启用后才参与加仓。"""
     return CounterTrendRule(
-        status=1,
+        status=0,
         action="all",
         point=100.0,
         lot_times=1.1,
@@ -605,6 +605,14 @@ def get_template(template_id: str) -> Optional[dict]:
         "description": t.get("description", ""),
         "rules": deepcopy(t["rules"]),
     }
+
+
+def live_template_name(template_id: str | None, fallback: str | None = None) -> str:
+    """当前注册表中的模版显示名；用于改名后覆盖实例上快照的旧名称。"""
+    t = STRATEGY_TEMPLATES.get(str(template_id or "").strip().lower())
+    if t:
+        return str(t["name"])
+    return fallback or template_id or ""
 
 
 # ---------------------------------------------------------------------------

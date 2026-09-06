@@ -15,6 +15,7 @@ from app.strategy_templates import (
     TEMPLATE_2_NAME,
     TEMPLATE_3_ID,
     TEMPLATE_3_NAME,
+    live_template_name,
 )
 
 _TEST_DB = pathlib.Path(__file__).resolve().parent / "_test_api.db"
@@ -46,6 +47,11 @@ def test_strategy_endpoints_require_auth(client):
     }).status_code == 401
 
 
+def test_live_template_name_overrides_stale_snapshot():
+    assert live_template_name(TEMPLATE_1_ID, "顺势逆势加仓策略") == TEMPLATE_1_NAME
+    assert live_template_name("unknown_tpl", "自定义") == "自定义"
+
+
 def test_list_templates_contains_template_1(client):
     h = auth_headers(client)
     r = client.get("/api/strategies/templates", headers=h)
@@ -58,7 +64,7 @@ def test_list_templates_contains_template_1(client):
     types = {rule["type"] for rule in tpl["rules"]}
     assert types == {1, 2}  # 逆势 + 顺势
     by_type = {rule["type"]: rule for rule in tpl["rules"]}
-    assert by_type[1]["status"] == 1
+    assert by_type[1]["status"] == 0
     assert by_type[1]["action"] == "all"
     assert by_type[1]["lot_times"] == 1.1
     assert by_type[1]["extra_lot"] == 0
@@ -94,6 +100,9 @@ def test_create_strategy_from_template(client):
     assert body["enabled"] is True
     assert len(body["rules"]) == 2
     assert {rule["type"] for rule in body["rules"]} == {1, 2}
+    by_type = {rule["type"]: rule for rule in body["rules"]}
+    assert by_type[1]["status"] == 0
+    assert by_type[2]["status"] == 1
 
 
 def test_create_strategy_with_custom_rules(client):

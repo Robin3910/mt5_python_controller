@@ -40,7 +40,9 @@ def _to_strategy_out(d: dict) -> StrategyOut:
         strategy_id=d["strategy_id"],
         name=d["name"],
         template_id=d["template_id"],
-        template_name=d.get("template_name") or d["template_id"],
+        template_name=strategy_templates.live_template_name(
+            d.get("template_id"), d.get("template_name")
+        ) or d["template_id"],
         symbol=d["symbol"],
         enabled=d.get("enabled", True),
         rules=rules,

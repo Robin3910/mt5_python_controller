@@ -78,6 +78,48 @@ const RULE_TYPE_LABEL: Record<number, string> = {
   [RULE_TYPE_GRID]: '网格交易',
 }
 
+/** 仅影响表单展示顺序：顺势加仓在前，逆势加仓在后；提交仍用 form.rules 原序 */
+const RULE_DISPLAY_ORDER: Record<number, number> = {
+  [RULE_TYPE_TREND]: 0,
+  [RULE_TYPE_COUNTER]: 1,
+  [RULE_TYPE_RISK_SIZED]: 2,
+  [RULE_TYPE_GRID]: 3,
+}
+
+function ruleTypeOf(rule: { type: number }): number {
+  return Number(rule.type)
+}
+
+const displayedRules = computed(() =>
+  form.rules
+    .map((rule, index) => ({ rule, index }))
+    .sort((a, b) => {
+      const oa = RULE_DISPLAY_ORDER[ruleTypeOf(a.rule)] ?? ruleTypeOf(a.rule)
+      const ob = RULE_DISPLAY_ORDER[ruleTypeOf(b.rule)] ?? ruleTypeOf(b.rule)
+      return oa - ob
+    }),
+)
+
+/** 逆势加仓默认折叠；顺势加仓始终展开。点标题可展开/收起逆势。 */
+const counterExpanded = ref(false)
+
+function isRuleFoldable(type: number): boolean {
+  return Number(type) === RULE_TYPE_COUNTER
+}
+
+function isRuleCollapsed(type: number): boolean {
+  return isRuleFoldable(type) && !counterExpanded.value
+}
+
+function toggleRuleCollapsed(type: number): void {
+  if (!isRuleFoldable(type)) return
+  counterExpanded.value = !counterExpanded.value
+}
+
+function resetRuleCollapse(): void {
+  counterExpanded.value = false
+}
+
 const RULE_TYPE_HELP: Record<number, string> = {
   [RULE_TYPE_COUNTER]:
     '逆势加仓：以首仓开仓价为锚（若已有更深的逆势仓则取最深一笔），价格朝不利方向偏离达到「点数 × Point()」后触发加仓。' +
@@ -480,6 +522,7 @@ async function loadEditForm(): Promise<void> {
 
 async function onOpen(): Promise<void> {
   resetSizing()
+  resetRuleCollapse()
   templates.value = await hub.fetchStrategyTemplates()
   if (props.mode === 'create') {
     resetCreateForm()
@@ -1027,14 +1070,28 @@ function resetRuleToTemplate(idx: number): void {
             </span>
           </div>
 
-          <div v-for="(r, idx) in form.rules" :key="`${r.type}-${idx}`" class="rule-panel">
-            <div class="rule-panel-head">
-              <FormLabel
-                class="rule-title-label"
-                :text="RULE_TYPE_LABEL[r.type] || `规则 ${idx + 1}`"
-                :help="RULE_TYPE_HELP[r.type] || FIELD_HELP.rules"
-              />
-              <div class="rule-panel-actions">
+          <div
+            v-for="{ rule: r, index: idx } in displayedRules"
+            :key="`${r.type}-${idx}`"
+            class="rule-panel"
+            :class="{ 'is-collapsed': isRuleCollapsed(r.type) }"
+          >
+            <div
+              class="rule-panel-head"
+              :class="{ 'is-foldable': isRuleFoldable(r.type) }"
+              @click="toggleRuleCollapsed(r.type)"
+            >
+              <div class="rule-title-wrap">
+                <span v-if="isRuleFoldable(r.type)" class="rule-fold-caret" aria-hidden="true">
+                  {{ isRuleCollapsed(r.type) ? '▸' : '▾' }}
+                </span>
+                <FormLabel
+                  class="rule-title-label"
+                  :text="RULE_TYPE_LABEL[r.type] || `规则 ${idx + 1}`"
+                  :help="RULE_TYPE_HELP[r.type] || FIELD_HELP.rules"
+                />
+              </div>
+              <div class="rule-panel-actions" @click.stop>
                 <div class="rule-enable-wrap">
                   <FormLabel text="启用" :help="FIELD_HELP.status" />
                   <input
@@ -1048,6 +1105,7 @@ function resetRuleToTemplate(idx: number): void {
               </div>
             </div>
 
+            <div v-show="!isRuleCollapsed(r.type)" class="rule-panel-body">
             <!-- 以损定量趋势单（模版2）：手数由风险金额反推，没有加仓倍数与档位 -->
             <template v-if="isRiskSized(r)">
               <div class="rule-grid">
@@ -1719,6 +1777,7 @@ function resetRuleToTemplate(idx: number): void {
                 </template>
               </div>
             </template>
+            </div>
           </div>
         </div>
 
@@ -1765,6 +1824,33 @@ function resetRuleToTemplate(idx: number): void {
   justify-content: space-between;
   gap: 12px;
   margin-bottom: 12px;
+}
+
+.rule-panel.is-collapsed .rule-panel-head {
+  margin-bottom: 0;
+}
+
+.rule-panel-head.is-foldable {
+  cursor: pointer;
+}
+
+.rule-title-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.rule-fold-caret {
+  flex-shrink: 0;
+  width: 14px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1;
+}
+
+.rule-title-wrap :deep(.form-label-wrap) {
+  margin-bottom: 0;
 }
 
 .rule-title-label :deep(.form-label-row) {
