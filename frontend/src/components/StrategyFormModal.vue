@@ -170,18 +170,20 @@ const FIELD_HELP = {
     '最大允许加仓次数。达到次数上限后，本条规则不再继续加仓。',
   batch_enabled:
     '开启后按当前持仓笔数命中下方档位，使用该档的点数 / 倍数 / 额外手数，' +
-    '覆盖上方基础参数。档位由批数与总手数自动生成，不可手动增删。',
+    '覆盖上方基础参数。可改批数自动切档，也可手动增删、改持仓笔数。',
   batch_action:
     '分批加仓独立的监控方向：全部=多空都监控，多单=只监控多单，空单=只监控空单。' +
     '可与上方基础监控方向不同。',
   batch_count:
-    '分批批数。修改后会按「第 2 笔 ~ 总手数」自动均分生成对应档位区间，不可手动添加档位。',
+    '分批批数。改批数或总手数会按「第 2 笔 ~ 总手数」均分生成档位；' +
+    '添加 / 删除档位也会按同一总手数重切区间，批数与档位数保持一致。',
   total_lot_limit:
-    '分批总手数上限，同时作为档位末笔上限。' +
-    '系统会把第 2 笔到该上限均分到各档；达到上限后不再继续分批加仓。',
+    '分批总手数上限，同时作为自动切档的末笔。' +
+    '改此项会按批数重新均分档位；添加档位若超过可切份数会顺延该上限。',
   batch_level:
-    '持仓笔数区间由批数与总手数自动计算，只读。' +
-    '命中区间时按该档的间距判断是否加仓，手数 = 倍数 × 基础手数 + 额外手数。',
+    '本档命中的持仓笔数区间（含两端），可手改，相邻档会首尾衔接。' +
+    '添加 / 删除档位会按总手数重新均分各档区间。' +
+    '命中区间时按该档间距判断是否加仓，手数 = 倍数 × 基础手数 + 额外手数。',
   calc_type:
     '本档加仓间距怎么算：\n' +
     '点数 = 固定间距，偏离达到「点数 × Point()」触发；\n' +
@@ -473,6 +475,62 @@ function setBatchEnabled(r: EditableRule, enabled: boolean): void {
 
 function onBatchMetaChange(r: EditableRule): void {
   if (!r.batch_enabled) return
+  rebuildBatchLevels(r)
+}
+
+function syncBatchMetaFromLevels(r: EditableRule): void {
+  r.batch_count = r.batch_levels.length
+  const last = r.batch_levels[r.batch_levels.length - 1]
+  if (!last) return
+  const to = Math.max(1, Math.floor(Number(last.pos_to) || 1))
+  r.total_lot_limit = to
+}
+
+function normalizeLevelRange(lv: StrategyBatchLevel): void {
+  const from = Math.max(1, Math.floor(Number(lv.pos_from) || 1))
+  lv.pos_from = from
+  lv.pos_to = Math.max(from, Math.floor(Number(lv.pos_to) || from))
+}
+
+function onLevelRangeChange(r: EditableRule, index: number): void {
+  const levels = r.batch_levels
+  if (!levels[index]) return
+  normalizeLevelRange(levels[index])
+  for (let i = index; i < levels.length - 1; i++) {
+    const nextFrom = levels[i].pos_to + 1
+    levels[i + 1].pos_from = nextFrom
+    if (levels[i + 1].pos_to < nextFrom) levels[i + 1].pos_to = nextFrom
+  }
+  for (let i = index; i > 0; i--) {
+    const prevTo = levels[i].pos_from - 1
+    if (prevTo < levels[i - 1].pos_from) {
+      levels[i].pos_from = levels[i - 1].pos_to + 1
+      if (levels[i].pos_to < levels[i].pos_from) levels[i].pos_to = levels[i].pos_from
+      break
+    }
+    levels[i - 1].pos_to = prevTo
+  }
+  syncBatchMetaFromLevels(r)
+}
+
+const BATCH_LEVEL_MAX = 50
+
+function addBatchLevel(r: EditableRule): void {
+  if (r.batch_levels.length >= BATCH_LEVEL_MAX) return
+  const nextCount = r.batch_levels.length + 1
+  const limit = Math.max(BATCH_POS_START, Math.floor(Number(r.total_lot_limit) || BATCH_POS_START))
+  const maxCount = limit - BATCH_POS_START + 1
+  if (nextCount > maxCount) {
+    r.total_lot_limit = BATCH_POS_START + nextCount - 1
+  }
+  r.batch_count = nextCount
+  rebuildBatchLevels(r)
+}
+
+function removeBatchLevel(r: EditableRule, index: number): void {
+  if (r.batch_levels.length <= 1) return
+  r.batch_levels.splice(index, 1)
+  r.batch_count = r.batch_levels.length
   rebuildBatchLevels(r)
 }
 
@@ -893,20 +951,17 @@ function validateRules(rules: EditableRule[]): string | null {
     if (!['all', 'buy', 'sell'].includes(String(r.batch_action || '').toLowerCase())) {
       return `${label}：分批监控方向非法`
     }
-    if (r.batch_count < 1) return `${label}：分批批数至少为 1`
-    if (r.total_lot_limit < BATCH_POS_START) {
-      return `${label}：总手数上限需 ≥ ${BATCH_POS_START}（档位从第 ${BATCH_POS_START} 笔起）`
-    }
     if (!r.batch_levels.length) return `${label}：启用分批加仓后至少需要一个档位`
-    const last = r.batch_levels[r.batch_levels.length - 1]
+    for (const lv of r.batch_levels) normalizeLevelRange(lv)
+    syncBatchMetaFromLevels(r)
+    if (r.batch_count < 1) return `${label}：分批批数至少为 1`
     if (r.batch_levels.length !== r.batch_count) {
-      return `${label}：档位数与批数不一致，请调整总手数或批数后重试`
-    }
-    if (last.pos_to !== Math.floor(r.total_lot_limit)) {
-      return `${label}：档位末笔需等于总手数上限`
+      return `${label}：档位数与批数不一致`
     }
     for (const [i, lv] of r.batch_levels.entries()) {
       const at = `${label} 档位 ${i + 1}`
+      if (lv.pos_from < 1) return `${at}：持仓笔数起点至少为 1`
+      if (lv.pos_to < lv.pos_from) return `${at}：持仓笔数终点不能小于起点`
       if (!CALC_TYPE_OPTIONS.some((o) => o.value === lv.calc_type)) {
         return `${at}：计算方式非法`
       }
@@ -938,10 +993,7 @@ async function save(): Promise<void> {
     formError.value = '请填写绑定品种'
     return
   }
-  const rulesErr = validateRules(form.rules.map((r) => {
-    if (!isRiskSized(r) && !isGrid(r) && r.batch_enabled) rebuildBatchLevels(r)
-    return r
-  }))
+  const rulesErr = validateRules(form.rules)
   if (rulesErr) {
     formError.value = rulesErr
     return
@@ -1683,9 +1735,31 @@ function resetRuleToTemplate(idx: number): void {
                     <div v-for="(lv, li) in r.batch_levels" :key="li" class="batch-level">
                       <span class="batch-level-no">└{{ li + 1 }}</span>
                       <div class="field batch-range">
-                        <FormLabel text="持仓笔数" :help="FIELD_HELP.batch_level" />
-                        <div class="batch-range-value" title="由批数与总手数自动生成">
-                          {{ lv.pos_from }} ~ {{ lv.pos_to }}
+                        <FormLabel
+                          :field-id="`rule-${idx}-lv-${li}-from`"
+                          text="持仓笔数"
+                          :help="FIELD_HELP.batch_level"
+                        />
+                        <div class="batch-range-inputs">
+                          <input
+                            :id="`rule-${idx}-lv-${li}-from`"
+                            v-model.number="lv.pos_from"
+                            type="number"
+                            min="1"
+                            step="1"
+                            aria-label="持仓笔数起点"
+                            @change="onLevelRangeChange(r, li)"
+                          />
+                          <span class="muted">~</span>
+                          <input
+                            :id="`rule-${idx}-lv-${li}-to`"
+                            v-model.number="lv.pos_to"
+                            type="number"
+                            min="1"
+                            step="1"
+                            aria-label="持仓笔数终点"
+                            @change="onLevelRangeChange(r, li)"
+                          />
                         </div>
                       </div>
                       <div class="field">
@@ -1768,11 +1842,32 @@ function resetRuleToTemplate(idx: number): void {
                           step="0.01"
                         />
                       </div>
+                      <div class="batch-level-actions">
+                        <button
+                          type="button"
+                          class="btn-sm btn-ghost"
+                          :disabled="r.batch_levels.length <= 1"
+                          @click="removeBatchLevel(r, li)"
+                        >
+                          删除
+                        </button>
+                      </div>
                     </div>
                   </div>
+                  <div class="batch-level-add">
+                    <button
+                      type="button"
+                      class="btn-sm btn-ghost"
+                      :disabled="r.batch_levels.length >= BATCH_LEVEL_MAX"
+                      @click="addBatchLevel(r)"
+                    >
+                      + 添加档位
+                    </button>
+                  </div>
                   <p class="rule-hint">
-                    档位区间由批数 × 总手数自动切分（第 {{ BATCH_POS_START }} 笔 ~ 第 {{ Math.floor(r.total_lot_limit) }} 笔），不可手动添加；
-                    每档的加仓间距可独立选择点数 / 指定价 / ATR / 波幅，ATR 与波幅取该周期最近 {{ BATCH_BAR_PERIOD }} 根已收盘 K 线
+                    改批数、总手数或添加 / 删除档位，都会按第 {{ BATCH_POS_START }} 笔 ~ 第 {{ Math.floor(r.total_lot_limit) }} 笔重切区间；
+                    手改某一档持仓笔数时，相邻档会首尾衔接。
+                    每档间距可独立选点数 / 指定价 / ATR / 波幅，ATR 与波幅取该周期最近 {{ BATCH_BAR_PERIOD }} 根已收盘 K 线
                   </p>
                 </template>
               </div>
@@ -1965,7 +2060,7 @@ function resetRuleToTemplate(idx: number): void {
 
 .batch-level {
   display: grid;
-  grid-template-columns: 28px minmax(88px, 0.9fr) repeat(4, minmax(0, 1fr));
+  grid-template-columns: 28px minmax(132px, 1.1fr) repeat(4, minmax(0, 1fr)) auto;
   gap: 10px;
   align-items: end;
 }
@@ -1977,18 +2072,28 @@ function resetRuleToTemplate(idx: number): void {
   padding-bottom: 8px;
 }
 
-.batch-range-value {
+.batch-range-inputs {
   display: flex;
   align-items: center;
-  min-height: 34px;
-  padding: 0 10px;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--glass-border);
-  background: color-mix(in srgb, var(--bg-soft) 70%, transparent);
+  gap: 6px;
+  min-width: 0;
+}
+
+.batch-range-inputs input {
+  flex: 1;
+  min-width: 0;
   font-family: var(--mono);
-  font-size: 13px;
-  color: var(--muted);
-  user-select: none;
+}
+
+.batch-level-actions {
+  display: flex;
+  align-items: center;
+  padding-bottom: 1px;
+}
+
+.batch-level-add {
+  display: flex;
+  justify-content: flex-start;
 }
 
 .batch-top-grid .field,
@@ -2041,6 +2146,11 @@ function resetRuleToTemplate(idx: number): void {
   .batch-level-no {
     grid-column: 1 / -1;
     padding-bottom: 0;
+  }
+  .batch-level-actions {
+    grid-column: 1 / -1;
+    padding-bottom: 0;
+    justify-content: flex-end;
   }
 }
 
