@@ -32,6 +32,7 @@ from typing import Callable, Optional
 
 import grid_trading
 import risk_sizing
+import signal_pl
 from market_hub import GONE, STALE, MarketEvent, MarketHub, Subscription
 from risk_sizing import EntryPlan, RiskSizedConfig, SymbolSpec
 import close_reason
@@ -202,6 +203,10 @@ class StrategyRunner:
         self._grid_detached = False
         self._reported_stuck: Optional[tuple[str, int]] = None
         self._mode_reject = self._template_mode_reject()
+        # 信号级盈亏控制：仅加仓路径消费；次数是本任务内存态
+        self._signal_pl = signal_pl.prepare_runtime(
+            signal_pl.extract_config(self.strategy.get("rules")),
+        )
 
     def _template_mode_reject(self) -> Optional[str]:
         """模版与快照规则对不上时的拒绝原因；一致或未知模版返回 None。"""
@@ -385,12 +390,16 @@ class StrategyRunner:
             if await self._risk_advance(event, positions):
                 return False
         else:
-            ctx = self._ctx(event, positions)
-            ctx.bar_metrics = await self._read_bar_metrics()
-            decision = evaluate(self.strategy.get("rules") or [], ctx)
-            if decision is not None:
-                await self._add_position(decision, positions)
-                return False
+            pl_result = await self._signal_pl_advance(positions)
+            if pl_result == "done":
+                return True
+            if pl_result != "hit":
+                ctx = self._ctx(event, positions)
+                ctx.bar_metrics = await self._read_bar_metrics()
+                decision = evaluate(self.strategy.get("rules") or [], ctx)
+                if decision is not None:
+                    await self._add_position(decision, positions)
+                    return False
 
         if time.time() - self._last_report >= self.report_interval:
             await self._emit_progress("heartbeat", phase="running", positions=positions)
@@ -446,6 +455,77 @@ class StrategyRunner:
             point=event.point,
             add_count=self.add_count,
         )
+
+    async def _read_balance(self) -> Optional[float]:
+        """读账户余额；失败返回 None，本拍跳过信号盈亏判定以免误平。"""
+        try:
+            acct = dict(await self._exec(self._mt5.account_info) or {})
+        except Exception:  # noqa: BLE001
+            logger.debug("task %s read account_info failed", self.task_id, exc_info=True)
+            return None
+        try:
+            bal = float(acct.get("balance") or 0)
+        except (TypeError, ValueError):
+            return None
+        return bal
+
+    async def _signal_pl_advance(self, positions: list[dict]) -> Optional[str]:
+        """加仓路径的信号级盈亏控制。
+
+        返回 done=已清该信号并收口；hit=本拍已平仓不再加仓；None=未触发。
+        """
+        if not signal_pl.any_enabled(self._signal_pl) or not positions:
+            return None
+        balance = await self._read_balance()
+        if balance is None:
+            return None
+        profit = sum(_as_float(p.get("profit")) for p in positions)
+        hit = signal_pl.find_triggered_rule(
+            self._signal_pl,
+            balance=balance,
+            signal_profit=profit,
+            positions=positions,
+        )
+        if hit is None:
+            return None
+        reason = signal_pl.describe_trigger(hit)
+        detail = signal_pl.trigger_detail(hit)
+        if hit.get("rule") == signal_pl.RULE_FLOAT_PL_RATIO:
+            self._signal_pl, _state = signal_pl.apply_float_pl_trigger(self._signal_pl)
+        if signal_pl.closes_all(hit):
+            self.request_stop(reason, detail=detail)
+            await self._emit_progress(
+                "signal_pl", phase="closing", positions=positions,
+                message=reason, detail=detail,
+            )
+            return "done" if await self._close_all() else "hit"
+        targets = signal_pl.select_close_targets(positions, hit)
+        if not targets:
+            return None
+        target_tickets = {int(t.get("ticket") or 0) for t in targets}
+        self._last_floating_profit = round(
+            sum(_as_float(p.get("profit")) for p in targets), 2,
+        )
+        res = dict(await self._exec(self._mt5.close_positions, targets) or {})
+        if not res.get("success", True):
+            err = str(res.get("error") or "close failed")
+            await self._emit_progress(
+                "error", phase="running", positions=positions,
+                message=f"{reason}：平仓失败 {err}",
+                detail=detail,
+            )
+            return "hit"
+        remaining = [
+            p for p in positions if int(p.get("ticket") or 0) not in target_tickets
+        ]
+        await self._emit_progress(
+            "signal_pl", phase="running" if remaining else "closing",
+            positions=remaining, message=reason, detail=detail,
+        )
+        if remaining:
+            return "hit"
+        self.request_stop(reason, detail=detail)
+        return "done" if await self._close_all() else "hit"
 
     def _seed_from_positions(self, positions: list[dict]) -> None:
         """恢复后按真实持仓重建计数。

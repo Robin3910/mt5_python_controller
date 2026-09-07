@@ -129,11 +129,20 @@ async function remove(s: StrategyOut): Promise<void> {
   await hub.deleteStrategy(s.strategy_id, currentSearchOptions())
 }
 
+function signalPlSummary(rules: StrategyRule[]): string {
+  const addon = rules.find((r) => r.type === RULE_TYPE_COUNTER || r.type === RULE_TYPE_TREND)
+  if (!addon) return ''
+  const bits: string[] = []
+  if (addon.float_pl_ratio?.enabled) bits.push('信号盈亏比')
+  if (addon.lot_pl_tiers?.enabled) bits.push('分档手数盈亏')
+  return bits.length ? `信号盈亏控制（${bits.join(' · ')}）` : ''
+}
+
 function ruleSummary(rules: StrategyRule[]): string {
   if (!rules.length) return '—'
   const enabled = displayRules(rules).filter((r) => r.status === 1)
   if (!enabled.length) return '全部关闭'
-  return enabled
+  const body = enabled
     .map((r) => {
       const label = RULE_TYPE_LABEL[r.type] || `类型${r.type}`
       if (isRiskSized(r)) {
@@ -153,6 +162,8 @@ function ruleSummary(rules: StrategyRule[]): string {
       return r.batch_enabled && levels ? `${label}（分批 ${levels} 档）` : label
     })
     .join(' · ')
+  const pl = signalPlSummary(rules)
+  return pl ? `${body} · ${pl}` : body
 }
 
 const ACTION_LABEL: Record<string, string> = {

@@ -67,6 +67,19 @@ export interface LotPlTiersRule {
   tiers: LotPlTier[]
 }
 
+/** 模版1 信号级浮盈亏比（配置不含运行时 remaining_times） */
+export interface SignalFloatPlRatio {
+  enabled: boolean
+  /** 触发比例（%），负数为浮亏侧，正数为浮盈侧。分子=该信号浮盈亏，分母=账户余额 */
+  ratio: number
+  action: 'close_all'
+  monitor_mode: RiskMonitorMode
+  max_times: number
+}
+
+/** 模版1 信号级分档手数盈亏 */
+export type SignalLotPlTiers = LotPlTiersRule
+
 /** 节点账户级风控配置 */
 export interface NodeRiskConfig {
   float_pl_ratio: FloatPlRatioRule
@@ -514,6 +527,10 @@ export interface StrategyRule {
   /** 总手数上限，0=不限制 */
   total_lot_limit?: number
   batch_levels?: StrategyBatchLevel[]
+  /** 信号级盈亏比（模版1 顺势/逆势写入相同值） */
+  float_pl_ratio?: SignalFloatPlRatio
+  /** 信号级分档手数盈亏（模版1 顺势/逆势写入相同值） */
+  lot_pl_tiers?: SignalLotPlTiers
   // --- type=3：以损定量趋势单 ---
   /** 风险金额（账户货币） */
   risk_amount?: number

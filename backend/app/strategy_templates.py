@@ -46,6 +46,15 @@ DEFAULT_BATCH_TIMEFRAME = "M5"
 # ATR / 波幅统计的已收盘 K 线根数，固定不可配
 BATCH_BAR_PERIOD = 14
 
+# --- 模版1：信号级盈亏控制（按魔术号独立监控，只平该信号仓）---
+# 形态对齐节点账户风控，但不写入 remaining_times（次数是任务内存态）。
+SIGNAL_PL_CLOSE_ALL = "close_all"
+SIGNAL_PL_MONITOR_LOOP = "loop"
+SIGNAL_PL_MONITOR_TIMES = "times"
+SIGNAL_PL_MONITOR_MODES = (SIGNAL_PL_MONITOR_LOOP, SIGNAL_PL_MONITOR_TIMES)
+SIGNAL_PL_CLOSE_SIDES = ("all", "buy", "sell")
+SIGNAL_PL_MAX_TIERS = 10
+
 # --- 模版2：以损定量趋势单 ---
 # 分散仓单数硬上限（与节点 risk_sizing.DISTRIBUTE_COUNT_MAX 对齐）
 DISTRIBUTE_COUNT_MAX = 50
@@ -114,6 +123,81 @@ def _as_float(value: object, default: float) -> float:
         return default
 
 
+def default_signal_float_pl_ratio() -> dict[str, Any]:
+    """信号盈亏比默认关闭；阈值口径与账户风控一致，默认 -20%。"""
+    return {
+        "enabled": False,
+        "ratio": -20.0,
+        "action": SIGNAL_PL_CLOSE_ALL,
+        "monitor_mode": SIGNAL_PL_MONITOR_LOOP,
+        "max_times": 1,
+    }
+
+
+def default_signal_lot_pl_tiers() -> dict[str, Any]:
+    """信号分档手数盈亏默认关闭。"""
+    return {
+        "enabled": False,
+        "batch_count": 2,
+        "close_action": "all",
+        "tiers": [
+            {"min_lot": 0.1, "pl_amount": 50.0},
+            {"min_lot": 0.5, "pl_amount": 100.0},
+        ],
+    }
+
+
+def _normalize_signal_float_pl_ratio(raw: object) -> dict[str, Any]:
+    src = raw if isinstance(raw, dict) else {}
+    defaults = default_signal_float_pl_ratio()
+    mode = str(src.get("monitor_mode") or defaults["monitor_mode"]).strip().lower()
+    if mode not in SIGNAL_PL_MONITOR_MODES:
+        mode = defaults["monitor_mode"]
+    max_times = max(1, _as_int(src.get("max_times", defaults["max_times"]), defaults["max_times"]))
+    return {
+        "enabled": bool(src.get("enabled", defaults["enabled"])),
+        "ratio": _as_float(src.get("ratio", defaults["ratio"]), defaults["ratio"]),
+        "action": SIGNAL_PL_CLOSE_ALL,
+        "monitor_mode": mode,
+        "max_times": max_times,
+    }
+
+
+def _normalize_signal_lot_pl_tiers(raw: object) -> dict[str, Any]:
+    src = raw if isinstance(raw, dict) else {}
+    defaults = default_signal_lot_pl_tiers()
+    enabled = bool(src.get("enabled", defaults["enabled"]))
+    batch_count = _as_int(src.get("batch_count", defaults["batch_count"]), defaults["batch_count"])
+    batch_count = max(1, min(SIGNAL_PL_MAX_TIERS, batch_count))
+    close_action = str(src.get("close_action") or defaults["close_action"]).strip().lower()
+    if close_action not in SIGNAL_PL_CLOSE_SIDES:
+        close_action = defaults["close_action"]
+    old_tiers = src.get("tiers") if isinstance(src.get("tiers"), list) else []
+    default_tiers = defaults["tiers"]
+    tiers: list[dict[str, Any]] = []
+    for i in range(batch_count):
+        prev = old_tiers[i] if i < len(old_tiers) and isinstance(old_tiers[i], dict) else {}
+        fallback = default_tiers[i] if i < len(default_tiers) else {}
+        min_lot = max(
+            0.0,
+            _as_float(
+                prev.get("min_lot", fallback.get("min_lot", 0.1 * (i + 1))),
+                float(fallback.get("min_lot", 0.1 * (i + 1))),
+            ),
+        )
+        pl_amount = _as_float(
+            prev.get("pl_amount", fallback.get("pl_amount", 50.0 * (i + 1))),
+            float(fallback.get("pl_amount", 50.0 * (i + 1))),
+        )
+        tiers.append({"min_lot": min_lot, "pl_amount": pl_amount})
+    return {
+        "enabled": enabled,
+        "batch_count": batch_count,
+        "close_action": close_action,
+        "tiers": tiers,
+    }
+
+
 # ---------------------------------------------------------------------------
 # 结构模型
 # ---------------------------------------------------------------------------
@@ -159,6 +243,9 @@ class CounterTrendRule:
     batch_count: int = 3
     total_lot_limit: float = 10.0
     batch_levels: list[BatchLevel] = field(default_factory=list)
+    # 信号级盈亏控制（与顺势规则写入相同值；运行时按魔术号独立监控）
+    float_pl_ratio: dict[str, Any] = field(default_factory=default_signal_float_pl_ratio)
+    lot_pl_tiers: dict[str, Any] = field(default_factory=default_signal_lot_pl_tiers)
 
     @property
     def type(self) -> int:
@@ -178,6 +265,8 @@ class CounterTrendRule:
             "batch_count": self.batch_count,
             "total_lot_limit": self.total_lot_limit,
             "batch_levels": [lv.to_dict() for lv in self.batch_levels],
+            "float_pl_ratio": deepcopy(self.float_pl_ratio),
+            "lot_pl_tiers": deepcopy(self.lot_pl_tiers),
         }
 
 
@@ -196,6 +285,8 @@ class TrendFollowRule:
     batch_count: int = 0
     total_lot_limit: float = 0.0
     batch_levels: list[BatchLevel] = field(default_factory=list)
+    float_pl_ratio: dict[str, Any] = field(default_factory=default_signal_float_pl_ratio)
+    lot_pl_tiers: dict[str, Any] = field(default_factory=default_signal_lot_pl_tiers)
 
     @property
     def type(self) -> int:
@@ -215,6 +306,8 @@ class TrendFollowRule:
             "batch_count": self.batch_count,
             "total_lot_limit": self.total_lot_limit,
             "batch_levels": [lv.to_dict() for lv in self.batch_levels],
+            "float_pl_ratio": deepcopy(self.float_pl_ratio),
+            "lot_pl_tiers": deepcopy(self.lot_pl_tiers),
         }
 
 
@@ -495,6 +588,7 @@ STRATEGY_TEMPLATES: dict[str, dict] = {
             "含逆势加仓与顺势加仓两条独立规则："
             "逆势支持分批加仓档位（点数 / 倍数随持仓加深）；"
             "实际手数 = lot_times × 基础手数 + extra_lot。"
+            "可配信号级盈亏比与分档手数盈亏：每个信号按魔术号独立监控，触发只平该信号仓。"
         ),
         # 模版内部按独立模型存放；对外仍暴露 rules 列表
         "rule_set": _TPL1_RULES,
@@ -688,6 +782,12 @@ def _normalize_add_on_rule(rule_type: int, raw: dict) -> dict[str, Any]:
             _as_float(raw.get("total_lot_limit", defaults["total_lot_limit"]), defaults["total_lot_limit"]),
         ),
         "batch_levels": _normalize_batch_levels(raw.get("batch_levels", defaults["batch_levels"])),
+        "float_pl_ratio": _normalize_signal_float_pl_ratio(
+            raw.get("float_pl_ratio", defaults.get("float_pl_ratio")),
+        ),
+        "lot_pl_tiers": _normalize_signal_lot_pl_tiers(
+            raw.get("lot_pl_tiers", defaults.get("lot_pl_tiers")),
+        ),
     }
 
 
@@ -859,7 +959,8 @@ def validate_rules_for_template(template_id: str, rules: list[dict]) -> Optional
 
     - 规则 type 必须落在该模版允许集合内；
     - 至少一条启用中的规则；
-    - 模版3 启用规则还要过区间 / 手数等基础合法性（与分发准入对齐）。
+    - 模版3 启用规则还要过区间 / 手数等基础合法性（与分发准入对齐）；
+    - 模版1 的信号级盈亏控制字段即使加仓规则关闭也要过合法性（策略共享一套参数）。
     """
     allowed = TEMPLATE_RULE_TYPES.get(str(template_id or "").strip())
     if allowed is None:
@@ -867,12 +968,18 @@ def validate_rules_for_template(template_id: str, rules: list[dict]) -> Optional
     if not rules:
         return "请至少配置一条规则"
     active = 0
+    signal_pl_checked = False
     for rule in rules:
         if not isinstance(rule, dict):
             continue
         rule_type = _as_int(rule.get("type"), 0)
         if rule_type not in allowed:
             return f"策略模版 {template_id} 不允许规则类型 {rule_type}"
+        if rule_type in (RULE_TYPE_COUNTER, RULE_TYPE_TREND) and not signal_pl_checked:
+            reason = _validate_signal_pl_fields(rule)
+            if reason:
+                return reason
+            signal_pl_checked = True
         if not _as_int(rule.get("status"), 0):
             continue
         active += 1
@@ -882,6 +989,44 @@ def validate_rules_for_template(template_id: str, rules: list[dict]) -> Optional
                 return reason
     if active <= 0:
         return "请至少启用一条规则"
+    return None
+
+
+def _validate_signal_pl_fields(rule: dict) -> Optional[str]:
+    """模版1 信号级盈亏控制合法性（与账户风控口径对齐，但不要求已启用）。"""
+    pl = rule.get("float_pl_ratio") if isinstance(rule.get("float_pl_ratio"), dict) else {}
+    try:
+        ratio_f = float(pl.get("ratio"))
+    except (TypeError, ValueError):
+        return "信号盈亏比比例无效"
+    if ratio_f == 0:
+        return "信号盈亏比比例不能为 0"
+    mode = pl.get("monitor_mode")
+    if mode not in SIGNAL_PL_MONITOR_MODES:
+        return "信号盈亏比监控模式无效"
+    if mode == SIGNAL_PL_MONITOR_TIMES:
+        mt = _as_int(pl.get("max_times"), 0)
+        if mt < 1:
+            return "信号盈亏比指定次数至少为 1"
+
+    lpt = rule.get("lot_pl_tiers") if isinstance(rule.get("lot_pl_tiers"), dict) else {}
+    if lpt.get("close_action") not in SIGNAL_PL_CLOSE_SIDES:
+        return "信号分档平仓动作无效"
+    tiers = lpt.get("tiers") or []
+    if not isinstance(tiers, list) or not tiers:
+        return "信号分档平仓至少需要 1 个批次"
+    for i, tier in enumerate(tiers):
+        if not isinstance(tier, dict):
+            return f"信号分档批次#{i + 1}参数无效"
+        try:
+            min_lot = float(tier.get("min_lot"))
+            pla = float(tier.get("pl_amount"))
+        except (TypeError, ValueError):
+            return f"信号分档批次#{i + 1}参数无效"
+        if min_lot < 0:
+            return f"信号分档批次#{i + 1}手数不能为负"
+        if pla == 0:
+            return f"信号分档批次#{i + 1}盈亏金额不能为 0"
     return None
 
 
@@ -938,6 +1083,8 @@ def rules_to_rule_set(rules: object) -> TemplateRuleSet:
                     batch_count=normalized["batch_count"],
                     total_lot_limit=normalized["total_lot_limit"],
                     batch_levels=levels,
+                    float_pl_ratio=deepcopy(normalized["float_pl_ratio"]),
+                    lot_pl_tiers=deepcopy(normalized["lot_pl_tiers"]),
                 )
             elif normalized["type"] == RULE_TYPE_TREND:
                 trend = TrendFollowRule(
@@ -952,5 +1099,7 @@ def rules_to_rule_set(rules: object) -> TemplateRuleSet:
                     batch_count=normalized["batch_count"],
                     total_lot_limit=normalized["total_lot_limit"],
                     batch_levels=levels,
+                    float_pl_ratio=deepcopy(normalized["float_pl_ratio"]),
+                    lot_pl_tiers=deepcopy(normalized["lot_pl_tiers"]),
                 )
     return TemplateRuleSet(counter=counter, trend=trend)

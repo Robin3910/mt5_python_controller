@@ -384,10 +384,38 @@ class StrategyBatchLevel(BaseModel):
     extra_lot: float = Field(default=0.0, ge=0)
 
 
+class SignalFloatPlRatio(BaseModel):
+    """模版1 信号级浮盈亏比。次数耗尽是节点任务内存态，配置里不存 remaining_times。"""
+    enabled: bool = False
+    ratio: float = Field(default=-20.0, description="触发比例（%）；负=浮亏侧，正=浮盈侧")
+    action: str = Field(default="close_all", description="触达后操作，目前仅清该信号全部")
+    monitor_mode: str = Field(default="loop", description="loop=循环 / times=指定次数")
+    max_times: int = Field(default=1, ge=1, description="指定次数模式下的次数上限")
+
+
+class SignalLotPlTier(BaseModel):
+    min_lot: float = Field(default=0.1, ge=0)
+    pl_amount: float = Field(default=50.0, description="盈亏金额；负=亏损侧达阈值")
+
+
+class SignalLotPlTiers(BaseModel):
+    """模版1 信号级分档手数盈亏。"""
+    enabled: bool = False
+    batch_count: int = Field(default=2, ge=1, le=10)
+    close_action: str = Field(default="all", description="all|buy|sell")
+    tiers: list[SignalLotPlTier] = Field(
+        default_factory=lambda: [
+            SignalLotPlTier(min_lot=0.1, pl_amount=50.0),
+            SignalLotPlTier(min_lot=0.5, pl_amount=100.0),
+        ],
+    )
+
+
 class StrategyRule(BaseModel):
     """单条策略规则，字段按 type 分组使用。
 
-    type=1 逆势加仓 / type=2 顺势加仓（模版1）：point ~ batch_levels；
+    type=1 逆势加仓 / type=2 顺势加仓（模版1）：point ~ batch_levels，以及
+    策略共享的信号级盈亏控制 float_pl_ratio / lot_pl_tiers；
     type=3 以损定量趋势单（模版2）：risk_amount ~ breakeven_times；
     type=4 网格交易（模版3）：price_lower ~ assist_max_loss。
 
@@ -408,6 +436,9 @@ class StrategyRule(BaseModel):
     batch_count: int = Field(default=0, ge=0, description="分批批数")
     total_lot_limit: float = Field(default=0.0, ge=0, description="总手数上限，0=不限制")
     batch_levels: list[StrategyBatchLevel] = Field(default_factory=list)
+    # 模版1 信号级盈亏控制（顺势/逆势写入相同值；其它 type 规范化时丢弃）
+    float_pl_ratio: Optional[SignalFloatPlRatio] = None
+    lot_pl_tiers: Optional[SignalLotPlTiers] = None
     # --- type=3：以损定量趋势单 ---
     risk_amount: float = Field(default=100.0, ge=0, description="风险金额（账户货币）")
     rr_ratio: float = Field(default=2.5, ge=0, description="盈亏比：止盈距离 = 止损距离 × 该值（挂在分散仓）")

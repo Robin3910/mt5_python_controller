@@ -81,6 +81,12 @@ def test_list_templates_contains_template_1(client):
     assert by_type[2]["max_allow_num"] == 10
     assert by_type[2]["batch_enabled"] is False
     assert by_type[2]["batch_action"] == "all"
+    for rule in tpl["rules"]:
+        assert rule["float_pl_ratio"]["enabled"] is False
+        assert rule["float_pl_ratio"]["ratio"] == -20
+        assert "remaining_times" not in rule["float_pl_ratio"]
+        assert rule["lot_pl_tiers"]["enabled"] is False
+        assert rule["lot_pl_tiers"]["batch_count"] == 2
 
 
 def test_create_strategy_from_template(client):
@@ -892,3 +898,93 @@ def test_create_grid_strategy_rejects_wrong_type(client):
     )
     assert r.status_code == 400, r.text
     assert "不允许规则类型" in r.json()["detail"]
+
+
+def test_legacy_addon_rules_get_disabled_signal_pl(client):
+    """旧策略不带信号盈亏字段时，规范化后默认关闭。"""
+    h = auth_headers(client)
+    r = client.post(
+        "/api/strategies",
+        json={
+            "template_id": TEMPLATE_1_ID,
+            "name": "旧口径加仓",
+            "symbol": "XAUUSD",
+            "rules": [
+                {"type": 1, "status": 1, "action": "all", "point": 100},
+                {"type": 2, "status": 1, "action": "all", "point": 80},
+            ],
+        },
+        headers=h,
+    )
+    assert r.status_code == 201, r.text
+    for rule in r.json()["rules"]:
+        assert rule["float_pl_ratio"]["enabled"] is False
+        assert rule["lot_pl_tiers"]["enabled"] is False
+
+
+def test_create_addon_rejects_zero_signal_pl_ratio(client):
+    h = auth_headers(client)
+    r = client.post(
+        "/api/strategies",
+        json={
+            "template_id": TEMPLATE_1_ID,
+            "name": "零盈亏比",
+            "symbol": "XAUUSD",
+            "rules": [
+                {
+                    "type": 2, "status": 1, "action": "all",
+                    "float_pl_ratio": {"enabled": True, "ratio": 0, "monitor_mode": "loop", "max_times": 1},
+                },
+            ],
+        },
+        headers=h,
+    )
+    assert r.status_code == 400, r.text
+    assert "信号盈亏比" in r.json()["detail"]
+
+
+def test_create_addon_keeps_custom_signal_pl(client):
+    h = auth_headers(client)
+    r = client.post(
+        "/api/strategies",
+        json={
+            "template_id": TEMPLATE_1_ID,
+            "name": "信号盈亏策略",
+            "symbol": "XAUUSD",
+            "rules": [
+                {
+                    "type": 1, "status": 0, "action": "all",
+                    "float_pl_ratio": {
+                        "enabled": True, "ratio": -15, "monitor_mode": "times", "max_times": 3,
+                    },
+                    "lot_pl_tiers": {
+                        "enabled": True, "batch_count": 1, "close_action": "buy",
+                        "tiers": [{"min_lot": 0.2, "pl_amount": -80}],
+                    },
+                },
+                {
+                    "type": 2, "status": 1, "action": "all",
+                    "float_pl_ratio": {
+                        "enabled": True, "ratio": -15, "monitor_mode": "times", "max_times": 3,
+                    },
+                    "lot_pl_tiers": {
+                        "enabled": True, "batch_count": 1, "close_action": "buy",
+                        "tiers": [{"min_lot": 0.2, "pl_amount": -80}],
+                    },
+                },
+            ],
+        },
+        headers=h,
+    )
+    assert r.status_code == 201, r.text
+    by_type = {rule["type"]: rule for rule in r.json()["rules"]}
+    pl = by_type[2]["float_pl_ratio"]
+    assert pl["enabled"] is True
+    assert pl["ratio"] == -15
+    assert pl["monitor_mode"] == "times"
+    assert pl["max_times"] == 3
+    assert "remaining_times" not in pl
+    lpt = by_type[2]["lot_pl_tiers"]
+    assert lpt["enabled"] is True
+    assert lpt["close_action"] == "buy"
+    assert lpt["tiers"][0]["pl_amount"] == -80

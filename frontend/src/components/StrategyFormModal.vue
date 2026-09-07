@@ -14,6 +14,10 @@ import type {
   GridSide,
   GridSizingData,
   NodeOut,
+  RiskMonitorMode,
+  RiskSideAction,
+  SignalFloatPlRatio,
+  SignalLotPlTiers,
   StrategyBatchLevel,
   StrategyOut,
   StrategyRule,
@@ -41,6 +45,7 @@ const emit = defineEmits<{
 
 /** ATR / 波幅统计的已收盘 K 线根数，与后端 BATCH_BAR_PERIOD 一致，固定不可配 */
 const BATCH_BAR_PERIOD = 14
+const TEMPLATE_1_ID = 'tpl_1'
 
 /** 规则 type，与后端 strategy_templates 对齐 */
 const RULE_TYPE_COUNTER = 1
@@ -153,7 +158,8 @@ const FIELD_HELP = {
   symbol: '绑定品种代码，如 XAUUSD。策略规则仅作用于该品种。',
   rules:
     '每条规则独立配置。关闭「启用」后该规则不会执行。' +
-    '实际加仓手数 = 倍数 × 基础订单手数 + 额外手数；触发距离 = 点数 × Point()。',
+    '实际加仓手数 = 倍数 × 基础订单手数 + 额外手数；触发距离 = 点数 × Point()。' +
+    '模版1 可另配信号级盈亏控制：每个信号独立监控，触发只平该信号仓位。',
   status:
     '关闭后本条规则不会参与监控与加仓；已产生的历史订单不受影响。',
   action:
@@ -294,6 +300,14 @@ const FIELD_HELP = {
   trailing_max:
     '最多允许平移多少格，0 表示不限。\n' +
     '不限时只要不触发止损，网格会一直跟着行情滚动。',
+  signal_pl:
+    '信号级盈亏控制：每个信号按自己的魔术号独立监控，触发后只平该信号仓位，' +
+    '不影响同节点其它信号。盈亏比分子是该信号浮盈亏，分母是账户余额。',
+  signal_float_pl:
+    '该信号浮盈亏 ÷ 账户余额 × 100%。负数为亏损侧达阈值，正数为盈利侧。' +
+    '触发后清仓该信号全部持仓。循环=同信号生命周期内可反复触发；指定次数耗尽后本任务不再触发。',
+  signal_lot_pl:
+    '按该信号持仓的总手数分档，命中后按所选方向平仓。负的盈亏金额表示亏损侧达阈值。优先匹配更高批次。',
 }
 
 /** 保本监控方式，与后端 BREAKEVEN_MODES 对齐 */
@@ -325,7 +339,10 @@ const GRID_ASSIST_TIMEFRAME: BatchTimeframe = 'H1'
  * 各组字段都会补齐，提交后由后端按 type 只保留对应的一组。
  */
 type EditableRule = Required<
-  Omit<StrategyRule, 'batch_levels' | 'grid_mode' | 'grid_side' | 'breakeven_mode'>
+  Omit<
+    StrategyRule,
+    'batch_levels' | 'grid_mode' | 'grid_side' | 'breakeven_mode' | 'float_pl_ratio' | 'lot_pl_tiers'
+  >
 > & {
   batch_levels: StrategyBatchLevel[]
   grid_mode: GridMode
@@ -378,6 +395,101 @@ function cloneRules(rules: StrategyRule[]): EditableRule[] {
     assist_max_loss: r.assist_max_loss ?? 0,
   }))
 }
+
+type SignalPlForm = {
+  float_pl_ratio: SignalFloatPlRatio
+  lot_pl_tiers: SignalLotPlTiers
+}
+
+function defaultSignalPl(): SignalPlForm {
+  return {
+    float_pl_ratio: {
+      enabled: false,
+      ratio: -20,
+      action: 'close_all',
+      monitor_mode: 'loop',
+      max_times: 1,
+    },
+    lot_pl_tiers: {
+      enabled: false,
+      batch_count: 2,
+      close_action: 'all',
+      tiers: [
+        { min_lot: 0.1, pl_amount: 50 },
+        { min_lot: 0.5, pl_amount: 100 },
+      ],
+    },
+  }
+}
+
+function rebuildSignalLotTiers(
+  count: number,
+  prev: SignalLotPlTiers['tiers'],
+): SignalLotPlTiers['tiers'] {
+  const n = Math.max(1, Math.min(10, Math.floor(count) || 2))
+  const tiers = []
+  for (let i = 0; i < n; i++) {
+    const old = prev[i]
+    tiers.push({
+      min_lot: Number(old?.min_lot ?? 0.1 * (i + 1)),
+      pl_amount: Number(old?.pl_amount ?? 50 * (i + 1)),
+    })
+  }
+  return tiers
+}
+
+function cloneSignalPl(src?: Partial<SignalPlForm> | null): SignalPlForm {
+  const base = defaultSignalPl()
+  const pl = src?.float_pl_ratio
+  const lpt = src?.lot_pl_tiers
+  const mode = String(pl?.monitor_mode || 'loop') === 'times' ? 'times' : 'loop'
+  const closeAction = ['all', 'buy', 'sell'].includes(String(lpt?.close_action))
+    ? (lpt!.close_action as RiskSideAction)
+    : 'all'
+  const batchCount = Math.max(1, Math.min(10, Math.floor(Number(lpt?.batch_count) || 2)))
+  return {
+    float_pl_ratio: {
+      enabled: Boolean(pl?.enabled),
+      ratio: Number(pl?.ratio ?? base.float_pl_ratio.ratio),
+      action: 'close_all',
+      monitor_mode: mode as RiskMonitorMode,
+      max_times: Math.max(1, Math.floor(Number(pl?.max_times) || 1)),
+    },
+    lot_pl_tiers: {
+      enabled: Boolean(lpt?.enabled),
+      batch_count: batchCount,
+      close_action: closeAction,
+      tiers: rebuildSignalLotTiers(batchCount, lpt?.tiers || base.lot_pl_tiers.tiers),
+    },
+  }
+}
+
+function extractSignalPl(rules: Array<{ type: number; status?: number; float_pl_ratio?: SignalFloatPlRatio; lot_pl_tiers?: SignalLotPlTiers }>): SignalPlForm {
+  const addon = rules.filter((r) => r.type === RULE_TYPE_COUNTER || r.type === RULE_TYPE_TREND)
+  const picked = addon.find((r) => r.status === 1) || addon[0]
+  if (!picked) return defaultSignalPl()
+  return cloneSignalPl({
+    float_pl_ratio: picked.float_pl_ratio,
+    lot_pl_tiers: picked.lot_pl_tiers,
+  })
+}
+
+function applySignalPlToRules(rules: EditableRule[], cfg: SignalPlForm): StrategyRule[] {
+  return rules.map((r) => {
+    if (r.type !== RULE_TYPE_COUNTER && r.type !== RULE_TYPE_TREND) return r
+    return {
+      ...r,
+      float_pl_ratio: { ...cfg.float_pl_ratio },
+      lot_pl_tiers: {
+        ...cfg.lot_pl_tiers,
+        tiers: cfg.lot_pl_tiers.tiers.map((t) => ({ ...t })),
+      },
+    }
+  })
+}
+
+const signalPl = reactive<SignalPlForm>(defaultSignalPl())
+const isTpl1 = computed(() => form.template_id === TEMPLATE_1_ID)
 
 /** 分批档位从第 2 笔起算（第 1 笔为首单） */
 const BATCH_POS_START = 2
@@ -537,6 +649,7 @@ function removeBatchLevel(r: EditableRule, index: number): void {
 function loadRulesFromTemplate(templateId: string): void {
   const tpl = templates.value.find((t) => t.template_id === templateId)
   form.rules = tpl ? cloneRules(tpl.rules) : []
+  Object.assign(signalPl, extractSignalPl(tpl?.rules || []))
   resetSizing()  // 换模版后规则整组换掉，之前的试算结果不再对应任何规则
 }
 
@@ -556,6 +669,7 @@ function populateEditForm(s: StrategyOut): void {
   form.name = s.name
   form.symbol = s.symbol
   form.rules = cloneRules(s.rules || [])
+  Object.assign(signalPl, extractSignalPl(s.rules || []))
 }
 
 async function loadEditForm(): Promise<void> {
@@ -609,6 +723,18 @@ watch(
   (id) => {
     // 仅新建时切换模版会重载默认规则；编辑不允许改模版
     if (props.modelValue && !isEditMode.value && id) loadRulesFromTemplate(id)
+  },
+)
+
+watch(
+  () => signalPl.lot_pl_tiers.batch_count,
+  (n) => {
+    const next = Math.max(1, Math.min(10, Math.floor(Number(n) || 2)))
+    if (next !== n) {
+      signalPl.lot_pl_tiers.batch_count = next
+      return
+    }
+    signalPl.lot_pl_tiers.tiers = rebuildSignalLotTiers(next, signalPl.lot_pl_tiers.tiers)
   },
 )
 
@@ -978,6 +1104,21 @@ function validateRules(rules: EditableRule[]): string | null {
   return null
 }
 
+function validateSignalPl(cfg: SignalPlForm): string | null {
+  const r = cfg.float_pl_ratio
+  if (!Number.isFinite(r.ratio) || r.ratio === 0) return '信号盈亏比比例不能为 0'
+  if (r.monitor_mode === 'times' && !(r.max_times >= 1)) return '信号盈亏比指定次数至少为 1'
+  const lpt = cfg.lot_pl_tiers
+  if (!['all', 'buy', 'sell'].includes(lpt.close_action)) return '信号分档平仓动作无效'
+  if (!lpt.tiers.length) return '信号分档平仓至少需要 1 个批次'
+  for (const [i, tier] of lpt.tiers.entries()) {
+    const at = `信号分档批次#${i + 1}`
+    if (!Number.isFinite(tier.min_lot) || tier.min_lot < 0) return `${at}手数不能为负`
+    if (!Number.isFinite(tier.pl_amount) || tier.pl_amount === 0) return `${at}盈亏金额不能为 0`
+  }
+  return null
+}
+
 async function save(): Promise<void> {
   if (!form.template_id) {
     formError.value = '请选择策略模版'
@@ -998,6 +1139,13 @@ async function save(): Promise<void> {
     formError.value = rulesErr
     return
   }
+  if (isTpl1.value) {
+    const plErr = validateSignalPl(signalPl)
+    if (plErr) {
+      formError.value = plErr
+      return
+    }
+  }
   saving.value = true
   formError.value = ''
   try {
@@ -1012,7 +1160,9 @@ async function save(): Promise<void> {
       return
     }
     try {
-      const rules = cloneRules(form.rules)
+      const rules = isTpl1.value
+        ? applySignalPlToRules(cloneRules(form.rules), signalPl)
+        : cloneRules(form.rules)
       if (isEditMode.value) {
         await hub.updateStrategy(
           props.strategyId || '',
@@ -1876,6 +2026,67 @@ function resetRuleToTemplate(idx: number): void {
           </div>
         </div>
 
+        <div v-if="isTpl1" class="signal-pl-editor">
+          <div class="rules-editor-head">
+            <FormLabel text="信号盈亏控制" :help="FIELD_HELP.signal_pl" />
+            <span class="muted" style="font-size: 12px">每个信号独立监控，触发只平该信号仓</span>
+          </div>
+          <div class="signal-pl-rules">
+            <div class="signal-pl-row">
+              <label class="signal-pl-switch">
+                <input v-model="signalPl.float_pl_ratio.enabled" type="checkbox" />
+                <span>信号盈亏比</span>
+              </label>
+              <input v-model.number="signalPl.float_pl_ratio.ratio" type="number" step="0.1" class="signal-pl-num" />
+              <span class="muted" style="font-size: 13px">% ，清仓该信号全部</span>
+              <select v-model="signalPl.float_pl_ratio.monitor_mode" class="signal-pl-select">
+                <option value="loop">循环</option>
+                <option value="times">指定次数</option>
+              </select>
+              <template v-if="signalPl.float_pl_ratio.monitor_mode === 'times'">
+                <input v-model.number="signalPl.float_pl_ratio.max_times" type="number" min="1" class="signal-pl-times" />
+                <span class="muted" style="font-size: 12px">次</span>
+              </template>
+            </div>
+            <div class="signal-pl-block">
+              <div class="signal-pl-row signal-pl-row-wrap">
+                <label class="signal-pl-switch">
+                  <input v-model="signalPl.lot_pl_tiers.enabled" type="checkbox" />
+                  <span>分档手数盈亏</span>
+                </label>
+                <span class="muted" style="font-size: 12px">批次</span>
+                <input
+                  v-model.number="signalPl.lot_pl_tiers.batch_count"
+                  type="number"
+                  min="1"
+                  max="10"
+                  class="signal-pl-times"
+                />
+                <select v-model="signalPl.lot_pl_tiers.close_action" class="signal-pl-select">
+                  <option value="all">全部</option>
+                  <option value="buy">多单</option>
+                  <option value="sell">空单</option>
+                </select>
+              </div>
+              <div
+                v-for="(tier, idx) in signalPl.lot_pl_tiers.tiers"
+                :key="idx"
+                class="signal-pl-row"
+                style="margin-top: 8px"
+              >
+                <span class="muted" style="font-size: 12px; min-width: 52px">批次{{ idx + 1 }}</span>
+                <span class="muted" style="font-size: 12px">总 lot &gt;=</span>
+                <input v-model.number="tier.min_lot" type="number" min="0" step="0.01" class="signal-pl-num" />
+                <span class="muted" style="font-size: 12px">盈亏金额 &gt;=</span>
+                <input v-model.number="tier.pl_amount" type="number" step="1" class="signal-pl-num" />
+              </div>
+              <p class="muted" style="font-size: 12px; margin: 8px 0 0">
+                按所选方向统计该信号总手数与浮盈亏；负的盈亏金额表示亏损侧达阈值。优先匹配更高批次。
+              </p>
+            </div>
+          </div>
+        </div>
+
         <p v-if="formError" class="form-error" style="margin-top: 10px">{{ formError }}</p>
       </div>
 
@@ -2174,5 +2385,59 @@ function resetRuleToTemplate(idx: number): void {
   .batch-level {
     grid-template-columns: 1fr 1fr;
   }
+}
+
+.signal-pl-editor {
+  margin-top: 12px;
+}
+
+.signal-pl-rules {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.signal-pl-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-soft);
+  border: 1px solid var(--glass-border);
+}
+
+.signal-pl-row-wrap {
+  padding: 0;
+  border: none;
+  background: transparent;
+}
+
+.signal-pl-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+}
+
+.signal-pl-num,
+.signal-pl-times {
+  width: 88px;
+}
+
+.signal-pl-select {
+  width: auto;
+  min-width: 110px;
+}
+
+.signal-pl-block {
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-soft);
+  border: 1px solid var(--glass-border);
 }
 </style>
