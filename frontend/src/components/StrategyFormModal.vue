@@ -105,8 +105,8 @@ const displayedRules = computed(() =>
     }),
 )
 
-/** 逆势加仓默认折叠；顺势加仓始终展开。点标题可展开/收起逆势。 */
-const counterExpanded = ref(false)
+/** 逆势加仓默认展开；顺势加仓始终展开。点标题可展开/收起逆势。 */
+const counterExpanded = ref(true)
 
 function isRuleFoldable(type: number): boolean {
   return Number(type) === RULE_TYPE_COUNTER
@@ -122,7 +122,7 @@ function toggleRuleCollapsed(type: number): void {
 }
 
 function resetRuleCollapse(): void {
-  counterExpanded.value = false
+  counterExpanded.value = true
 }
 
 const RULE_TYPE_HELP: Record<number, string> = {
@@ -1264,6 +1264,67 @@ function resetRuleToTemplate(idx: number): void {
           </div>
         </div>
 
+        <div v-if="isTpl1" class="signal-pl-editor">
+          <div class="rules-editor-head">
+            <FormLabel text="信号盈亏控制" :help="FIELD_HELP.signal_pl" />
+            <span class="muted" style="font-size: 12px">每个信号独立监控，触发只平该信号仓</span>
+          </div>
+          <div class="signal-pl-rules">
+            <div class="signal-pl-row">
+              <label class="signal-pl-switch">
+                <input v-model="signalPl.float_pl_ratio.enabled" type="checkbox" />
+                <span>信号盈亏比</span>
+              </label>
+              <input v-model.number="signalPl.float_pl_ratio.ratio" type="number" step="0.1" class="signal-pl-num" />
+              <span class="muted" style="font-size: 13px">% ，清仓该信号全部</span>
+              <select v-model="signalPl.float_pl_ratio.monitor_mode" class="signal-pl-select">
+                <option value="loop">循环</option>
+                <option value="times">指定次数</option>
+              </select>
+              <template v-if="signalPl.float_pl_ratio.monitor_mode === 'times'">
+                <input v-model.number="signalPl.float_pl_ratio.max_times" type="number" min="1" class="signal-pl-times" />
+                <span class="muted" style="font-size: 12px">次</span>
+              </template>
+            </div>
+            <div class="signal-pl-block">
+              <div class="signal-pl-row signal-pl-row-wrap">
+                <label class="signal-pl-switch">
+                  <input v-model="signalPl.lot_pl_tiers.enabled" type="checkbox" />
+                  <span>分档手数盈亏</span>
+                </label>
+                <span class="muted" style="font-size: 12px">批次</span>
+                <input
+                  v-model.number="signalPl.lot_pl_tiers.batch_count"
+                  type="number"
+                  min="1"
+                  max="10"
+                  class="signal-pl-times"
+                />
+                <select v-model="signalPl.lot_pl_tiers.close_action" class="signal-pl-select">
+                  <option value="all">全部</option>
+                  <option value="buy">多单</option>
+                  <option value="sell">空单</option>
+                </select>
+              </div>
+              <div
+                v-for="(tier, idx) in signalPl.lot_pl_tiers.tiers"
+                :key="idx"
+                class="signal-pl-row"
+                style="margin-top: 8px"
+              >
+                <span class="muted" style="font-size: 12px; min-width: 52px">批次{{ idx + 1 }}</span>
+                <span class="muted" style="font-size: 12px">总 lot &gt;=</span>
+                <input v-model.number="tier.min_lot" type="number" min="0" step="0.01" class="signal-pl-num" />
+                <span class="muted" style="font-size: 12px">盈亏金额 &gt;=</span>
+                <input v-model.number="tier.pl_amount" type="number" step="1" class="signal-pl-num" />
+              </div>
+              <p class="muted" style="font-size: 12px; margin: 8px 0 0">
+                按所选方向统计该信号总手数与浮盈亏；负的盈亏金额表示亏损侧达阈值。优先匹配更高批次。
+              </p>
+            </div>
+          </div>
+        </div>
+
         <div v-if="form.rules.length" class="rules-editor">
           <div class="rules-editor-head">
             <FormLabel text="规则参数" :help="FIELD_HELP.rules" />
@@ -1789,36 +1850,6 @@ function resetRuleToTemplate(idx: number): void {
             </template>
 
             <template v-else>
-              <div class="rule-grid">
-                <div class="field">
-                  <FormLabel :field-id="`rule-${idx}-action`" text="监控方向" :help="FIELD_HELP.action" />
-                  <select :id="`rule-${idx}-action`" v-model="r.action">
-                    <option value="all">全部</option>
-                    <option value="buy">多单</option>
-                    <option value="sell">空单</option>
-                  </select>
-                </div>
-                <div class="field">
-                  <FormLabel :field-id="`rule-${idx}-point`" text="点数" :help="FIELD_HELP.point" />
-                  <input :id="`rule-${idx}-point`" v-model.number="r.point" type="number" min="0" step="1" />
-                </div>
-                <div class="field">
-                  <FormLabel :field-id="`rule-${idx}-lot-times`" text="倍数" :help="FIELD_HELP.lot_times" />
-                  <input :id="`rule-${idx}-lot-times`" v-model.number="r.lot_times" type="number" min="0" step="0.01" />
-                </div>
-                <div class="field">
-                  <FormLabel :field-id="`rule-${idx}-extra-lot`" text="手数" :help="FIELD_HELP.extra_lot" />
-                  <input :id="`rule-${idx}-extra-lot`" v-model.number="r.extra_lot" type="number" min="0" step="0.01" />
-                </div>
-                <div class="field">
-                  <FormLabel :field-id="`rule-${idx}-max-allow`" text="次数" :help="FIELD_HELP.max_allow_num" />
-                  <input :id="`rule-${idx}-max-allow`" v-model.number="r.max_allow_num" type="number" min="0" step="1" />
-                </div>
-              </div>
-              <p class="rule-hint">
-                手数 = {{ r.lot_times }} × 基础手数 + {{ r.extra_lot }}；触发 = {{ r.point }} × Point()
-              </p>
-
               <div class="batch-block">
                 <div class="batch-head">
                   <div class="rule-enable-wrap">
@@ -2021,68 +2052,36 @@ function resetRuleToTemplate(idx: number): void {
                   </p>
                 </template>
               </div>
-            </template>
-            </div>
-          </div>
-        </div>
-
-        <div v-if="isTpl1" class="signal-pl-editor">
-          <div class="rules-editor-head">
-            <FormLabel text="信号盈亏控制" :help="FIELD_HELP.signal_pl" />
-            <span class="muted" style="font-size: 12px">每个信号独立监控，触发只平该信号仓</span>
-          </div>
-          <div class="signal-pl-rules">
-            <div class="signal-pl-row">
-              <label class="signal-pl-switch">
-                <input v-model="signalPl.float_pl_ratio.enabled" type="checkbox" />
-                <span>信号盈亏比</span>
-              </label>
-              <input v-model.number="signalPl.float_pl_ratio.ratio" type="number" step="0.1" class="signal-pl-num" />
-              <span class="muted" style="font-size: 13px">% ，清仓该信号全部</span>
-              <select v-model="signalPl.float_pl_ratio.monitor_mode" class="signal-pl-select">
-                <option value="loop">循环</option>
-                <option value="times">指定次数</option>
-              </select>
-              <template v-if="signalPl.float_pl_ratio.monitor_mode === 'times'">
-                <input v-model.number="signalPl.float_pl_ratio.max_times" type="number" min="1" class="signal-pl-times" />
-                <span class="muted" style="font-size: 12px">次</span>
-              </template>
-            </div>
-            <div class="signal-pl-block">
-              <div class="signal-pl-row signal-pl-row-wrap">
-                <label class="signal-pl-switch">
-                  <input v-model="signalPl.lot_pl_tiers.enabled" type="checkbox" />
-                  <span>分档手数盈亏</span>
-                </label>
-                <span class="muted" style="font-size: 12px">批次</span>
-                <input
-                  v-model.number="signalPl.lot_pl_tiers.batch_count"
-                  type="number"
-                  min="1"
-                  max="10"
-                  class="signal-pl-times"
-                />
-                <select v-model="signalPl.lot_pl_tiers.close_action" class="signal-pl-select">
-                  <option value="all">全部</option>
-                  <option value="buy">多单</option>
-                  <option value="sell">空单</option>
-                </select>
+              <div class="rule-grid">
+                <div class="field">
+                  <FormLabel :field-id="`rule-${idx}-action`" text="监控方向" :help="FIELD_HELP.action" />
+                  <select :id="`rule-${idx}-action`" v-model="r.action">
+                    <option value="all">全部</option>
+                    <option value="buy">多单</option>
+                    <option value="sell">空单</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <FormLabel :field-id="`rule-${idx}-point`" text="点数" :help="FIELD_HELP.point" />
+                  <input :id="`rule-${idx}-point`" v-model.number="r.point" type="number" min="0" step="1" />
+                </div>
+                <div class="field">
+                  <FormLabel :field-id="`rule-${idx}-lot-times`" text="倍数" :help="FIELD_HELP.lot_times" />
+                  <input :id="`rule-${idx}-lot-times`" v-model.number="r.lot_times" type="number" min="0" step="0.01" />
+                </div>
+                <div class="field">
+                  <FormLabel :field-id="`rule-${idx}-extra-lot`" text="手数" :help="FIELD_HELP.extra_lot" />
+                  <input :id="`rule-${idx}-extra-lot`" v-model.number="r.extra_lot" type="number" min="0" step="0.01" />
+                </div>
+                <div class="field">
+                  <FormLabel :field-id="`rule-${idx}-max-allow`" text="次数" :help="FIELD_HELP.max_allow_num" />
+                  <input :id="`rule-${idx}-max-allow`" v-model.number="r.max_allow_num" type="number" min="0" step="1" />
+                </div>
               </div>
-              <div
-                v-for="(tier, idx) in signalPl.lot_pl_tiers.tiers"
-                :key="idx"
-                class="signal-pl-row"
-                style="margin-top: 8px"
-              >
-                <span class="muted" style="font-size: 12px; min-width: 52px">批次{{ idx + 1 }}</span>
-                <span class="muted" style="font-size: 12px">总 lot &gt;=</span>
-                <input v-model.number="tier.min_lot" type="number" min="0" step="0.01" class="signal-pl-num" />
-                <span class="muted" style="font-size: 12px">盈亏金额 &gt;=</span>
-                <input v-model.number="tier.pl_amount" type="number" step="1" class="signal-pl-num" />
-              </div>
-              <p class="muted" style="font-size: 12px; margin: 8px 0 0">
-                按所选方向统计该信号总手数与浮盈亏；负的盈亏金额表示亏损侧达阈值。优先匹配更高批次。
+              <p class="rule-hint">
+                手数 = {{ r.lot_times }} × 基础手数 + {{ r.extra_lot }}；触发 = {{ r.point }} × Point()
               </p>
+            </template>
             </div>
           </div>
         </div>
@@ -2242,6 +2241,18 @@ function resetRuleToTemplate(idx: number): void {
   border-top: 1px dashed var(--glass-border);
 }
 
+.rule-panel-body > .batch-block:first-child {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
+}
+
+.batch-block + .rule-grid {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--glass-border);
+}
+
 .batch-head {
   display: flex;
   align-items: center;
@@ -2388,7 +2399,7 @@ function resetRuleToTemplate(idx: number): void {
 }
 
 .signal-pl-editor {
-  margin-top: 12px;
+  margin-top: 18px;
 }
 
 .signal-pl-rules {
