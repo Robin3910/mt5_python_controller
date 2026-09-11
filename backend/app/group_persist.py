@@ -213,6 +213,50 @@ async def all_active_subtasks() -> list[dict]:
         return []
 
 
+async def rewrite_running_strategy_snapshots(
+    strategy_id: str, snapshot: dict,
+) -> list[dict]:
+    """重写该策略下非终态子任务所属主任务的规则快照，返回这些子任务。
+
+    断线 resume 读的是主任务 strategy_snapshot_json；不改库只推 WS 会在重连后回到旧规则。
+    """
+    sid = str(strategy_id or "").strip()
+    if not sid or not isinstance(snapshot, dict):
+        return []
+    try:
+        async with SessionLocal() as s:
+            rows = (
+                await s.execute(
+                    select(GroupTaskDispatch, GroupSignalTask)
+                    .join(
+                        GroupSignalTask,
+                        GroupSignalTask.task_id == GroupTaskDispatch.task_id,
+                    )
+                    .where(
+                        GroupSignalTask.strategy_id == sid,
+                        GroupTaskDispatch.status.notin_(tuple(_TERMINAL)),
+                    )
+                    .order_by(GroupTaskDispatch.id.asc())
+                )
+            ).all()
+            task_ids = {t.task_id for _, t in rows}
+            if task_ids:
+                values: dict = {"strategy_snapshot_json": snapshot}
+                name = snapshot.get("name")
+                if name:
+                    values["strategy_name"] = str(name)[:64]
+                await s.execute(
+                    update(GroupSignalTask)
+                    .where(GroupSignalTask.task_id.in_(task_ids))
+                    .values(**values)
+                )
+                await s.commit()
+            return [_subtask_dict(d) for d, _ in rows]
+    except Exception as e:  # noqa: BLE001
+        logger.warning("rewrite_running_strategy_snapshots failed: %s", e)
+        return []
+
+
 async def active_subtasks_overview() -> list[dict]:
     """全库活动子任务 + 主任务品种 / 模版快照，供 CLOSE 独立候选。
 

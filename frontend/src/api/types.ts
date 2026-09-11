@@ -486,6 +486,16 @@ export interface StrategyBatchLevel {
   extra_lot: number
 }
 
+/** 模版1 手动分散仓：看起来像分批最后一档，运行时与分批加仓隔离 */
+export interface ManualScatterConfig {
+  enabled: boolean
+  entry_price: number
+  take_profit: number
+  stop_loss: number
+  volume: number
+  volume_locked: boolean
+}
+
 /** 以损定量的补仓方向（历史字段，模版2 已改为分散仓市价） */
 export type EntryDirection = 'pullback' | 'breakout'
 
@@ -531,6 +541,8 @@ export interface StrategyRule {
   float_pl_ratio?: SignalFloatPlRatio
   /** 信号级分档手数盈亏（模版1 顺势/逆势写入相同值） */
   lot_pl_tiers?: SignalLotPlTiers
+  /** 手动分散仓（模版1 顺势/逆势各至多一条；不进 batch_levels） */
+  manual_scatter?: ManualScatterConfig
   // --- type=3：以损定量趋势单 ---
   /** 风险金额（账户货币） */
   risk_amount?: number
@@ -742,7 +754,7 @@ export interface GroupTaskEventRecord {
   magic: number | null
   created_at: number | null
   /**
-   * open / add_counter / add_trend / grid_add / grid_shift /
+   * open / add_counter / add_trend / add_manual / grid_add / grid_shift /
    * close_partial / close_all / error / resume
    */
   event_type: string
@@ -777,6 +789,7 @@ export interface GroupTaskEventDetail {
     | 'grid_shift'
     | 'account_risk'
     | 'close_reason'
+    | 'manual_scatter'
   // —— 加仓（kind=add）——
   rule_type?: number
   rule_type_label?: string
@@ -808,6 +821,12 @@ export interface GroupTaskEventDetail {
   action?: string
   stop_loss?: number | null
   take_profit?: number | null
+  /** 手动分散仓（kind=manual_scatter） */
+  target_pl?: number | null
+  profit_per_lot?: number
+  volume_locked?: boolean
+  volume_step?: number
+  comment?: string
   signal_comment?: string | null
   strategy_id?: string
   strategy_name?: string

@@ -411,10 +411,20 @@ class SignalLotPlTiers(BaseModel):
     )
 
 
+class ManualScatterConfig(BaseModel):
+    """模版1 手动分散仓：视觉上像分批最后一档，运行时与分批加仓隔离。"""
+    enabled: bool = False
+    entry_price: float = Field(default=0.0, ge=0, description="入场价，到价后市价开仓")
+    take_profit: float = Field(default=0.0, ge=0, description="止盈价")
+    stop_loss: float = Field(default=0.0, ge=0, description="止损价，0=不设")
+    volume: float = Field(default=0.0, ge=0, description="手数；0 且未锁定时由节点按分档手数盈亏反推")
+    volume_locked: bool = Field(default=False, description="用户手改手数后不再自动重算")
+
+
 class StrategyRule(BaseModel):
     """单条策略规则，字段按 type 分组使用。
 
-    type=1 逆势加仓 / type=2 顺势加仓（模版1）：point ~ batch_levels，以及
+    type=1 逆势加仓 / type=2 顺势加仓（模版1）：point ~ batch_levels、manual_scatter，以及
     策略共享的信号级盈亏控制 float_pl_ratio / lot_pl_tiers；
     type=3 以损定量趋势单（模版2）：risk_amount ~ breakeven_times；
     type=4 网格交易（模版3）：price_lower ~ assist_max_loss。
@@ -439,6 +449,8 @@ class StrategyRule(BaseModel):
     # 模版1 信号级盈亏控制（顺势/逆势写入相同值；其它 type 规范化时丢弃）
     float_pl_ratio: Optional[SignalFloatPlRatio] = None
     lot_pl_tiers: Optional[SignalLotPlTiers] = None
+    # 模版1 手动分散仓（顺势 / 逆势各至多一条；不进 batch_levels）
+    manual_scatter: Optional[ManualScatterConfig] = None
     # --- type=3：以损定量趋势单 ---
     risk_amount: float = Field(default=100.0, ge=0, description="风险金额（账户货币）")
     rr_ratio: float = Field(default=2.5, ge=0, description="盈亏比：止盈距离 = 止损距离 × 该值（挂在分散仓）")

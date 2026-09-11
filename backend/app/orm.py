@@ -240,7 +240,7 @@ class GroupSignalTask(Base):
     comment: Mapped[str | None] = mapped_column(String(128), nullable=True)
     source_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
     raw_payload: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # —— 绑定策略（触发时快照，运行期不受策略后续编辑影响）——
+    # —— 绑定策略（触发时快照；保存策略时可热推给进行中子任务）——
     strategy_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     strategy_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
     strategy_snapshot_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
@@ -334,7 +334,7 @@ class GroupTaskEvent(Base):
     node_id: Mapped[str] = mapped_column(String(32), index=True)
     magic: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
-    # open / add_counter / add_trend / grid_add / grid_shift /
+    # open / add_counter / add_trend / add_manual / grid_add / grid_shift /
     # close_partial / close_all / error / resume
     event_type: Mapped[str] = mapped_column(String(16), index=True)
     symbol: Mapped[str | None] = mapped_column(String(32), nullable=True)

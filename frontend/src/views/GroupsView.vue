@@ -846,20 +846,16 @@ async function onStrategyFormSaved(): Promise<void> {
             <span class="muted" style="font-size: 12px">{{ asGroup(row).remark || '—' }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="启用" width="108">
-          <template #default="{ row }">
-            <button
-              class="btn-sm"
-              :class="asGroup(row).enabled ? 'btn-success' : 'btn-danger'"
-              @click="toggleEnabled(asGroup(row))"
-            >
-              {{ asGroup(row).enabled ? '已启用' : '已禁用' }}
-            </button>
-          </template>
-        </el-table-column>
-        <el-table-column label="操作" width="220" fixed="right" align="right">
+        <el-table-column label="操作" width="280" fixed="right" align="right">
           <template #default="{ row }">
             <div class="nowrap">
+              <button
+                class="btn-sm"
+                :class="asGroup(row).enabled ? 'btn-success' : 'btn-danger'"
+                @click="toggleEnabled(asGroup(row))"
+              >
+                {{ asGroup(row).enabled ? '已启用' : '已禁用' }}
+              </button>
               <button
                 class="btn-sm btn-danger"
                 :disabled="!!closingGroupIds[asGroup(row).group_id]"

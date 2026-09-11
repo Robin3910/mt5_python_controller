@@ -1,5 +1,6 @@
 """策略模版与策略管理 API 单元测试。"""
 import pathlib
+import time
 
 import fakeredis
 import pytest
@@ -988,3 +989,251 @@ def test_create_addon_keeps_custom_signal_pl(client):
     assert lpt["enabled"] is True
     assert lpt["close_action"] == "buy"
     assert lpt["tiers"][0]["pl_amount"] == -80
+
+
+def _manual_scatter(**over) -> dict:
+    cfg = {
+        "enabled": True,
+        "entry_price": 4400,
+        "take_profit": 4410,
+        "stop_loss": 0,
+        "volume": 0.5,
+        "volume_locked": True,
+    }
+    cfg.update(over)
+    return cfg
+
+
+def test_create_addon_keeps_manual_scatter(client):
+    h = auth_headers(client)
+    r = client.post(
+        "/api/strategies",
+        json={
+            "template_id": TEMPLATE_1_ID,
+            "name": "手动分散仓策略",
+            "symbol": "XAUUSD",
+            "rules": [
+                {"type": 1, "status": 0, "action": "all", "manual_scatter": _manual_scatter()},
+                {"type": 2, "status": 1, "action": "all", "manual_scatter": _manual_scatter(volume=0, volume_locked=False)},
+            ],
+        },
+        headers=h,
+    )
+    assert r.status_code == 201, r.text
+    by_type = {rule["type"]: rule for rule in r.json()["rules"]}
+    assert by_type[1]["manual_scatter"]["enabled"] is True
+    assert by_type[1]["manual_scatter"]["entry_price"] == 4400
+    assert by_type[1]["manual_scatter"]["volume"] == 0.5
+    assert by_type[2]["manual_scatter"]["volume_locked"] is False
+    assert "manual_scatter" not in (by_type[1].get("batch_levels") or [])
+
+
+def test_create_addon_rejects_equal_manual_prices(client):
+    h = auth_headers(client)
+    r = client.post(
+        "/api/strategies",
+        json={
+            "template_id": TEMPLATE_1_ID,
+            "name": "入场止盈相同",
+            "symbol": "XAUUSD",
+            "rules": [
+                {"type": 2, "status": 1, "action": "all", "manual_scatter": _manual_scatter(take_profit=4400)},
+            ],
+        },
+        headers=h,
+    )
+    assert r.status_code == 400, r.text
+    assert "入场价与止盈价" in r.json()["detail"]
+
+
+def test_create_addon_rejects_missing_manual_prices(client):
+    h = auth_headers(client)
+    r = client.post(
+        "/api/strategies",
+        json={
+            "template_id": TEMPLATE_1_ID,
+            "name": "缺入手动价",
+            "symbol": "XAUUSD",
+            "rules": [
+                {"type": 2, "status": 1, "action": "all", "manual_scatter": _manual_scatter(entry_price=0)},
+            ],
+        },
+        headers=h,
+    )
+    assert r.status_code == 400, r.text
+    assert "入场价与止盈价" in r.json()["detail"]
+
+
+def test_manual_scatter_survives_update(client):
+    h = auth_headers(client)
+    created = client.post(
+        "/api/strategies",
+        json={"template_id": TEMPLATE_1_ID, "name": "待改手动单", "symbol": "XAUUSD"},
+        headers=h,
+    ).json()
+    rules = created["rules"]
+    by_type = {r["type"]: r for r in rules}
+    by_type[2]["manual_scatter"] = _manual_scatter(entry_price=4410, take_profit=4420, volume=0.3)
+    r = client.patch(
+        f"/api/strategies/{created['strategy_id']}",
+        json={"rules": list(by_type.values())},
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    trend = next(x for x in r.json()["rules"] if x["type"] == 2)
+    assert trend["manual_scatter"]["enabled"] is True
+    assert trend["manual_scatter"]["entry_price"] == 4410
+    assert trend["manual_scatter"]["volume"] == 0.3
+
+
+def test_patch_accepts_addon_form_payload_with_grid_fields(client):
+    """编辑弹窗会把网格/以损定量字段一并提交；运行中改手动单不得因此 422。"""
+    h = auth_headers(client)
+    created = client.post(
+        "/api/strategies",
+        json={"template_id": TEMPLATE_1_ID, "name": "BTCUSD测试", "symbol": "BTCUSD"},
+        headers=h,
+    ).json()
+    payload = {
+        "name": "BTCUSD测试",
+        "symbol": "BTCUSD",
+        "rules": [
+            {
+                "type": 1, "status": 0, "action": "all",
+                "point": 100, "lot_times": 1.1, "extra_lot": 0, "max_allow_num": 3,
+                "batch_enabled": False, "batch_action": "all",
+                "batch_count": 3, "total_lot_limit": 5,
+                "batch_levels": [
+                    {"pos_from": 2, "pos_to": 3, "calc_type": "point", "point": 100,
+                     "price": 0, "timeframe": "M5", "lot_times": 1.1, "extra_lot": 0},
+                    {"pos_from": 4, "pos_to": 4, "calc_type": "point", "point": 200,
+                     "price": 0, "timeframe": "M5", "lot_times": 1.2, "extra_lot": 0},
+                    {"pos_from": 5, "pos_to": 5, "calc_type": "point", "point": 300,
+                     "price": 0, "timeframe": "M5", "lot_times": 1.3, "extra_lot": 0},
+                ],
+                "manual_scatter": {
+                    "enabled": False, "entry_price": 0, "take_profit": 0,
+                    "stop_loss": 0, "volume": 0, "volume_locked": False,
+                },
+                "risk_amount": 100, "rr_ratio": 2.5, "base_ratio": 30,
+                "add_batches": 10, "max_total_lot": 0,
+                "breakeven_enabled": True, "breakeven_times": 2,
+                "breakeven_mode": "once", "entry_mode": "market",
+                "price_lower": 0, "price_upper": 0, "grid_count": 10,
+                "grid_mode": "arithmetic", "grid_side": "long",
+                "lot_per_grid": 0.01, "trigger_price": 0,
+                "stop_lower": 0, "stop_upper": 0, "close_on_stop": True,
+                "prefill_enabled": True, "trailing_up": False, "trailing_max": 0,
+                "assist_enabled": False, "assist_timeframe": "H1",
+                "assist_atr_mult": 1, "assist_spacing": 0, "assist_max_loss": 0,
+                "float_pl_ratio": {
+                    "enabled": False, "ratio": -20, "action": "close_all",
+                    "monitor_mode": "loop", "max_times": 1,
+                },
+                "lot_pl_tiers": {
+                    "enabled": False, "batch_count": 2, "close_action": "all",
+                    "tiers": [
+                        {"min_lot": 0.1, "pl_amount": 50},
+                        {"min_lot": 0.5, "pl_amount": 100},
+                    ],
+                },
+            },
+            {
+                "type": 2, "status": 1, "action": "all",
+                "point": 100, "lot_times": 0.8, "extra_lot": 0, "max_allow_num": 10,
+                "batch_enabled": True, "batch_action": "all",
+                "batch_count": 3, "total_lot_limit": 10,
+                "batch_levels": [
+                    {"pos_from": 2, "pos_to": 4, "calc_type": "point", "point": 100,
+                     "price": 0, "timeframe": "M5", "lot_times": 1.1, "extra_lot": 0},
+                    {"pos_from": 5, "pos_to": 7, "calc_type": "point", "point": 200,
+                     "price": 0, "timeframe": "M5", "lot_times": 1.2, "extra_lot": 0},
+                    {"pos_from": 8, "pos_to": 10, "calc_type": "point", "point": 300,
+                     "price": 0, "timeframe": "M5", "lot_times": 1.3, "extra_lot": 0},
+                ],
+                "manual_scatter": {
+                    "enabled": True, "entry_price": 76980, "take_profit": 79880,
+                    "stop_loss": 76810, "volume": 0, "volume_locked": False,
+                },
+                "risk_amount": 100, "rr_ratio": 2.5, "base_ratio": 30,
+                "add_batches": 10, "max_total_lot": 0,
+                "breakeven_enabled": True, "breakeven_times": 2,
+                "breakeven_mode": "once", "entry_mode": "market",
+                "price_lower": 0, "price_upper": 0, "grid_count": 10,
+                "grid_mode": "arithmetic", "grid_side": "long",
+                "lot_per_grid": 0.01, "trigger_price": 0,
+                "stop_lower": 0, "stop_upper": 0, "close_on_stop": True,
+                "prefill_enabled": True, "trailing_up": False, "trailing_max": 0,
+                "assist_enabled": False, "assist_timeframe": "H1",
+                "assist_atr_mult": 1, "assist_spacing": 0, "assist_max_loss": 0,
+                "float_pl_ratio": {
+                    "enabled": False, "ratio": -20, "action": "close_all",
+                    "monitor_mode": "loop", "max_times": 1,
+                },
+                "lot_pl_tiers": {
+                    "enabled": False, "batch_count": 2, "close_action": "all",
+                    "tiers": [
+                        {"min_lot": 0.1, "pl_amount": 50},
+                        {"min_lot": 0.5, "pl_amount": 100},
+                    ],
+                },
+            },
+        ],
+    }
+    r = client.patch(
+        f"/api/strategies/{created['strategy_id']}",
+        json=payload,
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    trend = next(x for x in r.json()["rules"] if x["type"] == 2)
+    assert trend["manual_scatter"]["enabled"] is True
+    assert trend["manual_scatter"]["entry_price"] == 76980
+    assert trend["manual_scatter"]["take_profit"] == 79880
+    assert trend["manual_scatter"]["stop_loss"] == 76810
+    assert trend["batch_enabled"] is True
+    assert trend["batch_count"] == 3
+
+
+def test_patch_returns_when_hot_push_hangs(client, monkeypatch):
+    """热推改快照卡住时，PATCH 仍应在超时内 200（BackgroundTasks + wait_for）。"""
+    import asyncio
+
+    from app.strategies import HOT_PUSH_REWRITE_TIMEOUT
+
+    async def hang(*_a, **_k):
+        await asyncio.sleep(HOT_PUSH_REWRITE_TIMEOUT + 20)
+        return []
+
+    monkeypatch.setattr(
+        "app.group_persist.rewrite_running_strategy_snapshots", hang,
+    )
+    h = auth_headers(client)
+    created = client.post(
+        "/api/strategies",
+        json={"template_id": TEMPLATE_1_ID, "name": "热推卡住", "symbol": "BTCUSD"},
+        headers=h,
+    ).json()
+    t0 = time.monotonic()
+    r = client.patch(
+        f"/api/strategies/{created['strategy_id']}",
+        json={
+            "rules": [
+                {"type": 2, "status": 1, "action": "all",
+                 "manual_scatter": _manual_scatter(entry_price=76980, take_profit=79880, stop_loss=76810, volume=0, volume_locked=False)},
+            ],
+        },
+        headers=h,
+    )
+    elapsed = time.monotonic() - t0
+    assert r.status_code == 200, r.text
+    assert elapsed < HOT_PUSH_REWRITE_TIMEOUT + 3
+
+
+def test_normalize_manual_scatter_defaults_disabled():
+    from app import strategy_templates as tpl
+
+    out = tpl.normalize_rule({"type": 1, "status": 1, "action": "all"})
+    assert out["manual_scatter"]["enabled"] is False
+    assert out["manual_scatter"]["volume_locked"] is False
+

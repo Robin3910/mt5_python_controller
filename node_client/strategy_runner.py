@@ -31,6 +31,7 @@ import time
 from typing import Callable, Optional
 
 import grid_trading
+import manual_scatter
 import risk_sizing
 import signal_pl
 from market_hub import GONE, STALE, MarketEvent, MarketHub, Subscription
@@ -207,6 +208,15 @@ class StrategyRunner:
         self._signal_pl = signal_pl.prepare_runtime(
             signal_pl.extract_config(self.strategy.get("rules")),
         )
+        # 手动分散仓：每种规则只开一次；重连时优先用 runtime，其次用仓位 comment
+        self._manual_fired: set[int] = set()
+        raw_fired = self._resume_runtime.get("manual_fired")
+        if isinstance(raw_fired, list):
+            for item in raw_fired:
+                try:
+                    self._manual_fired.add(int(item))
+                except (TypeError, ValueError):
+                    continue
 
     def _template_mode_reject(self) -> Optional[str]:
         """模版与快照规则对不上时的拒绝原因；一致或未知模版返回 None。"""
@@ -255,6 +265,36 @@ class StrategyRunner:
         """连接断开时只取消本地循环，不上报结束——持仓还在，等重连后恢复。"""
         if self._task and not self._task.done():
             self._task.cancel()
+
+    def apply_strategy(self, snapshot: dict) -> bool:
+        """热推规则快照：只接受仍走加仓路径的更新，拒绝运行中切网格 / 以损定量。"""
+        if self._stopping or self._finished:
+            return False
+        snap = dict(snapshot) if isinstance(snapshot, dict) else {}
+        grid_rule = grid_trading.pick_grid_rule(snap.get("rules"))
+        risk_rule = (
+            None if grid_rule
+            else risk_sizing.pick_risk_sized_rule(snap.get("rules"))
+        )
+        new_mode = (
+            _MODE_GRID if grid_rule
+            else (_MODE_RISK_SIZED if risk_rule else _MODE_ADD_ON)
+        )
+        if self._mode != _MODE_ADD_ON or new_mode != _MODE_ADD_ON:
+            logger.warning(
+                "task %s refuse strategy_update: running %s, incoming %s",
+                self.task_id, self._mode, new_mode,
+            )
+            return False
+        self.strategy = snap
+        self._signal_pl = signal_pl.prepare_runtime(
+            signal_pl.extract_config(self.strategy.get("rules")),
+        )
+        self._metric_specs = None
+        if self._sub is not None:
+            self._sub.wake()
+        logger.info("task %s strategy snapshot updated", self.task_id)
+        return True
 
     @property
     def done(self) -> bool:
@@ -394,12 +434,16 @@ class StrategyRunner:
             if pl_result == "done":
                 return True
             if pl_result != "hit":
-                ctx = self._ctx(event, positions)
-                ctx.bar_metrics = await self._read_bar_metrics()
-                decision = evaluate(self.strategy.get("rules") or [], ctx)
-                if decision is not None:
-                    await self._add_position(decision, positions)
+                if await self._maybe_open_manual_scatter(event, positions):
                     return False
+                filtered = manual_scatter.exclude_manual(positions)
+                if filtered:
+                    ctx = self._ctx(event, filtered)
+                    ctx.bar_metrics = await self._read_bar_metrics()
+                    decision = evaluate(self.strategy.get("rules") or [], ctx)
+                    if decision is not None:
+                        await self._add_position(decision, positions)
+                        return False
 
         if time.time() - self._last_report >= self.report_interval:
             await self._emit_progress("heartbeat", phase="running", positions=positions)
@@ -534,16 +578,17 @@ class StrategyRunner:
         会失效而超额加仓。这里以当前持仓笔数反推：首单 1 笔，其余都是加仓。
         """
         self._seed_pending = False
-        count = len(positions)
-        if count <= 0:
-            return
-        self.add_count = max(self.add_count, count - 1)
-        self.total_orders = max(self.total_orders, count)
+        self._manual_fired |= manual_scatter.fired_rule_types(positions)
+        filtered = manual_scatter.exclude_manual(positions)
+        count = len(filtered)
+        if count > 0:
+            self.add_count = max(self.add_count, count - 1)
+            self.total_orders = max(self.total_orders, count)
         volume = round(sum(_as_float(p.get("volume")) for p in positions), 4)
         self.total_volume = max(self.total_volume, volume)
         logger.info(
-            "task %s resumed with %d position(s): add_count=%s total_volume=%s",
-            self.task_id, count, self.add_count, self.total_volume,
+            "task %s resumed with %d position(s) (%d add-on): add_count=%s total_volume=%s",
+            self.task_id, len(positions), count, self.add_count, self.total_volume,
         )
 
     # ------------------------------------------------------------------
@@ -622,6 +667,124 @@ class StrategyRunner:
             message=reason,
             detail=decision_detail(decision),
         )
+
+    async def _maybe_open_manual_scatter(
+        self, event: MarketEvent, positions: list[dict],
+    ) -> bool:
+        """价到入场则市价开一条手动分散仓。成功返回 True，本拍不再走分批加仓。"""
+        watches = manual_scatter.extract_watches(self.strategy.get("rules"))
+        if not watches:
+            return False
+        self._manual_fired |= manual_scatter.fired_rule_types(positions)
+        price = _as_float(event.price)
+        for watch in watches:
+            rule_type = int(watch.get("rule_type") or 0)
+            if rule_type in self._manual_fired:
+                continue
+            cfg = watch.get("cfg") if isinstance(watch.get("cfg"), dict) else {}
+            if not manual_scatter.price_reached(
+                str(watch.get("direction") or ""),
+                price,
+                _as_float(cfg.get("entry_price")),
+            ):
+                continue
+            if await self._open_manual_scatter(watch, positions):
+                return True
+        return False
+
+    async def _open_manual_scatter(self, watch: dict, positions: list[dict]) -> bool:
+        cfg = watch.get("cfg") if isinstance(watch.get("cfg"), dict) else {}
+        spec = await self._manual_symbol_spec()
+        if spec is None:
+            logger.warning("task %s manual scatter skipped: missing symbol spec", self.task_id)
+            return False
+        current = manual_scatter.current_lot(positions)
+        volume = manual_scatter.compute_volume(
+            cfg=cfg,
+            current_lot_size=current,
+            lot_pl_tiers=watch.get("lot_pl_tiers"),
+            tick_size=_as_float(spec.get("tick_size")),
+            tick_value=_as_float(spec.get("tick_value")),
+            volume_step=_as_float(spec.get("volume_step"), 0.01),
+            volume_min=_as_float(spec.get("volume_min"), 0.01),
+            volume_max=_as_float(spec.get("volume_max"), 100.0),
+        )
+        if volume is None or volume <= 0:
+            logger.debug("task %s manual scatter skipped: no target volume", self.task_id)
+            return False
+        direction = str(watch.get("direction") or "").upper()
+        sl = _as_float(cfg.get("stop_loss"))
+        tp = _as_float(cfg.get("take_profit"))
+        comment = str(watch.get("comment") or manual_scatter.comment_for(
+            int(watch.get("rule_type") or 0),
+        ))[:MT5_COMMENT_LIMIT]
+        res = await self._exec(
+            self._mt5.place_market_order,
+            self.symbol, direction, volume,
+            sl if sl > 0 else None, tp if tp > 0 else None,
+            comment, self.magic,
+        )
+        res = dict(res or {})
+        if not res.get("success"):
+            logger.warning("task %s manual scatter failed: %s", self.task_id, res.get("error"))
+            await self._emit_progress(
+                "error", phase="running", positions=positions,
+                message=f"手动分散仓失败：{res.get('error') or 'order failed'}",
+                detail={
+                    **manual_scatter.open_detail(
+                        watch, volume, target_pl=None, current_lot_size=current,
+                        profit_per_lot_value=0.0,
+                    ),
+                    "error": str(res.get("error") or ""),
+                },
+            )
+            return False
+        self._manual_fired.add(int(watch.get("rule_type") or 0))
+        self.total_volume = round(self.total_volume + volume, 4)
+        volume_step = _as_float(spec.get("volume_step"), 0.01)
+        target_pl = None if bool(cfg.get("volume_locked") and _as_float(cfg.get("volume")) > 0) else (
+            manual_scatter.match_target_pl(watch.get("lot_pl_tiers"), current)
+        )
+        per = manual_scatter.profit_per_lot(
+            _as_float(cfg.get("entry_price")),
+            _as_float(cfg.get("take_profit")),
+            _as_float(spec.get("tick_size")),
+            _as_float(spec.get("tick_value")),
+        )
+        reason = manual_scatter.describe_open(
+            watch, volume, target_pl=target_pl, current_lot_size=current,
+            profit_per_lot_value=per, volume_step=volume_step,
+        )
+        logger.info("task %s %s", self.task_id, reason)
+        await self._emit_progress(
+            manual_scatter.EVENT_TYPE, phase="running",
+            last_order={
+                "ticket": res.get("order") or res.get("ticket"),
+                "price": res.get("price"),
+                "volume": volume,
+            },
+            message=reason,
+            detail=manual_scatter.open_detail(
+                watch, volume, target_pl=target_pl, current_lot_size=current,
+                profit_per_lot_value=per, volume_step=volume_step,
+            ),
+        )
+        return True
+
+    async def _manual_symbol_spec(self) -> Optional[dict]:
+        try:
+            raw = dict(await self._exec(self._mt5.symbol_spec, self.symbol) or {})
+        except Exception:  # noqa: BLE001
+            logger.debug("task %s symbol_spec failed", self.task_id, exc_info=True)
+            return None
+        if _as_float(raw.get("tick_size")) <= 0 or _as_float(raw.get("tick_value")) <= 0:
+            return None
+        return raw
+
+    def _manual_runtime_payload(self) -> Optional[dict]:
+        if not self._manual_fired:
+            return None
+        return {"manual_fired": sorted(self._manual_fired)}
 
     # ------------------------------------------------------------------
     # 以损定量路径（模版2）
@@ -1590,11 +1753,16 @@ class StrategyRunner:
             data["message"] = message[:MESSAGE_LIMIT]
         if detail:
             data["detail"] = detail
-        # 非心跳附带网格运行态，服务端落 runtime_json，重连可原样恢复
-        if event != "heartbeat" and self.is_grid:
-            runtime = self._grid_runtime_payload()
-            if runtime is not None:
-                data["runtime"] = runtime
+        # 非心跳附带运行态：网格平移量，或手动分散仓已开火标记（重连防重）
+        if event != "heartbeat":
+            if self.is_grid:
+                runtime = self._grid_runtime_payload()
+                if runtime is not None:
+                    data["runtime"] = runtime
+            else:
+                runtime = self._manual_runtime_payload()
+                if runtime is not None:
+                    data["runtime"] = runtime
         await self._send({"type": "strategy_progress", "data": data})
 
     async def _resolve_passive_close_reason(self) -> None:

@@ -147,6 +147,18 @@ def default_signal_lot_pl_tiers() -> dict[str, Any]:
     }
 
 
+def default_manual_scatter() -> dict[str, Any]:
+    """手动分散仓默认关闭；顺势 / 逆势各至多一条。"""
+    return {
+        "enabled": False,
+        "entry_price": 0.0,
+        "take_profit": 0.0,
+        "stop_loss": 0.0,
+        "volume": 0.0,
+        "volume_locked": False,
+    }
+
+
 def _normalize_signal_float_pl_ratio(raw: object) -> dict[str, Any]:
     src = raw if isinstance(raw, dict) else {}
     defaults = default_signal_float_pl_ratio()
@@ -198,6 +210,28 @@ def _normalize_signal_lot_pl_tiers(raw: object) -> dict[str, Any]:
     }
 
 
+def _normalize_manual_scatter(raw: object) -> dict[str, Any]:
+    src = raw if isinstance(raw, dict) else {}
+    defaults = default_manual_scatter()
+    enabled = bool(src.get("enabled", defaults["enabled"]))
+    return {
+        "enabled": enabled,
+        "entry_price": max(
+            0.0, _as_float(src.get("entry_price", defaults["entry_price"]), defaults["entry_price"]),
+        ),
+        "take_profit": max(
+            0.0, _as_float(src.get("take_profit", defaults["take_profit"]), defaults["take_profit"]),
+        ),
+        "stop_loss": max(
+            0.0, _as_float(src.get("stop_loss", defaults["stop_loss"]), defaults["stop_loss"]),
+        ),
+        "volume": max(
+            0.0, _as_float(src.get("volume", defaults["volume"]), defaults["volume"]),
+        ),
+        "volume_locked": bool(src.get("volume_locked", defaults["volume_locked"])),
+    }
+
+
 # ---------------------------------------------------------------------------
 # 结构模型
 # ---------------------------------------------------------------------------
@@ -246,6 +280,7 @@ class CounterTrendRule:
     # 信号级盈亏控制（与顺势规则写入相同值；运行时按魔术号独立监控）
     float_pl_ratio: dict[str, Any] = field(default_factory=default_signal_float_pl_ratio)
     lot_pl_tiers: dict[str, Any] = field(default_factory=default_signal_lot_pl_tiers)
+    manual_scatter: dict[str, Any] = field(default_factory=default_manual_scatter)
 
     @property
     def type(self) -> int:
@@ -267,6 +302,7 @@ class CounterTrendRule:
             "batch_levels": [lv.to_dict() for lv in self.batch_levels],
             "float_pl_ratio": deepcopy(self.float_pl_ratio),
             "lot_pl_tiers": deepcopy(self.lot_pl_tiers),
+            "manual_scatter": deepcopy(self.manual_scatter),
         }
 
 
@@ -287,6 +323,7 @@ class TrendFollowRule:
     batch_levels: list[BatchLevel] = field(default_factory=list)
     float_pl_ratio: dict[str, Any] = field(default_factory=default_signal_float_pl_ratio)
     lot_pl_tiers: dict[str, Any] = field(default_factory=default_signal_lot_pl_tiers)
+    manual_scatter: dict[str, Any] = field(default_factory=default_manual_scatter)
 
     @property
     def type(self) -> int:
@@ -308,6 +345,7 @@ class TrendFollowRule:
             "batch_levels": [lv.to_dict() for lv in self.batch_levels],
             "float_pl_ratio": deepcopy(self.float_pl_ratio),
             "lot_pl_tiers": deepcopy(self.lot_pl_tiers),
+            "manual_scatter": deepcopy(self.manual_scatter),
         }
 
 
@@ -788,6 +826,7 @@ def _normalize_add_on_rule(rule_type: int, raw: dict) -> dict[str, Any]:
         "lot_pl_tiers": _normalize_signal_lot_pl_tiers(
             raw.get("lot_pl_tiers", defaults.get("lot_pl_tiers")),
         ),
+        "manual_scatter": _normalize_manual_scatter(raw.get("manual_scatter")),
     }
 
 
@@ -980,6 +1019,10 @@ def validate_rules_for_template(template_id: str, rules: list[dict]) -> Optional
             if reason:
                 return reason
             signal_pl_checked = True
+        if rule_type in (RULE_TYPE_COUNTER, RULE_TYPE_TREND):
+            reason = _validate_manual_scatter_fields(rule)
+            if reason:
+                return reason
         if not _as_int(rule.get("status"), 0):
             continue
         active += 1
@@ -1027,6 +1070,26 @@ def _validate_signal_pl_fields(rule: dict) -> Optional[str]:
             return f"信号分档批次#{i + 1}手数不能为负"
         if pla == 0:
             return f"信号分档批次#{i + 1}盈亏金额不能为 0"
+    return None
+
+
+def _validate_manual_scatter_fields(rule: dict) -> Optional[str]:
+    """手动分散仓：关闭时不校验价格；启用时入场/止盈须大于 0 且不相等。"""
+    raw = rule.get("manual_scatter")
+    if not isinstance(raw, dict) or not raw.get("enabled"):
+        return None
+    entry = _as_float(raw.get("entry_price"), 0.0)
+    tp = _as_float(raw.get("take_profit"), 0.0)
+    sl = _as_float(raw.get("stop_loss"), 0.0)
+    vol = _as_float(raw.get("volume"), 0.0)
+    if entry <= 0 or tp <= 0:
+        return "手动分散仓需要填写大于 0 的入场价与止盈价"
+    if entry == tp:
+        return "手动分散仓的入场价与止盈价不能相同"
+    if sl < 0:
+        return "手动分散仓止损价不能为负"
+    if vol < 0:
+        return "手动分散仓手数不能为负"
     return None
 
 
@@ -1085,6 +1148,7 @@ def rules_to_rule_set(rules: object) -> TemplateRuleSet:
                     batch_levels=levels,
                     float_pl_ratio=deepcopy(normalized["float_pl_ratio"]),
                     lot_pl_tiers=deepcopy(normalized["lot_pl_tiers"]),
+                    manual_scatter=deepcopy(normalized["manual_scatter"]),
                 )
             elif normalized["type"] == RULE_TYPE_TREND:
                 trend = TrendFollowRule(
@@ -1101,5 +1165,6 @@ def rules_to_rule_set(rules: object) -> TemplateRuleSet:
                     batch_levels=levels,
                     float_pl_ratio=deepcopy(normalized["float_pl_ratio"]),
                     lot_pl_tiers=deepcopy(normalized["lot_pl_tiers"]),
+                    manual_scatter=deepcopy(normalized["manual_scatter"]),
                 )
     return TemplateRuleSet(counter=counter, trend=trend)

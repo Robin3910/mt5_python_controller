@@ -9,6 +9,9 @@
 - 分组 sync / poll 两种分发模式；
 - 与 normal 链路的规则隔离（不受中控台品种配置、区间/持仓过滤、节点按币种配置影响）。
 """
+import asyncio
+import time
+
 import fakeredis
 import pytest
 from sqlalchemy import delete, select
@@ -1905,3 +1908,135 @@ async def test_stop_all_on_node_stops_every_group_on_that_node(store, monkeypatc
                 nd2_status.append(row.status)
     assert nd1_status == ["closing", "closing"]
     assert nd2_status == ["opened"]
+
+
+async def test_strategy_update_rewrites_running_snapshot_and_pushes(store, monkeypatch):
+    """PATCH 热推：非终态子任务改写快照并向在线节点发 strategy_update。"""
+    from app.group_rules import strategy_rules_snapshot
+    from app.state import state as app_state
+    from app.strategies import _hot_push_running_snapshot
+
+    await online(store, mk_node("nd_ms"))
+    strategy = await mk_strategy(
+        store, symbol="XAUUSD",
+        rules=[{
+            "type": 2, "status": 1, "action": "all",
+            "point": 100, "lot_times": 1, "extra_lot": 0, "max_allow_num": 3,
+            "batch_enabled": False, "batch_levels": [],
+        }],
+    )
+    await mk_group(store, "手动单组", ["nd_ms"], strategy=strategy)
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    engine = GroupDispatcher(store)
+    # 生产 lifespan 写的是 app.state.state 单例；模块属性同名会让热推静默失败。
+    monkeypatch.setattr("app.state.group_dispatcher", object(), raising=False)
+    app_state.group_dispatcher = engine
+    try:
+        await engine.dispatch(
+            TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_ms_hot",
+        )
+        tasks = await fetch_tasks("sig_ms_hot")
+        assert len(tasks) == 1
+        task = tasks[0]
+        sent.clear()
+
+        updated = {
+            **strategy,
+            "rules": [{
+                **strategy["rules"][0],
+                "manual_scatter": {
+                    "enabled": True,
+                    "entry_price": 4400,
+                    "take_profit": 4410,
+                    "stop_loss": 0,
+                    "volume": 0.5,
+                    "volume_locked": True,
+                },
+            }],
+        }
+        await _hot_push_running_snapshot(updated)
+
+        async with SessionLocal() as s:
+            refreshed = await s.get(GroupSignalTask, task.task_id)
+        snap = refreshed.strategy_snapshot_json or {}
+        ms = (snap.get("rules") or [{}])[0].get("manual_scatter") or {}
+        assert ms.get("enabled") is True
+        assert ms.get("entry_price") == 4400
+        cmds = [m for _, m in sent if m.get("cmd") == "strategy_update"]
+        assert len(cmds) == 1
+        assert cmds[0]["task_id"] == task.task_id
+        assert cmds[0]["strategy"]["rules"][0]["manual_scatter"]["enabled"] is True
+        assert strategy_rules_snapshot(updated)["rules"][0]["manual_scatter"]["volume"] == 0.5
+    finally:
+        app_state.group_dispatcher = None
+
+
+async def test_hot_push_rewrite_timeout_does_not_raise(monkeypatch):
+    """改快照卡住时热推应超时返回，不能一直占着保存请求。"""
+    from app.strategies import HOT_PUSH_REWRITE_TIMEOUT, _hot_push_running_snapshot
+
+    async def hang(*_a, **_k):
+        await asyncio.sleep(HOT_PUSH_REWRITE_TIMEOUT + 20)
+        return []
+
+    monkeypatch.setattr(
+        "app.group_persist.rewrite_running_strategy_snapshots", hang,
+    )
+    t0 = time.monotonic()
+    await _hot_push_running_snapshot({
+        "strategy_id": "s_timeout",
+        "name": "x",
+        "symbol": "XAUUSD",
+        "template_id": TEMPLATE_1_ID,
+        "rules": [{"type": 2, "status": 1, "action": "all"}],
+    })
+    assert time.monotonic() - t0 < HOT_PUSH_REWRITE_TIMEOUT + 2
+
+
+async def test_strategy_update_send_timeout_counts_as_not_sent(monkeypatch):
+    from app.group_dispatcher import STRATEGY_UPDATE_SEND_TIMEOUT, GroupDispatcher
+
+    async def hang(_node_id, _msg):
+        await asyncio.sleep(STRATEGY_UPDATE_SEND_TIMEOUT + 20)
+        return True
+
+    monkeypatch.setattr(manager, "send_to_node", hang)
+    engine = GroupDispatcher(RedisStore(fakeredis.FakeAsyncRedis(decode_responses=True)))
+    t0 = time.monotonic()
+    sent = await engine.push_strategy_updates(
+        [{"node_id": "nd_slow", "task_id": 1, "dispatch_id": 1, "magic": 1001}],
+        {"strategy_id": "s1", "rules": []},
+    )
+    assert sent == 0
+    assert time.monotonic() - t0 < STRATEGY_UPDATE_SEND_TIMEOUT + 2
+
+
+async def test_strategy_update_skips_finished_tasks(store, monkeypatch):
+    from app.group_persist import rewrite_running_strategy_snapshots
+
+    await online(store, mk_node("nd_done"))
+    strategy = await mk_strategy(store, symbol="XAUUSD")
+    await mk_group(store, "已收口组", ["nd_done"], strategy=strategy)
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    engine = GroupDispatcher(store)
+    await engine.dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_ms_done",
+    )
+    tasks = await fetch_tasks("sig_ms_done")
+    task = tasks[0]
+    await finish_task(store, task.task_id, ["nd_done"])
+    old = (await fetch_tasks("sig_ms_done"))[0].strategy_snapshot_json
+    sent.clear()
+    subs = await rewrite_running_strategy_snapshots(strategy["strategy_id"], {
+        "strategy_id": strategy["strategy_id"],
+        "name": "x",
+        "symbol": "XAUUSD",
+        "template_id": TEMPLATE_1_ID,
+        "rules": [{"type": 2, "status": 1, "manual_scatter": {"enabled": True}}],
+    })
+    assert subs == []
+    refreshed = (await fetch_tasks("sig_ms_done"))[0].strategy_snapshot_json
+    assert refreshed == old
+

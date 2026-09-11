@@ -251,6 +251,34 @@ function limitText(detail: GroupTaskEventDetail): string {
   return `${label} ${detail.limit_value}`
 }
 
+function reconstructManualScatterFormula(detail: GroupTaskEventDetail): string {
+  const vol = detail.volume
+  if (detail.volume_locked && vol != null) {
+    return `手数 = 手填锁定 ${vol}（不按分档反推）`
+  }
+  const target = detail.target_pl
+  const per = detail.profit_per_lot
+  if (target != null && per != null && Number(per) > 0) {
+    const raw = Math.abs(Number(target)) / Number(per)
+    const lot = detail.current_lot == null ? '' : `；当前仓 ${detail.current_lot} 手命中该档`
+    return `手数 = 分档目标 ${target}u ÷ 每手止盈 ${per}u = ${Number(raw.toPrecision(4))}，向上取整 → ${vol ?? '—'}${lot}`
+  }
+  if (vol != null) return `手数 ${vol}`
+  return ''
+}
+
+function eventReason(ev: GroupTaskEventRecord): string {
+  const msg = (ev.message || '').trim()
+  const d = ev.detail
+  if (d?.kind === 'manual_scatter') {
+    const formula = d.volume_formula || reconstructManualScatterFormula(d)
+    if (formula && !msg.includes('手填') && !msg.includes('分档目标') && !msg.includes('配置 ')) {
+      return msg ? `${msg}；${formula}` : formula
+    }
+  }
+  return msg || '—'
+}
+
 /** 把开单依据拆成可逐项展示的键值对；各 kind 的参数集不同 */
 function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string }> {
   const rows: Array<{ k: string; v: string }> = []
@@ -408,6 +436,23 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
     push('手数', detail.volume || detail.lot_per_grid)
     push('持格', detail.holding_count === undefined ? '' : `${detail.holding_count}/${detail.grid_count ?? '?'}`)
     push('订单号', detail.ticket)
+    push('错误', detail.error)
+    return rows
+  }
+  if (detail.kind === 'manual_scatter') {
+    push('规则', Number(detail.rule_type) === 1 ? '逆势' : '顺势')
+    push('方向', detail.direction)
+    push('手数公式', detail.volume_formula || reconstructManualScatterFormula(detail))
+    push('手数来源', detail.volume_locked ? '手填锁定' : (detail.target_pl != null ? '分档反推' : '配置手数'))
+    push('本次手数', detail.volume)
+    push('当前仓手数', detail.current_lot)
+    push('分档目标', detail.target_pl == null ? '' : `${detail.target_pl}u`)
+    push('每手止盈', detail.profit_per_lot == null || detail.profit_per_lot === 0 ? '' : `${detail.profit_per_lot}u`)
+    push('手数步长', detail.volume_step)
+    push('入场价', detail.entry_price)
+    push('止盈价', detail.take_profit)
+    push('止损价', detail.stop_loss || '不设')
+    push('注释', detail.comment)
     push('错误', detail.error)
     return rows
   }
@@ -587,6 +632,7 @@ function eventTag(
     open: { cls: 'green', text: '开仓' },
     add_counter: { cls: 'amber', text: '逆势加仓' },
     add_trend: { cls: 'amber', text: '顺势加仓' },
+    add_manual: { cls: 'amber', text: '手动分散仓' },
     grid_add: { cls: 'amber', text: '网格买入' },
     grid_shift: { cls: 'blue', text: '网格平移' },
     breakeven: { cls: 'blue', text: '保本' },
@@ -852,7 +898,7 @@ onUnmounted(stopAutoRefresh)
                                         <td class="right">{{ ev.position_count ?? '—' }}</td>
                                         <td class="right">{{ ev.total_volume ?? '—' }}</td>
                                         <td class="right">{{ ev.profit ?? '—' }}</td>
-                                        <td class="muted group-break">{{ ev.message || '—' }}</td>
+                                        <td class="muted group-break">{{ eventReason(ev) }}</td>
                                       </tr>
                                       <tr v-if="ev.detail && isEventExpanded(d.id, ev)" class="detail-row">
                                         <td></td>

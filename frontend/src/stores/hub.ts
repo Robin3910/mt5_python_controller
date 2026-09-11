@@ -238,7 +238,12 @@ export const useHubStore = defineStore('hub', {
       options?: { q?: string },
     ): Promise<StrategyOut> {
       const created = (await api.post('/api/strategies', payload)).data
-      await this.fetchStrategies(options)
+      try {
+        await this.fetchStrategies(options)
+      } catch {
+        const exists = this.strategies.some((s) => s.strategy_id === created.strategy_id)
+        if (!exists) this.strategies = [...this.strategies, created]
+      }
       return created
     },
     async updateStrategy(
@@ -246,8 +251,14 @@ export const useHubStore = defineStore('hub', {
       patch: StrategyUpdatePayload,
       options?: { q?: string },
     ): Promise<void> {
-      await api.patch(`/api/strategies/${id}`, patch)
-      await this.fetchStrategies(options)
+      const { data } = await api.patch<StrategyOut>(`/api/strategies/${id}`, patch)
+      try {
+        await this.fetchStrategies(options)
+      } catch {
+        const idx = this.strategies.findIndex((s) => s.strategy_id === id)
+        if (idx >= 0) this.strategies[idx] = data
+        else this.strategies.push(data)
+      }
     },
     async deleteStrategy(id: string, options?: { q?: string }): Promise<void> {
       await api.delete(`/api/strategies/${id}`)

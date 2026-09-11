@@ -3,10 +3,14 @@
 提供策略模版列表，以及策略实例的新建 / 查询 / 更新 / 删除。
 新建时选择模版，复制默认规则，并绑定品种。
 """
-from fastapi import APIRouter, Depends, HTTPException, Request
+import asyncio
+import logging
 
-from . import persist, strategy_service, strategy_templates
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+
+from . import group_persist, group_rules, persist, strategy_service, strategy_templates
 from .deps import client_ip, get_current_admin, get_store
+from .state import state
 from .models import (
     StrategyCreate,
     StrategyOut,
@@ -17,6 +21,47 @@ from .models import (
 from .redis_store import RedisStore
 
 router = APIRouter(prefix="/api/strategies", tags=["strategies"])
+logger = logging.getLogger(__name__)
+
+# 热推不得拖住 PATCH：改快照 / WS 下发各自封顶，超时只打日志。
+HOT_PUSH_REWRITE_TIMEOUT = 3.0
+
+
+async def _hot_push_running_snapshot(strategy: dict) -> None:
+    """PATCH 落库后 best-effort 改写进行中快照并 WS 下发；失败/超时不挡保存。"""
+    sid = str((strategy or {}).get("strategy_id") or "")
+    try:
+        snapshot = group_rules.strategy_rules_snapshot(strategy)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("strategy snapshot for hot-push failed %s: %s", sid, e)
+        return
+    if not snapshot or not sid:
+        return
+    try:
+        subs = await asyncio.wait_for(
+            group_persist.rewrite_running_strategy_snapshots(sid, snapshot),
+            timeout=HOT_PUSH_REWRITE_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("rewrite running snapshots timed out %s", sid)
+        return
+    except Exception as e:  # noqa: BLE001
+        logger.warning("rewrite running snapshots failed %s: %s", sid, e)
+        return
+    if not subs:
+        return
+    engine = state.group_dispatcher
+    if engine is None:
+        logger.warning("hot-push skipped %s: group dispatcher not ready", sid)
+        return
+    try:
+        sent = await engine.push_strategy_updates(subs, snapshot)
+        logger.info(
+            "strategy %s hot-pushed to %d/%d running subtask(s)",
+            sid, sent, len(subs),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("push strategy_update failed %s: %s", sid, e)
 
 
 def _strategy_audit_snapshot(d: dict | None) -> dict | None:
@@ -83,7 +128,13 @@ async def list_strategies(
             or needle in (s.get("symbol") or "").lower()
         ]
     items.sort(key=lambda s: (s.get("created_at", 0), s.get("name") or ""))
-    return [_to_strategy_out(s) for s in items]
+    out: list[StrategyOut] = []
+    for s in items:
+        try:
+            out.append(_to_strategy_out(s))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("skip invalid strategy %s: %s", (s or {}).get("strategy_id"), e)
+    return out
 
 
 @router.post("", response_model=StrategyOut, status_code=201)
@@ -124,6 +175,7 @@ async def update_strategy(
     strategy_id: str,
     body: StrategyUpdate,
     request: Request,
+    background_tasks: BackgroundTasks,
     store: RedisStore = Depends(get_store),
     admin: str = Depends(get_current_admin),
 ):
@@ -142,7 +194,13 @@ async def update_strategy(
         client_ip(request),
         category="console", before=before, after=_strategy_audit_snapshot(d),
     )
-    return _to_strategy_out(d)
+    # 先把 HTTP 200 发出去，避免改快照 / 节点 WS 卡住时前端 15s 超时误报保存失败。
+    background_tasks.add_task(_hot_push_running_snapshot, d)
+    try:
+        return _to_strategy_out(d)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("strategy out serialize failed %s: %s", strategy_id, e)
+        raise HTTPException(status_code=500, detail="策略已保存，但回读失败，请刷新列表") from e
 
 
 @router.delete("/{strategy_id}")

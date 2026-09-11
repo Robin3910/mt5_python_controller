@@ -363,7 +363,11 @@ def aggregate_task_status(dispatch_statuses: list[str]) -> str:
 
 
 def strategy_rules_snapshot(strategy: Optional[dict]) -> Optional[dict]:
-    """把绑定策略压成随任务下发的快照，运行期不再受策略后续编辑影响。"""
+    """把绑定策略压成随任务下发的快照。
+
+    默认随任务冻结；策略保存时会对进行中子任务重写并热推（见 group_persist
+    rewrite_running_strategy_snapshots）。
+    """
     if not strategy:
         return None
     return {
