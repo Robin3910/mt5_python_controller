@@ -116,6 +116,32 @@ class MT5Error(RuntimeError):
     pass
 
 
+# MetaTrader5 IPC：last_error 的 1 = RES_S_OK。部分终端真空仓时 positions_get
+# / orders_get 返回 None 而不是空元组，只有成功码才能当成「确实没有」。
+_BOOK_OK_CODES = {0, 1}
+
+
+def mt5_book_rows(rows, *, api_name: str):
+    """positions_get / orders_get：None 是读失败，() 才是真空仓。
+
+    旧写法 `positions_get() or []` 会把失败和空仓混成同一件事，策略监控会误发
+    GONE、账户快照会对账收口，MT5 里实际还挂着仓。
+    """
+    if rows is not None:
+        return rows
+    err = None
+    getter = getattr(mt5, "last_error", None) if mt5 is not None else None
+    if callable(getter):
+        try:
+            err = getter()
+        except Exception:  # noqa: BLE001
+            err = None
+    code = err[0] if isinstance(err, (tuple, list)) and err else None
+    if code in _BOOK_OK_CODES:
+        return ()
+    raise MT5Error(f"{api_name} failed: {err}")
+
+
 def peek_logged_in_account(path: str) -> dict | None:
     """尝试附着终端并读取当前已登录账户；未登录返回 None。用完会 shutdown。"""
     if mt5 is None:
@@ -293,10 +319,13 @@ class MT5Client:
         }
 
     def positions(self) -> list[dict]:
-        """返回当前所有持仓（标准化字段，方向转 BUY/SELL 字符串）。"""
+        """返回当前所有持仓（标准化字段，方向转 BUY/SELL 字符串）。
+
+        读失败抛 MT5Error，不得返回空列表——调用方要能区分「真空仓」和「没读到」。
+        """
         self.ensure()
         out = []
-        for p in mt5.positions_get() or []:
+        for p in mt5_book_rows(mt5.positions_get(), api_name="positions_get"):
             out.append(
                 {
                     "ticket": p.ticket,
@@ -323,7 +352,7 @@ class MT5Client:
         """
         self.ensure()
         out = []
-        for o in mt5.orders_get() or []:
+        for o in mt5_book_rows(mt5.orders_get(), api_name="orders_get"):
             otype = int(getattr(o, "type", -1))
             direction, kind = _PENDING_TYPE_NAMES.get(otype, ("", ""))
             if not direction:

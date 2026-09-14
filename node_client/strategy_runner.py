@@ -40,7 +40,10 @@ import close_reason
 from strategy_rules import (
     CALC_BAR_TYPES,
     MT5_COMMENT_LIMIT,
+    RULE_TYPE_COUNTER,
+    RULE_TYPE_TREND,
     PositionCtx,
+    count_adds_by_rule,
     counter_anchor_price,
     decision_comment,
     decision_detail,
@@ -153,6 +156,7 @@ class StrategyRunner:
         self.direction = str(self.entry.get("action") or "BUY").upper()
         self.base_volume = _as_float(self.entry.get("volume"))
         self.add_count = 0
+        self.add_counts: dict[int, int] = {RULE_TYPE_COUNTER: 0, RULE_TYPE_TREND: 0}
         self.total_orders = 0
         self.total_volume = 0.0
         self._opened = False
@@ -315,6 +319,7 @@ class StrategyRunner:
             "grid_detached": self._grid_detached,
             "opened": self._opened,
             "add_count": self.add_count,
+            "add_counts": dict(self.add_counts),
             "total_orders": self.total_orders,
             "total_volume": self.total_volume,
             "done": self.done,
@@ -489,6 +494,17 @@ class StrategyRunner:
         """加仓判定上下文：顺势取最近一笔；逆势取不利方向最深开仓价（通常即首仓）。"""
         latest = max(positions, key=lambda p: (p.get("time") or 0, p.get("ticket") or 0))
         opens = [_as_float(p.get("price_open")) for p in positions]
+        counted = count_adds_by_rule(positions)
+        merged = {
+            RULE_TYPE_COUNTER: max(
+                self.add_counts.get(RULE_TYPE_COUNTER, 0),
+                counted.get(RULE_TYPE_COUNTER, 0),
+            ),
+            RULE_TYPE_TREND: max(
+                self.add_counts.get(RULE_TYPE_TREND, 0),
+                counted.get(RULE_TYPE_TREND, 0),
+            ),
+        }
         return PositionCtx(
             direction=self.direction,
             position_count=len(positions),
@@ -497,7 +513,8 @@ class StrategyRunner:
             counter_base_price=counter_anchor_price(self.direction, opens),
             price=event.price,
             point=event.point,
-            add_count=self.add_count,
+            add_count=sum(merged.values()),
+            add_counts=merged,
         )
 
     async def _read_balance(self) -> Optional[float]:
@@ -574,21 +591,24 @@ class StrategyRunner:
     def _seed_from_positions(self, positions: list[dict]) -> None:
         """恢复后按真实持仓重建计数。
 
-        断线时节点内存里的计数已丢失，若从 0 重新计，非分批规则的 max_allow_num
-        会失效而超额加仓。这里以当前持仓笔数反推：首单 1 笔，其余都是加仓。
+        断线时节点内存里的计数已丢失。分批 / 最大加仓次数按规则独立，
+        从加仓单备注 R1 / R2 分类统计；无前缀的当作开仓，不计加仓。
         """
         self._seed_pending = False
         self._manual_fired |= manual_scatter.fired_rule_types(positions)
         filtered = manual_scatter.exclude_manual(positions)
-        count = len(filtered)
-        if count > 0:
-            self.add_count = max(self.add_count, count - 1)
-            self.total_orders = max(self.total_orders, count)
+        counted = count_adds_by_rule(filtered)
+        for rule_type, n in counted.items():
+            self.add_counts[rule_type] = max(self.add_counts.get(rule_type, 0), n)
+        seeded = sum(self.add_counts.values())
+        self.add_count = max(self.add_count, seeded)
+        if filtered:
+            self.total_orders = max(self.total_orders, len(filtered))
         volume = round(sum(_as_float(p.get("volume")) for p in positions), 4)
         self.total_volume = max(self.total_volume, volume)
         logger.info(
-            "task %s resumed with %d position(s) (%d add-on): add_count=%s total_volume=%s",
-            self.task_id, len(positions), count, self.add_count, self.total_volume,
+            "task %s resumed with %d position(s) (%d add-on): add_count=%s add_counts=%s total_volume=%s",
+            self.task_id, len(positions), seeded, self.add_count, self.add_counts, self.total_volume,
         )
 
     # ------------------------------------------------------------------
@@ -653,7 +673,9 @@ class StrategyRunner:
                 detail={**decision_detail(decision), "error": str(res.get("error") or "")},
             )
             return
-        self.add_count += 1
+        rule_type = int(decision.rule_type)
+        self.add_counts[rule_type] = self.add_counts.get(rule_type, 0) + 1
+        self.add_count = sum(self.add_counts.values())
         self.total_orders += 1
         self.total_volume += decision.volume
         logger.info("task %s add #%s: %s", self.task_id, self.add_count, reason)
@@ -671,21 +693,25 @@ class StrategyRunner:
     async def _maybe_open_manual_scatter(
         self, event: MarketEvent, positions: list[dict],
     ) -> bool:
-        """价到入场则市价开一条手动分散仓。成功返回 True，本拍不再走分批加仓。"""
+        """成交侧到价则市价开一条手动分散仓。成功返回 True，本拍不再走分批加仓。"""
         watches = manual_scatter.extract_watches(self.strategy.get("rules"))
         if not watches:
             return False
         self._manual_fired |= manual_scatter.fired_rule_types(positions)
-        price = _as_float(event.price)
         for watch in watches:
             rule_type = int(watch.get("rule_type") or 0)
             if rule_type in self._manual_fired:
                 continue
             cfg = watch.get("cfg") if isinstance(watch.get("cfg"), dict) else {}
+            direction = str(watch.get("direction") or "")
+            price = manual_scatter.fill_side_price(
+                direction,
+                bid=_as_float(event.bid),
+                ask=_as_float(event.ask),
+                fallback=_as_float(event.price),
+            )
             if not manual_scatter.price_reached(
-                str(watch.get("direction") or ""),
-                price,
-                _as_float(cfg.get("entry_price")),
+                direction, price, _as_float(cfg.get("entry_price")),
             ):
                 continue
             if await self._open_manual_scatter(watch, positions):
@@ -1699,6 +1725,7 @@ class StrategyRunner:
             "position_count": len(pos),
             "pending_orders": self._pending_orders,
             "add_count": self.add_count,
+            "add_counts": dict(self.add_counts),
             "total_orders": self.total_orders,
             "total_volume": round(self.total_volume, 4),
             "profit": profit,

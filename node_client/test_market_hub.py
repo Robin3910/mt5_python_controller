@@ -110,6 +110,8 @@ async def test_sample_emits_tick_with_price_and_point():
 
     assert event.kind == mh.TICK
     assert event.price == 2330.0  # 多单看买价
+    assert event.bid == 2330.0
+    assert event.ask == 2330.2
     assert event.point == 0.01
     assert len(event.positions) == 1
     assert event.positions[0]["ticket"] == 1
@@ -123,7 +125,10 @@ async def test_sell_direction_uses_ask_price():
 
     await hub.sample()
 
-    assert (await sub.next_event()).price == 2330.2
+    event = await sub.next_event()
+    assert event.price == 2330.2
+    assert event.bid == 2330.0
+    assert event.ask == 2330.2
 
 
 async def test_price_falls_back_to_position_when_quote_missing():

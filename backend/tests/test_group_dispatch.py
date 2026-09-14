@@ -2040,3 +2040,63 @@ async def test_strategy_update_skips_finished_tasks(store, monkeypatch):
     refreshed = (await fetch_tasks("sig_ms_done"))[0].strategy_snapshot_json
     assert refreshed == old
 
+
+def test_note_absent_magics_needs_consecutive_misses():
+    hits: dict[int, int] = {}
+    watched = {31}
+    assert group_persist.note_absent_magics(set(), watched, hits) == set()
+    assert hits[31] == 1
+    assert group_persist.note_absent_magics(set(), watched, hits) == {31}
+    assert hits[31] == 2
+
+
+def test_note_absent_magics_resets_when_seen_again():
+    hits = {31: 1}
+    assert group_persist.note_absent_magics({31}, {31}, hits) == set()
+    assert 31 not in hits
+
+
+async def test_reconcile_skips_first_empty_snapshot(store, monkeypatch):
+    """一轮残缺快照不能收口；连续两轮看不到魔术号才兜底完成。"""
+    await online(store, mk_node("nd_a"))
+    await mk_group(store, "对账确认组", ["nd_a"])
+    monkeypatch.setattr(manager, "send_to_node", capture_sender([]))
+    await GroupDispatcher(store).dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_recon_miss",
+    )
+    task = (await fetch_tasks("sig_recon_miss"))[0]
+    await open_first_orders(task.task_id, ["nd_a"])
+    hits: dict[int, int] = {}
+
+    first = await group_persist.reconcile_node_positions("nd_a", set(), hits=hits)
+    assert first == []
+    rows = await fetch_dispatches(task.task_id)
+    assert rows[0].status == "opened"
+
+    second = await group_persist.reconcile_node_positions("nd_a", set(), hits=hits)
+    assert second
+    assert second[0]["task_status"] == "done"
+    rows = await fetch_dispatches(task.task_id)
+    assert rows[0].status == "done"
+    assert rows[0].finish_reason == "reconciled_no_position"
+
+
+async def test_reconcile_resets_misses_when_magic_reappears(store, monkeypatch):
+    await online(store, mk_node("nd_a"))
+    await mk_group(store, "对账复位组", ["nd_a"])
+    monkeypatch.setattr(manager, "send_to_node", capture_sender([]))
+    await GroupDispatcher(store).dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_recon_reset",
+    )
+    task = (await fetch_tasks("sig_recon_reset"))[0]
+    await open_first_orders(task.task_id, ["nd_a"])
+    magic = int((await magics_of(task.task_id))["nd_a"])
+    hits: dict[int, int] = {}
+
+    await group_persist.reconcile_node_positions("nd_a", set(), hits=hits)
+    await group_persist.reconcile_node_positions("nd_a", {magic}, hits=hits)
+    again = await group_persist.reconcile_node_positions("nd_a", set(), hits=hits)
+    assert again == []
+    rows = await fetch_dispatches(task.task_id)
+    assert rows[0].status == "opened"
+

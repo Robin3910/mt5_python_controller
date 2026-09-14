@@ -109,8 +109,23 @@ def direction_from_prices(entry: float, take_profit: float) -> Optional[str]:
     return "BUY" if take_profit > entry else "SELL"
 
 
+def fill_side_price(
+    direction: str, *, bid: float = 0.0, ask: float = 0.0, fallback: float = 0.0,
+) -> float:
+    """开仓成交侧报价，与 `place_market_order` 一致：BUY=ask，SELL=bid。
+
+    缺对应侧时报 fallback（兼容只带平仓侧 `event.price` 的旧事件 / 单测）。
+    """
+    side = str(direction or "").strip().upper()
+    if side == "BUY":
+        return ask if ask > 0 else fallback
+    if side == "SELL":
+        return bid if bid > 0 else fallback
+    return fallback
+
+
 def price_reached(direction: str, price: float, entry: float) -> bool:
-    """BUY：现价已到或越过入场（>=）；SELL：现价已到或越过入场（<=）。"""
+    """BUY：成交侧现价已到或越过入场（>=）；SELL：成交侧现价已到或越过入场（<=）。"""
     if entry <= 0 or price <= 0:
         return False
     side = str(direction or "").strip().upper()

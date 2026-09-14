@@ -244,12 +244,12 @@ class RuleSet(Protocol):
 
 @dataclass
 class BatchLevel:
-    """分批加仓档位：在持仓笔数 [pos_from, pos_to] 内使用本组参数。
+    """分批加仓档位：在本规则第 [pos_from, pos_to] 次加仓内使用本组参数。
 
     加仓间距由 calc_type 决定用哪个参数：point 用点数，price 用指定价位，
     atr / range 用 timeframe 周期上的 K 线统计值（间距由行情实时算出）。
     """
-    pos_from: int = 2
+    pos_from: int = 1
     pos_to: int = 4
     calc_type: str = BATCH_CALC_POINT
     point: float = 100.0            # calc_type=point：触发点数
@@ -509,9 +509,9 @@ class GridRuleSet:
 
 
 def _default_counter_batch_levels() -> list[BatchLevel]:
-    """MTcommander 风格默认分批档位。"""
+    """默认分批档位：本规则第 1～10 次加仓，三档均分。"""
     return [
-        BatchLevel(pos_from=2, pos_to=4, point=100.0, lot_times=1.1, extra_lot=0.0),
+        BatchLevel(pos_from=1, pos_to=4, point=100.0, lot_times=1.1, extra_lot=0.0),
         BatchLevel(pos_from=5, pos_to=7, point=200.0, lot_times=1.2, extra_lot=0.0),
         BatchLevel(pos_from=8, pos_to=10, point=300.0, lot_times=1.3, extra_lot=0.0),
     ]

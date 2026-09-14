@@ -85,6 +85,9 @@ class MarketEvent:
     ts: float = 0.0
     # 该魔术号名下未成交的挂单；仅 track_orders 的订阅会被填充
     orders: tuple[dict, ...] = ()
+    # 原始买卖价；price 仍是平仓侧（多 bid / 空 ask）。开仓判定请用成交侧。
+    bid: float = 0.0
+    ask: float = 0.0
 
 
 @dataclass
@@ -260,6 +263,7 @@ class MarketHub:
             held = by_magic.get(sub.magic, [])
             resting = orders_by_magic.get(sub.magic, []) if sub.track_orders else []
             price = self._pick_price(quotes, sub, held)
+            bid, ask = self._quote_sides(quotes, sub.symbol)
             point = await self._point(sub.symbol)
             kind = self._classify(sub, held, resting, price, now)
             if kind is None:
@@ -269,7 +273,7 @@ class MarketHub:
                 MarketEvent(
                     kind=kind, symbol=sub.symbol, magic=sub.magic,
                     positions=tuple(held), price=price, point=point, ts=now,
-                    orders=tuple(resting),
+                    orders=tuple(resting), bid=bid, ask=ask,
                 )
             )
 
@@ -400,6 +404,20 @@ class MarketHub:
         if value > 0:
             self._metrics[key] = (value, now + bar_metrics.cache_seconds(timeframe))
         return value
+
+    @staticmethod
+    def _quote_sides(quotes: dict, symbol: str) -> tuple[float, float]:
+        """原始买卖价；取不到返回 (0, 0)。"""
+        quote = quotes.get(symbol) or quotes.get((symbol or "").upper()) or {}
+        try:
+            bid = float(quote.get("bid") or 0.0)
+        except (TypeError, ValueError):
+            bid = 0.0
+        try:
+            ask = float(quote.get("ask") or 0.0)
+        except (TypeError, ValueError):
+            ask = 0.0
+        return bid, ask
 
     @staticmethod
     def _pick_price(quotes: dict, sub: Subscription, held: list[dict]) -> float:

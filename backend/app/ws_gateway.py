@@ -34,6 +34,10 @@ from .state import state
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+# 账户快照对账的连续空仓计数：node_id -> {magic: consecutive_misses}
+# 断线即丢，重连后重新数，避免把下线期间的残缺快照带进下一轮。
+_reconcile_hits: dict[str, dict[int, int]] = {}
+
 
 class LoginMismatchError(Exception):
     """会话中检测到终端账号与节点绑定不符，应结束该连接。"""
@@ -213,6 +217,7 @@ async def node_ws(ws: WebSocket):
     finally:
         # 无论何种原因断开，都要清理连接与在线标记，并通知后台
         manager.unregister_node(node_id, ws)
+        _reconcile_hits.pop(node_id, None)
         await store.set_offline(node_id)
         await manager.broadcast_admin(
             {"type": "node_status", "data": {"node_id": node_id, "status": "offline"}}
@@ -282,7 +287,18 @@ async def _save_account(node_id: str, ws: WebSocket, data: dict) -> None:
     await _enforce_login_match(node_id, ws, reported)
 
     store = state.store
+    books_ok = _snapshot_books_readable(data)
     acct = dict(data.get("account") or {})
+    positions = data.get("positions", [])
+    orders = data.get("orders", [])
+    if not books_ok:
+        prev = await store.get_account(node_id) or {}
+        positions = list(prev.get("positions") or [])
+        orders = list(prev.get("orders") or [])
+        logger.warning(
+            "node %s account books unreadable, keep last snapshot and skip reconcile",
+            node_id,
+        )
     snapshot = {
         "node_id": node_id,
         "login": acct.get("login") or data.get("login"),
@@ -292,9 +308,9 @@ async def _save_account(node_id: str, ws: WebSocket, data: dict) -> None:
         "margin": acct.get("margin", 0),
         "free_margin": acct.get("free_margin", acct.get("margin_free", 0)),
         "leverage": acct.get("leverage", 0),
-        "positions": data.get("positions", []),
+        "positions": positions,
         # 未成交挂单：限价开仓的任务在成交前只有它，对账必须看得见
-        "orders": data.get("orders", []),
+        "orders": orders,
         "prices": data.get("prices", {}),  # 供区间过滤取价
         "quotes": data.get("quotes", {}),
         "updated_at": time.time(),
@@ -302,11 +318,11 @@ async def _save_account(node_id: str, ws: WebSocket, data: dict) -> None:
         "server_time_offset": data.get("server_time_offset"),
     }
     await store.save_account(node_id, snapshot)
-    await _reconcile_strategy_tasks(
-        node_id, snapshot.get("positions") or [], snapshot.get("orders") or [],
-    )
+    if books_ok:
+        await _reconcile_strategy_tasks(node_id, positions or [], orders or [])
     await manager.broadcast_admin({"type": "account", "data": snapshot})
-    asyncio.create_task(_run_limit_watch(node_id, snapshot.get("orders") or []))
+    if books_ok:
+        asyncio.create_task(_run_limit_watch(node_id, orders or []))
 
 
 async def _run_limit_watch(node_id: str, orders: list) -> None:
@@ -328,6 +344,25 @@ def _magics_of(rows: list) -> set[int]:
     return out
 
 
+def _snapshot_books_readable(data: dict) -> bool:
+    """持仓账本是否可读。读失败绝不能拿去对账。
+
+    新节点显式带 `books_ok=false`；旧节点读失败时会发空账户 + 空持仓 + 空报价，
+    也不能当成真空仓。真正的空仓快照会带上 login/balance 等账户字段。
+    """
+    if data.get("books_ok") is False:
+        return False
+    account = data.get("account") or {}
+    quotes = data.get("quotes") or {}
+    prices = data.get("prices") or {}
+    if not account and not quotes and not prices:
+        positions = data.get("positions") or []
+        orders = data.get("orders") or []
+        if not positions and not orders:
+            return False
+    return True
+
+
 async def _reconcile_strategy_tasks(
     node_id: str, positions: list, orders: list | None = None,
 ) -> None:
@@ -337,7 +372,10 @@ async def _reconcile_strategy_tasks(
     已平仓而提前收口、释放节点占位，那张挂单就成了没人监控的孤儿单。
     """
     magics = _magics_of(positions) | _magics_of(orders or [])
-    for done in await group_persist.reconcile_node_positions(node_id, magics):
+    hits = _reconcile_hits.setdefault(node_id, {})
+    for done in await group_persist.reconcile_node_positions(
+        node_id, magics, hits=hits,
+    ):
         logger.info(
             "task %s reconciled from account snapshot of %s", done.get("task_id"), node_id,
         )

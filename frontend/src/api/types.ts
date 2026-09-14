@@ -470,7 +470,7 @@ export type BatchCalcType = 'point' | 'price' | 'atr' | 'range'
 /** ATR / 波幅可选的 K 线周期 */
 export type BatchTimeframe = 'M1' | 'M5' | 'M15' | 'M30' | 'H1' | 'H4' | 'D1' | 'W1' | 'MN'
 
-/** 分批加仓档位：持仓笔数区间内的加仓间距 / 倍数 */
+/** 分批加仓档位：本规则第几次加仓区间内的间距 / 倍数 */
 export interface StrategyBatchLevel {
   pos_from: number
   pos_to: number
@@ -534,7 +534,7 @@ export interface StrategyRule {
   batch_action?: string
   /** 分批批数 */
   batch_count?: number
-  /** 总手数上限，0=不限制 */
+  /** 本规则最多加仓笔数（不含开仓），0=不限制 */
   total_lot_limit?: number
   batch_levels?: StrategyBatchLevel[]
   /** 信号级盈亏比（模版1 顺势/逆势写入相同值） */
@@ -809,6 +809,7 @@ export interface GroupTaskEventDetail {
   volume_formula?: string
   position_count?: number
   add_count?: number
+  next_rule_add_no?: number
   next_position_no?: number
   limit_kind?: string
   limit_value?: number

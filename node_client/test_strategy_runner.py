@@ -436,8 +436,9 @@ async def test_tick_without_decision_reports_heartbeat():
 async def test_resume_skips_first_order_and_seeds_counters():
     sent: list = []
     mt5 = MockMT5Client()
-    for _ in range(3):  # 断线前已有首单 + 2 次加仓
-        mt5.place_market_order("XAUUSD", "BUY", 0.1, magic=MAGIC)
+    mt5.place_market_order("XAUUSD", "BUY", 0.1, comment="S1", magic=MAGIC)
+    mt5.place_market_order("XAUUSD", "BUY", 0.1, comment="R1D100", magic=MAGIC)
+    mt5.place_market_order("XAUUSD", "BUY", 0.1, comment="R2L0D80", magic=MAGIC)
 
     runner, hub = _runner(sent, mt5=mt5)
     runner.start(resume=True)
@@ -452,7 +453,9 @@ async def test_resume_skips_first_order_and_seeds_counters():
     ))
     await _settle()
 
-    assert runner.add_count == 2  # 3 笔持仓 = 首单 + 2 次加仓
+    assert runner.add_count == 2
+    assert runner.add_counts[1] == 1
+    assert runner.add_counts[2] == 1
     assert runner.total_orders == 3
     assert runner.total_volume == 0.3
     runner.cancel()
@@ -462,8 +465,9 @@ async def test_resumed_runner_respects_max_allow_num():
     """恢复后计数已重建，达到次数上限就不再加仓。"""
     sent: list = []
     mt5 = MockMT5Client()
-    for _ in range(4):  # 首单 + 3 次加仓，已达 max_allow_num=3
-        mt5.place_market_order("XAUUSD", "BUY", 0.1, magic=MAGIC)
+    mt5.place_market_order("XAUUSD", "BUY", 0.1, comment="S1", magic=MAGIC)
+    for _ in range(3):  # 3 次逆势加仓，已达 max_allow_num=3
+        mt5.place_market_order("XAUUSD", "BUY", 0.1, comment="R1D100", magic=MAGIC)
 
     runner, hub = _runner(sent, mt5=mt5)
     runner.start(resume=True)
@@ -477,7 +481,74 @@ async def test_resumed_runner_respects_max_allow_num():
     await _settle()
 
     assert runner.add_count == 3
+    assert runner.add_counts[1] == 3
     assert len(mt5.positions_by_magic(MAGIC)) == 4
+    runner.cancel()
+
+
+async def test_counter_batch_full_does_not_block_trend_batch():
+    """逆势加仓笔数加满后，顺势仍可按自己的上限继续加。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    strategy = {"rules": [
+        {
+            "type": 1, "status": 1, "action": "all",
+            "point": 100, "lot_times": 1.1, "extra_lot": 0.0,
+            "max_allow_num": 10, "batch_enabled": True, "batch_action": "all",
+            "total_lot_limit": 2,
+            "batch_levels": [{
+                "pos_from": 1, "pos_to": 2, "calc_type": "point",
+                "point": 100, "lot_times": 1.1, "extra_lot": 0,
+            }],
+        },
+        {
+            "type": 2, "status": 1, "action": "all",
+            "point": 100, "lot_times": 0.8, "extra_lot": 0.0,
+            "max_allow_num": 10, "batch_enabled": True, "batch_action": "all",
+            "total_lot_limit": 3,
+            "batch_levels": [{
+                "pos_from": 1, "pos_to": 3, "calc_type": "point",
+                "point": 100, "lot_times": 0.8, "extra_lot": 0,
+            }],
+        },
+    ]}
+    runner, hub = _runner(sent, mt5=mt5, strategy=strategy)
+    runner.start()
+    await _settle()
+
+    first_px = mt5.positions_by_magic(MAGIC)[0]["price_open"]
+    for step in (1.0, 2.0):
+        px = first_px - step
+        mt5.prices_map["XAUUSD"] = px
+        hub.sub.offer(mh.MarketEvent(
+            kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+            positions=tuple(mt5.positions_by_magic(MAGIC)),
+            price=px, point=0.01,
+        ))
+        await _settle()
+    assert runner.add_counts[1] == 2
+    assert runner.add_counts[2] == 0
+
+    deeper = first_px - 5.0
+    mt5.prices_map["XAUUSD"] = deeper
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(mt5.positions_by_magic(MAGIC)),
+        price=deeper, point=0.01,
+    ))
+    await _settle()
+    assert runner.add_counts[1] == 2
+
+    latest = max(p["price_open"] for p in mt5.positions_by_magic(MAGIC))
+    trend_px = latest + 1.0
+    mt5.prices_map["XAUUSD"] = trend_px
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(mt5.positions_by_magic(MAGIC)),
+        price=trend_px, point=0.01,
+    ))
+    await _settle()
+    assert runner.add_counts[2] == 1
     runner.cancel()
 
 

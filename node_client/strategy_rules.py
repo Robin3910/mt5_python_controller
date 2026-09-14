@@ -7,9 +7,9 @@
 - action：监控方向 all | buy | sell
 - point：触发点数，偏离达到 point × Point() 后加仓
 - lot_times / extra_lot：手数 = lot_times × 基础手数 + extra_lot
-- max_allow_num：最大加仓次数（未启用分批时的次数上限）
-- batch_enabled / batch_levels：分批档位，按当前持仓笔数命中不同的点数与倍数
-- total_lot_limit：分批持仓笔数上限（与后台档位末笔一致）
+- max_allow_num：最大加仓次数（未启用分批时，按本规则已加次数计，不含开仓）
+- batch_enabled / batch_levels：分批档位，按本规则第几次加仓命中不同的点数与倍数
+- total_lot_limit：本规则最多加仓笔数（不含开仓，与另一条规则独立）
 
 逆势 = 价格朝持仓不利方向偏离后同向加仓；顺势 = 朝有利方向偏离后同向加仓。
 两者都只加与原持仓同方向的仓位。
@@ -22,10 +22,14 @@
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
 from bar_metrics import BAR_PERIOD
+
+# 加仓单备注：R1L0D121 / R1D100；避开模版2 的 R3B、手动仓 M1/M2、首单任意备注
+_ADD_COMMENT_RE = re.compile(r"^R([12])(?:L|[DPAW]|$)")
 
 RULE_TYPE_COUNTER = 1  # 逆势
 RULE_TYPE_TREND = 2    # 顺势
@@ -54,12 +58,14 @@ def metric_key(metric: str, timeframe: object) -> str:
 class PositionCtx:
     """判定加仓所需的实时上下文。"""
     direction: str          # 本次任务持仓方向：BUY / SELL
-    position_count: int     # 当前该魔术号的持仓笔数
+    position_count: int     # 当前该魔术号的持仓笔数（说明用，不含手动仓）
     base_volume: float      # 首单手数（倍率的基准）
     base_price: float       # 最近一笔开仓价（顺势偏离基准）
     price: float            # 当前市价
     point: float            # 品种最小价格变动单位
-    add_count: int = 0      # 已加仓次数
+    add_count: int = 0      # 已加仓总次数；未填 add_counts 时作为单规则回退
+    # 按规则类型的已加次数（不含开仓）；有值时优先于 add_count
+    add_counts: dict = field(default_factory=dict)
     # ATR / 波幅的预取值（键见 metric_key，值是价格距离）。
     # 判定层不做 I/O，读 K 线由执行器在判定前完成。
     bar_metrics: dict = field(default_factory=dict)
@@ -69,6 +75,15 @@ class PositionCtx:
     def __post_init__(self) -> None:
         if self.counter_base_price is None:
             self.counter_base_price = self.base_price
+
+    def rule_add_count(self, rule_type: int) -> int:
+        """本规则已加仓次数；开仓不计。未分类时回退到 add_count。"""
+        if self.add_counts:
+            try:
+                return int(self.add_counts.get(rule_type, 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+        return self.add_count
 
 
 @dataclass
@@ -98,7 +113,7 @@ class AddDecision:
     lot_times: float = 1.0
     extra_lot: float = 0.0
     position_count: int = 0     # 触发前的持仓笔数
-    add_count: int = 0          # 触发前的已加仓次数
+    add_count: int = 0          # 触发前本规则已加仓次数
     limit_kind: str = ""        # 本次生效的上限类型：total_lot_limit / max_allow_num
     limit_value: int = 0        # 对应的上限值，0 表示不限制
 
@@ -111,8 +126,13 @@ class AddDecision:
         return "逆势加仓" if self.rule_type == RULE_TYPE_COUNTER else "顺势加仓"
 
     @property
+    def next_rule_add_no(self) -> int:
+        """本次将是本规则的第几次加仓（从 1 起，不含开仓）。"""
+        return self.add_count + 1
+
+    @property
     def next_position_no(self) -> int:
-        """本次加仓将成为该魔术号下的第几笔持仓。"""
+        """本次加仓将成为该魔术号下的第几笔持仓（说明用）。"""
         return self.position_count + 1
 
 
@@ -159,7 +179,7 @@ def rule_base_price(rule_type: int, ctx: PositionCtx) -> float:
 
 
 def pick_batch_level(rule: dict, next_position_no: int) -> tuple[Optional[dict], Optional[int]]:
-    """按「下一笔的序号」命中分批档位；未启用或未命中返回 (None, None)。"""
+    """按「本规则下一次加仓序号」命中分批档位；未启用或未命中返回 (None, None)。"""
     if not rule.get("batch_enabled"):
         return None, None
     for idx, level in enumerate(rule.get("batch_levels") or []):
@@ -170,6 +190,52 @@ def pick_batch_level(rule: dict, next_position_no: int) -> tuple[Optional[dict],
         if lo <= next_position_no <= hi:
             return level, idx
     return None, None
+
+
+def parse_add_rule_type(comment: object) -> Optional[int]:
+    """从加仓单 MT5 备注解析规则类型。R1=逆势，R2=顺势；R3B / M1 / 首单返回 None。"""
+    text = str(comment or "").strip()
+    m = _ADD_COMMENT_RE.match(text)
+    if not m:
+        return None
+    return int(m.group(1))
+
+
+def count_adds_by_rule(positions: Sequence | None) -> dict[int, int]:
+    """按备注统计各规则已加仓次数；开仓与手动仓不计。"""
+    counts = {RULE_TYPE_COUNTER: 0, RULE_TYPE_TREND: 0}
+    for pos in positions or []:
+        if not isinstance(pos, dict):
+            continue
+        rule_type = parse_add_rule_type(pos.get("comment"))
+        if rule_type in counts:
+            counts[rule_type] += 1
+    return counts
+
+
+def _legacy_batch_levels(rule: dict) -> bool:
+    """旧档位从第 2 笔起（含开仓序号）；新档位从本规则第 1 次加仓起。"""
+    starts: list[int] = []
+    for level in rule.get("batch_levels") or []:
+        if not isinstance(level, dict):
+            continue
+        lo = _as_int(level.get("pos_from"), 0)
+        if lo > 0:
+            starts.append(lo)
+    return bool(starts) and min(starts) >= 2
+
+
+def batch_match_no_and_max_adds(rule: dict, rule_adds: int) -> tuple[int, int]:
+    """档位匹配序号，以及本规则最多可加次数（0=不限制）。
+
+    新格式（档位从 1 起）：匹配「第几次加仓」，上限即 total_lot_limit。
+    旧格式（档位从 2 起）：匹配「已加次数 + 2」，上限为 total_lot_limit - 1。
+    """
+    limit = _as_int(rule.get("total_lot_limit"), 0)
+    if _legacy_batch_levels(rule):
+        max_adds = max(0, limit - 1) if limit else 0
+        return rule_adds + 2, max_adds
+    return rule_adds + 1, limit
 
 
 def deviation_points(rule_type: int, direction: str, base_price: float,
@@ -243,20 +309,21 @@ def evaluate_rule(rule: dict, ctx: PositionCtx, rule_index: int = 0) -> Optional
     if ctx.position_count <= 0 or ctx.point <= 0:
         return None
 
-    next_no = ctx.position_count + 1
+    rule_adds = ctx.rule_add_count(rule_type)
+    next_no, max_adds = batch_match_no_and_max_adds(rule, rule_adds)
     level, level_index = pick_batch_level(rule, next_no)
 
     if level is not None:
-        # 分批模式：方向可独立配置，笔数上限用 total_lot_limit，间距按档位的计算方式解析
+        # 分批模式：方向可独立配置，笔数上限用本规则已加次数，间距按档位解析
         if not action_matches(rule.get("batch_action") or rule.get("action"), ctx.direction):
             return None
         limit = _as_int(rule.get("total_lot_limit"), 0)
-        if limit and ctx.position_count >= limit:
+        if limit and rule_adds >= max_adds:
             return None
         gap = resolve_threshold(rule_type, level, ctx)
         lot_times = _as_float(level.get("lot_times"), 1.0)
         extra_lot = _as_float(level.get("extra_lot"), 0.0)
-        limit_kind, limit_value = "total_lot_limit", limit
+        limit_kind, limit_value = "total_lot_limit", max_adds if max_adds else limit
     else:
         # 分批未启用（或已超出所有档位区间）：走基础参数 + 次数上限，基础参数只支持点数
         if rule.get("batch_enabled"):
@@ -264,7 +331,7 @@ def evaluate_rule(rule: dict, ctx: PositionCtx, rule_index: int = 0) -> Optional
         if not action_matches(rule.get("action"), ctx.direction):
             return None
         max_allow = _as_int(rule.get("max_allow_num"), 0)
-        if max_allow and ctx.add_count >= max_allow:
+        if max_allow and rule_adds >= max_allow:
             return None
         gap = Threshold(_as_float(rule.get("point"), 0.0))
         lot_times = _as_float(rule.get("lot_times"), 1.0)
@@ -302,7 +369,7 @@ def evaluate_rule(rule: dict, ctx: PositionCtx, rule_index: int = 0) -> Optional
         lot_times=lot_times,
         extra_lot=extra_lot,
         position_count=ctx.position_count,
-        add_count=ctx.add_count,
+        add_count=rule_adds,
         limit_kind=limit_kind,
         limit_value=limit_value,
     )
@@ -352,7 +419,7 @@ def _limit_text(decision: AddDecision) -> str:
     if not decision.limit_value:
         return "不限"
     if decision.limit_kind == "total_lot_limit":
-        return f"分批笔数上限 {decision.limit_value}"
+        return f"本规则加仓上限 {decision.limit_value}"
     return f"最大加仓次数 {decision.limit_value}"
 
 
@@ -375,7 +442,7 @@ def describe_decision(decision: AddDecision) -> str:
 
     示例：逆势加仓 · 规则#0 · 分批档位#1：BUY 基准价 2400.5 → 现价 2398，
     逆向偏离 200 点 ≥ 阈值 200 点；手数 = 首单 0.1 × 倍数 1.2 + 追加 0 = 0.12 手；
-    本次第 5 笔，触发前持仓 4 笔 / 已加仓 3 次，分批笔数上限 10
+    本次本规则第 1 次加仓，已加 0 次，本规则加仓上限 2；当前持仓 1 笔
     """
     where = f"规则#{decision.rule_index}"
     if decision.level_index is not None:
@@ -388,8 +455,8 @@ def describe_decision(decision: AddDecision) -> str:
         f"{toward}偏离 {_trim(decision.deviation, 1)} 点 ≥ {gap_text(decision)}；"
         f"手数 = 首单 {_trim(decision.base_volume, 2)} × 倍数 {_trim(decision.lot_times, 2)}"
         f" + 追加 {_trim(decision.extra_lot, 2)} = {_trim(decision.volume, 2)} 手；"
-        f"本次第 {decision.next_position_no} 笔，触发前持仓 {decision.position_count} 笔"
-        f" / 已加仓 {decision.add_count} 次，{_limit_text(decision)}"
+        f"本次本规则第 {decision.next_rule_add_no} 次加仓，已加 {decision.add_count} 次，"
+        f"{_limit_text(decision)}；当前持仓 {decision.position_count} 笔"
     )
 
 
@@ -425,6 +492,7 @@ def decision_detail(decision: AddDecision) -> dict:
         ),
         "position_count": decision.position_count,
         "add_count": decision.add_count,
+        "next_rule_add_no": decision.next_rule_add_no,
         "next_position_no": decision.next_position_no,
         "limit_kind": decision.limit_kind,
         "limit_value": decision.limit_value,

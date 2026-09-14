@@ -5,6 +5,7 @@ from strategy_rules import (
     RULE_TYPE_TREND,
     PositionCtx,
     action_matches,
+    count_adds_by_rule,
     counter_anchor_price,
     decision_comment,
     decision_detail,
@@ -13,6 +14,7 @@ from strategy_rules import (
     evaluate,
     evaluate_rule,
     metric_key,
+    parse_add_rule_type,
     pick_batch_level,
     rule_base_price,
 )
@@ -40,6 +42,7 @@ def counter_rule(**kw):
 
 
 def batched_counter_rule(**kw):
+    """旧档位从第 2 笔起，覆盖「含开仓序号」兼容路径。"""
     overrides = {
         "batch_enabled": True,
         "batch_count": 3,
@@ -52,6 +55,23 @@ def batched_counter_rule(**kw):
     }
     overrides.update(kw)
     return counter_rule(**overrides)
+
+
+def new_batched_rule(rule_type=RULE_TYPE_COUNTER, limit=2, **kw):
+    """新档位从本规则第 1 次加仓起。"""
+    rule = counter_rule(
+        type=rule_type,
+        batch_enabled=True,
+        batch_count=1,
+        total_lot_limit=limit,
+        batch_levels=[{
+            "pos_from": 1, "pos_to": limit, "calc_type": "point",
+            "point": 100, "lot_times": 1.0 if rule_type == RULE_TYPE_TREND else 1.1,
+            "extra_lot": 0,
+        }],
+    )
+    rule.update(kw)
+    return rule
 
 
 def ctx(**kw):
@@ -136,33 +156,33 @@ def test_pick_batch_level_by_next_position_no():
 
 def test_batch_level_params_apply_per_tier():
     rule = batched_counter_rule()
-    # 持仓 1 笔 -> 下一笔是第 2 笔，命中档位 1（100 点 / 1.1 倍）
-    d = evaluate_rule(rule, ctx(position_count=1, price=2399.0))
+    # 本规则尚未加仓 → 旧档位匹配第 2 笔，命中档位 1（100 点 / 1.1 倍）
+    d = evaluate_rule(rule, ctx(position_count=1, add_count=0, price=2399.0))
     assert d.volume == 0.11
     assert d.level_index == 0
 
-    # 持仓 4 笔 -> 下一笔是第 5 笔，命中档位 2（200 点 / 1.2 倍）
-    assert evaluate_rule(rule, ctx(position_count=4, price=2399.0)) is None  # 100 点不够
-    d2 = evaluate_rule(rule, ctx(position_count=4, price=2398.0))
+    # 本规则已加 3 次 → 匹配第 5 笔，命中档位 2（200 点 / 1.2 倍）
+    assert evaluate_rule(rule, ctx(add_count=3, price=2399.0)) is None  # 100 点不够
+    d2 = evaluate_rule(rule, ctx(add_count=3, price=2398.0))
     assert d2.volume == 0.12
     assert d2.level_index == 1
 
-    # 持仓 7 笔 -> 第 8 笔，命中档位 3（300 点 / 1.3 倍）
-    d3 = evaluate_rule(rule, ctx(position_count=7, price=2397.0))
+    # 本规则已加 6 次 → 匹配第 8 笔，命中档位 3（300 点 / 1.3 倍）
+    d3 = evaluate_rule(rule, ctx(add_count=6, price=2397.0))
     assert d3.volume == 0.13
     assert d3.level_index == 2
 
 
-def test_total_lot_limit_caps_position_count():
+def test_total_lot_limit_caps_this_rule_adds():
     rule = batched_counter_rule()
-    # 已有 10 笔（= total_lot_limit），不再加仓
-    assert evaluate_rule(rule, ctx(position_count=10, price=2390.0)) is None
+    # 旧档位总手数 10 = 本规则最多加 9 笔
+    assert evaluate_rule(rule, ctx(add_count=9, price=2390.0)) is None
 
 
 def test_batch_enabled_but_out_of_levels_does_not_fallback():
     """开了分批却超出所有档位区间时不应回落到基础参数继续加。"""
     rule = batched_counter_rule(total_lot_limit=0)
-    assert evaluate_rule(rule, ctx(position_count=11, price=2390.0)) is None
+    assert evaluate_rule(rule, ctx(add_count=9, price=2390.0)) is None
 
 
 def test_batch_action_can_differ_from_base_action():
@@ -348,14 +368,14 @@ def test_decision_carries_calculation_context():
     assert d.rule_index == 3
     assert (d.direction, d.base_price, d.price, d.point) == ("BUY", 2400.0, 2399.0, POINT)
     assert (d.base_volume, d.lot_times, d.extra_lot) == (0.1, 1.1, 0.05)
-    assert (d.position_count, d.add_count, d.next_position_no) == (1, 0, 2)
+    assert (d.position_count, d.add_count, d.next_rule_add_no) == (1, 0, 1)
     assert (d.limit_kind, d.limit_value) == ("max_allow_num", 3)
 
 
 def test_batch_decision_records_batch_limit():
-    d = evaluate_rule(batched_counter_rule(), ctx(position_count=4, price=2398.0))
+    d = evaluate_rule(batched_counter_rule(), ctx(add_count=3, price=2398.0))
     assert d.level_index == 1
-    assert (d.limit_kind, d.limit_value) == ("total_lot_limit", 10)
+    assert (d.limit_kind, d.limit_value) == ("total_lot_limit", 9)
 
 
 def test_describe_decision_covers_reason_and_formula():
@@ -366,7 +386,7 @@ def test_describe_decision_covers_reason_and_formula():
     assert "2400" in text and "2399" in text        # 基准价 → 现价
     assert "逆向偏离 100 点" in text and "阈值 100 点" in text
     assert "0.1 × 倍数 1.1 + 追加 0 = 0.11 手" in text
-    assert "第 2 笔" in text
+    assert "本规则第 1 次加仓" in text
     assert "最大加仓次数 3" in text
     assert len(text) <= 255                         # 事件说明列是 VARCHAR(255)
 
@@ -379,22 +399,112 @@ def test_describe_trend_decision_uses_favourable_wording():
 
 
 def test_decision_detail_exposes_every_parameter():
-    d = evaluate_rule(batched_counter_rule(), ctx(position_count=4, price=2398.0))
+    d = evaluate_rule(batched_counter_rule(), ctx(add_count=3, position_count=4, price=2398.0))
     detail = decision_detail(d)
     assert detail["kind"] == "add"
     assert detail["rule_type_label"] == "逆势加仓"
     assert detail["batch"] is True and detail["level_index"] == 1
     assert detail["threshold"] == 200 and detail["deviation"] == 200
     assert detail["volume_formula"] == "0.1 × 1.2 + 0 = 0.12"
+    assert detail["next_rule_add_no"] == 4
     assert detail["next_position_no"] == 5
     assert detail["limit_kind"] == "total_lot_limit"
 
 
 def test_decision_comment_fits_mt5_limit():
     """MT5 备注只有约 31 字符，紧凑编码必须能反查到规则与偏离。"""
-    batched = decision_comment(evaluate_rule(batched_counter_rule(), ctx(position_count=4, price=2398.0)))
+    batched = decision_comment(evaluate_rule(batched_counter_rule(), ctx(add_count=3, price=2398.0)))
     assert batched == "R1L1D200"
     assert len(batched) <= MT5_COMMENT_LIMIT
 
     plain = decision_comment(evaluate_rule(counter_rule(), ctx(price=2399.0)))
     assert plain == "R1D100"      # 未启用分批时不带档位段
+
+
+# --------------------------- 按规则独立计数 ---------------------------
+def test_parse_add_rule_type_reads_r1_r2_only():
+    assert parse_add_rule_type("R1D100") == RULE_TYPE_COUNTER
+    assert parse_add_rule_type("R1L0D121") == RULE_TYPE_COUNTER
+    assert parse_add_rule_type("R2L1A100") == RULE_TYPE_TREND
+    assert parse_add_rule_type("R3B0") is None
+    assert parse_add_rule_type("M1") is None
+    assert parse_add_rule_type("S1") is None
+    assert parse_add_rule_type("") is None
+
+
+def test_count_adds_by_rule_skips_open_and_manual():
+    counted = count_adds_by_rule([
+        {"comment": "S1"},
+        {"comment": "R1D100"},
+        {"comment": "R2L0D80"},
+        {"comment": "M2"},
+        {"comment": "R1L1D200"},
+    ])
+    assert counted[RULE_TYPE_COUNTER] == 2
+    assert counted[RULE_TYPE_TREND] == 1
+
+
+def test_open_does_not_occupy_new_batch_slot():
+    """开仓后本规则已加 0 次，应立即命中第 1 档。"""
+    rule = new_batched_rule(limit=2)
+    d = evaluate_rule(rule, ctx(position_count=1, add_count=0, price=2399.0))
+    assert d is not None
+    assert d.next_rule_add_no == 1
+    assert d.limit_value == 2
+
+
+def test_new_batch_limit_is_this_rule_add_count():
+    rule = new_batched_rule(limit=2)
+    assert evaluate_rule(rule, ctx(add_count=1, price=2399.0)) is not None
+    assert evaluate_rule(rule, ctx(add_count=2, price=2399.0)) is None
+
+
+def test_legacy_batch_total_3_allows_two_adds():
+    """旧档位 2～3 + 总手数 3 仍表示本规则加 2 笔。"""
+    rule = batched_counter_rule(
+        batch_count=1, total_lot_limit=3,
+        batch_levels=[{
+            "pos_from": 2, "pos_to": 3, "calc_type": "point",
+            "point": 100, "lot_times": 1.1, "extra_lot": 0,
+        }],
+    )
+    assert evaluate_rule(rule, ctx(add_count=0, price=2399.0)) is not None
+    assert evaluate_rule(rule, ctx(add_count=1, price=2399.0)) is not None
+    assert evaluate_rule(rule, ctx(add_count=2, price=2399.0)) is None
+
+
+def test_counter_and_trend_batch_limits_are_independent():
+    """逆势加满 2 笔后，顺势仍可按其自己的 3 笔上限加仓。"""
+    counter = new_batched_rule(RULE_TYPE_COUNTER, limit=2)
+    trend = new_batched_rule(RULE_TYPE_TREND, limit=3, lot_times=0.8)
+    held = ctx(
+        position_count=3,  # 开仓 + 2 笔逆势
+        add_counts={RULE_TYPE_COUNTER: 2, RULE_TYPE_TREND: 0},
+        add_count=2,
+        price=2399.0,
+    )
+    assert evaluate_rule(counter, held) is None
+    d = evaluate_rule(trend, ctx(
+        position_count=3,
+        add_counts={RULE_TYPE_COUNTER: 2, RULE_TYPE_TREND: 0},
+        price=2401.0,
+    ))
+    assert d is not None and d.rule_type == RULE_TYPE_TREND
+    assert evaluate_rule(trend, ctx(
+        position_count=6,
+        add_counts={RULE_TYPE_COUNTER: 2, RULE_TYPE_TREND: 3},
+        price=2401.0,
+    )) is None
+
+
+def test_max_allow_num_is_per_rule():
+    rule = counter_rule(max_allow_num=1)
+    assert evaluate_rule(rule, ctx(
+        add_counts={RULE_TYPE_COUNTER: 0, RULE_TYPE_TREND: 3},
+        add_count=3, price=2399.0,
+    )) is not None
+    assert evaluate_rule(rule, ctx(
+        add_counts={RULE_TYPE_COUNTER: 1, RULE_TYPE_TREND: 3},
+        add_count=4, price=2399.0,
+    )) is None
+

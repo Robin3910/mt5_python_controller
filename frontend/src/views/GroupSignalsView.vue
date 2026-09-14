@@ -241,7 +241,7 @@ function toggleEvent(dispatchId: number, ev: GroupTaskEventRecord): void {
 }
 
 const LIMIT_KIND_LABEL: Record<string, string> = {
-  total_lot_limit: '分批笔数上限',
+  total_lot_limit: '本规则加仓上限',
   max_allow_num: '最大加仓次数',
 }
 
@@ -305,8 +305,13 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
     push('追加手数', detail.extra_lot)
     push('本次手数', detail.volume)
     push('触发前持仓', detail.position_count === undefined ? '' : `${detail.position_count} 笔`)
-    push('触发前加仓', detail.add_count === undefined ? '' : `${detail.add_count} 次`)
-    push('本次为第', detail.next_position_no === undefined ? '' : `${detail.next_position_no} 笔`)
+    push('本规则已加仓', detail.add_count === undefined ? '' : `${detail.add_count} 次`)
+    push(
+      '本次本规则第',
+      detail.next_rule_add_no === undefined
+        ? (detail.next_position_no === undefined ? '' : `${detail.next_position_no} 笔`)
+        : `${detail.next_rule_add_no} 次`,
+    )
     push('生效上限', limitText(detail))
     push('错误', detail.error)
     return rows

@@ -115,6 +115,15 @@ def test_no_target_without_volume_returns_none():
     ) is None
 
 
+def test_fill_side_price_matches_market_order():
+    """BUY 看卖价、SELL 看买价；缺侧时报 fallback，兼容只带平仓侧的旧事件。"""
+    assert ms.fill_side_price("BUY", bid=4290.0, ask=4290.2) == 4290.2
+    assert ms.fill_side_price("SELL", bid=4290.0, ask=4290.2) == 4290.0
+    assert ms.fill_side_price("BUY", bid=4290.0, ask=0.0, fallback=4290.0) == 4290.0
+    assert ms.fill_side_price("SELL", bid=0.0, ask=4290.2, fallback=4290.2) == 4290.2
+    assert ms.fill_side_price("BUY", bid=0.0, ask=0.0, fallback=2330.0) == 2330.0
+
+
 def test_price_reached_buy_and_sell_including_already_past():
     assert ms.direction_from_prices(4400, 4410) == "BUY"
     assert ms.direction_from_prices(4400, 4390) == "SELL"
@@ -162,10 +171,10 @@ def test_exclude_manual_does_not_change_batch_position_count():
             "point": 1, "lot_times": 1, "extra_lot": 0,
         }],
     }]
-    # 过滤后持仓 1 笔 → 下一笔是第 2 笔，档位 3~3 不命中
+    # 过滤后本规则尚未加仓，旧档位 3~3 不命中
     assert evaluate(rules, ctx) is None
-    # 若把手动仓算进去，position_count=2 → 下一笔第 3 笔会命中
-    ctx_wrong = PositionCtx(**{**ctx.__dict__, "position_count": 2})
+    # 若把另一笔误记成本规则加仓，已加 1 次 → 匹配第 3 笔会命中
+    ctx_wrong = PositionCtx(**{**ctx.__dict__, "add_count": 1, "add_counts": {2: 1}})
     assert evaluate(rules, ctx_wrong) is not None
 
 
@@ -293,6 +302,41 @@ async def test_runner_already_past_entry_opens_immediately():
     hub.sub.offer(mh.MarketEvent(
         kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
         positions=tuple(held), price=4415.0, point=0.01,
+    ))
+    await _settle()
+    manuals = [p for p in mt5.positions_by_magic(MAGIC) if p.get("comment") == "M2"]
+    assert len(manuals) == 1
+    runner.cancel()
+
+
+async def test_runner_triggers_on_ask_not_bid():
+    """多单到价看卖价：卖价未到不开；卖价越过入场才市价开（买价仍可低于入场）。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub = _runner(
+        sent, mt5=mt5,
+        strategy={"template_id": "tpl_1", "rules": [
+            _trend_rule(manual_scatter=_cfg(
+                entry_price=4400, take_profit=4410, volume=0.01, volume_locked=True,
+            )),
+        ]},
+    )
+    runner.start()
+    await _settle()
+    held = mt5.positions_by_magic(MAGIC)
+
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(held), price=4399.8, point=0.01,
+        bid=4399.8, ask=4399.95,
+    ))
+    await _settle()
+    assert not [p for p in mt5.positions_by_magic(MAGIC) if p.get("comment") == "M2"]
+
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(held), price=4399.9, point=0.01,
+        bid=4399.9, ask=4400.1,
     ))
     await _settle()
     manuals = [p for p in mt5.positions_by_magic(MAGIC) if p.get("comment") == "M2"]

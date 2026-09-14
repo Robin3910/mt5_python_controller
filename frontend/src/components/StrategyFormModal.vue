@@ -174,31 +174,34 @@ const FIELD_HELP = {
   extra_lot:
     '额外手数，默认 0。加在倍率结果之后：实际手数 = 倍数 × 基础手数 + 额外手数。',
   max_allow_num:
-    '最大允许加仓次数。达到次数上限后，本条规则不再继续加仓。',
+    '本规则最多允许加仓次数（不含开仓，也不含另一条规则加出去的仓）。达到上限后本条规则不再加仓。',
   batch_enabled:
-    '开启后按当前持仓笔数命中下方档位，使用该档的点数 / 倍数 / 额外手数，' +
-    '覆盖上方基础参数。可改批数自动切档，也可手动增删、改持仓笔数。',
+    '开启后按本规则第几次加仓命中下方档位，使用该档的点数 / 倍数 / 额外手数，' +
+    '覆盖上方基础参数。可改批数自动切档，也可手动增删、改加仓笔数。开仓不占格，与另一条规则的档位独立。',
   batch_action:
     '分批加仓独立的监控方向：全部=多空都监控，多单=只监控多单，空单=只监控空单。' +
     '可与上方基础监控方向不同。',
   batch_count:
-    '分批批数。改批数或总手数会按「第 2 笔 ~ 总手数」均分生成档位；' +
-    '添加 / 删除档位也会按同一总手数重切区间，批数与档位数保持一致。' +
+    '分批批数。改批数或加仓笔数会按「第 1 次 ~ 加仓笔数」均分生成档位；' +
+    '添加 / 删除档位也会按同一上限重切区间，批数与档位数保持一致。' +
     '启用手动分散仓时，这里显示合计（分散仓 + 1），提交仍只保存分散仓批数。',
   total_lot_limit:
-    '分批总手数上限，同时作为自动切档的末笔。' +
-    '改此项会按批数重新均分档位；添加档位若超过可切份数会顺延该上限。' +
-    '启用手动分散仓时，这里显示合计（分散仓总手数 + 1），提交仍只保存分散仓总手数。',
+    '本规则最多加仓笔数，不含开仓，与另一条规则独立。同时作为自动切档的末笔。' +
+    '例如填 2 表示开仓后本规则最多再加 2 笔。改此项会按批数重新均分档位；添加档位若超过可切份数会顺延该上限。' +
+    '启用手动分散仓时，这里显示合计（分散仓加仓笔数 + 1），提交仍只保存分散仓上限。',
   batch_level:
-    '本档命中的持仓笔数区间（含两端），可手改，相邻档会首尾衔接。' +
-    '添加 / 删除档位会按总手数重新均分各档区间。' +
+    '本档命中的加仓次数区间（从 1 起，含两端），可手改，相邻档会首尾衔接。' +
+    '添加 / 删除档位会按加仓笔数重新均分各档区间。' +
     '命中区间时按该档间距判断是否加仓，手数 = 倍数 × 基础手数 + 额外手数。',
   manual_scatter:
-    '手动分散仓与分批加仓无关：价到入场后市价开仓，自带止盈/止损。' +
+    '手动分散仓与分批加仓无关：成交侧到价后市价开仓，自带止盈/止损。' +
+    'BUY 用卖价、SELL 用买价判断是否到达入场，与市价成交同一口价。' +
     '视觉上接在最后一档之后（档位号 +1，持仓笔数为末档终点 +1），不参与分批判定。' +
     '手数 0 表示触发时按当时持仓匹配「分档手数盈亏」反推；手改手数后按填写值开仓。' +
     '顺势 / 逆势各只能配一条。保存后若任务已在跑，会立刻下发到节点。',
-  manual_entry: '到价后按此价判定方向并市价开仓。止盈高于入场为多，低于入场为空。',
+  manual_entry:
+    '到价后按此价判定方向并市价开仓。止盈高于入场为多，低于入场为空。' +
+    '到价看成交侧：多单卖价 ≥ 入场，空单买价 ≤ 入场。',
   manual_tp: '挂在新仓上的止盈价，须与入场价不同。',
   manual_sl: '挂在新仓上的止损价；0 表示不设止损。',
   manual_volume:
@@ -378,52 +381,56 @@ function defaultManualScatter(): ManualScatterConfig {
 }
 
 function cloneRules(rules: StrategyRule[]): EditableRule[] {
-  return rules.map((r) => ({
-    type: r.type,
-    status: r.status,
-    action: r.action,
-    point: r.point ?? 100,
-    lot_times: r.lot_times ?? 1,
-    extra_lot: r.extra_lot ?? 0,
-    max_allow_num: r.max_allow_num ?? 5,
-    batch_enabled: r.batch_enabled ?? false,
-    batch_action: r.batch_action ?? 'all',
-    batch_count: r.batch_count ?? 0,
-    total_lot_limit: r.total_lot_limit ?? 0,
-    batch_levels: (r.batch_levels || []).map((lv) => ({ ...lv })),
-    manual_scatter: r.manual_scatter?.enabled
-      ? { ...defaultManualScatter(), ...r.manual_scatter, enabled: true }
-      : defaultManualScatter(),
-    risk_amount: r.risk_amount ?? 100,
-    rr_ratio: r.rr_ratio ?? 2.5,
-    base_ratio: r.base_ratio ?? 30,
-    add_batches: r.add_batches ?? 10,
-    max_total_lot: r.max_total_lot ?? 0,
-    breakeven_enabled: r.breakeven_enabled ?? true,
-    breakeven_times: r.breakeven_times ?? 2,
-    breakeven_mode: r.breakeven_mode === 'loop' ? 'loop' : 'once',
-    // 缺字段的历史配置一律按市价，保证旧策略行为不变
-    entry_mode: r.entry_mode === 'limit' ? 'limit' : 'market',
-    price_lower: r.price_lower ?? 0,
-    price_upper: r.price_upper ?? 0,
-    grid_count: r.grid_count ?? 10,
-    grid_mode: r.grid_mode ?? 'arithmetic',
-    // 旧配置若仍为 follow，编辑时回落到只做多（选项已移除）
-    grid_side: r.grid_side === 'short' ? 'short' : 'long',
-    lot_per_grid: r.lot_per_grid ?? 0.01,
-    trigger_price: r.trigger_price ?? 0,
-    stop_lower: r.stop_lower ?? 0,
-    stop_upper: r.stop_upper ?? 0,
-    close_on_stop: r.close_on_stop ?? true,
-    prefill_enabled: r.prefill_enabled ?? true,
-    trailing_up: r.trailing_up ?? false,
-    trailing_max: r.trailing_max ?? 0,
-    assist_enabled: r.assist_enabled ?? false,
-    assist_timeframe: r.assist_timeframe ?? GRID_ASSIST_TIMEFRAME,
-    assist_atr_mult: r.assist_atr_mult ?? 1,
-    assist_spacing: r.assist_spacing ?? 0,
-    assist_max_loss: r.assist_max_loss ?? 0,
-  }))
+  return rules.map((r) => {
+    const cloned: EditableRule = {
+      type: r.type,
+      status: r.status,
+      action: r.action,
+      point: r.point ?? 100,
+      lot_times: r.lot_times ?? 1,
+      extra_lot: r.extra_lot ?? 0,
+      max_allow_num: r.max_allow_num ?? 5,
+      batch_enabled: r.batch_enabled ?? false,
+      batch_action: r.batch_action ?? 'all',
+      batch_count: r.batch_count ?? 0,
+      total_lot_limit: r.total_lot_limit ?? 0,
+      batch_levels: (r.batch_levels || []).map((lv) => ({ ...lv })),
+      manual_scatter: r.manual_scatter?.enabled
+        ? { ...defaultManualScatter(), ...r.manual_scatter, enabled: true }
+        : defaultManualScatter(),
+      risk_amount: r.risk_amount ?? 100,
+      rr_ratio: r.rr_ratio ?? 2.5,
+      base_ratio: r.base_ratio ?? 30,
+      add_batches: r.add_batches ?? 10,
+      max_total_lot: r.max_total_lot ?? 0,
+      breakeven_enabled: r.breakeven_enabled ?? true,
+      breakeven_times: r.breakeven_times ?? 2,
+      breakeven_mode: r.breakeven_mode === 'loop' ? 'loop' : 'once',
+      // 缺字段的历史配置一律按市价，保证旧策略行为不变
+      entry_mode: r.entry_mode === 'limit' ? 'limit' : 'market',
+      price_lower: r.price_lower ?? 0,
+      price_upper: r.price_upper ?? 0,
+      grid_count: r.grid_count ?? 10,
+      grid_mode: r.grid_mode ?? 'arithmetic',
+      // 旧配置若仍为 follow，编辑时回落到只做多（选项已移除）
+      grid_side: r.grid_side === 'short' ? 'short' : 'long',
+      lot_per_grid: r.lot_per_grid ?? 0.01,
+      trigger_price: r.trigger_price ?? 0,
+      stop_lower: r.stop_lower ?? 0,
+      stop_upper: r.stop_upper ?? 0,
+      close_on_stop: r.close_on_stop ?? true,
+      prefill_enabled: r.prefill_enabled ?? true,
+      trailing_up: r.trailing_up ?? false,
+      trailing_max: r.trailing_max ?? 0,
+      assist_enabled: r.assist_enabled ?? false,
+      assist_timeframe: r.assist_timeframe ?? GRID_ASSIST_TIMEFRAME,
+      assist_atr_mult: r.assist_atr_mult ?? 1,
+      assist_spacing: r.assist_spacing ?? 0,
+      assist_max_loss: r.assist_max_loss ?? 0,
+    }
+    migrateLegacyBatchLevels(cloned)
+    return cloned
+  })
 }
 
 type SignalPlForm = {
@@ -521,8 +528,8 @@ function applySignalPlToRules(rules: EditableRule[], cfg: SignalPlForm): Strateg
 const signalPl = reactive<SignalPlForm>(defaultSignalPl())
 const isTpl1 = computed(() => form.template_id === TEMPLATE_1_ID)
 
-/** 分批档位从第 2 笔起算（第 1 笔为首单） */
-const BATCH_POS_START = 2
+/** 分批档位从本规则第 1 次加仓起算（开仓不占格） */
+const BATCH_POS_START = 1
 
 /** 加仓间距的计算方式；与后端 strategy_templates.BATCH_CALC_TYPES 对齐 */
 const CALC_TYPE_OPTIONS: Array<{ value: BatchCalcType; label: string }> = [
@@ -544,7 +551,7 @@ function isBarCalc(calcType: BatchCalcType): boolean {
   return BAR_CALC_TYPES.includes(calcType)
 }
 
-/** 将 [2, limit] 均分为 count 段，对齐 MTcommander「批数 × 总手数」切档 */
+/** 将 [1, limit] 均分为 count 段：第 1 次加仓 ~ 本规则加仓笔数上限 */
 function splitBatchRanges(
   limit: number,
   count: number,
@@ -626,6 +633,21 @@ function syncBatchMetaFromLevels(r: EditableRule): void {
   if (!last) return
   const to = Math.max(1, Math.floor(Number(last.pos_to) || 1))
   r.total_lot_limit = to
+}
+
+/** 旧档位从第 2 笔起（含开仓）；打开表单时改成从第 1 次加仓起，总手数同步减 1。 */
+function migrateLegacyBatchLevels(r: EditableRule): void {
+  if (!r.batch_enabled || !r.batch_levels.length) return
+  const starts = r.batch_levels
+    .map((lv) => Math.floor(Number(lv.pos_from) || 0))
+    .filter((n) => n > 0)
+  if (!starts.length || Math.min(...starts) < 2) return
+  for (const lv of r.batch_levels) {
+    const from = Math.max(1, Math.floor(Number(lv.pos_from) || 1) - 1)
+    lv.pos_from = from
+    lv.pos_to = Math.max(from, Math.floor(Number(lv.pos_to) || from) - 1)
+  }
+  syncBatchMetaFromLevels(r)
 }
 
 function normalizeLevelRange(lv: StrategyBatchLevel): void {
@@ -1185,8 +1207,8 @@ function validateRules(rules: EditableRule[]): string | null {
     }
     for (const [i, lv] of r.batch_levels.entries()) {
       const at = `${label} 档位 ${i + 1}`
-      if (lv.pos_from < 1) return `${at}：持仓笔数起点至少为 1`
-      if (lv.pos_to < lv.pos_from) return `${at}：持仓笔数终点不能小于起点`
+      if (lv.pos_from < 1) return `${at}：加仓笔数起点至少为 1`
+      if (lv.pos_to < lv.pos_from) return `${at}：加仓笔数终点不能小于起点`
       if (!CALC_TYPE_OPTIONS.some((o) => o.value === lv.calc_type)) {
         return `${at}：计算方式非法`
       }
@@ -2040,7 +2062,7 @@ function resetRuleToTemplate(idx: number): void {
                     <div class="field">
                       <FormLabel
                         :field-id="`rule-${idx}-total-lot`"
-                        text="总手数"
+                        text="加仓笔数"
                         :help="FIELD_HELP.total_lot_limit"
                       />
                       <input
@@ -2052,7 +2074,7 @@ function resetRuleToTemplate(idx: number): void {
                         @change="onDisplayedTotalLotChange(r, $event)"
                       />
                       <p v-if="r.manual_scatter.enabled" class="muted batch-split-hint">
-                        分散仓总手数 {{ Math.floor(r.total_lot_limit) }} · 手动分散仓总手数 1
+                        分散仓加仓笔数 {{ Math.floor(r.total_lot_limit) }} · 手动分散仓 1
                       </p>
                     </div>
                   </div>
@@ -2063,7 +2085,7 @@ function resetRuleToTemplate(idx: number): void {
                       <div class="field batch-range">
                         <FormLabel
                           :field-id="`rule-${idx}-lv-${li}-from`"
-                          text="持仓笔数"
+                          text="加仓次数"
                           :help="FIELD_HELP.batch_level"
                         />
                         <div class="batch-range-inputs">
@@ -2073,7 +2095,7 @@ function resetRuleToTemplate(idx: number): void {
                             type="number"
                             min="1"
                             step="1"
-                            aria-label="持仓笔数起点"
+                            aria-label="加仓次数起点"
                             @change="onLevelRangeChange(r, li)"
                           />
                           <span class="muted">~</span>
@@ -2083,7 +2105,7 @@ function resetRuleToTemplate(idx: number): void {
                             type="number"
                             min="1"
                             step="1"
-                            aria-label="持仓笔数终点"
+                            aria-label="加仓次数终点"
                             @change="onLevelRangeChange(r, li)"
                           />
                         </div>
@@ -2288,8 +2310,8 @@ function resetRuleToTemplate(idx: number): void {
                     </button>
                   </div>
                   <p class="rule-hint">
-                    改批数、总手数或添加 / 删除档位，都会按第 {{ BATCH_POS_START }} 笔 ~ 第 {{ Math.floor(r.total_lot_limit) }} 笔重切区间；
-                    手改某一档持仓笔数时，相邻档会首尾衔接。
+                    改批数、加仓笔数或添加 / 删除档位，都会按第 {{ BATCH_POS_START }} 次 ~ 第 {{ Math.floor(r.total_lot_limit) }} 次加仓重切区间；
+                    手改某一档加仓次数时，相邻档会首尾衔接。
                     每档间距可独立选点数 / 指定价 / ATR / 波幅，ATR 与波幅取该周期最近 {{ BATCH_BAR_PERIOD }} 根已收盘 K 线
                     <template v-if="r.manual_scatter.enabled">
                       ；手动分散仓展示为第 {{ manualScatterPos(r) }} 笔，不参与切档

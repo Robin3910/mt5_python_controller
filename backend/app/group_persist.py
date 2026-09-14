@@ -30,6 +30,36 @@ logger = logging.getLogger(__name__)
 _TERMINAL = frozenset(group_rules.SUBTASK_TERMINAL)
 # 已停手但仍有持仓：非终态，继续持有节点占位
 _STUCK = frozenset(group_rules.SUBTASK_STUCK)
+# 账户快照对账：连续几轮都看不到该魔术号才收口，避免一轮残缺快照误平
+RECONCILE_EMPTY_CONFIRM = 2
+
+
+def note_absent_magics(
+    present: set[int],
+    watched: set[int],
+    hits: dict[int, int],
+    *,
+    confirm: int = RECONCILE_EMPTY_CONFIRM,
+) -> set[int]:
+    """按本轮快照更新连续缺失计数，返回已确认不在盘上的魔术号。
+
+    present: 本轮快照里出现过的魔术号（持仓 ∪ 挂单）
+    watched: 该节点仍在跑、且已经开过仓的子任务魔术号
+    hits: 调用方持有的 {magic: consecutive_misses}，本函数就地更新
+    """
+    confirm = max(1, int(confirm or 1))
+    for magic in list(hits):
+        if magic not in watched:
+            hits.pop(magic, None)
+    confirmed: set[int] = set()
+    for magic in watched:
+        if magic in present:
+            hits.pop(magic, None)
+            continue
+        hits[magic] = int(hits.get(magic) or 0) + 1
+        if hits[magic] >= confirm:
+            confirmed.add(magic)
+    return confirmed
 
 
 async def create_task(
@@ -794,6 +824,8 @@ async def finish_subtask(
 
 async def reconcile_node_positions(
     node_id: str, magics: set[int],
+    *, hits: dict[int, int] | None = None,
+    confirm: int = RECONCILE_EMPTY_CONFIRM,
 ) -> list[dict]:
     """账户快照对账：节点上已无痕迹的运行中子任务，判定为已平仓并收口。
 
@@ -806,6 +838,9 @@ async def reconcile_node_positions(
 
     网格空仓是常态，正常运行时不据此收口；但已经停手、只等残仓被处理掉的子任务
     （STUCK）反过来必须靠这里收口，否则占位会一直挂着。
+
+    默认要连续 `confirm` 轮快照都看不到该魔术号才收口。`hits` 由调用方跨轮持有；
+    不传则本轮单独计数，confirm>1 时这一轮不会收口。
     返回 [{task_id, task_status, released}]，供调用方释放节点占位。
     """
     finished: list[dict] = []
@@ -828,10 +863,15 @@ async def reconcile_node_positions(
             ).scalars().all()
             if not rows:
                 return []
+            watched = {int(row.magic) for row in rows if row.magic is not None}
+            bucket = hits if hits is not None else {}
+            confirmed = note_absent_magics(
+                magics, watched, bucket, confirm=confirm,
+            )
             now = datetime.now()
             touched: dict[int, list[tuple[str, str]]] = {}
             for row in rows:
-                if row.magic is None or int(row.magic) in magics:
+                if row.magic is None or int(row.magic) not in confirmed:
                     continue
                 row.status = "done"
                 row.finish_reason = "reconciled_no_position"

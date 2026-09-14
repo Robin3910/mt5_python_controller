@@ -365,11 +365,11 @@ class GroupTaskEventRecord(BaseModel):
 
 # ----------------------------- 策略管理 ----------------------------
 class StrategyBatchLevel(BaseModel):
-    """分批加仓档位：持仓笔数区间内的加仓间距 / 倍数。
+    """分批加仓档位：本规则第几次加仓区间内的间距 / 倍数。
 
     加仓间距由 calc_type 决定读哪个参数，四种方式最终都换算成触发所需的偏离点数。
     """
-    pos_from: int = Field(default=2, ge=0)
+    pos_from: int = Field(default=1, ge=0)
     pos_to: int = Field(default=4, ge=0)
     calc_type: str = Field(
         default="point",
@@ -414,7 +414,10 @@ class SignalLotPlTiers(BaseModel):
 class ManualScatterConfig(BaseModel):
     """模版1 手动分散仓：视觉上像分批最后一档，运行时与分批加仓隔离。"""
     enabled: bool = False
-    entry_price: float = Field(default=0.0, ge=0, description="入场价，到价后市价开仓")
+    entry_price: float = Field(
+        default=0.0, ge=0,
+        description="入场价；成交侧到价后市价开仓（BUY 卖价 / SELL 买价）",
+    )
     take_profit: float = Field(default=0.0, ge=0, description="止盈价")
     stop_loss: float = Field(default=0.0, ge=0, description="止损价，0=不设")
     volume: float = Field(default=0.0, ge=0, description="手数；0 且未锁定时由节点按分档手数盈亏反推")
@@ -444,7 +447,10 @@ class StrategyRule(BaseModel):
     batch_enabled: bool = Field(default=False, description="是否启用分批加仓")
     batch_action: str = Field(default="all", description="分批监控方向 all|buy|sell")
     batch_count: int = Field(default=0, ge=0, description="分批批数")
-    total_lot_limit: float = Field(default=0.0, ge=0, description="总手数上限，0=不限制")
+    total_lot_limit: float = Field(
+        default=0.0, ge=0,
+        description="模版1=本规则最多加仓笔数（不含开仓）；模版3=总手数上限；0=不限制",
+    )
     batch_levels: list[StrategyBatchLevel] = Field(default_factory=list)
     # 模版1 信号级盈亏控制（顺势/逆势写入相同值；其它 type 规范化时丢弃）
     float_pl_ratio: Optional[SignalFloatPlRatio] = None

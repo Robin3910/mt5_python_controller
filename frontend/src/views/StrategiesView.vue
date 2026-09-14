@@ -402,13 +402,13 @@ function fmtTime(sec: number | null | undefined): string {
             <template v-else-if="r.batch_enabled">
               <div class="muted" style="font-size: 12px; margin-bottom: 6px">
                 分批加仓 · 方向 {{ actionLabel(r.batch_action) }} ·
-                {{ r.batch_count ?? 0 }} 批 · 总手数上限 {{ r.total_lot_limit ?? 0 }}
+                {{ r.batch_count ?? 0 }} 批 · 加仓笔数上限 {{ r.total_lot_limit ?? 0 }}
               </div>
               <div v-if="r.batch_levels?.length" class="table-scroll">
                 <table class="strategy-levels-table">
                   <thead>
                     <tr>
-                      <th>笔数</th>
+                      <th>加仓次数</th>
                       <th>计算</th>
                       <th>间距</th>
                       <th class="right">倍数</th>
@@ -516,13 +516,13 @@ function fmtTime(sec: number | null | undefined): string {
                     <template v-else-if="r.batch_enabled">
                       <div class="muted" style="font-size: 12px; margin-bottom: 6px">
                         分批加仓 · 方向 {{ actionLabel(r.batch_action) }} ·
-                        {{ r.batch_count ?? 0 }} 批 · 总手数上限 {{ r.total_lot_limit ?? 0 }}
+                        {{ r.batch_count ?? 0 }} 批 · 加仓笔数上限 {{ r.total_lot_limit ?? 0 }}
                       </div>
                       <div v-if="r.batch_levels?.length" class="table-scroll">
                         <table class="strategy-levels-table">
                           <thead>
                             <tr>
-                              <th>笔数区间</th>
+                              <th>加仓次数</th>
                               <th>计算方式</th>
                               <th>间距</th>
                               <th class="right">倍数</th>

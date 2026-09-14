@@ -4,6 +4,8 @@ import json
 import threading
 import time
 
+import pytest
+
 import node_client as nc
 
 
@@ -220,13 +222,57 @@ async def test_snapshot_shape():
     # orders 是限价开仓的存活凭据：服务端对账少了它会在挂单成交前就收口任务
     assert set(snap.keys()) == {
         "account", "positions", "orders", "prices", "quotes", "server_time_offset",
+        "books_ok",
     }
     assert snap["orders"] == []
+    assert snap["books_ok"] is True
     assert snap["server_time_offset"] == 0
     assert "EURUSD" in snap["prices"]
     assert "EURUSD" in snap["quotes"]
     assert set(snap["quotes"]["EURUSD"].keys()) == {"bid", "ask", "mid", "change"}
     assert snap["account"]["login"]
+
+
+async def test_snapshot_unreadable_positions_returns_none():
+    """持仓读失败不得上报空仓，否则服务端会把任务误收口。"""
+    n = _node()
+    await n._exec(n.mt5.connect)
+
+    def boom():
+        raise RuntimeError("IPC timeout")
+
+    n.mt5.positions = boom
+    assert await n._snapshot() is None
+
+
+async def test_snapshot_unreadable_orders_returns_none():
+    n = _node()
+    await n._exec(n.mt5.connect)
+
+    def boom():
+        raise RuntimeError("orders_get failed")
+
+    n.mt5.pending_orders = boom
+    assert await n._snapshot() is None
+
+
+async def test_reporter_does_not_send_unreadable_snapshot(monkeypatch):
+    n = _node()
+    ws = FakeWS()
+    n._check_login = lambda acct: None  # type: ignore[method-assign]
+
+    async def fake_snap():
+        return None
+
+    n._snapshot = fake_snap  # type: ignore[method-assign]
+
+    async def stop(_delay):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(nc.asyncio, "sleep", stop)
+    with pytest.raises(asyncio.CancelledError):
+        await n._reporter(ws)
+    assert ws.sent == []
 
 
 async def test_check_login_allows_match_and_empty():

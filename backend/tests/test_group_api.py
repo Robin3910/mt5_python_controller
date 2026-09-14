@@ -731,6 +731,94 @@ def test_strategy_end_to_end_sync(client):
     assert client.get(f"/api/groups/{gid}", headers=h).json()["active_task_count"] == 0
 
 
+def test_empty_account_snapshot_needs_two_rounds_to_reconcile(client):
+    """可读的真空仓快照要连续两轮才对账收口，避免一轮残缺快照误平。"""
+    h = auth_headers(client)
+    token = _node_token(client, h)
+    n1 = _mk_node(client, h, 5288, "对账节点")
+    gid = _mk_group(client, h, name="对账确认组", node_ids=[n1])["group_id"]
+
+    with client.websocket_connect("/ws/node") as ws1:
+        ws1.send_json({"type": "auth", "data": {"token": token, "mt5_login": 5288}})
+        assert ws1.receive_json()["type"] == "auth_ok"
+        r = client.post("/webhook", json={
+            "action": "buy", "symbol": "XAUUSD", "volume": 0.1, "model": "strategy",
+        })
+        assert r.status_code == 200, r.text
+        cmd = ws1.receive_json()
+        assert cmd["cmd"] == "strategy_start"
+        ws1.send_json({"type": "trade_result", "data": {
+            "signal_id": cmd["signal_id"], "magic": cmd["magic"],
+            "symbol": "XAUUSD", "success": True, "order": 8801, "price": 2401.0,
+        }})
+        _wait_task_status(client, h, gid, "running")
+
+        empty = {
+            "account": {"login": 5288, "balance": 1000, "equity": 1000},
+            "positions": [],
+            "orders": [],
+            "quotes": {"XAUUSD": {"bid": 2400, "ask": 2401, "mid": 2400.5}},
+            "prices": {"XAUUSD": 2400.5},
+            "books_ok": True,
+        }
+        ws1.send_json({"type": "account", "data": empty})
+        page = _wait_task_status(client, h, gid, "running", tries=20)
+        assert page["items"][0]["status"] == "running"
+        assert page["items"][0]["dispatches"][0]["status"] in ("sent", "opened", "running")
+
+        ws1.send_json({"type": "account", "data": empty})
+        page = _wait_task_status(client, h, gid, "done")
+    assert page["items"][0]["status"] == "done"
+    assert page["items"][0]["dispatches"][0]["finish_reason"] == "reconciled_no_position"
+
+
+def test_unreadable_account_snapshot_does_not_reconcile(client):
+    """books_ok=false 或空壳快照不得对账，哪怕连着上报。"""
+    h = auth_headers(client)
+    token = _node_token(client, h)
+    n1 = _mk_node(client, h, 5289, "不可读快照节点")
+    gid = _mk_group(client, h, name="不可读对账组", node_ids=[n1])["group_id"]
+
+    with client.websocket_connect("/ws/node") as ws1:
+        ws1.send_json({"type": "auth", "data": {"token": token, "mt5_login": 5289}})
+        assert ws1.receive_json()["type"] == "auth_ok"
+        r = client.post("/webhook", json={
+            "action": "buy", "symbol": "XAUUSD", "volume": 0.1, "model": "strategy",
+        })
+        assert r.status_code == 200, r.text
+        cmd = ws1.receive_json()
+        ws1.send_json({"type": "trade_result", "data": {
+            "signal_id": cmd["signal_id"], "magic": cmd["magic"],
+            "symbol": "XAUUSD", "success": True, "order": 8802, "price": 2401.0,
+        }})
+        _wait_task_status(client, h, gid, "running")
+
+        for _ in range(3):
+            ws1.send_json({"type": "account", "data": {
+                "account": {"login": 5289, "balance": 1000},
+                "positions": [],
+                "orders": [],
+                "books_ok": False,
+            }})
+        page = _wait_task_status(client, h, gid, "running", tries=20)
+    assert page["items"][0]["status"] == "running"
+
+
+def test_snapshot_books_readable_rejects_empty_shell():
+    from app.ws_gateway import _snapshot_books_readable
+
+    assert _snapshot_books_readable({"books_ok": False, "account": {"login": 1}}) is False
+    assert _snapshot_books_readable({
+        "account": {}, "positions": [], "orders": [], "quotes": {}, "prices": {},
+    }) is False
+    assert _snapshot_books_readable({
+        "account": {"login": 1, "balance": 10}, "positions": [], "orders": [],
+    }) is True
+    assert _snapshot_books_readable({
+        "account": {"login": 1}, "positions": [{"magic": 31}], "books_ok": True,
+    }) is True
+
+
 def test_active_task_count_and_signals_status_filter(client):
     """分组列表展示进行中主任务数；signals?status=active 仅返回活跃主任务。"""
     h = auth_headers(client)

@@ -75,6 +75,10 @@ def test_list_templates_contains_template_1(client):
     assert by_type[1]["batch_count"] == 3
     assert by_type[1]["total_lot_limit"] == 10
     assert len(by_type[1]["batch_levels"]) == 3
+    assert by_type[1]["batch_levels"][0]["pos_from"] == 1
+    assert by_type[1]["batch_levels"][0]["pos_to"] == 4
+    assert by_type[1]["batch_levels"][2]["pos_from"] == 8
+    assert by_type[1]["batch_levels"][2]["pos_to"] == 10
     assert by_type[2]["status"] == 1
     assert by_type[2]["action"] == "all"
     assert by_type[2]["lot_times"] == 0.8

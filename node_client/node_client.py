@@ -283,48 +283,62 @@ class NodeClient:
                 out.add(sym)
         return sorted(out)
 
-    async def _snapshot(self) -> dict:
+    async def _snapshot(self) -> dict | None:
         """采集一次账户快照（账户信息 + 持仓 + 挂单 + 观察列表报价）。
 
         挂单必须一起上报：服务端拿快照做兜底对账，只看持仓的话，限价开仓的任务在
         挂单成交前会被判成「已无持仓」而提前收口。
+
+        持仓或挂单读失败返回 None，调用方不得把空仓上报——否则服务端会把「没读到」
+        当成「已平完」自动收口。报价/账户信息失败仍可带着账本上报。
         """
         try:
             positions = await self._exec(self.mt5.positions)
             orders = await self._pending_orders()
-            quotes = await self._exec(self.mt5.quotes, self.effective_watchlist(positions))
-            offset = None
-            probe = getattr(self.mt5, "server_time_offset_sec", None)
-            if callable(probe):
-                try:
-                    offset = await self._exec(probe)
-                except Exception:  # noqa: BLE001
-                    logger.debug("server_time_offset_sec failed", exc_info=True)
-            return {
-                "account": await self._exec(self.mt5.account_info),
-                "positions": positions,
-                "orders": orders,
-                "quotes": quotes,
-                "prices": {sym: q["mid"] for sym, q in quotes.items()},
-                "server_time_offset": offset,
-            }
         except Exception as e:  # noqa: BLE001
-            logger.debug("snapshot error: %s", e)
-            return {
-                "account": {}, "positions": [], "orders": [], "prices": {}, "quotes": {},
-                "server_time_offset": None,
-            }
+            logger.warning("snapshot books unreadable, skip report: %s", e)
+            return None
+        if positions is None or orders is None:
+            logger.warning("snapshot books returned None, skip report")
+            return None
+        quotes: dict = {}
+        prices: dict = {}
+        try:
+            quotes = await self._exec(self.mt5.quotes, self.effective_watchlist(positions)) or {}
+            prices = {sym: q["mid"] for sym, q in quotes.items()}
+        except Exception as e:  # noqa: BLE001
+            logger.debug("snapshot quotes failed: %s", e)
+        offset = None
+        probe = getattr(self.mt5, "server_time_offset_sec", None)
+        if callable(probe):
+            try:
+                offset = await self._exec(probe)
+            except Exception:  # noqa: BLE001
+                logger.debug("server_time_offset_sec failed", exc_info=True)
+        account: dict = {}
+        try:
+            account = await self._exec(self.mt5.account_info) or {}
+        except Exception as e:  # noqa: BLE001
+            logger.debug("snapshot account_info failed: %s", e)
+        return {
+            "account": account,
+            "positions": list(positions),
+            "orders": list(orders),
+            "quotes": quotes,
+            "prices": prices,
+            "server_time_offset": offset,
+            "books_ok": True,
+        }
 
     async def _pending_orders(self) -> list[dict]:
-        """读未成交挂单；读不到时返回空列表，不影响快照其余部分上报。"""
+        """读未成交挂单。读失败抛错，由快照路径跳过上报，避免空挂单被对账当成已撤。"""
         reader = getattr(self.mt5, "pending_orders", None)
         if reader is None:
             return []
-        try:
-            return list(await self._exec(reader) or [])
-        except Exception as e:  # noqa: BLE001
-            logger.debug("read pending orders failed: %s", e)
-            return []
+        rows = await self._exec(reader)
+        if rows is None:
+            raise RuntimeError("pending_orders returned None")
+        return list(rows)
 
     # ----------------------- 协议 ------------------------
     async def _authenticate(self, ws) -> bool:
@@ -412,6 +426,9 @@ class NodeClient:
         """定时上报账户快照；顺带检查账户级风控；发现换号则抛错结束会话。"""
         while True:
             snap = await self._snapshot()
+            if snap is None:
+                await asyncio.sleep(clamp_account_report_interval(settings.account_report_interval))
+                continue
             self._check_login(snap.get("account") or {})
             await ws.send(json.dumps({"type": "account", "data": snap}))
             await self._check_account_risk(ws, snap)
@@ -512,9 +529,14 @@ class NodeClient:
         canceller = getattr(self.mt5, "cancel_order", None)
         if canceller is None:
             return 0
+        try:
+            pending = await self._pending_orders()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("read pending orders failed: %s", e)
+            return 0
         base = str(symbol or "").upper().replace("/", "")
         cancelled = 0
-        for order in await self._pending_orders():
+        for order in pending:
             name = str(order.get("symbol") or "").upper()
             if base and not (name.startswith(base) or base.startswith(name)):
                 continue
