@@ -192,7 +192,7 @@ class NodeGroup(Base):
     dispatch_mode: Mapped[str] = mapped_column(String(8), default="sync")
     # 趋势风控：开仓前按全局趋势参数对各节点算信号品种趋势，仅顺势放行（默认关）
     trend_risk_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
-    # 限价挂单监听：把节点 MT5 上手动挂的带关键字限价单转成 strategy 信号（默认关）
+    # 限价挂单监听：把节点 MT5 上手动挂的限价单转成 strategy 信号（默认关；关键字默认为 limit，允许空）
     limit_watch_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     limit_watch_keyword: Mapped[str] = mapped_column(String(32), default="limit")
     # 一对一绑定 TradingStrategy；unique 保证同一策略不能挂到多个分组
@@ -240,7 +240,7 @@ class GroupSignalTask(Base):
     comment: Mapped[str | None] = mapped_column(String(128), nullable=True)
     source_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
     raw_payload: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # —— 绑定策略（触发时快照，运行期不受策略后续编辑影响）——
+    # —— 绑定策略（触发时快照；保存策略时可热推给进行中子任务）——
     strategy_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     strategy_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
     strategy_snapshot_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
@@ -334,7 +334,7 @@ class GroupTaskEvent(Base):
     node_id: Mapped[str] = mapped_column(String(32), index=True)
     magic: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
-    # open / add_counter / add_trend / grid_add / grid_shift /
+    # open / add_counter / add_trend / add_manual / grid_add / grid_shift /
     # close_partial / close_all / error / resume
     event_type: Mapped[str] = mapped_column(String(16), index=True)
     symbol: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -346,6 +346,33 @@ class GroupTaskEvent(Base):
     total_volume: Mapped[float | None] = mapped_column(Float, nullable=True)
     profit: Mapped[float | None] = mapped_column(Float, nullable=True)
     message: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    detail_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+
+class LimitWatchLog(Base):
+    """分组限价挂单监听日志（strategy 链路附属，不进 normal 分发）。
+
+    一张触发单可能命中多个分组，按 group_id 各写一行。权威历史在 MySQL；
+    后台列表靠 WS `limit_watch_log` 实时追加。
+    """
+    __tablename__ = "limit_watch_log"
+
+    id: Mapped[int] = mapped_column(AutoPK, primary_key=True, autoincrement=True)
+    ts: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
+    group_id: Mapped[str] = mapped_column(String(32), index=True)
+    group_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    node_id: Mapped[str] = mapped_column(String(32), index=True)
+    ticket: Mapped[int] = mapped_column(BigInteger, default=0)
+    symbol: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    action: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    volume: Mapped[float | None] = mapped_column(Float, nullable=True)
+    price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    tp: Mapped[float | None] = mapped_column(Float, nullable=True)
+    comment: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # rejected / cancel_failed / ok / dispatch_rejected / duplicate
+    event: Mapped[str] = mapped_column(String(32), index=True)
+    message: Mapped[str] = mapped_column(String(512), default="")
     detail_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 

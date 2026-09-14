@@ -196,7 +196,7 @@ class GroupCreate(BaseModel):
     dispatch_mode: str = "sync"  # sync / poll
     # 趋势风控：开仓前按全局趋势参数对各节点算信号品种趋势（默认关）
     trend_risk_enabled: bool = False
-    # 限价挂单监听：仅绑定趋势策略的分组可开（默认关）；关键字默认 limit
+    # 限价挂单监听：仅绑定趋势策略的分组可开（默认关）；关键字默认 limit，空串表示不按注释过滤
     limit_watch_enabled: bool = False
     limit_watch_keyword: Optional[str] = Field(default=None, max_length=32)
     remark: Optional[str] = None
@@ -219,6 +219,34 @@ class GroupUpdate(BaseModel):
     node_ids: Optional[list[str]] = None  # 传入即整体替换成员列表
 
 
+class LimitWatchLogRecord(BaseModel):
+    """分组限价监听日志（落库 + 后台 WS 实时推送）。"""
+    id: int
+    ts: Optional[float] = None
+    group_id: str
+    group_name: Optional[str] = None
+    node_id: str
+    ticket: int = 0
+    symbol: Optional[str] = None
+    action: Optional[str] = None
+    volume: Optional[float] = None
+    price: Optional[float] = None
+    sl: Optional[float] = None
+    tp: Optional[float] = None
+    comment: Optional[str] = None
+    event: str
+    message: str = ""
+    detail: Optional[dict] = None
+
+
+class PaginatedLimitWatchLogs(BaseModel):
+    """分组限价监听日志分页。"""
+    items: list[LimitWatchLogRecord]
+    total: int
+    page: int
+    page_size: int
+
+
 class GroupOut(BaseModel):
     """分组对外展示对象（含成员节点与信号计数）。"""
     group_id: str
@@ -227,6 +255,7 @@ class GroupOut(BaseModel):
     dispatch_mode: str = "sync"
     trend_risk_enabled: bool = False
     limit_watch_enabled: bool = False
+    # 空串 = 不按注释过滤；缺省展示仍是 limit
     limit_watch_keyword: str = "limit"
     strategy_id: Optional[str] = None
     strategy_name: Optional[str] = None
@@ -237,6 +266,8 @@ class GroupOut(BaseModel):
     online_node_count: int = 0   # 有效节点数（已启用 + 在线）
     signal_count: int = 0        # 该分组已处理的信号主任务数
     active_task_count: int = 0   # 进行中主任务数（pending/dispatching/running）
+    # 已开监听时附带最近若干条；未开启为空列表
+    limit_watch_logs: list[LimitWatchLogRecord] = Field(default_factory=list)
 
 
 class GroupTaskDispatchRecord(BaseModel):
@@ -353,10 +384,48 @@ class StrategyBatchLevel(BaseModel):
     extra_lot: float = Field(default=0.0, ge=0)
 
 
+class SignalFloatPlRatio(BaseModel):
+    """模版1 信号级浮盈亏比。次数耗尽是节点任务内存态，配置里不存 remaining_times。"""
+    enabled: bool = False
+    ratio: float = Field(default=-20.0, description="触发比例（%）；负=浮亏侧，正=浮盈侧")
+    action: str = Field(default="close_all", description="触达后操作，目前仅清该信号全部")
+    monitor_mode: str = Field(default="loop", description="loop=循环 / times=指定次数")
+    max_times: int = Field(default=1, ge=1, description="指定次数模式下的次数上限")
+
+
+class SignalLotPlTier(BaseModel):
+    min_lot: float = Field(default=0.1, ge=0)
+    pl_amount: float = Field(default=50.0, description="盈亏金额；负=亏损侧达阈值")
+
+
+class SignalLotPlTiers(BaseModel):
+    """模版1 信号级分档手数盈亏。"""
+    enabled: bool = False
+    batch_count: int = Field(default=2, ge=1, le=10)
+    close_action: str = Field(default="all", description="all|buy|sell")
+    tiers: list[SignalLotPlTier] = Field(
+        default_factory=lambda: [
+            SignalLotPlTier(min_lot=0.1, pl_amount=50.0),
+            SignalLotPlTier(min_lot=0.5, pl_amount=100.0),
+        ],
+    )
+
+
+class ManualScatterConfig(BaseModel):
+    """模版1 手动分散仓：视觉上像分批最后一档，运行时与分批加仓隔离。"""
+    enabled: bool = False
+    entry_price: float = Field(default=0.0, ge=0, description="入场价，到价后市价开仓")
+    take_profit: float = Field(default=0.0, ge=0, description="止盈价")
+    stop_loss: float = Field(default=0.0, ge=0, description="止损价，0=不设")
+    volume: float = Field(default=0.0, ge=0, description="手数；0 且未锁定时由节点按分档手数盈亏反推")
+    volume_locked: bool = Field(default=False, description="用户手改手数后不再自动重算")
+
+
 class StrategyRule(BaseModel):
     """单条策略规则，字段按 type 分组使用。
 
-    type=1 逆势加仓 / type=2 顺势加仓（模版1）：point ~ batch_levels；
+    type=1 逆势加仓 / type=2 顺势加仓（模版1）：point ~ batch_levels、manual_scatter，以及
+    策略共享的信号级盈亏控制 float_pl_ratio / lot_pl_tiers；
     type=3 以损定量趋势单（模版2）：risk_amount ~ breakeven_times；
     type=4 网格交易（模版3）：price_lower ~ assist_max_loss。
 
@@ -377,6 +446,11 @@ class StrategyRule(BaseModel):
     batch_count: int = Field(default=0, ge=0, description="分批批数")
     total_lot_limit: float = Field(default=0.0, ge=0, description="总手数上限，0=不限制")
     batch_levels: list[StrategyBatchLevel] = Field(default_factory=list)
+    # 模版1 信号级盈亏控制（顺势/逆势写入相同值；其它 type 规范化时丢弃）
+    float_pl_ratio: Optional[SignalFloatPlRatio] = None
+    lot_pl_tiers: Optional[SignalLotPlTiers] = None
+    # 模版1 手动分散仓（顺势 / 逆势各至多一条；不进 batch_levels）
+    manual_scatter: Optional[ManualScatterConfig] = None
     # --- type=3：以损定量趋势单 ---
     risk_amount: float = Field(default=100.0, ge=0, description="风险金额（账户货币）")
     rr_ratio: float = Field(default=2.5, ge=0, description="盈亏比：止盈距离 = 止损距离 × 该值（挂在分散仓）")

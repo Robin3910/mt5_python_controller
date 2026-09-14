@@ -47,6 +47,8 @@ logger = logging.getLogger(__name__)
 
 # 写入 signal_history.dispatch_mode 的标识，用于把 strategy 信号与 sync/poll/manual 区分开
 SIGNAL_DISPATCH_MODE = "group"
+# 热推单节点发送封顶，避免半死 WS 拖住保存后的后台任务。
+STRATEGY_UPDATE_SEND_TIMEOUT = 2.0
 
 
 def build_strategy_start_command(
@@ -123,6 +125,19 @@ def build_strategy_resume_command(subtask: dict) -> dict:
     if isinstance(runtime, dict) and runtime:
         cmd["runtime"] = runtime
     return cmd
+
+
+def build_strategy_update_command(
+    *, task_id: int, dispatch_id: int, magic: Optional[int], snapshot: dict,
+) -> dict:
+    """热推进行中任务的策略快照，形状对齐 strategy_stop（cmd 直发、不包 type/data）。"""
+    return {
+        "cmd": "strategy_update",
+        "task_id": task_id,
+        "dispatch_id": dispatch_id,
+        "magic": magic,
+        "strategy": snapshot,
+    }
 
 
 class GroupDispatcher:
@@ -746,6 +761,44 @@ class GroupDispatcher:
     # ------------------------------------------------------------------
     # 辅助
     # ------------------------------------------------------------------
+    async def push_strategy_updates(self, subtasks: list[dict], snapshot: dict) -> int:
+        """把新快照发给仍未收口的节点；离线节点只靠库内快照，重连 resume 会带上。"""
+        sent = 0
+        for sub in subtasks or []:
+            node_id = str(sub.get("node_id") or "")
+            if not node_id:
+                continue
+            try:
+                task_id = int(sub.get("task_id"))
+                dispatch_id = int(sub.get("dispatch_id"))
+            except (TypeError, ValueError):
+                continue
+            cmd = build_strategy_update_command(
+                task_id=task_id,
+                dispatch_id=dispatch_id,
+                magic=sub.get("magic"),
+                snapshot=snapshot,
+            )
+            try:
+                ok = await asyncio.wait_for(
+                    manager.send_to_node(node_id, cmd),
+                    timeout=STRATEGY_UPDATE_SEND_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "strategy_update send timed out: node %s task %s",
+                    node_id, task_id,
+                )
+                continue
+            if ok:
+                sent += 1
+            else:
+                logger.info(
+                    "strategy_update queued-by-snapshot only: node %s task %s offline",
+                    node_id, task_id,
+                )
+        return sent
+
     async def _release(self, result: Optional[dict]) -> None:
         """释放持久化层回传的组内节点占位。"""
         for group_id, node_id in (result or {}).get("released", []):

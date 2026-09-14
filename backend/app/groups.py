@@ -10,6 +10,7 @@ from . import group_persist, group_rules, group_service, persist
 from .connections import manager
 from .deps import client_ip, get_current_admin, get_group_dispatcher, get_store
 from .group_dispatcher import GroupDispatcher
+from .limit_watch import normalize_keyword
 from .models import (
     GROUP_DISPATCH_MODES,
     GroupCreate,
@@ -18,6 +19,7 @@ from .models import (
     GroupTaskEventRecord,
     GroupUpdate,
     PaginatedGroupSignals,
+    PaginatedLimitWatchLogs,
 )
 from .redis_store import RedisStore
 
@@ -35,7 +37,7 @@ def _group_audit_snapshot(d: dict | None) -> dict | None:
         "dispatch_mode": d.get("dispatch_mode"),
         "trend_risk_enabled": bool(d.get("trend_risk_enabled", False)),
         "limit_watch_enabled": bool(d.get("limit_watch_enabled", False)),
-        "limit_watch_keyword": d.get("limit_watch_keyword") or "limit",
+        "limit_watch_keyword": normalize_keyword(d.get("limit_watch_keyword")),
         "strategy_id": d.get("strategy_id"),
         "remark": d.get("remark"),
         "node_ids": group_rules.member_ids(d),
@@ -52,6 +54,7 @@ def _validate_dispatch_mode(mode: str | None) -> None:
 
 async def _to_group_out(
     store: RedisStore, d: dict, signal_count: int = 0, active_task_count: int = 0,
+    limit_watch_logs: list | None = None,
 ) -> GroupOut:
     """把缓存里的分组 dict 组装成对外的 GroupOut（合并成员节点的在线状态）。"""
     nodes: list[GroupNodeRef] = []
@@ -78,6 +81,15 @@ async def _to_group_out(
     if strategy_id:
         sty = await store.get_strategy(strategy_id) or {}
         strategy_name = sty.get("name") or strategy_id
+    logs: list = []
+    if d.get("limit_watch_enabled"):
+        if limit_watch_logs is not None:
+            logs = limit_watch_logs
+        else:
+            gid = d.get("group_id")
+            if gid:
+                latest = await persist.latest_limit_watch_logs([gid])
+                logs = latest.get(gid, [])
     return GroupOut(
         group_id=d["group_id"],
         name=d["name"],
@@ -85,7 +97,7 @@ async def _to_group_out(
         dispatch_mode=d.get("dispatch_mode", "sync"),
         trend_risk_enabled=bool(d.get("trend_risk_enabled", False)),
         limit_watch_enabled=bool(d.get("limit_watch_enabled", False)),
-        limit_watch_keyword=str(d.get("limit_watch_keyword") or "limit"),
+        limit_watch_keyword=normalize_keyword(d.get("limit_watch_keyword")),
         strategy_id=strategy_id,
         strategy_name=strategy_name,
         remark=d.get("remark"),
@@ -95,6 +107,7 @@ async def _to_group_out(
         online_node_count=online,
         signal_count=signal_count,
         active_task_count=active_task_count,
+        limit_watch_logs=logs,
     )
 
 
@@ -113,9 +126,15 @@ async def list_groups(
     groups.sort(key=lambda g: (g.get("created_at", 0), g.get("name") or ""))
     counts = await group_persist.count_by_group()
     active_counts = await group_persist.count_active_by_group()
+    watch_ids = [
+        g["group_id"] for g in groups
+        if g.get("limit_watch_enabled") and g.get("group_id")
+    ]
+    latest_logs = await persist.latest_limit_watch_logs(watch_ids) if watch_ids else {}
     return [
         await _to_group_out(
             store, g, counts.get(g["group_id"], 0), active_counts.get(g["group_id"], 0),
+            limit_watch_logs=latest_logs.get(g["group_id"], []) if g.get("limit_watch_enabled") else [],
         )
         for g in groups
     ]
@@ -160,18 +179,34 @@ async def get_group(
     )
 
 
+@router.get("/{group_id}/limit-watch-logs", response_model=PaginatedLimitWatchLogs)
+async def group_limit_watch_logs(
+    group_id: str,
+    page: int = 1,
+    page_size: int = 50,
+    store: RedisStore = Depends(get_store),
+    _: str = Depends(get_current_admin),
+):
+    """分组限价监听日志分页（落库；列表页经后台 WS 实时追加）。"""
+    if not await store.get_group(group_id):
+        raise HTTPException(status_code=404, detail="group not found")
+    return await persist.list_limit_watch_logs(group_id, page, page_size)
+
+
 @router.get("/{group_id}/signals", response_model=PaginatedGroupSignals)
 async def group_signals(
     group_id: str,
     page: int = 1,
     page_size: int = 20,
     status: str | None = None,
+    signal_id: str | None = None,
     store: RedisStore = Depends(get_store),
     _: str = Depends(get_current_admin),
 ):
     """分组信号明细分页：主任务（信号 + 下发数据）与各节点的处理过程。
 
     status=active 时仅返回进行中主任务（pending/dispatching/running）。
+    signal_id 非空时按信号编号精确过滤（监听日志「已转成策略信号」跳转）。
     """
     if status is not None and status != "active":
         raise HTTPException(status_code=400, detail="status 仅支持 active")
@@ -179,8 +214,9 @@ async def group_signals(
         raise HTTPException(status_code=404, detail="group not found")
     nodes = await store.all_nodes()
     node_names = {n["node_id"]: n.get("name") or n["node_id"] for n in nodes}
+    sid = (signal_id or "").strip() or None
     return await group_persist.recent_group_signals(
-        group_id, page, page_size, node_names, status=status,
+        group_id, page, page_size, node_names, status=status, signal_id=sid,
     )
 
 

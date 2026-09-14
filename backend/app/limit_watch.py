@@ -1,8 +1,8 @@
-"""分组限价挂单监听：把节点 MT5 上手动挂的「带关键字限价单」转成 strategy 信号。
+"""分组限价挂单监听：把节点 MT5 上手动挂的限价单转成 strategy 信号。
 
 只作用于绑定趋势策略（模版2）且开关打开的分组。识别与校验是纯函数；撤单、
 分发、审计在编排层。复用 `process_signal`（与中控台手动触发同构），用
-`group_ids` 点名全部命中分组。
+`group_ids` 点名全部命中分组。关键字可留空（不按注释过滤）；未配置时默认 `limit`。
 """
 from __future__ import annotations
 
@@ -39,11 +39,13 @@ _pending_cancels: dict[str, asyncio.Future] = {}
 
 
 def normalize_keyword(raw: object) -> str:
-    """分组关键字：去空白，空则回落到默认 `limit`，超长截断。"""
-    text = str(raw or "").strip()
-    if not text:
+    """分组关键字：去两端空白并截断。
+
+    `None`（未传 / 旧缓存缺字段）回落默认 `limit`；空串或纯空白表示不按注释过滤。
+    """
+    if raw is None:
         return DEFAULT_KEYWORD
-    return text[:KEYWORD_MAX_LEN]
+    return str(raw).strip()[:KEYWORD_MAX_LEN]
 
 
 def is_trend_strategy(strategy: object) -> bool:
@@ -56,10 +58,14 @@ def is_trend_strategy(strategy: object) -> bool:
 
 
 def keyword_matches(comment: object, keyword: object) -> bool:
-    """订单注释是否包含该分组关键字（大小写不敏感）。"""
+    """订单注释是否命中该分组关键字（大小写不敏感的子串）。
+
+    关键字为空（显式留空）时不按注释过滤，视为命中。
+    """
     needle = normalize_keyword(keyword)
-    hay = str(comment or "")
-    return needle.lower() in hay.lower() if needle else False
+    if not needle:
+        return True
+    return needle.lower() in str(comment or "").lower()
 
 
 def _as_int(value: object, default: int = 0) -> int:
@@ -186,8 +192,8 @@ def select_watch_targets(
 ) -> tuple[list[dict], list[tuple[dict, str]]]:
     """从该节点所属分组里挑出应接收本张触发单的分组。
 
-    入选：分组启用 + 监听开 + 节点是成员 + 注释匹配该组关键字 + 绑定启用中的
-    趋势策略 + 品种匹配 + 通过 `entry_reject_reason`。
+    入选：分组启用 + 监听开 + 节点是成员 + 注释匹配该组关键字（空关键字视为命中）
+    + 绑定启用中的趋势策略 + 品种匹配 + 通过 `entry_reject_reason`。
     返回 (可下发分组, 关键字已命中但被准入拦住的 (分组, 原因))。
     关键字都没碰上的分组不出现在任一侧。
     """
@@ -240,6 +246,57 @@ def _blocked_reason(blocked: list[tuple[dict, str]]) -> str:
         name = group.get("name") or group.get("group_id")
         parts.append(f"{name}：{reason}")
     return "；".join(parts) if parts else "没有可接收的分组"
+
+
+def dispatch_event(status: object) -> str:
+    """process_signal 的 status → 监听日志 event。"""
+    text = str(status or "ok").strip().lower()
+    if text == "rejected":
+        return "dispatch_rejected"
+    if text == "duplicate":
+        return "duplicate"
+    return "ok"
+
+
+def format_watch_message(
+    event: str,
+    *,
+    node_id: str = "",
+    ticket: int = 0,
+    symbol: str = "",
+    action: str = "",
+    volume: float | None = None,
+    price: float | None = None,
+    reason: str = "",
+    signal_id: str = "",
+) -> str:
+    """人读的一行监听日志（纯函数，便于单测）。"""
+    loc = " ".join(p for p in (str(node_id or "").strip(), f"#{ticket}" if ticket else "") if p)
+    if symbol:
+        loc = f"{loc} {symbol}".strip()
+    reason = str(reason or "").strip()
+    signal_id = str(signal_id or "").strip()
+    if event == "rejected":
+        text = f"拒绝 {loc}：{reason}" if reason else f"拒绝 {loc}"
+    elif event == "cancel_failed":
+        text = f"撤单失败 {loc}：{reason}" if reason else f"撤单失败 {loc}"
+    elif event == "duplicate":
+        extra = f"（{signal_id}）" if signal_id else ""
+        text = f"已撤单但信号重复 {loc}{extra}"
+    elif event == "dispatch_rejected":
+        text = f"已撤单但分发被拒 {loc}：{reason}" if reason else f"已撤单但分发被拒 {loc}"
+    else:
+        bits = [f"已触发 {loc}".strip()]
+        if action:
+            bits.append(str(action).strip().upper())
+        if volume and volume > 0:
+            bits.append(f"{volume:g}手")
+        if price and price > 0:
+            bits.append(f"@{price:g}")
+        if signal_id:
+            bits.append(f"→ {signal_id}")
+        text = " ".join(bits)
+    return text.strip().strip("：")[:512]
 
 
 # ------------------------------------------------------------------
@@ -359,6 +416,9 @@ async def _handle_one(
                 node_id, snap, "cancel_failed",
                 after={"cancel": cancel, "group_ids": group_ids, "reason": err},
             )
+            await _emit_group_logs(
+                passing, node_id=node_id, order=order, event="cancel_failed", reason=str(err),
+            )
             await store.release_limit_watch_lock(node_id, ticket)
             return
 
@@ -388,6 +448,15 @@ async def _handle_one(
                 "group_ids": group_ids,
                 "group_names": group_names,
             },
+        )
+        await _emit_group_logs(
+            passing,
+            node_id=node_id,
+            order=order,
+            event=dispatch_event(status),
+            reason=str(result.get("reason") or ""),
+            signal_id=str(result.get("signal_id") or ""),
+            extra={"status": status, "signal_id": result.get("signal_id")},
         )
     except Exception:  # noqa: BLE001
         await store.release_limit_watch_lock(node_id, ticket)
@@ -435,6 +504,9 @@ async def _reject(
             "group_names": [g.get("name") or g.get("group_id") for g in groups],
         },
     )
+    await _emit_group_logs(
+        groups, node_id=node_id, order=order, event="rejected", reason=reason,
+    )
 
 
 async def _audit(node_id: str, before: dict, result: str, *, after: dict) -> None:
@@ -442,3 +514,56 @@ async def _audit(node_id: str, before: dict, result: str, *, after: dict) -> Non
         AUDIT_OPERATOR, AUDIT_ACTION, node_id, before, result, None,
         category="console", before=before, after=after,
     )
+
+
+async def _emit_group_logs(
+    groups: list[dict],
+    *,
+    node_id: str,
+    order: dict,
+    event: str,
+    reason: str = "",
+    signal_id: str = "",
+    extra: dict | None = None,
+) -> None:
+    """按分组分条落库并推后台 WS；失败不影响撤单/分发。"""
+    snap = order_snapshot(order)
+    ticket = order_ticket(order)
+    message = format_watch_message(
+        event,
+        node_id=node_id,
+        ticket=ticket,
+        symbol=str(snap.get("symbol") or ""),
+        action=str(snap.get("type") or ""),
+        volume=_as_float(snap.get("volume")),
+        price=_as_float(snap.get("price_open")),
+        reason=reason,
+        signal_id=signal_id,
+    )
+    seen: set[str] = set()
+    for group in groups or []:
+        gid = str((group or {}).get("group_id") or "").strip()
+        if not gid or gid in seen:
+            continue
+        seen.add(gid)
+        try:
+            row = await persist.record_limit_watch_log(
+                group_id=gid,
+                group_name=str(group.get("name") or gid),
+                node_id=node_id,
+                ticket=ticket,
+                symbol=snap.get("symbol"),
+                action=snap.get("type"),
+                volume=_as_float(snap.get("volume")) or None,
+                price=_as_float(snap.get("price_open")) or None,
+                sl=_as_float(snap.get("sl")) or None,
+                tp=_as_float(snap.get("tp")) or None,
+                comment=snap.get("comment"),
+                event=event,
+                message=message,
+                detail=extra,
+            )
+            if row:
+                await manager.broadcast_admin({"type": "limit_watch_log", "data": row})
+        except Exception:  # noqa: BLE001
+            logger.exception("limit_watch emit log failed group %s ticket %s", gid, ticket)

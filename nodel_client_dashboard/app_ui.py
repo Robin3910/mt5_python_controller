@@ -16,7 +16,7 @@ from client_deploy import count_pending_upgrades, read_version_near
 from models import InstanceConfig, default_label_from_path, shorten_path
 from process_manager import ProcessManager
 from store import load_instances, load_panel_config, save_instances
-from tray_icon import TrayController, tray_available
+from tray_icon import TrayController, apply_window_icon, tray_available
 from version import get_version
 from theme import (
     ACCENT,
@@ -87,6 +87,7 @@ class EditInstanceDialog(ctk.CTkToplevel):
         self.title("编辑实例")
         self.resizable(False, False)
         self.configure(fg_color=BG)
+        apply_window_icon(self)
         self.transient(master)
         self.result: InstanceConfig | None = None
         self._cfg = cfg
@@ -250,7 +251,8 @@ class DashboardApp(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         apply_theme()
-        self.title(f"节点运维面板 v{get_version()}")
+        self.title(f"节点控制台 v{get_version()}")
+        apply_window_icon(self, as_default=True)
         self.geometry("1200x760")
         self.minsize(980, 640)
         self.configure(fg_color=BG)
@@ -295,7 +297,7 @@ class DashboardApp(ctk.CTk):
         brand = ctk.CTkFrame(header, fg_color="transparent")
         brand.grid(row=0, column=0, padx=20, pady=14, sticky="w")
         ctk.CTkLabel(
-            brand, text="节点运维", text_color=ACCENT, font=font(22, "bold")
+            brand, text="节点控制台", text_color=ACCENT, font=font(22, "bold")
         ).pack(anchor="w")
         ctk.CTkLabel(
             brand,
@@ -1154,7 +1156,7 @@ class DashboardApp(ctk.CTk):
             schedule=lambda fn: self.after(0, fn),
             on_show=self._show_from_tray,
             on_quit=self._quit_app,
-            title="节点运维面板",
+            title="节点控制台",
         )
         if self._tray.start():
             # 顶栏提示可托盘驻留
@@ -1288,7 +1290,7 @@ class DashboardApp(ctk.CTk):
                 pass
         if not getattr(self, "_tray_tip_shown", False):
             self._tray_tip_shown = True
-            self._tray.notify("节点运维面板", "已最小化到托盘，右键可显示或退出")
+            self._tray.notify("节点控制台", "已最小化到托盘，右键可显示或退出")
 
     def _show_from_tray(self) -> None:
         if self._quitting:
@@ -1348,7 +1350,7 @@ def run_app() -> int:
 
             tip = tk.Tk()
             tip.withdraw()
-            messagebox.showinfo("提示", "运维面板已在运行，仅支持单实例。\n已尝试切换到已有窗口。")
+            messagebox.showinfo("提示", "节点控制台已在运行，仅支持单实例。\n已尝试切换到已有窗口。")
             tip.destroy()
         except Exception:  # noqa: BLE001
             pass

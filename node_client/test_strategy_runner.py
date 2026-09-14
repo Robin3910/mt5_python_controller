@@ -7,7 +7,7 @@ import asyncio
 
 import market_hub as mh
 from mock_mt5 import MockMT5Client
-from strategy_runner import StrategyRunner
+from strategy_runner import StrategyRunner, _trade_error_text
 
 MAGIC = 900000001
 
@@ -805,6 +805,54 @@ async def test_risk_sized_breakeven_moves_stop_to_average_price():
     # 保本改单不能顺手抹掉已挂的止盈（分散仓）
     assert mt5.positions_by_magic(MAGIC)[1]["tp"] == LADDER[0]
     runner.cancel()
+
+
+async def test_risk_sized_breakeven_failure_includes_broker_comment():
+    """改止损被拒时，进度里要带券商 comment / retcode，而不是笼统的 modify_sl_failed。"""
+    class RejectSL(MockMT5Client):
+        def modify_position_sl(self, ticket, sl, tp=None):
+            return {
+                "success": False,
+                "ticket": int(ticket),
+                "retcode": 10016,
+                "error": "Invalid stops",
+            }
+
+    sent: list = []
+    runner, hub, mt5 = _risk_runner(
+        sent, mt5=RejectSL(), breakeven_enabled=True, breakeven_times=1.0,
+    )
+    runner.start()
+    await _settle()
+
+    held = mt5.positions_by_magic(MAGIC)
+    _tick(hub, held, 2403.0)
+    await _settle()
+
+    errors = _progress(sent, "error")
+    assert errors
+    msg = errors[0]["message"]
+    assert "保本止损设置失败" in msg
+    assert "Invalid stops" in msg
+    assert "10016" in msg
+    assert errors[0]["detail"]["error"] == "Invalid stops (10016)"
+    assert mt5.positions_by_magic(MAGIC)[0]["sl"] == STOP_LOSS
+    runner.cancel()
+
+
+def test_trade_error_text_prefers_broker_comment_and_partial_count():
+    assert _trade_error_text({"success": False, "error": "Invalid stops", "retcode": 10016}) == (
+        "Invalid stops (10016)"
+    )
+    mixed = {
+        "success": False,
+        "results": [
+            {"success": True, "ticket": 1},
+            {"success": False, "ticket": 2, "error": "Invalid request", "retcode": 10013},
+        ],
+    }
+    assert _trade_error_text(mixed) == "1/2 笔失败：Invalid request (10013)"
+    assert _trade_error_text({}) == "改单失败"
 
 
 async def test_risk_sized_breakeven_only_triggers_once():
@@ -1755,4 +1803,115 @@ async def test_grid_trailing_comment_carries_absolute_level():
     held = mt5.positions_by_magic(MAGIC)
     assert held
     assert held[-1]["comment"] == "G4L4"
+    runner.cancel()
+
+
+OTHER_MAGIC = 900000002
+
+
+def _addon_pl_rule(**over) -> dict:
+    rule = counter_rule()
+    rule["float_pl_ratio"] = {
+        "enabled": False, "ratio": -20, "monitor_mode": "loop", "max_times": 1,
+    }
+    rule["lot_pl_tiers"] = {
+        "enabled": False, "batch_count": 2, "close_action": "all",
+        "tiers": [
+            {"min_lot": 0.1, "pl_amount": 50.0},
+            {"min_lot": 0.5, "pl_amount": 100.0},
+        ],
+    }
+    rule.update(over)
+    return rule
+
+
+async def test_signal_float_pl_closes_only_own_magic():
+    """信号盈亏比按本魔术号浮盈/余额计算，只平本信号，其它 magic 不动。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.balance = 10000.0
+    runner, hub = _runner(
+        sent, mt5=mt5,
+        strategy={"rules": [_addon_pl_rule(float_pl_ratio={
+            "enabled": True, "ratio": -20, "monitor_mode": "loop", "max_times": 1,
+        })]},
+    )
+    runner.start()
+    await _settle()
+
+    mt5.place_market_order("XAUUSD", "BUY", 0.2, magic=OTHER_MAGIC)
+    for p in mt5._positions:
+        if int(p.get("magic") or 0) == MAGIC:
+            p["profit"] = -2000.0
+        elif int(p.get("magic") or 0) == OTHER_MAGIC:
+            p["profit"] = 5000.0  # 账户净值其实是赚的；本信号仍达 -20%
+
+    held = [p for p in mt5._positions if int(p.get("magic") or 0) == MAGIC]
+    _tick(hub, held, held[0]["price_open"])
+    await _settle()
+
+    assert mt5.positions_by_magic(MAGIC) == []
+    assert mt5.positions_by_magic(OTHER_MAGIC)
+    finished = _of_type(sent, "strategy_finished")
+    assert finished and finished[0]["status"] == "done"
+    assert "信号盈亏比" in finished[0]["reason"]
+    assert finished[0]["detail"]["kind"] == "signal_pl"
+    assert finished[0]["detail"]["current_ratio"] == -20.0
+
+
+async def test_signal_lot_pl_tiers_prefers_higher_batch_and_closes_all():
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub = _runner(
+        sent, mt5=mt5,
+        strategy={"rules": [_addon_pl_rule(lot_pl_tiers={
+            "enabled": True, "batch_count": 2, "close_action": "all",
+            "tiers": [
+                {"min_lot": 0.05, "pl_amount": 10.0},
+                {"min_lot": 0.1, "pl_amount": 20.0},
+            ],
+        })]},
+    )
+    runner.start()
+    await _settle()
+    for p in mt5._positions:
+        if int(p.get("magic") or 0) == MAGIC:
+            p["volume"] = 0.1
+            p["profit"] = 25.0
+
+    held = [p for p in mt5._positions if int(p.get("magic") or 0) == MAGIC]
+    _tick(hub, held, held[0]["price_open"])
+    await _settle()
+
+    assert mt5.positions_by_magic(MAGIC) == []
+    finished = _of_type(sent, "strategy_finished")
+    assert finished and "信号分档手数盈亏" in finished[0]["reason"]
+    assert finished[0]["detail"]["tier_index"] == 1
+
+
+async def test_signal_lot_pl_buy_side_keeps_sell():
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub = _runner(
+        sent, mt5=mt5,
+        strategy={"rules": [_addon_pl_rule(lot_pl_tiers={
+            "enabled": True, "batch_count": 1, "close_action": "buy",
+            "tiers": [{"min_lot": 0.1, "pl_amount": 10.0}],
+        })]},
+    )
+    runner.start()
+    await _settle()
+    mt5.place_market_order("XAUUSD", "SELL", 0.1, magic=MAGIC)
+    for p in mt5._positions:
+        if int(p.get("magic") or 0) == MAGIC:
+            p["profit"] = 12.0
+
+    held = [p for p in mt5._positions if int(p.get("magic") or 0) == MAGIC]
+    _tick(hub, held, held[0]["price_open"])
+    await _settle()
+
+    left = mt5.positions_by_magic(MAGIC)
+    assert len(left) == 1
+    assert left[0]["type"] == "SELL"
+    assert not _of_type(sent, "strategy_finished")
     runner.cancel()

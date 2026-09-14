@@ -53,6 +53,8 @@ const props = defineProps<{
    */
   symbolStoragePrefix?: string
   online?: boolean
+  /** 总览等嵌入场景：只展示得分条，不加载 K 线与参数表单 */
+  compact?: boolean
 }>()
 
 const hub = useHubStore()
@@ -382,7 +384,7 @@ onMounted(() => {
     || props.symbolOptions?.[0]
     || ''
   if (initial) pickSymbol(initial)
-  if (chartEl.value) {
+  if (!props.compact && chartEl.value) {
     chart = echarts.init(chartEl.value)
     if (typeof ResizeObserver !== 'undefined') {
       resizeObserver = new ResizeObserver(() => chart?.resize())
@@ -401,9 +403,9 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div>
+  <div :class="{ 'trend-compact': compact }">
     <!-- 趋势总览 -->
-    <div class="card card-pad" style="margin-bottom: 16px">
+    <div class="card card-pad" :style="{ marginBottom: compact ? 0 : '16px' }">
       <div class="row between" style="align-items: flex-start">
         <div>
           <strong>{{ data?.symbol || symbol || '—' }}</strong>
@@ -450,10 +452,37 @@ onBeforeUnmount(() => {
         <span>最后更新：{{ fmtTime(data?.updated_at) }}</span>
         <span>K 线时间：{{ fmtTime(data?.bar_time) }}</span>
       </div>
+
+      <div v-if="compact" class="trend-compact-tools">
+        <label class="trend-field">
+          <span class="trend-field-k">周期</span>
+          <select v-model="form.timeframe" class="trend-select">
+            <option v-for="t in TREND_TIMEFRAMES" :key="t.value" :value="t.value">
+              {{ t.label }}
+            </option>
+          </select>
+        </label>
+        <button class="btn-sm btn-ghost" :disabled="loading || !symbol" @click="load">
+          {{ loading ? '读取中…' : '刷新' }}
+        </button>
+      </div>
+      <div v-if="compact && symbolOptions?.length" class="trend-chips">
+        <button
+          v-for="s in symbolOptions"
+          :key="s"
+          class="trend-chip"
+          :class="{ active: s === symbol }"
+          @click="pickSymbol(s)"
+        >
+          {{ s }}
+        </button>
+      </div>
+      <p v-if="!online" class="trend-warn">节点当前离线，无法读取实时行情。</p>
+      <p v-else-if="error" class="trend-warn">{{ error }}</p>
     </div>
 
     <!-- 指标详情 -->
-    <div v-if="data && data.ready" class="trend-metrics">
+    <div v-if="!compact && data && data.ready" class="trend-metrics">
       <div class="card card-pad trend-metric">
         <div class="row between">
           <strong>EMA({{ data.ema.period }})</strong>
@@ -497,7 +526,7 @@ onBeforeUnmount(() => {
     </div>
 
     <!-- K 线与指标走势 -->
-    <div class="card card-pad trend-chart-card">
+    <div v-if="!compact" class="card card-pad trend-chart-card">
       <div class="row between" style="margin-bottom: 8px">
         <strong style="font-size: 13px">K 线与指标</strong>
         <span class="muted trend-sub">
@@ -509,7 +538,7 @@ onBeforeUnmount(() => {
     </div>
 
     <!-- 品种 / 周期 / 刷新 -->
-    <div class="card card-pad" style="margin-bottom: 16px">
+    <div v-if="!compact" class="card card-pad" style="margin-bottom: 16px">
       <div class="row between" style="align-items: flex-start">
         <div class="row" style="gap: 10px">
           <label class="trend-field">
@@ -555,16 +584,13 @@ onBeforeUnmount(() => {
           {{ s }}
         </button>
       </div>
-      <p v-else class="muted trend-hint">
+      <p v-if="!symbolOptions?.length" class="muted trend-hint">
         该节点暂无报价与持仓品种可选，直接输入品种代码即可查看。
       </p>
-
-      <p v-if="!online" class="trend-warn">节点当前离线，无法读取实时行情。</p>
-      <p v-else-if="error" class="trend-warn">{{ error }}</p>
     </div>
 
     <!-- 参数 -->
-    <div class="card card-pad" style="margin-bottom: 16px">
+    <div v-if="!compact" class="card card-pad" style="margin-bottom: 16px">
       <div class="row between" style="align-items: flex-start; margin-bottom: 12px">
         <div>
           <strong>参数</strong>
@@ -675,6 +701,9 @@ onBeforeUnmount(() => {
 
 .trend-hint { font-size: 12px; margin: 10px 0 0; line-height: 1.5; }
 .trend-warn { color: var(--gold); font-size: 12px; margin: 10px 0 0; }
+.trend-compact-tools { display: flex; align-items: flex-end; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+.trend-compact .trend-score { font-size: 26px; }
+.trend-compact .trend-chips { margin-top: 8px; }
 .trend-saved { color: var(--primary); font-size: 12px; margin: 0 0 10px; }
 .trend-sub { font-size: 12px; margin-left: 8px; }
 .trend-price { font-family: var(--mono); font-size: 20px; font-weight: 700; }

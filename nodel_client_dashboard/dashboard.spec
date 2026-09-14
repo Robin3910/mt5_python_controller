@@ -1,10 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
 """PyInstaller spec — 由 build_exe.bat 调用（onefile GUI）。"""
+from pathlib import Path
+
 from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
 
 datas: list = []
+_logo = Path("logo.ico")
+if _logo.is_file():
+    datas.append((str(_logo.resolve()), "."))
 binaries: list = []
 hiddenimports: list = [
     # 打包前由 build_version.py stamp 生成；version.py 在 try 里导入，缺它只会回落到数字版本号
@@ -71,4 +76,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=str(_logo.resolve()) if _logo.is_file() else None,
 )

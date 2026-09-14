@@ -14,7 +14,12 @@ import type {
   GridSide,
   GridSizingData,
   NodeOut,
+  RiskMonitorMode,
+  RiskSideAction,
+  SignalFloatPlRatio,
+  SignalLotPlTiers,
   StrategyBatchLevel,
+  ManualScatterConfig,
   StrategyOut,
   StrategyRule,
   StrategyTemplateOut,
@@ -41,6 +46,7 @@ const emit = defineEmits<{
 
 /** ATR / 波幅统计的已收盘 K 线根数，与后端 BATCH_BAR_PERIOD 一致，固定不可配 */
 const BATCH_BAR_PERIOD = 14
+const TEMPLATE_1_ID = 'tpl_1'
 
 /** 规则 type，与后端 strategy_templates 对齐 */
 const RULE_TYPE_COUNTER = 1
@@ -78,6 +84,48 @@ const RULE_TYPE_LABEL: Record<number, string> = {
   [RULE_TYPE_GRID]: '网格交易',
 }
 
+/** 仅影响表单展示顺序：顺势加仓在前，逆势加仓在后；提交仍用 form.rules 原序 */
+const RULE_DISPLAY_ORDER: Record<number, number> = {
+  [RULE_TYPE_TREND]: 0,
+  [RULE_TYPE_COUNTER]: 1,
+  [RULE_TYPE_RISK_SIZED]: 2,
+  [RULE_TYPE_GRID]: 3,
+}
+
+function ruleTypeOf(rule: { type: number }): number {
+  return Number(rule.type)
+}
+
+const displayedRules = computed(() =>
+  form.rules
+    .map((rule, index) => ({ rule, index }))
+    .sort((a, b) => {
+      const oa = RULE_DISPLAY_ORDER[ruleTypeOf(a.rule)] ?? ruleTypeOf(a.rule)
+      const ob = RULE_DISPLAY_ORDER[ruleTypeOf(b.rule)] ?? ruleTypeOf(b.rule)
+      return oa - ob
+    }),
+)
+
+/** 逆势加仓默认展开；顺势加仓始终展开。点标题可展开/收起逆势。 */
+const counterExpanded = ref(true)
+
+function isRuleFoldable(type: number): boolean {
+  return Number(type) === RULE_TYPE_COUNTER
+}
+
+function isRuleCollapsed(type: number): boolean {
+  return isRuleFoldable(type) && !counterExpanded.value
+}
+
+function toggleRuleCollapsed(type: number): void {
+  if (!isRuleFoldable(type)) return
+  counterExpanded.value = !counterExpanded.value
+}
+
+function resetRuleCollapse(): void {
+  counterExpanded.value = true
+}
+
 const RULE_TYPE_HELP: Record<number, string> = {
   [RULE_TYPE_COUNTER]:
     '逆势加仓：以首仓开仓价为锚（若已有更深的逆势仓则取最深一笔），价格朝不利方向偏离达到「点数 × Point()」后触发加仓。' +
@@ -111,7 +159,8 @@ const FIELD_HELP = {
   symbol: '绑定品种代码，如 XAUUSD。策略规则仅作用于该品种。',
   rules:
     '每条规则独立配置。关闭「启用」后该规则不会执行。' +
-    '实际加仓手数 = 倍数 × 基础订单手数 + 额外手数；触发距离 = 点数 × Point()。',
+    '实际加仓手数 = 倍数 × 基础订单手数 + 额外手数；触发距离 = 点数 × Point()。' +
+    '模版1 可另配信号级盈亏控制：每个信号独立监控，触发只平该信号仓位。',
   status:
     '关闭后本条规则不会参与监控与加仓；已产生的历史订单不受影响。',
   action:
@@ -128,18 +177,34 @@ const FIELD_HELP = {
     '最大允许加仓次数。达到次数上限后，本条规则不再继续加仓。',
   batch_enabled:
     '开启后按当前持仓笔数命中下方档位，使用该档的点数 / 倍数 / 额外手数，' +
-    '覆盖上方基础参数。档位由批数与总手数自动生成，不可手动增删。',
+    '覆盖上方基础参数。可改批数自动切档，也可手动增删、改持仓笔数。',
   batch_action:
     '分批加仓独立的监控方向：全部=多空都监控，多单=只监控多单，空单=只监控空单。' +
     '可与上方基础监控方向不同。',
   batch_count:
-    '分批批数。修改后会按「第 2 笔 ~ 总手数」自动均分生成对应档位区间，不可手动添加档位。',
+    '分批批数。改批数或总手数会按「第 2 笔 ~ 总手数」均分生成档位；' +
+    '添加 / 删除档位也会按同一总手数重切区间，批数与档位数保持一致。' +
+    '启用手动分散仓时，这里显示合计（分散仓 + 1），提交仍只保存分散仓批数。',
   total_lot_limit:
-    '分批总手数上限，同时作为档位末笔上限。' +
-    '系统会把第 2 笔到该上限均分到各档；达到上限后不再继续分批加仓。',
+    '分批总手数上限，同时作为自动切档的末笔。' +
+    '改此项会按批数重新均分档位；添加档位若超过可切份数会顺延该上限。' +
+    '启用手动分散仓时，这里显示合计（分散仓总手数 + 1），提交仍只保存分散仓总手数。',
   batch_level:
-    '持仓笔数区间由批数与总手数自动计算，只读。' +
-    '命中区间时按该档的间距判断是否加仓，手数 = 倍数 × 基础手数 + 额外手数。',
+    '本档命中的持仓笔数区间（含两端），可手改，相邻档会首尾衔接。' +
+    '添加 / 删除档位会按总手数重新均分各档区间。' +
+    '命中区间时按该档间距判断是否加仓，手数 = 倍数 × 基础手数 + 额外手数。',
+  manual_scatter:
+    '手动分散仓与分批加仓无关：价到入场后市价开仓，自带止盈/止损。' +
+    '视觉上接在最后一档之后（档位号 +1，持仓笔数为末档终点 +1），不参与分批判定。' +
+    '手数 0 表示触发时按当时持仓匹配「分档手数盈亏」反推；手改手数后按填写值开仓。' +
+    '顺势 / 逆势各只能配一条。保存后若任务已在跑，会立刻下发到节点。',
+  manual_entry: '到价后按此价判定方向并市价开仓。止盈高于入场为多，低于入场为空。',
+  manual_tp: '挂在新仓上的止盈价，须与入场价不同。',
+  manual_sl: '挂在新仓上的止损价；0 表示不设止损。',
+  manual_volume:
+    '0 = 节点触发时，用该魔术号当时已持有的手数去匹配分档手数盈亏，再按价差 × tick 反推。' +
+    '只计已经开出的仓（首单、分批加仓、另一条规则已成交的手动单），不含本条尚未开出的手动分散仓。' +
+    '手改后锁定，不再自动重算。',
   calc_type:
     '本档加仓间距怎么算：\n' +
     '点数 = 固定间距，偏离达到「点数 × Point()」触发；\n' +
@@ -250,6 +315,14 @@ const FIELD_HELP = {
   trailing_max:
     '最多允许平移多少格，0 表示不限。\n' +
     '不限时只要不触发止损，网格会一直跟着行情滚动。',
+  signal_pl:
+    '信号级盈亏控制：每个信号按自己的魔术号独立监控，触发后只平该信号仓位，' +
+    '不影响同节点其它信号。盈亏比分子是该信号浮盈亏，分母是账户余额。',
+  signal_float_pl:
+    '该信号浮盈亏 ÷ 账户余额 × 100%。负数为亏损侧达阈值，正数为盈利侧。' +
+    '触发后清仓该信号全部持仓。循环=同信号生命周期内可反复触发；指定次数耗尽后本任务不再触发。',
+  signal_lot_pl:
+    '按该信号持仓的总手数分档，命中后按所选方向平仓。负的盈亏金额表示亏损侧达阈值。优先匹配更高批次。',
 }
 
 /** 保本监控方式，与后端 BREAKEVEN_MODES 对齐 */
@@ -281,12 +354,27 @@ const GRID_ASSIST_TIMEFRAME: BatchTimeframe = 'H1'
  * 各组字段都会补齐，提交后由后端按 type 只保留对应的一组。
  */
 type EditableRule = Required<
-  Omit<StrategyRule, 'batch_levels' | 'grid_mode' | 'grid_side' | 'breakeven_mode'>
+  Omit<
+    StrategyRule,
+    'batch_levels' | 'grid_mode' | 'grid_side' | 'breakeven_mode' | 'float_pl_ratio' | 'lot_pl_tiers' | 'manual_scatter'
+  >
 > & {
   batch_levels: StrategyBatchLevel[]
   grid_mode: GridMode
   grid_side: GridSide
   breakeven_mode: 'once' | 'loop'
+  manual_scatter: ManualScatterConfig
+}
+
+function defaultManualScatter(): ManualScatterConfig {
+  return {
+    enabled: false,
+    entry_price: 0,
+    take_profit: 0,
+    stop_loss: 0,
+    volume: 0,
+    volume_locked: false,
+  }
 }
 
 function cloneRules(rules: StrategyRule[]): EditableRule[] {
@@ -303,6 +391,9 @@ function cloneRules(rules: StrategyRule[]): EditableRule[] {
     batch_count: r.batch_count ?? 0,
     total_lot_limit: r.total_lot_limit ?? 0,
     batch_levels: (r.batch_levels || []).map((lv) => ({ ...lv })),
+    manual_scatter: r.manual_scatter?.enabled
+      ? { ...defaultManualScatter(), ...r.manual_scatter, enabled: true }
+      : defaultManualScatter(),
     risk_amount: r.risk_amount ?? 100,
     rr_ratio: r.rr_ratio ?? 2.5,
     base_ratio: r.base_ratio ?? 30,
@@ -334,6 +425,101 @@ function cloneRules(rules: StrategyRule[]): EditableRule[] {
     assist_max_loss: r.assist_max_loss ?? 0,
   }))
 }
+
+type SignalPlForm = {
+  float_pl_ratio: SignalFloatPlRatio
+  lot_pl_tiers: SignalLotPlTiers
+}
+
+function defaultSignalPl(): SignalPlForm {
+  return {
+    float_pl_ratio: {
+      enabled: false,
+      ratio: -20,
+      action: 'close_all',
+      monitor_mode: 'loop',
+      max_times: 1,
+    },
+    lot_pl_tiers: {
+      enabled: false,
+      batch_count: 2,
+      close_action: 'all',
+      tiers: [
+        { min_lot: 0.1, pl_amount: 50 },
+        { min_lot: 0.5, pl_amount: 100 },
+      ],
+    },
+  }
+}
+
+function rebuildSignalLotTiers(
+  count: number,
+  prev: SignalLotPlTiers['tiers'],
+): SignalLotPlTiers['tiers'] {
+  const n = Math.max(1, Math.min(10, Math.floor(count) || 2))
+  const tiers = []
+  for (let i = 0; i < n; i++) {
+    const old = prev[i]
+    tiers.push({
+      min_lot: Number(old?.min_lot ?? 0.1 * (i + 1)),
+      pl_amount: Number(old?.pl_amount ?? 50 * (i + 1)),
+    })
+  }
+  return tiers
+}
+
+function cloneSignalPl(src?: Partial<SignalPlForm> | null): SignalPlForm {
+  const base = defaultSignalPl()
+  const pl = src?.float_pl_ratio
+  const lpt = src?.lot_pl_tiers
+  const mode = String(pl?.monitor_mode || 'loop') === 'times' ? 'times' : 'loop'
+  const closeAction = ['all', 'buy', 'sell'].includes(String(lpt?.close_action))
+    ? (lpt!.close_action as RiskSideAction)
+    : 'all'
+  const batchCount = Math.max(1, Math.min(10, Math.floor(Number(lpt?.batch_count) || 2)))
+  return {
+    float_pl_ratio: {
+      enabled: Boolean(pl?.enabled),
+      ratio: Number(pl?.ratio ?? base.float_pl_ratio.ratio),
+      action: 'close_all',
+      monitor_mode: mode as RiskMonitorMode,
+      max_times: Math.max(1, Math.floor(Number(pl?.max_times) || 1)),
+    },
+    lot_pl_tiers: {
+      enabled: Boolean(lpt?.enabled),
+      batch_count: batchCount,
+      close_action: closeAction,
+      tiers: rebuildSignalLotTiers(batchCount, lpt?.tiers || base.lot_pl_tiers.tiers),
+    },
+  }
+}
+
+function extractSignalPl(rules: Array<{ type: number; status?: number; float_pl_ratio?: SignalFloatPlRatio; lot_pl_tiers?: SignalLotPlTiers }>): SignalPlForm {
+  const addon = rules.filter((r) => r.type === RULE_TYPE_COUNTER || r.type === RULE_TYPE_TREND)
+  const picked = addon.find((r) => r.status === 1) || addon[0]
+  if (!picked) return defaultSignalPl()
+  return cloneSignalPl({
+    float_pl_ratio: picked.float_pl_ratio,
+    lot_pl_tiers: picked.lot_pl_tiers,
+  })
+}
+
+function applySignalPlToRules(rules: EditableRule[], cfg: SignalPlForm): StrategyRule[] {
+  return rules.map((r) => {
+    if (r.type !== RULE_TYPE_COUNTER && r.type !== RULE_TYPE_TREND) return r
+    return {
+      ...r,
+      float_pl_ratio: { ...cfg.float_pl_ratio },
+      lot_pl_tiers: {
+        ...cfg.lot_pl_tiers,
+        tiers: cfg.lot_pl_tiers.tiers.map((t) => ({ ...t })),
+      },
+    }
+  })
+}
+
+const signalPl = reactive<SignalPlForm>(defaultSignalPl())
+const isTpl1 = computed(() => form.template_id === TEMPLATE_1_ID)
 
 /** 分批档位从第 2 笔起算（第 1 笔为首单） */
 const BATCH_POS_START = 2
@@ -434,9 +620,124 @@ function onBatchMetaChange(r: EditableRule): void {
   rebuildBatchLevels(r)
 }
 
+function syncBatchMetaFromLevels(r: EditableRule): void {
+  r.batch_count = r.batch_levels.length
+  const last = r.batch_levels[r.batch_levels.length - 1]
+  if (!last) return
+  const to = Math.max(1, Math.floor(Number(last.pos_to) || 1))
+  r.total_lot_limit = to
+}
+
+function normalizeLevelRange(lv: StrategyBatchLevel): void {
+  const from = Math.max(1, Math.floor(Number(lv.pos_from) || 1))
+  lv.pos_from = from
+  lv.pos_to = Math.max(from, Math.floor(Number(lv.pos_to) || from))
+}
+
+function onLevelRangeChange(r: EditableRule, index: number): void {
+  const levels = r.batch_levels
+  if (!levels[index]) return
+  normalizeLevelRange(levels[index])
+  for (let i = index; i < levels.length - 1; i++) {
+    const nextFrom = levels[i].pos_to + 1
+    levels[i + 1].pos_from = nextFrom
+    if (levels[i + 1].pos_to < nextFrom) levels[i + 1].pos_to = nextFrom
+  }
+  for (let i = index; i > 0; i--) {
+    const prevTo = levels[i].pos_from - 1
+    if (prevTo < levels[i - 1].pos_from) {
+      levels[i].pos_from = levels[i - 1].pos_to + 1
+      if (levels[i].pos_to < levels[i].pos_from) levels[i].pos_to = levels[i].pos_from
+      break
+    }
+    levels[i - 1].pos_to = prevTo
+  }
+  syncBatchMetaFromLevels(r)
+}
+
+const BATCH_LEVEL_MAX = 50
+
+function addBatchLevel(r: EditableRule): void {
+  if (r.batch_levels.length >= BATCH_LEVEL_MAX) return
+  const nextCount = r.batch_levels.length + 1
+  const limit = Math.max(BATCH_POS_START, Math.floor(Number(r.total_lot_limit) || BATCH_POS_START))
+  const maxCount = limit - BATCH_POS_START + 1
+  if (nextCount > maxCount) {
+    r.total_lot_limit = BATCH_POS_START + nextCount - 1
+  }
+  r.batch_count = nextCount
+  rebuildBatchLevels(r)
+}
+
+function removeBatchLevel(r: EditableRule, index: number): void {
+  if (r.batch_levels.length <= 1) return
+  r.batch_levels.splice(index, 1)
+  r.batch_count = r.batch_levels.length
+  rebuildBatchLevels(r)
+}
+
+function enableManualScatter(r: EditableRule): void {
+  if (r.manual_scatter.enabled) return
+  r.manual_scatter = {
+    ...defaultManualScatter(),
+    enabled: true,
+  }
+}
+
+function clearManualScatter(r: EditableRule): void {
+  r.manual_scatter = defaultManualScatter()
+}
+
+function onManualVolumeInput(r: EditableRule): void {
+  r.manual_scatter.volume_locked = r.manual_scatter.volume > 0
+}
+
+function displayedBatchCount(r: EditableRule): number {
+  const n = Math.max(0, Math.floor(Number(r.batch_count) || 0))
+  return n + (r.manual_scatter.enabled ? 1 : 0)
+}
+
+function displayedTotalLot(r: EditableRule): number {
+  const n = Math.max(0, Math.floor(Number(r.total_lot_limit) || 0))
+  return n + (r.manual_scatter.enabled ? 1 : 0)
+}
+
+function onDisplayedBatchCountChange(r: EditableRule, ev: Event): void {
+  const minShown = r.manual_scatter.enabled ? 2 : 1
+  const raw = Number((ev.target as HTMLInputElement).value)
+  const shown = Math.max(minShown, Math.floor(raw) || minShown)
+  r.batch_count = r.manual_scatter.enabled ? shown - 1 : shown
+  onBatchMetaChange(r)
+}
+
+function onDisplayedTotalLotChange(r: EditableRule, ev: Event): void {
+  const minShown = r.manual_scatter.enabled ? BATCH_POS_START + 1 : BATCH_POS_START
+  const raw = Number((ev.target as HTMLInputElement).value)
+  const shown = Math.max(minShown, Math.floor(raw) || minShown)
+  r.total_lot_limit = r.manual_scatter.enabled ? shown - 1 : shown
+  onBatchMetaChange(r)
+}
+
+function manualScatterLevelNo(r: EditableRule): number {
+  return (r.batch_enabled ? r.batch_levels.length : 0) + 1
+}
+
+function manualScatterPos(r: EditableRule): number {
+  if (r.batch_enabled && r.batch_levels.length) {
+    let end = 0
+    for (const lv of r.batch_levels) {
+      end = Math.max(end, Math.floor(Number(lv.pos_to) || 0))
+    }
+    end = Math.max(end, Math.floor(Number(r.total_lot_limit) || 0))
+    return Math.max(1, end + 1)
+  }
+  return 1
+}
+
 function loadRulesFromTemplate(templateId: string): void {
   const tpl = templates.value.find((t) => t.template_id === templateId)
   form.rules = tpl ? cloneRules(tpl.rules) : []
+  Object.assign(signalPl, extractSignalPl(tpl?.rules || []))
   resetSizing()  // 换模版后规则整组换掉，之前的试算结果不再对应任何规则
 }
 
@@ -456,6 +757,7 @@ function populateEditForm(s: StrategyOut): void {
   form.name = s.name
   form.symbol = s.symbol
   form.rules = cloneRules(s.rules || [])
+  Object.assign(signalPl, extractSignalPl(s.rules || []))
 }
 
 async function loadEditForm(): Promise<void> {
@@ -480,6 +782,7 @@ async function loadEditForm(): Promise<void> {
 
 async function onOpen(): Promise<void> {
   resetSizing()
+  resetRuleCollapse()
   templates.value = await hub.fetchStrategyTemplates()
   if (props.mode === 'create') {
     resetCreateForm()
@@ -508,6 +811,18 @@ watch(
   (id) => {
     // 仅新建时切换模版会重载默认规则；编辑不允许改模版
     if (props.modelValue && !isEditMode.value && id) loadRulesFromTemplate(id)
+  },
+)
+
+watch(
+  () => signalPl.lot_pl_tiers.batch_count,
+  (n) => {
+    const next = Math.max(1, Math.min(10, Math.floor(Number(n) || 2)))
+    if (next !== n) {
+      signalPl.lot_pl_tiers.batch_count = next
+      return
+    }
+    signalPl.lot_pl_tiers.tiers = rebuildSignalLotTiers(next, signalPl.lot_pl_tiers.tiers)
   },
 )
 
@@ -846,24 +1161,32 @@ function validateRules(rules: EditableRule[]): string | null {
     if (r.lot_times < 0) return `${label}：倍数不能为负`
     if (r.extra_lot < 0) return `${label}：手数不能为负`
     if (r.max_allow_num < 0) return `${label}：次数不能为负`
+    const ms = r.manual_scatter
+    if (ms?.enabled) {
+      if (!(ms.entry_price > 0) || !(ms.take_profit > 0)) {
+        return `${label}：手动分散仓需要填写大于 0 的入场价与止盈价`
+      }
+      if (ms.entry_price === ms.take_profit) {
+        return `${label}：手动分散仓的入场价与止盈价不能相同`
+      }
+      if (ms.stop_loss < 0) return `${label}：手动分散仓止损价不能为负`
+      if (ms.volume < 0) return `${label}：手动分散仓手数不能为负`
+    }
     if (!r.batch_enabled) continue
     if (!['all', 'buy', 'sell'].includes(String(r.batch_action || '').toLowerCase())) {
       return `${label}：分批监控方向非法`
     }
-    if (r.batch_count < 1) return `${label}：分批批数至少为 1`
-    if (r.total_lot_limit < BATCH_POS_START) {
-      return `${label}：总手数上限需 ≥ ${BATCH_POS_START}（档位从第 ${BATCH_POS_START} 笔起）`
-    }
     if (!r.batch_levels.length) return `${label}：启用分批加仓后至少需要一个档位`
-    const last = r.batch_levels[r.batch_levels.length - 1]
+    for (const lv of r.batch_levels) normalizeLevelRange(lv)
+    syncBatchMetaFromLevels(r)
+    if (r.batch_count < 1) return `${label}：分批批数至少为 1`
     if (r.batch_levels.length !== r.batch_count) {
-      return `${label}：档位数与批数不一致，请调整总手数或批数后重试`
-    }
-    if (last.pos_to !== Math.floor(r.total_lot_limit)) {
-      return `${label}：档位末笔需等于总手数上限`
+      return `${label}：档位数与批数不一致`
     }
     for (const [i, lv] of r.batch_levels.entries()) {
       const at = `${label} 档位 ${i + 1}`
+      if (lv.pos_from < 1) return `${at}：持仓笔数起点至少为 1`
+      if (lv.pos_to < lv.pos_from) return `${at}：持仓笔数终点不能小于起点`
       if (!CALC_TYPE_OPTIONS.some((o) => o.value === lv.calc_type)) {
         return `${at}：计算方式非法`
       }
@@ -878,6 +1201,48 @@ function validateRules(rules: EditableRule[]): string | null {
     }
   }
   return null
+}
+
+function validateSignalPl(cfg: SignalPlForm): string | null {
+  const r = cfg.float_pl_ratio
+  if (!Number.isFinite(r.ratio) || r.ratio === 0) return '信号盈亏比比例不能为 0'
+  if (r.monitor_mode === 'times' && !(r.max_times >= 1)) return '信号盈亏比指定次数至少为 1'
+  const lpt = cfg.lot_pl_tiers
+  if (!['all', 'buy', 'sell'].includes(lpt.close_action)) return '信号分档平仓动作无效'
+  if (!lpt.tiers.length) return '信号分档平仓至少需要 1 个批次'
+  for (const [i, tier] of lpt.tiers.entries()) {
+    const at = `信号分档批次#${i + 1}`
+    if (!Number.isFinite(tier.min_lot) || tier.min_lot < 0) return `${at}手数不能为负`
+    if (!Number.isFinite(tier.pl_amount) || tier.pl_amount === 0) return `${at}盈亏金额不能为 0`
+  }
+  return null
+}
+
+function formatSaveError(e: unknown, fallback: string): string {
+  const err = e as {
+    code?: string
+    message?: string
+    response?: { data?: { detail?: unknown } }
+  }
+  if (!err.response) {
+    if (err.code === 'ECONNABORTED' || /timeout/i.test(err.message || '')) {
+      return '请求超时，请刷新列表确认是否已保存成功'
+    }
+    return fallback
+  }
+  const detail = err.response.data?.detail
+  if (typeof detail === 'string' && detail.trim()) return detail
+  if (Array.isArray(detail)) {
+    const parts = detail.map((item) => {
+      if (typeof item === 'string') return item
+      if (item && typeof item === 'object' && 'msg' in item) {
+        return String((item as { msg: unknown }).msg || '')
+      }
+      return ''
+    }).filter(Boolean)
+    if (parts.length) return parts.join('；')
+  }
+  return fallback
 }
 
 async function save(): Promise<void> {
@@ -895,13 +1260,17 @@ async function save(): Promise<void> {
     formError.value = '请填写绑定品种'
     return
   }
-  const rulesErr = validateRules(form.rules.map((r) => {
-    if (!isRiskSized(r) && !isGrid(r) && r.batch_enabled) rebuildBatchLevels(r)
-    return r
-  }))
+  const rulesErr = validateRules(form.rules)
   if (rulesErr) {
     formError.value = rulesErr
     return
+  }
+  if (isTpl1.value) {
+    const plErr = validateSignalPl(signalPl)
+    if (plErr) {
+      formError.value = plErr
+      return
+    }
   }
   saving.value = true
   formError.value = ''
@@ -917,7 +1286,9 @@ async function save(): Promise<void> {
       return
     }
     try {
-      const rules = cloneRules(form.rules)
+      const rules = isTpl1.value
+        ? applySignalPlToRules(cloneRules(form.rules), signalPl)
+        : cloneRules(form.rules)
       if (isEditMode.value) {
         await hub.updateStrategy(
           props.strategyId || '',
@@ -936,8 +1307,7 @@ async function save(): Promise<void> {
         )
       }
     } catch (e: unknown) {
-      const err = e as { response?: { data?: { detail?: string } } }
-      formError.value = err?.response?.data?.detail || `${actionLabel}失败，请稍后重试`
+      formError.value = formatSaveError(e, `${actionLabel}失败，请稍后重试`)
       await ElMessageBox.alert(formError.value, '无法保存', {
         type: 'warning',
         confirmButtonText: '知道了',
@@ -1019,6 +1389,67 @@ function resetRuleToTemplate(idx: number): void {
           </div>
         </div>
 
+        <div v-if="isTpl1" class="signal-pl-editor">
+          <div class="rules-editor-head">
+            <FormLabel text="信号盈亏控制" :help="FIELD_HELP.signal_pl" />
+            <span class="muted" style="font-size: 12px">每个信号独立监控，触发只平该信号仓</span>
+          </div>
+          <div class="signal-pl-rules">
+            <div class="signal-pl-row">
+              <label class="signal-pl-switch">
+                <input v-model="signalPl.float_pl_ratio.enabled" type="checkbox" />
+                <span>信号盈亏比</span>
+              </label>
+              <input v-model.number="signalPl.float_pl_ratio.ratio" type="number" step="0.1" class="signal-pl-num" />
+              <span class="muted" style="font-size: 13px">% ，清仓该信号全部</span>
+              <select v-model="signalPl.float_pl_ratio.monitor_mode" class="signal-pl-select">
+                <option value="loop">循环</option>
+                <option value="times">指定次数</option>
+              </select>
+              <template v-if="signalPl.float_pl_ratio.monitor_mode === 'times'">
+                <input v-model.number="signalPl.float_pl_ratio.max_times" type="number" min="1" class="signal-pl-times" />
+                <span class="muted" style="font-size: 12px">次</span>
+              </template>
+            </div>
+            <div class="signal-pl-block">
+              <div class="signal-pl-row signal-pl-row-wrap">
+                <label class="signal-pl-switch">
+                  <input v-model="signalPl.lot_pl_tiers.enabled" type="checkbox" />
+                  <span>分档手数盈亏</span>
+                </label>
+                <span class="muted" style="font-size: 12px">批次</span>
+                <input
+                  v-model.number="signalPl.lot_pl_tiers.batch_count"
+                  type="number"
+                  min="1"
+                  max="10"
+                  class="signal-pl-times"
+                />
+                <select v-model="signalPl.lot_pl_tiers.close_action" class="signal-pl-select">
+                  <option value="all">全部</option>
+                  <option value="buy">多单</option>
+                  <option value="sell">空单</option>
+                </select>
+              </div>
+              <div
+                v-for="(tier, idx) in signalPl.lot_pl_tiers.tiers"
+                :key="idx"
+                class="signal-pl-row"
+                style="margin-top: 8px"
+              >
+                <span class="muted" style="font-size: 12px; min-width: 52px">批次{{ idx + 1 }}</span>
+                <span class="muted" style="font-size: 12px">总 lot &gt;=</span>
+                <input v-model.number="tier.min_lot" type="number" min="0" step="0.01" class="signal-pl-num" />
+                <span class="muted" style="font-size: 12px">盈亏金额 &gt;=</span>
+                <input v-model.number="tier.pl_amount" type="number" step="1" class="signal-pl-num" />
+              </div>
+              <p class="muted" style="font-size: 12px; margin: 8px 0 0">
+                按所选方向统计该信号总手数与浮盈亏；负的盈亏金额表示亏损侧达阈值。优先匹配更高批次。
+              </p>
+            </div>
+          </div>
+        </div>
+
         <div v-if="form.rules.length" class="rules-editor">
           <div class="rules-editor-head">
             <FormLabel text="规则参数" :help="FIELD_HELP.rules" />
@@ -1027,14 +1458,28 @@ function resetRuleToTemplate(idx: number): void {
             </span>
           </div>
 
-          <div v-for="(r, idx) in form.rules" :key="`${r.type}-${idx}`" class="rule-panel">
-            <div class="rule-panel-head">
-              <FormLabel
-                class="rule-title-label"
-                :text="RULE_TYPE_LABEL[r.type] || `规则 ${idx + 1}`"
-                :help="RULE_TYPE_HELP[r.type] || FIELD_HELP.rules"
-              />
-              <div class="rule-panel-actions">
+          <div
+            v-for="{ rule: r, index: idx } in displayedRules"
+            :key="`${r.type}-${idx}`"
+            class="rule-panel"
+            :class="{ 'is-collapsed': isRuleCollapsed(r.type) }"
+          >
+            <div
+              class="rule-panel-head"
+              :class="{ 'is-foldable': isRuleFoldable(r.type) }"
+              @click="toggleRuleCollapsed(r.type)"
+            >
+              <div class="rule-title-wrap">
+                <span v-if="isRuleFoldable(r.type)" class="rule-fold-caret" aria-hidden="true">
+                  {{ isRuleCollapsed(r.type) ? '▸' : '▾' }}
+                </span>
+                <FormLabel
+                  class="rule-title-label"
+                  :text="RULE_TYPE_LABEL[r.type] || `规则 ${idx + 1}`"
+                  :help="RULE_TYPE_HELP[r.type] || FIELD_HELP.rules"
+                />
+              </div>
+              <div class="rule-panel-actions" @click.stop>
                 <div class="rule-enable-wrap">
                   <FormLabel text="启用" :help="FIELD_HELP.status" />
                   <input
@@ -1048,6 +1493,7 @@ function resetRuleToTemplate(idx: number): void {
               </div>
             </div>
 
+            <div v-show="!isRuleCollapsed(r.type)" class="rule-panel-body">
             <!-- 以损定量趋势单（模版2）：手数由风险金额反推，没有加仓倍数与档位 -->
             <template v-if="isRiskSized(r)">
               <div class="rule-grid">
@@ -1529,36 +1975,6 @@ function resetRuleToTemplate(idx: number): void {
             </template>
 
             <template v-else>
-              <div class="rule-grid">
-                <div class="field">
-                  <FormLabel :field-id="`rule-${idx}-action`" text="监控方向" :help="FIELD_HELP.action" />
-                  <select :id="`rule-${idx}-action`" v-model="r.action">
-                    <option value="all">全部</option>
-                    <option value="buy">多单</option>
-                    <option value="sell">空单</option>
-                  </select>
-                </div>
-                <div class="field">
-                  <FormLabel :field-id="`rule-${idx}-point`" text="点数" :help="FIELD_HELP.point" />
-                  <input :id="`rule-${idx}-point`" v-model.number="r.point" type="number" min="0" step="1" />
-                </div>
-                <div class="field">
-                  <FormLabel :field-id="`rule-${idx}-lot-times`" text="倍数" :help="FIELD_HELP.lot_times" />
-                  <input :id="`rule-${idx}-lot-times`" v-model.number="r.lot_times" type="number" min="0" step="0.01" />
-                </div>
-                <div class="field">
-                  <FormLabel :field-id="`rule-${idx}-extra-lot`" text="手数" :help="FIELD_HELP.extra_lot" />
-                  <input :id="`rule-${idx}-extra-lot`" v-model.number="r.extra_lot" type="number" min="0" step="0.01" />
-                </div>
-                <div class="field">
-                  <FormLabel :field-id="`rule-${idx}-max-allow`" text="次数" :help="FIELD_HELP.max_allow_num" />
-                  <input :id="`rule-${idx}-max-allow`" v-model.number="r.max_allow_num" type="number" min="0" step="1" />
-                </div>
-              </div>
-              <p class="rule-hint">
-                手数 = {{ r.lot_times }} × 基础手数 + {{ r.extra_lot }}；触发 = {{ r.point }} × Point()
-              </p>
-
               <div class="batch-block">
                 <div class="batch-head">
                   <div class="rule-enable-wrap">
@@ -1570,9 +1986,23 @@ function resetRuleToTemplate(idx: number): void {
                       @change="setBatchEnabled(r, ($event.target as HTMLInputElement).checked)"
                     />
                   </div>
-                  <span v-if="r.batch_enabled" class="muted batch-count-hint">
-                    共 {{ r.batch_count }} 批
-                  </span>
+                  <div class="batch-head-actions">
+                    <span v-if="r.batch_enabled" class="muted batch-count-hint">
+                      共 {{ displayedBatchCount(r) }} 批
+                      <template v-if="r.manual_scatter.enabled">
+                        （分散仓 {{ r.batch_count }} · 手动分散仓 1）
+                      </template>
+                    </span>
+                    <button
+                      v-if="!r.batch_enabled"
+                      type="button"
+                      class="btn-sm btn-ghost"
+                      :disabled="r.manual_scatter.enabled"
+                      @click="enableManualScatter(r)"
+                    >
+                      手动单
+                    </button>
+                  </div>
                 </div>
 
                 <template v-if="r.batch_enabled">
@@ -1592,17 +2022,20 @@ function resetRuleToTemplate(idx: number): void {
                     <div class="field">
                       <FormLabel
                         :field-id="`rule-${idx}-batch-count`"
-                        text="批数"
+                        :text="r.manual_scatter.enabled ? '总批数' : '批数'"
                         :help="FIELD_HELP.batch_count"
                       />
                       <input
                         :id="`rule-${idx}-batch-count`"
-                        v-model.number="r.batch_count"
+                        :value="displayedBatchCount(r)"
                         type="number"
-                        min="1"
+                        :min="r.manual_scatter.enabled ? 2 : 1"
                         step="1"
-                        @change="onBatchMetaChange(r)"
+                        @change="onDisplayedBatchCountChange(r, $event)"
                       />
+                      <p v-if="r.manual_scatter.enabled" class="muted batch-split-hint">
+                        分散仓 {{ r.batch_count }} · 手动分散仓 1
+                      </p>
                     </div>
                     <div class="field">
                       <FormLabel
@@ -1612,12 +2045,15 @@ function resetRuleToTemplate(idx: number): void {
                       />
                       <input
                         :id="`rule-${idx}-total-lot`"
-                        v-model.number="r.total_lot_limit"
+                        :value="displayedTotalLot(r)"
                         type="number"
-                        :min="BATCH_POS_START"
+                        :min="r.manual_scatter.enabled ? BATCH_POS_START + 1 : BATCH_POS_START"
                         step="1"
-                        @change="onBatchMetaChange(r)"
+                        @change="onDisplayedTotalLotChange(r, $event)"
                       />
+                      <p v-if="r.manual_scatter.enabled" class="muted batch-split-hint">
+                        分散仓总手数 {{ Math.floor(r.total_lot_limit) }} · 手动分散仓总手数 1
+                      </p>
                     </div>
                   </div>
 
@@ -1625,9 +2061,31 @@ function resetRuleToTemplate(idx: number): void {
                     <div v-for="(lv, li) in r.batch_levels" :key="li" class="batch-level">
                       <span class="batch-level-no">└{{ li + 1 }}</span>
                       <div class="field batch-range">
-                        <FormLabel text="持仓笔数" :help="FIELD_HELP.batch_level" />
-                        <div class="batch-range-value" title="由批数与总手数自动生成">
-                          {{ lv.pos_from }} ~ {{ lv.pos_to }}
+                        <FormLabel
+                          :field-id="`rule-${idx}-lv-${li}-from`"
+                          text="持仓笔数"
+                          :help="FIELD_HELP.batch_level"
+                        />
+                        <div class="batch-range-inputs">
+                          <input
+                            :id="`rule-${idx}-lv-${li}-from`"
+                            v-model.number="lv.pos_from"
+                            type="number"
+                            min="1"
+                            step="1"
+                            aria-label="持仓笔数起点"
+                            @change="onLevelRangeChange(r, li)"
+                          />
+                          <span class="muted">~</span>
+                          <input
+                            :id="`rule-${idx}-lv-${li}-to`"
+                            v-model.number="lv.pos_to"
+                            type="number"
+                            min="1"
+                            step="1"
+                            aria-label="持仓笔数终点"
+                            @change="onLevelRangeChange(r, li)"
+                          />
                         </div>
                       </div>
                       <div class="field">
@@ -1710,15 +2168,257 @@ function resetRuleToTemplate(idx: number): void {
                           step="0.01"
                         />
                       </div>
+                      <div class="batch-level-actions">
+                        <button
+                          type="button"
+                          class="btn-sm btn-ghost"
+                          :disabled="r.batch_levels.length <= 1"
+                          @click="removeBatchLevel(r, li)"
+                        >
+                          删除
+                        </button>
+                      </div>
+                    </div>
+                    <div v-if="r.manual_scatter.enabled" class="batch-level is-manual">
+                      <span class="batch-level-no">└{{ manualScatterLevelNo(r) }}</span>
+                      <div class="field batch-range">
+                        <FormLabel
+                          :field-id="`rule-${idx}-ms-pos`"
+                          text="持仓笔数"
+                          :help="FIELD_HELP.manual_scatter"
+                        />
+                        <div class="batch-range-inputs">
+                          <input
+                            :id="`rule-${idx}-ms-pos`"
+                            type="number"
+                            :value="manualScatterPos(r)"
+                            disabled
+                            aria-label="手动分散仓持仓笔数（仅展示）"
+                          />
+                          <span class="muted">~</span>
+                          <input
+                            type="number"
+                            :value="manualScatterPos(r)"
+                            disabled
+                            aria-label="手动分散仓持仓笔数终点（仅展示）"
+                          />
+                        </div>
+                      </div>
+                      <div class="field">
+                        <FormLabel
+                          :field-id="`rule-${idx}-ms-entry`"
+                          text="入场价"
+                          :help="FIELD_HELP.manual_entry"
+                        />
+                        <input
+                          :id="`rule-${idx}-ms-entry`"
+                          v-model.number="r.manual_scatter.entry_price"
+                          type="number"
+                          min="0"
+                          step="any"
+                        />
+                      </div>
+                      <div class="field">
+                        <FormLabel
+                          :field-id="`rule-${idx}-ms-tp`"
+                          text="止盈价"
+                          :help="FIELD_HELP.manual_tp"
+                        />
+                        <input
+                          :id="`rule-${idx}-ms-tp`"
+                          v-model.number="r.manual_scatter.take_profit"
+                          type="number"
+                          min="0"
+                          step="any"
+                        />
+                      </div>
+                      <div class="field">
+                        <FormLabel
+                          :field-id="`rule-${idx}-ms-sl`"
+                          text="止损价"
+                          :help="FIELD_HELP.manual_sl"
+                        />
+                        <input
+                          :id="`rule-${idx}-ms-sl`"
+                          v-model.number="r.manual_scatter.stop_loss"
+                          type="number"
+                          min="0"
+                          step="any"
+                        />
+                      </div>
+                      <div class="field">
+                        <FormLabel
+                          :field-id="`rule-${idx}-ms-vol`"
+                          text="手数"
+                          :help="FIELD_HELP.manual_volume"
+                        />
+                        <input
+                          :id="`rule-${idx}-ms-vol`"
+                          v-model.number="r.manual_scatter.volume"
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          placeholder="0=自动"
+                          @change="onManualVolumeInput(r)"
+                        />
+                      </div>
+                      <div class="batch-level-actions">
+                        <button type="button" class="btn-sm btn-ghost" @click="clearManualScatter(r)">
+                          删除
+                        </button>
+                      </div>
                     </div>
                   </div>
+                  <div class="batch-level-add">
+                    <button
+                      type="button"
+                      class="btn-sm btn-ghost"
+                      :disabled="r.batch_levels.length >= BATCH_LEVEL_MAX"
+                      @click="addBatchLevel(r)"
+                    >
+                      + 添加档位
+                    </button>
+                    <button
+                      type="button"
+                      class="btn-sm btn-ghost"
+                      :disabled="r.manual_scatter.enabled"
+                      @click="enableManualScatter(r)"
+                    >
+                      手动单
+                    </button>
+                  </div>
                   <p class="rule-hint">
-                    档位区间由批数 × 总手数自动切分（第 {{ BATCH_POS_START }} 笔 ~ 第 {{ Math.floor(r.total_lot_limit) }} 笔），不可手动添加；
-                    每档的加仓间距可独立选择点数 / 指定价 / ATR / 波幅，ATR 与波幅取该周期最近 {{ BATCH_BAR_PERIOD }} 根已收盘 K 线
+                    改批数、总手数或添加 / 删除档位，都会按第 {{ BATCH_POS_START }} 笔 ~ 第 {{ Math.floor(r.total_lot_limit) }} 笔重切区间；
+                    手改某一档持仓笔数时，相邻档会首尾衔接。
+                    每档间距可独立选点数 / 指定价 / ATR / 波幅，ATR 与波幅取该周期最近 {{ BATCH_BAR_PERIOD }} 根已收盘 K 线
+                    <template v-if="r.manual_scatter.enabled">
+                      ；手动分散仓展示为第 {{ manualScatterPos(r) }} 笔，不参与切档
+                    </template>
                   </p>
                 </template>
+                <div v-else-if="r.manual_scatter.enabled" class="batch-levels">
+                  <div class="batch-level is-manual">
+                    <span class="batch-level-no">└{{ manualScatterLevelNo(r) }}</span>
+                    <div class="field batch-range">
+                      <FormLabel
+                        :field-id="`rule-${idx}-ms-pos`"
+                        text="持仓笔数"
+                        :help="FIELD_HELP.manual_scatter"
+                      />
+                      <div class="batch-range-inputs">
+                        <input
+                          :id="`rule-${idx}-ms-pos`"
+                          type="number"
+                          :value="manualScatterPos(r)"
+                          disabled
+                          aria-label="手动分散仓持仓笔数（仅展示）"
+                        />
+                        <span class="muted">~</span>
+                        <input
+                          type="number"
+                          :value="manualScatterPos(r)"
+                          disabled
+                          aria-label="手动分散仓持仓笔数终点（仅展示）"
+                        />
+                      </div>
+                    </div>
+                    <div class="field">
+                      <FormLabel
+                        :field-id="`rule-${idx}-ms-entry`"
+                        text="入场价"
+                        :help="FIELD_HELP.manual_entry"
+                      />
+                      <input
+                        :id="`rule-${idx}-ms-entry`"
+                        v-model.number="r.manual_scatter.entry_price"
+                        type="number"
+                        min="0"
+                        step="any"
+                      />
+                    </div>
+                    <div class="field">
+                      <FormLabel
+                        :field-id="`rule-${idx}-ms-tp`"
+                        text="止盈价"
+                        :help="FIELD_HELP.manual_tp"
+                      />
+                      <input
+                        :id="`rule-${idx}-ms-tp`"
+                        v-model.number="r.manual_scatter.take_profit"
+                        type="number"
+                        min="0"
+                        step="any"
+                      />
+                    </div>
+                    <div class="field">
+                      <FormLabel
+                        :field-id="`rule-${idx}-ms-sl`"
+                        text="止损价"
+                        :help="FIELD_HELP.manual_sl"
+                      />
+                      <input
+                        :id="`rule-${idx}-ms-sl`"
+                        v-model.number="r.manual_scatter.stop_loss"
+                        type="number"
+                        min="0"
+                        step="any"
+                      />
+                    </div>
+                    <div class="field">
+                      <FormLabel
+                        :field-id="`rule-${idx}-ms-vol`"
+                        text="手数"
+                        :help="FIELD_HELP.manual_volume"
+                      />
+                      <input
+                        :id="`rule-${idx}-ms-vol`"
+                        v-model.number="r.manual_scatter.volume"
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        placeholder="0=自动"
+                        @change="onManualVolumeInput(r)"
+                      />
+                    </div>
+                    <div class="batch-level-actions">
+                      <button type="button" class="btn-sm btn-ghost" @click="clearManualScatter(r)">
+                        删除
+                      </button>
+                    </div>
+                  </div>
+                </div>
               </div>
+              <div class="rule-grid">
+                <div class="field">
+                  <FormLabel :field-id="`rule-${idx}-action`" text="监控方向" :help="FIELD_HELP.action" />
+                  <select :id="`rule-${idx}-action`" v-model="r.action">
+                    <option value="all">全部</option>
+                    <option value="buy">多单</option>
+                    <option value="sell">空单</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <FormLabel :field-id="`rule-${idx}-point`" text="点数" :help="FIELD_HELP.point" />
+                  <input :id="`rule-${idx}-point`" v-model.number="r.point" type="number" min="0" step="1" />
+                </div>
+                <div class="field">
+                  <FormLabel :field-id="`rule-${idx}-lot-times`" text="倍数" :help="FIELD_HELP.lot_times" />
+                  <input :id="`rule-${idx}-lot-times`" v-model.number="r.lot_times" type="number" min="0" step="0.01" />
+                </div>
+                <div class="field">
+                  <FormLabel :field-id="`rule-${idx}-extra-lot`" text="手数" :help="FIELD_HELP.extra_lot" />
+                  <input :id="`rule-${idx}-extra-lot`" v-model.number="r.extra_lot" type="number" min="0" step="0.01" />
+                </div>
+                <div class="field">
+                  <FormLabel :field-id="`rule-${idx}-max-allow`" text="次数" :help="FIELD_HELP.max_allow_num" />
+                  <input :id="`rule-${idx}-max-allow`" v-model.number="r.max_allow_num" type="number" min="0" step="1" />
+                </div>
+              </div>
+              <p class="rule-hint">
+                手数 = {{ r.lot_times }} × 基础手数 + {{ r.extra_lot }}；触发 = {{ r.point }} × Point()
+              </p>
             </template>
+            </div>
           </div>
         </div>
 
@@ -1765,6 +2465,33 @@ function resetRuleToTemplate(idx: number): void {
   justify-content: space-between;
   gap: 12px;
   margin-bottom: 12px;
+}
+
+.rule-panel.is-collapsed .rule-panel-head {
+  margin-bottom: 0;
+}
+
+.rule-panel-head.is-foldable {
+  cursor: pointer;
+}
+
+.rule-title-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.rule-fold-caret {
+  flex-shrink: 0;
+  width: 14px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1;
+}
+
+.rule-title-wrap :deep(.form-label-wrap) {
+  margin-bottom: 0;
 }
 
 .rule-title-label :deep(.form-label-row) {
@@ -1850,6 +2577,18 @@ function resetRuleToTemplate(idx: number): void {
   border-top: 1px dashed var(--glass-border);
 }
 
+.rule-panel-body > .batch-block:first-child {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
+}
+
+.batch-block + .rule-grid {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--glass-border);
+}
+
 .batch-head {
   display: flex;
   align-items: center;
@@ -1857,8 +2596,20 @@ function resetRuleToTemplate(idx: number): void {
   gap: 12px;
 }
 
+.batch-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .batch-count-hint {
   font-size: 12px;
+}
+
+.batch-split-hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.4;
 }
 
 .batch-top-grid {
@@ -1879,7 +2630,7 @@ function resetRuleToTemplate(idx: number): void {
 
 .batch-level {
   display: grid;
-  grid-template-columns: 28px minmax(88px, 0.9fr) repeat(4, minmax(0, 1fr));
+  grid-template-columns: 28px minmax(132px, 1.1fr) repeat(4, minmax(0, 1fr)) auto;
   gap: 10px;
   align-items: end;
 }
@@ -1891,18 +2642,29 @@ function resetRuleToTemplate(idx: number): void {
   padding-bottom: 8px;
 }
 
-.batch-range-value {
+.batch-range-inputs {
   display: flex;
   align-items: center;
-  min-height: 34px;
-  padding: 0 10px;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--glass-border);
-  background: color-mix(in srgb, var(--bg-soft) 70%, transparent);
+  gap: 6px;
+  min-width: 0;
+}
+
+.batch-range-inputs input {
+  flex: 1;
+  min-width: 0;
   font-family: var(--mono);
-  font-size: 13px;
-  color: var(--muted);
-  user-select: none;
+}
+
+.batch-level-actions {
+  display: flex;
+  align-items: center;
+  padding-bottom: 1px;
+}
+
+.batch-level-add {
+  display: flex;
+  justify-content: flex-start;
+  gap: 8px;
 }
 
 .batch-top-grid .field,
@@ -1956,6 +2718,11 @@ function resetRuleToTemplate(idx: number): void {
     grid-column: 1 / -1;
     padding-bottom: 0;
   }
+  .batch-level-actions {
+    grid-column: 1 / -1;
+    padding-bottom: 0;
+    justify-content: flex-end;
+  }
 }
 
 @media (max-width: 768px) {
@@ -1978,5 +2745,59 @@ function resetRuleToTemplate(idx: number): void {
   .batch-level {
     grid-template-columns: 1fr 1fr;
   }
+}
+
+.signal-pl-editor {
+  margin-top: 18px;
+}
+
+.signal-pl-rules {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.signal-pl-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-soft);
+  border: 1px solid var(--glass-border);
+}
+
+.signal-pl-row-wrap {
+  padding: 0;
+  border: none;
+  background: transparent;
+}
+
+.signal-pl-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+}
+
+.signal-pl-num,
+.signal-pl-times {
+  width: 88px;
+}
+
+.signal-pl-select {
+  width: auto;
+  min-width: 110px;
+}
+
+.signal-pl-block {
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-soft);
+  border: 1px solid var(--glass-border);
 }
 </style>

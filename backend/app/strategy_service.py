@@ -22,7 +22,9 @@ def strategy_row_to_dict(row: TradingStrategy) -> dict:
         "strategy_id": row.strategy_id,
         "name": row.name,
         "template_id": row.template_id,
-        "template_name": row.template_name,
+        "template_name": templates.live_template_name(
+            row.template_id, row.template_name
+        ),
         "symbol": row.symbol,
         "enabled": row.enabled,
         "rules": templates.normalize_rules(row.config_json or []),

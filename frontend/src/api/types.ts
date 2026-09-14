@@ -67,6 +67,19 @@ export interface LotPlTiersRule {
   tiers: LotPlTier[]
 }
 
+/** 模版1 信号级浮盈亏比（配置不含运行时 remaining_times） */
+export interface SignalFloatPlRatio {
+  enabled: boolean
+  /** 触发比例（%），负数为浮亏侧，正数为浮盈侧。分子=该信号浮盈亏，分母=账户余额 */
+  ratio: number
+  action: 'close_all'
+  monitor_mode: RiskMonitorMode
+  max_times: number
+}
+
+/** 模版1 信号级分档手数盈亏 */
+export type SignalLotPlTiers = LotPlTiersRule
+
 /** 节点账户级风控配置 */
 export interface NodeRiskConfig {
   float_pl_ratio: FloatPlRatioRule
@@ -355,7 +368,7 @@ export interface GroupOut {
   trend_risk_enabled: boolean
   /** 限价挂单监听：把节点 MT5 上手动挂的带关键字限价单转成 strategy 信号（默认关） */
   limit_watch_enabled: boolean
-  /** 订单注释包含该关键字即视为触发单；默认 limit */
+  /** 订单注释包含该关键字即视为触发单；空字符串表示不限注释；未填时新建默认 limit */
   limit_watch_keyword: string
   /** 一对一绑定的策略 ID；未绑定为 null */
   strategy_id?: string | null
@@ -371,6 +384,42 @@ export interface GroupOut {
   signal_count: number
   /** 进行中主任务数（pending/dispatching/running） */
   active_task_count: number
+  /** 已开限价监听时附带的最近日志（新→旧）；未开启为空 */
+  limit_watch_logs?: LimitWatchLogOut[]
+}
+
+export type LimitWatchLogEvent =
+  | 'rejected'
+  | 'cancel_failed'
+  | 'ok'
+  | 'dispatch_rejected'
+  | 'duplicate'
+
+/** 分组限价监听日志（落库 + 后台 WS 实时推送） */
+export interface LimitWatchLogOut {
+  id: number
+  ts: number | null
+  group_id: string
+  group_name?: string | null
+  node_id: string
+  ticket: number
+  symbol?: string | null
+  action?: string | null
+  volume?: number | null
+  price?: number | null
+  sl?: number | null
+  tp?: number | null
+  comment?: string | null
+  event: LimitWatchLogEvent | string
+  message: string
+  detail?: Record<string, unknown> | null
+}
+
+export interface PaginatedLimitWatchLogs {
+  items: LimitWatchLogOut[]
+  total: number
+  page: number
+  page_size: number
 }
 
 /** 分组一键平仓结果：终止该分组未收口子任务并按魔术号平仓 */
@@ -437,6 +486,16 @@ export interface StrategyBatchLevel {
   extra_lot: number
 }
 
+/** 模版1 手动分散仓：看起来像分批最后一档，运行时与分批加仓隔离 */
+export interface ManualScatterConfig {
+  enabled: boolean
+  entry_price: number
+  take_profit: number
+  stop_loss: number
+  volume: number
+  volume_locked: boolean
+}
+
 /** 以损定量的补仓方向（历史字段，模版2 已改为分散仓市价） */
 export type EntryDirection = 'pullback' | 'breakout'
 
@@ -478,6 +537,12 @@ export interface StrategyRule {
   /** 总手数上限，0=不限制 */
   total_lot_limit?: number
   batch_levels?: StrategyBatchLevel[]
+  /** 信号级盈亏比（模版1 顺势/逆势写入相同值） */
+  float_pl_ratio?: SignalFloatPlRatio
+  /** 信号级分档手数盈亏（模版1 顺势/逆势写入相同值） */
+  lot_pl_tiers?: SignalLotPlTiers
+  /** 手动分散仓（模版1 顺势/逆势各至多一条；不进 batch_levels） */
+  manual_scatter?: ManualScatterConfig
   // --- type=3：以损定量趋势单 ---
   /** 风险金额（账户货币） */
   risk_amount?: number
@@ -689,7 +754,7 @@ export interface GroupTaskEventRecord {
   magic: number | null
   created_at: number | null
   /**
-   * open / add_counter / add_trend / grid_add / grid_shift /
+   * open / add_counter / add_trend / add_manual / grid_add / grid_shift /
    * close_partial / close_all / error / resume
    */
   event_type: string
@@ -724,6 +789,7 @@ export interface GroupTaskEventDetail {
     | 'grid_shift'
     | 'account_risk'
     | 'close_reason'
+    | 'manual_scatter'
   // —— 加仓（kind=add）——
   rule_type?: number
   rule_type_label?: string
@@ -755,6 +821,12 @@ export interface GroupTaskEventDetail {
   action?: string
   stop_loss?: number | null
   take_profit?: number | null
+  /** 手动分散仓（kind=manual_scatter） */
+  target_pl?: number | null
+  profit_per_lot?: number
+  volume_locked?: boolean
+  volume_step?: number
+  comment?: string
   signal_comment?: string | null
   strategy_id?: string
   strategy_name?: string

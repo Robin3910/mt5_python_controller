@@ -62,7 +62,13 @@ def template_reject_reason(
     template_id = str(strategy.get("template_id") or "").strip().lower()
     if template_id in template_ids:
         return None
-    label = strategy.get("template_name") or template_id or "未知模版"
+    label = (
+        strategy_templates.live_template_name(
+            template_id, strategy.get("template_name")
+        )
+        or template_id
+        or "未知模版"
+    )
     return f"策略模版 {label} 不在信号指定的 template_ids（{'、'.join(template_ids)}）内"
 
 
@@ -357,7 +363,11 @@ def aggregate_task_status(dispatch_statuses: list[str]) -> str:
 
 
 def strategy_rules_snapshot(strategy: Optional[dict]) -> Optional[dict]:
-    """把绑定策略压成随任务下发的快照，运行期不再受策略后续编辑影响。"""
+    """把绑定策略压成随任务下发的快照。
+
+    默认随任务冻结；策略保存时会对进行中子任务重写并热推（见 group_persist
+    rewrite_running_strategy_snapshots）。
+    """
     if not strategy:
         return None
     return {

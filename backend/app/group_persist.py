@@ -213,6 +213,50 @@ async def all_active_subtasks() -> list[dict]:
         return []
 
 
+async def rewrite_running_strategy_snapshots(
+    strategy_id: str, snapshot: dict,
+) -> list[dict]:
+    """重写该策略下非终态子任务所属主任务的规则快照，返回这些子任务。
+
+    断线 resume 读的是主任务 strategy_snapshot_json；不改库只推 WS 会在重连后回到旧规则。
+    """
+    sid = str(strategy_id or "").strip()
+    if not sid or not isinstance(snapshot, dict):
+        return []
+    try:
+        async with SessionLocal() as s:
+            rows = (
+                await s.execute(
+                    select(GroupTaskDispatch, GroupSignalTask)
+                    .join(
+                        GroupSignalTask,
+                        GroupSignalTask.task_id == GroupTaskDispatch.task_id,
+                    )
+                    .where(
+                        GroupSignalTask.strategy_id == sid,
+                        GroupTaskDispatch.status.notin_(tuple(_TERMINAL)),
+                    )
+                    .order_by(GroupTaskDispatch.id.asc())
+                )
+            ).all()
+            task_ids = {t.task_id for _, t in rows}
+            if task_ids:
+                values: dict = {"strategy_snapshot_json": snapshot}
+                name = snapshot.get("name")
+                if name:
+                    values["strategy_name"] = str(name)[:64]
+                await s.execute(
+                    update(GroupSignalTask)
+                    .where(GroupSignalTask.task_id.in_(task_ids))
+                    .values(**values)
+                )
+                await s.commit()
+            return [_subtask_dict(d) for d, _ in rows]
+    except Exception as e:  # noqa: BLE001
+        logger.warning("rewrite_running_strategy_snapshots failed: %s", e)
+        return []
+
+
 async def active_subtasks_overview() -> list[dict]:
     """全库活动子任务 + 主任务品种 / 模版快照，供 CLOSE 独立候选。
 
@@ -1031,10 +1075,12 @@ async def recent_group_signals(
     group_id: str, page: int = 1, page_size: int = 20,
     node_names: Optional[dict[str, str]] = None,
     status: Optional[str] = None,
+    signal_id: Optional[str] = None,
 ) -> dict:
     """分页读取某分组的信号主任务（含各节点处理明细）。
 
     status=\"active\" 时仅返回进行中主任务（pending/dispatching/running）。
+    signal_id 非空时再按信号编号精确过滤（监听日志跳转用）。
     """
     page = max(1, page)
     page_size = max(1, min(page_size, 100))
@@ -1043,6 +1089,9 @@ async def recent_group_signals(
     filters = [GroupSignalTask.group_id == group_id]
     if status == "active":
         filters.append(GroupSignalTask.status.in_(group_rules.TASK_ACTIVE))
+    sid = (signal_id or "").strip()
+    if sid:
+        filters.append(GroupSignalTask.signal_id == sid)
     try:
         async with SessionLocal() as s:
             total = (

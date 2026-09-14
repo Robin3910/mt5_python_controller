@@ -24,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 import websockets
 
 import account_risk
-from config import get_settings
+from config import clamp_account_report_interval, get_settings
 from local_status import LocalStatusServer
 from market_hub import MarketHub
 from mt5_prompt import prompt_mt5_credentials
@@ -415,7 +415,7 @@ class NodeClient:
             self._check_login(snap.get("account") or {})
             await ws.send(json.dumps({"type": "account", "data": snap}))
             await self._check_account_risk(ws, snap)
-            await asyncio.sleep(settings.account_report_interval)
+            await asyncio.sleep(clamp_account_report_interval(settings.account_report_interval))
 
     async def _heartbeat(self, ws) -> None:
         """定时心跳，维持服务端在线标记。"""
@@ -471,6 +471,8 @@ class NodeClient:
             await self._do_strategy_start(ws, msg, resume=True)
         elif cmd == "strategy_stop":
             await self._do_strategy_stop(ws, msg)
+        elif cmd == "strategy_update":
+            await self._do_strategy_update(msg)
         elif cmd == "cancel_pending":
             await self._do_cancel_pending(ws, msg)
         else:
@@ -716,6 +718,21 @@ class NodeClient:
         # 本地没有监控：节点重启过，或服务端补发了离线期间的终止指令。
         # 此时按魔术号直接平掉残留持仓，否则这批仓位再也没人负责收口。
         await self._close_orphan_strategy(ws, task_id, msg)
+
+    async def _do_strategy_update(self, msg: dict) -> None:
+        """热推进行中任务的策略快照（模版1 手动分散仓 / 加仓规则）。"""
+        try:
+            task_id = int(msg.get("task_id"))
+        except (TypeError, ValueError):
+            logger.warning("strategy_update with invalid task_id: %s", msg)
+            return
+        runner = self.runners.get(task_id)
+        if not runner or runner.done:
+            logger.info("strategy_update for unknown task %s ignored", task_id)
+            return
+        snapshot = msg.get("strategy") if isinstance(msg.get("strategy"), dict) else {}
+        if not runner.apply_strategy(snapshot):
+            logger.warning("task %s refused strategy_update", task_id)
 
     async def _close_orphan_strategy(self, ws, task_id: int, msg: dict) -> None:
         """无本地监控时按魔术号平仓并撤挂单，回报结果供服务端收口。"""

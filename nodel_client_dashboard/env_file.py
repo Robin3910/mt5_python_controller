@@ -54,7 +54,10 @@ ENV_FIELDS: tuple[EnvField, ...] = (
     EnvField("DEFAULT_SLIPPAGE", "默认滑点", "int"),
     EnvField("DEFAULT_MAGIC", "默认魔术号", "int"),
     EnvField("HEARTBEAT_INTERVAL", "心跳间隔（秒）", "int"),
-    EnvField("ACCOUNT_REPORT_INTERVAL", "账户上报间隔（秒）", "int"),
+    EnvField(
+        "ACCOUNT_REPORT_INTERVAL", "账户上报间隔（秒）", "float",
+        "支持小数，例如 0.5；下限 0.05，越小 MT5 快照与上报越频繁",
+    ),
     EnvField("RECONNECT_MIN", "重连退避下限（秒）", "int"),
     EnvField("RECONNECT_MAX", "重连退避上限（秒）", "int"),
     EnvField("AUTH_TIMEOUT", "鉴权超时（秒）", "int"),

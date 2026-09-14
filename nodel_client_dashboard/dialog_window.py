@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import tkinter as tk
 
+from tray_icon import apply_window_icon
+
 
 def centered_origin(
     size: tuple[int, int],
@@ -48,6 +50,7 @@ def _release_grab(win) -> None:
 
 def hide_while_building(win) -> None:
     """构建期把窗口设为全透明，避免用户看到控件逐个落位。"""
+    apply_window_icon(win)
     _set_alpha(win, 0.0)
 
 

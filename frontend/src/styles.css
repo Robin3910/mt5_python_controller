@@ -859,6 +859,10 @@ input[type='checkbox'] { width: auto; accent-color: var(--primary); cursor: poin
 /* ── Dashboard homepage ── */
 .content:has(.dash-page) { max-width: 1480px; }
 
+.dash-trend {
+  margin-bottom: 16px;
+}
+
 .dash-summary {
   display: grid;
   grid-template-columns: repeat(3, 1fr);

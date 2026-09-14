@@ -3,13 +3,14 @@ import fakeredis
 import pytest
 from sqlalchemy import delete
 
-from app import group_service, limit_watch
+from app import group_service, limit_watch, persist
 from app.db import SessionLocal, init_db
 from app.models import GroupCreate, GroupUpdate
 from app.orm import (
     GroupSignalTask,
     GroupTaskDispatch,
     GroupTaskEvent,
+    LimitWatchLog,
     NodeGroup,
     NodeGroupMember,
     SignalDispatch,
@@ -27,6 +28,7 @@ from app.strategy_templates import (
 )
 
 _TABLES = (
+    LimitWatchLog,
     GroupTaskEvent,
     GroupTaskDispatch,
     GroupSignalTask,
@@ -155,9 +157,10 @@ async def _mk_group(store, name, node_ids, *, strategy, watch=True, keyword="lim
 # ---------------------------------------------------------------------------
 # 纯函数
 # ---------------------------------------------------------------------------
-def test_normalize_keyword_defaults_and_clips():
+def test_normalize_keyword_allows_empty_and_clips():
     assert limit_watch.normalize_keyword(None) == "limit"
-    assert limit_watch.normalize_keyword("  ") == "limit"
+    assert limit_watch.normalize_keyword("  ") == ""
+    assert limit_watch.normalize_keyword("") == ""
     assert limit_watch.normalize_keyword(" SIGNAL ") == "SIGNAL"
     assert len(limit_watch.normalize_keyword("x" * 80)) == limit_watch.KEYWORD_MAX_LEN
 
@@ -166,6 +169,9 @@ def test_keyword_matches_is_case_insensitive_substring():
     assert limit_watch.keyword_matches("Open LIMIT here", "limit")
     assert not limit_watch.keyword_matches("manual", "limit")
     assert limit_watch.keyword_matches("abcSIGNALxyz", "signal")
+    assert limit_watch.keyword_matches("anything", "")
+    assert limit_watch.keyword_matches("", "")
+    assert limit_watch.keyword_matches("manual", "  ")
 
 
 def test_order_incomplete_reason_requires_limit_fields():
@@ -229,6 +235,26 @@ def test_select_watch_targets_sends_all_matching_groups():
     assert blocked == []
 
 
+def test_select_watch_targets_empty_keyword_matches_any_comment():
+    sty = {
+        "strategy_id": "sty_1", "template_id": TEMPLATE_2_ID, "enabled": True,
+        "symbol": "XAUUSD", "rules": [_risk_rule()],
+    }
+    groups = [
+        {
+            "group_id": "g_empty", "name": "空关键字", "enabled": True,
+            "limit_watch_enabled": True, "limit_watch_keyword": "",
+            "strategy_id": "sty_1",
+            "members": [{"node_id": "nd_a", "sort_order": 0}],
+        },
+    ]
+    passing, blocked = limit_watch.select_watch_targets(
+        groups, {"sty_1": sty}, "nd_a", _order(comment="手工单"),
+    )
+    assert [g["group_id"] for g in passing] == ["g_empty"]
+    assert blocked == []
+
+
 def test_select_watch_targets_ignores_non_member_and_tpl1():
     trend = {
         "strategy_id": "sty_t", "template_id": TEMPLATE_2_ID, "enabled": True,
@@ -284,6 +310,35 @@ def test_is_manual_pending_skips_strategy_magic():
     assert not limit_watch.is_manual_pending(_order(magic=900000001))
 
 
+def test_format_watch_message_and_dispatch_event():
+    assert limit_watch.dispatch_event("accepted") == "ok"
+    assert limit_watch.dispatch_event("rejected") == "dispatch_rejected"
+    assert limit_watch.dispatch_event("duplicate") == "duplicate"
+    text = limit_watch.format_watch_message(
+        "rejected", node_id="nd_a", ticket=9, symbol="XAUUSD", reason="缺少止损",
+    )
+    assert "拒绝" in text and "nd_a" in text and "止损" in text
+    ok = limit_watch.format_watch_message(
+        "ok", node_id="nd_a", ticket=9, symbol="XAUUSD", action="BUY",
+        volume=0.1, price=2390.0, signal_id="sig_1",
+    )
+    assert "已触发" in ok and "0.1手" in ok and "sig_1" in ok
+
+
+async def test_persist_limit_watch_log_roundtrip(store):
+    row = await persist.record_limit_watch_log(
+        group_id="grp_x", group_name="监听组", node_id="nd_a",
+        event="rejected", message="拒绝 nd_a #1：缺止损", ticket=1, symbol="XAUUSD",
+    )
+    assert row and row["id"] and row["group_id"] == "grp_x"
+    page = await persist.list_limit_watch_logs("grp_x")
+    assert page["total"] == 1
+    assert page["items"][0]["message"] == row["message"]
+    latest = await persist.latest_limit_watch_logs(["grp_x", "grp_y"])
+    assert len(latest["grp_x"]) == 1
+    assert latest["grp_y"] == []
+
+
 # ---------------------------------------------------------------------------
 # 编排
 # ---------------------------------------------------------------------------
@@ -317,11 +372,16 @@ async def test_handle_cancels_then_dispatches_to_all_hits(store, monkeypatch):
     assert dispatched[0]["payload"]["sl"] == 2380.0
     assert dispatched[0]["dedup_key"] == "nd_a:1001"
     assert "1001" in dispatched[0]["raw"]
+    for gid in ids:
+        page = await persist.list_limit_watch_logs(gid)
+        assert page["total"] == 1
+        assert page["items"][0]["event"] == "ok"
+        assert page["items"][0]["ticket"] == 1001
 
 
 async def test_handle_rejects_incomplete_without_cancel(store, monkeypatch):
     sty = await _mk_strategy(store)
-    await _mk_group(store, "缺止损组", ["nd_a"], strategy=sty)
+    g = await _mk_group(store, "缺止损组", ["nd_a"], strategy=sty)
 
     cancelled = []
 
@@ -337,6 +397,10 @@ async def test_handle_rejects_incomplete_without_cancel(store, monkeypatch):
 
     await limit_watch.handle_account_orders("nd_a", [_order(sl=0)])
     assert cancelled == []
+    page = await persist.list_limit_watch_logs(g["group_id"])
+    assert page["total"] == 1
+    assert page["items"][0]["event"] == "rejected"
+    assert "止损" in page["items"][0]["message"]
 
 
 async def test_handle_skips_strategy_magic_orders(store, monkeypatch):
@@ -374,7 +438,7 @@ async def test_handle_does_not_retry_same_ticket(store, monkeypatch):
 
 async def test_handle_releases_lock_when_cancel_fails(store, monkeypatch):
     sty = await _mk_strategy(store)
-    await _mk_group(store, "撤单失败组", ["nd_a"], strategy=sty)
+    g = await _mk_group(store, "撤单失败组", ["nd_a"], strategy=sty)
     n = {"dispatch": 0}
 
     async def fake_cancel(*_a, **_k):
@@ -389,6 +453,9 @@ async def test_handle_releases_lock_when_cancel_fails(store, monkeypatch):
 
     await limit_watch.handle_account_orders("nd_a", [_order()])
     assert n["dispatch"] == 0
+    page = await persist.list_limit_watch_logs(g["group_id"])
+    assert page["total"] == 1
+    assert page["items"][0]["event"] == "cancel_failed"
 
     async def ok_cancel(*_a, **_k):
         return {"success": True, "ticket": 1001}
@@ -424,3 +491,11 @@ async def test_unbinding_trend_strategy_turns_watch_off(store):
     )
     assert updated["limit_watch_enabled"] is False
     assert updated["limit_watch_keyword"] == "limit"
+
+
+async def test_create_group_keeps_empty_watch_keyword(store):
+    sty = await _mk_strategy(store)
+    g = await _mk_group(store, "空关键字组", [], strategy=sty, watch=True, keyword="")
+    assert g["limit_watch_keyword"] == ""
+    cached = await store.get_group(g["group_id"])
+    assert cached["limit_watch_keyword"] == ""

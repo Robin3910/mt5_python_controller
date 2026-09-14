@@ -552,11 +552,15 @@ class BreakevenMove:
 
     def describe(self, digits: int) -> str:
         mode_label = "循环" if self.mode == BREAKEVEN_LOOP else "按次"
+        sl_text = f"止损移至 {_trim(self.stop_loss, digits)}"
+        eps = 10 ** (-max(digits, 0)) / 2
+        if abs(self.stop_loss - self.avg_price) > eps:
+            sl_text += f"（均价 {_trim(self.avg_price, digits)} 按跳动取整）"
         return (
             f"保本触发（{mode_label}）：均价 {_trim(self.avg_price, digits)} → 现价 "
             f"{_trim(self.price, digits)}，有利偏离 {_trim(self.favorable, digits)} "
             f"≥ 止损距 × {_trim(self.times, 2)} = {_trim(self.threshold, digits)}；"
-            f"止损移至 {_trim(self.stop_loss, digits)}"
+            f"{sl_text}"
         )
 
     def detail(self) -> dict:
@@ -571,6 +575,32 @@ class BreakevenMove:
             "breakeven_mode": self.mode,
             "breakeven_mode_label": "循环" if self.mode == BREAKEVEN_LOOP else "按次",
         }
+
+
+def align_stop_to_tick(
+    price: float, *, tick_size: float, digits: int, direction: str,
+) -> float:
+    """把止损价对齐到合约最小跳动。
+
+    多单止损在现价下方，向下取整；空单止损在现价上方，向上取整。都是往离现价
+    更远的一侧靠，避免加权均价落在半个 tick 上被券商打成 Invalid stops。
+    `tick_size <= 0` 时退回按 `digits` 四舍五入，兼容旧调用。
+    """
+    value = float(price)
+    if value <= 0:
+        return 0.0
+    places = max(int(digits or 0), 0)
+    if tick_size <= 0:
+        return round(value, places)
+    steps = value / tick_size
+    nearest = round(steps)
+    if abs(steps - nearest) <= 1e-9:
+        aligned = nearest * tick_size
+    elif _is_buy(direction):
+        aligned = math.floor(steps + 1e-12) * tick_size
+    else:
+        aligned = math.ceil(steps - 1e-12) * tick_size
+    return round(aligned, places)
 
 
 def weighted_avg_price(positions: list[dict]) -> float:
@@ -607,10 +637,12 @@ def _stop_already_at_or_better(current_sl: float, target: float, *, direction: s
 
 
 def breakeven_move(cfg: RiskSizedConfig, plan: EntryPlan, *, positions: list[dict],
-                   price: float, digits: int = 5) -> Optional[BreakevenMove]:
+                   price: float, digits: int = 5, tick_size: float = 0.0,
+                   ) -> Optional[BreakevenMove]:
     """浮盈是否达到保本阈值；达标则返回要把止损挪到的均价。
 
-    若当前止损已经在均价或更优一侧，不再重复改单（按次 / 循环都适用）。
+    止损价按 `tick_size` 向离现价更远的一侧取整（见 `align_stop_to_tick`）。
+    若当前止损已经在目标价或更优一侧，不再重复改单（按次 / 循环都适用）。
     """
     if not cfg.breakeven_enabled or cfg.breakeven_times <= 0 or not plan.ok:
         return None
@@ -619,7 +651,12 @@ def breakeven_move(cfg: RiskSizedConfig, plan: EntryPlan, *, positions: list[dic
     avg = weighted_avg_price(positions)
     if avg <= 0:
         return None
-    target = round(avg, digits)
+    avg_shown = round(avg, digits)
+    target = align_stop_to_tick(
+        avg, tick_size=tick_size, digits=digits, direction=plan.direction,
+    )
+    if target <= 0:
+        return None
     current_sl = _worst_stop_loss(positions, direction=plan.direction)
     if _stop_already_at_or_better(current_sl, target, direction=plan.direction, digits=digits):
         return None
@@ -630,7 +667,7 @@ def breakeven_move(cfg: RiskSizedConfig, plan: EntryPlan, *, positions: list[dic
         return None
     return BreakevenMove(
         stop_loss=target,
-        avg_price=target,
+        avg_price=avg_shown,
         price=price,
         favorable=round(favorable, digits),
         threshold=round(threshold, digits),
