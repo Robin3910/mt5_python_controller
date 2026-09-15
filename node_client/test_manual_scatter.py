@@ -124,15 +124,26 @@ def test_fill_side_price_matches_market_order():
     assert ms.fill_side_price("BUY", bid=0.0, ask=0.0, fallback=2330.0) == 2330.0
 
 
-def test_price_reached_buy_and_sell_including_already_past():
+def test_price_reached_buy_pullback_and_sell_bounce():
     assert ms.direction_from_prices(4400, 4410) == "BUY"
     assert ms.direction_from_prices(4400, 4390) == "SELL"
     assert ms.price_reached("BUY", 4400, 4400) is True
-    assert ms.price_reached("BUY", 4401, 4400) is True
-    assert ms.price_reached("BUY", 4399, 4400) is False
+    assert ms.price_reached("BUY", 4399, 4400) is True
+    assert ms.price_reached("BUY", 4401, 4400) is False
     assert ms.price_reached("SELL", 4400, 4400) is True
-    assert ms.price_reached("SELL", 4399, 4400) is True
-    assert ms.price_reached("SELL", 4401, 4400) is False
+    assert ms.price_reached("SELL", 4401, 4400) is True
+    assert ms.price_reached("SELL", 4399, 4400) is False
+
+
+def test_tp_passed_buy_and_sell():
+    assert ms.tp_passed("BUY", 4410, 4410) is True
+    assert ms.tp_passed("BUY", 4411, 4410) is True
+    assert ms.tp_passed("BUY", 4409, 4410) is False
+    assert ms.tp_passed("SELL", 4390, 4390) is True
+    assert ms.tp_passed("SELL", 4389, 4390) is True
+    assert ms.tp_passed("SELL", 4391, 4390) is False
+    assert ms.tp_passed("BUY", 4415, 0) is False
+    assert "越过止盈" in ms.describe_tp_passed("BUY", 4415, 4400, 4410)
 
 
 def test_comment_is_m_prefix_not_r3b():
@@ -258,11 +269,12 @@ async def test_runner_opens_market_once_with_m2_comment():
     runner.start()
     await _settle()
 
-    mt5.prices_map["XAUUSD"] = 4400.0
+    mt5.prices_map["XAUUSD"] = 4399.0
     held = mt5.positions_by_magic(MAGIC)
     hub.sub.offer(mh.MarketEvent(
         kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
-        positions=tuple(held), price=4400.0, point=0.01,
+        positions=tuple(held), price=4399.0, point=0.01,
+        bid=4398.9, ask=4399.0,
     ))
     await _settle()
 
@@ -284,14 +296,16 @@ async def test_runner_opens_market_once_with_m2_comment():
 
     hub.sub.offer(mh.MarketEvent(
         kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
-        positions=tuple(mt5.positions_by_magic(MAGIC)), price=4400.0, point=0.01,
+        positions=tuple(mt5.positions_by_magic(MAGIC)), price=4399.0, point=0.01,
+        bid=4398.9, ask=4399.0,
     ))
     await _settle()
     assert len([p for p in mt5.positions_by_magic(MAGIC) if str(p.get("comment") or "").startswith("M")]) == 1
     runner.cancel()
 
 
-async def test_runner_already_past_entry_opens_immediately():
+async def test_runner_past_take_profit_does_not_open():
+    """现价已过止盈：不开仓，进度记越过止盈；不记开火，以后仍可回踩。"""
     sent: list = []
     mt5 = MockMT5Client()
     mt5.prices_map["XAUUSD"] = 4415.0
@@ -302,15 +316,48 @@ async def test_runner_already_past_entry_opens_immediately():
     hub.sub.offer(mh.MarketEvent(
         kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
         positions=tuple(held), price=4415.0, point=0.01,
+        bid=4414.9, ask=4415.0,
     ))
     await _settle()
     manuals = [p for p in mt5.positions_by_magic(MAGIC) if p.get("comment") == "M2"]
-    assert len(manuals) == 1
+    assert manuals == []
+    assert 2 not in runner._manual_fired
+    errors = _progress(sent, "error")
+    assert errors and "越过止盈" in (errors[0].get("message") or "")
+    assert errors[0]["detail"]["error"] == "tp_passed"
+
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(held), price=4416.0, point=0.01,
+        bid=4415.9, ask=4416.0,
+    ))
+    await _settle()
+    assert len(_progress(sent, "error")) == 1
     runner.cancel()
 
 
-async def test_runner_triggers_on_ask_not_bid():
-    """多单到价看卖价：卖价未到不开；卖价越过入场才市价开（买价仍可低于入场）。"""
+async def test_runner_between_entry_and_tp_waits():
+    """多单现价在入场与止盈之间：未回踩，也不算越过止盈，不开。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub = _runner(sent, mt5=mt5)
+    runner.start()
+    await _settle()
+    held = mt5.positions_by_magic(MAGIC)
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(held), price=4405.0, point=0.01,
+        bid=4404.9, ask=4405.0,
+    ))
+    await _settle()
+    assert not [p for p in mt5.positions_by_magic(MAGIC) if p.get("comment") == "M2"]
+    assert not _progress(sent, "error")
+    assert not _progress(sent, "add_manual")
+    runner.cancel()
+
+
+async def test_runner_triggers_on_ask_pullback():
+    """多单到价看卖价：卖价仍高于入场不开；回落到入场才市价开。"""
     sent: list = []
     mt5 = MockMT5Client()
     runner, hub = _runner(
@@ -327,16 +374,16 @@ async def test_runner_triggers_on_ask_not_bid():
 
     hub.sub.offer(mh.MarketEvent(
         kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
-        positions=tuple(held), price=4399.8, point=0.01,
-        bid=4399.8, ask=4399.95,
+        positions=tuple(held), price=4400.0, point=0.01,
+        bid=4399.9, ask=4400.1,
     ))
     await _settle()
     assert not [p for p in mt5.positions_by_magic(MAGIC) if p.get("comment") == "M2"]
 
     hub.sub.offer(mh.MarketEvent(
         kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
-        positions=tuple(held), price=4399.9, point=0.01,
-        bid=4399.9, ask=4400.1,
+        positions=tuple(held), price=4399.8, point=0.01,
+        bid=4399.7, ask=4399.95,
     ))
     await _settle()
     manuals = [p for p in mt5.positions_by_magic(MAGIC) if p.get("comment") == "M2"]
@@ -359,16 +406,18 @@ async def test_manual_positions_do_not_inflate_batch_position_count():
     runner, hub = _runner(sent, mt5=mt5, strategy={"template_id": "tpl_1", "rules": [rule]})
     runner.start()
     await _settle()
-    mt5.prices_map["XAUUSD"] = 4400.0
+    mt5.prices_map["XAUUSD"] = 4399.0
     hub.sub.offer(mh.MarketEvent(
         kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
-        positions=tuple(mt5.positions_by_magic(MAGIC)), price=4400.0, point=0.01,
+        positions=tuple(mt5.positions_by_magic(MAGIC)), price=4399.0, point=0.01,
+        bid=4398.9, ask=4399.0,
     ))
     await _settle()
     assert runner.add_count == 0
     hub.sub.offer(mh.MarketEvent(
         kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
-        positions=tuple(mt5.positions_by_magic(MAGIC)), price=4400.0, point=0.01,
+        positions=tuple(mt5.positions_by_magic(MAGIC)), price=4399.0, point=0.01,
+        bid=4398.9, ask=4399.0,
     ))
     await _settle()
     assert runner.add_count == 0

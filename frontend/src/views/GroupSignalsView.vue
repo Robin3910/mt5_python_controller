@@ -457,6 +457,7 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
     push('入场价', detail.entry_price)
     push('止盈价', detail.take_profit)
     push('止损价', detail.stop_loss || '不设')
+    push('成交侧现价', detail.fill_price)
     push('注释', detail.comment)
     push('错误', detail.error)
     return rows

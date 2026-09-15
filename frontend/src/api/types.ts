@@ -879,6 +879,7 @@ export interface GroupTaskEventDetail {
   batch_total?: number
   trigger_price?: number
   entry_price?: number
+  fill_price?: number
   avg_price?: number
   favorable?: number
   reason?: string

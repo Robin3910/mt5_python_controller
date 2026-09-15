@@ -1,8 +1,9 @@
 """模版1 手动分散仓：配置抽取、手数反推与到价判定。
 
 与分批加仓隔离：不进 batch_levels，MT5 注释用 M1/M2（禁止 R3B）。
-手数：按当前任务总手数匹配 lot_pl_tiers 的 pl_amount，再按
-|tp-entry| / tick_size * tick_value 反推，向上取整到 volume_step。
+到价是回踩/反弹到入场再市价开：BUY 等卖价 ≤ 入场，SELL 等买价 ≥ 入场。
+成交侧已越过止盈则不开。手数按当前任务总手数匹配 lot_pl_tiers 的
+pl_amount，再按 |tp-entry| / tick_size * tick_value 反推，向上取整到 volume_step。
 """
 from __future__ import annotations
 
@@ -125,15 +126,38 @@ def fill_side_price(
 
 
 def price_reached(direction: str, price: float, entry: float) -> bool:
-    """BUY：成交侧现价已到或越过入场（>=）；SELL：成交侧现价已到或越过入场（<=）。"""
+    """BUY：成交侧已回落到入场（<=）；SELL：成交侧已反弹到入场（>=）。"""
     if entry <= 0 or price <= 0:
         return False
     side = str(direction or "").strip().upper()
     if side == "BUY":
-        return price + 1e-12 >= entry
-    if side == "SELL":
         return price - 1e-12 <= entry
+    if side == "SELL":
+        return price + 1e-12 >= entry
     return False
+
+
+def tp_passed(direction: str, price: float, take_profit: float) -> bool:
+    """成交侧已越过止盈：BUY 现价 >= 止盈，SELL 现价 <= 止盈。止盈未设则 False。"""
+    if take_profit <= 0 or price <= 0:
+        return False
+    side = str(direction or "").strip().upper()
+    if side == "BUY":
+        return price + 1e-12 >= take_profit
+    if side == "SELL":
+        return price - 1e-12 <= take_profit
+    return False
+
+
+def describe_tp_passed(
+    direction: str, price: float, entry: float, take_profit: float,
+) -> str:
+    side = str(direction or "").strip().upper() or "?"
+    wait = "回落到入场" if side == "BUY" else "反弹到入场"
+    return (
+        f"手动分散仓越过止盈，暂不开仓：{side} 现价 {_trim(price)}"
+        f" 已过止盈 {_trim(take_profit)}，等待{wait} {_trim(entry)}"
+    )
 
 
 def match_target_pl(lot_pl_tiers: object, current_lot_size: float) -> Optional[float]:

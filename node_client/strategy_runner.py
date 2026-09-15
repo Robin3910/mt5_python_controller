@@ -214,6 +214,8 @@ class StrategyRunner:
         )
         # 手动分散仓：每种规则只开一次；重连时优先用 runtime，其次用仓位 comment
         self._manual_fired: set[int] = set()
+        # 越过止盈的 warning / 进度每条规则只发一次，避免每 tick 刷屏
+        self._manual_tp_logged: set[int] = set()
         raw_fired = self._resume_runtime.get("manual_fired")
         if isinstance(raw_fired, list):
             for item in raw_fired:
@@ -693,7 +695,7 @@ class StrategyRunner:
     async def _maybe_open_manual_scatter(
         self, event: MarketEvent, positions: list[dict],
     ) -> bool:
-        """成交侧到价则市价开一条手动分散仓。成功返回 True，本拍不再走分批加仓。"""
+        """回踩/反弹到入场则市价开一条手动分散仓。成功返回 True，本拍不再走分批加仓。"""
         watches = manual_scatter.extract_watches(self.strategy.get("rules"))
         if not watches:
             return False
@@ -710,15 +712,48 @@ class StrategyRunner:
                 ask=_as_float(event.ask),
                 fallback=_as_float(event.price),
             )
-            if not manual_scatter.price_reached(
-                direction, price, _as_float(cfg.get("entry_price")),
-            ):
+            entry = _as_float(cfg.get("entry_price"))
+            tp = _as_float(cfg.get("take_profit"))
+            if manual_scatter.tp_passed(direction, price, tp):
+                await self._skip_manual_tp_passed(
+                    watch, positions, price=price, entry=entry, take_profit=tp,
+                )
                 continue
-            if await self._open_manual_scatter(watch, positions):
+            if not manual_scatter.price_reached(direction, price, entry):
+                continue
+            if await self._open_manual_scatter(watch, positions, fill_price=price):
                 return True
         return False
 
-    async def _open_manual_scatter(self, watch: dict, positions: list[dict]) -> bool:
+    async def _skip_manual_tp_passed(
+        self, watch: dict, positions: list[dict], *,
+        price: float, entry: float, take_profit: float,
+    ) -> None:
+        rule_type = int(watch.get("rule_type") or 0)
+        direction = str(watch.get("direction") or "")
+        reason = manual_scatter.describe_tp_passed(direction, price, entry, take_profit)
+        if rule_type in self._manual_tp_logged:
+            logger.debug("task %s %s", self.task_id, reason)
+            return
+        self._manual_tp_logged.add(rule_type)
+        logger.warning("task %s %s", self.task_id, reason)
+        await self._emit_progress(
+            "error", phase="running", positions=positions,
+            message=reason,
+            detail={
+                "kind": manual_scatter.DETAIL_KIND,
+                "rule_type": rule_type,
+                "direction": direction,
+                "entry_price": entry,
+                "take_profit": take_profit,
+                "fill_price": price,
+                "error": "tp_passed",
+            },
+        )
+
+    async def _open_manual_scatter(
+        self, watch: dict, positions: list[dict], *, fill_price: float = 0.0,
+    ) -> bool:
         cfg = watch.get("cfg") if isinstance(watch.get("cfg"), dict) else {}
         spec = await self._manual_symbol_spec()
         if spec is None:
@@ -741,6 +776,12 @@ class StrategyRunner:
         direction = str(watch.get("direction") or "").upper()
         sl = _as_float(cfg.get("stop_loss"))
         tp = _as_float(cfg.get("take_profit"))
+        entry = _as_float(cfg.get("entry_price"))
+        if fill_price > 0 and manual_scatter.tp_passed(direction, fill_price, tp):
+            await self._skip_manual_tp_passed(
+                watch, positions, price=fill_price, entry=entry, take_profit=tp,
+            )
+            return False
         comment = str(watch.get("comment") or manual_scatter.comment_for(
             int(watch.get("rule_type") or 0),
         ))[:MT5_COMMENT_LIMIT]
