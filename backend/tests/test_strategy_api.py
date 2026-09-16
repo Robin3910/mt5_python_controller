@@ -1018,7 +1018,8 @@ def test_create_addon_keeps_manual_scatter(client):
             "symbol": "XAUUSD",
             "rules": [
                 {"type": 1, "status": 0, "action": "all", "manual_scatter": _manual_scatter()},
-                {"type": 2, "status": 1, "action": "all", "manual_scatter": _manual_scatter(volume=0, volume_locked=False)},
+                {"type": 2, "status": 1, "action": "all",
+                 "manual_scatter": _manual_scatter(volume=0, volume_locked=False, close_all_on_tp=True)},
             ],
         },
         headers=h,
@@ -1028,7 +1029,10 @@ def test_create_addon_keeps_manual_scatter(client):
     assert by_type[1]["manual_scatter"]["enabled"] is True
     assert by_type[1]["manual_scatter"]["entry_price"] == 4400
     assert by_type[1]["manual_scatter"]["volume"] == 0.5
+    # 止盈联动清仓：不传默认关闭，显式传 True 原样落库
+    assert by_type[1]["manual_scatter"]["close_all_on_tp"] is False
     assert by_type[2]["manual_scatter"]["volume_locked"] is False
+    assert by_type[2]["manual_scatter"]["close_all_on_tp"] is True
     assert "manual_scatter" not in (by_type[1].get("batch_levels") or [])
 
 
@@ -1240,4 +1244,16 @@ def test_normalize_manual_scatter_defaults_disabled():
     out = tpl.normalize_rule({"type": 1, "status": 1, "action": "all"})
     assert out["manual_scatter"]["enabled"] is False
     assert out["manual_scatter"]["volume_locked"] is False
+    assert out["manual_scatter"]["close_all_on_tp"] is False
+    # 旧配置缺该字段：规范化后关闭；显式开启保留
+    legacy = tpl.normalize_rule({
+        "type": 2, "status": 1, "action": "all",
+        "manual_scatter": {"enabled": True, "entry_price": 4400, "take_profit": 4410},
+    })
+    assert legacy["manual_scatter"]["close_all_on_tp"] is False
+    on = tpl.normalize_rule({
+        "type": 2, "status": 1, "action": "all",
+        "manual_scatter": {"enabled": True, "entry_price": 4400, "take_profit": 4410, "close_all_on_tp": 1},
+    })
+    assert on["manual_scatter"]["close_all_on_tp"] is True
 

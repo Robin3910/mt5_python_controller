@@ -213,31 +213,6 @@ def count_adds_by_rule(positions: Sequence | None) -> dict[int, int]:
     return counts
 
 
-def _legacy_batch_levels(rule: dict) -> bool:
-    """旧档位从第 2 笔起（含开仓序号）；新档位从本规则第 1 次加仓起。"""
-    starts: list[int] = []
-    for level in rule.get("batch_levels") or []:
-        if not isinstance(level, dict):
-            continue
-        lo = _as_int(level.get("pos_from"), 0)
-        if lo > 0:
-            starts.append(lo)
-    return bool(starts) and min(starts) >= 2
-
-
-def batch_match_no_and_max_adds(rule: dict, rule_adds: int) -> tuple[int, int]:
-    """档位匹配序号，以及本规则最多可加次数（0=不限制）。
-
-    新格式（档位从 1 起）：匹配「第几次加仓」，上限即 total_lot_limit。
-    旧格式（档位从 2 起）：匹配「已加次数 + 2」，上限为 total_lot_limit - 1。
-    """
-    limit = _as_int(rule.get("total_lot_limit"), 0)
-    if _legacy_batch_levels(rule):
-        max_adds = max(0, limit - 1) if limit else 0
-        return rule_adds + 2, max_adds
-    return rule_adds + 1, limit
-
-
 def deviation_points(rule_type: int, direction: str, base_price: float,
                      price: float, point: float) -> float:
     """当前偏离的点数；负值表示偏离方向与该规则关注的方向相反。
@@ -310,20 +285,20 @@ def evaluate_rule(rule: dict, ctx: PositionCtx, rule_index: int = 0) -> Optional
         return None
 
     rule_adds = ctx.rule_add_count(rule_type)
-    next_no, max_adds = batch_match_no_and_max_adds(rule, rule_adds)
-    level, level_index = pick_batch_level(rule, next_no)
+    # 档位按「本规则第几次加仓」命中（从 1 起，开仓不占格）；pos_from 一律按字面解释
+    level, level_index = pick_batch_level(rule, rule_adds + 1)
 
     if level is not None:
         # 分批模式：方向可独立配置，笔数上限用本规则已加次数，间距按档位解析
         if not action_matches(rule.get("batch_action") or rule.get("action"), ctx.direction):
             return None
         limit = _as_int(rule.get("total_lot_limit"), 0)
-        if limit and rule_adds >= max_adds:
+        if limit and rule_adds >= limit:
             return None
         gap = resolve_threshold(rule_type, level, ctx)
         lot_times = _as_float(level.get("lot_times"), 1.0)
         extra_lot = _as_float(level.get("extra_lot"), 0.0)
-        limit_kind, limit_value = "total_lot_limit", max_adds if max_adds else limit
+        limit_kind, limit_value = "total_lot_limit", limit
     else:
         # 分批未启用（或已超出所有档位区间）：走基础参数 + 次数上限，基础参数只支持点数
         if rule.get("batch_enabled"):

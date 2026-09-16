@@ -270,7 +270,7 @@ function reconstructManualScatterFormula(detail: GroupTaskEventDetail): string {
 function eventReason(ev: GroupTaskEventRecord): string {
   const msg = (ev.message || '').trim()
   const d = ev.detail
-  if (d?.kind === 'manual_scatter') {
+  if (d?.kind === 'manual_scatter' && !d.linked_close) {
     const formula = d.volume_formula || reconstructManualScatterFormula(d)
     if (formula && !msg.includes('手填') && !msg.includes('分档目标') && !msg.includes('配置 ')) {
       return msg ? `${msg}；${formula}` : formula
@@ -447,6 +447,18 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
   if (detail.kind === 'manual_scatter') {
     push('规则', Number(detail.rule_type) === 1 ? '逆势' : '顺势')
     push('方向', detail.direction)
+    if (detail.linked_close) {
+      // 止盈联动清仓：手动单已离场，展示离场依据与联动范围
+      push('离场原因', detail.exit_reason === 'tp' ? '券商止盈' : detail.exit_reason)
+      push('判定依据', detail.exit_source === 'price' ? '平仓侧现价到止盈（成交历史未到）' : 'MT5 成交历史')
+      push('联动动作', `平掉该信号其余 ${detail.remaining ?? '?'} 笔持仓`)
+      push('手动单手数', detail.volume)
+      push('开仓价', detail.entry_price)
+      push('止盈价', detail.take_profit)
+      push('订单号', detail.ticket)
+      push('注释', detail.comment)
+      return rows
+    }
     push('手数公式', detail.volume_formula || reconstructManualScatterFormula(detail))
     push('手数来源', detail.volume_locked ? '手填锁定' : (detail.target_pl != null ? '分档反推' : '配置手数'))
     push('本次手数', detail.volume)
@@ -457,6 +469,7 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
     push('入场价', detail.entry_price)
     push('止盈价', detail.take_profit)
     push('止损价', detail.stop_loss || '不设')
+    push('止盈联动', detail.close_all_on_tp === undefined ? '' : (detail.close_all_on_tp ? '止盈后清仓该信号' : '关闭'))
     push('成交侧现价', detail.fill_price)
     push('注释', detail.comment)
     push('错误', detail.error)
@@ -639,6 +652,7 @@ function eventTag(
     add_counter: { cls: 'amber', text: '逆势加仓' },
     add_trend: { cls: 'amber', text: '顺势加仓' },
     add_manual: { cls: 'amber', text: '手动分散仓' },
+    manual_tp_close: { cls: 'blue', text: '止盈联动清仓' },
     grid_add: { cls: 'amber', text: '网格买入' },
     grid_shift: { cls: 'blue', text: '网格平移' },
     breakeven: { cls: 'blue', text: '保本' },

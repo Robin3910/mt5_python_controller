@@ -156,6 +156,7 @@ def default_manual_scatter() -> dict[str, Any]:
         "stop_loss": 0.0,
         "volume": 0.0,
         "volume_locked": False,
+        "close_all_on_tp": False,
     }
 
 
@@ -229,6 +230,7 @@ def _normalize_manual_scatter(raw: object) -> dict[str, Any]:
             0.0, _as_float(src.get("volume", defaults["volume"]), defaults["volume"]),
         ),
         "volume_locked": bool(src.get("volume_locked", defaults["volume_locked"])),
+        "close_all_on_tp": bool(src.get("close_all_on_tp", defaults["close_all_on_tp"])),
     }
 
 

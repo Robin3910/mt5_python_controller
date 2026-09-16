@@ -199,6 +199,7 @@ const FIELD_HELP = {
     '多单等卖价 ≤ 入场再买，空单等买价 ≥ 入场再卖；现价已越过止盈则暂不开（记日志），等回到入场。' +
     '视觉上接在最后一档之后（档位号 +1，持仓笔数为末档终点 +1），不参与分批判定。' +
     '手数 0 表示触发时按当时持仓匹配「分档手数盈亏」反推；手改手数后按填写值开仓。' +
+    '可勾选「止盈联动清仓」：该手动单被券商止盈平掉后，节点平掉该信号其余持仓并收口。' +
     '顺势 / 逆势各只能配一条。保存后若任务已在跑，会立刻下发到节点。',
   manual_entry:
     '到价后按此价判定方向并市价开仓。止盈高于入场为多，低于入场为空。' +
@@ -209,6 +210,10 @@ const FIELD_HELP = {
     '0 = 节点触发时，用该魔术号当时已持有的手数去匹配分档手数盈亏，再按价差 × tick 反推。' +
     '只计已经开出的仓（首单、分批加仓、另一条规则已成交的手动单），不含本条尚未开出的手动分散仓。' +
     '手改后锁定，不再自动重算。',
+  manual_close_all_on_tp:
+    '勾选后，这条手动单被券商按止盈价平掉时，节点会平掉该信号（同魔术号）其余全部持仓并结束任务。' +
+    '离场原因以 MT5 成交历史为准：止损、人工或程序平仓不触发；成交历史晚到时以平仓侧现价到止盈兜底。' +
+    '节点离线期间被止盈的，重连后也会补做。默认关闭；不勾选则手动单止盈只影响它自己。',
   calc_type:
     '本档加仓间距怎么算：\n' +
     '点数 = 固定间距，偏离达到「点数 × Point()」触发；\n' +
@@ -378,6 +383,7 @@ function defaultManualScatter(): ManualScatterConfig {
     stop_loss: 0,
     volume: 0,
     volume_locked: false,
+    close_all_on_tp: false,
   }
 }
 
@@ -429,7 +435,6 @@ function cloneRules(rules: StrategyRule[]): EditableRule[] {
       assist_spacing: r.assist_spacing ?? 0,
       assist_max_loss: r.assist_max_loss ?? 0,
     }
-    migrateLegacyBatchLevels(cloned)
     return cloned
   })
 }
@@ -634,21 +639,6 @@ function syncBatchMetaFromLevels(r: EditableRule): void {
   if (!last) return
   const to = Math.max(1, Math.floor(Number(last.pos_to) || 1))
   r.total_lot_limit = to
-}
-
-/** 旧档位从第 2 笔起（含开仓）；打开表单时改成从第 1 次加仓起，总手数同步减 1。 */
-function migrateLegacyBatchLevels(r: EditableRule): void {
-  if (!r.batch_enabled || !r.batch_levels.length) return
-  const starts = r.batch_levels
-    .map((lv) => Math.floor(Number(lv.pos_from) || 0))
-    .filter((n) => n > 0)
-  if (!starts.length || Math.min(...starts) < 2) return
-  for (const lv of r.batch_levels) {
-    const from = Math.max(1, Math.floor(Number(lv.pos_from) || 1) - 1)
-    lv.pos_from = from
-    lv.pos_to = Math.max(from, Math.floor(Number(lv.pos_to) || from) - 1)
-  }
-  syncBatchMetaFromLevels(r)
 }
 
 function normalizeLevelRange(lv: StrategyBatchLevel): void {
@@ -2285,6 +2275,21 @@ function resetRuleToTemplate(idx: number): void {
                           @change="onManualVolumeInput(r)"
                         />
                       </div>
+                      <div class="field">
+                        <FormLabel
+                          :field-id="`rule-${idx}-ms-tp-link`"
+                          text="止盈联动"
+                          :help="FIELD_HELP.manual_close_all_on_tp"
+                        />
+                        <label class="manual-link-switch">
+                          <input
+                            :id="`rule-${idx}-ms-tp-link`"
+                            v-model="r.manual_scatter.close_all_on_tp"
+                            type="checkbox"
+                          />
+                          <span>止盈后清仓该信号</span>
+                        </label>
+                      </div>
                       <div class="batch-level-actions">
                         <button type="button" class="btn-sm btn-ghost" @click="clearManualScatter(r)">
                           删除
@@ -2402,6 +2407,21 @@ function resetRuleToTemplate(idx: number): void {
                         placeholder="0=自动"
                         @change="onManualVolumeInput(r)"
                       />
+                    </div>
+                    <div class="field">
+                      <FormLabel
+                        :field-id="`rule-${idx}-ms-tp-link`"
+                        text="止盈联动"
+                        :help="FIELD_HELP.manual_close_all_on_tp"
+                      />
+                      <label class="manual-link-switch">
+                        <input
+                          :id="`rule-${idx}-ms-tp-link`"
+                          v-model="r.manual_scatter.close_all_on_tp"
+                          type="checkbox"
+                        />
+                        <span>止盈后清仓该信号</span>
+                      </label>
                     </div>
                     <div class="batch-level-actions">
                       <button type="button" class="btn-sm btn-ghost" @click="clearManualScatter(r)">
@@ -2658,6 +2678,28 @@ function resetRuleToTemplate(idx: number): void {
   align-items: end;
 }
 
+/* 手动分散仓比普通档位多一列「止盈联动」 */
+.batch-level.is-manual {
+  grid-template-columns: 28px minmax(132px, 1.1fr) repeat(4, minmax(0, 1fr)) minmax(0, 1.2fr) auto;
+}
+
+.manual-link-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 34px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.batch-level .manual-link-switch input[type='checkbox'] {
+  width: auto;
+  margin: 0;
+}
+
 .batch-level-no {
   font-family: var(--mono);
   font-size: 12px;
@@ -2734,7 +2776,8 @@ function resetRuleToTemplate(idx: number): void {
     grid-template-columns: 1fr 1fr;
     max-width: none;
   }
-  .batch-level {
+  .batch-level,
+  .batch-level.is-manual {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .batch-level-no {
@@ -2765,7 +2808,8 @@ function resetRuleToTemplate(idx: number): void {
     grid-template-columns: 1fr;
     max-width: none;
   }
-  .batch-level {
+  .batch-level,
+  .batch-level.is-manual {
     grid-template-columns: 1fr 1fr;
   }
 }

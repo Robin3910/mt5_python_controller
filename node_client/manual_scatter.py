@@ -4,6 +4,9 @@
 到价是回踩/反弹到入场再市价开：BUY 等卖价 ≤ 入场，SELL 等买价 ≥ 入场。
 成交侧已越过止盈则不开。手数按当前任务总手数匹配 lot_pl_tiers 的
 pl_amount，再按 |tp-entry| / tick_size * tick_value 反推，向上取整到 volume_step。
+
+止盈联动清仓（close_all_on_tp）：跟踪在场手动仓，某一拍消失后查出场成交的
+DEAL_REASON；确认是止盈（历史未到时用平仓侧现价兜底）就平掉该魔术号其余持仓收口。
 """
 from __future__ import annotations
 
@@ -11,13 +14,41 @@ import math
 import re
 from typing import Any, Optional
 
+from close_reason import (
+    REASON_CLIENT,
+    REASON_EXPERT,
+    REASON_MOBILE,
+    REASON_SL,
+    REASON_SO,
+    REASON_TP,
+    REASON_WEB,
+)
+
 RULE_TYPE_COUNTER = 1
 RULE_TYPE_TREND = 2
 COMMENT_PREFIX = "M"
 # M1 / M2，可选后续字符；禁止与模版2 R3B 撞车
 _COMMENT_RE = re.compile(r"^M([12])(?:\b|$)")
 EVENT_TYPE = "add_manual"
+# 止盈联动清仓事件（库字段 VARCHAR(16)）
+TP_CLOSE_EVENT = "manual_tp_close"
 DETAIL_KIND = "manual_scatter"
+# 手动仓消失后成交历史还没写进来：最多再等几拍再放弃判定
+EXIT_RESOLVE_ATTEMPTS = 3
+# 查出场成交的时间窗往前多留的秒数：持仓 time 是券商钟面，与本机可能差几个小时
+EXIT_LOOKUP_MARGIN_SEC = 12 * 3600
+
+EXIT_TP = "tp"
+EXIT_OTHER = "other"
+_EXIT_LABELS = {
+    REASON_SL: "止损",
+    REASON_TP: "止盈",
+    REASON_SO: "强制平仓",
+    REASON_EXPERT: "程序平仓",
+    REASON_CLIENT: "人工平仓",
+    REASON_MOBILE: "人工平仓",
+    REASON_WEB: "人工平仓",
+}
 
 
 def _as_int(value: object, default: int = 0) -> int:
@@ -42,6 +73,7 @@ def default_config() -> dict[str, Any]:
         "stop_loss": 0.0,
         "volume": 0.0,
         "volume_locked": False,
+        "close_all_on_tp": False,
     }
 
 
@@ -55,6 +87,7 @@ def normalize(raw: object) -> dict[str, Any]:
         "stop_loss": max(0.0, _as_float(src.get("stop_loss"), defaults["stop_loss"])),
         "volume": max(0.0, _as_float(src.get("volume"), defaults["volume"])),
         "volume_locked": bool(src.get("volume_locked", defaults["volume_locked"])),
+        "close_all_on_tp": bool(src.get("close_all_on_tp", defaults["close_all_on_tp"])),
     }
 
 
@@ -279,6 +312,202 @@ def extract_watches(rules: object) -> list[dict[str, Any]]:
     return out
 
 
+# ----------------------------------------------------------------------
+# 止盈联动清仓：在场跟踪 → 消失 → 判离场原因
+# ----------------------------------------------------------------------
+def linkage_rule_types(rules: object) -> set[int]:
+    """启用了「止盈联动清仓」的规则类型；规则关闭或手动仓关闭的不算。"""
+    return {
+        int(w["rule_type"]) for w in extract_watches(rules)
+        if bool((w.get("cfg") or {}).get("close_all_on_tp"))
+    }
+
+
+def _snapshot_from_position(pos: dict) -> dict[str, Any]:
+    return {
+        "ticket": _as_int(pos.get("ticket")),
+        "type": str(pos.get("type") or "").strip().upper(),
+        "volume": _as_float(pos.get("volume")),
+        "tp": _as_float(pos.get("tp")),
+        "price_open": _as_float(pos.get("price_open")),
+        "time": _as_float(pos.get("time")),
+    }
+
+
+def snapshot_open(positions: list | tuple | None) -> dict[int, dict[str, Any]]:
+    """当前在场的手动分散仓，按规则类型索引（每种规则至多一条）。"""
+    out: dict[int, dict[str, Any]] = {}
+    for p in positions or []:
+        if not isinstance(p, dict):
+            continue
+        rt = parse_rule_type(p.get("comment"))
+        if rt is None:
+            continue
+        out[rt] = _snapshot_from_position(p)
+    return out
+
+
+def snapshot_from_order(
+    rule_type: int, direction: str, volume: float, *, ticket: object,
+    take_profit: float, price: float, opened_at: float,
+) -> dict[str, Any]:
+    """刚下完单、还没等到下一拍持仓快照时先登记一条，让随事件落库的 runtime 带上票号。"""
+    return {
+        "ticket": _as_int(ticket),
+        "type": str(direction or "").strip().upper(),
+        "volume": _as_float(volume),
+        "tp": _as_float(take_profit),
+        "price_open": _as_float(price),
+        "time": _as_float(opened_at),
+    }
+
+
+def gone_manual(
+    tracked: dict[int, dict] | None, current: dict[int, dict] | None,
+) -> dict[int, dict[str, Any]]:
+    """上一拍在、这一拍不在的手动仓。同规则只会有一条，按规则类型比对即可。"""
+    now = current or {}
+    return {
+        int(rt): dict(snap) for rt, snap in (tracked or {}).items()
+        if int(rt) not in now and isinstance(snap, dict)
+    }
+
+
+def runtime_open_payload(tracked: dict[int, dict] | None) -> dict[str, dict[str, Any]]:
+    """写进 runtime 的在场手动仓；键转字串以便 JSON 落库。"""
+    out: dict[str, dict[str, Any]] = {}
+    for rt, snap in (tracked or {}).items():
+        if not isinstance(snap, dict):
+            continue
+        out[str(int(rt))] = {
+            "ticket": _as_int(snap.get("ticket")),
+            "type": str(snap.get("type") or ""),
+            "volume": _as_float(snap.get("volume")),
+            "tp": _as_float(snap.get("tp")),
+            "price_open": _as_float(snap.get("price_open")),
+            "time": _as_float(snap.get("time")),
+        }
+    return out
+
+
+def parse_runtime_open(raw: object) -> dict[int, dict[str, Any]]:
+    """从服务端落库的 runtime 还原在场手动仓；脏数据一律丢弃。"""
+    out: dict[int, dict[str, Any]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for key, snap in raw.items():
+        rt = _as_int(key, -1)
+        if rt not in (RULE_TYPE_COUNTER, RULE_TYPE_TREND) or not isinstance(snap, dict):
+            continue
+        parsed = _snapshot_from_position(snap)
+        if parsed["ticket"] <= 0:
+            continue
+        out[rt] = parsed
+    return out
+
+
+def exit_lookup_since(snap: dict, started_at: float) -> float:
+    """查出场成交的起点：取开仓时间与任务启动时间较早者，再往前留钟面偏移余量。
+
+    窗口偏早只是多扫几条（已按魔术号过滤）；偏晚会漏掉成交、误判成非止盈。
+    """
+    opened = _as_float(snap.get("time"))
+    started = _as_float(started_at)
+    candidates = [t for t in (opened, started) if t > 0]
+    base = min(candidates) if candidates else 0.0
+    return max(1.0, base - EXIT_LOOKUP_MARGIN_SEC) if base > 0 else 0.0
+
+
+def deal_exit_reason(deals: list | tuple | None, ticket: object) -> Optional[int]:
+    """出场成交里找该持仓（position_id）的 DEAL_REASON；找不到返回 None。
+
+    分批出场会有多笔，任一笔是止盈即按止盈算。
+    """
+    target = _as_int(ticket)
+    if target <= 0:
+        return None
+    found: list[int] = []
+    for d in deals or []:
+        if not isinstance(d, dict):
+            continue
+        if _as_int(d.get("position_id")) != target:
+            continue
+        found.append(_as_int(d.get("reason"), -1))
+    if not found:
+        return None
+    return REASON_TP if REASON_TP in found else found[-1]
+
+
+def close_side_price(
+    direction: str, *, bid: float = 0.0, ask: float = 0.0, fallback: float = 0.0,
+) -> float:
+    """平仓侧报价：BUY=bid，SELL=ask——券商正是按这一侧触发止盈。"""
+    side = str(direction or "").strip().upper()
+    if side == "BUY":
+        return bid if bid > 0 else fallback
+    if side == "SELL":
+        return ask if ask > 0 else fallback
+    return fallback
+
+
+def resolve_exit(
+    snap: dict, deals: list | tuple | None, *,
+    bid: float = 0.0, ask: float = 0.0, fallback: float = 0.0,
+) -> Optional[dict[str, Any]]:
+    """判定已消失手动仓的离场原因。
+
+    返回 {"exit": tp|other, "reason": DEAL_REASON 或 None, "source": deal|price}；
+    成交历史里还没有、且平仓侧现价也没到止盈时返回 None（调用方下一拍再试）。
+    """
+    reason = deal_exit_reason(deals, snap.get("ticket"))
+    if reason is not None:
+        return {
+            "exit": EXIT_TP if reason == REASON_TP else EXIT_OTHER,
+            "reason": reason,
+            "source": "deal",
+        }
+    direction = str(snap.get("type") or "")
+    price = close_side_price(direction, bid=bid, ask=ask, fallback=fallback)
+    if tp_passed(direction, price, _as_float(snap.get("tp"))):
+        return {"exit": EXIT_TP, "reason": None, "source": "price"}
+    return None
+
+
+def exit_label(reason: Optional[int]) -> str:
+    if reason is None:
+        return "未知"
+    return _EXIT_LABELS.get(int(reason), f"原因 {int(reason)}")
+
+
+def describe_tp_close(rule_type: int, snap: dict, *, remaining: int) -> str:
+    label = "逆势" if int(rule_type or 0) == RULE_TYPE_COUNTER else "顺势"
+    side = str(snap.get("type") or "").upper() or "?"
+    return (
+        f"手动分散仓（{label}）止盈离场，联动清仓："
+        f"{side} {_trim(snap.get('volume'))} 手 #{_as_int(snap.get('ticket'))}"
+        f" 止盈 {_trim(snap.get('tp'))}；平掉该信号其余 {int(remaining)} 笔持仓"
+    )
+
+
+def tp_close_detail(
+    rule_type: int, snap: dict, *, remaining: int, source: str,
+) -> dict[str, Any]:
+    return {
+        "kind": DETAIL_KIND,
+        "rule_type": int(rule_type or 0),
+        "direction": str(snap.get("type") or "").upper() or None,
+        "ticket": _as_int(snap.get("ticket")) or None,
+        "volume": _as_float(snap.get("volume")),
+        "entry_price": _as_float(snap.get("price_open")) or None,
+        "take_profit": _as_float(snap.get("tp")) or None,
+        "exit_reason": EXIT_TP,
+        "exit_source": str(source or ""),
+        "linked_close": True,
+        "remaining": int(remaining),
+        "comment": comment_for(rule_type),
+    }
+
+
 def _trim(value: object, digits: int = 4) -> str:
     try:
         num = float(value)  # type: ignore[arg-type]
@@ -343,6 +572,8 @@ def describe_open(
     ]
     sl = _as_float(cfg.get("stop_loss"))
     bits.append(f"止损 {_trim(sl) if sl else '不设'}")
+    if bool(cfg.get("close_all_on_tp")):
+        bits.append("止盈离场后联动清仓")
     return "；".join(bits)
 
 

@@ -305,7 +305,7 @@ async def test_atr_level_prefetches_metric_and_adds():
     strategy = {"rules": [counter_rule(
         batch_enabled=True, batch_count=1, total_lot_limit=10,
         batch_levels=[{
-            "pos_from": 2, "pos_to": 10, "calc_type": "atr", "timeframe": "M5",
+            "pos_from": 1, "pos_to": 10, "calc_type": "atr", "timeframe": "M5",
             "lot_times": 1.0, "extra_lot": 0.0,
         }],
     )]}

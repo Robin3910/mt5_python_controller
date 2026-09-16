@@ -1038,7 +1038,8 @@ class MT5Client:
     def exit_deals_by_magic(self, magic: int, since_ts: float | None = None) -> list[dict]:
         """某魔术号在时间窗内的出场成交，供收口时区分止损 / 止盈 / 人工等。
 
-        每项含 entry / reason / profit / volume / price / ticket；只返回出场类 entry。
+        每项含 entry / reason / profit / volume / price / ticket / position_id；只返回出场类 entry。
+        position_id 是该成交所属持仓的票号，供按单笔持仓核对离场原因。
         """
         # DEAL_ENTRY_*：包不可用时回退到文档常量
         entry_out = getattr(mt5, "DEAL_ENTRY_OUT", 1) if mt5 else 1
@@ -1057,6 +1058,7 @@ class MT5Client:
                 continue
             out.append({
                 "ticket": int(getattr(d, "ticket", 0) or 0),
+                "position_id": int(getattr(d, "position_id", 0) or 0),
                 "entry": entry,
                 "reason": int(getattr(d, "reason", -1) if getattr(d, "reason", None) is not None else -1),
                 "volume": float(getattr(d, "volume", 0) or 0),

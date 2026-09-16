@@ -248,6 +248,7 @@ class MockMT5Client:
         """记下出场成交；reason 对齐 MT5 DEAL_REASON（4=SL / 5=TP / 3=EXPERT…）。"""
         self._exit_deals.append({
             "ticket": int(pos.get("ticket") or 0),
+            "position_id": int(pos.get("ticket") or 0),
             "magic": int(pos.get("magic") or self.magic),
             "entry": 1,  # DEAL_ENTRY_OUT
             "reason": int(reason),
@@ -304,6 +305,20 @@ class MockMT5Client:
             "cancelled": cancelled,
             "profit": round(profit, 2),
         }
+
+    def close_ticket_with_reason(self, ticket: int, reason: int = 5) -> bool:
+        """测试用：按 DEAL_REASON 平掉单笔持仓（默认 5=止盈），模拟终端自动兑现。"""
+        target = int(ticket)
+        pos = next((p for p in self._positions if int(p.get("ticket") or 0) == target), None)
+        if pos is None:
+            return False
+        pl = float(pos.get("profit") or 0.0)
+        magic = int(pos.get("magic") or self.magic)
+        self._record_exit(pos, reason=reason, profit=pl)
+        self._positions = [p for p in self._positions if int(p.get("ticket") or 0) != target]
+        self._realized_by_magic[magic] = self._realized_by_magic.get(magic, 0.0) + pl
+        self.balance += pl
+        return True
 
     def clear_by_magic_with_reason(self, magic: int, reason: int = 4) -> int:
         """测试用：按 DEAL_REASON 清空持仓（默认 4=止损），模拟终端自动打掉。"""

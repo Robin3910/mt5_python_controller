@@ -223,6 +223,12 @@ class StrategyRunner:
                     self._manual_fired.add(int(item))
                 except (TypeError, ValueError):
                     continue
+        # 止盈联动清仓：在场手动仓快照（重连从 runtime 还原，离线期间止盈也能补判）
+        self._manual_open: dict[int, dict] = manual_scatter.parse_runtime_open(
+            self._resume_runtime.get("manual_open"),
+        )
+        # 已消失、离场原因待确认的手动仓：成交历史可能晚一拍才写进来
+        self._manual_gone: dict[int, dict] = {}
 
     def _template_mode_reject(self) -> Optional[str]:
         """模版与快照规则对不上时的拒绝原因；一致或未知模版返回 None。"""
@@ -437,6 +443,9 @@ class StrategyRunner:
             if await self._risk_advance(event, positions):
                 return False
         else:
+            linked = await self._manual_tp_linkage(event, positions)
+            if linked is not None:
+                return linked == "done"
             pl_result = await self._signal_pl_advance(positions)
             if pl_result == "done":
                 return True
@@ -808,6 +817,14 @@ class StrategyRunner:
             return False
         self._manual_fired.add(int(watch.get("rule_type") or 0))
         self.total_volume = round(self.total_volume + volume, 4)
+        # 先按下单回报登记在场快照：随 add_manual 落库的 runtime 才带得上票号，
+        # 下一拍持仓快照会用真实持仓覆盖
+        self._manual_open[int(watch.get("rule_type") or 0)] = manual_scatter.snapshot_from_order(
+            int(watch.get("rule_type") or 0), direction, volume,
+            ticket=res.get("order") or res.get("ticket"),
+            take_profit=tp, price=_as_float(res.get("price")) or fill_price,
+            opened_at=time.time(),
+        )
         volume_step = _as_float(spec.get("volume_step"), 0.01)
         target_pl = None if bool(cfg.get("volume_locked") and _as_float(cfg.get("volume")) > 0) else (
             manual_scatter.match_target_pl(watch.get("lot_pl_tiers"), current)
@@ -849,9 +866,98 @@ class StrategyRunner:
         return raw
 
     def _manual_runtime_payload(self) -> Optional[dict]:
-        if not self._manual_fired:
+        payload: dict = {}
+        if self._manual_fired:
+            payload["manual_fired"] = sorted(self._manual_fired)
+        if self._manual_open:
+            payload["manual_open"] = manual_scatter.runtime_open_payload(self._manual_open)
+        return payload or None
+
+    async def _manual_tp_linkage(
+        self, event: MarketEvent, positions: list[dict],
+    ) -> Optional[str]:
+        """跟踪手动分散仓离场；止盈离场且该规则开了联动，就清掉该信号其余持仓。
+
+        返回 done=已清干净并收口；hit=已发起清仓但未确认干净（主循环续平，本拍不再交易）；
+        None=无动作。离场原因以出场成交 DEAL_REASON 为准，成交历史还没写进来时用
+        平仓侧现价兜底，仍判不出就下一拍再看，最多等 EXIT_RESOLVE_ATTEMPTS 拍。
+        """
+        current = manual_scatter.snapshot_open(positions)
+        gone = manual_scatter.gone_manual(self._manual_open, current)
+        # 在场的以真实持仓为准；仍在跟踪但本拍没出现的挪到待确认。
+        # 刚下单那拍的持仓采样可能还没包含新仓，下一拍它又出现了：撤回待确认
+        self._manual_open = current
+        for rule_type in current:
+            self._manual_gone.pop(rule_type, None)
+        for rule_type, snap in gone.items():
+            self._manual_gone[rule_type] = {**snap, "attempts": 0}
+        if not self._manual_gone:
             return None
-        return {"manual_fired": sorted(self._manual_fired)}
+        linked = manual_scatter.linkage_rule_types(self.strategy.get("rules"))
+        for rule_type in list(self._manual_gone):
+            pending = self._manual_gone[rule_type]
+            if rule_type not in linked:
+                logger.debug(
+                    "task %s manual scatter M%s left without tp linkage configured",
+                    self.task_id, rule_type,
+                )
+                self._manual_gone.pop(rule_type, None)
+                continue
+            deals = await self._manual_exit_deals(pending)
+            verdict = manual_scatter.resolve_exit(
+                pending, deals,
+                bid=_as_float(event.bid), ask=_as_float(event.ask),
+                fallback=_as_float(event.price),
+            )
+            if verdict is None:
+                pending["attempts"] = int(pending.get("attempts") or 0) + 1
+                if pending["attempts"] >= manual_scatter.EXIT_RESOLVE_ATTEMPTS:
+                    logger.info(
+                        "task %s manual scatter M%s #%s exit reason unresolved after %s ticks, skip linkage",
+                        self.task_id, rule_type, pending.get("ticket"), pending["attempts"],
+                    )
+                    self._manual_gone.pop(rule_type, None)
+                continue
+            self._manual_gone.pop(rule_type, None)
+            if verdict.get("exit") != manual_scatter.EXIT_TP:
+                logger.info(
+                    "task %s manual scatter M%s #%s closed by %s, no linkage",
+                    self.task_id, rule_type, pending.get("ticket"),
+                    manual_scatter.exit_label(verdict.get("reason")),
+                )
+                continue
+            return await self._manual_linked_close(
+                rule_type, pending, positions, source=str(verdict.get("source") or ""),
+            )
+        return None
+
+    async def _manual_exit_deals(self, snap: dict) -> list[dict]:
+        """读该魔术号出场成交，用于核对某笔手动仓的离场原因；读不到当作空。"""
+        if not hasattr(self._mt5, "exit_deals_by_magic"):
+            return []
+        since = manual_scatter.exit_lookup_since(snap, self._started_at)
+        try:
+            deals = await self._exec(self._mt5.exit_deals_by_magic, self.magic, since or None)
+        except Exception:  # noqa: BLE001
+            logger.debug("task %s exit_deals_by_magic failed", self.task_id, exc_info=True)
+            return []
+        return list(deals or [])
+
+    async def _manual_linked_close(
+        self, rule_type: int, snap: dict, positions: list[dict], *, source: str,
+    ) -> str:
+        remaining = len(positions)
+        reason = manual_scatter.describe_tp_close(rule_type, snap, remaining=remaining)
+        detail = manual_scatter.tp_close_detail(
+            rule_type, snap, remaining=remaining, source=source,
+        )
+        logger.info("task %s %s", self.task_id, reason)
+        self.request_stop(reason, detail=detail)
+        await self._emit_progress(
+            manual_scatter.TP_CLOSE_EVENT, phase="closing", positions=positions,
+            message=reason, detail=detail,
+        )
+        return "done" if await self._close_all() else "hit"
 
     # ------------------------------------------------------------------
     # 以损定量路径（模版2）

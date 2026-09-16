@@ -422,6 +422,10 @@ class ManualScatterConfig(BaseModel):
     stop_loss: float = Field(default=0.0, ge=0, description="止损价，0=不设")
     volume: float = Field(default=0.0, ge=0, description="手数；0 且未锁定时由节点按分档手数盈亏反推")
     volume_locked: bool = Field(default=False, description="用户手改手数后不再自动重算")
+    close_all_on_tp: bool = Field(
+        default=False,
+        description="止盈联动清仓：该手动单被券商止盈平掉后，节点平掉该信号其余持仓并收口",
+    )
 
 
 class StrategyRule(BaseModel):

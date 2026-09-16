@@ -494,6 +494,8 @@ export interface ManualScatterConfig {
   stop_loss: number
   volume: number
   volume_locked: boolean
+  /** 止盈联动清仓：该手动单被券商止盈平掉后，节点平掉该信号其余持仓并收口 */
+  close_all_on_tp: boolean
 }
 
 /** 以损定量的补仓方向（历史字段，模版2 已改为分散仓市价） */
@@ -754,7 +756,7 @@ export interface GroupTaskEventRecord {
   magic: number | null
   created_at: number | null
   /**
-   * open / add_counter / add_trend / add_manual / grid_add / grid_shift /
+   * open / add_counter / add_trend / add_manual / manual_tp_close / grid_add / grid_shift /
    * close_partial / close_all / error / resume
    */
   event_type: string
@@ -828,6 +830,12 @@ export interface GroupTaskEventDetail {
   volume_locked?: boolean
   volume_step?: number
   comment?: string
+  close_all_on_tp?: boolean
+  /** 止盈联动清仓事件：离场原因 / 判定来源（deal=成交历史，price=平仓侧现价兜底）/ 联动前剩余持仓 */
+  exit_reason?: string
+  exit_source?: string
+  linked_close?: boolean
+  remaining?: number
   signal_comment?: string | null
   strategy_id?: string
   strategy_name?: string
