@@ -460,17 +460,20 @@ def _m2(ticket: int = 1001, **over) -> dict:
     return snap
 
 
-def test_normalize_close_all_on_tp_defaults_false_and_round_trips():
-    assert ms.normalize({})["close_all_on_tp"] is False
-    assert ms.normalize(_cfg())["close_all_on_tp"] is False
-    assert ms.normalize(_cfg(close_all_on_tp=True))["close_all_on_tp"] is True
+def test_normalize_close_all_on_tp_defaults_on_and_round_trips():
+    """默认开启；旧快照缺字段同样按开启；显式 False 保留。"""
+    assert ms.default_config()["close_all_on_tp"] is True
+    assert ms.normalize({})["close_all_on_tp"] is True
+    assert ms.normalize(_cfg())["close_all_on_tp"] is True
+    assert ms.normalize(_cfg(close_all_on_tp=False))["close_all_on_tp"] is False
+    assert ms.normalize(_cfg(close_all_on_tp=0))["close_all_on_tp"] is False
     assert ms.normalize(_cfg(close_all_on_tp="yes"))["close_all_on_tp"] is True
 
 
 def test_linkage_rule_types_requires_rule_and_flag_enabled():
     rules = [
         {"type": 1, "status": 0, "manual_scatter": _cfg(close_all_on_tp=True)},
-        {"type": 2, "status": 1, "manual_scatter": _cfg(close_all_on_tp=True)},
+        {"type": 2, "status": 1, "manual_scatter": _cfg()},  # 缺字段 → 默认联动
     ]
     assert ms.linkage_rule_types(rules) == {2}
     rules[1]["manual_scatter"]["close_all_on_tp"] = False

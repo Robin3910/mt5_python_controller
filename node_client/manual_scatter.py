@@ -73,7 +73,8 @@ def default_config() -> dict[str, Any]:
         "stop_loss": 0.0,
         "volume": 0.0,
         "volume_locked": False,
-        "close_all_on_tp": False,
+        # 默认开启；旧快照缺字段也按开启处理，与后端 default_manual_scatter 一致
+        "close_all_on_tp": True,
     }
 
 

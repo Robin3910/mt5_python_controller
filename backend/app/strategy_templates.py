@@ -156,7 +156,8 @@ def default_manual_scatter() -> dict[str, Any]:
         "stop_loss": 0.0,
         "volume": 0.0,
         "volume_locked": False,
-        "close_all_on_tp": False,
+        # 止盈联动清仓默认开启；缺字段的旧配置规范化后同样按开启处理
+        "close_all_on_tp": True,
     }
 
 

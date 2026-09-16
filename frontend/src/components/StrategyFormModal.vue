@@ -1,9 +1,8 @@
 <script setup lang="ts">
 // 策略新建 / 编辑弹窗：表单逻辑、校验与提交
 import { computed, reactive, ref, watch } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
-import 'element-plus/es/components/message-box/style/css'
 import FormLabel from '@/components/FormLabel.vue'
 import { useHubStore } from '@/stores/hub'
 import type {
@@ -199,7 +198,7 @@ const FIELD_HELP = {
     '多单等卖价 ≤ 入场再买，空单等买价 ≥ 入场再卖；现价已越过止盈则暂不开（记日志），等回到入场。' +
     '视觉上接在最后一档之后（档位号 +1，持仓笔数为末档终点 +1），不参与分批判定。' +
     '手数 0 表示触发时按当时持仓匹配「分档手数盈亏」反推；手改手数后按填写值开仓。' +
-    '可勾选「止盈联动清仓」：该手动单被券商止盈平掉后，节点平掉该信号其余持仓并收口。' +
+    '「止盈联动清仓」默认勾选：该手动单被券商止盈平掉后，节点平掉该信号其余持仓并收口；取消勾选则只影响它自己。' +
     '顺势 / 逆势各只能配一条。保存后若任务已在跑，会立刻下发到节点。',
   manual_entry:
     '到价后按此价判定方向并市价开仓。止盈高于入场为多，低于入场为空。' +
@@ -213,7 +212,7 @@ const FIELD_HELP = {
   manual_close_all_on_tp:
     '勾选后，这条手动单被券商按止盈价平掉时，节点会平掉该信号（同魔术号）其余全部持仓并结束任务。' +
     '离场原因以 MT5 成交历史为准：止损、人工或程序平仓不触发；成交历史晚到时以平仓侧现价到止盈兜底。' +
-    '节点离线期间被止盈的，重连后也会补做。默认关闭；不勾选则手动单止盈只影响它自己。',
+    '节点离线期间被止盈的，重连后也会补做。默认勾选；取消勾选则手动单止盈只影响它自己。',
   calc_type:
     '本档加仓间距怎么算：\n' +
     '点数 = 固定间距，偏离达到「点数 × Point()」触发；\n' +
@@ -383,7 +382,7 @@ function defaultManualScatter(): ManualScatterConfig {
     stop_loss: 0,
     volume: 0,
     volume_locked: false,
-    close_all_on_tp: false,
+    close_all_on_tp: true,
   }
 }
 
@@ -1258,30 +1257,35 @@ function formatSaveError(e: unknown, fallback: string): string {
   return fallback
 }
 
+function showSaveError(msg: string, type: 'warning' | 'error' = 'warning'): void {
+  formError.value = msg
+  ElMessage({ type, message: msg, showClose: true, duration: 5000 })
+}
+
 async function save(): Promise<void> {
   if (!form.template_id) {
-    formError.value = '请选择策略模版'
+    showSaveError('请选择策略模版')
     return
   }
   const name = form.name.trim()
   if (!name) {
-    formError.value = '请填写策略名称'
+    showSaveError('请填写策略名称')
     return
   }
   const symbol = form.symbol.trim().toUpperCase()
   if (!symbol) {
-    formError.value = '请填写绑定品种'
+    showSaveError('请填写绑定品种')
     return
   }
   const rulesErr = validateRules(form.rules)
   if (rulesErr) {
-    formError.value = rulesErr
+    showSaveError(rulesErr)
     return
   }
   if (isTpl1.value) {
     const plErr = validateSignalPl(signalPl)
     if (plErr) {
-      formError.value = plErr
+      showSaveError(plErr)
       return
     }
   }
@@ -1320,11 +1324,7 @@ async function save(): Promise<void> {
         )
       }
     } catch (e: unknown) {
-      formError.value = formatSaveError(e, `${actionLabel}失败，请稍后重试`)
-      await ElMessageBox.alert(formError.value, '无法保存', {
-        type: 'warning',
-        confirmButtonText: '知道了',
-      })
+      showSaveError(formatSaveError(e, `${actionLabel}失败，请稍后重试`), 'error')
       return
     }
     emit('saved')
