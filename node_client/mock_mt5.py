@@ -340,6 +340,27 @@ class MockMT5Client:
         """与真实 MT5Client 同口径：返回该魔术号累计已实现盈亏。"""
         return round(float(self._realized_by_magic.get(int(magic), 0.0)), 2)
 
+    def realized_profit_by_position(
+        self, magic: int, since_ts: float | None = None,
+    ) -> dict[int, float]:
+        """与真实 MT5Client 同口径：按持仓票号汇总已实现盈亏。"""
+        del since_ts
+        target = int(magic)
+        out: dict[int, float] = {}
+        for d in self._exit_deals:
+            if int(d.get("magic") or 0) != target:
+                continue
+            pos_id = int(d.get("position_id") or 0)
+            if pos_id <= 0:
+                continue
+            pl = (
+                float(d.get("profit") or 0)
+                + float(d.get("swap") or 0)
+                + float(d.get("commission") or 0)
+            )
+            out[pos_id] = round(out.get(pos_id, 0.0) + pl, 2)
+        return out
+
     def exit_deals_by_magic(self, magic: int, since_ts: float | None = None) -> list[dict]:
         """与真实 MT5Client 同口径：返回该魔术号出场成交。"""
         del since_ts  # mock 不按时间窗裁剪

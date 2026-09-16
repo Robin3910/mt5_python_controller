@@ -267,6 +267,57 @@ function reconstructManualScatterFormula(detail: GroupTaskEventDetail): string {
   return ''
 }
 
+function roundProfit(n: number): number {
+  return Math.round(n * 100) / 100
+}
+
+/** 仍在场的关联订单用账户快照浮盈；无票号 / 已平仓保持事件落库快照。 */
+function liveTicketProfit(
+  nodeId: string,
+  ticket: number | null | undefined,
+  magic?: number | null,
+): number | null {
+  if (ticket == null) return null
+  const positions = hub.accounts[nodeId]?.positions
+  if (!positions?.length) return null
+  const want = Number(ticket)
+  const wantMagic = magic == null ? null : Number(magic)
+  const pos = positions.find((p) => {
+    if (Number(p.ticket) !== want) return false
+    if (wantMagic != null && p.magic != null && Number(p.magic) !== 0 && Number(p.magic) !== wantMagic) {
+      return false
+    }
+    return true
+  })
+  if (!pos) return null
+  const n = Number(pos.profit)
+  return Number.isFinite(n) ? roundProfit(n) : null
+}
+
+function eventHasTicket(ev: GroupTaskEventRecord): boolean {
+  return ev.order_ticket != null
+}
+
+function eventStatDisplay(ev: GroupTaskEventRecord, value: number | null | undefined): string {
+  if (!eventHasTicket(ev) && ev.event_type !== 'close_all') return '—'
+  if (value == null) return '—'
+  return String(value)
+}
+
+function eventProfitDisplay(
+  ev: GroupTaskEventRecord,
+  nodeId: string,
+  magic?: number | null,
+): string {
+  if (!eventHasTicket(ev)) {
+    if (ev.event_type === 'close_all' && ev.profit != null) return String(ev.profit)
+    return '—'
+  }
+  const n = liveTicketProfit(nodeId, ev.order_ticket, magic) ?? ev.profit
+  if (n == null) return '—'
+  return String(n)
+}
+
 function eventReason(ev: GroupTaskEventRecord): string {
   const msg = (ev.message || '').trim()
   const d = ev.detail
@@ -915,9 +966,9 @@ onUnmounted(stopAutoRefresh)
                                         <td class="right">{{ ev.volume ?? '—' }}</td>
                                         <td class="right">{{ ev.price ?? '—' }}</td>
                                         <td>{{ ev.order_ticket ?? '—' }}</td>
-                                        <td class="right">{{ ev.position_count ?? '—' }}</td>
-                                        <td class="right">{{ ev.total_volume ?? '—' }}</td>
-                                        <td class="right">{{ ev.profit ?? '—' }}</td>
+                                        <td class="right">{{ eventStatDisplay(ev, ev.position_count) }}</td>
+                                        <td class="right">{{ eventStatDisplay(ev, ev.total_volume) }}</td>
+                                        <td class="right">{{ eventProfitDisplay(ev, d.node_id, d.magic) }}</td>
                                         <td class="muted group-break">{{ eventReason(ev) }}</td>
                                       </tr>
                                       <tr v-if="ev.detail && isEventExpanded(d.id, ev)" class="detail-row">

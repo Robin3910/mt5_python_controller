@@ -236,6 +236,15 @@ async def group_dispatch_events(
     items = await group_persist.list_dispatch_events(group_id, dispatch_id)
     if items is None:
         raise HTTPException(status_code=404, detail="dispatch not found")
+    if items:
+        node_id = items[0].get("node_id")
+        magic = items[0].get("magic")
+        acct = await store.get_account(str(node_id)) if node_id else None
+        items = group_rules.overlay_live_event_profits(
+            items,
+            (acct or {}).get("positions") or [],
+            int(magic) if magic is not None else None,
+        )
     return items
 
 

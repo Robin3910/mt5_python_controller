@@ -954,6 +954,141 @@ def test_dispatch_events_related_orders(client):
     assert client.get("/api/groups/grp_missing/dispatches/1/events", headers=h).status_code == 404
 
 
+def test_dispatch_event_profit_overlays_live_position(client):
+    """关联订单盈亏：仍在场票号读取账户快照浮盈，无票号事件保持落库快照。"""
+    h = auth_headers(client)
+    token = _node_token(client, h)
+    n1 = _mk_node(client, h, 5252, "浮盈节点")
+    gid = _mk_group(client, h, name="浮盈覆盖组", node_ids=[n1])["group_id"]
+
+    with client.websocket_connect("/ws/node") as ws1:
+        ws1.send_json({"type": "auth", "data": {"token": token, "mt5_login": 5252}})
+        assert ws1.receive_json()["type"] == "auth_ok"
+
+        client.post("/webhook", json={
+            "action": "buy", "symbol": "XAUUSD", "volume": 0.1, "model": "strategy",
+        })
+        start = ws1.receive_json()
+        assert start["cmd"] == "strategy_start"
+        did = start["dispatch_id"]
+        magic = start["magic"]
+
+        ws1.send_json({"type": "strategy_progress", "data": {
+            "task_id": start["task_id"], "dispatch_id": did, "magic": magic,
+            "event": "open", "symbol": "XAUUSD", "action": "BUY",
+            "phase": "running", "position_count": 1, "add_count": 0,
+            "total_orders": 1, "total_volume": 0.1, "profit": 0.0,
+            "last_order": {"ticket": 1936505848, "price": 4346.67, "volume": 0.1},
+        }})
+        ws1.send_json({"type": "strategy_progress", "data": {
+            "task_id": start["task_id"], "dispatch_id": did, "magic": magic,
+            "event": "error", "symbol": "XAUUSD", "action": "BUY",
+            "phase": "running", "position_count": 1, "add_count": 0,
+            "total_orders": 1, "total_volume": 0.1, "profit": -1.9,
+            "message": "手动分散仓越过止盈，暂不开仓",
+        }})
+
+        opened = skipped = None
+        for _ in range(40):
+            frozen = client.get(f"/api/groups/{gid}/dispatches/{did}/events", headers=h)
+            if frozen.status_code == 200:
+                items = frozen.json()
+                opened = next((e for e in items if e["event_type"] == "open"), None)
+                skipped = next((e for e in items if e["event_type"] == "error"), None)
+                if opened and skipped:
+                    break
+            time.sleep(0.05)
+        assert opened is not None and skipped is not None
+        assert opened["profit"] == 0.0
+        assert skipped["order_ticket"] is None
+        assert skipped["profit"] is None
+        assert skipped["position_count"] is None
+        assert skipped["total_volume"] is None
+
+        ws1.send_json({"type": "account", "data": {
+            "account": {"login": 5252, "balance": 1000, "equity": 994.75},
+            "positions": [{
+                "ticket": 1936505848, "symbol": "XAUUSD", "type": "BUY",
+                "volume": 0.1, "magic": magic, "profit": -5.25,
+            }],
+            "orders": [],
+            "quotes": {},
+            "prices": {},
+            "books_ok": True,
+        }})
+
+        live_open = None
+        live_skip = None
+        for _ in range(40):
+            live = client.get(f"/api/groups/{gid}/dispatches/{did}/events", headers=h)
+            if live.status_code == 200:
+                items = live.json()
+                live_open = next((e for e in items if e["event_type"] == "open"), None)
+                live_skip = next((e for e in items if e["event_type"] == "error"), None)
+                if live_open and live_open.get("profit") == -5.25:
+                    break
+            time.sleep(0.05)
+        assert live_open is not None and live_skip is not None
+        assert live_open["profit"] == -5.25
+        assert live_skip["profit"] is None
+        assert live_skip["order_ticket"] is None
+
+
+def test_dispatch_event_profit_persists_after_finish(client):
+    """信号收口后，关联订单盈亏保留各票号已实现值，不再回到开仓时的 0。"""
+    h = auth_headers(client)
+    token = _node_token(client, h)
+    n1 = _mk_node(client, h, 5253, "收口盈亏节点")
+    gid = _mk_group(client, h, name="收口盈亏组", node_ids=[n1])["group_id"]
+
+    with client.websocket_connect("/ws/node") as ws1:
+        ws1.send_json({"type": "auth", "data": {"token": token, "mt5_login": 5253}})
+        assert ws1.receive_json()["type"] == "auth_ok"
+
+        client.post("/webhook", json={
+            "action": "buy", "symbol": "XAUUSD", "volume": 0.1, "model": "strategy",
+        })
+        start = ws1.receive_json()
+        did = start["dispatch_id"]
+        magic = start["magic"]
+        ws1.send_json({"type": "strategy_progress", "data": {
+            "task_id": start["task_id"], "dispatch_id": did, "magic": magic,
+            "event": "open", "symbol": "XAUUSD", "action": "BUY",
+            "phase": "running", "position_count": 1, "add_count": 0,
+            "total_orders": 1, "total_volume": 0.1, "profit": 0.0,
+            "last_order": {"ticket": 1936505848, "price": 4346.67, "volume": 0.1},
+        }})
+        ws1.send_json({"type": "strategy_progress", "data": {
+            "task_id": start["task_id"], "dispatch_id": did, "magic": magic,
+            "event": "add_manual", "symbol": "XAUUSD", "action": "BUY",
+            "phase": "running", "position_count": 2, "add_count": 0,
+            "total_orders": 2, "total_volume": 0.15, "profit": 0.0,
+            "last_order": {"ticket": 1936514755, "price": 4343.49, "volume": 0.05},
+        }})
+        ws1.send_json({"type": "strategy_finished", "data": {
+            "task_id": start["task_id"], "magic": magic,
+            "status": "done", "reason": "positions_cleared",
+            "total_orders": 2, "total_volume": 0.15, "realized_profit": -5.25,
+            "order_profits": {"1936505848": -3.2, "1936514755": -2.05},
+        }})
+        _wait_task_status(client, h, gid, "done")
+
+    items = []
+    for _ in range(40):
+        r = client.get(f"/api/groups/{gid}/dispatches/{did}/events", headers=h)
+        if r.status_code == 200:
+            items = r.json()
+            if any(e["event_type"] == "close_all" for e in items):
+                break
+        time.sleep(0.05)
+    opened = next(e for e in items if e["event_type"] == "open")
+    manual = next(e for e in items if e["event_type"] == "add_manual")
+    closed = next(e for e in items if e["event_type"] == "close_all")
+    assert opened["profit"] == -3.2
+    assert manual["profit"] == -2.05
+    assert closed["profit"] == -5.25
+
+
 def test_dispatch_event_keeps_open_reason_and_calc_detail(client):
     """节点上报的开单原因与计算依据要原样落库并回读，用于还原这一单为什么下。"""
     h = auth_headers(client)

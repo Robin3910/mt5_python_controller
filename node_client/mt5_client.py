@@ -1035,6 +1035,30 @@ class MT5Client:
             total += float(getattr(d, "commission", 0) or 0)
         return round(total, 2)
 
+    def realized_profit_by_position(
+        self, magic: int, since_ts: float | None = None,
+    ) -> dict[int, float]:
+        """按持仓票号汇总已实现盈亏（profit + swap + commission）。
+
+        开仓/平仓成交都计入同一 position_id，供收口时回写各关联订单。
+        """
+        deals = self._history_deals(since_ts)
+        target = int(magic)
+        out: dict[int, float] = {}
+        for d in deals:
+            if int(getattr(d, "magic", 0) or 0) != target:
+                continue
+            pos_id = int(getattr(d, "position_id", 0) or 0)
+            if pos_id <= 0:
+                continue
+            pl = (
+                float(getattr(d, "profit", 0) or 0)
+                + float(getattr(d, "swap", 0) or 0)
+                + float(getattr(d, "commission", 0) or 0)
+            )
+            out[pos_id] = round(out.get(pos_id, 0.0) + pl, 2)
+        return out
+
     def exit_deals_by_magic(self, magic: int, since_ts: float | None = None) -> list[dict]:
         """某魔术号在时间窗内的出场成交，供收口时区分止损 / 止盈 / 人工等。
 

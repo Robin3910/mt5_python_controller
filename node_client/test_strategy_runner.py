@@ -559,11 +559,12 @@ async def test_stop_request_closes_positions_and_finishes():
     runner.start()
     await _settle()
     assert len(mt5.positions_by_magic(MAGIC)) == 1
-    mt5.positions_by_magic(MAGIC)[0]  # ensure readable
     # 给持仓打上浮盈，收口时应作为已实现盈亏上报（不能再写死 0）
+    ticket = 0
     for p in mt5._positions:
         if int(p.get("magic") or 0) == MAGIC:
             p["profit"] = 12.5
+            ticket = int(p.get("ticket") or 0)
 
     runner.request_stop("close_signal")
     await _settle()
@@ -573,6 +574,8 @@ async def test_stop_request_closes_positions_and_finishes():
     assert finished and finished[0]["status"] == "done"
     assert finished[0]["reason"] == "close_signal"
     assert finished[0]["realized_profit"] == 12.5
+    assert ticket > 0
+    assert finished[0]["order_profits"][str(ticket)] == 12.5
     assert runner.done
 
 

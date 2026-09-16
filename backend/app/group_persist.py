@@ -702,6 +702,10 @@ async def record_strategy_progress(
             if event_type and event_type != "heartbeat":
                 order = data.get("last_order") or {}
                 detail = data.get("detail")
+                ticket = order.get("ticket")
+                # 没有票号的是日志（如越过止盈暂不开仓），不是关联订单；
+                # 持仓/累计手数/盈亏仍刷新子任务快照，但不写进事件行，避免看起来像一笔仓。
+                is_order = ticket is not None
                 s.add(
                     GroupTaskEvent(
                         task_id=task_id,
@@ -712,10 +716,10 @@ async def record_strategy_progress(
                         action=data.get("action"),
                         volume=_num(order.get("volume")) or _num(data.get("volume")),
                         price=_num(order.get("price")),
-                        order_ticket=order.get("ticket"),
-                        position_count=_int_or_none(data.get("position_count")),
-                        total_volume=_num(data.get("total_volume")),
-                        profit=_num(data.get("profit")),
+                        order_ticket=ticket,
+                        position_count=_int_or_none(data.get("position_count")) if is_order else None,
+                        total_volume=_num(data.get("total_volume")) if is_order else None,
+                        profit=_num(data.get("profit")) if is_order else None,
                         # 开单原因（人读）与计算依据（结构化）由节点在下单时一并上报
                         message=(str(data["message"])[:255] if data.get("message") else None),
                         detail_json=detail if isinstance(detail, dict) else None,
@@ -783,6 +787,10 @@ async def finish_subtask(
             if data.get("error"):
                 row.error = str(data["error"])[:255]
             detail = data.get("detail")
+            await _write_event_order_profits(
+                s, task_id=task_id, node_id=node_id,
+                profits=_parse_order_profits(data.get("order_profits")),
+            )
 
             s.add(
                 GroupTaskEvent(
@@ -977,6 +985,57 @@ def _num(value: object) -> Optional[float]:
 def _int_or_none(value: object) -> Optional[int]:
     n = _num(value)
     return int(n) if n is not None else None
+
+
+def _parse_order_profits(raw: object) -> dict[int, float]:
+    """strategy_finished.order_profits -> {持仓票号: 已实现盈亏}。
+
+    兼容 JSON 把 int key 转成字符串，以及 [{ticket, profit}] 列表。
+    """
+    pairs: list[tuple[object, object]] = []
+    if isinstance(raw, dict):
+        pairs = list(raw.items())
+    elif isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            pairs.append(
+                (item.get("ticket") or item.get("position_id"), item.get("profit")),
+            )
+    out: dict[int, float] = {}
+    for ticket, profit in pairs:
+        tid = _int_or_none(ticket)
+        pl = _num(profit)
+        if tid is None or tid <= 0 or pl is None:
+            continue
+        out[tid] = round(pl, 2)
+    return out
+
+
+async def _write_event_order_profits(
+    session, *, task_id: int, node_id: str, profits: dict[int, float],
+) -> None:
+    """把收口时的各票号已实现盈亏写回开仓/加仓等关联订单事件。"""
+    if not profits:
+        return
+    rows = (
+        await session.execute(
+            select(GroupTaskEvent).where(
+                GroupTaskEvent.task_id == task_id,
+                GroupTaskEvent.node_id == node_id,
+                GroupTaskEvent.order_ticket.in_(list(profits.keys())),
+            )
+        )
+    ).scalars().all()
+    for row in rows:
+        if row.event_type == "close_all":
+            continue
+        ticket = _int_or_none(row.order_ticket)
+        if ticket is None:
+            continue
+        pl = profits.get(ticket)
+        if pl is not None:
+            row.profit = pl
 
 
 async def _refresh_task_totals(session, task_id: int) -> None:

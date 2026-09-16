@@ -504,3 +504,56 @@ def entry_reject_reason(
         if reason:
             return reason
     return None
+
+
+def overlay_live_event_profits(
+    events: list[dict],
+    positions: Optional[list] = None,
+    magic: Optional[int] = None,
+) -> list[dict]:
+    """用账户快照里仍在场订单的浮盈覆盖关联事件的 profit。
+
+    事件表是下单当时的快照（开仓瞬间多为 0），不会随行情改写。读取时按票号
+    对上当前持仓，才能让「关联订单」盈亏跟着浮动。无票号（异常/跳过日志）
+    或已平仓的事件保持落库值。
+    """
+    live: dict[int, float] = {}
+    want_magic = None if magic is None else int(magic)
+    for pos in positions or []:
+        if not isinstance(pos, dict):
+            continue
+        ticket = pos.get("ticket")
+        if ticket is None:
+            continue
+        pos_magic = pos.get("magic")
+        if want_magic is not None and pos_magic not in (None, "", 0, "0"):
+            try:
+                if int(pos_magic) != want_magic:
+                    continue
+            except (TypeError, ValueError):
+                continue
+        try:
+            live[int(ticket)] = round(float(pos.get("profit") or 0.0), 2)
+        except (TypeError, ValueError):
+            continue
+    if not live:
+        return events
+    out: list[dict] = []
+    for ev in events:
+        ticket = ev.get("order_ticket")
+        if ticket is None:
+            out.append(ev)
+            continue
+        try:
+            key = int(ticket)
+        except (TypeError, ValueError):
+            out.append(ev)
+            continue
+        pl = live.get(key)
+        if pl is None:
+            out.append(ev)
+            continue
+        patched = dict(ev)
+        patched["profit"] = pl
+        out.append(patched)
+    return out

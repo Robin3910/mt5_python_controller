@@ -1217,6 +1217,65 @@ async def test_trade_result_by_magic_updates_task_and_signal(store, monkeypatch)
     assert sig.dispatch_mode == "group"
 
 
+async def test_finish_subtask_writes_order_profits_to_open_events(store, monkeypatch):
+    """收口时按票号把已实现盈亏写回开仓/加仓事件；无票号的异常日志保持原快照。"""
+    await online(store, mk_node("nd_a"))
+    await mk_group(store, "订单盈亏组", ["nd_a"])
+    monkeypatch.setattr(manager, "send_to_node", capture_sender([]))
+    await GroupDispatcher(store).dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_order_pl",
+    )
+    task = (await fetch_tasks("sig_order_pl"))[0]
+    await open_first_orders(task.task_id, ["nd_a"])
+    row = (await fetch_dispatches(task.task_id))[0]
+    await group_persist.record_strategy_progress(
+        node_id="nd_a", dispatch_id=row.id, task_id=task.task_id,
+        data={
+            "event": "open", "phase": "running", "action": "BUY",
+            "position_count": 1, "total_orders": 1, "total_volume": 0.1, "profit": 0.0,
+            "last_order": {"ticket": 1936505848, "price": 4346.67, "volume": 0.1},
+        },
+    )
+    await group_persist.record_strategy_progress(
+        node_id="nd_a", dispatch_id=row.id, task_id=task.task_id,
+        data={
+            "event": "add_manual", "phase": "running", "action": "BUY",
+            "position_count": 2, "total_orders": 2, "total_volume": 0.15, "profit": 0.0,
+            "last_order": {"ticket": 1936514755, "price": 4343.49, "volume": 0.05},
+        },
+    )
+    await group_persist.record_strategy_progress(
+        node_id="nd_a", dispatch_id=row.id, task_id=task.task_id,
+        data={
+            "event": "error", "phase": "running", "action": "BUY",
+            "position_count": 1, "total_orders": 1, "total_volume": 0.1, "profit": -1.9,
+            "message": "手动分散仓越过止盈，暂不开仓",
+        },
+    )
+    finished = await group_persist.finish_subtask(
+        node_id="nd_a", task_id=task.task_id,
+        data={
+            "status": "done", "reason": "positions_cleared",
+            "total_orders": 2, "total_volume": 0.15, "realized_profit": -5.25,
+            "order_profits": {"1936505848": -3.2, "1936514755": -2.05},
+        },
+    )
+    assert finished["task_status"] == "done"
+    async with SessionLocal() as s:
+        events = (
+            await s.execute(
+                select(GroupTaskEvent).where(GroupTaskEvent.task_id == task.task_id)
+            )
+        ).scalars().all()
+    by_type = {e.event_type: e for e in events}
+    assert by_type["open"].profit == -3.2
+    assert by_type["add_manual"].profit == -2.05
+    assert by_type["error"].profit is None
+    assert by_type["error"].position_count is None
+    assert by_type["error"].total_volume is None
+    assert by_type["close_all"].profit == -5.25
+
+
 async def test_finish_subtask_keeps_account_risk_reason_and_detail(store, monkeypatch):
     """账户风控收口：结束原因与触发参数要落到 close_all 事件，供开单原因展示。"""
     await online(store, mk_node("nd_a"))

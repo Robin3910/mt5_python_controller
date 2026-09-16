@@ -388,3 +388,39 @@ def test_trend_risk_reject_reason_includes_score_and_label():
     assert reason is not None
     assert "空头" in reason
     assert "-35.2" in reason
+
+
+def test_overlay_live_event_profits_replaces_open_ticket():
+    events = [
+        {"order_ticket": 101, "profit": 0.0, "event_type": "open"},
+        {"order_ticket": 102, "profit": 0.0, "event_type": "add_manual"},
+        {"order_ticket": None, "profit": -1.9, "event_type": "error"},
+    ]
+    positions = [
+        {"ticket": 101, "magic": 37, "profit": -3.21},
+        {"ticket": 102, "magic": 37, "profit": -2.04},
+    ]
+    out = group_rules.overlay_live_event_profits(events, positions, magic=37)
+    assert out[0]["profit"] == -3.21
+    assert out[1]["profit"] == -2.04
+    assert out[2]["profit"] == -1.9
+    assert events[0]["profit"] == 0.0
+
+
+def test_overlay_live_event_profits_keeps_closed_and_other_magic():
+    events = [
+        {"order_ticket": 101, "profit": 0.0},
+        {"order_ticket": 202, "profit": 1.5},
+    ]
+    positions = [
+        {"ticket": 202, "magic": 99, "profit": 8.8},
+    ]
+    out = group_rules.overlay_live_event_profits(events, positions, magic=37)
+    assert out[0]["profit"] == 0.0
+    assert out[1]["profit"] == 1.5
+
+
+def test_overlay_live_event_profits_empty_positions_is_noop():
+    events = [{"order_ticket": 1, "profit": 0.0}]
+    assert group_rules.overlay_live_event_profits(events, [], magic=1) is events
+    assert group_rules.overlay_live_event_profits(events, None, magic=1) is events

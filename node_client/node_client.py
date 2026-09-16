@@ -787,19 +787,38 @@ class NodeClient:
         except Exception:  # noqa: BLE001
             logger.debug("orphan realized_profit lookup failed", exc_info=True)
             realized = float(res.get("profit") or 0.0)
+        order_profits: dict[str, float] = {}
+        try:
+            if hasattr(self.mt5, "realized_profit_by_position"):
+                raw = await self._exec(
+                    self.mt5.realized_profit_by_position, magic, time.time() - 86400,
+                )
+                for key, val in dict(raw or {}).items():
+                    try:
+                        ticket = int(key)
+                        pl = round(float(val), 2)
+                    except (TypeError, ValueError):
+                        continue
+                    if ticket > 0:
+                        order_profits[str(ticket)] = pl
+        except Exception:  # noqa: BLE001
+            logger.debug("orphan order_profits lookup failed", exc_info=True)
         # 不带累计单量字段：服务端已有历史统计，这里回传 0 会把它覆盖掉
+        payload = {
+            "task_id": task_id,
+            "magic": magic,
+            "group_id": msg.get("group_id") or "",
+            "signal_id": msg.get("signal_id") or "",
+            "symbol": msg.get("symbol"),
+            "status": "done" if res.get("success") else "failed",
+            "reason": msg.get("reason") or "stop_command",
+            "realized_profit": round(realized, 2),
+        }
+        if order_profits:
+            payload["order_profits"] = order_profits
         await ws.send(json.dumps({
             "type": "strategy_finished",
-            "data": {
-                "task_id": task_id,
-                "magic": magic,
-                "group_id": msg.get("group_id") or "",
-                "signal_id": msg.get("signal_id") or "",
-                "symbol": msg.get("symbol"),
-                "status": "done" if res.get("success") else "failed",
-                "reason": msg.get("reason") or "stop_command",
-                "realized_profit": round(realized, 2),
-            },
+            "data": payload,
         }))
 
     def _cancel_runners(self) -> None:

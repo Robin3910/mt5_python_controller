@@ -170,6 +170,7 @@ class StrategyRunner:
         self._last_report = 0.0
         self._started_at = time.time()
         self._last_floating_profit = 0.0
+        self._last_position_profits: dict[int, float] = {}
         self._metric_specs: Optional[list[tuple[str, str]]] = None
 
         # 三条互斥执行路径：网格 > 以损定量 > 加仓（按规则 type 优先级）
@@ -578,6 +579,7 @@ class StrategyRunner:
         self._last_floating_profit = round(
             sum(_as_float(p.get("profit")) for p in targets), 2,
         )
+        self._remember_position_profits(targets)
         res = dict(await self._exec(self._mt5.close_positions, targets) or {})
         if not res.get("success", True):
             err = str(res.get("error") or "close failed")
@@ -1848,6 +1850,7 @@ class StrategyRunner:
                 self._last_floating_profit = round(
                     sum(_as_float(p.get("profit")) for p in held), 2,
                 )
+                self._remember_position_profits(held)
             if attempt + 1 >= _CLOSE_ALL_ATTEMPTS:
                 break
             res = dict(await self._exec(self._mt5.close_by_magic, self.magic) or {})
@@ -1868,6 +1871,7 @@ class StrategyRunner:
         profit = round(sum(_as_float(p.get("profit")) for p in pos), 2)
         if pos:
             self._last_floating_profit = profit
+            self._remember_position_profits(pos)
         return {
             "position_count": len(pos),
             "pending_orders": self._pending_orders,
@@ -1901,6 +1905,41 @@ class StrategyRunner:
                 "task %s realized_profit_by_magic failed", self.task_id, exc_info=True,
             )
         return floating
+
+    def _remember_position_profits(self, positions: list[dict]) -> None:
+        """记下仍在场各票号的浮盈，收口时成交历史尚未写入则按票号回退。"""
+        for p in positions or []:
+            ticket = int(p.get("ticket") or 0)
+            if ticket <= 0:
+                continue
+            self._last_position_profits[ticket] = round(_as_float(p.get("profit")), 2)
+
+    async def _resolve_order_profits(self) -> dict[str, float]:
+        """收口时各持仓票号的已实现盈亏：成交历史优先，缺票号回退平仓前浮盈。"""
+        out = {
+            str(ticket): round(float(pl), 2)
+            for ticket, pl in self._last_position_profits.items()
+            if ticket > 0
+        }
+        since = self._started_at or (time.time() - 86400)
+        try:
+            if hasattr(self._mt5, "realized_profit_by_position"):
+                raw = await self._exec(
+                    self._mt5.realized_profit_by_position, self.magic, since,
+                )
+                for key, val in dict(raw or {}).items():
+                    try:
+                        ticket = int(key)
+                        pl = round(float(val), 2)
+                    except (TypeError, ValueError):
+                        continue
+                    if ticket > 0:
+                        out[str(ticket)] = pl
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "task %s realized_profit_by_position failed", self.task_id, exc_info=True,
+            )
+        return out
 
     async def _emit_progress(
         self, event: str, *, phase: str,
@@ -1979,6 +2018,7 @@ class StrategyRunner:
                 "task %s %s: %s (residual=%s)", self.task_id, status, reason, residual,
             )
         realized = await self._resolve_realized_profit()
+        order_profits = await self._resolve_order_profits()
         logger.info(
             "task %s finished: %s (%s) realized_profit=%s",
             self.task_id, status, reason, realized,
@@ -1996,6 +2036,8 @@ class StrategyRunner:
             "realized_profit": realized,
             "residual_positions": residual,
         }
+        if order_profits:
+            data["order_profits"] = order_profits
         if self._stop_detail:
             data["detail"] = self._stop_detail
         await self._send({"type": "strategy_finished", "data": data})
