@@ -32,6 +32,7 @@ def group_row_to_dict(row: NodeGroup, members: list[NodeGroupMember]) -> dict:
         "name": row.name,
         "enabled": row.enabled,
         "dispatch_mode": row.dispatch_mode,
+        "signal_concurrent_enabled": bool(getattr(row, "signal_concurrent_enabled", False)),
         "trend_risk_enabled": bool(getattr(row, "trend_risk_enabled", False)),
         "limit_watch_enabled": bool(getattr(row, "limit_watch_enabled", False)),
         "limit_watch_keyword": normalize_keyword(
@@ -177,13 +178,17 @@ async def create_group(store: RedisStore, payload: GroupCreate) -> dict:
     if watch_enabled:
         await _require_trend_strategy(store, strategy_id)
     group_id = make_group_id()
+    mode = normalize_dispatch_mode(payload.dispatch_mode)
     async with SessionLocal() as s:
         s.add(
             NodeGroup(
                 group_id=group_id,
                 name=payload.name.strip(),
                 enabled=payload.enabled,
-                dispatch_mode=normalize_dispatch_mode(payload.dispatch_mode),
+                dispatch_mode=mode,
+                signal_concurrent_enabled=(
+                    bool(payload.signal_concurrent_enabled) and mode == "sync"
+                ),
                 trend_risk_enabled=bool(payload.trend_risk_enabled),
                 limit_watch_enabled=watch_enabled,
                 limit_watch_keyword=watch_keyword,
@@ -225,6 +230,11 @@ async def update_group(store: RedisStore, group_id: str, patch: GroupUpdate) -> 
             row.enabled = patch.enabled
         if patch.dispatch_mode is not None:
             row.dispatch_mode = normalize_dispatch_mode(patch.dispatch_mode)
+        if patch.signal_concurrent_enabled is not None:
+            row.signal_concurrent_enabled = bool(patch.signal_concurrent_enabled)
+        # 轮询不使用信号并发；切到轮询时关掉，避免再切回全员同步时意外放开
+        if normalize_dispatch_mode(row.dispatch_mode) != "sync":
+            row.signal_concurrent_enabled = False
         if patch.trend_risk_enabled is not None:
             row.trend_risk_enabled = bool(patch.trend_risk_enabled)
         if patch.remark is not None:

@@ -58,6 +58,8 @@ const triggering = ref(false)
 const triggerError = ref('')
 const triggerGroups = ref<GroupOut[]>([])
 const loadingTriggerGroups = ref(false)
+/** Webhook AUTH_TOKEN，写入可复制的信号 JSON，不随手动触发接口提交。 */
+const webhookAuthToken = ref('')
 
 const triggerForm = reactive({
   symbol: '',
@@ -174,8 +176,13 @@ async function openTrigger(): Promise<void> {
   showTrigger.value = true
   loadingTriggerGroups.value = true
   try {
-    const [groups] = await Promise.all([hub.listGroups(), hub.fetchStrategies()])
+    const [groups, , auth] = await Promise.all([
+      hub.listGroups(),
+      hub.fetchStrategies(),
+      hub.fetchWebhookAuth().catch(() => ({ enabled: false, token: '' })),
+    ])
     triggerGroups.value = groups
+    webhookAuthToken.value = auth.token || ''
   } catch {
     triggerError.value = '读取分组失败，命中范围暂时无法预演；请关闭弹窗后重试'
     return
@@ -213,6 +220,7 @@ function buildWebhookSignalPayload(payload: ManualSignalPayload): Record<string,
   if (payload.take_profit) data.tp = payload.take_profit
   if (payload.entry_price) data.limit_price = payload.entry_price
   if (payload.comment) data.comment = payload.comment
+  data.token = webhookAuthToken.value
   return data
 }
 

@@ -367,6 +367,28 @@ label {
   text-transform: uppercase;
 }
 .secure-badge-sm { font-size: 10px; padding: 4px 8px; }
+button.secure-badge.webhook-copy {
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--green);
+  background: rgba(16, 185, 129, 0.1);
+  border: 1px solid rgba(16, 185, 129, 0.25);
+  box-shadow: none;
+}
+button.secure-badge.webhook-copy:hover {
+  background: rgba(16, 185, 129, 0.18);
+  border-color: rgba(16, 185, 129, 0.42);
+  color: var(--green);
+}
+button.secure-badge.webhook-copy:focus-visible {
+  outline: 2px solid rgba(16, 185, 129, 0.7);
+  outline-offset: 2px;
+}
+.webhook-copy-text {
+  font-weight: 500;
+  font-size: 12px;
+  text-transform: none;
+}
 .secure-dot {
   width: 6px; height: 6px;
   border-radius: 50%;
@@ -1238,7 +1260,7 @@ a.dash-link { display: inline-block; }
   .mobile-only { display: flex; }
   .mobile-only.list-cards { flex-direction: column; }
 
-  .secure-badge { display: none; }
+  .secure-badge:not(.webhook-copy) { display: none; }
   .nav a span { display: none; }
   .nav a { padding: 8px 10px; }
   .nav a svg { width: 18px; height: 18px; opacity: 1; }

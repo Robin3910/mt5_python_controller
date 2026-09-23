@@ -1,15 +1,30 @@
 <script setup lang="ts">
 // 根组件：顶部导航 + 路由出口；登录后建立后台实时 WS，退出时断开
 import { computed, onMounted, watch } from 'vue'
+import { ElMessage } from 'element-plus'
+import 'element-plus/es/components/message/style/css'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useHubStore } from '@/stores/hub'
 import { connectAdminWs, disconnectAdminWs } from '@/services/ws'
+import { copyToClipboard } from '@/utils/clipboard'
 
 const auth = useAuthStore()
 const hub = useHubStore()
 const router = useRouter()
 const authed = computed(() => auth.isAuthed)
+
+/** 当前站点同源的 webhook 请求地址，供 TradingView 等外部系统 POST。 */
+const webhookUrl = computed(() => {
+  if (typeof window === 'undefined') return '/webhook'
+  return new URL('/webhook', window.location.origin).href
+})
+
+async function copyWebhookUrl(): Promise<void> {
+  const ok = await copyToClipboard(webhookUrl.value)
+  if (ok) ElMessage.success('复制成功')
+  else ElMessage.error('复制失败')
+}
 
 function setupWs(): void {
   if (auth.token) connectAdminWs(auth.token)
@@ -87,10 +102,16 @@ function logout(): void {
       <div class="spacer"></div>
 
       <div class="topbar-status">
-        <span class="secure-badge">
-          <span class="secure-dot"></span>
-          安全连接
-        </span>
+        <button
+          type="button"
+          class="secure-badge webhook-copy"
+          :title="`点击复制 ${webhookUrl}`"
+          :aria-label="`复制 webhook 请求地址 ${webhookUrl}`"
+          @click="copyWebhookUrl"
+        >
+          <span class="secure-dot" aria-hidden="true"></span>
+          <span class="webhook-copy-text">webhook地址</span>
+        </button>
         <span class="pill pill-live">
           <span class="dot online"></span>
           在线 {{ hub.onlineCount }}/{{ hub.nodes.length }}

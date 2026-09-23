@@ -138,6 +138,7 @@ def test_create_group_response_shape(client):
     assert g["name"] == "黄金策略组"
     assert g["enabled"] is True
     assert g["dispatch_mode"] == "poll"
+    assert g["signal_concurrent_enabled"] is False  # 信号并发默认关闭
     assert g["trend_risk_enabled"] is False  # 趋势风控默认关闭
     assert g["limit_watch_enabled"] is False  # 限价监听默认关闭
     assert g["limit_watch_keyword"] == "limit"
@@ -1640,6 +1641,47 @@ def test_patch_group_trend_risk_enabled(client):
     assert r.status_code == 200, r.text
     assert r.json()["trend_risk_enabled"] is True
     assert client.get(f"/api/groups/{gid}", headers=h).json()["trend_risk_enabled"] is True
+
+
+def test_signal_concurrent_defaults_off_and_is_audited(client):
+    """信号并发默认关闭；打开后写入操作审计的前后快照。"""
+    h = auth_headers(client)
+    g = _mk_group(client, h, name="并发默认关组", strategy_id=None)
+    gid = g["group_id"]
+    assert g["signal_concurrent_enabled"] is False
+
+    r = client.patch(
+        f"/api/groups/{gid}", json={"signal_concurrent_enabled": True}, headers=h,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["signal_concurrent_enabled"] is True
+
+    logs = client.get("/api/audits", params={"page_size": 50}, headers=h).json()["items"]
+    upd = next(x for x in logs if x["action"] == "update_group" and x["target"] == gid)
+    assert upd["before"]["signal_concurrent_enabled"] is False
+    assert upd["after"]["signal_concurrent_enabled"] is True
+
+
+def test_poll_mode_forces_signal_concurrent_off(client):
+    """轮询创建或改成轮询时，信号并发一律存成关闭。"""
+    h = auth_headers(client)
+    created = _mk_group(
+        client, h, name="轮询清并发组", strategy_id=None,
+        dispatch_mode="poll", signal_concurrent_enabled=True,
+    )
+    assert created["dispatch_mode"] == "poll"
+    assert created["signal_concurrent_enabled"] is False
+
+    gid = _mk_group(
+        client, h, name="切轮询关并发组", strategy_id=None,
+        signal_concurrent_enabled=True,
+    )["group_id"]
+    assert client.get(f"/api/groups/{gid}", headers=h).json()["signal_concurrent_enabled"] is True
+    out = client.patch(
+        f"/api/groups/{gid}", json={"dispatch_mode": "poll"}, headers=h,
+    ).json()
+    assert out["dispatch_mode"] == "poll"
+    assert out["signal_concurrent_enabled"] is False
 
 
 def _mk_trend_strategy(client, headers, name: str = "趋势策略实例", symbol: str = "XAUUSD") -> dict:

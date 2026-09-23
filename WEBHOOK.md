@@ -22,7 +22,7 @@ TradingView → MT5 跟单系统的信号接收接口说明。本文档描述的
 
 ## 2. 鉴权与访问控制
 
-解析信号**之前**有两道可选门槛，按顺序执行。两者默认均关闭（见 `.env`）。
+解析信号**之前**有两道可选门槛，按顺序执行。IP 白名单默认关闭；token 校验默认开启。配置页「Webhook 校验 token」保存后写入数据库，立即生效并覆盖 `ENABLE_AUTH`，进程重启后仍以该开关为准。
 
 ### 2.1 IP 白名单（先执行）
 
@@ -34,7 +34,7 @@ TradingView → MT5 跟单系统的信号接收接口说明。本文档描述的
 
 ### 2.2 Token 鉴权（后执行）
 
-- 开关：`ENABLE_AUTH=true`
+- 开关：配置页「Webhook 校验 token」（默认开启）。未在配置页保存过时，回落到环境变量 `ENABLE_AUTH`（未设置时视为开启）。
 - 共享密钥：`AUTH_TOKEN=xxx`
 - token 可通过以下 **4 种方式**传入（按此优先级查找，命中即止）：
   1. 请求头 `X-Auth-Token: <token>`
@@ -567,7 +567,7 @@ curl -X POST http://localhost:8000/webhook \
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `ENABLE_AUTH` | `false` | 是否校验 Webhook token |
+| `ENABLE_AUTH` | `true` | 未在配置页保存过时，是否校验 Webhook token |
 | `AUTH_TOKEN` | `""` | Webhook 共享 token |
 | `ENABLE_IP_WHITELIST` | `false` | 是否启用 IP 白名单 |
 | `WHITELISTED_IPS` | TradingView 出口 IP | 逗号分隔的 IP 名单 |

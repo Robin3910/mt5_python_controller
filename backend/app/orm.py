@@ -64,6 +64,7 @@ class SystemSetting(Base):
 
     当前用途：
     - `node_token` — 所有节点共享的接入令牌（明文，便于管理员复制到各节点 .env）
+    - `webhook_auth_enabled` — Webhook 是否校验 AUTH_TOKEN（"1" / "0"；未写入时看 ENABLE_AUTH）
     - `trend_config` — 趋势面板全局参数（JSON 文本）
     - `client_release` — 当前发布的客户端版本指针（JSON 文本，含回滚用的 previous）
     """
@@ -190,6 +191,8 @@ class NodeGroup(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     # sync（全员同步）/ poll（组内轮转，一个信号只由一个节点领取）
     dispatch_mode: Mapped[str] = mapped_column(String(8), default="sync")
+    # 信号并发：仅全员同步生效；开启后同组同节点可同时承接多条开仓信号（默认关）
+    signal_concurrent_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     # 趋势风控：开仓前按全局趋势参数对各节点算信号品种趋势，仅顺势放行（默认关）
     trend_risk_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     # 限价挂单监听：把节点 MT5 上手动挂的限价单转成 strategy 信号（默认关；关键字默认为 limit，允许空）

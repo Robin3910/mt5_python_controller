@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     mysql_dsn: str = "sqlite+aiosqlite:///./mt5hub.db"
 
     # —— Webhook 鉴权（与参考仓库一致）——
-    enable_auth: bool = False           # 是否校验 Webhook token
+    enable_auth: bool = True            # 未在配置页保存过时，是否校验 Webhook token（默认开启）
     auth_token: str = ""                # Webhook 共享 token
     enable_ip_whitelist: bool = False   # 是否启用 IP 白名单
     whitelisted_ips: str = ""           # 逗号分隔的 IP 列表

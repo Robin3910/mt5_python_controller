@@ -93,6 +93,13 @@ def normalize_dispatch_mode(value: object) -> str:
     return mode if mode in GROUP_DISPATCH_MODES else "sync"
 
 
+def allows_signal_concurrent(group: dict) -> bool:
+    """全员同步且打开信号并发时，同组同节点可同时承接多条开仓信号。"""
+    if normalize_dispatch_mode(group.get("dispatch_mode")) != "sync":
+        return False
+    return bool(group.get("signal_concurrent_enabled"))
+
+
 def resolve_volume(signal_volume: float) -> float:
     """分组链路的手数：直接用信号手数，仅做单笔上限保护。"""
     try:

@@ -65,6 +65,8 @@ const FIELD_HELP = {
     '禁用后该分组不再接收任何 strategy 信号；已下发的历史任务不受影响。',
   dispatch_mode:
     '分组级分发模式，作用于整个分组、不区分币种：全员同步 = 组内所有有效节点并发下发；轮询轮转 = 一条信号只交给组内队首的一个有效节点，成功后该节点移到队尾。',
+  signal_concurrent:
+    '仅全员同步可用，默认关闭。关闭时，同分组内每个节点同时只跑一个策略任务，进行中的节点会跳过新的开仓信号。开启后，新的开仓信号会继续发给仍在跑策略的节点，各自独立魔术号。轮询轮转不使用此开关。',
   trend_risk:
     '开启后，开仓信号进入各节点前会按「趋势面板」全局参数计算该节点上信号品种的趋势：' +
     'BUY 仅多头放行、SELL 仅空头放行；中性、数据不足或行情读取失败一律拦截并记入子任务跳过原因。CLOSE 不受影响。默认关闭。',
@@ -92,6 +94,7 @@ const form = reactive({
   name: '',
   enabled: true,
   dispatch_mode: 'sync' as GroupDispatchMode,
+  signal_concurrent_enabled: false,
   trend_risk_enabled: false,
   limit_watch_enabled: false,
   limit_watch_keyword: 'limit',
@@ -171,6 +174,7 @@ function openCreate(): void {
     name: '',
     enabled: true,
     dispatch_mode: 'sync' as GroupDispatchMode,
+    signal_concurrent_enabled: false,
     trend_risk_enabled: false,
     limit_watch_enabled: false,
     limit_watch_keyword: 'limit',
@@ -190,6 +194,7 @@ function openEdit(g: GroupOut): void {
     name: g.name,
     enabled: g.enabled,
     dispatch_mode: g.dispatch_mode,
+    signal_concurrent_enabled: Boolean(g.signal_concurrent_enabled),
     trend_risk_enabled: Boolean(g.trend_risk_enabled),
     limit_watch_enabled: Boolean(g.limit_watch_enabled),
     limit_watch_keyword: g.limit_watch_keyword ?? '',
@@ -211,10 +216,12 @@ async function save(): Promise<void> {
   formError.value = ''
   try {
     const strategyId = form.strategy_id.trim() || null
+    const signalConcurrent = form.dispatch_mode === 'sync' && form.signal_concurrent_enabled
     const payload = {
       name,
       enabled: form.enabled,
       dispatch_mode: form.dispatch_mode,
+      signal_concurrent_enabled: signalConcurrent,
       trend_risk_enabled: form.trend_risk_enabled,
       limit_watch_enabled: formIsTrendStrategy.value ? form.limit_watch_enabled : false,
       limit_watch_keyword: (form.limit_watch_keyword || '').trim(),
@@ -228,6 +235,9 @@ async function save(): Promise<void> {
       || '未绑定'
     const summary =
       `分发模式：${DISPATCH_MODE_LABEL[form.dispatch_mode]}\n` +
+      (form.dispatch_mode === 'sync'
+        ? `信号并发：${signalConcurrent ? '开启' : '关闭'}\n`
+        : '') +
       `趋势风控：${form.trend_risk_enabled ? '开启' : '关闭'}\n` +
       (formIsTrendStrategy.value
         ? `限价监听：${form.limit_watch_enabled ? `开启（${watchKeywordLabel(form.limit_watch_keyword)}）` : '关闭'}\n`
@@ -653,7 +663,10 @@ async function onStrategyFormSaved(): Promise<void> {
         </div>
         <div class="list-field">
           <span class="k">分发模式</span>
-          <span class="v"><span class="tag blue">{{ DISPATCH_MODE_LABEL[g.dispatch_mode] }}</span></span>
+          <span class="v">
+            <span class="tag blue">{{ DISPATCH_MODE_LABEL[g.dispatch_mode] }}</span>
+            <span v-if="g.signal_concurrent_enabled" class="tag">信号并发</span>
+          </span>
         </div>
         <div class="list-field">
           <span class="k">趋势风控</span>
@@ -765,6 +778,7 @@ async function onStrategyFormSaved(): Promise<void> {
         <el-table-column label="分发模式" min-width="160">
           <template #default="{ row }">
             <span class="tag blue">{{ DISPATCH_MODE_LABEL[asGroup(row).dispatch_mode] }}</span>
+            <span v-if="asGroup(row).signal_concurrent_enabled" class="tag">信号并发</span>
           </template>
         </el-table-column>
         <el-table-column label="趋势风控" width="88">
@@ -1130,6 +1144,13 @@ async function onStrategyFormSaved(): Promise<void> {
               <select id="group-mode" v-model="form.dispatch_mode">
                 <option value="sync">全员同步</option>
                 <option value="poll">轮询轮转（单节点领取）</option>
+              </select>
+            </div>
+            <div v-if="form.dispatch_mode === 'sync'">
+              <FormLabel field-id="group-signal-concurrent" text="信号并发" :help="FIELD_HELP.signal_concurrent" />
+              <select id="group-signal-concurrent" v-model="form.signal_concurrent_enabled">
+                <option :value="false">关闭</option>
+                <option :value="true">开启</option>
               </select>
             </div>
             <div>

@@ -33,6 +33,7 @@ import type {
   StrategyUpdatePayload,
   TrendConfig,
   TrendPanelData,
+  WebhookAuthInfo,
 } from '@/api/types'
 
 // 业务总线 store：集中保存节点、账户、配置与实时事件
@@ -343,6 +344,12 @@ export const useHubStore = defineStore('hub', {
     },
     async rotateNodeToken(): Promise<NodeTokenInfo> {
       return (await api.post('/api/config/node-token/rotate')).data
+    },
+    async fetchWebhookAuth(): Promise<WebhookAuthInfo> {
+      return (await api.get('/api/config/webhook-auth')).data
+    },
+    async setWebhookAuth(enabled: boolean): Promise<WebhookAuthInfo> {
+      return (await api.put('/api/config/webhook-auth', { enabled })).data
     },
     // ---- 远程平仓 ----
     async closeNode(id: string, body: CloseRequest): Promise<void> {

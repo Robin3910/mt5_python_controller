@@ -1,4 +1,4 @@
-"""运行期配置 API：区间过滤、全局节点令牌、趋势面板参数（需管理员鉴权）。
+"""运行期配置 API：区间过滤、全局节点令牌、Webhook token、趋势面板参数（需管理员鉴权）。
 
 这些配置存于 Redis（运行期实时态），下发分发时即时读取生效。
 节点令牌与趋势面板参数为持久化配置（MySQL/SQLite，见 system_settings）。
@@ -8,7 +8,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from . import persist, rules, system_settings
 from .connections import manager
 from .deps import client_ip, get_current_admin, get_store
-from .models import NodeTokenInfo
+from .models import NodeTokenInfo, WebhookAuthInfo, WebhookAuthUpdate
+from .settings import settings
 from .redis_store import RedisStore
 
 router = APIRouter(prefix="/api/config", tags=["config"])
@@ -75,6 +76,33 @@ async def rotate_node_token(
     token, updated_at = await system_settings.rotate_node_token(store)
     await persist.audit(admin, "rotate_node_token", None, None, "ok", client_ip(request))
     return NodeTokenInfo(token=token, updated_at=updated_at)
+
+
+@router.get("/webhook-auth", response_model=WebhookAuthInfo)
+async def get_webhook_auth(
+    store: RedisStore = Depends(get_store),
+    _: str = Depends(get_current_admin),
+):
+    """读取 Webhook 鉴权开关与共享 token，供中控台把 token 写进可复制的信号 JSON。"""
+    enabled = await system_settings.is_webhook_auth_enabled(store)
+    return WebhookAuthInfo(enabled=enabled, token=settings.auth_token or "")
+
+
+@router.put("/webhook-auth", response_model=WebhookAuthInfo)
+async def set_webhook_auth(
+    body: WebhookAuthUpdate,
+    request: Request,
+    store: RedisStore = Depends(get_store),
+    admin: str = Depends(get_current_admin),
+):
+    """保存 Webhook token 校验开关。关闭后 /webhook 不再校验 AUTH_TOKEN。"""
+    before = await system_settings.is_webhook_auth_enabled(store)
+    enabled = await system_settings.set_webhook_auth_enabled(store, body.enabled)
+    await persist.audit(
+        admin, "set_webhook_auth", None, {"enabled": enabled}, "ok", client_ip(request),
+        category="console", before={"enabled": before}, after={"enabled": enabled},
+    )
+    return WebhookAuthInfo(enabled=enabled, token=settings.auth_token or "")
 
 
 # ----------------- 趋势面板参数（全局共享，不分节点/币种）-----------------

@@ -247,7 +247,7 @@ def test_distinct_group_ids_not_deduped(client):
 # 4. Token 鉴权（ENABLE_AUTH）
 # =====================================================================
 def test_auth_disabled_accepts_without_token(client):
-    """默认 ENABLE_AUTH=false：不带 token 也放行。"""
+    """测试环境未开启鉴权：不带 token 也放行。"""
     r = client.post("/webhook", json={"action": "buy", "symbol": "EURUSD"})
     assert r.status_code == 200, r.text
 

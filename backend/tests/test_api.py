@@ -487,6 +487,46 @@ def test_disable_console_global_lot_blocked_when_node_follows(client):
     assert "follow-lot" in detail
 
 
+def test_webhook_auth_requires_admin(client):
+    assert client.get("/api/config/webhook-auth").status_code == 401
+
+
+def test_webhook_auth_returns_env_token(client, monkeypatch):
+    from app.settings import settings
+
+    monkeypatch.setattr(settings, "enable_auth", True)
+    monkeypatch.setattr(settings, "auth_token", "wh_secret")
+    h = _auth(client)
+    r = client.get("/api/config/webhook-auth", headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json() == {"enabled": True, "token": "wh_secret"}
+
+
+def test_webhook_auth_switch_overrides_env(client, monkeypatch):
+    """配置页关闭后，即使 ENABLE_AUTH 为真，/webhook 也不再校验 token。"""
+    from app.settings import settings
+
+    monkeypatch.setattr(settings, "enable_auth", True)
+    monkeypatch.setattr(settings, "auth_token", "wh_secret")
+    h = _auth(client)
+
+    off = client.put("/api/config/webhook-auth", json={"enabled": False}, headers=h)
+    assert off.status_code == 200, off.text
+    assert off.json()["enabled"] is False
+    opened = client.post("/webhook", json={"action": "buy", "symbol": "EURUSD"})
+    assert opened.status_code == 200, opened.text
+
+    on = client.put("/api/config/webhook-auth", json={"enabled": True}, headers=h)
+    assert on.status_code == 200, on.text
+    assert on.json()["enabled"] is True
+    denied = client.post("/webhook", json={"action": "buy", "symbol": "EURUSD"})
+    assert denied.status_code == 401
+    assert denied.json()["detail"] == "invalid token"
+
+    again = client.get("/api/config/webhook-auth", headers=h)
+    assert again.json()["enabled"] is True
+
+
 def test_node_token_rotate(client):
     """重置令牌后，旧令牌应失效，新令牌可用。"""
     h = _auth(client)

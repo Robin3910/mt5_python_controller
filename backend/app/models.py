@@ -47,6 +47,17 @@ class NodeTokenInfo(BaseModel):
     updated_at: float = 0
 
 
+class WebhookAuthInfo(BaseModel):
+    """Webhook 共享 token（.env 的 AUTH_TOKEN），供管理员复制进 TradingView 请求体。"""
+    enabled: bool
+    token: str
+
+
+class WebhookAuthUpdate(BaseModel):
+    """配置页开关：开启后 /webhook 必须带 AUTH_TOKEN。"""
+    enabled: bool
+
+
 class ClientVersionOut(BaseModel):
     """客户端安装包版本条目。"""
     version: str
@@ -194,6 +205,8 @@ class GroupCreate(BaseModel):
     name: str = Field(min_length=1, max_length=64)
     enabled: bool = True
     dispatch_mode: str = "sync"  # sync / poll
+    # 信号并发：仅全员同步生效；开启后同组同节点可同时处理多条开仓信号（默认关）
+    signal_concurrent_enabled: bool = False
     # 趋势风控：开仓前按全局趋势参数对各节点算信号品种趋势（默认关）
     trend_risk_enabled: bool = False
     # 限价挂单监听：仅绑定趋势策略的分组可开（默认关）；关键字默认 limit，空串表示不按注释过滤
@@ -210,6 +223,7 @@ class GroupUpdate(BaseModel):
     name: Optional[str] = None
     enabled: Optional[bool] = None
     dispatch_mode: Optional[str] = None
+    signal_concurrent_enabled: Optional[bool] = None
     trend_risk_enabled: Optional[bool] = None
     limit_watch_enabled: Optional[bool] = None
     limit_watch_keyword: Optional[str] = Field(default=None, max_length=32)
@@ -253,6 +267,7 @@ class GroupOut(BaseModel):
     name: str
     enabled: bool = True
     dispatch_mode: str = "sync"
+    signal_concurrent_enabled: bool = False
     trend_risk_enabled: bool = False
     limit_watch_enabled: bool = False
     # 空串 = 不按注释过滤；缺省展示仍是 limit

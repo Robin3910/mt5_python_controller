@@ -140,7 +140,8 @@ async def mk_strategy(store, *, symbol="XAUUSD", name=None, enabled=True, rules=
 
 
 async def mk_group(store, name, node_ids, *, mode="sync", enabled=True,
-                   symbol="XAUUSD", strategy=None, bind_strategy=True):
+                   symbol="XAUUSD", strategy=None, bind_strategy=True,
+                   signal_concurrent_enabled=False):
     """建分组；默认自动绑定一条同品种策略，使其能接收 strategy 信号。"""
     strategy_id = None
     if bind_strategy:
@@ -150,6 +151,7 @@ async def mk_group(store, name, node_ids, *, mode="sync", enabled=True,
         store,
         GroupCreate(
             name=name, enabled=enabled, dispatch_mode=mode,
+            signal_concurrent_enabled=signal_concurrent_enabled,
             strategy_id=strategy_id, node_ids=list(node_ids),
         ),
     )
@@ -688,6 +690,63 @@ async def test_busy_node_is_skipped_on_second_signal(store, monkeypatch):
     assert [r.status for r in rows] == ["skipped"]
     assert rows[0].magic is None
     assert "进行中的子任务" in rows[0].skip_reason
+
+
+async def test_sync_signal_concurrent_sends_second_signal(store, monkeypatch):
+    """全员同步打开信号并发后，同一节点可以同时接下第二条开仓信号。"""
+    await online(store, mk_node("nd_a"))
+    group = await mk_group(
+        store, "并发组", ["nd_a"], signal_concurrent_enabled=True,
+    )
+    gid = group["group_id"]
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    dispatcher = GroupDispatcher(store)
+
+    first = await dispatcher.dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_cc1",
+    )
+    assert first["tasks"][0]["status"] == "dispatching"
+    assert await store.get_group_node_busy(gid, "nd_a") is None
+
+    second = await dispatcher.dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_cc2",
+    )
+    assert second["targets"] == 1
+    assert second["tasks"][0]["status"] == "dispatching"
+    assert len(sent) == 2
+
+    rows1 = await fetch_dispatches((await fetch_tasks("sig_cc1"))[0].task_id)
+    rows2 = await fetch_dispatches((await fetch_tasks("sig_cc2"))[0].task_id)
+    assert [r.status for r in rows1] == ["sent"]
+    assert [r.status for r in rows2] == ["sent"]
+    assert rows1[0].magic is not None and rows2[0].magic is not None
+    assert rows1[0].magic != rows2[0].magic
+
+
+async def test_poll_ignores_signal_concurrent_flag(store, monkeypatch):
+    """轮询即使缓存里信号并发为真，同一节点仍只接一条进行中的任务。"""
+    await online(store, mk_node("nd_a"))
+    group = await mk_group(store, "轮询并发无效组", ["nd_a"], mode="poll")
+    group["dispatch_mode"] = "poll"
+    group["signal_concurrent_enabled"] = True
+    await store.cache_group(group)
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    dispatcher = GroupDispatcher(store)
+
+    first = await dispatcher.dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_poll_cc1",
+    )
+    assert first["tasks"][0]["status"] == "dispatching"
+
+    second = await dispatcher.dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_poll_cc2",
+    )
+    assert second["targets"] == 0
+    assert second["tasks"][0]["status"] == "skipped"
+    assert "均有进行中的任务" in second["tasks"][0]["reason"]
+    assert len(sent) == 1
 
 
 async def test_node_accepts_new_signal_after_subtask_finished(store, monkeypatch):

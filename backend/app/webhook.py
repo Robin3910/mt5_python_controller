@@ -18,7 +18,7 @@ import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from . import group_rules, persist
+from . import group_rules, persist, system_settings
 from .deps import client_ip, get_dispatcher, get_group_dispatcher, get_store
 from .dispatcher import Dispatcher
 from .group_dispatcher import GroupDispatcher
@@ -210,8 +210,8 @@ async def webhook(
     except json.JSONDecodeError:
         data = text  # 纯文本
 
-    # token 鉴权（仅在 ENABLE_AUTH 开启时校验）
-    if settings.enable_auth:
+    # token 鉴权：配置页保存过则以开关为准，否则看 ENABLE_AUTH（默认开启）
+    if await system_settings.is_webhook_auth_enabled(store):
         token = _extract_token(request, data)
         if token != settings.auth_token:
             logger.warning("webhook rejected (bad token) from %s", ip)

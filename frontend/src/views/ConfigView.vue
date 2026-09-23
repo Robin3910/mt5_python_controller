@@ -1,6 +1,9 @@
 <script setup lang="ts">
 // 配置页：账户设置
 import { onMounted, reactive, ref } from 'vue'
+import { ElSwitch } from 'element-plus'
+import 'element-plus/es/components/switch/style/css'
+import 'element-plus/theme-chalk/dark/css-vars.css'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useHubStore } from '@/stores/hub'
@@ -28,10 +31,13 @@ const nodeToken = reactive({ value: '', updated_at: 0 })
 const nodeTokenShow = ref(false)
 const nodeTokenLoading = ref(false)
 const nodeTokenError = ref('')
+const webhookAuthEnabled = ref(true)
+const webhookAuthLoading = ref(false)
 
 onMounted(async () => {
   await load2faStatus()
   await loadNodeToken()
+  await loadWebhookAuth()
 })
 
 async function loadNodeToken(): Promise<void> {
@@ -70,6 +76,38 @@ async function rotateNodeToken(): Promise<void> {
     nodeTokenError.value = '重置失败，请稍后重试'
   } finally {
     nodeTokenLoading.value = false
+  }
+}
+
+async function loadWebhookAuth(): Promise<void> {
+  try {
+    const info = await hub.fetchWebhookAuth()
+    webhookAuthEnabled.value = info.enabled
+  } catch {
+    nodeTokenError.value = nodeTokenError.value || '无法加载 Webhook 鉴权开关'
+  }
+}
+
+async function onWebhookAuthChange(value: boolean | string | number): Promise<void> {
+  const next = value === true || value === 'true' || value === 1
+  if (next === webhookAuthEnabled.value || webhookAuthLoading.value) return
+  if (!next) {
+    const ok = await confirmAction(
+      '关闭后，调用 /webhook 不再校验 token。知道该地址的请求都可以下发信号。',
+      '关闭 Webhook 鉴权',
+    )
+    if (!ok) return
+  }
+  webhookAuthLoading.value = true
+  nodeTokenError.value = ''
+  try {
+    const info = await hub.setWebhookAuth(next)
+    webhookAuthEnabled.value = info.enabled
+    flash(info.enabled ? '已开启 Webhook token 校验' : '已关闭 Webhook token 校验')
+  } catch {
+    nodeTokenError.value = 'Webhook 鉴权开关保存失败'
+  } finally {
+    webhookAuthLoading.value = false
   }
 }
 
@@ -262,6 +300,18 @@ async function changePassword(): Promise<void> {
         所有 node_client 共享此令牌进行接入鉴权。将其填入每个节点 <code>.env</code> 的
         <code>NODE_TOKEN</code>。点击「重置」会立即作废旧令牌，所有节点必须更新后才能重新接入。
       </p>
+      <div class="webhook-auth-row">
+        <span class="webhook-auth-label">Webhook 校验 token</span>
+        <ElSwitch
+          :model-value="webhookAuthEnabled"
+          :loading="webhookAuthLoading"
+          :disabled="webhookAuthLoading"
+          @change="onWebhookAuthChange"
+        />
+        <span class="muted webhook-auth-hint">
+          {{ webhookAuthEnabled ? '开启：调用 /webhook 必须携带 AUTH_TOKEN' : '关闭：调用 /webhook 不校验 token' }}
+        </span>
+      </div>
       <div class="form-grid">
         <div>
           <label>当前令牌</label>
@@ -387,3 +437,20 @@ async function changePassword(): Promise<void> {
     </div>
   </div>
 </template>
+
+<style scoped>
+.webhook-auth-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 4px 0 14px;
+}
+.webhook-auth-label {
+  font-size: 13px;
+  font-weight: 600;
+}
+.webhook-auth-hint {
+  font-size: 12px;
+}
+</style>

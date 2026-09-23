@@ -21,6 +21,7 @@ K_ONLINE = "node:online:{}"      # 在线标记（带 TTL）
 K_ACCOUNT = "node:account:{}"    # 账户快照（JSON）
 K_FILTERS = "config:filters"     # 多区间方向过滤配置
 K_NODE_TOKEN = "config:node_token"   # 全局节点接入令牌（明文）
+K_WEBHOOK_AUTH = "config:webhook_auth_enabled"  # Webhook 是否校验 AUTH_TOKEN（"1"/"0"）
 K_DEDUP = "dedup:{}"             # 信号去重指纹（带 TTL）
 K_EXEC_LOCK = "lock:exec:{}:{}"  # (node, symbol) 执行锁
 K_POLL_PENDING = "signal:poll:pending"  # 轮询待处理队列（List）
@@ -102,6 +103,15 @@ class RedisStore:
 
     async def set_node_token(self, token: str) -> None:
         await self.r.set(K_NODE_TOKEN, token)
+
+    async def get_webhook_auth_enabled(self) -> Optional[bool]:
+        raw = await self.r.get(K_WEBHOOK_AUTH)
+        if raw is None:
+            return None
+        return raw == "1"
+
+    async def set_webhook_auth_enabled(self, enabled: bool) -> None:
+        await self.r.set(K_WEBHOOK_AUTH, "1" if enabled else "0")
 
     # ----------------- 在线状态 / 心跳 -----------------
     async def touch_online(self, node_id: str) -> None:

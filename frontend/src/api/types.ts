@@ -293,6 +293,12 @@ export interface NodeTokenInfo {
   updated_at: number
 }
 
+/** Webhook 共享 token（.env AUTH_TOKEN），供复制进 TradingView 请求体 */
+export interface WebhookAuthInfo {
+  enabled: boolean
+  token: string
+}
+
 export interface NodeCreatePayload {
   // 留空时后端会自动生成 "{序号}-{mt5_login}"（序号从 1 起按节点位置递增）
   name?: string
@@ -364,6 +370,8 @@ export interface GroupOut {
   name: string
   enabled: boolean
   dispatch_mode: GroupDispatchMode
+  /** 信号并发：仅全员同步生效；开启后同组同节点可同时处理多条开仓信号（默认关） */
+  signal_concurrent_enabled: boolean
   /** 趋势风控：开仓前按全局趋势参数对各节点算信号品种趋势（默认关） */
   trend_risk_enabled: boolean
   /** 限价挂单监听：把节点 MT5 上手动挂的带关键字限价单转成 strategy 信号（默认关） */
@@ -441,6 +449,7 @@ export interface GroupCreatePayload {
   name: string
   enabled?: boolean
   dispatch_mode?: GroupDispatchMode
+  signal_concurrent_enabled?: boolean
   trend_risk_enabled?: boolean
   limit_watch_enabled?: boolean
   limit_watch_keyword?: string
@@ -454,6 +463,7 @@ export interface GroupUpdatePayload {
   name?: string
   enabled?: boolean
   dispatch_mode?: GroupDispatchMode
+  signal_concurrent_enabled?: boolean
   trend_risk_enabled?: boolean
   limit_watch_enabled?: boolean
   limit_watch_keyword?: string

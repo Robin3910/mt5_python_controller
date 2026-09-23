@@ -17,9 +17,11 @@
 策略托管：开仓信号下发的是 `strategy_start`，携带首单参数与策略规则快照，
 节点据此持续监控加仓，直到该魔术号的持仓全部平掉才算完成。
 
-并发控制的粒度是「分组 + 节点」：同一分组内一个节点同时只允许一个策略任务
-（Redis 占位 + 落库的子任务状态双保险）；不同分组各自独立，同一节点可以同时承接
-多个分组的任务。CLOSE 信号是终止指令，绕过互斥直接结束相关子任务。
+并发控制的粒度是「分组 + 节点」：默认同一分组内一个节点同时只允许一个策略任务
+（Redis 占位 + 落库的子任务状态双保险）。全员同步且分组打开「信号并发」时跳过
+这两道门，同一节点可同时承接该分组的多条开仓信号，且不下写单槽占位。
+不同分组各自独立，同一节点可以同时承接多个分组的任务。CLOSE 信号是终止指令，
+绕过互斥直接结束相关子任务。
 """
 from __future__ import annotations
 
@@ -620,46 +622,53 @@ class GroupDispatcher:
             "group_id": group_id, "node_id": node_id,
             "symbol": signal.symbol, "decided_vol": volume,
         }
+        # 全员同步 + 信号并发：不抢、不写单槽占位，允许同节点多条开仓并存
+        concurrent = group_rules.allows_signal_concurrent(group)
 
-        if not await self.store.acquire_group_node_busy(
-            group_id, node_id, "pending", Config.NODE_BUSY_TTL,
-        ):
-            reason = await self._busy_reason(group_id, node_id)
-            await group_persist.record_skipped_dispatch(
-                **base, status="skipped", skip_reason=reason,
-            )
-            logger.info("group %s node %s busy: %s", group_id, node_id, reason)
-            return {"node_id": node_id, "status": "skipped", "magic": None,
-                    "volume": volume, "reason": reason}
+        if not concurrent:
+            if not await self.store.acquire_group_node_busy(
+                group_id, node_id, "pending", Config.NODE_BUSY_TTL,
+            ):
+                reason = await self._busy_reason(group_id, node_id)
+                await group_persist.record_skipped_dispatch(
+                    **base, status="skipped", skip_reason=reason,
+                )
+                logger.info("group %s node %s busy: %s", group_id, node_id, reason)
+                return {"node_id": node_id, "status": "skipped", "magic": None,
+                        "volume": volume, "reason": reason}
 
-        # 占位有 TTL 兜底，长期运行的子任务可能在占位过期后被再次抢到；
-        # 以库里的真实状态复核，命中则续上占位并跳过，避免同一节点跑两个任务
-        stale = await group_persist.active_subtask_id(group_id, node_id)
-        if stale is not None:
-            await self.store.set_group_node_busy(
-                group_id, node_id, str(stale), Config.NODE_BUSY_TTL,
-            )
-            reason = f"该节点在本分组内已有进行中的子任务 #{stale}，本次跳过"
-            await group_persist.record_skipped_dispatch(
-                **base, status="skipped", skip_reason=reason,
-            )
-            logger.info("group %s node %s busy (db): %s", group_id, node_id, reason)
-            return {"node_id": node_id, "status": "skipped", "magic": None,
-                    "volume": volume, "reason": reason}
+            # 占位有 TTL 兜底，长期运行的子任务可能在占位过期后被再次抢到；
+            # 以库里的真实状态复核，命中则续上占位并跳过，避免同一节点跑两个任务
+            stale = await group_persist.active_subtask_id(group_id, node_id)
+            if stale is not None:
+                await self.store.set_group_node_busy(
+                    group_id, node_id, str(stale), Config.NODE_BUSY_TTL,
+                )
+                reason = f"该节点在本分组内已有进行中的子任务 #{stale}，本次跳过"
+                await group_persist.record_skipped_dispatch(
+                    **base, status="skipped", skip_reason=reason,
+                )
+                logger.info("group %s node %s busy (db): %s", group_id, node_id, reason)
+                return {"node_id": node_id, "status": "skipped", "magic": None,
+                        "volume": volume, "reason": reason}
 
-        # 趋势风控：占位已抢到、建子任务前，按该节点终端行情做顺势门禁
+        # 趋势风控：建子任务前，按该节点终端行情做顺势门禁
         if group.get("trend_risk_enabled"):
             blocked = await self._trend_risk_block(
                 group_id, node_id, signal, base, volume,
+                release_busy=not concurrent,
             )
             if blocked is not None:
                 return blocked
 
         try:
-            return await self._dispatch_locked_node(base, command)
+            return await self._dispatch_locked_node(
+                base, command, hold_busy=not concurrent,
+            )
         except Exception as e:  # noqa: BLE001
             # 抢到占位后中途出错：立刻放开，否则要等 TTL 才能再下发
-            await self.store.release_group_node_busy(group_id, node_id)
+            if not concurrent:
+                await self.store.release_group_node_busy(group_id, node_id)
             logger.warning("group %s node %s dispatch failed: %s", group_id, node_id, e)
             return {"node_id": node_id, "status": "offline", "magic": None,
                     "volume": volume, "reason": "下发失败：节点处理异常"}
@@ -671,9 +680,13 @@ class GroupDispatcher:
         signal: TradingSignal,
         base: dict,
         volume: float,
+        *,
+        release_busy: bool = True,
     ) -> Optional[dict]:
-        """开启趋势风控时：探针 + 判定；需拦截则释放占位并记 skipped，返回 outcome。
+        """开启趋势风控时：探针 + 判定；需拦截则记 skipped，返回 outcome。
 
+        调用方已抢到占位时 release_busy 为真，拦截后放开占位。
+        信号并发未占位时不得删键，否则会清掉其它任务留下的占位。
         放行时返回 None，由调用方继续建子任务下发。
         """
         reason: Optional[str] = None
@@ -707,7 +720,8 @@ class GroupDispatcher:
         if not reason:
             return None
 
-        await self.store.release_group_node_busy(group_id, node_id)
+        if release_busy:
+            await self.store.release_group_node_busy(group_id, node_id)
         await group_persist.record_skipped_dispatch(
             **base, status="skipped", skip_reason=reason,
         )
@@ -717,8 +731,13 @@ class GroupDispatcher:
             "volume": volume, "reason": reason,
         }
 
-    async def _dispatch_locked_node(self, base: dict, command: dict) -> dict:
-        """已持有组内节点占位后的下发：建子任务拿魔术号 -> 发命令。"""
+    async def _dispatch_locked_node(
+        self, base: dict, command: dict, *, hold_busy: bool = True,
+    ) -> dict:
+        """下发已通过互斥门禁的节点：建子任务拿魔术号 -> 发命令。
+
+        hold_busy 为假表示信号并发，不写、不释放单槽占位。
+        """
         node_id, group_id = base["node_id"], base["group_id"]
         volume = base["decided_vol"]
         # 网格等策略空仓是常态：建子任务时写入，对账热路径不必再解析策略快照
@@ -730,16 +749,18 @@ class GroupDispatcher:
             **base, hold_when_empty=hold_when_empty,
         )
         if created is None:
-            await self.store.release_group_node_busy(group_id, node_id)
+            if hold_busy:
+                await self.store.release_group_node_busy(group_id, node_id)
             reason = "子任务创建失败，已放弃该节点"
             logger.warning("group %s node %s: %s", group_id, node_id, reason)
             return {"node_id": node_id, "status": "offline", "magic": None,
                     "volume": volume, "reason": reason}
 
         dispatch_id, magic = created["dispatch_id"], created["magic"]
-        await self.store.set_group_node_busy(
-            group_id, node_id, str(dispatch_id), Config.NODE_BUSY_TTL,
-        )
+        if hold_busy:
+            await self.store.set_group_node_busy(
+                group_id, node_id, str(dispatch_id), Config.NODE_BUSY_TTL,
+            )
         cmd = for_node(command, dispatch_id=dispatch_id, magic=magic)
         if await manager.send_to_node(node_id, cmd):
             await group_persist.set_dispatch_status(dispatch_id, "sent")
@@ -748,7 +769,8 @@ class GroupDispatcher:
 
         reason = "下发失败：节点连接已断开"
         await group_persist.set_dispatch_status(dispatch_id, "offline", skip_reason=reason)
-        await self.store.release_group_node_busy(group_id, node_id)
+        if hold_busy:
+            await self.store.release_group_node_busy(group_id, node_id)
         return {"node_id": node_id, "status": "offline", "magic": magic,
                 "dispatch_id": dispatch_id, "volume": volume, "reason": reason}
 
