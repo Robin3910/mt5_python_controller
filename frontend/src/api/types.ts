@@ -201,6 +201,9 @@ export interface NodeOut {
   client_version_at: number | null
   created_at: number
   last_seen: number | null
+  /** 数据归属：null = 管理员名下 */
+  owner_user_id?: number | null
+  owner_username?: string | null
 }
 
 export interface Position {
@@ -370,7 +373,7 @@ export interface GroupOut {
   name: string
   enabled: boolean
   dispatch_mode: GroupDispatchMode
-  /** 信号并发：仅全员同步生效；开启后同组同节点可同时处理多条开仓信号（默认关） */
+  /** 信号并发：仅全员同步 + 绑定网格/趋势策略时可用；开启后同组同节点可同时处理多条开仓信号（默认关） */
   signal_concurrent_enabled: boolean
   /** 趋势风控：开仓前按全局趋势参数对各节点算信号品种趋势（默认关） */
   trend_risk_enabled: boolean
@@ -394,6 +397,9 @@ export interface GroupOut {
   active_task_count: number
   /** 已开限价监听时附带的最近日志（新→旧）；未开启为空 */
   limit_watch_logs?: LimitWatchLogOut[]
+  /** 数据归属：null = 管理员名下；成员节点与绑定策略必须同一所有者 */
+  owner_user_id?: number | null
+  owner_username?: string | null
 }
 
 export type LimitWatchLogEvent =
@@ -665,6 +671,9 @@ export interface StrategyOut {
   rules: StrategyRule[]
   remark: string | null
   created_at: number
+  /** 数据归属：null = 管理员名下 */
+  owner_user_id?: number | null
+  owner_username?: string | null
 }
 
 export interface StrategyCreatePayload {
@@ -1168,3 +1177,107 @@ export interface ClientVersionListOut {
   /** 未上报版本的节点数（旧客户端或从未上线） */
   unknown_node_count: number
 }
+
+// ----------------------------- 用户与权限 -----------------------------
+
+export interface RoleRef {
+  id: number
+  code: string
+  name: string
+  enabled: boolean
+}
+
+/** 当前登录用户：menus 驱动导航与路由守卫，is_admin 控制管理员操作是否显示 */
+export interface MeInfo {
+  user_id: number
+  username: string
+  display_name: string | null
+  is_admin: boolean
+  roles: RoleRef[]
+  menus: string[]
+}
+
+/** 菜单注册表条目；assignable=false 的只属于超级管理员 */
+export interface MenuDef {
+  code: string
+  name: string
+  path: string
+  assignable: boolean
+}
+
+export interface RoleOut {
+  id: number
+  code: string
+  name: string
+  is_builtin: boolean
+  enabled: boolean
+  remark: string | null
+  menus: string[]
+  user_count: number
+  created_at: number | null
+}
+
+export interface RoleCreatePayload {
+  code: string
+  name: string
+  remark?: string | null
+  enabled?: boolean
+  menus: string[]
+}
+
+export interface RoleUpdatePayload {
+  name?: string
+  remark?: string | null
+  enabled?: boolean
+}
+
+export interface UserOut {
+  id: number
+  username: string
+  display_name: string | null
+  is_active: boolean
+  is_admin: boolean
+  totp_enabled: boolean
+  roles: RoleRef[]
+  node_ids: string[]
+  group_count: number
+  strategy_count: number
+  created_at: number | null
+}
+
+export interface UserCreatePayload {
+  username: string
+  password: string
+  display_name?: string | null
+  is_active?: boolean
+  role_ids?: number[]
+}
+
+export interface UserUpdatePayload {
+  display_name?: string | null
+  is_active?: boolean
+}
+
+export interface UserNodesResult {
+  node_ids: string[]
+  added: string[]
+  removed: string[]
+  removed_memberships: NodeMembershipConflict[]
+}
+
+/** 节点分配时仍在分组中的成员关系（确认后会被移出分组） */
+export interface NodeMembershipConflict {
+  group_id: string
+  group_name: string | null
+  node_id: string
+  node_name: string | null
+}
+
+/** 节点分配 409 的两类原因：有进行中的策略任务 / 需确认移出分组 */
+export type NodeAssignConflict =
+  | {
+      reason: 'active_tasks'
+      message: string
+      nodes: { node_id: string; name: string | null; tasks: number }[]
+    }
+  | { reason: 'confirm_required'; message: string; memberships: NodeMembershipConflict[] }

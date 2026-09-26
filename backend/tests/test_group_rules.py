@@ -11,6 +11,7 @@ from app.strategy_templates import (
     TEMPLATE_1_ID,
     TEMPLATE_1_NAME,
     TEMPLATE_2_ID,
+    TEMPLATE_3_ID,
 )
 
 
@@ -110,6 +111,24 @@ def test_missing_group_ids_empty_when_all_known(group_ids):
 )
 def test_normalize_dispatch_mode(raw, expected):
     assert group_rules.normalize_dispatch_mode(raw) == expected
+
+
+# =====================================================================
+# 信号并发的策略模版限定：仅网格（tpl_3）、趋势（tpl_2）可用
+# =====================================================================
+@pytest.mark.parametrize("template_id", [TEMPLATE_2_ID, "TPL_2", " tpl_3 "])
+def test_supports_signal_concurrent_accepts_grid_and_trend(template_id):
+    assert group_rules.supports_signal_concurrent({"template_id": template_id}) is True
+
+
+@pytest.mark.parametrize("template_id", [TEMPLATE_1_ID, "tpl_x", "", None])
+def test_supports_signal_concurrent_rejects_others(template_id):
+    assert group_rules.supports_signal_concurrent({"template_id": template_id}) is False
+
+
+@pytest.mark.parametrize("strategy", [None, "tpl_2", [], {"name": "x"}])
+def test_supports_signal_concurrent_rejects_non_dict(strategy):
+    assert group_rules.supports_signal_concurrent(strategy) is False
 
 
 # =====================================================================

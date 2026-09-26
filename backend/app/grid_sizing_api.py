@@ -1,4 +1,4 @@
-"""网格试算 API（只读，需管理员鉴权）。
+"""网格试算 API（只读，需登录；普通用户只能以本人节点为行情源）。
 
 模版3 配置助手的取数与编排：向目标节点索取 K 线与合约规格（market_probe），再用
 grid_sizing 的纯函数算出建议的网格数量与每格手数。本模块只做鉴权、参数收集与编排，
@@ -15,7 +15,8 @@ import time
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from . import grid_sizing, market_probe
-from .deps import get_current_admin, get_store
+from .deps import get_principal, get_store, owned_node_or_404
+from .permissions import Principal
 from .redis_store import RedisStore
 
 router = APIRouter(prefix="/api/nodes", tags=["grid"])
@@ -64,16 +65,14 @@ async def node_grid_sizing(
     timeframe: str = Query(grid_sizing.DEFAULT_TIMEFRAME, description="算 ATR 的 K 线周期"),
     params: dict = Depends(sizing_params),
     store: RedisStore = Depends(get_store),
-    _: str = Depends(get_current_admin),
+    p: Principal = Depends(get_principal),
 ):
     """按 ATR 与风险预算试算网格数量与每格手数（只给建议，不写任何配置）。
 
     ATR 只跟品种与周期有关，倍数、亏损预算这些参数改了通常直接命中行情缓存，
-    不会额外惊动节点终端。
+    不会额外惊动节点终端。普通用户只能以本人节点为行情源。
     """
-    node = await store.get_node(node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="node not found")
+    await owned_node_or_404(store, p, node_id)
 
     sym = (symbol or "").strip().upper()
     if not _SYMBOL_RE.match(sym):

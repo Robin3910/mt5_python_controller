@@ -1,10 +1,12 @@
 <script setup lang="ts">
 // 手动触发策略信号：按钮 + 表单弹窗 + 二次确认
-// 与 Webhook 的 model=strategy 走同一条分组分发链路，只是入口换成后台管理员操作
+// 与 Webhook 的 model=strategy 走同一条分组分发链路，只是入口换成后台操作。
+// 普通用户只作用于本人分组（后端收窄），也拿不到全局 Webhook token，不提供复制 JSON
 import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
 import FormLabel from '@/components/FormLabel.vue'
+import { useAuthStore } from '@/stores/auth'
 import { useHubStore } from '@/stores/hub'
 import type {
   GroupDispatchMode,
@@ -20,6 +22,7 @@ const emit = defineEmits<{
 }>()
 
 const hub = useHubStore()
+const authStore = useAuthStore()
 
 const DISPATCH_MODE_LABEL: Record<GroupDispatchMode, string> = {
   sync: '全员同步',
@@ -179,7 +182,9 @@ async function openTrigger(): Promise<void> {
     const [groups, , auth] = await Promise.all([
       hub.listGroups(),
       hub.fetchStrategies(),
-      hub.fetchWebhookAuth().catch(() => ({ enabled: false, token: '' })),
+      authStore.isAdmin
+        ? hub.fetchWebhookAuth().catch(() => ({ enabled: false, token: '' }))
+        : Promise.resolve({ enabled: false, token: '' }),
     ])
     triggerGroups.value = groups
     webhookAuthToken.value = auth.token || ''
@@ -220,7 +225,7 @@ function buildWebhookSignalPayload(payload: ManualSignalPayload): Record<string,
   if (payload.take_profit) data.tp = payload.take_profit
   if (payload.entry_price) data.limit_price = payload.entry_price
   if (payload.comment) data.comment = payload.comment
-  data.token = webhookAuthToken.value
+  if (authStore.isAdmin) data.token = webhookAuthToken.value
   return data
 }
 
@@ -571,7 +576,12 @@ async function confirmSubmitTrigger(): Promise<void> {
             <template v-if="triggerPayloadExpanded">
               <div class="trigger-payload-head row between">
                 <span class="muted" style="font-size: 12px">Webhook 同构 JSON，与手动触发经后端转换后的信号体一致</span>
-                <button type="button" class="btn-sm btn-ghost" @click.stop="copyPendingTriggerPayload">
+                <button
+                  v-if="authStore.isAdmin"
+                  type="button"
+                  class="btn-sm btn-ghost"
+                  @click.stop="copyPendingTriggerPayload"
+                >
                   {{ triggerCopyTip || '复制 JSON' }}
                 </button>
               </div>

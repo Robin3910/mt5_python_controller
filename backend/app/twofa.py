@@ -1,4 +1,4 @@
-"""后台双因素认证（TOTP）管理 API。"""
+"""后台双因素认证（TOTP）管理 API：作用于当前登录用户自己的账号。"""
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from . import persist
@@ -44,7 +44,7 @@ async def twofa_setup(
     if not data:
         raise HTTPException(status_code=404, detail="user not found")
 
-    await persist.audit(admin, "2fa_setup", admin, None, "ok", client_ip(request))
+    await persist.audit(admin, "2fa_setup", admin, None, "ok", client_ip(request), category="auth")
     return data
 
 
@@ -58,7 +58,7 @@ async def twofa_confirm(
     if not await confirm_totp(admin, body.totp_code):
         raise HTTPException(status_code=400, detail="invalid totp code")
 
-    await persist.audit(admin, "2fa_confirm", admin, None, "ok", client_ip(request))
+    await persist.audit(admin, "2fa_confirm", admin, None, "ok", client_ip(request), category="auth")
     return {"ok": True, "enabled": True}
 
 
@@ -78,7 +78,7 @@ async def twofa_enable(
     if not await enable_totp(admin, body.totp_code):
         raise HTTPException(status_code=400, detail="invalid totp code")
 
-    await persist.audit(admin, "2fa_enable", admin, None, "ok", client_ip(request))
+    await persist.audit(admin, "2fa_enable", admin, None, "ok", client_ip(request), category="auth")
     return {"ok": True, "enabled": True}
 
 
@@ -96,7 +96,7 @@ async def twofa_disable(
     if not await disable_totp(admin):
         raise HTTPException(status_code=404, detail="user not found")
 
-    await persist.audit(admin, "2fa_disable", admin, None, "ok", client_ip(request))
+    await persist.audit(admin, "2fa_disable", admin, None, "ok", client_ip(request), category="auth")
     return {"ok": True, "enabled": False}
 
 
@@ -114,5 +114,5 @@ async def twofa_reset(
     if not await reset_totp(admin):
         raise HTTPException(status_code=404, detail="user not found")
 
-    await persist.audit(admin, "2fa_reset", admin, None, "ok", client_ip(request))
+    await persist.audit(admin, "2fa_reset", admin, None, "ok", client_ip(request), category="auth")
     return {"ok": True, "enabled": False, "bound": False}

@@ -1,14 +1,25 @@
-"""远程平仓 API：单节点 / 全员广播（需管理员鉴权）。"""
+"""远程平仓 API：单节点 / 批量 / 全员广播。
+
+普通用户只能平本人节点（总览页与节点页都有入口）；全员广播平仓仅管理员。
+"""
 import secrets
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from . import persist
+from . import permissions, persist
 from .connections import manager
-from .deps import client_ip, get_current_admin, get_group_dispatcher, get_store
+from .deps import (
+    client_ip,
+    get_group_dispatcher,
+    get_store,
+    owned_node_or_404,
+    require_admin,
+    require_menu,
+)
 from .group_dispatcher import GroupDispatcher
 from .models import CloseBatchRequest, CloseRequest, build_close_command
+from .permissions import MENU_DASHBOARD, MENU_NODES, Principal
 from .redis_store import RedisStore
 
 router = APIRouter(prefix="/api", tags=["close"])
@@ -41,14 +52,14 @@ async def close_node(
     request: Request,
     store: RedisStore = Depends(get_store),
     group_dispatcher: GroupDispatcher = Depends(get_group_dispatcher),
-    admin: str = Depends(get_current_admin),
+    p: Principal = Depends(require_menu(MENU_NODES, MENU_DASHBOARD)),
 ):
     """对单个节点下发平仓（全平 / 按品种 / 按订单）。
 
     全平会先终止该节点上所有未收口的策略子任务，再下发 close，避免网格/限价监控把仓补回来。
     """
-    if not await store.get_node(node_id):
-        raise HTTPException(status_code=404, detail="node not found")
+    await owned_node_or_404(store, p, node_id)
+    admin = p.username
     signal_id = _cmd_id()
     strategies = await _stop_strategies_on_flatten(
         group_dispatcher, node_id, signal_id, body.target,
@@ -73,9 +84,10 @@ async def close_all(
     request: Request,
     store: RedisStore = Depends(get_store),
     group_dispatcher: GroupDispatcher = Depends(get_group_dispatcher),
-    admin: str = Depends(get_current_admin),
+    p: Principal = Depends(require_admin),
 ):
-    """对所有在线节点广播平仓（危险操作，前端会二次确认）。"""
+    """对所有在线节点广播平仓（危险操作，前端会二次确认；仅管理员）。"""
+    admin = p.username
     signal_id = _cmd_id()
     cmd = build_close_command(signal_id, body.target, body.symbol, body.ticket)
     sent = []
@@ -106,9 +118,10 @@ async def close_batch(
     request: Request,
     store: RedisStore = Depends(get_store),
     group_dispatcher: GroupDispatcher = Depends(get_group_dispatcher),
-    admin: str = Depends(get_current_admin),
+    p: Principal = Depends(require_menu(MENU_NODES)),
 ):
-    """对指定节点批量下发平仓（全平 / 按品种 / 按订单）。"""
+    """对指定节点批量下发平仓（全平 / 按品种 / 按订单）；不属于自己的节点按不存在处理。"""
+    admin = p.username
     signal_id = _cmd_id()
     cmd = build_close_command(signal_id, body.target, body.symbol, body.ticket)
     sent: list[str] = []
@@ -119,7 +132,8 @@ async def close_batch(
         if node_id in seen:
             continue
         seen.add(node_id)
-        if not await store.get_node(node_id):
+        node = await store.get_node(node_id)
+        if not node or not permissions.owns(p, node.get("owner_user_id")):
             failed.append({"node_id": node_id, "reason": "not_found"})
             continue
         strategies = await _stop_strategies_on_flatten(

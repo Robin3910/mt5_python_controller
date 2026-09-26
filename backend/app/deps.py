@@ -1,13 +1,19 @@
-"""FastAPI 依赖项（鉴权 + 共享服务注入）。"""
+"""FastAPI 依赖项（鉴权 + 共享服务注入）。
+
+后台鉴权分三层：`get_principal` 校验 JWT 得到登录身份；`require_menu` /
+`require_admin` 校验功能权限；`owned_*_or_404` 校验数据归属（不属于自己的
+一律 404，不暴露资源是否存在）。
+"""
 from typing import Optional
 
 from fastapi import Depends, Header, HTTPException, Request
 
-from . import system_settings
+from . import permissions, rbac_service, system_settings
 from .dispatcher import Dispatcher
 from .group_dispatcher import GroupDispatcher
+from .permissions import Principal
 from .redis_store import RedisStore
-from .security import compare_secret, verify_jwt
+from .security import compare_secret
 from .state import state
 
 
@@ -32,14 +38,61 @@ def get_group_dispatcher() -> GroupDispatcher:
     return state.group_dispatcher
 
 
-async def get_current_admin(authorization: Optional[str] = Header(default=None)) -> str:
-    """从 Authorization: Bearer <jwt> 解析并校验管理员身份。"""
+async def get_principal(authorization: Optional[str] = Header(default=None)) -> Principal:
+    """从 Authorization: Bearer <jwt> 解析登录身份（已禁用 / 会话已吊销视为无效）。"""
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="missing bearer token")
-    sub = verify_jwt(authorization.split(" ", 1)[1])
-    if not sub:
+    p = await rbac_service.principal_from_token(state.store, authorization.split(" ", 1)[1])
+    if p is None:
         raise HTTPException(status_code=401, detail="invalid or expired token")
-    return sub
+    return p
+
+
+async def get_current_admin(p: Principal = Depends(get_principal)) -> str:
+    """当前登录用户名（沿用旧名）。只要求已登录；功能与数据权限由 require_* / owned_* 把关。"""
+    return p.username
+
+
+def require_menu(*codes: str):
+    """要求拥有任一菜单（同一操作可能出现在多个页面）；管理员直接放行。"""
+    async def _require(p: Principal = Depends(get_principal)) -> Principal:
+        if not permissions.can_menu(p, *codes):
+            raise HTTPException(status_code=403, detail="无权访问该功能")
+        return p
+    return _require
+
+
+async def require_admin(p: Principal = Depends(get_principal)) -> Principal:
+    """仅超级管理员：全局配置、全局写操作与系统级页面。"""
+    if not p.is_admin:
+        raise HTTPException(status_code=403, detail="仅管理员可执行该操作")
+    return p
+
+
+async def get_admin_username(p: Principal = Depends(require_admin)) -> str:
+    """仅超级管理员，返回用户名（供只需要审计操作人的管理员接口直接替换 get_current_admin）。"""
+    return p.username
+
+
+async def owned_node_or_404(store: RedisStore, p: Principal, node_id: str) -> dict:
+    d = await store.get_node(node_id)
+    if not d or not permissions.owns(p, d.get("owner_user_id")):
+        raise HTTPException(status_code=404, detail="node not found")
+    return d
+
+
+async def owned_group_or_404(store: RedisStore, p: Principal, group_id: str) -> dict:
+    d = await store.get_group(group_id)
+    if not d or not permissions.owns(p, d.get("owner_user_id")):
+        raise HTTPException(status_code=404, detail="group not found")
+    return d
+
+
+async def owned_strategy_or_404(store: RedisStore, p: Principal, strategy_id: str) -> dict:
+    d = await store.get_strategy(strategy_id)
+    if not d or not permissions.owns(p, d.get("owner_user_id")):
+        raise HTTPException(status_code=404, detail="strategy not found")
+    return d
 
 
 async def get_node_token_auth(

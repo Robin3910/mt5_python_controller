@@ -1644,9 +1644,10 @@ def test_patch_group_trend_risk_enabled(client):
 
 
 def test_signal_concurrent_defaults_off_and_is_audited(client):
-    """信号并发默认关闭；打开后写入操作审计的前后快照。"""
+    """信号并发默认关闭；打开后写入操作审计的前后快照（需绑定趋势策略）。"""
     h = auth_headers(client)
-    g = _mk_group(client, h, name="并发默认关组", strategy_id=None)
+    sty = _mk_trend_strategy(client, h, name="并发审计趋势")
+    g = _mk_group(client, h, name="并发默认关组", strategy_id=sty["strategy_id"])
     gid = g["group_id"]
     assert g["signal_concurrent_enabled"] is False
 
@@ -1673,7 +1674,8 @@ def test_poll_mode_forces_signal_concurrent_off(client):
     assert created["signal_concurrent_enabled"] is False
 
     gid = _mk_group(
-        client, h, name="切轮询关并发组", strategy_id=None,
+        client, h, name="切轮询关并发组",
+        strategy_id=_mk_trend_strategy(client, h, name="轮询并发趋势")["strategy_id"],
         signal_concurrent_enabled=True,
     )["group_id"]
     assert client.get(f"/api/groups/{gid}", headers=h).json()["signal_concurrent_enabled"] is True
@@ -1682,6 +1684,103 @@ def test_poll_mode_forces_signal_concurrent_off(client):
     ).json()
     assert out["dispatch_mode"] == "poll"
     assert out["signal_concurrent_enabled"] is False
+
+
+def _mk_grid_strategy(client, headers, name: str = "网格策略实例", symbol: str = "XAUUSD") -> dict:
+    from app.strategy_templates import RULE_TYPE_GRID, TEMPLATE_3_ID
+    r = client.post(
+        "/api/strategies",
+        json={
+            "template_id": TEMPLATE_3_ID, "name": name, "symbol": symbol,
+            "rules": [{
+                "type": RULE_TYPE_GRID, "status": 1,
+                "price_lower": 100.0, "price_upper": 110.0,
+                "grid_count": 10, "grid_mode": "arithmetic",
+                "grid_side": "long", "lot_per_grid": 0.01,
+            }],
+        },
+        headers=headers,
+    )
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def test_signal_concurrent_only_for_grid_or_trend_strategy(client):
+    """信号并发只允许绑定网格 / 趋势策略的分组：未绑定与加仓策略一律 400。"""
+    h = auth_headers(client)
+
+    gid = _mk_group(client, h, name="无策略并发组", strategy_id=None)["group_id"]
+    r = client.patch(
+        f"/api/groups/{gid}", json={"signal_concurrent_enabled": True}, headers=h,
+    )
+    assert r.status_code == 400
+    assert "信号并发" in r.json()["detail"]
+
+    plain = _mk_strategy(client, h, name="加仓策略实例")
+    r = client.post(
+        "/api/groups",
+        json={
+            "name": "加仓并发组", "strategy_id": plain["strategy_id"],
+            "signal_concurrent_enabled": True,
+        },
+        headers=h,
+    )
+    assert r.status_code == 400
+    assert "信号并发" in r.json()["detail"]
+
+    gid2 = _mk_group(client, h, name="加仓补开组", strategy_id=plain["strategy_id"])["group_id"]
+    r = client.patch(
+        f"/api/groups/{gid2}", json={"signal_concurrent_enabled": True}, headers=h,
+    )
+    assert r.status_code == 400
+    assert "信号并发" in r.json()["detail"]
+
+    grid = _mk_grid_strategy(client, h, name="可并发网格")
+    g = _mk_group(
+        client, h, name="网格并发组", strategy_id=grid["strategy_id"],
+        signal_concurrent_enabled=True,
+    )
+    assert g["signal_concurrent_enabled"] is True
+
+    trend = _mk_trend_strategy(client, h, name="可并发趋势")
+    g = _mk_group(
+        client, h, name="趋势并发组", strategy_id=trend["strategy_id"],
+        signal_concurrent_enabled=True,
+    )
+    assert g["signal_concurrent_enabled"] is True
+
+
+def test_signal_concurrent_auto_off_when_rebound_off_grid_trend(client):
+    """已开并发的分组换绑到加仓策略时自动关闭；换绑同时显式要求打开则 400。"""
+    h = auth_headers(client)
+    trend = _mk_trend_strategy(client, h, name="待换绑趋势")
+    plain = _mk_strategy(client, h, name="换入加仓策略")
+    gid = _mk_group(
+        client, h, name="换绑关并发组", strategy_id=trend["strategy_id"],
+        signal_concurrent_enabled=True,
+    )["group_id"]
+
+    out = client.patch(
+        f"/api/groups/{gid}", json={"strategy_id": plain["strategy_id"]}, headers=h,
+    )
+    assert out.status_code == 200, out.text
+    assert out.json()["signal_concurrent_enabled"] is False
+
+    r = client.patch(
+        f"/api/groups/{gid}",
+        json={"strategy_id": trend["strategy_id"], "signal_concurrent_enabled": True},
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["signal_concurrent_enabled"] is True
+
+    r = client.patch(
+        f"/api/groups/{gid}",
+        json={"strategy_id": plain["strategy_id"], "signal_concurrent_enabled": True},
+        headers=h,
+    )
+    assert r.status_code == 400
+    assert "信号并发" in r.json()["detail"]
 
 
 def _mk_trend_strategy(client, headers, name: str = "趋势策略实例", symbol: str = "XAUUSD") -> dict:

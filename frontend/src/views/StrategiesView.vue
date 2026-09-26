@@ -3,6 +3,7 @@
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import StrategyFormModal from '@/components/StrategyFormModal.vue'
+import { useAuthStore } from '@/stores/auth'
 import { useHubStore } from '@/stores/hub'
 import type {
   BatchCalcType,
@@ -24,6 +25,7 @@ const RULE_TYPE_RISK_SIZED = 3
 const RULE_TYPE_GRID = 4
 
 const hub = useHubStore()
+const auth = useAuthStore()
 const router = useRouter()
 
 const searchQuery = ref('')
@@ -372,6 +374,7 @@ function fmtTime(sec: number | null | undefined): string {
           <span class="tag" :class="s.enabled ? 'green' : ''">{{ s.enabled ? '已启用' : '已禁用' }}</span>
         </div>
         <div class="list-field"><span class="k">策略 ID</span><span class="v muted" style="font-size: 12px">{{ s.strategy_id }}</span></div>
+        <div v-if="auth.isAdmin" class="list-field"><span class="k">所有者</span><span class="v">{{ s.owner_username || '管理员' }}</span></div>
         <div class="list-field"><span class="k">模版</span><span class="v">{{ s.template_name }}</span></div>
         <div class="list-field"><span class="k">绑定品种</span><span class="v"><code>{{ s.symbol }}</code></span></div>
         <div class="list-field"><span class="k">规则</span><span class="v">{{ ruleSummary(s.rules) }}</span></div>
@@ -451,6 +454,7 @@ function fmtTime(sec: number | null | undefined): string {
           <tr>
             <th style="width: 28px"></th>
             <th>名称</th>
+            <th v-if="auth.isAdmin">所有者</th>
             <th>模版</th>
             <th>绑定品种</th>
             <th>规则</th>
@@ -467,6 +471,7 @@ function fmtTime(sec: number | null | undefined): string {
                 {{ s.name }}
                 <div class="muted" style="font-size: 11px">{{ s.strategy_id }}</div>
               </td>
+              <td v-if="auth.isAdmin" style="font-size: 12px">{{ s.owner_username || '管理员' }}</td>
               <td><span class="tag blue">{{ s.template_name }}</span></td>
               <td><code>{{ s.symbol }}</code></td>
               <td class="muted" style="font-size: 12px">{{ ruleSummary(s.rules) }}</td>
@@ -485,7 +490,7 @@ function fmtTime(sec: number | null | undefined): string {
             </tr>
             <tr v-if="isExpanded(s.strategy_id)" class="detail-row">
               <td></td>
-              <td colspan="7">
+              <td :colspan="auth.isAdmin ? 8 : 7">
                 <div class="strategy-detail">
                   <div v-if="s.remark" class="muted" style="font-size: 12px; margin-bottom: 10px">
                     备注：{{ s.remark }}
@@ -549,7 +554,7 @@ function fmtTime(sec: number | null | undefined): string {
             </tr>
           </template>
           <tr v-if="!hub.strategies.length && !loading">
-            <td colspan="8" class="muted" style="padding: 18px">
+            <td :colspan="auth.isAdmin ? 9 : 8" class="muted" style="padding: 18px">
               {{ appliedQuery ? '无匹配策略' : '暂无策略，点击右上角「新增策略」开始配置' }}
             </td>
           </tr>

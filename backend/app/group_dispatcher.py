@@ -20,6 +20,8 @@
 并发控制的粒度是「分组 + 节点」：默认同一分组内一个节点同时只允许一个策略任务
 （Redis 占位 + 落库的子任务状态双保险）。全员同步且分组打开「信号并发」时跳过
 这两道门，同一节点可同时承接该分组的多条开仓信号，且不下写单槽占位。
+信号并发仅网格策略（模版3）、趋势策略（模版2）可用，其它模版即使开关为真
+也按单槽互斥走。
 不同分组各自独立，同一节点可以同时承接多个分组的任务。CLOSE 信号是终止指令，
 绕过互斥直接结束相关子任务。
 """
@@ -623,7 +625,12 @@ class GroupDispatcher:
             "symbol": signal.symbol, "decided_vol": volume,
         }
         # 全员同步 + 信号并发：不抢、不写单槽占位，允许同节点多条开仓并存
+        # （仅网格 / 趋势策略可用；存量分组上的陈旧开关在此兜底，按单槽互斥走）
         concurrent = group_rules.allows_signal_concurrent(group)
+        if concurrent and not group_rules.supports_signal_concurrent(
+            command.get("strategy")
+        ):
+            concurrent = False
 
         if not concurrent:
             if not await self.store.acquire_group_node_busy(
@@ -784,7 +791,10 @@ class GroupDispatcher:
     # 辅助
     # ------------------------------------------------------------------
     async def push_strategy_updates(self, subtasks: list[dict], snapshot: dict) -> int:
-        """把新快照发给仍未收口的节点；离线节点只靠库内快照，重连 resume 会带上。"""
+        """把新快照发给仍未收口的节点；离线节点只靠库内快照，重连 resume 会带上。
+
+        只有加仓策略（模版1）的热推会调这里；网格 / 趋势策略不热推。
+        """
         sent = 0
         for sub in subtasks or []:
             node_id = str(sub.get("node_id") or "")

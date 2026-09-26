@@ -39,6 +39,9 @@ class NodeOut(BaseModel):
     client_version_at: Optional[float] = None
     created_at: float = 0
     last_seen: Optional[float] = None
+    # 数据归属：空 = 管理员名下
+    owner_user_id: Optional[int] = None
+    owner_username: Optional[str] = None
 
 
 class NodeTokenInfo(BaseModel):
@@ -205,7 +208,7 @@ class GroupCreate(BaseModel):
     name: str = Field(min_length=1, max_length=64)
     enabled: bool = True
     dispatch_mode: str = "sync"  # sync / poll
-    # 信号并发：仅全员同步生效；开启后同组同节点可同时处理多条开仓信号（默认关）
+    # 信号并发：仅全员同步 + 绑定网格/趋势策略时可用；开启后同组同节点可同时处理多条开仓信号（默认关）
     signal_concurrent_enabled: bool = False
     # 趋势风控：开仓前按全局趋势参数对各节点算信号品种趋势（默认关）
     trend_risk_enabled: bool = False
@@ -283,6 +286,9 @@ class GroupOut(BaseModel):
     active_task_count: int = 0   # 进行中主任务数（pending/dispatching/running）
     # 已开监听时附带最近若干条；未开启为空列表
     limit_watch_logs: list[LimitWatchLogRecord] = Field(default_factory=list)
+    # 数据归属：空 = 管理员名下
+    owner_user_id: Optional[int] = None
+    owner_username: Optional[str] = None
 
 
 class GroupTaskDispatchRecord(BaseModel):
@@ -580,6 +586,9 @@ class StrategyOut(BaseModel):
     rules: list[StrategyRule] = Field(default_factory=list)
     remark: Optional[str] = None
     created_at: float = 0
+    # 数据归属：空 = 管理员名下
+    owner_user_id: Optional[int] = None
+    owner_username: Optional[str] = None
 
 
 class AuditRecord(BaseModel):
@@ -740,7 +749,7 @@ class LoginRequest(BaseModel):
 
 
 class ChangePasswordRequest(BaseModel):
-    """修改后台管理员密码（需携带当前密码）。"""
+    """修改当前登录用户的密码（需携带当前密码）。"""
     current_password: str
     new_password: str
 
@@ -757,6 +766,108 @@ class TwoFACodeRequest(BaseModel):
 class TwoFAPasswordRequest(BaseModel):
     password: str
     totp_code: Optional[str] = None
+
+
+# ----------------------------- 用户与权限 ----------------------------
+USERNAME_PATTERN = r"^[A-Za-z0-9_.\-]{3,32}$"
+ROLE_CODE_PATTERN = r"^[a-z][a-z0-9_]{1,31}$"
+
+
+class RoleRef(BaseModel):
+    id: int
+    code: str
+    name: str
+    enabled: bool = True
+
+
+class MeOut(BaseModel):
+    """当前登录用户：前端据 menus 渲染导航与路由守卫，据 is_admin 显示管理员操作。"""
+    user_id: int
+    username: str
+    display_name: Optional[str] = None
+    is_admin: bool = False
+    roles: list[RoleRef] = Field(default_factory=list)
+    menus: list[str] = Field(default_factory=list)
+
+
+class MenuOut(BaseModel):
+    """菜单注册表条目；assignable=False 的只属于超级管理员，不可分配给其它角色。"""
+    code: str
+    name: str
+    path: str
+    assignable: bool
+
+
+class RoleOut(BaseModel):
+    id: int
+    code: str
+    name: str
+    is_builtin: bool = False
+    enabled: bool = True
+    remark: Optional[str] = None
+    menus: list[str] = Field(default_factory=list)
+    user_count: int = 0
+    created_at: Optional[float] = None
+
+
+class RoleCreate(BaseModel):
+    code: str = Field(pattern=ROLE_CODE_PATTERN, description="小写字母开头，2~32 位字母数字下划线")
+    name: str = Field(min_length=1, max_length=64)
+    remark: Optional[str] = Field(default=None, max_length=255)
+    enabled: bool = True
+    menus: list[str] = Field(default_factory=list)
+
+
+class RoleUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, max_length=64)
+    remark: Optional[str] = Field(default=None, max_length=255)
+    enabled: Optional[bool] = None
+
+
+class RoleMenusUpdate(BaseModel):
+    menus: list[str] = Field(default_factory=list)
+
+
+class UserOut(BaseModel):
+    id: int
+    username: str
+    display_name: Optional[str] = None
+    is_active: bool = True
+    is_admin: bool = False
+    totp_enabled: bool = False
+    roles: list[RoleRef] = Field(default_factory=list)
+    node_ids: list[str] = Field(default_factory=list)
+    group_count: int = 0
+    strategy_count: int = 0
+    created_at: Optional[float] = None
+
+
+class UserCreate(BaseModel):
+    username: str = Field(pattern=USERNAME_PATTERN, description="3~32 位字母数字及 _ . -")
+    password: str = Field(min_length=6, max_length=128)
+    display_name: Optional[str] = Field(default=None, max_length=64)
+    is_active: bool = True
+    # 为空时绑定内置「普通用户」角色
+    role_ids: list[int] = Field(default_factory=list)
+
+
+class UserUpdate(BaseModel):
+    display_name: Optional[str] = Field(default=None, max_length=64)
+    is_active: Optional[bool] = None
+
+
+class UserRolesUpdate(BaseModel):
+    role_ids: list[int] = Field(default_factory=list)
+
+
+class UserPasswordReset(BaseModel):
+    new_password: str = Field(min_length=6, max_length=128)
+
+
+class UserNodesUpdate(BaseModel):
+    """整体替换用户名下节点。节点仍在分组里时需 confirm=True 才会把它移出分组。"""
+    node_ids: list[str] = Field(default_factory=list)
+    confirm: bool = False
 
 
 def build_open_command(signal_id: str, action: str, symbol: str, volume: float,

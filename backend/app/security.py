@@ -40,13 +40,16 @@ def compare_secret(a: str, b: str) -> bool:
     return hmac.compare_digest(a or "", b or "")
 
 
-def create_jwt(sub: str) -> str:
-    """签发后台管理 JWT。"""
+def create_jwt(sub: str, *, uid: Optional[int] = None, ver: int = 0) -> str:
+    """签发后台 JWT。ver 为用户的会话版本（users.token_version），版本变了旧 token 即失效。"""
     payload = {
         "sub": sub,
         "typ": "access",
+        "ver": int(ver or 0),
         "exp": int(time.time()) + settings.jwt_expire_minutes * 60,
     }
+    if uid is not None:
+        payload["uid"] = int(uid)
     return jwt.encode(payload, settings.jwt_secret, algorithm="HS256")
 
 
@@ -60,15 +63,28 @@ def create_2fa_pending_jwt(sub: str) -> str:
     return jwt.encode(payload, settings.jwt_secret, algorithm="HS256")
 
 
-def verify_jwt(token: str) -> Optional[str]:
-    """校验 JWT，返回 sub（用户名）；非法/过期/2FA 中间态返回 None。"""
+def decode_access_jwt(token: str) -> Optional[dict]:
+    """校验正式 JWT，返回 {sub, uid, ver}；非法/过期/2FA 中间态返回 None。
+
+    RBAC 之前签发的 token 没有 ver，按 0 处理，与未改过会话版本的用户兼容。
+    """
     try:
         data = jwt.decode(token, settings.jwt_secret, algorithms=["HS256"])
-        if data.get("typ") == "2fa_pending":
-            return None
-        return data.get("sub")
     except Exception:
         return None
+    if data.get("typ") == "2fa_pending" or not data.get("sub"):
+        return None
+    try:
+        ver = int(data.get("ver") or 0)
+    except (TypeError, ValueError):
+        return None
+    return {"sub": str(data["sub"]), "uid": data.get("uid"), "ver": ver}
+
+
+def verify_jwt(token: str) -> Optional[str]:
+    """校验 JWT，返回 sub（用户名）；非法/过期/2FA 中间态返回 None。"""
+    claims = decode_access_jwt(token)
+    return claims["sub"] if claims else None
 
 
 def verify_2fa_pending_jwt(token: str) -> Optional[str]:

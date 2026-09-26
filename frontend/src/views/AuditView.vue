@@ -1,17 +1,20 @@
 <script setup lang="ts">
-// 操作审计页：中控台 / 节点操作记录，可展开查看操作前后数据
+// 操作审计页：中控台 / 节点 / 账号权限 / 系统操作记录，可展开查看操作前后数据。
+// 普通用户只看到本人的操作（后端按操作人过滤）
 import { computed, onMounted, ref } from 'vue'
+import { useAuthStore } from '@/stores/auth'
 import { useHubStore } from '@/stores/hub'
 import type { AuditRecord } from '@/api/types'
 
 const hub = useHubStore()
+const auth = useAuthStore()
 
 const items = ref<AuditRecord[]>([])
 const page = ref(1)
 const pageSize = ref(20)
 const total = ref(0)
 const loading = ref(false)
-const category = ref<'' | 'console' | 'node'>('')
+const category = ref<'all' | 'console' | 'node' | 'auth' | 'system'>('all')
 const expanded = ref<Record<number, boolean>>({})
 
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)))
@@ -19,7 +22,7 @@ const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.v
 async function loadAudits(): Promise<void> {
   loading.value = true
   try {
-    const res = await hub.fetchAudits(page.value, pageSize.value, category.value || null)
+    const res = await hub.fetchAudits(page.value, pageSize.value, category.value)
     items.value = res.items
     total.value = res.total
     if (res.page !== page.value) page.value = res.page
@@ -69,6 +72,8 @@ function fmtJson(data: unknown): string {
 function categoryTag(cat: string | null): { cls: string; text: string } {
   if (cat === 'console') return { cls: 'blue', text: '中控台' }
   if (cat === 'node') return { cls: 'green', text: '节点' }
+  if (cat === 'auth') return { cls: 'amber', text: '账号权限' }
+  if (cat === 'system') return { cls: '', text: '系统' }
   return { cls: '', text: cat || '其它' }
 }
 
@@ -86,6 +91,22 @@ function actionLabel(action: string): string {
     close_batch: '批量平仓',
     close_group_dispatch: '策略子任务平仓',
     close_group: '分组一键平仓',
+    login: '登录',
+    login_failed: '登录失败',
+    login_2fa_failed: '2FA 验证失败',
+    change_password: '修改密码',
+    create_user: '新建用户',
+    update_user: '更新用户',
+    set_user_roles: '分配角色',
+    reset_user_password: '重置用户密码',
+    reset_user_2fa: '重置用户 2FA',
+    assign_nodes: '分配节点',
+    delete_user: '删除用户',
+    create_role: '新建角色',
+    update_role: '更新角色',
+    set_role_menus: '分配菜单',
+    delete_role: '删除角色',
+    rotate_node_token: '重置节点令牌',
   }
   return m[action] || action
 }
@@ -108,7 +129,7 @@ onMounted(loadAudits)
     <div class="page-header">
       <div class="h1">操作审计</div>
       <p class="muted" style="font-size: 13px; margin-top: 4px">
-        记录中控台与节点相关操作，点击行可展开查看操作前后数据
+        {{ auth.isAdmin ? '记录全部用户的操作' : '仅显示你本人的操作' }}，点击行可展开查看操作前后数据
       </p>
     </div>
 
@@ -119,9 +140,11 @@ onMounted(loadAudits)
           <label class="row muted" style="font-size: 12px; gap: 6px">
             分类
             <select v-model="category" class="input-sm" @change="onCategoryChange">
-              <option value="">全部</option>
+              <option value="all">全部</option>
               <option value="console">中控台</option>
               <option value="node">节点</option>
+              <option value="auth">账号权限</option>
+              <option value="system">系统</option>
             </select>
           </label>
           <label class="row muted" style="font-size: 12px; gap: 6px">

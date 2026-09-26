@@ -2,10 +2,10 @@
 import json
 from typing import Optional
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 
 from .db import SessionLocal
-from .orm import User
+from .orm import User, UserRole
 from .redis_store import RedisStore
 from .security import compare_secret, hash_token
 from .settings import settings
@@ -39,15 +39,81 @@ async def verify_user_password(username: str, password: str) -> bool:
 
 
 async def update_user_password(username: str, new_password: str) -> bool:
-    """更新用户密码；用户不存在时返回 False。"""
+    """更新用户密码并吊销其全部旧会话（token_version + 1）；用户不存在时返回 False。"""
     async with SessionLocal() as s:
         result = await s.execute(
             update(User)
             .where(User.username == username)
-            .values(password_hash=hash_token(new_password))
+            .values(
+                password_hash=hash_token(new_password),
+                token_version=User.token_version + 1,
+            )
         )
         if result.rowcount == 0:
             return False
+        await s.commit()
+        return True
+
+
+async def get_user_by_id(user_id: int) -> Optional[User]:
+    async with SessionLocal() as s:
+        return await s.get(User, int(user_id))
+
+
+async def list_users() -> list[User]:
+    async with SessionLocal() as s:
+        return list((await s.execute(select(User).order_by(User.id.asc()))).scalars().all())
+
+
+async def create_user(
+    username: str, password: str, *, display_name: Optional[str] = None, is_active: bool = True,
+) -> User:
+    """新建后台用户。旧 role 字段写 user：它只在首次升级 RBAC 时被读取，不能写成 admin。
+
+    用户名重复会触发 IntegrityError，由路由层转成 409。
+    """
+    async with SessionLocal() as s:
+        user = User(
+            username=username,
+            display_name=(display_name or "").strip() or None,
+            password_hash=hash_token(password),
+            role="user",
+            is_active=is_active,
+            token_version=0,
+        )
+        s.add(user)
+        await s.commit()
+        await s.refresh(user)
+        return user
+
+
+async def update_user(
+    user_id: int, *, display_name: Optional[str] = None, is_active: Optional[bool] = None,
+) -> Optional[User]:
+    """更新显示名 / 启用状态；由启用改为禁用时吊销其全部旧会话。"""
+    async with SessionLocal() as s:
+        user = await s.get(User, int(user_id))
+        if not user:
+            return None
+        if display_name is not None:
+            user.display_name = display_name.strip() or None
+        if is_active is not None:
+            if user.is_active and not is_active:
+                user.token_version = int(user.token_version or 0) + 1
+            user.is_active = is_active
+        await s.commit()
+        await s.refresh(user)
+        return user
+
+
+async def delete_user(user_id: int) -> bool:
+    """删除用户及其角色绑定；名下资源是否为空由路由层先行校验。"""
+    async with SessionLocal() as s:
+        user = await s.get(User, int(user_id))
+        if not user:
+            return False
+        await s.execute(delete(UserRole).where(UserRole.user_id == user.id))
+        await s.delete(user)
         await s.commit()
         return True
 

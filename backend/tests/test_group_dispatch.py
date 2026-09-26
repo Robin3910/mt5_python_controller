@@ -693,10 +693,14 @@ async def test_busy_node_is_skipped_on_second_signal(store, monkeypatch):
 
 
 async def test_sync_signal_concurrent_sends_second_signal(store, monkeypatch):
-    """全员同步打开信号并发后，同一节点可以同时接下第二条开仓信号。"""
+    """全员同步打开信号并发后，同一节点可以同时接下第二条开仓信号（网格策略）。"""
     await online(store, mk_node("nd_a"))
+    strategy = await mk_strategy(
+        store, template_id=TEMPLATE_3_ID, template_name=TEMPLATE_3_NAME,
+    )
     group = await mk_group(
-        store, "并发组", ["nd_a"], signal_concurrent_enabled=True,
+        store, "并发组", ["nd_a"], strategy=strategy,
+        signal_concurrent_enabled=True,
     )
     gid = group["group_id"]
     sent = []
@@ -746,6 +750,30 @@ async def test_poll_ignores_signal_concurrent_flag(store, monkeypatch):
     assert second["targets"] == 0
     assert second["tasks"][0]["status"] == "skipped"
     assert "均有进行中的任务" in second["tasks"][0]["reason"]
+    assert len(sent) == 1
+
+
+async def test_signal_concurrent_flag_ignored_for_tpl1_strategy(store, monkeypatch):
+    """存量分组（加仓策略 + 陈旧并发开关）仍按单槽互斥走：第二条信号被跳过。"""
+    await online(store, mk_node("nd_a"))
+    group = await mk_group(store, "加仓旧并发组", ["nd_a"])
+    group["signal_concurrent_enabled"] = True
+    await store.cache_group(group)
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    dispatcher = GroupDispatcher(store)
+
+    first = await dispatcher.dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_tpl1_cc1",
+    )
+    assert first["tasks"][0]["status"] == "dispatching"
+
+    second = await dispatcher.dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_tpl1_cc2",
+    )
+    assert second["targets"] == 0
+    assert second["tasks"][0]["status"] == "skipped"
+    assert "进行中的任务" in second["tasks"][0]["reason"]
     assert len(sent) == 1
 
 
@@ -2086,6 +2114,62 @@ async def test_strategy_update_rewrites_running_snapshot_and_pushes(store, monke
         assert cmds[0]["task_id"] == task.task_id
         assert cmds[0]["strategy"]["rules"][0]["manual_scatter"]["enabled"] is True
         assert strategy_rules_snapshot(updated)["rules"][0]["manual_scatter"]["volume"] == 0.5
+    finally:
+        app_state.group_dispatcher = None
+
+
+@pytest.mark.parametrize(
+    "template_id,template_name,signal_kwargs,new_rules",
+    [
+        (
+            TEMPLATE_2_ID, TEMPLATE_2_NAME,
+            {"stop_loss": 2397.0},
+            [{"type": RULE_TYPE_RISK_SIZED, "status": 1, "risk_amount": 999.0}],
+        ),
+        (
+            TEMPLATE_3_ID, TEMPLATE_3_NAME,
+            {},
+            [{"type": RULE_TYPE_GRID, "status": 1, "lot_per_grid": 0.99}],
+        ),
+    ],
+)
+async def test_tpl2_tpl3_change_does_not_touch_running_tasks(
+    store, monkeypatch, template_id, template_name, signal_kwargs, new_rules,
+):
+    """网格 / 趋势策略 PATCH 不影响在跑任务：快照不改写，也不发 strategy_update。"""
+    from app.state import state as app_state
+    from app.strategies import _hot_push_running_snapshot
+
+    await online(store, mk_node("nd_frozen"))
+    strategy = await mk_strategy(
+        store, symbol="XAUUSD", template_id=template_id,
+        template_name=template_name, rules=[],
+    )
+    await mk_group(store, f"冻结组{template_id}", ["nd_frozen"], strategy=strategy)
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    engine = GroupDispatcher(store)
+    monkeypatch.setattr("app.state.group_dispatcher", object(), raising=False)
+    app_state.group_dispatcher = engine
+    try:
+        await engine.dispatch(
+            TradingSignal(
+                action="BUY", symbol="XAUUSD", volume=0.1, **signal_kwargs,
+            ),
+            f"sig_frozen_{template_id}",
+        )
+        tasks = await fetch_tasks(f"sig_frozen_{template_id}")
+        assert len(tasks) == 1
+        task = tasks[0]
+        assert (task.strategy_snapshot_json or {}).get("rules") == []
+        sent.clear()
+
+        await _hot_push_running_snapshot({**strategy, "rules": new_rules})
+
+        async with SessionLocal() as s:
+            refreshed = await s.get(GroupSignalTask, task.task_id)
+        assert (refreshed.strategy_snapshot_json or {}).get("rules") == []
+        assert [m for _, m in sent if m.get("cmd") == "strategy_update"] == []
     finally:
         app_state.group_dispatcher = None
 

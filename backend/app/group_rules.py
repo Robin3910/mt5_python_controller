@@ -100,6 +100,19 @@ def allows_signal_concurrent(group: dict) -> bool:
     return bool(group.get("signal_concurrent_enabled"))
 
 
+def supports_signal_concurrent(strategy: Optional[dict]) -> bool:
+    """该绑定策略是否可用信号并发：仅网格策略（模版3）、趋势策略（模版2）。
+
+    未绑定 / 非字典 / 其它模版一律返回 False。分发时配合
+    `allows_signal_concurrent` 使用，兜底存量分组上的陈旧开关。
+    """
+    if not isinstance(strategy, dict):
+        return False
+    return str(strategy.get("template_id") or "").strip().lower() in (
+        strategy_templates.TEMPLATE_2_ID, strategy_templates.TEMPLATE_3_ID,
+    )
+
+
 def resolve_volume(signal_volume: float) -> float:
     """分组链路的手数：直接用信号手数，仅做单笔上限保护。"""
     try:
@@ -372,8 +385,9 @@ def aggregate_task_status(dispatch_statuses: list[str]) -> str:
 def strategy_rules_snapshot(strategy: Optional[dict]) -> Optional[dict]:
     """把绑定策略压成随任务下发的快照。
 
-    默认随任务冻结；策略保存时会对进行中子任务重写并热推（见 group_persist
-    rewrite_running_strategy_snapshots）。
+    每个任务下发时新建一份，运行周期内以此为准；加仓策略（模版1）保存时还
+    会对进行中子任务重写并热推（见 group_persist
+    rewrite_running_strategy_snapshots），网格 / 趋势策略不热推。
     """
     if not strategy:
         return None

@@ -13,6 +13,7 @@ import 'element-plus/es/components/tooltip/style/css'
 import FormLabel from '@/components/FormLabel.vue'
 import LimitWatchLogCell from '@/components/LimitWatchLogCell.vue'
 import ManualStrategyTrigger from '@/components/ManualStrategyTrigger.vue'
+import { useAuthStore } from '@/stores/auth'
 import { useHubStore } from '@/stores/hub'
 import type {
   GroupDispatchMode,
@@ -26,6 +27,7 @@ import { confirmAction } from '@/utils/confirm'
 const StrategyFormModal = defineAsyncComponent(() => import('@/components/StrategyFormModal.vue'))
 
 const hub = useHubStore()
+const auth = useAuthStore()
 const router = useRouter()
 
 const searchQuery = ref('')
@@ -66,7 +68,7 @@ const FIELD_HELP = {
   dispatch_mode:
     '分组级分发模式，作用于整个分组、不区分币种：全员同步 = 组内所有有效节点并发下发；轮询轮转 = 一条信号只交给组内队首的一个有效节点，成功后该节点移到队尾。',
   signal_concurrent:
-    '仅全员同步可用，默认关闭。关闭时，同分组内每个节点同时只跑一个策略任务，进行中的节点会跳过新的开仓信号。开启后，新的开仓信号会继续发给仍在跑策略的节点，各自独立魔术号。轮询轮转不使用此开关。',
+    '仅全员同步且绑定网格策略（模版3）/ 趋势策略（模版2）的分组可用，默认关闭。关闭时，同分组内每个节点同时只跑一个策略任务，进行中的节点会跳过新的开仓信号。开启后，新的开仓信号会继续发给仍在跑策略的节点，各自独立魔术号。轮询轮转不使用此开关。',
   trend_risk:
     '开启后，开仓信号进入各节点前会按「趋势面板」全局参数计算该节点上信号品种的趋势：' +
     'BUY 仅多头放行、SELL 仅空头放行；中性、数据不足或行情读取失败一律拦截并记入子任务跳过原因。CLOSE 不受影响。默认关闭。',
@@ -114,11 +116,26 @@ const occupiedStrategyIds = computed(() => {
   return taken
 })
 
-/** 可选策略：未占用的 + 当前已绑定的 */
+/** 表单分组的所有者：编辑取分组本身；新建时管理员建的归管理员名下（null），普通用户归自己 */
+const formOwnerId = computed<number | null>(() => {
+  if (formMode.value === 'edit') {
+    return hub.groups.find((g) => g.group_id === editingId.value)?.owner_user_id ?? null
+  }
+  return auth.isAdmin ? null : auth.me?.user_id ?? null
+})
+
+/** 成员节点与绑定策略必须与分组同一所有者（后端同样校验） */
+function sameOwnerAsForm(ownerId: number | null | undefined): boolean {
+  return (ownerId ?? null) === formOwnerId.value
+}
+
+/** 可选策略：同一所有者名下，未占用的 + 当前已绑定的 */
 const selectableStrategies = computed<StrategyOut[]>(() => {
   const taken = occupiedStrategyIds.value
   return hub.strategies.filter(
-    (s) => !taken.has(s.strategy_id) || s.strategy_id === form.strategy_id,
+    (s) =>
+      sameOwnerAsForm(s.owner_user_id) &&
+      (!taken.has(s.strategy_id) || s.strategy_id === form.strategy_id),
   )
 })
 
@@ -131,11 +148,16 @@ const formBoundStrategy = computed(() =>
   hub.strategies.find((s) => s.strategy_id === form.strategy_id),
 )
 const formIsTrendStrategy = computed(() => formBoundStrategy.value?.template_id === 'tpl_2')
+/** 信号并发仅网格（tpl_3）、趋势（tpl_2）策略可用 */
+const formIsConcurrentStrategy = computed(
+  () => formBoundStrategy.value?.template_id === 'tpl_2' || formBoundStrategy.value?.template_id === 'tpl_3',
+)
 
 watch(
   () => form.strategy_id,
   () => {
     if (!formIsTrendStrategy.value) form.limit_watch_enabled = false
+    if (!formIsConcurrentStrategy.value) form.signal_concurrent_enabled = false
   },
 )
 
@@ -146,7 +168,7 @@ const memberNodes = computed<NodeOut[]>(() =>
     .filter((n): n is NodeOut => !!n),
 )
 const availableNodes = computed<NodeOut[]>(() =>
-  hub.nodes.filter((n) => !form.node_ids.includes(n.node_id)),
+  hub.nodes.filter((n) => !form.node_ids.includes(n.node_id) && sameOwnerAsForm(n.owner_user_id)),
 )
 
 function addMember(nodeId: string): void {
@@ -216,7 +238,10 @@ async function save(): Promise<void> {
   formError.value = ''
   try {
     const strategyId = form.strategy_id.trim() || null
-    const signalConcurrent = form.dispatch_mode === 'sync' && form.signal_concurrent_enabled
+    const signalConcurrent =
+      form.dispatch_mode === 'sync' &&
+      formIsConcurrentStrategy.value &&
+      form.signal_concurrent_enabled
     const payload = {
       name,
       enabled: form.enabled,
@@ -622,7 +647,7 @@ async function onStrategyFormSaved(): Promise<void> {
       <div class="row" style="gap: 8px">
         <button class="btn-ghost" @click="router.push('/strategies')">策略管理</button>
         <ManualStrategyTrigger @accepted="loadGroups" />
-        <button class="btn-danger" :disabled="purging" @click="purgeTradeLogs">
+        <button v-if="auth.isAdmin" class="btn-danger" :disabled="purging" @click="purgeTradeLogs">
           {{ purging ? '清空中…' : '清空交易记录' }}
         </button>
         <button class="btn-primary" @click="openCreate">+ 新建分组</button>
@@ -657,6 +682,7 @@ async function onStrategyFormSaved(): Promise<void> {
           <span class="tag" :class="g.enabled ? 'green' : ''">{{ g.enabled ? '已启用' : '已禁用' }}</span>
         </div>
         <div class="list-field"><span class="k">分组 ID</span><span class="v muted" style="font-size: 12px; font-weight: 500">{{ g.group_id }}</span></div>
+        <div v-if="auth.isAdmin" class="list-field"><span class="k">所有者</span><span class="v">{{ g.owner_username || '管理员' }}</span></div>
         <div class="list-field">
           <span class="k">绑定策略</span>
           <span class="v">{{ g.strategy_name || '未绑定' }}</span>
@@ -764,6 +790,11 @@ async function onStrategyFormSaved(): Promise<void> {
           <template #default="{ row }">
             {{ asGroup(row).name }}
             <div class="muted" style="font-size: 11px">{{ asGroup(row).group_id }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column v-if="auth.isAdmin" label="所有者" min-width="90">
+          <template #default="{ row }">
+            {{ asGroup(row).owner_username || '管理员' }}
           </template>
         </el-table-column>
         <el-table-column label="绑定策略" min-width="140">
@@ -1146,7 +1177,7 @@ async function onStrategyFormSaved(): Promise<void> {
                 <option value="poll">轮询轮转（单节点领取）</option>
               </select>
             </div>
-            <div v-if="form.dispatch_mode === 'sync'">
+            <div v-if="form.dispatch_mode === 'sync' && formIsConcurrentStrategy">
               <FormLabel field-id="group-signal-concurrent" text="信号并发" :help="FIELD_HELP.signal_concurrent" />
               <select id="group-signal-concurrent" v-model="form.signal_concurrent_enabled">
                 <option :value="false">关闭</option>

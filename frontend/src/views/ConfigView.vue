@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 配置页：账户设置
+// 配置页：个人设置（改密码 / 2FA，所有登录用户）+ 系统配置（节点令牌 / Webhook 开关，仅管理员）
 import { onMounted, reactive, ref } from 'vue'
 import { ElSwitch } from 'element-plus'
 import 'element-plus/es/components/switch/style/css'
@@ -36,6 +36,7 @@ const webhookAuthLoading = ref(false)
 
 onMounted(async () => {
   await load2faStatus()
+  if (!auth.isAdmin) return
   await loadNodeToken()
   await loadWebhookAuth()
 })
@@ -259,7 +260,7 @@ async function changePassword(): Promise<void> {
     pwdError.value = '两次输入的新密码不一致'
     return
   }
-  if (!(await confirmAction('确认修改管理员密码？\n\n修改成功后需使用新密码重新登录。', '确认修改密码'))) return
+  if (!(await confirmAction('确认修改登录密码？\n\n修改成功后需使用新密码重新登录。', '确认修改密码'))) return
   pwdLoading.value = true
   try {
     await auth.changePassword(pwd.current, pwd.new)
@@ -291,7 +292,7 @@ async function changePassword(): Promise<void> {
   </div>
 
   <div class="grid layout-config">
-    <div class="card card-pad span-full">
+    <div v-if="auth.isAdmin" class="card card-pad span-full">
       <div class="row between">
         <strong>节点令牌 (NODE_TOKEN)</strong>
         <span class="muted" style="font-size: 12px">最近更新：{{ fmtTokenUpdatedAt() }}</span>
@@ -339,7 +340,7 @@ async function changePassword(): Promise<void> {
 
     <div class="card card-pad">
       <strong>修改密码</strong>
-      <p class="muted" style="font-size: 12px">修改管理员登录密码；成功后需使用新密码重新登录。</p>
+      <p class="muted" style="font-size: 12px">修改当前账号的登录密码；成功后需使用新密码重新登录。</p>
       <div class="form-grid">
         <div>
           <label>当前密码</label>

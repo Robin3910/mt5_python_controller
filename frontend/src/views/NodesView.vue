@@ -1,5 +1,6 @@
 <script setup lang="ts">
-// 节点管理页：创建/编辑/删除节点、启停、重置令牌、批量全平（令牌仅创建时显示一次）
+// 节点管理页：创建/编辑/删除节点、启停、重置令牌、批量全平（令牌仅创建时显示一次）。
+// 普通用户只看到管理员分配给自己的节点，只能改名、启停；新建、删除与按币种配置仅管理员
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessageBox } from 'element-plus'
@@ -7,12 +8,14 @@ import 'element-plus/es/components/message-box/style/css'
 import FormLabel from '@/components/FormLabel.vue'
 import FilterRulesEditor from '@/components/FilterRulesEditor.vue'
 import { NODE_FORM_FIELD_HELP } from '@/constants/nodeFormHelp'
+import { useAuthStore } from '@/stores/auth'
 import { useHubStore } from '@/stores/hub'
 import type { NodeDispatchFiltersConfig, NodeOut } from '@/api/types'
 import { parseFilterRules, parseNodeDispatchFilters, serializeNodeDispatchFilters, validateNodeDispatchFilters, validateNodeGlobalLotMode } from '@/utils/filterRules'
 import { confirmAction } from '@/utils/confirm'
 
 const hub = useHubStore()
+const auth = useAuthStore()
 const router = useRouter()
 
 const searchQuery = ref('')
@@ -164,13 +167,31 @@ function openEdit(n: NodeOut): void {
     filters: parseNodeDispatchFilters(n.filters),
   })
   showForm.value = true
-  void ensureGlobalFiltersLoaded()
+  if (auth.isAdmin) void ensureGlobalFiltersLoaded()
+}
+
+/** 普通用户只能改名与启停（按币种配置属于 normal 链路，仅管理员） */
+async function saveOwnNode(): Promise<void> {
+  const label = form.name || editingId.value
+  const enabledText = form.enabled ? '启用' : '禁用'
+  if (!(await confirmAction(`确认更新节点「${label}」？\n\n启用状态：${enabledText}`))) return
+  try {
+    await hub.updateNode(editingId.value, { name: form.name, enabled: form.enabled }, currentSearchOptions())
+    showForm.value = false
+  } catch (e: unknown) {
+    const err = e as { response?: { data?: { detail?: string } } }
+    createError.value = err?.response?.data?.detail || '更新失败，请稍后重试'
+  }
 }
 
 async function save(): Promise<void> {
   saving.value = true
   createError.value = ''
   try {
+    if (!auth.isAdmin) {
+      await saveOwnNode()
+      return
+    }
     await ensureGlobalFiltersLoaded()
     const filtersPayload = serializeNodeDispatchFilters(form.filters)
     const globalRules = parseFilterRules(hub.filters)
@@ -261,7 +282,7 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
       >
         {{ closing ? '下发中…' : `全部平仓${someSelected ? ` (${selectedCount})` : ''}` }}
       </button>
-      <button class="btn-primary" @click="openCreate">+ 新建节点</button>
+      <button v-if="auth.isAdmin" class="btn-primary" @click="openCreate">+ 新建节点</button>
     </div>
   </div>
 
@@ -314,6 +335,7 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
       <div class="list-field"><span class="k">节点 ID</span><span class="v muted" style="font-weight: 500; font-size: 12px">{{ n.node_id }}</span></div>
       <div class="list-field"><span class="k">MT5 账号</span><span class="v">{{ n.mt5_login || '—' }}</span></div>
       <div class="list-field"><span class="k">MT5 服务器</span><span class="v">{{ n.mt5_server || '—' }}</span></div>
+      <div v-if="auth.isAdmin" class="list-field"><span class="k">所有者</span><span class="v">{{ n.owner_username || '管理员' }}</span></div>
       <div class="list-field"><span class="k">分发配置</span><span class="v muted">{{ filterSymbolCount(n) }}</span></div>
       <div class="list-field">
         <span class="k">启用</span>
@@ -326,7 +348,7 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
       <div class="list-card-actions">
         <button class="btn-sm btn-ghost" @click="goDetail(n)">详情</button>
         <button class="btn-sm btn-ghost" @click="openEdit(n)">编辑</button>
-        <button class="btn-sm btn-danger" @click="remove(n)">删除</button>
+        <button v-if="auth.isAdmin" class="btn-sm btn-danger" @click="remove(n)">删除</button>
       </div>
     </div>
     <div v-if="!hub.nodes.length && !searching" class="card card-pad muted">
@@ -345,7 +367,7 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
               @change="toggleSelectAll(($event.target as HTMLInputElement).checked)"
             />
           </th>
-          <th>状态</th><th>名称</th><th>MT5</th><th>币种配置</th><th>启用</th><th class="right">操作</th>
+          <th>状态</th><th>名称</th><th>MT5</th><th v-if="auth.isAdmin">所有者</th><th>币种配置</th><th>启用</th><th class="right">操作</th>
         </tr>
       </thead>
       <tbody>
@@ -363,6 +385,7 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
             <div class="muted" style="font-size: 11px">{{ n.node_id }}</div>
           </td>
           <td class="muted" style="font-size: 12px">{{ n.mt5_login || '—' }}<br />{{ n.mt5_server || '' }}</td>
+          <td v-if="auth.isAdmin" style="font-size: 12px">{{ n.owner_username || '管理员' }}</td>
           <td class="muted" style="font-size: 12px">{{ filterSymbolCount(n) }}</td>
           <td>
             <button class="btn-sm" :class="n.enabled ? 'btn-ghost' : 'btn-danger'" @click="toggleEnabled(n)">
@@ -372,11 +395,11 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
           <td class="right">
             <button class="btn-sm btn-ghost" @click="goDetail(n)">详情</button>
             <button class="btn-sm btn-ghost" @click="openEdit(n)">编辑</button>
-            <button class="btn-sm btn-danger" @click="remove(n)">删除</button>
+            <button v-if="auth.isAdmin" class="btn-sm btn-danger" @click="remove(n)">删除</button>
           </td>
         </tr>
         <tr v-if="!hub.nodes.length && !searching">
-          <td colspan="7" class="muted" style="padding: 18px">
+          <td :colspan="auth.isAdmin ? 8 : 7" class="muted" style="padding: 18px">
             {{ appliedQuery ? '无匹配节点' : '暂无节点' }}
           </td>
         </tr>
@@ -412,7 +435,7 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
             <FormLabel field-id="node-enabled" text="启用状态" :help="NODE_FORM_FIELD_HELP.enabled" />
             <select id="node-enabled" v-model="form.enabled"><option :value="true">启用</option><option :value="false">禁用</option></select>
           </div>
-          <div class="span-full">
+          <div v-if="auth.isAdmin" class="span-full">
             <FormLabel text="按币种配置" :help="NODE_FORM_FIELD_HELP.filters" />
             <div class="node-filter-scroll">
               <FilterRulesEditor v-model="form.filters" mode="node" />

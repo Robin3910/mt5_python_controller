@@ -1,15 +1,33 @@
-"""策略管理 API（需管理员鉴权）。
+"""策略管理 API。
 
 提供策略模版列表，以及策略实例的新建 / 查询 / 更新 / 删除。
 新建时选择模版，复制默认规则，并绑定品种。
+
+普通用户只能看 / 改自己创建的策略；写操作需要「策略管理」或「分组管理」菜单
+（分组页里可以直接新建、编辑策略）。
 """
 import asyncio
 import logging
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 
-from . import group_persist, group_rules, persist, strategy_service, strategy_templates
-from .deps import client_ip, get_current_admin, get_store
+from . import (
+    group_persist,
+    group_rules,
+    permissions,
+    persist,
+    rbac_service,
+    strategy_service,
+    strategy_templates,
+)
+from .deps import (
+    client_ip,
+    get_current_admin,
+    get_principal,
+    get_store,
+    owned_strategy_or_404,
+    require_menu,
+)
 from .state import state
 from .models import (
     StrategyCreate,
@@ -18,6 +36,7 @@ from .models import (
     StrategyTemplateOut,
     StrategyUpdate,
 )
+from .permissions import MENU_GROUPS, MENU_STRATEGIES, Principal
 from .redis_store import RedisStore
 
 router = APIRouter(prefix="/api/strategies", tags=["strategies"])
@@ -28,8 +47,18 @@ HOT_PUSH_REWRITE_TIMEOUT = 3.0
 
 
 async def _hot_push_running_snapshot(strategy: dict) -> None:
-    """PATCH 落库后 best-effort 改写进行中快照并 WS 下发；失败/超时不挡保存。"""
+    """PATCH 落库后 best-effort 改写进行中快照并 WS 下发；失败/超时不挡保存。
+
+    仅加仓策略（模版1）热推：网格 / 趋势策略的任务从下发那一刻起冻结快照，
+    整个运行周期内不受后续修改影响，新信号才用新配置。
+    """
     sid = str((strategy or {}).get("strategy_id") or "")
+    tid = str((strategy or {}).get("template_id") or "").strip().lower()
+    if tid in (strategy_templates.TEMPLATE_2_ID, strategy_templates.TEMPLATE_3_ID):
+        logger.info(
+            "strategy %s snapshot frozen for running tasks (template %s)", sid, tid,
+        )
+        return
     try:
         snapshot = group_rules.strategy_rules_snapshot(strategy)
     except Exception as e:  # noqa: BLE001
@@ -76,11 +105,13 @@ def _strategy_audit_snapshot(d: dict | None) -> dict | None:
         "enabled": d.get("enabled", True),
         "remark": d.get("remark"),
         "rules": d.get("rules") or [],
+        "owner_user_id": d.get("owner_user_id"),
     }
 
 
-def _to_strategy_out(d: dict) -> StrategyOut:
+def _to_strategy_out(d: dict, owner_names: dict[int, str] | None = None) -> StrategyOut:
     rules = [StrategyRule(**r) for r in (d.get("rules") or [])]
+    owner = permissions.normalize_owner(d.get("owner_user_id"))
     return StrategyOut(
         strategy_id=d["strategy_id"],
         name=d["name"],
@@ -93,6 +124,8 @@ def _to_strategy_out(d: dict) -> StrategyOut:
         rules=rules,
         remark=d.get("remark"),
         created_at=d.get("created_at", 0),
+        owner_user_id=owner,
+        owner_username=(owner_names or {}).get(owner) if owner is not None else None,
     )
 
 
@@ -116,10 +149,10 @@ async def list_strategy_templates(_: str = Depends(get_current_admin)):
 async def list_strategies(
     q: str | None = None,
     store: RedisStore = Depends(get_store),
-    _: str = Depends(get_current_admin),
+    p: Principal = Depends(get_principal),
 ):
-    """策略列表；可选 q 按名称 / 品种模糊搜索。"""
-    items = await store.all_strategies()
+    """策略列表；可选 q 按名称 / 品种模糊搜索。普通用户只看本人策略。"""
+    items = permissions.visible(p, await store.all_strategies())
     if q and (term := q.strip()):
         needle = term.lower()
         items = [
@@ -128,10 +161,11 @@ async def list_strategies(
             or needle in (s.get("symbol") or "").lower()
         ]
     items.sort(key=lambda s: (s.get("created_at", 0), s.get("name") or ""))
+    names = await rbac_service.owner_names_for(p)
     out: list[StrategyOut] = []
     for s in items:
         try:
-            out.append(_to_strategy_out(s))
+            out.append(_to_strategy_out(s, names))
         except Exception as e:  # noqa: BLE001
             logger.warning("skip invalid strategy %s: %s", (s or {}).get("strategy_id"), e)
     return out
@@ -142,32 +176,32 @@ async def create_strategy(
     body: StrategyCreate,
     request: Request,
     store: RedisStore = Depends(get_store),
-    admin: str = Depends(get_current_admin),
+    p: Principal = Depends(require_menu(MENU_STRATEGIES, MENU_GROUPS)),
 ):
+    """新建策略：归创建者所有（管理员建的归管理员名下），名称在同一所有者内唯一。"""
+    owner = permissions.owner_for_new(p)
     name = body.name.strip()
-    if await strategy_service.name_exists(name):
+    if await strategy_service.name_exists(name, owner_user_id=owner):
         raise HTTPException(status_code=409, detail=f"策略名称已存在：{name}")
     try:
-        d = await strategy_service.create_strategy(store, body)
+        d = await strategy_service.create_strategy(store, body, owner_user_id=owner)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     await persist.audit(
-        admin, "create_strategy", d["strategy_id"], None, "ok", client_ip(request),
+        p.username, "create_strategy", d["strategy_id"], None, "ok", client_ip(request),
         category="console", before=None, after=_strategy_audit_snapshot(d),
     )
-    return _to_strategy_out(d)
+    return _to_strategy_out(d, await rbac_service.owner_names_for(p))
 
 
 @router.get("/{strategy_id}", response_model=StrategyOut)
 async def get_strategy(
     strategy_id: str,
     store: RedisStore = Depends(get_store),
-    _: str = Depends(get_current_admin),
+    p: Principal = Depends(get_principal),
 ):
-    d = await store.get_strategy(strategy_id)
-    if not d:
-        raise HTTPException(status_code=404, detail="strategy not found")
-    return _to_strategy_out(d)
+    d = await owned_strategy_or_404(store, p, strategy_id)
+    return _to_strategy_out(d, await rbac_service.owner_names_for(p))
 
 
 @router.patch("/{strategy_id}", response_model=StrategyOut)
@@ -177,12 +211,15 @@ async def update_strategy(
     request: Request,
     background_tasks: BackgroundTasks,
     store: RedisStore = Depends(get_store),
-    admin: str = Depends(get_current_admin),
+    p: Principal = Depends(require_menu(MENU_STRATEGIES, MENU_GROUPS)),
 ):
+    current = await owned_strategy_or_404(store, p, strategy_id)
     if body.name is not None and (name := body.name.strip()):
-        if await strategy_service.name_exists(name, exclude_strategy_id=strategy_id):
+        if await strategy_service.name_exists(
+            name, exclude_strategy_id=strategy_id, owner_user_id=current.get("owner_user_id"),
+        ):
             raise HTTPException(status_code=409, detail=f"策略名称已存在：{name}")
-    before = _strategy_audit_snapshot(await store.get_strategy(strategy_id))
+    before = _strategy_audit_snapshot(current)
     try:
         d = await strategy_service.update_strategy(store, strategy_id, body)
     except ValueError as e:
@@ -190,14 +227,14 @@ async def update_strategy(
     if not d:
         raise HTTPException(status_code=404, detail="strategy not found")
     await persist.audit(
-        admin, "update_strategy", strategy_id, body.model_dump(exclude_none=True), "ok",
+        p.username, "update_strategy", strategy_id, body.model_dump(exclude_none=True), "ok",
         client_ip(request),
         category="console", before=before, after=_strategy_audit_snapshot(d),
     )
     # 先把 HTTP 200 发出去，避免改快照 / 节点 WS 卡住时前端 15s 超时误报保存失败。
     background_tasks.add_task(_hot_push_running_snapshot, d)
     try:
-        return _to_strategy_out(d)
+        return _to_strategy_out(d, await rbac_service.owner_names_for(p))
     except Exception as e:  # noqa: BLE001
         logger.exception("strategy out serialize failed %s: %s", strategy_id, e)
         raise HTTPException(status_code=500, detail="策略已保存，但回读失败，请刷新列表") from e
@@ -208,14 +245,14 @@ async def delete_strategy(
     strategy_id: str,
     request: Request,
     store: RedisStore = Depends(get_store),
-    admin: str = Depends(get_current_admin),
+    p: Principal = Depends(require_menu(MENU_STRATEGIES, MENU_GROUPS)),
 ):
-    before = _strategy_audit_snapshot(await store.get_strategy(strategy_id))
+    before = _strategy_audit_snapshot(await owned_strategy_or_404(store, p, strategy_id))
     ok = await strategy_service.delete_strategy(store, strategy_id)
     if not ok:
         raise HTTPException(status_code=404, detail="strategy not found")
     await persist.audit(
-        admin, "delete_strategy", strategy_id, None, "ok", client_ip(request),
+        p.username, "delete_strategy", strategy_id, None, "ok", client_ip(request),
         category="console", before=before, after=None,
     )
     return {"status": "deleted", "strategy_id": strategy_id}

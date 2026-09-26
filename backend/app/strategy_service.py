@@ -1,6 +1,7 @@
 """策略持久化：MySQL/SQLite 为权威，Redis 作缓存。
 
 策略基于内置模版创建：选择模版后复制默认规则到实例，并绑定品种。
+策略归创建者所有（owner_user_id，空 = 管理员名下），名称在同一所有者内唯一。
 """
 from __future__ import annotations
 
@@ -9,6 +10,7 @@ from typing import Optional
 
 from sqlalchemy import select
 
+from . import permissions
 from .db import SessionLocal
 from .models import StrategyCreate, StrategyUpdate
 from .orm import TradingStrategy
@@ -29,6 +31,7 @@ def strategy_row_to_dict(row: TradingStrategy) -> dict:
         "enabled": row.enabled,
         "rules": templates.normalize_rules(row.config_json or []),
         "remark": row.remark,
+        "owner_user_id": row.owner_user_id,
         "created_at": row.created_at.timestamp() if row.created_at else time.time(),
     }
 
@@ -45,15 +48,28 @@ def normalize_symbol(symbol: str) -> str:
     return (symbol or "").strip().upper()
 
 
-async def name_exists(name: str, exclude_strategy_id: Optional[str] = None) -> bool:
+async def name_exists(
+    name: str,
+    exclude_strategy_id: Optional[str] = None,
+    *,
+    owner_user_id: Optional[int] = None,
+) -> bool:
+    """策略名称在同一所有者内是否已被占用。"""
+    owner = permissions.normalize_owner(owner_user_id)
     async with SessionLocal() as s:
         stmt = select(TradingStrategy.strategy_id).where(TradingStrategy.name == name)
+        stmt = stmt.where(
+            TradingStrategy.owner_user_id.is_(None) if owner is None
+            else TradingStrategy.owner_user_id == owner
+        )
         if exclude_strategy_id:
             stmt = stmt.where(TradingStrategy.strategy_id != exclude_strategy_id)
         return (await s.execute(stmt)).first() is not None
 
 
-async def create_strategy(store: RedisStore, payload: StrategyCreate) -> dict:
+async def create_strategy(
+    store: RedisStore, payload: StrategyCreate, *, owner_user_id: Optional[int] = None,
+) -> dict:
     tpl = templates.get_template(payload.template_id)
     if not tpl:
         raise ValueError(f"策略模版不存在：{payload.template_id}")
@@ -81,6 +97,7 @@ async def create_strategy(store: RedisStore, payload: StrategyCreate) -> dict:
                 enabled=payload.enabled,
                 config_json=rules,
                 remark=(payload.remark or "").strip() or None,
+                owner_user_id=permissions.normalize_owner(owner_user_id),
             )
         )
         await s.commit()

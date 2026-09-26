@@ -1,18 +1,30 @@
 <script setup lang="ts">
-// 根组件：顶部导航 + 路由出口；登录后建立后台实时 WS，退出时断开
+// 根组件：顶部导航 + 路由出口；登录后建立后台实时 WS，退出时断开。
+// 导航按当前用户的菜单渲染；权限变更后当前页若已无权访问，自动跳到第一个有权限的菜单
 import { computed, onMounted, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useHubStore } from '@/stores/hub'
 import { connectAdminWs, disconnectAdminWs } from '@/services/ws'
 import { copyToClipboard } from '@/utils/clipboard'
+import { firstAllowedPath } from '@/constants/menus'
 
 const auth = useAuthStore()
 const hub = useHubStore()
 const router = useRouter()
+const route = useRoute()
 const authed = computed(() => auth.isAuthed)
+const userLabel = computed(() => auth.me?.display_name || auth.me?.username || '')
+
+watch(
+  () => auth.me,
+  (me) => {
+    const menu = route.meta.menu
+    if (me && menu && !auth.hasMenu(menu)) router.replace(firstAllowedPath(auth.hasMenu))
+  },
+)
 
 /** 当前站点同源的 webhook 请求地址，供 TradingView 等外部系统 POST。 */
 const webhookUrl = computed(() => {
@@ -61,23 +73,27 @@ function logout(): void {
       </div>
 
       <nav class="nav">
-        <RouterLink to="/">
+        <RouterLink v-if="auth.hasMenu('dashboard')" to="/">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
           <span>总览</span>
         </RouterLink>
-        <RouterLink to="/nodes">
+        <RouterLink v-if="auth.hasMenu('nodes')" to="/nodes">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
           <span>节点</span>
         </RouterLink>
-        <RouterLink to="/trend">
+        <RouterLink v-if="auth.hasMenu('trend')" to="/trend">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 17l6-6 4 4 8-8"/><path d="M14 7h7v7"/></svg>
           <span>趋势面板</span>
         </RouterLink>
-        <RouterLink to="/groups">
+        <RouterLink v-if="auth.hasMenu('groups')" to="/groups">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>
           <span>分组管理</span>
         </RouterLink>
-        <RouterLink to="/console">
+        <RouterLink v-if="auth.hasMenu('strategies')" to="/strategies">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+          <span>策略管理</span>
+        </RouterLink>
+        <RouterLink v-if="auth.hasMenu('console')" to="/console">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
           <span>中控台</span>
         </RouterLink>
@@ -85,17 +101,21 @@ function logout(): void {
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
           <span>配置</span>
         </RouterLink>
-        <RouterLink to="/client-versions">
+        <RouterLink v-if="auth.hasMenu('client_versions')" to="/client-versions">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 8v8a2 2 0 0 1-1 1.73l-7 4a2 2 0 0 1-2 0l-7-4A2 2 0 0 1 3 16V8a2 2 0 0 1 1-1.73l7-4a2 2 0 0 1 2 0l7 4A2 2 0 0 1 21 8z"/><path d="M3.27 6.96L12 12l8.73-5.04M12 22V12"/></svg>
           <span>客户端版本</span>
         </RouterLink>
-        <RouterLink to="/events">
+        <RouterLink v-if="auth.hasMenu('events')" to="/events">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
           <span>事件</span>
         </RouterLink>
-        <RouterLink to="/audits">
+        <RouterLink v-if="auth.hasMenu('audits')" to="/audits">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>
           <span>操作审计</span>
+        </RouterLink>
+        <RouterLink v-if="auth.hasMenu('permissions')" to="/permissions">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><circle cx="12" cy="10" r="2.5"/><path d="M8.5 16a3.5 3.5 0 0 1 7 0"/></svg>
+          <span>用户权限</span>
         </RouterLink>
       </nav>
 
@@ -103,6 +123,7 @@ function logout(): void {
 
       <div class="topbar-status">
         <button
+          v-if="auth.isAdmin"
           type="button"
           class="secure-badge webhook-copy"
           :title="`点击复制 ${webhookUrl}`"
@@ -118,6 +139,9 @@ function logout(): void {
         </span>
       </div>
 
+      <span v-if="userLabel" class="muted topbar-user" :title="auth.isAdmin ? '超级管理员' : '普通用户'">
+        {{ userLabel }}
+      </span>
       <button class="btn-ghost btn-sm btn-logout" @click="logout">退出</button>
     </header>
 

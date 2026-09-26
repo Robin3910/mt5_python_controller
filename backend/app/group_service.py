@@ -4,6 +4,9 @@
 成员节点通过 node_group_member 关联，一个节点可同时属于多个分组。
 每个分组最多绑定一个交易策略（一对一）；同一策略不可挂到多个分组。
 
+数据归属：分组有所有者（owner_user_id，空 = 管理员名下），成员节点与绑定策略
+必须与分组同一所有者；分组名称在同一所有者内唯一。
+
 所有写操作都遵循“先写库、再刷新缓存”，保证重启后能从库里恢复全部状态。
 """
 from __future__ import annotations
@@ -13,6 +16,7 @@ from typing import Optional
 
 from sqlalchemy import delete, select, update
 
+from . import group_rules, permissions
 from .db import SessionLocal
 from .group_rules import normalize_dispatch_mode
 from .limit_watch import is_trend_strategy, normalize_keyword
@@ -22,6 +26,7 @@ from .redis_store import RedisStore
 from .security import make_group_id
 
 _LIMIT_WATCH_ONLY_TREND = "限价单监听仅适用于绑定趋势策略（模版2）的分组"
+_SIGNAL_CONCURRENT_ONLY_GRID_TREND = "信号并发仅适用于绑定网格策略（模版3）、趋势策略（模版2）的分组"
 
 
 def group_row_to_dict(row: NodeGroup, members: list[NodeGroupMember]) -> dict:
@@ -40,6 +45,7 @@ def group_row_to_dict(row: NodeGroup, members: list[NodeGroupMember]) -> dict:
         ),
         "strategy_id": row.strategy_id,
         "remark": row.remark,
+        "owner_user_id": row.owner_user_id,
         "created_at": row.created_at.timestamp() if row.created_at else time.time(),
         "members": [
             {"node_id": m.node_id, "sort_order": m.sort_order or 0} for m in ordered
@@ -89,26 +95,34 @@ def _normalize_strategy_id(raw: Optional[str]) -> Optional[str]:
     return sid or None
 
 
-async def validate_node_ids(store: RedisStore, node_ids: list[str]) -> Optional[str]:
-    """校验成员节点均存在；返回错误说明或 None。"""
+async def validate_node_ids(
+    store: RedisStore, node_ids: list[str], owner_user_id: Optional[int] = None,
+) -> Optional[str]:
+    """校验成员节点均存在且与分组同一所有者；返回错误说明或 None。"""
     for nid in node_ids:
-        if not await store.get_node(nid):
+        node = await store.get_node(nid)
+        if not node:
             return f"节点不存在：{nid}"
+        if permissions.foreign_node_ids([node], owner_user_id):
+            return f"节点不存在或不属于该分组所有者：{nid}"
     return None
 
 
 async def validate_strategy_binding(
     strategy_id: Optional[str],
     *,
+    owner_user_id: Optional[int] = None,
     exclude_group_id: Optional[str] = None,
 ) -> Optional[str]:
-    """校验策略存在且未被其它分组占用；返回错误说明或 None。"""
+    """校验策略存在、与分组同一所有者且未被其它分组占用；返回错误说明或 None。"""
     if not strategy_id:
         return None
     async with SessionLocal() as s:
         sty = await s.get(TradingStrategy, strategy_id)
         if not sty:
             return f"策略不存在：{strategy_id}"
+        if not permissions.same_owner(sty.owner_user_id, owner_user_id):
+            return f"策略不存在或不属于该分组所有者：{strategy_id}"
         stmt = select(NodeGroup.group_id, NodeGroup.name).where(
             NodeGroup.strategy_id == strategy_id
         )
@@ -140,6 +154,12 @@ async def _require_trend_strategy(store: RedisStore, strategy_id: Optional[str])
         raise ValueError(_LIMIT_WATCH_ONLY_TREND)
 
 
+async def _require_concurrent_strategy(store: RedisStore, strategy_id: Optional[str]) -> None:
+    sty = await _strategy_dict(store, strategy_id)
+    if not group_rules.supports_signal_concurrent(sty):
+        raise ValueError(_SIGNAL_CONCURRENT_ONLY_GRID_TREND)
+
+
 def _limit_watch_fields(payload: GroupCreate) -> tuple[bool, str]:
     enabled = bool(payload.limit_watch_enabled)
     keyword = normalize_keyword(payload.limit_watch_keyword)
@@ -155,23 +175,45 @@ async def _replace_members(session, group_id: str, node_ids: list[str]) -> None:
         session.add(NodeGroupMember(group_id=group_id, node_id=nid, sort_order=idx))
 
 
-async def name_exists(name: str, exclude_group_id: Optional[str] = None) -> bool:
-    """分组名称是否已被占用（分组名用于日志与信号明细展示，要求唯一）。"""
+async def name_exists(
+    name: str,
+    exclude_group_id: Optional[str] = None,
+    *,
+    owner_user_id: Optional[int] = None,
+) -> bool:
+    """分组名称在同一所有者内是否已被占用（分组名用于日志与信号明细展示）。"""
+    owner = permissions.normalize_owner(owner_user_id)
     async with SessionLocal() as s:
         stmt = select(NodeGroup.group_id).where(NodeGroup.name == name)
+        stmt = stmt.where(
+            NodeGroup.owner_user_id.is_(None) if owner is None
+            else NodeGroup.owner_user_id == owner
+        )
         if exclude_group_id:
             stmt = stmt.where(NodeGroup.group_id != exclude_group_id)
         return (await s.execute(stmt)).first() is not None
 
 
-async def create_group(store: RedisStore, payload: GroupCreate) -> dict:
-    """创建分组：写库 + 刷新缓存。"""
+async def group_owner(group_id: str) -> tuple[bool, Optional[int]]:
+    """(分组是否存在, 所有者)；以库为准，供编辑时按原所有者校验成员与策略。"""
+    async with SessionLocal() as s:
+        row = await s.get(NodeGroup, group_id)
+        if not row:
+            return False, None
+        return True, permissions.normalize_owner(row.owner_user_id)
+
+
+async def create_group(
+    store: RedisStore, payload: GroupCreate, *, owner_user_id: Optional[int] = None,
+) -> dict:
+    """创建分组：写库 + 刷新缓存。owner_user_id 为空 = 管理员名下。"""
+    owner = permissions.normalize_owner(owner_user_id)
     node_ids = _dedup_node_ids(payload.node_ids)
-    err = await validate_node_ids(store, node_ids)
+    err = await validate_node_ids(store, node_ids, owner)
     if err:
         raise ValueError(err)
     strategy_id = _normalize_strategy_id(payload.strategy_id)
-    err = await validate_strategy_binding(strategy_id)
+    err = await validate_strategy_binding(strategy_id, owner_user_id=owner)
     if err:
         raise ValueError(err)
     watch_enabled, watch_keyword = _limit_watch_fields(payload)
@@ -179,6 +221,9 @@ async def create_group(store: RedisStore, payload: GroupCreate) -> dict:
         await _require_trend_strategy(store, strategy_id)
     group_id = make_group_id()
     mode = normalize_dispatch_mode(payload.dispatch_mode)
+    want_concurrent = bool(payload.signal_concurrent_enabled) and mode == "sync"
+    if want_concurrent:
+        await _require_concurrent_strategy(store, strategy_id)
     async with SessionLocal() as s:
         s.add(
             NodeGroup(
@@ -186,14 +231,13 @@ async def create_group(store: RedisStore, payload: GroupCreate) -> dict:
                 name=payload.name.strip(),
                 enabled=payload.enabled,
                 dispatch_mode=mode,
-                signal_concurrent_enabled=(
-                    bool(payload.signal_concurrent_enabled) and mode == "sync"
-                ),
+                signal_concurrent_enabled=want_concurrent,
                 trend_risk_enabled=bool(payload.trend_risk_enabled),
                 limit_watch_enabled=watch_enabled,
                 limit_watch_keyword=watch_keyword,
                 strategy_id=strategy_id,
                 remark=(payload.remark or "").strip() or None,
+                owner_user_id=owner,
             )
         )
         await _replace_members(s, group_id, node_ids)
@@ -204,11 +248,17 @@ async def create_group(store: RedisStore, payload: GroupCreate) -> dict:
 
 
 async def update_group(store: RedisStore, group_id: str, patch: GroupUpdate) -> Optional[dict]:
-    """更新分组：仅写入提供的字段；node_ids 传入即整体替换成员。"""
+    """更新分组：仅写入提供的字段；node_ids 传入即整体替换成员。
+
+    成员与策略按分组原所有者校验（管理员编辑用户的分组时同样只能选该用户名下的）。
+    """
+    exists, owner = await group_owner(group_id)
+    if not exists:
+        return None
     node_ids: Optional[list[str]] = None
     if patch.node_ids is not None:
         node_ids = _dedup_node_ids(patch.node_ids)
-        err = await validate_node_ids(store, node_ids)
+        err = await validate_node_ids(store, node_ids, owner)
         if err:
             raise ValueError(err)
 
@@ -216,7 +266,9 @@ async def update_group(store: RedisStore, group_id: str, patch: GroupUpdate) -> 
     strategy_id: Optional[str] = None
     if update_strategy:
         strategy_id = _normalize_strategy_id(patch.strategy_id)
-        err = await validate_strategy_binding(strategy_id, exclude_group_id=group_id)
+        err = await validate_strategy_binding(
+            strategy_id, owner_user_id=owner, exclude_group_id=group_id,
+        )
         if err:
             raise ValueError(err)
 
@@ -242,6 +294,13 @@ async def update_group(store: RedisStore, group_id: str, patch: GroupUpdate) -> 
         if update_strategy:
             row.strategy_id = strategy_id
         final_sid = row.strategy_id
+        if row.signal_concurrent_enabled:
+            sty = await _strategy_dict(store, final_sid)
+            if not group_rules.supports_signal_concurrent(sty):
+                if patch.signal_concurrent_enabled:
+                    raise ValueError(_SIGNAL_CONCURRENT_ONLY_GRID_TREND)
+                # 换绑/解绑到不适用的策略时自动关闭，避免存量开关意外生效
+                row.signal_concurrent_enabled = False
         if "limit_watch_keyword" in patch.model_fields_set:
             row.limit_watch_keyword = normalize_keyword(patch.limit_watch_keyword)
         want_watch = bool(getattr(row, "limit_watch_enabled", False))
@@ -292,6 +351,7 @@ async def clear_strategy_bindings(store: RedisStore, strategy_id: str) -> list[s
         await s.execute(
             update(NodeGroup).where(NodeGroup.strategy_id == sid).values(
                 strategy_id=None, limit_watch_enabled=False,
+                signal_concurrent_enabled=False,
             )
         )
         await s.commit()

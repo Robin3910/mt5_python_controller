@@ -1,11 +1,23 @@
-"""节点管理 API（需管理员鉴权）。"""
+"""节点管理 API。
+
+普通用户只能看到 / 修改管理员分配给自己的节点（改名、启停、账户风控）；
+节点入库、删除、批量手数与按币种配置（normal 链路）只有管理员能做。
+"""
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.exc import IntegrityError
 
-from . import node_service, persist, risk_control
+from . import node_service, permissions, persist, rbac_service, risk_control
 from .connections import manager
-from .deps import client_ip, get_current_admin, get_store
+from .deps import (
+    client_ip,
+    get_principal,
+    get_store,
+    owned_node_or_404,
+    require_admin,
+    require_menu,
+)
 from .models import LotBatch, NodeCreate, NodeOut, NodeUpdate, PaginatedNodeDispatches
+from .permissions import MENU_NODES, Principal
 from .redis_store import RedisStore
 
 router = APIRouter(prefix="/api/nodes", tags=["nodes"])
@@ -23,6 +35,7 @@ def _node_audit_snapshot(d: dict | None) -> dict | None:
         "risk": d.get("risk"),
         "mt5_login": d.get("mt5_login"),
         "mt5_server": d.get("mt5_server"),
+        "owner_user_id": d.get("owner_user_id"),
     }
 
 
@@ -35,9 +48,12 @@ def _node_matches_search(node: dict, term: str) -> bool:
     return mt5 is not None and term in str(mt5)
 
 
-async def _to_node_out(store: RedisStore, d: dict) -> NodeOut:
+async def _to_node_out(
+    store: RedisStore, d: dict, owner_names: dict[int, str] | None = None,
+) -> NodeOut:
     """把缓存里的节点 dict 组装成对外的 NodeOut（合并在线状态与账户登录信息）。"""
     acct = await store.get_account(d["node_id"]) or {}
+    owner = permissions.normalize_owner(d.get("owner_user_id"))
     return NodeOut(
         node_id=d["node_id"],
         name=d["name"],
@@ -52,6 +68,8 @@ async def _to_node_out(store: RedisStore, d: dict) -> NodeOut:
         client_version_at=d.get("client_version_at"),
         created_at=d.get("created_at", 0),
         last_seen=acct.get("updated_at"),
+        owner_user_id=owner,
+        owner_username=(owner_names or {}).get(owner) if owner is not None else None,
     )
 
 
@@ -59,14 +77,15 @@ async def _to_node_out(store: RedisStore, d: dict) -> NodeOut:
 async def list_nodes(
     q: str | None = None,
     store: RedisStore = Depends(get_store),
-    _: str = Depends(get_current_admin),
+    p: Principal = Depends(get_principal),
 ):
-    """节点列表（按创建时间排序）；可选 q 按名称 / MT5 账号模糊搜索。"""
-    nodes = await store.all_nodes()
+    """节点列表（按创建时间排序）；可选 q 按名称 / MT5 账号模糊搜索。普通用户只看本人节点。"""
+    nodes = permissions.visible(p, await store.all_nodes())
     if q and (term := q.strip()):
         nodes = [n for n in nodes if _node_matches_search(n, term)]
     nodes.sort(key=lambda n: n.get("created_at", 0))
-    return [await _to_node_out(store, n) for n in nodes]
+    names = await rbac_service.owner_names_for(p)
+    return [await _to_node_out(store, n, names) for n in nodes]
 
 
 @router.post("", response_model=NodeOut, status_code=201)
@@ -74,7 +93,7 @@ async def create_node(
     body: NodeCreate,
     request: Request,
     store: RedisStore = Depends(get_store),
-    admin: str = Depends(get_current_admin),
+    p: Principal = Depends(require_admin),
 ):
     """创建节点（管理员手动）。鉴权令牌为全局共享，见账户设置 → 节点令牌。
 
@@ -90,18 +109,20 @@ async def create_node(
             detail=f"node with mt5_login={body.mt5_login} already exists",
         )
     await persist.audit(
-        admin, "create_node", d["node_id"], None, "ok", client_ip(request),
+        p.username, "create_node", d["node_id"], None, "ok", client_ip(request),
         category="node", before=None, after=_node_audit_snapshot(d),
     )
     return await _to_node_out(store, d)
 
 
 @router.get("/{node_id}", response_model=NodeOut)
-async def get_node(node_id: str, store: RedisStore = Depends(get_store), _: str = Depends(get_current_admin)):
-    d = await store.get_node(node_id)
-    if not d:
-        raise HTTPException(status_code=404, detail="node not found")
-    return await _to_node_out(store, d)
+async def get_node(
+    node_id: str,
+    store: RedisStore = Depends(get_store),
+    p: Principal = Depends(get_principal),
+):
+    d = await owned_node_or_404(store, p, node_id)
+    return await _to_node_out(store, d, await rbac_service.owner_names_for(p))
 
 
 @router.get("/{node_id}/dispatches", response_model=PaginatedNodeDispatches)
@@ -110,11 +131,10 @@ async def node_dispatches(
     page: int = 1,
     page_size: int = 20,
     store: RedisStore = Depends(get_store),
-    _: str = Depends(get_current_admin),
+    p: Principal = Depends(get_principal),
 ):
     """某节点分发/成交明细分页（持久化历史，供详情页「信号」「成交回报」Tab）。"""
-    if not await store.get_node(node_id):
-        raise HTTPException(status_code=404, detail="node not found")
+    await owned_node_or_404(store, p, node_id)
     return await persist.recent_dispatches(node_id, page, page_size)
 
 
@@ -124,10 +144,13 @@ async def update_node(
     body: NodeUpdate,
     request: Request,
     store: RedisStore = Depends(get_store),
-    admin: str = Depends(get_current_admin),
+    p: Principal = Depends(require_menu(MENU_NODES)),
 ):
-    """更新节点配置（手数策略、跟随开关、轮询顺序、启用状态、账户级风控等）。"""
-    before = _node_audit_snapshot(await store.get_node(node_id))
+    """更新节点配置（名称、启用状态、账户级风控；按币种配置仅管理员）。"""
+    current = await owned_node_or_404(store, p, node_id)
+    if body.filters is not None and not p.is_admin:
+        raise HTTPException(status_code=403, detail="按币种配置（normal 链路）仅管理员可修改")
+    before = _node_audit_snapshot(current)
     try:
         d = await node_service.update_node(store, node_id, body)
     except ValueError as e:
@@ -138,11 +161,11 @@ async def update_node(
     if body.risk is not None:
         await risk_control.push_risk_config_to_node(node_id, d.get("risk"))
     await persist.audit(
-        admin, "update_node", node_id, body.model_dump(exclude_none=True), "ok",
+        p.username, "update_node", node_id, body.model_dump(exclude_none=True), "ok",
         client_ip(request),
         category="node", before=before, after=_node_audit_snapshot(d),
     )
-    return await _to_node_out(store, d)
+    return await _to_node_out(store, d, await rbac_service.owner_names_for(p))
 
 
 @router.delete("/{node_id}")
@@ -150,14 +173,14 @@ async def delete_node(
     node_id: str,
     request: Request,
     store: RedisStore = Depends(get_store),
-    admin: str = Depends(get_current_admin),
+    p: Principal = Depends(require_admin),
 ):
     before = _node_audit_snapshot(await store.get_node(node_id))
     ok = await node_service.delete_node(store, node_id)
     if not ok:
         raise HTTPException(status_code=404, detail="node not found")
     await persist.audit(
-        admin, "delete_node", node_id, None, "ok", client_ip(request),
+        p.username, "delete_node", node_id, None, "ok", client_ip(request),
         category="node", before=before, after=None,
     )
     return {"status": "deleted", "node_id": node_id}
@@ -168,7 +191,7 @@ async def batch_lot(
     body: LotBatch,
     request: Request,
     store: RedisStore = Depends(get_store),
-    admin: str = Depends(get_current_admin),
+    p: Principal = Depends(require_admin),
 ):
     """批量设置多个节点的手数策略。"""
     updated = []
@@ -179,7 +202,7 @@ async def batch_lot(
         if d:
             updated.append(nid)
     await persist.audit(
-        admin, "batch_lot", ",".join(updated), body.model_dump(), "ok", client_ip(request),
+        p.username, "batch_lot", ",".join(updated), body.model_dump(), "ok", client_ip(request),
         category="node", before=None, after=body.model_dump(),
     )
     return {"status": "ok", "updated": updated}

@@ -1,7 +1,7 @@
 """FastAPI 应用入口。
 
-在 lifespan 中完成装配：建表 -> 连接 Redis -> 预热节点缓存 -> 启动轮询 worker。
-路由划分：登录 / Webhook / 节点 WS 网关 / 节点管理 / 配置 / 账户 / 平仓 / 后台 WS。
+在 lifespan 中完成装配：建表 -> 连接 Redis -> 预热节点缓存 -> 权限种子 -> 启动轮询 worker。
+路由划分：登录 / 用户与角色 / Webhook / 节点 WS 网关 / 节点管理 / 配置 / 账户 / 平仓 / 后台 WS。
 """
 import logging
 from contextlib import asynccontextmanager
@@ -25,11 +25,14 @@ from . import (
     groups,
     node_service,
     nodes,
+    rbac_service,
+    roles_api,
     strategies,
     strategy_service,
     system_settings,
     trend_api,
     user_service,
+    users_api,
     webhook,
     ws_gateway,
     twofa,
@@ -79,6 +82,9 @@ async def lifespan(app: FastAPI):
     if busy:
         logger.info("restored %d group-node busy marker(s)", len(busy))
     await user_service.seed_default_admin(store)
+    await rbac_service.seed_rbac()
+    # 后台推送按事件所属节点 / 分组的所有者过滤，归属从 Redis 缓存里取
+    manager.owner_resolver = lambda resource: rbac_service.resolve_owner(store, resource)
     # 保证全局节点接入令牌存在；首次启动自动生成（管理员可在「账户设置」页面查看/重置）
     token = await system_settings.ensure_node_token(store)
     logger.info("global node token ready (length=%d)", len(token))
@@ -115,6 +121,8 @@ app.add_middleware(
 for r in (
     auth.router,
     twofa.router,
+    users_api.router,
+    roles_api.router,
     webhook.router,
     ws_gateway.router,
     nodes.router,

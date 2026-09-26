@@ -5,7 +5,7 @@
 MySQL，「当前发布哪个版本」存 system_setting.client_release 指针。
 
 两套鉴权刻意分开：
-- 管理端（JWT）——上传、发布、降级、回滚、删除；
+- 管理端（JWT，仅超级管理员）——版本清单、上传、发布、降级、回滚、删除；
 - 节点端（NODE_TOKEN）——只有查发布版本与下载安装包两个只读接口。
   NODE_TOKEN 全局共享且明文分发到每台节点机，不能用它授权任何写操作。
 """
@@ -26,7 +26,7 @@ from sqlalchemy import delete, func, select
 from . import client_version as cv
 from . import persist, system_settings
 from .db import SessionLocal
-from .deps import client_ip, get_current_admin, get_node_token_auth
+from .deps import client_ip, get_admin_username, get_node_token_auth
 from .models import (
     ClientReleaseOut,
     ClientReleasePayload,
@@ -94,7 +94,7 @@ def _release_out(release: dict) -> ClientReleaseOut:
 
 
 @router.get("", response_model=ClientVersionListOut)
-async def list_versions(_: str = Depends(get_current_admin)):
+async def list_versions(_: str = Depends(get_admin_username)):
     """版本清单（新版在前）+ 当前发布指针 + 各版本的节点数分布。"""
     release = await system_settings.get_client_release()
     current = str(release.get("version") or "")
@@ -130,7 +130,7 @@ async def upload_version(
     file: UploadFile = File(..., description="客户端安装包 zip"),
     version: str = Form("", description="留空则读包内 version.txt"),
     notes: str = Form("", description="更新说明"),
-    admin: str = Depends(get_current_admin),
+    admin: str = Depends(get_admin_username),
 ):
     """上传客户端安装包。
 
@@ -221,7 +221,7 @@ async def upload_version(
 @router.post("/rollback", response_model=ClientReleaseOut)
 async def rollback_release(
     request: Request,
-    admin: str = Depends(get_current_admin),
+    admin: str = Depends(get_admin_username),
 ):
     """把发布指针回退到上一个发布过的版本（服务端回滚）。"""
     current = await system_settings.get_client_release()
@@ -249,7 +249,7 @@ async def release_version(
     version: str,
     request: Request,
     body: ClientReleasePayload | None = None,
-    admin: str = Depends(get_current_admin),
+    admin: str = Depends(get_admin_username),
 ):
     """把某个版本设为当前发布版本；判定为降级时必须显式确认。"""
     norm = cv.normalize_version(version)
@@ -282,7 +282,7 @@ async def release_version(
 async def delete_version(
     version: str,
     request: Request,
-    admin: str = Depends(get_current_admin),
+    admin: str = Depends(get_admin_username),
 ):
     """删除某个版本的安装包；当前发布版本禁止删除。"""
     norm = cv.normalize_version(version)

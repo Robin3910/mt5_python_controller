@@ -1,20 +1,25 @@
-"""中控台手动触发信号 API（需管理员鉴权）。
+"""中控台手动触发信号 API。
 
-复用 /webhook 的解析与分发流程（webhook.process_signal），以管理员 JWT 鉴权，
+复用 /webhook 的解析与分发流程（webhook.process_signal），以后台 JWT 鉴权，
 避免把 Webhook token / IP 白名单暴露到浏览器；来源标记为 manual，便于事件页区分。
+
+普通用户只能手动触发 strategy 信号，且只作用于本人分组：复用 group_ids 精确定向，
+没点名就注入其全部分组，点名了别人的分组按不存在拒绝，分发引擎本身不做任何区分。
+清理交易日志是全局操作，仅管理员。
 """
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from . import group_persist, group_rules, persist
+from . import group_persist, group_rules, permissions, persist
 from .connections import manager
 from .deps import (
     client_ip,
-    get_current_admin,
     get_dispatcher,
     get_group_dispatcher,
     get_store,
+    require_admin,
+    require_menu,
 )
 from .dispatcher import Dispatcher
 from .group_dispatcher import GroupDispatcher, build_strategy_stop_command
@@ -26,6 +31,7 @@ from .models import (
     PurgeTradeLogsRequest,
     PurgeTradeLogsResult,
 )
+from .permissions import MENU_DASHBOARD, MENU_GROUPS, Principal
 from .redis_store import RedisStore
 from .webhook import process_signal
 
@@ -86,6 +92,23 @@ def _build_signal_payload(body: ManualSignalRequest) -> dict:
     return data
 
 
+async def _scope_to_own_groups(
+    store: RedisStore, p: Principal, body: ManualSignalRequest,
+) -> ManualSignalRequest:
+    """普通用户：只能发 strategy 信号，分组定向收窄到本人分组。管理员原样放行。"""
+    if p.is_admin:
+        return body
+    if group_rules.normalize_signal_model(body.model) != SIGNAL_MODEL_STRATEGY:
+        raise HTTPException(status_code=403, detail="普通用户只能手动触发 strategy 信号")
+    own = [g["group_id"] for g in permissions.visible(p, await store.all_groups())]
+    scoped, foreign = permissions.scope_group_ids(body.group_ids, own)
+    if foreign:
+        raise HTTPException(status_code=404, detail=f"分组不存在：{'、'.join(foreign)}")
+    if not scoped:
+        raise HTTPException(status_code=400, detail="你还没有分组，无法手动触发信号")
+    return body.model_copy(update={"group_ids": scoped})
+
+
 @router.post("/manual-signal")
 async def manual_signal(
     body: ManualSignalRequest,
@@ -93,9 +116,11 @@ async def manual_signal(
     store: RedisStore = Depends(get_store),
     dispatcher: Dispatcher = Depends(get_dispatcher),
     group_dispatcher: GroupDispatcher = Depends(get_group_dispatcher),
-    admin: str = Depends(get_current_admin),
+    p: Principal = Depends(require_menu(MENU_DASHBOARD, MENU_GROUPS)),
 ):
     """手动触发一条信号（BUY / SELL / CLOSE），走与 Webhook 完全一致的分发流程。"""
+    admin = p.username
+    body = await _scope_to_own_groups(store, p, body)
     data = _build_signal_payload(body)
     ip = client_ip(request)
     result = await process_signal(
@@ -125,7 +150,7 @@ async def purge_trade_logs(
     body: PurgeTradeLogsRequest,
     request: Request,
     store: RedisStore = Depends(get_store),
-    admin: str = Depends(get_current_admin),
+    p: Principal = Depends(require_admin),
 ):
     """清空全部交易日志表与记录表。
 
@@ -145,7 +170,7 @@ async def purge_trade_logs(
     redis_cleared = await store.clear_trade_runtime()
     total = sum(deleted.values())
     await persist.audit(
-        admin, "purge_trade_logs", None, {"confirm": True}, "ok", client_ip(request),
+        p.username, "purge_trade_logs", None, {"confirm": True}, "ok", client_ip(request),
         category="console", before=None, after={
             "deleted": deleted,
             "redis_cleared": redis_cleared,

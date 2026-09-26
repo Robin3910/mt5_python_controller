@@ -191,6 +191,14 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 .btn-sm { padding: 6px 12px; font-size: 12px; }
 .btn-block { width: 100%; }
 .btn-logout { flex-shrink: 0; }
+.topbar-user {
+  flex-shrink: 0;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
 
 /* ── Form controls ── */
 input, select, textarea {
@@ -1296,6 +1304,7 @@ a.dash-link { display: inline-block; }
   .spacer { display: none; }
   .topbar-status { order: 2; margin-left: auto; }
   .btn-logout { order: 2; }
+  .topbar-user { order: 2; }
   .pill { font-size: 10px; padding: 4px 8px; }
   .content { padding: 14px; }
   .two { grid-template-columns: 1fr; }

@@ -1,6 +1,6 @@
 # Webhook 入参文档
 
-> **最后更新：2026-08-17**（模版2 限价改为同价挂入场）
+> **最后更新：2026-09-24**（补充：Webhook 全站共用，不按登录用户拆分）
 
 TradingView → MT5 跟单系统的信号接收接口说明。本文档描述的是**代码的真实行为**（以 `backend/app/webhook.py` + `backend/app/parser.py` + `backend/app/config.py` + `backend/app/group_dispatcher.py` 为准），而非 README 的宣传性描述。
 
@@ -23,6 +23,8 @@ TradingView → MT5 跟单系统的信号接收接口说明。本文档描述的
 ## 2. 鉴权与访问控制
 
 解析信号**之前**有两道可选门槛，按顺序执行。IP 白名单默认关闭；token 校验默认开启。配置页「Webhook 校验 token」保存后写入数据库，立即生效并覆盖 `ENABLE_AUTH`，进程重启后仍以该开关为准。
+
+Webhook 是**全站一条**入口，不按登录用户拆分；开关、`AUTH_TOKEN` 与顶栏复制地址只给超级管理员。`model=strategy` 仍按分组 + 绑定策略分发，与后台「谁拥有该分组」无关——归属只约束管理端谁能改分组 / 谁能手动触发，不改变 TradingView 推过来的信号路由。
 
 ### 2.1 IP 白名单（先执行）
 

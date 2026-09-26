@@ -42,6 +42,8 @@ K_STRATEGIES = "strategies"             # 所有 strategy_id 的集合
 K_LIMIT_WATCH_LOCK = "limit_watch:lock:{}:{}"
 K_LIMIT_WATCH_DONE = "limit_watch:done:{}:{}"
 K_LIMIT_WATCH_REJECT = "limit_watch:reject:{}:{}"
+# 登录用户的权限快照（角色 / 菜单 / 启用状态 / 会话版本），权威在 MySQL，丢失即重建
+K_PRINCIPAL = "auth:principal:{}"
 
 
 class RedisStore:
@@ -357,3 +359,16 @@ class RedisStore:
     async def delete_strategy(self, strategy_id: str) -> None:
         await self.r.delete(K_STRATEGY.format(strategy_id))
         await self.r.srem(K_STRATEGIES, strategy_id)
+
+    # ----------------- 登录用户权限快照 -----------------
+    async def get_principal_cache(self, username: str) -> Optional[dict]:
+        raw = await self.r.get(K_PRINCIPAL.format(username))
+        return json.loads(raw) if raw else None
+
+    async def set_principal_cache(self, username: str, data: dict, ttl: int) -> None:
+        await self.r.set(K_PRINCIPAL.format(username), json.dumps(data), ex=ttl)
+
+    async def delete_principal_cache(self, *usernames: str) -> None:
+        keys = [K_PRINCIPAL.format(u) for u in usernames if u]
+        if keys:
+            await self.r.delete(*keys)

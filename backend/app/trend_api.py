@@ -1,4 +1,4 @@
-"""趋势面板 API（只读观测，需管理员鉴权）。
+"""趋势面板 API（只读观测，需登录；普通用户只能查看本人节点）。
 
 按品种 / 周期向目标节点索取 K 线与报价（market_probe），再用 trend_indicators 的
 纯函数算出 EMA、RSI 与综合趋势得分。本模块只做鉴权、参数合并与编排，不含任何
@@ -15,7 +15,8 @@ import time
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from . import market_probe, system_settings, trend_indicators
-from .deps import get_current_admin, get_store
+from .deps import get_principal, get_store, owned_node_or_404
+from .permissions import Principal
 from .redis_store import RedisStore
 
 router = APIRouter(prefix="/api/nodes", tags=["trend"])
@@ -68,16 +69,14 @@ async def node_trend(
     symbol: str = Query(..., description="品种代码，如 XAUUSD"),
     overrides: dict = Depends(trend_overrides),
     store: RedisStore = Depends(get_store),
-    _: str = Depends(get_current_admin),
+    p: Principal = Depends(get_principal),
 ):
     """某节点某品种的实时趋势快照（K 线 + EMA/RSI + 综合得分）。
 
     权重与阈值只影响得分换算，K 线取数与之无关，因此面板上调参数时通常直接命中
-    行情缓存、不会额外惊动节点终端。
+    行情缓存、不会额外惊动节点终端。普通用户只能以本人节点为行情源。
     """
-    node = await store.get_node(node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="node not found")
+    await owned_node_or_404(store, p, node_id)
 
     sym = (symbol or "").strip().upper()
     if not _SYMBOL_RE.match(sym):

@@ -1,7 +1,7 @@
 """SQLAlchemy ORM 模型（生产用 MySQL，本地开发用 SQLite）。
 
-承担“持久化”职责：节点账本、后台用户、操作审计、信号历史、分发明细，
-以及 strategy 信号的分组账本与主任务链路（node_group* / group_signal_task*）。
+承担“持久化”职责：节点账本、后台用户与角色权限（sys_*）、操作审计、信号历史、
+分发明细，以及 strategy 信号的分组账本与主任务链路（node_group* / group_signal_task*）。
 """
 from datetime import datetime
 
@@ -53,6 +53,8 @@ class Node(Base):
     # 节点鉴权首包上报的客户端版本；旧版本节点不带该字段，留空表示未知
     client_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
     client_version_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # 数据归属：管理员分配给哪个用户；空 = 管理员名下（含自动注册的新节点）
+    owner_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
@@ -95,20 +97,63 @@ class ClientVersion(Base):
 
 
 class User(Base):
-    """后台管理员用户（权威数据源）。"""
+    """后台用户：超级管理员与普通用户（权威数据源）。
+
+    权限以 sys_user_role 为准；`role` 是 RBAC 之前的旧字段，只在首次升级时
+    用来识别谁是管理员，之后不再读取。
+    """
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     username: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    display_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
     password_hash: Mapped[str] = mapped_column(String(64))  # SHA256 十六进制
     role: Mapped[str] = mapped_column(String(16), default="admin")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     totp_secret: Mapped[str | None] = mapped_column(String(32), nullable=True)
     totp_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 会话版本：禁用 / 改密 / 重置密码时 +1，签发时写进 JWT 的 ver，旧 token 随即失效
+    token_version: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
     )
+
+
+class Role(Base):
+    """角色：一组菜单的集合。内置角色（admin / user）由启动种子创建，不可删除。"""
+    __tablename__ = "sys_role"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(64))
+    is_builtin: Mapped[bool] = mapped_column(Boolean, default=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    remark: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class RoleMenu(Base):
+    """角色 × 菜单。菜单本身是代码注册表（permissions.MENU_REGISTRY），库里只存勾选关系。"""
+    __tablename__ = "sys_role_menu"
+    __table_args__ = (UniqueConstraint("role_id", "menu_code", name="uq_role_menu"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    role_id: Mapped[int] = mapped_column(Integer, index=True)
+    menu_code: Mapped[str] = mapped_column(String(32))
+
+
+class UserRole(Base):
+    """用户 × 角色（多对多）；用户的菜单为其全部启用角色的菜单并集。"""
+    __tablename__ = "sys_user_role"
+    __table_args__ = (UniqueConstraint("user_id", "role_id", name="uq_user_role"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(Integer, index=True)
+    role_id: Mapped[int] = mapped_column(Integer, index=True)
 
 
 class AuditLog(Base):
@@ -201,6 +246,8 @@ class NodeGroup(Base):
     # 一对一绑定 TradingStrategy；unique 保证同一策略不能挂到多个分组
     strategy_id: Mapped[str | None] = mapped_column(String(32), nullable=True, unique=True, index=True)
     remark: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # 数据归属：创建者；空 = 管理员名下。成员节点与绑定策略必须同一所有者
+    owner_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
@@ -397,6 +444,8 @@ class TradingStrategy(Base):
     #   batch_enabled, batch_action, batch_count, total_lot_limit, batch_levels}, ...]
     config_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
     remark: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # 数据归属：创建者；空 = 管理员名下
+    owner_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()

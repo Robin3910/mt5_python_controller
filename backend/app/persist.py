@@ -7,7 +7,7 @@ from dataclasses import asdict
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 
 from .db import SessionLocal
 from .orm import (
@@ -576,7 +576,7 @@ async def audit(
 ) -> None:
     """写一条操作审计。
 
-    category：console（中控台）/ node（节点）/ system（其它）
+    category：console（中控台）/ node（节点）/ auth（登录与账号权限）/ system（其它系统操作）
     before / after：操作前后数据快照（dict 或可 JSON 序列化对象）。
     """
     try:
@@ -619,8 +619,9 @@ async def recent_audits(
     page: int = 1,
     page_size: int = 20,
     categories: Optional[list[str]] = None,
+    operator: Optional[str] = None,
 ) -> dict:
-    """分页读取操作审计（默认中控台 + 节点）。"""
+    """分页读取操作审计（默认中控台 + 节点）；operator 非空时只返回该操作人的记录。"""
     page = max(1, page)
     page_size = max(1, min(page_size, 100))
     offset = (page - 1) * page_size
@@ -628,6 +629,8 @@ async def recent_audits(
     try:
         async with SessionLocal() as s:
             filt = AuditLog.category.in_(cats)
+            if operator:
+                filt = and_(filt, AuditLog.operator == operator)
             total = (
                 await s.execute(select(func.count()).select_from(AuditLog).where(filt))
             ).scalar_one()

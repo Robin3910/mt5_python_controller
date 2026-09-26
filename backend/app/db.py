@@ -277,6 +277,49 @@ def _migrate_node_client_version(sync_conn) -> None:
         sync_conn.execute(text("ALTER TABLE nodes ADD COLUMN client_version_at DATETIME"))
 
 
+def _migrate_user_rbac_columns(sync_conn) -> None:
+    """users.token_version / display_name：会话吊销版本号与显示名。"""
+    inspector = inspect(sync_conn)
+    if "users" not in inspector.get_table_names():
+        return
+    cols = {c["name"] for c in inspector.get_columns("users")}
+    if "token_version" not in cols:
+        sync_conn.execute(
+            text("ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0")
+        )
+    if "display_name" not in cols:
+        sync_conn.execute(text("ALTER TABLE users ADD COLUMN display_name VARCHAR(64)"))
+
+
+# 按用户归属数据的三张表：空值 = 管理员名下
+_OWNER_TABLES = ("nodes", "node_group", "trading_strategy")
+
+
+def _migrate_owner_columns(sync_conn) -> None:
+    """nodes / node_group / trading_strategy.owner_user_id：数据归属列 + 索引。
+
+    存量行保持空值（归管理员），不回填。索引名与 ORM 的 index=True 生成的一致，
+    新库与升级库结构相同。
+    """
+    inspector = inspect(sync_conn)
+    tables = set(inspector.get_table_names())
+    dialect = sync_conn.engine.dialect.name
+    for table in _OWNER_TABLES:
+        if table not in tables:
+            continue
+        cols = {c["name"] for c in inspector.get_columns(table)}
+        if "owner_user_id" in cols:
+            continue
+        sync_conn.execute(text(f"ALTER TABLE {table} ADD COLUMN owner_user_id INTEGER"))
+        index = f"ix_{table}_owner_user_id"
+        if dialect == "mysql":
+            sync_conn.execute(text(f"CREATE INDEX {index} ON {table} (owner_user_id)"))
+        else:
+            sync_conn.execute(
+                text(f"CREATE INDEX IF NOT EXISTS {index} ON {table} (owner_user_id)")
+            )
+
+
 def _drop_legacy_nodes_table(sync_conn) -> None:
     """v0.2 迁移：旧表带 `token_hash` 列（一节点一令牌）；新方案改为全局共享令牌，
     且 `mt5_login` 升级为 UNIQUE NOT NULL，无法平滑 ALTER —— 直接丢弃旧表，由
@@ -310,4 +353,6 @@ async def init_db() -> None:
         await conn.run_sync(_migrate_node_risk_json)
         await conn.run_sync(_migrate_node_trend_json)
         await conn.run_sync(_migrate_node_client_version)
+        await conn.run_sync(_migrate_user_rbac_columns)
+        await conn.run_sync(_migrate_owner_columns)
     logger.info("Database initialized (%s)", engine.url.render_as_string(hide_password=True))

@@ -249,6 +249,8 @@ async def rewrite_running_strategy_snapshots(
     """重写该策略下非终态子任务所属主任务的规则快照，返回这些子任务。
 
     断线 resume 读的是主任务 strategy_snapshot_json；不改库只推 WS 会在重连后回到旧规则。
+    调用方（strategies 热推）只对加仓策略（模版1）调这里；网格 / 趋势策略
+    的在跑任务全程用下发时的快照。
     """
     sid = str(strategy_id or "").strip()
     if not sid or not isinstance(snapshot, dict):

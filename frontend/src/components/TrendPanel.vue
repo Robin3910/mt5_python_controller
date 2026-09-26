@@ -15,6 +15,7 @@ import {
   TooltipComponent,
 } from 'echarts/components'
 import { CanvasRenderer } from 'echarts/renderers'
+import { useAuthStore } from '@/stores/auth'
 import { useHubStore } from '@/stores/hub'
 import type { TrendConfig, TrendPanelData } from '@/api/types'
 import {
@@ -58,6 +59,7 @@ const props = defineProps<{
 }>()
 
 const hub = useHubStore()
+const auth = useAuthStore()
 
 const symbol = ref('')
 const symbolInput = ref('')
@@ -594,13 +596,16 @@ onBeforeUnmount(() => {
       <div class="row between" style="align-items: flex-start; margin-bottom: 12px">
         <div>
           <strong>参数</strong>
-          <p class="muted trend-hint" style="margin: 4px 0 0">
+          <p v-if="auth.isAdmin" class="muted trend-hint" style="margin: 4px 0 0">
             改动即时生效于本次查看；点「保存」写入全局配置（不分节点/币种），下次打开与其他管理员都沿用
+          </p>
+          <p v-else class="muted trend-hint" style="margin: 4px 0 0">
+            改动只作用于本次查看；全局参数由管理员维护
           </p>
         </div>
         <div class="row" style="gap: 8px">
           <button class="btn-sm btn-ghost" @click="resetToDefaults">恢复默认</button>
-          <button class="btn-primary btn-sm" :disabled="saving" @click="save">
+          <button v-if="auth.isAdmin" class="btn-primary btn-sm" :disabled="saving" @click="save">
             {{ saving ? '保存中…' : '保存' }}
           </button>
         </div>

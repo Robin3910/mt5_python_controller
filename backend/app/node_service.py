@@ -40,6 +40,7 @@ def node_row_to_dict(row: Node) -> dict:
         "client_version_at": (
             row.client_version_at.timestamp() if row.client_version_at else None
         ),
+        "owner_user_id": row.owner_user_id,
         "created_at": row.created_at.timestamp() if row.created_at else time.time(),
     }
 
@@ -189,6 +190,22 @@ async def update_node(store: RedisStore, node_id: str, patch: NodeUpdate) -> Opt
             row.filters_json = patch.filters
         if risk_norm is not None:
             row.risk_json = risk_norm
+        await s.commit()
+        await s.refresh(row)
+        d = node_row_to_dict(row)
+    await store.cache_node(d)
+    return d
+
+
+async def set_owner(
+    store: RedisStore, node_id: str, owner_user_id: Optional[int],
+) -> Optional[dict]:
+    """改节点归属（None = 回到管理员名下）；前置校验（活动子任务、分组成员）由调用方完成。"""
+    async with SessionLocal() as s:
+        row = await s.get(Node, node_id)
+        if not row:
+            return None
+        row.owner_user_id = owner_user_id
         await s.commit()
         await s.refresh(row)
         d = node_row_to_dict(row)

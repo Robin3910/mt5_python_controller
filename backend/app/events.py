@@ -1,9 +1,10 @@
-"""Webhook 信号事件 API（需管理员鉴权）。"""
+"""Webhook 信号事件 API（仅管理员：信号历史是全局数据，含 normal 链路对全部节点的分发明细）。"""
 from fastapi import APIRouter, Depends
 
 from . import persist
-from .deps import get_current_admin, get_store
+from .deps import get_store, require_admin
 from .models import PaginatedSignalEvents
+from .permissions import Principal
 from .redis_store import RedisStore
 
 router = APIRouter(prefix="/api/events", tags=["events"])
@@ -14,7 +15,7 @@ async def list_signal_events(
     page: int = 1,
     page_size: int = 20,
     store: RedisStore = Depends(get_store),
-    _: str = Depends(get_current_admin),
+    _: Principal = Depends(require_admin),
 ):
     """分页列出 Webhook 信号：原始参数 + 各节点后续处理明细。"""
     nodes = await store.all_nodes()

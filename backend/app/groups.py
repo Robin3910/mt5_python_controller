@@ -1,14 +1,24 @@
-"""分组管理 API（需管理员鉴权）。
+"""分组管理 API。
 
 分组是 strategy 信号（Webhook 的 model=strategy）的分发单元：支持新建 / 编辑 /
 启停、维护成员节点、设置分组级分发模式（sync / poll，不区分币种），并提供该分组
 已处理信号的明细查询（主任务 + 各节点处理过程）。
+
+普通用户只能看 / 改自己创建的分组，成员只能选本人节点、策略只能绑本人策略；
+写操作与平仓需要「分组管理」菜单。
 """
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from . import group_persist, group_rules, group_service, persist
+from . import group_persist, group_rules, group_service, permissions, persist, rbac_service
 from .connections import manager
-from .deps import client_ip, get_current_admin, get_group_dispatcher, get_store
+from .deps import (
+    client_ip,
+    get_group_dispatcher,
+    get_principal,
+    get_store,
+    owned_group_or_404,
+    require_menu,
+)
 from .group_dispatcher import GroupDispatcher
 from .limit_watch import normalize_keyword
 from .models import (
@@ -21,6 +31,7 @@ from .models import (
     PaginatedGroupSignals,
     PaginatedLimitWatchLogs,
 )
+from .permissions import MENU_GROUPS, Principal
 from .redis_store import RedisStore
 
 router = APIRouter(prefix="/api/groups", tags=["groups"])
@@ -42,6 +53,7 @@ def _group_audit_snapshot(d: dict | None) -> dict | None:
         "strategy_id": d.get("strategy_id"),
         "remark": d.get("remark"),
         "node_ids": group_rules.member_ids(d),
+        "owner_user_id": d.get("owner_user_id"),
     }
 
 
@@ -55,7 +67,7 @@ def _validate_dispatch_mode(mode: str | None) -> None:
 
 async def _to_group_out(
     store: RedisStore, d: dict, signal_count: int = 0, active_task_count: int = 0,
-    limit_watch_logs: list | None = None,
+    limit_watch_logs: list | None = None, owner_names: dict[int, str] | None = None,
 ) -> GroupOut:
     """把缓存里的分组 dict 组装成对外的 GroupOut（合并成员节点的在线状态）。"""
     nodes: list[GroupNodeRef] = []
@@ -91,6 +103,7 @@ async def _to_group_out(
             if gid:
                 latest = await persist.latest_limit_watch_logs([gid])
                 logs = latest.get(gid, [])
+    owner = permissions.normalize_owner(d.get("owner_user_id"))
     return GroupOut(
         group_id=d["group_id"],
         name=d["name"],
@@ -110,6 +123,8 @@ async def _to_group_out(
         signal_count=signal_count,
         active_task_count=active_task_count,
         limit_watch_logs=logs,
+        owner_user_id=owner,
+        owner_username=(owner_names or {}).get(owner) if owner is not None else None,
     )
 
 
@@ -117,10 +132,10 @@ async def _to_group_out(
 async def list_groups(
     q: str | None = None,
     store: RedisStore = Depends(get_store),
-    _: str = Depends(get_current_admin),
+    p: Principal = Depends(get_principal),
 ):
-    """分组列表（按创建时间排序）；可选 q 按分组名称模糊搜索。"""
-    groups = await store.all_groups()
+    """分组列表（按创建时间排序）；可选 q 按分组名称模糊搜索。普通用户只看本人分组。"""
+    groups = permissions.visible(p, await store.all_groups())
     if q and (term := q.strip()):
         needle = term.lower()
         groups = [g for g in groups if needle in (g.get("name") or "").lower()]
@@ -133,10 +148,12 @@ async def list_groups(
         if g.get("limit_watch_enabled") and g.get("group_id")
     ]
     latest_logs = await persist.latest_limit_watch_logs(watch_ids) if watch_ids else {}
+    names = await rbac_service.owner_names_for(p)
     return [
         await _to_group_out(
             store, g, counts.get(g["group_id"], 0), active_counts.get(g["group_id"], 0),
             limit_watch_logs=latest_logs.get(g["group_id"], []) if g.get("limit_watch_enabled") else [],
+            owner_names=names,
         )
         for g in groups
     ]
@@ -147,37 +164,37 @@ async def create_group(
     body: GroupCreate,
     request: Request,
     store: RedisStore = Depends(get_store),
-    admin: str = Depends(get_current_admin),
+    p: Principal = Depends(require_menu(MENU_GROUPS)),
 ):
-    """新建分组。分组名称全局唯一。"""
+    """新建分组：归创建者所有（管理员建的归管理员名下），名称在同一所有者内唯一。"""
     _validate_dispatch_mode(body.dispatch_mode)
+    owner = permissions.owner_for_new(p)
     name = body.name.strip()
-    if await group_service.name_exists(name):
+    if await group_service.name_exists(name, owner_user_id=owner):
         raise HTTPException(status_code=409, detail=f"分组名称已存在：{name}")
     try:
-        d = await group_service.create_group(store, body)
+        d = await group_service.create_group(store, body, owner_user_id=owner)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     await persist.audit(
-        admin, "create_group", d["group_id"], None, "ok", client_ip(request),
+        p.username, "create_group", d["group_id"], None, "ok", client_ip(request),
         category="console", before=None, after=_group_audit_snapshot(d),
     )
-    return await _to_group_out(store, d)
+    return await _to_group_out(store, d, owner_names=await rbac_service.owner_names_for(p))
 
 
 @router.get("/{group_id}", response_model=GroupOut)
 async def get_group(
     group_id: str,
     store: RedisStore = Depends(get_store),
-    _: str = Depends(get_current_admin),
+    p: Principal = Depends(get_principal),
 ):
-    d = await store.get_group(group_id)
-    if not d:
-        raise HTTPException(status_code=404, detail="group not found")
+    d = await owned_group_or_404(store, p, group_id)
     counts = await group_persist.count_by_group()
     active_counts = await group_persist.count_active_by_group()
     return await _to_group_out(
         store, d, counts.get(group_id, 0), active_counts.get(group_id, 0),
+        owner_names=await rbac_service.owner_names_for(p),
     )
 
 
@@ -187,11 +204,10 @@ async def group_limit_watch_logs(
     page: int = 1,
     page_size: int = 50,
     store: RedisStore = Depends(get_store),
-    _: str = Depends(get_current_admin),
+    p: Principal = Depends(get_principal),
 ):
     """分组限价监听日志分页（落库；列表页经后台 WS 实时追加）。"""
-    if not await store.get_group(group_id):
-        raise HTTPException(status_code=404, detail="group not found")
+    await owned_group_or_404(store, p, group_id)
     return await persist.list_limit_watch_logs(group_id, page, page_size)
 
 
@@ -203,7 +219,7 @@ async def group_signals(
     status: str | None = None,
     signal_id: str | None = None,
     store: RedisStore = Depends(get_store),
-    _: str = Depends(get_current_admin),
+    p: Principal = Depends(get_principal),
 ):
     """分组信号明细分页：主任务（信号 + 下发数据）与各节点的处理过程。
 
@@ -212,8 +228,7 @@ async def group_signals(
     """
     if status is not None and status != "active":
         raise HTTPException(status_code=400, detail="status 仅支持 active")
-    if not await store.get_group(group_id):
-        raise HTTPException(status_code=404, detail="group not found")
+    await owned_group_or_404(store, p, group_id)
     nodes = await store.all_nodes()
     node_names = {n["node_id"]: n.get("name") or n["node_id"] for n in nodes}
     sid = (signal_id or "").strip() or None
@@ -230,11 +245,10 @@ async def group_dispatch_events(
     group_id: str,
     dispatch_id: int,
     store: RedisStore = Depends(get_store),
-    _: str = Depends(get_current_admin),
+    p: Principal = Depends(get_principal),
 ):
     """节点策略子任务的关联订单/事件流：开仓、加仓、平仓等。"""
-    if not await store.get_group(group_id):
-        raise HTTPException(status_code=404, detail="group not found")
+    await owned_group_or_404(store, p, group_id)
     items = await group_persist.list_dispatch_events(group_id, dispatch_id)
     if items is None:
         raise HTTPException(status_code=404, detail="dispatch not found")
@@ -257,21 +271,20 @@ async def close_group_dispatch(
     request: Request,
     store: RedisStore = Depends(get_store),
     group_dispatcher: GroupDispatcher = Depends(get_group_dispatcher),
-    admin: str = Depends(get_current_admin),
+    p: Principal = Depends(require_menu(MENU_GROUPS)),
 ):
     """手动终止单个节点策略子任务：下发 strategy_stop，平掉该魔术号持仓并结束监控。
 
     与 Webhook CLOSE（按品种命中全部分组全部子任务）不同，这里只作用于指定子任务。
     """
-    if not await store.get_group(group_id):
-        raise HTTPException(status_code=404, detail="group not found")
+    await owned_group_or_404(store, p, group_id)
     try:
         outcome = await group_dispatcher.close_subtask(group_id, dispatch_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     result = "ok" if outcome.get("status") == "closing" else "offline"
     await persist.audit(
-        admin, "close_group_dispatch", group_id,
+        p.username, "close_group_dispatch", group_id,
         {"dispatch_id": dispatch_id, "node_id": outcome.get("node_id")},
         result, client_ip(request),
         category="console", before=None, after=outcome,
@@ -285,15 +298,14 @@ async def close_group(
     request: Request,
     store: RedisStore = Depends(get_store),
     group_dispatcher: GroupDispatcher = Depends(get_group_dispatcher),
-    admin: str = Depends(get_current_admin),
+    p: Principal = Depends(require_menu(MENU_GROUPS)),
 ):
     """分组一键平仓：终止该分组全部未收口子任务，平掉各自魔术号持仓并结束监控。
 
     只作用于本分组，不做账户级全平，因此同一节点上其它分组的任务与持仓不受影响。
     与 Webhook CLOSE 同一条 strategy_stop 路径；CLOSE 还按品种筛选，这里不限品种。
     """
-    if not await store.get_group(group_id):
-        raise HTTPException(status_code=404, detail="group not found")
+    await owned_group_or_404(store, p, group_id)
     try:
         outcome = await group_dispatcher.close_group(group_id)
     except ValueError as e:
@@ -306,7 +318,7 @@ async def close_group(
     else:
         result = "offline"
     await persist.audit(
-        admin, "close_group", group_id, None, result, client_ip(request),
+        p.username, "close_group", group_id, None, result, client_ip(request),
         category="console", before=None, after=outcome,
     )
     return outcome
@@ -318,14 +330,17 @@ async def update_group(
     body: GroupUpdate,
     request: Request,
     store: RedisStore = Depends(get_store),
-    admin: str = Depends(get_current_admin),
+    p: Principal = Depends(require_menu(MENU_GROUPS)),
 ):
     """更新分组（名称 / 启用状态 / 分发模式 / 信号并发 / 趋势风控 / 限价监听 / 绑定策略 / 备注 / 成员节点）。"""
     _validate_dispatch_mode(body.dispatch_mode)
+    current = await owned_group_or_404(store, p, group_id)
     if body.name is not None and (name := body.name.strip()):
-        if await group_service.name_exists(name, exclude_group_id=group_id):
+        if await group_service.name_exists(
+            name, exclude_group_id=group_id, owner_user_id=current.get("owner_user_id"),
+        ):
             raise HTTPException(status_code=409, detail=f"分组名称已存在：{name}")
-    before = _group_audit_snapshot(await store.get_group(group_id))
+    before = _group_audit_snapshot(current)
     try:
         d = await group_service.update_group(store, group_id, body)
     except ValueError as e:
@@ -333,11 +348,11 @@ async def update_group(
     if not d:
         raise HTTPException(status_code=404, detail="group not found")
     await persist.audit(
-        admin, "update_group", group_id, body.model_dump(exclude_none=True), "ok",
+        p.username, "update_group", group_id, body.model_dump(exclude_none=True), "ok",
         client_ip(request),
         category="console", before=before, after=_group_audit_snapshot(d),
     )
-    return await _to_group_out(store, d)
+    return await _to_group_out(store, d, owner_names=await rbac_service.owner_names_for(p))
 
 
 @router.delete("/{group_id}")
@@ -345,14 +360,14 @@ async def delete_group(
     group_id: str,
     request: Request,
     store: RedisStore = Depends(get_store),
-    admin: str = Depends(get_current_admin),
+    p: Principal = Depends(require_menu(MENU_GROUPS)),
 ):
-    before = _group_audit_snapshot(await store.get_group(group_id))
+    before = _group_audit_snapshot(await owned_group_or_404(store, p, group_id))
     ok = await group_service.delete_group(store, group_id)
     if not ok:
         raise HTTPException(status_code=404, detail="group not found")
     await persist.audit(
-        admin, "delete_group", group_id, None, "ok", client_ip(request),
+        p.username, "delete_group", group_id, None, "ok", client_ip(request),
         category="console", before=before, after=None,
     )
     return {"status": "deleted", "group_id": group_id}
