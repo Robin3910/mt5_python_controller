@@ -6,6 +6,8 @@ import 'element-plus/es/components/message/style/css'
 import FormLabel from '@/components/FormLabel.vue'
 import TagSelect from '@/components/TagSelect.vue'
 import type { TagOption } from '@/components/tagOption'
+import StrategySignalFields from '@/components/StrategySignalFields.vue'
+import { signalSymbolMatches, type StrategySignalDraft } from '@/components/strategySignal'
 import { useHubStore } from '@/stores/hub'
 import type {
   BatchCalcType,
@@ -19,6 +21,8 @@ import type {
   RiskSideAction,
   SignalFloatPlRatio,
   SignalLotPlTiers,
+  ManualSignalPayload,
+  ManualSignalResult,
   StrategyBatchLevel,
   ManualScatterConfig,
   StrategyOut,
@@ -33,10 +37,13 @@ const props = withDefaults(
     mode: 'create' | 'edit'
     strategyId?: string
     listSearchOptions?: { q?: string }
+    /** 从分组列表「编辑策略」进入时传入；有值才显示触发信号 */
+    triggerGroup?: { group_id: string; name: string } | null
   }>(),
   {
     strategyId: '',
     listSearchOptions: () => ({}),
+    triggerGroup: null,
   },
 )
 
@@ -66,6 +73,26 @@ const form = reactive({
   symbol: '',
   rules: [] as EditableRule[],
 })
+
+const signalDraft = reactive<StrategySignalDraft>({
+  symbol: '',
+  action: 'BUY',
+  volume: 0.1,
+  stop_loss: null,
+  take_profit: null,
+  entry_price: null,
+  comment: '',
+})
+
+function resetSignalDraft(symbol: string): void {
+  signalDraft.symbol = symbol
+  signalDraft.action = 'BUY'
+  signalDraft.volume = 0.1
+  signalDraft.stop_loss = null
+  signalDraft.take_profit = null
+  signalDraft.entry_price = null
+  signalDraft.comment = ''
+}
 
 const isEditMode = computed(() => props.mode === 'edit')
 
@@ -830,6 +857,7 @@ async function onOpen(): Promise<void> {
   } else {
     await loadEditForm()
   }
+  if (props.triggerGroup) resetSignalDraft(form.symbol)
   // 试算的行情源节点选择器需要节点列表；策略页可能还没拉过
   if (!hub.nodes.length) {
     try {
@@ -1296,33 +1324,75 @@ function showSaveError(msg: string, type: 'warning' | 'error' = 'warning'): void
   ElMessage({ type, message: msg, showClose: true, duration: 5000 })
 }
 
-async function save(): Promise<void> {
+interface PreparedStrategy {
+  name: string
+  symbol: string
+  rules: StrategyRule[]
+}
+
+function prepareStrategy(): PreparedStrategy | null {
   if (!form.template_id) {
     showSaveError('请选择策略模版')
-    return
+    return null
   }
   const name = form.name.trim()
   if (!name) {
     showSaveError('请填写策略名称')
-    return
+    return null
   }
   const symbol = form.symbol.trim().toUpperCase()
   if (!symbol) {
     showSaveError('请填写绑定品种')
-    return
+    return null
   }
   const rulesErr = validateRules(form.rules)
   if (rulesErr) {
     showSaveError(rulesErr)
-    return
+    return null
   }
   if (isTpl1.value) {
     const plErr = validateSignalPl(signalPl)
     if (plErr) {
       showSaveError(plErr)
-      return
+      return null
     }
   }
+  const rules = isTpl1.value
+    ? applySignalPlToRules(cloneRules(form.rules), signalPl)
+    : cloneRules(form.rules)
+  return { name, symbol, rules }
+}
+
+async function writeStrategy(prepared: PreparedStrategy): Promise<boolean> {
+  const actionLabel = isEditMode.value ? '保存' : '创建'
+  try {
+    if (isEditMode.value) {
+      await hub.updateStrategy(
+        props.strategyId || '',
+        { name: prepared.name, symbol: prepared.symbol, rules: prepared.rules },
+        props.listSearchOptions,
+      )
+    } else {
+      await hub.createStrategy(
+        {
+          template_id: form.template_id,
+          name: prepared.name,
+          symbol: prepared.symbol,
+          rules: prepared.rules,
+        },
+        props.listSearchOptions,
+      )
+    }
+    return true
+  } catch (e: unknown) {
+    showSaveError(formatSaveError(e, `${actionLabel}失败，请稍后重试`), 'error')
+    return false
+  }
+}
+
+async function save(): Promise<void> {
+  const prepared = prepareStrategy()
+  if (!prepared) return
   saving.value = true
   formError.value = ''
   try {
@@ -1331,38 +1401,114 @@ async function save(): Promise<void> {
     const actionLabel = isEditMode.value ? '保存' : '创建'
     if (
       !(await confirmAction(
-        `确认${actionLabel}策略「${name}」？\n\n模版：${tplName}\n绑定品种：${symbol}\n启用规则：${enabledCount} / ${form.rules.length}`,
+        `确认${actionLabel}策略「${prepared.name}」？\n\n模版：${tplName}\n绑定品种：${prepared.symbol}\n启用规则：${enabledCount} / ${form.rules.length}`,
       ))
     ) {
       return
     }
-    try {
-      const rules = isTpl1.value
-        ? applySignalPlToRules(cloneRules(form.rules), signalPl)
-        : cloneRules(form.rules)
-      if (isEditMode.value) {
-        await hub.updateStrategy(
-          props.strategyId || '',
-          { name, symbol, rules },
-          props.listSearchOptions,
-        )
-      } else {
-        await hub.createStrategy(
-          {
-            template_id: form.template_id,
-            name,
-            symbol,
-            rules,
-          },
-          props.listSearchOptions,
-        )
-      }
-    } catch (e: unknown) {
-      showSaveError(formatSaveError(e, `${actionLabel}失败，请稍后重试`), 'error')
-      return
-    }
+    if (!(await writeStrategy(prepared))) return
     emit('saved')
     close()
+  } finally {
+    saving.value = false
+  }
+}
+
+function signalDraftError(): string | null {
+  if (!signalDraft.symbol.trim()) return '请填写信号品种'
+  if (signalDraft.action !== 'CLOSE' && !(Number(signalDraft.volume) > 0)) {
+    return '开仓信号必须填写大于 0 的手数'
+  }
+  return null
+}
+
+function reportGroupTrigger(payload: ManualSignalPayload, res: ManualSignalResult): void {
+  const head = `${payload.action} ${payload.symbol}`
+  if (res.status === 'accepted') {
+    const groups = res.groups ?? 0
+    const targets = res.targets ?? 0
+    if (payload.action === 'CLOSE') {
+      if (targets > 0) {
+        ElMessage.success(`已下发终止指令：命中 ${groups} 个分组，${targets} 个节点任务开始平仓`)
+      } else {
+        ElMessage.warning(`命中 ${groups} 个分组，但没有进行中的策略任务需要终止`)
+      }
+      return
+    }
+    const detail = `命中 ${groups} 个分组，${targets} 个节点收到下发`
+    if (targets > 0) {
+      ElMessage.success(`已触发 ${head}：${detail}`)
+      return
+    }
+    const reasons = [
+      ...new Set((res.tasks || []).map((t) => (t.reason || '').trim()).filter(Boolean)),
+    ]
+    const hint = reasons.length ? reasons.join('；') : '分组无有效节点，或未能下发到任何节点'
+    ElMessage.warning(`${head} 已受理但未下发：${detail}（${hint}）`)
+    return
+  }
+  if (res.status === 'duplicate') {
+    ElMessage.warning(`重复信号被抑制：5 秒内已有相同参数的 ${head} 策略信号`)
+    return
+  }
+  if (res.status === 'rejected') {
+    showSaveError(res.reason || '信号被拒收')
+    return
+  }
+  ElMessage.info(`已提交：${res.status}`)
+}
+
+async function triggerBoundGroup(): Promise<void> {
+  const group = props.triggerGroup
+  if (!group || !isEditMode.value) return
+  const draftErr = signalDraftError()
+  if (draftErr) {
+    showSaveError(draftErr)
+    return
+  }
+  const prepared = prepareStrategy()
+  if (!prepared) return
+  const signalSymbol = signalDraft.symbol.trim().toUpperCase()
+  if (!signalSymbolMatches(prepared.symbol, signalSymbol)) {
+    showSaveError(`信号品种 ${signalSymbol} 与策略绑定品种 ${prepared.symbol} 不一致，该分组不会收到信号`)
+    return
+  }
+  const extra = signalDraft.action === 'CLOSE'
+    ? '说明：终止该分组进行中的策略任务并平仓'
+    : `手数：${signalDraft.volume}`
+  if (
+    !(await confirmAction(
+      `确认向分组「${group.name}」触发 ${signalDraft.action} ${signalSymbol}？\n\n将先保存当前策略，再只向该分组发送信号。\n${extra}`,
+      '确认触发信号',
+    ))
+  ) {
+    return
+  }
+  saving.value = true
+  formError.value = ''
+  try {
+    if (!(await writeStrategy(prepared))) return
+    emit('saved')
+    const payload: ManualSignalPayload = {
+      symbol: signalSymbol,
+      action: signalDraft.action,
+      model: 'strategy',
+      group_ids: [group.group_id],
+    }
+    if (signalDraft.action !== 'CLOSE') {
+      payload.volume = Number(signalDraft.volume)
+      if (signalDraft.stop_loss) payload.stop_loss = signalDraft.stop_loss
+      if (signalDraft.take_profit) payload.take_profit = signalDraft.take_profit
+      if (signalDraft.entry_price) payload.entry_price = signalDraft.entry_price
+      const comment = signalDraft.comment.trim()
+      if (comment) payload.comment = comment
+    }
+    try {
+      const res = await hub.triggerManualSignal(payload)
+      reportGroupTrigger(payload, res)
+    } catch (e: unknown) {
+      showSaveError(formatSaveError(e, '策略已保存，但触发信号失败，请稍后重试'), 'error')
+    }
   } finally {
     saving.value = false
   }
@@ -1391,6 +1537,13 @@ function resetRuleToTemplate(idx: number): void {
       </div>
 
       <div class="modal-body card-pad" style="padding-top: 16px">
+        <div v-if="triggerGroup" class="strategy-signal-block">
+          <div class="strategy-signal-head">
+            <strong>触发信号</strong>
+            <span class="muted">只发给分组「{{ triggerGroup.name }}」。点击底部「触发信号」会先保存当前策略。</span>
+          </div>
+          <StrategySignalFields v-model="signalDraft" id-prefix="bound-signal" />
+        </div>
         <div class="form-grid">
           <div class="field">
             <FormLabel field-id="strategy-template" text="策略模版" :help="FIELD_HELP.template" />
@@ -2486,6 +2639,15 @@ function resetRuleToTemplate(idx: number): void {
         <span></span>
         <div class="row" style="gap: 8px">
           <button class="btn-ghost" :disabled="saving" @click="close">取消</button>
+          <button
+            v-if="triggerGroup"
+            type="button"
+            class="btn-success"
+            :disabled="saving"
+            @click="triggerBoundGroup"
+          >
+            {{ saving ? '处理中…' : '触发信号' }}
+          </button>
           <button class="btn-primary" :disabled="saving" @click="save">
             {{ saving ? '保存中…' : isEditMode ? '保存' : '创建' }}
           </button>
@@ -2496,6 +2658,24 @@ function resetRuleToTemplate(idx: number): void {
 </template>
 
 <style scoped>
+.strategy-signal-block {
+  margin-bottom: 18px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--glass-border);
+}
+
+.strategy-signal-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px 12px;
+  margin-bottom: 12px;
+}
+
+.strategy-signal-head .muted {
+  font-size: 12px;
+}
+
 .rules-editor {
   margin-top: 18px;
 }

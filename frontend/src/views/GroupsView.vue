@@ -647,6 +647,7 @@ function openActiveSignals(g: GroupOut): void {
 
 const showStrategyForm = ref(false)
 const editingStrategyId = ref('')
+const editingStrategyGroup = ref<{ group_id: string; name: string } | null>(null)
 
 function openGroupStrategyEdit(g: GroupOut): void {
   if (!g.strategy_id) {
@@ -654,6 +655,7 @@ function openGroupStrategyEdit(g: GroupOut): void {
     return
   }
   editingStrategyId.value = g.strategy_id
+  editingStrategyGroup.value = { group_id: g.group_id, name: g.name }
   showStrategyForm.value = true
 }
 
@@ -1284,6 +1286,7 @@ async function onStrategyFormSaved(): Promise<void> {
       v-model="showStrategyForm"
       mode="edit"
       :strategy-id="editingStrategyId"
+      :trigger-group="editingStrategyGroup"
       @saved="onStrategyFormSaved"
     />
   </div>

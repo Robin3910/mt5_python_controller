@@ -6,8 +6,8 @@ import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
 import FormLabel from '@/components/FormLabel.vue'
-import TagSelect from '@/components/TagSelect.vue'
-import type { TagOption } from '@/components/tagOption'
+import StrategySignalFields from '@/components/StrategySignalFields.vue'
+import { signalSymbolMatches } from '@/components/strategySignal'
 import { useAuthStore } from '@/stores/auth'
 import { useHubStore } from '@/stores/hub'
 import type {
@@ -31,31 +31,7 @@ const DISPATCH_MODE_LABEL: Record<GroupDispatchMode, string> = {
   poll: '轮询轮转（单节点领取）',
 }
 
-const ACTION_TAGS: TagOption<ManualSignalAction>[] = [
-  { value: 'BUY', label: 'BUY', hint: '策略托管开多', tone: 'buy' },
-  { value: 'SELL', label: 'SELL', hint: '策略托管开空', tone: 'sell' },
-  { value: 'CLOSE', label: 'CLOSE', hint: '终止任务并平仓', tone: 'close' },
-]
-
 const TRIGGER_HELP = {
-  symbol:
-    '信号品种。分组链路按「绑定策略的品种」匹配：只有已启用、且绑定了同品种启用策略的分组才会收到本信号。' +
-    '不同券商的后缀差异（XAUUSD / XAUUSDm / XAUUSD.pro）会自动归一化后匹配。',
-  action:
-    'BUY / SELL 触发策略托管开仓：命中分组的有效节点会收到首单参数与策略规则快照，之后由节点自主按规则加仓。' +
-    'CLOSE 是终止指令，平掉命中分组内进行中任务对应魔术号的持仓并结束节点侧监控。',
-  volume:
-    '首单手数。分组链路直接采用此手数（仅受单笔上限保护），不走节点的按币种手数策略。',
-  stop_loss:
-    '首单止损价（绝对价格），留空表示不设。\n' +
-    '策略模版2（以损定量趋势单）必填：它的手数就是由风险金额与止损距离反推的，缺止损会被拒收。',
-  take_profit: '首单止盈价（绝对价格），留空表示不设。',
-  entry_price:
-    '限价开仓的挂单价（对应 Webhook 的 limit_price 字段），留空表示不设。\n' +
-    '只有配成「限价」开仓的策略模版2 会用它：底仓与分散仓全部挂在这个价。\n' +
-    '这类策略缺了入场价会被拒收；配成「市价」的策略与其它模版忽略该字段。\n' +
-    '入场价必须落在止损价的盈利侧（多单高于止损、空单低于止损），否则挂单一成交就已越过止损。',
-  comment: '订单备注，会写入 MT5 订单的 comment 字段，便于对账。',
   template_ids:
     '策略模版定向（信号的 template_ids 字段）：勾选后，只有绑定了这些模版的分组才会收到本信号，' +
     '在品种匹配之上再加一层筛选。一个都不勾表示不限制模版。',
@@ -85,17 +61,6 @@ const triggerForm = reactive({
 })
 
 const isCloseAction = computed(() => triggerForm.action === 'CLOSE')
-
-function normalizeSymbolKey(symbol: string): string {
-  return (symbol || '').toUpperCase().replace(/[^A-Z0-9]/g, '')
-}
-
-function symbolMatch(strategySymbol: string, signalSymbol: string): boolean {
-  const a = normalizeSymbolKey(strategySymbol)
-  const b = normalizeSymbolKey(signalSymbol)
-  if (!a || !b) return false
-  return a.startsWith(b) || b.startsWith(a)
-}
 
 function strategyOf(g: GroupOut): StrategyOut | undefined {
   return g.strategy_id ? hub.strategies.find((s) => s.strategy_id === g.strategy_id) : undefined
@@ -143,7 +108,7 @@ const candidateGroups = computed<GroupOut[]>(() => {
   return triggerGroups.value.filter((g) => {
     if (!g.enabled) return false
     const sty = strategyOf(g)
-    if (!sty || !sty.enabled || !symbolMatch(sty.symbol, symbol)) return false
+    if (!sty || !sty.enabled || !signalSymbolMatches(sty.symbol, symbol)) return false
     return !templates.length || templates.includes(sty.template_id)
   })
 })
@@ -394,82 +359,13 @@ async function confirmSubmitTrigger(): Promise<void> {
           </p>
         </div>
         <div class="modal-body">
-          <div class="form-grid two">
-            <div>
-              <FormLabel field-id="trigger-symbol" text="信号品种" :help="TRIGGER_HELP.symbol" />
-              <input id="trigger-symbol" v-model="triggerForm.symbol" placeholder="例如：XAUUSD" />
-              <div v-if="triggerSymbolOptions.length" class="symbol-picks">
-                <span class="muted">已配置：</span>
-                <button
-                  v-for="s in triggerSymbolOptions"
-                  :key="s"
-                  type="button"
-                  class="btn-sm btn-ghost"
-                  @click="triggerForm.symbol = s"
-                >
-                  {{ s }}
-                </button>
-              </div>
-            </div>
-            <div>
-              <FormLabel text="信号方向" :help="TRIGGER_HELP.action" />
-              <TagSelect v-model="triggerForm.action" :options="ACTION_TAGS" aria-label="信号方向" />
-            </div>
+          <StrategySignalFields
+            v-model="triggerForm"
+            id-prefix="trigger"
+            :symbol-options="triggerSymbolOptions"
+          />
 
-            <div v-if="!isCloseAction" class="trigger-param-grid">
-              <div>
-                <FormLabel field-id="trigger-volume" text="首单手数" :help="TRIGGER_HELP.volume" />
-                <input
-                  id="trigger-volume"
-                  v-model.number="triggerForm.volume"
-                  type="number"
-                  min="0.01"
-                  step="0.01"
-                />
-              </div>
-              <div>
-                <FormLabel field-id="trigger-comment" text="订单备注" :help="TRIGGER_HELP.comment" />
-                <input id="trigger-comment" v-model="triggerForm.comment" placeholder="选填" />
-              </div>
-              <div>
-                <FormLabel field-id="trigger-sl" text="止损价" :help="TRIGGER_HELP.stop_loss" />
-                <input
-                  id="trigger-sl"
-                  v-model.number="triggerForm.stop_loss"
-                  type="number"
-                  step="0.01"
-                  placeholder="留空表示不设"
-                />
-              </div>
-              <div>
-                <FormLabel field-id="trigger-tp" text="止盈价" :help="TRIGGER_HELP.take_profit" />
-                <input
-                  id="trigger-tp"
-                  v-model.number="triggerForm.take_profit"
-                  type="number"
-                  step="0.01"
-                  placeholder="留空表示不设"
-                />
-              </div>
-              <div>
-                <FormLabel
-                  field-id="trigger-entry"
-                  text="入场价（限价开仓）"
-                  :help="TRIGGER_HELP.entry_price"
-                />
-                <input
-                  id="trigger-entry"
-                  v-model.number="triggerForm.entry_price"
-                  type="number"
-                  step="any"
-                  placeholder="留空表示不设"
-                />
-              </div>
-            </div>
-            <p v-else class="span-full trigger-warning">
-              CLOSE 会平掉命中分组内进行中任务对应魔术号的持仓并结束节点侧策略监控，不影响按币种分发链路的持仓。
-            </p>
-
+          <div class="form-grid" style="margin-top: 14px">
             <div v-if="triggerTemplateOptions.length" class="span-full">
               <FormLabel text="策略模版定向" :help="TRIGGER_HELP.template_ids" />
               <div class="template-picks">
@@ -628,15 +524,6 @@ async function confirmSubmitTrigger(): Promise<void> {
   font-size: 12px;
 }
 
-.symbol-picks {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 8px;
-  font-size: 12px;
-}
-
 .template-picks {
   display: flex;
   align-items: center;
@@ -663,17 +550,6 @@ async function confirmSubmitTrigger(): Promise<void> {
 
 .group-pick-off {
   opacity: 0.45;
-}
-
-.trigger-warning {
-  margin: 0;
-  padding: 10px 12px;
-  border: 1px solid rgba(245, 158, 11, 0.25);
-  border-radius: 8px;
-  background: rgba(245, 158, 11, 0.08);
-  color: #fbbf24;
-  font-size: 12px;
-  line-height: 1.6;
 }
 
 .trigger-confirm-mask {
@@ -748,18 +624,6 @@ async function confirmSubmitTrigger(): Promise<void> {
   overflow: auto;
 }
 
-.trigger-param-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 14px;
-  grid-column: 1 / -1;
-  min-width: 0;
-}
-
-.trigger-param-grid > div {
-  min-width: 0;
-}
-
 @media (max-width: 768px) {
   .group-trigger-modal {
     width: 100%;
@@ -769,9 +633,6 @@ async function confirmSubmitTrigger(): Promise<void> {
   }
   .member-row {
     flex-wrap: wrap;
-  }
-  .trigger-param-grid {
-    gap: 10px;
   }
 }
 </style>
