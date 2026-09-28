@@ -4,6 +4,8 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
+import TagSelect from '@/components/TagSelect.vue'
+import type { TagOption } from '@/components/tagOption'
 import { useHubStore } from '@/stores/hub'
 import type {
   GroupOut,
@@ -36,6 +38,11 @@ const focusSignalId = computed(() => {
 const signals = ref<GroupSignalTaskRecord[]>([])
 const page = ref(1)
 const pageSize = ref(20)
+const PAGE_SIZE_TAGS: TagOption<number>[] = [
+  { value: 10, label: '10 条/页' },
+  { value: 20, label: '20 条/页' },
+  { value: 50, label: '50 条/页' },
+]
 const total = ref(0)
 const loading = ref(false)
 const expanded = ref<Record<string, boolean>>({})
@@ -1016,11 +1023,7 @@ onUnmounted(stopAutoRefresh)
           共 {{ total }} 条 · 第 {{ page }} / {{ totalPages }} 页
         </span>
         <div class="row pagination-actions">
-          <select v-model.number="pageSize" class="pagination-size" @change="onPageSizeChange">
-            <option :value="10">10 条/页</option>
-            <option :value="20">20 条/页</option>
-            <option :value="50">50 条/页</option>
-          </select>
+          <TagSelect v-model="pageSize" :options="PAGE_SIZE_TAGS" aria-label="每页条数" @change="onPageSizeChange" />
           <button class="btn-sm btn-ghost" :disabled="loading || page <= 1" @click="goPage(page - 1)">
             上一页
           </button>

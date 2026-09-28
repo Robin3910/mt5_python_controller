@@ -21,6 +21,8 @@ import {
 } from '@/utils/filterRules'
 import { confirmAction } from '@/utils/confirm'
 import { useHubStore } from '@/stores/hub'
+import TagSelect from '@/components/TagSelect.vue'
+import type { TagOption } from '@/components/tagOption'
 
 const props = withDefaults(defineProps<{ mode?: 'global' | 'node' }>(), { mode: 'global' })
 
@@ -32,6 +34,28 @@ const model = defineModel<FilterRulesConfig | NodeDispatchFiltersConfig>({ requi
 const hub = useHubStore()
 
 const isGlobal = computed(() => props.mode === 'global')
+
+const DISPATCH_MODE_TAGS: TagOption<'sync' | 'poll'>[] = [
+  { value: 'sync', label: '全员同步' },
+  { value: 'poll', label: '轮询轮转（单节点领取）' },
+]
+const POSITION_SCOPE_TAGS: TagOption<'symbol' | 'account'>[] = [
+  { value: 'symbol', label: '按品种（同品种无持仓才开）' },
+  { value: 'account', label: '按账户（账户无任何持仓才开）' },
+]
+const DEFAULT_ACTION_TAGS: TagOption<'block' | 'pass'>[] = [
+  { value: 'block', label: '拦截 (block)' },
+  { value: 'pass', label: '放行 (pass)' },
+]
+const LOT_ENABLED_TAGS: TagOption<boolean>[] = [
+  { value: false, label: '关闭', tone: 'off' },
+  { value: true, label: '启用', tone: 'on' },
+]
+const LOT_MODE_TAGS: TagOption<'global' | 'fixed' | 'signal'>[] = [
+  { value: 'global', label: '跟随中控台' },
+  { value: 'fixed', label: '固定手数' },
+  { value: 'signal', label: '跟随信号' },
+]
 const addingSymbol = ref(false)
 const newSymbol = ref('')
 const filterKeyword = ref('')
@@ -355,43 +379,39 @@ defineExpose({ loadExample })
         <div class="form-grid two" style="margin-top: 12px">
           <div>
             <label>分发模式</label>
-            <select
-              :value="rule.dispatch_mode"
-              @change="updateRule(symbol, { dispatch_mode: ($event.target as HTMLSelectElement).value as 'sync' | 'poll' })"
-            >
-              <option value="sync">全员同步</option>
-              <option value="poll">轮询轮转（单节点领取）</option>
-            </select>
+            <TagSelect
+              :model-value="rule.dispatch_mode"
+              :options="DISPATCH_MODE_TAGS"
+              aria-label="分发模式"
+              @change="updateRule(symbol, { dispatch_mode: $event })"
+            />
           </div>
           <div>
             <label>持仓判定范围</label>
-            <select
-              :value="rule.position_scope"
-              @change="updateRule(symbol, { position_scope: ($event.target as HTMLSelectElement).value as 'symbol' | 'account' })"
-            >
-              <option value="symbol">按品种（同品种无持仓才开）</option>
-              <option value="account">按账户（账户无任何持仓才开）</option>
-            </select>
+            <TagSelect
+              :model-value="rule.position_scope"
+              :options="POSITION_SCOPE_TAGS"
+              aria-label="持仓判定范围"
+              @change="updateRule(symbol, { position_scope: $event })"
+            />
           </div>
           <div>
             <label>默认动作（价格不在任何区间内）</label>
-            <select
-              :value="rule.default_action"
-              @change="updateRule(symbol, { default_action: ($event.target as HTMLSelectElement).value as 'block' | 'pass' })"
-            >
-              <option value="block">拦截 (block)</option>
-              <option value="pass">放行 (pass)</option>
-            </select>
+            <TagSelect
+              :model-value="rule.default_action"
+              :options="DEFAULT_ACTION_TAGS"
+              aria-label="默认动作"
+              @change="updateRule(symbol, { default_action: $event })"
+            />
           </div>
           <div>
             <label>启用全局手数</label>
-            <select
-              :value="rule.lot_enabled ? 'true' : 'false'"
-              @change="setLotEnabled(symbol, ($event.target as HTMLSelectElement).value === 'true')"
-            >
-              <option value="false">关闭</option>
-              <option value="true">启用</option>
-            </select>
+            <TagSelect
+              :model-value="rule.lot_enabled"
+              :options="LOT_ENABLED_TAGS"
+              aria-label="启用全局手数"
+              @change="setLotEnabled(symbol, $event)"
+            />
           </div>
           <div>
             <label>全局手数</label>
@@ -551,14 +571,12 @@ defineExpose({ loadExample })
         <div class="form-grid three" style="margin-top: 12px">
           <div>
             <label>手数策略</label>
-            <select
-              :value="rule.lot_mode"
-              @change="setLotMode(symbol, ($event.target as HTMLSelectElement).value as 'global' | 'fixed' | 'signal')"
-            >
-              <option value="global">跟随中控台</option>
-              <option value="fixed">固定手数</option>
-              <option value="signal">跟随信号</option>
-            </select>
+            <TagSelect
+              :model-value="rule.lot_mode"
+              :options="LOT_MODE_TAGS"
+              aria-label="手数策略"
+              @change="setLotMode(symbol, $event)"
+            />
           </div>
           <div>
             <label>固定手数</label>

@@ -1,6 +1,8 @@
 <script setup lang="ts">
 // 事件页：Webhook 信号原始参数 + 各节点后续处理情况
 import { computed, onMounted, ref, watch } from 'vue'
+import TagSelect from '@/components/TagSelect.vue'
+import type { TagOption } from '@/components/tagOption'
 import { useHubStore } from '@/stores/hub'
 import type { SignalEventRecord } from '@/api/types'
 
@@ -9,6 +11,11 @@ const hub = useHubStore()
 const items = ref<SignalEventRecord[]>([])
 const page = ref(1)
 const pageSize = ref(20)
+const PAGE_SIZE_TAGS: TagOption<number>[] = [
+  { value: 10, label: '10' },
+  { value: 20, label: '20' },
+  { value: 50, label: '50' },
+]
 const total = ref(0)
 const loading = ref(false)
 const expanded = ref<Record<string, boolean>>({})
@@ -147,14 +154,10 @@ watch(
     <div class="row between" style="margin-bottom: 12px">
       <span class="muted" style="font-size: 12px">共 {{ total }} 条 · 点击行展开详情</span>
       <div class="row" style="gap: 8px">
-        <label class="row muted" style="font-size: 12px; gap: 6px">
-          每页
-          <select v-model.number="pageSize" class="input-sm" @change="onPageSizeChange">
-            <option :value="10">10</option>
-            <option :value="20">20</option>
-            <option :value="50">50</option>
-          </select>
-        </label>
+        <div class="row muted" style="font-size: 12px; gap: 6px; align-items: center">
+          <span>每页</span>
+          <TagSelect v-model="pageSize" :options="PAGE_SIZE_TAGS" aria-label="每页条数" @change="onPageSizeChange" />
+        </div>
         <button class="btn-sm btn-ghost" :disabled="loading" @click="loadEvents">
           {{ loading ? '刷新中…' : '刷新' }}
         </button>

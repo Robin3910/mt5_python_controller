@@ -3,6 +3,8 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import HubTrendEmbed from '@/components/HubTrendEmbed.vue'
+import TagSelect from '@/components/TagSelect.vue'
+import type { TagOption } from '@/components/tagOption'
 import ManualStrategyTrigger from '@/components/ManualStrategyTrigger.vue'
 import { useHubStore } from '@/stores/hub'
 import type { AccountSnapshot, HubEvent, NodeOut, Position } from '@/api/types'
@@ -17,6 +19,11 @@ onMounted(async () => {
 
 type StatusFilter = 'all' | 'online' | 'offline'
 type SortBy = 'equity_desc' | 'equity_asc' | 'name'
+const SORT_TAGS: TagOption<SortBy>[] = [
+  { value: 'equity_desc', label: '按净值降序' },
+  { value: 'equity_asc', label: '按净值升序' },
+  { value: 'name', label: '按名称' },
+]
 type ViewMode = 'grid' | 'list'
 type EventTab = 'all' | 'risk' | 'trade'
 
@@ -200,11 +207,7 @@ async function closeTicket(n: NodeOut, ticket: number): Promise<void> {
             <button type="button" class="dash-chip offline" :class="{ active: statusFilter === 'offline' }" @click="statusFilter = 'offline'">离线 {{ statusCounts.offline }}</button>
           </div>
           <div class="dash-toolbar-right">
-            <select v-model="sortBy" class="dash-select" aria-label="排序">
-              <option value="equity_desc">按净值降序</option>
-              <option value="equity_asc">按净值升序</option>
-              <option value="name">按名称</option>
-            </select>
+            <TagSelect v-model="sortBy" :options="SORT_TAGS" aria-label="排序" />
             <div class="dash-view-toggle" role="group" aria-label="视图切换">
               <button type="button" class="dash-view-btn" :class="{ active: viewMode === 'grid' }" title="网格" @click="viewMode = 'grid'">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>

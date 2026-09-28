@@ -5,6 +5,8 @@
 // 账户级风控：保存后 PATCH 并经 WS 下发节点，节点本地监控后回报 risk_event。
 import { computed, defineAsyncComponent, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import TagSelect from '@/components/TagSelect.vue'
+import type { TagOption } from '@/components/tagOption'
 import { useHubStore } from '@/stores/hub'
 import type {
   AccountSnapshot,
@@ -22,6 +24,35 @@ import type {
 } from '@/api/types'
 import { parseNodeDispatchFilters } from '@/utils/filterRules'
 import { confirmAction } from '@/utils/confirm'
+
+const MONITOR_MODE_TAGS: TagOption<RiskMonitorMode>[] = [
+  { value: 'loop', label: '循环' },
+  { value: 'times', label: '指定次数' },
+]
+const ORDER_OP_TAGS: TagOption<RiskOrderOp>[] = [
+  { value: 'any', label: '订单不限' },
+  { value: 'gt', label: '订单 >' },
+  { value: 'gte', label: '订单 >=' },
+  { value: 'eq', label: '订单 =' },
+  { value: 'lte', label: '订单 <=' },
+  { value: 'lt', label: '订单 <' },
+]
+const CLOSE_ACTION_TAGS: TagOption<RiskCloseAction>[] = [
+  { value: 'all', label: '全部平仓' },
+  { value: 'buy', label: '多单平仓' },
+  { value: 'sell', label: '空单平仓' },
+  { value: 'hedge', label: '锁单平仓' },
+]
+const SIDE_ACTION_TAGS: TagOption<RiskSideAction>[] = [
+  { value: 'all', label: '全部' },
+  { value: 'buy', label: '多单' },
+  { value: 'sell', label: '空单' },
+]
+const PAGE_SIZE_TAGS: TagOption<number>[] = [
+  { value: 10, label: '10 条/页' },
+  { value: 20, label: '20 条/页' },
+  { value: 50, label: '50 条/页' },
+]
 // 趋势面板带 echarts，异步加载让图表库不进节点详情页首屏 chunk（只在打开该 tab 时拉取）
 const TrendPanel = defineAsyncComponent(() => import('@/components/TrendPanel.vue'))
 
@@ -693,10 +724,7 @@ async function closeTicket(ticket: number): Promise<void> {
               </label>
               <input v-model.number="riskForm.float_pl_ratio.ratio" type="number" step="0.1" class="risk-ratio-input" />
               <span class="muted" style="font-size: 13px">% ，清仓全部</span>
-              <select v-model="riskForm.float_pl_ratio.monitor_mode" class="risk-mode-select">
-                <option value="loop">循环</option>
-                <option value="times">指定次数</option>
-              </select>
+              <TagSelect v-model="riskForm.float_pl_ratio.monitor_mode" :options="MONITOR_MODE_TAGS" aria-label="监控方式" />
               <template v-if="riskForm.float_pl_ratio.monitor_mode === 'times'">
                 <input v-model.number="riskForm.float_pl_ratio.max_times" type="number" min="1" class="risk-times-input" />
                 <span class="muted" style="font-size: 12px">次</span>
@@ -712,10 +740,7 @@ async function closeTicket(ticket: number): Promise<void> {
               <span class="muted" style="font-size: 13px">小于</span>
               <input v-model.number="riskForm.equity_min.amount" type="number" min="0.01" step="1" class="risk-ratio-input" />
               <span class="muted" style="font-size: 13px">USD ，清仓全部</span>
-              <select v-model="riskForm.equity_min.monitor_mode" class="risk-mode-select">
-                <option value="loop">循环</option>
-                <option value="times">指定次数</option>
-              </select>
+              <TagSelect v-model="riskForm.equity_min.monitor_mode" :options="MONITOR_MODE_TAGS" aria-label="监控方式" />
               <template v-if="riskForm.equity_min.monitor_mode === 'times'">
                 <input v-model.number="riskForm.equity_min.max_times" type="number" min="1" class="risk-times-input" />
                 <span class="muted" style="font-size: 12px">次</span>
@@ -743,14 +768,7 @@ async function closeTicket(ticket: number): Promise<void> {
                 <input v-model="it.symbol" type="text" placeholder="品种" class="risk-symbol-input" />
                 <span class="muted" style="font-size: 12px">盈亏</span>
                 <input v-model.number="it.pl_amount" type="number" step="1" class="risk-ratio-input" />
-                <select v-model="it.order_op" class="risk-mode-select">
-                  <option value="any">订单不限</option>
-                  <option value="gt">订单 &gt;</option>
-                  <option value="gte">订单 &gt;=</option>
-                  <option value="eq">订单 =</option>
-                  <option value="lte">订单 &lt;=</option>
-                  <option value="lt">订单 &lt;</option>
-                </select>
+                <TagSelect v-model="it.order_op" :options="ORDER_OP_TAGS" aria-label="订单条件" />
                 <input
                   v-model.number="it.order_count"
                   type="number"
@@ -758,16 +776,8 @@ async function closeTicket(ticket: number): Promise<void> {
                   class="risk-times-input"
                   :disabled="it.order_op === 'any'"
                 />
-                <select v-model="it.close_action" class="risk-mode-select">
-                  <option value="all">全部平仓</option>
-                  <option value="buy">多单平仓</option>
-                  <option value="sell">空单平仓</option>
-                  <option value="hedge">锁单平仓</option>
-                </select>
-                <select v-model="it.monitor_mode" class="risk-mode-select">
-                  <option value="loop">循环</option>
-                  <option value="times">指定次数</option>
-                </select>
+                <TagSelect v-model="it.close_action" :options="CLOSE_ACTION_TAGS" aria-label="平仓动作" />
+                <TagSelect v-model="it.monitor_mode" :options="MONITOR_MODE_TAGS" aria-label="监控方式" />
                 <template v-if="it.monitor_mode === 'times'">
                   <input v-model.number="it.max_times" type="number" min="1" class="risk-times-input" />
                   <span class="muted" style="font-size: 12px">次</span>
@@ -799,10 +809,7 @@ async function closeTicket(ticket: number): Promise<void> {
                 <input v-model.number="it.trigger_amount" type="number" step="1" class="risk-ratio-input" />
                 <span class="muted" style="font-size: 12px">收窄</span>
                 <input v-model.number="it.narrow_amount" type="number" step="1" class="risk-ratio-input" />
-                <select v-model="it.monitor_mode" class="risk-mode-select">
-                  <option value="loop">循环</option>
-                  <option value="times">指定次数</option>
-                </select>
+                <TagSelect v-model="it.monitor_mode" :options="MONITOR_MODE_TAGS" aria-label="监控方式" />
                 <template v-if="it.monitor_mode === 'times'">
                   <input v-model.number="it.max_times" type="number" min="1" class="risk-times-input" />
                   <span class="muted" style="font-size: 12px">次</span>
@@ -826,11 +833,7 @@ async function closeTicket(ticket: number): Promise<void> {
                   max="10"
                   class="risk-times-input"
                 />
-                <select v-model="riskForm.lot_pl_tiers.close_action" class="risk-mode-select">
-                  <option value="all">全部</option>
-                  <option value="buy">多单</option>
-                  <option value="sell">空单</option>
-                </select>
+                <TagSelect v-model="riskForm.lot_pl_tiers.close_action" :options="SIDE_ACTION_TAGS" aria-label="平仓方向" />
               </div>
               <div
                 v-for="(tier, idx) in riskForm.lot_pl_tiers.tiers"
@@ -1125,11 +1128,7 @@ async function closeTicket(ticket: number): Promise<void> {
             共 {{ historyTotal }} 条 · 第 {{ historyPage }} / {{ historyTotalPages }} 页
           </span>
           <div class="row pagination-actions">
-            <select v-model.number="historyPageSize" class="pagination-size" @change="onHistoryPageSizeChange">
-              <option :value="10">10 条/页</option>
-              <option :value="20">20 条/页</option>
-              <option :value="50">50 条/页</option>
-            </select>
+            <TagSelect v-model="historyPageSize" :options="PAGE_SIZE_TAGS" aria-label="每页条数" @change="onHistoryPageSizeChange" />
             <button class="btn-sm btn-ghost" :disabled="loadingHistory || historyPage <= 1" @click="goHistoryPage(historyPage - 1)">
               上一页
             </button>
@@ -1244,11 +1243,7 @@ async function closeTicket(ticket: number): Promise<void> {
             <span v-if="historyPage === 1"> · 含实时回报</span>
           </span>
           <div class="row pagination-actions">
-            <select v-model.number="historyPageSize" class="pagination-size" @change="onHistoryPageSizeChange">
-              <option :value="10">10 条/页</option>
-              <option :value="20">20 条/页</option>
-              <option :value="50">50 条/页</option>
-            </select>
+            <TagSelect v-model="historyPageSize" :options="PAGE_SIZE_TAGS" aria-label="每页条数" @change="onHistoryPageSizeChange" />
             <button class="btn-sm btn-ghost" :disabled="loadingHistory || historyPage <= 1" @click="goHistoryPage(historyPage - 1)">
               上一页
             </button>
@@ -1302,11 +1297,6 @@ async function closeTicket(ticket: number): Promise<void> {
 .risk-symbol-input {
   width: 96px;
   text-transform: uppercase;
-}
-
-.risk-mode-select {
-  width: auto;
-  min-width: 110px;
 }
 
 .risk-block {

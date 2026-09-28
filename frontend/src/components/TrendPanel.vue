@@ -15,6 +15,7 @@ import {
   TooltipComponent,
 } from 'echarts/components'
 import { CanvasRenderer } from 'echarts/renderers'
+import TagSelect from '@/components/TagSelect.vue'
 import { useAuthStore } from '@/stores/auth'
 import { useHubStore } from '@/stores/hub'
 import type { TrendConfig, TrendPanelData } from '@/api/types'
@@ -458,11 +459,7 @@ onBeforeUnmount(() => {
       <div v-if="compact" class="trend-compact-tools">
         <label class="trend-field">
           <span class="trend-field-k">周期</span>
-          <select v-model="form.timeframe" class="trend-select">
-            <option v-for="t in TREND_TIMEFRAMES" :key="t.value" :value="t.value">
-              {{ t.label }}
-            </option>
-          </select>
+          <TagSelect v-model="form.timeframe" :options="TREND_TIMEFRAMES" aria-label="周期" />
         </label>
         <button class="btn-sm btn-ghost" :disabled="loading || !symbol" @click="load">
           {{ loading ? '读取中…' : '刷新' }}
@@ -555,19 +552,11 @@ onBeforeUnmount(() => {
           </label>
           <label class="trend-field">
             <span class="trend-field-k">周期</span>
-            <select v-model="form.timeframe" class="trend-select">
-              <option v-for="t in TREND_TIMEFRAMES" :key="t.value" :value="t.value">
-                {{ t.label }}
-              </option>
-            </select>
+            <TagSelect v-model="form.timeframe" :options="TREND_TIMEFRAMES" aria-label="周期" />
           </label>
           <label class="trend-field">
             <span class="trend-field-k">自动刷新</span>
-            <select v-model.number="refreshMs" class="trend-select">
-              <option v-for="r in TREND_REFRESH_OPTIONS" :key="r.value" :value="r.value">
-                {{ r.label }}
-              </option>
-            </select>
+            <TagSelect v-model="refreshMs" :options="TREND_REFRESH_OPTIONS" aria-label="自动刷新" />
           </label>
         </div>
         <button class="btn-sm btn-ghost" :disabled="loading || !symbol" @click="load">
@@ -670,8 +659,7 @@ onBeforeUnmount(() => {
 .trend-field { display: flex; flex-direction: column; gap: 4px; }
 .trend-field-k { color: var(--muted); font-size: 12px; }
 
-.trend-input,
-.trend-select {
+.trend-input {
   background: rgba(12, 18, 32, 0.6);
   border: 1px solid var(--el-border-color);
   border-radius: 8px;
@@ -681,8 +669,7 @@ onBeforeUnmount(() => {
   padding: 7px 10px;
   min-width: 116px;
 }
-.trend-input:focus,
-.trend-select:focus { border-color: var(--primary); outline: none; }
+.trend-input:focus { border-color: var(--primary); outline: none; }
 .trend-input:disabled { color: var(--muted); }
 
 .trend-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }

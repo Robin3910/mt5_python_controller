@@ -2,6 +2,8 @@
 // 操作审计页：中控台 / 节点 / 账号权限 / 系统操作记录，可展开查看操作前后数据。
 // 普通用户只看到本人的操作（后端按操作人过滤）
 import { computed, onMounted, ref } from 'vue'
+import TagSelect from '@/components/TagSelect.vue'
+import type { TagOption } from '@/components/tagOption'
 import { useAuthStore } from '@/stores/auth'
 import { useHubStore } from '@/stores/hub'
 import type { AuditRecord } from '@/api/types'
@@ -14,7 +16,20 @@ const page = ref(1)
 const pageSize = ref(20)
 const total = ref(0)
 const loading = ref(false)
-const category = ref<'all' | 'console' | 'node' | 'auth' | 'system'>('all')
+type AuditCategory = 'all' | 'console' | 'node' | 'auth' | 'system'
+const category = ref<AuditCategory>('all')
+const CATEGORY_TAGS: TagOption<AuditCategory>[] = [
+  { value: 'all', label: '全部' },
+  { value: 'console', label: '中控台' },
+  { value: 'node', label: '节点' },
+  { value: 'auth', label: '账号权限' },
+  { value: 'system', label: '系统' },
+]
+const PAGE_SIZE_TAGS: TagOption<number>[] = [
+  { value: 10, label: '10' },
+  { value: 20, label: '20' },
+  { value: 50, label: '50' },
+]
 const expanded = ref<Record<number, boolean>>({})
 
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)))
@@ -137,24 +152,14 @@ onMounted(loadAudits)
       <div class="row between" style="margin-bottom: 12px; flex-wrap: wrap; gap: 8px">
         <span class="muted" style="font-size: 12px">共 {{ total }} 条 · 点击行展开详情</span>
         <div class="row" style="gap: 8px; flex-wrap: wrap">
-          <label class="row muted" style="font-size: 12px; gap: 6px">
-            分类
-            <select v-model="category" class="input-sm" @change="onCategoryChange">
-              <option value="all">全部</option>
-              <option value="console">中控台</option>
-              <option value="node">节点</option>
-              <option value="auth">账号权限</option>
-              <option value="system">系统</option>
-            </select>
-          </label>
-          <label class="row muted" style="font-size: 12px; gap: 6px">
-            每页
-            <select v-model.number="pageSize" class="input-sm" @change="onPageSizeChange">
-              <option :value="10">10</option>
-              <option :value="20">20</option>
-              <option :value="50">50</option>
-            </select>
-          </label>
+          <div class="row muted" style="font-size: 12px; gap: 6px; align-items: center">
+            <span>分类</span>
+            <TagSelect v-model="category" :options="CATEGORY_TAGS" aria-label="分类" @change="onCategoryChange" />
+          </div>
+          <div class="row muted" style="font-size: 12px; gap: 6px; align-items: center">
+            <span>每页</span>
+            <TagSelect v-model="pageSize" :options="PAGE_SIZE_TAGS" aria-label="每页条数" @change="onPageSizeChange" />
+          </div>
           <button class="btn-sm btn-ghost" :disabled="loading" @click="loadAudits">
             {{ loading ? '刷新中…' : '刷新' }}
           </button>

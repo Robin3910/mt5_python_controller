@@ -4,6 +4,8 @@ import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
 import FormLabel from '@/components/FormLabel.vue'
+import TagSelect from '@/components/TagSelect.vue'
+import type { TagOption } from '@/components/tagOption'
 import { useHubStore } from '@/stores/hub'
 import type {
   BatchCalcType,
@@ -75,6 +77,29 @@ const formTemplateLabel = computed(() => {
   if (selectedTemplate.value) return selectedTemplate.value.name
   return editingTemplateName.value || form.template_id || '—'
 })
+
+const templateTagOptions = computed(() => {
+  const opts = templates.value.map((t) => ({ value: t.template_id, label: t.name }))
+  if (isEditMode.value && form.template_id && !selectedTemplate.value) {
+    opts.push({ value: form.template_id, label: formTemplateLabel.value })
+  }
+  return opts
+})
+
+const MONITOR_MODE_TAGS: TagOption<RiskMonitorMode>[] = [
+  { value: 'loop', label: '循环' },
+  { value: 'times', label: '指定次数' },
+]
+const SIDE_TAGS: TagOption<string>[] = [
+  { value: 'all', label: '全部' },
+  { value: 'buy', label: '多单' },
+  { value: 'sell', label: '空单' },
+]
+const SIDE_ACTION_TAGS: TagOption<RiskSideAction>[] = [
+  { value: 'all', label: '全部' },
+  { value: 'buy', label: '多单' },
+  { value: 'sell', label: '空单' },
+]
 
 const RULE_TYPE_LABEL: Record<number, string> = {
   [RULE_TYPE_COUNTER]: '逆势加仓',
@@ -548,6 +573,10 @@ const CALC_TYPE_OPTIONS: Array<{ value: BatchCalcType; label: string }> = [
 const TIMEFRAME_OPTIONS: BatchTimeframe[] = [
   'M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1', 'MN',
 ]
+const TIMEFRAME_TAGS: TagOption<BatchTimeframe>[] = TIMEFRAME_OPTIONS.map((tf) => ({
+  value: tf,
+  label: tf,
+}))
 
 /** 需要读 K 线才能算出间距的方式 */
 const BAR_CALC_TYPES: BatchCalcType[] = ['atr', 'range']
@@ -1035,6 +1064,11 @@ function nodeLabel(n: NodeOut): string {
   return n.mt5_login ? `${name} · ${n.mt5_login}` : name
 }
 
+const assistNodeTagOptions = computed(() => [
+  { value: '', label: '请选择在线节点' },
+  ...onlineNodes.value.map((n) => ({ value: n.node_id, label: nodeLabel(n) })),
+])
+
 /** 试算所需的前置条件；返回原因表示还不能试算 */
 function sizingBlocker(r: EditableRule): string {
   if (!(r.price_lower > 0) || !(r.price_upper > r.price_lower)) return '请先填写合法的价格区间'
@@ -1360,22 +1394,13 @@ function resetRuleToTemplate(idx: number): void {
         <div class="form-grid">
           <div class="field">
             <FormLabel field-id="strategy-template" text="策略模版" :help="FIELD_HELP.template" />
-            <select
+            <TagSelect
               id="strategy-template"
               v-model="form.template_id"
+              :options="templateTagOptions"
               :disabled="isEditMode"
-            >
-              <option disabled value="">请选择模版</option>
-              <option v-for="t in templates" :key="t.template_id" :value="t.template_id">
-                {{ t.name }}
-              </option>
-              <option
-                v-if="isEditMode && form.template_id && !selectedTemplate"
-                :value="form.template_id"
-              >
-                {{ formTemplateLabel }}
-              </option>
-            </select>
+              aria-label="策略模版"
+            />
             <p v-if="selectedTemplate" class="muted" style="font-size: 12px; margin-top: 6px">
               {{ selectedTemplate.description }}
             </p>
@@ -1415,10 +1440,7 @@ function resetRuleToTemplate(idx: number): void {
               </label>
               <input v-model.number="signalPl.float_pl_ratio.ratio" type="number" step="0.1" class="signal-pl-num" />
               <span class="muted" style="font-size: 13px">% ，清仓该信号全部</span>
-              <select v-model="signalPl.float_pl_ratio.monitor_mode" class="signal-pl-select">
-                <option value="loop">循环</option>
-                <option value="times">指定次数</option>
-              </select>
+              <TagSelect v-model="signalPl.float_pl_ratio.monitor_mode" :options="MONITOR_MODE_TAGS" aria-label="监控方式" />
               <template v-if="signalPl.float_pl_ratio.monitor_mode === 'times'">
                 <input v-model.number="signalPl.float_pl_ratio.max_times" type="number" min="1" class="signal-pl-times" />
                 <span class="muted" style="font-size: 12px">次</span>
@@ -1438,11 +1460,7 @@ function resetRuleToTemplate(idx: number): void {
                   max="10"
                   class="signal-pl-times"
                 />
-                <select v-model="signalPl.lot_pl_tiers.close_action" class="signal-pl-select">
-                  <option value="all">全部</option>
-                  <option value="buy">多单</option>
-                  <option value="sell">空单</option>
-                </select>
+                <TagSelect v-model="signalPl.lot_pl_tiers.close_action" :options="SIDE_ACTION_TAGS" aria-label="平仓方向" />
               </div>
               <div
                 v-for="(tier, idx) in signalPl.lot_pl_tiers.tiers"
@@ -1512,11 +1530,7 @@ function resetRuleToTemplate(idx: number): void {
               <div class="rule-grid">
                 <div class="field">
                   <FormLabel :field-id="`rule-${idx}-action`" text="监控方向" :help="FIELD_HELP.action" />
-                  <select :id="`rule-${idx}-action`" v-model="r.action">
-                    <option value="all">全部</option>
-                    <option value="buy">多单</option>
-                    <option value="sell">空单</option>
-                  </select>
+                  <TagSelect :id="`rule-${idx}-action`" v-model="r.action" :options="SIDE_TAGS" aria-label="监控方向" />
                 </div>
                 <div class="field">
                   <FormLabel
@@ -1524,11 +1538,12 @@ function resetRuleToTemplate(idx: number): void {
                     text="开仓方式"
                     :help="FIELD_HELP.entry_mode"
                   />
-                  <select :id="`rule-${idx}-entry-mode`" v-model="r.entry_mode">
-                    <option v-for="o in ENTRY_MODE_OPTIONS" :key="o.value" :value="o.value">
-                      {{ o.label }}
-                    </option>
-                  </select>
+                  <TagSelect
+                    :id="`rule-${idx}-entry-mode`"
+                    v-model="r.entry_mode"
+                    :options="ENTRY_MODE_OPTIONS"
+                    aria-label="开仓方式"
+                  />
                 </div>
                 <div class="field">
                   <FormLabel
@@ -1665,11 +1680,12 @@ function resetRuleToTemplate(idx: number): void {
                       text="监控方式"
                       :help="FIELD_HELP.breakeven_mode"
                     />
-                    <select :id="`rule-${idx}-breakeven-mode`" v-model="r.breakeven_mode">
-                      <option v-for="o in BREAKEVEN_MODE_OPTIONS" :key="o.value" :value="o.value">
-                        {{ o.label }}
-                      </option>
-                    </select>
+                    <TagSelect
+                      :id="`rule-${idx}-breakeven-mode`"
+                      v-model="r.breakeven_mode"
+                      :options="BREAKEVEN_MODE_OPTIONS"
+                      aria-label="保本方式"
+                    />
                   </div>
                 </div>
                 <p v-if="r.breakeven_enabled" class="rule-hint">
@@ -1715,15 +1731,11 @@ function resetRuleToTemplate(idx: number): void {
                 </div>
                 <div class="field">
                   <FormLabel :field-id="`rule-${idx}-grid-mode`" text="网格模式" :help="FIELD_HELP.grid_mode" />
-                  <select :id="`rule-${idx}-grid-mode`" v-model="r.grid_mode">
-                    <option v-for="o in GRID_MODE_OPTIONS" :key="o.value" :value="o.value">{{ o.label }}</option>
-                  </select>
+                  <TagSelect :id="`rule-${idx}-grid-mode`" v-model="r.grid_mode" :options="GRID_MODE_OPTIONS" aria-label="网格模式" />
                 </div>
                 <div class="field">
                   <FormLabel :field-id="`rule-${idx}-grid-side`" text="网格方向" :help="FIELD_HELP.grid_side" />
-                  <select :id="`rule-${idx}-grid-side`" v-model="r.grid_side">
-                    <option v-for="o in GRID_SIDE_OPTIONS" :key="o.value" :value="o.value">{{ o.label }}</option>
-                  </select>
+                  <TagSelect :id="`rule-${idx}-grid-side`" v-model="r.grid_side" :options="GRID_SIDE_OPTIONS" aria-label="网格方向" />
                 </div>
               </div>
               <p class="rule-hint">{{ gridHint(r) }}</p>
@@ -1880,12 +1892,12 @@ function resetRuleToTemplate(idx: number): void {
                         text="行情源节点"
                         :help="FIELD_HELP.assist_node"
                       />
-                      <select :id="`rule-${idx}-assist-node`" v-model="sizingState(idx).nodeId">
-                        <option value="">请选择在线节点</option>
-                        <option v-for="n in onlineNodes" :key="n.node_id" :value="n.node_id">
-                          {{ nodeLabel(n) }}
-                        </option>
-                      </select>
+                      <TagSelect
+                        :id="`rule-${idx}-assist-node`"
+                        v-model="sizingState(idx).nodeId"
+                        :options="assistNodeTagOptions"
+                        aria-label="行情源节点"
+                      />
                     </div>
                     <div class="field">
                       <FormLabel
@@ -1893,9 +1905,12 @@ function resetRuleToTemplate(idx: number): void {
                         text="K线周期"
                         :help="FIELD_HELP.assist_timeframe"
                       />
-                      <select :id="`rule-${idx}-assist-tf`" v-model="r.assist_timeframe">
-                        <option v-for="tf in TIMEFRAME_OPTIONS" :key="tf" :value="tf">{{ tf }}</option>
-                      </select>
+                      <TagSelect
+                        :id="`rule-${idx}-assist-tf`"
+                        v-model="r.assist_timeframe"
+                        :options="TIMEFRAME_TAGS"
+                        aria-label="K线周期"
+                      />
                     </div>
                     <div class="field">
                       <FormLabel
@@ -2026,11 +2041,12 @@ function resetRuleToTemplate(idx: number): void {
                         text="分批方向"
                         :help="FIELD_HELP.batch_action"
                       />
-                      <select :id="`rule-${idx}-batch-action`" v-model="r.batch_action">
-                        <option value="all">全部</option>
-                        <option value="buy">多单</option>
-                        <option value="sell">空单</option>
-                      </select>
+                      <TagSelect
+                        :id="`rule-${idx}-batch-action`"
+                        v-model="r.batch_action"
+                        :options="SIDE_TAGS"
+                        aria-label="分批方向"
+                      />
                     </div>
                     <div class="field">
                       <FormLabel
@@ -2107,11 +2123,12 @@ function resetRuleToTemplate(idx: number): void {
                           text="计算方式"
                           :help="FIELD_HELP.calc_type"
                         />
-                        <select :id="`rule-${idx}-lv-${li}-calc`" v-model="lv.calc_type">
-                          <option v-for="o in CALC_TYPE_OPTIONS" :key="o.value" :value="o.value">
-                            {{ o.label }}
-                          </option>
-                        </select>
+                        <TagSelect
+                          :id="`rule-${idx}-lv-${li}-calc`"
+                          v-model="lv.calc_type"
+                          :options="CALC_TYPE_OPTIONS"
+                          aria-label="计算方式"
+                        />
                       </div>
                       <div v-if="lv.calc_type === 'price'" class="field">
                         <FormLabel
@@ -2133,11 +2150,12 @@ function resetRuleToTemplate(idx: number): void {
                           text="K 线周期"
                           :help="FIELD_HELP.batch_timeframe"
                         />
-                        <select :id="`rule-${idx}-lv-${li}-tf`" v-model="lv.timeframe">
-                          <option v-for="tf in TIMEFRAME_OPTIONS" :key="tf" :value="tf">
-                            {{ tf }}
-                          </option>
-                        </select>
+                        <TagSelect
+                          :id="`rule-${idx}-lv-${li}-tf`"
+                          v-model="lv.timeframe"
+                          :options="TIMEFRAME_TAGS"
+                          aria-label="K 线周期"
+                        />
                       </div>
                       <div v-else class="field">
                         <FormLabel
@@ -2434,11 +2452,7 @@ function resetRuleToTemplate(idx: number): void {
               <div class="rule-grid">
                 <div class="field">
                   <FormLabel :field-id="`rule-${idx}-action`" text="监控方向" :help="FIELD_HELP.action" />
-                  <select :id="`rule-${idx}-action`" v-model="r.action">
-                    <option value="all">全部</option>
-                    <option value="buy">多单</option>
-                    <option value="sell">空单</option>
-                  </select>
+                  <TagSelect :id="`rule-${idx}-action`" v-model="r.action" :options="SIDE_TAGS" aria-label="监控方向" />
                 </div>
                 <div class="field">
                   <FormLabel :field-id="`rule-${idx}-point`" text="点数" :help="FIELD_HELP.point" />
@@ -2854,11 +2868,6 @@ function resetRuleToTemplate(idx: number): void {
 .signal-pl-num,
 .signal-pl-times {
   width: 88px;
-}
-
-.signal-pl-select {
-  width: auto;
-  min-width: 110px;
 }
 
 .signal-pl-block {

@@ -11,6 +11,8 @@ import 'element-plus/es/components/table/style/css'
 import 'element-plus/es/components/loading/style/css'
 import 'element-plus/es/components/tooltip/style/css'
 import FormLabel from '@/components/FormLabel.vue'
+import TagSelect from '@/components/TagSelect.vue'
+import type { TagOption } from '@/components/tagOption'
 import LimitWatchLogCell from '@/components/LimitWatchLogCell.vue'
 import ManualStrategyTrigger from '@/components/ManualStrategyTrigger.vue'
 import { useAuthStore } from '@/stores/auth'
@@ -153,6 +155,26 @@ const formIsConcurrentStrategy = computed(
   () => formBoundStrategy.value?.template_id === 'tpl_2' || formBoundStrategy.value?.template_id === 'tpl_3',
 )
 
+const strategyTagOptions = computed(() => [
+  { value: '', label: '不绑定' },
+  ...selectableStrategies.value.map((s) => ({ value: s.strategy_id, label: strategyLabel(s) })),
+])
+
+const DISPATCH_MODE_TAGS: TagOption<GroupDispatchMode>[] = [
+  { value: 'sync', label: '全员同步' },
+  { value: 'poll', label: '轮询轮转（单节点领取）' },
+]
+
+const SWITCH_TAGS: TagOption<boolean>[] = [
+  { value: false, label: '关闭', tone: 'off' },
+  { value: true, label: '开启', tone: 'on' },
+]
+
+const ENABLED_TAGS: TagOption<boolean>[] = [
+  { value: true, label: '启用', tone: 'on' },
+  { value: false, label: '禁用', tone: 'off' },
+]
+
 watch(
   () => form.strategy_id,
   () => {
@@ -169,6 +191,12 @@ const memberNodes = computed<NodeOut[]>(() =>
 )
 const availableNodes = computed<NodeOut[]>(() =>
   hub.nodes.filter((n) => !form.node_ids.includes(n.node_id) && sameOwnerAsForm(n.owner_user_id)),
+)
+const memberTagOptions = computed(() =>
+  availableNodes.value.map((n) => ({
+    value: n.node_id,
+    label: `${n.name}（${n.mt5_login || '—'}）`,
+  })),
 )
 
 function addMember(nodeId: string): void {
@@ -1154,16 +1182,7 @@ async function onStrategyFormSaved(): Promise<void> {
             </div>
             <div>
               <FormLabel field-id="group-strategy" text="绑定策略" :help="FIELD_HELP.strategy" />
-              <select id="group-strategy" v-model="form.strategy_id">
-                <option value="">不绑定</option>
-                <option
-                  v-for="s in selectableStrategies"
-                  :key="s.strategy_id"
-                  :value="s.strategy_id"
-                >
-                  {{ strategyLabel(s) }}
-                </option>
-              </select>
+              <TagSelect id="group-strategy" v-model="form.strategy_id" :options="strategyTagOptions" aria-label="绑定策略" />
               <p v-if="!hub.strategies.length" class="muted" style="font-size: 12px; margin-top: 6px">
                 暂无策略，可先到
                 <button type="button" class="btn-sm btn-ghost" @click="router.push('/strategies')">策略管理</button>
@@ -1172,38 +1191,33 @@ async function onStrategyFormSaved(): Promise<void> {
             </div>
             <div>
               <FormLabel field-id="group-mode" text="分发模式" :help="FIELD_HELP.dispatch_mode" />
-              <select id="group-mode" v-model="form.dispatch_mode">
-                <option value="sync">全员同步</option>
-                <option value="poll">轮询轮转（单节点领取）</option>
-              </select>
+              <TagSelect id="group-mode" v-model="form.dispatch_mode" :options="DISPATCH_MODE_TAGS" aria-label="分发模式" />
             </div>
             <div v-if="form.dispatch_mode === 'sync' && formIsConcurrentStrategy">
               <FormLabel field-id="group-signal-concurrent" text="信号并发" :help="FIELD_HELP.signal_concurrent" />
-              <select id="group-signal-concurrent" v-model="form.signal_concurrent_enabled">
-                <option :value="false">关闭</option>
-                <option :value="true">开启</option>
-              </select>
+              <TagSelect
+                id="group-signal-concurrent"
+                v-model="form.signal_concurrent_enabled"
+                :options="SWITCH_TAGS"
+                aria-label="信号并发"
+              />
             </div>
             <div>
               <FormLabel field-id="group-enabled" text="启用状态" :help="FIELD_HELP.enabled" />
-              <select id="group-enabled" v-model="form.enabled">
-                <option :value="true">启用</option>
-                <option :value="false">禁用</option>
-              </select>
+              <TagSelect id="group-enabled" v-model="form.enabled" :options="ENABLED_TAGS" aria-label="启用状态" />
             </div>
             <div>
               <FormLabel field-id="group-trend-risk" text="趋势风控" :help="FIELD_HELP.trend_risk" />
-              <select id="group-trend-risk" v-model="form.trend_risk_enabled">
-                <option :value="false">关闭</option>
-                <option :value="true">开启</option>
-              </select>
+              <TagSelect id="group-trend-risk" v-model="form.trend_risk_enabled" :options="SWITCH_TAGS" aria-label="趋势风控" />
             </div>
             <div v-if="formIsTrendStrategy">
               <FormLabel field-id="group-limit-watch" text="限价监听" :help="FIELD_HELP.limit_watch" />
-              <select id="group-limit-watch" v-model="form.limit_watch_enabled">
-                <option :value="false">关闭</option>
-                <option :value="true">开启</option>
-              </select>
+              <TagSelect
+                id="group-limit-watch"
+                v-model="form.limit_watch_enabled"
+                :options="SWITCH_TAGS"
+                aria-label="限价监听"
+              />
             </div>
             <div v-if="formIsTrendStrategy">
               <FormLabel
@@ -1227,19 +1241,13 @@ async function onStrategyFormSaved(): Promise<void> {
               <FormLabel text="成员节点" :help="FIELD_HELP.nodes" />
               <div class="row" style="gap: 8px; margin-bottom: 10px">
                 <!-- 占位项不可 disabled，否则浏览器会预选第一个节点且不再触发 change -->
-                <select
-                  :key="`member-pick-${form.node_ids.join(',')}`"
-                  :value="''"
-                  :disabled="!availableNodes.length"
-                  @change="addMember(($event.target as HTMLSelectElement).value)"
-                >
-                  <option value="">
-                    {{ availableNodes.length ? '选择要加入的节点…' : '所有节点均已加入' }}
-                  </option>
-                  <option v-for="n in availableNodes" :key="n.node_id" :value="n.node_id">
-                    {{ n.name }}（{{ n.mt5_login || '—' }}）
-                  </option>
-                </select>
+                <TagSelect
+                  :model-value="''"
+                  :options="memberTagOptions"
+                  empty-text="所有节点均已加入"
+                  aria-label="选择要加入的节点"
+                  @change="addMember"
+                />
               </div>
               <div v-if="!memberNodes.length" class="muted" style="font-size: 12px">
                 尚未加入任何节点。分组无有效节点时不会处理 strategy 信号。

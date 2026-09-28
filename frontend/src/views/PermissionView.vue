@@ -5,6 +5,8 @@ import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
 import FormLabel from '@/components/FormLabel.vue'
+import TagSelect from '@/components/TagSelect.vue'
+import type { TagOption } from '@/components/tagOption'
 import { useAuthStore } from '@/stores/auth'
 import { useHubStore } from '@/stores/hub'
 import { useRbacStore } from '@/stores/rbac'
@@ -59,7 +61,22 @@ const showNodes = ref(false)
 const nodeTarget = ref<UserOut | null>(null)
 const selectedNodeIds = ref<string[]>([])
 const nodeQuery = ref('')
-const nodeFilter = ref<'all' | 'unassigned' | 'mine' | 'others'>('all')
+type NodeFilter = 'all' | 'unassigned' | 'mine' | 'others'
+const nodeFilter = ref<NodeFilter>('all')
+const NODE_FILTER_TAGS: TagOption<NodeFilter>[] = [
+  { value: 'all', label: '全部' },
+  { value: 'unassigned', label: '管理员名下' },
+  { value: 'mine', label: '已分配给该用户' },
+  { value: 'others', label: '其他用户' },
+]
+const USER_ACTIVE_TAGS: TagOption<boolean>[] = [
+  { value: true, label: '启用', tone: 'on' },
+  { value: false, label: '禁用', tone: 'off' },
+]
+const ROLE_ENABLED_TAGS: TagOption<boolean>[] = [
+  { value: true, label: '启用', tone: 'on' },
+  { value: false, label: '停用', tone: 'off' },
+]
 const nodeError = ref('')
 const nodeHint = ref('')
 const pendingMemberships = ref<NodeAssignConflict & { reason: 'confirm_required' } | null>(null)
@@ -755,10 +772,13 @@ async function removeRole(role: RoleOut): Promise<void> {
             </div>
             <div>
               <FormLabel field-id="perm-active" text="状态" help="禁用后无法登录，已登录会话立即失效。" />
-              <select id="perm-active" v-model="userForm.is_active" :disabled="editingUser != null && isSelf(editingUser)">
-                <option :value="true">启用</option>
-                <option :value="false">禁用</option>
-              </select>
+              <TagSelect
+                id="perm-active"
+                v-model="userForm.is_active"
+                :options="USER_ACTIVE_TAGS"
+                :disabled="editingUser != null && isSelf(editingUser)"
+                aria-label="启用状态"
+              />
             </div>
             <div v-if="userFormMode === 'create'" class="span-full">
               <FormLabel text="角色" help="可多选。不选则绑定内置普通用户角色。" />
@@ -863,12 +883,7 @@ async function removeRole(role: RoleOut): Promise<void> {
               aria-label="搜索可分配节点"
               style="flex: 1"
             />
-            <select v-model="nodeFilter" class="input-sm">
-              <option value="all">全部</option>
-              <option value="unassigned">管理员名下</option>
-              <option value="mine">已分配给该用户</option>
-              <option value="others">其他用户</option>
-            </select>
+            <TagSelect v-model="nodeFilter" :options="NODE_FILTER_TAGS" aria-label="节点筛选" />
           </div>
           <div class="row between" style="margin: 8px 0 10px">
             <label class="row muted" style="gap: 6px; font-size: 12px; cursor: pointer">
@@ -964,14 +979,13 @@ async function removeRole(role: RoleOut): Promise<void> {
             </div>
             <div>
               <FormLabel field-id="perm-role-enabled" text="状态" help="内置角色不可停用。停用后已持有该角色的用户会立刻丢掉对应菜单。" />
-              <select
+              <TagSelect
                 id="perm-role-enabled"
                 v-model="roleForm.enabled"
+                :options="ROLE_ENABLED_TAGS"
                 :disabled="editingRole?.is_builtin"
-              >
-                <option :value="true">启用</option>
-                <option :value="false">停用</option>
-              </select>
+                aria-label="角色状态"
+              />
             </div>
             <div class="span-full">
               <FormLabel text="菜单" help="只出现可分配菜单。超级管理员角色固定拥有全部菜单。" />

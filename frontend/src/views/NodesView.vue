@@ -6,6 +6,8 @@ import { useRouter } from 'vue-router'
 import { ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/message-box/style/css'
 import FormLabel from '@/components/FormLabel.vue'
+import TagSelect from '@/components/TagSelect.vue'
+import type { TagOption } from '@/components/tagOption'
 import FilterRulesEditor from '@/components/FilterRulesEditor.vue'
 import { NODE_FORM_FIELD_HELP } from '@/constants/nodeFormHelp'
 import { useAuthStore } from '@/stores/auth'
@@ -15,6 +17,11 @@ import { parseFilterRules, parseNodeDispatchFilters, serializeNodeDispatchFilter
 import { confirmAction } from '@/utils/confirm'
 
 const hub = useHubStore()
+
+const ENABLED_TAGS: TagOption<boolean>[] = [
+  { value: true, label: '启用', tone: 'on' },
+  { value: false, label: '禁用', tone: 'off' },
+]
 const auth = useAuthStore()
 const router = useRouter()
 
@@ -433,7 +440,7 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
           </div>
           <div v-if="formMode === 'edit'">
             <FormLabel field-id="node-enabled" text="启用状态" :help="NODE_FORM_FIELD_HELP.enabled" />
-            <select id="node-enabled" v-model="form.enabled"><option :value="true">启用</option><option :value="false">禁用</option></select>
+            <TagSelect id="node-enabled" v-model="form.enabled" :options="ENABLED_TAGS" aria-label="启用状态" />
           </div>
           <div v-if="auth.isAdmin" class="span-full">
             <FormLabel text="按币种配置" :help="NODE_FORM_FIELD_HELP.filters" />

@@ -6,6 +6,8 @@ import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
 import FormLabel from '@/components/FormLabel.vue'
+import TagSelect from '@/components/TagSelect.vue'
+import type { TagOption } from '@/components/tagOption'
 import { useAuthStore } from '@/stores/auth'
 import { useHubStore } from '@/stores/hub'
 import type {
@@ -28,6 +30,12 @@ const DISPATCH_MODE_LABEL: Record<GroupDispatchMode, string> = {
   sync: '全员同步',
   poll: '轮询轮转（单节点领取）',
 }
+
+const ACTION_TAGS: TagOption<ManualSignalAction>[] = [
+  { value: 'BUY', label: 'BUY', hint: '策略托管开多', tone: 'buy' },
+  { value: 'SELL', label: 'SELL', hint: '策略托管开空', tone: 'sell' },
+  { value: 'CLOSE', label: 'CLOSE', hint: '终止任务并平仓', tone: 'close' },
+]
 
 const TRIGGER_HELP = {
   symbol:
@@ -404,15 +412,11 @@ async function confirmSubmitTrigger(): Promise<void> {
               </div>
             </div>
             <div>
-              <FormLabel field-id="trigger-action" text="信号方向" :help="TRIGGER_HELP.action" />
-              <select id="trigger-action" v-model="triggerForm.action">
-                <option value="BUY">BUY（策略托管开多）</option>
-                <option value="SELL">SELL（策略托管开空）</option>
-                <option value="CLOSE">CLOSE（终止任务并平仓）</option>
-              </select>
+              <FormLabel text="信号方向" :help="TRIGGER_HELP.action" />
+              <TagSelect v-model="triggerForm.action" :options="ACTION_TAGS" aria-label="信号方向" />
             </div>
 
-            <template v-if="!isCloseAction">
+            <div v-if="!isCloseAction" class="trigger-param-grid">
               <div>
                 <FormLabel field-id="trigger-volume" text="首单手数" :help="TRIGGER_HELP.volume" />
                 <input
@@ -458,10 +462,10 @@ async function confirmSubmitTrigger(): Promise<void> {
                   v-model.number="triggerForm.entry_price"
                   type="number"
                   step="any"
-                  placeholder="仅限价开仓需要，留空表示不设"
+                  placeholder="留空表示不设"
                 />
               </div>
-            </template>
+            </div>
             <p v-else class="span-full trigger-warning">
               CLOSE 会平掉命中分组内进行中任务对应魔术号的持仓并结束节点侧策略监控，不影响按币种分发链路的持仓。
             </p>
@@ -744,6 +748,18 @@ async function confirmSubmitTrigger(): Promise<void> {
   overflow: auto;
 }
 
+.trigger-param-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  grid-column: 1 / -1;
+  min-width: 0;
+}
+
+.trigger-param-grid > div {
+  min-width: 0;
+}
+
 @media (max-width: 768px) {
   .group-trigger-modal {
     width: 100%;
@@ -753,6 +769,9 @@ async function confirmSubmitTrigger(): Promise<void> {
   }
   .member-row {
     flex-wrap: wrap;
+  }
+  .trigger-param-grid {
+    gap: 10px;
   }
 }
 </style>
