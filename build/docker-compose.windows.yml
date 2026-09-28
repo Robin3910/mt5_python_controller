@@ -78,6 +78,8 @@ services:
       args:
         BACKEND_FROM: ${BACKEND_FROM:-python:3.12-slim}
         INSTALL_DEPS: ${INSTALL_DEPS:-1}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.cloud.tencent.com/pypi/simple}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-mirrors.cloud.tencent.com}
     env_file: .env
     environment:
       MYSQL_DSN: mysql+asyncmy://${MYSQL_USER:-mt5}:${MYSQL_PASSWORD:-mt5pwd}@mysql:3306/${MYSQL_DATABASE:-mt5hub}
