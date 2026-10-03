@@ -160,14 +160,26 @@ def subtask_id_from_magic(magic: object) -> Optional[int]:
     return dispatch_id if dispatch_id > 0 else None
 
 
-def member_ids(group: dict) -> list[str]:
-    """分组成员的 node_id 列表，按组内顺序（sort_order 升序）排列。"""
+def _ordered_members(group: dict) -> list[dict]:
     members = group.get("members") or []
-    ordered = sorted(
+    return sorted(
         (m for m in members if isinstance(m, dict) and m.get("node_id")),
         key=lambda m: (int(m.get("sort_order") or 0), str(m.get("node_id"))),
     )
-    return [str(m["node_id"]) for m in ordered]
+
+
+def member_ids(group: dict) -> list[str]:
+    """分组成员的 node_id 列表，按组内顺序（sort_order 升序）排列。"""
+    return [str(m["node_id"]) for m in _ordered_members(group)]
+
+
+def limit_watch_report_ids(group: dict) -> list[str]:
+    """已打开「限价监听上报」的成员，按组内顺序。缺字段视为关闭。"""
+    return [
+        str(m["node_id"])
+        for m in _ordered_members(group)
+        if m.get("limit_watch_report")
+    ]
 
 
 def effective_node_ids(group: dict, nodemap: dict[str, dict], online_ids: set[str]) -> list[str]:

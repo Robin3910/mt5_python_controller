@@ -48,7 +48,12 @@ def group_row_to_dict(row: NodeGroup, members: list[NodeGroupMember]) -> dict:
         "owner_user_id": row.owner_user_id,
         "created_at": row.created_at.timestamp() if row.created_at else time.time(),
         "members": [
-            {"node_id": m.node_id, "sort_order": m.sort_order or 0} for m in ordered
+            {
+                "node_id": m.node_id,
+                "sort_order": m.sort_order or 0,
+                "limit_watch_report": bool(getattr(m, "limit_watch_report", False)),
+            }
+            for m in ordered
         ],
     }
 
@@ -166,13 +171,48 @@ def _limit_watch_fields(payload: GroupCreate) -> tuple[bool, str]:
     return enabled, keyword
 
 
-async def _replace_members(session, group_id: str, node_ids: list[str]) -> None:
+def _report_ids_for(
+    node_ids: list[str],
+    requested: Optional[list[str]],
+    *,
+    explicit: bool,
+    previous: dict[str, bool],
+) -> set[str]:
+    """算出哪些成员打开限价监听上报。
+
+    explicit：按 requested 与本次成员的交集（未列入的关闭）。
+    否则保留 previous 里仍在成员列表中的开关，新节点默认关闭。
+    """
+    if explicit:
+        wanted = set(_dedup_node_ids(requested))
+        return {nid for nid in node_ids if nid in wanted}
+    return {nid for nid in node_ids if previous.get(nid)}
+
+
+async def _member_rows(session, group_id: str) -> list[NodeGroupMember]:
+    rows = (
+        await session.execute(
+            select(NodeGroupMember).where(NodeGroupMember.group_id == group_id)
+        )
+    ).scalars().all()
+    return sorted(rows, key=lambda m: (m.sort_order or 0, m.node_id))
+
+
+async def _replace_members(
+    session, group_id: str, node_ids: list[str], report_ids: Optional[set[str]] = None,
+) -> None:
     """整体替换分组成员（传入顺序即组内轮询顺序）。"""
+    reporting = report_ids or set()
     await session.execute(
         delete(NodeGroupMember).where(NodeGroupMember.group_id == group_id)
     )
     for idx, nid in enumerate(node_ids):
-        session.add(NodeGroupMember(group_id=group_id, node_id=nid, sort_order=idx))
+        session.add(NodeGroupMember(
+            group_id=group_id,
+            node_id=nid,
+            sort_order=idx,
+            limit_watch_report=nid in reporting,
+        ))
 
 
 async def name_exists(
@@ -219,6 +259,15 @@ async def create_group(
     watch_enabled, watch_keyword = _limit_watch_fields(payload)
     if watch_enabled:
         await _require_trend_strategy(store, strategy_id)
+    sty = await _strategy_dict(store, strategy_id)
+    report_ids: set[str] = set()
+    if is_trend_strategy(sty):
+        report_ids = _report_ids_for(
+            node_ids,
+            payload.limit_watch_node_ids,
+            explicit="limit_watch_node_ids" in payload.model_fields_set,
+            previous={},
+        )
     group_id = make_group_id()
     mode = normalize_dispatch_mode(payload.dispatch_mode)
     want_concurrent = bool(payload.signal_concurrent_enabled) and mode == "sync"
@@ -240,7 +289,7 @@ async def create_group(
                 owner_user_id=owner,
             )
         )
-        await _replace_members(s, group_id, node_ids)
+        await _replace_members(s, group_id, node_ids, report_ids)
         await s.commit()
         d = await _load_group(s, group_id)
     await store.cache_group(d)
@@ -313,8 +362,31 @@ async def update_group(store: RedisStore, group_id: str, patch: GroupUpdate) -> 
         if want_watch:
             await _require_trend_strategy(store, final_sid)
         row.limit_watch_enabled = want_watch
-        if node_ids is not None:
-            await _replace_members(s, group_id, node_ids)
+        final_sty = await _strategy_dict(store, final_sid)
+        existing = await _member_rows(s, group_id)
+        previous = {
+            m.node_id: bool(getattr(m, "limit_watch_report", False)) for m in existing
+        }
+        existing_ids = [m.node_id for m in existing]
+        target_ids = node_ids if node_ids is not None else existing_ids
+        update_reports = "limit_watch_node_ids" in patch.model_fields_set
+        if not is_trend_strategy(final_sty):
+            # 非趋势策略不能当触发来源，成员开关一并清掉
+            report_ids = set()
+            rewrite = node_ids is not None or any(previous.values())
+        elif update_reports or node_ids is not None:
+            report_ids = _report_ids_for(
+                target_ids,
+                patch.limit_watch_node_ids if update_reports else None,
+                explicit=update_reports,
+                previous=previous,
+            )
+            rewrite = True
+        else:
+            report_ids = set()
+            rewrite = False
+        if rewrite:
+            await _replace_members(s, group_id, target_ids, report_ids)
         await s.commit()
         d = await _load_group(s, group_id)
     await store.cache_group(d)

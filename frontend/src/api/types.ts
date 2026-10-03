@@ -366,6 +366,8 @@ export interface GroupNodeRef {
   enabled: boolean
   status: 'online' | 'offline'
   sort_order: number
+  /** 该成员的挂单是否作为限价监听触发来源（默认关） */
+  limit_watch_report?: boolean
 }
 
 export interface GroupOut {
@@ -463,6 +465,8 @@ export interface GroupCreatePayload {
   /** 一对一绑定策略；空 / null = 不绑定 */
   strategy_id?: string | null
   node_ids?: string[]
+  /** 这些成员打开限价监听上报；未列入的成员为关闭 */
+  limit_watch_node_ids?: string[]
 }
 
 export interface GroupUpdatePayload {
@@ -478,6 +482,8 @@ export interface GroupUpdatePayload {
   strategy_id?: string | null
   /** 传入即整体替换成员列表 */
   node_ids?: string[]
+  /** 传入即重算成员上报开关；省略则替换成员时保留原开关，新节点默认关闭 */
+  limit_watch_node_ids?: string[]
 }
 
 /** 分批档位的加仓间距计算方式 */

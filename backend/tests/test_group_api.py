@@ -152,6 +152,7 @@ def test_create_group_response_shape(client):
     assert g["nodes"][0]["mt5_login"] == 5101
     assert g["nodes"][0]["status"] == "offline"
     assert g["nodes"][0]["sort_order"] == 0
+    assert g["nodes"][0]["limit_watch_report"] is False  # 成员上报默认关闭
     assert g.get("strategy_id") in (None, "")
     assert g.get("strategy_name") in (None, "")
 
@@ -1835,6 +1836,54 @@ def test_limit_watch_auto_off_when_unbinding_trend(client):
     assert r.json()["limit_watch_enabled"] is False
 
 
+def test_member_limit_watch_report_switch(client):
+    """成员上报默认关；显式列表打开；替换成员时新节点默认关、留下的保留；非趋势清掉。"""
+    h = auth_headers(client)
+    a = _mk_node(client, h, 5411, "上报甲")
+    b = _mk_node(client, h, 5412, "上报乙")
+    c = _mk_node(client, h, 5413, "上报丙")
+    sty = _mk_trend_strategy(client, h, name="上报趋势")
+    created = _mk_group(
+        client, h, name="上报开关组", strategy_id=sty["strategy_id"],
+        node_ids=[a, b], limit_watch_enabled=True, limit_watch_node_ids=[a],
+    )
+    gid = created["group_id"]
+    by_id = {n["node_id"]: n for n in created["nodes"]}
+    assert by_id[a]["limit_watch_report"] is True
+    assert by_id[b]["limit_watch_report"] is False
+
+    kept = client.patch(f"/api/groups/{gid}", json={"node_ids": [a, c]}, headers=h)
+    assert kept.status_code == 200, kept.text
+    by_id = {n["node_id"]: n for n in kept.json()["nodes"]}
+    assert [n["node_id"] for n in kept.json()["nodes"]] == [a, c]
+    assert by_id[a]["limit_watch_report"] is True
+    assert by_id[c]["limit_watch_report"] is False
+
+    named = client.patch(f"/api/groups/{gid}", json={"remark": "只改备注"}, headers=h)
+    assert named.status_code == 200
+    by_id = {n["node_id"]: n for n in named.json()["nodes"]}
+    assert by_id[a]["limit_watch_report"] is True
+    assert by_id[c]["limit_watch_report"] is False
+
+    flipped = client.patch(
+        f"/api/groups/{gid}",
+        json={"limit_watch_node_ids": [c]},
+        headers=h,
+    )
+    assert flipped.status_code == 200, flipped.text
+    by_id = {n["node_id"]: n for n in flipped.json()["nodes"]}
+    assert by_id[a]["limit_watch_report"] is False
+    assert by_id[c]["limit_watch_report"] is True
+
+    plain = _mk_strategy(client, h, name="非趋势清空上报")
+    cleared = client.patch(
+        f"/api/groups/{gid}", json={"strategy_id": plain["strategy_id"]}, headers=h,
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["limit_watch_enabled"] is False
+    assert all(n["limit_watch_report"] is False for n in cleared.json()["nodes"])
+
+
 def test_limit_watch_logs_rejected_appear_in_group_list(client):
     """不合格触发单落库监听日志，分组列表与分页接口都能读到。"""
     h = auth_headers(client)
@@ -1843,7 +1892,7 @@ def test_limit_watch_logs_rejected_appear_in_group_list(client):
     sty = _mk_trend_strategy(client, h, name="监听日志趋势")
     g = _mk_group(
         client, h, name="监听日志组", strategy_id=sty["strategy_id"],
-        node_ids=[n1], limit_watch_enabled=True,
+        node_ids=[n1], limit_watch_enabled=True, limit_watch_node_ids=[n1],
     )
     gid = g["group_id"]
     assert g["limit_watch_enabled"] is True

@@ -50,6 +50,7 @@ def _group_audit_snapshot(d: dict | None) -> dict | None:
         "trend_risk_enabled": bool(d.get("trend_risk_enabled", False)),
         "limit_watch_enabled": bool(d.get("limit_watch_enabled", False)),
         "limit_watch_keyword": normalize_keyword(d.get("limit_watch_keyword")),
+        "limit_watch_node_ids": group_rules.limit_watch_report_ids(d),
         "strategy_id": d.get("strategy_id"),
         "remark": d.get("remark"),
         "node_ids": group_rules.member_ids(d),
@@ -87,6 +88,7 @@ async def _to_group_out(
                 enabled=enabled,
                 status=status,
                 sort_order=member.get("sort_order", 0),
+                limit_watch_report=bool(member.get("limit_watch_report")),
             )
         )
     strategy_id = d.get("strategy_id") or None
@@ -332,7 +334,7 @@ async def update_group(
     store: RedisStore = Depends(get_store),
     p: Principal = Depends(require_menu(MENU_GROUPS)),
 ):
-    """更新分组（名称 / 启用状态 / 分发模式 / 信号并发 / 趋势风控 / 限价监听 / 绑定策略 / 备注 / 成员节点）。"""
+    """更新分组（名称 / 启用状态 / 分发模式 / 信号并发 / 趋势风控 / 限价监听 / 成员上报开关 / 绑定策略 / 备注 / 成员节点）。"""
     _validate_dispatch_mode(body.dispatch_mode)
     current = await owned_group_or_404(store, p, group_id)
     if body.name is not None and (name := body.name.strip()):

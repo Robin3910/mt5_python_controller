@@ -193,6 +193,16 @@ def test_member_ids_sorted_by_sort_order():
     assert group_rules.member_ids(g) == ["nd_a", "nd_b", "nd_c"]
 
 
+def test_limit_watch_report_ids_defaults_off_and_keeps_order():
+    g = _group(
+        {"node_id": "nd_c", "sort_order": 2, "limit_watch_report": True},
+        {"node_id": "nd_a", "sort_order": 0},
+        {"node_id": "nd_b", "sort_order": 1, "limit_watch_report": False},
+    )
+    assert group_rules.limit_watch_report_ids(g) == ["nd_c"]
+    assert group_rules.member_ids(g) == ["nd_a", "nd_b", "nd_c"]
+
+
 def test_member_ids_ignores_malformed_entries():
     g = _group({"node_id": "nd_a", "sort_order": 0}, {"sort_order": 1}, "not-a-dict")
     assert group_rules.member_ids(g) == ["nd_a"]

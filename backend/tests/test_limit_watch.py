@@ -3,7 +3,7 @@ import fakeredis
 import pytest
 from sqlalchemy import delete
 
-from app import group_service, limit_watch, persist
+from app import group_rules, group_service, limit_watch, persist
 from app.db import SessionLocal, init_db
 from app.models import GroupCreate, GroupUpdate
 from app.orm import (
@@ -138,7 +138,7 @@ async def _ensure_node(store, node_id="nd_a"):
 
 
 async def _mk_group(store, name, node_ids, *, strategy, watch=True, keyword="limit",
-                    enabled=True):
+                    enabled=True, report=True):
     if node_ids:
         for nid in node_ids:
             if not await store.get_node(nid):
@@ -149,6 +149,7 @@ async def _mk_group(store, name, node_ids, *, strategy, watch=True, keyword="lim
             name=name, enabled=enabled, dispatch_mode="sync",
             strategy_id=strategy["strategy_id"], node_ids=list(node_ids),
             limit_watch_enabled=watch, limit_watch_keyword=keyword,
+            limit_watch_node_ids=list(node_ids) if report else [],
         ),
     )
     return g
@@ -213,19 +214,19 @@ def test_select_watch_targets_sends_all_matching_groups():
             "group_id": "g1", "name": "一组", "enabled": True,
             "limit_watch_enabled": True, "limit_watch_keyword": "limit",
             "strategy_id": "sty_1",
-            "members": [{"node_id": "nd_a", "sort_order": 0}],
+            "members": [{"node_id": "nd_a", "sort_order": 0, "limit_watch_report": True}],
         },
         {
             "group_id": "g2", "name": "二组", "enabled": True,
             "limit_watch_enabled": True, "limit_watch_keyword": "limit",
             "strategy_id": "sty_1",
-            "members": [{"node_id": "nd_a", "sort_order": 0}],
+            "members": [{"node_id": "nd_a", "sort_order": 0, "limit_watch_report": True}],
         },
         {
             "group_id": "g3", "name": "关键字不同", "enabled": True,
             "limit_watch_enabled": True, "limit_watch_keyword": "signal",
             "strategy_id": "sty_1",
-            "members": [{"node_id": "nd_a", "sort_order": 0}],
+            "members": [{"node_id": "nd_a", "sort_order": 0, "limit_watch_report": True}],
         },
     ]
     passing, blocked = limit_watch.select_watch_targets(
@@ -245,7 +246,7 @@ def test_select_watch_targets_empty_keyword_matches_any_comment():
             "group_id": "g_empty", "name": "空关键字", "enabled": True,
             "limit_watch_enabled": True, "limit_watch_keyword": "",
             "strategy_id": "sty_1",
-            "members": [{"node_id": "nd_a", "sort_order": 0}],
+            "members": [{"node_id": "nd_a", "sort_order": 0, "limit_watch_report": True}],
         },
     ]
     passing, blocked = limit_watch.select_watch_targets(
@@ -269,13 +270,13 @@ def test_select_watch_targets_ignores_non_member_and_tpl1():
             "group_id": "g_other_node", "enabled": True,
             "limit_watch_enabled": True, "limit_watch_keyword": "limit",
             "strategy_id": "sty_t",
-            "members": [{"node_id": "nd_b", "sort_order": 0}],
+            "members": [{"node_id": "nd_b", "sort_order": 0, "limit_watch_report": True}],
         },
         {
             "group_id": "g_tpl1", "enabled": True,
             "limit_watch_enabled": True, "limit_watch_keyword": "limit",
             "strategy_id": "sty_1",
-            "members": [{"node_id": "nd_a", "sort_order": 0}],
+            "members": [{"node_id": "nd_a", "sort_order": 0, "limit_watch_report": True}],
         },
     ]
     passing, blocked = limit_watch.select_watch_targets(
@@ -285,7 +286,40 @@ def test_select_watch_targets_ignores_non_member_and_tpl1():
     assert [g["group_id"] for g, _ in blocked] == ["g_tpl1"]
 
 
-def test_select_watch_targets_blocks_limit_mode_wrong_side():
+def test_select_watch_targets_skips_member_without_report():
+    """成员上报关闭：不进通过侧，也不记拒绝。缺字段与显式 false 一样。"""
+    sty = {
+        "strategy_id": "sty_1", "template_id": TEMPLATE_2_ID, "enabled": True,
+        "symbol": "XAUUSD", "rules": [_risk_rule()],
+    }
+    groups = [
+        {
+            "group_id": "g_off", "name": "上报关", "enabled": True,
+            "limit_watch_enabled": True, "limit_watch_keyword": "limit",
+            "strategy_id": "sty_1",
+            "members": [{"node_id": "nd_a", "sort_order": 0, "limit_watch_report": False}],
+        },
+        {
+            "group_id": "g_missing", "name": "旧缓存", "enabled": True,
+            "limit_watch_enabled": True, "limit_watch_keyword": "limit",
+            "strategy_id": "sty_1",
+            "members": [{"node_id": "nd_a", "sort_order": 0}],
+        },
+        {
+            "group_id": "g_disabled", "name": "分组关", "enabled": False,
+            "limit_watch_enabled": True, "limit_watch_keyword": "limit",
+            "strategy_id": "sty_1",
+            "members": [{"node_id": "nd_a", "sort_order": 0, "limit_watch_report": True}],
+        },
+    ]
+    passing, blocked = limit_watch.select_watch_targets(
+        groups, {"sty_1": sty}, "nd_a", _order(),
+    )
+    assert passing == []
+    assert blocked == []
+    assert limit_watch.node_has_watch(groups, "nd_a") is False
+    assert group_rules.limit_watch_report_ids(groups[0]) == []
+    assert group_rules.limit_watch_report_ids(groups[2]) == ["nd_a"]
     sty = {
         "strategy_id": "sty_1", "template_id": TEMPLATE_2_ID, "enabled": True,
         "symbol": "XAUUSD",
@@ -295,7 +329,7 @@ def test_select_watch_targets_blocks_limit_mode_wrong_side():
         "group_id": "g1", "name": "限价组", "enabled": True,
         "limit_watch_enabled": True, "limit_watch_keyword": "limit",
         "strategy_id": "sty_1",
-        "members": [{"node_id": "nd_a", "sort_order": 0}],
+        "members": [{"node_id": "nd_a", "sort_order": 0, "limit_watch_report": True}],
     }]
     passing, blocked = limit_watch.select_watch_targets(
         groups, {"sty_1": sty}, "nd_a",
@@ -403,6 +437,29 @@ async def test_handle_rejects_incomplete_without_cancel(store, monkeypatch):
     assert "止损" in page["items"][0]["message"]
 
 
+async def test_handle_skips_member_without_report(store, monkeypatch):
+    """成员上报关闭时不撤单、不分发、不写拒绝日志。"""
+    sty = await _mk_strategy(store)
+    g = await _mk_group(store, "未开上报", ["nd_a"], strategy=sty, report=False)
+    called = []
+
+    async def fake_cancel(*_a, **_k):
+        called.append("cancel")
+        return {"success": True}
+
+    monkeypatch.setattr(limit_watch, "cancel_pending_on_node", fake_cancel)
+    monkeypatch.setattr(
+        limit_watch, "_dispatch",
+        _async_raise(AssertionError("should not dispatch")),
+    )
+
+    await limit_watch.handle_account_orders("nd_a", [_order(sl=0)])
+    assert called == []
+    page = await persist.list_limit_watch_logs(g["group_id"])
+    assert page["total"] == 0
+    assert all(not m.get("limit_watch_report") for m in g["members"])
+
+
 async def test_handle_skips_strategy_magic_orders(store, monkeypatch):
     sty = await _mk_strategy(store)
     await _mk_group(store, "魔术号组", ["nd_a"], strategy=sty)
@@ -491,6 +548,7 @@ async def test_unbinding_trend_strategy_turns_watch_off(store):
     )
     assert updated["limit_watch_enabled"] is False
     assert updated["limit_watch_keyword"] == "limit"
+    assert updated["members"] == []
 
 
 async def test_create_group_keeps_empty_watch_keyword(store):

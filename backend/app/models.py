@@ -201,6 +201,8 @@ class GroupNodeRef(BaseModel):
     enabled: bool = True
     status: str = "offline"  # online / offline
     sort_order: int = 0
+    # 该成员的挂单是否作为限价监听触发来源（默认关）
+    limit_watch_report: bool = False
 
 
 class GroupCreate(BaseModel):
@@ -219,6 +221,8 @@ class GroupCreate(BaseModel):
     # 一对一绑定交易策略；空 / null = 不绑定
     strategy_id: Optional[str] = Field(default=None, max_length=32)
     node_ids: list[str] = Field(default_factory=list)
+    # 这些成员打开「限价监听上报」；省略或未列入的成员为关闭。不在 node_ids 里的 id 忽略
+    limit_watch_node_ids: Optional[list[str]] = None
 
 
 class GroupUpdate(BaseModel):
@@ -234,6 +238,9 @@ class GroupUpdate(BaseModel):
     # 传入空字符串或 null 表示解除绑定；省略字段则不改
     strategy_id: Optional[str] = Field(default=None, max_length=32)
     node_ids: Optional[list[str]] = None  # 传入即整体替换成员列表
+    # 传入即按该列表重算成员上报开关（仅对当前成员生效）。省略则：未改成员时保持原开关；
+    # 替换成员时，留下的节点保留原开关，新节点默认关闭
+    limit_watch_node_ids: Optional[list[str]] = None
 
 
 class LimitWatchLogRecord(BaseModel):

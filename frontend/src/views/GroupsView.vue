@@ -75,10 +75,10 @@ const FIELD_HELP = {
     '开启后，开仓信号进入各节点前会按「趋势面板」全局参数计算该节点上信号品种的趋势：' +
     'BUY 仅多头放行、SELL 仅空头放行；中性、数据不足或行情读取失败一律拦截并记入子任务跳过原因。CLOSE 不受影响。默认关闭。',
   limit_watch:
-    '仅绑定趋势策略（模版2）的分组可用，默认关闭。开启后监听组内节点 MT5 上手动挂的限价单：' +
+    '仅绑定趋势策略（模版2）的分组可用，默认关闭。开启后，只看成员行里「限价监听上报」也打开的节点：' +
     '注释包含关键字即视为触发单（关键字可留空，表示不限注释）；参数须与「手动触发策略信号」的限价开仓规则一致（手数、止损、挂单价齐全），' +
     '合格则撤掉该挂单并按手动触发同构发给本分组；同一节点命中多个已开监听的趋势分组时发给全部命中分组。' +
-    '策略托管单（带魔术号）不会被误撤。留空时组内所有手工限价单都会被扫描，请谨慎。',
+    '成员上报关闭时，该节点的挂单不会被当成触发单。策略托管单（带魔术号）不会被误撤。',
   strategy:
     '一对一绑定交易策略。每个分组最多绑定一个策略，同一策略也不能挂到多个分组。' +
     '未绑定不影响分组本身的信号分发；可稍后在编辑中补绑或换绑。',
@@ -102,6 +102,7 @@ const form = reactive({
   trend_risk_enabled: false,
   limit_watch_enabled: false,
   limit_watch_keyword: 'limit',
+  limit_watch_node_ids: [] as string[],
   strategy_id: '' as string,
   remark: '',
   node_ids: [] as string[],
@@ -207,6 +208,16 @@ function addMember(nodeId: string): void {
 }
 function removeMember(nodeId: string): void {
   form.node_ids = form.node_ids.filter((id) => id !== nodeId)
+  form.limit_watch_node_ids = form.limit_watch_node_ids.filter((id) => id !== nodeId)
+}
+function setMemberWatch(nodeId: string, on: boolean): void {
+  if (on) {
+    if (!form.limit_watch_node_ids.includes(nodeId)) {
+      form.limit_watch_node_ids = [...form.limit_watch_node_ids, nodeId]
+    }
+    return
+  }
+  form.limit_watch_node_ids = form.limit_watch_node_ids.filter((id) => id !== nodeId)
 }
 function moveMember(index: number, delta: number): void {
   const next = index + delta
@@ -228,6 +239,7 @@ function openCreate(): void {
     trend_risk_enabled: false,
     limit_watch_enabled: false,
     limit_watch_keyword: 'limit',
+    limit_watch_node_ids: [],
     strategy_id: '',
     remark: '',
     node_ids: [],
@@ -248,6 +260,7 @@ function openEdit(g: GroupOut): void {
     trend_risk_enabled: Boolean(g.trend_risk_enabled),
     limit_watch_enabled: Boolean(g.limit_watch_enabled),
     limit_watch_keyword: g.limit_watch_keyword ?? '',
+    limit_watch_node_ids: g.nodes.filter((n) => n.limit_watch_report).map((n) => n.node_id),
     strategy_id: g.strategy_id || '',
     remark: g.remark || '',
     node_ids: g.nodes.map((n) => n.node_id),
@@ -270,6 +283,9 @@ async function save(): Promise<void> {
       form.dispatch_mode === 'sync' &&
       formIsConcurrentStrategy.value &&
       form.signal_concurrent_enabled
+    const reportIds = formIsTrendStrategy.value
+      ? form.limit_watch_node_ids.filter((id) => form.node_ids.includes(id))
+      : []
     const payload = {
       name,
       enabled: form.enabled,
@@ -281,6 +297,7 @@ async function save(): Promise<void> {
       strategy_id: strategyId,
       remark: form.remark.trim() || null,
       node_ids: form.node_ids,
+      limit_watch_node_ids: reportIds,
     }
     const styName =
       selectableStrategies.value.find((s) => s.strategy_id === strategyId)?.name
@@ -294,6 +311,7 @@ async function save(): Promise<void> {
       `趋势风控：${form.trend_risk_enabled ? '开启' : '关闭'}\n` +
       (formIsTrendStrategy.value
         ? `限价监听：${form.limit_watch_enabled ? `开启（${watchKeywordLabel(form.limit_watch_keyword)}）` : '关闭'}\n`
+          + `限价监听上报：${reportIds.length} 个\n`
         : '') +
       `绑定策略：${styName}\n` +
       `成员节点：${form.node_ids.length} 个`
@@ -1262,6 +1280,15 @@ async function onStrategyFormSaved(): Promise<void> {
                   <span class="muted member-meta">{{ n.mt5_login || '—' }}</span>
                   <span class="tag" :class="n.enabled ? 'green' : ''">{{ n.enabled ? '已启用' : '已禁用' }}</span>
                   <span class="member-actions">
+                    <span v-if="formIsTrendStrategy" class="member-watch">
+                      <span class="muted member-meta">限价监听上报</span>
+                      <TagSelect
+                        :model-value="form.limit_watch_node_ids.includes(n.node_id)"
+                        :options="SWITCH_TAGS"
+                        :aria-label="`${n.name} 限价监听上报`"
+                        @update:model-value="setMemberWatch(n.node_id, $event)"
+                      />
+                    </span>
                     <button class="btn-sm btn-ghost" :disabled="i === 0" @click="moveMember(i, -1)">↑</button>
                     <button class="btn-sm btn-ghost" :disabled="i === memberNodes.length - 1" @click="moveMember(i, 1)">↓</button>
                     <button class="btn-sm btn-danger" @click="removeMember(n.node_id)">移出</button>
@@ -1389,7 +1416,15 @@ async function onStrategyFormSaved(): Promise<void> {
 .member-actions {
   margin-left: auto;
   display: flex;
+  align-items: center;
   gap: 6px;
+}
+
+.member-watch {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-right: 4px;
 }
 
 .watch-log-modal .modal-body {

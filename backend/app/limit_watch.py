@@ -1,8 +1,9 @@
 """分组限价挂单监听：把节点 MT5 上手动挂的限价单转成 strategy 信号。
 
-只作用于绑定趋势策略（模版2）且开关打开的分组。识别与校验是纯函数；撤单、
-分发、审计在编排层。复用 `process_signal`（与中控台手动触发同构），用
-`group_ids` 点名全部命中分组。关键字可留空（不按注释过滤）；未配置时默认 `limit`。
+只作用于绑定趋势策略（模版2）、分组开关打开、且该成员「限价监听上报」打开的分组。
+识别与校验是纯函数；撤单、分发、审计在编排层。复用 `process_signal`（与中控台
+手动触发同构），用 `group_ids` 点名全部命中分组。关键字可留空（不按注释过滤）；
+未配置时默认 `limit`。成员上报默认关闭，缺字段视为关闭。
 """
 from __future__ import annotations
 
@@ -170,7 +171,7 @@ def build_signal_payload(order: dict, group_ids: list[str]) -> dict:
 
 
 def node_has_watch(groups: list[dict], node_id: str) -> bool:
-    """该节点是否属于任一已开监听的分组（快路径，避免无开关时扫挂单）。"""
+    """该节点是否是任一已开监听分组里、且打开了上报开关的成员。"""
     nid = str(node_id or "")
     if not nid:
         return False
@@ -179,7 +180,7 @@ def node_has_watch(groups: list[dict], node_id: str) -> bool:
             continue
         if not group.get("enabled", True):
             continue
-        if nid in group_rules.member_ids(group):
+        if nid in group_rules.limit_watch_report_ids(group):
             return True
     return False
 
@@ -192,23 +193,22 @@ def select_watch_targets(
 ) -> tuple[list[dict], list[tuple[dict, str]]]:
     """从该节点所属分组里挑出应接收本张触发单的分组。
 
-    入选：分组启用 + 监听开 + 节点是成员 + 注释匹配该组关键字（空关键字视为命中）
-    + 绑定启用中的趋势策略 + 品种匹配 + 通过 `entry_reject_reason`。
+    入选：分组启用 + 监听开 + 该成员打开了上报开关 + 注释匹配该组关键字
+    （空关键字视为命中）+ 绑定启用中的趋势策略 + 品种匹配 + 通过 `entry_reject_reason`。
     返回 (可下发分组, 关键字已命中但被准入拦住的 (分组, 原因))。
-    关键字都没碰上的分组不出现在任一侧。
+    分组监听关、分组禁用、成员上报关、或关键字没碰上的分组不出现在任一侧。
     """
     nid = str(node_id or "")
     passing: list[dict] = []
     blocked: list[tuple[dict, str]] = []
     for group in groups or []:
-        if nid not in group_rules.member_ids(group):
-            continue
         if not group.get("limit_watch_enabled"):
             continue
-        if not keyword_matches(order.get("comment"), group.get("limit_watch_keyword")):
-            continue
         if not group.get("enabled", True):
-            blocked.append((group, f"分组已禁用：{group.get('name') or group.get('group_id')}"))
+            continue
+        if nid not in group_rules.limit_watch_report_ids(group):
+            continue
+        if not keyword_matches(order.get("comment"), group.get("limit_watch_keyword")):
             continue
         sid = str(group.get("strategy_id") or "").strip()
         strategy = strategies.get(sid) if sid else None

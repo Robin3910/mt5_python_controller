@@ -263,6 +263,8 @@ class NodeGroupMember(Base):
     group_id: Mapped[str] = mapped_column(String(32), index=True)
     node_id: Mapped[str] = mapped_column(String(32), index=True)
     sort_order: Mapped[int] = mapped_column(Integer, default=0)  # 组内轮询顺序（越小越先）
+    # 该成员的挂单是否作为限价监听触发来源；默认关，与分组级开关独立
+    limit_watch_report: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
