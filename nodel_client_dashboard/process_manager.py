@@ -79,6 +79,11 @@ class ManagedProcess:
         self._daemon_thread: threading.Thread | None = None
         self._poll_thread: threading.Thread | None = None
         self._stop_threads = threading.Event()
+        self.daemon_grant = None
+        self.dashboard_managed = False
+        self._grant_checked_at = 0.0
+        self._identity_conflict = False
+        self.grant_configuration = None
 
     @property
     def log_path(self) -> Path:
@@ -89,6 +94,7 @@ class ManagedProcess:
         return node_logs_dir(self.cfg)
 
     def start(self) -> None:
+        self.assert_identity()
         if not self._op_lock.acquire(blocking=False):
             return
         try:
@@ -123,10 +129,15 @@ class ManagedProcess:
             self.runtime.health = "error"
             self.runtime.last_error = str(e)
             self._notify()
+            if self.dashboard_managed:
+                raise
         finally:
             self._op_lock.release()
 
     def stop(self, *, graceful: bool = True) -> None:
+        data = self.assert_identity(require_current=self._proc is None and self.runtime.process_alive)
+        if data is not None:
+            self._apply_status_payload(data)
         if not self._op_lock.acquire(blocking=False):
             return
         try:
@@ -169,6 +180,9 @@ class ManagedProcess:
                         except subprocess.TimeoutExpired:
                             pass
                 elif pid and self._status_reachable(timeout=0.25):
+                    current = self._fetch_status(timeout=0.25) or {}
+                    if self.dashboard_managed and int(current.get("pid") or 0) != pid:
+                        raise RuntimeError("实例 PID 已变化，拒绝强制结束未知进程")
                     self._force_kill_pid(pid)
                 self._cleanup_proc()
                 self.runtime.process_alive = False
@@ -181,6 +195,8 @@ class ManagedProcess:
             self.runtime.busy = ""
             self.runtime.last_error = str(e)
             self._notify()
+            if self.dashboard_managed:
+                raise
         finally:
             self._op_lock.release()
 
@@ -240,10 +256,28 @@ class ManagedProcess:
                 "GET", f"http://127.0.0.1:{port}/status", timeout=timeout
             )
             if code == 200 and isinstance(data, dict):
+                if self.dashboard_managed and self.cfg.node_id:
+                    login = int(data.get("mt5_login") or 0)
+                    node_id = str(data.get("node_id") or "")
+                    self._identity_conflict = login != self.cfg.mt5_login or bool(node_id and node_id != str(self.cfg.node_id))
+                    if self._identity_conflict:
+                        self.runtime.health = "error"
+                        self.runtime.last_error = "本机状态端口属于其他 MT5 账号或节点，拒绝接管"
+                        return None
                 return data
         except (URLError, OSError, TimeoutError, json.JSONDecodeError):
             return None
         return None
+
+    def assert_identity(self, *, require_current: bool = False) -> dict | None:
+        if not self.dashboard_managed:
+            return None
+        data = self._fetch_status(timeout=0.3)
+        if self._identity_conflict:
+            raise RuntimeError("实例身份已变化，拒绝控制该进程，请管理员重新核对绑定")
+        if require_current and data is None:
+            raise RuntimeError("无法确认接管实例的当前身份，拒绝控制未知进程")
+        return data
 
     def _status_reachable(self, timeout: float = 0.4) -> bool:
         data = self._fetch_status(timeout=timeout)
@@ -297,12 +331,20 @@ class ManagedProcess:
                 pass
 
     def _spawn(self) -> None:
+        if self.dashboard_managed:
+            self.assert_identity()
+            from client_binding import require_binding
+            require_binding(self.cfg.exe_path)
+            if self.cfg.mt5_login <= 0 or not self.cfg.node_id:
+                raise RuntimeError("该实例尚未绑定后台节点与 MT5 账号")
         exe = Path(self.cfg.exe_path)
         cwd = Path(self.cfg.cwd or exe.parent)
         if not exe.exists():
             self.runtime.health = "error"
             self.runtime.last_error = f"可执行文件不存在: {exe}"
             self._notify()
+            if self.dashboard_managed:
+                raise RuntimeError("客户端文件不存在，未启动节点")
             return
         if self.cfg.status_port <= 0:
             used = set()
@@ -313,6 +355,8 @@ class ManagedProcess:
         env = os.environ.copy()
         env["LOCAL_STATUS_HOST"] = "127.0.0.1"
         env["LOCAL_STATUS_PORT"] = str(self.cfg.status_port)
+        if self.dashboard_managed:
+            env["DASHBOARD_EXPECTED_MT5_LOGIN"] = str(self.cfg.mt5_login)
         # 强制子进程 stdout 用 UTF-8，避免中文 Windows 控制台码页写进日志文件
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUTF8"] = "1"
@@ -351,6 +395,8 @@ class ManagedProcess:
             self.runtime.last_error = str(e)
             self._cleanup_proc()
             self._notify()
+            if self.dashboard_managed:
+                raise RuntimeError("无法创建客户端进程，未启动节点") from e
             return
 
         self._log_pump = threading.Thread(
@@ -463,7 +509,18 @@ class ManagedProcess:
                         (self._proc is None or self._proc.poll() is not None)
                         and not self._status_reachable()
                     ):
-                        self._spawn()
+                        if self.dashboard_managed:
+                            grant = self.daemon_grant
+                            configuration = (self.cfg.exe_path, self.cfg.cwd, str(self.cfg.node_id), self.cfg.mt5_login)
+                            if grant is not None and grant.node_id == str(self.cfg.node_id) and grant.mt5_login == self.cfg.mt5_login and self.grant_configuration == configuration:
+                                try:
+                                    grant.restart(self._spawn)
+                                except (RuntimeError, OSError):
+                                    self.runtime.health = "error"
+                                    self.runtime.last_error = "自动重启失败，请检查客户端文件与本机日志"
+                                    self._notify()
+                        else:
+                            self._spawn()
 
     def _poll_loop(self) -> None:
         while not self._stop_threads.is_set():
@@ -471,6 +528,12 @@ class ManagedProcess:
             self._stop_threads.wait(2.0)
 
     def _poll_once(self) -> None:
+        if self.daemon_grant is not None and time.monotonic() - self._grant_checked_at >= 30.0:
+            self._grant_checked_at = time.monotonic()
+            self.daemon_grant.check()
+            self.daemon_grant.flush()
+            if not self.daemon_grant.allowed:
+                self.cfg.daemon = False
         with self._lock:
             proc = self._proc
             port = self.cfg.status_port
@@ -521,53 +584,109 @@ class ManagedProcess:
 
 
 class ProcessManager:
-    def __init__(self, on_change: OnChange | None = None) -> None:
+    def __init__(self, on_change: OnChange | None = None, session=None) -> None:
         self._on_change = on_change or (lambda _id: None)
         self._items: dict[str, ManagedProcess] = {}
+        self.session = session
+        self._visible_ids: set[str] | None = None
+
+    def set_visible(self, instance_ids: set[str]) -> None:
+        self._visible_ids = set(instance_ids)
+
+    def _perform(self, action: str, mp, fn, params=None):
+        if self.session is None:
+            return fn()
+        return self.session.perform(action, mp.cfg if mp else None, fn, params=params)
 
     def load(self, configs: list[InstanceConfig]) -> None:
+        if self.session is not None:
+            from auth_service import DashboardAuthError
+            self.session.check()
+            if any(not self.session.owns(cfg) for cfg in configs):
+                raise DashboardAuthError("无权加载或接管该实例", status=403)
         for cfg in configs:
             if cfg.id not in self._items:
                 self._items[cfg.id] = ManagedProcess(cfg, on_change=self._on_change)
+            self._items[cfg.id].dashboard_managed = self.session is not None
+            if self.session is not None and cfg.backend_base and cfg.backend_base.rstrip("/") != self.session.api.base:
+                continue
+            if self.session is not None:
+                self.session.grant_for_recovery(self._items[cfg.id])
             self._items[cfg.id].recover()
 
     def configs(self) -> list[InstanceConfig]:
-        return [m.cfg for m in self._items.values()]
+        return [m.cfg for iid, m in self._items.items() if self._visible_ids is None or iid in self._visible_ids]
 
     def get(self, instance_id: str) -> ManagedProcess | None:
+        if self._visible_ids is not None and instance_id not in self._visible_ids:
+            return None
         return self._items.get(instance_id)
 
     def add(self, cfg: InstanceConfig) -> ManagedProcess:
+        if self.session is not None:
+            return self.session.perform("add_instance", cfg, lambda: self._add(cfg))
+        return self._add(cfg)
+
+    def _add(self, cfg: InstanceConfig) -> ManagedProcess:
         used = {m.cfg.status_port for m in self._items.values() if m.cfg.status_port > 0}
         if cfg.status_port <= 0 or cfg.status_port in used:
             from ports import allocate_ports
 
             cfg.status_port = allocate_ports(used, 1)[0]
         mp = ManagedProcess(cfg, on_change=self._on_change)
+        mp.dashboard_managed = self.session is not None
         self._items[cfg.id] = mp
+        if self._visible_ids is not None:
+            self._visible_ids.add(cfg.id)
         return mp
 
     def remove(self, instance_id: str) -> None:
-        mp = self._items.pop(instance_id, None)
+        mp = self.get(instance_id)
+        if mp is None:
+            return
+        return self._perform("remove_instance", mp, lambda: self._remove(instance_id))
+
+    def _remove(self, instance_id: str) -> None:
+        mp = self._items.get(instance_id)
         if mp is None:
             return
         mp.stop(graceful=True)
         mp.shutdown_workers()
+        self._items.pop(instance_id, None)
+        if self._visible_ids is not None:
+            self._visible_ids.discard(instance_id)
+
+    def set_daemon(self, instance_id: str, enabled: bool) -> None:
+        mp = self.get(instance_id)
+        if mp is None:
+            return
+        def execute():
+            if enabled and self.session is not None:
+                self.session.grant_for_recovery(mp)
+            mp.set_daemon(enabled)
+        self._perform("set_daemon", mp, execute, {"enabled": enabled})
 
     def start(self, instance_id: str) -> None:
-        mp = self._items.get(instance_id)
+        mp = self.get(instance_id)
         if mp:
-            mp.start()
+            def execute():
+                if self.session is not None:
+                    mp.assert_identity()
+                    self.session.prepare_start(mp)
+                mp.start()
+                if mp.runtime.last_error:
+                    raise RuntimeError("节点启动失败，请检查本机日志")
+            self._perform("start", mp, execute)
 
     def stop(self, instance_id: str) -> None:
-        mp = self._items.get(instance_id)
+        mp = self.get(instance_id)
         if mp:
-            mp.stop(graceful=True)
+            self._perform("stop", mp, lambda: mp.stop(graceful=True))
 
     def start_all(self) -> list[tuple[str, str, bool, str]]:
         """批量启动全部实例。返回 [(id, name, ok, message), ...]。"""
         results: list[tuple[str, str, bool, str]] = []
-        for mp in list(self._items.values()):
+        for mp in self._select(None):
             name = mp.cfg.name
             iid = mp.cfg.id
             try:
@@ -577,7 +696,7 @@ class ProcessManager:
                 if mp.runtime.process_alive or mp._status_reachable(timeout=0.3):
                     results.append((iid, name, True, "已在运行"))
                     continue
-                mp.start()
+                self.start(iid)
                 results.append((iid, name, True, "已启动"))
             except Exception as e:  # noqa: BLE001
                 results.append((iid, name, False, str(e)))
@@ -586,7 +705,7 @@ class ProcessManager:
     def stop_all(self) -> list[tuple[str, str, bool, str]]:
         """批量停止全部实例。返回 [(id, name, ok, message), ...]。"""
         results: list[tuple[str, str, bool, str]] = []
-        for mp in list(self._items.values()):
+        for mp in self._select(None):
             name = mp.cfg.name
             iid = mp.cfg.id
             try:
@@ -601,7 +720,7 @@ class ProcessManager:
                 if not alive:
                     results.append((iid, name, True, "已是停止状态"))
                     continue
-                mp.stop(graceful=True)
+                self.stop(iid)
                 results.append((iid, name, True, "已停止"))
             except Exception as e:  # noqa: BLE001
                 results.append((iid, name, False, str(e)))
@@ -613,21 +732,21 @@ class ProcessManager:
         label_on = "已开启守护"
         label_off = "已关闭守护"
         already = "已是开启" if enabled else "已是关闭"
-        for mp in list(self._items.values()):
+        for mp in self._select(None):
             name = mp.cfg.name
             iid = mp.cfg.id
             try:
                 if bool(mp.cfg.daemon) is bool(enabled):
                     results.append((iid, name, True, already))
                     continue
-                mp.set_daemon(enabled)
+                self.set_daemon(iid, enabled)
                 results.append((iid, name, True, label_on if enabled else label_off))
             except Exception as e:  # noqa: BLE001
                 results.append((iid, name, False, str(e)))
         return results
 
     def _select(self, instance_ids: list[str] | None) -> list[ManagedProcess]:
-        targets = list(self._items.values())
+        targets = [self._items[cfg.id] for cfg in self.configs()]
         if instance_ids is None:
             return targets
         id_set = set(instance_ids)
@@ -640,9 +759,15 @@ class ProcessManager:
         *,
         restart_if_was_running: bool,
         ok_label: str,
+        action: str = "update_client",
     ):
+        return self._perform(action, mp, lambda: self._swap_authorized(mp, apply_fn, restart_if_was_running=restart_if_was_running, ok_label=ok_label))
+
+    def _swap_authorized(self, mp, apply_fn, *, restart_if_was_running: bool, ok_label: str):
         """单实例的「停 → 覆盖 → 按需重启」流程；apply_fn 负责实际写文件。"""
         from client_deploy import ReplaceResult, read_version_near
+
+        mp.assert_identity()
 
         old_ver = read_version_near(mp.cfg.exe_path) or mp.runtime.version
         was_running = bool(
@@ -652,14 +777,21 @@ class ProcessManager:
         )
         if was_running:
             mp.stop(graceful=True)
+            if mp.dashboard_managed and (mp._status_reachable(timeout=0.3) or (mp._proc is not None and mp._proc.poll() is None)):
+                raise RuntimeError("节点仍在运行，已拒绝替换客户端文件")
             # 等文件句柄释放（Windows 上正在运行的 exe 无法覆盖）
             time.sleep(0.4)
 
+        if self.session is not None:
+            self.session.check()
         ok, msg = apply_fn(Path(mp.cfg.exe_path))
         restarted = False
         if ok:
             mp._refresh_file_version()
-            if was_running and restart_if_was_running:
+            if was_running and restart_if_was_running and (self.session is None or (mp.cfg.approval_status == "approved" and mp.cfg.enabled)):
+                if self.session is not None:
+                    self.session.check()
+                    self.session.prepare_start(mp)
                 mp.start()
                 restarted = True
         result = ReplaceResult(
@@ -700,6 +832,9 @@ class ProcessManager:
         from client_deploy import replace_exe_file
 
         src = Path(source_exe)
+        if self.session is not None:
+            from client_binding import require_binding
+            require_binding(src)
         results = []
         for mp in self._select(instance_ids):
             if mp.runtime.busy:
@@ -713,8 +848,11 @@ class ProcessManager:
                     ),
                     restart_if_was_running=restart_if_was_running,
                     ok_label="已替换",
+                    action="replace_client",
                 )
             )
+            if not results[-1].ok:
+                break
         return results
 
     def batch_update(
@@ -732,6 +870,9 @@ class ProcessManager:
         from client_deploy import apply_package
 
         src = Path(package_dir)
+        if self.session is not None:
+            from client_binding import require_binding
+            require_binding(src / "node_client.exe")
         results = []
         for mp in self._select(instance_ids):
             if mp.runtime.busy:
@@ -745,6 +886,8 @@ class ProcessManager:
                     ok_label="已更新",
                 )
             )
+            if not results[-1].ok:
+                break
         return results
 
     def batch_rollback(
@@ -762,14 +905,21 @@ class ProcessManager:
             if mp.runtime.busy:
                 results.append(self._busy_skip(mp))
                 continue
+            if self.session is not None:
+                from client_binding import require_binding
+                from client_deploy import backup_dir_for
+                require_binding(backup_dir_for(mp.cfg.exe_path, version) / Path(mp.cfg.exe_path).name)
             results.append(
                 self._swap(
                     mp,
                     lambda target: restore_backup(target, version),
                     restart_if_was_running=restart_if_was_running,
                     ok_label=f"已回滚到 {version}",
+                    action="rollback_client",
                 )
             )
+            if not results[-1].ok:
+                break
         return results
 
     def shutdown_all(self) -> None:

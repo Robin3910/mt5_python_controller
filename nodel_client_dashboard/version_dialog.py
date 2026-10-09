@@ -1,7 +1,6 @@
 """客户端版本更新对话框：检测后端版本、批量更新、指定版本、本机回滚。
 
-后端地址与 NODE_TOKEN 可以在这里手工填写并保存到 panel_config.json；留空时会自动
-从各实例工作目录下的 node_client .env 里读取（见 version_service.resolve_backend）。
+所有查询与下载使用当前用户会话；连接配置由主窗口管理员入口维护。
 
 所有涉及文件替换的动作都在后台线程执行，主线程只负责渲染与二次确认。
 """
@@ -27,6 +26,7 @@ from client_deploy import (
 from dialog_window import hide_while_building, show_centered
 from process_manager import ProcessManager
 from store import load_panel_config, save_panel_config
+from session_ui import SessionDialog, secured
 from theme import (
     ACCENT,
     BG,
@@ -98,7 +98,7 @@ class _Row:
         self.verdict.configure(text=update_label(kind), text_color=color)
 
 
-class VersionUpdateDialog(ctk.CTkToplevel):
+class VersionUpdateDialog(SessionDialog):
     """版本检测 / 批量更新 / 降级 / 本机回滚。"""
 
     _W = 860
@@ -120,7 +120,7 @@ class VersionUpdateDialog(ctk.CTkToplevel):
 
         cfg = load_panel_config()
         self.base_var = tk.StringVar(value=str(cfg.get("backend_base") or ""))
-        self.token_var = tk.StringVar(value=str(cfg.get("node_token") or ""))
+        self.token_var = tk.StringVar(value="（使用用户登录，不需要节点令牌）")
 
         self._build()
         self._bind_rows()
@@ -145,25 +145,16 @@ class VersionUpdateDialog(ctk.CTkToplevel):
         ctk.CTkLabel(conn, text="后端地址", text_color=TEXT_MUTED, font=font(12)).grid(
             row=1, column=0, padx=16, pady=6, sticky="w"
         )
-        ctk.CTkEntry(
-            conn, textvariable=self.base_var, fg_color=BG_ELEVATED,
-            border_color=GLASS_BORDER, text_color=TEXT, height=34, corner_radius=10,
-            placeholder_text="http://159.75.33.185（留空则读实例 .env）",
-        ).grid(row=1, column=1, columnspan=2, padx=(8, 16), pady=6, sticky="ew")
+        ctk.CTkLabel(conn, text=self.session.api.base, text_color=TEXT, anchor="w").grid(row=1, column=1, columnspan=2, padx=(8, 16), pady=6, sticky="ew")
 
-        ctk.CTkLabel(conn, text="节点令牌", text_color=TEXT_MUTED, font=font(12)).grid(
+        ctk.CTkLabel(conn, text="登录身份", text_color=TEXT_MUTED, font=font(12)).grid(
             row=2, column=0, padx=16, pady=6, sticky="w"
         )
-        ctk.CTkEntry(
-            conn, textvariable=self.token_var, fg_color=BG_ELEVATED,
-            border_color=GLASS_BORDER, text_color=TEXT, height=34, corner_radius=10,
-            show="*", placeholder_text="NODE_TOKEN（留空则读实例 .env）",
-        ).grid(row=2, column=1, columnspan=2, padx=(8, 16), pady=6, sticky="ew")
+        ctk.CTkLabel(conn, text=str(self.session.principal.get("username") or "") + "（用户权限验证）", text_color=TEXT, anchor="w").grid(row=2, column=1, columnspan=2, padx=(8, 16), pady=6, sticky="ew")
 
         actions = ctk.CTkFrame(conn, fg_color="transparent")
         actions.grid(row=3, column=0, columnspan=3, padx=12, pady=(6, 14), sticky="ew")
         primary_btn(actions, "检测更新", self._detect, width=110).pack(side="left", padx=4)
-        ghost_btn(actions, "保存连接配置", self._save_config, width=130).pack(side="left", padx=4)
         self.status = ctk.CTkLabel(
             actions, text="尚未检测", text_color=TEXT_DIM, font=font(12), anchor="w"
         )
@@ -255,26 +246,20 @@ class VersionUpdateDialog(ctk.CTkToplevel):
 
     def _autofill_from_env(self) -> None:
         """地址/令牌留空时，用实例 .env 里的值把输入框填上，让用户看得见来源。"""
-        target = self._target()
-        if not self.base_var.get().strip() and target.base:
-            self.base_var.set(target.base)
-        if not self.token_var.get().strip() and target.token:
-            self.token_var.set(target.token)
+        self.base_var.set(self.session.api.base)
 
     def _target(self) -> vs.BackendTarget:
-        cfg = {
-            "backend_base": self.base_var.get().strip(),
-            "node_token": self.token_var.get().strip(),
-        }
-        cwds = [c.cwd or str(Path(c.exe_path).parent) for c in self.manager.configs()]
-        return vs.resolve_backend(cfg, cwds)
+        return self.version_target()
 
+    @secured("save_connection")
     def _save_config(self) -> None:
+        if not self.session.is_admin:
+            raise RuntimeError("连接配置仅管理员可修改")
         save_panel_config({
             "backend_base": self.base_var.get().strip().rstrip("/"),
-            "node_token": self.token_var.get().strip(),
         })
         self.status.configure(text="连接配置已保存", text_color=ACCENT)
+        self.session.lock("连接地址已修改，请重新登录", clear_token=True)
 
     # ---------------------------------------------------------------- 动作
 
@@ -284,6 +269,7 @@ class VersionUpdateDialog(ctk.CTkToplevel):
             self.status.configure(text=text, text_color=TEXT_MUTED)
 
     def _run_async(self, label: str, fn) -> None:
+        self.session_check()
         if self._busy:
             messagebox.showinfo("请稍候", "上一个操作还在进行中", parent=self)
             return
@@ -291,6 +277,8 @@ class VersionUpdateDialog(ctk.CTkToplevel):
 
         def worker():
             try:
+                self.session._local.generation = self._session_generation
+                self.session_check()
                 fn()
             # 必须先取出消息：except 块结束时 e 会被解绑，延迟执行的 lambda 里读不到它
             except vs.VersionServiceError as e:
@@ -300,6 +288,7 @@ class VersionUpdateDialog(ctk.CTkToplevel):
                 msg = str(e)
                 self.after(0, lambda: messagebox.showerror(label, msg, parent=self))
             finally:
+                self.session._local.generation = None
                 self.after(0, lambda: self._set_busy(False))
                 self.after(0, self._refresh_rows)
                 if self._on_done:
@@ -375,6 +364,7 @@ class VersionUpdateDialog(ctk.CTkToplevel):
             ok, msg = extract_package(pkg, extract_dir)
             if not ok:
                 raise RuntimeError(msg)
+            self.session_check()
 
             self.after(0, lambda: self.status.configure(
                 text=f"正在更新 {len(ids)} 个实例…", text_color=TEXT_MUTED

@@ -371,4 +371,58 @@ async def init_db() -> None:
         await conn.run_sync(_migrate_node_client_version)
         await conn.run_sync(_migrate_user_rbac_columns)
         await conn.run_sync(_migrate_owner_columns)
+        await conn.run_sync(_migrate_dashboard_columns)
+        await conn.run_sync(_migrate_node_credentials)
     logger.info("Database initialized (%s)", engine.url.render_as_string(hide_password=True))
+
+
+def _migrate_dashboard_columns(sync_conn) -> None:
+    """保留存量节点启用状态；专属凭证另表由 create_all 创建。"""
+    inspector = inspect(sync_conn)
+    tables = set(inspector.get_table_names())
+    additions = {
+        "nodes": {
+            "approval_status": "VARCHAR(16) NOT NULL DEFAULT 'approved'",
+            "requested_by_user_id": "INTEGER",
+            "admin_enable_requested": "BOOLEAN NOT NULL DEFAULT 0",
+        },
+        "audit_log": {"request_key": "VARCHAR(128)", "actor_user_id": "INTEGER"},
+    }
+    for table, columns in additions.items():
+        if table not in tables:
+            continue
+        existing = {c["name"] for c in inspector.get_columns(table)}
+        for column, definition in columns.items():
+            if column not in existing:
+                sync_conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {definition}"))
+    if "audit_log" in tables:
+        inspector = inspect(sync_conn)
+        unique_columns = {tuple(i["column_names"]) for i in inspector.get_indexes("audit_log") if i.get("unique")}
+        unique_columns.update(tuple(c["column_names"]) for c in inspector.get_unique_constraints("audit_log"))
+        if ("request_key",) not in unique_columns:
+            sync_conn.execute(text("CREATE UNIQUE INDEX uq_audit_dashboard_request ON audit_log (request_key)"))
+
+
+def _migrate_node_credentials(sync_conn) -> None:
+    """为本功能迭代中的独立凭证表补所属快照；不触碰 nodes 的旧令牌迁移。"""
+    inspector = inspect(sync_conn)
+    tables = set(inspector.get_table_names())
+    if "node_credentials" not in tables:
+        return
+    columns = {c["name"] for c in inspector.get_columns("node_credentials")}
+    if "owner_user_id" not in columns:
+        sync_conn.execute(text("ALTER TABLE node_credentials ADD COLUMN owner_user_id INTEGER"))
+        sync_conn.execute(text(
+            "UPDATE node_credentials SET owner_user_id = "
+            "(SELECT owner_user_id FROM nodes WHERE nodes.node_id = node_credentials.node_id)"
+        ))
+    # 未部署版本曾使用单数表名；保留数据并幂等拷贝，不做丢表操作。
+    if "node_credential" in tables:
+        old_cols = {c["name"] for c in inspector.get_columns("node_credential")}
+        owner_expr = "old.owner_user_id" if "owner_user_id" in old_cols else "n.owner_user_id"
+        sync_conn.execute(text(
+            "INSERT INTO node_credentials (node_id, token_sha256, generation, legacy_allowed, owner_user_id) "
+            f"SELECT old.node_id, old.token_sha256, old.generation, old.legacy_allowed, {owner_expr} "
+            "FROM node_credential old JOIN nodes n ON n.node_id = old.node_id "
+            "WHERE NOT EXISTS (SELECT 1 FROM node_credentials fresh WHERE fresh.node_id = old.node_id)"
+        ))

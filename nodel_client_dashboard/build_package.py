@@ -6,13 +6,16 @@
 自动安装通道，是给人手工解压用的，所以内部**带一层 `node_client_dashboard-<版本>/`
 目录**，解压时不会把文件铺一地。
 
-**面板的运行期数据绝不入包**：`panel_config.json` 存着 NODE_TOKEN，`instances.json`
-记录本机每个实例的绝对路径，两者都写在 exe 同目录（也就是 `dist\\`）—— 开发机上只要
-在 `dist\\` 里跑过一次面板就会生成它们，跟着打进分发包等于把令牌和本机拓扑一起发出去。
-改这里的排除规则前先想清楚这一点。
+打包时把面板源码目录的 `.env`（`APP_URL`）复制到产物目录，并打进压缩包，
+解压后与 exe 同目录，登录从这里读后端地址。
+
+**面板的运行期数据绝不入包**：实例清单、面板配置、日志、备份、
+脱敏审计补传队列及其原子写入临时文件均排除。密码、JWT 与守护令牌从不落盘。
+节点目录里的 `.env` 不在本产物树中，也不会入包。
 """
 from __future__ import annotations
 
+import shutil
 import sys
 import zipfile
 from pathlib import Path
@@ -21,21 +24,38 @@ from pathlib import Path
 ENTRY_NAME = "node_client_dashboard.exe"
 
 # 绝不入包的文件名（小写比较）
-# panel_config.json：后端地址与 NODE_TOKEN；instances.json：本机实例清单与路径
+# panel_config.json：上次用户名与旧令牌；instances.json：本机实例清单与路径
+# 根目录 .env 是面板 APP_URL，由 copy_dashboard_env 写入后再入包，不在此列
 EXCLUDE_NAMES = frozenset({
     "panel_config.json",
+    "panel_config.json.tmp",
     "instances.json",
+    "instances.json.tmp",
     ".dashboard.lock",
+    "audit_results.json",
+    "audit_results.json.tmp",
+    "daemon_events.json",
+    "daemon_events.json.tmp",
 })
 
 # 绝不入包的目录名（运行日志、Python 缓存）
-EXCLUDE_DIRS = frozenset({"logs", "__pycache__"})
+EXCLUDE_DIRS = frozenset({"logs", "__pycache__", ".backups"})
 
 # 绝不入包的后缀（替换时留下的备份、日志）
 EXCLUDE_SUFFIXES = frozenset({".bak", ".pyc", ".log"})
 
 # 随包附带的说明文档
 DOC_NAME = "README.md"
+
+
+def _is_dashboard_env(parts: list[str]) -> bool:
+    """仅产物根目录的面板 .env 入包。压缩包成员多一层版本目录，同样算根上的那一份。"""
+    if not parts or parts[-1].lower() != ".env":
+        return False
+    parents = parts[:-1]
+    if not parents:
+        return True
+    return len(parents) == 1 and parents[0].lower().startswith("node_client_dashboard-")
 
 
 def should_include(rel_path: str) -> bool:
@@ -46,7 +66,11 @@ def should_include(rel_path: str) -> bool:
     if any(p.lower() in EXCLUDE_DIRS for p in parts[:-1]):
         return False
     name = parts[-1]
+    if name.lower() == ".env":
+        return _is_dashboard_env(parts)
     if name.lower() in EXCLUDE_NAMES:
+        return False
+    if name.lower().startswith(".env.") and name.lower() != ".env.example":
         return False
     return Path(name).suffix.lower() not in EXCLUDE_SUFFIXES
 
@@ -92,19 +116,36 @@ def verify_package(zip_path: Path) -> tuple[bool, str]:
     lowered = {Path(n.replace("\\", "/")).name.lower() for n in names}
     if ENTRY_NAME not in lowered:
         return False, f"{ENTRY_NAME} missing from package"
-    leaked = sorted(EXCLUDE_NAMES & lowered)
+    leaked = sorted(n for n in names if not should_include(n.replace("\\", "/")))
     if leaked:
         return False, f"package must not contain {', '.join(leaked)}"
     return True, ""
 
 
-def build_package(root: Path, out_dir: Path, *, doc: Path | None = None) -> Path:
-    """把产物目录打成 zip（内部带一层版本目录），返回产物路径。"""
+def copy_dashboard_env(source: Path, dest_dir: Path) -> Path:
+    """把面板 .env 复制到产物目录，登录从 exe 同目录读取 APP_URL。"""
+    source = Path(source)
+    if not source.is_file():
+        raise FileNotFoundError(f"dashboard .env not found: {source}")
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / ".env"
+    shutil.copyfile(source, dest)
+    return dest
+
+
+def build_package(root: Path, out_dir: Path, *, doc: Path | None = None, env_file: Path | None = None) -> Path:
+    """把产物目录打成 zip（内部带一层版本目录），返回产物路径。
+
+    ``env_file`` 给定时，先覆盖复制到产物目录根，再打进压缩包。
+    """
     root = root.resolve()
     out_dir = out_dir.resolve()
     # 输出目录若在产物目录内部，下一次构建会把上一次的 zip 当成产物文件收进包里
     if out_dir == root or root in out_dir.parents:
         raise ValueError(f"output dir must be outside the build dir: {out_dir}")
+    if env_file is not None:
+        copy_dashboard_env(env_file, root)
 
     version = read_version(root)
     if not version:
@@ -145,9 +186,10 @@ def main(argv: list[str]) -> int:
         return 1
     out_dir = Path(argv[1]) if len(argv) > 1 else root.parent
     doc = Path(__file__).resolve().parent / DOC_NAME
+    env_file = Path(__file__).resolve().parent / ".env"
 
     try:
-        zip_path = build_package(root, out_dir, doc=doc)
+        zip_path = build_package(root, out_dir, doc=doc, env_file=env_file)
     except (OSError, RuntimeError, FileNotFoundError, ValueError) as e:
         print(f"Packaging failed: {e}", file=sys.stderr)
         return 1

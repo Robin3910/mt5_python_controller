@@ -38,6 +38,15 @@ class InstanceConfig:
     daemon: bool = False
     restart_delay_s: float = 5.0
     enabled: bool = True
+    node_id: str | None = None
+    mt5_login: int = 0
+    owner_user_id: int | None = None
+    requested_by_user_id: int | None = None
+    approval_status: str = "unbound"
+    credential_generation: int = 0
+    legacy_allowed: bool = False
+    has_credential: bool = False
+    backend_base: str = ""
 
     @classmethod
     def create(
@@ -82,6 +91,15 @@ class InstanceConfig:
             daemon=bool(data.get("daemon")),
             restart_delay_s=float(data.get("restart_delay_s") or 5.0),
             enabled=bool(data.get("enabled", True)),
+            node_id=str(data["node_id"]) if data.get("node_id") else None,
+            mt5_login=int(data.get("mt5_login") or 0),
+            owner_user_id=data.get("owner_user_id"),
+            requested_by_user_id=data.get("requested_by_user_id"),
+            approval_status=str(data.get("approval_status") or "unbound"),
+            credential_generation=int(data.get("credential_generation") or 0),
+            legacy_allowed=bool(data.get("legacy_allowed", False)),
+            has_credential=bool(data.get("has_credential", False)),
+            backend_base=str(data.get("backend_base") or ""),
         )
 
 
@@ -92,7 +110,7 @@ class RuntimeState:
     process_alive: bool = False
     health: str = "unknown"  # unknown|starting|ok|dead|error
     ws_state: str | None = None
-    node_id: int | None = None
+    node_id: str | None = None
     mt5_login: int | None = None
     runners: list[dict[str, Any]] = field(default_factory=list)
     last_error: str = ""

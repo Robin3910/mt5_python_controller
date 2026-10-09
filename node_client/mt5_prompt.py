@@ -4,6 +4,24 @@ from config import get_settings
 from mt5_discover import discover_mt5_terminal
 
 
+def require_dashboard_account(account: dict | None, expected: int | None) -> None:
+    """面板启动的账户绑定必须读取到真实正整数账号，缺失时不允许继续。"""
+    if expected is None:
+        return
+    from mt5_client import MT5Error
+
+    raw = (account or {}).get("login")
+    if isinstance(raw, bool) or not isinstance(raw, (int, str)) or not str(raw).isdigit():
+        raise MT5Error("面板启动失败：MT5 终端未登录或无法读取账号，请先登录已绑定账号")
+    actual = int(raw)
+    if actual <= 0:
+        raise MT5Error("面板启动失败：MT5 终端未登录或无法读取账号，请先登录已绑定账号")
+    if actual != expected:
+        raise MT5Error(
+            f"面板启动失败：终端当前账号 {actual} 与已授权账号 {expected} 不符，请切回正确账号"
+        )
+
+
 def prompt_mt5_credentials() -> dict[str, str | int | bool]:
     """采集 MT5 连接参数。
 
@@ -12,7 +30,9 @@ def prompt_mt5_credentials() -> dict[str, str | int | bool]:
       未登录再交互输入三者并在后续 connect 时执行 mt5.login。
     """
     settings = get_settings()
+    expected = getattr(settings, "dashboard_expected_mt5_login", None)
     if settings.mt5_mock:
+        require_dashboard_account({"login": 90000001}, expected)
         print("MT5_MOCK=true，跳过登录输入，使用模拟账户")
         return {
             "mt5_login": 90000001,
@@ -32,6 +52,8 @@ def prompt_mt5_credentials() -> dict[str, str | int | bool]:
     except MT5Error as e:
         raise MT5Error(f"无法连接 MT5 终端：{e}") from e
 
+    # 后台面板不弹交互登录，也不把已授权账号替换为终端当前账号。
+    require_dashboard_account(session, expected)
     if session:
         login = session["login"]
         server = session["server"] or ""

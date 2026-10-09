@@ -3,7 +3,8 @@
 // 普通用户只看到管理员分配给自己的节点，只能改名、启停；新建、删除与按币种配置仅管理员
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessageBox } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import 'element-plus/es/components/message/style/css'
 import 'element-plus/es/components/message-box/style/css'
 import FormLabel from '@/components/FormLabel.vue'
 import TagSelect from '@/components/TagSelect.vue'
@@ -15,6 +16,7 @@ import { useHubStore } from '@/stores/hub'
 import type { NodeDispatchFiltersConfig, NodeOut } from '@/api/types'
 import { parseFilterRules, parseNodeDispatchFilters, serializeNodeDispatchFilters, validateNodeDispatchFilters, validateNodeGlobalLotMode } from '@/utils/filterRules'
 import { confirmAction } from '@/utils/confirm'
+import { isPendingNode, nodeApprovalHint, nodeEnableIntent, nodeEnableLabel } from '@/utils/nodeApproval'
 
 const hub = useHubStore()
 
@@ -64,6 +66,7 @@ function goDetail(n: NodeOut): void {
 const showForm = ref(false)
 const formMode = ref<'create' | 'edit'>('create')
 const editingId = ref('')
+const editingNode = computed(() => hub.nodes.find((n) => n.node_id === editingId.value))
 const saving = ref(false)
 const createError = ref('')
 
@@ -170,7 +173,7 @@ function openEdit(n: NodeOut): void {
   Object.assign(form, {
     name: n.name,
     mt5_login: n.mt5_login,
-    enabled: n.enabled,
+    enabled: nodeEnableIntent(n),
     filters: parseNodeDispatchFilters(n.filters),
   })
   showForm.value = true
@@ -183,7 +186,10 @@ async function saveOwnNode(): Promise<void> {
   const enabledText = form.enabled ? '启用' : '禁用'
   if (!(await confirmAction(`确认更新节点「${label}」？\n\n启用状态：${enabledText}`))) return
   try {
-    await hub.updateNode(editingId.value, { name: form.name, enabled: form.enabled }, currentSearchOptions())
+    await hub.updateNode(editingId.value, {
+      name: form.name,
+      ...(editingNode.value && isPendingNode(editingNode.value) ? {} : { enabled: form.enabled }),
+    }, currentSearchOptions())
     showForm.value = false
   } catch (e: unknown) {
     const err = e as { response?: { data?: { detail?: string } } }
@@ -263,15 +269,30 @@ async function save(): Promise<void> {
   }
 }
 
+function errText(e: unknown, fallback: string): string {
+  const err = e as { response?: { data?: { detail?: unknown } } }
+  const detail = err.response?.data?.detail
+  return typeof detail === 'string' && detail ? detail : fallback
+}
+
 async function remove(n: NodeOut): Promise<void> {
   if (!(await confirmAction(`确认删除节点「${n.name}」？\n\n该操作不可恢复。`, '确认删除'))) return
-  await hub.deleteNode(n.node_id, currentSearchOptions())
+  try {
+    await hub.deleteNode(n.node_id, currentSearchOptions())
+  } catch (e: unknown) {
+    ElMessage.error(errText(e, '删除失败，请稍后重试'))
+  }
 }
 
 async function toggleEnabled(n: NodeOut): Promise<void> {
-  const next = n.enabled ? '禁用' : '启用'
-  if (!(await confirmAction(`确认${next}节点「${n.name}」？\n\n${next}后将${n.enabled ? '无法接入且不参与分发' : '恢复正常跟单'}。`))) return
-  await hub.updateNode(n.node_id, { enabled: !n.enabled }, currentSearchOptions())
+  if (isPendingNode(n) && !auth.isAdmin) return
+  const current = nodeEnableIntent(n)
+  const next = current ? '禁用' : '启用'
+  const hint = isPendingNode(n)
+    ? '确认启用与分配给申请人两项齐全后才会开通；操作顺序不限。'
+    : `${next}后将${current ? '无法接入且不参与分发' : '恢复正常跟单'}。`
+  if (!(await confirmAction(`确认${next}节点「${n.name}」？\n\n${hint}`))) return
+  await hub.updateNode(n.node_id, { enabled: !current }, currentSearchOptions())
 }
 </script>
 
@@ -343,12 +364,13 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
       <div class="list-field"><span class="k">MT5 账号</span><span class="v">{{ n.mt5_login || '—' }}</span></div>
       <div class="list-field"><span class="k">MT5 服务器</span><span class="v">{{ n.mt5_server || '—' }}</span></div>
       <div v-if="auth.isAdmin" class="list-field"><span class="k">所有者</span><span class="v">{{ n.owner_username || '管理员' }}</span></div>
+      <div v-if="isPendingNode(n)" class="list-field"><span class="k">开通</span><span class="v">{{ nodeApprovalHint(n) }}</span></div>
       <div class="list-field"><span class="k">分发配置</span><span class="v muted">{{ filterSymbolCount(n) }}</span></div>
       <div class="list-field">
         <span class="k">启用</span>
         <span class="v">
-          <button class="btn-sm" :class="n.enabled ? 'btn-ghost' : 'btn-danger'" @click="toggleEnabled(n)">
-            {{ n.enabled ? '已启用' : '已禁用' }}
+          <button class="btn-sm" :class="nodeEnableIntent(n) ? 'btn-ghost' : 'btn-danger'" :disabled="isPendingNode(n) && !auth.isAdmin" @click="toggleEnabled(n)">
+            {{ nodeEnableLabel(n) }}
           </button>
         </span>
       </div>
@@ -390,13 +412,14 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
           <td>
             <a class="node-link" @click="goDetail(n)">{{ n.name }}</a>
             <div class="muted" style="font-size: 11px">{{ n.node_id }}</div>
+            <div v-if="isPendingNode(n)" class="muted" style="font-size: 12px; margin-top: 4px">{{ nodeApprovalHint(n) }}</div>
           </td>
           <td class="muted" style="font-size: 12px">{{ n.mt5_login || '—' }}<br />{{ n.mt5_server || '' }}</td>
           <td v-if="auth.isAdmin" style="font-size: 12px">{{ n.owner_username || '管理员' }}</td>
           <td class="muted" style="font-size: 12px">{{ filterSymbolCount(n) }}</td>
           <td>
-            <button class="btn-sm" :class="n.enabled ? 'btn-ghost' : 'btn-danger'" @click="toggleEnabled(n)">
-              {{ n.enabled ? '已启用' : '已禁用' }}
+            <button class="btn-sm" :class="nodeEnableIntent(n) ? 'btn-ghost' : 'btn-danger'" :disabled="isPendingNode(n) && !auth.isAdmin" @click="toggleEnabled(n)">
+              {{ nodeEnableLabel(n) }}
             </button>
           </td>
           <td class="right">
@@ -440,7 +463,8 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
           </div>
           <div v-if="formMode === 'edit'">
             <FormLabel field-id="node-enabled" text="启用状态" :help="NODE_FORM_FIELD_HELP.enabled" />
-            <TagSelect id="node-enabled" v-model="form.enabled" :options="ENABLED_TAGS" aria-label="启用状态" />
+            <TagSelect v-if="!editingNode || !isPendingNode(editingNode) || auth.isAdmin" id="node-enabled" v-model="form.enabled" :options="ENABLED_TAGS" aria-label="启用状态" />
+            <p v-if="editingNode && isPendingNode(editingNode)" class="muted" style="font-size: 12px; margin: 6px 0 0">{{ nodeApprovalHint(editingNode) }}</p>
           </div>
           <div v-if="auth.isAdmin" class="span-full">
             <FormLabel text="按币种配置" :help="NODE_FORM_FIELD_HELP.filters" />

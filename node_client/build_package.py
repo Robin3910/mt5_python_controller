@@ -4,19 +4,22 @@
 
 只由 `build_exe*.bat` 在打包末尾调用。zip 内部是**相对客户端目录的文件树**，与
 后端 `client_version.validate_package` 和面板 `apply_package` 的口径一致：onefile
-形态是 `node_client.exe` + `version.txt`，onedir 形态是整棵目录树。
+形态是 `node_client.exe` + `version.txt` + `client_capabilities.json`，onedir 形态是整棵目录树。
 
 `.env` 绝不入包 —— 它承载 NODE_TOKEN 与 MT5 账号，而安装包会上传到后端，任何持有
 节点令牌的机器都能下载。改这里的排除规则前先想清楚这一点。
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import sys
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 # 主程序名；缺它后端会拒收整个包
 ENTRY_NAME = "node_client.exe"
+CAPABILITIES_NAME = "client_capabilities.json"
 
 # 随包附带的配置模板：面板导入新节点时用它生成 .env，用户才能看到完整的中文说明
 TEMPLATE_NAME = ".env.example"
@@ -67,21 +70,57 @@ def read_version(root: Path) -> str:
     return text.splitlines()[0].strip() if text else ""
 
 
+def write_capabilities(root: Path) -> Path:
+    """exe 构建完成后生成能力清单；重打时重新计算，不能沿用旧产物的哈希。"""
+    digest = hashlib.sha256()
+    with (root / ENTRY_NAME).open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    path = root / CAPABILITIES_NAME
+    path.write_text(
+        json.dumps({"account_binding": True, "executable_sha256": digest.hexdigest()}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def verify_package(zip_path: Path) -> tuple[bool, str]:
-    """自检刚打出的包：必须含主程序，且绝不能含 .env。
+    """自检刚打出的包：含主程序、绑定能力与匹配哈希，且绝不能含 .env。
 
     放在构建期而不是上传期，是为了让打包失误当场暴露 —— 上传后才发现 .env 泄露
     就已经晚了。
     """
     with zipfile.ZipFile(zip_path) as zf:
         names = [n for n in zf.namelist() if not n.endswith("/")]
-    if not names:
-        return False, "package is empty"
-    lowered = {Path(n.replace("\\", "/")).name.lower() for n in names}
-    if ENTRY_NAME not in lowered:
-        return False, f"{ENTRY_NAME} missing from package"
-    if EXCLUDE_NAMES & lowered:
-        return False, "package must not contain .env"
+        if not names:
+            return False, "package is empty"
+        lowered = {PurePosixPath(n.replace("\\", "/")).name.lower() for n in names}
+        entries = [n for n in names if PurePosixPath(n.replace("\\", "/")).name.lower() == ENTRY_NAME]
+        if len(entries) != 1:
+            return False, f"exactly one {ENTRY_NAME} required in package"
+        if EXCLUDE_NAMES & lowered:
+            return False, "package must not contain .env"
+        entry = entries[0]
+        parent = PurePosixPath(entry.replace("\\", "/")).parent
+        manifests = [
+            n for n in names
+            if PurePosixPath(n.replace("\\", "/")).parent == parent
+            and PurePosixPath(n.replace("\\", "/")).name.lower() == CAPABILITIES_NAME
+        ]
+        if len(manifests) != 1:
+            return False, f"{CAPABILITIES_NAME} missing beside {ENTRY_NAME}"
+        try:
+            manifest = json.loads(zf.read(manifests[0]).decode("utf-8-sig"))
+        except (ValueError, UnicodeError):
+            return False, f"invalid {CAPABILITIES_NAME}"
+        if not isinstance(manifest, dict) or manifest.get("account_binding") is not True:
+            return False, "package must support account_binding"
+        digest = hashlib.sha256()
+        with zf.open(entry) as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                digest.update(chunk)
+        if manifest.get("executable_sha256") != digest.hexdigest():
+            return False, "executable_sha256 mismatch"
     return True, ""
 
 
@@ -97,9 +136,10 @@ def build_package(root: Path, out_dir: Path, *, template: Path | None = None) ->
     if not version:
         raise FileNotFoundError(f"version.txt not found in {root}, run build_version.py first")
 
-    files = collect_files(root)
-    if not any(p.name.lower() == ENTRY_NAME for p in files):
+    if not (root / ENTRY_NAME).is_file():
         raise FileNotFoundError(f"{ENTRY_NAME} not found in {root}")
+    write_capabilities(root)
+    files = collect_files(root)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     zip_path = out_dir / package_name(version)

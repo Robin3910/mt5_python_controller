@@ -1,4 +1,6 @@
 """构建期打包测试：安装包结构与 .env 排除。"""
+import hashlib
+import json
 import zipfile
 from pathlib import Path
 
@@ -23,6 +25,7 @@ def test_should_include_excludes_env_and_noise():
     assert bp.should_include("version.txt")
     assert bp.should_include("_internal/base_library.zip")
     assert bp.should_include(".env.example")
+    assert bp.should_include("client_capabilities.json")
 
     # 节点身份，绝不入包
     assert not bp.should_include(".env")
@@ -43,6 +46,7 @@ def test_build_package_excludes_env_and_keeps_entry(tmp_path: Path):
         names = set(zf.namelist())
     assert "node_client.exe" in names
     assert "version.txt" in names
+    assert "client_capabilities.json" in names
     # 真实令牌绝不能被打进上传到后端的包里
     assert ".env" not in names
     assert not any(n.endswith("/.env") for n in names)
@@ -131,6 +135,9 @@ def test_verify_package_rejects_env_and_missing_entry(tmp_path: Path):
     good = tmp_path / "good.zip"
     with zipfile.ZipFile(good, "w") as zf:
         zf.writestr("node_client.exe", b"MZ")
+        zf.writestr("client_capabilities.json", json.dumps({
+            "account_binding": True, "executable_sha256": hashlib.sha256(b"MZ").hexdigest(),
+        }))
     assert bp.verify_package(good) == (True, "")
 
     leaked = tmp_path / "leaked.zip"
@@ -145,6 +152,37 @@ def test_verify_package_rejects_env_and_missing_entry(tmp_path: Path):
         zf.writestr("readme.txt", "hi")
     ok, reason = bp.verify_package(no_entry)
     assert not ok and "node_client.exe" in reason
+
+
+def test_build_package_generates_manifest_matching_current_executable(tmp_path: Path):
+    root = _onefile_build(tmp_path)
+    (root / bp.CAPABILITIES_NAME).write_text('{"account_binding": false}', encoding="utf-8")
+    zip_path = bp.build_package(root, tmp_path / "out")
+    with zipfile.ZipFile(zip_path) as zf:
+        manifest = json.loads(zf.read(bp.CAPABILITIES_NAME))
+        assert manifest == {
+            "account_binding": True,
+            "executable_sha256": hashlib.sha256(zf.read(bp.ENTRY_NAME)).hexdigest(),
+        }
+    assert json.loads((root / bp.CAPABILITIES_NAME).read_text(encoding="utf-8")) == manifest
+    (root / bp.ENTRY_NAME).write_bytes(b"MZ replacement")
+    bp.build_package(root, tmp_path / "out")
+    assert json.loads((root / bp.CAPABILITIES_NAME).read_text(encoding="utf-8")) != manifest
+
+
+@pytest.mark.parametrize("manifest", [
+    None, b"not-json", {"account_binding": False}, {"account_binding": 1},
+    {"account_binding": True, "executable_sha256": "stale"},
+])
+def test_verify_package_rejects_missing_invalid_or_stale_capabilities(tmp_path: Path, manifest):
+    package = tmp_path / "bad.zip"
+    with zipfile.ZipFile(package, "w") as zf:
+        zf.writestr(bp.ENTRY_NAME, b"MZ")
+        if manifest is not None:
+            body = json.dumps(manifest) if isinstance(manifest, dict) else manifest
+            zf.writestr(bp.CAPABILITIES_NAME, body)
+    ok, reason = bp.verify_package(package)
+    assert not ok and reason
 
 
 def test_read_version_and_package_name(tmp_path: Path):

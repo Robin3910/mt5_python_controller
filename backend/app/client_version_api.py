@@ -26,7 +26,7 @@ from sqlalchemy import delete, func, select
 from . import client_version as cv
 from . import persist, system_settings
 from .db import SessionLocal
-from .deps import client_ip, get_admin_username, get_node_token_auth
+from .deps import client_ip, get_admin_username, get_client_download_auth
 from .models import (
     ClientReleaseOut,
     ClientReleasePayload,
@@ -318,7 +318,7 @@ async def delete_version(
 
 
 @router.get("/available")
-async def available_versions(_: str = Depends(get_node_token_auth)):
+async def available_versions(_: str = Depends(get_client_download_auth)):
     """节点/面板列出可下载的版本（新版在前）。
 
     供运维面板的「导入节点」与「更新到指定版本」选版本用。只给下载所需的字段，
@@ -346,7 +346,7 @@ async def available_versions(_: str = Depends(get_node_token_auth)):
 
 
 @router.get("/current")
-async def current_version(_: str = Depends(get_node_token_auth)):
+async def current_version(_: str = Depends(get_client_download_auth)):
     """节点/面板查询当前应当安装的版本；尚未发布任何版本时返回 204。"""
     release = await system_settings.get_client_release()
     version = str(release.get("version") or "")
@@ -372,7 +372,7 @@ async def current_version(_: str = Depends(get_node_token_auth)):
 
 
 @router.get("/{version}/download")
-async def download_version(version: str, _: str = Depends(get_node_token_auth)):
+async def download_version(version: str, _: str = Depends(get_client_download_auth)):
     """下载指定版本的安装包。"""
     norm = cv.normalize_version(version)
     if not norm:

@@ -122,6 +122,41 @@ function actionLabel(action: string): string {
     set_role_menus: '分配菜单',
     delete_role: '删除角色',
     rotate_node_token: '重置节点令牌',
+    dashboard_enrollment: '面板申请节点',
+    dashboard_add_instance: '面板添加实例',
+    dashboard_import_node: '面板导入节点',
+    dashboard_bind_instance: '面板绑定实例',
+    dashboard_edit_instance: '面板编辑实例',
+    dashboard_edit_env: '面板保存节点配置',
+    dashboard_edit_config: '面板保存配置',
+    dashboard_connection_config: '面板连接配置',
+    dashboard_save_connection: '面板保存连接',
+    dashboard_start: '面板启动节点',
+    dashboard_stop: '面板停止节点',
+    dashboard_restart: '面板重启节点',
+    dashboard_remove_instance: '面板移除实例',
+    dashboard_set_daemon: '面板切换守护',
+    dashboard_daemon_on: '面板开启守护',
+    dashboard_daemon_off: '面板关闭守护',
+    dashboard_daemon_grant: '面板取得守护授权',
+    dashboard_daemon_restart: '守护自动重启',
+    dashboard_refresh_health: '面板刷新健康',
+    dashboard_view_status: '面板查看状态',
+    dashboard_view_log: '面板查看日志',
+    dashboard_clear_log: '面板清空日志显示',
+    dashboard_open_cwd: '面板打开工作目录',
+    dashboard_version_check: '面板检查版本',
+    dashboard_download_package: '面板下载安装包',
+    dashboard_update: '面板更新客户端',
+    dashboard_update_client: '面板更新客户端',
+    dashboard_rollback: '面板回滚客户端',
+    dashboard_rollback_client: '面板回滚客户端',
+    dashboard_replace: '面板替换客户端',
+    dashboard_replace_client: '面板替换客户端',
+    dashboard_credential_issue: '签发节点专属令牌',
+    dashboard_credential_verify: '验证节点专属令牌',
+    dashboard_credential_rotate: '重签节点专属令牌',
+    dashboard_logout: '面板退出登录',
   }
   return m[action] || action
 }
@@ -130,6 +165,7 @@ function resultTag(result: string): { cls: string; text: string } {
   if (result === 'ok' || result === 'accepted') return { cls: 'green', text: '成功' }
   if (result === 'offline') return { cls: 'amber', text: '离线' }
   if (result === 'skipped') return { cls: '', text: '跳过' }
+  if (result === 'pending') return { cls: 'amber', text: '待完成' }
   if (result === 'rejected') return { cls: 'amber', text: '拒绝' }
   if (result === 'cancel_failed') return { cls: 'red', text: '撤单失败' }
   if (result === 'fail' || result === 'failed') return { cls: 'red', text: '失败' }

@@ -4,7 +4,7 @@
 节点入库、删除、批量手数与按币种配置（normal 链路）只有管理员能做。
 """
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from . import node_service, permissions, persist, rbac_service, risk_control
 from .connections import manager
@@ -17,6 +17,8 @@ from .deps import (
     require_menu,
 )
 from .models import LotBatch, NodeCreate, NodeOut, NodeUpdate, PaginatedNodeDispatches
+from .db import SessionLocal
+from .orm import NodeCredential
 from .permissions import MENU_NODES, Principal
 from .redis_store import RedisStore
 
@@ -36,6 +38,9 @@ def _node_audit_snapshot(d: dict | None) -> dict | None:
         "mt5_login": d.get("mt5_login"),
         "mt5_server": d.get("mt5_server"),
         "owner_user_id": d.get("owner_user_id"),
+        "approval_status": d.get("approval_status", "approved"),
+        "requested_by_user_id": d.get("requested_by_user_id"),
+        "admin_enable_requested": d.get("admin_enable_requested", False),
     }
 
 
@@ -54,6 +59,8 @@ async def _to_node_out(
     """把缓存里的节点 dict 组装成对外的 NodeOut（合并在线状态与账户登录信息）。"""
     acct = await store.get_account(d["node_id"]) or {}
     owner = permissions.normalize_owner(d.get("owner_user_id"))
+    async with SessionLocal() as session:
+        credential = await session.get(NodeCredential, d["node_id"])
     return NodeOut(
         node_id=d["node_id"],
         name=d["name"],
@@ -70,6 +77,13 @@ async def _to_node_out(
         last_seen=acct.get("updated_at"),
         owner_user_id=owner,
         owner_username=(owner_names or {}).get(owner) if owner is not None else None,
+        approval_status=d.get("approval_status", "approved"),
+        requested_by_user_id=d.get("requested_by_user_id"),
+        requested_by_username=(owner_names or {}).get(d.get("requested_by_user_id")),
+        admin_enable_requested=bool(d.get("admin_enable_requested")),
+        credential_generation=credential.generation if credential else 0,
+        legacy_allowed=bool(credential.legacy_allowed) if credential else True,
+        has_credential=bool(credential and credential.token_sha256),
     )
 
 
@@ -148,13 +162,18 @@ async def update_node(
 ):
     """更新节点配置（名称、启用状态、账户级风控；按币种配置仅管理员）。"""
     current = await owned_node_or_404(store, p, node_id)
+    if current.get("approval_status") == "pending" and body.enabled is not None and not p.is_admin:
+        raise HTTPException(status_code=403, detail="新增节点须由管理员审核开通")
     if body.filters is not None and not p.is_admin:
         raise HTTPException(status_code=403, detail="按币种配置（normal 链路）仅管理员可修改")
     before = _node_audit_snapshot(current)
     try:
-        d = await node_service.update_node(store, node_id, body)
+        d = await node_service.update_node(store, node_id, body, admin_enable_intent=p.is_admin,
+                                           audit_principal=p, audit_ip=client_ip(request))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=503, detail="audit or database unavailable") from e
     if not d:
         raise HTTPException(status_code=404, detail="node not found")
     # 风控配置变更：立即下发给在线节点（离线节点登录时从 auth_ok 拉取）

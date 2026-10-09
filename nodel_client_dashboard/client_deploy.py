@@ -8,7 +8,9 @@
 from __future__ import annotations
 
 import re
+import json
 import shutil
+import tempfile
 import time
 import zipfile
 from collections.abc import Iterable
@@ -17,6 +19,8 @@ from pathlib import Path
 
 # 版本化备份目录名；放在 exe 同级，回滚时按版本号取回
 BACKUP_DIRNAME = ".backups"
+CAPABILITIES_NAME = "client_capabilities.json"
+SIDECAR_NAMES = ("version.txt", CAPABILITIES_NAME)
 
 # 覆盖安装时永不替换的文件（小写比较）
 PROTECTED_NAMES = frozenset({".env"})
@@ -138,6 +142,61 @@ def _copy_with_retry(src: Path, dst: Path) -> None:
     raise last if last else OSError(f"复制失败: {src} -> {dst}")
 
 
+def _copy_reversibly(
+    copies: list[tuple[Path, Path]], *, remove: tuple[Path, ...] = (),
+) -> tuple[bool, str]:
+    """先暂存本次所有目标原件；失败时撤回文件修改，不读取节点 .env。"""
+    targets = list(dict.fromkeys([dst for _, dst in copies] + list(remove)))
+    if any(is_protected(target.name) for target in targets):
+        return False, "更新目标包含受保护的节点配置，已中止"
+    temporary = Path(tempfile.mkdtemp(prefix="node_client_restore_")).resolve()
+    if temporary.parent != Path(tempfile.gettempdir()).resolve() or not temporary.name.startswith("node_client_restore_"):
+        raise RuntimeError("更新恢复目录不在预期临时目录内")
+    keep_snapshot = False
+    try:
+        snapshots: dict[Path, Path | None] = {}
+        try:
+            for index, target in enumerate(targets):
+                if target.exists():
+                    snapshot = Path(temporary) / str(index)
+                    shutil.copy2(target, snapshot)
+                    snapshots[target] = snapshot
+                else:
+                    snapshots[target] = None
+            (temporary / "recovery.json").write_text(json.dumps({str(target): str(snapshot) if snapshot else None for target, snapshot in snapshots.items()}, ensure_ascii=False), encoding="utf-8")
+        except OSError as exc:
+            return False, f"准备更新恢复快照失败，未修改客户端：{exc}"
+
+        touched: list[Path] = []
+        try:
+            for source, target in copies:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                touched.append(target)  # 复制失败也可能已经截断目标文件。
+                _copy_with_retry(source, target)
+            for target in remove:
+                touched.append(target)
+                target.unlink(missing_ok=True)
+        except OSError as exc:
+            recovery_errors = []
+            for target in reversed(list(dict.fromkeys(touched))):
+                try:
+                    snapshot = snapshots[target]
+                    if snapshot is None:
+                        target.unlink(missing_ok=True)
+                    else:
+                        _copy_with_retry(snapshot, target)
+                except OSError as recovery_exc:
+                    recovery_errors.append(str(recovery_exc))
+            if recovery_errors:
+                keep_snapshot = True
+                return False, f"更新失败且文件恢复失败：{exc}；{'；'.join(recovery_errors)}；恢复原件保留在：{temporary}"
+            return False, f"更新失败，已恢复原客户端文件：{exc}"
+    finally:
+        if not keep_snapshot:
+            shutil.rmtree(temporary)
+    return True, "ok"
+
+
 def is_protected(name: str) -> bool:
     """该文件是否必须保留目标机上的原件（不被安装包同名文件覆盖）。"""
     return Path(name).name.lower() in PROTECTED_NAMES
@@ -157,12 +216,13 @@ def read_version_near(exe_path: str | Path) -> str:
 
 
 def source_bundle_files(source_exe: str | Path) -> list[Path]:
-    """替换时一并复制的旁路文件（version.txt）。"""
+    """替换时一并复制版本与绑定能力清单，保证清单哈希对应当前 exe。"""
     src = Path(source_exe)
     out = [src]
-    ver = src.parent / "version.txt"
-    if ver.is_file():
-        out.append(ver)
+    for name in SIDECAR_NAMES:
+        sidecar = src.parent / name
+        if sidecar.is_file():
+            out.append(sidecar)
     return out
 
 
@@ -199,10 +259,9 @@ def list_local_backups(target_exe: str | Path) -> list[str]:
 
 
 def backup_current(target_exe: str | Path) -> tuple[bool, str, str]:
-    """把当前 exe 与 version.txt 一起备份到 .backups/<当前版本>/。
+    """把当前 exe、version.txt 与能力清单一起备份到 .backups/<当前版本>/。
 
-    两个文件必须一起备份：只存 exe 的话，恢复后 version.txt 还停留在新版本号，
-    面板与后台看到的版本会与实际运行的程序对不上。
+    这些文件必须一起备份，保证恢复后版本号、清单哈希与程序对应。
 
     返回 (是否成功, 备份的版本号, 失败原因)。
     """
@@ -214,9 +273,13 @@ def backup_current(target_exe: str | Path) -> tuple[bool, str, str]:
     try:
         dest.mkdir(parents=True, exist_ok=True)
         _copy_with_retry(exe, dest / exe.name)
-        ver_txt = exe.parent / "version.txt"
-        if ver_txt.is_file():
-            _copy_with_retry(ver_txt, dest / "version.txt")
+        for name in SIDECAR_NAMES:
+            source = exe.parent / name
+            if source.is_file():
+                _copy_with_retry(source, dest / name)
+            else:
+                # 同版本重做备份时，不能让上一次的能力清单伪装成本次 exe 的清单。
+                (dest / name).unlink(missing_ok=True)
     except OSError as e:
         return False, version, str(e)
     return True, version, ""
@@ -237,7 +300,7 @@ def apply_package(
     if not src_root.is_dir():
         return False, f"安装包目录不存在: {src_root}"
 
-    files = [p for p in src_root.rglob("*") if p.is_file()]
+    files = sorted((p for p in src_root.rglob("*") if p.is_file()), key=lambda p: p.relative_to(src_root).as_posix().lower())
     if not files:
         return False, "安装包内没有文件"
 
@@ -248,21 +311,15 @@ def apply_package(
 
     dst_root = exe.parent
     dst_root.mkdir(parents=True, exist_ok=True)
-    copied = 0
-    try:
-        for src in files:
-            rel = src.relative_to(src_root)
-            if is_protected(rel.name):
-                continue
-            dst = dst_root / rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            _copy_with_retry(src, dst)
-            copied += 1
-    except OSError as e:
-        return False, str(e)
-    if copied == 0:
+    copies = [(src, dst_root / src.relative_to(src_root)) for src in files if not is_protected(src.name)]
+    if not copies:
         return False, "安装包内没有可覆盖的文件"
-    return True, f"已覆盖 {copied} 个文件"
+    remove = ()
+    if (src_root / exe.name).is_file() and not (src_root / CAPABILITIES_NAME).is_file():
+        # 旧包不能继承新能力清单；该删除也必须能随失败撤回。
+        remove = (dst_root / CAPABILITIES_NAME,)
+    ok, message = _copy_reversibly(copies, remove=remove)
+    return (True, f"已覆盖 {len(copies)} 个文件") if ok else (False, message)
 
 
 def restore_backup(target_exe: str | Path, version: str) -> tuple[bool, str]:
@@ -289,16 +346,14 @@ def replace_exe_file(
     if not source_exe.is_file():
         return False, f"源文件不存在: {source_exe}"
     target_exe.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        if backup and target_exe.is_file():
-            bak = target_exe.with_suffix(target_exe.suffix + ".bak")
-            shutil.copy2(target_exe, bak)
-        shutil.copy2(source_exe, target_exe)
-        # 同步 version.txt
-        src_ver = source_exe.parent / "version.txt"
-        dst_ver = target_exe.parent / "version.txt"
-        if src_ver.is_file():
-            shutil.copy2(src_ver, dst_ver)
-        return True, "ok"
-    except OSError as e:
-        return False, str(e)
+    copies = []
+    if backup and target_exe.is_file():
+        copies.append((target_exe, target_exe.with_suffix(target_exe.suffix + ".bak")))
+    copies.append((source_exe, target_exe))
+    # 同步 version.txt 与当前 exe 对应的能力清单。
+    for name in SIDECAR_NAMES:
+        source = source_exe.parent / name
+        if source.is_file():
+            copies.append((source, target_exe.parent / name))
+    remove = () if (source_exe.parent / CAPABILITIES_NAME).is_file() else (target_exe.parent / CAPABILITIES_NAME,)
+    return _copy_reversibly(copies, remove=remove)

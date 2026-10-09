@@ -19,6 +19,7 @@ from collections.abc import Callable, Sequence
 import customtkinter as ctk
 
 import version_service as vs
+from session_ui import SessionDialog
 from dialog_window import hide_while_building, show_centered
 from theme import (
     ACCENT,
@@ -43,7 +44,7 @@ _EMPTY = "（无可用版本）"
 Loader = Callable[[], tuple[list[dict], str]]
 
 
-class VersionPickerDialog(ctk.CTkToplevel):
+class VersionPickerDialog(SessionDialog):
     """选一个版本；确认后 `selected` 为版本号，取消则为空串。"""
 
     _W = 600

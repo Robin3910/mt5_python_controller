@@ -7,7 +7,7 @@ from pathlib import Path
 
 from models import InstanceConfig
 from process_manager import ProcessManager
-from store import load_instances, save_instances
+from store import load_app_url, load_instances, save_instances
 
 
 def test_store_roundtrip(tmp_path: Path):
@@ -22,6 +22,15 @@ def test_store_roundtrip(tmp_path: Path):
     assert loaded[0].name == "a"
     assert loaded[0].status_port == 18765
     assert loaded[1].daemon is True
+
+
+def test_load_app_url_reads_quoted_value(tmp_path: Path):
+    env = tmp_path / ".env"
+    env.write_text("APP_URL='http://127.0.0.1:5777'\n", encoding="utf-8")
+    assert load_app_url(env) == "http://127.0.0.1:5777"
+    assert load_app_url(tmp_path / "missing.env") == ""
+    env.write_text("# comment\nOTHER=1\n", encoding="utf-8")
+    assert load_app_url(env) == ""
 
 
 def test_default_label_and_shorten_path():

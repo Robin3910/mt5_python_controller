@@ -1,10 +1,9 @@
 """面板与后端之间的版本通道：后端地址发现、版本查询、安装包下载与校验。
 
-鉴权用的是节点令牌 NODE_TOKEN（与 node_client 的 .env 同一份），它只被后端授权
-访问「查当前发布版本」和「下载安装包」两个只读接口。
+登录版面板通过 BackendTarget(auth_header="Authorization") 使用内存用户 JWT。
+旧全局节点令牌的只读兼容入口保留，不能用节点专属令牌查询或下载。
 
-后端地址的解析顺序是「面板手工配置优先，其次从实例 .env 自动发现」：新装机器上
-还没有任何实例时 .env 无从读起，而多个实例也可能连不同的后端。
+resolve_backend / target_from_env 仅保留旧调用兼容；登录版面板的地址来自当前会话。
 
 只用标准库：面板要打成单文件 exe，不引入 requests / httpx 之类的新依赖。
 """
@@ -14,7 +13,7 @@ import hashlib
 import json
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
@@ -33,6 +32,8 @@ class BackendTarget:
     base: str
     token: str
     source: str = ""       # 该配置来自哪里，用于界面提示
+    auth_header: str = "X-Node-Token"
+    session: object | None = None
 
     @property
     def ready(self) -> bool:
@@ -122,12 +123,13 @@ def resolve_backend(panel_cfg: dict | None, cwds: list[str] | None = None) -> Ba
 
 def _request(target: BackendTarget, path: str, timeout: int):
     url = f"{target.base}{path}"
-    req = urllib.request.Request(url, headers={"X-Node-Token": target.token})
+    credential = f"Bearer {target.token}" if target.auth_header == "Authorization" else target.token
+    req = urllib.request.Request(url, headers={target.auth_header: credential})
     try:
         return urllib.request.urlopen(req, timeout=timeout)  # noqa: S310 - 地址来自本机配置
     except urllib.error.HTTPError as e:
         if e.code == 401:
-            raise VersionServiceError("节点令牌无效，请检查 NODE_TOKEN") from e
+            raise VersionServiceError("登录或节点令牌已失效，请重新验证") from e
         if e.code == 404:
             raise VersionServiceError("后端没有该版本的安装包") from e
         raise VersionServiceError(f"后端返回 HTTP {e.code}") from e
@@ -139,6 +141,8 @@ def _request(target: BackendTarget, path: str, timeout: int):
 
 def fetch_current_version(target: BackendTarget, timeout: int = DEFAULT_TIMEOUT) -> dict:
     """查询后端当前发布的客户端版本；尚未发布任何版本时返回空字典。"""
+    if target.session is not None:
+        return target.session.perform("version_check", None, lambda: fetch_current_version(replace(target, session=None), timeout))
     if not target.ready:
         raise VersionServiceError("尚未配置后端地址或节点令牌")
     with _request(target, "/api/client-versions/current", timeout) as resp:
@@ -159,6 +163,8 @@ def fetch_available_versions(
 
     供「导入节点」与「更新到指定版本」选版本用；后端尚无任何安装包时返回空清单。
     """
+    if target.session is not None:
+        return target.session.perform("version_check", None, lambda: fetch_available_versions(replace(target, session=None), timeout))
     if not target.ready:
         raise VersionServiceError("尚未配置后端地址或节点令牌")
     with _request(target, "/api/client-versions/available", timeout) as resp:
@@ -181,6 +187,13 @@ def download_package(
     timeout: int = DOWNLOAD_TIMEOUT,
 ) -> Path:
     """下载指定版本的安装包到 dest；返回落地路径。"""
+    if target.session is not None:
+        session = target.session
+        generation = session.generation
+        def checked_download():
+            session.check(generation)
+            return download_package(replace(target, session=None), version, dest, timeout=timeout)
+        return session.perform("download_package", None, checked_download, params={"version": version}, generation=generation)
     if not target.ready:
         raise VersionServiceError("尚未配置后端地址或节点令牌")
     out = Path(dest)

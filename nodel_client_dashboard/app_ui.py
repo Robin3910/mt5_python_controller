@@ -7,7 +7,7 @@ import threading
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 
 import customtkinter as ctk
 
@@ -15,6 +15,9 @@ import version_service as vs
 from client_deploy import count_pending_upgrades, read_version_near
 from models import InstanceConfig, default_label_from_path, shorten_path
 from process_manager import ProcessManager
+from dashboard_auth_ui import DashboardAuthUI
+from auth_service import DashboardAuthError
+from session_ui import SessionDialog, secured, requires_session
 from store import load_instances, load_panel_config, save_instances
 from tray_icon import TrayController, apply_window_icon, tray_available
 from version import get_version
@@ -76,7 +79,7 @@ class _ListRow:
 
 
 
-class EditInstanceDialog(ctk.CTkToplevel):
+class EditInstanceDialog(SessionDialog):
     """编辑实例标签 / 客户端路径 / 工作目录。"""
 
     _W = 620
@@ -222,24 +225,30 @@ class EditInstanceDialog(ctk.CTkToplevel):
         if path:
             self.cwd_var.set(path)
 
+    @secured("edit_instance", lambda self: self._cfg)
     def _save(self) -> None:
         name = self.name_var.get().strip()
         exe = self.path_var.get().strip()
         cwd = self.cwd_var.get().strip()
         if not exe:
             messagebox.showerror("校验失败", "客户端路径不能为空", parent=self)
-            return
+            return False
         if not Path(exe).exists():
             if not messagebox.askyesno(
                 "路径不存在",
                 f"文件不存在：\n{exe}\n\n仍要保存吗？",
                 parent=self,
             ):
-                return
+                return False
         if not name:
             name = default_label_from_path(exe)
         if not cwd:
             cwd = str(Path(exe).parent)
+        self.dashboard.validate_instance_location(self._cfg, exe, cwd)
+        if (exe, cwd) != (self._cfg.exe_path, self._cfg.cwd):
+            mp = self.dashboard.manager.get(self._cfg.id)
+            if mp is not None and mp.daemon_grant is not None:
+                mp.daemon_grant.allowed = False
         self._cfg.name = name
         self._cfg.exe_path = exe
         self._cfg.cwd = cwd
@@ -247,7 +256,26 @@ class EditInstanceDialog(ctk.CTkToplevel):
         self.destroy()
 
 
-class DashboardApp(ctk.CTk):
+class DashboardApp(DashboardAuthUI, ctk.CTk):
+    def after(self, ms, func=None, *args):
+        if func is None or not hasattr(self, "session"):
+            return super().after(ms, func, *args)
+        generation = getattr(self.session._local, "generation", None)
+        if generation is None:
+            generation = self.session.generation
+        def current():
+            if generation == self.session.generation and not self._quitting:
+                previous = getattr(self.session._local, "generation", None)
+                self.session._local.generation = generation
+                try:
+                    return func(*args)
+                finally:
+                    self.session._local.generation = previous
+        try:
+            return super().after(ms, current)
+        except (tk.TclError, RuntimeError):
+            return None
+
     def __init__(self) -> None:
         super().__init__()
         apply_theme()
@@ -257,8 +285,9 @@ class DashboardApp(ctk.CTk):
         self.minsize(980, 640)
         self.configure(fg_color=BG)
 
-        self.manager = ProcessManager(on_change=self._on_runtime_change)
-        self.manager.load(load_instances())
+        self._auth_init()
+        self.manager = ProcessManager(on_change=self._on_runtime_change, session=self.session)
+        self.manager.set_visible(set())
         self._selected_id: str | None = None
         self._list_rows: dict[str, _ListRow] = {}
         self._list_order: tuple[str, ...] = ()
@@ -274,16 +303,13 @@ class DashboardApp(ctk.CTk):
         self._restore_repair_job: str | None = None
         self._remote_version = ""
 
-        self._build_layout()
-        self._bind_list()
-        self._bind_detail(refresh_log=True)
+        self._show_login()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         # 最小化进托盘；恢复时修复 CTk Canvas 残影
         self.bind("<Unmap>", self._on_unmap)
         self.bind("<Map>", self._on_map)
         self.after(1000, self._tick_ui)
         self.after(200, self._setup_tray)
-        self.after(_VERSION_CHECK_FIRST_MS, self._check_remote_version)
 
     def _build_layout(self) -> None:
         self.grid_columnconfigure(0, weight=1)
@@ -312,6 +338,7 @@ class DashboardApp(ctk.CTk):
             badges, _VERSION_BTN_IDLE, self._open_version_update, width=_VERSION_BTN_W
         )
         self.version_btn.pack(side="left", padx=(0, 8))
+        ghost_btn(badges, "退出登录", self._logout, width=90).pack(side="left", padx=4)
         ghost_btn(badges, "连接配置", self._open_connection_config, width=100).pack(
             side="left", padx=(0, 12)
         )
@@ -352,7 +379,7 @@ class DashboardApp(ctk.CTk):
             side="left", padx=2, fill="x", expand=True
         )
 
-        # 本地文件操作：不经后端，直接用本机已有的 exe
+        # 本地操作同样经过用户权限校验与操作审计。
         btn_row0 = ctk.CTkFrame(left, fg_color="transparent")
         btn_row0.grid(row=6, column=0, sticky="ew", padx=12, pady=(0, 14))
         ghost_btn(btn_row0, "手工添加", self._add_instance, width=120).pack(
@@ -361,6 +388,10 @@ class DashboardApp(ctk.CTk):
         ghost_btn(btn_row0, "手工替换全部", self._batch_replace, width=120).pack(
             side="left", padx=2
         )
+        account_actions = ctk.CTkFrame(left, fg_color="transparent")
+        account_actions.grid(row=7, column=0, padx=12, pady=(0, 8))
+        ghost_btn(account_actions, "绑定后台节点", self._bind_instance, width=120).pack(side="left", padx=2)
+        ghost_btn(account_actions, "重置专属令牌", self._rotate_credential, width=120).pack(side="left", padx=2)
 
         btn_row2 = ctk.CTkFrame(left, fg_color="transparent")
         btn_row2.grid(row=4, column=0, sticky="ew", padx=12, pady=(0, 4))
@@ -486,7 +517,7 @@ class DashboardApp(ctk.CTk):
         self.log_box.grid(row=3, column=0, sticky="nsew", padx=12, pady=(4, 12))
 
     def _persist(self) -> None:
-        save_instances(self.manager.configs())
+        DashboardAuthUI._persist(self)
 
     def _tone_color(self, tone: str, *, alive: bool = True, health: str = "unknown") -> str:
         if tone == "health":
@@ -590,6 +621,8 @@ class DashboardApp(ctk.CTk):
 
     def _bind_list(self) -> None:
         """按 ViewModel 差分同步左侧列表：复用卡片，避免整表销毁闪烁。"""
+        if not self.session.active:
+            return
         items = build_list(self.manager, self._selected_id)
         order = list_order(items)
         wanted = {vm.id for vm in items}
@@ -633,6 +666,8 @@ class DashboardApp(ctk.CTk):
 
     def _bind_detail(self, *, refresh_log: bool = False) -> None:
         """按 DetailVM 就地更新右侧；未变化则跳过。"""
+        if not self.session.active:
+            return
         mp = self._selected()
         detail = build_detail(mp)
         prev = self._detail_snap
@@ -680,6 +715,11 @@ class DashboardApp(ctk.CTk):
         self._log_snap = text
 
     def _select(self, instance_id: str) -> None:
+        self.session.check()
+        mp = self.manager.get(instance_id)
+        if mp is None:
+            return
+        self.session.perform("view_status", mp.cfg, lambda: None)
         self._selected_id = instance_id
         self._detail_snap = None
         self._log_snap = None
@@ -725,7 +765,8 @@ class DashboardApp(ctk.CTk):
             self.btn_start.configure(**muted)
             self.btn_stop.configure(**stop_on)
         else:
-            self.btn_start.configure(**start_on)
+            permitted = bool(mp.cfg.approval_status == "approved" and mp.cfg.enabled)
+            self.btn_start.configure(**(start_on if permitted else muted))
             self.btn_stop.configure(**muted)
 
     def _on_runtime_change(self, _instance_id: str) -> None:
@@ -739,6 +780,8 @@ class DashboardApp(ctk.CTk):
         self._safe_refresh(refresh_log=False)
 
     def _safe_refresh(self, *, refresh_log: bool = False) -> None:
+        if not self.session.active:
+            return
         try:
             self._bind_list()
             self._bind_detail(refresh_log=refresh_log)
@@ -746,6 +789,10 @@ class DashboardApp(ctk.CTk):
             pass
 
     def _tick_ui(self) -> None:
+        if not self.session.active:
+            if not self._quitting:
+                self.after(2000, self._tick_ui)
+            return
         try:
             self._bind_list()
             self._bind_detail(refresh_log=True)
@@ -759,7 +806,9 @@ class DashboardApp(ctk.CTk):
     def _update_detail(self) -> None:
         self._bind_detail(refresh_log=True)
 
+    @requires_session
     def _add_instance(self) -> None:
+        self.session.check()
         path = filedialog.askopenfilename(
             title="选择 node_client.exe",
             filetypes=[
@@ -776,6 +825,11 @@ class DashboardApp(ctk.CTk):
             exe_path=str(exe),
             cwd=str(exe.parent),
         )
+        login = simpledialog.askinteger("申请节点", "请输入此 MT5 终端的账号（管理员审核开通后才能启动）：", minvalue=1, parent=self)
+        if login is None:
+            return
+        self.validate_instance_location(cfg, cfg.exe_path, cfg.cwd)
+        self._enroll_instance(cfg, login)
         self.manager.add(cfg)
         self._persist()
         self._selected_id = cfg.id
@@ -784,6 +838,7 @@ class DashboardApp(ctk.CTk):
         self._refresh_version_badge()
         self._edit_instance()
 
+    @requires_session
     def _edit_instance(self, instance_id: str | None = None) -> None:
         if instance_id and instance_id != self._selected_id:
             self._select(instance_id)
@@ -791,6 +846,7 @@ class DashboardApp(ctk.CTk):
         if mp is None:
             messagebox.showinfo("提示", "请先选择一个实例")
             return
+        self.session.perform("view_status", mp.cfg, lambda: None)
         dialog = EditInstanceDialog(self, mp.cfg)
         self.wait_window(dialog)
         if dialog.result is None:
@@ -799,6 +855,7 @@ class DashboardApp(ctk.CTk):
         self._refresh_list()
         self._update_detail()
 
+    @requires_session
     def _batch_start(self) -> None:
         configs = self.manager.configs()
         if not configs:
@@ -822,6 +879,7 @@ class DashboardApp(ctk.CTk):
 
         self._run_async("全部启动", job)
 
+    @requires_session
     def _batch_stop(self) -> None:
         configs = self.manager.configs()
         if not configs:
@@ -851,6 +909,7 @@ class DashboardApp(ctk.CTk):
     def _batch_daemon_off(self) -> None:
         self._batch_set_daemon(False)
 
+    @requires_session
     def _batch_set_daemon(self, enabled: bool) -> None:
         configs = self.manager.configs()
         if not configs:
@@ -878,8 +937,13 @@ class DashboardApp(ctk.CTk):
 
         self._run_async(title, job)
 
+    @requires_session
     def _open_connection_config(self) -> None:
-        """配置后端 API 地址与节点令牌（供版本更新等功能访问后端）。"""
+        """查看当前登录后端。地址来自程序目录 .env 的 APP_URL。"""
+        self.session.check()
+        if not self.session.is_admin:
+            messagebox.showinfo("当前连接", self.session.api.base + "\n后端地址由程序目录 .env 的 APP_URL 决定", parent=self)
+            return
         from connection_dialog import ConnectionConfigDialog
 
         # 改完地址或令牌，原来查不通的后端可能就通了，立刻复检一次
@@ -887,7 +951,9 @@ class DashboardApp(ctk.CTk):
             self, self.manager, on_saved=lambda: self._check_remote_version(repeat=False)
         )
 
+    @requires_session
     def _import_node(self) -> None:
+        self.session.check()
         """选 MT5 目录 + 指定版本，从后端拉客户端部署成新实例。"""
         from import_dialog import ImportNodeDialog
 
@@ -900,12 +966,15 @@ class DashboardApp(ctk.CTk):
 
         ImportNodeDialog(self, self.manager, on_done=on_created)
 
+    @requires_session
     def _edit_node_env(self) -> None:
+        self.session.check()
         """编辑选中实例的 node_client .env。"""
         mp = self._selected()
         if mp is None:
             messagebox.showinfo("提示", "请先选择一个实例")
             return
+        self.session.perform("view_status", mp.cfg, lambda: None)
         from env_dialog import EnvConfigDialog
 
         dialog = EnvConfigDialog(self, mp.cfg)
@@ -926,7 +995,9 @@ class DashboardApp(ctk.CTk):
 
             self._run_async("重启", job)
 
+    @requires_session
     def _open_version_update(self) -> None:
+        self.session.check()
         """打开版本更新对话框：从后端检测版本、批量更新 / 降级 / 本机回滚。"""
         if not self.manager.configs():
             messagebox.showinfo("提示", "请先添加至少一个实例")
@@ -946,6 +1017,9 @@ class DashboardApp(ctk.CTk):
 
         静默失败：这只是个提示，后端不可达或没配令牌时不该弹窗打断本机运维。
         """
+        if not self.session.active:
+            return
+        generation = self.session.generation
         if repeat:
             self.after(_VERSION_CHECK_INTERVAL_MS, self._check_remote_version)
 
@@ -955,10 +1029,7 @@ class DashboardApp(ctk.CTk):
             return
 
         # 后端入口在主线程解析后再交给后台线程：Tcl 解释器不是线程安全的
-        target = vs.resolve_backend(
-            load_panel_config(),
-            [c.cwd or str(Path(c.exe_path).parent) for c in configs],
-        )
+        target = vs.BackendTarget(self.session.api.base, self.session.token, "用户登录", "Authorization")
         if not target.ready:
             self._render_version_badge("", 0)
             return
@@ -969,7 +1040,7 @@ class DashboardApp(ctk.CTk):
             except vs.VersionServiceError:
                 return
             version = str((data or {}).get("version") or "")
-            self.after(0, lambda: self._on_remote_version(version))
+            self.after(0, lambda: self._on_remote_version(version) if generation == self.session.generation and self.session.active else None)
 
         threading.Thread(target=worker, name="version-check", daemon=True).start()
 
@@ -1005,6 +1076,7 @@ class DashboardApp(ctk.CTk):
         except tk.TclError:
             pass
 
+    @requires_session
     def _batch_replace(self) -> None:
         configs = self.manager.configs()
         if not configs:
@@ -1062,6 +1134,7 @@ class DashboardApp(ctk.CTk):
 
         self._run_async("手工替换", job)
 
+    @requires_session
     def _remove_instance(self, instance_id: str | None = None) -> None:
         mp = self.manager.get(instance_id) if instance_id else self._selected()
         if mp is None:
@@ -1074,6 +1147,7 @@ class DashboardApp(ctk.CTk):
 
         def job():
             self.manager.remove(iid)
+            self._inventory.pop(iid, None)
             self.after(0, self._persist)
             self.after(0, self._refresh_version_badge)
 
@@ -1081,19 +1155,25 @@ class DashboardApp(ctk.CTk):
 
     def _run_async(self, label: str, fn) -> None:
         """启停等可能阻塞的操作丢后台线程，避免卡住 UI。"""
+        self.session.check()
+        generation = self.session.generation
         def worker():
             try:
+                self.session._local.generation = generation
+                self.session.check(generation)
                 fn()
             except Exception as e:  # noqa: BLE001
                 # 必须先取出消息：except 块结束时 e 会被解绑，延迟执行的 lambda 里读不到它
                 msg = str(e)
-                self.after(0, lambda: messagebox.showerror(label, msg))
+                self.after(0, lambda: messagebox.showerror(label, msg) if generation == self.session.generation and self.session.active else None)
             finally:
+                self.session._local.generation = None
                 self.after(0, self._safe_refresh)
 
         threading.Thread(target=worker, name=f"ui-{label}", daemon=True).start()
         self.after(50, self._safe_refresh)
 
+    @requires_session
     def _start(self) -> None:
         mp = self._selected()
         if mp is None:
@@ -1108,6 +1188,7 @@ class DashboardApp(ctk.CTk):
 
         self._run_async("启动", job)
 
+    @requires_session
     def _stop(self) -> None:
         mp = self._selected()
         if mp is None:
@@ -1122,32 +1203,37 @@ class DashboardApp(ctk.CTk):
 
         self._run_async("停止", job)
 
+    @requires_session
     def _refresh_health(self) -> None:
         mp = self._selected()
         if mp is None:
             return
         if mp.runtime.busy:
             return
-        self._run_async("刷新健康", mp.refresh_health)
+        self._run_async("刷新健康", lambda: self.session.perform("refresh_health", mp.cfg, mp.refresh_health))
 
+    @requires_session
     def _toggle_daemon(self) -> None:
         mp = self._selected()
         if mp is None:
             return
-        mp.set_daemon(self.daemon_var.get())
+        self.manager.set_daemon(mp.cfg.id, self.daemon_var.get())
         self._persist()
         self._refresh_list()
         self._update_detail()
 
+    @requires_session
     def _open_cwd(self) -> None:
         mp = self._selected()
         if mp is None:
             return
         path = mp.cfg.cwd or str(Path(mp.cfg.exe_path).parent)
-        if os.name == "nt":
-            os.startfile(path)  # type: ignore[attr-defined]
-        else:
-            subprocess.Popen(["xdg-open", path])
+        def open_folder():
+            if os.name == "nt":
+                os.startfile(path)  # type: ignore[attr-defined]
+            else:
+                subprocess.Popen(["xdg-open", path])
+        self.session.perform("open_cwd", mp.cfg, open_folder)
 
     def _setup_tray(self) -> None:
         if not tray_available():
@@ -1198,6 +1284,8 @@ class DashboardApp(ctk.CTk):
                 pass
 
     def _schedule_restore_repair(self) -> None:
+        if not self.session.active:
+            return
         """恢复可见后强制重绘（CTk Canvas 最小化残影）。"""
         if self._restore_repair_job is not None:
             try:
@@ -1208,6 +1296,8 @@ class DashboardApp(ctk.CTk):
         self._restore_repair_job = self.after(40, lambda: self._repair_ui_after_restore(pass_no=1))
 
     def _repair_ui_after_restore(self, *, pass_no: int = 1) -> None:
+        if not self.session.active:
+            return
         self._restore_repair_job = None
         if self._quitting or self._in_tray:
             return
@@ -1308,7 +1398,7 @@ class DashboardApp(ctk.CTk):
 
     def _on_close(self) -> None:
         """点关闭：进托盘（不退出）；真正退出走托盘「退出」。"""
-        if self._tray is not None and tray_available():
+        if self.session.active and self._tray is not None and tray_available():
             self._hide_to_tray()
             return
         self._quit_app()
@@ -1317,6 +1407,8 @@ class DashboardApp(ctk.CTk):
         if self._quitting:
             return
         self._quitting = True
+        self.session.token = ""
+        self.session.generation += 1
         self._persist()
         if self._tray is not None:
             self._tray.stop()
@@ -1328,11 +1420,14 @@ class DashboardApp(ctk.CTk):
         except tk.TclError:
             pass
 
+    @requires_session
     def _clear_log(self) -> None:
         mp = self._selected()
         if mp is None:
             return
-        mp.clear_log_display_file()
+        if not messagebox.askyesno("清空节点日志", "将清空当日节点日志，操作会记录审计。是否继续？", parent=self):
+            return
+        self.session.perform("clear_log", mp.cfg, mp.clear_log_display_file)
         self._update_detail()
 
 

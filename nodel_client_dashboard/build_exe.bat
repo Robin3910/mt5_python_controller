@@ -49,7 +49,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM Distribution zip; panel_config.json / instances.json / logs are never packed.
+REM Distribution zip. Runtime data stays out. Dashboard .env (APP_URL) is copied into the build dir and the zip.
 echo Packaging distribution zip ...
 set "PKG="
 for /f "usebackq tokens=1 delims=|" %%p in (`python build_package.py "%OUT%" "packages"`) do set "PKG=%%p"

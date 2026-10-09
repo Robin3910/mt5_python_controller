@@ -18,6 +18,11 @@ def _build_dir(tmp_path: Path, version: str = VERSION) -> Path:
     (root / "version.txt").write_text(version + "\n", encoding="utf-8")
     (root / "panel_config.json").write_text('{"node_token": "real-secret"}', encoding="utf-8")
     (root / "instances.json").write_text('[{"exe_path": "C:\\\\mt5"}]', encoding="utf-8")
+    for name in [".env", ".env.production", "audit_results.json", "daemon_events.json", "panel_config.json.tmp", "instances.json.tmp"]:
+        (root / name).write_text("synthetic-runtime-data", encoding="utf-8")
+    backups = root / ".backups"
+    backups.mkdir()
+    (backups / "credentials.json").write_text("synthetic-backup-data", encoding="utf-8")
     logs = root / "logs" / "node-1"
     logs.mkdir(parents=True)
     (logs / "2026-08-13.log").write_text("noise", encoding="utf-8")
@@ -30,8 +35,13 @@ def test_should_include_excludes_runtime_data():
     assert bp.should_include("README.md")
     assert bp.should_include("_internal/base_library.zip")
 
-    # 后端地址与 NODE_TOKEN，绝不入包
+    # 上次用户名与旧令牌，绝不入包
     assert not bp.should_include("panel_config.json")
+    assert bp.should_include(".env")
+    assert bp.should_include(f"{STEM}/.env")
+    assert not bp.should_include("nested/.env")
+    assert not bp.should_include(f"{STEM}/nested/.env")
+    assert not bp.should_include(".env.production")
     # 本机实例清单与绝对路径
     assert not bp.should_include("instances.json")
     assert not bp.should_include(".dashboard.lock")
@@ -54,6 +64,9 @@ def test_build_package_excludes_runtime_data(tmp_path: Path):
     assert not any(Path(n).name == "panel_config.json" for n in names)
     assert not any(Path(n).name == "instances.json" for n in names)
     assert not any("/logs/" in n for n in names)
+    assert not any("/.backups/" in n for n in names)
+    assert f"{STEM}/.env" in names
+    assert not any(Path(n).name in {".env.production", "audit_results.json", "daemon_events.json", "panel_config.json.tmp", "instances.json.tmp"} for n in names)
 
 
 def test_build_package_wraps_in_version_folder(tmp_path: Path):
@@ -165,3 +178,32 @@ def test_read_version_and_package_name(tmp_path: Path):
         "node_client_dashboard-2.0.0-20260101000000.zip"
     )
     assert bp.read_version(tmp_path / "nope") == ""
+
+
+def test_build_package_copies_dashboard_env_over_output(tmp_path: Path):
+    """打包用源码目录的 .env 覆盖产物目录，避免把本机改过的地址打出去。"""
+    root = _build_dir(tmp_path)
+    (root / ".env").write_text("APP_URL=http://stale.example\n", encoding="utf-8")
+    env = tmp_path / "panel.env"
+    env.write_text("APP_URL='http://127.0.0.1:5777'\n", encoding="utf-8")
+
+    zip_path = bp.build_package(root, tmp_path / "out", env_file=env)
+
+    assert (root / ".env").read_text(encoding="utf-8") == "APP_URL='http://127.0.0.1:5777'\n"
+    with zipfile.ZipFile(zip_path) as zf:
+        assert zf.read(f"{STEM}/.env") == (root / ".env").read_bytes()
+
+
+def test_build_package_requires_dashboard_env_file(tmp_path: Path):
+    with pytest.raises(FileNotFoundError, match="dashboard .env"):
+        bp.build_package(_build_dir(tmp_path), tmp_path / "out", env_file=tmp_path / "missing.env")
+
+
+@pytest.mark.parametrize("runtime_path", [".env", ".env.production", "audit_results.json", "daemon_events.json", "logs/a.log", ".backups/credentials.json", "instances.json.tmp"])
+def test_self_check_rejects_nested_runtime_data(tmp_path: Path, runtime_path):
+    archive = tmp_path / "leaked.zip"
+    with zipfile.ZipFile(archive, "w") as package:
+        package.writestr(f"{STEM}/node_client_dashboard.exe", b"MZ")
+        package.writestr(f"{STEM}/nested/{runtime_path}", "synthetic-data")
+    assert not bp.verify_package(archive)[0]
+    assert bp.should_include(".env.example")

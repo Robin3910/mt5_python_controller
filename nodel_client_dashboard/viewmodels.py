@@ -81,6 +81,10 @@ def build_list_item(mp: "ManagedProcess", selected_id: str | None) -> ListItemVM
     state = process_state_label(mp)
     daemon = "  ·  守护" if cfg.daemon else ""
     status_line = f"{state}  ·  {health_zh(rt.health)}{daemon}"
+    if cfg.approval_status == "pending":
+        status_line += "  ·  待管理员审核开通"
+    elif cfg.approval_status == "unbound":
+        status_line += "  ·  需管理员绑定"
     if rt.version:
         status_line = f"v{rt.version}  ·  {status_line}"
     return ListItemVM(

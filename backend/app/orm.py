@@ -55,10 +55,24 @@ class Node(Base):
     client_version_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     # 数据归属：管理员分配给哪个用户；空 = 管理员名下（含自动注册的新节点）
     owner_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    approval_status: Mapped[str] = mapped_column(String(16), default="approved", server_default="approved")
+    requested_by_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    admin_enable_requested: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
     )
+
+
+class NodeCredential(Base):
+    """专属节点凭证；独立于旧版 nodes.token_hash，防止触发旧结构清理。"""
+    __tablename__ = "node_credentials"
+
+    node_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    token_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    generation: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    legacy_allowed: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
+    owner_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class SystemSetting(Base):
@@ -172,6 +186,8 @@ class AuditLog(Base):
     category: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
     before_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # 操作前数据
     after_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)   # 操作后数据
+    request_key: Mapped[str | None] = mapped_column(String(128), nullable=True, unique=True)
+    actor_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class SignalHistory(Base):

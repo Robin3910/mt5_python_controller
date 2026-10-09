@@ -117,6 +117,26 @@ async def get_node_token_auth(
     return token
 
 
+async def get_client_download_auth(
+    x_node_token: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    store: RedisStore = Depends(get_store),
+) -> str:
+    """面板用用户 JWT；旧节点保留全局令牌下载，仅覆盖版本只读端点。"""
+    if not x_node_token and authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+        from .security import decode_access_jwt
+        claims = decode_access_jwt(token)
+        if claims:
+            p = await rbac_service.principal_from_token(store, token)
+            if not p:
+                raise HTTPException(401, "invalid or expired token")
+            if not permissions.can_menu(p, permissions.MENU_NODES):
+                raise HTTPException(403, "无权访问该功能")
+            return p.username
+    return await get_node_token_auth(x_node_token, authorization, store)
+
+
 def client_ip(request: Request) -> str:
     """获取客户端真实 IP（优先取 nginx 透传的 X-Forwarded-For）。"""
     xff = request.headers.get("x-forwarded-for")

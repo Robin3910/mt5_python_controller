@@ -42,6 +42,13 @@ class NodeOut(BaseModel):
     # 数据归属：空 = 管理员名下
     owner_user_id: Optional[int] = None
     owner_username: Optional[str] = None
+    approval_status: str = "approved"
+    requested_by_user_id: Optional[int] = None
+    requested_by_username: Optional[str] = None
+    admin_enable_requested: bool = False
+    credential_generation: int = 0
+    legacy_allowed: bool = True
+    has_credential: bool = False
 
 
 class NodeTokenInfo(BaseModel):

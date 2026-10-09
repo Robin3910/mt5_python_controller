@@ -3,6 +3,7 @@ import asyncio
 import json
 import threading
 import time
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -44,6 +45,55 @@ async def test_authenticate_ok():
     assert ws.sent[0]["data"]["mt5_login"] == 90000001
     assert any(m["type"] == "hello" for m in ws.sent)
     assert n.hub_symbols == {"BTCUST", "XAUUSD"}
+    assert n.node_id == "nd_x"
+    assert n.status_snapshot()["node_id"] == "nd_x"
+
+
+@pytest.mark.parametrize(
+    "connected, account", [(False, {}), (True, {}), (True, {"login": 54321}), (True, {"login": "bad"})],
+)
+async def test_dashboard_run_stops_before_hub_status_ws_or_trades(monkeypatch, connected, account):
+    monkeypatch.setattr(nc.settings, "dashboard_expected_mt5_login", 90000001)
+    n = _node()
+    monkeypatch.setattr(n.mt5, "connect", lambda: connected)
+    monkeypatch.setattr(n.mt5, "account_info", lambda: account)
+    hub = MagicMock()
+    ws = AsyncMock()
+    trade = MagicMock()
+    monkeypatch.setattr(n, "_ensure_hub", hub)
+    monkeypatch.setattr(n, "_connect_loop", ws)
+    monkeypatch.setattr(n.mt5, "place_market_order", trade)
+    with pytest.raises(RuntimeError, match="面板启动失败"):
+        await n.run()
+    hub.assert_not_called()
+    ws.assert_not_called()
+    trade.assert_not_called()
+    assert n._status_server is None
+
+
+async def test_dashboard_run_allows_matching_account(monkeypatch):
+    monkeypatch.setattr(nc.settings, "dashboard_expected_mt5_login", 90000001)
+    n = _node()
+    hub = MagicMock()
+    ws = AsyncMock()
+    monkeypatch.setattr(n, "_ensure_hub", hub)
+    monkeypatch.setattr(n, "_connect_loop", ws)
+    await n.run()
+    hub.assert_called_once()
+    ws.assert_awaited_once()
+
+
+def test_dashboard_constructor_cannot_switch_to_another_account(monkeypatch):
+    monkeypatch.setattr(nc.settings, "dashboard_expected_mt5_login", 12345)
+    with pytest.raises(RuntimeError, match="已授权账号"):
+        nc.NodeClient(mt5_login=54321)
+
+
+async def test_independent_connection_failure_keeps_existing_retry_behavior(monkeypatch):
+    n = _node()
+    monkeypatch.setattr(n.mt5, "connect", lambda: False)
+    await n._connect_mt5()
+    n._mt5_executor.shutdown(wait=False)
 
 
 async def test_authenticate_reports_client_version():

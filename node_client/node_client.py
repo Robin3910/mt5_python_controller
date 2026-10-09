@@ -27,7 +27,7 @@ import account_risk
 from config import clamp_account_report_interval, get_settings
 from local_status import LocalStatusServer
 from market_hub import MarketHub
-from mt5_prompt import prompt_mt5_credentials
+from mt5_prompt import prompt_mt5_credentials, require_dashboard_account
 from strategy_runner import StrategyRunner
 from version import get_version
 
@@ -36,6 +36,9 @@ logging.basicConfig(
     level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
 logger = logging.getLogger("node")
+
+# 仅用于面板识别本仓库固定开发入口；生产 exe 以构建期能力清单及文件哈希为准。
+ACCOUNT_BINDING_SUPPORTED = True
 
 
 class LoginMismatchError(RuntimeError):
@@ -99,9 +102,11 @@ class NodeClient:
         reuse_terminal_session: bool = False,
     ) -> None:
         self.expected_mt5_login = int(mt5_login)
+        self.dashboard_expected_mt5_login = settings.dashboard_expected_mt5_login
+        require_dashboard_account({"login": self.expected_mt5_login}, self.dashboard_expected_mt5_login)
         self.mt5 = make_client(
             mt5_login, mt5_password, mt5_server, mt5_path,
-            reuse_terminal_session=reuse_terminal_session,
+            reuse_terminal_session=(reuse_terminal_session or self.dashboard_expected_mt5_login is not None),
         )
         self.loop: asyncio.AbstractEventLoop | None = None
         # MT5 的 Python API 非线程安全：所有阻塞调用固定在这一个线程里排队，
@@ -109,7 +114,7 @@ class NodeClient:
         self._mt5_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mt5")
         self._stop = False
         self.started_at = time.time()
-        self.node_id: int | None = None
+        self.node_id: str | None = None
         self.ws_connected = False
         self.ws_state = "starting"  # starting|connecting|authenticated|reconnecting|stopping
         self._current_ws = None
@@ -153,15 +158,15 @@ class NodeClient:
     async def run(self) -> None:
         """主入口：先连 MT5，再进入“连接-鉴权-服务”的自动重连循环。"""
         self.loop = asyncio.get_running_loop()
-        await self._connect_mt5()
-        self._ensure_hub()
-        self._status_server = LocalStatusServer(
-            host=settings.local_status_host,
-            port=settings.local_status_port,
-            status_provider=self.status_snapshot,
-            on_stop=self.request_shutdown,
-        )
         try:
+            await self._connect_mt5()
+            self._ensure_hub()
+            self._status_server = LocalStatusServer(
+                host=settings.local_status_host,
+                port=settings.local_status_port,
+                status_provider=self.status_snapshot,
+                on_stop=self.request_shutdown,
+            )
             await self._status_server.start()
             await self._connect_loop()
         finally:
@@ -228,9 +233,18 @@ class NodeClient:
         try:
             ok = await self._exec(self.mt5.connect)
             if not ok:
+                if self.dashboard_expected_mt5_login is not None:
+                    raise RuntimeError("面板启动失败：无法复用已授权 MT5 终端会话")
                 logger.error("MT5 connect failed (will keep reporting empty until available)")
+            if self.dashboard_expected_mt5_login is not None:
+                # 再读一次，挡住 peek 与正式 attach 之间发生的终端换号或退出登录。
+                require_dashboard_account(
+                    await self._exec(self.mt5.account_info), self.dashboard_expected_mt5_login,
+                )
         except Exception as e:  # noqa: BLE001
             logger.error("MT5 connect error: %s", e)
+            if self.dashboard_expected_mt5_login is not None:
+                raise
 
     def _check_login(self, acct: dict) -> None:
         """终端实时登录号须与启动绑定账号一致；缺失则跳过（避免暂空误杀）。"""
@@ -369,10 +383,7 @@ class NodeClient:
         if msg.get("type") == "auth_ok":
             data = msg.get("data") or {}
             raw_id = data.get("node_id")
-            try:
-                self.node_id = int(raw_id) if raw_id is not None else None
-            except (TypeError, ValueError):
-                self.node_id = None
+            self.node_id = str(raw_id) if raw_id is not None else None
             logger.info("authenticated as node %s", data.get("node_id"))
             self.apply_hub_symbols(data.get("watch_symbols"))
             self.apply_risk_config(data.get("risk"))
@@ -390,7 +401,7 @@ class NodeClient:
         data = msg.get("data") or {}
         reason = data.get("reason") or msg.get("type") or "unknown"
         reason_text = {
-            "invalid_token": "全局节点令牌无效；请到管理后台「账户设置 → 节点令牌」查看/重置后更新本机 .env",
+            "invalid_token": "节点接入令牌无效；面板节点请登录后重新配置专属凭证，旧节点请联系管理员更新 NODE_TOKEN",
             "already_online": "该 MT5 账户已有在线连接，本次登录被拒绝（同一账户同一时刻只允许一个在线）",
             "disabled": "节点已被管理员禁用，无法接入",
             "missing_mt5_login": "鉴权包缺少 MT5 账户登录号（请确认启动时输入的 MT5 账号正确且已成功登录终端）",

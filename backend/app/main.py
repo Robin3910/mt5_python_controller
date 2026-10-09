@@ -24,6 +24,7 @@ from . import (
     group_service,
     groups,
     node_service,
+    node_dashboard_api,
     nodes,
     rbac_service,
     roles_api,
@@ -120,6 +121,7 @@ app.add_middleware(
 # 注册所有路由
 for r in (
     auth.router,
+    node_dashboard_api.router,
     twofa.router,
     users_api.router,
     roles_api.router,

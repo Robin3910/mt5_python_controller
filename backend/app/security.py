@@ -72,7 +72,7 @@ def decode_access_jwt(token: str) -> Optional[dict]:
         data = jwt.decode(token, settings.jwt_secret, algorithms=["HS256"])
     except Exception:
         return None
-    if data.get("typ") == "2fa_pending" or not data.get("sub"):
+    if data.get("typ") not in (None, "access") or not data.get("sub"):
         return None
     try:
         ver = int(data.get("ver") or 0)

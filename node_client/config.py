@@ -3,6 +3,7 @@ import sys
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -20,7 +21,9 @@ class NodeSettings(BaseSettings):
 
     # 后端网关地址，生产经 nginx/TLS 走 wss://hub.example.com/ws/node
     manager_ws_url: str = "ws://localhost:8000/ws/node"
-    node_token: str = ""  # 后端 POST /api/nodes 返回的一次性令牌
+    node_token: str = ""  # 节点接入令牌；面板节点由后台签发每节点专属凭证
+    # 面板通过进程环境注入，存在时只能复用此账号的已登录终端，禁止交互换号。
+    dashboard_expected_mt5_login: int | None = Field(default=None, gt=0)
 
     mt5_mock: bool = False  # true 时用内存模拟，免装 MT5
 

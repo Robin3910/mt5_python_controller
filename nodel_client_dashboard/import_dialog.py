@@ -24,6 +24,9 @@ from dialog_window import hide_while_building, show_centered
 from models import InstanceConfig, default_label_from_path
 from process_manager import ProcessManager
 from store import load_panel_config
+from session_ui import SessionDialog
+from client_binding import require_binding
+from terminal_account import TerminalAccountError, enroll_import_login, read_terminal_account, typed_login
 from theme import (
     ACCENT,
     BG,
@@ -45,7 +48,7 @@ from theme import (
 _NO_VERSION = "（尚未检测）"
 
 
-class ImportNodeDialog(ctk.CTkToplevel):
+class ImportNodeDialog(SessionDialog):
     """把一个 MT5 目录部署成新的节点实例。成功后 `created` 为新实例配置。"""
 
     _W = 780
@@ -65,6 +68,7 @@ class ImportNodeDialog(ctk.CTkToplevel):
         self._busy = False
         self._versions: list[dict] = []
         self._current = ""
+        self._pending_cfg = None
 
         self.dir_var = tk.StringVar()
         self.name_var = tk.StringVar()
@@ -145,21 +149,21 @@ class ImportNodeDialog(ctk.CTkToplevel):
         inner = ctk.CTkFrame(opts, fg_color="transparent")
         inner.pack(fill="x", padx=12, pady=10)
         ctk.CTkCheckBox(
-            inner, text="自动写入 .env（用面板的连接配置填后端地址与令牌）",
+            inner, text="生成准备配置 .env（开通后自动配置专属令牌）",
             variable=self.write_env_var, checkbox_width=18, checkbox_height=18,
             fg_color=ACCENT, hover_color=ACCENT, border_color=GLASS_BORDER,
             text_color=TEXT, font=font(12),
         ).pack(anchor="w")
         ctk.CTkCheckBox(
-            inner, text="导入后立即启动", variable=self.start_after_var,
+            inner, text="需管理员审核开通后才能启动", variable=self.start_after_var, state="disabled",
             checkbox_width=18, checkbox_height=18,
             fg_color=ACCENT, hover_color=ACCENT, border_color=GLASS_BORDER,
             text_color=TEXT, font=font(12),
         ).pack(anchor="w", pady=(6, 0))
         ctk.CTkLabel(
             inner,
-            text="勾选自动写入时，目录里已有的 .env 会整份覆盖；想保留旧文件请取消勾选。"
-                 "MT5 未登录时节点需要交互输入账号，首次建议先不自动启动。",
+            text="导入仅准备本机客户端并申请节点。账号可留空，留空将读取终端当前登录号。"
+                 "后台节点归属分配与启用审核均完成后，启动时仍会核对该账号，不符会拒绝启动。",
             text_color=TEXT_DIM, font=font(11), anchor="w",
             justify="left", wraplength=680,
         ).pack(anchor="w", pady=(6, 0))
@@ -190,7 +194,7 @@ class ImportNodeDialog(ctk.CTkToplevel):
         return [c.cwd or str(Path(c.exe_path).parent) for c in self.manager.configs()]
 
     def _target(self) -> vs.BackendTarget:
-        return vs.resolve_backend(load_panel_config(), self._cwds())
+        return self.version_target()
 
     def _browse(self) -> None:
         path = filedialog.askdirectory(
@@ -290,6 +294,7 @@ class ImportNodeDialog(ctk.CTkToplevel):
     # ---------------------------------------------------------------- 导入
 
     def _run_async(self, label: str, fn) -> None:
+        self.session_check()
         if self._busy:
             messagebox.showinfo("请稍候", "上一个操作还在进行中", parent=self)
             return
@@ -297,6 +302,8 @@ class ImportNodeDialog(ctk.CTkToplevel):
 
         def worker():
             try:
+                self.session._local.generation = self._session_generation
+                self.session_check()
                 fn()
             # 必须先取出消息：except 块结束时 e 会被解绑，延迟执行的 lambda 里读不到它
             except vs.VersionServiceError as e:
@@ -306,11 +313,13 @@ class ImportNodeDialog(ctk.CTkToplevel):
                 msg = str(e)
                 self.after(0, lambda: messagebox.showerror(label, msg, parent=self))
             finally:
+                self.session._local.generation = None
                 self.after(0, lambda: setattr(self, "_busy", False))
 
         threading.Thread(target=worker, name=f"import-{label}", daemon=True).start()
 
     def _import(self) -> None:
+        self.session_check()
         if not self._check_dir():
             return
         directory = Path(self.dir_var.get().strip())
@@ -327,13 +336,12 @@ class ImportNodeDialog(ctk.CTkToplevel):
 
         exe_path = directory / "node_client.exe"
         dup = next(
-            (c for c in self.manager.configs() if Path(c.exe_path) == exe_path), None
+            (c for c in self.dashboard._inventory.values() if Path(c.exe_path).resolve() == exe_path.resolve()), None
         )
         if dup is not None:
             messagebox.showinfo(
                 "已存在",
-                f"实例「{dup.name}」已经指向该目录。\n\n"
-                "如需更新它的客户端版本，请用顶栏「版本更新」。",
+                "该目录已登记为实例，不能重复导入。请使用版本更新。",
                 parent=self,
             )
             return
@@ -366,10 +374,26 @@ class ImportNodeDialog(ctk.CTkToplevel):
         if not messagebox.askyesno("导入确认", "\n".join(lines), parent=self):
             return
 
+        from tkinter import simpledialog
+        raw = simpledialog.askstring(
+            "申请节点",
+            "此 MT5 终端的实际账号（留空则读取终端当前登录号）：",
+            parent=self,
+        )
+        if raw is None:
+            return
+        try:
+            typed_login(raw)
+        except TerminalAccountError as exc:
+            messagebox.showerror("申请节点", str(exc), parent=self)
+            return
+        cfg = InstanceConfig.create(name=name, exe_path=str(exe_path), cwd=str(directory))
+        self._pending_cfg = cfg
+
         sha = str(item.get("sha256") or "")
         self._run_async(
             "导入",
-            lambda: self._deploy(target, version, sha, directory, name, write_env, ws_url),
+            lambda: self._deploy(target, version, sha, directory, name, write_env, ws_url, raw),
         )
 
     def _deploy(
@@ -381,8 +405,17 @@ class ImportNodeDialog(ctk.CTkToplevel):
         name: str,
         write_env: bool,
         ws_url: str,
+        account_raw: str,
     ) -> None:
-        """下载 → 校验 → 解压 → 覆盖到 MT5 目录 → 写 .env → 注册实例。"""
+        """先申请节点，再下载 → 校验 → 解压 → 覆盖到 MT5 目录 → 写 .env → 注册实例。"""
+        self.session_check()
+        if not (account_raw or "").strip():
+            self.after(0, lambda: self.status.configure(text="正在读取 MT5 当前登录号…", text_color=TEXT_MUTED))
+
+        def enroll(login: int, server: str) -> None:
+            self.dashboard._enroll_instance(self._pending_cfg, login, server)
+
+        enroll_import_login(account_raw, lambda: read_terminal_account(directory), enroll)
         with tempfile.TemporaryDirectory(prefix="node_client_import_") as tmp:
             tmpdir = Path(tmp)
             pkg = tmpdir / f"node_client-{version}.zip"
@@ -403,7 +436,9 @@ class ImportNodeDialog(ctk.CTkToplevel):
             ))
             exe_path = directory / "node_client.exe"
             # 目录里可能已有旧客户端，backup=True 让它先进版本化备份
-            ok, msg = apply_package(extract_dir, exe_path, backup=True)
+            self.session_check()
+            require_binding(extract_dir / "node_client.exe")
+            ok, msg = self.session.perform("import_node", self._pending_cfg, lambda: apply_package(extract_dir, exe_path, backup=True), generation=self._session_generation)
             if not ok:
                 raise RuntimeError(msg)
 
@@ -415,12 +450,11 @@ class ImportNodeDialog(ctk.CTkToplevel):
         env_written = False
         env_overwritten = False
         if write_env:
-            env_overwritten = ef.write_import_env(
-                directory,
-                template,
-                ws_url=ws_url,
-                node_token=target.token,
-            )
+            self.session_check()
+            old, _ = ef.read_env(directory)
+            env_overwritten = bool(old)
+            updates = {"MANAGER_WS_URL": ws_url, "DASHBOARD_EXPECTED_MT5_LOGIN": str(self._pending_cfg.mt5_login)}
+            self.session.perform("edit_env", self._pending_cfg, lambda: ef.write_env(directory, ef.update_env_text(old or template, updates)), generation=self._session_generation)
             env_written = True
 
         # 注册实例必须回主线程：ProcessManager 与实例列表由 UI 线程持有
@@ -441,12 +475,11 @@ class ImportNodeDialog(ctk.CTkToplevel):
         env_written: bool,
         env_overwritten: bool = False,
     ) -> None:
+        self.session_check()
         exe_path = directory / "node_client.exe"
-        cfg = InstanceConfig.create(
-            name=name or default_label_from_path(str(exe_path)),
-            exe_path=str(exe_path),
-            cwd=str(directory),
-        )
+        cfg = self._pending_cfg
+        if cfg is None:
+            raise RuntimeError("节点申请未完成")
         self.manager.add(cfg)
         self.created = cfg
         if self._on_done:
@@ -460,13 +493,10 @@ class ImportNodeDialog(ctk.CTkToplevel):
             parts.append(".env 已生成")
         self.status.configure(text="　".join(parts), text_color=ACCENT)
 
-        if self.start_after_var.get():
-            self.manager.start(cfg.id)
-
         if env_overwritten:
-            env_note = "已覆盖 .env（地址与令牌来自面板连接配置），可直接启动。"
+            env_note = "准备配置已保存；待管理员审核开通后再启动。"
         elif env_written:
-            env_note = "已生成 .env，可直接启动。"
+            env_note = "已生成准备配置；待管理员审核开通后再启动。"
         else:
             env_note = "请确认 .env 已配置好后端地址与令牌，再启动实例。"
         messagebox.showinfo(
@@ -477,3 +507,4 @@ class ImportNodeDialog(ctk.CTkToplevel):
             + env_note,
             parent=self,
         )
+        self.destroy()

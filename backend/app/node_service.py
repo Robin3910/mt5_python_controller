@@ -9,13 +9,13 @@ import time
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 
 from . import group_service
 from .db import SessionLocal
 from . import risk_control
 from .models import NodeCreate, NodeUpdate
-from .orm import Node
+from .orm import Node, NodeCredential
 from .redis_store import RedisStore
 from .rules import validate_node_global_lot_mode
 from .security import make_node_id
@@ -41,17 +41,27 @@ def node_row_to_dict(row: Node) -> dict:
             row.client_version_at.timestamp() if row.client_version_at else None
         ),
         "owner_user_id": row.owner_user_id,
+        "approval_status": row.approval_status,
+        "requested_by_user_id": row.requested_by_user_id,
+        "admin_enable_requested": bool(row.admin_enable_requested),
         "created_at": row.created_at.timestamp() if row.created_at else time.time(),
     }
 
 
 async def warm_cache(store: RedisStore) -> int:
-    """启动时把库里的节点全部预热进 Redis（含 mt5_login 反查索引）。"""
+    """启动时以库为准刷新 Redis，并丢掉库里已经没有的缓存节点。"""
     async with SessionLocal() as s:
         rows = (await s.execute(select(Node))).scalars().all()
+    alive = set()
     for row in rows:
+        alive.add(row.node_id)
         await store.cache_node(node_row_to_dict(row))
-    return len(rows)
+    for cached in await store.all_nodes():
+        nid = cached.get("node_id")
+        if nid and nid not in alive:
+            await store.delete_node(nid)
+            await group_service.remove_node_from_all_groups(store, nid)
+    return len(alive)
 
 
 # 节点自动注册时，每个品种的按币种默认条目（与节点详情表单默认一致）
@@ -164,7 +174,15 @@ async def auto_register(store: RedisStore, mt5_login: int) -> dict:
     )
 
 
-async def update_node(store: RedisStore, node_id: str, patch: NodeUpdate) -> Optional[dict]:
+async def _locked_node(session, node_id: str):
+    """串行化启用意图与归属更改，避免同时提交后两个条件齐备却未开通。"""
+    if session.bind.dialect.name == "sqlite":
+        await session.execute(text("BEGIN IMMEDIATE"))
+    return await session.scalar(select(Node).where(Node.node_id == node_id).with_for_update())
+
+
+async def update_node(store: RedisStore, node_id: str, patch: NodeUpdate, *, admin_enable_intent: bool = False,
+                      audit_principal=None, audit_ip: str | None = None) -> Optional[dict]:
     """更新节点：仅写入“非空”字段；成功后刷新缓存。"""
     if patch.filters is not None:
         err = validate_node_global_lot_mode(
@@ -179,17 +197,37 @@ async def update_node(store: RedisStore, node_id: str, patch: NodeUpdate) -> Opt
         if err:
             raise ValueError(err)
     async with SessionLocal() as s:
-        row = await s.get(Node, node_id)
+        row = await _locked_node(s, node_id)
         if not row:
             return None
-        for f in ("name", "enabled"):
+        approval_change = row.approval_status == "pending" and patch.enabled is not None
+        approval_before = {"approval_status": row.approval_status, "enabled": row.enabled,
+                           "admin_enable_requested": row.admin_enable_requested}
+        for f in ("name",):
             v = getattr(patch, f, None)
             if v is not None:
                 setattr(row, f, v)
+        if patch.enabled is not None:
+            if row.approval_status == "pending":
+                if not admin_enable_intent:
+                    raise ValueError("新增节点须由管理员审核开通")
+                row.admin_enable_requested = patch.enabled
+                row.enabled = False
+                from .node_credentials import activate_if_ready
+                await activate_if_ready(s, row)
+            else:
+                row.enabled = patch.enabled
         if patch.filters is not None:
             row.filters_json = patch.filters
         if risk_norm is not None:
             row.risk_json = risk_norm
+        if approval_change and audit_principal is not None:
+            from .dashboard_audit import begin_operation
+            audit_row = await begin_operation(s, audit_principal, "approval_intent", target=node_id,
+                                              params={"enabled": bool(patch.enabled)}, ip=audit_ip, result="ok")
+            audit_row.before_json = approval_before
+            audit_row.after_json = {"approval_status": row.approval_status, "enabled": row.enabled,
+                                    "admin_enable_requested": row.admin_enable_requested}
         await s.commit()
         await s.refresh(row)
         d = node_row_to_dict(row)
@@ -198,14 +236,31 @@ async def update_node(store: RedisStore, node_id: str, patch: NodeUpdate) -> Opt
 
 
 async def set_owner(
-    store: RedisStore, node_id: str, owner_user_id: Optional[int],
+    store: RedisStore, node_id: str, owner_user_id: Optional[int], *, audit_principal=None,
+    audit_ip: str | None = None,
 ) -> Optional[dict]:
     """改节点归属（None = 回到管理员名下）；前置校验（活动子任务、分组成员）由调用方完成。"""
     async with SessionLocal() as s:
-        row = await s.get(Node, node_id)
+        row = await _locked_node(s, node_id)
         if not row:
             return None
-        row.owner_user_id = owner_user_id
+        owner_changed = row.owner_user_id != owner_user_id
+        previous_owner = row.owner_user_id
+        if owner_changed:
+            from .node_credentials import activate_if_ready, revoke_on_transfer
+            credential = await s.get(NodeCredential, node_id)
+            needs_strict_audit = row.approval_status == "pending" or bool(
+                credential and (credential.token_sha256 or not credential.legacy_allowed))
+            await revoke_on_transfer(s, node_id, owner_user_id)
+            row.owner_user_id = owner_user_id
+            await activate_if_ready(s, row)
+            if needs_strict_audit and audit_principal is not None:
+                from .dashboard_audit import begin_operation
+                audit_row = await begin_operation(s, audit_principal, "assign_node", target=node_id,
+                                                  params={"node_id": node_id}, ip=audit_ip, result="ok")
+                audit_row.before_json = {"owner_user_id": previous_owner}
+                audit_row.after_json = {"owner_user_id": owner_user_id, "approval_status": row.approval_status,
+                                        "enabled": row.enabled}
         await s.commit()
         await s.refresh(row)
         d = node_row_to_dict(row)
@@ -260,13 +315,23 @@ async def report_client_version(
 
 
 async def delete_node(store: RedisStore, node_id: str) -> bool:
-    """删除节点：先删库，再清理 Redis 缓存/快照/在线标记与分组成员关联。"""
+    """删除节点：先删库，再清理 Redis 缓存/快照/在线标记与分组成员关联。
+
+    列表读的是 Redis。账本行已经不在、缓存还在时也要清掉，否则删除接口返回
+    404，页面上的节点却一直还在。
+    """
+    cached = await store.get_node(node_id)
     async with SessionLocal() as s:
         row = await s.get(Node, node_id)
-        if not row:
+        credential = await s.get(NodeCredential, node_id)
+        if row is None and credential is None and not cached:
             return False
-        await s.delete(row)
-        await s.commit()
+        if credential is not None:
+            await s.delete(credential)
+        if row is not None:
+            await s.delete(row)
+        if row is not None or credential is not None:
+            await s.commit()
     await store.delete_node(node_id)
     await group_service.remove_node_from_all_groups(store, node_id)
     return True

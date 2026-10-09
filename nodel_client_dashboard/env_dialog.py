@@ -18,6 +18,8 @@ import customtkinter as ctk
 import env_file as ef
 from dialog_window import hide_while_building, show_centered
 from models import InstanceConfig
+from session_ui import SessionDialog, secured
+from env_policy import PROTECTED_ENV_KEYS, protected_changes, redact_env, merge_redacted_env, env_values
 from theme import (
     ACCENT,
     BG,
@@ -36,7 +38,7 @@ from theme import (
 )
 
 
-class EnvConfigDialog(ctk.CTkToplevel):
+class EnvConfigDialog(SessionDialog):
     """编辑某个实例的 .env。保存成功后 `saved` 为 True。"""
 
     _W = 780
@@ -54,12 +56,15 @@ class EnvConfigDialog(ctk.CTkToplevel):
         self.saved = False
         self._cwd = cfg.cwd or str(Path(cfg.exe_path).parent)
         self._raw_text, values = ef.read_env(self._cwd)
+        values = env_values(self._raw_text)
         self._existed = bool(self._raw_text)
 
         self._vars: dict[str, tk.StringVar] = {}
         self._bools: dict[str, tk.BooleanVar] = {}
         for field in ef.ENV_FIELDS:
             raw = values.get(field.key, "")
+            if not self.session.is_admin and field.key in PROTECTED_ENV_KEYS:
+                raw = "（由面板管理）"
             if field.kind == "bool":
                 self._bools[field.key] = tk.BooleanVar(value=ef.as_bool(raw))
             else:
@@ -157,6 +162,8 @@ class EnvConfigDialog(ctk.CTkToplevel):
                     show="*" if field.secret else "",
                 )
                 entry.grid(row=row, column=1, padx=8, pady=6, sticky="ew")
+                if not self.session.is_admin and field.key in PROTECTED_ENV_KEYS:
+                    entry.configure(state="disabled")
                 if field.secret:
                     self._secret_entries.append(entry)
 
@@ -187,8 +194,9 @@ class EnvConfigDialog(ctk.CTkToplevel):
             border_width=1, corner_radius=10, font=mono(12),
         )
         self.raw_box.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-        self.raw_box.insert("1.0", self._raw_text)
-        self._raw_baseline = self._raw_text
+        displayed = self._raw_text if self.session.is_admin else redact_env(self._raw_text)
+        self.raw_box.insert("1.0", displayed)
+        self._raw_baseline = displayed
 
     def _show_centered(self) -> None:
         show_centered(self, self._W, self._H)
@@ -201,21 +209,29 @@ class EnvConfigDialog(ctk.CTkToplevel):
             entry.configure(show=show)
 
     def _reload(self) -> None:
+        self.session_check()
         self._raw_text, values = ef.read_env(self._cwd)
+        values = env_values(self._raw_text)
         for field in ef.ENV_FIELDS:
             raw = values.get(field.key, "")
+            if not self.session.is_admin and field.key in PROTECTED_ENV_KEYS:
+                raw = "（由面板管理）"
             if field.kind == "bool":
                 self._bools[field.key].set(ef.as_bool(raw))
             else:
                 self._vars[field.key].set(raw)
+        self.raw_box.configure(state="normal")
         self.raw_box.delete("1.0", "end")
-        self.raw_box.insert("1.0", self._raw_text)
-        self._raw_baseline = self._raw_text
+        displayed = self._raw_text if self.session.is_admin else redact_env(self._raw_text)
+        self.raw_box.insert("1.0", displayed)
+        self._raw_baseline = displayed
         self.status.configure(text="已从磁盘重新载入", text_color=TEXT_MUTED)
 
     def _form_values(self) -> dict[str, str]:
         out: dict[str, str] = {}
         for field in ef.ENV_FIELDS:
+            if not self.session.is_admin and field.key in PROTECTED_ENV_KEYS:
+                continue
             if field.kind == "bool":
                 out[field.key] = ef.bool_text(self._bools[field.key].get())
             else:
@@ -227,28 +243,40 @@ class EnvConfigDialog(ctk.CTkToplevel):
                     out[field.key] = value
         return out
 
+    @secured("edit_env", lambda self: self.cfg)
     def _save(self) -> None:
         raw_now = self.raw_box.get("1.0", "end-1c")
         raw_edited = raw_now != self._raw_baseline
 
         if raw_edited:
             # 原始文本被改过就以它为准：两边都改时无法合并，猜错会丢用户的编辑
-            errors = ef.validate_env(ef.parse_env_text(raw_now))
-            text = raw_now if raw_now.endswith("\n") else raw_now + "\n"
+            try:
+                text = raw_now if self.session.is_admin else merge_redacted_env(self._raw_text, raw_now)
+            except ValueError as exc:
+                self.status.configure(text=str(exc), text_color=DANGER)
+                return False
+            text = text if text.endswith("\n") else text + "\n"
+            errors = ef.validate_env(env_values(text))
         else:
             values = self._form_values()
-            errors = ef.validate_env(values)
             text = ef.update_env_text(self._raw_text, values)
+            errors = ef.validate_env(env_values(text))
+        if self.cfg.approval_status == "pending":
+            errors = [err for err in errors if "节点接入令牌" not in err]
+
+        if not self.session.is_admin and protected_changes(self._raw_text, text):
+            self.status.configure(text="后端地址、节点令牌与账户绑定仅由面板管理", text_color=DANGER)
+            return False
 
         if errors:
             self.status.configure(text="；".join(errors), text_color=DANGER)
-            return
+            return False
 
         try:
             ef.write_env(self._cwd, text)
         except OSError as e:
             messagebox.showerror("保存失败", str(e), parent=self)
-            return
+            return False
 
         self.saved = True
         self.status.configure(

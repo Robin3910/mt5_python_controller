@@ -88,7 +88,10 @@ class RedisStore:
         """删除节点时，连带清理 mt5_login 反查索引、账户快照、在线标记。"""
         n = await self.get_node(node_id)
         if n and n.get("mt5_login"):
-            await self.r.delete(K_NODE_BY_LOGIN.format(int(n["mt5_login"])))
+            login_key = K_NODE_BY_LOGIN.format(int(n["mt5_login"]))
+            # 同一登录号可能已被新节点占用；只在索引仍指向本节点时才删
+            if await self.r.get(login_key) == node_id:
+                await self.r.delete(login_key)
         await self.r.delete(K_NODE.format(node_id))
         await self.r.delete(K_ACCOUNT.format(node_id))
         await self.r.delete(K_ONLINE.format(node_id))

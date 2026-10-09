@@ -20,6 +20,7 @@ from . import (
     market_probe,
     mt5_identity,
     node_service,
+    node_credentials,
     persist,
     results,
     risk_control,
@@ -114,9 +115,16 @@ async def node_ws(ws: WebSocket):
     data = msg.get("data") or {}
     token = data.get("token", "")
 
-    # ---- 1. 校验全局节点令牌（所有节点共享同一 NODE_TOKEN）----
-    expected_token, _ = await system_settings.get_node_token(store) if store else ("", 0)
-    if not expected_token or not compare_secret(token, expected_token):
+    # ---- 1. 专属令牌限定节点；旧全局令牌仅为允许兼容的节点保留 ----
+    scoped = isinstance(token, str) and token.startswith("ndv1.")
+    scoped_node = None
+    if scoped:
+        scoped_node = await node_credentials.authenticate_scoped(token, _parse_mt5_login(data))
+        valid_token = scoped_node is not None
+    else:
+        expected_token, _ = await system_settings.get_node_token(store) if store else ("", 0)
+        valid_token = bool(expected_token and isinstance(token, str) and compare_secret(token, expected_token))
+    if not valid_token:
         await ws.send_json({"type": "auth_fail", "data": {"reason": "invalid_token"}})
         await ws.close(code=4401)
         return
@@ -136,7 +144,7 @@ async def node_ws(ws: WebSocket):
 
     # ---- 3. 按 mt5_login 查找节点；不存在则自动注册（默认配置见 node_service）----
     node_id = await store.node_by_mt5_login(client_login) if store else None
-    node = await store.get_node(node_id) if node_id else None
+    node = scoped_node or (await store.get_node(node_id) if node_id else None)
 
     if not node:
         # 兜底走 DB 直查（避免缓存未同步时误判为不存在）
@@ -163,7 +171,11 @@ async def node_ws(ws: WebSocket):
         )
 
     node_id = node["node_id"]
-    if not node.get("enabled", True):
+    if not scoped and not await node_credentials.legacy_allowed(node_id):
+        await ws.send_json({"type": "auth_fail", "data": {"reason": "invalid_token", "message": "节点需要专属接入令牌"}})
+        await ws.close(code=4401)
+        return
+    if node.get("approval_status", "approved") != "approved" or not node.get("enabled", True):
         await ws.send_json({"type": "auth_fail", "data": {"reason": "disabled", "message": "节点已被禁用，无法接入"}})
         await ws.close(code=4403)  # 节点被禁用
         return
@@ -189,6 +201,7 @@ async def node_ws(ws: WebSocket):
     await node_service.report_client_version(store, node_id, data.get("client_version") or "")
 
     # 先登记连接再回 auth_ok，确保节点收到确认时即可被路由（消除竞态）
+    ws.scope["node_credential_kind"] = "scoped" if scoped else "legacy"
     await manager.register_node(node_id, ws)
     await store.touch_online(node_id)
     watch_symbols = rules.filter_watch_symbols(await store.get_filters())

@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from . import (
     group_persist,
@@ -347,10 +347,13 @@ async def assign_nodes(
     previous_owners = {
         permissions.normalize_owner(nodemap[nid].get("owner_user_id")) for nid in added
     }
-    for nid in added:
-        await node_service.set_owner(store, nid, user.id)
-    for nid in removed:
-        await node_service.set_owner(store, nid, None)
+    try:
+        for nid in added:
+            await node_service.set_owner(store, nid, user.id, audit_principal=p, audit_ip=ip)
+        for nid in removed:
+            await node_service.set_owner(store, nid, None, audit_principal=p, audit_ip=ip)
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="audit or database unavailable") from exc
 
     names = await rbac_service.username_map()
     affected = {user.username} | {names[o] for o in previous_owners if o in names}

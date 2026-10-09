@@ -8,6 +8,7 @@ import { useRoute, useRouter } from 'vue-router'
 import TagSelect from '@/components/TagSelect.vue'
 import type { TagOption } from '@/components/tagOption'
 import { useHubStore } from '@/stores/hub'
+import { useAuthStore } from '@/stores/auth'
 import type {
   AccountSnapshot,
   LotPlTiersRule,
@@ -24,6 +25,7 @@ import type {
 } from '@/api/types'
 import { parseNodeDispatchFilters } from '@/utils/filterRules'
 import { confirmAction } from '@/utils/confirm'
+import { isPendingNode, nodeApprovalHint, nodeEnableIntent, nodeEnableLabel } from '@/utils/nodeApproval'
 
 const MONITOR_MODE_TAGS: TagOption<RiskMonitorMode>[] = [
   { value: 'loop', label: '循环' },
@@ -59,6 +61,7 @@ const TrendPanel = defineAsyncComponent(() => import('@/components/TrendPanel.vu
 const route = useRoute()
 const router = useRouter()
 const hub = useHubStore()
+const auth = useAuthStore()
 
 const id = computed(() => String(route.params.id))
 const node = computed<NodeOut | undefined>(() => hub.nodes.find((n) => n.node_id === id.value))
@@ -595,9 +598,12 @@ function feedDetail(row: NodeFeedItem): string {
 // ---- 操作 ----
 async function toggleEnabled(): Promise<void> {
   if (!node.value) return
-  const next = node.value.enabled ? '禁用' : '启用'
-  if (!(await confirmAction(`确认${next}节点「${node.value.name}」？`, `确认${next}`))) return
-  await hub.updateNode(id.value, { enabled: !node.value.enabled })
+  if (isPendingNode(node.value) && !auth.isAdmin) return
+  const current = nodeEnableIntent(node.value)
+  const next = current ? '禁用' : '启用'
+  const hint = isPendingNode(node.value) ? '\n\n确认启用与分配给申请人两项齐全后才会开通；操作顺序不限。' : ''
+  if (!(await confirmAction(`确认${next}节点「${node.value.name}」？${hint}`, `确认${next}`))) return
+  await hub.updateNode(id.value, { enabled: !current })
 }
 async function closeNodeAll(): Promise<void> {
   if (!(await confirmAction(
@@ -625,14 +631,15 @@ async function closeTicket(ticket: number): Promise<void> {
             {{ node.node_id }} · {{ acct?.login || node.mt5_login || '—' }} @
             {{ acct?.server || node.mt5_server || '—' }}
           </div>
+          <div v-if="isPendingNode(node)" class="muted" style="font-size: 12px; margin-top: 4px">{{ nodeApprovalHint(node) }}</div>
         </div>
         <span class="tag" :class="statusOf === 'online' ? 'green' : ''">
           {{ statusOf === 'online' ? '在线' : '离线' }}
         </span>
       </div>
       <div class="row">
-        <button class="btn-sm" :class="node.enabled ? 'btn-ghost' : 'btn-danger'" @click="toggleEnabled">
-          {{ node.enabled ? '已启用' : '已禁用' }}
+        <button class="btn-sm" :class="nodeEnableIntent(node) ? 'btn-ghost' : 'btn-danger'" :disabled="isPendingNode(node) && !auth.isAdmin" @click="toggleEnabled">
+          {{ nodeEnableLabel(node) }}
         </button>
         <button class="btn-sm btn-ghost" :disabled="!positions.length" @click="closeNodeAll">平掉全部</button>
       </div>

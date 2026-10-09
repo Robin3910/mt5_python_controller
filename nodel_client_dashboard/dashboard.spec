@@ -29,7 +29,7 @@ try:
 except Exception:
     pass
 
-for pkg in ("pystray", "PIL"):
+for pkg in ("pystray", "PIL", "MetaTrader5"):
     try:
         pkg_datas, pkg_binaries, pkg_hidden = collect_all(pkg)
         datas += pkg_datas
