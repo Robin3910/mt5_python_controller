@@ -270,7 +270,12 @@ const FIELD_HELP = {
     '点数 = 固定间距，偏离达到「点数 × Point()」触发；\n' +
     '指定价 = 到价触发，多单要求价位低于参考价、空单要求高于参考价；\n' +
     `ATR = 用 ${BATCH_BAR_PERIOD} 根已收盘 K 线的平均真实波幅作间距；\n` +
-    `波幅 = 用 ${BATCH_BAR_PERIOD} 根已收盘 K 线中最大的高低波幅作间距。`,
+    `波幅 = 用 ${BATCH_BAR_PERIOD} 根已收盘 K 线中最大的高低波幅作间距；\n` +
+    'FVG / OB / PDZ / FIBO = 只作标识，节点不计算指标。仅逆势档位可选，' +
+    '等 TradingView 按所选 K 线周期推送同类型价位，现价触到最近一条再市价加仓。',
+  batch_smc_timeframe:
+    '只用来和 TradingView 推送里的 tf 对应，节点不会按这个周期去读 K 线。' +
+    '可选 M1 / M5 / M15 / M30 / H1 / H4 / D1 / W1 / MN。',
   batch_price:
     '本档的指定价位（绝对价格）。逆势时多单需低于参考价、空单需高于参考价；' +
     '顺势方向相反。价位方向不符或留空时本档不会触发。',
@@ -595,6 +600,24 @@ const CALC_TYPE_OPTIONS: Array<{ value: BatchCalcType; label: string }> = [
   { value: 'atr', label: 'ATR' },
   { value: 'range', label: '波幅' },
 ]
+
+/** 只给逆势档位：节点不计算这些指标，只用来匹配 TradingView 推送 */
+const SMC_CALC_TYPE_OPTIONS: Array<{ value: BatchCalcType; label: string }> = [
+  { value: 'fvg', label: 'FVG' },
+  { value: 'ob', label: 'OB' },
+  { value: 'pdz', label: 'PDZ' },
+  { value: 'fibo', label: 'FIBO' },
+]
+const SMC_CALC_TYPES: BatchCalcType[] = SMC_CALC_TYPE_OPTIONS.map((o) => o.value)
+
+function calcTypeOptions(ruleType: number): Array<{ value: BatchCalcType; label: string }> {
+  if (ruleType === RULE_TYPE_COUNTER) return [...CALC_TYPE_OPTIONS, ...SMC_CALC_TYPE_OPTIONS]
+  return CALC_TYPE_OPTIONS
+}
+
+function isSmcCalc(calcType: BatchCalcType): boolean {
+  return SMC_CALC_TYPES.includes(calcType)
+}
 
 /** ATR / 波幅可选周期。不提供「当前图表周期」：节点是独立进程，没有图表上下文 */
 const TIMEFRAME_OPTIONS: BatchTimeframe[] = [
@@ -1261,12 +1284,20 @@ function validateRules(rules: EditableRule[]): string | null {
       const at = `${label} 档位 ${i + 1}`
       if (lv.pos_from < 1) return `${at}：加仓笔数起点至少为 1`
       if (lv.pos_to < lv.pos_from) return `${at}：加仓笔数终点不能小于起点`
-      if (!CALC_TYPE_OPTIONS.some((o) => o.value === lv.calc_type)) {
+      if (!calcTypeOptions(r.type).some((o) => o.value === lv.calc_type)) {
         return `${at}：计算方式非法`
       }
-      if (lv.calc_type === 'point' && !(lv.point > 0)) return `${at}：点数需大于 0`
+      if (!isSmcCalc(lv.calc_type) && lv.calc_type === 'point' && !(lv.point > 0)) {
+        return `${at}：点数需大于 0`
+      }
       if (lv.calc_type === 'price' && !(lv.price > 0)) return `${at}：请填写指定价位`
-      if (isBarCalc(lv.calc_type) && !TIMEFRAME_OPTIONS.includes(lv.timeframe)) {
+      if (isSmcCalc(lv.calc_type) && r.type !== RULE_TYPE_COUNTER) {
+        return `${at}：顺势加仓不支持 FVG / OB / PDZ / FIBO`
+      }
+      if (
+        (isBarCalc(lv.calc_type) || isSmcCalc(lv.calc_type))
+        && !TIMEFRAME_OPTIONS.includes(lv.timeframe)
+      ) {
         return `${at}：请选择 K 线周期`
       }
       if (lv.point < 0) return `${at}：点数不能为负`
@@ -1440,8 +1471,9 @@ function reportGroupTrigger(payload: ManualSignalPayload, res: ManualSignalResul
       ElMessage.success(`已触发 ${head}：${detail}`)
       return
     }
+    const taskRows = Array.isArray(res.tasks) ? res.tasks : []
     const reasons = [
-      ...new Set((res.tasks || []).map((t) => (t.reason || '').trim()).filter(Boolean)),
+      ...new Set(taskRows.map((t) => (t.reason || '').trim()).filter(Boolean)),
     ]
     const hint = reasons.length ? reasons.join('；') : '分组无有效节点，或未能下发到任何节点'
     ElMessage.warning(`${head} 已受理但未下发：${detail}（${hint}）`)
@@ -2279,7 +2311,7 @@ function resetRuleToTemplate(idx: number): void {
                         <TagSelect
                           :id="`rule-${idx}-lv-${li}-calc`"
                           v-model="lv.calc_type"
-                          :options="CALC_TYPE_OPTIONS"
+                          :options="calcTypeOptions(r.type)"
                           aria-label="计算方式"
                         />
                       </div>
@@ -2297,11 +2329,11 @@ function resetRuleToTemplate(idx: number): void {
                           step="0.00001"
                         />
                       </div>
-                      <div v-else-if="isBarCalc(lv.calc_type)" class="field">
+                      <div v-else-if="isBarCalc(lv.calc_type) || isSmcCalc(lv.calc_type)" class="field">
                         <FormLabel
                           :field-id="`rule-${idx}-lv-${li}-tf`"
                           text="K 线周期"
-                          :help="FIELD_HELP.batch_timeframe"
+                          :help="isSmcCalc(lv.calc_type) ? FIELD_HELP.batch_smc_timeframe : FIELD_HELP.batch_timeframe"
                         />
                         <TagSelect
                           :id="`rule-${idx}-lv-${li}-tf`"

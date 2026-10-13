@@ -515,6 +515,53 @@ def test_normal_and_strategy_not_deduped_against_each_other(client):
     assert other["mode"] == "group"
 
 
+def test_manual_signal_accepts_smc_data(client):
+    """手动触发可以推 type=smc-data；没有进行中的任务时不写副本，也不当开仓信号。"""
+    h = auth_headers(client)
+    r = client.post(
+        "/api/console/manual-signal",
+        json={
+            "type": "smc-data",
+            "symbol": "XAUUSDT",
+            "tf": "M5",
+            "data": [
+                {"type": "fvg", "side": 1, "price": 4300},
+                {"type": "bad", "side": 1, "price": 1},
+            ],
+        },
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "accepted"
+    assert body["type"] == "smc-data"
+    assert body["symbol"] == "XAUUSDT"
+    assert body["tf"] == "M5"
+    assert body["levels"] == 1
+    assert body["dropped"] == 1
+    assert body["tasks"] == 0
+    assert "signal_id" not in body
+
+
+def test_manual_smc_rejects_empty_or_bad_tf(client):
+    h = auth_headers(client)
+    empty = client.post(
+        "/api/console/manual-signal",
+        json={"type": "smc-data", "symbol": "XAUUSD", "tf": "M5", "data": []},
+        headers=h,
+    )
+    assert empty.status_code == 400
+    bad = client.post(
+        "/api/console/manual-signal",
+        json={"type": "smc-data", "symbol": "XAUUSD", "tf": "M7", "data": [
+            {"type": "fvg", "side": 1, "price": 1},
+        ]},
+        headers=h,
+    )
+    assert bad.status_code == 400
+    assert bad.json()["detail"].startswith("invalid smc-data:")
+
+
 def test_manual_signal_supports_strategy_model(client):
     """中控台手动触发也能选择 strategy 模型，走同一套分组链路。"""
     h = auth_headers(client)

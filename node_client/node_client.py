@@ -501,6 +501,8 @@ class NodeClient:
             await self._do_strategy_stop(ws, msg)
         elif cmd == "strategy_update":
             await self._do_strategy_update(msg)
+        elif cmd == "strategy_smc":
+            await self._do_strategy_smc(msg)
         elif cmd == "cancel_pending":
             await self._do_cancel_pending(ws, msg)
         else:
@@ -730,6 +732,9 @@ class NodeClient:
             runtime=msg.get("runtime") if isinstance(msg.get("runtime"), dict) else None,
         )
         self.runners[task_id] = runner
+        smc = msg.get("smc")
+        if isinstance(smc, dict):
+            runner.apply_smc(smc)
         runner.start(resume=resume)
         logger.info(
             "strategy task %s %s (magic=%s symbol=%s)",
@@ -766,6 +771,21 @@ class NodeClient:
         snapshot = msg.get("strategy") if isinstance(msg.get("strategy"), dict) else {}
         if not runner.apply_strategy(snapshot):
             logger.warning("task %s refused strategy_update", task_id)
+
+    async def _do_strategy_smc(self, msg: dict) -> None:
+        """热推本任务的 SMC 价位副本。离线期间的副本由 resume 带上，这里只更新在跑的任务。"""
+        try:
+            task_id = int(msg.get("task_id"))
+        except (TypeError, ValueError):
+            logger.warning("strategy_smc with invalid task_id: %s", msg)
+            return
+        runner = self.runners.get(task_id)
+        if not runner or runner.done:
+            logger.info("strategy_smc for unknown task %s ignored", task_id)
+            return
+        smc = msg.get("smc") if isinstance(msg.get("smc"), dict) else {}
+        if not runner.apply_smc(smc):
+            logger.warning("task %s refused strategy_smc", task_id)
 
     async def _close_orphan_strategy(self, ws, task_id: int, msg: dict) -> None:
         """无本地监控时按魔术号平仓并撤挂单，回报结果供服务端收口。"""

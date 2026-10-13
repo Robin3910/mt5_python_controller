@@ -22,14 +22,17 @@
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
 from bar_metrics import BAR_PERIOD
 
-# 加仓单备注：R1L0D121 / R1D100；避开模版2 的 R3B、手动仓 M1/M2、首单任意备注
+# 加仓单备注：R1L0D121 / R1D100 / R1L2Fa1b2c3d4；避开模版2 的 R3B、手动仓 M1/M2、首单任意备注
 _ADD_COMMENT_RE = re.compile(r"^R([12])(?:L|[DPAW]|$)")
+# SMC 加仓备注末段是计算方式字母 + 8 位哈希，重连后据此补「已用过」
+_SMC_KEY_RE = re.compile(r"^R[12]L\d+[FOZB]([0-9a-f]{8})")
 
 RULE_TYPE_COUNTER = 1  # 逆势
 RULE_TYPE_TREND = 2    # 顺势
@@ -39,6 +42,12 @@ CALC_POINT = "point"    # 固定点数
 CALC_PRICE = "price"    # 指定绝对价位，到价触发
 CALC_ATR = "atr"        # ATR 的平均波动作为间距
 CALC_RANGE = "range"    # 已收盘 K 线的最大高低波幅作为间距
+# 以下只是标识，节点不计算指标；价位来自 TradingView 推送（与后台 BATCH_CALC_SMC_TYPES 对齐）
+CALC_FVG = "fvg"
+CALC_OB = "ob"
+CALC_PDZ = "pdz"
+CALC_FIBO = "fibo"
+CALC_SMC_TYPES = (CALC_FVG, CALC_OB, CALC_PDZ, CALC_FIBO)
 CALC_BAR_TYPES = (CALC_ATR, CALC_RANGE)
 
 CALC_TYPE_LABEL = {
@@ -46,6 +55,10 @@ CALC_TYPE_LABEL = {
     CALC_PRICE: "指定价",
     CALC_ATR: "ATR",
     CALC_RANGE: "波幅",
+    CALC_FVG: "FVG",
+    CALC_OB: "OB",
+    CALC_PDZ: "PDZ",
+    CALC_FIBO: "FIBO",
 }
 
 
@@ -71,6 +84,9 @@ class PositionCtx:
     bar_metrics: dict = field(default_factory=dict)
     # 逆势偏离基准；未显式传入时回退为 base_price（单测可只填一个价）
     counter_base_price: Optional[float] = None
+    # 当前任务的 SMC 价位副本，以及本节点已经用过的记录哈希
+    smc: dict = field(default_factory=dict)
+    smc_used: set = field(default_factory=set)
 
     def __post_init__(self) -> None:
         if self.counter_base_price is None:
@@ -116,6 +132,9 @@ class AddDecision:
     add_count: int = 0          # 触发前本规则已加仓次数
     limit_kind: str = ""        # 本次生效的上限类型：total_lot_limit / max_allow_num
     limit_value: int = 0        # 对应的上限值，0 表示不限制
+    smc_key: str = ""           # symbol|tf|type|side|price 的 8 位哈希，用过即不再用
+    smc_side: int = 0           # 1=支撑，-1=阻力
+    smc_received_at: float = 0.0
 
     @property
     def event_type(self) -> str:
@@ -231,6 +250,86 @@ def deviation_points(rule_type: int, direction: str, base_price: float,
     return moved / point
 
 
+def smc_record_key(symbol: object, timeframe: object, calc_type: object,
+                   side: object, price: object) -> str:
+    """一条 SMC 记录在单次任务里的身份：symbol|tf|type|side|price 的 8 位哈希。"""
+    token = _trim(_as_float(price), 8)
+    raw = (
+        f"{str(symbol or '').strip().upper()}|{str(timeframe or '').strip().upper()}"
+        f"|{str(calc_type or '').strip().lower()}|{int(_as_int(side))}|"
+        f"{token}"
+    )
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
+
+
+def smc_key_from_comment(comment: object) -> Optional[str]:
+    """从已成交的 SMC 加仓备注里取出哈希；其它备注返回 None。"""
+    match = _SMC_KEY_RE.match(str(comment or "").strip())
+    return match.group(1) if match else None
+
+
+def _smc_side_for(direction: str) -> Optional[int]:
+    """多单只看支撑（1），空单只看阻力（-1）。"""
+    name = str(direction or "").strip().upper()
+    if name == "BUY":
+        return 1
+    if name == "SELL":
+        return -1
+    return None
+
+
+def _smc_is_adverse(direction: str, anchor: float, level_price: float) -> bool:
+    """价位必须在逆势锚点的不利一侧，否则触价也不是逆势加仓。"""
+    if anchor <= 0 or level_price <= 0:
+        return False
+    if str(direction or "").strip().upper() == "BUY":
+        return level_price < anchor
+    return level_price > anchor
+
+
+def pick_smc_level(level: dict, ctx: PositionCtx) -> Optional[dict]:
+    """在当前副本里选出本档可用的最近一条 SMC 价位。
+
+    顺序：周期、类型、side、锚点不利侧、本节点未用过，再按离现价的距离取最近。
+    距离相同保留数据里靠前的一条。没有可用记录返回 None。
+    """
+    calc_type = str(level.get("calc_type") or "").strip().lower()
+    want_tf = str(level.get("timeframe") or "").strip().upper()
+    blob = ctx.smc if isinstance(ctx.smc, dict) else {}
+    if str(blob.get("tf") or "").strip().upper() != want_tf or ctx.price <= 0:
+        return None
+    want_side = _smc_side_for(ctx.direction)
+    if want_side is None:
+        return None
+    anchor = rule_base_price(RULE_TYPE_COUNTER, ctx)
+    used = {str(item) for item in (ctx.smc_used or set())}
+    symbol = blob.get("symbol") or ""
+    received_at = _as_float(blob.get("received_at"), 0.0)
+    best: Optional[dict] = None
+    best_dist: Optional[float] = None
+    for item in blob.get("levels") or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("type") or "").strip().lower() != calc_type:
+            continue
+        side = _as_int(item.get("side"), 0)
+        price = _as_float(item.get("price"), 0.0)
+        if side != want_side or price <= 0:
+            continue
+        if not _smc_is_adverse(ctx.direction, anchor, price):
+            continue
+        key = smc_record_key(symbol, want_tf, calc_type, side, price)
+        if key in used:
+            continue
+        dist = abs(price - ctx.price)
+        if best is None or best_dist is None or dist < best_dist:
+            best_dist = dist
+            best = {
+                "price": price, "side": side, "key": key, "received_at": received_at,
+            }
+    return best
+
+
 @dataclass
 class Threshold:
     """一次间距解析的结果：触发所需的偏离点数，以及它是怎么来的。"""
@@ -239,20 +338,41 @@ class Threshold:
     timeframe: str = ""
     metric_value: float = 0.0
     target_price: float = 0.0
+    smc_key: str = ""
+    smc_side: int = 0
+    smc_received_at: float = 0.0
 
 
 def resolve_threshold(rule_type: int, level: dict, ctx: PositionCtx) -> Threshold:
     """把档位配置的加仓间距折算成「触发所需的偏离点数」。
 
-    四种方式殊途同归，都归一到点数，这样后面的判定与偏离比较完全共用一套逻辑：
+    点数、指定价、ATR / 波幅，以及 SMC 价位，最后都归一到点数，后面的偏离比较共用一套逻辑：
     - 点数：配置值即阈值；
     - 指定价：换算成该价位相对基准价的偏离，方向必须与本规则一致，否则等于要求
       行情反向到价、永远不会成立，此时返回 0 表示本档不可用；
-    - ATR / 波幅：行情算出的价格距离除以 point 得到点数。
+    - ATR / 波幅：行情算出的价格距离除以 point 得到点数；
+    - fvg / ob / pdz / fibo：从推送副本里选出一条价位，再按指定价同样折成偏离点数。
 
-    算不出来（未配置价位、行情未就绪）时 points 为 0，调用方据此跳过本次判定。
+    算不出来（未配置价位、行情未就绪、没有可用 SMC 记录）时 points 为 0，调用方据此跳过本次判定。
     """
     calc_type = str(level.get("calc_type") or CALC_POINT).strip().lower()
+
+    if calc_type in CALC_SMC_TYPES:
+        timeframe = str(level.get("timeframe") or "").strip().upper()
+        if rule_type != RULE_TYPE_COUNTER:
+            return Threshold(0.0, calc_type, timeframe=timeframe)
+        picked = pick_smc_level(level, ctx)
+        if picked is None:
+            return Threshold(0.0, calc_type, timeframe=timeframe)
+        base = rule_base_price(rule_type, ctx)
+        points = deviation_points(
+            rule_type, ctx.direction, base, picked["price"], ctx.point,
+        )
+        return Threshold(
+            max(points, 0.0), calc_type, timeframe=timeframe,
+            target_price=picked["price"], smc_key=picked["key"],
+            smc_side=int(picked["side"]), smc_received_at=picked["received_at"],
+        )
 
     if calc_type == CALC_PRICE:
         target = _as_float(level.get("price"), 0.0)
@@ -347,6 +467,9 @@ def evaluate_rule(rule: dict, ctx: PositionCtx, rule_index: int = 0) -> Optional
         add_count=rule_adds,
         limit_kind=limit_kind,
         limit_value=limit_value,
+        smc_key=gap.smc_key,
+        smc_side=gap.smc_side,
+        smc_received_at=gap.smc_received_at,
     )
 
 
@@ -380,6 +503,10 @@ _CALC_COMMENT_CODE = {
     CALC_PRICE: "P",    # price，指定价位
     CALC_ATR: "A",
     CALC_RANGE: "W",    # wave，波幅
+    CALC_FVG: "F",
+    CALC_OB: "O",
+    CALC_PDZ: "Z",
+    CALC_FIBO: "B",
 }
 
 
@@ -403,6 +530,13 @@ def gap_text(decision: AddDecision) -> str:
     points = f"{_trim(decision.threshold, 1)} 点"
     if decision.calc_type == CALC_PRICE:
         return f"到价 {_trim(decision.target_price, 5)}（折合 {points}）"
+    if decision.calc_type in CALC_SMC_TYPES:
+        label = CALC_TYPE_LABEL.get(decision.calc_type, decision.calc_type)
+        role = "支撑" if decision.smc_side == 1 else "阻力"
+        return (
+            f"{label}({decision.timeframe}) {role} {_trim(decision.target_price, 5)}"
+            f"（折合 {points}）"
+        )
     if decision.calc_type in CALC_BAR_TYPES:
         label = CALC_TYPE_LABEL[decision.calc_type]
         return (
@@ -457,6 +591,9 @@ def decision_detail(decision: AddDecision) -> dict:
         "bar_period": BAR_PERIOD if decision.calc_type in CALC_BAR_TYPES else None,
         "metric_value": decision.metric_value or None,
         "target_price": decision.target_price or None,
+        "smc_key": decision.smc_key or None,
+        "smc_side": decision.smc_side or None,
+        "smc_received_at": decision.smc_received_at or None,
         "base_volume": decision.base_volume,
         "lot_times": decision.lot_times,
         "extra_lot": decision.extra_lot,
@@ -478,10 +615,15 @@ def decision_comment(decision: AddDecision) -> str:
     """加仓单写进 MT5 的紧凑备注：R=规则类型，L=分批档位，末段=计算方式+偏离点数。
 
     MT5 备注只有约 31 字符，放不下完整说明，这里只保留能反查到决策的最小信息：
-    末段首字母即间距的来历（D 点数 / P 指定价 / A ATR / W 波幅）。
+    末段首字母即间距的来历（D 点数 / P 指定价 / A ATR / W 波幅 / F O Z B 为 SMC）。
+    SMC 末段接 8 位哈希而不是偏离点数，重连后才能认出这条价位已经用过。
     """
     parts = [f"R{decision.rule_type}"]
     if decision.level_index is not None:
         parts.append(f"L{decision.level_index}")
-    parts.append(f"{_CALC_COMMENT_CODE.get(decision.calc_type, 'D')}{int(round(decision.deviation))}")
+    code = _CALC_COMMENT_CODE.get(decision.calc_type, "D")
+    if decision.calc_type in CALC_SMC_TYPES and decision.smc_key:
+        parts.append(f"{code}{decision.smc_key}")
+    else:
+        parts.append(f"{code}{int(round(decision.deviation))}")
     return "".join(parts)[:MT5_COMMENT_LIMIT]

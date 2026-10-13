@@ -38,6 +38,9 @@ K_GROUP_NODE_BUSY = "group:node:busy:{}:{}"
 K_NODE_PENDING_STOP = "node:pending_stop:{}"
 K_STRATEGY = "strategy:{}"              # 策略实例缓存（JSON）
 K_STRATEGIES = "strategies"             # 所有 strategy_id 的集合
+# SMC 价位副本：每个策略主任务一份，新推送整体覆写。丢失后等下一次推送即可。
+K_SMC_TASK = "smc:task:{}"
+SMC_TASK_TTL = 7 * 24 * 3600
 # 限价挂单监听：按 (节点, ticket) 去重 / 锁定
 K_LIMIT_WATCH_LOCK = "limit_watch:lock:{}:{}"
 K_LIMIT_WATCH_DONE = "limit_watch:done:{}:{}"
@@ -289,6 +292,7 @@ class RedisStore:
             "dedup:*",
             "lock:exec:*",
             "limit_watch:*",
+            "smc:task:*",
         )
         deleted = 0
         seen: set[str] = set()
@@ -312,6 +316,23 @@ class RedisStore:
     async def save_group_rotation(self, group_id: str, order: list[str]) -> None:
         """持久化分组轮转顺序（领取成功后把消费节点移到队尾，重启后仍延续轮转）。"""
         await self.r.set(K_GROUP_ROTATION.format(group_id), json.dumps(order))
+
+    # ----------------- SMC 价位副本 -----------------
+    async def set_task_smc(self, task_id: int, payload: dict) -> None:
+        """整体覆写该任务的 SMC 副本。TTL 只是兜底，进行中的任务会不断被新推送续上。"""
+        await self.r.set(
+            K_SMC_TASK.format(int(task_id)), json.dumps(payload), ex=SMC_TASK_TTL,
+        )
+
+    async def get_task_smc(self, task_id: int) -> Optional[dict]:
+        raw = await self.r.get(K_SMC_TASK.format(int(task_id)))
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
 
     # ----------------- 限价挂单监听 -----------------
     async def try_lock_limit_watch(self, node_id: str, ticket: int, ttl: int = 60) -> bool:

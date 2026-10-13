@@ -501,7 +501,16 @@ async def _resume_strategy_tasks(node_id: str, ws: WebSocket) -> None:
                     node_id, subtask.get("dispatch_id"), subtask.get("magic"),
                 )
                 continue
-            await ws.send_json(group_dispatcher.build_strategy_resume_command(subtask))
+            smc = None
+            try:
+                smc = await state.store.get_task_smc(int(subtask.get("task_id") or 0))
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "load smc snapshot failed for task %s", subtask.get("task_id"),
+                )
+            await ws.send_json(
+                group_dispatcher.build_strategy_resume_command(subtask, smc=smc)
+            )
             logger.info(
                 "node %s resume strategy subtask %s (magic=%s)",
                 node_id, subtask.get("dispatch_id"), subtask.get("magic"),

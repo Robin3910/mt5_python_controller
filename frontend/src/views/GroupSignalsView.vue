@@ -371,6 +371,21 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
         : `${detail.next_rule_add_no} 次`,
     )
     push('生效上限', limitText(detail))
+    if (detail.smc_key || ['fvg', 'ob', 'pdz', 'fibo'].includes(String(detail.calc_type || ''))) {
+      push('SMC 类型', detail.calc_type_label || detail.calc_type)
+      push('K 线周期', detail.timeframe)
+      push(
+        '价位角色',
+        detail.smc_side === 1 ? '支撑' : detail.smc_side === -1 ? '阻力' : '',
+      )
+      push('SMC 价位', detail.target_price)
+      push(
+        '数据时间',
+        detail.smc_received_at
+          ? new Date(detail.smc_received_at * 1000).toLocaleString()
+          : '',
+      )
+    }
     push('错误', detail.error)
     return rows
   }

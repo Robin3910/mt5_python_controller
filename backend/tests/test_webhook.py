@@ -374,6 +374,53 @@ def test_ip_whitelist_uses_first_xff_hop(client, monkeypatch):
     assert deny.status_code == 403
 
 
+def _smc_body(**over):
+    body = {
+        "type": "smc-data",
+        "symbol": "XAUUSDT",
+        "tf": "M5",
+        "data": [{"type": "fvg", "side": 1, "price": 4300}],
+    }
+    body.update(over)
+    return body
+
+
+def test_smc_data_accepted_without_opening_a_signal(client, monkeypatch):
+    """价位推送不进交易信号解析，也不写 signal_history。"""
+    called = []
+
+    async def _boom(*_a, **_k):
+        called.append(1)
+
+    monkeypatch.setattr("app.webhook.persist.record_signal", _boom)
+    r = client.post("/webhook", json=_smc_body())
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "accepted"
+    assert body["type"] == "smc-data"
+    assert body["symbol"] == "XAUUSDT"
+    assert body["tf"] == "M5"
+    assert body["levels"] == 1
+    assert body["dropped"] == 0
+    assert body["tasks"] == 0
+    assert body["nodes"] == 0
+    assert called == []
+
+
+def test_smc_data_rejects_bad_envelope(client):
+    r = client.post("/webhook", json=_smc_body(tf="M7"))
+    assert r.status_code == 400
+    assert r.json()["detail"].startswith("invalid smc-data:")
+
+
+def test_smc_data_requires_token_when_auth_on(client, monkeypatch):
+    _enable_auth(monkeypatch)
+    denied = client.post("/webhook", json=_smc_body())
+    assert denied.status_code == 401
+    ok = client.post("/webhook", json=_smc_body(), headers={"X-Auth-Token": TOKEN})
+    assert ok.status_code == 200, ok.text
+
+
 def test_ip_whitelist_checked_before_auth(client, monkeypatch):
     """白名单在鉴权之前：IP 不通过时，即便 token 正确也返回 403。"""
     _enable_ip_whitelist(monkeypatch, "10.0.0.1")

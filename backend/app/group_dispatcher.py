@@ -107,8 +107,11 @@ def build_strategy_stop_command(
     }
 
 
-def build_strategy_resume_command(subtask: dict) -> dict:
-    """策略恢复命令：节点重连后据此重建监控（不重复下首单）。"""
+def build_strategy_resume_command(subtask: dict, smc: Optional[dict] = None) -> dict:
+    """策略恢复命令：节点重连后据此重建监控（不重复下首单）。
+
+    smc 是该任务当前的 TradingView 价位副本；没有则不带，节点继续等下一次推送。
+    """
     cmd = {
         "cmd": "strategy_resume",
         "signal_id": subtask.get("signal_id"),
@@ -128,7 +131,22 @@ def build_strategy_resume_command(subtask: dict) -> dict:
     runtime = subtask.get("runtime")
     if isinstance(runtime, dict) and runtime:
         cmd["runtime"] = runtime
+    if isinstance(smc, dict) and smc:
+        cmd["smc"] = smc
     return cmd
+
+
+def build_strategy_smc_command(
+    *, task_id: int, dispatch_id: int, magic: Optional[int], smc: dict,
+) -> dict:
+    """把一份 SMC 价位副本推给进行中的任务。形状对齐 strategy_update。"""
+    return {
+        "cmd": "strategy_smc",
+        "task_id": task_id,
+        "dispatch_id": dispatch_id,
+        "magic": magic,
+        "smc": smc,
+    }
 
 
 def build_strategy_update_command(

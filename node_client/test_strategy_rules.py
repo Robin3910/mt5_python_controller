@@ -16,7 +16,10 @@ from strategy_rules import (
     metric_key,
     parse_add_rule_type,
     pick_batch_level,
+    pick_smc_level,
     rule_base_price,
+    smc_key_from_comment,
+    smc_record_key,
 )
 
 POINT = 0.01  # 黄金类品种
@@ -503,6 +506,95 @@ def test_counter_and_trend_batch_limits_are_independent():
         add_counts={RULE_TYPE_COUNTER: 2, RULE_TYPE_TREND: 3},
         price=2401.0,
     )) is None
+
+
+def _smc_blob(*levels, tf="M5", symbol="XAUUSDT", received_at=1_700_000_000.0):
+    return {
+        "symbol": symbol, "tf": tf, "levels": list(levels), "received_at": received_at,
+    }
+
+
+def _fvg_rule(**kw):
+    rule = batched_counter_rule(
+        batch_count=1,
+        total_lot_limit=2,
+        batch_levels=[{
+            "pos_from": 1, "pos_to": 2, "calc_type": "fvg", "timeframe": "M5",
+            "point": 0, "lot_times": 1.2, "extra_lot": 0,
+        }],
+    )
+    rule.update(kw)
+    return rule
+
+
+def test_pick_smc_level_nearest_support_and_touch():
+    """多单只看支撑，取离现价最近的一条；现价未到该价位则不加。"""
+    rule = _fvg_rule()
+    blob = _smc_blob(
+        {"type": "fvg", "side": 1, "price": 2390.0},
+        {"type": "fvg", "side": 1, "price": 2350.0},
+        {"type": "fvg", "side": -1, "price": 2399.0},
+    )
+    # 2360 离 2350 更近，但还没跌到 2350；已穿过的 2390 不是最近一条，本拍不加
+    waiting = evaluate_rule(rule, ctx(
+        price=2360.0, counter_base_price=2400.0, smc=blob,
+    ))
+    assert waiting is None
+
+    hit = evaluate_rule(rule, ctx(
+        price=2350.0, counter_base_price=2400.0, smc=blob,
+    ))
+    assert hit is not None
+    assert hit.target_price == 2350.0
+    assert hit.smc_side == 1
+    assert hit.volume == 0.12
+    assert hit.smc_key == smc_record_key("XAUUSDT", "M5", "fvg", 1, 2350.0)
+    assert smc_key_from_comment(decision_comment(hit)) == hit.smc_key
+    assert "FVG(M5) 支撑" in describe_decision(hit)
+    assert decision_detail(hit)["smc_received_at"] == 1_700_000_000.0
+
+
+def test_pick_smc_level_skips_used_favorable_and_wrong_tf():
+    rule = _fvg_rule()
+    nearer = {"type": "fvg", "side": 1, "price": 2398.0}
+    farther = {"type": "fvg", "side": 1, "price": 2390.0}
+    used = smc_record_key("XAUUSDT", "M5", "fvg", 1, 2398.0)
+    blob = _smc_blob(
+        {"type": "fvg", "side": 1, "price": 2405.0},  # 在锚点有利侧
+        nearer,
+        farther,
+        {"type": "ob", "side": 1, "price": 2399.0},
+    )
+    picked = pick_smc_level(rule["batch_levels"][0], ctx(
+        price=2397.0, counter_base_price=2400.0, smc=blob, smc_used={used},
+    ))
+    assert picked is not None and picked["price"] == 2390.0
+
+    wrong_tf = evaluate_rule(rule, ctx(
+        price=2390.0, counter_base_price=2400.0,
+        smc=_smc_blob(farther, tf="H1"),
+    ))
+    assert wrong_tf is None
+
+
+def test_smc_sell_uses_resistance_above_anchor():
+    rule = _fvg_rule()
+    blob = _smc_blob(
+        {"type": "fvg", "side": -1, "price": 2402.0},
+        {"type": "fvg", "side": 1, "price": 2390.0},
+    )
+    early = evaluate_rule(rule, ctx(
+        direction="SELL", price=2401.0, base_price=2400.0,
+        counter_base_price=2400.0, smc=blob,
+    ))
+    assert early is None
+    hit = evaluate_rule(rule, ctx(
+        direction="SELL", price=2402.0, base_price=2400.0,
+        counter_base_price=2400.0, smc=blob,
+    ))
+    assert hit is not None and hit.action == "SELL"
+    assert hit.smc_side == -1
+    assert "阻力" in describe_decision(hit)
 
 
 def test_max_allow_num_is_per_rule():

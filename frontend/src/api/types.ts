@@ -341,10 +341,23 @@ export interface CloseBatchResult {
 /** 手动触发的信号方向；CLOSE 仅 strategy 模型开放（终止分组内进行中的策略任务） */
 export type ManualSignalAction = 'BUY' | 'SELL' | 'CLOSE'
 
+/** 手动触发的 SMC 价位，与 Webhook type=smc-data 的 data 项一致 */
+export interface ManualSmcLevel {
+  type: 'fvg' | 'ob' | 'pdz' | 'fibo'
+  /** 1=支撑，-1=阻力 */
+  side: 1 | -1
+  price: number
+}
+
 // 后台手动触发的信号（复用 Webhook 分发流程）
 export interface ManualSignalPayload {
   symbol: string
-  action: ManualSignalAction
+  /** 交易信号必填；type=smc-data 时不需要 */
+  action?: ManualSignalAction
+  /** smc-data：推送 SMC 价位，不走开仓分发 */
+  type?: 'smc-data'
+  tf?: BatchTimeframe
+  data?: ManualSmcLevel[]
   /** 开仓（BUY / SELL）必填；CLOSE 不需要手数 */
   volume?: number
   /** 处理模型：normal（按币种分发，默认）/ strategy（按分组分发） */
@@ -495,7 +508,7 @@ export interface GroupUpdatePayload {
 }
 
 /** 分批档位的加仓间距计算方式 */
-export type BatchCalcType = 'point' | 'price' | 'atr' | 'range'
+export type BatchCalcType = 'point' | 'price' | 'atr' | 'range' | 'fvg' | 'ob' | 'pdz' | 'fibo'
 
 /** ATR / 波幅可选的 K 线周期 */
 export type BatchTimeframe = 'M1' | 'M5' | 'M15' | 'M30' | 'H1' | 'H4' | 'D1' | 'W1' | 'MN'
@@ -504,13 +517,13 @@ export type BatchTimeframe = 'M1' | 'M5' | 'M15' | 'M30' | 'H1' | 'H4' | 'D1' | 
 export interface StrategyBatchLevel {
   pos_from: number
   pos_to: number
-  /** 间距计算方式：point=点数 / price=指定价位 / atr=ATR / range=K线波幅 */
+  /** 间距计算方式：point / price / atr / range，或 fvg / ob / pdz / fibo（仅逆势，只作标识） */
   calc_type: BatchCalcType
   /** calc_type=point 时的触发点数 */
   point: number
   /** calc_type=price 时的绝对价位 */
   price: number
-  /** calc_type=atr / range 时统计用的 K 线周期 */
+  /** atr / range 的统计周期，或 SMC 标识用来匹配推送的周期 */
   timeframe: BatchTimeframe
   lot_times: number
   extra_lot: number
@@ -849,6 +862,14 @@ export interface GroupTaskEventDetail {
   limit_kind?: string
   limit_value?: number
   error?: string
+  calc_type?: string
+  calc_type_label?: string
+  gap_source?: string
+  timeframe?: string
+  target_price?: number
+  smc_key?: string
+  smc_side?: number
+  smc_received_at?: number
   // —— 首单（kind=open）——
   signal_id?: string
   task_id?: number
@@ -1008,8 +1029,16 @@ export interface ManualSignalResult {
   groups?: number
   targets?: number
   reason?: string
-  /** strategy 链路各分组的处理结果 */
-  tasks?: ManualSignalGroupTask[]
+  /** strategy 链路各分组的处理结果；SMC 推送时这里是命中的任务数 */
+  tasks?: ManualSignalGroupTask[] | number
+  /** SMC 推送命中的节点数 */
+  nodes?: number
+  /** SMC 推送保留的价位条数 */
+  levels?: number
+  /** SMC 推送丢弃的非法价位条数 */
+  dropped?: number
+  tf?: string
+  type?: string
 }
 
 /** 清空交易记录结果 */

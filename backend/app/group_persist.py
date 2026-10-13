@@ -388,6 +388,40 @@ async def task_status(task_id: int) -> Optional[str]:
         return None
 
 
+def _snapshot_subtask(d: GroupTaskDispatch, t: GroupSignalTask) -> dict:
+    """未收口子任务 + 主任务快照。resume 与 SMC 匹配共用这一行映射。"""
+    return {
+        "dispatch_id": d.id,
+        "task_id": d.task_id,
+        "magic": d.magic,
+        "group_id": d.group_id,
+        "node_id": d.node_id,
+        "signal_id": d.signal_id,
+        "action": t.action,
+        "symbol": d.symbol or t.symbol,
+        "volume": d.decided_vol if d.decided_vol is not None else t.volume,
+        "strategy_snapshot": t.strategy_snapshot_json,
+        "status": d.status,
+        "stop_requested_at": (
+            d.stop_requested_at.timestamp()
+            if d.stop_requested_at is not None else None
+        ),
+        "runtime": d.runtime_json,
+    }
+
+
+def _active_snapshot_query():
+    """未收口子任务联主任务。调用方再按节点收窄，并自行排序。"""
+    return (
+        select(GroupTaskDispatch, GroupSignalTask)
+        .join(
+            GroupSignalTask,
+            GroupSignalTask.task_id == GroupTaskDispatch.task_id,
+        )
+        .where(GroupTaskDispatch.status.notin_(tuple(_TERMINAL)))
+    )
+
+
 async def resumable_tasks(node_id: str) -> list[dict]:
     """某节点上仍未收口的策略子任务（重连后据此重建监控）。
 
@@ -397,40 +431,29 @@ async def resumable_tasks(node_id: str) -> list[dict]:
         async with SessionLocal() as s:
             rows = (
                 await s.execute(
-                    select(GroupTaskDispatch, GroupSignalTask)
-                    .join(
-                        GroupSignalTask,
-                        GroupSignalTask.task_id == GroupTaskDispatch.task_id,
-                    )
-                    .where(
-                        GroupTaskDispatch.node_id == node_id,
-                        GroupTaskDispatch.status.notin_(tuple(_TERMINAL)),
-                    )
+                    _active_snapshot_query()
+                    .where(GroupTaskDispatch.node_id == node_id)
                     .order_by(GroupTaskDispatch.id.asc())
                 )
             ).all()
-            return [
-                {
-                    "dispatch_id": d.id,
-                    "task_id": d.task_id,
-                    "magic": d.magic,
-                    "group_id": d.group_id,
-                    "signal_id": d.signal_id,
-                    "action": t.action,
-                    "symbol": d.symbol or t.symbol,
-                    "volume": d.decided_vol if d.decided_vol is not None else t.volume,
-                    "strategy_snapshot": t.strategy_snapshot_json,
-                    "status": d.status,
-                    "stop_requested_at": (
-                        d.stop_requested_at.timestamp()
-                        if d.stop_requested_at is not None else None
-                    ),
-                    "runtime": d.runtime_json,
-                }
-                for d, t in rows
-            ]
+            return [_snapshot_subtask(d, t) for d, t in rows]
     except Exception as e:  # noqa: BLE001
         logger.warning("resumable_tasks failed: %s", e)
+        return []
+
+
+async def active_subtasks_with_snapshot() -> list[dict]:
+    """全部未收口子任务及其策略快照，供 SMC 推送按品种和档位匹配。"""
+    try:
+        async with SessionLocal() as s:
+            rows = (
+                await s.execute(
+                    _active_snapshot_query().order_by(GroupTaskDispatch.id.asc())
+                )
+            ).all()
+            return [_snapshot_subtask(d, t) for d, t in rows]
+    except Exception as e:  # noqa: BLE001
+        logger.warning("active_subtasks_with_snapshot failed: %s", e)
         return []
 
 

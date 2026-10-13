@@ -49,7 +49,7 @@ def counter_rule(**over) -> dict:
     return rule
 
 
-def _runner(sent: list, *, mt5=None, strategy=None) -> tuple[StrategyRunner, FakeHub]:
+def _runner(sent: list, *, mt5=None, strategy=None, runtime=None) -> tuple[StrategyRunner, FakeHub]:
     hub = FakeHub()
 
     async def send(payload: dict) -> None:
@@ -64,6 +64,7 @@ def _runner(sent: list, *, mt5=None, strategy=None) -> tuple[StrategyRunner, Fak
         strategy=strategy or {"rules": [counter_rule()]},
         mt5=mt5 or MockMT5Client(),
         hub=hub, exec_fn=_exec, send_fn=send, report_interval=1.0,
+        runtime=runtime,
     )
     return runner, hub
 
@@ -1988,4 +1989,81 @@ async def test_signal_lot_pl_buy_side_keeps_sell():
     assert len(left) == 1
     assert left[0]["type"] == "SELL"
     assert not _of_type(sent, "strategy_finished")
+    runner.cancel()
+
+
+def _smc_strategy() -> dict:
+    return {"rules": [counter_rule(
+        batch_enabled=True, batch_action="all", batch_count=1, total_lot_limit=4,
+        max_allow_num=10,
+        batch_levels=[{
+            "pos_from": 1, "pos_to": 4, "calc_type": "fvg", "timeframe": "M5",
+            "lot_times": 1.0, "extra_lot": 0, "point": 0,
+        }],
+    )]}
+
+
+def _smc_feed(price: float = 2390.0) -> dict:
+    return {
+        "symbol": "XAUUSDT", "tf": "M5", "received_at": 10.0,
+        "levels": [{"type": "fvg", "side": 1, "price": price}],
+    }
+
+
+async def test_smc_waits_for_data_then_touches_once():
+    """没有推送时即使价位已到也不加；触价成交后，同一条记录被覆写也不再用。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.prices_map["XAUUSD"] = 2400.0
+    runner, hub = _runner(sent, mt5=mt5, strategy=_smc_strategy())
+    runner.start()
+    await _settle()
+
+    held = mt5.positions_by_magic(MAGIC)
+    _tick(hub, held, 2390.0)
+    await _settle()
+    assert runner.add_count == 0
+
+    assert runner.apply_smc(_smc_feed()) is True
+    await _settle()
+    assert runner.add_count == 1
+    added = mt5.positions_by_magic(MAGIC)[-1]
+    assert added["comment"].startswith("R1L0F")
+    assert len(added["comment"]) == len("R1L0F") + 8
+    runtime = _progress(sent, "add_counter")[-1]["runtime"]["smc_used"]
+    assert runtime == [added["comment"][-8:]]
+
+    runner.apply_smc(_smc_feed())
+    await _settle()
+    _tick(hub, mt5.positions_by_magic(MAGIC), 2380.0)
+    await _settle()
+    assert runner.add_count == 1
+    runner.cancel()
+
+
+async def test_smc_resume_skips_level_already_on_comment_or_runtime():
+    """重连后备注和 runtime 里的已用记录都要认，避免同一价位再加一次。"""
+    from strategy_rules import smc_record_key
+
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.prices_map["XAUUSD"] = 2400.0
+    key = smc_record_key("XAUUSDT", "M5", "fvg", 1, 2390.0)
+    mt5.place_market_order("XAUUSD", "BUY", 0.1, comment="OPEN", magic=MAGIC)
+    mt5.place_market_order("XAUUSD", "BUY", 0.1, comment=f"R1L0F{key}", magic=MAGIC)
+
+    runner, hub = _runner(
+        sent, mt5=mt5, strategy=_smc_strategy(),
+        runtime={"smc_used": ["aaaaaaaa"]},
+    )
+    runner.apply_smc(_smc_feed())
+    runner.start(resume=True)
+    await _settle()
+
+    _tick(hub, mt5.positions_by_magic(MAGIC), 2380.0)
+    await _settle()
+    assert runner.add_count == 1
+    assert key in runner._smc_used
+    assert "aaaaaaaa" in runner._smc_used
+    assert len(mt5.positions_by_magic(MAGIC)) == 2
     runner.cancel()

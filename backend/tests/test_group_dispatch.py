@@ -2302,3 +2302,35 @@ async def test_reconcile_resets_misses_when_magic_reappears(store, monkeypatch):
     rows = await fetch_dispatches(task.task_id)
     assert rows[0].status == "opened"
 
+
+def test_resume_and_smc_commands_carry_the_snapshot():
+    """重连恢复要带上 Redis 里的 SMC 副本；推送命令本身不改策略快照。"""
+    from app.group_dispatcher import (
+        build_strategy_resume_command,
+        build_strategy_smc_command,
+    )
+
+    smc = {
+        "symbol": "XAUUSDT", "tf": "M5", "received_at": 10,
+        "levels": [{"type": "fvg", "side": 1, "price": 4300.0}],
+    }
+    resume = build_strategy_resume_command(
+        {
+            "signal_id": "s", "task_id": 7, "dispatch_id": 3, "magic": 9,
+            "group_id": "g", "action": "BUY", "symbol": "XAUUSD", "volume": 0.1,
+            "strategy_snapshot": {"rules": []},
+        },
+        smc=smc,
+    )
+    assert resume["cmd"] == "strategy_resume"
+    assert resume["smc"] == smc
+    bare = build_strategy_resume_command({"task_id": 7, "strategy_snapshot": {}})
+    assert "smc" not in bare
+
+    pushed = build_strategy_smc_command(
+        task_id=7, dispatch_id=3, magic=9, smc=smc,
+    )
+    assert pushed == {
+        "cmd": "strategy_smc", "task_id": 7, "dispatch_id": 3, "magic": 9, "smc": smc,
+    }
+

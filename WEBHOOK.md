@@ -1,6 +1,6 @@
 # Webhook 入参文档
 
-> **最后更新：2026-09-24**（补充：Webhook 全站共用，不按登录用户拆分）
+> **最后更新：2026-10-12**（补充：`type=smc-data` 价位推送，见 §4.7）
 
 TradingView → MT5 跟单系统的信号接收接口说明。本文档描述的是**代码的真实行为**（以 `backend/app/webhook.py` + `backend/app/parser.py` + `backend/app/config.py` + `backend/app/group_dispatcher.py` 为准），而非 README 的宣传性描述。
 
@@ -242,6 +242,53 @@ Webhook 是**全站一条**入口，不按登录用户拆分；开关、`AUTH_TO
 > 模版3 的信号里 `volume`、`sl`、`tp` 都会被忽略：手数按每格手数下单，止损止盈来自网格规则。无启用规则、区间非法、或总手数上限小于每格手数时，创建策略与分发都会拒收。
 >
 > `CLOSE` 按**进行中的子任务 + 开仓时策略快照**匹配（含 `group_ids` / `template_ids` / 品种），不要求分组或策略当前仍启用——禁用后仍可终止在跑网格。
+
+#### 4.7 SMC 价位推送（`type=smc-data`）
+
+这不是开仓信号。逆势分批档位把计算方式选成 `fvg` / `ob` / `pdz` / `fibo` 并指定 K 线周期后，节点不自己算这些指标，只等这里推来的价位。鉴权、IP 白名单与普通 webhook 相同；通过后**不**走信号解析、去重和分发，也**不**写入 `signal_history`。
+
+```json
+{
+  "type": "smc-data",
+  "symbol": "XAUUSDT",
+  "tf": "M5",
+  "data": [
+    { "type": "fvg", "side": 1, "price": 4300 },
+    { "type": "ob", "side": -1, "price": 4310.5 }
+  ]
+}
+```
+
+| 字段 | 规则 |
+| --- | --- |
+| `type` | 固定 `smc-data`（大小写不敏感）。带这个值就不再按交易信号解析 |
+| `symbol` | 必填。与策略品种按前缀对齐（`XAUUSDT` 可对上 `XAUUSD`） |
+| `tf` | 必填，且必须是 `M1` / `M5` / `M15` / `M30` / `H1` / `H4` / `D1` / `W1` / `MN` |
+| `data` | 必填数组，允许空数组（表示清空匹配任务的当前副本）。`type` 取 `fvg` / `ob` / `pdz` / `fibo`，`side` 为 `1`（支撑）或 `-1`（阻力），`price` 须大于 0 |
+| 非法的单条记录 | 丢弃并计入响应里的 `dropped`，不让整包失败 |
+| 顶层缺字段或 `tf` 非法 | `400 {"detail":"invalid smc-data: ..."}` |
+
+每个命中的**未收口主任务**在 Redis 存一份副本（`smc:task:{task_id}`），任何一次命中该任务的推送都**整份覆写**，不按周期合并。因此同一个任务的档位如果同时用了 M5 和 H1，后一次推送会盖掉前一个周期的数据。只配置了 M5 的任务不会被 H1 推送改写。
+
+命中条件：子任务未收口、品种一致、逆势规则已启用且分批打开、并且有该 `tf` 的 SMC 档位。推送到达时还没开出来的任务拿不到这份数据，要等下一次推送。在线节点会收到 `strategy_smc`；离线节点重连时 `strategy_resume` 带上当前副本。
+
+成功响应 `200`：
+
+```json
+{
+  "status": "accepted",
+  "type": "smc-data",
+  "symbol": "XAUUSDT",
+  "tf": "M5",
+  "levels": 2,
+  "dropped": 0,
+  "tasks": 1,
+  "nodes": 2
+}
+```
+
+节点到了对应的逆势批次后，按周期、类型、方向（多单只看支撑、空单只看阻力）、锚点不利侧筛出还没用过的记录，取离现价最近的一条。平仓侧现价到达或越过该价才市价加仓（多单买价 ≤ 价位，空单卖价 ≥ 价位）。`symbol + tf + type + side + price` 在单次任务的每个节点只用一次，覆写回来的同一条记录也不会再用。
+
 ---
 
 ## 5. 格式二：纯文本告警
@@ -447,12 +494,13 @@ SYMBOL=GBPUSD long LOT=0.1
 
 ### 9.4 持久化与查询（v0.4）
 
-每次 Webhook 请求（含解析失败）都会尽力写入 `signal_history.raw_payload`（原始 JSON 或纯文本），供管理端 **「事件」页**（`GET /api/events/signals`）与节点详情 Tab 追溯。解析失败时 `parsed_ok=false`、`status=rejected`，仍保留原始体。
+每次交易信号请求（含解析失败）都会尽力写入 `signal_history.raw_payload`（原始 JSON 或纯文本），供管理端 **「事件」页**（`GET /api/events/signals`）与节点详情 Tab 追溯。解析失败时 `parsed_ok=false`、`status=rejected`，仍保留原始体。`type=smc-data` 不写这张表，只打应用日志；真正用来加仓的那条价位记在子任务事件的 detail 里。
 
 ### 9.5 错误响应
 
 | 状态码 | body | 触发条件 |
 | --- | --- | --- |
+| `400` | `{"detail":"invalid smc-data: ..."}` | `type=smc-data` 但 `symbol` / `tf` / `data` 不合法（见 §4.7） |
 | `400` | `{"detail":"cannot parse signal"}` | 无法解析出有效信号（解析器返回 `None`） |
 | `400` | `{"detail":"invalid signal: ..."}` | 解析成功但校验不通过（见 §11，**默认配置下基本不会触发**） |
 | `400` | `{"detail":"invalid model: ..."}` | `model` 不是 `normal` / `strategy` |

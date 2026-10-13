@@ -16,9 +16,9 @@ import logging
 import secrets
 import time
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 
-from . import group_rules, persist, system_settings
+from . import group_rules, persist, smc_feed, smc_rules, system_settings
 from .deps import client_ip, get_dispatcher, get_group_dispatcher, get_store
 from .dispatcher import Dispatcher
 from .group_dispatcher import GroupDispatcher
@@ -191,6 +191,7 @@ async def process_signal(
 @router.post("/webhook")
 async def webhook(
     request: Request,
+    background_tasks: BackgroundTasks,
     store: RedisStore = Depends(get_store),
     dispatcher: Dispatcher = Depends(get_dispatcher),
     group_dispatcher: GroupDispatcher = Depends(get_group_dispatcher),
@@ -216,6 +217,14 @@ async def webhook(
         if token != settings.auth_token:
             logger.warning("webhook rejected (bad token) from %s", ip)
             raise HTTPException(status_code=401, detail="invalid token")
+
+    # SMC 价位不是开仓信号：不进解析 / 去重 / 分发，只为匹配中的任务留一份副本。
+    if smc_rules.is_smc_payload(data):
+        try:
+            parsed = smc_rules.parse_smc_payload(data)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"invalid smc-data: {e}")
+        return await smc_feed.ingest(store, parsed, background_tasks)
 
     raw_payload = _serialize_raw(data, text)
     return await process_signal(

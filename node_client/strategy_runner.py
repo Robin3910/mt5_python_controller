@@ -34,7 +34,7 @@ import grid_trading
 import manual_scatter
 import risk_sizing
 import signal_pl
-from market_hub import GONE, STALE, MarketEvent, MarketHub, Subscription
+from market_hub import GONE, STALE, WAKE, MarketEvent, MarketHub, Subscription
 from risk_sizing import EntryPlan, RiskSizedConfig, SymbolSpec
 import close_reason
 from strategy_rules import (
@@ -50,6 +50,7 @@ from strategy_rules import (
     describe_decision,
     evaluate,
     metric_key,
+    smc_key_from_comment,
 )
 
 # 执行路径
@@ -230,6 +231,17 @@ class StrategyRunner:
         )
         # 已消失、离场原因待确认的手动仓：成交历史可能晚一拍才写进来
         self._manual_gone: dict[int, dict] = {}
+        # TradingView SMC 价位副本，以及本任务在本节点已经用过的记录
+        self._smc: dict = {}
+        self._smc_used: set[str] = set()
+        raw_used = self._resume_runtime.get("smc_used")
+        if isinstance(raw_used, list):
+            for item in raw_used:
+                text = str(item or "").strip()
+                if text:
+                    self._smc_used.add(text)
+        self._last_market: Optional[MarketEvent] = None
+        self._replay_market = False
 
     def _template_mode_reject(self) -> Optional[str]:
         """模版与快照规则对不上时的拒绝原因；一致或未知模版返回 None。"""
@@ -307,6 +319,20 @@ class StrategyRunner:
         if self._sub is not None:
             self._sub.wake()
         logger.info("task %s strategy snapshot updated", self.task_id)
+        return True
+
+    def apply_smc(self, smc: dict) -> bool:
+        """整体替换本任务的 SMC 价位副本。已用记录不随副本清空。"""
+        if self._stopping or self._finished or self._mode != _MODE_ADD_ON:
+            return False
+        self._smc = dict(smc) if isinstance(smc, dict) else {}
+        if self._sub is not None:
+            self._replay_market = True
+            self._sub.wake()
+        logger.info(
+            "task %s smc snapshot updated (%s level(s))",
+            self.task_id, len(self._smc.get("levels") or []),
+        )
         return True
 
     @property
@@ -396,6 +422,16 @@ class StrategyRunner:
 
     async def _on_event(self, event: MarketEvent) -> bool:
         """处理一个事件；返回 True 表示任务已收口。"""
+        if event.kind == WAKE:
+            # 仅 SMC 推送需要立刻用上一份报价再判；其它唤醒（热推规则）保持原样
+            if not self._replay_market:
+                return False
+            self._replay_market = False
+            event = self._last_market
+            if event is None:
+                return False
+        elif event.kind not in (STALE, GONE):
+            self._last_market = event
         if event.kind == STALE:
             # 这一轮读不到持仓：绝不能据此判定已全平，等下次成功采样
             logger.debug("task %s positions unreadable, hold judgement", self.task_id)
@@ -527,6 +563,8 @@ class StrategyRunner:
             point=event.point,
             add_count=sum(merged.values()),
             add_counts=merged,
+            smc=self._smc,
+            smc_used=set(self._smc_used),
         )
 
     async def _read_balance(self) -> Optional[float]:
@@ -611,6 +649,10 @@ class StrategyRunner:
         self._manual_fired |= manual_scatter.fired_rule_types(positions)
         filtered = manual_scatter.exclude_manual(positions)
         counted = count_adds_by_rule(filtered)
+        for pos in filtered:
+            used = smc_key_from_comment(pos.get("comment") if isinstance(pos, dict) else None)
+            if used:
+                self._smc_used.add(used)
         for rule_type, n in counted.items():
             self.add_counts[rule_type] = max(self.add_counts.get(rule_type, 0), n)
         seeded = sum(self.add_counts.values())
@@ -687,6 +729,8 @@ class StrategyRunner:
             )
             return
         rule_type = int(decision.rule_type)
+        if getattr(decision, "smc_key", ""):
+            self._smc_used.add(str(decision.smc_key))
         self.add_counts[rule_type] = self.add_counts.get(rule_type, 0) + 1
         self.add_count = sum(self.add_counts.values())
         self.total_orders += 1
@@ -873,6 +917,8 @@ class StrategyRunner:
             payload["manual_fired"] = sorted(self._manual_fired)
         if self._manual_open:
             payload["manual_open"] = manual_scatter.runtime_open_payload(self._manual_open)
+        if self._smc_used:
+            payload["smc_used"] = sorted(self._smc_used)
         return payload or None
 
     async def _manual_tp_linkage(

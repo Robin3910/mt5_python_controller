@@ -202,6 +202,33 @@ def test_batch_level_keeps_each_calc_type(client):
     assert (point["calc_type"], point["point"]) == ("point", 250)
 
 
+def test_counter_batch_level_keeps_smc_calc_type(client):
+    """逆势档位的 FVG / OB / PDZ / FIBO 只存标识和周期，原样落库。"""
+    h = auth_headers(client)
+    level = _created_level(
+        client, h, "FVG策略", {"calc_type": "fvg", "timeframe": "m5"},
+    )
+    assert level["calc_type"] == "fvg"
+    assert level["timeframe"] == "M5"
+
+
+def test_trend_batch_level_rejects_smc_calc_type(client):
+    """顺势档位不能选 SMC 标识，避免节点按逆势价位去加顺势仓。"""
+    h = auth_headers(client)
+    rule = _batch_rule({"calc_type": "ob", "timeframe": "H1"})
+    rule["type"] = 2
+    r = client.post(
+        "/api/strategies",
+        json={
+            "template_id": TEMPLATE_1_ID, "name": "顺势OB策略", "symbol": "XAUUSD",
+            "rules": [rule],
+        },
+        headers=h,
+    )
+    assert r.status_code == 400, r.text
+    assert "顺势加仓不支持" in r.json()["detail"]
+
+
 def test_batch_level_normalizes_illegal_calc_and_timeframe(client):
     """枚举类字段没法靠类型校验拦住，非法取值回落到默认，不把坏配置下发给节点。"""
     h = auth_headers(client)

@@ -179,6 +179,10 @@ const CALC_TYPE_LABEL: Record<BatchCalcType, string> = {
   price: '指定价',
   atr: 'ATR',
   range: '波幅',
+  fvg: 'FVG',
+  ob: 'OB',
+  pdz: 'PDZ',
+  fibo: 'FIBO',
 }
 
 const expandedIds = ref<Set<string>>(new Set())
@@ -315,6 +319,9 @@ function levelSpacingText(lv: StrategyBatchLevel): string {
   if (kind === 'price') return `价位 ${lv.price ?? 0}`
   if (kind === 'atr') return `ATR(${lv.timeframe || 'M5'}×${BATCH_BAR_PERIOD})`
   if (kind === 'range') return `波幅(${lv.timeframe || 'M5'}×${BATCH_BAR_PERIOD})`
+  if (kind === 'fvg' || kind === 'ob' || kind === 'pdz' || kind === 'fibo') {
+    return `${CALC_TYPE_LABEL[kind]}(${lv.timeframe || 'M5'}) · 等 TV 推送`
+  }
   return `${lv.point ?? 0} 点`
 }
 

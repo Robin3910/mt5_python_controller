@@ -32,12 +32,23 @@ RULE_ACTIONS = ("all", "buy", "sell")
 # 分批档位的加仓间距计算方式：
 # point 点数固定间距；price 指定绝对价位到价触发；
 # atr 用 ATR 的平均波动作间距；range 用已收盘 K 线的最大高低波幅作间距。
+# fvg / ob / pdz / fibo 只作标识：节点不计算这些指标，等 TradingView 按周期推送价位。
 BATCH_CALC_POINT = "point"
 BATCH_CALC_PRICE = "price"
 BATCH_CALC_ATR = "atr"
 BATCH_CALC_RANGE = "range"
-BATCH_CALC_TYPES = (BATCH_CALC_POINT, BATCH_CALC_PRICE, BATCH_CALC_ATR, BATCH_CALC_RANGE)
-# 需要读 K 线才能算出间距的方式
+BATCH_CALC_FVG = "fvg"
+BATCH_CALC_OB = "ob"
+BATCH_CALC_PDZ = "pdz"
+BATCH_CALC_FIBO = "fibo"
+BATCH_CALC_SMC_TYPES = (
+    BATCH_CALC_FVG, BATCH_CALC_OB, BATCH_CALC_PDZ, BATCH_CALC_FIBO,
+)
+BATCH_CALC_TYPES = (
+    BATCH_CALC_POINT, BATCH_CALC_PRICE, BATCH_CALC_ATR, BATCH_CALC_RANGE,
+    *BATCH_CALC_SMC_TYPES,
+)
+# 需要读 K 线才能算出间距的方式（SMC 不在此列：价位来自外部推送）
 BATCH_CALC_BAR_TYPES = (BATCH_CALC_ATR, BATCH_CALC_RANGE)
 
 # ATR / 波幅可选的 K 线周期（不提供「当前图表周期」：节点是独立进程，没有图表上下文）
@@ -251,13 +262,14 @@ class BatchLevel:
 
     加仓间距由 calc_type 决定用哪个参数：point 用点数，price 用指定价位，
     atr / range 用 timeframe 周期上的 K 线统计值（间距由行情实时算出）。
+    fvg / ob / pdz / fibo 只记录周期标识，触发价由 TradingView 推送。
     """
     pos_from: int = 1
     pos_to: int = 4
     calc_type: str = BATCH_CALC_POINT
     point: float = 100.0            # calc_type=point：触发点数
     price: float = 0.0              # calc_type=price：指定的绝对价位
-    timeframe: str = DEFAULT_BATCH_TIMEFRAME  # calc_type=atr / range：K 线周期
+    timeframe: str = DEFAULT_BATCH_TIMEFRAME  # atr / range 的统计周期；SMC 标识的匹配周期
     lot_times: float = 1.1
     extra_lot: float = 0.0
 
@@ -1026,6 +1038,10 @@ def validate_rules_for_template(template_id: str, rules: list[dict]) -> Optional
             reason = _validate_manual_scatter_fields(rule)
             if reason:
                 return reason
+        if rule_type == RULE_TYPE_TREND:
+            reason = _validate_trend_batch_calc(rule)
+            if reason:
+                return reason
         if not _as_int(rule.get("status"), 0):
             continue
         active += 1
@@ -1073,6 +1089,17 @@ def _validate_signal_pl_fields(rule: dict) -> Optional[str]:
             return f"信号分档批次#{i + 1}手数不能为负"
         if pla == 0:
             return f"信号分档批次#{i + 1}盈亏金额不能为 0"
+    return None
+
+
+def _validate_trend_batch_calc(rule: dict) -> Optional[str]:
+    """顺势档位不接受 SMC 标识：那些价位只服务逆势分批。"""
+    for level in rule.get("batch_levels") or []:
+        if not isinstance(level, dict):
+            continue
+        calc_type = str(level.get("calc_type") or "").strip().lower()
+        if calc_type in BATCH_CALC_SMC_TYPES:
+            return "顺势加仓不支持 FVG / OB / PDZ / FIBO"
     return None
 
 
@@ -1131,6 +1158,8 @@ def rules_to_rule_set(rules: object) -> TemplateRuleSet:
                     pos_to=lv["pos_to"],
                     calc_type=lv["calc_type"],
                     point=lv["point"],
+                    price=lv["price"],
+                    timeframe=lv["timeframe"],
                     lot_times=lv["lot_times"],
                     extra_lot=lv["extra_lot"],
                 )

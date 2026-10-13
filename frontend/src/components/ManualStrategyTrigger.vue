@@ -7,16 +7,21 @@ import { ElMessage } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
 import FormLabel from '@/components/FormLabel.vue'
 import StrategySignalFields from '@/components/StrategySignalFields.vue'
+import TagSelect from '@/components/TagSelect.vue'
 import { signalSymbolMatches } from '@/components/strategySignal'
+import type { TagOption } from '@/components/tagOption'
 import { useAuthStore } from '@/stores/auth'
 import { useHubStore } from '@/stores/hub'
 import type {
+  BatchTimeframe,
   GroupDispatchMode,
   GroupOut,
   ManualSignalAction,
   ManualSignalPayload,
   ManualSignalResult,
+  ManualSmcLevel,
   StrategyOut,
+  StrategyRule,
 } from '@/api/types'
 
 const emit = defineEmits<{
@@ -32,14 +37,56 @@ const DISPATCH_MODE_LABEL: Record<GroupDispatchMode, string> = {
 }
 
 const TRIGGER_HELP = {
+  kind:
+    '交易信号按 model=strategy 下发 BUY / SELL / CLOSE。' +
+    'SMC 价位按 type=smc-data 推送，只更新正在跑、且逆势分批档位用了同一周期的任务，不会新开仓。',
   template_ids:
     '策略模版定向（信号的 template_ids 字段）：勾选后，只有绑定了这些模版的分组才会收到本信号，' +
-    '在品种匹配之上再加一层筛选。一个都不勾表示不限制模版。',
+    '在品种匹配之上再加一层筛选。一个都不勾表示不限制模版。SMC 价位同样按模版收窄下面的分组列表。',
   group_ids:
     '分组定向（信号的 group_ids 字段）：勾选后，只有勾中的分组会收到本信号。' +
-    '一个都不勾表示下面列出的分组全部收到。',
+    '一个都不勾表示下面列出的分组全部收到。SMC 价位勾选后只更新这些分组里进行中的任务。',
+  tf:
+    '与逆势分批档位里的 K 线周期对应，只作匹配。可选 M1 / M5 / M15 / M30 / H1 / H4 / D1 / W1 / MN。',
+  smc_type:
+    '与档位的计算方式对应：FVG / OB / PDZ / FIBO。节点不计算这些指标。',
+  smc_side:
+    '1 为支撑，多单逆势加仓只用支撑；-1 为阻力，空单只用阻力。',
+  smc_price: '现价到达或越过这一价位时，节点按该档手数市价加仓。',
 }
 
+type SignalKind = 'trade' | 'smc'
+type SmcCalcType = ManualSmcLevel['type']
+
+const KIND_TAGS: TagOption<SignalKind>[] = [
+  { value: 'trade', label: '交易信号', hint: 'BUY / SELL / CLOSE' },
+  { value: 'smc', label: 'SMC 价位', hint: 'type=smc-data' },
+]
+const TF_TAGS: TagOption<BatchTimeframe>[] = (
+  ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1', 'MN'] as BatchTimeframe[]
+).map((tf) => ({ value: tf, label: tf }))
+const SMC_TYPE_TAGS: TagOption<SmcCalcType>[] = [
+  { value: 'fvg', label: 'FVG' },
+  { value: 'ob', label: 'OB' },
+  { value: 'pdz', label: 'PDZ' },
+  { value: 'fibo', label: 'FIBO' },
+]
+const SMC_SIDE_TAGS: TagOption<1 | -1>[] = [
+  { value: 1, label: '支撑', hint: '多单' },
+  { value: -1, label: '阻力', hint: '空单' },
+]
+
+interface SmcRow {
+  type: SmcCalcType
+  side: 1 | -1
+  price: number | null
+}
+
+function blankSmcRow(): SmcRow {
+  return { type: 'fvg', side: 1, price: null }
+}
+
+const signalKind = ref<SignalKind>('trade')
 const showTrigger = ref(false)
 const triggering = ref(false)
 const triggerError = ref('')
@@ -58,9 +105,12 @@ const triggerForm = reactive({
   comment: '',
   template_ids: [] as string[],
   group_ids: [] as string[],
+  tf: 'M5' as BatchTimeframe,
+  smcLevels: [blankSmcRow()] as SmcRow[],
 })
 
-const isCloseAction = computed(() => triggerForm.action === 'CLOSE')
+const isSmc = computed(() => signalKind.value === 'smc')
+const isCloseAction = computed(() => !isSmc.value && triggerForm.action === 'CLOSE')
 
 function strategyOf(g: GroupOut): StrategyOut | undefined {
   return g.strategy_id ? hub.strategies.find((s) => s.strategy_id === g.strategy_id) : undefined
@@ -101,6 +151,24 @@ function toggleTriggerTemplate(templateId: string, checked: boolean): void {
   triggerForm.template_ids = checked ? [...kept, templateId] : kept
 }
 
+function ruleWatchesSmc(rule: StrategyRule, tf: string, types: SmcCalcType[]): boolean {
+  if (rule.type !== 1 || !rule.status || !rule.batch_enabled) return false
+  return (rule.batch_levels || []).some((lv) => {
+    if ((lv.timeframe || 'M5') !== tf) return false
+    const calc = lv.calc_type
+    if (calc !== 'fvg' && calc !== 'ob' && calc !== 'pdz' && calc !== 'fibo') return false
+    return !types.length || types.includes(calc)
+  })
+}
+
+const selectedSmcTypes = computed<SmcCalcType[]>(() => {
+  const out: SmcCalcType[] = []
+  for (const row of triggerForm.smcLevels) {
+    if (!out.includes(row.type)) out.push(row.type)
+  }
+  return out
+})
+
 const candidateGroups = computed<GroupOut[]>(() => {
   const symbol = triggerForm.symbol.trim()
   if (!symbol) return []
@@ -109,7 +177,9 @@ const candidateGroups = computed<GroupOut[]>(() => {
     if (!g.enabled) return false
     const sty = strategyOf(g)
     if (!sty || !sty.enabled || !signalSymbolMatches(sty.symbol, symbol)) return false
-    return !templates.length || templates.includes(sty.template_id)
+    if (templates.length && !templates.includes(sty.template_id)) return false
+    if (!isSmc.value) return true
+    return (sty.rules || []).some((rule) => ruleWatchesSmc(rule, triggerForm.tf, selectedSmcTypes.value))
   })
 })
 
@@ -135,8 +205,21 @@ const readyGroupCount = computed(
   () => matchedGroups.value.filter((g) => g.online_node_count > 0).length,
 )
 
+function addSmcRow(): void {
+  triggerForm.smcLevels.push(blankSmcRow())
+}
+
+function removeSmcRow(index: number): void {
+  if (triggerForm.smcLevels.length <= 1) {
+    triggerForm.smcLevels[0] = blankSmcRow()
+    return
+  }
+  triggerForm.smcLevels.splice(index, 1)
+}
+
 async function openTrigger(): Promise<void> {
   triggerError.value = ''
+  signalKind.value = 'trade'
   Object.assign(triggerForm, {
     symbol: '',
     action: 'BUY' as ManualSignalAction,
@@ -147,6 +230,8 @@ async function openTrigger(): Promise<void> {
     comment: '',
     template_ids: [] as string[],
     group_ids: [] as string[],
+    tf: 'M5' as BatchTimeframe,
+    smcLevels: [blankSmcRow()],
   })
   triggerGroups.value = []
   showTrigger.value = true
@@ -171,7 +256,32 @@ async function openTrigger(): Promise<void> {
   if (options.length === 1) triggerForm.symbol = options[0]
 }
 
+function buildSmcLevels(): ManualSmcLevel[] | null {
+  const levels: ManualSmcLevel[] = []
+  for (const row of triggerForm.smcLevels) {
+    const price = Number(row.price)
+    if (!(price > 0)) return null
+    levels.push({ type: row.type, side: row.side, price })
+  }
+  return levels.length ? levels : null
+}
+
 function buildTriggerPayload(symbol: string): ManualSignalPayload {
+  if (isSmc.value) {
+    const payload: ManualSignalPayload = {
+      type: 'smc-data',
+      symbol,
+      tf: triggerForm.tf,
+      data: buildSmcLevels() || [],
+    }
+    if (triggerForm.template_ids.length) payload.template_ids = [...triggerForm.template_ids]
+    if (triggerForm.group_ids.length) {
+      payload.group_ids = [...triggerForm.group_ids]
+    } else if (triggerForm.template_ids.length) {
+      payload.group_ids = candidateGroups.value.map((g) => g.group_id)
+    }
+    return payload
+  }
   const payload: ManualSignalPayload = { symbol, action: triggerForm.action, model: 'strategy' }
   if (triggerForm.template_ids.length) payload.template_ids = [...triggerForm.template_ids]
   if (triggerForm.group_ids.length) payload.group_ids = [...triggerForm.group_ids]
@@ -186,6 +296,16 @@ function buildTriggerPayload(symbol: string): ManualSignalPayload {
 }
 
 function buildWebhookSignalPayload(payload: ManualSignalPayload): Record<string, unknown> {
+  if (payload.type === 'smc-data') {
+    const data: Record<string, unknown> = {
+      type: 'smc-data',
+      symbol: payload.symbol,
+      tf: payload.tf,
+      data: payload.data || [],
+    }
+    if (authStore.isAdmin) data.token = webhookAuthToken.value
+    return data
+  }
   const data: Record<string, unknown> = {
     action: payload.action,
     symbol: payload.symbol,
@@ -203,6 +323,28 @@ function buildWebhookSignalPayload(payload: ManualSignalPayload): Record<string,
 }
 
 function triggerSummary(payload: ManualSignalPayload): string {
+  if (payload.type === 'smc-data') {
+    const hit = matchedGroups.value
+    const groupText = hit.length
+      ? hit.map((g) => `· ${g.name}（进行中任务 ${g.active_task_count}）`).join('\n')
+      : '· 无（没有启用中的逆势档位使用该周期，推送不会写入任何任务）'
+    const rows = (payload.data || [])
+      .map((row) => `${row.type} ${row.side === 1 ? '支撑' : '阻力'} ${row.price}`)
+      .join('、')
+    const lines = [
+      `品种：${payload.symbol}`,
+      `类型：smc-data`,
+      `周期：${payload.tf}`,
+      `价位：${rows || '无'}`,
+    ]
+    if (payload.group_ids?.length) {
+      lines.push(`分组定向：只更新勾选的 ${payload.group_ids.length} 个分组里进行中的任务`)
+    } else {
+      lines.push('分组定向：更新下面全部分组里进行中、且档位匹配的任务')
+    }
+    lines.push('说明：整份覆盖该任务当前价位，不新开仓。同一条记录在每个节点只用一次。')
+    return `${lines.join('\n')}\n\n预计涉及分组：\n${groupText}`
+  }
   const hit = matchedGroups.value
   const groupText = hit.length
     ? hit.map((g) => `· ${g.name}（有效节点 ${g.online_node_count}）`).join('\n')
@@ -260,6 +402,17 @@ function cancelTriggerConfirm(): void {
 }
 
 function reportTriggerResult(payload: ManualSignalPayload, res: ManualSignalResult): boolean {
+  if (payload.type === 'smc-data') {
+    const tasks = typeof res.tasks === 'number' ? res.tasks : 0
+    const nodes = res.nodes ?? 0
+    const levels = res.levels ?? payload.data?.length ?? 0
+    if (tasks > 0) {
+      ElMessage.success(`已推送 SMC 价位：${levels} 条，写入 ${tasks} 个任务，${nodes} 个节点`)
+    } else {
+      ElMessage.warning(`SMC 价位已受理，但没有进行中的任务匹配 ${payload.symbol} ${payload.tf}`)
+    }
+    return true
+  }
   const head = `${payload.action} ${payload.symbol}`
   if (res.status === 'accepted') {
     const groups = res.groups ?? 0
@@ -294,9 +447,10 @@ function reportTriggerResult(payload: ManualSignalPayload, res: ManualSignalResu
 }
 
 function acceptedButNotDispatchedHint(res: ManualSignalResult): string {
+  const rows = Array.isArray(res.tasks) ? res.tasks : []
   const reasons = [
     ...new Set(
-      (res.tasks || [])
+      rows
         .map((t) => (t.reason || '').trim())
         .filter(Boolean),
     ),
@@ -311,7 +465,20 @@ function submitTrigger(): void {
     triggerError.value = '请填写信号品种'
     return
   }
-  if (!isCloseAction.value && !(Number(triggerForm.volume) > 0)) {
+  if (isSmc.value) {
+    if (!TF_TAGS.some((tag) => tag.value === triggerForm.tf)) {
+      triggerError.value = '请选择 K 线周期'
+      return
+    }
+    if (!buildSmcLevels()) {
+      triggerError.value = '每条价位都需要大于 0 的价格'
+      return
+    }
+    if (triggerForm.template_ids.length && !candidateGroups.value.length) {
+      triggerError.value = '没有匹配该模版和周期的分组'
+      return
+    }
+  } else if (!isCloseAction.value && !(Number(triggerForm.volume) > 0)) {
     triggerError.value = '开仓信号必须填写大于 0 的手数'
     return
   }
@@ -352,18 +519,76 @@ async function confirmSubmitTrigger(): Promise<void> {
     <div v-if="showTrigger" class="modal-mask" @click.self="showTrigger = false">
       <div class="card card-pad modal modal-lg group-trigger-modal">
         <div class="modal-header">
-          <div class="h1">手动触发策略信号</div>
+          <div class="h1">手动触发信号</div>
           <p class="muted" style="font-size: 12px; margin: 4px 0 0">
-            等同于收到一条 <code>model=strategy</code> 的 Webhook：按品种匹配「已启用且绑定同品种启用策略」的分组，
-            各分组再按自己的分发模式下发给有效节点。不影响按币种分发（<code>model=normal</code>）的链路。
+            <template v-if="isSmc">
+              等同于收到一条 <code>type=smc-data</code> 的 Webhook：按品种和 K 线周期，
+              覆盖进行中任务的 SMC 价位。不新开仓，也不走按币种分发。
+            </template>
+            <template v-else>
+              等同于收到一条 <code>model=strategy</code> 的 Webhook：按品种匹配「已启用且绑定同品种启用策略」的分组，
+              各分组再按自己的分发模式下发给有效节点。不影响按币种分发（<code>model=normal</code>）的链路。
+            </template>
           </p>
         </div>
         <div class="modal-body">
+          <div class="form-grid" style="margin-bottom: 14px">
+            <div class="span-full">
+              <FormLabel text="信号类型" :help="TRIGGER_HELP.kind" />
+              <TagSelect v-model="signalKind" :options="KIND_TAGS" aria-label="信号类型" />
+            </div>
+          </div>
           <StrategySignalFields
+            v-if="!isSmc"
             v-model="triggerForm"
             id-prefix="trigger"
             :symbol-options="triggerSymbolOptions"
           />
+          <div v-else class="form-grid two">
+            <div>
+              <FormLabel
+                field-id="trigger-smc-symbol"
+                text="信号品种"
+                help="与策略绑定品种按前缀匹配，例如 XAUUSDT 可以命中 XAUUSD。只更新该品种上正在跑的任务。"
+              />
+              <input id="trigger-smc-symbol" v-model="triggerForm.symbol" placeholder="例如：XAUUSD" />
+              <div v-if="triggerSymbolOptions.length" class="symbol-picks">
+                <span class="muted">已配置：</span>
+                <button
+                  v-for="s in triggerSymbolOptions"
+                  :key="s"
+                  type="button"
+                  class="btn-sm btn-ghost"
+                  @click="triggerForm.symbol = s"
+                >
+                  {{ s }}
+                </button>
+              </div>
+            </div>
+            <div>
+              <FormLabel text="K 线周期" :help="TRIGGER_HELP.tf" />
+              <TagSelect v-model="triggerForm.tf" :options="TF_TAGS" aria-label="K 线周期" />
+            </div>
+            <div class="span-full">
+              <FormLabel text="价位" :help="TRIGGER_HELP.smc_price" />
+              <div class="smc-levels">
+                <div v-for="(row, index) in triggerForm.smcLevels" :key="index" class="smc-level">
+                  <TagSelect v-model="row.type" :options="SMC_TYPE_TAGS" aria-label="订单块类型" />
+                  <TagSelect v-model="row.side" :options="SMC_SIDE_TAGS" aria-label="支撑或阻力" />
+                  <input
+                    v-model.number="row.price"
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    placeholder="价格"
+                    :aria-label="`第 ${index + 1} 条价位`"
+                  />
+                  <button type="button" class="btn-sm btn-ghost" @click="removeSmcRow(index)">删除</button>
+                </div>
+                <button type="button" class="btn-sm btn-ghost" @click="addSmcRow">添加价位</button>
+              </div>
+            </div>
+          </div>
 
           <div class="form-grid" style="margin-top: 14px">
             <div v-if="triggerTemplateOptions.length" class="span-full">
@@ -394,9 +619,16 @@ async function confirmSubmitTrigger(): Promise<void> {
                 填写品种后，这里会列出将收到本信号的分组。
               </div>
               <div v-else-if="!candidateGroups.length" class="muted" style="font-size: 12px">
-                没有匹配的分组：该品种下没有「已启用且绑定同品种启用策略」<template
-                  v-if="triggerForm.template_ids.length"
-                >且模版在定向范围内</template>的分组，信号会被拒收。
+                <template v-if="isSmc">
+                  没有匹配的分组：该品种下没有启用中的逆势分批档位使用 {{ triggerForm.tf }}
+                  <template v-if="selectedSmcTypes.length">（{{ selectedSmcTypes.join(' / ') }}）</template>。
+                  推送不会写入任何任务。
+                </template>
+                <template v-else>
+                  没有匹配的分组：该品种下没有「已启用且绑定同品种启用策略」<template
+                    v-if="triggerForm.template_ids.length"
+                  >且模版在定向范围内</template>的分组，信号会被拒收。
+                </template>
               </div>
               <div v-else class="member-list">
                 <label
@@ -420,7 +652,10 @@ async function confirmSubmitTrigger(): Promise<void> {
                 </label>
                 <p class="muted" style="font-size: 12px; margin: 0">
                   <template v-if="triggerForm.group_ids.length">
-                    已定向到勾选的 {{ matchedGroups.length }} 个分组（信号带 group_ids），其余分组不会收到。
+                    已定向到勾选的 {{ matchedGroups.length }} 个分组，其余分组不会收到。
+                  </template>
+                  <template v-else-if="isSmc">
+                    上面 {{ candidateGroups.length }} 个分组里、正在跑且档位匹配的任务都会被覆盖；勾选后只更新勾中的分组。
                   </template>
                   <template v-else>上面 {{ candidateGroups.length }} 个分组都会收到；勾选后只发给勾中的分组。</template>
                 </p>
@@ -458,7 +693,7 @@ async function confirmSubmitTrigger(): Promise<void> {
         <div class="modal-header">
           <div class="h1">确认触发信号</div>
           <p class="muted" style="font-size: 12px; margin: 4px 0 0">
-            确认手动触发 strategy 信号？可展开查看 Webhook 同构 JSON。
+            {{ isSmc ? '确认推送 SMC 价位？可展开查看 Webhook 同构 JSON。' : '确认手动触发 strategy 信号？可展开查看 Webhook 同构 JSON。' }}
           </p>
         </div>
         <div class="modal-body">
@@ -550,6 +785,33 @@ async function confirmSubmitTrigger(): Promise<void> {
 
 .group-pick-off {
   opacity: 0.45;
+}
+
+.smc-levels {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.smc-level {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.smc-level input {
+  width: 140px;
+}
+
+.symbol-picks {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+  font-size: 12px;
 }
 
 .trigger-confirm-mask {

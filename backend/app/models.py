@@ -402,18 +402,23 @@ class GroupTaskEventRecord(BaseModel):
 class StrategyBatchLevel(BaseModel):
     """分批加仓档位：本规则第几次加仓区间内的间距 / 倍数。
 
-    加仓间距由 calc_type 决定读哪个参数，四种方式最终都换算成触发所需的偏离点数。
+    加仓间距由 calc_type 决定读哪个参数。点数 / 指定价 / ATR / 波幅换算成偏离点数；
+    fvg / ob / pdz / fibo 只作标识，触发价来自 TradingView 推送。
     """
     pos_from: int = Field(default=1, ge=0)
     pos_to: int = Field(default=4, ge=0)
     calc_type: str = Field(
         default="point",
-        description="间距计算方式：point=点数 / price=指定价位 / atr=ATR / range=K线波幅",
+        description=(
+            "间距计算方式：point=点数 / price=指定价位 / atr=ATR / range=K线波幅 / "
+            "fvg / ob / pdz / fibo=TradingView 价位标识（仅逆势）"
+        ),
     )
     point: float = Field(default=100, ge=0, description="calc_type=point 时的触发点数")
     price: float = Field(default=0.0, ge=0, description="calc_type=price 时的绝对价位")
     timeframe: str = Field(
-        default="M5", description="calc_type=atr / range 时统计用的 K 线周期",
+        default="M5",
+        description="atr / range 的统计周期，或 fvg / ob / pdz / fibo 用来匹配推送的周期标识",
     )
     lot_times: float = Field(default=1.0, ge=0)
     extra_lot: float = Field(default=0.0, ge=0)
@@ -721,9 +726,15 @@ class ManualSignalRequest(BaseModel):
     volume 只有开仓（BUY / SELL）才必填，由接口层按 action 校验：CLOSE 是终止
     指令，手数没有意义。stop_loss / take_profit / entry_price / comment 对齐
     Webhook 的同名字段。
+
+    type=smc-data 时不走开仓分发，改为推送 SMC 价位：此时 action 可空，
+    用 tf + data，分组定向仍用 group_ids。
     """
     symbol: str = Field(min_length=1)
-    action: str  # BUY / SELL / CLOSE（CLOSE 仅 strategy 链路开放）
+    action: str = ""  # BUY / SELL / CLOSE；SMC 价位推送可空
+    type: Optional[str] = None  # smc-data：TradingView 价位推送
+    tf: Optional[str] = None
+    data: list[dict] = Field(default_factory=list)
     volume: Optional[float] = Field(default=None, gt=0)
     model: Optional[str] = None  # normal（默认）/ strategy
     stop_loss: Optional[float] = Field(default=None, gt=0)

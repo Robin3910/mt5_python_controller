@@ -9,9 +9,9 @@
 """
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 
-from . import group_persist, group_rules, permissions, persist
+from . import group_persist, group_rules, permissions, persist, smc_feed, smc_rules
 from .connections import manager
 from .deps import (
     client_ip,
@@ -40,6 +40,10 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/console", tags=["console"])
 
 MANUAL_ACTIONS = ("BUY", "SELL", "CLOSE")
+
+
+def _is_smc_request(body: ManualSignalRequest) -> bool:
+    return str(body.type or "").strip().lower() == smc_rules.SMC_PAYLOAD_TYPE
 
 
 def _build_signal_payload(body: ManualSignalRequest) -> dict:
@@ -92,14 +96,10 @@ def _build_signal_payload(body: ManualSignalRequest) -> dict:
     return data
 
 
-async def _scope_to_own_groups(
+async def _scope_groups(
     store: RedisStore, p: Principal, body: ManualSignalRequest,
 ) -> ManualSignalRequest:
-    """普通用户：只能发 strategy 信号，分组定向收窄到本人分组。管理员原样放行。"""
-    if p.is_admin:
-        return body
-    if group_rules.normalize_signal_model(body.model) != SIGNAL_MODEL_STRATEGY:
-        raise HTTPException(status_code=403, detail="普通用户只能手动触发 strategy 信号")
+    """把分组定向收窄到本人分组。没点名则注入其全部分组。"""
     own = [g["group_id"] for g in permissions.visible(p, await store.all_groups())]
     scoped, foreign = permissions.scope_group_ids(body.group_ids, own)
     if foreign:
@@ -109,18 +109,84 @@ async def _scope_to_own_groups(
     return body.model_copy(update={"group_ids": scoped})
 
 
+async def _scope_to_own_groups(
+    store: RedisStore, p: Principal, body: ManualSignalRequest,
+) -> ManualSignalRequest:
+    """普通用户：交易信号只能发 strategy；SMC 价位同样只作用于本人分组。管理员原样放行。"""
+    if p.is_admin:
+        return body
+    if not _is_smc_request(body) and (
+        group_rules.normalize_signal_model(body.model) != SIGNAL_MODEL_STRATEGY
+    ):
+        raise HTTPException(status_code=403, detail="普通用户只能手动触发 strategy 信号")
+    return await _scope_groups(store, p, body)
+
+
+async def _manual_smc(
+    body: ManualSignalRequest,
+    request: Request,
+    store: RedisStore,
+    background_tasks: BackgroundTasks,
+    operator: str,
+) -> dict:
+    """手动推送一份 SMC 价位。校验与 Webhook 相同，分组定向只在这里生效。"""
+    try:
+        parsed = smc_rules.parse_smc_payload({
+            "type": smc_rules.SMC_PAYLOAD_TYPE,
+            "symbol": body.symbol,
+            "tf": body.tf,
+            "data": body.data,
+        })
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"invalid smc-data: {e}")
+    if not parsed.levels:
+        raise HTTPException(status_code=400, detail="至少填写一条有效价位")
+    # 管理员没点名分组时不收窄，与 Webhook 一样写给所有匹配中的任务
+    group_ids = list(body.group_ids) or None
+    result = await smc_feed.ingest(
+        store, parsed, background_tasks, group_ids=group_ids,
+    )
+    ip = client_ip(request)
+    stored = parsed.to_store()
+    await persist.audit(
+        operator, "manual_signal", parsed.symbol,
+        {"type": smc_rules.SMC_PAYLOAD_TYPE, **stored, "group_ids": body.group_ids},
+        result.get("status", "ok"), ip,
+        category="console", before=None, after={
+            "request": {
+                "type": smc_rules.SMC_PAYLOAD_TYPE,
+                "symbol": parsed.symbol,
+                "tf": parsed.tf,
+                "levels": len(parsed.levels),
+                "group_ids": body.group_ids,
+            },
+            "result": {
+                "status": result.get("status"),
+                "type": result.get("type"),
+                "tasks": result.get("tasks"),
+                "nodes": result.get("nodes"),
+                "dropped": result.get("dropped"),
+            },
+        },
+    )
+    return result
+
+
 @router.post("/manual-signal")
 async def manual_signal(
     body: ManualSignalRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     store: RedisStore = Depends(get_store),
     dispatcher: Dispatcher = Depends(get_dispatcher),
     group_dispatcher: GroupDispatcher = Depends(get_group_dispatcher),
     p: Principal = Depends(require_menu(MENU_DASHBOARD, MENU_GROUPS)),
 ):
-    """手动触发一条信号（BUY / SELL / CLOSE），走与 Webhook 完全一致的分发流程。"""
+    """手动触发一条信号（BUY / SELL / CLOSE 或 type=smc-data）。"""
     admin = p.username
     body = await _scope_to_own_groups(store, p, body)
+    if _is_smc_request(body):
+        return await _manual_smc(body, request, store, background_tasks, admin)
     data = _build_signal_payload(body)
     ip = client_ip(request)
     result = await process_signal(

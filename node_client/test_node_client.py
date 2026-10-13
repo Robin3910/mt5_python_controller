@@ -668,6 +668,23 @@ async def test_cancel_pending_removes_order():
     assert msg["data"]["ticket"] == ticket
 
 
+async def test_strategy_smc_reaches_running_task():
+    n = _node()
+    await n._exec(n.mt5.connect)
+    ws = FakeWS()
+    await n._handle(ws, _strategy_cmd())
+    await asyncio.sleep(0.05)
+
+    await n._handle(ws, {
+        "cmd": "strategy_smc", "task_id": 7,
+        "smc": {"symbol": "EURUSD", "tf": "M5", "levels": [], "received_at": 1},
+    })
+
+    assert n.runners[7]._smc["tf"] == "M5"
+    n._cancel_runners()
+    await n.hub.close()
+
+
 async def test_cancel_pending_missing_ticket():
     n = _node()
     await n._exec(n.mt5.connect)
