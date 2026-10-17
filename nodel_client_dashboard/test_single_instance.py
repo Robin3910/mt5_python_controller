@@ -3,7 +3,7 @@ import single_instance as si
 
 
 def test_window_title_constant():
-    assert si.WINDOW_TITLE == "节点控制台"
+    assert si.WINDOW_TITLE == "亿点点"
     assert "Dashboard" in si.MUTEX_NAME or "Robin" in si.MUTEX_NAME
 
 

@@ -29,7 +29,7 @@ if not defined APPVER (
 )
 echo   Version: %APPVER%
 
-echo Building node_client_dashboard.exe ...
+echo Building ...
 pyinstaller --noconfirm --clean dashboard.spec
 if errorlevel 1 (
     echo Build failed.
@@ -37,7 +37,8 @@ if errorlevel 1 (
 )
 
 set "OUT=dist"
-set "EXE=%OUT%\node_client_dashboard.exe"
+set "EXE_NAME=亿点点 - 交易.exe"
+set "EXE=%OUT%\%EXE_NAME%"
 if not exist "%EXE%" (
     echo Build failed: %EXE% not found.
     exit /b 1
@@ -69,6 +70,6 @@ echo   Logs:       %OUT%\logs\
 echo.
 echo Run:
 echo   cd %OUT%
-echo   node_client_dashboard.exe
+echo   %EXE_NAME%
 
 endlocal

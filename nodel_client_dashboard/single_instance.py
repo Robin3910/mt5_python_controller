@@ -8,7 +8,7 @@ from ctypes import wintypes
 
 # 全局互斥名（Local\ 仅本会话；Global\ 需权限，这里用 Local）
 MUTEX_NAME = "Local\\RobinNodeClientDashboard_SingleInstance"
-WINDOW_TITLE = "节点控制台"
+WINDOW_TITLE = "亿点点"
 
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True) if sys.platform == "win32" else None
 _user32 = ctypes.WinDLL("user32", use_last_error=True) if sys.platform == "win32" else None

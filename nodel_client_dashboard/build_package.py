@@ -21,7 +21,7 @@ import zipfile
 from pathlib import Path
 
 # 主程序名；缺它说明构建没成功
-ENTRY_NAME = "node_client_dashboard.exe"
+ENTRY_NAME = "亿点点 • 交易.exe"
 
 # 绝不入包的文件名（小写比较）
 # panel_config.json：上次用户名与旧令牌；instances.json：本机实例清单与路径

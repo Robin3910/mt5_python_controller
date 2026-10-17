@@ -49,7 +49,7 @@ build_exe.bat
 
 产物两份：
 
-- `dist\node_client_dashboard.exe`（`instances.json` / `panel_config.json` / `logs/` 运行时写在 exe 同目录）
+- `dist\亿点点 • 交易.exe`（`instances.json` / `panel_config.json` / `logs/` 运行时写在 exe 同目录）
 - `packages\node_client_dashboard-<版本>.zip` —— 拷到新机器解压即用的分发包
 
 版本号每次打包自动生成，规则 `${数字版本号}-${年月日时分秒}`（如 `1.0.0-20260813155913`）。数字版本号取 `version.py` 的 `BASE_VERSION`，只在发大版本时手工改；时间戳由构建脚本生成，所以同一天连打几次也不会撞号。版本号一式两份：`_build_info.py` 冻结进 exe，`version.txt` 写在产物目录旁，窗口标题会显示它。

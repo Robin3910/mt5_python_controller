@@ -25,7 +25,7 @@ class LoginView(ctk.CTkFrame):
         self.grid(row=0, column=0, rowspan=2, sticky="nsew")
         card = glass_card(self)
         card.place(relx=0.5, rely=0.5, anchor="center")
-        ctk.CTkLabel(card, text="节点控制台登录", text_color=ACCENT, font=font(24, "bold")).pack(padx=42, pady=(30, 8))
+        ctk.CTkLabel(card, text="亿点点登录", text_color=ACCENT, font=font(24, "bold")).pack(padx=42, pady=(30, 8))
         ctk.CTkLabel(card, text="使用后台账户，按本人节点权限进行管理", text_color=TEXT_MUTED).pack(pady=(0, 18))
         ctk.CTkLabel(card, text="后端地址", text_color=TEXT_MUTED, anchor="w").pack(fill="x", padx=34)
         self._base_label = ctk.CTkLabel(card, text=self._backend_text(), text_color=TEXT, anchor="w", wraplength=355, justify="left")

@@ -96,7 +96,7 @@ class TrayController:
         schedule: Callable[[Callable[[], None]], None],
         on_show: Callable[[], None],
         on_quit: Callable[[], None],
-        title: str = "节点控制台",
+        title: str = "亿点点",
     ) -> None:
         self._schedule = schedule
         self._on_show = on_show

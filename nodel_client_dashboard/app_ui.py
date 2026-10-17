@@ -75,6 +75,7 @@ class _ListRow:
     dot: ctk.CTkLabel
     path: ctk.CTkLabel
     status: ctk.CTkLabel
+    account: ctk.CTkLabel | None = None
     snapshot: ListItemVM | None = None
 
 
@@ -279,7 +280,7 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         apply_theme()
-        self.title(f"节点控制台 v{get_version()}")
+        self.title(f"亿点点 v{get_version()}")
         apply_window_icon(self, as_default=True)
         self.geometry("1200x760")
         self.minsize(980, 640)
@@ -323,7 +324,7 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
         brand = ctk.CTkFrame(header, fg_color="transparent")
         brand.grid(row=0, column=0, padx=20, pady=14, sticky="w")
         ctk.CTkLabel(
-            brand, text="节点控制台", text_color=ACCENT, font=font(22, "bold")
+            brand, text="亿点点", text_color=ACCENT, font=font(22, "bold")
         ).pack(anchor="w")
         ctk.CTkLabel(
             brand,
@@ -477,44 +478,50 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
         )
         self.summary.pack(fill="x", padx=14, pady=12)
 
-        # 任务 + 日志
-        mid = glass_card(right)
-        mid.grid(row=3, column=0, sticky="nsew")
-        mid.grid_columnconfigure(0, weight=1)
-        mid.grid_rowconfigure(1, weight=1)
-        mid.grid_rowconfigure(3, weight=2)
+        # —— 任务 + 日志 区域已按需隐藏（先注释入口，代码不删） ——
+        # 暂时禁用整个策略任务 + 运行日志卡片；恢复时把下面 if False 改回 if True 即可。
+        if False:
+            mid = glass_card(right)
+            mid.grid(row=3, column=0, sticky="nsew")
+            mid.grid_columnconfigure(0, weight=1)
+            mid.grid_rowconfigure(1, weight=1)
+            mid.grid_rowconfigure(3, weight=2)
 
-        ctk.CTkLabel(
-            mid, text="策略任务", text_color=ACCENT, font=font(11, "bold"), anchor="w"
-        ).grid(row=0, column=0, sticky="w", padx=14, pady=(12, 2))
-        self.tasks = ctk.CTkTextbox(
-            mid,
-            height=110,
-            fg_color=BG_ELEVATED,
-            text_color=TEXT,
-            border_color=GLASS_BORDER,
-            border_width=1,
-            corner_radius=10,
-            font=mono(12),
-        )
-        self.tasks.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 8))
+            ctk.CTkLabel(
+                mid, text="策略任务", text_color=ACCENT, font=font(11, "bold"), anchor="w"
+            ).grid(row=0, column=0, sticky="w", padx=14, pady=(12, 2))
+            self.tasks = ctk.CTkTextbox(
+                mid,
+                height=110,
+                fg_color=BG_ELEVATED,
+                text_color=TEXT,
+                border_color=GLASS_BORDER,
+                border_width=1,
+                corner_radius=10,
+                font=mono(12),
+            )
+            self.tasks.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 8))
 
-        log_bar = ctk.CTkFrame(mid, fg_color="transparent")
-        log_bar.grid(row=2, column=0, sticky="ew", padx=14)
-        ctk.CTkLabel(
-            log_bar, text="运行日志", text_color=ACCENT, font=font(11, "bold")
-        ).pack(side="left")
-        ghost_btn(log_bar, "清空显示", self._clear_log, width=96).pack(side="right")
-        self.log_box = ctk.CTkTextbox(
-            mid,
-            fg_color=BG_ELEVATED,
-            text_color=TEXT,
-            border_color=GLASS_BORDER,
-            border_width=1,
-            corner_radius=10,
-            font=mono(12),
-        )
-        self.log_box.grid(row=3, column=0, sticky="nsew", padx=12, pady=(4, 12))
+            log_bar = ctk.CTkFrame(mid, fg_color="transparent")
+            log_bar.grid(row=2, column=0, sticky="ew", padx=14)
+            ctk.CTkLabel(
+                log_bar, text="运行日志", text_color=ACCENT, font=font(11, "bold")
+            ).pack(side="left")
+            ghost_btn(log_bar, "清空显示", self._clear_log, width=96).pack(side="right")
+            self.log_box = ctk.CTkTextbox(
+                mid,
+                fg_color=BG_ELEVATED,
+                text_color=TEXT,
+                border_color=GLASS_BORDER,
+                border_width=1,
+                corner_radius=10,
+                font=mono(12),
+            )
+            self.log_box.grid(row=3, column=0, sticky="nsew", padx=12, pady=(4, 12))
+        else:
+            # 隐藏期占位：保留同名属性，避免差分绑定/清空等逻辑访问时 AttributeError。
+            self.tasks = None
+            self.log_box = None
 
     def _persist(self) -> None:
         DashboardAuthUI._persist(self)
@@ -550,6 +557,13 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
             anchor="w", height=22,
         )
         title.pack(side="left")
+        # 交易账号 ID：与状态点同排右侧；未配置时显示「账号 -」
+        account_text = f"账号 {vm.mt5_login}" if vm.mt5_login else "账号 -"
+        account = ctk.CTkLabel(
+            top, text=account_text, text_color=TEXT_MUTED, font=mono(11),
+            anchor="e", height=22,
+        )
+        account.pack(side="right", padx=(8, 22))
         dot = ctk.CTkLabel(
             top, text="●", text_color=color, font=font(12), width=18, height=22,
         )
@@ -594,7 +608,7 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
             height=26,
             font=font(12),
         ).pack(side="left")
-        return _ListRow(card=card, title=title, dot=dot, path=path, status=status, snapshot=vm)
+        return _ListRow(card=card, title=title, dot=dot, path=path, status=status, account=account, snapshot=vm)
 
     def _apply_list_row(self, row: _ListRow, vm: ListItemVM) -> None:
         if row.snapshot == vm:
@@ -612,6 +626,12 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
         ):
             row.status.configure(text=vm.status_line, text_color=color)
             row.dot.configure(text_color=color)
+        # 交易账号 ID 变化时刷新（节点从 status_port 拉到真实账号后会更新）。
+        if row.snapshot is None or row.snapshot.mt5_login != vm.mt5_login:
+            if row.account is not None:
+                row.account.configure(
+                    text=f"账号 {vm.mt5_login}" if vm.mt5_login else "账号 -"
+                )
         if row.snapshot is None or row.snapshot.selected != vm.selected:
             row.card.configure(
                 fg_color=ACCENT_SOFT if vm.selected else GLASS_SOFT,
@@ -689,16 +709,21 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
                 self._sync_action_buttons(mp)
             if prev is None or prev.summary != detail.summary:
                 self.summary.configure(text=detail.summary)
-            if prev is None or prev.tasks_text != detail.tasks_text:
+            # 策略任务文本框已隐藏：保留字段生成逻辑，UI 写入入口先注释掉。
+            if False and prev is None or prev.tasks_text != detail.tasks_text:
                 self.tasks.delete("1.0", "end")
                 if detail.tasks_text:
                     self.tasks.insert("end", detail.tasks_text)
             self._detail_snap = detail
 
-        if refresh_log:
+        # 运行日志轮询入口已隐藏（任务 + 日志卡片整块被注释）。
+        if False:
             self._bind_log(mp)
 
     def _bind_log(self, mp) -> None:
+        # 策略任务 + 运行日志 卡片当前已隐藏，文本控件占位为 None；不读、不写。
+        if getattr(self, "log_box", None) is None:
+            return
         if mp is None:
             if self._log_snap != "":
                 self.log_box.delete("1.0", "end")
@@ -1242,7 +1267,7 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
             schedule=lambda fn: self.after(0, fn),
             on_show=self._show_from_tray,
             on_quit=self._quit_app,
-            title="节点控制台",
+            title="亿点点",
         )
         if self._tray.start():
             # 顶栏提示可托盘驻留
@@ -1380,7 +1405,7 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
                 pass
         if not getattr(self, "_tray_tip_shown", False):
             self._tray_tip_shown = True
-            self._tray.notify("节点控制台", "已最小化到托盘，右键可显示或退出")
+            self._tray.notify("亿点点", "已最小化到托盘，右键可显示或退出")
 
     def _show_from_tray(self) -> None:
         if self._quitting:
@@ -1445,7 +1470,7 @@ def run_app() -> int:
 
             tip = tk.Tk()
             tip.withdraw()
-            messagebox.showinfo("提示", "节点控制台已在运行，仅支持单实例。\n已尝试切换到已有窗口。")
+            messagebox.showinfo("提示", "亿点点已在运行，仅支持单实例。\n已尝试切换到已有窗口。")
             tip.destroy()
         except Exception:  # noqa: BLE001
             pass
