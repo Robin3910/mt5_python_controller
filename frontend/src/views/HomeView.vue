@@ -160,10 +160,16 @@ const filteredNodes = computed(() => {
   })
 
   const equityOf = (n: NodeOut) => acct(n.node_id)?.equity ?? 0
-  list = [...list]
-  if (sortBy.value === 'equity_desc') list.sort((a, b) => equityOf(b) - equityOf(a))
-  else if (sortBy.value === 'equity_asc') list.sort((a, b) => equityOf(a) - equityOf(b))
-  else list.sort((a, b) => a.name.localeCompare(b.name, 'zh'))
+  // 主节点始终置顶；主键之后再按用户选定的次级规则排序。
+  const primaryFirst = (a: NodeOut, b: NodeOut) =>
+    (a.is_primary ? 0 : 1) - (b.is_primary ? 0 : 1)
+  list = [...list].sort((a, b) => {
+    const primaryCmp = primaryFirst(a, b)
+    if (primaryCmp !== 0) return primaryCmp
+    if (sortBy.value === 'equity_desc') return equityOf(b) - equityOf(a)
+    if (sortBy.value === 'equity_asc') return equityOf(a) - equityOf(b)
+    return a.name.localeCompare(b.name, 'zh')
+  })
   return list
 })
 
