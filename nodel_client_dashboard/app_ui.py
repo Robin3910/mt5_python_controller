@@ -709,11 +709,6 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
                 self._sync_action_buttons(mp)
             if prev is None or prev.summary != detail.summary:
                 self.summary.configure(text=detail.summary)
-            # 策略任务文本框已隐藏：保留字段生成逻辑，UI 写入入口先注释掉。
-            if False and prev is None or prev.tasks_text != detail.tasks_text:
-                self.tasks.delete("1.0", "end")
-                if detail.tasks_text:
-                    self.tasks.insert("end", detail.tasks_text)
             self._detail_snap = detail
 
         # 运行日志轮询入口已隐藏（任务 + 日志卡片整块被注释）。
