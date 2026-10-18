@@ -207,11 +207,6 @@ function fmtSigned(value: number | null | undefined, digits = 1): string {
   return `${value > 0 ? '+' : ''}${value.toFixed(digits)}`
 }
 
-function fmtTime(seconds: number | null | undefined): string {
-  if (!seconds) return '—'
-  return new Date(seconds * 1000).toLocaleString('zh-CN', { hour12: false })
-}
-
 function scoreClass(value: number | null | undefined): string {
   if (!value) return ''
   return value > 0 ? 'is-bull' : 'is-bear'

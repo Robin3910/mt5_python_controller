@@ -52,25 +52,6 @@ const symbolOptions = computed<string[]>(() => {
   return [...found].sort()
 })
 
-const nodeOptions = computed(() =>
-  [...hub.nodes].sort((a, b) => {
-    const ao = statusOf(a) === 'online' ? 0 : 1
-    const bo = statusOf(b) === 'online' ? 0 : 1
-    if (ao !== bo) return ao - bo
-    return (a.name || a.node_id).localeCompare(b.name || b.node_id, 'zh')
-  }),
-)
-
-function nodeLabel(n: NodeOut): string {
-  const name = n.name || n.node_id
-  return n.mt5_login ? `${name} · ${n.mt5_login}` : name
-}
-
-function onSelectNode(id: string): void {
-  selectedNodeId.value = id
-  nodeMenuOpen.value = false
-}
-
 function onDocClick(e: MouseEvent): void {
   const root = (e.target as HTMLElement | null)?.closest?.('.trend-hub-field')
   if (!root) nodeMenuOpen.value = false

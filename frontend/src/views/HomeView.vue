@@ -5,9 +5,8 @@ import { useRouter } from 'vue-router'
 import HubTrendEmbed from '@/components/HubTrendEmbed.vue'
 import TagSelect from '@/components/TagSelect.vue'
 import type { TagOption } from '@/components/tagOption'
-import ManualStrategyTrigger from '@/components/ManualStrategyTrigger.vue'
 import { useHubStore } from '@/stores/hub'
-import type { AccountSnapshot, HubEvent, NodeOut, Position } from '@/api/types'
+import type { AccountSnapshot, NodeOut, Position } from '@/api/types'
 import { confirmAction } from '@/utils/confirm'
 import { ElMessage } from 'element-plus'
 
@@ -84,7 +83,6 @@ const SORT_TAGS: TagOption<SortBy>[] = [
   { value: 'name', label: '按名称' },
 ]
 type ViewMode = 'grid' | 'list'
-type EventTab = 'all' | 'risk' | 'trade'
 
 const q = ref('')
 const statusFilter = ref<StatusFilter>('all')
@@ -92,8 +90,6 @@ const sortBy = ref<SortBy>('equity_desc')
 const viewMode = ref<ViewMode>('grid')
 const page = ref(1)
 const pageSize = 9
-const eventTab = ref<EventTab>('all')
-const readKeys = ref<Set<string>>(new Set())
 
 function statusOf(n: NodeOut): 'online' | 'offline' {
   const s = hub.statuses[n.node_id] || n.status
@@ -108,28 +104,6 @@ function fmt(n: number | undefined): string {
 function fmtSigned(n: number): string {
   const abs = Math.abs(n).toLocaleString(undefined, { maximumFractionDigits: 2 })
   return n >= 0 ? `+${abs}` : `-${abs}`
-}
-function eventKey(e: HubEvent): string {
-  return `${e.ts}|${e.text}`
-}
-function isRead(e: HubEvent): boolean {
-  return readKeys.value.has(eventKey(e))
-}
-function markAllRead(): void {
-  const next = new Set(readKeys.value)
-  for (const e of hub.events) next.add(eventKey(e))
-  readKeys.value = next
-}
-/** 从事件文案解析首个 ±金额 */
-function parseDelta(text: string): number | null {
-  const m = text.match(/([+-])\s*(\d+(?:\.\d+)?)/)
-  if (!m) return null
-  const n = Number(m[2])
-  if (Number.isNaN(n)) return null
-  return m[1] === '-' ? -n : n
-}
-function previewPositions(positions: Position[] | undefined): Position[] {
-  return (positions || []).slice(0, 3)
 }
 function nodeVolume(positions: Position[] | undefined): number {
   return (positions || []).reduce((a, p) => a + (p.volume || 0), 0)
@@ -217,22 +191,12 @@ watch(totalPages, (tp) => {
   if (page.value > tp) page.value = tp
 })
 
-const filteredEvents = computed(() => {
-  if (eventTab.value === 'risk') return hub.events.filter((e) => e.kind === 'warn')
-  if (eventTab.value === 'trade') return hub.events.filter((e) => e.kind === 'ok')
-  return hub.events
-})
-
 async function closeNodeAll(n: NodeOut): Promise<void> {
   if (!(await confirmAction(
     `确认平掉节点「${n.name}」的全部持仓？\n将同时终止该节点上所有进行中的策略任务。`,
     '确认平仓',
   ))) return
   await hub.closeNode(n.node_id, { target: 'all' })
-}
-async function closeTicket(n: NodeOut, ticket: number): Promise<void> {
-  if (!(await confirmAction(`确认平掉订单 #${ticket}？`, '确认平仓'))) return
-  await hub.closeNode(n.node_id, { target: 'ticket', ticket })
 }
 </script>
 
