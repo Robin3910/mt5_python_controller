@@ -259,6 +259,16 @@ async def set_owner(
             # 改主人后老标记对新主人没有意义也违反唯一约束。
             if row.is_primary:
                 row.is_primary = False
+            # 「账号第一个节点自动升级为主节点」：当节点被分配给一个具体用户，
+            # 且该用户此前名下没有任何主节点时，把这个新分配的节点自动升为主。
+            # 仅在 owner_user_id 变到非空（真正的"分配给用户"，而非回收回管理员）
+            # 且该用户维度下无现存主节点时触发；这样既不会顶替已有主节点，
+            # 也避免了"从管理员名下转管理员名下"（owner_user_id=None）的边界情况。
+            if (
+                owner_user_id is not None
+                and not await _owner_has_primary(s, owner_user_id, exclude_node_id=node_id)
+            ):
+                row.is_primary = True
             if needs_strict_audit and audit_principal is not None:
                 from .dashboard_audit import begin_operation
                 audit_row = await begin_operation(s, audit_principal, "assign_node", target=node_id,
@@ -271,6 +281,24 @@ async def set_owner(
         d = node_row_to_dict(row)
     await store.cache_node(d)
     return d
+
+
+async def _owner_has_primary(
+    session, owner_user_id: Optional[int], *, exclude_node_id: str | None = None,
+) -> bool:
+    """判断指定所有者名下是否已经存在主节点（排除 exclude_node_id）。
+
+    用于「分配新节点时自动升级为主」前的唯一性预检，避免顶替已有主节点。
+    """
+    stmt = select(Node.node_id).where(Node.is_primary.is_(True))
+    if owner_user_id is None:
+        stmt = stmt.where(Node.owner_user_id.is_(None))
+    else:
+        stmt = stmt.where(Node.owner_user_id == owner_user_id)
+    if exclude_node_id:
+        stmt = stmt.where(Node.node_id != exclude_node_id)
+    return (await session.execute(stmt.limit(1))).first() is not None
+
 
 
 async def _clear_primary_for_owner(

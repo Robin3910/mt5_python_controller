@@ -693,3 +693,53 @@ def test_set_primary_node_audit(client):
     assert audits.status_code == 200, audits.text
     actions = [a["action"] for a in audits.json()["items"]]
     assert any(a.endswith("set_primary_node") for a in actions), audits.text
+
+
+def test_assign_node_promotes_primary_for_first_node(client):
+    """管理员把节点分配给某用户时，若该用户此前名下没有任何主节点，
+    则这个新分配的节点自动升级为主节点；不会顶替已存在的主节点。"""
+    h = _auth(client)
+
+    # 建两个节点，初始都归管理员名下（owner_user_id 为空）
+    r1 = client.post("/api/nodes", json={"name": "auto-1", "mt5_login": 73001}, headers=h)
+    assert r1.status_code == 201, r1.text
+    n1 = r1.json()["node_id"]
+    r2 = client.post("/api/nodes", json={"name": "auto-2", "mt5_login": 73002}, headers=h)
+    assert r2.status_code == 201, r2.text
+    n2 = r2.json()["node_id"]
+
+    # 准备一个普通用户
+    ru = client.post(
+        "/api/users",
+        json={"username": "auto_user", "password": "p@ssw0rd-1"},
+        headers=h,
+    )
+    assert ru.status_code == 201, ru.text
+    uid = ru.json()["id"]
+
+    # 场景 1：把第一个节点分配给用户 → 用户原本无主节点 → 自动升级为主
+    a1 = client.put(
+        f"/api/users/{uid}/nodes", json={"node_ids": [n1], "confirm": True}, headers=h,
+    )
+    assert a1.status_code == 200, a1.text
+    listing = {n["node_id"]: n for n in client.get("/api/nodes", headers=h).json()}
+    assert listing[n1]["is_primary"] is True, "首节点分配时应自动升级为主"
+    assert listing[n1]["owner_user_id"] == uid
+
+    # 场景 2：再分配第二个节点给同一用户 → 已存在主节点 → 新节点不应抢占
+    a2 = client.put(
+        f"/api/users/{uid}/nodes", json={"node_ids": [n1, n2], "confirm": True}, headers=h,
+    )
+    assert a2.status_code == 200, a2.text
+    listing = {n["node_id"]: n for n in client.get("/api/nodes", headers=h).json()}
+    assert listing[n1]["is_primary"] is True, "原主节点保持不变"
+    assert listing[n2]["is_primary"] is False, "新节点不应顶替原主节点"
+
+    # 场景 3：把第二个节点从该用户收回（回到管理员名下）→ 不应被升为主
+    a3 = client.put(
+        f"/api/users/{uid}/nodes", json={"node_ids": [n1], "confirm": True}, headers=h,
+    )
+    assert a3.status_code == 200, a3.text
+    listing = {n["node_id"]: n for n in client.get("/api/nodes", headers=h).json()}
+    assert listing[n2]["is_primary"] is False, "回收回管理员名下不应升主"
+    assert listing[n2]["owner_user_id"] is None

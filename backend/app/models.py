@@ -765,6 +765,40 @@ class PurgeTradeLogsRequest(BaseModel):
     confirm: str = Field(description=f"必须为「{PURGE_TRADE_LOGS_CONFIRM}」")
 
 
+# ----------------------------- 交易页一键触发 -----------------------------
+STRATEGY_TYPE_TREND_MARKET = "trend_market"
+STRATEGY_TYPE_TREND_LIMIT = "trend_limit"
+STRATEGY_TYPE_GRID = "grid"
+TRADING_STRATEGY_TYPES = (
+    STRATEGY_TYPE_TREND_MARKET,
+    STRATEGY_TYPE_TREND_LIMIT,
+    STRATEGY_TYPE_GRID,
+)
+
+
+class QuickTriggerRequest(BaseModel):
+    """交易页一键触发：主节点 + 策略类型 + 开仓参数。"""
+    node_id: str = Field(min_length=1, max_length=32)
+    strategy_type: str = Field(description="trend_market / trend_limit / grid")
+    symbol: str = Field(min_length=1, max_length=32)
+    volume: float = Field(gt=0)
+    sl: Optional[float] = Field(default=None, gt=0)
+    tp: Optional[float] = Field(default=None, gt=0)
+    # 限价开仓必填；其它模式忽略
+    entry_price: Optional[float] = Field(default=None, gt=0)
+    # 网格模式必填（all/buy/sell，默认 long=all=long）；
+    # 趋势模式忽略（后端根据现价/SL 自动判断）
+    direction: Optional[str] = Field(default=None)
+    remark: Optional[str] = Field(default=None, max_length=64)
+
+
+class QuickTriggerResult(BaseModel):
+    """一键触发结果。"""
+    group_id: str
+    strategy_id: str
+    result: dict  # webhook.process_signal 的返回体
+
+
 class PurgeTradeLogsResult(BaseModel):
     """清空交易记录的结果：各表删除行数与 Redis 运行态清理数。"""
     deleted: dict[str, int]

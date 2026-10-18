@@ -31,6 +31,7 @@ from . import (
     strategies,
     strategy_service,
     system_settings,
+    trading_api,
     trend_api,
     user_service,
     users_api,
@@ -140,6 +141,7 @@ for r in (
     accounts.router,
     close.router,
     admin_ws.router,
+    trading_api.router,
 ):
     app.include_router(r)
 
