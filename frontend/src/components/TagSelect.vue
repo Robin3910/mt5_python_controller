@@ -1,4 +1,4 @@
-<script setup lang="ts" generic="T extends string | number | boolean">
+﻿<script setup lang="ts" generic="T extends string | number | boolean">
 // 单选标签：替代原生下拉，选项平铺为可点选标签
 import type { TagOption } from '@/components/tagOption'
 
@@ -94,13 +94,52 @@ function pick(opt: TagOption<T>, current: T | null | undefined, disabled?: boole
 
 .tag-select-item:focus-visible {
   outline: none;
-  box-shadow: 0 0 0 3px rgba(0, 212, 170, 0.16);
+  box-shadow: 0 0 0 3px rgba(37, 99, 234, 0.16);
 }
 
 .tag-select-item.active {
-  background: rgba(0, 212, 170, 0.12);
-  border-color: rgba(0, 212, 170, 0.45);
-  color: var(--primary);
+  background: linear-gradient(135deg, var(--primary) 0%, var(--primary-d) 100%);
+  border-color: transparent;
+  color: #ffffff;
+  box-shadow: 0 0 12px rgba(37, 99, 234, 0.32);
+}
+.tag-select-item.active:hover:not(:disabled) {
+  color: #ffffff;
+  background: linear-gradient(135deg, #3b82f6 0%, var(--primary) 100%);
+}
+.tag-select-item.active .tag-select-code {
+  background: rgba(255, 255, 255, 0.18);
+  border-color: rgba(255, 255, 255, 0.32);
+  color: #ffffff;
+}
+
+/* 语义态（buy/sell/close/on/off）选中态统一收敛为蓝底白字，与全站一致 */
+.tag-select-item.is-buy.active,
+.tag-select-item.is-sell.active,
+.tag-select-item.is-close.active,
+.tag-select-item.is-on.active,
+.tag-select-item.is-off.active {
+  background: linear-gradient(135deg, var(--primary) 0%, var(--primary-d) 100%);
+  border-color: transparent;
+  color: #ffffff;
+  box-shadow: 0 0 12px rgba(37, 99, 234, 0.32);
+}
+.tag-select-item.is-buy.active:hover:not(:disabled),
+.tag-select-item.is-sell.active:hover:not(:disabled),
+.tag-select-item.is-close.active:hover:not(:disabled),
+.tag-select-item.is-on.active:hover:not(:disabled),
+.tag-select-item.is-off.active:hover:not(:disabled) {
+  color: #ffffff;
+  background: linear-gradient(135deg, #3b82f6 0%, var(--primary) 100%);
+}
+.tag-select-item.is-buy.active .tag-select-code,
+.tag-select-item.is-sell.active .tag-select-code,
+.tag-select-item.is-close.active .tag-select-code,
+.tag-select-item.is-on.active .tag-select-code,
+.tag-select-item.is-off.active .tag-select-code {
+  background: rgba(255, 255, 255, 0.18);
+  border-color: rgba(255, 255, 255, 0.32);
+  color: #ffffff;
 }
 
 .tag-select-code {
@@ -119,54 +158,6 @@ function pick(opt: TagOption<T>, current: T | null | undefined, disabled?: boole
 .tag-select-hint,
 .tag-select-label {
   white-space: nowrap;
-}
-
-.tag-select-item.is-buy.active {
-  background: rgba(16, 185, 129, 0.14);
-  border-color: rgba(16, 185, 129, 0.45);
-  color: #6ee7b7;
-}
-
-.tag-select-item.is-buy.active .tag-select-code {
-  background: rgba(16, 185, 129, 0.22);
-  border-color: rgba(16, 185, 129, 0.4);
-  color: #a7f3d0;
-}
-
-.tag-select-item.is-sell.active {
-  background: rgba(239, 68, 68, 0.12);
-  border-color: rgba(239, 68, 68, 0.42);
-  color: #fca5a5;
-}
-
-.tag-select-item.is-sell.active .tag-select-code {
-  background: rgba(239, 68, 68, 0.2);
-  border-color: rgba(239, 68, 68, 0.4);
-  color: #fecaca;
-}
-
-.tag-select-item.is-close.active {
-  background: rgba(245, 158, 11, 0.12);
-  border-color: rgba(245, 158, 11, 0.42);
-  color: #fbbf24;
-}
-
-.tag-select-item.is-close.active .tag-select-code {
-  background: rgba(245, 158, 11, 0.2);
-  border-color: rgba(245, 158, 11, 0.4);
-  color: #fde68a;
-}
-
-.tag-select-item.is-on.active {
-  background: rgba(16, 185, 129, 0.14);
-  border-color: rgba(16, 185, 129, 0.45);
-  color: #6ee7b7;
-}
-
-.tag-select-item.is-off.active {
-  background: rgba(239, 68, 68, 0.1);
-  border-color: rgba(239, 68, 68, 0.35);
-  color: #fca5a5;
 }
 
 .tag-select-empty {

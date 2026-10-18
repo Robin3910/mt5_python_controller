@@ -373,6 +373,7 @@ async def init_db() -> None:
         await conn.run_sync(_migrate_owner_columns)
         await conn.run_sync(_migrate_dashboard_columns)
         await conn.run_sync(_migrate_node_credentials)
+        await conn.run_sync(_migrate_node_primary)
     logger.info("Database initialized (%s)", engine.url.render_as_string(hide_password=True))
 
 
@@ -426,3 +427,20 @@ def _migrate_node_credentials(sync_conn) -> None:
             "FROM node_credential old JOIN nodes n ON n.node_id = old.node_id "
             "WHERE NOT EXISTS (SELECT 1 FROM node_credentials fresh WHERE fresh.node_id = old.node_id)"
         ))
+
+
+def _migrate_node_primary(sync_conn) -> None:
+    """nodes.is_primary：按所有者唯一的主节点标记（默认 0）。"""
+    inspector = inspect(sync_conn)
+    if "nodes" not in inspector.get_table_names():
+        return
+    cols = {c["name"] for c in inspector.get_columns("nodes")}
+    if "is_primary" in cols:
+        return
+    dialect = sync_conn.engine.dialect.name
+    # MySQL / SQLite 都把 Boolean 映射为 0/1；统一加在末端即可。
+    col_type = "TINYINT(1) NOT NULL DEFAULT 0" if dialect == "mysql" else "BOOLEAN NOT NULL DEFAULT 0"
+    sync_conn.execute(text(f"ALTER TABLE nodes ADD COLUMN is_primary {col_type}"))
+    sync_conn.execute(text(
+        f"CREATE INDEX IF NOT EXISTS ix_nodes_is_primary ON nodes (is_primary)"
+    ))

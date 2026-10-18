@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import { computed, ref } from 'vue'
 import { ElMessageBox, ElSwitch } from 'element-plus'
 import 'element-plus/es/components/switch/style/css'
@@ -649,7 +649,7 @@ defineExpose({ loadExample })
 .filter-symbol-search-input:focus {
   outline: none;
   border-color: var(--primary);
-  box-shadow: 0 0 0 3px rgba(0, 212, 170, 0.12);
+  box-shadow: 0 0 0 3px rgba(37, 99, 234, 0.12);
 }
 .filter-symbol-search-input::-webkit-search-cancel-button { display: none; }
 .filter-symbol-search-clear {

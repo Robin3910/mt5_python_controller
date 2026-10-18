@@ -24,6 +24,11 @@ class NodeUpdate(BaseModel):
     risk: Optional[dict] = None
 
 
+class NodePrimaryUpdate(BaseModel):
+    """设置 / 取消节点的主节点标记入参。"""
+    is_primary: bool
+
+
 class NodeOut(BaseModel):
     """节点对外展示对象（合并了在线状态与账户登录信息）。"""
     node_id: str
@@ -49,6 +54,9 @@ class NodeOut(BaseModel):
     credential_generation: int = 0
     legacy_allowed: bool = True
     has_credential: bool = False
+    # 主节点：每个 owner 维度下唯一；归管理员名下的节点（owner_user_id 为空）共享
+    # 同一个「管理员」槽位，最多也只能有一个主节点。
+    is_primary: bool = False
 
 
 class NodeTokenInfo(BaseModel):

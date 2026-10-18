@@ -14,6 +14,12 @@ const router = createRouter({
   routes: [
     { path: '/login', name: 'login', component: () => import('@/views/LoginView.vue') },
     {
+      path: '/home',
+      name: 'home',
+      component: () => import('@/views/HomeView.vue'),
+      meta: { menu: 'home' },
+    },
+    {
       path: '/',
       name: 'dashboard',
       component: () => import('@/views/DashboardView.vue'),
@@ -94,7 +100,7 @@ const router = createRouter({
 router.beforeEach(async (to) => {
   const auth = useAuthStore()
   if (to.name !== 'login' && !auth.isAuthed) return { name: 'login' }
-  if (to.name === 'login') return auth.isAuthed ? { name: 'dashboard' } : true
+  if (to.name === 'login') return auth.isAuthed ? { name: 'home' } : true
   if (!auth.me) {
     try {
       await auth.fetchMe()

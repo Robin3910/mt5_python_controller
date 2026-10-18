@@ -1,5 +1,6 @@
 // 菜单 code 与后端 permissions.MENU_REGISTRY 一致；顺序即顶部导航顺序，也是无权限时的回退顺序
 export const MENU_PATHS: ReadonlyArray<{ code: string; path: string }> = [
+  { code: 'home', path: '/home' },
   { code: 'dashboard', path: '/' },
   { code: 'nodes', path: '/nodes' },
   { code: 'trend', path: '/trend' },

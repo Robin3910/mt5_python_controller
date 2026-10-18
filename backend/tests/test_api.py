@@ -615,3 +615,81 @@ def test_2fa_login_flow(client):
         headers=h,
     )
     assert disable.status_code == 200, disable.text
+
+
+def test_set_primary_node_single_owner(client):
+    """同一所有者名下：设置主节点、换主节点、取消主节点。"""
+    h = _auth(client)
+
+    # 建两个节点，都归管理员名下（owner_user_id 为空）
+    r1 = client.post("/api/nodes", json={"name": "p-1", "mt5_login": 71001}, headers=h)
+    assert r1.status_code == 201, r1.text
+    n1 = r1.json()["node_id"]
+    r2 = client.post("/api/nodes", json={"name": "p-2", "mt5_login": 71002}, headers=h)
+    assert r2.status_code == 201, r2.text
+    n2 = r2.json()["node_id"]
+
+    # 初始都不是主节点
+    listing = client.get("/api/nodes", headers=h).json()
+    by_id = {n["node_id"]: n for n in listing}
+    assert by_id[n1]["is_primary"] is False
+    assert by_id[n2]["is_primary"] is False
+
+    # 设 n1 为主节点
+    set1 = client.post(f"/api/nodes/{n1}/primary", json={"is_primary": True}, headers=h)
+    assert set1.status_code == 200, set1.text
+    assert set1.json()["is_primary"] is True
+
+    listing = client.get("/api/nodes", headers=h).json()
+    by_id = {n["node_id"]: n for n in listing}
+    assert by_id[n1]["is_primary"] is True
+    assert by_id[n2]["is_primary"] is False
+
+    # 把主节点切到 n2：n1 的标记自动清掉，n2 变成主节点
+    set2 = client.post(f"/api/nodes/{n2}/primary", json={"is_primary": True}, headers=h)
+    assert set2.status_code == 200, set2.text
+    assert set2.json()["is_primary"] is True
+
+    listing = client.get("/api/nodes", headers=h).json()
+    by_id = {n["node_id"]: n for n in listing}
+    assert by_id[n1]["is_primary"] is False
+    assert by_id[n2]["is_primary"] is True
+
+    # 取消 n2 的主节点标记
+    off = client.post(f"/api/nodes/{n2}/primary", json={"is_primary": False}, headers=h)
+    assert off.status_code == 200, off.text
+    assert off.json()["is_primary"] is False
+    listing = client.get("/api/nodes", headers=h).json()
+    by_id = {n["node_id"]: n for n in listing}
+    assert by_id[n1]["is_primary"] is False
+    assert by_id[n2]["is_primary"] is False
+
+
+def test_set_primary_node_requires_auth(client):
+    """设置主节点需要登录；不存在的节点返回 404。"""
+    _h = client.post("/api/login", json={"username": "admin", "password": "admin123"}).json()["token"]
+    h = {"Authorization": f"Bearer {_h}"}
+    r1 = client.post("/api/nodes", json={"name": "anon", "mt5_login": 72001}, headers=h)
+    assert r1.status_code == 201, r1.text
+    nid = r1.json()["node_id"]
+    unauth = client.post(f"/api/nodes/{nid}/primary", json={"is_primary": True})
+    assert unauth.status_code == 401
+    nf = client.post("/api/nodes/not-exist/primary", json={"is_primary": True}, headers=h)
+    assert nf.status_code == 404
+
+
+def test_set_primary_node_audit(client):
+    """设置主节点会写审计记录，且同 owner 转移时自动清掉旧主节点标记。"""
+    h = _auth(client)
+    r1 = client.post("/api/nodes", json={"name": "aud-1", "mt5_login": 73001}, headers=h)
+    nid = r1.json()["node_id"]
+    set_p = client.post(f"/api/nodes/{nid}/primary", json={"is_primary": True}, headers=h)
+    assert set_p.status_code == 200, set_p.text
+
+    # 取最近的审计记录，看是否含 set_primary_node
+    audits = client.get(
+        "/api/audits", headers=h, params={"page": 1, "page_size": 20, "category": "node"},
+    )
+    assert audits.status_code == 200, audits.text
+    actions = [a["action"] for a in audits.json()["items"]]
+    assert any(a.endswith("set_primary_node") for a in actions), audits.text

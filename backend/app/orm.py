@@ -58,6 +58,9 @@ class Node(Base):
     approval_status: Mapped[str] = mapped_column(String(16), default="approved", server_default="approved")
     requested_by_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     admin_enable_requested: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    # 主节点：按 owner_user_id 维度每用户唯一（NULL 视为管理员名下用户的「无主节点」）。
+    # 同一所有者下只能有一个主节点；所有权变更时自动清掉，避免跨用户遗留。
+    is_primary: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()

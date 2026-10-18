@@ -212,6 +212,8 @@ export interface NodeOut {
   credential_generation?: number
   has_credential?: boolean
   legacy_allowed?: boolean
+  /** 主节点：每个 owner 维度下唯一；后续如默认节点、Webhook 目标等会优先选它 */
+  is_primary?: boolean
 }
 
 export interface Position {
@@ -322,6 +324,11 @@ export interface NodeUpdatePayload {
   enabled?: boolean
   filters?: NodeDispatchFiltersConfig | null
   risk?: NodeRiskConfig | null
+}
+
+/** 设置 / 取消节点的主节点标记 */
+export interface NodePrimaryUpdatePayload {
+  is_primary: boolean
 }
 
 export interface CloseRequest {
