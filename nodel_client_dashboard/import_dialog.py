@@ -23,10 +23,17 @@ from client_deploy import apply_package, extract_package, read_version_near
 from dialog_window import hide_while_building, show_centered
 from models import InstanceConfig, default_label_from_path
 from process_manager import ProcessManager
-from store import load_panel_config
+from store import canonical_dir, load_panel_config, same_instance
 from session_ui import SessionDialog
 from client_binding import require_binding
-from terminal_account import TerminalAccountError, enroll_import_login, read_terminal_account, typed_login
+from terminal_account import (
+    TerminalAccountError,
+    enroll_import_login,
+    read_algo_trading_allowed,
+    read_terminal_account,
+    typed_login,
+)
+from viewmodels import ALGO_TRADING_OFF_LABEL
 from theme import (
     ACCENT,
     BG,
@@ -367,8 +374,13 @@ class ImportNodeDialog(SessionDialog):
             return
 
         exe_path = directory / "node_client.exe"
+        target_dir = canonical_dir(str(exe_path))
         dup = next(
-            (c for c in self.dashboard._inventory.values() if Path(c.exe_path).resolve() == exe_path.resolve()), None
+            (
+                c for c in self.dashboard._inventory.values()
+                if canonical_dir(c.exe_path or c.cwd) == target_dir
+            ),
+            None,
         )
         if dup is not None:
             messagebox.showinfo(
@@ -464,6 +476,10 @@ class ImportNodeDialog(SessionDialog):
                 raise RuntimeError(msg)
 
             self.after(0, lambda: self._start_busy_status(
+                "正在停止该目录中正在运行的客户端", TEXT_MUTED
+            ))
+            self.manager.stop_for_install(directory)
+            self.after(0, lambda: self._start_busy_status(
                 "正在部署到 MT5 目录，请不要操作鼠标！等待自动导入完成！", TEXT_MUTED
             ))
             exe_path = directory / "node_client.exe"
@@ -489,6 +505,9 @@ class ImportNodeDialog(SessionDialog):
             self.session.perform("edit_env", self._pending_cfg, lambda: ef.write_env(directory, ef.update_env_text(old or template, updates)), generation=self._session_generation)
             env_written = True
 
+        if self._pending_cfg is not None:
+            self._pending_cfg.algo_trading_disabled = read_algo_trading_allowed(directory) is False
+
         # 注册实例必须回主线程：ProcessManager 与实例列表由 UI 线程持有
         self.after(
             0,
@@ -512,6 +531,16 @@ class ImportNodeDialog(SessionDialog):
         cfg = self._pending_cfg
         if cfg is None:
             raise RuntimeError("节点申请未完成")
+        dup = next((c for c in self.dashboard._inventory.values() if same_instance(c, cfg)), None)
+        if dup is not None:
+            self._stop_busy_status()
+            messagebox.showinfo(
+                "已存在",
+                f"账号 {cfg.mt5_login or ''} 已在实例「{dup.name}」中，不再重复添加。",
+                parent=self,
+            )
+            self.destroy()
+            return
         self.manager.add(cfg)
         self.created = cfg
         if self._on_done:
@@ -523,6 +552,8 @@ class ImportNodeDialog(SessionDialog):
             parts.append(".env 已覆盖")
         elif env_written:
             parts.append(".env 已生成")
+        if cfg.algo_trading_disabled:
+            parts.append(ALGO_TRADING_OFF_LABEL)
         self._stop_busy_status()
         self.status.configure(text="　".join(parts), text_color=ACCENT)
 
@@ -532,6 +563,8 @@ class ImportNodeDialog(SessionDialog):
             env_note = "已生成准备配置；待管理员审核开通后再启动。"
         else:
             env_note = "请确认 .env 已配置好后端地址与令牌，再启动实例。"
+        if cfg.algo_trading_disabled:
+            env_note += "\n\n该终端未开启算法交易，已在实例列表右上角标出。"
         messagebox.showinfo(
             "导入完成",
             f"实例「{cfg.name}」已加入列表。\n\n"

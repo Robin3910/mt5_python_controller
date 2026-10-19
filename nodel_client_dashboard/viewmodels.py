@@ -10,6 +10,9 @@ if TYPE_CHECKING:
     from process_manager import ManagedProcess, ProcessManager
 
 
+ALGO_TRADING_OFF_LABEL = "算法交易未开启"
+
+
 def health_zh(health: str | None) -> str:
     return {
         "ok": "正常",
@@ -42,6 +45,7 @@ class ListItemVM:
     daemon: bool
     # 当前 MT5 交易账号：优先用 runtime 上报的实时账号，未上报时退回配置中的期望账号。
     mt5_login: int = 0
+    algo_trading_disabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -64,6 +68,15 @@ class DetailVM:
     health: str
     busy: bool
     chips: tuple[ChipVM, ...]
+
+
+def algo_trading_disabled_for(saved: bool, live: bool | None) -> bool:
+    """运行中的终端读数优先。没有读数时才用导入时记下的结果。"""
+    if live is False:
+        return True
+    if live is True:
+        return False
+    return bool(saved)
 
 
 def process_state_label(mp: "ManagedProcess | None") -> str:
@@ -100,6 +113,9 @@ def build_list_item(mp: "ManagedProcess", selected_id: str | None) -> ListItemVM
         selected=cfg.id == selected_id,
         daemon=bool(cfg.daemon),
         mt5_login=mt5_login,
+        algo_trading_disabled=algo_trading_disabled_for(
+            cfg.algo_trading_disabled, rt.algo_trading_allowed,
+        ),
     )
 
 

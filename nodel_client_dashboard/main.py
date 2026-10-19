@@ -13,4 +13,8 @@ def _run_ui() -> int:
 
 
 if __name__ == "__main__":
+    from admin_elevate import ensure_admin
+
+    if not ensure_admin():
+        sys.exit(0)
     sys.exit(recovery_main(_run_ui))

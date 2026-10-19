@@ -7,7 +7,7 @@ from pathlib import Path
 
 from models import InstanceConfig
 from process_manager import ProcessManager
-from store import load_app_url, load_instances, save_instances
+from store import canonical_dir, dedupe_instances, load_app_url, load_instances, save_instances
 
 
 def test_store_roundtrip(tmp_path: Path):
@@ -22,6 +22,27 @@ def test_store_roundtrip(tmp_path: Path):
     assert loaded[0].name == "a"
     assert loaded[0].status_port == 18765
     assert loaded[1].daemon is True
+
+
+def test_reopen_collapses_same_account_and_virtual_store_copy():
+    real = InstanceConfig.create(
+        name="MetaTrader 5",
+        exe_path=r"C:\Program Files\MetaTrader 5\node_client.exe",
+        cwd=r"C:\Program Files\MetaTrader 5",
+    )
+    real.mt5_login = 60108484
+    real.node_id = "nd_same"
+    shadow = InstanceConfig.create(
+        name="MetaTrader 5",
+        exe_path=r"C:\Users\SQB\AppData\Local\VirtualStore\Program Files\MetaTrader 5\node_client.exe",
+        cwd=r"C:\Users\SQB\AppData\Local\VirtualStore\Program Files\MetaTrader 5",
+    )
+    shadow.mt5_login = 60108484
+    shadow.node_id = "nd_same"
+    kept, dropped = dedupe_instances([shadow, real])
+    assert [cfg.id for cfg in kept] == [real.id]
+    assert [cfg.id for cfg in dropped] == [shadow.id]
+    assert canonical_dir(shadow.exe_path) == canonical_dir(real.exe_path)
 
 
 def test_load_app_url_reads_quoted_value(tmp_path: Path):
@@ -117,6 +138,29 @@ def test_daemon_restarts(tmp_path: Path, monkeypatch):
         time.sleep(0.2)
     mgr.stop(cfg.id)
     assert restarted
+
+
+def test_stop_for_install_stops_only_the_target_directory(tmp_path: Path, monkeypatch):
+    mgr = ProcessManager()
+    target = tmp_path / "mt5"
+    other = tmp_path / "other"
+    target.mkdir()
+    other.mkdir()
+    hit = mgr.add(InstanceConfig.create(name="hit", exe_path=str(target / "node_client.exe"), cwd=str(target)))
+    skip = mgr.add(InstanceConfig.create(name="skip", exe_path=str(other / "node_client.exe"), cwd=str(other)))
+    hit.runtime.process_alive = True
+    skip.runtime.process_alive = True
+    stopped: list[str] = []
+
+    def stop_hit(graceful=True):
+        stopped.append(hit.cfg.id)
+        hit.runtime.process_alive = False
+
+    monkeypatch.setattr(hit, "stop", stop_hit)
+    monkeypatch.setattr(hit, "_status_reachable", lambda timeout=0.3: False)
+    monkeypatch.setattr(skip, "stop", lambda graceful=True: stopped.append(skip.cfg.id))
+    mgr.stop_for_install(target)
+    assert stopped == [hit.cfg.id]
 
 
 def test_start_all_stop_all_skip_logic(tmp_path: Path, monkeypatch):

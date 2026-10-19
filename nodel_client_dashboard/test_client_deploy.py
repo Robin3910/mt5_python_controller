@@ -7,6 +7,8 @@ from client_deploy import (
     SAME,
     UPGRADE,
     apply_package,
+    release_client_processes,
+    select_node_client_pids,
     backup_current,
     backup_dir_for,
     classify_update,
@@ -189,3 +191,62 @@ def test_extract_package_rejects_non_zip(tmp_path: Path):
     bad.write_bytes(b"not a zip")
     ok, msg = extract_package(bad, tmp_path / "out")
     assert not ok and "zip" in msg
+
+
+def test_select_node_client_pids_ignores_terminal_and_other_dirs():
+    directory = r"C:\Program Files\MetaTrader 5"
+    images = [
+        (10, directory + r"\node_client.exe"),
+        (11, directory + r"\terminal64.exe"),
+        (12, r"C:\Other\node_client.exe"),
+        (0, directory + r"\node_client.exe"),
+    ]
+    assert select_node_client_pids(images, directory) == [10]
+
+
+def test_release_client_processes_kills_untracked_exe(tmp_path: Path):
+    directory = tmp_path / "mt5"
+    directory.mkdir()
+    exe = directory / "node_client.exe"
+    exe.write_bytes(b"running")
+    killed: list[int] = []
+    release_client_processes(
+        directory,
+        images=[(42, str(exe))],
+        kill=killed.append,
+        busy=lambda _path: False,
+        shutdown=False,
+        timeout=0,
+    )
+    assert killed == [42]
+
+
+def test_release_client_processes_raises_without_touching_files_when_still_busy(tmp_path: Path):
+    directory = tmp_path / "mt5"
+    directory.mkdir()
+    exe = directory / "node_client.exe"
+    exe.write_bytes(b"running")
+    try:
+        release_client_processes(
+            directory,
+            images=[],
+            kill=lambda _pid: None,
+            busy=lambda _path: True,
+            shutdown=False,
+            timeout=0,
+        )
+    except RuntimeError as exc:
+        assert "没有修改" in str(exc)
+    else:
+        raise AssertionError("still-busy install must abort")
+    assert exe.read_bytes() == b"running"
+
+
+def test_apply_package_refuses_busy_exe_without_changing_it(tmp_path: Path, monkeypatch):
+    exe = _install(tmp_path, "1.0.0")
+    monkeypatch.setattr("client_deploy.file_is_busy", lambda path: Path(path).name == "node_client.exe")
+    ok, msg = apply_package(_package(tmp_path, "2.0.0"), exe, backup=True)
+    assert not ok
+    assert "未修改" in msg
+    assert exe.read_bytes() == b"old-bin"
+    assert list_local_backups(exe) == []

@@ -8,6 +8,14 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import node_client as nc
+from mt5_client import trade_allowed_from_terminal
+
+
+def test_trade_allowed_from_terminal_is_the_algo_button():
+    assert trade_allowed_from_terminal(None) is None
+    assert trade_allowed_from_terminal(object()) is None
+    assert trade_allowed_from_terminal(type("Info", (), {"trade_allowed": False})()) is False
+    assert trade_allowed_from_terminal(type("Info", (), {"trade_allowed": 1})()) is True
 
 
 class FakeWS:
@@ -47,6 +55,13 @@ async def test_authenticate_ok():
     assert n.hub_symbols == {"BTCUST", "XAUUSD"}
     assert n.node_id == "nd_x"
     assert n.status_snapshot()["node_id"] == "nd_x"
+
+
+def test_status_snapshot_includes_cached_algo_switch():
+    n = nc.NodeClient()
+    n.loop = None
+    n._algo_trading_allowed = False
+    assert n.status_snapshot()["algo_trading_allowed"] is False
 
 
 @pytest.mark.parametrize(

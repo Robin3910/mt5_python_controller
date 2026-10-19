@@ -1,10 +1,14 @@
 """导入节点时解析 MT5 账号：手工填写优先，留空则读取终端当前登录号。"""
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Callable
 
 import env_file as ef
+
+# MetaTrader5 的连接是进程内全局的，导入读账号和列表轮询不能同时 initialize。
+_MT5_LOCK = threading.Lock()
 
 
 class TerminalAccountError(RuntimeError):
@@ -55,19 +59,50 @@ def _load_mt5():
     return mt5
 
 
+def algo_trading_allowed(info: object | None) -> bool | None:
+    """从 terminal_info 读取算法交易开关。连不上或没有该字段时返回 None。"""
+    if info is None:
+        return None
+    allowed = getattr(info, "trade_allowed", None)
+    if isinstance(allowed, bool):
+        return allowed
+    if isinstance(allowed, int):
+        return bool(allowed)
+    return None
+
+
+def read_algo_trading_allowed(directory: str | Path) -> bool | None:
+    """附着目录中的 MT5 终端，读取算法交易是否开启。失败返回 None，不中断导入。"""
+    terminal = ef.find_terminal(directory)
+    if terminal is None:
+        return None
+    try:
+        mt5 = _load_mt5()
+    except TerminalAccountError:
+        return None
+    with _MT5_LOCK:
+        if not mt5.initialize(path=str(terminal)):
+            return None
+        try:
+            return algo_trading_allowed(mt5.terminal_info())
+        finally:
+            mt5.shutdown()
+
+
 def read_terminal_account(directory: str | Path) -> dict:
     """附着所选目录中的终端，读取当前已登录账号。未登录或连不上则失败。"""
     terminal = ef.find_terminal(directory)
     if terminal is None:
         raise TerminalAccountError("所选目录没有 MT5 终端，无法读取当前登录号")
     mt5 = _load_mt5()
-    if not mt5.initialize(path=str(terminal)):
-        raise TerminalAccountError(f"无法连接 MT5 终端：{mt5.last_error()}")
-    try:
-        info = mt5.account_info()
-        login = int(getattr(info, "login", 0) or 0) if info is not None else 0
-        if login <= 0:
-            raise TerminalAccountError("终端未登录，请先在 MT5 登录，或手工填写账号")
-        return {"login": login, "server": str(getattr(info, "server", "") or "")}
-    finally:
-        mt5.shutdown()
+    with _MT5_LOCK:
+        if not mt5.initialize(path=str(terminal)):
+            raise TerminalAccountError(f"无法连接 MT5 终端：{mt5.last_error()}")
+        try:
+            info = mt5.account_info()
+            login = int(getattr(info, "login", 0) or 0) if info is not None else 0
+            if login <= 0:
+                raise TerminalAccountError("终端未登录，请先在 MT5 登录，或手工填写账号")
+            return {"login": login, "server": str(getattr(info, "server", "") or "")}
+        finally:
+            mt5.shutdown()

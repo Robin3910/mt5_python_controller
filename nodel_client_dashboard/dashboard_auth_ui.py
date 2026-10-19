@@ -10,7 +10,7 @@ from auth_service import DashboardAuthError
 from dashboard_session import DashboardSession
 from login_view import LoginView
 from process_manager import _http_json
-from store import load_instances, save_instances
+from store import dedupe_instances, load_instances, save_instances
 from session_ui import requires_session
 
 
@@ -89,6 +89,13 @@ class DashboardAuthUI:
 
     def _load_permitted_instances(self):
         stored = load_instances()
+        stored, dropped = dedupe_instances(stored)
+        for cfg in dropped:
+            if cfg.status_port > 0:
+                try:
+                    _http_json("POST", f"http://127.0.0.1:{cfg.status_port}/stop", timeout=0.6)
+                except Exception:  # noqa: BLE001
+                    pass
         for cfg in stored:
             self._inventory.setdefault(cfg.id, cfg)
         self._inventory_loaded = True

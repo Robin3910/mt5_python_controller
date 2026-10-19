@@ -58,6 +58,9 @@ class MockMT5Client:
     def disconnect(self) -> None:
         self.connected = False
 
+    def algo_trading_allowed(self) -> bool | None:
+        return getattr(self, "trade_allowed", True)
+
     def account_info(self) -> dict:
         # 净值 = 余额 + 浮动盈亏（这里浮盈恒为 0，简化处理）
         floating = sum(p["profit"] for p in self._positions)

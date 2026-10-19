@@ -112,6 +112,18 @@ TIMEFRAMES: dict[str, int] = (
 ACCOUNT_MARGIN_MODES = {0: "netting", 1: "exchange", 2: "hedging"}
 
 
+def trade_allowed_from_terminal(info: object | None) -> bool | None:
+    """terminal_info().trade_allowed 即算法交易按钮。字段缺失时无法判断。"""
+    if info is None:
+        return None
+    allowed = getattr(info, "trade_allowed", None)
+    if isinstance(allowed, bool):
+        return allowed
+    if isinstance(allowed, int):
+        return bool(allowed)
+    return None
+
+
 class MT5Error(RuntimeError):
     pass
 
@@ -298,6 +310,12 @@ class MT5Client:
             raise MT5Error("MT5 not connected")
 
     # ------------------------- 查询 -------------------------
+    def algo_trading_allowed(self) -> bool | None:
+        """终端工具栏「算法交易」是否打开。未连接或读不到时返回 None。"""
+        if mt5 is None or not self.connected:
+            return None
+        return trade_allowed_from_terminal(mt5.terminal_info())
+
     def account_info(self) -> dict:
         """返回账户概况（余额/净值/保证金/杠杆等）。"""
         self.ensure()

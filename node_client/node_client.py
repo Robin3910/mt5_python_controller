@@ -131,9 +131,32 @@ class NodeClient:
         self.runners: dict[int, StrategyRunner] = {}
         # 策略监控的事件源：全节点共用一个采样器，MT5 调用次数与任务数无关
         self.hub: MarketHub | None = None
+        # 算法交易按钮的最近一次读数。None 表示还没读到，面板不据此标红。
+        self._algo_trading_allowed: bool | None = None
+        self._algo_refresh_pending = False
+
+    def _schedule_algo_refresh(self) -> None:
+        """在 MT5 专用线程上刷新算法交易开关，不阻塞状态口。"""
+        loop = self.loop
+        if loop is None or not loop.is_running() or self._algo_refresh_pending:
+            return
+        self._algo_refresh_pending = True
+        future = loop.run_in_executor(self._mt5_executor, self.mt5.algo_trading_allowed)
+
+        def _done(done) -> None:
+            self._algo_refresh_pending = False
+            try:
+                value = done.result()
+            except Exception:  # noqa: BLE001
+                return
+            if value is None or isinstance(value, bool):
+                self._algo_trading_allowed = value
+
+        future.add_done_callback(_done)
 
     def status_snapshot(self) -> dict:
         """本机 /health|/status 用的只读快照。"""
+        self._schedule_algo_refresh()
         return {
             "ok": True,
             "process": "alive",
@@ -144,6 +167,7 @@ class NodeClient:
             "uptime_s": round(time.time() - self.started_at, 1),
             "node_id": self.node_id,
             "mt5_login": self.expected_mt5_login,
+            "algo_trading_allowed": self._algo_trading_allowed,
             "runners": [r.status_dict() for r in self.runners.values()],
         }
 
@@ -241,6 +265,7 @@ class NodeClient:
                 require_dashboard_account(
                     await self._exec(self.mt5.account_info), self.dashboard_expected_mt5_login,
                 )
+            self._algo_trading_allowed = await self._exec(self.mt5.algo_trading_allowed)
         except Exception as e:  # noqa: BLE001
             logger.error("MT5 connect error: %s", e)
             if self.dashboard_expected_mt5_login is not None:
@@ -441,6 +466,7 @@ class NodeClient:
                 await asyncio.sleep(clamp_account_report_interval(settings.account_report_interval))
                 continue
             self._check_login(snap.get("account") or {})
+            self._algo_trading_allowed = await self._exec(self.mt5.algo_trading_allowed)
             await ws.send(json.dumps({"type": "account", "data": snap}))
             await self._check_account_risk(ws, snap)
             await asyncio.sleep(clamp_account_report_interval(settings.account_report_interval))
