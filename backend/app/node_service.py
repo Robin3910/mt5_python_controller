@@ -20,6 +20,7 @@ from .orm import Node, NodeCredential
 from .redis_store import RedisStore
 from .rules import validate_node_global_lot_mode
 from .security import make_node_id
+from .strategy_templates import TEMPLATE_2_ID  # 趋势策略模版 ID（"tpl_2"）
 
 logger = logging.getLogger(__name__)
 
@@ -653,7 +654,7 @@ async def migrate_primary_groups(
         limit_watch_enabled = bool(g.get("limit_watch_enabled"))
         # group_row_to_dict 没存 template_id，要按 strategy_id 查策略拿到
         sty = await _strategy_dict(store, g.get("strategy_id"))
-        is_trend = bool(sty and sty.get("template_id") == "2")  # TEMPLATE_2_ID == 趋势
+        is_trend = bool(sty and sty.get("template_id") == TEMPLATE_2_ID)
         report_for_new = bool(limit_watch_enabled and is_trend and new_primary_id)
         try:
             patch_kwargs: dict = {"node_ids": new_members}
