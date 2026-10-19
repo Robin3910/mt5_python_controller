@@ -1,116 +1,560 @@
 <script setup lang="ts">
-// 交易页：针对主节点触发三种开仓策略（市价/限价/网格）
-// 首次触发自动按 (策略类型-节点名-MT5 登录号) 创建专属分组+策略；后续直接复用
-import { computed, onMounted, ref, watch } from 'vue'
-import { ElMessage } from 'element-plus'
+// 交易页：单品种报价 + 顶部持仓汇总
+// 底部三个策略按钮（市价/限价/智能吸筹）任选其一 → 弹开仓参数弹窗
+//   - 市价 / 限价：SL 必填，方向由后端根据 (入场价|现价) vs SL 自动判断
+//   - 限价：再加一个 entry_price 必填
+//   - 网格：方向必选（all / buy / sell）
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
-import 'element-plus/es/components/dialog/style/css'
+import 'element-plus/es/components/message-box/style/css'
+import OrderDialog, { type OrderForm } from '../components/OrderDialog.vue'
 import { useRouter } from 'vue-router'
 import { useHubStore } from '@/stores/hub'
+import { useAuthStore } from '@/stores/auth'
 import { quickTrigger, type TradingStrategyType, type QuickTriggerResult } from '@/api/trading'
-import type { AccountSnapshot, NodeOut } from '@/api/types'
+import type {
+  AccountSnapshot,
+  CloseRequest,
+  GroupOut,
+  GroupSignalTaskRecord,
+  ManualSignalPayload,
+  ManualSignalResult,
+  NodeDispatchRecord,
+  NodeOut,
+  PaginatedNodeDispatches,
+  Position,
+  QuoteInfo,
+} from '@/api/types'
 
 const hub = useHubStore()
+const auth = useAuthStore()
 const router = useRouter()
 
+// 头部状态信息：MT5 登录号、服务器、在线/离线
+const primaryNode = computed<NodeOut | undefined>(() => {
+  return hub.nodes.find((n) => n.is_primary && n.enabled) as NodeOut | undefined
+})
+
+const account = computed<AccountSnapshot | null>(() => {
+  if (!primaryNode.value) return null
+  return hub.accounts[primaryNode.value.node_id] || null
+})
+
+function nodeOnline(n: NodeOut): boolean {
+  return hub.statuses[n.node_id] === 'online' || n.status === 'online'
+}
+const isOnline = computed(() => !!primaryNode.value && nodeOnline(primaryNode.value))
+
+// ── 单品种报价 ──
+const QUOTE_SYMBOLS = ['EURUSD', 'GBPUSD', 'XAUUSD', 'USDJPY', 'AUDUSD'] as const
+type QuoteSymbol = (typeof QUOTE_SYMBOLS)[number]
+
+/**
+ * 节点当前实际有报价数据的 symbol 列表。
+ * 判定：`account.quotes[sym].bid > 0`（任一字段非零即认为终端上报了）。
+ * 始终按 QUOTE_SYMBOLS 顺序展示，便于用户形成稳定预期。
+ */
+const availableSymbols = computed<QuoteSymbol[]>(() => {
+  const quotes = account.value?.quotes
+  if (!quotes) return []
+  return QUOTE_SYMBOLS.filter((sym) => {
+    const q = quotes[sym]
+    if (!q) return false
+    return (q.bid || 0) > 0 || (q.ask || 0) > 0 || (q.mid || 0) > 0
+  })
+})
+
+// 当前选中：默认 = 第一个有数据的 symbol；快照未到时回退到白名单首项
+const currentSymbol = ref<QuoteSymbol>(
+  (availableSymbols.value[0] ?? QUOTE_SYMBOLS[0]) as QuoteSymbol,
+)
+
+// 当前选中的 symbol 在可用列表里突然消失（节点切换/快照清空）时，自动回退到第一个可用 symbol
+watch(availableSymbols, (list) => {
+  if (list.length === 0) return
+  if (!list.includes(currentSymbol.value)) {
+    currentSymbol.value = list[0]
+  }
+})
+
+function pickSymbol(sym: string): void {
+  currentSymbol.value = sym as QuoteSymbol
+}
+
+function currentQuote(): QuoteInfo | null {
+  if (!account.value || !account.value.quotes) return null
+  return account.value.quotes[currentSymbol.value] ?? null
+}
+
+/** 当前品种 mid 报价（用于 OrderDialog 计算市价开仓方向）。 */
+const currentMid = computed<number | null>(
+  () => currentQuote()?.mid ?? null,
+)
+
+function fmtPrice(n: number | undefined, sym: string): string {
+  if (!n || !isFinite(n)) return '—'
+  // JPY 类 3 位，其它 5 位
+  const digits = /JPY$/.test(sym) ? 3 : 5
+  return n.toFixed(digits)
+}
+
+function fmtPips(n: number | undefined): string {
+  if (n === undefined || n === null || !isFinite(n)) return '—'
+  const s = n >= 0 ? '+' : ''
+  return `${s}${n.toFixed(2)}`
+}
+
+/** 持仓方向（buy/sell）转中文标签 */
+function fmtPosType(t: string | null | undefined): string {
+  const v = (t || '').toLowerCase()
+  if (v === 'buy') return '多'
+  if (v === 'sell') return '空'
+  return t || '—'
+}
+
+/** 主节点时间戳（秒）→ 简短本地时间；0 / NaN 视为空 */
+function fmtPosTime(ts: number): string {
+  if (!ts || !isFinite(ts)) return '—'
+  const d = new Date(ts * 1000)
+  if (isNaN(d.getTime())) return '—'
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+// 节点全量持仓汇总（用于顶部状态条）
+const allPositions = computed<Position[]>(() => {
+  return account.value?.positions || []
+})
+const totalPosCount = computed(() => allPositions.value.length)
+const totalPosVolume = computed(() =>
+  allPositions.value.reduce((a, p) => a + (p.volume || 0), 0),
+)
+const totalPosPnl = computed(() =>
+  allPositions.value.reduce((a, p) => a + (p.profit || 0), 0),
+)
+
+// 资产数据（从 AccountSnapshot）
+const accountProfit = computed(() => totalPosPnl.value) // 浮动盈亏 = 持仓 profit 之和
+const accountBalance = computed(() => account.value?.balance ?? 0)
+const accountEquity = computed(() => account.value?.equity ?? 0)
+const accountMargin = computed(() => account.value?.margin ?? 0)
+const accountFreeMargin = computed(() => account.value?.free_margin ?? 0)
+const accountLeverage = computed(() => account.value?.leverage ?? 0)
+
+// 当前品种的持仓摘要（叠加在报价卡上）
+const symbolPositions = computed<Position[]>(() =>
+  allPositions.value.filter((p) => p.symbol === currentSymbol.value),
+)
+const symbolPosCount = computed(() => symbolPositions.value.length)
+const symbolPosVolume = computed(() =>
+  symbolPositions.value.reduce((a, p) => a + (p.volume || 0), 0),
+)
+const symbolPosPnl = computed(() =>
+  symbolPositions.value.reduce((a, p) => a + (p.profit || 0), 0),
+)
+
+// 全部持仓：按 ticket 倒序（最新开仓在前）
+const sortedPositions = computed<Position[]>(() =>
+  [...allPositions.value].sort((a, b) => (b.ticket || 0) - (a.ticket || 0)),
+)
+
+// 持仓 / 资产 / 历史订单 / 吸筹策略 tab
+type DetailTab = 'positions' | 'assets' | 'history' | 'grid'
+const detailTab = ref<DetailTab>('positions')
+
+// ── 吸筹策略（运行中的网格任务） ──
+// 数据来源：遍历当前用户名下所有"网格分组"（按命名规则 grid-<user>-<login>-<sym>），
+// 调 GET /api/groups/{id}/signals?status=active 拉运行中的主任务，合并展示。
+// 停止 = 与 GroupSignalsView 的"平仓"按钮同一接口：POST /api/groups/{id}/dispatches/{id}/close。
+const gridTasks = ref<GroupSignalTaskRecord[]>([])
+const gridLoading = ref(false)
+const gridRefreshing = ref(false) // 轮询时为 true，避免 loading 闪烁
+const closingGridTaskIds = ref<Set<number>>(new Set())
+const GRID_TAB_REFRESH_MS = 5000
+let gridTimer: number | null = null
+
+function isClosingGridTask(taskId: number): boolean {
+  return closingGridTaskIds.value.has(taskId)
+}
+
+/** 主任务是否仍有可停止的子任务（终态都跳过）。 */
+function isGridTaskStoppable(task: GroupSignalTaskRecord): boolean {
+  if (['done', 'failed', 'skipped'].includes(task.status)) return false
+  return task.dispatches.some(
+    (d) => !['done', 'failed', 'skipped'].includes(d.status),
+  )
+}
+
+async function refreshGridTasks(initial = false): Promise<void> {
+  if (!auth.me) {
+    gridTasks.value = []
+    return
+  }
+  // 进入 tab 第一次拉 → 全屏 loading；轮询 → 静默刷新
+  if (initial) gridLoading.value = true
+  else gridRefreshing.value = true
+  try {
+    // 确保 groups 是新的：用户刚在分组页新建了网格分组时也认得出来
+    if (!hub.groups || hub.groups.length === 0) {
+      try {
+        await hub.listGroups()
+      } catch {
+        /* 忽略，沿用旧缓存 */
+      }
+    }
+    const gridGroups = (hub.groups || []).filter(
+      (g: GroupOut) => typeof g.name === 'string' && g.name.startsWith('grid-'),
+    )
+    if (gridGroups.length === 0) {
+      gridTasks.value = []
+      return
+    }
+    const all: GroupSignalTaskRecord[] = []
+    for (const g of gridGroups) {
+      try {
+        const res = await hub.fetchGroupSignals(g.group_id, 1, 50, 'active')
+        for (const t of res.items || []) {
+          // 同一 signal_id 可能下发给多节点 → 多个 dispatches，但本质是 1 个网格任务。
+          // fetchGroupSignals 已经按 task 去重，这里直接收。
+          all.push(t)
+        }
+      } catch {
+        /* 单个分组拉失败不影响其它分组 */
+      }
+    }
+    all.sort((a, b) =>
+      (b.opened_at || b.created_at || 0) - (a.opened_at || a.created_at || 0),
+    )
+    gridTasks.value = all
+  } finally {
+    gridLoading.value = false
+    gridRefreshing.value = false
+  }
+}
+
+/** 合并展示时把同一 task 下所有 dispatch 的 position_count / profit 等求和。 */
+function gridTaskPositionCount(task: GroupSignalTaskRecord): number {
+  return task.dispatches.reduce((a, d) => a + (d.position_count || 0), 0)
+}
+function gridTaskPendingCount(task: GroupSignalTaskRecord): number {
+  return task.dispatches.reduce((a, d) => a + (d.pending_orders || 0), 0)
+}
+function gridTaskProfit(task: GroupSignalTaskRecord): number {
+  return task.dispatches.reduce((a, d) => a + (d.realized_profit || 0), 0)
+}
+
+/** 网格任务的运行节点摘要（多节点用「 / 」连接）。 */
+function gridTaskNodeNames(task: GroupSignalTaskRecord): string {
+  const names = task.dispatches
+    .map((d) => d.node_name || d.node_id)
+    .filter(Boolean)
+  if (names.length === 0) return '—'
+  if (names.length <= 2) return names.join(' / ')
+  return `${names[0]} / ${names[1]} 等 ${names.length} 节点`
+}
+
+/** 网格 action → dir-tag 配色（all 也按"多"色展示）。 */
+function gridDirTagClass(action: string | null): string {
+  const v = (action || '').toLowerCase()
+  if (v === 'buy' || v === 'long' || v === 'all') return 'buy'
+  if (v === 'sell' || v === 'short') return 'sell'
+  return ''
+}
+
+async function stopGridTask(task: GroupSignalTaskRecord): Promise<void> {
+  if (!isGridTaskStoppable(task) || isClosingGridTask(task.task_id)) return
+  const sym = task.symbol || '?'
+  const nodeSummary = gridTaskNodeNames(task)
+  const dispatchCount = task.dispatches.filter(
+    (d) => !['done', 'failed', 'skipped'].includes(d.status),
+  ).length
+  try {
+    await ElMessageBox.confirm(
+      `确认停止 ${sym} 网格任务（${nodeSummary}）？\n将向 ${dispatchCount} 个节点按魔术号平掉该网格的全部持仓并结束策略监控。`,
+      '停止吸筹策略',
+      {
+        type: 'warning',
+        confirmButtonText: '确认停止',
+        cancelButtonText: '取消',
+      },
+    )
+  } catch {
+    return
+  }
+  // 一键终止：调 closeGroup 走"整组一键平仓"，与分组页"返回分组列表点平仓"一致。
+  // 它会下发 strategy_stop 到所有未收口子任务，效果与逐个 closeDispatch 等价但更快。
+  const groupId = task.group_id
+  closingGridTaskIds.value = new Set([...closingGridTaskIds.value, task.task_id])
+  let targetsCount = 0
+  let forcedCount = 0
+  try {
+    // 先尝试整组一键终止
+    try {
+      const r = await hub.closeGroup(groupId)
+      targetsCount = r?.targets ?? 0
+      forcedCount = r?.forced ?? 0
+    } catch {
+      // 整组失败 → 退化到逐个 dispatch 调用 closeGroupDispatch
+      for (const d of task.dispatches) {
+        if (['done', 'failed', 'skipped'].includes(d.status)) continue
+        try {
+          await hub.closeGroupDispatch(groupId, d.id)
+          targetsCount += 1
+        } catch {
+          /* 单个失败留给后续轮询显示 */
+        }
+      }
+    }
+    if (targetsCount > 0) {
+      ElMessage.success(
+        `已下发停止 · 成功 ${targetsCount}` + (forcedCount ? ` · 离线 ${forcedCount}` : ''),
+      )
+    } else if (forcedCount > 0) {
+      ElMessage.warning(`节点离线，已强制结束，待重连补发平仓（${forcedCount}）`)
+    } else {
+      ElMessage.warning('已下发停止，结果待刷新确认')
+    }
+    await refreshGridTasks()
+  } finally {
+    const next = new Set(closingGridTaskIds.value)
+    next.delete(task.task_id)
+    closingGridTaskIds.value = next
+  }
+}
+
+// ── 历史订单 ──
+// 走 GET /api/nodes/{id}/dispatches?page=&page_size=，分页返回 signal_history + signal_dispatch 联表明细。
+// 每条 = 一次「信号 × 本节点执行」结果，包含 order_ticket / price / retcode / status / error 等成交流水。
+const HISTORY_PAGE_SIZE = 50
+const historyItems = ref<NodeDispatchRecord[]>([])
+const historyTotal = ref(0)
+const historyPage = ref(1)
+const historyLoading = ref(false)
+const historyNodeId = ref<string | null>(null) // 上次拉取用的节点 id，避免重复拉
+
+async function fetchHistory(): Promise<void> {
+  const nid = primaryNode.value?.node_id
+  if (!nid) {
+    historyItems.value = []
+    historyTotal.value = 0
+    return
+  }
+  historyLoading.value = true
+  historyNodeId.value = nid
+  try {
+    const res: PaginatedNodeDispatches = await hub.fetchNodeDispatches(
+      nid,
+      historyPage.value,
+      HISTORY_PAGE_SIZE,
+    )
+    historyItems.value = res.items || []
+    historyTotal.value = res.total || 0
+  } catch (e) {
+    historyItems.value = []
+    historyTotal.value = 0
+    // 不弹错：tab 里自有空态
+    console.warn('fetchHistory failed', e)
+  } finally {
+    historyLoading.value = false
+  }
+}
+
+const historyTotalPages = computed(() => {
+  if (historyTotal.value <= 0) return 1
+  return Math.max(1, Math.ceil(historyTotal.value / HISTORY_PAGE_SIZE))
+})
+
+/** 历史订单：status 着色标签 */
+function historyStatusClass(s: string | null): string {
+  const v = (s || '').toLowerCase()
+  if (v === 'filled' || v === 'success' || v === 'done' || v === 'executed') return 'ok'
+  if (v === 'pending' || v === 'dispatched' || v === 'queued') return 'pending'
+  if (v === 'rejected' || v === 'failed' || v === 'error' || v === 'skipped') return 'err'
+  return ''
+}
+
+/** 把 Unix 时间戳（秒）→ 简短本地时间（含日期），供历史订单表用 */
+function fmtHistoryTime(ts: number | null | undefined): string {
+  if (!ts || !isFinite(ts)) return '—'
+  const d = new Date(ts * 1000)
+  if (isNaN(d.getTime())) return '—'
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+}
+
+/** 切到 history tab 时拉一次（首次） */
+watch(
+  [detailTab, () => primaryNode.value?.node_id],
+  ([tab, nid]) => {
+    if (tab === 'history' && nid) {
+      // 节点变了 → 强制回第一页 + 重拉
+      if (historyNodeId.value !== nid) {
+        historyPage.value = 1
+        fetchHistory()
+      } else if (historyItems.value.length === 0 && !historyLoading.value) {
+        fetchHistory()
+      }
+    }
+  },
+  { immediate: true },
+)
+
+/** 吸筹策略 tab：切到时拉一次 + 启轮询；切走关轮询；分组数据变化时强制重拉 */
+watch(
+  [detailTab, () => hub.groups.length],
+  ([tab, groupLen]) => {
+    if (tab === 'grid') {
+      // 首次进入 或 分组数量变化（新建了网格分组） → 重新拉
+      void refreshGridTasks(gridTasks.value.length === 0 || groupLen === 0)
+      if (gridTimer === null) {
+        gridTimer = window.setInterval(() => {
+          void refreshGridTasks(false)
+        }, GRID_TAB_REFRESH_MS)
+      }
+    } else if (gridTimer !== null) {
+      window.clearInterval(gridTimer)
+      gridTimer = null
+    }
+  },
+  { immediate: true },
+)
+
+async function goHistoryPage(p: number): Promise<void> {
+  if (p < 1 || p > historyTotalPages.value) return
+  if (p === historyPage.value) return
+  historyPage.value = p
+  await fetchHistory()
+}
+
+// ── 弹窗（开仓参数）──
 const STRATEGY_LABEL: Record<TradingStrategyType, string> = {
   trend_market: '市价开仓',
   trend_limit: '限价开仓',
   grid: '智能吸筹',
 }
 
+const dialogVisible = ref(false)
+const submitting = ref(false)
+const lastError = ref('')
+const defaultVolume = ref(0.01)
+
+// 市价开仓走 strategy 模型需要真实 group_id；
+// 按 dialogGroupName（与后端命名规则一致）在 hub.groups 里查找。
+// 找不到（用户从未创建过该分组）→ OrderDialog 会拒绝触发 strategy 信号。
+const dialogGroupId = ref<string | null>(null)
+
+/** OrderDialog 组件引用，用于在「策略复用」触发后回写结果 / 错误 */
+const orderDialogRef = ref<InstanceType<typeof OrderDialog> | null>(null)
+
+// 策略类型 + 表单（与后端 _group_name 字段对齐：strategy_type-username-login-symbol）
 const strategyType = ref<TradingStrategyType>('trend_market')
 
-// 当前主节点：取 owner == 当前用户（或管理员名下）的 is_primary 节点
-const primaryNode = computed<NodeOut | undefined>(() => {
-  return hub.nodes.find((n) => n.is_primary && n.enabled) as NodeOut | undefined
-})
-
-// 节点账户快照（用于取现价 / 持仓）
-const account = computed<AccountSnapshot | null>(() => {
-  if (!primaryNode.value) return null
-  return hub.accounts[primaryNode.value.node_id] || null
-})
-
-// 在线状态：与项目其它视图保持一致 —— hub.statuses[xx] === 'online' || n.status === 'online'
-function nodeOnline(n: NodeOut): boolean {
-  return hub.statuses[n.node_id] === 'online' || n.status === 'online'
-}
-const isOnline = computed(() => {
-  if (!primaryNode.value) return false
-  return nodeOnline(primaryNode.value)
-})
-
-// 当前品种的持仓数
-const positionsCount = computed(() => {
-  if (!account.value || !form.value.symbol) return 0
-  const positions = account.value.positions || []
-  return positions.filter((p) => p.symbol === form.value.symbol).length
-})
-
-// 当前品种的中间价（市价模式自动判断方向用）
-const currentMid = computed(() => {
-  if (!account.value || !form.value.symbol) return 0
-  const q = account.value.quotes?.[form.value.symbol]
-  if (q && typeof q.mid === 'number' && q.mid > 0) return q.mid
-  return 0
-})
-
-const form = ref({
-  symbol: 'XAUUSD',
+const form = reactive<OrderForm & { grid_step?: number | null; grid_layers?: number | null }>({
+  symbol: 'EURUSD' as string,
   volume: 0.01,
   sl: 0 as number | null,
   tp: 0 as number | null,
   entry_price: 0 as number | null,
-  direction: 'long' as 'long' | 'short' | 'all',
+  /** 网格模式：all（多头）/ sell（空头） */
+  direction: 'all' as 'all' | 'buy' | 'sell',
   remark: '',
 })
 
-watch(strategyType, () => {
-  // 切策略时清空入场价
-  form.value.entry_price = 0
-})
-
-const canSubmit = computed(() => {
-  if (!primaryNode.value || !isOnline.value) return false
-  if (!form.value.symbol || form.value.volume <= 0) return false
-  if (strategyType.value === 'trend_limit' && (!form.value.entry_price || form.value.entry_price <= 0)) return false
-  return true
-})
-
-const dialogVisible = ref(false)
-const submitting = ref(false)
-const lastError = ref('')
-
-function openDialog() {
-  if (!canSubmit.value) return
+/** 点底部策略按钮 → 打开弹窗，按钮类型决定 strategyType */
+async function openDialog(type: TradingStrategyType): Promise<void> {
+  if (!primaryNode.value || !isOnline.value) {
+    ElMessage.warning('主节点不在线，无法触发')
+    return
+  }
+  strategyType.value = type
+  form.symbol = currentSymbol.value
+  form.volume = defaultVolume.value
+  form.sl = 0
+  form.tp = 0
+  form.entry_price = 0
+  form.direction = 'all'
+  form.remark = ''
   lastError.value = ''
+  dialogGroupId.value = null
+  // 预拉一次分组列表：
+  // 必须拿到真实 group_id 才能调 POST /api/console/manual-signal 的 strategy 模型（市价开仓）。
+  // 拉不到或没匹配上时，市价开仓弹窗会拒绝触发；限价 / 网格不受影响（仍走原 submit 路径）。
+  try {
+    const groups = await hub.listGroups()
+    dialogGroupId.value = resolveDialogGroupId(groups)
+  } catch {
+    dialogGroupId.value = null
+  }
   dialogVisible.value = true
 }
 
-async function submit() {
+const canSubmit = computed(() => {
+  if (!primaryNode.value || !isOnline.value) return false
+  if (!form.symbol) return false
+  // 限价：必须填入场价
+  if (strategyType.value === 'trend_limit' && (!form.entry_price || form.entry_price <= 0)) {
+    return false
+  }
+  // 市价 / 限价：止损价必填（后端会基于 SL 自动判断多空）
+  if (
+    strategyType.value !== 'grid' &&
+    (!form.sl || form.sl <= 0)
+  ) {
+    return false
+  }
+  return true
+})
+
+const dialogGroupName = computed(() => {
+  if (!primaryNode.value) return ''
+  const login = primaryNode.value.mt5_login ?? 'unknown'
+  const username = auth.me?.username || 'unknown'
+  return `${strategyType.value}-${username}-${login}-${form.symbol}`
+})
+
+/** 按 dialogGroupName 在 hub.groups 里查找对应的 group_id。
+ *  找不到时返回 null（OrderDialog 会回落到原 quickTrigger 路径）。*/
+function resolveDialogGroupId(groups: GroupOut[]): string | null {
+  const target = dialogGroupName.value
+  if (!target) return null
+  const hit = groups.find((g) => g.name === target)
+  return hit?.group_id ?? null
+}
+
+function closeDialog(): void {
+  dialogVisible.value = false
+}
+
+async function submit(): Promise<void> {
   if (!primaryNode.value) return
   submitting.value = true
   lastError.value = ''
   try {
+    // 手数兜底：未填 / 0 / NaN / 负数 → 0.01，
+    // 避免后端「开仓信号必须填写手数」拦截
+    const rawVolume = form.volume
+    const safeVolume =
+      rawVolume == null || isNaN(rawVolume) || rawVolume <= 0 ? 0.01 : rawVolume
+    if (safeVolume !== rawVolume) form.volume = safeVolume
     const payload = {
       node_id: primaryNode.value.node_id,
       strategy_type: strategyType.value,
-      symbol: form.value.symbol,
-      volume: form.value.volume,
-      sl: form.value.sl && form.value.sl > 0 ? form.value.sl : null,
-      tp: form.value.tp && form.value.tp > 0 ? form.value.tp : null,
-      entry_price: strategyType.value === 'trend_limit' ? form.value.entry_price : null,
+      symbol: form.symbol,
+      volume: safeVolume,
+      sl: form.sl && form.sl > 0 ? form.sl : null,
+      tp: form.tp && form.tp > 0 ? form.tp : null,
+      entry_price: strategyType.value === 'trend_limit' ? form.entry_price : null,
+      // 网格才传方向；其他模式由后端基于 SL 自动判断
       direction:
-        strategyType.value === 'grid'
-          ? ((form.value.direction === 'long' ? 'all' : 'sell') as 'all' | 'buy' | 'sell')
-          : (null as 'all' | 'buy' | 'sell' | null),
-      remark: form.value.remark || null,
+        strategyType.value === 'grid' ? form.direction : null,
+      remark: form.remark || null,
     }
+    console.log(payload)
     const r: QuickTriggerResult = await quickTrigger(payload)
     if (r.result.status === 'accepted') {
       ElMessage.success(
-        `已触发 ${STRATEGY_LABEL[strategyType.value]} ${form.value.symbol}（${r.result.targets ?? 0} 个目标节点）`,
+        `${STRATEGY_LABEL[strategyType.value]} ${form.symbol}（${r.result.targets ?? 0} 个目标节点）`,
       )
       dialogVisible.value = false
     } else if (r.result.status === 'duplicate') {
@@ -128,15 +572,83 @@ async function submit() {
   }
 }
 
-const dialogGroupName = computed(() => {
-  if (!primaryNode.value) return ''
-  const login = primaryNode.value.mt5_login ?? 'unknown'
-  return `${strategyType.value}-${primaryNode.value.name}-${login}`
-})
+/** OrderDialog 「策略复用」开关开启后的回调：调 POST /api/console/manual-signal，
+ *  与 StrategyFormModal.triggerBoundGroup 同一条路径。
+ *  payload 已是 ManualSignalPayload（含 model=strategy + group_ids=[group_id]）。
+ *  这里只负责调接口、回传结果 / 错误给 OrderDialog。*/
+async function triggerStrategyFromDialog(
+  payload: ManualSignalPayload,
+): Promise<void> {
+  try {
+    const res: ManualSignalResult = await hub.triggerManualSignal(payload)
+    if (res.status === 'accepted' || res.status === 'duplicate') {
+      // 成功 / 重复都关掉弹窗（重复是幂等保护，无副作用）
+      dialogVisible.value = false
+    }
+    orderDialogRef.value?.onStrategyResult(res)
+  } catch (e) {
+    const err = e as { response?: { data?: { detail?: string } }; message?: string }
+    const msg = err?.response?.data?.detail || err?.message || '策略复用触发失败'
+    orderDialogRef.value?.onStrategyError(msg)
+  }
+}
 
+// ── 单笔持仓平仓 ──
+// 走 POST /api/nodes/{id}/close，body={target:'ticket', ticket}。
+// 防止双击：loading 状态以 ticket 维度记录到 closingTickets Set。
+const closingTickets = ref<Set<number>>(new Set())
+function isClosing(ticket: number): boolean {
+  return closingTickets.value.has(ticket)
+}
+async function closePosition(p: Position): Promise<void> {
+  if (!primaryNode.value) {
+    ElMessage.warning('主节点不存在')
+    return
+  }
+  if (!p.ticket) {
+    ElMessage.warning('该持仓缺少 ticket，无法平仓')
+    return
+  }
+  if (closingTickets.value.has(p.ticket)) return
+  const type = (p.type || '').toLowerCase()
+  const dirLabel = type === 'buy' ? '多' : type === 'sell' ? '空' : ''
+  const sym = p.symbol
+  const vol = (p.volume || 0).toFixed(2)
+  try {
+    await ElMessageBox.confirm(
+      `确认平仓 #${p.ticket} ${sym} ${dirLabel} ${vol} 手？`,
+      '平仓确认',
+      {
+        type: 'warning',
+        confirmButtonText: '确认平仓',
+        cancelButtonText: '取消',
+      },
+    )
+  } catch {
+    return
+  }
+  const body: CloseRequest = { target: 'ticket', ticket: p.ticket }
+  closingTickets.value = new Set([...closingTickets.value, p.ticket])
+  try {
+    await hub.closeNode(primaryNode.value.node_id, body)
+    ElMessage.success(`已请求平仓 #${p.ticket} ${sym}`)
+    // 立即拉一次快照，避免等 5s 轮询
+    hub.fetchNodeAccount(primaryNode.value.node_id).catch(() => {})
+  } catch (e) {
+    const err = e as { response?: { data?: { detail?: string } }; message?: string }
+    const msg = err?.response?.data?.detail || err?.message || `平仓失败 #${p.ticket}`
+    ElMessage.error(msg)
+  } finally {
+    const next = new Set(closingTickets.value)
+    next.delete(p.ticket)
+    closingTickets.value = next
+  }
+}
+
+// 简单轮询拉取快照（保持行情新鲜）
+let pollTimer: number | null = null
 onMounted(async () => {
   await hub.fetchNodes()
-  // 拉取主节点账户快照（如已有则跳过；store 也可能在等 WS 推送）
   if (primaryNode.value && !hub.accounts[primaryNode.value.node_id]) {
     try {
       await hub.fetchNodeAccount(primaryNode.value.node_id)
@@ -144,172 +656,1253 @@ onMounted(async () => {
       /* 节点尚未上报快照，忽略 */
     }
   }
+  pollTimer = window.setInterval(() => {
+    if (primaryNode.value) {
+      hub.fetchNodeAccount(primaryNode.value.node_id).catch(() => {})
+    }
+  }, 5000)
+})
+onBeforeUnmount(() => {
+  if (pollTimer !== null) {
+    window.clearInterval(pollTimer)
+    pollTimer = null
+  }
+  if (gridTimer !== null) {
+    window.clearInterval(gridTimer)
+    gridTimer = null
+  }
 })
 </script>
 
 <template>
   <div class="trading-page">
-    <div class="row between page-header">
-      <div class="h1">交易</div>
-    </div>
-
     <!-- 空态：无主节点 -->
-    <div v-if="!primaryNode" class="card card-pad empty-state">
+    <div v-if="!primaryNode" class="empty-state card card-pad">
       <div class="empty-title">尚未设置主节点</div>
       <div class="empty-desc">请先在【节点】页将一个节点标记为主节点，再回到此页面触发开仓。</div>
       <button class="btn-primary" @click="router.push('/nodes')">前往节点页</button>
     </div>
 
     <template v-else>
-      <!-- 策略选择 -->
-      <div class="card card-pad strategy-tabs">
-        <button
-          v-for="(label, key) in STRATEGY_LABEL"
-          :key="key"
-          class="strategy-tab"
-          :class="{ active: strategyType === key }"
-          @click="strategyType = key as TradingStrategyType"
-        >
-          {{ label }}
-        </button>
+      
+      <!-- 单品种报价 -->
+      <div class="quote-board card card-pad">
+        <div class="quote-col">
+          <div class="quote-head">
+            <span class="quote-sym">{{ currentSymbol }}</span>
+            <span class="quote-pct" v-if="currentQuote()">100.00%</span>
+          </div>
+          <div class="quote-mid">{{ fmtPrice(currentQuote()?.mid, currentSymbol) }}</div>
+          <div class="quote-bidask">
+            <div class="ba-row bid">
+              <span class="ba-k">买价</span>
+              <span class="ba-v">{{ fmtPrice(currentQuote()?.bid, currentSymbol) }}</span>
+            </div>
+            <div class="ba-row ask">
+              <span class="ba-k">卖价</span>
+              <span class="ba-v">{{ fmtPrice(currentQuote()?.ask, currentSymbol) }}</span>
+            </div>
+            <div class="ba-row chg">
+              <span class="ba-k">变动</span>
+              <span
+                class="ba-v"
+                :class="(currentQuote()?.change ?? 0) >= 0 ? 'pos' : 'neg'"
+              >{{ fmtPips(currentQuote()?.change) }}</span>
+            </div>
+          </div>
+          <div class="quote-position" v-if="symbolPosCount > 0">
+            <div class="qp-row">
+              <span class="qp-k">{{ currentSymbol }} 持仓</span>
+              <span class="qp-v">{{ symbolPosCount }} 笔 · {{ symbolPosVolume.toFixed(2) }} 手</span>
+            </div>
+            <div class="qp-row">
+              <span class="qp-k">浮盈</span>
+              <span class="qp-v" :class="symbolPosPnl >= 0 ? 'pos' : 'neg'">
+                {{ symbolPosPnl >= 0 ? '+' : '' }}{{ symbolPosPnl.toFixed(2) }}
+              </span>
+            </div>
+          </div>
+          <div class="quote-sym-picker" v-if="availableSymbols.length > 0">
+            <button
+              v-for="sym in availableSymbols"
+              :key="sym"
+              class="sym-chip"
+              :class="{ active: currentSymbol === sym }"
+              @click="pickSymbol(sym)"
+            >{{ sym }}</button>
+          </div>
+          <div v-else class="sym-empty muted">主节点尚未上报任何品种报价</div>
+        </div>
       </div>
 
-      <!-- 主节点 / 操作节点 / 持仓 三块 -->
-      <div class="grid-3">
-        <div class="card card-pad">
-          <div class="label">主节点</div>
-          <div class="row" style="gap: 8px; margin-top: 8px">
-            <span class="pill pill-primary">主节点</span>
-            <strong>{{ primaryNode.name }}</strong>
-          </div>
-          <div class="muted small" style="margin-top: 6px">
-            MT5 登录：{{ primaryNode.mt5_login ?? '—' }} · 服务器：{{ primaryNode.mt5_server || '—' }}
-          </div>
-        </div>
+      <!-- 底部：三个策略按钮 -->
+      <div class="action-bar">
+        <button
+          class="action-btn"
+          :class="{ 'action-btn-disabled': !isOnline }"
+          :disabled="!isOnline"
+          @click="openDialog('trend_market')"
+        >
+          <svg class="action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z" />
+          </svg>
+          <span class="action-label">市价开仓</span>
+        </button>
+        <div class="action-sep"></div>
+        <button
+          class="action-btn"
+          :class="{ 'action-btn-disabled': !isOnline }"
+          :disabled="!isOnline"
+          @click="openDialog('trend_limit')"
+        >
+          <svg class="action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="9" />
+            <circle cx="12" cy="12" r="5" />
+            <circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none" />
+            <path d="M12 1.5v3M12 19.5v3M1.5 12h3M19.5 12h3" />
+          </svg>
+          <span class="action-label">限价开仓</span>
+        </button>
+        <div class="action-sep"></div>
+        <button
+          class="action-btn"
+          :class="{ 'action-btn-disabled': !isOnline }"
+          :disabled="!isOnline"
+          @click="openDialog('grid')"
+        >
+          <svg class="action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M3 6h18M3 12h18M3 18h18" />
+            <path d="M6 4v16M12 4v16M18 4v16" />
+            <path d="M4 8l4 4M8 8l-4 4M16 8l4 4M20 8l-4 4M4 16l4-2M8 16l-4-2M16 14l4 4M20 14l-4 4" />
+          </svg>
+          <span class="action-label">智能吸筹</span>
+        </button>
+      </div>
+      <div v-if="!isOnline" class="offline-tip">主节点离线，无法触发</div>
 
-        <div class="card card-pad">
-          <div class="label">操作节点</div>
-          <div class="row" style="gap: 8px; margin-top: 8px">
-            <span :class="['pill', isOnline ? 'pill-live' : 'pill-offline']">
-              <span :class="['dot', isOnline ? 'online' : 'offline']"></span>
+      <!-- 顶部状态条 -->
+      <div class="status-bar card card-pad">
+        <div class="status-row">
+          <div class="status-left">
+            <span class="status-pill" :class="isOnline ? 'on' : 'off'">
+              <span class="dot" :class="isOnline ? 'online' : 'offline'"></span>
               {{ isOnline ? '在线' : '离线' }}
             </span>
+            <span class="status-node">{{ primaryNode.name }}</span>
           </div>
-          <div v-if="account && currentMid > 0" class="muted small" style="margin-top: 6px">
-            {{ form.symbol }} 现价：{{ currentMid.toFixed(5) }}
+          <div class="status-right">
+            <span class="status-muted">MT5 {{ primaryNode.mt5_login ?? '—' }}</span>
           </div>
         </div>
-
-        <div class="card card-pad">
-          <div class="label">持仓</div>
-          <div class="big" style="margin-top: 8px">{{ positionsCount }}</div>
+        <div class="status-summary">
+          <div class="ss-item">
+            <span class="ss-k">当前持仓</span>
+            <span class="ss-v">{{ totalPosCount }} 笔</span>
+          </div>
+          <div class="ss-sep" aria-hidden="true"></div>
+          <div class="ss-item">
+            <span class="ss-k">合计手数</span>
+            <span class="ss-v">{{ totalPosVolume.toFixed(2) }}</span>
+          </div>
+          <div class="ss-sep" aria-hidden="true"></div>
+          <div class="ss-item">
+            <span class="ss-k">浮动盈亏</span>
+            <span
+              class="ss-v"
+              :class="totalPosPnl >= 0 ? 'pos' : 'neg'"
+            >{{ totalPosPnl >= 0 ? '+' : '' }}{{ totalPosPnl.toFixed(2) }}</span>
+          </div>
         </div>
       </div>
 
-      <!-- 参数表单 -->
-      <div class="card card-pad form-card">
-        <div class="label">开仓参数</div>
-        <div class="form-grid">
-          <label>
-            <span>开仓品种</span>
-            <input v-model="form.symbol" placeholder="如 XAUUSD" />
-          </label>
-          <label>
-            <span>开仓手数</span>
-            <input v-model.number="form.volume" type="number" step="0.01" min="0.01" />
-          </label>
-          <label v-if="strategyType === 'trend_limit'">
-            <span>入场价（必填）</span>
-            <input v-model.number="form.entry_price" type="number" step="0.0001" />
-          </label>
-          <label v-if="strategyType !== 'grid'">
-            <span>止损价</span>
-            <input v-model.number="form.sl" type="number" step="0.0001" min="0" />
-          </label>
-          <label v-if="strategyType !== 'grid'">
-            <span>止盈价</span>
-            <input v-model.number="form.tp" type="number" step="0.0001" min="0" />
-          </label>
-          <label v-if="strategyType === 'grid'">
-            <span>网格方向</span>
-            <select v-model="form.direction">
-              <option value="long">多头（默认）</option>
-              <option value="short">空头</option>
-            </select>
-          </label>
-          <label class="span-2">
-            <span>备注</span>
-            <input v-model="form.remark" maxlength="64" />
-          </label>
+
+      <!-- 持仓 / 资产详情（Tab 切换） -->
+      <div class="detail-panel card card-pad">
+        <!-- Tab 切换 -->
+        <div class="detail-tabs" role="tablist">
+          <button
+            class="detail-tab"
+            :class="{ active: detailTab === 'positions' }"
+            role="tab"
+            :aria-selected="detailTab === 'positions'"
+            @click="detailTab = 'positions'"
+          >
+            <svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="3" y="3" width="14" height="14" rx="2" />
+              <path d="M3 9h14M7 3v14" />
+            </svg>
+            当前持仓
+            <span v-if="totalPosCount > 0" class="tab-badge">{{ totalPosCount }}</span>
+          </button>
+          <button
+            class="detail-tab"
+            :class="{ active: detailTab === 'assets' }"
+            role="tab"
+            :aria-selected="detailTab === 'assets'"
+            @click="detailTab = 'assets'"
+          >
+            <svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="10" cy="10" r="7" />
+              <path d="M10 7v3l2 1" />
+            </svg>
+            资产
+          </button>
+          <button
+            class="detail-tab"
+            :class="{ active: detailTab === 'history' }"
+            role="tab"
+            :aria-selected="detailTab === 'history'"
+            @click="detailTab = 'history'"
+          >
+            <svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="10" cy="10" r="7" />
+              <path d="M10 5v5l3 2" />
+              <path d="M3.5 6.5L10 3l6.5 3.5" />
+            </svg>
+            历史订单
+            <span v-if="historyTotal > 0" class="tab-badge tab-badge-muted">{{ historyTotal }}</span>
+          </button>
+          <button
+            class="detail-tab"
+            :class="{ active: detailTab === 'grid' }"
+            role="tab"
+            :aria-selected="detailTab === 'grid'"
+            @click="detailTab = 'grid'"
+          >
+            <svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3 6h14M3 10h14M3 14h14" />
+              <path d="M6 4v12M10 4v12M14 4v12" />
+            </svg>
+            吸筹策略
+            <span v-if="gridTasks.length > 0" class="tab-badge tab-badge-muted">{{ gridTasks.length }}</span>
+          </button>
         </div>
 
-        <div class="row" style="margin-top: 16px; justify-content: flex-end">
-          <button class="btn-primary" :disabled="!canSubmit" @click="openDialog">触发信号</button>
+        <!-- Tab 内容 -->
+        <div class="detail-body">
+
+          <!-- 当前持仓 -->
+          <div v-if="detailTab === 'positions'" role="tabpanel">
+            <div v-if="allPositions.length === 0" class="detail-empty">
+              <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M3 3h18M3 9h18M3 15h12M3 21h6" />
+              </svg>
+              <div>暂无持仓</div>
+            </div>
+            <template v-else>
+              <!-- 桌面端：表格 -->
+              <div class="pos-table-wrap">
+                <table class="pos-table">
+                  <thead>
+                    <tr>
+                      <th class="num">#</th>
+                      <th>品种</th>
+                      <th>方向</th>
+                      <th class="num">手数</th>
+                      <th class="num">开仓价</th>
+                      <th class="num">现价</th>
+                      <th class="num">止损</th>
+                      <th class="num">止盈</th>
+                      <th class="num">开仓时间</th>
+                      <th class="num pnl">浮盈</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="p in sortedPositions" :key="p.ticket">
+                      <td class="num mono muted">{{ p.ticket }}</td>
+                      <td>
+                        <div class="sym-cell">
+                          <span class="mono strong">{{ p.symbol }}</span>
+                          <button
+                            class="pos-close-btn"
+                            :class="{ busy: isClosing(p.ticket) }"
+                            :disabled="isClosing(p.ticket)"
+                            :title="`平仓 #${p.ticket}`"
+                            @click="closePosition(p)"
+                          >
+                            <svg v-if="!isClosing(p.ticket)" viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                              <path d="M4 4l8 8M12 4l-8 8" />
+                            </svg>
+                            <span v-else class="dot-spin" aria-hidden="true"></span>
+                            <span>平仓</span>
+                          </button>
+                        </div>
+                      </td>
+                      <td>
+                        <span
+                          class="dir-tag"
+                          :class="(p.type || '').toLowerCase() === 'buy' ? 'buy' : 'sell'"
+                        >{{ fmtPosType(p.type) }}</span>
+                      </td>
+                      <td class="num mono">{{ (p.volume || 0).toFixed(2) }}</td>
+                      <td class="num mono">{{ fmtPrice(p.price_open, p.symbol) }}</td>
+                      <td class="num mono">{{ fmtPrice(p.price_current, p.symbol) }}</td>
+                      <td class="num mono muted">{{ p.sl ? fmtPrice(p.sl, p.symbol) : '—' }}</td>
+                      <td class="num mono muted">{{ p.tp ? fmtPrice(p.tp, p.symbol) : '—' }}</td>
+                      <td class="num mono muted">{{ fmtPosTime(p.time) }}</td>
+                      <td class="num mono pnl" :class="(p.profit || 0) >= 0 ? 'pos' : 'neg'">
+                        {{ (p.profit || 0) >= 0 ? '+' : '' }}{{ (p.profit || 0).toFixed(2) }}
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              <!-- 手机端：卡片列表 -->
+              <div class="pos-cards">
+                <div v-for="p in sortedPositions" :key="p.ticket" class="pos-card">
+                  <div class="pos-card-row1">
+                    <div class="pos-card-left">
+                      <span class="mono strong">{{ p.symbol }}</span>
+                      <span class="dir-tag" :class="(p.type || '').toLowerCase() === 'buy' ? 'buy' : 'sell'">{{ fmtPosType(p.type) }}</span>
+                    </div>
+                    <div class="pos-card-right">
+                      <button
+                        class="pos-close-btn"
+                        :class="{ busy: isClosing(p.ticket) }"
+                        :disabled="isClosing(p.ticket)"
+                        @click="closePosition(p)"
+                      >
+                        <svg v-if="!isClosing(p.ticket)" viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                          <path d="M4 4l8 8M12 4l-8 8" />
+                        </svg>
+                        <span v-else class="dot-spin" aria-hidden="true"></span>
+                        <span>平仓</span>
+                      </button>
+                      <div class="pos-card-pnl" :class="(p.profit || 0) >= 0 ? 'pos' : 'neg'">
+                        {{ (p.profit || 0) >= 0 ? '+' : '' }}{{ (p.profit || 0).toFixed(2) }}
+                      </div>
+                    </div>
+                  </div>
+                  <div class="pos-card-row2">
+                    <span class="kv"><span class="k">#</span><span class="v mono muted">{{ p.ticket }}</span></span>
+                    <span class="kv"><span class="k">手数</span><span class="v mono">{{ (p.volume || 0).toFixed(2) }}</span></span>
+                    <span class="kv"><span class="k">开仓</span><span class="v mono">{{ fmtPrice(p.price_open, p.symbol) }}</span></span>
+                    <span class="kv"><span class="k">现价</span><span class="v mono">{{ fmtPrice(p.price_current, p.symbol) }}</span></span>
+                    <span class="kv"><span class="k">止损</span><span class="v mono muted">{{ p.sl ? fmtPrice(p.sl, p.symbol) : '—' }}</span></span>
+                    <span class="kv"><span class="k">止盈</span><span class="v mono muted">{{ p.tp ? fmtPrice(p.tp, p.symbol) : '—' }}</span></span>
+                  </div>
+                  <div class="pos-card-row3 muted">{{ fmtPosTime(p.time) }}</div>
+                </div>
+              </div>
+            </template>
+          </div>
+
+          <!-- 资产 -->
+          <div v-if="detailTab === 'assets'" role="tabpanel">
+            <div class="asset-grid">
+              <div class="asset-item asset-highlight">
+                <div class="asset-label">净值（Equity）</div>
+                <div class="asset-value mono" :class="accountEquity >= 0 ? 'pos' : 'neg'">
+                  {{ accountEquity >= 0 ? '+' : '' }}{{ accountEquity.toFixed(2) }}
+                </div>
+              </div>
+              <div class="asset-item asset-highlight">
+                <div class="asset-label">浮动盈亏</div>
+                <div class="asset-value mono" :class="accountProfit >= 0 ? 'pos' : 'neg'">
+                  {{ accountProfit >= 0 ? '+' : '' }}{{ accountProfit.toFixed(2) }}
+                </div>
+              </div>
+              <div class="asset-item">
+                <div class="asset-label">余额（Balance）</div>
+                <div class="asset-value mono">{{ accountBalance.toFixed(2) }}</div>
+              </div>
+              <div class="asset-item">
+                <div class="asset-label">已用保证金（Margin）</div>
+                <div class="asset-value mono muted">{{ accountMargin.toFixed(2) }}</div>
+              </div>
+              <div class="asset-item">
+                <div class="asset-label">可用保证金（Free）</div>
+                <div class="asset-value mono">{{ accountFreeMargin.toFixed(2) }}</div>
+              </div>
+              <div class="asset-item">
+                <div class="asset-label">杠杆</div>
+                <div class="asset-value mono">1:{{ accountLeverage }}</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 历史订单 -->
+          <div v-if="detailTab === 'history'" role="tabpanel">
+            <div v-if="historyLoading && historyItems.length === 0" class="detail-empty">
+              <div class="dot-spin-lg" aria-hidden="true"></div>
+              <div>加载中…</div>
+            </div>
+            <div v-else-if="!historyLoading && historyItems.length === 0" class="detail-empty">
+              <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="12" cy="12" r="9" />
+                <path d="M12 7v5l3 2" />
+              </svg>
+              <div>暂无历史订单</div>
+            </div>
+            <template v-else>
+              <!-- 桌面端：表格 -->
+              <div class="pos-table-wrap">
+                <table class="pos-table hist-table">
+                  <thead>
+                    <tr>
+                      <th>时间</th>
+                      <th>品种</th>
+                      <th>方向</th>
+                      <th class="num">手数</th>
+                      <th class="num">成交价</th>
+                      <th class="num">订单号</th>
+                      <th>状态</th>
+                      <th>错误</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="it in historyItems" :key="it.id">
+                      <td class="mono muted">{{ fmtHistoryTime(it.dispatched_at || it.received_at) }}</td>
+                      <td class="mono strong">{{ it.symbol || '—' }}</td>
+                      <td>
+                        <span
+                          v-if="it.action"
+                          class="dir-tag"
+                          :class="(it.action || '').toLowerCase() === 'buy' ? 'buy' : ((it.action || '').toLowerCase() === 'sell' ? 'sell' : '')"
+                        >{{ fmtPosType(it.action) }}</span>
+                        <span v-else class="muted">—</span>
+                      </td>
+                      <td class="num mono">{{ it.decided_vol != null ? it.decided_vol.toFixed(2) : '—' }}</td>
+                      <td class="num mono">{{ it.price != null ? fmtPrice(it.price, it.symbol || '') : '—' }}</td>
+                      <td class="num mono muted">{{ it.order || it.deal || '—' }}</td>
+                      <td>
+                        <span class="hist-status" :class="historyStatusClass(it.status)">{{ it.status || '—' }}</span>
+                      </td>
+                      <td class="muted hist-err" :title="it.error || ''">{{ it.error || '—' }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              <!-- 手机端：卡片列表 -->
+              <div class="pos-cards">
+                <div v-for="it in historyItems" :key="it.id" class="pos-card">
+                  <div class="pos-card-row1">
+                    <div class="pos-card-left">
+                      <span class="mono strong">{{ it.symbol || '—' }}</span>
+                      <span
+                        v-if="it.action"
+                        class="dir-tag"
+                        :class="(it.action || '').toLowerCase() === 'buy' ? 'buy' : ((it.action || '').toLowerCase() === 'sell' ? 'sell' : '')"
+                      >{{ fmtPosType(it.action) }}</span>
+                      <span class="hist-status" :class="historyStatusClass(it.status)">{{ it.status || '—' }}</span>
+                    </div>
+                    <div class="pos-card-pnl mono">
+                      {{ it.decided_vol != null ? it.decided_vol.toFixed(2) + ' 手' : '—' }}
+                    </div>
+                  </div>
+                  <div class="pos-card-row2">
+                    <span class="kv"><span class="k">时间</span><span class="v mono">{{ fmtHistoryTime(it.dispatched_at || it.received_at) }}</span></span>
+                    <span class="kv"><span class="k">成交价</span><span class="v mono">{{ it.price != null ? fmtPrice(it.price, it.symbol || '') : '—' }}</span></span>
+                    <span class="kv"><span class="k">订单号</span><span class="v mono muted">{{ it.order || it.deal || '—' }}</span></span>
+                    <span class="kv"><span class="k">retcode</span><span class="v mono muted">{{ it.retcode ?? '—' }}</span></span>
+                    <span class="kv hist-err-kv" v-if="it.error"><span class="k">错误</span><span class="v mono err-text">{{ it.error }}</span></span>
+                  </div>
+                </div>
+              </div>
+              <!-- 翻页器 -->
+              <div class="hist-pager" v-if="historyTotal > HISTORY_PAGE_SIZE">
+                <button class="pager-btn" :disabled="historyPage <= 1" @click="goHistoryPage(1)">«</button>
+                <button class="pager-btn" :disabled="historyPage <= 1" @click="goHistoryPage(historyPage - 1)">‹</button>
+                <span class="pager-info">{{ historyPage }} / {{ historyTotalPages }}</span>
+                <button class="pager-btn" :disabled="historyPage >= historyTotalPages" @click="goHistoryPage(historyPage + 1)">›</button>
+                <button class="pager-btn" :disabled="historyPage >= historyTotalPages" @click="goHistoryPage(historyTotalPages)">»</button>
+                <span class="pager-total muted">共 {{ historyTotal }} 条</span>
+              </div>
+            </template>
+          </div>
+
+          <!-- 吸筹策略（运行中网格任务 · 一行一任务） -->
+          <div v-if="detailTab === 'grid'" role="tabpanel">
+            <div v-if="gridLoading && gridTasks.length === 0" class="detail-empty">
+              <div class="dot-spin-lg" aria-hidden="true"></div>
+              <div>加载中…</div>
+            </div>
+            <div v-else-if="!gridLoading && gridTasks.length === 0" class="detail-empty">
+              <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M3 6h18M3 12h18M3 18h18" />
+                <path d="M6 4v16M12 4v16M18 4v16" />
+              </svg>
+              <div>暂无运行中的网格策略</div>
+            </div>
+            <template v-else>
+              <div v-if="gridRefreshing" class="grid-refresh-hint muted">刷新中…</div>
+              <!-- 桌面端：表格（一行一任务） -->
+              <div class="pos-table-wrap">
+                <table class="pos-table grid-task-table">
+                  <thead>
+                    <tr>
+                      <th>品种</th>
+                      <th>方向</th>
+                      <th>节点</th>
+                      <th class="num">持仓</th>
+                      <th class="num">挂单</th>
+                      <th class="num">盈亏</th>
+                      <th class="num">启动</th>
+                      <th>信号 ID</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="t in gridTasks" :key="t.task_id">
+                      <td class="mono strong">{{ t.symbol || '—' }}</td>
+                      <td>
+                        <span class="dir-tag" :class="gridDirTagClass(t.action)">
+                          {{ fmtPosType(t.action) }}
+                        </span>
+                      </td>
+                      <td class="muted" :title="gridTaskNodeNames(t)">{{ gridTaskNodeNames(t) }}</td>
+                      <td class="num mono">{{ gridTaskPositionCount(t) }}</td>
+                      <td class="num mono muted">{{ gridTaskPendingCount(t) || '—' }}</td>
+                      <td
+                        class="num mono"
+                        :class="gridTaskProfit(t) >= 0 ? 'pos' : 'neg'"
+                      >
+                        {{ gridTaskProfit(t) >= 0 ? '+' : '' }}{{ gridTaskProfit(t).toFixed(2) }}
+                      </td>
+                      <td class="num mono muted">{{ fmtHistoryTime(t.opened_at || t.created_at) }}</td>
+                      <td class="mono muted grid-signal-cell" :title="t.signal_id">{{ t.signal_id }}</td>
+                      <td>
+                        <button
+                          class="pos-close-btn"
+                          :class="{ busy: isClosingGridTask(t.task_id) }"
+                          :disabled="isClosingGridTask(t.task_id) || !isGridTaskStoppable(t)"
+                          :title="isGridTaskStoppable(t) ? `停止 ${t.symbol} 网格任务` : '该任务已结束'"
+                          @click="stopGridTask(t)"
+                        >
+                          <svg v-if="!isClosingGridTask(t.task_id)" viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <rect x="4" y="4" width="8" height="8" rx="1" />
+                          </svg>
+                          <span v-else class="dot-spin" aria-hidden="true"></span>
+                          <span>{{ isClosingGridTask(t.task_id) ? '下发中…' : '停止' }}</span>
+                        </button>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              <!-- 手机端：卡片（一卡一任务） -->
+              <div class="pos-cards">
+                <div v-for="t in gridTasks" :key="`m-${t.task_id}`" class="pos-card">
+                  <div class="pos-card-row1">
+                    <div class="pos-card-left">
+                      <span class="mono strong">{{ t.symbol || '—' }}</span>
+                      <span class="dir-tag" :class="gridDirTagClass(t.action)">
+                        {{ fmtPosType(t.action) }}
+                      </span>
+                      <span class="tag" style="font-size: 10px">网格</span>
+                    </div>
+                    <div class="pos-card-right">
+                      <button
+                        class="pos-close-btn"
+                        :class="{ busy: isClosingGridTask(t.task_id) }"
+                        :disabled="isClosingGridTask(t.task_id) || !isGridTaskStoppable(t)"
+                        @click="stopGridTask(t)"
+                      >
+                        <svg v-if="!isClosingGridTask(t.task_id)" viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                          <rect x="4" y="4" width="8" height="8" rx="1" />
+                        </svg>
+                        <span v-else class="dot-spin" aria-hidden="true"></span>
+                        <span>{{ isClosingGridTask(t.task_id) ? '下发中…' : '停止' }}</span>
+                      </button>
+                    </div>
+                  </div>
+                  <div class="pos-card-row2">
+                    <span class="kv"><span class="k">节点</span><span class="v" :title="gridTaskNodeNames(t)">{{ gridTaskNodeNames(t) }}</span></span>
+                    <span class="kv"><span class="k">持仓</span><span class="v mono">{{ gridTaskPositionCount(t) }}</span></span>
+                    <span class="kv"><span class="k">挂单</span><span class="v mono muted">{{ gridTaskPendingCount(t) || '—' }}</span></span>
+                    <span class="kv"><span class="k">启动</span><span class="v mono muted">{{ fmtHistoryTime(t.opened_at || t.created_at) }}</span></span>
+                    <span class="kv"><span class="k">盈亏</span><span class="v mono" :class="gridTaskProfit(t) >= 0 ? 'pos' : 'neg'">
+                      {{ gridTaskProfit(t) >= 0 ? '+' : '' }}{{ gridTaskProfit(t).toFixed(2) }}
+                    </span></span>
+                    <span class="kv" style="grid-column: 1 / -1"><span class="k">信号</span><span class="v mono muted" style="font-size: 11px">{{ t.signal_id }}</span></span>
+                  </div>
+                </div>
+              </div>
+            </template>
+          </div>
+
         </div>
-        <div v-if="!isOnline" class="hint warn">主节点离线，无法触发</div>
       </div>
+
+
+
     </template>
 
-    <!-- 触发弹窗 -->
-    <el-dialog
+    <!-- 触发弹窗：开仓参数（新 UI） -->
+    <OrderDialog
+      ref="orderDialogRef"
       v-model="dialogVisible"
-      :title="`触发信号 - ${STRATEGY_LABEL[strategyType]}`"
-      width="520px"
-    >
-      <div class="dialog-form">
-        <div class="kv"><span class="k">分组</span><span class="v">{{ dialogGroupName }}</span></div>
-        <div class="kv"><span class="k">策略</span><span class="v">{{ STRATEGY_LABEL[strategyType] }}（自动复用/创建）</span></div>
-        <div class="kv"><span class="k">绑定品种</span><span class="v">{{ form.symbol }}</span></div>
-        <div class="kv" v-if="strategyType !== 'grid'"><span class="k">止损价</span><span class="v">{{ form.sl || '—' }}</span></div>
-        <div class="kv" v-if="strategyType !== 'grid'"><span class="k">止盈价</span><span class="v">{{ form.tp || '—' }}</span></div>
-        <div class="kv" v-if="strategyType === 'trend_limit'"><span class="k">入场价</span><span class="v">{{ form.entry_price }}</span></div>
-        <div class="kv" v-if="strategyType === 'grid'"><span class="k">方向</span><span class="v">{{ form.direction === 'long' ? '多头' : '空头' }}</span></div>
-        <div class="kv" v-if="form.remark"><span class="k">备注</span><span class="v">{{ form.remark }}</span></div>
-
-        <div class="hint">提示：首次触发会按 (策略类型-节点名-MT5 登录号) 自动创建「分组+策略」并把主节点加入；后续直接复用。</div>
-        <div v-if="lastError" class="hint error">{{ lastError }}</div>
-      </div>
-
-      <template #footer>
-        <button class="btn-ghost" @click="dialogVisible = false">取消</button>
-        <button class="btn-primary" :disabled="submitting" @click="submit">
-          {{ submitting ? '提交中...' : '确认触发' }}
-        </button>
-      </template>
-    </el-dialog>
+      v-model:strategy="strategyType"
+      :form="form"
+      :group-name="dialogGroupName"
+      :group-id="dialogGroupId"
+      :submitting="submitting"
+      :last-error="lastError"
+      :can-submit="canSubmit"
+      :current-mid="currentMid"
+      @update:form="(v) => Object.assign(form, v)"
+      @submit="submit"
+      @cancel="closeDialog"
+      @trigger-strategy="triggerStrategyFromDialog"
+    />
   </div>
 </template>
 
 <style scoped>
-.trading-page { display: flex; flex-direction: column; gap: 16px; }
-.strategy-tabs { display: flex; gap: 8px; }
-.strategy-tab {
-  flex: 1; padding: 14px;
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 8px; color: inherit; cursor: pointer; font-size: 14px;
+/* ── Page frame ── */
+.trading-page {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  /* 移动端风格：底部留出触达区 */
+  padding-bottom: 8px;
 }
-.strategy-tab.active { border-color: #4f8cff; background: rgba(79, 140, 255, 0.08); }
-.grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
-@media (max-width: 768px) { .grid-3 { grid-template-columns: 1fr; } }
-.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 16px; margin-top: 12px; }
-.form-grid label { display: flex; flex-direction: column; gap: 4px; }
-.form-grid label.span-2 { grid-column: span 2; }
-.form-grid input, .form-grid select {
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  color: inherit; padding: 8px 10px; border-radius: 6px;
-}
-.kv { display: grid; grid-template-columns: 100px 1fr; padding: 6px 0; }
-.kv .k { color: var(--muted, #888); }
-.dialog-form { display: flex; flex-direction: column; gap: 4px; }
-.hint { margin-top: 12px; font-size: 12px; color: var(--muted, #888); }
-.hint.warn { color: #f5a623; }
-.hint.error { color: #e74c3c; }
+
+/* ── Empty state ── */
 .empty-state { text-align: center; padding: 40px 20px; }
 .empty-title { font-size: 18px; font-weight: 600; margin-bottom: 8px; }
-.empty-desc { color: var(--muted, #888); margin-bottom: 16px; }
-.big { font-size: 28px; font-weight: 700; }
-.pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px; border-radius: 12px; font-size: 12px; }
-.pill-primary { background: rgba(79, 140, 255, 0.15); color: #4f8cff; }
+.empty-desc { color: var(--muted); margin-bottom: 16px; }
+
+/* ── Status bar ── */
+.status-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 16px;
+}
+.status-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.status-left, .status-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.status-summary {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 10px;
+  background: var(--glass);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm);
+  flex-wrap: wrap;
+}
+.ss-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.ss-k {
+  font-size: 11px;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+}
+.ss-v {
+  font-size: 13px;
+  font-weight: 700;
+  font-family: var(--mono);
+  color: var(--text);
+}
+.ss-v.pos { color: var(--green); }
+.ss-v.neg { color: var(--red); }
+.ss-sep {
+  width: 1px;
+  height: 18px;
+  background: var(--glass-border);
+  flex-shrink: 0;
+}
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  background: var(--glass);
+  border: 1px solid var(--glass-border);
+  color: var(--muted);
+}
+.status-pill.on { color: var(--green); border-color: rgba(16, 185, 129, 0.28); background: rgba(16, 185, 129, 0.08); }
+.status-pill.off { color: #9ca3af; }
+.status-node {
+  font-size: 14px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.status-muted { font-size: 12px; color: var(--muted); font-family: var(--mono); }
+.status-sep { color: rgba(255, 255, 255, 0.18); }
+
+/* ── Quote board (双柱) ── */
+.quote-board {
+  display: flex;
+  align-items: stretch;
+  padding: 0;
+  overflow: hidden;
+}
+.quote-col {
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 18px 16px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.quote-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.quote-sym {
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+.quote-pct {
+  font-size: 11px;
+  color: var(--muted);
+  font-family: var(--mono);
+}
+.quote-mid {
+  font-size: 32px;
+  font-weight: 700;
+  line-height: 1.1;
+  font-family: var(--mono);
+  letter-spacing: -0.01em;
+  color: var(--text);
+  margin: 2px 0 6px;
+}
+.quote-bidask {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  background: var(--glass);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm);
+}
+.ba-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  font-family: var(--mono);
+}
+.ba-k { color: var(--muted); }
+.ba-v { color: var(--text); font-weight: 600; }
+.ba-v.pos { color: var(--green); }
+.ba-v.neg { color: var(--red); }
+
+.quote-position {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  background: rgba(37, 99, 235, 0.06);
+  border: 1px solid rgba(37, 99, 235, 0.18);
+  border-radius: var(--radius-sm);
+}
+.qp-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  font-family: var(--mono);
+}
+.qp-k { color: var(--muted); }
+.qp-v { color: var(--text); font-weight: 600; }
+.qp-v.pos { color: var(--green); }
+.qp-v.neg { color: var(--red); }
+
+.quote-sym-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+.sym-chip {
+  padding: 4px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: 6px;
+  background: var(--glass);
+  color: var(--muted);
+  border: 1px solid var(--glass-border);
+  font-family: var(--mono);
+}
+.sym-chip:hover { color: var(--text); border-color: var(--glass-highlight); }
+.sym-chip.active {
+  background: linear-gradient(135deg, var(--primary) 0%, var(--primary-d) 100%);
+  color: #ffffff;
+  border-color: transparent;
+  box-shadow: 0 0 12px rgba(37, 99, 235, 0.32);
+}
+.sym-empty {
+  margin-top: 4px;
+  font-size: 12px;
+  padding: 6px 0 2px;
+}
+
+/* ── Action bar (3 个策略按钮) ── */
+.action-bar {
+  position: sticky;
+  bottom: 12px;
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  padding: 10px 12px;
+  margin-top: 8px;
+  background: var(--panel);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow), 0 0 24px rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(var(--blur)) saturate(1.4);
+  -webkit-backdrop-filter: blur(var(--blur)) saturate(1.4);
+}
+.action-btn {
+  flex: 1 1 0;
+  height: 64px;
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: #ffffff;
+  border: none;
+  cursor: pointer;
+  background: linear-gradient(135deg, var(--primary) 0%, var(--primary-d) 100%);
+  box-shadow: 0 6px 20px rgba(37, 99, 235, 0.28);
+  transition: transform 0.1s, box-shadow var(--transition), filter var(--transition);
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+.action-icon {
+  width: 22px;
+  height: 22px;
+  opacity: 0.85;
+  transition: transform var(--transition), opacity var(--transition);
+}
+.action-label {
+  line-height: 1.1;
+  font-size: 13px;
+}
+.action-btn:hover { filter: brightness(1.08); }
+.action-btn:hover .action-icon { opacity: 1; transform: translateY(-1px); }
+.action-btn:active { transform: translateY(1px); }
+.action-btn:disabled, .action-btn.action-btn-disabled { opacity: 0.45; cursor: not-allowed; box-shadow: none; }
+.action-btn:disabled .action-icon, .action-btn.action-btn-disabled .action-icon { opacity: 0.5; }
+.action-sep { width: 1px; background: var(--glass-border); flex-shrink: 0; }
+
+.offline-tip {
+  font-size: 12px;
+  color: #fbbf24;
+  text-align: center;
+  padding: 4px 0 0;
+}
+
+/* ── Dialog form 样式已迁出到 OrderDialog.vue ── */
+
+/* ── 持仓 / 资产详情（Tab 切换） ── */
+.detail-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+/* Tab 切换条 */
+.detail-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 10px 14px 0;
+  border-bottom: 1px solid var(--glass-border);
+  flex-shrink: 0;
+}
+.detail-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 8px 8px 0 0;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+  letter-spacing: 0.01em;
+  position: relative;
+  top: 1px;
+}
+.detail-tab:hover { color: var(--text); background: rgba(255,255,255,0.04); }
+.detail-tab.active {
+  color: var(--primary);
+  border-bottom-color: var(--primary);
+  background: rgba(37, 99, 235, 0.06);
+}
+.tab-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  font-size: 11px;
+  font-weight: 700;
+  background: var(--primary);
+  color: #ffffff;
+  border-radius: 999px;
+  line-height: 1;
+}
+.tab-badge-muted {
+  background: var(--glass);
+  color: var(--muted);
+  border: 1px solid var(--glass-border);
+}
+
+/* Tab 内容区 */
+.detail-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding-bottom: 2px;
+}
+
+/* 空态 */
+.detail-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 32px 20px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.detail-empty svg { opacity: 0.35; }
+
+.dot-spin-lg {
+  width: 22px;
+  height: 22px;
+  border: 2px solid var(--glass-border);
+  border-top-color: var(--primary);
+  border-radius: 50%;
+  animation: pos-spin 0.8s linear infinite;
+}
+
+/* ── 主节点持仓列表（桌面表格） ── */
+.pos-table-wrap { overflow-x: auto; }
+.pos-cards { display: none; }
+
+.pos-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 12px;
+  min-width: 720px;
+}
+.pos-table thead th {
+  text-align: left;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: 0.04em;
+  padding: 8px 10px;
+  background: var(--glass);
+  border-bottom: 1px solid var(--glass-border);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+.pos-table thead th.num { text-align: right; }
+.pos-table thead th.pnl { text-align: right; }
+.pos-table tbody td {
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--glass-border);
+  color: var(--text);
+  font-size: 12px;
+  vertical-align: middle;
+}
+.pos-table tbody tr:last-child td { border-bottom: none; }
+.pos-table tbody tr:hover { background: rgba(255, 255, 255, 0.02); }
+.pos-table td.num { text-align: right; }
+.pos-table td.pnl { text-align: right; font-weight: 700; }
+.pos-table td.mono { font-family: var(--mono); }
+.pos-table td.strong { font-weight: 700; }
+.pos-table td.muted { color: var(--muted); }
+.pos-table td.pnl.pos { color: var(--green); }
+.pos-table td.pnl.neg { color: var(--red); }
+
+/* 品种单元格：品种名 + 平仓按钮并排 */
+.sym-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+.pos-close-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #fca5a5;
+  background: rgba(239, 68, 68, 0.08);
+  border: 1px solid rgba(239, 68, 68, 0.28);
+  border-radius: 6px;
+  cursor: pointer;
+  line-height: 1;
+  transition: background 0.15s, color 0.15s, border-color 0.15s, transform 0.1s;
+}
+.pos-close-btn:hover {
+  background: rgba(239, 68, 68, 0.18);
+  color: #fecaca;
+  border-color: rgba(239, 68, 68, 0.5);
+}
+.pos-close-btn:active { transform: translateY(1px); }
+.pos-close-btn:disabled,
+.pos-close-btn.busy {
+  cursor: not-allowed;
+  opacity: 0.6;
+  background: rgba(239, 68, 68, 0.05);
+}
+.pos-close-btn.busy .dot-spin {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: pos-spin 0.8s linear infinite;
+}
+@keyframes pos-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* 方向 tag */
+.dir-tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  border: 1px solid transparent;
+}
+.dir-tag.buy { color: #fca5a5; background: rgba(239, 68, 68, 0.10); border-color: rgba(239, 68, 68, 0.28); }
+.dir-tag.sell { color: #6ee7b7; background: rgba(16, 185, 129, 0.10); border-color: rgba(16, 185, 129, 0.28); }
+
+/* ── 历史订单 ── */
+/* 状态色块（不区分成功颜色，保持语义化） */
+.hist-status {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  background: var(--glass);
+  color: var(--muted);
+  border: 1px solid var(--glass-border);
+  font-family: var(--mono);
+}
+.hist-status.ok {
+  color: #6ee7b7;
+  background: rgba(16, 185, 129, 0.10);
+  border-color: rgba(16, 185, 129, 0.28);
+}
+.hist-status.pending {
+  color: #fbbf24;
+  background: rgba(251, 191, 36, 0.08);
+  border-color: rgba(251, 191, 36, 0.28);
+}
+.hist-status.err {
+  color: #fca5a5;
+  background: rgba(239, 68, 68, 0.10);
+  border-color: rgba(239, 68, 68, 0.28);
+}
+
+/* 历史表比当前持仓表多一列错误，加宽一点 */
+.hist-table { min-width: 860px; }
+.hist-err {
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+}
+.hist-err-kv { grid-column: 1 / -1; }
+.err-text { color: var(--red); }
+
+/* 翻页器 */
+.hist-pager {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 12px;
+  font-size: 12px;
+  border-top: 1px solid var(--glass-border);
+  background: var(--glass);
+}
+.pager-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 28px;
+  height: 26px;
+  padding: 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid var(--glass-border);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+.pager-btn:hover:not(:disabled) {
+  background: rgba(37, 99, 235, 0.10);
+  border-color: rgba(37, 99, 235, 0.4);
+  color: var(--primary);
+}
+.pager-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+.pager-info {
+  font-family: var(--mono);
+  font-weight: 600;
+  color: var(--text);
+  padding: 0 4px;
+  min-width: 50px;
+  text-align: center;
+}
+.pager-total {
+  margin-left: auto;
+  font-size: 11px;
+  font-family: var(--mono);
+}
+
+/* 手机持仓卡片 */
+.pos-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 14px;
+  background: var(--glass);
+  border-bottom: 1px solid var(--glass-border);
+}
+.pos-card + .pos-card { margin-top: 0; }
+.pos-card-row1 {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.pos-card-left { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
+.pos-card-right { display: inline-flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.pos-card-pnl { font-size: 14px; font-weight: 700; font-family: var(--mono); }
+.pos-card-pnl.pos { color: var(--green); }
+.pos-card-pnl.neg { color: var(--red); }
+.pos-card-row2 {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 4px 8px;
+}
+.pos-card-row2 .kv { display: flex; justify-content: space-between; gap: 6px; min-width: 0; font-size: 12px; }
+.pos-card-row2 .k { color: var(--muted); }
+.pos-card-row2 .v { color: var(--text); font-weight: 600; }
+.pos-card-row2 .v.muted { color: var(--muted); }
+.pos-card-row3 { font-size: 11px; font-family: var(--mono); }
+
+/* ── 资产 ── */
+.asset-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1px;
+  background: var(--glass-border);
+}
+.asset-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 14px 16px;
+  background: var(--glass);
+}
+.asset-item.asset-highlight {
+  background: rgba(37, 99, 235, 0.04);
+}
+.asset-label {
+  font-size: 12px;
+  color: var(--muted);
+  font-weight: 500;
+}
+.asset-value {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: -0.01em;
+}
+.asset-value.pos { color: var(--green); }
+.asset-value.neg { color: var(--red); }
+.asset-value.muted { color: var(--muted); font-size: 15px; font-weight: 600; }
+
+.mono { font-family: var(--mono); }
+.strong { font-weight: 700; }
+
+/* ── Responsive ── */
+@media (max-width: 640px) {
+  .quote-mid { font-size: 26px; }
+  .quote-col { padding: 14px 10px 12px; }
+  .action-btn { height: 56px; }
+  .action-icon { width: 18px; height: 18px; }
+  .action-label { font-size: 12px; }
+  /* 手机端：隐藏表格，展示卡片 */
+  .pos-table-wrap { display: none; }
+  .pos-cards { display: block; }
+  /* 资产 3 列 → 2 列 */
+  .asset-grid { grid-template-columns: repeat(2, 1fr); }
+  /* 历史订单翻页器更紧凑 */
+  .hist-pager { flex-wrap: wrap; }
+  .pager-total { width: 100%; margin-left: 0; text-align: right; }
+}
+@media (max-width: 420px) {
+  .quote-mid { font-size: 24px; }
+  .action-bar { padding: 8px; gap: 6px; }
+  .action-btn { height: 52px; }
+  .pos-card-row2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  /* 资产单列 */
+  .asset-grid { grid-template-columns: 1fr; }
+}
+@media (max-width: 360px) {
+  /* 资产在更窄屏时高亮项放大字号 */
+  .asset-value { font-size: 20px; }
+}
+
+/* ── 吸筹策略 tab 表格 ── */
+.grid-task-table { min-width: 860px; }
+.grid-signal-cell {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+}
+.grid-refresh-hint {
+  font-size: 11px;
+  padding: 4px 14px 0;
+  text-align: right;
+}
 </style>
