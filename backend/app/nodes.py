@@ -245,7 +245,7 @@ async def set_primary_node(
     owned_node_or_404 普通用户不能动管理员名下的节点。
 
     v3 阻塞前置：被替换 / 被取消的旧主节点上仍有 in-flight 子任务时
-    （PRIMARY_BLOCKING_ENABLED=1 时启用）返回 409 + blocking_tasks 明细。
+    返回 409 + blocking_tasks 明细。
     路由不接受任何 force / 强制绕过参数 —— 唯一放行条件是"无 in-flight"。
     """
     await owned_node_or_404(store, p, node_id)

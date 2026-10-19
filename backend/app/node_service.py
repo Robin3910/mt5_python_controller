@@ -27,12 +27,6 @@ logger = logging.getLogger(__name__)
 PRIMARY_BLOCKING_DETAIL_LIMIT = 100
 
 
-def _primary_blocking_enabled() -> bool:
-    """灰度开关：从环境变量读取，0=关闭（按旧行为跑）/ 1=开启（走阻塞前置）。"""
-    import os
-    return os.environ.get("PRIMARY_BLOCKING_ENABLED", "0") == "1"
-
-
 class PrimarySwitchBlocked(Exception):
     """主节点切换被阻塞：旧主节点上仍有 in-flight 子任务。
 
@@ -465,27 +459,26 @@ async def set_primary(
     设置为 True 时会把同 owner 下其它节点的主节点标记全部清掉，保证唯一性。
     取消时只清本节点。权限与归属校验由路由层完成（先 owned_node_or_404）。
 
-    阶段 0（v3）：当 PRIMARY_BLOCKING_ENABLED=1 时，被替换 / 被取消的旧主节点上
-    若仍有非终态子任务（GroupTaskDispatch.status NOT IN SUBTASK_TERMINAL），
-    整个动作会被 PrimarySwitchBlocked 异常拦截。事务内、外各做一次校验：
-    事务外拦截绝大多数场景，事务内拦截"阶段 0 通过后到 _locked_node 之间"
-    极小窗口期新增的 in-flight。
+    阶段 0：被替换 / 被取消的旧主节点上若仍有非终态子任务
+    （GroupTaskDispatch.status NOT IN SUBTASK_TERMINAL），整个动作会被
+    PrimarySwitchBlocked 异常拦截。事务内、外各做一次校验：事务外拦截绝大多数
+    场景，事务内拦截"阶段 0 通过后到 _locked_node 之间"极小窗口期新增的 in-flight。
     """
-    blocking_on = _primary_blocking_enabled()
+    # ── 收集 victim ── 阶段 0 和阶段 2 共用；必须在阶段 0 之前抓取，
+    # 否则阶段 0 / 事务里把 victim 的 is_primary 清掉后，阶段 2 找不到 victim。
+    async with SessionLocal() as s_pre:
+        victims = await _collect_victim_node_ids(
+            s_pre, node_id=node_id, is_primary=is_primary,
+        )
 
     # ── 阶段 0（事务外预检）──
-    if blocking_on:
-        async with SessionLocal() as s_pre:
-            victims = await _collect_victim_node_ids(
-                s_pre, node_id=node_id, is_primary=is_primary,
-            )
-        for vid in victims:
-            # 不抛错就继续；任一 victim 命中阻塞则由异常上抛
-            await precheck_active_blocking(
-                store,
-                target_node_id=vid,
-                next_node_id=node_id if is_primary else None,
-            )
+    for vid in victims:
+        # 不抛错就继续；任一 victim 命中阻塞则由异常上抛
+        await precheck_active_blocking(
+            store,
+            target_node_id=vid,
+            next_node_id=node_id if is_primary else None,
+        )
 
     async with SessionLocal() as s:
         row = await _locked_node(s, node_id)
@@ -498,16 +491,12 @@ async def set_primary(
             return node_row_to_dict(row), []
 
         # ── 阶段 0（事务内重检）── 双重保险，挡住事务外阶段 0 之后的极小窗口
-        if blocking_on:
-            victims = await _collect_victim_node_ids(
-                s, node_id=node_id, is_primary=is_primary,
+        for vid in victims:
+            await precheck_active_blocking(
+                store,
+                target_node_id=vid,
+                next_node_id=node_id if is_primary else None,
             )
-            for vid in victims:
-                await precheck_active_blocking(
-                    store,
-                    target_node_id=vid,
-                    next_node_id=node_id if is_primary else None,
-                )
 
         if is_primary:
             await _clear_primary_for_owner(s, row.owner_user_id, exclude_node_id=node_id)
@@ -545,21 +534,17 @@ async def set_primary(
     for r in affected:
         await store.cache_node(node_row_to_dict(r))
 
-    # 阶段 2 前先确定 victim：从 owner 唯一性保证来看，最多一个 victim。
-    # 用一个独立 session 读，避免主事务已 commit 后的连接复用问题。
-    async with SessionLocal() as s_v:
-        victim_id_for_migration = await _collect_victim_for_migration(
-            s_v, node_id=node_id, is_primary=is_primary,
-        )
-
     # ── 阶段 2：迁移专属分组成员 ──
     # 仅在主节点标记真的翻转时才做迁移（同态 short-circuit 已 return，不会到这里）。
     # 取消主节点（is_primary=False）时只删旧成员、不补新成员。
     # 异常被隔离：失败只记日志，不影响主节点切换的返回值。
+    #
+    # victims 在阶段 0 之前就已收集；这里直接复用，避开"事务里清掉 victim 后
+    # 阶段 2 找不到 victim"的回归。
     try:
         migrated = await migrate_primary_groups(
             store,
-            old_primary_id=victim_id_for_migration,
+            old_primary_id=victims[0] if victims else None,
             new_primary_id=node_id if is_primary else None,
             owner_user_id=row.owner_user_id,
         )
@@ -567,7 +552,7 @@ async def set_primary(
             logger.info(
                 "primary migration: %d groups updated for owner=%s (%s -> %s)",
                 len(migrated), row.owner_user_id,
-                victim_id_for_migration, node_id if is_primary else None,
+                victims[0] if victims else None, node_id if is_primary else None,
             )
     except Exception as e:  # noqa: BLE001
         logger.warning("primary migration failed (isolated): %s", e)
@@ -630,7 +615,8 @@ async def migrate_primary_groups(
 
     返回：被改动的分组 ID 列表（用于响应头 / 审计）。
     """
-    if not old_primary_id or owner_user_id is None:
+    if not old_primary_id:
+        # 没 victim = 主节点没换人（首次设主 / 取消主）→ 没东西可迁移
         return []
 
     # 1) 拉所有 owner 维度下的分组（走 Redis 缓存）
