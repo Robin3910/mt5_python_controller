@@ -77,4 +77,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=str(_logo.resolve()) if _logo.is_file() else None,
+    uac_admin=True,
 )

@@ -19,6 +19,7 @@ from dashboard_auth_ui import DashboardAuthUI
 from auth_service import DashboardAuthError
 from session_ui import SessionDialog, secured, requires_session
 from store import load_instances, load_panel_config, save_instances
+from terminal_account import read_algo_trading_allowed
 from tray_icon import TrayController, apply_window_icon, tray_available
 from version import get_version
 from theme import (
@@ -50,6 +51,7 @@ from theme import (
     status_chip,
 )
 from viewmodels import (
+    ALGO_TRADING_OFF_LABEL,
     DetailVM,
     ListItemVM,
     build_detail,
@@ -76,6 +78,7 @@ class _ListRow:
     path: ctk.CTkLabel
     status: ctk.CTkLabel
     account: ctk.CTkLabel | None = None
+    algo_warning: ctk.CTkLabel | None = None
     snapshot: ListItemVM | None = None
 
 
@@ -550,6 +553,12 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
         )
         inner = ctk.CTkFrame(card, fg_color="transparent")
         inner.pack(fill="x", padx=12, pady=10)
+        algo_warning = ctk.CTkLabel(
+            inner, text=ALGO_TRADING_OFF_LABEL, text_color=DANGER, font=font(11, "bold"),
+            anchor="e", height=18,
+        )
+        if vm.algo_trading_disabled:
+            algo_warning.pack(fill="x", pady=(0, 2))
         top = ctk.CTkFrame(inner, fg_color="transparent")
         top.pack(fill="x", pady=(0, 2))
         title = ctk.CTkLabel(
@@ -608,7 +617,10 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
             height=26,
             font=font(12),
         ).pack(side="left")
-        return _ListRow(card=card, title=title, dot=dot, path=path, status=status, account=account, snapshot=vm)
+        return _ListRow(
+            card=card, title=title, dot=dot, path=path, status=status,
+            account=account, algo_warning=algo_warning, snapshot=vm,
+        )
 
     def _apply_list_row(self, row: _ListRow, vm: ListItemVM) -> None:
         if row.snapshot == vm:
@@ -632,6 +644,14 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
                 row.account.configure(
                     text=f"账号 {vm.mt5_login}" if vm.mt5_login else "账号 -"
                 )
+        if row.algo_warning is not None and (
+            row.snapshot is None or row.snapshot.algo_trading_disabled != vm.algo_trading_disabled
+        ):
+            if vm.algo_trading_disabled:
+                row.algo_warning.configure(text=ALGO_TRADING_OFF_LABEL)
+                row.algo_warning.pack(fill="x", pady=(0, 2), before=row.title.master)
+            else:
+                row.algo_warning.pack_forget()
         if row.snapshot is None or row.snapshot.selected != vm.selected:
             row.card.configure(
                 fg_color=ACCENT_SOFT if vm.selected else GLASS_SOFT,
@@ -818,7 +838,52 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
             self._bind_detail(refresh_log=True)
         except tk.TclError:
             return
+        self._probe_algo_trading()
         self.after(2000, self._tick_ui)
+
+    def _probe_algo_trading(self) -> None:
+        """直接读各实例目录里的 MT5 终端，不依赖节点客户端是否上报。"""
+        if getattr(self, "_algo_probe_running", False) or not self.session.active:
+            return
+        targets = [
+            (cfg.id, cfg.cwd or str(Path(cfg.exe_path).parent))
+            for cfg in self.manager.configs()
+        ]
+        if not targets:
+            return
+        self._algo_probe_running = True
+        generation = self.session.generation
+
+        def work() -> None:
+            results: list[tuple[str, bool]] = []
+            for instance_id, directory in targets:
+                try:
+                    allowed = read_algo_trading_allowed(directory)
+                except Exception:  # noqa: BLE001
+                    allowed = None
+                if isinstance(allowed, bool):
+                    results.append((instance_id, allowed))
+
+            def apply() -> None:
+                self._algo_probe_running = False
+                if generation != self.session.generation or not self.session.active:
+                    return
+                changed = False
+                for instance_id, allowed in results:
+                    mp = self.manager.get(instance_id)
+                    if mp is None or mp.runtime.algo_trading_allowed == allowed:
+                        continue
+                    mp.runtime.algo_trading_allowed = allowed
+                    changed = True
+                if changed:
+                    self._safe_refresh()
+
+            try:
+                self.after(0, apply)
+            except (tk.TclError, RuntimeError):
+                self._algo_probe_running = False
+
+        threading.Thread(target=work, name="algo-trading-probe", daemon=True).start()
 
     def _refresh_list(self) -> None:
         self._bind_list()

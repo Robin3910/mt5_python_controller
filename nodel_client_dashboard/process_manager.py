@@ -294,6 +294,9 @@ class ManagedProcess:
         self.runtime.ws_state = data.get("ws_state")
         self.runtime.node_id = data.get("node_id")
         self.runtime.mt5_login = data.get("mt5_login")
+        if "algo_trading_allowed" in data:
+            allowed = data.get("algo_trading_allowed")
+            self.runtime.algo_trading_allowed = allowed if isinstance(allowed, bool) else None
         self.runtime.uptime_s = data.get("uptime_s")
         ver = data.get("version")
         if ver:
@@ -921,6 +924,34 @@ class ProcessManager:
             if not results[-1].ok:
                 break
         return results
+
+    def stop_for_install(self, directory: str | Path) -> None:
+        """覆盖安装前停掉该目录里的客户端，含面板没接管、仍占着 exe 的进程。"""
+        from client_deploy import release_client_processes
+        from store import canonical_dir
+
+        target = canonical_dir(str(directory))
+        for mp in list(self._items.values()):
+            if canonical_dir(mp.cfg.exe_path or mp.cfg.cwd) != target:
+                continue
+            with mp._lock:
+                mp._want_running = False
+            was_running = bool(
+                mp.runtime.process_alive
+                or (mp._proc is not None and mp._proc.poll() is None)
+                or mp._status_reachable(timeout=0.3)
+            )
+            if not was_running:
+                continue
+            try:
+                if self.session is not None:
+                    self.session.perform("stop", mp.cfg, lambda mp=mp: mp.stop(graceful=True))
+                else:
+                    mp.stop(graceful=True)
+            except (RuntimeError, OSError):
+                with mp._lock:
+                    mp._want_running = False
+        release_client_processes(directory)
 
     def shutdown_all(self) -> None:
         for mp in list(self._items.values()):

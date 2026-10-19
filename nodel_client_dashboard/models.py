@@ -47,6 +47,8 @@ class InstanceConfig:
     legacy_allowed: bool = False
     has_credential: bool = False
     backend_base: str = ""
+    # 导入成功并连上终端后确认算法交易关闭。未知或已开启都不标红。
+    algo_trading_disabled: bool = False
 
     @classmethod
     def create(
@@ -100,6 +102,7 @@ class InstanceConfig:
             legacy_allowed=bool(data.get("legacy_allowed", False)),
             has_credential=bool(data.get("has_credential", False)),
             backend_base=str(data.get("backend_base") or ""),
+            algo_trading_disabled=bool(data.get("algo_trading_disabled", False)),
         )
 
 
@@ -117,3 +120,5 @@ class RuntimeState:
     uptime_s: float | None = None
     busy: str = ""  # "" | starting | stopping
     version: str = ""
+    # 运行中的客户端上报的算法交易按钮。None 表示这份状态里没有该字段。
+    algo_trading_allowed: bool | None = None

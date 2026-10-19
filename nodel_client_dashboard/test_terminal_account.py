@@ -4,7 +4,14 @@ from unittest.mock import MagicMock
 import pytest
 
 import terminal_account as ta
-from terminal_account import TerminalAccountError, enroll_import_login, read_terminal_account, resolve_import_login
+from terminal_account import (
+    TerminalAccountError,
+    algo_trading_allowed,
+    enroll_import_login,
+    read_algo_trading_allowed,
+    read_terminal_account,
+    resolve_import_login,
+)
 
 
 def test_typed_login_wins_and_does_not_read_terminal():
@@ -48,6 +55,48 @@ def test_invalid_login_does_not_enroll():
     with pytest.raises(TerminalAccountError, match="正整数"):
         enroll_import_login("abc", MagicMock(), enroll)
     enroll.assert_not_called()
+
+
+def test_algo_trading_allowed_reads_terminal_switch():
+    assert algo_trading_allowed(None) is None
+    assert algo_trading_allowed(object()) is None
+    assert algo_trading_allowed(type("Info", (), {"trade_allowed": False})()) is False
+    assert algo_trading_allowed(type("Info", (), {"trade_allowed": True})()) is True
+    assert algo_trading_allowed(type("Info", (), {"trade_allowed": 0})()) is False
+
+
+def test_read_algo_trading_allowed_when_terminal_button_is_off(tmp_path, monkeypatch):
+    (tmp_path / "terminal64.exe").write_bytes(b"MZ")
+
+    class FakeMT5:
+        def initialize(self, path):
+            return True
+
+        def terminal_info(self):
+            return type("Info", (), {"trade_allowed": False})()
+
+        def shutdown(self):
+            self.closed = True
+
+    fake = FakeMT5()
+    monkeypatch.setattr(ta, "_load_mt5", lambda: fake)
+    assert read_algo_trading_allowed(tmp_path) is False
+    assert fake.closed is True
+
+
+def test_read_algo_trading_allowed_is_unknown_when_terminal_cannot_connect(tmp_path, monkeypatch):
+    (tmp_path / "terminal64.exe").write_bytes(b"MZ")
+
+    class FakeMT5:
+        def initialize(self, path):
+            return False
+
+        def shutdown(self):
+            raise AssertionError("未连上不应关闭")
+
+    monkeypatch.setattr(ta, "_load_mt5", lambda: FakeMT5())
+    assert read_algo_trading_allowed(tmp_path) is None
+    assert read_algo_trading_allowed(tmp_path / "missing") is None
 
 
 def test_read_terminal_account_requires_terminal_exe(tmp_path):

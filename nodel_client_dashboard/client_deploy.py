@@ -7,9 +7,11 @@
 """
 from __future__ import annotations
 
+import os
 import re
 import json
 import shutil
+import subprocess
 import tempfile
 import time
 import zipfile
@@ -122,6 +124,223 @@ def extract_package(zip_path: str | Path, dest_dir: str | Path) -> tuple[bool, s
     except OSError as e:
         return False, str(e)
     return True, "ok"
+
+
+def image_is_node_client(image: str, directory: str | Path) -> bool:
+    """镜像是否为安装目录里的 node_client.exe。不匹配同目录的 terminal64.exe。"""
+    if not image or os.path.basename(image).lower() != "node_client.exe":
+        return False
+    root = os.path.normcase(os.path.abspath(directory))
+    img = os.path.normcase(os.path.abspath(image))
+    if img == os.path.normcase(os.path.join(root, "node_client.exe")):
+        return True
+    from store import canonical_dir
+
+    return canonical_dir(image) == canonical_dir(str(directory))
+
+
+def select_node_client_pids(images: Iterable[tuple[int, str]], directory: str | Path) -> list[int]:
+    me = os.getpid()
+    found: list[int] = []
+    for pid, image in images:
+        if pid <= 0 or pid == me or pid in found:
+            continue
+        if image_is_node_client(image, directory):
+            found.append(pid)
+    return found
+
+
+def file_is_busy(path: str | Path) -> bool:
+    """目标能否被独占写入。只有共享冲突（WinError 32）算占用，权限不足不算。"""
+    target = Path(path)
+    if os.name != "nt" or not target.is_file():
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    handle = kernel32.CreateFileW(str(target), 0x40000000, 0, None, 3, 0, None)
+    if handle != wintypes.HANDLE(-1).value:
+        kernel32.CloseHandle(handle)
+        return False
+    return ctypes.get_last_error() == 32
+
+
+def list_process_images() -> list[tuple[int, str]]:
+    """本机进程 (pid, 可执行文件完整路径)。查询失败的进程跳过。"""
+    if os.name != "nt":
+        return []
+    try:
+        return _list_process_images_win()
+    except OSError:
+        return []
+
+
+def _list_process_images_win() -> list[tuple[int, str]]:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    TH32CS_SNAPPROCESS = 0x00000002
+    INVALID = wintypes.HANDLE(-1).value
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snap == INVALID:
+        raise OSError("无法枚举进程")
+    images: list[tuple[int, str]] = []
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        ok = kernel32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            pid = int(entry.th32ProcessID)
+            image = _process_image(kernel32, pid)
+            if image:
+                images.append((pid, image))
+            ok = kernel32.Process32NextW(snap, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snap)
+    return images
+
+
+def _process_image(kernel32, pid: int) -> str:
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if handle == wintypes.HANDLE(-1).value or not handle:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(32768)
+        size = wintypes.DWORD(len(buf))
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return ""
+        return buf.value
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def kill_pid_tree(pid: int) -> None:
+    if pid <= 0 or pid == os.getpid():
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,  # type: ignore[attr-defined]
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return
+    try:
+        os.kill(pid, 15)
+    except OSError:
+        pass
+
+
+def _rm_force_shutdown(files: list[Path]) -> None:
+    """让重启管理器关掉占用这些文件的程序。只接受节点客户端文件。"""
+    if os.name != "nt":
+        return
+    paths = [str(p) for p in files if p.name.lower() == "node_client.exe" and p.is_file()]
+    if not paths:
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    rstrtmgr = ctypes.WinDLL("Rstrtmgr", use_last_error=True)
+    rstrtmgr.RmStartSession.argtypes = [ctypes.POINTER(wintypes.DWORD), wintypes.DWORD, ctypes.c_wchar_p]
+    rstrtmgr.RmStartSession.restype = wintypes.DWORD
+    rstrtmgr.RmRegisterResources.argtypes = [
+        wintypes.DWORD, wintypes.UINT, ctypes.POINTER(ctypes.c_wchar_p),
+        wintypes.UINT, ctypes.c_void_p, wintypes.UINT, ctypes.c_void_p,
+    ]
+    rstrtmgr.RmRegisterResources.restype = wintypes.DWORD
+    rstrtmgr.RmShutdown.argtypes = [wintypes.DWORD, wintypes.ULONG, ctypes.c_void_p]
+    rstrtmgr.RmShutdown.restype = wintypes.DWORD
+    rstrtmgr.RmEndSession.argtypes = [wintypes.DWORD]
+    rstrtmgr.RmEndSession.restype = wintypes.DWORD
+
+    handle = wintypes.DWORD()
+    key = ctypes.create_unicode_buffer(32)
+    if rstrtmgr.RmStartSession(ctypes.byref(handle), 0, key) != 0:
+        return
+    try:
+        array = (ctypes.c_wchar_p * len(paths))(*paths)
+        if rstrtmgr.RmRegisterResources(handle, len(paths), array, 0, None, 0, None) != 0:
+            return
+        rstrtmgr.RmShutdown(handle, 0x1, None)
+    finally:
+        rstrtmgr.RmEndSession(handle)
+
+
+def release_client_processes(
+    directory: str | Path,
+    *,
+    images: list[tuple[int, str]] | None = None,
+    kill=kill_pid_tree,
+    busy=file_is_busy,
+    shutdown=None,
+    timeout: float = 5,
+) -> None:
+    """结束该目录中的 node_client.exe，并等到 exe 不再被占用。
+
+    找不到进程或结束后文件仍被占用时抛出 RuntimeError，调用方不得开始覆盖。
+    """
+    directory = Path(directory)
+    exe = directory / "node_client.exe"
+    if not exe.is_file():
+        return
+    pids = select_node_client_pids(list_process_images() if images is None else images, directory)
+    for pid in pids:
+        kill(pid)
+    if busy(exe) and shutdown is not False:
+        (shutdown or _rm_force_shutdown)([exe])
+    deadline = time.time() + timeout
+    while busy(exe) and time.time() < deadline:
+        time.sleep(0.2)
+    if busy(exe):
+        raise RuntimeError(
+            f"{exe} 仍被占用，导入已中止，没有修改该目录。"
+            "请在任务管理器中结束该 node_client.exe 后重试。"
+        )
 
 
 def _copy_with_retry(src: Path, dst: Path) -> None:
@@ -304,16 +523,20 @@ def apply_package(
     if not files:
         return False, "安装包内没有文件"
 
-    if backup:
-        ok, _version, err = backup_current(exe)
-        if not ok and exe.is_file():
-            return False, f"备份失败，已放弃替换：{err}"
-
     dst_root = exe.parent
     dst_root.mkdir(parents=True, exist_ok=True)
     copies = [(src, dst_root / src.relative_to(src_root)) for src in files if not is_protected(src.name)]
     if not copies:
         return False, "安装包内没有可覆盖的文件"
+    busy = [dst for _src, dst in copies if file_is_busy(dst)]
+    if busy:
+        shown = "、".join(str(path) for path in busy[:5])
+        return False, f"文件仍被占用，已中止且未修改客户端：{shown}"
+
+    if backup:
+        ok, _version, err = backup_current(exe)
+        if not ok and exe.is_file():
+            return False, f"备份失败，已放弃替换：{err}"
     remove = ()
     if (src_root / exe.name).is_file() and not (src_root / CAPABILITIES_NAME).is_file():
         # 旧包不能继承新能力清单；该删除也必须能随失败撤回。

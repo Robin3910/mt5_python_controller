@@ -26,6 +26,19 @@ def test_list_and_detail_snapshots_stable(tmp_path):
     assert list_order(a) == (cfg.id,)
     assert a[0].selected is True
     assert "运行中" in a[0].status_line
+    assert a[0].algo_trading_disabled is False
+
+    cfg.algo_trading_disabled = True
+    marked = build_list(mgr, cfg.id)
+    assert marked[0].algo_trading_disabled is True
+    assert marked != a
+
+    mp.runtime.algo_trading_allowed = False
+    cfg.algo_trading_disabled = False
+    assert build_list(mgr, cfg.id)[0].algo_trading_disabled is True
+    mp._apply_status_payload({"algo_trading_allowed": True})
+    assert mp.runtime.algo_trading_allowed is True
+    assert build_list(mgr, cfg.id)[0].algo_trading_disabled is False
 
     d1 = build_detail(mp)
     d2 = build_detail(mp)

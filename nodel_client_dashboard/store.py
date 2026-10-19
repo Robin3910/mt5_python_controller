@@ -50,6 +50,80 @@ def logs_dir() -> Path:
     return d
 
 
+def canonical_dir(path: str) -> str:
+    """实例目录的比较键。把 UAC 虚拟化目录还原到真实的 Program Files 路径。"""
+    raw = os.path.normpath(os.path.abspath(path or "."))
+    if raw.lower().endswith(".exe"):
+        raw = os.path.dirname(raw)
+    marker = f"{os.sep}AppData{os.sep}Local{os.sep}VirtualStore{os.sep}"
+    folded = raw.lower()
+    idx = folded.find(marker.lower())
+    if idx != -1:
+        tail = raw[idx + len(marker):]
+        drive = os.path.splitdrive(raw)[0] or os.environ.get("SystemDrive", "C:")
+        raw = os.path.normpath(os.path.join(drive + os.sep, tail))
+    return os.path.normcase(raw)
+
+
+def same_instance(left: InstanceConfig, right: InstanceConfig) -> bool:
+    """同一后台节点、同一交易账号，或同一安装目录（含虚拟化副本）视为同一个实例。"""
+    if left.id == right.id:
+        return False
+    if left.node_id and left.node_id == right.node_id:
+        return True
+    if left.mt5_login and left.mt5_login == right.mt5_login:
+        return True
+    left_dir = canonical_dir(left.exe_path or left.cwd)
+    right_dir = canonical_dir(right.exe_path or right.cwd)
+    return bool(left_dir and left_dir == right_dir)
+
+
+def _prefer_instance(members: list[InstanceConfig]) -> InstanceConfig:
+    """真实安装目录优先于 VirtualStore 副本；同样真实时保留后写入的那条。"""
+    chosen = members[0]
+    for cfg in members[1:]:
+        chosen_virtual = "\\virtualstore\\" in chosen.exe_path.lower().replace("/", "\\")
+        cfg_virtual = "\\virtualstore\\" in cfg.exe_path.lower().replace("/", "\\")
+        if chosen_virtual and not cfg_virtual:
+            chosen = cfg
+        elif chosen_virtual == cfg_virtual:
+            chosen = cfg
+    return chosen
+
+
+def dedupe_instances(configs: list[InstanceConfig]) -> tuple[list[InstanceConfig], list[InstanceConfig]]:
+    """合并重复实例。返回 (保留, 丢弃)，保留项维持原有顺序。"""
+    parent = list(range(len(configs)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        root_left, root_right = find(left), find(right)
+        if root_left != root_right:
+            parent[root_right] = root_left
+
+    for i in range(len(configs)):
+        for j in range(i):
+            if same_instance(configs[i], configs[j]):
+                union(i, j)
+    groups: dict[int, list[InstanceConfig]] = {}
+    for i, cfg in enumerate(configs):
+        groups.setdefault(find(i), []).append(cfg)
+    drop_ids = set()
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        winner = _prefer_instance(members)
+        drop_ids.update(cfg.id for cfg in members if cfg.id != winner.id)
+    kept = [cfg for cfg in configs if cfg.id not in drop_ids]
+    dropped = [cfg for cfg in configs if cfg.id in drop_ids]
+    return kept, dropped
+
+
 def load_instances(path: Path | None = None) -> list[InstanceConfig]:
     p = path or instances_path()
     if not p.exists():
