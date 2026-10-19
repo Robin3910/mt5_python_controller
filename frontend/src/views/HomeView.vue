@@ -8,7 +8,8 @@ import type { TagOption } from '@/components/tagOption'
 import { useHubStore } from '@/stores/hub'
 import type { AccountSnapshot, NodeOut, Position } from '@/api/types'
 import { confirmAction } from '@/utils/confirm'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import api from '@/api/client'
 
 const hub = useHubStore()
 const router = useRouter()
@@ -45,12 +46,52 @@ onBeforeUnmount(() => {
   document.removeEventListener('keydown', onDocKey)
 })
 
-/** 把卡片操作菜单内的「主节点」开关切换走完整流程：确认 → 调用 store → toast 反馈。 */
+/** 拉取某节点当前 in-flight 子任务精简列表；空 = 放行。 */
+async function fetchActiveTasks(nodeId: string): Promise<{
+  count: number
+  items: Array<{
+    dispatch_id: number
+    task_id: number
+    signal_id: string
+    group_id: string
+    symbol: string | null
+    magic: number | null
+    status: string
+  }>
+  node_name: string
+}> {
+  const { data } = await api.get(`/api/nodes/${nodeId}/active-tasks`)
+  return data
+}
+
+/** 旧主节点 id：设置主节点时找同 owner 下当前的主节点；取消主节点就是自己。 */
+function findCurrentPrimaryId(excludeId: string): string | null {
+  const sameOwner = hub.nodes.filter((x) => x.node_id !== excludeId && x.is_primary)
+  return sameOwner[0]?.node_id ?? null
+}
+
+/** 把卡片操作菜单内的「主节点」开关切换走完整流程：
+ *  预查 in-flight → 命中阻塞直接禁提交 / 改文案 → 二次确认 → 调用 store → 处理 409 / 通用错误。 */
 async function togglePrimary(n: NodeOut): Promise<void> {
   closeNodeMenu()
   const next = !n.is_primary
+
+  // 阶段 0 预查：旧主节点在跑任务时直接弹阻塞弹窗，不进入二次确认
+  const victimId = next ? findCurrentPrimaryId(n.node_id) : n.is_primary ? n.node_id : null
+  if (victimId) {
+    try {
+      const active = await fetchActiveTasks(victimId)
+      if (active.count > 0) {
+        await showPrimaryBlockedDialog(active)
+        return
+      }
+    } catch (e) {
+      // 预查失败不阻塞流程（后端会再校验一次）
+      console.warn('primary precheck failed', e)
+    }
+  }
+
   if (next) {
-    // 设置主节点时给个明确确认：会顶替掉同账号下当前的主节点
     if (!(await confirmAction(
       `将「${n.name}」设置为本账号的主节点？\n` +
         '同一账号下已有主节点时，原主节点会被自动取消。',
@@ -70,9 +111,59 @@ async function togglePrimary(n: NodeOut): Promise<void> {
         : `已取消「${updated.name}」的主节点标记`,
     )
   } catch (err) {
-    const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
-    ElMessage.error(detail || (next ? '设置主节点失败' : '取消主节点失败'))
+    const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail
+    // 409 阻塞：detail 是个对象，带 blocking_tasks
+    if (detail && typeof detail === 'object' && (detail as { code?: string }).code === 'primary_switch_blocked') {
+      const d = detail as {
+        node_name?: string
+        message?: string
+        blocking_tasks?: Array<{ group_id: string; symbol: string | null; status: string; magic: number | null }>
+      }
+      await showPrimaryBlockedDialog({
+        count: d.blocking_tasks?.length ?? 0,
+        node_name: d.node_name ?? '',
+        items: (d.blocking_tasks ?? []).map((t) => ({
+          dispatch_id: 0,
+          task_id: 0,
+          signal_id: '',
+          group_id: t.group_id,
+          symbol: t.symbol,
+          magic: t.magic,
+          status: t.status,
+        })),
+      })
+      return
+    }
+    // 其它错误：保持原 toast
+    const text = typeof detail === 'string' ? detail : ''
+    ElMessage.error(text || (next ? '设置主节点失败' : '取消主节点失败'))
   }
+}
+
+async function showPrimaryBlockedDialog(active: {
+  count: number
+  node_name: string
+  items: Array<{ group_id: string; symbol: string | null; status: string; magic: number | null }>
+}): Promise<void> {
+  const lines = active.items
+    .slice(0, 20)
+    .map((t) => {
+      const sym = t.symbol ?? '-'
+      const mg = t.magic != null ? `#${t.magic}` : '-'
+      return `• ${t.group_id}  ${sym}  ${t.status}  ${mg}`
+    })
+    .join('\n')
+  const more = active.items.length > 20 ? `\n…（共 ${active.items.length} 条）` : ''
+  await ElMessageBox.alert(
+    `旧主节点「${active.node_name}」仍有 ${active.count} 条在跑子任务，\n` +
+      '主节点切换已被系统拒绝。请先到任务页收口这些任务后，再回来重试。\n\n' +
+      '阻塞明细：\n' + lines + more,
+    '主节点切换被拦截',
+    {
+      type: 'warning',
+      confirmButtonText: '我知道了',
+    },
+  )
 }
 
 type StatusFilter = 'all' | 'online' | 'offline'

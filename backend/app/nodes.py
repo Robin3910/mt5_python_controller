@@ -3,7 +3,7 @@
 普通用户只能看到 / 修改管理员分配给自己的节点（改名、启停、账户风控）；
 节点入库、删除、批量手数与按币种配置（normal 链路）只有管理员能做。
 """
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from . import node_service, permissions, persist, rbac_service, risk_control
@@ -234,6 +234,7 @@ async def set_primary_node(
     node_id: str,
     body: NodePrimaryUpdate,
     request: Request,
+    out_response: Response,
     store: RedisStore = Depends(get_store),
     p: Principal = Depends(require_menu(MENU_NODES)),
 ):
@@ -242,12 +243,57 @@ async def set_primary_node(
     每个所有者（普通用户 / 管理员）名下最多一个主节点；传 is_primary=True 时
     同 owner 下其它节点的原主节点标记会被自动清掉，保证唯一性。归属校验沿用
     owned_node_or_404 普通用户不能动管理员名下的节点。
+
+    v3 阻塞前置：被替换 / 被取消的旧主节点上仍有 in-flight 子任务时
+    （PRIMARY_BLOCKING_ENABLED=1 时启用）返回 409 + blocking_tasks 明细。
+    路由不接受任何 force / 强制绕过参数 —— 唯一放行条件是"无 in-flight"。
     """
     await owned_node_or_404(store, p, node_id)
-    d = await node_service.set_primary(
-        store, node_id, bool(body.is_primary),
-        audit_principal=p, audit_ip=client_ip(request),
-    )
+    try:
+        d, migrated_groups = await node_service.set_primary(
+            store, node_id, bool(body.is_primary),
+            audit_principal=p, audit_ip=client_ip(request),
+        )
+    except node_service.PrimarySwitchBlocked as e:
+        # 路由不把 force 字段写进 schema；这里是唯一对外结构
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": e.code,
+                "message": e.message if hasattr(e, "message") else str(e),
+                "node_id": e.node_id,
+                "node_name": e.node_name,
+                "next_node_id": e.next_node_id,
+                "blocking_tasks": e.blocking_tasks,
+            },
+        )
     if not d:
         raise HTTPException(status_code=404, detail="node not found")
-    return await _to_node_out(store, d, await rbac_service.owner_names_for(p))
+    out = await _to_node_out(store, d, await rbac_service.owner_names_for(p))
+    # 阶段 2 受影响的分组 ID 写到 X-Migrated-Groups，与 v1 文档约定一致
+    if migrated_groups:
+        out_response.headers["X-Migrated-Groups"] = ",".join(migrated_groups)
+    return out
+
+
+@router.get("/{node_id}/active-tasks")
+async def list_node_active_tasks(
+    node_id: str,
+    store: RedisStore = Depends(get_store),
+    p: Principal = Depends(require_menu(MENU_NODES)),
+):
+    """某节点当前 in-flight 的子任务（精简明细）。
+
+    仅用于主节点切换前的轻量预查：前端在确认弹窗前先拉一次，若非空则禁用
+    提交按钮 / 改文案为「旧主节点有 N 条在跑任务，无法切换」。权限与 set_primary
+    共享 owned_node_or_404。
+    """
+    await owned_node_or_404(store, p, node_id)
+    items = await node_service.list_active_tasks_for_node(node_id)
+    node = await store.get_node(node_id) or {}
+    return {
+        "node_id": node_id,
+        "node_name": node.get("name") or node_id,
+        "count": len(items),
+        "items": items,
+    }

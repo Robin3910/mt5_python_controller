@@ -5,13 +5,14 @@
 
 所有写操作都遵循“先写库、再刷新缓存”的顺序，保证重启后能从库里恢复全部状态。
 """
+import logging
 import time
 from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import func, select, text
 
-from . import group_service
+from . import group_persist, group_service
 from .db import SessionLocal
 from . import risk_control
 from .models import NodeCreate, NodeUpdate
@@ -19,6 +20,144 @@ from .orm import Node, NodeCredential
 from .redis_store import RedisStore
 from .rules import validate_node_global_lot_mode
 from .security import make_node_id
+
+logger = logging.getLogger(__name__)
+
+# 阻塞前置检查的硬上限：单次响应最多返回的明细条数，防止 N 条在跑任务把响应撑爆
+PRIMARY_BLOCKING_DETAIL_LIMIT = 100
+
+
+def _primary_blocking_enabled() -> bool:
+    """灰度开关：从环境变量读取，0=关闭（按旧行为跑）/ 1=开启（走阻塞前置）。"""
+    import os
+    return os.environ.get("PRIMARY_BLOCKING_ENABLED", "0") == "1"
+
+
+class PrimarySwitchBlocked(Exception):
+    """主节点切换被阻塞：旧主节点上仍有 in-flight 子任务。
+
+    - code: 给前端 / 审计的机器可读错误码
+    - node_id: 被阻塞的旧主节点 id
+    - node_name: 同上，节点显示名
+    - blocking_tasks: 阻塞明细（精简字段，limit = PRIMARY_BLOCKING_DETAIL_LIMIT）
+    - next_node_id: 即将上任的新主节点 id（取消主节点时为 None）
+    """
+
+    def __init__(
+        self, *, code: str, message: str, node_id: str, node_name: str,
+        next_node_id: Optional[str], blocking_tasks: list[dict],
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.node_id = node_id
+        self.node_name = node_name
+        self.next_node_id = next_node_id
+        self.blocking_tasks = blocking_tasks
+
+
+async def precheck_active_blocking(
+    store: RedisStore,
+    *,
+    target_node_id: str,
+    next_node_id: Optional[str],
+) -> None:
+    """阶段 0：检查旧主节点上是否仍有非终态子任务。命中阻塞即抛 PrimarySwitchBlocked。
+
+    阻塞判据（与 group_rules.SUBTASK_HOLDS_LOCK 对齐）：
+      GroupTaskDispatch 中 node_id == target_node_id 且
+      status NOT IN ("done", "failed", "skipped", "offline") → 阻塞
+
+    放行条件（唯一）：
+      旧主节点无任何 in-flight 子任务 → 放行。
+      任何其它情况（包括管理员运维请求）一律不放行。
+    """
+    # 1) 拉活动子任务（与 group_dispatcher 的活跃口径一致）
+    active = await group_persist.active_subtasks_for_node(target_node_id)
+    if not active:
+        return
+
+    # 2) 组装明细：精简字段，避免把内部列全抛出去
+    detail: list[dict] = [
+        {
+            "dispatch_id": s.get("dispatch_id"),
+            "task_id": s.get("task_id"),
+            "signal_id": s.get("signal_id"),
+            "group_id": s.get("group_id"),
+            "symbol": s.get("symbol"),
+            "magic": s.get("magic"),
+            "status": s.get("status"),
+        }
+        for s in active[:PRIMARY_BLOCKING_DETAIL_LIMIT]
+    ]
+
+    # 3) 节点名（缓存里查；没有就回退到 id）
+    node = await store.get_node(target_node_id) or {}
+    node_name = node.get("name") or target_node_id
+
+    # 4) 抛阻塞异常（路由层会原样映射成 409 + detail）
+    raise PrimarySwitchBlocked(
+        code="primary_switch_blocked",
+        message=(
+            f"旧主节点 {node_name} 仍有 {len(active)} 条在跑子任务，"
+            "请先到任务页收口后再切换主节点"
+        ),
+        node_id=target_node_id,
+        node_name=node_name,
+        next_node_id=next_node_id,
+        blocking_tasks=detail,
+    )
+
+
+async def list_active_tasks_for_node(node_id: str) -> list[dict]:
+    """前端轻量预查：返回某节点当前 in-flight 子任务精简列表。
+
+    与 precheck_active_blocking 同源（group_persist.active_subtasks_for_node），
+    区别是这里不抛异常；用于切换主节点前在确认框里展示「旧主节点有 N 条在跑」。
+    """
+    active = await group_persist.active_subtasks_for_node(node_id)
+    return [
+        {
+            "dispatch_id": s.get("dispatch_id"),
+            "task_id": s.get("task_id"),
+            "signal_id": s.get("signal_id"),
+            "group_id": s.get("group_id"),
+            "symbol": s.get("symbol"),
+            "magic": s.get("magic"),
+            "status": s.get("status"),
+        }
+        for s in active[:PRIMARY_BLOCKING_DETAIL_LIMIT]
+    ]
+
+
+async def _collect_victim_node_ids(
+    session, *, node_id: str, is_primary: bool,
+) -> list[str]:
+    """收集本次主节点切换会被踢下台 / 被取消的旧主节点 id 列表。
+
+    - 设为 True：同 owner 下当前 is_primary=True 但不是 node_id 自身的节点（被替换）
+    - 设为 False：node_id 自身（如果当前 is_primary=True）
+    - 状态未变（已同态）→ 返回空 list
+    """
+    row = await session.get(Node, node_id)
+    if not row:
+        return []
+    owner_user_id: Optional[int] = row.owner_user_id
+    if is_primary:
+        # 即将晋升为新主：找 owner 下其它当前仍是主节点的节点（被替换）
+        stmt = select(Node.node_id).where(Node.is_primary.is_(True))
+        if owner_user_id is None:
+            stmt = stmt.where(Node.owner_user_id.is_(None))
+        else:
+            stmt = stmt.where(Node.owner_user_id == owner_user_id)
+        stmt = stmt.where(Node.node_id != node_id)
+        return [r[0] for r in (await session.execute(stmt)).all()]
+    # 即将取消主节点
+    if row.is_primary:
+        return [node_id]
+    return []
+
+
+
 
 
 def node_row_to_dict(row: Node) -> dict:
@@ -320,21 +459,56 @@ async def _clear_primary_for_owner(
 async def set_primary(
     store: RedisStore, node_id: str, is_primary: bool,
     *, audit_principal=None, audit_ip: str | None = None,
-) -> Optional[dict]:
+) -> tuple[Optional[dict], list[str]]:
     """设置 / 取消某节点的主节点标记；按 owner 唯一。
 
     设置为 True 时会把同 owner 下其它节点的主节点标记全部清掉，保证唯一性。
     取消时只清本节点。权限与归属校验由路由层完成（先 owned_node_or_404）。
+
+    阶段 0（v3）：当 PRIMARY_BLOCKING_ENABLED=1 时，被替换 / 被取消的旧主节点上
+    若仍有非终态子任务（GroupTaskDispatch.status NOT IN SUBTASK_TERMINAL），
+    整个动作会被 PrimarySwitchBlocked 异常拦截。事务内、外各做一次校验：
+    事务外拦截绝大多数场景，事务内拦截"阶段 0 通过后到 _locked_node 之间"
+    极小窗口期新增的 in-flight。
     """
+    blocking_on = _primary_blocking_enabled()
+
+    # ── 阶段 0（事务外预检）──
+    if blocking_on:
+        async with SessionLocal() as s_pre:
+            victims = await _collect_victim_node_ids(
+                s_pre, node_id=node_id, is_primary=is_primary,
+            )
+        for vid in victims:
+            # 不抛错就继续；任一 victim 命中阻塞则由异常上抛
+            await precheck_active_blocking(
+                store,
+                target_node_id=vid,
+                next_node_id=node_id if is_primary else None,
+            )
+
     async with SessionLocal() as s:
         row = await _locked_node(s, node_id)
         if not row:
-            return None
+            return None, []
         owner_after: Optional[int] = row.owner_user_id
         before = {"is_primary": bool(row.is_primary)}
         if bool(row.is_primary) == bool(is_primary):
             # 状态未变，避免无谓的写入与审计
-            return node_row_to_dict(row)
+            return node_row_to_dict(row), []
+
+        # ── 阶段 0（事务内重检）── 双重保险，挡住事务外阶段 0 之后的极小窗口
+        if blocking_on:
+            victims = await _collect_victim_node_ids(
+                s, node_id=node_id, is_primary=is_primary,
+            )
+            for vid in victims:
+                await precheck_active_blocking(
+                    store,
+                    target_node_id=vid,
+                    next_node_id=node_id if is_primary else None,
+                )
+
         if is_primary:
             await _clear_primary_for_owner(s, row.owner_user_id, exclude_node_id=node_id)
         row.is_primary = bool(is_primary)
@@ -370,7 +544,165 @@ async def set_primary(
         ).scalars().all()
     for r in affected:
         await store.cache_node(node_row_to_dict(r))
-    return d
+
+    # 阶段 2 前先确定 victim：从 owner 唯一性保证来看，最多一个 victim。
+    # 用一个独立 session 读，避免主事务已 commit 后的连接复用问题。
+    async with SessionLocal() as s_v:
+        victim_id_for_migration = await _collect_victim_for_migration(
+            s_v, node_id=node_id, is_primary=is_primary,
+        )
+
+    # ── 阶段 2：迁移专属分组成员 ──
+    # 仅在主节点标记真的翻转时才做迁移（同态 short-circuit 已 return，不会到这里）。
+    # 取消主节点（is_primary=False）时只删旧成员、不补新成员。
+    # 异常被隔离：失败只记日志，不影响主节点切换的返回值。
+    try:
+        migrated = await migrate_primary_groups(
+            store,
+            old_primary_id=victim_id_for_migration,
+            new_primary_id=node_id if is_primary else None,
+            owner_user_id=row.owner_user_id,
+        )
+        if migrated:
+            logger.info(
+                "primary migration: %d groups updated for owner=%s (%s -> %s)",
+                len(migrated), row.owner_user_id,
+                victim_id_for_migration, node_id if is_primary else None,
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("primary migration failed (isolated): %s", e)
+
+    return d, migrated
+
+
+async def _collect_victim_for_migration(
+    session, *, node_id: str, is_primary: bool,
+) -> Optional[str]:
+    """阶段 2 用：取一个 victim 给成员迁移（不需要列表，迁移在循环里取 victims）。
+
+    设主时：取同 owner 下被替换的旧主节点 id（最多 1 个；owner 唯一性保证）；
+    取消时：取 node_id 自身（如果它当前就是主节点）。
+    非主 → 返回 None。
+    """
+    row = await session.get(Node, node_id)
+    if not row:
+        return None
+    owner_user_id: Optional[int] = row.owner_user_id
+    if is_primary:
+        stmt = select(Node.node_id).where(Node.is_primary.is_(True))
+        if owner_user_id is None:
+            stmt = stmt.where(Node.owner_user_id.is_(None))
+        else:
+            stmt = stmt.where(Node.owner_user_id == owner_user_id)
+        stmt = stmt.where(Node.node_id != node_id).limit(1)
+        hit = (await session.execute(stmt)).first()
+        return hit[0] if hit else None
+    if row.is_primary:
+        return node_id
+    return None
+
+
+async def migrate_primary_groups(
+    store: RedisStore,
+    *,
+    old_primary_id: Optional[str],
+    new_primary_id: Optional[str],
+    owner_user_id: Optional[int],
+) -> list[str]:
+    """阶段 2：把专属分组里的旧主节点替换成新主节点。
+
+    触发条件（由调用方保证）：
+      - 主节点标记已成功翻转（事务 1 已 commit）
+      - old_primary_id：被踢下台 / 被取消的旧主节点；无则跳过
+      - new_primary_id：即将上任的新主节点（取消主节点时为 None）
+
+    范围：
+      - 按 owner_user_id 隔离（与 set_primary 维度一致）
+      - 仅处理 _group_name 命名前缀的专属分组（trend_market-* / trend_limit-* / grid-*）
+      - 其它手工分组 / 中控台"多区间方向过滤"产生的旧分组 **不** 动
+
+    动作：
+      - 新主节点已经存在于成员里 → 仅删除旧主节点成员
+      - 新主节点不存在 → 删除旧主节点成员 + 加入新主节点成员（append 到末尾）
+      - 取消主节点（new_primary_id is None）→ 仅删除旧主节点成员
+      - 趋势策略（template_id=2）且 limit_watch_enabled=True 时，把新主节点成员的
+        limit_watch_report 设为 True；其它情况保持 False
+
+    返回：被改动的分组 ID 列表（用于响应头 / 审计）。
+    """
+    if not old_primary_id or owner_user_id is None:
+        return []
+
+    # 1) 拉所有 owner 维度下的分组（走 Redis 缓存）
+    all_groups = await store.all_groups()
+    targets: list[dict] = []
+    for g in all_groups:
+        if not _is_quick_trigger_group(g.get("name") or ""):
+            continue
+        if not _same_owner(g.get("owner_user_id"), owner_user_id):
+            continue
+        members = g.get("members") or []
+        if not any(m.get("node_id") == old_primary_id for m in members):
+            continue
+        targets.append(g)
+
+    if not targets:
+        return []
+
+    # 2) 每个命中分组做成员替换（仅成员变动时落地，幂等）
+    from .models import GroupUpdate  # 局部 import 避免循环
+    from .group_service import _strategy_dict  # 复用查策略的现有助手
+    changed: list[str] = []
+    for g in targets:
+        old_members: list[str] = [m.get("node_id") for m in g.get("members") or [] if m.get("node_id")]
+        if old_primary_id not in old_members:
+            continue
+        new_members = [nid for nid in old_members if nid != old_primary_id]
+        if new_primary_id and new_primary_id not in new_members:
+            new_members.append(new_primary_id)
+        if new_members == old_members:
+            # 顺序/内容没变：幂等跳过
+            continue
+        # limit_watch_report：仅在新成员入局时考虑（v1 与趋势策略联动）
+        limit_watch_enabled = bool(g.get("limit_watch_enabled"))
+        # group_row_to_dict 没存 template_id，要按 strategy_id 查策略拿到
+        sty = await _strategy_dict(store, g.get("strategy_id"))
+        is_trend = bool(sty and sty.get("template_id") == "2")  # TEMPLATE_2_ID == 趋势
+        report_for_new = bool(limit_watch_enabled and is_trend and new_primary_id)
+        try:
+            patch_kwargs: dict = {"node_ids": new_members}
+            if report_for_new:
+                # 仅在新成员入局且需打开 report 时才传；省略该字段让 update_group
+                # 用 model_fields_set 判「未传」语义，避免触发空 list → 全员关的副作用
+                patch_kwargs["limit_watch_node_ids"] = [new_primary_id]
+            await group_service.update_group(
+                store, g["group_id"], GroupUpdate(**patch_kwargs),
+            )
+            changed.append(g["group_id"])
+        except ValueError as e:
+            # validate_node_ids 拒绝（节点不存在 / 跨 owner）：单条分组跳过，不影响其它
+            logger.warning("migrate group %s failed: %s", g.get("group_id"), e)
+    return changed
+
+
+def _is_quick_trigger_group(name: str) -> bool:
+    """专属分组命名格式：`{trend_market|trend_limit|grid}-{user}-{login}-{symbol}`。
+
+    只迁移这种命名规则的分组；手工分组不参与主节点切换联动。
+    """
+    if not name:
+        return False
+    head = name.split("-", 1)[0]
+    return head in ("trend_market", "trend_limit", "grid")
+
+
+def _same_owner(a: Optional[int], b: Optional[int]) -> bool:
+    """两个 owner 是否等价（含 None）。"""
+    if a is None and b is None:
+        return True
+    if a is None or b is None:
+        return False
+    return int(a) == int(b)
 
 
 async def apply_risk_state(store: RedisStore, node_id: str, risk: dict) -> Optional[dict]:
