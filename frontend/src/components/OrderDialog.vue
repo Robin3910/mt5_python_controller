@@ -813,6 +813,22 @@ async function triggerMarketStrategy(): Promise<void> {
           err?.response?.data?.detail || err?.message || '打开限价监听失败'
       }
     }
+    // 信号并发：策略建/绑成功后自动开启（市价/限价用模版2，网格用模版3，均支持并发）。
+    // 必须在 strategy_id 绑上之后才能开（update_group:346 会校验策略类型）。
+    // 已存在的分组若已开启，此 PATCH 是幂等的；用户手动关过则会被重新打开。
+    if (currentGroup.value) {
+      const groupId = currentGroup.value.group_id
+      try {
+        await hub.updateGroup(groupId, { signal_concurrent_enabled: true })
+        const refreshed = (await hub.listGroups()).find((g) => g.group_id === groupId)
+        if (refreshed) currentGroup.value = refreshed
+      } catch (e) {
+        // 信号并发失败不影响信号下发：仅给用户提示，不抛出
+        const err = e as { response?: { data?: { detail?: string } }; message?: string }
+        lastStrategyError.value =
+          err?.response?.data?.detail || err?.message || '打开信号并发失败'
+      }
+    }
     // 发信号：市价/限价走 strategy 模型，action 由前端推导。
     // 限价时传 entry_price（后端会转成 limit_price，用于到价触发）。
     const action = derivedAction.value!
@@ -895,6 +911,21 @@ async function triggerGridStrategy(): Promise<void> {
         if (strategyId) {
           await hub.updateGroup(currentGroup.value.group_id, { strategy_id: strategyId })
         }
+      }
+    }
+    // 信号并发：网格用模版3（支持并发），策略建/绑成功后自动开启。
+    // 已存在的分组若已开启，此 PATCH 是幂等的。
+    if (currentGroup.value) {
+      try {
+        await hub.updateGroup(currentGroup.value.group_id, { signal_concurrent_enabled: true })
+        const refreshed = (await hub.listGroups()).find(
+          (g) => g.group_id === currentGroup.value!.group_id,
+        )
+        if (refreshed) currentGroup.value = refreshed
+      } catch (e) {
+        const err = e as { response?: { data?: { detail?: string } }; message?: string }
+        lastStrategyError.value =
+          err?.response?.data?.detail || err?.message || '打开信号并发失败'
       }
     }
     // 网格信号：方向由策略内的 grid_side 决定；payload 顶层 action 必须是大写
