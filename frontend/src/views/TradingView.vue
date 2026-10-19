@@ -266,12 +266,16 @@ async function stopGridTask(task: GroupSignalTaskRecord): Promise<void> {
   if (!isGridTaskStoppable(task) || isClosingGridTask(task.task_id)) return
   const sym = task.symbol || '?'
   const nodeSummary = gridTaskNodeNames(task)
-  const dispatchCount = task.dispatches.filter(
+  // 只对该 task 下的活跃 dispatch 下发 strategy_stop，不影响同组其他 task。
+  // 终态的 dispatch 跳过（已经收口，没必要再发一次）。
+  const activeDispatches = task.dispatches.filter(
     (d) => !['done', 'failed', 'skipped'].includes(d.status),
-  ).length
+  )
+  const dispatchCount = activeDispatches.length
+  if (dispatchCount === 0) return
   try {
     await ElMessageBox.confirm(
-      `确认停止 ${sym} 网格任务（${nodeSummary}）？\n将向 ${dispatchCount} 个节点按魔术号平掉该网格的全部持仓并结束策略监控。`,
+      `确认停止 ${sym} 网格任务（${nodeSummary}）？\n将向 ${dispatchCount} 个节点按魔术号平掉该网格的全部持仓并结束策略监控。\n（同分组内的其它任务不受影响）`,
       '停止吸筹策略',
       {
         type: 'warning',
@@ -282,36 +286,36 @@ async function stopGridTask(task: GroupSignalTaskRecord): Promise<void> {
   } catch {
     return
   }
-  // 一键终止：调 closeGroup 走"整组一键平仓"，与分组页"返回分组列表点平仓"一致。
-  // 它会下发 strategy_stop 到所有未收口子任务，效果与逐个 closeDispatch 等价但更快。
+  // 按 task 粒度停止：只对该 task 下未收口的 dispatch 逐个下发 strategy_stop，
+  // 不调 closeGroup（整组一键平仓会同时干掉同分组内的其它 task，与"只停一个"的需求冲突）。
   const groupId = task.group_id
   closingGridTaskIds.value = new Set([...closingGridTaskIds.value, task.task_id])
   let targetsCount = 0
   let forcedCount = 0
+  let failCount = 0
   try {
-    // 先尝试整组一键终止
-    try {
-      const r = await hub.closeGroup(groupId)
-      targetsCount = r?.targets ?? 0
-      forcedCount = r?.forced ?? 0
-    } catch {
-      // 整组失败 → 退化到逐个 dispatch 调用 closeGroupDispatch
-      for (const d of task.dispatches) {
-        if (['done', 'failed', 'skipped'].includes(d.status)) continue
-        try {
-          await hub.closeGroupDispatch(groupId, d.id)
-          targetsCount += 1
-        } catch {
-          /* 单个失败留给后续轮询显示 */
-        }
+    // 并发下发所有 dispatch 的停止命令，避免顺序等待拖慢交互
+    const results = await Promise.allSettled(
+      activeDispatches.map((d) => hub.closeGroupDispatch(groupId, d.id)),
+    )
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i]
+      if (r.status === 'fulfilled') {
+        const v = r.value as { status?: string }
+        if (v?.status === 'closing') targetsCount += 1
+        else forcedCount += 1
+      } else {
+        failCount += 1
       }
     }
-    if (targetsCount > 0) {
-      ElMessage.success(
-        `已下发停止 · 成功 ${targetsCount}` + (forcedCount ? ` · 离线 ${forcedCount}` : ''),
-      )
-    } else if (forcedCount > 0) {
-      ElMessage.warning(`节点离线，已强制结束，待重连补发平仓（${forcedCount}）`)
+    const parts: string[] = []
+    if (targetsCount > 0) parts.push(`已下发停止 ${sym} · 成功 ${targetsCount}`)
+    if (forcedCount > 0) parts.push(`离线 ${forcedCount}`)
+    if (parts.length > 0) {
+      // 成功 / 离线 都视为本次操作完成
+      ElMessage.success(parts.join(' · '))
+    } else if (failCount > 0) {
+      ElMessage.error(`下发停止失败（${failCount} 个节点）`)
     } else {
       ElMessage.warning('已下发停止，结果待刷新确认')
     }
@@ -827,10 +831,6 @@ onBeforeUnmount(() => {
             :aria-selected="detailTab === 'positions'"
             @click="detailTab = 'positions'"
           >
-            <svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <rect x="3" y="3" width="14" height="14" rx="2" />
-              <path d="M3 9h14M7 3v14" />
-            </svg>
             当前持仓
             <span v-if="totalPosCount > 0" class="tab-badge">{{ totalPosCount }}</span>
           </button>
@@ -841,10 +841,6 @@ onBeforeUnmount(() => {
             :aria-selected="detailTab === 'assets'"
             @click="detailTab = 'assets'"
           >
-            <svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <circle cx="10" cy="10" r="7" />
-              <path d="M10 7v3l2 1" />
-            </svg>
             资产
           </button>
           <button
@@ -854,11 +850,6 @@ onBeforeUnmount(() => {
             :aria-selected="detailTab === 'history'"
             @click="detailTab = 'history'"
           >
-            <svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <circle cx="10" cy="10" r="7" />
-              <path d="M10 5v5l3 2" />
-              <path d="M3.5 6.5L10 3l6.5 3.5" />
-            </svg>
             历史订单
             <span v-if="historyTotal > 0" class="tab-badge tab-badge-muted">{{ historyTotal }}</span>
           </button>
@@ -869,10 +860,6 @@ onBeforeUnmount(() => {
             :aria-selected="detailTab === 'grid'"
             @click="detailTab = 'grid'"
           >
-            <svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M3 6h14M3 10h14M3 14h14" />
-              <path d="M6 4v12M10 4v12M14 4v12" />
-            </svg>
             吸筹策略
             <span v-if="gridTasks.length > 0" class="tab-badge tab-badge-muted">{{ gridTasks.length }}</span>
           </button>

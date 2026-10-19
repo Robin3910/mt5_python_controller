@@ -20,15 +20,15 @@ export const TREND_DEFAULTS: TrendConfig = {
 }
 
 export const TREND_TIMEFRAMES: { value: TrendTimeframe; label: string }[] = [
-  { value: 'M1', label: '1 分钟' },
-  { value: 'M5', label: '5 分钟' },
-  { value: 'M15', label: '15 分钟' },
-  { value: 'M30', label: '30 分钟' },
-  { value: 'H1', label: '1 小时' },
-  { value: 'H4', label: '4 小时' },
-  { value: 'D1', label: '日线' },
-  { value: 'W1', label: '周线' },
-  { value: 'MN', label: '月线' },
+  { value: 'M1', label: '1m' },
+  { value: 'M5', label: '5m' },
+  { value: 'M15', label: '15m' },
+  { value: 'M30', label: '30m' },
+  { value: 'H1', label: '1h' },
+  { value: 'H4', label: '4h' },
+  { value: 'D1', label: 'D' },
+  { value: 'W1', label: 'W' },
+  { value: 'MN', label: 'M' },
 ]
 
 /** 面板轮询间隔选项；0 = 暂停自动刷新 */
