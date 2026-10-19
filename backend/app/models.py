@@ -225,7 +225,7 @@ class GroupCreate(BaseModel):
     name: str = Field(min_length=1, max_length=64)
     enabled: bool = True
     dispatch_mode: str = "sync"  # sync / poll
-    # 信号并发：仅全员同步 + 绑定网格/趋势策略时可用；开启后同组同节点可同时处理多条开仓信号（默认关）
+    # 信号并发：仅全员同步 + 绑定网格/趋势策略时可用；开启后同组同节点可同时处理多条开仓信号（默认开）
     signal_concurrent_enabled: bool = False
     # 趋势风控：开仓前按全局趋势参数对各节点算信号品种趋势（默认关）
     trend_risk_enabled: bool = False
@@ -790,6 +790,19 @@ class QuickTriggerRequest(BaseModel):
     # 趋势模式忽略（后端根据现价/SL 自动判断）
     direction: Optional[str] = Field(default=None)
     remark: Optional[str] = Field(default=None, max_length=64)
+    # 网格参数
+    price_lower: Optional[float] = Field(default=None, ge=0)
+    price_upper: Optional[float] = Field(default=None, ge=0)
+    grid_count: Optional[int] = Field(default=None, ge=2, le=200)
+    grid_mode: Optional[str] = Field(default=None)
+    grid_side: Optional[str] = Field(default=None)
+    lot_per_grid: Optional[float] = Field(default=None, gt=0)
+    prefill_enabled: Optional[bool] = Field(default=None)
+    trigger_price: Optional[float] = Field(default=None, ge=0)
+    stop_loss: Optional[float] = Field(default=None, ge=0)
+    stop_profit: Optional[float] = Field(default=None, ge=0)
+    trailing_up: Optional[bool] = Field(default=None)
+    assist_max_loss: Optional[float] = Field(default=None, ge=0)
 
 
 class QuickTriggerResult(BaseModel):

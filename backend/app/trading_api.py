@@ -108,6 +108,54 @@ def _build_default_rules(strategy_type: str) -> tuple[str, list[dict]]:
     raise ValueError(f"未知策略类型：{strategy_type}")
 
 
+def _apply_grid_params(rule: dict, body: "QuickTriggerRequest") -> None:
+    """把请求里的网格详情写进 rule dict。已存在的策略走 update_strategy 时复用。
+
+    必填：price_lower / price_upper / grid_count / grid_mode / grid_side / lot_per_grid。
+    可选：prefill_enabled / trigger_price / stop_loss / stop_profit / trailing_up / assist_max_loss。
+    几何位置与方向的对应：
+      grid_side=long：stop_loss → stop_lower、stop_profit → stop_upper
+      grid_side=short：stop_loss → stop_upper、stop_profit → stop_lower
+    最终写入落库字段是 stop_lower / stop_upper，由 normalize_rule 校验几何合法性。
+    """
+    if body.grid_mode:
+        rule["grid_mode"] = body.grid_mode
+    if body.grid_side:
+        rule["grid_side"] = body.grid_side
+    if body.price_lower is not None:
+        rule["price_lower"] = float(body.price_lower)
+    if body.price_upper is not None:
+        rule["price_upper"] = float(body.price_upper)
+    if body.grid_count is not None:
+        rule["grid_count"] = int(body.grid_count)
+    if body.lot_per_grid is not None:
+        rule["lot_per_grid"] = float(body.lot_per_grid)
+    if body.prefill_enabled is not None:
+        rule["prefill_enabled"] = bool(body.prefill_enabled)
+    if body.trigger_price is not None:
+        rule["trigger_price"] = float(body.trigger_price)
+    if body.trailing_up is not None:
+        rule["trailing_up"] = bool(body.trailing_up)
+    if body.assist_max_loss is not None:
+        rule["assist_max_loss"] = float(body.assist_max_loss)
+    # 止损 / 止盈按方向映射到 stop_lower / stop_upper。
+    # 暂存到辅助字段，让 normalize_rule 不被这一层逻辑污染（后端只认 stop_lower/upper）
+    if body.stop_loss is not None or body.stop_profit is not None:
+        side = (body.grid_side or rule.get("grid_side") or "long").lower()
+        # 把语义化字段暂存到 _stop_sl_buy 等临时键，下方再读
+        if body.stop_loss is not None:
+            rule["_stop_loss_input"] = float(body.stop_loss)
+        if body.stop_profit is not None:
+            rule["_stop_profit_input"] = float(body.stop_profit)
+        rule["_grid_side_input"] = side
+        if body.stop_loss is not None:
+            target = "stop_lower" if side == "long" else "stop_upper"
+            rule[target] = float(body.stop_loss)
+        if body.stop_profit is not None:
+            target = "stop_upper" if side == "long" else "stop_lower"
+            rule[target] = float(body.stop_profit)
+
+
 def _infer_trend_action(
     strategy_type: str,
     *,
@@ -187,6 +235,21 @@ async def quick_trigger(
         if d not in ("all", "buy", "sell"):
             raise HTTPException(status_code=400, detail="网格方向必须是 all/buy/sell")
         grid_direction = d
+        # 网格详情必填校验（区间、网格数、每格手数必须给）
+        if body.price_lower is None or body.price_lower <= 0:
+            raise HTTPException(status_code=400, detail="网格开仓必须填写区间下限")
+        if body.price_upper is None or body.price_upper <= 0:
+            raise HTTPException(status_code=400, detail="网格开仓必须填写区间上限")
+        if body.price_upper <= body.price_lower:
+            raise HTTPException(status_code=400, detail="网格区间上限须大于下限")
+        if body.grid_count is None or body.grid_count < 2:
+            raise HTTPException(status_code=400, detail="网格数量需 ≥ 2")
+        if body.lot_per_grid is None or body.lot_per_grid <= 0:
+            raise HTTPException(status_code=400, detail="网格每格手数必须大于 0")
+        if body.grid_mode and body.grid_mode not in ("arithmetic", "geometric"):
+            raise HTTPException(status_code=400, detail="网格模式必须是 arithmetic / geometric")
+        if body.grid_side and body.grid_side not in ("long", "short"):
+            raise HTTPException(status_code=400, detail="网格方向必须是 long / short")
 
     name = _group_name(body.strategy_type, p.username, login, body.symbol)
 
@@ -197,6 +260,9 @@ async def quick_trigger(
         # 网格首次创建时把方向写进 rule.action；其他模式不动
         if body.strategy_type == "grid" and grid_direction and rules:
             rules[0]["action"] = grid_direction if grid_direction != "all" else "all"
+        # 把请求里的网格详情写进首条规则（按 grid_side 映射 stop_lower/stop_upper）
+        if body.strategy_type == "grid" and rules:
+            _apply_grid_params(rules[0], body)
         try:
             strategy = await strategy_service.create_strategy(
                 store,
@@ -212,6 +278,27 @@ async def quick_trigger(
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=f"创建策略失败：{e}")
+    else:
+        # 已存在策略：仅 grid 模式按请求覆盖规则详情，
+        # 其它模式只复用，不重置（保留用户在策略页的编辑）。
+        if body.strategy_type == "grid":
+            try:
+                existing_rules = strategy.get("rules") or []
+                if existing_rules:
+                    _apply_grid_params(existing_rules[0], body)
+                    updated = await strategy_service.update_strategy(
+                        store,
+                        strategy["strategy_id"],
+                        StrategyUpdate(
+                            name=strategy.get("name") or name,
+                            symbol=body.symbol,
+                            rules=[StrategyRule(**r) for r in existing_rules],
+                        ),
+                    )
+                    if updated:
+                        strategy = updated
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=f"更新网格策略失败：{e}")
 
     # 5. 找/建分组
     group = await _find_group_by_name(store, name, owner_user_id=owner)
