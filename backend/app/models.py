@@ -226,7 +226,7 @@ class GroupCreate(BaseModel):
     enabled: bool = True
     dispatch_mode: str = "sync"  # sync / poll
     # 信号并发：仅全员同步 + 绑定网格/趋势策略时可用；开启后同组同节点可同时处理多条开仓信号（默认开）
-    signal_concurrent_enabled: bool = True
+    signal_concurrent_enabled: bool = False
     # 趋势风控：开仓前按全局趋势参数对各节点算信号品种趋势（默认关）
     trend_risk_enabled: bool = False
     # 限价挂单监听：仅绑定趋势策略的分组可开（默认关）；关键字默认 limit，空串表示不按注释过滤
