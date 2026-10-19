@@ -13,6 +13,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from . import (
+    group_rules,
     group_service,
     permissions,
     persist,
@@ -304,13 +305,16 @@ async def quick_trigger(
     group = await _find_group_by_name(store, name, owner_user_id=owner)
     if not group:
         try:
+            # signal_concurrent_enabled 不在建组时一次喂进去：建组瞬间虽然 strategy_id
+            # 也传了，但若该策略的 template_id 不在 tpl_2/tpl_3 范围（老策略、用户手动
+            # 改过模版等），_require_concurrent_strategy 会拒并中断整次触发。
+            # 与 limit_watch_enabled 同理：建完分再用 PATCH 在 strategy_id 落库后补开。
             group = await group_service.create_group(
                 store,
                 GroupCreate(
                     name=name,
                     enabled=True,
                     dispatch_mode="sync",
-                    signal_concurrent_enabled=True,
                     node_ids=[body.node_id],
                     strategy_id=strategy["strategy_id"],
                     remark=f"交易页自动创建（{body.strategy_type}）",
@@ -331,6 +335,22 @@ async def quick_trigger(
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=f"绑定策略失败：{e}")
         await _ensure_member(store, group, body.node_id)
+
+    # 5.5 信号并发开关：仅当绑定策略支持并发（tpl_2 / tpl_3）时打开。
+    # 这样首次触发时不需要用户去 GroupsView 手动开；同时避免给老策略/非并发策略
+    # 强行打开触发 _SIGNAL_CONCURRENT_ONLY_GRID_TREND 校验失败。已存在分组的
+    # 状态若已被用户在 GroupsView 改过，这里会保持原状（不主动覆盖）。
+    if group and not group.get("signal_concurrent_enabled"):
+        if group_rules.supports_signal_concurrent(strategy):
+            try:
+                updated = await group_service.update_group(
+                    store, group["group_id"],
+                    GroupUpdate(signal_concurrent_enabled=True),
+                )
+                if updated:
+                    group = updated
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=f"开启信号并发失败：{e}")
 
     # 6. 构造信号
     if body.strategy_type in ("trend_market", "trend_limit"):
