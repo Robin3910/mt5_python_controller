@@ -147,10 +147,11 @@ def owner_for_new(p: Principal) -> Optional[int]:
 
 def foreign_node_ids(nodes: Iterable[dict], owner_user_id: object) -> list[str]:
     """不在 owner_user_id 名下的节点 ID（分组成员必须与分组同一所有者）。"""
+    norm = normalize_owner(owner_user_id)
     return [
         str(n.get("node_id"))
         for n in nodes
-        if n and not same_owner(n.get("owner_user_id"), owner_user_id)
+        if n and normalize_owner(n.get("owner_user_id")) != norm
     ]
 
 

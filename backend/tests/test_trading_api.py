@@ -277,3 +277,46 @@ def test_quick_trigger_different_symbol_creates_separate_strategy_and_group(
     b_strat = next(s for s in strats if s["strategy_id"] == b["strategy_id"])
     assert a_strat["symbol"] == "XAUUSD", a_strat
     assert b_strat["symbol"] == "EURUSD", b_strat
+
+
+def test_quick_trigger_admin_self_assign_then_trigger(client, monkeypatch):
+    """管理员给自己分配节点后触发策略：节点 owner_user_id 为 admin.id，不是 NULL。
+
+    此前 foreign_node_ids() 用 raw owner_user_id 而非 normalize_owner() 比较，
+    导致同一整数值的 admin.id 被误判为「不属于」而 400 拒绝。
+    修复 normalize_owner 两侧后再 self-assign → trigger 应返回 200 + group_id。
+    """
+    admin_token = _admin_token(client)
+    h = _admin_headers(client)
+    uid = client.get("/api/me", headers=h).json()["user_id"]
+
+    # 1. 建节点（默认 admin 名下，owner_user_id = NULL）
+    r = client.post("/api/nodes", json={"name": "self-assign-node", "mt5_login": 70888}, headers=h)
+    assert r.status_code == 201, r.text
+    nid = r.json()["node_id"]
+
+    # 2. 管理员自分配：owner 从 NULL → admin.id
+    assign_r = client.put(f"/api/users/{uid}/nodes", json={"node_ids": [nid]}, headers=h)
+    assert assign_r.status_code == 200, assign_r.text
+    assert nid in assign_r.json()["added"]
+
+    # 3. 设为主节点
+    set_p = client.post(f"/api/nodes/{nid}/primary", json={"is_primary": True}, headers=h)
+    assert set_p.status_code == 200, set_p.text
+
+    # 4. 触发策略 — 此前此处报「节点不存在或不属于该分组所有者」
+    body = {
+        "node_id": nid,
+        "strategy_type": "grid",
+        "symbol": "XAUUSD",
+        "volume": 0.01,
+        "direction": "all",
+        "price_lower": 1900.0,
+        "price_upper": 2000.0,
+        "grid_count": 5,
+        "lot_per_grid": 0.01,
+    }
+    resp = _post_quick_trigger(client, monkeypatch, admin_token, body)
+    assert resp.status_code == 200, resp.text
+    assert "group_id" in resp.json(), resp.text
+    assert "strategy_id" in resp.json(), resp.text
