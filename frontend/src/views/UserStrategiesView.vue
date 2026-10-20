@@ -390,15 +390,27 @@ const aiStrategies = ref<StrategyOut[]>([])
 /** 保存后自动建分组中（避免重复点击） */
 const aiGroupCreating = ref(false)
 
-/** AI 策略分组名：AI-Augmentation-{用户名}-{MT5 登录号}-{品种}，与开仓分组命名保持同一套规则 */
-const aiGroupName = computed(() => aiGroupNameFor(currentSymbol.value))
-
-/** 按品种拼出 AI 分组名 */
-function aiGroupNameFor(symbol: string): string {
+/**
+ * 生成一个不会和现有分组名冲突的 AI 分组名。
+ * 基础名 = `AI-Augmentation-${username}-${login}-${symbol}`
+ * 若已存在，追加 `-2`、`-3` … 自增（最多试 1000 次）。
+ */
+function aiUniqueGroupName(symbol: string, existingGroups: GroupOut[]): string {
   if (!primaryNode.value) return ''
   const login = primaryNode.value.mt5_login ?? 'unknown'
   const username = auth.me?.username || 'unknown'
-  return `AI-Augmentation-${username}-${login}-${symbol}`
+  const base = `AI-Augmentation-${username}-${login}-${symbol}`
+  if (!existingGroups.find((g) => g.name === base)) {
+    return base
+  }
+  for (let n = 2; n <= 1000; n++) {
+    const candidate = `${base}-${n}`
+    if (!existingGroups.find((g) => g.name === candidate)) {
+      return candidate
+    }
+  }
+  // 不可能走到这里（1000 个同名分组），兜底用时间戳
+  return `${base}-${Date.now()}`
 }
 
 /** 打开 AI 策略配置弹窗（新建） */
@@ -459,13 +471,13 @@ async function onAiStrategySaved(
   await fetchAiStrategies()
   try {
     const nodeId = primaryNode.value?.node_id ?? ''
-    // 用策略自身的 symbol 拼分组名：编辑态下 currentSymbol 可能与策略品种不一致
-    const groupName = aiGroupNameFor(info.symbol)
+    const groups = await hub.listGroups()
+    // 取一个不会和现有分组名冲突的名称（若基础名已存在则追加 -2 / -3 …）
+    const groupName = aiUniqueGroupName(info.symbol, groups)
     if (!nodeId || !groupName) {
       ElMessage.warning('主节点未就绪，策略已保存但未能自动创建分组')
       return
     }
-    const groups = await hub.listGroups()
     let group = groups.find((g) => g.name === groupName) ?? null
     if (!group) {
       group = await hub.createGroup({
@@ -965,14 +977,14 @@ onBeforeUnmount(() => {
 .quote-sym-picker {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px;
-  margin-top: 4px;
+  gap: 8px;
+  margin-top: 8px;
 }
 .sym-chip {
-  padding: 4px 8px;
-  font-size: 11px;
-  font-weight: 600;
-  border-radius: 6px;
+  padding: 9px 16px;
+  font-size: 14px;
+  font-weight: 700;
+  border-radius: 8px;
   background: var(--glass);
   color: var(--muted);
   border: 1px solid var(--glass-border);
@@ -1038,7 +1050,7 @@ onBeforeUnmount(() => {
 .ai-panel-sym-chips {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 8px;
 }
 .ai-panel-btn { width: 100%; padding: 12px; font-size: 14px; font-weight: 600; }
 
