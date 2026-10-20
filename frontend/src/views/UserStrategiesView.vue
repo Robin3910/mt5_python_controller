@@ -8,6 +8,7 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
 import OrderDialog, { type OrderForm } from '../components/OrderDialog.vue'
+import StrategyFormModal from '@/components/StrategyFormModal.vue'
 import { useRouter } from 'vue-router'
 import { useHubStore } from '@/stores/hub'
 import { useAuthStore } from '@/stores/auth'
@@ -20,7 +21,11 @@ import type {
   NodeOut,
   PaginatedNodeDispatches,
   QuoteInfo,
+  StrategyOut,
 } from '@/api/types'
+
+/** AI 智能加仓策略模版 ID（与后端 strategy_templates.TEMPLATE_1_ID 对齐） */
+const TEMPLATE_1_ID = 'tpl_1'
 
 const hub = useHubStore()
 const auth = useAuthStore()
@@ -375,6 +380,119 @@ function closeDialog(): void {
   dialogVisible.value = false
 }
 
+// ───────────────────────── AI 智能加仓策略（tpl_1）─────────────────────────
+/** AI 策略配置弹窗可见性 */
+const aiFormVisible = ref(false)
+/** 编辑中的策略 ID；空 = 新建 */
+const aiFormId = ref('')
+/** 已配置的 AI 智能加仓策略（tpl_1） */
+const aiStrategies = ref<StrategyOut[]>([])
+/** 保存后自动建分组中（避免重复点击） */
+const aiGroupCreating = ref(false)
+
+/** AI 策略分组名：AI-Augmentation-{用户名}-{MT5 登录号}-{品种}，与开仓分组命名保持同一套规则 */
+const aiGroupName = computed(() => aiGroupNameFor(currentSymbol.value))
+
+/** 按品种拼出 AI 分组名 */
+function aiGroupNameFor(symbol: string): string {
+  if (!primaryNode.value) return ''
+  const login = primaryNode.value.mt5_login ?? 'unknown'
+  const username = auth.me?.username || 'unknown'
+  return `AI-Augmentation-${username}-${login}-${symbol}`
+}
+
+/** 打开 AI 策略配置弹窗（新建） */
+function openAiForm(): void {
+  aiFormId.value = ''
+  aiFormVisible.value = true
+}
+
+/** 打开 AI 策略配置弹窗（编辑已有策略） */
+function editAiForm(strategyId: string): void {
+  aiFormId.value = strategyId
+  aiFormVisible.value = true
+}
+
+/** 拉取当前用户可见的 AI 智能加仓策略（tpl_1），按品种归组展示 */
+async function fetchAiStrategies(): Promise<void> {
+  try {
+    await hub.fetchStrategies()
+    aiStrategies.value = (hub.strategies || []).filter((s) => s.template_id === TEMPLATE_1_ID)
+  } catch {
+    aiStrategies.value = []
+  }
+}
+
+/** 某个品种下已配置的 AI 策略（按创建时间倒序，最新的在前） */
+function aiStrategiesOfSymbol(symbol: string): StrategyOut[] {
+  return aiStrategies.value
+    .filter((s) => s.symbol === symbol)
+    .slice()
+    .sort((a, b) => b.created_at - a.created_at)
+}
+
+/** 当前品种下已配置的 AI 策略 */
+const symbolAiStrategies = computed(() => aiStrategiesOfSymbol(currentSymbol.value))
+
+/** 策略摘要：启用规则数 / 总规则数 */
+function aiStrategyRuleCount(s: StrategyOut): string {
+  const rules = s.rules || []
+  const enabled = rules.filter((r) => r.status === 1).length
+  return `${enabled} / ${rules.length}`
+}
+
+/** 切到 AI Tab 时拉取已配置的策略列表（编辑/新建共用同一份数据源） */
+watch(activeTab, (tab) => {
+  if (tab === 'ai') void fetchAiStrategies()
+})
+
+/**
+ * AI 策略保存成功后：按 (AI-Augmentation-用户名-MT5登录号-品种) 幂等创建分组，并把主节点加入、绑定该策略。
+ * 已有同名分组则复用（补绑策略 + 补齐主节点）。
+ */
+async function onAiStrategySaved(
+  info: { strategyId: string; name: string; symbol: string; templateId: string } | null | undefined,
+): Promise<void> {
+  if (!info) return
+  if (aiGroupCreating.value) return
+  aiGroupCreating.value = true
+  await fetchAiStrategies()
+  try {
+    const nodeId = primaryNode.value?.node_id ?? ''
+    // 用策略自身的 symbol 拼分组名：编辑态下 currentSymbol 可能与策略品种不一致
+    const groupName = aiGroupNameFor(info.symbol)
+    if (!nodeId || !groupName) {
+      ElMessage.warning('主节点未就绪，策略已保存但未能自动创建分组')
+      return
+    }
+    const groups = await hub.listGroups()
+    let group = groups.find((g) => g.name === groupName) ?? null
+    if (!group) {
+      group = await hub.createGroup({
+        name: groupName,
+        enabled: true,
+        node_ids: [nodeId],
+      })
+    }
+    // 分组已存在但可能没绑策略 / 没含主节点，补齐（失败不阻断保存）
+    if (group.strategy_id !== info.strategyId) {
+      await hub.updateGroup(group.group_id, { strategy_id: info.strategyId })
+    }
+    const memberIds = (group.nodes ?? []).map((n) => n.node_id)
+    if (!memberIds.includes(nodeId)) {
+      await hub.updateGroup(group.group_id, { node_ids: [...memberIds, nodeId] })
+    }
+    ElMessage.success(`AI 策略「${info.name}」已保存，并已创建分组「${groupName}」`)
+  } catch (e) {
+    const err = e as { response?: { data?: { detail?: string } }; message?: string }
+    ElMessage.warning(
+      `策略已保存，但自动创建分组失败：${err?.response?.data?.detail || err?.message || '未知错误'}`,
+    )
+  } finally {
+    aiGroupCreating.value = false
+  }
+}
+
 async function submit(): Promise<void> {
   if (!primaryNode.value) return
   submitting.value = true
@@ -578,10 +696,63 @@ onBeforeUnmount(() => {
 
       <!-- AI 交易 Tab（仅有权限者可见） -->
       <template v-else-if="activeTab === 'ai'">
-        <div class="ai-placeholder card card-pad">
-          <div class="ai-placeholder-icon">🤖</div>
-          <div class="ai-placeholder-title">AI 交易</div>
-          <div class="ai-placeholder-desc">AI 智能加仓策略配置入口，后续版本开放</div>
+        <div class="ai-panel card card-pad">
+          <div class="ai-panel-head">
+            <div class="ai-panel-title">AI 智能加仓策略</div>
+            <!-- <div class="ai-panel-sub">
+              选择品种并配置加仓参数，保存后自动创建分组「{{ aiGroupName }}」并把你的主节点加入
+            </div> -->
+          </div>
+
+          <!-- <div class="ai-panel-sym">
+            <span class="ai-panel-sym-label">目标品种</span>
+            <div class="ai-panel-sym-chips">
+              <button
+                v-for="sym in availableSymbols"
+                :key="sym"
+                class="sym-chip"
+                :class="{ active: currentSymbol === sym }"
+                @click="pickSymbol(sym)"
+              >{{ sym }}</button>
+            </div>
+            <span v-if="!availableSymbols.length" class="muted" style="font-size: 12px">
+              主节点尚未上报任何品种报价
+            </span>
+          </div> -->
+
+          <!-- 该品种下已配置的 AI 策略：可点「编辑」改参数 -->
+          <div v-if="symbolAiStrategies.length" class="ai-strategy-list">
+            <div class="ai-list-head">
+              <span>{{ currentSymbol }} 已配置策略</span>
+              <span class="muted">{{ symbolAiStrategies.length }} 个</span>
+            </div>
+            <div v-for="s in symbolAiStrategies" :key="s.strategy_id" class="ai-strategy-item">
+              <div class="ai-item-main">
+                <div class="ai-item-name">{{ s.name }}</div>
+                <div class="ai-item-meta">
+                  <span class="ai-item-tag">{{ s.template_name }}</span>
+                  <span class="ai-item-tag">规则 {{ aiStrategyRuleCount(s) }}</span>
+                  <span class="ai-item-tag" :class="{ off: !s.enabled }">
+                    {{ s.enabled ? '已启用' : '已停用' }}
+                  </span>
+                </div>
+              </div>
+              <button class="ai-item-edit" :disabled="aiGroupCreating" @click="editAiForm(s.strategy_id)">
+                编辑
+              </button>
+            </div>
+          </div>
+          <div v-else class="ai-list-empty">
+            {{ currentSymbol }} 尚未配置 AI 策略，点击下方按钮开始配置
+          </div>
+
+          <button
+            class="btn-primary ai-panel-btn"
+            :disabled="aiGroupCreating || !availableSymbols.length"
+            @click="openAiForm"
+          >
+            {{ aiGroupCreating ? '处理中…' : symbolAiStrategies.length ? '新增 AI 策略' : '配置 AI 策略' }}
+          </button>
         </div>
       </template>
 
@@ -602,6 +773,17 @@ onBeforeUnmount(() => {
       @update:form="(v) => Object.assign(form, v)"
       @submit="submit"
       @cancel="closeDialog"
+    />
+
+    <!-- AI 智能加仓策略配置弹窗：保存后自动建分组 + 绑定主节点 -->
+    <StrategyFormModal
+      v-model="aiFormVisible"
+      :mode="aiFormId ? 'edit' : 'create'"
+      :strategy-id="aiFormId"
+      preset-template-id="tpl_1"
+      :preset-symbol="currentSymbol"
+      :preset-symbol-locked="true"
+      @saved="onAiStrategySaved"
     />
   </div>
 </template>
@@ -842,20 +1024,91 @@ onBeforeUnmount(() => {
   color: var(--primary);
 }
 
-/* ── AI 交易占位 ── */
-.ai-placeholder {
+/* ── AI 交易面板 ── */
+.ai-panel {
   display: flex;
   flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  margin-top: 8px;
-  padding: 40px 20px;
-  text-align: center;
+  gap: 14px;
 }
-.ai-placeholder-icon { font-size: 32px; line-height: 1; }
-.ai-placeholder-title { font-size: 15px; font-weight: 700; color: var(--text); }
-.ai-placeholder-desc { font-size: 12px; color: var(--muted); }
+.ai-panel-head { display: flex; flex-direction: column; gap: 4px; }
+.ai-panel-title { font-size: 15px; font-weight: 700; color: var(--text); }
+.ai-panel-sub { font-size: 12px; color: var(--muted); line-height: 1.6; }
+.ai-panel-sym { display: flex; flex-direction: column; gap: 8px; }
+.ai-panel-sym-label { font-size: 12px; color: var(--muted); }
+.ai-panel-sym-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.ai-panel-btn { width: 100%; padding: 12px; font-size: 14px; font-weight: 600; }
+
+/* ── 已配置 AI 策略列表 ── */
+.ai-strategy-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.ai-list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--muted);
+}
+.ai-strategy-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  background: var(--panel-2, rgba(255, 255, 255, 0.03));
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.ai-item-main { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.ai-item-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ai-item-meta { display: flex; flex-wrap: wrap; gap: 6px; }
+.ai-item-tag {
+  padding: 2px 7px;
+  font-size: 11px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  line-height: 1.4;
+}
+.ai-item-tag.off { color: var(--muted); opacity: 0.75; }
+.ai-item-edit {
+  flex-shrink: 0;
+  padding: 6px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent, #60a5fa);
+  background: rgba(96, 165, 250, 0.1);
+  border: 1px solid rgba(96, 165, 250, 0.28);
+  border-radius: 7px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, transform 0.1s;
+}
+.ai-item-edit:hover { background: rgba(96, 165, 250, 0.2); border-color: rgba(96, 165, 250, 0.5); }
+.ai-item-edit:active { transform: translateY(1px); }
+.ai-item-edit:disabled { cursor: not-allowed; opacity: 0.6; }
+.ai-list-empty {
+  padding: 14px;
+  font-size: 12px;
+  color: var(--muted);
+  text-align: center;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+}
 
 .action-bar {
   position: sticky;

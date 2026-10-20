@@ -854,9 +854,9 @@ async function closeTicket(ticket: number): Promise<void> {
                 <span class="muted" style="font-size: 12px">盈亏金额 &gt;=</span>
                 <input v-model.number="tier.pl_amount" type="number" step="1" class="risk-ratio-input" />
               </div>
-              <p class="muted" style="font-size: 12px; margin: 8px 0 0">
+              <!-- <p class="muted" style="font-size: 12px; margin: 8px 0 0">
                 按所选方向统计总手数与浮盈亏；负的盈亏金额表示亏损侧达阈值。优先匹配更高批次。
-              </p>
+              </p> -->
             </div>
           </div>
 

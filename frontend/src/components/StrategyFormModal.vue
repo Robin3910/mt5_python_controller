@@ -40,17 +40,30 @@ const props = withDefaults(
     listSearchOptions?: { q?: string }
     /** 从分组列表「编辑策略」进入时传入；有值才显示触发信号 */
     triggerGroup?: { group_id: string; name: string } | null
+    /** 锁定策略模版（新建时预选并禁用模版选择）。用于「AI 交易」入口只做 tpl_1。 */
+    presetTemplateId?: string
+    /** 预填绑定品种（新建时）。配合 presetSymbolLocked 可锁定品种输入 */
+    presetSymbol?: string
+    /** 锁定品种输入框（品种由调用方决定，如跟随当前选中品种） */
+    presetSymbolLocked?: boolean
   }>(),
   {
     strategyId: '',
     listSearchOptions: () => ({}),
     triggerGroup: null,
+    presetTemplateId: '',
+    presetSymbol: '',
+    presetSymbolLocked: false,
   },
 )
 
 const emit = defineEmits<{
   'update:modelValue': [value: boolean]
-  saved: []
+  /**
+   * 保存成功。payload 为 null 表示关闭时未保存（保留旧签名兼容）。
+   * 携带创建/更新后的策略信息，便于调用方自动建分组并绑定主节点。
+   */
+  saved: [payload?: { strategyId: string; name: string; symbol: string; templateId: string } | null]
 }>()
 
 /** ATR / 波幅统计的已收盘 K 线根数，与后端 BATCH_BAR_PERIOD 一致，固定不可配 */
@@ -97,6 +110,8 @@ function resetSignalDraft(symbol: string): void {
 }
 
 const isEditMode = computed(() => props.mode === 'edit')
+/** 锁定模版标识（模板里用于禁用模版选择器） */
+const presetTemplateId = computed(() => props.presetTemplateId)
 
 const selectedTemplate = computed(() =>
   templates.value.find((t) => t.template_id === form.template_id) || null,
@@ -850,9 +865,10 @@ function loadRulesFromTemplate(templateId: string): void {
 function resetCreateForm(): void {
   editingTemplateName.value = ''
   formError.value = ''
-  form.template_id = templates.value[0]?.template_id || ''
+  // presetTemplateId 优先（AI 交易入口锁定 tpl_1），否则默认第一个模版
+  form.template_id = props.presetTemplateId || templates.value[0]?.template_id || ''
   form.name = ''
-  form.symbol = ''
+  form.symbol = props.presetSymbol
   loadRulesFromTemplate(form.template_id)
 }
 
@@ -1409,17 +1425,26 @@ function prepareStrategy(): PreparedStrategy | null {
   return { name, symbol, rules }
 }
 
-async function writeStrategy(prepared: PreparedStrategy): Promise<boolean> {
+async function writeStrategy(
+  prepared: PreparedStrategy,
+): Promise<{ strategyId: string; name: string; symbol: string; templateId: string } | null> {
   const actionLabel = isEditMode.value ? '保存' : '创建'
   try {
     if (isEditMode.value) {
+      const sid = props.strategyId || ''
       await hub.updateStrategy(
-        props.strategyId || '',
+        sid,
         { name: prepared.name, symbol: prepared.symbol, rules: prepared.rules },
         props.listSearchOptions,
       )
+      return {
+        strategyId: sid,
+        name: prepared.name,
+        symbol: prepared.symbol,
+        templateId: form.template_id,
+      }
     } else {
-      await hub.createStrategy(
+      const created = await hub.createStrategy(
         {
           template_id: form.template_id,
           name: prepared.name,
@@ -1428,11 +1453,16 @@ async function writeStrategy(prepared: PreparedStrategy): Promise<boolean> {
         },
         props.listSearchOptions,
       )
+      return {
+        strategyId: created.strategy_id,
+        name: prepared.name,
+        symbol: prepared.symbol,
+        templateId: form.template_id,
+      }
     }
-    return true
   } catch (e: unknown) {
     showSaveError(formatSaveError(e, `${actionLabel}失败，请稍后重试`), 'error')
-    return false
+    return null
   }
 }
 
@@ -1443,7 +1473,7 @@ async function save(): Promise<void> {
   formError.value = ''
   try {
     const tplName = formTemplateLabel.value
-    const enabledCount = form.rules.filter((r) => r.status === 1).length
+  const enabledCount = form.rules.filter((r) => r.status === 1).length
     const actionLabel = isEditMode.value ? '保存' : '创建'
     if (
       !(await confirmAction(
@@ -1452,8 +1482,9 @@ async function save(): Promise<void> {
     ) {
       return
     }
-    if (!(await writeStrategy(prepared))) return
-    emit('saved')
+    const written = await writeStrategy(prepared)
+    if (!written) return
+    emit('saved', written)
     close()
   } finally {
     saving.value = false
@@ -1574,13 +1605,13 @@ function resetRuleToTemplate(idx: number): void {
     <div class="card modal modal-lg strategy-form-modal">
       <div class="modal-header card-pad" style="padding-bottom: 0">
         <div class="h1">{{ isEditMode ? '编辑策略' : '新增策略' }}</div>
-        <p class="muted" style="font-size: 12px; margin: 4px 0 0">
+        <!-- <p class="muted" style="font-size: 12px; margin: 4px 0 0">
           {{
             isEditMode
               ? '可修改名称、绑定品种与规则参数；模版创建后不可更换'
               : '选择策略模版 → 填写名称 / 品种 → 自定义规则参数后创建'
           }}
-        </p>
+        </p> -->
       </div>
 
       <div class="modal-body card-pad" style="padding-top: 16px">
@@ -1598,7 +1629,7 @@ function resetRuleToTemplate(idx: number): void {
               id="strategy-template"
               v-model="form.template_id"
               :options="templateTagOptions"
-              :disabled="isEditMode"
+              :disabled="isEditMode || !!presetTemplateId"
               aria-label="策略模版"
             />
             <p v-if="selectedTemplate" class="muted" style="font-size: 12px; margin-top: 6px">
@@ -1622,6 +1653,7 @@ function resetRuleToTemplate(idx: number): void {
               type="text"
               maxlength="32"
               placeholder="例如：XAUUSD"
+              :readonly="presetSymbolLocked"
               style="text-transform: uppercase"
             />
           </div>
@@ -1630,52 +1662,122 @@ function resetRuleToTemplate(idx: number): void {
         <div v-if="isTpl1" class="signal-pl-editor">
           <div class="rules-editor-head">
             <FormLabel text="信号盈亏控制" :help="FIELD_HELP.signal_pl" />
-            <span class="muted" style="font-size: 12px">每个信号独立监控，触发只平该信号仓</span>
+            <!-- <span class="muted" style="font-size: 12px">每个信号独立监控，触发只平该信号仓</span> -->
           </div>
           <div class="signal-pl-rules">
-            <div class="signal-pl-row">
-              <label class="signal-pl-switch">
-                <input v-model="signalPl.float_pl_ratio.enabled" type="checkbox" />
-                <span>信号盈亏比</span>
-              </label>
-              <input v-model.number="signalPl.float_pl_ratio.ratio" type="number" step="0.1" class="signal-pl-num" />
-              <span class="muted" style="font-size: 13px">% ，清仓该信号全部</span>
-              <TagSelect v-model="signalPl.float_pl_ratio.monitor_mode" :options="MONITOR_MODE_TAGS" aria-label="监控方式" />
-              <template v-if="signalPl.float_pl_ratio.monitor_mode === 'times'">
-                <input v-model.number="signalPl.float_pl_ratio.max_times" type="number" min="1" class="signal-pl-times" />
-                <span class="muted" style="font-size: 12px">次</span>
-              </template>
+            <div class="signal-pl-card">
+              <div class="signal-pl-head">
+                <label class="signal-pl-switch">
+                  <input v-model="signalPl.float_pl_ratio.enabled" type="checkbox" />
+                  <span>信号盈亏比</span>
+                </label>
+                <span v-if="signalPl.float_pl_ratio.enabled" class="muted signal-pl-count">
+                  {{ signalPl.float_pl_ratio.monitor_mode === 'times'
+                    ? `触发 ${signalPl.float_pl_ratio.max_times} 次后停止`
+                    : '循环监控' }}
+                </span>
+              </div>
+              <div v-if="signalPl.float_pl_ratio.enabled" class="signal-pl-fields">
+                <div class="field">
+                  <FormLabel text="盈亏比例 %" :help="FIELD_HELP.signal_float_pl" />
+                  <input
+                    v-model.number="signalPl.float_pl_ratio.ratio"
+                    type="number"
+                    step="0.1"
+                    class="signal-pl-num"
+                    aria-label="信号盈亏比例"
+                  />
+                </div>
+                <div class="field">
+                  <FormLabel text="监控方式" :help="FIELD_HELP.signal_float_pl" />
+                  <TagSelect
+                    v-model="signalPl.float_pl_ratio.monitor_mode"
+                    :options="MONITOR_MODE_TAGS"
+                    aria-label="监控方式"
+                  />
+                </div>
+                <div v-if="signalPl.float_pl_ratio.monitor_mode === 'times'" class="field">
+                  <FormLabel text="指定次数" :help="FIELD_HELP.signal_float_pl" />
+                  <input
+                    v-model.number="signalPl.float_pl_ratio.max_times"
+                    type="number"
+                    min="1"
+                    class="signal-pl-times"
+                    aria-label="指定次数"
+                  />
+                </div>
+              </div>
+              <p v-else class="signal-pl-off">
+                关闭状态：该信号不按盈亏比自动平仓，下方「分档手数盈亏」仍独立生效
+              </p>
             </div>
-            <div class="signal-pl-block">
-              <div class="signal-pl-row signal-pl-row-wrap">
+
+            <div class="signal-pl-card">
+              <div class="signal-pl-head">
                 <label class="signal-pl-switch">
                   <input v-model="signalPl.lot_pl_tiers.enabled" type="checkbox" />
                   <span>分档手数盈亏</span>
                 </label>
-                <span class="muted" style="font-size: 12px">批次</span>
-                <input
-                  v-model.number="signalPl.lot_pl_tiers.batch_count"
-                  type="number"
-                  min="1"
-                  max="10"
-                  class="signal-pl-times"
-                />
-                <TagSelect v-model="signalPl.lot_pl_tiers.close_action" :options="SIDE_ACTION_TAGS" aria-label="平仓方向" />
+                <span v-if="signalPl.lot_pl_tiers.enabled" class="muted signal-pl-count">
+                  {{ signalPl.lot_pl_tiers.batch_count }} 档 · {{ signalPl.lot_pl_tiers.tiers.length }} 条
+                </span>
               </div>
-              <div
-                v-for="(tier, idx) in signalPl.lot_pl_tiers.tiers"
-                :key="idx"
-                class="signal-pl-row"
-                style="margin-top: 8px"
-              >
-                <span class="muted" style="font-size: 12px; min-width: 52px">批次{{ idx + 1 }}</span>
-                <span class="muted" style="font-size: 12px">总 lot &gt;=</span>
-                <input v-model.number="tier.min_lot" type="number" min="0" step="0.01" class="signal-pl-num" />
-                <span class="muted" style="font-size: 12px">盈亏金额 &gt;=</span>
-                <input v-model.number="tier.pl_amount" type="number" step="1" class="signal-pl-num" />
-              </div>
-              <p class="muted" style="font-size: 12px; margin: 8px 0 0">
-                按所选方向统计该信号总手数与浮盈亏；负的盈亏金额表示亏损侧达阈值。优先匹配更高批次。
+
+              <template v-if="signalPl.lot_pl_tiers.enabled">
+                <div class="signal-pl-fields">
+                  <div class="field">
+                    <FormLabel text="批次数" :help="FIELD_HELP.signal_lot_pl" />
+                    <input
+                      v-model.number="signalPl.lot_pl_tiers.batch_count"
+                      type="number"
+                      min="1"
+                      max="10"
+                      class="signal-pl-times"
+                      aria-label="批次数"
+                    />
+                  </div>
+                  <div class="field">
+                    <FormLabel text="平仓方向" :help="FIELD_HELP.signal_lot_pl" />
+                    <TagSelect
+                      v-model="signalPl.lot_pl_tiers.close_action"
+                      :options="SIDE_ACTION_TAGS"
+                      aria-label="平仓方向"
+                    />
+                  </div>
+                </div>
+
+                <div class="signal-pl-tiers">
+                  <div v-for="(tier, idx) in signalPl.lot_pl_tiers.tiers" :key="idx" class="signal-pl-tier">
+                    <span class="signal-pl-tier-no">批次 {{ idx + 1 }}</span>
+                    <div class="field">
+                      <FormLabel text="总 lot >=" :help="FIELD_HELP.signal_lot_pl" />
+                      <input
+                        v-model.number="tier.min_lot"
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        class="signal-pl-num"
+                        :aria-label="`批次${idx + 1} 总手数阈值`"
+                      />
+                    </div>
+                    <div class="field">
+                      <FormLabel text="盈亏金额 >=" :help="FIELD_HELP.signal_lot_pl" />
+                      <input
+                        v-model.number="tier.pl_amount"
+                        type="number"
+                        step="1"
+                        class="signal-pl-num"
+                        :aria-label="`批次${idx + 1} 盈亏金额阈值`"
+                      />
+                    </div>
+                  </div>
+                  <p class="signal-pl-note">
+                    按所选方向统计该信号总手数与浮盈亏；负的盈亏金额表示亏损侧达阈值。优先匹配更高批次。
+                  </p>
+                </div>
+              </template>
+              <p v-else class="signal-pl-off">
+                关闭状态：不按手数分批平仓，上方「信号盈亏比」仍独立生效
               </p>
             </div>
           </div>
@@ -2288,7 +2390,11 @@ function resetRuleToTemplate(idx: number): void {
 
                   <div class="batch-levels">
                     <div v-for="(lv, li) in r.batch_levels" :key="li" class="batch-level">
-                      <span class="batch-level-no">└{{ li + 1 }}</span>
+                      <span class="batch-level-no">
+                        <span class="lv-mark">└{{ li + 1 }}</span>
+                        <span class="lv-name">第 {{ li + 1 }} 档</span>
+                        <span class="lv-sub">{{ lv.pos_from }}~{{ lv.pos_to }} 次</span>
+                      </span>
                       <div class="field batch-range">
                         <FormLabel
                           :field-id="`rule-${idx}-lv-${li}-from`"
@@ -2411,7 +2517,11 @@ function resetRuleToTemplate(idx: number): void {
                       </div>
                     </div>
                     <div v-if="r.manual_scatter.enabled" class="batch-level is-manual">
-                      <span class="batch-level-no">└{{ manualScatterLevelNo(r) }}</span>
+                      <span class="batch-level-no">
+                        <span class="lv-mark">└{{ manualScatterLevelNo(r) }}</span>
+                        <span class="lv-name">手动分散仓</span>
+                        <span class="lv-sub">第 {{ manualScatterPos(r) }} 笔</span>
+                      </span>
                       <div class="field batch-range">
                         <FormLabel
                           :field-id="`rule-${idx}-ms-pos`"
@@ -2533,18 +2643,22 @@ function resetRuleToTemplate(idx: number): void {
                       手动单
                     </button>
                   </div>
-                  <p class="rule-hint">
+                  <!-- <p class="rule-hint">
                     改批数、加仓笔数或添加 / 删除档位，都会按第 {{ BATCH_POS_START }} 次 ~ 第 {{ Math.floor(r.total_lot_limit) }} 次加仓重切区间；
                     手改某一档加仓次数时，相邻档会首尾衔接。
                     每档间距可独立选点数 / 指定价 / ATR / 波幅，ATR 与波幅取该周期最近 {{ BATCH_BAR_PERIOD }} 根已收盘 K 线
                     <template v-if="r.manual_scatter.enabled">
                       ；手动分散仓展示为第 {{ manualScatterPos(r) }} 笔，不参与切档
-                    </template>
-                  </p>
+                  </template>
+                  </p> -->
                 </template>
                 <div v-else-if="r.manual_scatter.enabled" class="batch-levels">
                   <div class="batch-level is-manual">
-                    <span class="batch-level-no">└{{ manualScatterLevelNo(r) }}</span>
+                    <span class="batch-level-no">
+                      <span class="lv-mark">└{{ manualScatterLevelNo(r) }}</span>
+                      <span class="lv-name">手动分散仓</span>
+                      <span class="lv-sub">第 {{ manualScatterPos(r) }} 笔</span>
+                    </span>
                     <div class="field batch-range">
                       <FormLabel
                         :field-id="`rule-${idx}-ms-pos`"
@@ -3020,9 +3134,16 @@ function resetRuleToTemplate(idx: number): void {
     grid-template-columns: 1fr 1fr;
     max-width: none;
   }
+  /* 档位横向表格在窄屏必然挤成一团，改为整块卡片 */
   .batch-level,
   .batch-level.is-manual {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px 12px;
+    padding: 12px 14px;
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    background: rgba(255, 255, 255, 0.02);
+    align-items: start;
   }
   .batch-level-no {
     grid-column: 1 / -1;
@@ -3033,6 +3154,16 @@ function resetRuleToTemplate(idx: number): void {
     padding-bottom: 0;
     justify-content: flex-end;
   }
+  /* 间距类字段占满整行，标签不再与输入框错位 */
+  .batch-level .field {
+    min-width: 0;
+  }
+  .batch-level :deep(.form-label-row) {
+    white-space: normal;
+  }
+  .batch-level :deep(.tag-select) {
+    gap: 6px;
+  }
 }
 
 @media (max-width: 768px) {
@@ -3042,19 +3173,227 @@ function resetRuleToTemplate(idx: number): void {
     max-height: calc(100dvh - 24px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
     border-radius: 16px;
   }
-  .rule-grid {
-    grid-template-columns: 1fr 1fr;
-  }
   .rules-editor-head {
     flex-wrap: wrap;
+  }
+
+  /* ── 手机端：单列 + 更舒展的纵向间距，避免两列挤压 ── */
+  .rule-grid {
+    grid-template-columns: 1fr;
+    gap: 12px;
   }
   .batch-top-grid {
     grid-template-columns: 1fr;
     max-width: none;
+    gap: 12px;
+  }
+
+  /* 规则面板收紧内边距，把空间留给字段 */
+  .rule-panel {
+    padding: 12px 12px;
+    margin-bottom: 10px;
+  }
+  .rule-panel-head {
+    flex-wrap: wrap;
+    gap: 8px 10px;
+    margin-bottom: 10px;
+  }
+  .rule-title-wrap {
+    min-width: 0;
+  }
+  .rule-title-label :deep(.form-label-row) {
+    white-space: normal;
+  }
+  /* 「启用 + 恢复默认」独占一行，不再和标题挤在一起 */
+  .rule-panel-actions {
+    width: 100%;
+    justify-content: space-between;
+    padding-top: 8px;
+    border-top: 1px dashed var(--glass-border);
+  }
+
+  /* ── 档位卡片：表头行 + 字段网格 ── */
+  .batch-block {
+    margin-top: 12px;
+    padding-top: 10px;
+  }
+  .batch-head {
+    flex-wrap: wrap;
+    gap: 8px 10px;
+  }
+  .batch-levels {
+    gap: 12px;
   }
   .batch-level,
   .batch-level.is-manual {
+    grid-template-columns: 1fr;
+    gap: 12px;
+    padding: 12px;
+    border-radius: var(--radius-sm);
+  }
+  /* 加仓次数（起~止）单独占一行，读起来是「第 1~3 次」而不是两列裸输入框 */
+  .batch-level .batch-range {
+    grid-column: 1 / -1;
+  }
+  .batch-range-inputs {
+    gap: 8px;
+  }
+  .batch-range-inputs input {
+    padding: 10px;
+    text-align: center;
+  }
+  /* 档位标题行：└1 第 1 档 1~3 次 */
+  .batch-level-no {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 8px;
+    width: 100%;
+    padding-bottom: 10px;
+    margin-bottom: 2px;
+    border-bottom: 1px dashed var(--glass-border);
+    font-size: 12px;
+  }
+  .batch-level-no .lv-name {
+    color: var(--text);
+    font-weight: 600;
+  }
+  .batch-level-no .lv-sub {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--muted);
+  }
+  .batch-level-no .lv-mark {
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  /* 关键参数（点数 / 倍数 / 手数）并排三列，减少纵向滚动 */
+  .batch-level-actions {
+    justify-content: stretch;
+  }
+  .batch-level-actions .btn-sm {
+    flex: 1;
+    min-height: 40px;
+  }
+  .batch-level-add {
+    display: grid;
     grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+  .batch-level-add .btn-sm {
+    min-height: 40px;
+  }
+
+  /* ── 触控目标放大到接近 44px ── */
+  .rule-grid input,
+  .rule-grid select,
+  .batch-top-grid input,
+  .batch-top-grid select,
+  .batch-level input,
+  .batch-level select {
+    min-height: 42px;
+    font-size: 15px; /* 防止 iOS 聚焦时自动放大页面 */
+  }
+  .rule-grid :deep(.form-label-row),
+  .batch-top-grid :deep(.form-label-row),
+  .batch-level :deep(.form-label-row) {
+    white-space: normal;
+    font-size: 12px;
+  }
+  .rule-grid :deep(.tag-select),
+  .batch-top-grid :deep(.tag-select),
+  .batch-level :deep(.tag-select) {
+    gap: 8px;
+  }
+  /* 单选标签铺满整行，点击区域更宽 */
+  .rule-grid :deep(.tag-select-item),
+  .batch-top-grid :deep(.tag-select-item),
+  .batch-level :deep(.tag-select-item) {
+    flex: 1 1 auto;
+    justify-content: center;
+    min-height: 40px;
+    padding: 8px 10px;
+    font-size: 13px;
+  }
+  /* 帮助图标：放大到 24px（WCAG 2.5.8 最小目标尺寸），不撑高标签行 */
+  .field-help-btn {
+    width: 24px;
+    height: 24px;
+    font-size: 12px;
+  }
+  .rule-enable-wrap {
+    gap: 10px;
+  }
+  .rule-enable-wrap input[type='checkbox'] {
+    width: 20px;
+    height: 20px;
+  }
+  .manual-link-switch {
+    min-height: 42px;
+    white-space: normal;
+    font-size: 13px;
+  }
+
+  /* ── 帮助气泡：单列布局下铺满字段宽度，长文自动换行 ──
+     注意：这里不能用 position: fixed —— 外层 .card 带 backdrop-filter，
+     会成为 fixed 的包含块，气泡会锚到卡片底部而不是视口，跑到看不见的地方。 */
+  .rule-grid :deep(.field-help-popover),
+  .batch-top-grid :deep(.field-help-popover),
+  .batch-level :deep(.field-help-popover) {
+    position: absolute;
+    top: auto;
+    left: 0;
+    right: 0;
+    min-width: 0;
+    max-width: none;
+    white-space: normal;
+    line-height: 1.6;
+  }
+
+  /* 提示文案在窄屏放宽行距，长公式不再挤成一行 */
+  .rule-hint {
+    font-size: 12px;
+    line-height: 1.65;
+  }
+  .batch-count-hint,
+  .batch-split-hint {
+    font-size: 12px;
+  }
+
+  /* 信号盈亏控制的专属样式见文件末尾（随新结构一起定义） */
+}
+
+/* 超窄屏（iPhone SE / 小屏安卓）：再降一档密度 */
+@media (max-width: 400px) {
+  .rule-panel {
+    padding: 10px;
+  }
+  .rule-grid,
+  .batch-top-grid,
+  .batch-level,
+  .batch-level.is-manual {
+    gap: 10px;
+  }
+  .batch-level,
+  .batch-level.is-manual {
+    padding: 10px;
+  }
+  .batch-range-inputs {
+    gap: 6px;
+  }
+  .rule-panel-actions {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+  }
+  .rule-enable-wrap {
+    justify-content: space-between;
+  }
+  .batch-level-add {
+    grid-template-columns: 1fr;
+  }
+  .rule-title-label :deep(.form-label-row) {
+    font-size: 13px;
   }
 }
 
@@ -3068,21 +3407,27 @@ function resetRuleToTemplate(idx: number): void {
   gap: 10px;
 }
 
-.signal-pl-row {
+/* ── 信号盈亏控制（仅 AI 智能加仓模版） ── */
+.signal-pl-rules {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px 10px;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* 两块功能各自成卡，开关行固定在顶部，展开区不再和开关挤在一行 */
+.signal-pl-card {
   padding: 12px 14px;
   border-radius: var(--radius-sm);
   background: var(--bg-soft);
   border: 1px solid var(--glass-border);
 }
 
-.signal-pl-row-wrap {
-  padding: 0;
-  border: none;
-  background: transparent;
+.signal-pl-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 24px;
 }
 
 .signal-pl-switch {
@@ -3091,19 +3436,188 @@ function resetRuleToTemplate(idx: number): void {
   gap: 8px;
   font-size: 13px;
   font-weight: 600;
+  color: var(--text);
   cursor: pointer;
   user-select: none;
 }
 
-.signal-pl-num,
-.signal-pl-times {
-  width: 88px;
+.signal-pl-switch input[type='checkbox'] {
+  width: 18px;
+  height: 18px;
+  margin: 0;
 }
 
-.signal-pl-block {
-  padding: 12px 14px;
+.signal-pl-count {
+  font-size: 12px;
+}
+
+/* 字段网格：桌面三列 / 平板两列 / 手机单列 */
+.signal-pl-fields {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px 12px;
+  align-items: start;
+  margin-top: 12px;
+}
+
+.signal-pl-fields .field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.signal-pl-fields .field :deep(.form-label-wrap) {
+  margin-bottom: 0;
+}
+
+.signal-pl-fields .field :deep(.form-label-row) {
+  white-space: nowrap;
+}
+
+.signal-pl-fields :deep(.field-help-popover) {
+  position: absolute;
+  z-index: 5;
+  left: 0;
+  right: auto;
+  min-width: 220px;
+  max-width: min(320px, 70vw);
+}
+
+.signal-pl-num,
+.signal-pl-times {
+  width: 100%;
+  min-width: 0;
+}
+
+/* 档位区：每条一行，等宽两列 + 批次号 */
+.signal-pl-tiers {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--glass-border);
+}
+
+.signal-pl-tier {
+  display: grid;
+  grid-template-columns: 64px repeat(2, minmax(0, 1fr));
+  gap: 10px 12px;
+  align-items: start;
+}
+
+.signal-pl-tier-no {
+  display: inline-flex;
+  align-items: center;
+  min-height: 38px;
+  padding: 0 8px;
   border-radius: var(--radius-sm);
-  background: var(--bg-soft);
+  background: var(--glass);
   border: 1px solid var(--glass-border);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.signal-pl-tier .field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.signal-pl-tier .field :deep(.form-label-wrap) {
+  margin-bottom: 0;
+}
+
+.signal-pl-tier .field :deep(.form-label-row) {
+  white-space: nowrap;
+}
+
+.signal-pl-tier :deep(.field-help-popover) {
+  position: absolute;
+  z-index: 5;
+  left: 0;
+  right: auto;
+  min-width: 220px;
+  max-width: min(320px, 70vw);
+}
+
+.signal-pl-note,
+.signal-pl-off {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+.signal-pl-off {
+  margin-top: 8px;
+}
+
+/* 手机端：全部单列，避免标签和输入框被挤成两栏 */
+@media (max-width: 768px) {
+  .signal-pl-fields {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+  .signal-pl-card {
+    padding: 12px;
+  }
+  .signal-pl-tier {
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    padding: 10px;
+    border-radius: var(--radius-sm);
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid var(--glass-border);
+  }
+  /* 批次号独占一行，作为该档的标题 */
+  .signal-pl-tier-no {
+    grid-column: 1 / -1;
+    min-height: 28px;
+    justify-content: center;
+  }
+  .signal-pl-fields input,
+  .signal-pl-tier input {
+    min-height: 42px;
+    font-size: 15px; /* 防止 iOS 聚焦时自动放大页面 */
+  }
+  .signal-pl-switch input[type='checkbox'] {
+    width: 20px;
+    height: 20px;
+  }
+  .signal-pl-fields :deep(.form-label-row),
+  .signal-pl-tier :deep(.form-label-row) {
+    white-space: normal;
+  }
+  .signal-pl-fields :deep(.tag-select-item) {
+    flex: 1 1 auto;
+    justify-content: center;
+    min-height: 40px;
+  }
+  /* 单列下帮助气泡铺满字段宽度，长文自动换行。
+     不能用 position: fixed —— 外层 .card 带 backdrop-filter，
+     会成为 fixed 的包含块，气泡会锚到卡片底部而跑出视口。 */
+  .signal-pl-fields :deep(.field-help-popover),
+  .signal-pl-tier :deep(.field-help-popover) {
+    position: absolute;
+    top: auto;
+    left: 0;
+    right: 0;
+    min-width: 0;
+    max-width: none;
+    white-space: normal;
+    line-height: 1.6;
+  }
+}
+
+@media (max-width: 400px) {
+  .signal-pl-tier {
+    grid-template-columns: 1fr;
+  }
 }
 </style>

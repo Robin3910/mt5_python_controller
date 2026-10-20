@@ -95,10 +95,15 @@ function findCurrentPrimaryId(excludeId: string): string | null {
 }
 
 /** 把卡片操作菜单内的「主节点」开关切换走完整流程：
- *  预查 in-flight → 命中阻塞直接禁提交 / 改文案 → 二次确认 → 调用 store → 处理 409 / 通用错误。 */
+ *  预查 in-flight → 命中阻塞直接禁提交 / 改文案 → 二次确认 → 调用 store → 处理 409 / 通用错误。
+ *
+ *  客户（普通用户）只能「设置为主节点」：菜单里不渲染取消入口，函数入口再兜一层，
+ *  避免将来别处复用时把取消能力漏给客户——主节点一旦被清空，交易页会直接退化成
+ *  「尚未设置主节点」空态，客户自己也无法在页面上恢复。 */
 async function togglePrimary(n: NodeOut): Promise<void> {
   closeNodeMenu()
   const next = !n.is_primary
+  if (!next && !auth.isAdmin) return
 
   // 阶段 0 预查：旧主节点在跑任务时直接弹阻塞弹窗，不进入二次确认
   const victimId = next ? findCurrentPrimaryId(n.node_id) : n.is_primary ? n.node_id : null
@@ -441,7 +446,9 @@ async function closeNodeAll(n: NodeOut): Promise<void> {
                     <span class="dash-node-menu-icon">🔍</span>
                     <span>查看详情</span>
                   </button>
+                  <!-- 只有「还没设为主节点」时才给客户显示；已是主节点的取消入口仅管理员可见 -->
                   <button
+                    v-if="!n.is_primary || auth.isAdmin"
                     type="button"
                     class="dash-node-menu-item"
                     :class="{ 'is-on': !!n.is_primary }"

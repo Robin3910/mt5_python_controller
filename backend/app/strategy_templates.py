@@ -638,10 +638,7 @@ STRATEGY_TEMPLATES: dict[str, dict] = {
         "template_id": TEMPLATE_1_ID,
         "name": TEMPLATE_1_NAME,
         "description": (
-            "含逆势加仓与顺势加仓两条独立规则："
-            "逆势支持分批加仓档位（点数 / 倍数随持仓加深）；"
-            "实际手数 = lot_times × 基础手数 + extra_lot。"
-            "可配信号级盈亏比与分档手数盈亏：每个信号按魔术号独立监控，触发只平该信号仓。"
+            ""
         ),
         # 模版内部按独立模型存放；对外仍暴露 rules 列表
         "rule_set": _TPL1_RULES,
