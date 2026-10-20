@@ -77,8 +77,10 @@ const isOnline = computed(() => !!primaryNode.value && nodeOnline(primaryNode.va
  * 同时追加白名单（即使暂无数据也要展示，方便用户感知可交易品种）。
  * 按字母序排列。
  */
-const ALL_QUOTE_SYMBOLS = [] as const
-type AllQuoteSymbol = (typeof ALL_QUOTE_SYMBOLS)[number]
+// 注意：白名单故意留空（`[]`），所有可用品种都从账户 quotes / positions 动态拼出，
+// 所以类型直接取 `string`，避免 `(typeof [])[number]` 退化成 `never`。
+const ALL_QUOTE_SYMBOLS: readonly string[] = []
+type AllQuoteSymbol = string
 
 const availableSymbols = computed<AllQuoteSymbol[]>(() => {
   const found = new Set<AllQuoteSymbol>()

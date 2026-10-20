@@ -5,9 +5,8 @@
 //   - 限价：再加一个 entry_price 必填
 //   - 网格：方向必选（all / buy / sell）
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
-import 'element-plus/es/components/message-box/style/css'
 import OrderDialog, { type OrderForm } from '../components/OrderDialog.vue'
 import { useRouter } from 'vue-router'
 import { useHubStore } from '@/stores/hub'
@@ -15,13 +14,11 @@ import { useAuthStore } from '@/stores/auth'
 import { quickTrigger, type TradingStrategyType, type QuickTriggerResult } from '@/api/trading'
 import type {
   AccountSnapshot,
-  CloseRequest,
   GroupOut,
   GroupSignalTaskRecord,
   NodeDispatchRecord,
   NodeOut,
   PaginatedNodeDispatches,
-  Position,
   QuoteInfo,
 } from '@/api/types'
 
@@ -75,8 +72,10 @@ const isOnline = computed(() => !!primaryNode.value && nodeOnline(primaryNode.va
  * 同时追加白名单（即使暂无数据也要展示，方便用户感知可交易品种）。
  * 按字母序排列。
  */
-const ALL_QUOTE_SYMBOLS = [] as const
-type AllQuoteSymbol = (typeof ALL_QUOTE_SYMBOLS)[number]
+// 注意：白名单故意留空（`[]`），所有可用品种都从账户 quotes / positions 动态拼出，
+// 所以类型直接取 `string`，避免 `(typeof [])[number]` 退化成 `never`。
+const ALL_QUOTE_SYMBOLS: readonly string[] = []
+type AllQuoteSymbol = string
 
 const availableSymbols = computed<AllQuoteSymbol[]>(() => {
   const found = new Set<AllQuoteSymbol>()
@@ -131,65 +130,7 @@ function fmtPrice(n: number | undefined, sym: string): string {
   return n.toFixed(digits)
 }
 
-function fmtPips(n: number | undefined): string {
-  if (n === undefined || n === null || !isFinite(n)) return '—'
-  const s = n >= 0 ? '+' : ''
-  return `${s}${n.toFixed(2)}`
-}
-
-/** 持仓方向（buy/sell）转中文标签 */
-function fmtPosType(t: string | null | undefined): string {
-  const v = (t || '').toLowerCase()
-  if (v === 'buy') return '多'
-  if (v === 'sell') return '空'
-  return t || '—'
-}
-
-/** 主节点时间戳（秒）→ 简短本地时间；0 / NaN 视为空 */
-function fmtPosTime(ts: number): string {
-  if (!ts || !isFinite(ts)) return '—'
-  const d = new Date(ts * 1000)
-  if (isNaN(d.getTime())) return '—'
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
-}
-
-// 节点全量持仓汇总（用于顶部状态条）
-const allPositions = computed<Position[]>(() => {
-  return account.value?.positions || []
-})
-const totalPosCount = computed(() => allPositions.value.length)
-const totalPosVolume = computed(() =>
-  allPositions.value.reduce((a, p) => a + (p.volume || 0), 0),
-)
-const totalPosPnl = computed(() =>
-  allPositions.value.reduce((a, p) => a + (p.profit || 0), 0),
-)
-
-// 资产数据（从 AccountSnapshot）
-const accountProfit = computed(() => totalPosPnl.value) // 浮动盈亏 = 持仓 profit 之和
-const accountBalance = computed(() => account.value?.balance ?? 0)
-const accountEquity = computed(() => account.value?.equity ?? 0)
-const accountMargin = computed(() => account.value?.margin ?? 0)
-const accountFreeMargin = computed(() => account.value?.free_margin ?? 0)
-const accountLeverage = computed(() => account.value?.leverage ?? 0)
-
-// 当前品种的持仓摘要（叠加在报价卡上）
-const symbolPositions = computed<Position[]>(() =>
-  allPositions.value.filter((p) => p.symbol === currentSymbol.value),
-)
-const symbolPosCount = computed(() => symbolPositions.value.length)
-const symbolPosVolume = computed(() =>
-  symbolPositions.value.reduce((a, p) => a + (p.volume || 0), 0),
-)
-const symbolPosPnl = computed(() =>
-  symbolPositions.value.reduce((a, p) => a + (p.profit || 0), 0),
-)
-
-// 全部持仓：按 ticket 倒序（最新开仓在前）
-const sortedPositions = computed<Position[]>(() =>
-  [...allPositions.value].sort((a, b) => (b.ticket || 0) - (a.ticket || 0)),
-)
+// fmtPips / fmtPosType / fmtPosTime 暂未在模板里使用，等接上 UI 再恢复。
 
 // 持仓 / 资产 / 历史订单 / 吸筹策略 tab
 type DetailTab = 'positions' | 'assets' | 'history' | 'grid'
@@ -202,21 +143,8 @@ const detailTab = ref<DetailTab>('positions')
 const gridTasks = ref<GroupSignalTaskRecord[]>([])
 const gridLoading = ref(false)
 const gridRefreshing = ref(false) // 轮询时为 true，避免 loading 闪烁
-const closingGridTaskIds = ref<Set<number>>(new Set())
 const GRID_TAB_REFRESH_MS = 5000
 let gridTimer: number | null = null
-
-function isClosingGridTask(taskId: number): boolean {
-  return closingGridTaskIds.value.has(taskId)
-}
-
-/** 主任务是否仍有可停止的子任务（终态都跳过）。 */
-function isGridTaskStoppable(task: GroupSignalTaskRecord): boolean {
-  if (['done', 'failed', 'skipped'].includes(task.status)) return false
-  return task.dispatches.some(
-    (d) => !['done', 'failed', 'skipped'].includes(d.status),
-  )
-}
 
 async function refreshGridTasks(initial = false): Promise<void> {
   if (!auth.me) {
@@ -266,98 +194,8 @@ async function refreshGridTasks(initial = false): Promise<void> {
 }
 
 /** 合并展示时把同一 task 下所有 dispatch 的 position_count / profit 等求和。 */
-function gridTaskPositionCount(task: GroupSignalTaskRecord): number {
-  return task.dispatches.reduce((a, d) => a + (d.position_count || 0), 0)
-}
-function gridTaskPendingCount(task: GroupSignalTaskRecord): number {
-  return task.dispatches.reduce((a, d) => a + (d.pending_orders || 0), 0)
-}
-function gridTaskProfit(task: GroupSignalTaskRecord): number {
-  return task.dispatches.reduce((a, d) => a + (d.realized_profit || 0), 0)
-}
-
-/** 网格任务的运行节点摘要（多节点用「 / 」连接）。 */
-function gridTaskNodeNames(task: GroupSignalTaskRecord): string {
-  const names = task.dispatches
-    .map((d) => d.node_name || d.node_id)
-    .filter(Boolean)
-  if (names.length === 0) return '—'
-  if (names.length <= 2) return names.join(' / ')
-  return `${names[0]} / ${names[1]} 等 ${names.length} 节点`
-}
-
-/** 网格 action → dir-tag 配色（all 也按"多"色展示）。 */
-function gridDirTagClass(action: string | null): string {
-  const v = (action || '').toLowerCase()
-  if (v === 'buy' || v === 'long' || v === 'all') return 'buy'
-  if (v === 'sell' || v === 'short') return 'sell'
-  return ''
-}
-
-async function stopGridTask(task: GroupSignalTaskRecord): Promise<void> {
-  if (!isGridTaskStoppable(task) || isClosingGridTask(task.task_id)) return
-  const sym = task.symbol || '?'
-  const nodeSummary = gridTaskNodeNames(task)
-  // 只对该 task 下的活跃 dispatch 下发 strategy_stop，不影响同组其他 task。
-  // 终态的 dispatch 跳过（已经收口，没必要再发一次）。
-  const activeDispatches = task.dispatches.filter(
-    (d) => !['done', 'failed', 'skipped'].includes(d.status),
-  )
-  const dispatchCount = activeDispatches.length
-  if (dispatchCount === 0) return
-  try {
-    await ElMessageBox.confirm(
-      `确认停止 ${sym} 网格任务（${nodeSummary}）？\n将向 ${dispatchCount} 个节点按魔术号平掉该网格的全部持仓并结束策略监控。\n（同分组内的其它任务不受影响）`,
-      '停止吸筹策略',
-      {
-        type: 'warning',
-        confirmButtonText: '确认停止',
-        cancelButtonText: '取消',
-      },
-    )
-  } catch {
-    return
-  }
-  // 按 task 粒度停止：只对该 task 下未收口的 dispatch 逐个下发 strategy_stop，
-  // 不调 closeGroup（整组一键平仓会同时干掉同分组内的其它 task，与"只停一个"的需求冲突）。
-  const groupId = task.group_id
-  closingGridTaskIds.value = new Set([...closingGridTaskIds.value, task.task_id])
-  let targetsCount = 0
-  let forcedCount = 0
-  let failCount = 0
-  try {
-    // 并发下发所有 dispatch 的停止命令，避免顺序等待拖慢交互
-    const results = await Promise.allSettled(
-      activeDispatches.map((d) => hub.closeGroupDispatch(groupId, d.id)),
-    )
-    for (let i = 0; i < results.length; i++) {
-      const r = results[i]
-      if (r.status === 'fulfilled') {
-        const v = r.value as { status?: string }
-        if (v?.status === 'closing') targetsCount += 1
-        else forcedCount += 1
-      } else {
-        failCount += 1
-      }
-    }
-    const parts: string[] = []
-    if (targetsCount > 0) parts.push(`已下发停止 ${sym} · 成功 ${targetsCount}`)
-    if (forcedCount > 0) parts.push(`离线 ${forcedCount}`)
-    if (parts.length > 0) {
-      // 成功 / 离线 都视为本次操作完成
-      ElMessage.success(parts.join(' · '))
-    } else if (failCount > 0) {
-      ElMessage.error(`下发停止失败（${failCount} 个节点）`)
-    } else {
-      ElMessage.warning('已下发停止，结果待刷新确认')
-    }
-    await refreshGridTasks()
-  } finally {
-    const next = new Set(closingGridTaskIds.value)
-    next.delete(task.task_id)
-    closingGridTaskIds.value = next
-  }
-}
+// gridTaskPositionCount / gridTaskPendingCount / gridTaskProfit / gridTaskNodeNames
+// / gridDirTagClass / stopGridTask 当前未在模板里调用，等接上 UI 再恢复。
 
 // ── 历史订单 ──
 // 走 GET /api/nodes/{id}/dispatches?page=&page_size=，分页返回 signal_history + signal_dispatch 联表明细。
@@ -396,28 +234,8 @@ async function fetchHistory(): Promise<void> {
   }
 }
 
-const historyTotalPages = computed(() => {
-  if (historyTotal.value <= 0) return 1
-  return Math.max(1, Math.ceil(historyTotal.value / HISTORY_PAGE_SIZE))
-})
-
-/** 历史订单：status 着色标签 */
-function historyStatusClass(s: string | null): string {
-  const v = (s || '').toLowerCase()
-  if (v === 'filled' || v === 'success' || v === 'done' || v === 'executed') return 'ok'
-  if (v === 'pending' || v === 'dispatched' || v === 'queued') return 'pending'
-  if (v === 'rejected' || v === 'failed' || v === 'error' || v === 'skipped') return 'err'
-  return ''
-}
-
-/** 把 Unix 时间戳（秒）→ 简短本地时间（含日期），供历史订单表用 */
-function fmtHistoryTime(ts: number | null | undefined): string {
-  if (!ts || !isFinite(ts)) return '—'
-  const d = new Date(ts * 1000)
-  if (isNaN(d.getTime())) return '—'
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
-}
+// historyStatusClass / fmtHistoryTime / goHistoryPage / historyTotalPages 暂未在模板里使用，
+// 等接上历史 tab UI 再恢复。
 
 /** 切到 history tab 时拉一次（首次） */
 watch(
@@ -455,13 +273,6 @@ watch(
   },
   { immediate: true },
 )
-
-async function goHistoryPage(p: number): Promise<void> {
-  if (p < 1 || p > historyTotalPages.value) return
-  if (p === historyPage.value) return
-  historyPage.value = p
-  await fetchHistory()
-}
 
 // ── 弹窗（开仓参数）──
 const STRATEGY_LABEL: Record<TradingStrategyType, string> = {
@@ -610,57 +421,7 @@ async function submit(): Promise<void> {
   }
 }
 
-// ── 单笔持仓平仓 ──
-// 走 POST /api/nodes/{id}/close，body={target:'ticket', ticket}。
-// 防止双击：loading 状态以 ticket 维度记录到 closingTickets Set。
-const closingTickets = ref<Set<number>>(new Set())
-function isClosing(ticket: number): boolean {
-  return closingTickets.value.has(ticket)
-}
-async function closePosition(p: Position): Promise<void> {
-  if (!primaryNode.value) {
-    ElMessage.warning('主节点不存在')
-    return
-  }
-  if (!p.ticket) {
-    ElMessage.warning('该持仓缺少 ticket，无法平仓')
-    return
-  }
-  if (closingTickets.value.has(p.ticket)) return
-  const type = (p.type || '').toLowerCase()
-  const dirLabel = type === 'buy' ? '多' : type === 'sell' ? '空' : ''
-  const sym = p.symbol
-  const vol = (p.volume || 0).toFixed(2)
-  try {
-    await ElMessageBox.confirm(
-      `确认平仓 #${p.ticket} ${sym} ${dirLabel} ${vol} 手？`,
-      '平仓确认',
-      {
-        type: 'warning',
-        confirmButtonText: '确认平仓',
-        cancelButtonText: '取消',
-      },
-    )
-  } catch {
-    return
-  }
-  const body: CloseRequest = { target: 'ticket', ticket: p.ticket }
-  closingTickets.value = new Set([...closingTickets.value, p.ticket])
-  try {
-    await hub.closeNode(primaryNode.value.node_id, body)
-    ElMessage.success(`已请求平仓 #${p.ticket} ${sym}`)
-    // 立即拉一次快照，避免等 5s 轮询
-    hub.fetchNodeAccount(primaryNode.value.node_id).catch(() => {})
-  } catch (e) {
-    const err = e as { response?: { data?: { detail?: string } }; message?: string }
-    const msg = err?.response?.data?.detail || err?.message || `平仓失败 #${p.ticket}`
-    ElMessage.error(msg)
-  } finally {
-    const next = new Set(closingTickets.value)
-    next.delete(p.ticket)
-    closingTickets.value = next
-  }
-}
+// 单笔持仓平仓：当前模板未引用，等接上 UI 再恢复 closingTickets / isClosing / closePosition。
 
 // 简单轮询拉取快照（保持行情新鲜）
 let pollTimer: number | null = null
