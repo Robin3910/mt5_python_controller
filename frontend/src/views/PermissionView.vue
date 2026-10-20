@@ -588,12 +588,12 @@ async function removeRole(role: RoleOut): Promise<void> {
             <div class="list-field"><span class="k">用户名</span><span class="v">{{ u.username }}</span></div>
             <div class="list-field"><span class="k">角色</span><span class="v">{{ roleNames(u) }}</span></div>
             <div class="list-field"><span class="k">2FA</span><span class="v">{{ u.totp_enabled ? '已绑定' : '未绑定' }}</span></div>
-            <div class="list-field"><span class="k">节点</span><span class="v">{{ u.is_admin ? '全部' : u.node_ids.length }}</span></div>
+            <div class="list-field"><span class="k">节点</span><span class="v">{{ u.node_ids.length }}</span></div>
             <div class="list-field"><span class="k">分组 / 策略</span><span class="v">{{ u.group_count }} / {{ u.strategy_count }}</span></div>
             <div class="list-card-actions">
               <button class="btn-sm btn-ghost" @click="openEditUser(u)">编辑</button>
               <button class="btn-sm btn-ghost" @click="openRoles(u)">角色</button>
-              <button v-if="!u.is_admin" class="btn-sm btn-ghost" @click="openNodes(u)">分配节点</button>
+              <button class="btn-sm btn-ghost" @click="openNodes(u)">分配节点</button>
               <button class="btn-sm btn-ghost" @click="openPwd(u)">重置密码</button>
               <button v-if="u.totp_enabled" class="btn-sm btn-ghost" @click="reset2fa(u)">重置 2FA</button>
               <button class="btn-sm btn-ghost" :disabled="isSelf(u)" @click="toggleActive(u)">
@@ -633,14 +633,14 @@ async function removeRole(role: RoleOut): Promise<void> {
                 <td>{{ roleNames(u) }}</td>
                 <td><span class="tag" :class="u.is_active ? 'green' : ''">{{ u.is_active ? '启用' : '禁用' }}</span></td>
                 <td>{{ u.totp_enabled ? '已绑定' : '未绑定' }}</td>
-                <td>{{ u.is_admin ? '全部' : u.node_ids.length }}</td>
+                <td>{{ u.node_ids.length }}</td>
                 <td>{{ u.group_count }} / {{ u.strategy_count }}</td>
                 <td class="muted">{{ fmtTime(u.created_at) }}</td>
                 <td class="right">
                   <div class="perm-actions">
                     <button class="btn-sm btn-ghost" @click="openEditUser(u)">编辑</button>
                     <button class="btn-sm btn-ghost" @click="openRoles(u)">角色</button>
-                    <button v-if="!u.is_admin" class="btn-sm btn-ghost" @click="openNodes(u)">分配节点</button>
+                    <button class="btn-sm btn-ghost" @click="openNodes(u)">分配节点</button>
                     <button class="btn-sm btn-ghost" @click="openPwd(u)">重置密码</button>
                     <button v-if="u.totp_enabled" class="btn-sm btn-ghost" @click="reset2fa(u)">重置 2FA</button>
                     <button class="btn-sm btn-ghost" :disabled="isSelf(u)" @click="toggleActive(u)">
@@ -869,9 +869,19 @@ async function removeRole(role: RoleOut): Promise<void> {
     <div v-if="showNodes && nodeTarget" class="modal-mask" @click.self="showNodes = false">
       <div class="card card-pad modal modal-lg">
         <div class="modal-header">
-          <div class="h1">分配节点 · {{ nodeTarget.username }}</div>
+          <div class="h1">
+            分配节点 · {{ nodeTarget.is_admin ? '自分配' : nodeTarget.username }}
+          </div>
           <p class="muted" style="font-size: 12px; margin: 4px 0 0">
-            整体替换该用户名下节点：勾上的划给他，去掉的回到管理员名下。节点上还有进行中的策略任务时不能改；仍在分组里时需确认后移出。
+            <template v-if="nodeTarget.is_admin">
+              把「管理员名下」的节点勾给自己后，这些节点会转入你个人名下，
+              并按同一套「自己名下」口径出现在你的首页与交易页；去掉的则退回管理员名下。
+              节点上还有进行中的策略任务时不能改；仍在分组里时需确认后移出。
+            </template>
+            <template v-else>
+              整体替换该用户名下节点：勾上的划给他，去掉的回到管理员名下。
+              节点上还有进行中的策略任务时不能改；仍在分组里时需确认后移出。
+            </template>
           </p>
         </div>
         <div class="modal-body">

@@ -244,13 +244,15 @@ async def set_primary_node(
     同 owner 下其它节点的原主节点标记会被自动清掉，保证唯一性。归属校验沿用
     owned_node_or_404 普通用户不能动管理员名下的节点。
 
-    v3 阻塞前置：被替换 / 被取消的旧主节点上仍有 in-flight 子任务时
+    阻塞前置：被替换 / 被取消的旧主节点上仍有 in-flight 子任务时
     返回 409 + blocking_tasks 明细。
     路由不接受任何 force / 强制绕过参数 —— 唯一放行条件是"无 in-flight"。
+
+    分组和策略不做迁移：新主节点触发信号时会自动创建新分组和策略。
     """
     await owned_node_or_404(store, p, node_id)
     try:
-        d, migrated_groups = await node_service.set_primary(
+        d, _ = await node_service.set_primary(
             store, node_id, bool(body.is_primary),
             audit_principal=p, audit_ip=client_ip(request),
         )
@@ -269,11 +271,7 @@ async def set_primary_node(
         )
     if not d:
         raise HTTPException(status_code=404, detail="node not found")
-    out = await _to_node_out(store, d, await rbac_service.owner_names_for(p))
-    # 阶段 2 受影响的分组 ID 写到 X-Migrated-Groups，与 v1 文档约定一致
-    if migrated_groups:
-        out_response.headers["X-Migrated-Groups"] = ",".join(migrated_groups)
-    return out
+    return await _to_node_out(store, d, await rbac_service.owner_names_for(p))
 
 
 @router.get("/{node_id}/active-tasks")

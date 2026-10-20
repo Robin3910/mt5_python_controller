@@ -32,7 +32,29 @@ const auth = useAuthStore()
 const router = useRouter()
 
 // 头部状态信息：MT5 登录号、服务器、在线/离线
+/**
+ * 主节点选取规则（仅管理员一侧改变）：
+ *
+ * - 管理员：只允许 `owner_user_id === 当前管理员 user_id` 区间内的 `is_primary && enabled`
+ *   节点；这是后端 owner_user_id 维度的真实语义（参见 backend/node_service.py 中
+ *   `_clear_primary_for_owner` / `set_primary`）。如果该范围内没有主节点，回退到
+ *   模板的「尚未设置主节点」空态，不静默拿别人的主节点顶替——这条规则把
+ *   「管理员的【交易】页不能拿普通用户的主节点来展示」这一点固化下来。
+ * - 普通用户：保持原有 `is_primary && enabled` 行为不变。后端 `/api/nodes` 接口已
+ *   经按 owner 过滤，普通用户能看到的列表里 `is_primary=true` 的节点本来就是
+ *   他自己的主节点，无需在客户端再收紧。
+ */
 const primaryNode = computed<NodeOut | undefined>(() => {
+  if (auth.isAdmin && auth.me?.user_id != null) {
+    const myId = auth.me.user_id
+    const owned = hub.nodes.find(
+      (n) => n.is_primary && n.enabled && (n.owner_user_id ?? null) === myId,
+    ) as NodeOut | undefined
+    if (owned) return owned
+    // 管理员名下没有主节点 → 让模板显示「尚未设置主节点」空态，
+    // 不再去找"第一个 is_primary" 顶替。
+    return undefined
+  }
   return hub.nodes.find((n) => n.is_primary && n.enabled) as NodeOut | undefined
 })
 

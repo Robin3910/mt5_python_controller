@@ -641,6 +641,18 @@ td:first-child, th:first-child { font-family: var(--font); }
 .muted { color: var(--muted); }
 .right { text-align: right; }
 
+/* 首页管理员视图范围提示：放在统计卡和工具栏之间 */
+.home-scope-banner {
+  margin: 12px 0 4px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent, #5b8def) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent, #5b8def) 22%, transparent);
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .modal-mask {
   position: fixed;
   inset: 0;

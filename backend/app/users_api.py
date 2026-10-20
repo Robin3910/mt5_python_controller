@@ -284,14 +284,19 @@ async def assign_nodes(
 ):
     """整体替换用户名下节点：新增的从原所有者转来，移除的回到管理员名下。
 
+    目标可以是超级管理员本人：超管同样可以把自己名下的节点（owner_user_id=admin.id）
+    与「管理员名下」（owner_user_id=NULL）之间互相转移。超管自分配后，节点会出现在
+    其首页 / 交易页的「自己名下」视图里，与普通用户的行为完全一致。
+
     1. 变动节点上有未收口的策略子任务 → 409 active_tasks（先在分组页平仓 / 终止）；
     2. 变动节点仍在分组里 → 409 confirm_required，confirm=True 后移出这些分组；
     3. 写库刷新缓存，并让原所有者与新所有者的后台连接重新拉取权限。
     """
     user = await _user_or_404(user_id)
-    roles = (await rbac_service.roles_by_user()).get(user.id, [])
-    if _is_admin_roles(roles):
-        raise HTTPException(status_code=400, detail="超级管理员可见全部节点，无需分配")
+    # 目标可以是超级管理员本人：超管同样能在自己名下（owner_user_id=admin.id）
+    # 与「管理员名下」（owner_user_id=NULL）之间转移节点，语义与普通用户完全一致。
+    # 原先的「超管可见全部节点，无需分配」硬挡已移除；下面的 active_tasks /
+    # confirm_required 校验与审计对所有目标一视同仁。
 
     target = _dedup(body.node_ids)
     nodemap = {n["node_id"]: n for n in await store.all_nodes()}

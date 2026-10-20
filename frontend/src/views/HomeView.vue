@@ -10,12 +10,36 @@ import type { AccountSnapshot, NodeOut, Position } from '@/api/types'
 import { confirmAction } from '@/utils/confirm'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/api/client'
+import { useAuthStore } from '@/stores/auth'
 
 const hub = useHubStore()
+const auth = useAuthStore()
 const router = useRouter()
 
 onMounted(async () => {
   await hub.fetchNodes()
+})
+
+/**
+ * 首页可见节点列表。
+ *
+ * 口径（与首页以外的页面**无关**：本派生仅在 HomeView 内使用）：
+ * - 管理员登录：只展示「owner_user_id 等于自己 user_id」的节点；
+ *   「owner_user_id 为空」（在管理员名下 / 仍未分配给任何具体用户）的节点
+ *   在首页**不**展示——这是新口径与上一版的差异；这一类节点仍然在
+ *   「节点」页 / 「总览」页可见，留给日常运维窗口。
+ * - 非管理员登录：保持原全集行为，不影响他们的体验。
+ *
+ * 选择这条口径的原因：项目里"录入者"和"当前所有者"是两个概念；
+ * 管理员把节点创建出来后常会再 transfer 给具体用户，此时该节点的 owner
+ * 已经是受让人。用严格 owner==self 把"已分配出去但仍归管理员独占"的边界
+ * 场景过滤掉，让首页真正聚焦"我现在自己独占拥有"的节点集合。
+ */
+const homeVisibleNodes = computed<NodeOut[]>(() => {
+  if (!auth.isAdmin) return hub.nodes
+  const myId = auth.me?.user_id ?? null
+  if (myId == null) return []
+  return hub.nodes.filter((n) => (n.owner_user_id ?? null) === myId)
 })
 
 // 「卡片操作菜单」目前展开的节点 ID。null = 全部折叠；一次只能打开一个菜单，
@@ -206,36 +230,53 @@ function goNode(id: string): void {
   router.push({ name: 'node-detail', params: { id } })
 }
 
-const totalEquity = computed(() => hub.totalEquity)
+const totalEquity = computed(() =>
+  homeVisibleNodes.value.reduce(
+    (acc, n) => acc + ((hub.accounts[n.node_id]?.equity) || 0),
+    0,
+  ),
+)
 const totalPositions = computed(() =>
-  Object.values(hub.accounts).reduce((a, s) => a + (s?.positions?.length || 0), 0),
+  homeVisibleNodes.value.reduce(
+    (a, n) => a + ((hub.accounts[n.node_id]?.positions?.length) || 0),
+    0,
+  ),
 )
 const totalVolume = computed(() =>
-  Object.values(hub.accounts).reduce(
-    (a, s) => a + (s?.positions || []).reduce((x, p) => x + (p.volume || 0), 0),
+  homeVisibleNodes.value.reduce(
+    (a, n) =>
+      a + ((hub.accounts[n.node_id]?.positions || []).reduce(
+        (x, p) => x + (p.volume || 0),
+        0,
+      )),
     0,
   ),
 )
 const totalProfit = computed(() =>
-  Object.values(hub.accounts).reduce(
-    (a, s) => a + (s?.positions || []).reduce((x, p) => x + (p.profit || 0), 0),
+  homeVisibleNodes.value.reduce(
+    (a, n) =>
+      a + ((hub.accounts[n.node_id]?.positions || []).reduce(
+        (x, p) => x + (p.profit || 0),
+        0,
+      )),
     0,
   ),
 )
 
+/** 首页统计：全/在线/离线都基于首页可见的派生列表。 */
 const statusCounts = computed(() => {
   let online = 0
   let offline = 0
-  for (const n of hub.nodes) {
+  for (const n of homeVisibleNodes.value) {
     if (statusOf(n) === 'online') online += 1
     else offline += 1
   }
-  return { all: hub.nodes.length, online, offline }
+  return { all: homeVisibleNodes.value.length, online, offline }
 })
 
 const filteredNodes = computed(() => {
   const query = q.value.trim().toLowerCase()
-  let list = hub.nodes.filter((n) => {
+  let list = homeVisibleNodes.value.filter((n) => {
     if (statusFilter.value !== 'all' && statusOf(n) !== statusFilter.value) return false
     if (!query) return true
     const a = acct(n.node_id)
@@ -313,7 +354,7 @@ async function closeNodeAll(n: NodeOut): Promise<void> {
 
     <div class="dash-summary">
       <div class="card card-pad dash-stat">
-        <div class="stat"><span class="k">在线节点</span><span class="v">{{ hub.onlineCount }} / {{ hub.nodes.length }}</span></div>
+        <div class="stat"><span class="k">在线节点</span><span class="v">{{ statusCounts.online }} / {{ statusCounts.all }}</span></div>
       </div>
       <div class="card card-pad dash-stat">
         <div class="stat"><span class="k">合计净值</span><span class="v">{{ fmt(totalEquity) }}</span></div>
@@ -327,6 +368,12 @@ async function closeNodeAll(n: NodeOut): Promise<void> {
       <div class="card card-pad dash-stat" :class="totalProfit >= 0 ? 'dash-stat-profit-pos' : 'dash-stat-profit-neg'">
         <div class="stat"><span class="k">合计盈亏</span><span class="v dash-stat-profit-value">{{ fmtSigned(totalProfit) }}</span></div>
       </div>
+    </div>
+
+    <!-- 管理员专属提示：本页只展示「管理员自己独占拥有」的节点 -->
+    <div v-if="auth.isAdmin" class="home-scope-banner muted">
+      首页仅显示所有者（owner）为你本人的节点，共 {{ statusCounts.all }} 个；
+      尚未分配的节点、以及分配给其他用户的节点，请在「节点」或「总览」中查看。
     </div>
 
     <div class="dash-layout">
@@ -466,8 +513,16 @@ async function closeNodeAll(n: NodeOut): Promise<void> {
             </div>
           </div>
 
-          <div v-if="hub.nodes.length && !filteredNodes.length" class="card card-pad muted span-full">没有匹配的节点</div>
-          <div v-if="!hub.nodes.length" class="card card-pad muted span-full">还没有节点，请到「节点」页面创建。</div>
+          <div v-if="homeVisibleNodes.length && !filteredNodes.length" class="card card-pad muted span-full">没有匹配的节点</div>
+          <div v-if="!homeVisibleNodes.length" class="card card-pad muted span-full">
+            <template v-if="auth.isAdmin">
+              你当前没有 owner 为本人的节点。
+              请到「节点」页把未分配的节点分配给自己，或新建后再回到首页查看。
+            </template>
+            <template v-else>
+              还没有节点，请到「节点」页面创建。
+            </template>
+          </div>
         </div>
 
         <div v-if="filteredNodes.length > pageSize" class="dash-pagination">

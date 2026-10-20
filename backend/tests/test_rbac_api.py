@@ -349,10 +349,39 @@ def test_assign_nodes_rejects_node_with_active_tasks(client):
     assert client.get("/api/nodes", headers=_login(client, "alice")).json() == []
 
 
-def test_assign_nodes_rejects_admin_account(client):
+def test_assign_nodes_allows_admin_self_assignment(client):
+    """超管可以给自己分配节点：owner 从 NULL 转成自己的 user_id。
+
+    原先这里硬挡 400「超管可见全部节点，无需分配」；现在放开，语义与普通用户一致：
+    分配后节点进入本人名下，去掉则退回管理员名下（owner=NULL）。
+    """
     h = auth_headers(client)
     uid = client.get("/api/me", headers=h).json()["user_id"]
-    assert _assign(client, h, uid, []).status_code == 400
+    n1 = _mk_node(client, h, 7501)
+
+    # 分配前：节点在管理员名下（owner_user_id 为 NULL）
+    before = {n["node_id"]: n for n in client.get("/api/nodes", headers=h).json()}
+    assert before[n1]["owner_user_id"] is None
+
+    # 自分配 → 200，且 added 命中
+    r = _assign(client, h, uid, [n1])
+    assert r.status_code == 200, r.text
+    assert r.json()["added"] == [n1]
+
+    # owner 已转为超管本人
+    after = {n["node_id"]: n for n in client.get("/api/nodes", headers=h).json()}
+    assert after[n1]["owner_user_id"] == uid
+
+    # 用户列表里能查到自己的 node_ids
+    me = next(u for u in client.get("/api/users", headers=h).json() if u["id"] == uid)
+    assert n1 in me["node_ids"]
+
+    # 再整体替换为空 → 退回管理员名下
+    r2 = _assign(client, h, uid, [])
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["removed"] == [n1]
+    back = {n["node_id"]: n for n in client.get("/api/nodes", headers=h).json()}
+    assert back[n1]["owner_user_id"] is None
 
 
 # =====================================================================
