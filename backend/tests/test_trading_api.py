@@ -320,3 +320,87 @@ def test_quick_trigger_admin_self_assign_then_trigger(client, monkeypatch):
     assert resp.status_code == 200, resp.text
     assert "group_id" in resp.json(), resp.text
     assert "strategy_id" in resp.json(), resp.text
+
+
+def test_quick_trigger_rejects_other_users_primary_for_admin(client, monkeypatch):
+    """管理员用「别人的主节点」node_id 强行触发 → 403 + 「主节点不属于当前用户」。
+
+    此前 permissions.owns() 对管理员恒真，导致 admin 跨用户接管别 user 的
+    主节点（典型场景：某个普通用户 X 创建了自己的主节点，admin 误把 X 的 node_id
+    当成自己的 node_id 用 quick-trigger，仍会走到 process_signal 并给 X 那台主机
+    建组开仓）。本次修复后 admin 节点校验收紧到「owner ∈ {null, p.user_id}」，
+    这里回归这个 bug。
+    """
+    from app import trading_api
+    from app.strategy_templates import TEMPLATE_3_ID, default_grid_rule
+
+    admin_token = _admin_token(client)
+    h = _admin_headers(client)
+
+    # 1. 建一个普通用户 + 拿到它的 user_id
+    new_user_payload = {
+        "username": "trading_target_user",
+        "password": "pass1234",
+        "display_name": "Trigger Target",
+    }
+    cu = client.post("/api/users", json=new_user_payload, headers=h)
+    assert cu.status_code == 201, cu.text
+    target_uid = cu.json()["id"]
+
+    # 2. admin 建一个节点 → 分配给该用户 → 设为主节点
+    create_n = client.post(
+        "/api/nodes",
+        json={"name": "target-user-primary-node", "mt5_login": 79999},
+        headers=h,
+    )
+    assert create_n.status_code == 201, create_n.text
+    target_nid = create_n.json()["node_id"]
+
+    assign = client.put(
+        f"/api/users/{target_uid}/nodes",
+        json={"node_ids": [target_nid]},
+        headers=h,
+    )
+    assert assign.status_code == 200, assign.text
+    assert target_nid in assign.json()["added"]
+
+    set_p = client.post(
+        f"/api/nodes/{target_nid}/primary",
+        json={"is_primary": True},
+        headers=h,
+    )
+    assert set_p.status_code == 200, set_p.text
+
+    # 3. admin 拿这个别人 user 名下的主节点去触发 quick-trigger，
+    #    修复后应被 403 拦截，且不能走到 process_signal。
+    body = {
+        "node_id": target_nid,
+        "strategy_type": "trend_market",
+        "symbol": "XAUUSD",
+        "volume": 0.01,
+        "sl": 1900.0,
+    }
+
+    # 同时 mock 掉 process_signal：万一校验没生效，断言它没被调用、有兜底信号。
+    process_signal_called = {"n": 0}
+
+    async def _spy_process_signal(*_a, **_kw):
+        process_signal_called["n"] += 1
+        return {"status": "accepted", "signal_id": "should_not_run", "groups": 0, "targets": 0}
+
+    monkeypatch.setattr(manager, "is_node_online", lambda _node_id: True)
+    monkeypatch.setattr(trading_api, "process_signal", _spy_process_signal)
+
+    resp = client.post(
+        "/api/trading/quick-trigger",
+        json=body,
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+
+    assert resp.status_code == 403, resp.text
+    detail = resp.json().get("detail", "")
+    assert "不属于当前用户" in detail, detail
+    assert process_signal_called["n"] == 0, (
+        "校验失败：管理员触发了别人的主节点，应该在 owner 校验处被 403 拦下，"
+        "process_signal 不应被走到。"
+    )

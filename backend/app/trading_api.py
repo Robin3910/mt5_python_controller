@@ -214,10 +214,20 @@ async def quick_trigger(
     node = await store.get_node(body.node_id)
     if not node or not node.get("is_primary") or not node.get("enabled", True):
         raise HTTPException(status_code=400, detail=_PRIMARY_NOT_FOUND)
-    if not permissions.owns(p, node.get("owner_user_id")):
-        raise HTTPException(status_code=403, detail=_PRIMARY_NOT_OWNED)
     if not manager.is_node_online(body.node_id):
         raise HTTPException(status_code=400, detail=_PRIMARY_OFFLINE)
+    # 主节点归属校验：
+    # - 普通用户只能拿自己用户 id 维度下的主节点（permissions.owns 已经按此语义判定）。
+    # - 管理员不再沿用 permissions.owns（它对管理员恒真，会放任 admin 跨用户接管
+    #   别人 user_id 名下的主节点）。改为：主节点必须落在管理员的两个「自己维度」
+    #   —— 即 owner_user_id 为空（管理员共享池）或等于 p.user_id（管理员个人分配
+    #   给自己）。任何其它 user 的主节点都拒绝，避免误触发别人主节点拉起一组新信号。
+    if not p.is_admin and not permissions.owns(p, node.get("owner_user_id")):
+        raise HTTPException(status_code=403, detail=_PRIMARY_NOT_OWNED)
+    if p.is_admin:
+        owner = permissions.normalize_owner(node.get("owner_user_id"))
+        if owner is not None and owner != p.user_id:
+            raise HTTPException(status_code=403, detail=_PRIMARY_NOT_OWNED)
 
     owner = permissions.normalize_owner(node.get("owner_user_id"))
     login = int(node.get("mt5_login") or 0)
