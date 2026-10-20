@@ -431,15 +431,23 @@ def _migrate_node_credentials(sync_conn) -> None:
 
 
 def _migrate_role_capabilities(sync_conn) -> None:
-    """sys_role.capabilities：角色能力码 JSON 数组（默认空，即无 AI 策略授权）。"""
+    """sys_role.capabilities：角色能力码 JSON 数组（无 AI 策略授权 = 空数组）。
+
+    MySQL 不允许 TEXT / BLOB / JSON 列带 DEFAULT，所以这里不能写成
+    `ADD COLUMN capabilities TEXT NOT NULL DEFAULT '[]'`。存量行补列后会拿到空串，
+    再统一回填 '[]'——解码侧也会把非法 JSON 当空数组，双保险。
+    """
     inspector = inspect(sync_conn)
     if "sys_role" not in inspector.get_table_names():
         return
     cols = {c["name"] for c in inspector.get_columns("sys_role")}
     if "capabilities" in cols:
         return
+    sync_conn.execute(text("ALTER TABLE sys_role ADD COLUMN capabilities TEXT NULL"))
+    # 旧行为空串、新增行由 ORM default 写 '[]'；这里把空值统一成 '[]'，
+    # WHERE 用 = '' 而非 IS NULL：MySQL 补列给存量行的是 ''，不是 NULL。
     sync_conn.execute(
-        text("ALTER TABLE sys_role ADD COLUMN capabilities TEXT NOT NULL DEFAULT '[]'")
+        text("UPDATE sys_role SET capabilities = '[]' WHERE capabilities IS NULL OR capabilities = ''")
     )
 
 

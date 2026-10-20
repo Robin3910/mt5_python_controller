@@ -800,18 +800,24 @@ def test_create_role_with_ai_capability(client):
 
 
 def test_role_capabilities_column_migration_idempotent(tmp_path):
-    """补列迁移：缺列时补上，重复执行不报错，旧角色默认无能力。"""
+    """补列迁移：缺列时补上，重复执行不报错，存量角色回填为空能力数组。
+
+    MySQL 不允许 TEXT 带 DEFAULT，迁移里只能先加 NULL 列再回填；
+    这条用例锁住「存量行拿到的是 '[]' 而不是空串 / NULL」。
+    """
     from app.db import _migrate_role_capabilities
 
     eng = create_engine(f"sqlite:///{(tmp_path / 'legacy_caps.db').as_posix()}")
     with eng.begin() as conn:
         conn.execute(text("CREATE TABLE sys_role (id INTEGER PRIMARY KEY, code VARCHAR(32))"))
-        conn.execute(text("INSERT INTO sys_role (id, code) VALUES (1, 'user')"))
+        conn.execute(text("INSERT INTO sys_role (id, code) VALUES (1, 'admin'), (2, 'user')"))
     for _ in range(2):
         with eng.begin() as conn:
             _migrate_role_capabilities(conn)
     insp = inspect(eng)
     assert "capabilities" in {c["name"] for c in insp.get_columns("sys_role")}
     with eng.connect() as conn:
-        assert conn.execute(text("SELECT capabilities FROM sys_role")).scalar() == "[]"
+        rows = conn.execute(text("SELECT code, capabilities FROM sys_role ORDER BY id")).all()
+    # 存量行必须回填成 '[]'（空数组 = 无 AI 授权），不能是 NULL 或空串
+    assert rows == [("admin", "[]"), ("user", "[]")], rows
     eng.dispose()
