@@ -63,6 +63,12 @@ const props = defineProps<{
    * 父级未注入或为 null 时，按钮置灰并提示"等待报价"。
    */
   currentMid?: number | null
+  /**
+   * 模式：
+   *   'trigger' - 点按钮保存策略并 emit 'trigger-strategy' 发信号（TradingView 等管理员场景）
+   *   'save'    - 点按钮只保存策略参数，不发信号（UserStrategiesView 等用户场景）
+   */
+  mode?: 'trigger' | 'save'
 }>()
 
 const emit = defineEmits<{
@@ -179,6 +185,9 @@ const derivedAction = computed<ManualAction | null>(() => {
 const strategySubmitting = ref(false)
 /** 策略复用执行结果 / 错误回显 */
 const lastStrategyError = ref('')
+
+/** 是否仅保存模式：点按钮只保存策略，不发信号 */
+const isSaveMode = computed(() => props.mode === 'save')
 
 const STRATEGIES: { key: OrderStrategy; label: string; icon: string }[] = [
   { key: 'trend_market', label: '市价开仓', icon: '⚡' },
@@ -722,6 +731,143 @@ async function triggerStrategy(): Promise<void> {
     await triggerGridStrategy()
   } else {
     await triggerMarketStrategy()
+  }
+}
+
+/** 仅保存策略（不发信号）。成功时关闭弹窗并提示 */
+async function saveStrategyOnly(): Promise<void> {
+  if (isGrid.value) {
+    await saveGridStrategyOnly()
+  } else {
+    await saveRiskStrategyOnly()
+  }
+}
+
+/** 市价/限价：只保存策略，不发信号 */
+async function saveRiskStrategyOnly(): Promise<void> {
+  const rpErr = validateRiskParams()
+  if (rpErr) { lastStrategyError.value = rpErr; return }
+  const rules = buildRiskStrategyPayload()
+  if (!rules) return
+  if (!currentGroup.value) {
+    lastStrategyError.value = '分组未就绪，请稍后重试或刷新页面'
+    return
+  }
+  strategySubmitting.value = true
+  lastStrategyError.value = ''
+  try {
+    let strategyId = currentStrategy.value?.strategy_id
+    if (strategyId) {
+      await hub.updateStrategy(strategyId, {
+        name: currentStrategy.value!.name,
+        symbol: (localForm.symbol || '').trim().toUpperCase(),
+        rules,
+      })
+    } else {
+      const tpl2 = templates.value.find((t) => t.template_id === 'tpl_2')
+      const newName = `${currentGroup.value.name}-${strategyRef.value}-策略`
+      const before = [...hub.strategies]
+      let existed: StrategyOutType | undefined
+      try {
+        await hub.fetchStrategies({ q: newName })
+        existed = (hub.strategies || []).find(
+          (s) => s.name === newName && s.owner_user_id === currentGroup.value?.owner_user_id,
+        )
+      } finally {
+        hub.strategies = before
+      }
+      if (existed) {
+        await hub.updateStrategy(existed.strategy_id, {
+          name: newName,
+          symbol: (localForm.symbol || '').trim().toUpperCase(),
+          rules,
+        })
+        strategyId = existed.strategy_id
+        await hub.updateGroup(currentGroup.value.group_id, { strategy_id: existed.strategy_id })
+      } else {
+        const created = await hub.createStrategy({
+          template_id: tpl2?.template_id ?? '',
+          name: newName,
+          symbol: (localForm.symbol || '').trim().toUpperCase(),
+          rules,
+        })
+        strategyId = created.strategy_id
+        if (strategyId) {
+          await hub.updateGroup(currentGroup.value.group_id, { strategy_id: strategyId })
+        }
+      }
+    }
+    strategySubmitting.value = false
+    emit('update:modelValue', false)
+    ElMessage.success('策略参数已保存')
+  } catch (e) {
+    strategySubmitting.value = false
+    const err = e as { response?: { data?: { detail?: string } }; message?: string }
+    lastStrategyError.value = err?.response?.data?.detail || err?.message || '保存策略失败'
+  }
+}
+
+/** 网格：只保存策略，不发信号 */
+async function saveGridStrategyOnly(): Promise<void> {
+  const gpErr = validateGridParams()
+  if (gpErr) { lastStrategyError.value = gpErr; return }
+  const rules = buildGridStrategyPayload()
+  if (!rules) return
+  if (!currentGroup.value) {
+    lastStrategyError.value = '分组未就绪，请稍后重试或刷新页面'
+    return
+  }
+  strategySubmitting.value = true
+  lastStrategyError.value = ''
+  try {
+    let strategyId = currentStrategy.value?.strategy_id
+    if (strategyId) {
+      await hub.updateStrategy(strategyId, {
+        name: currentStrategy.value!.name,
+        symbol: (localForm.symbol || '').trim().toUpperCase(),
+        rules,
+      })
+    } else {
+      const tpl3 = templates.value.find((t) => t.template_id === 'tpl_3')
+      const gridName = `${currentGroup.value.name}-grid-策略`
+      const before = [...hub.strategies]
+      let existed: StrategyOutType | undefined
+      try {
+        await hub.fetchStrategies({ q: gridName })
+        existed = (hub.strategies || []).find(
+          (s) => s.name === gridName && s.owner_user_id === currentGroup.value?.owner_user_id,
+        )
+      } finally {
+        hub.strategies = before
+      }
+      if (existed) {
+        await hub.updateStrategy(existed.strategy_id, {
+          name: gridName,
+          symbol: (localForm.symbol || '').trim().toUpperCase(),
+          rules,
+        })
+        strategyId = existed.strategy_id
+        await hub.updateGroup(currentGroup.value.group_id, { strategy_id: existed.strategy_id })
+      } else {
+        const created = await hub.createStrategy({
+          template_id: tpl3?.template_id ?? '',
+          name: gridName,
+          symbol: (localForm.symbol || '').trim().toUpperCase(),
+          rules,
+        })
+        strategyId = created.strategy_id
+        if (strategyId) {
+          await hub.updateGroup(currentGroup.value.group_id, { strategy_id: strategyId })
+        }
+      }
+    }
+    strategySubmitting.value = false
+    emit('update:modelValue', false)
+    ElMessage.success('网格策略参数已保存')
+  } catch (e) {
+    strategySubmitting.value = false
+    const err = e as { response?: { data?: { detail?: string } }; message?: string }
+    lastStrategyError.value = err?.response?.data?.detail || err?.message || '保存网格策略失败'
   }
 }
 
@@ -1330,12 +1476,12 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
       </template>
 
       <!-- 策略参数（市价/限价均走 strategy 模型，按 riskParams 实时计算手数）
-           渲染条件：市价或限价开仓 + 有 groupId。
+           渲染条件：市价或限价开仓 + 有 currentGroup。
            不再要求「策略复用」开关开启——开了就是走 strategy 模型，
            没开就只展示参数，不影响原 quickTrigger 路径。
            「策略复用」开关决定提交时是 save 策略 + 触发 strategy 信号，
            还是仅用参数走 quickTrigger。-->
-      <template v-if="(isMarket || isLimit) && props.groupId">
+      <template v-if="(isMarket || isLimit) && currentGroup">
         <!-- <div class="od-section">策略参数</div> -->
         <!-- 加载状态 -->
         <div v-if="strategyLoading" class="od-loading">
@@ -1345,9 +1491,9 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
           加载策略数据…
         </div>
         <template v-else>
-          <!-- 无分组时的提示 -->
-          <div v-if="!props.groupId" class="od-error">
-            未找到当前分组，请在「分组」页确认该分组已创建后再使用策略复用
+          <!-- 无分组时的提示（实际上 currentGroup 有值时不会走到这里） -->
+          <div v-if="!currentGroup" class="od-error">
+            分组未就绪，请稍后重试
           </div>
           <template v-else>
             <!-- 风险金额 -->
@@ -1432,7 +1578,7 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
       </template>
 
       <!-- 网格策略参数（走 strategy 模型） -->
-      <template v-if="isGrid && props.groupId">
+      <template v-if="isGrid && currentGroup">
         <div v-if="strategyLoading" class="od-loading">
           <span class="od-loading-dot"></span>
           <span class="od-loading-dot"></span>
@@ -1440,8 +1586,8 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
           加载策略数据…
         </div>
         <template v-else>
-          <div v-if="!props.groupId" class="od-error">
-            未找到当前分组，请在「分组」页确认该分组已创建后再使用策略复用
+          <div v-if="!currentGroup" class="od-error">
+            分组未就绪，请稍后重试
           </div>
         </template>
       </template>
@@ -1466,7 +1612,7 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
     <template #footer>
       <div class="od-footer">
         <!-- 左：带单开关；右：触发按钮（取消按钮已移除，关闭点 dialog 蒙层或 X） -->
-        <div class="od-carry">
+        <div v-if="!isSaveMode" class="od-carry">
           <ElSwitch v-model="carry" />
           <span class="od-carry-label">带单</span>
           <!-- <span class="od-carry-sub">跟随本次信号自动执行</span> -->
@@ -1474,7 +1620,18 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
         <div class="od-actions">
           <!-- 市价 / 限价：统一走 triggerStrategy（strategy 模型），前端推导 BUY/SEL方向并展示 -->
           <template v-if="isMarket || isLimit">
+            <!-- 仅保存模式 -->
             <button
+              v-if="isSaveMode"
+              class="od-btn-primary"
+              :disabled="!canTriggerStrategy || strategySubmitting"
+              @click="saveStrategyOnly"
+            >
+              <span class="od-btn-primary-main">{{ strategySubmitting ? '保存中…' : '保存' }}</span>
+            </button>
+            <!-- 触发模式 -->
+            <button
+              v-else
               class="od-btn-primary"
               :disabled="!canTriggerStrategy"
               @click="triggerStrategy"
@@ -1493,20 +1650,32 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
             </button>
           </template>
           <!-- 网格：走 strategy 模型，与市价/限价统一 -->
-          <button
-            v-else
-            class="od-btn-primary"
-            :disabled="!canTriggerGridStrategy || strategySubmitting"
-            @click="triggerStrategy"
-          >
-            <span class="od-btn-primary-main">
-              {{ strategySubmitting ? '触发中…' : '触发' }}
-            </span>
-            <span class="od-btn-primary-sub">
-              {{ gridParams.grid_side === 'long' ? '多' : '空' }}
-              · {{ (localForm.symbol || '').toUpperCase() }}
-            </span>
-          </button>
+          <template v-else>
+            <!-- 仅保存模式 -->
+            <button
+              v-if="isSaveMode"
+              class="od-btn-primary"
+              :disabled="!canTriggerGridStrategy || strategySubmitting"
+              @click="saveStrategyOnly"
+            >
+              <span class="od-btn-primary-main">{{ strategySubmitting ? '保存中…' : '保存' }}</span>
+            </button>
+            <!-- 触发模式 -->
+            <button
+              v-else
+              class="od-btn-primary"
+              :disabled="!canTriggerGridStrategy || strategySubmitting"
+              @click="triggerStrategy"
+            >
+              <span class="od-btn-primary-main">
+                {{ strategySubmitting ? '触发中…' : '触发' }}
+              </span>
+              <span class="od-btn-primary-sub">
+                {{ gridParams.grid_side === 'long' ? '多' : '空' }}
+                · {{ (localForm.symbol || '').toUpperCase() }}
+              </span>
+            </button>
+          </template>
         </div>
       </div>
     </template>

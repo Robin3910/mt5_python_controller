@@ -1,10 +1,12 @@
-"""用户权限的纯规则：菜单注册表、登录身份（Principal）与数据归属判定。
+"""用户权限的纯规则：菜单注册表、能力注册表、登录身份（Principal）与数据归属判定。
 
 不做任何 I/O：路由 / 服务层拿到数据后调这里判断，便于单测。
 
 - 菜单是代码注册表：页面与接口写死在代码里，库（sys_role_menu）只存「角色勾了哪些菜单」；
+- 能力是代码注册表：菜单管「能进哪个页面」，能力管「页面里能做什么」，两者独立。
+  例如 AI 智能加仓策略（tpl_1）走 ai_strategy 能力，不额外开菜单；
 - 数据归属靠 owner_user_id：空 = 管理员名下；普通用户只能看 / 改自己名下的数据；
-- 超级管理员（内置角色 admin）拥有全部菜单、看全部数据。
+- 超级管理员（内置角色 admin）拥有全部菜单与能力、看全部数据。
 """
 from __future__ import annotations
 
@@ -58,6 +60,28 @@ ASSIGNABLE_MENU_CODES: tuple[str, ...] = tuple(m.code for m in MENU_REGISTRY if 
 DEFAULT_USER_MENUS: tuple[str, ...] = ASSIGNABLE_MENU_CODES
 
 
+# ---------------------------------------------------------------------------
+# 能力注册表（菜单之外的细粒度授权）
+# ---------------------------------------------------------------------------
+# 菜单回答「能进哪个页面」，能力回答「页面里能做什么」。能力同样由代码注册，
+# sys_role.capabilities 只存角色勾了哪些能力。
+#
+# ai_strategy：AI 智能加仓策略（策略模版1 / tpl_1，逆势 + 顺势加仓）。
+# 该模版需要授予能力后才能新建 / 编辑 / 删除；其余模版沿用菜单权限。
+CAP_AI_STRATEGY = "ai_strategy"
+
+CAPABILITY_REGISTRY: tuple[tuple[str, str], ...] = (
+    (CAP_AI_STRATEGY, "AI 智能加仓策略"),
+)
+
+ALL_CAPABILITY_CODES: tuple[str, ...] = tuple(code for code, _ in CAPABILITY_REGISTRY)
+CAPABILITY_NAMES: dict[str, str] = dict(CAPABILITY_REGISTRY)
+
+# AI 智能加仓策略对应的模版 ID（与 strategy_templates.TEMPLATE_1_ID 一致）。
+# 这里用字面量而非 import，避免 permissions 被策略模版反向依赖。
+AI_STRATEGY_TEMPLATE_ID = "tpl_1"
+
+
 @dataclass(frozen=True)
 class Principal:
     """一次请求 / 一条后台 WS 连接的登录身份。"""
@@ -65,6 +89,7 @@ class Principal:
     username: str
     is_admin: bool
     menus: frozenset[str]
+    capabilities: frozenset[str] = frozenset()
     token_version: int = 0
 
 
@@ -106,6 +131,59 @@ def resolve_menus(is_admin: bool, role_menu_codes: Iterable[object] | None) -> f
 def can_menu(p: Principal, *codes: str) -> bool:
     """是否拥有任一菜单（同一操作可能出现在多个页面，例如总览与节点页都能平仓）。"""
     return p.is_admin or any(c in p.menus for c in codes)
+
+
+# ---------------------------------------------------------------------------
+# 能力
+# ---------------------------------------------------------------------------
+def normalize_capability_codes(codes: Iterable[object] | None) -> list[str]:
+    """能力码去空白、去重并按注册表顺序排列；注册表里没有的 code 丢弃。"""
+    wanted = set(_clean_codes(codes))
+    return [c for c in ALL_CAPABILITY_CODES if c in wanted]
+
+
+def invalid_capability_codes(codes: Iterable[object] | None) -> list[str]:
+    """角色不能勾选的能力：注册表里没有的 code。"""
+    return [c for c in _clean_codes(codes) if c not in ALL_CAPABILITY_CODES]
+
+
+def resolve_capabilities(
+    is_admin: bool, role_capability_codes: Iterable[object] | None,
+) -> frozenset[str]:
+    """用户最终可用的能力：管理员 = 全部；普通用户 = 角色能力并集 ∩ 注册表。"""
+    if is_admin:
+        return frozenset(ALL_CAPABILITY_CODES)
+    return frozenset(normalize_capability_codes(role_capability_codes))
+
+
+def can_capability(p: Principal, code: str) -> bool:
+    """是否拥有该能力；管理员直接放行（权限页显示「全部能力」）。"""
+    return p.is_admin or code in p.capabilities
+
+
+def is_ai_strategy_template(template_id: object | None) -> bool:
+    """该模版是否为 AI 智能加仓策略（模版1）。"""
+    return str(template_id or "").strip().lower() == AI_STRATEGY_TEMPLATE_ID
+
+
+def can_create_strategy(p: Principal, template_id: object | None) -> bool:
+    """能否新建该模版的策略：AI 加仓看能力，其余模版看「策略管理 / 分组管理」菜单。"""
+    if is_ai_strategy_template(template_id):
+        return can_capability(p, CAP_AI_STRATEGY)
+    return can_menu(p, MENU_STRATEGIES, MENU_GROUPS)
+
+
+def can_write_strategy(p: Principal, strategy: dict | None) -> bool:
+    """能否编辑 / 启停 / 删除该策略：AI 加仓看能力，其余模版看菜单 + 数据归属。
+
+    读与写分开：普通用户仍可查看自己名下的 AI 加仓策略（分发中的实例要能看到），
+    但任何写操作都要求能力。
+    """
+    if not strategy:
+        return False
+    if is_ai_strategy_template(strategy.get("template_id")):
+        return can_capability(p, CAP_AI_STRATEGY)
+    return can_menu(p, MENU_STRATEGIES, MENU_GROUPS) and owns(p, strategy.get("owner_user_id"))
 
 
 # ---------------------------------------------------------------------------

@@ -1245,6 +1245,18 @@ export interface MeInfo {
   is_admin: boolean
   roles: RoleRef[]
   menus: string[]
+  /** 角色能力列表，如 ai_strategy；管理员固定全部能力 */
+  capabilities: string[]
+}
+
+/** 「我的」枢纽页模块卡片 */
+export interface ProfileHubModule {
+  code: string
+  label: string
+  description: string
+  path: string
+  icon: string
+  accent: string
 }
 
 /** 菜单注册表条目；assignable=false 的只属于超级管理员 */
@@ -1263,6 +1275,7 @@ export interface RoleOut {
   enabled: boolean
   remark: string | null
   menus: string[]
+  capabilities: string[]
   user_count: number
   created_at: number | null
 }
@@ -1273,6 +1286,7 @@ export interface RoleCreatePayload {
   remark?: string | null
   enabled?: boolean
   menus: string[]
+  capabilities: string[]
 }
 
 export interface RoleUpdatePayload {

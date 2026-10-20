@@ -8,6 +8,7 @@ import TagSelect from '@/components/TagSelect.vue'
 import type { TagOption } from '@/components/tagOption'
 import StrategySignalFields from '@/components/StrategySignalFields.vue'
 import { signalSymbolMatches, type StrategySignalDraft } from '@/components/strategySignal'
+import { useAuthStore } from '@/stores/auth'
 import { useHubStore } from '@/stores/hub'
 import type {
   BatchCalcType,
@@ -63,6 +64,7 @@ const RULE_TYPE_RISK_SIZED = 3
 const RULE_TYPE_GRID = 4
 
 const hub = useHubStore()
+const auth = useAuthStore()
 const templates = ref<StrategyTemplateOut[]>([])
 const editingTemplateName = ref('')
 const saving = ref(false)
@@ -106,12 +108,25 @@ const formTemplateLabel = computed(() => {
 })
 
 const templateTagOptions = computed(() => {
-  const opts = templates.value.map((t) => ({ value: t.template_id, label: t.name }))
+  const opts = templates.value.map((t) => {
+    const isTpl1 = t.template_id === TEMPLATE_1_ID
+    const locked = isTpl1 && !auth.canUseAiStrategy
+    return {
+      value: t.template_id,
+      label: t.name + (locked ? '（需 AI 策略权限）' : ''),
+      disabled: locked || (isEditMode.value && isTpl1),
+    }
+  })
   if (isEditMode.value && form.template_id && !selectedTemplate.value) {
-    opts.push({ value: form.template_id, label: formTemplateLabel.value })
+    opts.push({ value: form.template_id, label: formTemplateLabel.value, disabled: false })
   }
   return opts
 })
+
+/** 当前用户无法使用 AI 加仓策略（需能力或管理员） */
+const isTpl1LockedForCurrentUser = computed(() =>
+  form.template_id === TEMPLATE_1_ID && !auth.canUseAiStrategy,
+)
 
 const MONITOR_MODE_TAGS: TagOption<RiskMonitorMode>[] = [
   { value: 'loop', label: '循环' },
@@ -2665,6 +2680,9 @@ function resetRuleToTemplate(idx: number): void {
         </div>
 
         <p v-if="formError" class="form-error" style="margin-top: 10px">{{ formError }}</p>
+        <div v-if="isTpl1LockedForCurrentUser" class="form-error" style="margin-top: 10px">
+          AI 智能加仓策略需管理员授权后才能使用，当前角色未获授权
+        </div>
       </div>
 
       <div class="modal-footer card-pad" style="padding-top: 0">
@@ -2680,8 +2698,8 @@ function resetRuleToTemplate(idx: number): void {
           >
             {{ saving ? '处理中…' : '触发信号' }}
           </button>
-          <button class="btn-primary" :disabled="saving" @click="save">
-            {{ saving ? '保存中…' : isEditMode ? '保存' : '创建' }}
+          <button class="btn-primary" :disabled="saving || isTpl1LockedForCurrentUser" @click="save">
+            {{ saving ? '保存中…' : isTpl1LockedForCurrentUser ? '需 AI 策略权限' : isEditMode ? '保存' : '创建' }}
           </button>
         </div>
       </div>

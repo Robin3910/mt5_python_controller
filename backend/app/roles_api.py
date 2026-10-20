@@ -8,7 +8,15 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from . import permissions, persist, rbac_service
 from .deps import client_ip, get_store, require_admin
-from .models import MenuOut, RoleCreate, RoleMenusUpdate, RoleOut, RoleUpdate
+from .models import (
+    CapabilityOut,
+    MenuOut,
+    RoleCapabilitiesUpdate,
+    RoleCreate,
+    RoleMenusUpdate,
+    RoleOut,
+    RoleUpdate,
+)
 from .permissions import Principal
 from .redis_store import RedisStore
 
@@ -25,7 +33,10 @@ async def _role_or_404(role_id: int) -> dict:
 def _snapshot(role: dict | None) -> dict | None:
     if not role:
         return None
-    return {k: role.get(k) for k in ("id", "code", "name", "enabled", "remark", "menus")}
+    return {
+        k: role.get(k)
+        for k in ("id", "code", "name", "enabled", "remark", "menus", "capabilities")
+    }
 
 
 @router.get("/menus", response_model=list[MenuOut])
@@ -34,6 +45,15 @@ async def list_menus(_: Principal = Depends(require_admin)):
     return [
         MenuOut(code=m.code, name=m.name, path=m.path, assignable=m.assignable)
         for m in permissions.MENU_REGISTRY
+    ]
+
+
+@router.get("/capabilities", response_model=list[CapabilityOut])
+async def list_capabilities(_: Principal = Depends(require_admin)):
+    """能力注册表（角色编辑页据此列出可勾选项；与菜单同样只有代码里已登记的）。"""
+    return [
+        CapabilityOut(code=code, name=name)
+        for code, name in permissions.CAPABILITY_REGISTRY
     ]
 
 
@@ -53,7 +73,7 @@ async def create_role(
     try:
         role = await rbac_service.create_role(
             code=body.code, name=body.name, remark=body.remark,
-            enabled=body.enabled, menus=body.menus,
+            enabled=body.enabled, menus=body.menus, capabilities=body.capabilities,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -109,6 +129,33 @@ async def set_role_menus(
     await rbac_service.refresh_sessions(store, await rbac_service.usernames_with_role(role_id))
     await persist.audit(
         p.username, "set_role_menus", role["code"], {"menus": body.menus}, "ok",
+        client_ip(request), category="auth", before=_snapshot(before), after=_snapshot(role),
+    )
+    return role
+
+
+@router.put("/roles/{role_id}/capabilities", response_model=RoleOut)
+async def set_role_capabilities(
+    role_id: int,
+    body: RoleCapabilitiesUpdate,
+    request: Request,
+    store: RedisStore = Depends(get_store),
+    p: Principal = Depends(require_admin),
+):
+    """整体替换角色能力（如授权 AI 智能加仓策略）；未知能力码拒收。
+
+    与菜单同理走 refresh_sessions：持有该角色的用户下次拉取即生效。
+    """
+    before = await _role_or_404(role_id)
+    try:
+        role = await rbac_service.set_role_capabilities(role_id, body.capabilities)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if role is None:
+        raise HTTPException(status_code=404, detail="role not found")
+    await rbac_service.refresh_sessions(store, await rbac_service.usernames_with_role(role_id))
+    await persist.audit(
+        p.username, "set_role_capabilities", role["code"], {"capabilities": body.capabilities}, "ok",
         client_ip(request), category="auth", before=_snapshot(before), after=_snapshot(role),
     )
     return role

@@ -22,6 +22,11 @@ export const useAuthStore = defineStore('auth', {
     isAdmin: (s): boolean => !!s.me?.is_admin,
     /** 是否拥有某菜单；未拉到用户信息前一律视为没有 */
     hasMenu: (s) => (code: string): boolean => !!s.me && s.me.menus.includes(code),
+    /** 是否拥有某能力；未拉到用户信息前一律视为没有。管理员永远返回 true。 */
+    hasCapability: (s) => (cap: string): boolean =>
+      !!s.me?.is_admin || (!!s.me && s.me.capabilities?.includes(cap)) || false,
+    /** 能否使用 AI 智能加仓策略（tpl_1） */
+    canUseAiStrategy: (s): boolean => s.me?.is_admin || (!!s.me && s.me.capabilities?.includes('ai_strategy')) || false,
   },
   actions: {
     setToken(token: string): void {

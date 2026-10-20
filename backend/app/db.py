@@ -374,6 +374,7 @@ async def init_db() -> None:
         await conn.run_sync(_migrate_dashboard_columns)
         await conn.run_sync(_migrate_node_credentials)
         await conn.run_sync(_migrate_node_primary)
+        await conn.run_sync(_migrate_role_capabilities)
     logger.info("Database initialized (%s)", engine.url.render_as_string(hide_password=True))
 
 
@@ -427,6 +428,19 @@ def _migrate_node_credentials(sync_conn) -> None:
             "FROM node_credential old JOIN nodes n ON n.node_id = old.node_id "
             "WHERE NOT EXISTS (SELECT 1 FROM node_credentials fresh WHERE fresh.node_id = old.node_id)"
         ))
+
+
+def _migrate_role_capabilities(sync_conn) -> None:
+    """sys_role.capabilities：角色能力码 JSON 数组（默认空，即无 AI 策略授权）。"""
+    inspector = inspect(sync_conn)
+    if "sys_role" not in inspector.get_table_names():
+        return
+    cols = {c["name"] for c in inspector.get_columns("sys_role")}
+    if "capabilities" in cols:
+        return
+    sync_conn.execute(
+        text("ALTER TABLE sys_role ADD COLUMN capabilities TEXT NOT NULL DEFAULT '[]'")
+    )
 
 
 def _migrate_node_primary(sync_conn) -> None:

@@ -83,6 +83,7 @@ async def me(p: Principal = Depends(get_principal)):
         is_admin=p.is_admin,
         roles=[RoleRef(**r) for r in roles],
         menus=permissions.normalize_menu_codes(p.menus),
+        capabilities=permissions.normalize_capability_codes(p.capabilities),
     )
 
 

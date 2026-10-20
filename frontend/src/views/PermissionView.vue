@@ -9,7 +9,7 @@ import TagSelect from '@/components/TagSelect.vue'
 import type { TagOption } from '@/components/tagOption'
 import { useAuthStore } from '@/stores/auth'
 import { useHubStore } from '@/stores/hub'
-import { useRbacStore } from '@/stores/rbac'
+import { CAPABILITIES, useRbacStore } from '@/stores/rbac'
 import { confirmAction } from '@/utils/confirm'
 import type {
   NodeAssignConflict,
@@ -91,6 +91,7 @@ const roleForm = ref({
   remark: '',
   enabled: true,
   menus: [] as string[],
+  capabilities: [] as string[],
 })
 const roleFormError = ref('')
 const roleSaving = ref(false)
@@ -163,6 +164,10 @@ function roleNames(user: UserOut): string {
 
 function menuNames(codes: string[]): string {
   return codes.map((c) => rbac.menuName(c)).join('、') || '—'
+}
+
+function capabilityNames(codes: string[]): string {
+  return codes.map((c) => CAPABILITIES.find((cap) => cap.code === c)?.label || c).join('、') || '—'
 }
 
 function nodeOwnerLabel(n: NodeOut): string {
@@ -459,6 +464,7 @@ function openCreateRole(): void {
     remark: '',
     enabled: true,
     menus: rbac.assignableMenus.map((m) => m.code),
+    capabilities: [],
   }
   roleFormError.value = ''
   showRoleForm.value = true
@@ -473,6 +479,7 @@ function openEditRole(role: RoleOut): void {
     remark: role.remark || '',
     enabled: role.enabled,
     menus: [...role.menus],
+    capabilities: [...(role.capabilities || [])],
   }
   roleFormError.value = ''
   showRoleForm.value = true
@@ -483,6 +490,13 @@ function toggleRoleMenu(code: string, checked: boolean): void {
   if (checked) set.add(code)
   else set.delete(code)
   roleForm.value.menus = rbac.assignableMenus.filter((m) => set.has(m.code)).map((m) => m.code)
+}
+
+function toggleCapability(code: string, checked: boolean): void {
+  const set = new Set(roleForm.value.capabilities)
+  if (checked) set.add(code)
+  else set.delete(code)
+  roleForm.value.capabilities = [...set]
 }
 
 async function saveRole(): Promise<void> {
@@ -505,6 +519,7 @@ async function saveRole(): Promise<void> {
         remark: f.remark.trim() || null,
         enabled: f.enabled,
         menus: f.menus,
+        capabilities: f.capabilities,
       })
       ElMessage.success('角色已创建')
     } else if (editingRole.value) {
@@ -516,6 +531,7 @@ async function saveRole(): Promise<void> {
           enabled: f.enabled,
         })
         await rbac.setRoleMenus(editingRole.value.id, f.menus)
+        await rbac.setRoleCapabilities(editingRole.value.id, f.capabilities)
       }
       ElMessage.success('角色已更新')
     }
@@ -708,6 +724,7 @@ async function removeRole(role: RoleOut): Promise<void> {
                 <th>编码</th>
                 <th>类型</th>
                 <th>菜单</th>
+                <th>能力</th>
                 <th>用户数</th>
                 <th>状态</th>
                 <th class="right">操作</th>
@@ -722,6 +739,11 @@ async function removeRole(role: RoleOut): Promise<void> {
                 <td>{{ r.code }}</td>
                 <td><span class="tag" :class="r.is_builtin ? 'blue' : ''">{{ r.is_builtin ? '内置' : '自定义' }}</span></td>
                 <td class="perm-menus">{{ isAdminRole(r) ? '全部菜单' : menuNames(r.menus) }}</td>
+                <td class="perm-menus">
+                  <span v-if="isAdminRole(r)">全部</span>
+                  <span v-else-if="!r.capabilities?.length">—</span>
+                  <span v-else>{{ capabilityNames(r.capabilities) }}</span>
+                </td>
                 <td>{{ r.user_count }}</td>
                 <td><span class="tag" :class="r.enabled ? 'green' : ''">{{ r.enabled ? '启用' : '停用' }}</span></td>
                 <td class="right">
@@ -1018,6 +1040,31 @@ async function removeRole(role: RoleOut): Promise<void> {
               </div>
               <p v-if="editingRole && isAdminRole(editingRole)" class="muted" style="font-size: 12px; margin-top: 8px">
                 超级管理员角色固定，不可改名称、菜单或停用。
+              </p>
+            </div>
+
+            <!-- 能力：细粒度功能授权 -->
+            <div class="span-full">
+              <FormLabel text="能力" help="细粒度功能授权。管理员角色固定拥有全部能力，无需单独设置。" />
+              <div class="check-list">
+                <label
+                  v-for="cap in CAPABILITIES"
+                  :key="cap.code"
+                  class="check-item"
+                  :class="{ selected: roleForm.capabilities.includes(cap.code) }"
+                >
+                  <input
+                    type="checkbox"
+                    :checked="roleForm.capabilities.includes(cap.code)"
+                    :disabled="Boolean(editingRole && isAdminRole(editingRole))"
+                    @change="toggleCapability(cap.code, ($event.target as HTMLInputElement).checked)"
+                  />
+                  <span>{{ cap.label }}</span>
+                  <span class="muted">{{ cap.description }}</span>
+                </label>
+              </div>
+              <p v-if="editingRole && isAdminRole(editingRole)" class="muted" style="font-size: 12px; margin-top: 8px">
+                管理员角色固定拥有全部能力，此处不可修改。
               </p>
             </div>
             <div v-if="roleFormError" class="span-full perm-error">{{ roleFormError }}</div>

@@ -17,6 +17,7 @@ import { confirmAction } from '@/utils/confirm'
 
 /** ATR / 波幅统计的已收盘 K 线根数，与后端 BATCH_BAR_PERIOD 一致 */
 const BATCH_BAR_PERIOD = 14
+const TEMPLATE_1_ID = 'tpl_1'
 
 /** 规则 type，与后端 strategy_templates 对齐 */
 const RULE_TYPE_COUNTER = 1
@@ -206,6 +207,11 @@ function actionLabel(action: string | undefined | null): string {
 function calcTypeLabel(calcType: BatchCalcType | string | undefined): string {
   const key = (calcType || 'point') as BatchCalcType
   return CALC_TYPE_LABEL[key] || String(calcType || '点数')
+}
+
+/** 无 AI 策略能力时，AI 加仓实例的所有写操作被禁用 */
+function isAiStrategyLocked(s: StrategyOut): boolean {
+  return s.template_id === TEMPLATE_1_ID && !auth.canUseAiStrategy
 }
 
 /** 开仓方式；缺字段的历史配置一律按市价，与后端归一化口径一致 */
@@ -442,11 +448,11 @@ function fmtTime(sec: number | null | undefined): string {
           </div>
         </div>
         <div class="list-card-actions" @click.stop>
-          <button class="btn-sm btn-ghost" @click="openEdit(s)">编辑</button>
-          <button class="btn-sm" :class="s.enabled ? 'btn-ghost' : 'btn-danger'" @click="toggleEnabled(s)">
+          <button class="btn-sm btn-ghost" :disabled="isAiStrategyLocked(s)" @click="openEdit(s)">编辑</button>
+          <button class="btn-sm" :class="s.enabled ? 'btn-ghost' : 'btn-danger'" :disabled="isAiStrategyLocked(s)" @click="toggleEnabled(s)">
             {{ s.enabled ? '禁用' : '启用' }}
           </button>
-          <button class="btn-sm btn-danger" @click="remove(s)">删除</button>
+          <button class="btn-sm btn-danger" :disabled="isAiStrategyLocked(s)" @click="remove(s)">删除</button>
         </div>
       </div>
       <div v-if="!hub.strategies.length && !loading" class="card card-pad muted">
@@ -490,8 +496,8 @@ function fmtTime(sec: number | null | undefined): string {
               </td>
               <td class="right" @click.stop>
                 <div class="row" style="gap: 6px; justify-content: flex-end">
-                  <button class="btn-sm btn-ghost" @click="openEdit(s)">编辑</button>
-                  <button class="btn-sm btn-danger" @click="remove(s)">删除</button>
+                  <button class="btn-sm btn-ghost" :disabled="isAiStrategyLocked(s)" @click="openEdit(s)">编辑</button>
+                  <button class="btn-sm btn-danger" :disabled="isAiStrategyLocked(s)" @click="remove(s)">删除</button>
                 </div>
               </td>
             </tr>

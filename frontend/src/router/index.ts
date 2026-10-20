@@ -98,6 +98,13 @@ const router = createRouter({
       meta: { menu: 'permissions' },
     },
     { path: '/config', name: 'config', component: () => import('@/views/ConfigView.vue') },
+    { path: '/me', name: 'me', component: () => import('@/views/ProfileView.vue') },
+    {
+      path: '/user-strategies',
+      name: 'user-strategies',
+      component: () => import('@/views/UserStrategiesView.vue'),
+      meta: { menu: 'strategies' },
+    },
   ],
 })
 

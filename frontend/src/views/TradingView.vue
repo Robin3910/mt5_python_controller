@@ -68,28 +68,40 @@ function nodeOnline(n: NodeOut): boolean {
 }
 const isOnline = computed(() => !!primaryNode.value && nodeOnline(primaryNode.value))
 
-// ── 单品种报价 ──
-const QUOTE_SYMBOLS = ['EURUSD', 'GBPUSD', 'XAUUSD', 'USDJPY', 'AUDUSD'] as const
-type QuoteSymbol = (typeof QUOTE_SYMBOLS)[number]
+// ── 多品种报价 ──
+// 不再限制白名单，动态从账户数据中获取所有有报价或持仓的品种
+// 保持与首页 HubTrendEmbed 一致的逻辑
 
 /**
- * 节点当前实际有报价数据的 symbol 列表。
- * 判定：`account.quotes[sym].bid > 0`（任一字段非零即认为终端上报了）。
- * 始终按 QUOTE_SYMBOLS 顺序展示，便于用户形成稳定预期。
+ * 当前账户所有可用品种：合并 quotes 和 positions，
+ * 同时追加白名单（即使暂无数据也要展示，方便用户感知可交易品种）。
+ * 按字母序排列。
  */
-const availableSymbols = computed<QuoteSymbol[]>(() => {
-  const quotes = account.value?.quotes
-  if (!quotes) return []
-  return QUOTE_SYMBOLS.filter((sym) => {
+const ALL_QUOTE_SYMBOLS = [] as const
+type AllQuoteSymbol = (typeof ALL_QUOTE_SYMBOLS)[number]
+
+const availableSymbols = computed<AllQuoteSymbol[]>(() => {
+  const found = new Set<AllQuoteSymbol>()
+  // 白名单：确保用户能感知所有常见品种
+  for (const sym of ALL_QUOTE_SYMBOLS) found.add(sym)
+  // quotes 中有数据的品种
+  const quotes = account.value?.quotes || {}
+  for (const sym of Object.keys(quotes)) {
     const q = quotes[sym]
-    if (!q) return false
-    return (q.bid || 0) > 0 || (q.ask || 0) > 0 || (q.mid || 0) > 0
-  })
+    if ((q.bid || 0) > 0 || (q.ask || 0) > 0 || (q.mid || 0) > 0) {
+      found.add(sym.toUpperCase() as AllQuoteSymbol)
+    }
+  }
+  // 持仓中的品种
+  for (const pos of account.value?.positions || []) {
+    if (pos.symbol) found.add(pos.symbol.toUpperCase() as AllQuoteSymbol)
+  }
+  return [...found].sort()
 })
 
 // 当前选中：默认 = 第一个有数据的 symbol；快照未到时回退到白名单首项
-const currentSymbol = ref<QuoteSymbol>(
-  (availableSymbols.value[0] ?? QUOTE_SYMBOLS[0]) as QuoteSymbol,
+const currentSymbol = ref<AllQuoteSymbol>(
+  (availableSymbols.value[0] ?? ALL_QUOTE_SYMBOLS[0]) as AllQuoteSymbol,
 )
 
 // 当前选中的 symbol 在可用列表里突然消失（节点切换/快照清空）时，自动回退到第一个可用 symbol
@@ -101,7 +113,7 @@ watch(availableSymbols, (list) => {
 })
 
 function pickSymbol(sym: string): void {
-  currentSymbol.value = sym as QuoteSymbol
+  currentSymbol.value = sym as AllQuoteSymbol
 }
 
 function currentQuote(): QuoteInfo | null {

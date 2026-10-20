@@ -5,6 +5,9 @@
 
 普通用户只能看 / 改自己创建的策略；写操作需要「策略管理」或「分组管理」菜单
 （分组页里可以直接新建、编辑策略）。
+
+AI 智能加仓策略（模版1 / tpl_1）另需 ai_strategy 能力（见 permissions），
+未获授权的角色即使能进这个页面，也无法新建 / 编辑 / 删除该模版的实例。
 """
 import asyncio
 import logging
@@ -109,6 +112,14 @@ def _strategy_audit_snapshot(d: dict | None) -> dict | None:
     }
 
 
+def _deny_ai_strategy() -> None:
+    """AI 智能加仓策略未授权：与菜单无权同样的 403 口径，只是文案说明原因。"""
+    raise HTTPException(
+        status_code=403,
+        detail="AI 智能加仓策略需管理员授权后才能使用",
+    )
+
+
 def _to_strategy_out(d: dict, owner_names: dict[int, str] | None = None) -> StrategyOut:
     rules = [StrategyRule(**r) for r in (d.get("rules") or [])]
     owner = permissions.normalize_owner(d.get("owner_user_id"))
@@ -179,6 +190,8 @@ async def create_strategy(
     p: Principal = Depends(require_menu(MENU_STRATEGIES, MENU_GROUPS)),
 ):
     """新建策略：归创建者所有（管理员建的归管理员名下），名称在同一所有者内唯一。"""
+    if not permissions.can_create_strategy(p, body.template_id):
+        _deny_ai_strategy()
     owner = permissions.owner_for_new(p)
     name = body.name.strip()
     if await strategy_service.name_exists(name, owner_user_id=owner):
@@ -214,6 +227,12 @@ async def update_strategy(
     p: Principal = Depends(require_menu(MENU_STRATEGIES, MENU_GROUPS)),
 ):
     current = await owned_strategy_or_404(store, p, strategy_id)
+    # 菜单与归属已由依赖和 owned_* 把关，这里只补 AI 加仓的能力校验。
+    # StrategyUpdate 不含 template_id，模版在创建后不可改，故只需看当前实例。
+    if permissions.is_ai_strategy_template(current.get("template_id")) and not (
+        permissions.can_capability(p, permissions.CAP_AI_STRATEGY)
+    ):
+        _deny_ai_strategy()
     if body.name is not None and (name := body.name.strip()):
         if await strategy_service.name_exists(
             name, exclude_strategy_id=strategy_id, owner_user_id=current.get("owner_user_id"),
@@ -248,6 +267,10 @@ async def delete_strategy(
     p: Principal = Depends(require_menu(MENU_STRATEGIES, MENU_GROUPS)),
 ):
     before = _strategy_audit_snapshot(await owned_strategy_or_404(store, p, strategy_id))
+    if permissions.is_ai_strategy_template(before.get("template_id")) and not (
+        permissions.can_capability(p, permissions.CAP_AI_STRATEGY)
+    ):
+        _deny_ai_strategy()
     ok = await strategy_service.delete_strategy(store, strategy_id)
     if not ok:
         raise HTTPException(status_code=404, detail="strategy not found")

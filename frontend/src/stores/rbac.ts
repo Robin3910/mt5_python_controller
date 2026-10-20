@@ -17,6 +17,11 @@ interface RbacState {
   menus: MenuDef[]
 }
 
+/** 能力注册表（与后端 permissions.CAPABILITY_REGISTRY 对齐）。 */
+export const CAPABILITIES = [
+  { code: 'ai_strategy', label: 'AI 智能加仓策略', description: '允许新建、编辑、删除 AI 智能加仓策略（模版1）实例' },
+] as const
+
 // 用户权限管理（仅超级管理员）：用户、角色、菜单注册表
 export const useRbacStore = defineStore('rbac', {
   state: (): RbacState => ({ users: [], roles: [], menus: [] }),
@@ -79,6 +84,10 @@ export const useRbacStore = defineStore('rbac', {
     },
     async setRoleMenus(id: number, menus: string[]): Promise<void> {
       await api.put(`/api/roles/${id}/menus`, { menus })
+      await this.fetchRoles()
+    },
+    async setRoleCapabilities(id: number, caps: string[]): Promise<void> {
+      await api.put(`/api/roles/${id}/capabilities`, { capabilities: caps })
       await this.fetchRoles()
     },
     async deleteRole(id: number): Promise<void> {

@@ -61,8 +61,30 @@ def _assign(client, h, user_id: int, node_ids: list[str], confirm: bool = False)
     )
 
 
-def _mk_strategy(client, h, name: str, symbol: str = "XAUUSD") -> dict:
+def _grant_ai_strategy(client, admin_h) -> None:
+    """给内置普通用户角色授权 AI 智能加仓策略（走公共接口，与权限页勾选同一路径）。
+
+    必须用管理员的 header：改角色能力是 require_admin 端点。
+    角色级生效后该角色下所有用户都拿到能力。
+    """
+    roles = client.get("/api/roles", headers=admin_h).json()
+    role = next(r for r in roles if r["code"] == "user")
+    r = client.put(
+        f"/api/roles/{role['id']}/capabilities",
+        json={"capabilities": ["ai_strategy"]}, headers=admin_h,
+    )
+    assert r.status_code == 200, r.text
+
+
+def _mk_strategy(client, h, name: str, symbol: str = "XAUUSD", admin_h=None) -> dict:
+    """以 AI 智能加仓模版（tpl_1）新建策略。
+
+    tpl_1 需要 ai_strategy 能力；这些用例要验证的是数据归属而非授权本身，
+    故先用管理员 header 给普通用户角色授权，再以使用者身份创建。
+    """
     from app.strategy_templates import TEMPLATE_1_ID
+    if admin_h is not None:
+        _grant_ai_strategy(client, admin_h)
     r = client.post(
         "/api/strategies", json={"template_id": TEMPLATE_1_ID, "name": name, "symbol": symbol},
         headers=h,
@@ -227,7 +249,7 @@ def test_group_and_strategy_owner_rules(client):
     _assign(client, h, alice["id"], [n1])
     ah, bh = _login(client, "alice"), _login(client, "bob")
 
-    sa = _mk_strategy(client, ah, "黄金加仓")
+    sa = _mk_strategy(client, ah, "黄金加仓", admin_h=h)
     assert sa["owner_user_id"] == alice["id"]
     admin_sty = _mk_strategy(client, h, "管理员策略")
 
@@ -250,7 +272,7 @@ def test_group_and_strategy_owner_rules(client):
     assert client.get("/api/strategies", headers=bh).json() == []
     # 名称只在同一所有者内唯一
     assert _mk_group(client, bh, "A组").status_code == 201
-    assert _mk_strategy(client, bh, "黄金加仓")["owner_user_id"] != alice["id"]
+    assert _mk_strategy(client, bh, "黄金加仓", admin_h=h)["owner_user_id"] != alice["id"]
 
     # 管理员编辑用户的分组：成员仍只能选该用户名下的节点
     r = client.patch(f"/api/groups/{gid}", json={"node_ids": [n1, n2]}, headers=h)
@@ -265,7 +287,7 @@ def test_manual_signal_scoped_to_own_groups(client):
     n1 = _mk_node(client, h, 7201)
     _assign(client, h, alice["id"], [n1])
     ah = _login(client, "alice")
-    sa = _mk_strategy(client, ah, "a-xau")
+    sa = _mk_strategy(client, ah, "a-xau", admin_h=h)
     ga = _mk_group(client, ah, "A组", [n1], sa["strategy_id"]).json()
     sb = _mk_strategy(client, h, "admin-xau")
     gb = _mk_group(client, h, "管理员组", [], sb["strategy_id"]).json()
@@ -483,7 +505,7 @@ def test_audits_scoped_for_user_and_auth_category(client):
     n1 = _mk_node(client, h, 7601)
     _assign(client, h, alice["id"], [n1])
     ah = _login(client, "alice")
-    _mk_strategy(client, ah, "a-s")
+    _mk_strategy(client, ah, "a-s", admin_h=h)
 
     items = client.get("/api/audits", params={"category": "all", "page_size": 100}, headers=ah).json()["items"]
     assert items and all(a["operator"] == "alice" for a in items)
@@ -587,3 +609,209 @@ async def test_seed_rbac_binds_legacy_admin_only_on_first_upgrade():
         assert again is not None and not again.is_admin
     finally:
         await engine.dispose()
+
+
+# =====================================================================
+# AI 智能加仓策略的能力授权（tpl_1 需 ai_strategy）
+# =====================================================================
+def _mk_strategy_as(client, h, template_id: str, name: str) -> object:
+    return client.post(
+        "/api/strategies",
+        json={"template_id": template_id, "name": name, "symbol": "XAUUSD"},
+        headers=h,
+    )
+
+
+def test_ai_strategy_requires_capability_to_create(client):
+    """未授权的普通用户建不了 tpl_1，其余模版照常。"""
+    from app import permissions as perm
+    from app.strategy_templates import TEMPLATE_2_ID
+
+    h = auth_headers(client)
+    _mk_user(client, h, "alice")
+    ah = _login(client, "alice")
+
+    assert perm.CAP_AI_STRATEGY not in client.get("/api/me", headers=ah).json()["capabilities"]
+    denied = _mk_strategy_as(client, ah, perm.AI_STRATEGY_TEMPLATE_ID, "越权加仓")
+    assert denied.status_code == 403
+    assert "授权" in denied.json()["detail"]
+    # 未被拒绝时不该留下任何实例
+    assert client.get("/api/strategies", headers=ah).json() == []
+
+    # 其它模版不受 AI 授权影响
+    assert _mk_strategy_as(client, ah, TEMPLATE_2_ID, "普通趋势单").status_code == 201
+
+
+def test_ai_strategy_capability_grant_and_revoke(client):
+    """授权后能建 AI 加仓；收回后立刻回到 403。"""
+    from app import permissions as perm
+
+    h = auth_headers(client)
+    _mk_user(client, h, "alice")
+    roles = {r["code"]: r for r in client.get("/api/roles", headers=h).json()}
+    user_role = roles["user"]
+
+    denied = _mk_strategy_as(
+        client, _login(client, "alice"), perm.AI_STRATEGY_TEMPLATE_ID, "加仓-授权前",
+    )
+    assert denied.status_code == 403
+
+    grant = client.put(
+        f"/api/roles/{user_role['id']}/capabilities",
+        json={"capabilities": [perm.CAP_AI_STRATEGY]}, headers=h,
+    )
+    assert grant.status_code == 200
+    assert grant.json()["capabilities"] == [perm.CAP_AI_STRATEGY]
+
+    ah = _login(client, "alice")
+    assert perm.CAP_AI_STRATEGY in client.get("/api/me", headers=ah).json()["capabilities"]
+    assert _mk_strategy_as(client, ah, perm.AI_STRATEGY_TEMPLATE_ID, "加仓-授权后").status_code == 201
+
+    revoke = client.put(
+        f"/api/roles/{user_role['id']}/capabilities", json={"capabilities": []}, headers=h,
+    )
+    assert revoke.status_code == 200
+    assert _mk_strategy_as(
+        client, _login(client, "alice"), perm.AI_STRATEGY_TEMPLATE_ID, "加仓-收回后",
+    ).status_code == 403
+
+
+def test_ai_strategy_write_denied_after_grant_revoked(client):
+    """授权被收回后，既有 AI 加仓实例的任何写操作都要 403。"""
+    from app import permissions as perm
+    from app.strategy_templates import TEMPLATE_2_ID
+
+    h = auth_headers(client)
+    _mk_user(client, h, "alice")
+    roles = {r["code"]: r for r in client.get("/api/roles", headers=h).json()}
+    user_role = roles["user"]
+    client.put(
+        f"/api/roles/{user_role['id']}/capabilities",
+        json={"capabilities": [perm.CAP_AI_STRATEGY]}, headers=h,
+    )
+
+    ah = _login(client, "alice")
+    ai = _mk_strategy_as(client, ah, perm.AI_STRATEGY_TEMPLATE_ID, "我的加仓").json()
+    plain = _mk_strategy_as(client, ah, TEMPLATE_2_ID, "我的趋势单").json()
+
+    # 收回授权
+    client.put(
+        f"/api/roles/{user_role['id']}/capabilities", json={"capabilities": []}, headers=h,
+    )
+    ah = _login(client, "alice")
+
+    assert client.patch(
+        f"/api/strategies/{ai['strategy_id']}", json={"name": "改名"}, headers=ah,
+    ).status_code == 403
+    assert client.delete(f"/api/strategies/{ai['strategy_id']}", headers=ah).status_code == 403
+    # 不允许把普通模版的实例改成 AI 加仓来绕过
+    assert client.patch(
+        f"/api/strategies/{plain['strategy_id']}", json={"name": "改个名"}, headers=ah,
+    ).status_code == 200
+
+
+def test_ai_strategy_readable_without_capability(client):
+    """能力只管写：普通用户仍能看到自己名下的 AI 加仓实例（分发中要看得见）。"""
+    from app import permissions as perm
+
+    h = auth_headers(client)
+    _mk_user(client, h, "alice")
+    roles = {r["code"]: r for r in client.get("/api/roles", headers=h).json()}
+    client.put(
+        f"/api/roles/{roles['user']['id']}/capabilities",
+        json={"capabilities": [perm.CAP_AI_STRATEGY]}, headers=h,
+    )
+    ah = _login(client, "alice")
+    ai = _mk_strategy_as(client, ah, perm.AI_STRATEGY_TEMPLATE_ID, "我的加仓").json()
+
+    client.put(
+        f"/api/roles/{roles['user']['id']}/capabilities", json={"capabilities": []}, headers=h,
+    )
+    ah = _login(client, "alice")
+
+    listed = client.get("/api/strategies", headers=ah).json()
+    assert [s["strategy_id"] for s in listed] == [ai["strategy_id"]]
+    assert client.get(f"/api/strategies/{ai['strategy_id']}", headers=ah).status_code == 200
+
+
+def test_role_capabilities_api_rules(client):
+    """能力端点本身的管理员边界与入参校验。"""
+    from app import permissions as perm
+
+    h = auth_headers(client)
+    _mk_user(client, h, "alice")
+    ah = _login(client, "alice")
+
+    caps = client.get("/api/capabilities", headers=h)
+    assert caps.status_code == 200
+    assert {c["code"] for c in caps.json()} == set(perm.ALL_CAPABILITY_CODES)
+
+    roles = {r["code"]: r for r in client.get("/api/roles", headers=h).json()}
+    user_role_id, admin_role_id = roles["user"]["id"], roles["admin"]["id"]
+
+    # 普通用户无权改角色能力
+    assert client.put(
+        f"/api/roles/{user_role_id}/capabilities",
+        json={"capabilities": [perm.CAP_AI_STRATEGY]}, headers=ah,
+    ).status_code == 403
+    # 未知能力码拒收
+    bad = client.put(
+        f"/api/roles/{user_role_id}/capabilities",
+        json={"capabilities": ["nope"]}, headers=h,
+    )
+    assert bad.status_code == 400
+    # 管理员角色固定全部能力，不可改
+    assert client.put(
+        f"/api/roles/{admin_role_id}/capabilities",
+        json={"capabilities": []}, headers=h,
+    ).status_code == 400
+
+    # 管理员角色在角色列表里始终呈现全部能力
+    assert client.get("/api/roles", headers=h).json()  # 列表可读
+    listed = {r["code"]: r for r in client.get("/api/roles", headers=h).json()}
+    assert listed["admin"]["capabilities"] == list(perm.ALL_CAPABILITY_CODES)
+    assert listed["user"]["capabilities"] == []
+
+
+def test_create_role_with_ai_capability(client):
+    """新建角色时可直接带上 AI 授权。"""
+    from app import permissions as perm
+
+    h = auth_headers(client)
+    r = client.post(
+        "/api/roles",
+        json={
+            "code": "ai_trader", "name": "AI 交易员", "enabled": True,
+            "menus": [perm.MENU_STRATEGIES], "capabilities": [perm.CAP_AI_STRATEGY],
+        },
+        headers=h,
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["capabilities"] == [perm.CAP_AI_STRATEGY]
+
+    # 绑给用户后 /api/me 即带上能力，且能建 AI 加仓
+    user = _mk_user(client, h, "bob")
+    assert client.put(
+        f"/api/users/{user['id']}/roles", json={"role_ids": [r.json()["id"]]}, headers=h,
+    ).status_code == 200
+    bh = _login(client, "bob")
+    assert perm.CAP_AI_STRATEGY in client.get("/api/me", headers=bh).json()["capabilities"]
+    assert _mk_strategy_as(client, bh, perm.AI_STRATEGY_TEMPLATE_ID, "授权角色的加仓").status_code == 201
+
+
+def test_role_capabilities_column_migration_idempotent(tmp_path):
+    """补列迁移：缺列时补上，重复执行不报错，旧角色默认无能力。"""
+    from app.db import _migrate_role_capabilities
+
+    eng = create_engine(f"sqlite:///{(tmp_path / 'legacy_caps.db').as_posix()}")
+    with eng.begin() as conn:
+        conn.execute(text("CREATE TABLE sys_role (id INTEGER PRIMARY KEY, code VARCHAR(32))"))
+        conn.execute(text("INSERT INTO sys_role (id, code) VALUES (1, 'user')"))
+    for _ in range(2):
+        with eng.begin() as conn:
+            _migrate_role_capabilities(conn)
+    insp = inspect(eng)
+    assert "capabilities" in {c["name"] for c in insp.get_columns("sys_role")}
+    with eng.connect() as conn:
+        assert conn.execute(text("SELECT capabilities FROM sys_role")).scalar() == "[]"
+    eng.dispose()

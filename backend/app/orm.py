@@ -138,7 +138,11 @@ class User(Base):
 
 
 class Role(Base):
-    """角色：一组菜单的集合。内置角色（admin / user）由启动种子创建，不可删除。"""
+    """角色：一组菜单 + 一组能力。内置角色（admin / user）由启动种子创建，不可删除。
+
+    菜单走 sys_role_menu 关联表；capabilities 是本角色的能力码列表（JSON 数组字符串）。
+    管理员角色固定拥有全部能力，无需在这里维护 admin 的全量值。
+    """
     __tablename__ = "sys_role"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -147,6 +151,8 @@ class Role(Base):
     is_builtin: Mapped[bool] = mapped_column(Boolean, default=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     remark: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # 角色勾选的能力码，JSON 数组字符串（如 '["ai_strategy"]'）
+    capabilities: Mapped[str] = mapped_column(Text, default="[]")
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()

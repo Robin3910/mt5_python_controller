@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 from typing import Iterable, Optional
 
@@ -67,6 +68,20 @@ async def seed_rbac() -> None:
 # ---------------------------------------------------------------------------
 # 登录身份
 # ---------------------------------------------------------------------------
+def _decode_capabilities(raw: object) -> list[str]:
+    """Role.capabilities 存的是 JSON 数组字符串；脏数据当空数组，不让鉴权整体失败。"""
+    if isinstance(raw, list):
+        return [str(x) for x in raw]
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(str(raw))
+    except (TypeError, ValueError):
+        logger.warning("role capabilities is not valid json: %r", raw)
+        return []
+    return [str(x) for x in parsed] if isinstance(parsed, list) else []
+
+
 async def _principal_data(username: str) -> Optional[dict]:
     """从库里组装权限快照（可 JSON 缓存）；用户不存在返回 None。"""
     async with SessionLocal() as s:
@@ -84,14 +99,25 @@ async def _principal_data(username: str) -> Optional[dict]:
                 .where(UserRole.user_id == user.id, Role.enabled.is_(True))
             )
         ).all()
+        cap_rows = (
+            await s.execute(
+                select(Role.capabilities)
+                .select_from(UserRole)
+                .join(Role, Role.id == UserRole.role_id)
+                .where(UserRole.user_id == user.id, Role.enabled.is_(True))
+            )
+        ).all()
     is_admin = any(code == ADMIN_ROLE_CODE for code, _ in rows)
     menus = permissions.resolve_menus(is_admin, [m for _, m in rows if m])
+    role_caps = [c for (raw,) in cap_rows for c in _decode_capabilities(raw)]
+    caps = permissions.resolve_capabilities(is_admin, role_caps)
     return {
         "user_id": user.id,
         "username": user.username,
         "is_active": bool(user.is_active),
         "is_admin": is_admin,
         "menus": permissions.normalize_menu_codes(menus),
+        "capabilities": permissions.normalize_capability_codes(caps),
         "token_version": int(user.token_version or 0),
     }
 
@@ -123,6 +149,7 @@ async def load_principal(store: Optional[RedisStore], username: str) -> Optional
         username=str(data["username"]),
         is_admin=bool(data.get("is_admin")),
         menus=frozenset(data.get("menus") or []),
+        capabilities=frozenset(data.get("capabilities") or []),
         token_version=int(data.get("token_version") or 0),
     )
 
@@ -170,6 +197,7 @@ async def refresh_sessions(store: Optional[RedisStore], usernames: Iterable[str]
 # 角色
 # ---------------------------------------------------------------------------
 def _role_dict(role: Role, menus: list[str], user_count: int) -> dict:
+    role_caps = _decode_capabilities(role.capabilities)
     return {
         "id": role.id,
         "code": role.code,
@@ -180,6 +208,11 @@ def _role_dict(role: Role, menus: list[str], user_count: int) -> dict:
         "menus": (
             list(permissions.ALL_MENU_CODES) if role.code == ADMIN_ROLE_CODE
             else permissions.normalize_menu_codes(menus)
+        ),
+        # 管理员角色固定拥有全部能力，与角色菜单同一口径
+        "capabilities": (
+            list(permissions.ALL_CAPABILITY_CODES) if role.code == ADMIN_ROLE_CODE
+            else permissions.normalize_capability_codes(role_caps)
         ),
         "user_count": user_count,
         "created_at": role.created_at.timestamp() if role.created_at else None,
@@ -223,13 +256,19 @@ def _validate_menus(codes: Iterable[object]) -> list[str]:
 
 async def create_role(
     *, code: str, name: str, remark: Optional[str], enabled: bool, menus: Iterable[object],
+    capabilities: Iterable[object] = (),
 ) -> dict:
     """新建自定义角色；菜单只能从可分配菜单里选（未知 / 仅管理员菜单抛 ValueError）。"""
     menu_codes = _validate_menus(menus)
+    cap_codes = permissions.normalize_capability_codes(capabilities)
+    invalid_caps = permissions.invalid_capability_codes(capabilities)
+    if invalid_caps:
+        raise ValueError(f"能力不存在：{'、'.join(invalid_caps)}")
     async with SessionLocal() as s:
         role = Role(
             code=code, name=name.strip(), remark=(remark or "").strip() or None,
             is_builtin=False, enabled=enabled,
+            capabilities=json.dumps(cap_codes, ensure_ascii=False),
         )
         s.add(role)
         await s.flush()
@@ -274,6 +313,23 @@ async def set_role_menus(role_id: int, menus: Iterable[object]) -> Optional[dict
         await s.execute(delete(RoleMenu).where(RoleMenu.role_id == role.id))
         for menu in menu_codes:
             s.add(RoleMenu(role_id=role.id, menu_code=menu))
+        await s.commit()
+    return await get_role(role_id)
+
+
+async def set_role_capabilities(role_id: int, caps: Iterable[object]) -> Optional[dict]:
+    """整体替换角色能力；未知能力码抛 ValueError。管理员角色固定全部能力，不可修改。"""
+    cap_codes = permissions.normalize_capability_codes(caps)
+    invalid = permissions.invalid_capability_codes(caps)
+    if invalid:
+        raise ValueError(f"能力不存在：{'、'.join(invalid)}")
+    async with SessionLocal() as s:
+        role = await s.get(Role, int(role_id))
+        if not role:
+            return None
+        if role.code == ADMIN_ROLE_CODE:
+            raise ValueError("超级管理员角色固定拥有全部能力，不可修改")
+        role.capabilities = json.dumps(cap_codes, ensure_ascii=False)
         await s.commit()
     return await get_role(role_id)
 

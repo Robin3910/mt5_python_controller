@@ -861,13 +861,15 @@ class RoleRef(BaseModel):
 
 
 class MeOut(BaseModel):
-    """当前登录用户：前端据 menus 渲染导航与路由守卫，据 is_admin 显示管理员操作。"""
+    """当前登录用户：前端据 menus 渲染导航与路由守卫，据 is_admin 显示管理员操作，
+    据 capabilities 判断能否使用 AI 智能加仓策略等细粒度功能。"""
     user_id: int
     username: str
     display_name: Optional[str] = None
     is_admin: bool = False
     roles: list[RoleRef] = Field(default_factory=list)
     menus: list[str] = Field(default_factory=list)
+    capabilities: list[str] = Field(default_factory=list)
 
 
 class MenuOut(BaseModel):
@@ -886,8 +888,16 @@ class RoleOut(BaseModel):
     enabled: bool = True
     remark: Optional[str] = None
     menus: list[str] = Field(default_factory=list)
+    capabilities: list[str] = Field(default_factory=list)
     user_count: int = 0
     created_at: Optional[float] = None
+
+
+class CapabilityOut(BaseModel):
+    """能力注册表条目；角色编辑页据此列出可勾选项。"""
+
+    code: str
+    name: str
 
 
 class RoleCreate(BaseModel):
@@ -896,6 +906,7 @@ class RoleCreate(BaseModel):
     remark: Optional[str] = Field(default=None, max_length=255)
     enabled: bool = True
     menus: list[str] = Field(default_factory=list)
+    capabilities: list[str] = Field(default_factory=list)
 
 
 class RoleUpdate(BaseModel):
@@ -906,6 +917,10 @@ class RoleUpdate(BaseModel):
 
 class RoleMenusUpdate(BaseModel):
     menus: list[str] = Field(default_factory=list)
+
+
+class RoleCapabilitiesUpdate(BaseModel):
+    capabilities: list[str] = Field(default_factory=list)
 
 
 class UserOut(BaseModel):
