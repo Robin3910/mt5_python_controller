@@ -2,7 +2,7 @@
 
 覆盖这条链路的关键保证：
 - 能力语义：**跟单默认人人可做，带单需要 follow_leader 角色能力**；
-- 带单员列表只出现「有能力 + 有主节点 + 有含主节点的分组」的人，且排除自己；
+- 带单员列表只出现「有能力 + 有主节点 + 有含主节点的分组」的人，**含自己**（自跟单：自己的非主节点跟自己的分组）；
 - 加入跟单：节点必须是自己的、已启用、非主节点；分组必须是带单员名下的带单源分组；
 - 带单员被撤销能力后：列表里消失，GET /api/follow/me 仍能自行移出（清理不需要能力）；
 - 分组缓存带 followers，且 owner 编辑成员不会误删跟单关系；
@@ -226,7 +226,7 @@ def test_leader_list_requires_capability(client):
 
 
 def test_leader_list_shows_capable_user(client):
-    """持能力 + 有主节点 + 有含主节点分组 -> 出现在列表，且不含自己。"""
+    """持能力 + 有主节点 + 有含主节点分组 -> 出现在列表，且包含自己（自跟单）。"""
     admin_h = _login(client, "admin")
     _setup_leader_and_follower(client, admin_h)
 
@@ -240,14 +240,14 @@ def test_leader_list_shows_capable_user(client):
     assert alice["followable_group_count"] >= 1
     assert alice["my_follow_group_count"] == 0
 
-    # alice 自己看：不应看到自己
+    # alice 自己看：应能看到自己（自跟单场景）
     alice_h = _login(client, "alice")
     r2 = client.get("/api/follow/leaders", headers=alice_h)
     assert r2.status_code == 200, r2.text
-    assert "alice" not in {x["username"] for x in r2.json()["leaders"]}, "自己不跟自己"
+    assert "alice" in {x["username"] for x in r2.json()["leaders"]}, "自己有 follow_leader 能力时应看到自己"
 
 
-def test_leader_list_excludes_self_and_unknown_q(client):
+def test_leader_list_unknown_query_returns_empty(client):
     """搜索无结果时返回空列表而不是报错。"""
     admin_h = _login(client, "admin")
     _setup_leader_and_follower(client, admin_h)
@@ -360,6 +360,69 @@ def test_join_is_idempotent(client):
     r2 = client.post("/api/follow/join", json=body, headers=bob_h)
     assert r2.status_code == 200, r2.text
     assert r2.json()["joined"][0]["already_node_ids"] == [b_follow], "第二次应为幂等跳过"
+
+
+# ---------------------------------------------------------------------------
+# 自跟单：自己的非主节点跟自己的带单源分组
+# ---------------------------------------------------------------------------
+def test_self_follow_own_group_with_own_backup_node(client):
+    """自己的非主节点可以跟自己的分组（带单界面里能看到自己并加入）。"""
+    admin_h = _login(client, "admin")
+    alice, _bob, a_primary, a_extra, _b_primary, _b_follow, a_group = _setup_leader_and_follower(
+        client, admin_h,
+    )
+    alice_h = _login(client, "alice")
+
+    # 带单列表里有自己
+    lst = client.get("/api/follow/leaders", headers=alice_h)
+    assert lst.status_code == 200, lst.text
+    assert alice["id"] in {x["leader_user_id"] for x in lst.json()["leaders"]}
+
+    # 详情里能拿到自己名下含主节点的分组
+    det = client.get(f"/api/follow/leaders/{alice['id']}", headers=alice_h)
+    assert det.status_code == 200, det.text
+    assert a_group in {g["group_id"] for g in det.json()["groups"]}
+    # 可用于跟单的节点里不含主节点，但含自己的备节点
+    my_node_ids = {n["node_id"] for n in det.json()["my_nodes"]}
+    assert a_primary not in my_node_ids, "主节点不可用于跟单"
+    assert a_extra in my_node_ids, "自己的非主节点应可用于跟单"
+
+    # 加入：自己 = 带单员
+    r = client.post(
+        "/api/follow/join",
+        json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [a_extra]},
+        headers=alice_h,
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["leader_primary_node_id"] == a_primary
+    assert data["joined"][0]["node_ids"] == [a_extra]
+    assert data["skipped"] == []
+
+    # 我的跟单里能看到这条自跟单
+    me = client.get("/api/follow/me", headers=alice_h)
+    assert me.status_code == 200, me.text
+    mine = me.json()["following"]
+    assert len(mine) == 1, "应有一条指向自己的跟单"
+    assert mine[0]["leader"]["leader_user_id"] == alice["id"]
+    assert mine[0]["groups"][0]["group_id"] == a_group
+    assert {n["node_id"] for n in mine[0]["groups"][0]["my_nodes"]} == {a_extra}
+
+
+def test_self_follow_rejects_primary_node(client):
+    """自跟单也不能用自己的主节点（主节点是带单源，必须保持独立）。"""
+    admin_h = _login(client, "admin")
+    alice, _bob, a_primary, _a_extra, _b_primary, _b_follow, a_group = _setup_leader_and_follower(
+        client, admin_h,
+    )
+    alice_h = _login(client, "alice")
+    r = client.post(
+        "/api/follow/join",
+        json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [a_primary]},
+        headers=alice_h,
+    )
+    assert r.status_code == 400, r.text
+    assert "主节点" in r.json()["detail"]
 
 
 # ---------------------------------------------------------------------------

@@ -22,18 +22,79 @@ const keyword = ref('')
 
 const detail = ref<FollowDetailResponse | null>(null)
 const detailLoading = ref(false)
-const selectedGroups = ref<string[]>([])
 const selectedNodes = ref<string[]>([])
 const submitting = ref(false)
 
 const mine = ref<FollowMeResponse>({ following: [], summary: { following_count: 0, follow_node_count: 0 } })
 const mineLoading = ref(false)
 
-// 已选分组集合
-const groupSet = computed(() => new Set(selectedGroups.value))
-const nodeSet = computed(() => new Set(selectedNodes.value))
+// 已选分组集合（分组列表已移除，保留以备将来可选分组场景）
+// @ts-ignore
+const _groupSet = computed(() => new Set<string>())
+
 // 我的可跟单节点数（后端已剔除主节点）
 const myNodeCount = computed(() => detail.value?.my_nodes.length ?? 0)
+
+// ---------------------------------------------------------------------------
+// 跟单统计（后续由历史订单数据驱动；目前使用 mock）
+// ---------------------------------------------------------------------------
+interface LeaderStats {
+  total_profit: number      // 累计收益（USD）
+  profit_rate: number       // 收益率（%，带单员账户）
+  follower_count: number    // 当前跟单人数
+  win_rate: number          // 胜率（%）
+  total_trades: number      // 总交易笔数
+  win_trades: number        // 盈利笔数
+}
+
+// TODO: 后续由历史订单数据驱动。存储结构：_MOCK_STATS[leaderId] = stats
+// @ts-ignore
+const _statsDb: Record<number, LeaderStats> = {}
+
+function getMockStats(leaderId: number): LeaderStats {
+  // 用 leaderId 的哈希模拟不同带单员数据，后续接入真实统计时替换为 store 查询
+  const base = (leaderId * 7 + 13) % 100
+  return {
+    total_profit: parseFloat((base * 0.123).toFixed(2)),
+    profit_rate: parseFloat(((base % 60) + 2).toFixed(1)),
+    follower_count: (base % 20) + 1,
+    win_rate: parseFloat(((base % 30) + 50).toFixed(1)),
+    total_trades: (base + 1) * 10,
+    win_trades: Math.round(((base % 30) + 50) / 100 * ((base + 1) * 10)),
+  }
+}
+
+const currentStats = computed<LeaderStats | null>(() => {
+  if (!detail.value) return null
+  return getMockStats(detail.value.leader.leader_user_id)
+})
+
+const ZERO_STATS: LeaderStats = {
+  total_profit: 0, profit_rate: 0, follower_count: 0, win_rate: 0,
+  total_trades: 0, win_trades: 0,
+}
+
+/** 列表里每个带单员的统计（按 id 缓存，渲染时不再重复计算） */
+const leaderStatsMap = computed<Record<number, LeaderStats>>(() => {
+  const out: Record<number, LeaderStats> = {}
+  for (const l of leaders.value) out[l.leader_user_id] = getMockStats(l.leader_user_id)
+  return out
+})
+
+function statsOf(leaderId: number): LeaderStats {
+  return leaderStatsMap.value[leaderId] ?? ZERO_STATS
+}
+
+function fmtProfit(v: number): string {
+  return (v >= 0 ? '+' : '') + '$' + v.toFixed(2)
+}
+function fmtRate(v: number): string {
+  return (v >= 0 ? '+' : '') + v.toFixed(1) + '%'
+}
+function pctColor(v: number, pos = true): string {
+  const ok = pos ? v >= 0 : v <= 0
+  return ok ? 'var(--primary)' : 'var(--danger, #f56c6c)'
+}
 
 function errText(e: unknown, fallback: string): string {
   const ax = e as { response?: { data?: { detail?: string } } }
@@ -64,7 +125,6 @@ async function loadMine() {
 
 async function openLeader(l: FollowLeaderSummary) {
   detailLoading.value = true
-  selectedGroups.value = []
   selectedNodes.value = []
   try {
     detail.value = await fetchLeaderDetail(l.leader_user_id)
@@ -76,11 +136,14 @@ async function openLeader(l: FollowLeaderSummary) {
   }
 }
 
-function toggleGroup(id: string) {
-  const s = new Set(selectedGroups.value)
-  s.has(id) ? s.delete(id) : s.add(id)
-  selectedGroups.value = [...s]
-}
+// 自动选所有可跟分组
+const allSelectableGroupIds = computed<string[]>(() =>
+  (detail.value?.groups ?? [])
+    .filter((g) => g.selectable)
+    .map((g) => g.group_id),
+)
+
+const nodeSet = computed(() => new Set(selectedNodes.value))
 
 function toggleNode(id: string) {
   const s = new Set(selectedNodes.value)
@@ -89,12 +152,12 @@ function toggleNode(id: string) {
 }
 
 async function submitJoin() {
-  if (!detail.value || !selectedGroups.value.length || !selectedNodes.value.length) return
+  if (!detail.value || !allSelectableGroupIds.value.length || !selectedNodes.value.length) return
   submitting.value = true
   try {
     const res = await joinFollow({
       leader_user_id: detail.value.leader.leader_user_id,
-      group_ids: selectedGroups.value,
+      group_ids: allSelectableGroupIds.value,
       node_ids: selectedNodes.value,
     })
     const added = res.joined.reduce((n, j) => n + j.node_ids.length, 0)
@@ -105,7 +168,6 @@ async function submitJoin() {
       msg += `；${res.skipped.length} 项被跳过：${res.skipped[0].reason}`
     }
     ElMessage.success(msg)
-    selectedGroups.value = []
     selectedNodes.value = []
     await Promise.all([loadLeaders(), loadMine()])
   } catch (e) {
@@ -179,10 +241,10 @@ onMounted(() => {
   <div class="follow-page">
     <div class="row between page-header">
       <div>
-        <h2 class="page-title">带单</h2>
-        <p class="muted page-sub">把你的非主节点加入带单员的分组，接收他触发的信号。</p>
+        <h2 class="page-title">带单广场</h2>
+        <!-- <p class="muted page-sub">把你的非主节点加入带单员的分组，接收他触发的信号。</p> -->
       </div>
-      <RouterLink to="/nodes" class="btn-ghost btn-sm">管理我的节点</RouterLink>
+      <!-- <RouterLink to="/nodes" class="btn-ghost btn-sm">管理我的节点</RouterLink> -->
     </div>
 
     <div class="follow-grid">
@@ -216,15 +278,29 @@ onMounted(() => {
               <span v-if="l.my_follow_group_count" class="tag green">已跟 {{ l.my_follow_group_count }}</span>
               <span v-else class="tag">未跟</span>
             </div>
-            <div class="muted leader-sub">
-              主节点：{{ l.primary_node?.name ?? '—' }}
-              <template v-if="l.primary_node?.mt5_login">（MT5 {{ l.primary_node.mt5_login }}）</template>
-              <span :class="l.primary_node?.status === 'online' ? 'ok' : 'off'">
-                · {{ l.primary_node?.status === 'online' ? '在线' : '离线' }}
-              </span>
-            </div>
-            <div class="muted leader-sub">
-              带单源分组 {{ l.followable_group_count }} 个 · 被 {{ l.follower_node_count }} 个节点跟随
+
+            <!-- 4 项统计（后续由历史订单数据驱动） -->
+            <div class="leader-stats">
+              <div class="ls-item">
+                <span class="ls-k">累计收益</span>
+                <span class="ls-v" :style="{ color: pctColor(statsOf(l.leader_user_id).total_profit) }">
+                  {{ fmtProfit(statsOf(l.leader_user_id).total_profit) }}
+                </span>
+              </div>
+              <div class="ls-item">
+                <span class="ls-k">收益率</span>
+                <span class="ls-v" :style="{ color: pctColor(statsOf(l.leader_user_id).profit_rate) }">
+                  {{ fmtRate(statsOf(l.leader_user_id).profit_rate) }}
+                </span>
+              </div>
+              <div class="ls-item">
+                <span class="ls-k">跟单人数</span>
+                <span class="ls-v">{{ statsOf(l.leader_user_id).follower_count }} 人</span>
+              </div>
+              <div class="ls-item">
+                <span class="ls-k">胜率</span>
+                <span class="ls-v">{{ statsOf(l.leader_user_id).win_rate }}%</span>
+              </div>
             </div>
           </li>
         </ul>
@@ -239,45 +315,30 @@ onMounted(() => {
             <strong>跟单 · {{ detail.leader.display_name || detail.leader.username }}</strong>
             <button class="btn-sm btn-ghost" @click="detail = null">返回列表</button>
           </div>
-          <p class="muted page-sub">
-            带单源：{{ detail.leader.primary_node?.name }}
-            <template v-if="detail.leader.primary_node?.mt5_login">
-              （MT5 {{ detail.leader.primary_node.mt5_login }}）
-            </template>
-            — 他触发信号时，信号会下发给所选分组的全部成员（含你的节点）。
-          </p>
 
-          <h4 class="sec-title">分组（可多选）</h4>
-          <ul class="pick-list">
-            <li
-              v-for="g in detail.groups"
-              :key="g.group_id"
-              class="pick-item"
-              :class="{ disabled: !g.selectable, on: groupSet.has(g.group_id) }"
-              @click="g.selectable && toggleGroup(g.group_id)"
-            >
-              <label>
-                <input
-                  type="checkbox"
-                  :checked="groupSet.has(g.group_id)"
-                  :disabled="!g.selectable"
-                  @click.stop
-                  @change="toggleGroup(g.group_id)"
-                />
-                <span class="pick-name">{{ g.name || g.group_id }}</span>
-              </label>
-              <span v-if="!g.selectable" class="tag amber">{{ g.unselectable_reason }}</span>
-              <div class="muted pick-sub">
-                {{ g.strategy_name || '未绑定策略' }}
-                <template v-if="g.signal_concurrent_enabled"> · 全员同步</template>
-                · 成员 {{ g.member_count }} + 跟单 {{ g.follower_count }} · 在线 {{ g.online_count }}
-                · 已触发 {{ g.signal_count }} 次
-                <template v-if="g.my_follow_node_ids.length">
-                  · <span class="ok">你已跟 {{ g.my_follow_node_ids.length }} 个节点</span>
-                </template>
+          <!-- 跟单统计卡片（后续由历史订单数据驱动） -->
+          <div v-if="currentStats" class="stats-grid">
+            <div class="stat-card">
+              <div class="stat-label">累计收益</div>
+              <div class="stat-value" :style="{ color: pctColor(currentStats.total_profit) }">
+                {{ fmtProfit(currentStats.total_profit) }}
               </div>
-            </li>
-          </ul>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">收益率</div>
+              <div class="stat-value" :style="{ color: pctColor(currentStats.profit_rate) }">
+                {{ fmtRate(currentStats.profit_rate) }}
+              </div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">跟单人数</div>
+              <div class="stat-value">{{ currentStats.follower_count }} 人</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">胜率</div>
+              <div class="stat-value">{{ currentStats.win_rate }}%</div>
+            </div>
+          </div>
 
           <h4 class="sec-title">我的节点（可多选）</h4>
           <p v-if="!detail.my_nodes.length" class="muted empty">
@@ -310,12 +371,12 @@ onMounted(() => {
 
           <div class="join-bar">
             <span class="muted">
-              已选：{{ selectedNodes.length }} 个节点 × {{ selectedGroups.length }} 个分组
+              已选：{{ selectedNodes.length }} 个节点 · 将加入 {{ allSelectableGroupIds.length }} 个可跟分组
               <template v-if="myNodeCount"> · 可用节点 {{ myNodeCount }}</template>
             </span>
             <button
               class="btn-sm btn-primary"
-              :disabled="!selectedNodes.length || !selectedGroups.length || submitting"
+              :disabled="!selectedNodes.length || submitting"
               @click="submitJoin"
             >
               {{ submitting ? '提交中...' : '确认跟单' }}
@@ -450,10 +511,87 @@ onMounted(() => {
   margin-top: 4px;
 }
 
+/* 带单员列表里的 4 项统计：窄栏用 2×2，比横排 4 列易读 */
+.leader-stats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px 10px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--glass-border);
+}
+
+.ls-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
+  min-width: 0;
+}
+
+.ls-k {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.ls-v {
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 .sec-title {
   font-size: 13px;
   margin: 16px 0 8px;
   color: var(--muted);
+}
+
+/* 跟单统计卡片 */
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+  margin-bottom: 4px;
+}
+
+.stat-card {
+  background: var(--glass);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  text-align: center;
+}
+
+.stat-label {
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 4px;
+  letter-spacing: 0.04em;
+}
+
+.stat-value {
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+/* 手机端：2×2 网格，减小字体 */
+@media (max-width: 480px) {
+  .stats-grid {
+    grid-template-columns: repeat(2, 1fr);
+    gap: 8px;
+  }
+  .stat-value {
+    font-size: 15px;
+  }
+  .stat-label {
+    font-size: 10px;
+  }
+  .stat-card {
+    padding: 8px 8px;
+  }
 }
 
 .pick-list {

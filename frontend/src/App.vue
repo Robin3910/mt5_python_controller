@@ -81,14 +81,18 @@ function logout(): void {
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 17l6-6 4 4 8-8"/><path d="M14 7h7v7"/></svg>
           <span>交易</span>
         </RouterLink>
-        <!-- 普通用户：其他菜单全收进「我的」枢纽页，仅保留首页/交易/我的三个入口 -->
+        <RouterLink v-if="!auth.isAdmin && auth.hasMenu('follow')" to="/follow">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+          <span>带单</span>
+        </RouterLink>
+        <!-- 普通用户：其他菜单全收进「我的」枢纽页，仅保留首页/交易/带单/我的四个入口 -->
         <template v-if="!auth.isAdmin">
           <RouterLink to="/me">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
             <span>我的</span>
           </RouterLink>
         </template>
-        <!-- 管理员：仅显示总览、节点、用户权限、我的 -->
+        <!-- 管理员：仅显示总览、节点、分组管理、策略管理、带单、用户权限、我的 -->
         <template v-else>
           <RouterLink v-if="auth.hasMenu('dashboard')" to="/">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
@@ -105,6 +109,10 @@ function logout(): void {
           <RouterLink v-if="auth.hasMenu('strategies')" to="/strategies">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M9 13h6"/><path d="M9 17h4"/></svg>
             <span>策略管理</span>
+          </RouterLink>
+          <RouterLink v-if="auth.hasMenu('follow')" to="/follow">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+            <span>带单</span>
           </RouterLink>
           <RouterLink v-if="auth.hasMenu('permissions')" to="/permissions">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><circle cx="12" cy="10" r="2.5"/><path d="M8.5 16a3.5 3.5 0 0 1 7 0"/></svg>

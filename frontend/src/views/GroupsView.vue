@@ -663,6 +663,32 @@ function openActiveSignals(g: GroupOut): void {
   })
 }
 
+// ── 跟单节点明细（只读）───────────────────────────────────────────
+// 跟单员把自己的非主节点放进他人分组；分组 owner 只能查看，不能排序 /
+// 移出 / 开限价监听 —— 那些操作属于 owner 自有成员（NodeGroupMember）。
+const followerGroup = ref<GroupOut | null>(null)
+
+/** 跟单节点数：接口未回填 follower_count 时回退到数组长度 */
+function followerCountOf(g: GroupOut): number {
+  return g.follower_count ?? g.followers?.length ?? 0
+}
+
+function openFollowers(g: GroupOut): void {
+  if (!followerCountOf(g)) {
+    ElMessage.info('该分组暂无跟单节点')
+    return
+  }
+  followerGroup.value = g
+}
+
+function closeFollowers(): void {
+  followerGroup.value = null
+}
+
+function fmtFollowTime(ts?: number | null): string {
+  return ts ? new Date(ts * 1000).toLocaleString('zh-CN') : '—'
+}
+
 const showStrategyForm = ref(false)
 const editingStrategyId = ref('')
 const editingStrategyGroup = ref<{ group_id: string; name: string } | null>(null)
@@ -790,6 +816,20 @@ async function onStrategyFormSaved(): Promise<void> {
         </div>
         <div class="list-field"><span class="k">成员节点</span><span class="v">{{ g.node_count }}</span></div>
         <div class="list-field"><span class="k">有效节点</span><span class="v">{{ g.online_node_count }}</span></div>
+        <div class="list-field">
+          <span class="k">跟单节点</span>
+          <span class="v">
+            <button
+              v-if="followerCountOf(g) > 0"
+              class="btn-sm btn-ghost"
+              title="查看跟单员放进本分组的节点（只读）"
+              @click="openFollowers(g)"
+            >
+              {{ followerCountOf(g) }} 个 · {{ g.online_follower_count ?? 0 }} 在线
+            </button>
+            <span v-else class="muted">—</span>
+          </span>
+        </div>
         <div class="list-field">
           <span class="k">进行中</span>
           <span class="v">
@@ -924,6 +964,19 @@ async function onStrategyFormSaved(): Promise<void> {
             <span :class="asGroup(row).online_node_count ? '' : 'muted'">{{ asGroup(row).online_node_count }}</span>
           </template>
         </el-table-column>
+        <el-table-column label="跟单节点" width="120" align="right">
+          <template #default="{ row }">
+            <button
+              v-if="followerCountOf(asGroup(row)) > 0"
+              class="btn-sm btn-ghost"
+              :title="`${asGroup(row).online_follower_count ?? 0} 个在线；点击查看明细（只读）`"
+              @click="openFollowers(asGroup(row))"
+            >
+              {{ followerCountOf(asGroup(row)) }} 个
+            </button>
+            <span v-else class="muted">—</span>
+          </template>
+        </el-table-column>
         <el-table-column label="进行中" width="92" align="right">
           <template #default="{ row }">
             <button
@@ -962,6 +1015,40 @@ async function onStrategyFormSaved(): Promise<void> {
           </template>
         </el-table-column>
       </el-table>
+    </div>
+
+    <!-- 跟单节点明细（只读） -->
+    <div v-if="followerGroup" class="modal-mask" @click.self="closeFollowers">
+      <div class="card card-pad modal modal-lg">
+        <div class="modal-header">
+          <div class="h1">跟单节点 · {{ followerGroup.name }}</div>
+          <p class="muted" style="font-size: 12px; margin: 4px 0 0">
+            以下节点由跟单员放入本分组，会随本分组一起接收信号。
+            <strong>跟单节点对本分组只读</strong> —— 排序、移出、限价监听等操作需由跟单员本人在「带单」页进行。
+          </p>
+        </div>
+        <div class="modal-body">
+          <p v-if="!followerGroup.followers?.length" class="muted">暂无跟单节点</p>
+          <div v-else class="follower-list">
+            <div v-for="f in followerGroup.followers" :key="f.node_id" class="follower-row">
+              <span class="dot" :class="f.status === 'online' ? 'online' : 'offline'"></span>
+              <span class="follower-name">{{ f.name || f.node_id }}</span>
+              <span class="muted follower-meta">{{ f.mt5_login ? `MT5 ${f.mt5_login}` : '—' }}</span>
+              <span class="tag" :class="f.enabled ? 'green' : ''">{{ f.enabled ? '已启用' : '已禁用' }}</span>
+              <span class="muted follower-status">
+                {{ f.status === 'online' ? '在线' : '离线' }}
+              </span>
+              <span class="tag blue" :title="`跟单人用户 ID ${f.follower_user_id}`">
+                跟单人：{{ f.follower_username || `#${f.follower_user_id}` }}
+              </span>
+              <span class="muted follower-meta">加入于 {{ fmtFollowTime(f.joined_at) }}</span>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn-ghost" @click="closeFollowers">关闭</button>
+        </div>
+      </div>
     </div>
 
     <!-- 限价监听日志 -->
@@ -1387,6 +1474,37 @@ async function onStrategyFormSaved(): Promise<void> {
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+/* 跟单节点明细行：只读，不提供排序 / 移出控件 */
+.follower-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.follower-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  /* 与 owner 成员的 member-row 视觉上区分：左侧蓝边表示「外来跟单」 */
+  border-left: 3px solid var(--primary);
+}
+
+.follower-name {
+  font-weight: 600;
+}
+
+.follower-meta {
+  font-size: 12px;
+}
+
+.follower-status {
+  font-size: 12px;
 }
 
 .member-row {

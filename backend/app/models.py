@@ -286,6 +286,24 @@ class PaginatedLimitWatchLogs(BaseModel):
     page_size: int
 
 
+class GroupFollowerRef(BaseModel):
+    """分组内的跟单节点（跟单员把自己的非主节点放进他人分组）。
+
+    与 GroupNodeRef 严格分离：跟单节点对分组 owner 只读，不可排序 / 移出 /
+    开限价监听（那都是 NodeGroupMember 的职责）。
+    """
+    node_id: str
+    name: Optional[str] = None
+    mt5_login: Optional[int] = None
+    enabled: bool = True
+    status: str = "offline"  # online / offline
+    # 跟单员（节点所有者）—— 管理员需要知道是谁在跟
+    follower_user_id: int
+    follower_username: Optional[str] = None
+    # 加入跟单的时间（epoch 秒）
+    joined_at: Optional[float] = None
+
+
 class GroupOut(BaseModel):
     """分组对外展示对象（含成员节点与信号计数）。"""
     group_id: str
@@ -303,7 +321,13 @@ class GroupOut(BaseModel):
     created_at: float = 0
     nodes: list[GroupNodeRef] = Field(default_factory=list)
     node_count: int = 0
-    online_node_count: int = 0   # 有效节点数（已启用 + 在线）
+    # 有效节点数（已启用 + 在线）= owner 成员与跟单节点的合并口径
+    online_node_count: int = 0
+    # 跟单节点（跟单员放进本分组的节点，只读；与上面的 nodes 互不重叠）
+    followers: list[GroupFollowerRef] = Field(default_factory=list)
+    follower_count: int = 0
+    # 跟单节点中已启用且在线的数量
+    online_follower_count: int = 0
     signal_count: int = 0        # 该分组已处理的信号主任务数
     active_task_count: int = 0   # 进行中主任务数（pending/dispatching/running）
     # 已开监听时附带最近若干条；未开启为空列表

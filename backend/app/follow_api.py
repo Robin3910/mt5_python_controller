@@ -112,12 +112,12 @@ async def _strategies_of(groups: list[dict], store: RedisStore) -> dict[str, dic
 
 
 async def _leader_ids_with_capability(
-    store: RedisStore, users: list, exclude_user_id: int,
+    store: RedisStore, users: list,
 ) -> set[int]:
-    """持有 follow_leader 能力且启用的用户 ID（排除指定用户）。"""
+    """持有 follow_leader 能力且启用的用户 ID（含自己，用于带单界面自跟单）。"""
     out: set[int] = set()
     for u in users:
-        if not u.is_active or u.id == exclude_user_id:
+        if not u.is_active:
             continue
         principal = await rbac_service.load_principal(store, u.username)
         if principal and permissions.can_be_leader(principal):
@@ -134,13 +134,13 @@ async def list_follow_leaders(
     store: RedisStore = Depends(get_store),
     p: Principal = Depends(require_menu(MENU_FOLLOW)),
 ) -> FollowLeaderListResponse:
-    """带单员列表：持 follow_leader 能力 + 有主节点 + 至少一个可跟单分组（排除自己）。
+    """带单员列表：持 follow_leader 能力 + 有主节点 + 至少一个可跟单分组（含自己，用于自跟单）。
 
     节点 / 分组 / 我的跟单关系都**批量预取一次**再在内存里筛，
     避免「每个用户查一次 Redis」的 N+1。
     """
     users = await user_service.list_users()
-    leaders = await _leader_ids_with_capability(store, users, p.user_id)
+    leaders = await _leader_ids_with_capability(store, users)
     if not leaders:
         return FollowLeaderListResponse(leaders=[])
 

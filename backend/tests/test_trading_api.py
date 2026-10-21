@@ -168,6 +168,12 @@ def test_quick_trigger_grid_creates_strategy_and_group(client, monkeypatch):
         "symbol": "XAUUSD",
         "volume": 0.01,
         "direction": "all",
+        # 网格前置校验必填：旧 patch 通过 _build_default_rules 提供，
+        # 但前置校验读 body 字段；测试夹具按 QuickTriggerRequest 字段补齐。
+        "price_lower": 1900.0,
+        "price_upper": 2000.0,
+        "grid_count": 10,
+        "lot_per_grid": 0.01,
     }
 
     r = _post_quick_trigger(client, monkeypatch, admin_token, body, patch_grid_defaults=True)
@@ -207,6 +213,10 @@ def test_quick_trigger_reuses_existing(client, monkeypatch):
         "symbol": "XAUUSD",
         "volume": 0.01,
         "direction": "all",
+        "price_lower": 1900.0,
+        "price_upper": 2000.0,
+        "grid_count": 10,
+        "lot_per_grid": 0.01,
     }
 
     a = _post_quick_trigger(client, monkeypatch, admin_token, body, patch_grid_defaults=True).json()
@@ -240,6 +250,10 @@ def test_quick_trigger_different_symbol_creates_separate_strategy_and_group(
         "strategy_type": "grid",
         "volume": 0.01,
         "direction": "all",
+        "price_lower": 1900.0,
+        "price_upper": 2000.0,
+        "grid_count": 10,
+        "lot_per_grid": 0.01,
     }
     a_body = {**base, "symbol": "XAUUSD"}
     b_body = {**base, "symbol": "EURUSD"}

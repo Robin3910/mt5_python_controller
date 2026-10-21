@@ -403,6 +403,21 @@ export interface GroupNodeRef {
   limit_watch_report?: boolean
 }
 
+/** 分组内的跟单节点：跟单员把自己的非主节点放进他人分组，对分组 owner 只读 */
+export interface GroupFollowerRef {
+  node_id: string
+  name: string | null
+  mt5_login: number | null
+  enabled: boolean
+  status: 'online' | 'offline'
+  /** 跟单员（节点所有者）用户 ID */
+  follower_user_id: number
+  /** 跟单员用户名；仅管理员能拿到全量映射 */
+  follower_username?: string | null
+  /** 加入跟单时间（epoch 秒） */
+  joined_at?: number | null
+}
+
 export interface GroupOut {
   group_id: string
   name: string
@@ -424,8 +439,14 @@ export interface GroupOut {
   created_at: number
   nodes: GroupNodeRef[]
   node_count: number
-  /** 有效节点数（已启用 + 在线） */
+  /** 有效节点数（已启用 + 在线）= owner 成员与跟单节点的合并口径 */
   online_node_count: number
+  /** 跟单节点（只读，与 nodes 互不重叠） */
+  followers?: GroupFollowerRef[]
+  /** 跟单节点数 */
+  follower_count?: number
+  /** 跟单节点中已启用且在线的数量 */
+  online_follower_count?: number
   /** 该分组已处理的信号主任务数 */
   signal_count: number
   /** 进行中主任务数（pending/dispatching/running） */

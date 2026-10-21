@@ -88,14 +88,15 @@ def followable_groups(
 def is_displayable_leader(
     leader: dict, groups: list[dict], current_user_id: int,
 ) -> bool:
-    """该用户是否应出现在别人的【带单】列表里。
+    """该用户是否应出现在【带单】列表里（含自己，用于自跟单场景）。
+
+    实际列表过滤由 follow_api._leader_ids_with_capability 驱动，此函数为
+    未来精细化过滤（如屏蔽特定用户）留的后门。
 
     四个条件全满足才展示：持有 follow_leader 能力、账号启用、有主节点、
-    至少有一个可跟单分组；并且排除自己（自己不跟自己）。
+    至少有一个可跟单分组（含自己，用于自跟单场景）。
     """
     if not isinstance(leader, dict):
-        return False
-    if leader.get("user_id") == current_user_id:
         return False
     if not leader.get("is_active", True):
         return False

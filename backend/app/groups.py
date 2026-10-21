@@ -24,6 +24,7 @@ from .limit_watch import normalize_keyword
 from .models import (
     GROUP_DISPATCH_MODES,
     GroupCreate,
+    GroupFollowerRef,
     GroupNodeRef,
     GroupOut,
     GroupTaskEventRecord,
@@ -70,7 +71,11 @@ async def _to_group_out(
     store: RedisStore, d: dict, signal_count: int = 0, active_task_count: int = 0,
     limit_watch_logs: list | None = None, owner_names: dict[int, str] | None = None,
 ) -> GroupOut:
-    """把缓存里的分组 dict 组装成对外的 GroupOut（合并成员节点的在线状态）。"""
+    """把缓存里的分组 dict 组装成对外的 GroupOut（合并成员节点的在线状态）。
+
+    成员（owner 自有节点）与跟单节点分开组装：前者是 nodes，后者是 followers。
+    online_node_count 用两者合并口径 —— 真正能收到信号的节点就这两类。
+    """
     nodes: list[GroupNodeRef] = []
     online = 0
     for member in d.get("members") or []:
@@ -89,6 +94,31 @@ async def _to_group_out(
                 status=status,
                 sort_order=member.get("sort_order", 0),
                 limit_watch_report=bool(member.get("limit_watch_report")),
+            )
+        )
+    # 跟单节点：同样合并在线状态，并带上跟单人用户名供管理员识别
+    followers: list[GroupFollowerRef] = []
+    follower_online = 0
+    for f in d.get("followers") or []:
+        node_id = f.get("node_id")
+        if not node_id:
+            continue
+        node = await store.get_node(node_id) or {}
+        status = "online" if manager.is_node_online(node_id) else "offline"
+        enabled = bool(node.get("enabled", True)) if node else False
+        if node and enabled and status == "online":
+            follower_online += 1
+        uid = int(f.get("follower_user_id") or 0)
+        followers.append(
+            GroupFollowerRef(
+                node_id=node_id,
+                name=node.get("name") or node_id,
+                mt5_login=node.get("mt5_login"),
+                enabled=enabled,
+                status=status,
+                follower_user_id=uid,
+                follower_username=(owner_names or {}).get(uid) if uid else None,
+                joined_at=f.get("joined_at"),
             )
         )
     strategy_id = d.get("strategy_id") or None
@@ -121,7 +151,11 @@ async def _to_group_out(
         created_at=d.get("created_at", 0),
         nodes=nodes,
         node_count=len(nodes),
-        online_node_count=online,
+        # 合并口径：owner 成员 + 跟单节点中「已启用且在线」的总数
+        online_node_count=online + follower_online,
+        followers=followers,
+        follower_count=len(followers),
+        online_follower_count=follower_online,
         signal_count=signal_count,
         active_task_count=active_task_count,
         limit_watch_logs=logs,
