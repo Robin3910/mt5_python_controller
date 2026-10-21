@@ -872,6 +872,37 @@ async function saveGridStrategyOnly(): Promise<void> {
 }
 
 /**
+ * 跟单节点继承：把本带单员其它带单源分组里**已存在**的跟单节点一并写入当前分组。
+ *
+ * 分组名按 `${策略类型}-${用户名}-${MT5号}-${品种}` 生成，任一维度变化即全新分组，
+ * 所以换品种 / 换策略类型都会走到这里（跨策略类型继承）。
+ *
+ * 三条关键口径：
+ * - **必须等 strategy_id 绑上**：跟单关系对没有策略的分组没有意义，
+ *   而 loadGroupAndStrategy 建组阶段 strategy_id 还是 null。
+ * - **无条件调用，不看 carry 开关**：分组成员是持久状态，carry 只管单条信号的投递范围；
+ *   与 limit_watch / signal_concurrent 的无条件 PATCH 同一口径。
+ *   幂等，顺带修复「功能上线前已存在但无跟单节点」的存量分组。
+ * - **失败不阻断**：信号照常下发（主节点正常开仓，跟单节点这轮不跟），仅提示。
+ */
+async function syncFollowersIntoGroup(): Promise<void> {
+  if (!currentGroup.value) return
+  const groupId = currentGroup.value.group_id
+  try {
+    const r = await hub.adoptFollowers(groupId)
+    if (r.adopted?.length) {
+      const refreshed = (await hub.listGroups()).find((g) => g.group_id === groupId)
+      if (refreshed) currentGroup.value = refreshed
+    }
+  } catch (e) {
+    // 继承失败不影响信号下发：仅给用户提示，不抛出
+    const err = e as { response?: { data?: { detail?: string } }; message?: string }
+    lastStrategyError.value =
+      err?.response?.data?.detail || err?.message || '跟单节点同步失败，信号已照常下发'
+  }
+}
+
+/**
  * 市价开仓专用：先保存策略（含 4 个 riskParams），再发信号。
  * signal payload 的 volume 来自策略反算（由后端根据 risk_amount / sl 算出），
  * 所以 signal payload 里不填 volume，让后端取策略里的 risk_amount。
@@ -975,6 +1006,8 @@ async function triggerMarketStrategy(): Promise<void> {
           err?.response?.data?.detail || err?.message || '打开信号并发失败'
       }
     }
+    // 跟单节点继承（跨策略类型 / 品种）：strategy_id 已绑上，此时才认领跟单节点。
+    await syncFollowersIntoGroup()
     // 发信号：市价/限价走 strategy 模型，action 由前端推导。
     // 限价时传 entry_price（后端会转成 limit_price，用于到价触发）。
     const action = derivedAction.value!
@@ -1079,6 +1112,8 @@ async function triggerGridStrategy(): Promise<void> {
           err?.response?.data?.detail || err?.message || '打开信号并发失败'
       }
     }
+    // 跟单节点继承（跨策略类型 / 品种）：strategy_id 已绑上，此时才认领跟单节点。
+    await syncFollowersIntoGroup()
     // 网格信号：方向由策略内的 grid_side 决定；payload 顶层 action 必须是大写
     // （后端 console_api._build_manual_signal 会校验 BUY / SELL / CLOSE）
     // 顶层 volume 后端会强制要求显式传入（每格手数已在 strategy.rules 内由策略链路消费）

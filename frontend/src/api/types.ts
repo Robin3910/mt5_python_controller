@@ -523,6 +523,19 @@ export interface GroupCreatePayload {
   limit_watch_node_ids?: string[]
 }
 
+/**
+ * 认领跟单节点的结果（POST /api/groups/{id}/adopt-followers）。
+ * 带单员新建分组时，把「已经跟我」的跟单节点一并带进来。
+ */
+export interface AdoptFollowersResult {
+  /** 实际新写入的跟单关系 */
+  adopted: { node_id: string; follower_user_id: number; from_group_id: string | null }[]
+  /** 因已存在或源信息缺失而未写入的条目 */
+  skipped: { node_id: string; reason?: string }[]
+  /** 参与扫描的来源分组数（不含目标分组自身） */
+  scanned_groups: number
+}
+
 export interface GroupUpdatePayload {
   name?: string
   enabled?: boolean

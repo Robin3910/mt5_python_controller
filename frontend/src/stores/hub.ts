@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import api from '@/api/client'
 import type {
   AccountSnapshot,
+  AdoptFollowersResult,
   CloseRequest,
   CloseBatchResult,
   FilterRulesConfig,
@@ -237,6 +238,16 @@ export const useHubStore = defineStore('hub', {
     async deleteGroup(id: string, options?: { q?: string }): Promise<void> {
       await api.delete(`/api/groups/${id}`)
       await this.fetchGroups(options)
+    },
+    /**
+     * 分组 owner 认领自己其它分组的跟单节点（跨策略类型 / 品种继承）。
+     * 带单员换品种或换策略类型时会新建分组，新分组默认只有主节点；
+     * 本接口把「已经跟我」的跟单节点一并带进来，不会引入没跟过我的节点。幂等。
+     */
+    async adoptFollowers(id: string): Promise<AdoptFollowersResult> {
+      const { data } = await api.post<AdoptFollowersResult>(`/api/groups/${id}/adopt-followers`)
+      await this.fetchGroups()
+      return data
     },
     /** 取全量分组但不写入 state：供手动触发弹窗预演命中范围，不受列表搜索条件影响 */
     async listGroups(): Promise<GroupOut[]> {

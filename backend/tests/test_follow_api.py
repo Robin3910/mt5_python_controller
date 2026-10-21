@@ -689,3 +689,199 @@ def test_follow_rules_node_join_reject():
     assert follow_rules.node_join_reject_reason(
         {"node_id": "n", "enabled": True}, existing_group=None, group_id="g",
     ) is None
+
+
+# ---------------------------------------------------------------------------
+# 认领跟单节点（带单员新建分组时继承跟过自己的节点）
+# ---------------------------------------------------------------------------
+def _adopt(client, group_id: str, headers):
+    return client.post(f"/api/groups/{group_id}/adopt-followers", headers=headers)
+
+
+def _followers_of(client, group_id: str, headers) -> list[str]:
+    r = client.get(f"/api/groups/{group_id}", headers=headers)
+    assert r.status_code == 200, r.text
+    return [f["node_id"] for f in (r.json().get("followers") or [])]
+
+
+def test_adopt_followers_inherits_across_groups(client):
+    """新建分组认领继承：跟单员在新分组里自动出现，且 follower_user_id 取自源关系。"""
+    admin_h = _login(client, "admin")
+    alice, bob, a_primary, a_extra, b_primary, b_follow, a_group = _setup_leader_and_follower(
+        client, admin_h,
+    )
+    bob_h = _login(client, "bob")
+    r = client.post(
+        "/api/follow/join",
+        json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [b_follow]},
+        headers=bob_h,
+    )
+    assert r.status_code == 200, r.text
+
+    # alice 换品种 -> 全新分组（分组名按 策略类型-用户名-MT5号-品种 生成，任一维度变化即新组）
+    alice_h = _login(client, "alice")
+    new_group = _group_with_primary(client, alice_h, [a_primary], "trend_market-alice-90001-XAUUSD")
+
+    resp = _adopt(client, new_group, alice_h)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert [a["node_id"] for a in data["adopted"]] == [b_follow]
+    assert data["adopted"][0]["follower_user_id"] == bob["id"], "follower_user_id 必须取自源关系"
+    assert data["adopted"][0]["from_group_id"] == a_group
+    assert data["scanned_groups"] == 1
+
+    # 新分组真的带上跟单节点
+    assert _followers_of(client, new_group, alice_h) == [b_follow]
+
+    # bob 在【我的跟单】里能看到这条新关系（list_followings 按 follower_user_id 过滤）
+    me = client.get("/api/follow/me", headers=bob_h)
+    assert me.status_code == 200, me.text
+    groups = [g for lg in me.json()["following"] for g in lg["groups"]]
+    assert new_group in [g["group_id"] for g in groups]
+
+
+def test_adopt_followers_is_idempotent(client):
+    """重复认领幂等：第二次 adopted 为空，不产生重复关系。"""
+    admin_h = _login(client, "admin")
+    alice, bob, a_primary, a_extra, b_primary, b_follow, a_group = _setup_leader_and_follower(
+        client, admin_h,
+    )
+    bob_h = _login(client, "bob")
+    assert client.post(
+        "/api/follow/join",
+        json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [b_follow]},
+        headers=bob_h,
+    ).status_code == 200
+
+    alice_h = _login(client, "alice")
+    new_group = _group_with_primary(client, alice_h, [a_primary], "grid-alice-90001-XAUUSD")
+    first = _adopt(client, new_group, alice_h).json()
+    assert len(first["adopted"]) == 1
+
+    second = _adopt(client, new_group, alice_h).json()
+    assert second["adopted"] == [], "第二次不应重复写入"
+    assert [s["node_id"] for s in second["skipped"]] == [b_follow]
+    assert _followers_of(client, new_group, alice_h) == [b_follow], "关系只有一条"
+
+
+def test_adopt_followers_ignores_disabled_source_group(client):
+    """已确认决策：源分组被禁用时，其中的跟单节点仍应继承。"""
+    admin_h = _login(client, "admin")
+    alice, bob, a_primary, a_extra, b_primary, b_follow, a_group = _setup_leader_and_follower(
+        client, admin_h,
+    )
+    bob_h = _login(client, "bob")
+    assert client.post(
+        "/api/follow/join",
+        json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [b_follow]},
+        headers=bob_h,
+    ).status_code == 200
+
+    # 禁用源分组
+    alice_h = _login(client, "alice")
+    dis = client.patch(f"/api/groups/{a_group}", json={"enabled": False}, headers=alice_h)
+    assert dis.status_code == 200, dis.text
+
+    new_group = _group_with_primary(client, alice_h, [a_primary], "trend_market-alice-90001-EURUSD")
+    data = _adopt(client, new_group, alice_h).json()
+    assert [a["node_id"] for a in data["adopted"]] == [b_follow], "禁用不影响继承"
+    assert _followers_of(client, new_group, alice_h) == [b_follow]
+
+
+def test_adopt_followers_rejects_foreign_group(client):
+    """两道边界都要守住：没有「分组管理」菜单 -> 403；是别人名下的分组 -> 404。"""
+    admin_h = _login(client, "admin")
+    alice, bob, a_primary, a_extra, b_primary, b_follow, a_group = _setup_leader_and_follower(
+        client, admin_h,
+    )
+    new_group = _group_with_primary(
+        client, _login(client, "alice"), [a_primary], "trend_market-alice-90001-XAUUSD",
+    )
+
+    # bob 的角色只有 follow / trading，没有分组管理菜单 —— 菜单权限先挡下来
+    assert _adopt(client, new_group, _login(client, "bob")).status_code == 403
+
+    # 给 bob 分组管理菜单后，他仍不能认领 alice 名下的分组 -> 404，不泄露存在性
+    groups_role = _make_role(
+        client, admin_h, "plain_groups", "普通客户(分组)", ["follow", "trading", "groups"], [],
+    )
+    _bind_role(client, admin_h, bob["id"], groups_role["id"])
+    bob_h = _login(client, "bob")
+    resp = _adopt(client, new_group, bob_h)
+    assert resp.status_code == 404, resp.text
+    # 认领不存在的分组同样 404（不区分「不存在」与「非本人」）
+    assert _adopt(client, "grp_missing", bob_h).status_code == 404
+
+
+def test_adopt_followers_only_uses_existing_followings(client):
+    """决策 2：只搬运已存在的跟单关系，不会凭空引入没跟过我的节点。"""
+    admin_h = _login(client, "admin")
+    alice, bob, a_primary, a_extra, b_primary, b_follow, a_group = _setup_leader_and_follower(
+        client, admin_h,
+    )
+    bob_h = _login(client, "bob")
+    # bob 只往 a_extra 建的空分组跟（该组不含 alice 主节点，不是带单源分组）
+    alice_h = _login(client, "alice")
+    new_group = _group_with_primary(client, alice_h, [a_primary], "trend_market-alice-90001-XAUUSD")
+
+    data = _adopt(client, new_group, alice_h).json()
+    assert data["adopted"] == [], "没有任何已存在的跟单关系就不应写入"
+    assert _followers_of(client, new_group, alice_h) == []
+
+    # 现在 bob 跟了 a_group，新分组就应继承
+    assert client.post(
+        "/api/follow/join",
+        json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [b_follow]},
+        headers=bob_h,
+    ).status_code == 200
+    assert [a["node_id"] for a in _adopt(client, new_group, alice_h).json()["adopted"]] == [b_follow]
+
+
+def test_adopt_followers_dedupes_multi_group_followers(client):
+    """同一节点跟了 alice 的多个分组时，只继承一条（uq_follow_group_node 只保证组内唯一）。"""
+    admin_h = _login(client, "admin")
+    alice, bob, a_primary, a_extra, b_primary, b_follow, a_group = _setup_leader_and_follower(
+        client, admin_h,
+    )
+    alice_h = _login(client, "alice")
+    # alice 的第二个带单源分组
+    a_group2 = _group_with_primary(client, alice_h, [a_primary], "grid-alice-90001-EURUSD")
+
+    bob_h = _login(client, "bob")
+    assert client.post(
+        "/api/follow/join",
+        json={
+            "leader_user_id": alice["id"],
+            "group_ids": [a_group, a_group2],
+            "node_ids": [b_follow],
+        },
+        headers=bob_h,
+    ).status_code == 200
+
+    new_group = _group_with_primary(client, alice_h, [a_primary], "grid-alice-90001-XAUUSD")
+    data = _adopt(client, new_group, alice_h).json()
+    assert len(data["adopted"]) == 1, "同一节点只应继承一次"
+    assert data["adopted"][0]["node_id"] == b_follow
+    assert _followers_of(client, new_group, alice_h) == [b_follow], "不得产生重复行"
+
+
+def test_adopt_followers_skips_group_without_primary(client):
+    """目标分组不含带单员主节点时，不做任何继承（不是带单源分组）。"""
+    admin_h = _login(client, "admin")
+    alice, bob, a_primary, a_extra, b_primary, b_follow, a_group = _setup_leader_and_follower(
+        client, admin_h,
+    )
+    bob_h = _login(client, "bob")
+    assert client.post(
+        "/api/follow/join",
+        json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [b_follow]},
+        headers=bob_h,
+    ).status_code == 200
+
+    alice_h = _login(client, "alice")
+    # 手工分组：只有 a_extra，没有主节点
+    manual = _group_with_primary(client, alice_h, [a_extra], "alice-手工组")
+    data = _adopt(client, manual, alice_h).json()
+    assert data["scanned_groups"] == 1, "来源只含 a_group（手工组不含主节点，不算来源）"
+    assert [a["from_group_id"] for a in data["adopted"]] == [a_group]
+    assert _followers_of(client, manual, alice_h) == [b_follow]

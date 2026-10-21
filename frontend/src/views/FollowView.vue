@@ -11,8 +11,27 @@ import type {
   FollowDetailResponse,
   FollowLeaderSummary,
   FollowMeResponse,
-  FollowMyGroup,
 } from '@/api/types'
+
+/** 「我的跟单」聚合后的单条节点（已按 leader 聚合、按 node_id 去重） */
+interface MyFollowedNode {
+  node_id: string
+  name: string | null
+  mt5_login: number | null
+  status: string | null
+  joined_at: number | null
+  /** 该节点在该 leader 下所有相关分组的活跃任务合计 */
+  active_task_count: number
+  /** 该节点来自哪个 group（去重后保留首条，用于移出接口） */
+  group_id: string
+}
+
+/** 「我的跟单」聚合后的单条 leader 卡片数据 */
+interface MyFollowingEntry {
+  leader: FollowLeaderSummary
+  marketable: boolean
+  nodes: MyFollowedNode[]
+}
 
 const router = useRouter()
 
@@ -178,13 +197,13 @@ async function submitJoin() {
 }
 
 async function doLeave(
-  leader: FollowLeaderSummary, group: FollowMyGroup,
+  leader: FollowLeaderSummary, groupId: string,
   nodeIds: string[], closeTasks: boolean,
 ) {
   try {
     const res = await leaveFollow({
       leader_user_id: leader.leader_user_id,
-      group_ids: [group.group_id],
+      group_ids: [groupId],
       node_ids: nodeIds,
       close_tasks: closeTasks,
     })
@@ -202,11 +221,68 @@ async function doLeave(
   }
 }
 
-async function confirmLeave(leader: FollowLeaderSummary, group: FollowMyGroup, nodeId: string) {
-  const node = group.my_nodes.find((n) => n.node_id === nodeId)
-  const active = group.active_task_count
+/**
+ * 「我的跟单」按 leader 聚合、按 node_id 去重，分组不再展示。
+ * 后端响应里仍嵌套 `groups`，此处扁平化为 leader → nodes。
+ */
+const myFollowing = computed<MyFollowingEntry[]>(() =>
+  mine.value.following.map((f) => {
+    const nodesById = new Map<string, MyFollowedNode>()
+    for (const g of f.groups) {
+      for (const n of g.my_nodes) {
+        const prev = nodesById.get(n.node_id)
+        if (prev) {
+          prev.active_task_count += g.active_task_count
+          // joined_at 取最早的那一条作为代表
+          if (n.joined_at != null && (prev.joined_at == null || n.joined_at < prev.joined_at)) {
+            prev.joined_at = n.joined_at
+          }
+        } else {
+          nodesById.set(n.node_id, {
+            node_id: n.node_id,
+            name: n.name ?? null,
+            mt5_login: n.mt5_login ?? null,
+            status: n.status ?? null,
+            joined_at: n.joined_at ?? null,
+            active_task_count: g.active_task_count,
+            group_id: g.group_id,
+          })
+        }
+      }
+    }
+    return {
+      leader: f.leader,
+      marketable: f.leader.marketable,
+      nodes: [...nodesById.values()].sort((a, b) => a.node_id.localeCompare(b.node_id)),
+    }
+  }),
+)
+
+/** 反查：给 leader + nodeId 找到其所属的 group_id（聚合时记录的那条） */
+function findGroupIdForNode(leader: FollowLeaderSummary, nodeId: string): string | null {
+  const entry = myFollowing.value.find((x) => x.leader.leader_user_id === leader.leader_user_id)
+  return entry?.nodes.find((n) => n.node_id === nodeId)?.group_id ?? null
+}
+
+/** 详情卡片打开时："我已跟随该 leader 的节点"集合 → 用于置灰 */
+const alreadyFollowingNodeIds = computed<Set<string>>(() => {
+  const ids = new Set<string>()
+  if (!detail.value) return ids
+  const entry = myFollowing.value.find(
+    (x) => x.leader.leader_user_id === detail.value!.leader.leader_user_id,
+  )
+  if (entry) for (const n of entry.nodes) ids.add(n.node_id)
+  return ids
+})
+
+async function confirmLeave(leader: FollowLeaderSummary, nodeId: string) {
+  const groupId = findGroupIdForNode(leader, nodeId)
+  if (!groupId) return
+  const entry = myFollowing.value.find((x) => x.leader.leader_user_id === leader.leader_user_id)
+  const node = entry?.nodes.find((n) => n.node_id === nodeId)
+  const active = node?.active_task_count ?? 0
   if (!active) {
-    await doLeave(leader, group, [nodeId], false)
+    await doLeave(leader, groupId, [nodeId], false)
     return
   }
   // 有进行中的任务：让用户在「平仓后移出」和「保留任务」之间二选一
@@ -216,8 +292,8 @@ async function confirmLeave(leader: FollowLeaderSummary, group: FollowMyGroup, n
       type: 'warning',
       dangerouslyUseHTMLString: true,
       message:
-        `节点「${node?.name ?? nodeId}」在该分组还有进行中的任务。<br/>` +
-        '移出后该分组不再向它下发新信号，现有任务如何处理？',
+        `节点「${node?.name ?? nodeId}」在带单员「${leader.display_name || leader.username}」下还有 ${active} 个进行中的任务。<br/>` +
+        '移出后该带单员不再向它下发新信号，现有任务如何处理？',
       distinguishCancelAndClose: true,
       confirmButtonText: '平仓并关闭任务后移出',
       cancelButtonText: '保留任务，仅停止接收新信号',
@@ -225,7 +301,7 @@ async function confirmLeave(leader: FollowLeaderSummary, group: FollowMyGroup, n
       .then((r) => r.value)
       .catch((r) => (r === 'cancel' ? 'keep' : 'close'))
     if (choice === 'close') return
-    await doLeave(leader, group, [nodeId], choice === 'confirm')
+    await doLeave(leader, groupId, [nodeId], choice === 'confirm')
   } catch {
     // 关闭弹窗：不处理
   }
@@ -275,7 +351,9 @@ onMounted(() => {
           >
             <div class="row between">
               <strong>{{ l.display_name || l.username }}</strong>
-              <span v-if="l.my_follow_group_count" class="tag green">已跟 {{ l.my_follow_group_count }}</span>
+              <span v-if="l.my_follow_node_count" class="tag green">
+                已跟
+              </span>
               <span v-else class="tag">未跟</span>
             </div>
 
@@ -350,28 +428,30 @@ onMounted(() => {
               v-for="n in detail.my_nodes"
               :key="n.node_id"
               class="pick-item"
-              :class="{ on: nodeSet.has(n.node_id) }"
-              @click="toggleNode(n.node_id)"
+              :class="{
+                on: !alreadyFollowingNodeIds.has(n.node_id) && nodeSet.has(n.node_id),
+                disabled: alreadyFollowingNodeIds.has(n.node_id),
+              }"
+              @click="alreadyFollowingNodeIds.has(n.node_id) ? null : toggleNode(n.node_id)"
             >
               <label>
                 <input
                   type="checkbox"
-                  :checked="nodeSet.has(n.node_id)"
+                  :checked="!alreadyFollowingNodeIds.has(n.node_id) && nodeSet.has(n.node_id)"
+                  :disabled="alreadyFollowingNodeIds.has(n.node_id)"
                   @click.stop
-                  @change="toggleNode(n.node_id)"
+                  @change="alreadyFollowingNodeIds.has(n.node_id) ? null : toggleNode(n.node_id)"
                 />
                 <span class="pick-name">{{ n.name || n.node_id }}</span>
               </label>
               <span class="muted">MT5 {{ n.mt5_login ?? '—' }}</span>
-              <span :class="n.status === 'online' ? 'ok' : 'off'">
-                {{ n.status === 'online' ? '在线' : '离线' }}
-              </span>
+              <span v-if="alreadyFollowingNodeIds.has(n.node_id)" class="tag green">已跟随</span>
             </li>
           </ul>
 
           <div class="join-bar">
             <span class="muted">
-              已选：{{ selectedNodes.length }} 个节点 · 将加入 {{ allSelectableGroupIds.length }} 个可跟分组
+              已选：{{ selectedNodes.length }} 个节点
               <template v-if="myNodeCount"> · 可用节点 {{ myNodeCount }}</template>
             </span>
             <button
@@ -382,24 +462,19 @@ onMounted(() => {
               {{ submitting ? '提交中...' : '确认跟单' }}
             </button>
           </div>
-          <p class="warn">
-            加入后将按带单员绑定的策略在你的节点上执行，<strong>手数、止损、加仓规则均以带单员为准</strong>；移出不会自动平仓。
-          </p>
+
         </template>
 
         <template v-else>
           <div class="row between" style="margin-bottom: 12px">
             <strong>我的跟单</strong>
-            <span class="muted" style="font-size: 12px">
-              {{ mine.summary.following_count }} 个带单员 · {{ mine.summary.follow_node_count }} 个节点
-            </span>
           </div>
           <div v-if="mineLoading" class="muted" style="padding: 12px 0">加载中...</div>
           <div v-else-if="!mine.following.length" class="muted empty">
             还没有跟单，从左侧选择一个带单员开始
           </div>
           <div v-else class="mine-list">
-            <div v-for="f in mine.following" :key="f.leader.leader_user_id" class="mine-block">
+            <div v-for="f in myFollowing" :key="f.leader.leader_user_id" class="mine-block">
               <div class="row between mine-head">
                 <strong>
                   {{ f.leader.display_name || f.leader.username }}
@@ -410,23 +485,26 @@ onMounted(() => {
                     </template>
                   </span>
                 </strong>
-                <span v-if="!f.leader.marketable" class="tag amber">该带单员已关闭带单</span>
+                <span v-if="!f.marketable" class="tag amber">该带单员已关闭带单</span>
               </div>
-              <div v-for="g in f.groups" :key="g.group_id" class="mine-group">
-                <div class="row between">
-                  <span>
-                    {{ g.group_name || g.group_id }}
-                    <span v-if="g.active_task_count" class="muted">· 进行中 {{ g.active_task_count }}</span>
-                  </span>
-                  <span v-if="!g.marketable" class="tag amber">{{ g.unmarketable_reason }}</span>
-                </div>
-                <div v-for="n in g.my_nodes" :key="n.node_id" class="mine-node">
+              <p
+                v-if="!f.nodes.length"
+                class="muted"
+                style="margin: 4px 0 0; font-size: 12px"
+              >
+                暂未跟单任何节点
+              </p>
+              <div v-else>
+                <div v-for="n in f.nodes" :key="n.node_id" class="mine-node">
                   <span class="muted">
                     {{ n.name || n.node_id }}
                     <template v-if="n.mt5_login">（MT5 {{ n.mt5_login }}）</template>
                     · 加入于 {{ n.joined_at ? new Date(n.joined_at * 1000).toLocaleString('zh-CN') : '—' }}
+                    <template v-if="n.active_task_count">
+                      · 运行中 {{ n.active_task_count }} 单
+                    </template>
                   </span>
-                  <button class="btn-sm btn-ghost" @click="confirmLeave(f.leader, g, n.node_id)">
+                  <button class="btn-sm btn-ghost" @click="confirmLeave(f.leader, n.node_id)">
                     移出
                   </button>
                 </div>
@@ -688,12 +766,6 @@ onMounted(() => {
 
 .mine-head {
   margin-bottom: 8px;
-}
-
-.mine-group {
-  padding: 8px 0;
-  border-top: 1px solid var(--glass-border);
-  font-size: 13px;
 }
 
 .mine-node {

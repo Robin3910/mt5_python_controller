@@ -9,7 +9,16 @@
 """
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from . import group_persist, group_rules, group_service, permissions, persist, rbac_service
+from . import (
+    follow_rules,
+    follow_service,
+    group_persist,
+    group_rules,
+    group_service,
+    permissions,
+    persist,
+    rbac_service,
+)
 from .connections import manager
 from .deps import (
     client_ip,
@@ -23,6 +32,7 @@ from .group_dispatcher import GroupDispatcher
 from .limit_watch import normalize_keyword
 from .models import (
     GROUP_DISPATCH_MODES,
+    AdoptFollowersResponse,
     GroupCreate,
     GroupFollowerRef,
     GroupNodeRef,
@@ -358,6 +368,63 @@ async def close_group(
         category="console", before=None, after=outcome,
     )
     return outcome
+
+
+@router.post("/{group_id}/adopt-followers", response_model=AdoptFollowersResponse)
+async def adopt_followers(
+    group_id: str,
+    request: Request,
+    store: RedisStore = Depends(get_store),
+    p: Principal = Depends(require_menu(MENU_GROUPS)),
+):
+    """分组 owner 认领该分组沿用自己其它分组的跟单节点（跨策略类型 / 品种继承）。
+
+    场景：带单员换品种或换策略类型时会新建「分组 + 策略」，新分组默认只有主节点，
+    跟单节点得手动去【带单】页重新跟一次。本接口把**已存在的跟单关系**复制过来。
+
+    三条口径：
+    - **只搬运已存在的跟单关系**，绝不引入「本来就没跟我」的节点；
+    - 来源 = 本人名下、含本人主节点的分组，**忽略启用状态**（已确认决策），
+      即手工禁用过的源分组，里面的跟单节点同样继承；
+    - 幂等：已存在的关系进 skipped，不产生重复行。
+
+    归属校验用 owned_group_or_404：非本人分组一律 404，不泄露存在性。
+    """
+    target = await owned_group_or_404(store, p, group_id)
+    owner = permissions.normalize_owner(target.get("owner_user_id"))
+
+    all_nodes = await store.all_nodes()
+    primary = follow_rules.leader_primary_node_id(all_nodes, owner)
+    if not primary:
+        # 没有主节点就没有带单源，也就没有可继承的跟单关系
+        return AdoptFollowersResponse(adopted=[], skipped=[], scanned_groups=0)
+
+    all_groups = await store.all_groups()
+    # 用 is_leader_source_group（owner + 含主节点）而非 followable_groups，
+    # 后者带 enabled 过滤 —— 继承与「该分组是否对外接单」无关，故不过滤启用状态。
+    sources = [
+        g for g in (all_groups or [])
+        if isinstance(g, dict)
+        and str(g.get("group_id") or "") != str(group_id)
+        and follow_rules.is_leader_source_group(g, owner, primary)
+    ]
+    adopted, skipped = await follow_service.adopt_followers_for_group(
+        store,
+        target_group=target,
+        source_group_ids=[g["group_id"] for g in sources],
+    )
+    await persist.audit(
+        p.username, "adopt_followers", group_id, None, "ok", client_ip(request),
+        category="follow", before=None,
+        after={
+            "adopted_count": len(adopted),
+            "skipped_count": len(skipped),
+            "source_group_count": len(sources),
+        },
+    )
+    return AdoptFollowersResponse(
+        adopted=adopted, skipped=skipped, scanned_groups=len(sources),
+    )
 
 
 @router.patch("/{group_id}", response_model=GroupOut)

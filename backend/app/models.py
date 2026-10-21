@@ -258,6 +258,17 @@ class GroupUpdate(BaseModel):
     limit_watch_node_ids: Optional[list[str]] = None
 
 
+class AdoptFollowersResponse(BaseModel):
+    """分组 owner 认领跟单节点的结果（跨策略类型 / 品种继承）。
+
+    adopted = 实际新写入的跟单关系；skipped = 因已存在 / 源信息缺失而未写入的条目。
+    """
+    adopted: list[dict] = Field(default_factory=list)
+    skipped: list[dict] = Field(default_factory=list)
+    # 参与扫描的来源分组数（不含目标分组自身）
+    scanned_groups: int = 0
+
+
 class LimitWatchLogRecord(BaseModel):
     """分组限价监听日志（落库 + 后台 WS 实时推送）。"""
     id: int

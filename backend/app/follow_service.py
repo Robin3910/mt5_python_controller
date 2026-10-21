@@ -183,6 +183,66 @@ async def add_following(
     return True
 
 
+async def adopt_followers_for_group(
+    store: RedisStore,
+    *,
+    target_group: dict,
+    source_group_ids: list[str],
+) -> tuple[list[dict], list[dict]]:
+    """把来源分组里已存在的跟单节点写入目标分组；返回 (adopted, skipped)。
+
+    用于「带单员新建分组 + 策略时，把跟过自己其它分组的节点一并带进来」——
+    跨策略类型 / 品种都生效（分组名按 策略类型-用户名-MT5号-品种 生成）。
+
+    三条口径：
+    - **只搬运已存在的跟单关系**，绝不引入「本来就没跟我」的节点；
+    - 同一节点跟了多个来源分组时按 node_id 去重，follower_user_id 取首次出现的那条；
+    - 逐条走 add_following，已存在时返回 False 进 skipped，天然幂等。
+
+    leader_user_id / leader_primary_node_id **一律从源关系取**，不作入参：源关系里
+    已存了这两个字段（写入时快照），复用既避免管理员名下分组（owner 为 None）
+    触发 int(None) 崩溃，也保证与源关系完全一致。
+    """
+    target_gid = str((target_group or {}).get("group_id") or "").strip()
+    src_ids = [
+        str(g).strip() for g in (source_group_ids or [])
+        if str(g or "").strip() and str(g).strip() != target_gid
+    ]
+    if not target_gid or not src_ids:
+        return [], []
+
+    # 按 node_id 去重，保留首次出现的来源分组，便于回显「继承自哪个分组」
+    seen: dict[str, dict] = {}
+    for f in await list_for_groups(src_ids):
+        nid = str(f.get("node_id") or "").strip()
+        if nid and nid not in seen:
+            seen[nid] = f
+
+    adopted: list[dict] = []
+    skipped: list[dict] = []
+    for nid, src in seen.items():
+        follower_uid = src.get("follower_user_id")
+        leader_uid = src.get("leader_user_id")
+        if not follower_uid or not leader_uid:
+            skipped.append({"node_id": nid, "reason": "跟单关系缺少归属信息"})
+            continue
+        ok = await add_following(
+            store,
+            group_id=target_gid,
+            node_id=nid,
+            follower_user_id=int(follower_uid),
+            leader_user_id=int(leader_uid),
+            leader_primary_node_id=src.get("leader_primary_node_id"),
+        )
+        row = {
+            "node_id": nid,
+            "follower_user_id": int(follower_uid),
+            "from_group_id": src.get("group_id"),
+        }
+        (adopted if ok else skipped).append(row)
+    return adopted, skipped
+
+
 async def remove_following(
     store: RedisStore,
     *,
