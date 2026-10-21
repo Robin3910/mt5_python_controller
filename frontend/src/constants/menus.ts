@@ -2,6 +2,7 @@
 export const MENU_PATHS: ReadonlyArray<{ code: string; path: string }> = [
   { code: 'home', path: '/home' },
   { code: 'trading', path: '/trading' },
+  { code: 'follow', path: '/follow' },
   { code: 'dashboard', path: '/' },
   { code: 'nodes', path: '/nodes' },
   { code: 'trend', path: '/trend' },

@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from . import (
+    follow_service,
     group_persist,
     group_service,
     node_service,
@@ -75,7 +76,21 @@ def _to_user_out(user: User, roles: list[dict], ownership) -> UserOut:
         group_count=groups.get(user.id, 0),
         strategy_count=strategies.get(user.id, 0),
         created_at=user.created_at.timestamp() if user.created_at else None,
+        capabilities=_capabilities_of_roles(roles),
     )
+
+
+def _capabilities_of_roles(roles: list[dict]) -> list[str]:
+    """若干角色能力码的并集（管理员固定全部能力）；与 Principal.capabilities 同口径。"""
+    if any(r.get("code") == permissions.ADMIN_ROLE_CODE for r in roles or []):
+        from . import permissions as _permissions
+        return list(_permissions.ALL_CAPABILITY_CODES)
+    seen: set[str] = set()
+    for r in roles or []:
+        for c in r.get("capabilities") or []:
+            if isinstance(c, str) and c not in seen:
+                seen.add(c)
+    return [c for c in permissions.ALL_CAPABILITY_CODES if c in seen]
 
 
 async def _user_out(store: RedisStore, user: User) -> UserOut:
@@ -330,6 +345,7 @@ async def assign_nodes(
 
     changed_set = set(changed)
     memberships = []
+    following = []
     for g in await store.all_groups():
         for m in g.get("members") or []:
             nid = m.get("node_id")
@@ -340,15 +356,28 @@ async def assign_nodes(
                     "node_id": nid,
                     "node_name": nodemap[nid].get("name"),
                 })
-    if memberships and not body.confirm:
+        # 跟单关系同样要纳入确认清单：归属一变，跟单记录里的 follower_user_id 就失真了
+        for f in g.get("followers") or []:
+            nid = f.get("node_id")
+            if nid in changed_set:
+                following.append({
+                    "group_id": g["group_id"],
+                    "group_name": g.get("name"),
+                    "node_id": nid,
+                    "node_name": nodemap[nid].get("name"),
+                })
+    if (memberships or following) and not body.confirm:
         raise HTTPException(status_code=409, detail={
             "reason": "confirm_required",
             "message": "以下节点仍在分组中，确认后将把它们移出这些分组",
             "memberships": memberships,
+            "followings": following,
         })
 
     for nid in sorted({m["node_id"] for m in memberships}):
         await group_service.remove_node_from_all_groups(store, nid)
+    for nid in sorted({f["node_id"] for f in following}):
+        await follow_service.remove_node_followings(store, nid)
     previous_owners = {
         permissions.normalize_owner(nodemap[nid].get("owner_user_id")) for nid in added
     }
@@ -404,6 +433,9 @@ async def delete_user(
     roles = (await rbac_service.roles_by_user()).get(user.id, [])
     before = _snapshot(user, roles)
     await rbac_service.revoke_sessions(store, user.username)
+    # 跟单关系清理：名下节点/分组为空不代表没人跟他的单（跟单员自己可以没资源），
+    # 留着会变成指向已删除用户的脏关系。
+    await follow_service.remove_user_followings(store, user.id)
     if not await user_service.delete_user(user.id):
         raise HTTPException(status_code=404, detail="user not found")
     await persist.audit(

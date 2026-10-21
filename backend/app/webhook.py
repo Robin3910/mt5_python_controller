@@ -87,7 +87,9 @@ def _validate_targeting(signal: TradingSignal, model: str) -> None:
     点名了不存在的分组只在分发时记为落选（响应仍是 200 + rejected），不在这里拦。
     """
     for field_name, values in (
-        ("template_ids", signal.template_ids), ("group_ids", signal.group_ids),
+        ("template_ids", signal.template_ids),
+        ("group_ids", signal.group_ids),
+        ("node_ids", signal.node_ids),
     ):
         if values and model != SIGNAL_MODEL_STRATEGY:
             raise HTTPException(
@@ -145,6 +147,7 @@ async def process_signal(
         f"{model}:{signal.action}:{signal.symbol}:{signal.volume}"
         f":{signal.stop_loss}:{signal.take_profit}"
         f":{','.join(signal.template_ids)}:{','.join(signal.group_ids)}"
+        f":{','.join(signal.node_ids)}"
     )
     if extra := (dedup_key or "").strip():
         fp = f"{fp}:{extra}"

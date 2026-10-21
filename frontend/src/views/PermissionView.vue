@@ -170,6 +170,11 @@ function capabilityNames(codes: string[]): string {
   return codes.map((c) => CAPABILITIES.find((cap) => cap.code === c)?.label || c).join('、') || '—'
 }
 
+/** 单条能力码的展示名（与 capabilityNames 一致，但返回单数）；找不到时回落到原码。 */
+function capabilityLabel(code: string): string {
+  return CAPABILITIES.find((cap) => cap.code === code)?.label || code
+}
+
 function nodeOwnerLabel(n: NodeOut): string {
   if (n.owner_user_id == null) return '管理员'
   return n.owner_username || `用户 #${n.owner_user_id}`
@@ -604,6 +609,18 @@ async function removeRole(role: RoleOut): Promise<void> {
             <div class="list-field"><span class="k">用户名</span><span class="v">{{ u.username }}</span></div>
             <div class="list-field"><span class="k">角色</span><span class="v">{{ roleNames(u) }}</span></div>
             <div class="list-field"><span class="k">2FA</span><span class="v">{{ u.totp_enabled ? '已绑定' : '未绑定' }}</span></div>
+            <div class="list-field">
+              <span class="k">能力</span>
+              <span class="v">
+                <span v-if="u.is_admin" class="tag amber">全部能力</span>
+                <span v-else-if="!u.capabilities?.length" class="muted">—</span>
+                <span v-else class="cap-tags">
+                  <span v-for="code in u.capabilities" :key="code" class="tag blue">
+                    {{ capabilityLabel(code) }}
+                  </span>
+                </span>
+              </span>
+            </div>
             <div class="list-field"><span class="k">节点</span><span class="v">{{ u.node_ids.length }}</span></div>
             <div class="list-field"><span class="k">分组 / 策略</span><span class="v">{{ u.group_count }} / {{ u.strategy_count }}</span></div>
             <div class="list-card-actions">
@@ -631,6 +648,7 @@ async function removeRole(role: RoleOut): Promise<void> {
                 <th>角色</th>
                 <th>状态</th>
                 <th>2FA</th>
+                <th>能力</th>
                 <th>节点</th>
                 <th>分组 / 策略</th>
                 <th>创建时间</th>
@@ -649,6 +667,15 @@ async function removeRole(role: RoleOut): Promise<void> {
                 <td>{{ roleNames(u) }}</td>
                 <td><span class="tag" :class="u.is_active ? 'green' : ''">{{ u.is_active ? '启用' : '禁用' }}</span></td>
                 <td>{{ u.totp_enabled ? '已绑定' : '未绑定' }}</td>
+                <td class="perm-menus">
+                  <span v-if="u.is_admin" class="tag amber">全部能力</span>
+                  <span v-else-if="!u.capabilities?.length" class="muted">—</span>
+                  <span v-else class="cap-tags">
+                    <span v-for="code in u.capabilities" :key="code" class="tag blue">
+                      {{ capabilityLabel(code) }}
+                    </span>
+                  </span>
+                </td>
                 <td>{{ u.node_ids.length }}</td>
                 <td>{{ u.group_count }} / {{ u.strategy_count }}</td>
                 <td class="muted">{{ fmtTime(u.created_at) }}</td>
@@ -667,7 +694,7 @@ async function removeRole(role: RoleOut): Promise<void> {
                 </td>
               </tr>
               <tr v-if="!filteredUsers.length">
-                <td colspan="8" class="muted" style="padding: 18px">
+                <td colspan="9" class="muted" style="padding: 18px">
                   {{ loading ? '加载中…' : '没有匹配的用户' }}
                 </td>
               </tr>
@@ -1154,5 +1181,12 @@ async function removeRole(role: RoleOut): Promise<void> {
     flex: 1;
     min-height: 44px;
   }
+}
+
+/* 能力标签：用户列表「能力」列里的多个 tag 同行换行 */
+.cap-tags {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
 }
 </style>

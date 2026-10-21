@@ -378,6 +378,11 @@ export interface ManualSignalPayload {
   template_ids?: string[]
   /** 分组定向（仅 strategy 模型）：只发给 ID 在列表内的分组；省略或空数组 = 不限制 */
   group_ids?: string[]
+  /**
+   * 节点定向（仅 strategy 模型）：把信号限制到指定节点；省略或空数组 = 按分组参与者分发。
+   * OrderDialog 在「带单」关闭时由前端写入 [primary_node_id]，让信号只推到主节点。
+   */
+  node_ids?: string[]
 }
 
 /** Webhook model 字段：normal = 按币种分发（默认），strategy = 按分组分发 */
@@ -1307,6 +1312,8 @@ export interface UserOut {
   group_count: number
   strategy_count: number
   created_at: number | null
+  /** 启用角色的能力码并集（如 ['follow_leader']）；管理员固定全部能力 */
+  capabilities: string[]
 }
 
 export interface UserCreatePayload {
@@ -1345,3 +1352,105 @@ export type NodeAssignConflict =
       nodes: { node_id: string; name: string | null; tasks: number }[]
     }
   | { reason: 'confirm_required'; message: string; memberships: NodeMembershipConflict[] }
+
+// ── 带单（follow）───────────────────────────────────────────────
+/** 节点精简信息（带单员摘要 / 我的可跟单节点共用） */
+export interface FollowNodeBrief {
+  node_id: string
+  name: string | null
+  mt5_login: number | null
+  status: string | null
+  enabled: boolean
+  is_primary?: boolean
+}
+
+/** 带单员摘要：他的主节点就是带单源 */
+export interface FollowLeaderSummary {
+  leader_user_id: number
+  username: string
+  display_name: string | null
+  primary_node: FollowNodeBrief | null
+  /** 可跟单分组数（启用 + 含其主节点） */
+  followable_group_count: number
+  /** 全局：他的分组被多少个节点跟随 */
+  follower_node_count: number
+  /** 我已跟其中几个分组 */
+  my_follow_group_count: number
+  /** 我用了几个节点跟 */
+  my_follow_node_count: number
+  /** 带单员是否仍持有 follow_leader 能力；false 时已下架但仍可移出 */
+  marketable: boolean
+}
+
+export interface FollowGroupDetail {
+  group_id: string
+  name: string | null
+  strategy_name?: string | null
+  strategy_template?: string | null
+  dispatch_mode: string
+  signal_concurrent_enabled: boolean
+  trend_risk_enabled: boolean
+  enabled: boolean
+  member_count: number
+  follower_count: number
+  online_count: number
+  active_task_count: number
+  signal_count: number
+  my_follow_node_ids: string[]
+  selectable: boolean
+  unselectable_reason: string | null
+}
+
+export interface FollowDetailResponse {
+  leader: FollowLeaderSummary
+  groups: FollowGroupDetail[]
+  /** 我可用于跟单的节点（已剔除主节点） */
+  my_nodes: FollowNodeBrief[]
+}
+
+export interface FollowMyGroup {
+  group_id: string
+  group_name: string | null
+  symbol: string | null
+  strategy_name: string | null
+  marketable: boolean
+  unmarketable_reason: string | null
+  active_task_count: number
+  my_nodes: (FollowNodeBrief & { joined_at: number | null })[]
+}
+
+export interface FollowMyLeader {
+  leader: FollowLeaderSummary
+  groups: FollowMyGroup[]
+}
+
+export interface FollowMeResponse {
+  following: FollowMyLeader[]
+  summary: { following_count: number; follow_node_count: number }
+}
+
+export interface FollowJoinPayload {
+  leader_user_id: number
+  group_ids: string[]
+  node_ids: string[]
+}
+
+export interface FollowJoinResponse {
+  joined: { group_id: string; group_name: string | null; node_ids: string[]; already_node_ids: string[] }[]
+  skipped: { node_id: string; group_id?: string; reason: string }[]
+  leader_primary_node_id: string | null
+}
+
+export interface FollowLeavePayload {
+  leader_user_id: number
+  group_ids: string[]
+  node_ids: string[]
+  close_tasks: boolean
+}
+
+export interface FollowLeaveResponse {
+  removed: { group_id: string; node_ids: string[] }[]
+  closing: { node_id: string; group_id: string; status: string; magic: number | null }[]
+  forced: { node_id: string; group_id: string; status: string; magic: number | null }[]
+  warning: string | null
+}

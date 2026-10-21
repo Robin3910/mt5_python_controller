@@ -293,6 +293,33 @@ class NodeGroupMember(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
+class GroupFollowerNode(Base):
+    """跟单成员：非主节点加入他人的带单源分组。
+
+    与 NodeGroupMember 严格分离，两者职责不可混用：
+    - NodeGroupMember    = 分组所有者自己的节点（owner 可编辑 / 排序 / 开限价监听）；
+    - GroupFollowerNode  = 跟单员的节点（只读、不可被 owner 编辑、限价监听恒关）。
+
+    同一个节点不能既是 owner 成员又是跟单成员：加入跟单时校验节点归属，
+    而 owner 成员要求 owner_user_id 与分组一致，天然互斥。
+    """
+    __tablename__ = "group_follower_node"
+    __table_args__ = (UniqueConstraint("group_id", "node_id", name="uq_follow_group_node"),)
+
+    id: Mapped[int] = mapped_column(AutoPK, primary_key=True, autoincrement=True)
+    group_id: Mapped[str] = mapped_column(String(32), index=True)
+    node_id: Mapped[str] = mapped_column(String(32), index=True)
+    # 跟单员用户 ID（冗余自 nodes.owner_user_id，便于按人查询 / 审计）
+    follower_user_id: Mapped[int] = mapped_column(Integer, index=True)
+    # 带单源冗余快照：写入时取「分组 owner 的主节点」。
+    # 只用于展示 / 审计 / 主节点切换后的存量排查，不参与运行时判定
+    # （运行时一律按 group.owner_user_id 现算主节点，避免主节点切换后快照过期）。
+    leader_user_id: Mapped[int] = mapped_column(Integer, index=True)
+    leader_primary_node_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)  # 组内轮询顺序
+    joined_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 class GroupSignalTask(Base):
     """分组信号主任务：一条 strategy 信号在一个分组内的**分发记录**。
 

@@ -34,11 +34,39 @@ _BUILTIN_ROLES = (
 # ---------------------------------------------------------------------------
 # 启动种子
 # ---------------------------------------------------------------------------
+async def _backfill_default_user_menus(s, role: Optional[Role]) -> None:
+    """给存量内置 user 角色补齐 DEFAULT_USER_MENUS 中缺失的菜单（幂等）。
+
+    存量角色不会走 seed_rbac 的建角色分支，因此后来新增的 assignable 菜单
+    （如「带单」）对它不可见。这里只补缺，不删多，重复执行无副作用。
+    """
+    if role is None:
+        return
+    have = {
+        code
+        for (code,) in (
+            await s.execute(select(RoleMenu.menu_code).where(RoleMenu.role_id == role.id))
+        ).all()
+        if code
+    }
+    missing = [m for m in permissions.DEFAULT_USER_MENUS if m not in have]
+    if not missing:
+        return
+    for menu in missing:
+        s.add(RoleMenu(role_id=role.id, menu_code=menu))
+    await s.flush()
+    logger.info("rbac: backfilled %d menu(s) for builtin role %s", len(missing), role.code)
+
+
 async def seed_rbac() -> None:
     """确保内置角色存在；首次升级时把旧 role=admin 的账号绑定为超级管理员。
 
     旧账号绑定只在 sys_user_role 为空时做一次：之后管理员可以随意调整角色，
     重启不会把被收回权限的账号又加回超级管理员。
+
+    内置普通用户角色的菜单做**幂等补齐**：上方的循环只在角色首次创建时写菜单，
+    存量 user 角色升级后不会自动获得后来新增的菜单（如带单），这里补上。
+    只补 DEFAULT_USER_MENUS 里缺的那些，不动管理员手工调整过的其它菜单。
     """
     async with SessionLocal() as s:
         existing = {r.code: r for r in (await s.execute(select(Role))).scalars().all()}
@@ -52,6 +80,7 @@ async def seed_rbac() -> None:
             if code == DEFAULT_ROLE_CODE:
                 for menu in permissions.DEFAULT_USER_MENUS:
                     s.add(RoleMenu(role_id=role.id, menu_code=menu))
+        await _backfill_default_user_menus(s, existing.get(DEFAULT_ROLE_CODE))
         bound = await s.scalar(select(func.count()).select_from(UserRole))
         if not bound:
             admin_role_id = existing[ADMIN_ROLE_CODE].id

@@ -42,6 +42,8 @@ class TradingSignal:
     template_ids: List[str] = field(default_factory=list)
     # 分组定向（仅 strategy 链路使用）：只有 ID 在列表内的分组才接收本信号；空 = 不限制
     group_ids: List[str] = field(default_factory=list)
+    # 节点定向（仅 strategy 链路使用）：仅向 ID 在列表内的节点下发；空 = 不限制
+    node_ids: List[str] = field(default_factory=list)
 
 
 class TradingViewParser:
@@ -126,6 +128,7 @@ class TradingViewParser:
         allow_position = self._extract_allow_position(normalized)
         template_ids = self._extract_template_ids(normalized)
         group_ids = self._extract_group_ids(normalized)
+        node_ids = self._extract_node_ids(normalized)
 
         return TradingSignal(
             action=action,
@@ -139,6 +142,7 @@ class TradingViewParser:
             allow_position=allow_position,
             template_ids=template_ids,
             group_ids=group_ids,
+            node_ids=node_ids,
         )
 
     def _parse_text(self, text: str) -> Optional[TradingSignal]:
@@ -368,6 +372,12 @@ class TradingViewParser:
         """分组定向：本信号只发给 ID 在列表内的分组。"""
         return self._extract_id_list(
             data, "group_ids", "groupids", "group_id", "groupid",
+        )
+
+    def _extract_node_ids(self, data: Dict[str, Any]) -> List[str]:
+        """节点定向：仅向这些节点下发；空 = 不限制。"""
+        return self._extract_id_list(
+            data, "node_ids", "nodeids", "node_id", "nodeid",
         )
 
     def validate_signal(self, signal: TradingSignal) -> Tuple[bool, Optional[str]]:

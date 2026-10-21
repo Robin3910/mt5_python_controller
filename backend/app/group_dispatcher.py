@@ -36,10 +36,13 @@ from . import (
     group_persist,
     group_rules,
     market_probe,
+    permissions,
     persist,
+    rbac_service,
     strategy_templates,
     system_settings,
     trend_indicators,
+    user_service,
 )
 from .config import Config
 from .connections import manager
@@ -165,6 +168,58 @@ def build_strategy_update_command(
 class GroupDispatcher:
     def __init__(self, store: RedisStore) -> None:
         self.store = store
+
+    # ------------------------------------------------------------------
+    # 带单（跟单成员）参与判定
+    # ------------------------------------------------------------------
+    async def _effective_with_follows(
+        self, group: dict, nodemap: dict[str, dict], online_ids: set[str],
+        *, signal: Optional[TradingSignal] = None,
+    ) -> list[str]:
+        """本次分发的有效节点，串起 跟单员准入 与 节点定向（node_ids）。
+
+        三种情况处理准入（带单员是否仍有 follow_leader 能力）：
+        1. 没有跟单成员 -> 跟改动前完全一致（owner 成员口径，零行为变化）；
+        2. 有跟单成员 + 带单员仍有能力 -> owner 成员 + 跟单成员；
+        3. 带单员已被撤销能力 -> 退回 owner 成员口径；已在跑的任务继续跑。
+
+        节点定向（OrderDialog「带单」关闭 / 节点定向 webhook）：
+        信号带 node_ids 时，最终下发集合**按 node_ids 收窄**，
+        留一个稳定的可解释口径：「带单关 ⇒ 主节点」「带单开 ⇒ 全部参与者」。
+        空列表视为不限制。
+        """
+        if group_rules.has_followers(group) and not await self._leader_still_enabled(group):
+            base = group_rules.owner_effective_node_ids(group, nodemap, online_ids)
+        else:
+            base = group_rules.effective_node_ids(group, nodemap, online_ids)
+        if signal and getattr(signal, "node_ids", None):
+            wanted = {str(n).strip().lower() for n in signal.node_ids if n}
+            base = [nid for nid in base if nid.lower() in wanted]
+        return base
+
+    async def _leader_still_enabled(self, group: dict) -> bool:
+        """分组所有者是否仍持有 follow_leader 能力。
+
+        所有者是管理员（owner_user_id 为空）时没有对应的「带单员用户」，
+        按不可带单处理 —— 带单源必须挂在某个用户的角色能力上。
+        """
+        owner = permissions.normalize_owner(group.get("owner_user_id"))
+        if owner is None:
+            return False
+        try:
+            user = await user_service.get_user_by_id(owner)
+            if not user or not user.is_active:
+                return False
+            principal = await rbac_service.load_principal(self.store, user.username)
+        except Exception:  # noqa: BLE001
+            # 鉴权侧临时故障不应放大成「所有跟单节点收不到信号」，按仍可带单处理
+            logger.warning(
+                "leader capability lookup failed for group %s", group.get("group_id"),
+            )
+            return True
+        if principal is None:
+            return False
+        return permissions.can_be_leader(principal)
 
     # ------------------------------------------------------------------
     # 分组筛选
@@ -520,7 +575,9 @@ class GroupDispatcher:
     ) -> dict:
         """单个分组的处理：建主任务 -> 选节点 -> 逐节点抢占位并下发。"""
         mode = group_rules.normalize_dispatch_mode(group.get("dispatch_mode"))
-        effective = group_rules.effective_node_ids(group, nodemap, online_ids)
+        effective = await self._effective_with_follows(
+            group, nodemap, online_ids, signal=signal,
+        )
 
         snapshot = group_rules.strategy_rules_snapshot(strategy)
         task_id = await group_persist.create_task(
@@ -599,10 +656,14 @@ class GroupDispatcher:
         self, group: dict, signal: TradingSignal, task_id: int,
         effective: list[str], command: dict,
     ) -> list[dict]:
-        """组内轮转：把任务交给队首第一个可下发的有效节点，成功后移到队尾。"""
+        """组内轮转：把任务交给队首第一个可下发的有效节点，成功后移到队尾。
+
+        轮转队列用 participant_ids（owner 成员 + 跟单成员）：跟单员加入的节点
+        同样参与轮转，且稳定排在 owner 成员之后。
+        """
         group_id = group["group_id"]
         order = group_rules.reconcile_rotation(
-            await self.store.get_group_rotation(group_id), group_rules.member_ids(group),
+            await self.store.get_group_rotation(group_id), group_rules.participant_ids(group),
         )
         eligible = set(effective)
         outcomes: list[dict] = []

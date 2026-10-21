@@ -19,6 +19,7 @@ DEFAULT_ROLE_CODE = "user"  # 内置普通用户角色（新建用户未指定�
 MENU_DASHBOARD = "dashboard"
 MENU_HOME = "home"
 MENU_TRADING = "trading"
+MENU_FOLLOW = "follow"
 MENU_NODES = "nodes"
 MENU_TREND = "trend"
 MENU_GROUPS = "groups"
@@ -42,6 +43,7 @@ class MenuDef:
 MENU_REGISTRY: tuple[MenuDef, ...] = (
     MenuDef(MENU_HOME, "首页", "/home", True),
     MenuDef(MENU_TRADING, "交易", "/trading", True),
+    MenuDef(MENU_FOLLOW, "带单", "/follow", True),
     MenuDef(MENU_DASHBOARD, "总览", "/", True),
     MenuDef(MENU_NODES, "节点", "/nodes", True),
     MenuDef(MENU_TREND, "趋势面板", "/trend", True),
@@ -69,9 +71,13 @@ DEFAULT_USER_MENUS: tuple[str, ...] = ASSIGNABLE_MENU_CODES
 # ai_strategy：AI 智能加仓策略（策略模版1 / tpl_1，逆势 + 顺势加仓）。
 # 该模版需要授予能力后才能新建 / 编辑 / 删除；其余模版沿用菜单权限。
 CAP_AI_STRATEGY = "ai_strategy"
+# follow_leader：带单。持有者作为「带单员」对外接单，其主节点所在分组会出现在
+# 所有客户的【带单】Tab。跟单方向（把节点加入别人的分组）默认人人可做，不需要本能力。
+CAP_FOLLOW_LEADER = "follow_leader"
 
 CAPABILITY_REGISTRY: tuple[tuple[str, str], ...] = (
     (CAP_AI_STRATEGY, "AI 智能加仓策略"),
+    (CAP_FOLLOW_LEADER, "带单"),
 )
 
 ALL_CAPABILITY_CODES: tuple[str, ...] = tuple(code for code, _ in CAPABILITY_REGISTRY)
@@ -159,6 +165,15 @@ def resolve_capabilities(
 def can_capability(p: Principal, code: str) -> bool:
     """是否拥有该能力；管理员直接放行（权限页显示「全部能力」）。"""
     return p.is_admin or code in p.capabilities
+
+
+def can_be_leader(p: Principal) -> bool:
+    """能否作为带单员对外接单（仅看能力，不看数据归属）。
+
+    方向性说明：跟单（把节点加入别人的带单源分组）默认所有登录用户都可以做，
+    不需要本能力；本能力只决定「我能否被别人跟」。
+    """
+    return can_capability(p, CAP_FOLLOW_LEADER)
 
 
 def is_ai_strategy_template(template_id: object | None) -> bool:

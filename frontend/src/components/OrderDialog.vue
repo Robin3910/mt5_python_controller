@@ -988,6 +988,11 @@ async function triggerMarketStrategy(): Promise<void> {
     if (isLimit.value && localForm.entry_price && localForm.entry_price > 0) {
       payload.entry_price = localForm.entry_price
     }
+    // 带单关闭时，信号只推给主节点（不发给分组的其它成员，包括跟单节点）。
+    // 没有主节点就不带「node_ids」——按分组参与者处理，让用户报警，而不是悄悄不给主节点。
+    if (!carry.value && primaryNode.value) {
+      payload.node_ids = [primaryNode.value.node_id]
+    }
     const remark = (localForm.remark || '').trim()
     if (remark) payload.comment = remark
     normalizeVolume()
@@ -1084,6 +1089,10 @@ async function triggerGridStrategy(): Promise<void> {
       model: 'strategy',
       group_ids: [currentGroup.value.group_id],
       volume: 0.01,
+    }
+    // 带单关闭时，网格信号也只推给主节点
+    if (!carry.value && primaryNode.value) {
+      payload.node_ids = [primaryNode.value.node_id]
     }
     const remark = (localForm.remark || '').trim()
     if (remark) payload.comment = remark
@@ -1611,11 +1620,11 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
 
     <template #footer>
       <div class="od-footer">
-        <!-- 左：带单开关；右：触发按钮（取消按钮已移除，关闭点 dialog 蒙层或 X） -->
+        <!-- 「带单」开关：开启 → 信号下发到分组全部节点（含跟单员）；关闭 → 仅主节点 -->
         <div v-if="!isSaveMode" class="od-carry">
           <ElSwitch v-model="carry" />
           <span class="od-carry-label">带单</span>
-          <!-- <span class="od-carry-sub">跟随本次信号自动执行</span> -->
+          <span class="od-carry-sub">{{ carry ? '推到本分组全部节点' : '只推本分组主节点' }}</span>
         </div>
         <div class="od-actions">
           <!-- 市价 / 限价：统一走 triggerStrategy（strategy 模型），前端推导 BUY/SEL方向并展示 -->

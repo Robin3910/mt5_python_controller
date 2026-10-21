@@ -26,6 +26,12 @@ const router = createRouter({
       meta: { menu: 'trading' },
     },
     {
+      path: '/follow',
+      name: 'follow',
+      component: () => import('@/views/FollowView.vue'),
+      meta: { menu: 'follow' },
+    },
+    {
       path: '/',
       name: 'dashboard',
       component: () => import('@/views/DashboardView.vue'),

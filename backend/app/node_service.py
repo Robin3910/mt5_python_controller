@@ -12,7 +12,7 @@ from typing import Optional
 
 from sqlalchemy import func, select, text
 
-from . import group_persist, group_service
+from . import follow_service, group_persist, group_service
 from .db import SessionLocal
 from . import risk_control
 from .models import NodeCreate, NodeUpdate
@@ -195,6 +195,7 @@ async def warm_cache(store: RedisStore) -> int:
         if nid and nid not in alive:
             await store.delete_node(nid)
             await group_service.remove_node_from_all_groups(store, nid)
+            await follow_service.remove_node_followings(store, nid)
     return len(alive)
 
 
@@ -534,6 +535,12 @@ async def set_primary(
     for r in affected:
         await store.cache_node(node_row_to_dict(r))
 
+    # 跟单节点被设为 / 取消为主节点时清理跟单关系：
+    # - 升为主节点：主节点不可用于跟单，否则它会同时当带单源和跟单方，语义冲突；
+    # - 取消主节点：重新具备跟单资格，但不会自动重新加入，保持用户显式操作。
+    if is_primary:
+        await follow_service.remove_node_followings(store, node_id)
+
     return d, []
 
 
@@ -603,4 +610,6 @@ async def delete_node(store: RedisStore, node_id: str) -> bool:
             await s.commit()
     await store.delete_node(node_id)
     await group_service.remove_node_from_all_groups(store, node_id)
+    # 跟单关系同样要清：节点没了，这条跟单记录永远不会被分发，属于脏数据
+    await follow_service.remove_node_followings(store, node_id)
     return True

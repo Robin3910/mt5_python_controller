@@ -173,8 +173,46 @@ def member_ids(group: dict) -> list[str]:
     return [str(m["node_id"]) for m in _ordered_members(group)]
 
 
+def _ordered_followers(group: dict) -> list[dict]:
+    """跟单成员，按 sort_order 升序（与 owner 成员同口径）。"""
+    followers = group.get("followers") or []
+    return sorted(
+        (f for f in followers if isinstance(f, dict) and f.get("node_id")),
+        key=lambda f: (int(f.get("sort_order") or 0), str(f.get("node_id"))),
+    )
+
+
+def follower_ids(group: dict) -> list[str]:
+    """跟单成员的 node_id 列表（不含 owner 自己的成员）。"""
+    return [str(f["node_id"]) for f in _ordered_followers(group)]
+
+
+def participant_ids(group: dict) -> list[str]:
+    """分组**参与者**：owner 成员在前、跟单成员在后，各自按 sort_order，去重保序。
+
+    分发链路用这个口径而不是 member_ids —— 跟单员加入的节点同样要接收信号。
+    owner 成员永远排在跟单成员之前，保持「带单方优先」的轮转顺序。
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for nid in member_ids(group) + follower_ids(group):
+        if nid not in seen:
+            out.append(nid)
+            seen.add(nid)
+    return out
+
+
+def has_followers(group: dict) -> bool:
+    """该分组是否已有跟单成员（有跟单才需要判定带单员是否仍有带单能力）。"""
+    return bool(group.get("followers"))
+
+
 def limit_watch_report_ids(group: dict) -> list[str]:
-    """已打开「限价监听上报」的成员，按组内顺序。缺字段视为关闭。"""
+    """已打开「限价监听上报」的成员，按组内顺序。缺字段视为关闭。
+
+    只看 owner 成员：跟单员的挂单永不作为触发源，否则跟单者在自己终端随手挂一张
+    限价单就会触发带单方的分组开仓。
+    """
     return [
         str(m["node_id"])
         for m in _ordered_members(group)
@@ -183,7 +221,25 @@ def limit_watch_report_ids(group: dict) -> list[str]:
 
 
 def effective_node_ids(group: dict, nodemap: dict[str, dict], online_ids: set[str]) -> list[str]:
-    """分组内的“有效节点”：节点存在 + 已启用 + 当前在线，保持组内顺序。"""
+    """分组内的“有效节点”：节点存在 + 已启用 + 当前在线，保持组内顺序。
+
+    参与者 = owner 成员 + 跟单成员（跟单员加入的节点同样接收信号）。
+    这里**不过滤主节点**：带单方自己的主节点本来就要接收信号。
+    主节点的排除只发生在「主节点不是某节点的 owner」这一种跟单场景，
+    由 follow_rules.node_is_followable 判定，不是这里的口径。
+    """
+    return [
+        nid for nid in participant_ids(group)
+        if (node := nodemap.get(nid)) is not None
+        and node.get("enabled", True)
+        and nid in online_ids
+    ]
+
+
+def owner_effective_node_ids(
+    group: dict, nodemap: dict[str, dict], online_ids: set[str],
+) -> list[str]:
+    """只算 owner 自己的有效节点（带单员失去带单能力时退回这个口径，跟单成员不再接收）。"""
     return [
         nid for nid in member_ids(group)
         if (node := nodemap.get(nid)) is not None
@@ -196,7 +252,7 @@ def group_skip_reason(group: dict, effective: list[str]) -> Optional[str]:
     """分组不参与本次分发的原因；可参与时返回 None。"""
     if not group.get("enabled", True):
         return f"分组已禁用：{group.get('name') or group.get('group_id')}"
-    if not member_ids(group):
+    if not participant_ids(group):
         return f"分组无成员节点：{group.get('name') or group.get('group_id')}"
     if not effective:
         return f"分组无有效节点：{group.get('name') or group.get('group_id')}（成员均未启用或不在线）"

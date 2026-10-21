@@ -19,6 +19,7 @@ from . import (
     config_api,
     console_api,
     events,
+    follow_api,
     grid_sizing_api,
     group_persist,
     group_service,
@@ -142,6 +143,7 @@ for r in (
     close.router,
     admin_ws.router,
     trading_api.router,
+    follow_api.router,
 ):
     app.include_router(r)
 

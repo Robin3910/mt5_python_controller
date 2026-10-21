@@ -20,6 +20,7 @@ interface RbacState {
 /** 能力注册表（与后端 permissions.CAPABILITY_REGISTRY 对齐）。 */
 export const CAPABILITIES = [
   { code: 'ai_strategy', label: 'AI 智能加仓策略', description: '允许新建、编辑、删除 AI 智能加仓策略（模版1）实例' },
+  { code: 'follow_leader', label: '带单', description: '授予该能力的用户，其主节点与主节点所在分组将出现在所有客户的带单界面中（跟单无需此能力）' },
 ] as const
 
 // 用户权限管理（仅超级管理员）：用户、角色、菜单注册表

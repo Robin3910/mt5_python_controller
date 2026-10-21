@@ -754,6 +754,9 @@ class ManualSignalRequest(BaseModel):
     template_ids: list[str] = Field(default_factory=list)
     # 分组定向（仅 strategy 链路）：只发给 ID 在列表内的分组；空 = 不限制
     group_ids: list[str] = Field(default_factory=list)
+    # 节点定向（仅 strategy 链路）：把信号限制到指定节点；空 = 不限制（按分组参与者全量）。
+    # Webhook 同名字段 node_ids；用于 OrderDialog「带单」关闭时把信号只推到主节点。
+    node_ids: list[str] = Field(default_factory=list)
 
 
 # 清空交易记录时前端/调用方必须原样提交的确认词
@@ -923,6 +926,98 @@ class RoleCapabilitiesUpdate(BaseModel):
     capabilities: list[str] = Field(default_factory=list)
 
 
+# ── 带单（follow）────────────────────────────────────────────
+class FollowLeaderSummary(BaseModel):
+    """带单员列表 / 详情里单个带单员的摘要。"""
+    leader_user_id: int
+    username: str
+    display_name: Optional[str] = None
+    primary_node: Optional[dict] = None
+    followable_group_count: int = 0
+    follower_node_count: int = 0
+    my_follow_group_count: int = 0
+    my_follow_node_count: int = 0
+    marketable: bool = True
+
+
+class FollowLeaderListResponse(BaseModel):
+    leaders: list[FollowLeaderSummary]
+
+
+class FollowGroupDetail(BaseModel):
+    """带单员详情页的分组项。"""
+    group_id: str
+    name: Optional[str] = None
+    symbol: Optional[str] = None
+    strategy_id: Optional[str] = None
+    dispatch_mode: str = "sync"
+    signal_concurrent_enabled: bool = False
+    trend_risk_enabled: bool = False
+    enabled: bool = True
+    member_count: int = 0
+    follower_count: int = 0
+    online_count: int = 0
+    active_task_count: int = 0
+    signal_count: int = 0
+    my_follow_node_ids: list[str] = Field(default_factory=list)
+    selectable: bool = True
+    unselectable_reason: Optional[str] = None
+
+
+class FollowDetailOut(BaseModel):
+    leader: FollowLeaderSummary
+    groups: list[FollowGroupDetail]
+    my_nodes: list[dict] = Field(default_factory=list)
+
+
+class FollowJoinRequest(BaseModel):
+    leader_user_id: int = Field(ge=1)
+    group_ids: list[str] = Field(min_length=1, max_length=50)
+    node_ids: list[str] = Field(min_length=1, max_length=50)
+
+
+class FollowJoinResponse(BaseModel):
+    joined: list[dict] = Field(default_factory=list)
+    skipped: list[dict] = Field(default_factory=list)
+    leader_primary_node_id: Optional[str] = None
+
+
+class FollowLeaveRequest(BaseModel):
+    leader_user_id: int = Field(ge=1)
+    group_ids: list[str] = Field(min_length=1, max_length=50)
+    node_ids: list[str] = Field(min_length=1, max_length=50)
+    close_tasks: bool = False
+
+
+class FollowLeaveResponse(BaseModel):
+    removed: list[dict] = Field(default_factory=list)
+    closing: list[dict] = Field(default_factory=list)
+    forced: list[dict] = Field(default_factory=list)
+    warning: Optional[str] = None
+
+
+class FollowMyGroup(BaseModel):
+    """我的跟单里一项（按分组维度）。"""
+    group_id: str
+    group_name: Optional[str] = None
+    symbol: Optional[str] = None
+    strategy_id: Optional[str] = None
+    marketable: bool = True
+    unmarketable_reason: Optional[str] = None
+    active_task_count: int = 0
+    my_nodes: list[dict] = Field(default_factory=list)
+
+
+class FollowMyLeader(BaseModel):
+    leader: FollowLeaderSummary
+    groups: list[FollowMyGroup]
+
+
+class FollowMeResponse(BaseModel):
+    following: list[FollowMyLeader] = Field(default_factory=list)
+    summary: dict = Field(default_factory=dict)
+
+
 class UserOut(BaseModel):
     id: int
     username: str
@@ -935,6 +1030,9 @@ class UserOut(BaseModel):
     group_count: int = 0
     strategy_count: int = 0
     created_at: Optional[float] = None
+    # 启用角色的能力码并集（如 ["follow_leader"]）；管理员固定全部能力。供用户列表「能力」列展示，
+    # **不**参与鉴权（鉴权走 Principal，与 menus 是同一口径：只用于显示控制）。
+    capabilities: list[str] = Field(default_factory=list)
 
 
 class UserCreate(BaseModel):

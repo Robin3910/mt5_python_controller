@@ -21,7 +21,7 @@ from .db import SessionLocal
 from .group_rules import normalize_dispatch_mode
 from .limit_watch import is_trend_strategy, normalize_keyword
 from .models import GroupCreate, GroupUpdate
-from .orm import NodeGroup, NodeGroupMember, TradingStrategy
+from .orm import GroupFollowerNode, NodeGroup, NodeGroupMember, TradingStrategy
 from .redis_store import RedisStore
 from .security import make_group_id
 
@@ -29,9 +29,21 @@ _LIMIT_WATCH_ONLY_TREND = "限价单监听仅适用于绑定趋势策略（模�
 _SIGNAL_CONCURRENT_ONLY_GRID_TREND = "信号并发仅适用于绑定网格策略（模版3）、趋势策略（模版2）的分组"
 
 
-def group_row_to_dict(row: NodeGroup, members: list[NodeGroupMember]) -> dict:
-    """ORM 行 -> Redis 缓存用的 dict（created_at 转成 epoch 便于排序）。"""
+def group_row_to_dict(
+    row: NodeGroup,
+    members: list[NodeGroupMember],
+    followers: Optional[list[GroupFollowerNode]] = None,
+) -> dict:
+    """ORM 行 -> Redis 缓存用的 dict（created_at 转成 epoch 便于排序）。
+
+    members（owner 自有节点）与 followers（跟单员节点）严格分开存放：
+    前者可被 owner 编辑排序，后者只读。分组缓存同时带 owner_user_id，
+    分发时据此现算带单员的主节点，避免主节点切换后用过期快照。
+    """
     ordered = sorted(members, key=lambda m: (m.sort_order or 0, m.node_id))
+    ordered_followers = sorted(
+        followers or [], key=lambda f: (f.sort_order or 0, f.node_id)
+    )
     return {
         "group_id": row.group_id,
         "name": row.name,
@@ -55,6 +67,17 @@ def group_row_to_dict(row: NodeGroup, members: list[NodeGroupMember]) -> dict:
             }
             for m in ordered
         ],
+        "followers": [
+            {
+                "node_id": f.node_id,
+                "follower_user_id": f.follower_user_id,
+                "leader_user_id": f.leader_user_id,
+                "leader_primary_node_id": f.leader_primary_node_id,
+                "sort_order": f.sort_order or 0,
+                "joined_at": f.joined_at.timestamp() if f.joined_at else None,
+            }
+            for f in ordered_followers
+        ],
     }
 
 
@@ -67,19 +90,32 @@ async def _load_group(session, group_id: str) -> Optional[dict]:
             select(NodeGroupMember).where(NodeGroupMember.group_id == group_id)
         )
     ).scalars().all()
-    return group_row_to_dict(row, list(members))
+    followers = (
+        await session.execute(
+            select(GroupFollowerNode).where(GroupFollowerNode.group_id == group_id)
+        )
+    ).scalars().all()
+    return group_row_to_dict(row, list(members), list(followers))
 
 
 async def warm_cache(store: RedisStore) -> int:
-    """启动时把库里的分组（含成员）全部预热进 Redis。"""
+    """启动时把库里的分组（含成员与跟单关系）全部预热进 Redis。"""
     async with SessionLocal() as s:
         rows = (await s.execute(select(NodeGroup))).scalars().all()
         members = (await s.execute(select(NodeGroupMember))).scalars().all()
+        followers = (await s.execute(select(GroupFollowerNode))).scalars().all()
     by_group: dict[str, list[NodeGroupMember]] = {}
     for m in members:
         by_group.setdefault(m.group_id, []).append(m)
+    by_group_followers: dict[str, list[GroupFollowerNode]] = {}
+    for f in followers:
+        by_group_followers.setdefault(f.group_id, []).append(f)
     for row in rows:
-        await store.cache_group(group_row_to_dict(row, by_group.get(row.group_id, [])))
+        await store.cache_group(group_row_to_dict(
+            row,
+            by_group.get(row.group_id, []),
+            by_group_followers.get(row.group_id, []),
+        ))
     return len(rows)
 
 
@@ -394,12 +430,16 @@ async def update_group(store: RedisStore, group_id: str, patch: GroupUpdate) -> 
 
 
 async def delete_group(store: RedisStore, group_id: str) -> bool:
-    """删除分组：先删库（含成员关联），再清理 Redis 缓存与轮转顺序。"""
+    """删除分组：先删库（成员关联 + 跟单关系级联），再清理 Redis 缓存与轮转顺序。
+
+    跟单关系必须一并删：分组没了，留下来的跟单行就是永远不会被分发的脏数据。
+    """
     async with SessionLocal() as s:
         row = await s.get(NodeGroup, group_id)
         if not row:
             return False
         await s.execute(delete(NodeGroupMember).where(NodeGroupMember.group_id == group_id))
+        await s.execute(delete(GroupFollowerNode).where(GroupFollowerNode.group_id == group_id))
         await s.delete(row)
         await s.commit()
     await store.delete_group(group_id)

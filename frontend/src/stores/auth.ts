@@ -27,6 +27,9 @@ export const useAuthStore = defineStore('auth', {
       !!s.me?.is_admin || (!!s.me && s.me.capabilities?.includes(cap)) || false,
     /** 能否使用 AI 智能加仓策略（tpl_1） */
     canUseAiStrategy: (s): boolean => s.me?.is_admin || (!!s.me && s.me.capabilities?.includes('ai_strategy')) || false,
+    /** 能否作为带单员对外接单（follow_leader 能力）；跟单方向默认人人可做，不看这里 */
+    canBeFollowLeader: (s): boolean =>
+      s.me?.is_admin || (!!s.me && s.me.capabilities?.includes('follow_leader')) || false,
   },
   actions: {
     setToken(token: string): void {

@@ -83,6 +83,8 @@ def _build_signal_payload(body: ManualSignalRequest) -> dict:
         data["template_ids"] = body.template_ids
     if body.group_ids:
         data["group_ids"] = body.group_ids
+    if body.node_ids:
+        data["node_ids"] = body.node_ids
     if body.volume:
         data["volume"] = body.volume
     if body.stop_loss:
