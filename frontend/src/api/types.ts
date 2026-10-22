@@ -238,6 +238,21 @@ export interface QuoteInfo {
   change: number
 }
 
+/** 未成交挂单：字段口径对齐节点侧 mt5_client.pending_orders() */
+export interface PendingOrder {
+  ticket: number
+  symbol: string
+  type: string
+  volume: number
+  price_open: number
+  sl: number
+  tp: number
+  /** 魔术号：0 表示手工单（limit_watch 认的手工触发单口径） */
+  magic: number
+  comment: string
+  time: number
+}
+
 export interface AccountSnapshot {
   node_id?: string
   login?: number | null
@@ -248,6 +263,8 @@ export interface AccountSnapshot {
   free_margin: number
   leverage: number
   positions: Position[]
+  /** 未成交挂单：限价开仓在成交前只有它；老版本节点客户端没有该字段 */
+  orders?: PendingOrder[]
   prices: Record<string, number>
   quotes?: Record<string, QuoteInfo>
   updated_at: number
@@ -343,6 +360,36 @@ export interface CloseBatchResult {
   failed: Array<{ node_id: string; reason: string }>
   target: string
   strategies_total?: number
+}
+
+/** 批量撤挂单范围：all 撤光 / manual 只撤手工单 / strategy 只撤指定魔术号 */
+export type CancelPendingScope = 'all' | 'manual' | 'strategy'
+
+export interface CancelPendingRequest {
+  scope?: CancelPendingScope
+  magics?: number[] | null
+}
+
+export interface CancelPendingResult {
+  status: 'ok' | 'partial' | 'regenerated' | 'error' | string
+  node_id: string
+  scope?: string
+  /** 实际撤掉的挂单笔数 */
+  cancelled: number
+  failed: Array<{ ticket: number; symbol: string; error: string }>
+  /** 撤完复读后仍存在的挂单数；>0 说明外部又补了单 */
+  remaining: number
+  /** 实际下发的撤单轮数（最多 2） */
+  rounds: number
+  /** 被停掉的策略任务统计 */
+  strategies?: { stopped: number; forced: number; total: number }
+  /** 停完策略后是否等到了子任务收口 */
+  settled?: boolean
+  /** 该节点是否属于开启限价监听的分组 */
+  limit_watch_active?: boolean
+  /** status=regenerated 时的再生单数 */
+  regenerated?: number
+  error?: string
 }
 
 /** 手动触发的信号方向；CLOSE 仅 strategy 模型开放（终止分组内进行中的策略任务） */

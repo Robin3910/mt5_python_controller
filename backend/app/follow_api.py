@@ -71,8 +71,12 @@ def _owned_nodes(all_nodes: list[dict], user_id: int) -> list[dict]:
 
 
 def _primary_of(all_nodes: list[dict], user_id: int) -> Optional[dict]:
-    """某用户的主节点（带单源）。没有主节点 = 不对外接单的资格。"""
-    return next((n for n in _owned_nodes(all_nodes, user_id) if n.get("is_primary")), None)
+    """某用户的主节点（带单源）。没有主节点 = 不对外接单的资格。
+
+    实现委托 `follow_rules.primary_node_of`（与 AI 机器人页共用），
+    这里保留薄封装只为读起来像本地工具函数。
+    """
+    return follow_rules.primary_node_of(all_nodes, user_id)
 
 
 def _viewable_follow_nodes(all_nodes: list[dict], principal: Principal) -> list[dict]:
@@ -336,17 +340,11 @@ async def get_leader_detail(
     if win in cached:
         perf = dict(cached[win])
     else:
-        # 缓存未命中：就地算一次（详情是单人，不构成 N+1）
-        leader_node_ids = [
-            str(n.get("node_id"))
-            for n in all_nodes
-            if permissions.normalize_owner(n.get("owner_user_id")) == leader_user_id
-            and n.get("node_id")
-        ]
-        perf = await deal_stats.leader_batch(
-            leader_node_ids, deal_stats.window_start(win), None
-        )
-        perf = dict(perf)
+        # 缓存未命中：就地算一次（详情是单人，不构成 N+1）。
+        # 口径与预聚合一致 —— **主节点**（`primary` 已在上面做过存在性校验）。
+        perf = dict(await deal_stats.leader_batch(
+            [str(primary.get("node_id"))], deal_stats.window_start(win), None,
+        ))
     follower_count = int(perf.pop("follower_count", 0) or 0) or len({
         f["node_id"] for f in await follow_service.list_for_leaders({leader_user_id})
     })

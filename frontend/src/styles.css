@@ -58,61 +58,17 @@ html, body, #app {
   -webkit-font-smoothing: antialiased;
 }
 
-/* ── Animated background mesh ── */
+/* 全局背景保持纯色（--bg）；如需装饰性光球请用页面级 .home-hero-orb-*
+   或组件级背景，不要再加全屏 fixed 叠加层 —— 会让整站底色不均匀、影响可读性。 */
+
 .app-shell {
   display: flex;
   flex-direction: column;
   min-height: 100vh;
   position: relative;
-  isolation: isolate;
 }
 
-.bg-mesh {
-  position: fixed;
-  inset: 0;
-  z-index: -1;
-  overflow: hidden;
-  background: var(--bg);
-}
-
-.bg-orb {
-  position: absolute;
-  border-radius: 50%;
-  filter: blur(80px);
-  opacity: 0.45;
-  animation: orb-drift 20s ease-in-out infinite alternate;
-}
-
-.bg-orb-1 {
-  width: 520px; height: 520px;
-  top: -120px; left: -80px;
-  background: radial-gradient(circle, rgba(37, 99, 234, 0.22) 0%, transparent 70%);
-}
-
-.bg-orb-2 {
-  width: 480px; height: 480px;
-  top: 40%; right: -100px;
-  background: radial-gradient(circle, rgba(59, 130, 246, 0.18) 0%, transparent 70%);
-  animation-delay: -7s;
-}
-
-.bg-orb-3 {
-  width: 400px; height: 400px;
-  bottom: -80px; left: 30%;
-  background: radial-gradient(circle, rgba(139, 92, 246, 0.12) 0%, transparent 70%);
-  animation-delay: -14s;
-}
-
-.bg-grid {
-  position: absolute;
-  inset: 0;
-  background-image:
-    linear-gradient(rgba(255, 255, 255, 0.025) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.025) 1px, transparent 1px);
-  background-size: 48px 48px;
-  mask-image: radial-gradient(ellipse 80% 60% at 50% 30%, black 20%, transparent 80%);
-}
-
+/* 光球漂移动画：仅供页面级光球（如首页 Hero .home-hero-orb-*）复用 */
 @keyframes orb-drift {
   0% { transform: translate(0, 0) scale(1); }
   100% { transform: translate(30px, -20px) scale(1.08); }
@@ -189,6 +145,30 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
   border-color: var(--glass-highlight);
 }
 .btn-sm { padding: 6px 12px; font-size: 12px; }
+/* 告警色 ghost：破坏性但非「清仓」级别的操作（删挂单 vs 平掉全部），
+   与 .btn-danger 的红色分层，避免两个危险按钮长得一模一样导致误点 */
+.btn-warn-ghost {
+  color: #fbbf24;
+  border-color: rgba(251, 191, 36, 0.35);
+}
+.btn-warn-ghost:hover:not(:disabled) {
+  background: rgba(251, 191, 36, 0.12);
+  border-color: rgba(251, 191, 36, 0.55);
+}
+.btn-warn-ghost:disabled { opacity: 0.45; }
+/* 按钮内的迷你 loading 圈 */
+.spin-mini {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-left: 6px;
+  vertical-align: -1px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: spin-mini-rotate 0.7s linear infinite;
+}
+@keyframes spin-mini-rotate { to { transform: rotate(360deg); } }
 .btn-block { width: 100%; }
 .btn-logout { flex-shrink: 0; }
 .topbar-user {
@@ -1149,6 +1129,12 @@ input[type='checkbox'] { width: auto; accent-color: var(--primary); cursor: poin
   margin-top: 12px;
   gap: 8px;
   align-items: center;
+}
+/* 未设主节点时「删挂单」入口缺席的说明行 */
+.dash-pending-hint {
+  grid-column: 1 / -1;
+  font-size: 12px;
+  padding: 2px 2px 0;
 }
 .dash-link {
   background: none;

@@ -6,7 +6,7 @@ import HubTrendEmbed from '@/components/HubTrendEmbed.vue'
 import TagSelect from '@/components/TagSelect.vue'
 import type { TagOption } from '@/components/tagOption'
 import { useHubStore } from '@/stores/hub'
-import type { AccountSnapshot, NodeOut, Position } from '@/api/types'
+import type { AccountSnapshot, CancelPendingResult, NodeOut, PendingOrder, Position } from '@/api/types'
 import { confirmAction } from '@/utils/confirm'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/api/client'
@@ -341,6 +341,112 @@ async function closeNodeAll(n: NodeOut): Promise<void> {
   ))) return
   await hub.closeNode(n.node_id, { target: 'all' })
 }
+
+// ---- 远程撤挂单（只撤挂单，持仓不动） ----
+// 主节点卡片才显示：主节点是唯一接收策略信号、也是挂单唯一堆积的节点
+const pendingBusy = ref<Record<string, boolean>>({})
+
+function pendingOf(n: NodeOut): PendingOrder[] | undefined {
+  return acct(n.node_id)?.orders
+}
+
+/** 挂单按钮的四态禁用原因；返回空串表示可点 */
+function pendingDisabledReason(n: NodeOut): string {
+  if (n.status !== 'online') return '节点离线，无法操作'
+  const orders = pendingOf(n)
+  if (orders === undefined) return '等待节点上报挂单数据'
+  if (!orders.length) return '无挂单'
+  if (pendingBusy.value[n.node_id]) return '正在执行删挂单'
+  return ''
+}
+
+/** 该节点是否属于开启限价监听的分组（决定撤单提示要不要出现第三行）。 */
+function hasLimitWatch(n: NodeOut): boolean {
+  return hub.groups.some(
+    (g) => g.enabled && g.limit_watch_enabled
+      && g.nodes.some((m) => m.node_id === n.node_id && m.limit_watch_report !== false),
+  )
+}
+
+/** 撤单确认弹窗：列挂单明细 + 三条关键提示（含限价监听提醒） */
+async function confirmCancelPending(n: NodeOut): Promise<void> {
+  const orders = pendingOf(n) ?? []
+  if (!orders.length) return
+  const manual = orders.filter((o) => !o.magic).length
+  const lines = orders
+    .slice(0, 20)
+    .map((o) => `• ${o.symbol}  ${o.type}  ${o.volume}手  @${o.price_open}  magic=${o.magic ?? 0}`)
+    .join('\n')
+  const more = orders.length > 20 ? `\n…（共 ${orders.length} 条）` : ''
+  // 策略任务数走既有预查接口；查不到就只说明「会停止在跑策略」，不猜数字
+  let strategies = -1
+  try {
+    strategies = (await fetchActiveTasks(n.node_id)).count
+  } catch {
+    strategies = -1   // 预查失败不阻塞撤单，也不显示可能错误的数字
+  }
+  const hints = [
+    '· 只删除挂单，已有持仓不受影响。',
+    strategies >= 0
+      ? `· 将同时停止该节点上 ${strategies} 个在跑策略任务（否则策略会自动补单）。`
+      : '· 将同时停止该节点上所有在跑策略任务（否则策略会自动补单）。',
+  ]
+  if (hasLimitWatch(n)) {
+    hints.push('· 该节点属于开启限价监听的分组，删除后这些手工限价单不会再触发策略。')
+  }
+  try {
+    await ElMessageBox.confirm(
+      `确认删除「${n.name}」的全部挂单？\n\n` +
+        `该节点当前有 ${orders.length} 张挂单（手工单 ${manual} 张 / 策略单 ${orders.length - manual} 张）：\n` +
+        `${lines}${more}\n\n${hints.join('\n')}`,
+      '删除全部挂单',
+      {
+        type: 'warning',
+        confirmButtonText: `确认删除 ${orders.length} 张挂单`,
+        cancelButtonText: '取消',
+        customClass: 'cancel-pending-box',
+      },
+    )
+  } catch {
+    return   // 用户点了取消
+  }
+
+  pendingBusy.value = { ...pendingBusy.value, [n.node_id]: true }
+  try {
+    const res: CancelPendingResult = await hub.cancelPendingAll(n.node_id, { scope: 'all' })
+    reportCancelPending(res)
+  } catch (e: unknown) {
+    const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+    ElMessage.error(detail || '删挂单失败，请稍后重试')
+  } finally {
+    const next = { ...pendingBusy.value }
+    delete next[n.node_id]
+    pendingBusy.value = next
+  }
+}
+
+/** 撤单结果分五种情形反馈，失败明细绝不吞掉 */
+function reportCancelPending(res: CancelPendingResult): void {
+  if (res.status === 'error') {
+    ElMessage.error(res.error || '节点未确认撤单')
+    return
+  }
+  const extra: string[] = []
+  if (res.failed?.length) {
+    extra.push(
+      `失败明细：${res.failed.map((f) => `${f.symbol || '-'}${f.ticket} ${f.error}`).join('；')}`,
+    )
+  }
+  if (res.status === 'regenerated' || (res.remaining ?? 0) > 0) {
+    extra.push('撤单后系统又生成了挂单，可能是限价监听自动触发，请检查分组监听开关')
+  }
+  if (res.strategies?.forced) {
+    extra.push(`其中 ${res.strategies.forced} 个任务为强制停止`)
+  }
+  const tail = extra.length ? `\n${extra.join('\n')}` : ''
+  if (res.failed?.length) ElMessage.warning(`删除 ${res.cancelled} 张挂单，${res.failed.length} 张失败${tail}`)
+  else ElMessage.success(`已删除 ${res.cancelled} 张挂单${tail}`)
+}
 </script>
 
 <template>
@@ -511,12 +617,26 @@ async function closeNodeAll(n: NodeOut): Promise<void> {
                 @click="goNode(n.node_id)"
               >查看全部 {{ acct(n.node_id)!.positions.length }} 个持仓 →</button>
               <span v-else></span>
-              <button
-                type="button"
-                class="btn-sm btn-ghost"
-                :disabled="!acct(n.node_id)?.positions?.length"
-                @click="closeNodeAll(n)"
-              >平掉该节点全部</button>
+              <div class="row" style="gap: 8px">
+                <!-- 删挂单：仅主节点显示（主节点是唯一接收策略信号、也是挂单唯一堆积的节点） -->
+                <button
+                  v-if="n.is_primary"
+                  type="button"
+                  class="btn-sm btn-ghost btn-warn-ghost"
+                  :disabled="!!pendingDisabledReason(n)"
+                  :title="pendingDisabledReason(n) || '删除该节点全部挂单（不动持仓）'"
+                  @click="confirmCancelPending(n)"
+                >
+                  {{ pendingOf(n)?.length ? `删挂单 (${pendingOf(n)!.length})` : '删挂单' }}
+                  <span v-if="pendingBusy[n.node_id]" class="spin-mini"></span>
+                </button>
+                <button
+                  type="button"
+                  class="btn-sm btn-ghost"
+                  :disabled="!acct(n.node_id)?.positions?.length"
+                  @click="closeNodeAll(n)"
+                >平掉该节点全部</button>
+              </div>
             </div>
           </div>
 
@@ -530,6 +650,11 @@ async function closeNodeAll(n: NodeOut): Promise<void> {
               还没有节点，请到「节点」页面创建。
             </template>
           </div>
+          <!-- 删挂单只在主节点卡片上出现；没设主节点时给一句说明，避免用户以为功能坏了 -->
+          <div
+            v-if="filteredNodes.length && !filteredNodes.some((n) => n.is_primary)"
+            class="muted dash-pending-hint"
+          >尚未设置主节点，「删挂单」入口在设置主节点后可用。</div>
         </div>
 
         <div v-if="filteredNodes.length > pageSize" class="dash-pagination">

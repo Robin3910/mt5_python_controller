@@ -19,9 +19,9 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from . import deal_stats, deal_store, follow_service, permissions, user_service
+from . import deal_stats, deal_store, follow_rules, follow_service, user_service
 from .deps import get_store, owned_node_or_404, require_menu
-from .models import PaginatedDeals
+from .models import DealSummary, PaginatedDeals
 from .permissions import MENU_FOLLOW, Principal
 from .redis_store import RedisStore
 
@@ -94,7 +94,9 @@ async def leader_performance(
     """带单员绩效（累计收益 / 收益率 / 胜率 / 笔数 / 跟单人数）。
 
     口径：
-    - 绩效 = 该带单员**名下全部节点**的成交聚合（与订单历史页同一套实现）；
+    - 绩效 = 该带单员**主节点**的成交聚合（与订单历史页同一套实现）；
+      主节点就是带单源，跟单员收到的是它的信号，所以广场上给他看的绩效
+      也必须来自同一个账户 —— 混进名下其它节点会让选单依据失真；
     - 跟单人数 = 跟了他（任一分组）的**去重节点数**（跟单关系表，非订单数据）。
 
     跟单员看的是「带单员赚了多少」—— 这正是选单的依据，所以聚合绩效公开可见。
@@ -103,15 +105,19 @@ async def leader_performance(
     if not user or not user.is_active:
         raise HTTPException(status_code=404, detail="带单员不存在或已停用")
 
+    win = window if window in deal_stats.WINDOWS else deal_stats.DEFAULT_WINDOW
     all_nodes = await store.all_nodes()
-    leader_nodes = [
-        n for n in all_nodes
-        if permissions.normalize_owner(n.get("owner_user_id")) == leader_user_id
-    ]
-    node_ids = [str(n.get("node_id")) for n in leader_nodes if n.get("node_id")]
+    primary = follow_rules.primary_node_of(all_nodes, leader_user_id)
 
-    from_ts = deal_stats.window_start(window)
-    performance = await deal_stats.leader_batch(node_ids, from_ts, None)
+    # 没有主节点就没有带单源，也就无从谈起带单绩效 —— 返回空统计（前端显示
+    # 「暂无数据」），而不是 0，与 deal_stats._empty_summary 的语义一致。
+    performance: dict
+    if primary:
+        performance = await deal_stats.leader_batch(
+            [str(primary.get("node_id"))], deal_stats.window_start(win), None,
+        )
+    else:
+        performance = DealSummary().model_dump()
 
     # 跟单人数：跟了该带单员任一分组的去重节点数
     followers = await follow_service.list_for_leaders({leader_user_id})
@@ -119,7 +125,7 @@ async def leader_performance(
 
     return {
         "leader_user_id": leader_user_id,
-        "window": window if window in deal_stats.WINDOWS else deal_stats.DEFAULT_WINDOW,
+        "window": win,
         "performance": performance,
         "follower_count": follower_count,
     }

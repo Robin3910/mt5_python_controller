@@ -82,17 +82,13 @@ def _node_brief(node: Optional[dict]) -> Optional[dict]:
     }
 
 
-def _owned_nodes(all_nodes: list[dict], user_id: int) -> list[dict]:
-    """某用户名下的节点。"""
-    return [
-        n for n in all_nodes
-        if permissions.normalize_owner(n.get("owner_user_id")) == permissions.normalize_owner(user_id)
-    ]
-
-
 def _primary_of(all_nodes: list[dict], user_id: int) -> Optional[dict]:
-    """某用户的主节点。"""
-    return next((n for n in _owned_nodes(all_nodes, user_id) if n.get("is_primary")), None)
+    """某用户的主节点。
+
+    委托 `follow_rules.primary_node_of` —— 与带单广场共用同一实现，
+    两边口径本就相同（都是主节点口径），各写一遍必然漂移。
+    """
+    return follow_rules.primary_node_of(all_nodes, user_id)
 
 
 def _viewable_follow_nodes(all_nodes: list[dict], principal: Principal) -> list[dict]:

@@ -114,7 +114,10 @@ async def leader_batch(
     *,
     symbol: Optional[str] = None,
 ) -> dict:
-    """若干节点的合并汇总（带单员名下全部节点 = 其绩效）。
+    """若干节点的合并汇总（带单员绩效 = 其**主节点**传入单个 node_id）。
+
+    入参是 node_ids 列表是为了让 `leader_batch_multi` 复用同一份聚合逻辑；
+    带单 / AI 两个市场传的都只有主节点，所以**统计范围是主节点**。
 
     一次查询算完，避免逐节点查库的 N+1。
     """

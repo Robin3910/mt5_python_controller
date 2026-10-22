@@ -5,6 +5,8 @@ import type {
   AdoptFollowersResult,
   CloseRequest,
   CloseBatchResult,
+  CancelPendingRequest,
+  CancelPendingResult,
   FilterRulesConfig,
   GridSizingData,
   GroupCreatePayload,
@@ -458,6 +460,13 @@ export const useHubStore = defineStore('hub', {
           ...body,
         })
       ).data
+    },
+    // ---- 远程撤挂单（不动持仓） ----
+    async cancelPendingAll(
+      id: string,
+      body: CancelPendingRequest = { scope: 'all' }
+    ): Promise<CancelPendingResult> {
+      return (await api.post(`/api/nodes/${id}/cancel-pending`, body)).data
     },
     // ---- 事件流 ----
     pushEvent(text: string, kind: HubEvent['kind'] = 'info'): void {

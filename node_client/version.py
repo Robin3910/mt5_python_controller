@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 # 发大版本时改此常量；只写数字与点，时间戳由构建脚本追加
-BASE_VERSION = "1.1.0"
+BASE_VERSION = "1.2.0"
 
 # 时间戳格式：年月日时分秒
 STAMP_FORMAT = "%Y%m%d%H%M%S"

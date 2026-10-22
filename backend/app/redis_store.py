@@ -45,15 +45,19 @@ SMC_TASK_TTL = 7 * 24 * 3600
 K_LIMIT_WATCH_LOCK = "limit_watch:lock:{}:{}"
 K_LIMIT_WATCH_DONE = "limit_watch:done:{}:{}"
 K_LIMIT_WATCH_REJECT = "limit_watch:reject:{}:{}"
+# 人工「删挂单」：节点级互斥锁 + 撤单中避让窗口 + 被人工撤掉的 ticket 标记
+K_CANCEL_PENDING_LOCK = "cancel_pending:lock:{}"
+K_CANCEL_PENDING_BUSY = "cancel_pending:busy:{}"
+K_CANCEL_PENDING_TICKET = "cancel_pending:ticket:{}:{}"
 # 登录用户的权限快照（角色 / 菜单 / 启用状态 / 会话版本），权威在 MySQL，丢失即重建
 K_PRINCIPAL = "auth:principal:{}"
-# 带单员绩效预聚合：{leader_user_id: {window: summary}}（JSON）
+# 带单员绩效预聚合：**主节点口径**。{leader_user_id: {window: summary}}（JSON）
 # TTL 15min > 刷新周期 5min，容忍后台任务偶发失败
 K_LEADER_STATS = "stats:leader:{}"
 
 # AI 机器人绩效预聚合（**主节点口径**）：{leader_user_id: {window: summary}}（JSON）
-# 与 K_LEADER_STATS 分开存：带单页按「名下全部节点」聚合，AI 页按「主节点」聚合，
-# 两者口径不同，共用一个 key 会互相覆盖。
+# 与 K_LEADER_STATS 分开存：两边的**聚合范围相同**（都是主节点），差异在展示单位
+# 与跟单人数的统计范围；共用一个 key 会互相覆盖。
 K_ROBOT_STATS = "stats:robot:{}"
 
 
@@ -360,6 +364,41 @@ class RedisStore:
     async def is_limit_watch_done(self, node_id: str, ticket: int) -> bool:
         return bool(await self.r.get(K_LIMIT_WATCH_DONE.format(node_id, ticket)))
 
+    # ----------------- 人工「删挂单」 -----------------
+    async def acquire_cancel_pending_lock(self, node_id: str, ttl_s: int = 30) -> bool:
+        """节点级互斥锁：同一节点同一时刻只允许一个删挂单流程在跑。
+
+        前端按钮 loading 只挡单标签页；多标签页 / 多用户并发靠这把锁。
+        """
+        return bool(
+            await self.r.set(K_CANCEL_PENDING_LOCK.format(node_id), "1", nx=True, ex=ttl_s)
+        )
+
+    async def release_cancel_pending_lock(self, node_id: str) -> None:
+        await self.r.delete(K_CANCEL_PENDING_LOCK.format(node_id))
+
+    async def mark_cancel_pending_busy(self, node_id: str, ttl_s: int = 10) -> None:
+        """标记「该节点正在人工批量撤单」，限价监听据此避让，避免两边同时动同一张单。"""
+        await self.r.set(K_CANCEL_PENDING_BUSY.format(node_id), "1", ex=ttl_s)
+
+    async def clear_cancel_pending_busy(self, node_id: str) -> None:
+        await self.r.delete(K_CANCEL_PENDING_BUSY.format(node_id))
+
+    async def is_cancel_pending_busy(self, node_id: str) -> bool:
+        return bool(await self.r.get(K_CANCEL_PENDING_BUSY.format(node_id)))
+
+    async def note_manual_cancelled_ticket(self, node_id: str, ticket: int,
+                                           ttl_s: int = 300) -> None:
+        """记下「这张挂单被人工批量撤单撤掉了」。
+
+        限价监听的单张撤单若失败且命中这张表，说明单子已不存在 —— 不是它失败，
+        不该给用户记 cancel_failed 误报。
+        """
+        await self.r.set(K_CANCEL_PENDING_TICKET.format(node_id, ticket), "1", ex=ttl_s)
+
+    async def is_manual_cancelled_ticket(self, node_id: str, ticket: int) -> bool:
+        return bool(await self.r.get(K_CANCEL_PENDING_TICKET.format(node_id, ticket)))
+
     async def note_limit_watch_reject(
         self, node_id: str, ticket: int, fingerprint: str, ttl: int = 300,
     ) -> bool:
@@ -405,7 +444,7 @@ class RedisStore:
         if keys:
             await self.r.delete(*keys)
 
-    # ----------------- 带单员绩效预聚合 -----------------
+    # ----------------- 带单员绩效预聚合（主节点口径）-----------------
     async def get_leader_stats(self, leader_user_id: int) -> Optional[dict]:
         """读某个带单员的预聚合绩效（四窗口一次性算好）。
 
@@ -437,8 +476,8 @@ class RedisStore:
     async def get_robot_stats(self, leader_user_id: int) -> Optional[dict]:
         """读某个机器人的主节点绩效预聚合（四窗口一次性算好）。
 
-        与 `get_leader_stats` 结构一致但 key 不同：带单页聚合名下全部节点，
-        AI 页只聚合主节点，口径不能混。
+        与 `get_leader_stats` 结构一致但 key 不同：两边聚合范围相同（都是主节点），
+        差异在展示单位与跟单人数的统计范围，共用一个 key 会互相覆盖。
         """
         raw = await self.r.get(K_ROBOT_STATS.format(leader_user_id))
         if not raw:

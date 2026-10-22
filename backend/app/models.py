@@ -836,6 +836,14 @@ class CloseBatchRequest(CloseRequest):
     node_ids: list[str] = Field(min_length=1)
 
 
+# ------------------------- 删挂单请求 -----------------------
+class CancelPendingRequest(BaseModel):
+    """远程批量撤挂单请求（只撤未成交挂单，不动持仓）。"""
+    # all（默认，撤光）/ manual（只撤手工单）/ strategy（只撤指定魔术号，暂不开放）
+    scope: str = "all"
+    magics: Optional[list[int]] = None
+
+
 # ----------------------- 中控台手动触发 -----------------------
 class ManualSignalRequest(BaseModel):
     """后台手动触发的信号（复用 Webhook 分发流程）。
@@ -1048,7 +1056,11 @@ class FollowLeaderSummary(BaseModel):
     my_follow_node_count: int = 0
     marketable: bool = True
     # —— 绩效（由历史成交聚合，与订单历史页同一套口径）——
+    # 口径 = **主节点**：主节点就是带单源，跟单员收到的是它的信号，
+    # 广场上给他看的绩效也必须来自同一个账户。混进名下其它节点（闲置盘、
+    # 跟单测试盘）会让选单依据与他实际承担的风险脱节。
     # 聚合绩效公开可见：带单广场是公开的，绩效就是给潜在跟单者看的。
+    # 没有主节点或主节点无成交 -> data_available=False（前端显示「暂无数据」）
     performance: DealSummary = Field(default_factory=DealSummary)
     # 当前统计窗口（7d / 30d / 90d / all）
     perf_window: str = "30d"
@@ -1339,3 +1351,20 @@ def build_close_command(signal_id: str, target: str, symbol: Optional[str] = Non
         "close_symbol": symbol,
         "close_ticket": ticket,
     }
+
+
+# ------------------------- 删挂单 -----------------------
+CANCEL_PENDING_SCOPES = ("all", "manual", "strategy")
+
+
+def build_cancel_all_command(scope: str = "all", *,
+                            magics: Optional[list[int]] = None) -> dict[str, Any]:
+    """构造下发给节点的“批量撤挂单”命令（不动持仓）。
+
+    req_id 由 `node_rpc.request` 注入。
+    """
+    want = scope if scope in CANCEL_PENDING_SCOPES else "all"
+    cmd: dict[str, Any] = {"cmd": "cancel_pending_all", "scope": want}
+    if magics:
+        cmd["magics"] = [int(m) for m in magics]
+    return cmd

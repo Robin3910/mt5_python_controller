@@ -272,6 +272,37 @@ class MockMT5Client:
             "results": results,
         }
 
+    def cancel_pending_all(self, scope="all", *, magics=None):
+        """对齐 MT5Client.cancel_pending_all：范围过滤 + 撤完复读 remaining。"""
+        orders = self.pending_orders()
+        want = str(scope or "all").strip().lower()
+        if want not in ("all", "manual", "strategy"):
+            want = "all"
+        if want == "manual":
+            orders = [o for o in orders if int(o.get("magic") or 0) == 0]
+        elif want == "strategy":
+            if not magics:
+                return {
+                    "success": True, "action": "CANCEL_ALL", "scope": want,
+                    "cancelled": 0, "failed": [], "results": [],
+                    "remaining": len(self.pending_orders()),
+                    "error": "strategy 范围未指定魔术号，未撤任何单",
+                }
+            targets = {int(m) for m in magics}
+            orders = [o for o in orders if int(o.get("magic") or 0) in targets]
+
+        results = [self.cancel_order(int(o["ticket"])) for o in orders]
+        failed = [r for r in results if not r.get("success")]
+        return {
+            "success": not failed,
+            "action": "CANCEL_ALL",
+            "scope": want,
+            "cancelled": sum(1 for r in results if r.get("success")),
+            "failed": failed,
+            "results": results,
+            "remaining": len(self.pending_orders()),
+        }
+
     def _record_exit(self, pos: dict, *, reason: int, profit: float) -> None:
         """记下出场成交；reason 对齐 MT5 DEAL_REASON（4=SL / 5=TP / 3=EXPERT…）。"""
         self._exit_deals.append({

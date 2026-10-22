@@ -593,6 +593,8 @@ class NodeClient:
             await self._do_strategy_smc(msg)
         elif cmd == "cancel_pending":
             await self._do_cancel_pending(ws, msg)
+        elif cmd == "cancel_pending_all":
+            await self._do_cancel_pending_all(ws, msg)
         else:
             logger.debug("ignored message: %s", msg)
 
@@ -1027,6 +1029,47 @@ class NodeClient:
                         data.setdefault("success", False)
         await ws.send(json.dumps({"type": "cancel_pending_result", "data": data}))
         logger.info("cancel pending result: %s", data)
+
+    async def _do_cancel_pending_all(self, ws, msg: dict) -> None:
+        """撤掉本节点上全部（或指定范围的）未成交挂单，不动持仓。
+
+        回包字段与单张 `cancel_pending_result` 同风格：`cancelled` / `failed` / `remaining`，
+        `remaining` 由节点侧撤完复读挂单簿给出，服务端复扫靠它判断是否还有残余。
+        """
+        req_id = str(msg.get("req_id") or "")
+        scope = str(msg.get("scope") or "all")
+        data: dict = {
+            "req_id": req_id, "scope": scope, "success": False,
+            "cancelled": 0, "failed": [], "remaining": 0, "results": [],
+        }
+        canceller = getattr(self.mt5, "cancel_pending_all", None)
+        if canceller is None:
+            data["error"] = "节点客户端版本过低，不支持批量撤销挂单"
+        else:
+            magics = msg.get("magics")
+            want_magics = None
+            if isinstance(magics, (list, tuple, set)):
+                try:
+                    want_magics = {int(m) for m in magics}
+                except (TypeError, ValueError):
+                    want_magics = None
+            try:
+                # _exec 只收位置参数；magics 走关键字位（cancel_pending_all 的签名是
+                # (scope, *, magics)），故这里包一层 lambda 把关键字收进去。
+                res = dict(
+                    await self._exec(
+                        lambda: canceller(scope, magics=want_magics),
+                    )
+                    or {}
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("cancel_pending_all failed: %s", e)
+                data["error"] = str(e)
+            else:
+                data.update(res)
+                data.setdefault("success", False)
+        await ws.send(json.dumps({"type": "cancel_pending_all_result", "data": data}))
+        logger.info("cancel_pending_all result: %s", data)
 
     async def _safe_market_probe(self, ws, msg: dict) -> None:
         """后台任务包装：探针异常不得变成未捕获 Task 异常。"""

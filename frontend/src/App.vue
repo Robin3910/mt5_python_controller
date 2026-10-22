@@ -55,13 +55,6 @@ function logout(): void {
 
 <template>
   <div class="app-shell">
-    <div class="bg-mesh" aria-hidden="true">
-      <div class="bg-orb bg-orb-1"></div>
-      <div class="bg-orb bg-orb-2"></div>
-      <div class="bg-orb bg-orb-3"></div>
-      <div class="bg-grid"></div>
-    </div>
-
     <header v-if="authed" class="topbar glass-bar">
       <div class="brand">
         <span class="brand-icon" aria-hidden="true">

@@ -11,12 +11,13 @@
 
 TTL 15min > 刷新周期 5min：后台任务偶发失败时，缓存里的旧值还能顶一阵。
 
-**两种口径**：
-- `K_LEADER_STATS`（带单页）：带单员名下**全部节点**的成交聚合；
-- `K_ROBOT_STATS`（AI 机器人页）：只聚合**主节点**。
+**口径 = 主节点**（`primary_nodes_of`）：跟单员收到的是带单员**主节点**的信号，
+跟单广场给他看的绩效也必须来自同一个账户 —— 混进名下其它节点（闲置盘、
+跟单测试盘）会让选单依据与他实际承担的风险脱节。与 AI 机器人页口径一致。
 
-两者分开 key、共用同一个 `deal_stats.leader_batch_multi` 实现 —— 口径不同的
-是「聚合哪些节点」，聚合算法本身只有一份，不会漂移。
+**两个市场共用筛选、但分开存 key**：`K_LEADER_STATS` 与 `K_ROBOT_STATS`
+的聚合范围（哪些节点）完全相同，差异只在展示单位与跟单人数的统计范围；
+共用一个 key 会互相覆盖，所以分开写。聚合算法本身只有一份，不会漂移。
 """
 from __future__ import annotations
 
@@ -32,6 +33,26 @@ logger = logging.getLogger(__name__)
 # 预聚合周期（秒）与缓存 TTL（秒）
 AGG_INTERVAL = 300
 AGG_TTL = 900
+
+
+def primary_nodes_of(all_nodes: list[dict]) -> dict[int, list[str]]:
+    """{user_id: [主节点 node_id]}；名下没有主节点的用户不入 map。
+
+    带单页与 AI 机器人页**都是主节点口径**，共用这一个筛选实现 ——
+    两处各写一遍 `if not n.get("is_primary")` 将来必然会漂移。
+
+    不入 map 的用户仍会被写缓存（值是 `data_available=False` 的空统计，
+    前端显示「暂无数据」），语义 = 该带单员的主节点还没有成交数据。
+    """
+    out: dict[int, list[str]] = {}
+    for n in all_nodes or []:
+        owner = permissions.normalize_owner(n.get("owner_user_id"))
+        if owner is None or not n.get("is_primary"):
+            continue
+        nid = n.get("node_id")
+        if nid:
+            out.setdefault(owner, []).append(str(nid))
+    return out
 
 
 class LeaderStatsAggregator:
@@ -82,7 +103,7 @@ class LeaderStatsAggregator:
         """跑一轮预聚合，返回写入缓存的带单员数量。
 
         「有资格成为带单员」= 持有 follow_leader 能力且启用。
-        绩效口径 = 该用户名下**全部节点**的成交聚合（与订单历史页同一套实现）。
+        绩效口径 = 该用户**主节点**的成交聚合（与订单历史页同一套实现）。
         """
         store = self._store
         users = await user_service.list_users()
@@ -97,15 +118,8 @@ class LeaderStatsAggregator:
             return 0
 
         all_nodes = await store.all_nodes()
-        # leader_user_id -> 名下全部 node_id
-        leader_nodes: dict[int, list[str]] = {uid: [] for uid in leader_ids}
-        for n in all_nodes:
-            owner = permissions.normalize_owner(n.get("owner_user_id"))
-            if owner is None or owner not in leader_nodes:
-                continue
-            nid = n.get("node_id")
-            if nid:
-                leader_nodes[owner].append(str(nid))
+        # user_id -> [主节点 node_id]（主节点口径；没有主节点的用户不在 map 里）
+        primary_nodes = primary_nodes_of(all_nodes)
 
         # 跟单人数：跟了该带单员任一分组的去重节点数（跟单关系表，非订单数据）
         followers_by_leader: dict[int, set[str]] = {}
@@ -118,7 +132,7 @@ class LeaderStatsAggregator:
         for window in deal_stats.WINDOWS:
             from_ts = deal_stats.window_start(window)
             # 一次查询算完全部带单员（不是逐个 leader_batch）
-            summaries = await deal_stats.leader_batch_multi(leader_nodes, from_ts, None)
+            summaries = await deal_stats.leader_batch_multi(primary_nodes, from_ts, None)
             for uid in leader_ids:
                 # 缓存结构：{window: {**summary, follower_count}}
                 # summary 的字段与 DealSummary 一致，follower_count 附加在后。
@@ -128,41 +142,32 @@ class LeaderStatsAggregator:
                 cached[window] = perf
                 await store.set_leader_stats(uid, cached, AGG_TTL)
             written = len(leader_ids)
-        logger.info("leader stats refreshed: %d leader(s)", written)
-        written += await self._refresh_robot_stats(store, users, all_nodes)
+        logger.info("leader stats refreshed: %d leader(s) (primary node only)", written)
+        written += await self._refresh_robot_stats(store, primary_nodes)
         return written
 
-    async def _refresh_robot_stats(self, store: RedisStore, users: list, all_nodes: list[dict]) -> int:
+    async def _refresh_robot_stats(
+        self, store: RedisStore, primary_nodes: dict[int, list[str]],
+    ) -> int:
         """AI 机器人的绩效预聚合 —— **主节点口径**，单独存一份。
 
-        与带单页的差别在**节点范围**：带单页聚合名下全部节点，AI 机器人页只聚合
-        主节点。AI 机器人的展示单位就是主节点（见 models.AiRobotSummary 类注释），
-        跟着它走的账户看到的也是主节点实盘；混进名下其它节点会让横向对比失真。
+        与带单页共用 `primary_nodes_of` 的筛选结果（两边口径本就相同），
+        但**分开 key**：AI 机器人页有自己的展示单位与跟单人数统计范围，
+        共用一个 key 会互相覆盖。
 
-        这里不能直接复用 `refresh()` 的 leader_nodes：那已经是「全部节点」了。
-        重新从 all_nodes 里挑主节点拼一份 {user_id: [primary_node_id]}，
         仍然走 `leader_batch_multi` —— **一次查询**，口径实现与订单历史页同一套。
         """
-        # user_id -> [主节点 node_id]（没有主节点的用户不入 map，leader_batch_multi 会给空统计）
-        robot_nodes: dict[int, list[str]] = {}
-        for n in all_nodes:
-            owner = permissions.normalize_owner(n.get("owner_user_id"))
-            if owner is None or not n.get("is_primary"):
-                continue
-            nid = n.get("node_id")
-            if nid:
-                robot_nodes.setdefault(owner, []).append(str(nid))
-        if not robot_nodes:
+        if not primary_nodes:
             return 0
 
         written = 0
         for window in deal_stats.WINDOWS:
             from_ts = deal_stats.window_start(window)
-            summaries = await deal_stats.leader_batch_multi(robot_nodes, from_ts, None)
-            for uid in robot_nodes:
+            summaries = await deal_stats.leader_batch_multi(primary_nodes, from_ts, None)
+            for uid in primary_nodes:
                 cached = await store.get_robot_stats(uid) or {}
                 cached[window] = dict(summaries.get(uid) or {})
                 await store.set_robot_stats(uid, cached, AGG_TTL)
-            written = len(robot_nodes)
+            written = len(primary_nodes)
         logger.info("robot stats refreshed: %d robot(s) (primary node only)", written)
         return written

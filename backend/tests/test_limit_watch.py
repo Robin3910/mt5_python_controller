@@ -522,6 +522,91 @@ async def test_handle_releases_lock_when_cancel_fails(store, monkeypatch):
     assert n["dispatch"] == 1
 
 
+# ---------------------------------------------------------------------------
+# 与人工「删挂单」的互斥（docs/superpowers/plans/2026-10-22-cancel-pending-plan.md §6.2）
+# ---------------------------------------------------------------------------
+async def test_handle_skips_node_while_manual_cancel_pending(store, monkeypatch):
+    """人工批量撤单进行中：整段跳过该节点，不撤单不分发，避免两套逻辑打架。"""
+    sty = await _mk_strategy(store)
+    g = await _mk_group(store, "人工撤单中", ["nd_a"], strategy=sty)
+    called = []
+
+    async def fake_cancel(*_a, **_k):
+        called.append("cancel")
+        return {"success": True, "ticket": 1001}
+
+    monkeypatch.setattr(limit_watch, "cancel_pending_on_node", fake_cancel)
+    monkeypatch.setattr(
+        limit_watch, "_dispatch", _async_raise(AssertionError("should not dispatch")),
+    )
+
+    await store.mark_cancel_pending_busy("nd_a")
+    await limit_watch.handle_account_orders("nd_a", [_order()])
+    assert called == []
+    page = await persist.list_limit_watch_logs(g["group_id"])
+    assert page["total"] == 0        # 连拒绝日志都不该写
+
+    # 窗口过后恢复正常处理（不破坏既有行为）
+    await store.clear_cancel_pending_busy("nd_a")
+    dispatched = []
+
+    async def ok_cancel(*_a, **_k):
+        called.append("cancel")
+        return {"success": True, "ticket": 1001}
+
+    async def ok_dispatch(*_a, **_k):
+        dispatched.append(1)
+        return {"status": "accepted", "signal_id": "sig_x"}
+
+    monkeypatch.setattr(limit_watch, "cancel_pending_on_node", ok_cancel)
+    monkeypatch.setattr(limit_watch, "_dispatch", ok_dispatch)
+    await limit_watch.handle_account_orders("nd_a", [_order()])
+    assert called == ["cancel"]
+    assert dispatched == [1]
+
+
+async def test_cancel_failed_suppressed_when_manually_removed(store, monkeypatch):
+    """撤单失败且命中「被人工撤掉」标记：静默跳过，不给用户记 cancel_failed 误报。"""
+    sty = await _mk_strategy(store)
+    g = await _mk_group(store, "人工撤掉的单", ["nd_a"], strategy=sty)
+
+    async def fake_cancel(*_a, **_k):
+        return {"success": False, "error": "订单已不存在"}
+
+    monkeypatch.setattr(limit_watch, "cancel_pending_on_node", fake_cancel)
+    monkeypatch.setattr(
+        limit_watch, "_dispatch", _async_raise(AssertionError("should not dispatch")),
+    )
+
+    await store.note_manual_cancelled_ticket("nd_a", 1001)
+    await limit_watch.handle_account_orders("nd_a", [_order()])
+
+    page = await persist.list_limit_watch_logs(g["group_id"])
+    assert page["total"] == 0        # 没有 cancel_failed 误报
+    # 已记为处理过，下一轮快照不再重复打扰
+    assert await store.is_limit_watch_done("nd_a", 1001)
+
+
+async def test_cancel_failed_still_logged_for_other_tickets(store, monkeypatch):
+    """反向用例：标记里没有这张单时，cancel_failed 照记（不吞真实故障）。"""
+    sty = await _mk_strategy(store)
+    g = await _mk_group(store, "真实撤单失败", ["nd_a"], strategy=sty)
+
+    async def fake_cancel(*_a, **_k):
+        return {"success": False, "error": "节点离线"}
+
+    monkeypatch.setattr(limit_watch, "cancel_pending_on_node", fake_cancel)
+    monkeypatch.setattr(
+        limit_watch, "_dispatch", _async_raise(AssertionError("should not dispatch")),
+    )
+
+    await store.note_manual_cancelled_ticket("nd_a", 9999)   # 别的 ticket
+    await limit_watch.handle_account_orders("nd_a", [_order()])
+    page = await persist.list_limit_watch_logs(g["group_id"])
+    assert page["total"] == 1
+    assert page["items"][0]["event"] == "cancel_failed"
+
+
 async def test_create_group_rejects_watch_on_non_trend(store):
     sty = await _mk_strategy(
         store, template_id=TEMPLATE_1_ID, template_name=TEMPLATE_1_NAME, rules=[],

@@ -7,15 +7,13 @@
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-import uuid
 from typing import Any, Optional
 
 from fastapi import HTTPException
 
-from . import group_rules, persist, strategy_templates
+from . import group_rules, node_rpc, persist, strategy_templates
 from .connections import manager
 from .models import SIGNAL_MODEL_STRATEGY
 from .state import state
@@ -35,8 +33,12 @@ DONE_TTL_SEC = 86400
 # 同一张不合格单的拒绝日志去重窗口
 REJECT_TTL_SEC = 300
 
-# req_id -> 等待撤单回包的 future
-_pending_cancels: dict[str, asyncio.Future] = {}
+# 人工「删挂单」进行中的短窗口：撤单 RPC 期间让 limit_watch 避让该节点，
+# 避免两套逻辑同时动同一张手工限价单（详见 docs/superpowers/plans/2026-10-22-cancel-pending-plan.md §6.2）
+MANUAL_CANCEL_SKIP_SEC = 10
+# 人工批量撤单会在 Redis 记下它撤过哪些 ticket（TTL 同上）：
+# limit_watch 的撤单失败若命中这张表，说明单子是被人工撤掉的，不算它失败
+MANUAL_CANCELLED_MARK_SEC = 300
 
 
 def normalize_keyword(raw: object) -> str:
@@ -300,55 +302,52 @@ def format_watch_message(
 
 
 # ------------------------------------------------------------------
-# 撤单 RPC（仿 market_probe：req_id 配对）
+# 撤单 RPC（req_id 配对实现已上移到 node_rpc，本节只保留命令构造与兼容转发）
 # ------------------------------------------------------------------
 def build_cancel_command(req_id: str, ticket: int) -> dict:
     return {"cmd": "cancel_pending", "req_id": req_id, "ticket": int(ticket)}
 
 
 def resolve_cancel(req_id: object, payload: dict) -> None:
-    fut = _pending_cancels.pop(str(req_id or ""), None)
-    if fut is not None and not fut.done():
-        fut.set_result(payload or {})
+    """兼容转发：ws_gateway 的撤单回包统一走 node_rpc.resolve。"""
+    node_rpc.resolve(req_id, payload)
 
 
 def discard_cancel(req_id: str) -> None:
-    _pending_cancels.pop(req_id, None)
+    node_rpc.discard(req_id)
 
 
 def reset_cancel_waiters() -> None:
     """测试用：清空在途撤单等待。"""
-    _pending_cancels.clear()
+    node_rpc.reset_waiters()
 
 
 async def cancel_pending_on_node(node_id: str, ticket: int) -> dict:
     """向节点下发撤挂单并等待回包；失败返回 success=False，不抛。"""
-    req_id = uuid.uuid4().hex[:16]
-    loop = asyncio.get_running_loop()
-    fut: asyncio.Future = loop.create_future()
-    _pending_cancels[req_id] = fut
-    try:
-        sent = await manager.send_to_node(node_id, build_cancel_command(req_id, ticket))
-        if not sent:
-            return {"success": False, "ticket": ticket, "error": "节点当前离线，无法撤销挂单"}
-        try:
-            payload = await asyncio.wait_for(fut, timeout=CANCEL_TIMEOUT)
-        except asyncio.TimeoutError:
-            return {"success": False, "ticket": ticket, "error": "节点未在超时时间内确认撤单"}
-        if not isinstance(payload, dict):
-            return {"success": False, "ticket": ticket, "error": "撤单回包无法解析"}
-        return payload
-    finally:
-        discard_cancel(req_id)
+    payload = await node_rpc.request(
+        node_id, build_cancel_command("", ticket), timeout=CANCEL_TIMEOUT,
+        offline_error="节点当前离线，无法撤销挂单",
+        timeout_error="节点未在超时时间内确认撤单",
+        bad_payload_error="撤单回包无法解析",
+    )
+    payload.setdefault("ticket", int(ticket))
+    return payload
 
 
 # ------------------------------------------------------------------
 # 编排：账户快照里扫挂单
 # ------------------------------------------------------------------
 async def handle_account_orders(node_id: str, orders: list | None) -> None:
-    """扫描节点上报的挂单；命中则校验、撤单、按手动触发同构分发给命中分组。"""
+    """扫描节点上报的挂单；命中则校验、撤单、按手动触发同构分发给命中分组。
+
+    人工「删挂单」正在对这个节点批量撤单时整段跳过：两套逻辑同时动同一张
+    手工限价单，会打出 cancel_failed 误报，还可能把用户正要删的单转成策略信号。
+    """
     store = state.store
     if store is None or not node_id:
+        return
+    if await store.is_cancel_pending_busy(node_id):
+        logger.info("limit_watch skip node %s: manual cancel in progress", node_id)
         return
     groups = await store.all_groups()
     if not node_has_watch(groups, node_id):
@@ -408,6 +407,15 @@ async def _handle_one(
     try:
         cancel = await cancel_pending_on_node(node_id, ticket)
         if not cancel.get("success"):
+            # 人工批量撤单已经把这张单撤掉了：单子不存在是预期结果，
+            # 记 cancel_failed 只会给用户一条红字误报，直接静默收场。
+            if await store.is_manual_cancelled_ticket(node_id, ticket):
+                logger.info(
+                    "limit_watch skip node %s ticket %s: removed by manual cancel",
+                    node_id, ticket,
+                )
+                await store.mark_limit_watch_done(node_id, ticket, ttl=DONE_TTL_SEC)
+                return
             err = cancel.get("error") or "撤单失败"
             logger.warning(
                 "limit_watch cancel failed node %s ticket %s: %s", node_id, ticket, err,

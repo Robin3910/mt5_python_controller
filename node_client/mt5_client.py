@@ -766,6 +766,53 @@ class MT5Client:
             "results": results,
         }
 
+    def cancel_pending_all(
+        self, scope: str = "all", *, magics: Optional[set[int]] = None,
+    ) -> dict:
+        """扫全部未成交挂单并批量撤销（后台「删挂单」落点，不动持仓）。
+
+        撤单语义直接复用 `_cancel_many` —— 它已经实现「先无退避连发、
+        瞬时失败再带退避重试」，重写会丢掉这层保护。
+
+        scope：
+        - `all`（默认）不过滤，手工单与策略单一起撤；
+        - `manual` 只撤 magic=0 的手工单（`limit_watch` 认的手工触发单口径）；
+        - `strategy` 只撤 `magics` 名下的单，缺 `magics` 时不动任何单。
+
+        `remaining` 在撤完后重新读一次挂单簿，由节点侧给出权威值：
+        服务端复扫要靠它判断是否还有残余（快照有延迟，不能拿旧快照猜）。
+        """
+        self.ensure()
+        orders = self.pending_orders()          # 已过滤市价单，只含真挂单
+        want = str(scope or "all").strip().lower()
+        if want not in ("all", "manual", "strategy"):
+            want = "all"        # 未知 scope 收敛成「撤光」，同时保证回显值始终是已知口径
+        if want == "manual":
+            orders = [o for o in orders if int(o.get("magic") or 0) == 0]
+        elif want == "strategy":
+            if not magics:
+                return {
+                    "success": True, "action": "CANCEL_ALL", "scope": want,
+                    "cancelled": 0, "failed": [], "results": [],
+                    "remaining": len(self.pending_orders()),
+                    "error": "strategy 范围未指定魔术号，未撤任何单",
+                }
+            targets = {int(m) for m in magics}
+            orders = [o for o in orders if int(o.get("magic") or 0) in targets]
+
+        results = self._cancel_many(orders)
+        remaining = self.pending_orders()        # 撤完复读，给复扫判据
+        failed = [r for r in results if not r.get("success")]
+        return {
+            "success": not failed,
+            "action": "CANCEL_ALL",
+            "scope": want,
+            "cancelled": _cancelled_count(results),
+            "failed": failed,
+            "results": results,
+            "remaining": len(remaining),
+        }
+
     def close_position(self, pos: dict, max_retry: int = 3) -> dict:
         """平掉单个持仓：下反方向 deal，并通过 position=ticket 指定要平的仓位。
 

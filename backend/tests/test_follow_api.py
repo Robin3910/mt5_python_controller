@@ -9,6 +9,7 @@
 - 节点删除 / 归属转移 / 升主节点时跟单关系被清理（防脏数据）。
 """
 import pathlib
+import time
 
 import fakeredis
 import pytest
@@ -1112,4 +1113,129 @@ def test_adopt_followers_still_works_within_same_market(client):
     )
     data = _adopt(client, another, alice_h).json()
     assert [a["node_id"] for a in data["adopted"]] == [b_follow], "同市场应继续继承"
+
+
+# ---------------------------------------------------------------------------
+# 绩效口径：**只算主节点**
+# ---------------------------------------------------------------------------
+# 口径回归测试。带单绩效曾经聚合「名下全部节点」，导致广场上给跟单员看的
+# 数字与他实际承担的风险脱节（副节点可能是闲置盘 / 测试盘）。现在口径 =
+# 主节点 —— 与带单源、与 AI 机器人页一致。
+#
+# 造数策略：主节点与副节点**故意给出可区分的盈亏**（主节点亏、副节点赚），
+# 这样全节点口径与主节点口径的结果必然不同，断言才能真正卡住口径。
+def _seed_deal(node_id: str, deal_id: int, *, profit: float, equity: float,
+               position_id: int = 1) -> None:
+    """往 mt5_deal 插一笔**出场**成交（统计口径测试用）。
+
+    出场类 entry 才有「已实现盈亏」与胜率分母（见 deal_stats.OUT_ENTRIES）；
+    持仓级去重靠 position_id，所以同一持仓的多次出场算一笔。
+
+    走 `deal_store.save_deals`（节点上报的同一条路径），而不是直接 ORM：
+    免得测试绕过归一化（_normalize）造出线上不可能出现的数据。
+
+    本文件的 `client` fixture 是**同步** TestClient，主线程此刻没有 event loop，
+    自己 `asyncio.get_event_loop()` 在全量跑时会被前面的用例关掉而炸掉；
+    所以借 TestClient 自己那个 portal 把协程丢进去跑（同一线程、同一 loop）。
+    """
+    from anyio.from_thread import start_blocking_portal
+
+    async def _go():
+        from app import deal_store
+        await deal_store.save_deals(
+            node_id,
+            [{
+                "deal_id": deal_id,
+                "position_id": position_id,
+                "symbol": "EURUSD",
+                "entry_type": "OUT",
+                "direction": "SELL",
+                "volume": 0.1,
+                "price": 1.1,
+                "profit": profit,
+                "swap": 0.0,
+                "commission": 0.0,
+                "time": int(time.time()),
+            }],
+            account={"balance": equity, "equity": equity},
+        )
+
+    with start_blocking_portal() as portal:
+        portal.call(_go)
+
+
+def test_leader_performance_counts_primary_node_only(client):
+    """带单绩效只算主节点：副节点的盈利不得计入（核心口径回归）。"""
+    admin_h = _login(client, "admin")
+    alice, _bob, a_primary, a_extra, *_ = _setup_leader_and_follower(client, admin_h)
+
+    # 主节点亏 100，副节点赚 500 —— 两口径结果必然不同（-100 vs +400）
+    _seed_deal(a_primary, 5001, profit=-100.0, equity=10000.0, position_id=1)
+    _seed_deal(a_extra, 5002, profit=500.0, equity=10000.0, position_id=1)
+
+    bob_h = _login(client, "bob")
+    r = client.get(
+        f"/api/deals/follow/leaders/{alice['id']}/performance",
+        params={"window": "all"},
+        headers=bob_h,
+    )
+    assert r.status_code == 200, r.text
+    perf = r.json()["performance"]
+
+    assert perf["data_available"] is True, "主节点有成交，应视为有数据"
+    assert perf["total_profit"] == pytest.approx(-100.0), (
+        f"绩效必须只含主节点的 -100；混入副节点会变成 +400，实际 {perf}"
+    )
+    assert perf["total_trades"] == 1, "笔数也应只计主节点的持仓"
+
+
+def test_leader_performance_without_primary_node_is_unavailable(client):
+    """无主节点 -> data_available=False（暂无数据），而不是 0。"""
+    admin_h = _login(client, "admin")
+    # 借 _setup 造出 alice/bob（bob 用来读接口），再补一个「只有副节点」的带单员 carol
+    _setup_leader_and_follower(client, admin_h)
+    leader_role = _make_role(
+        client, admin_h, "leader2", "带单员2", ["follow", "trading", "groups"], [CAP],
+    )
+    carol = _mk_user(client, admin_h, "carol")
+    _bind_role(client, admin_h, carol["id"], leader_role["id"])
+    c_extra = _mk_node(client, admin_h, "carol-extra", 90011, primary=False)
+    assert _assign(client, admin_h, carol["id"], [c_extra], True).status_code == 200
+
+    bob_h = _login(client, "bob")
+    r = client.get(
+        f"/api/deals/follow/leaders/{carol['id']}/performance",
+        params={"window": "all"},
+        headers=bob_h,
+    )
+    assert r.status_code == 200, r.text
+    perf = r.json()["performance"]
+    assert perf["data_available"] is False, "无主节点就是无从统计，应显示暂无数据"
+    assert perf["total_profit"] == 0.0
+
+
+def test_leader_detail_fallback_matches_primary_only(client):
+    """详情兜底（缓存未命中）与列表口径一致 —— 防「改了预聚合忘了改兜底」。
+
+    详情接口在 `stats:leader:{id}` 缓存未命中时会就地算一次；那条路径必须
+    同样只算主节点，否则会出现「列表 -100 / 点进详情 +400」的分裂。
+    """
+    admin_h = _login(client, "admin")
+    alice, _bob, a_primary, a_extra, *_ = _setup_leader_and_follower(client, admin_h)
+
+    _seed_deal(a_primary, 6001, profit=-100.0, equity=10000.0, position_id=1)
+    _seed_deal(a_extra, 6002, profit=500.0, equity=10000.0, position_id=1)
+
+    bob_h = _login(client, "bob")
+    # 预聚合 worker 在测试里没跑，缓存必然未命中 -> 走兜底路径
+    r = client.get(
+        f"/api/follow/leaders/{alice['id']}",
+        params={"window": "all"},
+        headers=bob_h,
+    )
+    assert r.status_code == 200, r.text
+    perf = r.json()["leader"]["performance"]
+    assert perf["total_profit"] == pytest.approx(-100.0), (
+        "详情兜底也必须只算主节点"
+    )
 

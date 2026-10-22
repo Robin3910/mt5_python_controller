@@ -288,9 +288,10 @@ async def _session(node_id: str, ws: WebSocket) -> None:
             # 只读行情探针回包（趋势面板），按 req_id 唤醒等待中的请求
             market_probe.resolve(data.get("req_id"), data)
 
-        elif mtype == "cancel_pending_result":
-            from . import limit_watch
-            limit_watch.resolve_cancel(data.get("req_id"), data)
+        elif mtype in ("cancel_pending_result", "cancel_pending_all_result"):
+            # 单张撤单（限价监听）与批量撤单（人工删挂单）共用 req_id 配对
+            from . import node_rpc
+            node_rpc.resolve(data.get("req_id"), data)
 
         else:
             logger.debug("node %s unknown msg type=%s", node_id, mtype)

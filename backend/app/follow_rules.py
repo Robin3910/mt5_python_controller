@@ -131,6 +131,29 @@ def has_leader_capability(capabilities: object) -> bool:
 # ---------------------------------------------------------------------------
 # 带单源
 # ---------------------------------------------------------------------------
+def primary_node_of(nodes: list[dict], user_id: int) -> Optional[dict]:
+    """某用户的主节点**记录**；没有主节点返回 None。
+
+    主节点按所有者唯一（`node_service.set_primary` 保证同 owner 至多一个），
+    所以这里取第一个命中即可。这是「谁是主节点」的唯一实现：
+    带单广场、AI 机器人广场、绩效统计三处共用，避免各写一遍
+    `next(n for n in ... if n.get("is_primary"))` 日后口径漂移。
+
+    刻意**不看 enabled**：调用方（列表接口）另行用
+    `leader_primary_node_id` 做「是否对外接单」的准入判定，这里只回答
+    「哪个是主节点」。绩效统计要的是主节点的历史成交，哪怕它当前被禁用。
+    """
+    target = normalize_owner(user_id)
+    for n in nodes or []:
+        if not isinstance(n, dict):
+            continue
+        if normalize_owner(n.get("owner_user_id")) != target:
+            continue
+        if n.get("is_primary"):
+            return n
+    return None
+
+
 def leader_primary_node_id(nodes: list[dict], leader_user_id: int) -> Optional[str]:
     """带单员的主节点 ID（带单源）；没有主节点返回 None。
 

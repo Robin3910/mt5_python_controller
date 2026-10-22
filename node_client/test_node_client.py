@@ -708,3 +708,55 @@ async def test_cancel_pending_missing_ticket():
     msg = [m for m in ws.sent if m["type"] == "cancel_pending_result"][0]
     assert msg["data"]["success"] is False
     assert "订单号" in msg["data"]["error"]
+
+
+async def test_cancel_pending_all_clears_orders_and_reports_remaining():
+    n = _node()
+    await n._exec(n.mt5.connect)
+    placed = await n._exec(
+        n.mt5.place_pending_order,
+        "EURUSD", "BUY", 0.1, 1.05, 1.04, None, "a", None,
+    )
+    assert placed.get("success")
+    placed2 = await n._exec(
+        n.mt5.place_pending_order,
+        "EURUSD", "SELL", 0.1, 1.10, 1.11, None, "b", None,
+    )
+    assert placed2.get("success")
+    assert len(n.mt5.pending_orders()) == 2
+
+    ws = FakeWS()
+    await n._handle(ws, {"cmd": "cancel_pending_all", "req_id": "ca1", "scope": "all"})
+
+    msg = [m for m in ws.sent if m["type"] == "cancel_pending_all_result"][0]
+    data = msg["data"]
+    assert data["success"] is True
+    assert data["req_id"] == "ca1"
+    assert data["cancelled"] == 2
+    assert data["remaining"] == 0
+    assert n.mt5.pending_orders() == []
+
+
+async def test_cancel_pending_all_on_old_client_reports_upgrade_hint():
+    """老版本节点没有该方法：回明确错误，服务端据此提示升级而不是静默卡住。"""
+    n = _node()
+    await n._exec(n.mt5.connect)
+    ws = FakeWS()
+
+    class _OldClient:
+        """模拟旧客户端：只有旧接口，没有 cancel_pending_all。"""
+        def __getattr__(self, name):
+            raise AttributeError(name)
+
+        def __getattribute__(self, name):
+            if name == "cancel_pending_all":
+                raise AttributeError(name)
+            return object.__getattribute__(self, name)
+
+    n.mt5 = _OldClient()
+    await n._handle(ws, {"cmd": "cancel_pending_all", "req_id": "ca2"})
+
+    msg = [m for m in ws.sent if m["type"] == "cancel_pending_all_result"][0]
+    assert msg["data"]["success"] is False
+    assert msg["data"]["req_id"] == "ca2"
+    assert "版本" in msg["data"]["error"]
