@@ -9,17 +9,24 @@ import type {
   AiRobotListResponse,
 } from './types'
 
-/** 机器人广场列表（q 匹配用户名 / 显示名 / 主节点名 / MT5 号） */
-export async function fetchAiRobots(q = ''): Promise<AiRobotListResponse> {
+/** 机器人广场列表（q 匹配用户名 / 显示名 / 主节点名 / MT5 号）
+ *  window 控制绩效统计窗口（7d / 30d / 90d / all），默认 30d */
+export async function fetchAiRobots(q = '', window = '30d'): Promise<AiRobotListResponse> {
   const { data } = await api.get<AiRobotListResponse>('/api/ai-follow/robots', {
-    params: q ? { q } : undefined,
+    params: q || window ? { ...(q ? { q } : {}), ...(window ? { window } : {}) } : undefined,
   })
   return data
 }
 
 /** 机器人详情：可开放的 AI 分组 + 我的可跟单节点 */
-export async function fetchAiRobotDetail(leaderUserId: number): Promise<AiRobotDetailResponse> {
-  const { data } = await api.get<AiRobotDetailResponse>(`/api/ai-follow/robots/${leaderUserId}`)
+export async function fetchAiRobotDetail(
+  leaderUserId: number,
+  window = '30d',
+): Promise<AiRobotDetailResponse> {
+  const { data } = await api.get<AiRobotDetailResponse>(
+    `/api/ai-follow/robots/${leaderUserId}`,
+    { params: window ? { window } : undefined },
+  )
   return data
 }
 

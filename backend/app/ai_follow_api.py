@@ -29,6 +29,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from . import (
+    deal_stats,
     follow_rules,
     follow_service,
     group_persist,
@@ -185,12 +186,17 @@ def _ai_groups_of(
 @router.get("/robots", response_model=AiRobotListResponse)
 async def list_ai_robots(
     q: str = "",
+    window: str = "30d",
     store: RedisStore = Depends(get_store),
     p: Principal = Depends(require_menu(MENU_AI_TRADE)),
 ) -> AiRobotListResponse:
     """AI 机器人广场：持 ai_strategy + follow_leader + 有主节点 + 至少一个已开放 AI 跟单的 tpl_1 分组。
 
     节点 / 分组 / 跟单关系都**批量预取一次**再在内存里筛，避免 N+1。
+
+    绩效口径 = **主节点**的成交聚合（AI 机器人的展示单位就是主节点）。
+    只读 deal_agg 预聚合的 Redis 缓存，**未命中不回源查库** —— 与带单广场
+    同一套策略，保证列表接口延迟恒定。
     """
     users = await user_service.list_users()
     hosts = await _ai_host_ids_with_capability(store, users)
@@ -208,6 +214,14 @@ async def list_ai_robots(
     followers_by_leader: dict[int, set[str]] = {}
     for f in await follow_service.list_for_leaders(hosts):
         followers_by_leader.setdefault(int(f["leader_user_id"]), set()).add(f["node_id"])
+
+    # 绩效：一次 MGET 拿全部机器人的主节点预聚合结果（未命中就是 None）
+    win = window if window in deal_stats.WINDOWS else deal_stats.DEFAULT_WINDOW
+    cached: dict[int, dict] = {}
+    for uid in hosts:
+        entry = await store.get_robot_stats(uid)
+        if entry and win in entry:
+            cached[uid] = entry[win]
 
     by_id = {u.id: u for u in users}
     needle = q.strip().lower()
@@ -236,6 +250,8 @@ async def list_ai_robots(
         ]
         max_allow = [r["max_allow_num"] for r in risk if r["max_allow_num"] is not None]
         lot_limits = [r["total_lot_limit"] for r in risk if r["total_lot_limit"] is not None]
+        # 绩效：主节点口径的预聚合（缓存未命中 -> 空统计，前端显示「暂无数据」）
+        perf = dict(cached.get(uid) or {})
         out.append({
             "leader_user_id": uid,
             "username": u.username,
@@ -248,6 +264,10 @@ async def list_ai_robots(
             "max_allow_num": max(max_allow) if max_allow else None,
             "total_lot_limit": max(lot_limits) if lot_limits else None,
             "marketable": True,
+            "performance": perf,
+            "perf_window": win,
+            # 跟单人数取预聚合里的值，回落到跟单关系表实时统计
+            "follower_count": len(followers_by_leader.get(uid, set())),
         })
     # 已跟过的排前面，其余按用户名
     out.sort(key=lambda x: (x["my_follow_group_count"] == 0, x["username"]))
@@ -260,6 +280,7 @@ async def list_ai_robots(
 @router.get("/robots/{leader_user_id}", response_model=AiRobotDetailResponse)
 async def get_ai_robot_detail(
     leader_user_id: int,
+    window: str = "30d",
     store: RedisStore = Depends(get_store),
     p: Principal = Depends(require_menu(MENU_AI_TRADE)),
 ) -> AiRobotDetailResponse:
@@ -326,6 +347,20 @@ async def get_ai_robot_detail(
     risk_all = [_risk_summary(strategies.get(g.get("strategy_id") or "")) for g in groups]
     max_allow = [r["max_allow_num"] for r in risk_all if r["max_allow_num"] is not None]
     lot_limits = [r["total_lot_limit"] for r in risk_all if r["total_lot_limit"] is not None]
+
+    # 绩效：主节点口径，与列表同一份缓存（口径完全一致）。
+    # 详情是单个人，缓存刚建立时可能还没有 —— 允许就地回源算一次兜底。
+    win = window if window in deal_stats.WINDOWS else deal_stats.DEFAULT_WINDOW
+    perf: dict = {}
+    cached = await store.get_robot_stats(leader_user_id) or {}
+    if win in cached:
+        perf = dict(cached[win])
+    else:
+        perf = await deal_stats.leader_batch([str(primary.get("node_id"))], deal_stats.window_start(win), None)
+
+    follower_count = len({
+        f["node_id"] for f in await follow_service.list_for_leaders({leader_user_id})
+    })
     return AiRobotDetailResponse(
         robot={
             "leader_user_id": leader_user_id,
@@ -333,14 +368,15 @@ async def get_ai_robot_detail(
             "display_name": user.display_name,
             "primary_node": _node_brief(primary),
             "ai_group_count": len(groups),
-            "follower_node_count": len({
-                f["node_id"] for f in await follow_service.list_for_leaders({leader_user_id})
-            }),
+            "follower_node_count": follower_count,
             "my_follow_group_count": len(mine),
             "my_follow_node_count": sum(len(v) for v in mine.values()),
             "max_allow_num": max(max_allow) if max_allow else None,
             "total_lot_limit": max(lot_limits) if lot_limits else None,
             "marketable": True,
+            "performance": perf,
+            "perf_window": win,
+            "follower_count": follower_count,
         },
         groups=detail_groups,
         my_nodes=[_node_brief(n) for n in _viewable_follow_nodes(all_nodes, p)],

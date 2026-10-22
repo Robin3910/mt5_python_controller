@@ -1613,8 +1613,23 @@ export interface AiRobotSummary {
   /** 风险上限（取各分组最大值）—— 必须公开，跟单员不控手数 */
   max_allow_num: number | null
   total_lot_limit: number | null
+  /** 该机器人是否仍开放 AI 跟单；false 时已下架 */
   marketable: boolean
   unmarketable_reason: string | null
+  /**
+   * 绩效（由**主节点**的成交聚合，与订单历史页同一套口径）。
+   *
+   * AI 机器人的展示单位就是主节点，所以绩效只算主节点 —— 混进主人名下
+   * 其它账户的盈亏会让机器人之间的横向对比失真。
+   *
+   * `data_available=false` 表示**暂无成交数据**（节点未上线 / 同步未开），
+   * 前端要显示「暂无数据」而不是 0。
+   */
+  performance: DealSummary
+  /** 当前统计窗口（7d / 30d / 90d / all） */
+  perf_window: string
+  /** 跟单人数（AI 市场内跟了该机器人的去重节点数） */
+  follower_count: number
 }
 
 /** 机器人详情里的单个 AI 分组 */

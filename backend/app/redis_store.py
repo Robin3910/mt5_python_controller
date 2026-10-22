@@ -51,6 +51,11 @@ K_PRINCIPAL = "auth:principal:{}"
 # TTL 15min > 刷新周期 5min，容忍后台任务偶发失败
 K_LEADER_STATS = "stats:leader:{}"
 
+# AI 机器人绩效预聚合（**主节点口径**）：{leader_user_id: {window: summary}}（JSON）
+# 与 K_LEADER_STATS 分开存：带单页按「名下全部节点」聚合，AI 页按「主节点」聚合，
+# 两者口径不同，共用一个 key 会互相覆盖。
+K_ROBOT_STATS = "stats:robot:{}"
+
 
 class RedisStore:
     def __init__(self, client: aioredis.Redis) -> None:
@@ -425,5 +430,33 @@ class RedisStore:
 
     async def delete_leader_stats(self, *leader_user_ids: int) -> None:
         keys = [K_LEADER_STATS.format(u) for u in leader_user_ids if u]
+        if keys:
+            await self.r.delete(*keys)
+
+    # ----------------- AI 机器人绩效预聚合（主节点口径）-----------------
+    async def get_robot_stats(self, leader_user_id: int) -> Optional[dict]:
+        """读某个机器人的主节点绩效预聚合（四窗口一次性算好）。
+
+        与 `get_leader_stats` 结构一致但 key 不同：带单页聚合名下全部节点，
+        AI 页只聚合主节点，口径不能混。
+        """
+        raw = await self.r.get(K_ROBOT_STATS.format(leader_user_id))
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    async def set_robot_stats(self, leader_user_id: int, data: dict, ttl: int) -> None:
+        await self.r.set(
+            K_ROBOT_STATS.format(leader_user_id),
+            json.dumps(data),
+            ex=ttl,
+        )
+
+    async def delete_robot_stats(self, *leader_user_ids: int) -> None:
+        keys = [K_ROBOT_STATS.format(u) for u in leader_user_ids if u]
         if keys:
             await self.r.delete(*keys)

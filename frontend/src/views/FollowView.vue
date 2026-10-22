@@ -371,6 +371,13 @@ function toggleAllLeaveNodes() {
   d.selected = d.selected.length === d.entry.nodes.length ? [] : d.entry.nodes.map((n) => n.node_id)
 }
 
+/** 全选框的勾选态（空列表时不能显示为已全选） */
+const leaveAllSelected = computed<boolean>(() => {
+  const d = leaveDialog.value
+  if (!d || !d.entry.nodes.length) return false
+  return d.selected.length === d.entry.nodes.length
+})
+
 /** 选中的节点涉及的分组并集（移出时要覆盖全部） */
 const leaveTargetGroupIds = computed<string[]>(() => {
   const d = leaveDialog.value
@@ -513,33 +520,49 @@ onMounted(() => {
               <span v-else class="tag">未跟</span>
             </div>
 
-            <!-- 4 项统计（真实成交聚合，与订单历史页同一口径） -->
+            <!-- 4 项统计（真实成交聚合，与订单历史页同一口径）
+                 手机端：累计收益 / 收益率 提为主视觉大数字，胜率 / 跟单人数退为小格子 -->
             <div class="leader-stats">
-              <div class="ls-item">
-                <span class="ls-k">累计收益</span>
-                <span v-if="!l.performance?.data_available" class="ls-v muted">暂无数据</span>
-                <span v-else class="ls-v" :style="{ color: pctColor(statsOf(l).total_profit) }">
-                  {{ fmtProfit(statsOf(l).total_profit) }}
-                </span>
+              <div class="ls-hero">
+                <div class="ls-hero-main">
+                  <span class="ls-hero-k">累计收益</span>
+                  <span v-if="!l.performance?.data_available" class="ls-hero-v muted">暂无数据</span>
+                  <span
+                    v-else
+                    class="ls-hero-v"
+                    :class="statsOf(l).total_profit >= 0 ? 'pos' : 'neg'"
+                  >
+                    {{ fmtProfit(statsOf(l).total_profit) }}
+                  </span>
+                </div>
+                <div class="ls-hero-side">
+                  <span class="ls-hero-k">收益率</span>
+                  <span v-if="!l.performance?.data_available" class="ls-hero-sub muted">暂无数据</span>
+                  <span v-else-if="!statsOf(l).profit_rate_valid" class="ls-hero-sub muted">—</span>
+                  <span
+                    v-else
+                    class="ls-hero-sub"
+                    :class="statsOf(l).profit_rate >= 0 ? 'pos' : 'neg'"
+                  >
+                    {{ fmtRate(statsOf(l).profit_rate) }}
+                  </span>
+                </div>
               </div>
-              <div class="ls-item">
-                <span class="ls-k">收益率</span>
-                <span v-if="!l.performance?.data_available" class="ls-v muted">暂无数据</span>
-                <span v-else class="ls-v" :style="{ color: pctColor(statsOf(l).profit_rate) }">
-                  {{ fmtRate(statsOf(l).profit_rate) }}
-                </span>
+
+              <div class="ls-mini-row">
+                <div class="ls-mini">
+                  <span class="ls-mini-k">胜率</span>
+                  <span v-if="!l.performance?.data_available" class="ls-mini-v muted">暂无数据</span>
+                  <span v-else class="ls-mini-v">{{ statsOf(l).win_rate.toFixed(2) }}%</span>
+                </div>
+                <div class="ls-mini">
+                  <span class="ls-mini-k">跟单人数</span>
+                  <span class="ls-mini-v">{{ followerCountOf(l) }} 人</span>
+                </div>
               </div>
-              <div class="ls-item">
-                <span class="ls-k">跟单人数</span>
-                <span class="ls-v">{{ followerCountOf(l) }} 人</span>
-              </div>
-              <div class="ls-item">
-                <span class="ls-k">胜率</span>
-                <span v-if="!l.performance?.data_available" class="ls-v muted">暂无数据</span>
-                <span v-else class="ls-v">{{ statsOf(l).win_rate.toFixed(2) }}%</span>
-              </div>
+
+              <div v-if="updatedText(l)" class="ls-updated muted">{{ updatedText(l) }}</div>
             </div>
-            <div v-if="updatedText(l)" class="ls-updated muted">{{ updatedText(l) }}</div>
           </li>
         </ul>
       </section>
@@ -679,13 +702,7 @@ onMounted(() => {
                     <template v-if="n.active_task_count">
                       · 运行中 {{ n.active_task_count }} 单
                     </template>
-                    <template v-if="n.groups.length > 1">
-                      · 跟自 {{ n.groups.length }} 个分组
-                    </template>
                   </span>
-                  <button class="btn-sm btn-ghost" @click="openLeaveDialog(f.leader, n.node_id)">
-                    移出
-                  </button>
                 </div>
               </div>
             </div>
@@ -699,60 +716,93 @@ onMounted(() => {
       v-if="leaveDialog"
       v-model="leaveDialogVisible"
       width="460px"
-      title="移出跟单"
       :close-on-click-modal="false"
       align-center
       class="leave-dialog"
+      :style="{ '--leave-radius': '16px' }"
     >
-      <p class="muted" style="margin: 0 0 10px; font-size: 12px">
-        带单员「{{ leaveDialog.leader.display_name || leaveDialog.leader.username }}」
-        · 勾选要移出的节点，移出后该带单员不再向它们下发信号
-      </p>
-      <div class="leave-all">
-        <label>
-          <input
-            type="checkbox"
-            :checked="leaveDialog.selected.length === leaveDialog.entry.nodes.length && leaveDialog.entry.nodes.length > 0"
-            @change="toggleAllLeaveNodes"
-          />
-          <span>全选（{{ leaveDialog.entry.nodes.length }} 个节点）</span>
-        </label>
-      </div>
-      <ul class="leave-list">
-        <li
-          v-for="n in leaveDialog.entry.nodes"
-          :key="n.node_id"
-          class="leave-item"
-          :class="{ on: leaveDialog.selected.includes(n.node_id) }"
-          @click="toggleLeaveNode(n.node_id)"
-        >
+      <template #header>
+        <div class="lv-header">
+          <div class="lv-title">
+            <span class="lv-title-main">移出跟单</span>
+            <span class="lv-title-sub">
+              带单员「{{ leaveDialog.leader.display_name || leaveDialog.leader.username }}」
+            </span>
+          </div>
+
+        </div>
+      </template>
+
+      <div class="lv-body">
+        <!-- 提示 + 全选：粘在列表顶部，不随列表滚走 -->
+        <div class="lv-hint muted">
+          勾选要移出的节点，移出后该带单员不再向它们下发信号。
+        </div>
+
+        <div class="leave-all">
           <label>
             <input
               type="checkbox"
-              :checked="leaveDialog.selected.includes(n.node_id)"
-              @click.stop
-              @change="toggleLeaveNode(n.node_id)"
+              :checked="leaveAllSelected"
+              :disabled="!leaveDialog.entry.nodes.length"
+              @change="toggleAllLeaveNodes"
             />
-            <span class="pick-name">{{ n.name || n.node_id }}</span>
+            <span class="leave-all-text">全选</span>
+            <span class="leave-all-count">{{ leaveDialog.entry.nodes.length }} 个节点</span>
           </label>
-          <span class="muted" style="font-size: 12px">
-            MT5 {{ n.mt5_login ?? '—' }}
-            <template v-if="n.groups.length">
-              · {{ n.groups.map((g) => g.group_name || g.group_id).join('、') }}
-            </template>
-            <template v-if="n.active_task_count"> · 运行中 {{ n.active_task_count }} 单</template>
+          <span v-if="leaveDialog.selected.length" class="leave-all-selected">
+            已选 {{ leaveDialog.selected.length }}
           </span>
-        </li>
-      </ul>
-      <p v-if="leaveActiveTaskCount" class="muted" style="margin: 10px 0 0; font-size: 12px">
-        选中的节点还有 {{ leaveActiveTaskCount }} 个进行中的任务，移出时可选择是否平仓关闭。
-      </p>
+        </div>
+
+        <ul class="leave-list">
+          <li
+            v-for="n in leaveDialog.entry.nodes"
+            :key="n.node_id"
+            class="leave-item"
+            :class="{ on: leaveDialog.selected.includes(n.node_id) }"
+            @click="toggleLeaveNode(n.node_id)"
+          >
+            <label>
+              <input
+                type="checkbox"
+                :checked="leaveDialog.selected.includes(n.node_id)"
+                @click.stop
+                @change="toggleLeaveNode(n.node_id)"
+              />
+              <span class="lv-node-main">
+                <span class="pick-name">{{ n.name || n.node_id }}</span>
+                <span class="lv-node-meta mono">
+                  MT5 {{ n.mt5_login ?? '—' }}
+                  <template v-if="n.active_task_count">
+                    <span class="lv-node-tasks">运行中 {{ n.active_task_count }} 单</span>
+                  </template>
+                </span>
+              </span>
+            </label>
+          </li>
+        </ul>
+
+        <!-- 选中后会影响到的分组 / 任务：给用户一个可预期的后果说明 -->
+        <div v-if="leaveDialog.selected.length" class="lv-impact">
+
+          <div v-if="leaveActiveTaskCount" class="lv-impact-row lv-impact-warn">
+            <span class="lv-impact-k">进行中任务</span>
+            <span class="lv-impact-v">{{ leaveActiveTaskCount }} 个 · 移出时可选择是否平仓</span>
+          </div>
+          <div v-else class="lv-impact-row">
+            <span class="lv-impact-k">进行中任务</span>
+            <span class="lv-impact-v muted">无</span>
+          </div>
+        </div>
+      </div>
+
       <template #footer>
-        <div class="row between" style="width: 100%">
-          <span class="muted" style="font-size: 12px">
-            已选 {{ leaveDialog.selected.length }} 个节点 · 涉及 {{ leaveTargetGroupIds.length }} 个分组
+        <div class="lv-footer">
+          <span class="lv-footer-hint muted">
+            {{ leaveDialog.selected.length ? `已选 ${leaveDialog.selected.length} 个节点` : '请选择要移出的节点' }}
           </span>
-          <div class="row" style="gap: 8px">
+          <div class="lv-footer-btns">
             <button class="btn-sm btn-ghost" :disabled="leaveSubmitting" @click="closeLeaveDialog">
               取消
             </button>
@@ -842,35 +892,113 @@ onMounted(() => {
   margin-top: 4px;
 }
 
-/* 带单员列表里的 4 项统计：窄栏用 2×2，比横排 4 列易读 */
+/* 带单员列表里的 4 项统计
+   —— 桌面：主指标 + 副指标一行，胜率/跟单人数并排
+   —— 手机：主指标放大成 hero 行，胜率/跟单人数压成 2 个小格子 */
 .leader-stats {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 4px 10px;
-  margin-top: 8px;
-  padding-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 10px;
   border-top: 1px dashed var(--glass-border);
 }
 
-.ls-item {
+.ls-hero {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+.ls-hero-main {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+.ls-hero-side {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.ls-hero-k {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.ls-hero-v {
+  font-size: 16px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  letter-spacing: -0.01em;
+}
+.ls-hero-v.pos { color: var(--green); }
+.ls-hero-v.neg { color: var(--red); }
+.ls-hero-sub {
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.ls-hero-sub.pos { color: var(--green); }
+.ls-hero-sub.neg { color: var(--red); }
+
+.ls-mini-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+.ls-mini {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
   gap: 6px;
   min-width: 0;
+  padding: 4px 8px;
+  background: var(--glass);
+  border: 1px solid var(--glass-border);
+  border-radius: 6px;
 }
-
-.ls-k {
+.ls-mini-k {
   font-size: 11px;
   color: var(--muted);
   white-space: nowrap;
+  flex-shrink: 0;
 }
-
-.ls-v {
+.ls-mini-v {
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 600;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ls-updated {
+  font-size: 11px;
+  text-align: right;
+}
+
+/* 手机端：主指标再放大一档，hero 换行避免数字被挤压 */
+@media (max-width: 480px) {
+  .ls-hero {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
+  }
+  .ls-hero-main { justify-content: space-between; }
+  .ls-hero-side {
+    justify-content: space-between;
+    padding-top: 4px;
+    border-top: 1px solid rgba(255, 255, 255, 0.04);
+  }
+  .ls-hero-v { font-size: 20px; }
+  .ls-hero-sub { font-size: 13px; }
+  .ls-mini { padding: 5px 8px; }
 }
 
 .sec-title {
@@ -1031,11 +1159,80 @@ onMounted(() => {
 }
 
 /* ── 移出跟单选择弹窗 ───────────────────────────────── */
+/* 说明：ElDialog 会把内容 teleport 到 body，scoped 样式作用不到内部结构，
+   所以「弹窗外壳」（el-dialog 自身的 header/body/footer 盒模型）必须写在
+   文件末尾的非 scoped <style> 里；弹窗内容（lv-* / leave-*）是本组件的
+   节点，留在 scoped 这段即可。 */
+
+/* Header：标题 + 带单员名 + 关闭按钮 */
+.lv-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.lv-title {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.lv-title-main {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text);
+}
+.lv-title-sub {
+  font-size: 12px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lv-close {
+  flex-shrink: 0;
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  border: 1px solid var(--glass-border);
+  background: var(--glass);
+  color: var(--muted);
+  cursor: pointer;
+  transition: background var(--transition), color var(--transition), border-color var(--transition);
+}
+.lv-close:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--glass-highlight);
+}
+.lv-close:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Body：flex 列，列表区可滚动 */
+.lv-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  min-height: 0;
+  flex: 1;
+}
+.lv-hint {
+  font-size: 12px;
+  line-height: 1.6;
+  margin-bottom: 10px;
+}
+
 .leave-all {
-  padding: 6px 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 10px;
   border: 1px dashed var(--glass-border);
-  border-radius: var(--radius);
+  border-radius: var(--radius-sm);
   margin-bottom: 8px;
+  background: var(--glass);
 }
 
 .leave-all label {
@@ -1044,6 +1241,15 @@ onMounted(() => {
   gap: 8px;
   cursor: pointer;
   font-size: 13px;
+  min-width: 0;
+}
+.leave-all-text { font-weight: 600; flex-shrink: 0; }
+.leave-all-count { color: var(--muted); font-size: 12px; }
+.leave-all-selected {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--primary);
+  flex-shrink: 0;
 }
 
 .leave-list {
@@ -1053,32 +1259,176 @@ onMounted(() => {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  max-height: 45vh;
+  max-height: 46vh;
   overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 .leave-item {
-  padding: 8px 10px;
+  padding: 9px 11px;
   border: 1px solid var(--glass-border);
-  border-radius: var(--radius);
+  border-radius: var(--radius-sm);
   cursor: pointer;
   font-size: 13px;
+  transition: border-color var(--transition), background var(--transition);
 }
 
-.leave-item:hover {
-  border-color: var(--primary);
-}
-
+/* 手机端没有 hover，选中态必须够醒目才反馈得到 */
 .leave-item.on {
   border-color: var(--primary);
-  background: var(--glass);
+  background: rgba(37, 99, 235, 0.08);
 }
+.leave-item:active { background: rgba(37, 99, 235, 0.12); }
 
 .leave-item label {
-  display: inline-flex;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: inherit;
+  min-width: 0;
+}
+
+/* 节点名 + MT5 账号竖排，长账号换行而不是把整行撑破 */
+.lv-node-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.lv-node-meta {
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lv-node-tasks {
+  margin-left: 4px;
+  color: var(--gold, #fbbf24);
+}
+
+/* 后果说明：让用户点确认前就知道会影响几个分组 / 几个运行中任务 */
+.lv-impact {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 10px;
+  padding: 8px 10px;
+  background: var(--glass);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm);
+}
+.lv-impact-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12px;
+  min-width: 0;
+}
+.lv-impact-k { color: var(--muted); flex-shrink: 0; }
+.lv-impact-v { font-weight: 600; text-align: right; }
+.lv-impact-warn .lv-impact-v { color: var(--gold, #fbbf24); }
+
+/* Footer：提示文字 + 操作按钮 */
+.lv-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+}
+.lv-footer-hint {
+  font-size: 12px;
+  text-align: left;
+  min-width: 0;
+}
+.lv-footer-btns {
+  display: flex;
   align-items: center;
   gap: 8px;
-  cursor: inherit;
-  margin-right: 10px;
+  flex-shrink: 0;
+}
+
+/* ── 手机端：弹窗贴顶全高，列表区滚动，按钮加大可点 ── */
+@media (max-width: 600px) {
+  .leave-list { max-height: none; }
+  .lv-impact-row { flex-direction: column; align-items: flex-start; gap: 2px; }
+  .lv-impact-v { text-align: left; }
+}
+</style>
+
+<style>
+/* 非 scoped：覆盖被 teleport 到 body 的 el-dialog 内部结构 */
+.leave-dialog {
+  --el-border-color-lighter: rgba(255, 255, 255, 0.06);
+  --el-border-color: rgba(255, 255, 255, 0.1);
+}
+.leave-dialog .el-dialog {
+  border-radius: var(--leave-radius, 16px);
+  overflow: hidden;
+  max-height: calc(100dvh - 32px);
+  display: flex;
+  flex-direction: column;
+}
+.leave-dialog .el-dialog__header {
+  padding: 14px 16px 12px;
+  margin-right: 0;
+  border-bottom: 1px solid var(--glass-border);
+  flex-shrink: 0;
+}
+.leave-dialog .el-dialog__body {
+  padding: 12px 16px;
+  /* 用 flex 让「提示 + 全选」固定、只有列表滚动 */
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.leave-dialog .el-dialog__footer {
+  padding: 10px 16px 14px;
+  border-top: 1px solid var(--glass-border);
+  background: transparent;
+  flex-shrink: 0;
+}
+
+@media (max-width: 600px) {
+  .leave-dialog { margin: 0 !important; }
+  .leave-dialog .el-dialog {
+    width: 100vw !important;
+    max-width: 100vw !important;
+    height: 100dvh !important;
+    max-height: 100dvh !important;
+    border-radius: 0 !important;
+    margin: 0 !important;
+  }
+  /* 手机端撑满全屏后列表才有意义：吃掉除头尾以外的全部高度 */
+  .leave-dialog .leave-list {
+    flex: 1;
+    min-height: 0;
+    max-height: none;
+    overflow-y: auto;
+  }
+  /* 按钮加大到可点的高度，并让「已选 N 个」独占一行 */
+  .leave-dialog .lv-footer {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+  .leave-dialog .lv-footer-hint { text-align: center; }
+  .leave-dialog .lv-footer-btns {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+  .leave-dialog .lv-footer-btns button {
+    height: 44px;
+    width: 100%;
+    font-size: 15px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
 }
 </style>

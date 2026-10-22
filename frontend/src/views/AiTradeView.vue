@@ -13,7 +13,7 @@
 //   4. 移出默认不停止在跑任务（决策 = 与带单一致，由 node_client 跑完）
 //
 // 跟单员收不到实时 WS 事件（M3）—— 用 45s 轮询替代。
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
 import 'element-plus/es/components/message-box/style/css'
@@ -34,6 +34,15 @@ import type {
 const robots = ref<AiRobotSummary[]>([])
 const loading = ref(false)
 const keyword = ref('')
+
+/** 绩效统计窗口（四档，与后端 deal_stats.WINDOWS 对齐） */
+const WINDOW_OPTIONS = [
+  { value: '7d', label: '近 7 天' },
+  { value: '30d', label: '近 30 天' },
+  { value: '90d', label: '近 90 天' },
+  { value: 'all', label: '全部' },
+] as const
+const perfWindow = ref<string>('30d')
 
 const detail = ref<AiRobotDetailResponse | null>(null)
 const detailLoading = ref(false)
@@ -165,27 +174,47 @@ function errText(e: unknown, fallback: string): string {
   return ax?.response?.data?.detail || fallback
 }
 
-function fmtNullable(v: number | null | undefined, suffix = '', digits = 2): string {
-  if (v == null) return '—'
-  return Number(v).toFixed(digits) + suffix
-}
-
-function fmtIntNullable(v: number | null | undefined): string {
-  if (v == null) return '—'
-  return String(Math.trunc(v))
-}
-
 function primaryText(robot: AiRobotSummary): string {
   const n = robot.primary_node
   if (!n) return '无主节点'
-  return `${n.name ?? n.node_id} · MT5 ${n.mt5_login ?? '?'} · ${n.online ? '在线' : '离线'}`
+  return `${n.name ?? n.node_id} · MT5 ${n.mt5_login ?? '?'}`
+}
+
+// ---------- 绩效（与 FollowView 同一套口径与展示）----------
+/** 绩效是否有真实成交数据（false = 节点没上线/同步未开，不是「赚 0」） */
+function perfOf(robot: AiRobotSummary): AiRobotSummary['performance'] {
+  return robot.performance
+}
+function hasPerf(robot: AiRobotSummary): boolean {
+  return !!robot.performance?.data_available
+}
+
+/** 跟单人数：优先后端算好的，回落到全量关系数 */
+function followerCountOf(robot: AiRobotSummary): number {
+  return robot.follower_count || robot.follower_node_count || 0
+}
+
+/** 数据新鲜度：绩效由预聚合任务刷新，必然滞后，UI 必须标注 */
+function updatedText(robot: AiRobotSummary): string {
+  const ts = robot.performance?.updated_at
+  if (!ts) return ''
+  const d = new Date(ts * 1000)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `数据更新于 ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+function fmtProfit(v: number): string {
+  return (v >= 0 ? '+' : '') + '$' + v.toFixed(2)
+}
+function fmtRate(v: number): string {
+  return (v >= 0 ? '+' : '') + v.toFixed(1) + '%'
 }
 
 // ---------- 加载 ----------
 async function loadRobots() {
   loading.value = true
   try {
-    const res = await fetchAiRobots(keyword.value.trim())
+    const res = await fetchAiRobots(keyword.value.trim(), perfWindow.value)
     robots.value = res.robots
   } catch (e) {
     ElMessage.error(errText(e, '加载机器人广场失败'))
@@ -210,7 +239,7 @@ async function openRobot(r: AiRobotSummary) {
   selectedGroupIds.value = []
   selectedNodeIds.value = []
   try {
-    detail.value = await fetchAiRobotDetail(r.leader_user_id)
+    detail.value = await fetchAiRobotDetail(r.leader_user_id, perfWindow.value)
     selectedGroupIds.value = allSelectableGroupIds.value
   } catch (e) {
     detail.value = null
@@ -227,6 +256,15 @@ function closeDetail() {
 async function refreshAll() {
   await Promise.all([loadRobots(), loadMine()])
 }
+
+// 统计窗口切换：重拉列表 + 当前详情（绩效是纯读缓存，切换零延迟）。
+// 不重拉「我的 AI 跟单」—— 它不含绩效，没必要跟着抖一下。
+watch(perfWindow, () => {
+  void loadRobots()
+  if (detail.value) {
+    void openRobot(detail.value.robot)
+  }
+})
 
 onMounted(() => {
   void refreshAll()
@@ -250,17 +288,28 @@ async function submitJoin() {
     ElMessage.warning('请选择至少一个可加入的分组')
     return
   }
-  const nodeIds = (detail.value.my_nodes ?? [])
-    .map((n) => n.node_id)
-    .filter((nid) => selectedNodeIds.value.includes(nid))
+  // 只提交「现在仍然可选」的节点。
+// 已跟过的节点虽然置灰禁用了，但 selectedNodeIds 里可能还留着它 —— 勾选是
+// 分组切换之前的事（先勾节点，再勾一个它已跟过的分组，那个勾就失效了）。
+// 这里再按禁用条件过滤一次，提交侧就不依赖 UI 有没有正确置灰。
+const nodeIds = (detail.value.my_nodes ?? [])
+  .filter((n) => selectableNodeIds.value.has(n.node_id))
+  .map((n) => n.node_id)
+  .filter((nid) => selectedNodeIds.value.includes(nid))
+  .filter((nid) => !alreadyFollowingNodeIds.value.has(nid))
   if (!nodeIds.length) {
     ElMessage.warning('请选择至少一个可用节点（主节点不可跟单）')
     return
   }
-  if (alreadyFollowingNodeIds.value.size && nodeIds.some((n) => alreadyFollowingNodeIds.value.has(n))) {
+  // 预聚合勾选里混进了已跟过的节点（用户先勾后切分组导致）—— 告诉用户被剔除了哪些，
+  // 而不是静默丢弃：静默少跟一个节点，用户事后对不上账。
+  const dropped = (detail.value.my_nodes ?? [])
+    .map((n) => n.node_id)
+    .filter((nid) => selectedNodeIds.value.includes(nid) && alreadyFollowingNodeIds.value.has(nid))
+  if (dropped.length) {
     if (!(await new Promise<boolean>((resolve) => {
       ElMessageBox.confirm(
-        '所选节点中包含已跟单该机器人的节点，会跳过重复项。是否继续？',
+        `所选节点中 ${dropped.length} 个已跟过该机器人的分组，本次将自动跳过。是否继续？`,
         '部分节点已跟',
         { type: 'warning', confirmButtonText: '继续', cancelButtonText: '取消' },
       )
@@ -270,10 +319,7 @@ async function submitJoin() {
   }
   if (!(await new Promise<boolean>((resolve) => {
     ElMessageBox.confirm(
-      '确认跟单该 AI 机器人？\n\n'
-        + '你的节点将按机器人设定的完整手数执行 AI 加仓。\n'
-        + '机器人主人修改策略会实时同步到你在跑的任务，无法锁定。\n'
-        + '移出跟单不会自动平仓，在跑任务会继续运行至结束。',
+      '确认跟单该 AI 机器人？',
       '确认跟单',
       {
         type: 'warning',
@@ -294,7 +340,7 @@ async function submitJoin() {
     })
     ElMessage.success(`已加入 ${res.joined.length} 个分组`)
     await refreshAll()
-    detail.value = await fetchAiRobotDetail(detail.value.robot.leader_user_id)
+    detail.value = await fetchAiRobotDetail(detail.value.robot.leader_user_id, perfWindow.value)
     selectedGroupIds.value = allSelectableGroupIds.value
   } catch (e) {
     ElMessage.error(errText(e, '加入 AI 跟单失败'))
@@ -308,13 +354,11 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
   if (!groupIds.length) return
   const ok = await new Promise<boolean>((resolve) => {
     ElMessageBox.confirm(
-      '确认移出 AI 跟单？\n\n'
-        + '移出后关系解除，不再下发新信号。\n'
-        + '**已有任务不会自动平仓**，将由 node_client 继续按策略运行至结束。',
+      '确认移出 AI 跟单？',
       '确认移出',
       {
         type: 'warning',
-        confirmButtonText: '移出（不停止在跑任务）',
+        confirmButtonText: '移出',
         cancelButtonText: '取消',
         customClass: 'ai-leave-confirm',
       },
@@ -344,7 +388,7 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     ElMessage.success(msg)
     await refreshAll()
     if (detail.value?.robot.leader_user_id === robot.leader_user_id) {
-      detail.value = await fetchAiRobotDetail(robot.leader_user_id)
+      detail.value = await fetchAiRobotDetail(robot.leader_user_id, perfWindow.value)
     }
   } catch (e) {
     ElMessage.error(errText(e, '移出 AI 跟单失败'))
@@ -360,13 +404,32 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
       <section class="panel">
         <header class="panel-head">
           <h2>AI 机器人广场</h2>
+          <span class="muted" style="font-size: 12px; margin-left: auto">{{ robots.length }} 个</span>
+        </header>
+        <!-- 统计窗口：所有机器人同一窗口，否则没法横向比较 -->
+        <div class="win-row">
+          <span class="muted win-label">统计窗口</span>
+          <div class="win-btns">
+            <button
+              v-for="opt in WINDOW_OPTIONS"
+              :key="opt.value"
+              class="btn-sm"
+              :class="perfWindow === opt.value ? 'btn-primary' : 'btn-ghost'"
+              :disabled="loading"
+              @click="perfWindow = opt.value"
+            >
+              {{ opt.label }}
+            </button>
+          </div>
+        </div>
+        <div class="search-row">
           <input
             v-model="keyword"
             placeholder="搜索用户名 / 显示名 / 主节点名 / MT5 号"
             @keyup.enter="loadRobots"
           />
           <button class="btn-sm" :disabled="loading" @click="loadRobots">搜索</button>
-        </header>
+        </div>
 
         <div v-if="loading" class="empty">加载中…</div>
         <div v-else-if="!robots.length" class="empty">暂无机器人</div>
@@ -380,23 +443,48 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
           >
             <div class="robot-head">
               <span class="robot-name">{{ r.display_name || r.username }}</span>
-              <span class="muted">@{{ r.username }}</span>
             </div>
             <div class="robot-sub">
               <span>{{ primaryText(r) }}</span>
             </div>
-            <div class="robot-risk">
-              <span class="risk-label">风险上限</span>
-              <span>批次 {{ fmtIntNullable(r.max_allow_num) }}</span>
-              <span>手数 {{ fmtNullable(r.total_lot_limit, '', 2) }}</span>
-            </div>
-            <div class="robot-meta">
-              <span class="muted">AI 分组 {{ r.ai_group_count }}</span>
-              <span class="muted">被跟 {{ r.follower_node_count }}</span>
-              <span
-                v-if="r.my_follow_group_count > 0"
-                class="badge ok"
-              >已跟 {{ r.my_follow_group_count }} 组 / {{ r.my_follow_node_count }} 节点</span>
+
+            <!-- 绩效（主节点口径）：与 FollowView 带单广场同一套组件与口径 -->
+            <div class="leader-stats">
+              <div class="ls-hero">
+                <div class="ls-hero-main">
+                  <span class="ls-hero-k">累计收益</span>
+                  <span v-if="!hasPerf(r)" class="ls-hero-v muted">暂无数据</span>
+                  <span v-else class="ls-hero-v" :class="perfOf(r).total_profit >= 0 ? 'pos' : 'neg'">
+                    {{ fmtProfit(perfOf(r).total_profit) }}
+                  </span>
+                </div>
+                <div class="ls-hero-side">
+                  <span class="ls-hero-k">收益率</span>
+                  <span v-if="!hasPerf(r)" class="ls-hero-sub muted">暂无数据</span>
+                  <span v-else-if="!perfOf(r).profit_rate_valid" class="ls-hero-sub muted">—</span>
+                  <span
+                    v-else
+                    class="ls-hero-sub"
+                    :class="perfOf(r).profit_rate >= 0 ? 'pos' : 'neg'"
+                  >
+                    {{ fmtRate(perfOf(r).profit_rate) }}
+                  </span>
+                </div>
+              </div>
+
+              <div class="ls-mini-row">
+                <div class="ls-mini">
+                  <span class="ls-mini-k">胜率</span>
+                  <span v-if="!hasPerf(r)" class="ls-mini-v muted">暂无数据</span>
+                  <span v-else class="ls-mini-v">{{ perfOf(r).win_rate.toFixed(2) }}%</span>
+                </div>
+                <div class="ls-mini">
+                  <span class="ls-mini-k">跟单人数</span>
+                  <span class="ls-mini-v">{{ followerCountOf(r) }} 人</span>
+                </div>
+              </div>
+
+              <div v-if="updatedText(r)" class="ls-updated muted">{{ updatedText(r) }}</div>
             </div>
           </li>
         </ul>
@@ -407,7 +495,7 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
         <header class="panel-head">
           <h2>
             <template v-if="detail">{{ detail.robot.display_name || detail.robot.username }} 的 AI 分组</template>
-            <template v-else>详情 / 我的 AI 跟单</template>
+            <template v-else>详情</template>
           </h2>
           <button v-if="detail" class="btn-sm" @click="closeDetail">关闭</button>
         </header>
@@ -418,24 +506,32 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
           <header class="robot-detail-head">
             <div>
               <span class="robot-name large">{{ detail.robot.display_name || detail.robot.username }}</span>
-              <span class="muted">@{{ detail.robot.username }}</span>
             </div>
             <div class="muted">{{ primaryText(detail.robot) }}</div>
           </header>
 
           <h3 class="sec-title">我的节点（可多选）</h3>
           <ul v-if="(detail.my_nodes ?? []).length" class="pick-list">
-            <li v-for="n in detail.my_nodes" :key="n.node_id" class="pick-item">
+            <!-- 已经跟着的节点：**不可勾选**（置灰）。
+                 跟单关系是 (group_id, node_id) 维度的，同一节点跟了 A 组仍然可以跟 B 组，
+                 所以「已跟过」必须落到**当前选中的分组**上（alreadyFollowingNodeIds）。
+                 把它做成 disabled 而不是只改样式：真正禁止勾选，提交时也不会带上。 -->
+            <li
+              v-for="n in detail.my_nodes"
+              :key="n.node_id"
+              class="pick-item"
+              :class="{ 'is-followed': alreadyFollowingNodeIds.has(n.node_id) }"
+            >
               <label>
                 <input
                   type="checkbox"
                   :value="n.node_id"
-                  :disabled="!selectableNodeIds.has(n.node_id)"
+                  :disabled="!selectableNodeIds.has(n.node_id) || alreadyFollowingNodeIds.has(n.node_id)"
                   v-model="selectedNodeIds"
                 />
                 <span class="pick-name">{{ n.name || n.node_id }}</span>
                 <span class="muted">MT5 {{ n.mt5_login ?? '?' }}</span>
-                <span v-if="alreadyFollowingNodeIds.has(n.node_id)" class="tag amber">已跟过</span>
+                <span v-if="alreadyFollowingNodeIds.has(n.node_id)" class="tag amber">已跟</span>
               </label>
             </li>
           </ul>
@@ -450,7 +546,7 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
           </div>
         </div>
 
-        <div v-else class="empty muted">从左侧选一个机器人查看详情</div>
+        <div v-else class="empty muted">选一个机器人查看详情</div>
 
         <!-- 我的 AI 跟单 -->
         <header class="panel-head sub">
@@ -465,27 +561,23 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
           <li v-for="e in myFollowing" :key="e.robot.leader_user_id" class="mine-block">
             <header class="mine-head">
               <span class="robot-name">{{ e.robot.display_name || e.robot.username }}</span>
-              <span class="muted">@{{ e.robot.username }}</span>
               <span v-if="e.marketable" class="tag ok">运行中</span>
               <span v-else class="tag amber">已下架</span>
             </header>
+            <!-- 这里只回答「我跟着哪些节点跑」+「怎么退」。
+                 分组 / 活跃任务 / 手数上限不展示：分组与手数上限是机器人主人的
+                 策略参数（不是我的持仓），活跃任务是对方侧的运行态，退单时看它没意义。
+                 节点的所属分组仍留在数据里 —— 移出时必须一次性清干净。 -->
             <table class="mine-table">
               <thead>
-                <tr><th>分组</th><th>节点</th><th>活跃任务</th><th>手数上限</th><th></th></tr>
+                <tr><th>节点</th><th></th></tr>
               </thead>
               <tbody>
                 <tr v-for="n in e.nodes" :key="e.robot.leader_user_id + '|' + n.node_id">
                   <td>
-                    <span v-for="(g, gi) in n.groups" :key="g.group_id">
-                      {{ gi > 0 ? '、' : '' }}{{ g.group_name || g.group_id }}
-                    </span>
-                  </td>
-                  <td>
                     {{ n.name || n.node_id }}
                     <span class="muted">· MT5 {{ n.mt5_login ?? '?' }}</span>
                   </td>
-                  <td>{{ n.active_task_count }}</td>
-                  <td>{{ fmtNullable(n.batch_limit, '', 0) }}</td>
                   <td>
                     <button
                       v-if="e.marketable"
@@ -569,6 +661,134 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
 .robot-card:hover { border-color: var(--primary); }
 .robot-card.active { border-color: var(--primary); background: rgba(64, 158, 255, 0.06); }
 
+/* 统计窗口 + 搜索：窄栏（280~380px）里各占一行，别和标题挤在一起 */
+.win-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.win-label { font-size: 12px; white-space: nowrap; }
+.win-btns {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.search-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.search-row input { flex: 1; min-width: 0; }
+
+/* ── 绩效统计（与 FollowView 带单广场同一套 DOM 与样式）───────── */
+.leader-stats {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--glass-border);
+}
+
+.ls-hero {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+.ls-hero-main {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+.ls-hero-side {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.ls-hero-k {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.ls-hero-v {
+  font-size: 16px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  letter-spacing: -0.01em;
+}
+.ls-hero-v.pos { color: var(--green); }
+.ls-hero-v.neg { color: var(--red); }
+.ls-hero-sub {
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.ls-hero-sub.pos { color: var(--green); }
+.ls-hero-sub.neg { color: var(--red); }
+
+.ls-mini-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+.ls-mini {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
+  min-width: 0;
+  padding: 4px 8px;
+  background: var(--glass);
+  border: 1px solid var(--glass-border);
+  border-radius: 6px;
+}
+.ls-mini-k {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.ls-mini-v {
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ls-updated {
+  font-size: 11px;
+  text-align: right;
+}
+
+/* 手机端：主指标再放大一档，hero 换行避免数字被挤压 */
+@media (max-width: 480px) {
+  .ls-hero {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
+  }
+  .ls-hero-main { justify-content: space-between; }
+  .ls-hero-side {
+    justify-content: space-between;
+    padding-top: 4px;
+    border-top: 1px solid rgba(255, 255, 255, 0.04);
+  }
+  .ls-hero-v { font-size: 20px; }
+  .ls-hero-sub { font-size: 13px; }
+  .ls-mini { padding: 5px 8px; }
+}
+
 .robot-head {
   display: flex;
   align-items: baseline;
@@ -645,6 +865,18 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
   gap: 8px;
   cursor: pointer;
 }
+/* 已跟过的节点：置灰 + 光标变 not-allowed，让「点不动」一眼可辨，
+   而不是让人反复点才发现 checkbox 灰了。
+   只压暗「节点信息」，不压暗整行 —— 整行 opacity 会连「已跟过」标签一起淡下去，
+   标签正是这里唯一说明原因的东西，必须保持可读。 */
+.pick-item.is-followed {
+  background: transparent;
+  border-style: dashed;
+}
+.pick-item.is-followed label { cursor: not-allowed; }
+.pick-item.is-followed .pick-name,
+.pick-item.is-followed .muted { opacity: 0.45; }
+.pick-item input:disabled { cursor: not-allowed; }
 .pick-name { font-weight: 600; }
 .pick-sub { font-size: 12px; margin-left: 24px; }
 
@@ -704,6 +936,8 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
   border-bottom: 1px dashed var(--glass-border);
 }
 .mine-table th { font-weight: 600; color: var(--muted); }
+/* 末列是操作按钮：贴右，不要被节点名挤走 */
+.mine-table th:last-child, .mine-table td:last-child { text-align: right; white-space: nowrap; }
 
 .badge {
   padding: 1px 6px;

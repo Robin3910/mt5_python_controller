@@ -11,6 +11,9 @@
 //   要排查派发结果请去信号事件页。
 // - **统计条用后端返回的 summary**，不要在前端自己算 —— 后端与 items
 //   用同一 WHERE 条件，前端再算一遍必然对不上。
+// - **样式必须自带**：本组件被父页面以 scoped CSS 包裹使用，父页面的
+//   scoped 规则不会作用到子组件内部。所以这里所有用到的类都在本文件里
+//   重新定义一份（不依赖父页面的 .pos-table / .dir-tag / .pager-* 等）。
 import { computed, onMounted, ref, watch } from 'vue'
 import { useHubStore } from '@/stores/hub'
 import type { DealRecord, DealSummary } from '@/api/types'
@@ -123,11 +126,21 @@ async function goPage(p: number): Promise<void> {
 }
 
 // ── 展示辅助 ──
+function pad2(n: number): string {
+  return String(n).padStart(2, '0')
+}
+
 function fmtTime(ts: number | null | undefined): string {
   if (!ts || !isFinite(ts)) return '—'
   const d = new Date(ts * 1000)
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`
+}
+
+/** 手机端用的紧凑时间：省掉年份，保留月-日 时:分:秒 */
+function fmtShortTime(ts: number | null | undefined): string {
+  if (!ts || !isFinite(ts)) return '—'
+  const d = new Date(ts * 1000)
+  return `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`
 }
 
 function fmtPrice(n: number, sym: string): string {
@@ -174,6 +187,11 @@ function dirLabel(d: DealRecord): string {
   return '—'
 }
 
+/** 开/平标签的样式类（entry_type 小写） */
+function entryClass(d: DealRecord): string {
+  return (d.entry_type || '').toLowerCase()
+}
+
 /** MT5 DEAL_REASON 的人读标签 */
 const REASON_LABELS: Record<number, string> = {
   0: '客户端',
@@ -193,8 +211,7 @@ function updatedText(): string {
   const ts = summary.value?.updated_at
   if (!ts) return ''
   const d = new Date(ts * 1000)
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `数据更新于 ${pad(d.getHours())}:${pad(d.getMinutes())}`
+  return `数据更新于 ${pad2(d.getHours())}:${pad2(d.getMinutes())}`
 }
 </script>
 
@@ -240,7 +257,7 @@ function updatedText(): string {
 
     <!-- 筛选器 -->
     <div class="deals-filters">
-      <select v-model="filterDays" class="df-select">
+      <select v-model="filterDays" class="df-select" aria-label="按时间范围筛选">
         <option :value="0">全部时间</option>
         <option :value="1">今天</option>
         <option :value="7">近 7 天</option>
@@ -275,7 +292,7 @@ function updatedText(): string {
       </select>
       <button
         v-if="hasFilter"
-        class="btn-sm btn-ghost"
+        class="btn-sm btn-ghost df-clear"
         type="button"
         @click="
           filterSymbol = ''; filterDirection = ''; filterEntry = ''; filterSource = ''; filterDays = 0
@@ -299,9 +316,9 @@ function updatedText(): string {
       <div v-if="!stats?.data_available" class="muted">节点尚未上报成交数据</div>
     </div>
     <template v-else>
-      <!-- 桌面端：表格 -->
-      <div class="pos-table-wrap">
-        <table class="pos-table deals-table">
+      <!-- 桌面端：表格（窄屏由媒体查询切成下方卡片） -->
+      <div class="deals-table-wrap">
+        <table class="deals-table">
           <thead>
             <tr>
               <th>时间</th>
@@ -325,7 +342,7 @@ function updatedText(): string {
                 <span class="dir-tag" :class="dirClass(d)">{{ dirLabel(d) }}</span>
               </td>
               <td>
-                <span class="deal-entry" :class="d.entry_type.toLowerCase()">{{ d.entry_label }}</span>
+                <span class="deal-entry" :class="entryClass(d)">{{ d.entry_label }}</span>
                 <span v-if="d.reason" class="muted deal-reason" :title="`DEAL_REASON=${d.reason}`">
                   {{ reasonLabel(d.reason) }}
                 </span>
@@ -335,29 +352,60 @@ function updatedText(): string {
               <td class="num pnl mono" :class="pnlClass(d.net_profit)">{{ fmtMoney(d.net_profit) }}</td>
               <td class="num mono muted">{{ d.commission.toFixed(2) }}</td>
               <td class="num mono muted">{{ d.swap.toFixed(2) }}</td>
-              <td><span class="deal-source">{{ d.source_label }}</span></td>
+              <td><span class="deal-source">{{ d.source_label || '—' }}</span></td>
               <td class="num mono muted">{{ d.deal_id }}</td>
             </tr>
           </tbody>
         </table>
       </div>
 
-      <!-- 手机端：卡片列表 -->
-      <div class="pos-cards">
-        <div v-for="d in items" :key="d.id" class="pos-card">
-          <div class="pos-card-row1">
-            <div class="pos-card-left">
-              <span class="mono strong">{{ d.symbol || '—' }}</span>
+      <!-- 手机端：卡片列表（一卡一成交，信息不丢） -->
+      <div class="deals-cards">
+        <div v-for="d in items" :key="`m-${d.id}`" class="deal-card">
+          <div class="deal-card-top">
+            <div class="deal-card-head">
+              <span class="mono strong deal-card-sym">{{ d.symbol || '—' }}</span>
               <span class="dir-tag" :class="dirClass(d)">{{ dirLabel(d) }}</span>
-              <span class="deal-entry" :class="d.entry_type.toLowerCase()">{{ d.entry_label }}</span>
+              <span class="deal-entry" :class="entryClass(d)">{{ d.entry_label }}</span>
             </div>
-            <div class="pos-card-pnl mono" :class="pnlClass(d.net_profit)">
+            <div class="deal-card-pnl mono" :class="pnlClass(d.net_profit)">
               {{ fmtMoney(d.net_profit) }}
             </div>
           </div>
-          <div class="pos-card-row2 muted mono">
-            {{ fmtTime(d.deal_time) }} · {{ fmtVolume(d.volume) }} 手 ·
-            @{{ fmtPrice(d.price, d.symbol || '') }} · {{ d.source_label }}
+
+          <div class="deal-card-grid">
+            <div class="dc-kv">
+              <span class="dc-k">时间</span>
+              <span class="dc-v mono">{{ fmtShortTime(d.deal_time) }}</span>
+            </div>
+            <div class="dc-kv">
+              <span class="dc-k">手数</span>
+              <span class="dc-v mono">{{ fmtVolume(d.volume) }}</span>
+            </div>
+            <div class="dc-kv">
+              <span class="dc-k">成交价</span>
+              <span class="dc-v mono">{{ fmtPrice(d.price, d.symbol || '') }}</span>
+            </div>
+            <div class="dc-kv">
+              <span class="dc-k">手续费</span>
+              <span class="dc-v mono muted">{{ d.commission.toFixed(2) }}</span>
+            </div>
+            <div class="dc-kv">
+              <span class="dc-k">隔夜利息</span>
+              <span class="dc-v mono muted">{{ d.swap.toFixed(2) }}</span>
+            </div>
+            <div class="dc-kv">
+              <span class="dc-k">来源</span>
+              <span class="dc-v">{{ d.source_label || '—' }}</span>
+            </div>
+            <div class="dc-kv">
+              <span class="dc-k">成交号</span>
+              <span class="dc-v mono muted">{{ d.deal_id }}</span>
+            </div>
+            <div v-if="d.reason" class="dc-kv">
+              <span class="dc-k">原因</span>
+              <span class="dc-v muted">{{ reasonLabel(d.reason) }}</span>
+            </div>
           </div>
         </div>
       </div>
@@ -377,6 +425,9 @@ function updatedText(): string {
 
 <style scoped>
 .deals { display: flex; flex-direction: column; gap: 10px; }
+
+.mono { font-family: var(--mono); }
+.strong { font-weight: 700; }
 
 /* ── 统计条 ── */
 .deals-stats {
@@ -404,7 +455,9 @@ function updatedText(): string {
   align-items: center;
 }
 .df-select, .df-input {
-  height: 28px;
+  /* 全局 input/select 有 width:100%，这里必须显式覆盖，否则下拉框占满整行 */
+  width: auto;
+  height: 30px;
   padding: 0 8px;
   font-size: 12px;
   color: var(--text);
@@ -413,11 +466,59 @@ function updatedText(): string {
   border-radius: var(--radius-sm);
   outline: none;
 }
-.df-input { width: 100px; }
+.df-input { width: 96px; }
 .df-select:focus, .df-input:focus { border-color: var(--primary); }
+.df-clear { height: 30px; }
 
-/* ── 表格 ── */
-.deals-table { min-width: 1000px; }
+/* ── 桌面表格 ── */
+.deals-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm);
+  -webkit-overflow-scrolling: touch;
+}
+.deals-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 12px;
+  min-width: 1000px;
+}
+.deals-table thead th {
+  text-align: left;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: 0.04em;
+  padding: 8px 10px;
+  background: var(--glass);
+  border-bottom: 1px solid var(--glass-border);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  white-space: nowrap;
+}
+.deals-table thead th.num { text-align: right; }
+.deals-table thead th.pnl { text-align: right; }
+.deals-table tbody td {
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--glass-border);
+  color: var(--text);
+  font-size: 12px;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.deals-table tbody tr:last-child td { border-bottom: none; }
+.deals-table tbody tr:hover { background: rgba(255, 255, 255, 0.02); }
+.deals-table td.num { text-align: right; }
+.deals-table td.pnl { text-align: right; font-weight: 700; }
+.deals-table td.mono { font-family: var(--mono); }
+.deals-table td.strong { font-weight: 700; }
+.deals-table td.muted { color: var(--muted); }
+.deals-table td.pnl.pos { color: var(--green); }
+.deals-table td.pnl.neg { color: var(--red); }
+
+/* ── 标签 ── */
 .deal-entry {
   display: inline-block;
   padding: 2px 6px;
@@ -428,12 +529,181 @@ function updatedText(): string {
   color: var(--muted);
   border: 1px solid var(--glass-border);
 }
+.deal-entry.in { color: #93c5fd; border-color: rgba(147, 197, 253, 0.28); }
 .deal-entry.out { color: #fbbf24; border-color: rgba(251, 191, 36, 0.28); }
 .deal-entry.inout { color: #a78bfa; border-color: rgba(167, 139, 250, 0.28); }
+.deal-entry.out_by { color: #f472b6; border-color: rgba(244, 114, 182, 0.28); }
 .deal-reason { margin-left: 6px; font-size: 11px; }
 .deal-source { font-size: 11px; color: var(--muted); }
 
+.dir-tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  border: 1px solid transparent;
+}
+.dir-tag.buy { color: #fca5a5; background: rgba(239, 68, 68, 0.10); border-color: rgba(239, 68, 68, 0.28); }
+.dir-tag.sell { color: #6ee7b7; background: rgba(16, 185, 129, 0.10); border-color: rgba(16, 185, 129, 0.28); }
+
+/* ── 手机端卡片 ── */
+.deals-cards { display: none; }
+.deal-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--glass);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm);
+}
+.deal-card + .deal-card { margin-top: 8px; }
+.deal-card-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.deal-card-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+.deal-card-sym {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 45vw;
+}
+.deal-card-pnl {
+  font-size: 15px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+.deal-card-pnl.pos { color: var(--green); }
+.deal-card-pnl.neg { color: var(--red); }
+.deal-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+  gap: 6px 10px;
+}
+.dc-kv { display: flex; align-items: baseline; gap: 6px; min-width: 0; font-size: 12px; }
+.dc-k { color: var(--muted); font-size: 11px; flex-shrink: 0; }
+.dc-v {
+  color: var(--text);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dc-v.muted { color: var(--muted); font-weight: 500; }
+
+/* ── 空状态 / 加载 ── */
+.detail-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 32px 20px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.detail-empty svg { opacity: 0.35; }
+.dot-spin-lg {
+  width: 22px;
+  height: 22px;
+  border: 2px solid var(--glass-border);
+  border-top-color: var(--primary);
+  border-radius: 50%;
+  animation: deals-spin 0.8s linear infinite;
+}
+@keyframes deals-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ── 翻页器 ── */
+.hist-pager {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 12px;
+  font-size: 12px;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm);
+  background: var(--glass);
+}
+.pager-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 30px;
+  height: 28px;
+  padding: 0 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid var(--glass-border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.pager-btn:hover:not(:disabled) {
+  background: rgba(37, 99, 235, 0.10);
+  border-color: rgba(37, 99, 235, 0.4);
+  color: var(--primary);
+}
+.pager-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+.pager-info {
+  font-family: var(--mono);
+  font-weight: 600;
+  color: var(--text);
+  padding: 0 4px;
+  min-width: 50px;
+  text-align: center;
+}
+.pager-total {
+  margin-left: auto;
+  font-size: 11px;
+  font-family: var(--mono);
+}
+
+/* ── Responsive ── */
 @media (max-width: 768px) {
-  .ds-updated { margin-left: 0; width: 100%; }
+  /* 统计条：两列网格，避免 7 项挤成一行 */
+  .deals-stats {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px 12px;
+  }
+  .ds-item { justify-content: space-between; }
+  .ds-updated { margin-left: 0; grid-column: 1 / -1; }
+
+  /* 筛选器：两列网格，控件不再占满整行 */
+  .deals-filters {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+  .df-select, .df-input { width: 100%; height: 34px; }
+  .df-clear { width: 100%; }
+
+  /* 表格换成卡片 */
+  .deals-table-wrap { display: none; }
+  .deals-cards { display: block; }
+
+  /* 翻页器更紧凑 */
+  .hist-pager { flex-wrap: wrap; justify-content: center; }
+  .pager-total { width: 100%; margin-left: 0; text-align: right; }
+}
+
+@media (max-width: 420px) {
+  .deal-card-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .deal-card-sym { max-width: 38vw; }
 }
 </style>

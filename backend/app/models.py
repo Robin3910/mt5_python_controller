@@ -1164,6 +1164,15 @@ class AiRobotSummary(BaseModel):
     # 该机器人是否已对我关闭 AI 跟单（能力被撤销 / 分组下架）
     marketable: bool = True
     unmarketable_reason: Optional[str] = None
+    # —— 绩效（由主节点的成交聚合而来）——
+    # 口径 = **主节点**（不是名下全部节点）：AI 机器人的展示单位就是主节点
+    # （见类注释），用户点进去看的也是主节点账号的实盘，用全部节点会把
+    # 与该机器人无关的账户盈亏混进来，横向对比就失真了。
+    performance: DealSummary = Field(default_factory=DealSummary)
+    # 当前统计窗口（7d / 30d / 90d / all）
+    perf_window: str = "30d"
+    # 跟单人数（AI 市场内跟了该机器人的去重节点数）
+    follower_count: int = 0
 
 
 class AiRobotListResponse(BaseModel):

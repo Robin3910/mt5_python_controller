@@ -10,6 +10,13 @@
 「同一节点在订单历史页与带单页胜率不一致」。
 
 TTL 15min > 刷新周期 5min：后台任务偶发失败时，缓存里的旧值还能顶一阵。
+
+**两种口径**：
+- `K_LEADER_STATS`（带单页）：带单员名下**全部节点**的成交聚合；
+- `K_ROBOT_STATS`（AI 机器人页）：只聚合**主节点**。
+
+两者分开 key、共用同一个 `deal_stats.leader_batch_multi` 实现 —— 口径不同的
+是「聚合哪些节点」，聚合算法本身只有一份，不会漂移。
 """
 from __future__ import annotations
 
@@ -122,4 +129,40 @@ class LeaderStatsAggregator:
                 await store.set_leader_stats(uid, cached, AGG_TTL)
             written = len(leader_ids)
         logger.info("leader stats refreshed: %d leader(s)", written)
+        written += await self._refresh_robot_stats(store, users, all_nodes)
+        return written
+
+    async def _refresh_robot_stats(self, store: RedisStore, users: list, all_nodes: list[dict]) -> int:
+        """AI 机器人的绩效预聚合 —— **主节点口径**，单独存一份。
+
+        与带单页的差别在**节点范围**：带单页聚合名下全部节点，AI 机器人页只聚合
+        主节点。AI 机器人的展示单位就是主节点（见 models.AiRobotSummary 类注释），
+        跟着它走的账户看到的也是主节点实盘；混进名下其它节点会让横向对比失真。
+
+        这里不能直接复用 `refresh()` 的 leader_nodes：那已经是「全部节点」了。
+        重新从 all_nodes 里挑主节点拼一份 {user_id: [primary_node_id]}，
+        仍然走 `leader_batch_multi` —— **一次查询**，口径实现与订单历史页同一套。
+        """
+        # user_id -> [主节点 node_id]（没有主节点的用户不入 map，leader_batch_multi 会给空统计）
+        robot_nodes: dict[int, list[str]] = {}
+        for n in all_nodes:
+            owner = permissions.normalize_owner(n.get("owner_user_id"))
+            if owner is None or not n.get("is_primary"):
+                continue
+            nid = n.get("node_id")
+            if nid:
+                robot_nodes.setdefault(owner, []).append(str(nid))
+        if not robot_nodes:
+            return 0
+
+        written = 0
+        for window in deal_stats.WINDOWS:
+            from_ts = deal_stats.window_start(window)
+            summaries = await deal_stats.leader_batch_multi(robot_nodes, from_ts, None)
+            for uid in robot_nodes:
+                cached = await store.get_robot_stats(uid) or {}
+                cached[window] = dict(summaries.get(uid) or {})
+                await store.set_robot_stats(uid, cached, AGG_TTL)
+            written = len(robot_nodes)
+        logger.info("robot stats refreshed: %d robot(s) (primary node only)", written)
         return written
