@@ -33,6 +33,7 @@ import time
 from typing import Optional
 
 from . import (
+    follow_rules,
     group_persist,
     group_rules,
     market_probe,
@@ -175,23 +176,36 @@ class GroupDispatcher:
     async def _effective_with_follows(
         self, group: dict, nodemap: dict[str, dict], online_ids: set[str],
         *, signal: Optional[TradingSignal] = None,
+        strategy: Optional[dict] = None,
     ) -> list[str]:
-        """本次分发的有效节点，串起 跟单员准入 与 节点定向（node_ids）。
+        """本次分发的有效节点，串起 跟单员准入 / 跟单市场准入 / 节点定向。
 
         三种情况处理准入（带单员是否仍有 follow_leader 能力）：
         1. 没有跟单成员 -> 跟改动前完全一致（owner 成员口径，零行为变化）；
         2. 有跟单成员 + 带单员仍有能力 -> owner 成员 + 跟单成员；
         3. 带单员已被撤销能力 -> 退回 owner 成员口径；已在跑的任务继续跑。
 
+        跟单市场准入：分组绑定的策略模版决定该分组属于哪个跟单市场
+        （带单市场 = 趋势 / 网格，AI 市场 = AI 智能加仓策略，两个市场互斥）。
+        跟单关系的市场 = 它所在分组的市场（一个分组只绑定一个策略），
+        所以 AI 分组的跟单员收 AI 信号、带单分组的跟单员收带单信号，
+        天然互不串台。模版未知（两个市场都不收）时保守退回 owner 口径 ——
+        宁可漏发也不误发。
+
         节点定向（OrderDialog「带单」关闭 / 节点定向 webhook）：
         信号带 node_ids 时，最终下发集合**按 node_ids 收窄**，
         留一个稳定的可解释口径：「带单关 ⇒ 主节点」「带单开 ⇒ 全部参与者」。
         空列表视为不限制。
         """
-        if group_rules.has_followers(group) and not await self._leader_still_enabled(group):
-            base = group_rules.owner_effective_node_ids(group, nodemap, online_ids)
-        else:
-            base = group_rules.effective_node_ids(group, nodemap, online_ids)
+        base = group_rules.effective_node_ids(group, nodemap, online_ids)
+        if group_rules.has_followers(group):
+            if not await self._leader_still_enabled(group):
+                base = group_rules.owner_effective_node_ids(group, nodemap, online_ids)
+            elif not follow_rules.market_for_template(
+                (strategy or {}).get("template_id"),
+            ):
+                # 未知模版：两个跟单市场都不收，跟单节点不接收新信号（保守）
+                base = group_rules.owner_effective_node_ids(group, nodemap, online_ids)
         if signal and getattr(signal, "node_ids", None):
             wanted = {str(n).strip().lower() for n in signal.node_ids if n}
             base = [nid for nid in base if nid.lower() in wanted]
@@ -576,7 +590,7 @@ class GroupDispatcher:
         """单个分组的处理：建主任务 -> 选节点 -> 逐节点抢占位并下发。"""
         mode = group_rules.normalize_dispatch_mode(group.get("dispatch_mode"))
         effective = await self._effective_with_follows(
-            group, nodemap, online_ids, signal=signal,
+            group, nodemap, online_ids, signal=signal, strategy=strategy,
         )
 
         snapshot = group_rules.strategy_rules_snapshot(strategy)

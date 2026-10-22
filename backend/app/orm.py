@@ -268,6 +268,10 @@ class NodeGroup(Base):
     # 限价挂单监听：把节点 MT5 上手动挂的限价单转成 strategy 信号（默认关；关键字默认为 limit，允许空）
     limit_watch_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     limit_watch_keyword: Mapped[str] = mapped_column(String(32), default="limit")
+    # AI 跟单开关：是否对外开放【AI 交易】广场的跟单（默认关）。
+    # 只对绑定 tpl_1（AI 智能加仓策略）的分组有意义；AI 加仓是持续加仓，
+    # 暴露一个参数激进的老分组代价远高于普通带单，所以默认关闭、需显式开启。
+    accept_ai_follow: Mapped[bool] = mapped_column(Boolean, default=False)
     # 一对一绑定 TradingStrategy；unique 保证同一策略不能挂到多个分组
     strategy_id: Mapped[str | None] = mapped_column(String(32), nullable=True, unique=True, index=True)
     remark: Mapped[str | None] = mapped_column(String(255), nullable=True)

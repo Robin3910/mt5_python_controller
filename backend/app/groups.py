@@ -155,6 +155,7 @@ async def _to_group_out(
         trend_risk_enabled=bool(d.get("trend_risk_enabled", False)),
         limit_watch_enabled=bool(d.get("limit_watch_enabled", False)),
         limit_watch_keyword=normalize_keyword(d.get("limit_watch_keyword")),
+        accept_ai_follow=bool(d.get("accept_ai_follow", False)),
         strategy_id=strategy_id,
         strategy_name=strategy_name,
         remark=d.get("remark"),
@@ -400,14 +401,39 @@ async def adopt_followers(
         return AdoptFollowersResponse(adopted=[], skipped=[], scanned_groups=0)
 
     all_groups = await store.all_groups()
-    # 用 is_leader_source_group（owner + 含主节点）而非 followable_groups，
-    # 后者带 enabled 过滤 —— 继承与「该分组是否对外接单」无关，故不过滤启用状态。
-    sources = [
-        g for g in (all_groups or [])
-        if isinstance(g, dict)
-        and str(g.get("group_id") or "") != str(group_id)
-        and follow_rules.is_leader_source_group(g, owner, primary)
-    ]
+    # 跨市场隔离：只继承**与目标分组同市场**的来源分组的跟单节点。
+    # 目标分组绑定的模版决定它属于哪个跟单市场（两个市场互斥）：
+    #   带单市场 = 趋势 / 网格    AI 交易市场 = AI 智能加仓策略
+    # 不收窄的话，带单员一旦开 AI 分组并触发继承，跟单员会被**静默**拉进
+    # AI 分组，开始用自己的钱执行 AI 加仓计划。
+    strategies = await follow_service._strategies_of(all_groups, store)
+    tmpl_map = follow_service._template_ids_of(strategies)
+    target_tid = tmpl_map.get(str(target.get("strategy_id") or ""))
+    market = follow_rules.market_for_template(target_tid)
+    if not market:
+        # 目标分组的模版**未知**（未绑策略 / 策略被删除）：无从判定市场，
+        # 保持既有继承行为 —— 这样的目标分组本身也不会被分发，不构成风险。
+        # 用 is_leader_source_group（owner + 含主节点）而非 followable_groups，
+        # 后者带 enabled 过滤 —— 继承与「该分组是否对外接单」无关，故不过滤启用状态。
+        sources = [
+            g for g in (all_groups or [])
+            if isinstance(g, dict)
+            and str(g.get("group_id") or "") != str(group_id)
+            and follow_rules.is_leader_source_group(g, owner, primary)
+        ]
+    else:
+        # 目标分组的模版**已知**（如 AI 智能加仓策略 tpl_1）：只继承**同市场**的
+        # 来源分组。模版未知的来源分组也排除 —— 它们的跟单节点是跟「别的策略」
+        # 建立的，搬到 AI 分组等于让跟单员在不知情下开始执行 AI 加仓计划。
+        sources = [
+            g for g in (all_groups or [])
+            if isinstance(g, dict)
+            and str(g.get("group_id") or "") != str(group_id)
+            and follow_rules.is_leader_source_group(g, owner, primary)
+            and follow_rules.template_in_market(
+                tmpl_map.get(str(g.get("strategy_id") or "")), market,
+            )
+        ]
     adopted, skipped = await follow_service.adopt_followers_for_group(
         store,
         target_group=target,

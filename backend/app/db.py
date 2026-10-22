@@ -156,6 +156,21 @@ def _migrate_node_group_limit_watch(sync_conn) -> None:
         )
 
 
+def _migrate_node_group_accept_ai_follow(sync_conn) -> None:
+    """node_group.accept_ai_follow：是否开放【AI 交易】广场的跟单（默认关闭）。"""
+    inspector = inspect(sync_conn)
+    if "node_group" not in inspector.get_table_names():
+        return
+    cols = {c["name"] for c in inspector.get_columns("node_group")}
+    if "accept_ai_follow" in cols:
+        return
+    dialect = sync_conn.engine.dialect.name
+    col_type = "TINYINT(1) NOT NULL DEFAULT 0" if dialect == "mysql" else "BOOLEAN NOT NULL DEFAULT 0"
+    sync_conn.execute(
+        text(f"ALTER TABLE node_group ADD COLUMN accept_ai_follow {col_type}")
+    )
+
+
 def _migrate_node_group_member_limit_watch(sync_conn) -> None:
     """node_group_member.limit_watch_report：成员是否作为限价监听触发来源（默认关）。"""
     inspector = inspect(sync_conn)
@@ -364,6 +379,7 @@ async def init_db() -> None:
         await conn.run_sync(_migrate_node_group_trend_risk)
         await conn.run_sync(_migrate_node_group_signal_concurrent)
         await conn.run_sync(_migrate_node_group_limit_watch)
+        await conn.run_sync(_migrate_node_group_accept_ai_follow)
         await conn.run_sync(_migrate_node_group_member_limit_watch)
         await conn.run_sync(_migrate_group_task_strategy_columns)
         await conn.run_sync(_migrate_node_risk_json)

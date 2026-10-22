@@ -100,15 +100,15 @@ async def _strategies_of(groups: list[dict], store: RedisStore) -> dict[str, dic
     读缓存，缺失的策略按「已停用」处理（调用方据此把分组标为不可选），
     不为一次列表请求去逐个回源查库。
     """
-    out: dict[str, dict] = {}
-    for sid in {g.get("strategy_id") for g in groups if g.get("strategy_id")}:
-        try:
-            s = await store.get_strategy(str(sid))
-        except Exception:  # noqa: BLE001
-            s = None
-        if s:
-            out[str(sid)] = s
-    return out
+    return await follow_service._strategies_of(groups, store)
+
+
+def _template_ids_of(strategies: dict[str, dict]) -> dict[str, str]:
+    """{strategy_id: strategy} -> {strategy_id: template_id}（跟单市场判定用）。
+
+    缺失的策略（已删除）不会出现在入参里，调用方据此把分组判为不可跟（保守）。
+    """
+    return follow_service._template_ids_of(strategies)
 
 
 async def _leader_ids_with_capability(
@@ -146,6 +146,9 @@ async def list_follow_leaders(
 
     all_groups = await store.all_groups()
     all_nodes = await store.all_nodes()
+    # 跟单市场判定所需的模版快照：一次批量读 Redis，不在循环里逐个查
+    strategies = await _strategies_of(all_groups, store)
+    tmpl_map = _template_ids_of(strategies)
     mine_by_leader: dict[int, list[dict]] = {}
     for f in await follow_service.list_followings(p.user_id):
         mine_by_leader.setdefault(int(f["leader_user_id"]), []).append(f)
@@ -166,6 +169,8 @@ async def list_follow_leaders(
             continue
         followable = follow_rules.followable_groups(
             all_groups, uid, primary.get("node_id"),
+            market=follow_rules.FOLLOW_MARKET_TEMPLATE_IDS,
+            strategy_templates_map=tmpl_map,
         )
         if not followable:
             continue
@@ -216,10 +221,26 @@ async def get_leader_detail(
         raise HTTPException(status_code=404, detail="该带单员尚无主节点")
 
     all_groups = await store.all_groups()
+    # 跟单市场判定所需的模版快照：一次批量读 Redis
+    all_strategies = await _strategies_of(all_groups, store)
+    tmpl_map = _template_ids_of(all_strategies)
+    # 市场内（可跟）：趋势 / 网格
     followable = follow_rules.followable_groups(
         all_groups, leader_user_id, primary.get("node_id"),
+        market=follow_rules.FOLLOW_MARKET_TEMPLATE_IDS,
+        strategy_templates_map=tmpl_map,
     )
-    strategies = await _strategies_of(followable, store)
+    # 市场外（AI 加仓等）：仅提示，不可选 —— 支撑「存量关系人工清理」需要看得见
+    followable_ids = {g["group_id"] for g in followable}
+    hidden = [
+        g for g in follow_rules.followable_groups(
+            all_groups, leader_user_id, primary.get("node_id"),
+            market=follow_rules.AI_MARKET_TEMPLATE_IDS,
+            strategy_templates_map=tmpl_map,
+        )
+        if g["group_id"] not in followable_ids
+    ]
+    strategies = all_strategies
     signal_counts = await group_persist.count_by_group()
     active_counts = await group_persist.count_active_by_group()
 
@@ -254,6 +275,33 @@ async def get_leader_detail(
             "unselectable_reason": reason,
         })
 
+    # 市场外分组（AI 加仓等）：置灰展示 + 原因，供「存量关系人工清理」看得见
+    hidden_groups = []
+    for g in sorted(hidden, key=follow_rules.leader_group_sort_key):
+        gid = g["group_id"]
+        strategy = strategies.get(g.get("strategy_id") or "")
+        hidden_groups.append({
+            "group_id": gid,
+            "name": g.get("name"),
+            "strategy_name": (strategy or {}).get("name"),
+            "strategy_template": (strategy or {}).get("template_name"),
+            "dispatch_mode": g.get("dispatch_mode", "sync"),
+            "signal_concurrent_enabled": bool(g.get("signal_concurrent_enabled")),
+            "trend_risk_enabled": bool(g.get("trend_risk_enabled")),
+            "enabled": bool(g.get("enabled", True)),
+            "member_count": len(g.get("members") or []),
+            "follower_count": len(g.get("followers") or []),
+            "online_count": _count_online(g),
+            "active_task_count": active_counts.get(gid, 0),
+            "signal_count": signal_counts.get(gid, 0),
+            "my_follow_node_ids": mine_by_group.get(gid, []),
+            "selectable": False,
+            "unselectable_reason": follow_rules.market_reject_reason(
+                (strategy or {}).get("template_id"),
+                follow_rules.FOLLOW_MARKET_TEMPLATE_IDS,
+            ) or "该分组不在普通跟单市场",
+        })
+
     mine = mine_by_group
     return FollowDetailOut(
         leader={
@@ -270,6 +318,7 @@ async def get_leader_detail(
             "marketable": True,
         },
         groups=detail_groups,
+        hidden_groups=hidden_groups,
         my_nodes=[_node_brief(n) for n in _viewable_follow_nodes(all_nodes, p)],
     )
 
@@ -291,6 +340,9 @@ async def list_my_followings(
     all_groups = {g["group_id"]: g for g in await store.all_groups()}
     all_nodes = await store.all_nodes()
     active_counts = await group_persist.count_active_by_group()
+    # 跟单市场判定所需的模版快照（存量 AI 分组的关系仍在，只是标不可跟）
+    strategies = await _strategies_of(list(all_groups.values()), store)
+    tmpl_map = _template_ids_of(strategies)
 
     by_leader: dict[int, list[dict]] = {}
     for f in followings:
@@ -316,6 +368,8 @@ async def list_my_followings(
                 continue  # 分组已被删除（理论上 delete_group 已级联），跳过
             reason = follow_rules.marketable_reason(
                 g, has_cap, primary.get("node_id") if primary else None,
+                template_id=tmpl_map.get(str(g.get("strategy_id") or "")),
+                market=follow_rules.FOLLOW_MARKET_TEMPLATE_IDS,
             )
             node_ids = {f["node_id"] for f in fs}
             groups_out.append({
@@ -409,14 +463,19 @@ async def join_follow(
     if not node_ids:
         raise HTTPException(status_code=400, detail="没有可用于跟单的节点（主节点不可跟单）")
 
-    # 分组：必须是该带单员名下、含其主节点、启用、策略启用
+    # 分组：必须是该带单员名下、含其主节点、启用、策略启用、且模版在**带单市场**内。
+    # 这是唯一的写入路径 —— 收窄到带单市场后，AI 分组就写不进跟单关系了。
     all_groups = await store.all_groups()
+    all_strategies = await _strategies_of(all_groups, store)
+    tmpl_map = _template_ids_of(all_strategies)
     followable = {
         g["group_id"]: g for g in follow_rules.followable_groups(
             all_groups, body.leader_user_id, leader_primary.get("node_id"),
+            market=follow_rules.FOLLOW_MARKET_TEMPLATE_IDS,
+            strategy_templates_map=tmpl_map,
         )
     }
-    strategies = await _strategies_of(list(followable.values()), store)
+    strategies = all_strategies
     joined: list[dict] = []
     for gid in body.group_ids:
         gid = str(gid or "").strip()

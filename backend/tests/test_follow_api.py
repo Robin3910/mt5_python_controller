@@ -885,3 +885,231 @@ def test_adopt_followers_skips_group_without_primary(client):
     assert data["scanned_groups"] == 1, "来源只含 a_group（手工组不含主节点，不算来源）"
     assert [a["from_group_id"] for a in data["adopted"]] == [a_group]
     assert _followers_of(client, manual, alice_h) == [b_follow]
+
+# ---------------------------------------------------------------------------
+# 跟单市场隔离（带单 tab 只收趋势 / 网格，AI 加仓走【AI 交易】tab）
+# ---------------------------------------------------------------------------
+def _mk_strategy(client, h, name: str, template_id: str, symbol: str = "XAUUSD") -> str:
+    """建策略；rules 不传则用模版默认规则。
+
+    网格模版（tpl_3）的默认规则不合法（格距 / 手数为 0），必须显式给一条可用规则。
+    """
+    payload: dict = {"name": name, "template_id": template_id, "symbol": symbol}
+    if template_id == "tpl_3":
+        payload["rules"] = [{
+            "type": 4, "status": 1, "action": "all",
+            "price_lower": 1.0, "price_upper": 1.1,
+            "grid_count": 10, "grid_mode": "arithmetic",
+            "grid_side": "long", "lot_per_grid": 0.01,
+            "total_lot_limit": 0.0, "trigger_price": 0.0,
+            "stop_lower": 0.0, "stop_upper": 0.0,
+            "close_on_stop": True, "prefill_enabled": True,
+            "trailing_up": False, "trailing_max": 0,
+        }]
+    r = client.post("/api/strategies", json=payload, headers=h)
+    assert r.status_code == 201, r.text
+    return r.json()["strategy_id"]
+
+
+def _mk_group_with_strategy(
+    client, h, node_ids: list[str], name: str, strategy_id: str,
+    *, accept_ai_follow: bool = False,
+) -> str:
+    r = client.post(
+        "/api/groups",
+        json={
+            "name": name, "node_ids": node_ids, "strategy_id": strategy_id,
+            "accept_ai_follow": accept_ai_follow,
+        },
+        headers=h,
+    )
+    assert r.status_code == 201, r.text
+    return r.json()["group_id"]
+
+
+def _setup_ai_leader(client, admin_h):
+    """alice 同时是带单员与 AI 主人：名下有一个 tpl_1（AI）分组 + 一个 tpl_3（网格）分组。
+
+    bob 是普通跟单员（持 follow_leader 无关，有 follow 菜单即可）。
+    返回 (alice, bob, a_primary, b_follow, ai_group, grid_group)
+    """
+    alice = _mk_user(client, admin_h, "alice")
+    bob = _mk_user(client, admin_h, "bob")
+
+    leader_role = _make_role(
+        client, admin_h, "leader", "带单员",
+        ["follow", "trading", "groups", "ai_trade"],
+        [CAP, "ai_strategy"],
+    )
+    plain_role = _make_role(
+        client, admin_h, "plain", "普通客户",
+        ["follow", "trading", "groups", "ai_trade"], [],
+    )
+    _bind_role(client, admin_h, alice["id"], leader_role["id"])
+    _bind_role(client, admin_h, bob["id"], plain_role["id"])
+
+    a_primary = _mk_node(client, admin_h, "alice-primary", 91001)
+    _mk_node(client, admin_h, "alice-extra", 91002, primary=False)
+    b_primary = _mk_node(client, admin_h, "bob-primary", 91003)
+    b_follow = _mk_node(client, admin_h, "bob-follow", 91004, primary=False)
+    assert _assign(client, admin_h, alice["id"], [a_primary], True).status_code == 200
+    assert _assign(client, admin_h, bob["id"], [b_primary, b_follow], True).status_code == 200
+
+    alice_h = _login(client, "alice")
+    ai_sid = _mk_strategy(client, alice_h, "alice-ai", "tpl_1")
+    grid_sid = _mk_strategy(client, alice_h, "alice-grid", "tpl_3", symbol="EURUSD")
+    # AI 分组必须开放 AI 跟单（accept_ai_follow 默认关），否则进不了机器人广场
+    ai_group = _mk_group_with_strategy(
+        client, alice_h, [a_primary], "alice-AI组", ai_sid, accept_ai_follow=True,
+    )
+    grid_group = _mk_group_with_strategy(
+        client, alice_h, [a_primary], "alice-网格组", grid_sid,
+    )
+    return alice, bob, a_primary, b_follow, ai_group, grid_group
+
+
+def test_leader_list_excludes_ai_only_leader(client):
+    """带单员**只有** tpl_1 分组 -> 不出现在【带单】列表（AI 市场不外露到带单 tab）。"""
+    admin_h = _login(client, "admin")
+    alice, bob, a_primary, b_follow, ai_group, grid_group = _setup_ai_leader(client, admin_h)
+
+    # 把网格分组删掉，只留 AI 分组
+    alice_h = _login(client, "alice")
+    d = client.delete(f"/api/groups/{grid_group}", headers=alice_h)
+    assert d.status_code == 200, d.text
+
+    bob_h = _login(client, "bob")
+    r = client.get("/api/follow/leaders", headers=bob_h)
+    assert r.status_code == 200, r.text
+    names = {x["username"] for x in r.json()["leaders"]}
+    assert "alice" not in names, "只有 AI 分组的带单员不应出现在带单列表"
+
+
+def test_leader_list_counts_only_follow_market_groups(client):
+    """带单员同时有 AI 分组与网格分组 -> 只计入网格分组（AI 分组不计入可跟数）。"""
+    admin_h = _login(client, "admin")
+    _setup_ai_leader(client, admin_h)
+
+    bob_h = _login(client, "bob")
+    r = client.get("/api/follow/leaders", headers=bob_h)
+    assert r.status_code == 200, r.text
+    leaders = r.json()["leaders"]
+    alice = next(x for x in leaders if x["username"] == "alice")
+    assert alice["followable_group_count"] == 1, "只有网格分组计入带单市场"
+
+
+def test_follow_join_rejects_ai_group(client):
+    """POST /api/follow/join 加入 tpl_1 分组 -> 400（市场互斥，写入侧拦截）。"""
+    admin_h = _login(client, "admin")
+    alice, bob, a_primary, b_follow, ai_group, grid_group = _setup_ai_leader(client, admin_h)
+
+    bob_h = _login(client, "bob")
+    r = client.post(
+        "/api/follow/join",
+        json={
+            "leader_user_id": alice["id"],
+            "group_ids": [ai_group],
+            "node_ids": [b_follow],
+        },
+        headers=bob_h,
+    )
+    assert r.status_code == 400, r.text
+
+
+def test_leader_detail_hides_ai_group_but_shows_hidden(client):
+    """详情：AI 分组不进 groups，但进 hidden_groups 且标不可选（存量关系需人工清理）。"""
+    admin_h = _login(client, "admin")
+    alice, bob, a_primary, b_follow, ai_group, grid_group = _setup_ai_leader(client, admin_h)
+
+    bob_h = _login(client, "bob")
+    r = client.get(f"/api/follow/leaders/{alice['id']}", headers=bob_h)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    visible = {g["group_id"] for g in body["groups"]}
+    hidden = {g["group_id"] for g in body.get("hidden_groups") or []}
+    assert ai_group not in visible, "AI 分组不得出现在可跟列表"
+    assert ai_group in hidden, "AI 分组应出现在 hidden_groups"
+    assert grid_group in visible
+    hid = next(g for g in body["hidden_groups"] if g["group_id"] == ai_group)
+    assert hid["selectable"] is False
+    assert hid["unselectable_reason"], "不可选必须给人读原因"
+
+
+def test_my_following_marks_ai_group_unmarketable(client):
+    """存量关系：AI 分组仍出现在【我的跟单】，但 marketable=false 且原因指向【AI 交易】。"""
+    admin_h = _login(client, "admin")
+    alice, bob, a_primary, b_follow, ai_group, grid_group = _setup_ai_leader(client, admin_h)
+
+    # 先用 AI tab 加入（带单 tab 加不进去）
+    bob_h = _login(client, "bob")
+    j = client.post(
+        "/api/ai-follow/join",
+        json={
+            "leader_user_id": alice["id"],
+            "group_ids": [ai_group],
+            "node_ids": [b_follow],
+        },
+        headers=bob_h,
+    )
+    assert j.status_code == 200, j.text
+
+    r = client.get("/api/follow/me", headers=bob_h)
+    assert r.status_code == 200, r.text
+    groups = [
+        g for f in r.json()["following"] for g in f["groups"]
+        if g["group_id"] == ai_group
+    ]
+    assert groups, "存量 AI 跟单关系应仍可见"
+    assert groups[0]["marketable"] is False
+    assert "AI" in groups[0]["unmarketable_reason"]
+
+
+def test_adopt_followers_does_not_cross_market(client):
+    """跨市场隔离：AI 分组不得继承网格分组的跟单节点（否则静默拉进 AI 加仓）。"""
+    admin_h = _login(client, "admin")
+    alice, bob, a_primary, b_follow, ai_group, grid_group = _setup_ai_leader(client, admin_h)
+
+    # bob 先跟网格分组（同一市场）
+    bob_h = _login(client, "bob")
+    assert client.post(
+        "/api/follow/join",
+        json={
+            "leader_user_id": alice["id"],
+            "group_ids": [grid_group],
+            "node_ids": [b_follow],
+        },
+        headers=bob_h,
+    ).status_code == 200
+
+    alice_h = _login(client, "alice")
+    # 认领继承：AI 分组不应拿到网格分组的跟单节点
+    data = _adopt(client, ai_group, alice_h).json()
+    assert data["adopted"] == [], "AI 分组不得继承网格分组的跟单节点"
+    assert _followers_of(client, ai_group, alice_h) == []
+
+
+def test_adopt_followers_still_works_within_same_market(client):
+    """同市场仍继承：网格分组认领继承网格分组的跟单节点（回归）。"""
+    admin_h = _login(client, "admin")
+    alice, bob, a_primary, b_follow, ai_group, grid_group = _setup_ai_leader(client, admin_h)
+
+    bob_h = _login(client, "bob")
+    assert client.post(
+        "/api/follow/join",
+        json={
+            "leader_user_id": alice["id"],
+            "group_ids": [grid_group],
+            "node_ids": [b_follow],
+        },
+        headers=bob_h,
+    ).status_code == 200
+
+    alice_h = _login(client, "alice")
+    # 一个策略只能绑一个分组 -> 另建一个同模版的网格策略来承载新分组
+    grid_sid2 = _mk_strategy(client, alice_h, "alice-grid-2", "tpl_3", symbol="EURUSD")
+    another = _mk_group_with_strategy(
+        client, alice_h, [a_primary], "alice-网格组2", grid_sid2,
+    )
+    data = _adopt(client, another, alice_h).json()
+    assert [a["node_id"] for a in data["adopted"]] == [b_follow], "同市场应继续继承"
+

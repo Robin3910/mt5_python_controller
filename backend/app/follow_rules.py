@@ -14,7 +14,80 @@ from __future__ import annotations
 from typing import Optional
 
 from . import group_rules
+from . import strategy_templates
 from .permissions import CAP_FOLLOW_LEADER, normalize_owner
+
+
+# ---------------------------------------------------------------------------
+# 跟单市场（模版白名单）
+# ---------------------------------------------------------------------------
+# 「跟单市场」= 允许被跟单的策略模版集合。两个市场**互斥**：
+#
+#   带单市场（FOLLOW）  = 趋势策略(tpl_2) + 网格策略(tpl_3)  -> 【带单】Tab
+#   AI 交易市场（AI）    = AI 智能加仓策略(tpl_1)              -> 【AI 交易】Tab
+#
+# 一个分组只绑定一个策略（node_group.strategy_id 唯一），所以一个分组只可能
+# 属于一个市场 —— 市场互斥由数据结构天然保证，不需要额外的标记字段。
+#
+# 白名单而非黑名单：未来新增模版默认**不**外露，需显式加入才进入某个市场。
+FOLLOW_MARKET_TEMPLATE_IDS: frozenset[str] = frozenset({
+    strategy_templates.TEMPLATE_2_ID,   # tpl_2 趋势策略（市价 / 现价开仓）
+    strategy_templates.TEMPLATE_3_ID,   # tpl_3 网格策略
+})
+
+AI_MARKET_TEMPLATE_IDS: frozenset[str] = frozenset({
+    strategy_templates.TEMPLATE_1_ID,   # tpl_1 AI 智能加仓策略
+})
+
+
+def template_in_market(template_id: object | None, market: frozenset[str]) -> bool:
+    """该策略模版是否属于指定跟单市场；白名单命中才算。
+
+    template_id 为空（未知模版）时返回 False —— 调用方据此「模版已知但不在市场」
+    与「模版未知」两种情况要分开处理，见 followable_groups 的注释。
+    """
+    if not template_id:
+        return False
+    return str(template_id).strip().lower() in market
+
+
+def template_out_of_market(template_id: object | None, market: frozenset[str]) -> bool:
+    """该模版**已知**且不在指定市场内。
+
+    与 template_in_market 相反的方向，用于「拒绝」判定。关键区别：
+    **模版未知（空）不算 out_of_market** —— 未绑定策略的分组、策略被删除的分组
+    都不据此判死，避免把「跟单员在跟一个还没配策略的分组」这种既有场景打掉。
+    """
+    if not template_id:
+        return False
+    return not template_in_market(template_id, market)
+
+
+def market_for_template(template_id: object | None) -> frozenset[str]:
+    """按分组绑定的模版决定它属于哪个跟单市场。
+
+    返回空集表示「两个市场都不收」（未知模版 / 未绑策略）—— 调用方据此
+    保守处理（跟单节点不接收新信号）。
+    """
+    tid = str(template_id or "").strip().lower()
+    if tid == strategy_templates.TEMPLATE_1_ID:
+        return AI_MARKET_TEMPLATE_IDS
+    if tid in (strategy_templates.TEMPLATE_2_ID, strategy_templates.TEMPLATE_3_ID):
+        return FOLLOW_MARKET_TEMPLATE_IDS
+    return frozenset()
+
+
+def market_reject_reason(template_id: object | None, market: frozenset[str]) -> Optional[str]:
+    """该模版不属于指定市场时的人读原因（详情页置灰提示用）。"""
+    if template_in_market(template_id, market):
+        return None
+    tid = str(template_id or "").strip().lower()
+    label = strategy_templates.live_template_name(tid, None) or tid or "未知策略"
+    if tid == strategy_templates.TEMPLATE_1_ID:
+        return f"「{label}」不在普通跟单市场，请在【AI 交易】页跟单"
+    if not tid:
+        return "该分组未绑定可用策略，暂不开放跟单"
+    return f"「{label}」暂不开放跟单"
 
 
 # ---------------------------------------------------------------------------
@@ -73,16 +146,44 @@ def is_leader_source_group(group: dict, leader_user_id: int, primary_node_id: Op
 
 def followable_groups(
     groups: list[dict], leader_user_id: int, primary_node_id: Optional[str],
+    *,
+    market: frozenset[str] = FOLLOW_MARKET_TEMPLATE_IDS,
+    strategy_templates_map: Optional[dict[str, str]] = None,
 ) -> list[dict]:
-    """带单员名下所有可被跟单的分组（启用 + 含主节点）。"""
+    """带单员名下所有可被跟单的分组（启用 + 含主节点 + 模版在市场白名单内）。
+
+    market：跟单市场的模版白名单。默认 = 普通带单市场（tpl_2 + tpl_3）；
+        传 AI_MARKET_TEMPLATE_IDS 即得【AI 交易】市场的可跟分组。
+    strategy_templates_map：{strategy_id: template_id} 快照，由调用方批量预取
+        （避免在循环里逐个查 Redis）。为 None 时**跳过模版判定**（仅供内部 / 测试用）。
+
+    这是带单市场 / AI 交易市场共用的**唯一**判定入口：列表、详情、join 三处
+    都走这里，改一个函数三处一起生效。
+    """
     if not primary_node_id:
         return []
-    return [
-        g for g in (groups or [])
-        if isinstance(g, dict)
-        and g.get("enabled", True)
-        and is_leader_source_group(g, leader_user_id, primary_node_id)
-    ]
+    out: list[dict] = []
+    for g in groups or []:
+        if not isinstance(g, dict):
+            continue
+        if not g.get("enabled", True):
+            continue
+        if not is_leader_source_group(g, leader_user_id, primary_node_id):
+            continue
+        sid = str(g.get("strategy_id") or "").strip()
+        if not sid:
+            # 未绑策略的分组：保持既有可跟单行为（不因市场判定被拒）。
+            # 它本来也不会被分发 —— _candidate_groups 见到未绑策略直接跳过。
+            out.append(g)
+            continue
+        if strategy_templates_map is not None:
+            tid = strategy_templates_map.get(sid)
+            # 只在模版**已知**且不属于本市场时才拒绝。模版未知（策略被删除）
+            # 保持既有行为，不在跟单侧判死 —— 分发侧另有保守处理。
+            if template_out_of_market(tid, market):
+                continue
+        out.append(g)
+    return out
 
 
 def is_displayable_leader(
@@ -148,16 +249,24 @@ def node_join_reject_reason(
 # ---------------------------------------------------------------------------
 def marketable_reason(
     group: dict, leader_has_capability: bool, primary_node_id: Optional[str],
+    template_id: object | None = None,
+    market: frozenset[str] = FOLLOW_MARKET_TEMPLATE_IDS,
 ) -> Optional[str]:
-    """该分组当前是否还在带单市场；下架时返回人读原因，可带单返回 None。
+    """
+    该分组当前是否还在指定市场；下架时返回人读原因，可跟单返回 None。
 
-    两种下架：带单员被撤销能力、分组不再包含其当前主节点（切换主节点后
-    旧分组不再对外接单）。跟单员仍可自行移出，这里只负责解释。
+    三种下架：带单员被撤销能力、分组不再包含其当前主节点（切换主节点后旧分组不再对外接单）、
+    分组绑定的模版不在该市场内（如 AI 智能加仓策略不在普通带单市场）。
+    跟单员仍可自行移出，这里只负责解释。
+
+    判断顺序：能力 / 主节点在前（更根本），模版市场其次，分组禁用最后。
     """
     if not leader_has_capability:
         return "该带单员已关闭带单，本分组不再下发新信号"
     if not group_contains_primary(group, primary_node_id):
         return "该带单员已更换主节点，本分组不再对外接单"
+    if template_out_of_market(template_id, market):
+        return market_reject_reason(template_id, market)
     if not group.get("enabled", True):
         return "分组已禁用"
     return None

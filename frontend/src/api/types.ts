@@ -431,6 +431,8 @@ export interface GroupOut {
   limit_watch_enabled: boolean
   /** 订单注释包含该关键字即视为触发单；空字符串表示不限注释；未填时新建默认 limit */
   limit_watch_keyword: string
+  /** 是否开放【AI 交易】广场的跟单（默认关）；只对绑定 AI 智能加仓策略(tpl_1)的分组有意义 */
+  accept_ai_follow: boolean
   /** 一对一绑定的策略 ID；未绑定为 null */
   strategy_id?: string | null
   /** 绑定策略名称（展示用） */
@@ -515,6 +517,8 @@ export interface GroupCreatePayload {
   trend_risk_enabled?: boolean
   limit_watch_enabled?: boolean
   limit_watch_keyword?: string
+  /** 是否开放【AI 交易】广场的跟单（默认关）；前端只对 tpl_1 分组展示。 */
+  accept_ai_follow?: boolean
   remark?: string | null
   /** 一对一绑定策略；空 / null = 不绑定 */
   strategy_id?: string | null
@@ -544,6 +548,8 @@ export interface GroupUpdatePayload {
   trend_risk_enabled?: boolean
   limit_watch_enabled?: boolean
   limit_watch_keyword?: string
+  /** 是否开放【AI 交易】广场的跟单（默认关） */
+  accept_ai_follow?: boolean
   remark?: string | null
   /** 传入空字符串或 null 表示解除绑定 */
   strategy_id?: string | null
@@ -1396,6 +1402,8 @@ export interface FollowNodeBrief {
   status: string | null
   enabled: boolean
   is_primary?: boolean
+  /** 主节点 / 机器人在场时附带；不带则表示未接入或离线聚合展示 */
+  online?: boolean
 }
 
 /** 带单员摘要：他的主节点就是带单源 */
@@ -1438,6 +1446,8 @@ export interface FollowGroupDetail {
 export interface FollowDetailResponse {
   leader: FollowLeaderSummary
   groups: FollowGroupDetail[]
+  /** 不在普通跟单市场内的分组（AI 加仓策略等）：仅提示，不可选 */
+  hidden_groups?: FollowGroupDetail[]
   /** 我可用于跟单的节点（已剔除主节点） */
   my_nodes: FollowNodeBrief[]
 }
@@ -1483,6 +1493,118 @@ export interface FollowLeavePayload {
 }
 
 export interface FollowLeaveResponse {
+  removed: { group_id: string; node_ids: string[] }[]
+  closing: { node_id: string; group_id: string; status: string; magic: number | null }[]
+  forced: { node_id: string; group_id: string; status: string; magic: number | null }[]
+  warning: string | null
+}
+
+// ===========================================================================
+// AI 交易（ai_follow）：跟随 AI 智能加仓策略的机器人
+// ===========================================================================
+
+/** 机器人广场摘要。展示单位 = 主人主节点；一个机器人挂若干 tpl_1 分组。 */
+export interface AiRobotSummary {
+  leader_user_id: number
+  username: string
+  display_name: string | null
+  primary_node: FollowNodeBrief | null
+  /** 已开放 AI 跟单的 tpl_1 分组数 */
+  ai_group_count: number
+  follower_node_count: number
+  my_follow_group_count: number
+  my_follow_node_count: number
+  /** 风险上限（取各分组最大值）—— 必须公开，跟单员不控手数 */
+  max_allow_num: number | null
+  total_lot_limit: number | null
+  marketable: boolean
+  unmarketable_reason: string | null
+}
+
+/** 机器人详情里的单个 AI 分组 */
+export interface AiRobotGroupDetail {
+  group_id: string
+  name: string | null
+  symbol: string | null
+  strategy_id: string | null
+  strategy_name: string | null
+  strategy_template: string | null
+  enabled: boolean
+  member_count: number
+  follower_count: number
+  online_count: number
+  active_task_count: number
+  signal_count: number
+  my_follow_node_ids: string[]
+  selectable: boolean
+  unselectable_reason: string | null
+  // AI 特有的风险参数（必须公开，跟单员不控手数）
+  risk_amount: number | null
+  max_allow_num: number | null
+  total_lot_limit: number | null
+  lot_times: number | null
+  point: number | null
+  // AI 智能加仓策略不支持信号并发
+  signal_concurrent_enabled: boolean
+  concurrent_unavailable_reason: string | null
+}
+
+export interface AiRobotDetailResponse {
+  robot: AiRobotSummary
+  groups: AiRobotGroupDetail[]
+  my_nodes: FollowNodeBrief[]
+}
+
+export interface AiRobotListResponse {
+  robots: AiRobotSummary[]
+}
+
+/** 我的 AI 跟单里一项（按分组维度） */
+export interface AiMyGroup {
+  group_id: string
+  group_name: string | null
+  symbol: string | null
+  strategy_id: string | null
+  marketable: boolean
+  unmarketable_reason: string | null
+  active_task_count: number
+  /** 批次已用 / 批次上限 —— AI 跟单员最需要盯的指标 */
+  batch_used: number
+  batch_limit: number
+  my_nodes: (FollowNodeBrief & { joined_at: number | null })[]
+}
+
+export interface AiMyRobot {
+  robot: AiRobotSummary
+  groups: AiMyGroup[]
+}
+
+export interface AiMeResponse {
+  following: AiMyRobot[]
+  summary: Record<string, number>
+}
+
+export interface AiJoinPayload {
+  leader_user_id: number
+  group_ids: string[]
+  node_ids: string[]
+}
+
+export interface AiJoinResponse {
+  joined: { group_id: string; group_name: string | null; node_ids: string[]; already_node_ids: string[] }[]
+  skipped: { node_id: string; group_id?: string; reason: string }[]
+  leader_primary_node_id: string | null
+}
+
+export interface AiLeavePayload {
+  leader_user_id: number
+  group_ids: string[]
+  node_ids: string[]
+  /** false = 在跑任务不停止，继续按策略运行至结束 */
+  close_tasks: boolean
+}
+
+export interface AiLeaveResponse {
   removed: { group_id: string; node_ids: string[] }[]
   closing: { node_id: string; group_id: string; status: string; magic: number | null }[]
   forced: { node_id: string; group_id: string; status: string; magic: number | null }[]

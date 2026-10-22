@@ -85,7 +85,11 @@ function logout(): void {
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
           <span>带单</span>
         </RouterLink>
-        <!-- 普通用户：其他菜单全收进「我的」枢纽页，仅保留首页/交易/带单/我的四个入口 -->
+        <RouterLink v-if="!auth.isAdmin && auth.hasMenu('ai_trade')" to="/ai-trade">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="8" width="16" height="12" rx="2"/><path d="M12 8V4"/><circle cx="12" cy="3" r="1.5"/><path d="M9 14h.01M15 14h.01M9.5 17h5"/></svg>
+          <span>AI 交易</span>
+        </RouterLink>
+        <!-- 普通用户：其他菜单全收进「我的」枢纽页，仅保留首页/交易/带单/AI交易/我的五个入口 -->
         <template v-if="!auth.isAdmin">
           <RouterLink to="/me">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
@@ -113,6 +117,10 @@ function logout(): void {
           <RouterLink v-if="auth.hasMenu('follow')" to="/follow">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
             <span>带单</span>
+          </RouterLink>
+          <RouterLink v-if="auth.hasMenu('ai_trade')" to="/ai-trade">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="8" width="16" height="12" rx="2"/><path d="M12 8V4"/><circle cx="12" cy="3" r="1.5"/><path d="M9 14h.01M15 14h.01M9.5 17h5"/></svg>
+            <span>AI 交易</span>
           </RouterLink>
           <RouterLink v-if="auth.hasMenu('permissions')" to="/permissions">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><circle cx="12" cy="10" r="2.5"/><path d="M8.5 16a3.5 3.5 0 0 1 7 0"/></svg>

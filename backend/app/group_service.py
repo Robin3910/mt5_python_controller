@@ -55,6 +55,7 @@ def group_row_to_dict(
         "limit_watch_keyword": normalize_keyword(
             getattr(row, "limit_watch_keyword", None),
         ),
+        "accept_ai_follow": bool(getattr(row, "accept_ai_follow", False)),
         "strategy_id": row.strategy_id,
         "remark": row.remark,
         "owner_user_id": row.owner_user_id,
@@ -320,6 +321,7 @@ async def create_group(
                 trend_risk_enabled=bool(payload.trend_risk_enabled),
                 limit_watch_enabled=watch_enabled,
                 limit_watch_keyword=watch_keyword,
+                accept_ai_follow=bool(payload.accept_ai_follow),
                 strategy_id=strategy_id,
                 remark=(payload.remark or "").strip() or None,
                 owner_user_id=owner,
@@ -374,6 +376,8 @@ async def update_group(store: RedisStore, group_id: str, patch: GroupUpdate) -> 
             row.signal_concurrent_enabled = False
         if patch.trend_risk_enabled is not None:
             row.trend_risk_enabled = bool(patch.trend_risk_enabled)
+        if patch.accept_ai_follow is not None:
+            row.accept_ai_follow = bool(patch.accept_ai_follow)
         if patch.remark is not None:
             row.remark = patch.remark.strip() or None
         if update_strategy:

@@ -32,6 +32,12 @@ const router = createRouter({
       meta: { menu: 'follow' },
     },
     {
+      path: '/ai-trade',
+      name: 'ai-trade',
+      component: () => import('@/views/AiTradeView.vue'),
+      meta: { menu: 'ai_trade' },
+    },
+    {
       path: '/',
       name: 'dashboard',
       component: () => import('@/views/DashboardView.vue'),

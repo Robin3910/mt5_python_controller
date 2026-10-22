@@ -103,6 +103,7 @@ const form = reactive({
   limit_watch_enabled: false,
   limit_watch_keyword: 'limit',
   limit_watch_node_ids: [] as string[],
+  accept_ai_follow: false,
   strategy_id: '' as string,
   remark: '',
   node_ids: [] as string[],
@@ -154,6 +155,10 @@ const formIsTrendStrategy = computed(() => formBoundStrategy.value?.template_id 
 /** 信号并发仅网格（tpl_3）、趋势（tpl_2）策略可用 */
 const formIsConcurrentStrategy = computed(
   () => formBoundStrategy.value?.template_id === 'tpl_2' || formBoundStrategy.value?.template_id === 'tpl_3',
+)
+/** AI 跟单开关仅 AI 智能加仓策略（tpl_1）有意义 —— 它归【AI 交易】Tab 承载 */
+const formIsAiStrategy = computed(
+  () => formBoundStrategy.value?.template_id === 'tpl_1',
 )
 
 const strategyTagOptions = computed(() => [
@@ -240,6 +245,7 @@ function openCreate(): void {
     limit_watch_enabled: false,
     limit_watch_keyword: 'limit',
     limit_watch_node_ids: [],
+    accept_ai_follow: false,
     strategy_id: '',
     remark: '',
     node_ids: [],
@@ -261,6 +267,7 @@ function openEdit(g: GroupOut): void {
     limit_watch_enabled: Boolean(g.limit_watch_enabled),
     limit_watch_keyword: g.limit_watch_keyword ?? '',
     limit_watch_node_ids: g.nodes.filter((n) => n.limit_watch_report).map((n) => n.node_id),
+    accept_ai_follow: Boolean(g.accept_ai_follow),
     strategy_id: g.strategy_id || '',
     remark: g.remark || '',
     node_ids: g.nodes.map((n) => n.node_id),
@@ -294,6 +301,7 @@ async function save(): Promise<void> {
       trend_risk_enabled: form.trend_risk_enabled,
       limit_watch_enabled: formIsTrendStrategy.value ? form.limit_watch_enabled : false,
       limit_watch_keyword: (form.limit_watch_keyword || '').trim(),
+      accept_ai_follow: formIsAiStrategy.value ? form.accept_ai_follow : false,
       strategy_id: strategyId,
       remark: form.remark.trim() || null,
       node_ids: form.node_ids,
@@ -312,6 +320,9 @@ async function save(): Promise<void> {
       (formIsTrendStrategy.value
         ? `限价监听：${form.limit_watch_enabled ? `开启（${watchKeywordLabel(form.limit_watch_keyword)}）` : '关闭'}\n`
           + `限价监听上报：${reportIds.length} 个\n`
+        : '') +
+      (formIsAiStrategy.value
+        ? `开放 AI 跟单：${form.accept_ai_follow ? '开启（会进入【AI 交易】广场）' : '关闭'}\n`
         : '') +
       `绑定策略：${styName}\n` +
       `成员节点：${form.node_ids.length} 个`
@@ -354,6 +365,24 @@ async function toggleTrendRisk(g: GroupOut): Promise<void> {
   await hub.updateGroup(
     g.group_id,
     { trend_risk_enabled: !g.trend_risk_enabled },
+    currentSearchOptions(),
+  )
+}
+
+function isAiGroup(g: GroupOut): boolean {
+  const sty = g.strategy_id ? hub.strategies.find((s) => s.strategy_id === g.strategy_id) : undefined
+  return sty?.template_id === 'tpl_1'
+}
+
+async function toggleAcceptAiFollow(g: GroupOut): Promise<void> {
+  const next = g.accept_ai_follow ? '关闭' : '开启'
+  const effect = g.accept_ai_follow
+    ? '本分组会从【AI 交易】广场消失，已建立的 AI 跟单关系保留、但不再接收新信号；在跑任务等待自然结束'
+    : '本分组将出现在【AI 交易】广场供其它用户跟单。AI 智能加仓策略会持续累积仓位，跟单员用自己的资金按你的策略执行'
+  if (!(await confirmAction(`确认${next}分组「${g.name}」的 AI 跟单开放？\n\n${next}后：${effect}。`))) return
+  await hub.updateGroup(
+    g.group_id,
+    { accept_ai_follow: !g.accept_ai_follow },
     currentSearchOptions(),
   )
 }
@@ -796,6 +825,21 @@ async function onStrategyFormSaved(): Promise<void> {
             <span v-else class="muted">—</span>
           </span>
         </div>
+        <div class="list-field">
+          <span class="k">开放 AI 跟单</span>
+          <span class="v">
+            <button
+              v-if="isAiGroup(g)"
+              class="btn-sm"
+              :class="g.accept_ai_follow ? 'btn-success' : 'btn-danger'"
+              :title="g.accept_ai_follow ? '已开放：分组进入【AI 交易】广场' : '已关闭：分组不进入【AI 交易】广场'"
+              @click="toggleAcceptAiFollow(g)"
+            >
+              {{ g.accept_ai_follow ? '已开放' : '已关闭' }}
+            </button>
+            <span v-else class="muted">—</span>
+          </span>
+        </div>
         <div v-if="g.limit_watch_enabled" class="list-field list-field-block">
           <span class="k">监听日志</span>
           <span class="v">
@@ -922,6 +966,20 @@ async function onStrategyFormSaved(): Promise<void> {
               @click="toggleLimitWatch(asGroup(row))"
             >
               {{ asGroup(row).limit_watch_enabled ? '开启' : '关闭' }}
+            </button>
+            <span v-else class="muted">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="AI 跟单" width="92">
+          <template #default="{ row }">
+            <button
+              v-if="isAiGroup(asGroup(row))"
+              class="btn-sm"
+              :class="asGroup(row).accept_ai_follow ? 'btn-success' : 'btn-danger'"
+              :title="asGroup(row).accept_ai_follow ? '已开放：分组进入【AI 交易】广场' : '已关闭：分组不进入【AI 交易】广场'"
+              @click="toggleAcceptAiFollow(asGroup(row))"
+            >
+              {{ asGroup(row).accept_ai_follow ? '开放' : '关闭' }}
             </button>
             <span v-else class="muted">—</span>
           </template>
@@ -1337,6 +1395,19 @@ async function onStrategyFormSaved(): Promise<void> {
                 v-model="form.limit_watch_keyword"
                 maxlength="32"
                 placeholder="留空则不限注释"
+              />
+            </div>
+            <div v-if="formIsAiStrategy">
+              <FormLabel
+                field-id="group-accept-ai-follow"
+                text="开放 AI 跟单"
+                help="开放后本分组会出现在【AI 交易】广场供其它用户跟单。AI 智能加仓策略会持续累积仓位，参数激进的老分组代价远高于普通带单，强烈建议仅对参数已经稳定、且你愿意长期对外开放的分组开启。"
+              />
+              <TagSelect
+                id="group-accept-ai-follow"
+                v-model="form.accept_ai_follow"
+                :options="SWITCH_TAGS"
+                aria-label="开放 AI 跟单"
               />
             </div>
             <div class="span-full">

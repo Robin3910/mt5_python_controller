@@ -232,6 +232,8 @@ class GroupCreate(BaseModel):
     # 限价挂单监听：仅绑定趋势策略的分组可开（默认关）；关键字默认 limit，空串表示不按注释过滤
     limit_watch_enabled: bool = False
     limit_watch_keyword: Optional[str] = Field(default=None, max_length=32)
+    # 是否开放【AI 交易】广场的跟单（默认关）；只对绑定 tpl_1 的分组有意义
+    accept_ai_follow: bool = False
     remark: Optional[str] = None
     # 一对一绑定交易策略；空 / null = 不绑定
     strategy_id: Optional[str] = Field(default=None, max_length=32)
@@ -249,6 +251,8 @@ class GroupUpdate(BaseModel):
     trend_risk_enabled: Optional[bool] = None
     limit_watch_enabled: Optional[bool] = None
     limit_watch_keyword: Optional[str] = Field(default=None, max_length=32)
+    # 是否开放【AI 交易】广场的跟单（默认关）；只对绑定 tpl_1 的分组有意义
+    accept_ai_follow: Optional[bool] = None
     remark: Optional[str] = None
     # 传入空字符串或 null 表示解除绑定；省略字段则不改
     strategy_id: Optional[str] = Field(default=None, max_length=32)
@@ -326,6 +330,8 @@ class GroupOut(BaseModel):
     limit_watch_enabled: bool = False
     # 空串 = 不按注释过滤；缺省展示仍是 limit
     limit_watch_keyword: str = "limit"
+    # 是否开放【AI 交易】广场的跟单（只对绑定 tpl_1 的分组有意义）
+    accept_ai_follow: bool = False
     strategy_id: Optional[str] = None
     strategy_name: Optional[str] = None
     remark: Optional[str] = None
@@ -1002,6 +1008,8 @@ class FollowGroupDetail(BaseModel):
 class FollowDetailOut(BaseModel):
     leader: FollowLeaderSummary
     groups: list[FollowGroupDetail]
+    # 不在普通跟单市场内的分组（AI 智能加仓策略等）：仅提示，不可选
+    hidden_groups: list[FollowGroupDetail] = Field(default_factory=list)
     my_nodes: list[dict] = Field(default_factory=list)
 
 
@@ -1051,6 +1059,122 @@ class FollowMyLeader(BaseModel):
 class FollowMeResponse(BaseModel):
     following: list[FollowMyLeader] = Field(default_factory=list)
     summary: dict = Field(default_factory=dict)
+
+
+# ── AI 交易（ai_follow）────────────────────────────────────────
+class AiRobotSummary(BaseModel):
+    """机器人广场里一个「机器人」的摘要。
+
+    展示单位 = 主节点：一位带单员的主节点即一个机器人，其名下绑定 tpl_1
+    且已开放 AI 跟单的分组挂在它下面。
+    """
+    leader_user_id: int
+    username: str
+    display_name: Optional[str] = None
+    primary_node: Optional[dict] = None
+    # 已开放 AI 跟单的 tpl_1 分组数
+    ai_group_count: int = 0
+    # 被多少个节点跟随（全量跟单关系）
+    follower_node_count: int = 0
+    my_follow_group_count: int = 0
+    my_follow_node_count: int = 0
+    # 机器人对外公开的风险上限（取各分组最大值）—— 跟单员不控手数，
+    # 必须能一眼看到风险量级（决策：不控手数的对价是公开风险参数）
+    max_allow_num: Optional[int] = None
+    total_lot_limit: Optional[float] = None
+    # 该机器人是否已对我关闭 AI 跟单（能力被撤销 / 分组下架）
+    marketable: bool = True
+    unmarketable_reason: Optional[str] = None
+
+
+class AiRobotListResponse(BaseModel):
+    robots: list[AiRobotSummary] = Field(default_factory=list)
+
+
+class AiRobotGroupDetail(BaseModel):
+    """机器人详情页的分组项（只含已开放 AI 跟单的 tpl_1 分组）。"""
+    group_id: str
+    name: Optional[str] = None
+    symbol: Optional[str] = None
+    strategy_id: Optional[str] = None
+    strategy_name: Optional[str] = None
+    strategy_template: Optional[str] = None
+    enabled: bool = True
+    member_count: int = 0
+    follower_count: int = 0
+    online_count: int = 0
+    active_task_count: int = 0
+    signal_count: int = 0
+    my_follow_node_ids: list[str] = Field(default_factory=list)
+    selectable: bool = True
+    unselectable_reason: Optional[str] = None
+    # AI 特有的风险参数（必须公开，跟单员不控手数）
+    risk_amount: Optional[float] = None
+    max_allow_num: Optional[int] = None
+    total_lot_limit: Optional[float] = None
+    lot_times: Optional[float] = None
+    point: Optional[float] = None
+    # AI 智能加仓策略不支持信号并发：同一节点同时只跑一单
+    signal_concurrent_enabled: bool = False
+    concurrent_unavailable_reason: Optional[str] = None
+
+
+class AiRobotDetailResponse(BaseModel):
+    robot: AiRobotSummary
+    groups: list[AiRobotGroupDetail] = Field(default_factory=list)
+    my_nodes: list[dict] = Field(default_factory=list)
+
+
+class AiMyGroup(BaseModel):
+    """我的 AI 跟单里一项（按分组维度）。"""
+    group_id: str
+    group_name: Optional[str] = None
+    symbol: Optional[str] = None
+    strategy_id: Optional[str] = None
+    marketable: bool = True
+    unmarketable_reason: Optional[str] = None
+    active_task_count: int = 0
+    # 批次已用 / 批次上限 —— AI 跟单员最需要盯的指标（决定还剩多少加仓空间）
+    batch_used: int = 0
+    batch_limit: int = 0
+    my_nodes: list[dict] = Field(default_factory=list)
+
+
+class AiMyRobot(BaseModel):
+    robot: AiRobotSummary
+    groups: list[AiMyGroup]
+
+
+class AiMeResponse(BaseModel):
+    following: list[AiMyRobot] = Field(default_factory=list)
+    summary: dict = Field(default_factory=dict)
+
+
+class AiJoinRequest(BaseModel):
+    leader_user_id: int = Field(ge=1)
+    group_ids: list[str] = Field(min_length=1, max_length=50)
+    node_ids: list[str] = Field(min_length=1, max_length=50)
+
+
+class AiJoinResponse(BaseModel):
+    joined: list[dict] = Field(default_factory=list)
+    skipped: list[dict] = Field(default_factory=list)
+    leader_primary_node_id: Optional[str] = None
+
+
+class AiLeaveRequest(BaseModel):
+    leader_user_id: int = Field(ge=1)
+    group_ids: list[str] = Field(min_length=1, max_length=50)
+    node_ids: list[str] = Field(min_length=1, max_length=50)
+    # False = 在跑任务不停止，继续按策略运行至结束（与带单同一口径）
+    close_tasks: bool = False
+
+
+class AiLeaveResponse(BaseModel):
+    removed: list[dict] = Field(default_factory=list)
+    closing: list[dict] = Field(default_factory=list)
+    forced: list[dict] = Field(default_factory=list)
+    warning: Optional[str] = None
 
 
 class UserOut(BaseModel):

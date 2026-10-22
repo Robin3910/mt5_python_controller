@@ -20,6 +20,7 @@ MENU_DASHBOARD = "dashboard"
 MENU_HOME = "home"
 MENU_TRADING = "trading"
 MENU_FOLLOW = "follow"
+MENU_AI_TRADE = "ai_trade"
 MENU_NODES = "nodes"
 MENU_TREND = "trend"
 MENU_GROUPS = "groups"
@@ -44,6 +45,7 @@ MENU_REGISTRY: tuple[MenuDef, ...] = (
     MenuDef(MENU_HOME, "首页", "/home", True),
     MenuDef(MENU_TRADING, "交易", "/trading", True),
     MenuDef(MENU_FOLLOW, "带单", "/follow", True),
+    MenuDef(MENU_AI_TRADE, "AI 交易", "/ai-trade", True),
     MenuDef(MENU_DASHBOARD, "总览", "/", True),
     MenuDef(MENU_NODES, "节点", "/nodes", True),
     MenuDef(MENU_TREND, "趋势面板", "/trend", True),
@@ -174,6 +176,18 @@ def can_be_leader(p: Principal) -> bool:
     不需要本能力；本能力只决定「我能否被别人跟」。
     """
     return can_capability(p, CAP_FOLLOW_LEADER)
+
+
+def can_host_ai_robot(p: Principal) -> bool:
+    """能否作为【AI 交易】广场的机器人主人：需同时持有 ai_strategy 与 follow_leader。
+
+    两个能力都要的语义：能配 AI 智能加仓策略（ai_strategy）+ 愿意对外接单（follow_leader）。
+    与 can_be_leader 的方向性说明互补 —— 跟单方向人人可做，本能力只决定「我能否当机器人主人」。
+
+    管理员直接放行（can_capability 内部已含 is_admin 分支）。
+    """
+    return (can_capability(p, CAP_AI_STRATEGY)
+            and can_capability(p, CAP_FOLLOW_LEADER))
 
 
 def is_ai_strategy_template(template_id: object | None) -> bool:

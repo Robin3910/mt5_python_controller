@@ -24,6 +24,36 @@ from .redis_store import RedisStore
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# 跟单市场判定所需的策略快照
+# ---------------------------------------------------------------------------
+# 放在本模块而非 follow_api：groups.py（adopt-followers 的跨市场隔离）也要用，
+# 而 groups.py 导入 follow_api 会形成循环依赖。
+async def _strategies_of(groups: list[dict], store: RedisStore) -> dict[str, dict]:
+    """分组绑定的策略快照 {strategy_id: strategy}（只取这些分组用到的）。
+
+    读缓存，缺失的策略按「已停用」处理（调用方据此把分组标为不可选），
+    不为一次列表请求去逐个回源查库。
+    """
+    out: dict[str, dict] = {}
+    for sid in {g.get("strategy_id") for g in groups if g.get("strategy_id")}:
+        try:
+            s = await store.get_strategy(str(sid))
+        except Exception:  # noqa: BLE001
+            s = None
+        if s:
+            out[str(sid)] = s
+    return out
+
+
+def _template_ids_of(strategies: dict[str, dict]) -> dict[str, str]:
+    """{strategy_id: strategy} -> {strategy_id: template_id}（跟单市场判定用）。
+
+    缺失的策略（已删除）不会出现在入参里，调用方据此把分组判为不可跟（保守）。
+    """
+    return {sid: str(st.get("template_id") or "") for sid, st in strategies.items()}
+
+
 def _row_to_dict(row: GroupFollowerNode) -> dict:
     return {
         "id": row.id,
