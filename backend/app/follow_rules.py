@@ -90,6 +90,31 @@ def market_reject_reason(template_id: object | None, market: frozenset[str]) -> 
     return f"「{label}」暂不开放跟单"
 
 
+def leave_market_skip_reason(
+    template_id: object | None, market: frozenset[str],
+) -> Optional[str]:
+    """移出跟单时的市场校验：该分组是否属于**别的**跟单市场。
+
+    返回 None = 允许从本市场移出；返回字符串 = 跨市场，应跳过且**不动这条关系**。
+
+    两个市场共用同一张关系表，而「移出」是按 (group_id, node_id) 删关系的。
+    若不校验市场，在【带单】tab 移出就会连带删掉【AI 交易】市场的关系 ——
+    跟单员在另一侧还自以为在跟，属于跨市场误删。
+
+    只在模版**已知**时判定：模版未知（未绑策略 / 策略被删除）既不属于任何市场，
+    允许从任一市场移出 —— 跟单员必须始终能自行清理自己的节点。
+    """
+    tid = str(template_id or "").strip().lower()
+    if not tid:
+        return None
+    if template_in_market(tid, market):
+        return None
+    label = strategy_templates.live_template_name(tid, None) or tid
+    if tid == strategy_templates.TEMPLATE_1_ID:
+        return f"「{label}」属于【AI 交易】市场，请在【AI 交易】页移出"
+    return f"「{label}」属于【带单】市场，请在【带单】页移出"
+
+
 # ---------------------------------------------------------------------------
 # 能力
 # ---------------------------------------------------------------------------

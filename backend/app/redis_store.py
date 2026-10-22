@@ -47,6 +47,9 @@ K_LIMIT_WATCH_DONE = "limit_watch:done:{}:{}"
 K_LIMIT_WATCH_REJECT = "limit_watch:reject:{}:{}"
 # 登录用户的权限快照（角色 / 菜单 / 启用状态 / 会话版本），权威在 MySQL，丢失即重建
 K_PRINCIPAL = "auth:principal:{}"
+# 带单员绩效预聚合：{leader_user_id: {window: summary}}（JSON）
+# TTL 15min > 刷新周期 5min，容忍后台任务偶发失败
+K_LEADER_STATS = "stats:leader:{}"
 
 
 class RedisStore:
@@ -394,5 +397,33 @@ class RedisStore:
 
     async def delete_principal_cache(self, *usernames: str) -> None:
         keys = [K_PRINCIPAL.format(u) for u in usernames if u]
+        if keys:
+            await self.r.delete(*keys)
+
+    # ----------------- 带单员绩效预聚合 -----------------
+    async def get_leader_stats(self, leader_user_id: int) -> Optional[dict]:
+        """读某个带单员的预聚合绩效（四窗口一次性算好）。
+
+        返回 {window: summary}；**未命中返回 None** —— 调用方据此决定
+        是否回源查库（列表接口不回源，保证延迟恒定）。
+        """
+        raw = await self.r.get(K_LEADER_STATS.format(leader_user_id))
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    async def set_leader_stats(self, leader_user_id: int, data: dict, ttl: int) -> None:
+        await self.r.set(
+            K_LEADER_STATS.format(leader_user_id),
+            json.dumps(data),
+            ex=ttl,
+        )
+
+    async def delete_leader_stats(self, *leader_user_ids: int) -> None:
+        keys = [K_LEADER_STATS.format(u) for u in leader_user_ids if u]
         if keys:
             await self.r.delete(*keys)

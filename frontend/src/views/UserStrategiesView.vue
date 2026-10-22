@@ -9,6 +9,7 @@ import { ElMessage } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
 import OrderDialog, { type OrderForm } from '../components/OrderDialog.vue'
 import StrategyFormModal from '@/components/StrategyFormModal.vue'
+import DealsTable from '@/components/DealsTable.vue'
 import { useRouter } from 'vue-router'
 import { useHubStore } from '@/stores/hub'
 import { useAuthStore } from '@/stores/auth'
@@ -17,9 +18,7 @@ import type {
   AccountSnapshot,
   GroupOut,
   GroupSignalTaskRecord,
-  NodeDispatchRecord,
   NodeOut,
-  PaginatedNodeDispatches,
   QuoteInfo,
   StrategyOut,
 } from '@/api/types'
@@ -203,61 +202,8 @@ async function refreshGridTasks(initial = false): Promise<void> {
 // / gridDirTagClass / stopGridTask 当前未在模板里调用，等接上 UI 再恢复。
 
 // ── 历史订单 ──
-// 走 GET /api/nodes/{id}/dispatches?page=&page_size=，分页返回 signal_history + signal_dispatch 联表明细。
-// 每条 = 一次「信号 × 本节点执行」结果，包含 order_ticket / price / retcode / status / error 等成交流水。
-const HISTORY_PAGE_SIZE = 50
-const historyItems = ref<NodeDispatchRecord[]>([])
-const historyTotal = ref(0)
-const historyPage = ref(1)
-const historyLoading = ref(false)
-const historyNodeId = ref<string | null>(null) // 上次拉取用的节点 id，避免重复拉
-
-async function fetchHistory(): Promise<void> {
-  const nid = primaryNode.value?.node_id
-  if (!nid) {
-    historyItems.value = []
-    historyTotal.value = 0
-    return
-  }
-  historyLoading.value = true
-  historyNodeId.value = nid
-  try {
-    const res: PaginatedNodeDispatches = await hub.fetchNodeDispatches(
-      nid,
-      historyPage.value,
-      HISTORY_PAGE_SIZE,
-    )
-    historyItems.value = res.items || []
-    historyTotal.value = res.total || 0
-  } catch (e) {
-    historyItems.value = []
-    historyTotal.value = 0
-    // 不弹错：tab 里自有空态
-    console.warn('fetchHistory failed', e)
-  } finally {
-    historyLoading.value = false
-  }
-}
-
-// historyStatusClass / fmtHistoryTime / goHistoryPage / historyTotalPages 暂未在模板里使用，
-// 等接上历史 tab UI 再恢复。
-
-/** 切到 history tab 时拉一次（首次） */
-watch(
-  [detailTab, () => primaryNode.value?.node_id],
-  ([tab, nid]) => {
-    if (tab === 'history' && nid) {
-      // 节点变了 → 强制回第一页 + 重拉
-      if (historyNodeId.value !== nid) {
-        historyPage.value = 1
-        fetchHistory()
-      } else if (historyItems.value.length === 0 && !historyLoading.value) {
-        fetchHistory()
-      }
-    }
-  },
-  { immediate: true },
-)
+// 已整体迁移到共享组件 <DealsTable>（成交明细唯一视图）。
+// 本页不再持有派发明细逻辑：成交明细由组件自己拉取 / 筛选 / 分页。
 
 /** 吸筹策略 tab：切到时拉一次 + 启轮询；切走关轮询；分组数据变化时强制重拉 */
 watch(

@@ -46,6 +46,12 @@ class NodeSettings(BaseSettings):
 
     log_level: str = "INFO"
 
+    # 历史成交采集（订单历史 / 带单绩效的数据源）
+    deals_sync_enabled: bool = True   # 关闭后节点不再上报成交
+    deals_sync_interval: float = 60.0  # 采集间隔（秒）
+    deals_batch_size: int = 500        # 单次上报的成交条数上限
+    deals_lookback_days: int = 7       # 首次运行回看天数（此前的成交一并补采）
+
     # 本机运维面板状态口（仅 loopback；PORT=0 关闭）
     local_status_host: str = "127.0.0.1"
     local_status_port: int = 0

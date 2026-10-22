@@ -1159,6 +1159,87 @@ export interface PaginatedNodeDispatches {
   page_size: number
 }
 
+// ----------------------------- 成交明细（MT5 deal）-----------------------------
+/** 单笔 MT5 成交明细（订单历史 Tab 的数据源） */
+export interface DealRecord {
+  id: number
+  node_id: string
+  /** MT5 成交票号（deal.ticket） */
+  deal_id: number
+  order_id: number | null
+  position_id: number | null
+  symbol: string | null
+  /** 成交方向（MT5 原始方向：平多单是 SELL） */
+  direction: 'BUY' | 'SELL' | string
+  /**
+   * 出场成交的方向色按「被平掉的那个持仓的方向」取。
+   * 平多单在 MT5 里是 SELL，直接显示 direction 会让人误以为又开了空仓。
+   */
+  position_direction: 'BUY' | 'SELL' | string
+  /** 开仓 / 平仓 / 双向 / 对冲平仓 */
+  entry_type: 'IN' | 'OUT' | 'INOUT' | 'OUT_BY' | string
+  /** 开平仓的人读标签：开仓 / 平仓 / 双向 / 对冲平仓 */
+  entry_label: string
+  /** MT5 DEAL_REASON：0=客户端 1=移动端 2=网页 3=专家 4=止损 5=止盈 6=对手方… */
+  reason: number
+  volume: number
+  price: number
+  profit: number
+  swap: number
+  commission: number
+  /** 净盈亏 = profit + swap + commission（统计口径统一用它） */
+  net_profit: number
+  magic: number | null
+  comment: string | null
+  /** 来源：signal / strategy / manual / terminal */
+  source: 'signal' | 'strategy' | 'manual' | 'terminal' | string
+  /** 来源的人读标签：信号 / 策略 / 手工 / 终端 */
+  source_label: string
+  signal_id: string | null
+  task_id: number | null
+  group_id: string | null
+  /** 成交时间（Unix 秒） */
+  deal_time: number
+}
+
+/** 成交汇总（统计口径集中在后端 deal_stats，前端直接展示不要自己再算） */
+export interface DealSummary {
+  total_profit: number
+  profit_rate: number
+  win_rate: number
+  /** 交易笔数 = 持仓数（按 position_id 聚合），不是成交笔数 */
+  total_trades: number
+  win_trades: number
+  lose_trades: number
+  gross_volume: number
+  commission_total: number
+  swap_total: number
+  /** 区间期初权益（收益率的分母） */
+  base_equity: number
+  /** 期初权益拿不到时收益率为 0 且此标志为 False（前端应显示「暂无数据」） */
+  profit_rate_valid: boolean
+  /** 节点未上线 / 无成交 / 同步未开 —— 与「有数据但全亏」区分 */
+  data_available: boolean
+  updated_at: number | null
+}
+
+export interface PaginatedDeals {
+  items: DealRecord[]
+  total: number
+  page: number
+  page_size: number
+  /** 与 items 同一 WHERE 条件算出的汇总 */
+  summary: DealSummary
+}
+
+/** 带单员绩效（由成交聚合而来） */
+export interface LeaderPerformance {
+  leader_user_id: number
+  window: string
+  performance: DealSummary
+  follower_count: number
+}
+
 export interface SignalEventDispatch {
   id: number
   node_id: string
@@ -1422,6 +1503,19 @@ export interface FollowLeaderSummary {
   my_follow_node_count: number
   /** 带单员是否仍持有 follow_leader 能力；false 时已下架但仍可移出 */
   marketable: boolean
+  /**
+   * 绩效（由历史成交聚合，与订单历史页同一套口径）。
+   *
+   * `data_available=false` 表示该带单员**暂无成交数据**（节点未上线 / 同步未开），
+   * 前端要显示「暂无数据」而不是 0 —— 0 和「没数据」是两回事。
+   */
+  performance: DealSummary
+  /** 当前统计窗口（7d / 30d / 90d / all） */
+  perf_window: string
+  /** 跟单人数（来自跟单关系表，非订单数据） */
+  follower_count: number
+  /** 聚合缓存是否命中（false = 暂无绩效数据） */
+  perf_available: boolean
 }
 
 export interface FollowGroupDetail {
@@ -1497,6 +1591,8 @@ export interface FollowLeaveResponse {
   closing: { node_id: string; group_id: string; status: string; magic: number | null }[]
   forced: { node_id: string; group_id: string; status: string; magic: number | null }[]
   warning: string | null
+  /** 跨市场跳过的分组（关系**未**被删除） */
+  skipped: { group_id: string; group_name: string | null; reason: string }[]
 }
 
 // ===========================================================================
@@ -1609,4 +1705,6 @@ export interface AiLeaveResponse {
   closing: { node_id: string; group_id: string; status: string; magic: number | null }[]
   forced: { node_id: string; group_id: string; status: string; magic: number | null }[]
   warning: string | null
+  /** 跨市场跳过的分组（关系**未**被删除） */
+  skipped: { group_id: string; group_name: string | null; reason: string }[]
 }

@@ -9,6 +9,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
 import 'element-plus/es/components/message-box/style/css'
 import OrderDialog, { type OrderForm } from '../components/OrderDialog.vue'
+import DealsTable from '@/components/DealsTable.vue'
 import { useRouter } from 'vue-router'
 import { useHubStore } from '@/stores/hub'
 import { useAuthStore } from '@/stores/auth'
@@ -20,9 +21,7 @@ import type {
   GroupSignalTaskRecord,
   ManualSignalPayload,
   ManualSignalResult,
-  NodeDispatchRecord,
   NodeOut,
-  PaginatedNodeDispatches,
   Position,
   QuoteInfo,
 } from '@/api/types'
@@ -364,57 +363,10 @@ async function stopGridTask(task: GroupSignalTaskRecord): Promise<void> {
 }
 
 // ── 历史订单 ──
-// 走 GET /api/nodes/{id}/dispatches?page=&page_size=，分页返回 signal_history + signal_dispatch 联表明细。
-// 每条 = 一次「信号 × 本节点执行」结果，包含 order_ticket / price / retcode / status / error 等成交流水。
-const HISTORY_PAGE_SIZE = 50
-const historyItems = ref<NodeDispatchRecord[]>([])
-const historyTotal = ref(0)
-const historyPage = ref(1)
-const historyLoading = ref(false)
-const historyNodeId = ref<string | null>(null) // 上次拉取用的节点 id，避免重复拉
+// Tab 内已换成共享组件 <DealsTable>（成交明细唯一视图），本页不再持有派发明细逻辑。
+// 这里只保留网格 tab 还要用的时间格式化。
 
-async function fetchHistory(): Promise<void> {
-  const nid = primaryNode.value?.node_id
-  if (!nid) {
-    historyItems.value = []
-    historyTotal.value = 0
-    return
-  }
-  historyLoading.value = true
-  historyNodeId.value = nid
-  try {
-    const res: PaginatedNodeDispatches = await hub.fetchNodeDispatches(
-      nid,
-      historyPage.value,
-      HISTORY_PAGE_SIZE,
-    )
-    historyItems.value = res.items || []
-    historyTotal.value = res.total || 0
-  } catch (e) {
-    historyItems.value = []
-    historyTotal.value = 0
-    // 不弹错：tab 里自有空态
-    console.warn('fetchHistory failed', e)
-  } finally {
-    historyLoading.value = false
-  }
-}
-
-const historyTotalPages = computed(() => {
-  if (historyTotal.value <= 0) return 1
-  return Math.max(1, Math.ceil(historyTotal.value / HISTORY_PAGE_SIZE))
-})
-
-/** 历史订单：status 着色标签 */
-function historyStatusClass(s: string | null): string {
-  const v = (s || '').toLowerCase()
-  if (v === 'filled' || v === 'success' || v === 'done' || v === 'executed') return 'ok'
-  if (v === 'pending' || v === 'dispatched' || v === 'queued') return 'pending'
-  if (v === 'rejected' || v === 'failed' || v === 'error' || v === 'skipped') return 'err'
-  return ''
-}
-
-/** 把 Unix 时间戳（秒）→ 简短本地时间（含日期），供历史订单表用 */
+/** 把 Unix 时间戳（秒）→ 简短本地时间（含日期） */
 function fmtHistoryTime(ts: number | null | undefined): string {
   if (!ts || !isFinite(ts)) return '—'
   const d = new Date(ts * 1000)
@@ -423,22 +375,8 @@ function fmtHistoryTime(ts: number | null | undefined): string {
   return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
 }
 
-/** 切到 history tab 时拉一次（首次） */
-watch(
-  [detailTab, () => primaryNode.value?.node_id],
-  ([tab, nid]) => {
-    if (tab === 'history' && nid) {
-      // 节点变了 → 强制回第一页 + 重拉
-      if (historyNodeId.value !== nid) {
-        historyPage.value = 1
-        fetchHistory()
-      } else if (historyItems.value.length === 0 && !historyLoading.value) {
-        fetchHistory()
-      }
-    }
-  },
-  { immediate: true },
-)
+// 历史订单 Tab 的成交总条数（Tab 角标用；由 DealsTable 上报）
+const dealsTotal = ref(0)
 
 /** 吸筹策略 tab：切到时拉一次 + 启轮询；切走关轮询；分组数据变化时强制重拉 */
 watch(
@@ -459,13 +397,6 @@ watch(
   },
   { immediate: true },
 )
-
-async function goHistoryPage(p: number): Promise<void> {
-  if (p < 1 || p > historyTotalPages.value) return
-  if (p === historyPage.value) return
-  historyPage.value = p
-  await fetchHistory()
-}
 
 // ── 弹窗（开仓参数）──
 const STRATEGY_LABEL: Record<TradingStrategyType, string> = {
@@ -887,7 +818,7 @@ onBeforeUnmount(() => {
             @click="detailTab = 'history'"
           >
             历史订单
-            <span v-if="historyTotal > 0" class="tab-badge tab-badge-muted">{{ historyTotal }}</span>
+            <span v-if="dealsTotal > 0" class="tab-badge tab-badge-muted">{{ dealsTotal }}</span>
           </button>
           <button
             class="detail-tab"
@@ -1044,94 +975,9 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
-          <!-- 历史订单 -->
+          <!-- 历史订单：成交明细（唯一视图，无视图切换） -->
           <div v-if="detailTab === 'history'" role="tabpanel">
-            <div v-if="historyLoading && historyItems.length === 0" class="detail-empty">
-              <div class="dot-spin-lg" aria-hidden="true"></div>
-              <div>加载中…</div>
-            </div>
-            <div v-else-if="!historyLoading && historyItems.length === 0" class="detail-empty">
-              <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <circle cx="12" cy="12" r="9" />
-                <path d="M12 7v5l3 2" />
-              </svg>
-              <div>暂无历史订单</div>
-            </div>
-            <template v-else>
-              <!-- 桌面端：表格 -->
-              <div class="pos-table-wrap">
-                <table class="pos-table hist-table">
-                  <thead>
-                    <tr>
-                      <th>时间</th>
-                      <th>品种</th>
-                      <th>方向</th>
-                      <th class="num">手数</th>
-                      <th class="num">成交价</th>
-                      <th class="num">订单号</th>
-                      <th>状态</th>
-                      <th>错误</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr v-for="it in historyItems" :key="it.id">
-                      <td class="mono muted">{{ fmtHistoryTime(it.dispatched_at || it.received_at) }}</td>
-                      <td class="mono strong">{{ it.symbol || '—' }}</td>
-                      <td>
-                        <span
-                          v-if="it.action"
-                          class="dir-tag"
-                          :class="(it.action || '').toLowerCase() === 'buy' ? 'buy' : ((it.action || '').toLowerCase() === 'sell' ? 'sell' : '')"
-                        >{{ fmtPosType(it.action) }}</span>
-                        <span v-else class="muted">—</span>
-                      </td>
-                      <td class="num mono">{{ it.decided_vol != null ? it.decided_vol.toFixed(2) : '—' }}</td>
-                      <td class="num mono">{{ it.price != null ? fmtPrice(it.price, it.symbol || '') : '—' }}</td>
-                      <td class="num mono muted">{{ it.order || it.deal || '—' }}</td>
-                      <td>
-                        <span class="hist-status" :class="historyStatusClass(it.status)">{{ it.status || '—' }}</span>
-                      </td>
-                      <td class="muted hist-err" :title="it.error || ''">{{ it.error || '—' }}</td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-              <!-- 手机端：卡片列表 -->
-              <div class="pos-cards">
-                <div v-for="it in historyItems" :key="it.id" class="pos-card">
-                  <div class="pos-card-row1">
-                    <div class="pos-card-left">
-                      <span class="mono strong">{{ it.symbol || '—' }}</span>
-                      <span
-                        v-if="it.action"
-                        class="dir-tag"
-                        :class="(it.action || '').toLowerCase() === 'buy' ? 'buy' : ((it.action || '').toLowerCase() === 'sell' ? 'sell' : '')"
-                      >{{ fmtPosType(it.action) }}</span>
-                      <span class="hist-status" :class="historyStatusClass(it.status)">{{ it.status || '—' }}</span>
-                    </div>
-                    <div class="pos-card-pnl mono">
-                      {{ it.decided_vol != null ? it.decided_vol.toFixed(2) + ' 手' : '—' }}
-                    </div>
-                  </div>
-                  <div class="pos-card-row2">
-                    <span class="kv"><span class="k">时间</span><span class="v mono">{{ fmtHistoryTime(it.dispatched_at || it.received_at) }}</span></span>
-                    <span class="kv"><span class="k">成交价</span><span class="v mono">{{ it.price != null ? fmtPrice(it.price, it.symbol || '') : '—' }}</span></span>
-                    <span class="kv"><span class="k">订单号</span><span class="v mono muted">{{ it.order || it.deal || '—' }}</span></span>
-                    <span class="kv"><span class="k">retcode</span><span class="v mono muted">{{ it.retcode ?? '—' }}</span></span>
-                    <span class="kv hist-err-kv" v-if="it.error"><span class="k">错误</span><span class="v mono err-text">{{ it.error }}</span></span>
-                  </div>
-                </div>
-              </div>
-              <!-- 翻页器 -->
-              <div class="hist-pager" v-if="historyTotal > HISTORY_PAGE_SIZE">
-                <button class="pager-btn" :disabled="historyPage <= 1" @click="goHistoryPage(1)">«</button>
-                <button class="pager-btn" :disabled="historyPage <= 1" @click="goHistoryPage(historyPage - 1)">‹</button>
-                <span class="pager-info">{{ historyPage }} / {{ historyTotalPages }}</span>
-                <button class="pager-btn" :disabled="historyPage >= historyTotalPages" @click="goHistoryPage(historyPage + 1)">›</button>
-                <button class="pager-btn" :disabled="historyPage >= historyTotalPages" @click="goHistoryPage(historyTotalPages)">»</button>
-                <span class="pager-total muted">共 {{ historyTotal }} 条</span>
-              </div>
-            </template>
+            <DealsTable :node-id="primaryNode?.node_id ?? null" @total="dealsTotal = $event" />
           </div>
 
           <!-- 吸筹策略（运行中网格任务 · 一行一任务） -->
@@ -1448,14 +1294,14 @@ onBeforeUnmount(() => {
 .quote-sym-picker {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px;
-  margin-top: 4px;
+  gap: 6px;
+  margin-top: 6px;
 }
 .sym-chip {
-  padding: 4px 8px;
-  font-size: 11px;
-  font-weight: 600;
-  border-radius: 6px;
+  padding: 7px 12px;
+  font-size: 13px;
+  font-weight: 700;
+  border-radius: 8px;
   background: var(--glass);
   color: var(--muted);
   border: 1px solid var(--glass-border);

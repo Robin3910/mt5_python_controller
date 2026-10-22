@@ -14,6 +14,7 @@ from fastapi import APIRouter, WebSocket
 from starlette.websockets import WebSocketDisconnect
 
 from . import (
+    deal_store,
     group_dispatcher,
     group_persist,
     group_rules,
@@ -263,6 +264,10 @@ async def _session(node_id: str, ws: WebSocket) -> None:
             # 成交回报
             await _on_trade_result(node_id, data)
 
+        elif mtype == "deals_report":
+            # 节点上报的历史成交明细（订单历史 / 带单绩效的数据源）
+            await _on_deals_report(node_id, data)
+
         elif mtype == "strategy_progress":
             # 策略托管运行期上报（加仓 / 快照）
             await _on_strategy_progress(node_id, data)
@@ -425,6 +430,34 @@ async def _on_trade_result(node_id: str, data: dict) -> None:
         await _release_node_busy(handled)
     await manager.broadcast_admin(
         {"type": "trade_result", "data": {"node_id": node_id, **data}}
+    )
+
+
+async def _on_deals_report(node_id: str, data: dict) -> None:
+    """处理节点上报的历史成交明细。
+
+    节点侧是增量采集（带重叠窗口），同一批成交重传是常态，落库靠
+    (node_id, deal_id) 唯一键幂等去重（见 deal_store.save_deals）。
+
+    account 是节点同时上报的账户快照，冗余进每条成交 —— 收益率的分母
+    （区间期初权益）靠它算，缺了就永远算不出收益率。
+
+    入库后回填来源（信号 / 策略 / 手工 / 终端），再广播给管理端，
+    订单历史页可实时追加。
+    """
+    rows = data.get("deals") or []
+    if not isinstance(rows, list) or not rows:
+        return
+    account = data.get("account") if isinstance(data.get("account"), dict) else None
+    inserted = await deal_store.save_deals(node_id, rows, account=account)
+    if inserted:
+        logger.info("node %s saved %s deals", node_id, inserted)
+        # 回填来源：节点不知道这单属于哪个信号/策略/手工操作
+        await deal_store.backfill_sources(
+            node_id, [int(r.get("deal_id") or 0) for r in rows if r.get("deal_id")]
+        )
+    await manager.broadcast_admin(
+        {"type": "deals", "data": {"node_id": node_id, "inserted": inserted}}
     )
 
 

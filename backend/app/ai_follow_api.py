@@ -371,6 +371,27 @@ async def list_my_ai_followings(
     for f in followings:
         by_leader.setdefault(int(f["leader_user_id"]), []).append(f)
 
+    # 市场隔离：AI tab 只管 **AI 市场**（tpl_1）的分组。
+    # 带单市场（tpl_2/tpl_3）的分组归【带单】tab —— 在这里显示会让跟单员以为
+    # 自己在跟 AI 机器人，实际却在跟网格分组（而且移出会移错组）。
+    # 模版未知的分组（未绑策略 / 策略被删除）保持可见，与既有口径一致。
+    ai_group_ids: set[str] = {
+        gid for gid, g in all_groups.items()
+        if not follow_rules.leave_market_skip_reason(
+            tmpl_map.get(str(g.get("strategy_id") or "")),
+            follow_rules.AI_MARKET_TEMPLATE_IDS,
+        )
+    }
+    by_leader = {
+        lid: [f for f in items if f["group_id"] in ai_group_ids]
+        for lid, items in by_leader.items()
+    }
+    by_leader = {lid: items for lid, items in by_leader.items() if items}
+    if not by_leader:
+        return AiMeResponse(
+            following=[], summary={"following_count": 0, "follow_node_count": 0},
+        )
+
     following_out: list[dict] = []
     for lid, items in sorted(by_leader.items()):
         user = await user_service.get_user_by_id(lid)
@@ -436,7 +457,8 @@ async def list_my_ai_followings(
         following=following_out,
         summary={
             "following_count": len(by_leader),
-            "follow_node_count": len(followings),
+            # 计数也只算 AI 市场的关系（与上面过滤后的口径一致）
+            "follow_node_count": sum(len(items) for items in by_leader.values()),
         },
     )
 
@@ -575,19 +597,44 @@ async def leave_ai_follow(
 
     close_tasks 默认 False：**在跑任务不停止，继续按策略运行至结束**
     （任务执行由 node_client 负责，后端只解除跟单关系、不再下发新信号）。
+
+    **市场隔离**：只允许移出 **AI 市场**的分组。带单市场（tpl_2/tpl_3）的分组
+    归【带单】tab 管 —— 在这里删掉会连带清掉跟单员在带单侧的关系。
+    两个市场共用同一张关系表，所以校验必须在**写入侧**。
+    跨市场的分组会被跳过（关系不动）并在 skipped 里回报原因。
     """
     from .follow_api import _stop_following_subtasks
 
     removed: list[dict] = []
     closing: list[dict] = []
     forced: list[dict] = []
+    skipped: list[dict] = []
     stopped = 0
+
+    # 一次取全部分组 + 模版快照，循环内不逐个回源查 Redis
+    all_groups = {g["group_id"]: g for g in await store.all_groups()}
+    strategies = await follow_service._strategies_of(list(all_groups.values()), store)
+    tmpl_map = follow_service._template_ids_of(strategies)
 
     for gid in body.group_ids:
         gid = str(gid or "").strip()
         if not gid:
             continue
-        group = await store.get_group(gid)
+        group = all_groups.get(gid) or await store.get_group(gid)
+        if not group:
+            continue
+        # 市场校验：带单市场分组不在 AI 市场 -> 跳过，关系保持不变
+        skip_reason = follow_rules.leave_market_skip_reason(
+            tmpl_map.get(str(group.get("strategy_id") or "")),
+            follow_rules.AI_MARKET_TEMPLATE_IDS,
+        )
+        if skip_reason:
+            skipped.append({
+                "group_id": gid,
+                "group_name": group.get("name"),
+                "reason": skip_reason,
+            })
+            continue
         node_ids = [
             nid for nid in (body.node_ids or [])
             if follow_service.follows_node(group, nid, p.user_id)
@@ -621,11 +668,13 @@ async def leave_ai_follow(
             "node_ids": body.node_ids,
             "close_tasks": body.close_tasks,
             "stopped_subtasks": stopped,
+            "skipped_group_ids": [s["group_id"] for s in skipped],
         },
         "ok", client_ip(request), category="ai_follow",
         before=None,
-        after={"removed": removed, "closing": closing, "forced": forced},
+        after={"removed": removed, "closing": closing, "forced": forced, "skipped": skipped},
     )
     return AiLeaveResponse(
         removed=removed, closing=closing, forced=forced, warning=warning,
+        skipped=skipped,
     )

@@ -18,6 +18,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from . import (
+    deal_stats,
     follow_rules,
     follow_service,
     group_persist,
@@ -131,6 +132,7 @@ async def _leader_ids_with_capability(
 @router.get("/leaders", response_model=FollowLeaderListResponse)
 async def list_follow_leaders(
     q: str = "",
+    window: str = "30d",
     store: RedisStore = Depends(get_store),
     p: Principal = Depends(require_menu(MENU_FOLLOW)),
 ) -> FollowLeaderListResponse:
@@ -138,6 +140,10 @@ async def list_follow_leaders(
 
     节点 / 分组 / 我的跟单关系都**批量预取一次**再在内存里筛，
     避免「每个用户查一次 Redis」的 N+1。
+
+    绩效来自后台预聚合的 Redis 缓存（deal_agg）。**未命中不回源查库** ——
+    带单广场一次要展示 N 个带单员，回源就是 N+1 查询，接口延迟会随人数线性劣化。
+    未命中时返回 `data_available=False`，前端显示「暂无数据」而不是 0。
     """
     users = await user_service.list_users()
     leaders = await _leader_ids_with_capability(store, users)
@@ -156,6 +162,14 @@ async def list_follow_leaders(
     followers_by_leader: dict[int, set[str]] = {}
     for f in await follow_service.list_for_leaders(leaders):
         followers_by_leader.setdefault(int(f["leader_user_id"]), set()).add(f["node_id"])
+
+    # 绩效：一次 MGET 拿全部带单员的预聚合结果（未命中就是 None）
+    win = window if window in deal_stats.WINDOWS else deal_stats.DEFAULT_WINDOW
+    cached: dict[int, dict] = {}
+    for uid in leaders:
+        entry = await store.get_leader_stats(uid)
+        if entry and win in entry:
+            cached[uid] = entry[win]
 
     by_id = {u.id: u for u in users}
     needle = q.strip().lower()
@@ -182,6 +196,8 @@ async def list_follow_leaders(
             if needle not in haystack:
                 continue
         mine = mine_by_leader.get(uid, [])
+        # 缓存结构：{window: {**summary, follower_count}} —— 与 deal_agg 写入的一致
+        perf = dict(cached.get(uid) or {})
         out.append({
             "leader_user_id": uid,
             "username": u.username,
@@ -192,6 +208,14 @@ async def list_follow_leaders(
             "my_follow_group_count": len({f["group_id"] for f in mine}),
             "my_follow_node_count": len(mine),
             "marketable": True,
+            # 绩效：聚合公开可见（带单广场是给潜在跟单者看的）
+            "performance": {
+                k: v for k, v in perf.items() if k != "follower_count"
+            },
+            "perf_window": win,
+            "follower_count": int(perf.get("follower_count") or 0)
+            or len(followers_by_leader.get(uid, set())),
+            "perf_available": bool(perf),
         })
     # 已跟过的排前面，其余按用户名
     out.sort(key=lambda x: (x["my_follow_group_count"] == 0, x["username"]))
@@ -204,10 +228,11 @@ async def list_follow_leaders(
 @router.get("/leaders/{leader_user_id}", response_model=FollowDetailOut)
 async def get_leader_detail(
     leader_user_id: int,
+    window: str = "30d",
     store: RedisStore = Depends(get_store),
     p: Principal = Depends(require_menu(MENU_FOLLOW)),
 ) -> FollowDetailOut:
-    """带单员详情：可跟单分组（含我的已跟标记）+ 我可用于跟单的节点。"""
+    """带单员详情：可跟单分组（含我的已跟标记）+ 我可用于跟单的节点 + 绩效。"""
     user = await user_service.get_user_by_id(leader_user_id)
     if not user or not user.is_active:
         raise HTTPException(status_code=404, detail="带单员不存在或已停用")
@@ -303,6 +328,29 @@ async def get_leader_detail(
         })
 
     mine = mine_by_group
+    # 绩效：读后台预聚合的 Redis 缓存（与列表同一份，口径完全一致）。
+    # 详情是单个人，允许回源查库兜底（缓存刚建立时可能还没有）。
+    win = window if window in deal_stats.WINDOWS else deal_stats.DEFAULT_WINDOW
+    perf: dict = {}
+    cached = await store.get_leader_stats(leader_user_id) or {}
+    if win in cached:
+        perf = dict(cached[win])
+    else:
+        # 缓存未命中：就地算一次（详情是单人，不构成 N+1）
+        leader_node_ids = [
+            str(n.get("node_id"))
+            for n in all_nodes
+            if permissions.normalize_owner(n.get("owner_user_id")) == leader_user_id
+            and n.get("node_id")
+        ]
+        perf = await deal_stats.leader_batch(
+            leader_node_ids, deal_stats.window_start(win), None
+        )
+        perf = dict(perf)
+    follower_count = int(perf.pop("follower_count", 0) or 0) or len({
+        f["node_id"] for f in await follow_service.list_for_leaders({leader_user_id})
+    })
+    perf["follower_count"] = follower_count
     return FollowDetailOut(
         leader={
             "leader_user_id": leader_user_id,
@@ -316,6 +364,10 @@ async def get_leader_detail(
             "my_follow_group_count": len(mine),
             "my_follow_node_count": sum(len(v) for v in mine.values()),
             "marketable": True,
+            "performance": {k: v for k, v in perf.items() if k != "follower_count"},
+            "perf_window": win,
+            "follower_count": follower_count,
+            "perf_available": True,
         },
         groups=detail_groups,
         hidden_groups=hidden_groups,
@@ -549,17 +601,43 @@ async def leave_follow(
 
     不要求带单员仍有 follow_leader 能力 —— 跟单员必须始终能自行清理自己的节点。
     close_tasks=True 时按「节点在该分组的子任务」逐个终止（复用现有 stop 路径）。
+
+    **市场隔离**：只允许移出**带单市场**的分组。AI 分组（tpl_1）虽然因存量
+    关系需要在【我的跟单】里可见（便于人工清理），但它的关系归【AI 交易】
+    市场管 —— 在这里删掉会让跟单员在另一侧还自以为在跟。两个市场共用同一张
+    关系表，所以这个校验必须在**写入侧**，不能只靠前端不显示。
+    跨市场的分组会被跳过（关系不动）并在 skipped 里回报原因。
     """
     removed: list[dict] = []
     closing: list[dict] = []
     forced: list[dict] = []
+    skipped: list[dict] = []
     stopped = 0
+
+    # 一次取全部分组 + 模版快照，循环内不逐个回源查 Redis
+    all_groups = {g["group_id"]: g for g in await store.all_groups()}
+    strategies = await _strategies_of(list(all_groups.values()), store)
+    tmpl_map = _template_ids_of(strategies)
 
     for gid in body.group_ids:
         gid = str(gid or "").strip()
         if not gid:
             continue
-        group = await store.get_group(gid)
+        group = all_groups.get(gid) or await store.get_group(gid)
+        if not group:
+            continue
+        # 市场校验：AI 分组不在带单市场 -> 跳过，关系保持不变
+        skip_reason = follow_rules.leave_market_skip_reason(
+            tmpl_map.get(str(group.get("strategy_id") or "")),
+            follow_rules.FOLLOW_MARKET_TEMPLATE_IDS,
+        )
+        if skip_reason:
+            skipped.append({
+                "group_id": gid,
+                "group_name": group.get("name"),
+                "reason": skip_reason,
+            })
+            continue
         node_ids = [
             nid for nid in (body.node_ids or [])
             if follow_service.follows_node(group, nid, p.user_id)
@@ -593,13 +671,15 @@ async def leave_follow(
             "node_ids": body.node_ids,
             "close_tasks": body.close_tasks,
             "stopped_subtasks": stopped,
+            "skipped_group_ids": [s["group_id"] for s in skipped],
         },
         "ok", client_ip(request), category="follow",
         before=None,
-        after={"removed": removed, "closing": closing, "forced": forced},
+        after={"removed": removed, "closing": closing, "forced": forced, "skipped": skipped},
     )
     return FollowLeaveResponse(
         removed=removed, closing=closing, forced=forced, warning=warning,
+        skipped=skipped,
     )
 
 

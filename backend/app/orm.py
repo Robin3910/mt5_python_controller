@@ -242,7 +242,59 @@ class SignalDispatch(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
-# ===================== strategy 信号：分组账本与主任务链路 =====================
+class Deal(Base):
+    """MT5 成交明细（deal）：节点上报的历史成交，订单历史页与带单绩效的数据源。
+
+    幂等键 = (node_id, deal_id)：同一个节点上同一笔成交只入库一次。节点采集是
+    增量的（带重叠窗口），重传是常态，因此**必须**靠这个唯一键去重，否则统计
+    会因重复上报而翻倍。
+
+    deal_id 是 MT5 的成交票号（deal.ticket），在单个账户内单调递增。
+    """
+    __tablename__ = "mt5_deal"
+    __table_args__ = (
+        UniqueConstraint("node_id", "deal_id", name="uq_mt5_deal_node_deal"),
+    )
+
+    id: Mapped[int] = mapped_column(AutoPK, primary_key=True, autoincrement=True)
+    node_id: Mapped[str] = mapped_column(String(32), index=True)
+    # MT5 成交票号（deal.ticket）
+    deal_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    order_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    position_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
+    symbol: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    # BUY / SELL：成交方向
+    direction: Mapped[str] = mapped_column(String(8), default="BUY")
+    # IN / OUT / INOUT / OUT_BY：开仓 / 平仓 / 反手 / 对敲
+    entry_type: Mapped[str] = mapped_column(String(8), default="IN", index=True)
+    # MT5 DEAL_REASON：0=客户端 1=移动端 2=网页 3=专家 4=止损 5=止盈 6=对手方…
+    reason: Mapped[int] = mapped_column(Integer, default=0)
+    volume: Mapped[float] = mapped_column(Float, default=0.0)
+    price: Mapped[float] = mapped_column(Float, default=0.0)
+    profit: Mapped[float] = mapped_column(Float, default=0.0)
+    swap: Mapped[float] = mapped_column(Float, default=0.0)
+    commission: Mapped[float] = mapped_column(Float, default=0.0)
+    # net_profit = profit + swap + commission：统计口径统一用这个
+    net_profit: Mapped[float] = mapped_column(Float, default=0.0)
+    # 魔术号：可反查是哪个策略任务下的成交
+    magic: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
+    comment: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # 成交时间（MT5 服务器时间，Unix 秒）
+    deal_time: Mapped[int] = mapped_column(BigInteger, index=True)
+    # —— 来源与关联（回填）——
+    # strategy（策略任务）/ signal（信号派发）/ manual（手工平仓）/ terminal（终端手工单）
+    source: Mapped[str] = mapped_column(String(16), default="terminal", index=True)
+    signal_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    task_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
+    group_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # 上报时的账户权益：收益率分母（区间期初权益）依赖它
+    balance: Mapped[float] = mapped_column(Float, default=0.0)
+    equity: Mapped[float] = mapped_column(Float, default=0.0)
+    # 是否为补采的历史成交（不是实时增量）；补采不计入实时统计
+    backfill: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
+
+
 # 以下四张表只服务于 model=strategy 的分组分发流程，与上面的 signal_dispatch
 # （model=normal 的按币种分发）互不读写，保证两条链路的规则与数据完全隔离。
 

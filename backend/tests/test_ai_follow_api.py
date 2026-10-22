@@ -97,6 +97,17 @@ def _mk_ai_strategy(client, h, name: str, symbol: str = "XAUUSD") -> str:
     return r.json()["strategy_id"]
 
 
+def _mk_trend_strategy(client, h, name: str, symbol: str = "EURUSD") -> str:
+    """建一个趋势策略（tpl_2，即「开仓策略」）；模版默认规则合法，不用显式给 rules。"""
+    r = client.post(
+        "/api/strategies",
+        json={"name": name, "template_id": "tpl_2", "symbol": symbol},
+        headers=h,
+    )
+    assert r.status_code == 201, r.text
+    return r.json()["strategy_id"]
+
+
 def _mk_grid_strategy(client, h, name: str, symbol: str = "EURUSD") -> str:
     """建一个网格策略（tpl_3）；模版默认规则不合法，必须显式给一条可用规则。"""
     r = client.post(
@@ -508,3 +519,224 @@ def test_robot_detail_404_when_not_host(client):
     bob_h = _login(client, "bob")
     r = client.get(f"/api/ai-follow/robots/{s['bob']['id']}", headers=bob_h)
     assert r.status_code == 404, r.text
+
+
+# ---------------------------------------------------------------------------
+# 已跟标记必须按分组维度（跨市场不串）
+# ---------------------------------------------------------------------------
+def test_detail_my_follow_node_ids_are_group_scoped(client):
+    """my_follow_node_ids 是**分组维度**的：跟了开仓策略分组 ≠ 跟了 AI 分组。
+
+    前端「已跟过」标记直接读这个字段 —— 如果它跨市场串了，
+    客户只跟了 tpl_2 开仓策略分组时，AI 分组上也会显示「已跟过」（误导）。
+    """
+    admin_h = _login(client, "admin")
+    s = _setup(client, admin_h, caps=[CAP_AI, CAP_LEADER])
+    bob_h = _login(client, "bob")
+
+    # 主人再开一个 tpl_2「开仓策略」分组（带单市场，非 AI 市场）
+    sid = _mk_trend_strategy(client, s["host_h"], "host-trend")
+    trend_gid = _mk_group(client, s["host_h"], [s["h_primary"]], "host-trend组", strategy_id=sid)
+
+    # 客户只跟**开仓策略分组**（带单 tab）
+    r = client.post(
+        "/api/follow/join",
+        json={
+            "leader_user_id": s["host"]["id"],
+            "group_ids": [trend_gid],
+            "node_ids": [s["b_follow"]],
+        },
+        headers=bob_h,
+    )
+    assert r.status_code == 200, r.text
+
+    # AI 详情里，该节点**没有**跟任何 AI 分组
+    d = client.get(f"/api/ai-follow/robots/{s['host']['id']}", headers=bob_h)
+    assert d.status_code == 200, d.text
+    ai_groups = d.json()["groups"]
+    assert [g["group_id"] for g in ai_groups] == [s["ai_group_id"]]
+    assert ai_groups[0]["my_follow_node_ids"] == [], "跟了开仓策略分组不代表跟了 AI 分组"
+
+
+def test_detail_my_follow_node_ids_reflects_own_group(client):
+    """真正跟了 AI 分组时，该分组的 my_follow_node_ids 才有值。"""
+    admin_h = _login(client, "admin")
+    s = _setup(client, admin_h, caps=[CAP_AI, CAP_LEADER])
+    bob_h = _login(client, "bob")
+
+    r = client.post(
+        "/api/ai-follow/join",
+        json={
+            "leader_user_id": s["host"]["id"],
+            "group_ids": [s["ai_group_id"]],
+            "node_ids": [s["b_follow"]],
+        },
+        headers=bob_h,
+    )
+    assert r.status_code == 200, r.text
+
+    d = client.get(f"/api/ai-follow/robots/{s['host']['id']}", headers=bob_h)
+    assert d.status_code == 200, d.text
+    ai_groups = d.json()["groups"]
+    assert ai_groups[0]["my_follow_node_ids"] == [s["b_follow"]]
+
+
+# ---------------------------------------------------------------------------
+# 市场隔离：移出与「我的跟单」都不能跨市场
+# ---------------------------------------------------------------------------
+def test_ai_me_excludes_follow_market_groups(client):
+    """【我的 AI 跟单】只显示 AI 市场（tpl_1）的分组。
+
+    带单市场（tpl_2）的分组归【带单】tab —— 在 AI tab 显示会让跟单员以为
+    自己在跟 AI 机器人，实际跟的是开仓策略分组（而且移出会移错组）。
+    """
+    admin_h = _login(client, "admin")
+    s = _setup(client, admin_h, caps=[CAP_AI, CAP_LEADER])
+    bob_h = _login(client, "bob")
+
+    # 主人再开一个 tpl_2「开仓策略」分组（带单市场，非 AI 市场）
+    sid = _mk_trend_strategy(client, s["host_h"], "host-trend")
+    trend_gid = _mk_group(client, s["host_h"], [s["h_primary"]], "host-trend组", strategy_id=sid)
+
+    # 客户跟**开仓策略分组**（带单 tab），并跟 AI 分组（AI tab）
+    assert client.post(
+        "/api/follow/join",
+        json={
+            "leader_user_id": s["host"]["id"],
+            "group_ids": [trend_gid],
+            "node_ids": [s["b_follow"]],
+        },
+        headers=bob_h,
+    ).status_code == 200
+    assert client.post(
+        "/api/ai-follow/join",
+        json={
+            "leader_user_id": s["host"]["id"],
+            "group_ids": [s["ai_group_id"]],
+            "node_ids": [s["b_follow"]],
+        },
+        headers=bob_h,
+    ).status_code == 200
+
+    m = client.get("/api/ai-follow/me", headers=bob_h)
+    assert m.status_code == 200, m.text
+    body = m.json()
+    gids = [g["group_id"] for f in body["following"] for g in f["groups"]]
+    assert gids == [s["ai_group_id"]], "AI tab 不应出现带单市场的分组"
+    # 计数口径也只算 AI 市场的关系
+    assert body["summary"]["follow_node_count"] == 1
+
+
+def test_leave_across_market_is_skipped_and_relation_kept(client):
+    """在【带单】tab 移出 AI 分组 -> 跳过，**关系不被删除**。
+
+    两个市场共用同一张关系表，「移出」是按 (group_id, node_id) 删的。
+    不做市场校验的话，在带单 tab 移出会连带删掉 AI 市场的关系 ——
+    跟单员在 AI tab 还自以为在跟。
+    """
+    admin_h = _login(client, "admin")
+    s = _setup(client, admin_h, caps=[CAP_AI, CAP_LEADER])
+    bob_h = _login(client, "bob")
+
+    assert client.post(
+        "/api/ai-follow/join",
+        json={
+            "leader_user_id": s["host"]["id"],
+            "group_ids": [s["ai_group_id"]],
+            "node_ids": [s["b_follow"]],
+        },
+        headers=bob_h,
+    ).status_code == 200
+
+    # 在带单 tab 移出 AI 分组
+    r = client.post(
+        "/api/follow/leave",
+        json={
+            "leader_user_id": s["host"]["id"],
+            "group_ids": [s["ai_group_id"]],
+            "node_ids": [s["b_follow"]],
+        },
+        headers=bob_h,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["removed"] == [], "跨市场分组不应被移出"
+    assert len(body["skipped"]) == 1
+    assert body["skipped"][0]["group_id"] == s["ai_group_id"]
+    assert body["skipped"][0]["reason"]
+
+    # 关系仍在（AI tab 仍看得到）
+    m = client.get("/api/ai-follow/me", headers=bob_h)
+    assert m.json()["following"], "关系不应被跨市场移出删掉"
+
+
+def test_leave_ai_across_market_is_skipped_and_relation_kept(client):
+    """在【AI 交易】tab 移出带单市场分组 -> 跳过，**关系不被删除**。"""
+    admin_h = _login(client, "admin")
+    s = _setup(client, admin_h, caps=[CAP_AI, CAP_LEADER])
+    bob_h = _login(client, "bob")
+
+    sid = _mk_trend_strategy(client, s["host_h"], "host-trend")
+    trend_gid = _mk_group(client, s["host_h"], [s["h_primary"]], "host-trend组", strategy_id=sid)
+
+    assert client.post(
+        "/api/follow/join",
+        json={
+            "leader_user_id": s["host"]["id"],
+            "group_ids": [trend_gid],
+            "node_ids": [s["b_follow"]],
+        },
+        headers=bob_h,
+    ).status_code == 200
+
+    r = client.post(
+        "/api/ai-follow/leave",
+        json={
+            "leader_user_id": s["host"]["id"],
+            "group_ids": [trend_gid],
+            "node_ids": [s["b_follow"]],
+        },
+        headers=bob_h,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["removed"] == [], "跨市场分组不应被移出"
+    assert len(body["skipped"]) == 1
+    assert body["skipped"][0]["group_id"] == trend_gid
+
+    # 关系仍在（带单 tab 仍看得到）
+    m = client.get("/api/follow/me", headers=bob_h)
+    gids = [g["group_id"] for f in m.json()["following"] for g in f["groups"]]
+    assert trend_gid in gids, "关系不应被跨市场移出删掉"
+
+
+def test_leave_same_market_still_works(client):
+    """同市场移出不受影响（市场校验不能误伤正常移出）。"""
+    admin_h = _login(client, "admin")
+    s = _setup(client, admin_h, caps=[CAP_AI, CAP_LEADER])
+    bob_h = _login(client, "bob")
+
+    assert client.post(
+        "/api/ai-follow/join",
+        json={
+            "leader_user_id": s["host"]["id"],
+            "group_ids": [s["ai_group_id"]],
+            "node_ids": [s["b_follow"]],
+        },
+        headers=bob_h,
+    ).status_code == 200
+
+    r = client.post(
+        "/api/ai-follow/leave",
+        json={
+            "leader_user_id": s["host"]["id"],
+            "group_ids": [s["ai_group_id"]],
+            "node_ids": [s["b_follow"]],
+        },
+        headers=bob_h,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["removed"]) == 1
+    assert body["skipped"] == []
+    assert client.get("/api/ai-follow/me", headers=bob_h).json()["following"] == []

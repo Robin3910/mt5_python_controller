@@ -70,8 +70,8 @@ interface MyFollowedNode {
   joined_at: number | null
   active_task_count: number
   batch_limit: number
-  group_id: string
-  group_name: string | null
+  /** 该节点被跟随的**全部分组**（移出时必须一次性清掉，只清一个会留「半个跟单」） */
+  groups: { group_id: string; group_name: string | null }[]
 }
 
 interface MyRobotEntry {
@@ -92,6 +92,11 @@ const myFollowing = computed<MyRobotEntry[]>(() =>
         const prev = nodesById.get(n.node_id)
         if (prev) {
           prev.active_task_count += g.active_task_count
+          // 记全所属分组（去重）：同一节点可能在同一机器人下的多个分组被跟随，
+          // 移出时只清一个分组会残留「半个跟单」（仍在其它分组收信号）。
+          if (!prev.groups.some((x) => x.group_id === g.group_id)) {
+            prev.groups.push({ group_id: g.group_id, group_name: g.group_name ?? null })
+          }
           if (batchLimit > prev.batch_limit) prev.batch_limit = batchLimit
           if (n.joined_at != null && (prev.joined_at == null || n.joined_at < prev.joined_at)) {
             prev.joined_at = n.joined_at
@@ -104,8 +109,7 @@ const myFollowing = computed<MyRobotEntry[]>(() =>
             joined_at: n.joined_at ?? null,
             active_task_count: g.active_task_count,
             batch_limit: batchLimit,
-            group_id: g.group_id,
-            group_name: g.group_name ?? null,
+            groups: [{ group_id: g.group_id, group_name: g.group_name ?? null }],
           })
         }
       }
@@ -119,18 +123,40 @@ const myFollowing = computed<MyRobotEntry[]>(() =>
   }),
 )
 
-function findGroupIdForNode(robot: AiRobotSummary, nodeId: string): string | null {
+/**
+ * 该节点在**该机器人**下被跟随的全部分组 ID。
+ *
+ * 必须取**全部**而不是第一个：跟单关系是 (group_id, node_id) 维度的，
+ * 同一节点可以同时跟同一个机器人的多个 AI 分组。移出时只发一个分组会
+ * 残留「半个跟单」—— 节点仍在其它分组里收信号，用户以为已经退干净了。
+ */
+function findGroupIdsForNode(robot: AiRobotSummary, nodeId: string): string[] {
   const entry = myFollowing.value.find((x) => x.robot.leader_user_id === robot.leader_user_id)
-  return entry?.nodes.find((n) => n.node_id === nodeId)?.group_id ?? null
+  const node = entry?.nodes.find((n) => n.node_id === nodeId)
+  if (!node) return []
+  return node.groups.map((g) => g.group_id)
 }
 
+/**
+ * 已跟过的节点（**按分组维度**判定）。
+ *
+ * 不能用「我的 AI 跟单」的全局聚合：那里面混着两个市场的关系
+ * （客户跟了主人的 tpl_2 开仓策略分组，跟了 AI 分组是两回事）。
+ * 客户只跟了开仓策略分组时，AI 分组里并不存在该节点的关系，
+ * 这里显示「已跟过」是错的 —— 会误导客户以为已经跟了 AI。
+ *
+ * 口径 = **将要加入的分组**（已选 ∩ 可选）的 my_follow_node_ids 并集：
+ * 跟单关系是 (group_id, node_id) 维度的（uq_follow_group_node），
+ * 同一节点跟了 A 组可以再跟 B 组，所以「是否已跟过」必须落到具体分组上。
+ */
 const alreadyFollowingNodeIds = computed<Set<string>>(() => {
   const ids = new Set<string>()
   if (!detail.value) return ids
-  const entry = myFollowing.value.find(
-    (x) => x.robot.leader_user_id === detail.value!.robot.leader_user_id,
-  )
-  if (entry) for (const n of entry.nodes) ids.add(n.node_id)
+  const selected = new Set(selectedGroupIds.value)
+  for (const g of selectableGroups.value) {
+    if (!selected.has(g.group_id)) continue
+    for (const nid of g.my_follow_node_ids ?? []) ids.add(nid)
+  }
   return ids
 })
 
@@ -285,8 +311,8 @@ async function submitJoin() {
 }
 
 async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
-  const groupId = findGroupIdForNode(robot, nodeId)
-  if (!groupId) return
+  const groupIds = findGroupIdsForNode(robot, nodeId)
+  if (!groupIds.length) return
   const ok = await new Promise<boolean>((resolve) => {
     ElMessageBox.confirm(
       '确认移出 AI 跟单？\n\n'
@@ -307,7 +333,9 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
   try {
     const res = await leaveAiFollow({
       leader_user_id: robot.leader_user_id,
-      group_ids: [groupId],
+      // 发**全部分组**：同一节点可能同时跟了该机器人的多个 AI 分组，
+      // 只发一个会残留「半个跟单」（节点仍在其它分组收信号）。
+      group_ids: groupIds,
       node_ids: [nodeId],
       close_tasks: false,
     })
@@ -316,6 +344,10 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     if (res.closing.length) msg += `，${res.closing.length} 个任务正在平仓`
     if (res.forced.length) msg += `，${res.forced.length} 个离线节点已排队补发平仓`
     if (res.warning) ElMessage.warning(res.warning)
+    // 跨市场分组：关系**未**被删除，单独提示（不能混进「已移出」的计数里）
+    if (res.skipped.length) {
+      ElMessage.warning(`有 ${res.skipped.length} 个分组属于【带单】市场，未在本次移出：${res.skipped[0].reason}`)
+    }
     ElMessage.success(msg)
     await refreshAll()
     if (detail.value?.robot.leader_user_id === robot.leader_user_id) {
@@ -398,29 +430,6 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
             <div class="muted">{{ primaryText(detail.robot) }}</div>
           </header>
 
-          <div class="risk-bar">
-            <span class="risk-label">机器人风险上限</span>
-            <span>批次上限 <strong>{{ fmtIntNullable(detail.robot.max_allow_num) }}</strong></span>
-            <span>总手数上限 <strong>{{ fmtNullable(detail.robot.total_lot_limit) }}</strong></span>
-          </div>
-
-          <h3 class="sec-title">可跟 AI 分组（{{ selectableGroups.length }}）</h3>
-          <ul v-if="selectableGroups.length" class="pick-list">
-            <li v-for="g in selectableGroups" :key="g.group_id" class="pick-item">
-              <label>
-                <input type="checkbox" :value="g.group_id" v-model="selectedGroupIds" />
-                <span class="pick-name">{{ g.name }}</span>
-              </label>
-              <div class="pick-sub muted">
-                {{ g.symbol || '-' }} · {{ g.strategy_name || g.strategy_template || '' }}
-                · 单槽执行
-                · 批次 {{ fmtIntNullable(g.max_allow_num) }} / 手数 {{ fmtNullable(g.total_lot_limit) }}
-                · 加仓倍数 {{ fmtNullable(g.lot_times, 'x', 2) }}
-              </div>
-            </li>
-          </ul>
-          <div v-else class="empty muted">该机器人暂无可跟 AI 分组</div>
-
           <h3 class="sec-title">我的节点（可多选）</h3>
           <ul v-if="(detail.my_nodes ?? []).length" class="pick-list">
             <li v-for="n in detail.my_nodes" :key="n.node_id" class="pick-item">
@@ -433,7 +442,7 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
                 />
                 <span class="pick-name">{{ n.name || n.node_id }}</span>
                 <span class="muted">MT5 {{ n.mt5_login ?? '?' }}</span>
-                <span :class="onlineBadge(n).cls">· {{ onlineBadge(n).text }}</span>
+                <!-- <span :class="onlineBadge(n).cls">· {{ onlineBadge(n).text }}</span> -->
                 <span v-if="alreadyFollowingNodeIds.has(n.node_id)" class="tag amber">已跟过</span>
               </label>
             </li>
@@ -446,11 +455,6 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
               :disabled="submitting"
               @click="submitJoin"
             >{{ submitting ? '提交中…' : '确认跟单' }}</button>
-            <p class="warn">
-              ⚠ <strong>手数不缩放</strong>：你的节点将按机器人设定的完整手数执行。
-              <strong>策略实时同步</strong>：机器人主人修改参数会立即作用到你在跑的任务。
-              <strong>移出不自动平仓</strong>：在跑任务会继续运行至结束（由 node_client 负责）。
-            </p>
           </div>
         </div>
 
@@ -479,7 +483,11 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
               </thead>
               <tbody>
                 <tr v-for="n in e.nodes" :key="e.robot.leader_user_id + '|' + n.node_id">
-                  <td>{{ n.group_name || n.group_id }}</td>
+                  <td>
+                    <span v-for="(g, gi) in n.groups" :key="g.group_id">
+                      {{ gi > 0 ? '、' : '' }}{{ g.group_name || g.group_id }}
+                    </span>
+                  </td>
                   <td>
                     {{ n.name || n.node_id }}
                     <span class="muted">· MT5 {{ n.mt5_login ?? '?' }}</span>

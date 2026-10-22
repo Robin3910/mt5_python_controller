@@ -12,6 +12,7 @@ import type {
   GroupCloseResult,
   GroupUpdatePayload,
   HubEvent,
+  LeaderPerformance,
   ManualSignalPayload,
   ManualSignalResult,
   PurgeTradeLogsResult,
@@ -25,6 +26,7 @@ import type {
   GroupTaskEventRecord,
   LimitWatchLogOut,
   PaginatedAudits,
+  PaginatedDeals,
   PaginatedGroupSignals,
   PaginatedLimitWatchLogs,
   PaginatedNodeDispatches,
@@ -37,6 +39,29 @@ import type {
   TrendPanelData,
   WebhookAuthInfo,
 } from '@/api/types'
+
+/** 成交汇总的空值占位（接口失败 / 尚未加载时用）。
+ *
+ * data_available=false 让 UI 能区分「没数据」与「有数据但全亏」——
+ * 前者要显示「暂无数据」，后者要显示 0.00%。
+ */
+function EMPTY_DEAL_SUMMARY() {
+  return {
+    total_profit: 0,
+    profit_rate: 0,
+    win_rate: 0,
+    total_trades: 0,
+    win_trades: 0,
+    lose_trades: 0,
+    gross_volume: 0,
+    commission_total: 0,
+    swap_total: 0,
+    base_equity: 0,
+    profit_rate_valid: true,
+    data_available: false,
+    updated_at: null,
+  }
+}
 
 // 业务总线 store：集中保存节点、账户、配置与实时事件
 interface HubState {
@@ -122,6 +147,49 @@ export const useHubStore = defineStore('hub', {
         ).data
       } catch {
         return { items: [], total: 0, page, page_size: pageSize }
+      }
+    },
+    // 拉取单节点的 MT5 成交明细（订单历史 Tab 的数据源）
+    async fetchNodeDeals(
+      id: string,
+      page = 1,
+      pageSize = 50,
+      params: Record<string, string | number> = {},
+    ): Promise<PaginatedDeals> {
+      try {
+        return (
+          await api.get(`/api/deals/nodes/${id}/deals`, {
+            params: { page, page_size: pageSize, ...params },
+          })
+        ).data
+      } catch {
+        return {
+          items: [],
+          total: 0,
+          page,
+          page_size: pageSize,
+          summary: EMPTY_DEAL_SUMMARY(),
+        }
+      }
+    },
+    // 拉取带单员绩效（成交聚合 + 跟单人数）
+    async fetchLeaderPerformance(
+      leaderUserId: number,
+      window = '30d',
+    ): Promise<LeaderPerformance> {
+      try {
+        return (
+          await api.get(`/api/deals/follow/leaders/${leaderUserId}/performance`, {
+            params: { window },
+          })
+        ).data
+      } catch {
+        return {
+          leader_user_id: leaderUserId,
+          window,
+          performance: EMPTY_DEAL_SUMMARY(),
+          follower_count: 0,
+        }
       }
     },
     /**

@@ -6,6 +6,7 @@
 import { computed, defineAsyncComponent, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import TagSelect from '@/components/TagSelect.vue'
+import DealsTable from '@/components/DealsTable.vue'
 import type { TagOption } from '@/components/tagOption'
 import { useHubStore } from '@/stores/hub'
 import { useAuthStore } from '@/stores/auth'
@@ -70,7 +71,15 @@ const nodeDispatchSymbols = computed(() => Object.keys(nodeDispatchFilters.value
 const acct = computed<AccountSnapshot | undefined>(() => hub.accounts[id.value])
 const statusOf = computed(() => hub.statuses[id.value] || node.value?.status || 'offline')
 
-type TabKey = 'overview' | 'risk' | 'trend' | 'positions' | 'prices' | 'signals' | 'feed'
+type TabKey =
+  | 'overview'
+  | 'risk'
+  | 'trend'
+  | 'positions'
+  | 'prices'
+  | 'signals'
+  | 'feed'
+  | 'deals'
 const tab = ref<TabKey>('overview')
 const tabs: { key: TabKey; label: string }[] = [
   { key: 'overview', label: '概览' },
@@ -80,6 +89,7 @@ const tabs: { key: TabKey; label: string }[] = [
   { key: 'prices', label: '报价' },
   { key: 'signals', label: '信号' },
   { key: 'feed', label: '成交回报' },
+  { key: 'deals', label: '成交明细' },
 ]
 
 // 趋势面板的候选品种：节点上报的报价 / 当前持仓 / 按币种配置三者并集
@@ -1263,6 +1273,11 @@ async function closeTicket(ticket: number): Promise<void> {
             </button>
           </div>
         </div>
+      </div>
+
+      <!-- 成交明细（MT5 真实成交；订单历史的唯一数据源） -->
+      <div v-else-if="tab === 'deals'">
+        <DealsTable :node-id="id" />
       </div>
     </template>
   </div>

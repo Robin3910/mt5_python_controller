@@ -1,9 +1,10 @@
 <script setup lang="ts">
 // 带单（跟单）页：左侧带单员列表，右侧「我的跟单」
 // 能力语义：跟单默认人人可做；带单员由管理员授予 follow_leader 角色能力产生。
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElDialog, ElMessage, ElMessageBox } from 'element-plus'
+import 'element-plus/es/components/dialog/style/css'
 import 'element-plus/es/components/message/style/css'
 import 'element-plus/es/components/message-box/style/css'
 import { fetchLeaders, fetchLeaderDetail, fetchMyFollowings, joinFollow, leaveFollow } from '@/api/follow'
@@ -22,8 +23,8 @@ interface MyFollowedNode {
   joined_at: number | null
   /** 该节点在该 leader 下所有相关分组的活跃任务合计 */
   active_task_count: number
-  /** 该节点来自哪个 group（去重后保留首条，用于移出接口） */
-  group_id: string
+  /** 该节点被跟随的**全部分组**（同一 leader 下可能同时跟多个分组，移出时必须一次性清掉） */
+  groups: { group_id: string; group_name: string | null }[]
 }
 
 /** 「我的跟单」聚合后的单条 leader 卡片数据 */
@@ -33,6 +34,8 @@ interface MyFollowingEntry {
   /** 不可跟单的人读原因（带单员已撤销 / 切换主节点 / 不在本市场等） */
   unmarketable_reason?: string | null
   nodes: MyFollowedNode[]
+  /** 我在该 leader 下跟的分组（分组级活跃任务数只此一份，不能按节点重复累加） */
+  groups: { group_id: string; group_name: string | null; active_task_count: number }[]
 }
 
 const router = useRouter()
@@ -57,53 +60,54 @@ const _groupSet = computed(() => new Set<string>())
 const myNodeCount = computed(() => detail.value?.my_nodes.length ?? 0)
 
 // ---------------------------------------------------------------------------
-// 跟单统计（后续由历史订单数据驱动；目前使用 mock）
+// 带单员绩效（来自历史成交聚合，与订单历史页同一套口径）
 // ---------------------------------------------------------------------------
-interface LeaderStats {
-  total_profit: number      // 累计收益（USD）
-  profit_rate: number       // 收益率（%，带单员账户）
-  follower_count: number    // 当前跟单人数
-  win_rate: number          // 胜率（%）
-  total_trades: number      // 总交易笔数
-  win_trades: number        // 盈利笔数
+//
+// **没有 mock**：绩效全部读后端返回的 `leader.performance`。
+// 后端预聚合在 Redis 里（deal_agg），前端只读缓存，不自己算 ——
+// 统计口径唯一化是硬要求：两个页面胜率不一致会直接摧毁数据可信度。
+//
+// 「暂无数据」与「0」是两回事：`data_available=false` 表示该带单员名下
+// 节点未上线 / 无成交 / 同步未开，UI 要明示「暂无数据」而不是显示 0。
+
+/** 统计窗口（四档，与后端 deal_stats.WINDOWS 对齐） */
+const WINDOW_OPTIONS = [
+  { value: '7d', label: '近 7 天' },
+  { value: '30d', label: '近 30 天' },
+  { value: '90d', label: '近 90 天' },
+  { value: 'all', label: '全部' },
+] as const
+const perfWindow = ref<string>('30d')
+
+/** 列表里每个带单员的绩效（后端已算好，这里只做取值） */
+function statsOf(leader: FollowLeaderSummary): FollowLeaderSummary['performance'] {
+  return leader.performance
 }
 
-// TODO: 后续由历史订单数据驱动。存储结构：_MOCK_STATS[leaderId] = stats
-// @ts-ignore
-const _statsDb: Record<number, LeaderStats> = {}
-
-function getMockStats(leaderId: number): LeaderStats {
-  // 用 leaderId 的哈希模拟不同带单员数据，后续接入真实统计时替换为 store 查询
-  const base = (leaderId * 7 + 13) % 100
-  return {
-    total_profit: parseFloat((base * 0.123).toFixed(2)),
-    profit_rate: parseFloat(((base % 60) + 2).toFixed(1)),
-    follower_count: (base % 20) + 1,
-    win_rate: parseFloat(((base % 30) + 50).toFixed(1)),
-    total_trades: (base + 1) * 10,
-    win_trades: Math.round(((base % 30) + 50) / 100 * ((base + 1) * 10)),
-  }
+/** 跟单人数：来自跟单关系表（与订单数据无关，可独立成立） */
+function followerCountOf(leader: FollowLeaderSummary): number {
+  return leader.follower_count || leader.follower_node_count || 0
 }
 
-const currentStats = computed<LeaderStats | null>(() => {
+/** 当前详情页的绩效 */
+const currentStats = computed<FollowLeaderSummary['performance'] | null>(() => {
   if (!detail.value) return null
-  return getMockStats(detail.value.leader.leader_user_id)
+  return detail.value.leader.performance
 })
 
-const ZERO_STATS: LeaderStats = {
-  total_profit: 0, profit_rate: 0, follower_count: 0, win_rate: 0,
-  total_trades: 0, win_trades: 0,
-}
-
-/** 列表里每个带单员的统计（按 id 缓存，渲染时不再重复计算） */
-const leaderStatsMap = computed<Record<number, LeaderStats>>(() => {
-  const out: Record<number, LeaderStats> = {}
-  for (const l of leaders.value) out[l.leader_user_id] = getMockStats(l.leader_user_id)
-  return out
+/** 当前详情页的跟单人数 */
+const currentFollowerCount = computed<number>(() => {
+  if (!detail.value) return 0
+  return followerCountOf(detail.value.leader)
 })
 
-function statsOf(leaderId: number): LeaderStats {
-  return leaderStatsMap.value[leaderId] ?? ZERO_STATS
+/** 数据新鲜度：成交是准实时的，绩效必然滞后，UI 必须标注 */
+function updatedText(leader: FollowLeaderSummary): string {
+  const ts = leader.performance?.updated_at
+  if (!ts) return ''
+  const d = new Date(ts * 1000)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `数据更新于 ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
 function fmtProfit(v: number): string {
@@ -125,7 +129,7 @@ function errText(e: unknown, fallback: string): string {
 async function loadLeaders() {
   loading.value = true
   try {
-    leaders.value = await fetchLeaders(keyword.value.trim())
+    leaders.value = await fetchLeaders(keyword.value.trim(), perfWindow.value)
   } catch (e) {
     ElMessage.error(errText(e, '加载带单员失败'))
   } finally {
@@ -148,7 +152,7 @@ async function openLeader(l: FollowLeaderSummary) {
   detailLoading.value = true
   selectedNodes.value = []
   try {
-    detail.value = await fetchLeaderDetail(l.leader_user_id)
+    detail.value = await fetchLeaderDetail(l.leader_user_id, perfWindow.value)
   } catch (e) {
     detail.value = null
     ElMessage.error(errText(e, '加载带单员详情失败'))
@@ -199,20 +203,32 @@ async function submitJoin() {
 }
 
 async function doLeave(
-  leader: FollowLeaderSummary, groupId: string,
-  nodeIds: string[], closeTasks: boolean,
+  leader: FollowLeaderSummary,
+  groupIds: string[],
+  nodeIds: string[],
+  closeTasks: boolean,
 ) {
+  if (!groupIds.length || !nodeIds.length) return
   try {
     const res = await leaveFollow({
       leader_user_id: leader.leader_user_id,
-      group_ids: [groupId],
+      group_ids: groupIds,
       node_ids: nodeIds,
       close_tasks: closeTasks,
     })
-    let msg = `已移出 ${res.removed.reduce((n, r) => n + r.node_ids.length, 0)} 个节点`
+    // 后端返回的是「节点 × 分组」对，同一节点被跟多个分组会被计多次 ——
+    // 提示语按去重后的节点数算，否则「已移出 3 个节点」实际只移了 2 个。
+    const removedNodeCount = new Set(
+      res.removed.flatMap((r) => r.node_ids),
+    ).size
+    let msg = `已移出 ${removedNodeCount} 个节点`
     if (res.closing.length) msg += `，${res.closing.length} 个任务正在平仓`
     if (res.forced.length) msg += `，${res.forced.length} 个离线节点已排队补发平仓`
     if (res.warning) ElMessage.warning(res.warning)
+    // 跨市场分组：关系**未**被删除，单独提示（不能混进「已移出」的计数里）
+    if (res.skipped.length) {
+      ElMessage.warning(`有 ${res.skipped.length} 个分组属于【AI 交易】市场，未在本次移出：${res.skipped[0].reason}`)
+    }
     ElMessage.success(msg)
     await Promise.all([loadLeaders(), loadMine()])
     if (detail.value?.leader.leader_user_id === leader.leader_user_id) {
@@ -226,6 +242,10 @@ async function doLeave(
 /**
  * 「我的跟单」按 leader 聚合、按 node_id 去重，分组不再展示。
  * 后端响应里仍嵌套 `groups`，此处扁平化为 leader → nodes。
+ *
+ * 关键：同一节点可能在同一 leader 的**多个分组**下被跟随，
+ * 所以聚合时必须记全该节点所属的全部分组 —— 移出时要一次性全清，
+ * 只清一个分组会残留「半个跟单」状态（仍在其它分组收信号）。
  */
 const myFollowing = computed<MyFollowingEntry[]>(() =>
   mine.value.following.map((f) => {
@@ -237,10 +257,13 @@ const myFollowing = computed<MyFollowingEntry[]>(() =>
       for (const n of g.my_nodes) {
         const prev = nodesById.get(n.node_id)
         if (prev) {
-          prev.active_task_count += g.active_task_count
           // joined_at 取最早的那一条作为代表
           if (n.joined_at != null && (prev.joined_at == null || n.joined_at < prev.joined_at)) {
             prev.joined_at = n.joined_at
+          }
+          // 记全所属分组（去重）
+          if (!prev.groups.some((x) => x.group_id === g.group_id)) {
+            prev.groups.push({ group_id: g.group_id, group_name: g.group_name ?? null })
           }
         } else {
           nodesById.set(n.node_id, {
@@ -250,25 +273,33 @@ const myFollowing = computed<MyFollowingEntry[]>(() =>
             status: n.status ?? null,
             joined_at: n.joined_at ?? null,
             active_task_count: g.active_task_count,
-            group_id: g.group_id,
+            groups: [{ group_id: g.group_id, group_name: g.group_name ?? null }],
           })
         }
       }
+    }
+    // 运行中任务数：按**去重后的分组**求和，避免同一分组被重复计数
+    for (const node of nodesById.values()) {
+      const ids = new Set(node.groups.map((x) => x.group_id))
+      let sum = 0
+      for (const g of f.groups) {
+        if (ids.has(g.group_id)) sum += g.active_task_count
+      }
+      node.active_task_count = sum
     }
     return {
       leader: f.leader,
       marketable: f.leader.marketable,
       unmarketable_reason: unmarketableReason,
       nodes: [...nodesById.values()].sort((a, b) => a.node_id.localeCompare(b.node_id)),
+      groups: f.groups.map((g) => ({
+        group_id: g.group_id,
+        group_name: g.group_name ?? null,
+        active_task_count: g.active_task_count,
+      })),
     }
   }),
 )
-
-/** 反查：给 leader + nodeId 找到其所属的 group_id（聚合时记录的那条） */
-function findGroupIdForNode(leader: FollowLeaderSummary, nodeId: string): string | null {
-  const entry = myFollowing.value.find((x) => x.leader.leader_user_id === leader.leader_user_id)
-  return entry?.nodes.find((n) => n.node_id === nodeId)?.group_id ?? null
-}
 
 /** 详情卡片打开时："我已跟随该 leader 的节点"集合 → 用于置灰 */
 const alreadyFollowingNodeIds = computed<Set<string>>(() => {
@@ -281,16 +312,111 @@ const alreadyFollowingNodeIds = computed<Set<string>>(() => {
   return ids
 })
 
-async function confirmLeave(leader: FollowLeaderSummary, nodeId: string) {
-  const groupId = findGroupIdForNode(leader, nodeId)
-  if (!groupId) return
+// ---------------------------------------------------------------------------
+// 移出跟单（多选）
+// ---------------------------------------------------------------------------
+//
+// 交互：点「移出」弹出选择框 → 勾选要移出的节点 → 确认。
+// 语义：勾选的节点会从**它被跟随的全部分组**中一次性移出，
+// 因为「跟不跟某个带单员」是节点级语义，不是分组级语义 ——
+// 只从其中一组移出会让节点继续在其它分组收信号，用户以为已经退干净了。
+interface LeaveDialogState {
+  leader: FollowLeaderSummary
+  entry: MyFollowingEntry
+  /** 待移出的节点 id */
+  selected: string[]
+}
+
+const leaveDialog = ref<LeaveDialogState | null>(null)
+const leaveSubmitting = ref(false)
+
+/**
+ * 弹窗的 v-model 桥接：开 = leaveDialog 非空，关 = 置空。
+ * 用 v-model 而不是静态 :model-value，ESC / 右上角 X 才能正常关闭。
+ */
+const leaveDialogVisible = computed<boolean>({
+  get: () => leaveDialog.value !== null,
+  set: (v) => {
+    if (!v) closeLeaveDialog()
+  },
+})
+
+/** 打开移出选择框；presetNodeId 非空时预勾选该节点 */
+function openLeaveDialog(leader: FollowLeaderSummary, presetNodeId?: string) {
   const entry = myFollowing.value.find((x) => x.leader.leader_user_id === leader.leader_user_id)
-  const node = entry?.nodes.find((n) => n.node_id === nodeId)
-  const active = node?.active_task_count ?? 0
+  if (!entry || !entry.nodes.length) return
+  leaveDialog.value = {
+    leader,
+    entry,
+    selected: presetNodeId ? [presetNodeId] : [],
+  }
+}
+
+function closeLeaveDialog() {
+  if (leaveSubmitting.value) return
+  leaveDialog.value = null
+}
+
+function toggleLeaveNode(nodeId: string) {
+  const d = leaveDialog.value
+  if (!d) return
+  const s = new Set(d.selected)
+  s.has(nodeId) ? s.delete(nodeId) : s.add(nodeId)
+  d.selected = [...s]
+}
+
+function toggleAllLeaveNodes() {
+  const d = leaveDialog.value
+  if (!d) return
+  d.selected = d.selected.length === d.entry.nodes.length ? [] : d.entry.nodes.map((n) => n.node_id)
+}
+
+/** 选中的节点涉及的分组并集（移出时要覆盖全部） */
+const leaveTargetGroupIds = computed<string[]>(() => {
+  const d = leaveDialog.value
+  if (!d) return []
+  const ids = new Set<string>()
+  for (const n of d.entry.nodes) {
+    if (!d.selected.includes(n.node_id)) continue
+    for (const g of n.groups) ids.add(g.group_id)
+  }
+  return [...ids]
+})
+
+/**
+ * 选中的节点涉及的运行中任务数。
+ *
+ * 按**分组去重**求和，而不是按节点累加 —— 多个被选节点可能同属一个分组，
+ * 那个分组的活跃任务数只有一份，按节点累加会把同一个任务算好几次，
+ * 导致「平仓关闭」提示的数量虚高。
+ */
+const leaveActiveTaskCount = computed<number>(() => {
+  const d = leaveDialog.value
+  if (!d) return 0
+  const ids = new Set(leaveTargetGroupIds.value)
+  let sum = 0
+  for (const g of d.entry.groups) {
+    if (ids.has(g.group_id)) sum += g.active_task_count
+  }
+  return sum
+})
+
+async function confirmLeave() {
+  const d = leaveDialog.value
+  if (!d || !d.selected.length) return
+  const nodeIds = [...d.selected]
+  const groupIds = leaveTargetGroupIds.value
+  const active = leaveActiveTaskCount.value
+
+  // 无进行中任务：直接移出
   if (!active) {
-    await doLeave(leader, groupId, [nodeId], false)
+    leaveSubmitting.value = true
+    await doLeave(d.leader, groupIds, nodeIds, false)
+    leaveSubmitting.value = false
+    leaveDialog.value = null
     return
   }
+
   // 有进行中的任务：让用户在「平仓后移出」和「保留任务」之间二选一
   try {
     const choice = await ElMessageBox({
@@ -298,8 +424,8 @@ async function confirmLeave(leader: FollowLeaderSummary, nodeId: string) {
       type: 'warning',
       dangerouslyUseHTMLString: true,
       message:
-        `节点「${node?.name ?? nodeId}」在带单员「${leader.display_name || leader.username}」下还有 ${active} 个进行中的任务。<br/>` +
-        '移出后该带单员不再向它下发新信号，现有任务如何处理？',
+        `选中的 ${nodeIds.length} 个节点在带单员「${d.leader.display_name || d.leader.username}」下还有 ${active} 个进行中的任务。<br/>` +
+        '移出后该带单员不再向它们下发新信号，现有任务如何处理？',
       distinguishCancelAndClose: true,
       confirmButtonText: '平仓并关闭任务后移出',
       cancelButtonText: '保留任务，仅停止接收新信号',
@@ -307,11 +433,22 @@ async function confirmLeave(leader: FollowLeaderSummary, nodeId: string) {
       .then((r) => r.value)
       .catch((r) => (r === 'cancel' ? 'keep' : 'close'))
     if (choice === 'close') return
-    await doLeave(leader, groupId, [nodeId], choice === 'confirm')
+    leaveSubmitting.value = true
+    await doLeave(d.leader, groupIds, nodeIds, choice === 'confirm')
+    leaveSubmitting.value = false
+    leaveDialog.value = null
   } catch {
     // 关闭弹窗：不处理
   }
 }
+
+// 统计窗口切换：重拉列表 + 当前详情（窗口是纯读缓存，切换零延迟）
+watch(perfWindow, () => {
+  void loadLeaders()
+  if (detail.value) {
+    void openLeader(detail.value.leader)
+  }
+})
 
 onMounted(() => {
   void loadLeaders()
@@ -335,6 +472,19 @@ onMounted(() => {
         <div class="row between" style="margin-bottom: 12px">
           <strong>带单员</strong>
           <span class="muted" style="font-size: 12px">{{ leaders.length }} 人开放</span>
+        </div>
+        <!-- 统计窗口：所有带单员同一窗口，否则没法横向比较 -->
+        <div class="row" style="gap: 6px; margin-bottom: 10px; flex-wrap: wrap">
+          <span class="muted" style="font-size: 12px">统计窗口</span>
+          <button
+            v-for="opt in WINDOW_OPTIONS"
+            :key="opt.value"
+            class="btn-sm"
+            :class="perfWindow === opt.value ? 'btn-primary' : 'btn-ghost'"
+            @click="perfWindow = opt.value"
+          >
+            {{ opt.label }}
+          </button>
         </div>
         <input
           v-model="keyword"
@@ -363,29 +513,33 @@ onMounted(() => {
               <span v-else class="tag">未跟</span>
             </div>
 
-            <!-- 4 项统计（后续由历史订单数据驱动） -->
+            <!-- 4 项统计（真实成交聚合，与订单历史页同一口径） -->
             <div class="leader-stats">
               <div class="ls-item">
                 <span class="ls-k">累计收益</span>
-                <span class="ls-v" :style="{ color: pctColor(statsOf(l.leader_user_id).total_profit) }">
-                  {{ fmtProfit(statsOf(l.leader_user_id).total_profit) }}
+                <span v-if="!l.performance?.data_available" class="ls-v muted">暂无数据</span>
+                <span v-else class="ls-v" :style="{ color: pctColor(statsOf(l).total_profit) }">
+                  {{ fmtProfit(statsOf(l).total_profit) }}
                 </span>
               </div>
               <div class="ls-item">
                 <span class="ls-k">收益率</span>
-                <span class="ls-v" :style="{ color: pctColor(statsOf(l.leader_user_id).profit_rate) }">
-                  {{ fmtRate(statsOf(l.leader_user_id).profit_rate) }}
+                <span v-if="!l.performance?.data_available" class="ls-v muted">暂无数据</span>
+                <span v-else class="ls-v" :style="{ color: pctColor(statsOf(l).profit_rate) }">
+                  {{ fmtRate(statsOf(l).profit_rate) }}
                 </span>
               </div>
               <div class="ls-item">
                 <span class="ls-k">跟单人数</span>
-                <span class="ls-v">{{ statsOf(l.leader_user_id).follower_count }} 人</span>
+                <span class="ls-v">{{ followerCountOf(l) }} 人</span>
               </div>
               <div class="ls-item">
                 <span class="ls-k">胜率</span>
-                <span class="ls-v">{{ statsOf(l.leader_user_id).win_rate }}%</span>
+                <span v-if="!l.performance?.data_available" class="ls-v muted">暂无数据</span>
+                <span v-else class="ls-v">{{ statsOf(l).win_rate.toFixed(2) }}%</span>
               </div>
             </div>
+            <div v-if="updatedText(l)" class="ls-updated muted">{{ updatedText(l) }}</div>
           </li>
         </ul>
       </section>
@@ -400,28 +554,35 @@ onMounted(() => {
             <button class="btn-sm btn-ghost" @click="detail = null">返回列表</button>
           </div>
 
-          <!-- 跟单统计卡片（后续由历史订单数据驱动） -->
+          <!-- 跟单统计卡片（真实成交聚合） -->
           <div v-if="currentStats" class="stats-grid">
             <div class="stat-card">
               <div class="stat-label">累计收益</div>
-              <div class="stat-value" :style="{ color: pctColor(currentStats.total_profit) }">
+              <div v-if="!currentStats.data_available" class="stat-value muted">暂无数据</div>
+              <div v-else class="stat-value" :style="{ color: pctColor(currentStats.total_profit) }">
                 {{ fmtProfit(currentStats.total_profit) }}
               </div>
             </div>
             <div class="stat-card">
               <div class="stat-label">收益率</div>
-              <div class="stat-value" :style="{ color: pctColor(currentStats.profit_rate) }">
+              <div v-if="!currentStats.data_available" class="stat-value muted">暂无数据</div>
+              <div v-else-if="!currentStats.profit_rate_valid" class="stat-value muted">—</div>
+              <div v-else class="stat-value" :style="{ color: pctColor(currentStats.profit_rate) }">
                 {{ fmtRate(currentStats.profit_rate) }}
               </div>
             </div>
             <div class="stat-card">
               <div class="stat-label">跟单人数</div>
-              <div class="stat-value">{{ currentStats.follower_count }} 人</div>
+              <div class="stat-value">{{ currentFollowerCount }} 人</div>
             </div>
             <div class="stat-card">
               <div class="stat-label">胜率</div>
-              <div class="stat-value">{{ currentStats.win_rate }}%</div>
+              <div v-if="!currentStats.data_available" class="stat-value muted">暂无数据</div>
+              <div v-else class="stat-value">{{ currentStats.win_rate.toFixed(2) }}%</div>
             </div>
+          </div>
+          <div v-if="updatedText(detail.leader)" class="muted" style="font-size: 12px; margin-top: -4px">
+            {{ updatedText(detail.leader) }}
           </div>
 
           <h4 class="sec-title">我的节点（可多选）</h4>
@@ -491,7 +652,16 @@ onMounted(() => {
                     </template>
                   </span>
                 </strong>
-                <span v-if="!f.marketable" class="tag amber">{{ f.unmarketable_reason || '该带单员已关闭带单' }}</span>
+                <div class="row" style="gap: 8px">
+                  <span v-if="!f.marketable" class="tag amber">{{ f.unmarketable_reason || '该带单员已关闭带单' }}</span>
+                  <button
+                    v-if="f.nodes.length"
+                    class="btn-sm btn-ghost"
+                    @click="openLeaveDialog(f.leader)"
+                  >
+                    移出节点
+                  </button>
+                </div>
               </div>
               <p
                 v-if="!f.nodes.length"
@@ -509,8 +679,11 @@ onMounted(() => {
                     <template v-if="n.active_task_count">
                       · 运行中 {{ n.active_task_count }} 单
                     </template>
+                    <template v-if="n.groups.length > 1">
+                      · 跟自 {{ n.groups.length }} 个分组
+                    </template>
                   </span>
-                  <button class="btn-sm btn-ghost" @click="confirmLeave(f.leader, n.node_id)">
+                  <button class="btn-sm btn-ghost" @click="openLeaveDialog(f.leader, n.node_id)">
                     移出
                   </button>
                 </div>
@@ -520,6 +693,80 @@ onMounted(() => {
         </template>
       </section>
     </div>
+
+    <!-- 移出跟单：选择要移出的节点（一次清空该节点被跟随的全部分组） -->
+    <ElDialog
+      v-if="leaveDialog"
+      v-model="leaveDialogVisible"
+      width="460px"
+      title="移出跟单"
+      :close-on-click-modal="false"
+      align-center
+      class="leave-dialog"
+    >
+      <p class="muted" style="margin: 0 0 10px; font-size: 12px">
+        带单员「{{ leaveDialog.leader.display_name || leaveDialog.leader.username }}」
+        · 勾选要移出的节点，移出后该带单员不再向它们下发信号
+      </p>
+      <div class="leave-all">
+        <label>
+          <input
+            type="checkbox"
+            :checked="leaveDialog.selected.length === leaveDialog.entry.nodes.length && leaveDialog.entry.nodes.length > 0"
+            @change="toggleAllLeaveNodes"
+          />
+          <span>全选（{{ leaveDialog.entry.nodes.length }} 个节点）</span>
+        </label>
+      </div>
+      <ul class="leave-list">
+        <li
+          v-for="n in leaveDialog.entry.nodes"
+          :key="n.node_id"
+          class="leave-item"
+          :class="{ on: leaveDialog.selected.includes(n.node_id) }"
+          @click="toggleLeaveNode(n.node_id)"
+        >
+          <label>
+            <input
+              type="checkbox"
+              :checked="leaveDialog.selected.includes(n.node_id)"
+              @click.stop
+              @change="toggleLeaveNode(n.node_id)"
+            />
+            <span class="pick-name">{{ n.name || n.node_id }}</span>
+          </label>
+          <span class="muted" style="font-size: 12px">
+            MT5 {{ n.mt5_login ?? '—' }}
+            <template v-if="n.groups.length">
+              · {{ n.groups.map((g) => g.group_name || g.group_id).join('、') }}
+            </template>
+            <template v-if="n.active_task_count"> · 运行中 {{ n.active_task_count }} 单</template>
+          </span>
+        </li>
+      </ul>
+      <p v-if="leaveActiveTaskCount" class="muted" style="margin: 10px 0 0; font-size: 12px">
+        选中的节点还有 {{ leaveActiveTaskCount }} 个进行中的任务，移出时可选择是否平仓关闭。
+      </p>
+      <template #footer>
+        <div class="row between" style="width: 100%">
+          <span class="muted" style="font-size: 12px">
+            已选 {{ leaveDialog.selected.length }} 个节点 · 涉及 {{ leaveTargetGroupIds.length }} 个分组
+          </span>
+          <div class="row" style="gap: 8px">
+            <button class="btn-sm btn-ghost" :disabled="leaveSubmitting" @click="closeLeaveDialog">
+              取消
+            </button>
+            <button
+              class="btn-sm btn-primary"
+              :disabled="!leaveDialog.selected.length || leaveSubmitting"
+              @click="confirmLeave"
+            >
+              {{ leaveSubmitting ? '提交中...' : '确认移出' }}
+            </button>
+          </div>
+        </div>
+      </template>
+    </ElDialog>
   </div>
 </template>
 
@@ -781,5 +1028,57 @@ onMounted(() => {
   gap: 10px;
   padding: 6px 0 0 12px;
   font-size: 12px;
+}
+
+/* ── 移出跟单选择弹窗 ───────────────────────────────── */
+.leave-all {
+  padding: 6px 10px;
+  border: 1px dashed var(--glass-border);
+  border-radius: var(--radius);
+  margin-bottom: 8px;
+}
+
+.leave-all label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.leave-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 45vh;
+  overflow-y: auto;
+}
+
+.leave-item {
+  padding: 8px 10px;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.leave-item:hover {
+  border-color: var(--primary);
+}
+
+.leave-item.on {
+  border-color: var(--primary);
+  background: var(--glass);
+}
+
+.leave-item label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: inherit;
+  margin-right: 10px;
 }
 </style>

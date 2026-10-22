@@ -19,6 +19,7 @@ from . import (
     close,
     config_api,
     console_api,
+    deals_api,
     events,
     follow_api,
     grid_sizing_api,
@@ -44,6 +45,7 @@ from . import (
 from .config import Config
 from .connections import manager
 from .db import engine, init_db
+from .deal_agg import LeaderStatsAggregator
 from .dispatcher import Dispatcher
 from .group_dispatcher import GroupDispatcher
 from .poll_queue import PollWorker
@@ -98,6 +100,10 @@ async def lifespan(app: FastAPI):
     state.group_dispatcher = GroupDispatcher(store)
     state.poll_worker = PollWorker(store, state.dispatcher)
     state.poll_worker.start()
+    # 带单员绩效预聚合：后台把「所有带单员 × 四个窗口」的绩效算好写 Redis，
+    # 列表接口只读缓存（未命中不回源查库，延迟恒定）。
+    state.leader_stats_agg = LeaderStatsAggregator(store)
+    state.leader_stats_agg.start()
     logger.info("MT5 hub ready")
     try:
         yield
@@ -107,6 +113,8 @@ async def lifespan(app: FastAPI):
         # 换个循环去 dispose 收不干净，会留下悬挂的连接与文件句柄。
         if state.poll_worker:
             await state.poll_worker.stop()
+        if state.leader_stats_agg:
+            await state.leader_stats_agg.stop()
         await store.close()
         await engine.dispose()
 
@@ -146,6 +154,7 @@ for r in (
     trading_api.router,
     follow_api.router,
     ai_follow_api.router,
+    deals_api.router,
 ):
     app.include_router(r)
 

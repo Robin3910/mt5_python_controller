@@ -25,6 +25,7 @@ import websockets
 
 import account_risk
 from config import clamp_account_report_interval, get_settings
+from deal_cursor import DealCursor
 from local_status import LocalStatusServer
 from market_hub import MarketHub
 from mt5_prompt import prompt_mt5_credentials, require_dashboard_account
@@ -437,13 +438,15 @@ class NodeClient:
         return False
 
     async def _serve(self, ws) -> None:
-        """并发跑三个任务；任一退出(通常是断线)即取消其余，触发外层重连。"""
+        """并发跑四个任务；任一退出(通常是断线)即取消其余，触发外层重连。"""
         self.ws_connected = True
         tasks = [
             asyncio.create_task(self._reporter(ws)),
             asyncio.create_task(self._heartbeat(ws)),
             asyncio.create_task(self._receiver(ws)),
         ]
+        if settings.deals_sync_enabled:
+            tasks.append(asyncio.create_task(self._deals_reporter(ws)))
         try:
             done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for t in done:
@@ -470,6 +473,65 @@ class NodeClient:
             await ws.send(json.dumps({"type": "account", "data": snap}))
             await self._check_account_risk(ws, snap)
             await asyncio.sleep(clamp_account_report_interval(settings.account_report_interval))
+
+    async def _deals_reporter(self, ws) -> None:
+        """定时采集 MT5 历史成交并上报服务端（订单历史 / 带单绩效的数据源）。
+
+        关键约定：**只有确认上报成功后才推进游标**。读失败或发送失败时游标保持不动，
+        下一轮会重新采集同一批 —— 宁可重复（服务端按成交号幂等），不可丢失。
+        """
+        cursor = DealCursor(self.expected_mt5_login)
+        cursor.load(lookback_days=settings.deals_lookback_days)
+        while True:
+            try:
+                sent = await self._collect_deals(ws, cursor)
+                if sent:
+                    logger.info("deals collected: %s rows", sent)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                # 采集失败不致命：保留游标，下一轮重试
+                logger.warning("deals collection failed: %s", e)
+            await asyncio.sleep(max(5.0, float(settings.deals_sync_interval)))
+
+    async def _collect_deals(self, ws, cursor: DealCursor) -> int:
+        """采集一批增量成交并上报；返回本次上报的条数。"""
+        since_ts = cursor.since_ts
+        after_id = cursor.last_deal_id
+        reader = getattr(self.mt5, "history_deals_since", None)
+        if reader is None:
+            raise RuntimeError("history_deals_since unsupported by this client")
+        # 读失败必须抛错（不能返回空列表），否则游标会误推进
+        rows = await self._exec(reader, since_ts, after_id)
+        if not rows:
+            return 0
+        # 账户快照随成交一起上报：收益率的分母（区间期初权益）靠它算。
+        # 读不到就照常上报成交，只是收益率算不出来。
+        try:
+            account = await self._exec(self.mt5.account_info) or {}
+        except Exception:  # noqa: BLE001
+            account = {}
+        # 分批上报，避免单条消息过大
+        batch_size = max(1, int(settings.deals_batch_size))
+        total = 0
+        for start in range(0, len(rows), batch_size):
+            chunk = rows[start:start + batch_size]
+            await ws.send(json.dumps({
+                "type": "deals_report",
+                "data": {
+                    "deals": chunk,
+                    "account": {
+                        "balance": account.get("balance"),
+                        "equity": account.get("equity"),
+                    },
+                },
+            }))
+            total += len(chunk)
+        # 上报成功后才推进游标
+        max_id = max(int(r.get("deal_id") or 0) for r in rows)
+        max_ts = max(float(r.get("time") or 0.0) for r in rows)
+        cursor.advance(since_ts=max_ts, last_deal_id=max_id)
+        return total
 
     async def _heartbeat(self, ws) -> None:
         """定时心跳，维持服务端在线标记。"""

@@ -42,6 +42,7 @@ class MockMT5Client:
         self._pending: list[dict] = []           # 内存挂单（未成交）
         self._realized_by_magic: dict[int, float] = {}  # 按魔术号累计已实现盈亏
         self._exit_deals: list[dict] = []         # 出场成交（供收口原因汇总）
+        self._deals: list[dict] = []              # 全部成交流水（开仓 + 出场），供增量采集
         self.prices_map = dict(_DEFAULT_PRICES)
         # 逐笔持仓的对冲账户；改成 netting 可模拟网格被拒的场景
         self.margin_mode = "hedging"
@@ -123,6 +124,18 @@ class MockMT5Client:
             }
         )
         logger.info("MOCK open %s %s %.2f @ %.5f -> ticket %s", action, symbol, volume, price, tk)
+        self._record_deal(
+            entry="IN",
+            reason=0,
+            position_id=tk,
+            symbol=symbol.upper(),
+            direction="BUY" if action == "BUY" else "SELL",
+            volume=float(volume),
+            price=price,
+            profit=0.0,
+            magic=int(magic or self.magic),
+            comment=comment,
+        )
         return {"success": True, "symbol": symbol, "retcode": 10009,
                 "order": tk, "deal": tk, "volume": float(volume), "price": price}
 
@@ -209,6 +222,18 @@ class MockMT5Client:
             }
         )
         logger.info("MOCK pending filled: ticket %s @ %.5f", order["ticket"], price)
+        self._record_deal(
+            entry="IN",
+            reason=0,
+            position_id=int(order["ticket"]),
+            symbol=str(order["symbol"] or ""),
+            direction="BUY" if str(order.get("type")) == "BUY" else "SELL",
+            volume=float(order.get("volume") or 0),
+            price=price,
+            profit=0.0,
+            magic=int(order.get("magic") or self.magic),
+            comment=str(order.get("comment") or ""),
+        )
 
     def fill_pending_order(self, ticket: int) -> bool:
         """测试用：不看价格，强制成交某张挂单。"""
@@ -260,6 +285,54 @@ class MockMT5Client:
             "profit": float(profit),
             "time": time.time(),
         })
+        self._record_deal(
+            entry="OUT",
+            reason=int(reason),
+            position_id=int(pos.get("ticket") or 0),
+            symbol=str(pos.get("symbol") or ""),
+            direction=("SELL" if str(pos.get("type")) == "BUY" else "BUY"),
+            volume=float(pos.get("volume") or 0),
+            price=float(pos.get("price_current") or pos.get("price_open") or 0),
+            profit=float(profit),
+            magic=int(pos.get("magic") or self.magic),
+            comment=str(pos.get("comment") or ""),
+        )
+
+    def _record_deal(
+        self, *, entry: str, reason: int, position_id: int, symbol: str,
+        direction: str, volume: float, price: float, profit: float,
+        magic: int, comment: str,
+    ) -> None:
+        """记一笔成交流水（开仓 / 出场），字段与真实 MT5 的 deal 对齐。"""
+        tk = next(self._tickets)
+        self._deals.append({
+            "deal_id": tk,
+            "order_id": tk,
+            "position_id": int(position_id or 0),
+            "symbol": str(symbol or ""),
+            "direction": direction,
+            "entry_type": entry,
+            "reason": int(reason),
+            "volume": float(volume or 0),
+            "price": float(price or 0),
+            "profit": float(profit or 0),
+            "swap": 0.0,
+            "commission": 0.0,
+            "net_profit": float(profit or 0),
+            "magic": int(magic or 0),
+            "comment": str(comment or "")[:128],
+            "time": time.time(),
+        })
+
+    def history_deals_since(self, since_ts: float, after_deal_id: int = 0) -> list[dict]:
+        """与真实 MT5Client 同口径：取增量成交流水。
+
+        mock 不按时间窗裁剪（成交都在本进程内产生），只按成交号做增量过滤。
+        """
+        floor = int(after_deal_id or 0)
+        rows = [dict(d) for d in self._deals if int(d.get("deal_id") or 0) > floor]
+        rows.sort(key=lambda r: (r["time"], r["deal_id"]))
+        return rows
 
     def close_ticket(self, ticket: int) -> dict:
         pos = next((p for p in self._positions if p["ticket"] == ticket), None)

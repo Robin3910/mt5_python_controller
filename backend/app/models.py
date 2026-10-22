@@ -152,6 +152,74 @@ class PaginatedNodeDispatches(BaseModel):
     page_size: int
 
 
+class DealRecord(BaseModel):
+    """单笔 MT5 成交明细。"""
+    id: int
+    node_id: str
+    deal_id: int
+    order_id: Optional[int] = None
+    position_id: Optional[int] = None
+    symbol: Optional[str] = None
+    direction: str = "BUY"
+    # 出场成交的方向色按「被平掉的那个持仓的方向」取（平多单在 MT5 里是 SELL）
+    position_direction: str = "BUY"
+    entry_type: str = "IN"
+    entry_label: str = "开仓"
+    reason: int = 0
+    volume: float = 0.0
+    price: float = 0.0
+    profit: float = 0.0
+    swap: float = 0.0
+    commission: float = 0.0
+    net_profit: float = 0.0
+    magic: Optional[int] = None
+    comment: Optional[str] = None
+    source: str = "terminal"
+    source_label: str = "终端"
+    signal_id: Optional[str] = None
+    task_id: Optional[int] = None
+    group_id: Optional[str] = None
+    deal_time: int = 0
+
+
+class DealSummary(BaseModel):
+    """成交汇总（统计口径集中在 deal_stats，前端直接展示不要自己再算）。"""
+    total_profit: float = 0.0
+    profit_rate: float = 0.0
+    win_rate: float = 0.0
+    # 交易笔数 = 持仓数（按 position_id 聚合），不是成交笔数
+    total_trades: int = 0
+    win_trades: int = 0
+    lose_trades: int = 0
+    gross_volume: float = 0.0
+    commission_total: float = 0.0
+    swap_total: float = 0.0
+    # 区间期初权益（收益率的分母）
+    base_equity: float = 0.0
+    # 期初权益拿不到时收益率为 0 且此标志为 False（前端应显示「暂无数据」）
+    profit_rate_valid: bool = True
+    # 节点未上线 / 无成交 / 同步未开 —— 与「有数据但全亏」区分
+    data_available: bool = False
+    updated_at: Optional[int] = None
+
+
+class PaginatedDeals(BaseModel):
+    """成交明细分页结果（summary 与 items 同一 WHERE 条件）。"""
+    items: list[DealRecord]
+    total: int
+    page: int
+    page_size: int
+    summary: DealSummary = Field(default_factory=DealSummary)
+
+
+class LeaderPerformance(BaseModel):
+    """带单员绩效（由成交聚合而来）。"""
+    leader_user_id: int
+    window: str = "30d"
+    performance: DealSummary = Field(default_factory=DealSummary)
+    follower_count: int = 0
+
+
 class SignalEventDispatch(BaseModel):
     """单条 Webhook 信号在某节点上的处理明细。"""
     id: int
@@ -979,6 +1047,15 @@ class FollowLeaderSummary(BaseModel):
     my_follow_group_count: int = 0
     my_follow_node_count: int = 0
     marketable: bool = True
+    # —— 绩效（由历史成交聚合，与订单历史页同一套口径）——
+    # 聚合绩效公开可见：带单广场是公开的，绩效就是给潜在跟单者看的。
+    performance: DealSummary = Field(default_factory=DealSummary)
+    # 当前统计窗口（7d / 30d / 90d / all）
+    perf_window: str = "30d"
+    # 跟单人数（来自跟单关系表，非订单数据）
+    follower_count: int = 0
+    # 聚合缓存是否命中（未命中 = 该带单员暂无成交数据）
+    perf_available: bool = False
 
 
 class FollowLeaderListResponse(BaseModel):
@@ -1037,6 +1114,8 @@ class FollowLeaveResponse(BaseModel):
     closing: list[dict] = Field(default_factory=list)
     forced: list[dict] = Field(default_factory=list)
     warning: Optional[str] = None
+    # 跨市场跳过的分组（关系**未**被删除）：[{group_id, group_name, reason}]
+    skipped: list[dict] = Field(default_factory=list)
 
 
 class FollowMyGroup(BaseModel):
@@ -1175,6 +1254,8 @@ class AiLeaveResponse(BaseModel):
     closing: list[dict] = Field(default_factory=list)
     forced: list[dict] = Field(default_factory=list)
     warning: Optional[str] = None
+    # 跨市场跳过的分组（关系**未**被删除）：[{group_id, group_name, reason}]
+    skipped: list[dict] = Field(default_factory=list)
 
 
 class UserOut(BaseModel):
