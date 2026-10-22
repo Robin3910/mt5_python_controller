@@ -329,10 +329,6 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
 
 <template>
   <div class="page follow-wrap">
-    <header class="banner danger">
-      <strong>AI 智能加仓策略会持续累积仓位</strong>
-      <span>你的节点将用<strong>自己的资金</strong>执行机器人的加仓计划，无法锁定参数。请先看清风险上限。</span>
-    </header>
 
     <div class="main-grid">
       <!-- 左：广场 -->

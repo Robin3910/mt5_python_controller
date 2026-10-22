@@ -400,28 +400,6 @@ onMounted(() => {
             <button class="btn-sm btn-ghost" @click="detail = null">返回列表</button>
           </div>
 
-          <!-- 不在本市场的分组（AI 加仓等）：置灰展示，让用户知道「之前跟的 AI 分组去哪了」 -->
-          <div v-if="detail.hidden_groups && detail.hidden_groups.length" class="hidden-groups">
-            <h4 class="sec-title muted">
-              不在普通跟单市场（{{ detail.hidden_groups.length }}）
-              <span style="font-weight: 400">AI 加仓策略请到【AI 交易】页跟单</span>
-            </h4>
-            <ul class="pick-list">
-              <li
-                v-for="g in detail.hidden_groups"
-                :key="g.group_id"
-                class="pick-item disabled"
-              >
-                <span class="pick-name">{{ g.name }}</span>
-                <span class="muted">{{ g.strategy_name || g.strategy_template }}</span>
-                <span class="tag amber">{{ g.unselectable_reason }}</span>
-                <span v-if="g.my_follow_node_ids.length" class="muted" style="margin-left: 8px">
-                  · 我已跟 {{ g.my_follow_node_ids.length }} 节点
-                </span>
-              </li>
-            </ul>
-          </div>
-
           <!-- 跟单统计卡片（后续由历史订单数据驱动） -->
           <div v-if="currentStats" class="stats-grid">
             <div class="stat-card">
