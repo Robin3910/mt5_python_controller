@@ -29,7 +29,6 @@ import type {
   AiMyRobot,
   AiRobotDetailResponse,
   AiRobotSummary,
-  FollowNodeBrief,
 } from '@/api/types'
 
 const robots = ref<AiRobotSummary[]>([])
@@ -174,12 +173,6 @@ function fmtNullable(v: number | null | undefined, suffix = '', digits = 2): str
 function fmtIntNullable(v: number | null | undefined): string {
   if (v == null) return '—'
   return String(Math.trunc(v))
-}
-
-function onlineBadge(n: FollowNodeBrief | null | undefined): { text: string; cls: string } {
-  if (!n) return { text: '未配主节点', cls: 'muted' }
-  if (n.online) return { text: '在线', cls: 'ok' }
-  return { text: '离线', cls: 'off' }
 }
 
 function primaryText(robot: AiRobotSummary): string {
@@ -442,7 +435,6 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
                 />
                 <span class="pick-name">{{ n.name || n.node_id }}</span>
                 <span class="muted">MT5 {{ n.mt5_login ?? '?' }}</span>
-                <!-- <span :class="onlineBadge(n).cls">· {{ onlineBadge(n).text }}</span> -->
                 <span v-if="alreadyFollowingNodeIds.has(n.node_id)" class="tag amber">已跟过</span>
               </label>
             </li>
