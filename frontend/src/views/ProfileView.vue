@@ -6,6 +6,7 @@ import { ElMessage } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
 import { useAuthStore } from '@/stores/auth'
 import { copyToClipboard } from '@/utils/clipboard'
+import { disconnectAdminWs } from '@/services/ws'
 import type { ProfileHubModule } from '@/api/types'
 
 const auth = useAuthStore()
@@ -146,6 +147,13 @@ async function copyWebhook(): Promise<void> {
   const ok = await copyToClipboard(WEBHOOK_URL)
   ElMessage.success(ok ? 'webhook 地址已复制' : '复制失败')
 }
+
+/** 退出登录：断开后台 WS 后清空登录态并回到登录页 */
+function logout(): void {
+  disconnectAdminWs()
+  auth.logout()
+  router.push({ name: 'login' })
+}
 </script>
 
 <template>
@@ -195,6 +203,11 @@ async function copyWebhook(): Promise<void> {
         </div>
         <div class="hub-card-arrow" aria-hidden="true">→</div>
       </button>
+    </div>
+
+    <!-- 退出登录：置于页面最底部 -->
+    <div class="profile-logout">
+      <button type="button" class="btn-ghost btn-sm btn-logout" @click="logout">退出登录</button>
     </div>
   </div>
 </template>
@@ -353,6 +366,23 @@ async function copyWebhook(): Promise<void> {
 .hub-card:hover .hub-card-arrow {
   opacity: 1;
   transform: translateX(0);
+}
+
+/* ── 退出登录 ── */
+.profile-logout {
+  display: flex;
+  justify-content: center;
+  padding: 8px 0 4px;
+}
+
+.profile-logout .btn-logout {
+  color: var(--red);
+  border-color: rgba(239, 68, 68, 0.4);
+}
+
+.profile-logout .btn-logout:hover {
+  background: rgba(239, 68, 68, 0.12);
+  border-color: var(--red);
 }
 
 /* ── Mobile ── */

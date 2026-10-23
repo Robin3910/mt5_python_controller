@@ -45,12 +45,6 @@ function setupWs(): void {
 
 onMounted(setupWs)
 watch(() => auth.token, setupWs)
-
-function logout(): void {
-  disconnectAdminWs()
-  auth.logout()
-  router.push({ name: 'login' })
-}
 </script>
 
 <template>
@@ -149,7 +143,6 @@ function logout(): void {
       <span v-if="userLabel" class="muted topbar-user" :title="auth.isAdmin ? '超级管理员' : '普通用户'">
         {{ userLabel }}
       </span>
-      <button class="btn-ghost btn-sm btn-logout" @click="logout">退出</button>
     </header>
 
     <main :class="authed ? 'content' : 'content-full'">

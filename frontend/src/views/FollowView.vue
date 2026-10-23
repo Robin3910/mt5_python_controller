@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // 带单（跟单）页：左侧带单员列表，右侧「我的跟单」
 // 能力语义：跟单默认人人可做；带单员由管理员授予 follow_leader 角色能力产生。
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElDialog, ElMessage, ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/dialog/style/css'
@@ -110,8 +110,16 @@ function updatedText(leader: FollowLeaderSummary): string {
   return `数据更新于 ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
+/**
+ * 金额格式化：符号在货币符号**之前**（-$123.45 / +$123.45）。
+ *
+ * 原来负数写成 `$-123.45`（负号在 $ 后面），不符合金额书写惯例，
+ * 在深色背景上 `-$` 连在一起也容易看漏方向。桌面端和手机端共用这个函数，
+ * 改一处即可同时修好两端。
+ */
 function fmtProfit(v: number): string {
-  return (v >= 0 ? '+' : '') + '$' + v.toFixed(2)
+  const sign = v > 0 ? '+' : v < 0 ? '-' : ''
+  return sign + '$' + Math.abs(v).toFixed(2)
 }
 function fmtRate(v: number): string {
   return (v >= 0 ? '+' : '') + v.toFixed(1) + '%'
@@ -195,6 +203,9 @@ async function submitJoin() {
     ElMessage.success(msg)
     selectedNodes.value = []
     await Promise.all([loadLeaders(), loadMine()])
+    // 手机端收起详情并跳到「我的跟单」：成功结果在那里才看得见。
+    // 桌面端保持留在详情页（detail 仍非空，原有行为不变）。
+    if (mobileSheetOpen.value) afterJoinSettled()
   } catch (e) {
     ElMessage.error(errText(e, '加入跟单失败'))
   } finally {
@@ -456,6 +467,70 @@ watch(perfWindow, () => {
     void openLeader(detail.value.leader)
   }
 })
+
+// ---------------------------------------------------------------------------
+// 手机端布局状态
+// ---------------------------------------------------------------------------
+//
+// 手机端不复用桌面的「左列表 + 右详情」两栏（窄屏下会退化成嵌套滚动），
+// 改为：顶部分段切换「带单员 / 我的跟单」+ 点带单员进全屏详情页。
+// 这些状态只在 ≤768px 生效，桌面端看不到，所以可以与桌面共用同一批数据源。
+
+/** 分段切换当前面板 */
+const mobileTab = ref<'leaders' | 'mine'>('leaders')
+
+/** 详情全屏页是否打开（与桌面共用 detail 数据，只是手机端多一层遮罩） */
+const mobileSheetOpen = ref(false)
+
+/** 手机端打开详情：立刻弹页 + 拉数据，避免点完没有反馈 */
+async function openMobileLeader(l: FollowLeaderSummary) {
+  mobileSheetOpen.value = true
+  await openLeader(l)
+}
+
+/** 关闭详情页并回到列表 */
+function closeMobileSheet() {
+  mobileSheetOpen.value = false
+  selectedNodes.value = []
+  detail.value = null
+}
+
+// 详情页打开时锁住背景滚动：手机端全屏页是 fixed 覆盖层，
+// 不锁的话手指在页面上滑会连带把背后的列表一起滚掉。
+watch(mobileSheetOpen, (open) => {
+  document.body.style.overflow = open ? 'hidden' : ''
+})
+
+onBeforeUnmount(() => {
+  document.body.style.overflow = ''
+})
+
+// 跟单成功后：手机端收起详情页并切到「我的跟单」，让结果立刻可见。
+// 只改移动端状态，不动 detail —— 桌面端保持「留在详情页」的原有行为。
+function afterJoinSettled() {
+  mobileSheetOpen.value = false
+  mobileTab.value = 'mine'
+}
+
+/** 当前统计窗口的中文标签（详情页标题里要显示"这些数字算的是哪一段"） */
+const perfWindowLabel = computed(
+  () => WINDOW_OPTIONS.find((o) => o.value === perfWindow.value)?.label ?? '',
+)
+
+/**
+ * 手机端紧凑日期。
+ *
+ * 列表里只需要"哪天跟的"，`toLocaleString` 产出的
+ * `2026/10/23 10:34:00` 在窄屏上会把整行节点信息挤爆。
+ */
+function fmtJoinedShort(ts: number | null): string {
+  if (!ts) return '—'
+  const d = new Date(ts * 1000)
+  const sameYear = d.getFullYear() === new Date().getFullYear()
+  return sameYear
+    ? `${d.getMonth() + 1}月${d.getDate()}日`
+    : `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`
+}
 
 onMounted(() => {
   void loadLeaders()
@@ -817,6 +892,265 @@ onMounted(() => {
         </div>
       </template>
     </ElDialog>
+
+    <!-- ══════════════════════════════════════════════════════════════
+         手机端专属层（≤768px 可见，桌面端 display:none）
+         结构：分段切换「带单员 / 我的跟单」+ 全屏详情页
+         ══════════════════════════════════════════════════════════════ -->
+
+    <!-- 顶部分段切换：手机上「带单员」和「我的跟单」是两份互斥信息，
+         堆在一起会让页面变成很长的滚动条。 -->
+    <div class="m-only m-tabs" role="tablist" aria-label="带单广场">
+      <button
+        v-for="t in ([
+          { key: 'leaders', label: '带单员', badge: leaders.length },
+          { key: 'mine', label: '我的跟单', badge: myFollowing.length },
+        ] as const)"
+        :key="t.key"
+        class="m-tab"
+        role="tab"
+        :aria-selected="mobileTab === t.key"
+        :class="{ on: mobileTab === t.key }"
+        @click="mobileTab = t.key"
+      >
+        {{ t.label }}
+        <span v-if="t.badge" class="m-tab-badge">{{ t.badge }}</span>
+      </button>
+    </div>
+
+    <!-- ── 分段一：带单员列表 ── -->
+    <div v-show="mobileTab === 'leaders'" class="m-only m-panel">
+      <div class="m-search-wrap">
+        <input
+          v-model="keyword"
+          class="inp m-search"
+          type="search"
+          enterkeyhint="search"
+          placeholder="搜索用户名 / 节点 / MT5 号"
+          @keyup.enter="loadLeaders"
+        />
+      </div>
+
+      <!-- 统计窗口：手机端做成可横向滑动的分段控件，避免换行占掉一屏 -->
+      <div class="m-win" role="group" aria-label="统计窗口">
+        <button
+          v-for="opt in WINDOW_OPTIONS"
+          :key="opt.value"
+          class="m-win-btn"
+          :class="{ on: perfWindow === opt.value }"
+          :aria-pressed="perfWindow === opt.value"
+          @click="perfWindow = opt.value"
+        >
+          {{ opt.label }}
+        </button>
+      </div>
+
+      <div v-if="loading" class="m-empty muted">加载中...</div>
+      <div v-else-if="!leaders.length" class="m-empty muted">
+        当前没有开放跟单的带单员
+      </div>
+
+      <ul v-else class="m-leader-list">
+        <li
+          v-for="l in leaders"
+          :key="l.leader_user_id"
+          class="m-leader"
+          @click="openMobileLeader(l)"
+        >
+          <div class="m-leader-top">
+            <span class="m-leader-name">{{ l.display_name || l.username }}</span>
+            <span v-if="l.my_follow_node_count" class="tag green">已跟 {{ l.my_follow_node_count }}</span>
+            <span v-else class="tag">未跟</span>
+          </div>
+
+          <!-- 主视觉：累计收益 + 收益率放大成一行大数字。
+               手机端先给结论（赚没赚），细节指标退到下方小格子。 -->
+          <div class="m-pnl">
+            <div v-if="!l.performance?.data_available" class="m-pnl-none muted">暂无成交数据</div>
+            <template v-else>
+              <span class="m-pnl-main" :class="statsOf(l).total_profit >= 0 ? 'pos' : 'neg'">
+                {{ fmtProfit(statsOf(l).total_profit) }}
+              </span>
+              <span
+                v-if="statsOf(l).profit_rate_valid"
+                class="m-pnl-rate"
+                :class="statsOf(l).profit_rate >= 0 ? 'pos' : 'neg'"
+              >
+                {{ fmtRate(statsOf(l).profit_rate) }}
+              </span>
+            </template>
+            <span v-if="updatedText(l)" class="m-pnl-time muted">{{ updatedText(l) }}</span>
+          </div>
+
+          <div class="m-mini-row">
+            <span class="m-mini">
+              <span class="m-mini-k">胜率</span>
+              <span v-if="!l.performance?.data_available" class="m-mini-v muted">—</span>
+              <span v-else class="m-mini-v">{{ statsOf(l).win_rate.toFixed(1) }}%</span>
+            </span>
+            <span class="m-mini">
+              <span class="m-mini-k">跟单</span>
+              <span class="m-mini-v">{{ followerCountOf(l) }} 人</span>
+            </span>
+          </div>
+        </li>
+      </ul>
+    </div>
+
+    <!-- ── 分段二：我的跟单 ── -->
+    <div v-show="mobileTab === 'mine'" class="m-only m-panel">
+      <div v-if="mineLoading" class="m-empty muted">加载中...</div>
+      <div v-else-if="!mine.following.length" class="m-empty">
+        <p class="muted m-empty-text">还没有跟单</p>
+        <button class="btn-sm btn-ghost m-empty-btn" @click="mobileTab = 'leaders'">
+          去挑一个带单员
+        </button>
+      </div>
+      <div v-else class="m-mine-list">
+        <div v-for="f in myFollowing" :key="f.leader.leader_user_id" class="m-mine">
+          <div class="m-mine-head">
+            <div class="m-mine-id">
+              <span class="m-mine-name">{{ f.leader.display_name || f.leader.username }}</span>
+              <span v-if="!f.marketable" class="tag amber m-mine-tag">
+                {{ f.unmarketable_reason || '已关闭带单' }}
+              </span>
+            </div>
+            <button
+              v-if="f.nodes.length"
+              class="btn-sm btn-warn-ghost m-mine-btn"
+              @click="openLeaveDialog(f.leader)"
+            >
+              移出节点
+            </button>
+          </div>
+
+          <p v-if="!f.nodes.length" class="muted m-mine-none">暂未跟单任何节点</p>
+
+          <ul v-else class="m-mine-nodes">
+            <li v-for="n in f.nodes" :key="n.node_id" class="m-mine-node">
+              <span class="m-mine-node-name">{{ n.name || n.node_id }}</span>
+              <span v-if="n.mt5_login" class="mono m-mine-node-login">MT5 {{ n.mt5_login }}</span>
+              <span class="m-mine-node-meta muted">
+                {{ fmtJoinedShort(n.joined_at) }} 加入
+                <template v-if="n.active_task_count">
+                  · 运行中 {{ n.active_task_count }} 单
+                </template>
+              </span>
+            </li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── 全屏详情页：点带单员后覆盖整个视口，带返回按钮 ──
+         详情原来排在列表下方，手机上要点完再滚过去；这里改为整页，
+         彻底消除"列表内滚动 + 页面滚动"的双层滚动。 -->
+    <div v-if="mobileSheetOpen" class="m-sheet" role="dialog" aria-modal="true" aria-label="带单员详情">
+      <header class="m-sheet-bar">
+        <button class="m-back" aria-label="返回带单员列表" @click="closeMobileSheet">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M15 18l-6-6 6-6" />
+          </svg>
+        </button>
+        <span class="m-sheet-title">跟单详情</span>
+      </header>
+
+      <div class="m-sheet-body">
+        <div v-if="detailLoading" class="m-empty muted">加载中...</div>
+
+        <template v-else-if="detail">
+          <!-- 带单员身份 + 关键数字 -->
+          <div class="m-d-lead">
+            <div class="m-d-name">{{ detail.leader.display_name || detail.leader.username }}</div>
+            <div v-if="detail.leader.primary_node" class="m-d-node muted">
+              主节点 {{ detail.leader.primary_node.name }}
+              <template v-if="detail.leader.primary_node.mt5_login">
+                （MT5 {{ detail.leader.primary_node.mt5_login }}）
+              </template>
+            </div>
+
+            <div class="m-d-grid">
+              <div class="m-d-stat">
+                <span class="m-d-k">累计收益</span>
+                <span v-if="!currentStats?.data_available" class="m-d-v muted">暂无数据</span>
+                <span v-else class="m-d-v" :class="currentStats.total_profit >= 0 ? 'pos' : 'neg'">
+                  {{ fmtProfit(currentStats.total_profit) }}
+                </span>
+              </div>
+              <div class="m-d-stat">
+                <span class="m-d-k">收益率</span>
+                <span v-if="!currentStats?.data_available" class="m-d-v muted">暂无数据</span>
+                <span v-else-if="!currentStats.profit_rate_valid" class="m-d-v muted">—</span>
+                <span v-else class="m-d-v" :class="currentStats.profit_rate >= 0 ? 'pos' : 'neg'">
+                  {{ fmtRate(currentStats.profit_rate) }}
+                </span>
+              </div>
+              <div class="m-d-stat">
+                <span class="m-d-k">胜率</span>
+                <span v-if="!currentStats?.data_available" class="m-d-v muted">暂无数据</span>
+                <span v-else class="m-d-v">{{ currentStats.win_rate.toFixed(1) }}%</span>
+              </div>
+              <div class="m-d-stat">
+                <span class="m-d-k">跟单人数</span>
+                <span class="m-d-v">{{ currentFollowerCount }} 人</span>
+              </div>
+            </div>
+            <div v-if="updatedText(detail.leader)" class="m-d-updated muted">
+              {{ perfWindowLabel }} · {{ updatedText(detail.leader) }}
+            </div>
+          </div>
+
+          <!-- 选节点：整行 56px 触控区，选中态用整块高亮 + 左侧色条 -->
+          <div class="m-d-sec-title">
+            选择要跟随的节点
+            <span class="m-d-sec-sub muted">可多选</span>
+          </div>
+
+          <p v-if="!detail.my_nodes.length" class="muted m-empty-text">
+            你没有可用于跟单的节点（主节点不可跟单）
+            <button class="btn-sm btn-ghost m-empty-btn" @click="router.push('/nodes')">去节点页</button>
+          </p>
+
+          <ul v-else class="m-pick-list">
+            <li
+              v-for="n in detail.my_nodes"
+              :key="n.node_id"
+              class="m-pick"
+              :class="{
+                on: !alreadyFollowingNodeIds.has(n.node_id) && nodeSet.has(n.node_id),
+                done: alreadyFollowingNodeIds.has(n.node_id),
+              }"
+              @click="alreadyFollowingNodeIds.has(n.node_id) ? null : toggleNode(n.node_id)"
+            >
+              <span class="m-pick-box" aria-hidden="true">
+                <svg v-if="!alreadyFollowingNodeIds.has(n.node_id) && nodeSet.has(n.node_id)" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M20 6L9 17l-5-5" />
+                </svg>
+              </span>
+              <span class="m-pick-main">
+                <span class="m-pick-name">{{ n.name || n.node_id }}</span>
+                <span class="m-pick-meta muted mono">MT5 {{ n.mt5_login ?? '—' }}</span>
+              </span>
+              <span v-if="alreadyFollowingNodeIds.has(n.node_id)" class="tag green">已跟随</span>
+            </li>
+          </ul>
+        </template>
+      </div>
+
+      <!-- 底部固定操作条：跟主页面的滚动区域分离，按钮永远够得着 -->
+      <footer v-if="detail" class="m-sheet-foot">
+        <span class="m-foot-count muted">
+          已选 <strong class="m-foot-n">{{ selectedNodes.length }}</strong> 个节点
+        </span>
+        <button
+          class="m-foot-btn"
+          :disabled="!selectedNodes.length || submitting"
+          @click="submitJoin"
+        >
+          {{ submitting ? '提交中...' : '确认跟单' }}
+        </button>
+      </footer>
+    </div>
   </div>
 </template>
 
@@ -930,7 +1264,7 @@ onMounted(() => {
   flex-shrink: 0;
 }
 .ls-hero-v {
-  font-size: 16px;
+  font-size: 12px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
@@ -983,7 +1317,7 @@ onMounted(() => {
   text-align: right;
 }
 
-/* 手机端：主指标再放大一档，hero 换行避免数字被挤压 */
+/* 手机端：hero 换行避免数字被挤压，字号保持与桌面一致 */
 @media (max-width: 480px) {
   .ls-hero {
     flex-direction: column;
@@ -996,8 +1330,6 @@ onMounted(() => {
     padding-top: 4px;
     border-top: 1px solid rgba(255, 255, 255, 0.04);
   }
-  .ls-hero-v { font-size: 20px; }
-  .ls-hero-sub { font-size: 13px; }
   .ls-mini { padding: 5px 8px; }
 }
 
@@ -1430,5 +1762,547 @@ onMounted(() => {
     align-items: center;
     justify-content: center;
   }
+}
+</style>
+
+<!-- ══════════════════════════════════════════════════════════════════════
+     手机端样式（ui-ux-pro-max: dark OLED · 触控 ≥44pt · 4/8dp 节奏 · 安全区）
+     全部规则挂在 .m-only / .m-* 前缀上，桌面端 display:none，零影响。
+     ══════════════════════════════════════════════════════════════════════ -->
+<style scoped>
+/* ── 可见性闸门：桌面端隐藏手机端专属层 ── */
+.m-only { display: none; }
+
+@media (max-width: 768px) {
+  .m-only { display: block; }
+
+  /* 手机端页面不再用 24px 内边距（太小，挤掉内容宽度），改 12px + 安全区 */
+  .follow-page {
+    padding: 12px 12px
+      calc(12px + env(safe-area-inset-bottom, 0px));
+  }
+
+  /* 桌面端的标题栏 + 左右两栏（.follow-grid）在手机端整体隐藏。
+     手机端改用下面的分段切换 + 全屏详情页。
+     漏掉 .follow-grid 会导致桌面布局在手机上照样渲染，
+     变成「上半截桌面 UI + 下半截手机 UI」重复两套 —— 必须两个一起隐藏。 */
+  .page-header,
+  .follow-grid {
+    display: none;
+  }
+
+  /* ── 分段切换（带单员 / 我的跟单）─────────────────────────────
+     手机端这两份信息互斥，堆一起会变成超长滚动条。
+     按钮高 44px 满足触控下限，底部滑动块做选中指示。 */
+  .m-tabs {
+    position: sticky;
+    top: 0;
+    z-index: 12;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px;
+    padding: 4px;
+    margin: 0 0 12px;
+    background: rgba(6, 10, 18, 0.9);
+    border: 1px solid var(--glass-border);
+    border-radius: 12px;
+    backdrop-filter: blur(var(--blur)) saturate(1.3);
+    -webkit-backdrop-filter: blur(var(--blur)) saturate(1.3);
+  }
+  .m-tab {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    min-height: 44px;
+    padding: 0 8px;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 9px;
+    color: var(--muted);
+    font-size: 14px;
+    font-weight: 600;
+    transition: color var(--transition), background var(--transition);
+  }
+  .m-tab:active { background: rgba(255, 255, 255, 0.05); }
+  .m-tab.on {
+    color: #ffffff;
+    background: linear-gradient(135deg, var(--primary) 0%, var(--primary-d) 100%);
+    border-color: transparent;
+    box-shadow: 0 2px 12px var(--primary-glow);
+  }
+  .m-tab-badge {
+    min-width: 20px;
+    padding: 1px 6px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.1);
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1.5;
+  }
+  .m-tab.on .m-tab-badge {
+    background: rgba(4, 21, 16, 0.28);
+    color: #ffffff;
+  }
+
+  .m-panel { display: block; }
+
+  /* ── 搜索框 ── */
+  /* 字号必须 ≥16px：iOS Safari 聚焦小于 16px 的输入框会自动放大整个页面，
+     用户无法缩回去。14/15px 会触发这个行为。 */
+  .m-search-wrap { margin-bottom: 10px; }
+  .m-search {
+    min-height: 44px;
+    border-radius: 12px;
+    font-size: 16px;
+  }
+
+  /* ── 统计窗口：横向滑动的分段控件，不再换行占一屏 ── */
+  .m-win {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 12px;
+    /* 4 个按钮在 320px 宽放不下，允许横向滑动而不是压缩文字 */
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .m-win::-webkit-scrollbar { display: none; }
+  .m-win-btn {
+    flex: 1 0 auto;
+    min-height: 36px;
+    padding: 0 14px;
+    border-radius: 999px;
+    border: 1px solid var(--glass-border);
+    background: var(--glass);
+    color: var(--muted);
+    font-size: 13px;
+    font-weight: 600;
+    white-space: nowrap;
+    touch-action: manipulation;
+    transition: color var(--transition), background var(--transition), border-color var(--transition);
+  }
+  .m-win-btn:active { background: rgba(255, 255, 255, 0.07); }
+  .m-win-btn.on {
+    color: #ffffff;
+    background: linear-gradient(135deg, var(--primary) 0%, var(--primary-d) 100%);
+    border-color: transparent;
+    box-shadow: 0 2px 12px var(--primary-glow);
+  }
+
+  /* ── 带单员卡片 ── */
+  .m-leader-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .m-leader {
+    padding: 14px;
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius);
+    background: var(--panel);
+    backdrop-filter: blur(var(--blur));
+    -webkit-backdrop-filter: blur(var(--blur));
+    cursor: pointer;
+    touch-action: manipulation;
+    transition: border-color var(--transition), background var(--transition);
+  }
+  /* 手机端没有 hover，用 active 给出点按反馈 */
+  .m-leader:active {
+    border-color: var(--primary);
+    background: rgba(37, 99, 235, 0.08);
+  }
+  .m-leader-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    min-width: 0;
+    margin-bottom: 10px;
+  }
+  .m-leader-name {
+    font-size: 15px;
+    font-weight: 600;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* 主视觉：收益/收益率放大。手机端先给"赚没赚"的结论，再看细节。 */
+  .m-pnl {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    flex-wrap: wrap;
+    padding-bottom: 10px;
+    margin-bottom: 10px;
+    border-bottom: 1px dashed var(--glass-border);
+  }
+  .m-pnl-main {
+    font-family: var(--mono);
+    font-size: 26px;
+    font-weight: 700;
+    line-height: 1.1;
+    letter-spacing: -0.02em;
+    font-variant-numeric: tabular-nums;
+  }
+  .m-pnl-rate {
+    font-family: var(--mono);
+    font-size: 15px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 6px;
+    font-variant-numeric: tabular-nums;
+  }
+  .m-pnl-rate.pos { color: var(--green); background: rgba(16, 185, 129, 0.12); }
+  .m-pnl-rate.neg { color: var(--red); background: rgba(239, 68, 68, 0.12); }
+  .m-pnl-main.pos { color: var(--green); }
+  .m-pnl-main.neg { color: var(--red); }
+  .m-pnl-none { font-size: 13px; }
+  .m-pnl-time { margin-left: auto; font-size: 11px; white-space: nowrap; }
+
+  /* 次要指标：退成两个小格子 */
+  .m-mini-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .m-mini {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 6px;
+    min-width: 0;
+    padding: 7px 10px;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    border-radius: 8px;
+  }
+  .m-mini-k { font-size: 11px; color: var(--muted); white-space: nowrap; }
+  .m-mini-v {
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ── 空态 / 加载态 ── */
+  .m-empty {
+    padding: 40px 16px;
+    text-align: center;
+    font-size: 13px;
+  }
+  .m-empty-text { margin: 0 0 12px; font-size: 13px; }
+  .m-empty-btn { min-height: 40px; }
+
+  /* ── 我的跟单 ── */
+  .m-mine-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .m-mine {
+    padding: 14px;
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius);
+    background: var(--panel);
+    backdrop-filter: blur(var(--blur));
+    -webkit-backdrop-filter: blur(var(--blur));
+  }
+  .m-mine-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  .m-mine-id {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+  }
+  .m-mine-name {
+    font-size: 15px;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .m-mine-tag { align-self: flex-start; }
+  .m-mine-btn {
+    flex-shrink: 0;
+    min-height: 40px;
+    padding: 0 14px;
+  }
+  .m-mine-none { margin: 0; font-size: 12px; }
+
+  /* 节点条目：原来是"名称（MT5）· 加入于 时间戳 · 运行中 N 单"挤一行，
+     窄屏必爆。改成两行：名称一行 + 账号/时间/任务数一行小字。 */
+  .m-mine-nodes {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .m-mine-node {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 10px 12px;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+  }
+  .m-mine-node-name {
+    font-size: 14px;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .m-mine-node-login {
+    font-size: 12px;
+    color: var(--text);
+  }
+  .m-mine-node-meta { font-size: 11px; }
+
+  /* ── 全屏详情页 ───────────────────────────────────────────────
+     fixed 覆盖整个视口，顶部返回 + 底部固定操作条，中间内容滚动。
+     用 100dvh 而不是 100vh：iOS 动态地址栏下 100vh 会超出可见区域。 */
+  .m-sheet {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    height: 100dvh;
+    background: var(--bg);
+    animation: m-sheet-in 0.22s cubic-bezier(0.32, 0.72, 0, 1);
+  }
+  @keyframes m-sheet-in {
+    from { transform: translateY(12px); opacity: 0; }
+    to { transform: translateY(0); opacity: 1; }
+  }
+
+  .m-sheet-bar {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    height: 52px;
+    padding: 0 6px;
+    padding-top: env(safe-area-inset-top, 0px);
+    height: calc(52px + env(safe-area-inset-top, 0px));
+    background: rgba(6, 10, 18, 0.92);
+    border-bottom: 1px solid var(--glass-border);
+    backdrop-filter: blur(var(--blur));
+    -webkit-backdrop-filter: blur(var(--blur));
+  }
+  .m-back {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 44px;
+    height: 44px;
+    padding: 0;
+    background: transparent;
+    border: none;
+    color: var(--text);
+    border-radius: 10px;
+    touch-action: manipulation;
+  }
+  .m-back:active { background: rgba(255, 255, 255, 0.07); }
+  .m-sheet-title {
+    font-size: 16px;
+    font-weight: 600;
+  }
+
+  .m-sheet-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    padding: 16px 14px 16px;
+  }
+
+  /* 带单员身份区 */
+  .m-d-lead { margin-bottom: 20px; }
+  .m-d-name {
+    font-size: 19px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+  }
+  .m-d-node { margin-top: 3px; font-size: 12px; }
+
+  .m-d-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-top: 14px;
+  }
+  .m-d-stat {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 11px 12px;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+  }
+  .m-d-k { font-size: 11px; color: var(--muted); }
+  .m-d-v {
+    font-family: var(--mono);
+    font-size: 17px;
+    font-weight: 700;
+    line-height: 1.2;
+    font-variant-numeric: tabular-nums;
+  }
+  .m-d-v.pos { color: var(--green); }
+  .m-d-v.neg { color: var(--red); }
+  .m-d-updated { margin-top: 10px; font-size: 11px; }
+
+  .m-d-sec-title {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin: 0 0 10px;
+    font-size: 14px;
+    font-weight: 600;
+  }
+  .m-d-sec-sub { font-size: 12px; font-weight: 400; }
+
+  /* ── 节点选择项：整行 56px 触控区 ── */
+  .m-pick-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .m-pick {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-height: 56px;
+    padding: 10px 12px;
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    background: var(--glass);
+    cursor: pointer;
+    touch-action: manipulation;
+    transition: border-color var(--transition), background var(--transition);
+  }
+  .m-pick:active { background: rgba(37, 99, 235, 0.12); }
+  /* 选中态：整块高亮 + 边框加粗，不靠颜色单独承载信息（另配勾选框） */
+  .m-pick.on {
+    border-color: var(--primary);
+    background: rgba(37, 99, 235, 0.1);
+  }
+  .m-pick.done { opacity: 0.55; cursor: not-allowed; }
+
+  /* 自绘勾选框：原生 checkbox 在深色下对比度差且样式不可控 */
+  .m-pick-box {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border: 2px solid var(--glass-highlight);
+    border-radius: 6px;
+    color: transparent;
+    transition: background var(--transition), border-color var(--transition), color var(--transition);
+  }
+  .m-pick.on .m-pick-box {
+    background: var(--primary);
+    border-color: var(--primary);
+    color: #ffffff;
+  }
+  .m-pick-main {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    flex: 1;
+  }
+  .m-pick-name {
+    font-size: 14px;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .m-pick-meta { font-size: 11px; }
+
+  /* ── 底部固定操作条 ──
+     与滚动区分离，"确认跟单"永远在拇指可达的位置。 */
+  .m-sheet-foot {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 14px;
+    padding-bottom: calc(10px + env(safe-area-inset-bottom, 0px));
+    background: rgba(6, 10, 18, 0.94);
+    border-top: 1px solid var(--glass-border);
+    backdrop-filter: blur(var(--blur));
+    -webkit-backdrop-filter: blur(var(--blur));
+  }
+  .m-foot-count { font-size: 13px; flex-shrink: 0; }
+  .m-foot-n {
+    font-family: var(--mono);
+    font-size: 15px;
+    color: var(--text);
+  }
+  .m-foot-btn {
+    flex: 1;
+    min-height: 48px;
+    padding: 0 20px;
+    background: linear-gradient(135deg, var(--primary) 0%, var(--primary-d) 100%);
+    color: #041510;
+    font-size: 15px;
+    font-weight: 600;
+    border-radius: 12px;
+    box-shadow: 0 4px 16px var(--primary-glow);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    touch-action: manipulation;
+  }
+  .m-foot-btn:disabled {
+    opacity: 0.4;
+    background: var(--panel-2);
+    color: var(--muted);
+    box-shadow: none;
+    cursor: not-allowed;
+  }
+}
+
+/* ── 减少动态效果偏好：关掉入场动画，避免前庭不适 ── */
+@media (max-width: 768px) and (prefers-reduced-motion: reduce) {
+  .m-sheet { animation: none; }
+  .m-leader,
+  .m-tab,
+  .m-win-btn,
+  .m-pick,
+  .m-back,
+  .m-foot-btn {
+    transition: none;
+  }
+}
+
+/* ── 极窄屏（iPhone SE 320px）：主视觉再收一档，避免换行 ── */
+@media (max-width: 360px) {
+  .m-pnl-main { font-size: 23px; }
+  .m-pnl { gap: 8px; }
+  .m-tab { font-size: 13px; }
+  .m-d-v { font-size: 15px; }
 }
 </style>

@@ -452,16 +452,21 @@ onBeforeUnmount(() => {
       <div class="row between" style="align-items: flex-start">
         
       <div v-if="compact" class="trend-compact-tools">
-        <div v-if="compact && symbolOptions?.length" class="trend-chips">
-          <button
-            v-for="s in symbolOptions"
-            :key="s"
-            class="trend-chip"
-            :class="{ active: s === symbol }"
-            @click="pickSymbol(s)"
-          >
-            {{ s }}
-          </button>
+        <!-- 品种芯片：标题与芯片分层。标题之前混在 chips 容器里，
+             会和按钮并排显示，按钮放大后更明显。 -->
+        <div v-if="symbolOptions?.length" class="trend-compact-block">
+          <span class="trend-field-k">标的趋势 - 多空值</span>
+          <div class="trend-chips">
+            <button
+              v-for="s in symbolOptions"
+              :key="s"
+              class="trend-chip"
+              :class="{ active: s === symbol }"
+              @click="pickSymbol(s)"
+            >
+              {{ s }}
+            </button>
+          </div>
         </div>
         <label class="trend-field">
           <span class="trend-field-k">周期</span>
@@ -681,16 +686,25 @@ onBeforeUnmount(() => {
 .trend-input:focus { border-color: var(--primary); outline: none; }
 .trend-input:disabled { color: var(--muted); }
 
-.trend-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+.trend-chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .trend-chip {
   background: var(--glass);
   border: 1px solid var(--glass-border);
-  border-radius: 999px;
+  border-radius: 10px;
   color: var(--muted);
   cursor: pointer;
   font-family: var(--mono);
-  font-size: 11px;
-  padding: 4px 10px;
+  /* 放大：11px → 14px。11px 在手机上几乎看不清，芯片文字是主要信息载体。 */
+  font-size: 14px;
+  font-weight: 600;
+  /* 内边距同步放大，撑出更明确的可点区域 */
+  padding: 8px 16px;
+  /* 触摸目标 ≥ 40px，避免「看得见但点不准」 */
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  touch-action: manipulation;
   transition: var(--transition);
 }
 .trend-chip:hover { color: var(--text); border-color: var(--glass-highlight); }
@@ -707,9 +721,22 @@ onBeforeUnmount(() => {
 
 .trend-hint { font-size: 12px; margin: 10px 0 0; line-height: 1.5; }
 .trend-warn { color: var(--gold); font-size: 12px; margin: 10px 0 0; }
-.trend-compact-tools { display: flex; align-items: flex-end; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
-.trend-compact .trend-score { font-size: 26px; }
-.trend-compact .trend-chips { margin-top: 8px; }
+.trend-compact-tools {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+/* 品种块：内部纵向排列（标题 + 芯片），整体作为一个 flex item */
+.trend-compact-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  flex: 1 1 240px;
+}.trend-compact .trend-score { font-size: 26px; }
+.trend-compact .trend-chips { margin-top: 0; }
 .trend-saved { color: var(--primary); font-size: 12px; margin: 0 0 10px; }
 .trend-sub { font-size: 12px; margin-left: 8px; }
 .trend-price { font-family: var(--mono); font-size: 20px; font-weight: 700; }
@@ -788,5 +815,67 @@ onBeforeUnmount(() => {
 @media (max-width: 720px) {
   .trend-chart { height: 320px; }
   .trend-foot { gap: 4px 12px; }
+
+  /* ── compact 工具区（首页 / 仪表盘嵌入的迷你趋势面板）─────────
+     桌面上「品种芯片」与「周期」并排一行；窄屏放不下 9 个周期按钮，
+     强行并排会把两者都挤成多行、按钮被压扁。改为纵向堆叠。
+
+     min-width: 0 是必须的：父级 .row 是 flex 容器，默认 min-width:auto
+     会让子项被内容（芯片 + 12 个周期按钮）的固有宽度撑开，
+     实测在 390px 视口下 .trend-compact-tools 宽 483px > 卡片 357px，
+     虽然内容用 overflow 藏住了，但整块仍会溢出卡片边界。 */
+  .trend-compact-tools {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 14px;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+  }
+  .trend-compact-block,
+  .trend-compact-tools > .trend-field {
+    flex: 1 1 auto;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  /* 周期：横向滑动，避免 9 个按钮撑破卡片换行成三行 */
+  .trend-compact-tools .tag-select {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    /* 去掉最后一个按钮的右侧留白，让它能贴到卡片边缘 */
+    padding-bottom: 2px;
+  }
+  .trend-compact-tools .tag-select::-webkit-scrollbar { display: none; }
+  /* TagSelect 是子组件，.tag-select-item 带的是它自己的 scope 属性，
+     TrendPanel 的 scoped 样式必须用 :deep() 才能命中，否则这里的
+     放大/滑动规则会完全失效（字号仍是 12px、min-height 仍是 0）。 */
+  .trend-compact-tools :deep(.tag-select-item) {
+    flex-shrink: 0;
+    /* 触摸目标 ≥ 40px */
+    min-height: 40px;
+    padding: 8px 14px;
+    font-size: 13px;
+  }
+
+  /* 品种芯片：同样允许横向滚动 */
+  .trend-chips {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    padding-bottom: 2px;
+    /* 负边距让芯片贴到卡片内边距，滚动时不会左右跳动 */
+    margin: 0 -4px;
+    padding-left: 4px;
+    padding-right: 4px;
+  }
+  .trend-chips::-webkit-scrollbar { display: none; }
+  .trend-chip {
+    flex-shrink: 0;
+  }
 }
 </style>

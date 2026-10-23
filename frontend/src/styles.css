@@ -1380,6 +1380,22 @@ a.dash-link { display: inline-block; }
   .nav a { padding: 8px 10px; }
   .nav a svg { width: 18px; height: 18px; opacity: 1; }
 
+  /* 手机端：隐藏顶栏的品牌区/在线状态/用户名/退出，只保留一行图标导航 */
+  .topbar {
+    padding: 0 8px;
+    height: 48px;
+    gap: 4px;
+  }
+  .topbar .brand,
+  .topbar-status,
+  .topbar-user { display: none; }
+  .nav {
+    flex: 1;
+    justify-content: space-around;
+    gap: 2px;
+  }
+  .nav a { flex: 1; justify-content: center; padding: 8px 4px; }
+
   .pagination {
     flex-direction: column;
     align-items: stretch;
@@ -1393,25 +1409,24 @@ a.dash-link { display: inline-block; }
 
 @media (max-width: 640px) {
   .topbar {
-    gap: 8px;
-    padding: 8px 12px;
-    height: auto;
-    min-height: 56px;
-    flex-wrap: wrap;
+    gap: 4px;
+    padding: 0 6px;
+    height: 46px;
+    min-height: 46px;
+    flex-wrap: nowrap;
   }
   .brand-text { font-size: 13px; }
   .brand-sub { display: none; }
   .nav {
-    order: 3;
-    flex: 1 1 100%;
-    justify-content: space-between;
+    flex: 1;
+    justify-content: space-around;
     gap: 2px;
   }
   .nav a { flex: 1; justify-content: center; }
   .spacer { display: none; }
-  .topbar-status { order: 2; margin-left: auto; }
-  .btn-logout { order: 2; }
-  .topbar-user { order: 2; }
+  .topbar-status { display: none; }
+  .topbar .btn-logout { display: none; }
+  .topbar-user { display: none; }
   .pill { font-size: 10px; padding: 4px 8px; }
   .content { padding: 14px; }
   .two { grid-template-columns: 1fr; }

@@ -1654,6 +1654,10 @@ export interface AiRobotSummary {
   primary_node: FollowNodeBrief | null
   /** 已开放 AI 跟单的 tpl_1 分组数 */
   ai_group_count: number
+  /** 该机器人名下可跟分组的策略名称（列表/详情标题用）；无策略时为 null */
+  strategy_name: string | null
+  /** 该机器人名下可跟分组用到的全部策略名称（去重，按出现顺序） */
+  strategy_names: string[]
   follower_node_count: number
   my_follow_group_count: number
   my_follow_node_count: number
@@ -1723,6 +1727,8 @@ export interface AiMyGroup {
   group_name: string | null
   symbol: string | null
   strategy_id: string | null
+  /** 该分组绑定的策略名称（「我的跟单」按策略名展示机器人） */
+  strategy_name: string | null
   marketable: boolean
   unmarketable_reason: string | null
   active_task_count: number

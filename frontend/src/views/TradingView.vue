@@ -741,11 +741,7 @@ onBeforeUnmount(() => {
           :disabled="!isOnline"
           @click="openDialog('grid')"
         >
-          <svg class="action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M3 6h18M3 12h18M3 18h18" />
-            <path d="M6 4v16M12 4v16M18 4v16" />
-            <path d="M4 8l4 4M8 8l-4 4M16 8l4 4M20 8l-4 4M4 16l4-2M8 16l-4-2M16 14l4 4M20 14l-4 4" />
-          </svg>
+          <svg data-v-52e09d8a="" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path data-v-52e09d8a="" d="M3 6h18M3 12h18M3 18h18"></path><path data-v-52e09d8a="" d="M6 4v16M12 4v16M18 4v16"></path></svg>
           <span class="action-label">智能吸筹</span>
         </button>
       </div>
@@ -1743,6 +1739,20 @@ onBeforeUnmount(() => {
   .pos-cards { display: block; }
   /* 资产 3 列 → 2 列 */
   .asset-grid { grid-template-columns: repeat(2, 1fr); }
+  /* 手机端：详情 tab 标题缩小并压缩内边距，四个 tab 一行放下 */
+  .detail-tabs { padding: 8px 8px 0; gap: 2px; }
+  .detail-tab {
+    gap: 4px;
+    padding: 7px 8px;
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  .tab-badge {
+    min-width: 16px;
+    height: 16px;
+    padding: 0 4px;
+    font-size: 10px;
+  }
   /* 历史订单翻页器更紧凑 */
   .hist-pager { flex-wrap: wrap; }
   .pager-total { width: 100%; margin-left: 0; text-align: right; }

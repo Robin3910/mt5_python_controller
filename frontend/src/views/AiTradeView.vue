@@ -13,7 +13,7 @@
 //   4. 移出默认不停止在跑任务（决策 = 与带单一致，由 node_client 跑完）
 //
 // 跟单员收不到实时 WS 事件（M3）—— 用 45s 轮询替代。
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, onUnmounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
 import 'element-plus/es/components/message-box/style/css'
@@ -174,6 +174,26 @@ function errText(e: unknown, fallback: string): string {
   return ax?.response?.data?.detail || fallback
 }
 
+/**
+ * 机器人的展示标题 = **策略名称**。
+ *
+ * 「机器人在跑什么策略」才是用户识别一个机器人的依据；
+ * 用户名 / 主节点名 / MT5 账号是主人的账户信息，不是机器人的身份，
+ * 放在标题位置会让人对不上号（同一主人可能挂着多个机器人）。
+ *
+ * 策略名取不到（分组未绑策略 / 策略被删除）时回落到用户名 ——
+ * 总比一个空白标题强。
+ */
+function robotTitle(robot: AiRobotSummary): string {
+  return robot.strategy_name || robot.display_name || robot.username
+}
+
+/** 副标题：策略名有多个时提示「还有 N 个策略」 */
+function robotStrategyExtra(robot: AiRobotSummary): string {
+  const n = robot.strategy_names?.length ?? 0
+  return n > 1 ? `等 ${n} 个策略` : ''
+}
+
 function primaryText(robot: AiRobotSummary): string {
   const n = robot.primary_node
   if (!n) return '无主节点'
@@ -204,10 +224,95 @@ function updatedText(robot: AiRobotSummary): string {
 }
 
 function fmtProfit(v: number): string {
-  return (v >= 0 ? '+' : '') + '$' + v.toFixed(2)
+  // 符号在货币符号**之前**（-$123.45 / +$123.45）。
+  // 原来负数写成 `$-123.45`，符号跑到 $ 后面不符合金额书写惯例。
+  const sign = v > 0 ? '+' : v < 0 ? '-' : ''
+  return sign + '$' + Math.abs(v).toFixed(2)
 }
 function fmtRate(v: number): string {
   return (v >= 0 ? '+' : '') + v.toFixed(1) + '%'
+}
+
+/**
+ * 手机端紧凑日期。
+ *
+ * 表格里的 `toLocaleString` 时间戳在窄屏必爆，只取到日就够看。
+ */
+function fmtJoinedShort(ts: number | null): string {
+  if (!ts) return '—'
+  const d = new Date(ts * 1000)
+  const sameYear = d.getFullYear() === new Date().getFullYear()
+  return sameYear
+    ? `${d.getMonth() + 1}月${d.getDate()}日`
+    : `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`
+}
+
+// ---------------------------------------------------------------------------
+// 手机端布局状态
+// ---------------------------------------------------------------------------
+//
+// 与 FollowView 同一套结构：顶部分段切换「机器人 / 我的跟单」+ 点机器人进全屏详情。
+// 桌面端的两栏（.main-grid）在窄屏会退化成「长列表 + 长详情」的超长滚动条，
+// 且 .mine-table 真表格在窄屏无法阅读 —— 两端必须用不同的信息架构。
+
+/** 分段切换当前面板 */
+const mobileTab = ref<'robots' | 'mine'>('robots')
+
+/** 详情全屏页是否打开 */
+const mobileSheetOpen = ref(false)
+
+/** 当前统计窗口的中文标签（详情页里要说明「这些数字算的是哪一段」） */
+const perfWindowLabel = computed(
+  () => WINDOW_OPTIONS.find((o) => o.value === perfWindow.value)?.label ?? '',
+)
+
+/** 手机端打开详情：立刻弹页再拉数据，避免点完没有反馈 */
+async function openMobileRobot(r: AiRobotSummary) {
+  mobileSheetOpen.value = true
+  await openRobot(r)
+}
+
+/** 关闭详情页并回到列表 */
+function closeMobileSheet() {
+  mobileSheetOpen.value = false
+  selectedGroupIds.value = []
+  selectedNodeIds.value = []
+  detail.value = null
+}
+
+// 详情页打开时锁住背景滚动：全屏页是 fixed 覆盖层，
+// 不锁的话手指在页面上滑会连带把背后的列表一起滚掉。
+watch(mobileSheetOpen, (open) => {
+  document.body.style.overflow = open ? 'hidden' : ''
+})
+
+onBeforeUnmount(() => {
+  document.body.style.overflow = ''
+})
+
+/**
+ * 跟单成功后：手机端收起详情页并切到「我的跟单」。
+ * 桌面端保持留在详情页（原有行为不变）。
+ */
+function afterJoinSettled() {
+  mobileSheetOpen.value = false
+  mobileTab.value = 'mine'
+}
+
+/**
+ * 手机端节点勾选。
+ *
+ * 桌面端用原生 checkbox + v-model，窄屏上原生控件在小、深色背景下对比度差
+ * 且不好点，所以手机端改成自绘勾选框 + 整行点击。
+ * 语义必须与 v-model 一致：已跟过的节点不可勾（保持不可选），
+ * 可选节点点一下切换选中状态。
+ */
+function toggleMobileNode(nodeId: string) {
+  if (!selectableNodeIds.value.has(nodeId)) return
+  if (alreadyFollowingNodeIds.value.has(nodeId)) return
+  const s = new Set(selectedNodeIds.value)
+  s.has(nodeId) ? s.delete(nodeId) : s.add(nodeId)
+  selectedNodeIds.value = [...s]
 }
 
 // ---------- 加载 ----------
@@ -342,6 +447,9 @@ const nodeIds = (detail.value.my_nodes ?? [])
     await refreshAll()
     detail.value = await fetchAiRobotDetail(detail.value.robot.leader_user_id, perfWindow.value)
     selectedGroupIds.value = allSelectableGroupIds.value
+    // 手机端收起详情并跳到「我的跟单」：成功结果在那里才看得见。
+    // 桌面端保持留在详情页（detail 仍非空，原有行为不变）。
+    if (mobileSheetOpen.value) afterJoinSettled()
   } catch (e) {
     ElMessage.error(errText(e, '加入 AI 跟单失败'))
   } finally {
@@ -593,6 +701,262 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
         </ul>
       </section>
     </div>
+
+    <!-- ══════════════════════════════════════════════════════════════
+         手机端专属层（≤768px 可见，桌面端 display:none）
+         结构：分段切换「机器人 / 我的跟单」+ 全屏详情页
+         ══════════════════════════════════════════════════════════════ -->
+
+    <!-- 顶部分段切换：手机上「广场」和「我的跟单」是两份互斥信息 -->
+    <div class="m-only m-tabs" role="tablist" aria-label="AI 机器人广场">
+      <button
+        v-for="t in ([
+          { key: 'robots', label: '机器人', badge: robots.length },
+          { key: 'mine', label: '我的跟单', badge: myFollowing.length },
+        ] as const)"
+        :key="t.key"
+        class="m-tab"
+        role="tab"
+        :aria-selected="mobileTab === t.key"
+        :class="{ on: mobileTab === t.key }"
+        @click="mobileTab = t.key"
+      >
+        {{ t.label }}
+        <span v-if="t.badge" class="m-tab-badge">{{ t.badge }}</span>
+      </button>
+    </div>
+
+    <!-- ── 分段一：机器人广场 ── -->
+    <div v-show="mobileTab === 'robots'" class="m-only m-panel">
+      <div class="m-search-row">
+        <input
+          v-model="keyword"
+          class="m-search"
+          type="search"
+          enterkeyhint="search"
+          placeholder="搜索用户名 / 节点 / MT5 号"
+          @keyup.enter="loadRobots"
+        />
+        <button class="m-search-btn" :disabled="loading" @click="loadRobots">搜索</button>
+      </div>
+
+      <!-- 统计窗口：横向滑动的分段控件，不再换行占一屏 -->
+      <div class="m-win" role="group" aria-label="统计窗口">
+        <button
+          v-for="opt in WINDOW_OPTIONS"
+          :key="opt.value"
+          class="m-win-btn"
+          :class="{ on: perfWindow === opt.value }"
+          :aria-pressed="perfWindow === opt.value"
+          :disabled="loading"
+          @click="perfWindow = opt.value"
+        >
+          {{ opt.label }}
+        </button>
+      </div>
+
+      <div v-if="loading" class="m-empty muted">加载中…</div>
+      <div v-else-if="!robots.length" class="m-empty muted">暂无机器人</div>
+
+      <ul v-else class="m-robot-list">
+        <li
+          v-for="r in robots"
+          :key="r.leader_user_id"
+          class="m-robot"
+          @click="openMobileRobot(r)"
+        >
+          <div class="m-robot-top">
+            <span class="m-robot-name">{{ robotTitle(r) }}</span>
+            <span v-if="robotStrategyExtra(r)" class="m-robot-extra muted">{{ robotStrategyExtra(r) }}</span>
+            <span v-if="!r.marketable" class="tag amber">已下架</span>
+            <span v-else-if="r.my_follow_node_count" class="tag green">已跟 {{ r.my_follow_node_count }}</span>
+          </div>
+
+          <!-- 主视觉：收益 + 收益率放大成一行大数字，先给结论再看细节 -->
+          <div class="m-pnl">
+            <div v-if="!hasPerf(r)" class="m-pnl-none muted">暂无成交数据</div>
+            <template v-else>
+              <span class="m-pnl-main" :class="perfOf(r).total_profit >= 0 ? 'pos' : 'neg'">
+                {{ fmtProfit(perfOf(r).total_profit) }}
+              </span>
+              <span
+                v-if="perfOf(r).profit_rate_valid"
+                class="m-pnl-rate"
+                :class="perfOf(r).profit_rate >= 0 ? 'pos' : 'neg'"
+              >
+                {{ fmtRate(perfOf(r).profit_rate) }}
+              </span>
+            </template>
+            <span v-if="updatedText(r)" class="m-pnl-time muted">{{ updatedText(r) }}</span>
+          </div>
+
+          <div class="m-mini-row">
+            <span class="m-mini">
+              <span class="m-mini-k">胜率</span>
+              <span v-if="!hasPerf(r)" class="m-mini-v muted">—</span>
+              <span v-else class="m-mini-v">{{ perfOf(r).win_rate.toFixed(1) }}%</span>
+            </span>
+            <span class="m-mini">
+              <span class="m-mini-k">跟单</span>
+              <span class="m-mini-v">{{ followerCountOf(r) }} 人</span>
+            </span>
+          </div>
+        </li>
+      </ul>
+    </div>
+
+    <!-- ── 分段二：我的 AI 跟单 ── -->
+    <div v-show="mobileTab === 'mine'" class="m-only m-panel">
+      <div v-if="mineLoading && !myFollowing.length" class="m-empty muted">加载中…</div>
+      <div v-else-if="!myFollowing.length" class="m-empty">
+        <p class="muted m-empty-text">暂无 AI 跟单</p>
+        <button class="m-empty-btn btn-sm btn-ghost" @click="mobileTab = 'robots'">
+          去挑一个机器人
+        </button>
+      </div>
+      <div v-else class="m-mine-list">
+        <div v-for="e in myFollowing" :key="e.robot.leader_user_id" class="m-mine">
+          <div class="m-mine-head">
+            <span class="m-mine-name">{{ robotTitle(e.robot) }}</span>
+            <span v-if="e.marketable" class="tag ok">运行中</span>
+            <span v-else class="tag amber">已下架</span>
+          </div>
+
+          <p v-if="!e.nodes.length" class="muted m-mine-none">暂未跟单任何节点</p>
+
+          <!-- 桌面端是 <table>，窄屏没法读；这里用卡片行代替表格。
+               每行一个节点：名称 + 账号一行，移出按钮独立成行。 -->
+          <ul v-else class="m-mine-nodes">
+            <li v-for="n in e.nodes" :key="e.robot.leader_user_id + '|' + n.node_id" class="m-mine-node">
+              <div class="m-mine-node-main">
+                <span class="m-mine-node-name">{{ n.name || n.node_id }}</span>
+                <span class="m-mine-node-meta muted">
+                  <template v-if="n.joined_at">{{ fmtJoinedShort(n.joined_at) }} 加入</template>
+                </span>
+              </div>
+              <button
+                v-if="e.marketable"
+                class="m-mine-leave"
+                @click="confirmLeave(e.robot, n.node_id)"
+              >移出</button>
+              <span v-else class="m-mine-wait muted">等待清理</span>
+            </li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── 全屏详情页 ──
+         详情原来排在列表下方，手机上要点完再滚过去；改为整页覆盖。 -->
+    <div v-if="mobileSheetOpen" class="m-sheet" role="dialog" aria-modal="true" aria-label="AI 机器人详情">
+      <header class="m-sheet-bar">
+        <button class="m-back" aria-label="返回机器人列表" @click="closeMobileSheet">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M15 18l-6-6 6-6" />
+          </svg>
+        </button>
+        <span class="m-sheet-title">机器人详情</span>
+      </header>
+
+      <div class="m-sheet-body">
+        <div v-if="detailLoading" class="m-empty muted">加载中…</div>
+
+        <template v-else-if="detail">
+          <div class="m-d-lead">
+            <div class="m-d-name">{{ robotTitle(detail.robot) }}</div>
+            <!-- 副标题只说明「还有几个策略」，不再显示节点名 / MT5 账号 -->
+            <div v-if="robotStrategyExtra(detail.robot)" class="m-d-node muted">
+              {{ robotStrategyExtra(detail.robot) }}
+            </div>
+
+            <div class="m-d-grid">
+              <div class="m-d-stat">
+                <span class="m-d-k">累计收益</span>
+                <span v-if="!hasPerf(detail.robot)" class="m-d-v muted">暂无数据</span>
+                <span v-else class="m-d-v" :class="perfOf(detail.robot).total_profit >= 0 ? 'pos' : 'neg'">
+                  {{ fmtProfit(perfOf(detail.robot).total_profit) }}
+                </span>
+              </div>
+              <div class="m-d-stat">
+                <span class="m-d-k">收益率</span>
+                <span v-if="!hasPerf(detail.robot)" class="m-d-v muted">暂无数据</span>
+                <span v-else-if="!perfOf(detail.robot).profit_rate_valid" class="m-d-v muted">—</span>
+                <span v-else class="m-d-v" :class="perfOf(detail.robot).profit_rate >= 0 ? 'pos' : 'neg'">
+                  {{ fmtRate(perfOf(detail.robot).profit_rate) }}
+                </span>
+              </div>
+              <div class="m-d-stat">
+                <span class="m-d-k">胜率</span>
+                <span v-if="!hasPerf(detail.robot)" class="m-d-v muted">暂无数据</span>
+                <span v-else class="m-d-v">{{ perfOf(detail.robot).win_rate.toFixed(1) }}%</span>
+              </div>
+              <div class="m-d-stat">
+                <span class="m-d-k">跟单人数</span>
+                <span class="m-d-v">{{ followerCountOf(detail.robot) }} 人</span>
+              </div>
+            </div>
+            <div v-if="updatedText(detail.robot)" class="m-d-updated muted">
+              {{ perfWindowLabel }} · {{ updatedText(detail.robot) }}
+            </div>
+          </div>
+
+          <!-- 选节点：整行 56px 触控区 -->
+          <div class="m-d-sec-title">
+            选择要跟随的节点
+            <span class="m-d-sec-sub muted">可多选</span>
+          </div>
+
+          <p v-if="!(detail.my_nodes ?? []).length" class="muted m-empty-text">
+            尚无可用于跟单的节点（主节点不可跟单）
+          </p>
+
+          <ul v-else class="m-pick-list">
+            <li
+              v-for="n in detail.my_nodes"
+              :key="n.node_id"
+              class="m-pick"
+              :class="{
+                on: selectableNodeIds.has(n.node_id) && selectedNodeIds.includes(n.node_id),
+                done: !selectableNodeIds.has(n.node_id) || alreadyFollowingNodeIds.has(n.node_id),
+              }"
+              @click="
+                !selectableNodeIds.has(n.node_id) || alreadyFollowingNodeIds.has(n.node_id)
+                  ? null
+                  : toggleMobileNode(n.node_id)
+              "
+            >
+              <span class="m-pick-box" aria-hidden="true">
+                <svg
+                  v-if="selectableNodeIds.has(n.node_id) && selectedNodeIds.includes(n.node_id)"
+                  viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"
+                  stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"
+                >
+                  <path d="M20 6L9 17l-5-5" />
+                </svg>
+              </span>
+              <span class="m-pick-main">
+                <span class="m-pick-name">{{ n.name || n.node_id }}</span>
+              </span>
+              <span v-if="alreadyFollowingNodeIds.has(n.node_id)" class="tag amber">已跟</span>
+            </li>
+          </ul>
+        </template>
+      </div>
+
+      <!-- 底部固定操作条 -->
+      <footer v-if="detail" class="m-sheet-foot">
+        <span class="m-foot-count muted">
+          已选 <strong class="m-foot-n">{{ selectedNodeIds.length }}</strong> 个节点
+        </span>
+        <button
+          class="m-foot-btn"
+          :disabled="!selectedNodeIds.length || submitting"
+          @click="submitJoin"
+        >
+          {{ submitting ? '提交中…' : '确认跟单' }}
+        </button>
+      </footer>
+    </div>
   </div>
 </template>
 
@@ -718,7 +1082,7 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
   flex-shrink: 0;
 }
 .ls-hero-v {
-  font-size: 16px;
+  font-size: 12px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
@@ -771,7 +1135,7 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
   text-align: right;
 }
 
-/* 手机端：主指标再放大一档，hero 换行避免数字被挤压 */
+/* 手机端：hero 换行避免数字被挤压，字号保持与桌面一致 */
 @media (max-width: 480px) {
   .ls-hero {
     flex-direction: column;
@@ -784,8 +1148,6 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     padding-top: 4px;
     border-top: 1px solid rgba(255, 255, 255, 0.04);
   }
-  .ls-hero-v { font-size: 20px; }
-  .ls-hero-sub { font-size: 13px; }
   .ls-mini { padding: 5px 8px; }
 }
 
@@ -945,4 +1307,566 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
   border-radius: 4px;
 }
 .badge.ok { background: rgba(64, 158, 255, 0.16); color: var(--primary); }
+</style>
+
+<!-- ══════════════════════════════════════════════════════════════════════
+     手机端样式（ui-ux-pro-max: dark OLED · 触控 ≥44pt · 4/8dp 节奏 · 安全区）
+     全部规则挂在 .m-only / .m-* 前缀上，桌面端 display:none，零影响。
+     ══════════════════════════════════════════════════════════════════════ -->
+<style scoped>
+/* ── 可见性闸门：桌面端隐藏手机端专属层 ── */
+.m-only { display: none; }
+
+@media (max-width: 768px) {
+  .m-only { display: block; }
+
+  .follow-wrap {
+    gap: 0;
+    padding: 12px 12px calc(12px + env(safe-area-inset-bottom, 0px));
+  }
+
+  /* 桌面端的两栏（.main-grid）在手机端整体隐藏。
+     漏掉它会导致桌面布局在手机上照样渲染，
+     变成「上半截桌面 UI + 下半截手机 UI」重复两套 —— 必须整个隐藏。 */
+  .main-grid { display: none; }
+
+  /* ── 分段切换 ── */
+  .m-tabs {
+    position: sticky;
+    top: 0;
+    z-index: 12;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px;
+    padding: 4px;
+    margin: 0 0 12px;
+    background: rgba(6, 10, 18, 0.9);
+    border: 1px solid var(--glass-border);
+    border-radius: 12px;
+    backdrop-filter: blur(var(--blur)) saturate(1.3);
+    -webkit-backdrop-filter: blur(var(--blur)) saturate(1.3);
+  }
+  .m-tab {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    min-height: 44px;
+    padding: 0 8px;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 9px;
+    color: var(--muted);
+    font-size: 14px;
+    font-weight: 600;
+    transition: color var(--transition), background var(--transition);
+  }
+  .m-tab:active { background: rgba(255, 255, 255, 0.05); }
+  .m-tab.on {
+    color: #ffffff;
+    background: linear-gradient(135deg, var(--primary) 0%, var(--primary-d) 100%);
+    border-color: transparent;
+    box-shadow: 0 2px 12px var(--primary-glow);
+  }
+  .m-tab-badge {
+    min-width: 20px;
+    padding: 1px 6px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.1);
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1.5;
+  }
+  .m-tab.on .m-tab-badge {
+    background: rgba(4, 21, 16, 0.28);
+    color: #ffffff;
+  }
+
+  .m-panel { display: block; }
+
+  /* ── 搜索行：输入框 + 搜索按钮并排，按钮 44px 可点 ── */
+  .m-search-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  /* 字号必须 ≥16px：iOS Safari 聚焦小于 16px 的输入框会自动放大整个页面，
+     用户无法缩回去。 */
+  .m-search {
+    flex: 1;
+    min-width: 0;
+    min-height: 44px;
+    border-radius: 12px;
+    font-size: 16px;
+  }
+  .m-search-btn {
+    flex-shrink: 0;
+    min-height: 44px;
+    padding: 0 16px;
+    border-radius: 12px;
+    font-size: 14px;
+    font-weight: 600;
+    touch-action: manipulation;
+  }
+
+  /* ── 统计窗口：横向滑动的分段控件 ── */
+  .m-win {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 12px;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .m-win::-webkit-scrollbar { display: none; }
+  .m-win-btn {
+    flex: 1 0 auto;
+    min-height: 36px;
+    padding: 0 14px;
+    border-radius: 999px;
+    border: 1px solid var(--glass-border);
+    background: var(--glass);
+    color: var(--muted);
+    font-size: 13px;
+    font-weight: 600;
+    white-space: nowrap;
+    touch-action: manipulation;
+    transition: color var(--transition), background var(--transition), border-color var(--transition);
+  }
+  .m-win-btn:active { background: rgba(255, 255, 255, 0.07); }
+  .m-win-btn.on {
+    color: #ffffff;
+    background: linear-gradient(135deg, var(--primary) 0%, var(--primary-d) 100%);
+    border-color: transparent;
+    box-shadow: 0 2px 12px var(--primary-glow);
+  }
+
+  /* ── 机器人卡片 ── */
+  .m-robot-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .m-robot {
+    padding: 14px;
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius);
+    background: var(--panel);
+    backdrop-filter: blur(var(--blur));
+    -webkit-backdrop-filter: blur(var(--blur));
+    cursor: pointer;
+    touch-action: manipulation;
+    transition: border-color var(--transition), background var(--transition);
+  }
+  /* 手机端没有 hover，用 active 给出点按反馈 */
+  .m-robot:active {
+    border-color: var(--primary);
+    background: rgba(37, 99, 235, 0.08);
+  }
+  .m-robot-top {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    margin-bottom: 2px;
+  }
+  .m-robot-name {
+    font-size: 15px;
+    font-weight: 600;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* 副标题：策略名有多个时提示「等 N 个策略」 */
+  .m-robot-extra {
+    flex-shrink: 0;
+    font-size: 11px;
+    white-space: nowrap;
+  }
+  /* 主视觉：收益/收益率放大 */
+  .m-pnl {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    flex-wrap: wrap;
+    padding-bottom: 10px;
+    margin-bottom: 10px;
+    border-bottom: 1px dashed var(--glass-border);
+  }
+  .m-pnl-main {
+    font-family: var(--mono);
+    font-size: 26px;
+    font-weight: 700;
+    line-height: 1.1;
+    letter-spacing: -0.02em;
+    font-variant-numeric: tabular-nums;
+  }
+  .m-pnl-rate {
+    font-family: var(--mono);
+    font-size: 15px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 6px;
+    font-variant-numeric: tabular-nums;
+  }
+  .m-pnl-rate.pos { color: var(--green); background: rgba(16, 185, 129, 0.12); }
+  .m-pnl-rate.neg { color: var(--red); background: rgba(239, 68, 68, 0.12); }
+  .m-pnl-main.pos { color: var(--green); }
+  .m-pnl-main.neg { color: var(--red); }
+  .m-pnl-none { font-size: 13px; }
+  .m-pnl-time { margin-left: auto; font-size: 11px; white-space: nowrap; }
+
+  /* 次要指标：2 个小格子（胜率 / 跟单人数） */
+  .m-mini-row {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+  .m-mini {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    min-width: 0;
+    padding: 7px 10px;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    border-radius: 8px;
+  }
+  .m-mini-k { font-size: 11px; color: var(--muted); white-space: nowrap; }
+  .m-mini-v {
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 100%;
+  }
+
+  /* ── 空态 / 加载态 ── */
+  .m-empty {
+    padding: 40px 16px;
+    text-align: center;
+    font-size: 13px;
+  }
+  .m-empty-text { margin: 0 0 12px; font-size: 13px; }
+  .m-empty-btn { min-height: 40px; }
+
+  /* ── 我的 AI 跟单 ── */
+  .m-mine-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .m-mine {
+    padding: 14px;
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius);
+    background: var(--panel);
+    backdrop-filter: blur(var(--blur));
+    -webkit-backdrop-filter: blur(var(--blur));
+  }
+  .m-mine-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  .m-mine-name {
+    font-size: 15px;
+    font-weight: 600;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .m-mine-none { margin: 0; font-size: 12px; }
+
+  /* 桌面端是 <table>，窄屏没法读；这里用卡片行代替表格 */
+  .m-mine-nodes {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .m-mine-node {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    min-height: 56px;
+    padding: 10px 12px;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+  }
+  .m-mine-node-main {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    flex: 1;
+  }
+  .m-mine-node-name {
+    font-size: 14px;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .m-mine-node-meta { font-size: 11px; }
+  .m-mine-leave {
+    flex-shrink: 0;
+    min-height: 40px;
+    padding: 0 16px;
+    border-radius: 10px;
+    font-size: 13px;
+    font-weight: 600;
+    background: rgba(239, 68, 68, 0.14);
+    color: #f87171;
+    border: 1px solid rgba(239, 68, 68, 0.3);
+    touch-action: manipulation;
+  }
+  .m-mine-leave:active { background: rgba(239, 68, 68, 0.24); }
+  .m-mine-wait { flex-shrink: 0; font-size: 12px; }
+
+  /* ── 全屏详情页 ──
+     用 100dvh 而不是 100vh：iOS 动态地址栏下 100vh 会超出可见区域。 */
+  .m-sheet {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    height: 100dvh;
+    background: var(--bg);
+    animation: m-sheet-in 0.22s cubic-bezier(0.32, 0.72, 0, 1);
+  }
+  @keyframes m-sheet-in {
+    from { transform: translateY(12px); opacity: 0; }
+    to { transform: translateY(0); opacity: 1; }
+  }
+
+  .m-sheet-bar {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 0 6px;
+    padding-top: env(safe-area-inset-top, 0px);
+    height: calc(52px + env(safe-area-inset-top, 0px));
+    background: rgba(6, 10, 18, 0.92);
+    border-bottom: 1px solid var(--glass-border);
+    backdrop-filter: blur(var(--blur));
+    -webkit-backdrop-filter: blur(var(--blur));
+  }
+  .m-back {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 44px;
+    height: 44px;
+    padding: 0;
+    background: transparent;
+    border: none;
+    color: var(--text);
+    border-radius: 10px;
+    touch-action: manipulation;
+  }
+  .m-back:active { background: rgba(255, 255, 255, 0.07); }
+  .m-sheet-title { font-size: 16px; font-weight: 600; }
+
+  .m-sheet-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    padding: 16px 14px;
+  }
+
+  /* 机器人身份区 */
+  .m-d-lead { margin-bottom: 20px; }
+  .m-d-name {
+    font-size: 19px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+  }
+  .m-d-node { margin-top: 3px; font-size: 12px; }
+
+  .m-d-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-top: 14px;
+  }
+  .m-d-stat {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 11px 12px;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+  }
+  .m-d-k { font-size: 11px; color: var(--muted); }
+  .m-d-v {
+    font-family: var(--mono);
+    font-size: 17px;
+    font-weight: 700;
+    line-height: 1.2;
+    font-variant-numeric: tabular-nums;
+  }
+  .m-d-v.pos { color: var(--green); }
+  .m-d-v.neg { color: var(--red); }
+  .m-d-updated { margin-top: 10px; font-size: 11px; }
+
+  .m-d-sec-title {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin: 0 0 10px;
+    font-size: 14px;
+    font-weight: 600;
+  }
+  .m-d-sec-sub { font-size: 12px; font-weight: 400; }
+
+  /* ── 节点选择项：整行 56px 触控区 ── */
+  .m-pick-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .m-pick {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-height: 56px;
+    padding: 10px 12px;
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    background: var(--glass);
+    cursor: pointer;
+    touch-action: manipulation;
+    transition: border-color var(--transition), background var(--transition);
+  }
+  .m-pick:active { background: rgba(37, 99, 235, 0.12); }
+  .m-pick.on {
+    border-color: var(--primary);
+    background: rgba(37, 99, 235, 0.1);
+  }
+  .m-pick.done { opacity: 0.55; cursor: not-allowed; }
+
+  /* 自绘勾选框：原生 checkbox 在深色下对比度差且样式不可控 */
+  .m-pick-box {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border: 2px solid var(--glass-highlight);
+    border-radius: 6px;
+    color: transparent;
+    transition: background var(--transition), border-color var(--transition), color var(--transition);
+  }
+  .m-pick.on .m-pick-box {
+    background: var(--primary);
+    border-color: var(--primary);
+    color: #ffffff;
+  }
+  .m-pick-main {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    flex: 1;
+  }
+  .m-pick-name {
+    font-size: 14px;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* ── 底部固定操作条 ── */
+  .m-sheet-foot {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 14px;
+    padding-bottom: calc(10px + env(safe-area-inset-bottom, 0px));
+    background: rgba(6, 10, 18, 0.94);
+    border-top: 1px solid var(--glass-border);
+    backdrop-filter: blur(var(--blur));
+    -webkit-backdrop-filter: blur(var(--blur));
+  }
+  .m-foot-count { font-size: 13px; flex-shrink: 0; }
+  .m-foot-n {
+    font-family: var(--mono);
+    font-size: 15px;
+    color: var(--text);
+  }
+  .m-foot-btn {
+    flex: 1;
+    min-height: 48px;
+    padding: 0 20px;
+    background: linear-gradient(135deg, var(--primary) 0%, var(--primary-d) 100%);
+    color: #041510;
+    font-size: 15px;
+    font-weight: 600;
+    border-radius: 12px;
+    box-shadow: 0 4px 16px var(--primary-glow);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    touch-action: manipulation;
+  }
+  .m-foot-btn:disabled {
+    opacity: 0.4;
+    background: var(--panel-2);
+    color: var(--muted);
+    box-shadow: none;
+    cursor: not-allowed;
+  }
+}
+
+/* ── 减少动态效果偏好：关掉入场动画，避免前庭不适 ── */
+@media (max-width: 768px) and (prefers-reduced-motion: reduce) {
+  .m-sheet { animation: none; }
+  .m-robot,
+  .m-tab,
+  .m-win-btn,
+  .m-pick,
+  .m-back,
+  .m-foot-btn,
+  .m-mine-leave {
+    transition: none;
+  }
+}
+
+/* ── 极窄屏（iPhone SE 320px）：主视觉再收一档，避免换行 ── */
+@media (max-width: 360px) {
+  .m-pnl-main { font-size: 23px; }
+  .m-pnl { gap: 8px; }
+  .m-tab { font-size: 13px; }
+  .m-d-v { font-size: 15px; }
+  /* 3 个格子在 320px 会挤，改为 2 列让「风险上限」独占一行 */
+  .m-mini-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 </style>

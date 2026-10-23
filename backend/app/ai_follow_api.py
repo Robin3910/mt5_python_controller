@@ -246,6 +246,14 @@ async def list_ai_robots(
         ]
         max_allow = [r["max_allow_num"] for r in risk if r["max_allow_num"] is not None]
         lot_limits = [r["total_lot_limit"] for r in risk if r["total_lot_limit"] is not None]
+        # 策略名称（列表标题用）：按分组顺序去重，取第一个作为主标题。
+        # 分组未绑策略 / 策略已删除时该名字为空 —— 此时列表不显示标题文字，
+        # 前端会回落到用户名，不展示空白标题。
+        strategy_names: list[str] = []
+        for g in groups:
+            sname = (strategies.get(g.get("strategy_id") or "") or {}).get("name")
+            if sname and sname not in strategy_names:
+                strategy_names.append(str(sname))
         # 绩效：主节点口径的预聚合（缓存未命中 -> 空统计，前端显示「暂无数据」）
         perf = dict(cached.get(uid) or {})
         out.append({
@@ -254,6 +262,8 @@ async def list_ai_robots(
             "display_name": u.display_name,
             "primary_node": _node_brief(primary),
             "ai_group_count": len(groups),
+            "strategy_name": strategy_names[0] if strategy_names else None,
+            "strategy_names": strategy_names,
             "follower_node_count": len(followers_by_leader.get(uid, set())),
             "my_follow_group_count": len({f["group_id"] for f in mine}),
             "my_follow_node_count": len(mine),
@@ -357,6 +367,12 @@ async def get_ai_robot_detail(
     follower_count = len({
         f["node_id"] for f in await follow_service.list_for_leaders({leader_user_id})
     })
+    # 策略名称：与列表接口同一口径（按分组顺序去重，取第一个作主标题）
+    strategy_names: list[str] = []
+    for g in groups:
+        sname = (strategies.get(g.get("strategy_id") or "") or {}).get("name")
+        if sname and sname not in strategy_names:
+            strategy_names.append(str(sname))
     return AiRobotDetailResponse(
         robot={
             "leader_user_id": leader_user_id,
@@ -364,6 +380,8 @@ async def get_ai_robot_detail(
             "display_name": user.display_name,
             "primary_node": _node_brief(primary),
             "ai_group_count": len(groups),
+            "strategy_name": strategy_names[0] if strategy_names else None,
+            "strategy_names": strategy_names,
             "follower_node_count": follower_count,
             "my_follow_group_count": len(mine),
             "my_follow_node_count": sum(len(v) for v in mine.values()),
@@ -456,6 +474,7 @@ async def list_my_ai_followings(
                 "group_name": g.get("name"),
                 "symbol": g.get("strategy_symbol") or risk.get("symbol"),
                 "strategy_id": g.get("strategy_id"),
+                "strategy_name": (strategies.get(g.get("strategy_id") or "") or {}).get("name"),
                 "marketable": reason is None,
                 "unmarketable_reason": reason,
                 "active_task_count": active_counts.get(gid, 0),
@@ -478,6 +497,13 @@ async def list_my_ai_followings(
                 "display_name": user.display_name,
                 "primary_node": _node_brief(primary),
                 "ai_group_count": len(by_group),
+                # 策略名称：与广场列表同一口径（按分组顺序去重，取第一个作主标题）
+                "strategy_name": (groups_out[0].get("strategy_name") if groups_out else None),
+                "strategy_names": [
+                    n for n in dict.fromkeys(
+                        str(g.get("strategy_name")) for g in groups_out if g.get("strategy_name")
+                    )
+                ],
                 "follower_node_count": 0,
                 "my_follow_group_count": len(by_group),
                 "my_follow_node_count": len(items),

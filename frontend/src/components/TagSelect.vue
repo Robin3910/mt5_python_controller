@@ -65,12 +65,12 @@ function pick(opt: TagOption<T>, current: T | null | undefined, disabled?: boole
   margin: 0;
   padding: 6px 12px;
   border: 1px solid var(--glass-border);
-  border-radius: 999px;
+  border-radius: 10px;
   background: var(--glass);
   color: var(--muted);
   font-size: 12px;
   font-weight: 600;
-  line-height: 1.3;
+  line-height: 1;
   box-shadow: none;
   backdrop-filter: none;
   -webkit-backdrop-filter: none;

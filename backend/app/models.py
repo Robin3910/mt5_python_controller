@@ -1165,6 +1165,12 @@ class AiRobotSummary(BaseModel):
     primary_node: Optional[dict] = None
     # 已开放 AI 跟单的 tpl_1 分组数
     ai_group_count: int = 0
+    # 该机器人名下可跟分组的**策略名称**（列表页标题用）。
+    # 可能有多个分组 → 多个策略名，这里给出去重后的第一个作为主标题；
+    # 前端展示策略名比展示用户名/主节点名更符合「机器人在跑什么策略」这个语义。
+    strategy_name: Optional[str] = None
+    # 该机器人名下可跟分组用到的**全部策略名称**（去重，按出现顺序）。
+    strategy_names: list[str] = Field(default_factory=list)
     # 被多少个节点跟随（全量跟单关系）
     follower_node_count: int = 0
     my_follow_group_count: int = 0
@@ -1231,6 +1237,8 @@ class AiMyGroup(BaseModel):
     group_name: Optional[str] = None
     symbol: Optional[str] = None
     strategy_id: Optional[str] = None
+    # 该分组绑定的策略名称（「我的跟单」按策略名展示机器人）
+    strategy_name: Optional[str] = None
     marketable: bool = True
     unmarketable_reason: Optional[str] = None
     active_task_count: int = 0
