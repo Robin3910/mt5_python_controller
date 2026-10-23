@@ -13,17 +13,20 @@ import DealsTable from '@/components/DealsTable.vue'
 import { useRouter } from 'vue-router'
 import { useHubStore } from '@/stores/hub'
 import { useAuthStore } from '@/stores/auth'
+import { trendLabel, trendTagClass } from '@/utils/trendConfig'
 import { quickTrigger, type TradingStrategyType, type QuickTriggerResult } from '@/api/trading'
 import type {
   AccountSnapshot,
   CloseRequest,
-  GroupOut,
+    GroupOut,
   GroupSignalTaskRecord,
   ManualSignalPayload,
   ManualSignalResult,
   NodeOut,
   Position,
   QuoteInfo,
+  TrendPanelData,
+  TrendVerdict,
 } from '@/api/types'
 
 const hub = useHubStore()
@@ -134,10 +137,37 @@ function fmtPrice(n: number | undefined, sym: string): string {
   return n.toFixed(digits)
 }
 
-function fmtPips(n: number | undefined): string {
-  if (n === undefined || n === null || !isFinite(n)) return '—'
-  const s = n >= 0 ? '+' : ''
-  return `${s}${n.toFixed(2)}`
+/**
+ * 当日涨跌额：MT5 的 SYMBOL_PRICE_CHANGE（相对昨收的绝对价差）。
+ * 快照只上报了涨跌幅（%），这里按 mid / (1 + pct) 反推昨收再求差值，
+ * 节点没上报 change 时返回 null，由模板显示「—」而不是伪造 0。
+ */
+function fmtDailyChangeAbs(q: QuoteInfo | null, sym: string): string | null {
+  const pct = q?.change
+  const mid = q?.mid
+  if (pct == null || !isFinite(pct) || mid == null || !isFinite(mid) || mid <= 0) return null
+  const base = mid / (1 + pct / 100)
+  if (!isFinite(base) || base <= 0) return null
+  const diff = mid - base
+  const digits = /JPY$/.test(sym) ? 3 : 5
+  const s = diff >= 0 ? '+' : ''
+  return `${s}${diff.toFixed(digits)}`
+}
+
+/** 当日涨跌幅（%）：与 MT5 Market Watch「Daily Change」同口径 */
+function fmtDailyChangePct(q: QuoteInfo | null): string | null {
+  const pct = q?.change
+  if (pct == null || !isFinite(pct)) return null
+  const s = pct >= 0 ? '+' : ''
+  return `${s}${pct.toFixed(2)}%`
+}
+
+/** 趋势标签配色（复用趋势面板的 tag 语义） */
+function trendClass(v: TrendVerdict): string {
+  return trendTagClass(v)
+}
+function trendText(v: TrendVerdict): string {
+  return trendLabel(v)
 }
 
 /** 持仓方向（buy/sell）转中文标签 */
@@ -616,8 +646,48 @@ async function closePosition(p: Position): Promise<void> {
   }
 }
 
+// ── 当前品种的多空结论（趋势面板同源） ──
+// 与【趋势面板】读同一套后端判定（GET /api/nodes/{id}/trend），这里只取结论标签，
+// 不复制指标算法：周期与阈值都沿用全局已保存配置，切换品种时重取。
+// 节点离线 / 品种无 K 线时后端会报错，这里静默降级成「暂无结论」，不打断报价展示。
+const TREND_POLL_MS = 15000
+const trendData = ref<TrendPanelData | null>(null)
+const trendVerdict = computed<TrendVerdict>(
+  () => trendData.value?.trend ?? 'unknown',
+)
+const trendReady = computed(() => !!trendData.value?.ready)
+
+async function loadTrend(): Promise<void> {
+  if (!primaryNode.value || !currentSymbol.value) {
+    trendData.value = null
+    return
+  }
+  const nodeId = primaryNode.value.node_id
+  const sym = currentSymbol.value
+  try {
+    const res = await hub.fetchNodeTrend(nodeId, sym)
+    // 响应回来时用户可能已切走品种 / 节点，丢弃过期结论
+    if (
+      primaryNode.value?.node_id !== nodeId ||
+      currentSymbol.value !== sym
+    ) {
+      return
+    }
+    trendData.value = res
+  } catch {
+    // 离线、无 K 线等一律降级：不显示结论，不打断页面其它数据
+    trendData.value = null
+  }
+}
+
+// 切换主节点 / 品种后立刻对齐结论，避免停留在上一个品种的多空方向
+watch([primaryNode, currentSymbol], () => {
+  void loadTrend()
+})
+
 // 简单轮询拉取快照（保持行情新鲜）
 let pollTimer: number | null = null
+let trendTimer: number | null = null
 onMounted(async () => {
   await hub.fetchNodes()
   if (primaryNode.value && !hub.accounts[primaryNode.value.node_id]) {
@@ -627,16 +697,24 @@ onMounted(async () => {
       /* 节点尚未上报快照，忽略 */
     }
   }
+  void loadTrend()
   pollTimer = window.setInterval(() => {
     if (primaryNode.value) {
       hub.fetchNodeAccount(primaryNode.value.node_id).catch(() => {})
     }
   }, 5000)
+  trendTimer = window.setInterval(() => {
+    void loadTrend()
+  }, TREND_POLL_MS)
 })
 onBeforeUnmount(() => {
   if (pollTimer !== null) {
     window.clearInterval(pollTimer)
     pollTimer = null
+  }
+  if (trendTimer !== null) {
+    window.clearInterval(trendTimer)
+    trendTimer = null
   }
   if (gridTimer !== null) {
     window.clearInterval(gridTimer)
@@ -661,24 +739,22 @@ onBeforeUnmount(() => {
         <div class="quote-col">
           <div class="quote-head">
             <span class="quote-sym">{{ currentSymbol }}</span>
-            <span class="quote-pct" v-if="currentQuote()">100.00%</span>
           </div>
           <div class="quote-mid">{{ fmtPrice(currentQuote()?.mid, currentSymbol) }}</div>
           <div class="quote-bidask">
-            <div class="ba-row bid">
-              <span class="ba-k">买价</span>
-              <span class="ba-v">{{ fmtPrice(currentQuote()?.bid, currentSymbol) }}</span>
-            </div>
-            <div class="ba-row ask">
-              <span class="ba-k">卖价</span>
-              <span class="ba-v">{{ fmtPrice(currentQuote()?.ask, currentSymbol) }}</span>
-            </div>
             <div class="ba-row chg">
-              <span class="ba-k">变动</span>
+              <span class="ba-k">涨跌</span>
               <span
                 class="ba-v"
                 :class="(currentQuote()?.change ?? 0) >= 0 ? 'pos' : 'neg'"
-              >{{ fmtPips(currentQuote()?.change) }}</span>
+              >{{ fmtDailyChangeAbs(currentQuote(), currentSymbol) ?? '—' }}</span>
+              <span
+                class="ba-v"
+                :class="(currentQuote()?.change ?? 0) >= 0 ? 'pos' : 'neg'"
+              >{{ fmtDailyChangePct(currentQuote()) ?? '—' }}</span>
+              <span class="tag" :class="trendReady ? trendClass(trendVerdict) : ''">
+                {{ trendReady ? trendText(trendVerdict) : '—' }}
+              </span>
             </div>
           </div>
           <div class="quote-position" v-if="symbolPosCount > 0">
@@ -1267,6 +1343,18 @@ onBeforeUnmount(() => {
 .ba-v.pos { color: var(--green); }
 .ba-v.neg { color: var(--red); }
 
+/* 涨跌 / 涨跌幅 / 多空结论：三者挤在一行，中间用细分隔线断开 */
+.ba-row.chg {
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px;
+}
+.ba-row.chg .ba-v + .ba-v,
+.ba-row.chg .ba-v + .tag {
+  padding-left: 10px;
+  border-left: 1px solid var(--glass-border);
+}
+
 .quote-position {
   display: flex;
   flex-direction: column;
@@ -1756,6 +1844,12 @@ onBeforeUnmount(() => {
   /* 历史订单翻页器更紧凑 */
   .hist-pager { flex-wrap: wrap; }
   .pager-total { width: 100%; margin-left: 0; text-align: right; }
+  /* 报价行塞了三项，手机端收紧间距与 tag 尺寸 */
+  .ba-row { font-size: 11.5px; }
+  .ba-row.chg { gap: 7px; }
+  .ba-row.chg .ba-v + .ba-v,
+  .ba-row.chg .ba-v + .tag { padding-left: 7px; }
+  .ba-row.chg .tag { font-size: 10px; padding: 2px 6px; }
 }
 @media (max-width: 420px) {
   .quote-mid { font-size: 24px; }

@@ -1296,6 +1296,12 @@ a.dash-link { display: inline-block; }
   .dash-summary { grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; }
 }
 
+/* 紧一点：带单页是宽卡片流，挤掉一层横向内边距后能多出 24px 可用宽度。
+     只作用于本页（:has 命中 .follow-page），其他页面间距不动。 */
+@media (max-width: 768px) {
+  .content:has(.follow-page) { padding: 10px 8px calc(8px + env(safe-area-inset-bottom, 0px)); }
+}
+
 @media (max-width: 768px) {
   .layout-split,
   .layout-config { grid-template-columns: 1fr; }
@@ -1376,14 +1382,24 @@ a.dash-link { display: inline-block; }
   .mobile-only.list-cards { flex-direction: column; }
 
   .secure-badge:not(.webhook-copy) { display: none; }
-  .nav a span { display: none; }
-  .nav a { padding: 8px 10px; }
-  .nav a svg { width: 18px; height: 18px; opacity: 1; }
+
+  /* 手机/平板顶栏导航：icon 上 + 文字下，icon 缩小，保证每个 tab 都能看到名称 */
+  .nav a {
+    flex-direction: column;
+    gap: 2px;
+    padding: 6px 4px;
+    font-size: 11px;
+    line-height: 1.15;
+    min-width: 0;
+  }
+  .nav a span { display: block; white-space: nowrap; }
+  .nav a svg { width: 16px; height: 16px; opacity: 1; }
 
   /* 手机端：隐藏顶栏的品牌区/在线状态/用户名/退出，只保留一行图标导航 */
   .topbar {
     padding: 0 8px;
-    height: 48px;
+    height: 54px;
+    min-height: 54px;
     gap: 4px;
   }
   .topbar .brand,
@@ -1391,10 +1407,14 @@ a.dash-link { display: inline-block; }
   .topbar-user { display: none; }
   .nav {
     flex: 1;
+    min-width: 0;
     justify-content: space-around;
     gap: 2px;
+    overflow-x: auto;
+    scrollbar-width: none;
   }
-  .nav a { flex: 1; justify-content: center; padding: 8px 4px; }
+  .nav::-webkit-scrollbar { display: none; }
+  .nav a { flex: 1 0 auto; justify-content: center; padding: 5px 6px; font-size: 11px; }
 
   .pagination {
     flex-direction: column;
@@ -1411,18 +1431,28 @@ a.dash-link { display: inline-block; }
   .topbar {
     gap: 4px;
     padding: 0 6px;
-    height: 46px;
-    min-height: 46px;
+    height: 52px;
+    min-height: 52px;
     flex-wrap: nowrap;
   }
   .brand-text { font-size: 13px; }
   .brand-sub { display: none; }
   .nav {
     flex: 1;
+    min-width: 0;
     justify-content: space-around;
     gap: 2px;
+    overflow-x: auto;
+    scrollbar-width: none;
   }
-  .nav a { flex: 1; justify-content: center; }
+  .nav::-webkit-scrollbar { display: none; }
+  .nav a {
+    flex: 1 0 auto;
+    justify-content: center;
+    padding: 5px 5px;
+    font-size: 10px;
+  }
+  .nav a svg { width: 15px; height: 15px; }
   .spacer { display: none; }
   .topbar-status { display: none; }
   .topbar .btn-logout { display: none; }

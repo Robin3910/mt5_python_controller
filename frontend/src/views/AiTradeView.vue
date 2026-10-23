@@ -30,6 +30,7 @@ import type {
   AiRobotDetailResponse,
   AiRobotSummary,
 } from '@/api/types'
+import RobotIcon from '@/components/RobotIcon.vue'
 
 const robots = ref<AiRobotSummary[]>([])
 const loading = ref(false)
@@ -506,17 +507,30 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
 
 <template>
   <div class="page follow-wrap">
+    <!-- 页面标题 + 图标 + 标签 + 副标题：桌面 / 手机共用一套（手机端在 ≤768px 保留显示） -->
+    <div class="row between page-header">
+      <div class="page-head-l">
+        <RobotIcon class="page-head-icon" :size="26" boxed />
+        <div class="page-head-text">
+          <div class="page-head-title-row">
+            <h2 class="page-title">AI 智能交易机器人</h2>
+            <span class="page-head-tag">热门机器人</span>
+          </div>
+          <p class="page-sub">策略自动化运行，7x24 小时监控</p>
+        </div>
+      </div>
+    </div>
 
     <div class="main-grid">
       <!-- 左：广场 -->
       <section class="panel">
         <header class="panel-head">
-          <h2>AI 机器人广场</h2>
+          <h2>机器人</h2>
           <span class="muted" style="font-size: 12px; margin-left: auto">{{ robots.length }} 个</span>
         </header>
-        <!-- 统计窗口：所有机器人同一窗口，否则没法横向比较 -->
+        <!-- 统计周期：所有机器人同一窗口，否则没法横向比较 -->
         <div class="win-row">
-          <span class="muted win-label">统计窗口</span>
+          <span class="muted win-label">统计周期</span>
           <div class="win-btns">
             <button
               v-for="opt in WINDOW_OPTIONS"
@@ -549,11 +563,19 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
             :class="{ active: detail?.robot.leader_user_id === r.leader_user_id }"
             @click="openRobot(r)"
           >
-            <div class="robot-head">
-              <span class="robot-name">{{ r.display_name || r.username }}</span>
+            <!-- 头部：头像 + 策略名 + 状态标签（与 FollowView 带单卡片同一套版式） -->
+            <div class="row between robot-head">
+              <span class="row robot-name">
+                <RobotIcon class="robot-avatar" :size="30" variant="iconfont" boxed />
+                <strong class="robot-name-text">{{ robotTitle(r) }}</strong>
+                <span v-if="!r.marketable" class="tag amber robot-flag">已下架</span>
+              </span>
+              <span v-if="r.my_follow_node_count" class="tag green robot-flag">已跟</span>
+              <span v-else class="tag robot-flag">未跟</span>
             </div>
             <div class="robot-sub">
-              <span>{{ primaryText(r) }}</span>
+              <span>{{ r.username }}</span>
+              <span class="muted"> · {{ primaryText(r) }}</span>
             </div>
 
             <!-- 绩效（主节点口径）：与 FollowView 带单广场同一套组件与口径 -->
@@ -590,6 +612,11 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
                   <span class="ls-mini-k">跟单人数</span>
                   <span class="ls-mini-v">{{ followerCountOf(r) }} 人</span>
                 </div>
+                <div class="ls-mini">
+                  <span class="ls-mini-k">交易</span>
+                  <span v-if="!hasPerf(r)" class="ls-mini-v muted">暂无数据</span>
+                  <span v-else class="ls-mini-v">{{ perfOf(r).total_trades }} 笔</span>
+                </div>
               </div>
 
               <div v-if="updatedText(r)" class="ls-updated muted">{{ updatedText(r) }}</div>
@@ -612,9 +639,10 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
         <div v-if="detailLoading" class="empty">加载中…</div>
         <div v-else-if="detail">
           <header class="robot-detail-head">
-            <div>
-              <span class="robot-name large">{{ detail.robot.display_name || detail.robot.username }}</span>
-            </div>
+            <span class="row robot-name">
+              <RobotIcon class="robot-avatar" :size="34" variant="iconfont" boxed />
+              <span class="robot-name-text">{{ robotTitle(detail.robot) }}</span>
+            </span>
             <div class="muted">{{ primaryText(detail.robot) }}</div>
           </header>
 
@@ -667,9 +695,12 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
         </div>
         <ul v-else class="mine-list">
           <li v-for="e in myFollowing" :key="e.robot.leader_user_id" class="mine-block">
-            <header class="mine-head">
-              <span class="robot-name">{{ e.robot.display_name || e.robot.username }}</span>
-              <span v-if="e.marketable" class="tag ok">运行中</span>
+            <header class="row between mine-head">
+              <span class="row robot-name">
+                <RobotIcon class="robot-avatar" :size="30" variant="iconfont" boxed />
+                <span class="robot-name-text">{{ robotTitle(e.robot) }}</span>
+              </span>
+              <span v-if="e.marketable" class="tag green">运行中</span>
               <span v-else class="tag amber">已下架</span>
             </header>
             <!-- 这里只回答「我跟着哪些节点跑」+「怎么退」。
@@ -728,31 +759,23 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
 
     <!-- ── 分段一：机器人广场 ── -->
     <div v-show="mobileTab === 'robots'" class="m-only m-panel">
-      <div class="m-search-row">
-        <input
-          v-model="keyword"
-          class="m-search"
-          type="search"
-          enterkeyhint="search"
-          placeholder="搜索用户名 / 节点 / MT5 号"
-          @keyup.enter="loadRobots"
-        />
-        <button class="m-search-btn" :disabled="loading" @click="loadRobots">搜索</button>
-      </div>
 
-      <!-- 统计窗口：横向滑动的分段控件，不再换行占一屏 -->
-      <div class="m-win" role="group" aria-label="统计窗口">
-        <button
-          v-for="opt in WINDOW_OPTIONS"
-          :key="opt.value"
-          class="m-win-btn"
-          :class="{ on: perfWindow === opt.value }"
-          :aria-pressed="perfWindow === opt.value"
-          :disabled="loading"
-          @click="perfWindow = opt.value"
-        >
-          {{ opt.label }}
-        </button>
+      <!-- 统计周期：标签 + 按钮排同一行，横向滑动不换行占一屏 -->
+      <div class="m-win-row">
+        <span class="m-win-label">统计周期</span>
+        <div class="m-win" role="group" aria-label="统计周期">
+          <button
+            v-for="opt in WINDOW_OPTIONS"
+            :key="opt.value"
+            class="m-win-btn"
+            :class="{ on: perfWindow === opt.value }"
+            :aria-pressed="perfWindow === opt.value"
+            :disabled="loading"
+            @click="perfWindow = opt.value"
+          >
+            {{ opt.label }}
+          </button>
+        </div>
       </div>
 
       <div v-if="loading" class="m-empty muted">加载中…</div>
@@ -765,31 +788,51 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
           class="m-robot"
           @click="openMobileRobot(r)"
         >
+          <!-- 头部：头像 + 策略名 + 状态胶囊（与 FollowView .m-leader 同一套版式） -->
           <div class="m-robot-top">
-            <span class="m-robot-name">{{ robotTitle(r) }}</span>
-            <span v-if="robotStrategyExtra(r)" class="m-robot-extra muted">{{ robotStrategyExtra(r) }}</span>
-            <span v-if="!r.marketable" class="tag amber">已下架</span>
-            <span v-else-if="r.my_follow_node_count" class="tag green">已跟 {{ r.my_follow_node_count }}</span>
+            <span class="m-robot-id">
+              <RobotIcon :size="40" variant="iconfont" boxed />
+              <span class="m-robot-id-text">
+                <span class="m-robot-name">{{ robotTitle(r) }}</span>
+                <span class="m-robot-sub">
+                  <template v-if="robotStrategyExtra(r)">{{ robotStrategyExtra(r) }}</template>
+                  <template v-else>{{ r.username }}</template>
+                  <template v-if="updatedText(r)">
+                    {{ robotStrategyExtra(r) ? ' · ' : '' }}{{ updatedText(r) }}
+                  </template>
+                </span>
+              </span>
+            </span>
+            <span class="m-robot-badge" :class="r.my_follow_node_count ? 'is-followed' : ''">
+              {{ r.my_follow_node_count ? '已跟' : '跟单' }}
+            </span>
           </div>
 
-          <!-- 主视觉：收益 + 收益率放大成一行大数字，先给结论再看细节 -->
+          <!-- 主视觉：累计收益（大号）+ 收益率（右上小号），左右分栏 -->
           <div class="m-pnl">
             <div v-if="!hasPerf(r)" class="m-pnl-none muted">暂无成交数据</div>
             <template v-else>
-              <span class="m-pnl-main" :class="perfOf(r).total_profit >= 0 ? 'pos' : 'neg'">
-                {{ fmtProfit(perfOf(r).total_profit) }}
-              </span>
-              <span
-                v-if="perfOf(r).profit_rate_valid"
-                class="m-pnl-rate"
-                :class="perfOf(r).profit_rate >= 0 ? 'pos' : 'neg'"
-              >
-                {{ fmtRate(perfOf(r).profit_rate) }}
-              </span>
+              <div class="m-pnl-left">
+                <span class="m-pnl-main" :class="perfOf(r).total_profit >= 0 ? 'pos' : 'neg'">
+                  {{ fmtProfit(perfOf(r).total_profit) }}
+                </span>
+                <span class="m-pnl-label">累计收益</span>
+              </div>
+              <div class="m-pnl-right">
+                <span
+                  v-if="perfOf(r).profit_rate_valid"
+                  class="m-pnl-rate"
+                  :class="perfOf(r).profit_rate >= 0 ? 'pos' : 'neg'"
+                >
+                  {{ fmtRate(perfOf(r).profit_rate) }}
+                </span>
+                <span v-else class="m-pnl-rate muted">—</span>
+                <span class="m-pnl-label">收益率</span>
+              </div>
             </template>
-            <span v-if="updatedText(r)" class="m-pnl-time muted">{{ updatedText(r) }}</span>
           </div>
 
+          <!-- 次要指标：三个等宽小格 -->
           <div class="m-mini-row">
             <span class="m-mini">
               <span class="m-mini-k">胜率</span>
@@ -799,6 +842,11 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
             <span class="m-mini">
               <span class="m-mini-k">跟单</span>
               <span class="m-mini-v">{{ followerCountOf(r) }} 人</span>
+            </span>
+            <span class="m-mini">
+              <span class="m-mini-k">交易</span>
+              <span v-if="!hasPerf(r)" class="m-mini-v muted">—</span>
+              <span v-else class="m-mini-v">{{ perfOf(r).total_trades }} 笔</span>
             </span>
           </div>
         </li>
@@ -817,23 +865,27 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
       <div v-else class="m-mine-list">
         <div v-for="e in myFollowing" :key="e.robot.leader_user_id" class="m-mine">
           <div class="m-mine-head">
-            <span class="m-mine-name">{{ robotTitle(e.robot) }}</span>
-            <span v-if="e.marketable" class="tag ok">运行中</span>
-            <span v-else class="tag amber">已下架</span>
+            <div class="m-mine-id">
+              <span class="m-mine-name-row">
+                <RobotIcon :size="34" variant="iconfont" boxed />
+                <span class="m-mine-name">{{ robotTitle(e.robot) }}</span>
+                <span v-if="!e.marketable" class="tag amber m-mine-flag">已下架</span>
+              </span>
+            </div>
+            <span v-if="e.marketable" class="tag green m-mine-flag">运行中</span>
           </div>
 
           <p v-if="!e.nodes.length" class="muted m-mine-none">暂未跟单任何节点</p>
 
           <!-- 桌面端是 <table>，窄屏没法读；这里用卡片行代替表格。
-               每行一个节点：名称 + 账号一行，移出按钮独立成行。 -->
+               每行一个节点：名称一行 + 账号/时间一行小字。 -->
           <ul v-else class="m-mine-nodes">
             <li v-for="n in e.nodes" :key="e.robot.leader_user_id + '|' + n.node_id" class="m-mine-node">
-              <div class="m-mine-node-main">
-                <span class="m-mine-node-name">{{ n.name || n.node_id }}</span>
-                <span class="m-mine-node-meta muted">
-                  <template v-if="n.joined_at">{{ fmtJoinedShort(n.joined_at) }} 加入</template>
-                </span>
-              </div>
+              <span class="m-mine-node-name">{{ n.name || n.node_id }}</span>
+              <span v-if="n.mt5_login" class="mono m-mine-node-login">MT5 {{ n.mt5_login }}</span>
+              <span class="m-mine-node-meta muted">
+                <template v-if="n.joined_at">{{ fmtJoinedShort(n.joined_at) }} 加入</template>
+              </span>
               <button
                 v-if="e.marketable"
                 class="m-mine-leave"
@@ -863,7 +915,11 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
 
         <template v-else-if="detail">
           <div class="m-d-lead">
-            <div class="m-d-name">{{ robotTitle(detail.robot) }}</div>
+            <!-- 名字 + 头像同排，名字过长时省略而不是把标签挤到下一行 -->
+            <div class="m-d-name-row">
+              <RobotIcon :size="44" variant="iconfont" boxed />
+              <div class="m-d-name">{{ robotTitle(detail.robot) }}</div>
+            </div>
             <!-- 副标题只说明「还有几个策略」，不再显示节点名 / MT5 账号 -->
             <div v-if="robotStrategyExtra(detail.robot)" class="m-d-node muted">
               {{ robotStrategyExtra(detail.robot) }}
@@ -978,6 +1034,59 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
 .banner strong { margin-right: 6px; }
 .banner.danger { border-color: var(--danger, #f56c6c); }
 
+/* ── 页面标题 + 图标 + 标签 + 副标题 ────────────────────────
+   与 FollowView .page-head-l / .page-head-tag 同一套版式，
+   主色沿用本项目的蓝色（--primary），不用 FollowView 的紫色。 */
+.page-head-l {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+/* 标题左侧的机器人图标：带底色的方块，和列表里的图标同一套 */
+.page-head-icon {
+  color: var(--primary);
+}
+.page-head-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+/* 标题 + 标签同一行 */
+.page-head-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.page-title {
+  font-size: 20px;
+  font-weight: 700;
+  margin: 0;
+  letter-spacing: -0.01em;
+}
+/* 透明底标签：只有描边和字色，没有填充 */
+.page-head-tag {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: transparent;
+  border: 1px solid rgba(37, 99, 234, 0.45);
+  color: #93b4fb;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+/* 标题下面的一行小字介绍 */
+.page-sub {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 0;
+  line-height: 1.5;
+}
+
 .main-grid {
   display: grid;
   grid-template-columns: minmax(280px, 380px) 1fr;
@@ -1020,10 +1129,10 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  transition: border-color 0.15s ease;
+  transition: border-color 0.15s ease, background 0.15s ease;
 }
 .robot-card:hover { border-color: var(--primary); }
-.robot-card.active { border-color: var(--primary); background: rgba(64, 158, 255, 0.06); }
+.robot-card.active { border-color: var(--primary); background: rgba(37, 99, 234, 0.08); }
 
 /* 统计窗口 + 搜索：窄栏（280~380px）里各占一行，别和标题挤在一起 */
 .win-row {
@@ -1101,7 +1210,7 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
 
 .ls-mini-row {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 6px;
 }
 .ls-mini {
@@ -1151,14 +1260,20 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
   .ls-mini { padding: 5px 8px; }
 }
 
-.robot-head {
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
+/* 机器人卡片头部：头像 + 策略名 + 标签。
+   与 FollowView .leader-head 同一套版式：名字过长时省略，
+   头像和状态标签固定不缩（否则长名字会把标签挤到第二行）。 */
+.robot-head { align-items: center; }
+.robot-name { gap: 6px; min-width: 0; font-weight: 600; }
+.robot-name-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.robot-name { font-weight: 600; }
-.robot-name.large { font-size: 18px; }
-.robot-sub { color: var(--muted); font-size: 12px; }
+.robot-avatar { margin: 0 2px; }
+.robot-flag { flex-shrink: 0; align-self: center; }
+.robot-sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
 .robot-risk {
   display: flex;
   flex-wrap: wrap;
@@ -1182,7 +1297,7 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
 .robot-detail-head {
   display: flex;
   justify-content: space-between;
-  align-items: baseline;
+  align-items: center;
   flex-wrap: wrap;
   gap: 12px;
   margin-bottom: 12px;
@@ -1259,14 +1374,8 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
 }
 .empty.muted { color: var(--muted); }
 
-.tag {
-  display: inline-block;
-  padding: 1px 6px;
-  font-size: 11px;
-  border-radius: 4px;
-}
-.tag.ok { background: rgba(64, 158, 255, 0.16); color: var(--primary); }
-.tag.amber { background: rgba(230, 162, 60, 0.16); color: #c4823a; }
+/* 标签样式沿用全局 .tag（styles.css），与 FollowView 带单广场保持一致，
+   不在这里另起一套 —— 局部覆盖会和全局的 .tag.green / .tag.blue 打架。 */
 
 .ok { color: var(--primary); }
 .off { color: var(--muted); }
@@ -1283,7 +1392,7 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
 }
 .mine-head {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 8px;
   margin-bottom: 8px;
 }
@@ -1322,27 +1431,46 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
 
   .follow-wrap {
     gap: 0;
-    padding: 12px 12px calc(12px + env(safe-area-inset-bottom, 0px));
+    padding: 10px 0 calc(4px + env(safe-area-inset-bottom, 0px));
   }
 
   /* 桌面端的两栏（.main-grid）在手机端整体隐藏。
      漏掉它会导致桌面布局在手机上照样渲染，
-     变成「上半截桌面 UI + 下半截手机 UI」重复两套 —— 必须整个隐藏。 */
+     变成「上半截桌面 UI + 下半截手机 UI」重复两套 —— 必须整个隐藏。
+     注意 .page-header 不隐藏：手机端是单栏信息流，没有标题用户不知道自己在哪一页。 */
   .main-grid { display: none; }
+
+  /* 标题栏在手机端保留：全局 768px 规则会把 .page-header 改成
+     column + stretch，这里改回单行左对齐，标题略缩小。 */
+  .page-header {
+    flex-direction: row;
+    align-items: center;
+    flex-wrap: nowrap;
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+  .page-title {
+    font-size: 17px;
+    font-weight: 700;
+    margin: 0;
+  }
+  .page-sub { font-size: 11px; }
 
   /* ── 分段切换 ── */
   .m-tabs {
     position: sticky;
-    top: 0;
+    /* 顶栏（.topbar）也是 sticky top:0、z-index:20，尺寸 60px（≤640px 是 46px）。
+       分段切换必须让开顶栏高度，否则滚动时会滑到顶栏底下被盖住。 */
+    top: 60px;
     z-index: 12;
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 4px;
-    padding: 4px;
-    margin: 0 0 12px;
+    gap: 3px;
+    padding: 3px;
+    margin: 0 0 10px;
     background: rgba(6, 10, 18, 0.9);
     border: 1px solid var(--glass-border);
-    border-radius: 12px;
+    border-radius: 10px;
     backdrop-filter: blur(var(--blur)) saturate(1.3);
     -webkit-backdrop-filter: blur(var(--blur)) saturate(1.3);
   }
@@ -1351,14 +1479,15 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     display: flex;
     align-items: center;
     justify-content: center;
-    gap: 6px;
-    min-height: 44px;
+    gap: 5px;
+    /* 高度 36px：仍高于 32px 的最小触控建议，但更省垂直空间 */
+    min-height: 36px;
     padding: 0 8px;
     background: transparent;
     border: 1px solid transparent;
-    border-radius: 9px;
+    border-radius: 8px;
     color: var(--muted);
-    font-size: 14px;
+    font-size: 13px;
     font-weight: 600;
     transition: color var(--transition), background var(--transition);
   }
@@ -1370,12 +1499,12 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     box-shadow: 0 2px 12px var(--primary-glow);
   }
   .m-tab-badge {
-    min-width: 20px;
-    padding: 1px 6px;
+    min-width: 18px;
+    padding: 0 5px;
     border-radius: 999px;
     background: rgba(255, 255, 255, 0.1);
     font-family: var(--mono);
-    font-size: 11px;
+    font-size: 10px;
     font-weight: 700;
     line-height: 1.5;
   }
@@ -1386,12 +1515,7 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
 
   .m-panel { display: block; }
 
-  /* ── 搜索行：输入框 + 搜索按钮并排，按钮 44px 可点 ── */
-  .m-search-row {
-    display: flex;
-    gap: 8px;
-    margin-bottom: 10px;
-  }
+  /* ── 搜索框 ── */
   /* 字号必须 ≥16px：iOS Safari 聚焦小于 16px 的输入框会自动放大整个页面，
      用户无法缩回去。 */
   .m-search {
@@ -1400,6 +1524,13 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     min-height: 44px;
     border-radius: 12px;
     font-size: 16px;
+    /* 搜索框跟着设计稿走：卡片实色底 + 聚焦蓝色描边 */
+    background: #121828;
+    border-color: rgba(255, 255, 255, 0.08);
+  }
+  .m-search:focus {
+    border-color: rgba(37, 99, 234, 0.65);
+    box-shadow: 0 0 0 3px rgba(37, 99, 234, 0.16);
   }
   .m-search-btn {
     flex-shrink: 0;
@@ -1411,39 +1542,59 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     touch-action: manipulation;
   }
 
-  /* ── 统计窗口：横向滑动的分段控件 ── */
+  /* ── 统计周期：标签 + 横向滑动的分段控件，同一行 ── */
+  .m-win-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+    min-width: 0;
+  }
+  .m-win-label {
+    flex-shrink: 0;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted);
+    white-space: nowrap;
+  }
   .m-win {
     display: flex;
     gap: 6px;
-    margin-bottom: 12px;
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
     scrollbar-width: none;
+    /* 让按钮组吃掉剩余宽度，标签不被挤掉 */
+    flex: 1 1 auto;
+    min-width: 0;
   }
   .m-win::-webkit-scrollbar { display: none; }
   .m-win-btn {
     flex: 1 0 auto;
-    min-height: 36px;
-    padding: 0 14px;
+    min-height: 30px;
+    padding: 0 10px;
     border-radius: 999px;
-    border: 1px solid var(--glass-border);
-    background: var(--glass);
-    color: var(--muted);
-    font-size: 13px;
+    /* 未选中态也带一点蓝调，和主色统一 */
+    border: 1px solid rgba(37, 99, 234, 0.28);
+    background: rgba(37, 99, 234, 0.1);
+    color: #93b4fb;
+    font-size: 12px;
     font-weight: 600;
     white-space: nowrap;
     touch-action: manipulation;
     transition: color var(--transition), background var(--transition), border-color var(--transition);
   }
-  .m-win-btn:active { background: rgba(255, 255, 255, 0.07); }
+  .m-win-btn:active { background: rgba(37, 99, 234, 0.22); }
   .m-win-btn.on {
     color: #ffffff;
+    /* 选中态实心蓝，和顶部分段切换同一套主色 */
     background: linear-gradient(135deg, var(--primary) 0%, var(--primary-d) 100%);
     border-color: transparent;
     box-shadow: 0 2px 12px var(--primary-glow);
   }
 
-  /* ── 机器人卡片 ── */
+  /* ── 机器人卡片 ──────────────────────────────────────────────
+     版式对齐 FollowView .m-leader：卡片实色底 #121828、
+     40px 头像、收益主数字 28px、三等分小格。 */
   .m-robot-list {
     list-style: none;
     margin: 0;
@@ -1454,26 +1605,40 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
   }
   .m-robot {
     padding: 14px;
-    border: 1px solid var(--glass-border);
-    border-radius: var(--radius);
-    background: var(--panel);
-    backdrop-filter: blur(var(--blur));
-    -webkit-backdrop-filter: blur(var(--blur));
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 16px;
+    /* 参考设计的卡片底色比全局 --panel 更实、更亮，这里用实色而非半透明 */
+    background: #121828;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.32);
     cursor: pointer;
     touch-action: manipulation;
     transition: border-color var(--transition), background var(--transition);
   }
   /* 手机端没有 hover，用 active 给出点按反馈 */
   .m-robot:active {
-    border-color: var(--primary);
-    background: rgba(37, 99, 235, 0.08);
+    border-color: rgba(37, 99, 234, 0.55);
+    background: #16203a;
   }
   .m-robot-top {
     display: flex;
     align-items: center;
-    gap: 8px;
+    justify-content: space-between;
+    gap: 10px;
     min-width: 0;
-    margin-bottom: 2px;
+    margin-bottom: 14px;
+  }
+  /* 头像 + 策略名（名字在上、副标题在下） */
+  .m-robot-id {
+    display: flex;
+    align-items: center;
+    gap: 11px;
+    min-width: 0;
+  }
+  .m-robot-id-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
   }
   .m-robot-name {
     font-size: 15px;
@@ -1483,61 +1648,91 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  /* 副标题：策略名有多个时提示「等 N 个策略」 */
-  .m-robot-extra {
-    flex-shrink: 0;
+  /* 副标题：策略名有多个时提示「等 N 个策略」，否则显示用户名 */
+  .m-robot-sub {
     font-size: 11px;
+    color: var(--muted);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
     white-space: nowrap;
   }
-  /* 主视觉：收益/收益率放大 */
+  /* 右上角状态胶囊 */
+  .m-robot-badge {
+    flex-shrink: 0;
+    padding: 5px 12px;
+    border-radius: 999px;
+    background: rgba(37, 99, 234, 0.18);
+    border: 1px solid rgba(37, 99, 234, 0.4);
+    color: #93b4fb;
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1.2;
+    white-space: nowrap;
+  }
+  .m-robot-badge.is-followed {
+    background: rgba(16, 185, 129, 0.16);
+    border-color: rgba(16, 185, 129, 0.4);
+    color: #34d399;
+  }
+
+  /* 主视觉：收益在左（大号），收益率在右（小号），左右分栏 */
   .m-pnl {
     display: flex;
-    align-items: baseline;
-    gap: 10px;
-    flex-wrap: wrap;
-    padding-bottom: 10px;
-    margin-bottom: 10px;
-    border-bottom: 1px dashed var(--glass-border);
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 12px;
+    padding-bottom: 14px;
+    margin-bottom: 12px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
   }
+  .m-pnl-left,
+  .m-pnl-right {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+  }
+  .m-pnl-right { text-align: right; }
   .m-pnl-main {
     font-family: var(--mono);
-    font-size: 26px;
+    font-size: 28px;
     font-weight: 700;
-    line-height: 1.1;
-    letter-spacing: -0.02em;
+    line-height: 1.05;
+    letter-spacing: -0.03em;
     font-variant-numeric: tabular-nums;
+  }
+  .m-pnl-label {
+    font-size: 11px;
+    color: var(--muted);
+    white-space: nowrap;
   }
   .m-pnl-rate {
     font-family: var(--mono);
-    font-size: 15px;
+    font-size: 18px;
     font-weight: 700;
-    padding: 2px 8px;
-    border-radius: 6px;
+    line-height: 1.05;
     font-variant-numeric: tabular-nums;
   }
-  .m-pnl-rate.pos { color: var(--green); background: rgba(16, 185, 129, 0.12); }
-  .m-pnl-rate.neg { color: var(--red); background: rgba(239, 68, 68, 0.12); }
+  .m-pnl-rate.pos { color: var(--green); }
+  .m-pnl-rate.neg { color: var(--red); }
   .m-pnl-main.pos { color: var(--green); }
   .m-pnl-main.neg { color: var(--red); }
   .m-pnl-none { font-size: 13px; }
-  .m-pnl-time { margin-left: auto; font-size: 11px; white-space: nowrap; }
 
-  /* 次要指标：2 个小格子（胜率 / 跟单人数） */
-  .m-mini-row {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 8px;
-  }
+  /* 次要指标：三个等宽小格，卡片底部一行 */
+  .m-mini-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
   .m-mini {
     display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 2px;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 6px;
     min-width: 0;
-    padding: 7px 10px;
-    background: var(--glass);
-    border: 1px solid var(--glass-border);
-    border-radius: 8px;
+    padding: 8px 10px;
+    /* 小格底色比卡片略深，做出「卡片内嵌小格」的层次 */
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 10px;
   }
   .m-mini-k { font-size: 11px; color: var(--muted); white-space: nowrap; }
   .m-mini-v {
@@ -1545,10 +1740,6 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     font-size: 13px;
     font-weight: 600;
     font-variant-numeric: tabular-nums;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    max-width: 100%;
   }
 
   /* ── 空态 / 加载态 ── */
@@ -1568,17 +1759,30 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
   }
   .m-mine {
     padding: 14px;
-    border: 1px solid var(--glass-border);
-    border-radius: var(--radius);
-    background: var(--panel);
-    backdrop-filter: blur(var(--blur));
-    -webkit-backdrop-filter: blur(var(--blur));
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 16px;
+    background: #121828;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.32);
   }
   .m-mine-head {
     display: flex;
     align-items: center;
+    justify-content: space-between;
     gap: 8px;
     margin-bottom: 10px;
+  }
+  .m-mine-id {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+  }
+  /* 名字 + 头像同排：名字过长时省略，头像和标签不被挤掉 */
+  .m-mine-name-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
   }
   .m-mine-name {
     font-size: 15px;
@@ -1588,9 +1792,14 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .m-mine-flag {
+    flex-shrink: 0;
+    align-self: center;
+  }
   .m-mine-none { margin: 0; font-size: 12px; }
 
-  /* 桌面端是 <table>，窄屏没法读；这里用卡片行代替表格 */
+  /* 桌面端是 <table>，窄屏没法读；这里用卡片行代替表格。
+     改成两行：名称一行 + 账号/时间一行小字，移出按钮在右侧。 */
   .m-mine-nodes {
     list-style: none;
     margin: 0;
@@ -1601,21 +1810,12 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
   }
   .m-mine-node {
     display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-    min-height: 56px;
-    padding: 10px 12px;
-    background: var(--glass);
-    border: 1px solid var(--glass-border);
-    border-radius: var(--radius-sm);
-  }
-  .m-mine-node-main {
-    display: flex;
     flex-direction: column;
     gap: 2px;
-    min-width: 0;
-    flex: 1;
+    padding: 10px 12px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 12px;
   }
   .m-mine-node-name {
     font-size: 14px;
@@ -1624,9 +1824,14 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .m-mine-node-login {
+    font-size: 12px;
+    color: var(--text);
+  }
   .m-mine-node-meta { font-size: 11px; }
   .m-mine-leave {
     flex-shrink: 0;
+    align-self: flex-end;
     min-height: 40px;
     padding: 0 16px;
     border-radius: 10px;
@@ -1692,15 +1897,26 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     min-height: 0;
     overflow-y: auto;
     -webkit-overflow-scrolling: touch;
-    padding: 16px 14px;
+    padding: 14px 10px 14px;
   }
 
   /* 机器人身份区 */
   .m-d-lead { margin-bottom: 20px; }
+  /* 名字 + 头像同排，名字过长时省略而不是把标签挤到下一行 */
+  .m-d-name-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+  }
   .m-d-name {
     font-size: 19px;
     font-weight: 700;
     letter-spacing: -0.01em;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .m-d-node { margin-top: 3px; font-size: 12px; }
 
@@ -1715,9 +1931,9 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     flex-direction: column;
     gap: 3px;
     padding: 11px 12px;
-    background: var(--glass);
-    border: 1px solid var(--glass-border);
-    border-radius: var(--radius-sm);
+    background: #121828;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 12px;
   }
   .m-d-k { font-size: 11px; color: var(--muted); }
   .m-d-v {
@@ -1756,17 +1972,18 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     gap: 12px;
     min-height: 56px;
     padding: 10px 12px;
-    border: 1px solid var(--glass-border);
-    border-radius: var(--radius-sm);
-    background: var(--glass);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 12px;
+    background: #121828;
     cursor: pointer;
     touch-action: manipulation;
     transition: border-color var(--transition), background var(--transition);
   }
-  .m-pick:active { background: rgba(37, 99, 235, 0.12); }
+  .m-pick:active { background: #16203a; }
+  /* 选中态：整块高亮 + 边框加粗，不靠颜色单独承载信息（另配勾选框） */
   .m-pick.on {
-    border-color: var(--primary);
-    background: rgba(37, 99, 235, 0.1);
+    border-color: rgba(37, 99, 234, 0.6);
+    background: rgba(37, 99, 234, 0.12);
   }
   .m-pick.done { opacity: 0.55; cursor: not-allowed; }
 
@@ -1827,7 +2044,8 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     min-height: 48px;
     padding: 0 20px;
     background: linear-gradient(135deg, var(--primary) 0%, var(--primary-d) 100%);
-    color: #041510;
+    /* 蓝底用白字：全局 .btn-primary 的 #041510 是深色字，配亮蓝对比度不够 */
+    color: #ffffff;
     font-size: 15px;
     font-weight: 600;
     border-radius: 12px;
@@ -1860,13 +2078,18 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
   }
 }
 
+/* ── 顶栏在 ≤640px 收窄到 46px，分段切换的 sticky 偏移要跟着变小 ── */
+@media (max-width: 640px) {
+  .m-tabs { top: 46px; }
+}
+
 /* ── 极窄屏（iPhone SE 320px）：主视觉再收一档，避免换行 ── */
 @media (max-width: 360px) {
-  .m-pnl-main { font-size: 23px; }
+  .m-pnl-main { font-size: 24px; }
   .m-pnl { gap: 8px; }
-  .m-tab { font-size: 13px; }
+  .m-tab { font-size: 12px; }
   .m-d-v { font-size: 15px; }
-  /* 3 个格子在 320px 会挤，改为 2 列让「风险上限」独占一行 */
+  /* 3 个格子在 320px 会挤，改为 2 列 + 第 3 个独占一行 */
   .m-mini-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 </style>

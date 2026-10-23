@@ -180,6 +180,7 @@ function logout(): void {
       <div class="hero-right">
         <RouterLink to="/config" class="btn-ghost btn-sm">个人设置</RouterLink>
         <button class="btn-ghost btn-sm" @click="copyWebhook">复制 webhook</button>
+        <button type="button" class="btn-ghost btn-sm btn-logout" @click="logout">退出登录</button>
       </div>
     </div>
 
@@ -203,11 +204,6 @@ function logout(): void {
         </div>
         <div class="hub-card-arrow" aria-hidden="true">→</div>
       </button>
-    </div>
-
-    <!-- 退出登录：置于页面最底部 -->
-    <div class="profile-logout">
-      <button type="button" class="btn-ghost btn-sm btn-logout" @click="logout">退出登录</button>
     </div>
   </div>
 </template>
@@ -368,19 +364,13 @@ function logout(): void {
   transform: translateX(0);
 }
 
-/* ── 退出登录 ── */
-.profile-logout {
-  display: flex;
-  justify-content: center;
-  padding: 8px 0 4px;
-}
-
-.profile-logout .btn-logout {
+/* ── 退出登录（红色警示） ── */
+.btn-logout {
   color: var(--red);
   border-color: rgba(239, 68, 68, 0.4);
 }
 
-.profile-logout .btn-logout:hover {
+.btn-logout:hover {
   background: rgba(239, 68, 68, 0.12);
   border-color: var(--red);
 }
@@ -397,12 +387,20 @@ function logout(): void {
   }
 
   .hub-grid {
-    grid-template-columns: repeat(2, 1fr);
+    grid-template-columns: 1fr;
     gap: 10px;
   }
 
+  /* 单列时改为横向布局：图标在左，文字在右 */
+  .hub-card {
+    flex-direction: row;
+    align-items: center;
+    gap: 12px;
+  }
+
   .hub-card-icon {
-    padding: 16px 12px 6px;
+    padding: 12px 0 12px 14px;
+    flex-shrink: 0;
   }
 
   .hub-card-icon svg {
@@ -411,15 +409,22 @@ function logout(): void {
   }
 
   .hub-card-body {
-    padding: 2px 12px 14px;
+    padding: 12px 0;
   }
 
   .hub-card-label {
-    font-size: 13px;
+    font-size: 14px;
   }
 
   .hub-card-desc {
-    font-size: 11px;
+    font-size: 12px;
+  }
+
+  .hub-card-arrow {
+    position: static;
+    margin-right: 14px;
+    opacity: 0.6;
+    transform: none;
   }
 }
 </style>

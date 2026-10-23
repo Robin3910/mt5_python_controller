@@ -1036,6 +1036,27 @@ def test_leader_detail_hides_ai_group_but_shows_hidden(client):
     assert hid["unselectable_reason"], "不可选必须给人读原因"
 
 
+def test_leader_detail_groups_expose_symbol(client):
+    """详情分组必须带出交易品种（可跟 + 市场外都要），供前端展示「他交易什么」。
+
+    symbol 来自策略快照；市场外分组（hidden_groups）同样要带，
+    否则用户在详情页看到的品种会漏掉 AI 那部分。
+    """
+    admin_h = _login(client, "admin")
+    alice, bob, a_primary, b_follow, ai_group, grid_group = _setup_ai_leader(client, admin_h)
+
+    bob_h = _login(client, "bob")
+    r = client.get(f"/api/follow/leaders/{alice['id']}", headers=bob_h)
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    vis = next(g for g in body["groups"] if g["group_id"] == grid_group)
+    assert vis["symbol"] == "EURUSD", "可跟分组应带出策略品种"
+
+    hid = next(g for g in body["hidden_groups"] if g["group_id"] == ai_group)
+    assert hid["symbol"] == "XAUUSD", "市场外分组也要带品种，否则展示会漏"
+
+
 def test_my_following_marks_ai_group_unmarketable(client):
     """存量关系：AI 分组仍出现在【我的跟单】，但 marketable=false 且原因指向【AI 交易】。"""
     admin_h = _login(client, "admin")

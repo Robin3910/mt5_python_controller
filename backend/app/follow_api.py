@@ -288,6 +288,8 @@ async def get_leader_detail(
         detail_groups.append({
             "group_id": gid,
             "name": g.get("name"),
+            # 品种：优先策略快照（跟单市场里分组都绑了策略），回退分组冗余字段
+            "symbol": (strategy or {}).get("symbol") or g.get("strategy_symbol"),
             "strategy_name": (strategy or {}).get("name"),
             "strategy_template": (strategy or {}).get("template_name"),
             "dispatch_mode": g.get("dispatch_mode", "sync"),
@@ -312,6 +314,7 @@ async def get_leader_detail(
         hidden_groups.append({
             "group_id": gid,
             "name": g.get("name"),
+            "symbol": (strategy or {}).get("symbol") or g.get("strategy_symbol"),
             "strategy_name": (strategy or {}).get("name"),
             "strategy_template": (strategy or {}).get("template_name"),
             "dispatch_mode": g.get("dispatch_mode", "sync"),

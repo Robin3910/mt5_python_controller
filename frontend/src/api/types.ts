@@ -1568,6 +1568,8 @@ export interface FollowLeaderSummary {
 export interface FollowGroupDetail {
   group_id: string
   name: string | null
+  /** 交易品种（XAUUSD 等），来自策略快照；未绑定策略时为 null */
+  symbol?: string | null
   strategy_name?: string | null
   strategy_template?: string | null
   dispatch_mode: string

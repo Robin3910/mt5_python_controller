@@ -1280,7 +1280,7 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
       <div v-if="isLimit" class="od-row">
         <div class="od-row-text">
           <div class="od-row-label required">入场价（必填）</div>
-          <div class="od-row-sub">价格到达时再触发</div>
+          <!-- <div class="od-row-sub">价格到达时再触发</div> -->
         </div>
         <div class="od-row-control od-input-affix">
           <input v-model.number="localForm.entry_price" class="od-input" type="number" step="0.0001" min="0" placeholder="如 3150.50" />
@@ -1293,9 +1293,9 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
         <div class="od-row">
           <div class="od-row-text">
             <div class="od-row-label required">止损价（必填）</div>
-            <div class="od-row-sub">
+            <!-- <div class="od-row-sub">
               {{ isMarket ? '用于按风险金额反推总手数 + 分散仓按盈亏比挂阶梯止盈' : '同时用于自动判定方向' }}
-            </div>
+            </div> -->
           </div>
           <div class="od-row-control od-input-affix">
             <input v-model.number="localForm.sl" class="od-input" type="number" step="0.0001" min="0" placeholder="如 3140.00" />
@@ -1544,7 +1544,7 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
             <div class="od-row">
               <div class="od-row-text">
                 <div class="od-row-label">风险金额（USD）</div>
-                <div class="od-row-sub">本次交易愿意承担的亏损金额</div>
+                <!-- <div class="od-row-sub">本次交易愿意承担的亏损金额</div> -->
               </div>
               <div class="od-row-control od-input-affix">
                 <input
@@ -1562,7 +1562,7 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
             <div class="od-row">
               <div class="od-row-text">
                 <div class="od-row-label">盈亏比</div>
-                <div class="od-row-sub">止盈 = 止损 × 盈亏比</div>
+                <!-- <div class="od-row-sub">止盈 = 止损 × 盈亏比</div> -->
               </div>
               <div class="od-row-control">
                 <input
@@ -1579,7 +1579,7 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
             <div class="od-row">
               <div class="od-row-text">
                 <div class="od-row-label">底仓占比</div>
-                <div class="od-row-sub">底仓占总手数的百分比</div>
+                <!-- <div class="od-row-sub">底仓占总手数的百分比</div> -->
               </div>
               <div class="od-row-control od-input-affix">
                 <input
@@ -1598,7 +1598,7 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
             <div class="od-row">
               <div class="od-row-text">
                 <div class="od-row-label">保本倍数</div>
-                <div class="od-row-sub">浮盈 ≥ 止损距 × 倍数时保本（0=不启用）</div>
+                <!-- <div class="od-row-sub">浮盈 ≥ 止损距 × 倍数时保本（0=不启用）</div> -->
               </div>
               <div class="od-row-control">
                 <input
@@ -1659,7 +1659,7 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
         <div v-if="!isSaveMode" class="od-carry">
           <ElSwitch v-model="carry" />
           <span class="od-carry-label">带单</span>
-          <span class="od-carry-sub">{{ carry ? '推到本分组全部节点' : '只推本分组主节点' }}</span>
+          <!-- <span class="od-carry-sub">{{ carry ? '推到本分组全部节点' : '只推本分组主节点' }}</span> -->
         </div>
         <div class="od-actions">
           <!-- 市价 / 限价：统一走 triggerStrategy（strategy 模型），前端推导 BUY/SEL方向并展示 -->

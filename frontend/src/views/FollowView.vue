@@ -13,6 +13,8 @@ import type {
   FollowLeaderSummary,
   FollowMeResponse,
 } from '@/api/types'
+import { useAuthStore } from '@/stores/auth'
+import UserAvatar from '@/components/UserAvatar.vue'
 
 /** 「我的跟单」聚合后的单条节点（已按 leader 聚合、按 node_id 去重） */
 interface MyFollowedNode {
@@ -39,6 +41,7 @@ interface MyFollowingEntry {
 }
 
 const router = useRouter()
+const auth = useAuthStore()
 
 const leaders = ref<FollowLeaderSummary[]>([])
 const loading = ref(false)
@@ -87,6 +90,21 @@ function statsOf(leader: FollowLeaderSummary): FollowLeaderSummary['performance'
 /** 跟单人数：来自跟单关系表（与订单数据无关，可独立成立） */
 function followerCountOf(leader: FollowLeaderSummary): number {
   return leader.follower_count || leader.follower_node_count || 0
+}
+
+/**
+ * 这个带单员是不是我自己。
+ *
+ * 带单员列表是全市场视角（我也出现在别人的列表里），不加标记的话
+ * 「哪一栏是自己开的单」只能靠回忆用户名来判断。名字后面挂一个「我的」
+ * 标签，扫一眼就能定位。
+ *
+ * 只认 `leader_user_id` —— 用户名可改，用 ID 比对才不会在改名后失效。
+ * `me` 还没拉到时返回 false：宁可先不显示，也不要在身份未确认时误标。
+ */
+function isMyLeader(leader: FollowLeaderSummary): boolean {
+  const myId = auth.me?.user_id
+  return myId != null && leader.leader_user_id === myId
 }
 
 /** 当前详情页的绩效 */
@@ -541,8 +559,9 @@ onMounted(() => {
 <template>
   <div class="follow-page">
     <div class="row between page-header">
-      <div>
+      <div class="page-head-l">
         <h2 class="page-title">带单广场</h2>
+        <span class="page-head-tag">热门带单员</span>
         <!-- <p class="muted page-sub">把你的非主节点加入带单员的分组，接收他触发的信号。</p> -->
       </div>
       <!-- <RouterLink to="/nodes" class="btn-ghost btn-sm">管理我的节点</RouterLink> -->
@@ -587,8 +606,12 @@ onMounted(() => {
             :class="{ active: detail?.leader.leader_user_id === l.leader_user_id }"
             @click="openLeader(l)"
           >
-            <div class="row between">
-              <strong>{{ l.display_name || l.username }}</strong>
+            <div class="row between leader-head">
+              <span class="row leader-name">
+                <UserAvatar class="leader-avatar" :name="l.display_name || l.username" :size="30" />
+                <strong class="leader-name-text">{{ l.display_name || l.username }}</strong>
+                <span v-if="isMyLeader(l)" class="tag blue leader-mine">我的</span>
+              </span>
               <span v-if="l.my_follow_node_count" class="tag green">
                 已跟
               </span>
@@ -648,7 +671,11 @@ onMounted(() => {
 
         <template v-else-if="detail">
           <div class="row between" style="margin-bottom: 4px">
-            <strong>跟单 · {{ detail.leader.display_name || detail.leader.username }}</strong>
+            <strong class="row leader-name">
+              <UserAvatar class="leader-avatar" :name="detail.leader.display_name || detail.leader.username" :size="30" />
+              <span class="leader-name-text">跟单 · {{ detail.leader.display_name || detail.leader.username }}</span>
+              <span v-if="isMyLeader(detail.leader)" class="tag blue leader-mine">我的</span>
+            </strong>
             <button class="btn-sm btn-ghost" @click="detail = null">返回列表</button>
           </div>
 
@@ -741,14 +768,18 @@ onMounted(() => {
           <div v-else class="mine-list">
             <div v-for="f in myFollowing" :key="f.leader.leader_user_id" class="mine-block">
               <div class="row between mine-head">
-                <strong>
-                  {{ f.leader.display_name || f.leader.username }}
-                  <span class="muted" style="font-weight: 400">
-                    · {{ f.leader.primary_node?.name }}
-                    <template v-if="f.leader.primary_node?.mt5_login">
-                      （MT5 {{ f.leader.primary_node.mt5_login }}）
-                    </template>
+                <strong class="row leader-name">
+                  <UserAvatar class="leader-avatar" :name="f.leader.display_name || f.leader.username" :size="30" />
+                  <span class="leader-name-text">
+                    {{ f.leader.display_name || f.leader.username }}
+                    <span class="muted" style="font-weight: 400">
+                      · {{ f.leader.primary_node?.name }}
+                      <template v-if="f.leader.primary_node?.mt5_login">
+                        （MT5 {{ f.leader.primary_node.mt5_login }}）
+                      </template>
+                    </span>
                   </span>
+                  <span v-if="isMyLeader(f.leader)" class="tag blue leader-mine">我的</span>
                 </strong>
                 <div class="row" style="gap: 8px">
                   <span v-if="!f.marketable" class="tag amber">{{ f.unmarketable_reason || '该带单员已关闭带单' }}</span>
@@ -920,29 +951,22 @@ onMounted(() => {
 
     <!-- ── 分段一：带单员列表 ── -->
     <div v-show="mobileTab === 'leaders'" class="m-only m-panel">
-      <div class="m-search-wrap">
-        <input
-          v-model="keyword"
-          class="inp m-search"
-          type="search"
-          enterkeyhint="search"
-          placeholder="搜索用户名 / 节点 / MT5 号"
-          @keyup.enter="loadLeaders"
-        />
-      </div>
-
-      <!-- 统计窗口：手机端做成可横向滑动的分段控件，避免换行占掉一屏 -->
-      <div class="m-win" role="group" aria-label="统计窗口">
-        <button
-          v-for="opt in WINDOW_OPTIONS"
-          :key="opt.value"
-          class="m-win-btn"
-          :class="{ on: perfWindow === opt.value }"
-          :aria-pressed="perfWindow === opt.value"
-          @click="perfWindow = opt.value"
-        >
-          {{ opt.label }}
-        </button>
+      <!-- 统计周期：手机端做成可横向滑动的分段控件，避免换行占掉一屏。
+           「统计周期」标签和按钮排同一行，不额外占一行高度。 -->
+      <div class="m-win-row">
+        <span class="m-win-label">统计周期</span>
+        <div class="m-win" role="group" aria-label="统计周期">
+          <button
+            v-for="opt in WINDOW_OPTIONS"
+            :key="opt.value"
+            class="m-win-btn"
+            :class="{ on: perfWindow === opt.value }"
+            :aria-pressed="perfWindow === opt.value"
+            @click="perfWindow = opt.value"
+          >
+            {{ opt.label }}
+          </button>
+        </div>
       </div>
 
       <div v-if="loading" class="m-empty muted">加载中...</div>
@@ -957,31 +981,52 @@ onMounted(() => {
           class="m-leader"
           @click="openMobileLeader(l)"
         >
+          <!-- 头部：头像 + 昵称 + 状态标签 -->
           <div class="m-leader-top">
-            <span class="m-leader-name">{{ l.display_name || l.username }}</span>
-            <span v-if="l.my_follow_node_count" class="tag green">已跟 {{ l.my_follow_node_count }}</span>
-            <span v-else class="tag">未跟</span>
+            <span class="m-leader-id">
+              <UserAvatar :name="l.display_name || l.username" :size="40" />
+              <span class="m-leader-id-text">
+                <span class="m-leader-name">{{ l.display_name || l.username }}</span>
+                <span class="m-leader-sub">
+                  <template v-if="isMyLeader(l)">我开设的带单</template>
+                  <template v-else-if="l.primary_node">{{ l.primary_node.name || '主节点' }}</template>
+                  <template v-if="updatedText(l)">
+                    {{ isMyLeader(l) || l.primary_node ? ' · ' : '' }}{{ updatedText(l) }}
+                  </template>
+                </span>
+              </span>
+            </span>
+            <span class="m-leader-badge" :class="l.my_follow_node_count ? 'is-followed' : ''">
+              {{ l.my_follow_node_count ? '已跟' : '跟单' }}
+            </span>
           </div>
 
-          <!-- 主视觉：累计收益 + 收益率放大成一行大数字。
-               手机端先给结论（赚没赚），细节指标退到下方小格子。 -->
+          <!-- 主视觉：累计收益 + 收益率。设计稿里收益是大号主数字，
+               收益率作为右上角小字，比例和参考图一致。 -->
           <div class="m-pnl">
             <div v-if="!l.performance?.data_available" class="m-pnl-none muted">暂无成交数据</div>
             <template v-else>
-              <span class="m-pnl-main" :class="statsOf(l).total_profit >= 0 ? 'pos' : 'neg'">
-                {{ fmtProfit(statsOf(l).total_profit) }}
-              </span>
-              <span
-                v-if="statsOf(l).profit_rate_valid"
-                class="m-pnl-rate"
-                :class="statsOf(l).profit_rate >= 0 ? 'pos' : 'neg'"
-              >
-                {{ fmtRate(statsOf(l).profit_rate) }}
-              </span>
+              <div class="m-pnl-left">
+                <span class="m-pnl-main" :class="statsOf(l).total_profit >= 0 ? 'pos' : 'neg'">
+                  {{ fmtProfit(statsOf(l).total_profit) }}
+                </span>
+                <span class="m-pnl-label">累计收益</span>
+              </div>
+              <div class="m-pnl-right">
+                <span
+                  v-if="statsOf(l).profit_rate_valid"
+                  class="m-pnl-rate"
+                  :class="statsOf(l).profit_rate >= 0 ? 'pos' : 'neg'"
+                >
+                  {{ fmtRate(statsOf(l).profit_rate) }}
+                </span>
+                <span v-else class="m-pnl-rate muted">—</span>
+                <span class="m-pnl-label">收益率</span>
+              </div>
             </template>
-            <span v-if="updatedText(l)" class="m-pnl-time muted">{{ updatedText(l) }}</span>
           </div>
 
+          <!-- 次要指标：三个等宽小格，比例对齐设计稿底部一行 -->
           <div class="m-mini-row">
             <span class="m-mini">
               <span class="m-mini-k">胜率</span>
@@ -991,6 +1036,11 @@ onMounted(() => {
             <span class="m-mini">
               <span class="m-mini-k">跟单</span>
               <span class="m-mini-v">{{ followerCountOf(l) }} 人</span>
+            </span>
+            <span class="m-mini">
+              <span class="m-mini-k">交易</span>
+              <span v-if="!l.performance?.data_available" class="m-mini-v muted">—</span>
+              <span v-else class="m-mini-v">{{ statsOf(l).total_trades }} 笔</span>
             </span>
           </div>
         </li>
@@ -1010,7 +1060,11 @@ onMounted(() => {
         <div v-for="f in myFollowing" :key="f.leader.leader_user_id" class="m-mine">
           <div class="m-mine-head">
             <div class="m-mine-id">
-              <span class="m-mine-name">{{ f.leader.display_name || f.leader.username }}</span>
+              <span class="m-mine-name-row">
+                <UserAvatar :name="f.leader.display_name || f.leader.username" :size="34" />
+                <span class="m-mine-name">{{ f.leader.display_name || f.leader.username }}</span>
+                <span v-if="isMyLeader(f.leader)" class="tag blue m-mine-flag">我的</span>
+              </span>
               <span v-if="!f.marketable" class="tag amber m-mine-tag">
                 {{ f.unmarketable_reason || '已关闭带单' }}
               </span>
@@ -1061,12 +1115,10 @@ onMounted(() => {
         <template v-else-if="detail">
           <!-- 带单员身份 + 关键数字 -->
           <div class="m-d-lead">
-            <div class="m-d-name">{{ detail.leader.display_name || detail.leader.username }}</div>
-            <div v-if="detail.leader.primary_node" class="m-d-node muted">
-              主节点 {{ detail.leader.primary_node.name }}
-              <template v-if="detail.leader.primary_node.mt5_login">
-                （MT5 {{ detail.leader.primary_node.mt5_login }}）
-              </template>
+            <div class="m-d-name-row">
+              <UserAvatar :name="detail.leader.display_name || detail.leader.username" :size="44" />
+              <div class="m-d-name">{{ detail.leader.display_name || detail.leader.username }}</div>
+              <span v-if="isMyLeader(detail.leader)" class="tag blue m-mine-flag">我的</span>
             </div>
 
             <div class="m-d-grid">
@@ -1174,6 +1226,28 @@ onMounted(() => {
   margin: 0 0 4px;
 }
 
+/* 标题 + 「热门带单员」标签同一行（桌面 / 手机共用） */
+.page-head-l {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* 透明底标签：只有描边和字色，没有填充 */
+.page-head-tag {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: transparent;
+  border: 1px solid rgba(117, 62, 228, 0.45);
+  color: #b9a3f5;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
 .page-sub {
   font-size: 13px;
   margin: 0;
@@ -1224,6 +1298,32 @@ onMounted(() => {
 .leader-sub {
   font-size: 12px;
   margin-top: 4px;
+}
+
+/* 带单员名 + 「我的」标记
+   名字和标签同一行居中对齐；名字过长时省略收缩，标签固定不缩 ——
+   否则长名字会把标签挤到第二行，「谁的」和「叫什么」就分家了。 */
+.leader-head {
+  gap: 8px;
+}
+.leader-name {
+  gap: 6px;
+  min-width: 0;
+}
+/* 详情页标题 / 我的跟单标题：文字部分自己承担省略，标签不被挤到第二行 */
+.leader-name-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 头像排在名字前，与名字留 8px（比 .leader-name 的 6px 稍宽，圆和字更好区分） */
+.leader-avatar {
+  margin: 0 2px;
+}
+.leader-mine {
+  flex-shrink: 0;
+  align-self: center;
 }
 
 /* 带单员列表里的 4 项统计
@@ -1776,36 +1876,56 @@ onMounted(() => {
 @media (max-width: 768px) {
   .m-only { display: block; }
 
-  /* 手机端页面不再用 24px 内边距（太小，挤掉内容宽度），改 12px + 安全区 */
+  /* 横向边距只由外层 <main class="content"> 负责（≤640px 是 14px）。
+     .follow-page 自己再叠一层 12px，窄屏上两侧实际空出 26px（平板更到 36px），
+     卡片被推得离屏幕边很远。这里把自身横向内边距清零，只留纵向节奏和底部安全区。 */
   .follow-page {
-    padding: 12px 12px
-      calc(12px + env(safe-area-inset-bottom, 0px));
+    padding: 10px 0 calc(4px + env(safe-area-inset-bottom, 0px));
   }
 
-  /* 桌面端的标题栏 + 左右两栏（.follow-grid）在手机端整体隐藏。
+  /* 桌面端的两栏（.follow-grid）在手机端整体隐藏。
      手机端改用下面的分段切换 + 全屏详情页。
      漏掉 .follow-grid 会导致桌面布局在手机上照样渲染，
-     变成「上半截桌面 UI + 下半截手机 UI」重复两套 —— 必须两个一起隐藏。 */
-  .page-header,
+     变成「上半截桌面 UI + 下半截手机 UI」重复两套 —— 必须隐藏。
+     注意 .page-header 不再隐藏：手机端是单栏信息流，没有标题用户不知道自己在哪一页。 */
   .follow-grid {
     display: none;
   }
 
+  /* 标题栏在手机端保留：手机端是单栏信息流，没有标题用户不知道自己在哪一页。
+     全局 768px 规则会把 .page-header 改成 column + stretch，这里改回单行左对齐。 */
+  .page-header {
+    flex-direction: row;
+    align-items: center;
+    flex-wrap: nowrap;
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+  /* 标题 + 「热门带单员」标签同一行 */
+  .page-title {
+    font-size: 17px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    margin: 0;
+  }
+
   /* ── 分段切换（带单员 / 我的跟单）─────────────────────────────
      手机端这两份信息互斥，堆一起会变成超长滚动条。
-     按钮高 44px 满足触控下限，底部滑动块做选中指示。 */
+     按钮高 36px（仍高于 32px 触控建议），底部滑动块做选中指示。 */
   .m-tabs {
     position: sticky;
-    top: 0;
+    /* 顶栏（.topbar）也是 sticky top:0、z-index:20，尺寸 60px（≤640px 是 46px）。
+       分段切换必须让开顶栏高度，否则滚动时会滑到顶栏底下被盖住。 */
+    top: 60px;
     z-index: 12;
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 4px;
-    padding: 4px;
-    margin: 0 0 12px;
+    gap: 3px;
+    padding: 3px;
+    margin: 0 0 10px;
     background: rgba(6, 10, 18, 0.9);
     border: 1px solid var(--glass-border);
-    border-radius: 12px;
+    border-radius: 10px;
     backdrop-filter: blur(var(--blur)) saturate(1.3);
     -webkit-backdrop-filter: blur(var(--blur)) saturate(1.3);
   }
@@ -1814,31 +1934,34 @@ onMounted(() => {
     display: flex;
     align-items: center;
     justify-content: center;
-    gap: 6px;
-    min-height: 44px;
+    gap: 5px;
+    /* 高度从 44px 收到 36px：仍高于 32px 的最小触控建议，
+       但整行占用的垂直空间更省，留给下面的卡片。 */
+    min-height: 36px;
     padding: 0 8px;
     background: transparent;
     border: 1px solid transparent;
-    border-radius: 9px;
+    border-radius: 8px;
     color: var(--muted);
-    font-size: 14px;
+    font-size: 13px;
     font-weight: 600;
     transition: color var(--transition), background var(--transition);
   }
   .m-tab:active { background: rgba(255, 255, 255, 0.05); }
   .m-tab.on {
     color: #ffffff;
-    background: linear-gradient(135deg, var(--primary) 0%, var(--primary-d) 100%);
+    /* 参考设计主色是紫 #753EE4，顶部分段控件跟着换 */
+    background: linear-gradient(135deg, #753ee4 0%, #5b21b6 100%);
     border-color: transparent;
-    box-shadow: 0 2px 12px var(--primary-glow);
+    box-shadow: 0 2px 12px rgba(117, 62, 228, 0.4);
   }
   .m-tab-badge {
-    min-width: 20px;
-    padding: 1px 6px;
+    min-width: 18px;
+    padding: 0 5px;
     border-radius: 999px;
     background: rgba(255, 255, 255, 0.1);
     font-family: var(--mono);
-    font-size: 11px;
+    font-size: 10px;
     font-weight: 700;
     line-height: 1.5;
   }
@@ -1857,42 +1980,71 @@ onMounted(() => {
     min-height: 44px;
     border-radius: 12px;
     font-size: 16px;
+    /* 搜索框跟着设计稿走：卡片实色底 + 聚焦紫色描边 */
+    background: #121828;
+    border-color: rgba(255, 255, 255, 0.08);
+  }
+  .m-search:focus {
+    border-color: rgba(117, 62, 228, 0.65);
+    box-shadow: 0 0 0 3px rgba(117, 62, 228, 0.16);
   }
 
-  /* ── 统计窗口：横向滑动的分段控件，不再换行占一屏 ── */
+  /* ── 统计周期：标签 + 横向滑动的分段控件，同一行 ── */
+  .m-win-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+    min-width: 0;
+  }
+  .m-win-label {
+    flex-shrink: 0;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted);
+    white-space: nowrap;
+  }
   .m-win {
     display: flex;
     gap: 6px;
-    margin-bottom: 12px;
     /* 4 个按钮在 320px 宽放不下，允许横向滑动而不是压缩文字 */
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
     scrollbar-width: none;
+    /* 让按钮组吃掉剩余宽度，标签不被挤掉 */
+    flex: 1 1 auto;
+    min-width: 0;
   }
   .m-win::-webkit-scrollbar { display: none; }
   .m-win-btn {
     flex: 1 0 auto;
-    min-height: 36px;
-    padding: 0 14px;
+    /* 高度从 36px 收到 30px，横向内边距 14→10，整行更紧凑 */
+    min-height: 30px;
+    padding: 0 10px;
     border-radius: 999px;
-    border: 1px solid var(--glass-border);
-    background: var(--glass);
-    color: var(--muted);
-    font-size: 13px;
+    /* 未选中态也带一点紫调，和参考设计的紫色主色统一 */
+    border: 1px solid rgba(117, 62, 228, 0.28);
+    background: rgba(117, 62, 228, 0.1);
+    color: #b9a3f5;
+    font-size: 12px;
     font-weight: 600;
     white-space: nowrap;
     touch-action: manipulation;
     transition: color var(--transition), background var(--transition), border-color var(--transition);
   }
-  .m-win-btn:active { background: rgba(255, 255, 255, 0.07); }
+  .m-win-btn:active { background: rgba(117, 62, 228, 0.22); }
   .m-win-btn.on {
     color: #ffffff;
-    background: linear-gradient(135deg, var(--primary) 0%, var(--primary-d) 100%);
+    /* 选中态实心紫，和顶部分段切换同一套紫色主色 */
+    background: linear-gradient(135deg, #753ee4 0%, #5b21b6 100%);
     border-color: transparent;
-    box-shadow: 0 2px 12px var(--primary-glow);
+    box-shadow: 0 2px 12px rgba(117, 62, 228, 0.4);
   }
 
-  /* ── 带单员卡片 ── */
+  /* ── 带单员卡片 ──────────────────────────────────────────────
+     版式对齐「带单广场」参考设计：卡片底色 #121828、紫色主色 #753EE4、
+     蓝色辅色 #3762E4，比例（头像 40px、收益主数字 28px、三等分小格）
+     也照抄设计稿。功能与数据源保持原样，只换呈现。 */
   .m-leader-list {
     list-style: none;
     margin: 0;
@@ -1903,27 +2055,40 @@ onMounted(() => {
   }
   .m-leader {
     padding: 14px;
-    border: 1px solid var(--glass-border);
-    border-radius: var(--radius);
-    background: var(--panel);
-    backdrop-filter: blur(var(--blur));
-    -webkit-backdrop-filter: blur(var(--blur));
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 16px;
+    /* 参考设计的卡片底色比全局 --panel 更实、更亮，这里用实色而非半透明 */
+    background: #121828;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.32);
     cursor: pointer;
     touch-action: manipulation;
     transition: border-color var(--transition), background var(--transition);
   }
   /* 手机端没有 hover，用 active 给出点按反馈 */
   .m-leader:active {
-    border-color: var(--primary);
-    background: rgba(37, 99, 235, 0.08);
+    border-color: rgba(117, 62, 228, 0.55);
+    background: #16203a;
   }
   .m-leader-top {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 8px;
+    gap: 10px;
     min-width: 0;
-    margin-bottom: 10px;
+    margin-bottom: 14px;
+  }
+  /* 头像 + 昵称（昵称在上、副标题在下） */
+  .m-leader-id {
+    display: flex;
+    align-items: center;
+    gap: 11px;
+    min-width: 0;
+  }
+  .m-leader-id-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
   }
   .m-leader-name {
     font-size: 15px;
@@ -1933,52 +2098,91 @@ onMounted(() => {
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  /* 副标题：主节点名 / 「我开设的带单」+ 数据更新时间 */
+  .m-leader-sub {
+    font-size: 11px;
+    color: var(--muted);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* 右上角状态胶囊：设计稿是实心紫底 */
+  .m-leader-badge {
+    flex-shrink: 0;
+    padding: 5px 12px;
+    border-radius: 999px;
+    background: rgba(117, 62, 228, 0.18);
+    border: 1px solid rgba(117, 62, 228, 0.4);
+    color: #a78bfa;
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1.2;
+    white-space: nowrap;
+  }
+  .m-leader-badge.is-followed {
+    background: rgba(55, 98, 228, 0.18);
+    border-color: rgba(55, 98, 228, 0.45);
+    color: #93b4fb;
+  }
 
-  /* 主视觉：收益/收益率放大。手机端先给"赚没赚"的结论，再看细节。 */
+  /* 主视觉：收益在左（大号），收益率在右（小号），左右分栏对齐设计稿 */
   .m-pnl {
     display: flex;
-    align-items: baseline;
-    gap: 10px;
-    flex-wrap: wrap;
-    padding-bottom: 10px;
-    margin-bottom: 10px;
-    border-bottom: 1px dashed var(--glass-border);
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 12px;
+    padding-bottom: 14px;
+    margin-bottom: 12px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
   }
+  .m-pnl-left,
+  .m-pnl-right {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+  }
+  .m-pnl-right { text-align: right; }
   .m-pnl-main {
     font-family: var(--mono);
-    font-size: 26px;
+    font-size: 28px;
     font-weight: 700;
-    line-height: 1.1;
-    letter-spacing: -0.02em;
+    line-height: 1.05;
+    letter-spacing: -0.03em;
     font-variant-numeric: tabular-nums;
+  }
+  .m-pnl-label {
+    font-size: 11px;
+    color: var(--muted);
+    white-space: nowrap;
   }
   .m-pnl-rate {
     font-family: var(--mono);
-    font-size: 15px;
+    font-size: 18px;
     font-weight: 700;
-    padding: 2px 8px;
-    border-radius: 6px;
+    line-height: 1.05;
     font-variant-numeric: tabular-nums;
   }
-  .m-pnl-rate.pos { color: var(--green); background: rgba(16, 185, 129, 0.12); }
-  .m-pnl-rate.neg { color: var(--red); background: rgba(239, 68, 68, 0.12); }
+  .m-pnl-rate.pos { color: var(--green); }
+  .m-pnl-rate.neg { color: var(--red); }
   .m-pnl-main.pos { color: var(--green); }
   .m-pnl-main.neg { color: var(--red); }
   .m-pnl-none { font-size: 13px; }
-  .m-pnl-time { margin-left: auto; font-size: 11px; white-space: nowrap; }
 
-  /* 次要指标：退成两个小格子 */
-  .m-mini-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  /* 次要指标：三个等宽小格，卡片底部一行 */
+  .m-mini-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
   .m-mini {
     display: flex;
     align-items: baseline;
     justify-content: space-between;
     gap: 6px;
     min-width: 0;
-    padding: 7px 10px;
-    background: var(--glass);
-    border: 1px solid var(--glass-border);
-    border-radius: 8px;
+    padding: 8px 10px;
+    /* 小格底色比卡片略深，做出设计稿里「卡片内嵌小格」的层次 */
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 10px;
   }
   .m-mini-k { font-size: 11px; color: var(--muted); white-space: nowrap; }
   .m-mini-v {
@@ -2005,11 +2209,10 @@ onMounted(() => {
   }
   .m-mine {
     padding: 14px;
-    border: 1px solid var(--glass-border);
-    border-radius: var(--radius);
-    background: var(--panel);
-    backdrop-filter: blur(var(--blur));
-    -webkit-backdrop-filter: blur(var(--blur));
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 16px;
+    background: #121828;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.32);
   }
   .m-mine-head {
     display: flex;
@@ -2024,12 +2227,24 @@ onMounted(() => {
     gap: 4px;
     min-width: 0;
   }
+  /* 名字 + 头像 + 「我的」同排：名字过长时省略，头像和标签不被挤掉 */
+  .m-mine-name-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
   .m-mine-name {
     font-size: 15px;
     font-weight: 600;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  /* 「我的」标记：手机端有多处（列表 / 我的跟单 / 详情页），统一一套尺寸 */
+  .m-mine-flag {
+    flex-shrink: 0;
+    align-self: center;
   }
   .m-mine-tag { align-self: flex-start; }
   .m-mine-btn {
@@ -2054,9 +2269,9 @@ onMounted(() => {
     flex-direction: column;
     gap: 2px;
     padding: 10px 12px;
-    background: var(--glass);
-    border: 1px solid var(--glass-border);
-    border-radius: var(--radius-sm);
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 12px;
   }
   .m-mine-node-name {
     font-size: 14px;
@@ -2123,20 +2338,32 @@ onMounted(() => {
     font-weight: 600;
   }
 
+  /* 全屏详情页脱离 .content，独立控制内边距：横向收到 10px */
   .m-sheet-body {
     flex: 1;
     min-height: 0;
     overflow-y: auto;
     -webkit-overflow-scrolling: touch;
-    padding: 16px 14px 16px;
+    padding: 14px 10px 14px;
   }
 
   /* 带单员身份区 */
   .m-d-lead { margin-bottom: 20px; }
+  /* 名字 + 头像 + 「我的」同排，名字过长时省略而不是把标签挤到下一行 */
+  .m-d-name-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+  }
   .m-d-name {
     font-size: 19px;
     font-weight: 700;
     letter-spacing: -0.01em;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .m-d-node { margin-top: 3px; font-size: 12px; }
 
@@ -2151,9 +2378,9 @@ onMounted(() => {
     flex-direction: column;
     gap: 3px;
     padding: 11px 12px;
-    background: var(--glass);
-    border: 1px solid var(--glass-border);
-    border-radius: var(--radius-sm);
+    background: #121828;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 12px;
   }
   .m-d-k { font-size: 11px; color: var(--muted); }
   .m-d-v {
@@ -2192,18 +2419,18 @@ onMounted(() => {
     gap: 12px;
     min-height: 56px;
     padding: 10px 12px;
-    border: 1px solid var(--glass-border);
-    border-radius: var(--radius-sm);
-    background: var(--glass);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 12px;
+    background: #121828;
     cursor: pointer;
     touch-action: manipulation;
     transition: border-color var(--transition), background var(--transition);
   }
-  .m-pick:active { background: rgba(37, 99, 235, 0.12); }
+  .m-pick:active { background: #16203a; }
   /* 选中态：整块高亮 + 边框加粗，不靠颜色单独承载信息（另配勾选框） */
   .m-pick.on {
-    border-color: var(--primary);
-    background: rgba(37, 99, 235, 0.1);
+    border-color: rgba(117, 62, 228, 0.6);
+    background: rgba(117, 62, 228, 0.12);
   }
   .m-pick.done { opacity: 0.55; cursor: not-allowed; }
 
@@ -2221,8 +2448,8 @@ onMounted(() => {
     transition: background var(--transition), border-color var(--transition), color var(--transition);
   }
   .m-pick.on .m-pick-box {
-    background: var(--primary);
-    border-color: var(--primary);
+    background: #753ee4;
+    border-color: #753ee4;
     color: #ffffff;
   }
   .m-pick-main {
@@ -2248,7 +2475,7 @@ onMounted(() => {
     display: flex;
     align-items: center;
     gap: 12px;
-    padding: 10px 14px;
+    padding: 10px 10px;
     padding-bottom: calc(10px + env(safe-area-inset-bottom, 0px));
     background: rgba(6, 10, 18, 0.94);
     border-top: 1px solid var(--glass-border);
@@ -2265,12 +2492,12 @@ onMounted(() => {
     flex: 1;
     min-height: 48px;
     padding: 0 20px;
-    background: linear-gradient(135deg, var(--primary) 0%, var(--primary-d) 100%);
-    color: #041510;
+    background: linear-gradient(135deg, #753ee4 0%, #5b21b6 100%);
+    color: #ffffff;
     font-size: 15px;
     font-weight: 600;
     border-radius: 12px;
-    box-shadow: 0 4px 16px var(--primary-glow);
+    box-shadow: 0 4px 16px rgba(117, 62, 228, 0.4);
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -2298,11 +2525,20 @@ onMounted(() => {
   }
 }
 
+/* ── 顶栏在 ≤640px 收窄到 46px，分段切换的 sticky 偏移要跟着变小 ── */
+@media (max-width: 640px) {
+  .m-tabs { top: 46px; }
+}
+
 /* ── 极窄屏（iPhone SE 320px）：主视觉再收一档，避免换行 ── */
 @media (max-width: 360px) {
   .m-pnl-main { font-size: 23px; }
   .m-pnl { gap: 8px; }
   .m-tab { font-size: 13px; }
   .m-d-v { font-size: 15px; }
+  /* 320px 上三格仍然放得下（每格约 86px），只把内边距收紧保住三个指标 */
+  .m-mini { padding: 7px 7px; }
+  .m-mini-k { font-size: 10px; }
+  .m-mini-v { font-size: 12px; }
 }
 </style>
