@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // 带单（跟单）页：左侧带单员列表，右侧「我的跟单」
 // 能力语义：跟单默认人人可做；带单员由管理员授予 follow_leader 角色能力产生。
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElDialog, ElMessage, ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/dialog/style/css'
@@ -15,6 +15,10 @@ import type {
 } from '@/api/types'
 import { useAuthStore } from '@/stores/auth'
 import UserAvatar from '@/components/UserAvatar.vue'
+
+// 收益柱状图带 echarts，异步加载让图表库不进带单广场首屏 chunk
+// （与节点详情页的 TrendPanel 同一处理）
+const ProfitBarChart = defineAsyncComponent(() => import('@/components/ProfitBarChart.vue'))
 
 /** 「我的跟单」聚合后的单条节点（已按 leader 聚合、按 node_id 去重） */
 interface MyFollowedNode {
@@ -118,6 +122,16 @@ const currentFollowerCount = computed<number>(() => {
   if (!detail.value) return 0
   return followerCountOf(detail.value.leader)
 })
+
+/**
+ * 近 7 日收益序列（柱状图数据）。
+ *
+ * 数据由后端按与绩效**同一套口径**算好（主节点 + 出场类成交的 net_profit），
+ * 前端不自己统计 —— 自己算必然与页面头部的「累计收益」对不上。
+ *
+ * 固定 7 日，**不随页面统计窗口（7d/30d/90d/all）变化**，所以标题写明「近 7 日」。
+ */
+const dailyProfit = computed(() => detail.value?.daily_profit ?? [])
 
 /** 数据新鲜度：成交是准实时的，绩效必然滞后，UI 必须标注 */
 function updatedText(leader: FollowLeaderSummary): string {
@@ -710,6 +724,16 @@ onMounted(() => {
             {{ updatedText(detail.leader) }}
           </div>
 
+          <!-- 近 7 日收益柱状图（与手机端全屏详情同一份数据） -->
+          <div class="detail-chart">
+            <ProfitBarChart
+              v-if="currentStats?.data_available !== false"
+              :points="dailyProfit"
+              :height="170"
+            />
+            <p v-else class="muted empty">近 7 日暂无收益数据</p>
+          </div>
+
           <h4 class="sec-title">我的节点（可多选）</h4>
           <p v-if="!detail.my_nodes.length" class="muted empty">
             你没有可用于跟单的节点（主节点不可跟单）
@@ -1152,6 +1176,17 @@ onMounted(() => {
             </div>
           </div>
 
+          <!-- 近 7 日收益柱状图：放在「选择要跟随的节点」上方，
+               让人在选节点前先看一眼这个带单员最近赚不赚钱。 -->
+          <div class="m-d-chart">
+            <ProfitBarChart
+              :points="dailyProfit"
+              :height="140"
+              v-if="currentStats?.data_available !== false"
+            />
+            <p v-else class="muted m-empty-text">近 7 日暂无收益数据</p>
+          </div>
+
           <!-- 选节点：整行 56px 触控区，选中态用整块高亮 + 左侧色条 -->
           <div class="m-d-sec-title">
             选择要跟随的节点
@@ -1437,6 +1472,13 @@ onMounted(() => {
   font-size: 13px;
   margin: 16px 0 8px;
   color: var(--muted);
+}
+
+/* 桌面端详情：近 7 日收益柱状图（统计卡片与「我的节点」之间） */
+.detail-chart {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
 }
 
 /* 跟单统计卡片 */
@@ -2393,6 +2435,15 @@ onMounted(() => {
   .m-d-v.pos { color: var(--green); }
   .m-d-v.neg { color: var(--red); }
   .m-d-updated { margin-top: 10px; font-size: 11px; }
+
+  /* 手机端详情：近 7 日收益柱状图（在「选择要跟随的节点」上方） */
+  .m-d-chart {
+    margin-top: 16px;
+    padding: 12px 12px 8px;
+    background: #121828;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 12px;
+  }
 
   .m-d-sec-title {
     display: flex;

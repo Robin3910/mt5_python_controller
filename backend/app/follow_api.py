@@ -352,6 +352,16 @@ async def get_leader_detail(
         f["node_id"] for f in await follow_service.list_for_leaders({leader_user_id})
     })
     perf["follower_count"] = follower_count
+
+    # 近 7 日每日收益（柱状图数据源）。
+    # 口径与上面完全一致（主节点 + 出场类成交的 net_profit），所以 7 根柱子的和
+    # 必然等于 7d 窗口的 total_profit —— 两条数字对不上用户会怀疑整个页面。
+    # 这里**不回源缓存**：日序列与四窗口汇总结构不同，塞进 K_LEADER_STATS 会让
+    # 缓存语义变浑浊；详情是单人，一次轻量查询即可。
+    daily_profit = await deal_stats.daily_net_profit(
+        [str(primary.get("node_id"))], days=7,
+    )
+
     return FollowDetailOut(
         leader={
             "leader_user_id": leader_user_id,
@@ -373,6 +383,7 @@ async def get_leader_detail(
         groups=detail_groups,
         hidden_groups=hidden_groups,
         my_nodes=[_node_brief(n) for n in _viewable_follow_nodes(all_nodes, p)],
+        daily_profit=daily_profit,
     )
 
 

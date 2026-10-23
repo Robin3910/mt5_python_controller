@@ -1094,12 +1094,29 @@ class FollowGroupDetail(BaseModel):
     unselectable_reason: Optional[str] = None
 
 
+class FollowDailyProfitPoint(BaseModel):
+    """近 7 日收益柱状图的一个数据点（每日已实现净盈亏）。
+
+    口径与 `performance` 同一套：出场类成交的 net_profit、主节点范围。
+    `date` 由后端按 UTC+8 自然日分好，前端直接显示，不再本地换算
+    （前后端时区不同会让日期整体错位一天）。
+    """
+    date: str
+    # 该日 00:00 (UTC+8) 的 Unix 秒
+    ts: int = 0
+    profit: float = 0.0
+    # 当日出场成交笔数（tooltip 展示用）
+    deals: int = 0
+
+
 class FollowDetailOut(BaseModel):
     leader: FollowLeaderSummary
     groups: list[FollowGroupDetail]
     # 不在普通跟单市场内的分组（AI 智能加仓策略等）：仅提示，不可选
     hidden_groups: list[FollowGroupDetail] = Field(default_factory=list)
     my_nodes: list[dict] = Field(default_factory=list)
+    # 近 7 日每日收益（柱状图数据源）；固定 7 日，**不随页面统计窗口变化**
+    daily_profit: list[FollowDailyProfitPoint] = Field(default_factory=list)
 
 
 class FollowJoinRequest(BaseModel):

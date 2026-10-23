@@ -8,7 +8,8 @@
  *  - 底部：左下「带单 / 策略复用」模式选择 + 右下主操作按钮
  *  - 移动端：撑满全屏（无圆角、贴顶贴底），大屏保持居中卡片
  *
- *  - 「带单」关闭时，点提交走原 quickTrigger（normal 模型，按币种分发）；
+ *  - 「带单」默认关闭：点提交走原 quickTrigger（normal 模型，按币种分发），且只投递主节点；
+ *    需要下发到分组全部节点（含跟单员）时手动打开。
  *  - 「带单」开启 + 「策略复用」开启时，点提交走 strategy 模型 + 当前分组的 group_id，
  *    与 StrategyFormModal.triggerBoundGroup 行为一致，但**不持久化**模版参数，
  *    仅用弹窗里手填的 volume/sl/tp/entry_price/remark 作为本次信号值。
@@ -18,6 +19,7 @@ import { ElDialog, ElMessage, ElSwitch } from 'element-plus'
 import 'element-plus/es/components/dialog/style/css'
 import 'element-plus/es/components/switch/style/css'
 import { useHubStore } from '@/stores/hub'
+import { useAuthStore } from '@/stores/auth'
 import type {
   GridMode,
   GridSizingData,
@@ -32,6 +34,7 @@ import type {
 } from '@/api/types'
 
 const hub = useHubStore()
+const auth = useAuthStore()
 
 export type OrderStrategy = 'trend_market' | 'trend_limit' | 'grid'
 export type GridDirection = 'all' | 'buy' | 'sell'
@@ -140,7 +143,7 @@ watch(
   () => props.modelValue,
   async (open) => {
     if (open) {
-      carry.value = true
+      carry.value = false
       lastStrategyError.value = ''
       // 每次打开清空试算结果，避免上一笔的旧数据混入
       gridSizing.data = null
@@ -154,8 +157,8 @@ watch(
   },
 )
 
-/** 「带单」开关：跟着开仓信号走（保留原语义） */
-const carry = defineModel<boolean>('carry', { default: true })
+/** 「带单」开关：默认关闭（每笔新单都只发主节点），需要时手动打开 */
+const carry = defineModel<boolean>('carry', { default: false })
 
 /**
  * 市价开仓的方向由前端根据「止损价 vs 当前 mid」自动判定：
@@ -188,6 +191,16 @@ const lastStrategyError = ref('')
 
 /** 是否仅保存模式：点按钮只保存策略，不发信号 */
 const isSaveMode = computed(() => props.mode === 'save')
+
+/**
+ * 是否展示「带单」开关：非保存模式（保存不发信号，无需选投递范围）
+ * 且持有 follow_leader 能力（管理员自动放行）。
+ *
+ * 能力语义与后端 permissions.can_be_leader 同口径：跟单方向人人可做，
+ * 带单能力只决定「我能否被别人跟」。没有该能力的客户看不到开关，
+ * carry 恒为 false，信号仍按原逻辑只投递主节点，行为与隐藏前一致。
+ */
+const canCarry = computed(() => !isSaveMode.value && auth.canBeFollowLeader)
 
 const STRATEGIES: { key: OrderStrategy; label: string; icon: string }[] = [
   { key: 'trend_market', label: '市价开仓', icon: '⚡' },
@@ -1655,8 +1668,9 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
 
     <template #footer>
       <div class="od-footer">
-        <!-- 「带单」开关：开启 → 信号下发到分组全部节点（含跟单员）；关闭 → 仅主节点 -->
-        <div v-if="!isSaveMode" class="od-carry">
+        <!-- 「带单」开关：开启 → 信号下发到分组全部节点（含跟单员）；关闭 → 仅主节点。
+             仅对持有 follow_leader 能力的用户展示（无权限的客户看不到，也无法被别人跟）。 -->
+        <div v-if="canCarry" class="od-carry">
           <ElSwitch v-model="carry" />
           <span class="od-carry-label">带单</span>
           <!-- <span class="od-carry-sub">{{ carry ? '推到本分组全部节点' : '只推本分组主节点' }}</span> -->

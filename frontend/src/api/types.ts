@@ -1586,6 +1586,17 @@ export interface FollowGroupDetail {
   unselectable_reason: string | null
 }
 
+export interface FollowDailyProfitPoint {
+  /** 后端按 UTC+8 自然日分好，直接显示（前端不再本地换算） */
+  date: string
+  /** 该日 00:00 (UTC+8) 的 Unix 秒 */
+  ts: number
+  /** 当日已实现净盈亏（美元） */
+  profit: number
+  /** 当日出场成交笔数 */
+  deals: number
+}
+
 export interface FollowDetailResponse {
   leader: FollowLeaderSummary
   groups: FollowGroupDetail[]
@@ -1593,6 +1604,8 @@ export interface FollowDetailResponse {
   hidden_groups?: FollowGroupDetail[]
   /** 我可用于跟单的节点（已剔除主节点） */
   my_nodes: FollowNodeBrief[]
+  /** 近 7 日每日收益（柱状图数据源）；固定 7 日，不随页面统计窗口变化 */
+  daily_profit?: FollowDailyProfitPoint[]
 }
 
 export interface FollowMyGroup {

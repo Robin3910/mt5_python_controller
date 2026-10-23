@@ -1146,11 +1146,15 @@ def test_adopt_followers_still_works_within_same_market(client):
 # 造数策略：主节点与副节点**故意给出可区分的盈亏**（主节点亏、副节点赚），
 # 这样全节点口径与主节点口径的结果必然不同，断言才能真正卡住口径。
 def _seed_deal(node_id: str, deal_id: int, *, profit: float, equity: float,
-               position_id: int = 1) -> None:
-    """往 mt5_deal 插一笔**出场**成交（统计口径测试用）。
+               position_id: int = 1, at: int | None = None,
+               entry_type: str = "OUT") -> None:
+    """往 mt5_deal 插一笔成交（统计口径测试用）。
 
     出场类 entry 才有「已实现盈亏」与胜率分母（见 deal_stats.OUT_ENTRIES）；
     持仓级去重靠 position_id，所以同一持仓的多次出场算一笔。
+
+    `at` 指定成交时间（Unix 秒），默认现在 —— 日序列测试需要把成交
+    放到「昨天 / 前天」这类特定自然日里。
 
     走 `deal_store.save_deals`（节点上报的同一条路径），而不是直接 ORM：
     免得测试绕过归一化（_normalize）造出线上不可能出现的数据。
@@ -1169,14 +1173,14 @@ def _seed_deal(node_id: str, deal_id: int, *, profit: float, equity: float,
                 "deal_id": deal_id,
                 "position_id": position_id,
                 "symbol": "EURUSD",
-                "entry_type": "OUT",
+                "entry_type": entry_type,
                 "direction": "SELL",
                 "volume": 0.1,
                 "price": 1.1,
                 "profit": profit,
                 "swap": 0.0,
                 "commission": 0.0,
-                "time": int(time.time()),
+                "time": int(at if at is not None else time.time()),
             }],
             account={"balance": equity, "equity": equity},
         )
@@ -1259,4 +1263,107 @@ def test_leader_detail_fallback_matches_primary_only(client):
     assert perf["total_profit"] == pytest.approx(-100.0), (
         "详情兜底也必须只算主节点"
     )
+
+
+# ---------------------------------------------------------------------------
+# 近 7 日收益序列（柱状图数据源）
+# ---------------------------------------------------------------------------
+# 核心保证：**柱状图与页面头部的「累计收益」必须对得上**。
+# 两者一旦不一致，用户会立刻怀疑整个页面的数据可信度 —— 所以下面第一条
+# 用例直接把「7 根柱子的和 === 7d 窗口的 total_profit」钉死。
+
+
+def _day_start_utc8(offset_days: int = 0) -> int:
+    """UTC+8 的某个自然日 00:00（Unix 秒）。offset_days=0 表示今天。"""
+    day = 86400
+    offset = 8 * 3600
+    now = int(time.time())
+    today = ((now + offset) // day) * day - offset
+    return today - offset_days * day
+
+
+def test_leader_detail_daily_profit_matches_7d_total(client):
+    """7 根柱子的和 === 7d 窗口的 total_profit（口径一致红线）。"""
+    admin_h = _login(client, "admin")
+    alice, _bob, a_primary, a_extra, *_ = _setup_leader_and_follower(client, admin_h)
+
+    # 三笔分布在三天里：今天 +120，昨天 -30，前天 +50
+    _seed_deal(a_primary, 7001, profit=120.0, equity=10000.0,
+               position_id=1, at=_day_start_utc8(0) + 3600)
+    _seed_deal(a_primary, 7002, profit=-30.0, equity=10000.0,
+               position_id=2, at=_day_start_utc8(1) + 3600)
+    _seed_deal(a_primary, 7003, profit=50.0, equity=10000.0,
+               position_id=3, at=_day_start_utc8(2) + 3600)
+    # 副节点的盈利不得进柱状图（口径 = 主节点）
+    _seed_deal(a_extra, 7004, profit=999.0, equity=10000.0,
+               position_id=4, at=_day_start_utc8(0) + 3600)
+
+    bob_h = _login(client, "bob")
+    r = client.get(
+        f"/api/follow/leaders/{alice['id']}",
+        params={"window": "7d"},
+        headers=bob_h,
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    daily = data["daily_profit"]
+
+    assert len(daily) == 7, f"必须是 7 个点（没有成交的日子也要占位），实际 {len(daily)}"
+    assert daily[0]["date"], "日期不能为空"
+
+    total = sum(p["profit"] for p in daily)
+    perf_total = data["leader"]["performance"]["total_profit"]
+    assert total == pytest.approx(perf_total), (
+        f"柱状图合计 {total} 必须等于 7d 窗口累计收益 {perf_total}"
+    )
+    assert total == pytest.approx(140.0), (
+        f"只应含主节点三笔（120 - 30 + 50），实际 {total}"
+    )
+
+    # 分日正确性：今天 +120、昨天 -30、前天 +50（从后往前数）
+    assert daily[-1]["profit"] == pytest.approx(120.0)
+    assert daily[-2]["profit"] == pytest.approx(-30.0)
+    assert daily[-3]["profit"] == pytest.approx(50.0)
+    # 更早的 4 天没有成交，但必须占位（X 轴连续）
+    assert [p["profit"] for p in daily[:4]] == [0.0, 0.0, 0.0, 0.0]
+    assert daily[-1]["deals"] == 1
+
+
+def test_leader_detail_daily_profit_excludes_open_entries(client):
+    """开仓（IN）不计入日收益 —— 与 deal_stats 的出场类口径一致。"""
+    admin_h = _login(client, "admin")
+    alice, _bob, a_primary, _a_extra, *_ = _setup_leader_and_follower(client, admin_h)
+
+    _seed_deal(a_primary, 7101, profit=88.0, equity=10000.0,
+               position_id=1, entry_type="IN")
+
+    bob_h = _login(client, "bob")
+    r = client.get(
+        f"/api/follow/leaders/{alice['id']}",
+        params={"window": "7d"},
+        headers=bob_h,
+    )
+    assert r.status_code == 200, r.text
+    daily = r.json()["daily_profit"]
+    assert sum(p["profit"] for p in daily) == pytest.approx(0.0), (
+        "开仓成交不应计入已实现收益"
+    )
+
+
+def test_leader_detail_daily_profit_without_data_is_placeholder(client):
+    """无成交 -> 仍然是 7 个 0 值占位点（前端据此显示空图而不是报错）。"""
+    admin_h = _login(client, "admin")
+    alice, _bob, *_ = _setup_leader_and_follower(client, admin_h)
+
+    bob_h = _login(client, "bob")
+    r = client.get(
+        f"/api/follow/leaders/{alice['id']}",
+        params={"window": "7d"},
+        headers=bob_h,
+    )
+    assert r.status_code == 200, r.text
+    daily = r.json()["daily_profit"]
+    assert len(daily) == 7
+    assert all(p["profit"] == 0.0 for p in daily)
+    assert all(p["deals"] == 0 for p in daily)
 

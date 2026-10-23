@@ -316,6 +316,17 @@ function toggleMobileNode(nodeId: string) {
   selectedNodeIds.value = [...s]
 }
 
+/**
+ * 节点当前是否**可勾选**。
+ *
+ * 两个不可选原因：主节点（不可被跟单）与「已跟过该机器人的分组」。
+ * 模板里到处要用这个判定（高亮 / 置灰 / aria 状态 / tabindex），
+ * 各写一遍很容易走偏 —— 统一收敛到这里。
+ */
+function isNodeSelectable(nodeId: string): boolean {
+  return selectableNodeIds.value.has(nodeId) && !alreadyFollowingNodeIds.value.has(nodeId)
+}
+
 // ---------- 加载 ----------
 async function loadRobots() {
   loading.value = true
@@ -510,11 +521,9 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     <!-- 页面标题 + 图标 + 标签 + 副标题：桌面 / 手机共用一套（手机端在 ≤768px 保留显示） -->
     <div class="row between page-header">
       <div class="page-head-l">
-        <RobotIcon class="page-head-icon" :size="26" boxed />
         <div class="page-head-text">
           <div class="page-head-title-row">
             <h2 class="page-title">AI 智能交易机器人</h2>
-            <span class="page-head-tag">热门机器人</span>
           </div>
           <p class="page-sub">策略自动化运行，7x24 小时监控</p>
         </div>
@@ -786,7 +795,11 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
           v-for="r in robots"
           :key="r.leader_user_id"
           class="m-robot"
+          role="button"
+          tabindex="0"
           @click="openMobileRobot(r)"
+          @keydown.enter.prevent="openMobileRobot(r)"
+          @keydown.space.prevent="openMobileRobot(r)"
         >
           <!-- 头部：头像 + 策略名 + 状态胶囊（与 FollowView .m-leader 同一套版式） -->
           <div class="m-robot-top">
@@ -972,18 +985,20 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
               :key="n.node_id"
               class="m-pick"
               :class="{
-                on: selectableNodeIds.has(n.node_id) && selectedNodeIds.includes(n.node_id),
-                done: !selectableNodeIds.has(n.node_id) || alreadyFollowingNodeIds.has(n.node_id),
+                on: isNodeSelectable(n.node_id) && selectedNodeIds.includes(n.node_id),
+                done: !isNodeSelectable(n.node_id),
               }"
-              @click="
-                !selectableNodeIds.has(n.node_id) || alreadyFollowingNodeIds.has(n.node_id)
-                  ? null
-                  : toggleMobileNode(n.node_id)
-              "
+              role="checkbox"
+              :aria-checked="isNodeSelectable(n.node_id) && selectedNodeIds.includes(n.node_id)"
+              :aria-disabled="!isNodeSelectable(n.node_id)"
+              :tabindex="isNodeSelectable(n.node_id) ? 0 : -1"
+              @click="isNodeSelectable(n.node_id) ? toggleMobileNode(n.node_id) : null"
+              @keydown.enter.prevent="isNodeSelectable(n.node_id) ? toggleMobileNode(n.node_id) : null"
+              @keydown.space.prevent="isNodeSelectable(n.node_id) ? toggleMobileNode(n.node_id) : null"
             >
               <span class="m-pick-box" aria-hidden="true">
                 <svg
-                  v-if="selectableNodeIds.has(n.node_id) && selectedNodeIds.includes(n.node_id)"
+                  v-if="isNodeSelectable(n.node_id) && selectedNodeIds.includes(n.node_id)"
                   viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"
                   stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"
                 >
@@ -992,6 +1007,12 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
               </span>
               <span class="m-pick-main">
                 <span class="m-pick-name">{{ n.name || n.node_id }}</span>
+                <span v-if="!selectableNodeIds.has(n.node_id)" class="m-pick-sub muted">
+                  主节点不可跟单
+                </span>
+                <span v-else-if="alreadyFollowingNodeIds.has(n.node_id)" class="m-pick-sub muted">
+                  已跟该机器人的分组
+                </span>
               </span>
               <span v-if="alreadyFollowingNodeIds.has(n.node_id)" class="tag amber">已跟</span>
             </li>
@@ -1429,9 +1450,33 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
 @media (max-width: 768px) {
   .m-only { display: block; }
 
+  /* ── Apple 风格设计令牌 ─────────────────────────────────
+     苹果的克制来自三件事：
+       1) 背景是**中性灰**而不是带色相的深蓝 —— 颜色只用来表意，不用来装饰；
+       2) 单一强调色（systemBlue），语义色（绿/红/橙）只在表达数据时出现；
+       3) 用「面 + 发丝分隔线」建立层次，而不是用渐变和重投影。
+
+     所有取值都过了 WCAG 对比度校验（正文 ≥4.5:1，控件边界 ≥3:1），
+     校验脚本见仓库根目录 _contrast_check.py 的对应表。 */
   .follow-wrap {
+    --m-bg: #08090d;                        /* 页面底：近黑 */
+    --m-card: #1c1c1e;                      /* systemGray6 暗色：卡片面 */
+    --m-cell: #2c2c2e;                      /* systemGray5 暗色：卡内嵌套小格 */
+    --m-fill: #3a3a3c;                      /* systemGray4 暗色：分段控件选中态 */
+    --m-label: #f2f2f7;                     /* systemGray6 亮色：主文字 */
+    --m-label-2: #aeaeb2;                   /* systemGray4 亮色：次级文字 */
+    --m-label-3: #98989d;                   /* systemGray3 亮色：三级文字 */
+    --m-sep: rgba(255, 255, 255, 0.1);      /* 发丝分隔线 */
+    --m-sep-2: rgba(255, 255, 255, 0.16);
+    --m-blue: #0a84ff;                      /* systemBlue：填充 / 描边（非文字） */
+    --m-blue-txt: #5aa9ff;                  /* systemBlue 提亮：作文字用，保证 ≥4.5:1 */
+    --m-blue-fill: #0a6dd4;                 /* systemBlue 加深：白字底，保证 5.06:1 */
+    --m-green: #30d158;                     /* systemGreen */
+    --m-red: #ff6961;                       /* systemRed 提亮：作文字用，保证 ≥4.5:1 */
+    --m-orange: #ff9f0a;                    /* systemOrange */
+
     gap: 0;
-    padding: 10px 0 calc(4px + env(safe-area-inset-bottom, 0px));
+    padding: 12px 0 calc(8px + env(safe-area-inset-bottom, 0px));
   }
 
   /* 桌面端的两栏（.main-grid）在手机端整体隐藏。
@@ -1447,32 +1492,43 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     align-items: center;
     flex-wrap: nowrap;
     gap: 8px;
-    margin-bottom: 12px;
+    margin-bottom: 14px;
   }
   .page-title {
-    font-size: 17px;
+    font-size: 20px;
     font-weight: 700;
+    letter-spacing: -0.02em;
     margin: 0;
   }
-  .page-sub { font-size: 11px; }
+  .page-sub { font-size: 12px; color: var(--m-label-3); }
+  /* 标题旁的标签：改成 systemBlue 的「淡染」胶囊，
+     和全局的蓝色描边版式统一到同一套蓝。 */
+  .page-head-tag {
+    background: rgba(10, 132, 255, 0.15);
+    border-color: rgba(10, 132, 255, 0.3);
+    color: var(--m-blue-txt);
+  }
+  .page-head-icon { color: var(--m-blue); }
 
-  /* ── 分段切换 ── */
+  /* ── 分段切换（iOS Segmented Control）───────────────
+     结构 = 轨道（灰）+ 选中药丸（更亮的灰）+ 白字。
+     不用蓝色填充：蓝底白字在这个亮度下对比度不足，
+     而中性灰选中态正是 iOS 原生的分段控件样式。 */
   .m-tabs {
     position: sticky;
-    /* 顶栏（.topbar）也是 sticky top:0、z-index:20，尺寸 60px（≤640px 是 46px）。
-       分段切换必须让开顶栏高度，否则滚动时会滑到顶栏底下被盖住。 */
-    top: 60px;
+    /* 顶栏（.topbar）也是 sticky top:0、z-index:20。
+       ≤768px 顶栏高 54px、≤640px 高 52px（见 styles.css）。
+       分段切换必须让开顶栏实际高度，否则滚动时会滑到顶栏底下被盖住。 */
+    top: 54px;
     z-index: 12;
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 3px;
-    padding: 3px;
-    margin: 0 0 10px;
-    background: rgba(6, 10, 18, 0.9);
-    border: 1px solid var(--glass-border);
-    border-radius: 10px;
-    backdrop-filter: blur(var(--blur)) saturate(1.3);
-    -webkit-backdrop-filter: blur(var(--blur)) saturate(1.3);
+    gap: 2px;
+    padding: 2px;
+    margin: 0 0 14px;
+    background: var(--m-card);
+    border: 1px solid var(--m-sep);
+    border-radius: 12px;
   }
   .m-tab {
     position: relative;
@@ -1480,23 +1536,29 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     align-items: center;
     justify-content: center;
     gap: 5px;
-    /* 高度 36px：仍高于 32px 的最小触控建议，但更省垂直空间 */
+    /* 视觉高度 36px；下面用 ::after 把实际可点区域撑到 44px */
     min-height: 36px;
     padding: 0 8px;
     background: transparent;
     border: 1px solid transparent;
-    border-radius: 8px;
-    color: var(--muted);
+    border-radius: 10px;
+    color: var(--m-label-2);
     font-size: 13px;
     font-weight: 600;
     transition: color var(--transition), background var(--transition);
   }
-  .m-tab:active { background: rgba(255, 255, 255, 0.05); }
+  /* 触控热区扩展：视觉 36px，实际可点 44px（不改变布局，不产生视觉跳动） */
+  .m-tab::after {
+    content: '';
+    position: absolute;
+    inset: -4px 0;
+  }
+  .m-tab:active { background: rgba(255, 255, 255, 0.06); }
   .m-tab.on {
-    color: #ffffff;
-    background: linear-gradient(135deg, var(--primary) 0%, var(--primary-d) 100%);
+    color: var(--m-label);
+    background: var(--m-fill);
     border-color: transparent;
-    box-shadow: 0 2px 12px var(--primary-glow);
+    box-shadow: none;
   }
   .m-tab-badge {
     min-width: 18px;
@@ -1509,8 +1571,8 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     line-height: 1.5;
   }
   .m-tab.on .m-tab-badge {
-    background: rgba(4, 21, 16, 0.28);
-    color: #ffffff;
+    background: rgba(255, 255, 255, 0.18);
+    color: var(--m-label);
   }
 
   .m-panel { display: block; }
@@ -1524,13 +1586,13 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     min-height: 44px;
     border-radius: 12px;
     font-size: 16px;
-    /* 搜索框跟着设计稿走：卡片实色底 + 聚焦蓝色描边 */
-    background: #121828;
-    border-color: rgba(255, 255, 255, 0.08);
+    /* iOS 搜索框：中性灰面 + 可见的控件边界（≥3:1） */
+    background: var(--m-cell);
+    border-color: var(--m-sep-2);
   }
   .m-search:focus {
-    border-color: rgba(37, 99, 234, 0.65);
-    box-shadow: 0 0 0 3px rgba(37, 99, 234, 0.16);
+    border-color: var(--m-blue);
+    box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.2);
   }
   .m-search-btn {
     flex-shrink: 0;
@@ -1542,19 +1604,21 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     touch-action: manipulation;
   }
 
-  /* ── 统计周期：标签 + 横向滑动的分段控件，同一行 ── */
+  /* ── 统计周期：标签 + 横向滑动的胶囊组，同一行 ──
+     用「药丸 + 描边」而不是蓝底填充：
+     蓝底在这个亮度上白字对比度不够，描边药丸既统一又有足够对比。 */
   .m-win-row {
     display: flex;
     align-items: center;
     gap: 8px;
-    margin-bottom: 10px;
+    margin-bottom: 12px;
     min-width: 0;
   }
   .m-win-label {
     flex-shrink: 0;
     font-size: 12px;
     font-weight: 600;
-    color: var(--muted);
+    color: var(--m-label-3);
     white-space: nowrap;
   }
   .m-win {
@@ -1570,31 +1634,30 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
   .m-win::-webkit-scrollbar { display: none; }
   .m-win-btn {
     flex: 1 0 auto;
-    min-height: 30px;
-    padding: 0 10px;
+    min-height: 32px;
+    padding: 0 12px;
     border-radius: 999px;
-    /* 未选中态也带一点蓝调，和主色统一 */
-    border: 1px solid rgba(37, 99, 234, 0.28);
-    background: rgba(37, 99, 234, 0.1);
-    color: #93b4fb;
+    border: 1px solid var(--m-sep-2);
+    background: transparent;
+    color: var(--m-label-2);
     font-size: 12px;
     font-weight: 600;
     white-space: nowrap;
     touch-action: manipulation;
     transition: color var(--transition), background var(--transition), border-color var(--transition);
   }
-  .m-win-btn:active { background: rgba(37, 99, 234, 0.22); }
+  .m-win-btn:active { background: rgba(255, 255, 255, 0.07); }
   .m-win-btn.on {
-    color: #ffffff;
-    /* 选中态实心蓝，和顶部分段切换同一套主色 */
-    background: linear-gradient(135deg, var(--primary) 0%, var(--primary-d) 100%);
+    color: var(--m-label);
+    /* 选中态：systemBlue 加深底 + 白字（5.06:1） */
+    background: var(--m-blue-fill);
     border-color: transparent;
-    box-shadow: 0 2px 12px var(--primary-glow);
   }
 
   /* ── 机器人卡片 ──────────────────────────────────────────────
-     版式对齐 FollowView .m-leader：卡片实色底 #121828、
-     40px 头像、收益主数字 28px、三等分小格。 */
+     Apple 风格卡片 = 纯色面 + 发丝描边 + 极轻的投影。
+     不用渐变、不用重投影、不用彩色底 —— 层次靠「面 + 线」建立，
+     颜色只留给数据本身（收益正负、状态）。 */
   .m-robot-list {
     list-style: none;
     margin: 0;
@@ -1604,20 +1667,19 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     gap: 10px;
   }
   .m-robot {
-    padding: 14px;
-    border: 1px solid rgba(255, 255, 255, 0.06);
+    padding: 16px;
+    border: 1px solid var(--m-sep);
     border-radius: 16px;
-    /* 参考设计的卡片底色比全局 --panel 更实、更亮，这里用实色而非半透明 */
-    background: #121828;
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.32);
+    background: var(--m-card);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
     cursor: pointer;
     touch-action: manipulation;
     transition: border-color var(--transition), background var(--transition);
   }
   /* 手机端没有 hover，用 active 给出点按反馈 */
   .m-robot:active {
-    border-color: rgba(37, 99, 234, 0.55);
-    background: #16203a;
+    border-color: var(--m-sep-2);
+    background: #232326;
   }
   .m-robot-top {
     display: flex;
@@ -1625,7 +1687,7 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     justify-content: space-between;
     gap: 10px;
     min-width: 0;
-    margin-bottom: 14px;
+    margin-bottom: 16px;
   }
   /* 头像 + 策略名（名字在上、副标题在下） */
   .m-robot-id {
@@ -1643,6 +1705,7 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
   .m-robot-name {
     font-size: 15px;
     font-weight: 600;
+    color: var(--m-label);
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1650,30 +1713,30 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
   }
   /* 副标题：策略名有多个时提示「等 N 个策略」，否则显示用户名 */
   .m-robot-sub {
-    font-size: 11px;
-    color: var(--muted);
+    font-size: 12px;
+    color: var(--m-label-3);
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  /* 右上角状态胶囊 */
+  /* 右上角状态胶囊：系统蓝淡染（未跟）/ 系统绿淡染（已跟） */
   .m-robot-badge {
     flex-shrink: 0;
-    padding: 5px 12px;
+    padding: 4px 10px;
     border-radius: 999px;
-    background: rgba(37, 99, 234, 0.18);
-    border: 1px solid rgba(37, 99, 234, 0.4);
-    color: #93b4fb;
+    background: rgba(10, 132, 255, 0.15);
+    border: 1px solid rgba(10, 132, 255, 0.28);
+    color: var(--m-blue-txt);
     font-size: 12px;
     font-weight: 600;
     line-height: 1.2;
     white-space: nowrap;
   }
   .m-robot-badge.is-followed {
-    background: rgba(16, 185, 129, 0.16);
-    border-color: rgba(16, 185, 129, 0.4);
-    color: #34d399;
+    background: rgba(48, 209, 88, 0.15);
+    border-color: rgba(48, 209, 88, 0.28);
+    color: var(--m-green);
   }
 
   /* 主视觉：收益在左（大号），收益率在右（小号），左右分栏 */
@@ -1684,7 +1747,7 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     gap: 12px;
     padding-bottom: 14px;
     margin-bottom: 12px;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+    border-bottom: 1px solid var(--m-sep);
   }
   .m-pnl-left,
   .m-pnl-right {
@@ -1704,7 +1767,7 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
   }
   .m-pnl-label {
     font-size: 11px;
-    color: var(--muted);
+    color: var(--m-label-3);
     white-space: nowrap;
   }
   .m-pnl-rate {
@@ -1714,11 +1777,11 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     line-height: 1.05;
     font-variant-numeric: tabular-nums;
   }
-  .m-pnl-rate.pos { color: var(--green); }
-  .m-pnl-rate.neg { color: var(--red); }
-  .m-pnl-main.pos { color: var(--green); }
-  .m-pnl-main.neg { color: var(--red); }
-  .m-pnl-none { font-size: 13px; }
+  .m-pnl-rate.pos { color: var(--m-green); }
+  .m-pnl-rate.neg { color: var(--m-red); }
+  .m-pnl-main.pos { color: var(--m-green); }
+  .m-pnl-main.neg { color: var(--m-red); }
+  .m-pnl-none { font-size: 13px; color: var(--m-label-3); }
 
   /* 次要指标：三个等宽小格，卡片底部一行 */
   .m-mini-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
@@ -1729,27 +1792,35 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     gap: 6px;
     min-width: 0;
     padding: 8px 10px;
-    /* 小格底色比卡片略深，做出「卡片内嵌小格」的层次 */
-    background: rgba(255, 255, 255, 0.04);
-    border: 1px solid rgba(255, 255, 255, 0.06);
+    /* 小格底色比卡片略亮，做出「卡片内嵌小格」的层次 */
+    background: var(--m-cell);
+    border: 1px solid transparent;
     border-radius: 10px;
   }
-  .m-mini-k { font-size: 11px; color: var(--muted); white-space: nowrap; }
+  .m-mini-k { font-size: 11px; color: var(--m-label-3); white-space: nowrap; }
   .m-mini-v {
     font-family: var(--mono);
     font-size: 13px;
     font-weight: 600;
+    color: var(--m-label);
     font-variant-numeric: tabular-nums;
   }
 
   /* ── 空态 / 加载态 ── */
   .m-empty {
-    padding: 40px 16px;
+    padding: 44px 16px;
     text-align: center;
     font-size: 13px;
+    color: var(--m-label-3);
   }
-  .m-empty-text { margin: 0 0 12px; font-size: 13px; }
-  .m-empty-btn { min-height: 40px; }
+  .m-empty-text { margin: 0 0 14px; font-size: 13px; }
+  .m-empty-btn {
+    min-height: 44px;
+    padding: 0 18px;
+    border-radius: 12px;
+    font-size: 14px;
+    font-weight: 600;
+  }
 
   /* ── 我的 AI 跟单 ── */
   .m-mine-list {
@@ -1758,18 +1829,18 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     gap: 12px;
   }
   .m-mine {
-    padding: 14px;
-    border: 1px solid rgba(255, 255, 255, 0.06);
+    padding: 16px;
+    border: 1px solid var(--m-sep);
     border-radius: 16px;
-    background: #121828;
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.32);
+    background: var(--m-card);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
   }
   .m-mine-head {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 8px;
-    margin-bottom: 10px;
+    margin-bottom: 12px;
   }
   .m-mine-id {
     display: flex;
@@ -1787,6 +1858,7 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
   .m-mine-name {
     font-size: 15px;
     font-weight: 600;
+    color: var(--m-label);
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1796,7 +1868,33 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     flex-shrink: 0;
     align-self: center;
   }
-  .m-mine-none { margin: 0; font-size: 12px; }
+  .m-mine-none { margin: 0; font-size: 12px; color: var(--m-label-3); }
+
+  /* ── 状态标签：换成 Apple 语义色 ──
+     全局 .tag 用的是项目自有色（#34d399 / #fbbf24 / --muted），
+     放在新的中性灰卡片上，中性标签只有 4.44:1（差一点不到 4.5）。
+     这里按 Apple 语义色重定义，且只在本页手机端生效。 */
+  .tag {
+    background: rgba(255, 255, 255, 0.09);
+    color: var(--m-label-2);
+    border-color: transparent;
+  }
+  .tag.green {
+    background: rgba(48, 209, 88, 0.15);
+    color: var(--m-green);
+  }
+  .tag.amber {
+    background: rgba(255, 159, 10, 0.15);
+    color: var(--m-orange);
+  }
+  .tag.red {
+    background: rgba(255, 69, 58, 0.15);
+    color: var(--m-red);
+  }
+  .tag.blue {
+    background: rgba(10, 132, 255, 0.15);
+    color: var(--m-blue-txt);
+  }
 
   /* 桌面端是 <table>，窄屏没法读；这里用卡片行代替表格。
      改成两行：名称一行 + 账号/时间一行小字，移出按钮在右侧。 */
@@ -1812,38 +1910,41 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     display: flex;
     flex-direction: column;
     gap: 2px;
-    padding: 10px 12px;
-    background: rgba(255, 255, 255, 0.04);
-    border: 1px solid rgba(255, 255, 255, 0.06);
+    padding: 12px;
+    background: var(--m-cell);
+    border: 1px solid transparent;
     border-radius: 12px;
   }
   .m-mine-node-name {
     font-size: 14px;
     font-weight: 600;
+    color: var(--m-label);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   .m-mine-node-login {
     font-size: 12px;
-    color: var(--text);
+    color: var(--m-label-2);
   }
-  .m-mine-node-meta { font-size: 11px; }
+  .m-mine-node-meta { font-size: 11px; color: var(--m-label-3); }
   .m-mine-leave {
     flex-shrink: 0;
     align-self: flex-end;
-    min-height: 40px;
-    padding: 0 16px;
+    min-height: 44px;
+    padding: 0 18px;
     border-radius: 10px;
     font-size: 13px;
     font-weight: 600;
-    background: rgba(239, 68, 68, 0.14);
-    color: #f87171;
-    border: 1px solid rgba(239, 68, 68, 0.3);
+    /* iOS 危险操作用「红字 + 红淡染底」，不是实心红块：
+       实心红太抢眼，容易误触；红字同样传达「危险」且更克制。 */
+    background: rgba(255, 69, 58, 0.13);
+    color: var(--m-red);
+    border: 1px solid rgba(255, 69, 58, 0.28);
     touch-action: manipulation;
   }
-  .m-mine-leave:active { background: rgba(239, 68, 68, 0.24); }
-  .m-mine-wait { flex-shrink: 0; font-size: 12px; }
+  .m-mine-leave:active { background: rgba(255, 69, 58, 0.22); }
+  .m-mine-wait { flex-shrink: 0; font-size: 12px; color: var(--m-label-3); }
 
   /* ── 全屏详情页 ──
      用 100dvh 而不是 100vh：iOS 动态地址栏下 100vh 会超出可见区域。 */
@@ -1855,8 +1956,8 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     flex-direction: column;
     height: 100vh;
     height: 100dvh;
-    background: var(--bg);
-    animation: m-sheet-in 0.22s cubic-bezier(0.32, 0.72, 0, 1);
+    background: var(--m-bg);
+    animation: m-sheet-in 0.28s cubic-bezier(0.32, 0.72, 0, 1);
   }
   @keyframes m-sheet-in {
     from { transform: translateY(12px); opacity: 0; }
@@ -1871,10 +1972,10 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     padding: 0 6px;
     padding-top: env(safe-area-inset-top, 0px);
     height: calc(52px + env(safe-area-inset-top, 0px));
-    background: rgba(6, 10, 18, 0.92);
-    border-bottom: 1px solid var(--glass-border);
-    backdrop-filter: blur(var(--blur));
-    -webkit-backdrop-filter: blur(var(--blur));
+    background: rgba(8, 9, 13, 0.88);
+    border-bottom: 1px solid var(--m-sep);
+    backdrop-filter: blur(var(--blur)) saturate(1.4);
+    -webkit-backdrop-filter: blur(var(--blur)) saturate(1.4);
   }
   .m-back {
     display: inline-flex;
@@ -1885,23 +1986,28 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     padding: 0;
     background: transparent;
     border: none;
-    color: var(--text);
+    color: var(--m-blue-txt);
     border-radius: 10px;
     touch-action: manipulation;
   }
-  .m-back:active { background: rgba(255, 255, 255, 0.07); }
-  .m-sheet-title { font-size: 16px; font-weight: 600; }
+  .m-back:active { background: rgba(255, 255, 255, 0.08); }
+  .m-sheet-title {
+    font-size: 17px;
+    font-weight: 600;
+    color: var(--m-label);
+    letter-spacing: -0.01em;
+  }
 
   .m-sheet-body {
     flex: 1;
     min-height: 0;
     overflow-y: auto;
     -webkit-overflow-scrolling: touch;
-    padding: 14px 10px 14px;
+    padding: 16px 12px 16px;
   }
 
   /* 机器人身份区 */
-  .m-d-lead { margin-bottom: 20px; }
+  .m-d-lead { margin-bottom: 24px; }
   /* 名字 + 头像同排，名字过长时省略而不是把标签挤到下一行 */
   .m-d-name-row {
     display: flex;
@@ -1910,32 +2016,33 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     min-width: 0;
   }
   .m-d-name {
-    font-size: 19px;
+    font-size: 20px;
     font-weight: 700;
-    letter-spacing: -0.01em;
+    letter-spacing: -0.02em;
+    color: var(--m-label);
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .m-d-node { margin-top: 3px; font-size: 12px; }
+  .m-d-node { margin-top: 3px; font-size: 12px; color: var(--m-label-3); }
 
   .m-d-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 8px;
-    margin-top: 14px;
+    margin-top: 16px;
   }
   .m-d-stat {
     display: flex;
     flex-direction: column;
     gap: 3px;
-    padding: 11px 12px;
-    background: #121828;
-    border: 1px solid rgba(255, 255, 255, 0.06);
+    padding: 12px;
+    background: var(--m-card);
+    border: 1px solid var(--m-sep);
     border-radius: 12px;
   }
-  .m-d-k { font-size: 11px; color: var(--muted); }
+  .m-d-k { font-size: 11px; color: var(--m-label-3); }
   .m-d-v {
     font-family: var(--mono);
     font-size: 17px;
@@ -1943,19 +2050,20 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     line-height: 1.2;
     font-variant-numeric: tabular-nums;
   }
-  .m-d-v.pos { color: var(--green); }
-  .m-d-v.neg { color: var(--red); }
-  .m-d-updated { margin-top: 10px; font-size: 11px; }
+  .m-d-v.pos { color: var(--m-green); }
+  .m-d-v.neg { color: var(--m-red); }
+  .m-d-updated { margin-top: 12px; font-size: 11px; color: var(--m-label-3); }
 
   .m-d-sec-title {
     display: flex;
     align-items: baseline;
     gap: 8px;
     margin: 0 0 10px;
-    font-size: 14px;
+    font-size: 15px;
     font-weight: 600;
+    color: var(--m-label);
   }
-  .m-d-sec-sub { font-size: 12px; font-weight: 400; }
+  .m-d-sec-sub { font-size: 12px; font-weight: 400; color: var(--m-label-3); }
 
   /* ── 节点选择项：整行 56px 触控区 ── */
   .m-pick-list {
@@ -1972,22 +2080,28 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     gap: 12px;
     min-height: 56px;
     padding: 10px 12px;
-    border: 1px solid rgba(255, 255, 255, 0.06);
+    border: 1px solid var(--m-sep);
     border-radius: 12px;
-    background: #121828;
+    background: var(--m-card);
     cursor: pointer;
     touch-action: manipulation;
     transition: border-color var(--transition), background var(--transition);
   }
-  .m-pick:active { background: #16203a; }
-  /* 选中态：整块高亮 + 边框加粗，不靠颜色单独承载信息（另配勾选框） */
+  .m-pick:active { background: #232326; }
+  /* 选中态：蓝淡染底 + systemBlue 描边 + 勾选框。
+     不靠颜色单独承载信息 —— 勾选框本身就是状态指示。 */
   .m-pick.on {
-    border-color: rgba(37, 99, 234, 0.6);
-    background: rgba(37, 99, 234, 0.12);
+    border-color: var(--m-blue);
+    background: rgba(10, 132, 255, 0.15);
   }
-  .m-pick.done { opacity: 0.55; cursor: not-allowed; }
+  .m-pick.done {
+    opacity: 0.55;
+    cursor: not-allowed;
+    border-style: dashed;
+  }
 
-  /* 自绘勾选框：原生 checkbox 在深色下对比度差且样式不可控 */
+  /* 自绘勾选框：原生 checkbox 在深色下对比度差且样式不可控。
+     未选中的边框用 #6E6E73（对卡片 3.36:1），保证控件边界可见。 */
   .m-pick-box {
     flex-shrink: 0;
     display: inline-flex;
@@ -1995,14 +2109,14 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     justify-content: center;
     width: 22px;
     height: 22px;
-    border: 2px solid var(--glass-highlight);
+    border: 2px solid #6e6e73;
     border-radius: 6px;
     color: transparent;
     transition: background var(--transition), border-color var(--transition), color var(--transition);
   }
   .m-pick.on .m-pick-box {
-    background: var(--primary);
-    border-color: var(--primary);
+    background: var(--m-blue);
+    border-color: var(--m-blue);
     color: #ffffff;
   }
   .m-pick-main {
@@ -2015,10 +2129,13 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
   .m-pick-name {
     font-size: 14px;
     font-weight: 600;
+    color: var(--m-label);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  /* 不可选原因：把「为什么点不动」写出来，而不是让人反复点才发现 */
+  .m-pick-sub { font-size: 11px; color: var(--m-label-3); }
 
   /* ── 底部固定操作条 ── */
   .m-sheet-foot {
@@ -2028,37 +2145,39 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     gap: 12px;
     padding: 10px 14px;
     padding-bottom: calc(10px + env(safe-area-inset-bottom, 0px));
-    background: rgba(6, 10, 18, 0.94);
-    border-top: 1px solid var(--glass-border);
-    backdrop-filter: blur(var(--blur));
-    -webkit-backdrop-filter: blur(var(--blur));
+    background: rgba(8, 9, 13, 0.92);
+    border-top: 1px solid var(--m-sep);
+    backdrop-filter: blur(var(--blur)) saturate(1.4);
+    -webkit-backdrop-filter: blur(var(--blur)) saturate(1.4);
   }
-  .m-foot-count { font-size: 13px; flex-shrink: 0; }
+  .m-foot-count { font-size: 13px; flex-shrink: 0; color: var(--m-label-2); }
   .m-foot-n {
     font-family: var(--mono);
     font-size: 15px;
-    color: var(--text);
+    color: var(--m-label);
   }
   .m-foot-btn {
     flex: 1;
-    min-height: 48px;
+    min-height: 50px;
     padding: 0 20px;
-    background: linear-gradient(135deg, var(--primary) 0%, var(--primary-d) 100%);
-    /* 蓝底用白字：全局 .btn-primary 的 #041510 是深色字，配亮蓝对比度不够 */
+    /* systemBlue 加深底 + 白字（5.06:1），满足正文对比度要求。
+       不用渐变：苹果的按钮是纯色。 */
+    background: var(--m-blue-fill);
     color: #ffffff;
     font-size: 15px;
     font-weight: 600;
-    border-radius: 12px;
-    box-shadow: 0 4px 16px var(--primary-glow);
+    border-radius: 14px;
+    box-shadow: none;
     display: inline-flex;
     align-items: center;
     justify-content: center;
     touch-action: manipulation;
   }
+  .m-foot-btn:active { background: #0a62c8; }
   .m-foot-btn:disabled {
-    opacity: 0.4;
-    background: var(--panel-2);
-    color: var(--muted);
+    opacity: 1;
+    background: var(--m-cell);
+    color: var(--m-label-3);
     box-shadow: none;
     cursor: not-allowed;
   }
@@ -2071,6 +2190,7 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
   .m-tab,
   .m-win-btn,
   .m-pick,
+  .m-pick-box,
   .m-back,
   .m-foot-btn,
   .m-mine-leave {
@@ -2078,9 +2198,9 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
   }
 }
 
-/* ── 顶栏在 ≤640px 收窄到 46px，分段切换的 sticky 偏移要跟着变小 ── */
+/* ── 顶栏在 ≤640px 收窄到 52px，分段切换的 sticky 偏移要跟着变小 ── */
 @media (max-width: 640px) {
-  .m-tabs { top: 46px; }
+  .m-tabs { top: 52px; }
 }
 
 /* ── 极窄屏（iPhone SE 320px）：主视觉再收一档，避免换行 ── */
@@ -2089,6 +2209,7 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
   .m-pnl { gap: 8px; }
   .m-tab { font-size: 12px; }
   .m-d-v { font-size: 15px; }
+  .m-robot { padding: 14px; }
   /* 3 个格子在 320px 会挤，改为 2 列 + 第 3 个独占一行 */
   .m-mini-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }

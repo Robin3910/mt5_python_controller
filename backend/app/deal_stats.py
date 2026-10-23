@@ -375,6 +375,97 @@ async def leader_batch_multi(
 
 
 
+# ---------------------------------------------------------------------------
+# 近 N 日收益序列（柱状图数据源）
+# ---------------------------------------------------------------------------
+#
+# 口径与 `leader_batch` **完全一致**：同一批出场类成交（OUT / INOUT / OUT_BY）、
+# 同一份 net_profit（profit + swap + commission）、同一个节点范围（主节点）。
+# 恒等式：7 根柱子的和 === 7d 窗口的 total_profit。柱状图与页面头部的
+# 「累计收益」如果对不上，用户会立刻怀疑整个页面的数据可信度。
+#
+# **分日不在 SQL 里做**：`DATE(FROM_UNIXTIME(t))`（MySQL）与 `date(t,'unixepoch')`
+# （SQLite）表达式不同，而本项目两种库都要跑（参见 `_out_profit` 用 `case`
+# 而非 `iif` 的同类谨慎）。7 天单节点的成交行数在几百~几千量级，
+# 查出来在 Python 侧累加完全够用，还顺带省掉了方言风险。
+#
+# **时区**：deal_time 是 MT5 服务器时间（Unix 秒），按 UTC+8 自然日分桶 ——
+# 服务端与浏览器分属不同机器/时区，若在前端分日会整体错位一天。
+# 这里把分桶放在后端，前端只拿 `date` 字符串显示。
+
+# 分日用的固定偏移（秒）：UTC+8
+_DAY_OFFSET = 8 * 3600
+
+# 一天的秒数
+_DAY_SECONDS = 86400
+
+
+async def daily_net_profit(
+    node_ids: list[str],
+    days: int = 7,
+) -> list[dict]:
+    """近 N 个自然日的每日已实现净盈亏序列。
+
+    返回 `days` 个元素，**没有成交的日子也占位**（profit=0）——
+    X 轴必须连续，否则「没成交」会被渲染成「那天不存在」。
+
+    每个元素：{date: 'MM-DD', ts: 该日 00:00(UTC+8) 的 Unix 秒, profit, deals}
+    """
+    ids = [str(i) for i in (node_ids or []) if i]
+    days = max(1, int(days or 1))
+    if not ids:
+        return []
+
+    # 窗口起点按「自然日」对齐：往前数 days 天，取当天 00:00(UTC+8)
+    now = int(time.time())
+    today_start = ((now + _DAY_OFFSET) // _DAY_SECONDS) * _DAY_SECONDS - _DAY_OFFSET
+    start = today_start - (days - 1) * _DAY_SECONDS
+    end = today_start + _DAY_SECONDS
+
+    # 取出窗口内的出场类成交（净盈亏 = net_profit = profit + swap + commission），
+    # 分日累加放在 Python 侧做（见文件头说明：不做 SQL 日期分组）。
+    try:
+        async with SessionLocal() as s:
+            rows = (
+                await s.execute(
+                    select(Deal.deal_time, Deal.net_profit)
+                    .where(
+                        Deal.node_id.in_(ids),
+                        Deal.deal_time >= int(start),
+                        Deal.deal_time < int(end),
+                        Deal.entry_type.in_(OUT_ENTRIES),
+                    )
+                )
+            ).all()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("daily_net_profit failed: %s", e)
+        return []
+
+    # 分日累加：索引 = (deal_time - start) 落在第几天
+    profits = [0.0] * days
+    deals = [0] * days
+    for deal_time, net_profit in rows:
+        idx = (int(deal_time or 0) - start) // _DAY_SECONDS
+        if idx < 0 or idx >= days:
+            continue
+        profits[idx] += float(net_profit or 0.0)
+        deals[idx] += 1
+
+    out: list[dict] = []
+    for i in range(days):
+        ts = start + i * _DAY_SECONDS
+        # 用 gmtime(ts + 8h) 取「UTC+8 的墙上时钟」——
+        # 不能用 localtime：服务器本地时区不确定，localtime 会再叠一层偏移。
+        d = time.gmtime(ts + _DAY_OFFSET)
+        out.append({
+            "date": time.strftime("%m-%d", d),
+            "ts": ts,
+            "profit": round(profits[i], 2),
+            "deals": deals[i],
+        })
+    return out
+
+
 async def position_agg(
     node_id: str,
     from_ts: Optional[float] = None,
