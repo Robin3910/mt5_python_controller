@@ -13,7 +13,7 @@
 //   4. 移出默认不停止在跑任务（决策 = 与带单一致，由 node_client 跑完）
 //
 // 跟单员收不到实时 WS 事件（M3）—— 用 45s 轮询替代。
-import { computed, onBeforeUnmount, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, onUnmounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
 import 'element-plus/es/components/message-box/style/css'
@@ -31,6 +31,10 @@ import type {
   AiRobotSummary,
 } from '@/api/types'
 import RobotIcon from '@/components/RobotIcon.vue'
+
+// 收益柱状图带 echarts，异步加载让图表库不进 AI 交易页首屏 chunk
+// （与带单页的 ProfitBarChart 同一处理；两个页面复用同一个组件）
+const ProfitBarChart = defineAsyncComponent(() => import('@/components/ProfitBarChart.vue'))
 
 const robots = ref<AiRobotSummary[]>([])
 const loading = ref(false)
@@ -209,6 +213,17 @@ function perfOf(robot: AiRobotSummary): AiRobotSummary['performance'] {
 function hasPerf(robot: AiRobotSummary): boolean {
   return !!robot.performance?.data_available
 }
+
+/**
+ * 近 7 日收益序列（柱状图数据源）。
+ *
+ * 数据由后端按与绩效**同一套口径**算好（主节点 + 出场类成交的 net_profit），
+ * 前端不自己统计。与跟单页共用同一个 ProfitBarChart 与同一个后端实现，
+ * 两个市场看到的数字必然一致。
+ *
+ * 固定 7 日，**不随页面统计窗口（7d/30d/90d/all）变化**，标题写明「近 7 日」。
+ */
+const dailyProfit = computed(() => detail.value?.daily_profit ?? [])
 
 /** 跟单人数：优先后端算好的，回落到全量关系数 */
 function followerCountOf(robot: AiRobotSummary): number {
@@ -655,6 +670,16 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
             <div class="muted">{{ primaryText(detail.robot) }}</div>
           </header>
 
+          <!-- 近 7 日收益柱状图（与手机端全屏详情同一份数据、同一口径） -->
+          <div class="robot-detail-chart">
+            <ProfitBarChart
+              v-if="hasPerf(detail.robot)"
+              :points="dailyProfit"
+              :height="170"
+            />
+            <p v-else class="empty muted">近 7 日暂无收益数据</p>
+          </div>
+
           <h3 class="sec-title">我的节点（可多选）</h3>
           <ul v-if="(detail.my_nodes ?? []).length" class="pick-list">
             <!-- 已经跟着的节点：**不可勾选**（置灰）。
@@ -967,6 +992,17 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
             <div v-if="updatedText(detail.robot)" class="m-d-updated muted">
               {{ perfWindowLabel }} · {{ updatedText(detail.robot) }}
             </div>
+          </div>
+
+          <!-- 近 7 日收益柱状图：放在「选择要跟随的节点」上方，
+               让人在选节点前先看一眼这个机器人最近赚不赚钱。 -->
+          <div class="m-d-chart">
+            <ProfitBarChart
+              v-if="hasPerf(detail.robot)"
+              :points="dailyProfit"
+              :height="140"
+            />
+            <p v-else class="muted m-empty-text">近 7 日暂无收益数据</p>
           </div>
 
           <!-- 选节点：整行 56px 触控区 -->
@@ -1322,6 +1358,12 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
   flex-wrap: wrap;
   gap: 12px;
   margin-bottom: 12px;
+}
+
+/* 桌面端机器人详情：近 7 日收益柱状图（头部与「我的节点」之间） */
+.robot-detail-chart {
+  margin-top: 4px;
+  margin-bottom: 4px;
 }
 .risk-bar {
   display: flex;
@@ -2053,6 +2095,17 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
   .m-d-v.pos { color: var(--m-green); }
   .m-d-v.neg { color: var(--m-red); }
   .m-d-updated { margin-top: 12px; font-size: 11px; color: var(--m-label-3); }
+
+  /* 手机端详情：近 7 日收益柱状图（在「选择要跟随的节点」上方）。
+     卡片底色 / 描边沿用本页面自己的 m-* 变量，不硬编码 ——
+     跟单页用的是另一套变量，两个页面的主题不能各写一份。 */
+  .m-d-chart {
+    margin-bottom: 20px;
+    padding: 12px;
+    background: var(--m-card);
+    border: 1px solid var(--m-sep);
+    border-radius: 12px;
+  }
 
   .m-d-sec-title {
     display: flex;

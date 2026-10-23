@@ -740,3 +740,139 @@ def test_leave_same_market_still_works(client):
     assert len(body["removed"]) == 1
     assert body["skipped"] == []
     assert client.get("/api/ai-follow/me", headers=bob_h).json()["following"] == []
+
+
+# ---------------------------------------------------------------------------
+# 近 7 日收益序列（柱状图数据源）
+# ---------------------------------------------------------------------------
+# 与带单页**同一个** `deal_stats.daily_net_profit`、同一个主节点口径 ——
+# 两个市场各算一次必然漂移（「同一节点在带单页与 AI 页收益不同」），
+# 所以这里重点卡住两件事：合计与绩效一致、且与带单页口径相同。
+
+
+def _seed_deal(node_id: str, deal_id: int, *, profit: float, equity: float,
+               position_id: int = 1, at: int | None = None,
+               entry_type: str = "OUT") -> None:
+    """往 mt5_deal 插一笔成交（绩效口径测试用）。
+
+    走 `deal_store.save_deals`（节点上报的同一条路径），而不是直接 ORM：
+    免得测试绕过归一化（_normalize）造出线上不可能出现的数据。
+    `at` 指定成交时间（Unix 秒），日序列测试要往特定自然日里放成交。
+
+    本文件的 `client` fixture 是**同步** TestClient，主线程此刻没有 event loop，
+    所以借 TestClient 自己那个 portal 把协程丢进去跑（同一线程、同一 loop）。
+    """
+    import time
+
+    from anyio.from_thread import start_blocking_portal
+
+    async def _go():
+        from app import deal_store
+        await deal_store.save_deals(
+            node_id,
+            [{
+                "deal_id": deal_id,
+                "position_id": position_id,
+                "symbol": "XAUUSD",
+                "entry_type": entry_type,
+                "direction": "SELL",
+                "volume": 0.1,
+                "price": 3300.0,
+                "profit": profit,
+                "swap": 0.0,
+                "commission": 0.0,
+                "time": int(at if at is not None else time.time()),
+            }],
+            account={"balance": equity, "equity": equity},
+        )
+
+    with start_blocking_portal() as portal:
+        portal.call(_go)
+
+
+def _day_start_utc8(offset_days: int = 0) -> int:
+    """UTC+8 的某个自然日 00:00（Unix 秒）。offset_days=0 表示今天。"""
+    import time
+
+    day = 86400
+    offset = 8 * 3600
+    now = int(time.time())
+    today = ((now + offset) // day) * day - offset
+    return today - offset_days * day
+
+
+def test_ai_robot_detail_daily_profit_matches_7d_total(client):
+    """7 根柱子的和 === 7d 窗口的 total_profit（口径一致红线）。"""
+    admin_h = _login(client, "admin")
+    s = _setup(client, admin_h, caps=[CAP_AI, CAP_LEADER])
+    bob_h = _login(client, "bob")
+
+    # 今天 +90，昨天 -40，前天 +70；副节点 +999 不得混入
+    _seed_deal(s["h_primary"], 8101, profit=90.0, equity=20000.0,
+               position_id=1, at=_day_start_utc8(0) + 3600)
+    _seed_deal(s["h_primary"], 8102, profit=-40.0, equity=20000.0,
+               position_id=2, at=_day_start_utc8(1) + 3600)
+    _seed_deal(s["h_primary"], 8103, profit=70.0, equity=20000.0,
+               position_id=3, at=_day_start_utc8(2) + 3600)
+    _seed_deal(s["h_extra"], 8104, profit=999.0, equity=20000.0,
+               position_id=4, at=_day_start_utc8(0) + 3600)
+
+    r = client.get(
+        f"/api/ai-follow/robots/{s['host']['id']}",
+        params={"window": "7d"},
+        headers=bob_h,
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    daily = data["daily_profit"]
+
+    assert len(daily) == 7, f"必须是 7 个点（没有成交的日子也要占位），实际 {len(daily)}"
+    total = sum(p["profit"] for p in daily)
+    assert total == pytest.approx(120.0), (
+        f"只应含主节点三笔（90 - 40 + 70），副节点不得混入，实际 {total}"
+    )
+    assert total == pytest.approx(data["robot"]["performance"]["total_profit"]), (
+        "柱状图合计必须等于 7d 窗口累计收益"
+    )
+    assert daily[-1]["profit"] == pytest.approx(90.0)
+    assert daily[-2]["profit"] == pytest.approx(-40.0)
+    assert daily[-3]["profit"] == pytest.approx(70.0)
+    assert [p["profit"] for p in daily[:4]] == [0.0, 0.0, 0.0, 0.0]
+
+
+def test_ai_robot_detail_daily_profit_excludes_open_entries(client):
+    """开仓（IN）不计入日收益 —— 与 deal_stats 的出场类口径一致。"""
+    admin_h = _login(client, "admin")
+    s = _setup(client, admin_h, caps=[CAP_AI, CAP_LEADER])
+    bob_h = _login(client, "bob")
+
+    _seed_deal(s["h_primary"], 8201, profit=77.0, equity=20000.0,
+               position_id=1, entry_type="IN")
+
+    r = client.get(
+        f"/api/ai-follow/robots/{s['host']['id']}",
+        params={"window": "7d"},
+        headers=bob_h,
+    )
+    assert r.status_code == 200, r.text
+    daily = r.json()["daily_profit"]
+    assert sum(p["profit"] for p in daily) == pytest.approx(0.0), (
+        "开仓成交不应计入已实现收益"
+    )
+
+
+def test_ai_robot_detail_daily_profit_without_data_is_placeholder(client):
+    """无成交 -> 仍然是 7 个 0 值占位点（前端据此显示空图而不是报错）。"""
+    admin_h = _login(client, "admin")
+    s = _setup(client, admin_h, caps=[CAP_AI, CAP_LEADER])
+    bob_h = _login(client, "bob")
+
+    r = client.get(
+        f"/api/ai-follow/robots/{s['host']['id']}",
+        params={"window": "7d"},
+        headers=bob_h,
+    )
+    assert r.status_code == 200, r.text
+    daily = r.json()["daily_profit"]
+    assert len(daily) == 7
+    assert all(p["profit"] == 0.0 and p["deals"] == 0 for p in daily)

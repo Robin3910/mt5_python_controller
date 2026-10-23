@@ -2449,7 +2449,7 @@ onMounted(() => {
     display: flex;
     align-items: baseline;
     gap: 8px;
-    margin: 0 0 10px;
+    margin: 20px 0 20px!important;
     font-size: 14px;
     font-weight: 600;
   }

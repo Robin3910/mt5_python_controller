@@ -373,6 +373,15 @@ async def get_ai_robot_detail(
         sname = (strategies.get(g.get("strategy_id") or "") or {}).get("name")
         if sname and sname not in strategy_names:
             strategy_names.append(str(sname))
+
+    # 近 7 日每日收益（柱状图数据源）。
+    # 与跟单详情同一个 `daily_net_profit`、同一个主节点，口径天然一致 ——
+    # 两个市场各算一次必然漂移（「同一节点在跟单页与 AI 页收益不同」）。
+    # 同样不回源缓存：日序列与四窗口汇总结构不同，塞进 K_ROBOT_STATS 会污染缓存语义。
+    daily_profit = await deal_stats.daily_net_profit(
+        [str(primary.get("node_id"))], days=7,
+    )
+
     return AiRobotDetailResponse(
         robot={
             "leader_user_id": leader_user_id,
@@ -394,6 +403,7 @@ async def get_ai_robot_detail(
         },
         groups=detail_groups,
         my_nodes=[_node_brief(n) for n in _viewable_follow_nodes(all_nodes, p)],
+        daily_profit=daily_profit,
     )
 
 

@@ -1246,6 +1246,10 @@ class AiRobotDetailResponse(BaseModel):
     robot: AiRobotSummary
     groups: list[AiRobotGroupDetail] = Field(default_factory=list)
     my_nodes: list[dict] = Field(default_factory=list)
+    # 近 7 日每日收益（柱状图数据源）；固定 7 日，**不随页面统计窗口变化**
+    # 与跟单详情共用 FollowDailyProfitPoint —— 两个市场的口径本就相同（都是主节点），
+    # 各写一份只会让两边日后漂移。
+    daily_profit: list[FollowDailyProfitPoint] = Field(default_factory=list)
 
 
 class AiMyGroup(BaseModel):

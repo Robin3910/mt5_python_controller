@@ -1730,6 +1730,8 @@ export interface AiRobotDetailResponse {
   robot: AiRobotSummary
   groups: AiRobotGroupDetail[]
   my_nodes: FollowNodeBrief[]
+  /** 近 7 日每日收益（柱状图数据源）；固定 7 日，不随页面统计窗口变化 */
+  daily_profit?: FollowDailyProfitPoint[]
 }
 
 export interface AiRobotListResponse {
