@@ -165,13 +165,17 @@ function findGroupIdsForNode(robot: AiRobotSummary, nodeId: string): string[] {
  * 口径 = **将要加入的分组**（已选 ∩ 可选）的 my_follow_node_ids 并集：
  * 跟单关系是 (group_id, node_id) 维度的（uq_follow_group_node），
  * 同一节点跟了 A 组可以再跟 B 组，所以「是否已跟过」必须落到具体分组上。
+ *
+ * **暂停期间**分组全部不可选，上面那个口径会退化成空集 —— 已有的跟单员
+ * 会突然看不到「已跟」标记，像是关系被清掉了。暂停不动存量关系，
+ * 所以这里改用「该机器人名下全部分组」来判定，保持标记如实显示。
  */
 const alreadyFollowingNodeIds = computed<Set<string>>(() => {
   const ids = new Set<string>()
   if (!detail.value) return ids
   const selected = new Set(selectedGroupIds.value)
-  for (const g of selectableGroups.value) {
-    if (!selected.has(g.group_id)) continue
+  for (const g of detail.value.groups ?? []) {
+    if (!detailPaused.value && !selected.has(g.group_id)) continue
     for (const nid of g.my_follow_node_ids ?? []) ids.add(nid)
   }
   return ids
@@ -328,8 +332,7 @@ function afterJoinSettled() {
  * 可选节点点一下切换选中状态。
  */
 function toggleMobileNode(nodeId: string) {
-  if (!selectableNodeIds.value.has(nodeId)) return
-  if (alreadyFollowingNodeIds.value.has(nodeId)) return
+  if (!isNodeSelectable(nodeId)) return
   const s = new Set(selectedNodeIds.value)
   s.has(nodeId) ? s.delete(nodeId) : s.add(nodeId)
   selectedNodeIds.value = [...s]
@@ -338,11 +341,13 @@ function toggleMobileNode(nodeId: string) {
 /**
  * 节点当前是否**可勾选**。
  *
- * 两个不可选原因：主节点（不可被跟单）与「已跟过该机器人的分组」。
+ * 三个不可选原因：主节点（不可被跟单）、「已跟过该机器人的分组」、
+ * 主人已暂停 AI 跟单（整体收口）。
  * 模板里到处要用这个判定（高亮 / 置灰 / aria 状态 / tabindex），
  * 各写一遍很容易走偏 —— 统一收敛到这里。
  */
 function isNodeSelectable(nodeId: string): boolean {
+  if (detailPaused.value) return false
   return selectableNodeIds.value.has(nodeId) && !alreadyFollowingNodeIds.value.has(nodeId)
 }
 
@@ -407,6 +412,14 @@ const pauseBusy = ref(false)
 
 /** 当前详情页是否处于「已暂停 AI 跟单」状态 */
 const detailPaused = computed<boolean>(() => detail.value?.robot.ai_follow_paused === true)
+
+/**
+ * 暂停提示文案。
+ *
+ * 与后端 `follow_rules.PAUSED_AI_REASON` 保持同一句 —— 前端写侧兜底提示与
+ * 服务端 400 的 detail 长得不一样时，客户会以为是两个问题。
+ */
+const PAUSED_AI_HINT = '该机器人主人已暂停 AI 跟单，不再接收新的跟单'
 
 /** 这个机器人是不是我自己的（主人才能暂停） */
 function isMyRobot(robot: AiRobotSummary): boolean {
@@ -499,6 +512,13 @@ onUnmounted(() => {
 // ---------- 加入 / 移出 ----------
 async function submitJoin() {
   if (!detail.value) return
+  // 暂停判定放在最前面：暂停时所有分组都不可选，下面「没有可加入分组」的分支
+  // 会先一步返回，跟单员就看不到任何原因提示了 —— 按钮虽然已置灰，
+  // 但置灰的**理由**必须说清楚，不能让人猜。
+  if (detailPaused.value) {
+    ElMessage.warning(PAUSED_AI_HINT)
+    return
+  }
   const groupIds = selectedGroupIds.value.filter((id) =>
     selectableGroups.value.some((g) => g.group_id === id),
   )
@@ -773,10 +793,14 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
 
           <!-- 暂停提示：说清「不动什么、动什么」，避免主人误以为暂停会踢掉跟单员 -->
           <div v-if="detailPaused" class="pause-banner">
-            <strong>AI 跟单已暂停</strong>
-            <span>
+            <strong>{{ isMyRobot(detail.robot) ? 'AI 跟单已暂停' : '该机器人主人已暂停 AI 跟单' }}</strong>
+            <span v-if="isMyRobot(detail.robot)">
               新的客户无法再加入该机器人的 AI 分组；已有的跟单关系与在跑任务保持不变，
               等跟单员自行移出。之后触发的信号只下发主节点。
+            </span>
+            <span v-else>
+              {{ PAUSED_AI_HINT }}。已有的跟单关系与在跑任务不受影响，
+              等对方恢复后即可正常加入。
             </span>
           </div>
 
@@ -806,7 +830,7 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
                 <input
                   type="checkbox"
                   :value="n.node_id"
-                  :disabled="!selectableNodeIds.has(n.node_id) || alreadyFollowingNodeIds.has(n.node_id)"
+                  :disabled="!isNodeSelectable(n.node_id)"
                   v-model="selectedNodeIds"
                 />
                 <span class="pick-name">{{ n.name || n.node_id }}</span>
@@ -820,9 +844,9 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
           <div class="join-bar">
             <button
               class="btn-primary"
-              :disabled="submitting"
+              :disabled="submitting || detailPaused || !selectedGroupIds.length || !selectedNodeIds.length"
               @click="submitJoin"
-            >{{ submitting ? '提交中…' : '确认跟单' }}</button>
+            >{{ detailPaused ? '已暂停 AI 跟单' : (submitting ? '提交中…' : '确认跟单') }}</button>
           </div>
         </div>
 
@@ -1086,10 +1110,14 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
 
             <!-- 暂停提示：说清「不动什么、动什么」 -->
             <div v-if="detailPaused" class="pause-banner">
-              <strong>AI 跟单已暂停</strong>
-              <span>
+              <strong>{{ isMyRobot(detail.robot) ? 'AI 跟单已暂停' : '该机器人主人已暂停 AI 跟单' }}</strong>
+              <span v-if="isMyRobot(detail.robot)">
                 新的客户无法再加入该机器人的 AI 分组；已有的跟单关系与在跑任务保持不变，
                 等跟单员自行移出。之后触发的信号只下发主节点。
+              </span>
+              <span v-else>
+                {{ PAUSED_AI_HINT }}。已有的跟单关系与在跑任务不受影响，
+                等对方恢复后即可正常加入。
               </span>
             </div>
 
@@ -1178,7 +1206,10 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
               </span>
               <span class="m-pick-main">
                 <span class="m-pick-name">{{ n.name || n.node_id }}</span>
-                <span v-if="!selectableNodeIds.has(n.node_id)" class="m-pick-sub muted">
+                <span v-if="detailPaused" class="m-pick-sub muted">
+                  主人已暂停 AI 跟单
+                </span>
+                <span v-else-if="!selectableNodeIds.has(n.node_id)" class="m-pick-sub muted">
                   主节点不可跟单
                 </span>
                 <span v-else-if="alreadyFollowingNodeIds.has(n.node_id)" class="m-pick-sub muted">
@@ -1198,10 +1229,10 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
         </span>
         <button
           class="m-foot-btn"
-          :disabled="!selectedNodeIds.length || submitting"
+          :disabled="!selectedNodeIds.length || submitting || detailPaused"
           @click="submitJoin"
         >
-          {{ submitting ? '提交中…' : '确认跟单' }}
+          {{ detailPaused ? '已暂停 AI 跟单' : (submitting ? '提交中…' : '确认跟单') }}
         </button>
       </footer>
     </div>
@@ -1580,6 +1611,16 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
   align-items: center;
   gap: 16px;
   flex-wrap: wrap;
+}
+
+/* 置灰：全局 `button:disabled` 只降不透明度，主按钮仍是蓝的 —— 看着还能点。
+   暂停 AI 跟单时按钮必须真正「灭掉」，否则跟单员会一直点一个点不动的按钮。 */
+.join-bar .btn-primary:disabled {
+  opacity: 1;
+  background: var(--panel-2);
+  color: var(--muted);
+  box-shadow: none;
+  cursor: not-allowed;
 }
 .warn { font-size: 12px; color: var(--muted); line-height: 1.6; flex: 1; min-width: 280px; margin: 0; }
 

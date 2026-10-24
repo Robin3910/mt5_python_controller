@@ -134,6 +134,14 @@ const pauseBusy = ref(false)
 const detailPaused = computed<boolean>(() => detail.value?.leader.follow_paused === true)
 
 /**
+ * 暂停提示文案。
+ *
+ * 与后端 `follow_rules.PAUSED_FOLLOW_REASON` 保持同一句 —— 前端写侧兜底提示与
+ * 服务端 400 的 detail 长得不一样时，客户会以为是两个问题。
+ */
+const PAUSED_FOLLOW_HINT = '该带单员已暂停带单，不再接收新的跟单'
+
+/**
  * 切换暂停状态。
  *
  * 暂停是不可逆的「对外接单」动作 —— 跟单员点进来会看到「已暂停」，
@@ -290,14 +298,36 @@ const allSelectableGroupIds = computed<string[]>(() =>
 
 const nodeSet = computed(() => new Set(selectedNodes.value))
 
+/**
+ * 节点当前是否**可勾选**。
+ *
+ * 三个不可选原因：带单员已暂停（整体收口）、已跟随该带单员、主节点（后端已剔除）。
+ * 模板里到处要用这个判定（高亮 / 置灰 / aria 状态 / tabindex），
+ * 各写一遍很容易走偏 —— 统一收敛到这里。
+ */
+function isNodeSelectable(id: string): boolean {
+  if (detailPaused.value) return false
+  return !alreadyFollowingNodeIds.value.has(id)
+}
+
 function toggleNode(id: string) {
+  // 暂停期间整体不可选：跟单员不该在「选了也加不进去」的地方反复勾选。
+  if (!isNodeSelectable(id)) return
   const s = new Set(selectedNodes.value)
   s.has(id) ? s.delete(id) : s.add(id)
   selectedNodes.value = [...s]
 }
 
 async function submitJoin() {
-  if (!detail.value || !allSelectableGroupIds.value.length || !selectedNodes.value.length) return
+  if (!detail.value) return
+  // 暂停判定放在最前面：暂停时所有分组都不可选，下面「没有可加入分组」的分支
+  // 会先一步返回，跟单员就看不到任何原因提示了 —— 按钮虽然已置灰，
+  // 但置灰的**理由**必须说清楚，不能让人猜。
+  if (detailPaused.value) {
+    ElMessage.warning(PAUSED_FOLLOW_HINT)
+    return
+  }
+  if (!allSelectableGroupIds.value.length || !selectedNodes.value.length) return
   submitting.value = true
   try {
     const res = await joinFollow({
@@ -788,10 +818,14 @@ onMounted(() => {
 
           <!-- 暂停提示：说清「不动什么、动什么」，避免主人误以为暂停会踢掉跟单员 -->
           <div v-if="detailPaused" class="pause-banner">
-            <strong>带单已暂停</strong>
-            <span>
+            <strong>{{ isMyLeader(detail.leader) ? '带单已暂停' : '该带单员已暂停带单' }}</strong>
+            <span v-if="isMyLeader(detail.leader)">
               新的客户无法再加入你的跟单分组；已有的跟单关系与在跑任务保持不变，
               等跟单员自行移出。之后触发的信号只下发主节点。
+            </span>
+            <span v-else>
+              {{ PAUSED_FOLLOW_HINT }}。已有的跟单关系与在跑任务不受影响，
+              等对方恢复带单后即可正常加入。
             </span>
           </div>
 
@@ -847,18 +881,18 @@ onMounted(() => {
               :key="n.node_id"
               class="pick-item"
               :class="{
-                on: !alreadyFollowingNodeIds.has(n.node_id) && nodeSet.has(n.node_id),
-                disabled: alreadyFollowingNodeIds.has(n.node_id),
+                on: isNodeSelectable(n.node_id) && nodeSet.has(n.node_id),
+                disabled: !isNodeSelectable(n.node_id),
               }"
-              @click="alreadyFollowingNodeIds.has(n.node_id) ? null : toggleNode(n.node_id)"
+              @click="isNodeSelectable(n.node_id) ? toggleNode(n.node_id) : null"
             >
               <label>
                 <input
                   type="checkbox"
-                  :checked="!alreadyFollowingNodeIds.has(n.node_id) && nodeSet.has(n.node_id)"
-                  :disabled="alreadyFollowingNodeIds.has(n.node_id)"
+                  :checked="isNodeSelectable(n.node_id) && nodeSet.has(n.node_id)"
+                  :disabled="!isNodeSelectable(n.node_id)"
                   @click.stop
-                  @change="alreadyFollowingNodeIds.has(n.node_id) ? null : toggleNode(n.node_id)"
+                  @change="isNodeSelectable(n.node_id) ? toggleNode(n.node_id) : null"
                 />
                 <span class="pick-name">{{ n.name || n.node_id }}</span>
               </label>
@@ -874,10 +908,10 @@ onMounted(() => {
             </span>
             <button
               class="btn-sm btn-primary"
-              :disabled="!selectedNodes.length || submitting"
+              :disabled="!selectedNodes.length || submitting || detailPaused"
               @click="submitJoin"
             >
-              {{ submitting ? '提交中...' : '确认跟单' }}
+              {{ detailPaused ? '已暂停带单' : (submitting ? '提交中...' : '确认跟单') }}
             </button>
           </div>
 
@@ -1263,10 +1297,14 @@ onMounted(() => {
 
             <!-- 暂停提示：说清「不动什么、动什么」 -->
             <div v-if="detailPaused" class="pause-banner">
-              <strong>带单已暂停</strong>
-              <span>
+              <strong>{{ isMyLeader(detail.leader) ? '带单已暂停' : '该带单员已暂停带单' }}</strong>
+              <span v-if="isMyLeader(detail.leader)">
                 新的客户无法再加入你的跟单分组；已有的跟单关系与在跑任务保持不变，
                 等跟单员自行移出。之后触发的信号只下发主节点。
+              </span>
+              <span v-else>
+                {{ PAUSED_FOLLOW_HINT }}。已有的跟单关系与在跑任务不受影响，
+                等对方恢复带单后即可正常加入。
               </span>
             </div>
 
@@ -1329,13 +1367,19 @@ onMounted(() => {
               :key="n.node_id"
               class="m-pick"
               :class="{
-                on: !alreadyFollowingNodeIds.has(n.node_id) && nodeSet.has(n.node_id),
-                done: alreadyFollowingNodeIds.has(n.node_id),
+                on: isNodeSelectable(n.node_id) && nodeSet.has(n.node_id),
+                done: !isNodeSelectable(n.node_id),
               }"
-              @click="alreadyFollowingNodeIds.has(n.node_id) ? null : toggleNode(n.node_id)"
+              role="checkbox"
+              :aria-checked="isNodeSelectable(n.node_id) && nodeSet.has(n.node_id)"
+              :aria-disabled="!isNodeSelectable(n.node_id)"
+              :tabindex="isNodeSelectable(n.node_id) ? 0 : -1"
+              @click="isNodeSelectable(n.node_id) ? toggleNode(n.node_id) : null"
+              @keydown.enter.prevent="isNodeSelectable(n.node_id) ? toggleNode(n.node_id) : null"
+              @keydown.space.prevent="isNodeSelectable(n.node_id) ? toggleNode(n.node_id) : null"
             >
               <span class="m-pick-box" aria-hidden="true">
-                <svg v-if="!alreadyFollowingNodeIds.has(n.node_id) && nodeSet.has(n.node_id)" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round">
+                <svg v-if="isNodeSelectable(n.node_id) && nodeSet.has(n.node_id)" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M20 6L9 17l-5-5" />
                 </svg>
               </span>
@@ -1356,10 +1400,10 @@ onMounted(() => {
         </span>
         <button
           class="m-foot-btn"
-          :disabled="!selectedNodes.length || submitting"
+          :disabled="!selectedNodes.length || submitting || detailPaused"
           @click="submitJoin"
         >
-          {{ submitting ? '提交中...' : '确认跟单' }}
+          {{ detailPaused ? '已暂停带单' : (submitting ? '提交中...' : '确认跟单') }}
         </button>
       </footer>
     </div>
@@ -1738,6 +1782,16 @@ onMounted(() => {
   padding-top: 12px;
   border-top: 1px solid var(--glass-border);
   flex-wrap: wrap;
+}
+
+/* 置灰：全局 `button:disabled` 只降不透明度，主按钮仍是蓝的 —— 看着还能点。
+   暂停带单时按钮必须真正「灭掉」，否则跟单员会一直点一个点不动的按钮。 */
+.join-bar .btn-primary:disabled {
+  opacity: 1;
+  background: var(--panel-2);
+  color: var(--muted);
+  box-shadow: none;
+  cursor: not-allowed;
 }
 
 .warn {
