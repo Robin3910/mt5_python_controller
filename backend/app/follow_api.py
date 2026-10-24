@@ -36,6 +36,8 @@ from .models import (
     FollowLeaveResponse,
     FollowLeaderListResponse,
     FollowMeResponse,
+    FollowPauseRequest,
+    FollowPauseResponse,
 )
 from .permissions import MENU_FOLLOW, Principal
 from .redis_store import RedisStore
@@ -220,6 +222,8 @@ async def list_follow_leaders(
             "follower_count": int(perf.get("follower_count") or 0)
             or len(followers_by_leader.get(uid, set())),
             "perf_available": bool(perf),
+            # 暂停带单状态：暂停后不再接受新跟单，新信号只发主节点
+            "follow_paused": bool(getattr(u, "follow_paused", False)),
         })
     # 已跟过的排前面，其余按用户名
     out.sort(key=lambda x: (x["my_follow_group_count"] == 0, x["username"]))
@@ -279,12 +283,18 @@ async def get_leader_detail(
             mine_by_group.setdefault(f["group_id"], []).append(f["node_id"])
 
     detail_groups = []
+    # 暂停带单：分组置灰 + 给出原因，让跟单员**看得出**这里已经收口，
+    # 而不是点了「确认跟单」才吃到一句 400。
+    # 写侧仍会再拦一次（写侧拦截才是权威，前端置灰只是提示）。
+    leader_paused = bool(getattr(user, "follow_paused", False))
     for g in sorted(followable, key=follow_rules.leader_group_sort_key):
         gid = g["group_id"]
         strategy = strategies.get(g.get("strategy_id") or "")
         reason = None if g.get("enabled", True) else "分组已禁用"
         if strategy is None and g.get("strategy_id"):
             reason = "已停止接收新信号（策略已停用）"
+        if reason is None and leader_paused:
+            reason = follow_rules.PAUSED_FOLLOW_REASON
         detail_groups.append({
             "group_id": gid,
             "name": g.get("name"),
@@ -379,6 +389,8 @@ async def get_leader_detail(
             "perf_window": win,
             "follower_count": follower_count,
             "perf_available": True,
+            # 暂停带单状态（详情页据此显示「暂停 / 恢复带单」按钮）
+            "follow_paused": bool(getattr(user, "follow_paused", False)),
         },
         groups=detail_groups,
         hidden_groups=hidden_groups,
@@ -434,6 +446,8 @@ async def list_my_followings(
                 g, has_cap, primary.get("node_id") if primary else None,
                 template_id=tmpl_map.get(str(g.get("strategy_id") or "")),
                 market=follow_rules.FOLLOW_MARKET_TEMPLATE_IDS,
+                # 带单员暂停带单 -> 存量关系保留但标不可再收新信号
+                paused=bool(getattr(user, "follow_paused", False)),
             )
             node_ids = {f["node_id"] for f in fs}
             groups_out.append({
@@ -466,6 +480,8 @@ async def list_my_followings(
                 "my_follow_group_count": len(by_group),
                 "my_follow_node_count": len(items),
                 "marketable": has_cap,
+                # 暂停状态：跟单员据此看到「该带单员已暂停带单」
+                "follow_paused": bool(getattr(user, "follow_paused", False)),
             },
             "groups": groups_out,
         })
@@ -499,6 +515,12 @@ async def join_follow(
     principal = await rbac_service.load_principal(store, user.username)
     if not principal or not permissions.can_be_leader(principal):
         raise HTTPException(status_code=404, detail="该用户暂未开放带单")
+    # 暂停带单：写侧拦截。必须在**写入前**挡住 —— 只在展示侧过滤的话，
+    # 用户可以绕过 UI 直接调 API 加入已暂停的分组。
+    if getattr(user, "follow_paused", False):
+        raise HTTPException(
+            status_code=400, detail=follow_rules.PAUSED_FOLLOW_REASON,
+        )
 
     all_nodes = await store.all_nodes()
     leader_primary = _primary_of(all_nodes, body.leader_user_id)
@@ -597,6 +619,80 @@ async def join_follow(
         skipped=skipped,
         leader_primary_node_id=leader_primary.get("node_id"),
     )
+
+
+# ---------------------------------------------------------------------------
+# 暂停 / 恢复带单
+# ---------------------------------------------------------------------------
+@router.post("/pause", response_model=FollowPauseResponse)
+async def set_follow_paused(
+    body: FollowPauseRequest,
+    request: Request,
+    store: RedisStore = Depends(get_store),
+    p: Principal = Depends(require_menu(MENU_FOLLOW)),
+) -> FollowPauseResponse:
+    """暂停 / 恢复【带单】市场的对外接单。
+
+    语义（三条，缺一不可）：
+    ① 新的客户无法再加入该带单员名下的跟单分组（写侧拦截 + 展示侧置灰）；
+    ② 已有跟单关系与在跑任务**不动** —— 等跟单员自行移出，本接口不碰
+       任何跟单数据、不平任何仓（这是与「移出跟单」的本质区别）；
+    ③ 之后触发的信号只发主节点，不再下发给跟单节点（服务端在分发侧收窄，
+       webhook / 限价监听等非前端发起的信号同样被收窄）。
+
+    只作用于【带单】市场（趋势 / 网格分组）。AI 市场（AI 智能加仓分组）有
+    独立的开关（/api/ai-follow/pause），两边互不影响。
+
+    权限：只能操作自己（管理员可代操作他人）—— 这是主人级的对外接单开关，
+    不能被别人替他暂停。必须仍持有带单资格，否则暂停一个带不单的人没有意义。
+    """
+    if body.leader_user_id != p.user_id and not p.is_admin:
+        raise HTTPException(status_code=403, detail="只能暂停自己的带单")
+
+    user = await user_service.get_user_by_id(body.leader_user_id)
+    if not user or not user.is_active:
+        raise HTTPException(status_code=404, detail="带单员不存在或已停用")
+
+    principal = await rbac_service.load_principal(store, user.username)
+    if not principal or not permissions.can_be_leader(principal):
+        raise HTTPException(status_code=400, detail="该用户暂未开放带单，无法暂停带单")
+
+    before = bool(getattr(user, "follow_paused", False))
+    if before == body.paused:
+        # 幂等：状态没变就不写库（避免审计日志刷屏）
+        return FollowPauseResponse(
+            leader_user_id=user.id,
+            follow_paused=before,
+            paused_at=_paused_at(user.follow_paused_at) if before else None,
+        )
+
+    updated = await user_service.set_follow_paused(user.id, body.paused)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="带单员不存在")
+
+    await persist.audit(
+        p.username, "pause_follow" if body.paused else "resume_follow", user.username,
+        {"leader_user_id": user.id, "paused": body.paused},
+        "ok", client_ip(request), category="follow",
+        before={"follow_paused": before},
+        after={"follow_paused": body.paused},
+    )
+    return FollowPauseResponse(
+        leader_user_id=updated.id,
+        follow_paused=bool(updated.follow_paused),
+        paused_at=_paused_at(updated.follow_paused_at) if updated.follow_paused else None,
+    )
+
+
+def _paused_at(value: object) -> Optional[float]:
+    """暂停时刻 -> Unix 秒（供前端展示「暂停于 …」）。"""
+    if value is None:
+        return None
+    ts = getattr(value, "timestamp", None)
+    try:
+        return float(ts()) if callable(ts) else None
+    except (TypeError, ValueError, OSError):
+        return None
 
 
 # ---------------------------------------------------------------------------

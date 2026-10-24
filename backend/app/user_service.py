@@ -1,5 +1,6 @@
 """后台用户持久化：MySQL/SQLite 为权威数据源。"""
 import json
+from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import delete, func, select, update
@@ -63,6 +64,42 @@ async def get_user_by_id(user_id: int) -> Optional[User]:
 async def list_users() -> list[User]:
     async with SessionLocal() as s:
         return list((await s.execute(select(User).order_by(User.id.asc()))).scalars().all())
+
+
+# ---------------------------------------------------------------------------
+# 暂停接单（两个市场各一个开关）
+# ---------------------------------------------------------------------------
+#
+# 语义（两个市场一致）：
+#   ① 新的客户无法再加入该市场名下的跟单分组；
+#   ② 已有跟单关系与在跑任务**不动**，等跟单员自行移出；
+#   ③ 之后触发的信号只发主节点，不再下发给跟单节点。
+#
+# 写库与「跟单关系」「任务」完全无关 —— 暂停不动任何跟单数据。
+async def set_follow_paused(user_id: int, paused: bool) -> Optional[User]:
+    """设置【带单】市场的暂停开关；返回更新后的用户（用户不存在返回 None）。"""
+    async with SessionLocal() as s:
+        row = await s.get(User, int(user_id))
+        if row is None:
+            return None
+        row.follow_paused = bool(paused)
+        row.follow_paused_at = datetime.now() if paused else None
+        await s.commit()
+        await s.refresh(row)
+        return row
+
+
+async def set_ai_follow_paused(user_id: int, paused: bool) -> Optional[User]:
+    """设置【AI 交易】市场的暂停开关；返回更新后的用户（用户不存在返回 None）。"""
+    async with SessionLocal() as s:
+        row = await s.get(User, int(user_id))
+        if row is None:
+            return None
+        row.ai_follow_paused = bool(paused)
+        row.ai_follow_paused_at = datetime.now() if paused else None
+        await s.commit()
+        await s.refresh(row)
+        return row
 
 
 async def create_user(

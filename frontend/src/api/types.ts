@@ -1420,6 +1420,14 @@ export interface MeInfo {
   menus: string[]
   /** 角色能力列表，如 ai_strategy；管理员固定全部能力 */
   capabilities: string[]
+  /**
+   * 我自己的两个「暂停接单」开关（两个市场各自独立）。
+   *
+   * 暂停 = 新客户无法加入 + 新信号只发主节点；已有跟单关系与在跑任务不动。
+   * 交易页据此提示「即使打开带单开关，信号也只下发主节点」。
+   */
+  follow_paused?: boolean
+  ai_follow_paused?: boolean
 }
 
 /** 「我的」枢纽页模块卡片 */
@@ -1563,6 +1571,13 @@ export interface FollowLeaderSummary {
   follower_count: number
   /** 聚合缓存是否命中（false = 暂无绩效数据） */
   perf_available: boolean
+  /**
+   * 是否已暂停【带单】市场对外接单（趋势 / 网格分组）。
+   *
+   * 暂停 = 新客户无法加入 + 新信号只发主节点；已有跟单关系与在跑任务不动。
+   * 只影响带单市场，AI 市场有独立的 `ai_follow_paused`。
+   */
+  follow_paused?: boolean
 }
 
 export interface FollowGroupDetail {
@@ -1657,6 +1672,19 @@ export interface FollowLeaveResponse {
   skipped: { group_id: string; group_name: string | null; reason: string }[]
 }
 
+/** 暂停 / 恢复带单（【带单】市场） */
+export interface FollowPausePayload {
+  leader_user_id: number
+  paused: boolean
+}
+
+export interface FollowPauseResponse {
+  leader_user_id: number
+  follow_paused: boolean
+  /** 暂停时刻（Unix 秒）；恢复后为 null */
+  paused_at: number | null
+}
+
 // ===========================================================================
 // AI 交易（ai_follow）：跟随 AI 智能加仓策略的机器人
 // ===========================================================================
@@ -1696,6 +1724,13 @@ export interface AiRobotSummary {
   perf_window: string
   /** 跟单人数（AI 市场内跟了该机器人的去重节点数） */
   follower_count: number
+  /**
+   * 是否已暂停【AI 交易】市场对外接单（AI 智能加仓分组）。
+   *
+   * 暂停 = 新客户无法加入 + 新信号只发主节点；已有跟单关系与在跑任务不动。
+   * 只影响 AI 市场，带单市场有独立的 `follow_paused`。
+   */
+  ai_follow_paused?: boolean
 }
 
 /** 机器人详情里的单个 AI 分组 */
@@ -1792,4 +1827,17 @@ export interface AiLeaveResponse {
   warning: string | null
   /** 跨市场跳过的分组（关系**未**被删除） */
   skipped: { group_id: string; group_name: string | null; reason: string }[]
+}
+
+/** 暂停 / 恢复 AI 跟单（【AI 交易】市场） */
+export interface AiPausePayload {
+  leader_user_id: number
+  paused: boolean
+}
+
+export interface AiPauseResponse {
+  leader_user_id: number
+  ai_follow_paused: boolean
+  /** 暂停时刻（Unix 秒）；恢复后为 null */
+  paused_at: number | null
 }

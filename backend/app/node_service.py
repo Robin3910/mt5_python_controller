@@ -28,18 +28,20 @@ PRIMARY_BLOCKING_DETAIL_LIMIT = 100
 
 
 class PrimarySwitchBlocked(Exception):
-    """主节点切换被阻塞：旧主节点上仍有 in-flight 子任务。
+    """主节点切换被阻塞：旧主节点上仍有 in-flight 子任务，或待晋升节点仍在跟单。
 
     - code: 给前端 / 审计的机器可读错误码
-    - node_id: 被阻塞的旧主节点 id
+    - node_id: 被阻塞的旧主节点 id（跟单阻塞时 = 待晋升节点 id）
     - node_name: 同上，节点显示名
     - blocking_tasks: 阻塞明细（精简字段，limit = PRIMARY_BLOCKING_DETAIL_LIMIT）
     - next_node_id: 即将上任的新主节点 id（取消主节点时为 None）
+    - blocking_followings: 跟单阻塞明细（group_id / group_name / leader 用户名等）
     """
 
     def __init__(
         self, *, code: str, message: str, node_id: str, node_name: str,
         next_node_id: Optional[str], blocking_tasks: list[dict],
+        blocking_followings: Optional[list[dict]] = None,
     ) -> None:
         super().__init__(message)
         self.code = code
@@ -47,6 +49,75 @@ class PrimarySwitchBlocked(Exception):
         self.node_name = node_name
         self.next_node_id = next_node_id
         self.blocking_tasks = blocking_tasks
+        self.blocking_followings = blocking_followings or []
+
+
+async def _following_detail(store: RedisStore, followings: list[dict]) -> list[dict]:
+    """把跟单关系列表组装成对外明细（分组名从缓存查，缺失回退到 group_id）。"""
+    detail: list[dict] = []
+    for f in followings[:PRIMARY_BLOCKING_DETAIL_LIMIT]:
+        gid = str(f.get("group_id") or "")
+        group = await store.get_group(gid) if gid else None
+        detail.append({
+            "group_id": gid,
+            "group_name": (group or {}).get("name") or gid,
+            "leader_user_id": f.get("leader_user_id"),
+            "follower_user_id": f.get("follower_user_id"),
+            "joined_at": f.get("joined_at"),
+        })
+    return detail
+
+
+async def list_followings_for_node(node_id: str) -> list[dict]:
+    """某节点当前的跟单关系（精简明细）。
+
+    与 precheck_following_blocking 同源（follow_service.list_for_node），
+    区别是这里不抛异常；用于前端在「设置主节点」前预查 —— 命中就提前禁用
+    提交按钮 / 改文案，避免用户点下去才吃一个 409。
+    """
+    return await follow_service.list_for_node(node_id)
+
+
+async def precheck_following_blocking(
+    store: RedisStore,
+    *,
+    target_node_id: str,
+    next_node_id: Optional[str],
+) -> None:
+    """阶段 0：检查待晋升节点当前是否仍在跟单。命中阻塞即抛 PrimarySwitchBlocked。
+
+    阻塞判据：group_follower_node 中 node_id == target_node_id 存在记录，
+    即该节点正在作为「跟单方」参与别人的带单源分组。
+
+    为什么必须拦：主节点不可用于跟单（主节点要保持独立），而跟单关系是**持久
+    状态**。若放任升主，只能把跟单关系静默删掉 —— 用户的跟单配置无声消失，
+    且该节点将同时具备「带单源」与「跟单方」两种互斥身份。
+    因此这里选择**显式拒绝**，让用户先自己把节点移出跟单。
+
+    放行条件（唯一）：
+      该节点没有任何跟单关系 → 放行。
+    """
+    followings = await follow_service.list_for_node(target_node_id)
+    if not followings:
+        return
+
+    detail = await _following_detail(store, followings)
+
+    node = await store.get_node(target_node_id) or {}
+    node_name = node.get("name") or target_node_id
+
+    raise PrimarySwitchBlocked(
+        code="primary_switch_following_blocked",
+        message=(
+            f"节点 {node_name} 当前有 {len(followings)} 个跟单分组，"
+            "主节点不可用于跟单，请先到【带单】页把该节点移出跟单后再设置主节点"
+        ),
+        node_id=target_node_id,
+        node_name=node_name,
+        next_node_id=next_node_id,
+        blocking_tasks=[],
+        blocking_followings=detail,
+    )
 
 
 async def precheck_active_blocking(
@@ -460,10 +531,14 @@ async def set_primary(
     设置为 True 时会把同 owner 下其它节点的主节点标记全部清掉，保证唯一性。
     取消时只清本节点。权限与归属校验由路由层完成（先 owned_node_or_404）。
 
-    阶段 0：被替换 / 被取消的旧主节点上若仍有非终态子任务
-    （GroupTaskDispatch.status NOT IN SUBTASK_TERMINAL），整个动作会被
-    PrimarySwitchBlocked 异常拦截。事务内、外各做一次校验：事务外拦截绝大多数
-    场景，事务内拦截"阶段 0 通过后到 _locked_node 之间"极小窗口期新增的 in-flight。
+    阶段 0：两种阻塞前置，都用 PrimarySwitchBlocked 异常拦截。
+    A. 待晋升的节点当前**仍在跟单**（group_follower_node 有记录）-> 拒绝。
+       主节点不可用于跟单（主节点要保持独立），而跟单关系是持久状态；
+       放任升主只会把用户的跟单配置静默删掉，所以显式拒绝，让用户先自己移出。
+    B. 被替换 / 被取消的旧主节点上仍有非终态子任务
+       （GroupTaskDispatch.status NOT IN SUBTASK_TERMINAL）-> 拒绝。
+    两者都在事务内、外各做一次校验：事务外拦截绝大多数场景，事务内拦截
+    "阶段 0 通过后到 _locked_node 之间"极小窗口期新增的 in-flight / 跟单。
     """
     # ── 收集 victim ── 阶段 0 和阶段 2 共用；必须在阶段 0 之前抓取，
     # 否则阶段 0 / 事务里把 victim 的 is_primary 清掉后，阶段 2 找不到 victim。
@@ -473,6 +548,14 @@ async def set_primary(
         )
 
     # ── 阶段 0（事务外预检）──
+    # 顺序：先查「待晋升节点自身是否在跟单」（用户直接操作的对象，最贴身），
+    # 再查「被替换的旧主节点是否有在跑任务」。
+    if is_primary:
+        await precheck_following_blocking(
+            store,
+            target_node_id=node_id,
+            next_node_id=node_id,
+        )
     for vid in victims:
         # 不抛错就继续；任一 victim 命中阻塞则由异常上抛
         await precheck_active_blocking(
@@ -492,6 +575,12 @@ async def set_primary(
             return node_row_to_dict(row), []
 
         # ── 阶段 0（事务内重检）── 双重保险，挡住事务外阶段 0 之后的极小窗口
+        if is_primary:
+            await precheck_following_blocking(
+                store,
+                target_node_id=node_id,
+                next_node_id=node_id,
+            )
         for vid in victims:
             await precheck_active_blocking(
                 store,
@@ -535,8 +624,11 @@ async def set_primary(
     for r in affected:
         await store.cache_node(node_row_to_dict(r))
 
-    # 跟单节点被设为 / 取消为主节点时清理跟单关系：
-    # - 升为主节点：主节点不可用于跟单，否则它会同时当带单源和跟单方，语义冲突；
+    # 跟单关系清理（升为主节点时）：
+    # - 正常路径：阶段 0 的 precheck_following_blocking 已经拦下「仍在跟单」的节点，
+    #   不会走到这里，所以正常情况下这里是无操作。
+    # - 兜底：阶段 0 与本次清理之间的极小窗口期若新加入了跟单关系，
+    #   这里把它清掉，避免该节点同时当带单源和跟单方（语义冲突）。
     # - 取消主节点：重新具备跟单资格，但不会自动重新加入，保持用户显式操作。
     if is_primary:
         await follow_service.remove_node_followings(store, node_id)

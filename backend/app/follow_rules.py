@@ -77,6 +77,93 @@ def market_for_template(template_id: object | None) -> frozenset[str]:
     return frozenset()
 
 
+# ---------------------------------------------------------------------------
+# 暂停接单（两个市场各一个开关）
+# ---------------------------------------------------------------------------
+#
+# 「暂停」的语义（两个市场完全一致）：
+#   ① 新的客户无法再加入该市场名下的跟单分组；
+#   ② 已有跟单关系与在跑任务**不动**，等跟单员自行移出；
+#   ③ 之后触发的信号只发主节点，不再下发给跟单节点。
+#
+# 两个市场各自一个开关（users.follow_paused / users.ai_follow_paused）：
+# 一个带单员可能同时做普通带单与 AI 机器人，合并成一个开关就无法表达
+# 「只停一边」。分发时按**分组所属模版**决定取用哪一个 ——
+# 模版白名单在这里落地，而不是靠每个调用方记得加判断。
+PAUSED_FOLLOW_REASON = "该带单员已暂停带单，不再接收新的跟单"
+PAUSED_AI_REASON = "该机器人主人已暂停 AI 跟单，不再接收新的跟单"
+
+
+def pause_flags_for_template(template_id: object | None) -> tuple[bool, bool]:
+    """该模版所属市场应取用哪个暂停标志。
+
+    返回 (用带单市场暂停标志, 用 AI 市场暂停标志)：
+    - tpl_1（AI 智能加仓）      -> (False, True)
+    - tpl_2 / tpl_3（趋势/网格） -> (True, False)
+    - 未知模版                  -> (False, False)：两个市场都不收，取哪个都不合适。
+
+    调用方据此**按分组**取对应的暂停状态，两个市场互不串台。
+    """
+    tid = str(template_id or "").strip().lower()
+    if tid == strategy_templates.TEMPLATE_1_ID:
+        return False, True
+    if tid in (strategy_templates.TEMPLATE_2_ID, strategy_templates.TEMPLATE_3_ID):
+        return True, False
+    return False, False
+
+
+def paused_marketable_reason(
+    paused: bool, *, ai: bool = False,
+) -> Optional[str]:
+    """暂停时的「不可跟单」人读原因；未暂停返回 None。
+
+    ai=True 取 AI 市场的文案，否则取带单市场的 —— 两个市场文案不同，
+    跟单员看到时才知道是哪个市场停了。
+    """
+    if not paused:
+        return None
+    return PAUSED_AI_REASON if ai else PAUSED_FOLLOW_REASON
+
+
+def paused_dispatch_note(template_id: object | None) -> str:
+    """暂停时写在任务上的提示语（说明为什么只发了主节点）。
+
+    按分组所属模版取对应市场的文案 —— 任务列表里一眼能看出是哪个市场停了。
+    """
+    use_follow, use_ai = pause_flags_for_template(template_id)
+    if use_ai:
+        return "主人已暂停 AI 跟单，本次信号只下发主节点"
+    return "主人已暂停带单，本次信号只下发主节点"
+
+
+def paused_dispatch_targets(
+    group: dict, nodemap: dict[str, dict], online_ids: set[str],
+    primary_node_id: Optional[str],
+) -> list[str]:
+    """暂停接单时，该分组本次应下发的节点：**严格只发主节点**。
+
+    与【交易】界面的「带单开关关闭」完全同构：那里由前端把
+    `node_ids` 收窄到主节点，这里是服务端持久状态，必须在分发侧做同样的收窄
+    （否则 webhook / 限价监听 / 其它页面的信号都会绕过前端开关）。
+
+    返回空集的两种情况：
+    - 主节点不在本分组内 —— 调用方另行退回 owner 口径（见分发层）；
+    - 主节点已禁用 / 不在线 —— 与 OrderDialog 同口径：收窄到不可达的主节点
+      等于本次不下发，而不是改发给别人。
+    """
+    if not primary_node_id:
+        return []
+    target = str(primary_node_id).strip().lower()
+    for nid in group_rules.member_ids(group):
+        if nid.strip().lower() != target:
+            continue
+        node = nodemap.get(nid)
+        if node is None or not node.get("enabled", True) or nid not in online_ids:
+            return []
+        return [nid]
+    return []
+
+
 def market_reject_reason(template_id: object | None, market: frozenset[str]) -> Optional[str]:
     """该模版不属于指定市场时的人读原因（详情页置灰提示用）。"""
     if template_in_market(template_id, market):
@@ -299,18 +386,29 @@ def marketable_reason(
     group: dict, leader_has_capability: bool, primary_node_id: Optional[str],
     template_id: object | None = None,
     market: frozenset[str] = FOLLOW_MARKET_TEMPLATE_IDS,
+    paused: bool = False,
+    ai: bool = False,
 ) -> Optional[str]:
     """
     该分组当前是否还在指定市场；下架时返回人读原因，可跟单返回 None。
 
-    三种下架：带单员被撤销能力、分组不再包含其当前主节点（切换主节点后旧分组不再对外接单）、
-    分组绑定的模版不在该市场内（如 AI 智能加仓策略不在普通带单市场）。
+    四种下架：带单员被撤销能力、带单员暂停接单、分组不再包含其当前主节点
+    （切换主节点后旧分组不再对外接单）、分组绑定的模版不在该市场内
+    （如 AI 智能加仓策略不在普通带单市场）。
     跟单员仍可自行移出，这里只负责解释。
 
-    判断顺序：能力 / 主节点在前（更根本），模版市场其次，分组禁用最后。
+    判断顺序：能力 / 暂停在前（更根本），主节点其次，模版市场再次，分组禁用最后。
+    暂停与能力撤销都是主人级的「对外接单」开关，能力撤销更强（连分组都不再对外接单），
+    暂停只是「接单但只发主节点」。
+
+    paused / ai 由调用方传入**对应市场**的暂停状态 —— 两个市场各用一个开关，
+    传错市场会让 AI 暂停误报到带单市场（反之亦然）。
     """
     if not leader_has_capability:
         return "该带单员已关闭带单，本分组不再下发新信号"
+    pause_reason = paused_marketable_reason(paused, ai=ai)
+    if pause_reason:
+        return pause_reason
     if not group_contains_primary(group, primary_node_id):
         return "该带单员已更换主节点，本分组不再对外接单"
     if template_out_of_market(template_id, market):

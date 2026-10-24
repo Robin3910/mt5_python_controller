@@ -84,6 +84,9 @@ async def me(p: Principal = Depends(get_principal)):
         roles=[RoleRef(**r) for r in roles],
         menus=permissions.normalize_menu_codes(p.menus),
         capabilities=permissions.normalize_capability_codes(p.capabilities),
+        # 我自己的两个「暂停接单」开关（两个市场各自独立）
+        follow_paused=bool(getattr(user, "follow_paused", False)),
+        ai_follow_paused=bool(getattr(user, "ai_follow_paused", False)),
     )
 
 

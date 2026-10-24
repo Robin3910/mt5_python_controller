@@ -5,6 +5,8 @@ import type {
   AiLeavePayload,
   AiLeaveResponse,
   AiMeResponse,
+  AiPausePayload,
+  AiPauseResponse,
   AiRobotDetailResponse,
   AiRobotListResponse,
 } from './types'
@@ -45,5 +47,17 @@ export async function joinAiFollow(payload: AiJoinPayload): Promise<AiJoinRespon
 /** 移出 AI 跟单（在跑任务默认不停止） */
 export async function leaveAiFollow(payload: AiLeavePayload): Promise<AiLeaveResponse> {
   const { data } = await api.post<AiLeaveResponse>('/api/ai-follow/leave', payload)
+  return data
+}
+
+/**
+ * 暂停 / 恢复【AI 交易】市场对外接单。
+ *
+ * 暂停后：新客户无法加入 AI 分组；新信号只发主节点。
+ * 已有跟单关系与在跑任务**不动** —— 等跟单员自行移出。
+ * 只影响 AI 市场（AI 智能加仓），带单市场用 setFollowPaused。
+ */
+export async function setAiFollowPaused(payload: AiPausePayload): Promise<AiPauseResponse> {
+  const { data } = await api.post<AiPauseResponse>('/api/ai-follow/pause', payload)
   return data
 }

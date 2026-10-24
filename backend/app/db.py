@@ -52,6 +52,32 @@ def _migrate_user_totp_columns(sync_conn) -> None:
             )
 
 
+def _migrate_users_follow_paused(sync_conn) -> None:
+    """users 的「暂停接单」四列：带单市场与 AI 市场各一个独立开关。
+
+    - follow_paused / follow_paused_at：暂停【带单】市场（tpl_2 趋势 / tpl_3 网格）
+    - ai_follow_paused / ai_follow_paused_at：暂停【AI 交易】市场（tpl_1）
+
+    两组各存各的，不合成一个布尔：一个带单员可能同时做普通带单与 AI 机器人，
+    合并后无法表达「只停一边」。
+
+    布尔列给 NOT NULL DEFAULT 0（存量用户一律视为未暂停，零行为变化），
+    时间列可空（未暂停时没有暂停时刻）。
+    """
+    inspector = inspect(sync_conn)
+    if "users" not in inspector.get_table_names():
+        return
+    cols = {c["name"] for c in inspector.get_columns("users")}
+    dialect = sync_conn.engine.dialect.name
+    bool_type = "TINYINT(1) NOT NULL DEFAULT 0" if dialect == "mysql" else "BOOLEAN NOT NULL DEFAULT 0"
+    for name in ("follow_paused", "ai_follow_paused"):
+        if name not in cols:
+            sync_conn.execute(text(f"ALTER TABLE users ADD COLUMN {name} {bool_type}"))
+    for name in ("follow_paused_at", "ai_follow_paused_at"):
+        if name not in cols:
+            sync_conn.execute(text(f"ALTER TABLE users ADD COLUMN {name} DATETIME"))
+
+
 def _migrate_dispatch_price_column(sync_conn) -> None:
     """为已存在的 signal_dispatch 表补充成交价位列（create_all 不会改已存在的表）。"""
     inspector = inspect(sync_conn)
@@ -372,6 +398,7 @@ async def init_db() -> None:
         await conn.run_sync(_drop_legacy_nodes_table)
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_migrate_user_totp_columns)
+        await conn.run_sync(_migrate_users_follow_paused)
         await conn.run_sync(_migrate_dispatch_price_column)
         await conn.run_sync(_migrate_signal_source_column)
         await conn.run_sync(_migrate_audit_columns)

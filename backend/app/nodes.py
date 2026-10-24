@@ -244,10 +244,14 @@ async def set_primary_node(
     同 owner 下其它节点的原主节点标记会被自动清掉，保证唯一性。归属校验沿用
     owned_node_or_404 普通用户不能动管理员名下的节点。
 
-    阻塞前置：被替换 / 被取消的旧主节点上仍有 in-flight 子任务时
-    返回 409 + blocking_tasks 明细。
-    路由不接受任何 force / 强制绕过参数 —— 唯一放行条件是"无 in-flight"。
+    阻塞前置（两种，都返回 409）：
+    1. 待晋升的节点当前**仍在跟单** -> code=primary_switch_following_blocked，
+       带 blocking_followings 明细。主节点不可用于跟单，跟单关系又是持久状态，
+       放任升主只会把用户的跟单配置静默删掉，所以这里显式拒绝。
+    2. 被替换 / 被取消的旧主节点上仍有 in-flight 子任务 -> code=primary_switch_blocked，
+       带 blocking_tasks 明细。
 
+    路由不接受任何 force / 强制绕过参数 —— 唯一放行条件是"无跟单 + 无 in-flight"。
     分组和策略不做迁移：新主节点触发信号时会自动创建新分组和策略。
     """
     await owned_node_or_404(store, p, node_id)
@@ -267,11 +271,35 @@ async def set_primary_node(
                 "node_name": e.node_name,
                 "next_node_id": e.next_node_id,
                 "blocking_tasks": e.blocking_tasks,
+                "blocking_followings": e.blocking_followings,
             },
         )
     if not d:
         raise HTTPException(status_code=404, detail="node not found")
     return await _to_node_out(store, d, await rbac_service.owner_names_for(p))
+
+
+@router.get("/{node_id}/followings")
+async def list_node_followings(
+    node_id: str,
+    store: RedisStore = Depends(get_store),
+    p: Principal = Depends(require_menu(MENU_NODES)),
+):
+    """某节点当前的跟单关系（精简明细）。
+
+    仅用于设置主节点前的轻量预查：前端在确认弹窗前先拉一次，若非空则禁用
+    提交按钮 / 改文案为「该节点有 N 个跟单，无法设为主节点」。权限与
+    set_primary 共享 owned_node_or_404。
+    """
+    await owned_node_or_404(store, p, node_id)
+    items = await node_service.list_followings_for_node(node_id)
+    node = await store.get_node(node_id) or {}
+    return {
+        "node_id": node_id,
+        "node_name": node.get("name") or node_id,
+        "count": len(items),
+        "items": items,
+    }
 
 
 @router.get("/{node_id}/active-tasks")

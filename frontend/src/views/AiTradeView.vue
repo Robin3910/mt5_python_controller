@@ -23,6 +23,7 @@ import {
   fetchMyAiFollowings,
   joinAiFollow,
   leaveAiFollow,
+  setAiFollowPaused,
 } from '@/api/aiFollow'
 import type {
   AiMyGroup,
@@ -30,6 +31,7 @@ import type {
   AiRobotDetailResponse,
   AiRobotSummary,
 } from '@/api/types'
+import { useAuthStore } from '@/stores/auth'
 import RobotIcon from '@/components/RobotIcon.vue'
 
 // 收益柱状图带 echarts，异步加载让图表库不进 AI 交易页首屏 chunk
@@ -39,6 +41,8 @@ const ProfitBarChart = defineAsyncComponent(() => import('@/components/ProfitBar
 const robots = ref<AiRobotSummary[]>([])
 const loading = ref(false)
 const keyword = ref('')
+
+const auth = useAuthStore()
 
 /** 绩效统计窗口（四档，与后端 deal_stats.WINDOWS 对齐） */
 const WINDOW_OPTIONS = [
@@ -385,6 +389,88 @@ function closeDetail() {
   detail.value = null
 }
 
+// ---------------------------------------------------------------------------
+// 暂停 AI 跟单（我的机器人才有的开关）
+// ---------------------------------------------------------------------------
+//
+// 「暂停」= 主人对外停止接单，但**不动**已有的跟单关系与在跑任务：
+//   ① 新客户无法再加入该机器人的 AI 分组（服务端写侧拦截，前端只做提示）；
+//   ② 已有跟单员与在跑任务**保留**，等他们自行移出；
+//   ③ 之后触发的信号只发主节点，不再下发给跟单节点（服务端分发侧收窄）。
+//
+// 与【带单】页的「暂停带单」是**两个独立开关**：
+// 一个主人可能同时做普通带单与 AI 机器人，停一边不该连累另一边。
+// 服务端按分组绑定的策略模版决定取用哪个标志（tpl_1 -> AI，tpl_2/tpl_3 -> 带单）。
+
+/** 暂停操作进行中（防止重复点击） */
+const pauseBusy = ref(false)
+
+/** 当前详情页是否处于「已暂停 AI 跟单」状态 */
+const detailPaused = computed<boolean>(() => detail.value?.robot.ai_follow_paused === true)
+
+/** 这个机器人是不是我自己的（主人才能暂停） */
+function isMyRobot(robot: AiRobotSummary): boolean {
+  const myId = auth.me?.user_id
+  return myId != null && robot.leader_user_id === myId
+}
+
+/**
+ * 切换暂停状态。
+ *
+ * 暂停是对外接单的动作 —— 跟单员点进来会看到「已暂停」，
+ * 所以必须二次确认，把影响说清楚再执行。
+ */
+async function togglePause() {
+  if (!detail.value) return
+  const robot = detail.value.robot
+  const myId = auth.me?.user_id
+  // 只有本人才能改这个开关 —— 服务端也会再校验一次。
+  if (myId == null || robot.leader_user_id !== myId) return
+
+  const next = !robot.ai_follow_paused
+  const name = robot.display_name || robot.username
+  try {
+    if (next) {
+      await ElMessageBox.confirm(
+        `暂停后，${name} 将不再接收新的 AI 跟单申请。\n\n` +
+          `· 已有跟单关系与在跑任务**保留**，等跟单员自行移出\n` +
+          `· 之后触发的信号只下发主节点，不再下发给跟单节点\n` +
+          `· 只影响 AI 智能加仓分组，不影响普通带单（趋势 / 网格）\n\n` +
+          `确认暂停 AI 跟单吗？`,
+        '暂停 AI 跟单',
+        { type: 'warning', confirmButtonText: '确认暂停', cancelButtonText: '再想想' },
+      )
+    } else {
+      await ElMessageBox.confirm(
+        `恢复后，${name} 将重新接受新的 AI 跟单申请，新信号也会重新下发给跟单节点。`,
+        '恢复 AI 跟单',
+        { type: 'info', confirmButtonText: '确认恢复', cancelButtonText: '取消' },
+      )
+    }
+  } catch {
+    // 用户取消
+    return
+  }
+
+  pauseBusy.value = true
+  try {
+    const res = await setAiFollowPaused({ leader_user_id: robot.leader_user_id, paused: next })
+    // 就地更新：详情页与列表共用同一份摘要，避免整页重拉。
+    detail.value.robot.ai_follow_paused = res.ai_follow_paused
+    const i = robots.value.findIndex((r) => r.leader_user_id === robot.leader_user_id)
+    if (i >= 0) robots.value[i].ai_follow_paused = res.ai_follow_paused
+    const mineRobot = mine.value.following.find((f) => f.robot.leader_user_id === robot.leader_user_id)
+    if (mineRobot) mineRobot.robot.ai_follow_paused = res.ai_follow_paused
+    ElMessage.success(res.ai_follow_paused ? '已暂停 AI 跟单' : '已恢复 AI 跟单')
+    // 列表与「我的 AI 跟单」的不可跟单标记依赖服务端口径，重拉一次最保险。
+    await refreshAll()
+  } catch (e) {
+    ElMessage.error(errText(e, next ? '暂停 AI 跟单失败' : '恢复 AI 跟单失败'))
+  } finally {
+    pauseBusy.value = false
+  }
+}
+
 async function refreshAll() {
   await Promise.all([loadRobots(), loadMine()])
 }
@@ -592,7 +678,9 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
               <span class="row robot-name">
                 <RobotIcon class="robot-avatar" :size="30" variant="iconfont" boxed />
                 <strong class="robot-name-text">{{ robotTitle(r) }}</strong>
-                <span v-if="!r.marketable" class="tag amber robot-flag">已下架</span>
+                <span v-if="isMyRobot(r)" class="tag blue robot-flag">我的</span>
+                <span v-if="r.ai_follow_paused" class="tag amber robot-flag">已暂停</span>
+                <span v-else-if="!r.marketable" class="tag amber robot-flag">已下架</span>
               </span>
               <span v-if="r.my_follow_node_count" class="tag green robot-flag">已跟</span>
               <span v-else class="tag robot-flag">未跟</span>
@@ -666,9 +754,31 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
             <span class="row robot-name">
               <RobotIcon class="robot-avatar" :size="34" variant="iconfont" boxed />
               <span class="robot-name-text">{{ robotTitle(detail.robot) }}</span>
+              <span v-if="isMyRobot(detail.robot)" class="tag blue robot-flag">我的</span>
+              <span v-if="detailPaused" class="tag amber robot-flag">已暂停 AI 跟单</span>
             </span>
-            <div class="muted">{{ primaryText(detail.robot) }}</div>
+            <div class="row" style="gap: 10px">
+              <span class="muted">{{ primaryText(detail.robot) }}</span>
+              <button
+                v-if="isMyRobot(detail.robot)"
+                class="btn-sm"
+                :class="detailPaused ? 'btn-ghost' : 'btn-warn-ghost'"
+                :disabled="pauseBusy"
+                @click="togglePause"
+              >
+                {{ detailPaused ? '恢复 AI 跟单' : '暂停 AI 跟单' }}
+              </button>
+            </div>
           </header>
+
+          <!-- 暂停提示：说清「不动什么、动什么」，避免主人误以为暂停会踢掉跟单员 -->
+          <div v-if="detailPaused" class="pause-banner">
+            <strong>AI 跟单已暂停</strong>
+            <span>
+              新的客户无法再加入该机器人的 AI 分组；已有的跟单关系与在跑任务保持不变，
+              等跟单员自行移出。之后触发的信号只下发主节点。
+            </span>
+          </div>
 
           <!-- 近 7 日收益柱状图（与手机端全屏详情同一份数据、同一口径） -->
           <div class="robot-detail-chart">
@@ -733,6 +843,7 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
               <span class="row robot-name">
                 <RobotIcon class="robot-avatar" :size="30" variant="iconfont" boxed />
                 <span class="robot-name-text">{{ robotTitle(e.robot) }}</span>
+                <span v-if="e.robot.ai_follow_paused" class="tag amber robot-flag">主人已暂停</span>
               </span>
               <span v-if="e.marketable" class="tag green">运行中</span>
               <span v-else class="tag amber">已下架</span>
@@ -907,7 +1018,8 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
               <span class="m-mine-name-row">
                 <RobotIcon :size="34" variant="iconfont" boxed />
                 <span class="m-mine-name">{{ robotTitle(e.robot) }}</span>
-                <span v-if="!e.marketable" class="tag amber m-mine-flag">已下架</span>
+                <span v-if="e.robot.ai_follow_paused" class="tag amber m-mine-flag">主人已暂停</span>
+                <span v-else-if="!e.marketable" class="tag amber m-mine-flag">已下架</span>
               </span>
             </div>
             <span v-if="e.marketable" class="tag green m-mine-flag">运行中</span>
@@ -957,7 +1069,30 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
             <div class="m-d-name-row">
               <RobotIcon :size="44" variant="iconfont" boxed />
               <div class="m-d-name">{{ robotTitle(detail.robot) }}</div>
+              <span v-if="isMyRobot(detail.robot)" class="tag blue robot-flag">我的</span>
+              <span v-if="detailPaused" class="tag amber robot-flag">已暂停</span>
             </div>
+
+            <!-- 暂停 AI 跟单（我的机器人才有的开关）：手机端整行通栏 -->
+            <button
+              v-if="isMyRobot(detail.robot)"
+              class="btn-sm m-d-pause-btn"
+              :class="detailPaused ? 'btn-ghost' : 'btn-warn-ghost'"
+              :disabled="pauseBusy"
+              @click="togglePause"
+            >
+              {{ detailPaused ? '恢复 AI 跟单' : '暂停 AI 跟单' }}
+            </button>
+
+            <!-- 暂停提示：说清「不动什么、动什么」 -->
+            <div v-if="detailPaused" class="pause-banner">
+              <strong>AI 跟单已暂停</strong>
+              <span>
+                新的客户无法再加入该机器人的 AI 分组；已有的跟单关系与在跑任务保持不变，
+                等跟单员自行移出。之后触发的信号只下发主节点。
+              </span>
+            </div>
+
             <!-- 副标题只说明「还有几个策略」，不再显示节点名 / MT5 账号 -->
             <div v-if="robotStrategyExtra(detail.robot)" class="m-d-node muted">
               {{ robotStrategyExtra(detail.robot) }}
@@ -1331,6 +1466,23 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
 .robot-avatar { margin: 0 2px; }
 .robot-flag { flex-shrink: 0; align-self: center; }
 .robot-sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
+
+/* 暂停提示条：说清「不动什么、动什么」，避免主人误以为暂停会踢掉跟单员 */
+.pause-banner {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 10px 0 4px;
+  padding: 10px 12px;
+  border: 1px solid rgba(245, 158, 11, 0.28);
+  border-radius: 8px;
+  background: rgba(245, 158, 11, 0.08);
+  color: #fbbf24;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.pause-banner strong { font-size: 13px; }
+.pause-banner span { color: var(--muted); }
 .robot-risk {
   display: flex;
   flex-wrap: wrap;
@@ -2068,6 +2220,14 @@ async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
     white-space: nowrap;
   }
   .m-d-node { margin-top: 3px; font-size: 12px; color: var(--m-label-3); }
+
+  /* 暂停 AI 跟单按钮：手机端整行通栏，触控区够大 */
+  .m-d-pause-btn {
+    width: 100%;
+    margin-top: 12px;
+    padding: 10px 12px;
+    font-size: 13px;
+  }
 
   .m-d-grid {
     display: grid;

@@ -7,7 +7,7 @@ import { ElDialog, ElMessage, ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/dialog/style/css'
 import 'element-plus/es/components/message/style/css'
 import 'element-plus/es/components/message-box/style/css'
-import { fetchLeaders, fetchLeaderDetail, fetchMyFollowings, joinFollow, leaveFollow } from '@/api/follow'
+import { fetchLeaders, fetchLeaderDetail, fetchMyFollowings, joinFollow, leaveFollow, setFollowPaused } from '@/api/follow'
 import type {
   FollowDetailResponse,
   FollowLeaderSummary,
@@ -109,6 +109,86 @@ function followerCountOf(leader: FollowLeaderSummary): number {
 function isMyLeader(leader: FollowLeaderSummary): boolean {
   const myId = auth.me?.user_id
   return myId != null && leader.leader_user_id === myId
+}
+
+// ---------------------------------------------------------------------------
+// 暂停带单（我的带单才有的开关）
+// ---------------------------------------------------------------------------
+//
+// 「暂停」= 主人对外停止接单，但**不动**已有的跟单关系与在跑任务：
+//   ① 新客户无法再加入我的跟单分组（服务端写侧拦截，前端只做提示）；
+//   ② 已有跟单员与在跑任务**保留**，等他们自行移出；
+//   ③ 之后触发的信号只发主节点，不再下发给跟单节点（服务端分发侧收窄）。
+//
+// 这与「交易」界面的「带单」开关关闭是同一件事，只是那里的开关是**单次信号**
+// 级别的（前端把 node_ids 收窄到主节点），这里的是**持久**状态（服务端收窄，
+// 覆盖 webhook / 限价监听等所有触发路径）。
+//
+// 只作用于带单市场（趋势 / 网格）；AI 市场（AI 智能加仓）有独立开关，
+// 在【AI 交易】页操作，两边互不影响。
+
+/** 暂停操作进行中（防止重复点击） */
+const pauseBusy = ref(false)
+
+/** 当前详情页是否处于「已暂停带单」状态 */
+const detailPaused = computed<boolean>(() => detail.value?.leader.follow_paused === true)
+
+/**
+ * 切换暂停状态。
+ *
+ * 暂停是不可逆的「对外接单」动作 —— 跟单员点进来会看到「已暂停」，
+ * 所以必须二次确认，把影响说清楚再执行。
+ */
+async function togglePause() {
+  if (!detail.value) return
+  const leader = detail.value.leader
+  const myId = auth.me?.user_id
+  // 只有本人（或管理员代操作他人）才能改这个开关 —— 服务端也会再校验一次。
+  if (myId == null || leader.leader_user_id !== myId) return
+
+  const next = !leader.follow_paused
+  const name = leader.display_name || leader.username
+  try {
+    if (next) {
+      await ElMessageBox.confirm(
+        `暂停后，${name} 将不再接收新的跟单申请。\n\n` +
+          `· 已有跟单关系与在跑任务**保留**，等跟单员自行移出\n` +
+          `· 之后触发的信号只下发主节点，不再下发给跟单节点\n` +
+          `· 只影响带单市场（趋势 / 网格），不影响 AI 智能加仓分组\n\n` +
+          `确认暂停带单吗？`,
+        '暂停带单',
+        { type: 'warning', confirmButtonText: '确认暂停', cancelButtonText: '再想想' },
+      )
+    } else {
+      await ElMessageBox.confirm(
+        `恢复后，${name} 将重新接受新的跟单申请，新信号也会重新下发给跟单节点。`,
+        '恢复带单',
+        { type: 'info', confirmButtonText: '确认恢复', cancelButtonText: '取消' },
+      )
+    }
+  } catch {
+    // 用户取消
+    return
+  }
+
+  pauseBusy.value = true
+  try {
+    const res = await setFollowPaused({ leader_user_id: leader.leader_user_id, paused: next })
+    // 就地更新：详情页与列表共用同一份 leader 摘要，避免整页重拉。
+    detail.value.leader.follow_paused = res.follow_paused
+    const i = leaders.value.findIndex((l) => l.leader_user_id === leader.leader_user_id)
+    if (i >= 0) leaders.value[i].follow_paused = res.follow_paused
+    // 「我的跟单」里也可能有自己（自跟单），一并同步。
+    const mineLeader = mine.value.following.find((f) => f.leader.leader_user_id === leader.leader_user_id)
+    if (mineLeader) mineLeader.leader.follow_paused = res.follow_paused
+    ElMessage.success(res.follow_paused ? '已暂停带单' : '已恢复带单')
+    // 列表与「我的跟单」的不可跟单标记依赖服务端口径，重拉一次最保险。
+    await Promise.all([loadLeaders(), loadMine()])
+  } catch (e) {
+    ElMessage.error(errText(e, next ? '暂停带单失败' : '恢复带单失败'))
+  } finally {
+    pauseBusy.value = false
+  }
 }
 
 /** 当前详情页的绩效 */
@@ -625,6 +705,7 @@ onMounted(() => {
                 <UserAvatar class="leader-avatar" :name="l.display_name || l.username" :size="30" />
                 <strong class="leader-name-text">{{ l.display_name || l.username }}</strong>
                 <span v-if="isMyLeader(l)" class="tag blue leader-mine">我的</span>
+                <span v-if="l.follow_paused" class="tag amber leader-paused">已暂停带单</span>
               </span>
               <span v-if="l.my_follow_node_count" class="tag green">
                 已跟
@@ -689,8 +770,29 @@ onMounted(() => {
               <UserAvatar class="leader-avatar" :name="detail.leader.display_name || detail.leader.username" :size="30" />
               <span class="leader-name-text">跟单 · {{ detail.leader.display_name || detail.leader.username }}</span>
               <span v-if="isMyLeader(detail.leader)" class="tag blue leader-mine">我的</span>
+              <span v-if="detailPaused" class="tag amber leader-paused">已暂停带单</span>
             </strong>
-            <button class="btn-sm btn-ghost" @click="detail = null">返回列表</button>
+            <div class="row" style="gap: 8px">
+              <button
+                v-if="isMyLeader(detail.leader)"
+                class="btn-sm"
+                :class="detailPaused ? 'btn-ghost' : 'btn-warn-ghost'"
+                :disabled="pauseBusy"
+                @click="togglePause"
+              >
+                {{ detailPaused ? '恢复带单' : '暂停带单' }}
+              </button>
+              <button class="btn-sm btn-ghost" @click="detail = null">返回列表</button>
+            </div>
+          </div>
+
+          <!-- 暂停提示：说清「不动什么、动什么」，避免主人误以为暂停会踢掉跟单员 -->
+          <div v-if="detailPaused" class="pause-banner">
+            <strong>带单已暂停</strong>
+            <span>
+              新的客户无法再加入你的跟单分组；已有的跟单关系与在跑任务保持不变，
+              等跟单员自行移出。之后触发的信号只下发主节点。
+            </span>
           </div>
 
           <!-- 跟单统计卡片（真实成交聚合） -->
@@ -804,6 +906,7 @@ onMounted(() => {
                     </span>
                   </span>
                   <span v-if="isMyLeader(f.leader)" class="tag blue leader-mine">我的</span>
+                  <span v-if="f.leader.follow_paused" class="tag amber leader-paused">已暂停带单</span>
                 </strong>
                 <div class="row" style="gap: 8px">
                   <span v-if="!f.marketable" class="tag amber">{{ f.unmarketable_reason || '该带单员已关闭带单' }}</span>
@@ -1088,6 +1191,7 @@ onMounted(() => {
                 <UserAvatar :name="f.leader.display_name || f.leader.username" :size="34" />
                 <span class="m-mine-name">{{ f.leader.display_name || f.leader.username }}</span>
                 <span v-if="isMyLeader(f.leader)" class="tag blue m-mine-flag">我的</span>
+                <span v-if="f.leader.follow_paused" class="tag amber m-mine-flag">已暂停带单</span>
               </span>
               <span v-if="!f.marketable" class="tag amber m-mine-tag">
                 {{ f.unmarketable_reason || '已关闭带单' }}
@@ -1143,6 +1247,27 @@ onMounted(() => {
               <UserAvatar :name="detail.leader.display_name || detail.leader.username" :size="44" />
               <div class="m-d-name">{{ detail.leader.display_name || detail.leader.username }}</div>
               <span v-if="isMyLeader(detail.leader)" class="tag blue m-mine-flag">我的</span>
+              <span v-if="detailPaused" class="tag amber m-mine-flag">已暂停带单</span>
+            </div>
+
+            <!-- 暂停带单（我的带单才有的开关）：手机端放这里，桌面端在详情标题右侧 -->
+            <button
+              v-if="isMyLeader(detail.leader)"
+              class="btn-sm m-d-pause-btn"
+              :class="detailPaused ? 'btn-ghost' : 'btn-warn-ghost'"
+              :disabled="pauseBusy"
+              @click="togglePause"
+            >
+              {{ detailPaused ? '恢复带单' : '暂停带单' }}
+            </button>
+
+            <!-- 暂停提示：说清「不动什么、动什么」 -->
+            <div v-if="detailPaused" class="pause-banner">
+              <strong>带单已暂停</strong>
+              <span>
+                新的客户无法再加入你的跟单分组；已有的跟单关系与在跑任务保持不变，
+                等跟单员自行移出。之后触发的信号只下发主节点。
+              </span>
             </div>
 
             <div class="m-d-grid">
@@ -1359,6 +1484,34 @@ onMounted(() => {
 .leader-mine {
   flex-shrink: 0;
   align-self: center;
+}
+
+/* 「已暂停带单」标记：与「我的」同款标签，但用告警色 —— 主人一眼能看出
+   自己的带单当前是收口状态（列表里的「我的」那栏也要挂） */
+.leader-paused {
+  flex-shrink: 0;
+  align-self: center;
+}
+
+/* 暂停提示条：说清「不动什么、动什么」，避免主人误以为暂停会踢掉跟单员 */
+.pause-banner {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 10px 0 4px;
+  padding: 10px 12px;
+  border: 1px solid rgba(245, 158, 11, 0.28);
+  border-radius: 8px;
+  background: rgba(245, 158, 11, 0.08);
+  color: #fbbf24;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.pause-banner strong {
+  font-size: 13px;
+}
+.pause-banner span {
+  color: var(--muted);
 }
 
 /* 带单员列表里的 4 项统计
@@ -2406,6 +2559,13 @@ onMounted(() => {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  /* 暂停带单按钮：手机端整行通栏，触控区够大（不与返回按钮抢位置） */
+  .m-d-pause-btn {
+    width: 100%;
+    margin-top: 12px;
+    padding: 10px 12px;
+    font-size: 13px;
   }
   .m-d-node { margin-top: 3px; font-size: 12px; }
 

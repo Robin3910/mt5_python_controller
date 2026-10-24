@@ -990,6 +990,10 @@ class MeOut(BaseModel):
     roles: list[RoleRef] = Field(default_factory=list)
     menus: list[str] = Field(default_factory=list)
     capabilities: list[str] = Field(default_factory=list)
+    # 我自己的两个「暂停接单」开关（两个市场各自独立）。
+    # 前端据此提示「即使打开带单开关，信号也只下发主节点」。
+    follow_paused: bool = False
+    ai_follow_paused: bool = False
 
 
 class MenuOut(BaseModel):
@@ -1068,6 +1072,10 @@ class FollowLeaderSummary(BaseModel):
     follower_count: int = 0
     # 聚合缓存是否命中（未命中 = 该带单员暂无成交数据）
     perf_available: bool = False
+    # 是否已暂停【带单】市场对外接单（趋势 / 网格分组）。
+    # 暂停 = 新客户无法加入 + 新信号只发主节点；已有跟单关系与在跑任务不动。
+    # 只影响带单市场，AI 市场有独立的 ai_follow_paused。
+    follow_paused: bool = False
 
 
 class FollowLeaderListResponse(BaseModel):
@@ -1136,6 +1144,23 @@ class FollowLeaveRequest(BaseModel):
     group_ids: list[str] = Field(min_length=1, max_length=50)
     node_ids: list[str] = Field(min_length=1, max_length=50)
     close_tasks: bool = False
+
+
+class FollowPauseRequest(BaseModel):
+    """暂停 / 恢复带单（【带单】市场）。
+
+    leader_user_id 必须是操作者自己（或管理员代操作他人）；
+    paused=True 暂停，False 恢复。
+    """
+    leader_user_id: int = Field(ge=1)
+    paused: bool
+
+
+class FollowPauseResponse(BaseModel):
+    leader_user_id: int
+    follow_paused: bool
+    # 暂停时刻（Unix 秒）；恢复后为 None
+    paused_at: Optional[float] = None
 
 
 class FollowLeaveResponse(BaseModel):
@@ -1208,6 +1233,10 @@ class AiRobotSummary(BaseModel):
     perf_window: str = "30d"
     # 跟单人数（AI 市场内跟了该机器人的去重节点数）
     follower_count: int = 0
+    # 是否已暂停【AI 交易】市场对外接单（AI 智能加仓分组）。
+    # 暂停 = 新客户无法加入 + 新信号只发主节点；已有跟单关系与在跑任务不动。
+    # 只影响 AI 市场，带单市场有独立的 follow_paused。
+    ai_follow_paused: bool = False
 
 
 class AiRobotListResponse(BaseModel):
@@ -1297,6 +1326,23 @@ class AiLeaveRequest(BaseModel):
     node_ids: list[str] = Field(min_length=1, max_length=50)
     # False = 在跑任务不停止，继续按策略运行至结束（与带单同一口径）
     close_tasks: bool = False
+
+
+class AiPauseRequest(BaseModel):
+    """暂停 / 恢复 AI 跟单（【AI 交易】市场）。
+
+    leader_user_id 必须是操作者自己（或管理员代操作他人）；
+    paused=True 暂停，False 恢复。
+    """
+    leader_user_id: int = Field(ge=1)
+    paused: bool
+
+
+class AiPauseResponse(BaseModel):
+    leader_user_id: int
+    ai_follow_paused: bool
+    # 暂停时刻（Unix 秒）；恢复后为 None
+    paused_at: Optional[float] = None
 
 
 class AiLeaveResponse(BaseModel):

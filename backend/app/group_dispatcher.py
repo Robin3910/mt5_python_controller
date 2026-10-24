@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
 from typing import Optional
 
 from . import (
@@ -57,6 +58,21 @@ logger = logging.getLogger(__name__)
 SIGNAL_DISPATCH_MODE = "group"
 # 热推单节点发送封顶，避免半死 WS 拖住保存后的后台任务。
 STRATEGY_UPDATE_SEND_TIMEOUT = 2.0
+
+
+@dataclass(frozen=True)
+class LeaderState:
+    """分组所有者的带单状态快照（一次查询拿全，避免重复打 IO）。
+
+    两个暂停标志各自对应一个市场：follow_paused 管带单市场（趋势/网格），
+    ai_follow_paused 管 AI 市场（AI 智能加仓）。分发时按分组所属模版取用
+    对应那个 —— 暂停一边不影响另一边。
+    """
+
+    enabled: bool            # 是否仍持有 follow_leader 能力
+    follow_paused: bool      # 带单市场是否已暂停接单
+    ai_follow_paused: bool  # AI 市场是否已暂停接单
+    primary_node_id: Optional[str]  # 当前主节点 id（带单源）
 
 
 def build_strategy_start_command(
@@ -177,8 +193,11 @@ class GroupDispatcher:
         self, group: dict, nodemap: dict[str, dict], online_ids: set[str],
         *, signal: Optional[TradingSignal] = None,
         strategy: Optional[dict] = None,
-    ) -> list[str]:
-        """本次分发的有效节点，串起 跟单员准入 / 跟单市场准入 / 节点定向。
+    ) -> tuple[list[str], Optional[str]]:
+        """本次分发的有效节点，串起 跟单员准入 / 跟单市场准入 / 暂停接单 / 节点定向。
+
+        返回 (有效节点列表, 暂停提示语)。暂停提示语仅在「因暂停而收窄」时非空，
+        用来在任务上留一句人话原因（否则主节点不在线时会误报「分组无有效节点」）。
 
         三种情况处理准入（带单员是否仍有 follow_leader 能力）：
         1. 没有跟单成员 -> 跟改动前完全一致（owner 成员口径，零行为变化）；
@@ -192,48 +211,100 @@ class GroupDispatcher:
         天然互不串台。模版未知（两个市场都不收）时保守退回 owner 口径 ——
         宁可漏发也不误发。
 
+        暂停接单：主人暂停对应市场后，新信号**只发主节点**（与【交易】界面的
+        「带单开关关闭」同构，但这里是服务端持久状态，webhook / 限价监听等
+        非前端发起的信号也必须被收窄）。暂停按**分组所属模版**取对应市场的
+        标志 —— 暂停带单不影响 AI 分组，反之亦然。
+        **只影响新信号**：已在跑的子任务不终止（由各自自然结束），
+        CLOSE 信号走 `_dispatch_close`（按活动子任务筛），完全不受暂停影响 ——
+        否则跟单节点的持仓会平不掉。
+
         节点定向（OrderDialog「带单」关闭 / 节点定向 webhook）：
         信号带 node_ids 时，最终下发集合**按 node_ids 收窄**，
         留一个稳定的可解释口径：「带单关 ⇒ 主节点」「带单开 ⇒ 全部参与者」。
         空列表视为不限制。
         """
         base = group_rules.effective_node_ids(group, nodemap, online_ids)
+        pause_note: Optional[str] = None
         if group_rules.has_followers(group):
-            if not await self._leader_still_enabled(group):
+            template_id = (strategy or {}).get("template_id")
+            state = await self._leader_state(group, nodemap)
+            if not state.enabled:
                 base = group_rules.owner_effective_node_ids(group, nodemap, online_ids)
-            elif not follow_rules.market_for_template(
-                (strategy or {}).get("template_id"),
-            ):
+            elif not follow_rules.market_for_template(template_id):
                 # 未知模版：两个跟单市场都不收，跟单节点不接收新信号（保守）
                 base = group_rules.owner_effective_node_ids(group, nodemap, online_ids)
+            elif self._paused_for(template_id, state):
+                # 暂停中：严格只发主节点（跟单成员与 owner 其它成员都不收）
+                if follow_rules.group_contains_primary(group, state.primary_node_id):
+                    base = follow_rules.paused_dispatch_targets(
+                        group, nodemap, online_ids, state.primary_node_id,
+                    )
+                else:
+                    # 本分组不含主节点（不是带单源分组，理论上不会有跟单成员）：
+                    # 退回 owner 口径，跟单节点照常不收信号
+                    base = group_rules.owner_effective_node_ids(group, nodemap, online_ids)
+                pause_note = follow_rules.paused_dispatch_note(template_id)
         if signal and getattr(signal, "node_ids", None):
             wanted = {str(n).strip().lower() for n in signal.node_ids if n}
             base = [nid for nid in base if nid.lower() in wanted]
-        return base
+        return base, pause_note
 
-    async def _leader_still_enabled(self, group: dict) -> bool:
-        """分组所有者是否仍持有 follow_leader 能力。
+    @staticmethod
+    def _paused_for(template_id: object | None, state: "LeaderState") -> bool:
+        """该分组是否处于「暂停接单」状态。
+
+        按分组所属模版取用对应市场的标志 —— 两个市场各停各的：
+        暂停带单不影响 AI 分组，反之亦然。
+        """
+        use_follow, use_ai = follow_rules.pause_flags_for_template(template_id)
+        if use_follow:
+            return state.follow_paused
+        if use_ai:
+            return state.ai_follow_paused
+        return False
+
+    async def _leader_state(
+        self, group: dict, nodemap: Optional[dict[str, dict]] = None,
+    ) -> "LeaderState":
+        """分组所有者的带单状态：能力 + 暂停标志 + 主节点。
+
+        一次查询拿全三样 —— 查用户本来就为了取能力，暂停标志与主节点
+        顺手读出来，不额外打 IO。
+
+        暂停标志两个都返回：调用方按**分组所属模版**取用对应那个
+        （见 `_paused_for`），不在这里判模版 —— 同一个带单员名下可能同时有
+        带单分组与 AI 分组，只有分组才知道自己属于哪个市场。
 
         所有者是管理员（owner_user_id 为空）时没有对应的「带单员用户」，
         按不可带单处理 —— 带单源必须挂在某个用户的角色能力上。
         """
         owner = permissions.normalize_owner(group.get("owner_user_id"))
         if owner is None:
-            return False
+            return LeaderState(False, False, False, None)
         try:
             user = await user_service.get_user_by_id(owner)
             if not user or not user.is_active:
-                return False
+                return LeaderState(False, False, False, None)
             principal = await rbac_service.load_principal(self.store, user.username)
         except Exception:  # noqa: BLE001
             # 鉴权侧临时故障不应放大成「所有跟单节点收不到信号」，按仍可带单处理
             logger.warning(
                 "leader capability lookup failed for group %s", group.get("group_id"),
             )
-            return True
+            return LeaderState(True, False, False, None)
         if principal is None:
-            return False
-        return permissions.can_be_leader(principal)
+            return LeaderState(False, False, False, None)
+        primary_id: Optional[str] = None
+        if nodemap:
+            primary = follow_rules.primary_node_of(list(nodemap.values()), owner)
+            primary_id = str(primary.get("node_id")) if primary else None
+        return LeaderState(
+            enabled=permissions.can_be_leader(principal),
+            follow_paused=bool(getattr(user, "follow_paused", False)),
+            ai_follow_paused=bool(getattr(user, "ai_follow_paused", False)),
+            primary_node_id=primary_id,
+        )
 
     # ------------------------------------------------------------------
     # 分组筛选
@@ -589,7 +660,7 @@ class GroupDispatcher:
     ) -> dict:
         """单个分组的处理：建主任务 -> 选节点 -> 逐节点抢占位并下发。"""
         mode = group_rules.normalize_dispatch_mode(group.get("dispatch_mode"))
-        effective = await self._effective_with_follows(
+        effective, pause_note = await self._effective_with_follows(
             group, nodemap, online_ids, signal=signal, strategy=strategy,
         )
 
@@ -606,6 +677,13 @@ class GroupDispatcher:
 
         skip_reason = group_rules.group_skip_reason(group, effective)
         if skip_reason:
+            # 暂停收窄后主节点恰好不在线时，group_skip_reason 会说「成员均未启用或不在线」，
+            # 那是误导 —— 真正的原因是主人暂停了接单。这条优先，附带说明主节点不可达。
+            if pause_note:
+                skip_reason = (
+                    f"{pause_note}（主节点当前不可用，本次未下发）"
+                    if not effective else pause_note
+                )
             await group_persist.mark_task_skipped(task_id, skip_reason)
             logger.info("group %s skipped: %s", group["group_id"], skip_reason)
             return self._result(group, mode, 0, "skipped", skip_reason, task_id)

@@ -600,8 +600,8 @@ def test_delete_node_cascades_followings(client):
     assert me.json()["summary"]["follow_node_count"] == 0, "节点删除应清理跟单"
 
 
-def test_set_primary_cascades_followings(client):
-    """跟单节点升为主节点 -> 跟单关系自动清理（主节点不可跟单）。"""
+def test_set_primary_blocked_by_followings(client):
+    """跟单节点升为主节点 -> **被拒绝**（主节点不可跟单，跟单关系不能被静默清掉）。"""
     admin_h = _login(client, "admin")
     alice, bob, a_primary, a_extra, b_primary, b_follow, a_group = _setup_leader_and_follower(
         client, admin_h,
@@ -614,13 +614,108 @@ def test_set_primary_cascades_followings(client):
     )
     me = client.get("/api/follow/me", headers=bob_h)
     assert me.json()["summary"]["follow_node_count"] == 1
-    # 把 b_follow 设为主节点
+
+    # 把仍在跟单的 b_follow 设为主节点 -> 应被拒绝
     p = client.post(
         f"/api/nodes/{b_follow}/primary", json={"is_primary": True}, headers=admin_h,
     )
-    assert p.status_code == 200, p.text
+    assert p.status_code == 409, p.text
+    detail = p.json()["detail"]
+    assert detail["code"] == "primary_switch_following_blocked", detail
+    assert detail["blocking_followings"], "应带跟单明细"
+    assert any(
+        f["group_id"] == a_group for f in detail["blocking_followings"]
+    ), f"明细应含被跟的分组：{detail}"
+
+    # 关键：跟单关系必须**原样保留**，不能被静默清掉
     me2 = client.get("/api/follow/me", headers=bob_h)
-    assert me2.json()["summary"]["follow_node_count"] == 0, "升主节点应清理跟单"
+    assert me2.json()["summary"]["follow_node_count"] == 1, "被拒绝时跟单关系不能丢"
+
+    # 节点也没有被升为主节点
+    nodes = client.get("/api/nodes", headers=admin_h).json()
+    assert not any(
+        n["node_id"] == b_follow and n["is_primary"] for n in nodes
+    ), "被拒绝时不应升为主节点"
+
+
+def test_set_primary_allowed_after_leaving_followings(client):
+    """移出跟单后 -> 同一节点即可正常设为主节点（限制只拦当下，不永久封禁）。"""
+    admin_h = _login(client, "admin")
+    alice, bob, a_primary, a_extra, b_primary, b_follow, a_group = _setup_leader_and_follower(
+        client, admin_h,
+    )
+    bob_h = _login(client, "bob")
+    client.post(
+        "/api/follow/join",
+        json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [b_follow]},
+        headers=bob_h,
+    )
+    blocked = client.post(
+        f"/api/nodes/{b_follow}/primary", json={"is_primary": True}, headers=admin_h,
+    )
+    assert blocked.status_code == 409, blocked.text
+
+    # 移出跟单
+    leave = client.post(
+        "/api/follow/leave",
+        json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [b_follow]},
+        headers=bob_h,
+    )
+    assert leave.status_code == 200, leave.text
+
+    ok = client.post(
+        f"/api/nodes/{b_follow}/primary", json={"is_primary": True}, headers=admin_h,
+    )
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["is_primary"] is True
+
+
+def test_set_primary_precheck_endpoint(client):
+    """GET /api/nodes/{id}/followings 预查接口：有跟单返回明细，无跟单返回空。"""
+    admin_h = _login(client, "admin")
+    alice, bob, a_primary, a_extra, b_primary, b_follow, a_group = _setup_leader_and_follower(
+        client, admin_h,
+    )
+    bob_h = _login(client, "bob")
+
+    # 还没跟单 -> count 0
+    r0 = client.get(f"/api/nodes/{b_follow}/followings", headers=admin_h)
+    assert r0.status_code == 200, r0.text
+    assert r0.json()["count"] == 0, r0.text
+
+    client.post(
+        "/api/follow/join",
+        json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [b_follow]},
+        headers=bob_h,
+    )
+    r1 = client.get(f"/api/nodes/{b_follow}/followings", headers=admin_h)
+    assert r1.status_code == 200, r1.text
+    body = r1.json()
+    assert body["count"] == 1, body
+    assert body["items"][0]["group_id"] == a_group, body
+
+
+def test_set_primary_unaffected_node_no_following(client):
+    """没有跟单的节点升主 -> 正常放行（限制不能误伤普通节点）。"""
+    admin_h = _login(client, "admin")
+    alice, bob, a_primary, a_extra, b_primary, b_follow, a_group = _setup_leader_and_follower(
+        client, admin_h,
+    )
+    bob_h = _login(client, "bob")
+    client.post(
+        "/api/follow/join",
+        json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [b_follow]},
+        headers=bob_h,
+    )
+    # b_primary 没有跟单 -> 可以升主
+    p = client.post(
+        f"/api/nodes/{b_primary}/primary", json={"is_primary": True}, headers=admin_h,
+    )
+    assert p.status_code == 200, p.text
+    assert p.json()["is_primary"] is True
+    # bob 的跟单关系不受影响
+    me = client.get("/api/follow/me", headers=bob_h)
+    assert me.json()["summary"]["follow_node_count"] == 1
 
 
 # ---------------------------------------------------------------------------

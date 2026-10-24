@@ -110,6 +110,26 @@ async def list_for_groups(group_ids: list[str]) -> list[dict]:
     return [_row_to_dict(r) for r in rows]
 
 
+async def list_for_node(node_id: str) -> list[dict]:
+    """某节点当前的全部跟单关系（升主节点前的阻塞预检用）。
+
+    口径：group_follower_node 中 node_id == 该节点的记录，即该节点正在
+    作为「跟单方」参与别人的带单源分组。
+    """
+    nid = str(node_id or "").strip()
+    if not nid:
+        return []
+    async with SessionLocal() as s:
+        rows = (
+            await s.execute(
+                select(GroupFollowerNode)
+                .where(GroupFollowerNode.node_id == nid)
+                .order_by(GroupFollowerNode.joined_at.asc(), GroupFollowerNode.id.asc())
+            )
+        ).scalars().all()
+    return [_row_to_dict(r) for r in rows]
+
+
 async def list_for_leaders(leader_user_ids: set[int] | list[int]) -> list[dict]:
     """若干带单员名下的全部跟单关系（统计「被多少节点跟随」用）。"""
     ids = [int(i) for i in (leader_user_ids or []) if i]

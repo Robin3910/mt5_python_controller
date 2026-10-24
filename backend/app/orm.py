@@ -131,6 +131,18 @@ class User(Base):
     totp_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     # 会话版本：禁用 / 改密 / 重置密码时 +1，签发时写进 JWT 的 ver，旧 token 随即失效
     token_version: Mapped[int] = mapped_column(Integer, default=0)
+    # —— 暂停接单（两个市场各自独立，互不影响）——
+    # follow_paused：暂停【带单】市场（tpl_2 趋势 / tpl_3 网格）对外接单。
+    #   语义 = 新客户无法加入跟单分组 + 之后的新信号只发主节点；
+    #   已有跟单关系与在跑任务**不动**，等跟单员自行移出。
+    # ai_follow_paused：暂停【AI 交易】市场（tpl_1 AI 智能加仓）对外接单，
+    #   语义与上面一致，但只约束 tpl_1 分组。
+    # 两列分开而不是合成一个：一个带单员可能同时做普通带单与 AI 机器人，
+    # 合并后无法表达「只停一边」。
+    follow_paused: Mapped[bool] = mapped_column(Boolean, default=False)
+    follow_paused_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    ai_follow_paused: Mapped[bool] = mapped_column(Boolean, default=False)
+    ai_follow_paused_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()

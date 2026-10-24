@@ -202,6 +202,18 @@ const isSaveMode = computed(() => props.mode === 'save')
  */
 const canCarry = computed(() => !isSaveMode.value && auth.canBeFollowLeader)
 
+/**
+ * 我是否已暂停【带单】市场。
+ *
+ * 暂停后，即使「带单」开关打开，信号也**只下发主节点** —— 收窄在服务端做
+ * （服务端按分组绑定的策略模版取用对应市场的暂停标志），覆盖 webhook /
+ * 限价监听等所有触发路径，前端开关绕不过去。
+ *
+ * 这个弹窗只发趋势（tpl_2）/ 网格（tpl_3）策略，都属带单市场；
+ * AI 智能加仓（tpl_1）在【AI 交易】页触发，那边有独立的 ai_follow_paused。
+ */
+const pausedInMarket = computed<string>(() => (auth.me?.follow_paused ? '带单' : ''))
+
 const STRATEGIES: { key: OrderStrategy; label: string; icon: string }[] = [
   { key: 'trend_market', label: '市价开仓', icon: '⚡' },
   { key: 'trend_limit', label: '限价开仓', icon: '◎' },
@@ -1675,6 +1687,13 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
           <span class="od-carry-label">带单</span>
           <!-- <span class="od-carry-sub">{{ carry ? '推到本分组全部节点' : '只推本分组主节点' }}</span> -->
         </div>
+        <!-- 暂停提示：主人点了「暂停带单 / 暂停 AI 跟单」后，
+             这个开关打开也不会下发给跟单节点 —— 收窄在**服务端**做，
+             覆盖 webhook / 限价监听等所有触发路径，前端开关绕不过去。
+             这里说明清楚，免得主人以为开关失灵。 -->
+        <div v-if="canCarry && pausedInMarket" class="od-carry-note">
+          你已暂停{{ pausedInMarket }}，本次信号仍只下发主节点。
+        </div>
         <div class="od-actions">
           <!-- 市价 / 限价：统一走 triggerStrategy（strategy 模型），前端推导 BUY/SEL方向并展示 -->
           <template v-if="isMarket || isLimit">
@@ -2245,6 +2264,15 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
 }
 .od-carry-label { font-weight: 600; color: var(--el-text-color-primary, #111827); }
 .od-carry-sub { font-size: 11px; }
+
+/* 暂停提示：主人已暂停接单时，「带单」开关看着能开但实际只发主节点。
+   摆在这里说清楚，免得主人以为开关失灵。 */
+.od-carry-note {
+  font-size: 11px;
+  color: #b45309;
+  line-height: 1.5;
+  max-width: 220px;
+}
 
 .od-actions {
   display: flex;

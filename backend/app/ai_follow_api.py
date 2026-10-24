@@ -47,6 +47,8 @@ from .models import (
     AiMeResponse,
     AiMyGroup,
     AiMyRobot,
+    AiPauseRequest,
+    AiPauseResponse,
     AiRobotDetailResponse,
     AiRobotGroupDetail,
     AiRobotListResponse,
@@ -274,6 +276,8 @@ async def list_ai_robots(
             "perf_window": win,
             # 跟单人数取预聚合里的值，回落到跟单关系表实时统计
             "follower_count": len(followers_by_leader.get(uid, set())),
+            # 暂停 AI 跟单状态：暂停后不再接受新跟单，新信号只发主节点
+            "ai_follow_paused": bool(getattr(u, "ai_follow_paused", False)),
         })
     # 已跟过的排前面，其余按用户名
     out.sort(key=lambda x: (x["my_follow_group_count"] == 0, x["username"]))
@@ -316,6 +320,10 @@ async def get_ai_robot_detail(
             mine_by_group.setdefault(f["group_id"], []).append(f["node_id"])
 
     detail_groups: list[dict] = []
+    # 暂停 AI 跟单：分组置灰 + 给出原因，让跟单员**看得出**这里已经收口，
+    # 而不是点了「确认跟单」才吃到一句 400。
+    # 写侧仍会再拦一次（写侧拦截才是权威，前端置灰只是提示）。
+    leader_paused = bool(getattr(user, "ai_follow_paused", False))
     for g in sorted(groups, key=follow_rules.leader_group_sort_key):
         gid = g["group_id"]
         strategy = strategies.get(g.get("strategy_id") or "")
@@ -324,6 +332,8 @@ async def get_ai_robot_detail(
             reason = "分组已禁用"
         elif strategy is None:
             reason = "已停止接收新信号（策略已停用）"
+        elif leader_paused:
+            reason = follow_rules.PAUSED_AI_REASON
         risk = _risk_summary(strategy)
         detail_groups.append({
             "group_id": gid,
@@ -400,6 +410,8 @@ async def get_ai_robot_detail(
             "performance": perf,
             "perf_window": win,
             "follower_count": follower_count,
+            # 暂停 AI 跟单状态（详情页据此显示「暂停 / 恢复 AI 跟单」按钮）
+            "ai_follow_paused": bool(getattr(user, "ai_follow_paused", False)),
         },
         groups=detail_groups,
         my_nodes=[_node_brief(n) for n in _viewable_follow_nodes(all_nodes, p)],
@@ -474,6 +486,9 @@ async def list_my_ai_followings(
                 g, has_cap, primary.get("node_id") if primary else None,
                 template_id=tmpl_map.get(str(g.get("strategy_id") or "")),
                 market=follow_rules.AI_MARKET_TEMPLATE_IDS,
+                # 主人暂停 AI 跟单 -> 存量关系保留但标不可再收新信号
+                paused=bool(getattr(user, "ai_follow_paused", False)),
+                ai=True,
             )
             # AI 特有：分组未开放 AI 跟单时，存量关系保留但标不可跟
             if reason is None and not g.get("accept_ai_follow"):
@@ -518,6 +533,8 @@ async def list_my_ai_followings(
                 "my_follow_group_count": len(by_group),
                 "my_follow_node_count": len(items),
                 "marketable": has_cap,
+                # 暂停状态：跟单员据此看到「该机器人主人已暂停 AI 跟单」
+                "ai_follow_paused": bool(getattr(user, "ai_follow_paused", False)),
             },
             "groups": groups_out,
         })
@@ -556,6 +573,12 @@ async def join_ai_follow(
     principal = await rbac_service.load_principal(store, user.username)
     if not principal or not permissions.can_host_ai_robot(principal):
         raise HTTPException(status_code=404, detail="该用户暂未开放 AI 跟单")
+    # 暂停 AI 跟单：写侧拦截。必须在**写入前**挡住 —— 只在展示侧过滤的话，
+    # 用户可以绕过 UI 直接调 API 加入已暂停的分组。
+    if getattr(user, "ai_follow_paused", False):
+        raise HTTPException(
+            status_code=400, detail=follow_rules.PAUSED_AI_REASON,
+        )
 
     all_nodes = await store.all_nodes()
     leader_primary = _primary_of(all_nodes, body.leader_user_id)
@@ -647,6 +670,81 @@ async def join_ai_follow(
         skipped=skipped,
         leader_primary_node_id=leader_primary.get("node_id"),
     )
+
+
+# ---------------------------------------------------------------------------
+# 暂停 / 恢复 AI 跟单
+# ---------------------------------------------------------------------------
+@router.post("/pause", response_model=AiPauseResponse)
+async def set_ai_follow_paused(
+    body: AiPauseRequest,
+    request: Request,
+    store: RedisStore = Depends(get_store),
+    p: Principal = Depends(require_menu(MENU_AI_TRADE)),
+) -> AiPauseResponse:
+    """暂停 / 恢复【AI 交易】市场的对外接单。
+
+    语义（与带单市场一致）：
+    ① 新的客户无法再加入该机器人主人名下的 AI 分组（写侧拦截 + 展示侧置灰）；
+    ② 已有跟单关系与在跑任务**不动** —— 等跟单员自行移出，本接口不碰
+       任何跟单数据、不平任何仓；
+    ③ 之后触发的信号只发主节点，不再下发给跟单节点（服务端在分发侧收窄）。
+
+    只作用于【AI 交易】市场（AI 智能加仓分组）。带单市场（趋势 / 网格分组）
+    有独立的开关（/api/follow/pause），两边互不影响 —— 同一个主人可能同时
+    做普通带单与 AI 机器人，停一边不该连累另一边。
+
+    权限：只能操作自己（管理员可代操作他人）。必须仍持有机器人主人资格。
+    """
+    if body.leader_user_id != p.user_id and not p.is_admin:
+        raise HTTPException(status_code=403, detail="只能暂停自己的 AI 跟单")
+
+    user = await user_service.get_user_by_id(body.leader_user_id)
+    if not user or not user.is_active:
+        raise HTTPException(status_code=404, detail="机器人主人不存在或已停用")
+
+    principal = await rbac_service.load_principal(store, user.username)
+    if not principal or not permissions.can_host_ai_robot(principal):
+        raise HTTPException(status_code=400, detail="该用户暂未开放 AI 跟单，无法暂停")
+
+    before = bool(getattr(user, "ai_follow_paused", False))
+    if before == body.paused:
+        # 幂等：状态没变就不写库（避免审计日志刷屏）
+        return AiPauseResponse(
+            leader_user_id=user.id,
+            ai_follow_paused=before,
+            paused_at=_paused_at(user.ai_follow_paused_at) if before else None,
+        )
+
+    updated = await user_service.set_ai_follow_paused(user.id, body.paused)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="机器人主人不存在")
+
+    await persist.audit(
+        p.username,
+        "pause_ai_follow" if body.paused else "resume_ai_follow",
+        user.username,
+        {"leader_user_id": user.id, "paused": body.paused},
+        "ok", client_ip(request), category="ai_follow",
+        before={"ai_follow_paused": before},
+        after={"ai_follow_paused": body.paused},
+    )
+    return AiPauseResponse(
+        leader_user_id=updated.id,
+        ai_follow_paused=bool(updated.ai_follow_paused),
+        paused_at=_paused_at(updated.ai_follow_paused_at) if updated.ai_follow_paused else None,
+    )
+
+
+def _paused_at(value: object) -> Optional[float]:
+    """暂停时刻 -> Unix 秒（供前端展示「暂停于 …」）。"""
+    if value is None:
+        return None
+    ts = getattr(value, "timestamp", None)
+    try:
+        return float(ts()) if callable(ts) else None
+    except (TypeError, ValueError, OSError):
+        return None
 
 
 # ---------------------------------------------------------------------------
