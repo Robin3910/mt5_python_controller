@@ -1552,9 +1552,9 @@ export interface FollowLeaderSummary {
   followable_group_count: number
   /** 全局：他的分组被多少个节点跟随 */
   follower_node_count: number
-  /** 我已跟其中几个分组 */
+  /** 我已跟其中几个分组（**只算带单市场** tpl_2 / tpl_3，不含 AI 市场） */
   my_follow_group_count: number
-  /** 我用了几个节点跟 */
+  /** 我用了几个节点跟（**只算带单市场** tpl_2 / tpl_3，不含 AI 市场） */
   my_follow_node_count: number
   /** 带单员是否仍持有 follow_leader 能力；false 时已下架但仍可移出 */
   marketable: boolean
@@ -1702,7 +1702,9 @@ export interface AiRobotSummary {
   /** 该机器人名下可跟分组用到的全部策略名称（去重，按出现顺序） */
   strategy_names: string[]
   follower_node_count: number
+  /** 我已跟其中几个分组（**只算 AI 市场** tpl_1，不含带单市场） */
   my_follow_group_count: number
+  /** 我用了几个节点跟（**只算 AI 市场** tpl_1，不含带单市场） */
   my_follow_node_count: number
   /** 风险上限（取各分组最大值）—— 必须公开，跟单员不控手数 */
   max_allow_num: number | null

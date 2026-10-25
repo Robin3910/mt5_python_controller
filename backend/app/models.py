@@ -1056,7 +1056,11 @@ class FollowLeaderSummary(BaseModel):
     primary_node: Optional[dict] = None
     followable_group_count: int = 0
     follower_node_count: int = 0
+    # 「我已跟」的分组数 —— **只算带单市场**（tpl_2 / tpl_3）。
+    # 两个市场共用同一张跟单关系表，不按市场隔离的话，只跟了 AI 分组
+    # 的客户会在带单页看到误导性的「已跟」。
     my_follow_group_count: int = 0
+    # 「我已跟」的节点数（跟单关系条数），同样**只算带单市场**
     my_follow_node_count: int = 0
     marketable: bool = True
     # —— 绩效（由历史成交聚合，与订单历史页同一套口径）——
@@ -1215,7 +1219,11 @@ class AiRobotSummary(BaseModel):
     strategy_names: list[str] = Field(default_factory=list)
     # 被多少个节点跟随（全量跟单关系）
     follower_node_count: int = 0
+    # 「我已跟」的分组数 —— **只算 AI 市场**（tpl_1）。
+    # 两个市场共用同一张跟单关系表，不按市场隔离的话，只跟了开仓策略分组的
+    # 客户会在 AI 页看到误导性的「已跟」（以为已经跟了 AI 策略）。
     my_follow_group_count: int = 0
+    # 「我已跟」的节点数（跟单关系条数），同样**只算 AI 市场**
     my_follow_node_count: int = 0
     # 机器人对外公开的风险上限（取各分组最大值）—— 跟单员不控手数，
     # 必须能一眼看到风险量级（决策：不控手数的对价是公开风险参数）

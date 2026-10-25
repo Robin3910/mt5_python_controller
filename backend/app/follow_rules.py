@@ -203,6 +203,76 @@ def leave_market_skip_reason(
 
 
 # ---------------------------------------------------------------------------
+# 「我已跟」的计数口径（按市场隔离）
+# ---------------------------------------------------------------------------
+def group_in_market(
+    group: Optional[dict], market: frozenset[str],
+    strategy_templates_map: Optional[dict[str, str]] = None,
+) -> bool:
+    """该分组是否属于指定跟单市场（用于「我已跟」计数）。
+
+    判定口径与 `leave_market_skip_reason` / `followable_groups` **一致**：
+    - 模版已知且在市场内 -> 属于；
+    - 模版已知但不在市场内 -> **不属于**（这才是要消除的跨市场误报）；
+    - 模版未知（未绑策略 / 策略已删除）-> **属于**（两个市场都算）。
+
+    为什么未知模版两个市场都算：未知模版的分组在 `followable_groups` 里两个市场
+    都可跟（未绑策略不因市场判定被拒），`leave_market_skip_reason` 里两个市场
+    也都允许移出 —— 计数口径必须与「能不能加入 / 能不能移出」一致，否则会出现
+    「能加进去却不计数」「能移出却仍显示已跟」的自相矛盾。
+
+    strategy_templates_map: {strategy_id: template_id} 快照，由调用方批量预取。
+        为 None 时无法查模版 -> 判「不属于」（调用方应始终传入快照）。
+    """
+    if not group:
+        return False
+    if strategy_templates_map is None:
+        return False
+    sid = str(group.get("strategy_id") or "").strip()
+    tid = strategy_templates_map.get(sid) if sid else None
+    if not tid:
+        # 模版未知：两个市场都算（见上面的说明）
+        return True
+    return template_in_market(tid, market)
+
+
+def my_follow_counts_in_market(
+    followings: list[dict],
+    groups_by_id: dict[str, dict],
+    market: frozenset[str],
+    strategy_templates_map: Optional[dict[str, str]] = None,
+) -> tuple[int, int]:
+    """「我已跟」的 (分组数, 节点数) —— **只算本市场**的跟单关系。
+
+    跟单关系是 (group_id, node_id) 维度的，两个市场共用同一张
+    `group_follower_node` 表，所以**不按市场过滤就会串台**：
+    客户只跟了主人的 tpl_2 开仓策略分组时，AI 分组上也会显示「已跟」——
+    误导客户以为已经跟了 AI（实际一条 AI 关系都没有）。
+
+    返回 (分组数, 节点数)：
+    - 分组数 = 本市场内我已跟的**去重**分组数；
+    - 节点数 = 本市场内我跟单关系**条数**（同一节点跟多个分组算多条，
+      与 `my_follow_node_ids` 的分组维度口径一致）。
+
+    groups_by_id: {group_id: group} 快照（调用方批量预取，避免循环内回源）。
+    strategy_templates_map: {strategy_id: template_id} 快照。
+    """
+    if not followings:
+        return 0, 0
+    group_ids: set[str] = set()
+    node_count = 0
+    for f in followings:
+        gid = str(f.get("group_id") or "").strip()
+        if not gid:
+            continue
+        if not group_in_market(groups_by_id.get(gid), market, strategy_templates_map):
+            continue
+        group_ids.add(gid)
+        node_count += 1
+    return len(group_ids), node_count
+
+
+# ---------------------------------------------------------------------------
 # 能力
 # ---------------------------------------------------------------------------
 def has_leader_capability(capabilities: object) -> bool:

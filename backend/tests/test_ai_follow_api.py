@@ -582,6 +582,129 @@ def test_detail_my_follow_node_ids_reflects_own_group(client):
 
 
 # ---------------------------------------------------------------------------
+# 「已跟」计数必须按市场隔离（本市场内我已跟的分组/节点数）
+# ---------------------------------------------------------------------------
+def test_ai_robot_list_my_follow_count_excludes_follow_market(client):
+    """【AI 广场】只跟了开仓策略分组 -> 机器人卡片**不得**显示「已跟」。
+
+    这是用户报的现象：跟了带单员A 的**开仓策略**（tpl_2），没跟他的
+    **AI 交易策略**（tpl_1），但 AI 交易界面显示「已跟」。
+
+    根因：两个市场共用同一张 `group_follower_node` 关系表，而广场的
+    `my_follow_node_count` 直接数了**全部**关系，没有按市场过滤。
+    """
+    admin_h = _login(client, "admin")
+    s = _setup(client, admin_h, caps=[CAP_AI, CAP_LEADER])
+    bob_h = _login(client, "bob")
+
+    # 主人再开一个 tpl_2「开仓策略」分组（带单市场，非 AI 市场）
+    sid = _mk_trend_strategy(client, s["host_h"], "host-trend")
+    trend_gid = _mk_group(client, s["host_h"], [s["h_primary"]], "host-trend组", strategy_id=sid)
+
+    # 客户只跟**开仓策略分组**（带单 tab）
+    r = client.post(
+        "/api/follow/join",
+        json={
+            "leader_user_id": s["host"]["id"],
+            "group_ids": [trend_gid],
+            "node_ids": [s["b_follow"]],
+        },
+        headers=bob_h,
+    )
+    assert r.status_code == 200, r.text
+
+    # AI 广场：机器人卡片必须是「未跟」
+    r = client.get("/api/ai-follow/robots", headers=bob_h)
+    assert r.status_code == 200, r.text
+    robot = next(x for x in r.json()["robots"] if x["leader_user_id"] == s["host"]["id"])
+    assert robot["my_follow_node_count"] == 0, "跟了开仓策略分组不代表跟了 AI 分组"
+    assert robot["my_follow_group_count"] == 0, "开仓策略分组不计入 AI 市场的已跟分组数"
+
+
+def test_ai_robot_detail_my_follow_count_excludes_follow_market(client):
+    """【AI 详情】同样按市场隔离：只跟开仓策略分组时计数为 0。"""
+    admin_h = _login(client, "admin")
+    s = _setup(client, admin_h, caps=[CAP_AI, CAP_LEADER])
+    bob_h = _login(client, "bob")
+
+    sid = _mk_trend_strategy(client, s["host_h"], "host-trend")
+    trend_gid = _mk_group(client, s["host_h"], [s["h_primary"]], "host-trend组", strategy_id=sid)
+
+    assert client.post(
+        "/api/follow/join",
+        json={
+            "leader_user_id": s["host"]["id"],
+            "group_ids": [trend_gid],
+            "node_ids": [s["b_follow"]],
+        },
+        headers=bob_h,
+    ).status_code == 200
+
+    d = client.get(f"/api/ai-follow/robots/{s['host']['id']}", headers=bob_h)
+    assert d.status_code == 200, d.text
+    robot = d.json()["robot"]
+    assert robot["my_follow_node_count"] == 0
+    assert robot["my_follow_group_count"] == 0
+
+
+def test_ai_my_follow_counts_only_ai_market(client):
+    """【我的 AI 跟单】的 leader 计数只算 AI 市场（两个市场都跟时不被带单市场撑大）。"""
+    admin_h = _login(client, "admin")
+    s = _setup(client, admin_h, caps=[CAP_AI, CAP_LEADER])
+    bob_h = _login(client, "bob")
+
+    sid = _mk_trend_strategy(client, s["host_h"], "host-trend")
+    trend_gid = _mk_group(client, s["host_h"], [s["h_primary"]], "host-trend组", strategy_id=sid)
+
+    # 两个市场都跟（同一个节点）
+    assert client.post(
+        "/api/follow/join",
+        json={"leader_user_id": s["host"]["id"], "group_ids": [trend_gid],
+              "node_ids": [s["b_follow"]]},
+        headers=bob_h,
+    ).status_code == 200
+    assert client.post(
+        "/api/ai-follow/join",
+        json={"leader_user_id": s["host"]["id"], "group_ids": [s["ai_group_id"]],
+              "node_ids": [s["b_follow"]]},
+        headers=bob_h,
+    ).status_code == 200
+
+    m = client.get("/api/ai-follow/me", headers=bob_h)
+    assert m.status_code == 200, m.text
+    body = m.json()
+    robot = body["following"][0]["robot"]
+    assert robot["my_follow_group_count"] == 1, "AI 侧只有 1 个分组"
+    assert robot["my_follow_node_count"] == 1, "AI 侧只有 1 个跟单节点"
+    assert body["summary"]["follow_node_count"] == 1
+
+
+def test_ai_robot_list_my_follow_count_reflects_own_market(client):
+    """真正跟了 AI 分组时，AI 广场的计数必须 > 0（别把正常场景一起改没了）。"""
+    admin_h = _login(client, "admin")
+    s = _setup(client, admin_h, caps=[CAP_AI, CAP_LEADER])
+    bob_h = _login(client, "bob")
+
+    assert client.post(
+        "/api/ai-follow/join",
+        json={
+            "leader_user_id": s["host"]["id"],
+            "group_ids": [s["ai_group_id"]],
+            "node_ids": [s["b_follow"]],
+        },
+        headers=bob_h,
+    ).status_code == 200
+
+    r = client.get("/api/ai-follow/robots", headers=bob_h)
+    robot = next(x for x in r.json()["robots"] if x["leader_user_id"] == s["host"]["id"])
+    assert robot["my_follow_node_count"] == 1
+    assert robot["my_follow_group_count"] == 1
+
+    d = client.get(f"/api/ai-follow/robots/{s['host']['id']}", headers=bob_h)
+    assert d.json()["robot"]["my_follow_node_count"] == 1
+
+
+# ---------------------------------------------------------------------------
 # 市场隔离：移出与「我的跟单」都不能跨市场
 # ---------------------------------------------------------------------------
 def test_ai_me_excludes_follow_market_groups(client):

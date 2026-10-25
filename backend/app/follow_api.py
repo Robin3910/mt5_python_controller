@@ -168,6 +168,16 @@ async def list_follow_leaders(
     followers_by_leader: dict[int, set[str]] = {}
     for f in await follow_service.list_for_leaders(leaders):
         followers_by_leader.setdefault(int(f["leader_user_id"]), set()).add(f["node_id"])
+    # 「我已跟」的计数必须**按市场隔离**（只算带单市场 tpl_2 / tpl_3）：
+    # 两个市场共用同一张跟单关系表，不隔离的话，客户只跟了 AI 分组时，
+    # 带单卡片也会打上「已跟」—— 误导他以为已经跟了带单策略。
+    groups_by_id = {g["group_id"]: g for g in all_groups}
+    mine_counts: dict[int, tuple[int, int]] = {
+        uid: follow_rules.my_follow_counts_in_market(
+            items, groups_by_id, follow_rules.FOLLOW_MARKET_TEMPLATE_IDS, tmpl_map,
+        )
+        for uid, items in mine_by_leader.items()
+    }
 
     # 绩效：一次 MGET 拿全部带单员的预聚合结果（未命中就是 None）
     win = window if window in deal_stats.WINDOWS else deal_stats.DEFAULT_WINDOW
@@ -201,7 +211,9 @@ async def list_follow_leaders(
             ]).lower()
             if needle not in haystack:
                 continue
-        mine = mine_by_leader.get(uid, [])
+        # 「我已跟」计数：**只算带单市场**（tpl_2 / tpl_3）的跟单关系。
+        # AI 市场（tpl_1）的关系不算 —— 跟了 AI 分组 ≠ 跟了带单策略。
+        my_group_count, my_node_count = mine_counts.get(uid, (0, 0))
         # 缓存结构：{window: {**summary, follower_count}} —— 与 deal_agg 写入的一致
         perf = dict(cached.get(uid) or {})
         out.append({
@@ -211,8 +223,8 @@ async def list_follow_leaders(
             "primary_node": _node_brief(primary),
             "followable_group_count": len(followable),
             "follower_node_count": len(followers_by_leader.get(uid, set())),
-            "my_follow_group_count": len({f["group_id"] for f in mine}),
-            "my_follow_node_count": len(mine),
+            "my_follow_group_count": my_group_count,
+            "my_follow_node_count": my_node_count,
             "marketable": True,
             # 绩效：聚合公开可见（带单广场是给潜在跟单者看的）
             "performance": {
@@ -278,9 +290,19 @@ async def get_leader_detail(
     active_counts = await group_persist.count_active_by_group()
 
     mine_by_group: dict[str, list[str]] = {}
+    my_followings_for_leader: list[dict] = []
     for f in await follow_service.list_followings(p.user_id):
         if int(f["leader_user_id"]) == leader_user_id:
             mine_by_group.setdefault(f["group_id"], []).append(f["node_id"])
+            my_followings_for_leader.append(f)
+    # 「我已跟」计数：**只算带单市场**（tpl_2 / tpl_3）的跟单关系。
+    # AI 市场（tpl_1）的关系不算 —— 跟了 AI 分组 ≠ 跟了带单策略。
+    my_group_count, my_node_count = follow_rules.my_follow_counts_in_market(
+        my_followings_for_leader,
+        {g["group_id"]: g for g in all_groups},
+        follow_rules.FOLLOW_MARKET_TEMPLATE_IDS,
+        tmpl_map,
+    )
 
     detail_groups = []
     # 暂停带单：分组置灰 + 给出原因，让跟单员**看得出**这里已经收口，
@@ -344,7 +366,6 @@ async def get_leader_detail(
             ) or "该分组不在普通跟单市场",
         })
 
-    mine = mine_by_group
     # 绩效：读后台预聚合的 Redis 缓存（与列表同一份，口径完全一致）。
     # 详情是单个人，允许回源查库兜底（缓存刚建立时可能还没有）。
     win = window if window in deal_stats.WINDOWS else deal_stats.DEFAULT_WINDOW
@@ -382,8 +403,8 @@ async def get_leader_detail(
             "follower_node_count": len({
                 f["node_id"] for f in await follow_service.list_for_leaders({leader_user_id})
             }),
-            "my_follow_group_count": len(mine),
-            "my_follow_node_count": sum(len(v) for v in mine.values()),
+            "my_follow_group_count": my_group_count,
+            "my_follow_node_count": my_node_count,
             "marketable": True,
             "performance": {k: v for k, v in perf.items() if k != "follower_count"},
             "perf_window": win,
@@ -425,6 +446,8 @@ async def list_my_followings(
         by_leader.setdefault(int(f["leader_user_id"]), []).append(f)
 
     following_out: list[dict] = []
+    # 「我已跟」节点总数（只算带单市场）—— 与 leader 上的口径一致
+    market_node_total = 0
     for lid, items in sorted(by_leader.items()):
         user = await user_service.get_user_by_id(lid)
         if not user:
@@ -469,6 +492,10 @@ async def list_my_followings(
                     if f["node_id"] in node_ids
                 ],
             })
+        my_group_count, my_node_count = follow_rules.my_follow_counts_in_market(
+            items, all_groups, follow_rules.FOLLOW_MARKET_TEMPLATE_IDS, tmpl_map,
+        )
+        market_node_total += my_node_count
         following_out.append({
             "leader": {
                 "leader_user_id": lid,
@@ -477,8 +504,10 @@ async def list_my_followings(
                 "primary_node": _node_brief(primary),
                 "followable_group_count": 0,
                 "follower_node_count": 0,
-                "my_follow_group_count": len(by_group),
-                "my_follow_node_count": len(items),
+                # 「我已跟」计数：**只算带单市场**（tpl_2 / tpl_3）。
+                # 存量 AI 分组的关系在这里**可见**（便于人工清理），但不算本市场计数。
+                "my_follow_group_count": my_group_count,
+                "my_follow_node_count": my_node_count,
                 "marketable": has_cap,
                 # 暂停状态：跟单员据此看到「该带单员已暂停带单」
                 "follow_paused": bool(getattr(user, "follow_paused", False)),
@@ -489,7 +518,8 @@ async def list_my_followings(
         following=following_out,
         summary={
             "following_count": len(by_leader),
-            "follow_node_count": len(followings),
+            # 计数也只算带单市场的关系（与 leader 上的口径一致）
+            "follow_node_count": market_node_total,
         },
     )
 

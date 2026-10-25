@@ -1181,6 +1181,109 @@ def test_my_following_marks_ai_group_unmarketable(client):
     assert "AI" in groups[0]["unmarketable_reason"]
 
 
+# ---------------------------------------------------------------------------
+# 「已跟」计数必须按市场隔离（本市场内我已跟的分组/节点数）
+# ---------------------------------------------------------------------------
+def test_leader_list_my_follow_count_excludes_ai_market(client):
+    """【带单广场】只跟了 AI 分组 -> 带单卡片**不得**显示「已跟」。
+
+    与 AI 侧对称：两个市场共用同一张跟单关系表，带单侧的计数也必须
+    按市场过滤，否则只跟了 AI 分组的客户会在带单页看到误导性的「已跟」。
+    """
+    admin_h = _login(client, "admin")
+    alice, bob, a_primary, b_follow, ai_group, grid_group = _setup_ai_leader(client, admin_h)
+
+    bob_h = _login(client, "bob")
+    assert client.post(
+        "/api/ai-follow/join",
+        json={"leader_user_id": alice["id"], "group_ids": [ai_group],
+              "node_ids": [b_follow]},
+        headers=bob_h,
+    ).status_code == 200
+
+    r = client.get("/api/follow/leaders", headers=bob_h)
+    assert r.status_code == 200, r.text
+    leader = next(x for x in r.json()["leaders"] if x["leader_user_id"] == alice["id"])
+    assert leader["my_follow_node_count"] == 0, "跟了 AI 分组不代表跟了带单策略"
+    assert leader["my_follow_group_count"] == 0
+
+
+def test_leader_detail_my_follow_count_excludes_ai_market(client):
+    """【带单详情】同样按市场隔离：只跟 AI 分组时计数为 0。"""
+    admin_h = _login(client, "admin")
+    alice, bob, a_primary, b_follow, ai_group, grid_group = _setup_ai_leader(client, admin_h)
+
+    bob_h = _login(client, "bob")
+    assert client.post(
+        "/api/ai-follow/join",
+        json={"leader_user_id": alice["id"], "group_ids": [ai_group],
+              "node_ids": [b_follow]},
+        headers=bob_h,
+    ).status_code == 200
+
+    d = client.get(f"/api/follow/leaders/{alice['id']}", headers=bob_h)
+    assert d.status_code == 200, d.text
+    leader = d.json()["leader"]
+    assert leader["my_follow_node_count"] == 0
+    assert leader["my_follow_group_count"] == 0
+
+
+def test_my_following_counts_only_follow_market(client):
+    """【我的跟单】的 leader 计数只算带单市场（两个市场都跟时不被 AI 市场撑大）。
+
+    存量 AI 关系**仍要可见**（便于人工清理），但不能计入带单市场的计数。
+    """
+    admin_h = _login(client, "admin")
+    alice, bob, a_primary, b_follow, ai_group, grid_group = _setup_ai_leader(client, admin_h)
+
+    bob_h = _login(client, "bob")
+    assert client.post(
+        "/api/follow/join",
+        json={"leader_user_id": alice["id"], "group_ids": [grid_group],
+              "node_ids": [b_follow]},
+        headers=bob_h,
+    ).status_code == 200
+    assert client.post(
+        "/api/ai-follow/join",
+        json={"leader_user_id": alice["id"], "group_ids": [ai_group],
+              "node_ids": [b_follow]},
+        headers=bob_h,
+    ).status_code == 200
+
+    r = client.get("/api/follow/me", headers=bob_h)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    leader = body["following"][0]["leader"]
+    assert leader["my_follow_group_count"] == 1, "带单侧只有 1 个分组"
+    assert leader["my_follow_node_count"] == 1, "带单侧只有 1 个跟单节点"
+    assert body["summary"]["follow_node_count"] == 1
+    # 存量 AI 关系仍可见（人工清理需要）
+    gids = [g["group_id"] for f in body["following"] for g in f["groups"]]
+    assert ai_group in gids
+
+
+def test_leader_list_my_follow_count_reflects_own_market(client):
+    """真正跟了带单市场分组时，带单广场计数必须 > 0（别把正常场景一起改没了）。"""
+    admin_h = _login(client, "admin")
+    alice, bob, a_primary, b_follow, ai_group, grid_group = _setup_ai_leader(client, admin_h)
+
+    bob_h = _login(client, "bob")
+    assert client.post(
+        "/api/follow/join",
+        json={"leader_user_id": alice["id"], "group_ids": [grid_group],
+              "node_ids": [b_follow]},
+        headers=bob_h,
+    ).status_code == 200
+
+    r = client.get("/api/follow/leaders", headers=bob_h)
+    leader = next(x for x in r.json()["leaders"] if x["leader_user_id"] == alice["id"])
+    assert leader["my_follow_node_count"] == 1
+    assert leader["my_follow_group_count"] == 1
+
+    d = client.get(f"/api/follow/leaders/{alice['id']}", headers=bob_h)
+    assert d.json()["leader"]["my_follow_node_count"] == 1
+
+
 def test_adopt_followers_does_not_cross_market(client):
     """跨市场隔离：AI 分组不得继承网格分组的跟单节点（否则静默拉进 AI 加仓）。"""
     admin_h = _login(client, "admin")

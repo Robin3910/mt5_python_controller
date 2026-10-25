@@ -212,7 +212,16 @@ async def list_ai_robots(
     followers_by_leader: dict[int, set[str]] = {}
     for f in await follow_service.list_for_leaders(hosts):
         followers_by_leader.setdefault(int(f["leader_user_id"]), set()).add(f["node_id"])
-
+    # 「我已跟」的计数必须**按市场隔离**（只算 AI 市场 tpl_1）：
+    # 两个市场共用同一张跟单关系表，不隔离的话，客户只跟了主人的
+    # tpl_2 开仓策略分组时，AI 卡片也会打上「已跟」—— 误导他以为已经跟了 AI。
+    groups_by_id = {g["group_id"]: g for g in all_groups}
+    mine_counts: dict[int, tuple[int, int]] = {
+        uid: follow_rules.my_follow_counts_in_market(
+            items, groups_by_id, follow_rules.AI_MARKET_TEMPLATE_IDS, tmpl_map,
+        )
+        for uid, items in mine_by_leader.items()
+    }
     # 绩效：一次 MGET 拿全部机器人的主节点预聚合结果（未命中就是 None）
     win = window if window in deal_stats.WINDOWS else deal_stats.DEFAULT_WINDOW
     cached: dict[int, dict] = {}
@@ -241,7 +250,10 @@ async def list_ai_robots(
             ]).lower()
             if needle not in haystack:
                 continue
-        mine = mine_by_leader.get(uid, [])
+        # 「我已跟」计数：**只算 AI 市场**（tpl_1）的跟单关系。
+        # 带单市场（tpl_2 开仓策略 / tpl_3 网格）的关系不算 ——
+        # 跟了开仓策略分组 ≠ 跟了 AI 机器人。
+        my_group_count, my_node_count = mine_counts.get(uid, (0, 0))
         # 风险上限取各分组里的最大值，让用户一眼看到风险量级
         risk = [
             _risk_summary(strategies.get(g.get("strategy_id") or "")) for g in groups
@@ -267,8 +279,8 @@ async def list_ai_robots(
             "strategy_name": strategy_names[0] if strategy_names else None,
             "strategy_names": strategy_names,
             "follower_node_count": len(followers_by_leader.get(uid, set())),
-            "my_follow_group_count": len({f["group_id"] for f in mine}),
-            "my_follow_node_count": len(mine),
+            "my_follow_group_count": my_group_count,
+            "my_follow_node_count": my_node_count,
             "max_allow_num": max(max_allow) if max_allow else None,
             "total_lot_limit": max(lot_limits) if lot_limits else None,
             "marketable": True,
@@ -315,9 +327,20 @@ async def get_ai_robot_detail(
     active_counts = await group_persist.count_active_by_group()
 
     mine_by_group: dict[str, list[str]] = {}
+    my_followings_for_leader: list[dict] = []
     for f in await follow_service.list_followings(p.user_id):
         if int(f["leader_user_id"]) == leader_user_id:
             mine_by_group.setdefault(f["group_id"], []).append(f["node_id"])
+            my_followings_for_leader.append(f)
+    # 「我已跟」计数：**只算 AI 市场**（tpl_1）的跟单关系。
+    # 带单市场（tpl_2 开仓策略 / tpl_3 网格）的关系不算 ——
+    # 跟了开仓策略分组 ≠ 跟了 AI 机器人（该用户报的现象）。
+    my_group_count, my_node_count = follow_rules.my_follow_counts_in_market(
+        my_followings_for_leader,
+        {g["group_id"]: g for g in all_groups},
+        follow_rules.AI_MARKET_TEMPLATE_IDS,
+        tmpl_map,
+    )
 
     detail_groups: list[dict] = []
     # 暂停 AI 跟单：分组置灰 + 给出原因，让跟单员**看得出**这里已经收口，
@@ -359,7 +382,6 @@ async def get_ai_robot_detail(
             ),
         })
 
-    mine = mine_by_group
     risk_all = [_risk_summary(strategies.get(g.get("strategy_id") or "")) for g in groups]
     max_allow = [r["max_allow_num"] for r in risk_all if r["max_allow_num"] is not None]
     lot_limits = [r["total_lot_limit"] for r in risk_all if r["total_lot_limit"] is not None]
@@ -402,8 +424,8 @@ async def get_ai_robot_detail(
             "strategy_name": strategy_names[0] if strategy_names else None,
             "strategy_names": strategy_names,
             "follower_node_count": follower_count,
-            "my_follow_group_count": len(mine),
-            "my_follow_node_count": sum(len(v) for v in mine.values()),
+            "my_follow_group_count": my_group_count,
+            "my_follow_node_count": my_node_count,
             "max_allow_num": max(max_allow) if max_allow else None,
             "total_lot_limit": max(lot_limits) if lot_limits else None,
             "marketable": True,
@@ -515,6 +537,9 @@ async def list_my_ai_followings(
                     for f in sorted(fs, key=lambda x: x.get("joined_at") or 0)
                 ],
             })
+        my_group_count, my_node_count = follow_rules.my_follow_counts_in_market(
+            items, all_groups, follow_rules.AI_MARKET_TEMPLATE_IDS, tmpl_map,
+        )
         following_out.append({
             "robot": {
                 "leader_user_id": lid,
@@ -530,8 +555,9 @@ async def list_my_ai_followings(
                     )
                 ],
                 "follower_node_count": 0,
-                "my_follow_group_count": len(by_group),
-                "my_follow_node_count": len(items),
+                # 「我已跟」计数：**只算 AI 市场**（tpl_1）的跟单关系。
+                "my_follow_group_count": my_group_count,
+                "my_follow_node_count": my_node_count,
                 "marketable": has_cap,
                 # 暂停状态：跟单员据此看到「该机器人主人已暂停 AI 跟单」
                 "ai_follow_paused": bool(getattr(user, "ai_follow_paused", False)),
