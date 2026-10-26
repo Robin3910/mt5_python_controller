@@ -8,7 +8,9 @@ from urllib.request import Request, urlopen
 
 import pytest
 
-from local_status import LocalStatusServer
+import socket
+
+from local_status import LocalStatusServer, StatusPortBusy, bind_status_socket
 
 
 def _http_json(method: str, url: str, timeout: float = 2.0) -> tuple[int, dict]:
@@ -128,3 +130,67 @@ async def test_status_snapshot_includes_runners_shape():
     assert body["ws_state"] == "authenticated"
     full = srv._status_provider()
     assert full["runners"][0]["task_id"] == 1
+
+
+def test_bind_status_socket_rejects_busy_port():
+    held = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    held.bind(("127.0.0.1", 0))
+    held.listen(1)
+    port = held.getsockname()[1]
+    try:
+        with pytest.raises(StatusPortBusy) as caught:
+            bind_status_socket("127.0.0.1", port)
+        assert str(port) in str(caught.value)
+        assert "未连接 MT5" in str(caught.value)
+    finally:
+        held.close()
+
+
+def test_bind_status_socket_disabled_when_port_is_zero():
+    assert bind_status_socket("127.0.0.1", 0) is None
+
+
+@pytest.mark.asyncio
+async def test_prebound_socket_serves_health():
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    sock = bind_status_socket("127.0.0.1", port)
+    assert sock is not None
+    srv = LocalStatusServer(
+        host="127.0.0.1",
+        port=port,
+        status_provider=lambda: {"ok": True, "process": "alive", "ws_state": "starting", "uptime_s": 1},
+        on_stop=lambda: None,
+    )
+    await srv.start(sock)
+    try:
+        code, health = await asyncio.to_thread(_http_json, "GET", f"http://127.0.0.1:{port}/health")
+        assert code == 200
+        assert health["process"] == "alive"
+    finally:
+        await srv.close()
+
+
+@pytest.mark.asyncio
+async def test_main_exits_before_touching_mt5_when_port_is_busy(monkeypatch):
+    import node_client
+
+    held = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    held.bind(("127.0.0.1", 0))
+    held.listen(1)
+    port = held.getsockname()[1]
+    monkeypatch.setattr(node_client.settings, "local_status_host", "127.0.0.1")
+    monkeypatch.setattr(node_client.settings, "local_status_port", port)
+
+    def fail_if_called():
+        raise AssertionError("端口被占用时不应读取 MT5")
+
+    monkeypatch.setattr(node_client, "prompt_mt5_credentials", fail_if_called)
+    try:
+        with pytest.raises(SystemExit) as caught:
+            await node_client.main()
+        assert caught.value.code == 1
+    finally:
+        held.close()

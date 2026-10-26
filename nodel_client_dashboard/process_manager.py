@@ -15,7 +15,7 @@ from urllib.request import Request, urlopen
 
 from models import InstanceConfig, RuntimeState
 from node_log import DailyLogWriter, latest_log_path, log_path_for_day, node_logs_dir
-from ports import find_free_port
+from ports import find_free_port, port_has_listener
 
 
 OnChange = Callable[[str], None]
@@ -117,6 +117,8 @@ class ManagedProcess:
                     self.runtime.busy = ""
                     self._ensure_workers()
                 self._notify()
+                return
+            if self._block_duplicate_listener():
                 return
             with self._lock:
                 self._want_running = True
@@ -283,6 +285,42 @@ class ManagedProcess:
         data = self._fetch_status(timeout=timeout)
         return bool(data and data.get("ok", True) and data.get("process") == "alive")
 
+    def _note_panel(self, text: str) -> None:
+        try:
+            writer = self._log_writer
+            temporary = writer is None
+            if writer is None:
+                writer = DailyLogWriter(self.cfg)
+            writer.write_line(text)
+            if temporary:
+                writer.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _block_duplicate_listener(self) -> bool:
+        """状态口已有监听、又无法确认为本实例时，停止拉起第二个进程。"""
+        port = int(self.cfg.status_port or 0)
+        if port <= 0 or self._status_reachable(timeout=0.4):
+            return False
+        if not port_has_listener("127.0.0.1", port):
+            return False
+        if self._identity_conflict:
+            message = f"状态口 127.0.0.1:{port} 属于其他 MT5 账号或节点，已停止自动重启"
+        else:
+            message = (
+                f"状态口 127.0.0.1:{port} 已被占用，已停止自动重启。"
+                "请先结束占用该端口的 node_client，再启动本实例"
+            )
+        self._want_running = False
+        self.cfg.daemon = False
+        self.runtime.health = "error"
+        self.runtime.busy = ""
+        self.runtime.process_alive = False
+        self.runtime.last_error = message
+        self._note_panel(f"[panel] {message}")
+        self._notify()
+        return True
+
     def _refresh_file_version(self) -> None:
         from client_deploy import read_version_near
 
@@ -334,6 +372,8 @@ class ManagedProcess:
                 pass
 
     def _spawn(self) -> None:
+        if self._block_duplicate_listener():
+            raise RuntimeError(self.runtime.last_error)
         if self.dashboard_managed:
             self.assert_identity()
             from client_binding import require_binding
@@ -490,6 +530,9 @@ class ManagedProcess:
             # 无本面板持有的 Popen：若状态口仍在，视为外部/已接管进程，勿重复拉起
             if self._status_reachable():
                 continue
+            # 端口已有监听但 /status 对不上：再拉起会绑定失败，并先挤掉对方的 MT5 IPC
+            if self._block_duplicate_listener():
+                continue
             # process exited
             with self._lock:
                 if self._proc is not None and self._proc.poll() is not None:
@@ -507,6 +550,8 @@ class ManagedProcess:
                 time.sleep(delay)
                 if self._stop_threads.is_set() or not self._want_running:
                     continue
+                if self._block_duplicate_listener():
+                    continue
                 with self._lock:
                     if self.cfg.daemon and self._want_running and (
                         (self._proc is None or self._proc.poll() is not None)
@@ -518,12 +563,21 @@ class ManagedProcess:
                             if grant is not None and grant.node_id == str(self.cfg.node_id) and grant.mt5_login == self.cfg.mt5_login and self.grant_configuration == configuration:
                                 try:
                                     grant.restart(self._spawn)
-                                except (RuntimeError, OSError):
+                                except (RuntimeError, OSError) as exc:
                                     self.runtime.health = "error"
-                                    self.runtime.last_error = "自动重启失败，请检查客户端文件与本机日志"
+                                    self.runtime.last_error = (
+                                        str(exc).strip() or "自动重启失败，请检查客户端文件与本机日志"
+                                    )
                                     self._notify()
                         else:
-                            self._spawn()
+                            try:
+                                self._spawn()
+                            except (RuntimeError, OSError) as exc:
+                                self.runtime.health = "error"
+                                self.runtime.last_error = (
+                                    str(exc).strip() or "自动重启失败，请检查客户端文件与本机日志"
+                                )
+                                self._notify()
 
     def _poll_loop(self) -> None:
         while not self._stop_threads.is_set():

@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+import socket
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -26,7 +27,7 @@ import websockets
 import account_risk
 from config import clamp_account_report_interval, get_settings
 from deal_cursor import DealCursor
-from local_status import LocalStatusServer
+from local_status import LocalStatusServer, StatusPortBusy, bind_status_socket
 from market_hub import MarketHub
 from mt5_prompt import prompt_mt5_credentials, require_dashboard_account
 from strategy_runner import StrategyRunner
@@ -180,19 +181,22 @@ class NodeClient:
         if ws is not None and self.loop is not None:
             self.loop.create_task(ws.close())
 
-    async def run(self) -> None:
-        """主入口：先连 MT5，再进入“连接-鉴权-服务”的自动重连循环。"""
+    async def run(self, status_sock: socket.socket | None = None) -> None:
+        """主入口：先占住本机状态口，再连 MT5，然后进入自动重连循环。
+
+        status_sock 由 main() 在读取 MT5 账号之前绑定。绑定失败的进程不会进入这里。
+        """
         self.loop = asyncio.get_running_loop()
         try:
-            await self._connect_mt5()
-            self._ensure_hub()
             self._status_server = LocalStatusServer(
                 host=settings.local_status_host,
                 port=settings.local_status_port,
                 status_provider=self.status_snapshot,
                 on_stop=self.request_shutdown,
             )
-            await self._status_server.start()
+            await self._status_server.start(status_sock)
+            await self._connect_mt5()
+            self._ensure_hub()
             await self._connect_loop()
         finally:
             if self._status_server is not None:
@@ -1147,19 +1151,33 @@ class NodeClient:
 
 async def main() -> None:
     logger.info("node_client version %s", get_version())
+    # 先占端口。prompt / connect 都会 initialize MT5，失败的第二次启动不能去碰终端。
+    status_sock = None
     try:
-        creds = prompt_mt5_credentials()
-    except FileNotFoundError as e:
+        status_sock = bind_status_socket(
+            settings.local_status_host, settings.local_status_port
+        )
+    except StatusPortBusy as e:
         logger.error("%s", e)
         raise SystemExit(1) from e
-    except Exception as e:
-        from mt5_client import MT5Error
-
-        if isinstance(e, MT5Error):
+    try:
+        try:
+            creds = prompt_mt5_credentials()
+        except FileNotFoundError as e:
             logger.error("%s", e)
             raise SystemExit(1) from e
-        raise
-    await NodeClient(**creds).run()
+        except Exception as e:
+            from mt5_client import MT5Error
+
+            if isinstance(e, MT5Error):
+                logger.error("%s", e)
+                raise SystemExit(1) from e
+            raise
+        await NodeClient(**creds).run(status_sock)
+        status_sock = None
+    finally:
+        if status_sock is not None:
+            status_sock.close()
 
 
 if __name__ == "__main__":
