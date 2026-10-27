@@ -12,6 +12,7 @@ from tkinter import filedialog, messagebox, simpledialog
 import customtkinter as ctk
 
 import version_service as vs
+from busy_status import BusyStatus
 from client_deploy import count_pending_upgrades, read_version_near
 from models import InstanceConfig, default_label_from_path, shorten_path
 from process_manager import ProcessManager
@@ -66,6 +67,13 @@ _VERSION_BTN_W_ALERT = 190
 # 启动约 3 秒后查一次后端发布版本，之后每 1 分钟复检
 _VERSION_CHECK_INTERVAL_MS = 60 * 1000
 _VERSION_CHECK_FIRST_MS = 3000
+
+# 手工替换的阶段文案：停 → 覆盖 → 重启
+_SWAP_PHASE_LABELS = {
+    "stop": "停止实例…",
+    "apply": "覆盖文件…",
+    "restart": "重新启动…",
+}
 
 
 @dataclass
@@ -303,6 +311,8 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
         self._tray_hide_job: str | None = None
         self._restore_repair_job: str | None = None
         self._remote_version = ""
+        self._header_busy_status: BusyStatus | None = None
+        self._header_clear_job: str | None = None
 
         self._show_login()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -335,6 +345,13 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
 
         badges = ctk.CTkFrame(header, fg_color="transparent")
         badges.grid(row=0, column=2, padx=20, pady=14, sticky="e")
+        # 长耗时操作（批量替换等）的状态条：转圈 + 文案，空闲时清空不占视觉
+        self.header_status = ctk.CTkLabel(
+            badges, text="", text_color=TEXT_MUTED, font=font(12), anchor="e"
+        )
+        self.header_status.pack(side="left", padx=(0, 12))
+        # 布局会随重新登录重建，旧指示器指向已销毁的标签，必须重置
+        self._header_busy_status = None
         self.version_btn = ghost_btn(
             badges, _VERSION_BTN_IDLE, self._open_version_update, width=_VERSION_BTN_W
         )
@@ -1133,8 +1150,14 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
         if not messagebox.askyesno("手工替换全部 · 确认", "\n".join(lines)):
             return
 
+        def on_instance(index: int, total: int, name: str, phase: str) -> None:
+            label = _SWAP_PHASE_LABELS.get(phase, "处理中…")
+            self.after(0, lambda t=f"正在替换 ({index}/{total}) {name}：{label}": self._header_busy_update(t))
+
         def job():
-            results = self.manager.batch_replace(source, restart_if_was_running=True)
+            results = self.manager.batch_replace(
+                source, restart_if_was_running=True, on_progress=on_instance
+            )
             ok_n = sum(1 for r in results if r.ok)
             fail = [r for r in results if not r.ok]
             summary = [f"完成：成功 {ok_n}/{len(results)}"]
@@ -1152,7 +1175,7 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
             self.after(0, self._persist)
             self.after(0, self._refresh_version_badge)
 
-        self._run_async("手工替换", job)
+        self._run_async("手工替换", job, message=f"正在批量替换 {len(configs)} 个实例…")
 
     @requires_session
     def _remove_instance(self, instance_id: str | None = None) -> None:
@@ -1173,10 +1196,16 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
 
         self._run_async("移除", job)
 
-    def _run_async(self, label: str, fn) -> None:
-        """启停等可能阻塞的操作丢后台线程，避免卡住 UI。"""
+    def _run_async(self, label: str, fn, message: str | None = None) -> None:
+        """启停等可能阻塞的操作丢后台线程，避免卡住 UI。
+
+        `message` 非空时在顶栏显示转圈状态（如「正在批量替换…」），让用户知道
+        程序还在干活而不是卡死；不给就保持顶栏干净。
+        """
         self.session.check()
         generation = self.session.generation
+        if message:
+            self._header_busy_start(message)
         def worker():
             try:
                 self.session._local.generation = generation
@@ -1189,9 +1218,50 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
             finally:
                 self.session._local.generation = None
                 self.after(0, self._safe_refresh)
+                if message:
+                    self.after(0, self._header_busy_stop)
 
         threading.Thread(target=worker, name=f"ui-{label}", daemon=True).start()
         self.after(50, self._safe_refresh)
+
+    # ------------------------------------------------------------ 顶栏状态条
+
+    def _header_busy(self) -> BusyStatus | None:
+        """顶栏转圈指示器；界面还没建好时返回 None。"""
+        label = getattr(self, "header_status", None)
+        if label is None:
+            return None
+        if getattr(self, "_header_busy_status", None) is None:
+            self._header_busy_status = BusyStatus(label, owner=self)
+        return self._header_busy_status
+
+    def _header_busy_start(self, text: str) -> None:
+        # 新的操作开始时，作废上一个「延迟清空」的定时器，
+        # 否则旧定时器会把新操作的状态条一起抹掉。
+        self._header_clear_job = None
+        busy = self._header_busy()
+        if busy is not None:
+            busy.start(text, TEXT_MUTED)
+
+    def _header_busy_update(self, text: str) -> None:
+        busy = self._header_busy()
+        if busy is not None:
+            busy.update(text)
+
+    def _header_busy_stop(self, text: str = "", color: str | None = None) -> None:
+        """停掉顶栏动画；给了终态文案就显示几秒再清空。"""
+        busy = self._header_busy()
+        if busy is None:
+            return
+        busy.stop(text, color)
+        if text:
+            self._header_clear_job = self.after(3000, self._header_busy_clear)
+
+    def _header_busy_clear(self) -> None:
+        self._header_clear_job = None
+        busy = self._header_busy()
+        if busy is not None:
+            busy.clear()
 
     @requires_session
     def _start(self) -> None:

@@ -412,6 +412,37 @@ def test_batch_file_failure_restores_first_instance_and_skips_next(active_sessio
     assert api.result.call_args.args[2]["result"] == "fail"
 
 
+def test_batch_update_reports_per_instance_progress(active_session, tmp_path, monkeypatch):
+    """批量更新要能报出「第几个实例、叫什么、处在哪个阶段」，界面据此显示进度。"""
+    session, _api = active_session
+    manager, first = _managed(session, tmp_path / "first")
+    _other_manager, second = _managed(session, tmp_path / "second")
+    manager._items[second.cfg.id] = second
+    source = _capable_client(tmp_path / "source", "2.0.0", b"MZ updated client")
+    monkeypatch.setattr(first, "assert_identity", lambda: None)
+    monkeypatch.setattr(first, "_status_reachable", lambda **_kwargs: False)
+    monkeypatch.setattr(second, "assert_identity", lambda: None)
+    monkeypatch.setattr(second, "_status_reachable", lambda **_kwargs: False)
+
+    seen: list[tuple[int, int, str, str]] = []
+    results = manager.batch_update(
+        source.parent,
+        on_progress=lambda index, total, name, phase: seen.append((index, total, name, phase)),
+    )
+    assert all(r.ok for r in results)
+    assert seen, "应该上报进度"
+    # 序号从 1 起，总数是实例数
+    assert seen[0][0] == 1
+    assert {total for _i, total, _n, _p in seen} == {2}
+    # 阶段名是约定好的三个
+    assert {phase for _i, _t, _n, phase in seen} <= {"stop", "apply", "restart"}
+    # 至少覆盖到「apply」阶段
+    assert any(phase == "apply" for _i, _t, _n, phase in seen)
+    # 实例名对得上
+    names = {first.cfg.name, second.cfg.name}
+    assert {name for _i, _t, name, _p in seen} <= names
+
+
 def test_reused_status_port_cannot_stop_another_account(active_session, tmp_path, monkeypatch):
     session, _api = active_session
     manager, mp = _managed(session, tmp_path)

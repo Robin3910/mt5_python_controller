@@ -362,3 +362,84 @@ def test_desktop_enrollment_approval_start_and_logout_flow(desktop):
     assert "nd_enrolled" in persisted
     assert "synthetic-memory-only-grant" not in persisted
     assert "synthetic-access-token" not in persisted
+
+
+def test_version_dialog_shows_spinning_status_and_disables_buttons(desktop, monkeypatch):
+    """版本更新对话框忙碌时要转圈 + 禁用按钮，防止用户连点起两个下载任务。"""
+    import version_dialog
+    from version_dialog import VersionUpdateDialog
+
+    app, api, _tmp_path, _errors = desktop
+    app.session.establish(api, "synthetic-access-token")
+    app._authenticated()
+    dialog = VersionUpdateDialog(app, app.manager)
+    try:
+        # 初始状态：按钮可用，状态栏是静态文案
+        assert dialog.detect_btn.cget("state") == "normal"
+        assert dialog.status.cget("text") == "尚未检测"
+
+        dialog._set_busy(True, "正在下载 v1.0.0…")
+        # 转圈字符出现
+        assert any(frame in dialog.status.cget("text") for frame in "⠋⠙⠹⠸⠼⠴⠦⠧")
+        assert "正在下载 v1.0.0" in dialog.status.cget("text")        # 忙碌时所有操作按钮都被禁用
+        for button in (
+            dialog.detect_btn,
+            dialog.update_release_btn,
+            dialog.update_specific_btn,
+            dialog.rollback_btn,
+            dialog.refresh_btn,
+        ):
+            assert button.cget("state") == "disabled"
+
+        # 阶段切换：只换文案，动画继续转
+        dialog._busy_indicator().update("正在校验安装包 sha256…")
+        assert "正在校验" in dialog.status.cget("text")
+        assert any(frame in dialog.status.cget("text") for frame in "⠋⠙⠹⠸⠼⠴⠦⠧")
+
+        # 结束：恢复按钮 + 写入终态文案
+        dialog._done_text = ("✓ 完成：成功 2/2", "#2EE6A8")
+        dialog._finish_busy()
+        assert dialog.detect_btn.cget("state") == "normal"
+        assert dialog.status.cget("text") == "✓ 完成：成功 2/2"
+        assert dialog._busy_indicator().running is False
+    finally:
+        dialog.destroy()
+
+
+def test_version_dialog_busy_status_survives_dialog_destroy(desktop):
+    """对话框被关掉后，残留的动画回调不能往已销毁的标签上写。"""
+    from version_dialog import VersionUpdateDialog
+
+    app, api, _tmp_path, _errors = desktop
+    app.session.establish(api, "synthetic-access-token")
+    app._authenticated()
+    dialog = VersionUpdateDialog(app, app.manager)
+    dialog._set_busy(True, "正在下载…")
+    dialog.destroy()
+    # 销毁后再触发一次回调：不能抛 TclError
+    dialog._busy_indicator().update("还在跑？")
+    dialog._busy_indicator().stop("完成")
+
+
+def test_main_window_header_status_shows_progress_and_clears(desktop, monkeypatch):
+    """主窗口顶栏状态条：长耗时操作要转圈，结束后清空。"""
+    app, api, tmp_path, _errors = desktop
+    app.session.establish(api, "synthetic-access-token")
+    app._authenticated()
+    assert app.header_status.cget("text") == ""
+
+    app._header_busy_start("正在批量替换 3 个实例…")
+    text = app.header_status.cget("text")
+    assert "正在批量替换 3 个实例" in text
+    assert any(frame in text for frame in "⠋⠙⠹⠸⠼⠴⠦⠧")
+
+    # 阶段推进：只换文案
+    app._header_busy_update("正在替换 (2/3) icmarkets：覆盖文件…")
+    assert "覆盖文件" in app.header_status.cget("text")
+    assert any(frame in app.header_status.cget("text") for frame in "⠋⠙⠹⠸⠼⠴⠦⠧")
+
+    # 结束并清空
+    app._header_busy_stop("✓ 完成：成功 3/3", "#2EE6A8")
+    assert "完成" in app.header_status.cget("text")
+    app._header_busy_clear()
+    assert app.header_status.cget("text") == ""
