@@ -47,6 +47,11 @@ from theme import (
 
 _NO_VERSION = "（尚未检测）"
 
+# 状态条 loading 动画：8 帧 Braille 旋转（风车型），跨 Windows/macOS/Linux 都能显示。
+# 100ms 一帧才像"在转"；再慢就感觉卡顿。
+_BUSY_FRAMES = ("\u280b", "\u2819", "\u2839", "\u2838", "\u283c", "\u2834", "\u2826", "\u2827")
+_BUSY_TICK_MS = 100
+
 
 class ImportNodeDialog(SessionDialog):
     """把一个 MT5 目录部署成新的节点实例。成功后 `created` 为新实例配置。"""
@@ -67,6 +72,7 @@ class ImportNodeDialog(SessionDialog):
         self.created: InstanceConfig | None = None
         self._busy = False
         self._versions: list[dict] = []
+        self._busy_status_token = 0  # 状态条 loading 动画的代数；切换阶段时 +1，旧动画会自检失效
         self._current = ""
         self._pending_cfg = None
 
@@ -82,6 +88,32 @@ class ImportNodeDialog(SessionDialog):
         self.after(120, self._detect_versions)
 
     # ---------------------------------------------------------------- 布局
+
+    def _start_busy_status(self, text: str, color: str) -> None:
+        """状态条进入「忙碌 + loading 点数」状态。重复调用会替换前一个动画，
+        不会和上一阶段残留的 after 循环打架。"""
+        self._stop_busy_status()
+        self._busy_status_token += 1
+        token = self._busy_status_token
+
+        def render(frame_idx: int = 0) -> None:
+            # 已被新动画或终态覆盖 → 静默退出
+            if token != self._busy_status_token or not self.winfo_exists():
+                return
+            try:
+                self.status.configure(
+                    text=f"{_BUSY_FRAMES[frame_idx % len(_BUSY_FRAMES)]}  {text}",
+                    text_color=color,
+                )
+            except tk.TclError:
+                return
+            self.after(_BUSY_TICK_MS, lambda: render(frame_idx + 1))
+
+        render(0)
+
+    def _stop_busy_status(self) -> None:
+        """停掉 loading 动画；终态文本由调用方随后 configure 上去即可。"""
+        self._busy_status_token += 1
 
     def _build(self) -> None:
         card = glass_card(self)
@@ -169,7 +201,7 @@ class ImportNodeDialog(SessionDialog):
         ).pack(anchor="w", pady=(6, 0))
 
         self.status = ctk.CTkLabel(
-            card, text="", text_color=TEXT_DIM, font=font(12),
+            card, text="", text_color=TEXT_DIM, font=font(30, "bold"),
             anchor="w", justify="left", wraplength=700,
         )
         self.status.grid(row=7, column=0, columnspan=3, padx=16, pady=(6, 4), sticky="ew")
@@ -410,7 +442,7 @@ class ImportNodeDialog(SessionDialog):
         """先申请节点，再下载 → 校验 → 解压 → 覆盖到 MT5 目录 → 写 .env → 注册实例。"""
         self.session_check()
         if not (account_raw or "").strip():
-            self.after(0, lambda: self.status.configure(text="正在读取 MT5 当前登录号…", text_color=TEXT_MUTED))
+            self.after(0, lambda: self._start_busy_status("正在读取 MT5 当前登录号", TEXT_MUTED))
 
         def enroll(login: int, server: str) -> None:
             self.dashboard._enroll_instance(self._pending_cfg, login, server)
@@ -419,8 +451,8 @@ class ImportNodeDialog(SessionDialog):
         with tempfile.TemporaryDirectory(prefix="node_client_import_") as tmp:
             tmpdir = Path(tmp)
             pkg = tmpdir / f"node_client-{version}.zip"
-            self.after(0, lambda: self.status.configure(
-                text=f"正在下载 v{version}…", text_color=TEXT_MUTED
+            self.after(0, lambda: self._start_busy_status(
+                f"正在下载 v{version}，预计需要3-4分钟，请不要操作鼠标！等待自动导入完成！", TEXT_MUTED
             ))
             vs.download_package(target, version, pkg)
             if not vs.verify_sha256(pkg, sha256):
@@ -431,8 +463,8 @@ class ImportNodeDialog(SessionDialog):
             if not ok:
                 raise RuntimeError(msg)
 
-            self.after(0, lambda: self.status.configure(
-                text="正在部署到 MT5 目录…", text_color=TEXT_MUTED
+            self.after(0, lambda: self._start_busy_status(
+                "正在部署到 MT5 目录，请不要操作鼠标！等待自动导入完成！", TEXT_MUTED
             ))
             exe_path = directory / "node_client.exe"
             # 目录里可能已有旧客户端，backup=True 让它先进版本化备份
@@ -491,6 +523,7 @@ class ImportNodeDialog(SessionDialog):
             parts.append(".env 已覆盖")
         elif env_written:
             parts.append(".env 已生成")
+        self._stop_busy_status()
         self.status.configure(text="　".join(parts), text_color=ACCENT)
 
         if env_overwritten:

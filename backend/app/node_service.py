@@ -44,6 +44,7 @@ def node_row_to_dict(row: Node) -> dict:
         "approval_status": row.approval_status,
         "requested_by_user_id": row.requested_by_user_id,
         "admin_enable_requested": bool(row.admin_enable_requested),
+        "is_primary": bool(row.is_primary),
         "created_at": row.created_at.timestamp() if row.created_at else time.time(),
     }
 
@@ -254,17 +255,93 @@ async def set_owner(
             await revoke_on_transfer(s, node_id, owner_user_id)
             row.owner_user_id = owner_user_id
             await activate_if_ready(s, row)
+            # 跨用户转交时即时清掉主节点标记：主节点是「按所有者」维度唯一，
+            # 改主人后老标记对新主人没有意义也违反唯一约束。
+            if row.is_primary:
+                row.is_primary = False
             if needs_strict_audit and audit_principal is not None:
                 from .dashboard_audit import begin_operation
                 audit_row = await begin_operation(s, audit_principal, "assign_node", target=node_id,
                                                   params={"node_id": node_id}, ip=audit_ip, result="ok")
                 audit_row.before_json = {"owner_user_id": previous_owner}
                 audit_row.after_json = {"owner_user_id": owner_user_id, "approval_status": row.approval_status,
-                                        "enabled": row.enabled}
+                                        "enabled": row.enabled, "is_primary": row.is_primary}
         await s.commit()
         await s.refresh(row)
         d = node_row_to_dict(row)
     await store.cache_node(d)
+    return d
+
+
+async def _clear_primary_for_owner(
+    session, owner_user_id: Optional[int], *, exclude_node_id: str | None = None,
+) -> None:
+    """清掉同一所有者下其它节点的主节点标记（保留 exclude_node_id）。"""
+    stmt = select(Node).where(Node.is_primary.is_(True))
+    if owner_user_id is None:
+        stmt = stmt.where(Node.owner_user_id.is_(None))
+    else:
+        stmt = stmt.where(Node.owner_user_id == owner_user_id)
+    rows = (await session.execute(stmt)).scalars().all()
+    for r in rows:
+        if exclude_node_id and r.node_id == exclude_node_id:
+            continue
+        r.is_primary = False
+
+
+async def set_primary(
+    store: RedisStore, node_id: str, is_primary: bool,
+    *, audit_principal=None, audit_ip: str | None = None,
+) -> Optional[dict]:
+    """设置 / 取消某节点的主节点标记；按 owner 唯一。
+
+    设置为 True 时会把同 owner 下其它节点的主节点标记全部清掉，保证唯一性。
+    取消时只清本节点。权限与归属校验由路由层完成（先 owned_node_or_404）。
+    """
+    async with SessionLocal() as s:
+        row = await _locked_node(s, node_id)
+        if not row:
+            return None
+        owner_after: Optional[int] = row.owner_user_id
+        before = {"is_primary": bool(row.is_primary)}
+        if bool(row.is_primary) == bool(is_primary):
+            # 状态未变，避免无谓的写入与审计
+            return node_row_to_dict(row)
+        if is_primary:
+            await _clear_primary_for_owner(s, row.owner_user_id, exclude_node_id=node_id)
+        row.is_primary = bool(is_primary)
+        # 审计：业务写入前先占位，确保与 is_primary 一起提交。
+        # 这里不能用 commit 之后的 begin_operation：commit 已结束，写入会留在外层
+        # 但因为 begin_operation 内部只 flush、不 commit，会和业务行一起落到下一次提交。
+        # 因此先 flush 业务行再写审计，最后统一 commit。
+        await s.flush()
+        if audit_principal is not None:
+            from .dashboard_audit import begin_operation
+            audit_row = await begin_operation(
+                s, audit_principal,
+                "set_primary_node", target=node_id,
+                params={"is_primary": bool(is_primary)},
+                ip=audit_ip, result="ok",
+            )
+            audit_row.before_json = before
+            audit_row.after_json = {"is_primary": bool(row.is_primary), "owner_user_id": owner_after}
+        await s.commit()
+        await s.refresh(row)
+        d = node_row_to_dict(row)
+    # 任一节点的主节点标记变更，都可能影响同 owner 下其它节点的视图，
+    # 全部刷一遍缓存（包含受影响节点的 owner），保证下一次列表返回最新状态。
+    async with SessionLocal() as s2:
+        affected = (
+            await s2.execute(
+                select(Node).where(
+                    Node.owner_user_id.is_(row.owner_user_id)
+                    if row.owner_user_id is None
+                    else Node.owner_user_id == row.owner_user_id
+                )
+            )
+        ).scalars().all()
+    for r in affected:
+        await store.cache_node(node_row_to_dict(r))
     return d
 
 

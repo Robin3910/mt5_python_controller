@@ -63,7 +63,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name="node_client_dashboard",
+    name="亿点点 • 交易",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

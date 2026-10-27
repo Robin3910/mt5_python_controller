@@ -52,25 +52,6 @@ const symbolOptions = computed<string[]>(() => {
   return [...found].sort()
 })
 
-const nodeOptions = computed(() =>
-  [...hub.nodes].sort((a, b) => {
-    const ao = statusOf(a) === 'online' ? 0 : 1
-    const bo = statusOf(b) === 'online' ? 0 : 1
-    if (ao !== bo) return ao - bo
-    return (a.name || a.node_id).localeCompare(b.name || b.node_id, 'zh')
-  }),
-)
-
-function nodeLabel(n: NodeOut): string {
-  const name = n.name || n.node_id
-  return n.mt5_login ? `${name} · ${n.mt5_login}` : name
-}
-
-function onSelectNode(id: string): void {
-  selectedNodeId.value = id
-  nodeMenuOpen.value = false
-}
-
 function onDocClick(e: MouseEvent): void {
   const root = (e.target as HTMLElement | null)?.closest?.('.trend-hub-field')
   if (!root) nodeMenuOpen.value = false
@@ -113,15 +94,15 @@ onUnmounted(() => {
 <template>
   <div :class="{ 'hub-trend-compact': compact }">
     <div class="row between hub-trend-head">
-      <div>
+      <!-- <div>
         <h2 v-if="!compact" style="margin: 0">趋势面板</h2>
         <strong v-else class="hub-trend-title">趋势</strong>
         <p class="muted hub-trend-desc">
           <template v-if="compact">与趋势面板同一套 EMA / RSI 观测；默认在线节点、{{ DEFAULT_SYMBOL }}</template>
           <template v-else>跨节点只读观测 EMA / RSI 趋势；默认第一个在线节点、品种 {{ DEFAULT_SYMBOL }}</template>
         </p>
-      </div>
-      <div class="row hub-trend-actions">
+      </div> -->
+      <!-- <div class="row hub-trend-actions">
         <RouterLink v-if="compact" class="hub-trend-link" to="/trend">完整面板 →</RouterLink>
         <div class="trend-hub-field">
           <span class="muted" style="font-size: 12px">观察节点</span>
@@ -157,7 +138,7 @@ onUnmounted(() => {
             </button>
           </div>
         </div>
-      </div>
+      </div> -->
     </div>
 
     <div v-if="loading" class="card card-pad muted">正在加载节点列表…</div>
@@ -281,8 +262,12 @@ onUnmounted(() => {
 }
 .trend-hub-option:hover,
 .trend-hub-option.active {
-  background: rgba(59, 130, 246, 0.18);
+  background: linear-gradient(135deg, var(--primary) 0%, var(--primary-d) 100%);
+  color: #ffffff;
+  box-shadow: 0 0 12px rgba(37, 99, 234, 0.32);
 }
+.trend-hub-option.active .dot.online { box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.4), 0 0 12px rgba(16, 185, 129, 0.6); }
+.trend-hub-option.active .dot.offline { background: #9ca3af; box-shadow: none; }
 @media (max-width: 768px) {
   .hub-trend-head {
     flex-direction: column;

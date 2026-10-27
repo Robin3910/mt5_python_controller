@@ -73,6 +73,10 @@ function logout(): void {
       </div>
 
       <nav class="nav">
+        <RouterLink v-if="auth.hasMenu('home')" to="/home">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 11l9-8 9 8"/><path d="M5 10v10a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1V10"/></svg>
+          <span>首页</span>
+        </RouterLink>
         <RouterLink v-if="auth.hasMenu('dashboard')" to="/">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
           <span>总览</span>

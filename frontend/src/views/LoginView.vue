@@ -33,7 +33,7 @@ async function submitCredentials(): Promise<void> {
       totpCode.value = ''
       return
     }
-    router.push({ name: 'dashboard' })
+    router.push({ name: 'home' })
   } catch (e: unknown) {
     const err = e as { response?: { data?: { detail?: string } } }
     error.value = mapError(err?.response?.data?.detail)
@@ -51,7 +51,7 @@ async function submit2fa(): Promise<void> {
   loading.value = true
   try {
     await auth.login2fa(loginToken.value, totpCode.value.trim())
-    router.push({ name: 'dashboard' })
+    router.push({ name: 'home' })
   } catch (e: unknown) {
     const err = e as { response?: { data?: { detail?: string } } }
     error.value = mapError(err?.response?.data?.detail)

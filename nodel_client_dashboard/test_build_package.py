@@ -14,7 +14,7 @@ def _build_dir(tmp_path: Path, version: str = VERSION) -> Path:
     """造一个面板产物目录，并带上只有在 dist 里跑过面板才会出现的运行期数据。"""
     root = tmp_path / "dist"
     root.mkdir(parents=True, exist_ok=True)
-    (root / "node_client_dashboard.exe").write_bytes(b"MZ fake")
+    (root / "亿点点 • 交易.exe").write_bytes(b"MZ fake")
     (root / "version.txt").write_text(version + "\n", encoding="utf-8")
     (root / "panel_config.json").write_text('{"node_token": "real-secret"}', encoding="utf-8")
     (root / "instances.json").write_text('[{"exe_path": "C:\\\\mt5"}]', encoding="utf-8")
@@ -30,7 +30,7 @@ def _build_dir(tmp_path: Path, version: str = VERSION) -> Path:
 
 
 def test_should_include_excludes_runtime_data():
-    assert bp.should_include("node_client_dashboard.exe")
+    assert bp.should_include("亿点点 • 交易.exe")
     assert bp.should_include("version.txt")
     assert bp.should_include("README.md")
     assert bp.should_include("_internal/base_library.zip")
@@ -46,7 +46,7 @@ def test_should_include_excludes_runtime_data():
     assert not bp.should_include("instances.json")
     assert not bp.should_include(".dashboard.lock")
     assert not bp.should_include("logs/node-1/2026-08-13.log")
-    assert not bp.should_include("node_client_dashboard.exe.bak")
+    assert not bp.should_include("亿点点 • 交易.exe.bak")
     assert not bp.should_include("__pycache__/x.pyc")
     assert not bp.should_include("run.log")
     assert not bp.should_include("")
@@ -58,7 +58,7 @@ def test_build_package_excludes_runtime_data(tmp_path: Path):
     assert zip_path.name == f"{STEM}.zip"
     with zipfile.ZipFile(zip_path) as zf:
         names = set(zf.namelist())
-    assert f"{STEM}/node_client_dashboard.exe" in names
+    assert f"{STEM}/亿点点 • 交易.exe" in names
     assert f"{STEM}/version.txt" in names
     # 令牌与本机拓扑绝不能跟着分发包走
     assert not any(Path(n).name == "panel_config.json" for n in names)
@@ -115,7 +115,7 @@ def test_build_package_keeps_doc_already_in_build_dir(tmp_path: Path):
 def test_build_package_requires_version_txt(tmp_path: Path):
     root = tmp_path / "dist"
     root.mkdir()
-    (root / "node_client_dashboard.exe").write_bytes(b"MZ")
+    (root / "亿点点 • 交易.exe").write_bytes(b"MZ")
     with pytest.raises(FileNotFoundError, match="version.txt"):
         bp.build_package(root, tmp_path / "out")
 
@@ -124,7 +124,7 @@ def test_build_package_requires_entry(tmp_path: Path):
     root = tmp_path / "dist"
     root.mkdir()
     (root / "version.txt").write_text(VERSION + "\n", encoding="utf-8")
-    with pytest.raises(FileNotFoundError, match="node_client_dashboard.exe"):
+    with pytest.raises(FileNotFoundError, match="亿点点 • 交易.exe"):
         bp.build_package(root, tmp_path / "out")
 
 
@@ -154,12 +154,12 @@ def test_build_package_rejects_output_inside_build_dir(tmp_path: Path):
 def test_verify_package_rejects_leaked_config_and_missing_entry(tmp_path: Path):
     good = tmp_path / "good.zip"
     with zipfile.ZipFile(good, "w") as zf:
-        zf.writestr(f"{STEM}/node_client_dashboard.exe", b"MZ")
+        zf.writestr(f"{STEM}/亿点点 • 交易.exe", b"MZ")
     assert bp.verify_package(good) == (True, "")
 
     leaked = tmp_path / "leaked.zip"
     with zipfile.ZipFile(leaked, "w") as zf:
-        zf.writestr(f"{STEM}/node_client_dashboard.exe", b"MZ")
+        zf.writestr(f"{STEM}/亿点点 • 交易.exe", b"MZ")
         zf.writestr(f"{STEM}/panel_config.json", '{"node_token": "secret"}')
     ok, reason = bp.verify_package(leaked)
     assert not ok and "panel_config.json" in reason
@@ -168,7 +168,7 @@ def test_verify_package_rejects_leaked_config_and_missing_entry(tmp_path: Path):
     with zipfile.ZipFile(no_entry, "w") as zf:
         zf.writestr(f"{STEM}/README.md", "hi")
     ok, reason = bp.verify_package(no_entry)
-    assert not ok and "node_client_dashboard.exe" in reason
+    assert not ok and "亿点点 • 交易.exe" in reason
 
 
 def test_read_version_and_package_name(tmp_path: Path):
@@ -203,7 +203,7 @@ def test_build_package_requires_dashboard_env_file(tmp_path: Path):
 def test_self_check_rejects_nested_runtime_data(tmp_path: Path, runtime_path):
     archive = tmp_path / "leaked.zip"
     with zipfile.ZipFile(archive, "w") as package:
-        package.writestr(f"{STEM}/node_client_dashboard.exe", b"MZ")
+        package.writestr(f"{STEM}/亿点点 • 交易.exe", b"MZ")
         package.writestr(f"{STEM}/nested/{runtime_path}", "synthetic-data")
     assert not bp.verify_package(archive)[0]
     assert bp.should_include(".env.example")

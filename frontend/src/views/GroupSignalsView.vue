@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 // 分组信号页：展示某分组处理过的 strategy 主任务与各节点下发明细
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -1148,7 +1148,7 @@ onUnmounted(stopAutoRefresh)
 }
 
 .group-signal-table tr.signal-focus td {
-  background: rgba(0, 212, 170, 0.12);
+  background: rgba(37, 99, 234, 0.12);
 }
 
 .group-detail-table {

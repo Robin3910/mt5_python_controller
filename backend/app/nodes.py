@@ -16,7 +16,7 @@ from .deps import (
     require_admin,
     require_menu,
 )
-from .models import LotBatch, NodeCreate, NodeOut, NodeUpdate, PaginatedNodeDispatches
+from .models import LotBatch, NodeCreate, NodeOut, NodePrimaryUpdate, NodeUpdate, PaginatedNodeDispatches
 from .db import SessionLocal
 from .orm import NodeCredential
 from .permissions import MENU_NODES, Principal
@@ -41,6 +41,7 @@ def _node_audit_snapshot(d: dict | None) -> dict | None:
         "approval_status": d.get("approval_status", "approved"),
         "requested_by_user_id": d.get("requested_by_user_id"),
         "admin_enable_requested": d.get("admin_enable_requested", False),
+        "is_primary": d.get("is_primary", False),
     }
 
 
@@ -84,6 +85,7 @@ async def _to_node_out(
         credential_generation=credential.generation if credential else 0,
         legacy_allowed=bool(credential.legacy_allowed) if credential else True,
         has_credential=bool(credential and credential.token_sha256),
+        is_primary=bool(d.get("is_primary", False)),
     )
 
 
@@ -225,3 +227,27 @@ async def batch_lot(
         category="node", before=None, after=body.model_dump(),
     )
     return {"status": "ok", "updated": updated}
+
+
+@router.post("/{node_id}/primary", response_model=NodeOut)
+async def set_primary_node(
+    node_id: str,
+    body: NodePrimaryUpdate,
+    request: Request,
+    store: RedisStore = Depends(get_store),
+    p: Principal = Depends(require_menu(MENU_NODES)),
+):
+    """设置 / 取消某节点的主节点标记。
+
+    每个所有者（普通用户 / 管理员）名下最多一个主节点；传 is_primary=True 时
+    同 owner 下其它节点的原主节点标记会被自动清掉，保证唯一性。归属校验沿用
+    owned_node_or_404 普通用户不能动管理员名下的节点。
+    """
+    await owned_node_or_404(store, p, node_id)
+    d = await node_service.set_primary(
+        store, node_id, bool(body.is_primary),
+        audit_principal=p, audit_ip=client_ip(request),
+    )
+    if not d:
+        raise HTTPException(status_code=404, detail="node not found")
+    return await _to_node_out(store, d, await rbac_service.owner_names_for(p))

@@ -40,6 +40,8 @@ class ListItemVM:
     health: str
     selected: bool
     daemon: bool
+    # 当前 MT5 交易账号：优先用 runtime 上报的实时账号，未上报时退回配置中的期望账号。
+    mt5_login: int = 0
 
 
 @dataclass(frozen=True)
@@ -87,6 +89,7 @@ def build_list_item(mp: "ManagedProcess", selected_id: str | None) -> ListItemVM
         status_line += "  ·  需管理员绑定"
     if rt.version:
         status_line = f"v{rt.version}  ·  {status_line}"
+    mt5_login = int(rt.mt5_login) if rt.mt5_login else int(cfg.mt5_login or 0)
     return ListItemVM(
         id=cfg.id,
         title=title,
@@ -96,6 +99,7 @@ def build_list_item(mp: "ManagedProcess", selected_id: str | None) -> ListItemVM
         health=rt.health or "unknown",
         selected=cfg.id == selected_id,
         daemon=bool(cfg.daemon),
+        mt5_login=mt5_login,
     )
 
 

@@ -17,6 +17,7 @@ import type {
   NodeCreatePayload,
   NodeFeedItem,
   NodeOut,
+  NodePrimaryUpdatePayload,
   NodeTokenInfo,
   NodeUpdatePayload,
   RiskFeedItem,
@@ -196,6 +197,22 @@ export const useHubStore = defineStore('hub', {
     async deleteNode(id: string, options?: { q?: string }): Promise<void> {
       await api.delete(`/api/nodes/${id}`)
       await this.fetchNodes(options)
+    },
+    /**
+     * 设置 / 取消某节点的主节点标记。后端已确保同 owner 维度下唯一：
+     * 把 A 设为主时，原主节点的标记会自动被清掉，所以本地拿到的最新列表里
+     * `is_primary` 已是最终态。失败抛错，由调用方决定怎么提示。
+     */
+    async setNodePrimary(
+      id: string,
+      isPrimary: boolean,
+      options?: { q?: string },
+    ): Promise<NodeOut> {
+      const payload: NodePrimaryUpdatePayload = { is_primary: isPrimary }
+      const { data } = await api.post<NodeOut>(`/api/nodes/${id}/primary`, payload)
+      // 后端会清掉同 owner 下其它节点的原主节点标记，整列表都要刷
+      await this.fetchNodes(options)
+      return data
     },
     // ---- 分组增删改查（strategy 信号链路）----
     async fetchGroups(options?: { q?: string }): Promise<void> {

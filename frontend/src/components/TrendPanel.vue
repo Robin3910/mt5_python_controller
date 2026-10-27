@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 // 节点详情「趋势面板」：按币种 / 周期实时查看 EMA + RSI 合成的趋势得分。
 // 面板只负责选品种、调参数与展示；指标算法、权重换算与多空判定全在后端
 // （trend_indicators），前端不承载任何交易决策。
@@ -207,11 +207,6 @@ function fmtSigned(value: number | null | undefined, digits = 1): string {
   return `${value > 0 ? '+' : ''}${value.toFixed(digits)}`
 }
 
-function fmtTime(seconds: number | null | undefined): string {
-  if (!seconds) return '—'
-  return new Date(seconds * 1000).toLocaleString('zh-CN', { hour12: false })
-}
-
 function scoreClass(value: number | null | undefined): string {
   if (!value) return ''
   return value > 0 ? 'is-bull' : 'is-bear'
@@ -286,8 +281,8 @@ function buildOption(d: TrendPanelData) {
       textStyle: { color: '#e8edf5', fontSize: 11 },
     },
     grid: [
-      { left: 60, right: 18, top: 14, height: '54%' },
-      { left: 60, right: 18, top: '72%', height: '20%' },
+      { left: 8, right: 18, top: 14, height: '54%', containLabel: true },
+      { left: 8, right: 18, top: '72%', height: '20%', containLabel: true },
     ],
     xAxis: [
       {
@@ -407,9 +402,75 @@ onBeforeUnmount(() => {
 
 <template>
   <div :class="{ 'trend-compact': compact }">
+
+    <!-- 品种 / 周期 / 刷新 -->
+    <div v-if="!compact" class="card card-pad" style="margin-bottom: 16px">
+      <div class="row between" style="align-items: flex-start">
+        <div class="row" style="gap: 10px">
+          <label class="trend-field">
+            <span class="trend-field-k">品种</span>
+            <input
+              v-model="symbolInput"
+              class="trend-input"
+              placeholder="如 XAUUSD"
+              @keyup.enter="commitSymbol"
+              @blur="commitSymbol"
+            />
+          </label>
+          <label class="trend-field">
+            <span class="trend-field-k">周期</span>
+            <TagSelect v-model="form.timeframe" :options="TREND_TIMEFRAMES" aria-label="周期" />
+          </label>
+          <label class="trend-field">
+            <span class="trend-field-k">自动刷新</span>
+            <TagSelect v-model="refreshMs" :options="TREND_REFRESH_OPTIONS" aria-label="自动刷新" />
+          </label>
+        </div>
+        <button class="btn-sm btn-ghost" :disabled="loading || !symbol" @click="load">
+          {{ loading ? '读取中…' : '立即刷新' }}
+        </button>
+      </div>
+
+      <div v-if="symbolOptions?.length" class="trend-chips">
+        <button
+          v-for="s in symbolOptions"
+          :key="s"
+          class="trend-chip"
+          :class="{ active: s === symbol }"
+          @click="pickSymbol(s)"
+        >
+          {{ s }}
+        </button>
+      </div>
+      <p v-if="!symbolOptions?.length" class="muted trend-hint">
+        该节点暂无报价与持仓品种可选，直接输入品种代码即可查看。
+      </p>
+    </div>
+    
     <!-- 趋势总览 -->
     <div class="card card-pad" :style="{ marginBottom: compact ? 0 : '16px' }">
       <div class="row between" style="align-items: flex-start">
+        
+      <div v-if="compact" class="trend-compact-tools">
+        <div v-if="compact && symbolOptions?.length" class="trend-chips">
+          <button
+            v-for="s in symbolOptions"
+            :key="s"
+            class="trend-chip"
+            :class="{ active: s === symbol }"
+            @click="pickSymbol(s)"
+          >
+            {{ s }}
+          </button>
+        </div>
+        <label class="trend-field">
+          <span class="trend-field-k">周期</span>
+          <TagSelect v-model="form.timeframe" :options="TREND_TIMEFRAMES" aria-label="周期" />
+        </label>
+        <!-- <button class="btn-sm btn-ghost" :disabled="loading || !symbol" @click="load">
+          {{ loading ? '读取中…' : '刷新' }}
+        </button> -->
+      </div>
         <div>
           <strong>{{ data?.symbol || symbol || '—' }}</strong>
           <span class="muted trend-sub">{{ timeframeLabel(cfg.timeframe) }}</span>
@@ -449,35 +510,27 @@ onBeforeUnmount(() => {
       </p>
       <p v-else class="muted trend-hint">选择品种后显示趋势得分。</p>
 
-      <div class="trend-foot muted">
+      <!-- <div class="trend-foot muted">
         <span>权重：EMA {{ emaWeightPct }}% + RSI {{ rsiWeightPct }}%</span>
         <span>阈值：多头 &gt; {{ cfg.bullish }} ｜ 中性 {{ cfg.bearish }}~{{ cfg.bullish }} ｜ 空头 &lt; {{ cfg.bearish }}</span>
         <span>最后更新：{{ fmtTime(data?.updated_at) }}</span>
         <span>K 线时间：{{ fmtTime(data?.bar_time) }}</span>
-      </div>
+      </div> -->
 
-      <div v-if="compact" class="trend-compact-tools">
-        <label class="trend-field">
-          <span class="trend-field-k">周期</span>
-          <TagSelect v-model="form.timeframe" :options="TREND_TIMEFRAMES" aria-label="周期" />
-        </label>
-        <button class="btn-sm btn-ghost" :disabled="loading || !symbol" @click="load">
-          {{ loading ? '读取中…' : '刷新' }}
-        </button>
-      </div>
-      <div v-if="compact && symbolOptions?.length" class="trend-chips">
-        <button
-          v-for="s in symbolOptions"
-          :key="s"
-          class="trend-chip"
-          :class="{ active: s === symbol }"
-          @click="pickSymbol(s)"
-        >
-          {{ s }}
-        </button>
-      </div>
+
       <p v-if="!online" class="trend-warn">节点当前离线，无法读取实时行情。</p>
       <p v-else-if="error" class="trend-warn">{{ error }}</p>
+    </div>
+
+    <div v-if="compact" class="card card-pad trend-chart-card trend-compact-tools">
+      <!-- <div class="row between" style="margin-bottom: 8px">
+        <strong style="font-size: 13px">K 线与指标</strong>
+        <span class="muted trend-sub">
+          上：K 线 + EMA ｜ 下：RSI（虚线为超买超卖，点线为偏多偏空）
+        </span>
+      </div> -->
+      <div ref="chartEl" class="trend-chart"></div>
+      <p v-if="!data?.bars?.length" class="muted trend-hint">暂无 K 线数据。</p>
     </div>
 
     <!-- 指标详情 -->
@@ -534,50 +587,6 @@ onBeforeUnmount(() => {
       </div>
       <div ref="chartEl" class="trend-chart"></div>
       <p v-if="!data?.bars?.length" class="muted trend-hint">暂无 K 线数据。</p>
-    </div>
-
-    <!-- 品种 / 周期 / 刷新 -->
-    <div v-if="!compact" class="card card-pad" style="margin-bottom: 16px">
-      <div class="row between" style="align-items: flex-start">
-        <div class="row" style="gap: 10px">
-          <label class="trend-field">
-            <span class="trend-field-k">品种</span>
-            <input
-              v-model="symbolInput"
-              class="trend-input"
-              placeholder="如 XAUUSD"
-              @keyup.enter="commitSymbol"
-              @blur="commitSymbol"
-            />
-          </label>
-          <label class="trend-field">
-            <span class="trend-field-k">周期</span>
-            <TagSelect v-model="form.timeframe" :options="TREND_TIMEFRAMES" aria-label="周期" />
-          </label>
-          <label class="trend-field">
-            <span class="trend-field-k">自动刷新</span>
-            <TagSelect v-model="refreshMs" :options="TREND_REFRESH_OPTIONS" aria-label="自动刷新" />
-          </label>
-        </div>
-        <button class="btn-sm btn-ghost" :disabled="loading || !symbol" @click="load">
-          {{ loading ? '读取中…' : '立即刷新' }}
-        </button>
-      </div>
-
-      <div v-if="symbolOptions?.length" class="trend-chips">
-        <button
-          v-for="s in symbolOptions"
-          :key="s"
-          class="trend-chip"
-          :class="{ active: s === symbol }"
-          @click="pickSymbol(s)"
-        >
-          {{ s }}
-        </button>
-      </div>
-      <p v-if="!symbolOptions?.length" class="muted trend-hint">
-        该节点暂无报价与持仓品种可选，直接输入品种代码即可查看。
-      </p>
     </div>
 
     <!-- 参数 -->
@@ -686,9 +695,14 @@ onBeforeUnmount(() => {
 }
 .trend-chip:hover { color: var(--text); border-color: var(--glass-highlight); }
 .trend-chip.active {
-  background: rgba(0, 212, 170, 0.12);
-  border-color: var(--border-bright);
-  color: var(--primary);
+  background: linear-gradient(135deg, var(--primary) 0%, var(--primary-d) 100%);
+  border-color: transparent;
+  color: #ffffff;
+  box-shadow: 0 0 12px rgba(37, 99, 234, 0.32);
+}
+.trend-chip.active:hover {
+  color: #ffffff;
+  background: linear-gradient(135deg, #3b82f6 0%, var(--primary) 100%);
 }
 
 .trend-hint { font-size: 12px; margin: 10px 0 0; line-height: 1.5; }

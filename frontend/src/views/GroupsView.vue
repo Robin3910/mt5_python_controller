@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 // 分组管理页：strategy 信号（Webhook model=strategy）的分发单元
 // 新建/编辑/删除分组、启停、维护成员节点、设置分组级分发模式；信号明细见 GroupSignalsView
 import { computed, defineAsyncComponent, onMounted, ref, reactive, watch } from 'vue'
@@ -1343,8 +1343,8 @@ async function onStrategyFormSaved(): Promise<void> {
   --el-table-header-text-color: var(--muted);
   --el-table-text-color: var(--text);
   --el-table-border-color: var(--glass-border);
-  --el-table-row-hover-bg-color: rgba(0, 212, 170, 0.05);
-  --el-table-current-row-bg-color: rgba(0, 212, 170, 0.05);
+  --el-table-row-hover-bg-color: rgba(37, 99, 234, 0.05);
+  --el-table-current-row-bg-color: rgba(37, 99, 234, 0.05);
   --el-fill-color-blank: #0e1628;
   --el-table-fixed-box-shadow: -8px 0 12px rgba(0, 0, 0, 0.45);
   width: 100%;

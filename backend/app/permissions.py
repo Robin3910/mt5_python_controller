@@ -15,6 +15,7 @@ ADMIN_ROLE_CODE = "admin"   # 内置超级管理员角色
 DEFAULT_ROLE_CODE = "user"  # 内置普通用户角色（新建用户未指定角色时使用）
 
 MENU_DASHBOARD = "dashboard"
+MENU_HOME = "home"
 MENU_NODES = "nodes"
 MENU_TREND = "trend"
 MENU_GROUPS = "groups"
@@ -36,6 +37,7 @@ class MenuDef:
 
 
 MENU_REGISTRY: tuple[MenuDef, ...] = (
+    MenuDef(MENU_HOME, "首页", "/home", True),
     MenuDef(MENU_DASHBOARD, "总览", "/", True),
     MenuDef(MENU_NODES, "节点", "/nodes", True),
     MenuDef(MENU_TREND, "趋势面板", "/trend", True),
