@@ -74,6 +74,8 @@ MESSAGE_LIMIT = 255
 _TERMINAL_STATUSES = ("done", "failed")
 # 一次停止流程内的「读持仓 -> 平仓」轮次；平仓本身在 mt5_client 层已有瞬时错误重试
 _CLOSE_ALL_ATTEMPTS = 3
+# 分档改单被券商拒绝后，按行情保活间隔再试，避免跟着 0.5 秒报价连刷
+_LOT_SLTP_RETRY_SEC = 5.0
 
 logger = logging.getLogger("node.strategy")
 
@@ -214,6 +216,12 @@ class StrategyRunner:
         self._signal_pl = signal_pl.prepare_runtime(
             signal_pl.extract_config(self.strategy.get("rules")),
         )
+        # 分档止盈止损：订单构成或热推变化才重算；失败签名用来按保活间隔重试
+        self._lot_sltp_sig: tuple = ()
+        self._lot_sltp_dirty = True
+        self._lot_sltp_fail_sig: Optional[tuple] = None
+        self._lot_sltp_fail_at = 0.0
+        self._lot_sltp_cross_blocked = False
         # 手动分散仓：每种规则只开一次；重连时优先用 runtime，其次用仓位 comment
         self._manual_fired: set[int] = set()
         # 越过止盈的 warning / 进度每条规则只发一次，避免每 tick 刷屏
@@ -315,6 +323,8 @@ class StrategyRunner:
         self._signal_pl = signal_pl.prepare_runtime(
             signal_pl.extract_config(self.strategy.get("rules")),
         )
+        self._lot_sltp_dirty = True
+        self._lot_sltp_fail_at = 0.0
         self._metric_specs = None
         if self._sub is not None:
             self._sub.wake()
@@ -487,6 +497,11 @@ class StrategyRunner:
             if pl_result == "done":
                 return True
             if pl_result != "hit":
+                lot_result = await self._lot_sltp_sync(event, positions)
+                if lot_result == "done":
+                    return True
+                if lot_result == "hit":
+                    return False
                 if await self._maybe_open_manual_scatter(event, positions):
                     return False
                 filtered = manual_scatter.exclude_manual(positions)
@@ -581,11 +596,12 @@ class StrategyRunner:
         return bal
 
     async def _signal_pl_advance(self, positions: list[dict]) -> Optional[str]:
-        """加仓路径的信号级盈亏控制。
+        """加仓路径的信号盈亏比。分档手数改走 _lot_sltp_sync，不在这里比浮盈。
 
         返回 done=已清该信号并收口；hit=本拍已平仓不再加仓；None=未触发。
         """
-        if not signal_pl.any_enabled(self._signal_pl) or not positions:
+        rule = (self._signal_pl or {}).get(signal_pl.RULE_FLOAT_PL_RATIO) or {}
+        if not rule.get("enabled") or not positions:
             return None
         balance = await self._read_balance()
         if balance is None:
@@ -638,6 +654,158 @@ class StrategyRunner:
             return "hit"
         self.request_stop(reason, detail=detail)
         return "done" if await self._close_all() else "hit"
+
+    async def _lot_sltp_sync(self, event: MarketEvent, positions: list[dict]) -> Optional[str]:
+        """按批次1金额给同方向加仓单写共同止盈止损。
+
+        返回 done=穿过目标价后已清干净并收口；hit=本拍已市价平掉穿过的方向，不再加仓；
+        None=已改单或无需动作，本拍可以继续交易。
+        """
+        amount = signal_pl.lot_pl_amount(self._signal_pl)
+        if amount is None or not positions:
+            return None
+        scoped = signal_pl.filter_lot_side(
+            manual_scatter.exclude_manual(positions),
+            signal_pl.lot_pl_close_action(self._signal_pl),
+        )
+        sig = signal_pl.position_book_signature(scoped)
+        now = time.time()
+        if not self._lot_sltp_dirty and sig == self._lot_sltp_sig:
+            return None
+        if (
+            sig == self._lot_sltp_fail_sig
+            and now - self._lot_sltp_fail_at < _LOT_SLTP_RETRY_SEC
+        ):
+            return "hit" if self._lot_sltp_cross_blocked else None
+        spec = await self._manual_symbol_spec()
+        if spec is None:
+            await self._lot_sltp_fail(sig, positions, "缺少合约规格，无法反推止盈止损")
+            return None
+        plans = signal_pl.plan_common_stops(
+            scoped,
+            amount=amount,
+            tick_size=_as_float(spec.get("tick_size")),
+            tick_value=_as_float(spec.get("tick_value")),
+            digits=int(spec.get("digits") or 0),
+            bid=_as_float(event.bid),
+            ask=_as_float(event.ask),
+            fallback_price=_as_float(event.price),
+        )
+        closed_tickets: set[int] = set()
+        crossed_reasons: list[str] = []
+        failed = False
+        for plan in plans:
+            if plan.get("crossed"):
+                ok = await self._lot_sltp_market_close(plan, positions)
+                if ok:
+                    closed_tickets.update(
+                        int(p.get("ticket") or 0) for p in plan["positions"]
+                    )
+                    crossed_reasons.append(signal_pl.describe_lot_stops(plan))
+                else:
+                    failed = True
+                continue
+            ok, changed = await self._lot_sltp_modify(plan)
+            if not ok:
+                failed = True
+            elif changed:
+                reason = signal_pl.describe_lot_stops(plan)
+                await self._emit_progress(
+                    "signal_pl", phase="running", positions=positions,
+                    message=reason, detail=signal_pl.lot_stops_detail(plan),
+                )
+        crossed_any = any(plan.get("crossed") for plan in plans)
+        if failed:
+            self._lot_sltp_fail_sig = sig
+            self._lot_sltp_fail_at = now
+            self._lot_sltp_cross_blocked = crossed_any
+        else:
+            self._lot_sltp_sig = sig
+            self._lot_sltp_dirty = False
+            self._lot_sltp_fail_sig = None
+            self._lot_sltp_cross_blocked = False
+        if not closed_tickets:
+            return "hit" if crossed_any else None
+        remaining = [
+            p for p in positions if int(p.get("ticket") or 0) not in closed_tickets
+        ]
+        if remaining:
+            return "hit"
+        reason = "；".join(crossed_reasons) or "信号分档手数盈亏：现价已越过共同止盈止损，市价平仓"
+        detail = {"kind": "signal_pl", "rule": signal_pl.RULE_LOT_PL_TIERS, "crossed": True}
+        self.request_stop(reason, detail=detail)
+        return "done" if await self._close_all() else "hit"
+
+    async def _lot_sltp_modify(self, plan: dict) -> tuple[bool, bool]:
+        """把同一方向还没写成目标价的持仓改到共同止盈止损。返回 (是否全部成功, 是否改过)。"""
+        sl = float(plan["sl"])
+        tp = float(plan["tp"])
+        digits = int(plan.get("digits") or 0)
+        changed = False
+        ok = True
+        for pos in plan.get("positions") or []:
+            if signal_pl.stops_match(pos, sl, tp, digits):
+                continue
+            changed = True
+            try:
+                res = dict(await self._exec(
+                    self._mt5.modify_position_sl,
+                    int(pos.get("ticket") or 0), sl, tp,
+                ) or {})
+            except Exception as e:  # noqa: BLE001
+                logger.warning("task %s lot sltp modify failed: %s", self.task_id, e)
+                ok = False
+                continue
+            if not res.get("success"):
+                logger.warning(
+                    "task %s lot sltp modify failed: %s", self.task_id, res.get("error"),
+                )
+                ok = False
+        if changed and not ok:
+            await self._emit_progress(
+                "error", phase="running", positions=plan.get("positions"),
+                message=signal_pl.describe_lot_stops(plan) + "：改单失败",
+                detail=signal_pl.lot_stops_detail(plan),
+            )
+        return ok, changed
+
+    async def _lot_sltp_market_close(self, plan: dict, positions: list[dict]) -> bool:
+        """目标价已经在现价错误一侧，券商拒单，改为市价平掉该方向。"""
+        targets = list(plan.get("positions") or [])
+        reason = signal_pl.describe_lot_stops(plan)
+        detail = signal_pl.lot_stops_detail(plan)
+        self._last_floating_profit = round(
+            sum(_as_float(p.get("profit")) for p in targets), 2,
+        )
+        self._remember_position_profits(targets)
+        try:
+            res = dict(await self._exec(self._mt5.close_positions, targets) or {})
+        except Exception as e:  # noqa: BLE001
+            logger.warning("task %s lot sltp market close failed: %s", self.task_id, e)
+            res = {"success": False, "error": str(e)}
+        if not res.get("success", True):
+            await self._emit_progress(
+                "error", phase="running", positions=positions,
+                message=f"{reason}：平仓失败 {res.get('error') or 'close failed'}",
+                detail=detail,
+            )
+            return False
+        closed = {int(p.get("ticket") or 0) for p in targets}
+        remaining = [p for p in positions if int(p.get("ticket") or 0) not in closed]
+        await self._emit_progress(
+            "signal_pl", phase="running" if remaining else "closing",
+            positions=remaining, message=reason, detail=detail,
+        )
+        return True
+
+    async def _lot_sltp_fail(self, sig: tuple, positions: list[dict], message: str) -> None:
+        self._lot_sltp_fail_sig = sig
+        self._lot_sltp_fail_at = time.time()
+        logger.warning("task %s %s", self.task_id, message)
+        await self._emit_progress(
+            "error", phase="running", positions=positions, message=message,
+            detail={"kind": "signal_pl", "rule": signal_pl.RULE_LOT_PL_TIERS},
+        )
 
     def _seed_from_positions(self, positions: list[dict]) -> None:
         """恢复后按真实持仓重建计数。

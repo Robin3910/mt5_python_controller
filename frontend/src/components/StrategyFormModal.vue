@@ -387,7 +387,8 @@ const FIELD_HELP = {
     '该信号浮盈亏 ÷ 账户余额 × 100%。负数为亏损侧达阈值，正数为盈利侧。' +
     '触发后清仓该信号全部持仓。循环=同信号生命周期内可反复触发；指定次数耗尽后本任务不再触发。',
   signal_lot_pl:
-    '按该信号持仓的总手数分档，命中后按所选方向平仓。负的盈亏金额表示亏损侧达阈值。优先匹配更高批次。',
+    '只用批次1的盈亏金额绝对值，给该信号同方向持仓写共同止盈和共同止损。\n' +
+    '加仓或平仓改变手数后，按新的总手数和开仓价重算并改单。更高批次不参与这个平仓价。',
 }
 
 /** 保本监控方式，与后端 BREAKEVEN_MODES 对齐 */
@@ -1660,7 +1661,7 @@ function resetRuleToTemplate(idx: number): void {
                 <input v-model.number="tier.pl_amount" type="number" step="1" class="signal-pl-num" />
               </div>
               <p class="muted" style="font-size: 12px; margin: 8px 0 0">
-                按所选方向统计该信号总手数与浮盈亏；负的盈亏金额表示亏损侧达阈值。优先匹配更高批次。
+                只用批次1的盈亏金额（取绝对值，同时写止盈和止损）。订单手数变化时重算共同平仓价并改单。
               </p>
             </div>
           </div>

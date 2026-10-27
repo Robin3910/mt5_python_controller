@@ -59,41 +59,82 @@ def test_float_pl_triggers_on_signal_profit_not_account_equity():
     assert miss is None
 
 
-def test_lot_pl_tiers_prefers_higher_batch():
+def test_lot_pl_uses_batch1_absolute_amount_and_weighted_open():
+    """两笔多单按手数加权；批次2的金额不参与，负数金额取绝对值。"""
     cfg = _cfg(lot_pl_tiers={
         "enabled": True,
         "batch_count": 2,
         "close_action": "all",
         "tiers": [
-            {"min_lot": 0.1, "pl_amount": 50},
-            {"min_lot": 0.5, "pl_amount": 100},
+            {"min_lot": 0.1, "pl_amount": -30},
+            {"min_lot": 0.5, "pl_amount": 999},
         ],
     })
-    positions = [{"type": "BUY", "volume": 0.6, "profit": 120, "symbol": "XAUUSD"}]
-    hit = sp.should_trigger_lot_pl_tiers(cfg, positions=positions)
-    assert hit is not None
-    assert hit["tier_index"] == 1
-    assert hit["min_lot"] == 0.5
+    assert sp.lot_pl_amount(cfg) == 30.0
+    positions = [
+        {"type": "BUY", "ticket": 1, "volume": 0.1, "price_open": 2300},
+        {"type": "BUY", "ticket": 2, "volume": 0.2, "price_open": 2310},
+    ]
+    # W = (0.1*2300 + 0.2*2310) / 0.3 = 2306.666...
+    # D = 30 / ((1/0.01) * 0.3) = 1
+    plans = sp.plan_common_stops(
+        positions, amount=sp.lot_pl_amount(cfg),
+        tick_size=0.01, tick_value=1.0, digits=2,
+        bid=2306.0,
+    )
+    assert len(plans) == 1
+    plan = plans[0]
+    assert plan["side"] == "BUY"
+    assert plan["tp"] == 2307.67
+    assert plan["sl"] == 2305.67
+    assert plan["crossed"] is None
+    assert plan["amount"] == 30.0
 
 
-def test_lot_pl_tiers_side_buy_ignores_sell():
+def test_lot_pl_sell_stops_are_mirrored():
+    positions = [{"type": "SELL", "ticket": 1, "volume": 1.0, "price_open": 1.1}]
+    plans = sp.plan_common_stops(
+        positions, amount=10,
+        tick_size=0.00001, tick_value=1.0, digits=5,
+        ask=1.1,
+    )
+    assert plans[0]["tp"] == 1.0999
+    assert plans[0]["sl"] == 1.1001
+
+
+def test_lot_pl_buy_side_ignores_sell_and_crossed_take_profit():
     cfg = _cfg(lot_pl_tiers={
         "enabled": True,
         "close_action": "buy",
         "batch_count": 1,
-        "tiers": [{"min_lot": 0.1, "pl_amount": 10}],
+        "tiers": [{"min_lot": 0.01, "pl_amount": 10}],
     })
     positions = [
-        {"type": "SELL", "volume": 1.0, "profit": 80, "symbol": "XAUUSD", "ticket": 1},
-        {"type": "BUY", "volume": 0.05, "profit": 1, "symbol": "XAUUSD", "ticket": 2},
+        {"type": "SELL", "volume": 1.0, "price_open": 2300, "ticket": 1},
+        {"type": "BUY", "volume": 0.1, "price_open": 2330, "ticket": 2},
     ]
-    assert sp.should_trigger_lot_pl_tiers(cfg, positions=positions) is None
-    positions[1]["volume"] = 0.2
-    positions[1]["profit"] = 10
-    hit = sp.should_trigger_lot_pl_tiers(cfg, positions=positions)
-    assert hit is not None
-    targets = sp.select_close_targets(positions, hit)
-    assert [p["ticket"] for p in targets] == [2]
+    scoped = sp.filter_lot_side(positions, sp.lot_pl_close_action(cfg))
+    assert [p["ticket"] for p in scoped] == [2]
+    plans = sp.plan_common_stops(
+        scoped, amount=10, tick_size=0.01, tick_value=1.0, digits=2,
+        bid=2331.0,
+    )
+    # D = 10 / (100 * 0.1) = 1，止盈 2331，买价已经到了
+    assert plans[0]["tp"] == 2331.0
+    assert plans[0]["sl"] == 2329.0
+    assert plans[0]["crossed"] == "tp"
+
+
+def test_lot_pl_does_not_market_close_inside_find_triggered_rule():
+    cfg = _cfg(lot_pl_tiers={
+        "enabled": True,
+        "close_action": "all",
+        "tiers": [{"min_lot": 0.1, "pl_amount": 10}],
+    })
+    positions = [{"type": "BUY", "volume": 1.0, "profit": 500, "price_open": 2300}]
+    assert sp.find_triggered_rule(
+        cfg, balance=10000, signal_profit=500, positions=positions,
+    ) is None
 
 
 def test_times_mode_consumes_remaining():

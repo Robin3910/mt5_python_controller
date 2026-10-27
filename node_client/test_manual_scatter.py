@@ -267,6 +267,9 @@ def _progress(sent: list, event: str) -> list[dict]:
 async def test_runner_opens_market_once_with_m2_comment():
     sent: list = []
     mt5 = MockMT5Client()
+    # 首单开在手动入场附近：批次1金额会给底仓写共同止盈，
+    # 若仍从 2330 跳到 4400，底仓会先被市价平掉。
+    mt5.prices_map["XAUUSD"] = 4390.0
     runner, hub = _runner(sent, mt5=mt5)
     runner.start()
     await _settle()
@@ -370,6 +373,7 @@ async def test_runner_triggers_on_ask_pullback():
             )),
         ]},
     )
+    mt5.prices_map["XAUUSD"] = 4390.0
     runner.start()
     await _settle()
     held = mt5.positions_by_magic(MAGIC)
@@ -406,6 +410,7 @@ async def test_manual_positions_do_not_inflate_batch_position_count():
         }],
     )
     runner, hub = _runner(sent, mt5=mt5, strategy={"template_id": "tpl_1", "rules": [rule]})
+    mt5.prices_map["XAUUSD"] = 4390.0
     runner.start()
     await _settle()
     mt5.prices_map["XAUUSD"] = 4399.0
@@ -565,6 +570,7 @@ async def _open_first_and_manual(sent: list, mt5: MockMT5Client, **cfg_over):
         sent, mt5=mt5,
         strategy={"template_id": "tpl_1", "rules": [_trend_rule(manual_scatter=cfg)]},
     )
+    mt5.prices_map["XAUUSD"] = 4390.0
     runner.start()
     await _settle()
     mt5.prices_map["XAUUSD"] = 4399.0
