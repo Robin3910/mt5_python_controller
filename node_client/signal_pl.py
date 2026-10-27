@@ -1,7 +1,8 @@
 """模版1 信号级盈亏控制纯函数：配置抽取与触发判定。
 
-与账户风控隔离：分子只统计本魔术号持仓浮盈亏，分母用账户余额；
-触发后由调用方只平该魔术号仓位。分档手数复用 account_risk 的匹配逻辑。
+与账户风控隔离：盈亏比分子只统计本魔术号持仓浮盈亏，分母用账户余额；
+触发后由调用方只平该魔术号仓位。分档手数不在这里比浮盈，只按批次1金额
+反推同方向持仓的共同止盈止损，交给调用方改单。
 """
 from __future__ import annotations
 
@@ -239,21 +240,211 @@ def should_trigger_float_pl(
     }
 
 
-def should_trigger_lot_pl_tiers(
-    cfg: dict | None,
-    *,
-    positions: list | None,
-) -> dict | None:
-    src = normalize_config(cfg)
-    hit = ar.should_trigger_lot_pl_tiers(
-        {ar.RULE_LOT_PL_TIERS: src[RULE_LOT_PL_TIERS]},
-        positions=positions,
-    )
-    if hit is None:
+def lot_pl_amount(cfg: dict | None) -> Optional[float]:
+    """启用时返回批次1盈亏金额的绝对值。未启用、无档或金额为 0 时返回 None。"""
+    rule = normalize_config(cfg)[RULE_LOT_PL_TIERS]
+    if not rule.get("enabled"):
         return None
-    hit = dict(hit)
-    hit["rule"] = RULE_LOT_PL_TIERS
-    return hit
+    tiers = rule.get("tiers") or []
+    if not tiers:
+        return None
+    amount = abs(_as_float(tiers[0].get("pl_amount"), 0.0))
+    if amount <= 0:
+        return None
+    return amount
+
+
+def lot_pl_close_action(cfg: dict | None) -> str:
+    action = str(normalize_config(cfg)[RULE_LOT_PL_TIERS].get("close_action") or "all").lower()
+    if action not in CLOSE_SIDES:
+        return "all"
+    return action
+
+
+def filter_lot_side(positions: list | None, close_action: str) -> list[dict]:
+    """按全部 / 多单 / 空单留下要改止盈止损的持仓。"""
+    action = str(close_action or "all").lower()
+    out: list[dict] = []
+    for pos in positions or []:
+        if not isinstance(pos, dict):
+            continue
+        side = str(pos.get("type") or "").upper()
+        if side not in ("BUY", "SELL"):
+            continue
+        if action == "buy" and side != "BUY":
+            continue
+        if action == "sell" and side != "SELL":
+            continue
+        out.append(pos)
+    return out
+
+
+def position_book_signature(positions: list | None) -> tuple:
+    """票号、手数、方向。报价变化不改变这个签名。"""
+    rows = []
+    for pos in positions or []:
+        if not isinstance(pos, dict):
+            continue
+        rows.append((
+            _as_int(pos.get("ticket"), 0),
+            round(max(0.0, _as_float(pos.get("volume"), 0.0)), 4),
+            str(pos.get("type") or "").upper(),
+        ))
+    return tuple(sorted(rows))
+
+
+def _price_eps(digits: int) -> float:
+    step = 10 ** (-max(0, int(digits)))
+    return max(step / 2, 1e-9)
+
+
+def stops_match(pos: dict, sl: float, tp: float, digits: int) -> bool:
+    """持仓上的止盈止损已经是目标价（按报价小数位比较）。"""
+    eps = _price_eps(digits)
+    return (
+        abs(_as_float(pos.get("sl"), 0.0) - float(sl)) <= eps
+        and abs(_as_float(pos.get("tp"), 0.0) - float(tp)) <= eps
+    )
+
+
+def _round_price(price: float, digits: int) -> float:
+    return round(float(price), max(0, int(digits)))
+
+
+def _market_for_side(side: str, *, bid: float, ask: float, fallback: float) -> float:
+    """平仓侧现价：多单看买价，空单看卖价。缺一侧时用事件价。"""
+    raw = bid if side == "BUY" else ask
+    price = _as_float(raw, 0.0)
+    if price <= 0:
+        price = _as_float(fallback, 0.0)
+    return price if price > 0 else 0.0
+
+
+def _cross_side(side: str, sl: float, tp: float, market: float) -> Optional[str]:
+    """现价已经到了或越过共同止盈 / 止损。券商不会接受错误一侧的价。"""
+    if market <= 0:
+        return None
+    if side == "BUY":
+        if market >= tp:
+            return "tp"
+        if market <= sl:
+            return "sl"
+        return None
+    if market <= tp:
+        return "tp"
+    if market >= sl:
+        return "sl"
+    return None
+
+
+def plan_common_stops(
+    positions: list | None,
+    *,
+    amount: float,
+    tick_size: float,
+    tick_value: float,
+    digits: int,
+    bid: float = 0.0,
+    ask: float = 0.0,
+    fallback_price: float = 0.0,
+) -> list[dict]:
+    """按方向各算一对共同止盈止损。
+
+    加权开仓价 W = Σ(手数 × 开仓价) / Σ手数。
+    距离 D = |金额| / ((tick_value / tick_size) × Σ手数)。
+    多单止盈 W+D、止损 W-D；空单相反。调用方负责去掉手动分散仓并按方向筛选。
+    """
+    target = abs(_as_float(amount, 0.0))
+    size = _as_float(tick_size, 0.0)
+    value = _as_float(tick_value, 0.0)
+    if target <= 0 or size <= 0 or value <= 0:
+        return []
+    grouped: dict[str, list[dict]] = {"BUY": [], "SELL": []}
+    for pos in positions or []:
+        if not isinstance(pos, dict):
+            continue
+        side = str(pos.get("type") or "").upper()
+        if side not in grouped:
+            continue
+        if _as_float(pos.get("volume"), 0.0) <= 0 or _as_float(pos.get("price_open"), 0.0) <= 0:
+            continue
+        grouped[side].append(pos)
+    plans: list[dict] = []
+    for side, rows in grouped.items():
+        if not rows:
+            continue
+        volume = 0.0
+        weighted = 0.0
+        for pos in rows:
+            vol = _as_float(pos.get("volume"), 0.0)
+            volume += vol
+            weighted += vol * _as_float(pos.get("price_open"), 0.0)
+        money_per_price = (value / size) * volume
+        if volume <= 0 or money_per_price <= 0:
+            continue
+        distance = target / money_per_price
+        anchor = weighted / volume
+        if side == "BUY":
+            tp = _round_price(anchor + distance, digits)
+            sl = _round_price(anchor - distance, digits)
+        else:
+            tp = _round_price(anchor - distance, digits)
+            sl = _round_price(anchor + distance, digits)
+        market = _market_for_side(side, bid=bid, ask=ask, fallback=fallback_price)
+        plans.append({
+            "rule": RULE_LOT_PL_TIERS,
+            "side": side,
+            "sl": sl,
+            "tp": tp,
+            "weighted_open": anchor,
+            "distance": distance,
+            "amount": target,
+            "volume": volume,
+            "digits": max(0, int(digits)),
+            "positions": rows,
+            "crossed": _cross_side(side, sl, tp, market),
+        })
+    return plans
+
+
+def describe_lot_stops(plan: dict | None) -> str:
+    if not isinstance(plan, dict):
+        return "信号分档手数盈亏"
+    side = "多单" if plan.get("side") == "BUY" else "空单"
+    amount = _as_float(plan.get("amount"), 0.0)
+    volume = _as_float(plan.get("volume"), 0.0)
+    sl = _as_float(plan.get("sl"), 0.0)
+    tp = _as_float(plan.get("tp"), 0.0)
+    crossed = plan.get("crossed")
+    if crossed == "tp":
+        text = f"信号分档手数盈亏：{side}现价已越过共同止盈 {tp:g}，市价平仓"
+    elif crossed == "sl":
+        text = f"信号分档手数盈亏：{side}现价已越过共同止损 {sl:g}，市价平仓"
+    else:
+        text = (
+            f"信号分档手数盈亏：{side}共同止盈 {tp:g} 止损 {sl:g}"
+            f"（批次1金额 {amount:g}，总手数 {volume:g}）"
+        )
+    return text[:REASON_LIMIT]
+
+
+def lot_stops_detail(plan: dict | None) -> Optional[dict]:
+    if not isinstance(plan, dict):
+        return None
+    return {
+        "kind": "signal_pl",
+        "rule": RULE_LOT_PL_TIERS,
+        "rule_label": RULE_LABELS[RULE_LOT_PL_TIERS],
+        "side": plan.get("side"),
+        "sl": plan.get("sl"),
+        "tp": plan.get("tp"),
+        "amount": plan.get("amount"),
+        "volume": plan.get("volume"),
+        "weighted_open": plan.get("weighted_open"),
+        "distance": plan.get("distance"),
+        "crossed": plan.get("crossed"),
+        "tier_index": 0,
+    }
 
 
 def find_triggered_rule(
@@ -263,14 +454,13 @@ def find_triggered_rule(
     signal_profit: float,
     positions: list | None,
 ) -> dict | None:
-    """先盈亏比、再分档手数。"""
-    has_positions = bool(positions)
-    hit = should_trigger_float_pl(
-        cfg, balance=balance, signal_profit=signal_profit, has_positions=has_positions,
+    """只判定信号盈亏比。分档手数改为改写券商止盈止损，不再在这里市价平仓。"""
+    return should_trigger_float_pl(
+        cfg,
+        balance=balance,
+        signal_profit=signal_profit,
+        has_positions=bool(positions),
     )
-    if hit:
-        return hit
-    return should_trigger_lot_pl_tiers(cfg, positions=positions)
 
 
 def apply_float_pl_trigger(cfg: dict) -> tuple[dict, dict]:

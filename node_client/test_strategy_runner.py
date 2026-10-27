@@ -1934,34 +1934,56 @@ async def test_signal_float_pl_closes_only_own_magic():
     assert finished[0]["detail"]["current_ratio"] == -20.0
 
 
-async def test_signal_lot_pl_tiers_prefers_higher_batch_and_closes_all():
+def _lot_tiers(**over) -> dict:
+    tiers = {
+        "enabled": True, "batch_count": 2, "close_action": "all",
+        "tiers": [
+            {"min_lot": 0.05, "pl_amount": 10.0},
+            {"min_lot": 0.1, "pl_amount": 20.0},
+        ],
+    }
+    tiers.update(over)
+    return tiers
+
+
+async def test_signal_lot_pl_writes_batch1_stops_and_ignores_price_ticks():
+    """批次1金额写成共同止盈止损；报价波动不市价平仓，手数变化才重算。"""
     sent: list = []
     mt5 = MockMT5Client()
     runner, hub = _runner(
         sent, mt5=mt5,
-        strategy={"rules": [_addon_pl_rule(lot_pl_tiers={
-            "enabled": True, "batch_count": 2, "close_action": "all",
-            "tiers": [
-                {"min_lot": 0.05, "pl_amount": 10.0},
-                {"min_lot": 0.1, "pl_amount": 20.0},
-            ],
-        })]},
+        strategy={"rules": [_addon_pl_rule(lot_pl_tiers=_lot_tiers())]},
     )
     runner.start()
     await _settle()
-    for p in mt5._positions:
-        if int(p.get("magic") or 0) == MAGIC:
-            p["volume"] = 0.1
-            p["profit"] = 25.0
-
     held = [p for p in mt5._positions if int(p.get("magic") or 0) == MAGIC]
-    _tick(hub, held, held[0]["price_open"])
+    open_px = held[0]["price_open"]
+    _tick(hub, held, open_px)
     await _settle()
 
-    assert mt5.positions_by_magic(MAGIC) == []
-    finished = _of_type(sent, "strategy_finished")
-    assert finished and "信号分档手数盈亏" in finished[0]["reason"]
-    assert finished[0]["detail"]["tier_index"] == 1
+    # D = 10 / ((1/0.01) * 0.1) = 1，不用批次2的 20
+    pos = mt5.positions_by_magic(MAGIC)[0]
+    assert pos["tp"] == open_px + 1
+    assert pos["sl"] == open_px - 1
+    assert not _of_type(sent, "strategy_finished")
+
+    _tick(hub, [p for p in mt5._positions if int(p.get("magic") or 0) == MAGIC], open_px + 0.2)
+    await _settle()
+    pos = mt5.positions_by_magic(MAGIC)[0]
+    assert pos["tp"] == open_px + 1
+    assert len(mt5.positions_by_magic(MAGIC)) == 1
+
+    live = next(p for p in mt5._positions if int(p.get("magic") or 0) == MAGIC)
+    live["volume"] = 0.2
+    _tick(hub, [p for p in mt5._positions if int(p.get("magic") or 0) == MAGIC], open_px)
+    await _settle()
+    pos = mt5.positions_by_magic(MAGIC)[0]
+    assert pos["tp"] == open_px + 0.5
+    assert pos["sl"] == open_px - 0.5
+    noted = _progress(sent, "signal_pl")
+    assert noted and noted[-1]["detail"]["amount"] == 10.0
+    assert noted[-1]["detail"]["tier_index"] == 0
+    runner.cancel()
 
 
 async def test_signal_lot_pl_buy_side_keeps_sell():
@@ -1969,26 +1991,67 @@ async def test_signal_lot_pl_buy_side_keeps_sell():
     mt5 = MockMT5Client()
     runner, hub = _runner(
         sent, mt5=mt5,
-        strategy={"rules": [_addon_pl_rule(lot_pl_tiers={
-            "enabled": True, "batch_count": 1, "close_action": "buy",
-            "tiers": [{"min_lot": 0.1, "pl_amount": 10.0}],
-        })]},
+        strategy={"rules": [_addon_pl_rule(lot_pl_tiers=_lot_tiers(
+            batch_count=1, close_action="buy",
+            tiers=[{"min_lot": 0.1, "pl_amount": 10.0}],
+        ))]},
     )
     runner.start()
     await _settle()
     mt5.place_market_order("XAUUSD", "SELL", 0.1, magic=MAGIC)
-    for p in mt5._positions:
-        if int(p.get("magic") or 0) == MAGIC:
-            p["profit"] = 12.0
-
     held = [p for p in mt5._positions if int(p.get("magic") or 0) == MAGIC]
     _tick(hub, held, held[0]["price_open"])
     await _settle()
 
     left = mt5.positions_by_magic(MAGIC)
-    assert len(left) == 1
-    assert left[0]["type"] == "SELL"
+    assert len(left) == 2
+    buy = next(p for p in left if p["type"] == "BUY")
+    sell = next(p for p in left if p["type"] == "SELL")
+    assert buy["tp"] == buy["price_open"] + 1
+    assert sell["tp"] == 0
+    assert sell["sl"] == 0
     assert not _of_type(sent, "strategy_finished")
+    runner.cancel()
+
+
+async def test_signal_lot_pl_crossed_price_market_closes():
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub = _runner(
+        sent, mt5=mt5,
+        strategy={"rules": [_addon_pl_rule(lot_pl_tiers=_lot_tiers())]},
+    )
+    runner.start()
+    await _settle()
+    held = [p for p in mt5._positions if int(p.get("magic") or 0) == MAGIC]
+    _tick(hub, held, held[0]["price_open"] + 2)
+    await _settle()
+
+    assert mt5.positions_by_magic(MAGIC) == []
+    finished = _of_type(sent, "strategy_finished")
+    assert finished and "越过共同止盈" in finished[0]["reason"]
+
+
+async def test_signal_lot_pl_skips_manual_scatter_orders():
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub = _runner(
+        sent, mt5=mt5,
+        strategy={"rules": [_addon_pl_rule(lot_pl_tiers=_lot_tiers())]},
+    )
+    runner.start()
+    await _settle()
+    mt5.place_market_order("XAUUSD", "BUY", 0.1, comment="M1", magic=MAGIC)
+    held = [p for p in mt5._positions if int(p.get("magic") or 0) == MAGIC]
+    _tick(hub, held, held[0]["price_open"])
+    await _settle()
+
+    left = mt5.positions_by_magic(MAGIC)
+    addon = next(p for p in left if not str(p.get("comment") or "").startswith("M"))
+    manual = next(p for p in left if str(p.get("comment") or "").startswith("M"))
+    assert addon["tp"] == addon["price_open"] + 1
+    assert manual["tp"] == 0
+    assert manual["sl"] == 0
     runner.cancel()
 
 
