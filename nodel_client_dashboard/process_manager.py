@@ -814,12 +814,24 @@ class ProcessManager:
         restart_if_was_running: bool,
         ok_label: str,
         action: str = "update_client",
+        on_phase: Callable[[str], None] | None = None,
     ):
-        return self._perform(action, mp, lambda: self._swap_authorized(mp, apply_fn, restart_if_was_running=restart_if_was_running, ok_label=ok_label))
+        return self._perform(action, mp, lambda: self._swap_authorized(mp, apply_fn, restart_if_was_running=restart_if_was_running, ok_label=ok_label, on_phase=on_phase))
 
-    def _swap_authorized(self, mp, apply_fn, *, restart_if_was_running: bool, ok_label: str):
-        """单实例的「停 → 覆盖 → 按需重启」流程；apply_fn 负责实际写文件。"""
+    def _swap_authorized(
+        self, mp, apply_fn, *, restart_if_was_running: bool, ok_label: str,
+        on_phase: Callable[[str], None] | None = None,
+    ):
+        """单实例的「停 → 覆盖 → 按需重启」流程；apply_fn 负责实际写文件。
+
+        `on_phase` 在「停 / 覆盖 / 重启」三个阶段各回调一次（阶段名见 `_PHASES`），
+        供界面显示「正在更新 (2/5) xxx：停止实例…」。回调在调用线程触发。
+        """
         from client_deploy import ReplaceResult, read_version_near
+
+        def phase(name: str) -> None:
+            if on_phase is not None:
+                on_phase(name)
 
         mp.assert_identity()
 
@@ -830,6 +842,7 @@ class ProcessManager:
             or mp._status_reachable(timeout=0.3)
         )
         if was_running:
+            phase("stop")
             mp.stop(graceful=True)
             if mp.dashboard_managed and (mp._status_reachable(timeout=0.3) or (mp._proc is not None and mp._proc.poll() is None)):
                 raise RuntimeError("节点仍在运行，已拒绝替换客户端文件")
@@ -838,11 +851,13 @@ class ProcessManager:
 
         if self.session is not None:
             self.session.check()
+        phase("apply")
         ok, msg = apply_fn(Path(mp.cfg.exe_path))
         restarted = False
         if ok:
             mp._refresh_file_version()
             if was_running and restart_if_was_running and (self.session is None or (mp.cfg.approval_status == "approved" and mp.cfg.enabled)):
+                phase("restart")
                 if self.session is not None:
                     self.session.check()
                     self.session.prepare_start(mp)
@@ -875,12 +890,25 @@ class ProcessManager:
             old_version=read_version_near(mp.cfg.exe_path) or mp.runtime.version,
         )
 
+    def _batch_progress(
+        self,
+        on_progress: Callable[[int, int, str, str], None] | None,
+        index: int,
+        total: int,
+        name: str,
+        phase: str,
+    ) -> None:
+        """批量操作的进度回调：(序号, 总数, 实例名, 阶段)。"""
+        if on_progress is not None:
+            on_progress(index, total, name, phase)
+
     def batch_replace(
         self,
         source_exe: str | Path,
         *,
         instance_ids: list[str] | None = None,
         restart_if_was_running: bool = True,
+        on_progress: Callable[[int, int, str, str], None] | None = None,
     ) -> list:
         """批量替换客户端 exe：停 → 备份覆盖 →（可选）再启。"""
         from client_deploy import replace_exe_file
@@ -890,7 +918,9 @@ class ProcessManager:
             from client_binding import require_binding
             require_binding(src)
         results = []
-        for mp in self._select(instance_ids):
+        targets = self._select(instance_ids)
+        total = len(targets)
+        for index, mp in enumerate(targets, start=1):
             if mp.runtime.busy:
                 results.append(self._busy_skip(mp))
                 continue
@@ -903,6 +933,9 @@ class ProcessManager:
                     restart_if_was_running=restart_if_was_running,
                     ok_label="已替换",
                     action="replace_client",
+                    on_phase=lambda phase, i=index, n=mp.cfg.name: self._batch_progress(
+                        on_progress, i, total, n, phase
+                    ),
                 )
             )
             if not results[-1].ok:
@@ -915,6 +948,7 @@ class ProcessManager:
         *,
         instance_ids: list[str] | None = None,
         restart_if_was_running: bool = True,
+        on_progress: Callable[[int, int, str, str], None] | None = None,
     ) -> list:
         """用解压好的安装包目录批量更新：停 → 版本化备份 → 按文件树覆盖 → 按需再启。
 
@@ -928,7 +962,9 @@ class ProcessManager:
             from client_binding import require_binding
             require_binding(src / "node_client.exe")
         results = []
-        for mp in self._select(instance_ids):
+        targets = self._select(instance_ids)
+        total = len(targets)
+        for index, mp in enumerate(targets, start=1):
             if mp.runtime.busy:
                 results.append(self._busy_skip(mp))
                 continue
@@ -938,6 +974,9 @@ class ProcessManager:
                     lambda target: apply_package(src, target, backup=True),
                     restart_if_was_running=restart_if_was_running,
                     ok_label="已更新",
+                    on_phase=lambda phase, i=index, n=mp.cfg.name: self._batch_progress(
+                        on_progress, i, total, n, phase
+                    ),
                 )
             )
             if not results[-1].ok:
@@ -950,12 +989,15 @@ class ProcessManager:
         *,
         instance_ids: list[str] | None = None,
         restart_if_was_running: bool = True,
+        on_progress: Callable[[int, int, str, str], None] | None = None,
     ) -> list:
         """从本机备份目录回滚到指定版本（不依赖网络）。"""
         from client_deploy import restore_backup
 
         results = []
-        for mp in self._select(instance_ids):
+        targets = self._select(instance_ids)
+        total = len(targets)
+        for index, mp in enumerate(targets, start=1):
             if mp.runtime.busy:
                 results.append(self._busy_skip(mp))
                 continue
@@ -970,6 +1012,9 @@ class ProcessManager:
                     restart_if_was_running=restart_if_was_running,
                     ok_label=f"已回滚到 {version}",
                     action="rollback_client",
+                    on_phase=lambda phase, i=index, n=mp.cfg.name: self._batch_progress(
+                        on_progress, i, total, n, phase
+                    ),
                 )
             )
             if not results[-1].ok:

@@ -19,6 +19,7 @@ from collections.abc import Callable, Sequence
 import customtkinter as ctk
 
 import version_service as vs
+from busy_status import BusyStatus
 from session_ui import SessionDialog
 from dialog_window import hide_while_building, show_centered
 from theme import (
@@ -73,6 +74,7 @@ class VersionPickerDialog(SessionDialog):
         self._loading_hint = loading_hint
         self._items: list[dict] = []
         self._busy = False
+        self._busy_status: BusyStatus | None = None
 
         self.selected = ""
         self.selected_sha256 = ""
@@ -140,14 +142,29 @@ class VersionPickerDialog(SessionDialog):
     def _show_centered(self) -> None:
         show_centered(self, self._W, self._H)
 
+    def destroy(self) -> None:
+        # 先停掉转圈动画：窗口销毁后残留的 after 回调会报
+        # `invalid command name ...` 并往已销毁的标签上写。
+        if self._busy_status is not None:
+            self._busy_status.destroy()
+        super().destroy()
+
     # ---------------------------------------------------------------- 数据
+
+    def _busy_indicator(self) -> BusyStatus:
+        """转圈指示器绑定到状态栏标签；用对话框自己排定时器，
+        这样登录失效后动画会随会话代次一起停下。"""
+        if self._busy_status is None:
+            self._busy_status = BusyStatus(self.status, owner=self)
+        return self._busy_status
 
     def _load(self) -> None:
         if self._busy:
             return
         self._busy = True
         if self._loading_hint:
-            self.status.configure(text=self._loading_hint, text_color=TEXT_MUTED)
+            # 拉版本清单要走网络，给个转圈让用户知道程序在跑
+            self._busy_indicator().start(self._loading_hint, TEXT_MUTED)
 
         def worker() -> None:
             try:
@@ -172,7 +189,7 @@ class VersionPickerDialog(SessionDialog):
     def _fail(self, message: str) -> None:
         self._busy = False
         self._reset_empty()
-        self.status.configure(text=message, text_color=DANGER)
+        self._busy_indicator().stop(message, DANGER)
 
     def _fill(self, items: list[dict], current: str) -> None:
         self._busy = False
@@ -180,13 +197,13 @@ class VersionPickerDialog(SessionDialog):
         names = [str(i.get("version") or "") for i in items if i.get("version")]
         if not names:
             self._reset_empty()
-            self.status.configure(text=self._empty_hint, text_color=WARNING)
+            self._busy_indicator().stop(self._empty_hint, WARNING)
             return
         self.version_menu.configure(values=names)
         # 默认选当前发布版本；没有就用最新的一个
         self.version_var.set(current if current in names else names[0])
         self.ok_btn.configure(state="normal")
-        self.status.configure(text=f"共 {len(names)} 个可选版本", text_color=ACCENT)
+        self._busy_indicator().stop(f"共 {len(names)} 个可选版本", ACCENT)
         self._render_detail()
 
     def _selected_item(self) -> dict | None:

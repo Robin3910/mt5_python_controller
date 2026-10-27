@@ -19,6 +19,7 @@ import customtkinter as ctk
 
 import env_file as ef
 import version_service as vs
+from busy_status import BusyStatus, ThrottledProgress, format_bytes
 from client_deploy import apply_package, extract_package, read_version_near
 from dialog_window import hide_while_building, show_centered
 from models import InstanceConfig, default_label_from_path
@@ -47,11 +48,6 @@ from theme import (
 
 _NO_VERSION = "（尚未检测）"
 
-# 状态条 loading 动画：8 帧 Braille 旋转（风车型），跨 Windows/macOS/Linux 都能显示。
-# 100ms 一帧才像"在转"；再慢就感觉卡顿。
-_BUSY_FRAMES = ("\u280b", "\u2819", "\u2839", "\u2838", "\u283c", "\u2834", "\u2826", "\u2827")
-_BUSY_TICK_MS = 100
-
 
 class ImportNodeDialog(SessionDialog):
     """把一个 MT5 目录部署成新的节点实例。成功后 `created` 为新实例配置。"""
@@ -72,7 +68,7 @@ class ImportNodeDialog(SessionDialog):
         self.created: InstanceConfig | None = None
         self._busy = False
         self._versions: list[dict] = []
-        self._busy_status_token = 0  # 状态条 loading 动画的代数；切换阶段时 +1，旧动画会自检失效
+        self._busy_status: BusyStatus | None = None
         self._current = ""
         self._pending_cfg = None
 
@@ -89,31 +85,22 @@ class ImportNodeDialog(SessionDialog):
 
     # ---------------------------------------------------------------- 布局
 
+    def _busy_indicator(self) -> BusyStatus:
+        """转圈指示器绑定到状态栏标签；用对话框自己排定时器，
+        这样登录失效后动画会随会话代次一起停下。"""
+        if self._busy_status is None:
+            self._busy_status = BusyStatus(self.status, owner=self)
+        return self._busy_status
+
     def _start_busy_status(self, text: str, color: str) -> None:
         """状态条进入「忙碌 + loading 点数」状态。重复调用会替换前一个动画，
         不会和上一阶段残留的 after 循环打架。"""
-        self._stop_busy_status()
-        self._busy_status_token += 1
-        token = self._busy_status_token
-
-        def render(frame_idx: int = 0) -> None:
-            # 已被新动画或终态覆盖 → 静默退出
-            if token != self._busy_status_token or not self.winfo_exists():
-                return
-            try:
-                self.status.configure(
-                    text=f"{_BUSY_FRAMES[frame_idx % len(_BUSY_FRAMES)]}  {text}",
-                    text_color=color,
-                )
-            except tk.TclError:
-                return
-            self.after(_BUSY_TICK_MS, lambda: render(frame_idx + 1))
-
-        render(0)
+        self._busy_indicator().start(text, color)
 
     def _stop_busy_status(self) -> None:
         """停掉 loading 动画；终态文本由调用方随后 configure 上去即可。"""
-        self._busy_status_token += 1
+        if self._busy_status is not None:
+            self._busy_status.stop()
 
     def _build(self) -> None:
         card = glass_card(self)
@@ -219,6 +206,13 @@ class ImportNodeDialog(SessionDialog):
 
     def _show_centered(self) -> None:
         show_centered(self, self._W, self._H)
+
+    def destroy(self) -> None:
+        # 先停掉转圈动画：窗口销毁后残留的 after 回调会报
+        # `invalid command name ...` 并往已销毁的标签上写。
+        if self._busy_status is not None:
+            self._busy_status.destroy()
+        super().destroy()
 
     # ---------------------------------------------------------------- 数据
 
@@ -454,10 +448,19 @@ class ImportNodeDialog(SessionDialog):
             self.after(0, lambda: self._start_busy_status(
                 f"正在下载 v{version}，预计需要3-4分钟，请不要操作鼠标！等待自动导入完成！", TEXT_MUTED
             ))
-            vs.download_package(target, version, pkg)
+
+            def on_download(done: int, total: int) -> None:
+                text = f"正在下载 v{version}　{format_bytes(done)}"
+                if total > 0:
+                    text = f"正在下载 v{version}　{format_bytes(done)} / {format_bytes(total)}　{done * 100 // total}%"
+                self.after(0, lambda t=text: self._busy_indicator().update(t))
+
+            throttle = ThrottledProgress(on_download)
+            vs.download_package(target, version, pkg, on_progress=throttle.report)
             if not vs.verify_sha256(pkg, sha256):
                 raise RuntimeError("安装包校验和不匹配，已中止导入")
 
+            self.after(0, lambda: self._start_busy_status("正在校验并解压安装包…", TEXT_MUTED))
             extract_dir = tmpdir / "extracted"
             ok, msg = extract_package(pkg, extract_dir)
             if not ok:

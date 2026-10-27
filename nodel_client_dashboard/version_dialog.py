@@ -15,6 +15,7 @@ from tkinter import messagebox
 import customtkinter as ctk
 
 import version_service as vs
+from busy_status import BusyStatus, ThrottledProgress, format_bytes
 from client_deploy import (
     DOWNGRADE,
     classify_update,
@@ -117,6 +118,8 @@ class VersionUpdateDialog(SessionDialog):
         self._rows: list[_Row] = []
         self._remote: dict = {}
         self._busy = False
+        self._busy_status: BusyStatus | None = None
+        self._done_text: tuple[str, str] | None = None
 
         cfg = load_panel_config()
         self.base_var = tk.StringVar(value=str(cfg.get("backend_base") or ""))
@@ -154,7 +157,8 @@ class VersionUpdateDialog(SessionDialog):
 
         actions = ctk.CTkFrame(conn, fg_color="transparent")
         actions.grid(row=3, column=0, columnspan=3, padx=12, pady=(6, 14), sticky="ew")
-        primary_btn(actions, "检测更新", self._detect, width=110).pack(side="left", padx=4)
+        self.detect_btn = primary_btn(actions, "检测更新", self._detect, width=110)
+        self.detect_btn.pack(side="left", padx=4)
         self.status = ctk.CTkLabel(
             actions, text="尚未检测", text_color=TEXT_DIM, font=font(12), anchor="w"
         )
@@ -201,12 +205,10 @@ class VersionUpdateDialog(SessionDialog):
 
         line1 = ctk.CTkFrame(ops, fg_color="transparent")
         line1.pack(fill="x", padx=12, pady=(12, 6))
-        primary_btn(line1, "更新到发布版本", self._update_to_release, width=150).pack(
-            side="left", padx=4
-        )
-        ghost_btn(line1, "更新到指定版本", self._update_to_specific, width=140).pack(
-            side="left", padx=4
-        )
+        self.update_release_btn = primary_btn(line1, "更新到发布版本", self._update_to_release, width=150)
+        self.update_release_btn.pack(side="left", padx=4)
+        self.update_specific_btn = ghost_btn(line1, "更新到指定版本", self._update_to_specific, width=140)
+        self.update_specific_btn.pack(side="left", padx=4)
         ctk.CTkLabel(
             line1,
             text="更新会先停止实例，备份当前版本后覆盖，再自动启动；.env 不会被覆盖。",
@@ -215,12 +217,21 @@ class VersionUpdateDialog(SessionDialog):
 
         line2 = ctk.CTkFrame(ops, fg_color="transparent")
         line2.pack(fill="x", padx=12, pady=(0, 12))
-        danger_btn(line2, "回滚到本机备份", self._rollback, width=150).pack(side="left", padx=4)
-        ghost_btn(line2, "刷新本机版本", self._refresh_rows, width=130).pack(side="left", padx=4)
+        self.rollback_btn = danger_btn(line2, "回滚到本机备份", self._rollback, width=150)
+        self.rollback_btn.pack(side="left", padx=4)
+        self.refresh_btn = ghost_btn(line2, "刷新本机版本", self._refresh_rows, width=130)
+        self.refresh_btn.pack(side="left", padx=4)
         ghost_btn(line2, "关闭", self.destroy, width=90).pack(side="right", padx=4)
 
     def _show_centered(self) -> None:
         show_centered(self, self._W, self._H)
+
+    def destroy(self) -> None:
+        # 先停掉转圈动画：窗口销毁后残留的 after 回调会报
+        # `invalid command name ...` 并往已销毁的标签上写。
+        if self._busy_status is not None:
+            self._busy_status.destroy()
+        super().destroy()
 
     # ---------------------------------------------------------------- 数据
 
@@ -263,17 +274,56 @@ class VersionUpdateDialog(SessionDialog):
 
     # ---------------------------------------------------------------- 动作
 
+    # 批量更新的阶段文案：停 → 覆盖 → 重启
+    _PHASE_LABELS = {
+        "stop": "停止实例…",
+        "apply": "覆盖文件…",
+        "restart": "重新启动…",
+    }
+
+    def _busy_indicator(self) -> BusyStatus:
+        """转圈指示器绑定到状态栏标签；用对话框自己排定时器，
+        这样登录失效后动画会随会话代次一起停下。"""
+        if self._busy_status is None:
+            self._busy_status = BusyStatus(self.status, owner=self)
+        return self._busy_status
+
     def _set_busy(self, busy: bool, text: str = "") -> None:
+        """切换忙碌状态：转圈动画 + 禁用操作按钮。
+
+        忙碌时禁用按钮是必须的 —— 原来只有一句「更新中…」文字，用户连点两次
+        就会起两个下载任务互相踩文件。
+        """
         self._busy = busy
-        if text:
-            self.status.configure(text=text, text_color=TEXT_MUTED)
+        state = "disabled" if busy else "normal"
+        for button in (
+            self.detect_btn,
+            self.update_release_btn,
+            self.update_specific_btn,
+            self.rollback_btn,
+            self.refresh_btn,
+        ):
+            try:
+                button.configure(state=state)
+            except tk.TclError:
+                pass
+        if busy:
+            self._busy_indicator().start(text or "处理中…", TEXT_MUTED)
+        else:
+            self._busy_indicator().stop()
+
+    def _set_status(self, text: str, color: str = TEXT_DIM) -> None:
+        """写一条静态状态（不转圈）：检测结果、错误提示等。"""
+        self._busy_indicator().stop(text, color)
 
     def _run_async(self, label: str, fn) -> None:
         self.session_check()
         if self._busy:
             messagebox.showinfo("请稍候", "上一个操作还在进行中", parent=self)
             return
-        self._set_busy(True, f"{label}中…")
+        self._set_busy(True, f"正在{label}…")
+        # 终态文案：成功用 ✓ + 强调色，失败用 ! + 红色。默认不写（保持最后一次进度文案）。
+        self._done_text = None
 
         def worker():
             try:
@@ -283,25 +333,47 @@ class VersionUpdateDialog(SessionDialog):
             # 必须先取出消息：except 块结束时 e 会被解绑，延迟执行的 lambda 里读不到它
             except vs.VersionServiceError as e:
                 msg = str(e)
-                self.after(0, lambda: self.status.configure(text=msg, text_color=DANGER))
+                self.after(0, lambda: self._set_status(msg, DANGER))
             except Exception as e:  # noqa: BLE001
                 msg = str(e)
                 self.after(0, lambda: messagebox.showerror(label, msg, parent=self))
+                self.after(0, lambda: self._set_status(f"! {msg}", DANGER))
             finally:
                 self.session._local.generation = None
-                self.after(0, lambda: self._set_busy(False))
+                self.after(0, lambda: self._finish_busy())
                 self.after(0, self._refresh_rows)
                 if self._on_done:
                     self.after(0, self._on_done)
 
         threading.Thread(target=worker, name=f"ver-{label}", daemon=True).start()
 
+    def _finish_busy(self) -> None:
+        """结束忙碌：停动画、恢复按钮，并按需写入终态文案。"""
+        self._busy = False
+        state = "normal"
+        for button in (
+            self.detect_btn,
+            self.update_release_btn,
+            self.update_specific_btn,
+            self.rollback_btn,
+            self.refresh_btn,
+        ):
+            try:
+                button.configure(state=state)
+            except tk.TclError:
+                pass
+        done = getattr(self, "_done_text", None)
+        if done:
+            self._busy_indicator().stop(done[0], done[1])
+        else:
+            self._busy_indicator().stop()
+
     def _detect(self) -> None:
         target = self._target()
         if not target.ready:
-            self.status.configure(
-                text="缺少后端地址或节点令牌：请手工填写，或确保实例 .env 里有 MANAGER_WS_URL 与 NODE_TOKEN",
-                text_color=DANGER,
+            self._set_status(
+                "缺少后端地址或节点令牌：请手工填写，或确保实例 .env 里有 MANAGER_WS_URL 与 NODE_TOKEN",
+                DANGER,
             )
             return
 
@@ -311,15 +383,15 @@ class VersionUpdateDialog(SessionDialog):
 
             def done():
                 if not self._remote:
-                    self.status.configure(text="后端尚未发布任何客户端版本", text_color=WARNING)
+                    self._set_status("后端尚未发布任何客户端版本", WARNING)
                     return
                 note = self._remote.get("notes") or ""
                 text = f"后端发布版本 v{self._remote.get('version')}（来源：{target.source}）"
-                self.status.configure(text=f"{text}　{note}".strip(), text_color=ACCENT)
+                self._set_status(f"{text}　{note}".strip(), ACCENT)
 
             self.after(0, done)
 
-        self._run_async("检测", job)
+        self._run_async("检测更新", job)
 
     def _confirm(self, title: str, lines: list[str]) -> bool:
         return messagebox.askyesno(title, "\n".join(lines), parent=self)
@@ -333,7 +405,14 @@ class VersionUpdateDialog(SessionDialog):
                 f"v{r.old_version or '-'} → v{r.new_version or '-'}  {r.message}"
             )
         text = "\n".join(lines)
+        # 终态也写进状态条：弹窗之外还能看到「成功 5/5」
+        if ok_n == len(results):
+            self._done_text = (f"✓ 完成：成功 {ok_n}/{len(results)}", ACCENT)
+        else:
+            self._done_text = (f"! 部分失败：成功 {ok_n}/{len(results)}", WARNING)
         show = messagebox.showinfo if ok_n == len(results) else messagebox.showwarning
+        # 先收尾状态条再弹窗：模态框会挡住主循环，动画停在弹窗后面看不见。
+        self.after(0, self._finish_busy)
         self.after(0, lambda: show(title, text, parent=self))
 
     def _download_and_apply(
@@ -353,24 +432,41 @@ class VersionUpdateDialog(SessionDialog):
         with tempfile.TemporaryDirectory(prefix="node_client_pkg_") as tmp:
             tmpdir = Path(tmp)
             pkg = tmpdir / f"node_client-{version}.zip"
-            self.after(0, lambda: self.status.configure(
-                text=f"正在下载 v{version}…", text_color=TEXT_MUTED
-            ))
-            vs.download_package(target, version, pkg)
+
+            # —— 下载：把字节进度转成「百分比 + 已下载/总量」——
+            def on_download(done: int, total: int) -> None:
+                text = f"正在下载 v{version}　{format_bytes(done)}"
+                if total > 0:
+                    text = f"正在下载 v{version}　{format_bytes(done)} / {format_bytes(total)}　{done * 100 // total}%"
+                self.after(0, lambda t=text: self._busy_indicator().update(t))
+
+            throttle = ThrottledProgress(on_download)
+            self.after(0, lambda: self._busy_indicator().update(f"正在下载 v{version}…"))
+            vs.download_package(target, version, pkg, on_progress=throttle.report)
+
+            self.after(0, lambda: self._busy_indicator().update("正在校验安装包 sha256…"))
             if not vs.verify_sha256(pkg, sha256):
                 raise RuntimeError("安装包校验和不匹配，已中止更新")
 
+            self.after(0, lambda: self._busy_indicator().update("正在解压安装包…"))
             extract_dir = tmpdir / "extracted"
             ok, msg = extract_package(pkg, extract_dir)
             if not ok:
                 raise RuntimeError(msg)
             self.session_check()
 
-            self.after(0, lambda: self.status.configure(
-                text=f"正在更新 {len(ids)} 个实例…", text_color=TEXT_MUTED
+            # —— 逐实例更新：显示「(2/5) 实例名：停止实例…」——
+            def on_instance(index: int, total: int, name: str, phase: str) -> None:
+                label = self._PHASE_LABELS.get(phase, "处理中…")
+                text = f"正在更新 ({index}/{total}) {name}：{label}"
+                self.after(0, lambda t=text: self._busy_indicator().update(t))
+
+            self.after(0, lambda: self._busy_indicator().update(
+                f"正在更新 {len(ids)} 个实例…"
             ))
             results = self.manager.batch_update(
-                extract_dir, instance_ids=ids, restart_if_was_running=True
+                extract_dir, instance_ids=ids, restart_if_was_running=True,
+                on_progress=on_instance,
             )
         self._report(title, results)
 
@@ -481,9 +577,15 @@ class VersionUpdateDialog(SessionDialog):
 
         ids = [r.cfg.id for r in rows]
 
+        def on_instance(index: int, total: int, name: str, phase: str) -> None:
+            label = self._PHASE_LABELS.get(phase, "处理中…")
+            text = f"正在回滚 ({index}/{total}) {name}：{label}"
+            self.after(0, lambda t=text: self._busy_indicator().update(t))
+
         def job():
             results = self.manager.batch_rollback(
-                version, instance_ids=ids, restart_if_was_running=True
+                version, instance_ids=ids, restart_if_was_running=True,
+                on_progress=on_instance,
             )
             self._report("回滚结果", results)
 
