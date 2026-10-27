@@ -1,6 +1,7 @@
 """split tests: store + process_manager."""
 from __future__ import annotations
 
+import socket
 import sys
 import time
 from pathlib import Path
@@ -166,6 +167,33 @@ def test_set_daemon_all(tmp_path: Path):
     assert a.cfg.daemon is False
     assert b.cfg.daemon is False
     assert "已关闭守护" in off[0][3]
+
+
+def test_start_stops_daemon_when_status_port_is_already_listening(tmp_path: Path, monkeypatch):
+    """端口上已有监听且 /status 认不出本实例时，不再拉起第二个进程。"""
+    import node_log as nl
+
+    monkeypatch.setattr(nl, "logs_dir", lambda: tmp_path / "logs")
+    held = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    held.bind(("127.0.0.1", 0))
+    held.listen(1)
+    port = held.getsockname()[1]
+    mgr = ProcessManager()
+    cfg = InstanceConfig.create(
+        name="busy", exe_path=str(tmp_path / "node_client.exe"), cwd=str(tmp_path),
+        status_port=port, daemon=True,
+    )
+    mp = mgr.add(cfg)
+    monkeypatch.setattr(mp, "_status_reachable", lambda timeout=0.4: False)
+    try:
+        mp.start()
+        assert mp._proc is None
+        assert mp._want_running is False
+        assert mp.cfg.daemon is False
+        assert "已被占用" in mp.runtime.last_error
+        assert "停止自动重启" in mp.runtime.last_error
+    finally:
+        held.close()
 
 
 def test_recover_attaches_via_status_port(tmp_path: Path, monkeypatch):

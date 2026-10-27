@@ -35,3 +35,20 @@ def allocate_ports(used: set[int], count: int = 1, start: int = 18765) -> list[i
     if len(out) < count:
         raise RuntimeError("无法分配足够的本机状态端口")
     return out
+
+
+def port_has_listener(host: str = "127.0.0.1", port: int = 0, timeout: float = 0.2) -> bool:
+    """该地址上是否已有进程在 accept。
+
+    只有连接成功才算有监听。这台 Windows 上，空端口和只 bind 未 listen 的套接字
+    都会让 connect 超时而不是立刻拒绝，不能把超时当成占用。
+    """
+    if int(port) <= 0:
+        return False
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        try:
+            sock.connect((host, int(port)))
+        except OSError:
+            return False
+    return True
