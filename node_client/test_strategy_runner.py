@@ -1900,8 +1900,8 @@ def _addon_pl_rule(**over) -> dict:
     return rule
 
 
-async def test_signal_float_pl_closes_only_own_magic():
-    """信号盈亏比按本魔术号浮盈/余额计算，只平本信号，其它 magic 不动。"""
+async def test_signal_float_pl_writes_stop_not_market_close():
+    """盈亏比按 |比例| × 余额写成止损，浮亏本身不平仓，其它魔术号不动。"""
     sent: list = []
     mt5 = MockMT5Client()
     mt5.balance = 10000.0
@@ -1918,20 +1918,19 @@ async def test_signal_float_pl_closes_only_own_magic():
     for p in mt5._positions:
         if int(p.get("magic") or 0) == MAGIC:
             p["profit"] = -2000.0
-        elif int(p.get("magic") or 0) == OTHER_MAGIC:
-            p["profit"] = 5000.0  # 账户净值其实是赚的；本信号仍达 -20%
 
     held = [p for p in mt5._positions if int(p.get("magic") or 0) == MAGIC]
-    _tick(hub, held, held[0]["price_open"])
+    open_px = held[0]["price_open"]
+    _tick(hub, held, open_px)
     await _settle()
 
-    assert mt5.positions_by_magic(MAGIC) == []
-    assert mt5.positions_by_magic(OTHER_MAGIC)
-    finished = _of_type(sent, "strategy_finished")
-    assert finished and finished[0]["status"] == "done"
-    assert "信号盈亏比" in finished[0]["reason"]
-    assert finished[0]["detail"]["kind"] == "signal_pl"
-    assert finished[0]["detail"]["current_ratio"] == -20.0
+    # 亏损金额 10000*20% = 2000；0.1 手每美元 10，止损距离 200
+    pos = mt5.positions_by_magic(MAGIC)[0]
+    assert pos["sl"] == open_px - 200
+    assert pos["tp"] == 0
+    assert mt5.positions_by_magic(OTHER_MAGIC)[0]["sl"] == 0
+    assert not _of_type(sent, "strategy_finished")
+    runner.cancel()
 
 
 def _lot_tiers(**over) -> dict:
@@ -1947,7 +1946,7 @@ def _lot_tiers(**over) -> dict:
 
 
 async def test_signal_lot_pl_writes_batch1_stops_and_ignores_price_ticks():
-    """批次1金额写成共同止盈止损；报价波动不市价平仓，手数变化才重算。"""
+    """批次1金额只写止盈；没开盈亏比时不写止损。报价波动不平仓，手数变化才重算。"""
     sent: list = []
     mt5 = MockMT5Client()
     runner, hub = _runner(
@@ -1964,7 +1963,7 @@ async def test_signal_lot_pl_writes_batch1_stops_and_ignores_price_ticks():
     # D = 10 / ((1/0.01) * 0.1) = 1，不用批次2的 20
     pos = mt5.positions_by_magic(MAGIC)[0]
     assert pos["tp"] == open_px + 1
-    assert pos["sl"] == open_px - 1
+    assert pos["sl"] == 0
     assert not _of_type(sent, "strategy_finished")
 
     _tick(hub, [p for p in mt5._positions if int(p.get("magic") or 0) == MAGIC], open_px + 0.2)
@@ -1979,7 +1978,7 @@ async def test_signal_lot_pl_writes_batch1_stops_and_ignores_price_ticks():
     await _settle()
     pos = mt5.positions_by_magic(MAGIC)[0]
     assert pos["tp"] == open_px + 0.5
-    assert pos["sl"] == open_px - 0.5
+    assert pos["sl"] == 0
     noted = _progress(sent, "signal_pl")
     assert noted and noted[-1]["detail"]["amount"] == 10.0
     assert noted[-1]["detail"]["tier_index"] == 0

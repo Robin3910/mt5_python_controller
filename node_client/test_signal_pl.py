@@ -78,7 +78,7 @@ def test_lot_pl_uses_batch1_absolute_amount_and_weighted_open():
     # W = (0.1*2300 + 0.2*2310) / 0.3 = 2306.666...
     # D = 30 / ((1/0.01) * 0.3) = 1
     plans = sp.plan_common_stops(
-        positions, amount=sp.lot_pl_amount(cfg),
+        positions, tp_amount=sp.lot_pl_amount(cfg),
         tick_size=0.01, tick_value=1.0, digits=2,
         bid=2306.0,
     )
@@ -86,15 +86,20 @@ def test_lot_pl_uses_batch1_absolute_amount_and_weighted_open():
     plan = plans[0]
     assert plan["side"] == "BUY"
     assert plan["tp"] == 2307.67
-    assert plan["sl"] == 2305.67
+    assert plan["sl"] is None
     assert plan["crossed"] is None
     assert plan["amount"] == 30.0
+    both = sp.plan_common_stops(
+        positions, tp_amount=30, sl_amount=30,
+        tick_size=0.01, tick_value=1.0, digits=2, bid=2306.0,
+    )
+    assert both[0]["sl"] == 2305.67
 
 
 def test_lot_pl_sell_stops_are_mirrored():
     positions = [{"type": "SELL", "ticket": 1, "volume": 1.0, "price_open": 1.1}]
     plans = sp.plan_common_stops(
-        positions, amount=10,
+        positions, tp_amount=10, sl_amount=10,
         tick_size=0.00001, tick_value=1.0, digits=5,
         ask=1.1,
     )
@@ -116,12 +121,12 @@ def test_lot_pl_buy_side_ignores_sell_and_crossed_take_profit():
     scoped = sp.filter_lot_side(positions, sp.lot_pl_close_action(cfg))
     assert [p["ticket"] for p in scoped] == [2]
     plans = sp.plan_common_stops(
-        scoped, amount=10, tick_size=0.01, tick_value=1.0, digits=2,
+        scoped, tp_amount=10, tick_size=0.01, tick_value=1.0, digits=2,
         bid=2331.0,
     )
-    # D = 10 / (100 * 0.1) = 1，止盈 2331，买价已经到了
+    # D = 10 / (100 * 0.1) = 1，止盈 2331，买价已经到了；没给止损金额就不写止损
     assert plans[0]["tp"] == 2331.0
-    assert plans[0]["sl"] == 2329.0
+    assert plans[0]["sl"] is None
     assert plans[0]["crossed"] == "tp"
 
 
@@ -137,21 +142,13 @@ def test_lot_pl_does_not_market_close_inside_find_triggered_rule():
     ) is None
 
 
-def test_times_mode_consumes_remaining():
-    cfg = sp.prepare_runtime(_cfg(float_pl_ratio={
-        "enabled": True, "ratio": -20, "monitor_mode": "times", "max_times": 2,
-    }))
-    assert cfg["float_pl_ratio"]["remaining_times"] == 2
-    hit = sp.should_trigger_float_pl(
-        cfg, balance=10000, signal_profit=-2000, has_positions=True,
-    )
-    assert hit is not None
-    cfg, state = sp.apply_float_pl_trigger(cfg)
-    assert state["remaining_times"] == 1
-    assert cfg["float_pl_ratio"]["enabled"] is True
-    cfg, state = sp.apply_float_pl_trigger(cfg)
-    assert state["disabled"] is True
-    assert cfg["float_pl_ratio"]["enabled"] is False
-    assert sp.should_trigger_float_pl(
-        cfg, balance=10000, signal_profit=-2000, has_positions=True,
+def test_float_pl_ratio_becomes_loss_amount():
+    """盈亏比只折成亏损金额，正负号都按绝对值。未启用不折。"""
+    cfg = _cfg(float_pl_ratio={"enabled": True, "ratio": -20})
+    assert sp.float_pl_loss_amount(cfg, 10000) == 2000.0
+    assert sp.float_pl_loss_amount(
+        _cfg(float_pl_ratio={"enabled": True, "ratio": 20}), 10000,
+    ) == 2000.0
+    assert sp.float_pl_loss_amount(
+        _cfg(float_pl_ratio={"enabled": False, "ratio": -20}), 10000,
     ) is None

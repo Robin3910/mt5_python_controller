@@ -113,10 +113,6 @@ const templateTagOptions = computed(() => {
   return opts
 })
 
-const MONITOR_MODE_TAGS: TagOption<RiskMonitorMode>[] = [
-  { value: 'loop', label: '循环' },
-  { value: 'times', label: '指定次数' },
-]
 const SIDE_TAGS: TagOption<string>[] = [
   { value: 'all', label: '全部' },
   { value: 'buy', label: '多单' },
@@ -381,14 +377,14 @@ const FIELD_HELP = {
     '最多允许平移多少格，0 表示不限。\n' +
     '不限时只要不触发止损，网格会一直跟着行情滚动。',
   signal_pl:
-    '信号级盈亏控制：每个信号按自己的魔术号独立监控，触发后只平该信号仓位，' +
-    '不影响同节点其它信号。盈亏比分子是该信号浮盈亏，分母是账户余额。',
+    '止盈和止损都写到该信号的订单上，由券商到价平仓。\n' +
+    '订单手数变化时重算。不按浮盈抽样平仓。',
   signal_float_pl:
-    '该信号浮盈亏 ÷ 账户余额 × 100%。负数为亏损侧达阈值，正数为盈利侧。' +
-    '触发后清仓该信号全部持仓。循环=同信号生命周期内可反复触发；指定次数耗尽后本任务不再触发。',
+    '用这个百分比的绝对值 × 账户余额，得到亏损金额，再反推共同止损价。\n' +
+    '-20 和 20 都表示亏损达到余额的 20% 时止损。',
   signal_lot_pl:
-    '只用批次1的盈亏金额绝对值，给该信号同方向持仓写共同止盈和共同止损。\n' +
-    '加仓或平仓改变手数后，按新的总手数和开仓价重算并改单。更高批次不参与这个平仓价。',
+    '只用批次1的盈亏金额绝对值反推共同止盈，不写止损。\n' +
+    '加仓或平仓改变手数后重算。更高批次不参与这个止盈价。',
 }
 
 /** 保本监控方式，与后端 BREAKEVEN_MODES 对齐 */
@@ -1312,7 +1308,6 @@ function validateRules(rules: EditableRule[]): string | null {
 function validateSignalPl(cfg: SignalPlForm): string | null {
   const r = cfg.float_pl_ratio
   if (!Number.isFinite(r.ratio) || r.ratio === 0) return '信号盈亏比比例不能为 0'
-  if (r.monitor_mode === 'times' && !(r.max_times >= 1)) return '信号盈亏比指定次数至少为 1'
   const lpt = cfg.lot_pl_tiers
   if (!['all', 'buy', 'sell'].includes(lpt.close_action)) return '信号分档平仓动作无效'
   if (!lpt.tiers.length) return '信号分档平仓至少需要 1 个批次'
@@ -1616,7 +1611,7 @@ function resetRuleToTemplate(idx: number): void {
         <div v-if="isTpl1" class="signal-pl-editor">
           <div class="rules-editor-head">
             <FormLabel text="信号盈亏控制" :help="FIELD_HELP.signal_pl" />
-            <span class="muted" style="font-size: 12px">每个信号独立监控，触发只平该信号仓</span>
+            <span class="muted" style="font-size: 12px">止盈按分档金额，止损按盈亏比</span>
           </div>
           <div class="signal-pl-rules">
             <div class="signal-pl-row">
@@ -1625,12 +1620,7 @@ function resetRuleToTemplate(idx: number): void {
                 <span>信号盈亏比</span>
               </label>
               <input v-model.number="signalPl.float_pl_ratio.ratio" type="number" step="0.1" class="signal-pl-num" />
-              <span class="muted" style="font-size: 13px">% ，清仓该信号全部</span>
-              <TagSelect v-model="signalPl.float_pl_ratio.monitor_mode" :options="MONITOR_MODE_TAGS" aria-label="监控方式" />
-              <template v-if="signalPl.float_pl_ratio.monitor_mode === 'times'">
-                <input v-model.number="signalPl.float_pl_ratio.max_times" type="number" min="1" class="signal-pl-times" />
-                <span class="muted" style="font-size: 12px">次</span>
-              </template>
+              <span class="muted" style="font-size: 13px">% ，按余额反推止损</span>
             </div>
             <div class="signal-pl-block">
               <div class="signal-pl-row signal-pl-row-wrap">
@@ -1661,7 +1651,7 @@ function resetRuleToTemplate(idx: number): void {
                 <input v-model.number="tier.pl_amount" type="number" step="1" class="signal-pl-num" />
               </div>
               <p class="muted" style="font-size: 12px; margin: 8px 0 0">
-                只用批次1的盈亏金额（取绝对值，同时写止盈和止损）。订单手数变化时重算共同平仓价并改单。
+                只用批次1的盈亏金额（取绝对值）写止盈。止损用上面的盈亏比和账户余额反推。订单手数变化时重算并改单。
               </p>
             </div>
           </div>

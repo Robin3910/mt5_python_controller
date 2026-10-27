@@ -493,25 +493,21 @@ class StrategyRunner:
             linked = await self._manual_tp_linkage(event, positions)
             if linked is not None:
                 return linked == "done"
-            pl_result = await self._signal_pl_advance(positions)
-            if pl_result == "done":
+            lot_result = await self._lot_sltp_sync(event, positions)
+            if lot_result == "done":
                 return True
-            if pl_result != "hit":
-                lot_result = await self._lot_sltp_sync(event, positions)
-                if lot_result == "done":
-                    return True
-                if lot_result == "hit":
+            if lot_result == "hit":
+                return False
+            if await self._maybe_open_manual_scatter(event, positions):
+                return False
+            filtered = manual_scatter.exclude_manual(positions)
+            if filtered:
+                ctx = self._ctx(event, filtered)
+                ctx.bar_metrics = await self._read_bar_metrics()
+                decision = evaluate(self.strategy.get("rules") or [], ctx)
+                if decision is not None:
+                    await self._add_position(decision, positions)
                     return False
-                if await self._maybe_open_manual_scatter(event, positions):
-                    return False
-                filtered = manual_scatter.exclude_manual(positions)
-                if filtered:
-                    ctx = self._ctx(event, filtered)
-                    ctx.bar_metrics = await self._read_bar_metrics()
-                    decision = evaluate(self.strategy.get("rules") or [], ctx)
-                    if decision is not None:
-                        await self._add_position(decision, positions)
-                        return False
 
         if time.time() - self._last_report >= self.report_interval:
             await self._emit_progress("heartbeat", phase="running", positions=positions)
@@ -595,74 +591,15 @@ class StrategyRunner:
             return None
         return bal
 
-    async def _signal_pl_advance(self, positions: list[dict]) -> Optional[str]:
-        """加仓路径的信号盈亏比。分档手数改走 _lot_sltp_sync，不在这里比浮盈。
-
-        返回 done=已清该信号并收口；hit=本拍已平仓不再加仓；None=未触发。
-        """
-        rule = (self._signal_pl or {}).get(signal_pl.RULE_FLOAT_PL_RATIO) or {}
-        if not rule.get("enabled") or not positions:
-            return None
-        balance = await self._read_balance()
-        if balance is None:
-            return None
-        profit = sum(_as_float(p.get("profit")) for p in positions)
-        hit = signal_pl.find_triggered_rule(
-            self._signal_pl,
-            balance=balance,
-            signal_profit=profit,
-            positions=positions,
-        )
-        if hit is None:
-            return None
-        reason = signal_pl.describe_trigger(hit)
-        detail = signal_pl.trigger_detail(hit)
-        if hit.get("rule") == signal_pl.RULE_FLOAT_PL_RATIO:
-            self._signal_pl, _state = signal_pl.apply_float_pl_trigger(self._signal_pl)
-        if signal_pl.closes_all(hit):
-            self.request_stop(reason, detail=detail)
-            await self._emit_progress(
-                "signal_pl", phase="closing", positions=positions,
-                message=reason, detail=detail,
-            )
-            return "done" if await self._close_all() else "hit"
-        targets = signal_pl.select_close_targets(positions, hit)
-        if not targets:
-            return None
-        target_tickets = {int(t.get("ticket") or 0) for t in targets}
-        self._last_floating_profit = round(
-            sum(_as_float(p.get("profit")) for p in targets), 2,
-        )
-        self._remember_position_profits(targets)
-        res = dict(await self._exec(self._mt5.close_positions, targets) or {})
-        if not res.get("success", True):
-            err = str(res.get("error") or "close failed")
-            await self._emit_progress(
-                "error", phase="running", positions=positions,
-                message=f"{reason}：平仓失败 {err}",
-                detail=detail,
-            )
-            return "hit"
-        remaining = [
-            p for p in positions if int(p.get("ticket") or 0) not in target_tickets
-        ]
-        await self._emit_progress(
-            "signal_pl", phase="running" if remaining else "closing",
-            positions=remaining, message=reason, detail=detail,
-        )
-        if remaining:
-            return "hit"
-        self.request_stop(reason, detail=detail)
-        return "done" if await self._close_all() else "hit"
-
     async def _lot_sltp_sync(self, event: MarketEvent, positions: list[dict]) -> Optional[str]:
-        """按批次1金额给同方向加仓单写共同止盈止损。
+        """分档批次1写共同止盈，盈亏比 × 余额写共同止损。订单构成变化时重算。
 
         返回 done=穿过目标价后已清干净并收口；hit=本拍已市价平掉穿过的方向，不再加仓；
         None=已改单或无需动作，本拍可以继续交易。
         """
-        amount = signal_pl.lot_pl_amount(self._signal_pl)
-        if amount is None or not positions:
+        tp_amount = signal_pl.lot_pl_amount(self._signal_pl)
+        ratio_on = signal_pl.float_pl_enabled(self._signal_pl)
+        if (tp_amount is None and not ratio_on) or not positions:
             return None
         scoped = signal_pl.filter_lot_side(
             manual_scatter.exclude_manual(positions),
@@ -681,9 +618,20 @@ class StrategyRunner:
         if spec is None:
             await self._lot_sltp_fail(sig, positions, "缺少合约规格，无法反推止盈止损")
             return None
+        sl_amount = None
+        if ratio_on:
+            balance = await self._read_balance()
+            if balance is None:
+                await self._lot_sltp_fail(sig, positions, "读不到账户余额，无法反推止损")
+                return None
+            sl_amount = signal_pl.float_pl_loss_amount(self._signal_pl, balance)
+            if sl_amount is None:
+                await self._lot_sltp_fail(sig, positions, "盈亏比无法折成止损金额")
+                return None
         plans = signal_pl.plan_common_stops(
             scoped,
-            amount=amount,
+            tp_amount=tp_amount,
+            sl_amount=sl_amount,
             tick_size=_as_float(spec.get("tick_size")),
             tick_value=_as_float(spec.get("tick_value")),
             digits=int(spec.get("digits") or 0),
@@ -737,9 +685,9 @@ class StrategyRunner:
         return "done" if await self._close_all() else "hit"
 
     async def _lot_sltp_modify(self, plan: dict) -> tuple[bool, bool]:
-        """把同一方向还没写成目标价的持仓改到共同止盈止损。返回 (是否全部成功, 是否改过)。"""
-        sl = float(plan["sl"])
-        tp = float(plan["tp"])
+        """写入这一侧算出的止盈和/或止损。没算的一侧沿用持仓上的现价。"""
+        sl = plan.get("sl")
+        tp = plan.get("tp")
         digits = int(plan.get("digits") or 0)
         changed = False
         ok = True
@@ -747,10 +695,12 @@ class StrategyRunner:
             if signal_pl.stops_match(pos, sl, tp, digits):
                 continue
             changed = True
+            send_sl = float(sl) if sl is not None else _as_float(pos.get("sl"), 0.0)
+            send_tp = float(tp) if tp is not None else None
             try:
                 res = dict(await self._exec(
                     self._mt5.modify_position_sl,
-                    int(pos.get("ticket") or 0), sl, tp,
+                    int(pos.get("ticket") or 0), send_sl, send_tp,
                 ) or {})
             except Exception as e:  # noqa: BLE001
                 logger.warning("task %s lot sltp modify failed: %s", self.task_id, e)
