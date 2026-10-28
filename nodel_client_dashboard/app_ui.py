@@ -435,16 +435,16 @@ class DashboardApp(ctk.CTk):
 
         # 摘要卡
         summary_card = soft_card(right)
-        summary_card.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        summary_card.grid(row=2, column=0, sticky="nsew", pady=(0, 10))
         self.summary = ctk.CTkLabel(
             summary_card,
             text="",
             justify="left",
-            anchor="w",
+            anchor="nw",
             text_color=TEXT_MUTED,
             font=mono(12),
         )
-        self.summary.pack(fill="x", padx=14, pady=12)
+        self.summary.pack(fill="both", expand=True, padx=14, pady=12)
 
     def _persist(self) -> None:
         save_instances(self.manager.configs())
