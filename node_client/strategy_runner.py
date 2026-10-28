@@ -87,6 +87,13 @@ def _as_float(value: object, default: float = 0.0) -> float:
         return default
 
 
+def _fmt_stop(value: object) -> str:
+    number = _as_float(value)
+    if number <= 0:
+        return "不设"
+    return f"{number:g}"
+
+
 def _trade_error_text(res: object, *, fallback: str = "改单失败") -> str:
     """从单笔或批量 order_send 回包抽出券商原文（comment + retcode）。
 
@@ -795,6 +802,90 @@ class StrategyRunner:
     # ------------------------------------------------------------------
     # 交易动作
     # ------------------------------------------------------------------
+    async def _open_quote(self) -> tuple[float, float]:
+        """开仓用的买价 / 卖价。读不到时退回最近一次事件。"""
+        bid = ask = 0.0
+        try:
+            quotes = dict(await self._exec(self._mt5.quotes, [self.symbol]) or {})
+        except Exception:  # noqa: BLE001
+            logger.debug("task %s quotes failed", self.task_id, exc_info=True)
+            quotes = {}
+        quote = quotes.get(self.symbol) or next(iter(quotes.values()), {})
+        if isinstance(quote, dict):
+            bid = _as_float(quote.get("bid"))
+            ask = _as_float(quote.get("ask"))
+        event = self._last_market
+        if event is not None:
+            if bid <= 0:
+                bid = _as_float(event.bid) or _as_float(event.price)
+            if ask <= 0:
+                ask = _as_float(event.ask) or _as_float(event.price)
+        return bid, ask
+
+    async def _stops_on_open(
+        self, side: str, volume: float, positions: list[dict],
+    ) -> Optional[tuple[Optional[float], Optional[float]]]:
+        """开仓前按预计成交价算出要写进市价单的共同止损、止盈。
+
+        返回 None 表示这次没算出来，调用方沿用信号自带的止损止盈（加仓则不挂）。
+        返回元组时，其中的 None 表示这一侧不写进订单。
+        """
+        tp_amount = signal_pl.lot_pl_amount(self._signal_pl)
+        ratio_on = signal_pl.float_pl_enabled(self._signal_pl)
+        if tp_amount is None and not ratio_on:
+            return None
+        try:
+            spec = await self._manual_symbol_spec()
+            if spec is None:
+                return None
+            bid, ask = await self._open_quote()
+            action = str(side or "").upper()
+            fill = ask if action == "BUY" else bid
+            if fill <= 0:
+                fill = bid or ask
+            sl_amount = None
+            if ratio_on:
+                balance = await self._read_balance()
+                if balance is not None:
+                    sl_amount = signal_pl.float_pl_loss_amount(self._signal_pl, balance)
+            if tp_amount is None and sl_amount is None:
+                return None
+            return signal_pl.opening_stops(
+                manual_scatter.exclude_manual(positions),
+                side=action,
+                volume=volume,
+                fill_price=fill,
+                tp_amount=tp_amount,
+                sl_amount=sl_amount,
+                tp_min_lot=signal_pl.lot_pl_min_lot(self._signal_pl),
+                close_action=signal_pl.lot_pl_close_action(self._signal_pl),
+                tick_size=_as_float(spec.get("tick_size")),
+                tick_value=_as_float(spec.get("tick_value")),
+                digits=int(spec.get("digits") or 0),
+                bid=bid,
+                ask=ask,
+                stops_level=int(spec.get("stops_level") or 0),
+                point=_as_float(spec.get("point")),
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("task %s opening stops failed", self.task_id, exc_info=True)
+            return None
+
+    def _merge_entry_stops(
+        self, computed: Optional[tuple[Optional[float], Optional[float]]],
+    ) -> tuple[Optional[float], Optional[float]]:
+        """首单：算出来的一侧用共同价，没启用的一侧仍用信号自带的止损止盈。"""
+        signal_sl = self.entry.get("stop_loss")
+        signal_tp = self.entry.get("take_profit")
+        if computed is None:
+            return signal_sl, signal_tp
+        sl, tp = computed
+        if sl is None and not signal_pl.float_pl_enabled(self._signal_pl):
+            sl = signal_sl
+        if tp is None and signal_pl.lot_pl_amount(self._signal_pl) is None:
+            tp = signal_tp
+        return sl, tp
+
     async def _open_first(self) -> bool:
         """下首单；失败直接结束子任务（服务端会据此收口）。
 
@@ -805,10 +896,13 @@ class StrategyRunner:
             return await self._grid_open_first()
         if self.risk_sized:
             return await self._risk_open_base()
+        order_sl, order_tp = self._merge_entry_stops(
+            await self._stops_on_open(self.direction, self.base_volume, []),
+        )
         res = await self._exec(
             self._mt5.place_market_order,
             self.symbol, self.direction, self.base_volume,
-            self.entry.get("stop_loss"), self.entry.get("take_profit"),
+            order_sl, order_tp,
             self._open_comment(), self.magic,
         )
         res = dict(res or {})
@@ -832,17 +926,22 @@ class StrategyRunner:
                 "price": res.get("price"),
                 "volume": self.base_volume,
             },
-            message=self._describe_open(),
-            detail=self._open_detail(),
+            message=self._describe_open(order_sl, order_tp),
+            detail=self._open_detail(order_sl, order_tp),
         )
         return True
 
     async def _add_position(self, decision, positions: list[dict]) -> None:
         reason = describe_decision(decision)
+        order_sl, order_tp = await self._stops_on_open(
+            decision.action, decision.volume, positions,
+        ) or (None, None)
+        if order_sl or order_tp:
+            reason += f"；止损 {_fmt_stop(order_sl)}，止盈 {_fmt_stop(order_tp)}"
         res = await self._exec(
             self._mt5.place_market_order,
             self.symbol, decision.action, decision.volume,
-            None, None, decision_comment(decision), self.magic,
+            order_sl, order_tp, decision_comment(decision), self.magic,
         )
         res = dict(res or {})
         if not res.get("success"):
@@ -870,7 +969,11 @@ class StrategyRunner:
                 "volume": decision.volume,
             },
             message=reason,
-            detail=decision_detail(decision),
+            detail={
+                **decision_detail(decision),
+                "stop_loss": order_sl,
+                "take_profit": order_tp,
+            },
         )
 
     async def _maybe_open_manual_scatter(
@@ -1943,14 +2046,13 @@ class StrategyRunner:
         comment = str(self.entry.get("comment") or "").strip()
         return (comment or f"S{self.task_id}")[:MT5_COMMENT_LIMIT]
 
-    def _describe_open(self) -> str:
+    def _describe_open(self, stop_loss: object = None, take_profit: object = None) -> str:
         """首单的开单原因：说明这一单来自哪条信号、按哪个策略托管。"""
         parts = [
             f"策略信号首单：{self.direction} {self.symbol} {self.base_volume} 手",
             f"托管策略「{self._strategy_name()}」（{self._enabled_rule_count()} 条规则生效）",
         ]
-        sl, tp = self.entry.get("stop_loss"), self.entry.get("take_profit")
-        parts.append(f"止损 {sl if sl else '不设'}，止盈 {tp if tp else '不设'}")
+        parts.append(f"止损 {_fmt_stop(stop_loss)}，止盈 {_fmt_stop(take_profit)}")
         parts.append(f"信号 {self.signal_id or '—'}")
         return "；".join(parts)
 
@@ -1960,7 +2062,7 @@ class StrategyRunner:
             if isinstance(r, dict) and str(r.get("status") or "0") not in ("0", "False")
         )
 
-    def _open_detail(self) -> dict:
+    def _open_detail(self, stop_loss: object = None, take_profit: object = None) -> dict:
         return {
             "kind": "open",
             "signal_id": self.signal_id,
@@ -1969,8 +2071,8 @@ class StrategyRunner:
             "symbol": self.symbol,
             "action": self.direction,
             "volume": self.base_volume,
-            "stop_loss": self.entry.get("stop_loss"),
-            "take_profit": self.entry.get("take_profit"),
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
             "signal_comment": self.entry.get("comment") or None,
             "strategy_id": self.strategy.get("strategy_id"),
             "strategy_name": self.strategy.get("name"),

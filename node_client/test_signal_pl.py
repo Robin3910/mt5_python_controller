@@ -179,3 +179,72 @@ def test_float_pl_ratio_becomes_loss_amount():
     assert sp.float_pl_loss_amount(
         _cfg(float_pl_ratio={"enabled": False, "ratio": -20}), 10000,
     ) is None
+
+
+def test_opening_stops_include_the_new_fill():
+    """新单按预计成交价并进加权价，下单时就能带上止损止盈。"""
+    held = [{"type": "BUY", "volume": 0.1, "price_open": 2300.0}]
+    sl, tp = sp.opening_stops(
+        held, side="BUY", volume=0.1, fill_price=2310.0,
+        tp_amount=10, sl_amount=20, tp_min_lot=0.1,
+        tick_size=0.01, tick_value=1.0, digits=2,
+        bid=2305.0, ask=2310.0,
+    )
+    # W = (0.1*2300 + 0.1*2310) / 0.2 = 2305
+    # D_sl = 20 / 20 = 1，D_tp = 10 / 20 = 0.5
+    assert sl == 2304.0
+    assert tp == 2305.5
+    # 空单：止盈在加权价之下，止损在上，且相对卖价都在合法一侧
+    sell_sl, sell_tp = sp.opening_stops(
+        [], side="SELL", volume=0.1, fill_price=2300.0,
+        tp_amount=10, sl_amount=20,
+        tick_size=0.01, tick_value=1.0, digits=2,
+        bid=2300.0, ask=2300.1,
+    )
+    assert sell_sl == 2302.0
+    assert sell_tp == 2299.0
+
+
+def test_opening_stops_skip_unsendable_side():
+    """现价已经越过、或近于 stops_level 的那一侧不挂，避免整张市价单被拒。"""
+    common = dict(
+        side="BUY", volume=0.1, fill_price=2300.0,
+        tp_amount=10, sl_amount=2000, tp_min_lot=0.0,
+        tick_size=0.01, tick_value=1.0, digits=2,
+        bid=2300.0, ask=2300.0,
+    )
+    # D_tp = 10 / 10 = 1，止盈 2301；现价已在 2302，越过止盈
+    sl, tp = sp.opening_stops([], bid=2302.0, ask=2302.0, **{
+        k: v for k, v in common.items() if k not in ("bid", "ask")
+    })
+    assert sl == 2100.0
+    assert tp is None
+
+    # 止盈距现价 100 点，低于券商要求的 150 点，这一侧不挂；止损距离足够，仍挂
+    near = sp.opening_stops(
+        [], side="BUY", volume=0.1, fill_price=2300.0,
+        tp_amount=10, sl_amount=2000, tp_min_lot=0.0,
+        tick_size=0.01, tick_value=1.0, digits=2,
+        bid=2300.0, ask=2300.0, stops_level=150, point=0.01,
+    )
+    assert near == (2100.0, None)
+
+
+def test_opening_stops_respect_side_and_min_lot():
+    assert sp.opening_stops(
+        [], side="BUY", volume=0.1, fill_price=2300.0,
+        tp_amount=10, sl_amount=20, close_action="sell",
+        tick_size=0.01, tick_value=1.0, digits=2, bid=2300.0,
+    ) is None
+    sl, tp = sp.opening_stops(
+        [], side="BUY", volume=0.1, fill_price=2300.0,
+        tp_amount=10, sl_amount=20, tp_min_lot=0.2,
+        tick_size=0.01, tick_value=1.0, digits=2, bid=2300.0,
+    )
+    assert sl == 2298.0
+    assert tp is None
+    assert sp.opening_stops(
+        [], side="BUY", volume=0.1, fill_price=0,
+        tp_amount=10, sl_amount=20,
+        tick_size=0.01, tick_value=1.0, digits=2,
+    ) is None

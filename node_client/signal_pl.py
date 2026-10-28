@@ -1,7 +1,8 @@
 """模版1 信号级盈亏控制纯函数：配置抽取与止盈止损价。
 
 不再按浮盈采样平仓。分档手数只用批次1金额反推共同止盈；
-信号盈亏比只用比例绝对值 × 账户余额反推共同止损。改单由调用方完成。
+信号盈亏比只用比例绝对值 × 账户余额反推共同止损。
+新开的一笔在下单时就带上这两个价；已有持仓仍由调用方改单对齐。
 """
 from __future__ import annotations
 
@@ -465,6 +466,93 @@ def plan_common_stops(
             "crossed": _cross_side(side, sl, tp, market),
         })
     return plans
+
+
+def _sendable_stop(
+    price: float | None, market: float, *, above: bool,
+    stops_level: int, point: float,
+) -> Optional[float]:
+    """这一侧能写进市价单才返回价格。落在现价错误一侧或近于 stops_level 时返回 None。
+
+    市价单把非法止损止盈带进去，券商会拒掉整张单，而不只是丢掉这一侧。
+    """
+    if price is None:
+        return None
+    px = float(price)
+    if px <= 0 or market <= 0:
+        return None
+    if above and px <= market:
+        return None
+    if not above and px >= market:
+        return None
+    level = max(0, int(stops_level))
+    step = _as_float(point, 0.0)
+    if level > 0 and step > 0 and abs(px - market) < level * step:
+        return None
+    return px
+
+
+def opening_stops(
+    positions: list | None,
+    *,
+    side: str,
+    volume: float,
+    fill_price: float,
+    tick_size: float,
+    tick_value: float,
+    digits: int,
+    tp_amount: float | None = None,
+    sl_amount: float | None = None,
+    tp_min_lot: float = 0.0,
+    close_action: str = "all",
+    bid: float = 0.0,
+    ask: float = 0.0,
+    stops_level: int = 0,
+    point: float = 0.0,
+) -> Optional[tuple[Optional[float], Optional[float]]]:
+    """新开这一笔要带上的 (止损, 止盈)。
+
+    预计成交价算进同方向加权开仓价，口径与事后改单相同。
+    该方向不在分档范围内、或缺少价格 / 规格 / 金额时返回 None，调用方沿用原有止损止盈。
+    返回元组时，其中的 None 表示这一侧不挂，避免非法价把整张市价单拒掉。
+    """
+    action_side = str(side or "").upper()
+    vol = _as_float(volume, 0.0)
+    fill = _as_float(fill_price, 0.0)
+    if action_side not in ("BUY", "SELL") or vol <= 0 or fill <= 0:
+        return None
+    selected = str(close_action or "all").lower()
+    if selected == "buy" and action_side != "BUY":
+        return None
+    if selected == "sell" and action_side != "SELL":
+        return None
+    if _price_distance(tp_amount or 0, 1) is None and _price_distance(sl_amount or 0, 1) is None:
+        return None
+    book = filter_lot_side(positions, selected)
+    book.append({"type": action_side, "volume": vol, "price_open": fill})
+    plans = plan_common_stops(
+        book,
+        tp_amount=tp_amount,
+        sl_amount=sl_amount,
+        tp_min_lot=tp_min_lot,
+        tick_size=tick_size,
+        tick_value=tick_value,
+        digits=digits,
+        bid=bid,
+        ask=ask,
+        fallback_price=fill,
+    )
+    plan = next((row for row in plans if row.get("side") == action_side), None)
+    if plan is None:
+        return None
+    market = _market_for_side(action_side, bid=bid, ask=ask, fallback=fill)
+    if action_side == "BUY":
+        sl = _sendable_stop(plan.get("sl"), market, above=False, stops_level=stops_level, point=point)
+        tp = _sendable_stop(plan.get("tp"), market, above=True, stops_level=stops_level, point=point)
+    else:
+        sl = _sendable_stop(plan.get("sl"), market, above=True, stops_level=stops_level, point=point)
+        tp = _sendable_stop(plan.get("tp"), market, above=False, stops_level=stops_level, point=point)
+    return sl, tp
 
 
 def describe_lot_stops(plan: dict | None) -> str:

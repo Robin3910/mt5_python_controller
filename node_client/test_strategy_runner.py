@@ -1900,6 +1900,42 @@ def _addon_pl_rule(**over) -> dict:
     return rule
 
 
+async def test_open_and_add_attach_tp_sl_on_the_order():
+    """开仓和加仓的市价单发出时就要带上共同止盈止损，不能等下一拍改单。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.balance = 10000.0
+    runner, hub = _runner(
+        sent, mt5=mt5,
+        strategy={"rules": [_addon_pl_rule(
+            float_pl_ratio={
+                "enabled": True, "ratio": -20, "monitor_mode": "loop", "max_times": 1,
+            },
+            lot_pl_tiers=_lot_tiers(),
+        )]},
+    )
+    runner.start()
+    await _settle()
+
+    first = mt5.positions_by_magic(MAGIC)[0]
+    # 成交按报价中间价 2330；止损止盈按开仓侧卖价预估后直接写进市价单
+    assert first["sl"] == 2130.06
+    assert first["tp"] == 2331.06
+
+    held = mt5.positions_by_magic(MAGIC)
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(held), price=held[0]["price_open"] - 1.0, point=0.01,
+    ))
+    await _settle()
+
+    added = mt5.positions_by_magic(MAGIC)[-1]
+    assert added["ticket"] != first["ticket"]
+    assert added["sl"] == 2230.03
+    assert added["tp"] == 2330.53
+    runner.cancel()
+
+
 async def test_signal_float_pl_writes_stop_not_market_close():
     """盈亏比按 |比例| × 余额写成止损，浮亏本身不平仓，其它魔术号不动。"""
     sent: list = []
