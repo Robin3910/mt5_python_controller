@@ -2018,6 +2018,34 @@ async def test_signal_lot_pl_writes_batch1_stops_and_ignores_price_ticks():
     runner.cancel()
 
 
+async def test_signal_take_profit_starts_only_after_min_lot():
+    """总手数没到批次1门槛时不写止盈；加仓达标后才算。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub = _runner(
+        sent, mt5=mt5,
+        strategy={"rules": [_addon_pl_rule(lot_pl_tiers=_lot_tiers(
+            tiers=[
+                {"min_lot": 0.2, "pl_amount": 10.0},
+                {"min_lot": 0.5, "pl_amount": 20.0},
+            ],
+        ))]},
+    )
+    runner.start()
+    await _settle()
+    held = [p for p in mt5._positions if int(p.get("magic") or 0) == MAGIC]
+    open_px = held[0]["price_open"]
+    _tick(hub, held, open_px)
+    await _settle()
+    assert mt5.positions_by_magic(MAGIC)[0]["tp"] == 0
+
+    mt5.place_market_order("XAUUSD", "BUY", 0.1, magic=MAGIC)
+    _tick(hub, [p for p in mt5._positions if int(p.get("magic") or 0) == MAGIC], open_px)
+    await _settle()
+    assert {p["tp"] for p in mt5.positions_by_magic(MAGIC)} == {open_px + 0.5}
+    runner.cancel()
+
+
 async def test_signal_lot_pl_buy_side_keeps_sell():
     sent: list = []
     mt5 = MockMT5Client()

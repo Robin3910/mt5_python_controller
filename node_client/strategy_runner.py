@@ -637,6 +637,7 @@ class StrategyRunner:
             scoped,
             tp_amount=tp_amount,
             sl_amount=sl_amount,
+            tp_min_lot=signal_pl.lot_pl_min_lot(self._signal_pl),
             tick_size=_as_float(spec.get("tick_size")),
             tick_value=_as_float(spec.get("tick_value")),
             digits=int(spec.get("digits") or 0),

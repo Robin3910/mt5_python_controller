@@ -384,7 +384,7 @@ const FIELD_HELP = {
     '-20 和 20 都表示亏损达到余额的 20% 时止损。只在新开一单时重算。',
   signal_lot_pl:
     '只用批次1的盈亏金额绝对值反推共同止盈，不写止损。\n' +
-    '加仓或平仓改变手数后重算。更高批次不参与这个止盈价。',
+    '该方向总手数达到批次1的「总 lot >=」才开始计算。更高批次不参与这个止盈价。',
 }
 
 /** 保本监控方式，与后端 BREAKEVEN_MODES 对齐 */
@@ -1651,7 +1651,7 @@ function resetRuleToTemplate(idx: number): void {
                 <input v-model.number="tier.pl_amount" type="number" step="1" class="signal-pl-num" />
               </div>
               <p class="muted" style="font-size: 12px; margin: 8px 0 0">
-                只用批次1的盈亏金额（取绝对值）写止盈，手数变化时重算。止损用上面的盈亏比和账户余额反推，只在新开仓时重算。
+                只用批次1的盈亏金额（取绝对值）写止盈，该方向总手数达到批次1的「总 lot >=」才计算。止损用上面的盈亏比和账户余额反推，只在新开仓时重算。
               </p>
             </div>
           </div>

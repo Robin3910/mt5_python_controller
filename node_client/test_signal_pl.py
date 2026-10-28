@@ -96,6 +96,22 @@ def test_lot_pl_uses_batch1_absolute_amount_and_weighted_open():
     assert both[0]["sl"] == 2305.67
 
 
+def test_take_profit_waits_for_min_lot():
+    positions = [{"type": "BUY", "ticket": 1, "volume": 0.1, "price_open": 2300}]
+    below = sp.plan_common_stops(
+        positions, tp_amount=10, sl_amount=30, tp_min_lot=0.2,
+        tick_size=0.01, tick_value=1.0, digits=2, bid=2300,
+    )
+    assert below[0]["tp"] is None
+    assert below[0]["sl"] == 2297.0
+    reached = sp.plan_common_stops(
+        [{"type": "BUY", "ticket": 1, "volume": 0.2, "price_open": 2300}],
+        tp_amount=10, tp_min_lot=0.2,
+        tick_size=0.01, tick_value=1.0, digits=2, bid=2300,
+    )
+    assert reached[0]["tp"] == 2300.5
+
+
 def test_lot_pl_sell_stops_are_mirrored():
     positions = [{"type": "SELL", "ticket": 1, "volume": 1.0, "price_open": 1.1}]
     plans = sp.plan_common_stops(

@@ -268,6 +268,17 @@ def lot_pl_amount(cfg: dict | None) -> Optional[float]:
     return amount
 
 
+def lot_pl_min_lot(cfg: dict | None) -> float:
+    """启用时返回批次1的总手数门槛。未启用时返回 0，表示不挡止盈。"""
+    rule = normalize_config(cfg)[RULE_LOT_PL_TIERS]
+    if not rule.get("enabled"):
+        return 0.0
+    tiers = rule.get("tiers") or []
+    if not tiers:
+        return 0.0
+    return max(0.0, _as_float(tiers[0].get("min_lot"), 0.0))
+
+
 def lot_pl_close_action(cfg: dict | None) -> str:
     action = str(normalize_config(cfg)[RULE_LOT_PL_TIERS].get("close_action") or "all").lower()
     if action not in CLOSE_SIDES:
@@ -383,6 +394,7 @@ def plan_common_stops(
     digits: int,
     tp_amount: float | None = None,
     sl_amount: float | None = None,
+    tp_min_lot: float = 0.0,
     bid: float = 0.0,
     ask: float = 0.0,
     fallback_price: float = 0.0,
@@ -391,7 +403,7 @@ def plan_common_stops(
 
     加权开仓价 W = Σ(手数 × 开仓价) / Σ手数。
     距离 D = 金额 / ((tick_value / tick_size) × Σ手数)。
-    止盈金额来自分档批次1；止损金额来自盈亏比 × 余额。某一侧没给金额就不写那一侧。
+    止盈金额来自分档批次1，且该方向总手数达到 tp_min_lot 才计算；止损金额来自盈亏比 × 余额。
     多单止盈在 W 之上、止损在 W 之下；空单相反。
     """
     size = _as_float(tick_size, 0.0)
@@ -424,6 +436,8 @@ def plan_common_stops(
         if volume <= 0 or money_per_price <= 0:
             continue
         d_tp = _price_distance(tp_amount or 0, money_per_price)
+        if d_tp is not None and volume + 1e-8 < max(0.0, _as_float(tp_min_lot, 0.0)):
+            d_tp = None
         d_sl = _price_distance(sl_amount or 0, money_per_price)
         if d_tp is None and d_sl is None:
             continue
