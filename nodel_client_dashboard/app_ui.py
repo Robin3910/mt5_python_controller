@@ -384,7 +384,7 @@ class DashboardApp(ctk.CTk):
         right = ctk.CTkFrame(body, fg_color="transparent")
         right.grid(row=0, column=1, sticky="nsew")
         right.grid_columnconfigure(0, weight=1)
-        right.grid_rowconfigure(3, weight=1)
+        right.grid_rowconfigure(2, weight=1)
 
         # 标题卡
         title_card = glass_card(right)
@@ -445,45 +445,6 @@ class DashboardApp(ctk.CTk):
             font=mono(12),
         )
         self.summary.pack(fill="x", padx=14, pady=12)
-
-        # 任务 + 日志
-        mid = glass_card(right)
-        mid.grid(row=3, column=0, sticky="nsew")
-        mid.grid_columnconfigure(0, weight=1)
-        mid.grid_rowconfigure(1, weight=1)
-        mid.grid_rowconfigure(3, weight=2)
-
-        ctk.CTkLabel(
-            mid, text="策略任务", text_color=ACCENT, font=font(11, "bold"), anchor="w"
-        ).grid(row=0, column=0, sticky="w", padx=14, pady=(12, 2))
-        self.tasks = ctk.CTkTextbox(
-            mid,
-            height=110,
-            fg_color=BG_ELEVATED,
-            text_color=TEXT,
-            border_color=GLASS_BORDER,
-            border_width=1,
-            corner_radius=10,
-            font=mono(12),
-        )
-        self.tasks.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 8))
-
-        log_bar = ctk.CTkFrame(mid, fg_color="transparent")
-        log_bar.grid(row=2, column=0, sticky="ew", padx=14)
-        ctk.CTkLabel(
-            log_bar, text="运行日志", text_color=ACCENT, font=font(11, "bold")
-        ).pack(side="left")
-        ghost_btn(log_bar, "清空显示", self._clear_log, width=96).pack(side="right")
-        self.log_box = ctk.CTkTextbox(
-            mid,
-            fg_color=BG_ELEVATED,
-            text_color=TEXT,
-            border_color=GLASS_BORDER,
-            border_width=1,
-            corner_radius=10,
-            font=mono(12),
-        )
-        self.log_box.grid(row=3, column=0, sticky="nsew", padx=12, pady=(4, 12))
 
     def _persist(self) -> None:
         save_instances(self.manager.configs())
@@ -654,30 +615,11 @@ class DashboardApp(ctk.CTk):
                 self._sync_action_buttons(mp)
             if prev is None or prev.summary != detail.summary:
                 self.summary.configure(text=detail.summary)
-            if prev is None or prev.tasks_text != detail.tasks_text:
-                self.tasks.delete("1.0", "end")
-                if detail.tasks_text:
-                    self.tasks.insert("end", detail.tasks_text)
             self._detail_snap = detail
 
-        if refresh_log:
-            self._bind_log(mp)
-
     def _bind_log(self, mp) -> None:
-        if mp is None:
-            if self._log_snap != "":
-                self.log_box.delete("1.0", "end")
-                self._log_snap = ""
-            return
-        text = mp.read_log_tail()
-        if text == self._log_snap:
-            return
-        at_end = self.log_box.yview()[1] >= 0.98
-        self.log_box.delete("1.0", "end")
-        self.log_box.insert("end", text)
-        if at_end:
-            self.log_box.see("end")
-        self._log_snap = text
+        """运行日志面板已在 UI 上隐藏，保留空实现以兼容调用方。"""
+        return
 
     def _select(self, instance_id: str) -> None:
         self._selected_id = instance_id
@@ -1329,6 +1271,7 @@ class DashboardApp(ctk.CTk):
             pass
 
     def _clear_log(self) -> None:
+        """运行日志面板已隐藏，此入口不再从 UI 触发；保留供外部调用。"""
         mp = self._selected()
         if mp is None:
             return
