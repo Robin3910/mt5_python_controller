@@ -307,6 +307,16 @@ def position_book_signature(positions: list | None) -> tuple:
     return tuple(sorted(rows))
 
 
+def book_has_open(previous: tuple, current: tuple) -> bool:
+    """出现新票号，或同一票号手数变大，才算开仓。平仓和减仓不算。"""
+    prev_vol = {ticket: vol for ticket, vol, _side in previous}
+    for ticket, vol, _side in current:
+        old = prev_vol.get(ticket)
+        if old is None or vol > old + 1e-8:
+            return True
+    return False
+
+
 def _price_eps(digits: int) -> float:
     step = 10 ** (-max(0, int(digits)))
     return max(step / 2, 1e-9)

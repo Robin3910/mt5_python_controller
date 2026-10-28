@@ -1933,6 +1933,39 @@ async def test_signal_float_pl_writes_stop_not_market_close():
     runner.cancel()
 
 
+async def test_signal_stop_recalculates_on_open_not_on_close():
+    """新开一单才重算止损；手动平掉一单后，剩下的单保持上一次止损价。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.balance = 10000.0
+    runner, hub = _runner(
+        sent, mt5=mt5,
+        strategy={"rules": [_addon_pl_rule(float_pl_ratio={
+            "enabled": True, "ratio": -20, "monitor_mode": "loop", "max_times": 1,
+        })]},
+    )
+    runner.start()
+    await _settle()
+    held = [p for p in mt5._positions if int(p.get("magic") or 0) == MAGIC]
+    open_px = held[0]["price_open"]
+    _tick(hub, held, open_px)
+    await _settle()
+    assert mt5.positions_by_magic(MAGIC)[0]["sl"] == open_px - 200
+
+    opened = mt5.place_market_order("XAUUSD", "BUY", 0.1, magic=MAGIC)
+    _tick(hub, [p for p in mt5._positions if int(p.get("magic") or 0) == MAGIC], open_px)
+    await _settle()
+    assert {p["sl"] for p in mt5.positions_by_magic(MAGIC)} == {open_px - 100}
+
+    assert mt5.close_ticket(opened["order"])["success"] is True
+    _tick(hub, [p for p in mt5._positions if int(p.get("magic") or 0) == MAGIC], open_px)
+    await _settle()
+    left = mt5.positions_by_magic(MAGIC)
+    assert len(left) == 1
+    assert left[0]["sl"] == open_px - 100
+    runner.cancel()
+
+
 def _lot_tiers(**over) -> dict:
     tiers = {
         "enabled": True, "batch_count": 2, "close_action": "all",

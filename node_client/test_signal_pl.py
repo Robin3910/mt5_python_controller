@@ -142,6 +142,17 @@ def test_lot_pl_does_not_market_close_inside_find_triggered_rule():
     ) is None
 
 
+def test_book_has_open_ignores_closes():
+    first = ((1, 0.1, "BUY"),)
+    assert sp.book_has_open((), first) is True
+    assert sp.book_has_open(first, ((1, 0.1, "BUY"), (2, 0.1, "BUY"))) is True
+    assert sp.book_has_open(first, ((1, 0.2, "BUY"),)) is True
+    assert sp.book_has_open(
+        ((1, 0.1, "BUY"), (2, 0.1, "BUY")), ((1, 0.1, "BUY"),),
+    ) is False
+    assert sp.book_has_open(first, ((1, 0.05, "BUY"),)) is False
+
+
 def test_float_pl_ratio_becomes_loss_amount():
     """盈亏比只折成亏损金额，正负号都按绝对值。未启用不折。"""
     cfg = _cfg(float_pl_ratio={"enabled": True, "ratio": -20})

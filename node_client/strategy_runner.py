@@ -222,6 +222,8 @@ class StrategyRunner:
         self._lot_sltp_fail_sig: Optional[tuple] = None
         self._lot_sltp_fail_at = 0.0
         self._lot_sltp_cross_blocked = False
+        # 重连后的第一份持仓是已有单，不算新开仓，不重算止损
+        self._lot_sltp_seed_existing = False
         # 手动分散仓：每种规则只开一次；重连时优先用 runtime，其次用仓位 comment
         self._manual_fired: set[int] = set()
         # 越过止盈的 warning / 进度每条规则只发一次，避免每 tick 刷屏
@@ -399,6 +401,7 @@ class StrategyRunner:
                 # 恢复场景：首单早已成交，按现有持仓续跑，计数待首个事件重建
                 self._opened = True
                 self._seed_pending = True
+                self._lot_sltp_seed_existing = True
                 await self._emit_progress("resume", phase="running")
 
             while True:
@@ -592,7 +595,7 @@ class StrategyRunner:
         return bal
 
     async def _lot_sltp_sync(self, event: MarketEvent, positions: list[dict]) -> Optional[str]:
-        """分档批次1写共同止盈，盈亏比 × 余额写共同止损。订单构成变化时重算。
+        """分档批次1写共同止盈；盈亏比 × 余额写共同止损，且只在新开仓时重算。
 
         返回 done=穿过目标价后已清干净并收口；hit=本拍已市价平掉穿过的方向，不再加仓；
         None=已改单或无需动作，本拍可以继续交易。
@@ -607,6 +610,8 @@ class StrategyRunner:
         )
         sig = signal_pl.position_book_signature(scoped)
         now = time.time()
+        suppress_open = bool(self._lot_sltp_seed_existing and sig and not self._lot_sltp_sig)
+        opened = False if suppress_open else signal_pl.book_has_open(self._lot_sltp_sig, sig)
         if not self._lot_sltp_dirty and sig == self._lot_sltp_sig:
             return None
         if (
@@ -619,7 +624,7 @@ class StrategyRunner:
             await self._lot_sltp_fail(sig, positions, "缺少合约规格，无法反推止盈止损")
             return None
         sl_amount = None
-        if ratio_on:
+        if ratio_on and opened:
             balance = await self._read_balance()
             if balance is None:
                 await self._lot_sltp_fail(sig, positions, "读不到账户余额，无法反推止损")
@@ -672,6 +677,8 @@ class StrategyRunner:
             self._lot_sltp_dirty = False
             self._lot_sltp_fail_sig = None
             self._lot_sltp_cross_blocked = False
+            if suppress_open:
+                self._lot_sltp_seed_existing = False
         if not closed_tickets:
             return "hit" if crossed_any else None
         remaining = [
