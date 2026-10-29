@@ -7,12 +7,17 @@ from strategy_rules import (
     action_matches,
     count_adds_by_rule,
     counter_anchor_price,
+    counter_limit_price,
+    counter_order_key,
+    counter_pending_key,
     decision_comment,
     decision_detail,
+    describe_counter_limit,
     describe_decision,
     deviation_points,
     evaluate,
     evaluate_rule,
+    plan_counter_limit,
     metric_key,
     parse_add_rule_type,
     pick_batch_level,
@@ -595,6 +600,119 @@ def test_smc_sell_uses_resistance_above_anchor():
     assert hit is not None and hit.action == "SELL"
     assert hit.smc_side == -1
     assert "阻力" in describe_decision(hit)
+
+
+def test_plan_counter_limit_rests_below_anchor_before_price_arrives():
+    """逆势限价按锚点提前算好，不等现价跌到阈值。"""
+    plan = plan_counter_limit([counter_rule()], ctx(price=2400.0), digits=2)
+    assert plan is not None
+    assert plan.limit_price == 2399.0
+    assert plan.deviation == 100
+    assert plan.volume == 0.11
+    assert counter_order_key(plan) == (0.11, -1, "point", "")
+    assert counter_pending_key(decision_comment(plan), plan.volume) == counter_order_key(plan)
+    assert "挂出限价" in describe_counter_limit(plan, verb="挂出限价")
+
+
+def test_plan_counter_limit_sell_sits_above_anchor():
+    plan = plan_counter_limit(
+        [counter_rule()], ctx(direction="SELL", price=2400.0), digits=2,
+    )
+    assert plan is not None and plan.limit_price == 2401.0
+    assert plan.action == "SELL"
+
+
+def test_plan_counter_limit_uses_anchor_not_latest_trend_price():
+    plan = plan_counter_limit(
+        [counter_rule()],
+        ctx(base_price=2410.0, counter_base_price=2400.0, price=2405.0),
+        digits=2,
+    )
+    assert plan is not None and plan.limit_price == 2399.0
+    assert plan.base_price == 2400.0
+
+
+def test_plan_counter_limit_atr_and_absolute_prices():
+    atr = plan_counter_limit(
+        [counter_rule(
+            batch_enabled=True, batch_count=1, total_lot_limit=4,
+            batch_levels=[{
+                "pos_from": 1, "pos_to": 4, "calc_type": "atr", "timeframe": "M5",
+                "lot_times": 1.0, "extra_lot": 0,
+            }],
+        )],
+        ctx(bar_metrics={metric_key("atr", "M5"): 1.0}),
+        digits=2,
+    )
+    assert atr is not None and atr.limit_price == 2399.0
+    assert counter_order_key(atr)[2] == "atr"
+
+    priced = plan_counter_limit(
+        [counter_rule(
+            batch_enabled=True, batch_count=1, total_lot_limit=2,
+            batch_levels=[{
+                "pos_from": 1, "pos_to": 2, "calc_type": "price", "price": 2390.0,
+                "lot_times": 1.0, "extra_lot": 0,
+            }],
+        )],
+        ctx(),
+        digits=2,
+    )
+    assert priced is not None and priced.limit_price == 2390.0
+
+    smc = {
+        "symbol": "XAUUSD", "tf": "M5", "received_at": 10.0,
+        "levels": [{"type": "fvg", "side": 1, "price": 2388.5}],
+    }
+    fvg = plan_counter_limit(
+        [counter_rule(
+            batch_enabled=True, batch_count=1, total_lot_limit=2,
+            batch_levels=[{
+                "pos_from": 1, "pos_to": 2, "calc_type": "fvg", "timeframe": "M5",
+                "lot_times": 1.0, "extra_lot": 0,
+            }],
+        )],
+        ctx(smc=smc),
+        digits=2,
+    )
+    assert fvg is not None and fvg.limit_price == 2388.5
+    assert fvg.smc_key
+    assert counter_pending_key(decision_comment(fvg), fvg.volume) == counter_order_key(fvg)
+
+
+def test_plan_counter_limit_skips_disabled_full_and_wrong_side():
+    assert plan_counter_limit([counter_rule(status=0)], ctx()) is None
+    assert plan_counter_limit(
+        [counter_rule(max_allow_num=1)],
+        ctx(add_counts={RULE_TYPE_COUNTER: 1}),
+    ) is None
+    assert plan_counter_limit([counter_rule(action="sell")], ctx(direction="BUY")) is None
+    # 指定价在锚点有利侧，不是逆势限价
+    assert plan_counter_limit(
+        [counter_rule(
+            batch_enabled=True, batch_count=1, total_lot_limit=1,
+            batch_levels=[{
+                "pos_from": 1, "pos_to": 1, "calc_type": "price", "price": 2410.0,
+                "lot_times": 1.0, "extra_lot": 0,
+            }],
+        )],
+        ctx(),
+    ) is None
+
+
+def test_evaluate_can_ignore_counter_rules():
+    """执行器市价路径只跑顺势时，逆势偏离够了也不返回。"""
+    rules = [counter_rule(), counter_rule(type=RULE_TYPE_TREND, point=100)]
+    assert evaluate(rules, ctx(price=2399.0), rule_types=(RULE_TYPE_TREND,)) is None
+    trend = evaluate(rules, ctx(price=2401.0), rule_types=(RULE_TYPE_TREND,))
+    assert trend is not None and trend.rule_type == RULE_TYPE_TREND
+
+
+def test_counter_limit_price_points_from_anchor():
+    from strategy_rules import Threshold
+    gap = Threshold(100.0)
+    assert counter_limit_price("BUY", 2400.0, POINT, gap) == 2399.0
+    assert counter_limit_price("SELL", 2400.0, POINT, gap) == 2401.0
 
 
 def test_max_allow_num_is_per_rule():

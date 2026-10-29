@@ -723,6 +723,9 @@ function eventTag(
   const m: Record<string, { cls: string; text: string }> = {
     open: { cls: 'green', text: '开仓' },
     add_counter: { cls: 'amber', text: '逆势加仓' },
+    cnt_limit: { cls: 'amber', text: '逆势挂限价' },
+    cnt_limit_mod: { cls: 'blue', text: '逆势改限价' },
+    cnt_limit_off: { cls: '', text: '逆势撤限价' },
     add_trend: { cls: 'amber', text: '顺势加仓' },
     add_manual: { cls: 'amber', text: '手动分散仓' },
     manual_tp_close: { cls: 'blue', text: '止盈联动清仓' },

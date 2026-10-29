@@ -582,6 +582,52 @@ class MT5Client:
             "error": getattr(last, "comment", "order failed after retries"),
         }
 
+    def _pending_price_status(self, symbol: str, action: str, price: float,
+                              kind: str = PENDING_LIMIT) -> tuple[Optional[str], Optional[str]]:
+        """挂单价合法性。(None, None) 可挂；否则是 (side|stops|unavailable, 原因)。
+
+        side：落在成交侧的错误一侧（多单限价不低于卖价，空单限价不高于买价）。
+        stops：方向对，但离现价小于 trade_stops_level。
+        unavailable：品种或报价暂时读不到，调用方应下拍再试，不要改市价。
+        """
+        resolved = self.resolve_symbol(symbol)
+        if not resolved:
+            return "unavailable", f"symbol not found: {symbol}"
+        if price <= 0:
+            return "unavailable", "挂单价需大于 0"
+        tick = mt5.symbol_info_tick(resolved)
+        if tick is None:
+            return "unavailable", "no tick"
+        info = mt5.symbol_info(resolved)
+        point = float(getattr(info, "point", 0.0) or 0.0) if info else 0.0
+        digits = int(getattr(info, "digits", 5) or 5) if info else 5
+        stops = int(getattr(info, "trade_stops_level", 0) or 0) if info else 0
+        # 挂单成交侧：BUY 用 ask、SELL 用 bid，与该方向真正的成交价口径一致
+        market = float(tick.ask if action == "BUY" else tick.bid)
+        if market <= 0:
+            return "unavailable", "no tick"
+        below = price < market
+        # BUY LIMIT 挂在现价下方等回落，SELL LIMIT 挂在上方等反弹；STOP 单方向相反
+        want_below = (action == "BUY") == (kind == PENDING_LIMIT)
+        if below != want_below:
+            side = "低于" if want_below else "高于"
+            return "side", (
+                f"{action} {kind} 挂单价 {round(price, digits)} 必须{side}现价 "
+                f"{round(market, digits)}"
+            )
+        if stops > 0 and point > 0 and abs(price - market) < stops * point:
+            return "stops", (
+                f"挂单价距现价 {round(abs(price - market) / point)} 点，"
+                f"低于券商要求的 {stops} 点"
+            )
+        return None, None
+
+    def pending_price_block(self, symbol: str, action: str, price: float,
+                            kind: str = PENDING_LIMIT) -> Optional[str]:
+        """可挂返回 None，否则返回 side / stops / unavailable。"""
+        code, _message = self._pending_price_status(symbol, action, price, kind)
+        return code
+
     def check_pending_price(self, symbol: str, action: str, price: float,
                             kind: str = PENDING_LIMIT) -> Optional[str]:
         """校验挂单价是否落在合法一侧且离现价足够远；合法返回 None，否则返回原因。
@@ -590,37 +636,8 @@ class MT5Client:
         （10015 价格非法 / 10016 距离太近）不像市价单那样重试就能好，只能改价，
         所以宁可在下第一笔之前就发现整组都不可行。
         """
-        resolved = self.resolve_symbol(symbol)
-        if not resolved:
-            return f"symbol not found: {symbol}"
-        if price <= 0:
-            return "挂单价需大于 0"
-        tick = mt5.symbol_info_tick(resolved)
-        if tick is None:
-            return "no tick"
-        info = mt5.symbol_info(resolved)
-        point = float(getattr(info, "point", 0.0) or 0.0) if info else 0.0
-        digits = int(getattr(info, "digits", 5) or 5) if info else 5
-        stops = int(getattr(info, "trade_stops_level", 0) or 0) if info else 0
-        # 挂单成交侧：BUY 用 ask、SELL 用 bid，与该方向真正的成交价口径一致
-        market = float(tick.ask if action == "BUY" else tick.bid)
-        if market <= 0:
-            return "no tick"
-        below = price < market
-        # BUY LIMIT 挂在现价下方等回落，SELL LIMIT 挂在上方等反弹；STOP 单方向相反
-        want_below = (action == "BUY") == (kind == PENDING_LIMIT)
-        if below != want_below:
-            side = "低于" if want_below else "高于"
-            return (
-                f"{action} {kind} 挂单价 {round(price, digits)} 必须{side}现价 "
-                f"{round(market, digits)}"
-            )
-        if stops > 0 and point > 0 and abs(price - market) < stops * point:
-            return (
-                f"挂单价距现价 {round(abs(price - market) / point)} 点，"
-                f"低于券商要求的 {stops} 点"
-            )
-        return None
+        _code, message = self._pending_price_status(symbol, action, price, kind)
+        return message
 
     def place_pending_order(self, symbol: str, action: str, volume: float, price: float,
                             sl: Optional[float] = None, tp: Optional[float] = None,
@@ -700,6 +717,84 @@ class MT5Client:
             "symbol": symbol,
             "retcode": getattr(last, "retcode", None),
             "error": getattr(last, "comment", "pending order failed after retries"),
+        }
+
+    def modify_pending_order(self, ticket: int, price: float,
+                             sl: Optional[float] = None, tp: Optional[float] = None,
+                             max_retry: int = 3) -> dict:
+        """改挂单的价格和止损止盈（TRADE_ACTION_MODIFY）。不能改手数和备注。
+
+        sl / tp 传 None 表示沿用挂单上的现值。价格不合法时直接拒绝，不发给终端。
+        """
+        self.ensure()
+        target = int(ticket)
+        order = next(
+            (o for o in self.pending_orders() if int(o.get("ticket") or 0) == target),
+            None,
+        )
+        if order is None:
+            return {"success": False, "ticket": target, "error": f"order not found: {target}"}
+        action = str(order.get("type") or "")
+        kind = str(order.get("pending_kind") or PENDING_LIMIT)
+        reject = self.check_pending_price(order["symbol"], action, float(price), kind)
+        if reject:
+            return {
+                "success": False, "ticket": target, "symbol": order["symbol"], "error": reject,
+            }
+        resolved = self.resolve_symbol(order["symbol"])
+        if not resolved:
+            return {"success": False, "ticket": target, "error": f"symbol not found: {order['symbol']}"}
+        send_sl = float(order.get("sl") or 0.0) if sl is None else float(sl or 0.0)
+        send_tp = float(order.get("tp") or 0.0) if tp is None else float(tp or 0.0)
+        fillings = self.filling_modes(resolved, pending=True)
+        fill_idx = 0
+        attempt = 0
+        last = None
+        while attempt <= max_retry and fill_idx < len(fillings):
+            request = {
+                "action": mt5.TRADE_ACTION_MODIFY,
+                "order": target,
+                "symbol": resolved,
+                "price": float(price),
+                "sl": send_sl,
+                "tp": send_tp,
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": fillings[fill_idx],
+            }
+            result = mt5.order_send(request)
+            last = result
+            if result is None:
+                logger.error("modify pending order_send returned None: %s", mt5.last_error())
+                attempt += 1
+                continue
+            rc = result.retcode
+            if rc in (RET_DONE, RET_DONE_PARTIAL):
+                return {
+                    "success": True,
+                    "ticket": target,
+                    "symbol": order["symbol"],
+                    "price": float(price),
+                    "sl": send_sl,
+                    "tp": send_tp,
+                    "retcode": rc,
+                }
+            if rc == RET_INVALID_FILL:
+                fill_idx += 1
+                continue
+            if rc in TRANSIENT:
+                attempt += 1
+                _backoff_sleep(attempt, max_retry)
+                continue
+            return {
+                "success": False, "ticket": target, "symbol": order["symbol"],
+                "retcode": rc, "error": result.comment,
+            }
+        return {
+            "success": False,
+            "ticket": target,
+            "symbol": order["symbol"],
+            "retcode": getattr(last, "retcode", None),
+            "error": getattr(last, "comment", "modify pending failed after retries"),
         }
 
     def cancel_order(self, ticket: int, max_retry: int = 3) -> dict:

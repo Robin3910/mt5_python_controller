@@ -47,6 +47,8 @@ class MockMT5Client:
         self.margin_mode = "hedging"
         # 现价触及挂单价时自动成交；置 False 可让测试完全手工驱动成交时点
         self.auto_fill_pending = True
+        # 券商要求挂单价离现价的最小点数；0 表示不限制
+        self.stops_level = 0
         # 模拟环境没有券商钟面偏移，与 time.time() 同一套 UTC
         self._server_tz_offset = 0
 
@@ -124,16 +126,34 @@ class MockMT5Client:
                 "order": tk, "deal": tk, "volume": float(volume), "price": price}
 
     # ----------------------- 挂单 -----------------------
-    def check_pending_price(self, symbol, action, price, kind="limit"):
-        """只校验方向，不校验最小距离（mock 的 stops_level 恒为 0）。"""
-        mid = float(self.prices_map.get(symbol.upper(), 1.0))
+    def _pending_price_status(self, symbol, action, price, kind="limit"):
+        """与 MT5Client 同一组返回码：None 可挂，否则 side / stops / unavailable。"""
+        mid = float(self.prices_map.get(str(symbol or "").upper(), 0.0))
         if price <= 0:
-            return "挂单价需大于 0"
+            return "unavailable", "挂单价需大于 0"
+        if mid <= 0:
+            return "unavailable", "no tick"
+        point = self.symbol_point(symbol)
+        stops = int(self.stops_level or 0)
         want_below = (action == "BUY") == (kind == "limit")
         if (price < mid) != want_below:
             side = "低于" if want_below else "高于"
-            return f"{action} {kind} 挂单价 {price} 必须{side}现价 {mid}"
-        return None
+            return "side", f"{action} {kind} 挂单价 {price} 必须{side}现价 {mid}"
+        if stops > 0 and point > 0 and abs(price - mid) < stops * point:
+            return "stops", (
+                f"挂单价距现价 {round(abs(price - mid) / point)} 点，"
+                f"低于券商要求的 {stops} 点"
+            )
+        return None, None
+
+    def pending_price_block(self, symbol, action, price, kind="limit"):
+        code, _message = self._pending_price_status(symbol, action, price, kind)
+        return code
+
+    def check_pending_price(self, symbol, action, price, kind="limit"):
+        """方向必须对，且不能近于 stops_level。"""
+        _code, message = self._pending_price_status(symbol, action, price, kind)
+        return message
 
     def place_pending_order(self, symbol, action, volume, price, sl=None, tp=None,
                             comment="", magic=None, kind="limit", max_retry=3) -> dict:
@@ -165,6 +185,29 @@ class MockMT5Client:
         return {"success": True, "pending": True, "symbol": symbol, "action": action,
                 "pending_kind": kind, "retcode": 10009, "order": tk,
                 "volume": float(volume), "price": float(price)}
+
+    def modify_pending_order(self, ticket, price, sl=None, tp=None, max_retry=3) -> dict:
+        """改挂单价和止损止盈。sl / tp 为 None 时保留原值。"""
+        self._settle_pending()
+        target = int(ticket)
+        order = next((o for o in self._pending if int(o["ticket"]) == target), None)
+        if order is None:
+            return {"success": False, "ticket": target, "error": f"order not found: {target}"}
+        reject = self.check_pending_price(
+            order["symbol"], order["type"], float(price), order.get("pending_kind") or "limit",
+        )
+        if reject:
+            return {"success": False, "ticket": target, "symbol": order["symbol"], "error": reject}
+        order["price_open"] = float(price)
+        if sl is not None:
+            order["sl"] = float(sl or 0.0)
+        if tp is not None:
+            order["tp"] = float(tp or 0.0)
+        return {
+            "success": True, "ticket": target, "symbol": order["symbol"],
+            "price": float(price), "sl": float(order.get("sl") or 0.0),
+            "tp": float(order.get("tp") or 0.0), "retcode": 10009,
+        }
 
     def _touched(self, order: dict) -> bool:
         """现价是否已触及挂单价。"""
@@ -385,7 +428,7 @@ class MockMT5Client:
             "volume_min": 0.01,
             "volume_step": 0.01,
             "volume_max": 100.0,
-            "stops_level": 0,
+            "stops_level": int(self.stops_level or 0),
         }
 
     def modify_position_sl(self, ticket: int, sl: float, tp=None) -> dict:

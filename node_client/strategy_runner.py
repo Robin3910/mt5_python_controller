@@ -8,8 +8,8 @@
 
 按策略快照里的规则走三条互斥的执行路径：
 
-- 加仓路径（模版1）：首单手数用信号手数，之后按逆势 / 顺势规则加仓，判定见
-  `strategy_rules.evaluate`；
+- 加仓路径（模版1）：首单手数用信号手数。顺势仍按 `strategy_rules.evaluate`
+  采样到价后市价加；逆势每次只挂一张限价，见 `plan_counter_limit`；
 - 以损定量路径（模版2）：手数由「风险金额 ÷ 止损距离」反推，底仓市价成交（TP=0）
   后立即拆开等手数分散仓市价单（按等分阶梯挂止盈），可选浮盈达标后移动止损保本，
   计算见 `risk_sizing`；
@@ -45,11 +45,17 @@ from strategy_rules import (
     PositionCtx,
     count_adds_by_rule,
     counter_anchor_price,
+    counter_order_key,
+    counter_pending_key,
     decision_comment,
     decision_detail,
+    describe_counter_limit,
     describe_decision,
+    deviation_points,
     evaluate,
     metric_key,
+    parse_add_rule_type,
+    plan_counter_limit,
     smc_key_from_comment,
 )
 
@@ -167,6 +173,10 @@ class StrategyRunner:
         self.base_volume = _as_float(self.entry.get("volume"))
         self.add_count = 0
         self.add_counts: dict[int, int] = {RULE_TYPE_COUNTER: 0, RULE_TYPE_TREND: 0}
+        # 已经记过账的逆势成交票号；市价兜底先记账时用 skip 避免下一拍再记一次
+        self._counter_seen: set[int] = set()
+        self._counter_skip_fills = 0
+        self._counter_resync = False
         self.total_orders = 0
         self.total_volume = 0.0
         self._opened = False
@@ -335,6 +345,7 @@ class StrategyRunner:
         self._lot_sltp_dirty = True
         self._lot_sltp_fail_at = 0.0
         self._metric_specs = None
+        self._counter_resync = True
         if self._sub is not None:
             self._sub.wake()
         logger.info("task %s strategy snapshot updated", self.task_id)
@@ -443,12 +454,21 @@ class StrategyRunner:
     async def _on_event(self, event: MarketEvent) -> bool:
         """处理一个事件；返回 True 表示任务已收口。"""
         if event.kind == WAKE:
-            # 仅 SMC 推送需要立刻用上一份报价再判；其它唤醒（热推规则）保持原样
-            if not self._replay_market:
+            # SMC 推送重放上一口价，顺势和逆势一起再判。
+            # 规则热推只改逆势限价，不重放顺势，避免同一口价连加。
+            resync = self._counter_resync
+            self._counter_resync = False
+            if self._replay_market:
+                self._replay_market = False
+                event = self._last_market
+                if event is None:
+                    return False
+            elif resync and self._last_market is not None:
+                await self._sync_counter_limit(
+                    self._last_market, list(self._last_market.positions),
+                )
                 return False
-            self._replay_market = False
-            event = self._last_market
-            if event is None:
+            else:
                 return False
         elif event.kind not in (STALE, GONE):
             self._last_market = event
@@ -465,6 +485,10 @@ class StrategyRunner:
             # 默认 positions_cleared 时查成交历史，区分止损 / 止盈 / 人工
             if self._stop_reason == close_reason.DEFAULT_CLEAR_REASON:
                 await self._resolve_passive_close_reason()
+            # 持仓没了，逆势限价必须先撤掉。撤不掉就交给停止流程重试，不能报终态。
+            if not await self._cancel_open_counter_limits(reason="持仓已清空，撤下逆势限价"):
+                self._stopping = True
+                return False
             await self._finish("done", self._stop_reason)
             return True
 
@@ -508,16 +532,26 @@ class StrategyRunner:
                 return True
             if lot_result == "hit":
                 return False
-            if await self._maybe_open_manual_scatter(event, positions):
-                return False
+            report_due = time.time() - self._last_report >= self.report_interval
+            opened_manual = await self._maybe_open_manual_scatter(event, positions)
             filtered = manual_scatter.exclude_manual(positions)
+            metrics = await self._read_bar_metrics()
             if filtered:
                 ctx = self._ctx(event, filtered)
-                ctx.bar_metrics = await self._read_bar_metrics()
-                decision = evaluate(self.strategy.get("rules") or [], ctx)
+                ctx.bar_metrics = metrics
+                # 逆势走限价，市价判定只留给顺势
+                decision = evaluate(
+                    self.strategy.get("rules") or [], ctx,
+                    rule_types=(RULE_TYPE_TREND,),
+                )
                 if decision is not None:
                     await self._add_position(decision, positions)
-                    return False
+            await self._sync_counter_limit(event, positions, metrics)
+            if opened_manual:
+                return False
+            if report_due:
+                await self._emit_progress("heartbeat", phase="running", positions=positions)
+            return False
 
         if time.time() - self._last_report >= self.report_interval:
             await self._emit_progress("heartbeat", phase="running", positions=positions)
@@ -783,9 +817,15 @@ class StrategyRunner:
         filtered = manual_scatter.exclude_manual(positions)
         counted = count_adds_by_rule(filtered)
         for pos in filtered:
-            used = smc_key_from_comment(pos.get("comment") if isinstance(pos, dict) else None)
+            if not isinstance(pos, dict):
+                continue
+            used = smc_key_from_comment(pos.get("comment"))
             if used:
                 self._smc_used.add(used)
+            if parse_add_rule_type(pos.get("comment")) == RULE_TYPE_COUNTER:
+                ticket = int(pos.get("ticket") or 0)
+                if ticket:
+                    self._counter_seen.add(ticket)
         for rule_type, n in counted.items():
             self.add_counts[rule_type] = max(self.add_counts.get(rule_type, 0), n)
         seeded = sum(self.add_counts.values())
@@ -931,8 +971,312 @@ class StrategyRunner:
         )
         return True
 
-    async def _add_position(self, decision, positions: list[dict]) -> None:
-        reason = describe_decision(decision)
+    def _stops_differ(self, left: float, right: float, point: float) -> bool:
+        tol = point if point > 0 else 1e-9
+        return abs(_as_float(left) - _as_float(right)) >= tol
+
+    async def _counter_resting_orders(self) -> Optional[list[dict]]:
+        """该魔术号上备注为逆势加仓的在途限价。读失败返回 None。"""
+        rows = await self._magic_orders()
+        if rows is None:
+            return None
+        return [
+            o for o in rows
+            if parse_add_rule_type(o.get("comment")) == RULE_TYPE_COUNTER
+        ]
+
+    async def _cancel_counter_orders(
+        self, resting: list[dict], positions: list[dict], *, reason: str,
+    ) -> bool:
+        """撤掉给出的逆势限价。没有单视为成功；有撤失败则整批算失败。"""
+        if not resting:
+            return True
+        ok = True
+        for order in resting:
+            ticket = int(order.get("ticket") or 0)
+            try:
+                res = dict(await self._exec(self._mt5.cancel_order, ticket) or {})
+            except Exception as e:  # noqa: BLE001
+                logger.warning("task %s cancel counter limit failed: %s", self.task_id, e)
+                ok = False
+                continue
+            if not res.get("success"):
+                logger.warning(
+                    "task %s cancel counter limit failed: %s",
+                    self.task_id, res.get("error"),
+                )
+                ok = False
+        if not ok:
+            return False
+        self._pending_orders = 0
+        sample = resting[0]
+        await self._emit_progress(
+            "cnt_limit_off", phase="running", positions=positions,
+            message=reason,
+            detail={
+                "kind": "counter_limit",
+                "limit_action": "cancel",
+                "ticket": sample.get("ticket"),
+                "price": _as_float(sample.get("price_open")),
+                "comment": sample.get("comment"),
+            },
+        )
+        return True
+
+    async def _cancel_open_counter_limits(self, *, reason: str) -> bool:
+        resting = await self._counter_resting_orders()
+        if resting is None:
+            return False
+        return await self._cancel_counter_orders(resting, [], reason=reason)
+
+    async def _counter_price_block(self, plan) -> Optional[str]:
+        """side / stops 改市价；unavailable 本拍跳过；None 可以挂。"""
+        blocker = getattr(self._mt5, "pending_price_block", None)
+        if blocker is None:
+            checker = getattr(self._mt5, "check_pending_price", None)
+            if checker is None:
+                return None
+            try:
+                message = await self._exec(
+                    checker, self.symbol, plan.action, plan.limit_price, "limit",
+                )
+            except Exception:  # noqa: BLE001
+                return "unavailable"
+            text = str(message or "")
+            if not text:
+                return None
+            if "必须" in text:
+                return "side"
+            if "券商" in text:
+                return "stops"
+            return "unavailable"
+        try:
+            code = await self._exec(
+                blocker, self.symbol, plan.action, plan.limit_price, "limit",
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("task %s pending price check failed", self.task_id, exc_info=True)
+            return "unavailable"
+        return str(code) if code else None
+
+    async def _observe_counter_fills(self, positions: list[dict]) -> None:
+        """限价被券商成交后补记一笔逆势加仓。市价兜底已经记过的票号跳过。"""
+        fresh: list[dict] = []
+        for pos in positions:
+            if parse_add_rule_type(pos.get("comment")) != RULE_TYPE_COUNTER:
+                continue
+            ticket = int(pos.get("ticket") or 0)
+            if ticket <= 0 or ticket in self._counter_seen:
+                continue
+            fresh.append(pos)
+        for pos in fresh:
+            ticket = int(pos.get("ticket") or 0)
+            self._counter_seen.add(ticket)
+            key = smc_key_from_comment(pos.get("comment"))
+            if key:
+                self._smc_used.add(key)
+            if self._counter_skip_fills > 0:
+                self._counter_skip_fills -= 1
+                continue
+            volume = _as_float(pos.get("volume"))
+            price = _as_float(pos.get("price_open"))
+            comment = str(pos.get("comment") or "")
+            self.add_counts[RULE_TYPE_COUNTER] = self.add_counts.get(RULE_TYPE_COUNTER, 0) + 1
+            self.add_count = sum(self.add_counts.values())
+            self.total_orders += 1
+            self.total_volume += volume
+            await self._emit_progress(
+                "add_counter", phase="running", positions=positions,
+                last_order={"ticket": ticket, "price": price, "volume": volume},
+                message=(
+                    f"逆势加仓限价成交：{self.direction} 票号 {ticket}，"
+                    f"开仓价 {price}，手数 {volume}，备注 {comment}"
+                ),
+                detail={
+                    "kind": "add",
+                    "rule_type": RULE_TYPE_COUNTER,
+                    "rule_type_label": "逆势加仓",
+                    "via": "limit_fill",
+                    "price": price,
+                    "volume": volume,
+                    "comment": comment,
+                    "smc_key": key or None,
+                },
+            )
+
+    async def _place_counter_limit(
+        self, plan, positions: list[dict], comment: str,
+        sl: Optional[float], tp: Optional[float],
+    ) -> None:
+        try:
+            res = dict(await self._exec(
+                self._mt5.place_pending_order,
+                self.symbol, plan.action, plan.volume, plan.limit_price,
+                sl, tp, comment, self.magic, "limit",
+            ) or {})
+        except Exception as e:  # noqa: BLE001
+            logger.warning("task %s place counter limit failed: %s", self.task_id, e)
+            res = {"success": False, "error": str(e)}
+        if not res.get("success"):
+            await self._emit_progress(
+                "error", phase="running", positions=positions,
+                message=f"逆势限价挂单失败：{res.get('error') or 'pending order failed'}",
+                detail={
+                    **decision_detail(plan),
+                    "kind": "counter_limit",
+                    "limit_action": "place",
+                    "error": str(res.get("error") or ""),
+                },
+            )
+            return
+        self._pending_orders = 1
+        await self._emit_progress(
+            "cnt_limit", phase="running", positions=positions,
+            last_order={
+                "ticket": res.get("order") or res.get("ticket"),
+                "price": plan.limit_price,
+                "volume": plan.volume,
+            },
+            message=describe_counter_limit(plan, verb="挂出限价"),
+            detail={**decision_detail(plan), "kind": "counter_limit", "limit_action": "place"},
+        )
+
+    async def _align_counter_order(
+        self, plan, positions: list[dict], resting: list[dict],
+        sl: Optional[float], tp: Optional[float], *, point: float,
+    ) -> None:
+        """在途的那一张和计划对齐：身份变了就撤掉重挂，只变价或止损就改单。"""
+        want = counter_order_key(plan)
+        comment = decision_comment(plan)
+        if len(resting) > 1:
+            if not await self._cancel_counter_orders(
+                resting, positions, reason="逆势限价只保留一张",
+            ):
+                return
+            resting = []
+        current = resting[0] if resting else None
+        if current is not None and counter_pending_key(
+            current.get("comment"), current.get("volume"),
+        ) != want:
+            if not await self._cancel_counter_orders(
+                [current], positions, reason="逆势限价手数或价位来源变了，撤下重挂",
+            ):
+                return
+            current = None
+        if current is None:
+            await self._place_counter_limit(plan, positions, comment, sl, tp)
+            return
+        old_price = _as_float(current.get("price_open"))
+        old_sl = _as_float(current.get("sl"))
+        old_tp = _as_float(current.get("tp"))
+        price_moved = self._stops_differ(old_price, plan.limit_price, point)
+        stops_moved = (
+            sl is not None and self._stops_differ(old_sl, _as_float(sl), point)
+        ) or (
+            tp is not None and self._stops_differ(old_tp, _as_float(tp), point)
+        )
+        if not price_moved and not stops_moved:
+            return
+        try:
+            res = dict(await self._exec(
+                self._mt5.modify_pending_order,
+                int(current.get("ticket") or 0),
+                plan.limit_price,
+                None if sl is None else _as_float(sl),
+                None if tp is None else _as_float(tp),
+            ) or {})
+        except Exception as e:  # noqa: BLE001
+            logger.warning("task %s modify counter limit failed: %s", self.task_id, e)
+            res = {"success": False, "error": str(e)}
+        if not res.get("success"):
+            await self._emit_progress(
+                "error", phase="running", positions=positions,
+                message=f"逆势限价改单失败：{res.get('error') or 'modify failed'}",
+                detail={
+                    **decision_detail(plan),
+                    "kind": "counter_limit",
+                    "limit_action": "modify",
+                    "error": str(res.get("error") or ""),
+                },
+            )
+            return
+        await self._emit_progress(
+            "cnt_limit_mod", phase="running", positions=positions,
+            last_order={
+                "ticket": current.get("ticket"),
+                "price": plan.limit_price,
+                "volume": plan.volume,
+            },
+            message=describe_counter_limit(plan, verb="更新限价"),
+            detail={**decision_detail(plan), "kind": "counter_limit", "limit_action": "modify"},
+        )
+
+    async def _counter_market_fallback(self, plan, positions: list[dict], resting: list[dict]) -> None:
+        """挂单价已经不能放在限价一侧：撤掉在途单，本档改市价。"""
+        if resting and not await self._cancel_counter_orders(
+            resting, positions, reason="逆势限价不可挂，撤下后改市价",
+        ):
+            return
+        moved = deviation_points(
+            RULE_TYPE_COUNTER, plan.direction, plan.base_price, plan.price, plan.point,
+        )
+        if moved > 0:
+            plan.deviation = moved
+        before = self.add_counts.get(RULE_TYPE_COUNTER, 0)
+        await self._add_position(
+            plan, positions,
+            message=describe_counter_limit(plan, verb="限价不可挂，改为市价"),
+        )
+        if self.add_counts.get(RULE_TYPE_COUNTER, 0) > before:
+            self._counter_skip_fills += 1
+
+    async def _sync_counter_limit(
+        self, event: MarketEvent, positions: list[dict],
+        bar_metrics: Optional[dict] = None,
+    ) -> None:
+        """把下一档逆势加仓维持成唯一一张限价；成交后才挂再下一张。"""
+        if self._mode != _MODE_ADD_ON or event.point <= 0:
+            return
+        live = await self._magic_positions()
+        book = list(live) if live is not None else list(positions)
+        await self._observe_counter_fills(book)
+        resting = await self._counter_resting_orders()
+        if resting is None:
+            return
+        self._pending_orders = len(resting)
+        filtered = manual_scatter.exclude_manual(book)
+        if not filtered:
+            await self._cancel_counter_orders(resting, book, reason="没有可锚定的持仓")
+            return
+        counted = count_adds_by_rule(filtered)
+        if self.add_counts.get(RULE_TYPE_COUNTER, 0) > counted.get(RULE_TYPE_COUNTER, 0):
+            return
+        ctx = self._ctx(event, filtered)
+        ctx.bar_metrics = (
+            bar_metrics if bar_metrics is not None else await self._read_bar_metrics()
+        )
+        spec = await self._manual_symbol_spec()
+        digits = int((spec or {}).get("digits") or 0)
+        plan = plan_counter_limit(self.strategy.get("rules") or [], ctx, digits=digits)
+        if plan is None:
+            await self._cancel_counter_orders(resting, book, reason="逆势加仓没有下一档")
+            return
+        block = await self._counter_price_block(plan)
+        if block == "unavailable":
+            return
+        if block in ("side", "stops"):
+            await self._counter_market_fallback(plan, book, resting)
+            return
+        sl = tp = None
+        stops = await self._stops_on_open(plan.action, plan.volume, filtered)
+        if stops is not None:
+            sl, tp = stops
+        await self._align_counter_order(plan, book, resting, sl, tp, point=ctx.point)
+
+    async def _add_position(
+        self, decision, positions: list[dict], *, message: Optional[str] = None,
+    ) -> None:
+        reason = message or describe_decision(decision)
         order_sl, order_tp = await self._stops_on_open(
             decision.action, decision.volume, positions,
         ) or (None, None)

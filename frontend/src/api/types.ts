@@ -810,7 +810,7 @@ export interface GroupTaskEventRecord {
   created_at: number | null
   /**
    * open / add_counter / add_trend / add_manual / manual_tp_close / grid_add / grid_shift /
-   * close_partial / close_all / error / resume
+   * cnt_limit / cnt_limit_mod / cnt_limit_off / close_partial / close_all / error / resume
    */
   event_type: string
   symbol: string | null

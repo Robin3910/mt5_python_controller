@@ -5,7 +5,8 @@
 - type：1=逆势加仓，2=顺势加仓
 - status：0=关闭，1=启用
 - action：监控方向 all | buy | sell
-- point：触发点数，偏离达到 point × Point() 后加仓
+- point：触发点数。顺势是偏离达到 point × Point() 后市价加仓；
+  逆势由 plan_counter_limit 预先算好挂单价，不在这里等现价走到阈值
 - lot_times / extra_lot：手数 = lot_times × 基础手数 + extra_lot
 - max_allow_num：最大加仓次数（未启用分批时，按本规则已加次数计，不含开仓）
 - batch_enabled / batch_levels：分批档位，按本规则第几次加仓命中不同的点数与倍数
@@ -18,7 +19,7 @@
 - 顺势：最近一笔开仓价（继续沿有利方向铺仓）；
 - 逆势：持仓中不利方向最深的开仓价（多单取最低、空单取最高）。
   尚未出现更深逆势仓时即首仓价——顺势加在更高/更低价后，
-  必须先回到首仓不利侧达到阈值，才会触发逆势加仓。
+  逆势限价仍挂在首仓不利侧，顺势仓上的回撤不会把它成交。
 """
 from __future__ import annotations
 
@@ -119,7 +120,8 @@ class AddDecision:
     calc_type: str = CALC_POINT     # 间距计算方式
     timeframe: str = ""             # ATR / 波幅所用的 K 线周期
     metric_value: float = 0.0       # ATR / 波幅算出的价格距离
-    target_price: float = 0.0       # 指定价模式配置的价位
+    target_price: float = 0.0       # 指定价 / SMC 的绝对价位
+    limit_price: float = 0.0       # 逆势限价的挂单价；市价判定为 0
     rule_index: int = 0         # 规则在策略快照 rules 中的原始下标
     direction: str = ""         # 持仓方向（判定基准）
     base_price: float = 0.0     # 本次规则实际使用的偏离基准价
@@ -391,11 +393,23 @@ def resolve_threshold(rule_type: int, level: dict, ctx: PositionCtx) -> Threshol
     return Threshold(_as_float(level.get("point"), 0.0), CALC_POINT)
 
 
-def evaluate_rule(rule: dict, ctx: PositionCtx, rule_index: int = 0) -> Optional[AddDecision]:
-    """单条规则的加仓判定；不满足条件返回 None。
+@dataclass
+class _AddPrep:
+    """一条规则在比较现价之前就能确定的加仓参数。"""
+    rule_type: int
+    level_index: Optional[int]
+    gap: Threshold
+    lot_times: float
+    extra_lot: float
+    limit_kind: str
+    limit_value: int
+    rule_adds: int
+    base: float
+    volume: float
 
-    rule_index 是该规则在策略快照中的原始下标，只用于在说明里指明是哪条规则命中。
-    """
+
+def _prepare_rule(rule: dict, ctx: PositionCtx) -> Optional[_AddPrep]:
+    """方向、档位、笔数上限和间距都齐了才返回；现价够不够由调用方另判。"""
     if not rule or not _as_int(rule.get("status"), 0):
         return None
     rule_type = _as_int(rule.get("type"), RULE_TYPE_COUNTER)
@@ -433,57 +447,135 @@ def evaluate_rule(rule: dict, ctx: PositionCtx, rule_index: int = 0) -> Optional
         extra_lot = _as_float(rule.get("extra_lot"), 0.0)
         limit_kind, limit_value = "max_allow_num", max_allow
 
-    threshold = gap.points
-    if threshold <= 0:
+    if gap.points <= 0:
         return None
-    base = rule_base_price(rule_type, ctx)
-    moved = deviation_points(rule_type, ctx.direction, base, ctx.price, ctx.point)
-    if moved < threshold:
-        return None
-
-    volume = lot_times * ctx.base_volume + extra_lot
+    volume = round(lot_times * ctx.base_volume + extra_lot, 2)
     if volume <= 0:
         return None
-    return AddDecision(
+    return _AddPrep(
         rule_type=rule_type,
-        action=str(ctx.direction).upper(),
-        volume=round(volume, 2),
-        deviation=moved,
-        threshold=threshold,
         level_index=level_index,
+        gap=gap,
+        lot_times=lot_times,
+        extra_lot=extra_lot,
+        limit_kind=limit_kind,
+        limit_value=limit_value,
+        rule_adds=rule_adds,
+        base=rule_base_price(rule_type, ctx),
+        volume=volume,
+    )
+
+
+def _build_decision(
+    prep: _AddPrep, ctx: PositionCtx, rule_index: int, *,
+    deviation: float, price: float, limit_price: float = 0.0,
+) -> AddDecision:
+    gap = prep.gap
+    return AddDecision(
+        rule_type=prep.rule_type,
+        action=str(ctx.direction).upper(),
+        volume=prep.volume,
+        deviation=deviation,
+        threshold=gap.points,
+        level_index=prep.level_index,
         calc_type=gap.calc_type,
         timeframe=gap.timeframe,
         metric_value=gap.metric_value,
         target_price=gap.target_price,
+        limit_price=limit_price,
         rule_index=rule_index,
         direction=str(ctx.direction).upper(),
-        base_price=base,
-        price=ctx.price,
+        base_price=prep.base,
+        price=price,
         point=ctx.point,
         base_volume=ctx.base_volume,
-        lot_times=lot_times,
-        extra_lot=extra_lot,
+        lot_times=prep.lot_times,
+        extra_lot=prep.extra_lot,
         position_count=ctx.position_count,
-        add_count=rule_adds,
-        limit_kind=limit_kind,
-        limit_value=limit_value,
+        add_count=prep.rule_adds,
+        limit_kind=prep.limit_kind,
+        limit_value=prep.limit_value,
         smc_key=gap.smc_key,
         smc_side=gap.smc_side,
         smc_received_at=gap.smc_received_at,
     )
 
 
-def evaluate(rules: list, ctx: PositionCtx) -> Optional[AddDecision]:
-    """按规则顺序取第一条命中的加仓决策（逆势优先于顺势）。
+def counter_limit_price(direction: str, base: float, point: float, gap: Threshold) -> float:
+    """下一档逆势限价的绝对价格。点数 / ATR / 波幅从锚点向不利侧量；指定价和 SMC 用绝对价。"""
+    if gap.calc_type == CALC_PRICE or gap.calc_type in CALC_SMC_TYPES:
+        return gap.target_price if gap.target_price > 0 else 0.0
+    if base <= 0 or point <= 0 or gap.points <= 0:
+        return 0.0
+    distance = gap.points * point
+    if str(direction or "").strip().upper() == "BUY":
+        return base - distance
+    return base + distance
 
+
+def evaluate_rule(rule: dict, ctx: PositionCtx, rule_index: int = 0) -> Optional[AddDecision]:
+    """单条规则的市价加仓判定；现价偏离不够返回 None。
+
+    逆势的常态路径不走这里，见 plan_counter_limit。本函数仍保留逆势判定，
+    供「偏离是否已经够」的单元测试使用。
+    rule_index 是该规则在策略快照中的原始下标，只用于在说明里指明是哪条规则命中。
+    """
+    prep = _prepare_rule(rule, ctx)
+    if prep is None:
+        return None
+    moved = deviation_points(prep.rule_type, ctx.direction, prep.base, ctx.price, ctx.point)
+    if moved < prep.gap.points:
+        return None
+    return _build_decision(prep, ctx, rule_index, deviation=moved, price=ctx.price)
+
+
+def evaluate(
+    rules: list, ctx: PositionCtx, *, rule_types: Optional[Sequence[int]] = None,
+) -> Optional[AddDecision]:
+    """按规则顺序取第一条命中的市价加仓决策（逆势优先于顺势）。
+
+    rule_types 给定时只跑这些类型。执行器里逆势已改成限价，市价判定只传入顺势。
     排序只影响判定优先级，决策里记录的仍是规则在原快照中的下标。
     """
+    allowed = None if rule_types is None else {int(item) for item in rule_types}
     indexed = [(i, r) for i, r in enumerate(rules or []) if isinstance(r, dict)]
     ordered = sorted(indexed, key=lambda item: _as_int(item[1].get("type"), RULE_TYPE_COUNTER))
     for index, rule in ordered:
+        rule_type = _as_int(rule.get("type"), RULE_TYPE_COUNTER)
+        if allowed is not None and rule_type not in allowed:
+            continue
         decision = evaluate_rule(rule, ctx, index)
         if decision is not None:
             return decision
+    return None
+
+
+def plan_counter_limit(
+    rules: list, ctx: PositionCtx, *, digits: int = 0,
+) -> Optional[AddDecision]:
+    """算出下一档逆势限价，不等现价走到阈值。
+
+    没有启用的逆势规则、档位用尽或间距算不出时返回 None。挂单价按 digits 四舍五入。
+    偏离字段写成计划阈值，备注才不会跟着现价每一拍变。
+    """
+    for index, rule in enumerate(rules or []):
+        if not isinstance(rule, dict):
+            continue
+        if _as_int(rule.get("type"), RULE_TYPE_COUNTER) != RULE_TYPE_COUNTER:
+            continue
+        prep = _prepare_rule(rule, ctx)
+        if prep is None:
+            continue
+        raw = counter_limit_price(ctx.direction, prep.base, ctx.point, prep.gap)
+        if raw <= 0:
+            continue
+        limit_price = round(raw, digits) if digits > 0 else raw
+        if limit_price <= 0:
+            continue
+        return _build_decision(
+            prep, ctx, index,
+            deviation=prep.gap.points, price=ctx.price, limit_price=limit_price,
+        )
     return None
 
 
@@ -508,6 +600,9 @@ _CALC_COMMENT_CODE = {
     CALC_PDZ: "Z",
     CALC_FIBO: "B",
 }
+_COMMENT_CODE_CALC = {code: name for name, code in _CALC_COMMENT_CODE.items()}
+# 逆势挂单备注：R1、可选档位、计算方式字母，SMC 再接 8 位哈希。偏离数字不参与身份比较。
+_COUNTER_PENDING_RE = re.compile(r"^R1(?:L(\d+))?([DPAWFOZB])([0-9a-f]{8})?")
 
 
 def _trim(value: float, digits: int) -> str:
@@ -591,6 +686,7 @@ def decision_detail(decision: AddDecision) -> dict:
         "bar_period": BAR_PERIOD if decision.calc_type in CALC_BAR_TYPES else None,
         "metric_value": decision.metric_value or None,
         "target_price": decision.target_price or None,
+        "limit_price": decision.limit_price or None,
         "smc_key": decision.smc_key or None,
         "smc_side": decision.smc_side or None,
         "smc_received_at": decision.smc_received_at or None,
@@ -627,3 +723,39 @@ def decision_comment(decision: AddDecision) -> str:
     else:
         parts.append(f"{code}{int(round(decision.deviation))}")
     return "".join(parts)[:MT5_COMMENT_LIMIT]
+
+
+def counter_order_key(decision: AddDecision) -> tuple:
+    """逆势挂单的身份：手数、档位、计算方式、SMC 哈希。价格和止损不在里面。"""
+    level = -1 if decision.level_index is None else int(decision.level_index)
+    smc = decision.smc_key if decision.calc_type in CALC_SMC_TYPES else ""
+    return (round(float(decision.volume), 2), level, decision.calc_type, smc or "")
+
+
+def counter_pending_key(comment: object, volume: object) -> Optional[tuple]:
+    """从在途挂单备注还原身份；不是逆势加仓单时返回 None。"""
+    matched = _COUNTER_PENDING_RE.match(str(comment or "").strip())
+    if matched is None:
+        return None
+    level = int(matched.group(1)) if matched.group(1) is not None else -1
+    calc = _COMMENT_CODE_CALC.get(matched.group(2) or "", "")
+    smc = matched.group(3) or ""
+    if calc not in CALC_SMC_TYPES:
+        smc = ""
+    return (round(_as_float(volume), 2), level, calc, smc)
+
+
+def describe_counter_limit(decision: AddDecision, *, verb: str) -> str:
+    """逆势限价的挂出 / 改价 / 撤下 / 改市价说明。verb 用「挂出限价」这类短语。"""
+    where = f"规则#{decision.rule_index}"
+    if decision.level_index is not None:
+        where += f" · 分批档位#{decision.level_index}"
+    return (
+        f"逆势加仓 · {where}：{verb} {decision.action}"
+        f" 挂单价 {_trim(decision.limit_price, 5)}，"
+        f"基准价 {_trim(decision.base_price, 5)}，{gap_text(decision)}；"
+        f"手数 = 首单 {_trim(decision.base_volume, 2)} × 倍数 {_trim(decision.lot_times, 2)}"
+        f" + 追加 {_trim(decision.extra_lot, 2)} = {_trim(decision.volume, 2)} 手；"
+        f"本次本规则第 {decision.next_rule_add_no} 次加仓，已加 {decision.add_count} 次，"
+        f"{_limit_text(decision)}"
+    )
