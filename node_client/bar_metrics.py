@@ -54,14 +54,20 @@ def average_true_range(bars: list[dict]) -> float:
     return sum(ranges) / len(ranges) if ranges else 0.0
 
 
-def max_range(bars: list[dict]) -> float:
-    """最大波幅：这段 K 线里单根高低差的最大值。"""
-    spans = [
-        float(b.get("high") or 0.0) - float(b.get("low") or 0.0)
-        for b in bars or []
-    ]
-    spans = [s for s in spans if s > 0]
-    return max(spans) if spans else 0.0
+def high_low_span(bars: list[dict]) -> float:
+    """高低点总跨度：这段 K 线里最高的高点减最低的低点。
+
+    与 ATR 的区别：ATR 是每根 K 线真实波幅的**平均**（逐根算再平均），这里把
+    整个窗口当成一段行情，取首尾包络的极值差——反映的是「这 14 根行情走了多远」，
+    而不是「单根 K 线平均波动多大」。
+    """
+    highs = [float(b.get("high") or 0.0) for b in bars or []]
+    lows = [float(b.get("low") or 0.0) for b in bars or []]
+    highs = [h for h in highs if h > 0]
+    lows = [l for l in lows if l > 0]
+    if not highs or not lows:
+        return 0.0
+    return max(highs) - min(lows)
 
 
 def compute(metric: str, bars: list[dict]) -> float:
@@ -69,7 +75,7 @@ def compute(metric: str, bars: list[dict]) -> float:
     if metric == METRIC_ATR:
         return average_true_range(bars)
     if metric == METRIC_RANGE:
-        return max_range(bars)
+        return high_low_span(bars)
     return 0.0
 
 

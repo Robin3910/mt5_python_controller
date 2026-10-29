@@ -463,7 +463,7 @@ class MockMT5Client:
     def closed_bars(self, symbol: str, timeframe: str, count: int) -> list[dict]:
         """合成一段已收盘 K 线：围绕当前中间价做固定振幅，便于联调 ATR / 波幅。
 
-        振幅取 200 个 point，因此 ATR 与最大波幅都稳定等于该值，测试可直接断言。
+        振幅取 200 个 point，因此 ATR 与高低点总跨度都稳定等于该值，测试可直接断言。
         """
         tf = str(timeframe or "").strip().upper()
         step = _TIMEFRAME_SECONDS.get(tf)

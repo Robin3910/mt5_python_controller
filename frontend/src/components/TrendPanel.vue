@@ -24,7 +24,6 @@ import {
   TREND_REFRESH_OPTIONS,
   TREND_TIMEFRAMES,
   rsiStateLabel,
-  timeframeLabel,
   toTrendForm,
   trendLabel,
   trendTagClass,
@@ -463,18 +462,18 @@ onBeforeUnmount(() => {
             {{ s }}
           </button>
         </div>
-        <label class="trend-field">
+        <!-- <label class="trend-field">
           <span class="trend-field-k">周期</span>
           <TagSelect v-model="form.timeframe" :options="TREND_TIMEFRAMES" aria-label="周期" />
-        </label>
+        </label> -->
         <!-- <button class="btn-sm btn-ghost" :disabled="loading || !symbol" @click="load">
           {{ loading ? '读取中…' : '刷新' }}
         </button> -->
       </div>
-        <div>
+        <!-- <div>
           <strong>{{ data?.symbol || symbol || '—' }}</strong>
           <span class="muted trend-sub">{{ timeframeLabel(cfg.timeframe) }}</span>
-        </div>
+        </div> -->
         <div class="right">
           <div class="trend-price">{{ fmtPrice(data?.price) }}</div>
           <div class="muted trend-sub">

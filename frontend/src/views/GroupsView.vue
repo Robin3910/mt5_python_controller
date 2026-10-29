@@ -193,8 +193,25 @@ const memberNodes = computed<NodeOut[]>(() =>
 const availableNodes = computed<NodeOut[]>(() =>
   hub.nodes.filter((n) => !form.node_ids.includes(n.node_id) && sameOwnerAsForm(n.owner_user_id)),
 )
+// 成员节点搜索：节点多时按名称 / 节点 ID / MT5 账号过滤
+const nodeSearch = ref('')
+function matchNodeSearch(n: NodeOut, q: string): boolean {
+  if (!q) return true
+  const hay = `${n.name} ${n.node_id} ${n.mt5_login ?? ''} ${n.mt5_server ?? ''}`.toLowerCase()
+  return hay.includes(q)
+}
+const filteredAvailableNodes = computed<NodeOut[]>(() => {
+  const q = nodeSearch.value.trim().toLowerCase()
+  return availableNodes.value.filter((n) => matchNodeSearch(n, q))
+})
+const filteredMemberNodes = computed(() => {
+  const q = nodeSearch.value.trim().toLowerCase()
+  return memberNodes.value
+    .map((n, index) => ({ node: n, index }))
+    .filter(({ node }) => matchNodeSearch(node, q))
+})
 const memberTagOptions = computed(() =>
-  availableNodes.value.map((n) => ({
+  filteredAvailableNodes.value.map((n) => ({
     value: n.node_id,
     label: `${n.name}（${n.mt5_login || '—'}）`,
   })),
@@ -231,6 +248,7 @@ function openCreate(): void {
   formMode.value = 'create'
   editingId.value = ''
   formError.value = ''
+  nodeSearch.value = ''
   Object.assign(form, {
     name: '',
     enabled: true,
@@ -252,6 +270,7 @@ function openEdit(g: GroupOut): void {
   formMode.value = 'edit'
   editingId.value = g.group_id
   formError.value = ''
+  nodeSearch.value = ''
   Object.assign(form, {
     name: g.name,
     enabled: g.enabled,
@@ -374,6 +393,12 @@ function limitWatchButtonTitle(g: GroupOut): string {
 }
 
 const showWatchLogColumn = computed(() => hub.groups.some((g) => g.limit_watch_enabled))
+
+// 手机端分组卡片：点标题行展开/收起明细
+const groupDetailOpen = reactive<Record<string, boolean>>({})
+function toggleGroupDetail(groupId: string): void {
+  groupDetailOpen[groupId] = !groupDetailOpen[groupId]
+}
 const emptyTableText = computed(() =>
   appliedQuery.value ? '无匹配分组' : '暂无分组，点击右上角「新建分组」开始配置',
 )
@@ -723,86 +748,86 @@ async function onStrategyFormSaved(): Promise<void> {
     </div>
 
     <!-- 移动端卡片 -->
-    <div class="list-cards mobile-only">
-      <div v-for="g in hub.groups" :key="g.group_id" class="list-card card">
-        <div class="list-card-head row between">
-          <strong>{{ g.name }}</strong>
-          <span class="tag" :class="g.enabled ? 'green' : ''">{{ g.enabled ? '已启用' : '已禁用' }}</span>
-        </div>
-        <div class="list-field"><span class="k">分组 ID</span><span class="v muted" style="font-size: 12px; font-weight: 500">{{ g.group_id }}</span></div>
-        <div v-if="auth.isAdmin" class="list-field"><span class="k">所有者</span><span class="v">{{ g.owner_username || '管理员' }}</span></div>
-        <div class="list-field">
-          <span class="k">绑定策略</span>
-          <span class="v">{{ g.strategy_name || '未绑定' }}</span>
-        </div>
-        <div class="list-field">
-          <span class="k">分发模式</span>
-          <span class="v">
+    <div class="group-cards mobile-only">
+      <div v-for="g in hub.groups" :key="g.group_id" class="group-card card">
+        <div class="group-row" @click="toggleGroupDetail(g.group_id)">
+          <div class="group-title">
+            <strong class="group-name">{{ g.name }}</strong>
+            <span class="tag" :class="g.enabled ? 'green' : ''">{{ g.enabled ? '已启用' : '已禁用' }}</span>
             <span class="tag blue">{{ DISPATCH_MODE_LABEL[g.dispatch_mode] }}</span>
             <span v-if="g.signal_concurrent_enabled" class="tag">信号并发</span>
-          </span>
+          </div>
+          <div class="group-stats">
+            <span class="group-stat"><b>{{ g.online_node_count }}</b>/{{ g.node_count }} 节点</span>
+            <span class="group-stat"><b>{{ g.signal_count }}</b> 信号</span>
+            <span class="group-stat"><b>{{ g.active_task_count }}</b> 进行中</span>
+            <span class="group-caret" :class="{ open: groupDetailOpen[g.group_id] }">▾</span>
+          </div>
         </div>
-        <div class="list-field">
-          <span class="k">趋势风控</span>
-          <span class="v">
-            <button
-              class="btn-sm"
-              :class="g.trend_risk_enabled ? 'btn-success' : 'btn-danger'"
-              :title="FIELD_HELP.trend_risk"
-              @click="toggleTrendRisk(g)"
-            >
-              {{ g.trend_risk_enabled ? '已开启' : '已关闭' }}
-            </button>
-          </span>
+        <div v-if="groupDetailOpen[g.group_id]" class="group-detail">
+          <div class="list-field"><span class="k">分组 ID</span><span class="v muted" style="font-size: 12px; font-weight: 500">{{ g.group_id }}</span></div>
+          <div v-if="auth.isAdmin" class="list-field"><span class="k">所有者</span><span class="v">{{ g.owner_username || '管理员' }}</span></div>
+          <div class="list-field">
+            <span class="k">绑定策略</span>
+            <span class="v">
+              <button v-if="g.strategy_id" class="btn-sm btn-success" @click="openGroupStrategyEdit(g)">{{ g.strategy_name || '编辑策略' }}</button>
+              <span v-else class="muted">未绑定</span>
+            </span>
+          </div>
+          <div class="list-field">
+            <span class="k">趋势风控</span>
+            <span class="v">
+              <button
+                class="btn-sm"
+                :class="g.trend_risk_enabled ? 'btn-success' : 'btn-danger'"
+                :title="FIELD_HELP.trend_risk"
+                @click="toggleTrendRisk(g)"
+              >
+                {{ g.trend_risk_enabled ? '已开启' : '已关闭' }}
+              </button>
+            </span>
+          </div>
+          <div class="list-field">
+            <span class="k">限价监听</span>
+            <span class="v">
+              <button
+                v-if="isTrendGroup(g)"
+                class="btn-sm"
+                :class="g.limit_watch_enabled ? 'btn-success' : 'btn-danger'"
+                :title="limitWatchButtonTitle(g)"
+                @click="toggleLimitWatch(g)"
+              >
+                {{ g.limit_watch_enabled ? '已开启' : '已关闭' }}
+              </button>
+              <span v-else class="muted">—</span>
+            </span>
+          </div>
+          <div v-if="g.limit_watch_enabled" class="list-field list-field-block">
+            <span class="k">监听日志</span>
+            <span class="v">
+              <LimitWatchLogCell :logs="watchLogsOf(g)" @open="openWatchLogs(g)" />
+            </span>
+          </div>
+          <div class="list-field">
+            <span class="k">信号</span>
+            <span class="v">
+              <button class="btn-sm btn-success" @click="openSignals(g)">{{ g.signal_count }} 条</button>
+            </span>
+          </div>
+          <div class="list-field">
+            <span class="k">进行中</span>
+            <span class="v">
+              <button
+                v-if="g.active_task_count > 0"
+                class="btn-sm btn-success"
+                @click="openActiveSignals(g)"
+              >{{ g.active_task_count }} 条</button>
+              <span v-else class="muted">—</span>
+            </span>
+          </div>
+          <div class="list-field"><span class="k">备注</span><span class="v muted" style="font-size: 12px; font-weight: 500">{{ g.remark || '—' }}</span></div>
         </div>
-        <div class="list-field">
-          <span class="k">限价监听</span>
-          <span class="v">
-            <button
-              v-if="isTrendGroup(g)"
-              class="btn-sm"
-              :class="g.limit_watch_enabled ? 'btn-success' : 'btn-danger'"
-              :title="limitWatchButtonTitle(g)"
-              @click="toggleLimitWatch(g)"
-            >
-              {{ g.limit_watch_enabled ? '已开启' : '已关闭' }}
-            </button>
-            <span v-else class="muted">—</span>
-          </span>
-        </div>
-        <div v-if="g.limit_watch_enabled" class="list-field list-field-block">
-          <span class="k">监听日志</span>
-          <span class="v">
-            <LimitWatchLogCell :logs="watchLogsOf(g)" @open="openWatchLogs(g)" />
-          </span>
-        </div>
-        <div v-if="g.strategy_id" class="list-field">
-          <span class="k">策略</span>
-          <span class="v">
-            <button class="btn-sm btn-success" @click="openGroupStrategyEdit(g)">编辑策略</button>
-          </span>
-        </div>
-        <div class="list-field">
-          <span class="k">信号</span>
-          <span class="v">
-            <button class="btn-sm btn-success" @click="openSignals(g)">{{ g.signal_count }} 条</button>
-          </span>
-        </div>
-        <div class="list-field"><span class="k">成员节点</span><span class="v">{{ g.node_count }}</span></div>
-        <div class="list-field"><span class="k">有效节点</span><span class="v">{{ g.online_node_count }}</span></div>
-        <div class="list-field">
-          <span class="k">进行中</span>
-          <span class="v">
-            <button
-              v-if="g.active_task_count > 0"
-              class="btn-sm btn-success"
-              @click="openActiveSignals(g)"
-            >{{ g.active_task_count }} 条</button>
-            <span v-else class="muted">—</span>
-          </span>
-        </div>
-        <div class="list-field"><span class="k">备注</span><span class="v muted" style="font-size: 12px; font-weight: 500">{{ g.remark || '—' }}</span></div>
-        <div class="list-card-actions">
+        <div class="group-actions">
           <button class="btn-sm" :class="g.enabled ? 'btn-success' : 'btn-danger'" @click="toggleEnabled(g)">
             {{ g.enabled ? '禁用' : '启用' }}
           </button>
@@ -1259,7 +1284,22 @@ async function onStrategyFormSaved(): Promise<void> {
 
             <div class="span-full">
               <FormLabel text="成员节点" :help="FIELD_HELP.nodes" />
-              <div class="row" style="gap: 8px; margin-bottom: 10px">
+              <div class="node-search-row">
+                <input
+                  v-model="nodeSearch"
+                  type="search"
+                  class="node-search-input"
+                  placeholder="搜索节点名称 / 节点 ID / MT5 账号…"
+                  aria-label="搜索节点"
+                />
+                <span class="muted node-search-count">
+                  可选 {{ filteredAvailableNodes.length }} / {{ availableNodes.length }} · 已选 {{ memberNodes.length }}
+                </span>
+              </div>
+              <div v-if="!filteredAvailableNodes.length" class="muted node-search-empty">
+                {{ availableNodes.length ? '没有匹配的节点' : '所有节点均已加入' }}
+              </div>
+              <div v-else class="row" style="gap: 8px; margin-bottom: 10px">
                 <!-- 占位项不可 disabled，否则浏览器会预选第一个节点且不再触发 change -->
                 <TagSelect
                   :model-value="''"
@@ -1273,7 +1313,7 @@ async function onStrategyFormSaved(): Promise<void> {
                 尚未加入任何节点。分组无有效节点时不会处理 strategy 信号。
               </div>
               <div v-else class="member-list">
-                <div v-for="(n, i) in memberNodes" :key="n.node_id" class="member-row">
+                <div v-for="{ node: n, index: i } in filteredMemberNodes" :key="n.node_id" class="member-row">
                   <span class="member-order">{{ i + 1 }}</span>
                   <span class="dot" :class="hub.statuses[n.node_id] || n.status"></span>
                   <span class="member-name">{{ n.name }}</span>
@@ -1293,6 +1333,9 @@ async function onStrategyFormSaved(): Promise<void> {
                     <button class="btn-sm btn-ghost" :disabled="i === memberNodes.length - 1" @click="moveMember(i, 1)">↓</button>
                     <button class="btn-sm btn-danger" @click="removeMember(n.node_id)">移出</button>
                   </span>
+                </div>
+                <div v-if="!filteredMemberNodes.length" class="muted" style="font-size: 12px">
+                  没有匹配的已选节点
                 </div>
               </div>
             </div>
@@ -1320,6 +1363,82 @@ async function onStrategyFormSaved(): Promise<void> {
 </template>
 
 <style scoped>
+/* ── 手机端紧凑分组卡片 ── */
+.group-cards {
+  display: none;
+}
+@media (max-width: 768px) {
+  .group-cards {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+}
+.group-card {
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+}
+.group-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  cursor: pointer;
+}
+.group-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.group-name {
+  font-size: 14px;
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 55%;
+}
+.group-stats {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.group-stat b {
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 700;
+}
+.group-caret {
+  margin-left: auto;
+  transition: transform var(--transition);
+  opacity: 0.7;
+}
+.group-caret.open {
+  transform: rotate(180deg);
+}
+.group-detail {
+  margin-top: 8px;
+  padding-top: 4px;
+  border-top: 1px solid var(--glass-border);
+}
+.group-detail .list-field {
+  padding: 7px 0;
+}
+.group-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.group-actions .btn-sm {
+  flex: 1 1 auto;
+  min-width: 60px;
+  padding: 6px 8px;
+}
+
 .groups-page {
   width: 100%;
   min-width: 0;
@@ -1381,6 +1500,27 @@ async function onStrategyFormSaved(): Promise<void> {
 }
 .groups-table :deep(.el-table__fixed-right-patch) {
   background: #101a2e;
+}
+
+.node-search-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.node-search-input {
+  flex: 1 1 220px;
+  min-width: 0;
+  width: auto;
+}
+.node-search-count {
+  font-size: 12px;
+  white-space: nowrap;
+}
+.node-search-empty {
+  font-size: 12px;
+  padding: 8px 0 10px;
 }
 
 .member-list {

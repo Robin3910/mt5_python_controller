@@ -85,8 +85,8 @@ const SORT_TAGS: TagOption<SortBy>[] = [
 type ViewMode = 'grid' | 'list'
 
 const q = ref('')
-const statusFilter = ref<StatusFilter>('all')
-const sortBy = ref<SortBy>('equity_desc')
+const statusFilter = ref<StatusFilter>('online')
+const sortBy = ref<SortBy>('name')
 const viewMode = ref<ViewMode>('grid')
 const page = ref(1)
 const pageSize = 9
@@ -160,10 +160,15 @@ const filteredNodes = computed(() => {
   })
 
   const equityOf = (n: NodeOut) => acct(n.node_id)?.equity ?? 0
+  // 是否有持仓（无快照的节点按无仓位处理）
+  const hasPositions = (n: NodeOut) => (acct(n.node_id)?.positions?.length || 0) > 0
   // 主节点始终置顶；主键之后再按用户选定的次级规则排序。
   const primaryFirst = (a: NodeOut, b: NodeOut) =>
     (a.is_primary ? 0 : 1) - (b.is_primary ? 0 : 1)
   list = [...list].sort((a, b) => {
+    // 有仓位优先：避免个别节点异常未同步时落到列表末尾（始终生效）
+    const posCmp = (hasPositions(b) ? 0 : 1) - (hasPositions(a) ? 0 : 1)
+    if (posCmp !== 0) return posCmp
     const primaryCmp = primaryFirst(a, b)
     if (primaryCmp !== 0) return primaryCmp
     if (sortBy.value === 'equity_desc') return equityOf(b) - equityOf(a)

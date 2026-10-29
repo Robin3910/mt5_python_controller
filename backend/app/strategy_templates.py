@@ -31,7 +31,7 @@ RULE_ACTIONS = ("all", "buy", "sell")
 
 # 分批档位的加仓间距计算方式：
 # point 点数固定间距；price 指定绝对价位到价触发；
-# atr 用 ATR 的平均波动作间距；range 用已收盘 K 线的最大高低波幅作间距。
+# atr 用 ATR 的平均波动作间距；range 用已收盘 K 线的高低点总跨度作间距。
 # fvg / ob / pdz / fibo 只作标识：节点不计算这些指标，等 TradingView 按周期推送价位。
 BATCH_CALC_POINT = "point"
 BATCH_CALC_PRICE = "price"

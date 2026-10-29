@@ -42,7 +42,7 @@ RULE_TYPE_TREND = 2    # 顺势
 CALC_POINT = "point"    # 固定点数
 CALC_PRICE = "price"    # 指定绝对价位，到价触发
 CALC_ATR = "atr"        # ATR 的平均波动作为间距
-CALC_RANGE = "range"    # 已收盘 K 线的最大高低波幅作为间距
+CALC_RANGE = "range"    # 已收盘 K 线的高低点总跨度作为间距
 # 以下只是标识，节点不计算指标；价位来自 TradingView 推送（与后台 BATCH_CALC_SMC_TYPES 对齐）
 CALC_FVG = "fvg"
 CALC_OB = "ob"

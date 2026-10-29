@@ -38,21 +38,23 @@ def test_average_true_range_needs_at_least_two_bars():
     assert bm.average_true_range([]) == 0.0
 
 
-# --------------------------- 最大波幅 ---------------------------
-def test_max_range_picks_widest_bar():
+# --------------------------- 高低点总跨度 ---------------------------
+def test_high_low_span_covers_whole_window():
+    """总跨度 = 最高的高点 − 最低的低点，跨整段窗口。"""
     bars = [bar(10, 8, 9), bar(15, 14, 14.5), bar(20, 12, 16)]
-    assert bm.max_range(bars) == 8
+    assert bm.high_low_span(bars) == 12          # 最高 20 − 最低 8
 
 
-def test_max_range_ignores_empty_bars():
-    assert bm.max_range([]) == 0.0
+def test_high_low_span_ignores_empty_bars():
+    assert bm.high_low_span([]) == 0.0
+    assert bm.high_low_span([bar(0, 0, 0)]) == 0.0
 
 
 # --------------------------- 分发与缓存时长 ---------------------------
 def test_compute_dispatches_by_metric():
     bars = [bar(10, 8, 9), bar(11, 9, 10)]
     assert bm.compute(bm.METRIC_ATR, bars) == 2
-    assert bm.compute(bm.METRIC_RANGE, bars) == 2
+    assert bm.compute(bm.METRIC_RANGE, bars) == 3      # 最高 11 − 最低 8
     assert bm.compute("unknown", bars) == 0.0
 
 

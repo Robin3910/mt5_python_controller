@@ -26,7 +26,7 @@ class FakeMT5:
         self.quotes_calls = 0
         self.bars_calls = 0
         self.fail_bars = False
-        # 每根 K 线高低差固定 2.0，ATR 与最大波幅都等于 2.0
+        # 每根 K 线高低差固定 2.0，ATR 与高低点总跨度都等于 2.0
         self.bar_span = 2.0
 
     def positions(self) -> list[dict]:
