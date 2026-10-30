@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
 from bar_metrics import BAR_PERIOD
+import bar_metrics
 
 # 加仓单备注：R1L0D121 / R1D100 / R1L2Fa1b2c3d4；避开模版2 的 R3B、手动仓 M1/M2、首单任意备注
 _ADD_COMMENT_RE = re.compile(r"^R([12])(?:L|[DPAW]|$)")
@@ -83,6 +84,9 @@ class PositionCtx:
     # ATR / 波幅的预取值（键见 metric_key，值是价格距离）。
     # 判定层不做 I/O，读 K 线由执行器在判定前完成。
     bar_metrics: dict = field(default_factory=dict)
+    # 实时波幅（键同 bar_metrics），值是当前这根未收盘 K 线已走出的高低差。
+    # 只有开启了「波幅纳入当前 K 线」的档位才会被填充；未开启时为空。
+    bar_live: dict = field(default_factory=dict)
     # 逆势偏离基准；未显式传入时回退为 base_price（单测可只填一个价）
     counter_base_price: Optional[float] = None
     # 当前任务的 SMC 价位副本，以及本节点已经用过的记录哈希
@@ -137,6 +141,8 @@ class AddDecision:
     smc_key: str = ""           # symbol|tf|type|side|price 的 8 位哈希，用过即不再用
     smc_side: int = 0           # 1=支撑，-1=阻力
     smc_received_at: float = 0.0
+    # 波幅纳入当前 K 线时的明细；未开启时为 None
+    adapt: Optional[dict] = None
 
     @property
     def event_type(self) -> str:
@@ -343,6 +349,56 @@ class Threshold:
     smc_key: str = ""
     smc_side: int = 0
     smc_received_at: float = 0.0
+    # 波幅纳入当前 K 线时的明细（基线 / 实时 / 生效值 / 是否被裁剪）；未开启时为 None
+    adapt: Optional[dict] = None
+
+
+def _as_bool(value: object, default: bool = False) -> bool:
+    """宽松地读布尔：True / 1 / "1" / "true" 都算真，其余算假。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value or "").strip().lower()
+    if text in ("true", "1", "yes", "on"):
+        return True
+    if text in ("false", "0", "no", "off", ""):
+        return False
+    return default
+
+
+def range_adapt_enabled(level: dict) -> bool:
+    """本档是否启用「波幅纳入当前 K 线」。
+
+    只对「波幅」口径有意义；ATR 是逐根均值，尺度大、上升慢，本次不做。
+    """
+    calc_type = str(level.get("calc_type") or CALC_POINT).strip().lower()
+    if calc_type != CALC_RANGE:
+        return False
+    return _as_bool(level.get("range_include_live"), False)
+
+
+def _adaptive_for_level(
+    level: dict, ctx: PositionCtx, baseline: float, timeframe: str,
+) -> Optional[dict]:
+    """算出本档生效的波幅；没有实时数据时返回 None（退回纯基线）。"""
+    live = _as_float(ctx.bar_live.get(metric_key(CALC_RANGE, timeframe)), 0.0)
+    if live <= 0:
+        return None
+    cap = _as_float(level.get("range_live_cap"), 1000.0)
+    if cap <= 0:
+        cap = 1000.0
+    effective, info = bar_metrics.effective_range(baseline, live, cap)
+    return {
+        "baseline": info["baseline"],
+        "live": info["live"],
+        "effective": info["effective"],
+        "cap": info["cap"],
+        "adapted": info["adapted"],
+        "clamped": info["clamped"],
+        # 重检间隔随明细一起走：限价改价的节流要用它
+        "refresh": max(1.0, _as_float(level.get("range_live_refresh"), 5.0)),
+    }
 
 
 def resolve_threshold(rule_type: int, level: dict, ctx: PositionCtx) -> Threshold:
@@ -387,8 +443,17 @@ def resolve_threshold(rule_type: int, level: dict, ctx: PositionCtx) -> Threshol
     if calc_type in CALC_BAR_TYPES:
         timeframe = str(level.get("timeframe") or "").strip().upper()
         distance = _as_float(ctx.bar_metrics.get(metric_key(calc_type, timeframe)), 0.0)
+        adapt = None
+        # 波幅纳入当前 K 线：取 max(基线, 实时)，急跌时把间距推远。
+        # 只对逆势生效：顺势放大间距等于主动放弃动量（后台也会强制关闭）。
+        if rule_type == RULE_TYPE_COUNTER and range_adapt_enabled(level):
+            adapt = _adaptive_for_level(level, ctx, distance, timeframe)
+            if adapt is not None:
+                distance = adapt["effective"]
         points = distance / ctx.point if ctx.point > 0 and distance > 0 else 0.0
-        return Threshold(points, calc_type, timeframe=timeframe, metric_value=distance)
+        return Threshold(
+            points, calc_type, timeframe=timeframe, metric_value=distance, adapt=adapt,
+        )
 
     return Threshold(_as_float(level.get("point"), 0.0), CALC_POINT)
 
@@ -498,6 +563,7 @@ def _build_decision(
         smc_key=gap.smc_key,
         smc_side=gap.smc_side,
         smc_received_at=gap.smc_received_at,
+        adapt=gap.adapt,
     )
 
 
@@ -634,10 +700,19 @@ def gap_text(decision: AddDecision) -> str:
         )
     if decision.calc_type in CALC_BAR_TYPES:
         label = CALC_TYPE_LABEL[decision.calc_type]
-        return (
+        text = (
             f"{label}({decision.timeframe},{BAR_PERIOD}) "
             f"{_trim(decision.metric_value, 5)}（折合 {points}）"
         )
+        adapt = decision.adapt or {}
+        if adapt.get("adapted"):
+            # 自适应放大：说明基线、实时与生效值，让后台能还原这个决策
+            text = (
+                f"{label}({decision.timeframe},{BAR_PERIOD}) "
+                f"{_trim(adapt.get('baseline'), 5)} → {_trim(adapt.get('effective'), 5)}"
+                f"（当前 K 线实时 {_trim(adapt.get('live'), 5)}，折合 {points}）"
+            )
+        return text
     return f"阈值 {points}"
 
 
@@ -666,6 +741,7 @@ def describe_decision(decision: AddDecision) -> str:
 
 def decision_detail(decision: AddDecision) -> dict:
     """加仓决策的结构化明细，供后台逐项展示计算参数。"""
+    adapt = decision.adapt or {}
     return {
         "kind": "add",
         "rule_type": decision.rule_type,
@@ -690,6 +766,12 @@ def decision_detail(decision: AddDecision) -> dict:
         "smc_key": decision.smc_key or None,
         "smc_side": decision.smc_side or None,
         "smc_received_at": decision.smc_received_at or None,
+        # 波幅纳入当前 K 线：基线 / 实时 / 生效值
+        "baseline_range": adapt.get("baseline"),
+        "live_range": adapt.get("live"),
+        "effective_range": adapt.get("effective"),
+        "range_live_adapted": bool(adapt.get("adapted")),
+        "range_live_clamped": bool(adapt.get("clamped")),
         "base_volume": decision.base_volume,
         "lot_times": decision.lot_times,
         "extra_lot": decision.extra_lot,

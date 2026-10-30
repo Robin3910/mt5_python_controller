@@ -263,6 +263,9 @@ class BatchLevel:
     加仓间距由 calc_type 决定用哪个参数：point 用点数，price 用指定价位，
     atr / range 用 timeframe 周期上的 K 线统计值（间距由行情实时算出）。
     fvg / ob / pdz / fibo 只记录周期标识，触发价由 TradingView 推送。
+
+    range_include_live 让「波幅」间距额外纳入当前这根未收盘 K 线的实时高低差：
+    急跌时大周期档位的限价会被自动推远，避免在下跌中位加仓。仅逆势可用。
     """
     pos_from: int = 1
     pos_to: int = 4
@@ -270,6 +273,10 @@ class BatchLevel:
     point: float = 100.0            # calc_type=point：触发点数
     price: float = 0.0              # calc_type=price：指定的绝对价位
     timeframe: str = DEFAULT_BATCH_TIMEFRAME  # atr / range 的统计周期；SMC 标识的匹配周期
+    # 波幅纳入当前 K 线（仅逆势）
+    range_include_live: bool = False
+    range_live_cap: float = 1000.0
+    range_live_refresh: int = 5
     lot_times: float = 1.1
     extra_lot: float = 0.0
 
@@ -786,6 +793,12 @@ def normalize_batch_level(raw: dict) -> dict[str, Any]:
         # 指定价位是绝对价格，允许为 0（表示未设置，节点侧据此跳过该档）
         "price": max(0.0, _as_float(raw.get("price", 0.0), 0.0)),
         "timeframe": normalize_timeframe(raw.get("timeframe")),
+        # 波幅纳入当前 K 线：只对波幅口径有意义，其余计算方式一律关闭
+        "range_include_live": bool(
+            raw.get("range_include_live", False)
+        ) and calc_type == BATCH_CALC_RANGE,
+        "range_live_cap": max(0.1, _as_float(raw.get("range_live_cap", 1000.0), 1000.0)),
+        "range_live_refresh": max(1, _as_int(raw.get("range_live_refresh", 5), 5)),
         "lot_times": max(0.0, _as_float(raw.get("lot_times", 1.0), 1.0)),
         "extra_lot": max(0.0, _as_float(raw.get("extra_lot", 0.0), 0.0)),
     }
@@ -817,6 +830,12 @@ def _normalize_add_on_rule(rule_type: int, raw: dict) -> dict[str, Any]:
         else default_trend_rule().to_dict()
     )
     action = _normalize_action(raw.get("action"), defaults["action"])
+    levels = _normalize_batch_levels(raw.get("batch_levels", defaults["batch_levels"]))
+    if rule_type == RULE_TYPE_TREND:
+        # 顺势强制关闭「波幅纳入当前 K 线」：放大间距对逆势是「挂得更远、不在半山腰
+        # 接刀」，对顺势是「进场更晚、错过最快的一段」，语义完全相反。
+        for level in levels:
+            level["range_include_live"] = False
     return {
         "type": rule_type,
         "status": _normalize_status(raw, defaults["status"]),
@@ -834,7 +853,7 @@ def _normalize_add_on_rule(rule_type: int, raw: dict) -> dict[str, Any]:
             0.0,
             _as_float(raw.get("total_lot_limit", defaults["total_lot_limit"]), defaults["total_lot_limit"]),
         ),
-        "batch_levels": _normalize_batch_levels(raw.get("batch_levels", defaults["batch_levels"])),
+        "batch_levels": levels,
         "float_pl_ratio": _normalize_signal_float_pl_ratio(
             raw.get("float_pl_ratio", defaults.get("float_pl_ratio")),
         ),
@@ -1160,6 +1179,9 @@ def rules_to_rule_set(rules: object) -> TemplateRuleSet:
                     point=lv["point"],
                     price=lv["price"],
                     timeframe=lv["timeframe"],
+                    range_include_live=lv["range_include_live"],
+                    range_live_cap=lv["range_live_cap"],
+                    range_live_refresh=lv["range_live_refresh"],
                     lot_times=lv["lot_times"],
                     extra_lot=lv["extra_lot"],
                 )

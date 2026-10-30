@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 // 分组信号页：展示某分组处理过的 strategy 主任务与各节点下发明细
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -357,6 +357,13 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
     push('最小变动单位', detail.point)
     push('实际偏离', detail.deviation === undefined ? '' : `${detail.deviation} 点`)
     push('触发阈值', detail.threshold === undefined ? '' : `${detail.threshold} 点`)
+    // 波幅纳入当前 K 线：基线 / 实时 / 生效值，说明这一单的间距是怎么来的
+    if (detail.range_live_adapted) {
+      push('基线波幅', detail.baseline_range)
+      push('当前 K 线实时波幅', detail.live_range)
+      push('生效波幅', detail.effective_range)
+      push('波幅被上限裁剪', detail.range_live_clamped ? '是' : '')
+    }
     push('手数公式', detail.volume_formula)
     push('首单手数（倍率基准）', detail.base_volume)
     push('倍数', detail.lot_times)
@@ -617,6 +624,13 @@ function fmtPayload(raw: unknown): string {
     }
   }
   return JSON.stringify(raw, null, 2)
+}
+
+/** 时延埋点（毫秒）。小于 1ms 显示小数，超过 1s 转成秒更好读。 */
+function fmtMs(ms: number | null | undefined): string {
+  if (ms === null || ms === undefined) return '—'
+  if (ms < 1000) return `${ms.toFixed(1)}ms`
+  return `${(ms / 1000).toFixed(2)}s`
 }
 
 function taskTag(status: string): { cls: string; text: string } {
@@ -911,6 +925,7 @@ onUnmounted(stopAutoRefresh)
                           <th class="right">盈亏</th><th>结束原因</th>
                           <th>订单</th><th class="right">成交价</th>
                           <th>错误</th><th>下发时间</th><th>完成时间</th>
+                          <th class="right">节点排队</th><th class="right">券商往返</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -944,10 +959,12 @@ onUnmounted(stopAutoRefresh)
                             <td class="muted group-break">{{ d.error || '—' }}</td>
                             <td class="muted" style="white-space: nowrap">{{ fmtTime(d.dispatched_at) }}</td>
                             <td class="muted" style="white-space: nowrap">{{ fmtTime(d.finished_at) }}</td>
+                            <td class="right muted">{{ fmtMs(d.queued_ms) }}</td>
+                            <td class="right muted">{{ fmtMs(d.order_to_fill_ms) }}</td>
                           </tr>
                           <tr v-if="isDispatchExpanded(d.id)" class="detail-row">
                             <td></td>
-                            <td colspan="16">
+                            <td colspan="18">
                               <div class="muted" style="font-size: 12px; margin-bottom: 6px">
                                 关联订单 · {{ d.node_name || d.node_id }}
                                 <template v-if="d.magic != null"> · 魔术号 {{ d.magic }}</template>

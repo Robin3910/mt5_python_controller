@@ -20,7 +20,7 @@ from typing import Optional
 
 from sqlalchemy import func, or_, select, update
 
-from . import group_rules
+from . import group_rules, latency_marks
 from .db import SessionLocal
 from .orm import GroupSignalTask, GroupTaskDispatch, GroupTaskEvent, SignalHistory
 
@@ -533,8 +533,12 @@ async def record_skipped_dispatch(
 
 async def set_dispatch_status(
     dispatch_id: int, status: str, *, skip_reason: Optional[str] = None,
+    sent_at: Optional[datetime] = None,
 ) -> Optional[dict]:
-    """更新子任务状态（下发成功 / 失败）。终态时回传需要释放的节点占位。"""
+    """更新子任务状态（下发成功 / 失败）。终态时回传需要释放的节点占位。
+
+    sent_at：服务端发包时刻，写入后成为跨节点唯一可比的时间轴。
+    """
     try:
         async with SessionLocal() as s:
             row = await s.get(GroupTaskDispatch, dispatch_id)
@@ -543,6 +547,8 @@ async def set_dispatch_status(
             row.status = status
             if skip_reason:
                 row.skip_reason = skip_reason
+            if sent_at is not None:
+                row.sent_at = sent_at
             terminal = status in _TERMINAL
             if terminal:
                 row.finished_at = datetime.now()
@@ -601,6 +607,10 @@ async def update_dispatch_result(
                 row.deal = result.get("deal")
                 row.price = result.get("price")
                 row.error = result.get("error")
+                # 时延埋点：节点上报的观测字段，缺失或非法都不影响交易逻辑
+                for key, value in latency_marks.extract(result).items():
+                    if value is not None:
+                        setattr(row, key, value)
                 if success:
                     row.status = "opened"
                     row.opened_at = row.opened_at or now
@@ -1160,6 +1170,10 @@ def _dispatch_row(d: GroupTaskDispatch, node_name: Optional[str]) -> dict:
         "opened_at": d.opened_at.timestamp() if d.opened_at else None,
         "last_report_at": d.last_report_at.timestamp() if d.last_report_at else None,
         "finished_at": d.finished_at.timestamp() if d.finished_at else None,
+        # —— 时延埋点 ——
+        "sent_at": d.sent_at.timestamp() if d.sent_at else None,
+        "queued_ms": d.queued_ms,
+        "order_to_fill_ms": d.order_to_fill_ms,
     }
 
 

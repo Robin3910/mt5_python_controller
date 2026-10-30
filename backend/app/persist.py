@@ -9,6 +9,7 @@ from typing import Optional
 
 from sqlalchemy import and_, delete, func, or_, select, update
 
+from . import latency_marks
 from .db import SessionLocal
 from .orm import (
     AuditLog,
@@ -63,8 +64,12 @@ async def record_signal(signal_id, signal, source_ip=None, parsed_ok=True,
 
 
 async def record_dispatch(signal_id, node_id, decided_vol, gate_result,
-                          skip_reason, status) -> None:
-    """落库一条分发明细（pending / skipped），终态时尝试收口信号整体状态。"""
+                          skip_reason, status, sent_at: Optional[datetime] = None) -> None:
+    """落库一条分发明细（pending / skipped），终态时尝试收口信号整体状态。
+
+    sent_at：服务端把命令交给节点的时刻（发包时刻）。它是跨节点唯一可比的时间轴，
+    缺省时不写该列。
+    """
     try:
         async with SessionLocal() as s:
             s.add(
@@ -76,6 +81,7 @@ async def record_dispatch(signal_id, node_id, decided_vol, gate_result,
                     skip_reason=skip_reason,
                     status=status,
                     dispatched_at=datetime.now(),
+                    sent_at=sent_at,
                 )
             )
             if status in _DISPATCH_TERMINAL:
@@ -149,25 +155,31 @@ async def update_signal_status(signal_id: str, status: str) -> None:
 
 
 async def update_dispatch_result(signal_id, node_id, status, result: Optional[dict] = None) -> None:
-    """根据节点回报更新分发明细的最终结果，并尝试收口信号整体状态。"""
+    """根据节点回报更新分发明细的最终结果，并尝试收口信号整体状态。
+
+    回报里若带时延埋点（recv_at / order_at / filled_at / queued_ms /
+    order_to_fill_ms），一并落库——这些是观测字段，缺失或非法都不影响交易逻辑。
+    """
     result = result or {}
     try:
         async with SessionLocal() as s:
+            values: dict = {
+                "status": status,
+                "retcode": result.get("retcode"),
+                "order_ticket": result.get("order") or result.get("ticket"),
+                "deal": result.get("deal"),
+                "price": result.get("price"),
+                "error": result.get("error"),
+                "finished_at": datetime.now(),
+            }
+            values.update(latency_marks.extract(result))
             await s.execute(
                 update(SignalDispatch)
                 .where(
                     SignalDispatch.signal_id == signal_id,
                     SignalDispatch.node_id == node_id,
                 )
-                .values(
-                    status=status,
-                    retcode=result.get("retcode"),
-                    order_ticket=result.get("order") or result.get("ticket"),
-                    deal=result.get("deal"),
-                    price=result.get("price"),
-                    error=result.get("error"),
-                    finished_at=datetime.now(),
-                )
+                .values(**values)
             )
             hist_vals: dict = {}
             if result.get("symbol"):
@@ -254,6 +266,13 @@ def _dispatch_rows(rows) -> list[dict]:
             "error": d.error,
             "dispatched_at": d.dispatched_at.timestamp() if d.dispatched_at else None,
             "finished_at": d.finished_at.timestamp() if d.finished_at else None,
+            # —— 时延埋点 ——
+            # sent_at：服务端发包时刻（跨节点唯一可比的时间轴）
+            "sent_at": d.sent_at.timestamp() if d.sent_at else None,
+            # queued_ms：节点内部排队耗时；order_to_fill_ms：券商往返耗时
+            # （两者都是同一节点内的差值，跨机时钟不可比，只在同节点内有效）
+            "queued_ms": d.queued_ms,
+            "order_to_fill_ms": d.order_to_fill_ms,
         }
         for d, sig in rows
     ]
@@ -301,6 +320,10 @@ def _signal_dispatch_row(d: SignalDispatch, node_name: Optional[str]) -> dict:
         "error": d.error,
         "dispatched_at": d.dispatched_at.timestamp() if d.dispatched_at else None,
         "finished_at": d.finished_at.timestamp() if d.finished_at else None,
+        # —— 时延埋点 ——
+        "sent_at": d.sent_at.timestamp() if d.sent_at else None,
+        "queued_ms": d.queued_ms,
+        "order_to_fill_ms": d.order_to_fill_ms,
     }
 
 

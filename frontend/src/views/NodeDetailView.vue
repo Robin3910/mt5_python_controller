@@ -57,6 +57,10 @@ const PAGE_SIZE_TAGS: TagOption<number>[] = [
 ]
 // 趋势面板带 echarts，异步加载让图表库不进节点详情页首屏 chunk（只在打开该 tab 时拉取）
 const TrendPanel = defineAsyncComponent(() => import('@/components/TrendPanel.vue'))
+// 历史盈亏面板同样带 echarts（内部再异步加载柱状图），用同样的异步方式
+const NodePerformancePanel = defineAsyncComponent(
+  () => import('@/components/NodePerformancePanel.vue'),
+)
 
 const route = useRoute()
 const router = useRouter()
@@ -581,6 +585,12 @@ function fmtChange(n: number | undefined | null): string {
 function fmtTime(ms: number | undefined | null): string {
   return ms ? new Date(ms).toLocaleString() : '—'
 }
+/** 时延埋点（毫秒）。小于 1ms 显示小数，超过 1s 转成秒更好读。 */
+function fmtMs(ms: number | null | undefined): string {
+  if (ms === null || ms === undefined) return '—'
+  if (ms < 1000) return `${ms.toFixed(1)}ms`
+  return `${(ms / 1000).toFixed(2)}s`
+}
 function feedTag(status: string): { cls: string; text: string } {
   const m: Record<string, { cls: string; text: string }> = {
     done: { cls: 'green', text: '成功' },
@@ -680,6 +690,10 @@ async function closeTicket(ticket: number): Promise<void> {
             <div class="kv"><span class="k">最近上报</span><span class="v" style="font-size: 12px">{{ fmtTime((acct.updated_at || 0) * 1000) }}</span></div>
           </div>
           <div v-else class="muted" style="font-size: 12px; margin-top: 8px">暂无账户快照（节点未上线或尚未上报）。</div>
+        </div>
+
+        <div class="card card-pad" style="margin-bottom: 16px">
+          <NodePerformancePanel :node-id="id" />
         </div>
 
         <div class="card card-pad">
@@ -1122,6 +1136,8 @@ async function closeTicket(ticket: number): Promise<void> {
                       <div class="kv"><span class="k">错误</span><span class="v" style="font-size: 12px">{{ s.error || '—' }}</span></div>
                       <div class="kv"><span class="k">下发时间</span><span class="v" style="font-size: 12px">{{ fmtTime((s.dispatched_at || 0) * 1000) }}</span></div>
                       <div class="kv"><span class="k">完成时间</span><span class="v" style="font-size: 12px">{{ fmtTime((s.finished_at || 0) * 1000) }}</span></div>
+                      <div class="kv"><span class="k">节点排队</span><span class="v" style="font-size: 12px">{{ fmtMs(s.queued_ms) }}</span></div>
+                      <div class="kv"><span class="k">券商往返</span><span class="v" style="font-size: 12px">{{ fmtMs(s.order_to_fill_ms) }}</span></div>
                     </div>
                   </div>
                   <div v-if="s.raw_payload" style="margin-top: 10px">

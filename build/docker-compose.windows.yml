@@ -52,7 +52,8 @@ services:
     expose:
       - 3306
     ports:
-      - 3306:3306
+      # 本机 3306 可能被原生 MySQL 占用，可用 .env 的 MYSQL_PORT 改（默认 3306）
+      - "${MYSQL_PORT:-3306}:3306"
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${MYSQL_ROOT_PASSWORD:-rootpwd}"]
       interval: 10s

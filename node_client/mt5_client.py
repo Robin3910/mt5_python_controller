@@ -510,7 +510,11 @@ class MT5Client:
                            sl: Optional[float] = None, tp: Optional[float] = None,
                            comment: str = "", magic: Optional[int] = None,
                            max_retry: int = 3) -> dict:
-        """下市价单。内部循环处理：填充模式切换(10030) + 瞬时错误重试(刷新价格)。"""
+        """下市价单。内部循环处理：填充模式切换(10030) + 瞬时错误重试(刷新价格)。
+
+        返回值额外带两个内部时刻（`_order_at` / `_filled_at`）：下单前与返回后的
+        本地时刻，供上层算「券商往返耗时」。它们是观测字段，不参与任何交易判断。
+        """
         self.ensure()
         resolved = self.resolve_symbol(symbol)
         if not resolved:
@@ -521,6 +525,9 @@ class MT5Client:
         fill_idx = 0     # 当前尝试的填充模式下标
         attempt = 0      # 瞬时错误重试计数
         last = None
+        # 下单时刻（第一次真正调 order_send 之前）；填了也不会用
+        order_at = 0.0
+        filled_at = 0.0
 
         while attempt <= max_retry and fill_idx < len(fillings):
             # 每次都重新取价（重试时价格可能已变）
@@ -545,7 +552,9 @@ class MT5Client:
             if tp:
                 request["tp"] = float(tp)
 
+            order_at = time.time()
             result = mt5.order_send(request)
+            filled_at = time.time()
             last = result
             if result is None:
                 logger.error("order_send returned None: %s", mt5.last_error())
@@ -563,6 +572,8 @@ class MT5Client:
                     "deal": result.deal,
                     "volume": result.volume,
                     "price": result.price,
+                    "_order_at": order_at,
+                    "_filled_at": filled_at,
                 }
             if rc == RET_INVALID_FILL:
                 fill_idx += 1  # 换下一种填充模式（不消耗重试次数）
@@ -573,13 +584,19 @@ class MT5Client:
                 _backoff_sleep(attempt, max_retry)
                 continue
             # 其余视为致命错误，直接返回
-            return {"success": False, "symbol": symbol, "retcode": rc, "error": result.comment}
+            return {
+                "success": False, "symbol": symbol, "retcode": rc,
+                "error": result.comment,
+                "_order_at": order_at, "_filled_at": filled_at,
+            }
 
         return {
             "success": False,
             "symbol": symbol,
             "retcode": getattr(last, "retcode", None),
             "error": getattr(last, "comment", "order failed after retries"),
+            "_order_at": order_at,
+            "_filled_at": filled_at,
         }
 
     def _pending_price_status(self, symbol: str, action: str, price: float,
@@ -647,6 +664,8 @@ class MT5Client:
 
         与市价单的关键差别：价格由调用方给定，不刷新、不重取，因此瞬时错误重试也
         不会改价；请求里没有 deviation（挂单按挂单价成交，没有滑点容忍的概念）。
+
+        返回值同样带 `_order_at` / `_filled_at` 两个内部时刻（观测字段）。
         """
         self.ensure()
         resolved = self.resolve_symbol(symbol)
@@ -665,6 +684,8 @@ class MT5Client:
         fill_idx = 0
         attempt = 0
         last = None
+        order_at = 0.0
+        filled_at = 0.0
 
         while attempt <= max_retry and fill_idx < len(fillings):
             request = {
@@ -683,7 +704,9 @@ class MT5Client:
             if tp:
                 request["tp"] = float(tp)
 
+            order_at = time.time()
             result = mt5.order_send(request)
+            filled_at = time.time()
             last = result
             if result is None:
                 logger.error("pending order_send returned None: %s", mt5.last_error())
@@ -702,6 +725,8 @@ class MT5Client:
                     "order": result.order,
                     "volume": float(volume),
                     "price": float(price),
+                    "_order_at": order_at,
+                    "_filled_at": filled_at,
                 }
             if rc == RET_INVALID_FILL:
                 fill_idx += 1
@@ -710,13 +735,19 @@ class MT5Client:
                 attempt += 1
                 _backoff_sleep(attempt, max_retry)
                 continue
-            return {"success": False, "symbol": symbol, "retcode": rc, "error": result.comment}
+            return {
+                "success": False, "symbol": symbol, "retcode": rc,
+                "error": result.comment,
+                "_order_at": order_at, "_filled_at": filled_at,
+            }
 
         return {
             "success": False,
             "symbol": symbol,
             "retcode": getattr(last, "retcode", None),
             "error": getattr(last, "comment", "pending order failed after retries"),
+            "_order_at": order_at,
+            "_filled_at": filled_at,
         }
 
     def modify_pending_order(self, ticket: int, price: float,
@@ -1114,6 +1145,77 @@ class MT5Client:
             start = end - timedelta(days=7)
         return mt5.history_deals_get(start, end) or ()
 
+    def history_deals_since(self, since_ts: float, after_deal_id: int = 0) -> list[dict]:
+        """取 (since_ts, ∞) 内且成交号大于 `after_deal_id` 的成交，标准化字段返回。
+
+        增量采集用。**读失败必须抛错，不能返回空列表** —— 调用方据此决定是否推进
+        同步游标；若把「读失败」当成「没有新成交」，那段历史就永久丢了。
+
+        时间窗取宽（回看 2 分钟），再用成交号做精确去重：同一秒内可能有多笔成交，
+        只按时间戳过滤会漏单（见 deal_cursor 的说明）。
+
+        返回的每项含 deal_id / order_id / position_id / symbol / direction /
+        entry_type / reason / volume / price / profit / swap / commission /
+        magic / comment / time。
+        """
+        self.ensure()
+        from datetime import datetime, timedelta
+
+        # MT5 的 DEAL_ENTRY_* / DEAL_TYPE_* 常量；包不可用时回退到文档值
+        entry_in = int(getattr(mt5, "DEAL_ENTRY_IN", 0) if mt5 else 0)
+        entry_out = int(getattr(mt5, "DEAL_ENTRY_OUT", 1) if mt5 else 1)
+        entry_inout = int(getattr(mt5, "DEAL_ENTRY_INOUT", 2) if mt5 else 2)
+        entry_out_by = int(getattr(mt5, "DEAL_ENTRY_OUT_BY", 3) if mt5 else 3)
+        type_buy = int(getattr(mt5, "DEAL_TYPE_BUY", 0) if mt5 else 0)
+        type_sell = int(getattr(mt5, "DEAL_TYPE_SELL", 1) if mt5 else 1)
+
+        entry_names = {
+            entry_in: "IN",
+            entry_out: "OUT",
+            entry_inout: "INOUT",
+            entry_out_by: "OUT_BY",
+        }
+        type_names = {type_buy: "BUY", type_sell: "SELL"}
+
+        end = datetime.now()
+        start = datetime.fromtimestamp(float(since_ts)) - timedelta(minutes=2)
+        rows = mt5.history_deals_get(start, end)
+        # None = 读失败（与「确实没有成交」必须区分开），失败直接抛错
+        rows = mt5_book_rows(rows, api_name="history_deals_get")
+
+        floor = int(after_deal_id or 0)
+        out: list[dict] = []
+        for d in rows:
+            deal_id = int(getattr(d, "ticket", 0) or 0)
+            if deal_id <= floor:
+                continue
+            entry = int(getattr(d, "entry", entry_in) or entry_in)
+            dtype = int(getattr(d, "type", type_buy) or type_buy)
+            profit = float(getattr(d, "profit", 0) or 0)
+            swap = float(getattr(d, "swap", 0) or 0)
+            commission = float(getattr(d, "commission", 0) or 0)
+            out.append({
+                "deal_id": deal_id,
+                "order_id": int(getattr(d, "order", 0) or 0),
+                "position_id": int(getattr(d, "position_id", 0) or 0),
+                "symbol": str(getattr(d, "symbol", "") or ""),
+                "direction": type_names.get(dtype, "BUY"),
+                "entry_type": entry_names.get(entry, "IN"),
+                "reason": int(getattr(d, "reason", 0) or 0),
+                "volume": float(getattr(d, "volume", 0) or 0),
+                "price": float(getattr(d, "price", 0) or 0),
+                "profit": profit,
+                "swap": swap,
+                "commission": commission,
+                "net_profit": round(profit + swap + commission, 8),
+                "magic": int(getattr(d, "magic", 0) or 0),
+                "comment": str(getattr(d, "comment", "") or "")[:128],
+                "time": float(getattr(d, "time", 0) or 0),
+            })
+        # 按成交时间升序返回，服务端按序入库便于推进游标
+        out.sort(key=lambda r: (r["time"], r["deal_id"]))
+        return out
+
     def realized_profit_by_magic(self, magic: int, since_ts: float | None = None) -> float:
         """汇总某魔术号在时间窗内的已实现盈亏（成交 profit + swap + commission）。
 
@@ -1308,6 +1410,43 @@ class MT5Client:
             }
             for r in rates
         ]
+
+    def recent_bars(self, symbol: str, timeframe: str, count: int) -> list[dict]:
+        """取最近 count 根 K 线（**含**当前未收盘那根），按时间升序返回。
+
+        与 closed_bars 的区别只在起点：这里从 index 0 起取，第一根就是当前正在
+        走的那根 K 线，后面才是已收盘的。一次读取就能同时拿到「实时根」与
+        「已收盘窗口」，两者天然一致 —— 波幅自适应必须这样读，否则 K 线收盘的
+        瞬间实时值归零而基线还停留在旧缓存，有效波幅会塌陷、限价单被猛地拉回。
+
+        取不到时返回空列表，由调用方决定跳过判定。
+        """
+        self.ensure()
+        tf = TIMEFRAMES.get(str(timeframe or "").strip().upper())
+        if tf is None or count <= 0:
+            return []
+        resolved = self.resolve_symbol(symbol)
+        if not resolved:
+            return []
+        rates = mt5.copy_rates_from_pos(resolved, tf, 0, int(count))
+        if rates is None or len(rates) == 0:
+            logger.debug("no recent bars for %s %s: %s", resolved, timeframe, mt5.last_error())
+            return []
+        return [
+            {
+                "time": float(r["time"]),
+                "open": float(r["open"]),
+                "high": float(r["high"]),
+                "low": float(r["low"]),
+                "close": float(r["close"]),
+            }
+            for r in rates
+        ]
+
+    def current_bar(self, symbol: str, timeframe: str) -> dict:
+        """取当前**未收盘**的那根 K 线（index 0）；取不到返回空 dict。"""
+        bars = self.recent_bars(symbol, timeframe, 1)
+        return bars[0] if bars else {}
 
     def close_symbol(self, symbol: str) -> dict:
         """平掉某品种的所有持仓并撤掉其挂单（兼容券商后缀）。"""

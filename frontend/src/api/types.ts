@@ -532,6 +532,12 @@ export interface StrategyBatchLevel {
   price: number
   /** atr / range 的统计周期，或 SMC 标识用来匹配推送的周期 */
   timeframe: BatchTimeframe
+  /** 波幅间距是否纳入当前未收盘 K 线的实时高低差（仅逆势可用） */
+  range_include_live: boolean
+  /** 纳入实时后的波幅上限倍数（基线 × 该值） */
+  range_live_cap: number
+  /** 重检间隔（秒）：刷新实时波幅的节奏，也是限价改价的最小间隔 */
+  range_live_refresh: number
   lot_times: number
   extra_lot: number
 }
@@ -758,6 +764,13 @@ export interface GroupTaskDispatchRecord {
   opened_at: number | null
   last_report_at: number | null
   finished_at: number | null
+  // —— 时延埋点（观测用）——
+  /** 服务端发包时刻（Unix 秒）；跨节点唯一可比的时间轴 */
+  sent_at: number | null
+  /** 节点内部排队耗时（毫秒）：从读到命令到真正调 order_send */
+  queued_ms: number | null
+  /** 券商往返耗时（毫秒）：从 order_send 到拿到成交价 */
+  order_to_fill_ms: number | null
 }
 
 /** 分组信号主任务：分发记录；魔术号在各节点子任务上，主任务不持有 */
@@ -877,6 +890,17 @@ export interface GroupTaskEventDetail {
   smc_key?: string
   smc_side?: number
   smc_received_at?: number
+  // —— 波幅纳入当前 K 线 ——
+  /** 基线波幅（14 根已收盘 K 线的高低点总跨度） */
+  baseline_range?: number | null
+  /** 实时波幅（当前这根未收盘 K 线已走出的高低差） */
+  live_range?: number | null
+  /** 最终生效波幅 */
+  effective_range?: number | null
+  /** 是否发生了自适应放大 */
+  range_live_adapted?: boolean
+  /** 是否被上限裁剪 */
+  range_live_clamped?: boolean
   // —— 首单（kind=open）——
   signal_id?: string
   task_id?: number
@@ -1105,6 +1129,13 @@ export interface NodeDispatchRecord {
   error: string | null
   dispatched_at: number | null
   finished_at: number | null
+  // —— 时延埋点（观测用）——
+  /** 服务端发包时刻（Unix 秒）；跨节点唯一可比的时间轴 */
+  sent_at: number | null
+  /** 节点内部排队耗时（毫秒）：从读到命令到真正调 order_send */
+  queued_ms: number | null
+  /** 券商往返耗时（毫秒）：从 order_send 到拿到成交价 */
+  order_to_fill_ms: number | null
 }
 
 export interface PaginatedNodeDispatches {
@@ -1112,6 +1143,101 @@ export interface PaginatedNodeDispatches {
   total: number
   page: number
   page_size: number
+}
+
+/** 单笔 MT5 成交明细。 */
+export interface DealRecord {
+  id: number
+  node_id: string
+  /** MT5 成交票号（deal.ticket） */
+  deal_id: number
+  order_id: number | null
+  position_id: number | null
+  symbol: string | null
+  /** 成交方向（MT5 原始方向：平多单是 SELL） */
+  direction: 'BUY' | 'SELL' | string
+  /**
+   * 出场成交的方向色按「被平掉的那个持仓的方向」取。
+   * 平多单在 MT5 里是 SELL，直接展示 direction 会让人误以为又开了空仓。
+   */
+  position_direction: 'BUY' | 'SELL' | string
+  /** 开仓 / 平仓 / 双向 / 对冲平仓 */
+  entry_type: 'IN' | 'OUT' | 'INOUT' | 'OUT_BY' | string
+  /** 开平仓的人读标签：开仓 / 平仓 / 双向 / 对冲平仓 */
+  entry_label: string
+  /** MT5 DEAL_REASON：0=客户端 1=移动 2=网页 3=专家 4=止损 5=止盈 6=对手方 */
+  reason: number
+  volume: number
+  price: number
+  profit: number
+  swap: number
+  commission: number
+  net_profit: number
+  magic: number | null
+  comment: string | null
+  /** 来源：terminal / strategy / signal / manual */
+  source: string
+  /** 来源的人读标签：终端 / 策略 / 信号 / 手工 */
+  source_label: string
+  signal_id: string | null
+  task_id: number | null
+  group_id: string | null
+  deal_time: number
+}
+
+/** 成交汇总（统计口径集中在后端 deal_stats，前端直接展示不要自己再算）。 */
+export interface DealSummary {
+  total_profit: number
+  profit_rate: number
+  win_rate: number
+  /** 交易笔数 = 持仓数（position_id 聚合），不是成交笔数 */
+  total_trades: number
+  win_trades: number
+  lose_trades: number
+  gross_volume: number
+  commission_total: number
+  swap_total: number
+  /** 区间期初权益（收益率的分母） */
+  base_equity: number
+  /** 期初权益拿不到时收益率为 0 且此标志为 false（前端应显示「暂无数据」） */
+  profit_rate_valid: boolean
+  /** 节点未上报 / 无成交 / 同步未开 —— 与「有数据但全亏」区分开 */
+  data_available: boolean
+  updated_at: number | null
+}
+
+export interface PaginatedDeals {
+  items: DealRecord[]
+  total: number
+  page: number
+  page_size: number
+  /** 与 items 同一 WHERE 条件算出的汇总 */
+  summary: DealSummary
+}
+
+/**
+ * 节点每日已实现净盈亏（柱状图数据源）。
+ *
+ * 日期由后端按节点所在时区分好，前端只显示 `date` 字符串，不再本地换算
+ * （服务端与浏览器分属不同机器/时区，前端换算会整体错位一天）。
+ */
+export interface NodeDailyProfitPoint {
+  date: string
+  /** 该日 00:00 的 Unix 秒 */
+  ts: number
+  /** 当日已实现净盈亏 */
+  profit: number
+  /** 当日出场成交笔数 */
+  deals: number
+}
+
+/** 节点绩效（汇总 + 按日序列），节点详情页概览用。 */
+export interface NodePerformance {
+  node_id: string
+  /** 统计窗口：7d / 30d / 90d / all */
+  window: string
+  summary: DealSummary
+  daily: NodeDailyProfitPoint[]
 }
 
 export interface SignalEventDispatch {
@@ -1129,6 +1255,13 @@ export interface SignalEventDispatch {
   error: string | null
   dispatched_at: number | null
   finished_at: number | null
+  // —— 时延埋点（观测用）——
+  /** 服务端发包时刻（Unix 秒）；跨节点唯一可比的时间轴 */
+  sent_at: number | null
+  /** 节点内部排队耗时（毫秒）：从读到命令到真正调 order_send */
+  queued_ms: number | null
+  /** 券商往返耗时（毫秒）：从 order_send 到拿到成交价 */
+  order_to_fill_ms: number | null
 }
 
 export interface SignalEventRecord {

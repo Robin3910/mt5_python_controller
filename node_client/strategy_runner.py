@@ -31,6 +31,7 @@ import time
 from typing import Callable, Optional
 
 import grid_trading
+import latency_marks
 import manual_scatter
 import risk_sizing
 import signal_pl
@@ -39,6 +40,7 @@ from risk_sizing import EntryPlan, RiskSizedConfig, SymbolSpec
 import close_reason
 from strategy_rules import (
     CALC_BAR_TYPES,
+    CALC_RANGE,
     MT5_COMMENT_LIMIT,
     RULE_TYPE_COUNTER,
     RULE_TYPE_TREND,
@@ -56,6 +58,7 @@ from strategy_rules import (
     metric_key,
     parse_add_rule_type,
     plan_counter_limit,
+    range_adapt_enabled,
     smc_key_from_comment,
 )
 
@@ -153,6 +156,7 @@ class StrategyRunner:
         send_fn: Callable,
         report_interval: float = 5.0,
         runtime: Optional[dict] = None,
+        recv_at: Optional[float] = None,
     ) -> None:
         self.task_id = int(task_id)
         self.magic = int(magic)
@@ -167,6 +171,8 @@ class StrategyRunner:
         self._exec = exec_fn      # async (fn, *args) -> result，把阻塞 MT5 调用丢线程池
         self._send = send_fn      # async (dict) -> None，向服务端发消息
         self.report_interval = max(1.0, float(report_interval or 5.0))
+        # strategy_start 命令被读到的时刻（节点本地时钟）：首单时延埋点的起点
+        self._recv_at = float(recv_at) if recv_at is not None else time.time()
 
         self.symbol = str(self.entry.get("symbol") or "")
         self.direction = str(self.entry.get("action") or "BUY").upper()
@@ -192,6 +198,10 @@ class StrategyRunner:
         self._last_floating_profit = 0.0
         self._last_position_profits: dict[int, float] = {}
         self._metric_specs: Optional[list[tuple[str, str]]] = None
+        # 需要实时口径的 (周期, 重检间隔)；None 表示还没解析过
+        self._live_specs: Optional[list[tuple[str, float]]] = None
+        # 逆势限价的改价限流：ticket -> 上次改价时刻
+        self._counter_modify_at: dict[int, float] = {}
 
         # 三条互斥执行路径：网格 > 以损定量 > 加仓（按规则 type 优先级）
         grid_rule = grid_trading.pick_grid_rule(self.strategy.get("rules"))
@@ -345,6 +355,7 @@ class StrategyRunner:
         self._lot_sltp_dirty = True
         self._lot_sltp_fail_at = 0.0
         self._metric_specs = None
+        self._live_specs = None
         self._counter_resync = True
         if self._sub is not None:
             self._sub.wake()
@@ -535,10 +546,11 @@ class StrategyRunner:
             report_due = time.time() - self._last_report >= self.report_interval
             opened_manual = await self._maybe_open_manual_scatter(event, positions)
             filtered = manual_scatter.exclude_manual(positions)
-            metrics = await self._read_bar_metrics()
+            metrics, lives = await self._read_bars()
             if filtered:
                 ctx = self._ctx(event, filtered)
                 ctx.bar_metrics = metrics
+                ctx.bar_live = lives
                 # 逆势走限价，市价判定只留给顺势
                 decision = evaluate(
                     self.strategy.get("rules") or [], ctx,
@@ -546,7 +558,7 @@ class StrategyRunner:
                 )
                 if decision is not None:
                     await self._add_position(decision, positions)
-            await self._sync_counter_limit(event, positions, metrics)
+            await self._sync_counter_limit(event, positions, metrics, lives)
             if opened_manual:
                 return False
             if report_due:
@@ -581,9 +593,47 @@ class StrategyRunner:
         self._metric_specs = specs
         return specs
 
+    def _live_range_specs(self) -> list[tuple[str, float]]:
+        """扫策略快照，收集需要「实时波幅」的 (周期, 重检间隔) 组合。
+
+        只有开启了「波幅纳入当前 K 线」的档位才需要；这些档位走一次读取
+        （pos=0）同时拿到基线与实时，不再走只读已收盘的旧路径——否则两者
+        不是同一次读取，K 线收盘的瞬间有效波幅会塌陷。
+        """
+        if self._live_specs is not None:
+            return self._live_specs
+        specs: list[tuple[str, float]] = []
+        for rule in self.strategy.get("rules") or []:
+            if not isinstance(rule, dict) or not rule.get("batch_enabled"):
+                continue
+            if int(rule.get("type") or RULE_TYPE_COUNTER) != RULE_TYPE_COUNTER:
+                continue  # 顺势强制关闭
+            for level in rule.get("batch_levels") or []:
+                if not isinstance(level, dict):
+                    continue
+                if not range_adapt_enabled(level):
+                    continue
+                tf = str(level.get("timeframe") or "").strip().upper()
+                if not tf:
+                    continue
+                refresh = max(1.0, float(level.get("range_live_refresh") or 5.0))
+                spec = (tf, refresh)
+                if spec not in specs:
+                    specs.append(spec)
+        self._live_specs = specs
+        return specs
+
     async def _read_bar_metrics(self) -> dict[str, float]:
-        """判定前预取 ATR / 波幅。取值走 MarketHub 的按周期缓存，不会每轮都读 K 线。"""
-        specs = self._bar_metric_specs()
+        """判定前预取 ATR / 波幅。取值走 MarketHub 的按周期缓存，不会每轮都读 K 线。
+
+        开启了「波幅纳入当前 K 线」的档位不在这里取值——它们由
+        _read_live_ranges 单独读（基线与实时必须同源）。
+        """
+        live_timeframes = {tf for tf, _ in self._live_range_specs()}
+        specs = [
+            spec for spec in self._bar_metric_specs()
+            if not (spec[0] == CALC_RANGE and spec[1] in live_timeframes)
+        ]
         if not specs:
             return {}
         metrics: dict[str, float] = {}
@@ -592,6 +642,37 @@ class StrategyRunner:
             if value > 0:
                 metrics[metric_key(metric, timeframe)] = value
         return metrics
+
+    async def _read_live_ranges(self) -> tuple[dict[str, float], dict[str, float]]:
+        """读取需要实时口径的波幅档位，返回 (基线表, 实时表)。
+
+        一次读取同时拿到两者：分开读的话，K 线收盘的瞬间实时值归零而基线
+        还停留在旧缓存，有效波幅会从 200 塌回 50，限价单被猛地拉回来成交在最低点。
+        """
+        specs = self._live_range_specs()
+        if not specs:
+            return {}, {}
+        baselines: dict[str, float] = {}
+        lives: dict[str, float] = {}
+        for timeframe, refresh in specs:
+            baseline, live = await self._hub.bar_range_pair(
+                self.symbol, timeframe, refresh=refresh,
+            )
+            if baseline > 0:
+                baselines[metric_key(CALC_RANGE, timeframe)] = baseline
+                lives[metric_key(CALC_RANGE, timeframe)] = live
+        return baselines, lives
+
+    async def _read_bars(self) -> tuple[dict[str, float], dict[str, float]]:
+        """预取本拍判定需要的全部 K 线指标，返回 (基线表, 实时表)。
+
+        基线表含 ATR 与未开启实时的波幅档位；实时表只含开启了「波幅纳入
+        当前 K 线」的档位（其基线也一并给出，两者同源）。
+        """
+        metrics = await self._read_bar_metrics()
+        baselines, lives = await self._read_live_ranges()
+        metrics.update(baselines)
+        return metrics, lives
 
     def _ctx(self, event: MarketEvent, positions: list[dict]) -> PositionCtx:
         """加仓判定上下文：顺势取最近一笔；逆势取不利方向最深开仓价（通常即首仓）。"""
@@ -926,6 +1007,19 @@ class StrategyRunner:
             tp = signal_tp
         return sl, tp
 
+    def _attach_latency_marks(self, res: dict) -> dict:
+        """给下单回报并上时延埋点（观测字段，不参与交易判断）。
+
+        MT5 客户端在真正调 `order_send` 前后各记了一个时刻，取出后换算成
+        「节点内部排队耗时」与「券商往返耗时」。取不到就退回当前时刻，
+        保证字段口径一致（宁可不准，也不要缺列）。
+        """
+        order_at = res.pop("_order_at", None) or time.time()
+        filled_at = res.pop("_filled_at", None) or time.time()
+        return latency_marks.merge(res, latency_marks.build(
+            recv_at=self._recv_at, order_at=order_at, filled_at=filled_at,
+        ))
+
     async def _open_first(self) -> bool:
         """下首单；失败直接结束子任务（服务端会据此收口）。
 
@@ -950,6 +1044,7 @@ class StrategyRunner:
         res["task_id"] = self.task_id
         res["magic"] = self.magic
         res.setdefault("symbol", self.symbol)
+        self._attach_latency_marks(res)
         await self._send({"type": "trade_result", "data": res})
 
         if not res.get("success"):
@@ -974,6 +1069,51 @@ class StrategyRunner:
     def _stops_differ(self, left: float, right: float, point: float) -> bool:
         tol = point if point > 0 else 1e-9
         return abs(_as_float(left) - _as_float(right)) >= tol
+
+    def _counter_reprice_limits(
+        self, plan, old_price: float, point: float,
+    ) -> tuple[float, float]:
+        """逆势限价改价的 (价格死区, 最小改价间隔)。
+
+        未开启「波幅纳入当前 K 线」时沿用原来的 1 个最小变动单位、无限流。
+
+        开启后间距会随行情实时变化，没有节流就会每拍都发一次改单，券商侧
+        改单频率过高。死区按方向不对称：
+        - 限价被推远（远离现价）：保护性动作，急 → 小死区、立即改；
+        - 限价被拉回（靠近现价）：行情已恢复，不急 → 大死区、两倍间隔。
+        """
+        adapt = getattr(plan, "adapt", None) or {}
+        if not adapt.get("adapted"):
+            return point, 0.0
+        effective = _as_float(adapt.get("effective"), 0.0)
+        if effective <= 0:
+            return point, 0.0
+        base = max(point, effective * 0.01)
+        new_price = _as_float(getattr(plan, "limit_price", 0.0), 0.0)
+        old = _as_float(old_price, 0.0)
+        pushed_away = False
+        if new_price > 0 and old > 0:
+            # 多单限价在下侧：挂单价变低 = 推远；空单在上侧：挂单价变高 = 推远
+            direction = str(getattr(plan, "direction", "") or "").upper()
+            if direction == "BUY":
+                pushed_away = new_price < old
+            else:
+                pushed_away = new_price > old
+        refresh = max(1.0, float(adapt.get("refresh") or 5.0))
+        if pushed_away:
+            return base, refresh
+        return max(point, effective * 0.03), refresh * 2
+
+    def _counter_modify_allowed(self, ticket: int, min_interval: float) -> bool:
+        """改价节流：距上次改价不足最小间隔就不改。"""
+        if min_interval <= 0:
+            return True
+        now = time.time()
+        last = self._counter_modify_at.get(int(ticket or 0))
+        if last is not None and now - last < min_interval:
+            return False
+        self._counter_modify_at[int(ticket or 0)] = now
+        return True
 
     async def _counter_resting_orders(self) -> Optional[list[dict]]:
         """该魔术号上备注为逆势加仓的在途限价。读失败返回 None。"""
@@ -1106,13 +1246,19 @@ class StrategyRunner:
 
     async def _place_counter_limit(
         self, plan, positions: list[dict], comment: str,
-        sl: Optional[float], tp: Optional[float],
     ) -> None:
+        """挂出下一档逆势限价。
+
+        挂单上**不写止损止盈**：限价的成交价是挂单价，而挂单价会随波幅自适应
+        不断被推远，按现价算出来的止损可能落到入场价上方，券商会直接拒掉整张
+        挂单（error 130 invalid stops）。限价成交后 `_lot_sltp_sync` 会按真实持仓
+        重算并改单，风险敞口只差一个采样周期。
+        """
         try:
             res = dict(await self._exec(
                 self._mt5.place_pending_order,
                 self.symbol, plan.action, plan.volume, plan.limit_price,
-                sl, tp, comment, self.magic, "limit",
+                None, None, comment, self.magic, "limit",
             ) or {})
         except Exception as e:  # noqa: BLE001
             logger.warning("task %s place counter limit failed: %s", self.task_id, e)
@@ -1142,10 +1288,13 @@ class StrategyRunner:
         )
 
     async def _align_counter_order(
-        self, plan, positions: list[dict], resting: list[dict],
-        sl: Optional[float], tp: Optional[float], *, point: float,
+        self, plan, positions: list[dict], resting: list[dict], *, point: float,
     ) -> None:
-        """在途的那一张和计划对齐：身份变了就撤掉重挂，只变价或止损就改单。"""
+        """在途的那一张和计划对齐：身份变了就撤掉重挂，只变价就改单。
+
+        挂单上不带止损止盈，所以改单也只改价格（sl / tp 传 None 表示沿用挂单上的现值，
+        而挂单上本来就没有）。
+        """
         want = counter_order_key(plan)
         comment = decision_comment(plan)
         if len(resting) > 1:
@@ -1164,26 +1313,29 @@ class StrategyRunner:
                 return
             current = None
         if current is None:
-            await self._place_counter_limit(plan, positions, comment, sl, tp)
+            await self._place_counter_limit(plan, positions, comment)
             return
         old_price = _as_float(current.get("price_open"))
-        old_sl = _as_float(current.get("sl"))
-        old_tp = _as_float(current.get("tp"))
-        price_moved = self._stops_differ(old_price, plan.limit_price, point)
-        stops_moved = (
-            sl is not None and self._stops_differ(old_sl, _as_float(sl), point)
-        ) or (
-            tp is not None and self._stops_differ(old_tp, _as_float(tp), point)
+        # 升级前挂的老单可能还带着止损止盈：那种止损是按现价算的，限价被推远后
+        # 可能落在入场价上方。这里顺手清掉，改单时统一传 0。
+        legacy_stops = (
+            _as_float(current.get("sl")) > 0 or _as_float(current.get("tp")) > 0
         )
-        if not price_moved and not stops_moved:
+        tolerance, min_interval = self._counter_reprice_limits(plan, old_price, point)
+        price_moved = self._stops_differ(old_price, plan.limit_price, tolerance)
+        if not price_moved and not legacy_stops:
+            return
+        # 改价限流：实时口径下间距会持续变化，没有节流会每拍都发一次改单
+        ticket = int(current.get("ticket") or 0)
+        if min_interval > 0 and not self._counter_modify_allowed(ticket, min_interval):
             return
         try:
             res = dict(await self._exec(
                 self._mt5.modify_pending_order,
-                int(current.get("ticket") or 0),
+                ticket,
                 plan.limit_price,
-                None if sl is None else _as_float(sl),
-                None if tp is None else _as_float(tp),
+                0.0 if legacy_stops else None,
+                0.0 if legacy_stops else None,
             ) or {})
         except Exception as e:  # noqa: BLE001
             logger.warning("task %s modify counter limit failed: %s", self.task_id, e)
@@ -1233,6 +1385,7 @@ class StrategyRunner:
     async def _sync_counter_limit(
         self, event: MarketEvent, positions: list[dict],
         bar_metrics: Optional[dict] = None,
+        bar_live: Optional[dict] = None,
     ) -> None:
         """把下一档逆势加仓维持成唯一一张限价；成交后才挂再下一张。"""
         if self._mode != _MODE_ADD_ON or event.point <= 0:
@@ -1252,9 +1405,13 @@ class StrategyRunner:
         if self.add_counts.get(RULE_TYPE_COUNTER, 0) > counted.get(RULE_TYPE_COUNTER, 0):
             return
         ctx = self._ctx(event, filtered)
-        ctx.bar_metrics = (
-            bar_metrics if bar_metrics is not None else await self._read_bar_metrics()
-        )
+        if bar_metrics is not None and bar_live is not None:
+            ctx.bar_metrics = bar_metrics
+            ctx.bar_live = bar_live
+        else:
+            metrics, lives = await self._read_bars()
+            ctx.bar_metrics = metrics
+            ctx.bar_live = lives
         spec = await self._manual_symbol_spec()
         digits = int((spec or {}).get("digits") or 0)
         plan = plan_counter_limit(self.strategy.get("rules") or [], ctx, digits=digits)
@@ -1267,11 +1424,7 @@ class StrategyRunner:
         if block in ("side", "stops"):
             await self._counter_market_fallback(plan, book, resting)
             return
-        sl = tp = None
-        stops = await self._stops_on_open(plan.action, plan.volume, filtered)
-        if stops is not None:
-            sl, tp = stops
-        await self._align_counter_order(plan, book, resting, sl, tp, point=ctx.point)
+        await self._align_counter_order(plan, book, resting, point=ctx.point)
 
     async def _add_position(
         self, decision, positions: list[dict], *, message: Optional[str] = None,
@@ -1652,6 +1805,7 @@ class StrategyRunner:
         res["task_id"] = self.task_id
         res["magic"] = self.magic
         res.setdefault("symbol", self.symbol)
+        self._attach_latency_marks(res)
         await self._send({"type": "trade_result", "data": res})
 
         if not res.get("success"):

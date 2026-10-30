@@ -18,12 +18,14 @@ import type {
   NodeFeedItem,
   NodeOut,
   NodePrimaryUpdatePayload,
+  NodePerformance,
   NodeTokenInfo,
   NodeUpdatePayload,
   RiskFeedItem,
   GroupTaskEventRecord,
   LimitWatchLogOut,
   PaginatedAudits,
+  PaginatedDeals,
   PaginatedGroupSignals,
   PaginatedLimitWatchLogs,
   PaginatedNodeDispatches,
@@ -36,6 +38,30 @@ import type {
   TrendPanelData,
   WebhookAuthInfo,
 } from '@/api/types'
+
+/**
+ * 成交汇总的空值占位（接口失败 / 尚未加载时用）。
+ *
+ * data_available=false —— UI 能区分「没数据」与「有数据但全亏」：
+ * 前者要显示「暂无数据」，后者要显示 0.00%。
+ */
+function EMPTY_DEAL_SUMMARY() {
+  return {
+    total_profit: 0,
+    profit_rate: 0,
+    win_rate: 0,
+    total_trades: 0,
+    win_trades: 0,
+    lose_trades: 0,
+    gross_volume: 0,
+    commission_total: 0,
+    swap_total: 0,
+    base_equity: 0,
+    profit_rate_valid: true,
+    data_available: false,
+    updated_at: null,
+  }
+}
 
 // 业务总线 store：集中保存节点、账户、配置与实时事件
 interface HubState {
@@ -121,6 +147,52 @@ export const useHubStore = defineStore('hub', {
         ).data
       } catch {
         return { items: [], total: 0, page, page_size: pageSize }
+      }
+    },
+    /**
+     * 某节点的绩效汇总与按日收益序列（概览页历史盈亏）。
+     *
+     * 失败返回 null：概览据此显示「加载失败」而不是伪造一份空数据 ——
+     * 空数据会被误读成「这个节点没赚过钱」。
+     */
+    async fetchNodePerformance(
+      id: string,
+      window = '30d',
+      days = 7,
+    ): Promise<NodePerformance | null> {
+      try {
+        return (
+          await api.get(`/api/deals/nodes/${id}/performance`, {
+            params: { window, days },
+          })
+        ).data
+      } catch {
+        return null
+      }
+    },
+    /**
+     * 某节点的 MT5 成交明细（分页 + 同条件汇总）。
+     */
+    async fetchNodeDeals(
+      id: string,
+      page = 1,
+      pageSize = 50,
+      params: Record<string, string | number> = {},
+    ): Promise<PaginatedDeals> {
+      try {
+        return (
+          await api.get(`/api/deals/nodes/${id}/deals`, {
+            params: { page, page_size: pageSize, ...params },
+          })
+        ).data
+      } catch {
+        return {
+          items: [],
+          total: 0,
+          page,
+          page_size: pageSize,
+          summary: EMPTY_DEAL_SUMMARY(),
+        }
       }
     },
     /**

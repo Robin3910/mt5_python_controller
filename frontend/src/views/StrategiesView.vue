@@ -318,7 +318,11 @@ function levelSpacingText(lv: StrategyBatchLevel): string {
   const kind = (lv.calc_type || 'point') as BatchCalcType
   if (kind === 'price') return `价位 ${lv.price ?? 0}`
   if (kind === 'atr') return `ATR(${lv.timeframe || 'M5'}×${BATCH_BAR_PERIOD})`
-  if (kind === 'range') return `波幅(${lv.timeframe || 'M5'}×${BATCH_BAR_PERIOD})`
+  if (kind === 'range') {
+    const base = `波幅(${lv.timeframe || 'M5'}×${BATCH_BAR_PERIOD})`
+    // 纳入当前 K 线波幅的档位要标出来，否则看不出这档会随行情变
+    return lv.range_include_live ? `${base} +实时` : base
+  }
   if (kind === 'fvg' || kind === 'ob' || kind === 'pdz' || kind === 'fibo') {
     return `${CALC_TYPE_LABEL[kind]}(${lv.timeframe || 'M5'}) · 等 TV 推送`
   }

@@ -74,6 +74,32 @@ def _migrate_signal_source_column(sync_conn) -> None:
         sync_conn.execute(text("ALTER TABLE signal_history ADD COLUMN model VARCHAR(16)"))
 
 
+# 时延埋点列：sent_at / recv_at / order_at / filled_at + 两段耗时（毫秒）
+# signal_dispatch（normal 链路）与 group_task_dispatch（strategy 链路）共用同一组列名，
+# 便于后台用同一套口径展示两条链路的时延分解。
+_LATENCY_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("sent_at", "DATETIME"),
+    ("recv_at", "DATETIME"),
+    ("order_at", "DATETIME"),
+    ("filled_at", "DATETIME"),
+    ("queued_ms", "FLOAT"),
+    ("order_to_fill_ms", "FLOAT"),
+)
+
+
+def _migrate_latency_marks(sync_conn) -> None:
+    """为已存在的分发明细表补时延埋点列（create_all 不会改已存在的表）。"""
+    inspector = inspect(sync_conn)
+    tables = set(inspector.get_table_names())
+    for table in ("signal_dispatch", "group_task_dispatch"):
+        if table not in tables:
+            continue
+        cols = {c["name"] for c in inspector.get_columns(table)}
+        for name, ddl in _LATENCY_COLUMNS:
+            if name not in cols:
+                sync_conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+
+
 def _migrate_audit_columns(sync_conn) -> None:
     """为已存在的 audit_log 表补充分类与操作前后数据列。"""
     inspector = inspect(sync_conn)
@@ -359,6 +385,7 @@ async def init_db() -> None:
         await conn.run_sync(_migrate_user_totp_columns)
         await conn.run_sync(_migrate_dispatch_price_column)
         await conn.run_sync(_migrate_signal_source_column)
+        await conn.run_sync(_migrate_latency_marks)
         await conn.run_sync(_migrate_audit_columns)
         await conn.run_sync(_migrate_node_group_strategy_id)
         await conn.run_sync(_migrate_node_group_trend_risk)
@@ -374,7 +401,27 @@ async def init_db() -> None:
         await conn.run_sync(_migrate_dashboard_columns)
         await conn.run_sync(_migrate_node_credentials)
         await conn.run_sync(_migrate_node_primary)
+        await conn.run_sync(_migrate_mt5_deal_columns)
     logger.info("Database initialized (%s)", engine.url.render_as_string(hide_password=True))
+
+
+def _migrate_mt5_deal_columns(sync_conn) -> None:
+    """为已存在的 mt5_deal 表补充 server_time_offset 列。
+
+    `mt5_deal` 是新表，create_all 会直接建好；但如果先上线了成交上报、
+    后补这一列，create_all 不会改已存在的表，必须显式 ALTER 补上。
+
+    server_time_offset = 该节点券商服务器钟面相对真实 UTC 的偏移（秒）。
+    分日归集时要减掉它，否则经纪商不在 UTC+0 时会把成交归到错误的一天。
+    """
+    inspector = inspect(sync_conn)
+    if "mt5_deal" not in inspector.get_table_names():
+        return
+    cols = {c["name"] for c in inspector.get_columns("mt5_deal")}
+    if "server_time_offset" not in cols:
+        sync_conn.execute(
+            text("ALTER TABLE mt5_deal ADD COLUMN server_time_offset INTEGER NOT NULL DEFAULT 0")
+        )
 
 
 def _migrate_dashboard_columns(sync_conn) -> None:

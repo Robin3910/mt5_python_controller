@@ -13,9 +13,10 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import time
 from typing import Optional
 
-from . import mt5_identity, persist, results, rules
+from . import latency_marks, mt5_identity, persist, results, rules
 from .config import Config
 from .connections import manager
 from .models import build_close_command, build_open_command
@@ -189,16 +190,21 @@ class Dispatcher:
             return {"status": "skipped", "reason": reason}
 
         vol = rules.resolve_volume(node, signal.volume, filters, signal.symbol)
+        # 发包时刻：命令交给节点的瞬间。取在 build_open_command 之前，
+        # 这样 sent_at 与命令内容里的时间戳严格对应（跨节点唯一可比的时间轴）。
+        sent_at = time.time()
         cmd = build_open_command(
             signal_id, signal.action, signal.symbol, vol,
             signal.stop_loss, signal.take_profit, signal.comment,
             Config.DEFAULT_MAGIC_NUMBER,
+            sent_at=sent_at,
         )
 
         # 轮询模式下先注册“等待回报”的 future
         fut = results.register(signal_id, node_id) if wait else None
         sent = await manager.send_to_node(node_id, cmd)
-        await persist.record_dispatch(signal_id, node_id, vol, "passed", None, "pending")
+        await persist.record_dispatch(signal_id, node_id, vol, "passed", None, "pending",
+                                      sent_at=latency_marks.utcnow())
         # 推送给后台前端做实时展示
         await manager.broadcast_admin(
             {"type": "dispatch", "data": {"signal_id": signal_id, "node_id": node_id,

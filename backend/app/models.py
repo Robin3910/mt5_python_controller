@@ -152,6 +152,87 @@ class PaginatedNodeDispatches(BaseModel):
     page_size: int
 
 
+class DealRecord(BaseModel):
+    """单笔 MT5 成交明细。"""
+    id: int
+    node_id: str
+    deal_id: int                        # MT5 成交票号（deal.ticket）
+    order_id: Optional[int] = None
+    position_id: Optional[int] = None
+    symbol: Optional[str] = None
+    direction: str = "BUY"              # 成交方（MT5 原始方向：平多单是 SELL）
+    # 出场成交的方向色按「被平掉的那个持仓的方向」取。
+    # 平多单在 MT5 里是 SELL，直接展示 direction 会让人误以为又开了空仓。
+    position_direction: str = "BUY"
+    entry_type: str = "IN"              # IN / OUT / INOUT / OUT_BY
+    entry_label: str = "开仓"           # 开仓 / 平仓 / 双向 / 对冲平仓
+    reason: int = 0                     # MT5 DEAL_REASON
+    volume: float = 0.0
+    price: float = 0.0
+    profit: float = 0.0
+    swap: float = 0.0
+    commission: float = 0.0
+    net_profit: float = 0.0
+    magic: Optional[int] = None
+    comment: Optional[str] = None
+    source: str = "terminal"            # terminal / strategy / signal / manual
+    source_label: str = "终端"
+    signal_id: Optional[str] = None
+    task_id: Optional[int] = None
+    group_id: Optional[str] = None
+    deal_time: int = 0
+
+
+class DealSummary(BaseModel):
+    """成交汇总（统计口径集中在 deal_stats，前端直接展示不要自己再算）。"""
+    total_profit: float = 0.0
+    profit_rate: float = 0.0
+    win_rate: float = 0.0
+    # 交易笔数 = 持仓数（position_id 聚合），不是成交笔数
+    total_trades: int = 0
+    win_trades: int = 0
+    lose_trades: int = 0
+    gross_volume: float = 0.0
+    commission_total: float = 0.0
+    swap_total: float = 0.0
+    # 区间期初权益（收益率的分母）
+    base_equity: float = 0.0
+    # 期初权益拿不到时收益率为 0 且此标志为 False（前端应显示「暂无数据」）
+    profit_rate_valid: bool = True
+    # 节点未上报 / 无成交 / 同步未开 —— 与「有数据但全亏」区分开
+    data_available: bool = False
+    updated_at: Optional[int] = None
+
+
+class PaginatedDeals(BaseModel):
+    """成交明细分页结果（summary 与 items 同一 WHERE 条件）。"""
+    items: list[DealRecord]
+    total: int
+    page: int
+    page_size: int
+    summary: DealSummary = Field(default_factory=DealSummary)
+
+
+class NodeDailyProfitPoint(BaseModel):
+    """节点每日已实现净盈亏（柱状图数据源）。
+
+    日期由后端按节点所在时区分好，前端只显示 `date` 字符串，不再本地换算
+    （服务端与浏览器分属不同机器/时区，前端换算会整体错位一天）。
+    """
+    date: str                    # 'MM-DD'
+    ts: float                    # 该日 00:00 的 Unix 秒
+    profit: float = 0.0          # 当日已实现净盈亏
+    deals: int = 0               # 当日出场成交笔数
+
+
+class NodePerformanceResponse(BaseModel):
+    """节点绩效（汇总 + 按日序列），节点详情页概览用。"""
+    node_id: str
+    window: str = "30d"          # 统计窗口：7d / 30d / 90d / all
+    summary: DealSummary = Field(default_factory=DealSummary)
+    daily: list[NodeDailyProfitPoint] = Field(default_factory=list)
+
+
 class SignalEventDispatch(BaseModel):
     """单条 Webhook 信号在某节点上的处理明细。"""
     id: int
@@ -341,6 +422,13 @@ class GroupTaskDispatchRecord(BaseModel):
     opened_at: Optional[float] = None
     last_report_at: Optional[float] = None
     finished_at: Optional[float] = None
+    # —— 时延埋点（观测用）——
+    # sent_at：服务端发包时刻，跨节点唯一可比的时间轴
+    sent_at: Optional[float] = None
+    # queued_ms：节点内部排队耗时（单线程 MT5 队列抢占）
+    queued_ms: Optional[float] = None
+    # order_to_fill_ms：券商往返耗时
+    order_to_fill_ms: Optional[float] = None
 
 
 class GroupSignalTaskRecord(BaseModel):
@@ -427,6 +515,24 @@ class StrategyBatchLevel(BaseModel):
     timeframe: str = Field(
         default="M5",
         description="atr / range 的统计周期，或 fvg / ob / pdz / fibo 用来匹配推送的周期标识",
+    )
+    range_include_live: bool = Field(
+        default=False,
+        description=(
+            "波幅间距是否纳入当前未收盘 K 线的实时高低差（仅逆势可用）。"
+            "开启后急跌时自动把加仓限价推远，避免在下跌中位加仓"
+        ),
+    )
+    range_live_cap: float = Field(
+        default=1000.0, gt=0,
+        description=(
+            "纳入实时后的波幅上限倍数（基线 × 该值）。这是数据异常的安全网："
+            "实时波幅超过这个倍数时判定为数据异常，直接忽略实时值退回基线"
+        ),
+    )
+    range_live_refresh: int = Field(
+        default=5, ge=1,
+        description="重检间隔（秒）：刷新实时波幅的节奏，同时也是限价改价的最小间隔",
     )
     lot_times: float = Field(default=1.0, ge=0)
     extra_lot: float = Field(default=0.0, ge=0)
@@ -905,9 +1011,15 @@ class UserNodesUpdate(BaseModel):
 
 def build_open_command(signal_id: str, action: str, symbol: str, volume: float,
                        stop_loss: Optional[float], take_profit: Optional[float],
-                       comment: str = "", magic: Optional[int] = None) -> dict[str, Any]:
-    """构造下发给节点的“开仓”命令。"""
-    return {
+                       comment: str = "", magic: Optional[int] = None,
+                       sent_at: Optional[float] = None) -> dict[str, Any]:
+    """构造下发给节点的“开仓”命令。
+
+    sent_at：服务端下发时刻（Unix 秒，浮点）。这是**跨节点唯一可比**的时间轴——
+    节点回报里的时刻用的是节点本地时钟，两机时钟不同源，不能直接相减。
+    字段可选：旧节点会忽略它，不影响下发。
+    """
+    cmd = {
         "cmd": "open",
         "signal_id": signal_id,
         "action": action,
@@ -918,6 +1030,9 @@ def build_open_command(signal_id: str, action: str, symbol: str, volume: float,
         "comment": comment,
         "magic": magic,
     }
+    if sent_at is not None:
+        cmd["sent_at"] = round(float(sent_at), 6)
+    return cmd
 
 
 def build_close_command(signal_id: str, target: str, symbol: Optional[str] = None,

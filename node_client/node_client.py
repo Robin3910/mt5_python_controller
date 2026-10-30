@@ -21,11 +21,15 @@ import os
 import socket
 import time
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 
 import websockets
 
 import account_risk
+import config
 from config import clamp_account_report_interval, get_settings
+from deal_cursor import DealCursor
+import latency_marks
 from local_status import LocalStatusServer, StatusPortBusy, bind_status_socket
 from market_hub import MarketHub
 from mt5_prompt import prompt_mt5_credentials, require_dashboard_account
@@ -416,13 +420,15 @@ class NodeClient:
         return False
 
     async def _serve(self, ws) -> None:
-        """并发跑三个任务；任一退出(通常是断线)即取消其余，触发外层重连。"""
+        """并发跑几个任务；任一退出(通常是断线)即取消其余，触发外层重连。"""
         self.ws_connected = True
         tasks = [
             asyncio.create_task(self._reporter(ws)),
             asyncio.create_task(self._heartbeat(ws)),
             asyncio.create_task(self._receiver(ws)),
         ]
+        if settings.deals_sync_enabled:
+            tasks.append(asyncio.create_task(self._deals_reporter(ws)))
         try:
             done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for t in done:
@@ -449,6 +455,72 @@ class NodeClient:
             await self._check_account_risk(ws, snap)
             await asyncio.sleep(clamp_account_report_interval(settings.account_report_interval))
 
+    async def _deals_reporter(self, ws) -> None:
+        """定时采集 MT5 历史成交并上报服务端（概览盈亏统计的数据源）。
+
+        关键约定：**只有确认上报成功后才推进游标**。读失败或发送失败时游标保持不动，
+        下一轮会重新采集同一批 —— 宁可重复（服务端按成交号幂等），不可丢失。
+        """
+        cursor = DealCursor(self.expected_mt5_login)
+        cursor.load(lookback_days=settings.deals_lookback_days)
+        while True:
+            try:
+                sent = await self._collect_deals(ws, cursor)
+                if sent:
+                    logger.info("deals collected: %s rows", sent)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                # 采集失败不致命：保留游标，下一轮重试
+                logger.warning("deals collection failed: %s", e)
+            await asyncio.sleep(max(5.0, float(settings.deals_sync_interval)))
+
+    async def _collect_deals(self, ws, cursor: DealCursor) -> int:
+        """采集一批增量成交并上报；返回本次上报的条数。"""
+        since_ts = cursor.since_ts
+        after_id = cursor.last_deal_id
+        reader = getattr(self.mt5, "history_deals_since", None)
+        if reader is None:
+            raise RuntimeError("history_deals_since unsupported by this client")
+        # 读失败必须抛错（不能返回空列表），否则游标会误推
+        rows = await self._exec(reader, since_ts, after_id)
+        if not rows:
+            return 0
+        # 账户快照随成交一起上报：收益率的分母（区间期初权益）靠它算。
+        # 读不到就照常上报成交，只是收益率算不出来。
+        try:
+            account = await self._exec(self.mt5.account_info) or {}
+        except Exception:  # noqa: BLE001
+            account = {}
+        # 券商服务器钟面相对真实 UTC 的偏移：分日归集时要减掉它，
+        # 否则经纪商不在 UTC+0 时会把成交归到错误的一天。
+        try:
+            offset = await self._exec(self.mt5.server_time_offset_sec)
+        except Exception:  # noqa: BLE001
+            offset = None
+        # 分批上报，避免单条消息过大
+        batch_size = max(1, int(settings.deals_batch_size))
+        total = 0
+        for start in range(0, len(rows), batch_size):
+            chunk = rows[start:start + batch_size]
+            await ws.send(json.dumps({
+                "type": "deals_report",
+                "data": {
+                    "deals": chunk,
+                    "account": {
+                        "balance": account.get("balance"),
+                        "equity": account.get("equity"),
+                        "server_time_offset": offset,
+                    },
+                },
+            }))
+            total += len(chunk)
+        # 上报成功后才推进游标
+        max_id = max(int(r.get("deal_id") or 0) for r in rows)
+        max_ts = max(float(r.get("time") or 0.0) for r in rows)
+        cursor.advance(since_ts=max_ts, last_deal_id=max_id)
+        return total
+
     async def _heartbeat(self, ws) -> None:
         """定时心跳，维持服务端在线标记。"""
         while True:
@@ -458,15 +530,21 @@ class NodeClient:
     async def _receiver(self, ws) -> None:
         """接收服务端下发的命令。"""
         async for raw in ws:
+            # 收包时刻：命令从此刻起才进入节点的处理链，是时延分解的起点
+            recv_at = time.time()
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-            await self._handle(ws, msg)
+            await self._handle(ws, msg, recv_at=recv_at)
 
-    async def _handle(self, ws, msg: dict) -> None:
+    async def _handle(self, ws, msg: dict, recv_at: Optional[float] = None) -> None:
         """按命令类型分派：open / close / market_probe / cancel_pending / pong / watch_symbols；
-        处理服务端登录号拒绝。"""
+        处理服务端登录号拒绝。
+
+        recv_at：命令被读到的时刻（节点本地时钟）。传下去用于时延埋点；
+        缺省时在分派处补一个当前时刻。
+        """
         mtype = msg.get("type")
         if mtype == "auth_fail":
             data = msg.get("data") or {}
@@ -490,17 +568,17 @@ class NodeClient:
 
         cmd = msg.get("cmd")
         if cmd == "open":
-            await self._do_open(ws, msg)
+            await self._do_open(ws, msg, recv_at=recv_at)
         elif cmd == "close":
-            await self._do_close(ws, msg)
+            await self._do_close(ws, msg, recv_at=recv_at)
         elif cmd == "market_probe":
             # 拉高周期历史可能卡住终端调用；丢到后台，别堵死接收循环
             # （否则心跳排不上，服务端 ping 超时会把节点判离线）
             asyncio.create_task(self._safe_market_probe(ws, msg))
         elif cmd == "strategy_start":
-            await self._do_strategy_start(ws, msg, resume=False)
+            await self._do_strategy_start(ws, msg, resume=False, recv_at=recv_at)
         elif cmd == "strategy_resume":
-            await self._do_strategy_start(ws, msg, resume=True)
+            await self._do_strategy_start(ws, msg, resume=True, recv_at=recv_at)
         elif cmd == "strategy_stop":
             await self._do_strategy_stop(ws, msg)
         elif cmd == "strategy_update":
@@ -705,8 +783,12 @@ class NodeClient:
         logger.warning("account risk: %s", event["message"])
 
     # ---------------------- 策略托管 ----------------------
-    async def _do_strategy_start(self, ws, msg: dict, *, resume: bool) -> None:
-        """启动（或恢复）一个分组策略任务的常驻监控。"""
+    async def _do_strategy_start(self, ws, msg: dict, *, resume: bool,
+                                 recv_at: Optional[float] = None) -> None:
+        """启动（或恢复）一个分组策略任务的常驻监控。
+
+        recv_at：命令读到的时刻（节点本地时钟），传给 runner 用于首单时延埋点。
+        """
         task_id = msg.get("task_id")
         magic = msg.get("magic")
         if not task_id or not magic:
@@ -734,6 +816,7 @@ class NodeClient:
             send_fn=send,
             report_interval=msg.get("report_interval") or 5,
             runtime=msg.get("runtime") if isinstance(msg.get("runtime"), dict) else None,
+            recv_at=recv_at if recv_at is not None else time.time(),
         )
         self.runners[task_id] = runner
         smc = msg.get("smc")
@@ -868,8 +951,14 @@ class NodeClient:
             if not runner.done:
                 runner.request_stop(reason)
 
-    async def _do_open(self, ws, msg: dict) -> None:
-        """执行开仓并回报结果（带 signal_id/symbol 供服务端关联与释放锁）。"""
+    async def _do_open(self, ws, msg: dict, recv_at: Optional[float] = None) -> None:
+        """执行开仓并回报结果（带 signal_id/symbol 供服务端关联与释放锁）。
+
+        recv_at：命令读到的时刻（节点本地时钟）。回报里带上 recv_at / order_at /
+        filled_at 与两段耗时，服务端据此还原「命令→下单→成交」的时间线。
+        """
+        if recv_at is None:
+            recv_at = time.time()
         acct = await self._exec(self.mt5.account_info)
         try:
             self._check_login(acct)
@@ -882,6 +971,7 @@ class NodeClient:
                     "signal_id": msg.get("signal_id"),
                     "symbol": msg.get("symbol"),
                     "action": msg.get("action"),
+                    "recv_at": round(recv_at, 6),
                 },
             }))
             raise
@@ -894,11 +984,19 @@ class NodeClient:
         )
         res["signal_id"] = msg.get("signal_id")
         res.setdefault("symbol", msg.get("symbol"))
+        # 下单时刻由 MT5 客户端在真正调 order_send 之前记下；取不到时退回当前时刻
+        order_at = res.pop("_order_at", None) or time.time()
+        filled_at = res.pop("_filled_at", None) or time.time()
+        latency_marks.merge(res, latency_marks.build(
+            recv_at=recv_at, order_at=order_at, filled_at=filled_at,
+        ))
         await ws.send(json.dumps({"type": "trade_result", "data": res}))
         logger.info("open result: %s", res)
 
-    async def _do_close(self, ws, msg: dict) -> None:
+    async def _do_close(self, ws, msg: dict, recv_at: Optional[float] = None) -> None:
         """执行平仓（按订单/按品种/全平）并回报结果。"""
+        if recv_at is None:
+            recv_at = time.time()
         target = msg.get("close_target", "all")
         if target == "ticket" and msg.get("close_ticket"):
             res = await self._exec(self.mt5.close_ticket, msg["close_ticket"])
@@ -912,6 +1010,8 @@ class NodeClient:
         res.setdefault("action", "CLOSE")
         res.setdefault("symbol", msg.get("close_symbol"))
         res["detail"] = self._close_detail(msg, res)
+        # 平仓没有券商往返时刻可取（批量接口不逐笔记），只报收包时刻
+        latency_marks.merge(res, latency_marks.build(recv_at=recv_at))
         await ws.send(json.dumps({"type": "trade_result", "data": res}))
         logger.info("close result: %s", res)
 

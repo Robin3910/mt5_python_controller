@@ -25,9 +25,12 @@ class FakeMT5:
         self.orders_calls = 0
         self.quotes_calls = 0
         self.bars_calls = 0
+        self.recent_bars_calls = 0
         self.fail_bars = False
         # 每根 K 线高低差固定 2.0，ATR 与高低点总跨度都等于 2.0
         self.bar_span = 2.0
+        # 当前未收盘那根的高低差；0 表示与已收盘一致
+        self.live_bar_span = 0.0
 
     def positions(self) -> list[dict]:
         self.positions_calls += 1
@@ -58,6 +61,25 @@ class FakeMT5:
             {"time": float(i), "open": mid, "high": mid + half, "low": mid - half, "close": mid}
             for i in range(int(count))
         ]
+
+    def recent_bars(self, symbol, timeframe, count) -> list[dict]:
+        """含当前未收盘根（最后一根），时间升序。"""
+        self.recent_bars_calls += 1
+        if self.fail_bars:
+            raise RuntimeError("no history")
+        mid = 2330.0
+        half = self.bar_span / 2
+        bars = [
+            {"time": float(i), "open": mid, "high": mid + half, "low": mid - half, "close": mid}
+            for i in range(int(count))
+        ]
+        # 当前这根：时间最后，振幅可单独设（模拟急跌）
+        live_half = self.live_bar_span / 2 if self.live_bar_span else half
+        bars.append({
+            "time": float(count), "open": mid,
+            "high": mid + live_half, "low": mid - live_half, "close": mid,
+        })
+        return bars
 
     def add(self, *, ticket: int, magic: int, price: float = 2330.0) -> None:
         self._positions.append({
@@ -412,6 +434,63 @@ async def test_bar_metric_failure_is_not_cached():
     assert await hub.bar_metric("XAUUSD", "M5", "atr") == 0.0
     mt5.fail_bars = False
     assert await hub.bar_metric("XAUUSD", "M5", "atr") == 2.0
+
+
+# --------------------------- 波幅实时口径 ---------------------------
+async def test_bar_range_pair_returns_baseline_and_live():
+    mt5 = FakeMT5()
+    mt5.live_bar_span = 200.0
+    hub = _hub(mt5)
+
+    baseline, live = await hub.bar_range_pair("XAUUSD", "M5", refresh=5.0)
+
+    assert baseline == 2.0      # 14 根已收盘的总跨度
+    assert live == 200.0       # 当前这根已走出的高低差
+
+
+async def test_bar_range_pair_reads_once_per_refresh_interval():
+    """实时口径要跟行情走，但也不该每拍都读终端。"""
+    mt5 = FakeMT5()
+    hub = _hub(mt5)
+
+    for _ in range(5):
+        await hub.bar_range_pair("XAUUSD", "M5", refresh=5.0)
+
+    assert mt5.recent_bars_calls == 1
+    # 基线与实时来自同一次读取，不能分两次读
+    assert mt5.bars_calls == 0
+
+
+async def test_bar_range_pair_cache_is_separate_from_baseline_cache():
+    """两套缓存互不干扰：基线走长 TTL，实时走重检间隔。"""
+    mt5 = FakeMT5()
+    hub = _hub(mt5)
+
+    await hub.bar_metric("XAUUSD", "M5", "range")
+    await hub.bar_range_pair("XAUUSD", "M5", refresh=5.0)
+
+    assert mt5.bars_calls == 1
+    assert mt5.recent_bars_calls == 1
+
+
+async def test_bar_range_pair_failure_returns_zero():
+    """读不到就返回 0，让判定退回纯基线而不是退化成 0 阈值。"""
+    mt5 = FakeMT5()
+    mt5.fail_bars = True
+    hub = _hub(mt5)
+
+    assert await hub.bar_range_pair("XAUUSD", "M5", refresh=5.0) == (0.0, 0.0)
+
+
+async def test_bar_range_pair_refreshes_after_interval():
+    mt5 = FakeMT5()
+    hub = _hub(mt5)
+
+    await hub.bar_range_pair("XAUUSD", "M5", refresh=0.2)
+    await asyncio.sleep(0.3)
+    await hub.bar_range_pair("XAUUSD", "M5", refresh=0.2)
+
+    assert mt5.recent_bars_calls == 2
 
 
 async def test_hold_when_empty_emits_price_ticks_instead_of_gone():
