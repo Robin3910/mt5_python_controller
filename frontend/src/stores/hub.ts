@@ -76,6 +76,9 @@ interface HubState {
   nodeFeed: Record<string, NodeFeedItem[]>  // node_id -> 实时分发/回报（详情页“成交回报”用）
   riskFeed: Record<string, RiskFeedItem[]>  // node_id -> 账户级风控执行回报
   limitWatchLogs: Record<string, LimitWatchLogOut[]>  // group_id -> 限价监听日志（新→旧）
+  // node_id -> 成交入库计数（每次 +1）。概览面板监听它来触发重新拉取，
+  // 这样节点上报新成交后页面能自动刷新，不必手动点刷新。
+  dealVersions: Record<string, number>
 }
 
 export const useHubStore = defineStore('hub', {
@@ -91,6 +94,7 @@ export const useHubStore = defineStore('hub', {
     nodeFeed: {},
     riskFeed: {},
     limitWatchLogs: {},
+    dealVersions: {},
   }),
   getters: {
     // 在线节点数（优先用实时状态，其次用 REST 字段）
@@ -610,6 +614,18 @@ export const useHubStore = defineStore('hub', {
         const ev = d.event as string
         const kind = ev === 'ok' ? 'ok' : ev === 'rejected' || ev === 'cancel_failed' ? 'warn' : 'info'
         this.pushEvent(`限价监听 ${name} ${text}`, kind)
+      } else if (t === 'deals') {
+        // 节点上报了新的历史成交：把该节点的成交版本号 +1，
+        // 概览面板监听它重新拉取绩效数据（否则页面会一直停在旧值，
+        // 看起来就像「数据和 MT5 对不上」）。
+        //
+        // 只在**确有新成交入库**时才 +1：后端每轮采集都会广播（哪怕全是重复的
+        // 老成交，inserted=0），无条件 +1 会让概览按采集周期反复空拉。
+        const nodeId = d.node_id as string
+        const inserted = Number(d.inserted ?? 0)
+        if (nodeId && inserted > 0) {
+          this.dealVersions[nodeId] = (this.dealVersions[nodeId] ?? 0) + 1
+        }
       }
     },
   },

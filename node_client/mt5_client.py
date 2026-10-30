@@ -31,6 +31,20 @@ _OFFSET_TICK_MAX_AGE = 14 * 3600
 _OFFSET_CACHE_TTL = 60.0
 _OFFSET_PROBE_SYMBOLS = ("BTCUSD", "ETHUSD", "XAUUSD", "EURUSD")
 
+# 查历史成交时，窗口上界要额外放宽的余量（秒）。
+#
+# 为什么必须放宽：MT5 的 deal.time 是「服务器钟面按 UTC 编码」的 Unix，
+# 比真实 UTC 快 offset 秒；券商不在 UTC+0 时（IC Markets 是 GMT+3），
+# 若上界按真实 UTC 取，最近 offset 秒的成交会被**整段截掉** ——
+# 节点采不到最新成交，前端概览就永远落后 MT5 三个小时。
+#
+# 偏移推断得出来时，精确换算就够了；推断不出来时（周末外汇报价不跳动）
+# 用这个上限兜底，保证上界不会切掉真实存在的成交。
+# 窗口放宽只是多扫几条，读到的成交仍按成交号去重，不影响正确性。
+_HISTORY_END_MARGIN_SEC = 14 * 3600
+# 偏移已知时的兜底余量：只需覆盖时钟抖动与推断取整误差
+_HISTORY_END_MARGIN_KNOWN_SEC = 3600
+
 
 def infer_server_time_offset(tick_times: list[float], now: float) -> Optional[int]:
     """由 MT5 tick.time 与真实 UTC 的差值，推断券商服务器时区偏移（秒）。
@@ -49,6 +63,64 @@ def infer_server_time_offset(tick_times: list[float], now: float) -> Optional[in
     if hours < -12 or hours > 14:
         return None
     return hours * 3600
+
+
+def server_epoch(real_epoch: float, offset_sec: Optional[int]) -> float:
+    """把真实 UTC 时刻换算到 **MT5 服务器钟面域**。
+
+    MT5 的 `deal.time` / `position.time` / `tick.time` 都是「服务器钟面按 UTC 编码」
+    的 Unix：IC Markets 是 GMT+3，同一笔成交的 `deal.time` 比 `time.time()` 快 10800 秒。
+
+    `history_deals_get(start, end)` 收的是 naive datetime，底层按 `mktime()` 解释，
+    也就是**本机本地时区的墙钟**。传进去的 epoch 必须和 MT5 内部钟面同一套，
+    否则窗口整体错位 offset 秒 —— 错位方向决定了成交是被漏掉还是被重复读到。
+    """
+    if not offset_sec:
+        return float(real_epoch)
+    return float(real_epoch) + float(offset_sec)
+
+
+def history_window(
+    since_server: float | None,
+    offset_sec: Optional[int],
+    *,
+    back_sec: int = 0,
+    end_margin_sec: Optional[int] = None,
+) -> tuple:
+    """构造 `history_deals_get` 的 (start, end) naive datetime。
+
+    - `since_server`：**服务器钟面域**的起点（None = 不限起点）
+    - `offset_sec`：券商服务器钟面相对真实 UTC 的偏移（秒，None = 推断不出来）
+    - `back_sec`：起点再往前放宽的秒数（重叠窗口，防止同一秒多笔成交漏单）
+    - `end_margin_sec`：上界再放宽的秒数；None 时按偏移是否已知自动选
+
+    `history_deals_get` 收的是 naive datetime，底层按 `mktime()` 解释，
+    也就是**本机本地时区的墙钟** —— 传进去的 epoch 必须和 MT5 内部钟面同一套。
+
+    **起点按服务器钟面域直接用，不做换算**：游标记的就是 `deal.time`（同一时钟），
+    换算会引入偏移估计误差；偏移一旦在两次运行之间变了（DST / 周末推断不出），
+    换算后的起点会偏到真实成交之前甚至之后 —— 偏到之后就**永久漏单**。
+    只有上界（真实「现在」）需要换算。
+
+    **上界余量自适应**：偏移已知时只需覆盖时钟抖动（1 小时足够）；
+    偏移推断不出来时用 14 小时兜底（偏移的合法上限），宁可多扫不可漏读。
+    """
+    from datetime import datetime, timedelta
+
+    if end_margin_sec is None:
+        end_margin_sec = (
+            _HISTORY_END_MARGIN_KNOWN_SEC if offset_sec is not None
+            else _HISTORY_END_MARGIN_SEC
+        )
+    now_real = time.time()
+    # 上界：真实「现在」换算到服务器钟面，再加余量
+    end_epoch = server_epoch(now_real, offset_sec) + float(end_margin_sec)
+    end = datetime.fromtimestamp(end_epoch)
+    if since_server is None:
+        return end - timedelta(days=7), end
+    start_epoch = float(since_server) - float(back_sec)
+    return datetime.fromtimestamp(start_epoch), end
+
 
 # —— MT5 返回码(retcode)子集，分类见技术方案 10.7 ——
 RET_DONE = 10009            # 成交
@@ -1134,15 +1206,24 @@ class MT5Client:
         }
 
     def _history_deals(self, since_ts: float | None = None):
-        """取时间窗内的成交历史；失败或空返回空元组。"""
-        self.ensure()
-        from datetime import datetime, timedelta
+        """取时间窗内的成交历史；失败或空返回空元组。
 
-        end = datetime.now()
-        if since_ts:
-            start = datetime.fromtimestamp(float(since_ts)) - timedelta(minutes=1)
-        else:
-            start = end - timedelta(days=7)
+        **上界换算到服务器钟面域**再交给 MT5：`deal.time` 是服务器钟面
+        （比真实 UTC 快 offset 秒），上界若按真实 UTC 取，最近的成交会被
+        整段截掉 —— 策略收口时算出的已实现盈亏会偏小甚至为 0。
+
+        **下界额外放宽 14 小时**：调用方传的 `since_ts` 时钟不统一 ——
+        策略任务传的是 `time.time()`（真实 UTC），手动分散仓传的是持仓的
+        `position.time`（服务器钟面），两者可能混用。放宽到偏移推断的合法上限，
+        无论实际偏移是 -12h 还是 +14h 都不会漏掉该查的成交。
+        多读出来的成交按魔术号过滤，不影响结果。
+        """
+        self.ensure()
+        offset = self.server_time_offset_sec()
+        start, end = history_window(
+            since_ts, offset,
+            back_sec=_OFFSET_TICK_MAX_AGE + 60,
+        )
         return mt5.history_deals_get(start, end) or ()
 
     def history_deals_since(self, since_ts: float, after_deal_id: int = 0) -> list[dict]:
@@ -1154,12 +1235,17 @@ class MT5Client:
         时间窗取宽（回看 2 分钟），再用成交号做精确去重：同一秒内可能有多笔成交，
         只按时间戳过滤会漏单（见 deal_cursor 的说明）。
 
+        **窗口两端都在服务器钟面域**：`since_ts` 与返回的 `deal.time` 是同一时钟
+        （MT5 服务器钟面，比真实 UTC 快 offset 秒）。上界若按真实 UTC 取，最近
+        offset 秒的成交会被整段截掉 —— 这正是「前端概览比 MT5 晚三个小时」的
+        成因；更糟的是游标会被推进到服务器钟面域，此后 `start > end`，
+        采集**永久停滞**，节点再也上报不了任何新成交。
+
         返回的每项含 deal_id / order_id / position_id / symbol / direction /
         entry_type / reason / volume / price / profit / swap / commission /
-        magic / comment / time。
+        magic / comment / time（time 为服务器钟面域 Unix 秒）。
         """
         self.ensure()
-        from datetime import datetime, timedelta
 
         # MT5 的 DEAL_ENTRY_* / DEAL_TYPE_* 常量；包不可用时回退到文档值
         entry_in = int(getattr(mt5, "DEAL_ENTRY_IN", 0) if mt5 else 0)
@@ -1177,8 +1263,11 @@ class MT5Client:
         }
         type_names = {type_buy: "BUY", type_sell: "SELL"}
 
-        end = datetime.now()
-        start = datetime.fromtimestamp(float(since_ts)) - timedelta(minutes=2)
+        offset = self.server_time_offset_sec()
+        start, end = history_window(
+            float(since_ts), offset,
+            back_sec=120,
+        )
         rows = mt5.history_deals_get(start, end)
         # None = 读失败（与「确实没有成交」必须区分开），失败直接抛错
         rows = mt5_book_rows(rows, api_name="history_deals_get")

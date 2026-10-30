@@ -13,6 +13,10 @@
 //
 // 组件自己拉数据（父组件只给 nodeId），这样切到概览时按需请求，
 // 且图表库不进节点详情页首屏 chunk（与 TrendPanel 同样的处理方式）。
+//
+// 实时性：节点每次上报新成交，后端会广播 deals 事件；store 里的成交版本号
+// 随之变化，本组件监听后重新拉取 —— 概览数字会跟着节点上报实时走，
+// 不需要用户手动刷新。
 import { computed, defineAsyncComponent, onMounted, ref, watch } from 'vue'
 import { useHubStore } from '@/stores/hub'
 import type { NodePerformance } from '@/api/types'
@@ -37,6 +41,11 @@ const windowKey = ref(props.window)
 const data = ref<NodePerformance | null>(null)
 const loading = ref(false)
 const failed = ref(false)
+
+// 节点上报新成交时，后端广播 deals 事件、store 里该节点的版本号 +1。
+// 监听它重新拉取：否则概览会一直停在打开页面那一刻的快照，
+// 用户会以为「数据和 MT5 对不上」。
+const dealVersion = computed(() => hub.dealVersions[props.nodeId] ?? 0)
 
 const WINDOW_OPTIONS = [
   { value: '7d', label: '7 天' },
@@ -79,6 +88,11 @@ watch(
     void load()
   },
 )
+
+// 节点上报新成交 -> 重新拉取绩效（概览实时跟随节点上报）
+watch(dealVersion, () => {
+  void load()
+})
 
 onMounted(() => {
   void load()

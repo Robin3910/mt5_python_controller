@@ -319,6 +319,80 @@ async def test_daily_net_profit_empty_returns_empty_list(store):
     assert await deal_stats.daily_net_profit([], days=7) == []
 
 
+async def test_summary_window_filter_respects_server_offset(store):
+    """统计窗口的时间过滤要按**真实 UTC** 比较。
+
+    `deal_time` 存的是服务器钟面（快 offset 秒），而 `from_ts` / `to_ts`
+    来自 `time.time()`（真实 UTC）。直接拿 `deal_time` 比会整体错位 offset 秒。
+
+    真正的坑在**上界**：一笔 5 分钟前成交的单，服务器钟面是 now+3h，
+    拿它跟真实 `now` 比会得到「这笔成交发生在未来」-> 被 `to_ts` 切出窗口，
+    概览的净盈亏因此比 MT5 少一块。
+    """
+    from app import deal_stats
+
+    now = int(time.time())
+    offset = 3 * 3600
+    real_utc = now - 300
+    server_clock = real_utc + offset
+
+    await deal_store_save(store, [
+        mk_deal(
+            1, position_id=100, profit=50.0,
+            deal_time=server_clock, server_time_offset=offset,
+        )
+    ])
+
+    # 窗口 = 最近 1 小时（真实 UTC 域），含上界
+    summary = await deal_stats.node_summary("nd_a", now - 3600, now)
+    assert summary["total_profit"] == pytest.approx(50.0), "最近的成交被上界切掉了"
+    assert summary["total_trades"] == 1
+
+
+async def test_summary_window_filter_excludes_older_than_window(store):
+    """窗口之外的成交仍然要被排除（偏移修正不能把过滤放松成全量）。"""
+    from app import deal_stats
+
+    now = int(time.time())
+    offset = 3 * 3600
+    real_utc = now - 86400 * 2
+    server_clock = real_utc + offset
+
+    await deal_store_save(store, [
+        mk_deal(
+            1, position_id=100, profit=50.0,
+            deal_time=server_clock, server_time_offset=offset,
+        )
+    ])
+
+    # 窗口 = 最近 1 小时：两天前的成交不在窗口内
+    summary = await deal_stats.node_summary("nd_a", now - 3600, now)
+    assert summary["total_profit"] == pytest.approx(0.0)
+    assert summary["data_available"] is False
+
+
+async def test_list_deals_window_filter_respects_server_offset(store):
+    """成交明细分页的时间过滤同样按真实 UTC 比较。"""
+    from app import deal_store
+
+    now = int(time.time())
+    offset = 3 * 3600
+    server_clock = now - 300 + offset
+
+    await deal_store_save(store, [
+        mk_deal(
+            1, position_id=100, profit=50.0,
+            deal_time=server_clock, server_time_offset=offset,
+        )
+    ])
+
+    page = await deal_store.list_deals(
+        node_id="nd_a", from_ts=now - 3600, to_ts=now,
+    )
+    assert page["total"] == 1, "最近的成交被时间过滤切掉了"
+    assert page["items"][0]["deal_id"] == 1
+
+
 async def deal_store_save(store, rows):
     """便捷封装：写入成交（fixture 名保留 store 参数仅为统一签名）。"""
     from app import deal_store

@@ -11,6 +11,10 @@
 所以策略是：**时间戳决定"往哪看"，成交号决定"哪笔算新的"**。
 读失败时抛错，绝不推进游标 —— 否则那段历史永久丢失。
 
+**时域：`since_ts` 是 MT5 服务器钟面域的 Unix 秒**（与 `deal.time` 同一时钟，
+比真实 UTC 快 offset 秒）。采集时窗口两端都用这个时钟，与游标保持一致 ——
+混用真实 UTC 会让窗口整体错位 offset 秒，最坏情况是起点晚于真实成交而漏单。
+
 游标落本地 JSON 文件（节点侧），键按 MT5 登录号分：一台机器可能绑过多个账号。
 """
 from __future__ import annotations
@@ -84,11 +88,20 @@ class DealCursor:
         self._loaded = False
 
     # ---------------- 持久化 ----------------
-    def load(self, *, lookback_days: int = 7) -> None:
+    def load(self, *, lookback_days: int = 7, server_offset_sec: int = 0) -> None:
         """读游标；首次运行（无记录）时按 lookback_days 回看初始化。
 
         回看是必须的：节点第一次上线时，账户里已经有历史成交，采集应当从
         "最近 N 天"开始，而不是只从"此刻"开始 —— 否则用户看到的历史订单是空的。
+
+        **游标的时域 = MT5 服务器钟面域**：`since_ts` 记的是 `deal.time`
+        （服务器钟面，比真实 UTC 快 offset 秒）。首次初始化必须按同一时钟
+        计算，否则起点会落在真实成交之前 offset 秒（多读，靠成交号去重，
+        无害）—— 但若按真实 UTC 计算而 MT5 偏移为负，起点会**晚于**真实成交，
+        反而漏单。
+
+        `server_offset_sec` 由调用方从 MT5 推断后传入；取不到时按 0 处理
+        （退化成「宁可多读，不可漏单」的方向）。
         """
         if self._loaded:
             return
@@ -103,10 +116,14 @@ class DealCursor:
             self._last_deal_id = 0
         if self._since_ts <= 0:
             import time as _time
-            self._since_ts = _time.time() - max(1, int(lookback_days)) * 86400
+            # 服务器钟面域 = 真实 UTC + 偏移
+            self._since_ts = (
+                _time.time() + int(server_offset_sec or 0)
+                - max(1, int(lookback_days)) * 86400
+            )
             logger.info(
-                "deal cursor initialized for login=%s, lookback=%s days",
-                self.login, lookback_days,
+                "deal cursor initialized for login=%s, lookback=%s days, offset=%s",
+                self.login, lookback_days, server_offset_sec,
             )
         else:
             logger.info(

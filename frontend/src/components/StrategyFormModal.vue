@@ -56,6 +56,16 @@ const emit = defineEmits<{
 const BATCH_BAR_PERIOD = 14
 const TEMPLATE_1_ID = 'tpl_1'
 
+/**
+ * 波幅自适应（纳入当前 K 线实时高低差）的固定参数。
+ * 表单不提供开关与输入框：逆势 + 波幅档位自动开启，参数固定为「上限 1000 倍 / 重检 5 秒」。
+ * 数值与后端 strategy_templates / 节点端 strategy_rules 的缺省一致。
+ */
+const RANGE_LIVE_CAP_DEFAULT = 1000
+const RANGE_LIVE_REFRESH_DEFAULT = 5
+/** M1 档不纳入实时波幅：要让第一笔加仓先成交，M1 档必须保持原样 */
+const RANGE_LIVE_SKIP_TIMEFRAME: BatchTimeframe = 'M1'
+
 /** 规则 type，与后端 strategy_templates 对齐 */
 const RULE_TYPE_COUNTER = 1
 const RULE_TYPE_TREND = 2
@@ -281,20 +291,18 @@ const FIELD_HELP = {
   batch_timeframe:
     `统计 ATR / 波幅用的 K 线周期，固定取最近 ${BATCH_BAR_PERIOD} 根**已收盘** K 线（不含当前未走完的那根）。` +
     '算出的价格距离会换算成点数，再与实际偏离比较。' +
-    '开启「纳入当前 K 线波幅」后，本档间距会额外算上当前这根未走完的 K 线已走出的高低差。',
-  range_include_live:
-    '开启后，本档间距 = max(14 根已收盘 K 线的高低点总跨度, 当前这根未走完 K 线的实时高低差)。\n' +
+    '波幅口径会自动纳入当前这根未走完 K 线已走出的高低差（M1 档除外）。',
+  range_auto:
+    '逆势加仓的「波幅」档位自动纳入当前这根未走完 K 线的实时高低差，无需配置。\n' +
+    '本档间距 = max(' +
+    `${BATCH_BAR_PERIOD} 根已收盘 K 线的高低点总跨度, 当前这根未走完 K 线的实时高低差)。\n` +
     '急跌时实时高低差会迅速变大，间距被自动推远，逆势限价单不会在下跌中位被立刻成交。\n' +
     '行情平稳时与原逻辑完全一致。K 线收盘时实时值会并入已收盘窗口，间距自然交接、不会突然缩回。\n' +
-    '仅逆势加仓可用；顺势放大间距等于主动放弃动量，表单里不提供。\n' +
-    '建议 M1 档不要开启——要让第一笔加仓先成交，M1 档必须保持原样。',
-  range_live_cap:
-    '纳入实时后的波幅上限倍数：实时波幅超过「基线波幅 × 该值」时判定为数据异常，' +
-    '直接忽略实时值、退回基线（而不是裁剪成中间值——中间值既不保守也不激进）。\n' +
-    '这是数据异常的安全网，正常急跌不该被它挡住。默认 1000 倍，正常行情永远碰不到。',
-  range_live_refresh:
-    '重检间隔（秒）：多久刷新一次实时波幅，同时也是限价改单的最小间隔。\n' +
-    '间隔越小越灵敏、改单越频繁；终端压力大时可调到 10 秒。默认 5 秒。',
+    '仅逆势加仓可用；顺势放大间距等于主动放弃动量。\n' +
+    `异常保护固定为上限 ${RANGE_LIVE_CAP_DEFAULT} 倍、重检间隔 ${RANGE_LIVE_REFRESH_DEFAULT} 秒：` +
+    '实时波幅超过「基线波幅 × 上限倍数」时判定为数据异常，直接忽略实时值、退回基线；' +
+    '重检间隔是刷新实时波幅的节奏，也是限价改单的最小间隔。\n' +
+    'M1 档不纳入实时波幅：要让第一笔加仓先成交，M1 档必须保持原样。',
   entry_mode:
     '开仓方式：\n' +
     '市价 = 信号一到，底仓与分散仓全部市价打齐，各单开仓价相同；\n' +
@@ -476,8 +484,8 @@ function cloneRules(rules: StrategyRule[]): EditableRule[] {
         ...lv,
         // 老配置没有波幅自适应的三个字段，补默认值
         range_include_live: lv.range_include_live ?? false,
-        range_live_cap: lv.range_live_cap ?? 1000,
-        range_live_refresh: lv.range_live_refresh ?? 5,
+        range_live_cap: lv.range_live_cap ?? RANGE_LIVE_CAP_DEFAULT,
+        range_live_refresh: lv.range_live_refresh ?? RANGE_LIVE_REFRESH_DEFAULT,
       })),
       manual_scatter: r.manual_scatter?.enabled
         ? { ...defaultManualScatter(), ...r.manual_scatter, enabled: true }
@@ -657,24 +665,46 @@ function isBarCalc(calcType: BatchCalcType): boolean {
 }
 
 /**
- * 本档能否开启「纳入当前 K 线波幅」：只有逆势 + 波幅口径可用。
- * 顺势放大间距等于主动放弃动量，服务端也会强制关闭。
+ * 本档是否自动「纳入当前 K 线实时波幅」：只有逆势 + 波幅口径可用，且排除 M1 档。
+ * 顺势放大间距等于主动放弃动量，服务端也会强制关闭；
+ * M1 档要保证第一笔加仓先成交，保持原样（只按已收盘 K 线波幅）。
  */
-function canRangeAdapt(r: EditableRule, lv: StrategyBatchLevel): boolean {
-  return r.type === 1 && lv.calc_type === 'range'
+function shouldAutoRangeLive(r: EditableRule, lv: StrategyBatchLevel): boolean {
+  return (
+    r.type === RULE_TYPE_COUNTER &&
+    lv.calc_type === 'range' &&
+    lv.timeframe !== RANGE_LIVE_SKIP_TIMEFRAME
+  )
 }
 
-function onRangeAdaptToggle(lv: StrategyBatchLevel, ev: Event): void {
-  const checked = (ev.target as HTMLInputElement).checked
-  lv.range_include_live = checked
-  if (!checked) {
-    // 关闭时清掉自适应参数，避免留下无用配置
-    lv.range_live_cap = 1000
-    lv.range_live_refresh = 5
-    return
+/** 写入固定的波幅自适应参数：开关按场景，参数一律用固定默认值 */
+function applyRangeLiveDefaults(lv: StrategyBatchLevel, enabled: boolean): void {
+  lv.range_include_live = enabled
+  lv.range_live_cap = RANGE_LIVE_CAP_DEFAULT
+  lv.range_live_refresh = RANGE_LIVE_REFRESH_DEFAULT
+}
+
+/** 计算方式切换：波幅口径按规则自动开/关实时自适应，其余口径一律关闭 */
+function onCalcTypeChange(r: EditableRule, lv: StrategyBatchLevel): void {
+  applyRangeLiveDefaults(lv, shouldAutoRangeLive(r, lv))
+}
+
+/** K 线周期切换：改成 M1 就退出实时自适应，改回其它周期再按规则打开 */
+function onTimeframeChange(r: EditableRule, lv: StrategyBatchLevel): void {
+  applyRangeLiveDefaults(lv, shouldAutoRangeLive(r, lv))
+}
+
+/**
+ * 提交前统一归一波幅自适应参数：
+ * 逆势 + 波幅 + 非 M1 的档位恒为「纳入实时」，其余档位一律关闭；
+ * 上限倍数 / 重检间隔固定为 1000 / 5，不接受外部输入。
+ */
+function normalizeRangeLive(rules: EditableRule[]): void {
+  for (const r of rules) {
+    for (const lv of r.batch_levels || []) {
+      applyRangeLiveDefaults(lv, shouldAutoRangeLive(r, lv))
+    }
   }
-  if (!(lv.range_live_cap > 0)) lv.range_live_cap = 1000
-  if (!(lv.range_live_refresh >= 1)) lv.range_live_refresh = 5
 }
 
 /** 将 [1, limit] 均分为 count 段：第 1 次加仓 ~ 本规则加仓笔数上限 */
@@ -718,9 +748,10 @@ function defaultLevelParams(index: number, prev?: StrategyBatchLevel): LevelPara
       point: prev.point,
       price: prev.price ?? 0,
       timeframe: prev.timeframe || 'M5',
+      // 存量配置原样带入，实际生效值由提交前的 normalizeRangeLive 统一归一
       range_include_live: prev.range_include_live ?? false,
-      range_live_cap: prev.range_live_cap ?? 1000,
-      range_live_refresh: prev.range_live_refresh ?? 5,
+      range_live_cap: prev.range_live_cap ?? RANGE_LIVE_CAP_DEFAULT,
+      range_live_refresh: prev.range_live_refresh ?? RANGE_LIVE_REFRESH_DEFAULT,
       lot_times: prev.lot_times,
       extra_lot: prev.extra_lot,
     }
@@ -731,8 +762,8 @@ function defaultLevelParams(index: number, prev?: StrategyBatchLevel): LevelPara
     price: 0,
     timeframe: 'M5',
     range_include_live: false,
-    range_live_cap: 1000,
-    range_live_refresh: 5,
+    range_live_cap: RANGE_LIVE_CAP_DEFAULT,
+    range_live_refresh: RANGE_LIVE_REFRESH_DEFAULT,
     lot_times: Number((1.1 + index * 0.1).toFixed(2)),
     extra_lot: 0,
   }
@@ -1359,13 +1390,9 @@ function validateRules(rules: EditableRule[]): string | null {
       if (lv.point < 0) return `${at}：点数不能为负`
       if (lv.lot_times < 0) return `${at}：倍数不能为负`
       if (lv.extra_lot < 0) return `${at}：手数不能为负`
-      // 波幅纳入当前 K 线：仅逆势 + 波幅口径可用
-      if (lv.range_include_live) {
-        if (!canRangeAdapt(r, lv)) {
-          return `${at}：只有逆势加仓的波幅档位才能纳入当前 K 线波幅`
-        }
-        if (!(lv.range_live_cap > 0)) return `${at}：上限倍数需大于 0`
-        if (!(lv.range_live_refresh >= 1)) return `${at}：重检间隔至少为 1 秒`
+      // 波幅纳入当前 K 线：由表单自动决定并固定参数，这里只兜底检查一致性
+      if (lv.range_include_live && !shouldAutoRangeLive(r, lv)) {
+        return `${at}：只有逆势加仓的波幅档位才能纳入当前 K 线波幅`
       }
     }
   }
@@ -1439,6 +1466,9 @@ function prepareStrategy(): PreparedStrategy | null {
     showSaveError('请填写绑定品种')
     return null
   }
+  // 先就地归一波幅自适应（逆势 + 波幅 + 非 M1 恒为「纳入实时」，参数固定 1000 / 5），
+// 这样校验与界面看到的都是同一份最终值
+  normalizeRangeLive(form.rules)
   const rulesErr = validateRules(form.rules)
   if (rulesErr) {
     showSaveError(rulesErr)
@@ -1451,9 +1481,10 @@ function prepareStrategy(): PreparedStrategy | null {
       return null
     }
   }
+  const cloned = cloneRules(form.rules)
   const rules = isTpl1.value
-    ? applySignalPlToRules(cloneRules(form.rules), signalPl)
-    : cloneRules(form.rules)
+    ? applySignalPlToRules(cloned, signalPl)
+    : cloned
   return { name, symbol, rules }
 }
 
@@ -2371,6 +2402,7 @@ function resetRuleToTemplate(idx: number): void {
                           v-model="lv.calc_type"
                           :options="calcTypeOptions(r.type)"
                           aria-label="计算方式"
+                          @change="onCalcTypeChange(r, lv)"
                         />
                       </div>
                       <div v-if="lv.calc_type === 'price'" class="field">
@@ -2398,54 +2430,18 @@ function resetRuleToTemplate(idx: number): void {
                           v-model="lv.timeframe"
                           :options="TIMEFRAME_TAGS"
                           aria-label="K 线周期"
+                          @change="onTimeframeChange(r, lv)"
                         />
                       </div>
-                      <!-- 波幅纳入当前 K 线：仅逆势 + 波幅口径可用 -->
-                      <div v-if="canRangeAdapt(r, lv)" class="field range-adapt-field">
-                        <FormLabel
-                          :field-id="`rule-${idx}-lv-${li}-live`"
-                          text="纳入当前 K 线波幅"
-                          :help="FIELD_HELP.range_include_live"
-                        />
-                        <input
-                          :id="`rule-${idx}-lv-${li}-live`"
-                          type="checkbox"
-                          :checked="lv.range_include_live"
-                          :aria-label="`第 ${li + 1} 档纳入当前 K 线波幅`"
-                          @change="onRangeAdaptToggle(lv, $event)"
-                        />
-                      </div>
-                      <template v-if="canRangeAdapt(r, lv) && lv.range_include_live">
-                        <div class="field">
-                          <FormLabel
-                            :field-id="`rule-${idx}-lv-${li}-cap`"
-                            text="上限倍数"
-                            :help="FIELD_HELP.range_live_cap"
-                          />
-                          <input
-                            :id="`rule-${idx}-lv-${li}-cap`"
-                            v-model.number="lv.range_live_cap"
-                            type="number"
-                            min="0.1"
-                            step="0.1"
-                          />
-                        </div>
-                        <div class="field">
-                          <FormLabel
-                            :field-id="`rule-${idx}-lv-${li}-refresh`"
-                            text="重检间隔(秒)"
-                            :help="FIELD_HELP.range_live_refresh"
-                          />
-                          <input
-                            :id="`rule-${idx}-lv-${li}-refresh`"
-                            v-model.number="lv.range_live_refresh"
-                            type="number"
-                            min="1"
-                            step="1"
-                          />
-                        </div>
-                      </template>
-                      <div v-else class="field">
+                      
+                      <div
+                        v-if="
+                          lv.calc_type !== 'price'
+                          && !isBarCalc(lv.calc_type)
+                          && !isSmcCalc(lv.calc_type)
+                        "
+                        class="field"
+                      >
                         <FormLabel
                           :field-id="`rule-${idx}-lv-${li}-point`"
                           text="点数"

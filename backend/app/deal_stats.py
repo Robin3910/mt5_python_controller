@@ -84,12 +84,19 @@ def _base_conds(
     to_ts: Optional[float] = None,
     symbol: Optional[str] = None,
 ) -> list:
-    """构造查询条件。node_ids 为空列表时调用方应直接返回空统计。"""
+    """构造查询条件。node_ids 为空列表时调用方应直接返回空统计。
+
+    **时间条件在「真实 UTC」域比较**：`deal_time` 存的是服务器钟面（快 offset 秒），
+    而 `from_ts` / `to_ts` 来自 `time.time()`（真实 UTC）。直接拿 `deal_time` 比
+    会整体错位 offset 秒 —— 窗口末尾会切掉最近的成交、开头会多算一段，
+    概览的净盈亏与 MT5 对不上。所以按每行自带的 `server_time_offset` 还原成
+    真实 UTC 再比。
+    """
     conds = [Deal.node_id.in_(node_ids)]
     if from_ts is not None:
-        conds.append(Deal.deal_time >= int(from_ts))
+        conds.append(Deal.deal_time - Deal.server_time_offset >= int(from_ts))
     if to_ts is not None:
-        conds.append(Deal.deal_time <= int(to_ts))
+        conds.append(Deal.deal_time - Deal.server_time_offset <= int(to_ts))
     if symbol:
         conds.append(Deal.symbol == symbol.upper())
     return conds

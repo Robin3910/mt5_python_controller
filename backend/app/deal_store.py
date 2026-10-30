@@ -373,9 +373,11 @@ async def list_deals(
     if magic is not None:
         conds.append(Deal.magic == int(magic))
     if from_ts is not None:
-        conds.append(Deal.deal_time >= int(from_ts))
+        # deal_time 是服务器钟面（快 offset 秒），from_ts/to_ts 是真实 UTC；
+        # 按每行自带的 offset 还原后再比，否则窗口错位 offset 秒。
+        conds.append(Deal.deal_time - Deal.server_time_offset >= int(from_ts))
     if to_ts is not None:
-        conds.append(Deal.deal_time <= int(to_ts))
+        conds.append(Deal.deal_time - Deal.server_time_offset <= int(to_ts))
     if keyword:
         kw = f"%{str(keyword).strip()}%"
         conds.append(

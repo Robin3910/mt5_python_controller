@@ -461,8 +461,17 @@ class NodeClient:
         关键约定：**只有确认上报成功后才推进游标**。读失败或发送失败时游标保持不动，
         下一轮会重新采集同一批 —— 宁可重复（服务端按成交号幂等），不可丢失。
         """
+        # 游标与采集窗口都在**服务器钟面域**：先把偏移问出来，初始化游标时用得上。
+        # 偏移取不到时按 0 处理（退化成「宁可多读，不可漏读」的方向）。
+        try:
+            offset = int(await self._exec(self.mt5.server_time_offset_sec) or 0)
+        except Exception:  # noqa: BLE001
+            offset = 0
         cursor = DealCursor(self.expected_mt5_login)
-        cursor.load(lookback_days=settings.deals_lookback_days)
+        cursor.load(
+            lookback_days=settings.deals_lookback_days,
+            server_offset_sec=offset,
+        )
         while True:
             try:
                 sent = await self._collect_deals(ws, cursor)

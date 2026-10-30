@@ -321,7 +321,8 @@ function levelSpacingText(lv: StrategyBatchLevel): string {
   if (kind === 'range') {
     const base = `波幅(${lv.timeframe || 'M5'}×${BATCH_BAR_PERIOD})`
     // 纳入当前 K 线波幅的档位要标出来，否则看不出这档会随行情变
-    return lv.range_include_live ? `${base} +实时` : base
+    // 该开关由表单自动决定（逆势 + 波幅 + 非 M1），不需要用户配置
+    return lv.range_include_live ? `${base} +实时(自动)` : base
   }
   if (kind === 'fvg' || kind === 'ob' || kind === 'pdz' || kind === 'fibo') {
     return `${CALC_TYPE_LABEL[kind]}(${lv.timeframe || 'M5'}) · 等 TV 推送`
