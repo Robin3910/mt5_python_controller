@@ -251,10 +251,16 @@ class StrategyRunner:
         self._lot_sltp_cross_blocked = False
         # 重连后的第一份持仓是已有单，不算新开仓，不重算止损
         self._lot_sltp_seed_existing = False
-        # 手动分散仓：每种规则只开一次；重连时优先用 runtime，其次用仓位 comment
+        # 手动分散仓：每种规则只挂一次；重连时优先用 runtime，其次用仓位 comment
         self._manual_fired: set[int] = set()
+        # 各规则手动仓的在途限价单：键是规则类型，值是挂单快照（票号 / 手数 / 挂价）。
+        # 挂出后节点就不盯价了，成交由终端撮合；这张单还在不在盘上要靠它记着，
+        # 否则重连后会重复挂一张（挂两次就是双倍手数）。
+        self._manual_pending: dict[int, dict] = {}
         # 越过止盈的 warning / 进度每条规则只发一次，避免每 tick 刷屏
         self._manual_tp_logged: set[int] = set()
+        # 分批未加完暂不开仓的提示每条规则只发一次
+        self._manual_batch_logged: set[int] = set()
         raw_fired = self._resume_runtime.get("manual_fired")
         if isinstance(raw_fired, list):
             for item in raw_fired:
@@ -266,8 +272,21 @@ class StrategyRunner:
         self._manual_open: dict[int, dict] = manual_scatter.parse_runtime_open(
             self._resume_runtime.get("manual_open"),
         )
+        # 在途的手动限价单（重连从 runtime 还原）。离线期间这张单可能已经成交，
+        # 重连后先对着真实持仓与挂单核对一遍再决定要不要重挂。
+        self._manual_pending: dict[int, dict] = manual_scatter.parse_runtime_pending(
+            self._resume_runtime.get("manual_pending"),
+        )
         # 已消失、离场原因待确认的手动仓：成交历史可能晚一拍才写进来
         self._manual_gone: dict[int, dict] = {}
+        # 手动仓在场时，它的止盈价是本魔术号所有仓位的止盈权威：
+        # 键是规则类型，值是那一条手动仓的止盈价
+        self._manual_tp_authority: dict[int, float] = {}
+        # 重连：手动仓还在场时，它的止盈价仍是权威
+        for rule_type, snap in self._manual_open.items():
+            tp = _as_float(snap.get("tp"), 0.0)
+            if tp > 0:
+                self._manual_tp_authority[int(rule_type)] = tp
         # TradingView SMC 价位副本，以及本任务在本节点已经用过的记录
         self._smc: dict = {}
         self._smc_used: set[str] = set()
@@ -535,16 +554,24 @@ class StrategyRunner:
             if await self._risk_advance(event, positions):
                 return False
         else:
+            # 先看手动限价单有没有成交：成交了要把止盈价同步给全部持仓
+            if await self._observe_manual_pending_fills(event, positions):
+                # 刚成交，本拍不再走分批加仓（成交的手数要按新仓位重算）
+                return False
             linked = await self._manual_tp_linkage(event, positions)
             if linked is not None:
                 return linked == "done"
-            lot_result = await self._lot_sltp_sync(event, positions)
-            if lot_result == "done":
-                return True
-            if lot_result == "hit":
-                return False
+            if self._manual_authority_tp() is not None:
+                # 手动仓的止盈价是本魔术号所有仓位的止盈权威：
+                # 不再让分档手数盈亏那套反推的共同止盈来改单，只对齐到手动仓的 TP
+                await self._align_positions_to_manual_tp(positions, event)
+            else:
+                lot_result = await self._lot_sltp_sync(event, positions)
+                if lot_result == "done":
+                    return True
+                if lot_result == "hit":
+                    return False
             report_due = time.time() - self._last_report >= self.report_interval
-            opened_manual = await self._maybe_open_manual_scatter(event, positions)
             filtered = manual_scatter.exclude_manual(positions)
             metrics, lives = await self._read_bars()
             if filtered:
@@ -558,6 +585,9 @@ class StrategyRunner:
                 )
                 if decision is not None:
                     await self._add_position(decision, positions)
+            # 顺势加仓先做完，再判手动分散仓：手动仓要求本规则的分批已加满，
+            # 同拍刚加满时就能开，不必再等下一拍
+            opened_manual = await self._maybe_open_manual_scatter(event, positions)
             await self._sync_counter_limit(event, positions, metrics, lives)
             if opened_manual:
                 return False
@@ -1425,6 +1455,11 @@ class StrategyRunner:
             await self._counter_market_fallback(plan, book, resting)
             return
         await self._align_counter_order(plan, book, resting, point=ctx.point)
+        # 刚挂出的限价可能已经成交（挂价贴现价时终端立刻撮合）。
+        # 不在这里补记一笔，下一拍才会看到成交，本轮这一档就白等一个周期。
+        live2 = await self._magic_positions()
+        if live2 is not None:
+            await self._observe_counter_fills(list(live2))
 
     async def _add_position(
         self, decision, positions: list[dict], *, message: Optional[str] = None,
@@ -1476,11 +1511,17 @@ class StrategyRunner:
     async def _maybe_open_manual_scatter(
         self, event: MarketEvent, positions: list[dict],
     ) -> bool:
-        """回踩/反弹到入场则市价开一条手动分散仓。成功返回 True，本拍不再走分批加仓。"""
+        """手动分散仓：分批加满后挂出限价单，成交由终端撮合。
+
+        挂单挂上后节点就不盯价了——价格回到入场价时终端自动成交，节点只负责
+        成交后把止盈价同步给本魔术号的全部持仓。成功挂出返回 True。
+        """
         watches = manual_scatter.extract_watches(self.strategy.get("rules"))
         if not watches:
             return False
         self._manual_fired |= manual_scatter.fired_rule_types(positions)
+        # 在途的逆势限价单：那几档还没成交，分批算没加完
+        pending_counter = await self._manual_counter_pending()
         for watch in watches:
             rule_type = int(watch.get("rule_type") or 0)
             if rule_type in self._manual_fired:
@@ -1500,11 +1541,195 @@ class StrategyRunner:
                     watch, positions, price=price, entry=entry, take_profit=tp,
                 )
                 continue
-            if not manual_scatter.price_reached(direction, price, entry):
+            # 手动分散仓要等本规则的分批加仓先加完，否则不加。
+            # 在途的逆势限价单只阻塞逆势规则上的手动仓（顺势规则的档位不靠限价）
+            blocked = manual_scatter.manual_blocked_reason(
+                watch.get("rule"), self._manual_rule_added(rule_type),
+                pending_counter=pending_counter and rule_type == RULE_TYPE_COUNTER,
+            )
+            if blocked:
+                await self._skip_manual_batch_pending(watch, positions, reason=blocked)
                 continue
-            if await self._open_manual_scatter(watch, positions, fill_price=price):
+            if await self._place_manual_pending(
+                watch, positions, price=price, event=event,
+            ):
                 return True
         return False
+
+    async def _place_manual_pending(
+        self, watch: dict, positions: list[dict], *, price: float,
+        event: Optional[MarketEvent] = None,
+    ) -> bool:
+        """挂出手动分散仓的限价单。手数在这一刻算死，之后不再随行情变。
+
+        手数按「存量仓位到止盈时刻的预估亏损」反推：手动仓止盈那一刻的净额
+        刚好等于分档第一档的目标金额，与中途行情无关——存量在止盈时刻的盈亏
+        由存量开仓价决定（历史事实），手动仓的盈利由固定入场价与止盈价决定。
+
+        挂单价就是配置入场价，成交价正好等于它，止盈时刻的净额才对得上。
+        """
+        rule_type = int(watch.get("rule_type") or 0)
+        cfg = watch.get("cfg") if isinstance(watch.get("cfg"), dict) else {}
+        spec = await self._manual_symbol_spec()
+        if spec is None:
+            logger.warning("task %s manual scatter skipped: missing symbol spec", self.task_id)
+            return False
+        direction = str(watch.get("direction") or "").upper()
+        entry = _as_float(cfg.get("entry_price"))
+        tp = _as_float(cfg.get("take_profit"))
+        sl = _as_float(cfg.get("stop_loss"))
+        # 现价正好压在入场价上：限价单与止损单都挂不上（都要严格在现价一侧）
+        kind = manual_scatter.pending_kind(direction, price, entry)
+        if kind is None:
+            logger.debug(
+                "task %s manual scatter pending skipped: price %s on entry %s",
+                self.task_id, price, entry,
+            )
+            return False
+        current = manual_scatter.current_lot(positions)
+        # 存量仓位到止盈时刻的预估盈亏：手动仓止盈那一刻的净额要刚好等于目标金额，
+        # 所以先把存量仓位在止盈价处的盈亏折算出来，一并计入要赚的钱。
+        # 手动分散仓自己不进基数：它有各自的止盈价与目标金额，混进来会重复计算。
+        target = manual_scatter.tier0_pl_amount(watch.get("lot_pl_tiers"))
+        projected = manual_scatter.projected_profit(
+            manual_scatter.exclude_manual(positions),
+            tp,
+            _as_float(spec.get("tick_size")),
+            _as_float(spec.get("tick_value")),
+        )
+        projected_loss = max(0.0, -projected) if target is not None else 0.0
+        volume = manual_scatter.compute_volume(
+            cfg=cfg,
+            current_lot_size=current,
+            lot_pl_tiers=watch.get("lot_pl_tiers"),
+            tick_size=_as_float(spec.get("tick_size")),
+            tick_value=_as_float(spec.get("tick_value")),
+            volume_step=_as_float(spec.get("volume_step"), 0.01),
+            volume_min=_as_float(spec.get("volume_min"), 0.01),
+            volume_max=_as_float(spec.get("volume_max"), 100.0),
+            projected_loss=projected_loss,
+        )
+        if volume is None or volume <= 0:
+            logger.debug("task %s manual scatter skipped: no target volume", self.task_id)
+            return False
+        # 止损：配了就带上，但必须落在入场价的反方向，否则券商拒掉整张单
+        points = _as_float(spec.get("point"), 0.0)
+        stops_level = int(spec.get("stops_level") or 0)
+        order_sl = None
+        if sl > 0:
+            if manual_scatter.sl_is_sendable(
+                direction, sl, entry, stops_level=stops_level, point=points,
+            ):
+                order_sl = sl
+            else:
+                logger.info(
+                    "task %s manual scatter pending without stop loss: %s %s entry %s sl %s",
+                    self.task_id, direction, kind, entry, sl,
+                )
+        comment = str(watch.get("comment") or manual_scatter.comment_for(rule_type))[
+            :MT5_COMMENT_LIMIT
+        ]
+        try:
+            res = dict(await self._exec(
+                self._mt5.place_pending_order,
+                self.symbol, direction, volume, entry,
+                order_sl, None,   # 止盈不写进挂单：成交后由节点统一同步
+                comment, self.magic, kind,
+            ) or {})
+        except Exception as e:  # noqa: BLE001
+            logger.warning("task %s manual scatter pending failed: %s", self.task_id, e)
+            res = {"success": False, "error": str(e)}
+        if not res.get("success"):
+            logger.warning(
+                "task %s manual scatter pending failed: %s", self.task_id, res.get("error"),
+            )
+            await self._emit_progress(
+                "error", phase="running", positions=positions,
+                message=f"手动分散仓挂单失败：{res.get('error') or 'pending order failed'}",
+                detail={
+                    **manual_scatter.open_detail(
+                        watch, volume, target_pl=None, current_lot_size=current,
+                        profit_per_lot_value=0.0,
+                    ),
+                    "error": str(res.get("error") or ""),
+                },
+            )
+            return False
+        ticket = res.get("order") or res.get("ticket")
+        # 记下这张单：重连后靠它知道已经挂过，不再重复挂
+        self._manual_pending[rule_type] = {
+            "ticket": int(ticket or 0),
+            "type": direction,
+            "volume": volume,
+            "price_open": entry,
+            "sl": float(order_sl or 0.0),
+            "tp": float(tp or 0.0),
+            "time": time.time(),
+        }
+        self._manual_fired.add(rule_type)
+        # 手数不在这里计入总手数：挂单还不是持仓，成交后才算
+        volume_step = _as_float(spec.get("volume_step"), 0.01)
+        target_pl = None if bool(cfg.get("volume_locked") and _as_float(cfg.get("volume")) > 0) else (
+            manual_scatter.tier0_pl_amount(watch.get("lot_pl_tiers"))
+        )
+        per = manual_scatter.profit_per_lot(
+            entry, tp,
+            _as_float(spec.get("tick_size")),
+            _as_float(spec.get("tick_value")),
+        )
+        reason = manual_scatter.describe_pending(
+            watch, volume, target_pl=target_pl, current_lot_size=current,
+            profit_per_lot_value=per, volume_step=volume_step,
+            projected_loss=projected_loss,
+        )
+        logger.info("task %s %s", self.task_id, reason)
+        await self._emit_progress(
+            manual_scatter.PENDING_EVENT, phase="running",
+            last_order={"ticket": ticket, "price": entry, "volume": volume},
+            message=reason,
+            detail=manual_scatter.pending_detail(
+                watch, volume, target_pl=target_pl, current_lot_size=current,
+                profit_per_lot_value=per, volume_step=volume_step,
+                projected_loss=projected_loss, ticket=ticket, kind=kind,
+            ),
+        )
+        return True
+
+    def _manual_rule_added(self, rule_type: int) -> int:
+        """本规则已加仓笔数（不含开仓、不含手动仓）。"""
+        return int(self.add_counts.get(int(rule_type or 0), 0))
+
+    async def _manual_counter_pending(self) -> bool:
+        """还有在途的逆势加仓限价单吗？读失败当作没有，不阻塞手动仓。"""
+        try:
+            resting = await self._counter_resting_orders()
+        except Exception:  # noqa: BLE001
+            logger.debug("task %s counter resting read failed", self.task_id, exc_info=True)
+            return False
+        return bool(resting)
+
+    async def _skip_manual_batch_pending(
+        self, watch: dict, positions: list[dict], *, reason: str,
+    ) -> None:
+        """分批没加完时不记开火：等分批加完、回到入场仍可开。"""
+        rule_type = int(watch.get("rule_type") or 0)
+        if rule_type in self._manual_batch_logged:
+            logger.debug("task %s %s", self.task_id, reason)
+            return
+        self._manual_batch_logged.add(rule_type)
+        logger.info("task %s %s", self.task_id, reason)
+        await self._emit_progress(
+            "error", phase="running", positions=positions,
+            message=reason,
+            detail={
+                "kind": manual_scatter.DETAIL_KIND,
+                "rule_type": rule_type,
+                "direction": str(watch.get("direction") or ""),
+                "entry_price": _as_float((watch.get("cfg") or {}).get("entry_price")),
+                "take_profit": _as_float((watch.get("cfg") or {}).get("take_profit")),
+                "error": "batch_pending",
+            },
+        )
 
     async def _skip_manual_tp_passed(
         self, watch: dict, positions: list[dict], *,
@@ -1532,101 +1757,6 @@ class StrategyRunner:
             },
         )
 
-    async def _open_manual_scatter(
-        self, watch: dict, positions: list[dict], *, fill_price: float = 0.0,
-    ) -> bool:
-        cfg = watch.get("cfg") if isinstance(watch.get("cfg"), dict) else {}
-        spec = await self._manual_symbol_spec()
-        if spec is None:
-            logger.warning("task %s manual scatter skipped: missing symbol spec", self.task_id)
-            return False
-        current = manual_scatter.current_lot(positions)
-        volume = manual_scatter.compute_volume(
-            cfg=cfg,
-            current_lot_size=current,
-            lot_pl_tiers=watch.get("lot_pl_tiers"),
-            tick_size=_as_float(spec.get("tick_size")),
-            tick_value=_as_float(spec.get("tick_value")),
-            volume_step=_as_float(spec.get("volume_step"), 0.01),
-            volume_min=_as_float(spec.get("volume_min"), 0.01),
-            volume_max=_as_float(spec.get("volume_max"), 100.0),
-        )
-        if volume is None or volume <= 0:
-            logger.debug("task %s manual scatter skipped: no target volume", self.task_id)
-            return False
-        direction = str(watch.get("direction") or "").upper()
-        sl = _as_float(cfg.get("stop_loss"))
-        tp = _as_float(cfg.get("take_profit"))
-        entry = _as_float(cfg.get("entry_price"))
-        if fill_price > 0 and manual_scatter.tp_passed(direction, fill_price, tp):
-            await self._skip_manual_tp_passed(
-                watch, positions, price=fill_price, entry=entry, take_profit=tp,
-            )
-            return False
-        comment = str(watch.get("comment") or manual_scatter.comment_for(
-            int(watch.get("rule_type") or 0),
-        ))[:MT5_COMMENT_LIMIT]
-        res = await self._exec(
-            self._mt5.place_market_order,
-            self.symbol, direction, volume,
-            sl if sl > 0 else None, tp if tp > 0 else None,
-            comment, self.magic,
-        )
-        res = dict(res or {})
-        if not res.get("success"):
-            logger.warning("task %s manual scatter failed: %s", self.task_id, res.get("error"))
-            await self._emit_progress(
-                "error", phase="running", positions=positions,
-                message=f"手动分散仓失败：{res.get('error') or 'order failed'}",
-                detail={
-                    **manual_scatter.open_detail(
-                        watch, volume, target_pl=None, current_lot_size=current,
-                        profit_per_lot_value=0.0,
-                    ),
-                    "error": str(res.get("error") or ""),
-                },
-            )
-            return False
-        self._manual_fired.add(int(watch.get("rule_type") or 0))
-        self.total_volume = round(self.total_volume + volume, 4)
-        # 先按下单回报登记在场快照：随 add_manual 落库的 runtime 才带得上票号，
-        # 下一拍持仓快照会用真实持仓覆盖
-        self._manual_open[int(watch.get("rule_type") or 0)] = manual_scatter.snapshot_from_order(
-            int(watch.get("rule_type") or 0), direction, volume,
-            ticket=res.get("order") or res.get("ticket"),
-            take_profit=tp, price=_as_float(res.get("price")) or fill_price,
-            opened_at=time.time(),
-        )
-        volume_step = _as_float(spec.get("volume_step"), 0.01)
-        target_pl = None if bool(cfg.get("volume_locked") and _as_float(cfg.get("volume")) > 0) else (
-            manual_scatter.match_target_pl(watch.get("lot_pl_tiers"), current)
-        )
-        per = manual_scatter.profit_per_lot(
-            _as_float(cfg.get("entry_price")),
-            _as_float(cfg.get("take_profit")),
-            _as_float(spec.get("tick_size")),
-            _as_float(spec.get("tick_value")),
-        )
-        reason = manual_scatter.describe_open(
-            watch, volume, target_pl=target_pl, current_lot_size=current,
-            profit_per_lot_value=per, volume_step=volume_step,
-        )
-        logger.info("task %s %s", self.task_id, reason)
-        await self._emit_progress(
-            manual_scatter.EVENT_TYPE, phase="running",
-            last_order={
-                "ticket": res.get("order") or res.get("ticket"),
-                "price": res.get("price"),
-                "volume": volume,
-            },
-            message=reason,
-            detail=manual_scatter.open_detail(
-                watch, volume, target_pl=target_pl, current_lot_size=current,
-                profit_per_lot_value=per, volume_step=volume_step,
-            ),
-        )
-        return True
-
     async def _manual_symbol_spec(self) -> Optional[dict]:
         try:
             raw = dict(await self._exec(self._mt5.symbol_spec, self.symbol) or {})
@@ -1643,9 +1773,179 @@ class StrategyRunner:
             payload["manual_fired"] = sorted(self._manual_fired)
         if self._manual_open:
             payload["manual_open"] = manual_scatter.runtime_open_payload(self._manual_open)
+        if self._manual_pending:
+            payload["manual_pending"] = manual_scatter.runtime_pending_payload(
+                self._manual_pending,
+            )
+        if self._manual_tp_authority:
+            payload["manual_tp_authority"] = {
+                str(int(k)): round(float(v), 8) for k, v in self._manual_tp_authority.items()
+            }
         if self._smc_used:
             payload["smc_used"] = sorted(self._smc_used)
         return payload or None
+
+    def _manual_authority_tp(self) -> Optional[float]:
+        """手动仓在场时的止盈权威价。多条手动仓在场时取规则类型最小的那条。"""
+        for rule_type in sorted(self._manual_tp_authority):
+            tp = _as_float(self._manual_tp_authority.get(rule_type), 0.0)
+            if tp > 0:
+                return tp
+        return None
+
+    async def _align_positions_to_manual_tp(
+        self, positions: list[dict], event: MarketEvent,
+    ) -> list[int]:
+        """把本魔术号下所有仓位的止盈价对齐到手动仓的止盈价。
+
+        手动仓的止盈价一旦成为权威，其它仓位就不再由「信号分档手数盈亏」反推
+        各自的共同止盈——那套价是按加权开仓价算的，和手动仓的绝对价对不上，
+        会出现存量仓位先被平掉、手动仓还挂着的情况。
+
+        返回本次改成功���票号列表（空列表表示这次没有改动）。
+        """
+        tp = self._manual_authority_tp()
+        if tp is None:
+            return []
+        spec = await self._manual_symbol_spec()
+        if spec is None:
+            return []
+        digits = int(spec.get("digits") or 0)
+        stops_level = int(spec.get("stops_level") or 0)
+        point = _as_float(spec.get("point"), 0.0)
+        changed: list[int] = []
+        failed = False
+        for pos in positions:
+            ticket = int(pos.get("ticket") or 0)
+            if ticket <= 0:
+                continue
+            cur_tp = _as_float(pos.get("tp"), 0.0)
+            if abs(cur_tp - tp) <= 1e-9:
+                continue
+            # 止盈价已经落在现价错误一侧时券商会拒单：这次先不改，等价格回来
+            if not manual_scatter.tp_is_sendable(
+                str(pos.get("type") or ""), tp, _as_float(event.price),
+                stops_level=stops_level, point=point,
+            ):
+                continue
+            try:
+                res = dict(await self._exec(
+                    self._mt5.modify_position_sl, ticket, _as_float(pos.get("sl"), 0.0), tp,
+                ) or {})
+            except Exception as e:  # noqa: BLE001
+                logger.warning("task %s manual tp align failed: %s", self.task_id, e)
+                failed = True
+                continue
+            if not res.get("success"):
+                logger.warning(
+                    "task %s manual tp align failed: %s", self.task_id, res.get("error"),
+                )
+                failed = True
+                continue
+            changed.append(ticket)
+        if changed:
+            logger.info(
+                "task %s manual tp authority %s applied to %d position(s)",
+                self.task_id, _fmt_stop(tp), len(changed),
+            )
+            await self._emit_progress(
+                manual_scatter.TP_ALIGN_EVENT, phase="running", positions=positions,
+                message=f"手动仓止盈价 {_fmt_stop(tp)} 已同步到 {len(changed)} 笔持仓",
+                detail={
+                    "kind": manual_scatter.DETAIL_KIND,
+                    "take_profit": tp,
+                    "aligned_tickets": changed,
+                },
+            )
+        return changed
+
+    async def _observe_manual_pending_fills(
+        self, event: MarketEvent, positions: list[dict],
+    ) -> bool:
+        """检查在途的手动限价单是否已成交；成交则把止盈价同步给全部持仓。
+
+        挂单成交是终端撮合的，节点只在持仓快照里看到它变成了持仓。成交之后
+        立刻要做两件事：
+        1. 把手动仓的止盈价设为权威（本魔术号所有仓位的止盈都对齐过去）
+        2. 记一笔成交事件，让前端看到「挂单成交了」
+
+        返回 True 表示本拍有手动单成交（调用方本拍不要再走分批加仓）。
+        """
+        if not self._manual_pending:
+            return False
+        # 在途挂单：还在盘上的手动单。读失败当「不知道」，不能当成已撤单。
+        resting = await self._magic_orders()
+        resting_by_rule: dict[int, dict] = {}
+        if resting is not None:
+            for order in resting:
+                rt = manual_scatter.pending_rule_type(order)
+                if rt is not None:
+                    resting_by_rule[rt] = order
+        # 持仓快照里带 M1/M2 备注的，就是已成交的手动仓
+        held_manual = manual_scatter.snapshot_open(positions)
+        filled = False
+        for rule_type in list(self._manual_pending):
+            snap = held_manual.get(rule_type)
+            if snap is None:
+                # 还没成交：挂单若确定已不在盘上，说明被撤了或被拒了，
+                # 这条规则的手动仓就此作废，不要再重挂
+                if resting is not None and rule_type not in resting_by_rule:
+                    logger.info(
+                        "task %s manual scatter M%s pending order gone without fill",
+                        self.task_id, rule_type,
+                    )
+                    self._manual_pending.pop(rule_type, None)
+                    self._manual_fired.discard(rule_type)
+                continue
+            # 成交了
+            self._manual_pending.pop(rule_type, None)
+            filled = True
+            # 成交后手数才计入总手数（挂单期间不是持仓）
+            filled_volume = _as_float(snap.get("volume"))
+            if filled_volume > 0:
+                self.total_volume = round(self.total_volume + filled_volume, 4)
+                self.total_orders += 1
+            cfg = self._manual_watch_cfg(rule_type)
+            tp = _as_float(snap.get("tp"), 0.0)
+            if tp <= 0:
+                # 挂单上没写止盈（止盈是成交后统一同步的），按配置补上
+                tp = _as_float((cfg or {}).get("take_profit"), 0.0)
+            if tp > 0:
+                self._manual_tp_authority[rule_type] = tp
+                # 挂单上没写止盈（止盈是成交后统一同步的），持仓快照里的 tp 也是 0。
+                # 这里补上，让随事件落库的 runtime 带上止盈价——重连后它就是权威价。
+                snap["tp"] = tp
+            # 在场快照立即登记：随事件落库的 runtime 才有票号，
+            # 重连后才知道离场的是哪一笔
+            self._manual_open[rule_type] = dict(snap)
+            # 立刻把存量仓位的止盈价对齐到手动仓 TP，不能等下一拍：
+            # 存量原本的共同止盈可能更近（按加权开仓价反推），价格先到那儿
+            # 存量就被平掉了，手动仓还挂着
+            aligned = await self._align_positions_to_manual_tp(positions, event)
+            count = len(aligned)
+            reason = manual_scatter.describe_pending_filled(rule_type, snap, aligned=count)
+            logger.info("task %s %s", self.task_id, reason)
+            await self._emit_progress(
+                manual_scatter.PENDING_FILLED_EVENT, phase="running",
+                last_order={
+                    "ticket": snap.get("ticket"),
+                    "price": snap.get("price_open"),
+                    "volume": snap.get("volume"),
+                },
+                message=reason,
+                detail=manual_scatter.pending_filled_detail(
+                    rule_type, snap, aligned=count,
+                ),
+            )
+        return filled
+
+    def _manual_watch_cfg(self, rule_type: int) -> Optional[dict]:
+        """该规则手动仓的配置快照（入口价 / 止盈价）。"""
+        for watch in manual_scatter.extract_watches(self.strategy.get("rules")):
+            if int(watch.get("rule_type") or 0) == int(rule_type):
+                cfg = watch.get("cfg")
+                return cfg if isinstance(cfg, dict) else None
+        return None
 
     async def _manual_tp_linkage(
         self, event: MarketEvent, positions: list[dict],
@@ -1663,8 +1963,16 @@ class StrategyRunner:
         self._manual_open = current
         for rule_type in current:
             self._manual_gone.pop(rule_type, None)
+            # 权威价跟随真实持仓快照：手动仓的止盈价被改过（比如用户热推配置）后，
+            # 这里拿到的是券商侧的实际值，不会拿着过期的价去改其它仓位
+            tp = _as_float((current.get(rule_type) or {}).get("tp"), 0.0)
+            if tp > 0:
+                self._manual_tp_authority[int(rule_type)] = tp
         for rule_type, snap in gone.items():
             self._manual_gone[rule_type] = {**snap, "attempts": 0}
+            # 手动仓不在场了，它的止盈价不再权威：撤掉，
+            # 否则会一直拿一个已经失效的止盈价去改其它仓位的单
+            self._manual_tp_authority.pop(rule_type, None)
         if not self._manual_gone:
             return None
         linked = manual_scatter.linkage_rule_types(self.strategy.get("rules"))

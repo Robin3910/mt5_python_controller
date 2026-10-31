@@ -574,6 +574,9 @@ export type GridSide = 'long' | 'short'
  * type=1 逆势加仓 / type=2 顺势加仓（模版1）；type=3 以损定量趋势单（模版2）；
  * type=4 网格交易（模版3）。
  * 后端会按 type 只保留该类型的字段，因此另一组字段可以留空。
+ *
+ * 前端新建策略时的默认启用状态：type=1 逆势加仓默认打开，type=2 顺势加仓默认关闭；
+ * 编辑存量策略时保留已保存的状态。
  */
 export interface StrategyRule {
   type: number
@@ -822,8 +825,10 @@ export interface GroupTaskEventRecord {
   magic: number | null
   created_at: number | null
   /**
-   * open / add_counter / add_trend / add_manual / manual_tp_close / grid_add / grid_shift /
-   * cnt_limit / cnt_limit_mod / cnt_limit_off / close_partial / close_all / error / resume
+   * open / add_counter / add_trend / add_manual / manual_pending / manual_filled /
+   * manual_tp_align / manual_tp_close /
+   * grid_add / grid_shift / cnt_limit / cnt_limit_mod / cnt_limit_off / close_partial /
+   * close_all / error / resume
    */
   event_type: string
   symbol: string | null

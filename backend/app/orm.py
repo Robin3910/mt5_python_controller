@@ -496,7 +496,8 @@ class GroupTaskEvent(Base):
     node_id: Mapped[str] = mapped_column(String(32), index=True)
     magic: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
-    # open / add_counter / add_trend / add_manual / grid_add / grid_shift /
+    # open / add_counter / add_trend / add_manual / manual_pending / manual_filled /
+    # manual_tp_align / manual_tp_close / grid_add / grid_shift /
     # cnt_limit / cnt_limit_mod / cnt_limit_off / close_partial / close_all / error / resume
     event_type: Mapped[str] = mapped_column(String(16), index=True)
     symbol: Mapped[str | None] = mapped_column(String(32), nullable=True)

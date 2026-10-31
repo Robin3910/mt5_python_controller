@@ -252,21 +252,25 @@ const FIELD_HELP = {
     '添加 / 删除档位会按加仓笔数重新均分各档区间。' +
     '命中区间时按该档间距判断是否加仓，手数 = 倍数 × 基础手数 + 额外手数。',
   manual_scatter:
-    '手动分散仓与分批加仓无关：成交侧回踩/反弹到入场后市价开仓，自带止盈/止损。' +
-    'BUY 用卖价、SELL 用买价判断是否到达入场，与市价成交同一口价。' +
-    '多单等卖价 ≤ 入场再买，空单等买价 ≥ 入场再卖；现价已越过止盈则暂不开（记日志），等回到入场。' +
+    '手动分散仓与分批加仓无关：本规则的分批加仓加满后，手动仓以「限价单」挂到券商，成交价正好是入场价。' +
+    '手数在挂出那一刻就按存量仓位反推算死，之后行情怎么走都不重算：' +
+    '手数 =（分档第一档目标金额 + 存量仓位到止盈时刻的预估亏损）÷ 每手止盈。' +
+    '存量在止盈时刻的盈亏由存量开仓价决定（历史事实），手动仓的盈利由固定入场价与止盈价决定，' +
+    '所以价格走到止盈那一刻，本任务全部仓位的净额刚好等于第一档目标金额。' +
+    '成交后手动仓的止盈价成为本魔术号所有仓位的止盈权威，其余仓位的止盈统一改到它。' +
     '视觉上接在最后一档之后（档位号 +1，持仓笔数为末档终点 +1），不参与分批判定。' +
-    '手数 0 表示触发时按当时持仓匹配「分档手数盈亏」反推；手改手数后按填写值开仓。' +
+    '逆势还有在途限价单时同样算没加完。分批未启用时不受此限制。' +
+    '手数 0 表示挂单时按当时持仓匹配「分档手数盈亏」反推；手改手数后按填写值挂单。' +
     '「止盈联动清仓」默认勾选：该手动单被券商止盈平掉后，节点平掉该信号其余持仓并收口；取消勾选则只影响它自己。' +
     '顺势 / 逆势各只能配一条。保存后若任务已在跑，会立刻下发到节点。',
   manual_entry:
-    '到价后按此价判定方向并市价开仓。止盈高于入场为多，低于入场为空。' +
-    '到价看成交侧：多单卖价 ≤ 入场（回落），空单买价 ≥ 入场（反弹）。现价已过止盈则不开。',
-  manual_tp: '挂在新仓上的止盈价，须与入场价不同。',
-  manual_sl: '挂在新仓上的止损价；0 表示不设止损。',
+    '这张限价单的挂单价，成交价正好是它。止盈高于入场为多，低于入场为空。' +
+    '现价在入场上方就挂 Buy Limit 等回落，在下方就挂 Buy Stop 等反弹；现价已越过止盈则暂不挂（记日志）。',
+  manual_tp: '成交后统一同步到本任务全部仓位的止盈价；挂单本身不带止盈。须与入场价不同。',
+  manual_sl: '挂在限价单上的止损价；0 表示不设止损。止损必须落在入场价的反方向，否则券商会拒掉整张单，此时节点不带止损。',
   manual_volume:
-    '0 = 节点触发时，用该魔术号当时已持有的手数去匹配分档手数盈亏，再按价差 × tick 反推。' +
-    '只计已经开出的仓（首单、分批加仓、另一条规则已成交的手动单），不含本条尚未开出的手动分散仓。' +
+    '0 = 挂单那一刻，用该魔术号当时已持有的手数去匹配分档手数盈亏，再按价差 × tick 反推；手数在挂出时算死。' +
+    '只计已经开出的仓（首单、分批加仓、另一条规则已成交的手动单），不含本条尚未成交的手动分散仓。' +
     '手改后锁定，不再自动重算。',
   manual_close_all_on_tp:
     '勾选后，这条手动单被券商按止盈价平掉时，节点会平掉该信号（同魔术号）其余全部持仓并结束任务。' +
@@ -464,6 +468,24 @@ function defaultManualScatter(): ManualScatterConfig {
     volume_locked: false,
     close_all_on_tp: true,
   }
+}
+
+/**
+ * 前端新建策略时的默认启用状态：逆势加仓默认打开，顺势加仓默认关闭。
+ * 只作用于「按模版载入默认规则 / 恢复默认」；编辑存量策略时保留已保存的状态。
+ */
+const DEFAULT_RULE_STATUS: Record<number, number> = {
+  [RULE_TYPE_COUNTER]: 1,
+  [RULE_TYPE_TREND]: 0,
+}
+
+/** 按类型套用默认启用状态（未列出的类型保持原值） */
+function withDefaultStatus(rules: StrategyRule[]): StrategyRule[] {
+  return rules.map((r) => {
+    const def = DEFAULT_RULE_STATUS[r.type]
+    if (def === undefined) return r
+    return { ...r, status: def }
+  })
 }
 
 function cloneRules(rules: StrategyRule[]): EditableRule[] {
@@ -914,8 +936,9 @@ function manualScatterPos(r: EditableRule): number {
 
 function loadRulesFromTemplate(templateId: string): void {
   const tpl = templates.value.find((t) => t.template_id === templateId)
-  form.rules = tpl ? cloneRules(tpl.rules) : []
-  Object.assign(signalPl, extractSignalPl(tpl?.rules || []))
+  // 新建时套用前端的默认启用状态：逆势默认打开、顺势默认关闭
+  form.rules = tpl ? cloneRules(withDefaultStatus(tpl.rules)) : []
+  Object.assign(signalPl, extractSignalPl(withDefaultStatus(tpl?.rules || [])))
   resetSizing()  // 换模版后规则整组换掉，之前的试算结果不再对应任何规则
 }
 
@@ -1643,7 +1666,7 @@ async function triggerBoundGroup(): Promise<void> {
 function resetRuleToTemplate(idx: number): void {
   const tplRule = selectedTemplate.value?.rules?.[idx]
   if (!tplRule || !form.rules[idx]) return
-  Object.assign(form.rules[idx], cloneRules([tplRule])[0])
+  Object.assign(form.rules[idx], cloneRules(withDefaultStatus([tplRule]))[0])
   delete sizing[idx]
 }
 </script>

@@ -139,22 +139,37 @@ class MockMT5Client:
                 "order": tk, "deal": tk, "volume": float(volume), "price": price}
 
     # ----------------------- 挂单 -----------------------
+    def _market_price(self, symbol: str, action: str) -> float:
+        """挂单校验用的现价：BUY 看卖价、SELL 看买价（与真实 MT5Client 一致）。
+
+        挂单成交侧决定挂单价必须在哪一侧：BUY LIMIT 要挂在卖价下方，
+        BUY STOP 要挂在卖价上方。
+        """
+        sym = str(symbol or "").upper()
+        mid = float(self.prices_map.get(sym, 0.0))
+        if mid <= 0:
+            return 0.0
+        quote = self.quotes([sym]).get(sym) or {}
+        bid = float(quote.get("bid") or mid)
+        ask = float(quote.get("ask") or mid)
+        return ask if str(action or "").upper() == "BUY" else bid
+
     def _pending_price_status(self, symbol, action, price, kind="limit"):
         """与 MT5Client 同一组返回码：None 可挂，否则 side / stops / unavailable。"""
-        mid = float(self.prices_map.get(str(symbol or "").upper(), 0.0))
+        market = self._market_price(symbol, action)
         if price <= 0:
             return "unavailable", "挂单价需大于 0"
-        if mid <= 0:
+        if market <= 0:
             return "unavailable", "no tick"
         point = self.symbol_point(symbol)
         stops = int(self.stops_level or 0)
         want_below = (action == "BUY") == (kind == "limit")
-        if (price < mid) != want_below:
+        if (price < market) != want_below:
             side = "低于" if want_below else "高于"
-            return "side", f"{action} {kind} 挂单价 {price} 必须{side}现价 {mid}"
-        if stops > 0 and point > 0 and abs(price - mid) < stops * point:
+            return "side", f"{action} {kind} 挂单价 {price} 必须{side}现价 {market}"
+        if stops > 0 and point > 0 and abs(price - market) < stops * point:
             return "stops", (
-                f"挂单价距现价 {round(abs(price - mid) / point)} 点，"
+                f"挂单价距现价 {round(abs(price - market) / point)} 点，"
                 f"低于券商要求的 {stops} 点"
             )
         return None, None
