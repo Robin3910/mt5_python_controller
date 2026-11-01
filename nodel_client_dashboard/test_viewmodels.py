@@ -56,3 +56,126 @@ def test_detail_empty():
     d = build_detail(None)
     assert d.empty is True
     assert d.chips[0].key == "empty"
+
+
+def test_format_uptime_distinguishes_none_and_zero():
+    from viewmodels import format_uptime
+    assert format_uptime(None) == "--"
+    assert format_uptime(0) == "0天 0小时"
+    assert format_uptime(3600) == "0天 1小时"
+    assert format_uptime(3600 * 24 * 3 + 3600 * 14) == "3天 14小时"
+
+
+def test_hero_counts_each_state():
+    from viewmodels import build_hero
+    mgr = ProcessManager()
+    a = InstanceConfig.create(name="a", exe_path="/x/a.exe", cwd="/x")
+    b = InstanceConfig.create(name="b", exe_path="/x/b.exe", cwd="/x")
+    c = InstanceConfig.create(name="c", exe_path="/x/c.exe", cwd="/x")
+    d = InstanceConfig.create(name="d", exe_path="/x/d.exe", cwd="/x")
+    e = InstanceConfig.create(name="e", exe_path="/x/e.exe", cwd="/x")
+    ma, mb, mc, md, me = (mgr.add(x) for x in (a, b, c, d, e))
+    ma.runtime = RuntimeState(process_alive=True, health="ok", ws_state="authenticated")
+    mb.runtime = RuntimeState(process_alive=True, health="ok", ws_state="connecting")
+    mc.runtime = RuntimeState(process_alive=False, busy="starting", health="starting")
+    md.runtime = RuntimeState(process_alive=False, health="dead")
+    e.approval_status = "pending"
+    hero = build_hero(mgr)
+    assert hero.total == 5
+    assert hero.online == 2
+    assert hero.starting == 1
+    assert hero.stopped == 1
+    assert hero.pending == 1
+    assert hero.connected_mt5 == 2
+    assert hero.authenticated == 1
+    assert hero.alerts == 0
+
+
+def test_hero_states_are_mutually_exclusive():
+    """四个状态互斥：在线+启动中+已停止+待审核 必须等于总数。
+
+    否则分布条的比例和会超过 1，条形图画错。
+    """
+    from viewmodels import build_hero
+    mgr = ProcessManager()
+    # 同一实例同时满足「在线」和「待审核」两个条件
+    a = InstanceConfig.create(name="a", exe_path="/x/a.exe", cwd="/x")
+    a.approval_status = "pending"
+    mp = mgr.add(a)
+    mp.runtime = RuntimeState(process_alive=True, health="ok")
+    # 同时满足「已停止」和「待审核」
+    b = InstanceConfig.create(name="b", exe_path="/x/b.exe", cwd="/x")
+    b.approval_status = "pending"
+    mb = mgr.add(b)
+    mb.runtime = RuntimeState(process_alive=False, health="dead")
+    hero = build_hero(mgr)
+    assert hero.online + hero.starting + hero.stopped + hero.pending == hero.total
+    assert hero.online == 1
+    assert hero.pending == 1
+
+
+def test_hero_alerts_count_last_error():
+    from viewmodels import build_hero
+    mgr = ProcessManager()
+    cfg = InstanceConfig.create(name="a", exe_path="/x/a.exe", cwd="/x")
+    mp = mgr.add(cfg)
+    mp.runtime = RuntimeState(process_alive=True, health="error", last_error="连接断开")
+    assert build_hero(mgr).alerts == 1
+
+
+def test_hero_zero_instances():
+    from viewmodels import build_hero
+    hero = build_hero(ProcessManager())
+    assert hero.total == 0
+    assert hero.online == 0
+
+
+def test_card_fields_reflect_runtime():
+    from viewmodels import build_list
+    mgr = ProcessManager()
+    cfg = InstanceConfig.create(name="a", exe_path="/x/a.exe", cwd="/x", status_port=18765)
+    mp = mgr.add(cfg)
+    mp.runtime = RuntimeState(
+        process_alive=True, health="ok", ws_state="authenticated",
+        algo_trading_allowed=True, uptime_s=3600 * 25, node_id="TID-1", mt5_login=88001234,
+    )
+    item = build_list(mgr, None)[0]
+    assert item.mt5_connected is True
+    assert item.mt5_authenticated is True
+    assert item.algo_trading_ok is True
+    assert item.algo_trading_known is True
+    assert item.uptime_text == "1天 1小时"
+    assert item.node_id == "TID-1"
+    assert item.server_label == "账号 88001234"
+    assert item.badge_text == "运行中"
+    assert item.badge_tone == "online"
+
+
+def test_card_algo_unknown_is_not_ok():
+    from viewmodels import build_list
+    mgr = ProcessManager()
+    cfg = InstanceConfig.create(name="a", exe_path="/x/a.exe", cwd="/x")
+    mp = mgr.add(cfg)
+    mp.runtime = RuntimeState(process_alive=True, health="ok")
+    item = build_list(mgr, None)[0]
+    assert item.algo_trading_known is False
+    assert item.algo_trading_ok is False
+
+
+def test_card_badge_tone_matches_hero_counting():
+    """卡片徽章的状态判定必须与 hero 分布条一致。
+
+    一个实例同时「在线」且「待审核」时，卡片显示运行中，hero 也必须算进 online。
+    """
+    from viewmodels import build_hero, build_list
+    mgr = ProcessManager()
+    a = InstanceConfig.create(name="a", exe_path="/x/a.exe", cwd="/x")
+    a.approval_status = "pending"
+    mp = mgr.add(a)
+    mp.runtime = RuntimeState(process_alive=True, health="ok")
+    item = build_list(mgr, None)[0]
+    assert item.badge_tone == "online"
+    assert item.badge_text == "运行中"
+    hero = build_hero(mgr)
+    assert hero.online == 1
+    assert hero.pending == 0

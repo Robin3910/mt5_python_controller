@@ -12,6 +12,18 @@ if TYPE_CHECKING:
 
 ALGO_TRADING_OFF_LABEL = "算法交易未开启"
 
+# 连接态里算「已连上 MT5」的几种：已鉴权 / 连接中 / 重连中
+_CONNECTED_WS_STATES = ("authenticated", "connecting", "reconnecting")
+
+
+def format_uptime(seconds: float | None) -> str:
+    """运行时长文案。None=未知显示 --；0=刚启动显示 0天 0小时。"""
+    if seconds is None:
+        return "--"
+    total_hours = int(seconds) // 3600
+    days, hours = divmod(total_hours, 24)
+    return f"{days}天 {hours}小时"
+
 
 def health_zh(health: str | None) -> str:
     return {
@@ -46,6 +58,31 @@ class ListItemVM:
     # 当前 MT5 交易账号：优先用 runtime 上报的实时账号，未上报时退回配置中的期望账号。
     mt5_login: int = 0
     algo_trading_disabled: bool = False
+    # —— 卡片网格需要的字段 ——
+    node_id: str = ""
+    server_label: str = ""
+    uptime_text: str = "--"
+    mt5_connected: bool = False
+    mt5_authenticated: bool = False
+    algo_trading_ok: bool = False
+    algo_trading_known: bool = False
+    badge_text: str = "已停止"
+    badge_tone: str = "mute"
+    pending_review: bool = False
+
+
+@dataclass(frozen=True)
+class HeroVM:
+    """顶部 hero 统计：总数、四个互斥状态、三个关键指标。"""
+
+    total: int
+    online: int
+    starting: int
+    stopped: int
+    pending: int
+    connected_mt5: int
+    authenticated: int
+    alerts: int
 
 
 @dataclass(frozen=True)
@@ -89,6 +126,23 @@ def process_state_label(mp: "ManagedProcess | None") -> str:
     return "运行中" if mp.runtime.process_alive else "已停止"
 
 
+def badge_for(cfg, rt) -> tuple[str, str]:
+    """节点状态徽章：(文案, 色调)。
+
+    判定顺序与 `build_hero` 的四状态计数**必须一致** —— 否则卡片上的徽章
+    和 hero 分布条会互相矛盾（同一个实例被算进两个桶）。
+    """
+    if rt.busy == "starting":
+        return "启动中", "starting"
+    if rt.busy == "stopping":
+        return "停止中", "starting"
+    if rt.process_alive:
+        return "运行中", "online"
+    if cfg.approval_status == "pending":
+        return "待审核", "pending"
+    return "已停止", "offline"
+
+
 def build_list_item(mp: "ManagedProcess", selected_id: str | None) -> ListItemVM:
     cfg = mp.cfg
     rt = mp.runtime
@@ -103,6 +157,8 @@ def build_list_item(mp: "ManagedProcess", selected_id: str | None) -> ListItemVM
     if rt.version:
         status_line = f"v{rt.version}  ·  {status_line}"
     mt5_login = int(rt.mt5_login) if rt.mt5_login else int(cfg.mt5_login or 0)
+    badge_text, badge_tone = badge_for(cfg, rt)
+    node_id = str(rt.node_id or cfg.node_id or "")
     return ListItemVM(
         id=cfg.id,
         title=title,
@@ -116,6 +172,16 @@ def build_list_item(mp: "ManagedProcess", selected_id: str | None) -> ListItemVM
         algo_trading_disabled=algo_trading_disabled_for(
             cfg.algo_trading_disabled, rt.algo_trading_allowed,
         ),
+        node_id=node_id,
+        server_label=f"账号 {mt5_login}" if mt5_login else "账号 -",
+        uptime_text=format_uptime(rt.uptime_s),
+        mt5_connected=rt.ws_state in _CONNECTED_WS_STATES,
+        mt5_authenticated=rt.ws_state == "authenticated",
+        algo_trading_ok=rt.algo_trading_allowed is True,
+        algo_trading_known=rt.algo_trading_allowed is not None,
+        badge_text=badge_text,
+        badge_tone=badge_tone,
+        pending_review=cfg.approval_status == "pending",
     )
 
 
@@ -127,6 +193,47 @@ def build_list(manager: "ProcessManager", selected_id: str | None) -> tuple[List
             continue
         items.append(build_list_item(mp, selected_id))
     return tuple(items)
+
+
+def build_hero(manager: "ProcessManager") -> HeroVM:
+    """顶部 hero 统计。
+
+    四个状态互斥（在线 + 启动中 + 待审核 + 已停止 == 总数），判定复用
+    `badge_for` —— 与卡片徽章同源，避免条形图和卡片互相矛盾。
+    """
+    total = online = starting = stopped = pending = 0
+    connected_mt5 = authenticated = alerts = 0
+    for cfg in manager.configs():
+        mp = manager.get(cfg.id)
+        if mp is None:
+            continue
+        rt = mp.runtime
+        total += 1
+        _text, tone = badge_for(cfg, rt)
+        if tone == "online":
+            online += 1
+        elif tone == "starting":
+            starting += 1
+        elif tone == "pending":
+            pending += 1
+        else:
+            stopped += 1
+        if rt.ws_state in _CONNECTED_WS_STATES:
+            connected_mt5 += 1
+        if rt.ws_state == "authenticated":
+            authenticated += 1
+        if rt.last_error:
+            alerts += 1
+    return HeroVM(
+        total=total,
+        online=online,
+        starting=starting,
+        stopped=stopped,
+        pending=pending,
+        connected_mt5=connected_mt5,
+        authenticated=authenticated,
+        alerts=alerts,
+    )
 
 
 def build_detail(mp: "ManagedProcess | None") -> DetailVM:
