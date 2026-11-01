@@ -37,6 +37,7 @@ from . import (
     follow_rules,
     group_persist,
     group_rules,
+    latency_marks,
     market_probe,
     permissions,
     persist,
@@ -78,12 +79,16 @@ class LeaderState:
 def build_strategy_start_command(
     signal_id: str, signal: TradingSignal, volume: float,
     task_id: int, group_id: str, strategy_snapshot: dict,
+    sent_at: Optional[float] = None,
 ) -> dict:
     """策略托管开仓命令的公共部分：首单参数 + 策略规则快照。
 
     魔术号与子任务号按节点各不相同，下发前用 `for_node` 补齐。
+
+    sent_at：服务端下发时刻（Unix 秒，浮点），跨节点唯一可比的时间轴。
+    字段可选：旧节点忽略它，不影响下发。
     """
-    return {
+    cmd = {
         "cmd": "strategy_start",
         "signal_id": signal_id,
         "task_id": task_id,
@@ -102,6 +107,9 @@ def build_strategy_start_command(
         "strategy": strategy_snapshot,
         "report_interval": Config.STRATEGY_REPORT_INTERVAL,
     }
+    if sent_at is not None:
+        cmd["sent_at"] = round(float(sent_at), 6)
+    return cmd
 
 
 def for_node(command: dict, *, dispatch_id: int, magic: int) -> dict:
@@ -173,11 +181,18 @@ def build_strategy_update_command(
     *, task_id: int, dispatch_id: int, magic: Optional[int], snapshot: dict,
 ) -> dict:
     """热推进行中任务的策略快照，形状对齐 strategy_stop（cmd 直发、不包 type/data）。"""
+    version = None
+    if isinstance(snapshot, dict):
+        try:
+            version = int(snapshot.get("config_version"))
+        except (TypeError, ValueError):
+            version = None
     return {
         "cmd": "strategy_update",
         "task_id": task_id,
         "dispatch_id": dispatch_id,
         "magic": magic,
+        "config_version": version,
         "strategy": snapshot,
     }
 
@@ -940,8 +955,13 @@ class GroupDispatcher:
                 group_id, node_id, str(dispatch_id), Config.NODE_BUSY_TTL,
             )
         cmd = for_node(command, dispatch_id=dispatch_id, magic=magic)
+        # 发包时刻：逐节点各记一次（同步模式下各节点的命令是分别发出的，
+        # 记同一个时间会掩盖节点间的先后差）。跨节点唯一可比的时间轴。
+        sent_at = time.time()
+        cmd["sent_at"] = round(sent_at, 6)
         if await manager.send_to_node(node_id, cmd):
-            await group_persist.set_dispatch_status(dispatch_id, "sent")
+            await group_persist.set_dispatch_status(dispatch_id, "sent",
+                                                   sent_at=latency_marks.utcnow())
             return {"node_id": node_id, "status": "sent", "magic": magic,
                     "dispatch_id": dispatch_id, "volume": volume, "reason": None}
 

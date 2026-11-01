@@ -58,6 +58,13 @@ function fmtTime(sec: number | null | undefined): string {
   return sec ? new Date(sec * 1000).toLocaleString() : '—'
 }
 
+/** 时延埋点（毫秒）。小于 1ms 显示小数，超过 1s 转成秒更好读。 */
+function fmtMs(ms: number | null | undefined): string {
+  if (ms === null || ms === undefined) return '—'
+  if (ms < 1000) return `${ms.toFixed(1)}ms`
+  return `${(ms / 1000).toFixed(2)}s`
+}
+
 function fmtPayload(raw: string | null | undefined): string {
   if (!raw) return '—'
   try {
@@ -224,6 +231,8 @@ watch(
                 <span class="v"><span class="tag" :class="dispatchTag(d.status).cls">{{ dispatchTag(d.status).text }}</span></span>
               </div>
               <div class="list-field"><span class="k">跳过原因</span><span class="v muted" style="font-size: 12px">{{ d.skip_reason || '—' }}</span></div>
+              <div class="list-field"><span class="k">节点排队</span><span class="v muted" style="font-size: 12px">{{ fmtMs(d.queued_ms) }}</span></div>
+              <div class="list-field"><span class="k">券商往返</span><span class="v muted" style="font-size: 12px">{{ fmtMs(d.order_to_fill_ms) }}</span></div>
             </div>
           </div>
           <div v-else class="muted" style="font-size: 13px">{{ emptyDispatchHint(row) }}</div>
@@ -298,6 +307,7 @@ watch(
                     <tr>
                       <th>节点</th><th>状态</th><th>闸门</th><th class="right">决策手数</th>
                       <th>跳过原因</th><th>订单</th><th>错误</th><th>下发时间</th><th>完成时间</th>
+                      <th class="right">节点排队</th><th class="right">券商往返</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -311,6 +321,8 @@ watch(
                       <td class="muted events-break">{{ d.error || '—' }}</td>
                       <td class="muted col-time">{{ fmtTime(d.dispatched_at) }}</td>
                       <td class="muted col-time">{{ fmtTime(d.finished_at) }}</td>
+                      <td class="right muted">{{ fmtMs(d.queued_ms) }}</td>
+                      <td class="right muted">{{ fmtMs(d.order_to_fill_ms) }}</td>
                     </tr>
                   </tbody>
                 </table>

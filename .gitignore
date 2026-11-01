@@ -50,3 +50,4 @@ test/
 .idea/
 AGENTS.md
 .gitignore
+frontend/.env.local

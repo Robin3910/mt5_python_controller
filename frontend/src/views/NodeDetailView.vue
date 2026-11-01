@@ -58,6 +58,10 @@ const PAGE_SIZE_TAGS: TagOption<number>[] = [
 ]
 // 趋势面板带 echarts，异步加载让图表库不进节点详情页首屏 chunk（只在打开该 tab 时拉取）
 const TrendPanel = defineAsyncComponent(() => import('@/components/TrendPanel.vue'))
+// 历史盈亏面板同样带 echarts（内部再异步加载柱状图），用同样的异步方式
+const NodePerformancePanel = defineAsyncComponent(
+  () => import('@/components/NodePerformancePanel.vue'),
+)
 
 const route = useRoute()
 const router = useRouter()
@@ -80,12 +84,12 @@ type TabKey =
   | 'signals'
   | 'feed'
   | 'deals'
-const tab = ref<TabKey>('overview')
+const tab = ref<TabKey>('positions')
 const tabs: { key: TabKey; label: string }[] = [
+  { key: 'positions', label: '持仓' },
   { key: 'overview', label: '概览' },
   { key: 'risk', label: '账户级风控' },
   { key: 'trend', label: '趋势面板' },
-  { key: 'positions', label: '持仓' },
   { key: 'prices', label: '报价' },
   { key: 'signals', label: '信号' },
   { key: 'feed', label: '成交回报' },
@@ -487,6 +491,11 @@ watch(
 
 // ---- 列表数据 ----
 const positions = computed(() => acct.value?.positions ?? [])
+// 手机端持仓行：点击展开/收起补充字段（止损止盈、魔术号、时间）
+const posExpanded = reactive<Record<number, boolean>>({})
+function togglePos(ticket: number): void {
+  posExpanded[ticket] = !posExpanded[ticket]
+}
 const prices = computed(() => {
   const quotes = acct.value?.quotes ?? {}
   const legacy = acct.value?.prices ?? {}
@@ -585,6 +594,12 @@ function fmtChange(n: number | undefined | null): string {
 }
 function fmtTime(ms: number | undefined | null): string {
   return ms ? new Date(ms).toLocaleString() : '—'
+}
+/** 时延埋点（毫秒）。小于 1ms 显示小数，超过 1s 转成秒更好读。 */
+function fmtMs(ms: number | null | undefined): string {
+  if (ms === null || ms === undefined) return '—'
+  if (ms < 1000) return `${ms.toFixed(1)}ms`
+  return `${(ms / 1000).toFixed(2)}s`
 }
 function feedTag(status: string): { cls: string; text: string } {
   const m: Record<string, { cls: string; text: string }> = {
@@ -685,6 +700,10 @@ async function closeTicket(ticket: number): Promise<void> {
             <div class="kv"><span class="k">最近上报</span><span class="v" style="font-size: 12px">{{ fmtTime((acct.updated_at || 0) * 1000) }}</span></div>
           </div>
           <div v-else class="muted" style="font-size: 12px; margin-top: 8px">暂无账户快照（节点未上线或尚未上报）。</div>
+        </div>
+
+        <div class="card card-pad" style="margin-bottom: 16px">
+          <NodePerformancePanel :node-id="id" />
         </div>
 
         <div class="card card-pad">
@@ -914,26 +933,27 @@ async function closeTicket(ticket: number): Promise<void> {
 
       <!-- 持仓 -->
       <div v-else-if="tab === 'positions'">
-        <div v-if="positions.length" class="list-cards mobile-only">
-          <div v-for="p in positions" :key="p.ticket" class="list-card card">
-            <div class="list-field"><span class="k">品种</span><span class="v">{{ p.symbol }}</span></div>
-            <div class="list-field">
-              <span class="k">方向</span>
-              <span class="v"><span class="tag" :class="p.type === 'BUY' ? 'green' : 'blue'">{{ p.type }}</span></span>
+        <div v-if="positions.length" class="pos-list mobile-only">
+          <div v-for="p in positions" :key="p.ticket" class="pos-item card">
+            <div class="pos-row" @click="togglePos(p.ticket)">
+              <div class="pos-main">
+                <span class="pos-symbol">{{ p.symbol }}</span>
+                <span class="tag" :class="p.type === 'BUY' ? 'green' : 'blue'">{{ p.type === 'BUY' ? '多' : '空' }}</span>
+                <span class="pos-vol">{{ p.volume }}</span>
+              </div>
+              <div class="pos-px">
+                <span class="pos-px-from">{{ p.price_open }}</span>
+                <span class="pos-px-arrow">→</span>
+                <span class="pos-px-to">{{ p.price_current }}</span>
+              </div>
+              <span class="pos-profit" :class="p.profit >= 0 ? 'profit-pos' : 'profit-neg'">{{ fmt(p.profit) }}</span>
+              <button class="btn-sm btn-ghost pos-close" @click.stop="closeTicket(p.ticket)">平</button>
             </div>
-            <div class="list-field"><span class="k">手数</span><span class="v">{{ p.volume }}</span></div>
-            <div class="list-field"><span class="k">开仓价</span><span class="v">{{ p.price_open }}</span></div>
-            <div class="list-field"><span class="k">现价</span><span class="v">{{ p.price_current }}</span></div>
-            <div class="list-field"><span class="k">止损</span><span class="v">{{ p.sl || '—' }}</span></div>
-            <div class="list-field"><span class="k">止盈</span><span class="v">{{ p.tp || '—' }}</span></div>
-            <div class="list-field">
-              <span class="k">盈亏</span>
-              <span class="v" :class="p.profit >= 0 ? 'profit-pos' : 'profit-neg'">{{ fmt(p.profit) }}</span>
-            </div>
-            <div class="list-field"><span class="k">魔术号</span><span class="v muted">{{ p.magic }}</span></div>
-            <div class="list-field"><span class="k">时间</span><span class="v muted" style="font-size: 12px; font-weight: 500">{{ fmtTime(p.time * 1000) }}</span></div>
-            <div class="list-card-actions">
-              <button class="btn-sm btn-ghost" @click="closeTicket(p.ticket)">平仓</button>
+            <div v-if="posExpanded[p.ticket]" class="pos-detail">
+              <span>止损 <b>{{ p.sl || '—' }}</b></span>
+              <span>止盈 <b>{{ p.tp || '—' }}</b></span>
+              <span>魔术 <b>{{ p.magic }}</b></span>
+              <span>时间 <b>{{ fmtTime(p.time * 1000) }}</b></span>
             </div>
           </div>
         </div>
@@ -1126,6 +1146,8 @@ async function closeTicket(ticket: number): Promise<void> {
                       <div class="kv"><span class="k">错误</span><span class="v" style="font-size: 12px">{{ s.error || '—' }}</span></div>
                       <div class="kv"><span class="k">下发时间</span><span class="v" style="font-size: 12px">{{ fmtTime((s.dispatched_at || 0) * 1000) }}</span></div>
                       <div class="kv"><span class="k">完成时间</span><span class="v" style="font-size: 12px">{{ fmtTime((s.finished_at || 0) * 1000) }}</span></div>
+                      <div class="kv"><span class="k">节点排队</span><span class="v" style="font-size: 12px">{{ fmtMs(s.queued_ms) }}</span></div>
+                      <div class="kv"><span class="k">券商往返</span><span class="v" style="font-size: 12px">{{ fmtMs(s.order_to_fill_ms) }}</span></div>
                     </div>
                   </div>
                   <div v-if="s.raw_payload" style="margin-top: 10px">
@@ -1284,6 +1306,91 @@ async function closeTicket(ticket: number): Promise<void> {
 </template>
 
 <style scoped>
+/* ── 手机端紧凑持仓行：一行展示一个仓位 ── */
+.pos-list {
+  display: none;
+}
+@media (max-width: 768px) {
+  .pos-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+}
+.pos-item {
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+}
+.pos-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+}
+.pos-main {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 0 auto;
+  min-width: 0;
+}
+.pos-symbol {
+  font-size: 13px;
+  font-weight: 700;
+  font-family: var(--mono);
+  white-space: nowrap;
+}
+.pos-vol {
+  font-size: 11px;
+  color: var(--muted);
+  font-family: var(--mono);
+  white-space: nowrap;
+}
+.pos-px {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  justify-content: flex-end;
+  gap: 4px;
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.pos-px-from { color: var(--muted); }
+.pos-px-arrow { color: var(--muted); opacity: 0.6; font-size: 10px; }
+.pos-px-to { color: var(--text); }
+.pos-profit {
+  flex: 0 0 auto;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 700;
+  text-align: right;
+  min-width: 56px;
+}
+.pos-close {
+  flex: 0 0 auto;
+  padding: 3px 8px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+.pos-detail {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--glass-border);
+  font-size: 11px;
+  color: var(--muted);
+}
+.pos-detail b {
+  color: var(--text);
+  font-weight: 600;
+  font-family: var(--mono);
+}
+
 .risk-rules {
   display: flex;
   flex-direction: column;

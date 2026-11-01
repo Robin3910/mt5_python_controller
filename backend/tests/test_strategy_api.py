@@ -212,6 +212,58 @@ def test_counter_batch_level_keeps_smc_calc_type(client):
     assert level["timeframe"] == "M5"
 
 
+def test_batch_level_range_live_fields_are_persisted(client):
+    """波幅纳入当前 K 线的三个字段要能原样存下来。"""
+    h = auth_headers(client)
+    level = _created_level(client, h, "波幅自适应策略", {
+        "calc_type": "range", "timeframe": "M5",
+        "range_include_live": True, "range_live_cap": 12.5, "range_live_refresh": 3,
+    })
+    assert level["range_include_live"] is True
+    assert level["range_live_cap"] == 12.5
+    assert level["range_live_refresh"] == 3
+
+
+def test_batch_level_range_live_defaults_to_off(client):
+    """老配置没有这三个字段时补默认值，行为与上线前一致。"""
+    h = auth_headers(client)
+    level = _created_level(client, h, "波幅默认策略", {
+        "calc_type": "range", "timeframe": "M5",
+    })
+    assert level["range_include_live"] is False
+    assert level["range_live_cap"] == 1000.0
+    assert level["range_live_refresh"] == 5
+
+
+def test_batch_level_range_live_is_forced_off_for_non_range_calc(client):
+    """只有波幅口径才谈得上纳入实时，其它计算方式一律关闭。"""
+    h = auth_headers(client)
+    level = _created_level(client, h, "ATR策略", {
+        "calc_type": "atr", "timeframe": "M5", "range_include_live": True,
+    })
+    assert level["range_include_live"] is False
+
+
+def test_trend_rule_forces_range_live_off(client):
+    """顺势强制关闭：放大间距对顺势等于主动放弃动量。"""
+    h = auth_headers(client)
+    rule = _batch_rule({
+        "calc_type": "range", "timeframe": "M5", "range_include_live": True,
+    })
+    rule["type"] = 2
+    r = client.post(
+        "/api/strategies",
+        json={
+            "template_id": TEMPLATE_1_ID, "name": "顺势波幅策略", "symbol": "XAUUSD",
+            "rules": [rule],
+        },
+        headers=h,
+    )
+    assert r.status_code == 201, r.text
+    trend = next(x for x in r.json()["rules"] if x["type"] == 2)
+    assert trend["batch_levels"][0]["range_include_live"] is False
+
+
 def test_trend_batch_level_rejects_smc_calc_type(client):
     """顺势档位不能选 SMC 标识，避免节点按逆势价位去加顺势仓。"""
     h = auth_headers(client)

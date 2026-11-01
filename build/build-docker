@@ -2,3 +2,7 @@
 cd "$(dirname "$0")"
 git pull
 docker compose up -d --build --force-recreate
+
+
+# $env:BUILDX_BAKE_ENTITLEMENTS_FS="false"
+# docker compose -f docker-compose.windows.yml up -d --build --force-recreate

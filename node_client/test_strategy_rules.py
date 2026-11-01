@@ -7,16 +7,23 @@ from strategy_rules import (
     action_matches,
     count_adds_by_rule,
     counter_anchor_price,
+    counter_limit_price,
+    counter_order_key,
+    counter_pending_key,
     decision_comment,
     decision_detail,
+    describe_counter_limit,
     describe_decision,
     deviation_points,
     evaluate,
     evaluate_rule,
+    plan_counter_limit,
     metric_key,
     parse_add_rule_type,
     pick_batch_level,
     pick_smc_level,
+    range_adapt_enabled,
+    resolve_threshold,
     rule_base_price,
     smc_key_from_comment,
     smc_record_key,
@@ -359,6 +366,168 @@ def test_unknown_calc_type_falls_back_to_point():
     assert d is not None and d.calc_type == "point"
 
 
+# --------------------------- 波幅纳入当前 K 线 ---------------------------
+def test_range_level_with_live_uses_larger_of_baseline_and_live():
+    """开启纳入实时后，间距取 max(基线, 实时)。
+
+    基线 30.0 → 3000 点；实时 60.0 → 6000 点。现价走到 2340（逆向 6000 点）才触发。
+    """
+    rule = leveled_rule({
+        "calc_type": "range", "timeframe": "M5",
+        "range_include_live": True, "range_live_cap": 50.0, "range_live_refresh": 5,
+    })
+    c = ctx(
+        price=2340.0,
+        bar_metrics={metric_key("range", "M5"): 30.0},
+        bar_live={metric_key("range", "M5"): 60.0},
+    )
+    d = evaluate_rule(rule, c)
+    assert d is not None
+    assert d.metric_value == 60.0
+    assert d.threshold == 6000           # 60.0 / 0.01
+    assert d.adapt is not None
+    assert d.adapt["baseline"] == 30.0
+    assert d.adapt["live"] == 60.0
+    assert d.adapt["effective"] == 60.0
+    assert d.adapt["adapted"] is True
+
+
+def test_range_level_without_live_keeps_baseline():
+    """未开启时行为与原来完全一致，明细为空。"""
+    rule = leveled_rule({"calc_type": "range", "timeframe": "M5"})
+    c = ctx(
+        price=2370.0,
+        bar_metrics={metric_key("range", "M5"): 30.0},
+        bar_live={metric_key("range", "M5"): 60.0},
+    )
+    d = evaluate_rule(rule, c)
+    assert d is not None
+    assert d.metric_value == 30.0
+    assert d.threshold == 3000
+    assert d.adapt is None
+
+
+def test_range_level_without_live_data_keeps_baseline():
+    """开启了但没读到实时值时退回基线，不能退化成 0 阈值。"""
+    rule = leveled_rule({
+        "calc_type": "range", "timeframe": "M5", "range_include_live": True,
+    })
+    c = ctx(price=2370.0, bar_metrics={metric_key("range", "M5"): 30.0})
+    d = evaluate_rule(rule, c)
+    assert d is not None
+    assert d.metric_value == 30.0
+    assert d.adapt is None
+
+
+def test_range_level_with_live_respects_cap():
+    """上限是数据异常的安全网：实时波幅超过 基线 × cap 时忽略实时值。
+
+    基线 30.0、上限 50 倍 → 实时 5000.0（166 倍）判为异常，退回基线 30.0。
+    """
+    level = {
+        "calc_type": "range", "timeframe": "M5",
+        "range_include_live": True, "range_live_cap": 50.0,
+    }
+    c = ctx(
+        bar_metrics={metric_key("range", "M5"): 30.0},
+        bar_live={metric_key("range", "M5"): 5000.0},
+    )
+    t = resolve_threshold(RULE_TYPE_COUNTER, level, c)
+    assert t.metric_value == 30.0        # 退回基线，不是裁剪成中间值
+    assert t.adapt is not None
+    assert t.adapt["clamped"] is True
+    assert t.adapt["adapted"] is False
+
+
+def test_range_level_does_not_clamp_normal_crash():
+    """正常急跌不该被上限挡掉，否则「跟随更大波幅」就失效了。
+
+    场景：平稳时基线 30 点，暴跌时实时波幅 6000 点（200 倍）——
+    这是真实行情，默认上限（1000 倍）不该把它挡下来。
+    """
+    level = {
+        "calc_type": "range", "timeframe": "M5",
+        "range_include_live": True, "range_live_cap": 1000.0,
+    }
+    c = ctx(
+        bar_metrics={metric_key("range", "M5"): 30.0},
+        bar_live={metric_key("range", "M5"): 6000.0},
+    )
+    t = resolve_threshold(RULE_TYPE_COUNTER, level, c)
+    assert t.metric_value == 6000.0
+    assert t.adapt is not None
+    assert t.adapt["clamped"] is False
+    assert t.adapt["adapted"] is True
+
+
+def test_trend_rule_ignores_range_live():
+    """顺势不启用自适应：放大间距等于主动放弃动量。"""
+    rule = leveled_rule({
+        "calc_type": "range", "timeframe": "M5", "range_include_live": True,
+    }, type=RULE_TYPE_TREND)
+    c = ctx(
+        price=2460.0,
+        bar_metrics={metric_key("range", "M5"): 30.0},
+        bar_live={metric_key("range", "M5"): 60.0},
+    )
+    d = evaluate_rule(rule, c)
+    assert d is not None
+    assert d.metric_value == 30.0
+    assert d.adapt is None
+
+
+def test_atr_level_never_uses_live():
+    """ATR 是逐根均值，本次不做自适应。"""
+    rule = leveled_rule({
+        "calc_type": "atr", "timeframe": "M5", "range_include_live": True,
+    })
+    c = ctx(
+        price=2390.0,
+        bar_metrics={metric_key("atr", "M5"): 1.0},
+        bar_live={metric_key("atr", "M5"): 5.0},
+    )
+    d = evaluate_rule(rule, c)
+    assert d is not None
+    assert d.metric_value == 1.0
+    assert d.adapt is None
+
+
+def test_range_adapt_enabled_only_for_range_calc():
+    assert range_adapt_enabled({"calc_type": "range", "range_include_live": True})
+    assert not range_adapt_enabled({"calc_type": "range", "range_include_live": False})
+    assert not range_adapt_enabled({"calc_type": "atr", "range_include_live": True})
+    assert not range_adapt_enabled({"calc_type": "point", "range_include_live": True})
+
+
+def test_range_adapt_enabled_accepts_string_flags():
+    """配置从 JSON 过来时开关可能是字符串。"""
+    assert range_adapt_enabled({"calc_type": "range", "range_include_live": "true"})
+    assert range_adapt_enabled({"calc_type": "range", "range_include_live": 1})
+    assert not range_adapt_enabled({"calc_type": "range", "range_include_live": "false"})
+    assert not range_adapt_enabled({"calc_type": "range"})
+
+
+def test_decision_detail_reports_adapt_breakdown():
+    """后台要能还原「基线 → 实时 → 生效」这条链路。"""
+    rule = leveled_rule({
+        "calc_type": "range", "timeframe": "M5", "range_include_live": True,
+    })
+    c = ctx(
+        price=2340.0,
+        bar_metrics={metric_key("range", "M5"): 30.0},
+        bar_live={metric_key("range", "M5"): 60.0},
+    )
+    d = evaluate_rule(rule, c)
+    assert d is not None
+    detail = decision_detail(d)
+    assert detail["baseline_range"] == 30.0
+    assert detail["live_range"] == 60.0
+    assert detail["effective_range"] == 60.0
+    assert detail["range_live_adapted"] is True
+    assert detail["range_live_clamped"] is False
+    assert "当前 K 线实时" in detail["gap_source"]
+
+
 def test_base_params_always_use_point_calc():
     """非分批的基础参数没有计算方式，恒按点数处理。"""
     d = evaluate_rule(counter_rule(), ctx(price=2399.0))
@@ -595,6 +764,119 @@ def test_smc_sell_uses_resistance_above_anchor():
     assert hit is not None and hit.action == "SELL"
     assert hit.smc_side == -1
     assert "阻力" in describe_decision(hit)
+
+
+def test_plan_counter_limit_rests_below_anchor_before_price_arrives():
+    """逆势限价按锚点提前算好，不等现价跌到阈值。"""
+    plan = plan_counter_limit([counter_rule()], ctx(price=2400.0), digits=2)
+    assert plan is not None
+    assert plan.limit_price == 2399.0
+    assert plan.deviation == 100
+    assert plan.volume == 0.11
+    assert counter_order_key(plan) == (0.11, -1, "point", "")
+    assert counter_pending_key(decision_comment(plan), plan.volume) == counter_order_key(plan)
+    assert "挂出限价" in describe_counter_limit(plan, verb="挂出限价")
+
+
+def test_plan_counter_limit_sell_sits_above_anchor():
+    plan = plan_counter_limit(
+        [counter_rule()], ctx(direction="SELL", price=2400.0), digits=2,
+    )
+    assert plan is not None and plan.limit_price == 2401.0
+    assert plan.action == "SELL"
+
+
+def test_plan_counter_limit_uses_anchor_not_latest_trend_price():
+    plan = plan_counter_limit(
+        [counter_rule()],
+        ctx(base_price=2410.0, counter_base_price=2400.0, price=2405.0),
+        digits=2,
+    )
+    assert plan is not None and plan.limit_price == 2399.0
+    assert plan.base_price == 2400.0
+
+
+def test_plan_counter_limit_atr_and_absolute_prices():
+    atr = plan_counter_limit(
+        [counter_rule(
+            batch_enabled=True, batch_count=1, total_lot_limit=4,
+            batch_levels=[{
+                "pos_from": 1, "pos_to": 4, "calc_type": "atr", "timeframe": "M5",
+                "lot_times": 1.0, "extra_lot": 0,
+            }],
+        )],
+        ctx(bar_metrics={metric_key("atr", "M5"): 1.0}),
+        digits=2,
+    )
+    assert atr is not None and atr.limit_price == 2399.0
+    assert counter_order_key(atr)[2] == "atr"
+
+    priced = plan_counter_limit(
+        [counter_rule(
+            batch_enabled=True, batch_count=1, total_lot_limit=2,
+            batch_levels=[{
+                "pos_from": 1, "pos_to": 2, "calc_type": "price", "price": 2390.0,
+                "lot_times": 1.0, "extra_lot": 0,
+            }],
+        )],
+        ctx(),
+        digits=2,
+    )
+    assert priced is not None and priced.limit_price == 2390.0
+
+    smc = {
+        "symbol": "XAUUSD", "tf": "M5", "received_at": 10.0,
+        "levels": [{"type": "fvg", "side": 1, "price": 2388.5}],
+    }
+    fvg = plan_counter_limit(
+        [counter_rule(
+            batch_enabled=True, batch_count=1, total_lot_limit=2,
+            batch_levels=[{
+                "pos_from": 1, "pos_to": 2, "calc_type": "fvg", "timeframe": "M5",
+                "lot_times": 1.0, "extra_lot": 0,
+            }],
+        )],
+        ctx(smc=smc),
+        digits=2,
+    )
+    assert fvg is not None and fvg.limit_price == 2388.5
+    assert fvg.smc_key
+    assert counter_pending_key(decision_comment(fvg), fvg.volume) == counter_order_key(fvg)
+
+
+def test_plan_counter_limit_skips_disabled_full_and_wrong_side():
+    assert plan_counter_limit([counter_rule(status=0)], ctx()) is None
+    assert plan_counter_limit(
+        [counter_rule(max_allow_num=1)],
+        ctx(add_counts={RULE_TYPE_COUNTER: 1}),
+    ) is None
+    assert plan_counter_limit([counter_rule(action="sell")], ctx(direction="BUY")) is None
+    # 指定价在锚点有利侧，不是逆势限价
+    assert plan_counter_limit(
+        [counter_rule(
+            batch_enabled=True, batch_count=1, total_lot_limit=1,
+            batch_levels=[{
+                "pos_from": 1, "pos_to": 1, "calc_type": "price", "price": 2410.0,
+                "lot_times": 1.0, "extra_lot": 0,
+            }],
+        )],
+        ctx(),
+    ) is None
+
+
+def test_evaluate_can_ignore_counter_rules():
+    """执行器市价路径只跑顺势时，逆势偏离够了也不返回。"""
+    rules = [counter_rule(), counter_rule(type=RULE_TYPE_TREND, point=100)]
+    assert evaluate(rules, ctx(price=2399.0), rule_types=(RULE_TYPE_TREND,)) is None
+    trend = evaluate(rules, ctx(price=2401.0), rule_types=(RULE_TYPE_TREND,))
+    assert trend is not None and trend.rule_type == RULE_TYPE_TREND
+
+
+def test_counter_limit_price_points_from_anchor():
+    from strategy_rules import Threshold
+    gap = Threshold(100.0)
+    assert counter_limit_price("BUY", 2400.0, POINT, gap) == 2399.0
+    assert counter_limit_price("SELL", 2400.0, POINT, gap) == 2401.0
 
 
 def test_max_allow_num_is_per_rule():

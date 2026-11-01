@@ -14,7 +14,7 @@ import * as echarts from 'echarts/core'
 import { BarChart } from 'echarts/charts'
 import { GridComponent, MarkLineComponent, TooltipComponent } from 'echarts/components'
 import { CanvasRenderer } from 'echarts/renderers'
-import type { FollowDailyProfitPoint } from '@/api/types'
+import type { FollowDailyProfitPoint, NodeDailyProfitPoint } from '@/api/types'
 
 echarts.use([
   BarChart,
@@ -26,12 +26,19 @@ echarts.use([
 
 const props = withDefaults(
   defineProps<{
-    /** 近 N 日的每日净盈亏（已按日期升序） */
-    points?: FollowDailyProfitPoint[]
+    /** 近 N 日的每日净盈亏（已按日期升序）。
+     *
+     * 带单页 / AI 页用 `FollowDailyProfitPoint`（固定 7 日），
+     * 节点概览页用 `NodeDailyProfitPoint`（天数可变）——
+     * 两者字段完全一致，这里用联合类型同时兼容。
+     */
+    points?: (FollowDailyProfitPoint | NodeDailyProfitPoint)[]
     /** 图表高度（px） */
     height?: number
+    /** 标题里的天数（与 points 长度一致） */
+    days?: number
   }>(),
-  { points: () => [], height: 150 },
+  { points: () => [], height: 150, days: 7 },
 )
 
 /** 与全局主题一致的配色 */
@@ -204,7 +211,7 @@ onBeforeUnmount(() => {
 <template>
   <div ref="wrapEl" class="pbc-wrap">
     <div class="pbc-head">
-      <span class="pbc-title">近 7 日收益</span>
+      <span class="pbc-title">近 {{ days }} 日收益</span>
       <!-- 没有数据点时不显示合计：$0.00 会被误读成「赚了 0 块」，
            而真实语义是「连这 7 天的数据都没有」 -->
       <span v-if="hasData" class="pbc-total" :class="total >= 0 ? 'pos' : 'neg'">{{ fmtAmount(total) }}</span>

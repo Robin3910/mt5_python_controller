@@ -1,11 +1,12 @@
-"""成交明细 API（订单历史 / 带单绩效的数据出口）。
+"""成交明细 API（订单历史 / 带单绩效 / 节点概览的绩效数据出口）。
 
 - `GET /api/deals/nodes/{node_id}/deals`：某节点的成交明细分页（带 summary）
+- `GET /api/deals/nodes/{node_id}/performance`：某节点的绩效汇总 + 按日序列
 - `GET /api/deals/follow/leaders/{leader_user_id}/performance`：带单员绩效
 
 数据源全部是 `mt5_deal` 表（节点上报的历史成交）。**统计口径集中在
-deal_stats 一处**（胜率按持仓级聚合，不是按成交笔数），订单历史页与带单页
-读的是同一套实现，保证同一节点两处看到的胜率、净盈亏完全一致。
+deal_stats 一处**（胜率按持仓级聚合，不是按成交笔数），订单历史页、概览页
+与带单页读的是同一套实现，保证同一节点各处看到的胜率、净盈亏完全一致。
 
 权限与数据可见性（设计文档要求，务必遵守）：
 - 聚合绩效（收益 / 胜率 / 笔数）：所有能进【带单】菜单的人可见 —— 带单广场
@@ -21,11 +22,14 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from . import deal_stats, deal_store, follow_rules, follow_service, user_service
 from .deps import get_store, owned_node_or_404, require_menu
-from .models import DealSummary, PaginatedDeals
+from .models import DealSummary, NodePerformanceResponse, PaginatedDeals
 from .permissions import MENU_FOLLOW, Principal
 from .redis_store import RedisStore
 
 router = APIRouter(prefix="/api/deals", tags=["deals"])
+
+# 概览页默认 7 天柱状图；统计窗口另有 7d/30d/90d/all 四档
+DEFAULT_DAILY_DAYS = 7
 
 
 # ---------------------------------------------------------------------------
@@ -34,7 +38,7 @@ router = APIRouter(prefix="/api/deals", tags=["deals"])
 async def get_principal_deals(
     p: Principal = Depends(require_menu("nodes", "trading")),
 ) -> Principal:
-    """节点成交明细的访问身份。
+    """节点成交明细 / 绩效的访问身份。
 
     订单历史出现在【交易】与【节点】两个页面，因此要求拥有其中任一菜单；
     数据归属仍由 owned_node_or_404 兜住。
@@ -82,6 +86,44 @@ async def node_deals(
 
 
 # ---------------------------------------------------------------------------
+# 节点绩效（概览页）
+# ---------------------------------------------------------------------------
+@router.get("/nodes/{node_id}/performance", response_model=NodePerformanceResponse)
+async def node_performance(
+    node_id: str,
+    window: str = "30d",
+    days: int = DEFAULT_DAILY_DAYS,
+    store: RedisStore = Depends(get_store),
+    p: Principal = Depends(get_principal_deals),
+):
+    """某节点的绩效汇总与按日收益序列（概览页数据源）。
+
+    - summary：按窗口（7d/30d/90d/all）聚合的收益 / 胜率 / 笔数
+    - daily：按日柱状图数据，**固定 days 天**（默认 7 天），
+      不随统计窗口变化 —— 柱状图看的是近况，数字看的是区间收益，两者口径不同
+      是有意为之（与带单页一致）。
+
+    恒等式（重要）：daily 的总和与 `days` 天内所有出场成交的净盈亏之和相等。
+    daily 与 summary 用的是同一批成交（出场类 OUT / INOUT / OUT_BY）、
+    同一份 net_profit（profit + swap + commission），只是统计区间不同。
+    """
+    await owned_node_or_404(store, p, node_id)
+
+    win = window if window in deal_stats.WINDOWS else deal_stats.DEFAULT_WINDOW
+    from_ts = deal_stats.window_start(win)
+    days = max(1, min(int(days or DEFAULT_DAILY_DAYS), 90))
+
+    summary = await deal_stats.node_summary(node_id, from_ts, None)
+    daily = await deal_stats.daily_net_profit([node_id], days=days)
+    return {
+        "node_id": node_id,
+        "window": win,
+        "summary": summary,
+        "daily": daily,
+    }
+
+
+# ---------------------------------------------------------------------------
 # 带单员绩效
 # ---------------------------------------------------------------------------
 @router.get("/follow/leaders/{leader_user_id}/performance")
@@ -94,7 +136,7 @@ async def leader_performance(
     """带单员绩效（累计收益 / 收益率 / 胜率 / 笔数 / 跟单人数）。
 
     口径：
-    - 绩效 = 该带单员**主节点**的成交聚合（与订单历史页同一套实现）；
+    - 绩效 = 该带单员**主节点**的成交聚合（与订单历史页、概览页同一套实现）；
       主节点就是带单源，跟单员收到的是它的信号，所以广场上给他看的绩效
       也必须来自同一个账户 —— 混进名下其它节点会让选单依据失真；
     - 跟单人数 = 跟了他（任一分组）的**去重节点数**（跟单关系表，非订单数据）。
