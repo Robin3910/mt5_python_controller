@@ -1,13 +1,14 @@
 """成交统计口径的**唯一实现**。
 
 改动前请先读：
-- 「带单员绩效」= 「主节点绩效」= `node_summary(主节点)`，**同一套函数**，不是两套实现。
-  两处各写一份必然漂移，届时会出现「同一节点在订单历史页与带单页胜率不一致」。
+- 「带单员绩效」= 「主节点绩效」= 「节点概览绩效」= 「成交明细页的 summary」
+  = `node_summary(node_id)` / `leader_batch(node_ids)`，**同一套函数**，不是多套实现。
+  各处各写一份必然漂移，届时会出现「同一节点在订单历史页、带单页与概览页胜率不一致」。
 - **胜率按 position_id 聚合**（持仓级），不是按成交笔数。
   一笔持仓可能分多次出场（分批止盈 + 移动止损），按成交计数会把一笔持仓算成多笔，
   胜率失真。这是本模块最容易写错的地方。
 
-窗口定义（带单页可切换，四档）：
+窗口定义（页面可切换，四档）：
     7d / 30d（默认）/ 90d / all
 """
 from __future__ import annotations
@@ -83,12 +84,19 @@ def _base_conds(
     to_ts: Optional[float] = None,
     symbol: Optional[str] = None,
 ) -> list:
-    """构造查询条件。node_ids 为空列表时调用方应直接返回空统计。"""
+    """构造查询条件。node_ids 为空列表时调用方应直接返回空统计。
+
+    **时间条件在「真实 UTC」域比较**：`deal_time` 存的是服务器钟面（快 offset 秒），
+    而 `from_ts` / `to_ts` 来自 `time.time()`（真实 UTC）。直接拿 `deal_time` 比
+    会整体错位 offset 秒 —— 窗口末尾会切掉最近的成交、开头会多算一段，
+    概览的净盈亏与 MT5 对不上。所以按每行自带的 `server_time_offset` 还原成
+    真实 UTC 再比。
+    """
     conds = [Deal.node_id.in_(node_ids)]
     if from_ts is not None:
-        conds.append(Deal.deal_time >= int(from_ts))
+        conds.append(Deal.deal_time - Deal.server_time_offset >= int(from_ts))
     if to_ts is not None:
-        conds.append(Deal.deal_time <= int(to_ts))
+        conds.append(Deal.deal_time - Deal.server_time_offset <= int(to_ts))
     if symbol:
         conds.append(Deal.symbol == symbol.upper())
     return conds
@@ -116,7 +124,8 @@ async def leader_batch(
 ) -> dict:
     """若干节点的合并汇总（带单员绩效 = 其**主节点**传入单个 node_id）。
 
-    入参是 node_ids 列表是为了让 `leader_batch_multi` 复用同一份聚合逻辑；
+    入参是 node_ids 列表是为了让 `leader_batch_multi`（按带单员分组批量）
+    与调用方一次查多节点复用同一份聚合逻辑；
     带单 / AI 两个市场传的都只有主节点，所以**统计范围是主节点**。
 
     一次查询算完，避免逐节点查库的 N+1。
@@ -193,8 +202,8 @@ def _build_summary(
     """把原始聚合结果算成最终统计口径。
 
     **这是口径的唯一实现**：`leader_batch`（单/多节点）与 `leader_batch_multi`
-    （按带单员分组批量）都调它，保证订单历史页与带单页的胜率、净盈亏
-    永远一致 —— 两处各算一次必然漂移。
+    （按带单员分组批量）都调它，保证订单历史页、带单页与概览页的胜率、净盈亏
+    永远一致 —— 各处各算一次必然漂移。
     """
     net = float(net_profit or 0.0)
     vol = float(gross_volume or 0.0)
@@ -374,7 +383,6 @@ async def leader_batch_multi(
     return out
 
 
-
 # ---------------------------------------------------------------------------
 # 近 N 日收益序列（柱状图数据源）
 # ---------------------------------------------------------------------------
@@ -389,9 +397,16 @@ async def leader_batch_multi(
 # 而非 `iif` 的同类谨慎）。7 天单节点的成交行数在几百~几千量级，
 # 查出来在 Python 侧累加完全够用，还顺带省掉了方言风险。
 #
-# **时区**：deal_time 是 MT5 服务器时间（Unix 秒），按 UTC+8 自然日分桶 ——
-# 服务端与浏览器分属不同机器/时区，若在前端分日会整体错位一天。
-# 这里把分桶放在后端，前端只拿 `date` 字符串显示。
+# **时区**（这里是最容易出错的地方）：
+# deal_time 是 **MT5 服务器钟面**按 UTC 编码的 Unix —— 经纪商服务器不在 UTC+0 时，
+# 它比真实 UTC 快 server_time_offset 秒。若直接按它分桶，MT5 里看到的收盘时间
+# 会被归到错误的一天（UTC+3 的经纪商配 UTC+8 的用户，差 5 小时）。
+# 所以分桶前先换算回真实 UTC：真实UTC = deal_time - server_time_offset。
+# 真实 UTC 再按 UTC+8 自然日切分（用户所在时区），与 v4 的口径一致，
+# 同时把「经纪商不在 UTC+8」这个偏差修正掉。
+#
+# 分桶放在后端而不是前端：服务端与浏览器分属不同机器/时区，
+# 若在前端分日会整体错位一天。前端只拿 date 字符串显示。
 
 # 分日用的固定偏移（秒）：UTC+8
 _DAY_OFFSET = 8 * 3600
@@ -424,15 +439,22 @@ async def daily_net_profit(
 
     # 取出窗口内的出场类成交（净盈亏 = net_profit = profit + swap + commission），
     # 分日累加放在 Python 侧做（见文件头说明：不做 SQL 日期分组）。
+    #
+    # 窗口过滤放宽两天：deal_time 是服务器钟面，真实 UTC = deal_time - offset，
+    # 而 offset 可能是负的（服务器比 UTC 慢）或正的（快，最多 ~+14h）。
+    # 这里按服务器钟面取宽出两天的范围，再用换算后的真实 UTC 精确归日。
     try:
         async with SessionLocal() as s:
             rows = (
                 await s.execute(
-                    select(Deal.deal_time, Deal.net_profit)
-                    .where(
+                    select(
+                        Deal.deal_time,
+                        Deal.net_profit,
+                        Deal.server_time_offset,
+                    ).where(
                         Deal.node_id.in_(ids),
-                        Deal.deal_time >= int(start),
-                        Deal.deal_time < int(end),
+                        Deal.deal_time >= int(start) - 2 * _DAY_SECONDS,
+                        Deal.deal_time < int(end) + 2 * _DAY_SECONDS,
                         Deal.entry_type.in_(OUT_ENTRIES),
                     )
                 )
@@ -441,11 +463,13 @@ async def daily_net_profit(
         logger.warning("daily_net_profit failed: %s", e)
         return []
 
-    # 分日累加：索引 = (deal_time - start) 落在第几天
+    # 分日累加：索引 = (真实UTC - start) 落在第几天
     profits = [0.0] * days
     deals = [0] * days
-    for deal_time, net_profit in rows:
-        idx = (int(deal_time or 0) - start) // _DAY_SECONDS
+    for deal_time, net_profit, offset in rows:
+        # 服务器钟面 -> 真实 UTC，再按 UTC+8 自然日归集
+        real_utc = int(deal_time or 0) - int(offset or 0)
+        idx = (real_utc - start) // _DAY_SECONDS
         if idx < 0 or idx >= days:
             continue
         profits[idx] += float(net_profit or 0.0)

@@ -252,17 +252,38 @@ class SignalDispatch(Base):
     error: Mapped[str | None] = mapped_column(String(255), nullable=True)
     dispatched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # —— 时延埋点（观测用，不参与任何交易判断）——
+    # sent_at：服务端把命令交给节点的时刻（UTC）。与 dispatched_at 不同——
+    # 后者是落库时刻，落在 send_to_node 之后，语义不够准。
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # recv_at：节点从 WS 读到命令的时刻（节点本地时钟，与 sent_at 跨机不可比）
+    recv_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # order_at：节点真正调 order_send 之前的时刻
+    order_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # filled_at：order_send 返回（拿到成交价）的时刻
+    filled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # queued_ms：order_at - recv_at，节点内部排队耗时（单线程 MT5 队列抢占）
+    queued_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # order_to_fill_ms：filled_at - order_at，券商往返耗时
+    order_to_fill_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+# ===================== MT5 成交明细（deal）=====================
+# 节点上报的历史成交，是「已实现盈亏 / 胜率」的唯一权威数据源。
+# 与 group_task_dispatch.realized_profit（策略任务收口时上报的累计值）不同：
+# deal 是**逐笔**真实成交，覆盖策略任务、普通信号分发、终端手工单全部来源。
 
 
 class Deal(Base):
-    """MT5 成交明细（deal）：节点上报的历史成交，订单历史页与带单绩效的数据源。
+    """MT5 成交明细（deal）：节点上报的历史成交，节点概览盈亏统计的数据源。
 
     幂等键 = (node_id, deal_id)：同一个节点上同一笔成交只入库一次。节点采集是
     增量的（带重叠窗口），重传是常态，因此**必须**靠这个唯一键去重，否则统计
     会因重复上报而翻倍。
 
-    deal_id 是 MT5 的成交票号（deal.ticket），在单个账户内单调递增。
+    deal_id = MT5 的成交票号（deal.ticket），在单个账户内单调递增。
     """
+
     __tablename__ = "mt5_deal"
     __table_args__ = (
         UniqueConstraint("node_id", "deal_id", name="uq_mt5_deal_node_deal"),
@@ -275,11 +296,11 @@ class Deal(Base):
     order_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     position_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
     symbol: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
-    # BUY / SELL：成交方向
+    # BUY / SELL：成交方
     direction: Mapped[str] = mapped_column(String(8), default="BUY")
     # IN / OUT / INOUT / OUT_BY：开仓 / 平仓 / 反手 / 对敲
     entry_type: Mapped[str] = mapped_column(String(8), default="IN", index=True)
-    # MT5 DEAL_REASON：0=客户端 1=移动端 2=网页 3=专家 4=止损 5=止盈 6=对手方…
+    # MT5 DEAL_REASON：0=客户端 1=移动 2=网页 3=专家 4=止损 5=止盈 6=对手方
     reason: Mapped[int] = mapped_column(Integer, default=0)
     volume: Mapped[float] = mapped_column(Float, default=0.0)
     price: Mapped[float] = mapped_column(Float, default=0.0)
@@ -302,7 +323,11 @@ class Deal(Base):
     # 上报时的账户权益：收益率分母（区间期初权益）依赖它
     balance: Mapped[float] = mapped_column(Float, default=0.0)
     equity: Mapped[float] = mapped_column(Float, default=0.0)
-    # 是否为补采的历史成交（不是实时增量）；补采不计入实时统计
+    # 上报时该节点的券商服务器时钟相对真实 UTC 的偏移（秒）。
+    # deal_time 是「服务器钟面按 UTC 编码的 Unix」，比真实 UTC 快 offset 秒；
+    # 按自然日分桶时必须减掉它，否则经纪商不在 UTC+0 时会整体错位一天。
+    server_time_offset: Mapped[int] = mapped_column(Integer, default=0)
+    # 是否为补采的历史成交（不是实时增量）
     backfill: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
 
@@ -474,6 +499,9 @@ class GroupTaskDispatch(Base):
     # 当前 magic 未成交挂单笔数；限价开仓在成交前只有它，是「在途但未持仓」的唯一凭据
     pending_orders: Mapped[int] = mapped_column(Integer, default=0)
     add_count: Mapped[int] = mapped_column(Integer, default=0)        # 已加仓次数
+    # 各规则已开笔数（按规则类型分开，如 {"1": 3, "2": 0}）：前端校验
+    # 「上限不能低于已开笔数」的依据，规则类型是动态键所以用 JSON 存
+    add_counts_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     total_orders: Mapped[int] = mapped_column(Integer, default=0)     # 累计下单笔数
     total_volume: Mapped[float] = mapped_column(Float, default=0.0)   # 累计手数
     realized_profit: Mapped[float] = mapped_column(Float, default=0.0)
@@ -491,6 +519,19 @@ class GroupTaskDispatch(Base):
     opened_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_report_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # —— 时延埋点（观测用，不参与任何交易判断）——
+    # sent_at：服务端把 strategy_start 交给节点的时刻（UTC）
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # recv_at：节点从 WS 读到命令的时刻（节点本地时钟，与 sent_at 跨机不可比）
+    recv_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # order_at：节点真正调 order_send 之前的时刻
+    order_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # filled_at：order_send 返回（拿到成交价）的时刻
+    filled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # queued_ms：order_at - recv_at，节点内部排队耗时（单线程 MT5 队列抢占）
+    queued_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # order_to_fill_ms：filled_at - order_at，券商往返耗时
+    order_to_fill_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 class GroupTaskEvent(Base):
@@ -506,8 +547,9 @@ class GroupTaskEvent(Base):
     node_id: Mapped[str] = mapped_column(String(32), index=True)
     magic: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
-    # open / add_counter / add_trend / add_manual / grid_add / grid_shift /
-    # close_partial / close_all / error / resume
+    # open / add_counter / add_trend / add_manual / manual_pending / manual_filled /
+    # manual_tp_align / manual_tp_close / grid_add / grid_shift /
+    # cnt_limit / cnt_limit_mod / cnt_limit_off / close_partial / close_all / error / resume
     event_type: Mapped[str] = mapped_column(String(16), index=True)
     symbol: Mapped[str | None] = mapped_column(String(32), nullable=True)
     action: Mapped[str | None] = mapped_column(String(8), nullable=True)
@@ -566,6 +608,9 @@ class TradingStrategy(Base):
     #   batch_enabled, batch_action, batch_count, total_lot_limit, batch_levels}, ...]
     config_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
     remark: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # 配置版本：每次保存 +1。热推时随快照下发，节点用它做版本门，
+    # 迟到的旧版本包直接丢弃，避免乱序热推把新配置覆盖回旧的。
+    config_version: Mapped[int] = mapped_column(Integer, default=0)
     # 数据归属：创建者；空 = 管理员名下
     owner_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

@@ -15,11 +15,15 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Callable
 from urllib.parse import urlparse, urlunparse
 
 DEFAULT_TIMEOUT = 15
 DOWNLOAD_TIMEOUT = 300
 _CHUNK = 1 << 16
+
+# 下载进度回调：(已下载字节, 总字节)。总字节为 0 表示服务端未给 Content-Length。
+ProgressCallback = Callable[[int, int], None]
 
 
 class VersionServiceError(Exception):
@@ -185,26 +189,44 @@ def download_package(
     dest: str | Path,
     *,
     timeout: int = DOWNLOAD_TIMEOUT,
+    on_progress: "ProgressCallback | None" = None,
 ) -> Path:
-    """下载指定版本的安装包到 dest；返回落地路径。"""
+    """下载指定版本的安装包到 dest；返回落地路径。
+
+    `on_progress(done_bytes, total_bytes)` 在每块写入后回调；`total_bytes` 为 0 表示
+    服务端没给 Content-Length（此时只能报已下载字节数）。回调发生在调用线程里，
+    界面更新要自己切回主线程。
+    """
     if target.session is not None:
         session = target.session
         generation = session.generation
         def checked_download():
             session.check(generation)
-            return download_package(replace(target, session=None), version, dest, timeout=timeout)
+            return download_package(
+                replace(target, session=None), version, dest,
+                timeout=timeout, on_progress=on_progress,
+            )
         return session.perform("download_package", None, checked_download, params={"version": version}, generation=generation)
     if not target.ready:
         raise VersionServiceError("尚未配置后端地址或节点令牌")
     out = Path(dest)
     out.parent.mkdir(parents=True, exist_ok=True)
     with _request(target, f"/api/client-versions/{version}/download", timeout) as resp:
+        total = 0
+        try:
+            total = int(resp.headers.get("Content-Length") or 0)
+        except (AttributeError, TypeError, ValueError):
+            total = 0
+        done = 0
         with out.open("wb") as f:
             while True:
                 chunk = resp.read(_CHUNK)
                 if not chunk:
                     break
                 f.write(chunk)
+                done += len(chunk)
+                if on_progress is not None:
+                    on_progress(done, total)
     return out
 
 

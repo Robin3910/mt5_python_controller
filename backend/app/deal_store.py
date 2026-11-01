@@ -158,6 +158,8 @@ def _normalize(raw: dict) -> Optional[dict]:
         # 账户快照（收益率分母依赖 equity）
         "balance": _num("balance"),
         "equity": _num("equity"),
+        # 券商服务器时钟相对真实 UTC 的偏移（秒）；缺省 0（视为 UTC+0）
+        "server_time_offset": _int("server_time_offset") or 0,
         "backfill": bool(raw.get("backfill") or False),
     }
 
@@ -178,6 +180,7 @@ async def save_deals(
         return 0
     bal = 0.0
     eq = 0.0
+    off = 0
     if isinstance(account, dict):
         try:
             bal = float(account.get("balance") or 0.0)
@@ -187,7 +190,10 @@ async def save_deals(
             eq = float(account.get("equity") or 0.0)
         except (TypeError, ValueError):
             eq = 0.0
-
+        try:
+            off = int(account.get("server_time_offset") or 0)
+        except (TypeError, ValueError):
+            off = 0
     items = []
     seen: set[int] = set()
     for raw in rows:
@@ -203,6 +209,9 @@ async def save_deals(
             norm["balance"] = bal
         if not norm["equity"]:
             norm["equity"] = eq
+        # 服务器时钟偏移同理：成交行没带就用本批的
+        if not norm["server_time_offset"]:
+            norm["server_time_offset"] = off
         items.append(norm)
     if not items:
         return 0
@@ -364,9 +373,11 @@ async def list_deals(
     if magic is not None:
         conds.append(Deal.magic == int(magic))
     if from_ts is not None:
-        conds.append(Deal.deal_time >= int(from_ts))
+        # deal_time 是服务器钟面（快 offset 秒），from_ts/to_ts 是真实 UTC；
+        # 按每行自带的 offset 还原后再比，否则窗口错位 offset 秒。
+        conds.append(Deal.deal_time - Deal.server_time_offset >= int(from_ts))
     if to_ts is not None:
-        conds.append(Deal.deal_time <= int(to_ts))
+        conds.append(Deal.deal_time - Deal.server_time_offset <= int(to_ts))
     if keyword:
         kw = f"%{str(keyword).strip()}%"
         conds.append(

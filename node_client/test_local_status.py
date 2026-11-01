@@ -6,9 +6,9 @@ import json
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-import pytest
-
 import socket
+
+import pytest
 
 from local_status import LocalStatusServer, StatusPortBusy, bind_status_socket
 

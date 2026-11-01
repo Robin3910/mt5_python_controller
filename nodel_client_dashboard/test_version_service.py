@@ -135,3 +135,75 @@ def test_verify_sha256_matches_and_skips_when_absent(tmp_path):
     assert not vs.verify_sha256(f, "0" * 64)
     # 后端没给校验和时不阻断更新
     assert vs.verify_sha256(f, "")
+
+
+class _FakeResponse:
+    """最小 HTTP 响应替身：按块吐出内容，带 Content-Length。"""
+
+    def __init__(self, payload: bytes, *, with_length: bool = True) -> None:
+        self._payload = payload
+        self.headers = {"Content-Length": str(len(payload))} if with_length else {}
+
+    def read(self, _size: int) -> bytes:
+        if not self._payload:
+            return b""
+        chunk, self._payload = self._payload[:_size], self._payload[_size:]
+        return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc) -> bool:
+        return False
+
+
+def test_download_package_reports_progress(tmp_path, monkeypatch):
+    """下载进度回调要能报出字节数与总量，界面据此显示百分比。"""
+    payload = b"x" * 5000
+    response = _FakeResponse(payload)
+
+    def fake_request(_target, _path, _timeout):
+        return response
+
+    monkeypatch.setattr(vs, "_request", fake_request)
+    seen: list[tuple[int, int]] = []
+    dest = tmp_path / "pkg.zip"
+
+    vs.download_package(
+        vs.BackendTarget("http://hub.example.com", "tok"),
+        "1.0.0",
+        dest,
+        on_progress=lambda done, total: seen.append((done, total)),
+    )
+
+    assert dest.read_bytes() == payload
+    assert seen, "应该至少回调一次进度"
+    assert seen[-1] == (5000, 5000)
+    assert all(total == 5000 for _done, total in seen)
+    # 单调递增
+    dones = [done for done, _ in seen]
+    assert dones == sorted(dones)
+
+
+def test_download_package_reports_zero_total_without_content_length(tmp_path, monkeypatch):
+    """服务端没给 Content-Length 时，总量报 0（界面据此只显示已下载字节）。"""
+    response = _FakeResponse(b"y" * 100, with_length=False)
+    monkeypatch.setattr(vs, "_request", lambda *_a, **_k: response)
+
+    seen: list[tuple[int, int]] = []
+    dest = tmp_path / "pkg.zip"
+    vs.download_package(
+        vs.BackendTarget("http://hub.example.com", "tok"),
+        "1.0.0",
+        dest,
+        on_progress=lambda done, total: seen.append((done, total)),
+    )
+    assert seen and seen[-1] == (100, 0)
+
+
+def test_download_package_without_callback_still_works(tmp_path, monkeypatch):
+    response = _FakeResponse(b"z" * 32)
+    monkeypatch.setattr(vs, "_request", lambda *_a, **_k: response)
+    dest = tmp_path / "pkg.zip"
+    vs.download_package(vs.BackendTarget("http://hub.example.com", "tok"), "1.0.0", dest)
+    assert dest.read_bytes() == b"z" * 32

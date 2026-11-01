@@ -31,6 +31,20 @@ _OFFSET_TICK_MAX_AGE = 14 * 3600
 _OFFSET_CACHE_TTL = 60.0
 _OFFSET_PROBE_SYMBOLS = ("BTCUSD", "ETHUSD", "XAUUSD", "EURUSD")
 
+# 查历史成交时，窗口上界要额外放宽的余量（秒）。
+#
+# 为什么必须放宽：MT5 的 deal.time 是「服务器钟面按 UTC 编码」的 Unix，
+# 比真实 UTC 快 offset 秒；券商不在 UTC+0 时（IC Markets 是 GMT+3），
+# 若上界按真实 UTC 取，最近 offset 秒的成交会被**整段截掉** ——
+# 节点采不到最新成交，前端概览就永远落后 MT5 三个小时。
+#
+# 偏移推断得出来时，精确换算就够了；推断不出来时（周末外汇报价不跳动）
+# 用这个上限兜底，保证上界不会切掉真实存在的成交。
+# 窗口放宽只是多扫几条，读到的成交仍按成交号去重，不影响正确性。
+_HISTORY_END_MARGIN_SEC = 14 * 3600
+# 偏移已知时的兜底余量：只需覆盖时钟抖动与推断取整误差
+_HISTORY_END_MARGIN_KNOWN_SEC = 3600
+
 
 def infer_server_time_offset(tick_times: list[float], now: float) -> Optional[int]:
     """由 MT5 tick.time 与真实 UTC 的差值，推断券商服务器时区偏移（秒）。
@@ -49,6 +63,64 @@ def infer_server_time_offset(tick_times: list[float], now: float) -> Optional[in
     if hours < -12 or hours > 14:
         return None
     return hours * 3600
+
+
+def server_epoch(real_epoch: float, offset_sec: Optional[int]) -> float:
+    """把真实 UTC 时刻换算到 **MT5 服务器钟面域**。
+
+    MT5 的 `deal.time` / `position.time` / `tick.time` 都是「服务器钟面按 UTC 编码」
+    的 Unix：IC Markets 是 GMT+3，同一笔成交的 `deal.time` 比 `time.time()` 快 10800 秒。
+
+    `history_deals_get(start, end)` 收的是 naive datetime，底层按 `mktime()` 解释，
+    也就是**本机本地时区的墙钟**。传进去的 epoch 必须和 MT5 内部钟面同一套，
+    否则窗口整体错位 offset 秒 —— 错位方向决定了成交是被漏掉还是被重复读到。
+    """
+    if not offset_sec:
+        return float(real_epoch)
+    return float(real_epoch) + float(offset_sec)
+
+
+def history_window(
+    since_server: float | None,
+    offset_sec: Optional[int],
+    *,
+    back_sec: int = 0,
+    end_margin_sec: Optional[int] = None,
+) -> tuple:
+    """构造 `history_deals_get` 的 (start, end) naive datetime。
+
+    - `since_server`：**服务器钟面域**的起点（None = 不限起点）
+    - `offset_sec`：券商服务器钟面相对真实 UTC 的偏移（秒，None = 推断不出来）
+    - `back_sec`：起点再往前放宽的秒数（重叠窗口，防止同一秒多笔成交漏单）
+    - `end_margin_sec`：上界再放宽的秒数；None 时按偏移是否已知自动选
+
+    `history_deals_get` 收的是 naive datetime，底层按 `mktime()` 解释，
+    也就是**本机本地时区的墙钟** —— 传进去的 epoch 必须和 MT5 内部钟面同一套。
+
+    **起点按服务器钟面域直接用，不做换算**：游标记的就是 `deal.time`（同一时钟），
+    换算会引入偏移估计误差；偏移一旦在两次运行之间变了（DST / 周末推断不出），
+    换算后的起点会偏到真实成交之前甚至之后 —— 偏到之后就**永久漏单**。
+    只有上界（真实「现在」）需要换算。
+
+    **上界余量自适应**：偏移已知时只需覆盖时钟抖动（1 小时足够）；
+    偏移推断不出来时用 14 小时兜底（偏移的合法上限），宁可多扫不可漏读。
+    """
+    from datetime import datetime, timedelta
+
+    if end_margin_sec is None:
+        end_margin_sec = (
+            _HISTORY_END_MARGIN_KNOWN_SEC if offset_sec is not None
+            else _HISTORY_END_MARGIN_SEC
+        )
+    now_real = time.time()
+    # 上界：真实「现在」换算到服务器钟面，再加余量
+    end_epoch = server_epoch(now_real, offset_sec) + float(end_margin_sec)
+    end = datetime.fromtimestamp(end_epoch)
+    if since_server is None:
+        return end - timedelta(days=7), end
+    start_epoch = float(since_server) - float(back_sec)
+    return datetime.fromtimestamp(start_epoch), end
+
 
 # —— MT5 返回码(retcode)子集，分类见技术方案 10.7 ——
 RET_DONE = 10009            # 成交
@@ -528,7 +600,11 @@ class MT5Client:
                            sl: Optional[float] = None, tp: Optional[float] = None,
                            comment: str = "", magic: Optional[int] = None,
                            max_retry: int = 3) -> dict:
-        """下市价单。内部循环处理：填充模式切换(10030) + 瞬时错误重试(刷新价格)。"""
+        """下市价单。内部循环处理：填充模式切换(10030) + 瞬时错误重试(刷新价格)。
+
+        返回值额外带两个内部时刻（`_order_at` / `_filled_at`）：下单前与返回后的
+        本地时刻，供上层算「券商往返耗时」。它们是观测字段，不参与任何交易判断。
+        """
         self.ensure()
         resolved = self.resolve_symbol(symbol)
         if not resolved:
@@ -539,6 +615,9 @@ class MT5Client:
         fill_idx = 0     # 当前尝试的填充模式下标
         attempt = 0      # 瞬时错误重试计数
         last = None
+        # 下单时刻（第一次真正调 order_send 之前）；填了也不会用
+        order_at = 0.0
+        filled_at = 0.0
 
         while attempt <= max_retry and fill_idx < len(fillings):
             # 每次都重新取价（重试时价格可能已变）
@@ -563,7 +642,9 @@ class MT5Client:
             if tp:
                 request["tp"] = float(tp)
 
+            order_at = time.time()
             result = mt5.order_send(request)
+            filled_at = time.time()
             last = result
             if result is None:
                 logger.error("order_send returned None: %s", mt5.last_error())
@@ -581,6 +662,8 @@ class MT5Client:
                     "deal": result.deal,
                     "volume": result.volume,
                     "price": result.price,
+                    "_order_at": order_at,
+                    "_filled_at": filled_at,
                 }
             if rc == RET_INVALID_FILL:
                 fill_idx += 1  # 换下一种填充模式（不消耗重试次数）
@@ -591,14 +674,66 @@ class MT5Client:
                 _backoff_sleep(attempt, max_retry)
                 continue
             # 其余视为致命错误，直接返回
-            return {"success": False, "symbol": symbol, "retcode": rc, "error": result.comment}
+            return {
+                "success": False, "symbol": symbol, "retcode": rc,
+                "error": result.comment,
+                "_order_at": order_at, "_filled_at": filled_at,
+            }
 
         return {
             "success": False,
             "symbol": symbol,
             "retcode": getattr(last, "retcode", None),
             "error": getattr(last, "comment", "order failed after retries"),
+            "_order_at": order_at,
+            "_filled_at": filled_at,
         }
+
+    def _pending_price_status(self, symbol: str, action: str, price: float,
+                              kind: str = PENDING_LIMIT) -> tuple[Optional[str], Optional[str]]:
+        """挂单价合法性。(None, None) 可挂；否则是 (side|stops|unavailable, 原因)。
+
+        side：落在成交侧的错误一侧（多单限价不低于卖价，空单限价不高于买价）。
+        stops：方向对，但离现价小于 trade_stops_level。
+        unavailable：品种或报价暂时读不到，调用方应下拍再试，不要改市价。
+        """
+        resolved = self.resolve_symbol(symbol)
+        if not resolved:
+            return "unavailable", f"symbol not found: {symbol}"
+        if price <= 0:
+            return "unavailable", "挂单价需大于 0"
+        tick = mt5.symbol_info_tick(resolved)
+        if tick is None:
+            return "unavailable", "no tick"
+        info = mt5.symbol_info(resolved)
+        point = float(getattr(info, "point", 0.0) or 0.0) if info else 0.0
+        digits = int(getattr(info, "digits", 5) or 5) if info else 5
+        stops = int(getattr(info, "trade_stops_level", 0) or 0) if info else 0
+        # 挂单成交侧：BUY 用 ask、SELL 用 bid，与该方向真正的成交价口径一致
+        market = float(tick.ask if action == "BUY" else tick.bid)
+        if market <= 0:
+            return "unavailable", "no tick"
+        below = price < market
+        # BUY LIMIT 挂在现价下方等回落，SELL LIMIT 挂在上方等反弹；STOP 单方向相反
+        want_below = (action == "BUY") == (kind == PENDING_LIMIT)
+        if below != want_below:
+            side = "低于" if want_below else "高于"
+            return "side", (
+                f"{action} {kind} 挂单价 {round(price, digits)} 必须{side}现价 "
+                f"{round(market, digits)}"
+            )
+        if stops > 0 and point > 0 and abs(price - market) < stops * point:
+            return "stops", (
+                f"挂单价距现价 {round(abs(price - market) / point)} 点，"
+                f"低于券商要求的 {stops} 点"
+            )
+        return None, None
+
+    def pending_price_block(self, symbol: str, action: str, price: float,
+                            kind: str = PENDING_LIMIT) -> Optional[str]:
+        """可挂返回 None，否则返回 side / stops / unavailable。"""
+        code, _message = self._pending_price_status(symbol, action, price, kind)
+        return code
 
     def check_pending_price(self, symbol: str, action: str, price: float,
                             kind: str = PENDING_LIMIT) -> Optional[str]:
@@ -608,37 +743,8 @@ class MT5Client:
         （10015 价格非法 / 10016 距离太近）不像市价单那样重试就能好，只能改价，
         所以宁可在下第一笔之前就发现整组都不可行。
         """
-        resolved = self.resolve_symbol(symbol)
-        if not resolved:
-            return f"symbol not found: {symbol}"
-        if price <= 0:
-            return "挂单价需大于 0"
-        tick = mt5.symbol_info_tick(resolved)
-        if tick is None:
-            return "no tick"
-        info = mt5.symbol_info(resolved)
-        point = float(getattr(info, "point", 0.0) or 0.0) if info else 0.0
-        digits = int(getattr(info, "digits", 5) or 5) if info else 5
-        stops = int(getattr(info, "trade_stops_level", 0) or 0) if info else 0
-        # 挂单成交侧：BUY 用 ask、SELL 用 bid，与该方向真正的成交价口径一致
-        market = float(tick.ask if action == "BUY" else tick.bid)
-        if market <= 0:
-            return "no tick"
-        below = price < market
-        # BUY LIMIT 挂在现价下方等回落，SELL LIMIT 挂在上方等反弹；STOP 单方向相反
-        want_below = (action == "BUY") == (kind == PENDING_LIMIT)
-        if below != want_below:
-            side = "低于" if want_below else "高于"
-            return (
-                f"{action} {kind} 挂单价 {round(price, digits)} 必须{side}现价 "
-                f"{round(market, digits)}"
-            )
-        if stops > 0 and point > 0 and abs(price - market) < stops * point:
-            return (
-                f"挂单价距现价 {round(abs(price - market) / point)} 点，"
-                f"低于券商要求的 {stops} 点"
-            )
-        return None
+        _code, message = self._pending_price_status(symbol, action, price, kind)
+        return message
 
     def place_pending_order(self, symbol: str, action: str, volume: float, price: float,
                             sl: Optional[float] = None, tp: Optional[float] = None,
@@ -648,6 +754,8 @@ class MT5Client:
 
         与市价单的关键差别：价格由调用方给定，不刷新、不重取，因此瞬时错误重试也
         不会改价；请求里没有 deviation（挂单按挂单价成交，没有滑点容忍的概念）。
+
+        返回值同样带 `_order_at` / `_filled_at` 两个内部时刻（观测字段）。
         """
         self.ensure()
         resolved = self.resolve_symbol(symbol)
@@ -666,6 +774,8 @@ class MT5Client:
         fill_idx = 0
         attempt = 0
         last = None
+        order_at = 0.0
+        filled_at = 0.0
 
         while attempt <= max_retry and fill_idx < len(fillings):
             request = {
@@ -684,7 +794,9 @@ class MT5Client:
             if tp:
                 request["tp"] = float(tp)
 
+            order_at = time.time()
             result = mt5.order_send(request)
+            filled_at = time.time()
             last = result
             if result is None:
                 logger.error("pending order_send returned None: %s", mt5.last_error())
@@ -703,6 +815,8 @@ class MT5Client:
                     "order": result.order,
                     "volume": float(volume),
                     "price": float(price),
+                    "_order_at": order_at,
+                    "_filled_at": filled_at,
                 }
             if rc == RET_INVALID_FILL:
                 fill_idx += 1
@@ -711,13 +825,97 @@ class MT5Client:
                 attempt += 1
                 _backoff_sleep(attempt, max_retry)
                 continue
-            return {"success": False, "symbol": symbol, "retcode": rc, "error": result.comment}
+            return {
+                "success": False, "symbol": symbol, "retcode": rc,
+                "error": result.comment,
+                "_order_at": order_at, "_filled_at": filled_at,
+            }
 
         return {
             "success": False,
             "symbol": symbol,
             "retcode": getattr(last, "retcode", None),
             "error": getattr(last, "comment", "pending order failed after retries"),
+            "_order_at": order_at,
+            "_filled_at": filled_at,
+        }
+
+    def modify_pending_order(self, ticket: int, price: float,
+                             sl: Optional[float] = None, tp: Optional[float] = None,
+                             max_retry: int = 3) -> dict:
+        """改挂单的价格和止损止盈（TRADE_ACTION_MODIFY）。不能改手数和备注。
+
+        sl / tp 传 None 表示沿用挂单上的现值。价格不合法时直接拒绝，不发给终端。
+        """
+        self.ensure()
+        target = int(ticket)
+        order = next(
+            (o for o in self.pending_orders() if int(o.get("ticket") or 0) == target),
+            None,
+        )
+        if order is None:
+            return {"success": False, "ticket": target, "error": f"order not found: {target}"}
+        action = str(order.get("type") or "")
+        kind = str(order.get("pending_kind") or PENDING_LIMIT)
+        reject = self.check_pending_price(order["symbol"], action, float(price), kind)
+        if reject:
+            return {
+                "success": False, "ticket": target, "symbol": order["symbol"], "error": reject,
+            }
+        resolved = self.resolve_symbol(order["symbol"])
+        if not resolved:
+            return {"success": False, "ticket": target, "error": f"symbol not found: {order['symbol']}"}
+        send_sl = float(order.get("sl") or 0.0) if sl is None else float(sl or 0.0)
+        send_tp = float(order.get("tp") or 0.0) if tp is None else float(tp or 0.0)
+        fillings = self.filling_modes(resolved, pending=True)
+        fill_idx = 0
+        attempt = 0
+        last = None
+        while attempt <= max_retry and fill_idx < len(fillings):
+            request = {
+                "action": mt5.TRADE_ACTION_MODIFY,
+                "order": target,
+                "symbol": resolved,
+                "price": float(price),
+                "sl": send_sl,
+                "tp": send_tp,
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": fillings[fill_idx],
+            }
+            result = mt5.order_send(request)
+            last = result
+            if result is None:
+                logger.error("modify pending order_send returned None: %s", mt5.last_error())
+                attempt += 1
+                continue
+            rc = result.retcode
+            if rc in (RET_DONE, RET_DONE_PARTIAL):
+                return {
+                    "success": True,
+                    "ticket": target,
+                    "symbol": order["symbol"],
+                    "price": float(price),
+                    "sl": send_sl,
+                    "tp": send_tp,
+                    "retcode": rc,
+                }
+            if rc == RET_INVALID_FILL:
+                fill_idx += 1
+                continue
+            if rc in TRANSIENT:
+                attempt += 1
+                _backoff_sleep(attempt, max_retry)
+                continue
+            return {
+                "success": False, "ticket": target, "symbol": order["symbol"],
+                "retcode": rc, "error": result.comment,
+            }
+        return {
+            "success": False,
+            "ticket": target,
+            "symbol": order["symbol"],
+            "retcode": getattr(last, "retcode", None),
+            "error": getattr(last, "comment", "modify pending failed after retries"),
         }
 
     def cancel_order(self, ticket: int, max_retry: int = 3) -> dict:
@@ -1073,19 +1271,28 @@ class MT5Client:
         }
 
     def _history_deals(self, since_ts: float | None = None):
-        """取时间窗内的成交历史；失败或空返回空元组。"""
-        self.ensure()
-        from datetime import datetime, timedelta
+        """取时间窗内的成交历史；失败或空返回空元组。
 
-        end = datetime.now()
-        if since_ts:
-            start = datetime.fromtimestamp(float(since_ts)) - timedelta(minutes=1)
-        else:
-            start = end - timedelta(days=7)
+        **上界换算到服务器钟面域**再交给 MT5：`deal.time` 是服务器钟面
+        （比真实 UTC 快 offset 秒），上界若按真实 UTC 取，最近的成交会被
+        整段截掉 —— 策略收口时算出的已实现盈亏会偏小甚至为 0。
+
+        **下界额外放宽 14 小时**：调用方传的 `since_ts` 时钟不统一 ——
+        策略任务传的是 `time.time()`（真实 UTC），手动分散仓传的是持仓的
+        `position.time`（服务器钟面），两者可能混用。放宽到偏移推断的合法上限，
+        无论实际偏移是 -12h 还是 +14h 都不会漏掉该查的成交。
+        多读出来的成交按魔术号过滤，不影响结果。
+        """
+        self.ensure()
+        offset = self.server_time_offset_sec()
+        start, end = history_window(
+            since_ts, offset,
+            back_sec=_OFFSET_TICK_MAX_AGE + 60,
+        )
         return mt5.history_deals_get(start, end) or ()
 
     def history_deals_since(self, since_ts: float, after_deal_id: int = 0) -> list[dict]:
-        """取 (since_ts, ∞) 内且成交号大于 after_deal_id 的成交，标准化字段返回。
+        """取 (since_ts, ∞) 内且成交号大于 `after_deal_id` 的成交，标准化字段返回。
 
         增量采集用。**读失败必须抛错，不能返回空列表** —— 调用方据此决定是否推进
         同步游标；若把「读失败」当成「没有新成交」，那段历史就永久丢了。
@@ -1093,12 +1300,17 @@ class MT5Client:
         时间窗取宽（回看 2 分钟），再用成交号做精确去重：同一秒内可能有多笔成交，
         只按时间戳过滤会漏单（见 deal_cursor 的说明）。
 
+        **窗口两端都在服务器钟面域**：`since_ts` 与返回的 `deal.time` 是同一时钟
+        （MT5 服务器钟面，比真实 UTC 快 offset 秒）。上界若按真实 UTC 取，最近
+        offset 秒的成交会被整段截掉 —— 这正是「前端概览比 MT5 晚三个小时」的
+        成因；更糟的是游标会被推进到服务器钟面域，此后 `start > end`，
+        采集**永久停滞**，节点再也上报不了任何新成交。
+
         返回的每项含 deal_id / order_id / position_id / symbol / direction /
         entry_type / reason / volume / price / profit / swap / commission /
-        magic / comment / time。
+        magic / comment / time（time 为服务器钟面域 Unix 秒）。
         """
         self.ensure()
-        from datetime import datetime, timedelta
 
         # MT5 的 DEAL_ENTRY_* / DEAL_TYPE_* 常量；包不可用时回退到文档值
         entry_in = int(getattr(mt5, "DEAL_ENTRY_IN", 0) if mt5 else 0)
@@ -1116,8 +1328,11 @@ class MT5Client:
         }
         type_names = {type_buy: "BUY", type_sell: "SELL"}
 
-        end = datetime.now()
-        start = datetime.fromtimestamp(float(since_ts)) - timedelta(minutes=2)
+        offset = self.server_time_offset_sec()
+        start, end = history_window(
+            float(since_ts), offset,
+            back_sec=120,
+        )
         rows = mt5.history_deals_get(start, end)
         # None = 读失败（与「确实没有成交」必须区分开），失败直接抛错
         rows = mt5_book_rows(rows, api_name="history_deals_get")
@@ -1349,6 +1564,43 @@ class MT5Client:
             }
             for r in rates
         ]
+
+    def recent_bars(self, symbol: str, timeframe: str, count: int) -> list[dict]:
+        """取最近 count 根 K 线（**含**当前未收盘那根），按时间升序返回。
+
+        与 closed_bars 的区别只在起点：这里从 index 0 起取，第一根就是当前正在
+        走的那根 K 线，后面才是已收盘的。一次读取就能同时拿到「实时根」与
+        「已收盘窗口」，两者天然一致 —— 波幅自适应必须这样读，否则 K 线收盘的
+        瞬间实时值归零而基线还停留在旧缓存，有效波幅会塌陷、限价单被猛地拉回。
+
+        取不到时返回空列表，由调用方决定跳过判定。
+        """
+        self.ensure()
+        tf = TIMEFRAMES.get(str(timeframe or "").strip().upper())
+        if tf is None or count <= 0:
+            return []
+        resolved = self.resolve_symbol(symbol)
+        if not resolved:
+            return []
+        rates = mt5.copy_rates_from_pos(resolved, tf, 0, int(count))
+        if rates is None or len(rates) == 0:
+            logger.debug("no recent bars for %s %s: %s", resolved, timeframe, mt5.last_error())
+            return []
+        return [
+            {
+                "time": float(r["time"]),
+                "open": float(r["open"]),
+                "high": float(r["high"]),
+                "low": float(r["low"]),
+                "close": float(r["close"]),
+            }
+            for r in rates
+        ]
+
+    def current_bar(self, symbol: str, timeframe: str) -> dict:
+        """取当前**未收盘**的那根 K 线（index 0）；取不到返回空 dict。"""
+        bars = self.recent_bars(symbol, timeframe, 1)
+        return bars[0] if bars else {}
 
     def close_symbol(self, symbol: str) -> dict:
         """平掉某品种的所有持仓并撤掉其挂单（兼容券商后缀）。"""

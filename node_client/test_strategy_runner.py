@@ -13,13 +13,16 @@ MAGIC = 900000001
 
 
 class FakeHub:
-    """事件源替身：只实现 subscribe / unsubscribe / bar_metric 契约。"""
+    """事件源替身：只实现 subscribe / unsubscribe / bar_metric / bar_range_pair 契约。"""
 
     def __init__(self) -> None:
         self.sub: mh.Subscription | None = None
         self.unsubscribed = False
         self.metrics: dict[tuple[str, str], float] = {}
         self.metric_calls: list[tuple[str, str, str]] = []
+        # (周期) -> (基线波幅, 实时波幅)
+        self.range_pairs: dict[str, tuple[float, float]] = {}
+        self.range_pair_calls: list[tuple[str, str, float]] = []
 
     def subscribe(self, *, symbol, magic, direction, hold_when_empty=False,
                   track_orders=False) -> mh.Subscription:
@@ -37,6 +40,12 @@ class FakeHub:
     async def bar_metric(self, symbol: str, timeframe: str, metric: str) -> float:
         self.metric_calls.append((symbol, timeframe, metric))
         return self.metrics.get((timeframe, metric), 0.0)
+
+    async def bar_range_pair(
+        self, symbol: str, timeframe: str, *, refresh: float = 5.0,
+    ) -> tuple[float, float]:
+        self.range_pair_calls.append((symbol, timeframe, refresh))
+        return self.range_pairs.get(timeframe, (0.0, 0.0))
 
 
 def counter_rule(**over) -> dict:
@@ -192,6 +201,7 @@ async def test_stale_event_does_not_finish_task():
 
 
 async def test_tick_beyond_threshold_adds_position():
+    """现价还没到阈值时只挂一张限价；穿过挂单价后这一档成交，再挂下一张。"""
     sent: list = []
     mt5 = MockMT5Client()
     runner, hub = _runner(sent, mt5=mt5)
@@ -200,16 +210,33 @@ async def test_tick_beyond_threshold_adds_position():
 
     held = mt5.positions_by_magic(MAGIC)
     assert len(held) == 1
-    # 逆势：多单朝不利方向走 100 点（point=0.01 -> 价格跌 1.0）
+    open_px = held[0]["price_open"]
     hub.sub.offer(mh.MarketEvent(
         kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
-        positions=tuple(held), price=held[0]["price_open"] - 1.0, point=0.01,
+        positions=tuple(held), price=open_px, point=0.01,
     ))
     await _settle()
 
-    assert runner.add_count == 1
-    assert len(mt5.positions_by_magic(MAGIC)) == 2
+    orders = mt5.pending_orders_by_magic(MAGIC)
+    assert len(orders) == 1
+    assert orders[0]["price_open"] == open_px - 1.0
+    assert orders[0]["comment"] == "R1D100"
+    assert runner.add_count == 0
+    assert len(mt5.positions_by_magic(MAGIC)) == 1
+    assert _progress(sent, "cnt_limit")
+
+    mt5.prices_map["XAUUSD"] = open_px - 1.5
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(mt5.positions_by_magic(MAGIC)),
+        price=open_px - 1.5, point=0.01,
+    ))
+    await _settle()
+
+    assert runner.add_counts[1] == 1
     assert _progress(sent, "add_counter")
+    assert len(mt5.positions_by_magic(MAGIC)) == 2
+    assert len(mt5.pending_orders_by_magic(MAGIC)) == 1
     runner.cancel()
 
 
@@ -248,7 +275,14 @@ async def test_counter_does_not_use_trend_add_as_anchor():
     assert len(held) == 2
     assert max(p["price_open"] for p in held) == trend_px
 
-    # 从顺势仓回撤约 100 点，但仍高于首仓——不得触发逆势
+    # 逆势限价锚在首仓，不跟着顺势仓上移
+    orders = mt5.pending_orders_by_magic(MAGIC)
+    assert len(orders) == 1
+    assert orders[0]["price_open"] == first_px - 1.0
+    placed = _progress(sent, "cnt_limit")
+    assert placed and placed[-1]["detail"]["base_price"] == first_px
+
+    # 从顺势仓回撤约 100 点，但仍高于首仓——限价还挂在首仓下方，不得成交
     hub.sub.offer(mh.MarketEvent(
         kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
         positions=tuple(held), price=trend_px - 1.0, point=0.01,
@@ -256,23 +290,24 @@ async def test_counter_does_not_use_trend_add_as_anchor():
     await _settle()
     assert runner.add_count == 1
     assert not _progress(sent, "add_counter")
+    assert mt5.pending_orders_by_magic(MAGIC)[0]["price_open"] == first_px - 1.0
 
-    # 相对首仓再逆向偏离 100 点，才应逆势加仓，且说明里基准为首仓价
+    # 现价穿过首仓下方的挂单价，这一档才成交
+    mt5.prices_map["XAUUSD"] = first_px - 1.5
     hub.sub.offer(mh.MarketEvent(
         kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
         positions=tuple(mt5.positions_by_magic(MAGIC)),
-        price=first_px - 1.0, point=0.01,
+        price=first_px - 1.5, point=0.01,
     ))
     await _settle()
     assert runner.add_count == 2
-    counter_ev = _progress(sent, "add_counter")
-    assert counter_ev
-    assert counter_ev[0]["detail"]["base_price"] == first_px
+    assert runner.add_counts[1] == 1
+    assert _progress(sent, "add_counter")
     runner.cancel()
 
 
 async def test_add_reports_reason_detail_and_compact_mt5_comment():
-    """加仓单要能还原开单原因：上报带说明与逐项计算依据，MT5 备注带紧凑编码。"""
+    """逆势限价单要能还原挂单原因：上报带说明与计算依据，MT5 备注带紧凑编码。"""
     sent: list = []
     mt5 = MockMT5Client()
     runner, hub = _runner(sent, mt5=mt5)
@@ -282,25 +317,26 @@ async def test_add_reports_reason_detail_and_compact_mt5_comment():
     held = mt5.positions_by_magic(MAGIC)
     hub.sub.offer(mh.MarketEvent(
         kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
-        positions=tuple(held), price=held[0]["price_open"] - 1.0, point=0.01,
+        positions=tuple(held), price=held[0]["price_open"], point=0.01,
     ))
     await _settle()
 
-    add = _progress(sent, "add_counter")[0]
-    assert "逆势加仓" in add["message"]
-    assert "偏离 100 点" in add["message"] and "阈值 100 点" in add["message"]
+    add = _progress(sent, "cnt_limit")[0]
+    assert "逆势加仓" in add["message"] and "挂出限价" in add["message"]
+    assert "阈值 100 点" in add["message"]
     detail = add["detail"]
-    assert detail["kind"] == "add"
+    assert detail["kind"] == "counter_limit"
     assert detail["threshold"] == 100.0 and detail["deviation"] == 100.0
+    assert detail["limit_price"] == held[0]["price_open"] - 1.0
     assert detail["volume_formula"] == "0.1 × 1 + 0 = 0.1"
 
-    added = mt5.positions_by_magic(MAGIC)[-1]
-    assert added["comment"] == "R1D100"
+    pending = mt5.pending_orders_by_magic(MAGIC)[0]
+    assert pending["comment"] == "R1D100"
     runner.cancel()
 
 
 async def test_atr_level_prefetches_metric_and_adds():
-    """ATR 档位：判定前先取到行情指标，再按折算出的点数触发加仓。"""
+    """ATR 档位：判定前先取行情指标，按折算距离挂限价；指标变了只改这一张。"""
     sent: list = []
     mt5 = MockMT5Client()
     strategy = {"rules": [counter_rule(
@@ -316,18 +352,180 @@ async def test_atr_level_prefetches_metric_and_adds():
     await _settle()
 
     held = mt5.positions_by_magic(MAGIC)
+    open_px = held[0]["price_open"]
     hub.sub.offer(mh.MarketEvent(
         kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
-        positions=tuple(held), price=held[0]["price_open"] - 1.0, point=0.01,
+        positions=tuple(held), price=open_px, point=0.01,
     ))
     await _settle()
 
     assert hub.metric_calls == [("XAUUSD", "M5", "atr")]
-    assert runner.add_count == 1
-    add = _progress(sent, "add_counter")[0]
+    assert runner.add_count == 0
+    add = _progress(sent, "cnt_limit")[0]
     assert "ATR(M5,14)" in add["message"]
     assert add["detail"]["calc_type"] == "atr"
-    assert mt5.positions_by_magic(MAGIC)[-1]["comment"] == "R1L0A100"
+    pending = mt5.pending_orders_by_magic(MAGIC)
+    assert len(pending) == 1
+    assert pending[0]["price_open"] == open_px - 1.0
+    assert pending[0]["comment"] == "R1L0A100"
+    ticket = pending[0]["ticket"]
+
+    hub.metrics[("M5", "atr")] = 1.5
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(mt5.positions_by_magic(MAGIC)), price=open_px, point=0.01,
+    ))
+    await _settle()
+
+    pending = mt5.pending_orders_by_magic(MAGIC)
+    assert len(pending) == 1
+    assert pending[0]["ticket"] == ticket
+    assert pending[0]["price_open"] == open_px - 1.5
+    assert _progress(sent, "cnt_limit_mod")
+    assert runner.add_count == 0
+    runner.cancel()
+
+
+async def test_counter_limit_markets_when_price_already_through():
+    """挂单价已经在现价错误一侧时，本档市价成交，不留限价单。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub = _runner(sent, mt5=mt5)
+    runner.start()
+    await _settle()
+
+    open_px = mt5.positions_by_magic(MAGIC)[0]["price_open"]
+    mt5.prices_map["XAUUSD"] = open_px - 2.0
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(mt5.positions_by_magic(MAGIC)),
+        price=open_px - 2.0, point=0.01,
+    ))
+    await _settle()
+
+    assert runner.add_counts[1] == 1
+    assert mt5.pending_orders_by_magic(MAGIC) == []
+    assert "改为市价" in _progress(sent, "add_counter")[0]["message"]
+    runner.cancel()
+
+
+async def test_counter_limit_markets_when_inside_stops_level():
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.stops_level = 500
+    runner, hub = _runner(sent, mt5=mt5)
+    runner.start()
+    await _settle()
+
+    open_px = mt5.positions_by_magic(MAGIC)[0]["price_open"]
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(mt5.positions_by_magic(MAGIC)),
+        price=open_px, point=0.01,
+    ))
+    await _settle()
+
+    assert runner.add_counts[1] == 1
+    assert mt5.pending_orders_by_magic(MAGIC) == []
+    runner.cancel()
+
+
+async def test_gone_cancels_counter_limit_before_finish():
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub = _runner(sent, mt5=mt5)
+    runner.start()
+    await _settle()
+
+    open_px = mt5.positions_by_magic(MAGIC)[0]["price_open"]
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(mt5.positions_by_magic(MAGIC)),
+        price=open_px, point=0.01,
+    ))
+    await _settle()
+    assert len(mt5.pending_orders_by_magic(MAGIC)) == 1
+
+    mt5._positions = [p for p in mt5._positions if int(p.get("magic") or 0) != MAGIC]
+    hub.sub.offer(mh.MarketEvent(kind=mh.GONE, symbol="XAUUSD", magic=MAGIC))
+    await _settle()
+
+    assert mt5.pending_orders_by_magic(MAGIC) == []
+    finished = _of_type(sent, "strategy_finished")
+    assert finished and finished[0]["status"] == "done"
+    runner.cancel()
+
+
+async def test_resume_adopts_existing_counter_limit():
+    """重连认领已有的逆势限价，不另挂第二张。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    opened = mt5.place_market_order("XAUUSD", "BUY", 0.1, comment="S1", magic=MAGIC)
+    open_px = opened["price"]
+    pending = mt5.place_pending_order(
+        "XAUUSD", "BUY", 0.1, open_px - 1.0, comment="R1D100", magic=MAGIC,
+    )
+    runner, hub = _runner(sent, mt5=mt5)
+    runner.start(resume=True)
+    await _settle()
+
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(mt5.positions_by_magic(MAGIC)),
+        price=open_px, point=0.01,
+    ))
+    await _settle()
+
+    orders = mt5.pending_orders_by_magic(MAGIC)
+    assert len(orders) == 1
+    assert orders[0]["ticket"] == pending["order"]
+    assert not _progress(sent, "cnt_limit")
+    runner.cancel()
+
+
+async def test_disabling_counter_rule_cancels_resting_limit():
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub = _runner(sent, mt5=mt5)
+    runner.start()
+    await _settle()
+    open_px = mt5.positions_by_magic(MAGIC)[0]["price_open"]
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(mt5.positions_by_magic(MAGIC)),
+        price=open_px, point=0.01,
+    ))
+    await _settle()
+    assert len(mt5.pending_orders_by_magic(MAGIC)) == 1
+
+    assert runner.apply_strategy({"rules": [counter_rule(status=0)]}) is True
+    await _settle()
+    assert mt5.pending_orders_by_magic(MAGIC) == []
+    assert _progress(sent, "cnt_limit_off")
+    runner.cancel()
+
+
+async def test_trend_add_does_not_place_counter_limit():
+    sent: list = []
+    mt5 = MockMT5Client()
+    strategy = {"rules": [counter_rule(type=2, point=100.0, lot_times=1.0, max_allow_num=3)]}
+    runner, hub = _runner(sent, mt5=mt5, strategy=strategy)
+    runner.start()
+    await _settle()
+
+    open_px = mt5.positions_by_magic(MAGIC)[0]["price_open"]
+    trend_px = open_px + 1.0
+    mt5.prices_map["XAUUSD"] = trend_px
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(mt5.positions_by_magic(MAGIC)),
+        price=trend_px, point=0.01,
+    ))
+    await _settle()
+
+    assert _progress(sent, "add_trend")
+    assert mt5.pending_orders_by_magic(MAGIC) == []
+    assert runner.add_counts[2] == 1
     runner.cancel()
 
 
@@ -616,6 +814,9 @@ async def test_add_failure_reports_error_and_keeps_running():
             self.calls += 1
             if self.calls == 1:
                 return super().place_market_order(*a, **kw)
+            return {"success": False, "error": "requote"}
+
+        def place_pending_order(self, *a, **kw):
             return {"success": False, "error": "requote"}
 
     sent: list = []
@@ -1900,8 +2101,148 @@ def _addon_pl_rule(**over) -> dict:
     return rule
 
 
-async def test_signal_float_pl_closes_only_own_magic():
-    """信号盈亏比按本魔术号浮盈/余额计算，只平本信号，其它 magic 不动。"""
+async def test_open_and_add_attach_tp_sl_on_the_order():
+    """开仓和加仓的市价单发出时就要带上共同止盈止损，不能等下一拍改单。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.balance = 10000.0
+    runner, hub = _runner(
+        sent, mt5=mt5,
+        strategy={"rules": [_addon_pl_rule(
+            float_pl_ratio={
+                "enabled": True, "ratio": -20, "monitor_mode": "loop", "max_times": 1,
+            },
+            lot_pl_tiers=_lot_tiers(),
+        )]},
+    )
+    runner.start()
+    await _settle()
+
+    first = mt5.positions_by_magic(MAGIC)[0]
+    # 成交按报价中间价 2330；止损止盈按开仓侧卖价预估后直接写进市价单
+    assert first["sl"] == 2130.06
+    assert first["tp"] == 2331.06
+
+    held = mt5.positions_by_magic(MAGIC)
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(held), price=held[0]["price_open"], point=0.01,
+    ))
+    await _settle()
+
+    pending = mt5.pending_orders_by_magic(MAGIC)
+    assert len(pending) == 1
+    assert pending[0]["ticket"] != first["ticket"]
+    # 逆势限价挂单不写止损止盈：限价成交后由 _lot_sltp_sync 按真实持仓重算
+    assert pending[0]["sl"] == 0
+    assert pending[0]["tp"] == 0
+    assert len(mt5.positions_by_magic(MAGIC)) == 1
+    runner.cancel()
+
+
+async def test_counter_limit_fills_and_stops_are_written_afterwards():
+    """逆势限价裸单成交后，持仓上必须被补上止损止盈。
+
+    挂单不写止损止盈（限价会被推到现价下方很深，按现价算的止损可能落到入场价
+    上方而被券商拒单），风险控制只能靠成交后的重算改单补上。
+    """
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.balance = 10000.0
+    mt5.auto_fill_pending = False
+    runner, hub = _runner(
+        sent, mt5=mt5,
+        strategy={"rules": [_addon_pl_rule(
+            float_pl_ratio={
+                "enabled": True, "ratio": -20, "monitor_mode": "loop", "max_times": 1,
+            },
+            lot_pl_tiers=_lot_tiers(),
+        )]},
+    )
+    runner.start()
+    await _settle()
+
+    held = mt5.positions_by_magic(MAGIC)
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(held), price=held[0]["price_open"], point=0.01,
+    ))
+    await _settle()
+
+    pending = mt5.pending_orders_by_magic(MAGIC)
+    assert len(pending) == 1
+    assert pending[0]["sl"] == 0
+    assert pending[0]["tp"] == 0
+
+    # 价格压到挂单价下方，限价成交
+    fill_px = pending[0]["price_open"]
+    mt5.prices_map["XAUUSD"] = fill_px - 0.5
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(mt5.positions_by_magic(MAGIC)),
+        price=fill_px - 0.5, point=0.01,
+    ))
+    await _settle()
+
+    filled = mt5.positions_by_magic(MAGIC)
+    assert len(filled) == 2
+    # 成交的那一笔必须已经被补上止损止盈
+    for pos in filled:
+        assert pos["sl"], f"ticket {pos['ticket']} 没有止损"
+        assert pos["tp"], f"ticket {pos['ticket']} 没有止盈"
+    runner.cancel()
+
+
+async def test_legacy_counter_limit_with_stops_gets_them_cleared():
+    """升级前挂的老单还带着止损止盈时，要顺手清掉。
+
+    那种止损是按现价算的，限价被推远后可能落到入场价上方，券商会直接拒单。
+    """
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.balance = 10000.0
+    runner, hub = _runner(
+        sent, mt5=mt5,
+        strategy={"rules": [_addon_pl_rule(
+            float_pl_ratio={
+                "enabled": True, "ratio": -20, "monitor_mode": "loop", "max_times": 1,
+            },
+            lot_pl_tiers=_lot_tiers(),
+        )]},
+    )
+    runner.start()
+    await _settle()
+
+    held = mt5.positions_by_magic(MAGIC)
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(held), price=held[0]["price_open"], point=0.01,
+    ))
+    await _settle()
+
+    pending = mt5.pending_orders_by_magic(MAGIC)
+    assert len(pending) == 1
+    # 模拟升级前挂的老单：带上了止损止盈
+    pending[0]["sl"] = 2200.0
+    pending[0]["tp"] = 2400.0
+
+    # 再来一拍，节点要对齐这张单
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(mt5.positions_by_magic(MAGIC)),
+        price=held[0]["price_open"], point=0.01,
+    ))
+    await _settle()
+
+    cleaned = mt5.pending_orders_by_magic(MAGIC)
+    assert len(cleaned) == 1
+    assert cleaned[0]["sl"] == 0
+    assert cleaned[0]["tp"] == 0
+    runner.cancel()
+
+
+async def test_signal_float_pl_writes_stop_not_market_close():
+    """盈亏比按 |比例| × 余额写成止损，浮亏本身不平仓，其它魔术号不动。"""
     sent: list = []
     mt5 = MockMT5Client()
     mt5.balance = 10000.0
@@ -1918,50 +2259,132 @@ async def test_signal_float_pl_closes_only_own_magic():
     for p in mt5._positions:
         if int(p.get("magic") or 0) == MAGIC:
             p["profit"] = -2000.0
-        elif int(p.get("magic") or 0) == OTHER_MAGIC:
-            p["profit"] = 5000.0  # 账户净值其实是赚的；本信号仍达 -20%
 
     held = [p for p in mt5._positions if int(p.get("magic") or 0) == MAGIC]
-    _tick(hub, held, held[0]["price_open"])
+    open_px = held[0]["price_open"]
+    _tick(hub, held, open_px)
     await _settle()
 
-    assert mt5.positions_by_magic(MAGIC) == []
-    assert mt5.positions_by_magic(OTHER_MAGIC)
-    finished = _of_type(sent, "strategy_finished")
-    assert finished and finished[0]["status"] == "done"
-    assert "信号盈亏比" in finished[0]["reason"]
-    assert finished[0]["detail"]["kind"] == "signal_pl"
-    assert finished[0]["detail"]["current_ratio"] == -20.0
+    # 亏损金额 10000*20% = 2000；0.1 手每美元 10，止损距离 200
+    pos = mt5.positions_by_magic(MAGIC)[0]
+    assert pos["sl"] == open_px - 200
+    assert pos["tp"] == 0
+    assert mt5.positions_by_magic(OTHER_MAGIC)[0]["sl"] == 0
+    assert not _of_type(sent, "strategy_finished")
+    runner.cancel()
 
 
-async def test_signal_lot_pl_tiers_prefers_higher_batch_and_closes_all():
+async def test_signal_stop_recalculates_on_open_not_on_close():
+    """新开一单才重算止损；手动平掉一单后，剩下的单保持上一次止损价。"""
     sent: list = []
     mt5 = MockMT5Client()
+    mt5.balance = 10000.0
     runner, hub = _runner(
         sent, mt5=mt5,
-        strategy={"rules": [_addon_pl_rule(lot_pl_tiers={
-            "enabled": True, "batch_count": 2, "close_action": "all",
-            "tiers": [
-                {"min_lot": 0.05, "pl_amount": 10.0},
-                {"min_lot": 0.1, "pl_amount": 20.0},
-            ],
+        strategy={"rules": [_addon_pl_rule(float_pl_ratio={
+            "enabled": True, "ratio": -20, "monitor_mode": "loop", "max_times": 1,
         })]},
     )
     runner.start()
     await _settle()
-    for p in mt5._positions:
-        if int(p.get("magic") or 0) == MAGIC:
-            p["volume"] = 0.1
-            p["profit"] = 25.0
-
     held = [p for p in mt5._positions if int(p.get("magic") or 0) == MAGIC]
-    _tick(hub, held, held[0]["price_open"])
+    open_px = held[0]["price_open"]
+    _tick(hub, held, open_px)
+    await _settle()
+    assert mt5.positions_by_magic(MAGIC)[0]["sl"] == open_px - 200
+
+    opened = mt5.place_market_order("XAUUSD", "BUY", 0.1, magic=MAGIC)
+    _tick(hub, [p for p in mt5._positions if int(p.get("magic") or 0) == MAGIC], open_px)
+    await _settle()
+    assert {p["sl"] for p in mt5.positions_by_magic(MAGIC)} == {open_px - 100}
+
+    assert mt5.close_ticket(opened["order"])["success"] is True
+    _tick(hub, [p for p in mt5._positions if int(p.get("magic") or 0) == MAGIC], open_px)
+    await _settle()
+    left = mt5.positions_by_magic(MAGIC)
+    assert len(left) == 1
+    assert left[0]["sl"] == open_px - 100
+    runner.cancel()
+
+
+def _lot_tiers(**over) -> dict:
+    tiers = {
+        "enabled": True, "batch_count": 2, "close_action": "all",
+        "tiers": [
+            {"min_lot": 0.05, "pl_amount": 10.0},
+            {"min_lot": 0.1, "pl_amount": 20.0},
+        ],
+    }
+    tiers.update(over)
+    return tiers
+
+
+async def test_signal_lot_pl_writes_batch1_stops_and_ignores_price_ticks():
+    """批次1金额只写止盈；没开盈亏比时不写止损。报价波动不平仓，手数变化才重算。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub = _runner(
+        sent, mt5=mt5,
+        strategy={"rules": [_addon_pl_rule(lot_pl_tiers=_lot_tiers())]},
+    )
+    runner.start()
+    await _settle()
+    held = [p for p in mt5._positions if int(p.get("magic") or 0) == MAGIC]
+    open_px = held[0]["price_open"]
+    _tick(hub, held, open_px)
     await _settle()
 
-    assert mt5.positions_by_magic(MAGIC) == []
-    finished = _of_type(sent, "strategy_finished")
-    assert finished and "信号分档手数盈亏" in finished[0]["reason"]
-    assert finished[0]["detail"]["tier_index"] == 1
+    # D = 10 / ((1/0.01) * 0.1) = 1，不用批次2的 20
+    pos = mt5.positions_by_magic(MAGIC)[0]
+    assert pos["tp"] == open_px + 1
+    assert pos["sl"] == 0
+    assert not _of_type(sent, "strategy_finished")
+
+    _tick(hub, [p for p in mt5._positions if int(p.get("magic") or 0) == MAGIC], open_px + 0.2)
+    await _settle()
+    pos = mt5.positions_by_magic(MAGIC)[0]
+    assert pos["tp"] == open_px + 1
+    assert len(mt5.positions_by_magic(MAGIC)) == 1
+
+    live = next(p for p in mt5._positions if int(p.get("magic") or 0) == MAGIC)
+    live["volume"] = 0.2
+    _tick(hub, [p for p in mt5._positions if int(p.get("magic") or 0) == MAGIC], open_px)
+    await _settle()
+    pos = mt5.positions_by_magic(MAGIC)[0]
+    assert pos["tp"] == open_px + 0.5
+    assert pos["sl"] == 0
+    noted = _progress(sent, "signal_pl")
+    assert noted and noted[-1]["detail"]["amount"] == 10.0
+    assert noted[-1]["detail"]["tier_index"] == 0
+    runner.cancel()
+
+
+async def test_signal_take_profit_starts_only_after_min_lot():
+    """总手数没到批次1门槛时不写止盈；加仓达标后才算。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub = _runner(
+        sent, mt5=mt5,
+        strategy={"rules": [_addon_pl_rule(lot_pl_tiers=_lot_tiers(
+            tiers=[
+                {"min_lot": 0.2, "pl_amount": 10.0},
+                {"min_lot": 0.5, "pl_amount": 20.0},
+            ],
+        ))]},
+    )
+    runner.start()
+    await _settle()
+    held = [p for p in mt5._positions if int(p.get("magic") or 0) == MAGIC]
+    open_px = held[0]["price_open"]
+    _tick(hub, held, open_px)
+    await _settle()
+    assert mt5.positions_by_magic(MAGIC)[0]["tp"] == 0
+
+    mt5.place_market_order("XAUUSD", "BUY", 0.1, magic=MAGIC)
+    _tick(hub, [p for p in mt5._positions if int(p.get("magic") or 0) == MAGIC], open_px)
+    await _settle()
+    assert {p["tp"] for p in mt5.positions_by_magic(MAGIC)} == {open_px + 0.5}
+    runner.cancel()
 
 
 async def test_signal_lot_pl_buy_side_keeps_sell():
@@ -1969,26 +2392,67 @@ async def test_signal_lot_pl_buy_side_keeps_sell():
     mt5 = MockMT5Client()
     runner, hub = _runner(
         sent, mt5=mt5,
-        strategy={"rules": [_addon_pl_rule(lot_pl_tiers={
-            "enabled": True, "batch_count": 1, "close_action": "buy",
-            "tiers": [{"min_lot": 0.1, "pl_amount": 10.0}],
-        })]},
+        strategy={"rules": [_addon_pl_rule(lot_pl_tiers=_lot_tiers(
+            batch_count=1, close_action="buy",
+            tiers=[{"min_lot": 0.1, "pl_amount": 10.0}],
+        ))]},
     )
     runner.start()
     await _settle()
     mt5.place_market_order("XAUUSD", "SELL", 0.1, magic=MAGIC)
-    for p in mt5._positions:
-        if int(p.get("magic") or 0) == MAGIC:
-            p["profit"] = 12.0
-
     held = [p for p in mt5._positions if int(p.get("magic") or 0) == MAGIC]
     _tick(hub, held, held[0]["price_open"])
     await _settle()
 
     left = mt5.positions_by_magic(MAGIC)
-    assert len(left) == 1
-    assert left[0]["type"] == "SELL"
+    assert len(left) == 2
+    buy = next(p for p in left if p["type"] == "BUY")
+    sell = next(p for p in left if p["type"] == "SELL")
+    assert buy["tp"] == buy["price_open"] + 1
+    assert sell["tp"] == 0
+    assert sell["sl"] == 0
     assert not _of_type(sent, "strategy_finished")
+    runner.cancel()
+
+
+async def test_signal_lot_pl_crossed_price_market_closes():
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub = _runner(
+        sent, mt5=mt5,
+        strategy={"rules": [_addon_pl_rule(lot_pl_tiers=_lot_tiers())]},
+    )
+    runner.start()
+    await _settle()
+    held = [p for p in mt5._positions if int(p.get("magic") or 0) == MAGIC]
+    _tick(hub, held, held[0]["price_open"] + 2)
+    await _settle()
+
+    assert mt5.positions_by_magic(MAGIC) == []
+    finished = _of_type(sent, "strategy_finished")
+    assert finished and "越过共同止盈" in finished[0]["reason"]
+
+
+async def test_signal_lot_pl_skips_manual_scatter_orders():
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub = _runner(
+        sent, mt5=mt5,
+        strategy={"rules": [_addon_pl_rule(lot_pl_tiers=_lot_tiers())]},
+    )
+    runner.start()
+    await _settle()
+    mt5.place_market_order("XAUUSD", "BUY", 0.1, comment="M1", magic=MAGIC)
+    held = [p for p in mt5._positions if int(p.get("magic") or 0) == MAGIC]
+    _tick(hub, held, held[0]["price_open"])
+    await _settle()
+
+    left = mt5.positions_by_magic(MAGIC)
+    addon = next(p for p in left if not str(p.get("comment") or "").startswith("M"))
+    manual = next(p for p in left if str(p.get("comment") or "").startswith("M"))
+    assert addon["tp"] == addon["price_open"] + 1
+    assert manual["tp"] == 0
+    assert manual["sl"] == 0
     runner.cancel()
 
 
@@ -2011,7 +2475,7 @@ def _smc_feed(price: float = 2390.0) -> dict:
 
 
 async def test_smc_waits_for_data_then_touches_once():
-    """没有推送时即使价位已到也不加；触价成交后，同一条记录被覆写也不再用。"""
+    """没有推送时不挂单；推送后先挂限价，成交后同一条记录被覆写也不再用。"""
     sent: list = []
     mt5 = MockMT5Client()
     mt5.prices_map["XAUUSD"] = 2400.0
@@ -2020,14 +2484,25 @@ async def test_smc_waits_for_data_then_touches_once():
     await _settle()
 
     held = mt5.positions_by_magic(MAGIC)
-    _tick(hub, held, 2390.0)
+    _tick(hub, held, 2400.0)
     await _settle()
     assert runner.add_count == 0
+    assert mt5.pending_orders_by_magic(MAGIC) == []
 
     assert runner.apply_smc(_smc_feed()) is True
     await _settle()
+    pending = mt5.pending_orders_by_magic(MAGIC)
+    assert len(pending) == 1
+    assert pending[0]["price_open"] == 2390.0
+    assert pending[0]["comment"].startswith("R1L0F")
+    assert runner.add_count == 0
+    assert "smc_used" not in (_progress(sent, "cnt_limit")[-1].get("runtime") or {})
+
+    mt5.prices_map["XAUUSD"] = 2389.0
+    _tick(hub, mt5.positions_by_magic(MAGIC), 2389.0)
+    await _settle()
     assert runner.add_count == 1
-    added = mt5.positions_by_magic(MAGIC)[-1]
+    added = next(p for p in mt5.positions_by_magic(MAGIC) if str(p["comment"]).startswith("R1"))
     assert added["comment"].startswith("R1L0F")
     assert len(added["comment"]) == len("R1L0F") + 8
     runtime = _progress(sent, "add_counter")[-1]["runtime"]["smc_used"]
@@ -2038,6 +2513,7 @@ async def test_smc_waits_for_data_then_touches_once():
     _tick(hub, mt5.positions_by_magic(MAGIC), 2380.0)
     await _settle()
     assert runner.add_count == 1
+    assert len(mt5.positions_by_magic(MAGIC)) == 2
     runner.cancel()
 
 
@@ -2067,3 +2543,122 @@ async def test_smc_resume_skips_level_already_on_comment_or_runtime():
     assert "aaaaaaaa" in runner._smc_used
     assert len(mt5.positions_by_magic(MAGIC)) == 2
     runner.cancel()
+
+
+# --------------------------- 波幅纳入当前 K 线 ---------------------------
+def _range_live_strategy(**level_over) -> dict:
+    """逆势 + 波幅档位，可选开启「纳入当前 K 线波幅」。"""
+    level = {
+        "pos_from": 1, "pos_to": 4, "calc_type": "range", "timeframe": "M5",
+        "range_include_live": True, "range_live_cap": 1000.0,
+        "range_live_refresh": 5,
+        "lot_times": 1.0, "extra_lot": 0.0,
+    }
+    level.update(level_over)
+    return {"rules": [counter_rule(
+        batch_enabled=True, batch_count=1, total_lot_limit=4, batch_levels=[level],
+    )]}
+
+
+async def test_range_live_reads_via_range_pair_not_bar_metric():
+    """开了实时口径的档位，基线与实时必须同源：只走 bar_range_pair。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub = _runner(sent, mt5=mt5, strategy=_range_live_strategy())
+    hub.range_pairs["M5"] = (30.0, 60.0)
+    runner.start()
+    await _settle()
+
+    open_px = mt5.positions_by_magic(MAGIC)[0]["price_open"]
+    _tick(hub, mt5.positions_by_magic(MAGIC), open_px)
+    await _settle()
+
+    assert hub.range_pair_calls == [("XAUUSD", "M5", 5.0)]
+    # 不该再走只读已收盘的旧路径
+    assert hub.metric_calls == []
+
+
+async def test_range_live_limit_is_pushed_farther():
+    """急跌时实时波幅变大，逆势限价被推到更远处。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub = _runner(sent, mt5=mt5, strategy=_range_live_strategy())
+    hub.range_pairs["M5"] = (30.0, 60.0)     # 基线 3000 点，实时 6000 点
+    runner.start()
+    await _settle()
+
+    open_px = mt5.positions_by_magic(MAGIC)[0]["price_open"]
+    _tick(hub, mt5.positions_by_magic(MAGIC), open_px)
+    await _settle()
+
+    pending = mt5.pending_orders_by_magic(MAGIC)
+    assert len(pending) == 1
+    # 间距取实时 60.0 → 6000 点 → 挂单价 = 锚点 - 60.0
+    assert pending[0]["price_open"] == round(open_px - 60.0, 2)
+
+
+async def test_range_live_limit_without_live_data_uses_baseline():
+    """没读到实时值时退回基线，挂单价与未开启时一致。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub = _runner(sent, mt5=mt5, strategy=_range_live_strategy())
+    hub.range_pairs["M5"] = (30.0, 0.0)
+    runner.start()
+    await _settle()
+
+    open_px = mt5.positions_by_magic(MAGIC)[0]["price_open"]
+    _tick(hub, mt5.positions_by_magic(MAGIC), open_px)
+    await _settle()
+
+    pending = mt5.pending_orders_by_magic(MAGIC)
+    assert len(pending) == 1
+    assert pending[0]["price_open"] == round(open_px - 30.0, 2)
+
+
+async def test_range_live_reports_breakdown_in_progress_detail():
+    """后台要能看到「基线 → 实时 → 生效」的明细。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub = _runner(sent, mt5=mt5, strategy=_range_live_strategy())
+    hub.range_pairs["M5"] = (30.0, 60.0)
+    runner.start()
+    await _settle()
+
+    open_px = mt5.positions_by_magic(MAGIC)[0]["price_open"]
+    _tick(hub, mt5.positions_by_magic(MAGIC), open_px)
+    await _settle()
+
+    placed = _progress(sent, "cnt_limit")
+    assert placed
+    detail = placed[-1]["detail"]
+    assert detail["baseline_range"] == 30.0
+    assert detail["live_range"] == 60.0
+    assert detail["effective_range"] == 60.0
+    assert detail["range_live_adapted"] is True
+
+
+async def test_range_live_is_disabled_for_trend_rule():
+    """顺势不启用自适应：也不会去读实时口径。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    level = {
+        "pos_from": 1, "pos_to": 4, "calc_type": "range", "timeframe": "M5",
+        "range_include_live": True, "range_live_cap": 1000.0,
+        "range_live_refresh": 5, "lot_times": 1.0, "extra_lot": 0.0,
+    }
+    strategy = {"rules": [counter_rule(
+        type=2, batch_enabled=True, batch_count=1, total_lot_limit=4,
+        batch_levels=[level],
+    )]}
+    runner, hub = _runner(sent, mt5=mt5, strategy=strategy)
+    hub.range_pairs["M5"] = (30.0, 60.0)
+    runner.start()
+    await _settle()
+
+    open_px = mt5.positions_by_magic(MAGIC)[0]["price_open"]
+    _tick(hub, mt5.positions_by_magic(MAGIC), open_px)
+    await _settle()
+
+    assert hub.range_pair_calls == []
+    # 顺势不挂逆势限价
+    assert mt5.pending_orders_by_magic(MAGIC) == []

@@ -346,39 +346,33 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
 
   <div class="list-cards mobile-only">
     <div v-for="n in hub.nodes" :key="n.node_id" class="list-card card" :class="{ 'row-selected': isSelected(n.node_id) }">
-      <div class="list-card-head row between">
-        <div class="row" style="gap: 8px">
-          <input
-            type="checkbox"
-            :checked="isSelected(n.node_id)"
-            @change="toggleSelect(n.node_id, ($event.target as HTMLInputElement).checked)"
-          />
-          <span class="dot" :class="hub.statuses[n.node_id] || n.status"></span>
-          <a class="node-link" @click="goDetail(n)">{{ n.name }}</a>
-        </div>
+      <div class="node-row">
+        <input
+          type="checkbox"
+          :checked="isSelected(n.node_id)"
+          @change="toggleSelect(n.node_id, ($event.target as HTMLInputElement).checked)"
+        />
+        <span class="dot" :class="hub.statuses[n.node_id] || n.status"></span>
+        <a class="node-link node-name" @click="goDetail(n)">{{ n.name }}</a>
+        <span class="node-meta muted">{{ n.mt5_login || '—' }}</span>
         <span class="tag" :class="(hub.statuses[n.node_id] || n.status) === 'online' ? 'green' : ''">
           {{ (hub.statuses[n.node_id] || n.status) === 'online' ? '在线' : '离线' }}
         </span>
       </div>
-      <div class="list-field"><span class="k">节点 ID</span><span class="v muted" style="font-weight: 500; font-size: 12px">{{ n.node_id }}</span></div>
-      <div class="list-field"><span class="k">MT5 账号</span><span class="v">{{ n.mt5_login || '—' }}</span></div>
-      <div class="list-field"><span class="k">MT5 服务器</span><span class="v">{{ n.mt5_server || '—' }}</span></div>
-      <div v-if="auth.isAdmin" class="list-field"><span class="k">所有者</span><span class="v">{{ n.owner_username || '管理员' }}</span></div>
-      <div v-if="isPendingNode(n)" class="list-field"><span class="k">开通</span><span class="v">{{ nodeApprovalHint(n) }}</span></div>
-      <div class="list-field"><span class="k">分发配置</span><span class="v muted">{{ filterSymbolCount(n) }}</span></div>
-      <div class="list-field">
-        <span class="k">启用</span>
-        <span class="v">
-          <button class="btn-sm" :class="nodeEnableIntent(n) ? 'btn-ghost' : 'btn-danger'" :disabled="isPendingNode(n) && !auth.isAdmin" @click="toggleEnabled(n)">
-            {{ nodeEnableLabel(n) }}
-          </button>
-        </span>
+      <div class="node-sub muted">
+        <span v-if="n.mt5_server">{{ n.mt5_server }}</span>
+        <span v-if="auth.isAdmin">{{ n.owner_username || '管理员' }}</span>
+        <span>{{ filterSymbolCount(n) }}</span>
       </div>
-      <div class="list-card-actions">
+      <div class="node-actions">
+        <button class="btn-sm" :class="nodeEnableIntent(n) ? 'btn-ghost' : 'btn-danger'" :disabled="isPendingNode(n) && !auth.isAdmin" @click="toggleEnabled(n)">
+          {{ nodeEnableLabel(n) }}
+        </button>
         <button class="btn-sm btn-ghost" @click="goDetail(n)">详情</button>
         <button class="btn-sm btn-ghost" @click="openEdit(n)">编辑</button>
         <button v-if="auth.isAdmin" class="btn-sm btn-danger" @click="remove(n)">删除</button>
       </div>
+      <div v-if="isPendingNode(n)" class="node-hint muted">{{ nodeApprovalHint(n) }}</div>
     </div>
     <div v-if="!hub.nodes.length && !searching" class="card card-pad muted">
       {{ appliedQuery ? '无匹配节点' : '暂无节点' }}
@@ -488,6 +482,58 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
 </template>
 
 <style scoped>
+/* ── 手机端紧凑节点行 ── */
+@media (max-width: 768px) {
+  .list-cards { gap: 8px; }
+  .list-card { padding: 10px 12px; }
+}
+.node-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+}
+.node-row .node-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+}
+.node-row .node-meta {
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-family: var(--mono);
+}
+.node-row .tag {
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+.node-sub {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+  margin-top: 2px;
+  padding-left: 26px;
+  font-size: 11px;
+}
+.node-hint {
+  margin-top: 4px;
+  font-size: 11px;
+}
+.node-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.node-actions .btn-sm {
+  flex: 1 1 auto;
+  min-width: 60px;
+  padding: 6px 8px;
+}
+
 /* 币种配置区随弹窗 body 滚动；桌面仍可限高，手机交给 modal-body */
 .node-filter-scroll {
   margin-top: 4px;

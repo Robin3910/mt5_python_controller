@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 // 分组信号页：展示某分组处理过的 strategy 主任务与各节点下发明细
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -266,9 +266,19 @@ function reconstructManualScatterFormula(detail: GroupTaskEventDetail): string {
   const target = detail.target_pl
   const per = detail.profit_per_lot
   if (target != null && per != null && Number(per) > 0) {
-    const raw = Math.abs(Number(target)) / Number(per)
-    const lot = detail.current_lot == null ? '' : `；当前仓 ${detail.current_lot} 手命中该档`
-    return `手数 = 分档目标 ${target}u ÷ 每手止盈 ${per}u = ${Number(raw.toPrecision(4))}，向上取整 → ${vol ?? '—'}${lot}`
+    // 存量在止盈时刻的预估盈亏：浮盈抵扣目标、浮亏补进目标
+    const pl = Number(detail.projected_pl ?? 0)
+    const remaining = Math.abs(Number(target)) - pl
+    let head = `手数 = (分档目标 ${Math.abs(Number(target))}u`
+    if (pl < 0) head += ` + 存量仓位到止盈预估亏损 ${Math.abs(pl)}u)`
+    else if (pl > 0) head += ` - 存量仓位到止盈预估盈利 ${pl}u)`
+    else head += ')'
+    const lot = detail.current_lot == null ? '' : `；当前仓 ${detail.current_lot} 手`
+    if (remaining <= 0) {
+      return `${head} ÷ 每手止盈 ${per}u ≤ 0 → 按品种最小手数开 ${vol ?? '—'}${lot}`
+    }
+    const raw = remaining / Number(per)
+    return `${head} ÷ 每手止盈 ${per}u = ${Number(raw.toPrecision(4))}，向上取整 → ${vol ?? '—'}${lot}`
   }
   if (vol != null) return `手数 ${vol}`
   return ''
@@ -357,6 +367,13 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
     push('最小变动单位', detail.point)
     push('实际偏离', detail.deviation === undefined ? '' : `${detail.deviation} 点`)
     push('触发阈值', detail.threshold === undefined ? '' : `${detail.threshold} 点`)
+    // 波幅纳入当前 K 线：基线 / 实时 / 生效值，说明这一单的间距是怎么来的
+    if (detail.range_live_adapted) {
+      push('基线波幅', detail.baseline_range)
+      push('当前 K 线实时波幅', detail.live_range)
+      push('生效波幅', detail.effective_range)
+      push('波幅被上限裁剪', detail.range_live_clamped ? '是' : '')
+    }
     push('手数公式', detail.volume_formula)
     push('首单手数（倍率基准）', detail.base_volume)
     push('倍数', detail.lot_times)
@@ -537,6 +554,7 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
     push('本次手数', detail.volume)
     push('当前仓手数', detail.current_lot)
     push('分档目标', detail.target_pl == null ? '' : `${detail.target_pl}u`)
+    push('存量到止盈预估盈亏', detail.projected_pl == null ? '' : `${detail.projected_pl}u`)
     push('每手止盈', detail.profit_per_lot == null || detail.profit_per_lot === 0 ? '' : `${detail.profit_per_lot}u`)
     push('手数步长', detail.volume_step)
     push('入场价', detail.entry_price)
@@ -546,6 +564,45 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
     push('成交侧现价', detail.fill_price)
     push('注释', detail.comment)
     push('错误', detail.error)
+    return rows
+  }
+  if (detail.kind === 'signal_pl') {
+    // 节点有两种形状都用这个 kind：共同止盈止损（lot_stops_detail）
+    // 与信号盈亏比触发（trigger_detail）。键不重叠，按存在与否显示。
+    push('方向', detail.side === 'BUY' ? '多单' : detail.side === 'SELL' ? '空单' : '')
+    push('结论', signalPlStatusLabel(detail.status))
+    push('共同止盈', detail.tp)
+    push('共同止损', detail.sl)
+    // 越价被拒时，被拒的新价单独列出来，让人看到「本来要写成多少」
+    if ((detail.status || '') === 'kept') {
+      push('未写入的止盈价', detail.new_tp)
+      push('未写入的止损价', detail.new_sl)
+    }
+    push('现价', detail.market)
+    push('总手数', detail.volume)
+    push('加权开仓价', detail.weighted_open)
+    push('批次1金额', detail.amount)
+    push('盈亏比亏损金额', detail.sl_amount)
+    push('说明', detail.kept_reason || detail.message_core)
+    push('错误', detail.error)
+    return rows
+  }
+  if (detail.kind === 'strategy_update') {
+    push('整体结论', strategyUpdateResultLabel(detail.result))
+    push('配置版本', detail.config_version)
+    const fields = Array.isArray(detail.fields) ? detail.fields : []
+    if (!fields.length) {
+      push('说明', '没有字段级变更')
+      return rows
+    }
+    // 逐字段结论：状态 + 说明
+    fields.forEach((f, i) => {
+      push(
+        `字段 ${i + 1}`,
+        `${strategyUpdateFieldLabel(f.status)} · ${f.field || '-'}` +
+          (f.message ? ` — ${f.message}` : ''),
+      )
+    })
     return rows
   }
   if (detail.kind === 'account_risk') {
@@ -592,6 +649,38 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
   return rows
 }
 
+function strategyUpdateResultLabel(result?: string | null): string {
+  const m: Record<string, string> = {
+    applied: '✅ 全部生效',
+    partial: '⚠️ 部分生效',
+    rejected: '❌ 被拒绝',
+  }
+  const key = String(result || '').toLowerCase()
+  return m[key] || (key ? key : '—')
+}
+
+function signalPlStatusLabel(status?: string | null): string {
+  const m: Record<string, string> = {
+    written: '✅ 新值已写入',
+    kept: '⚠️ 保留旧值',
+    crossed_closed: '🔒 现价越价已平仓',
+  }
+  const key = String(status || '').toLowerCase()
+  return m[key] || (key ? key : '—')
+}
+
+function strategyUpdateFieldLabel(status?: string | null): string {
+  const m: Record<string, string> = {
+    applied: '✅ 生效',
+    partial: '⚠️ 部分生效',
+    frozen: '❄️ 冻结',
+    locked: '🔒 锁定',
+    no_effect: '➖ 无效果',
+  }
+  const key = String(status || '').toLowerCase()
+  return m[key] || (key ? key : '—')
+}
+
 /** 一律按东八区（北京时间）显示，不跟券商 MT5 钟面对齐。 */
 function fmtTime(sec: number | null | undefined): string {
   if (!sec) return '—'
@@ -617,6 +706,13 @@ function fmtPayload(raw: unknown): string {
     }
   }
   return JSON.stringify(raw, null, 2)
+}
+
+/** 时延埋点（毫秒）。小于 1ms 显示小数，超过 1s 转成秒更好读。 */
+function fmtMs(ms: number | null | undefined): string {
+  if (ms === null || ms === undefined) return '—'
+  if (ms < 1000) return `${ms.toFixed(1)}ms`
+  return `${(ms / 1000).toFixed(2)}s`
 }
 
 function taskTag(status: string): { cls: string; text: string } {
@@ -723,9 +819,17 @@ function eventTag(
   const m: Record<string, { cls: string; text: string }> = {
     open: { cls: 'green', text: '开仓' },
     add_counter: { cls: 'amber', text: '逆势加仓' },
+    cnt_limit: { cls: 'amber', text: '逆势挂限价' },
+    cnt_limit_mod: { cls: 'blue', text: '逆势改限价' },
+    cnt_limit_off: { cls: '', text: '逆势撤限价' },
     add_trend: { cls: 'amber', text: '顺势加仓' },
     add_manual: { cls: 'amber', text: '手动分散仓' },
+    manual_pending: { cls: 'amber', text: '手动仓挂单' },
+    manual_filled: { cls: 'green', text: '手动仓成交' },
+    manual_off: { cls: '', text: '手动仓撤单' },
+    manual_tp_align: { cls: 'blue', text: '止盈价同步' },
     manual_tp_close: { cls: 'blue', text: '止盈联动清仓' },
+    signal_pl: { cls: 'blue', text: '止盈止损' },
     grid_add: { cls: 'amber', text: '网格买入' },
     grid_shift: { cls: 'blue', text: '网格平移' },
     breakeven: { cls: 'blue', text: '保本' },
@@ -733,6 +837,7 @@ function eventTag(
     close_all: { cls: 'blue', text: '全部平仓' },
     error: { cls: 'red', text: '异常' },
     resume: { cls: '', text: '恢复' },
+    strategy_update: { cls: 'blue', text: '策略更新' },
   }
   return m[eventType] || { cls: '', text: eventType }
 }
@@ -908,6 +1013,7 @@ onUnmounted(stopAutoRefresh)
                           <th class="right">盈亏</th><th>结束原因</th>
                           <th>订单</th><th class="right">成交价</th>
                           <th>错误</th><th>下发时间</th><th>完成时间</th>
+                          <th class="right">节点排队</th><th class="right">券商往返</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -941,10 +1047,12 @@ onUnmounted(stopAutoRefresh)
                             <td class="muted group-break">{{ d.error || '—' }}</td>
                             <td class="muted" style="white-space: nowrap">{{ fmtTime(d.dispatched_at) }}</td>
                             <td class="muted" style="white-space: nowrap">{{ fmtTime(d.finished_at) }}</td>
+                            <td class="right muted">{{ fmtMs(d.queued_ms) }}</td>
+                            <td class="right muted">{{ fmtMs(d.order_to_fill_ms) }}</td>
                           </tr>
                           <tr v-if="isDispatchExpanded(d.id)" class="detail-row">
                             <td></td>
-                            <td colspan="16">
+                            <td colspan="18">
                               <div class="muted" style="font-size: 12px; margin-bottom: 6px">
                                 关联订单 · {{ d.node_name || d.node_id }}
                                 <template v-if="d.magic != null"> · 魔术号 {{ d.magic }}</template>
