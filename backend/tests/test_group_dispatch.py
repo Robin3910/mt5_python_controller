@@ -601,6 +601,38 @@ async def test_progress_runtime_roundtrip_and_stuck_finish(store, monkeypatch):
     assert cmd["runtime"]["shift_count"] == 2
 
 
+async def test_manual_off_reason_reaches_runtime_hints(store, monkeypatch):
+    """手动单被撤销的原因要一路送到 hints：前端据此显示对应文案。
+
+    链路：节点上报 runtime.manual_off_reason → 落 runtime_json →
+    strategy_runtime_hints 汇总 → 前端读 manual_off_reason。
+    """
+    await online(store, mk_node("nd_a"))
+    strategy = await mk_strategy(store, name="手动单策略")
+    await mk_group(store, "手动单组", ["nd_a"], strategy=strategy)
+    monkeypatch.setattr(manager, "send_to_node", capture_sender([]))
+    d = GroupDispatcher(store)
+    await d.dispatch(TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_ms_off")
+    task = (await fetch_tasks("sig_ms_off"))[0]
+    await open_first_orders(task.task_id, ["nd_a"])
+    row = (await fetch_dispatches(task.task_id))[0]
+
+    await group_persist.record_strategy_progress(
+        node_id="nd_a", dispatch_id=row.id, task_id=task.task_id,
+        data={
+            "event": "manual_off", "phase": "running",
+            "runtime": {
+                "manual_state": {"2": "void"},
+                "manual_off_reason": {"2": "removed"},
+            },
+        },
+    )
+
+    hints = await group_persist.strategy_runtime_hints(strategy["strategy_id"])
+    assert hints["manual_state"]["2"] == "void", "void 状态必须能进 hints"
+    assert hints["manual_off_reason"]["2"] == "removed", "撤销原因必须能进 hints"
+
+
 async def test_grid_signal_needs_no_stop_loss(store, monkeypatch):
     """网格不靠止损距离算手数，缺 sl 也照常下发（与模版2 相反）。"""
     await online(store, mk_node("nd_a"))

@@ -2405,3 +2405,194 @@ async def test_runner_keeps_pending_when_new_tiers_disabled():
     assert len(now) == 1, "算不出手数时不该撤旧单"
     assert now[0]["ticket"] == ticket
     runner.cancel()
+
+
+# ----------------------------------------------------------------------
+# 配置里删掉手动单 → 撤掉盘上的挂单
+# ----------------------------------------------------------------------
+
+
+async def _place_pending_manual(sent: list, mt5: MockMT5Client):
+    """跑到「手动分散仓挂单已在盘上」这一步，返回 (runner, hub, ticket)。"""
+    mt5.prices_map["XAUUSD"] = 4405.0
+    runner, hub = _runner(sent, mt5=mt5)
+    runner.start()
+    await _settle()
+    mt5.prices_map["XAUUSD"] = 4405.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4404.9, ask=4405.0)
+    await _settle()
+    placed = [o for o in mt5.pending_orders_by_magic(MAGIC) if o.get("comment") == "M2"]
+    assert len(placed) == 1, "手动分散仓应已挂出"
+    return runner, hub, placed[0]["ticket"]
+
+
+async def test_runner_cancels_pending_when_manual_removed_from_config():
+    """客户把手动单删了：盘上那张挂单必须撤掉。
+
+    场景：手动单已挂出但没成交 → 客户在表单里删掉了手动单（或把它关掉）→
+    节点收到热推 → 撤掉那张单。留着它等于在一个客户已经不认可的配置上成交。
+    """
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub, ticket = await _place_pending_manual(sent, mt5)
+
+    runner.apply_strategy({
+        "template_id": "tpl_1",
+        "rules": [_trend_rule(manual_scatter=_cfg(enabled=False))],
+    })
+    mt5.prices_map["XAUUSD"] = 4405.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4404.9, ask=4405.0)
+    await _settle(10)
+
+    assert ticket not in [o["ticket"] for o in mt5.pending_orders_by_magic(MAGIC)], \
+        "手动单被删后，挂单必须撤掉"
+    off = _progress(sent, ms.PENDING_OFF_EVENT)
+    assert off, "撤单要发 manual_off 事件"
+    assert off[-1]["detail"]["off_reason"] == ms.OFF_REMOVED
+    assert runner._manual_lifecycle(2) == ms.STATE_VOID
+    runner.cancel()
+
+
+async def test_runner_cancels_pending_when_manual_block_removed():
+    """手动单整块被删掉（不是 enabled=false）：同样要撤单。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub, ticket = await _place_pending_manual(sent, mt5)
+
+    rule = _trend_rule()
+    rule.pop("manual_scatter")
+    runner.apply_strategy({"template_id": "tpl_1", "rules": [rule]})
+    mt5.prices_map["XAUUSD"] = 4405.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4404.9, ask=4405.0)
+    await _settle(10)
+
+    assert ticket not in [o["ticket"] for o in mt5.pending_orders_by_magic(MAGIC)], \
+        "手动单整块被删后，挂单必须撤掉"
+    off = _progress(sent, ms.PENDING_OFF_EVENT)
+    assert off and off[-1]["detail"]["off_reason"] == ms.OFF_REMOVED
+    runner.cancel()
+
+
+async def test_runner_manual_removed_reopens_add_on_rule():
+    """手动单被删 → 该规则的「加仓已收口」标记撤销，重新填参数还能再挂。
+
+    手动分散仓是本任务最后一次加仓，所以挂出后 `_manual_fired` 记上了收口。
+    客户既然把手动单删了，收口的前提就不存在了——标记要一起撤销，
+    否则客户重新填了参数也挂不出来（`_maybe_open_manual_scatter` 会跳过）。
+    """
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub, _ticket = await _place_pending_manual(sent, mt5)
+    assert 2 in runner._manual_fired, "挂出后该规则加仓应收口"
+
+    runner.apply_strategy({
+        "template_id": "tpl_1",
+        "rules": [_trend_rule(manual_scatter=_cfg(enabled=False))],
+    })
+    mt5.prices_map["XAUUSD"] = 4405.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4404.9, ask=4405.0)
+    await _settle(10)
+
+    assert 2 not in runner._manual_fired, "手动单删掉后加仓收口标记应撤销"
+    runner.cancel()
+
+
+async def test_runner_cancels_pending_on_resume_when_config_has_no_manual():
+    """重连兜底：runtime 里记着挂单，但快照里已没有手动单 → 撤掉。
+
+    热推包在节点离线时没送到，库里的运行快照却被改写了；节点重连 resume
+    拿到的快照没有手动单，而 runtime 里还记着那张挂单——不撤就留下一张
+    永远没人管的孤儿单。
+    """
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.prices_map["XAUUSD"] = 4405.0
+    # 盘上确实有这张单（票号由 mock 分配，runtime 里要写同一个）
+    res = mt5.place_pending_order(
+        "XAUUSD", "BUY", 0.5, 4400.0, 0.0, None, "M2", MAGIC, "limit",
+    )
+    ticket = int(res["order"])
+    # runtime 里有在途挂单，但策略快照里已经没有 manual_scatter
+    runtime = {
+        "manual_pending": {"2": {
+            "ticket": ticket, "type": "BUY", "volume": 0.5,
+            "price_open": 4400.0, "sl": 0.0, "tp": 4410.0, "time": 1.0,
+        }},
+        "manual_fired": [2],
+    }
+    rule = _trend_rule()
+    rule.pop("manual_scatter")
+    runner, hub = _runner(
+        sent, mt5=mt5,
+        strategy={"template_id": "tpl_1", "rules": [rule]},
+        runtime=runtime,
+    )
+    runner.start()
+    await _settle()
+    mt5.prices_map["XAUUSD"] = 4405.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4404.9, ask=4405.0)
+    await _settle(10)
+
+    assert not [o for o in mt5.pending_orders_by_magic(MAGIC) if o.get("comment") == "M2"], \
+        "重连后配置里没有手动单，挂单必须撤掉"
+    runner.cancel()
+
+
+def test_describe_pending_off_removed_mentions_config_deleted():
+    """撤销原因文案要说明是「配置被删」，不是笼统的「已撤销」。"""
+    text = ms.describe_pending_off(ms.OFF_REMOVED)
+    assert "配置已删除" in text
+    assert "不再入场" in text
+
+
+async def test_runner_cancels_pending_on_wake_without_new_tick():
+    """热推后没有新行情（周末 / 挂单等成交）：WAKE 就要把单撤掉。
+
+    撤单不能等下一轮真实 tick——行情静止时根本没有 tick，客户保存后
+    撤单会一直排队到下一次开市。
+    """
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub, ticket = await _place_pending_manual(sent, mt5)
+
+    runner.apply_strategy({
+        "template_id": "tpl_1",
+        "rules": [_trend_rule(manual_scatter=_cfg(enabled=False))],
+    })
+    # 只唤醒，不给新 tick
+    hub.sub.wake()
+    await _settle(10)
+
+    assert ticket not in [o["ticket"] for o in mt5.pending_orders_by_magic(MAGIC)], \
+        "WAKE 就该撤单，不能等下一次真实 tick"
+    runner.cancel()
+
+
+async def test_runner_keeps_pending_when_cancel_not_confirmed():
+    """撤单没被券商确认：不能当成撤成功，要保留 PENDING 下一拍再撤。
+
+    静默当成功会留下「节点以为撤了、券商那边还挂着」的孤儿单——那张单
+    随时可能在一个客户已经不认可的配置上成交。
+    """
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub, ticket = await _place_pending_manual(sent, mt5)
+
+    # 撤单被券商拒绝
+    mt5.cancel_order = lambda t, max_retry=3: {
+        "success": False, "action": "CANCEL", "ticket": t, "error": "invalid order",
+    }
+    runner.apply_strategy({
+        "template_id": "tpl_1",
+        "rules": [_trend_rule(manual_scatter=_cfg(enabled=False))],
+    })
+    mt5.prices_map["XAUUSD"] = 4405.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4404.9, ask=4405.0)
+    await _settle(10)
+
+    assert runner._manual_lifecycle(2) == ms.STATE_PENDING, \
+        "撤单没确认时不能标成已撤销"
+    assert 2 in runner._manual_pending, "撤单没确认时要保留挂单记录，下一拍再撤"
+    assert not _progress(sent, ms.PENDING_OFF_EVENT), \
+        "撤单没确认时不该发 manual_off 事件"
+    runner.cancel()

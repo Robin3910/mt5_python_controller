@@ -185,6 +185,32 @@ function manualScatterVoid(ruleType: number): boolean {
   return manualScatterState(ruleType) === 'void'
 }
 
+/**
+ * 挂单被撤销的原因文案。
+ * 撤销有几种成因，说清楚是哪一种客户才知道下一步该做什么：
+ * - removed：客户自己把手动单删了（保存后节点撤掉了那张单）
+ * - ladder_tp：阶梯止盈先到，仓位已经收口
+ * - replaced：参数调整，节点撤旧单重挂
+ * - closed：任务收口
+ */
+function manualScatterVoidHint(ruleType: number): string {
+  const reasons = runtimeHints.value?.manual_off_reason || {}
+  const reason = reasons[String(ruleType)] || reasons[Number(ruleType)]
+  if (reason === 'removed') {
+    return '手动分散仓配置已删除，挂单已撤销：本次不再入场；如需继续请重新填写入场价与止盈价'
+  }
+  if (reason === 'ladder_tp') {
+    return '手动分散仓挂单已被撤销（阶梯止盈先到）：本次不再入场；如需继续请重新填写入场价与止盈价'
+  }
+  if (reason === 'closed') {
+    return '手动分散仓挂单已被撤销（任务收口）'
+  }
+  if (reason === 'replaced') {
+    return '手动分散仓参数已调整，原挂单已撤销并按新参数重新挂单'
+  }
+  return '手动分散仓挂单已被撤销：本次不再入场；如需继续请重新填写入场价与止盈价'
+}
+
 /** 该规则的上限下限：不能低于已开笔数 */
 function limitFloor(ruleType: number): number {
   return addedByRule.value[ruleType] || 0
@@ -275,15 +301,13 @@ const runtimeBanner = computed<{ title: string; lines: string[] } | null>(() => 
     if (state === 'pending') {
       lines.push(
         `${label}的手动分散仓挂单在盘上：入场价 / 止盈 / 止损仍可修改，` +
-          '保存后节点会撤掉旧单、按新参数重算手数并重新挂单。',
+          '保存后节点会撤掉旧单、按新参数重算手数并重新挂单；' +
+          '删除手动单并保存则会撤掉这张挂单。',
       )
     } else if (state === 'filled') {
       lines.push(`${label}的手动分散仓已成交：配置已锁定，之后不能再修改。`)
     } else if (state === 'void') {
-      lines.push(
-        `${label}的手动分散仓挂单已被撤销（阶梯止盈先到）：本次不再入场，` +
-          '如需继续请重新填写入场价与止盈价。',
-      )
+      lines.push(`${label}的${manualScatterVoidHint(Number(ruleType))}`)
     }
   }
   if (!lines.length) return null
@@ -2935,12 +2959,12 @@ function resetRuleToTemplate(idx: number): void {
                       <!-- 挂单在盘上：还能改，保存后节点撤旧单重算重挂 -->
                       <p v-else-if="manualScatterPending(r.type)" class="locked-hint is-editable">
                         手动分散仓挂单在盘上，入场价 / 止盈 / 止损仍可修改；
-                        保存后节点会撤掉旧单、按新参数重算手数并重新挂单
+                        保存后节点会撤掉旧单、按新参数重算手数并重新挂单。
+                        删除手动单并保存，则会撤掉盘上这张挂单，本次不再入场
                       </p>
                       <!-- 挂单被撤销：需要客户重新敲数字 -->
                       <p v-else-if="manualScatterVoid(r.type)" class="locked-hint">
-                        手动分散仓挂单已被撤销（阶梯止盈先到），本次不再入场；
-                        如需继续请重新填写入场价与止盈价
+                        {{ manualScatterVoidHint(r.type) }}
                       </p>
                       <div class="field batch-range">
                         <FormLabel

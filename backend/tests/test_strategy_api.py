@@ -1336,3 +1336,46 @@ def test_normalize_manual_scatter_defaults_disabled():
     })
     assert off["manual_scatter"]["close_all_on_tp"] is False
 
+
+# ----------------------------------------------------------------------
+# 手动单生命周期提示：void 不能被合并逻辑丢掉
+# ----------------------------------------------------------------------
+def test_merge_manual_runtime_keeps_void_state():
+    """挂单被撤销（void）必须能进到提示里。
+
+    早期版本的合并条件漏了 void，导致前端「挂单已被撤销」那条提示
+    实际永远不显示。
+    """
+    from app import group_persist
+
+    state: dict[int, str] = {}
+    reason: dict[int, str] = {}
+    group_persist.merge_manual_runtime(
+        {"manual_state": {"2": "void"}, "manual_off_reason": {"2": "removed"}},
+        state, reason,
+    )
+    assert state[2] == "void"
+    assert reason[2] == "removed"
+
+
+def test_merge_manual_runtime_prefers_filled_over_void():
+    """多节点合并：任一节点已成交就整体按已成交算。"""
+    from app import group_persist
+
+    state: dict[int, str] = {}
+    reason: dict[int, str] = {}
+    group_persist.merge_manual_runtime({"manual_state": {"2": "void"}}, state, reason)
+    group_persist.merge_manual_runtime({"manual_state": {"2": "filled"}}, state, reason)
+    assert state[2] == "filled"
+
+
+def test_merge_manual_runtime_prefers_pending_over_void():
+    """pending 比 void 靠后：一个节点还挂着单，另一个已撤销 → 按 pending 算。"""
+    from app import group_persist
+
+    state: dict[int, str] = {}
+    reason: dict[int, str] = {}
+    group_persist.merge_manual_runtime({"manual_state": {"2": "void"}}, state, reason)
+    group_persist.merge_manual_runtime({"manual_state": {"2": "pending"}}, state, reason)
+    assert state[2] == "pending"
+

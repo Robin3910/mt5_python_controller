@@ -628,6 +628,7 @@ STATE_VOID = "void"
 OFF_LADDER_TP = "ladder_tp"      # 阶梯止盈先到
 OFF_REPLACED = "replaced"        # 客户改参，撤旧单重挂
 OFF_CLOSED = "closed"            # 任务收口
+OFF_REMOVED = "removed"          # 配置里删掉了手动单 → 撤掉在途挂单
 
 
 def pending_signature(snap: dict) -> tuple:
@@ -737,6 +738,11 @@ def describe_pending_off(reason: str) -> str:
         return "手动分散仓参数已调整：原挂单已撤销，按新参数重新挂单"
     if reason == OFF_CLOSED:
         return "手动分散仓挂单已撤销：任务收口"
+    if reason == OFF_REMOVED:
+        return (
+            "手动分散仓配置已删除：挂单已撤销，本次不再入场；"
+            "如需继续请重新填写入场价与止盈价"
+        )
     return "手动分散仓挂单已撤销"
 
 

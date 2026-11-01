@@ -36,6 +36,10 @@ logger = logging.getLogger(__name__)
 _TERMINAL = frozenset(group_rules.SUBTASK_TERMINAL)
 # 已停手但仍有持仓：非终态，继续持有节点占位
 _STUCK = frozenset(group_rules.SUBTASK_STUCK)
+# 手动单生命周期的合并优先级：越靠后越「靠后」。
+# filled（已成交，配置锁死）> pending（挂单在盘上，还能改）> void（已被撤销）
+# > none。多节点合并时取最靠后的那个。
+_MANUAL_STATE_RANK = {"none": 0, "void": 1, "pending": 2, "filled": 3}
 # 账户快照对账：连续几轮都看不到该魔术号才收口，避免一轮残缺快照误平
 RECONCILE_EMPTY_CONFIRM = 2
 
@@ -322,6 +326,34 @@ async def running_strategy_subtasks(strategy_id: str) -> list[dict]:
         return []
 
 
+def merge_manual_runtime(
+    runtime: dict, manual_state: dict[int, str], manual_off_reason: dict[int, str],
+) -> None:
+    """把一个节点的运行态里的手动单信息并进汇总（就地修改两个 dict）。
+
+    生命周期按「最靠后」的状态合并：任一节点已成交就整体按已成交算。
+    优先级 filled > pending > void > none。
+
+    早期版本的判断条件漏了 void（`value != "void"` 那一支永远进不去），
+    导致「挂单被撤销」这个状态永远进不了提示，前端那条提示实际是死代码。
+    """
+    if not isinstance(runtime, dict):
+        return
+    for key, value in (runtime.get("manual_state") or {}).items():
+        n = _int_or_none(key)
+        if n is None or not isinstance(value, str):
+            continue
+        prev = manual_state.get(n, "")
+        if _MANUAL_STATE_RANK.get(value, 0) > _MANUAL_STATE_RANK.get(prev, 0):
+            manual_state[n] = value
+    # 撤销原因：同一规则可能多个节点各撤各的，取任一即可
+    for key, value in (runtime.get("manual_off_reason") or {}).items():
+        n = _int_or_none(key)
+        if n is None or not isinstance(value, str) or not value:
+            continue
+        manual_off_reason.setdefault(n, value)
+
+
 async def strategy_runtime_hints(strategy_id: str) -> dict:
     """该策略在跑任务的运行态提示，供前端做保存前校验。
 
@@ -331,6 +363,7 @@ async def strategy_runtime_hints(strategy_id: str) -> dict:
       "max_added_by_rule": {规则类型: 各在跑任务里已开笔数的最大值},
       "manual_fired":      已开过手动分散仓的规则类型,
       "manual_state":      {规则类型: 手动单生命周期}（none/pending/filled/void）,
+      "manual_off_reason": {规则类型: 挂单被撤销的原因},
       "nodes_offline":     在跑但节点不在线的子任务数,
     }
 
@@ -343,6 +376,7 @@ async def strategy_runtime_hints(strategy_id: str) -> dict:
         "max_added_by_rule": {},
         "manual_fired": [],
         "manual_state": {},
+        "manual_off_reason": {},
         "nodes_offline": 0,
     }
     if not sid:
@@ -368,6 +402,7 @@ async def strategy_runtime_hints(strategy_id: str) -> dict:
             max_added: dict[str, int] = {}
             manual_fired: set[int] = set()
             manual_state: dict[int, str] = {}
+            manual_off_reason: dict[int, str] = {}
             offline = 0
             for dispatch, _task in rows:
                 counts = dispatch.add_counts_json
@@ -385,14 +420,9 @@ async def strategy_runtime_hints(strategy_id: str) -> dict:
                         n = _int_or_none(item)
                         if n is not None:
                             manual_fired.add(n)
-                    # 生命周期取「最靠后」的状态：任一节点已成交就整体按已成交算
-                    for key, value in (runtime.get("manual_state") or {}).items():
-                        n = _int_or_none(key)
-                        if n is None or not isinstance(value, str):
-                            continue
-                        prev = manual_state.get(n, "")
-                        if value == "filled" or (prev != "filled" and value != "void"):
-                            manual_state[n] = value
+                    merge_manual_runtime(
+                        runtime, manual_state, manual_off_reason,
+                    )
                 if not dispatch.last_report_at:
                     offline += 1
             return {
@@ -400,6 +430,9 @@ async def strategy_runtime_hints(strategy_id: str) -> dict:
                 "max_added_by_rule": max_added,
                 "manual_fired": sorted(manual_fired),
                 "manual_state": {str(k): v for k, v in sorted(manual_state.items())},
+                "manual_off_reason": {
+                    str(k): v for k, v in sorted(manual_off_reason.items())
+                },
                 "nodes_offline": offline,
             }
     except Exception as e:  # noqa: BLE001

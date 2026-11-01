@@ -827,9 +827,12 @@ export interface StrategyOut {
  * - none：未配置或已被消费摘除
  * - pending：挂单在盘上，**允许客户改参数**（节点撤旧单重算重挂）
  * - filled：挂单已成交成持仓，**配置彻底锁定**，之后一律不许改
- * - void：挂单被撤销（阶梯止盈先到等），本任务内不再自动挂
+ * - void：挂单被撤销（配置已删除 / 阶梯止盈先到等），本任务内不再自动挂
  */
 export type ManualScatterState = 'none' | 'pending' | 'filled' | 'void'
+
+/** 手动分散仓挂单被撤销的原因 */
+export type ManualScatterOffReason = 'ladder_tp' | 'replaced' | 'closed' | 'removed'
 
 export interface StrategyRuntimeHints {
   running_task_count: number
@@ -838,6 +841,8 @@ export interface StrategyRuntimeHints {
   manual_fired: number[]
   /** 键是规则类型字符串，值是手动单生命周期 */
   manual_state?: Record<string, ManualScatterState>
+  /** 键是规则类型字符串，值是挂单被撤销的原因 */
+  manual_off_reason?: Record<string, ManualScatterOffReason>
   nodes_offline: number
 }
 

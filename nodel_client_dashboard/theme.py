@@ -214,7 +214,9 @@ def badge(master, text: str, color: str) -> ctk.CTkLabel:
 def info_cell(master, label: str, value: str, ok: bool) -> ctk.CTkFrame:
     """卡片内的信息格（连接MT5 / 是否鉴权 / 算法交易）。
 
-    返回的 frame 上挂 `value_label`，供差分更新与测试断言使用。
+    结构对齐参考稿：上排是「✓ 标签」，下排是取值。
+
+    返回的 frame 上挂 `value_label` / `mark_label`，供差分更新与测试断言使用。
     """
     color = GREEN if ok else MUTE
     cell = ctk.CTkFrame(
@@ -224,18 +226,23 @@ def info_cell(master, label: str, value: str, ok: bool) -> ctk.CTkFrame:
         border_color=_mix(TEXT, 0.09),
         corner_radius=8,
     )
-    mark = "✓" if ok else "✗"
-    ctk.CTkLabel(
-        cell, text=mark, text_color=color, font=font(12, "bold"), height=16
-    ).pack(pady=(6, 0))
-    value_label = ctk.CTkLabel(
-        cell, text=value, text_color=color, font=font(11, "bold"), height=16
+    head = ctk.CTkFrame(cell, fg_color="transparent")
+    head.pack(fill="x", padx=8, pady=(6, 0))
+    mark_label = ctk.CTkLabel(
+        head, text="✓" if ok else "✗", text_color=color, font=font(12, "bold"),
+        width=14, height=16,
     )
-    value_label.pack(pady=(0, 1))
+    mark_label.pack(side="left", padx=(0, 3))
     ctk.CTkLabel(
-        cell, text=label, text_color=MUTE, font=font(10), height=14
-    ).pack(pady=(0, 5))
+        head, text=label, text_color=MUTE, font=font(10), height=16, anchor="w"
+    ).pack(side="left", fill="x", expand=True)
+    value_label = ctk.CTkLabel(
+        cell, text=value, text_color=color, font=font(11, "bold"), height=16, anchor="w"
+    )
+    value_label.pack(fill="x", padx=8, pady=(0, 6))
     cell.value_label = value_label
+    cell.mark_label = mark_label
+    cell.label_text = label
     return cell
 
 

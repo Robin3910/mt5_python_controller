@@ -321,6 +321,9 @@ class StrategyRunner:
         # FILLED 之后配置彻底锁定（客户说了「已成交之后不能再改」）；
         # PENDING 期间允许客户改参数，节点撤旧单重算重挂。
         self._manual_state: dict[int, str] = {}
+        # 挂单被撤销的原因：规则类型 -> 撤销原因码（ladder_tp / replaced / closed / removed）。
+        # 前端据此说人话（「配置已删除」和「阶梯止盈先到」不是一回事）。
+        self._manual_off_reason: dict[int, str] = {}
         # 热推后要同步在途的手动挂单（撤旧单重算重挂）
         self._manual_resync = False
         # 分批未加完暂不开仓的提示每条规则只发一次
@@ -346,6 +349,16 @@ class StrategyRunner:
             self._manual_state[int(rule_type)] = manual_scatter.STATE_PENDING
         for rule_type in self._manual_open:
             self._manual_state[int(rule_type)] = manual_scatter.STATE_FILLED
+        # 重连后还原挂单被撤销的原因（前端据此显示对应文案）
+        raw_off = self._resume_runtime.get("manual_off_reason")
+        if isinstance(raw_off, dict):
+            for key, value in raw_off.items():
+                try:
+                    rule_type = int(key)
+                except (TypeError, ValueError):
+                    continue
+                if rule_type in (RULE_TYPE_COUNTER, RULE_TYPE_TREND):
+                    self._manual_off_reason[rule_type] = str(value or "")
         # 已消失、离场原因待确认的手动仓：成交历史可能晚一拍才写进来
         self._manual_gone: dict[int, dict] = {}
         # 手动仓在场时，它的止盈价是本魔术号所有仓位的止盈权威：
@@ -496,6 +509,7 @@ class StrategyRunner:
             added_by_rule=dict(self.add_counts),
             closed_rules=self._closed_rule_types(),
             manual_locked=self._manual_locked_rule_types(),
+            manual_pending=self._manual_pending_rule_types(),
         )
         result = strategy_reconcile.summarize(fields)
 
@@ -741,6 +755,14 @@ class StrategyRunner:
             # 规则热推只改逆势限价，不重放顺势，避免同一口价连加。
             resync = self._counter_resync
             self._counter_resync = False
+            # 热推后要同步在途的手动挂单（撤旧单 / 撤掉已删掉的手动单）。
+            # 这一步不能等下一轮真实 tick：行情静止时（周末 / 挂单等成交）根本
+            # 没有新 tick，客户保存后撤单会一直排队到下一次开市。
+            if self._manual_resync and self._last_market is not None:
+                self._manual_resync = False
+                await self._sync_manual_pending_on_update(
+                    list(self._last_market.positions),
+                )
             if self._replay_market:
                 self._replay_market = False
                 event = self._last_market
@@ -2501,14 +2523,35 @@ class StrategyRunner:
             if self._manual_is_locked(rt)
         }
 
+    def _manual_pending_rule_types(self) -> set[int]:
+        """挂单还在盘上的规则类型（客户这时改参数，节点会撤旧单重算重挂）。
+
+        客户在这期间把手动单删掉 → 节点撤掉盘上那张单。这条信息要带回执，
+        让客户知道保存后会发生什么。
+        """
+        return {
+            rt for rt in (RULE_TYPE_COUNTER, RULE_TYPE_TREND)
+            if self._manual_lifecycle(rt) == manual_scatter.STATE_PENDING
+        }
+
     async def _void_manual_pending(
         self, reason: str, *, positions: Optional[list[dict]] = None,
         rule_types: Optional[list[int]] = None,
+        discard_fired: bool = False,
+        retry_on_failure: bool = False,
     ) -> list[int]:
         """撤掉在途的手动挂单并标记作废。
 
         阶梯止盈先到达时必须这么做：手动挂单不在 positions 里，市价平仓平不掉它，
         撤单晚了它就会在不该成交的时候成交。
+
+        `discard_fired=True` 时同时撤销「该规则加仓已收口」的标记
+        （`_manual_fired`）。用于「配置里删掉了手动单」这个场景：手动单不存在了，
+        加仓收口的前提就没了，规则重新变成可加仓，客户重新填参数就能再挂一张。
+
+        `retry_on_failure=True` 时，撤单没被券商确认就不算撤成功：保留 PENDING
+        状态，下一拍继续撤。静默当成功会留下「节点以为撤了、券商那边还挂着」
+        的孤儿单——那张单随时可能在一个客户已经不认可的配置上成交。
 
         返回被撤销的规则类型列表。
         """
@@ -2535,9 +2578,22 @@ class StrategyRunner:
                         "task %s manual scatter cancel failed #%s: %s",
                         self.task_id, ticket, e,
                     )
+            if retry_on_failure and ticket > 0 and not cancelled:
+                # 撤单没确认：先不改状态，下一拍再撤（见上面 docstring）
+                logger.warning(
+                    "task %s manual scatter order #%s cancel not confirmed: "
+                    "keep pending and retry next tick",
+                    self.task_id, ticket,
+                )
+                continue
             self._manual_pending.pop(rule_type, None)
             # 作废后本任务不再自动挂这张单（要客户重新设置）
             self._manual_state[rule_type] = manual_scatter.STATE_VOID
+            # 记下撤销原因：前端据此显示对应文案（配置已删除 ≠ 阶梯止盈先到）
+            self._manual_off_reason[rule_type] = str(reason or "")
+            if discard_fired:
+                # 配置里已经没有手动单了：加仓收口的前提消失，规则重新可加仓
+                self._manual_fired.discard(rule_type)
             voided.append(rule_type)
             text = manual_scatter.describe_pending_off(reason)
             logger.info("task %s %s (#%s)", self.task_id, text, ticket)
@@ -2601,21 +2657,31 @@ class StrategyRunner:
                 # 这张挂单的手数不动。
                 tiers_changed = False
             if cfg is None:
-                # 手动仓配置已被后端消费掉（挂出即消费），客户没改它：
-                # 只有阶梯止盈金额变了才需要动这张单。
-                if not tiers_changed:
-                    continue
-            elif manual_scatter.pending_matches_cfg(
+                # 配置里已经没有这条规则的手动单了（客户删掉了手动单 / 关掉了
+                # 手动单 / 规则停用 / 入场价=止盈价算出方向）：客户已经不想要
+                # 这张单了，盘上那张就不能再留——留着它随时可能在一个客户已经不
+                # 认可的配置上成交。
+                #
+                # 撤掉并作废；同时撤销「该规则加仓已收口」的标记——手动单不存在
+                # 了，收口的前提就没了，客户重新填参数就能再挂一张。
+                logger.info(
+                    "task %s manual scatter M%s removed from config: cancel pending",
+                    self.task_id, rule_type,
+                )
+                await self._void_manual_pending(
+                    manual_scatter.OFF_REMOVED,
+                    positions=positions, rule_types=[rule_type],
+                    discard_fired=True, retry_on_failure=True,
+                )
+                continue
+            if manual_scatter.pending_matches_cfg(
                 cfg, snap, stops_level=stops_level, point=points,
             ) and not tiers_changed:
                 # 手动仓自己的参数没变，阶梯止盈金额也没变 → 不动它
                 # （撤挂会触券商限频）
                 continue
-            # 手动仓自己的参数用最新的（热推带来的）；拿不到就用挂单快照里的旧值
-            # ——挂出后后端会消费掉 manual_scatter，self._rules 里可能已经没这一块了。
-            watch = self._manual_watch(rule_type) or self._manual_rebuild_watch(
-                rule_type, snap,
-            )
+            # 手动仓的参数用最新的（热推带来的）
+            watch = self._manual_watch(rule_type)
             if watch is None:
                 continue
             if tiers_changed:
@@ -2681,32 +2747,6 @@ class StrategyRunner:
             return False
         src = manual_scatter.normalize(raw)
         return bool(src.get("volume_locked") and src.get("volume", 0.0) > 0)
-
-    def _manual_rebuild_watch(self, rule_type: int, snap: dict) -> Optional[dict]:
-        """用挂单快照里的配置 + 当前的分档配置，造一个可重挂的 watch。
-
-        为什么要重建：手动仓配置挂出后会被后端消费掉（单次消费），
-        `self._rules` 里可能已经没有 `manual_scatter` 那一块了，
-        `_manual_watch` 会返回 None。但重挂需要入场价 / 止盈价 / 止损价——
-        它们在挂单快照里存着（那是挂出时用的配置）。
-        """
-        cfg = snap.get("cfg") if isinstance(snap.get("cfg"), dict) else {}
-        if not cfg:
-            return None
-        direction = manual_scatter.direction_from_prices(
-            _as_float(cfg.get("entry_price")), _as_float(cfg.get("take_profit")),
-        )
-        if direction is None:
-            return None
-        return {
-            "rule_type": int(rule_type),
-            "cfg": dict(cfg),
-            "direction": direction,
-            "lot_pl_tiers": self._manual_tiers(rule_type) or {},
-            "comment": manual_scatter.comment_for(rule_type),
-            "batch_enabled": False,
-            "rule": {},
-        }
 
     def _manual_market_price(self, watch: dict) -> float:
         """手动单该按哪一侧现价算（成交侧：BUY=ask，SELL=bid）。"""
@@ -2792,6 +2832,11 @@ class StrategyRunner:
         if self._manual_state:
             payload["manual_state"] = {
                 str(int(k)): str(v) for k, v in sorted(self._manual_state.items())
+            }
+        # 挂单被撤销的原因：前端据此显示对应文案（配置已删除 ≠ 阶梯止盈先到）
+        if self._manual_off_reason:
+            payload["manual_off_reason"] = {
+                str(int(k)): str(v) for k, v in sorted(self._manual_off_reason.items())
             }
         if self._manual_open:
             payload["manual_open"] = manual_scatter.runtime_open_payload(self._manual_open)
@@ -2913,9 +2958,10 @@ class StrategyRunner:
         for rule_type in list(self._manual_pending):
             snap = held_manual.get(rule_type)
             if snap is None:
-                # 还没成交：挂单若确定已不在盘上，说明被撤了或被拒了，
-                # 这条规则的手动仓就此作废，不要再重挂
+                # 还没成交
                 if resting is not None and rule_type not in resting_by_rule:
+                    # 挂单确定已不在盘上：被撤了或被拒了，
+                    # 这条规则的手动仓就此作废，不要再重挂
                     logger.info(
                         "task %s manual scatter M%s pending order gone without fill",
                         self.task_id, rule_type,
@@ -2923,6 +2969,22 @@ class StrategyRunner:
                     self._manual_pending.pop(rule_type, None)
                     self._manual_fired.discard(rule_type)
                     self._manual_state.pop(rule_type, None)
+                    continue
+                # 挂单还在盘上，但配置里已经没有这条规则的手动单了 → 撤掉。
+                #
+                # 兜底场景：热推包没送到（节点离线 / WS 断了），但库里的运行快照
+                # 已经被改写；节点重连 resume 时拿到的快照没有手动单，而 runtime
+                # 里还记着这张挂单——不撤就留下一张永远没人管的孤儿单。
+                if self._manual_watch_cfg(rule_type) is None:
+                    logger.info(
+                        "task %s manual scatter M%s removed from config: cancel pending",
+                        self.task_id, rule_type,
+                    )
+                    await self._void_manual_pending(
+                        manual_scatter.OFF_REMOVED,
+                        positions=positions, rule_types=[rule_type],
+                        discard_fired=True, retry_on_failure=True,
+                    )
                 continue
             # 成交了
             self._manual_pending.pop(rule_type, None)

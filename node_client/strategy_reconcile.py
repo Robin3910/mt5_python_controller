@@ -66,6 +66,18 @@ def _manual_cfg(rule: dict) -> dict:
     return cfg if isinstance(cfg, dict) else {}
 
 
+def _manual_enabled(rule: dict) -> bool:
+    """这条规则的手动分散仓当前是否「有且启用」。
+
+    「没有 manual_scatter 整块」与「有但 enabled=false」对节点来说是同一件事：
+    这条规则不再有手动单。所以判断口径统一成「配置里有没有生效的手动单」。
+    """
+    cfg = _manual_cfg(rule)
+    if not cfg:
+        return False
+    return bool(cfg.get("enabled"))
+
+
 def _changed(old: Any, new: Any) -> bool:
     """两个值是否真的不同（浮点用容差，整数/字符串直接比）。"""
     if isinstance(old, (int, float)) and isinstance(new, (int, float)):
@@ -263,6 +275,7 @@ def reconcile_rules(
     *, added_by_rule: Optional[dict] = None,
     closed_rules: Optional[set] = None,
     manual_locked: Optional[set] = None,
+    manual_pending: Optional[set] = None,
 ) -> tuple[list[dict], list[dict]]:
     """逐条规则、逐字段比对。
 
@@ -275,10 +288,14 @@ def reconcile_rules(
     manual_locked ：手动分散仓**已成交**的规则类型（这类配置彻底锁死；
                    挂单在盘上（PENDING）的不锁，客户可以改参数，节点会
                    撤旧单重算重挂）
+    manual_pending：手动分散仓**挂单在盘上**的规则类型。客户在这期间把手动单
+                   删掉时，节点会撤掉盘上那张挂单——这里给出逐字段结论，
+                   让客户知道「保存后那张单会被撤掉」。
     """
     added_by_rule = added_by_rule or {}
     closed_rules = closed_rules or set()
     manual_locked = manual_locked or set()
+    manual_pending = manual_pending or set()
     out: list[dict] = []
 
     old_list = [r for r in (old_rules or []) if isinstance(r, dict)]
@@ -374,6 +391,22 @@ def reconcile_rules(
                 ),
             })
             applied_rule["manual_scatter"] = dict(_manual_cfg(old_rule))
+        # 手动分散仓被删掉 / 关掉，而挂单还在盘上：节点会撤掉那张单。
+        # 这里必须给出结论——否则回执说「全部生效」，客户完全不知道
+        # 盘上那张挂单会被撤（动作是不可逆的，得让人看见）。
+        elif (
+            rule_type in manual_pending
+            and _manual_enabled(old_rule)
+            and not _manual_enabled(new_rule)
+        ):
+            out.append({
+                "field": f"{path}.manual_scatter",
+                "status": "applied",
+                "message": (
+                    f"{label}手动分散仓配置已删除：节点会撤掉盘上的挂单，"
+                    "本次不再入场；如需继续请重新填写入场价与止盈价"
+                ),
+            })
 
         # 信号级盈亏控制：次数型监控在热推时沿用运行态已消耗的次数，
         # 这里只把「次数上限被调大」这件事说清楚，避免用户以为次数被复活了。
@@ -410,6 +443,7 @@ def reconcile_snapshot(
     *, added_by_rule: Optional[dict] = None,
     closed_rules: Optional[set] = None,
     manual_locked: Optional[set] = None,
+    manual_pending: Optional[set] = None,
 ) -> tuple[list[dict], dict]:
     """整体快照的逐字段结论。
 
@@ -422,6 +456,7 @@ def reconcile_snapshot(
         added_by_rule=added_by_rule,
         closed_rules=closed_rules,
         manual_locked=manual_locked,
+        manual_pending=manual_pending,
     )
 
     effective = dict(new)

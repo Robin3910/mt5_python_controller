@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>路由 /ai-trade功能分支脑图</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #161920; --panel-2: #1c2028;
+    --text: #e6e8ee; --text-2: #9aa3b2; --text-3: #6b7383;
+    --stroke: #262b35; --stroke-2: #323846;
+    --accent: #3b82f6; --accent-soft: rgba(59,130,246,0.14);
+    --ok: #22c55e; --warn: #f59e0b;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f7f9; --panel: #ffffff; --panel-2: #f0f2f5; --text: #16181d;
+      --text-2: #5a6272; --text-3: #8a92a2; --stroke: #e2e5ea; --stroke-2: #cfd4dd;
+      --accent: #2563eb; --accent-soft: rgba(37,99,235,0.10);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    font-size: 14px; line-height: 1.6;
+  }
+  .wrap { max-width: 1400px; margin: 0 auto; padding: 28px 20px 60px; }
+  h1 { font-size: 24px; margin: 0 0 6px; font-weight: 600; }
+  h2 { font-size: 17px; margin: 32px 0 10px; font-weight: 600; }
+  .sub { color: var(--text-2); font-size: 13px; margin: 0 0 18px; max-width: 900px; }
+  .bar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 18px; }
+  .stat { background: var(--panel); border: 1px solid var(--stroke); border-radius: 8px; padding: 8px 14px; }
+  .stat b { display: block; font-size: 18px; font-weight: 600; }
+  .stat span { font-size: 11px; color: var(--text-3); }
+  .tabs { display: flex; gap: 6px; margin-left: auto; }
+  .tab { background: var(--panel); border: 1px solid var(--stroke); color: var(--text-2);
+         border-radius: 999px; padding: 5px 14px; font-size: 12px; cursor: pointer; }
+  .tab.on { background: var(--accent); border-color: transparent; color: #fff; }
+  .note { background: var(--panel); border: 1px solid var(--stroke); border-left: 3px solid var(--accent);
+          border-radius: 8px; padding: 12px 14px; font-size: 13px; color: var(--text-2); margin-bottom: 18px; }
+  .note code { color: var(--text); }
+  .note strong { color: var(--text); }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+  .panel { background: var(--panel); border: 1px solid var(--stroke); border-radius: 10px; overflow: hidden; }
+  .mapwrap { overflow: auto; max-height: 72vh; position: relative; }
+  .node { position: absolute; display: flex; align-items: center; gap: 6px; height: 30px;
+          padding: 0 8px; border-radius: 6px; font-size: 12px; white-space: nowrap;
+          overflow: hidden; cursor: pointer; border: 1px solid var(--stroke); background: var(--panel-2); }
+  .node:hover { border-color: var(--accent); }
+  .node.l1 { background: var(--panel-2); border-left: 2px solid var(--accent); font-weight: 600; }
+  .node.case { background: var(--panel); color: var(--text); }
+  .node.sel { outline: 2px solid var(--accent); }
+  .toggle { width: 14px; height: 14px; border: 1px solid var(--stroke-2); border-radius: 3px;
+            font-size: 10px; display: inline-flex; align-items: center; justify-content: center;
+            color: var(--text-2); flex-shrink: 0; }
+  .toggle:hover { border-color: var(--accent); color: var(--accent); }
+  .detail { margin-top: 14px; background: var(--panel); border: 1px solid var(--stroke);
+            border-radius: 10px; padding: 14px 16px; }
+  .detail h3 { margin: 0 0 10px; font-size: 15px; font-weight: 600; }
+  .detail dl { margin: 0; display: grid; grid-template-columns: 82px 1fr; gap: 8px 14px; font-size: 13px; }
+  .detail dt { color: var(--text-3); font-size: 12px; }
+  .detail dd { margin: 0; color: var(--text-2); }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--stroke); vertical-align: top; }
+  th { color: var(--text-3); font-weight: 600; font-size: 11.5px; position: sticky; top: 0; background: var(--panel-2); }
+  td.n { font-family: ui-monospace, Menlo, Consolas, monospace; color: var(--text-3); white-space: nowrap; }
+  .chk { border: 1px solid var(--stroke-2); border-radius: 999px; padding: 2px 10px; font-size: 11px;
+         cursor: pointer; color: var(--text-2); background: transparent; white-space: nowrap; }
+  .chk.on { background: var(--ok); border-color: transparent; color: #fff; }
+  tr.done td { color: var(--text-3); }
+  pre { background: var(--panel); border: 1px solid var(--stroke); border-radius: 10px; padding: 16px;
+        overflow: auto; font-size: 12.5px; line-height: 1.7; font-family: ui-monospace, Menlo, Consolas, monospace; }
+  .src { font-size: 12.5px; color: var(--text-2); }
+  .src li { margin: 3px 0; }
+  .hide { display: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>AI 交易 /ai-trade功能分支脑图</h1>
+  <p class="sub">路由 /ai-trade，菜单码 ai_trade，权限 MENU_AI_TRADE（assignable，人人有）；左栏 AI 机器人广场 + 右栏「机器人详情 / 我的 AI 跟单」二态切换</p>
+
+  <div class="bar">
+    <div class="stat"><b>66</b><span>可测分支</span></div>
+    <div class="stat"><b>10</b><span>一级模块</span></div>
+    <div class="tabs">
+      <button class="tab on" data-v="map">脑图</button>
+      <button class="tab" data-v="list">测试清单</button>
+    </div>
+  </div>
+
+  <div class="note">路由 /ai-trade，菜单码 ai_trade，权限 MENU_AI_TRADE（assignable，人人有）；左栏 AI 机器人广场 + 右栏「机器人详情 / 我的 AI 跟单」二态切换</div>
+
+  <div id="v-map">
+    <div class="panel"><div class="mapwrap" id="map"></div></div>
+    <div class="detail" id="detail"></div>
+  </div>
+
+  <div id="v-list" class="hide">
+    <div class="bar">
+      <div class="stat"><b id="prog">0 / 66</b><span>测试进度</span></div>
+      <button class="tab" id="clear">清空标记</button>
+    </div>
+    <div class="panel" style="overflow:auto; max-height:72vh">
+      <table>
+        <thead><tr>
+          <th>编号</th><th>分支</th><th>界面表现</th><th>后端行为</th><th>测试要点</th><th>状态</th>
+        </tr></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <h2>脑图结构</h2>
+  <pre id="tree"></pre>
+</div>
+
+<script>
+const TREE = {"id": "root", "label": "AI 交易 /ai-trade", "kind": "group", "ui": "路由 /ai-trade，菜单码 ai_trade，权限 MENU_AI_TRADE（assignable，人人有）；左栏 AI 机器人广场 + 右栏「机器人详情 / 我的 AI 跟单」二态切换", "test": "身份矩阵：无任何能力的普通用户（跟单员）/ 有 ai_strategy + follow_leader 的机器人主人 / 管理员；以及机器人主人自跟单", "children": [{"id": "1", "label": "① 页面骨架与加载", "kind": "group", "children": [{"id": "1.1", "label": "路由与菜单", "kind": "case", "ui": "顶栏「AI 交易」入口，路径 /ai-trade", "be": "MENU_AI_TRADE = 'ai_trade'，MenuDef(assignable=True) → 内置 user 角色默认可见", "test": "普通用户默认能看到「AI 交易」Tab；无 ai_trade 菜单权限时路由被守卫重定向"}, {"id": "1.2", "label": "两栏布局与响应式", "kind": "case", "ui": "左 minmax(280px,380px) 广场 + 右 1fr 详情/我的跟单；≤960px 断点塌成单列", "be": "—", "test": "窄屏下两个面板应上下排列而非挤压"}, {"id": "1.3", "label": "初始并发加载", "kind": "case", "ui": "onMounted 同时 loadRobots() 与 loadMine()，互不阻塞", "be": "GET /api/ai-follow/robots、GET /api/ai-follow/me", "test": "广场接口慢时「我的 AI 跟单」应先出现，不被拖住"}, {"id": "1.4", "label": "45s 轮询替代 WS", "kind": "case", "ui": "页面可见时每 45s 重拉「我的 AI 跟单」；页面不可见时不轮询", "be": "跟单员收不到 WS 事件（event_visible 只认 owner）", "test": "切到别的标签页时应停止轮询"}, {"id": "1.5", "label": "加载中 / 失败提示", "kind": "case", "ui": "加载中显示「加载中…」；失败 ElMessage.error(后端 detail || 兜底文案)", "be": "errText() 统一取 response.data.detail", "test": "接口 500 时应弹出「加载机器人广场失败」而不是白屏"}, {"id": "1.6", "label": "广场内搜索", "kind": "case", "ui": "占位「搜索用户名 / 显示名 / 主节点名 / MT5 号」，回车触发查询", "be": "GET /api/ai-follow/robots?q=，对 username/display_name/主节点名/mt5_login 做包含匹配", "test": "输入主节点 MT5 号应能命中"}]}, {"id": "2", "label": "② AI 机器人广场（左栏）", "kind": "group", "children": [{"id": "2.1", "label": "准入五条件", "kind": "case", "ui": "只列出真正能对外接单的机器人主人", "be": "ai_strategy **且** follow_leader + is_active + 有主节点 + ≥1 个已开放 AI 跟单的 tpl_1 分组", "test": "只持一个能力的主人不应出现在广场"}, {"id": "2.2", "label": "未开放开关的分组不进广场", "kind": "case", "ui": "分组 accept_ai_follow=false 时，主人不出现在列表", "be": "_ai_groups_of(..., only_open=True) 过滤 accept_ai_follow", "test": "关掉开关后刷新列表该主人应消失"}, {"id": "2.3", "label": "卡片内容", "kind": "case", "ui": "显示名 / @用户名 + 主节点行 + 风险上限行 + AI分组数 / 被跟节点数 / 已跟标记", "be": "primary_node、ai_group_count、follower_node_count、my_follow_group_count、my_follow_node_count", "test": "跟过一次后卡片应出现「已跟 N 组 / N 节点」绿标"}, {"id": "2.4", "label": "风险上限随卡片展示", "kind": "case", "ui": "卡片第一眼显示「批次 N · 手数 X」，取各分组里的最大值", "be": "max_allow_num / total_lot_limit 取各分组 max", "test": "跟单员不控手数，必须先看到风险量级再决定跟谁"}, {"id": "2.5", "label": "排序：已跟的排前面", "kind": "case", "ui": "我已跟过的机器人优先，其余按 username 排", "be": "sort(key=(my_follow_group_count == 0, username))", "test": "已跟过的机器人应出现在列表靠前位置"}, {"id": "2.6", "label": "空态", "kind": "case", "ui": "「暂无机器人」", "be": "—", "test": "全场无机器人时应显示该文案而非空白"}, {"id": "2.7", "label": "点击打开详情", "kind": "case", "ui": "点击卡片 → detailLoading → 拉详情；失败时 detail 置 null 并提示「加载机器人详情失败」", "be": "GET /api/ai-follow/robots/{leader_user_id}", "test": "点不存在的机器人应提示 404 文案并回到列表"}]}, {"id": "3", "label": "③ 机器人详情（右栏）", "kind": "group", "children": [{"id": "3.1", "label": "风险上限条", "kind": "case", "ui": "详情页顶部独立一条：批次上限 / 总手数上限", "be": "detail.robot.max_allow_num / total_lot_limit", "test": "与广场卡片上的数值应一致"}, {"id": "3.2", "label": "可跟 AI 分组（多选）", "kind": "case", "ui": "列出可跟分组：名称 + 品种 · 策略名 · 单槽执行 · 批次/手数 · 加仓倍数", "be": "detail.groups 中 selectable=true 的分组；selectedGroupIds 参与提交", "test": "勾选后才进 group_ids，不勾不提交"}, {"id": "3.3", "label": "不可选分组整体不渲染", "kind": "case", "ui": "分组禁用 / 策略已停用的分组在界面上**完全看不到**（既不可勾选，也没有原因文案）", "be": "前端 selectableGroups = groups.filter(g => g.selectable)；后端仍返回 selectable=false + unselectable_reason", "test": "停用策略后该分组应从列表消失；若期望看到原因，需前端补渲染不可选区"}, {"id": "3.4", "label": "单槽执行提示", "kind": "case", "ui": "分组行固定显示「单槽执行」；接口固定 signal_concurrent_enabled=false", "be": "AI 智能加仓策略不支持信号并发（supports_signal_concurrent 只放行 tpl_2/tpl_3）", "test": "同一节点同时只跑一单"}, {"id": "3.5", "label": "我的节点（可多选）", "kind": "case", "ui": "复选框：节点名 + MT5 号 + 在线/离线；主节点已被剔除", "be": "后端 _viewable_follow_nodes（自己的 + 启用 + 非主节点）", "test": "主节点不应出现在可跟节点列表里"}, {"id": "3.6", "label": "已跟过的节点标记", "kind": "case", "ui": "该机器人下已跟的节点显示琥珀色「已跟过」标签", "be": "alreadyFollowingNodeIds 由 /api/ai-follow/me 聚合", "test": "再次提交时会走「部分节点已跟」二次确认"}, {"id": "3.7", "label": "提交条 + 三条风险提示", "kind": "case", "ui": "【确认跟单】按钮 + 警示：手数不缩放 / 策略实时同步 / 移出不自动平仓", "be": "POST /api/ai-follow/join", "test": "三条提示必须同时可见，缺一条即为回归"}]}, {"id": "4", "label": "④ 加入 AI 跟单（join）", "kind": "group", "children": [{"id": "4.1", "label": "校验顺序固定", "kind": "case", "ui": "越权与不存在一律 4xx，不透露对方名下有什么分组", "be": "主人有效性 → 主节点存在 → 节点归属/主节点 → 分组可跟单性", "test": "请求不存在的 leader_user_id 应 404"}, {"id": "4.2", "label": "节点拒绝原因", "kind": "case", "ui": "skipped 里逐条给原因：主节点不能用于跟单 / 节点已停用 / 节点不属于你 / 已在此分组跟单", "be": "follow_rules.node_join_reject_reason", "test": "把主节点塞进 node_ids 应被拒且原因可读"}, {"id": "4.3", "label": "分组静默跳过", "kind": "case", "ui": "不可跟的分组不进 joined", "be": "followable.get(gid) 命中不到 → continue（市场外或 accept_ai_follow=false）", "test": "混入 tpl_3 分组 ID 时应 400 且不写入任何关系"}, {"id": "4.4", "label": "幂等：已跟过的不重复写", "kind": "case", "ui": "已存在的跟单关系计入 already_node_ids", "be": "add_following 唯一键 (group_id, node_id)，已存在返回 False", "test": "同一节点重复提交两次，关系表应只有一行"}, {"id": "4.5", "label": "部分节点已跟 → 二次确认", "kind": "case", "ui": "「所选节点中包含已跟单该机器人的节点，会跳过重复项。是否继续？」", "be": "前端 alreadyFollowingNodeIds 交集检测", "test": "选【继续】应照常提交并跳过重复项"}, {"id": "4.6", "label": "确认跟单二次确认", "kind": "case", "ui": "弹窗写明三条风险 + 【确认跟单】/【取消】", "be": "ElMessageBox.confirm，customClass ai-join-confirm", "test": "取消不应产生任何写入"}, {"id": "4.7", "label": "成功提示与刷新", "kind": "case", "ui": "「已加入 N 个分组」；随后刷新广场 + 我的跟单 + 当前详情", "be": "res.joined.length；refreshAll() + 条件重拉 detail", "test": "提交后三处状态都应刷新"}, {"id": "4.8", "label": "操作审计", "kind": "case", "ui": "每次跟单写一条审计", "be": "persist.audit(action='join_ai_follow', category='ai_follow')", "test": "【操作审计】页按 ai_follow 分类能筛出本次跟单"}]}, {"id": "5", "label": "⑤ 我的 AI 跟单", "kind": "group", "children": [{"id": "5.1", "label": "按机器人聚合", "kind": "case", "ui": "后端返回 following[]（每个机器人一块）+ summary", "be": "GET /api/ai-follow/me", "test": "跟了 2 个机器人应显示 2 个块"}, {"id": "5.2", "label": "前端按 node_id 去重", "kind": "case", "ui": "同一机器人名下多个分组里的同一节点只显示一行", "be": "myFollowing computed 按 node_id 建 Map", "test": "同一节点跟了两个分组时不应出现两行"}, {"id": "5.3", "label": "聚合口径", "kind": "case", "ui": "活跃任务 = 各分组之和；加入时间取最早；手数上限取最大", "be": "active_task_count 累加、joined_at 取 min、batch_limit 取 max", "test": "重复跟同一节点应保留第一次的加入时间"}, {"id": "5.4", "label": "不可跟标灰（当前只有粗粒度标签）", "kind": "case", "ui": "机器人被撤能力 / 换主节点 / 分组禁用 / 关闭开关时，头部标琥珀色「已下架」；具体原因文案**未渲染**，且此时移出按钮变成「等待清理」而无法自行清理", "be": "后端按 marketable_reason + AI 特有「该机器人已关闭 AI 跟单」给出 unmarketable_reason；前端只读 marketable 布尔值", "test": "主人被撤能力后应能自行移出 —— 当前 UI 挡掉了移出入口，与后端「清理不需要能力」的语义不一致"}, {"id": "5.5", "label": "节点行信息", "kind": "case", "ui": "分组名 / 节点名 + MT5 / 活跃任务 / 手数上限 + 【移出】", "be": "batch_limit 取自策略 max_allow_num", "test": "行内应能看到还剩多少加仓空间（风险敞口）"}, {"id": "5.6", "label": "空态", "kind": "case", "ui": "「暂无 AI 跟单」", "be": "—", "test": "没跟过时应显示该文案而非空白"}]}, {"id": "6", "label": "⑥ 移出 AI 跟单（leave）", "kind": "group", "children": [{"id": "6.1", "label": "移出二次确认", "kind": "case", "ui": "「移出后关系解除，不再下发新信号。已有任务不会自动平仓」+【移出（不停止在跑任务）】/【取消】", "be": "ElMessageBox.confirm，customClass ai-leave-confirm", "test": "取消不应解除关系"}, {"id": "6.2", "label": "在跑任务不停止", "kind": "case", "ui": "移出只解绑关系，不下发平仓指令", "be": "close_tasks 默认 false；_stop_following_subtasks 仅在 close_tasks=true 时调用", "test": "移出后机器人再触发一次信号，该节点不应收到"}, {"id": "6.3", "label": "不要求主人仍有能力", "kind": "case", "ui": "主人被撤能力后，跟单员仍能自行移出", "be": "leave 不做 can_host_ai_robot 校验", "test": "对方被撤能力后仍应能点移出并成功"}, {"id": "6.4", "label": "closing / forced / warning 提示", "kind": "case", "ui": "「已移出 N 个节点」+「N 个任务正在平仓」+「N 个离线节点已排队补发平仓」", "be": "res.closing / res.forced / res.warning", "test": "离线节点移出应出现补发平仓提示"}, {"id": "6.5", "label": "移出后刷新", "kind": "case", "ui": "刷新广场 + 我的跟单；若正看该机器人详情再重拉一次", "be": "Promise.all([loadRobots(), loadMine()]) + 条件重拉 detail", "test": "移出后详情页的「已跟过」标记应消失"}, {"id": "6.6", "label": "移出后不再接新信号", "kind": "case", "ui": "关系解除后后续分发不再覆盖该节点", "be": "分组缓存 followers 移除 → _effective_with_follows 不再纳入", "test": "同上：移出后该节点不应再产生子任务"}]}, {"id": "7", "label": "⑦ 跟单市场与互斥", "kind": "group", "children": [{"id": "7.1", "label": "两个市场互斥", "kind": "case", "ui": "【带单】= tpl_2 趋势 + tpl_3 网格；【AI 交易】= tpl_1 AI 智能加仓", "be": "FOLLOW_MARKET_TEMPLATE_IDS / AI_MARKET_TEMPLATE_IDS；一个分组只绑一个策略 → 天然互斥", "test": "tpl_1 分组在 /api/follow/join 里写不进"}, {"id": "7.2", "label": "单一判定入口", "kind": "case", "ui": "列表 / 详情 / join 三处共用 followable_groups", "be": "follow_rules.followable_groups(market=..., strategy_templates_map=...)", "test": "改一次白名单，三个入口同时生效"}, {"id": "7.3", "label": "白名单而非黑名单", "kind": "case", "ui": "未来新增模版默认不外露", "be": "template_in_market 命中白名单才算", "test": "新增 tpl_4 若未加白名单应默认不可跟"}, {"id": "7.4", "label": "模版未知不判死", "kind": "case", "ui": "未绑策略 / 策略被删除的分组保持既有可跟单行为", "be": "用 template_out_of_market：只在「模版已知且不在市场内」时拒绝", "test": "删掉策略后分组仍可跟，但分发侧不会下发"}, {"id": "7.5", "label": "accept_ai_follow 显式开关", "kind": "case", "ui": "分组级开关，默认关；只对绑定 tpl_1 的分组有意义", "be": "node_group.accept_ai_follow + 分组编辑页开关（仅 AI 策略分组显示）", "test": "新建分组的 accept_ai_follow 默认为 false"}, {"id": "7.6", "label": "开关在写入侧校验", "kind": "case", "ui": "未开放的分组直接调 API 也写不进关系", "be": "join 里 followable 只取 accept_ai_follow=true 的分组", "test": "绕过 UI 调 API 也应 400"}, {"id": "7.7", "label": "跨市场继承隔离", "kind": "case", "ui": "adopt-followers 只继承与目标分组**同市场**的来源分组", "be": "groups.py：目标模版定 market → 来源按 template_in_market 收窄", "test": "在 AI 分组触发继承，不应把网格分组的跟单节点拉进来"}]}, {"id": "8", "label": "⑧ 分发侧口径（跟单员如何收到信号）", "kind": "group", "children": [{"id": "8.1", "label": "参与者 = owner 成员 + 跟单成员", "kind": "case", "ui": "跟单员加入的节点同样接收信号，且稳定排在 owner 成员之后", "be": "group_rules.participant_ids（去重保序）", "test": "分组里同时有 owner 成员和跟单成员时两者都应收到"}, {"id": "8.2", "label": "有效节点 = 存在 + 启用 + 在线", "kind": "case", "ui": "跟单节点离线则本轮不接收，poll 模式自动跳下一个", "be": "group_rules.effective_node_ids", "test": "跟单节点离线时分组仍能正常开仓"}, {"id": "8.3", "label": "主人失去能力 → 退回 owner 口径", "kind": "case", "ui": "跟单节点一律不再接收新信号，已在跑的任务不受影响，自然跑完", "be": "group_dispatcher._effective_with_follows → owner_effective_node_ids", "test": "撤销能力后触发信号，跟单节点不应产生子任务"}, {"id": "8.4", "label": "未知模版 → 同样退回 owner 口径", "kind": "case", "ui": "两个市场都不收的分组，跟单节点不接收新信号（保守）", "be": "follow_rules.market_for_template 为空集 → 降级", "test": "把分组策略换成未知模版后跟单节点不应收到信号"}, {"id": "8.5", "label": "单槽：忙闲占位按 (group_id, node_id)", "kind": "case", "ui": "跟单员之间不互相挤占——各跟单员节点各有独立单槽；真正的限制是同一节点同时只跑一单", "be": "store.acquire_group_node_busy(group_id, node_id)", "test": "两个跟单员跟同一分组应能同时各跑一单"}, {"id": "8.6", "label": "策略热推实时同步", "kind": "case", "ui": "机器人主人改参数 → 在跑任务被即时改写，跟单员无法锁定", "be": "rewrite_running_strategy_snapshots + push_strategy_updates（按 strategy_id 覆盖非终态子任务）", "test": "主人改 lot_times 后跟单员在跑任务应立刻生效"}, {"id": "8.7", "label": "手数不缩放", "kind": "case", "ui": "跟单员按机器人设定的完整手数执行（风险文案写在 UI）", "be": "group_rules.resolve_volume(signal.volume)", "test": "机器人设 1 手时跟单节点也应按 1 手执行"}]}, {"id": "9", "label": "⑨ 节点准入与生命周期清理", "kind": "group", "children": [{"id": "9.1", "label": "主节点永不可跟单", "kind": "case", "ui": "主节点同时是机器人载体，保持独立才有「机器人 / 跟单」的方向性", "be": "join 时 node_join_reject_reason 判 is_primary；前端也本地剔除", "test": "主节点塞进 join 请求应被拒"}, {"id": "9.2", "label": "停用节点不可跟", "kind": "case", "ui": "已停用节点给出「节点已停用」", "be": "node_join_reject_reason 判 enabled", "test": "停用某节点后它不应出现在可跟列表"}, {"id": "9.3", "label": "跟单节点升主节点 → 自动移出跟单", "kind": "case", "ui": "升主后不再具备跟单资格，跟单关系自动清掉", "be": "node_service.set_primary → follow_service.remove_node_followings", "test": "把已跟单的节点设为主节点后，我的跟单里应不再有它"}, {"id": "9.4", "label": "节点删除 / 归属转移 → 清跟单关系", "kind": "case", "ui": "不留永远不会被分发的脏关系", "be": "node_service.delete_node、users_api.assign_nodes → remove_node_followings", "test": "把跟单节点转移给别的用户后，我的跟单里应不再有它"}, {"id": "9.5", "label": "用户删除 → 清其全部跟单关系", "kind": "case", "ui": "防止指向已删除用户的脏关系", "be": "users_api.delete_user → follow_service.remove_user_followings", "test": "删除用户后其跟单关系应被级联清掉"}, {"id": "9.6", "label": "分组删除 → 级联删跟单行", "kind": "case", "ui": "分组没了关系也不能留", "be": "group_service.delete_group 事务内级联", "test": "机器人主人删除分组后，跟单员侧不应残留该分组条目"}]}, {"id": "10", "label": "⑩ 权限与审计", "kind": "group", "children": [{"id": "10.1", "label": "方向性约定：跟单人人可做", "kind": "case", "ui": "能进【AI 交易】菜单即可加入跟单，不需要任何额外能力", "be": "五个路由只校验 require_menu(MENU_AI_TRADE)", "test": "无任何能力的普通用户应能正常跟别人的 AI 机器人"}, {"id": "10.2", "label": "方向性约定：机器人主人需两能力", "kind": "case", "ui": "我能否被别人跟，由 ai_strategy 且 follow_leader 共同决定", "be": "permissions.can_host_ai_robot(principal)", "test": "只给一个能力则不出现在广场"}, {"id": "10.3", "label": "能力撤销立即生效", "kind": "case", "ui": "撤销后立刻从广场消失，但存量关系保留、在跑任务跑完", "be": "按用户名现算 principal（带缓存），避免撤销后仍对外可见", "test": "撤销能力后刷新广场该主人应消失"}, {"id": "10.4", "label": "管理员自动放行", "kind": "case", "ui": "管理员天然具备全部能力", "be": "can_capability 内部 is_admin 分支", "test": "管理员应在广场里看到自己"}, {"id": "10.5", "label": "不泄露对方分组", "kind": "case", "ui": "越权与不存在返回同一个原因", "be": "node_join_reject_reason 不返回「对方分组是否存在」类信息", "test": "用他人 node_id 探测不应得到可区分的报错"}, {"id": "10.6", "label": "审计分类 ai_follow", "kind": "case", "ui": "加入 / 移出各写一条审计，分类与带单分开", "be": "persist.audit(category='ai_follow', action='join_ai_follow' / 'leave_ai_follow')", "test": "【操作审计】页按 ai_follow 分类能筛出 AI 跟单操作"}]}]};
+const LEAVES = [{"id": "1.1", "path": "① 页面骨架与加载 › 路由与菜单", "ui": "顶栏「AI 交易」入口，路径 /ai-trade", "be": "MENU_AI_TRADE = 'ai_trade'，MenuDef(assignable=True) → 内置 user 角色默认可见", "test": "普通用户默认能看到「AI 交易」Tab；无 ai_trade 菜单权限时路由被守卫重定向"}, {"id": "1.2", "path": "① 页面骨架与加载 › 两栏布局与响应式", "ui": "左 minmax(280px,380px) 广场 + 右 1fr 详情/我的跟单；≤960px 断点塌成单列", "be": "—", "test": "窄屏下两个面板应上下排列而非挤压"}, {"id": "1.3", "path": "① 页面骨架与加载 › 初始并发加载", "ui": "onMounted 同时 loadRobots() 与 loadMine()，互不阻塞", "be": "GET /api/ai-follow/robots、GET /api/ai-follow/me", "test": "广场接口慢时「我的 AI 跟单」应先出现，不被拖住"}, {"id": "1.4", "path": "① 页面骨架与加载 › 45s 轮询替代 WS", "ui": "页面可见时每 45s 重拉「我的 AI 跟单」；页面不可见时不轮询", "be": "跟单员收不到 WS 事件（event_visible 只认 owner）", "test": "切到别的标签页时应停止轮询"}, {"id": "1.5", "path": "① 页面骨架与加载 › 加载中 / 失败提示", "ui": "加载中显示「加载中…」；失败 ElMessage.error(后端 detail || 兜底文案)", "be": "errText() 统一取 response.data.detail", "test": "接口 500 时应弹出「加载机器人广场失败」而不是白屏"}, {"id": "1.6", "path": "① 页面骨架与加载 › 广场内搜索", "ui": "占位「搜索用户名 / 显示名 / 主节点名 / MT5 号」，回车触发查询", "be": "GET /api/ai-follow/robots?q=，对 username/display_name/主节点名/mt5_login 做包含匹配", "test": "输入主节点 MT5 号应能命中"}, {"id": "2.1", "path": "② AI 机器人广场（左栏） › 准入五条件", "ui": "只列出真正能对外接单的机器人主人", "be": "ai_strategy **且** follow_leader + is_active + 有主节点 + ≥1 个已开放 AI 跟单的 tpl_1 分组", "test": "只持一个能力的主人不应出现在广场"}, {"id": "2.2", "path": "② AI 机器人广场（左栏） › 未开放开关的分组不进广场", "ui": "分组 accept_ai_follow=false 时，主人不出现在列表", "be": "_ai_groups_of(..., only_open=True) 过滤 accept_ai_follow", "test": "关掉开关后刷新列表该主人应消失"}, {"id": "2.3", "path": "② AI 机器人广场（左栏） › 卡片内容", "ui": "显示名 / @用户名 + 主节点行 + 风险上限行 + AI分组数 / 被跟节点数 / 已跟标记", "be": "primary_node、ai_group_count、follower_node_count、my_follow_group_count、my_follow_node_count", "test": "跟过一次后卡片应出现「已跟 N 组 / N 节点」绿标"}, {"id": "2.4", "path": "② AI 机器人广场（左栏） › 风险上限随卡片展示", "ui": "卡片第一眼显示「批次 N · 手数 X」，取各分组里的最大值", "be": "max_allow_num / total_lot_limit 取各分组 max", "test": "跟单员不控手数，必须先看到风险量级再决定跟谁"}, {"id": "2.5", "path": "② AI 机器人广场（左栏） › 排序：已跟的排前面", "ui": "我已跟过的机器人优先，其余按 username 排", "be": "sort(key=(my_follow_group_count == 0, username))", "test": "已跟过的机器人应出现在列表靠前位置"}, {"id": "2.6", "path": "② AI 机器人广场（左栏） › 空态", "ui": "「暂无机器人」", "be": "—", "test": "全场无机器人时应显示该文案而非空白"}, {"id": "2.7", "path": "② AI 机器人广场（左栏） › 点击打开详情", "ui": "点击卡片 → detailLoading → 拉详情；失败时 detail 置 null 并提示「加载机器人详情失败」", "be": "GET /api/ai-follow/robots/{leader_user_id}", "test": "点不存在的机器人应提示 404 文案并回到列表"}, {"id": "3.1", "path": "③ 机器人详情（右栏） › 风险上限条", "ui": "详情页顶部独立一条：批次上限 / 总手数上限", "be": "detail.robot.max_allow_num / total_lot_limit", "test": "与广场卡片上的数值应一致"}, {"id": "3.2", "path": "③ 机器人详情（右栏） › 可跟 AI 分组（多选）", "ui": "列出可跟分组：名称 + 品种 · 策略名 · 单槽执行 · 批次/手数 · 加仓倍数", "be": "detail.groups 中 selectable=true 的分组；selectedGroupIds 参与提交", "test": "勾选后才进 group_ids，不勾不提交"}, {"id": "3.3", "path": "③ 机器人详情（右栏） › 不可选分组整体不渲染", "ui": "分组禁用 / 策略已停用的分组在界面上**完全看不到**（既不可勾选，也没有原因文案）", "be": "前端 selectableGroups = groups.filter(g => g.selectable)；后端仍返回 selectable=false + unselectable_reason", "test": "停用策略后该分组应从列表消失；若期望看到原因，需前端补渲染不可选区"}, {"id": "3.4", "path": "③ 机器人详情（右栏） › 单槽执行提示", "ui": "分组行固定显示「单槽执行」；接口固定 signal_concurrent_enabled=false", "be": "AI 智能加仓策略不支持信号并发（supports_signal_concurrent 只放行 tpl_2/tpl_3）", "test": "同一节点同时只跑一单"}, {"id": "3.5", "path": "③ 机器人详情（右栏） › 我的节点（可多选）", "ui": "复选框：节点名 + MT5 号 + 在线/离线；主节点已被剔除", "be": "后端 _viewable_follow_nodes（自己的 + 启用 + 非主节点）", "test": "主节点不应出现在可跟节点列表里"}, {"id": "3.6", "path": "③ 机器人详情（右栏） › 已跟过的节点标记", "ui": "该机器人下已跟的节点显示琥珀色「已跟过」标签", "be": "alreadyFollowingNodeIds 由 /api/ai-follow/me 聚合", "test": "再次提交时会走「部分节点已跟」二次确认"}, {"id": "3.7", "path": "③ 机器人详情（右栏） › 提交条 + 三条风险提示", "ui": "【确认跟单】按钮 + 警示：手数不缩放 / 策略实时同步 / 移出不自动平仓", "be": "POST /api/ai-follow/join", "test": "三条提示必须同时可见，缺一条即为回归"}, {"id": "4.1", "path": "④ 加入 AI 跟单（join） › 校验顺序固定", "ui": "越权与不存在一律 4xx，不透露对方名下有什么分组", "be": "主人有效性 → 主节点存在 → 节点归属/主节点 → 分组可跟单性", "test": "请求不存在的 leader_user_id 应 404"}, {"id": "4.2", "path": "④ 加入 AI 跟单（join） › 节点拒绝原因", "ui": "skipped 里逐条给原因：主节点不能用于跟单 / 节点已停用 / 节点不属于你 / 已在此分组跟单", "be": "follow_rules.node_join_reject_reason", "test": "把主节点塞进 node_ids 应被拒且原因可读"}, {"id": "4.3", "path": "④ 加入 AI 跟单（join） › 分组静默跳过", "ui": "不可跟的分组不进 joined", "be": "followable.get(gid) 命中不到 → continue（市场外或 accept_ai_follow=false）", "test": "混入 tpl_3 分组 ID 时应 400 且不写入任何关系"}, {"id": "4.4", "path": "④ 加入 AI 跟单（join） › 幂等：已跟过的不重复写", "ui": "已存在的跟单关系计入 already_node_ids", "be": "add_following 唯一键 (group_id, node_id)，已存在返回 False", "test": "同一节点重复提交两次，关系表应只有一行"}, {"id": "4.5", "path": "④ 加入 AI 跟单（join） › 部分节点已跟 → 二次确认", "ui": "「所选节点中包含已跟单该机器人的节点，会跳过重复项。是否继续？」", "be": "前端 alreadyFollowingNodeIds 交集检测", "test": "选【继续】应照常提交并跳过重复项"}, {"id": "4.6", "path": "④ 加入 AI 跟单（join） › 确认跟单二次确认", "ui": "弹窗写明三条风险 + 【确认跟单】/【取消】", "be": "ElMessageBox.confirm，customClass ai-join-confirm", "test": "取消不应产生任何写入"}, {"id": "4.7", "path": "④ 加入 AI 跟单（join） › 成功提示与刷新", "ui": "「已加入 N 个分组」；随后刷新广场 + 我的跟单 + 当前详情", "be": "res.joined.length；refreshAll() + 条件重拉 detail", "test": "提交后三处状态都应刷新"}, {"id": "4.8", "path": "④ 加入 AI 跟单（join） › 操作审计", "ui": "每次跟单写一条审计", "be": "persist.audit(action='join_ai_follow', category='ai_follow')", "test": "【操作审计】页按 ai_follow 分类能筛出本次跟单"}, {"id": "5.1", "path": "⑤ 我的 AI 跟单 › 按机器人聚合", "ui": "后端返回 following[]（每个机器人一块）+ summary", "be": "GET /api/ai-follow/me", "test": "跟了 2 个机器人应显示 2 个块"}, {"id": "5.2", "path": "⑤ 我的 AI 跟单 › 前端按 node_id 去重", "ui": "同一机器人名下多个分组里的同一节点只显示一行", "be": "myFollowing computed 按 node_id 建 Map", "test": "同一节点跟了两个分组时不应出现两行"}, {"id": "5.3", "path": "⑤ 我的 AI 跟单 › 聚合口径", "ui": "活跃任务 = 各分组之和；加入时间取最早；手数上限取最大", "be": "active_task_count 累加、joined_at 取 min、batch_limit 取 max", "test": "重复跟同一节点应保留第一次的加入时间"}, {"id": "5.4", "path": "⑤ 我的 AI 跟单 › 不可跟标灰（当前只有粗粒度标签）", "ui": "机器人被撤能力 / 换主节点 / 分组禁用 / 关闭开关时，头部标琥珀色「已下架」；具体原因文案**未渲染**，且此时移出按钮变成「等待清理」而无法自行清理", "be": "后端按 marketable_reason + AI 特有「该机器人已关闭 AI 跟单」给出 unmarketable_reason；前端只读 marketable 布尔值", "test": "主人被撤能力后应能自行移出 —— 当前 UI 挡掉了移出入口，与后端「清理不需要能力」的语义不一致"}, {"id": "5.5", "path": "⑤ 我的 AI 跟单 › 节点行信息", "ui": "分组名 / 节点名 + MT5 / 活跃任务 / 手数上限 + 【移出】", "be": "batch_limit 取自策略 max_allow_num", "test": "行内应能看到还剩多少加仓空间（风险敞口）"}, {"id": "5.6", "path": "⑤ 我的 AI 跟单 › 空态", "ui": "「暂无 AI 跟单」", "be": "—", "test": "没跟过时应显示该文案而非空白"}, {"id": "6.1", "path": "⑥ 移出 AI 跟单（leave） › 移出二次确认", "ui": "「移出后关系解除，不再下发新信号。已有任务不会自动平仓」+【移出（不停止在跑任务）】/【取消】", "be": "ElMessageBox.confirm，customClass ai-leave-confirm", "test": "取消不应解除关系"}, {"id": "6.2", "path": "⑥ 移出 AI 跟单（leave） › 在跑任务不停止", "ui": "移出只解绑关系，不下发平仓指令", "be": "close_tasks 默认 false；_stop_following_subtasks 仅在 close_tasks=true 时调用", "test": "移出后机器人再触发一次信号，该节点不应收到"}, {"id": "6.3", "path": "⑥ 移出 AI 跟单（leave） › 不要求主人仍有能力", "ui": "主人被撤能力后，跟单员仍能自行移出", "be": "leave 不做 can_host_ai_robot 校验", "test": "对方被撤能力后仍应能点移出并成功"}, {"id": "6.4", "path": "⑥ 移出 AI 跟单（leave） › closing / forced / warning 提示", "ui": "「已移出 N 个节点」+「N 个任务正在平仓」+「N 个离线节点已排队补发平仓」", "be": "res.closing / res.forced / res.warning", "test": "离线节点移出应出现补发平仓提示"}, {"id": "6.5", "path": "⑥ 移出 AI 跟单（leave） › 移出后刷新", "ui": "刷新广场 + 我的跟单；若正看该机器人详情再重拉一次", "be": "Promise.all([loadRobots(), loadMine()]) + 条件重拉 detail", "test": "移出后详情页的「已跟过」标记应消失"}, {"id": "6.6", "path": "⑥ 移出 AI 跟单（leave） › 移出后不再接新信号", "ui": "关系解除后后续分发不再覆盖该节点", "be": "分组缓存 followers 移除 → _effective_with_follows 不再纳入", "test": "同上：移出后该节点不应再产生子任务"}, {"id": "7.1", "path": "⑦ 跟单市场与互斥 › 两个市场互斥", "ui": "【带单】= tpl_2 趋势 + tpl_3 网格；【AI 交易】= tpl_1 AI 智能加仓", "be": "FOLLOW_MARKET_TEMPLATE_IDS / AI_MARKET_TEMPLATE_IDS；一个分组只绑一个策略 → 天然互斥", "test": "tpl_1 分组在 /api/follow/join 里写不进"}, {"id": "7.2", "path": "⑦ 跟单市场与互斥 › 单一判定入口", "ui": "列表 / 详情 / join 三处共用 followable_groups", "be": "follow_rules.followable_groups(market=..., strategy_templates_map=...)", "test": "改一次白名单，三个入口同时生效"}, {"id": "7.3", "path": "⑦ 跟单市场与互斥 › 白名单而非黑名单", "ui": "未来新增模版默认不外露", "be": "template_in_market 命中白名单才算", "test": "新增 tpl_4 若未加白名单应默认不可跟"}, {"id": "7.4", "path": "⑦ 跟单市场与互斥 › 模版未知不判死", "ui": "未绑策略 / 策略被删除的分组保持既有可跟单行为", "be": "用 template_out_of_market：只在「模版已知且不在市场内」时拒绝", "test": "删掉策略后分组仍可跟，但分发侧不会下发"}, {"id": "7.5", "path": "⑦ 跟单市场与互斥 › accept_ai_follow 显式开关", "ui": "分组级开关，默认关；只对绑定 tpl_1 的分组有意义", "be": "node_group.accept_ai_follow + 分组编辑页开关（仅 AI 策略分组显示）", "test": "新建分组的 accept_ai_follow 默认为 false"}, {"id": "7.6", "path": "⑦ 跟单市场与互斥 › 开关在写入侧校验", "ui": "未开放的分组直接调 API 也写不进关系", "be": "join 里 followable 只取 accept_ai_follow=true 的分组", "test": "绕过 UI 调 API 也应 400"}, {"id": "7.7", "path": "⑦ 跟单市场与互斥 › 跨市场继承隔离", "ui": "adopt-followers 只继承与目标分组**同市场**的来源分组", "be": "groups.py：目标模版定 market → 来源按 template_in_market 收窄", "test": "在 AI 分组触发继承，不应把网格分组的跟单节点拉进来"}, {"id": "8.1", "path": "⑧ 分发侧口径（跟单员如何收到信号） › 参与者 = owner 成员 + 跟单成员", "ui": "跟单员加入的节点同样接收信号，且稳定排在 owner 成员之后", "be": "group_rules.participant_ids（去重保序）", "test": "分组里同时有 owner 成员和跟单成员时两者都应收到"}, {"id": "8.2", "path": "⑧ 分发侧口径（跟单员如何收到信号） › 有效节点 = 存在 + 启用 + 在线", "ui": "跟单节点离线则本轮不接收，poll 模式自动跳下一个", "be": "group_rules.effective_node_ids", "test": "跟单节点离线时分组仍能正常开仓"}, {"id": "8.3", "path": "⑧ 分发侧口径（跟单员如何收到信号） › 主人失去能力 → 退回 owner 口径", "ui": "跟单节点一律不再接收新信号，已在跑的任务不受影响，自然跑完", "be": "group_dispatcher._effective_with_follows → owner_effective_node_ids", "test": "撤销能力后触发信号，跟单节点不应产生子任务"}, {"id": "8.4", "path": "⑧ 分发侧口径（跟单员如何收到信号） › 未知模版 → 同样退回 owner 口径", "ui": "两个市场都不收的分组，跟单节点不接收新信号（保守）", "be": "follow_rules.market_for_template 为空集 → 降级", "test": "把分组策略换成未知模版后跟单节点不应收到信号"}, {"id": "8.5", "path": "⑧ 分发侧口径（跟单员如何收到信号） › 单槽：忙闲占位按 (group_id, node_id)", "ui": "跟单员之间不互相挤占——各跟单员节点各有独立单槽；真正的限制是同一节点同时只跑一单", "be": "store.acquire_group_node_busy(group_id, node_id)", "test": "两个跟单员跟同一分组应能同时各跑一单"}, {"id": "8.6", "path": "⑧ 分发侧口径（跟单员如何收到信号） › 策略热推实时同步", "ui": "机器人主人改参数 → 在跑任务被即时改写，跟单员无法锁定", "be": "rewrite_running_strategy_snapshots + push_strategy_updates（按 strategy_id 覆盖非终态子任务）", "test": "主人改 lot_times 后跟单员在跑任务应立刻生效"}, {"id": "8.7", "path": "⑧ 分发侧口径（跟单员如何收到信号） › 手数不缩放", "ui": "跟单员按机器人设定的完整手数执行（风险文案写在 UI）", "be": "group_rules.resolve_volume(signal.volume)", "test": "机器人设 1 手时跟单节点也应按 1 手执行"}, {"id": "9.1", "path": "⑨ 节点准入与生命周期清理 › 主节点永不可跟单", "ui": "主节点同时是机器人载体，保持独立才有「机器人 / 跟单」的方向性", "be": "join 时 node_join_reject_reason 判 is_primary；前端也本地剔除", "test": "主节点塞进 join 请求应被拒"}, {"id": "9.2", "path": "⑨ 节点准入与生命周期清理 › 停用节点不可跟", "ui": "已停用节点给出「节点已停用」", "be": "node_join_reject_reason 判 enabled", "test": "停用某节点后它不应出现在可跟列表"}, {"id": "9.3", "path": "⑨ 节点准入与生命周期清理 › 跟单节点升主节点 → 自动移出跟单", "ui": "升主后不再具备跟单资格，跟单关系自动清掉", "be": "node_service.set_primary → follow_service.remove_node_followings", "test": "把已跟单的节点设为主节点后，我的跟单里应不再有它"}, {"id": "9.4", "path": "⑨ 节点准入与生命周期清理 › 节点删除 / 归属转移 → 清跟单关系", "ui": "不留永远不会被分发的脏关系", "be": "node_service.delete_node、users_api.assign_nodes → remove_node_followings", "test": "把跟单节点转移给别的用户后，我的跟单里应不再有它"}, {"id": "9.5", "path": "⑨ 节点准入与生命周期清理 › 用户删除 → 清其全部跟单关系", "ui": "防止指向已删除用户的脏关系", "be": "users_api.delete_user → follow_service.remove_user_followings", "test": "删除用户后其跟单关系应被级联清掉"}, {"id": "9.6", "path": "⑨ 节点准入与生命周期清理 › 分组删除 → 级联删跟单行", "ui": "分组没了关系也不能留", "be": "group_service.delete_group 事务内级联", "test": "机器人主人删除分组后，跟单员侧不应残留该分组条目"}, {"id": "10.1", "path": "⑩ 权限与审计 › 方向性约定：跟单人人可做", "ui": "能进【AI 交易】菜单即可加入跟单，不需要任何额外能力", "be": "五个路由只校验 require_menu(MENU_AI_TRADE)", "test": "无任何能力的普通用户应能正常跟别人的 AI 机器人"}, {"id": "10.2", "path": "⑩ 权限与审计 › 方向性约定：机器人主人需两能力", "ui": "我能否被别人跟，由 ai_strategy 且 follow_leader 共同决定", "be": "permissions.can_host_ai_robot(principal)", "test": "只给一个能力则不出现在广场"}, {"id": "10.3", "path": "⑩ 权限与审计 › 能力撤销立即生效", "ui": "撤销后立刻从广场消失，但存量关系保留、在跑任务跑完", "be": "按用户名现算 principal（带缓存），避免撤销后仍对外可见", "test": "撤销能力后刷新广场该主人应消失"}, {"id": "10.4", "path": "⑩ 权限与审计 › 管理员自动放行", "ui": "管理员天然具备全部能力", "be": "can_capability 内部 is_admin 分支", "test": "管理员应在广场里看到自己"}, {"id": "10.5", "path": "⑩ 权限与审计 › 不泄露对方分组", "ui": "越权与不存在返回同一个原因", "be": "node_join_reject_reason 不返回「对方分组是否存在」类信息", "test": "用他人 node_id 探测不应得到可区分的报错"}, {"id": "10.6", "path": "⑩ 权限与审计 › 审计分类 ai_follow", "ui": "加入 / 移出各写一条审计，分类与带单分开", "be": "persist.audit(category='ai_follow', action='join_ai_follow' / 'leave_ai_follow')", "test": "【操作审计】页按 ai_follow 分类能筛出 AI 跟单操作"}];
+
+const NW = 232, NH = 30, GX = 52, GY = 10;
+const nodes = [];
+let cursor = 0;
+function assign(n, depth) {
+  const x = depth * (NW + GX);
+  if (!n.children || !n.children.length) {
+    nodes.push({ ...n, x, y: cursor, depth });
+    cursor += NH + GY;
+    return;
+  }
+  const ys = n.children.map((c) => { assign(c, depth + 1); return nodes.find((q) => q.id === c.id).y; });
+  nodes.push({ ...n, x, y: (ys[0] + ys[ys.length - 1]) / 2, depth });
+}
+assign(TREE, 0);
+const W = Math.max(...nodes.map((n) => n.x)) + NW + 24;
+const H = Math.max(...nodes.map((n) => n.y)) + NH + 24;
+
+const byId = {};
+nodes.forEach((n) => (byId[n.id] = n));
+const collapsed = new Set();
+let selected = "root";
+
+function visibleList() {
+  const hidden = new Set();
+  (function walk(n) {
+    if (collapsed.has(n.id)) {
+      hidden.add(n.id);
+      (n.children || []).forEach(walk);
+      return;
+    }
+    (n.children || []).forEach(walk);
+  })(TREE);
+  return nodes.filter((n) => !hidden.has(n.id));
+}
+
+const mapEl = document.getElementById("map");
+const detailEl = document.getElementById("detail");
+
+function escapeHtml(s) {
+  return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function draw() {
+  const vis = visibleList();
+  const visIds = new Set(vis.map((v) => v.id));
+  let edges = "";
+  for (const n of vis) {
+    for (const c of n.children || []) {
+      if (!visIds.has(c.id)) continue;
+      const cc = byId[c.id];
+      const x1 = n.x + NW, y1 = n.y + NH / 2, x2 = cc.x, y2 = cc.y + NH / 2;
+      const dx = Math.max(18, (x2 - x1) / 2);
+      edges += '<path d="M ' + x1 + ' ' + y1 + ' C ' + (x1 + dx) + ' ' + y1 + ', ' + (x2 - dx) + ' ' + y2 + ', ' + x2 + ' ' + y2 +
+        '" fill="none" stroke="var(--stroke-2)" stroke-width="1"/>';
+    }
+  }
+  let html = '<svg width="' + W + '" height="' + H + '" style="position:absolute;left:0;top:0;pointer-events:none">' + edges + "</svg>";
+  for (const n of vis) {
+    const kids = (n.children || []).length > 0;
+    const cls = "node" + (n.depth === 1 ? " l1" : "") + (n.kind === "case" ? " case" : "") + (n.id === selected ? " sel" : "");
+    const t = kids ? '<span class="toggle" data-t="' + n.id + '">' + (collapsed.has(n.id) ? "+" : "−") + "</span>" : "";
+    html += '<div class="' + cls + '" style="left:' + n.x + "px;top:" + n.y + 'px;width:' + NW + 'px" data-n="' + n.id + '">' +
+      t + "<span>" + escapeHtml(n.label) + "</span></div>";
+  }
+  mapEl.style.height = H + "px";
+  mapEl.innerHTML = html;
+  drawDetail();
+}
+
+function drawDetail() {
+  const n = byId[selected];
+  if (!n) { detailEl.innerHTML = ""; return; }
+  let h = "<h3>" + escapeHtml(n.label) + "</h3>";
+  if (n.ui || n.be || n.test) {
+    h += "<dl>";
+    if (n.ui) h += "<dt>界面表现</dt><dd>" + escapeHtml(n.ui) + "</dd>";
+    if (n.be) h += "<dt>后端行为</dt><dd>" + escapeHtml(n.be) + "</dd>";
+    if (n.test) h += "<dt>测试要点</dt><dd>" + escapeHtml(n.test) + "</dd>";
+    h += "</dl>";
+  } else {
+    h += '<p style="margin:0;color:var(--text-3);font-size:13px">这是结构分组节点，请选择具体的分支。</p>';
+  }
+  detailEl.innerHTML = h;
+}
+
+mapEl.addEventListener("click", (e) => {
+  const tg = e.target.closest("[data-t]");
+  if (tg) {
+    const id = tg.getAttribute("data-t");
+    collapsed.has(id) ? collapsed.delete(id) : collapsed.add(id);
+    draw();
+    return;
+  }
+  const nd = e.target.closest("[data-n]");
+  if (nd) { selected = nd.getAttribute("data-n"); draw(); }
+});
+
+const done = new Set();
+const tbody = document.getElementById("tbody");
+function drawList() {
+  let h = "";
+  for (const l of LEAVES) {
+    const ok = done.has(l.id);
+    h += '<tr class="' + (ok ? "done" : "") + '"><td class="n">' + escapeHtml(l.id) + "</td><td>" + escapeHtml(l.path) +
+      "</td><td>" + escapeHtml(l.ui || "—") + "</td><td>" + escapeHtml(l.be || "—") + "</td><td>" + escapeHtml(l.test || "—") +
+      '</td><td><button class="chk' + (ok ? " on" : "") + '" data-c="' + l.id + '">' + (ok ? "已测" : "未测") + "</button></td></tr>";
+  }
+  tbody.innerHTML = h;
+  document.getElementById("prog").textContent = done.size + " / " + LEAVES.length;
+}
+tbody.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-c]");
+  if (!b) return;
+  const id = b.getAttribute("data-c");
+  done.has(id) ? done.delete(id) : done.add(id);
+  drawList();
+});
+document.getElementById("clear").addEventListener("click", () => { done.clear(); drawList(); });
+
+document.querySelectorAll(".tab[data-v]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".tab[data-v]").forEach((b) => b.classList.toggle("on", b === btn));
+    const v = btn.getAttribute("data-v");
+    document.getElementById("v-map").classList.toggle("hide", v !== "map");
+    document.getElementById("v-list").classList.toggle("hide", v !== "list");
+  });
+});
+
+(function () {
+  let out = "";
+  (function walk(n, prefix, last, isRoot) {
+    out += isRoot ? n.label : prefix + (last ? "└─ " : "├─ ") + n.label + "\n";
+    const kids = n.children || [];
+    const cp = isRoot ? "" : prefix + (last ? "   " : "│  ");
+    kids.forEach((c, i) => walk(c, cp, i === kids.length - 1, false));
+  })(TREE, "", true, true);
+  document.getElementById("tree").textContent = out;
+})();
+
+draw();
+drawList();
+</script>
+</body>
+</html>

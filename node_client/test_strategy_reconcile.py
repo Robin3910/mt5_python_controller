@@ -164,6 +164,52 @@ def test_manual_config_free_before_fired():
     assert effective["rules"][0]["manual_scatter"]["entry_price"] == 4500.0
 
 
+def test_manual_removed_while_pending_reports_cancel():
+    """挂单在盘上时客户把手动单删了：回执要说明挂单会被撤掉。
+
+    动作不可逆（撤单后那张单就没了），必须让客户在回执里看见。
+    """
+    old = _snap([_rule(2, manual_scatter={"enabled": True, "entry_price": 4400.0})])
+    new = _snap([_rule(2, manual_scatter={"enabled": False})])
+    fields, _effective = sr.reconcile_snapshot(old, new, manual_pending={2})
+    assert len(fields) == 1
+    assert fields[0]["status"] == "applied"
+    assert "撤掉" in fields[0]["message"]
+    assert "manual_scatter" in fields[0]["field"]
+
+
+def test_manual_removed_without_pending_has_no_extra_field():
+    """挂单不在盘上时删手动单：不用额外报一条（没有单可撤）。"""
+    old = _snap([_rule(2, manual_scatter={"enabled": True, "entry_price": 4400.0})])
+    new = _snap([_rule(2, manual_scatter={"enabled": False})])
+    fields, _effective = sr.reconcile_snapshot(old, new, manual_pending=set())
+    assert not fields
+
+
+def test_manual_block_removed_while_pending_reports_cancel():
+    """手动单整块被删（不是 enabled=false）：同样要报「挂单会被撤掉」。"""
+    old = _snap([_rule(2, manual_scatter={"enabled": True, "entry_price": 4400.0})])
+    new = _snap([_rule(2)])
+    new["rules"][0].pop("manual_scatter")
+    fields, _effective = sr.reconcile_snapshot(old, new, manual_pending={2})
+    assert len(fields) == 1
+    assert "撤掉" in fields[0]["message"]
+
+
+def test_manual_removed_after_filled_stays_locked():
+    """已成交（FILLED）后删手动单：仍然锁死，不报「会被撤掉」。
+
+    已成交的手动仓是持仓，不是挂单——撤单对它没有意义。
+    """
+    old = _snap([_rule(2, manual_scatter={"enabled": True, "entry_price": 4400.0})])
+    new = _snap([_rule(2, manual_scatter={"enabled": False})])
+    fields, effective = sr.reconcile_snapshot(
+        old, new, manual_locked={2}, manual_pending={2},
+    )
+    assert fields[0]["status"] == "locked"
+    assert effective["rules"][0]["manual_scatter"]["enabled"] is True
+
+
 # ----------------------------------------------------------------------
 # 规则增删
 # ----------------------------------------------------------------------

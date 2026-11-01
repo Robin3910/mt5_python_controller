@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>路由 /trading功能分支脑图</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #161920; --panel-2: #1c2028;
+    --text: #e6e8ee; --text-2: #9aa3b2; --text-3: #6b7383;
+    --stroke: #262b35; --stroke-2: #323846;
+    --accent: #3b82f6; --accent-soft: rgba(59,130,246,0.14);
+    --ok: #22c55e; --warn: #f59e0b;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f7f9; --panel: #ffffff; --panel-2: #f0f2f5; --text: #16181d;
+      --text-2: #5a6272; --text-3: #8a92a2; --stroke: #e2e5ea; --stroke-2: #cfd4dd;
+      --accent: #2563eb; --accent-soft: rgba(37,99,235,0.10);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    font-size: 14px; line-height: 1.6;
+  }
+  .wrap { max-width: 1400px; margin: 0 auto; padding: 28px 20px 60px; }
+  h1 { font-size: 24px; margin: 0 0 6px; font-weight: 600; }
+  h2 { font-size: 17px; margin: 32px 0 10px; font-weight: 600; }
+  .sub { color: var(--text-2); font-size: 13px; margin: 0 0 18px; max-width: 900px; }
+  .bar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 18px; }
+  .stat { background: var(--panel); border: 1px solid var(--stroke); border-radius: 8px; padding: 8px 14px; }
+  .stat b { display: block; font-size: 18px; font-weight: 600; }
+  .stat span { font-size: 11px; color: var(--text-3); }
+  .tabs { display: flex; gap: 6px; margin-left: auto; }
+  .tab { background: var(--panel); border: 1px solid var(--stroke); color: var(--text-2);
+         border-radius: 999px; padding: 5px 14px; font-size: 12px; cursor: pointer; }
+  .tab.on { background: var(--accent); border-color: transparent; color: #fff; }
+  .note { background: var(--panel); border: 1px solid var(--stroke); border-left: 3px solid var(--accent);
+          border-radius: 8px; padding: 12px 14px; font-size: 13px; color: var(--text-2); margin-bottom: 18px; }
+  .note code { color: var(--text); }
+  .note strong { color: var(--text); }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+  .panel { background: var(--panel); border: 1px solid var(--stroke); border-radius: 10px; overflow: hidden; }
+  .mapwrap { overflow: auto; max-height: 72vh; position: relative; }
+  .node { position: absolute; display: flex; align-items: center; gap: 6px; height: 30px;
+          padding: 0 8px; border-radius: 6px; font-size: 12px; white-space: nowrap;
+          overflow: hidden; cursor: pointer; border: 1px solid var(--stroke); background: var(--panel-2); }
+  .node:hover { border-color: var(--accent); }
+  .node.l1 { background: var(--panel-2); border-left: 2px solid var(--accent); font-weight: 600; }
+  .node.case { background: var(--panel); color: var(--text); }
+  .node.sel { outline: 2px solid var(--accent); }
+  .toggle { width: 14px; height: 14px; border: 1px solid var(--stroke-2); border-radius: 3px;
+            font-size: 10px; display: inline-flex; align-items: center; justify-content: center;
+            color: var(--text-2); flex-srink: 0; }
+  .toggle:hover { border-color: var(--accent); color: var(--accent); }
+  .detail { margin-top: 14px; background: var(--panel); border: 1px solid var(--stroke);
+            border-radius: 10px; padding: 14px 16px; }
+  .detail h3 { margin: 0 0 10px; font-size: 15px; font-weight: 600; }
+  .detail dl { margin: 0; display: grid; grid-template-columns: 82px 1fr; gap: 8px 14px; font-size: 13px; }
+  .detail dt { color: var(--text-3); font-size: 12px; }
+  .detail dd { margin: 0; color: var(--text-2); }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--stroke); vertical-align: top; }
+  th { color: var(--text-3); font-weight: 600; font-size: 11.5px; position: sticky; top: 0; background: var(--panel-2); }
+  td.n { font-family: ui-monospace, Menlo, Consolas, monospace; color: var(--text-3); white-space: nowrap; }
+  .chk { border: 1px solid var(--stroke-2); border-radius: 999px; padding: 2px 10px; font-size: 11px;
+         cursor: pointer; color: var(--text-2); background: transparent; white-space: nowrap; }
+  .chk.on { background: var(--ok); border-color: transparent; color: #fff; }
+  tr.done td { color: var(--text-3); }
+  pre { background: var(--panel); border: 1px solid var(--stroke); border-radius: 10px; padding: 16px;
+        overflow: auto; font-size: 12.5px; line-height: 1.7; font-family: ui-monospace, Menlo, Consolas, monospace; }
+  .src { font-size: 12.5px; color: var(--text-2); }
+  .src li { margin: 3px 0; }
+  .hide { display: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>交易页 /trading功能分支脑图</h1>
+  <p class="sub">路由 /trading，菜单键 trading，权限要求 MENU_TRADING</p>
+
+  <div class="bar">
+    <div class="stat"><b>60</b><span>可测分支</span></div>
+    <div class="stat"><b>10</b><span>一级模块</span></div>
+    <div class="tabs">
+      <button class="tab on" data-v="map">脑图</button>
+      <button class="tab" data-v="list">测试清单</button>
+    </div>
+  </div>
+
+  <div class="note">路由 /trading，菜单键 trading，权限要求 MENU_TRADING</div>
+
+  <div id="v-map">
+    <div class="panel"><div class="mapwrap" id="map"></div></div>
+    <div class="detail" id="detail"></div>
+  </div>
+
+  <div id="v-list" class="hide">
+    <div class="bar">
+      <div class="stat"><b id="prog">0 / 60</b><span>测试进度</span></div>
+      <button class="tab" id="clear">清空标记</button>
+    </div>
+    <div class="panel" style="overflow:auto; max-height:72vh">
+      <table>
+        <thead><tr>
+          <th>编号</th><th>分支</th><th>界面表现</th><th>后端行为</th><th>测试要点</th><th>状态</th>
+        </tr></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <h2>脑图结构</h2>
+  <pre id="tree"></pre>
+</div>
+
+<script>
+const TREE = {"id":"root","label":"交易页 /trading","kind":"group","ui":"路由 /trading，菜单键 trading，权限要求 MENU_TRADING","test":"入口可访问性：未登录、已登录无菜单权限、已登录有菜单权限三种身份","children":[{"id":"1","label":"① 入口 / 主节点选取","kind":"group","children":[{"id":"1.1","label":"无主节点 → 全页空态","kind":"case","ui":"只渲染「尚未设置主节点」+ 描述 + 【前往节点页】按钮；报价卡、底部三按钮、状态条、详情面板全部不渲染","be":"—","test":"把唯一节点 is_primary 置否 → 刷新交易页应只见空态；点击按钮跳到 /nodes"},{"id":"1.2","label":"管理员主节点口径","kind":"case","ui":"仅认 owner_user_id == 当前管理员 且 is_primary && enabled；名下没有主节点就显示空态，不借用他人主节点","be":"与 node_service.set_primary / _clear_primary_for_owner 一致","test":"A 管理员名下节点为主、B 用户名下节点也为主 → 管理员交易页应显示空态而非借用 B"},{"id":"1.3","label":"普通用户主节点口径","kind":"case","ui":"is_primary && enabled（后端 /api/nodes 已按 owner 过滤，客户端不再收紧）","be":"—","test":"普通用户多个主节点时取第一个；自己的主节点禁用后应回落空态"},{"id":"1.4","label":"在线 / 离线双态","kind":"case","ui":"在线：状态条绿点「在线」；离线：灰点「离线」+ 底部三按钮 disabled + 黄色提示「主节点离线，无法触发」","be":"quick-trigger 再次校验：manager.is_node_online 不通过 → 400「主节点不在线」","test":"断开节点连接后：按钮置灰；强行点按 openDialog → warning「主节点不在线，无法触发」且弹窗不打开"},{"id":"1.5","label":"轮询与快照容错","kind":"case","ui":"onMounted 拉节点列表 + 一次账户快照；此后每 5s 拉一次快照；失败静默忽略不弹错","be":"—","test":"让账户快照接口 500，交易页应保持可用、无数值抖动、无错误弹窗"}]},{"id":"2","label":"② 报价卡 / 品种选择","kind":"group","children":[{"id":"2.1","label":"品种来源与排序","kind":"case","ui":"取 quotes 中 bid/ask/mid 任一 > 0 的品种 ∪ 持仓中的品种，去重转大写后按字母序；白名单为空","be":"—","test":"节点同时上报 EURUSD 报价 + XAUUSD 持仓 → 两个 chip 都在且已排序"},{"id":"2.2","label":"无任何报价","kind":"case","ui":"显示「主节点尚未上报任何品种报价」，不渲染品种切换 chips","be":"—","test":"节点上线但未上报品种 → 报价区显示该文案，页面其余部分正常"},{"id":"2.3","label":"当前品种消失 → 自动回退","kind":"case","ui":"watch(availableSymbols)：当前 symbol 不在列表内时自动切到第一个可用品种","be":"—","test":"选中 EURUSD 后节点撤掉该品种报价 → 界面应自动切到剩余第一个，不出现空白报价"},{"id":"2.4","label":"价格格式化","kind":"case","ui":"JPY 结尾 3 位小数、其它 5 位；0/undefined/NaN → 「—」；变动显示 ±xx.xx，正绿负红","be":"—","test":"USDJPY vs EURUSD 小数位；缺 mid 时中间价显示「—」"},{"id":"2.5","label":"品种持仓摘要卡","kind":"case","ui":"仅当该品种有持仓时显示「N 笔 · X 手」+ 浮盈（带正负号，0 记为不显示 +）","be":"—","test":"多品种持仓时切换 chip，摘要随品种联动"}]},{"id":"3","label":"③ 开仓弹窗（OrderDialog）","kind":"group","children":[{"id":"3.0","label":"实际可见字段（注意多处已注释隐藏）","kind":"case","ui":"分组 / 开仓品种 / 开仓手数 / 方向 / 止盈价 / 备注 / 手动重算 的输入框当前已被注释隐藏；市价=止损价+风险参数，限价=入场价+止损价+风险参数，网格=完整网格参数集","be":"—","test":"回归确认：这些字段确实不可见，且弹窗不会因缺手数而阻断（市价手数由 risk_amount 反算）"},{"id":"3.1","label":"openDialog 前置与表单重置","kind":"case","ui":"无主节点或离线 → warning 且不打开；打开时重置 form（symbol=当前品种、volume=0.01、sl/tp/entry=0、direction=all、remark 空）","be":"预拉 GET /api/groups，按 {策略类型}-{用户名}-{MT5号}-{品种} 匹配 group_id；失败则 group_id=null","test":"连续开三个策略按钮，每次表单应完全重置，不残留上一次输入"},{"id":"3.2","label":"分组与策略加载（loadGroupAndStrategy）","kind":"case","ui":"先按 groupId 找分组 → 找不到按 groupName 找 → 还找不到则自动建组（主节点加入）；建组失败显示「自动创建分组失败」，触发按钮保持禁用","be":"POST /api/groups；首次触发会同时创建「分组 + 策略」","test":"同一 (类型,用户,登录号,品种) 第二次触发应复用分组与策略，不重复创建"},{"id":"3.3","label":"策略参数回填","kind":"case","ui":"分组已有 strategy_id → 从启用中的 type=3 规则回填 riskParams（风险金额/盈亏比/底仓占比/保本倍数），从 type=4 回填网格参数；无策略则用模版 tpl_2 / tpl_3 首条规则默认值","be":"GET /api/strategies/templates、GET /api/strategies","test":"改了风险参数后重开弹窗应保留；新建时默认值应为 100 / 2.5 / 30 / 0"},{"id":"3.4","label":"方向自动推导（derivedAction）","kind":"case","ui":"限价：入场价 > 止损 → BUY 多；< 止损 → SELL 空。市价：止损 < 当前 mid → BUY；止损 > mid → SELL。无法判定时触发按钮禁用，副标题提示「请填写入场价与止损价」/「请填写止损价并等待报价」","be":"—","test":"改止损价到 mid 上下两侧，按钮副标题应在 BUY 多 / SELL 空 之间切换"},{"id":"3.5","label":"趋势参数校验（validateRiskParams）","kind":"case","ui":"风险金额 > 0、盈亏比 ≥ 0、底仓占比 1~100、保本倍数 ≥ 0；不通过时弹窗底部红框显示原因","be":"—","test":"逐个置 0 / 101 / 负数，确认每条都给出对应中文提示且按钮禁用"},{"id":"3.6","label":"网格参数校验（validateGridParams）","kind":"case","ui":"区间下限 > 0、上限 > 下限、网格数量 2~200、模式 ∈ 等差/等比、方向 ∈ 只做多/只做空、每格手数 > 0","be":"—","test":"网格数量填 1 或 201、区间上下限填反，均应被拦"},{"id":"3.7","label":"网格试算（自动）","kind":"case","ui":"条件满足后 debounce 500ms 自动试算，8s 超时；试算中显示「试算中…」，结果回写网格数量与每格手数；无主节点显示「未设置主节点，无法自动试算」；条件不满足静默清空","be":"GET /api/nodes/{id}/grid_sizing（timeframe=M1、atr_mult=0.6、spacing=0）","test":"只做多时必须填止损价才触发试算；只做空时必须填止盈价"},{"id":"3.8","label":"网格试算失败降级","kind":"case","ui":"ready=false 或每格手数为 0 → 显示 warnings 首条或「该品种试算失败，可手动填写网格参数」；【↻ 重算】按钮可手动再试","be":"后端 409（行情读取失败）/ 400（品种代码非法）","test":"对不支持的品种试算 → 应给出提示且仍允许手动填网格数量后触发"},{"id":"3.9","label":"网格条件字段联动","kind":"case","ui":"方向切换会改变「止损价 / 止盈价」标签文案；「向上追踪」开启后才出现「最大平移格数」；「初始建仓」开关每次开弹窗强制复位为关","be":"—","test":"开向上追踪 → 出现最大平移格数行；关掉即消失"},{"id":"3.10","label":"带单开关（carry）","kind":"case","ui":"开 → 信号推给本分组全部节点（含跟单员）；关 → 只推主节点","be":"payload.node_ids = [主节点]，后端按 node_ids 收窄最终下发集合","test":"关闭带单后应只有主节点收到信号；同分组其它任务不受影响"},{"id":"3.11","label":"触发提交（市价 / 限价）","kind":"case","ui":"建或更新策略 → 限价额外打开限价监听（limit_watch_enabled + limit_watch_node_ids）→ 打开信号并发 → 继承跟单节点 → 发出信号","be":"POST/PATCH /api/strategies、PATCH /api/groups、POST /api/groups/{id}/adopt-followers","test":"限价触发后分组应自动开启限价监听；中间步骤失败只提示不阻断信号下发"},{"id":"3.12","label":"触发提交（网格）","kind":"case","ui":"建或更新 type=4 网格规则 → 打开信号并发 → 继承跟单节点 → 发出信号；顶层 action 由 grid_side 决定","be":"网格方向只做多 → action=BUY；只做空 → action=SELL","test":"只做空网格发单后节点侧应按 SELL 执行"},{"id":"3.13","label":"弹窗关闭与重开","kind":"case","ui":"X / 取消 → 关闭并清空错误；重开时试算结果与网格预填被清空","be":"—","test":"触发一次报错后关闭重开，不应残留上次的错误文案"}]},{"id":"4","label":"④ 前端提交与结果提示","kind":"group","children":[{"id":"4.1","label":"策略复用路径（manual-signal）","kind":"case","ui":"accepted / duplicate → 关闭弹窗；rejected → 弹窗内红框显示 reason；网络异常 → 显示后端 detail","be":"POST /api/console/manual-signal（model=strategy，group_ids=[当前分组]）","test":"构造一个会被拒的场景（如分组禁用）确认红框文案可读"},{"id":"4.2","label":"一键触发路径（quick-trigger）","kind":"case","ui":"accepted → 成功提示「X 个目标节点」；duplicate → 警告「重复信号被抑制（5 秒内已有相同信号）」；rejected → lastError 展示","be":"POST /api/trading/quick-trigger","test":"同一参数 5 秒内连点两次 → 第二次必须走 duplicate 分支"},{"id":"4.3","label":"手数与空值兜底","kind":"case","ui":"手数未填 / 0 / NaN / 负数 → 强制 0.01；sl、tp ≤ 0 → 传 null；非网格模式 direction 传 null","be":"后端「开仓信号必须填写手数」","test":"清空手数提交，不应被后端拦截"},{"id":"4.4","label":"结果文案分级","kind":"case","ui":"targets > 0 → success「已触发 BUY XAUUSD：命中 N 个分组，M 个节点任务开始执行」；targets = 0 → warning「已受理但未下发：命中 N 个分组（原因）」；其他 → info「已提交：status」","be":"后端返回 tasks[].reason 汇总","test":"分组内无有效节点时，提示应指出具体原因（成员未启用/不在线）"}]},{"id":"5","label":"⑤ 后端 quick-trigger 校验","kind":"group","children":[{"id":"5.1","label":"主节点四道校验","kind":"case","ui":"400「主节点不存在或未启用」/ 403「主节点不属于当前用户」/ 400「主节点不在线」/ 400「主节点未绑定 MT5 登录号」","be":"trading_api.quick_trigger 第 1 步","test":"管理员触发他人主节点 → 403；主节点解绑 MT5 登录号 → 400"},{"id":"5.2","label":"限价必填入场价","kind":"case","ui":"400「限价开仓必须填写入场价」","be":"entry_price 缺失或 ≤ 0","test":"直接调接口不带 entry_price 验证"},{"id":"5.3","label":"网格八项必填校验","kind":"case","ui":"direction 非法 / 区间下限缺失 / 区间上限缺失 / 上限 ≤ 下限 / 网格数 < 2 / 每格手数 ≤ 0 / 模式非法 / 方向非法，各自 400","be":"trading_api 第 3 步","test":"逐项置空/置非法值各打一次接口，核对文案"},{"id":"5.4","label":"策略 / 分组创建与绑定","kind":"case","ui":"400「创建策略失败：…」/「更新网格策略失败：…」/「创建分组失败：…」/「绑定策略失败：…」","be":"命名规则 {strategy_type}-{username}-{login}-{symbol}，同品种不同策略类型互不污染","test":"同一用户两个不同品种应生成两组独立 group+strategy"},{"id":"5.5","label":"趋势方向推导与异常","kind":"case","ui":"400「无法获取主节点当前报价，请稍后再试」/「趋势策略必须填写止损价」/「入场价与止损价相同，无法判断方向」","be":"市价 ref=mid、限价 ref=entry_price；ref > sl → BUY，ref < sl → SELL","test":"入场价与止损价填相同值 → 应报「无法判断方向」而非静默成单"}]},{"id":"6","label":"⑥ 信号处理通用流程","kind":"group","children":[{"id":"6.1","label":"解析与校验失败","kind":"case","ui":"400「cannot parse signal」（并记录 rejected）/ 400「invalid signal: <原因>」","be":"parser.parse / parser.validate_signal","test":"字段类型异常时的报错可读性"},{"id":"6.2","label":"定向字段校验","kind":"case","ui":"400（分组/模版/节点定向非法）","be":"webhook._validate_targeting","test":"普通用户点名他人分组 → 404「分组不存在」"},{"id":"6.3","label":"5 秒幂等去重","kind":"case","ui":"返回 duplicate，前端提示「重复信号被抑制」","be":"指纹 = model:action:symbol:volume:sl:tp:template_ids:group_ids:node_ids","test":"仅改 node_ids 的信号应视为不同信号，不被误判重复"},{"id":"6.4","label":"引擎选择","kind":"case","ui":"503「service not ready」（分发器未就绪）","be":"model=strategy → group_dispatcher；normal → dispatcher","test":"交易页固定走 strategy 模型"},{"id":"6.5","label":"操作审计留痕","kind":"case","ui":"交易页触发会写入操作审计（category=console，action=quick_trigger / manual_signal）","be":"persist.audit","test":"在【操作审计】页应能查到本次触发记录与结果状态"}]},{"id":"7","label":"⑦ 分发引擎（group_dispatcher）","kind":"group","children":[{"id":"7.1","label":"CLOSE 分支","kind":"case","ui":"无匹配活动子任务 → rejected「无匹配任务：…」","be":"CLOSE 只终止分组内进行中的策略任务，不做账户级全平","test":"分组无任务时发 CLOSE 应被明确拒绝"},{"id":"7.2","label":"候选分组筛选（8 条落选原因）","kind":"case","ui":"指定的分组不存在 / 分组已禁用 / 未绑定策略 / 绑定的策略不存在 / 绑定策略已禁用 / 模版定向不符 / 策略品种与信号品种不符 / 准入不通过","be":"品种匹配容忍 XAUUSD / XAUUSDm 前缀差异","test":"策略绑 EURUSD 却发 XAUUSD 信号 → 应在分发前被拦，不下发节点"},{"id":"7.3","label":"规则启用态准入","kind":"case","ui":"「策略没有启用中的规则」/「网格策略没有启用中的网格规则」/「趋势策略没有启用中的以损定量规则」","be":"group_rules.no_active_rule_reason","test":"把策略规则全部停用后触发 → 应命中这条"},{"id":"7.4","label":"以损定量准入","kind":"case","ui":"缺 sl / 风险金额 ≤ 0 / 限价缺入场价 / BUY 且入场价 ≤ 止损 / SELL 且入场价 ≥ 止损","be":"group_rules._reject_risk_sized","test":"限价 BUY 但入场价低于止损 → 明确提示「需高于止损价」"},{"id":"7.5","label":"网格准入","kind":"case","ui":"区间非法 / 每格手数 ≤ 0 / 总手数上限 < 每格手数 / 只做多不收 SELL / 只做空不收 BUY","be":"group_rules._reject_grid","test":"网格只做多却发 SELL → 分发前拦截"},{"id":"7.6","label":"无匹配分组 → 整体拒收","kind":"case","ui":"rejected，前端红框显示「无匹配分组：<逐条原因>」","be":"dispatch 返回 mode=rejected，targets=0","test":"所有候选都被拒时，提示应列出全部原因而非第一条"},{"id":"7.7","label":"建任务后的分组级跳过","kind":"case","ui":"task skipped：分组已禁用 / 分组无成员节点 / 分组无有效节点（成员均未启用或不在线）；主任务创建失败 → failed","be":"group_rules.group_skip_reason","test":"把主节点下线后触发 → 任务状态应为 skipped 而非 failed"},{"id":"7.8","label":"带单与节点定向收窄","kind":"case","ui":"有跟单成员 + 带单员仍有能力 → owner 成员 + 跟单成员；带单员被撤销能力 → 退回 owner 成员；管理员名下分组（owner 为空）→ 不可带单","be":"group_dispatcher._effective_with_follows","test":"撤销带单员能力后，跟单节点应不再收到新信号，但已在跑的任务继续跑"},{"id":"7.9","label":"逐节点下发四态","kind":"case","ui":"sent 成功 / skipped 节点忙（分组内已有进行中子任务）/ skipped 趋势风控拦截 / offline 下发失败","be":"趋势风控文案：「趋势风控：信号 BUY，当前趋势为<多/空/震荡/数据不足>（得分 ±x.x），已拦截」","test":"开启趋势风控分组后逆势信号 → 节点侧应被跳过，信号记录里带风控原因"},{"id":"7.10","label":"零下发汇总","kind":"case","ui":"任务 skipped，原因区分：全部被趋势风控拦截 / 全部节点忙 / 节点均不可用","be":"group_rules.summarize_no_target","test":"三种零下发场景各验一次汇总文案"}]},{"id":"8","label":"⑧ 底部四个详情 Tab","kind":"group","children":[{"id":"8.1","label":"当前持仓","kind":"case","ui":"无持仓 → 「暂无持仓」；有持仓按 ticket 倒序；桌面表格 / ≤640px 切卡片列表；方向标签 多(buy,红) / 空(sell,绿)，其它显示原值或「—」","be":"—","test":"桌面与手机两种宽度下布局都要验证；浮盈正负号与配色"},{"id":"8.2","label":"资产","kind":"case","ui":"净值 / 浮动盈亏 / 余额 / 已用保证金 / 可用保证金 / 杠杆 1:N；净值与浮盈带正负号；3 列 → ≤640px 2 列 → ≤420px 1 列","be":"AccountSnapshot 字段缺失时全部回落为 0","test":"快照缺字段时不应显示 NaN"},{"id":"8.3","label":"历史订单","kind":"case","ui":"加载中转圈 / 「暂无历史订单」/ 表格；状态着色：filled·success·done·executed=绿，pending·dispatched·queued=黄，rejected·failed·error·skipped=红","be":"GET /api/nodes/{id}/dispatches?page=&page_size=50","test":"每页 50 条，« ‹ › » 翻页；切换主节点自动回第 1 页；请求失败只留空态不弹错"},{"id":"8.4","label":"吸筹策略（运行中网格任务）","kind":"case","ui":"来源 = 名称以 grid- 开头的分组 → GET /api/groups/{id}/signals?status=active；每 5s 静默轮询，切走停轮询，分组数变化时重拉；节点名超过 2 个显示「A / B 等 N 节点」","be":"同一 signal_id 多节点下发合并为一个任务，持仓/挂单/盈亏按 dispatch 求和","test":"新建网格分组后本 Tab 应能拉到；轮询中显示「刷新中…」且不闪 loading"}]},{"id":"9","label":"⑨ 平仓 / 停止策略","kind":"group","children":[{"id":"9.1","label":"单笔持仓平仓","kind":"case","ui":"无主节点 → warning「主节点不存在」；缺 ticket → warning「该持仓缺少 ticket，无法平仓」；重复点击被忽略（按钮转圈禁用）；确认框取消则放弃","be":"POST /api/nodes/{id}/close（target=ticket）；节点离线 → 409","test":"平仓成功提示后应立即刷新快照；节点离线时的错误提示要能看出是离线"},{"id":"9.2","label":"平仓的连带影响","kind":"case","ui":"—","be":"平仓会连带停止该节点上同魔术号的策略任务，避免网格重新挂格","test":"网格运行中平掉某格持仓，观察是否被重新加仓"},{"id":"9.3","label":"停止吸筹任务","kind":"case","ui":"任务终态（done/failed/skipped）或无活跃 dispatch → 按钮禁用「该任务已结束」；确认框文案含品种、节点、节点数；结果提示「已下发停止 XAUUSD · 成功 N · 离线 M」","be":"POST /api/groups/{id}/dispatches/{did}/close（逐 dispatch 并发下发 strategy_stop）","test":"只停当前 task，同分组其它 task 不受影响；节点离线时应计入「离线」计数"}]},{"id":"10","label":"⑩ 权限与鉴权","kind":"group","children":[{"id":"10.1","label":"交易菜单权限","kind":"case","ui":"无 trading 菜单权限 → 菜单不出现 / 路由被拦","be":"require_menu(MENU_TRADING) → 403","test":"用无权限账号访问 /trading 与 /api/trading/quick-trigger"},{"id":"10.2","label":"普通用户信号模型限制","kind":"case","ui":"403「普通用户只能手动触发 strategy 信号」","be":"console_api._scope_to_own_groups","test":"普通用户只能发 strategy 模型"},{"id":"10.3","label":"分组归属收窄","kind":"case","ui":"404「分组不存在：…」（点名他人分组）/ 400「你还没有分组，无法手动触发信号」","be":"未点名分组则自动注入本人全部分组","test":"普通用户无任何分组时触发应报「你还没有分组」"},{"id":"10.4","label":"动作与手数约束","kind":"case","ui":"400「动作非法：…（应为 BUY / SELL / CLOSE）」/ 400「处理模型非法：…」/ 400「CLOSE 仅支持 strategy 模型…」/ 400「开仓信号必须填写手数」","be":"console_api._build_signal_payload","test":"四条约束各打一次接口核对文案"},{"id":"10.5","label":"分组写操作归属","kind":"case","ui":"404（非本人分组，操作者不是 owner）","be":"owned_group_or_404（停止任务、继承跟单节点）","test":"跨用户操作分组应 404 而不是 403（不泄露存在性）"}]}]};
+const LEAVES = [{"id":"1.1","path":"① 入口 / 主节点选取 › 无主节点 → 全页空态","ui":"只渲染「尚未设置主节点」+ 描述 + 【前往节点页】按钮；报价卡、底部三按钮、状态条、详情面板全部不渲染","be":"—","test":"把唯一节点 is_primary 置否 → 刷新交易页应只见空态；点击按钮跳到 /nodes"},{"id":"1.2","path":"① 入口 / 主节点选取 › 管理员主节点口径","ui":"仅认 owner_user_id == 当前管理员 且 is_primary && enabled；名下没有主节点就显示空态，不借用他人主节点","be":"与 node_service.set_primary / _clear_primary_for_owner 一致","test":"A 管理员名下节点为主、B 用户名下节点也为主 → 管理员交易页应显示空态而非借用 B"},{"id":"1.3","path":"① 入口 / 主节点选取 › 普通用户主节点口径","ui":"is_primary && enabled（后端 /api/nodes 已按 owner 过滤，客户端不再收紧）","be":"—","test":"普通用户多个主节点时取第一个；自己的主节点禁用后应回落空态"},{"id":"1.4","path":"① 入口 / 主节点选取 › 在线 / 离线双态","ui":"在线：状态条绿点「在线」；离线：灰点「离线」+ 底部三按钮 disabled + 黄色提示「主节点离线，无法触发」","be":"quick-trigger 再次校验：manager.is_node_online 不通过 → 400「主节点不在线」","test":"断开节点连接后：按钮置灰；强行点按 openDialog → warning「主节点不在线，无法触发」且弹窗不打开"},{"id":"1.5","path":"① 入口 / 主节点选取 › 轮询与快照容错","ui":"onMounted 拉节点列表 + 一次账户快照；此后每 5s 拉一次快照；失败静默忽略不弹错","be":"—","test":"让账户快照接口 500，交易页应保持可用、无数值抖动、无错误弹窗"},{"id":"2.1","path":"② 报价卡 / 品种选择 › 品种来源与排序","ui":"取 quotes 中 bid/ask/mid 任一 > 0 的品种 ∪ 持仓中的品种，去重转大写后按字母序；白名单为空","be":"—","test":"节点同时上报 EURUSD 报价 + XAUUSD 持仓 → 两个 chip 都在且已排序"},{"id":"2.2","path":"② 报价卡 / 品种选择 › 无任何报价","ui":"显示「主节点尚未上报任何品种报价」，不渲染品种切换 chips","be":"—","test":"节点上线但未上报品种 → 报价区显示该文案，页面其余部分正常"},{"id":"2.3","path":"② 报价卡 / 品种选择 › 当前品种消失 → 自动回退","ui":"watch(availableSymbols)：当前 symbol 不在列表内时自动切到第一个可用品种","be":"—","test":"选中 EURUSD 后节点撤掉该品种报价 → 界面应自动切到剩余第一个，不出现空白报价"},{"id":"2.4","path":"② 报价卡 / 品种选择 › 价格格式化","ui":"JPY 结尾 3 位小数、其它 5 位；0/undefined/NaN → 「—」；变动显示 ±xx.xx，正绿负红","be":"—","test":"USDJPY vs EURUSD 小数位；缺 mid 时中间价显示「—」"},{"id":"2.5","path":"② 报价卡 / 品种选择 › 品种持仓摘要卡","ui":"仅当该品种有持仓时显示「N 笔 · X 手」+ 浮盈（带正负号，0 记为不显示 +）","be":"—","test":"多品种持仓时切换 chip，摘要随品种联动"},{"id":"3.0","path":"③ 开仓弹窗（OrderDialog） › 实际可见字段（注意多处已注释隐藏）","ui":"分组 / 开仓品种 / 开仓手数 / 方向 / 止盈价 / 备注 / 手动重算 的输入框当前已被注释隐藏；市价=止损价+风险参数，限价=入场价+止损价+风险参数，网格=完整网格参数集","be":"—","test":"回归确认：这些字段确实不可见，且弹窗不会因缺手数而阻断（市价手数由 risk_amount 反算）"},{"id":"3.1","path":"③ 开仓弹窗（OrderDialog） › openDialog 前置与表单重置","ui":"无主节点或离线 → warning 且不打开；打开时重置 form（symbol=当前品种、volume=0.01、sl/tp/entry=0、direction=all、remark 空）","be":"预拉 GET /api/groups，按 {策略类型}-{用户名}-{MT5号}-{品种} 匹配 group_id；失败则 group_id=null","test":"连续开三个策略按钮，每次表单应完全重置，不残留上一次输入"},{"id":"3.2","path":"③ 开仓弹窗（OrderDialog） › 分组与策略加载（loadGroupAndStrategy）","ui":"先按 groupId 找分组 → 找不到按 groupName 找 → 还找不到则自动建组（主节点加入）；建组失败显示「自动创建分组失败」，触发按钮保持禁用","be":"POST /api/groups；首次触发会同时创建「分组 + 策略」","test":"同一 (类型,用户,登录号,品种) 第二次触发应复用分组与策略，不重复创建"},{"id":"3.3","path":"③ 开仓弹窗（OrderDialog） › 策略参数回填","ui":"分组已有 strategy_id → 从启用中的 type=3 规则回填 riskParams（风险金额/盈亏比/底仓占比/保本倍数），从 type=4 回填网格参数；无策略则用模版 tpl_2 / tpl_3 首条规则默认值","be":"GET /api/strategies/templates、GET /api/strategies","test":"改了风险参数后重开弹窗应保留；新建时默认值应为 100 / 2.5 / 30 / 0"},{"id":"3.4","path":"③ 开仓弹窗（OrderDialog） › 方向自动推导（derivedAction）","ui":"限价：入场价 > 止损 → BUY 多；< 止损 → SELL 空。市价：止损 < 当前 mid → BUY；止损 > mid → SELL。无法判定时触发按钮禁用，副标题提示「请填写入场价与止损价」/「请填写止损价并等待报价」","be":"—","test":"改止损价到 mid 上下两侧，按钮副标题应在 BUY 多 / SELL 空 之间切换"},{"id":"3.5","path":"③ 开仓弹窗（OrderDialog） › 趋势参数校验（validateRiskParams）","ui":"风险金额 > 0、盈亏比 ≥ 0、底仓占比 1~100、保本倍数 ≥ 0；不通过时弹窗底部红框显示原因","be":"—","test":"逐个置 0 / 101 / 负数，确认每条都给出对应中文提示且按钮禁用"},{"id":"3.6","path":"③ 开仓弹窗（OrderDialog） › 网格参数校验（validateGridParams）","ui":"区间下限 > 0、上限 > 下限、网格数量 2~200、模式 ∈ 等差/等比、方向 ∈ 只做多/只做空、每格手数 > 0","be":"—","test":"网格数量填 1 或 201、区间上下限填反，均应被拦"},{"id":"3.7","path":"③ 开仓弹窗（OrderDialog） › 网格试算（自动）","ui":"条件满足后 debounce 500ms 自动试算，8s 超时；试算中显示「试算中…」，结果回写网格数量与每格手数；无主节点显示「未设置主节点，无法自动试算」；条件不满足静默清空","be":"GET /api/nodes/{id}/grid_sizing（timeframe=M1、atr_mult=0.6、spacing=0）","test":"只做多时必须填止损价才触发试算；只做空时必须填止盈价"},{"id":"3.8","path":"③ 开仓弹窗（OrderDialog） › 网格试算失败降级","ui":"ready=false 或每格手数为 0 → 显示 warnings 首条或「该品种试算失败，可手动填写网格参数」；【↻ 重算】按钮可手动再试","be":"后端 409（行情读取失败）/ 400（品种代码非法）","test":"对不支持的品种试算 → 应给出提示且仍允许手动填网格数量后触发"},{"id":"3.9","path":"③ 开仓弹窗（OrderDialog） › 网格条件字段联动","ui":"方向切换会改变「止损价 / 止盈价」标签文案；「向上追踪」开启后才出现「最大平移格数」；「初始建仓」开关每次开弹窗强制复位为关","be":"—","test":"开向上追踪 → 出现最大平移格数行；关掉即消失"},{"id":"3.10","path":"③ 开仓弹窗（OrderDialog） › 带单开关（carry）","ui":"开 → 信号推给本分组全部节点（含跟单员）；关 → 只推主节点","be":"payload.node_ids = [主节点]，后端按 node_ids 收窄最终下发集合","test":"关闭带单后应只有主节点收到信号；同分组其它任务不受影响"},{"id":"3.11","path":"③ 开仓弹窗（OrderDialog） › 触发提交（市价 / 限价）","ui":"建或更新策略 → 限价额外打开限价监听（limit_watch_enabled + limit_watch_node_ids）→ 打开信号并发 → 继承跟单节点 → 发出信号","be":"POST/PATCH /api/strategies、PATCH /api/groups、POST /api/groups/{id}/adopt-followers","test":"限价触发后分组应自动开启限价监听；中间步骤失败只提示不阻断信号下发"},{"id":"3.12","path":"③ 开仓弹窗（OrderDialog） › 触发提交（网格）","ui":"建或更新 type=4 网格规则 → 打开信号并发 → 继承跟单节点 → 发出信号；顶层 action 由 grid_side 决定","be":"网格方向只做多 → action=BUY；只做空 → action=SELL","test":"只做空网格发单后节点侧应按 SELL 执行"},{"id":"3.13","path":"③ 开仓弹窗（OrderDialog） › 弹窗关闭与重开","ui":"X / 取消 → 关闭并清空错误；重开时试算结果与网格预填被清空","be":"—","test":"触发一次报错后关闭重开，不应残留上次的错误文案"},{"id":"4.1","path":"④ 前端提交与结果提示 › 策略复用路径（manual-signal）","ui":"accepted / duplicate → 关闭弹窗；rejected → 弹窗内红框显示 reason；网络异常 → 显示后端 detail","be":"POST /api/console/manual-signal（model=strategy，group_ids=[当前分组]）","test":"构造一个会被拒的场景（如分组禁用）确认红框文案可读"},{"id":"4.2","path":"④ 前端提交与结果提示 › 一键触发路径（quick-trigger）","ui":"accepted → 成功提示「X 个目标节点」；duplicate → 警告「重复信号被抑制（5 秒内已有相同信号）」；rejected → lastError 展示","be":"POST /api/trading/quick-trigger","test":"同一参数 5 秒内连点两次 → 第二次必须走 duplicate 分支"},{"id":"4.3","path":"④ 前端提交与结果提示 › 手数与空值兜底","ui":"手数未填 / 0 / NaN / 负数 → 强制 0.01；sl、tp ≤ 0 → 传 null；非网格模式 direction 传 null","be":"后端「开仓信号必须填写手数」","test":"清空手数提交，不应被后端拦截"},{"id":"4.4","path":"④ 前端提交与结果提示 › 结果文案分级","ui":"targets > 0 → success「已触发 BUY XAUUSD：命中 N 个分组，M 个节点任务开始执行」；targets = 0 → warning「已受理但未下发：命中 N 个分组（原因）」；其他 → info「已提交：status」","be":"后端返回 tasks[].reason 汇总","test":"分组内无有效节点时，提示应指出具体原因（成员未启用/不在线）"},{"id":"5.1","path":"⑤ 后端 quick-trigger 校验 › 主节点四道校验","ui":"400「主节点不存在或未启用」/ 403「主节点不属于当前用户」/ 400「主节点不在线」/ 400「主节点未绑定 MT5 登录号」","be":"trading_api.quick_trigger 第 1 步","test":"管理员触发他人主节点 → 403；主节点解绑 MT5 登录号 → 400"},{"id":"5.2","path":"⑤ 后端 quick-trigger 校验 › 限价必填入场价","ui":"400「限价开仓必须填写入场价」","be":"entry_price 缺失或 ≤ 0","test":"直接调接口不带 entry_price 验证"},{"id":"5.3","path":"⑤ 后端 quick-trigger 校验 › 网格八项必填校验","ui":"direction 非法 / 区间下限缺失 / 区间上限缺失 / 上限 ≤ 下限 / 网格数 < 2 / 每格手数 ≤ 0 / 模式非法 / 方向非法，各自 400","be":"trading_api 第 3 步","test":"逐项置空/置非法值各打一次接口，核对文案"},{"id":"5.4","path":"⑤ 后端 quick-trigger 校验 › 策略 / 分组创建与绑定","ui":"400「创建策略失败：…」/「更新网格策略失败：…」/「创建分组失败：…」/「绑定策略失败：…」","be":"命名规则 {strategy_type}-{username}-{login}-{symbol}，同品种不同策略类型互不污染","test":"同一用户两个不同品种应生成两组独立 group+strategy"},{"id":"5.5","path":"⑤ 后端 quick-trigger 校验 › 趋势方向推导与异常","ui":"400「无法获取主节点当前报价，请稍后再试」/「趋势策略必须填写止损价」/「入场价与止损价相同，无法判断方向」","be":"市价 ref=mid、限价 ref=entry_price；ref > sl → BUY，ref < sl → SELL","test":"入场价与止损价填相同值 → 应报「无法判断方向」而非静默成单"},{"id":"6.1","path":"⑥ 信号处理通用流程 › 解析与校验失败","ui":"400「cannot parse signal」（并记录 rejected）/ 400「invalid signal: <原因>」","be":"parser.parse / parser.validate_signal","test":"字段类型异常时的报错可读性"},{"id":"6.2","path":"⑥ 信号处理通用流程 › 定向字段校验","ui":"400（分组/模版/节点定向非法）","be":"webhook._validate_targeting","test":"普通用户点名他人分组 → 404「分组不存在」"},{"id":"6.3","path":"⑥ 信号处理通用流程 › 5 秒幂等去重","ui":"返回 duplicate，前端提示「重复信号被抑制」","be":"指纹 = model:action:symbol:volume:sl:tp:template_ids:group_ids:node_ids","test":"仅改 node_ids 的信号应视为不同信号，不被误判重复"},{"id":"6.4","path":"⑥ 信号处理通用流程 › 引擎选择","ui":"503「service not ready」（分发器未就绪）","be":"model=strategy → group_dispatcher；normal → dispatcher","test":"交易页固定走 strategy 模型"},{"id":"6.5","path":"⑥ 信号处理通用流程 › 操作审计留痕","ui":"交易页触发会写入操作审计（category=console，action=quick_trigger / manual_signal）","be":"persist.audit","test":"在【操作审计】页应能查到本次触发记录与结果状态"},{"id":"7.1","path":"⑦ 分发引擎（group_dispatcher） › CLOSE 分支","ui":"无匹配活动子任务 → rejected「无匹配任务：…」","be":"CLOSE 只终止分组内进行中的策略任务，不做账户级全平","test":"分组无任务时发 CLOSE 应被明确拒绝"},{"id":"7.2","path":"⑦ 分发引擎（group_dispatcher） › 候选分组筛选（8 条落选原因）","ui":"指定的分组不存在 / 分组已禁用 / 未绑定策略 / 绑定的策略不存在 / 绑定策略已禁用 / 模版定向不符 / 策略品种与信号品种不符 / 准入不通过","be":"品种匹配容忍 XAUUSD / XAUUSDm 前缀差异","test":"策略绑 EURUSD 却发 XAUUSD 信号 → 应在分发前被拦，不下发节点"},{"id":"7.3","path":"⑦ 分发引擎（group_dispatcher） › 规则启用态准入","ui":"「策略没有启用中的规则」/「网格策略没有启用中的网格规则」/「趋势策略没有启用中的以损定量规则」","be":"group_rules.no_active_rule_reason","test":"把策略规则全部停用后触发 → 应命中这条"},{"id":"7.4","path":"⑦ 分发引擎（group_dispatcher） › 以损定量准入","ui":"缺 sl / 风险金额 ≤ 0 / 限价缺入场价 / BUY 且入场价 ≤ 止损 / SELL 且入场价 ≥ 止损","be":"group_rules._reject_risk_sized","test":"限价 BUY 但入场价低于止损 → 明确提示「需高于止损价」"},{"id":"7.5","path":"⑦ 分发引擎（group_dispatcher） › 网格准入","ui":"区间非法 / 每格手数 ≤ 0 / 总手数上限 < 每格手数 / 只做多不收 SELL / 只做空不收 BUY","be":"group_rules._reject_grid","test":"网格只做多却发 SELL → 分发前拦截"},{"id":"7.6","path":"⑦ 分发引擎（group_dispatcher） › 无匹配分组 → 整体拒收","ui":"rejected，前端红框显示「无匹配分组：<逐条原因>」","be":"dispatch 返回 mode=rejected，targets=0","test":"所有候选都被拒时，提示应列出全部原因而非第一条"},{"id":"7.7","path":"⑦ 分发引擎（group_dispatcher） › 建任务后的分组级跳过","ui":"task skipped：分组已禁用 / 分组无成员节点 / 分组无有效节点（成员均未启用或不在线）；主任务创建失败 → failed","be":"group_rules.group_skip_reason","test":"把主节点下线后触发 → 任务状态应为 skipped 而非 failed"},{"id":"7.8","path":"⑦ 分发引擎（group_dispatcher） › 带单与节点定向收窄","ui":"有跟单成员 + 带单员仍有能力 → owner 成员 + 跟单成员；带单员被撤销能力 → 退回 owner 成员；管理员名下分组（owner 为空）→ 不可带单","be":"group_dispatcher._effective_with_follows","test":"撤销带单员能力后，跟单节点应不再收到新信号，但已在跑的任务继续跑"},{"id":"7.9","path":"⑦ 分发引擎（group_dispatcher） › 逐节点下发四态","ui":"sent 成功 / skipped 节点忙（分组内已有进行中子任务）/ skipped 趋势风控拦截 / offline 下发失败","be":"趋势风控文案：「趋势风控：信号 BUY，当前趋势为<多/空/震荡/数据不足>（得分 ±x.x），已拦截」","test":"开启趋势风控分组后逆势信号 → 节点侧应被跳过，信号记录里带风控原因"},{"id":"7.10","path":"⑦ 分发引擎（group_dispatcher） › 零下发汇总","ui":"任务 skipped，原因区分：全部被趋势风控拦截 / 全部节点忙 / 节点均不可用","be":"group_rules.summarize_no_target","test":"三种零下发场景各验一次汇总文案"},{"id":"8.1","path":"⑧ 底部四个详情 Tab › 当前持仓","ui":"无持仓 → 「暂无持仓」；有持仓按 ticket 倒序；桌面表格 / ≤640px 切卡片列表；方向标签 多(buy,红) / 空(sell,绿)，其它显示原值或「—」","be":"—","test":"桌面与手机两种宽度下布局都要验证；浮盈正负号与配色"},{"id":"8.2","path":"⑧ 底部四个详情 Tab › 资产","ui":"净值 / 浮动盈亏 / 余额 / 已用保证金 / 可用保证金 / 杠杆 1:N；净值与浮盈带正负号；3 列 → ≤640px 2 列 → ≤420px 1 列","be":"AccountSnapshot 字段缺失时全部回落为 0","test":"快照缺字段时不应显示 NaN"},{"id":"8.3","path":"⑧ 底部四个详情 Tab › 历史订单","ui":"加载中转圈 / 「暂无历史订单」/ 表格；状态着色：filled·success·done·executed=绿，pending·dispatched·queued=黄，rejected·failed·error·skipped=红","be":"GET /api/nodes/{id}/dispatches?page=&page_size=50","test":"每页 50 条，« ‹ › » 翻页；切换主节点自动回第 1 页；请求失败只留空态不弹错"},{"id":"8.4","path":"⑧ 底部四个详情 Tab › 吸筹策略（运行中网格任务）","ui":"来源 = 名称以 grid- 开头的分组 → GET /api/groups/{id}/signals?status=active；每 5s 静默轮询，切走停轮询，分组数变化时重拉；节点名超过 2 个显示「A / B 等 N 节点」","be":"同一 signal_id 多节点下发合并为一个任务，持仓/挂单/盈亏按 dispatch 求和","test":"新建网格分组后本 Tab 应能拉到；轮询中显示「刷新中…」且不闪 loading"},{"id":"9.1","path":"⑨ 平仓 / 停止策略 › 单笔持仓平仓","ui":"无主节点 → warning「主节点不存在」；缺 ticket → warning「该持仓缺少 ticket，无法平仓」；重复点击被忽略（按钮转圈禁用）；确认框取消则放弃","be":"POST /api/nodes/{id}/close（target=ticket）；节点离线 → 409","test":"平仓成功提示后应立即刷新快照；节点离线时的错误提示要能看出是离线"},{"id":"9.2","path":"⑨ 平仓 / 停止策略 › 平仓的连带影响","ui":"—","be":"平仓会连带停止该节点上同魔术号的策略任务，避免网格重新挂格","test":"网格运行中平掉某格持仓，观察是否被重新加仓"},{"id":"9.3","path":"⑨ 平仓 / 停止策略 › 停止吸筹任务","ui":"任务终态（done/failed/skipped）或无活跃 dispatch → 按钮禁用「该任务已结束」；确认框文案含品种、节点、节点数；结果提示「已下发停止 XAUUSD · 成功 N · 离线 M」","be":"POST /api/groups/{id}/dispatches/{did}/close（逐 dispatch 并发下发 strategy_stop）","test":"只停当前 task，同分组其它 task 不受影响；节点离线时应计入「离线」计数"},{"id":"10.1","path":"⑩ 权限与鉴权 › 交易菜单权限","ui":"无 trading 菜单权限 → 菜单不出现 / 路由被拦","be":"require_menu(MENU_TRADING) → 403","test":"用无权限账号访问 /trading 与 /api/trading/quick-trigger"},{"id":"10.2","path":"⑩ 权限与鉴权 › 普通用户信号模型限制","ui":"403「普通用户只能手动触发 strategy 信号」","be":"console_api._scope_to_own_groups","test":"普通用户只能发 strategy 模型"},{"id":"10.3","path":"⑩ 权限与鉴权 › 分组归属收窄","ui":"404「分组不存在：…」（点名他人分组）/ 400「你还没有分组，无法手动触发信号」","be":"未点名分组则自动注入本人全部分组","test":"普通用户无任何分组时触发应报「你还没有分组」"},{"id":"10.4","path":"⑩ 权限与鉴权 › 动作与手数约束","ui":"400「动作非法：…（应为 BUY / SELL / CLOSE）」/ 400「处理模型非法：…」/ 400「CLOSE 仅支持 strategy 模型…」/ 400「开仓信号必须填写手数」","be":"console_api._build_signal_payload","test":"四条约束各打一次接口核对文案"},{"id":"10.5","path":"⑩ 权限与鉴权 › 分组写操作归属","ui":"404（非本人分组，操作者不是 owner）","be":"owned_group_or_404（停止任务、继承跟单节点）","test":"跨用户操作分组应 404 而不是 403（不泄露存在性）"}];
+
+const NW = 232, NH = 30, GX = 52, GY = 10;
+const nodes = [];
+let cursor = 0;
+function assign(n, depth) {
+  const x = depth * (NW + GX);
+  if (!n.children || !n.children.length) {
+    nodes.push({ ...n, x, y: cursor, depth });
+    cursor += NH + GY;
+    return;
+  }
+  const ys = n.children.map((c) => { assign(c, depth + 1); return nodes.find((q) => q.id === c.id).y; });
+  nodes.push({ ...n, x, y: (ys[0] + ys[ys.length - 1]) / 2, depth });
+}
+assign(TREE, 0);
+const W = Math.max(...nodes.map((n) => n.x)) + NW + 24;
+const H = Math.max(...nodes.map((n) => n.y)) + NH + 24;
+
+const byId = {};
+nodes.forEach((n) => (byId[n.id] = n));
+const collapsed = new Set();
+let selected = "root";
+
+function visibleList() {
+  const hidden = new Set();
+  (function walk(n) {
+    if (collapsed.has(n.id)) {
+      hidden.add(n.id);
+      (n.children || []).forEach(walk);
+      return;
+    }
+    (n.children || []).forEach(walk);
+  })(TREE);
+  return nodes.filter((n) => !hidden.has(n.id));
+}
+
+const mapEl = document.getElementById("map");
+const detailEl = document.getElementById("detail");
+
+function escapeHtml(s) {
+  return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function draw() {
+  const vis = visibleList();
+  const visIds = new Set(vis.map((v) => v.id));
+  let edges = "";
+  for (const n of vis) {
+    for (const c of n.children || []) {
+      if (!visIds.has(c.id)) continue;
+      const cc = byId[c.id];
+      const x1 = n.x + NW, y1 = n.y + NH / 2, x2 = cc.x, y2 = cc.y + NH / 2;
+      const dx = Math.max(18, (x2 - x1) / 2);
+      edges += '<path d="M ' + x1 + ' ' + y1 + ' C ' + (x1 + dx) + ' ' + y1 + ', ' + (x2 - dx) + ' ' + y2 + ', ' + x2 + ' ' + y2 +
+        '" fill="none" stroke="var(--stroke-2)" stroke-width="1"/>';
+    }
+  }
+  let html = '<svg width="' + W + '" height="' + H + '" style="position:absolute;left:0;top:0;pointer-events:none">' + edges + "</svg>";
+  for (const n of vis) {
+    const kids = (n.children || []).length > 0;
+    const cls = "node" + (n.depth === 1 ? " l1" : "") + (n.kind === "case" ? " case" : "") + (n.id === selected ? " sel" : "");
+    const t = kids ? '<span class="toggle" data-t="' + n.id + '">' + (collapsed.has(n.id) ? "+" : "−") + "</span>" : "";
+    html += '<div class="' + cls + '" style="left:' + n.x + "px;top:" + n.y + 'px;width:' + NW + 'px" data-n="' + n.id + '">' +
+      t + "<span>" + escapeHtml(n.label) + "</span></div>";
+  }
+  mapEl.style.height = H + "px";
+  mapEl.innerHTML = html;
+  drawDetail();
+}
+
+function drawDetail() {
+  const n = byId[selected];
+  if (!n) { detailEl.innerHTML = ""; return; }
+  let h = "<h3>" + escapeHtml(n.label) + "</h3>";
+  if (n.ui || n.be || n.test) {
+    h += "<dl>";
+    if (n.ui) h += "<dt>界面表现</dt><dd>" + escapeHtml(n.ui) + "</dd>";
+    if (n.be) h += "<dt>后端行为</dt><dd>" + escapeHtml(n.be) + "</dd>";
+    if (n.test) h += "<dt>测试要点</dt><dd>" + escapeHtml(n.test) + "</dd>";
+    h += "</dl>";
+  } else {
+    h += '<p style="margin:0;color:var(--text-3);font-size:13px">这是结构分组节点，请选择具体的分支。</p>';
+  }
+  detailEl.innerHTML = h;
+}
+
+mapEl.addEventListener("click", (e) => {
+  const tg = e.target.closest("[data-t]");
+  if (tg) {
+    const id = tg.getAttribute("data-t");
+    collapsed.has(id) ? collapsed.delete(id) : collapsed.add(id);
+    draw();
+    return;
+  }
+  const nd = e.target.closest("[data-n]");
+  if (nd) { selected = nd.getAttribute("data-n"); draw(); }
+});
+
+const done = new Set();
+const tbody = document.getElementById("tbody");
+function drawList() {
+  let h = "";
+  for (const l of LEAVES) {
+    const ok = done.has(l.id);
+    h += '<tr class="' + (ok ? "done" : "") + '"><td class="n">' + escapeHtml(l.id) + "</td><td>" + escapeHtml(l.path) +
+      "</td><td>" + escapeHtml(l.ui || "—") + "</td><td>" + escapeHtml(l.be || "—") + "</td><td>" + escapeHtml(l.test || "—") +
+      '</td><td><button class="chk' + (ok ? " on" : "") + '" data-c="' + l.id + '">' + (ok ? "已测" : "未测") + "</button></td></tr>";
+  }
+  tbody.innerHTML = h;
+  document.getElementById("prog").textContent = done.size + " / " + LEAVES.length;
+}
+tbody.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-c]");
+  if (!b) return;
+  const id = b.getAttribute("data-c");
+  done.has(id) ? done.delete(id) : done.add(id);
+  drawList();
+});
+document.getElementById("clear").addEventListener("click", () => { done.clear(); drawList(); });
+
+document.querySelectorAll(".tab[data-v]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".tab[data-v]").forEach((b) => b.classList.toggle("on", b === btn));
+    const v = btn.getAttribute("data-v");
+    document.getElementById("v-map").classList.toggle("hide", v !== "map");
+    document.getElementById("v-list").classList.toggle("hide", v !== "list");
+  });
+});
+
+(function () {
+  let out = "";
+  (function walk(n, prefix, last, isRoot) {
+    out += isRoot ? n.label : prefix + (last ? "└─ " : "├─ ") + n.label + "\n";
+    const kids = n.children || [];
+    const cp = isRoot ? "" : prefix + (last ? "   " : "│  ");
+    kids.forEach((c, i) => walk(c, cp, i === kids.length - 1, false));
+  })(TREE, "", true, true);
+  document.getElementById("tree").textContent = out;
+})();
+
+draw();
+drawList();
+</script>
+</body>
+</html>
