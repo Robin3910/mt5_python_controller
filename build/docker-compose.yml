@@ -9,7 +9,8 @@
 # 前置条件：
 #   1. 安装 Docker Desktop（建议使用 WSL2 后端）。
 #   2. 复制并按需修改环境变量：copy .env.example .env
-#      （前端会在 docker compose build 时自动 npm ci && npm run build）
+#      （前端会在 docker compose build 时自动 npm ci && npm run build；
+#       VITE_API_BASE 从本目录 .env 打进静态资源，留空则走同源）
 #
 # 启动 / 运维（在 build/ 目录下，或从仓库根目录加 -f build/docker-compose.yml）：
 #   docker compose up -d --build
@@ -90,6 +91,8 @@ services:
     build:
       context: ..
       dockerfile: deploy/nginx/Dockerfile
+      args:
+        VITE_API_BASE: ${VITE_API_BASE:-}
     ports:
       - "${HTTP_PORT:-80}:80"
       - "${HTTPS_PORT:-443}:443"
