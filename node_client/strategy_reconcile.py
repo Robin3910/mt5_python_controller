@@ -92,48 +92,167 @@ def _pl_cfg(rule: dict) -> dict:
     return cfg if isinstance(cfg, dict) else {}
 
 
-def _pl_ratio_field(old_rule: dict, new_rule: dict) -> Optional[dict]:
-    """信号盈亏比的变更结论。"""
+def _pl_tiers_cfg(rule: dict) -> dict:
+    cfg = (rule or {}).get(PL_TIERS_FIELD)
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _pl_ratio_fields(old_rule: dict, new_rule: dict) -> list[dict]:
+    """信号盈亏比的变更结论（逐字段）。
+
+    早期版本在这里提前 return：同时改开关 + 比例 + 次数时只报一条，
+    客户看不到另外两个字段的结论。这里改成返回列表，逐字段都给说法。
+    """
     old_cfg = _pl_cfg(old_rule)
     new_cfg = _pl_cfg(new_rule)
-    ratio_changed = _changed(old_cfg.get("ratio"), new_cfg.get("ratio"))
+    out: list[dict] = []
+
+    old_enabled = bool(old_cfg.get("enabled"))
+    new_enabled = bool(new_cfg.get("enabled"))
+    if old_enabled != new_enabled:
+        if new_enabled:
+            out.append({
+                "field": f"rules[{PL_RATIO_FIELD}].enabled",
+                "status": "applied",
+                "old": old_enabled,
+                "new": new_enabled,
+                "message": "信号盈亏比已启用；下一拍按新比例重算共同止损",
+            })
+        else:
+            out.append({
+                "field": f"rules[{PL_RATIO_FIELD}].enabled",
+                "status": "applied",
+                "old": old_enabled,
+                "new": new_enabled,
+                "message": (
+                    "信号盈亏比已关闭；已有持仓上的止损价保持不变（不会自动摘除）"
+                ),
+            })
+
     old_mode = str(old_cfg.get("monitor_mode") or "loop")
     new_mode = str(new_cfg.get("monitor_mode") or "loop")
     old_times = _as_int(old_cfg.get("max_times"), 0)
     new_times = _as_int(new_cfg.get("max_times"), 0)
     times_changed = old_times != new_times
 
-    if times_changed and new_mode == MONITOR_TIMES:
-        if old_mode == MONITOR_TIMES and new_times > old_times:
-            message = (
-                f"信号盈亏比次数上限从 {old_times} 次调大到 {new_times} 次；"
-                f"本任务已消耗的次数不复活，剩余次数按新上限顺延"
-            )
+    if times_changed:
+        if new_mode == MONITOR_TIMES:
+            if old_mode == MONITOR_TIMES and new_times > old_times:
+                message = (
+                    f"信号盈亏比次数上限从 {old_times} 次调大到 {new_times} 次；"
+                    f"本任务已消耗的次数不复活，剩余次数按新上限顺延"
+                )
+            else:
+                message = (
+                    f"信号盈亏比次数上限从 {old_times} 次调整为 {new_times} 次；"
+                    f"本任务已消耗的次数不复活"
+                )
         else:
             message = (
-                f"信号盈亏比次数上限从 {old_times} 次调整为 {new_times} 次；"
-                f"本任务已消耗的次数不复活"
+                f"信号盈亏比次数上限从 {old_times} 次调整为 {new_times} 次"
             )
-        return {
-            "field": "rules[float_pl_ratio].max_times",
+        out.append({
+            "field": f"rules[{PL_RATIO_FIELD}].max_times",
             "status": "applied",
             "old": old_times,
             "new": new_times,
             "message": message,
-        }
+        })
 
-    if ratio_changed:
-        return {
-            "field": "rules[float_pl_ratio].ratio",
+    old_ratio = old_cfg.get("ratio")
+    new_ratio = new_cfg.get("ratio")
+    if _changed(old_ratio, new_ratio):
+        out.append({
+            "field": f"rules[{PL_RATIO_FIELD}].ratio",
             "status": "applied",
-            "old": old_cfg.get("ratio"),
-            "new": new_cfg.get("ratio"),
+            "old": old_ratio,
+            "new": new_ratio,
             "message": (
-                f"信号盈亏比阈值从 {old_cfg.get('ratio')} 调整为 "
-                f"{new_cfg.get('ratio')}；下一拍改单生效"
+                f"信号盈亏比阈值从 {old_ratio} 调整为 {new_ratio}；"
+                f"下一拍按新比例重算共同止损"
             ),
-        }
-    return None
+        })
+    return out
+
+
+def _pl_tiers_fields(old_rule: dict, new_rule: dict) -> list[dict]:
+    """信号分档手数盈亏的变更结论（逐字段）。
+
+    批次 1 的盈亏金额是**真正生效**的那个；批次 2+ 当前节点不参与共同止盈
+    计算，这里如实标注，免得客户以为改了就能用。
+    """
+    old_cfg = _pl_tiers_cfg(old_rule)
+    new_cfg = _pl_tiers_cfg(new_rule)
+    out: list[dict] = []
+
+    old_enabled = bool(old_cfg.get("enabled"))
+    new_enabled = bool(new_cfg.get("enabled"))
+    if old_enabled != new_enabled:
+        if new_enabled:
+            out.append({
+                "field": f"rules[{PL_TIERS_FIELD}].enabled",
+                "status": "applied",
+                "old": old_enabled,
+                "new": new_enabled,
+                "message": "分档手数盈亏已启用；下一拍按批次1金额重算共同止盈",
+            })
+        else:
+            out.append({
+                "field": f"rules[{PL_TIERS_FIELD}].enabled",
+                "status": "applied",
+                "old": old_enabled,
+                "new": new_enabled,
+                "message": (
+                    "分档手数盈亏已关闭；已有持仓上的止盈价保持不变（不会自动摘除）"
+                ),
+            })
+
+    old_action = str(old_cfg.get("close_action") or "all")
+    new_action = str(new_cfg.get("close_action") or "all")
+    if _changed(old_action, new_action):
+        out.append({
+            "field": f"rules[{PL_TIERS_FIELD}].close_action",
+            "status": "applied",
+            "old": old_action,
+            "new": new_action,
+            "message": (
+                f"分档手数盈亏的平仓方向从 {old_action} 调整为 {new_action}；"
+                f"下一拍按新方向改写止盈"
+            ),
+        })
+
+    old_tiers = [t for t in (old_cfg.get("tiers") or []) if isinstance(t, dict)]
+    new_tiers = [t for t in (new_cfg.get("tiers") or []) if isinstance(t, dict)]
+    for idx, new_tier in enumerate(new_tiers):
+        old_tier = old_tiers[idx] if idx < len(old_tiers) else {}
+        if _changed(old_tier.get("min_lot"), new_tier.get("min_lot")):
+            out.append({
+                "field": f"rules[{PL_TIERS_FIELD}].tiers[{idx}].min_lot",
+                "status": "applied",
+                "old": old_tier.get("min_lot"),
+                "new": new_tier.get("min_lot"),
+                "message": (
+                    f"批次{idx + 1}的总手数门槛从 {old_tier.get('min_lot')} 调整为 "
+                    f"{new_tier.get('min_lot')}；影响该方向达到多少手数才写止盈"
+                ),
+            })
+        if _changed(old_tier.get("pl_amount"), new_tier.get("pl_amount")):
+            message = (
+                f"批次{idx + 1}的盈亏金额从 {old_tier.get('pl_amount')} 调整为 "
+                f"{new_tier.get('pl_amount')}"
+            )
+            if idx == 0:
+                message += "；这是实际生效的共同止盈金额，下一拍重算止盈价"
+            else:
+                message += "；当前版本只有批次1参与共同止盈计算，该批次暂不生效"
+            out.append({
+                "field": f"rules[{PL_TIERS_FIELD}].tiers[{idx}].pl_amount",
+                "status": "applied",
+                "old": old_tier.get("pl_amount"),
+                "new": new_tier.get("pl_amount"),
+                "message": message,
+            })
+    return out
 
 
 def reconcile_rules(
@@ -167,6 +286,8 @@ def reconcile_rules(
     new_by_type = {_rule_type(r): r for r in new_list}
 
     effective: list[dict] = []
+    # 盈亏配置在逆势 / 顺势两条规则上是同一份，字段级结论只报一次
+    seen_pl: set[str] = set()
 
     for rule_type, new_rule in new_by_type.items():
         old_rule = old_by_type.get(rule_type)
@@ -253,8 +374,14 @@ def reconcile_rules(
 
         # 信号级盈亏控制：次数型监控在热推时沿用运行态已消耗的次数，
         # 这里只把「次数上限被调大」这件事说清楚，避免用户以为次数被复活了。
-        pl_field = _pl_ratio_field(old_rule, new_rule)
-        if pl_field is not None:
+        # 盈亏配置写在逆势 / 顺势两条规则上的是同一份，去重后只报一次。
+        pl_fields = _pl_ratio_fields(old_rule, new_rule)
+        pl_fields.extend(_pl_tiers_fields(old_rule, new_rule))
+        for pl_field in pl_fields:
+            key = str(pl_field.get("field") or "")
+            if key in seen_pl:
+                continue
+            seen_pl.add(key)
             out.append(pl_field)
 
         effective.append(applied_rule)

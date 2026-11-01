@@ -410,3 +410,114 @@ async def test_send_update_ack_emits_payload():
     assert data["config_version"] == 3
     assert data["result"] == "partial"
     assert data["fields"][0]["status"] == "locked"
+
+
+# ----------------------------------------------------------------------
+# 信号盈亏控制：逐字段结论 + 去重
+# ----------------------------------------------------------------------
+def _pl_rule(**over) -> dict:
+    rule = _rule(1, float_pl_ratio={
+        "enabled": True, "ratio": -20.0, "monitor_mode": "loop", "max_times": 2,
+    }, lot_pl_tiers={
+        "enabled": True, "batch_count": 2, "close_action": "all",
+        "tiers": [
+            {"min_lot": 0.1, "pl_amount": 50.0},
+            {"min_lot": 0.5, "pl_amount": 100.0},
+        ],
+    })
+    rule.update(over)
+    return rule
+
+
+def _pl_fields(fields: list, field: str) -> list[dict]:
+    return [f for f in fields if f["field"] == field]
+
+
+def test_pl_tiers_batch1_amount_reports_field():
+    """批次1的盈亏金额是实际生效的那个，必须出现在回执里。"""
+    old = _snap([_pl_rule()])
+    new = _snap([_pl_rule(lot_pl_tiers={
+        "enabled": True, "batch_count": 2, "close_action": "all",
+        "tiers": [
+            {"min_lot": 0.1, "pl_amount": 80.0},
+            {"min_lot": 0.5, "pl_amount": 100.0},
+        ],
+    })])
+    fields, _effective = sr.reconcile_snapshot(old, new)
+    got = _pl_fields(fields, "rules[lot_pl_tiers].tiers[0].pl_amount")
+    assert len(got) == 1
+    assert got[0]["status"] == "applied"
+    assert got[0]["old"] == 50.0
+    assert got[0]["new"] == 80.0
+    assert "实际生效" in got[0]["message"]
+
+
+def test_pl_tiers_higher_batch_marks_not_effective():
+    """批次2+ 当前不参与共同止盈计算，要如实标注。"""
+    old = _snap([_pl_rule()])
+    new = _snap([_pl_rule(lot_pl_tiers={
+        "enabled": True, "batch_count": 2, "close_action": "all",
+        "tiers": [
+            {"min_lot": 0.1, "pl_amount": 50.0},
+            {"min_lot": 0.5, "pl_amount": 300.0},
+        ],
+    })])
+    fields, _effective = sr.reconcile_snapshot(old, new)
+    got = _pl_fields(fields, "rules[lot_pl_tiers].tiers[1].pl_amount")
+    assert len(got) == 1
+    assert "暂不生效" in got[0]["message"]
+
+
+def test_pl_ratio_enabled_off_says_stop_kept():
+    """关开关要说清「不会自动摘除已有止损」。"""
+    old = _snap([_pl_rule()])
+    new = _snap([_pl_rule(float_pl_ratio={
+        "enabled": False, "ratio": -20.0, "monitor_mode": "loop", "max_times": 2,
+    })])
+    fields, _effective = sr.reconcile_snapshot(old, new)
+    got = _pl_fields(fields, "rules[float_pl_ratio].enabled")
+    assert len(got) == 1
+    assert "不会自动摘除" in got[0]["message"]
+
+
+def test_pl_multiple_fields_all_reported():
+    """同时改开关 + 比例 + 次数：三条都要出现（早期版本只报一条）。"""
+    old = _snap([_pl_rule(float_pl_ratio={
+        "enabled": False, "ratio": -20.0, "monitor_mode": "loop", "max_times": 2,
+    })])
+    new = _snap([_pl_rule(float_pl_ratio={
+        "enabled": True, "ratio": -30.0, "monitor_mode": "times", "max_times": 5,
+    })])
+    fields, _effective = sr.reconcile_snapshot(old, new)
+    assert len(_pl_fields(fields, "rules[float_pl_ratio].enabled")) == 1
+    assert len(_pl_fields(fields, "rules[float_pl_ratio].ratio")) == 1
+    assert len(_pl_fields(fields, "rules[float_pl_ratio].max_times")) == 1
+
+
+def test_pl_tiers_close_action_and_min_lot_reported():
+    old = _snap([_pl_rule()])
+    new = _snap([_pl_rule(lot_pl_tiers={
+        "enabled": True, "batch_count": 2, "close_action": "buy",
+        "tiers": [
+            {"min_lot": 0.2, "pl_amount": 50.0},
+            {"min_lot": 0.5, "pl_amount": 100.0},
+        ],
+    })])
+    fields, _effective = sr.reconcile_snapshot(old, new)
+    assert len(_pl_fields(fields, "rules[lot_pl_tiers].close_action")) == 1
+    assert len(_pl_fields(fields, "rules[lot_pl_tiers].tiers[0].min_lot")) == 1
+
+
+def test_pl_config_deduped_across_rules():
+    """逆势 / 顺势两条规则带同一份盈亏配置：回执只报一次。"""
+    old = _snap([_pl_rule(), _pl_rule(type=2)])
+    new = _snap([
+        _pl_rule(float_pl_ratio={
+            "enabled": True, "ratio": -40.0, "monitor_mode": "loop", "max_times": 2,
+        }),
+        _pl_rule(type=2, float_pl_ratio={
+            "enabled": True, "ratio": -40.0, "monitor_mode": "loop", "max_times": 2,
+        }),
+    ])
+    fields, _effective = sr.reconcile_snapshot(old, new)
+    assert len(_pl_fields(fields, "rules[float_pl_ratio].ratio")) == 1

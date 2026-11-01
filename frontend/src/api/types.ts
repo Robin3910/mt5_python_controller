@@ -905,6 +905,7 @@ export interface GroupTaskEventDetail {
     | 'account_risk'
     | 'close_reason'
     | 'manual_scatter'
+    | 'signal_pl'
     | 'strategy_update'
   // —— 加仓（kind=add）——
   rule_type?: number
@@ -960,6 +961,8 @@ export interface GroupTaskEventDetail {
   /** 手动分散仓（kind=manual_scatter） */
   target_pl?: number | null
   profit_per_lot?: number
+  /** 存量仓位到止盈时刻的预估盈亏：浮盈抵扣目标、浮亏补进目标 */
+  projected_pl?: number
   volume_locked?: boolean
   volume_step?: number
   comment?: string
@@ -1062,6 +1065,29 @@ export interface GroupTaskEventDetail {
   tier_index?: number
   min_lot?: number
   current_lot?: number
+  // —— 信号盈亏控制（kind=signal_pl）——
+  /** 批次1盈亏金额 */
+  amount?: number | null
+  /** 盈亏比折出的亏损金额 */
+  sl_amount?: number | null
+  /** 加权开仓价 */
+  weighted_open?: number | null
+  /** 现价 */
+  market?: number | null
+  /** 越价哪一侧：tp / sl */
+  crossed?: string | null
+  /**
+   * 本轮结论：written=新值已写入 / kept=越价被拒保留旧值 / crossed_closed=现价越价已平仓
+   */
+  status?: string
+  /** 保留旧值的是哪一侧：tp / sl */
+  kept_side?: string
+  /** 保留旧值的原因（人话） */
+  kept_reason?: string
+  /** 越价被拒时，本来要写的止损价 */
+  new_sl?: number | null
+  /** 越价被拒时，本来要写的止盈价 */
+  new_tp?: number | null
   // —— 网格 ——
   side?: string
   grid_side?: string

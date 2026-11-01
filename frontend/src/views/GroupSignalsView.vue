@@ -266,9 +266,19 @@ function reconstructManualScatterFormula(detail: GroupTaskEventDetail): string {
   const target = detail.target_pl
   const per = detail.profit_per_lot
   if (target != null && per != null && Number(per) > 0) {
-    const raw = Math.abs(Number(target)) / Number(per)
-    const lot = detail.current_lot == null ? '' : `；当前仓 ${detail.current_lot} 手命中该档`
-    return `手数 = 分档目标 ${target}u ÷ 每手止盈 ${per}u = ${Number(raw.toPrecision(4))}，向上取整 → ${vol ?? '—'}${lot}`
+    // 存量在止盈时刻的预估盈亏：浮盈抵扣目标、浮亏补进目标
+    const pl = Number(detail.projected_pl ?? 0)
+    const remaining = Math.abs(Number(target)) - pl
+    let head = `手数 = (分档目标 ${Math.abs(Number(target))}u`
+    if (pl < 0) head += ` + 存量仓位到止盈预估亏损 ${Math.abs(pl)}u)`
+    else if (pl > 0) head += ` - 存量仓位到止盈预估盈利 ${pl}u)`
+    else head += ')'
+    const lot = detail.current_lot == null ? '' : `；当前仓 ${detail.current_lot} 手`
+    if (remaining <= 0) {
+      return `${head} ÷ 每手止盈 ${per}u ≤ 0 → 按品种最小手数开 ${vol ?? '—'}${lot}`
+    }
+    const raw = remaining / Number(per)
+    return `${head} ÷ 每手止盈 ${per}u = ${Number(raw.toPrecision(4))}，向上取整 → ${vol ?? '—'}${lot}`
   }
   if (vol != null) return `手数 ${vol}`
   return ''
@@ -544,6 +554,7 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
     push('本次手数', detail.volume)
     push('当前仓手数', detail.current_lot)
     push('分档目标', detail.target_pl == null ? '' : `${detail.target_pl}u`)
+    push('存量到止盈预估盈亏', detail.projected_pl == null ? '' : `${detail.projected_pl}u`)
     push('每手止盈', detail.profit_per_lot == null || detail.profit_per_lot === 0 ? '' : `${detail.profit_per_lot}u`)
     push('手数步长', detail.volume_step)
     push('入场价', detail.entry_price)
@@ -552,6 +563,27 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
     push('止盈联动', detail.close_all_on_tp === undefined ? '' : (detail.close_all_on_tp ? '止盈后清仓该信号' : '关闭'))
     push('成交侧现价', detail.fill_price)
     push('注释', detail.comment)
+    push('错误', detail.error)
+    return rows
+  }
+  if (detail.kind === 'signal_pl') {
+    // 节点有两种形状都用这个 kind：共同止盈止损（lot_stops_detail）
+    // 与信号盈亏比触发（trigger_detail）。键不重叠，按存在与否显示。
+    push('方向', detail.side === 'BUY' ? '多单' : detail.side === 'SELL' ? '空单' : '')
+    push('结论', signalPlStatusLabel(detail.status))
+    push('共同止盈', detail.tp)
+    push('共同止损', detail.sl)
+    // 越价被拒时，被拒的新价单独列出来，让人看到「本来要写成多少」
+    if ((detail.status || '') === 'kept') {
+      push('未写入的止盈价', detail.new_tp)
+      push('未写入的止损价', detail.new_sl)
+    }
+    push('现价', detail.market)
+    push('总手数', detail.volume)
+    push('加权开仓价', detail.weighted_open)
+    push('批次1金额', detail.amount)
+    push('盈亏比亏损金额', detail.sl_amount)
+    push('说明', detail.kept_reason || detail.message_core)
     push('错误', detail.error)
     return rows
   }
@@ -624,6 +656,16 @@ function strategyUpdateResultLabel(result?: string | null): string {
     rejected: '❌ 被拒绝',
   }
   const key = String(result || '').toLowerCase()
+  return m[key] || (key ? key : '—')
+}
+
+function signalPlStatusLabel(status?: string | null): string {
+  const m: Record<string, string> = {
+    written: '✅ 新值已写入',
+    kept: '⚠️ 保留旧值',
+    crossed_closed: '🔒 现价越价已平仓',
+  }
+  const key = String(status || '').toLowerCase()
   return m[key] || (key ? key : '—')
 }
 
@@ -787,6 +829,7 @@ function eventTag(
     manual_off: { cls: '', text: '手动仓撤单' },
     manual_tp_align: { cls: 'blue', text: '止盈价同步' },
     manual_tp_close: { cls: 'blue', text: '止盈联动清仓' },
+    signal_pl: { cls: 'blue', text: '止盈止损' },
     grid_add: { cls: 'amber', text: '网格买入' },
     grid_shift: { cls: 'blue', text: '网格平移' },
     breakeven: { cls: 'blue', text: '保本' },

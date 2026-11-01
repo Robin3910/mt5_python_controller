@@ -374,7 +374,8 @@ const FIELD_HELP = {
   manual_scatter:
     '手动分散仓与分批加仓无关：本规则的分批加仓加满后，手动仓以「限价单」挂到券商，成交价正好是入场价。' +
     '手数在挂出那一刻就按存量仓位反推算死，之后行情怎么走都不重算：' +
-    '手数 =（分档第一档目标金额 + 存量仓位到止盈时刻的预估亏损）÷ 每手止盈。' +
+    '手数 =（分档第一档目标金额 − 存量仓位到止盈时刻的预估盈亏）÷ 每手止盈。' +
+    '存量浮盈要抵扣（少开手动仓），存量浮亏要补上（多开手动仓）；' +
     '存量在止盈时刻的盈亏由存量开仓价决定（历史事实），手动仓的盈利由固定入场价与止盈价决定，' +
     '所以价格走到止盈那一刻，本任务全部仓位的净额刚好等于第一档目标金额。' +
     '成交后手动仓的止盈价成为本魔术号所有仓位的止盈权威，其余仓位的止盈统一改到它。' +
@@ -391,6 +392,7 @@ const FIELD_HELP = {
   manual_volume:
     '0 = 挂单那一刻，用该魔术号当时已持有的手数去匹配分档手数盈亏，再按价差 × tick 反推；手数在挂出时算死。' +
     '只计已经开出的仓（首单、分批加仓、另一条规则已成交的手动单），不含本条尚未成交的手动分散仓。' +
+    '存量在止盈时刻浮盈会抵扣目标金额、浮亏会补进目标金额。' +
     '手改后锁定，不再自动重算。',
   manual_close_all_on_tp:
     '勾选后，这条手动单被券商按止盈价平掉时，节点会平掉该信号（同魔术号）其余全部持仓并结束任务。' +
@@ -528,10 +530,10 @@ const FIELD_HELP = {
   signal_pl:
     '止盈和止损都写到该信号的订单上，由券商到价平仓。不按浮盈抽样平仓。\n' +
     '开仓和加仓的市价单发出时就带上当时算出的价；成交价和预估有偏差时，下一拍再改单对齐。\n' +
-    '止损只在新开仓时重算；手动平仓不改其余单的止损。止盈在手数变化时重算。',
+    '止损在新开仓和「配置热推」后重算；报价波动不重算。止盈在手数变化时重算。',
   signal_float_pl:
     '用这个百分比的绝对值 × 当时账户余额，得到亏损金额，再反推共同止损价。\n' +
-    '-20 和 20 都表示亏损达到余额的 20% 时止损。只在新开一单时重算。',
+    '-20 和 20 都表示亏损达到余额的 20% 时止损。新开仓和热推改比例后都会重算。',
   signal_lot_pl:
     '只用批次1的盈亏金额绝对值反推共同止盈，不写止损。\n' +
     '该方向总手数达到批次1的「总 lot >=」才开始计算。更高批次不参与这个止盈价。',
@@ -1038,23 +1040,81 @@ function onLevelRangeChange(r: EditableRule, index: number): void {
 
 const BATCH_LEVEL_MAX = 50
 
-function addBatchLevel(r: EditableRule): void {
-  if (r.batch_levels.length >= BATCH_LEVEL_MAX) return
-  const nextCount = r.batch_levels.length + 1
-  const limit = Math.max(BATCH_POS_START, Math.floor(Number(r.total_lot_limit) || BATCH_POS_START))
-  const maxCount = limit - BATCH_POS_START + 1
-  if (nextCount > maxCount) {
-    r.total_lot_limit = BATCH_POS_START + nextCount - 1
-  }
-  r.batch_count = nextCount
-  rebuildBatchLevels(r, batchEditMode())
-}
-
+/**
+ * 删除档位：其余档位**不被重新均分**。
+ *
+ * 语义（shrink_limit）：
+ * - 被删档的区间整段丢弃；
+ * - 其余档位保持各自的**长度**，整体往前补位，首尾衔接、不留空洞；
+ * - 加仓笔数上限收紧到末档终点。
+ *
+ * 例：1~1 / 2~2 / 3~3 删中间 → 1~1 / 2~2（上限 3 → 2）。
+ * 第一批的「加仓次数」不会被改写成 1~2 之类的更大区间——
+ * 长度没变，只是后面的档位往前挪。
+ *
+ * 有在跑任务时沿用原有 append 行为：已开仓命中的档位区间不能动，
+ * 只在尾部追加 / 截断。
+ */
 function removeBatchLevel(r: EditableRule, index: number): void {
   if (r.batch_levels.length <= 1) return
   r.batch_levels.splice(index, 1)
   r.batch_count = r.batch_levels.length
-  rebuildBatchLevels(r, batchEditMode())
+  if (hasRunningTask.value) {
+    rebuildBatchLevels(r, 'append')
+    return
+  }
+  // 剩余档位按各自长度重排：从第 1 次加仓起首尾衔接，被删区间整段丢弃
+  let cursor = BATCH_POS_START
+  for (const lv of r.batch_levels) {
+    const len = Math.max(
+      1,
+      Math.floor(Number(lv.pos_to) || 0) - Math.floor(Number(lv.pos_from) || 0) + 1,
+    )
+    lv.pos_from = cursor
+    lv.pos_to = cursor + len - 1
+    cursor = lv.pos_to + 1
+  }
+  // 加仓笔数上限收紧到末档终点（被删的那一段直接从上限里扣掉）
+  const lastTo = r.batch_levels.length
+    ? r.batch_levels[r.batch_levels.length - 1].pos_to
+    : BATCH_POS_START
+  r.total_lot_limit = Math.max(BATCH_POS_START, lastTo)
+}
+
+/**
+ * 添加档位：已有档位**不被重新均分**，新档接在末尾。
+ *
+ * 原来这里走 redistribute（把 [1, 上限] 按新档位数重新均分），
+ * 结果「加一档」会把前面所有档位的加仓次数区间全部改掉——
+ * 和删除档位是同一个问题。这里改为尾部追加：
+ * 新档占用末档之后的加仓次数，末档没铺满上限时新档顺带吃掉剩下的空段。
+ */
+function addBatchLevel(r: EditableRule): void {
+  if (r.batch_levels.length >= BATCH_LEVEL_MAX) return
+  const nextCount = r.batch_levels.length + 1
+  const maxCount = Math.max(
+    1,
+    Math.floor(Number(r.total_lot_limit) || BATCH_POS_START) - BATCH_POS_START + 1,
+  )
+  if (nextCount > maxCount) {
+    r.total_lot_limit = BATCH_POS_START + nextCount - 1
+  }
+  const limit = Math.max(BATCH_POS_START, Math.floor(Number(r.total_lot_limit) || BATCH_POS_START))
+  r.batch_count = nextCount
+  if (hasRunningTask.value) {
+    rebuildBatchLevels(r, 'append')
+    return
+  }
+  const prev = r.batch_levels[r.batch_levels.length - 1]
+  // 新档接在末档之后；末档没铺满上限时，新档顺带把剩下的空段一起吃掉（不留空洞）
+  const from = prev ? Math.floor(Number(prev.pos_to) || 0) + 1 : BATCH_POS_START
+  const to = from <= limit ? limit : from
+  r.batch_levels.push({
+    ...defaultLevelParams(r.batch_levels.length, prev),
+    pos_from: from,
+    pos_to: to,
+  })
+  r.total_lot_limit = to
 }
 
 function enableManualScatter(r: EditableRule): void {
@@ -1978,7 +2038,7 @@ function resetRuleToTemplate(idx: number): void {
                 <input v-model.number="tier.pl_amount" type="number" step="1" class="signal-pl-num" />
               </div>
               <p class="muted" style="font-size: 12px; margin: 8px 0 0">
-                只用批次1的盈亏金额（取绝对值）写止盈，该方向总手数达到批次1的「总 lot >=」才计算。止损用上面的盈亏比和账户余额反推，只在新开仓时重算。
+                只用批次1的盈亏金额（取绝对值）写止盈，该方向总手数达到批次1的「总 lot >=」才计算。止损用上面的盈亏比和账户余额反推，在新开仓和热推改参数后重算。关闭任一开关不会摘掉持仓上已有的止盈 / 止损。
               </p>
             </div>
           </div>
@@ -2880,7 +2940,8 @@ function resetRuleToTemplate(idx: number): void {
                     </button>
                   </div>
                   <p class="rule-hint">
-                    改批数、加仓笔数或添加 / 删除档位，都会按第 {{ BATCH_POS_START }} 次 ~ 第 {{ Math.floor(r.total_lot_limit) }} 次加仓重切区间；
+                    改批数或加仓笔数会按第 {{ BATCH_POS_START }} 次 ~ 第 {{ Math.floor(r.total_lot_limit) }} 次加仓重切区间；
+                    添加档位接在末尾、删除档位只丢弃该档区间并收紧上限，已有档位的区间不会被重切；
                     手改某一档加仓次数时，相邻档会首尾衔接。
                     每档间距可独立选点数 / 指定价 / ATR / 波幅，ATR 与波幅取该周期最近 {{ BATCH_BAR_PERIOD }} 根已收盘 K 线
                     <template v-if="r.manual_scatter.enabled">

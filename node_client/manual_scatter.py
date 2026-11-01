@@ -4,9 +4,13 @@
 
 入场走**挂限价单**：分批加满后把手动仓挂成 Buy Limit / Sell Limit 等成交，
 不再由节点盯价市价开。挂单价固定在配置入场价上，手数在挂出那一刻算死
-（按存量仓位到止盈时刻的预估亏损反推），所以价格中途怎么走都不影响
+（按存量仓位到止盈时刻的预估盈亏反推），所以价格中途怎么走都不影响
 止盈时刻的净额。到价即由终端撮合成交，成交后手动仓的止盈价成为本魔术号
 所有仓位的止盈权威。
+
+手数口径：`手数 =（分档第一档目标金额 − 存量仓位到止盈时刻的预估盈亏）÷ 每手止盈`。
+存量浮盈要抵扣（少开手动仓），存量浮亏要补上（多开手动仓）——两种情况都让
+止盈那一刻的净额刚好等于目标金额。
 
 成交侧已越过止盈则不开。止盈联动清仓（close_all_on_tp）：跟踪在场手动仓，
 某一拍消失后查出场成交的 DEAL_REASON；确认是止盈（历史未到时用平仓侧现价兜底）
@@ -314,7 +318,7 @@ def sl_is_sendable(
 def describe_pending(
     watch: dict, volume: float, *, target_pl: Optional[float],
     current_lot_size: float, profit_per_lot_value: float = 0.0,
-    volume_step: float = 0.01, projected_loss: float = 0.0,
+    volume_step: float = 0.01, projected_pl: float = 0.0,
 ) -> str:
     """挂出限价单的说明文案：手数怎么来的 + 挂在哪 + 止盈怎么对齐。"""
     cfg = watch.get("cfg") if isinstance(watch.get("cfg"), dict) else {}
@@ -326,7 +330,7 @@ def describe_pending(
         volume_formula(
             cfg=cfg, volume=volume, current_lot_size=current_lot_size,
             target_pl=target_pl, profit_per_lot_value=profit_per_lot_value,
-            volume_step=volume_step, projected_loss=projected_loss,
+            volume_step=volume_step, projected_pl=projected_pl,
         ),
         f"挂单价 {_trim(cfg.get('entry_price'))}",
         f"止盈 {_trim(cfg.get('take_profit'))}（成交后统一同步到全部持仓）",
@@ -338,7 +342,7 @@ def describe_pending(
 def pending_detail(
     watch: dict, volume: float, *, target_pl: Optional[float],
     current_lot_size: float, profit_per_lot_value: float,
-    volume_step: float = 0.01, projected_loss: float = 0.0,
+    volume_step: float = 0.01, projected_pl: float = 0.0,
     ticket: object = None, kind: Optional[str] = None,
 ) -> dict[str, Any]:
     """挂单事件的明细：和开仓明细同构，另加挂单票号与挂单类型。"""
@@ -351,7 +355,7 @@ def pending_detail(
             watch, volume, target_pl=used_target,
             current_lot_size=current_lot_size,
             profit_per_lot_value=profit_per_lot_value,
-            volume_step=volume_step, projected_loss=projected_loss,
+            volume_step=volume_step, projected_pl=projected_pl,
         ),
         "pending_ticket": _as_int(ticket) or None,
         "pending_kind": str(kind or ""),
@@ -534,13 +538,17 @@ def compute_volume(
     volume_step: float = 0.01,
     volume_min: float = 0.01,
     volume_max: float = 100.0,
-    projected_loss: float = 0.0,
+    projected_pl: float = 0.0,
 ) -> Optional[float]:
-    """返回开仓手数；无法计算返回 None。
+    """返回开仓手数；无法计算返回 None（返回 None 表示不该开手动仓）。
 
     volume_locked 且 volume>0 时直接用配置手数（仍夹到 min/max/step）。
-    目标金额 = 分档批次1的 pl_amount + 存量仓位到止盈时刻的预估亏损，
-    手动仓止盈那一刻净额刚好等于目标金额。
+    目标金额 = 分档批次1的 pl_amount − 存量仓位到止盈时刻的预估盈亏：
+      存量浮亏（projected_pl < 0）→ 目标变大，手数加厚，补上亏损；
+      存量浮盈（projected_pl > 0）→ 目标变小，手数收薄，抵扣掉已赚的；
+      两种情况都让手动仓止盈那一刻的净额刚好等于目标金额。
+    存量浮盈已经超过目标金额时按品种最小手数开：手动仓是本任务最后一次加仓，
+    它的止盈价是全部仓位的止盈权威、止盈联动清仓也挂在它身上，不能没有。
     """
     src = normalize(cfg)
     if src.get("volume_locked") and src["volume"] > 0:
@@ -555,7 +563,13 @@ def compute_volume(
     per = profit_per_lot(src["entry_price"], src["take_profit"], tick_size, tick_value)
     if per <= 0:
         return None
-    raw = (abs(target) + max(0.0, float(projected_loss or 0.0))) / per
+    # 存量在止盈时刻的预估盈亏：浮盈抵扣、浮亏补上
+    remaining = abs(target) - float(projected_pl or 0.0)
+    if remaining <= 0:
+        # 存量仓位在止盈时刻已经赚到目标金额（或更多）：按最小手数开，
+        # 净额会略超目标，但手动仓本身必须存在（止盈权威 / 联动清仓都靠它）
+        return ceil_to_step(volume_min, volume_step, volume_min, volume_max)
+    raw = remaining / per
     sized = ceil_to_step(raw, volume_step, volume_min, volume_max)
     return sized if sized > 0 else None
 
@@ -1059,7 +1073,7 @@ def volume_formula(
     target_pl: Optional[float],
     profit_per_lot_value: float,
     volume_step: float = 0.01,
-    projected_loss: float = 0.0,
+    projected_pl: float = 0.0,
 ) -> str:
     """手数怎么来的：手填锁定 / 分档反推 / 配置手数。"""
     src = normalize(cfg)
@@ -1071,22 +1085,30 @@ def volume_formula(
             return f"手数 = 手填锁定 {filled}，按品种步长取整为 {sized}（不按分档反推）"
         return f"手数 = 手填锁定 {sized}（不按分档反推）"
     if target_pl is not None and profit_per_lot_value > 0:
-        raw = abs(float(target_pl)) / profit_per_lot_value
         step = volume_step if volume_step > 0 else 0.01
-        loss = max(0.0, float(projected_loss or 0.0))
-        if loss > 0:
+        pl = float(projected_pl or 0.0)
+        # 存量在止盈时刻的预估盈亏：浮盈抵扣、浮亏补上
+        remaining = abs(float(target_pl)) - pl
+        head = f"手数 = (分档目标 {_trim(abs(float(target_pl)), 2)}u"
+        if pl < -1e-9:
+            head += f" + 存量仓位到止盈预估亏损 {_trim(-pl, 2)}u)"
+        elif pl > 1e-9:
+            # 用 ASCII 的减号：U+2212 在 GBK 码页下写日志会抛 UnicodeEncodeError
+            head += f" - 存量仓位到止盈预估盈利 {_trim(pl, 2)}u)"
+        else:
+            head += ")"
+        if remaining <= 0:
+            # 存量浮盈已经超过目标金额：按最小手数开，净额会略超目标
             return (
-                f"手数 = (分档目标 {_trim(abs(float(target_pl)), 2)}u"
-                f" + 存量仓位到止盈预估亏损 {_trim(loss, 2)}u)"
-                f" ÷ 每手止盈 {_trim(profit_per_lot_value, 4)}u"
-                f" = {_trim(raw, 4)}，向上取整到步长 {_trim(step, 4)}"
-                f" → {sized}；当前仓 {_trim(current_lot_size)} 手"
+                f"{head} ÷ 每手止盈 {_trim(profit_per_lot_value, 4)}u"
+                f" ≤ 0 → 按品种最小手数开 {_trim(volume)}"
+                f"；当前仓 {_trim(current_lot_size)} 手"
             )
+        raw = remaining / profit_per_lot_value
         return (
-            f"手数 = 分档目标 {_trim(abs(float(target_pl)), 2)}u"
-            f" ÷ 每手止盈 {_trim(profit_per_lot_value, 4)}u"
+            f"{head} ÷ 每手止盈 {_trim(profit_per_lot_value, 4)}u"
             f" = {_trim(raw, 4)}，向上取整到步长 {_trim(step, 4)}"
-            f" → {sized}；当前仓 {_trim(current_lot_size)} 手命中该档"
+            f" → {sized}；当前仓 {_trim(current_lot_size)} 手"
         )
     if src["volume"] > 0:
         return (
@@ -1099,7 +1121,7 @@ def volume_formula(
 def describe_open(
     watch: dict, volume: float, *, target_pl: Optional[float],
     current_lot_size: float, profit_per_lot_value: float = 0.0,
-    volume_step: float = 0.01, projected_loss: float = 0.0,
+    volume_step: float = 0.01, projected_pl: float = 0.0,
 ) -> str:
     cfg = watch.get("cfg") if isinstance(watch.get("cfg"), dict) else {}
     side = str(watch.get("direction") or "")
@@ -1109,7 +1131,7 @@ def describe_open(
         volume_formula(
             cfg=cfg, volume=volume, current_lot_size=current_lot_size,
             target_pl=target_pl, profit_per_lot_value=profit_per_lot_value,
-            volume_step=volume_step, projected_loss=projected_loss,
+            volume_step=volume_step, projected_pl=projected_pl,
         ),
         f"入场 {_trim(cfg.get('entry_price'))}",
         f"止盈 {_trim(cfg.get('take_profit'))}",
@@ -1123,7 +1145,7 @@ def describe_open(
 
 def open_detail(watch: dict, volume: float, *, target_pl: Optional[float],
                 current_lot_size: float, profit_per_lot_value: float,
-                volume_step: float = 0.01, projected_loss: float = 0.0) -> dict[str, Any]:
+                volume_step: float = 0.01, projected_pl: float = 0.0) -> dict[str, Any]:
     cfg = watch.get("cfg") if isinstance(watch.get("cfg"), dict) else {}
     src = normalize(cfg)
     locked = bool(src.get("volume_locked") and src["volume"] > 0)
@@ -1142,12 +1164,13 @@ def open_detail(watch: dict, volume: float, *, target_pl: Optional[float],
             target_pl=used_target,
             profit_per_lot_value=profit_per_lot_value,
             volume_step=volume_step,
-            projected_loss=projected_loss,
+            projected_pl=projected_pl,
         ),
         "target_pl": used_target,
         "current_lot": current_lot_size,
         "profit_per_lot": profit_per_lot_value,
         "volume_step": volume_step,
-        "projected_loss": round(float(projected_loss or 0.0), 2),
+        # 存量仓位到止盈时刻的预估盈亏：浮盈抵扣、浮亏补上
+        "projected_pl": round(float(projected_pl or 0.0), 2),
         "comment": watch.get("comment"),
     }

@@ -41,18 +41,41 @@ def rule_type_label(rule_type: int) -> str:
 
 
 def describe_crossed(plan: dict) -> str:
-    """把一个 crossed 的 plan 说成人话。"""
+    """把一个 crossed 的 plan 说成人话。
+
+    两侧同时越价时两边都要说，不能只报一个——用户要知道自己改的哪几个
+    目标价有问题。
+    """
     side = str(plan.get("side") or "").upper()
     tp = plan.get("tp")
     sl = plan.get("sl")
     market = _as_float(plan.get("market"))
-    which = "止盈" if plan.get("crossed") == "tp" else "止损"
-    target = tp if plan.get("crossed") == "tp" else sl
     direction = "多单" if side == "BUY" else "空单"
-    return (
-        f"{direction}按新配置算出的{which}价 {target}，"
-        f"现价 {market} 已经越过，改动会立刻触发{which}平仓"
-    )
+    crossed = plan.get("crossed_sides")
+    if isinstance(crossed, (list, tuple, set)):
+        kinds = [str(k) for k in crossed if str(k) in ("tp", "sl")]
+    else:
+        kinds = []
+        if str(plan.get("crossed") or "") in ("tp", "sl"):
+            kinds = [str(plan.get("crossed"))]
+    bits: list[str] = []
+    for kind in kinds:
+        label = "止盈" if kind == "tp" else "止损"
+        target = tp if kind == "tp" else sl
+        if target is None:
+            continue
+        bits.append(
+            f"{direction}按新配置算出的{label}价 {float(target):g}，"
+            f"现价 {market:g} 已经越过，改动会立刻触发{label}平仓"
+        )
+    if not bits:
+        which = "止盈" if plan.get("crossed") == "tp" else "止损"
+        target = tp if plan.get("crossed") == "tp" else sl
+        bits.append(
+            f"{direction}按新配置算出的{which}价 {target}，"
+            f"现价 {market:g} 已经越过，改动会立刻触发{which}平仓"
+        )
+    return "；".join(bits)
 
 
 def check_sltp_crossed(
@@ -66,16 +89,23 @@ def check_sltp_crossed(
     bid: float = 0.0,
     ask: float = 0.0,
     fallback_price: float = 0.0,
+    manual_authority: bool = False,
 ) -> list[dict]:
     """用新规则重算共同止盈止损，检查现价是否已经越过。
 
     返回 crossed 列表，每项：
-    {"code": "sltp_crossed", "side", "crossed": "tp"|"sl", "tp", "sl",
-     "market", "message"}
+    {"code": "sltp_crossed", "side", "crossed": "tp"|"sl", "crossed_sides": [...],
+     "tp", "sl", "market", "message"}
+
+    manual_authority：手动分散仓的止盈价在场。此时节点**不会**写共同止盈
+    （止盈听手动仓权威），所以只检查止损那一侧——拦一个永远不会被写入的
+    目标价是误拦，尤其是在加仓收口、客户最需要调止损的阶段。
     """
     cfg = signal_pl.extract_config(rules)
     tp_amount = signal_pl.lot_pl_amount(cfg)
     ratio_on = signal_pl.float_pl_enabled(cfg)
+    if manual_authority:
+        tp_amount = None
     if (tp_amount is None and not ratio_on) or not positions:
         return []
 
@@ -106,12 +136,14 @@ def check_sltp_crossed(
 
     out: list[dict] = []
     for plan in plans:
-        if not plan.get("crossed"):
+        kinds = [str(k) for k in (plan.get("crossed_sides") or []) if str(k) in ("tp", "sl")]
+        if not kinds:
             continue
         item = {
             "code": "sltp_crossed",
             "side": str(plan.get("side") or "").upper(),
-            "crossed": str(plan.get("crossed") or ""),
+            "crossed": kinds[0],
+            "crossed_sides": kinds,
             "tp": plan.get("tp"),
             "sl": plan.get("sl"),
             "market": plan.get("market"),

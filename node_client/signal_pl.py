@@ -261,8 +261,98 @@ def should_trigger_float_pl(
     }
 
 
+def side_crossed(side: str, kind: str, value: float | None, market: float) -> bool:
+    """单独判这一侧（tp / sl）是否已被现价越过。"""
+    if value is None or market <= 0:
+        return False
+    px = float(value)
+    if px <= 0:
+        return False
+    if kind == "tp":
+        return market >= px if side == "BUY" else market <= px
+    if kind == "sl":
+        return market <= px if side == "BUY" else market >= px
+    return False
+
+
+def stop_side_decision(
+    side: str, kind: str, *,
+    new_value: float | None, positions: list | None, market: float,
+    allow_keep: bool = True,
+) -> dict:
+    """新算出的这一侧该不该写。
+
+    判据是**持仓上已有的值**，不是「这是不是一次配置改动」：
+    - 旧值还没被现价越过、新值却越了 → 配置把目标调得离现价太近，
+      保留旧值（方案 2b）；
+    - 旧值也已被越过 → 价格事件，止盈止损本来就该被打掉；
+    - 本来就没有旧值 → 没有可保留的东西。
+
+    allow_keep=False 时不走 2b：新值越价一律市价平掉。这是**加仓**场景的
+    既有口径——加仓后重算出的止盈落到现价之下，说明行情已经走过去了，
+    按原逻辑平掉；2b 只针对**配置改动**这一类。
+
+    返回 {"action": "none"|"write"|"keep"|"close", "has_old", "old_crossed",
+    "old_value"}。old_value 取「最容易先被触发」的那个极值。
+    """
+    if new_value is None or float(new_value) <= 0:
+        return {"action": "none", "has_old": False, "old_crossed": False, "old_value": None}
+    if not side_crossed(side, kind, float(new_value), market):
+        return {"action": "write", "has_old": False, "old_crossed": False, "old_value": None}
+    olds: list[float] = []
+    for pos in positions or []:
+        if not isinstance(pos, dict):
+            continue
+        val = _as_float(pos.get(kind), 0.0)
+        if val > 0:
+            olds.append(val)
+    if not olds:
+        return {"action": "close", "has_old": False, "old_crossed": False, "old_value": None}
+    old_crossed = any(side_crossed(side, kind, val, market) for val in olds)
+    if old_crossed or not allow_keep:
+        return {
+            "action": "close", "has_old": bool(olds), "old_crossed": old_crossed,
+            "old_value": None,
+        }
+    # 保留旧值：取最容易先被触发的那一个
+    if kind == "tp":
+        old_value = min(olds) if side == "BUY" else max(olds)
+    else:
+        old_value = max(olds) if side == "BUY" else min(olds)
+    return {
+        "action": "keep", "has_old": True, "old_crossed": False, "old_value": old_value,
+    }
+
+
+def lot_pl_cfg_sig(cfg: dict | None) -> tuple:
+    """止盈配置指纹：(开关, 批次1金额, 批次1门槛, 平仓方向)。
+
+    改了就要重算共同止盈——与手数是否变化无关。
+    """
+    rule = normalize_config(cfg)[RULE_LOT_PL_TIERS]
+    tiers = rule.get("tiers") or []
+    first = tiers[0] if tiers else {}
+    return (
+        bool(rule.get("enabled")),
+        round(abs(_as_float(first.get("pl_amount"), 0.0)), 6),
+        round(_as_float(first.get("min_lot"), 0.0), 6),
+        str(rule.get("close_action") or "all"),
+    )
+
+
 def float_pl_enabled(cfg: dict | None) -> bool:
     return bool(normalize_config(cfg)[RULE_FLOAT_PL_RATIO].get("enabled"))
+
+
+def float_pl_ratio_value(cfg: dict | None) -> float:
+    """启用时返回盈亏比阈值的原始值（带符号）；未启用返回 0。
+
+    用于给止损配置做指纹：比例或开关变了就要重算止损。
+    """
+    rule = normalize_config(cfg)[RULE_FLOAT_PL_RATIO]
+    if not rule.get("enabled"):
+        return 0.0
+    return _as_float(rule.get("ratio"), 0.0)
 
 
 def float_pl_loss_amount(cfg: dict | None, balance: float) -> Optional[float]:
@@ -419,21 +509,38 @@ def cross_level(
     return None
 
 
+def crossed_sides(
+    side: str, sl: float | None, tp: float | None, market: float,
+) -> set[str]:
+    """两侧各自是否已被现价越过。返回 {"tp"} / {"sl"} / {"tp","sl"} / 空集。
+
+    与 `_cross_side` 同口径，但它能同时报出两侧——止盈和止损要分别决定
+    写不写，一侧越价不该把另一侧一起拖下水。
+    """
+    out: set[str] = set()
+    if market <= 0:
+        return out
+    if side == "BUY":
+        if tp is not None and market >= float(tp):
+            out.add("tp")
+        if sl is not None and market <= float(sl):
+            out.add("sl")
+        return out
+    if tp is not None and market <= float(tp):
+        out.add("tp")
+    if sl is not None and market >= float(sl):
+        out.add("sl")
+    return out
+
+
 def _cross_side(
     side: str, sl: float | None, tp: float | None, market: float,
 ) -> Optional[str]:
     """现价已经到了或越过要写的止盈 / 止损。没算的那一侧不参与。"""
-    if market <= 0:
-        return None
-    if side == "BUY":
-        if tp is not None and market >= tp:
-            return "tp"
-        if sl is not None and market <= sl:
-            return "sl"
-        return None
-    if tp is not None and market <= tp:
+    crossed = crossed_sides(side, sl, tp, market)
+    if "tp" in crossed:
         return "tp"
-    if sl is not None and market >= sl:
+    if "sl" in crossed:
         return "sl"
     return None
 
@@ -522,6 +629,10 @@ def plan_common_stops(
             "digits": max(0, int(digits)),
             "positions": rows,
             "crossed": _cross_side(side, sl, tp, market),
+            # 两侧各自的越价情况：止盈和止损要分别决定写不写
+            "crossed_sides": sorted(crossed_sides(side, sl, tp, market)),
+            # 现价：预检提示与越价告警都要用它，少了这个只能显示「现价 0」
+            "market": market,
         })
     return plans
 
@@ -644,7 +755,7 @@ def describe_lot_stops(plan: dict | None) -> str:
 def lot_stops_detail(plan: dict | None) -> Optional[dict]:
     if not isinstance(plan, dict):
         return None
-    return {
+    detail = {
         "kind": "signal_pl",
         "rule": RULE_LOT_PL_TIERS,
         "rule_label": RULE_LABELS[RULE_LOT_PL_TIERS],
@@ -659,6 +770,31 @@ def lot_stops_detail(plan: dict | None) -> Optional[dict]:
         "crossed": plan.get("crossed"),
         "tier_index": 0,
     }
+    # 越价保留旧值时才有这些键：现价、保留的是哪一侧、为什么保留
+    for key in (
+        "status", "kept_side", "kept_reason", "market", "new_sl", "new_tp",
+    ):
+        if plan.get(key) is not None:
+            detail[key] = plan.get(key)
+    return detail
+
+
+def describe_kept_side(
+    side: str, *, kind: str, new_value: float | None,
+    old_value: float | None, market: float,
+) -> str:
+    """越价被拒、保留旧值时的一句话说明。
+
+    kind 是 "tp" 或 "sl"。old_value 为 0 / None 表示这一侧本来就没有值。
+    """
+    label = "止盈" if kind == "tp" else "止损"
+    direction = "多单" if side == "BUY" else "空单"
+    old_text = f"{float(old_value):g}" if old_value else "无"
+    new_text = f"{float(new_value):g}" if new_value is not None else "无"
+    return (
+        f"{direction}新的{label}价 {new_text} 已在现价 {float(market):g} 的错误一侧，"
+        f"本次未写入，保留原{label}价 {old_text}"
+    )
 
 
 def find_triggered_rule(

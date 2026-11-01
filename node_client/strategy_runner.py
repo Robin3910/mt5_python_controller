@@ -268,6 +268,14 @@ class StrategyRunner:
         # 目标价时同样要立刻平仓，否则挂在盘上的手动单会在语境已变时成交。
         # 值：(止损价, 止盈价, 小数位)
         self._lot_sltp_levels: dict[str, tuple[float, float, int]] = {}
+        # 止损配置指纹：(开关, |比例|)。比例或开关变了就要重算止损——
+        # 与仓位构成是否变化无关。早期版本只看仓位构成，热推改比例时
+        # 仓位没变，止损金额分支被短路，用户改的比例完全不生效。
+        self._lot_sltp_sl_cfg_sig: Optional[tuple] = None
+        # 止盈配置指纹：(开关, 批次1金额, 批次1门槛, 平仓方向)
+        self._lot_sltp_tp_cfg_sig: Optional[tuple] = None
+        # 手动分散仓在场时只写止损那条线的仓位签名（止盈听手动仓权威）
+        self._lot_sltp_sl_only_sig: tuple = ()
         # 重连后的第一份持仓是已有单，不算新开仓，不重算止损
         self._lot_sltp_seed_existing = False
         # 手动分散仓：每种规则只挂一次；重连时优先用 runtime，其次用仓位 comment
@@ -589,6 +597,8 @@ class StrategyRunner:
             bid=_as_float(event.bid),
             ask=_as_float(event.ask),
             fallback_price=market,
+            # 手动止盈权威在场时节点不写共同止盈，预检只查止损那一侧
+            manual_authority=self._manual_authority_tp() is not None,
         )
 
     def apply_smc(self, smc: dict) -> bool:
@@ -786,6 +796,9 @@ class StrategyRunner:
                 # 手动仓的止盈价是本魔术号所有仓位的止盈权威：
                 # 不再让分档手数盈亏那套反推的共同止盈来改单，只对齐到手动仓的 TP
                 await self._align_positions_to_manual_tp(positions, event)
+                # 止盈听手动仓的，止损仍然按盈亏比 × 余额算——早期版本在这里
+                # 把整条止损线跳过了，加仓收口阶段止损热推完全失效。
+                await self._lot_sltp_sync_sl(event, positions)
             else:
                 lot_result = await self._lot_sltp_sync(event, positions)
                 if lot_result == "done":
@@ -971,15 +984,165 @@ class StrategyRunner:
             return None
         return bal
 
+    def _sl_cfg_sig(self) -> tuple:
+        """止损配置指纹：(开关, |比例|)。
+
+        比例或开关变了就要重算止损——与仓位构成是否变化无关。
+        余额不进指纹：余额变化不重算止损是既有口径。
+        """
+        ratio = abs(signal_pl.float_pl_ratio_value(self._signal_pl))
+        return (signal_pl.float_pl_enabled(self._signal_pl), round(ratio, 6))
+
+    async def _lot_sltp_apply_plans(
+        self, event: MarketEvent, positions: list[dict], plans: list[dict],
+        *, allow_keep: bool = True,
+    ) -> dict:
+        """把算好的 plan 写进持仓。
+
+        逐侧判定（方案 2b）：新算出的价落在现价错误一侧时，比对持仓上
+        **已有的**那一侧：
+        - 旧值也已被现价越过 → 价格事件，市价平掉整个方向（保持现状）；
+        - 旧值还有效 → 保留旧值，不强平，发告警；
+        - 本来就没有旧值 → 没有可保留的，市价平掉（与现状一致）。
+
+        allow_keep=False 时不走 2b：新值越价一律市价平掉。
+
+        返回 {"closed", "reasons", "failed", "levels", "close_any"}。
+        """
+        closed_tickets: set[int] = set()
+        crossed_reasons: list[str] = []
+        failed = False
+        close_any = False
+        # 记下这一轮实际生效的目标价：之后只有价格动、仓位构成没动的那几拍，
+        # 靠它判断现价是不是冲过了共同止盈/止损。
+        levels: dict[str, tuple[float, float, int]] = {}
+        for plan in plans:
+            side = str(plan.get("side") or "").upper()
+            market = _as_float(plan.get("market"), 0.0)
+            rows = list(plan.get("positions") or [])
+            new_sl = plan.get("sl")
+            new_tp = plan.get("tp")
+            tp_dec = signal_pl.stop_side_decision(
+                side, "tp", new_value=new_tp, positions=rows, market=market,
+                allow_keep=allow_keep,
+            )
+            sl_dec = signal_pl.stop_side_decision(
+                side, "sl", new_value=new_sl, positions=rows, market=market,
+                allow_keep=allow_keep,
+            )
+            close_side = ""
+            if tp_dec.get("action") == "close":
+                close_side = "tp"
+            elif sl_dec.get("action") == "close":
+                close_side = "sl"
+            if close_side:
+                # 价格事件：目标价已经在现价错误一侧，券商拒单，改为市价平掉。
+                close_any = True
+                plan["crossed"] = close_side
+                # 阶梯止盈先到达：手动挂单不在 positions 里，市价平仓平不掉它。
+                # 不撤单的话它会在不该成交的时候成交（语境已经变了）。
+                await self._void_manual_pending(
+                    manual_scatter.OFF_LADDER_TP, positions=positions,
+                )
+                ok = await self._lot_sltp_market_close(plan, positions)
+                if ok:
+                    closed_tickets.update(
+                        int(p.get("ticket") or 0) for p in plan["positions"]
+                    )
+                    crossed_reasons.append(signal_pl.describe_lot_stops(plan))
+                else:
+                    failed = True
+                continue
+
+            kept: list[str] = []
+            # 描述用的快照要在清空之前取：清空后 plan 里没有新价了
+            describe_snapshot = dict(plan)
+            if tp_dec.get("action") == "keep":
+                plan["tp"] = None
+                kept.append("tp")
+            if sl_dec.get("action") == "keep":
+                plan["sl"] = None
+                kept.append("sl")
+            if kept:
+                # 不是价格事件：新目标越了价但旧目标还有效——不能说成「市价平仓」
+                plan["crossed"] = None
+                # 被拒的新价要留一份：界面上要让人看到「本来要写成多少」
+                plan["new_sl"] = new_sl
+                plan["new_tp"] = new_tp
+
+            # 落价记录：保留旧值的那一侧记**持仓上的实际值**（券商侧真正的
+            # 目标价）——记新算出来的被拒价会让价格事件路径按错价去平仓。
+            # 没算的那一侧记 0（表示这一侧没有可跟踪的目标价）。
+            def _rec(kind: str, dec: dict, new_value: float | None) -> float:
+                if dec.get("action") == "keep":
+                    return _as_float(dec.get("old_value"), 0.0)
+                if dec.get("action") == "write" and new_value is not None:
+                    return _as_float(new_value, 0.0)
+                return 0.0
+
+            levels[side] = (
+                _rec("sl", sl_dec, new_sl),
+                _rec("tp", tp_dec, new_tp),
+                int(plan.get("digits") or 0),
+            )
+
+            ok, changed = await self._lot_sltp_modify(plan)
+            if not ok:
+                failed = True
+            if kept:
+                plan["status"] = "kept"
+                plan["kept_side"] = "sl" if "sl" in kept else "tp"
+                plan["market"] = market
+                reason = "；".join(
+                    signal_pl.describe_kept_side(
+                        side, kind=kind,
+                        new_value=new_tp if kind == "tp" else new_sl,
+                        old_value=tp_dec.get("old_value") if kind == "tp"
+                        else sl_dec.get("old_value"),
+                        market=market,
+                    )
+                    for kind in kept
+                )
+                plan["kept_reason"] = reason
+                if changed:
+                    # 描述用清空前的快照：新价已经被拒了，不能再当成要写的价
+                    reason = f"{reason}；{signal_pl.describe_lot_stops(describe_snapshot)}"
+                await self._emit_progress(
+                    "signal_pl", phase="running", positions=positions,
+                    message=reason, detail=signal_pl.lot_stops_detail(plan),
+                )
+            elif changed:
+                await self._emit_progress(
+                    "signal_pl", phase="running", positions=positions,
+                    message=signal_pl.describe_lot_stops(plan),
+                    detail=signal_pl.lot_stops_detail(plan),
+                )
+        return {
+            "closed": closed_tickets,
+            "reasons": crossed_reasons,
+            "failed": failed,
+            "levels": levels,
+            "close_any": close_any,
+        }
+
     async def _lot_sltp_sync(self, event: MarketEvent, positions: list[dict]) -> Optional[str]:
-        """分档批次1写共同止盈；盈亏比 × 余额写共同止损，且只在新开仓时重算。
+        """分档批次1写共同止盈；盈亏比 × 余额写共同止损。
+
+        止损在两种情况下重算：仓位构成变了（新开仓 / 加仓），或**止损配置
+        变了**（热推改比例 / 开关）。早期版本只看前者，用户热推改比例时
+        仓位没变，止损金额分支被短路，改动完全不生效。
 
         返回 done=穿过目标价后已清干净并收口；hit=本拍已市价平掉穿过的方向，不再加仓；
         None=已改单或无需动作，本拍可以继续交易。
         """
         tp_amount = signal_pl.lot_pl_amount(self._signal_pl)
         ratio_on = signal_pl.float_pl_enabled(self._signal_pl)
+        sl_cfg_sig = self._sl_cfg_sig()
+        tp_cfg_sig = signal_pl.lot_pl_cfg_sig(self._signal_pl)
         if (tp_amount is None and not ratio_on) or not positions:
+            # 没有可写的东西：把指纹记成当前配置，这样下次启用时能被认出来
+            self._lot_sltp_sl_cfg_sig = sl_cfg_sig
+            self._lot_sltp_tp_cfg_sig = tp_cfg_sig
             return None
         scoped = signal_pl.filter_lot_side(
             manual_scatter.exclude_manual(positions),
@@ -989,7 +1152,17 @@ class StrategyRunner:
         now = time.time()
         suppress_open = bool(self._lot_sltp_seed_existing and sig and not self._lot_sltp_sig)
         opened = False if suppress_open else signal_pl.book_has_open(self._lot_sltp_sig, sig)
-        if not self._lot_sltp_dirty and sig == self._lot_sltp_sig:
+        # 止损配置变了也要重算止损——与仓位构成无关（热推改比例能生效的关键）。
+        # 重连后的第一轮压制住：存量仓不重算止损（与既有语义一致）。
+        sl_cfg_changed = sl_cfg_sig != self._lot_sltp_sl_cfg_sig
+        tp_cfg_changed = tp_cfg_sig != self._lot_sltp_tp_cfg_sig
+        # 2b（越价保留旧值）只针对**配置改动**：加仓后重算出的价落到现价
+        # 错误一侧是价格事件的延伸，那一轮仍然按原逻辑市价平掉。
+        allow_keep = sl_cfg_changed or tp_cfg_changed
+        if (
+            not self._lot_sltp_dirty and sig == self._lot_sltp_sig
+            and not sl_cfg_changed and not tp_cfg_changed
+        ):
             # 仓位构成没变：只可能是价格动了。要判的是「现价冲过了已经落下的
             # 共同止盈/止损」——这是价格事件，不能因为签名没变就不看。
             return await self._lot_sltp_check_crossed(event, positions)
@@ -1003,7 +1176,7 @@ class StrategyRunner:
             await self._lot_sltp_fail(sig, positions, "缺少合约规格，无法反推止盈止损")
             return None
         sl_amount = None
-        if ratio_on and opened:
+        if ratio_on and (opened or (sl_cfg_changed and not suppress_open)):
             balance = await self._read_balance()
             if balance is None:
                 await self._lot_sltp_fail(sig, positions, "读不到账户余额，无法反推止损")
@@ -1024,48 +1197,21 @@ class StrategyRunner:
             ask=_as_float(event.ask),
             fallback_price=_as_float(event.price),
         )
-        closed_tickets: set[int] = set()
-        crossed_reasons: list[str] = []
-        failed = False
-        # 记下这一轮算出的目标价：之后只有价格动、仓位构成没动的那几拍，
-        # 靠它判断现价是不是冲过了共同止盈/止损。
-        levels: dict[str, tuple[float, float, int]] = {}
-        for plan in plans:
-            if plan.get("crossed"):
-                # 阶梯止盈先到达：手动挂单不在 positions 里，市价平仓平不掉它。
-                # 不撤单的话它会在不该成交的时候成交（语境已经变了）。
-                await self._void_manual_pending(
-                    manual_scatter.OFF_LADDER_TP, positions=positions,
-                )
-                ok = await self._lot_sltp_market_close(plan, positions)
-                if ok:
-                    closed_tickets.update(
-                        int(p.get("ticket") or 0) for p in plan["positions"]
-                    )
-                    crossed_reasons.append(signal_pl.describe_lot_stops(plan))
-                else:
-                    failed = True
-                continue
-            side = str(plan.get("side") or "").upper()
-            levels[side] = (
-                _as_float(plan.get("sl"), 0.0),
-                _as_float(plan.get("tp"), 0.0),
-                int(plan.get("digits") or 0),
-            )
-            ok, changed = await self._lot_sltp_modify(plan)
-            if not ok:
-                failed = True
-            elif changed:
-                reason = signal_pl.describe_lot_stops(plan)
-                await self._emit_progress(
-                    "signal_pl", phase="running", positions=positions,
-                    message=reason, detail=signal_pl.lot_stops_detail(plan),
-                )
-        crossed_any = any(plan.get("crossed") for plan in plans)
+        applied = await self._lot_sltp_apply_plans(
+            event, positions, plans,
+            # 2b 只针对配置改动：加仓后重算出的价落到现价错误一侧，
+            # 仍然按原逻辑市价平掉（价格事件的延伸）。
+            allow_keep=sl_cfg_changed or tp_cfg_changed,
+        )
+        closed_tickets = applied["closed"]
+        crossed_reasons = list(applied["reasons"])
+        failed = bool(applied["failed"])
+        crossed_any = bool(applied["close_any"])
         if failed:
             self._lot_sltp_fail_sig = sig
             self._lot_sltp_fail_at = now
             self._lot_sltp_cross_blocked = crossed_any
+            # 失败时不更新指纹：改动会被继续重试
         else:
             self._lot_sltp_sig = sig
             self._lot_sltp_dirty = False
@@ -1073,9 +1219,12 @@ class StrategyRunner:
             self._lot_sltp_cross_blocked = False
             if suppress_open:
                 self._lot_sltp_seed_existing = False
+            # 指纹记成这次用的止损配置：改了比例的那一拍已经算过了
+            self._lot_sltp_sl_cfg_sig = sl_cfg_sig
+            self._lot_sltp_tp_cfg_sig = tp_cfg_sig
             # 目标价记下来：只在真的改成功（或本来就没要改）时更新，
             # 改单失败的这一轮宁可沿用旧值，也不要按错价去判「冲过了」。
-            self._lot_sltp_levels = levels
+            self._lot_sltp_levels = applied["levels"]
         if not closed_tickets:
             return "hit" if crossed_any else None
         remaining = [
@@ -1087,6 +1236,73 @@ class StrategyRunner:
         detail = {"kind": "signal_pl", "rule": signal_pl.RULE_LOT_PL_TIERS, "crossed": True}
         self.request_stop(reason, detail=detail)
         return "done" if await self._close_all() else "hit"
+
+    async def _lot_sltp_sync_sl(
+        self, event: MarketEvent, positions: list[dict],
+    ) -> Optional[str]:
+        """手动分散仓在场时只同步止损。
+
+        止盈听手动仓权威（`_align_positions_to_manual_tp`），但**止损**仍然是
+        盈亏比 × 余额反推出来的共同止损。早期版本在手动分支里把整条止损线
+        跳过了，导致加仓收口阶段止损热推完全失效——而那恰恰是客户最需要
+        调止损的阶段。
+
+        止损与止盈互不干扰：这一路算出来的 plan 里 tp 恒为 None，写单时
+        止盈沿用持仓上的现值（手动仓的权威价）。
+        """
+        if not signal_pl.float_pl_enabled(self._signal_pl) or not positions:
+            return None
+        scoped = signal_pl.filter_lot_side(
+            manual_scatter.exclude_manual(positions),
+            signal_pl.lot_pl_close_action(self._signal_pl),
+        )
+        if not scoped:
+            return None
+        sig = signal_pl.position_book_signature(scoped)
+        sl_cfg_sig = self._sl_cfg_sig()
+        if sig == self._lot_sltp_sl_only_sig and sl_cfg_sig == self._lot_sltp_sl_cfg_sig:
+            # 仓位构成和止损配置都没变：没有可写的东西
+            return None
+        spec = await self._manual_symbol_spec()
+        if spec is None:
+            return None
+        balance = await self._read_balance()
+        if balance is None:
+            await self._emit_progress(
+                "error", phase="running", positions=positions,
+                message="读不到账户余额，无法反推止损",
+                detail={"kind": "signal_pl", "rule": signal_pl.RULE_FLOAT_PL_RATIO},
+            )
+            return None
+        sl_amount = signal_pl.float_pl_loss_amount(self._signal_pl, balance)
+        if sl_amount is None:
+            return None
+        plans = signal_pl.plan_common_stops(
+            scoped,
+            tp_amount=None,
+            sl_amount=sl_amount,
+            tp_min_lot=0.0,
+            tick_size=_as_float(spec.get("tick_size")),
+            tick_value=_as_float(spec.get("tick_value")),
+            digits=int(spec.get("digits") or 0),
+            bid=_as_float(event.bid),
+            ask=_as_float(event.ask),
+            fallback_price=_as_float(event.price),
+        )
+        applied = await self._lot_sltp_apply_plans(
+            event, positions, plans,
+            # 2b 只针对配置改动：止损配置变了才保留旧值
+            allow_keep=sl_cfg_sig != self._lot_sltp_sl_cfg_sig,
+        )
+        if applied["failed"]:
+            # 失败时不更新指纹：下一拍继续重试
+            return None
+        self._lot_sltp_sl_only_sig = sig
+        self._lot_sltp_sl_cfg_sig = sl_cfg_sig
+        # 止盈指纹也同步一下：手动分支不写共同止盈，但指纹不该因此变陈旧，
+        # 否则手动权威撤销后的第一轮会误判成「配置变了」。
+        self._lot_sltp_tp_cfg_sig = signal_pl.lot_pl_cfg_sig(self._signal_pl)
+        return None
 
     async def _lot_sltp_check_crossed(
         self, event: MarketEvent, positions: list[dict],
@@ -1873,9 +2089,10 @@ class StrategyRunner:
     ) -> bool:
         """挂出手动分散仓的限价单。手数在这一刻算死，之后不再随行情变。
 
-        手数按「存量仓位到止盈时刻的预估亏损」反推：手动仓止盈那一刻的净额
+        手数按「存量仓位到止盈时刻的预估盈亏」反推：手动仓止盈那一刻的净额
         刚好等于分档第一档的目标金额，与中途行情无关——存量在止盈时刻的盈亏
         由存量开仓价决定（历史事实），手动仓的盈利由固定入场价与止盈价决定。
+        存量浮盈抵扣目标、浮亏补进目标，两种情况净额都等于目标金额。
 
         挂单价就是配置入场价，成交价正好等于它，止盈时刻的净额才对得上。
         """
@@ -1900,6 +2117,7 @@ class StrategyRunner:
         current = manual_scatter.current_lot(positions)
         # 存量仓位到止盈时刻的预估盈亏：手动仓止盈那一刻的净额要刚好等于目标金额，
         # 所以先把存量仓位在止盈价处的盈亏折算出来，一并计入要赚的钱。
+        # 浮盈抵扣（少开手动仓）、浮亏补上（多开手动仓）——两种情况净额都等于目标。
         # 手动分散仓自己不进基数：它有各自的止盈价与目标金额，混进来会重复计算。
         target = manual_scatter.tier0_pl_amount(watch.get("lot_pl_tiers"))
         projected = manual_scatter.projected_profit(
@@ -1908,7 +2126,7 @@ class StrategyRunner:
             _as_float(spec.get("tick_size")),
             _as_float(spec.get("tick_value")),
         )
-        projected_loss = max(0.0, -projected) if target is not None else 0.0
+        projected_pl = projected if target is not None else 0.0
         volume = manual_scatter.compute_volume(
             cfg=cfg,
             current_lot_size=current,
@@ -1918,10 +2136,13 @@ class StrategyRunner:
             volume_step=_as_float(spec.get("volume_step"), 0.01),
             volume_min=_as_float(spec.get("volume_min"), 0.01),
             volume_max=_as_float(spec.get("volume_max"), 100.0),
-            projected_loss=projected_loss,
+            projected_pl=projected_pl,
         )
         if volume is None or volume <= 0:
-            logger.debug("task %s manual scatter skipped: no target volume", self.task_id)
+            logger.debug(
+                "task %s manual scatter skipped: no target volume (projected %s)",
+                self.task_id, round(projected_pl, 2),
+            )
             return False
         # 止损：配了就带上，但必须落在入场价的反方向，否则券商拒掉整张单
         points = _as_float(spec.get("point"), 0.0)
@@ -1992,7 +2213,7 @@ class StrategyRunner:
         reason = manual_scatter.describe_pending(
             watch, volume, target_pl=target_pl, current_lot_size=current,
             profit_per_lot_value=per, volume_step=volume_step,
-            projected_loss=projected_loss,
+            projected_pl=projected_pl,
         )
         logger.info("task %s %s", self.task_id, reason)
         await self._emit_progress(
@@ -2002,7 +2223,7 @@ class StrategyRunner:
             detail=manual_scatter.pending_detail(
                 watch, volume, target_pl=target_pl, current_lot_size=current,
                 profit_per_lot_value=per, volume_step=volume_step,
-                projected_loss=projected_loss, ticket=ticket, kind=kind,
+                projected_pl=projected_pl, ticket=ticket, kind=kind,
             ),
         )
         return True

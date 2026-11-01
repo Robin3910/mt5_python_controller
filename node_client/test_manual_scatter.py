@@ -56,7 +56,7 @@ def test_describe_open_explains_locked_and_formula_volume():
     )
     assert "分档目标 500u" in formula
     assert "每手止盈 1000u" in formula
-    assert "当前仓 0.1 手命中该档" in formula
+    assert "当前仓 0.1 手" in formula
     detail = ms.open_detail(
         watch, 0.4, target_pl=100.0, current_lot_size=0.79,
         profit_per_lot_value=2900.0,
@@ -165,11 +165,55 @@ def test_volume_covers_existing_loss_to_reach_target():
         lot_pl_tiers=_gold_tiers(),
         tick_size=0.01,
         tick_value=1.0,
-        projected_loss=max(0.0, -projected),
+        projected_pl=projected,
     )
     assert vol == 1.5
     # 手动仓止盈时：存量 -1000u + 手动仓 1.5 手 × 1000u = 净赚 500u
     assert projected + vol * 1000.0 == 500.0
+
+
+def test_volume_deducts_existing_profit_from_target():
+    """存量浮盈 200u：手数要按 (目标 500 − 盈利 200) / 每手止盈 反推。
+
+    存量 0.1 手开在 4390，到 4410 时浮盈 200u；目标净赚 500u
+    → 手动仓只需赚 300u → 0.3 手。止盈那一刻净额仍等于 500u。
+    """
+    positions = [{"type": "BUY", "volume": 0.1, "price_open": 4390.0}]
+    projected = ms.projected_profit(positions, 4410.0, 0.01, 1.0)
+    assert projected == 200.0
+    vol = ms.compute_volume(
+        cfg=_cfg(),
+        current_lot_size=0.1,
+        lot_pl_tiers=_gold_tiers(),
+        tick_size=0.01,
+        tick_value=1.0,
+        projected_pl=projected,
+    )
+    assert vol == 0.3
+    # 存量 +200u + 手动仓 0.3 手 × 1000u = 净赚 500u
+    assert projected + vol * 1000.0 == 500.0
+
+
+def test_volume_uses_min_lot_when_profit_already_covers_target():
+    """存量在止盈时刻的浮盈已经超过目标金额：按品种最小手数开。
+
+    手动仓是本任务最后一次加仓，它的止盈价是全部仓位的止盈权威、
+    止盈联动清仓也挂在它身上——所以它必须存在，不能因为「不需要赚那么多」就消失。
+    """
+    # 存量 0.6 手开在 4390 → 到 4410 浮盈 1200u > 目标 500u
+    positions = [{"type": "BUY", "volume": 0.6, "price_open": 4390.0}]
+    projected = ms.projected_profit(positions, 4410.0, 0.01, 1.0)
+    assert projected == 1200.0
+    vol = ms.compute_volume(
+        cfg=_cfg(),
+        current_lot_size=0.6,
+        lot_pl_tiers=_gold_tiers(),
+        tick_size=0.01,
+        tick_value=1.0,
+        volume_min=0.01,
+        projected_pl=projected,
+    )
+    assert vol == 0.01
 
 
 def test_net_profit_at_tp_is_invariant_to_intermediate_moves():
@@ -186,7 +230,7 @@ def test_net_profit_at_tp_is_invariant_to_intermediate_moves():
     vol = ms.compute_volume(
         cfg=_cfg(), current_lot_size=0.1, lot_pl_tiers=_gold_tiers(),
         tick_size=0.01, tick_value=1.0,
-        projected_loss=max(0.0, -projected),
+        projected_pl=projected,
     )
     assert vol == 1.5
     # 中途价格走过的每一条路径，止盈那一刻的净额都一样
@@ -207,7 +251,7 @@ def test_volume_frozen_at_placement_survives_market_moves():
     vol = ms.compute_volume(
         cfg=_cfg(), current_lot_size=0.1, lot_pl_tiers=_gold_tiers(),
         tick_size=0.01, tick_value=1.0,
-        projected_loss=max(0.0, -projected_at_placement),
+        projected_pl=projected_at_placement,
     )
     # 中途行情变化：当下浮盈变了，但止盈时刻的净额没变
     for mid_price in (4300.0, 4600.0):
@@ -219,29 +263,33 @@ def test_volume_frozen_at_placement_survives_market_moves():
         assert projected_at_placement + manual_profit == 500.0
 
 
-def test_volume_ignores_profit_when_no_loss():
-    """存量是浮盈时不抵扣：手数仍按目标金额算。"""
-    positions = [{"type": "BUY", "volume": 0.1, "price_open": 4390.0}]
-    projected = ms.projected_profit(positions, 4410.0, 0.01, 1.0)
-    assert projected == 200.0
-    vol = ms.compute_volume(
-        cfg=_cfg(),
-        current_lot_size=0.1,
-        lot_pl_tiers=_gold_tiers(),
-        tick_size=0.01,
-        tick_value=1.0,
-        projected_loss=max(0.0, -projected),
-    )
-    assert vol == 0.5
-
-
 def test_volume_formula_mentions_projected_loss():
     text = ms.volume_formula(
         cfg=_cfg(), volume=1.5, current_lot_size=0.1, target_pl=500.0,
-        profit_per_lot_value=1000.0, volume_step=0.01, projected_loss=1000.0,
+        profit_per_lot_value=1000.0, volume_step=0.01, projected_pl=-1000.0,
     )
     assert "存量仓位到止盈预估亏损 1000u" in text
     assert "分档目标 500u" in text
+
+
+def test_volume_formula_mentions_projected_profit_deduction():
+    text = ms.volume_formula(
+        cfg=_cfg(), volume=0.3, current_lot_size=0.1, target_pl=500.0,
+        profit_per_lot_value=1000.0, volume_step=0.01, projected_pl=200.0,
+    )
+    assert "存量仓位到止盈预估盈利 200u" in text
+    assert "分档目标 500u" in text
+
+
+def test_volume_formula_when_profit_exceeds_target():
+    """浮盈超过目标：文案说清是按最小手数开，不出现负数手数。"""
+    text = ms.volume_formula(
+        cfg=_cfg(), volume=0.01, current_lot_size=0.6, target_pl=500.0,
+        profit_per_lot_value=1000.0, volume_step=0.01, projected_pl=1200.0,
+    )
+    assert "存量仓位到止盈预估盈利 1200u" in text
+    assert "按品种最小手数开 0.01" in text
+    assert "-0.7" not in text
 
 
 def test_fill_side_price_matches_market_order():
@@ -364,7 +412,7 @@ def test_describe_pending_mentions_limit_and_sync():
     watch = {"rule_type": 2, "direction": "BUY", "comment": "M2", "cfg": _cfg()}
     text = ms.describe_pending(
         watch, 1.5, target_pl=500.0, current_lot_size=0.1,
-        profit_per_lot_value=1000.0, volume_step=0.01, projected_loss=1000.0,
+        profit_per_lot_value=1000.0, volume_step=0.01, projected_pl=-1000.0,
     )
     assert "挂出限价单" in text
     assert "挂单价 4400" in text
@@ -524,7 +572,9 @@ async def test_runner_places_pending_order_once_with_m2_comment():
     manuals = [o for o in pending if str(o.get("comment") or "").startswith("M")]
     assert len(manuals) == 1, "手动分散仓应挂成一张限价单"
     assert manuals[0]["comment"] == "M2"
-    assert manuals[0]["volume"] == 0.5
+    # 底仓 0.1 手开在 4390，到手动止盈 4410 时浮盈 200u；目标 500u 被抵扣 200u
+    # → 手动仓只需赚 300u，每手止盈 1000u → 0.3 手
+    assert manuals[0]["volume"] == 0.3
     assert manuals[0]["price_open"] == 4400.0, "挂单价就是配置入场价"
     # 现价（卖价 4399）已在入场价下方 → Buy Stop 等反弹回入场价成交
     assert manuals[0]["pending_kind"] == "stop"
@@ -586,9 +636,9 @@ async def test_runner_pending_fills_and_aligns_all_tp():
     manuals = [p for p in mt5.positions_by_magic(MAGIC) if p.get("comment") == "M2"]
     assert len(manuals) == 1, "限价单成交后应有一笔手动仓持仓"
     assert manuals[0]["price_open"] == 4400.0, "成交价正好等于入场价"
-    assert manuals[0]["volume"] == 0.5
+    assert manuals[0]["volume"] == 0.3
     # 成交后手数才计入总手数
-    assert runner.total_volume == 0.6
+    assert runner.total_volume == 0.4
     filled = _progress(sent, "manual_filled")
     assert filled, "应记一笔成交事件"
     assert "限价单成交" in (filled[0].get("message") or "")
@@ -616,7 +666,7 @@ async def test_runner_pending_order_keeps_volume_frozen():
     ))
     await _settle()
     placed = [o for o in mt5.pending_orders_by_magic(MAGIC) if o.get("comment") == "M2"]
-    assert placed and placed[0]["volume"] == 0.5
+    assert placed and placed[0]["volume"] == 0.3
 
     # 价格继续下跌（存量浮亏扩大），挂单手数不能变
     mt5.prices_map["XAUUSD"] = 4250.0
@@ -627,7 +677,7 @@ async def test_runner_pending_order_keeps_volume_frozen():
     ))
     await _settle()
     still = [o for o in mt5.pending_orders_by_magic(MAGIC) if o.get("comment") == "M2"]
-    assert still and still[0]["volume"] == 0.5, "手数在挂出时已算死，不随行情变"
+    assert still and still[0]["volume"] == 0.3, "手数在挂出时已算死，不随行情变"
     runner.cancel()
 
 
