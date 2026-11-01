@@ -173,6 +173,9 @@ class MarketHub:
         self._points: dict[str, float] = {}
         # (symbol, timeframe, metric) -> (指标值, 过期时刻)
         self._metrics: dict[tuple[str, str, str], tuple[float, float]] = {}
+        # (symbol, timeframe) -> (基线波幅, 实时波幅, 过期时刻)
+        # 与基线缓存分开：基线要稳（TTL 长），实时要灵敏（TTL = 重检间隔）。
+        self._range_pairs: dict[tuple[str, str], tuple[float, float, float]] = {}
         self._task: Optional[asyncio.Task] = None
         self._closed = False
         self._awake = asyncio.Event()
@@ -404,6 +407,36 @@ class MarketHub:
         if value > 0:
             self._metrics[key] = (value, now + bar_metrics.cache_seconds(timeframe))
         return value
+
+    async def bar_range_pair(
+        self, symbol: str, timeframe: str, *, refresh: float = 5.0,
+    ) -> tuple[float, float]:
+        """一次读取同时取 (基线波幅, 实时波幅)，按重检间隔缓存。
+
+        基线与实时必须来自同一次读取：分开读的话，K 线收盘的瞬间实时值归零
+        而基线还停留在旧缓存，有效波幅会塌陷、限价单被猛地拉回来成交在最低点。
+        所以这里走 recent_bars（pos=0），一次拿到实时根与已收盘窗口。
+
+        返回的基线与只读已收盘时同口径（最近 14 根已收盘 K 线的高低点总跨度）。
+        """
+        key = (symbol, str(timeframe or "").upper())
+        now = time.time()
+        cached = self._range_pairs.get(key)
+        if cached and cached[2] > now:
+            return cached[0], cached[1]
+        try:
+            bars = await self._exec(
+                self._mt5.recent_bars, symbol, timeframe,
+                bar_metrics.bars_needed_with_live(bar_metrics.METRIC_RANGE),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("hub read recent bars failed for %s %s: %s", symbol, timeframe, e)
+            return 0.0, 0.0
+        baseline, live = bar_metrics.range_pair(list(bars or []))
+        if baseline > 0:
+            ttl = bar_metrics.live_cache_seconds(refresh)
+            self._range_pairs[key] = (baseline, live, now + ttl)
+        return baseline, live
 
     @staticmethod
     def _quote_sides(quotes: dict, symbol: str) -> tuple[float, float]:

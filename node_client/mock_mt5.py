@@ -48,6 +48,8 @@ class MockMT5Client:
         self.margin_mode = "hedging"
         # 现价触及挂单价时自动成交；置 False 可让测试完全手工驱动成交时点
         self.auto_fill_pending = True
+        # 券商要求挂单价离现价的最小点数；0 表示不限制
+        self.stops_level = 0
         # 模拟环境没有券商钟面偏移，与 time.time() 同一套 UTC
         self._server_tz_offset = 0
 
@@ -126,10 +128,10 @@ class MockMT5Client:
         logger.info("MOCK open %s %s %.2f @ %.5f -> ticket %s", action, symbol, volume, price, tk)
         self._record_deal(
             entry="IN",
-            reason=0,
+            reason=0,  # DEAL_REASON_CLIENT
             position_id=tk,
             symbol=symbol.upper(),
-            direction="BUY" if action == "BUY" else "SELL",
+            direction=str(action).upper(),
             volume=float(volume),
             price=price,
             profit=0.0,
@@ -140,16 +142,49 @@ class MockMT5Client:
                 "order": tk, "deal": tk, "volume": float(volume), "price": price}
 
     # ----------------------- 挂单 -----------------------
-    def check_pending_price(self, symbol, action, price, kind="limit"):
-        """只校验方向，不校验最小距离（mock 的 stops_level 恒为 0）。"""
-        mid = float(self.prices_map.get(symbol.upper(), 1.0))
+    def _market_price(self, symbol: str, action: str) -> float:
+        """挂单校验用的现价：BUY 看卖价、SELL 看买价（与真实 MT5Client 一致）。
+
+        挂单成交侧决定挂单价必须在哪一侧：BUY LIMIT 要挂在卖价下方，
+        BUY STOP 要挂在卖价上方。
+        """
+        sym = str(symbol or "").upper()
+        mid = float(self.prices_map.get(sym, 0.0))
+        if mid <= 0:
+            return 0.0
+        quote = self.quotes([sym]).get(sym) or {}
+        bid = float(quote.get("bid") or mid)
+        ask = float(quote.get("ask") or mid)
+        return ask if str(action or "").upper() == "BUY" else bid
+
+    def _pending_price_status(self, symbol, action, price, kind="limit"):
+        """与 MT5Client 同一组返回码：None 可挂，否则 side / stops / unavailable。"""
+        market = self._market_price(symbol, action)
         if price <= 0:
-            return "挂单价需大于 0"
+            return "unavailable", "挂单价需大于 0"
+        if market <= 0:
+            return "unavailable", "no tick"
+        point = self.symbol_point(symbol)
+        stops = int(self.stops_level or 0)
         want_below = (action == "BUY") == (kind == "limit")
-        if (price < mid) != want_below:
+        if (price < market) != want_below:
             side = "低于" if want_below else "高于"
-            return f"{action} {kind} 挂单价 {price} 必须{side}现价 {mid}"
-        return None
+            return "side", f"{action} {kind} 挂单价 {price} 必须{side}现价 {market}"
+        if stops > 0 and point > 0 and abs(price - market) < stops * point:
+            return "stops", (
+                f"挂单价距现价 {round(abs(price - market) / point)} 点，"
+                f"低于券商要求的 {stops} 点"
+            )
+        return None, None
+
+    def pending_price_block(self, symbol, action, price, kind="limit"):
+        code, _message = self._pending_price_status(symbol, action, price, kind)
+        return code
+
+    def check_pending_price(self, symbol, action, price, kind="limit"):
+        """方向必须对，且不能近于 stops_level。"""
+        _code, message = self._pending_price_status(symbol, action, price, kind)
+        return message
 
     def place_pending_order(self, symbol, action, volume, price, sl=None, tp=None,
                             comment="", magic=None, kind="limit", max_retry=3) -> dict:
@@ -181,6 +216,29 @@ class MockMT5Client:
         return {"success": True, "pending": True, "symbol": symbol, "action": action,
                 "pending_kind": kind, "retcode": 10009, "order": tk,
                 "volume": float(volume), "price": float(price)}
+
+    def modify_pending_order(self, ticket, price, sl=None, tp=None, max_retry=3) -> dict:
+        """改挂单价和止损止盈。sl / tp 为 None 时保留原值。"""
+        self._settle_pending()
+        target = int(ticket)
+        order = next((o for o in self._pending if int(o["ticket"]) == target), None)
+        if order is None:
+            return {"success": False, "ticket": target, "error": f"order not found: {target}"}
+        reject = self.check_pending_price(
+            order["symbol"], order["type"], float(price), order.get("pending_kind") or "limit",
+        )
+        if reject:
+            return {"success": False, "ticket": target, "symbol": order["symbol"], "error": reject}
+        order["price_open"] = float(price)
+        if sl is not None:
+            order["sl"] = float(sl or 0.0)
+        if tp is not None:
+            order["tp"] = float(tp or 0.0)
+        return {
+            "success": True, "ticket": target, "symbol": order["symbol"],
+            "price": float(price), "sl": float(order.get("sl") or 0.0),
+            "tp": float(order.get("tp") or 0.0), "retcode": 10009,
+        }
 
     def _touched(self, order: dict) -> bool:
         """现价是否已触及挂单价。"""
@@ -224,10 +282,10 @@ class MockMT5Client:
         logger.info("MOCK pending filled: ticket %s @ %.5f", order["ticket"], price)
         self._record_deal(
             entry="IN",
-            reason=0,
+            reason=0,  # DEAL_REASON_CLIENT
             position_id=int(order["ticket"]),
-            symbol=str(order["symbol"] or ""),
-            direction="BUY" if str(order.get("type")) == "BUY" else "SELL",
+            symbol=str(order.get("symbol") or ""),
+            direction=str(order.get("type") or "BUY").upper(),
             volume=float(order.get("volume") or 0),
             price=price,
             profit=0.0,
@@ -303,38 +361,14 @@ class MockMT5Client:
             "remaining": len(self.pending_orders()),
         }
 
-    def _record_exit(self, pos: dict, *, reason: int, profit: float) -> None:
-        """记下出场成交；reason 对齐 MT5 DEAL_REASON（4=SL / 5=TP / 3=EXPERT…）。"""
-        self._exit_deals.append({
-            "ticket": int(pos.get("ticket") or 0),
-            "position_id": int(pos.get("ticket") or 0),
-            "magic": int(pos.get("magic") or self.magic),
-            "entry": 1,  # DEAL_ENTRY_OUT
-            "reason": int(reason),
-            "volume": float(pos.get("volume") or 0),
-            "price": float(pos.get("price_current") or pos.get("price_open") or 0),
-            "profit": float(profit),
-            "time": time.time(),
-        })
-        self._record_deal(
-            entry="OUT",
-            reason=int(reason),
-            position_id=int(pos.get("ticket") or 0),
-            symbol=str(pos.get("symbol") or ""),
-            direction=("SELL" if str(pos.get("type")) == "BUY" else "BUY"),
-            volume=float(pos.get("volume") or 0),
-            price=float(pos.get("price_current") or pos.get("price_open") or 0),
-            profit=float(profit),
-            magic=int(pos.get("magic") or self.magic),
-            comment=str(pos.get("comment") or ""),
-        )
+    def _record_deal(self, *, entry: str, reason: int, position_id: int,
+                     symbol: str, direction: str, volume: float, price: float,
+                     profit: float, magic: int, comment: str = "") -> None:
+        """记一笔成交到成交流水（与真 MT5 的字段口径一致）。
 
-    def _record_deal(
-        self, *, entry: str, reason: int, position_id: int, symbol: str,
-        direction: str, volume: float, price: float, profit: float,
-        magic: int, comment: str,
-    ) -> None:
-        """记一笔成交流水（开仓 / 出场），字段与真实 MT5 的 deal 对齐。"""
+        deal_id 用自增票号，模拟 MT5 单账户内成交号单调递增的语义 ——
+        增量采集的游标正是靠「成交号决定哪笔算新」来去重的。
+        """
         tk = next(self._tickets)
         self._deals.append({
             "deal_id": tk,
@@ -356,7 +390,7 @@ class MockMT5Client:
         })
 
     def history_deals_since(self, since_ts: float, after_deal_id: int = 0) -> list[dict]:
-        """与真实 MT5Client 同口径：取增量成交流水。
+        """与真 MT5Client 同口径：取增量成交流水。
 
         mock 不按时间窗裁剪（成交都在本进程内产生），只按成交号做增量过滤。
         """
@@ -364,6 +398,33 @@ class MockMT5Client:
         rows = [dict(d) for d in self._deals if int(d.get("deal_id") or 0) > floor]
         rows.sort(key=lambda r: (r["time"], r["deal_id"]))
         return rows
+
+    def _record_exit(self, pos: dict, *, reason: int, profit: float) -> None:
+        """记下出场成交；reason 对齐 MT5 DEAL_REASON（4=SL / 5=TP / 3=EXPERT…）。"""
+        self._exit_deals.append({
+            "ticket": int(pos.get("ticket") or 0),
+            "position_id": int(pos.get("ticket") or 0),
+            "magic": int(pos.get("magic") or self.magic),
+            "entry": 1,  # DEAL_ENTRY_OUT
+            "reason": int(reason),
+            "volume": float(pos.get("volume") or 0),
+            "price": float(pos.get("price_current") or pos.get("price_open") or 0),
+            "profit": float(profit),
+            "time": time.time(),
+        })
+        # 同时记进成交流水：出场方向与持仓方向相反（平多单是 SELL）
+        self._record_deal(
+            entry="OUT",
+            reason=int(reason),
+            position_id=int(pos.get("ticket") or 0),
+            symbol=str(pos.get("symbol") or ""),
+            direction=("SELL" if str(pos.get("type")) == "BUY" else "BUY"),
+            volume=float(pos.get("volume") or 0),
+            price=float(pos.get("price_current") or pos.get("price_open") or 0),
+            profit=float(profit),
+            magic=int(pos.get("magic") or self.magic),
+            comment=str(pos.get("comment") or ""),
+        )
 
     def close_ticket(self, ticket: int) -> dict:
         pos = next((p for p in self._positions if p["ticket"] == ticket), None)
@@ -492,7 +553,7 @@ class MockMT5Client:
             "volume_min": 0.01,
             "volume_step": 0.01,
             "volume_max": 100.0,
-            "stops_level": 0,
+            "stops_level": int(self.stops_level or 0),
         }
 
     def modify_position_sl(self, ticket: int, sl: float, tp=None) -> dict:
@@ -527,7 +588,28 @@ class MockMT5Client:
     def closed_bars(self, symbol: str, timeframe: str, count: int) -> list[dict]:
         """合成一段已收盘 K 线：围绕当前中间价做固定振幅，便于联调 ATR / 波幅。
 
-        振幅取 200 个 point，因此 ATR 与最大波幅都稳定等于该值，测试可直接断言。
+        振幅取 200 个 point，因此 ATR 与高低点总跨度都稳定等于该值，测试可直接断言。
+        """
+        return self._synth_bars(symbol, timeframe, count, live=False)
+
+    def recent_bars(self, symbol: str, timeframe: str, count: int) -> list[dict]:
+        """合成最近 count 根 K 线，**含**当前未收盘那根（最后一根）。
+
+        与 closed_bars 只差起点：这里最后一根就是正在走的那根，
+        供波幅自适应同时拿到「实时根」与「已收盘窗口」。
+        """
+        return self._synth_bars(symbol, timeframe, count, live=True)
+
+    def current_bar(self, symbol: str, timeframe: str) -> dict:
+        bars = self.recent_bars(symbol, timeframe, 1)
+        return bars[-1] if bars else {}
+
+    def _synth_bars(
+        self, symbol: str, timeframe: str, count: int, *, live: bool,
+    ) -> list[dict]:
+        """合成 K 线序列（时间升序）；live=True 时最后一根是当前正在走的这根。
+
+        与 MT5 的 copy_rates_from_pos 口径一致：最老在前，最新在后。
         """
         tf = str(timeframe or "").strip().upper()
         step = _TIMEFRAME_SECONDS.get(tf)
@@ -545,6 +627,16 @@ class MockMT5Client:
                 "low": mid - span / 2,
                 "close": mid,
             })
+        if not live:
+            return bars
+        # 当前这根：时间落在最后（未收盘），振幅沿用同一段
+        bars.append({
+            "time": now,
+            "open": mid,
+            "high": mid + span / 2,
+            "low": mid - span / 2,
+            "close": mid,
+        })
         return bars
 
     def close_symbol(self, symbol: str) -> dict:

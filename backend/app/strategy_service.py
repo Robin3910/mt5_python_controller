@@ -31,6 +31,7 @@ def strategy_row_to_dict(row: TradingStrategy) -> dict:
         "enabled": row.enabled,
         "rules": templates.normalize_rules(row.config_json or []),
         "remark": row.remark,
+        "config_version": int(row.config_version or 0),
         "owner_user_id": row.owner_user_id,
         "created_at": row.created_at.timestamp() if row.created_at else time.time(),
     }
@@ -98,6 +99,8 @@ async def create_strategy(
                 config_json=rules,
                 remark=(payload.remark or "").strip() or None,
                 owner_user_id=permissions.normalize_owner(owner_user_id),
+                # 配置版本从 1 起：首个热推的版本号是 2，节点侧版本门能正确比较
+                config_version=1,
             )
         )
         await s.commit()
@@ -133,6 +136,8 @@ async def update_strategy(
             if bad:
                 raise ValueError(bad)
             row.config_json = rules
+        # 配置版本 +1：热推时随快照下发，节点用它做版本门
+        row.config_version = int(row.config_version or 0) + 1
         await s.commit()
         d = strategy_row_to_dict(row)
     await store.cache_strategy(d)

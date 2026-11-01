@@ -22,6 +22,7 @@ import type {
   NodeFeedItem,
   NodeOut,
   NodePrimaryUpdatePayload,
+  NodePerformance,
   NodeTokenInfo,
   NodeUpdatePayload,
   RiskFeedItem,
@@ -42,9 +43,10 @@ import type {
   WebhookAuthInfo,
 } from '@/api/types'
 
-/** 成交汇总的空值占位（接口失败 / 尚未加载时用）。
+/**
+ * 成交汇总的空值占位（接口失败 / 尚未加载时用）。
  *
- * data_available=false 让 UI 能区分「没数据」与「有数据但全亏」——
+ * data_available=false —— UI 能区分「没数据」与「有数据但全亏」：
  * 前者要显示「暂无数据」，后者要显示 0.00%。
  */
 function EMPTY_DEAL_SUMMARY() {
@@ -78,6 +80,9 @@ interface HubState {
   nodeFeed: Record<string, NodeFeedItem[]>  // node_id -> 实时分发/回报（详情页“成交回报”用）
   riskFeed: Record<string, RiskFeedItem[]>  // node_id -> 账户级风控执行回报
   limitWatchLogs: Record<string, LimitWatchLogOut[]>  // group_id -> 限价监听日志（新→旧）
+  // node_id -> 成交入库计数（每次 +1）。概览面板监听它来触发重新拉取，
+  // 这样节点上报新成交后页面能自动刷新，不必手动点刷新。
+  dealVersions: Record<string, number>
 }
 
 export const useHubStore = defineStore('hub', {
@@ -93,6 +98,7 @@ export const useHubStore = defineStore('hub', {
     nodeFeed: {},
     riskFeed: {},
     limitWatchLogs: {},
+    dealVersions: {},
   }),
   getters: {
     // 在线节点数（优先用实时状态，其次用 REST 字段）
@@ -192,6 +198,27 @@ export const useHubStore = defineStore('hub', {
           performance: EMPTY_DEAL_SUMMARY(),
           follower_count: 0,
         }
+      }
+    },
+    /**
+     * 某节点的绩效汇总与按日收益序列（概览页历史盈亏）。
+     *
+     * 失败返回 null：概览据此显示「加载失败」而不是伪造一份空数据 ——
+     * 空数据会被误读成「这个节点没赚过钱」。
+     */
+    async fetchNodePerformance(
+      id: string,
+      window = '30d',
+      days = 7,
+    ): Promise<NodePerformance | null> {
+      try {
+        return (
+          await api.get(`/api/deals/nodes/${id}/performance`, {
+            params: { window, days },
+          })
+        ).data
+      } catch {
+        return null
       }
     },
     /**
@@ -331,6 +358,13 @@ export const useHubStore = defineStore('hub', {
       const q = options?.q?.trim()
       const params = q ? { q } : undefined
       this.strategies = (await api.get('/api/strategies', { params })).data
+    },
+    /**
+     * 取单个策略详情：带 runtime_hints（在跑任务的已开笔数等）。
+     * 列表接口不带这些运行时信息，编辑表单要用它做保存前校验。
+     */
+    async fetchStrategyDetail(id: string): Promise<StrategyOut> {
+      return (await api.get(`/api/strategies/${id}`)).data
     },
     async createStrategy(
       payload: StrategyCreatePayload,
@@ -626,6 +660,18 @@ export const useHubStore = defineStore('hub', {
         const ev = d.event as string
         const kind = ev === 'ok' ? 'ok' : ev === 'rejected' || ev === 'cancel_failed' ? 'warn' : 'info'
         this.pushEvent(`限价监听 ${name} ${text}`, kind)
+      } else if (t === 'deals') {
+        // 节点上报了新的历史成交：把该节点的成交版本号 +1，
+        // 概览面板监听它重新拉取绩效数据（否则页面会一直停在旧值，
+        // 看起来就像「数据和 MT5 对不上」）。
+        //
+        // 只在**确有新成交入库**时才 +1：后端每轮采集都会广播（哪怕全是重复的
+        // 老成交，inserted=0），无条件 +1 会让概览按采集周期反复空拉。
+        const nodeId = d.node_id as string
+        const inserted = Number(d.inserted ?? 0)
+        if (nodeId && inserted > 0) {
+          this.dealVersions[nodeId] = (this.dealVersions[nodeId] ?? 0) + 1
+        }
       }
     },
   },

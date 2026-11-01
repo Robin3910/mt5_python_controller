@@ -1,12 +1,20 @@
-"""模版1 手动分散仓：配置抽取、手数反推与到价判定。
+"""模版1 手动分散仓：配置抽取、手数反推、到价判定与挂限价单。
 
 与分批加仓隔离：不进 batch_levels，MT5 注释用 M1/M2（禁止 R3B）。
-到价是回踩/反弹到入场再市价开：BUY 等卖价 ≤ 入场，SELL 等买价 ≥ 入场。
-成交侧已越过止盈则不开。手数按当前任务总手数匹配 lot_pl_tiers 的
-pl_amount，再按 |tp-entry| / tick_size * tick_value 反推，向上取整到 volume_step。
 
-止盈联动清仓（close_all_on_tp）：跟踪在场手动仓，某一拍消失后查出场成交的
-DEAL_REASON；确认是止盈（历史未到时用平仓侧现价兜底）就平掉该魔术号其余持仓收口。
+入场走**挂限价单**：分批加满后把手动仓挂成 Buy Limit / Sell Limit 等成交，
+不再由节点盯价市价开。挂单价固定在配置入场价上，手数在挂出那一刻算死
+（按存量仓位到止盈时刻的预估盈亏反推），所以价格中途怎么走都不影响
+止盈时刻的净额。到价即由终端撮合成交，成交后手动仓的止盈价成为本魔术号
+所有仓位的止盈权威。
+
+手数口径：`手数 =（分档第一档目标金额 − 存量仓位到止盈时刻的预估盈亏）÷ 每手止盈`。
+存量浮盈要抵扣（少开手动仓），存量浮亏要补上（多开手动仓）——两种情况都让
+止盈那一刻的净额刚好等于目标金额。
+
+成交侧已越过止盈则不开。止盈联动清仓（close_all_on_tp）：跟踪在场手动仓，
+某一拍消失后查出场成交的 DEAL_REASON；确认是止盈（历史未到时用平仓侧现价兜底）
+就平掉该魔术号其余持仓收口。
 """
 from __future__ import annotations
 
@@ -30,8 +38,16 @@ COMMENT_PREFIX = "M"
 # M1 / M2，可选后续字符；禁止与模版2 R3B 撞车
 _COMMENT_RE = re.compile(r"^M([12])(?:\b|$)")
 EVENT_TYPE = "add_manual"
+# 手动仓挂出限价单的事件（库字段 VARCHAR(16)）
+PENDING_EVENT = "manual_pending"
+# 手动仓限价单成交的事件（库字段 VARCHAR(16)）
+PENDING_FILLED_EVENT = "manual_filled"
 # 止盈联动清仓事件（库字段 VARCHAR(16)）
 TP_CLOSE_EVENT = "manual_tp_close"
+# 手动仓止盈价同步到其它持仓的事件
+TP_ALIGN_EVENT = "manual_tp_align"
+# 手动仓挂单被撤销的事件（阶梯止盈先到 / 客户改参重挂）
+PENDING_OFF_EVENT = "manual_off"
 DETAIL_KIND = "manual_scatter"
 # 手动仓消失后成交历史还没写进来：最多再等几拍再放弃判定
 EXIT_RESOLVE_ATTEMPTS = 3
@@ -183,6 +199,223 @@ def tp_passed(direction: str, price: float, take_profit: float) -> bool:
     return False
 
 
+def pending_kind(direction: str, price: float, entry: float) -> Optional[str]:
+    """手动仓该挂哪种单：限价单还是止损单。
+
+    手动单的成交价必须**正好等于**配置入场价 —— 手数是按这个价反推的，
+    成交价偏一点，止盈时刻的净额就对不上目标金额。
+
+    所以按现价在入场价的哪一侧选单：
+    - BUY 现价高于入场 → Buy Limit，等价格回落到入场
+    - BUY 现价低于入场 → Buy Stop，等价格反弹回入场
+    - SELL 现价低于入场 → Sell Limit，等价格反弹到入场
+    - SELL 现价高于入场 → Sell Stop，等价格回落到入场
+
+    两种单都在入场价上成交，区别只是等待的方向。
+    """
+    side = str(direction or "").strip().upper()
+    p = _as_float(price)
+    e = _as_float(entry)
+    if side not in ("BUY", "SELL") or p <= 0 or e <= 0:
+        return None
+    if side == "BUY":
+        if p > e + 1e-12:
+            return "limit"   # 现价在上方，等回落
+        if p < e - 1e-12:
+            return "stop"    # 现价在下方，等反弹
+        return None
+    if p < e - 1e-12:
+        return "limit"       # 现价在下方，等反弹
+    if p > e + 1e-12:
+        return "stop"        # 现价在上方，等回落
+    return None
+
+
+def pending_entry_ok(direction: str, entry: float, price: float) -> bool:
+    """现价与入场价是否已经错开到可以挂单。
+
+    挂单要求价格严格落在现价的一侧；现价正好压在入场价上时两种单都挂不上
+    （限价单要低于/高于现价，止损单要高于/低于现价），此时返回 False。
+    """
+    return pending_kind(direction, price, entry) is not None
+
+
+def pending_comment(rule_type: int) -> str:
+    """挂单备注。与持仓的 M1/M2 同前缀，便于成交后从持仓认出是手动仓。"""
+    return comment_for(rule_type)
+
+
+def is_manual_pending(order: object) -> bool:
+    """这张挂单是不是手动分散仓挂出去的。
+
+    限价单与止损单都算：手动仓按现价在入场价的哪一侧决定挂哪种单，
+    两种单都是在入场价上成交。
+    """
+    if not isinstance(order, dict):
+        return False
+    if parse_rule_type(order.get("comment")) is None:
+        return False
+    return str(order.get("pending_kind") or "limit").strip().lower() in ("limit", "stop")
+
+
+def pending_rule_type(order: object) -> Optional[int]:
+    """挂单属于哪条规则的手动仓；不是手动单返回 None。"""
+    if not is_manual_pending(order):
+        return None
+    return parse_rule_type(order.get("comment"))
+
+
+def pending_volume(order: object) -> float:
+    """挂单的挂出量（部分成交后取剩余量）。"""
+    if not isinstance(order, dict):
+        return 0.0
+    return _as_float(order.get("volume"))
+
+
+def pending_price(order: object) -> float:
+    """挂单价格。"""
+    if not isinstance(order, dict):
+        return 0.0
+    return _as_float(order.get("price_open"))
+
+
+def pending_ticket(order: object) -> int:
+    """挂单票号。"""
+    if not isinstance(order, dict):
+        return 0
+    return _as_int(order.get("ticket"))
+
+
+def sl_is_sendable(
+    direction: str, stop_loss: float, entry: float, *,
+    stops_level: int = 0, point: float = 0.0,
+) -> bool:
+    """这个止损价能不能挂到限价单上。
+
+    限价单带止损时，止损必须落在**入场价的反方向**且离入场价足够远：
+    - BUY 限价单的止损要低于入场价（买进来后往下才是亏）
+    - SELL 限价单的止损要高于入场价
+
+    券商拒掉的是整张单（error 130 invalid stops），所以条件不满足就不带止损，
+    宁可少一个保护位，也不能让这张单挂不上去。
+    """
+    side = str(direction or "").strip().upper()
+    sl = _as_float(stop_loss)
+    e = _as_float(entry)
+    if side not in ("BUY", "SELL") or sl <= 0 or e <= 0:
+        return False
+    if side == "BUY" and sl >= e:
+        return False
+    if side == "SELL" and sl <= e:
+        return False
+    level = max(0, int(stops_level))
+    step = _as_float(point, 0.0)
+    if level > 0 and step > 0 and abs(e - sl) < level * step:
+        return False
+    return True
+
+
+def describe_pending(
+    watch: dict, volume: float, *, target_pl: Optional[float],
+    current_lot_size: float, profit_per_lot_value: float = 0.0,
+    volume_step: float = 0.01, projected_pl: float = 0.0,
+) -> str:
+    """挂出限价单的说明文案：手数怎么来的 + 挂在哪 + 止盈怎么对齐。"""
+    cfg = watch.get("cfg") if isinstance(watch.get("cfg"), dict) else {}
+    side = str(watch.get("direction") or "")
+    label = "逆势" if int(watch.get("rule_type") or 0) == RULE_TYPE_COUNTER else "顺势"
+    sl = _as_float(cfg.get("stop_loss"))
+    bits = [
+        f"手动分散仓（{label}）挂出限价单：{side} {_trim(volume)} 手",
+        volume_formula(
+            cfg=cfg, volume=volume, current_lot_size=current_lot_size,
+            target_pl=target_pl, profit_per_lot_value=profit_per_lot_value,
+            volume_step=volume_step, projected_pl=projected_pl,
+        ),
+        f"挂单价 {_trim(cfg.get('entry_price'))}",
+        f"止盈 {_trim(cfg.get('take_profit'))}（成交后统一同步到全部持仓）",
+    ]
+    bits.append(f"止损 {_trim(sl) if sl else '不设'}")
+    return "；".join(bits)
+
+
+def pending_detail(
+    watch: dict, volume: float, *, target_pl: Optional[float],
+    current_lot_size: float, profit_per_lot_value: float,
+    volume_step: float = 0.01, projected_pl: float = 0.0,
+    ticket: object = None, kind: Optional[str] = None,
+) -> dict[str, Any]:
+    """挂单事件的明细：和开仓明细同构，另加挂单票号与挂单类型。"""
+    cfg = watch.get("cfg") if isinstance(watch.get("cfg"), dict) else {}
+    src = normalize(cfg)
+    locked = bool(src.get("volume_locked") and src["volume"] > 0)
+    used_target = None if locked else target_pl
+    return {
+        **open_detail(
+            watch, volume, target_pl=used_target,
+            current_lot_size=current_lot_size,
+            profit_per_lot_value=profit_per_lot_value,
+            volume_step=volume_step, projected_pl=projected_pl,
+        ),
+        "pending_ticket": _as_int(ticket) or None,
+        "pending_kind": str(kind or ""),
+        "pending_action": "place",
+    }
+
+
+def describe_pending_filled(rule_type: int, snap: dict, *, aligned: int) -> str:
+    """限价单成交后的说明。"""
+    label = "逆势" if int(rule_type or 0) == RULE_TYPE_COUNTER else "顺势"
+    side = str(snap.get("type") or "").upper() or "?"
+    return (
+        f"手动分散仓（{label}）限价单成交：{side} {_trim(snap.get('volume'))} 手 "
+        f"#{_as_int(snap.get('ticket'))} 开在 {_trim(snap.get('price_open'))}；"
+        f"止盈价已同步到 {int(aligned)} 笔持仓"
+    )
+
+
+def pending_filled_detail(
+    rule_type: int, snap: dict, *, aligned: int,
+) -> dict[str, Any]:
+    """成交事件的明细。"""
+    return {
+        "kind": DETAIL_KIND,
+        "rule_type": int(rule_type or 0),
+        "direction": str(snap.get("type") or "").upper() or None,
+        "ticket": _as_int(snap.get("ticket")) or None,
+        "volume": _as_float(snap.get("volume")),
+        "entry_price": _as_float(snap.get("price_open")) or None,
+        "take_profit": _as_float(snap.get("tp")) or None,
+        "aligned_tickets": int(aligned),
+        "pending_action": "filled",
+        "comment": comment_for(rule_type),
+    }
+
+
+def tp_is_sendable(
+    direction: str, take_profit: float, market: float, *,
+    stops_level: int = 0, point: float = 0.0,
+) -> bool:
+    """这个止盈价能不能写进订单：方向在现价正确一侧，且离现价不近于券商的 stops_level。
+
+    券商拒掉的是**整张单**，而不只是丢掉止盈这一侧，所以宁可这次不写。
+    """
+    side = str(direction or "").strip().upper()
+    px = _as_float(take_profit)
+    mkt = _as_float(market)
+    if side not in ("BUY", "SELL") or px <= 0 or mkt <= 0:
+        return False
+    if side == "BUY" and px <= mkt:
+        return False
+    if side == "SELL" and px >= mkt:
+        return False
+    level = max(0, int(stops_level))
+    step = _as_float(point, 0.0)
+    if level > 0 and step > 0 and abs(px - mkt) < level * step:
+        return False
+    return True
+
+
 def describe_tp_passed(
     direction: str, price: float, entry: float, take_profit: float,
 ) -> str:
@@ -215,6 +448,55 @@ def match_target_pl(lot_pl_tiers: object, current_lot_size: float) -> Optional[f
         if lot + 1e-12 >= min_lot:
             return pla
     return None
+
+
+def tier0_pl_amount(lot_pl_tiers: object) -> Optional[float]:
+    """分档批次1的目标金额（绝对值）。分档未启用或金额为 0 时返回 None。
+
+    手动分散仓按固定第一档对齐信号共同止盈的口径，不随当前手数命中高档。
+    """
+    src = lot_pl_tiers if isinstance(lot_pl_tiers, dict) else {}
+    if not src.get("enabled"):
+        return None
+    tiers = src.get("tiers") if isinstance(src.get("tiers"), list) else []
+    if not tiers:
+        return None
+    amount = abs(_as_float(tiers[0].get("pl_amount"), 0.0))
+    return amount if amount > 0 else None
+
+
+def position_profit_at(
+    pos: dict, price: float, tick_size: float, tick_value: float,
+) -> float:
+    """某笔持仓在 `price` 处的浮动盈亏（不含 swap / 手续费）。
+
+    用开仓价与目标价的距离折算，不看当下的浮盈：手动仓止盈那一刻，现价已经
+    走到止盈价，存量仓位的盈亏必须按那一刻的价格重估，否则算出来的手数
+    到价时对不上目标金额。
+    """
+    side = str(pos.get("type") or "").upper()
+    vol = _as_float(pos.get("volume"))
+    open_price = _as_float(pos.get("price_open"))
+    px = _as_float(price)
+    if side not in ("BUY", "SELL") or vol <= 0 or open_price <= 0 or px <= 0:
+        return 0.0
+    size = _as_float(tick_size)
+    value = _as_float(tick_value)
+    if size <= 0 or value <= 0:
+        return 0.0
+    diff = (px - open_price) if side == "BUY" else (open_price - px)
+    return diff * vol * (value / size)
+
+
+def projected_profit(
+    positions: list | tuple | None, price: float, tick_size: float, tick_value: float,
+) -> float:
+    """全部持仓在 `price` 处的浮动盈亏合计。"""
+    total = 0.0
+    for pos in positions or []:
+        if isinstance(pos, dict):
+            total += position_profit_at(pos, price, tick_size, tick_value)
+    return total
 
 
 def profit_per_lot(entry: float, take_profit: float, tick_size: float, tick_value: float) -> float:
@@ -256,17 +538,24 @@ def compute_volume(
     volume_step: float = 0.01,
     volume_min: float = 0.01,
     volume_max: float = 100.0,
+    projected_pl: float = 0.0,
 ) -> Optional[float]:
-    """返回开仓手数；无法计算返回 None。
+    """返回开仓手数；无法计算返回 None（返回 None 表示不该开手动仓）。
 
     volume_locked 且 volume>0 时直接用配置手数（仍夹到 min/max/step）。
+    目标金额 = 分档批次1的 pl_amount − 存量仓位到止盈时刻的预估盈亏：
+      存量浮亏（projected_pl < 0）→ 目标变大，手数加厚，补上亏损；
+      存量浮盈（projected_pl > 0）→ 目标变小，手数收薄，抵扣掉已赚的；
+      两种情况都让手动仓止盈那一刻的净额刚好等于目标金额。
+    存量浮盈已经超过目标金额时按品种最小手数开：手动仓是本任务最后一次加仓，
+    它的止盈价是全部仓位的止盈权威、止盈联动清仓也挂在它身上，不能没有。
     """
     src = normalize(cfg)
     if src.get("volume_locked") and src["volume"] > 0:
         return ceil_to_step(
             src["volume"], volume_step, volume_min, volume_max,
         )
-    target = match_target_pl(lot_pl_tiers, current_lot_size)
+    target = tier0_pl_amount(lot_pl_tiers)
     if target is None:
         if src["volume"] > 0:
             return ceil_to_step(src["volume"], volume_step, volume_min, volume_max)
@@ -274,7 +563,13 @@ def compute_volume(
     per = profit_per_lot(src["entry_price"], src["take_profit"], tick_size, tick_value)
     if per <= 0:
         return None
-    raw = abs(float(target)) / per
+    # 存量在止盈时刻的预估盈亏：浮盈抵扣、浮亏补上
+    remaining = abs(target) - float(projected_pl or 0.0)
+    if remaining <= 0:
+        # 存量仓位在止盈时刻已经赚到目标金额（或更多）：按最小手数开，
+        # 净额会略超目标，但手动仓本身必须存在（止盈权威 / 联动清仓都靠它）
+        return ceil_to_step(volume_min, volume_step, volume_min, volume_max)
+    raw = remaining / per
     sized = ceil_to_step(raw, volume_step, volume_min, volume_max)
     return sized if sized > 0 else None
 
@@ -309,8 +604,186 @@ def extract_watches(rules: object) -> list[dict[str, Any]]:
             "direction": direction,
             "lot_pl_tiers": lot_pl,
             "comment": comment_for(rule_type),
+            # 该规则的分批加仓是否启用；未启用时不设「先加完」的门槛
+            "batch_enabled": bool(raw.get("batch_enabled")),
+            # 原始规则，用于判定「本规则分批加仓是否已加完」
+            "rule": raw,
         })
     return out
+
+
+# ----------------------------------------------------------------------
+# 手动单生命周期：NONE -> PENDING -> FILLED / VOID
+# ----------------------------------------------------------------------
+# 未配置（或已被消费摘除）：什么手动单都没有
+STATE_NONE = "none"
+# 挂单在盘上，等终端撮合：这一段允许客户改参数（撤旧单重算重挂）
+STATE_PENDING = "pending"
+# 挂单已成交成持仓：配置彻底锁定，之后一律不许改
+STATE_FILLED = "filled"
+# 挂单被撤销（阶梯止盈先到 / 任务收口）：本任务内不再自动挂
+STATE_VOID = "void"
+
+# 撤销原因
+OFF_LADDER_TP = "ladder_tp"      # 阶梯止盈先到
+OFF_REPLACED = "replaced"        # 客户改参，撤旧单重挂
+OFF_CLOSED = "closed"            # 任务收口
+
+
+def pending_signature(snap: dict) -> tuple:
+    """在途挂单的配置签名：只含「客户能改的那几项」。
+
+    用来判断热推后的新配置与盘上那张单是否真的不一样——一样就不动，
+    不一样才撤单重算重挂。
+    """
+    src = snap if isinstance(snap, dict) else {}
+    return (
+        round(_as_float(src.get("price_open")), 8),
+        round(_as_float(src.get("tp")), 8),
+        round(_as_float(src.get("sl")), 8),
+        round(_as_float(src.get("volume")), 8),
+        str(src.get("type") or "").strip().upper(),
+    )
+
+
+def cfg_signature(cfg: dict) -> tuple:
+    """配置侧的手动单签名，与 `pending_signature` 同一套字段口径。
+
+    手数只比「手填锁定」的那一份：非锁定时手数是按分档反推出来的，
+    盘上那张单的手数就是结果，比它没有意义。
+    """
+    src = normalize(cfg)
+    locked = bool(src.get("volume_locked") and src["volume"] > 0)
+    return (
+        round(_as_float(src.get("entry_price")), 8),
+        round(_as_float(src.get("take_profit")), 8),
+        round(_as_float(src.get("stop_loss")), 8),
+        round(_as_float(src["volume"]) if locked else 0.0, 8),
+        locked,
+    )
+
+
+def pending_matches_cfg(
+    cfg: dict, snap: dict, *, stops_level: int = 0, point: float = 0.0,
+) -> bool:
+    """盘上那张挂单是否与当前配置一致。
+
+    一致就不动它（改单要撤单重挂，频繁撤挂会触券商限频）。不一致才重挂。
+
+    止损的对照口径与挂出时一致：配了但挂不上（券商 stops_level 或方向不对）
+    时盘上就是没止损，那也算一致——否则每次热推都会无意义地撤单重挂。
+    """
+    src = normalize(cfg)
+    cur = snap if isinstance(snap, dict) else {}
+    if round(_as_float(cur.get("price_open")), 8) != round(src["entry_price"], 8):
+        return False
+    if round(_as_float(cur.get("tp")), 8) != round(src["take_profit"], 8):
+        return False
+    sl = src["stop_loss"]
+    if sl > 0:
+        direction = direction_from_prices(src["entry_price"], src["take_profit"])
+        expect_sl = sl if (
+            direction
+            and sl_is_sendable(
+                direction, sl, src["entry_price"],
+                stops_level=stops_level, point=point,
+            )
+        ) else 0.0
+        if round(_as_float(cur.get("sl")), 8) != round(expect_sl, 8):
+            return False
+    else:
+        if round(_as_float(cur.get("sl")), 8) != 0.0:
+            return False
+    locked = bool(src.get("volume_locked") and src["volume"] > 0)
+    if locked and round(_as_float(cur.get("volume")), 8) != round(src["volume"], 8):
+        return False
+    return True
+
+
+def describe_pending_off(reason: str) -> str:
+    """挂单被撤销的人话说明。"""
+    if reason == OFF_LADDER_TP:
+        return (
+            "阶梯止盈先到达，手动分散仓挂单已撤销："
+            "仓位已按阶梯止盈收口，手动单不再入场"
+        )
+    if reason == OFF_REPLACED:
+        return "手动分散仓参数已调整：原挂单已撤销，按新参数重新挂单"
+    if reason == OFF_CLOSED:
+        return "手动分散仓挂单已撤销：任务收口"
+    return "手动分散仓挂单已撤销"
+
+
+def pending_off_detail(
+    rule_type: int, reason: str, *, ticket: object = None,
+) -> dict[str, Any]:
+    """挂单撤销事件的明细。"""
+    return {
+        "kind": DETAIL_KIND,
+        "rule_type": int(rule_type or 0),
+        "pending_ticket": _as_int(ticket) or None,
+        "pending_action": "cancel",
+        "off_reason": str(reason or ""),
+        "comment": comment_for(rule_type),
+    }
+
+
+# ----------------------------------------------------------------------
+# 先后顺序：手动分散仓要等本规则的分批加仓先加完
+# ----------------------------------------------------------------------
+def batch_add_limit(rule: object) -> int:
+    """本规则分批加仓的笔数上限。
+
+    分批启用时用 total_lot_limit；未启用时回退到 max_allow_num。
+    两者都为 0 表示不限（此时不设门槛）。
+    """
+    src = rule if isinstance(rule, dict) else {}
+    if src.get("batch_enabled"):
+        limit = _as_int(src.get("total_lot_limit"), 0)
+        if limit > 0:
+            return limit
+        return 0
+    limit = _as_int(src.get("max_allow_num"), 0)
+    return limit if limit > 0 else 0
+
+
+def batch_pending(rule: object) -> bool:
+    """该规则的分批加仓是否还有没加完的档位。
+
+    已加笔数达到上限才算加完。分批未启用时不算门槛（False）。
+    """
+    src = rule if isinstance(rule, dict) else {}
+    if not src.get("batch_enabled"):
+        return False
+    limit = batch_add_limit(src)
+    if limit <= 0:
+        return False
+    return True
+
+
+def manual_blocked_reason(
+    rule: object, added_count: int, *, pending_counter: bool = False,
+) -> Optional[str]:
+    """手动分散仓现在能不能开；不能开时返回原因文案。
+
+    门槛：同一条规则的分批加仓必须先加完（已加笔数达到上限）。
+    在途的逆势限价单说明那一档还没成交，同样算没加完。
+    规则没启用分批加仓时不设门槛。
+    """
+    src = rule if isinstance(rule, dict) else {}
+    if not src.get("batch_enabled"):
+        return None
+    limit = batch_add_limit(src)
+    if limit <= 0:
+        return None
+    if pending_counter:
+        return "本规则还有在途的逆势加仓限价单，分批尚未加完，手动分散仓暂不开仓"
+    if int(added_count or 0) < limit:
+        return (
+            f"本规则分批加仓尚未加完（已加 {int(added_count or 0)} / {limit} 笔），"
+            "手动分散仓暂不开仓"
+        )
+    return None
 
 
 # ----------------------------------------------------------------------
@@ -322,6 +795,34 @@ def linkage_rule_types(rules: object) -> set[int]:
         int(w["rule_type"]) for w in extract_watches(rules)
         if bool((w.get("cfg") or {}).get("close_all_on_tp"))
     }
+
+
+# ----------------------------------------------------------------------
+# 加仓收口：手动分散仓是本任务的最后一次加仓
+# ----------------------------------------------------------------------
+def add_closed_rule_types(fired: object) -> set[int]:
+    """哪些规则类型的加仓已经收口。
+
+    手动分散仓是本任务的最后一次加仓：它一挂出单，就代表这条规则的批次已经
+    铺完，不能再开新的分批加仓（逆势 / 顺势都不再）。收口是**按规则**判定的，
+    逆势的手动仓只锁逆势，顺势照常。
+
+    `fired` 是节点的 `_manual_fired` 集合（规则类型 -> 已开过）。
+    """
+    out: set[int] = set()
+    for item in fired or []:
+        try:
+            rule_type = int(item)
+        except (TypeError, ValueError):
+            continue
+        if rule_type in (RULE_TYPE_COUNTER, RULE_TYPE_TREND):
+            out.add(rule_type)
+    return out
+
+
+def is_add_closed(fired: object, rule_type: int) -> bool:
+    """这条规则的加仓是否已经收口（手动分散仓已开）。"""
+    return int(rule_type or 0) in add_closed_rule_types(fired)
 
 
 def _snapshot_from_position(pos: dict) -> dict[str, Any]:
@@ -401,6 +902,52 @@ def parse_runtime_open(raw: object) -> dict[int, dict[str, Any]]:
         if rt not in (RULE_TYPE_COUNTER, RULE_TYPE_TREND) or not isinstance(snap, dict):
             continue
         parsed = _snapshot_from_position(snap)
+        if parsed["ticket"] <= 0:
+            continue
+        out[rt] = parsed
+    return out
+
+
+def runtime_pending_payload(tracked: dict[int, dict] | None) -> dict[str, dict[str, Any]]:
+    """写进 runtime 的在途手动限价单；键转字串以便 JSON 落库。
+
+    挂出后节点就不知道这张单还在不在盘上了——重连时靠这个还原，
+    避免重连后重复挂一张（挂出去两次就是双倍手数）。
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for rt, snap in (tracked or {}).items():
+        if not isinstance(snap, dict):
+            continue
+        out[str(int(rt))] = {
+            "ticket": _as_int(snap.get("ticket")),
+            "type": str(snap.get("type") or ""),
+            "volume": _as_float(snap.get("volume")),
+            "price_open": _as_float(snap.get("price_open")),
+            "sl": _as_float(snap.get("sl")),
+            "tp": _as_float(snap.get("tp")),
+            "time": _as_float(snap.get("time")),
+        }
+    return out
+
+
+def parse_runtime_pending(raw: object) -> dict[int, dict[str, Any]]:
+    """从服务端落库的 runtime 还原在途手动限价单；脏数据一律丢弃。"""
+    out: dict[int, dict[str, Any]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for key, snap in raw.items():
+        rt = _as_int(key, -1)
+        if rt not in (RULE_TYPE_COUNTER, RULE_TYPE_TREND) or not isinstance(snap, dict):
+            continue
+        parsed = {
+            "ticket": _as_int(snap.get("ticket")),
+            "type": str(snap.get("type") or "").strip().upper(),
+            "volume": _as_float(snap.get("volume")),
+            "price_open": _as_float(snap.get("price_open")),
+            "sl": _as_float(snap.get("sl")),
+            "tp": _as_float(snap.get("tp")),
+            "time": _as_float(snap.get("time")),
+        }
         if parsed["ticket"] <= 0:
             continue
         out[rt] = parsed
@@ -526,6 +1073,7 @@ def volume_formula(
     target_pl: Optional[float],
     profit_per_lot_value: float,
     volume_step: float = 0.01,
+    projected_pl: float = 0.0,
 ) -> str:
     """手数怎么来的：手填锁定 / 分档反推 / 配置手数。"""
     src = normalize(cfg)
@@ -537,18 +1085,35 @@ def volume_formula(
             return f"手数 = 手填锁定 {filled}，按品种步长取整为 {sized}（不按分档反推）"
         return f"手数 = 手填锁定 {sized}（不按分档反推）"
     if target_pl is not None and profit_per_lot_value > 0:
-        raw = abs(float(target_pl)) / profit_per_lot_value
         step = volume_step if volume_step > 0 else 0.01
+        pl = float(projected_pl or 0.0)
+        # 存量在止盈时刻的预估盈亏：浮盈抵扣、浮亏补上
+        remaining = abs(float(target_pl)) - pl
+        head = f"手数 = (分档目标 {_trim(abs(float(target_pl)), 2)}u"
+        if pl < -1e-9:
+            head += f" + 存量仓位到止盈预估亏损 {_trim(-pl, 2)}u)"
+        elif pl > 1e-9:
+            # 用 ASCII 的减号：U+2212 在 GBK 码页下写日志会抛 UnicodeEncodeError
+            head += f" - 存量仓位到止盈预估盈利 {_trim(pl, 2)}u)"
+        else:
+            head += ")"
+        if remaining <= 0:
+            # 存量浮盈已经超过目标金额：按最小手数开，净额会略超目标
+            return (
+                f"{head} ÷ 每手止盈 {_trim(profit_per_lot_value, 4)}u"
+                f" ≤ 0 → 按品种最小手数开 {_trim(volume)}"
+                f"；当前仓 {_trim(current_lot_size)} 手"
+            )
+        raw = remaining / profit_per_lot_value
         return (
-            f"手数 = 分档目标 {_trim(abs(float(target_pl)), 2)}u"
-            f" ÷ 每手止盈 {_trim(profit_per_lot_value, 4)}u"
+            f"{head} ÷ 每手止盈 {_trim(profit_per_lot_value, 4)}u"
             f" = {_trim(raw, 4)}，向上取整到步长 {_trim(step, 4)}"
-            f" → {sized}；当前仓 {_trim(current_lot_size)} 手命中该档"
+            f" → {sized}；当前仓 {_trim(current_lot_size)} 手"
         )
     if src["volume"] > 0:
         return (
             f"手数 = 配置 {_trim(src['volume'])}"
-            f"（分档未启用或当前仓 {_trim(current_lot_size)} 手未命中），取整为 {sized}"
+            f"（分档未启用），取整为 {sized}"
         )
     return f"手数 {sized}"
 
@@ -556,7 +1121,7 @@ def volume_formula(
 def describe_open(
     watch: dict, volume: float, *, target_pl: Optional[float],
     current_lot_size: float, profit_per_lot_value: float = 0.0,
-    volume_step: float = 0.01,
+    volume_step: float = 0.01, projected_pl: float = 0.0,
 ) -> str:
     cfg = watch.get("cfg") if isinstance(watch.get("cfg"), dict) else {}
     side = str(watch.get("direction") or "")
@@ -566,7 +1131,7 @@ def describe_open(
         volume_formula(
             cfg=cfg, volume=volume, current_lot_size=current_lot_size,
             target_pl=target_pl, profit_per_lot_value=profit_per_lot_value,
-            volume_step=volume_step,
+            volume_step=volume_step, projected_pl=projected_pl,
         ),
         f"入场 {_trim(cfg.get('entry_price'))}",
         f"止盈 {_trim(cfg.get('take_profit'))}",
@@ -580,7 +1145,7 @@ def describe_open(
 
 def open_detail(watch: dict, volume: float, *, target_pl: Optional[float],
                 current_lot_size: float, profit_per_lot_value: float,
-                volume_step: float = 0.01) -> dict[str, Any]:
+                volume_step: float = 0.01, projected_pl: float = 0.0) -> dict[str, Any]:
     cfg = watch.get("cfg") if isinstance(watch.get("cfg"), dict) else {}
     src = normalize(cfg)
     locked = bool(src.get("volume_locked") and src["volume"] > 0)
@@ -599,10 +1164,13 @@ def open_detail(watch: dict, volume: float, *, target_pl: Optional[float],
             target_pl=used_target,
             profit_per_lot_value=profit_per_lot_value,
             volume_step=volume_step,
+            projected_pl=projected_pl,
         ),
         "target_pl": used_target,
         "current_lot": current_lot_size,
         "profit_per_lot": profit_per_lot_value,
         "volume_step": volume_step,
+        # 存量仓位到止盈时刻的预估盈亏：浮盈抵扣、浮亏补上
+        "projected_pl": round(float(projected_pl or 0.0), 2),
         "comment": watch.get("comment"),
     }
