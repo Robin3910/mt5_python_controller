@@ -266,7 +266,7 @@ const runtimeBanner = computed<{ title: string; lines: string[] } | null>(() => 
   const fired = hints.manual_fired || []
   if (fired.length) {
     const labels = fired.map((t) => RULE_TYPE_LABEL[Number(t)] || `类型${t}`)
-    lines.push(`${labels.join('、')}的手动分散仓已开仓，本任务加仓已收口，该配置已锁定。`)
+    lines.push(`${labels.join('、')}的手动分散仓进场后，任务加仓会收口，配置直接锁定。`)
   }
   // 手动单的生命周期：挂单在盘上的还能改，已成交的锁死
   const states = hints.manual_state || {}

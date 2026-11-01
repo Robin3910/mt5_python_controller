@@ -63,6 +63,12 @@ const DISPATCH_MODE_LABEL: Record<GroupDispatchMode, string> = {
   poll: '轮询轮转（单节点领取）',
 }
 
+/** 手机端卡片用的短标签，避免长文案把一行撑开 */
+const DISPATCH_MODE_SHORT: Record<GroupDispatchMode, string> = {
+  sync: '同步',
+  poll: '轮询',
+}
+
 const FIELD_HELP = {
   name: '分组名称，全局唯一。会展示在信号明细与操作审计中，便于追溯是哪个分组下发的订单。',
   enabled:
@@ -767,10 +773,7 @@ async function onStrategyFormSaved(): Promise<void> {
     <div class="row between page-header">
       <div>
         <div class="h1">分组管理</div>
-        <p class="muted" style="font-size: 13px; margin-top: 4px">
-          分组是 strategy 信号的分发单元：Webhook 携带 <code>model=strategy</code> 时按分组分发，
-          与按币种分发（<code>model=normal</code>，默认）的规则完全隔离
-        </p>
+
       </div>
       <div class="row" style="gap: 8px">
         <button class="btn-ghost" @click="router.push('/strategies')">策略管理</button>
@@ -802,177 +805,145 @@ async function onStrategyFormSaved(): Promise<void> {
       </p>
     </div>
 
-    <!-- 移动端卡片 -->
+    <!-- 移动端卡片：默认只显示「标题 + 关键统计 + 常用开关」，点击展开明细 -->
     <div class="group-cards mobile-only">
       <div v-for="g in hub.groups" :key="g.group_id" class="group-card card">
-        <div class="group-row" @click="toggleGroupDetail(g.group_id)">
-          <div class="group-title">
+        <div class="group-head" @click="toggleGroupDetail(g.group_id)">
+          <div class="group-head-main">
             <strong class="group-name">{{ g.name }}</strong>
-            <span class="tag" :class="g.enabled ? 'green' : ''">{{ g.enabled ? '已启用' : '已禁用' }}</span>
-            <span class="tag blue">{{ DISPATCH_MODE_LABEL[g.dispatch_mode] }}</span>
-            <span v-if="g.signal_concurrent_enabled" class="tag">信号并发</span>
+            <span class="tag" :class="g.enabled ? 'green' : 'red'">{{ g.enabled ? '启用' : '禁用' }}</span>
+            <span class="tag blue">{{ DISPATCH_MODE_SHORT[g.dispatch_mode] }}</span>
+            <span v-if="g.signal_concurrent_enabled" class="tag">并发</span>
           </div>
-          <div class="group-stats">
-            <span class="group-stat"><b>{{ g.online_node_count }}</b>/{{ g.node_count }} 节点</span>
-            <span class="group-stat"><b>{{ g.signal_count }}</b> 信号</span>
-            <span class="group-stat"><b>{{ g.active_task_count }}</b> 进行中</span>
-            <span class="group-caret" :class="{ open: groupDetailOpen[g.group_id] }">▾</span>
-          </div>
-        </div>
-        <div v-if="groupDetailOpen[g.group_id]" class="group-detail">
-          <div class="list-field"><span class="k">分组 ID</span><span class="v muted" style="font-size: 12px; font-weight: 500">{{ g.group_id }}</span></div>
-          <div v-if="auth.isAdmin" class="list-field"><span class="k">所有者</span><span class="v">{{ g.owner_username || '管理员' }}</span></div>
-          <div class="list-field">
-            <span class="k">绑定策略</span>
-            <span class="v">
-              <button v-if="g.strategy_id" class="btn-sm btn-success" @click="openGroupStrategyEdit(g)">{{ g.strategy_name || '编辑策略' }}</button>
-              <span v-else class="muted">未绑定</span>
-            </span>
-          </div>
-          <div class="list-field">
-            <span class="k">趋势风控</span>
-            <span class="v">
-              <button
-                class="btn-sm"
-                :class="g.trend_risk_enabled ? 'btn-success' : 'btn-danger'"
-                :title="FIELD_HELP.trend_risk"
-                @click="toggleTrendRisk(g)"
-              >
-                {{ g.trend_risk_enabled ? '已开启' : '已关闭' }}
-              </button>
-            </span>
-          </div>
-          <div class="list-field">
-            <span class="k">限价监听</span>
-            <span class="v">
-              <button
-                v-if="isTrendGroup(g)"
-                class="btn-sm"
-                :class="g.limit_watch_enabled ? 'btn-success' : 'btn-danger'"
-                :title="limitWatchButtonTitle(g)"
-                @click="toggleLimitWatch(g)"
-              >
-                {{ g.limit_watch_enabled ? '已开启' : '已关闭' }}
-              </button>
-              <span v-else class="muted">—</span>
-            </span>
-          </div>
-          <div v-if="g.limit_watch_enabled" class="list-field list-field-block">
-            <span class="k">监听日志</span>
-            <span class="v">
-              <LimitWatchLogCell :logs="watchLogsOf(g)" @open="openWatchLogs(g)" />
-            </span>
-          </div>
-          <div class="list-field">
-            <span class="k">信号</span>
-            <span class="v">
-              <button class="btn-sm btn-success" @click="openSignals(g)">{{ g.signal_count }} 条</button>
-            </span>
-          </div>
-          <div class="list-field">
-            <span class="k">进行中</span>
-            <span class="v">
-              <button
-                v-if="g.active_task_count > 0"
-                class="btn-sm btn-success"
-                @click="openActiveSignals(g)"
-              >{{ g.active_task_count }} 条</button>
-              <span v-else class="muted">—</span>
-            </span>
-          </div>
-          <div class="list-field"><span class="k">备注</span><span class="v muted" style="font-size: 12px; font-weight: 500">{{ g.remark || '—' }}</span></div>
+          <span class="group-caret" :class="{ open: groupDetailOpen[g.group_id] }">▾</span>
         </div>
 
-        <div class="list-field">
-          <span class="k">限价监听</span>
-          <span class="v">
-            <button
-              v-if="isTrendGroup(g)"
-              class="btn-sm"
-              :class="g.limit_watch_enabled ? 'btn-success' : 'btn-danger'"
-              :title="limitWatchButtonTitle(g)"
-              @click="toggleLimitWatch(g)"
-            >
-              {{ g.limit_watch_enabled ? '已开启' : '已关闭' }}
-            </button>
-            <span v-else class="muted">—</span>
+        <!-- 关键统计：横排紧凑 -->
+        <div class="group-chips" @click.stop>
+          <span class="chip"><b>{{ g.online_node_count }}</b>/{{ g.node_count }} 节点</span>
+          <span class="chip"><b>{{ g.signal_count }}</b> 信号</span>
+          <span class="chip" :class="{ warn: g.active_task_count > 0 }"><b>{{ g.active_task_count }}</b> 进行中</span>
+          <span v-if="followerCountOf(g) > 0" class="chip">
+            <b>{{ followerCountOf(g) }}</b> 跟单
           </span>
+          <button
+            v-if="g.active_task_count > 0"
+            class="chip chip-btn"
+            @click="openActiveSignals(g)"
+          >
+            查看
+          </button>
         </div>
-        <div class="list-field">
-          <span class="k">开放 AI 跟单</span>
-          <span class="v">
-            <button
-              v-if="isAiGroup(g)"
-              class="btn-sm"
-              :class="g.accept_ai_follow ? 'btn-success' : 'btn-danger'"
-              :title="g.accept_ai_follow ? '已开放：分组进入【AI 交易】广场' : '已关闭：分组不进入【AI 交易】广场'"
-              @click="toggleAcceptAiFollow(g)"
-            >
-              {{ g.accept_ai_follow ? '已开放' : '已关闭' }}
-            </button>
-            <span v-else class="muted">—</span>
-          </span>
-        </div>
-        <div v-if="g.limit_watch_enabled" class="list-field list-field-block">
-          <span class="k">监听日志</span>
-          <span class="v">
-            <LimitWatchLogCell :logs="watchLogsOf(g)" @open="openWatchLogs(g)" />
-          </span>
-        </div>
-        <div v-if="g.strategy_id" class="list-field">
-          <span class="k">策略</span>
-          <span class="v">
-            <button class="btn-sm btn-success" @click="openGroupStrategyEdit(g)">编辑策略</button>
-          </span>
-        </div>
-        <div class="list-field">
-          <span class="k">信号</span>
-          <span class="v">
-            <button class="btn-sm btn-success" @click="openSignals(g)">{{ g.signal_count }} 条</button>
-          </span>
-        </div>
-        <div class="list-field"><span class="k">成员节点</span><span class="v">{{ g.node_count }}</span></div>
-        <div class="list-field"><span class="k">有效节点</span><span class="v">{{ g.online_node_count }}</span></div>
-        <div class="list-field">
-          <span class="k">跟单节点</span>
-          <span class="v">
-            <button
-              v-if="followerCountOf(g) > 0"
-              class="btn-sm btn-ghost"
-              title="查看跟单员放进本分组的节点（只读）"
-              @click="openFollowers(g)"
-            >
-              {{ followerCountOf(g) }} 个 · {{ g.online_follower_count ?? 0 }} 在线
-            </button>
-            <span v-else class="muted">—</span>
-          </span>
-        </div>
-        <div class="list-field">
-          <span class="k">进行中</span>
-          <span class="v">
-            <button
-              v-if="g.active_task_count > 0"
-              class="btn-sm btn-success"
-              @click="openActiveSignals(g)"
-            >{{ g.active_task_count }} 条</button>
-            <span v-else class="muted">—</span>
-          </span>
-        </div>
-        <div class="list-field"><span class="k">备注</span><span class="v muted" style="font-size: 12px; font-weight: 500">{{ g.remark || '—' }}</span></div>
-        <div class="list-card-actions group-actions">
 
-          <button class="btn-sm" :class="g.enabled ? 'btn-success' : 'btn-danger'" @click="toggleEnabled(g)">
-            {{ g.enabled ? '禁用' : '启用' }}
+        <!-- 常用开关：横排紧凑 -->
+        <div class="group-switches" @click.stop>
+          <button
+            class="mini-toggle"
+            :class="g.trend_risk_enabled ? 'on' : 'off'"
+            :title="FIELD_HELP.trend_risk"
+            @click="toggleTrendRisk(g)"
+          >
+            趋势{{ g.trend_risk_enabled ? '开' : '关' }}
           </button>
           <button
-            class="btn-sm btn-danger"
-            :disabled="!!closingGroupIds[g.group_id]"
-            @click="closeGroup(g)"
+            v-if="isTrendGroup(g)"
+            class="mini-toggle"
+            :class="g.limit_watch_enabled ? 'on' : 'off'"
+            :title="limitWatchButtonTitle(g)"
+            @click="toggleLimitWatch(g)"
           >
-            {{ closingGroupIds[g.group_id] ? '下发中…' : '平仓' }}
+            限价{{ g.limit_watch_enabled ? '开' : '关' }}
           </button>
-          <button class="btn-sm btn-ghost" @click="openEdit(g)">编辑</button>
-          <button class="btn-sm btn-danger" @click="remove(g)">删除</button>
+          <button
+            v-if="isAiGroup(g)"
+            class="mini-toggle"
+            :class="g.accept_ai_follow ? 'on' : 'off'"
+            :title="g.accept_ai_follow ? '已开放：分组进入【AI 交易】广场' : '已关闭：分组不进入【AI 交易】广场'"
+            @click="toggleAcceptAiFollow(g)"
+          >
+            AI{{ g.accept_ai_follow ? '开' : '关' }}
+          </button>
+        </div>
+
+        <!-- 展开明细 -->
+        <div v-if="groupDetailOpen[g.group_id]" class="group-detail">
+          <div class="group-detail-grid">
+            <div class="mini-kv"><span class="k">分组 ID</span><span class="v">{{ g.group_id }}</span></div>
+            <div v-if="auth.isAdmin" class="mini-kv">
+              <span class="k">所有者</span><span class="v">{{ g.owner_username || '管理员' }}</span>
+            </div>
+            <div class="mini-kv">
+              <span class="k">成员节点</span><span class="v">{{ g.node_count }}（{{ g.online_node_count }} 在线）</span>
+            </div>
+            <div class="mini-kv">
+              <span class="k">分发模式</span><span class="v">{{ DISPATCH_MODE_LABEL[g.dispatch_mode] }}</span>
+            </div>
+            <div class="mini-kv mini-kv-block">
+              <span class="k">绑定策略</span>
+              <span class="v">
+                <button v-if="g.strategy_id" class="btn-sm btn-success" @click="openGroupStrategyEdit(g)">
+                  {{ g.strategy_name || '编辑策略' }}
+                </button>
+                <span v-else class="muted">未绑定</span>
+              </span>
+            </div>
+            <div class="mini-kv">
+              <span class="k">信号</span>
+              <span class="v">
+                <button class="btn-sm btn-success" @click="openSignals(g)">{{ g.signal_count }} 条</button>
+              </span>
+            </div>
+            <div class="mini-kv">
+              <span class="k">进行中</span>
+              <span class="v">
+                <button
+                  v-if="g.active_task_count > 0"
+                  class="btn-sm btn-success"
+                  @click="openActiveSignals(g)"
+                >{{ g.active_task_count }} 条</button>
+                <span v-else class="muted">—</span>
+              </span>
+            </div>
+            <div class="mini-kv">
+              <span class="k">跟单节点</span>
+              <span class="v">
+                <button
+                  v-if="followerCountOf(g) > 0"
+                  class="btn-sm btn-ghost"
+                  title="查看跟单员放进本分组的节点（只读）"
+                  @click="openFollowers(g)"
+                >
+                  {{ followerCountOf(g) }} 个 · {{ g.online_follower_count ?? 0 }} 在线
+                </button>
+                <span v-else class="muted">—</span>
+              </span>
+            </div>
+            <div v-if="g.limit_watch_enabled" class="mini-kv mini-kv-block">
+              <span class="k">监听日志</span>
+              <span class="v">
+                <LimitWatchLogCell :logs="watchLogsOf(g)" @open="openWatchLogs(g)" />
+              </span>
+            </div>
+            <div class="mini-kv mini-kv-block">
+              <span class="k">备注</span>
+              <span class="v muted remark-text">{{ g.remark || '—' }}</span>
+            </div>
+          </div>
+
+          <div class="group-actions">
+            <button class="btn-sm" :class="g.enabled ? 'btn-success' : 'btn-danger'" @click="toggleEnabled(g)">
+              {{ g.enabled ? '禁用' : '启用' }}
+            </button>
+            <button
+              class="btn-sm btn-danger"
+              :disabled="!!closingGroupIds[g.group_id]"
+              @click="closeGroup(g)"
+            >
+              {{ closingGroupIds[g.group_id] ? '下发中…' : '平仓' }}
+            </button>
+            <button class="btn-sm btn-ghost" @click="openEdit(g)">编辑</button>
+            <button class="btn-sm btn-danger" @click="remove(g)">删除</button>
+          </div>
         </div>
       </div>
       <div v-if="!hub.groups.length && !loading" class="card card-pad muted">
@@ -1582,19 +1553,22 @@ async function onStrategyFormSaved(): Promise<void> {
   }
 }
 .group-card {
-  padding: 10px 12px;
+  padding: 8px 10px;
   border-radius: var(--radius-sm);
 }
-.group-row {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  cursor: pointer;
-}
-.group-title {
+/* 标题行：名称 + 状态标签横排，箭头固定在右侧 */
+.group-head {
   display: flex;
   align-items: center;
   gap: 6px;
+  cursor: pointer;
+}
+.group-head-main {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 1 1 auto;
+  min-width: 0;
   flex-wrap: wrap;
 }
 .group-name {
@@ -1603,36 +1577,125 @@ async function onStrategyFormSaved(): Promise<void> {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 55%;
+  max-width: 60%;
 }
-.group-stats {
+/* 统计行：横排小胶囊 */
+.group-chips {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 4px;
+  flex-wrap: wrap;
+  margin-top: 5px;
+}
+.chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 2px;
   font-size: 11px;
   color: var(--muted);
+  background: var(--glass);
+  border: 1px solid var(--glass-border);
+  border-radius: 6px;
+  padding: 1px 6px;
+  white-space: nowrap;
 }
-.group-stat b {
+.chip b {
   color: var(--text);
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 700;
 }
+.chip.warn b {
+  color: #fbbf24;
+}
+.chip-btn {
+  cursor: pointer;
+  color: var(--primary);
+  font-weight: 600;
+}
+/* 常用开关行：横排小按钮 */
+.group-switches {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+.mini-toggle {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 6px;
+  border: 1px solid var(--glass-border);
+  background: var(--glass);
+  color: var(--muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.mini-toggle.on {
+  background: rgba(16, 185, 129, 0.12);
+  color: #34d399;
+  border-color: rgba(16, 185, 129, 0.25);
+}
+.mini-toggle.off {
+  background: rgba(239, 68, 68, 0.1);
+  color: #f87171;
+  border-color: rgba(239, 68, 68, 0.22);
+}
 .group-caret {
-  margin-left: auto;
+  flex: none;
   transition: transform var(--transition);
   opacity: 0.7;
+  font-size: 12px;
 }
 .group-caret.open {
   transform: rotate(180deg);
 }
+/* 展开明细：两列栅格，省空间 */
 .group-detail {
-  margin-top: 8px;
-  padding-top: 4px;
+  margin-top: 6px;
+  padding-top: 6px;
   border-top: 1px solid var(--glass-border);
 }
-.group-detail .list-field {
-  padding: 7px 0;
+.group-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 2px 10px;
+}
+.mini-kv {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--glass-border);
+  min-width: 0;
+}
+.mini-kv .k {
+  flex: none;
+  color: var(--muted);
+  font-size: 11px;
+}
+.mini-kv .v {
+  flex: 1 1 auto;
+  min-width: 0;
+  text-align: right;
+  font-size: 12px;
+  font-weight: 600;
+  word-break: break-word;
+  font-family: var(--mono);
+}
+.mini-kv-block {
+  grid-column: 1 / -1;
+  flex-direction: column;
+  align-items: stretch;
+}
+.mini-kv-block .v {
+  text-align: left;
+}
+.remark-text {
+  font-weight: 500;
+  font-size: 11px;
 }
 .group-actions {
   display: flex;

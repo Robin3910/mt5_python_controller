@@ -1868,6 +1868,97 @@ async def test_runner_voids_pending_when_positions_cleared_by_ladder_tp():
     runner.cancel()
 
 
+async def test_runner_voids_pending_on_gone_event_after_ladder_tp():
+    """GONE 收口（持仓被券商按止盈清掉）时，手动挂单必须被撤掉。
+
+    场景：手动单已挂出但没吃进去，行情直接拉回打到阶梯止盈点。
+    券商按仓位上的止盈平掉持仓 → 持仓归零 → hub 派发 GONE → 任务收口。
+
+    关键：加仓模式**不跟踪挂单**（track_orders 只在限价开仓时为 True），
+    所以 hub 看到持仓清空就直接判 GONE，GONE 分支必须自己把盘上的手动挂单撤掉。
+    手动挂单不在 positions 里，市价平仓 / 券商平仓都碰不到它——
+    不撤就变成孤儿单，收口后没人再监控。
+    """
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.prices_map["XAUUSD"] = 4405.0
+    runner, hub = _runner(sent, mt5=mt5)
+    runner.start()
+    await _settle()
+    mt5.prices_map["XAUUSD"] = 4405.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4404.9, ask=4405.0)
+    await _settle()
+    placed = [o for o in mt5.pending_orders_by_magic(MAGIC) if o.get("comment") == "M2"]
+    assert len(placed) == 1, "手动分散仓应已挂出"
+    ticket = placed[0]["ticket"]
+
+    # 券商按止盈把持仓平掉（手动挂单还没成交，仍在盘上）
+    for pos in mt5.positions_by_magic(MAGIC):
+        mt5.close_ticket_with_reason(pos["ticket"], cr.REASON_TP)
+
+    # hub 判空仓 → 派发 GONE
+    hub.sub.offer(mh.MarketEvent(kind=mh.GONE, symbol="XAUUSD", magic=MAGIC))
+    await _settle(10)
+
+    assert ticket not in [o["ticket"] for o in mt5.pending_orders_by_magic(MAGIC)], \
+        "GONE 收口后手动挂单必须被撤掉，不能留在盘上变孤儿单"
+    assert not mt5.pending_orders_by_magic(MAGIC), \
+        "GONE 收口后本魔术号下不应有任何残留挂单"
+
+    # 规则状态要置成作废：本任务内不再自动挂这张单
+    assert runner._manual_lifecycle(2) == ms.STATE_VOID
+
+    # 撤单原因应是「阶梯止盈先到」
+    off = _progress(sent, ms.PENDING_OFF_EVENT)
+    assert off, "应记一笔 manual_off 事件"
+    assert off[0]["detail"]["off_reason"] == ms.OFF_LADDER_TP
+
+    # 任务正常收口
+    finished = [m["data"] for m in sent if m["type"] == "strategy_finished"]
+    assert finished and finished[0]["status"] == "done"
+    runner.cancel()
+
+
+async def test_runner_does_not_finish_with_pending_orders_left():
+    """撤单失败时不能报终态：残留挂单还在盘上，服务端不能释放节点占位。
+
+    撤不干净 → 报非终态 stop_failed，主循环下一轮继续重试。
+    """
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.prices_map["XAUUSD"] = 4405.0
+    runner, hub = _runner(sent, mt5=mt5)
+    runner.start()
+    await _settle()
+    mt5.prices_map["XAUUSD"] = 4405.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4404.9, ask=4405.0)
+    await _settle()
+    assert [
+        o for o in mt5.pending_orders_by_magic(MAGIC) if o.get("comment") == "M2"
+    ], "手动分散仓应已挂出"
+
+    # 撤单一律失败（模拟券商拒撤）
+    real_cancel = mt5.cancel_order
+    mt5.cancel_order = lambda ticket, max_retry=3: {
+        "success": False, "action": "CANCEL", "ticket": ticket,
+        "error": "cannot cancel",
+    }
+
+    for pos in mt5.positions_by_magic(MAGIC):
+        mt5.close_ticket_with_reason(pos["ticket"], cr.REASON_TP)
+    hub.sub.offer(mh.MarketEvent(kind=mh.GONE, symbol="XAUUSD", magic=MAGIC))
+    await _settle(10)
+
+    mt5.cancel_order = real_cancel
+    finished = [m["data"] for m in sent if m["type"] == "strategy_finished"]
+    assert finished, "撤单失败仍要上报（非终态）让服务端保留占位"
+    assert finished[0]["status"] != "done", \
+        "挂单还在盘上时不能报终态，否则服务端会释放节点占位"
+    assert finished[0]["status"] == "stop_failed"
+    assert not runner._finished, "撤单失败不能置终态，后续还要重试"
+    runner.cancel()
+
+
 async def test_runner_replaces_pending_order_when_params_change():
     """挂单在盘上时改参数：撤旧单，按新入场/止盈重算手数后重挂。"""
     sent: list = []

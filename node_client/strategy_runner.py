@@ -213,6 +213,8 @@ class StrategyRunner:
         self._stopping = False
         self._stop_reason = "positions_cleared"
         self._stop_detail: Optional[dict] = None
+        # 被动全平的出场构成：是否为止盈出场（阶梯止盈先到的判定依据）
+        self._passive_exit_tp = False
         self._finished = False
         self._seed_pending = False
         self._task: Optional[asyncio.Task] = None
@@ -766,8 +768,16 @@ class StrategyRunner:
             # 默认 positions_cleared 时查成交历史，区分止损 / 止盈 / 人工
             if self._stop_reason == close_reason.DEFAULT_CLEAR_REASON:
                 await self._resolve_passive_close_reason()
-            # 持仓没了，逆势限价必须先撤掉。撤不掉就交给停止流程重试，不能报终态。
-            if not await self._cancel_open_counter_limits(reason="持仓已清空，撤下逆势限价"):
+            # 持仓没了，盘上残留的挂单必须全部撤掉。
+            #
+            # 关键场景：手动分散仓挂单还没成交，行情直接拉回打到阶梯止盈点，
+            # 券商按仓位上的止盈把持仓平掉了。手动挂单不在 positions 里，
+            # 市价平仓 / 券商平仓都碰不到它——不撤的话它就留在盘上变成孤儿单，
+            # 任务收口后没人再监控它，它随时可能在不该成交的时候成交。
+            #
+            # 撤不干净就不报终态：交给停止流程（_close_all）重试，
+            # 绝不带着残留挂单收口。
+            if not await self._cleanup_pending_before_finish(reason=self._stop_reason):
                 self._stopping = True
                 return False
             await self._finish("done", self._stop_reason)
@@ -3783,6 +3793,126 @@ class StrategyRunner:
             return None
         return None if rows is None else list(rows)
 
+    async def _cleanup_pending_before_finish(self, *, reason: str) -> bool:
+        """收口前把本魔术号下残留的挂单撤掉。返回是否已确认撤干净。
+
+        为什么必须做：挂在盘上的单随时可能成交，而任务收口后就没有人再监控它了。
+        最典型的场景是**手动分散仓挂单还没成交，行情直接拉回打到阶梯止盈点**——
+        券商按仓位上的止盈把持仓平掉了，但手动挂单不在 `positions` 里，
+        市价平仓和券商平仓都碰不到它，它就留在盘上变成孤儿单。
+
+        这里只负责**带事件地**撤掉两类语义明确的单，让前端能看到撤单过程：
+        1. 手动分散仓挂单：走 `_void_manual_pending`，带 `manual_off` 事件并把
+           规则状态置成 void（本任务内不再自动挂这张单）。
+        2. 逆势加仓限价：走 `_cancel_counter_orders`，带 `cnt_limit_off` 事件。
+
+        其余挂单由第 3 步兜底撤掉。
+
+        撤不干净就返回 False —— 调用方不能报终态，要交给停止流程重试。
+        """
+        # 1) 手动分散仓挂单
+        if self._manual_pending:
+            off_reason = (
+                manual_scatter.OFF_LADDER_TP
+                if self._passive_exit_tp
+                else manual_scatter.OFF_CLOSED
+            )
+            await self._void_manual_pending(off_reason, positions=[])
+
+        # 2) 逆势加仓限价（带 cnt_limit_off 事件，前端能看到撤单过程）
+        if not await self._cancel_open_counter_limits(reason="持仓已清空，撤下逆势限价"):
+            return False
+
+        # 3) 兜底：把本魔术号下其余挂单一并撤掉（语义不明的单没有事件，
+        #    但留在盘上就是孤儿单，收口后没人负责）
+        return await self._cancel_remaining_pending_orders()
+
+    async def _void_orphan_manual_pending(self, resting: list[dict]) -> None:
+        """把「盘上有、但内存态里没记」的手动挂单标成作废。
+
+        重连恢复时 runtime 里可能没有 `manual_pending`（挂单是恢复前挂出的）。
+        收口时这些单会被兜底撤掉，但规则状态还停在「未消费」，与盘面不一致。
+
+        只发事件、标状态，不重复撤单（撤单由调用方统一做）。
+        """
+        for order in resting or []:
+            rule_type = manual_scatter.pending_rule_type(order)
+            if rule_type is None:
+                continue
+            if rule_type in self._manual_pending:
+                continue
+            if self._manual_state.get(rule_type) == manual_scatter.STATE_VOID:
+                continue
+            self._manual_state[rule_type] = manual_scatter.STATE_VOID
+            logger.info(
+                "task %s manual scatter M%s pending orphaned at finish", self.task_id,
+                rule_type,
+            )
+            await self._emit_progress(
+                manual_scatter.PENDING_OFF_EVENT, phase="running", positions=[],
+                message=manual_scatter.describe_pending_off(manual_scatter.OFF_CLOSED),
+                detail=manual_scatter.pending_off_detail(
+                    rule_type, manual_scatter.OFF_CLOSED,
+                    ticket=manual_scatter.pending_ticket(order),
+                ),
+            )
+
+    async def _cancel_remaining_pending_orders(self) -> bool:
+        """撤掉本魔术号下其余在途挂单。返回是否已确认撤干净。
+
+        与 `_cancel_counter_orders` 的差别：那个只撤备注为逆势加仓的单，
+        这里撤的是这个魔术号下的所有单（手动分散仓挂单、逆势限价、
+        以损定量的分散仓限价单……），是收口前的最后一道兜底。
+
+        撤单前先把「盘上有、但内存态里没记」的手动挂单标成作废：
+        重连恢复时 runtime 里可能没有 `manual_pending`（挂单是恢复前挂出的），
+        不标的话规则状态还停在「未消费」，与盘面不一致。
+
+        读不到挂单簿时返回 False：「不知道」不能当成「干净」——
+        否则带着未确认的残留挂单收口，服务端释放节点占位后就再没人负责了。
+        """
+        resting = await self._magic_orders()
+        if resting is None:
+            logger.warning(
+                "task %s cleanup pending: read pending orders failed", self.task_id,
+            )
+            return False
+        if not resting:
+            self._pending_orders = 0
+            return True
+
+        await self._void_orphan_manual_pending(resting)
+
+        for order in resting:
+            ticket = int(order.get("ticket") or 0)
+            if ticket <= 0:
+                continue
+            try:
+                res = dict(await self._exec(self._mt5.cancel_order, ticket) or {})
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "task %s cleanup pending cancel failed #%s: %s",
+                    self.task_id, ticket, e,
+                )
+                continue
+            if not res.get("success"):
+                logger.warning(
+                    "task %s cleanup pending cancel failed #%s: %s",
+                    self.task_id, ticket, res.get("error"),
+                )
+
+        # 复查：撤单期间可能刚成交（挂价被现价触及），以复查结果为准
+        left_rows = await self._magic_orders()
+        if left_rows is None:
+            return False
+        self._pending_orders = len(left_rows)
+        if left_rows:
+            logger.warning(
+                "task %s cleanup pending: %s order(s) left", self.task_id, len(left_rows),
+            )
+            return False
+        return True
+
     async def _close_all(self) -> bool:
         """终止指令：平掉该魔术号的全部持仓并撤掉挂单。返回是否已确认干净并收口。
 
@@ -3954,6 +4084,11 @@ class StrategyRunner:
         self._stop_reason = message
         if detail is not None and self._stop_detail is None:
             self._stop_detail = detail
+        # 是否止盈出场：阶梯止盈先到的判定依据。
+        # 混出场里只要有止盈笔也算（模版2 阶梯止盈常见形态：先兑掉若干档，
+        # 剩余被共用止损收走——那也是「阶梯止盈先到」）。
+        counts = close_reason.count_exit_reasons(list(deals or []))
+        self._passive_exit_tp = counts.get("tp", 0) > 0
 
     async def _finish(self, status: str, reason: str, *, residual: int = 0) -> None:
         """上报收口结果。
