@@ -10,6 +10,8 @@ from copy import deepcopy
 from typing import Any, Optional
 
 import account_risk as ar
+# 资金操作（出入金等）的成交类型口径见 deal_types.py。
+from deal_types import FUNDING_DEAL_TYPES
 
 RULE_TYPE_COUNTER = 1
 RULE_TYPE_TREND = 2
@@ -364,6 +366,48 @@ def float_pl_loss_amount(cfg: dict | None, balance: float) -> Optional[float]:
     if ratio <= 0 or bal <= 0:
         return None
     return bal * ratio / 100.0
+
+
+# ----------------------------------------------------------------------
+# 余额变动来源判定：只认「出入金等资金操作」
+# ----------------------------------------------------------------------
+#
+# 口径与理由见 deal_types.py（MT5 领域常量集中在那里）：资金操作是客户主动
+# 改变本金的那几种成交；交易平仓只是把浮动盈亏转成已实现，本金没变。
+
+
+def is_funding_deal(deal: dict | None) -> bool:
+    """这笔成交是不是「出入金等资金操作」。
+
+    只认 MT5 原始的 `deal_type`（DEAL_TYPE_*）。`direction` 判不了：
+    出入金成交没有方向，会被兜底成 "BUY"，靠它判断会把出入金误认成开仓。
+    """
+    if not isinstance(deal, dict):
+        return False
+    raw = deal.get("deal_type")
+    if raw is None:
+        return False
+    try:
+        return int(raw) in FUNDING_DEAL_TYPES
+    except (TypeError, ValueError):
+        return False
+
+
+def filter_funding_deals(deals: list[dict] | None) -> list[dict]:
+    """挑出其中的资金操作成交（出入金 / 赠送 / 扣费 / 授信）。"""
+    return [d for d in (deals or []) if is_funding_deal(d)]
+
+
+def funding_balance_delta(deals: list[dict] | None) -> float:
+    """这些资金操作成交合起来给账户余额带来的净变化（正=入金，负=出金）。
+
+    出入金成交的金额记在 `profit` 字段上（MT5 对 DEAL_TYPE_BALANCE 就是这么记的），
+    出场成交则是「已实现盈亏」。这里只统计资金操作成交，所以不会把平仓结算算进来。
+    """
+    total = 0.0
+    for deal in filter_funding_deals(deals):
+        total += _as_float(deal.get("profit"), 0.0)
+    return round(total, 8)
 
 
 def lot_pl_amount(cfg: dict | None) -> Optional[float]:

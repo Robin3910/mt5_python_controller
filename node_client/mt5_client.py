@@ -18,6 +18,24 @@ import logging
 import time
 from typing import Optional
 
+from deal_types import (  # noqa: F401  （转出，供既有调用方继续从这里取）
+    DEAL_TYPE_BALANCE,
+    DEAL_TYPE_BUY,
+    DEAL_TYPE_BUY_CANCELED,
+    DEAL_TYPE_CHARGE,
+    DEAL_TYPE_COMMISSION,
+    DEAL_TYPE_COMMISSION_AGENT_DAILY,
+    DEAL_TYPE_COMMISSION_AGENT_MONTHLY,
+    DEAL_TYPE_COMMISSION_DAILY,
+    DEAL_TYPE_COMMISSION_MONTHLY,
+    DEAL_TYPE_CORRECTION,
+    DEAL_TYPE_CREDIT,
+    DEAL_TYPE_INTEREST,
+    DEAL_TYPE_SELL,
+    DEAL_TYPE_SELL_CANCELED,
+    FUNDING_DEAL_TYPES,
+)
+
 try:  # MetaTrader5 仅 Windows 可用，这里做守卫，保证模块在任何平台都能 import
     import MetaTrader5 as mt5  # type: ignore
 except Exception:  # noqa: BLE001
@@ -141,6 +159,8 @@ TRANSIENT = {
 PENDING_LIMIT = "limit"
 PENDING_STOP = "stop"
 PENDING_KINDS = (PENDING_LIMIT, PENDING_STOP)
+
+# 「出入金等资金操作」的 MT5 成交类型（DEAL_TYPE_*）与判定口径见 deal_types.py。
 
 # (方向, 挂单类型) -> MT5 订单类型。与 TIMEFRAMES 同样做导入守卫：非 Windows 上
 # MetaTrader5 不可用时留空，下挂单的入口会因此直接返回失败而不是抛 AttributeError。
@@ -1307,8 +1327,13 @@ class MT5Client:
         采集**永久停滞**，节点再也上报不了任何新成交。
 
         返回的每项含 deal_id / order_id / position_id / symbol / direction /
-        entry_type / reason / volume / price / profit / swap / commission /
-        magic / comment / time（time 为服务器钟面域 Unix 秒）。
+        deal_type / entry_type / reason / volume / price / profit / swap /
+        commission / magic / comment / time（time 为服务器钟面域 Unix 秒）。
+
+        **deal_type 是 MT5 原始成交类型**（`DEAL_TYPE_*`），不能丢：只有它能
+        区分「一笔真交易」与「一笔出入金等资金操作」（`DEAL_TYPE_BALANCE`），
+        余额变动的来源判定完全依赖它。direction 只映射 BUY/SELL，出入金成交
+        会被兜底成 "BUY" —— 靠 direction 判断资金操作会把出入金误认成开仓。
         """
         self.ensure()
 
@@ -1354,6 +1379,7 @@ class MT5Client:
                 "position_id": int(getattr(d, "position_id", 0) or 0),
                 "symbol": str(getattr(d, "symbol", "") or ""),
                 "direction": type_names.get(dtype, "BUY"),
+                "deal_type": dtype,
                 "entry_type": entry_names.get(entry, "IN"),
                 "reason": int(getattr(d, "reason", 0) or 0),
                 "volume": float(getattr(d, "volume", 0) or 0),
@@ -1369,6 +1395,25 @@ class MT5Client:
         # 按成交时间升序返回，服务端按序入库便于推进游标
         out.sort(key=lambda r: (r["time"], r["deal_id"]))
         return out
+
+    def balance_operations_since(self, since_ts: float) -> list[dict]:
+        """取 (since_ts, ∞) 内的**资金操作**成交（出入金 / 赠送 / 扣费 / 授信）。
+
+        用来判定「余额为什么变了」。余额变只有两种来源：
+        - 资金操作：客户出入金 → 本金变了，止损要跟着重算
+        - 交易平仓：已实现盈亏结算 → 本金没变，止损不该动
+
+        只靠余额数字分不出来（两者都让 balance 变），必须看成交的 `deal_type`。
+
+        **读失败必须抛错**，与 `history_deals_since` 同口径：调用方要靠异常
+        区分「没有新出入金」与「读不到」，把读失败当成「没有」会永远漏掉这次
+        余额变化，止损就再也不会跟着客户入金调整了。
+
+        返回的每项与 `history_deals_since` 同构（含 `deal_type` 与 `profit`，
+        出入金金额记在 `profit` 上）。
+        """
+        rows = self.history_deals_since(float(since_ts), 0)
+        return [r for r in rows if int(r.get("deal_type") or 0) in FUNDING_DEAL_TYPES]
 
     def realized_profit_by_magic(self, magic: int, since_ts: float | None = None) -> float:
         """汇总某魔术号在时间窗内的已实现盈亏（成交 profit + swap + commission）。

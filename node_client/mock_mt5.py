@@ -11,6 +11,13 @@ import itertools
 import logging
 import time
 
+from deal_types import (
+    DEAL_TYPE_BALANCE,
+    DEAL_TYPE_BUY,
+    DEAL_TYPE_SELL,
+    FUNDING_DEAL_TYPES,
+)
+
 logger = logging.getLogger("node.mock")
 
 # 模拟报价（用于持仓建仓价与观察列表）
@@ -363,19 +370,27 @@ class MockMT5Client:
 
     def _record_deal(self, *, entry: str, reason: int, position_id: int,
                      symbol: str, direction: str, volume: float, price: float,
-                     profit: float, magic: int, comment: str = "") -> None:
+                     profit: float, magic: int, comment: str = "",
+                     deal_type: int | None = None) -> None:
         """记一笔成交到成交流水（与真 MT5 的字段口径一致）。
 
         deal_id 用自增票号，模拟 MT5 单账户内成交号单调递增的语义 ——
         增量采集的游标正是靠「成交号决定哪笔算新」来去重的。
+
+        `deal_type` 是 MT5 原始成交类型（DEAL_TYPE_*）：交易成交是 BUY/SELL，
+        出入金等资金操作是 DEAL_TYPE_BALANCE。止损的「客户入金后重算」靠它
+        区分资金操作与平仓结算，所以必须带上。
         """
         tk = next(self._tickets)
+        if deal_type is None:
+            deal_type = DEAL_TYPE_BUY if direction == "BUY" else DEAL_TYPE_SELL
         self._deals.append({
             "deal_id": tk,
             "order_id": tk,
             "position_id": int(position_id or 0),
             "symbol": str(symbol or ""),
             "direction": direction,
+            "deal_type": int(deal_type),
             "entry_type": entry,
             "reason": int(reason),
             "volume": float(volume or 0),
@@ -398,6 +413,43 @@ class MockMT5Client:
         rows = [dict(d) for d in self._deals if int(d.get("deal_id") or 0) > floor]
         rows.sort(key=lambda r: (r["time"], r["deal_id"]))
         return rows
+
+    def balance_operations_since(self, since_ts: float) -> list[dict]:
+        """与真 MT5Client 同口径：取资金操作成交（出入金等）。
+
+        mock 的成交全在本进程内产生，不按时间窗裁剪；只按成交类型筛。
+        """
+        return [
+            dict(d) for d in self._deals
+            if int(d.get("deal_type") or 0) in FUNDING_DEAL_TYPES
+        ]
+
+    def deposit(self, amount: float, *, comment: str = "balance") -> dict:
+        """模拟客户在 MT5 里手动入金（余额增加）。
+
+        出入金成交在 MT5 里没有方向（type=DEAL_TYPE_BALANCE），金额记在
+        profit 上。这里按同样的口径造一笔，节点侧的判定才能复现真实行为。
+        """
+        amount = float(amount)
+        self.balance += amount
+        self._record_deal(
+            entry="OUT",
+            reason=0,
+            position_id=0,
+            symbol="",
+            direction="BUY",   # 无方向，MT5 侧会被兜底成 BUY
+            volume=0.0,
+            price=0.0,
+            profit=amount,
+            magic=0,
+            comment=comment,
+            deal_type=DEAL_TYPE_BALANCE,
+        )
+        return {"success": True, "balance": self.balance, "amount": amount}
+
+    def withdraw(self, amount: float, *, comment: str = "balance") -> dict:
+        """模拟客户出金（余额减少）。"""
+        return self.deposit(-float(amount), comment=comment)
 
     def _record_exit(self, pos: dict, *, reason: int, profit: float) -> None:
         """记下出场成交；reason 对齐 MT5 DEAL_REASON（4=SL / 5=TP / 3=EXPERT…）。"""

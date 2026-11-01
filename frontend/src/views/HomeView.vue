@@ -23,24 +23,12 @@ onMounted(async () => {
 /**
  * 首页可见节点列表。
  *
- * 口径（与首页以外的页面**无关**：本派生仅在 HomeView 内使用）：
- * - 管理员登录：只展示「owner_user_id 等于自己 user_id」的节点；
- *   「owner_user_id 为空」（在管理员名下 / 仍未分配给任何具体用户）的节点
- *   在首页**不**展示——这是新口径与上一版的差异；这一类节点仍然在
- *   「节点」页 / 「总览」页可见，留给日常运维窗口。
- * - 非管理员登录：保持原全集行为，不影响他们的体验。
- *
- * 选择这条口径的原因：项目里"录入者"和"当前所有者"是两个概念；
- * 管理员把节点创建出来后常会再 transfer 给具体用户，此时该节点的 owner
- * 已经是受让人。用严格 owner==self 把"已分配出去但仍归管理员独占"的边界
- * 场景过滤掉，让首页真正聚焦"我现在自己独占拥有"的节点集合。
+ * 口径：管理员与普通用户一致，都是「我能看到的全部节点」。
+ * - 管理员：后端 /api/nodes 返回全量节点（超级管理员可见全部数据），
+ *   首页不再按 owner 收窄，与「总览」页口径一致。
+ * - 普通用户：后端已按 owner_user_id 过滤，前端直接用全集。
  */
-const homeVisibleNodes = computed<NodeOut[]>(() => {
-  if (!auth.isAdmin) return hub.nodes
-  const myId = auth.me?.user_id ?? null
-  if (myId == null) return []
-  return hub.nodes.filter((n) => (n.owner_user_id ?? null) === myId)
-})
+const homeVisibleNodes = computed<NodeOut[]>(() => hub.nodes)
 
 // 「卡片操作菜单」目前展开的节点 ID。null = 全部折叠；一次只能打开一个菜单，
 // 再次点击同一节点则关闭；点击其它节点切换展开目标；点击页面空白处收起。
@@ -103,9 +91,17 @@ async function fetchFollowings(nodeId: string): Promise<{
   return data
 }
 
-/** 旧主节点 id：设置主节点时找同 owner 下当前的主节点；取消主节点就是自己。 */
-function findCurrentPrimaryId(excludeId: string): string | null {
-  const sameOwner = hub.nodes.filter((x) => x.node_id !== excludeId && x.is_primary)
+/**
+ * 旧主节点 id：设置主节点时找**同一 owner** 下当前的主节点；取消主节点就是自己。
+ *
+ * 主节点是「按 owner 维度唯一」的（后端 set_primary 只清同 owner 的其它主节点），
+ * 所以这里必须按 owner_user_id 对齐，否则管理员在首页看到多账号节点时，
+ * 会把别人的主节点误当成自己要替换的那个。
+ */
+function findCurrentPrimaryId(target: NodeOut): string | null {
+  const sameOwner = hub.nodes.filter(
+    (x) => x.node_id !== target.node_id && x.is_primary && (x.owner_user_id ?? null) === (target.owner_user_id ?? null),
+  )
   return sameOwner[0]?.node_id ?? null
 }
 
@@ -144,7 +140,7 @@ async function togglePrimary(n: NodeOut): Promise<void> {
   }
 
   // 阶段 0 预查 ②：旧主节点在跑任务时直接弹阻塞弹窗，不进入二次确认
-  const victimId = next ? findCurrentPrimaryId(n.node_id) : n.is_primary ? n.node_id : null
+  const victimId = next ? findCurrentPrimaryId(n) : n.is_primary ? n.node_id : null
   if (victimId) {
     try {
       const active = await fetchActiveTasks(victimId)
@@ -568,12 +564,6 @@ function reportCancelPending(res: CancelPendingResult): void {
       </div>
     </div>
 
-    <!-- 管理员专属提示：本页只展示「管理员自己独占拥有」的节点 -->
-    <div v-if="auth.isAdmin" class="home-scope-banner muted">
-      首页仅显示所有者（owner）为你本人的节点，共 {{ statusCounts.all }} 个；
-      尚未分配的节点、以及分配给其他用户的节点，请在「节点」或「总览」中查看。
-    </div>
-
     <div class="dash-layout">
       <div class="dash-main">
         <div class="card card-pad dash-toolbar">
@@ -730,8 +720,7 @@ function reportCancelPending(res: CancelPendingResult): void {
           <div v-if="homeVisibleNodes.length && !filteredNodes.length" class="card card-pad muted span-full">没有匹配的节点</div>
           <div v-if="!homeVisibleNodes.length" class="card card-pad muted span-full">
             <template v-if="auth.isAdmin">
-              你当前没有 owner 为本人的节点。
-              请到「节点」页把未分配的节点分配给自己，或新建后再回到首页查看。
+              还没有任何节点。请到「节点」页新建节点，或等待客户接入。
             </template>
             <template v-else>
               还没有节点，请到「节点」页面创建。

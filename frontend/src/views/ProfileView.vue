@@ -120,11 +120,19 @@ const ALL_MODULES: ProfileHubModule[] = [
   },
 ]
 
-// 管理员 / 普通用户：都按菜单权限过滤；管理员额外加分组管理入口
+// 管理员 / 普通用户：都按菜单权限过滤；管理员额外加「首页」「分组管理」入口
 const visibleModules = computed<ProfileHubModule[]>(() => {
   let base = auth.isAdmin ? ALL_MODULES : ALL_MODULES.filter((m) => auth.hasMenu(m.code))
   if (auth.isAdmin) {
     base = [
+      {
+        code: 'home',
+        label: '首页',
+        description: '全部节点的净值、持仓与实时状态',
+        path: '/home',
+        icon: '<path d="M3 11l9-8 9 8"/><path d="M5 10v10a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1V10"/>',
+        accent: '#0ea5e9',
+      },
       ...base,
       {
         code: 'groups',

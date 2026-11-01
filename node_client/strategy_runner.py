@@ -89,6 +89,16 @@ _CLOSE_ALL_ATTEMPTS = 3
 # 分档改单被券商拒绝后，按行情保活间隔再试，避免跟着 0.5 秒报价连刷
 _LOT_SLTP_RETRY_SEC = 5.0
 
+# 出入金探测：客户在 MT5 里手动加保证金后，止损要在多久内跟着重算。
+#
+# 探测放在节点侧而不是靠服务端推送：客户是在 MT5 终端里操作资金的，终端与
+# 中控台之间没有事件，节点只能自己读账户。轮询节流到这个间隔即可 ——
+# 余额变了最多等这么久就该反映到止损上。
+_BALANCE_PROBE_INTERVAL_SEC = 5.0
+# 查资金操作成交的回看窗口（秒）。取宽是为了覆盖节点卡顿 / 断线重连那几秒：
+# 漏掉一笔出入金意味着这次止损没跟着重算。
+_BALANCE_PROBE_LOOKBACK_SEC = 3600.0
+
 logger = logging.getLogger("node.strategy")
 
 
@@ -278,6 +288,27 @@ class StrategyRunner:
         self._lot_sltp_sl_only_sig: tuple = ()
         # 重连后的第一份持仓是已有单，不算新开仓，不重算止损
         self._lot_sltp_seed_existing = False
+        # —— 出入金 → 止损重算 ——
+        # 记下「当前止损是按多少余额算出来的」。余额变了才需要重算止损。
+        # 重连时从 runtime 还原：节点重启后要知道这笔止损的基准余额。
+        self._lot_sltp_sl_balance: Optional[float] = None
+        raw_sl_balance = self._resume_runtime.get("sl_balance")
+        if raw_sl_balance is not None:
+            try:
+                self._lot_sltp_sl_balance = float(raw_sl_balance)
+            except (TypeError, ValueError):
+                self._lot_sltp_sl_balance = None
+        # 上一次看到的账户余额（用来发现变动）
+        self._last_seen_balance: Optional[float] = None
+        # 上一次探测出入金成交的时刻（节流用）
+        self._balance_probe_at: float = 0.0
+        # 已探测到的资金操作成交号游标：只把新出现的出入金当成新事件，
+        # 否则每次轮询都会把同一笔出入金重复当成「刚刚入金」。
+        self._balance_deal_cursor: int = 0
+        # 是否已经做过首次探测（首次只登记游标，不追溯历史出入金）
+        self._balance_deal_seeded: bool = False
+        # 余额变动了（且确认是入金）→ 下一轮重算止损
+        self._balance_dirty: bool = False
         # 手动分散仓：每种规则只挂一次；重连时优先用 runtime，其次用仓位 comment
         self._manual_fired: set[int] = set()
         # 各规则手动仓的在途限价单：键是规则类型，值是挂单快照（票号 / 手数 / 挂价）。
@@ -780,6 +811,9 @@ class StrategyRunner:
             if await self._risk_advance(event, positions):
                 return False
         else:
+            # 客户在 MT5 里手动出入金 → 余额变了 → 止损要跟着重算。
+            # 放在热推同步之前：探测到入金后，这一拍的重算就能带上新余额。
+            await self._probe_balance()
             # 热推后同步在途的手动挂单：客户改了参数就撤旧单重算重挂。
             # 放在成交判定之前：撤单后这一拍不再挂，等下一拍重新走挂单路径。
             if self._manual_resync:
@@ -984,6 +1018,115 @@ class StrategyRunner:
             return None
         return bal
 
+    async def _probe_balance(self) -> None:
+        """探测账户余额变动；确认是入金就标脏，触发止损重算。
+
+        **只认「出入金等资金操作」**：余额数字变了可能是两种原因 ——
+        客户出入金（本金变了，止损要跟着重算），或者平仓结算（只是把浮动
+        盈亏转成已实现，本金没变，止损不该动）。两者光看 balance 分不出来，
+        必须去看成交的 `deal_type`。
+
+        **出金保留旧 SL 不动**：客户把钱提走时，收紧止损等于把仓位推进
+        更危险的价位；放宽止损又超出了客户现在的本金承受范围。两种都不是
+        客户想要的，所以出金这一侧什么都不做 —— 止损维持客户设好时的那个值。
+        （客户想改止损，走热推改比例那条路。）
+
+        **重连后不追溯**：节点离线期间发生的出入金，重连后第一次探测到的
+        余额已经变了，但那时止损是按旧余额算的。这里不把「探测之前就存在
+        的出入金」当成新事件，避免节点一上线就把止损推到一个客户没预期的
+        位置。首次探测时只登记游标，不标脏。
+        """
+        now = time.time()
+        if now - self._balance_probe_at < _BALANCE_PROBE_INTERVAL_SEC:
+            return
+        self._balance_probe_at = now
+        balance = await self._read_balance()
+        if balance is None:
+            return
+        previous = self._last_seen_balance
+        self._last_seen_balance = balance
+        fresh = await self._read_new_funding_deals()
+        if not fresh:
+            return
+        delta = signal_pl.funding_balance_delta(fresh)
+        if delta > 0:
+            self._balance_dirty = True
+            logger.info(
+                "task %s funding deposit %.2f detected (balance %s -> %.2f), "
+                "stop loss will be recalculated",
+                self.task_id, delta,
+                "?" if previous is None else f"{previous:.2f}", balance,
+            )
+        elif delta < 0:
+            # 出金：保留旧 SL 不动（口径见文档字符串）
+            logger.info(
+                "task %s funding withdrawal %.2f detected (balance %s -> %.2f), "
+                "stop loss left unchanged",
+                self.task_id, -delta,
+                "?" if previous is None else f"{previous:.2f}", balance,
+            )
+
+    async def _read_new_funding_deals(self) -> list[dict]:
+        """取游标之后新出现的资金操作成交（出入金等）。
+
+        首次调用只登记游标并返回空列表：那之前的出入金不是「刚刚发生」的，
+        不能拿来触发止损重算（见 `_probe_balance` 的说明）。
+
+        读不到成交（异常）时返回空列表：宁可漏一次重算，也不能把平仓结算
+        误判成入金 —— 那会让止损在「仓位已经走了」之后被推到别的位置。
+        """
+        reader = getattr(self._mt5, "balance_operations_since", None)
+        if reader is None:
+            # 旧版客户端没有这个能力：等价于「读不到」，不标脏
+            return []
+        since = await self._server_now() - _BALANCE_PROBE_LOOKBACK_SEC
+        try:
+            deals = await self._exec(reader, float(since))
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "task %s balance operations read failed", self.task_id, exc_info=True,
+            )
+            return []
+        if not isinstance(deals, list):
+            return []
+        rows = [d for d in deals if isinstance(d, dict)]
+        if not self._balance_deal_seeded:
+            # 首次：登记游标，不追溯
+            self._balance_deal_seeded = True
+            if rows:
+                self._balance_deal_cursor = max(
+                    int(d.get("deal_id") or 0) for d in rows
+                )
+            return []
+        # 只看游标之后的新成交：同一笔出入金不能反复当成「刚刚入金」，
+        # 否则每次探测都会重新标脏，止损会被反复重算。
+        fresh = [
+            d for d in rows
+            if int(d.get("deal_id") or 0) > int(self._balance_deal_cursor)
+        ]
+        if fresh:
+            # 游标推进到本批最大成交号
+            self._balance_deal_cursor = max(
+                int(d.get("deal_id") or 0) for d in fresh
+            )
+        return fresh
+
+    async def _server_now(self) -> float:
+        """当前时刻（**服务器钟面域**）。
+
+        成交的 `time` 与 `deal_cursor` 的 `since_ts` 都是服务器钟面，
+        比真实 UTC 快 offset 秒。查资金操作成交用的起点必须落在同一时钟域，
+        否则窗口整体错位 —— 错到之后就会漏掉那笔出入金。
+        """
+        offset: Optional[int] = None
+        try:
+            offset = await self._exec(self._mt5.server_time_offset_sec)
+        except Exception:  # noqa: BLE001
+            offset = None
+        if offset is None:
+            return time.time()
+        return time.time() + float(offset)
+
     def _sl_cfg_sig(self) -> tuple:
         """止损配置指纹：(开关, |比例|)。
 
@@ -995,7 +1138,7 @@ class StrategyRunner:
 
     async def _lot_sltp_apply_plans(
         self, event: MarketEvent, positions: list[dict], plans: list[dict],
-        *, allow_keep: bool = True,
+        *, allow_keep: bool = True, allow_keep_sl: Optional[bool] = None,
     ) -> dict:
         """把算好的 plan 写进持仓。
 
@@ -1007,8 +1150,15 @@ class StrategyRunner:
 
         allow_keep=False 时不走 2b：新值越价一律市价平掉。
 
+        **allow_keep_sl 是止损侧的独立开关**（默认跟随 allow_keep）：有些触发
+        只影响止损那一侧 —— 比如客户入金（余额变了 → 止损重算，止盈与余额
+        无关）。这时止损侧可以保留旧值，但止盈侧必须维持既有口径，否则
+        加仓后重算出的止盈越价会从「平掉」变成「保留」，那是另一套语义。
+
         返回 {"closed", "reasons", "failed", "levels", "close_any"}。
         """
+        if allow_keep_sl is None:
+            allow_keep_sl = allow_keep
         closed_tickets: set[int] = set()
         crossed_reasons: list[str] = []
         failed = False
@@ -1028,7 +1178,7 @@ class StrategyRunner:
             )
             sl_dec = signal_pl.stop_side_decision(
                 side, "sl", new_value=new_sl, positions=rows, market=market,
-                allow_keep=allow_keep,
+                allow_keep=allow_keep_sl,
             )
             close_side = ""
             if tp_dec.get("action") == "close":
@@ -1156,12 +1306,15 @@ class StrategyRunner:
         # 重连后的第一轮压制住：存量仓不重算止损（与既有语义一致）。
         sl_cfg_changed = sl_cfg_sig != self._lot_sltp_sl_cfg_sig
         tp_cfg_changed = tp_cfg_sig != self._lot_sltp_tp_cfg_sig
+        # 客户入金了：余额变了 → 止损金额要按新余额重算。
+        # 与配置改动同类 —— 是一次的、明确的外部事件，不是价格事件的延伸。
+        balance_changed = self._balance_dirty
         # 2b（越价保留旧值）只针对**配置改动**：加仓后重算出的价落到现价
         # 错误一侧是价格事件的延伸，那一轮仍然按原逻辑市价平掉。
         allow_keep = sl_cfg_changed or tp_cfg_changed
         if (
             not self._lot_sltp_dirty and sig == self._lot_sltp_sig
-            and not sl_cfg_changed and not tp_cfg_changed
+            and not sl_cfg_changed and not tp_cfg_changed and not balance_changed
         ):
             # 仓位构成没变：只可能是价格动了。要判的是「现价冲过了已经落下的
             # 共同止盈/止损」——这是价格事件，不能因为签名没变就不看。
@@ -1176,7 +1329,10 @@ class StrategyRunner:
             await self._lot_sltp_fail(sig, positions, "缺少合约规格，无法反推止盈止损")
             return None
         sl_amount = None
-        if ratio_on and (opened or (sl_cfg_changed and not suppress_open)):
+        sl_balance: Optional[float] = None
+        if ratio_on and (
+            opened or (sl_cfg_changed and not suppress_open) or balance_changed
+        ):
             balance = await self._read_balance()
             if balance is None:
                 await self._lot_sltp_fail(sig, positions, "读不到账户余额，无法反推止损")
@@ -1185,6 +1341,7 @@ class StrategyRunner:
             if sl_amount is None:
                 await self._lot_sltp_fail(sig, positions, "盈亏比无法折成止损金额")
                 return None
+            sl_balance = balance
         plans = signal_pl.plan_common_stops(
             scoped,
             tp_amount=tp_amount,
@@ -1201,7 +1358,10 @@ class StrategyRunner:
             event, positions, plans,
             # 2b 只针对配置改动：加仓后重算出的价落到现价错误一侧，
             # 仍然按原逻辑市价平掉（价格事件的延伸）。
-            allow_keep=sl_cfg_changed or tp_cfg_changed,
+            allow_keep=allow_keep,
+            # 客户入金只影响止损那一侧：止损可以保留旧值，止盈维持既有口径
+            # （止盈由分档金额决定，与余额无关）。
+            allow_keep_sl=sl_cfg_changed or tp_cfg_changed or balance_changed,
         )
         closed_tickets = applied["closed"]
         crossed_reasons = list(applied["reasons"])
@@ -1225,6 +1385,14 @@ class StrategyRunner:
             # 目标价记下来：只在真的改成功（或本来就没要改）时更新，
             # 改单失败的这一轮宁可沿用旧值，也不要按错价去判「冲过了」。
             self._lot_sltp_levels = applied["levels"]
+            # 止损基准余额：记下这次算止损用的余额。客户入金后要靠它判断
+            # 「当前止损是不是按旧余额算的」。
+            if sl_balance is not None:
+                self._lot_sltp_sl_balance = sl_balance
+            if balance_changed:
+                # 止损已按新余额重算：脏标记清掉。
+                # 只在改单成功时清 —— 失败的话下一拍还要按新余额重算。
+                self._balance_dirty = False
         if not closed_tickets:
             return "hit" if crossed_any else None
         remaining = [
@@ -1260,7 +1428,13 @@ class StrategyRunner:
             return None
         sig = signal_pl.position_book_signature(scoped)
         sl_cfg_sig = self._sl_cfg_sig()
-        if sig == self._lot_sltp_sl_only_sig and sl_cfg_sig == self._lot_sltp_sl_cfg_sig:
+        # 客户入金了：余额变了 → 止损金额要按新余额重算
+        balance_changed = self._balance_dirty
+        if (
+            sig == self._lot_sltp_sl_only_sig
+            and sl_cfg_sig == self._lot_sltp_sl_cfg_sig
+            and not balance_changed
+        ):
             # 仓位构成和止损配置都没变：没有可写的东西
             return None
         spec = await self._manual_symbol_spec()
@@ -1292,7 +1466,9 @@ class StrategyRunner:
         applied = await self._lot_sltp_apply_plans(
             event, positions, plans,
             # 2b 只针对配置改动：止损配置变了才保留旧值
-            allow_keep=sl_cfg_sig != self._lot_sltp_sl_cfg_sig,
+            allow_keep=(sl_cfg_sig != self._lot_sltp_sl_cfg_sig),
+            # 客户入金也允许止损保留旧值（这一路 tp 恒为 None，没有止盈侧）
+            allow_keep_sl=(sl_cfg_sig != self._lot_sltp_sl_cfg_sig) or balance_changed,
         )
         if applied["failed"]:
             # 失败时不更新指纹：下一拍继续重试
@@ -1302,6 +1478,12 @@ class StrategyRunner:
         # 止盈指纹也同步一下：手动分支不写共同止盈，但指纹不该因此变陈旧，
         # 否则手动权威撤销后的第一轮会误判成「配置变了」。
         self._lot_sltp_tp_cfg_sig = signal_pl.lot_pl_cfg_sig(self._signal_pl)
+        # 止损基准余额：记下这次算止损用的余额
+        self._lot_sltp_sl_balance = balance
+        if balance_changed:
+            # 止损已按新余额重算：脏标记清掉。
+            # 只在改单成功时清 —— 失败的话下一拍还要按新余额重算。
+            self._balance_dirty = False
         return None
 
     async def _lot_sltp_check_crossed(
@@ -2469,6 +2651,10 @@ class StrategyRunner:
             }
         if self._smc_used:
             payload["smc_used"] = sorted(self._smc_used)
+        # 止损基准余额：重连后要知道「当前止损是按多少余额算的」，
+        # 才能判断客户入金后该不该重算。
+        if self._lot_sltp_sl_balance is not None:
+            payload["sl_balance"] = round(float(self._lot_sltp_sl_balance), 8)
         return payload or None
 
     def _manual_authority_tp(self) -> Optional[float]:
