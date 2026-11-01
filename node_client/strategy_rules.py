@@ -92,6 +92,9 @@ class PositionCtx:
     # 当前任务的 SMC 价位副本，以及本节点已经用过的记录哈希
     smc: dict = field(default_factory=dict)
     smc_used: set = field(default_factory=set)
+    # 加仓已收口的规则类型（手动分散仓已开 = 该规则是本任务最后一次加仓）。
+    # 收口按规则独立：逆势收口不影响顺势。
+    closed_rules: set = field(default_factory=set)
 
     def __post_init__(self) -> None:
         if self.counter_base_price is None:
@@ -105,6 +108,10 @@ class PositionCtx:
             except (TypeError, ValueError):
                 return 0
         return self.add_count
+
+    def add_closed(self, rule_type: int) -> bool:
+        """这条规则的加仓是否已收口（手动分散仓已开）。"""
+        return int(rule_type) in self.closed_rules
 
 
 @dataclass
@@ -481,6 +488,9 @@ def _prepare_rule(rule: dict, ctx: PositionCtx) -> Optional[_AddPrep]:
     if rule_type not in (RULE_TYPE_COUNTER, RULE_TYPE_TREND):
         return None
     if ctx.position_count <= 0 or ctx.point <= 0:
+        return None
+    # 手动分散仓是本任务最后一次加仓：该规则的批次已收口，不再开新的加仓
+    if ctx.add_closed(rule_type):
         return None
 
     rule_adds = ctx.rule_add_count(rule_type)

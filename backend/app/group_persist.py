@@ -22,7 +22,13 @@ from sqlalchemy import func, or_, select, update
 
 from . import group_rules, latency_marks
 from .db import SessionLocal
-from .orm import GroupSignalTask, GroupTaskDispatch, GroupTaskEvent, SignalHistory
+from .orm import (
+    GroupSignalTask,
+    GroupTaskDispatch,
+    GroupTaskEvent,
+    SignalHistory,
+    TradingStrategy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -287,6 +293,118 @@ async def rewrite_running_strategy_snapshots(
     except Exception as e:  # noqa: BLE001
         logger.warning("rewrite_running_strategy_snapshots failed: %s", e)
         return []
+
+
+async def running_strategy_subtasks(strategy_id: str) -> list[dict]:
+    """该策略下所有非终态子任务（预检要逐个问节点）。"""
+    sid = str(strategy_id or "").strip()
+    if not sid:
+        return []
+    try:
+        async with SessionLocal() as s:
+            rows = (
+                await s.execute(
+                    select(GroupTaskDispatch, GroupSignalTask)
+                    .join(
+                        GroupSignalTask,
+                        GroupSignalTask.task_id == GroupTaskDispatch.task_id,
+                    )
+                    .where(
+                        GroupSignalTask.strategy_id == sid,
+                        GroupTaskDispatch.status.notin_(tuple(_TERMINAL)),
+                    )
+                    .order_by(GroupTaskDispatch.id.asc())
+                )
+            ).all()
+            return [_subtask_dict(d) for d, _ in rows]
+    except Exception as e:  # noqa: BLE001
+        logger.warning("running_strategy_subtasks failed: %s", e)
+        return []
+
+
+async def strategy_runtime_hints(strategy_id: str) -> dict:
+    """该策略在跑任务的运行态提示，供前端做保存前校验。
+
+    返回：
+    {
+      "running_task_count": 在跑子任务数,
+      "max_added_by_rule": {规则类型: 各在跑任务里已开笔数的最大值},
+      "manual_fired":      已开过手动分散仓的规则类型,
+      "manual_state":      {规则类型: 手动单生命周期}（none/pending/filled/void）,
+      "nodes_offline":     在跑但节点不在线的子任务数,
+    }
+
+    多任务场景取**最大值**：任何节点的实际已开笔数超过新上限都会让该节点
+    进入非法状态，宁可严不可松。
+    """
+    sid = str(strategy_id or "").strip()
+    empty = {
+        "running_task_count": 0,
+        "max_added_by_rule": {},
+        "manual_fired": [],
+        "manual_state": {},
+        "nodes_offline": 0,
+    }
+    if not sid:
+        return empty
+    try:
+        async with SessionLocal() as s:
+            rows = (
+                await s.execute(
+                    select(GroupTaskDispatch, GroupSignalTask)
+                    .join(
+                        GroupSignalTask,
+                        GroupSignalTask.task_id == GroupTaskDispatch.task_id,
+                    )
+                    .where(
+                        GroupSignalTask.strategy_id == sid,
+                        GroupTaskDispatch.status.notin_(tuple(_TERMINAL)),
+                    )
+                )
+            ).all()
+            if not rows:
+                return empty
+
+            max_added: dict[str, int] = {}
+            manual_fired: set[int] = set()
+            manual_state: dict[int, str] = {}
+            offline = 0
+            for dispatch, _task in rows:
+                counts = dispatch.add_counts_json
+                if isinstance(counts, dict):
+                    for key, value in counts.items():
+                        n = _int_or_none(value)
+                        if n is None:
+                            continue
+                        prev = max_added.get(str(key), 0)
+                        if n > prev:
+                            max_added[str(key)] = n
+                runtime = dispatch.runtime_json
+                if isinstance(runtime, dict):
+                    for item in runtime.get("manual_fired") or []:
+                        n = _int_or_none(item)
+                        if n is not None:
+                            manual_fired.add(n)
+                    # 生命周期取「最靠后」的状态：任一节点已成交就整体按已成交算
+                    for key, value in (runtime.get("manual_state") or {}).items():
+                        n = _int_or_none(key)
+                        if n is None or not isinstance(value, str):
+                            continue
+                        prev = manual_state.get(n, "")
+                        if value == "filled" or (prev != "filled" and value != "void"):
+                            manual_state[n] = value
+                if not dispatch.last_report_at:
+                    offline += 1
+            return {
+                "running_task_count": len(rows),
+                "max_added_by_rule": max_added,
+                "manual_fired": sorted(manual_fired),
+                "manual_state": {str(k): v for k, v in sorted(manual_state.items())},
+                "nodes_offline": offline,
+            }
+    except Exception as e:  # noqa: BLE001
+        logger.warning("strategy_runtime_hints failed: %s", e)
+        return empty
 
 
 async def active_subtasks_overview() -> list[dict]:
@@ -687,6 +805,76 @@ async def _locate_dispatch(
     ).scalar_one_or_none()
 
 
+async def task_strategy_id(task_id: int) -> Optional[str]:
+    """子任务所属主任务绑定的策略 ID（手动单消费要用）。"""
+    tid = _int_or_none(task_id)
+    if tid is None:
+        return None
+    try:
+        async with SessionLocal() as s:
+            row = await s.get(GroupSignalTask, tid)
+            if row is None:
+                return None
+            sid = str(row.strategy_id or "").strip()
+            return sid or None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("task_strategy_id failed %s: %s", tid, e)
+        return None
+
+
+async def consume_manual_scatter(strategy_id: str, rule_type: int) -> bool:
+    """把策略配置里的手动分散仓摘掉：挂出即消费，一次信号只发一次。
+
+    客户的要求：手动单触发完成一次之后，后续就从参数里面删除，
+    下一次信号得等客户重新设置（重新敲数字）。
+
+    这里做的是**字面删除**：`config_json` 里那条规则的 `manual_scatter`
+    整块去掉。配置版本 +1，后续信号拿到的快照自然不带手动单。
+
+    幂等：已经摘掉（或本来就没配）时返回 False，不重复改版本。
+    """
+    sid = str(strategy_id or "").strip()
+    rt = int(rule_type or 0)
+    if not sid or rt not in (1, 2):
+        return False
+    try:
+        async with SessionLocal() as s:
+            row = await s.get(TradingStrategy, sid)
+            if row is None:
+                return False
+            rules = list(row.config_json or [])
+            changed = False
+            out: list = []
+            for raw in rules:
+                if not isinstance(raw, dict):
+                    out.append(raw)
+                    continue
+                if int(raw.get("type") or 0) != rt:
+                    out.append(raw)
+                    continue
+                block = raw.get("manual_scatter")
+                if not isinstance(block, dict) or not block.get("enabled"):
+                    out.append(raw)
+                    continue
+                new_rule = dict(raw)
+                new_rule.pop("manual_scatter", None)
+                out.append(new_rule)
+                changed = True
+            if not changed:
+                return False
+            row.config_json = out
+            row.config_version = int(row.config_version or 0) + 1
+            await s.commit()
+            logger.info(
+                "strategy %s manual scatter consumed (rule type %s), version %s",
+                sid, rt, row.config_version,
+            )
+            return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("consume_manual_scatter failed %s: %s", sid, e)
+        return False
+
+
 async def record_strategy_progress(
     *, node_id: str, data: dict,
     dispatch_id: Optional[int] = None, task_id: Optional[int] = None,
@@ -717,6 +905,14 @@ async def record_strategy_progress(
                 row.pending_orders = int(data["pending_orders"])
             if _num(data.get("add_count")) is not None:
                 row.add_count = int(data["add_count"])
+            # 各规则已开笔数（按规则类型分开）：前端校验「上限不能低于已开笔数」
+            # 的依据。心跳也要刷——加仓是随时可能发生的
+            add_counts = data.get("add_counts")
+            if isinstance(add_counts, dict) and add_counts:
+                row.add_counts_json = {
+                    str(int(k)): int(v) for k, v in add_counts.items()
+                    if _num(v) is not None
+                }
             if _num(data.get("total_orders")) is not None:
                 row.total_orders = int(data["total_orders"])
             if _num(data.get("total_volume")) is not None:
@@ -768,6 +964,73 @@ async def record_strategy_progress(
             return True
     except Exception as e:  # noqa: BLE001
         logger.warning("record_strategy_progress failed: %s", e)
+        return False
+
+
+async def record_strategy_update_ack(
+    *, node_id: str, data: dict,
+    dispatch_id: Optional[int] = None, task_id: Optional[int] = None,
+) -> bool:
+    """节点回执：热推配置的逐字段结论落成一条任务事件。
+
+    事件类型固定为 strategy_update，结论放在 detail_json 里：
+    {"kind": "strategy_update", "result": ..., "fields": [...]}
+    前端据此渲染「生效 / 部分生效 / 被拒」。
+    """
+    result = str(data.get("result") or "applied").strip().lower() or "applied"
+    fields = data.get("fields")
+    fields = fields if isinstance(fields, list) else []
+    config_version = _int_or_none(data.get("config_version"))
+    try:
+        async with SessionLocal() as s:
+            row = await _locate_dispatch(
+                s, node_id=node_id, dispatch_id=dispatch_id, task_id=task_id,
+            )
+            if not row:
+                return False
+            task_id = row.task_id
+
+            messages = [
+                str(f.get("message") or "").strip() for f in fields
+                if isinstance(f, dict) and str(f.get("message") or "").strip()
+            ]
+            if result == "applied":
+                summary = "配置已生效"
+            elif result == "rejected":
+                summary = "配置被拒绝"
+            else:
+                summary = "配置部分生效"
+            if messages:
+                summary = f"{summary}：" + "；".join(messages)[:180]
+
+            s.add(
+                GroupTaskEvent(
+                    task_id=task_id,
+                    node_id=node_id,
+                    magic=row.magic,
+                    event_type="strategy_update",
+                    symbol=None,
+                    action=None,
+                    volume=None,
+                    price=None,
+                    order_ticket=None,
+                    position_count=row.position_count,
+                    total_volume=row.total_volume,
+                    profit=None,
+                    message=summary[:255],
+                    detail_json={
+                        "kind": "strategy_update",
+                        "result": result,
+                        "config_version": config_version,
+                        "fields": fields,
+                    },
+                )
+            )
+            await s.flush()
+            await s.commit()
+            return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("record_strategy_update_ack failed: %s", e)
         return False
 
 

@@ -161,11 +161,18 @@ def build_strategy_update_command(
     *, task_id: int, dispatch_id: int, magic: Optional[int], snapshot: dict,
 ) -> dict:
     """热推进行中任务的策略快照，形状对齐 strategy_stop（cmd 直发、不包 type/data）。"""
+    version = None
+    if isinstance(snapshot, dict):
+        try:
+            version = int(snapshot.get("config_version"))
+        except (TypeError, ValueError):
+            version = None
     return {
         "cmd": "strategy_update",
         "task_id": task_id,
         "dispatch_id": dispatch_id,
         "magic": magic,
+        "config_version": version,
         "strategy": snapshot,
     }
 

@@ -327,6 +327,13 @@ export const useHubStore = defineStore('hub', {
       const params = q ? { q } : undefined
       this.strategies = (await api.get('/api/strategies', { params })).data
     },
+    /**
+     * 取单个策略详情：带 runtime_hints（在跑任务的已开笔数等）。
+     * 列表接口不带这些运行时信息，编辑表单要用它做保存前校验。
+     */
+    async fetchStrategyDetail(id: string): Promise<StrategyOut> {
+      return (await api.get(`/api/strategies/${id}`)).data
+    },
     async createStrategy(
       payload: StrategyCreatePayload,
       options?: { q?: string },

@@ -5,6 +5,7 @@ import time
 import close_reason as cr
 import market_hub as mh
 import manual_scatter as ms
+import signal_pl
 from mock_mt5 import MockMT5Client
 from strategy_rules import PositionCtx, evaluate
 from strategy_runner import StrategyRunner
@@ -756,8 +757,12 @@ async def test_runner_places_pending_after_batch_full():
     runner.cancel()
 
 
-async def test_runner_past_take_profit_does_not_open():
-    """现价已过止盈：不挂单，进度记越过止盈；不记开火，以后仍可回踩。"""
+async def test_runner_past_take_profit_still_places_pending():
+    """现价已过止盈：照样挂单（不再等回落到入场）。
+
+    挂单本身就是「等成交」的工具：BUY 现价 4415 在入场 4400 上方 → Buy Limit
+    挂在 4400 等回落，终端撮合。之前这道「越过止盈暂不开仓」的闸已经取消。
+    """
     sent: list = []
     mt5 = MockMT5Client()
     mt5.prices_map["XAUUSD"] = 4415.0
@@ -772,19 +777,34 @@ async def test_runner_past_take_profit_does_not_open():
     ))
     await _settle()
     manuals = [o for o in mt5.pending_orders_by_magic(MAGIC) if o.get("comment") == "M2"]
-    assert manuals == []
-    assert 2 not in runner._manual_fired
+    assert len(manuals) == 1, "越过止盈不该再挡着不挂单"
+    assert manuals[0]["price_open"] == 4400.0
+    assert manuals[0]["pending_kind"] == "limit", "现价在上方 → Buy Limit 等回落"
+    assert 2 in runner._manual_fired
+    # 不再报「越过止盈」的错误
     errors = _progress(sent, "error")
-    assert errors and "越过止盈" in (errors[0].get("message") or "")
-    assert errors[0]["detail"]["error"] == "tp_passed"
+    assert not errors or errors[0]["detail"].get("error") != "tp_passed"
+    runner.cancel()
 
+
+async def test_runner_places_pending_immediately_when_batch_disabled():
+    """分批未启用：不等任何条件，挂单直接出（没有「等回落」这道闸）。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.prices_map["XAUUSD"] = 4390.0
+    runner, hub = _runner(sent, mt5=mt5)
+    runner.start()
+    await _settle()
+    held = mt5.positions_by_magic(MAGIC)
     hub.sub.offer(mh.MarketEvent(
         kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
-        positions=tuple(held), price=4416.0, point=0.01,
-        bid=4415.9, ask=4416.0,
+        positions=tuple(held), price=4390.0, point=0.01,
+        bid=4389.9, ask=4390.0,
     ))
     await _settle()
-    assert len(_progress(sent, "error")) == 1
+    manuals = [o for o in mt5.pending_orders_by_magic(MAGIC) if o.get("comment") == "M2"]
+    assert len(manuals) == 1
+    assert manuals[0]["pending_kind"] == "stop"
     runner.cancel()
 
 
@@ -1185,12 +1205,61 @@ def test_apply_strategy_refuses_grid_and_keeps_fired():
     }
     assert runner.apply_strategy({"rules": [grid]}) is False
     assert runner._manual_fired == {2}
+    # 挂单在盘上（PENDING）：客户改参数是可以的，节点会撤旧单重算重挂
     ok = runner.apply_strategy({
         "template_id": "tpl_1",
         "rules": [_trend_rule(manual_scatter=_cfg(entry_price=4500, take_profit=4510))],
     })
     assert ok is True
     assert runner._manual_fired == {2}
+    watches = ms.extract_watches(runner.strategy.get("rules"))
+    assert watches[0]["cfg"]["entry_price"] == 4500, "挂单在盘上时参数可改"
+
+
+def test_apply_strategy_locks_manual_after_filled():
+    """已成交（FILLED）：配置彻底锁定，改了不生效（保留旧值）。"""
+    sent: list = []
+    runner, _hub = _runner(sent)
+    runner._manual_fired.add(2)
+    runner._manual_state[2] = ms.STATE_FILLED
+    ok = runner.apply_strategy({
+        "template_id": "tpl_1",
+        "rules": [_trend_rule(manual_scatter=_cfg(entry_price=4500, take_profit=4510))],
+    })
+    assert ok is True
+    assert runner._manual_fired == {2}
+    watches = ms.extract_watches(runner.strategy.get("rules"))
+    assert watches[0]["cfg"]["entry_price"] == 4400, "已成交后配置应锁定保留旧值"
+
+
+def test_apply_strategy_allows_manual_change_while_pending():
+    """PENDING 态：手动仓参数可以热推（会触发撤单重挂）。"""
+    sent: list = []
+    runner, _hub = _runner(sent)
+    runner._manual_pending[2] = {
+        "ticket": 5001, "type": "BUY", "volume": 0.5,
+        "price_open": 4400.0, "sl": 0.0, "tp": 4410.0, "time": 1.0,
+    }
+    runner._manual_state[2] = ms.STATE_PENDING
+    ok = runner.apply_strategy({
+        "template_id": "tpl_1",
+        "rules": [_trend_rule(manual_scatter=_cfg(entry_price=4500, take_profit=4510))],
+    })
+    assert ok is True
+    watches = ms.extract_watches(runner.strategy.get("rules"))
+    assert watches[0]["cfg"]["entry_price"] == 4500
+    assert runner._manual_resync is True, "热推后要触发一次在途挂单同步"
+
+
+def test_apply_strategy_allows_manual_change_before_manual_fired():
+    """手动仓还没开过时，手动分散仓配置可以正常热推。"""
+    sent: list = []
+    runner, _hub = _runner(sent)
+    ok = runner.apply_strategy({
+        "template_id": "tpl_1",
+        "rules": [_trend_rule(manual_scatter=_cfg(entry_price=4500, take_profit=4510))],
+    })
+    assert ok is True
     watches = ms.extract_watches(runner.strategy.get("rules"))
     assert watches[0]["cfg"]["entry_price"] == 4500
 
@@ -1604,3 +1673,343 @@ async def test_runner_manual_pending_runtime_carries_order_ticket():
     assert pending_rt["2"]["ticket"] > 0
     assert pending_rt["2"]["price_open"] == 4400.0
     runner.cancel()
+
+
+# ----------------------------------------------------------------------
+# 生命周期：none -> pending -> filled / void
+# ----------------------------------------------------------------------
+def test_manual_lifecycle_constants_and_descriptions():
+    assert ms.STATE_NONE == "none"
+    assert ms.STATE_PENDING == "pending"
+    assert ms.STATE_FILLED == "filled"
+    assert ms.STATE_VOID == "void"
+    assert ms.PENDING_OFF_EVENT == "manual_off"
+    assert "阶梯止盈" in ms.describe_pending_off(ms.OFF_LADDER_TP)
+    assert "撤销" in ms.describe_pending_off(ms.OFF_REPLACED)
+    detail = ms.pending_off_detail(2, ms.OFF_LADDER_TP, ticket=5001)
+    assert detail["kind"] == "manual_scatter"
+    assert detail["pending_action"] == "cancel"
+    assert detail["off_reason"] == ms.OFF_LADDER_TP
+    assert detail["pending_ticket"] == 5001
+
+
+def test_pending_matches_cfg_detects_changes():
+    snap = {
+        "ticket": 5001, "type": "BUY", "volume": 0.5,
+        "price_open": 4400.0, "sl": 0.0, "tp": 4410.0,
+    }
+    cfg = _cfg(entry_price=4400, take_profit=4410)
+    assert ms.pending_matches_cfg(cfg, snap) is True
+    # 改了入场价 → 不一致
+    assert ms.pending_matches_cfg(_cfg(entry_price=4500, take_profit=4410), snap) is False
+    # 改了止盈 → 不一致
+    assert ms.pending_matches_cfg(_cfg(entry_price=4400, take_profit=4500), snap) is False
+    # 改了止损（盘上没带止损）→ 不一致
+    assert ms.pending_matches_cfg(
+        _cfg(entry_price=4400, take_profit=4410, stop_loss=4350), snap,
+    ) is False
+    # 配了止损但挂不上（方向不对）→ 盘上没止损也算一致，不反复撤单
+    assert ms.pending_matches_cfg(
+        _cfg(entry_price=4400, take_profit=4410, stop_loss=4450), snap,
+    ) is True
+    # 手填锁定的手数变了 → 不一致
+    assert ms.pending_matches_cfg(
+        _cfg(entry_price=4400, take_profit=4410, volume=0.8, volume_locked=True), snap,
+    ) is False
+
+
+async def test_runner_voids_pending_when_ladder_tp_crossed():
+    """阶梯止盈先到达：手动挂单必须被撤掉并作废。
+
+    手动挂单不在 positions 里，市价平仓平不掉它——不撤的话它会在
+    不该成交的时候成交。
+
+    构造：现价在入场价**上方** → 挂 Buy Limit（等回落）。价格向上冲过
+    阶梯止盈时这张单还没成交，正好验证「阶梯止盈先到 → 撤掉手动挂单」。
+    """
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.prices_map["XAUUSD"] = 4405.0
+    runner, hub = _runner(sent, mt5=mt5)
+    runner.start()
+    await _settle()
+
+    mt5.prices_map["XAUUSD"] = 4405.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4404.9, ask=4405.0)
+    await _settle()
+    placed = [o for o in mt5.pending_orders_by_magic(MAGIC) if o.get("comment") == "M2"]
+    assert len(placed) == 1
+    assert placed[0]["pending_kind"] == "limit", "现价在上方 → Buy Limit 等回落"
+    ticket = placed[0]["ticket"]
+
+    # 阶梯止盈先到：现价越过共同止盈 → 节点市价平掉这一侧的仓位。
+    # 手动挂单不在 positions 里，市价平仓碰不到它 —— 必须由节点显式撤单。
+    mt5.prices_map["XAUUSD"] = 4600.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4599.9, ask=4600.0)
+    await _settle(10)
+
+    assert not [
+        o for o in mt5.pending_orders_by_magic(MAGIC) if o.get("comment") == "M2"
+    ], "阶梯止盈触发后手动挂单应被撤掉"
+    assert ticket not in [o["ticket"] for o in mt5.pending_orders_by_magic(MAGIC)]
+    off = _progress(sent, ms.PENDING_OFF_EVENT)
+    assert off, "应记一笔 manual_off 事件"
+    assert off[0]["detail"]["off_reason"] == ms.OFF_LADDER_TP
+    assert runner._manual_lifecycle(2) == ms.STATE_VOID
+    runner.cancel()
+
+
+async def test_runner_does_not_reopen_after_void():
+    """作废后本任务内不再自动挂单（要客户重新设置）。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.prices_map["XAUUSD"] = 4405.0
+    runner, hub = _runner(sent, mt5=mt5)
+    runner.start()
+    await _settle()
+    mt5.prices_map["XAUUSD"] = 4405.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4404.9, ask=4405.0)
+    await _settle()
+    assert [o for o in mt5.pending_orders_by_magic(MAGIC) if o.get("comment") == "M2"]
+
+    mt5.prices_map["XAUUSD"] = 4600.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4599.9, ask=4600.0)
+    await _settle(10)
+    assert runner._manual_lifecycle(2) == ms.STATE_VOID
+
+    # 价格回来：不该再挂一张
+    mt5.prices_map["XAUUSD"] = 4405.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4404.9, ask=4405.0)
+    await _settle(10)
+    assert not [
+        o for o in mt5.pending_orders_by_magic(MAGIC) if o.get("comment") == "M2"
+    ], "作废后不该再挂单"
+    runner.cancel()
+
+
+async def test_runner_voids_pending_when_positions_cleared_by_ladder_tp():
+    """券商把仓位按阶梯止盈平掉、手动挂单还在：挂单必须被撤掉。
+
+    这是「阶梯止盈先到达」最常见的形态：止盈是写在仓位上的，券商先平仓，
+    节点是事后才发现的。挂单不在 positions 里，平仓不会带走它。
+    """
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.prices_map["XAUUSD"] = 4405.0
+    runner, hub = _runner(sent, mt5=mt5)
+    runner.start()
+    await _settle()
+    mt5.prices_map["XAUUSD"] = 4405.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4404.9, ask=4405.0)
+    await _settle()
+    placed = [o for o in mt5.pending_orders_by_magic(MAGIC) if o.get("comment") == "M2"]
+    assert len(placed) == 1
+    ticket = placed[0]["ticket"]
+
+    # 券商按止盈把底仓平掉（挂单还在盘上）
+    for pos in mt5.positions_by_magic(MAGIC):
+        mt5.close_ticket_with_reason(pos["ticket"], cr.REASON_TP)
+    mt5.prices_map["XAUUSD"] = 4600.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4599.9, ask=4600.0)
+    await _settle(10)
+
+    assert ticket not in [o["ticket"] for o in mt5.pending_orders_by_magic(MAGIC)], \
+        "仓位被止盈清掉后，手动挂单不能留在盘上"
+    runner.cancel()
+
+
+async def test_runner_replaces_pending_order_when_params_change():
+    """挂单在盘上时改参数：撤旧单，按新入场/止盈重算手数后重挂。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.prices_map["XAUUSD"] = 4390.0
+    runner, hub = _runner(sent, mt5=mt5)
+    runner.start()
+    await _settle()
+    mt5.prices_map["XAUUSD"] = 4399.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4398.9, ask=4399.0)
+    await _settle()
+    placed = [o for o in mt5.pending_orders_by_magic(MAGIC) if o.get("comment") == "M2"]
+    assert len(placed) == 1
+    old_ticket = placed[0]["ticket"]
+    old_volume = placed[0]["volume"]
+
+    # 客户改参数：入场 4400→4500，止盈 4410→4600
+    runner.apply_strategy({
+        "template_id": "tpl_1",
+        "rules": [_trend_rule(manual_scatter=_cfg(entry_price=4500, take_profit=4600))],
+    })
+    mt5.prices_map["XAUUSD"] = 4399.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4398.9, ask=4399.0)
+    await _settle(10)
+
+    now = [o for o in mt5.pending_orders_by_magic(MAGIC) if o.get("comment") == "M2"]
+    assert len(now) == 1, "改参后应该只有一张单（旧单已撤）"
+    assert now[0]["ticket"] != old_ticket, "旧挂单应被撤掉并换新票号"
+    assert now[0]["price_open"] == 4500.0, "新挂单价用新的入场价"
+    # 每手止盈从 10 变成 100 → 手数按同一目标金额重算，手数应变小
+    assert now[0]["volume"] != old_volume
+    assert now[0]["volume"] < old_volume
+    runner.cancel()
+
+
+async def test_runner_keeps_pending_when_params_unchanged():
+    """参数没变：不撤单（撤挂会触券商限频）。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.prices_map["XAUUSD"] = 4390.0
+    runner, hub = _runner(sent, mt5=mt5)
+    runner.start()
+    await _settle()
+    mt5.prices_map["XAUUSD"] = 4399.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4398.9, ask=4399.0)
+    await _settle()
+    placed = [o for o in mt5.pending_orders_by_magic(MAGIC) if o.get("comment") == "M2"]
+    ticket = placed[0]["ticket"]
+
+    # 热推一份完全一样的配置
+    runner.apply_strategy({
+        "template_id": "tpl_1",
+        "rules": [_trend_rule(manual_scatter=_cfg(entry_price=4400, take_profit=4410))],
+    })
+    mt5.prices_map["XAUUSD"] = 4399.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4398.9, ask=4399.0)
+    await _settle(10)
+
+    now = [o for o in mt5.pending_orders_by_magic(MAGIC) if o.get("comment") == "M2"]
+    assert len(now) == 1
+    assert now[0]["ticket"] == ticket, "参数没变就不该撤单重挂"
+    assert not _progress(sent, ms.PENDING_OFF_EVENT)
+    runner.cancel()
+
+
+async def test_runner_locks_manual_config_after_fill():
+    """已成交之后不能再改：改配置被锁死，旧值保留。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub, manual = await _open_first_and_manual(sent, mt5)
+    assert runner._manual_lifecycle(2) == ms.STATE_FILLED
+
+    runner.apply_strategy({
+        "template_id": "tpl_1",
+        "rules": [_trend_rule(manual_scatter=_cfg(entry_price=4500, take_profit=4600))],
+    })
+    watches = ms.extract_watches(runner.strategy.get("rules"))
+    assert watches[0]["cfg"]["entry_price"] == 4400, "已成交后配置应锁定保留旧值"
+    # 不该有撤单重挂
+    assert not _progress(sent, ms.PENDING_OFF_EVENT)
+    runner.cancel()
+
+
+async def test_runner_manual_state_in_runtime():
+    """runtime 带上手动单生命周期：前端据此区分「能改」与「已锁定」。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.prices_map["XAUUSD"] = 4390.0
+    runner, hub = _runner(sent, mt5=mt5)
+    runner.start()
+    await _settle()
+    mt5.prices_map["XAUUSD"] = 4399.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4398.9, ask=4399.0)
+    await _settle()
+    ev = _progress(sent, "manual_pending")
+    assert ev and ev[0]["runtime"]["manual_state"]["2"] == ms.STATE_PENDING
+    runner.cancel()
+
+
+async def test_runner_manual_pending_is_consumed_once():
+    """挂出即消费：挂单在场期间不再挂第二张（每个信号只有一次机会）。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.prices_map["XAUUSD"] = 4390.0
+    runner, hub = _runner(sent, mt5=mt5)
+    runner.start()
+    await _settle()
+    for _ in range(3):
+        mt5.prices_map["XAUUSD"] = 4399.0
+        _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4398.9, ask=4399.0)
+        await _settle()
+    manuals = [o for o in mt5.pending_orders_by_magic(MAGIC) if o.get("comment") == "M2"]
+    assert len(manuals) == 1, "挂出即消费：不会重复挂"
+    runner.cancel()
+
+
+async def test_runner_voids_pending_when_book_cleared_without_crossing():
+    """底仓被清空、手动挂单还在盘上：挂单必须撤掉（不能留孤儿单）。
+
+    挂单不在 positions 里，市价平仓平不掉它——语境已经变了（这一批的仓位
+    都没了），它再挂着就可能在一个已经收口的批次上成交。
+    """
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.prices_map["XAUUSD"] = 4405.0
+    runner, hub = _runner(sent, mt5=mt5)
+    runner.start()
+    await _settle()
+    mt5.prices_map["XAUUSD"] = 4405.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4404.9, ask=4405.0)
+    await _settle()
+    placed = [o for o in mt5.pending_orders_by_magic(MAGIC) if o.get("comment") == "M2"]
+    assert len(placed) == 1
+    ticket = placed[0]["ticket"]
+
+    # 底仓被清空（人工平仓），挂单还挂在盘上
+    for pos in mt5.positions_by_magic(MAGIC):
+        mt5.close_ticket_with_reason(pos["ticket"], cr.REASON_CLIENT)
+    mt5.prices_map["XAUUSD"] = 4406.0
+    _tick_bid_ask(hub, [], bid=4405.9, ask=4406.0)
+    await _settle(10)
+
+    assert ticket not in [o["ticket"] for o in mt5.pending_orders_by_magic(MAGIC)], \
+        "底仓清空后手动挂单不能留在盘上"
+    assert runner._manual_lifecycle(2) == ms.STATE_VOID
+    runner.cancel()
+
+
+async def test_runner_voids_pending_when_price_spikes_past_common_tp():
+    """价格冲过共同止盈时，即使仓位构成没变也要撤掉手动挂单。
+
+    「冲过目标价」是价格事件：仓位签名没变不代表没越界。之前只按签名判断，
+    要等下一次仓位变动才发现，挂单会在语境已变之后才被处理。
+    """
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.prices_map["XAUUSD"] = 4405.0
+    runner, hub = _runner(sent, mt5=mt5)
+    runner.start()
+    await _settle()
+    mt5.prices_map["XAUUSD"] = 4405.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4404.9, ask=4405.0)
+    await _settle()
+    placed = [o for o in mt5.pending_orders_by_magic(MAGIC) if o.get("comment") == "M2"]
+    assert len(placed) == 1
+    ticket = placed[0]["ticket"]
+    # 共同止盈已经落在仓位上了（批次1目标 500u / 0.1 手）
+    assert runner._lot_sltp_levels, "应记下共同止盈价"
+
+    # 价格冲过共同止盈：只动价格，仓位构成不变
+    mt5.prices_map["XAUUSD"] = 4600.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4599.9, ask=4600.0)
+    await _settle(10)
+
+    assert ticket not in [o["ticket"] for o in mt5.pending_orders_by_magic(MAGIC)], \
+        "冲过共同止盈后手动挂单应被撤掉"
+    off = _progress(sent, ms.PENDING_OFF_EVENT)
+    assert off and off[0]["detail"]["off_reason"] == ms.OFF_LADDER_TP
+    assert runner._manual_lifecycle(2) == ms.STATE_VOID
+    runner.cancel()
+
+
+def test_signal_pl_cross_level_detects_price_spike():
+    """现价越过已落下的目标价：能判出来（与 _cross_side 同口径）。"""
+    assert signal_pl.cross_level("BUY", (0.0, 4410.0), 4411.0) == "tp"
+    assert signal_pl.cross_level("BUY", (0.0, 4410.0), 4409.0) is None
+    assert signal_pl.cross_level("SELL", (0.0, 4410.0), 4409.0) == "tp"
+    assert signal_pl.cross_level("SELL", (0.0, 4410.0), 4411.0) is None
+    # 止损那一侧
+    assert signal_pl.cross_level("BUY", (4350.0, 0.0), 4349.0) == "sl"
+    assert signal_pl.cross_level("SELL", (4350.0, 0.0), 4351.0) == "sl"
+    # 没算的那一侧不参与
+    assert signal_pl.cross_level("BUY", (0.0, 0.0), 4400.0) is None
+    # 现价读不到时不算越过
+    assert signal_pl.cross_level("BUY", (0.0, 4410.0), 0.0) is None

@@ -451,6 +451,9 @@ class GroupTaskDispatch(Base):
     # 当前 magic 未成交挂单笔数；限价开仓在成交前只有它，是「在途但未持仓」的唯一凭据
     pending_orders: Mapped[int] = mapped_column(Integer, default=0)
     add_count: Mapped[int] = mapped_column(Integer, default=0)        # 已加仓次数
+    # 各规则已开笔数（按规则类型分开，如 {"1": 3, "2": 0}）：前端校验
+    # 「上限不能低于已开笔数」的依据，规则类型是动态键所以用 JSON 存
+    add_counts_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     total_orders: Mapped[int] = mapped_column(Integer, default=0)     # 累计下单笔数
     total_volume: Mapped[float] = mapped_column(Float, default=0.0)   # 累计手数
     realized_profit: Mapped[float] = mapped_column(Float, default=0.0)
@@ -557,6 +560,9 @@ class TradingStrategy(Base):
     #   batch_enabled, batch_action, batch_count, total_lot_limit, batch_levels}, ...]
     config_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
     remark: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # 配置版本：每次保存 +1。热推时随快照下发，节点用它做版本门，
+    # 迟到的旧版本包直接丢弃，避免乱序热推把新配置覆盖回旧的。
+    config_version: Mapped[int] = mapped_column(Integer, default=0)
     # 数据归属：创建者；空 = 管理员名下
     owner_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

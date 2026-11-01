@@ -403,11 +403,17 @@ def strategy_rules_snapshot(strategy: Optional[dict]) -> Optional[dict]:
     """
     if not strategy:
         return None
+    try:
+        version = int(strategy.get("config_version") or 0)
+    except (TypeError, ValueError):
+        version = 0
     return {
         "strategy_id": strategy.get("strategy_id"),
         "name": strategy.get("name"),
         "symbol": strategy.get("symbol"),
         "template_id": strategy.get("template_id"),
+        # 配置版本：热推时带上，节点用它做版本门（迟到的旧包直接丢弃）
+        "config_version": version,
         "rules": [dict(r) for r in (strategy.get("rules") or []) if isinstance(r, dict)],
     }
 

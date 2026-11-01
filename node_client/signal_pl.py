@@ -163,16 +163,37 @@ def extract_config(rules: object) -> dict[str, Any]:
     })
 
 
-def prepare_runtime(cfg: dict | None) -> dict[str, Any]:
-    """任务启动时把指定次数的剩余次数灌进内存态。"""
+def prepare_runtime(
+    cfg: dict | None, *, keep_remaining: Optional[int] = None,
+) -> dict[str, Any]:
+    """任务启动时把指定次数的剩余次数灌进内存态。
+
+    keep_remaining：热推时沿用运行态已消耗的次数（传运行态的 remaining_times）。
+    传 None 表示按配置重置为 max_times（任务启动的语义）。
+    """
     out = normalize_config(cfg)
     rule = dict(out[RULE_FLOAT_PL_RATIO])
     if rule["enabled"] and rule["monitor_mode"] == MONITOR_TIMES:
-        rule["remaining_times"] = int(rule.get("max_times") or 1)
+        if keep_remaining is None:
+            rule["remaining_times"] = int(rule.get("max_times") or 1)
+        else:
+            # 热推沿用运行态：已消耗的次数不复活
+            rule["remaining_times"] = max(0, min(int(keep_remaining), int(rule.get("max_times") or 1)))
     else:
         rule["remaining_times"] = 0
     out[RULE_FLOAT_PL_RATIO] = rule
     return out
+
+
+def float_pl_remaining(cfg: dict | None) -> int:
+    """当前运行态里，次数型盈亏比还剩几次可触发。"""
+    src = cfg if isinstance(cfg, dict) else {}
+    rule = src.get(RULE_FLOAT_PL_RATIO)
+    if not isinstance(rule, dict):
+        return 0
+    if rule.get("monitor_mode") != MONITOR_TIMES:
+        return 0
+    return max(0, int(rule.get("remaining_times") or 0))
 
 
 def any_enabled(cfg: dict | None) -> bool:
@@ -352,6 +373,11 @@ def _round_price(price: float, digits: int) -> float:
     return round(float(price), max(0, int(digits)))
 
 
+def market_for_side(side: str, *, bid: float, ask: float, fallback: float) -> float:
+    """平仓侧现价：多单看买价，空单看卖价。缺一侧时用事件价。"""
+    return _market_for_side(side, bid=bid, ask=ask, fallback=fallback)
+
+
 def _market_for_side(side: str, *, bid: float, ask: float, fallback: float) -> float:
     """平仓侧现价：多单看买价，空单看卖价。缺一侧时用事件价。"""
     raw = bid if side == "BUY" else ask
@@ -359,6 +385,38 @@ def _market_for_side(side: str, *, bid: float, ask: float, fallback: float) -> f
     if price <= 0:
         price = _as_float(fallback, 0.0)
     return price if price > 0 else 0.0
+
+
+def cross_level(
+    side: str, levels: tuple[float | None, float | None], market: float,
+) -> Optional[str]:
+    """现价是否越过了已经算好的目标价（止损, 止盈）。
+
+    与 `_cross_side` 同口径，但吃的是**已经落在仓位上的**那一对价，
+    用来在只有价格变动、仓位构成没变的那一拍也能判出「冲过目标价了」。
+
+    levels = (sl, tp)；没算的那一侧传 None 或 0（价格 0 不是有效目标价）。
+    """
+    if market <= 0:
+        return None
+    raw_sl, raw_tp = levels
+    sl = _as_float(raw_sl, 0.0)
+    tp = _as_float(raw_tp, 0.0)
+    if sl <= 0:
+        sl = None
+    if tp <= 0:
+        tp = None
+    if side == "BUY":
+        if tp is not None and market >= tp:
+            return "tp"
+        if sl is not None and market <= sl:
+            return "sl"
+        return None
+    if tp is not None and market <= tp:
+        return "tp"
+    if sl is not None and market >= sl:
+        return "sl"
+    return None
 
 
 def _cross_side(

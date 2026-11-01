@@ -377,6 +377,37 @@ def _drop_legacy_nodes_table(sync_conn) -> None:
         sync_conn.execute(text("DROP TABLE nodes"))
 
 
+def _migrate_strategy_config_version(sync_conn) -> None:
+    """trading_strategy.config_version：配置版本号（热推版本门 + 上限下限校验）。"""
+    inspector = inspect(sync_conn)
+    if "trading_strategy" not in inspector.get_table_names():
+        return
+    cols = {c["name"] for c in inspector.get_columns("trading_strategy")}
+    if "config_version" not in cols:
+        sync_conn.execute(
+            text("ALTER TABLE trading_strategy ADD COLUMN config_version INTEGER NOT NULL DEFAULT 0")
+        )
+
+
+def _migrate_group_dispatch_add_counts(sync_conn) -> None:
+    """group_task_dispatch.add_counts_json：各规则已开笔数（前端上限下限校验的依据）。
+
+    节点上报里已经带了 add_counts（按规则类型分开），但历史只落了合计的
+    add_count。存 JSON 是因为规则类型是动态键（"1" / "2"）。
+    """
+    inspector = inspect(sync_conn)
+    if "group_task_dispatch" not in inspector.get_table_names():
+        return
+    cols = {c["name"] for c in inspector.get_columns("group_task_dispatch")}
+    if "add_counts_json" in cols:
+        return
+    dialect = sync_conn.engine.dialect.name
+    json_type = "JSON" if dialect == "mysql" else "TEXT"
+    sync_conn.execute(
+        text(f"ALTER TABLE group_task_dispatch ADD COLUMN add_counts_json {json_type}")
+    )
+
+
 async def init_db() -> None:
     """不存在则建表。生产环境建议改用 Alembic 迁移而非 create_all。"""
     async with engine.begin() as conn:
@@ -398,6 +429,8 @@ async def init_db() -> None:
         await conn.run_sync(_migrate_node_client_version)
         await conn.run_sync(_migrate_user_rbac_columns)
         await conn.run_sync(_migrate_owner_columns)
+        await conn.run_sync(_migrate_strategy_config_version)
+        await conn.run_sync(_migrate_group_dispatch_add_counts)
         await conn.run_sync(_migrate_dashboard_columns)
         await conn.run_sync(_migrate_node_credentials)
         await conn.run_sync(_migrate_node_primary)

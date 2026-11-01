@@ -42,6 +42,8 @@ PENDING_FILLED_EVENT = "manual_filled"
 TP_CLOSE_EVENT = "manual_tp_close"
 # 手动仓止盈价同步到其它持仓的事件
 TP_ALIGN_EVENT = "manual_tp_align"
+# 手动仓挂单被撤销的事件（阶梯止盈先到 / 客户改参重挂）
+PENDING_OFF_EVENT = "manual_off"
 DETAIL_KIND = "manual_scatter"
 # 手动仓消失后成交历史还没写进来：最多再等几拍再放弃判定
 EXIT_RESOLVE_ATTEMPTS = 3
@@ -597,6 +599,122 @@ def extract_watches(rules: object) -> list[dict[str, Any]]:
 
 
 # ----------------------------------------------------------------------
+# 手动单生命周期：NONE -> PENDING -> FILLED / VOID
+# ----------------------------------------------------------------------
+# 未配置（或已被消费摘除）：什么手动单都没有
+STATE_NONE = "none"
+# 挂单在盘上，等终端撮合：这一段允许客户改参数（撤旧单重算重挂）
+STATE_PENDING = "pending"
+# 挂单已成交成持仓：配置彻底锁定，之后一律不许改
+STATE_FILLED = "filled"
+# 挂单被撤销（阶梯止盈先到 / 任务收口）：本任务内不再自动挂
+STATE_VOID = "void"
+
+# 撤销原因
+OFF_LADDER_TP = "ladder_tp"      # 阶梯止盈先到
+OFF_REPLACED = "replaced"        # 客户改参，撤旧单重挂
+OFF_CLOSED = "closed"            # 任务收口
+
+
+def pending_signature(snap: dict) -> tuple:
+    """在途挂单的配置签名：只含「客户能改的那几项」。
+
+    用来判断热推后的新配置与盘上那张单是否真的不一样——一样就不动，
+    不一样才撤单重算重挂。
+    """
+    src = snap if isinstance(snap, dict) else {}
+    return (
+        round(_as_float(src.get("price_open")), 8),
+        round(_as_float(src.get("tp")), 8),
+        round(_as_float(src.get("sl")), 8),
+        round(_as_float(src.get("volume")), 8),
+        str(src.get("type") or "").strip().upper(),
+    )
+
+
+def cfg_signature(cfg: dict) -> tuple:
+    """配置侧的手动单签名，与 `pending_signature` 同一套字段口径。
+
+    手数只比「手填锁定」的那一份：非锁定时手数是按分档反推出来的，
+    盘上那张单的手数就是结果，比它没有意义。
+    """
+    src = normalize(cfg)
+    locked = bool(src.get("volume_locked") and src["volume"] > 0)
+    return (
+        round(_as_float(src.get("entry_price")), 8),
+        round(_as_float(src.get("take_profit")), 8),
+        round(_as_float(src.get("stop_loss")), 8),
+        round(_as_float(src["volume"]) if locked else 0.0, 8),
+        locked,
+    )
+
+
+def pending_matches_cfg(
+    cfg: dict, snap: dict, *, stops_level: int = 0, point: float = 0.0,
+) -> bool:
+    """盘上那张挂单是否与当前配置一致。
+
+    一致就不动它（改单要撤单重挂，频繁撤挂会触券商限频）。不一致才重挂。
+
+    止损的对照口径与挂出时一致：配了但挂不上（券商 stops_level 或方向不对）
+    时盘上就是没止损，那也算一致——否则每次热推都会无意义地撤单重挂。
+    """
+    src = normalize(cfg)
+    cur = snap if isinstance(snap, dict) else {}
+    if round(_as_float(cur.get("price_open")), 8) != round(src["entry_price"], 8):
+        return False
+    if round(_as_float(cur.get("tp")), 8) != round(src["take_profit"], 8):
+        return False
+    sl = src["stop_loss"]
+    if sl > 0:
+        direction = direction_from_prices(src["entry_price"], src["take_profit"])
+        expect_sl = sl if (
+            direction
+            and sl_is_sendable(
+                direction, sl, src["entry_price"],
+                stops_level=stops_level, point=point,
+            )
+        ) else 0.0
+        if round(_as_float(cur.get("sl")), 8) != round(expect_sl, 8):
+            return False
+    else:
+        if round(_as_float(cur.get("sl")), 8) != 0.0:
+            return False
+    locked = bool(src.get("volume_locked") and src["volume"] > 0)
+    if locked and round(_as_float(cur.get("volume")), 8) != round(src["volume"], 8):
+        return False
+    return True
+
+
+def describe_pending_off(reason: str) -> str:
+    """挂单被撤销的人话说明。"""
+    if reason == OFF_LADDER_TP:
+        return (
+            "阶梯止盈先到达，手动分散仓挂单已撤销："
+            "仓位已按阶梯止盈收口，手动单不再入场"
+        )
+    if reason == OFF_REPLACED:
+        return "手动分散仓参数已调整：原挂单已撤销，按新参数重新挂单"
+    if reason == OFF_CLOSED:
+        return "手动分散仓挂单已撤销：任务收口"
+    return "手动分散仓挂单已撤销"
+
+
+def pending_off_detail(
+    rule_type: int, reason: str, *, ticket: object = None,
+) -> dict[str, Any]:
+    """挂单撤销事件的明细。"""
+    return {
+        "kind": DETAIL_KIND,
+        "rule_type": int(rule_type or 0),
+        "pending_ticket": _as_int(ticket) or None,
+        "pending_action": "cancel",
+        "off_reason": str(reason or ""),
+        "comment": comment_for(rule_type),
+    }
+
+
+# ----------------------------------------------------------------------
 # 先后顺序：手动分散仓要等本规则的分批加仓先加完
 # ----------------------------------------------------------------------
 def batch_add_limit(rule: object) -> int:
@@ -663,6 +781,34 @@ def linkage_rule_types(rules: object) -> set[int]:
         int(w["rule_type"]) for w in extract_watches(rules)
         if bool((w.get("cfg") or {}).get("close_all_on_tp"))
     }
+
+
+# ----------------------------------------------------------------------
+# 加仓收口：手动分散仓是本任务的最后一次加仓
+# ----------------------------------------------------------------------
+def add_closed_rule_types(fired: object) -> set[int]:
+    """哪些规则类型的加仓已经收口。
+
+    手动分散仓是本任务的最后一次加仓：它一挂出单，就代表这条规则的批次已经
+    铺完，不能再开新的分批加仓（逆势 / 顺势都不再）。收口是**按规则**判定的，
+    逆势的手动仓只锁逆势，顺势照常。
+
+    `fired` 是节点的 `_manual_fired` 集合（规则类型 -> 已开过）。
+    """
+    out: set[int] = set()
+    for item in fired or []:
+        try:
+            rule_type = int(item)
+        except (TypeError, ValueError):
+            continue
+        if rule_type in (RULE_TYPE_COUNTER, RULE_TYPE_TREND):
+            out.add(rule_type)
+    return out
+
+
+def is_add_closed(fired: object, rule_type: int) -> bool:
+    """这条规则的加仓是否已经收口（手动分散仓已开）。"""
+    return int(rule_type or 0) in add_closed_rule_types(fired)
 
 
 def _snapshot_from_position(pos: dict) -> dict[str, Any]:

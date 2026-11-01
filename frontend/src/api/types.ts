@@ -714,9 +714,39 @@ export interface StrategyOut {
   rules: StrategyRule[]
   remark: string | null
   created_at: number
+  /** 配置版本：每次保存 +1，热推时随快照下发 */
+  config_version?: number
+  /**
+   * 运行态提示：用于保存前校验。
+   * - running_task_count：在跑的子任务数
+   * - max_added_by_rule：各规则已开笔数的最大值（键是规则类型字符串）
+   * - manual_fired：已开过手动分散仓的规则类型
+   * - manual_state：手动分散仓的生命周期（none/pending/filled/void）
+   * - nodes_offline：在跑但节点不在线的子任务数
+   */
+  runtime_hints?: StrategyRuntimeHints | null
   /** 数据归属：null = 管理员名下 */
   owner_user_id?: number | null
   owner_username?: string | null
+}
+
+/**
+ * 手动分散仓的生命周期：
+ * - none：未配置或已被消费摘除
+ * - pending：挂单在盘上，**允许客户改参数**（节点撤旧单重算重挂）
+ * - filled：挂单已成交成持仓，**配置彻底锁定**，之后一律不许改
+ * - void：挂单被撤销（阶梯止盈先到等），本任务内不再自动挂
+ */
+export type ManualScatterState = 'none' | 'pending' | 'filled' | 'void'
+
+export interface StrategyRuntimeHints {
+  running_task_count: number
+  /** 键是规则类型字符串（"1" 逆势 / "2" 顺势） */
+  max_added_by_rule: Record<string, number>
+  manual_fired: number[]
+  /** 键是规则类型字符串，值是手动单生命周期 */
+  manual_state?: Record<string, ManualScatterState>
+  nodes_offline: number
 }
 
 export interface StrategyCreatePayload {
@@ -826,7 +856,7 @@ export interface GroupTaskEventRecord {
   created_at: number | null
   /**
    * open / add_counter / add_trend / add_manual / manual_pending / manual_filled /
-   * manual_tp_align / manual_tp_close /
+   * manual_off / manual_tp_align / manual_tp_close /
    * grid_add / grid_shift / cnt_limit / cnt_limit_mod / cnt_limit_off / close_partial /
    * close_all / error / resume
    */
@@ -843,6 +873,18 @@ export interface GroupTaskEventRecord {
   message: string | null
   /** 计算依据明细：偏离点数、阈值、手数公式等逐项参数 */
   detail: GroupTaskEventDetail | null
+}
+
+/** 策略热推回执里的单个字段结论 */
+export interface StrategyUpdateField {
+  /** 字段路径，如 rules[type=1].total_lot_limit */
+  field: string
+  /** applied=已生效 / partial=部分生效 / frozen=冻结 / locked=锁定 / no_effect=无效果 */
+  status: string
+  old?: unknown
+  new?: unknown
+  /** 人类可读的说明 */
+  message?: string
 }
 
 /** 事件的计算依据明细。字段随 kind 不同 */
@@ -863,6 +905,7 @@ export interface GroupTaskEventDetail {
     | 'account_risk'
     | 'close_reason'
     | 'manual_scatter'
+    | 'strategy_update'
   // —— 加仓（kind=add）——
   rule_type?: number
   rule_type_label?: string
@@ -995,6 +1038,13 @@ export interface GroupTaskEventDetail {
   rule_label?: string
   close_action?: string
   close_action_label?: string
+  // —— 策略热推回执（kind=strategy_update）——
+  /** 整体结论：applied=全部生效 / partial=部分生效 / rejected=被拒 */
+  result?: string
+  /** 生效的配置版本 */
+  config_version?: number | null
+  /** 逐字段结论 */
+  fields?: StrategyUpdateField[]
   message_core?: string
   monitor_mode?: string
   item_id?: string

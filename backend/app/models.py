@@ -719,6 +719,10 @@ class StrategyOut(BaseModel):
     rules: list[StrategyRule] = Field(default_factory=list)
     remark: Optional[str] = None
     created_at: float = 0
+    # 配置版本：每次保存 +1，热推时随快照下发
+    config_version: int = 0
+    # 运行态提示：在跑任务数、各规则已开笔数、手动仓是否已开
+    runtime_hints: Optional[dict] = None
     # 数据归属：空 = 管理员名下
     owner_user_id: Optional[int] = None
     owner_username: Optional[str] = None

@@ -555,6 +555,24 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
     push('错误', detail.error)
     return rows
   }
+  if (detail.kind === 'strategy_update') {
+    push('整体结论', strategyUpdateResultLabel(detail.result))
+    push('配置版本', detail.config_version)
+    const fields = Array.isArray(detail.fields) ? detail.fields : []
+    if (!fields.length) {
+      push('说明', '没有字段级变更')
+      return rows
+    }
+    // 逐字段结论：状态 + 说明
+    fields.forEach((f, i) => {
+      push(
+        `字段 ${i + 1}`,
+        `${strategyUpdateFieldLabel(f.status)} · ${f.field || '-'}` +
+          (f.message ? ` — ${f.message}` : ''),
+      )
+    })
+    return rows
+  }
   if (detail.kind === 'account_risk') {
     push('风控规则', detail.rule_label || detail.rule)
     push('触发说明', detail.message_core)
@@ -597,6 +615,28 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
   )
   push('魔术号', detail.magic)
   return rows
+}
+
+function strategyUpdateResultLabel(result?: string | null): string {
+  const m: Record<string, string> = {
+    applied: '✅ 全部生效',
+    partial: '⚠️ 部分生效',
+    rejected: '❌ 被拒绝',
+  }
+  const key = String(result || '').toLowerCase()
+  return m[key] || (key ? key : '—')
+}
+
+function strategyUpdateFieldLabel(status?: string | null): string {
+  const m: Record<string, string> = {
+    applied: '✅ 生效',
+    partial: '⚠️ 部分生效',
+    frozen: '❄️ 冻结',
+    locked: '🔒 锁定',
+    no_effect: '➖ 无效果',
+  }
+  const key = String(status || '').toLowerCase()
+  return m[key] || (key ? key : '—')
 }
 
 /** 一律按东八区（北京时间）显示，不跟券商 MT5 钟面对齐。 */
@@ -744,6 +784,7 @@ function eventTag(
     add_manual: { cls: 'amber', text: '手动分散仓' },
     manual_pending: { cls: 'amber', text: '手动仓挂单' },
     manual_filled: { cls: 'green', text: '手动仓成交' },
+    manual_off: { cls: '', text: '手动仓撤单' },
     manual_tp_align: { cls: 'blue', text: '止盈价同步' },
     manual_tp_close: { cls: 'blue', text: '止盈联动清仓' },
     grid_add: { cls: 'amber', text: '网格买入' },
@@ -753,6 +794,7 @@ function eventTag(
     close_all: { cls: 'blue', text: '全部平仓' },
     error: { cls: 'red', text: '异常' },
     resume: { cls: '', text: '恢复' },
+    strategy_update: { cls: 'blue', text: '策略更新' },
   }
   return m[eventType] || { cls: '', text: eventType }
 }
