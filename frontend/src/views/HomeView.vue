@@ -1,10 +1,8 @@
 <script setup lang="ts">
-// 总览页：趋势观测 + 汇总统计 + 节点卡片（筛选/排序/分页）+ 远程平仓 + 事件流
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { useRouter } from 'vue-router'
+// 首页：左侧趋势/K 线 + 右侧按归属分组的节点总览。平仓与删挂单仍走原确认流程。
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import HubTrendEmbed from '@/components/HubTrendEmbed.vue'
-import TagSelect from '@/components/TagSelect.vue'
-import type { TagOption } from '@/components/tagOption'
 import { useHubStore } from '@/stores/hub'
 import type { AccountSnapshot, CancelPendingResult, NodeOut, PendingOrder, Position } from '@/api/types'
 import { confirmAction } from '@/utils/confirm'
@@ -15,6 +13,8 @@ import { useAuthStore } from '@/stores/auth'
 const hub = useHubStore()
 const auth = useAuthStore()
 const router = useRouter()
+const route = useRoute()
+const trendConfigOpen = computed(() => route.query.config === 'trend')
 
 onMounted(async () => {
   await hub.fetchNodes()
@@ -46,20 +46,27 @@ const homeVisibleNodes = computed<NodeOut[]>(() => {
 // 再次点击同一节点则关闭；点击其它节点切换展开目标；点击页面空白处收起。
 const openMenuNodeId = ref<string | null>(null)
 function toggleNodeMenu(n: NodeOut): void {
+  sortOpen.value = false
   openMenuNodeId.value = openMenuNodeId.value === n.node_id ? null : n.node_id
 }
 function closeNodeMenu(): void {
   openMenuNodeId.value = null
 }
+const sortOpen = ref(false)
 function onDocClick(ev: MouseEvent): void {
-  if (!openMenuNodeId.value) return
   const target = ev.target as HTMLElement | null
-  // 点在菜单容器 / 触发按钮上都不要关闭
-  if (target && target.closest('.dash-node-menu')) return
-  closeNodeMenu()
+  if (openMenuNodeId.value && !target?.closest('.home-node-menu')) closeNodeMenu()
+  if (sortOpen.value && !target?.closest('.home-sort')) sortOpen.value = false
 }
 function onDocKey(ev: KeyboardEvent): void {
-  if (ev.key === 'Escape') closeNodeMenu()
+  if (ev.key === 'Escape') {
+    closeNodeMenu()
+    sortOpen.value = false
+  }
+}
+function toggleSort(): void {
+  closeNodeMenu()
+  sortOpen.value = !sortOpen.value
 }
 onMounted(() => {
   document.addEventListener('click', onDocClick)
@@ -277,21 +284,29 @@ async function showPrimaryBlockedDialog(active: {
   )
 }
 
-type StatusFilter = 'all' | 'online' | 'offline'
+type StatusFilter = 'all' | 'holding' | 'profit' | 'loss' | 'online' | 'offline'
 type SortBy = 'equity_desc' | 'equity_asc' | 'name'
-const SORT_TAGS: TagOption<SortBy>[] = [
+const SORT_OPTIONS: { value: SortBy; label: string }[] = [
   { value: 'equity_desc', label: '按净值降序' },
   { value: 'equity_asc', label: '按净值升序' },
   { value: 'name', label: '按名称' },
 ]
-type ViewMode = 'grid' | 'list'
+const FILTERS: { value: StatusFilter; label: string }[] = [
+  { value: 'all', label: '全部' },
+  { value: 'holding', label: '持仓' },
+  { value: 'profit', label: '浮盈' },
+  { value: 'loss', label: '浮亏' },
+  { value: 'online', label: '在线' },
+  { value: 'offline', label: '离线' },
+]
 
 const q = ref('')
-const statusFilter = ref<StatusFilter>('online')
+const statusFilter = ref<StatusFilter>('all')
 const sortBy = ref<SortBy>('name')
-const viewMode = ref<ViewMode>('grid')
-const page = ref(1)
-const pageSize = 9
+function pickSort(value: SortBy): void {
+  sortBy.value = value
+  sortOpen.value = false
+}
 
 function statusOf(n: NodeOut): 'online' | 'offline' {
   const s = hub.statuses[n.node_id] || n.status
@@ -300,12 +315,15 @@ function statusOf(n: NodeOut): 'online' | 'offline' {
 function acct(id: string): AccountSnapshot | undefined {
   return hub.accounts[id]
 }
-function fmt(n: number | undefined): string {
-  return (n ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 })
+function fmtMoney(n: number | undefined): string {
+  return (n ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 }
 function fmtSigned(n: number): string {
-  const abs = Math.abs(n).toLocaleString(undefined, { maximumFractionDigits: 2 })
+  const abs = Math.abs(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
   return n >= 0 ? `+${abs}` : `-${abs}`
+}
+function fmtVol(n: number): string {
+  return n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 }
 function nodeVolume(positions: Position[] | undefined): number {
   return (positions || []).reduce((a, p) => a + (p.volume || 0), 0)
@@ -317,9 +335,9 @@ function goNode(id: string): void {
   router.push({ name: 'node-detail', params: { id } })
 }
 
-const totalEquity = computed(() =>
+const totalBalance = computed(() =>
   homeVisibleNodes.value.reduce(
-    (acc, n) => acc + ((hub.accounts[n.node_id]?.equity) || 0),
+    (acc, n) => acc + ((hub.accounts[n.node_id]?.balance) || 0),
     0,
   ),
 )
@@ -364,7 +382,17 @@ const statusCounts = computed(() => {
 const filteredNodes = computed(() => {
   const query = q.value.trim().toLowerCase()
   let list = homeVisibleNodes.value.filter((n) => {
-    if (statusFilter.value !== 'all' && statusOf(n) !== statusFilter.value) return false
+    const positions = acct(n.node_id)?.positions
+    const profit = nodeProfit(positions)
+    if (statusFilter.value === 'online' || statusFilter.value === 'offline') {
+      if (statusOf(n) !== statusFilter.value) return false
+    } else if (statusFilter.value === 'holding') {
+      if (!positions?.length) return false
+    } else if (statusFilter.value === 'profit') {
+      if (profit <= 0) return false
+    } else if (statusFilter.value === 'loss') {
+      if (profit >= 0) return false
+    }
     if (!query) return true
     const a = acct(n.node_id)
     const hay = [
@@ -397,28 +425,23 @@ const filteredNodes = computed(() => {
   return list
 })
 
-const totalPages = computed(() => Math.max(1, Math.ceil(filteredNodes.value.length / pageSize)))
-
-const pagedNodes = computed(() => {
-  const start = (page.value - 1) * pageSize
-  return filteredNodes.value.slice(start, start + pageSize)
-})
-
-const pageNumbers = computed(() => {
-  const total = totalPages.value
-  const cur = page.value
-  const pages: number[] = []
-  const from = Math.max(1, cur - 2)
-  const to = Math.min(total, from + 4)
-  for (let i = Math.max(1, to - 4); i <= to; i++) pages.push(i)
-  return pages
-})
-
-watch([q, statusFilter, sortBy], () => {
-  page.value = 1
-})
-watch(totalPages, (tp) => {
-  if (page.value > tp) page.value = tp
+const groupedNodes = computed(() => {
+  const map = new Map<string, NodeOut[]>()
+  for (const n of filteredNodes.value) {
+    const name = (n.owner_username || '').trim() || '未分配'
+    const bucket = map.get(name)
+    if (bucket) bucket.push(n)
+    else map.set(name, [n])
+  }
+  return [...map.entries()].map(([name, nodes]) => ({
+    key: name,
+    name,
+    initial: name.slice(0, 1),
+    nodes,
+    online: nodes.filter((n) => statusOf(n) === 'online').length,
+    balance: nodes.reduce((sum, n) => sum + (acct(n.node_id)?.balance || 0), 0),
+    profit: nodes.reduce((sum, n) => sum + nodeProfit(acct(n.node_id)?.positions), 0),
+  }))
 })
 
 async function closeNodeAll(n: NodeOut): Promise<void> {
@@ -537,261 +560,534 @@ function reportCancelPending(res: CancelPendingResult): void {
 </script>
 
 <template>
-  <div class="dash-page">
-    <!-- <div class="row between page-header">
-      <div>
-        <div class="h1">实时总览11122</div>
-        <p class="muted page-desc">多节点账户净值、持仓与事件流实时监控</p>
-      </div>
-      <div class="row" style="gap: 8px">
-        <ManualStrategyTrigger />
-      </div>
-    </div> -->
-
-    <HubTrendEmbed compact show-full-panel class="dash-trend" />
-
-    <div class="dash-summary">
-      <div class="card card-pad dash-stat">
-        <div class="stat"><span class="k">在线节点</span><span class="v">{{ statusCounts.online }} / {{ statusCounts.all }}</span></div>
-      </div>
-      <div class="card card-pad dash-stat">
-        <div class="stat"><span class="k">合计净值</span><span class="v">{{ fmt(totalEquity) }}</span></div>
-      </div>
-      <div class="card card-pad dash-stat">
-        <div class="stat"><span class="k">合计持仓</span><span class="v">{{ totalPositions }}</span></div>
-      </div>
-      <div class="card card-pad dash-stat">
-        <div class="stat"><span class="k">合计手数</span><span class="v">{{ fmt(totalVolume) }}</span></div>
-      </div>
-      <div class="card card-pad dash-stat" :class="totalProfit >= 0 ? 'dash-stat-profit-pos' : 'dash-stat-profit-neg'">
-        <div class="stat"><span class="k">合计盈亏</span><span class="v dash-stat-profit-value">{{ fmtSigned(totalProfit) }}</span></div>
-      </div>
+  <div class="home-board" :class="{ 'is-config': trendConfigOpen }">
+    <div class="home-board-main">
+      <HubTrendEmbed home />
     </div>
 
-    <!-- 管理员专属提示：本页只展示「管理员自己独占拥有」的节点 -->
-    <div v-if="auth.isAdmin" class="home-scope-banner muted">
-      首页仅显示所有者（owner）为你本人的节点，共 {{ statusCounts.all }} 个；
-      尚未分配的节点、以及分配给其他用户的节点，请在「节点」或「总览」中查看。
-    </div>
+    <aside v-if="!trendConfigOpen" class="home-board-side">
+      <p v-if="auth.isAdmin" class="home-scope">
+        首页仅显示所有者为你本人的节点，共 {{ statusCounts.all }} 个。尚未分配或已分给其他用户的节点，请到「节点」或「总览」查看。
+      </p>
 
-    <div class="dash-layout">
-      <div class="dash-main">
-        <div class="card card-pad dash-toolbar">
-          <div class="dash-search">
-            <svg class="dash-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
-            <input v-model="q" class="dash-search-input" type="search" placeholder="搜索节点 / 账号" />
+      <section class="home-panel">
+        <div class="home-panel-head">
+          <p class="home-kicker">节点总览</p>
+          <span class="home-online-pill">
+            <i></i>{{ statusCounts.online }} / {{ statusCounts.all }} 在线
+          </span>
+        </div>
+
+        <div class="home-stats">
+          <div class="home-stat">
+            <span class="k">在线节点</span>
+            <span class="v">{{ statusCounts.online }}/{{ statusCounts.all }}</span>
           </div>
-          <div class="dash-status-chips" role="group" aria-label="状态筛选">
-            <button type="button" class="dash-chip" :class="{ active: statusFilter === 'all' }" @click="statusFilter = 'all'">全部 {{ statusCounts.all }}</button>
-            <button type="button" class="dash-chip online" :class="{ active: statusFilter === 'online' }" @click="statusFilter = 'online'">在线 {{ statusCounts.online }}</button>
-            <button type="button" class="dash-chip offline" :class="{ active: statusFilter === 'offline' }" @click="statusFilter = 'offline'">离线 {{ statusCounts.offline }}</button>
+          <div class="home-stat">
+            <span class="k">合计余额</span>
+            <span class="v">{{ fmtMoney(totalBalance) }}</span>
           </div>
-          <div class="dash-toolbar-right">
-            <TagSelect v-model="sortBy" :options="SORT_TAGS" aria-label="排序" />
-            <!-- <div class="dash-view-toggle" role="group" aria-label="视图切换">
-              <button type="button" class="dash-view-btn" :class="{ active: viewMode === 'grid' }" title="网格" @click="viewMode = 'grid'">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
-              </button>
-              <button type="button" class="dash-view-btn" :class="{ active: viewMode === 'list' }" title="列表" @click="viewMode = 'list'">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
-              </button>
-            </div> -->
+          <div class="home-stat">
+            <span class="k">合计持仓</span>
+            <span class="v">{{ totalPositions }}</span>
+          </div>
+          <div class="home-stat">
+            <span class="k">合计手数</span>
+            <span class="v">{{ fmtVol(totalVolume) }}</span>
+          </div>
+          <div class="home-stat home-stat-pnl" :class="totalProfit >= 0 ? 'is-up' : 'is-down'">
+            <span class="k">合计盈亏</span>
+            <span class="v">{{ fmtSigned(totalProfit) }}</span>
           </div>
         </div>
 
-        <div class="dash-list-head row between">
-          <div>
-            <strong>节点列表</strong>
-            <span class="muted" style="margin-left: 8px; font-size: 12px">{{ filteredNodes.length }} 个结果</span>
+        <div class="home-tools">
+          <label class="home-search">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+            <input v-model="q" type="search" placeholder="搜索节点编号 / 名称" />
+          </label>
+          <div class="home-sort">
+            <button type="button" class="home-sort-btn" :aria-expanded="sortOpen" @click.stop="toggleSort">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M8 7h11M8 12h8M8 17h5"/><path d="M4 7v10M4 17l-2-2M4 17l2-2"/></svg>
+              排序
+            </button>
+            <div v-if="sortOpen" class="home-menu" role="menu">
+              <button
+                v-for="opt in SORT_OPTIONS"
+                :key="opt.value"
+                type="button"
+                class="home-menu-item"
+                :class="{ active: sortBy === opt.value }"
+                role="menuitem"
+                @click="pickSort(opt.value)"
+              >{{ opt.label }}</button>
+            </div>
           </div>
         </div>
 
-        <div class="dash-nodes" :class="viewMode === 'list' ? 'is-list' : 'is-grid'">
-          <div v-for="n in pagedNodes" :key="n.node_id" class="card card-pad dash-node-card">
-            <div class="row between dash-node-head">
-              <div class="row" style="gap: 8px; min-width: 0">
-                <span class="dot" :class="statusOf(n)"></span>
-                <strong class="dash-node-name" @click="goNode(n.node_id)">{{ n.name }}</strong>
-                <span class="tag" :class="statusOf(n) === 'online' ? 'green' : 'red'">{{ statusOf(n) === 'online' ? '在线' : '离线' }}</span>
-                <span v-if="n.is_primary" class="tag dash-node-primary-tag" title="本账号主节点">★ 主节点</span>
+        <div class="home-filters" role="group" aria-label="节点筛选">
+          <button
+            v-for="f in FILTERS"
+            :key="f.value"
+            type="button"
+            class="home-filter"
+            :class="{ active: statusFilter === f.value }"
+            @click="statusFilter = f.value"
+          >{{ f.label }}</button>
+        </div>
+
+        <div v-if="groupedNodes.length" class="home-groups">
+          <section v-for="g in groupedNodes" :key="g.key" class="home-group">
+            <header class="home-group-head">
+              <span class="home-avatar" aria-hidden="true">{{ g.initial }}</span>
+              <div class="home-group-text">
+                <strong>{{ g.name }}</strong>
+                <p>{{ g.nodes.length }} 个节点 · {{ g.online }}/{{ g.nodes.length }} 在线 · 余额 {{ fmtMoney(g.balance) }}</p>
               </div>
-              <div class="dash-node-menu">
-                <button
-                  type="button"
-                  class="dash-more btn-ghost btn-sm"
-                  title="更多操作"
-                  aria-haspopup="menu"
-                  :aria-expanded="openMenuNodeId === n.node_id"
-                  @click.stop="toggleNodeMenu(n)"
-                >⋯</button>
-                <div
-                  v-if="openMenuNodeId === n.node_id"
-                  class="dash-node-menu-pop"
-                  role="menu"
-                  @click.stop
-                >
+              <span class="home-group-pnl" :class="g.profit >= 0 ? 'is-up' : 'is-down'">{{ fmtSigned(g.profit) }}</span>
+            </header>
+
+            <article
+              v-for="n in g.nodes"
+              :key="n.node_id"
+              class="home-node"
+              @click="goNode(n.node_id)"
+            >
+              <div class="home-node-top">
+                <span class="home-node-ico" :class="{ primary: n.is_primary }" aria-hidden="true">
+                  <svg v-if="n.is_primary" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2 9.2 8.4 2.4 9.2l5 4.6L6.2 21 12 17.6 17.8 21l-1.2-7.2 5-4.6-6.8-.8L12 2z"/></svg>
+                  <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M8 15V9M12 15v-3M16 15V8"/></svg>
+                </span>
+                <div class="home-node-id">
+                  <div class="home-node-title">
+                    <span>{{ n.node_id }}</span>
+                    <em v-if="n.is_primary">主节点</em>
+                  </div>
+                  <p>{{ n.name }}</p>
+                </div>
+                <span class="home-status" :class="statusOf(n)">{{ statusOf(n) === 'online' ? '在线' : '离线' }}</span>
+                <div class="home-node-menu" @click.stop>
                   <button
                     type="button"
-                    class="dash-node-menu-item"
-                    role="menuitem"
-                    @click="goNode(n.node_id)"
-                  >
-                    <span class="dash-node-menu-icon">🔍</span>
-                    <span>查看详情</span>
-                  </button>
-                  <!-- 只有「还没设为主节点」时才给客户显示；已是主节点的取消入口仅管理员可见 -->
-                  <button
-                    v-if="!n.is_primary || auth.isAdmin"
-                    type="button"
-                    class="dash-node-menu-item"
-                    :class="{ 'is-on': !!n.is_primary }"
-                    role="menuitem"
-                    @click="togglePrimary(n)"
-                  >
-                    <span class="dash-node-menu-icon">{{ n.is_primary ? '★' : '☆' }}</span>
-                    <span>{{ n.is_primary ? '取消主节点' : '设置为主节点' }}</span>
-                  </button>
+                    class="home-more"
+                    title="更多操作"
+                    aria-haspopup="menu"
+                    :aria-expanded="openMenuNodeId === n.node_id"
+                    @click="toggleNodeMenu(n)"
+                  >⋯</button>
+                  <div v-if="openMenuNodeId === n.node_id" class="home-menu" role="menu">
+                    <button type="button" class="home-menu-item" role="menuitem" @click="closeNodeMenu(); goNode(n.node_id)">查看详情</button>
+                    <button
+                      v-if="!n.is_primary || auth.isAdmin"
+                      type="button"
+                      class="home-menu-item"
+                      :class="{ active: n.is_primary }"
+                      role="menuitem"
+                      @click="togglePrimary(n)"
+                    >{{ n.is_primary ? '取消主节点' : '设置为主节点' }}</button>
+                    <button
+                      type="button"
+                      class="home-menu-item"
+                      role="menuitem"
+                      :disabled="!(acct(n.node_id)?.positions?.length)"
+                      @click="closeNodeMenu(); closeNodeAll(n)"
+                    >平掉该节点全部</button>
+                    <button
+                      v-if="n.is_primary"
+                      type="button"
+                      class="home-menu-item"
+                      role="menuitem"
+                      :disabled="!!pendingDisabledReason(n)"
+                      :title="pendingDisabledReason(n) || '删除该节点全部挂单（不动持仓）'"
+                      @click="closeNodeMenu(); confirmCancelPending(n)"
+                    >{{ pendingOf(n)?.length ? `删挂单 (${pendingOf(n)!.length})` : '删挂单' }}</button>
+                  </div>
                 </div>
               </div>
-            </div>
-            <div class="muted dash-node-sub">
-              {{ acct(n.node_id)?.login || n.mt5_login || '—' }} @ {{ acct(n.node_id)?.server || n.mt5_server || '—' }}
-            </div>
-
-            <div class="dash-metrics">
-              <div class="stat">
-                <span class="k">净值</span>
-                <span class="v dash-metric-v">{{ fmt(acct(n.node_id)?.equity) }}</span>
+              <div class="home-node-metrics">
+                <span><em>余额</em> {{ fmtMoney(acct(n.node_id)?.balance) }}</span>
+                <span><em>持仓</em> {{ acct(n.node_id)?.positions?.length || 0 }} · {{ fmtVol(nodeVolume(acct(n.node_id)?.positions)) }}手</span>
+                <strong :class="nodeProfit(acct(n.node_id)?.positions) >= 0 ? 'is-up' : 'is-down'">
+                  {{ fmtSigned(nodeProfit(acct(n.node_id)?.positions)) }}
+                </strong>
               </div>
-              <div class="stat">
-                <span class="k">持仓</span>
-                <span class="v dash-metric-v">
-                  {{ acct(n.node_id)?.positions?.length || 0 }} - {{ fmt(nodeVolume(acct(n.node_id)?.positions)) }} 手
-                </span>
-              </div>
-              <div class="stat">
-                <span class="k">盈亏</span>
-                <span
-                  class="v dash-metric-v dash-metric-profit"
-                  :class="nodeProfit(acct(n.node_id)?.positions) >= 0 ? 'profit-pos' : 'profit-neg'"
-                >{{ fmtSigned(nodeProfit(acct(n.node_id)?.positions)) }}</span>
-              </div>
-            </div>
-
-            <!-- <template v-if="acct(n.node_id)?.positions?.length">
-              <table class="dash-pos-table">
-                <thead>
-                  <tr><th>品种</th><th>方向</th><th class="right">手数</th><th class="right">盈亏</th><th></th></tr>
-                </thead>
-                <tbody>
-                  <tr v-for="p in previewPositions(acct(n.node_id)!.positions)" :key="p.ticket">
-                    <td>{{ p.symbol }}</td>
-                    <td><span class="tag" :class="p.type === 'BUY' ? 'green' : 'blue'">{{ p.type }}</span></td>
-                    <td class="right">{{ p.volume }}</td>
-                    <td class="right" :class="p.profit >= 0 ? 'profit-pos' : 'profit-neg'">{{ fmt(p.profit) }}</td>
-                    <td class="right"><button type="button" class="btn-sm btn-ghost" @click="closeTicket(n, p.ticket)">平</button></td>
-                  </tr>
-                </tbody>
-              </table>
-            </template> -->
-            <!-- <div v-else class="muted dash-empty-pos">无持仓</div> -->
-
-            <div class="dash-node-foot row between">
-              <button
-                v-if="acct(n.node_id)?.positions?.length"
-                type="button"
-                class="dash-link"
-                @click="goNode(n.node_id)"
-              >查看全部 {{ acct(n.node_id)!.positions.length }} 个持仓 →</button>
-              <span v-else></span>
-              <div class="row" style="gap: 8px">
-                <!-- 删挂单：仅主节点显示（主节点是唯一接收策略信号、也是挂单唯一堆积的节点） -->
-                <button
-                  v-if="n.is_primary"
-                  type="button"
-                  class="btn-sm btn-ghost btn-warn-ghost"
-                  :disabled="!!pendingDisabledReason(n)"
-                  :title="pendingDisabledReason(n) || '删除该节点全部挂单（不动持仓）'"
-                  @click="confirmCancelPending(n)"
-                >
-                  {{ pendingOf(n)?.length ? `删挂单 (${pendingOf(n)!.length})` : '删挂单' }}
-                  <span v-if="pendingBusy[n.node_id]" class="spin-mini"></span>
-                </button>
-                <button
-                  type="button"
-                  class="btn-sm btn-ghost"
-                  :disabled="!acct(n.node_id)?.positions?.length"
-                  @click="closeNodeAll(n)"
-                >平掉该节点全部</button>
-              </div>
-            </div>
-          </div>
-
-          <div v-if="homeVisibleNodes.length && !filteredNodes.length" class="card card-pad muted span-full">没有匹配的节点</div>
-          <div v-if="!homeVisibleNodes.length" class="card card-pad muted span-full">
-            <template v-if="auth.isAdmin">
-              你当前没有 owner 为本人的节点。
-              请到「节点」页把未分配的节点分配给自己，或新建后再回到首页查看。
-            </template>
-            <template v-else>
-              还没有节点，请到「节点」页面创建。
-            </template>
-          </div>
-          <!-- 删挂单只在主节点卡片上出现；没设主节点时给一句说明，避免用户以为功能坏了 -->
-          <div
-            v-if="filteredNodes.length && !filteredNodes.some((n) => n.is_primary)"
-            class="muted dash-pending-hint"
-          >尚未设置主节点，「删挂单」入口在设置主节点后可用。</div>
+            </article>
+          </section>
         </div>
 
-        <div v-if="filteredNodes.length > pageSize" class="dash-pagination">
-          <button type="button" class="dash-page-btn" :disabled="page <= 1" @click="page -= 1">‹</button>
-          <button
-            v-for="p in pageNumbers"
-            :key="p"
-            type="button"
-            class="dash-page-btn"
-            :class="{ active: p === page }"
-            @click="page = p"
-          >{{ p }}</button>
-          <button type="button" class="dash-page-btn" :disabled="page >= totalPages" @click="page += 1">›</button>
-        </div>
-      </div>
-<!-- 
-      <aside class="card card-pad dash-events">
-        <div class="row between dash-events-head">
-          <strong>实时事件</strong>
-          <button type="button" class="dash-link" @click="markAllRead">全部标记已读</button>
-        </div>
-        <div class="dash-event-tabs">
-          <button type="button" class="dash-event-tab" :class="{ active: eventTab === 'all' }" @click="eventTab = 'all'">全部</button>
-          <button type="button" class="dash-event-tab" :class="{ active: eventTab === 'risk' }" @click="eventTab = 'risk'">风险</button>
-          <button type="button" class="dash-event-tab" :class="{ active: eventTab === 'trade' }" @click="eventTab = 'trade'">交易</button>
-        </div>
-        <div class="dash-event-list">
-          <div
-            v-for="e in filteredEvents"
-            :key="eventKey(e)"
-            class="dash-event"
-            :class="[e.kind, { unread: !isRead(e) }]"
-          >
-            <span class="ts">{{ new Date(e.ts).toLocaleTimeString() }}</span>
-            <span class="dash-event-icon" :class="e.kind" aria-hidden="true">
-              <svg v-if="e.kind === 'warn'" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2 1 21h22L12 2zm0 6 1.5 8h-3L12 8zm0 10.5a1.25 1.25 0 1 1 0 2.5 1.25 1.25 0 0 1 0-2.5z"/></svg>
-              <svg v-else-if="e.kind === 'ok'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M20 6 9 17l-5-5"/></svg>
-              <span v-else class="dash-event-dot"></span>
-            </span>
-            <span class="text">{{ e.text }}</span>
-            <span
-              v-if="parseDelta(e.text) != null"
-              class="dash-event-delta"
-              :class="(parseDelta(e.text) ?? 0) >= 0 ? 'profit-pos' : 'profit-neg'"
-            >{{ fmtSigned(parseDelta(e.text)!) }}</span>
-          </div>
-          <div v-if="!filteredEvents.length" class="muted" style="font-size: 12px; padding: 12px 0">暂无事件</div>
-        </div>
-        <RouterLink class="dash-link dash-events-foot" to="/events">查看全部事件 →</RouterLink>
-      </aside> -->
-    </div>
+        <p v-else-if="homeVisibleNodes.length" class="home-empty">没有匹配的节点</p>
+        <p v-else class="home-empty">
+          <template v-if="auth.isAdmin">你当前没有所有者为本人的节点。请到「节点」页分配或新建后再回来查看。</template>
+          <template v-else>还没有节点，请到「节点」页面创建。</template>
+        </p>
+        <p
+          v-if="filteredNodes.length && !filteredNodes.some((n) => n.is_primary)"
+          class="home-empty"
+        >尚未设置主节点，「删挂单」入口在设置主节点后可用。</p>
+      </section>
+    </aside>
   </div>
 </template>
+
+<style scoped>
+.home-board {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr);
+  gap: 16px;
+  align-items: start;
+  min-width: 0;
+}
+.home-board.is-config { display: block; }
+.home-board.is-config .home-board-main {
+  max-width: 560px;
+  margin: 8px auto 0;
+}
+.home-board-main,
+.home-board-side { min-width: 0; }
+.home-board-side {
+  position: sticky;
+  top: 76px;
+}
+.home-scope {
+  margin: 0 0 8px;
+  color: #5B6B85;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.home-panel {
+  border: 1px solid #1C2740;
+  background: #101828;
+  border-radius: 12px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
+  padding: 16px;
+}
+.home-panel-head,
+.home-group-head,
+.home-node-top,
+.home-node-metrics,
+.home-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.home-panel-head { justify-content: space-between; }
+.home-kicker {
+  margin: 0;
+  color: #8B96A8;
+  font-size: 12px;
+  font-weight: 500;
+}
+.home-online-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid #22304A;
+  background: #0C1220;
+  color: #8B96A8;
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 10px;
+}
+.home-online-pill i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #34d399;
+}
+.home-stats {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 12px;
+}
+.home-stat {
+  grid-column: span 2;
+  display: block;
+  gap: 0;
+  min-height: 0;
+  overflow: hidden;
+  position: static;
+  background: #0C1220;
+  border: 1px solid #22304A;
+  border-radius: 8px;
+  padding: 8px 10px;
+  min-width: 0;
+}
+.home-stat::before { content: none; display: none; }
+.home-stat:nth-child(4),
+.home-stat:nth-child(5) { grid-column: span 3; }
+.home-stat .k {
+  display: block;
+  color: #5B6B85;
+  font-size: 11px;
+  margin-bottom: 4px;
+}
+.home-stat .v {
+  display: block;
+  color: #E6EBF4;
+  font-size: 16px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.home-stat-pnl.is-up {
+  background: rgba(16, 185, 129, 0.12);
+  border-color: rgba(16, 185, 129, 0.35);
+}
+.home-stat-pnl.is-down {
+  background: rgba(239, 68, 68, 0.1);
+  border-color: rgba(239, 68, 68, 0.32);
+}
+.home-stat-pnl.is-up .v { color: #34d399; }
+.home-stat-pnl.is-down .v { color: #f87171; }
+.home-tools { margin-top: 12px; }
+.home-search {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 34px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid #22304A;
+  background: #0C1220;
+  color: #5B6B85;
+}
+.home-search svg { width: 14px; height: 14px; flex-shrink: 0; }
+.home-search input {
+  flex: 1;
+  width: auto;
+  min-width: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: #E6EBF4;
+  font: inherit;
+  font-size: 12px;
+  padding: 0;
+  outline: none;
+  box-shadow: none;
+  backdrop-filter: none;
+}
+.home-search input:focus {
+  border: none;
+  box-shadow: none;
+}
+.home-search input::placeholder { color: #5B6B85; }
+.home-sort { position: relative; flex-shrink: 0; }
+.home-sort-btn,
+.home-filter,
+.home-more,
+.home-menu-item {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+.home-sort-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 34px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid #22304A;
+  background: #0C1220;
+  color: #8B96A8;
+  font-size: 12px;
+}
+.home-sort-btn svg { width: 14px; height: 14px; }
+.home-sort-btn:hover,
+.home-filter:hover,
+.home-more:hover { background: #16213A; color: #E6EBF4; }
+.home-filters {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 4px;
+  margin-top: 8px;
+}
+.home-filter {
+  padding: 6px 0;
+  border-radius: 6px;
+  border: 1px solid #22304A;
+  background: #0C1220;
+  color: #8B96A8;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1;
+}
+.home-filter.active,
+.home-menu-item.active {
+  background: #2563EB;
+  border-color: transparent;
+  color: #fff;
+}
+.home-groups { margin-top: 14px; display: flex; flex-direction: column; gap: 14px; }
+.home-group-head { align-items: flex-start; }
+.home-avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #162033;
+  color: #8B96A8;
+  font-size: 12px;
+  font-weight: 650;
+  flex-shrink: 0;
+}
+.home-group-text { flex: 1; min-width: 0; }
+.home-group-text strong {
+  display: block;
+  color: #E6EBF4;
+  font-size: 13px;
+  font-weight: 600;
+}
+.home-group-text p {
+  margin: 2px 0 0;
+  color: #5B6B85;
+  font-size: 11px;
+  line-height: 1.4;
+}
+.home-group-pnl {
+  font-size: 12px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.home-node {
+  margin-top: 8px;
+  padding: 10px;
+  border-radius: 10px;
+  border: 1px solid #22304A;
+  background: #0C1220;
+  cursor: pointer;
+}
+.home-node:hover { border-color: #31425f; }
+.home-node-top { align-items: flex-start; }
+.home-node-ico {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: #8B96A8;
+  background: #101828;
+}
+.home-node-ico svg { width: 16px; height: 16px; }
+.home-node-ico.primary { color: #fbbf24; background: rgba(251, 191, 36, 0.12); }
+.home-node-id { flex: 1; min-width: 0; }
+.home-node-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: #E6EBF4;
+  font-size: 13px;
+  font-weight: 600;
+}
+.home-node-title span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.home-node-title em {
+  flex-shrink: 0;
+  font-style: normal;
+  font-size: 10px;
+  font-weight: 600;
+  color: #fbbf24;
+  background: rgba(251, 191, 36, 0.12);
+  border-radius: 999px;
+  padding: 1px 6px;
+}
+.home-node-id p {
+  margin: 2px 0 0;
+  color: #5B6B85;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.home-status {
+  flex-shrink: 0;
+  border-radius: 999px;
+  padding: 2px 7px;
+  font-size: 10px;
+  font-weight: 600;
+}
+.home-status.online { color: #34d399; background: rgba(16, 185, 129, 0.12); }
+.home-status.offline { color: #8B96A8; background: rgba(139, 150, 168, 0.12); }
+.home-node-menu { position: relative; flex-shrink: 0; }
+.home-more {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #8B96A8;
+  font-size: 16px;
+  line-height: 1;
+}
+.home-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 8;
+  min-width: 148px;
+  padding: 4px;
+  border-radius: 8px;
+  border: 1px solid #22304A;
+  background: #0C1220;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+.home-menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: transparent;
+  color: #E6EBF4;
+  font-size: 12px;
+}
+.home-menu-item:hover:not(:disabled) { background: #16213A; }
+.home-node-metrics {
+  margin-top: 8px;
+  color: #8B96A8;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.home-node-metrics em {
+  font-style: normal;
+  color: #5B6B85;
+  margin-right: 4px;
+}
+.home-node-metrics span { white-space: nowrap; }
+.home-node-metrics strong {
+  margin-left: auto;
+  font-size: 13px;
+  font-weight: 650;
+}
+.is-up { color: #34d399; }
+.is-down { color: #f87171; }
+.home-empty {
+  margin: 12px 0 0;
+  color: #5B6B85;
+  font-size: 12px;
+  line-height: 1.5;
+}
+@media (max-width: 1023px) {
+  .home-board { grid-template-columns: 1fr; gap: 12px; }
+  .home-board-side { position: static; }
+  .home-panel { padding: 12px; }
+}
+@media (max-width: 420px) {
+  .home-node-metrics { flex-wrap: wrap; }
+  .home-node-metrics strong { margin-left: 0; }
+}
+</style>
