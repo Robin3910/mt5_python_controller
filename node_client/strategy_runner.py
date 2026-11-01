@@ -2381,6 +2381,12 @@ class StrategyRunner:
             return False
         ticket = res.get("order") or res.get("ticket")
         # 记下这张单：重连后靠它知道已经挂过，不再重复挂
+        #
+        # 除了「这张单本身」，还要记下**算它手数时的依据**：
+        # - cfg：挂出时的手动仓配置。挂出后后端会把 manual_scatter 从策略配置里
+        #   消费掉（单次消费），self._rules 里可能已经没这一块了，重挂时得从这里取。
+        # - lot_pl_tiers：挂出时的分档配置。阶梯止盈的批次1 金额变了，手数就得重算；
+        #   没有这份快照就看不出该不该重挂。
         self._manual_pending[rule_type] = {
             "ticket": int(ticket or 0),
             "type": direction,
@@ -2389,6 +2395,9 @@ class StrategyRunner:
             "sl": float(order_sl or 0.0),
             "tp": float(tp or 0.0),
             "time": time.time(),
+            "cfg": dict(cfg),
+            "lot_pl_tiers": dict(watch.get("lot_pl_tiers") or {}),
+            "projected_pl": round(projected_pl, 6),
         }
         self._manual_fired.add(rule_type)
         self._manual_state[rule_type] = manual_scatter.STATE_PENDING
@@ -2439,6 +2448,44 @@ class StrategyRunner:
         if rt in self._manual_open:
             return manual_scatter.STATE_FILLED
         return manual_scatter.STATE_NONE
+
+    async def _manual_pending_can_place(
+        self, watch: dict, positions: list[dict], *, spec: dict,
+    ) -> bool:
+        """按当前配置能不能算出可挂的手数。
+
+        撤旧单之前先问一遍：撤了却挂不上，手动仓就彻底没了（止盈权威、
+        止盈联动清仓都挂在它身上）。算不出来就保留旧单——旧单至少还在场。
+        """
+        cfg = watch.get("cfg") if isinstance(watch.get("cfg"), dict) else {}
+        if not cfg:
+            return False
+        src = manual_scatter.normalize(cfg)
+        if src.get("volume_locked") and src.get("volume", 0.0) > 0:
+            return True
+        target = manual_scatter.tier0_pl_amount(watch.get("lot_pl_tiers"))
+        if target is None:
+            # 没有目标金额：只有客户手填了手数才挂得出来
+            return src.get("volume", 0.0) > 0
+        current = manual_scatter.current_lot(positions)
+        projected = manual_scatter.projected_profit(
+            manual_scatter.exclude_manual(positions),
+            _as_float(src.get("take_profit")),
+            _as_float(spec.get("tick_size")),
+            _as_float(spec.get("tick_value")),
+        )
+        volume = manual_scatter.compute_volume(
+            cfg=cfg,
+            current_lot_size=current,
+            lot_pl_tiers=watch.get("lot_pl_tiers"),
+            tick_size=_as_float(spec.get("tick_size")),
+            tick_value=_as_float(spec.get("tick_value")),
+            volume_step=_as_float(spec.get("volume_step"), 0.01),
+            volume_min=_as_float(spec.get("volume_min"), 0.01),
+            volume_max=_as_float(spec.get("volume_max"), 100.0),
+            projected_pl=projected if target is not None else 0.0,
+        )
+        return volume is not None and volume > 0
 
     def _manual_is_locked(self, rule_type: int) -> bool:
         """这条规则的手动单是否已锁死（已成交：之后一律不许改）。
@@ -2514,10 +2561,17 @@ class StrategyRunner:
     ) -> bool:
         """热推配置后同步在途的手动挂单。
 
-        客户在挂单还没成交时改了入场 / 止盈 / 止损：撤掉旧单，按新参数重算手数，
-        再挂一张新单。手数是按新入场/止盈反推的，所以必须重算。
+        两种改动都要撤旧单重算手数重挂：
+        1. 客户改了手动仓自己的入场 / 止盈 / 止损；
+        2. 客户改了**阶梯止盈的批次1 金额**（`lot_pl_tiers.tiers[0].pl_amount`）——
+           手动仓手数是按这个金额反推的（目标金额 − 存量预估盈亏）÷ 每手止盈，
+           金额变了手数就不对了。
+
+        第 2 种改动容易漏：`pending_matches_cfg` 只比手动仓自己的那几个字段，
+        阶梯止盈金额不在里面，光靠它判断会以为「配置没变」就不动挂单。
 
         已成交（FILLED）的一律不动——客户说了「已成交之后不能再修改了」。
+        手填锁定手数时也不动（手数与阶梯止盈金额无关）。
         """
         if not self._manual_pending:
             return False
@@ -2531,23 +2585,57 @@ class StrategyRunner:
             snap = self._manual_pending.get(rule_type)
             if snap is None:
                 continue
+            # 已成交（FILLED）的手动仓配置彻底锁死：阶梯止盈金额再改也不动它
             if self._manual_is_locked(rule_type):
                 continue
             cfg = self._manual_watch_cfg(rule_type)
+            # 阶梯止盈的批次1 金额变了 → 手动仓手数必须重算。
+            # 手动仓手数是按这个金额反推的（目标金额 − 存量预估盈亏）÷ 每手止盈，
+            # 金额变了手数就不对了，在途挂单得撤旧单重挂。
+            tiers_changed = manual_scatter.tiers_target_changed(
+                snap.get("lot_pl_tiers"), self._manual_tiers(rule_type),
+            )
+            if tiers_changed and self._manual_volume_locked(rule_type, cfg, snap):
+                # 手填锁定手数：手数是客户自己敲死的，与阶梯止盈金额无关。
+                # 阶梯止盈金额改了只影响存量仓位的共同止盈（另一条路径处理），
+                # 这张挂单的手数不动。
+                tiers_changed = False
             if cfg is None:
-                continue
-            if manual_scatter.pending_matches_cfg(
+                # 手动仓配置已被后端消费掉（挂出即消费），客户没改它：
+                # 只有阶梯止盈金额变了才需要动这张单。
+                if not tiers_changed:
+                    continue
+            elif manual_scatter.pending_matches_cfg(
                 cfg, snap, stops_level=stops_level, point=points,
+            ) and not tiers_changed:
+                # 手动仓自己的参数没变，阶梯止盈金额也没变 → 不动它
+                # （撤挂会触券商限频）
+                continue
+            # 手动仓自己的参数用最新的（热推带来的）；拿不到就用挂单快照里的旧值
+            # ——挂出后后端会消费掉 manual_scatter，self._rules 里可能已经没这一块了。
+            watch = self._manual_watch(rule_type) or self._manual_rebuild_watch(
+                rule_type, snap,
+            )
+            if watch is None:
+                continue
+            if tiers_changed:
+                # 分档金额一定要用最新的：手数就是按它反推的
+                watch["lot_pl_tiers"] = self._manual_tiers(rule_type) or {}
+            # **先确认能重挂，再撤旧单**：撤了却挂不上，手动仓就彻底没了。
+            # 典型场景：客户把分档停用了 → 算不出手数 → 不能撤。
+            if not await self._manual_pending_can_place(
+                watch, positions, spec=spec,
             ):
+                logger.warning(
+                    "task %s manual pending kept: cannot recompute volume for rule %s",
+                    self.task_id, rule_type,
+                )
                 continue
             # 撤旧单（先撤后算，避免两张单同时在场）
             await self._void_manual_pending(
                 manual_scatter.OFF_REPLACED,
                 positions=positions, rule_types=[rule_type],
             )
-            watch = self._manual_watch(rule_type)
-            if watch is None:
-                continue
             price = self._manual_market_price(watch)
             if price <= 0:
                 continue
@@ -2563,6 +2651,62 @@ class StrategyRunner:
             if int(watch.get("rule_type") or 0) == int(rule_type):
                 return watch
         return None
+
+    def _manual_tiers(self, rule_type: int) -> Optional[dict]:
+        """该规则当前的分档手数盈亏配置。
+
+        与 `_manual_watch` 分开取：手动仓那块配置挂出后会被后端消费掉
+        （单次消费），但分档配置不会——阶梯止盈金额改了，手数必须跟着重算，
+        不能因为手动仓那块被摘了就看不见新金额。
+        """
+        for raw in self._rules or []:
+            if not isinstance(raw, dict):
+                continue
+            if int(raw.get("type") or 0) != int(rule_type or 0):
+                continue
+            tiers = raw.get("lot_pl_tiers")
+            return tiers if isinstance(tiers, dict) else {}
+        return None
+
+    def _manual_volume_locked(
+        self, rule_type: int, cfg: Optional[dict], snap: dict,
+    ) -> bool:
+        """手动仓的手数是不是客户手填锁定的。
+
+        锁定时手数与阶梯止盈金额无关，改金额不该动这张挂单。
+        配置以最新的为准，拿不到就退回挂单快照里挂出时的那份。
+        """
+        raw = cfg if isinstance(cfg, dict) else snap.get("cfg")
+        if not isinstance(raw, dict):
+            return False
+        src = manual_scatter.normalize(raw)
+        return bool(src.get("volume_locked") and src.get("volume", 0.0) > 0)
+
+    def _manual_rebuild_watch(self, rule_type: int, snap: dict) -> Optional[dict]:
+        """用挂单快照里的配置 + 当前的分档配置，造一个可重挂的 watch。
+
+        为什么要重建：手动仓配置挂出后会被后端消费掉（单次消费），
+        `self._rules` 里可能已经没有 `manual_scatter` 那一块了，
+        `_manual_watch` 会返回 None。但重挂需要入场价 / 止盈价 / 止损价——
+        它们在挂单快照里存着（那是挂出时用的配置）。
+        """
+        cfg = snap.get("cfg") if isinstance(snap.get("cfg"), dict) else {}
+        if not cfg:
+            return None
+        direction = manual_scatter.direction_from_prices(
+            _as_float(cfg.get("entry_price")), _as_float(cfg.get("take_profit")),
+        )
+        if direction is None:
+            return None
+        return {
+            "rule_type": int(rule_type),
+            "cfg": dict(cfg),
+            "direction": direction,
+            "lot_pl_tiers": self._manual_tiers(rule_type) or {},
+            "comment": manual_scatter.comment_for(rule_type),
+            "batch_enabled": False,
+            "rule": {},
+        }
 
     def _manual_market_price(self, watch: dict) -> float:
         """手动单该按哪一侧现价算（成交侧：BUY=ask，SELL=bid）。"""

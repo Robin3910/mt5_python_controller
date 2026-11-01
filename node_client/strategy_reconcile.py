@@ -242,7 +242,10 @@ def _pl_tiers_fields(old_rule: dict, new_rule: dict) -> list[dict]:
                 f"{new_tier.get('pl_amount')}"
             )
             if idx == 0:
-                message += "；这是实际生效的共同止盈金额，下一拍重算止盈价"
+                message += (
+                    "；这是实际生效的共同止盈金额，下一拍重算止盈价；"
+                    "在途的手动分散仓挂单会按新金额重算手数后重挂"
+                )
             else:
                 message += "；当前版本只有批次1参与共同止盈计算，该批次暂不生效"
             out.append({

@@ -663,6 +663,32 @@ def cfg_signature(cfg: dict) -> tuple:
     )
 
 
+def tiers_target_changed(old_tiers: object, new_tiers: object) -> bool:
+    """分档批次1 的目标金额是否变了（变了 → 手动仓手数要重算）。
+
+    手动分散仓的手数是按「批次1 目标金额」反推出来的：
+    手数 =（批次1 目标金额 − 存量仓位到止盈时刻的预估盈亏）÷ 每手止盈。
+    所以阶梯止盈的金额改了，手数必须跟着重算，在途挂单要撤旧单重挂。
+
+    **只比批次1 的 pl_amount**：
+    - 批次1 是**真正生效**的那个（批次2+ 当前版本不参与共同止盈计算），
+      改了它手数才真的要变；
+    - `min_lot`（批次1 的手数门槛）只影响「达到多少手数才写止盈」，
+      不影响手动仓手数；
+    - `close_action`（平仓方向）与手数无关。
+
+    **不比存量预估盈亏**：它随行情实时变化，比了会导致每次热推都撤单重挂
+    （撤挂会触券商限频），而且存量盈亏变化不该改手动单的目标金额口径。
+    """
+    old = tier0_pl_amount(old_tiers)
+    new = tier0_pl_amount(new_tiers)
+    if old is None and new is None:
+        return False
+    if old is None or new is None:
+        return True
+    return abs(old - new) > 1e-9
+
+
 def pending_matches_cfg(
     cfg: dict, snap: dict, *, stops_level: int = 0, point: float = 0.0,
 ) -> bool:
@@ -926,6 +952,14 @@ def runtime_pending_payload(tracked: dict[int, dict] | None) -> dict[str, dict[s
             "sl": _as_float(snap.get("sl")),
             "tp": _as_float(snap.get("tp")),
             "time": _as_float(snap.get("time")),
+            # 挂出时的手动仓配置与分档配置：重连后要判断「阶梯止盈金额改了
+            # 吗」——改了手数得重算重挂。没有这两项，重连后就看不出该不该动。
+            "cfg": dict(snap.get("cfg") or {}) if isinstance(snap.get("cfg"), dict) else {},
+            "lot_pl_tiers": (
+                dict(snap.get("lot_pl_tiers") or {})
+                if isinstance(snap.get("lot_pl_tiers"), dict) else {}
+            ),
+            "projected_pl": _as_float(snap.get("projected_pl")),
         }
     return out
 
@@ -947,6 +981,12 @@ def parse_runtime_pending(raw: object) -> dict[int, dict[str, Any]]:
             "sl": _as_float(snap.get("sl")),
             "tp": _as_float(snap.get("tp")),
             "time": _as_float(snap.get("time")),
+            "cfg": dict(snap.get("cfg") or {}) if isinstance(snap.get("cfg"), dict) else {},
+            "lot_pl_tiers": (
+                dict(snap.get("lot_pl_tiers") or {})
+                if isinstance(snap.get("lot_pl_tiers"), dict) else {}
+            ),
+            "projected_pl": _as_float(snap.get("projected_pl")),
         }
         if parsed["ticket"] <= 0:
             continue

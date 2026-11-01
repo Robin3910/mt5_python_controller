@@ -2154,3 +2154,254 @@ def test_signal_pl_cross_level_detects_price_spike():
     assert signal_pl.cross_level("BUY", (0.0, 0.0), 4400.0) is None
     # 现价读不到时不算越过
     assert signal_pl.cross_level("BUY", (0.0, 4410.0), 0.0) is None
+
+
+# ----------------------------------------------------------------------
+# 阶梯止盈金额热推 → 在途手动挂单按新手数重挂
+# ----------------------------------------------------------------------
+
+
+def test_tiers_target_changed_only_on_batch1_amount():
+    """只认批次1 的金额：批次2+ / min_lot / close_action 变了都不算改。"""
+    old = _gold_tiers(pl_lo=500.0, pl_hi=800.0)
+    # 批次1 金额变了 → True
+    assert ms.tiers_target_changed(old, _gold_tiers(pl_lo=600.0, pl_hi=800.0)) is True
+    # 只改批次2 → False（批次2 当前版本不参与共同止盈计算）
+    assert ms.tiers_target_changed(old, _gold_tiers(pl_lo=500.0, pl_hi=900.0)) is False
+    # 完全一样 → False
+    assert ms.tiers_target_changed(old, _gold_tiers()) is False
+    # 分档从启用到关闭 → True
+    off = {"enabled": False, "tiers": []}
+    assert ms.tiers_target_changed(old, off) is True
+    # 两边都没启用 → False
+    assert ms.tiers_target_changed(off, off) is False
+    # 关闭 → 启用 → True
+    assert ms.tiers_target_changed(off, old) is True
+
+
+async def test_runner_replaces_pending_when_tier_amount_changes():
+    """阶梯止盈金额改了：手动挂单必须撤旧单、按新手数重挂。
+
+    场景：手动单已挂出但没成交 → 客户改了信号分档批次1 的盈亏金额 →
+    手动仓手数是按这个金额反推的，必须重算。
+    """
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.prices_map["XAUUSD"] = 4405.0
+    runner, hub = _runner(sent, mt5=mt5)
+    runner.start()
+    await _settle()
+    mt5.prices_map["XAUUSD"] = 4405.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4404.9, ask=4405.0)
+    await _settle()
+    placed = [o for o in mt5.pending_orders_by_magic(MAGIC) if o.get("comment") == "M2"]
+    assert len(placed) == 1, "手动分散仓应已挂出"
+    old_ticket = placed[0]["ticket"]
+    old_volume = placed[0]["volume"]
+
+    # 客户改阶梯止盈金额：批次1 500 → 2000（目标变大，手数应变多）
+    runner.apply_strategy({
+        "template_id": "tpl_1",
+        "rules": [_trend_rule(
+            manual_scatter=_cfg(),
+            lot_pl_tiers=_gold_tiers(pl_lo=2000.0, pl_hi=800.0),
+        )],
+    })
+    mt5.prices_map["XAUUSD"] = 4405.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4404.9, ask=4405.0)
+    await _settle(10)
+
+    now = [o for o in mt5.pending_orders_by_magic(MAGIC) if o.get("comment") == "M2"]
+    assert len(now) == 1, "重挂后只能有一张单"
+    assert now[0]["ticket"] != old_ticket, "旧挂单应被撤掉并换新票号"
+    assert now[0]["volume"] > old_volume, "目标金额变大，手数应变多"
+    runner.cancel()
+
+
+async def test_runner_keeps_pending_when_only_batch2_amount_changes():
+    """只改批次2 的金额：不该动挂单（批次2 当前版本不参与共同止盈计算）。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.prices_map["XAUUSD"] = 4405.0
+    runner, hub = _runner(sent, mt5=mt5)
+    runner.start()
+    await _settle()
+    mt5.prices_map["XAUUSD"] = 4405.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4404.9, ask=4405.0)
+    await _settle()
+    placed = [o for o in mt5.pending_orders_by_magic(MAGIC) if o.get("comment") == "M2"]
+    assert len(placed) == 1
+    ticket = placed[0]["ticket"]
+
+    runner.apply_strategy({
+        "template_id": "tpl_1",
+        "rules": [_trend_rule(
+            manual_scatter=_cfg(),
+            lot_pl_tiers=_gold_tiers(pl_lo=500.0, pl_hi=9999.0),
+        )],
+    })
+    mt5.prices_map["XAUUSD"] = 4405.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4404.9, ask=4405.0)
+    await _settle(10)
+
+    now = [o for o in mt5.pending_orders_by_magic(MAGIC) if o.get("comment") == "M2"]
+    assert len(now) == 1
+    assert now[0]["ticket"] == ticket, "只改批次2 不该撤单重挂"
+    runner.cancel()
+
+
+async def test_runner_keeps_pending_when_volume_locked():
+    """手填锁定手数：阶梯止盈金额改了也不该动挂单（手数与它无关）。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.prices_map["XAUUSD"] = 4405.0
+    runner, hub = _runner(
+        sent, mt5=mt5,
+        strategy={"template_id": "tpl_1", "rules": [
+            _trend_rule(manual_scatter=_cfg(volume=0.4, volume_locked=True)),
+        ]},
+    )
+    runner.start()
+    await _settle()
+    mt5.prices_map["XAUUSD"] = 4405.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4404.9, ask=4405.0)
+    await _settle()
+    placed = [o for o in mt5.pending_orders_by_magic(MAGIC) if o.get("comment") == "M2"]
+    assert len(placed) == 1
+    ticket = placed[0]["ticket"]
+    assert placed[0]["volume"] == 0.4
+
+    runner.apply_strategy({
+        "template_id": "tpl_1",
+        "rules": [_trend_rule(
+            manual_scatter=_cfg(volume=0.4, volume_locked=True),
+            lot_pl_tiers=_gold_tiers(pl_lo=2000.0, pl_hi=800.0),
+        )],
+    })
+    mt5.prices_map["XAUUSD"] = 4405.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4404.9, ask=4405.0)
+    await _settle(10)
+
+    now = [o for o in mt5.pending_orders_by_magic(MAGIC) if o.get("comment") == "M2"]
+    assert len(now) == 1
+    assert now[0]["ticket"] == ticket, "手填锁定手数时不该撤单重挂"
+    runner.cancel()
+
+
+async def test_runner_replaces_pending_when_manual_config_consumed():
+    """手动仓配置被后端消费掉（挂出即消费）：只改阶梯止盈金额仍能重挂。
+
+    挂出后后端会把 manual_scatter 从策略配置里摘掉，热推过来的快照里
+    可能已经没有这一块。阶梯止盈金额在规则上（lot_pl_tiers），不受影响——
+    手数必须照常重算。
+    """
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.prices_map["XAUUSD"] = 4405.0
+    runner, hub = _runner(sent, mt5=mt5)
+    runner.start()
+    await _settle()
+    mt5.prices_map["XAUUSD"] = 4405.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4404.9, ask=4405.0)
+    await _settle()
+    placed = [o for o in mt5.pending_orders_by_magic(MAGIC) if o.get("comment") == "M2"]
+    assert len(placed) == 1
+    old_ticket = placed[0]["ticket"]
+    old_volume = placed[0]["volume"]
+
+    # 热推：手动仓配置已被消费掉（没有 manual_scatter 块），只改了阶梯止盈金额
+    runner.apply_strategy({
+        "template_id": "tpl_1",
+        "rules": [_trend_rule(
+            lot_pl_tiers=_gold_tiers(pl_lo=2000.0, pl_hi=800.0),
+        )],
+    })
+    mt5.prices_map["XAUUSD"] = 4405.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4404.9, ask=4405.0)
+    await _settle(10)
+
+    now = [o for o in mt5.pending_orders_by_magic(MAGIC) if o.get("comment") == "M2"]
+    assert len(now) == 1, "重挂后只能有一张单"
+    assert now[0]["ticket"] != old_ticket, "旧挂单应被撤掉并换新票号"
+    assert now[0]["price_open"] == 4400.0, "挂单价沿用挂出时的入场价"
+    assert now[0]["volume"] > old_volume, "按新目标金额重算，手数应变多"
+    runner.cancel()
+
+
+async def test_runner_keeps_pending_when_manual_filled():
+    """已成交（FILLED）的手动仓：阶梯止盈金额改了也不动它（配置已锁死）。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub, manual = await _open_first_and_manual(sent, mt5)
+    assert runner._manual_lifecycle(2) == ms.STATE_FILLED
+
+    runner.apply_strategy({
+        "template_id": "tpl_1",
+        "rules": [_trend_rule(
+            manual_scatter=_cfg(),
+            lot_pl_tiers=_gold_tiers(pl_lo=2000.0, pl_hi=800.0),
+        )],
+    })
+    mt5.prices_map["XAUUSD"] = 4400.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4399.9, ask=4400.0)
+    await _settle(10)
+
+    assert runner._manual_lifecycle(2) == ms.STATE_FILLED
+    runner.cancel()
+
+
+def test_runtime_pending_payload_keeps_volume_source():
+    """runtime 要带上算手数的依据：重连后才知道该不该重算重挂。"""
+    snap = {
+        "ticket": 12345, "type": "BUY", "volume": 0.3, "price_open": 4400.0,
+        "sl": 0.0, "tp": 4410.0, "time": 100.0,
+        "cfg": {"entry_price": 4400.0, "take_profit": 4410.0, "volume_locked": False},
+        "lot_pl_tiers": _gold_tiers(pl_lo=500.0),
+        "projected_pl": -12.5,
+    }
+    payload = ms.runtime_pending_payload({2: snap})
+    raw = payload["2"]
+    assert raw["cfg"]["entry_price"] == 4400.0
+    assert ms.tier0_pl_amount(raw["lot_pl_tiers"]) == 500.0
+    assert raw["projected_pl"] == -12.5
+
+    # 还原回来仍然能判断金额变没变
+    back = ms.parse_runtime_pending(payload)
+    assert 2 in back
+    assert ms.tier0_pl_amount(back[2]["lot_pl_tiers"]) == 500.0
+    assert ms.tiers_target_changed(
+        back[2]["lot_pl_tiers"], _gold_tiers(pl_lo=2000.0),
+    ) is True
+
+
+async def test_runner_keeps_pending_when_new_tiers_disabled():
+    """新分档算不出手数：不能撤旧单（撤了挂不上，手动仓就彻底没了）。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.prices_map["XAUUSD"] = 4405.0
+    runner, hub = _runner(sent, mt5=mt5)
+    runner.start()
+    await _settle()
+    mt5.prices_map["XAUUSD"] = 4405.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4404.9, ask=4405.0)
+    await _settle()
+    placed = [o for o in mt5.pending_orders_by_magic(MAGIC) if o.get("comment") == "M2"]
+    assert len(placed) == 1
+    ticket = placed[0]["ticket"]
+
+    # 客户把分档停用了：算不出手数
+    runner.apply_strategy({
+        "template_id": "tpl_1",
+        "rules": [_trend_rule(
+            manual_scatter=_cfg(),
+            lot_pl_tiers={"enabled": False, "tiers": []},
+        )],
+    })
+    mt5.prices_map["XAUUSD"] = 4405.0
+    _tick_bid_ask(hub, mt5.positions_by_magic(MAGIC), bid=4404.9, ask=4405.0)
+    await _settle(10)
+
+    now = [o for o in mt5.pending_orders_by_magic(MAGIC) if o.get("comment") == "M2"]
+    assert len(now) == 1, "算不出手数时不该撤旧单"
+    assert now[0]["ticket"] == ticket
+    runner.cancel()
