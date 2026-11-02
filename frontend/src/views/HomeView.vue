@@ -707,12 +707,6 @@ function reportCancelPending(res: CancelPendingResult): void {
                   {{ pendingOf(n)?.length ? `删挂单 (${pendingOf(n)!.length})` : '删挂单' }}
                   <span v-if="pendingBusy[n.node_id]" class="spin-mini"></span>
                 </button>
-                <button
-                  type="button"
-                  class="btn-sm btn-ghost"
-                  :disabled="!acct(n.node_id)?.positions?.length"
-                  @click="closeNodeAll(n)"
-                >平掉该节点全部</button>
               </div>
             </div>
           </div>

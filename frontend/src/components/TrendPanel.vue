@@ -467,6 +467,13 @@ onBeforeUnmount(() => {
             </button>
           </div>
         </div>
+        <!-- 当前价：紧凑模式下放在品种芯片行右侧 -->
+        <div v-if="compact" class="trend-compact-price">
+          <div class="trend-price">{{ fmtPrice(data?.price) }}</div>
+          <div class="muted trend-sub trend-compact-price-k">
+            当前价<template v-if="data?.price_source === 'close'">（报价缺失，取收盘价）</template>
+          </div>
+        </div>
         <!-- <label class="trend-field">
           <span class="trend-field-k">周期</span>
           <TagSelect v-model="form.timeframe" :options="TREND_TIMEFRAMES" aria-label="周期" />
@@ -479,7 +486,7 @@ onBeforeUnmount(() => {
           <strong>{{ data?.symbol || symbol || '—' }}</strong>
           <span class="muted trend-sub">{{ timeframeLabel(cfg.timeframe) }}</span>
         </div> -->
-        <div class="right">
+        <div v-if="!compact" class="right">
           <div class="trend-price">{{ fmtPrice(data?.price) }}</div>
           <div class="muted trend-sub">
             当前价<template v-if="data?.price_source === 'close'">（报价缺失，取收盘价）</template>
@@ -734,7 +741,18 @@ onBeforeUnmount(() => {
   gap: 6px;
   min-width: 0;
   flex: 1 1 240px;
-}.trend-compact .trend-score { font-size: 26px; }
+}
+/* 当前价：紧凑模式下贴在品种芯片行右侧 */
+.trend-compact-price {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  flex: 0 0 auto;
+  margin-left: auto;
+  text-align: right;
+}
+.trend-compact-price-k { margin-left: 0; }.trend-compact .trend-score { font-size: 26px; }
 .trend-compact .trend-chips { margin-top: 0; }
 .trend-saved { color: var(--primary); font-size: 12px; margin: 0 0 10px; }
 .trend-sub { font-size: 12px; margin-left: 8px; }
@@ -837,6 +855,14 @@ onBeforeUnmount(() => {
     width: 100%;
     min-width: 0;
     max-width: 100%;
+  }
+
+  /* 窄屏下当前价换行后仍靠右对齐，不跟着 stretch 撑满 */
+  .trend-compact-price {
+    align-items: flex-end;
+    width: 100%;
+    max-width: 100%;
+    margin-left: 0;
   }
 
   /* 周期：横向滑动，避免 9 个按钮撑破卡片换行成三行 */
