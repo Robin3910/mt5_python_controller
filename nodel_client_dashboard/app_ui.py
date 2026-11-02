@@ -1460,6 +1460,13 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
         if self._tray is not None:
             self._tray.stop()
             self._tray = None
+        # 关掉残留的详情弹窗，避免退出时留窗口
+        if getattr(self, "_detail_dialog", None) is not None:
+            try:
+                self._detail_dialog.destroy()
+            except tk.TclError:
+                pass
+            self._detail_dialog = None
         for mp in self.manager._items.values():
             mp.shutdown_workers()
         try:

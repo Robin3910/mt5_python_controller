@@ -197,6 +197,53 @@ def test_detail_controls_moved_off_main_window(desktop):
     assert not hasattr(app, "btn_stop")
 
 
+# —— 节点详情弹窗 ——
+
+
+def test_detail_dialog_opens_for_instance(desktop, tmp_path):
+    app, api, tmp, _errs = desktop
+    _login(app, api)
+    cfg = InstanceConfig.create(name="det-1", exe_path=str(tmp / "d1.exe"), cwd=str(tmp))
+    app.manager.add(cfg)
+    app._open_detail_for(cfg.id)
+    app.update_idletasks()
+    dlg = app._detail_dialog
+    assert dlg is not None
+    assert "det-1" in dlg.title_label.cget("text")
+    dlg.destroy()
+    app._detail_dialog = None
+
+
+def test_detail_dialog_refresh_updates_chips(desktop, tmp_path):
+    app, api, tmp, _errs = desktop
+    _login(app, api)
+    cfg = InstanceConfig.create(name="det-2", exe_path=str(tmp / "d2.exe"), cwd=str(tmp))
+    mp = app.manager.add(cfg)
+    app._open_detail_for(cfg.id)
+    app.update_idletasks()
+    dlg = app._detail_dialog
+    mp.runtime.process_alive = True
+    mp.runtime.health = "ok"
+    dlg.refresh()
+    assert any(c.key == "online" for c in dlg.detail.chips)
+    dlg.destroy()
+    app._detail_dialog = None
+
+
+def test_detail_dialog_closes_when_instance_removed(desktop, tmp_path):
+    """实例被移除后，详情弹窗应自行关闭，不能悬在登录页之上。"""
+    app, api, tmp, _errs = desktop
+    _login(app, api)
+    cfg = InstanceConfig.create(name="det-3", exe_path=str(tmp / "d3.exe"), cwd=str(tmp))
+    app.manager.add(cfg)
+    app._open_detail_for(cfg.id)
+    app.update_idletasks()
+    dlg = app._detail_dialog
+    app.manager.remove(cfg.id)
+    dlg._check_instance_alive()
+    assert not dlg.winfo_exists()
+
+
 def test_unlogged_window_does_not_load_or_adopt_instances(desktop, monkeypatch):
     app, _api, _tmp_path, _errors = desktop
     load = MagicMock()
