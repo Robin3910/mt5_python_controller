@@ -20,6 +20,7 @@ const userLabel = computed(() => auth.me?.display_name || auth.me?.username || '
 
 const PAGE_TITLES: Record<string, string> = {
   home: '首页',
+  'home-node': '节点主页',
   trading: '交易',
   'ai-trade': 'AI交易',
   follow: '带单',
@@ -41,7 +42,15 @@ const PAGE_TITLES: Record<string, string> = {
 }
 const pageTitle = computed(() => PAGE_TITLES[String(route.name || '')] || '')
 const trendConfigOpen = computed(() => route.name === 'home' && route.query.config === 'trend')
-function closeTrendConfig(): void {
+const nodeHomeOpen = computed(() => route.name === 'home-node')
+const homeNavActive = computed(() => route.name === 'home' || route.name === 'home-node')
+const customerBackTitle = computed(() => {
+  if (trendConfigOpen.value) return '参数配置'
+  if (route.name === 'home') return ''
+  if (nodeHomeOpen.value) return '节点主页'
+  return pageTitle.value
+})
+function onCustomerBack(): void {
   router.push({ name: 'home' })
 }
 
@@ -79,9 +88,9 @@ watch(() => auth.token, setupWs)
     <header v-if="authed && !auth.isAdmin" class="topbar topbar-customer">
       <div class="topbar-customer-inner">
         <div class="brand brand-customer">
-          <button v-if="trendConfigOpen" type="button" class="brand-back" @click="closeTrendConfig">
+          <button v-if="customerBackTitle" type="button" class="brand-back" @click="onCustomerBack">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg>
-            <span>参数配置</span>
+            <span>{{ customerBackTitle }}</span>
           </button>
           <template v-else>
             <span class="brand-mark" aria-hidden="true">T</span>
@@ -89,7 +98,7 @@ watch(() => auth.token, setupWs)
           </template>
         </div>
         <nav class="nav nav-customer" aria-label="顶部导航">
-          <RouterLink v-if="auth.hasMenu('home')" to="/home">
+          <RouterLink v-if="auth.hasMenu('home')" to="/home" :class="{ 'router-link-active': homeNavActive }">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>
             <span>首页</span>
           </RouterLink>

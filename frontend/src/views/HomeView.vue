@@ -6,6 +6,7 @@ import HubTrendEmbed from '@/components/HubTrendEmbed.vue'
 import { useHubStore } from '@/stores/hub'
 import type { AccountSnapshot, CancelPendingResult, NodeOut, PendingOrder, Position } from '@/api/types'
 import { confirmAction } from '@/utils/confirm'
+import { setNodePrimary } from '@/utils/nodePrimary'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '@/api/client'
 import { useAuthStore } from '@/stores/auth'
@@ -95,193 +96,15 @@ async function fetchActiveTasks(nodeId: string): Promise<{
   return data
 }
 
-/** 拉取某节点当前的跟单关系；空 = 放行（可设为主节点）。 */
-async function fetchFollowings(nodeId: string): Promise<{
-  count: number
-  items: Array<{
-    group_id: string
-    leader_user_id: number | null
-    follower_user_id: number | null
-    joined_at: number | null
-  }>
-  node_name: string
-}> {
-  const { data } = await api.get(`/api/nodes/${nodeId}/followings`)
-  return data
-}
-
-/** 旧主节点 id：设置主节点时找同 owner 下当前的主节点；取消主节点就是自己。 */
-function findCurrentPrimaryId(excludeId: string): string | null {
-  const sameOwner = hub.nodes.filter((x) => x.node_id !== excludeId && x.is_primary)
-  return sameOwner[0]?.node_id ?? null
-}
-
-/** 把卡片操作菜单内的「主节点」开关切换走完整流程：
- *  预查跟单 / in-flight → 命中阻塞直接弹窗 → 二次确认 → 调用 store → 处理 409 / 通用错误。
- *
- *  客户（普通用户）只能「设置为主节点」：菜单里不渲染取消入口，函数入口再兜一层，
- *  避免将来别处复用时把取消能力漏给客户——主节点一旦被清空，交易页会直接退化成
- *  「尚未设置主节点」空态，客户自己也无法在页面上恢复。 */
+/** 卡片菜单与节点主页共用同一套主节点切换。客户不能取消主节点。 */
 async function togglePrimary(n: NodeOut): Promise<void> {
   closeNodeMenu()
-  const next = !n.is_primary
-  if (!next && !auth.isAdmin) return
-
-  // 阶段 0 预查 ①：待晋升节点自身仍在跟单 -> 直接弹阻塞弹窗，不进入二次确认。
-  // 主节点不可用于跟单，跟单关系又是持久状态，后端会硬拦截，这里提前告知。
-  if (next) {
-    try {
-      const fs = await fetchFollowings(n.node_id)
-      if (fs.count > 0) {
-        await showPrimaryFollowingBlockedDialog({
-          count: fs.count,
-          node_name: n.name,
-          items: fs.items.map((f) => ({
-            group_id: f.group_id,
-            leader_user_id: f.leader_user_id,
-            joined_at: f.joined_at,
-          })),
-        })
-        return
-      }
-    } catch (e) {
-      // 预查失败不阻塞流程（后端会再校验一次）
-      console.warn('primary following precheck failed', e)
-    }
-  }
-
-  // 阶段 0 预查 ②：旧主节点在跑任务时直接弹阻塞弹窗，不进入二次确认
-  const victimId = next ? findCurrentPrimaryId(n.node_id) : n.is_primary ? n.node_id : null
-  if (victimId) {
-    try {
-      const active = await fetchActiveTasks(victimId)
-      if (active.count > 0) {
-        await showPrimaryBlockedDialog(active)
-        return
-      }
-    } catch (e) {
-      // 预查失败不阻塞流程（后端会再校验一次）
-      console.warn('primary precheck failed', e)
-    }
-  }
-
-  if (next) {
-    if (!(await confirmAction(
-      `将「${n.name}」设置为本账号的主节点？\n` +
-        '同一账号下已有主节点时，原主节点会被自动取消。',
-      '设置为主节点',
-    ))) return
-  } else {
-    if (!(await confirmAction(
-      `取消「${n.name}」的主节点标记？`,
-      '取消主节点',
-    ))) return
-  }
-  try {
-    const updated = await hub.setNodePrimary(n.node_id, next)
-    ElMessage.success(
-      updated.is_primary
-        ? `已将「${updated.name}」设置为主节点`
-        : `已取消「${updated.name}」的主节点标记`,
-    )
-  } catch (err) {
-    const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail
-    // 409 阻塞：detail 是个对象，按 code 分派到对应的阻塞弹窗
-    if (detail && typeof detail === 'object') {
-      const code = (detail as { code?: string }).code
-      if (code === 'primary_switch_blocked') {
-        const d = detail as {
-          node_name?: string
-          message?: string
-          blocking_tasks?: Array<{ group_id: string; symbol: string | null; status: string; magic: number | null }>
-        }
-        await showPrimaryBlockedDialog({
-          count: d.blocking_tasks?.length ?? 0,
-          node_name: d.node_name ?? '',
-          items: (d.blocking_tasks ?? []).map((t) => ({
-            dispatch_id: 0,
-            task_id: 0,
-            signal_id: '',
-            group_id: t.group_id,
-            symbol: t.symbol,
-            magic: t.magic,
-            status: t.status,
-          })),
-        })
-        return
-      }
-      if (code === 'primary_switch_following_blocked') {
-        const d = detail as {
-          node_name?: string
-          message?: string
-          blocking_followings?: Array<{ group_id: string; leader_user_id: number | null; joined_at: number | null }>
-        }
-        await showPrimaryFollowingBlockedDialog({
-          count: d.blocking_followings?.length ?? 0,
-          node_name: d.node_name ?? '',
-          items: (d.blocking_followings ?? []).map((f) => ({
-            group_id: f.group_id,
-            leader_user_id: f.leader_user_id,
-            joined_at: f.joined_at,
-          })),
-        })
-        return
-      }
-    }
-    // 其它错误：保持原 toast
-    const text = typeof detail === 'string' ? detail : ''
-    ElMessage.error(text || (next ? '设置主节点失败' : '取消主节点失败'))
-  }
-}
-
-/** 主节点切换被跟单拦截时的弹窗：告诉用户先到【带单】页把节点移出跟单。 */
-async function showPrimaryFollowingBlockedDialog(f: {
-  count: number
-  node_name: string
-  items: Array<{ group_id: string; leader_user_id: number | null; joined_at: number | null }>
-}): Promise<void> {
-  const lines = f.items
-    .slice(0, 20)
-    .map((x) => `• ${x.group_id}`)
-    .join('\n')
-  const more = f.items.length > 20 ? `\n…（共 ${f.items.length} 个）` : ''
-  await ElMessageBox.alert(
-    `节点「${f.node_name}」当前有 ${f.count} 个跟单分组，\n` +
-      '主节点不可用于跟单（主节点需保持独立），主节点切换已被系统拒绝。\n' +
-      '请先到【带单】页把该节点移出跟单，再回来重试。\n\n' +
-      '跟单分组：\n' + lines + more,
-    '主节点切换被拦截',
-    {
-      type: 'warning',
-      confirmButtonText: '我知道了',
-    },
-  )
-}
-
-async function showPrimaryBlockedDialog(active: {
-  count: number
-  node_name: string
-  items: Array<{ group_id: string; symbol: string | null; status: string; magic: number | null }>
-}): Promise<void> {
-  const lines = active.items
-    .slice(0, 20)
-    .map((t) => {
-      const sym = t.symbol ?? '-'
-      const mg = t.magic != null ? `#${t.magic}` : '-'
-      return `• ${t.group_id}  ${sym}  ${t.status}  ${mg}`
-    })
-    .join('\n')
-  const more = active.items.length > 20 ? `\n…（共 ${active.items.length} 条）` : ''
-  await ElMessageBox.alert(
-    `旧主节点「${active.node_name}」仍有 ${active.count} 条在跑子任务，\n` +
-      '主节点切换已被系统拒绝。请先到任务页收口这些任务后，再回来重试。\n\n' +
-      '阻塞明细：\n' + lines + more,
-    '主节点切换被拦截',
-    {
-      type: 'warning',
-      confirmButtonText: '我知道了',
-    },
-  )
+  await setNodePrimary({
+    node: n,
+    nodes: hub.nodes,
+    isAdmin: auth.isAdmin,
+    apply: (id, next) => hub.setNodePrimary(id, next),
+  })
 }
 
 type StatusFilter = 'all' | 'holding' | 'profit' | 'loss' | 'online' | 'offline'
@@ -332,7 +155,7 @@ function nodeProfit(positions: Position[] | undefined): number {
   return (positions || []).reduce((a, p) => a + (p.profit || 0), 0)
 }
 function goNode(id: string): void {
-  router.push({ name: 'node-detail', params: { id } })
+  router.push({ name: 'home-node', params: { id } })
 }
 
 const totalBalance = computed(() =>
