@@ -501,13 +501,30 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
         self._relayout_grid()
 
     def _grid_columns(self) -> int:
-        """按窗口宽度算列数：>=1180 三列，>=820 两列，否则一列。"""
+        """按窗口宽度算列数：>=1180 三列，>=820 两列，否则一列。
+
+        CTk 会做 DPI 缩放，`winfo_width()` 返回的是物理像素；必须换算回
+        逻辑像素，否则在 125% 缩放的机器上永远算成三列。
+        """
         width = self.winfo_width() or 1200
+        scaling = self._widget_scaling()
+        if scaling > 1.0:
+            width = int(width / scaling)
         if width >= 1180:
             return 3
         if width >= 820:
             return 2
         return 1
+
+    def _widget_scaling(self) -> float:
+        """当前控件的 DPI 缩放比；取不到时按 1.0 处理。
+
+        `ctk.CTk`（tkinter.Tk）本身不带缩放访问器，要问 ScalingTracker。
+        """
+        try:
+            return float(ctk.ScalingTracker.get_widget_scaling(self))
+        except Exception:  # noqa: BLE001
+            return 1.0
 
     def _relayout_grid(self) -> None:
         """按窗口宽度重排网格列数。只改位置，不重建控件。"""
@@ -515,6 +532,9 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
         self._grid_columns_cache = columns
         set_grid_columns(self.node_grid, columns)
         self._place_cards(columns)
+        # 空态提示要跟着列数走，否则窄窗口下会被挤到网格外面
+        if self._empty_label.winfo_ismapped():
+            self._empty_label.configure(columnspan=max(1, columns))
 
     def _place_cards(self, columns: int) -> None:
         """按 `self._list_order` 把卡片摆进网格。"""
@@ -1353,6 +1373,7 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
         try:
             self.update_idletasks()
             self._force_ctk_redraw(self)
+            self._redraw_canvases(self)
             # 使快照失效，重绑文本类控件（CTkTextbox 残影主要靠重写内容清除）
             self._detail_snap = None
             self._log_snap = None
@@ -1365,6 +1386,27 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
                 )
         except tk.TclError:
             pass
+
+    def _redraw_canvases(self, root) -> None:
+        """重画 CTkCanvas：CTkCanvas 没有 `_draw`，最小化恢复后需手工重建内容。
+
+        hero 面板的网格纹理挂在 canvas 的 `_on_restore_redraw` 上。
+        """
+        stack = [root]
+        while stack:
+            w = stack.pop()
+            try:
+                stack.extend(w.winfo_children())
+            except tk.TclError:
+                continue
+            if not isinstance(w, ctk.CTkCanvas):
+                continue
+            redraw = getattr(w, "_on_restore_redraw", None)
+            if callable(redraw):
+                try:
+                    redraw()
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _force_ctk_redraw(self, root) -> None:
         stack = [root]

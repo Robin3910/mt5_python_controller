@@ -14,6 +14,7 @@ import app_ui
 import dashboard_auth_ui
 import login_view
 import store
+import theme
 from auth_service import DashboardAuthError
 from models import InstanceConfig
 from process_manager import ManagedProcess, ProcessManager
@@ -242,6 +243,63 @@ def test_detail_dialog_closes_when_instance_removed(desktop, tmp_path):
     app.manager.remove(cfg.id)
     dlg._check_instance_alive()
     assert not dlg.winfo_exists()
+
+
+def test_restore_repair_redraws_canvas_texture(desktop):
+    """最小化恢复后 hero 的网格纹理要重画，否则留残影。"""
+    app, api, _tmp, _errs = desktop
+    _login(app, api)
+    app.update_idletasks()
+    canvas = app.hero_panel.canvas
+    assert callable(getattr(canvas, "_on_restore_redraw", None))
+    canvas.delete("all")
+    app._repair_ui_after_restore()
+    # 纹理被重画：画布上重新有了图元
+    assert canvas.find_all()
+
+
+# —— 网格响应式断点 ——
+
+
+def _card_positions(app):
+    return sorted(
+        (c.grid_info()["row"], c.grid_info()["column"])
+        for c in app._list_rows.values()
+    )
+
+
+def test_grid_columns_follow_width_breakpoints(desktop, monkeypatch):
+    """窗口宽度跨断点时列数应为 3 / 2 / 1，且卡片位置跟着变。"""
+    app, api, tmp, _errs = desktop
+    _login(app, api)
+    for i in range(4):
+        cfg = InstanceConfig.create(name=f"g{i}", exe_path=str(tmp / f"g{i}.exe"), cwd=str(tmp))
+        app.manager.add(cfg)
+    app._bind_list()
+
+    # 断点按逻辑像素判定，这里把缩放固定成 1.0 便于直接给宽度
+    monkeypatch.setattr(app, "_widget_scaling", lambda: 1.0)
+    for width, columns in ((1400, 3), (900, 2), (600, 1)):
+        monkeypatch.setattr(app, "winfo_width", lambda _w=width: _w)
+        assert app._grid_columns() == columns
+        app._relayout_grid()
+        assert _card_positions(app) == [
+            (i // columns, i % columns) for i in range(4)
+        ], f"宽度 {width} 的列数布局不对"
+
+
+def test_grid_columns_use_logical_pixels(desktop, monkeypatch):
+    """CTk 会做 DPI 缩放，宽度必须换算回逻辑像素再判断断点。"""
+    app, api, _tmp, _errs = desktop
+    _login(app, api)
+    scaling = app._widget_scaling()
+    assert scaling >= 1.0
+    # 逻辑 900px（在 1.25 缩放下是物理 1125px）-> 两列
+    monkeypatch.setattr(app, "winfo_width", lambda: int(900 * scaling))
+    assert app._grid_columns() == 2
+    # 逻辑 1200px -> 三列
+    monkeypatch.setattr(app, "winfo_width", lambda: int(1200 * scaling))
+    assert app._grid_columns() == 3
 
 
 def test_unlogged_window_does_not_load_or_adopt_instances(desktop, monkeypatch):
@@ -538,7 +596,7 @@ def test_version_dialog_shows_spinning_status_and_disables_buttons(desktop, monk
         assert any(frame in dialog.status.cget("text") for frame in "⠋⠙⠹⠸⠼⠴⠦⠧")
 
         # 结束：恢复按钮 + 写入终态文案
-        dialog._done_text = ("✓ 完成：成功 2/2", "#2EE6A8")
+        dialog._done_text = ("✓ 完成：成功 2/2", theme.GREEN)
         dialog._finish_busy()
         assert dialog.detect_btn.cget("state") == "normal"
         assert dialog.status.cget("text") == "✓ 完成：成功 2/2"
@@ -580,7 +638,7 @@ def test_main_window_header_status_shows_progress_and_clears(desktop, monkeypatc
     assert any(frame in app.header_status.cget("text") for frame in "⠋⠙⠹⠸⠼⠴⠦⠧")
 
     # 结束并清空
-    app._header_busy_stop("✓ 完成：成功 3/3", "#2EE6A8")
+    app._header_busy_stop("✓ 完成：成功 3/3", theme.GREEN)
     assert "完成" in app.header_status.cget("text")
     app._header_busy_clear()
     assert app.header_status.cget("text") == ""
