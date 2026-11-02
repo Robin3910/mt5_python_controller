@@ -1,9 +1,7 @@
 <script setup lang="ts">
 // 操作审计页：中控台 / 节点 / 账号权限 / 系统操作记录，可展开查看操作前后数据。
-// 普通用户只看到本人的操作（后端按操作人过滤）
+// 版式 1:1 复刻 UI/H5.html 的「操作审计」tab；普通用户只看到本人的操作（后端按操作人过滤）。
 import { computed, onMounted, ref } from 'vue'
-import TagSelect from '@/components/TagSelect.vue'
-import type { TagOption } from '@/components/tagOption'
 import { useAuthStore } from '@/stores/auth'
 import { useHubStore } from '@/stores/hub'
 import type { AuditRecord } from '@/api/types'
@@ -13,23 +11,21 @@ const auth = useAuthStore()
 
 const items = ref<AuditRecord[]>([])
 const page = ref(1)
-const pageSize = ref(20)
+const pageSize = ref(10)
 const total = ref(0)
 const loading = ref(false)
+
 type AuditCategory = 'all' | 'console' | 'node' | 'auth' | 'system'
 const category = ref<AuditCategory>('all')
-const CATEGORY_TAGS: TagOption<AuditCategory>[] = [
-  { value: 'all', label: '全部' },
-  { value: 'console', label: '中控台' },
-  { value: 'node', label: '节点' },
-  { value: 'auth', label: '账号权限' },
-  { value: 'system', label: '系统' },
+const CATEGORY_OPTIONS: { key: AuditCategory; label: string }[] = [
+  { key: 'all', label: '全部' },
+  { key: 'console', label: '中控台' },
+  { key: 'node', label: '节点' },
+  { key: 'auth', label: '账号权限' },
+  { key: 'system', label: '系统' },
 ]
-const PAGE_SIZE_TAGS: TagOption<number>[] = [
-  { value: 10, label: '10' },
-  { value: 20, label: '20' },
-  { value: 50, label: '50' },
-]
+const PAGE_SIZES = [10, 20, 50]
+
 const expanded = ref<Record<number, boolean>>({})
 
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)))
@@ -53,12 +49,15 @@ function goPage(next: number): void {
   loadAudits()
 }
 
-function onPageSizeChange(): void {
+function onPageSizeChange(next: number): void {
+  pageSize.value = next
   page.value = 1
   loadAudits()
 }
 
-function onCategoryChange(): void {
+function onCategoryChange(next: AuditCategory): void {
+  if (category.value === next) return
+  category.value = next
   page.value = 1
   loadAudits()
 }
@@ -72,7 +71,10 @@ function isExpanded(id: number): boolean {
 }
 
 function fmtTime(sec: number | null | undefined): string {
-  return sec ? new Date(sec * 1000).toLocaleString() : '—'
+  if (!sec) return '—'
+  const d = new Date(sec * 1000)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
 }
 
 function fmtJson(data: unknown): string {
@@ -84,12 +86,25 @@ function fmtJson(data: unknown): string {
   }
 }
 
+/** 分类药丸：原型里中控台蓝、节点紫 */
 function categoryTag(cat: string | null): { cls: string; text: string } {
   if (cat === 'console') return { cls: 'blue', text: '中控台' }
-  if (cat === 'node') return { cls: 'green', text: '节点' }
+  if (cat === 'node') return { cls: '', text: '节点' }
   if (cat === 'auth') return { cls: 'amber', text: '账号权限' }
-  if (cat === 'system') return { cls: '', text: '系统' }
-  return { cls: '', text: cat || '其它' }
+  if (cat === 'system') return { cls: 'grey', text: '系统' }
+  return { cls: 'grey', text: cat || '其它' }
+}
+
+/** 结果标记：原型只有「成功 / 跳过」两种，其余沿用既有语义 */
+function resultTag(result: string): { cls: string; text: string } {
+  if (result === 'ok' || result === 'accepted' || result === 'success') return { cls: 'ok', text: '成功' }
+  if (result === 'offline') return { cls: 'warn', text: '离线' }
+  if (result === 'skipped') return { cls: 'skip', text: '跳过' }
+  if (result === 'pending') return { cls: 'warn', text: '待完成' }
+  if (result === 'rejected') return { cls: 'warn', text: '拒绝' }
+  if (result === 'cancel_failed') return { cls: 'fail', text: '撤单失败' }
+  if (result === 'fail' || result === 'failed') return { cls: 'fail', text: '失败' }
+  return { cls: 'skip', text: result }
 }
 
 function actionLabel(action: string): string {
@@ -161,220 +176,231 @@ function actionLabel(action: string): string {
   return m[action] || action
 }
 
-function resultTag(result: string): { cls: string; text: string } {
-  if (result === 'ok' || result === 'accepted') return { cls: 'green', text: '成功' }
-  if (result === 'offline') return { cls: 'amber', text: '离线' }
-  if (result === 'skipped') return { cls: '', text: '跳过' }
-  if (result === 'pending') return { cls: 'amber', text: '待完成' }
-  if (result === 'rejected') return { cls: 'amber', text: '拒绝' }
-  if (result === 'cancel_failed') return { cls: 'red', text: '撤单失败' }
-  if (result === 'fail' || result === 'failed') return { cls: 'red', text: '失败' }
-  return { cls: '', text: result }
-}
-
 onMounted(loadAudits)
 </script>
 
 <template>
-  <div class="audits-page">
-    <div class="page-header">
-      <div class="h1">操作审计</div>
-      <p class="muted" style="font-size: 13px; margin-top: 4px">
-        {{ auth.isAdmin ? '记录全部用户的操作' : '仅显示你本人的操作' }}，点击行可展开查看操作前后数据
-      </p>
-    </div>
+  <div class="pf-page au-page">
+    <section class="pf-card">
+      <!-- 卡片头 -->
+      <div class="pf-card-head">
+        <div class="pf-card-head-main">
+          <span class="pf-card-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+              <path d="m9 11 3 3L22 4" />
+            </svg>
+          </span>
+          <div>
+            <p class="pf-card-title">操作审计</p>
+            <p class="pf-card-sub">
+              共 <b>{{ total }}</b> 条记录 · {{ auth.isAdmin ? '记录全部用户的操作' : '仅显示你本人的操作' }}
+            </p>
+          </div>
+        </div>
+        <button type="button" class="pf-btn au-refresh" :disabled="loading" @click="loadAudits">
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            :class="{ spin: loading }"
+          >
+            <path d="M21 2v6h-6" />
+            <path d="M3 12a9 9 0 0 1 15-6.7L21 8" />
+            <path d="M3 22v-6h6" />
+            <path d="M21 12a9 9 0 0 1-15 6.7L3 16" />
+          </svg>
+          {{ loading ? '刷新中…' : '刷新' }}
+        </button>
+      </div>
 
-    <div class="card card-pad audits-panel">
-      <div class="row between" style="margin-bottom: 12px; flex-wrap: wrap; gap: 8px">
-        <span class="muted" style="font-size: 12px">共 {{ total }} 条 · 点击行展开详情</span>
-        <div class="row" style="gap: 8px; flex-wrap: wrap">
-          <div class="row muted" style="font-size: 12px; gap: 6px; align-items: center">
+      <!-- 分类筛选 -->
+      <div class="pf-seg au-filter">
+        <button
+          v-for="opt in CATEGORY_OPTIONS"
+          :key="opt.key"
+          type="button"
+          class="pf-seg-item"
+          :class="{ active: category === opt.key }"
+          @click="onCategoryChange(opt.key)"
+        >
+          {{ opt.label }}
+        </button>
+      </div>
+
+      <!-- 记录表 -->
+      <div class="pf-rows au-rows">
+        <div class="pf-rows-inner">
+          <div class="pf-row au-thead">
+            <span>操作时间</span>
             <span>分类</span>
-            <TagSelect v-model="category" :options="CATEGORY_TAGS" aria-label="分类" @change="onCategoryChange" />
+            <span>操作</span>
+            <span>目标</span>
+            <span>操作人</span>
+            <span>结果</span>
+            <span>IP</span>
           </div>
-          <div class="row muted" style="font-size: 12px; gap: 6px; align-items: center">
-            <span>每页</span>
-            <TagSelect v-model="pageSize" :options="PAGE_SIZE_TAGS" aria-label="每页条数" @change="onPageSizeChange" />
-          </div>
-          <button class="btn-sm btn-ghost" :disabled="loading" @click="loadAudits">
-            {{ loading ? '刷新中…' : '刷新' }}
+
+          <template v-for="row in items" :key="row.id">
+            <div class="pf-row au-row" @click="toggleRow(row.id)">
+              <span class="c-muted">{{ fmtTime(row.ts) }}</span>
+              <span>
+                <span class="pf-pill" :class="categoryTag(row.category).cls">
+                  {{ categoryTag(row.category).text }}
+                </span>
+              </span>
+              <span class="c-mono" :title="row.action">{{ actionLabel(row.action) }}</span>
+              <span class="c-muted" :title="row.target || ''">{{ row.target || '—' }}</span>
+              <span class="c-muted">{{ row.operator }}</span>
+              <span>
+                <span class="pf-result" :class="resultTag(row.result).cls">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                    <path v-if="resultTag(row.result).cls === 'ok'" d="M20 6 9 17l-5-5" />
+                    <path v-else-if="resultTag(row.result).cls === 'fail'" d="M18 6 6 18M6 6l12 12" />
+                    <circle v-else cx="12" cy="12" r="9" />
+                  </svg>
+                  {{ resultTag(row.result).text }}
+                </span>
+              </span>
+              <span class="c-dim au-ip">{{ row.ip || '—' }}</span>
+            </div>
+
+            <div v-if="isExpanded(row.id)" class="au-detail">
+              <div class="au-detail-kv">
+                <div class="pf-metric">
+                  <p class="pf-metric-k">记录 ID</p>
+                  <p class="pf-metric-v">{{ row.id }}</p>
+                </div>
+                <div class="pf-metric">
+                  <p class="pf-metric-k">动作码</p>
+                  <p class="pf-metric-v">{{ row.action }}</p>
+                </div>
+              </div>
+              <div class="au-diff">
+                <div>
+                  <p class="pf-label">操作前数据</p>
+                  <pre class="token-box au-json">{{ fmtJson(row.before) }}</pre>
+                </div>
+                <div>
+                  <p class="pf-label">操作后数据</p>
+                  <pre class="token-box au-json">{{ fmtJson(row.after) }}</pre>
+                </div>
+              </div>
+              <div v-if="row.params" class="au-params">
+                <p class="pf-label">附加参数</p>
+                <pre class="token-box au-json">{{ fmtJson(row.params) }}</pre>
+              </div>
+            </div>
+          </template>
+
+          <p v-if="!items.length && !loading" class="pf-empty">当前筛选条件下暂无审计记录</p>
+          <p v-else-if="loading" class="pf-empty">加载中…</p>
+        </div>
+      </div>
+
+      <!-- 分页 -->
+      <div class="au-foot">
+        <div class="au-pagesize">
+          <span class="au-foot-label">每页</span>
+          <button
+            v-for="n in PAGE_SIZES"
+            :key="n"
+            type="button"
+            class="pf-seg-item mini"
+            :class="{ active: pageSize === n }"
+            @click="onPageSizeChange(n)"
+          >
+            {{ n }}
+          </button>
+          <span class="au-foot-label">条</span>
+        </div>
+        <div class="au-pager">
+          <button
+            type="button"
+            class="pf-page-btn"
+            :disabled="page <= 1 || loading"
+            aria-label="上一页"
+            @click="goPage(page - 1)"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="m15 18-6-6 6-6" />
+            </svg>
+          </button>
+          <span class="au-page-num">第 {{ page }} / {{ totalPages }} 页</span>
+          <button
+            type="button"
+            class="pf-page-btn"
+            :disabled="page >= totalPages || loading"
+            aria-label="下一页"
+            @click="goPage(page + 1)"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="m9 18 6-6-6-6" />
+            </svg>
           </button>
         </div>
       </div>
-
-      <template v-if="items.length">
-        <div class="list-cards mobile-only">
-          <div
-            v-for="row in items"
-            :key="row.id"
-            class="list-card card clickable"
-            @click="toggleRow(row.id)"
-          >
-            <div class="list-card-head row between">
-              <strong>{{ actionLabel(row.action) }}</strong>
-              <span class="muted">{{ isExpanded(row.id) ? '▾' : '▸' }}</span>
-            </div>
-            <div class="list-field">
-              <span class="k">时间</span>
-              <span class="v muted" style="font-size: 12px">{{ fmtTime(row.ts) }}</span>
-            </div>
-            <div class="list-field">
-              <span class="k">分类</span>
-              <span class="v">
-                <span class="tag" :class="categoryTag(row.category).cls">{{ categoryTag(row.category).text }}</span>
-              </span>
-            </div>
-            <div class="list-field">
-              <span class="k">结果</span>
-              <span class="v">
-                <span class="tag" :class="resultTag(row.result).cls">{{ resultTag(row.result).text }}</span>
-              </span>
-            </div>
-            <div class="list-field">
-              <span class="k">操作人</span>
-              <span class="v muted" style="font-size: 12px">{{ row.operator }}</span>
-            </div>
-            <div v-if="isExpanded(row.id)" class="list-card-detail">
-              <div class="muted" style="font-size: 12px; margin-bottom: 6px">操作前</div>
-              <pre class="token-box audits-json">{{ fmtJson(row.before) }}</pre>
-              <div class="muted" style="font-size: 12px; margin: 12px 0 6px">操作后</div>
-              <pre class="token-box audits-json">{{ fmtJson(row.after) }}</pre>
-            </div>
-          </div>
-        </div>
-
-        <div class="audits-table-wrap desktop-only">
-          <table class="audits-table">
-            <thead>
-              <tr>
-                <th class="col-expand"></th>
-                <th class="col-time">时间</th>
-                <th class="col-cat">分类</th>
-                <th class="col-action">操作</th>
-                <th class="col-target">目标</th>
-                <th class="col-op">操作人</th>
-                <th class="col-result">结果</th>
-                <th class="col-ip">IP</th>
-              </tr>
-            </thead>
-            <tbody>
-              <template v-for="row in items" :key="row.id">
-                <tr class="clickable" @click="toggleRow(row.id)">
-                  <td class="muted col-expand">{{ isExpanded(row.id) ? '▾' : '▸' }}</td>
-                  <td class="muted col-time">{{ fmtTime(row.ts) }}</td>
-                  <td class="col-cat">
-                    <span class="tag" :class="categoryTag(row.category).cls">{{ categoryTag(row.category).text }}</span>
-                  </td>
-                  <td class="col-action">{{ actionLabel(row.action) }}</td>
-                  <td class="muted col-target audits-break">{{ row.target || '—' }}</td>
-                  <td class="col-op">{{ row.operator }}</td>
-                  <td class="col-result">
-                    <span class="tag" :class="resultTag(row.result).cls">{{ resultTag(row.result).text }}</span>
-                  </td>
-                  <td class="muted col-ip">{{ row.ip || '—' }}</td>
-                </tr>
-                <tr v-if="isExpanded(row.id)" class="detail-row">
-                  <td colspan="8">
-                    <div class="audits-detail">
-                      <div class="grid cols-2 audits-detail-kv" style="gap: 12px; margin-bottom: 12px">
-                        <div class="kv"><span class="k">记录 ID</span><span class="v">{{ row.id }}</span></div>
-                        <div class="kv"><span class="k">动作码</span><span class="v">{{ row.action }}</span></div>
-                      </div>
-                      <div class="audits-diff">
-                        <div>
-                          <div class="muted" style="font-size: 12px; margin-bottom: 6px">操作前数据</div>
-                          <pre class="token-box audits-json">{{ fmtJson(row.before) }}</pre>
-                        </div>
-                        <div>
-                          <div class="muted" style="font-size: 12px; margin-bottom: 6px">操作后数据</div>
-                          <pre class="token-box audits-json">{{ fmtJson(row.after) }}</pre>
-                        </div>
-                      </div>
-                      <div v-if="row.params" style="margin-top: 12px">
-                        <div class="muted" style="font-size: 12px; margin-bottom: 6px">附加参数</div>
-                        <pre class="token-box audits-json">{{ fmtJson(row.params) }}</pre>
-                      </div>
-                    </div>
-                  </td>
-                </tr>
-              </template>
-            </tbody>
-          </table>
-        </div>
-      </template>
-
-      <div v-else-if="!loading" class="muted" style="font-size: 13px; padding: 8px 0">暂无操作审计记录。</div>
-      <div v-else class="muted" style="font-size: 13px; padding: 8px 0">加载中…</div>
-
-      <div v-if="totalPages > 1" class="row between" style="margin-top: 16px">
-        <span class="muted" style="font-size: 12px">第 {{ page }} / {{ totalPages }} 页</span>
-        <div class="row" style="gap: 8px">
-          <button class="btn-sm btn-ghost" :disabled="page <= 1 || loading" @click="goPage(page - 1)">上一页</button>
-          <button class="btn-sm btn-ghost" :disabled="page >= totalPages || loading" @click="goPage(page + 1)">下一页</button>
-        </div>
-      </div>
-    </div>
+    </section>
   </div>
 </template>
 
 <style scoped>
-.audits-page {
-  width: 100%;
-  min-width: 0;
+/* 版式 1:1 复刻 UI/H5.html 的「操作审计」tab；
+   卡片 / 按钮 / 药丸等共用外观见 styles.css 的 pf- 前缀类。 */
+.au-page {
+  max-width: 1080px;
 }
 
-.audits-panel {
-  width: 100%;
-  min-width: 0;
+.au-refresh svg.spin {
+  animation: spin-mini-rotate 0.8s linear infinite;
 }
 
-.audits-table-wrap {
-  width: 100%;
-  min-width: 0;
-  overflow-x: auto;
-  -webkit-overflow-scrolling: touch;
+.au-filter {
+  margin-top: 12px;
 }
 
-.audits-table {
-  width: 100%;
-  min-width: 0;
-  table-layout: fixed;
+.au-thead,
+.au-row {
+  grid-template-columns: 120px 76px minmax(0, 1fr) minmax(0, 1fr) 76px 64px 110px;
 }
 
-.audits-table th,
-.audits-table td {
-  white-space: normal;
-  word-break: break-word;
-  overflow-wrap: anywhere;
-  vertical-align: top;
-  font-size: 12px;
+.au-row {
+  cursor: pointer;
 }
 
-.audits-table .col-expand { width: 28px; white-space: nowrap; }
-.audits-table .col-time { width: 14%; white-space: nowrap; }
-.audits-table .col-cat { width: 8%; white-space: nowrap; }
-.audits-table .col-action { width: 16%; }
-.audits-table .col-target { width: auto; }
-.audits-table .col-op { width: 10%; }
-.audits-table .col-result { width: 8%; white-space: nowrap; }
-.audits-table .col-ip { width: 12%; }
-
-.audits-detail {
-  padding: 8px 0 4px;
-  min-width: 0;
+.au-ip {
+  font-family: var(--mono);
+  font-size: 11px;
 }
 
-.audits-detail-kv {
+/* ── 展开详情 ── */
+.au-detail {
+  padding: 12px 8px;
+  border-bottom: 1px solid #161f30;
+  background: rgba(6, 10, 18, 0.35);
+}
+
+.au-detail-kv {
+  display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
 }
 
-.audits-diff {
+.au-diff {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 12px;
 }
 
-.audits-json {
+.au-params {
+  margin-top: 12px;
+}
+
+.au-json {
   width: 100%;
   max-width: 100%;
   margin: 0;
@@ -384,17 +410,37 @@ onMounted(loadAudits)
   max-height: 360px;
 }
 
-.audits-break {
-  word-break: break-word;
-  overflow-wrap: anywhere;
+/* ── 分页条 ── */
+.au-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.au-pagesize,
+.au-pager {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.au-foot-label {
+  font-size: 10px;
+  color: var(--pf-dim);
+}
+
+.au-page-num {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--pf-muted);
 }
 
 @media (max-width: 900px) {
-  .audits-diff {
+  .au-diff {
     grid-template-columns: 1fr;
-  }
-  .audits-table {
-    table-layout: auto;
   }
 }
 </style>

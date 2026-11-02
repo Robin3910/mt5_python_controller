@@ -1577,6 +1577,25 @@ export interface MeInfo {
    */
   follow_paused?: boolean
   ai_follow_paused?: boolean
+  // —— 个人中心自助维护字段 ——
+  /** 联系邮箱，不参与登录，允许重复 */
+  email?: string | null
+  /** 带单员展示名；为空时回退显示 display_name */
+  leader_name?: string | null
+  /** 带单员介绍；目前只在个人中心自己可见 */
+  leader_intro?: string | null
+  /** 绑定的手机号（脱敏 138****8000）；未绑定为 null */
+  phone?: string | null
+  /** 是否已通过短信验证 */
+  phone_verified?: boolean
+}
+
+/** PATCH /api/me/profile 的请求体：字段级「传什么改什么」，传空串表示清空 */
+export interface ProfileUpdate {
+  display_name?: string
+  email?: string
+  leader_name?: string
+  leader_intro?: string
 }
 
 /** 「我的」枢纽页模块卡片 */

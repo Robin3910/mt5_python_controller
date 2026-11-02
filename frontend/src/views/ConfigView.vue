@@ -1,10 +1,12 @@
 <script setup lang="ts">
-// 配置页：个人设置（改密码 / 2FA，所有登录用户）+ 系统配置（节点令牌 / Webhook 开关，仅管理员）
+// 配置页：**系统级**配置（节点令牌 / Webhook 开关 / 短信服务，仅管理员）。
+//
+// 个人自己的设置（个人信息 / 修改密码 / 2FA）已搬到「个人中心」/profile ——
+// 那是登录即可进的地方；配置页留给管理员的系统级开关。
 import { onMounted, reactive, ref } from 'vue'
 import { ElSwitch } from 'element-plus'
 import 'element-plus/es/components/switch/style/css'
 import 'element-plus/theme-chalk/dark/css-vars.css'
-import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useHubStore } from '@/stores/hub'
 import { copyToClipboard } from '@/utils/clipboard'
@@ -12,20 +14,8 @@ import { confirmAction } from '@/utils/confirm'
 
 const hub = useHubStore()
 const auth = useAuthStore()
-const router = useRouter()
 
 const savedFlag = ref('')
-
-const pwd = reactive({ current: '', new: '', confirm: '' })
-const pwdError = ref('')
-const pwdLoading = ref(false)
-
-const twofa = reactive({ enabled: false, bound: false, pending_setup: false })
-const twofaSetup = ref<{ secret: string; qr_data_uri: string } | null>(null)
-const twofaCode = ref('')
-const twofaPwd = ref('')
-const twofaError = ref('')
-const twofaLoading = ref(false)
 
 const nodeToken = reactive({ value: '', updated_at: 0 })
 const nodeTokenShow = ref(false)
@@ -53,7 +43,6 @@ const smsLoading = ref(false)
 const smsError = ref('')
 
 onMounted(async () => {
-  await load2faStatus()
   if (!auth.isAdmin) return
   await loadNodeToken()
   await loadWebhookAuth()
@@ -168,172 +157,11 @@ function fmtTokenUpdatedAt(): string {
   return new Date(nodeToken.updated_at * 1000).toLocaleString()
 }
 
-async function load2faStatus(): Promise<void> {
-  try {
-    const s = await auth.fetch2faStatus()
-    twofa.enabled = s.enabled
-    twofa.bound = s.bound
-    twofa.pending_setup = s.pending_setup
-  } catch {
-    twofaError.value = '无法加载 2FA 状态'
-  }
-}
-
-function map2faError(detail?: string): string {
-  if (detail === 'invalid password') return '密码不正确'
-  if (detail === 'invalid totp code') return '验证码错误或已过期'
-  if (detail === '2fa already enabled') return '2FA 已开启，请先关闭或重置'
-  if (detail === '2fa not bound') return '尚未绑定验证器'
-  return '操作失败，请稍后重试'
-}
-
-async function start2faSetup(): Promise<void> {
-  if (!(await confirmAction('确认开始绑定双因素认证？\n\n将生成新的验证器密钥。', '确认绑定 2FA'))) return
-  twofaError.value = ''
-  twofaLoading.value = true
-  try {
-    twofaSetup.value = await auth.setup2fa()
-    twofaCode.value = ''
-    await load2faStatus()
-    flash('请扫描二维码并输入验证码完成绑定')
-  } catch (e: unknown) {
-    const err = e as { response?: { data?: { detail?: string } } }
-    twofaError.value = map2faError(err?.response?.data?.detail)
-  } finally {
-    twofaLoading.value = false
-  }
-}
-
-async function confirm2faBind(): Promise<void> {
-  twofaError.value = ''
-  if (!twofaCode.value.trim()) {
-    twofaError.value = '请输入验证码'
-    return
-  }
-  if (!(await confirmAction('确认绑定验证器并开启双因素认证？', '确认开启 2FA'))) return
-  twofaLoading.value = true
-  try {
-    await auth.confirm2fa(twofaCode.value.trim())
-    twofaSetup.value = null
-    twofaCode.value = ''
-    await load2faStatus()
-    flash('双因素认证已开启')
-  } catch (e: unknown) {
-    const err = e as { response?: { data?: { detail?: string } } }
-    twofaError.value = map2faError(err?.response?.data?.detail)
-  } finally {
-    twofaLoading.value = false
-  }
-}
-
-async function enable2fa(): Promise<void> {
-  twofaError.value = ''
-  if (!twofaCode.value.trim()) {
-    twofaError.value = '请输入验证码以开启 2FA'
-    return
-  }
-  if (!(await confirmAction('确认开启双因素认证？\n\n登录时将需要额外输入验证码。', '确认开启 2FA'))) return
-  twofaLoading.value = true
-  try {
-    await auth.enable2fa(twofaCode.value.trim())
-    twofaCode.value = ''
-    await load2faStatus()
-    flash('双因素认证已开启')
-  } catch (e: unknown) {
-    const err = e as { response?: { data?: { detail?: string } } }
-    twofaError.value = map2faError(err?.response?.data?.detail)
-  } finally {
-    twofaLoading.value = false
-  }
-}
-
-async function disable2fa(): Promise<void> {
-  twofaError.value = ''
-  if (!twofaPwd.value) {
-    twofaError.value = '请输入当前密码'
-    return
-  }
-  if (!(await confirmAction('确认关闭双因素认证？\n\n关闭后登录将不再需要验证码。', '确认关闭 2FA'))) return
-  twofaLoading.value = true
-  try {
-    await auth.disable2fa(twofaPwd.value, twofa.enabled ? twofaCode.value.trim() : undefined)
-    twofaPwd.value = ''
-    twofaCode.value = ''
-    await load2faStatus()
-    flash('双因素认证已关闭')
-  } catch (e: unknown) {
-    const err = e as { response?: { data?: { detail?: string } } }
-    twofaError.value = map2faError(err?.response?.data?.detail)
-  } finally {
-    twofaLoading.value = false
-  }
-}
-
-async function reset2fa(): Promise<void> {
-  twofaError.value = ''
-  if (!twofaPwd.value) {
-    twofaError.value = '请输入当前密码'
-    return
-  }
-  if (!(await confirmAction('确认重置双因素认证绑定？\n\n需重新扫码绑定验证器。', '确认重置 2FA'))) return
-  twofaLoading.value = true
-  try {
-    await auth.reset2fa(twofaPwd.value, twofa.enabled ? twofaCode.value.trim() : undefined)
-    twofaSetup.value = null
-    twofaPwd.value = ''
-    twofaCode.value = ''
-    await load2faStatus()
-    flash('双因素认证已重置')
-  } catch (e: unknown) {
-    const err = e as { response?: { data?: { detail?: string } } }
-    twofaError.value = map2faError(err?.response?.data?.detail)
-  } finally {
-    twofaLoading.value = false
-  }
-}
-
 function flash(msg: string): void {
   savedFlag.value = msg
   setTimeout(() => (savedFlag.value = ''), 1800)
 }
 
-async function changePassword(): Promise<void> {
-  pwdError.value = ''
-  if (!pwd.current || !pwd.new) {
-    pwdError.value = '请填写当前密码和新密码'
-    return
-  }
-  if (pwd.new.length < 6) {
-    pwdError.value = '新密码至少 6 位'
-    return
-  }
-  if (pwd.new !== pwd.confirm) {
-    pwdError.value = '两次输入的新密码不一致'
-    return
-  }
-  if (!(await confirmAction('确认修改登录密码？\n\n修改成功后需使用新密码重新登录。', '确认修改密码'))) return
-  pwdLoading.value = true
-  try {
-    await auth.changePassword(pwd.current, pwd.new)
-    flash('密码已修改，请重新登录')
-    pwd.current = ''
-    pwd.new = ''
-    pwd.confirm = ''
-    setTimeout(() => {
-      auth.logout()
-      router.push({ name: 'login' })
-    }, 1200)
-  } catch (e: unknown) {
-    const err = e as { response?: { data?: { detail?: string } } }
-    const detail = err?.response?.data?.detail
-    if (detail === 'invalid current password') pwdError.value = '当前密码不正确'
-    else if (detail === 'password too short') pwdError.value = '新密码至少 6 位'
-    else if (detail === 'password unchanged') pwdError.value = '新密码不能与当前密码相同'
-    else pwdError.value = '修改失败，请稍后重试'
-  } finally {
-    pwdLoading.value = false
-  }
-}
 </script>
 
 <template>
@@ -467,105 +295,7 @@ async function changePassword(): Promise<void> {
       </div>
     </div>
 
-    <div class="card card-pad">
-      <strong>修改密码</strong>
-      <p class="muted" style="font-size: 12px">修改当前账号的登录密码；成功后需使用新密码重新登录。</p>
-      <div class="form-grid">
-        <div>
-          <label>当前密码</label>
-          <input v-model="pwd.current" type="password" autocomplete="current-password" />
-        </div>
-        <div>
-          <label>新密码</label>
-          <input v-model="pwd.new" type="password" autocomplete="new-password" />
-        </div>
-        <div>
-          <label>确认新密码</label>
-          <input v-model="pwd.confirm" type="password" autocomplete="new-password" />
-        </div>
-        <div v-if="pwdError" style="color: var(--red); font-size: 13px">{{ pwdError }}</div>
-        <button class="btn-primary" :disabled="pwdLoading" @click="changePassword">
-          {{ pwdLoading ? '保存中…' : '修改密码' }}
-        </button>
       </div>
-    </div>
-
-    <div class="card card-pad">
-      <strong>双因素认证 (2FA)</strong>
-      <p class="muted" style="font-size: 12px">
-        使用 Google Authenticator 等 App 扫码绑定；开启后登录需额外输入 6 位验证码。
-      </p>
-      <div class="form-grid">
-        <div>
-          <span class="tag" :class="twofa.enabled ? 'green' : twofa.bound ? 'amber' : 'blue'">
-            {{ twofa.enabled ? '已开启' : twofa.bound ? '已绑定未开启' : '未绑定' }}
-          </span>
-        </div>
-
-        <template v-if="twofaSetup">
-          <div style="text-align: center">
-            <img :src="twofaSetup.qr_data_uri" alt="2FA QR" width="180" height="180" />
-          </div>
-          <div>
-            <label>手动输入密钥</label>
-            <input :value="twofaSetup.secret" readonly style="font-family: ui-monospace, monospace" />
-          </div>
-          <div>
-            <label>验证码（完成绑定）</label>
-            <input v-model="twofaCode" inputmode="numeric" maxlength="6" placeholder="000000" />
-          </div>
-          <button class="btn-primary" :disabled="twofaLoading" @click="confirm2faBind">
-            {{ twofaLoading ? '提交中…' : '确认绑定并开启' }}
-          </button>
-        </template>
-
-        <template v-else-if="!twofa.bound">
-          <button class="btn-primary" :disabled="twofaLoading" @click="start2faSetup">
-            {{ twofaLoading ? '生成中…' : '开始绑定' }}
-          </button>
-        </template>
-
-        <template v-else>
-          <div v-if="!twofa.enabled">
-            <label>验证码（重新开启）</label>
-            <input v-model="twofaCode" inputmode="numeric" maxlength="6" placeholder="000000" />
-            <button class="btn-primary btn-sm" style="margin-top: 8px" :disabled="twofaLoading" @click="enable2fa">
-              开启 2FA
-            </button>
-          </div>
-          <div>
-            <label>当前密码</label>
-            <input v-model="twofaPwd" type="password" autocomplete="current-password" />
-          </div>
-          <div v-if="twofa.enabled">
-            <label>验证码</label>
-            <input v-model="twofaCode" inputmode="numeric" maxlength="6" placeholder="关闭/重置时需填写" />
-          </div>
-          <div class="row" style="gap: 8px">
-            <button
-              v-if="twofa.enabled"
-              class="btn-ghost btn-sm"
-              :disabled="twofaLoading"
-              @click="disable2fa"
-            >
-              关闭 2FA
-            </button>
-            <button class="btn-ghost btn-sm" :disabled="twofaLoading" @click="reset2fa">重置绑定</button>
-            <button
-              v-if="twofa.enabled"
-              class="btn-ghost btn-sm"
-              :disabled="twofaLoading"
-              @click="start2faSetup"
-            >
-              更换密钥
-            </button>
-          </div>
-        </template>
-
-        <div v-if="twofaError" style="color: var(--red); font-size: 13px">{{ twofaError }}</div>
-      </div>
-    </div>
-  </div>
 </template>
 
 <style scoped>

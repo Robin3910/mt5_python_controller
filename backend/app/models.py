@@ -1106,6 +1106,29 @@ class MeOut(BaseModel):
     # 前端据此提示「即使打开带单开关，信号也只下发主节点」。
     follow_paused: bool = False
     ai_follow_paused: bool = False
+    # —— 个人中心自助维护字段 ——
+    # 邮箱：联系用，不参与登录，故允许重复。
+    email: Optional[str] = None
+    # 带单员展示名：为空时前端回退显示 display_name。
+    leader_name: Optional[str] = None
+    # 带单员介绍：目前只在个人中心自己可见，带单广场暂不公开展示。
+    leader_intro: Optional[str] = None
+    # 手机号（脱敏展示 138****8000）；未绑定为 None。
+    phone: Optional[str] = None
+    # 是否已通过短信验证（注册路径 True；管理员手工绑定 False）
+    phone_verified: bool = False
+
+
+class ProfileUpdate(BaseModel):
+    """个人中心自助修改资料：只改自己，不传表示不改。
+
+    字段级「传什么改什么」：传空串表示清空该字段（置 NULL）。
+    """
+    display_name: Optional[str] = Field(default=None, max_length=64)
+    # 邮箱格式由接口层校验（这里是宽松长度限制，避免 pydantic 直接拒掉空串）。
+    email: Optional[str] = Field(default=None, max_length=128)
+    leader_name: Optional[str] = Field(default=None, max_length=64)
+    leader_intro: Optional[str] = Field(default=None, max_length=2000)
 
 
 class MenuOut(BaseModel):

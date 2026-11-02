@@ -112,7 +112,10 @@ const router = createRouter({
       meta: { menu: 'permissions' },
     },
     { path: '/config', name: 'config', component: () => import('@/views/ConfigView.vue') },
-    { path: '/me', name: 'me', component: () => import('@/views/ProfileView.vue') },
+    // 「我的」枢纽页：账号卡片 + 模块入口
+    { path: '/me', name: 'me', component: () => import('@/views/MineView.vue') },
+    // 「个人中心」：个人信息 / 带单员 / 修改密码 / 2FA（登录即可进，不限菜单）
+    { path: '/profile', name: 'profile', component: () => import('@/views/ProfileView.vue') },
     {
       path: '/user-strategies',
       name: 'user-strategies',

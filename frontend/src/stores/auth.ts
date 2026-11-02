@@ -1,6 +1,13 @@
 import { defineStore } from 'pinia'
 import api from '@/api/client'
-import type { MeInfo, PhoneRegisterPayload, PhoneRegisterResult, SmsPurpose, SmsStatus } from '@/api/types'
+import type {
+  MeInfo,
+  PhoneRegisterPayload,
+  PhoneRegisterResult,
+  ProfileUpdate,
+  SmsPurpose,
+  SmsStatus,
+} from '@/api/types'
 
 interface AuthState {
   token: string
@@ -42,6 +49,17 @@ export const useAuthStore = defineStore('auth', {
     },
     async fetchMe(): Promise<MeInfo> {
       const { data } = await api.get<MeInfo>('/api/me')
+      this.me = data
+      return data
+    },
+    /**
+     * 个人中心自助修改资料（只改自己）。
+     *
+     * 成功后把服务端返回的最新 `me` 合并回本地 —— 接口直接回 `MeOut`，
+     * 所以这里不用再发一次 GET，也就不会出现「保存成功但页面还是旧值」。
+     */
+    async updateProfile(payload: ProfileUpdate): Promise<MeInfo> {
+      const { data } = await api.patch<MeInfo>('/api/me/profile', payload)
       this.me = data
       return data
     },

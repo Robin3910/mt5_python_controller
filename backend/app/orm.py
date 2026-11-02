@@ -135,6 +135,16 @@ class User(Base):
     # 是否已通过短信验证：注册路径为 True；管理员手工绑定手机号时为 False
     # （手工绑定的用户同样可用验证码登录，登录不要求 phone_verified）。
     phone_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    # —— 个人中心自助维护字段（后加列，存量用户一律 NULL）——
+    # email：联系邮箱，**不参与任何登录流程**（登录凭据是用户名+密码 / 手机号验证码）。
+    #   不设唯一约束 —— 邮箱不作为身份标识，允许重复。
+    email: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # leader_name：带单员对外展示名。为 NULL 时前端回退显示 display_name，
+    #   所以不强制填 —— 不填也不会让带单广场显示不出名字。
+    leader_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # leader_intro：带单员介绍（自由文本）。目前只在个人中心自己可见，
+    #   带单广场暂不公开展示（公开页展示用户自由文本需要内容审核）。
+    leader_intro: Mapped[str | None] = mapped_column(Text, nullable=True)
     # 会话版本：禁用 / 改密 / 重置密码时 +1，签发时写进 JWT 的 ver，旧 token 随即失效
     token_version: Mapped[int] = mapped_column(Integer, default=0)
     # —— 暂停接单（两个市场各自独立，互不影响）——

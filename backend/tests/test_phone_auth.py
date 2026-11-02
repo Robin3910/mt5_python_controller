@@ -549,8 +549,10 @@ def test_original_login_and_me_unchanged(client, provider):
     r = client.get("/api/me", headers=h)
     assert r.status_code == 200, r.text
     body = r.json()
-    # MeOut 不新增手机号字段，避免影响前端
-    assert "phone" not in body
+    # MeOut 里的 phone 是**脱敏值**（个人中心只读展示用），不是完整号码。
+    # 未绑定手机号时为 None。
+    assert body.get("phone") is None
+    assert body.get("phone_verified") is False
     assert body["username"] == "admin"
     assert body["is_admin"] is True
 

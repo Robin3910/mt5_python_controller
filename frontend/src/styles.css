@@ -2063,13 +2063,690 @@ a.dash-link { display: inline-block; }
   .home-nodes-bar { grid-template-columns: 64px 1fr 80px; gap: 10px; }
 }
 
-/* ── Profile Hub Page ── */
-.profile-page {}
+/* ============================================================
+ * 「我的」/「个人中心」共用样式 —— 1:1 复刻 UI/H5.html 原型
+ *
+ * 两个页面（MineView / ProfileView）共用同一套卡片、区块标题、
+ * 按钮与表单外观，所以放在全局而不是各页 scoped —— 避免同一份
+ * 样式抄两遍，改一处漏一处。
+ * ============================================================ */
+:root {
+  --pf-card: #101828;
+  --pf-soft: #0c1220;
+  --pf-border: #1c2740;
+  --pf-border-2: #22304a;
+  --pf-text: #e6ebf4;
+  --pf-muted: #8b96a8;
+  --pf-dim: #5b6b85;
+  --pf-faint: #4a5568;
+  --pf-blue: #2563eb;
+  --pf-green: #22c55e;
+}
 
-/* responsive override for profile */
-@media (max-width: 1100px) {
-  .hub-grid { grid-template-columns: repeat(3, 1fr); }
+/* ── 卡片 ── */
+.pf-card {
+  border-radius: 12px;
+  border: 1px solid var(--pf-border);
+  background: var(--pf-card);
+  padding: 12px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
 }
-@media (max-width: 800px) {
-  .hub-grid { grid-template-columns: repeat(2, 1fr); }
+@media (min-width: 1024px) {
+  .pf-card { padding: 16px; }
 }
+
+/* ── 区块标题（带左侧色条）── */
+.pf-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 2px;
+}
+.pf-section-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--pf-text);
+}
+.pf-bar {
+  width: 3px;
+  height: 12px;
+  border-radius: 2px;
+  background: var(--pf-blue);
+}
+.pf-count {
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--pf-border-2);
+  background: var(--pf-soft);
+  color: var(--pf-dim);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+/* ── 按钮 ── */
+.pf-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  height: 32px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid var(--pf-border-2);
+  background: var(--pf-soft);
+  color: var(--pf-muted);
+  font-size: 12px;
+  line-height: 1;
+  text-decoration: none;
+  white-space: nowrap;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.pf-btn:hover {
+  border-color: #2b3a5c;
+  color: var(--pf-text);
+  background: var(--pf-soft);
+}
+.pf-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.pf-btn svg { width: 14px; height: 14px; flex-shrink: 0; }
+
+.pf-btn-primary {
+  border-color: transparent;
+  background: var(--pf-blue);
+  color: #fff;
+  font-weight: 600;
+  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.35);
+}
+.pf-btn-primary:hover {
+  border-color: transparent;
+  background: #1d4ed8;
+  color: #fff;
+}
+
+.pf-btn-danger {
+  color: #f87171;
+  border-color: rgba(239, 68, 68, 0.4);
+}
+.pf-btn-danger:hover {
+  color: #fca5a5;
+  border-color: #ef4444;
+  background: rgba(239, 68, 68, 0.12);
+}
+
+/* 小号按钮（卡片内的次要操作）*/
+.pf-btn-mini {
+  height: 26px;
+  padding: 0 8px;
+  font-size: 10px;
+  border-radius: 6px;
+}
+
+/* 手动触发 BUY / SELL */
+.pf-btn-buy {
+  border-color: transparent;
+  background: #22c55e;
+  color: #fff;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  box-shadow: 0 2px 8px rgba(34, 197, 94, 0.35);
+}
+.pf-btn-buy:hover:not(:disabled) {
+  border-color: transparent;
+  background: #16a34a;
+  color: #fff;
+}
+.pf-btn-sell {
+  border-color: transparent;
+  background: #f6465d;
+  color: #fff;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  box-shadow: 0 2px 8px rgba(246, 70, 93, 0.35);
+}
+.pf-btn-sell:hover:not(:disabled) {
+  border-color: transparent;
+  background: #ef3a52;
+  color: #fff;
+}
+
+/* ── 表单 ── */
+.pf-label {
+  display: block;
+  margin: 0 0 4px;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--pf-dim);
+  text-transform: none;
+  letter-spacing: 0;
+}
+.pf-input {
+  width: 100%;
+  height: 34px;
+  padding: 0 12px;
+  border-radius: 8px;
+  border: 1px solid var(--pf-border-2);
+  background: var(--pf-soft);
+  color: var(--pf-text);
+  font-size: 12px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.pf-input::placeholder { color: var(--pf-faint); }
+.pf-input:focus { border-color: var(--pf-blue); }
+.pf-input:disabled,
+.pf-input[readonly] {
+  color: var(--pf-dim);
+  background: rgba(6, 10, 18, 0.5);
+  cursor: not-allowed;
+}
+textarea.pf-input {
+  height: auto;
+  min-height: 88px;
+  padding: 8px 12px;
+  line-height: 1.6;
+  resize: vertical;
+}
+.pf-grid-3 {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 1fr;
+}
+@media (min-width: 640px) {
+  .pf-grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+/* ── 只读列表（divide-y 分隔行）── */
+.pf-list {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.pf-list > li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid #1a2436;
+}
+.pf-list > li:last-child { border-bottom: none; }
+.pf-list-k {
+  font-size: 12px;
+  color: var(--pf-dim);
+  white-space: nowrap;
+}
+.pf-list-v {
+  min-width: 0;
+  font-size: 12px;
+  color: var(--pf-text);
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pf-list-v.strong { font-weight: 600; }
+.pf-list-v.wrap { white-space: normal; text-align: right; line-height: 1.6; color: #b8c4d9; }
+
+/* 状态徽章（2FA 状态等）*/
+.pf-count.ok {
+  background: rgba(34, 197, 94, 0.15);
+  border-color: rgba(34, 197, 94, 0.3);
+  color: #22c55e;
+}
+.pf-count.warn {
+  background: rgba(245, 158, 11, 0.15);
+  border-color: rgba(245, 158, 11, 0.3);
+  color: #fbbf24;
+}
+
+/* ── 提示与错误文案 ── */
+.pf-hint {
+  margin: 0;
+  font-size: 10px;
+  line-height: 1.6;
+  color: var(--pf-dim);
+}
+.pf-error {
+  margin: 8px 0 0;
+  font-size: 11px;
+  color: #f87171;
+}
+/* 等宽字体（2FA 密钥等）*/
+.pf-mono { font-family: var(--mono); }
+
+/* ── 表单尾部操作条 ── */
+.pf-form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+/* ── 折叠面板（修改密码 / 2FA 用）── */
+.pf-collapse-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 12px;
+  text-align: left;
+  border: none;
+  border-radius: 12px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.pf-collapse-head:hover { background: #0c1322; }
+.pf-collapse-head > span:first-child {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--pf-text);
+}
+.pf-collapse-head svg { width: 18px; height: 18px; flex-shrink: 0; color: var(--pf-muted); }
+.pf-collapse-body {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #1a2436;
+}
+.pf-chevron {
+  color: var(--pf-dim);
+  transition: transform 0.2s;
+}
+.pf-chevron.open { transform: rotate(180deg); }
+
+/* 「我的」枢纽页样式已全部收敛到 views/MineView.vue 的 scoped 样式中。 */
+
+/* ============================================================
+ * 「客户端版本管理」/「操作审计」共用样式 —— 1:1 复刻 UI/H5.html 原型
+ *
+ * 两页都走「卡片 + 区块标题 + 指标格 + 分隔列表」这套原型版式，
+ * 所以共用外观放在全局，各页 scoped 只放自己独有的部分。
+ * ============================================================ */
+.pf-page {
+  width: 100%;
+  max-width: 1080px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* ── 卡片头（图标 + 标题 + 右侧操作）── */
+.pf-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.pf-card-head-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.pf-card-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  border-radius: 8px;
+  background: rgba(124, 58, 237, 0.15);
+  color: #a78bfa;
+}
+.pf-card-icon svg { width: 16px; height: 16px; }
+.pf-card-title {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--pf-text);
+}
+.pf-card-sub {
+  margin: 2px 0 0;
+  font-size: 10px;
+  color: var(--pf-dim);
+}
+.pf-card-sub b { color: var(--pf-text); font-weight: 600; }
+
+/* ── 说明条（info / ok / warn）── */
+.pf-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(37, 99, 235, 0.4);
+  background: rgba(37, 99, 235, 0.1);
+  color: #93c5fd;
+  font-size: 11px;
+  line-height: 1.6;
+}
+.pf-note svg { width: 14px; height: 14px; flex-shrink: 0; margin-top: 1px; }
+.pf-note.ok {
+  border-color: rgba(22, 163, 74, 0.4);
+  background: rgba(34, 197, 94, 0.1);
+  color: #4ade80;
+}
+.pf-note.warn {
+  border-color: rgba(180, 83, 9, 0.4);
+  background: rgba(245, 158, 11, 0.1);
+  color: #fbbf24;
+}
+.pf-note p { margin: 0; }
+
+/* ── 指标格（当前发布版本下方的四格）── */
+.pf-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+@media (min-width: 640px) {
+  .pf-metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}
+.pf-metric {
+  border-radius: 8px;
+  border: 1px solid var(--pf-border-2);
+  background: var(--pf-soft);
+  padding: 8px;
+}
+.pf-metric-k {
+  margin: 0;
+  font-size: 9px;
+  color: var(--pf-dim);
+}
+.pf-metric-v {
+  margin: 2px 0 0;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--pf-text);
+  font-family: var(--mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── 状态药丸（带呼吸点）── */
+.pf-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(124, 58, 237, 0.15);
+  color: #a78bfa;
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.pf-pill-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: pulse-dot 2s ease-in-out infinite;
+}
+.pf-pill.blue { background: rgba(37, 99, 235, 0.15); color: #60a5fa; }
+.pf-pill.green { background: rgba(34, 197, 94, 0.15); color: #4ade80; }
+.pf-pill.amber { background: rgba(245, 158, 11, 0.15); color: #fbbf24; }
+.pf-pill.red { background: rgba(239, 68, 68, 0.15); color: #f87171; }
+.pf-pill.grey { background: rgba(107, 122, 147, 0.15); color: #8b96a8; }
+
+/* ── 分段筛选（原型 vo：选中蓝底白字）── */
+.pf-seg {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.pf-seg-item {
+  padding: 6px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--pf-border-2);
+  background: var(--pf-soft);
+  color: var(--pf-muted);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.pf-seg-item:hover { color: var(--pf-text); }
+.pf-seg-item.active {
+  border-color: transparent;
+  background: var(--pf-blue);
+  color: #fff;
+  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.35);
+}
+.pf-seg-item.mini { padding: 4px 8px; font-size: 10px; font-weight: 500; }
+/* 语义态选中色：拦截红 / 放行绿 */
+.pf-seg-item.danger.active {
+  background: #f6465d;
+  box-shadow: 0 2px 8px rgba(246, 70, 93, 0.35);
+}
+.pf-seg-item.success.active {
+  background: #22c55e;
+  box-shadow: 0 2px 8px rgba(34, 197, 94, 0.35);
+}
+
+/* ── 开关（原型 qx：蓝色药丸 + 白色滑块）── */
+.pf-switch {
+  position: relative;
+  width: 36px;
+  height: 20px;
+  flex-shrink: 0;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background: var(--pf-border-2);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.pf-switch::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+  transition: left 0.15s;
+}
+.pf-switch.on { background: var(--pf-blue); }
+.pf-switch.on::after { left: 18px; }
+.pf-switch:disabled { opacity: 0.45; cursor: not-allowed; }
+.pf-switch:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.2);
+}
+
+/* 开关行：左标签右开关 */
+.pf-switch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+.pf-switch-label {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--pf-text);
+}
+
+/* ── 数字步进器（原型全局手数：− 数字 ＋）── */
+.pf-stepper {
+  display: inline-flex;
+  align-items: center;
+  max-width: 220px;
+  border-radius: 8px;
+  border: 1px solid var(--pf-border-2);
+  background: var(--pf-soft);
+  overflow: hidden;
+}
+.pf-stepper-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 34px;
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  color: var(--pf-muted);
+  cursor: pointer;
+  transition: color 0.15s;
+}
+.pf-stepper-btn:hover:not(:disabled) { color: var(--pf-text); }
+.pf-stepper-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.pf-stepper-btn svg { width: 15px; height: 15px; }
+.pf-stepper-input {
+  width: 100%;
+  min-width: 0;
+  flex: 1;
+  height: 34px;
+  padding: 0 4px;
+  border: none;
+  border-left: 1px solid var(--pf-border-2);
+  border-right: 1px solid var(--pf-border-2);
+  background: transparent;
+  color: var(--pf-text);
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 600;
+  text-align: center;
+  outline: none;
+}
+.pf-stepper-input::-webkit-outer-spin-button,
+.pf-stepper-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.pf-stepper-input[type='number'] { -moz-appearance: textfield; }
+
+/* ── 分隔列表（原型审计表格：表头行 + 数据行）── */
+.pf-rows {
+  margin-top: 10px;
+  overflow-x: auto;
+}
+.pf-rows-inner { min-width: 680px; }
+.pf-row-head,
+.pf-row {
+  display: grid;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px;
+}
+.pf-row-head {
+  border-bottom: 1px solid var(--pf-border-2);
+  padding-bottom: 8px;
+  font-size: 10px;
+  color: var(--pf-dim);
+}
+.pf-row {
+  border-bottom: 1px solid #161f30;
+  padding: 10px 8px;
+  font-size: 12px;
+  transition: background 0.15s;
+}
+.pf-row:hover { background: var(--pf-soft); }
+.pf-row:last-child { border-bottom: none; }
+.pf-row > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pf-row .c-muted { color: var(--pf-muted); }
+.pf-row .c-dim { color: var(--pf-dim); }
+.pf-row .c-mono { font-family: var(--mono); font-size: 11px; color: var(--pf-text); }
+.pf-row .c-text { color: var(--pf-text); }
+.pf-row .c-strong { font-weight: 600; color: var(--pf-text); }
+.pf-row .c-blue { color: #3b82f6; }
+.pf-row .c-green { color: #22c55e; }
+
+/* ── 结果标记（图标 + 文案）── */
+.pf-result {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  font-weight: 600;
+}
+.pf-result svg { width: 12px; height: 12px; }
+.pf-result.ok { color: #22c55e; }
+.pf-result.skip { color: #6b7a93; }
+.pf-result.warn { color: #fbbf24; }
+.pf-result.fail { color: #f87171; }
+
+/* ── 空态 ── */
+.pf-empty {
+  padding: 32px 0;
+  text-align: center;
+  font-size: 10px;
+  color: var(--pf-faint);
+}
+
+/* ── 圆形翻页按钮 ── */
+.pf-page-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  border: 1px solid var(--pf-border-2);
+  background: var(--pf-soft);
+  color: var(--pf-muted);
+  transition: color 0.15s;
+}
+.pf-page-btn:hover:not(:disabled) { color: var(--pf-text); }
+.pf-page-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.pf-page-btn svg { width: 14px; height: 14px; }
+
+/* ── 分隔线 ── */
+.pf-divider {
+  height: 1px;
+  margin: 12px 0;
+  background: #1a2436;
+}
+
+/* ── 文件选择框（虚线）── */
+.pf-file-picker {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  margin-top: 6px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px dashed #2b3a5c;
+  background: var(--pf-soft);
+  color: var(--pf-muted);
+  font-size: 12px;
+  text-align: left;
+  transition: border-color 0.15s, color 0.15s;
+}
+.pf-file-picker:hover:not(:disabled) { border-color: rgba(37, 99, 235, 0.6); color: var(--pf-text); }
+.pf-file-picker:disabled { opacity: 0.5; cursor: not-allowed; }
+.pf-file-picker-main {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.pf-file-picker-main svg { width: 15px; height: 15px; flex-shrink: 0; }
+.pf-file-picker-main span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pf-file-picker > svg { width: 15px; height: 15px; flex-shrink: 0; }
+
