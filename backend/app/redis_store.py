@@ -60,6 +60,19 @@ K_LEADER_STATS = "stats:leader:{}"
 # 与跟单人数的统计范围；共用一个 key 会互相覆盖。
 K_ROBOT_STATS = "stats:robot:{}"
 
+# ---- 手机号注册 / 验证码登录（短信）----
+# 验证码本体：{purpose}:{phone} -> JSON {code_hash, attempts, issued_at}（只存哈希）
+# purpose 必须在 key 里：register 与 login 的验证码是不同的，防止跨用途复用
+K_SMS_CODE = "sms:code:{}:{}"
+# 每手机号每日发送计数：{phone}:{YYYYMMDD} -> int（防刷费）
+K_SMS_SEND_PHONE = "sms:send:{}:{}"
+# 每 IP 每小时发送计数：{ip}:{YYYYMMDDHH} -> int（防批量轰炸）
+K_SMS_SEND_IP = "sms:sendip:{}:{}"
+# 发送冷却：{phone} -> "1"（防连点）
+K_SMS_LOCK = "sms:lock:{}"
+# 全局每日发送总数：{YYYYMMDD} -> int（配置页展示「今日已发送条数」）
+K_SMS_SEND_TOTAL = "sms:sendtotal:{}"
+
 
 class RedisStore:
     def __init__(self, client: aioredis.Redis) -> None:
@@ -499,3 +512,49 @@ class RedisStore:
         keys = [K_ROBOT_STATS.format(u) for u in leader_user_ids if u]
         if keys:
             await self.r.delete(*keys)
+
+    # ----------------- 短信验证码 / 限频 -----------------
+    async def save_sms_code(
+        self, purpose: str, phone: str, payload: dict, ttl: int,
+    ) -> None:
+        """写入验证码（只存哈希）；同号码同用途的旧码被覆盖。"""
+        await self.r.set(K_SMS_CODE.format(purpose, phone), json.dumps(payload), ex=ttl)
+
+    async def get_sms_code(self, purpose: str, phone: str) -> Optional[dict]:
+        raw = await self.r.get(K_SMS_CODE.format(purpose, phone))
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    async def delete_sms_code(self, purpose: str, phone: str) -> None:
+        """作废验证码（校验通过即焚 / 错误次数超限时作废）。"""
+        await self.r.delete(K_SMS_CODE.format(purpose, phone))
+
+    async def incr_sms_send_counter(self, key: str, ttl: int) -> int:
+        """计数 +1 并首次设置 TTL，返回当前值。
+
+        TTL 覆盖到当天结束即可（发送计数是「每日上限」语义），但为避免跨天边界
+        的计数残留，这里统一给一个覆盖窗口。
+        """
+        value = await self.r.incr(key)
+        if int(value) == 1:
+            await self.r.expire(key, ttl)
+        return int(value)
+
+    async def get_sms_send_counter(self, key: str) -> int:
+        raw = await self.r.get(key)
+        try:
+            return int(raw or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    async def acquire_sms_lock(self, phone: str, ttl: int) -> bool:
+        """抢占发送冷却锁；拿到返回 True（已存在则 False）。"""
+        return bool(await self.r.set(K_SMS_LOCK.format(phone), "1", nx=True, ex=ttl))
+
+    async def release_sms_lock(self, phone: str) -> None:
+        await self.r.delete(K_SMS_LOCK.format(phone))

@@ -30,6 +30,14 @@ class Settings(BaseSettings):
     admin_user: str = "admin"
     admin_password: str = "admin123"
 
+    # —— 阿里云短信认证（号码认证服务 PNVS / 短信认证）——
+    # 只放密钥，不放签名与模板（那两项在 sms_config 里，运维可在配置页改）。
+    # 生产环境用 K8s Secret / 密钥管理服务注入，**不入 .env 文件、不进仓库**。
+    aliyun_access_key_id: str = ""
+    aliyun_access_key_secret: str = ""
+    # 验证码哈希用的服务端盐（与 jwt_secret 独立）：改它会让存量验证码全部失效
+    sms_code_salt: str = ""
+
     # —— WebSocket / 各类时间间隔（秒）——
     heartbeat_interval: int = 30        # 下发给节点的心跳间隔
     online_ttl: int = 90                # 在线标记的过期时间（超过即判离线）

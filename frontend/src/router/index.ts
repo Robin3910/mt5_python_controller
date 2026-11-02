@@ -13,6 +13,8 @@ const router = createRouter({
   history: createWebHistory(),
   routes: [
     { path: '/login', name: 'login', component: () => import('@/views/LoginView.vue') },
+    // 注册页是公开路由（不加 meta.menu）；已登录访问它会被守卫弹回首页
+    { path: '/register', name: 'register', component: () => import('@/views/RegisterView.vue') },
     {
       path: '/home',
       name: 'home',
@@ -120,12 +122,15 @@ const router = createRouter({
   ],
 })
 
-// 全局守卫：未登录只能进 /login；已登录先拉当前用户，再按菜单权限放行，
+// 全局守卫：未登录只能进 /login / register；已登录先拉当前用户，再按菜单权限放行，
 // 无权限时跳到第一个有权限的菜单（都没有则到配置页）
 router.beforeEach(async (to) => {
   const auth = useAuthStore()
-  if (to.name !== 'login' && !auth.isAuthed) return { name: 'login' }
-  if (to.name === 'login') return auth.isAuthed ? { name: 'home' } : true
+  const isPublic = to.name === 'login' || to.name === 'register'
+  if (!isPublic && !auth.isAuthed) return { name: 'login' }
+  // 已登录不该再看到登录 / 注册页
+  if (isPublic && auth.isAuthed) return { name: 'home' }
+  if (to.name === 'login' || to.name === 'register') return true
   if (!auth.me) {
     try {
       await auth.fetchMe()

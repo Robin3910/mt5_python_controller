@@ -34,12 +34,63 @@ const nodeTokenError = ref('')
 const webhookAuthEnabled = ref(true)
 const webhookAuthLoading = ref(false)
 
+const sms = reactive({
+  enabled: false,
+  provider: 'aliyun_sms_auth',
+  endpoint: 'dypnsapi.aliyuncs.com',
+  sign_name: '',
+  template_code: '100001',
+  require_approval: true,
+  code_ttl_seconds: 300,
+  send_interval_seconds: 60,
+  daily_limit_per_phone: 10,
+  hourly_limit_per_ip: 20,
+  max_verify_attempts: 5,
+  today_sent: 0,
+  credentials_present: false,
+})
+const smsLoading = ref(false)
+const smsError = ref('')
+
 onMounted(async () => {
   await load2faStatus()
   if (!auth.isAdmin) return
   await loadNodeToken()
   await loadWebhookAuth()
+  await loadSmsConfig()
 })
+
+async function loadSmsConfig(): Promise<void> {
+  try {
+    const cfg = await hub.fetchSmsConfig()
+    Object.assign(sms, cfg)
+  } catch {
+    smsError.value = '无法加载短信配置'
+  }
+}
+
+async function saveSmsConfig(): Promise<void> {
+  smsError.value = ''
+  smsLoading.value = true
+  try {
+    const cfg = await hub.setSmsConfig({ ...sms })
+    Object.assign(sms, cfg)
+    flash('短信配置已保存')
+  } catch (e: unknown) {
+    const err = e as { response?: { data?: { detail?: string } } }
+    smsError.value = err?.response?.data?.detail || '保存失败，请稍后重试'
+  } finally {
+    smsLoading.value = false
+  }
+}
+
+function onSmsEnabledChange(value: boolean | string | number): void {
+  sms.enabled = value === true || value === 'true' || value === 1
+}
+
+function onSmsApprovalChange(value: boolean | string | number): void {
+  sms.require_approval = value === true || value === 'true' || value === 1
+}
 
 async function loadNodeToken(): Promise<void> {
   try {
@@ -333,6 +384,84 @@ async function changePassword(): Promise<void> {
         <div class="row" style="gap: 8px">
           <button class="btn-danger btn-sm" :disabled="nodeTokenLoading" @click="rotateNodeToken">
             {{ nodeTokenLoading ? '重置中…' : '重置令牌' }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div v-if="auth.isAdmin" class="card card-pad span-full">
+      <div class="row between">
+        <strong>短信服务（手机号注册 / 验证码登录）</strong>
+        <span class="muted" style="font-size: 12px">今日已发送：{{ sms.today_sent }} 条</span>
+      </div>
+      <p class="muted" style="font-size: 12px">
+        验证码由本系统生成并校验，阿里云短信认证只负责把短信送达。关闭开关后所有短信接口立即不可用，
+        前端会自动隐藏验证码入口，无需重启。
+      </p>
+      <div class="webhook-auth-row">
+        <span class="webhook-auth-label">启用短信服务</span>
+        <ElSwitch
+          :model-value="sms.enabled"
+          :disabled="smsLoading"
+          @change="onSmsEnabledChange"
+        />
+        <span class="muted webhook-auth-hint">
+          {{ sms.enabled ? '已启用：注册与验证码登录入口可见' : '已停用：所有短信接口返回 404' }}
+        </span>
+      </div>
+      <div class="webhook-auth-row">
+        <span class="webhook-auth-label">注册需管理员审核</span>
+        <ElSwitch
+          :model-value="sms.require_approval"
+          :disabled="smsLoading"
+          @change="onSmsApprovalChange"
+        />
+        <span class="muted webhook-auth-hint">
+          {{ sms.require_approval ? '开启：新注册用户默认禁用，管理员启用后才能登录' : '关闭：新注册用户注册即可登录' }}
+        </span>
+      </div>
+      <div class="form-grid">
+        <div>
+          <label>短信签名</label>
+          <input v-model="sms.sign_name" placeholder="阿里云控制台已审核通过的签名" />
+        </div>
+        <div>
+          <label>模板 Code</label>
+          <input v-model="sms.template_code" placeholder="例如 SMS_123456789" />
+        </div>
+        <div>
+          <label>AccessKey</label>
+          <span class="tag" :class="sms.credentials_present ? 'green' : 'amber'">
+            {{ sms.credentials_present ? '已注入环境变量' : '未注入（无法发送）' }}
+          </span>
+          <p class="muted" style="font-size: 12px; margin: 4px 0 0">
+            密钥只从后端环境变量读取，页面永不回显。
+          </p>
+        </div>
+        <div>
+          <label>验证码有效期（秒）</label>
+          <input v-model.number="sms.code_ttl_seconds" type="number" min="60" max="1800" />
+        </div>
+        <div>
+          <label>重发冷却（秒）</label>
+          <input v-model.number="sms.send_interval_seconds" type="number" min="10" max="3600" />
+        </div>
+        <div>
+          <label>每号码每日上限</label>
+          <input v-model.number="sms.daily_limit_per_phone" type="number" min="1" max="1000" />
+        </div>
+        <div>
+          <label>每 IP 每小时上限</label>
+          <input v-model.number="sms.hourly_limit_per_ip" type="number" min="1" max="5000" />
+        </div>
+        <div>
+          <label>验证码最大校验次数</label>
+          <input v-model.number="sms.max_verify_attempts" type="number" min="1" max="20" />
+        </div>
+        <div v-if="smsError" style="color: var(--red); font-size: 13px">{{ smsError }}</div>
+        <div class="row" style="gap: 8px">
+          <button class="btn-primary" :disabled="smsLoading" @click="saveSmsConfig">
+            {{ smsLoading ? '保存中…' : '保存短信配置' }}
           </button>
         </div>
       </div>

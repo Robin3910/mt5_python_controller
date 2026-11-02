@@ -14,3 +14,4 @@ PyJWT>=2.8
 python-multipart>=0.0.9
 pyotp>=2.9
 qrcode[pil]>=7.4
+alibabacloud_dypnsapi20170525>=2.2.0

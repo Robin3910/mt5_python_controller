@@ -129,6 +129,12 @@ class User(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     totp_secret: Mapped[str | None] = mapped_column(String(32), nullable=True)
     totp_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 手机号：手机号注册 / 验证码登录的唯一凭据。存归一化后的 E.164（+86xxxxxxxxxxx）。
+    # 存量用户为 NULL（MySQL / SQLite 的唯一索引都允许多个 NULL），因此加列零影响。
+    phone: Mapped[str | None] = mapped_column(String(20), nullable=True, unique=True, index=True)
+    # 是否已通过短信验证：注册路径为 True；管理员手工绑定手机号时为 False
+    # （手工绑定的用户同样可用验证码登录，登录不要求 phone_verified）。
+    phone_verified: Mapped[bool] = mapped_column(Boolean, default=False)
     # 会话版本：禁用 / 改密 / 重置密码时 +1，签发时写进 JWT 的 ver，旧 token 随即失效
     token_version: Mapped[int] = mapped_column(Integer, default=0)
     # —— 暂停接单（两个市场各自独立，互不影响）——

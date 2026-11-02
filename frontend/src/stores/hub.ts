@@ -26,6 +26,7 @@ import type {
   NodeTokenInfo,
   NodeUpdatePayload,
   RiskFeedItem,
+  SmsConfig,
   GroupTaskEventRecord,
   LimitWatchLogOut,
   PaginatedAudits,
@@ -482,6 +483,13 @@ export const useHubStore = defineStore('hub', {
     },
     async setWebhookAuth(enabled: boolean): Promise<WebhookAuthInfo> {
       return (await api.put('/api/config/webhook-auth', { enabled })).data
+    },
+    // ---- 短信服务配置（手机号注册 / 验证码登录）----
+    async fetchSmsConfig(): Promise<SmsConfig> {
+      return (await api.get('/api/config/sms')).data
+    },
+    async setSmsConfig(payload: Partial<SmsConfig>): Promise<SmsConfig> {
+      return (await api.put('/api/config/sms', payload)).data
     },
     // ---- 远程平仓 ----
     async closeNode(id: string, body: CloseRequest): Promise<void> {

@@ -1008,7 +1008,6 @@ class Login2FARequest(BaseModel):
     login_token: str
     totp_code: str
 
-
 class TwoFACodeRequest(BaseModel):
     totp_code: str
 
@@ -1016,6 +1015,69 @@ class TwoFACodeRequest(BaseModel):
 class TwoFAPasswordRequest(BaseModel):
     password: str
     totp_code: Optional[str] = None
+
+
+# ------------------------- 手机号注册 / 验证码登录 -------------------------
+class PhoneSmsSendRequest(BaseModel):
+    """发送验证码。purpose 决定验证码的用途（register / login 互不可用）。"""
+    phone: str = Field(min_length=1, max_length=32)
+    purpose: str = Field(default="login", max_length=16)
+
+
+class PhoneSmsVerifyRequest(BaseModel):
+    """校验验证码；通过后返回 ticket。"""
+    phone: str = Field(min_length=1, max_length=32)
+    code: str = Field(min_length=1, max_length=16)
+    purpose: str = Field(default="login", max_length=16)
+
+
+class PhoneRegisterRequest(BaseModel):
+    """手机号注册。ticket 是 /api/auth/sms/verify 换来的「手机号已验证」票据。
+
+    username / password 均可省略：省略 username 时自动生成 m{手机号}，
+    省略 password 时生成随机强密码（该用户只能走验证码登录）。
+    """
+    phone: str = Field(min_length=1, max_length=32)
+    ticket: str = Field(min_length=1)
+    nickname: Optional[str] = Field(default=None, max_length=64)
+    username: Optional[str] = Field(default=None, max_length=64)
+    password: Optional[str] = Field(default=None, max_length=128)
+
+
+class PhoneRegisterResult(BaseModel):
+    """注册结果。require_approval=true 时只返回 pending_approval，不签发 token。"""
+    ok: bool = True
+    pending_approval: bool = False
+    user_id: Optional[int] = None
+    username: Optional[str] = None
+    token: Optional[str] = None
+    token_type: Optional[str] = None
+    requires_2fa: bool = False
+
+
+class PhoneSmsLoginRequest(BaseModel):
+    """验证码登录。"""
+    phone: str = Field(min_length=1, max_length=32)
+    code: str = Field(min_length=1, max_length=16)
+
+
+class SmsConfigOut(BaseModel):
+    """短信配置（配置页展示）。密钥永不回显。"""
+    enabled: bool = False
+    provider: str = "aliyun_sms_auth"
+    endpoint: str = "dypnsapi.aliyuncs.com"
+    sign_name: str = ""
+    template_code: str = "100001"
+    require_approval: bool = True
+    code_ttl_seconds: int = 300
+    send_interval_seconds: int = 60
+    daily_limit_per_phone: int = 10
+    hourly_limit_per_ip: int = 20
+    max_verify_attempts: int = 5
+    # 今日已发送条数（Redis 计数，只读）
+    today_sent: int = 0
+    # AccessKey 是否已注入 env（只回显「有没有」，不回显内容）
+    credentials_present: bool = False
 
 
 # ----------------------------- 用户与权限 ----------------------------
@@ -1419,6 +1481,10 @@ class UserOut(BaseModel):
     is_active: bool = True
     is_admin: bool = False
     totp_enabled: bool = False
+    # 绑定的手机号（脱敏展示：138****8000）；未绑定为 None
+    phone: Optional[str] = None
+    # 是否已通过短信验证（管理员手工绑定时为 False）
+    phone_verified: bool = False
     roles: list[RoleRef] = Field(default_factory=list)
     node_ids: list[str] = Field(default_factory=list)
     group_count: int = 0
@@ -1441,6 +1507,10 @@ class UserCreate(BaseModel):
 class UserUpdate(BaseModel):
     display_name: Optional[str] = Field(default=None, max_length=64)
     is_active: Optional[bool] = None
+    # 绑定 / 解绑手机号：传 11 位手机号即绑定，传空串即解绑；不传表示不改。
+    # 手工绑定的用户 phone_verified=False，但**仍可用验证码登录**
+    # （登录只校验 users.phone 存在且 is_active）。
+    phone: Optional[str] = Field(default=None, max_length=32)
 
 
 class UserRolesUpdate(BaseModel):

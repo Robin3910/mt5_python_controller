@@ -30,6 +30,7 @@ from . import (
     node_dashboard_api,
     nodes,
     pending_api,
+    phone_auth,
     rbac_service,
     roles_api,
     strategies,
@@ -133,6 +134,7 @@ app.add_middleware(
 # 注册所有路由
 for r in (
     auth.router,
+    phone_auth.router,
     node_dashboard_api.router,
     twofa.router,
     users_api.router,

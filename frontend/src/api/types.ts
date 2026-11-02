@@ -1632,6 +1632,10 @@ export interface UserOut {
   is_active: boolean
   is_admin: boolean
   totp_enabled: boolean
+  /** 绑定的手机号（脱敏：138****8000）；未绑定为 null */
+  phone: string | null
+  /** 是否已通过短信验证（管理员手工绑定时为 false） */
+  phone_verified: boolean
   roles: RoleRef[]
   node_ids: string[]
   group_count: number
@@ -1652,6 +1656,69 @@ export interface UserCreatePayload {
 export interface UserUpdatePayload {
   display_name?: string | null
   is_active?: boolean
+  /** 绑定手机号（11 位）；传空串表示解绑；不传表示不改 */
+  phone?: string | null
+}
+
+// ----------------------------- 手机号注册 / 验证码登录 -----------------------------
+
+/** 验证码用途：注册与登录的验证码互相隔离（Redis key 里带 purpose） */
+export type SmsPurpose = 'register' | 'login'
+
+/** GET /api/auth/sms/status：短信服务是否可用（前端据此隐藏验证码入口） */
+export interface SmsStatus {
+  enabled: boolean
+  require_approval: boolean
+  code_ttl_seconds: number
+  send_interval_seconds: number
+}
+
+/** POST /api/auth/sms/send 的响应 */
+export interface SmsSendResult {
+  ok: boolean
+  /** 验证码有效期（秒） */
+  expire_in: number
+  /** 重发冷却（秒） */
+  cooldown: number
+}
+
+/** POST /api/auth/register 的响应 */
+export interface PhoneRegisterResult {
+  ok: boolean
+  /** true = 等待管理员审核（此时没有 token） */
+  pending_approval: boolean
+  user_id: number | null
+  username: string | null
+  token: string | null
+  token_type: string | null
+  requires_2fa: boolean
+}
+
+export interface PhoneRegisterPayload {
+  phone: string
+  ticket: string
+  nickname?: string | null
+  username?: string | null
+  password?: string | null
+}
+
+/** 短信服务配置（管理员配置页；密钥永不回显） */
+export interface SmsConfig {
+  enabled: boolean
+  provider: string
+  endpoint: string
+  sign_name: string
+  template_code: string
+  require_approval: boolean
+  code_ttl_seconds: number
+  send_interval_seconds: number
+  daily_limit_per_phone: number
+  hourly_limit_per_ip: number
+  max_verify_attempts: number
+  /** 今日已发送条数（只读） */
+  today_sent: number
+  /** AccessKey 是否已注入 env（只回显有没有，不回显内容） */
+  credentials_present: boolean
 }
 
 export interface UserNodesResult {

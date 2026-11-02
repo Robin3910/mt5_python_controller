@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import api from '@/api/client'
-import type { MeInfo } from '@/api/types'
+import type { MeInfo, PhoneRegisterPayload, PhoneRegisterResult, SmsPurpose, SmsStatus } from '@/api/types'
 
 interface AuthState {
   token: string
@@ -12,6 +12,9 @@ export interface LoginResult {
   requires2fa: boolean
   loginToken?: string
 }
+
+/** 短信服务可用性（前端据此隐藏验证码入口）；null = 还没查过 */
+let smsStatusCache: SmsStatus | null = null
 
 // 登录态：token 持久化在 localStorage，刷新页面后仍保持登录
 export const useAuthStore = defineStore('auth', {
@@ -87,6 +90,52 @@ export const useAuthStore = defineStore('auth', {
     },
     async reset2fa(password: string, totpCode?: string): Promise<void> {
       await api.post('/api/2fa/reset', { password, totp_code: totpCode || undefined })
+    },
+
+    // ----------------- 手机号注册 / 验证码登录 -----------------
+    /** 短信服务是否可用；未配置或已关闭时前端隐藏验证码入口。 */
+    async fetchSmsStatus(force = false): Promise<SmsStatus> {
+      if (smsStatusCache && !force) return smsStatusCache
+      try {
+        const { data } = await api.get<SmsStatus>('/api/auth/sms/status')
+        smsStatusCache = data
+        return data
+      } catch {
+        // 接口不可用（含 404）视为未配置
+        const fallback: SmsStatus = {
+          enabled: false,
+          require_approval: true,
+          code_ttl_seconds: 300,
+          send_interval_seconds: 60,
+        }
+        smsStatusCache = fallback
+        return fallback
+      }
+    },
+    /** 发送验证码；返回有效期与重发冷却（秒） */
+    async sendSmsCode(phone: string, purpose: SmsPurpose): Promise<{ expire_in: number; cooldown: number }> {
+      const { data } = await api.post('/api/auth/sms/send', { phone, purpose })
+      return { expire_in: data.expire_in, cooldown: data.cooldown }
+    },
+    /** 校验验证码；通过则返回「手机号已验证」票据 */
+    async verifySmsCode(phone: string, code: string, purpose: SmsPurpose): Promise<string> {
+      const { data } = await api.post('/api/auth/sms/verify', { phone, code, purpose })
+      return data.ticket
+    },
+    /** 手机号注册；待审核时 pending_approval=true 且没有 token */
+    async registerByPhone(payload: PhoneRegisterPayload): Promise<PhoneRegisterResult> {
+      const { data } = await api.post<PhoneRegisterResult>('/api/auth/register', payload)
+      if (data.token) this.setToken(data.token)
+      return data
+    },
+    /** 验证码登录；2FA 用户返回 requires2fa + loginToken（复用现有 2FA 分支） */
+    async loginBySms(phone: string, code: string): Promise<LoginResult> {
+      const { data } = await api.post('/api/auth/sms/login', { phone, code })
+      if (data.requires_2fa) {
+        return { requires2fa: true, loginToken: data.login_token }
+      }
+      this.setToken(data.token)
+      return { requires2fa: false }
     },
   },
 })

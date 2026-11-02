@@ -96,3 +96,34 @@ def verify_2fa_pending_jwt(token: str) -> Optional[str]:
         return data.get("sub")
     except Exception:
         return None
+
+
+def create_phone_pending_jwt(phone: str, purpose: str) -> str:
+    """签发「手机号已验证」票据（验证码校验通过后签发），有效期 10 分钟。
+
+    typ=phone_pending；sub 是归一化后的手机号；purpose 记用途（register / login），
+    票据不可跨用途使用。
+
+    票据用 JWT 而非 Redis：与 2FA 中间态保持同一套做法，无状态、少一次 IO。
+    """
+    payload = {
+        "sub": phone,
+        "typ": "phone_pending",
+        "purpose": purpose,
+        "exp": int(time.time()) + 600,
+    }
+    return jwt.encode(payload, settings.jwt_secret, algorithm="HS256")
+
+
+def verify_phone_pending_jwt(token: str, purpose: str) -> Optional[str]:
+    """校验手机号票据；类型 / 用途不符一律返回 None（防止跨用途复用）。"""
+    try:
+        data = jwt.decode(token, settings.jwt_secret, algorithms=["HS256"])
+    except Exception:
+        return None
+    if data.get("typ") != "phone_pending":
+        return None
+    if data.get("purpose") != purpose:
+        return None
+    sub = data.get("sub")
+    return str(sub) if sub else None

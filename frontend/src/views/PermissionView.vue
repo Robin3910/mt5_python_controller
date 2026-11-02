@@ -16,6 +16,7 @@ import type {
   NodeOut,
   RoleOut,
   UserOut,
+  UserUpdatePayload,
 } from '@/api/types'
 
 const USERNAME_RE = /^[A-Za-z0-9_.-]{3,32}$/
@@ -43,6 +44,10 @@ const userForm = ref({
 })
 const userFormError = ref('')
 const userSaving = ref(false)
+/** 手机号绑定输入：列表接口只回显脱敏号码，因此这里存「用户新输入的号码」 */
+const phoneInput = ref('')
+/** 勾选后提交空串解绑手机号 */
+const phoneUnbind = ref(false)
 
 const showRoles = ref(false)
 const roleTarget = ref<UserOut | null>(null)
@@ -101,7 +106,7 @@ const filteredUsers = computed(() => {
   if (!q) return rbac.users
   return rbac.users.filter((u) => {
     const roles = u.roles.map((r) => r.name).join(' ')
-    return [u.username, u.display_name || '', roles].some((s) => s.toLowerCase().includes(q))
+    return [u.username, u.display_name || '', u.phone || '', roles].some((s) => s.toLowerCase().includes(q))
   })
 })
 
@@ -216,6 +221,8 @@ function openCreateUser(): void {
     is_active: true,
     role_ids: def ? [def] : [],
   }
+  phoneInput.value = ''
+  phoneUnbind.value = false
   userFormError.value = ''
   showUserForm.value = true
 }
@@ -230,6 +237,8 @@ function openEditUser(user: UserOut): void {
     is_active: user.is_active,
     role_ids: user.roles.map((r) => r.id),
   }
+  phoneInput.value = ''
+  phoneUnbind.value = false
   userFormError.value = ''
   showUserForm.value = true
 }
@@ -254,6 +263,12 @@ async function saveUser(): Promise<void> {
       return
     }
   }
+  // 手机号：留空且未勾选解绑 = 不改；填了号码 = 绑定；勾选解绑 = 传空串
+  const phone = phoneInput.value.trim()
+  if (phone && !/^1[3-9]\d{9}$/.test(phone)) {
+    userFormError.value = '手机号须为 11 位中国大陆号码'
+    return
+  }
   userSaving.value = true
   try {
     if (userFormMode.value === 'create') {
@@ -266,10 +281,13 @@ async function saveUser(): Promise<void> {
       })
       ElMessage.success('用户已创建')
     } else if (editingUser.value) {
-      await rbac.updateUser(editingUser.value.id, {
+      const patch: UserUpdatePayload = {
         display_name: f.display_name.trim() || null,
         is_active: f.is_active,
-      })
+      }
+      if (phoneUnbind.value) patch.phone = ''
+      else if (phone) patch.phone = phone
+      await rbac.updateUser(editingUser.value.id, patch)
       ElMessage.success('用户已更新')
     }
     showUserForm.value = false
@@ -588,7 +606,7 @@ async function removeRole(role: RoleOut): Promise<void> {
           <input
             v-model="userQuery"
             type="search"
-            placeholder="搜索用户名 / 显示名 / 角色…"
+            placeholder="搜索用户名 / 显示名 / 手机号 / 角色…"
             aria-label="搜索用户"
             style="width: 28%"
           />
@@ -607,6 +625,14 @@ async function removeRole(role: RoleOut): Promise<void> {
               <span class="tag" :class="u.is_active ? 'green' : ''">{{ u.is_active ? '启用' : '禁用' }}</span>
             </div>
             <div class="list-field"><span class="k">用户名</span><span class="v">{{ u.username }}</span></div>
+            <div class="list-field">
+              <span class="k">手机号</span>
+              <span class="v">
+                <span v-if="u.phone">{{ u.phone }}</span>
+                <span v-else class="muted">未绑定</span>
+                <span v-if="u.phone && !u.phone_verified" class="tag amber">未验证</span>
+              </span>
+            </div>
             <div class="list-field"><span class="k">角色</span><span class="v">{{ roleNames(u) }}</span></div>
             <div class="list-field"><span class="k">2FA</span><span class="v">{{ u.totp_enabled ? '已绑定' : '未绑定' }}</span></div>
             <div class="list-field">
@@ -645,6 +671,7 @@ async function removeRole(role: RoleOut): Promise<void> {
             <thead>
               <tr>
                 <th>用户</th>
+                <th>手机号</th>
                 <th>角色</th>
                 <th>状态</th>
                 <th>2FA</th>
@@ -663,6 +690,11 @@ async function removeRole(role: RoleOut): Promise<void> {
                     <span v-if="u.display_name" class="muted">{{ u.username }}</span>
                     <span v-if="u.is_admin" class="tag amber">超管</span>
                   </div>
+                </td>
+                <td>
+                  <span v-if="u.phone">{{ u.phone }}</span>
+                  <span v-else class="muted">未绑定</span>
+                  <span v-if="u.phone && !u.phone_verified" class="tag amber">未验证</span>
                 </td>
                 <td>{{ roleNames(u) }}</td>
                 <td><span class="tag" :class="u.is_active ? 'green' : ''">{{ u.is_active ? '启用' : '禁用' }}</span></td>
@@ -694,7 +726,7 @@ async function removeRole(role: RoleOut): Promise<void> {
                 </td>
               </tr>
               <tr v-if="!filteredUsers.length">
-                <td colspan="9" class="muted" style="padding: 18px">
+                <td colspan="10" class="muted" style="padding: 18px">
                   {{ loading ? '加载中…' : '没有匹配的用户' }}
                 </td>
               </tr>
@@ -818,6 +850,25 @@ async function removeRole(role: RoleOut): Promise<void> {
             <div>
               <FormLabel field-id="perm-display" text="显示名" help="顶栏展示用，可空。" />
               <input id="perm-display" v-model="userForm.display_name" maxlength="64" placeholder="可选" />
+            </div>
+            <div v-if="userFormMode === 'edit'">
+              <FormLabel
+                field-id="perm-phone"
+                text="手机号"
+                help="11 位中国大陆号码。绑定后该用户可用验证码登录；手工绑定标记为未验证。"
+              />
+              <input
+                id="perm-phone"
+                v-model="phoneInput"
+                inputmode="numeric"
+                maxlength="11"
+                :disabled="phoneUnbind"
+                :placeholder="editingUser?.phone || '未绑定'"
+              />
+              <label class="row muted" style="gap: 6px; font-size: 12px; cursor: pointer; margin-top: 6px">
+                <input v-model="phoneUnbind" type="checkbox" @change="phoneInput = ''" />
+                解绑该用户的手机号
+              </label>
             </div>
             <div>
               <FormLabel field-id="perm-active" text="状态" help="禁用后无法登录，已登录会话立即失效。" />

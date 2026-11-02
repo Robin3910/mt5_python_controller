@@ -359,6 +359,50 @@ def _migrate_node_client_version(sync_conn) -> None:
         sync_conn.execute(text("ALTER TABLE nodes ADD COLUMN client_version_at DATETIME"))
 
 
+def _migrate_user_phone(sync_conn) -> None:
+    """users.phone / users.phone_verified：手机号登录凭据。
+
+    - phone：归一化后的 E.164（+86xxxxxxxxxxx），唯一索引；存量用户为 NULL，不受影响
+    - phone_verified：是否已通过短信验证（管理员手工绑定时为 False）
+
+    MySQL 不支持 `CREATE UNIQUE INDEX IF NOT EXISTS`，需按方言分支。
+    """
+    inspector = inspect(sync_conn)
+    if "users" not in inspector.get_table_names():
+        return
+    cols = {c["name"] for c in inspector.get_columns("users")}
+    dialect = sync_conn.engine.dialect.name
+    if "phone" not in cols:
+        sync_conn.execute(text("ALTER TABLE users ADD COLUMN phone VARCHAR(20)"))
+    # 唯一索引单独处理：存量列已存在但索引缺失（手工加过列的库）时也要补上。
+    # 索引名与 ORM 的 index=True 生成的一致（ix_users_phone），新库与升级库结构相同。
+    indexes = {i["name"] for i in inspector.get_indexes("users") if i.get("unique")}
+    if "ix_users_phone" not in indexes:
+        # 建唯一索引前先扫重：存量全 NULL 不会冲突，但手工绑过手机号的库可能有重复
+        dup = sync_conn.execute(
+            text(
+                "SELECT phone, COUNT(*) AS c FROM users "
+                "WHERE phone IS NOT NULL GROUP BY phone HAVING c > 1"
+            )
+        ).fetchall()
+        if dup:
+            logger.warning(
+                "users.phone has %d duplicate value(s); unique index skipped", len(dup)
+            )
+        elif dialect == "mysql":
+            sync_conn.execute(text("CREATE UNIQUE INDEX ix_users_phone ON users (phone)"))
+        else:
+            sync_conn.execute(
+                text("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_phone ON users (phone)")
+            )
+    if "phone_verified" not in cols:
+        col_type = (
+            "TINYINT(1) NOT NULL DEFAULT 0" if dialect == "mysql"
+            else "BOOLEAN NOT NULL DEFAULT 0"
+        )
+        sync_conn.execute(text(f"ALTER TABLE users ADD COLUMN phone_verified {col_type}"))
+
+
 def _migrate_user_rbac_columns(sync_conn) -> None:
     """users.token_version / display_name：会话吊销版本号与显示名。"""
     inspector = inspect(sync_conn)
@@ -471,6 +515,7 @@ async def init_db() -> None:
         await conn.run_sync(_migrate_node_trend_json)
         await conn.run_sync(_migrate_node_client_version)
         await conn.run_sync(_migrate_user_rbac_columns)
+        await conn.run_sync(_migrate_user_phone)
         await conn.run_sync(_migrate_owner_columns)
         await conn.run_sync(_migrate_strategy_config_version)
         await conn.run_sync(_migrate_group_dispatch_add_counts)
