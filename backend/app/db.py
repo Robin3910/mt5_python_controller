@@ -449,6 +449,25 @@ def _migrate_group_dispatch_add_counts(sync_conn) -> None:
     )
 
 
+def _migrate_group_dispatch_add_progress(sync_conn) -> None:
+    """group_task_dispatch.add_progress_json：各规则的加仓进度。
+
+    节点上报里已经带了 add_progress（当前第几批 / 还能再加几笔 / 下一批参数），
+    存 JSON 是因为规则类型是动态键（"1" / "2"）。
+    """
+    inspector = inspect(sync_conn)
+    if "group_task_dispatch" not in inspector.get_table_names():
+        return
+    cols = {c["name"] for c in inspector.get_columns("group_task_dispatch")}
+    if "add_progress_json" in cols:
+        return
+    dialect = sync_conn.engine.dialect.name
+    json_type = "JSON" if dialect == "mysql" else "TEXT"
+    sync_conn.execute(
+        text(f"ALTER TABLE group_task_dispatch ADD COLUMN add_progress_json {json_type}")
+    )
+
+
 async def init_db() -> None:
     """不存在则建表。生产环境建议改用 Alembic 迁移而非 create_all。"""
     async with engine.begin() as conn:
@@ -474,6 +493,7 @@ async def init_db() -> None:
         await conn.run_sync(_migrate_owner_columns)
         await conn.run_sync(_migrate_strategy_config_version)
         await conn.run_sync(_migrate_group_dispatch_add_counts)
+        await conn.run_sync(_migrate_group_dispatch_add_progress)
         await conn.run_sync(_migrate_dashboard_columns)
         await conn.run_sync(_migrate_node_credentials)
         await conn.run_sync(_migrate_node_primary)

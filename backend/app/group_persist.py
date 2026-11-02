@@ -300,7 +300,7 @@ async def rewrite_running_strategy_snapshots(
 
 
 async def running_strategy_subtasks(strategy_id: str) -> list[dict]:
-    """该策略下所有非终态子任务（预检要逐个问节点）。"""
+    """该策略下所有非终态子任务（按任务查在跑节点用）。"""
     sid = str(strategy_id or "").strip()
     if not sid:
         return []
@@ -364,6 +364,7 @@ async def strategy_runtime_hints(strategy_id: str) -> dict:
       "manual_fired":      已开过手动分散仓的规则类型,
       "manual_state":      {规则类型: 手动单生命周期}（none/pending/filled/void）,
       "manual_off_reason": {规则类型: 挂单被撤销的原因},
+      "add_progress":      {规则类型: 加仓进度}（当前第几批 / 还能再加几笔）,
       "nodes_offline":     在跑但节点不在线的子任务数,
     }
 
@@ -377,6 +378,7 @@ async def strategy_runtime_hints(strategy_id: str) -> dict:
         "manual_fired": [],
         "manual_state": {},
         "manual_off_reason": {},
+        "add_progress": {},
         "nodes_offline": 0,
     }
     if not sid:
@@ -403,6 +405,7 @@ async def strategy_runtime_hints(strategy_id: str) -> dict:
             manual_fired: set[int] = set()
             manual_state: dict[int, str] = {}
             manual_off_reason: dict[int, str] = {}
+            add_progress: dict[str, dict] = {}
             offline = 0
             for dispatch, _task in rows:
                 counts = dispatch.add_counts_json
@@ -414,6 +417,25 @@ async def strategy_runtime_hints(strategy_id: str) -> dict:
                         prev = max_added.get(str(key), 0)
                         if n > prev:
                             max_added[str(key)] = n
+                # 加仓进度：多个节点各加各的，取「已加笔数最多的那个节点」为准
+                progress = dispatch.add_progress_json
+                if isinstance(progress, dict):
+                    for key, value in progress.items():
+                        if not isinstance(value, dict):
+                            continue
+                        cur = add_progress.get(str(key))
+                        if cur is None:
+                            add_progress[str(key)] = dict(value)
+                            continue
+                        added_now = _int_or_none(value.get("added")) or 0
+                        added_prev = _int_or_none(cur.get("added")) or 0
+                        if added_now > added_prev:
+                            add_progress[str(key)] = dict(value)
+                        else:
+                            # 已加笔数相同时取更新的上限（配置是全局的，取最新即可）
+                            for field in ("limit", "remaining", "closed"):
+                                if field in value:
+                                    cur[field] = value[field]
                 runtime = dispatch.runtime_json
                 if isinstance(runtime, dict):
                     for item in runtime.get("manual_fired") or []:
@@ -433,6 +455,7 @@ async def strategy_runtime_hints(strategy_id: str) -> dict:
                 "manual_off_reason": {
                     str(k): v for k, v in sorted(manual_off_reason.items())
                 },
+                "add_progress": add_progress,
                 "nodes_offline": offline,
             }
     except Exception as e:  # noqa: BLE001
@@ -946,6 +969,14 @@ async def record_strategy_progress(
                     str(int(k)): int(v) for k, v in add_counts.items()
                     if _num(v) is not None
                 }
+            # 加仓进度（当前第几批 / 还能再加几笔 / 下一批参数）：
+            # 前端展示「加到第几批第几仓」的唯一来源
+            add_progress = data.get("add_progress")
+            if isinstance(add_progress, dict) and add_progress:
+                row.add_progress_json = {
+                    str(k): v for k, v in add_progress.items()
+                    if isinstance(v, dict)
+                }
             if _num(data.get("total_orders")) is not None:
                 row.total_orders = int(data["total_orders"])
             if _num(data.get("total_volume")) is not None:
@@ -1056,6 +1087,9 @@ async def record_strategy_update_ack(
                         "result": result,
                         "config_version": config_version,
                         "fields": fields,
+                        # 加仓进度：用户刚改完配置就能看到「加到第几批、还能再加几笔」
+                        "progress": data.get("progress")
+                        if isinstance(data.get("progress"), dict) else {},
                     },
                 )
             )

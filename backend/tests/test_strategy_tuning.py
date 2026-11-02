@@ -96,6 +96,91 @@ def test_snapshot_config_version_defaults_to_zero():
 
 
 # ----------------------------------------------------------------------
+# 档位自动补齐
+# ----------------------------------------------------------------------
+def _batched_rule(levels: list[dict], limit: int = 5) -> dict:
+    return _rule(batch_enabled=True, batch_count=len(levels),
+                 total_lot_limit=limit, batch_levels=levels)
+
+
+def test_snapshot_pads_levels_to_cover_limit():
+    """档位只覆盖 1~3、上限 5 → 快照里补到 5，参数沿用最后一档。"""
+    from app import group_rules
+
+    levels = [
+        {"pos_from": 1, "pos_to": 3, "calc_type": "point", "point": 100,
+         "lot_times": 1.1, "extra_lot": 0},
+        {"pos_from": 4, "pos_to": 4, "calc_type": "point", "point": 200,
+         "lot_times": 1.2, "extra_lot": 0},
+    ]
+    snap = group_rules.strategy_rules_snapshot({
+        "strategy_id": "s1", "name": "n", "symbol": "XAUUSD",
+        "template_id": TEMPLATE_1_ID, "rules": [_batched_rule(levels, limit=6)],
+    })
+    out = snap["rules"][0]["batch_levels"]
+    covered = max(int(lv["pos_to"]) for lv in out)
+    assert covered >= 6, "档位必须覆盖到上限"
+    # 补出来的档沿用最后一档的参数
+    last = out[-1]
+    assert last["point"] == 200
+    assert last["lot_times"] == 1.2
+
+
+def test_snapshot_pads_gap_between_levels():
+    """档位中间有洞 → 补齐后连续无洞。"""
+    from app import group_rules
+
+    levels = [
+        {"pos_from": 1, "pos_to": 2, "calc_type": "point", "point": 100,
+         "lot_times": 1.1, "extra_lot": 0},
+        {"pos_from": 5, "pos_to": 6, "calc_type": "point", "point": 300,
+         "lot_times": 1.3, "extra_lot": 0},
+    ]
+    snap = group_rules.strategy_rules_snapshot({
+        "strategy_id": "s1", "name": "n", "symbol": "XAUUSD",
+        "template_id": TEMPLATE_1_ID, "rules": [_batched_rule(levels, limit=6)],
+    })
+    out = snap["rules"][0]["batch_levels"]
+    # 从 1 开始连续覆盖到 6
+    cursor = 1
+    for lv in sorted(out, key=lambda x: int(x["pos_from"])):
+        assert int(lv["pos_from"]) <= cursor, f"档位 {lv} 之前有洞"
+        cursor = max(cursor, int(lv["pos_to"]) + 1)
+    assert cursor >= 7
+
+
+def test_snapshot_does_not_pad_when_limit_unlimited():
+    """上限 0（不限）→ 不往上补档。"""
+    from app import group_rules
+
+    levels = [
+        {"pos_from": 1, "pos_to": 3, "calc_type": "point", "point": 100,
+         "lot_times": 1.1, "extra_lot": 0},
+    ]
+    snap = group_rules.strategy_rules_snapshot({
+        "strategy_id": "s1", "name": "n", "symbol": "XAUUSD",
+        "template_id": TEMPLATE_1_ID, "rules": [_batched_rule(levels, limit=0)],
+    })
+    assert len(snap["rules"][0]["batch_levels"]) == 1
+
+
+def test_snapshot_does_not_mutate_source_rule():
+    """补档不能污染原始规则对象（快照是另一次下发用的）。"""
+    from app import group_rules
+
+    levels = [
+        {"pos_from": 1, "pos_to": 3, "calc_type": "point", "point": 100,
+         "lot_times": 1.1, "extra_lot": 0},
+    ]
+    rule = _batched_rule(levels, limit=6)
+    group_rules.strategy_rules_snapshot({
+        "strategy_id": "s1", "name": "n", "symbol": "XAUUSD",
+        "template_id": TEMPLATE_1_ID, "rules": [rule],
+    })
+    assert len(rule["batch_levels"]) == 1, "原始规则不该被补档改写"
+
+
+# ----------------------------------------------------------------------
 # runtime_hints
 # ----------------------------------------------------------------------
 def test_get_strategy_returns_runtime_hints(client):
@@ -115,13 +200,18 @@ def test_get_strategy_returns_runtime_hints(client):
     assert hints["running_task_count"] == 0
     assert hints["max_added_by_rule"] == {}
     assert hints["manual_fired"] == []
+    assert hints["add_progress"] == {}, "没有在跑任务时进度为空"
 
 
 # ----------------------------------------------------------------------
-# 上限下限校验（后端兜底）
+# 上限字段：配置无条件热推，保存路径上不再拦截
 # ----------------------------------------------------------------------
-def test_limit_below_added_is_rejected(client, monkeypatch):
-    """已开 3 笔时把上限改成 2 → 400 拒绝。"""
+def test_limit_below_added_is_accepted(client, monkeypatch):
+    """已开 3 笔时把上限改成 2 → 仍然 200 保存。
+
+    上限低于已开笔数不再阻止保存：字段值一律采纳并热推到节点，
+    「还加不加」由节点自己按已开笔数决定。
+    """
     h = auth_headers(client)
     created = client.post(
         "/api/strategies",
@@ -149,13 +239,10 @@ def test_limit_below_added_is_rejected(client, monkeypatch):
         json={"rules": [_rule(total_lot_limit=2)]},
         headers=h,
     )
-    assert r.status_code == 400, r.text
-    detail = r.json()["detail"]
-    assert detail["error"] == "limit_below_added"
-    assert detail["blocks"][0]["rule_type"] == 1
-    assert detail["blocks"][0]["added"] == 3
-    assert detail["blocks"][0]["limit"] == 2
-    assert "低于已开笔数" in detail["message"]
+    assert r.status_code == 200, r.text
+    # 新值真的落库了（不是保留旧值）
+    assert r.json()["rules"][0]["total_lot_limit"] == 2
+    assert r.json()["config_version"] == 2
 
 
 def test_limit_equal_to_added_is_allowed(client, monkeypatch):
@@ -222,7 +309,7 @@ def test_limit_expansion_is_allowed(client, monkeypatch):
 
 
 def test_limit_check_is_per_rule(client, monkeypatch):
-    """按规则独立校验：逆势超限被拒，顺势可以改。"""
+    """按规则独立生效：逆势超限照常保存（节点自己决定不再加），顺势也不受影响。"""
     h = auth_headers(client)
     created = client.post(
         "/api/strategies",
@@ -245,14 +332,14 @@ def test_limit_check_is_per_rule(client, monkeypatch):
 
     monkeypatch.setattr(group_persist, "strategy_runtime_hints", fake_hints)
 
-    # 逆势改成 2（低于已开 3）→ 拒
+    # 逆势改成 2（低于已开 3）→ 照常保存
     r = client.patch(
         f"/api/strategies/{created['strategy_id']}",
         json={"rules": [_rule(1, total_lot_limit=2), _rule(2, total_lot_limit=5)]},
         headers=h,
     )
-    assert r.status_code == 400
-    assert r.json()["detail"]["blocks"][0]["rule_type"] == 1
+    assert r.status_code == 200, r.text
+    assert r.json()["rules"][0]["total_lot_limit"] == 2
 
     # 只改顺势 → 放行
     r = client.patch(

@@ -39,7 +39,6 @@ import signal_pl
 from market_hub import GONE, STALE, WAKE, MarketEvent, MarketHub, Subscription
 from risk_sizing import EntryPlan, RiskSizedConfig, SymbolSpec
 import close_reason
-import strategy_precheck
 import strategy_reconcile
 from strategy_rules import (
     CALC_BAR_TYPES,
@@ -107,6 +106,42 @@ def _as_float(value: object, default: float = 0.0) -> float:
         return float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return default
+
+
+def _as_int(value: object, default: int = 0) -> int:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def _level_at(levels: list[dict], position_no: int) -> Optional[tuple[dict, int]]:
+    """找出覆盖「第 position_no 次加仓」的档位；没覆盖则回退到最接近的档位。
+
+    回退规则与节点侧的判定一致（见 strategy_rules.pick_batch_level）：
+    - 在所有档位之后 → 沿用最后一档
+    - 落在两档之间的洞里 → 沿用洞前面那一档
+    - 在第一档之前 → 没有档位（用户把起点设在 2 就是说前面不加）
+    """
+    if not levels:
+        return None
+    for idx, level in enumerate(levels):
+        lo = _as_int(level.get("pos_from"), 0)
+        hi = _as_int(level.get("pos_to"), 0)
+        if lo <= position_no <= hi:
+            return level, idx
+    first_from = _as_int(levels[0].get("pos_from"), 0)
+    if position_no < first_from:
+        return None
+    prev_idx = -1
+    for idx, level in enumerate(levels):
+        if _as_int(level.get("pos_from"), 0) <= position_no:
+            prev_idx = idx
+        else:
+            break
+    if prev_idx < 0:
+        prev_idx = 0
+    return levels[prev_idx], prev_idx
 
 
 def _deep_copy_snapshot(snapshot: dict) -> dict:
@@ -207,6 +242,9 @@ class StrategyRunner:
         self._counter_seen: set[int] = set()
         self._counter_skip_fills = 0
         self._counter_resync = False
+        # 热推后需要立刻做一次「加仓对齐检查」：扩容时不等价格触发就续挂下一档，
+        # 缩容时立刻撤掉在途限价单。对齐完成后清掉这个标记。
+        self._add_align_pending = False
         self.total_orders = 0
         self.total_volume = 0.0
         self._opened = False
@@ -537,6 +575,9 @@ class StrategyRunner:
         self._metric_specs = None
         self._live_specs = None
         self._counter_resync = True
+        # 热推后立刻做一次加仓对齐：扩容时不等价格触发就续挂下一档逆势限价，
+        # 顺势也按新参数立刻判一次。缩容时对齐会把在途限价单撤掉。
+        self._add_align_pending = True
         # 手动单可能在盘上：热推改了参数就撤旧单重算重挂（下一拍执行，
         # 那时才有真实持仓可用来反推手数）
         self._manual_resync = True
@@ -565,6 +606,9 @@ class StrategyRunner:
                 "config_version": config_version,
                 "result": result,
                 "fields": fields,
+                # 顺带带上加仓进度：用户刚改完配置就能在回执里看到
+                # 「现在第几批、还能再加几笔」
+                "progress": self._add_progress(),
             },
         }
         try:
@@ -577,76 +621,6 @@ class StrategyRunner:
                 self.task_id, result,
                 "; ".join(str(f.get("message") or "") for f in fields),
             )
-
-    async def precheck_strategy(self, snapshot: dict) -> dict:
-        """预检一份新快照：只算不改，返回会不会被拒。
-
-        用于服务端在 PATCH 落库前问节点一句「这么改行不行」——
-        SL/TP 是否已经越过现价、上限是否低于已开笔数、手动仓是否已锁死。
-
-        返回 {"ok": bool, "blocks": [...], "message": str}
-        """
-        snap = dict(snapshot) if isinstance(snapshot, dict) else {}
-        rules = [r for r in (snap.get("rules") or []) if isinstance(r, dict)]
-        blocks: list[dict] = []
-
-        # 1) 上限低于已开笔数
-        blocks.extend(strategy_precheck.check_limit_below_added(
-            rules, added_by_rule=dict(self.add_counts),
-        ))
-
-        # 2) 手动分散仓已成交 → 整块锁定（挂单在盘上的还能改）
-        blocks.extend(strategy_precheck.check_manual_locked(
-            rules, manual_locked=self._manual_locked_rule_types(),
-        ))
-
-        # 3) 档位区间锚定：已开过的区间不能被改乱
-        blocks.extend(strategy_precheck.check_batch_anchor(
-            rules, added_by_rule=dict(self.add_counts),
-        ))
-
-        # 4) SL/TP 越过现价
-        crossed = await self._precheck_sltp_crossed(rules)
-        blocks.extend(crossed)
-
-        return {
-            "ok": not blocks,
-            "blocks": blocks,
-            "message": strategy_precheck.summarize(blocks),
-        }
-
-    async def _precheck_sltp_crossed(self, rules: list[dict]) -> list[dict]:
-        """用新规则重算 SL/TP，检查现价是否已经越过。
-
-        拿不到持仓 / 合约规格 / 现价时放行——预检是加分项，
-        拿不到数据不该把合法的保存请求也拦下来。
-        """
-        if not rules:
-            return []
-        positions = await self._magic_positions()
-        if not positions:
-            return []
-        spec = await self._manual_symbol_spec()
-        if spec is None:
-            return []
-        balance = await self._read_balance()
-        event = self._last_market
-        market = _as_float(event.price) if event is not None else 0.0
-        if market <= 0:
-            return []
-        return strategy_precheck.check_sltp_crossed(
-            positions,
-            rules=rules,
-            tick_size=_as_float(spec.get("tick_size")),
-            tick_value=_as_float(spec.get("tick_value")),
-            digits=int(spec.get("digits") or 0),
-            balance=balance,
-            bid=_as_float(event.bid),
-            ask=_as_float(event.ask),
-            fallback_price=market,
-            # 手动止盈权威在场时节点不写共同止盈，预检只查止损那一侧
-            manual_authority=self._manual_authority_tp() is not None,
-        )
 
     def apply_smc(self, smc: dict) -> bool:
         """整体替换本任务的 SMC 价位副本。已用记录不随副本清空。"""
@@ -772,6 +746,13 @@ class StrategyRunner:
                 await self._sync_counter_limit(
                     self._last_market, list(self._last_market.positions),
                 )
+                # 扩容后不等价格触发：立刻按新配置对齐一次加仓。
+                # 行情静止时（周末 / 挂单等成交）没有新 tick，等下一口价才对齐
+                # 会让用户以为配置没生效。
+                if self._add_align_pending:
+                    await self._align_adds_after_update(
+                        self._last_market, list(self._last_market.positions),
+                    )
                 return False
             else:
                 return False
@@ -894,6 +875,10 @@ class StrategyRunner:
             await self._sync_counter_limit(event, positions, metrics, lives)
             if opened_manual:
                 return False
+            # 热推后的加仓对齐：扩容时立刻续挂下一档，缩容时立刻撤掉在途限价单。
+            # 放在最后：顺势刚加过仓时，对齐再判一次会重复加。
+            if self._add_align_pending:
+                await self._align_adds_after_update(event, positions)
             if report_due:
                 await self._emit_progress("heartbeat", phase="running", positions=positions)
             return False
@@ -2149,6 +2134,62 @@ class StrategyRunner:
         if self.add_counts.get(RULE_TYPE_COUNTER, 0) > before:
             self._counter_skip_fills += 1
 
+    async def _align_adds_after_update(
+        self, event: MarketEvent, positions: list[dict],
+    ) -> None:
+        """热推后立刻做一次加仓对齐。
+
+        为什么不等价格触发：热推可能把「不该加」变成「还能加」（扩容），
+        也可能把「还能加」变成「不该加」（缩容）。等下一次价格走到阈值才生效，
+        用户会以为配置没生效；更糟的是逆势那一档限价单**已经在盘上**，
+        不重算就会按旧参数成交。
+
+        对齐做的事：
+        - 顺势：按新参数立刻判一次市价加仓（偏离够就立刻加）
+        - 逆势：重算下一档限价（撤旧改单 / 撤掉挂新的）
+        """
+        self._add_align_pending = False
+        filtered = manual_scatter.exclude_manual(positions)
+        if not filtered:
+            return
+        metrics, lives = await self._read_bars()
+        ctx = self._ctx(event, filtered)
+        ctx.bar_metrics = metrics
+        ctx.bar_live = lives
+        open_types = self._open_rule_types()
+        if RULE_TYPE_TREND in open_types:
+            decision = evaluate(
+                self._rules or [], ctx, rule_types=(RULE_TYPE_TREND,),
+            )
+            if decision is not None:
+                await self._add_position(decision, positions)
+        # 逆势：重新算下一档限价（没算出来就撤掉在途的那张）
+        await self._sync_counter_limit(event, positions, metrics, lives)
+
+    def _counter_no_next_reason(self, ctx) -> str:
+        """逆势算不出下一档时的撤单原因。
+
+        区分两种情形，用户看到的意义完全不同：
+        - 上限已低于已开笔数（用户把上限调小了）→ 本任务不再新增批次
+        - 档位用尽 / 参数算不出 → 逆势加仓没有下一档
+        """
+        rule = self._counter_rule()
+        if rule is not None:
+            added = int(ctx.rule_add_count(RULE_TYPE_COUNTER))
+            limit = _as_int(rule.get("total_lot_limit"), 0)
+            if limit and added >= limit:
+                return (
+                    f"上限 {limit} 笔 ≤ 已开 {added} 笔，本任务不再新增批次"
+                )
+        return "逆势加仓没有下一档"
+
+    def _counter_rule(self) -> Optional[dict]:
+        """本任务的逆势规则（生效快照里的 type=1 那条）。"""
+        for rule in self._rules or []:
+            if isinstance(rule, dict) and int(rule.get("type") or 0) == RULE_TYPE_COUNTER:
+                return rule
+        return None
+
     async def _sync_counter_limit(
         self, event: MarketEvent, positions: list[dict],
         bar_metrics: Optional[dict] = None,
@@ -2190,7 +2231,9 @@ class StrategyRunner:
         digits = int((spec or {}).get("digits") or 0)
         plan = plan_counter_limit(self._rules or [], ctx, digits=digits)
         if plan is None:
-            await self._cancel_counter_orders(resting, book, reason="逆势加仓没有下一档")
+            await self._cancel_counter_orders(
+                resting, book, reason=self._counter_no_next_reason(ctx),
+            )
             return
         block = await self._counter_price_block(plan)
         if block == "unavailable":
@@ -4157,6 +4200,58 @@ class StrategyRunner:
     # ------------------------------------------------------------------
     # 上报
     # ------------------------------------------------------------------
+    def _add_progress(self) -> dict:
+        """各规则的加仓进度：加到第几批、还能再加几笔、下一批参数是多少。
+
+        用户在后台最想知道的就这三件事：「还剩多少额度」「现在第几批」
+        「下一批按什么参数加」。加仓笔数（add_counts）只回答了第一件的一半，
+        档位序号和下一批参数一直没有对外暴露。
+
+        键是规则类型字符串（"1" 逆势 / "2" 顺势），与服务端 runtime_hints 一致。
+        """
+        out: dict[str, dict] = {}
+        for rule in self._rules or []:
+            if not isinstance(rule, dict):
+                continue
+            rule_type = int(rule.get("type") or 0)
+            if rule_type not in (RULE_TYPE_COUNTER, RULE_TYPE_TREND):
+                continue
+            added = int(self.add_counts.get(rule_type, 0))
+            limit = _as_int(rule.get("total_lot_limit"), 0)
+            levels = [
+                lv for lv in (rule.get("batch_levels") or []) if isinstance(lv, dict)
+            ]
+            item: dict = {
+                "added": added,
+                "limit": limit,
+                # limit == 0 表示不限，用 -1 表示「不限」，不能写 0（会误导成不能再加）
+                "remaining": (limit - added) if limit else -1,
+                "closed": rule_type in self._closed_rule_types(),
+                "current_level_index": -1,
+                "current_level_range": [],
+                "next_level_index": -1,
+                "next_level_range": [],
+                "next_gap_points": 0.0,
+                "next_volume": 0.0,
+            }
+            if levels:
+                cur = _level_at(levels, added) if added > 0 else None
+                nxt = _level_at(levels, added + 1)
+                if cur is not None:
+                    item["current_level_index"] = cur[1]
+                    item["current_level_range"] = [cur[0].get("pos_from"), cur[0].get("pos_to")]
+                if nxt is not None:
+                    item["next_level_index"] = nxt[1]
+                    item["next_level_range"] = [nxt[0].get("pos_from"), nxt[0].get("pos_to")]
+                    item["next_gap_points"] = _as_float(nxt[0].get("point"), 0.0)
+                    lot_times = _as_float(nxt[0].get("lot_times"), 1.0)
+                    extra_lot = _as_float(nxt[0].get("extra_lot"), 0.0)
+                    item["next_volume"] = round(
+                        lot_times * self.base_volume + extra_lot, 2,
+                    )
+            out[str(rule_type)] = item
+        return out
+
     def _snapshot(self, positions: Optional[list[dict]] = None) -> dict:
         pos = positions or []
         profit = round(sum(_as_float(p.get("profit")) for p in pos), 2)
@@ -4168,6 +4263,7 @@ class StrategyRunner:
             "pending_orders": self._pending_orders,
             "add_count": self.add_count,
             "add_counts": dict(self.add_counts),
+            "add_progress": self._add_progress(),
             "total_orders": self.total_orders,
             "total_volume": round(self.total_volume, 4),
             "profit": profit,

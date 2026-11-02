@@ -161,7 +161,8 @@ def test_pick_batch_level_by_next_position_no():
     assert pick_batch_level(rule, 1)[1] == 0
     assert pick_batch_level(rule, 5)[1] == 1
     assert pick_batch_level(rule, 10)[1] == 2
-    assert pick_batch_level(rule, 11)[1] is None
+    # 超出所有档位 → 兜底沿用最后一档（不再返回 None）
+    assert pick_batch_level(rule, 11)[1] == 2
 
 
 def test_batch_level_params_apply_per_tier():
@@ -190,10 +191,32 @@ def test_total_lot_limit_caps_this_rule_adds():
     assert evaluate_rule(rule, ctx(add_count=9, price=2390.0)) is None
 
 
-def test_batch_enabled_but_out_of_levels_does_not_fallback():
-    """开了分批却超出所有档位区间时不应回落到基础参数继续加。"""
+def test_batch_enabled_but_out_of_levels_falls_back_to_last_level():
+    """档位没覆盖下一次加仓 → 沿用最后一档继续加，不静默卡死。
+
+    旧行为是 return None：用户以为「不限次数」，实际第 10 次之后永远不加。
+    现在沿用最后一档的参数（300 点 / 1.3 倍），并在决策里标记 level_fallback。
+    """
     rule = batched_counter_rule(total_lot_limit=0)
-    assert evaluate_rule(rule, ctx(add_count=10, price=2390.0)) is None
+    d = evaluate_rule(rule, ctx(add_count=10, price=2390.0))
+    assert d is not None, "档位未覆盖时不应静默卡死"
+    assert d.level_index == 2, "应沿用最后一档"
+    assert d.volume == 0.13
+    assert d.level_fallback is True
+
+
+def test_batch_level_not_covered_still_honors_limit():
+    """兜底沿用最后一档不能绕过上限：缩容后仍然不再加仓。"""
+    rule = batched_counter_rule(total_lot_limit=5)
+    assert evaluate_rule(rule, ctx(add_count=5, price=2390.0)) is None
+    assert evaluate_rule(rule, ctx(add_count=4, price=2390.0)) is not None
+
+
+def test_batch_level_covered_is_not_marked_fallback():
+    """正常命中档位时不该带兜底标记。"""
+    rule = batched_counter_rule()
+    d = evaluate_rule(rule, ctx(position_count=1, add_count=0, price=2399.0))
+    assert d.level_fallback is False
 
 
 def test_batch_action_can_differ_from_base_action():

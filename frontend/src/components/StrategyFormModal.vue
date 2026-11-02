@@ -102,6 +102,14 @@ const editingTemplateName = ref('')
 const saving = ref(false)
 const formError = ref('')
 /**
+ * 保存前的**提醒**（不阻止保存）。
+ *
+ * 配置无条件热推：字段值一律采纳用户填的值，「加不加 / 怎么加」由节点
+ * 自身状态决定。所以「上限低于已开笔数」这类情况不再是错误，只是一条
+ * 提醒——告诉用户保存后会怎样，但拦不住他。
+ */
+const formWarnings = ref<string[]>([])
+/**
  * 运行态提示（编辑态从详情接口取）：在跑任务的已开笔数、手动仓是否已开。
  * 用来在保存前拦下「上限低于已开笔数」这类非法修改，并把锁定区标出来。
  */
@@ -287,7 +295,32 @@ const runtimeBanner = computed<{ title: string; lines: string[] } | null>(() => 
   }
   for (const [ruleType, added] of Object.entries(addedByRule.value)) {
     const label = RULE_TYPE_LABEL[Number(ruleType)] || `类型${ruleType}`
-    lines.push(`${label}已开 ${added} 笔，「最多加仓笔数」不能低于 ${added}。`)
+    lines.push(
+      `${label}已开 ${added} 笔：把「最多加仓笔数」改到 ${added} 以下也可以保存，` +
+        '保存后本任务不再新增批次，现有仓位继续由止盈止损管理。',
+    )
+  }
+  // 加仓进度：加到第几批、还能再加几笔、下一批按什么参数加
+  const progress = hints.add_progress || {}
+  for (const [ruleType, p] of Object.entries(progress)) {
+    const label = RULE_TYPE_LABEL[Number(ruleType)] || `类型${ruleType}`
+    const added = Number(p.added || 0)
+    const limit = Number(p.limit || 0)
+    const remaining = Number(p.remaining ?? -1)
+    const curIdx = Number(p.current_level_index ?? -1)
+    const nextIdx = Number(p.next_level_index ?? -1)
+    const nextGap = Number(p.next_gap_points || 0)
+    const nextVol = Number(p.next_volume || 0)
+    const parts: string[] = []
+    parts.push(limit > 0 ? `已加 ${added} / ${limit} 笔` : `已加 ${added} 笔（不限次数）`)
+    if (curIdx >= 0) parts.push(`当前第 ${curIdx + 1} 批`)
+    if (remaining === -1) parts.push('还能继续加')
+    else if (remaining > 0) parts.push(`还能再加 ${remaining} 笔`)
+    else parts.push('已到上限，不再新增批次')
+    if (nextIdx >= 0) {
+      parts.push(`下一批 ${nextGap} 点 × ${nextVol} 手`)
+    }
+    lines.push(`${label}加仓进度：${parts.join('，')}。`)
   }
   const fired = hints.manual_fired || []
   if (fired.length) {
@@ -1054,11 +1087,43 @@ function onBatchMetaChange(r: EditableRule): void {
 
 /**
  * 当前该用哪种档位编辑模式。
- * 有在跑任务时一律 append——重新均分会改变后续加仓命中的档位参数，
- * 等于在运行中偷偷改了策略。空闲时 redistribute 更顺手。
+ *
+ * 原来是「有在跑任务时一律 append」（重新均分会改变后续加仓命中的档位参数，
+ * 等于在运行中偷偷改了策略）。现在配置无条件热推，均分出来的参数一样会生效，
+ * 所以两种模式都放开——但界面上要说明均分的影响，让用户自己选。
  */
 function batchEditMode(): BatchEditMode {
-  return hasRunningTask.value ? 'append' : 'redistribute'
+  return 'redistribute'
+}
+
+/**
+ * 档位区间没覆盖到新的加仓笔数上限时，自动在末尾补档。
+ *
+ * 补出来的参数沿用最后一档——用户扩容时最常见的意图就是「照着上一档继续加」。
+ * 服务端下发快照时也会做同样的补齐，这里的补是为了让界面上看到的就是最终会下发的。
+ */
+function ensureBatchCoverage(r: EditableRule): boolean {
+  if (!r.batch_enabled) return false
+  const limit = Math.floor(Number(r.total_lot_limit) || 0)
+  if (limit <= 0) return false
+  const levels = r.batch_levels
+  if (!levels.length) return false
+  const last = levels[levels.length - 1]
+  const covered = Math.max(
+    ...levels.map((lv) => Math.max(1, Math.floor(Number(lv.pos_to) || 1))),
+  )
+  if (covered >= limit) return false
+  // 末尾补档：沿用最后一档的参数，区间接续
+  const cursor = Math.max(covered + 1, 1)
+  for (let pos = cursor; pos <= limit; pos++) {
+    levels.push({
+      ...last,
+      pos_from: pos,
+      pos_to: pos,
+    })
+  }
+  r.batch_count = levels.length
+  return true
 }
 
 function syncBatchMetaFromLevels(r: EditableRule): void {
@@ -1678,15 +1743,6 @@ function validateRules(rules: EditableRule[]): string | null {
     if (r.lot_times < 0) return `${label}：倍数不能为负`
     if (r.extra_lot < 0) return `${label}：手数不能为负`
     if (r.max_allow_num < 0) return `${label}：次数不能为负`
-    // 上限不能低于该规则已开笔数：缩容只能缩减剩余额度，不能砍掉已开的仓。
-    // （后端 PATCH 会再兜底一次，这里是为了当场拦下，不让用户白等一次请求。）
-    const floor = limitFloor(r.type)
-    if (floor > 0) {
-      const limit = Math.floor(Number(r.total_lot_limit) || 0)
-      if (limit > 0 && limit < floor) {
-        return `${label}：已开 ${floor} 笔，最多加仓笔数不能低于已开笔数，请填写 ≥ ${floor} 的值`
-      }
-    }
     const ms = r.manual_scatter
     if (ms?.enabled) {
       if (!(ms.entry_price > 0) || !(ms.take_profit > 0)) {
@@ -1799,6 +1855,45 @@ interface PreparedStrategy {
   rules: StrategyRule[]
 }
 
+/**
+ * 收集保存前的提醒（不阻止保存）。
+ *
+ * 配置无条件热推之后，这些情况不再是「非法修改」，只是「保存后会发生什么」：
+ * - 上限低于已开笔数 → 本任务不再新增批次，现有仓位继续由止盈止损管理
+ * - 档位没覆盖到新的上限 → 自动补档（沿用最后一档参数）
+ * - 重切了档位 → 后续加仓命中的参数会变，已开仓位不受影响
+ */
+function collectWarnings(rules: EditableRule[]): string[] {
+  const out: string[] = []
+  for (const r of rules) {
+    const label = RULE_TYPE_LABEL[r.type] || `类型${r.type}`
+    if (isRiskSized(r) || isGrid(r)) continue
+    const floor = limitFloor(r.type)
+    const limit = Math.floor(Number(r.total_lot_limit) || 0)
+    if (floor > 0 && limit > 0 && limit < floor) {
+      out.push(
+        `${label}：已开 ${floor} 笔，新上限 ${limit} 笔低于已开笔数；` +
+          '保存后本任务不再新增批次，现有仓位继续由止盈止损管理（不平仓）。',
+      )
+    }
+    if (r.batch_enabled) {
+      const levels = r.batch_levels || []
+      if (levels.length && limit > 0) {
+        const covered = Math.max(
+          ...levels.map((lv) => Math.max(1, Math.floor(Number(lv.pos_to) || 1))),
+        )
+        if (covered < limit) {
+          out.push(
+            `${label}：档位只覆盖到第 ${covered} 次加仓，新上限 ${limit} 笔；` +
+              '已自动补档（沿用最后一档的参数），保存后节点会按补出来的档位继续加。',
+          )
+        }
+      }
+    }
+  }
+  return out
+}
+
 function prepareStrategy(): PreparedStrategy | null {
   if (!form.template_id) {
     showSaveError('请选择策略模版')
@@ -1822,6 +1917,12 @@ function prepareStrategy(): PreparedStrategy | null {
     showSaveError(rulesErr)
     return null
   }
+  // 档位没覆盖到新的上限 → 自动补档（不阻止保存，补完让用户看得见）
+  for (const r of form.rules) {
+    if (isRiskSized(r) || isGrid(r)) continue
+    ensureBatchCoverage(r)
+  }
+  formWarnings.value = collectWarnings(form.rules)
   if (isTpl1.value) {
     const plErr = validateSignalPl(signalPl)
     if (plErr) {
@@ -2796,10 +2897,14 @@ function resetRuleToTemplate(idx: number): void {
                       <p v-if="r.manual_scatter.enabled" class="muted batch-split-hint">
                         分散仓加仓笔数 {{ Math.floor(r.total_lot_limit) }} · 手动分散仓 1
                       </p>
-                      <!-- 已开笔数下限提示：上限只能缩减剩余额度，不能砍掉已开的仓 -->
+                      <!-- 已开笔数提示：上限可以改到已开笔数以下，只是那样就不再新增批次 -->
                       <p v-if="limitFloor(r.type) > 0" class="muted batch-split-hint">
-                        已开 {{ limitFloor(r.type) }} 笔，剩余额度最多再开
-                        {{ Math.max(0, Math.floor(r.total_lot_limit) - limitFloor(r.type)) }} 笔
+                        已开 {{ limitFloor(r.type) }} 笔，
+                        <template v-if="Math.floor(r.total_lot_limit) > limitFloor(r.type)">
+                          还能再开
+                          {{ Math.floor(r.total_lot_limit) - limitFloor(r.type) }} 笔
+                        </template>
+                        <template v-else>保存后本任务不再新增批次，现有仓位继续由止盈止损管理</template>
                       </p>
                     </div>
                   </div>
@@ -3253,6 +3358,14 @@ function resetRuleToTemplate(idx: number): void {
           AI 智能加仓策略需管理员授权后才能使用，当前角色未获授权
         </div>
 
+        <!-- 保存提醒：不阻止保存，只说明「保存后会发生什么」 -->
+        <div v-if="formWarnings.length" class="form-warnings" style="margin-top: 10px">
+          <p class="form-warnings-title">保存提醒</p>
+          <ul class="form-warnings-list">
+            <li v-for="(w, i) in formWarnings" :key="i">{{ w }}</li>
+          </ul>
+        </div>
+
         <!-- 运行态提示：有在跑任务时，配置改动会立刻热推到节点 -->
         <div v-if="runtimeBanner" class="runtime-banner">
           <p class="runtime-banner-title">{{ runtimeBanner.title }}</p>
@@ -3548,6 +3661,30 @@ function resetRuleToTemplate(idx: number): void {
 }
 
 .runtime-banner-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--muted, #666);
+}
+
+/* 保存提醒：不阻止保存，只说明「保存后会发生什么」 */
+.form-warnings {
+  padding: 10px 12px;
+  border: 1px solid rgba(230, 162, 60, 0.35);
+  border-left: 3px solid #e6a23c;
+  border-radius: 4px;
+  background: rgba(230, 162, 60, 0.07);
+}
+
+.form-warnings-title {
+  margin: 0 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text, inherit);
+}
+
+.form-warnings-list {
   margin: 0;
   padding-left: 18px;
   font-size: 12px;

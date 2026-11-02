@@ -5,6 +5,8 @@
 """
 import asyncio
 
+import pytest
+
 import market_hub as mh
 from mock_mt5 import MockMT5Client
 from strategy_runner import StrategyRunner, _trade_error_text
@@ -502,6 +504,98 @@ async def test_disabling_counter_rule_cancels_resting_limit():
     await _settle()
     assert mt5.pending_orders_by_magic(MAGIC) == []
     assert _progress(sent, "cnt_limit_off")
+    runner.cancel()
+
+
+async def test_hot_push_expands_limit_places_next_level_without_price_trigger():
+    """扩容后立刻续挂下一档，不等价格走到阈值。
+
+    逆势那一档限价单是**已经挂在盘上的**：扩容后如果不等下一次触发，
+    用户会以为配置没生效，而挂在盘上的那张单还会按旧参数成交。
+    """
+    sent: list = []
+    mt5 = MockMT5Client()
+    strategy = {"rules": [counter_rule(
+        batch_enabled=True, total_lot_limit=3,
+        batch_levels=[
+            {"pos_from": 1, "pos_to": 3, "calc_type": "point", "point": 100.0,
+             "lot_times": 1.0, "extra_lot": 0.0},
+        ],
+    )]}
+    runner, hub = _runner(sent, mt5=mt5, strategy=strategy)
+    runner.start()
+    await _settle()
+    open_px = mt5.positions_by_magic(MAGIC)[0]["price_open"]
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(mt5.positions_by_magic(MAGIC)),
+        price=open_px, point=0.01,
+    ))
+    await _settle()
+    assert len(mt5.pending_orders_by_magic(MAGIC)) == 1
+
+    # 节点已开到第 3 笔 → 下一档落在扩容后新增的第 2 档（间距 200 点）
+    extra = [
+        mt5.place_market_order("XAUUSD", "BUY", 0.1, comment="R1D100", magic=MAGIC)
+        for _ in range(3)
+    ]
+    # 这三笔是「历史已成交的加仓」，别让节点把它们当新成交再记一次
+    runner._counter_seen.update(int(o["order"]) for o in extra)
+    runner.add_counts[1] = 3
+
+    runner.apply_strategy({"rules": [counter_rule(
+        batch_enabled=True, total_lot_limit=5,
+        batch_levels=[
+            {"pos_from": 1, "pos_to": 3, "calc_type": "point", "point": 100.0,
+             "lot_times": 1.0, "extra_lot": 0.0},
+            {"pos_from": 4, "pos_to": 5, "calc_type": "point", "point": 200.0,
+             "lot_times": 1.0, "extra_lot": 0.0},
+        ],
+    )]})
+    await _settle()
+
+    orders = mt5.pending_orders_by_magic(MAGIC)
+    assert len(orders) == 1, "仍然只保留一张逆势限价单"
+    # 档位变了 → 挂单价跟着变（新档间距 200 点）
+    assert orders[0]["price_open"] == pytest.approx(open_px - 2.0, abs=0.02)
+    runner.cancel()
+
+
+async def test_hot_push_shrinks_limit_cancels_resting_limit():
+    """缩容到已开笔数以下：在途逆势限价单要撤掉（不再新增批次）。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    strategy = {"rules": [counter_rule(batch_enabled=True, total_lot_limit=5, batch_levels=[
+        {"pos_from": 1, "pos_to": 5, "calc_type": "point", "point": 100.0,
+         "lot_times": 1.0, "extra_lot": 0.0},
+    ])]}
+    runner, hub = _runner(sent, mt5=mt5, strategy=strategy)
+    runner.start()
+    await _settle()
+    open_px = mt5.positions_by_magic(MAGIC)[0]["price_open"]
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(mt5.positions_by_magic(MAGIC)),
+        price=open_px, point=0.01,
+    ))
+    await _settle()
+    assert len(mt5.pending_orders_by_magic(MAGIC)) == 1
+
+    # 节点已开到第 3 笔（真实持仓），上限缩到 2 → 不再新增批次
+    extra = [
+        mt5.place_market_order("XAUUSD", "BUY", 0.1, comment="R1D100", magic=MAGIC)
+        for _ in range(3)
+    ]
+    runner._counter_seen.update(int(o["order"]) for o in extra)
+    runner.add_counts[1] = 3
+    runner.apply_strategy({"rules": [counter_rule(batch_enabled=True, total_lot_limit=2, batch_levels=[
+        {"pos_from": 1, "pos_to": 2, "calc_type": "point", "point": 100.0,
+         "lot_times": 1.0, "extra_lot": 0.0},
+    ])]})
+    await _settle()
+
+    assert mt5.pending_orders_by_magic(MAGIC) == [], "上限低于已开笔数，在途单要撤掉"
+    assert _progress(sent, "cnt_limit_off"), "撤单要留痕，说明为什么不再加"
     runner.cancel()
 
 

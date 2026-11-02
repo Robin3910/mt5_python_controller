@@ -450,12 +450,64 @@ def aggregate_task_status(dispatch_statuses: list[str]) -> str:
     return "skipped"
 
 
+def _ensure_batch_coverage(rule: dict) -> dict:
+    """保证分批档位连续覆盖 [1, total_lot_limit]；不足就在尾部补档。
+
+    为什么要补：节点按「本规则第几次加仓」命中档位，档位没覆盖到下一次加仓
+    时节点会沿用相邻档位的参数兜底（不会卡死），但补出来的参数是猜的。
+    服务端先补齐，节点就总能命中用户真正配置的那一档。
+
+    补档参数沿用最后一档（间距 / 倍数 / 手数原样带过去）——用户扩容时最
+    常见的意图就是「照着上一档继续加」。
+    """
+    if not isinstance(rule, dict):
+        return rule
+    if not rule.get("batch_enabled"):
+        return rule
+    levels = [
+        dict(lv) for lv in (rule.get("batch_levels") or []) if isinstance(lv, dict)
+    ]
+    if not levels:
+        return rule
+    try:
+        limit = int(float(rule.get("total_lot_limit") or 0))
+    except (TypeError, ValueError):
+        limit = 0
+    if limit <= 0:
+        # 0 = 不限：只保证现有档位自洽，不往上补
+        return rule
+    # 按 pos_from 排序，让「末尾」有确定含义
+    levels = sorted(levels, key=lambda lv: int(lv.get("pos_from") or 0))
+    cursor = 1
+    for lv in levels:
+        lo = int(lv.get("pos_from") or 0)
+        hi = int(lv.get("pos_to") or 0)
+        if lo > cursor:
+            # 中间有洞：把这一档的起点拉到 cursor，先把连续性补上
+            lv["pos_from"] = cursor
+        cursor = max(cursor, hi + 1)
+    last = levels[-1]
+    while cursor <= limit:
+        levels.append({
+            **dict(last),
+            "pos_from": cursor,
+            "pos_to": cursor,
+        })
+        cursor += 1
+    out = dict(rule)
+    out["batch_levels"] = levels
+    return out
+
+
 def strategy_rules_snapshot(strategy: Optional[dict]) -> Optional[dict]:
     """把绑定策略压成随任务下发的快照。
 
     每个任务下发时新建一份，运行周期内以此为准；加仓策略（模版1）保存时还
     会对进行中子任务重写并热推（见 group_persist
     rewrite_running_strategy_snapshots），网格 / 趋势策略不热推。
+
+    分批档位在这里补齐（见 `_ensure_batch_coverage`）：保证节点永远能命中
+    下一档，不会因为用户扩容忘了加档而沿用兜底参数。
     """
     if not strategy:
         return None
@@ -470,7 +522,10 @@ def strategy_rules_snapshot(strategy: Optional[dict]) -> Optional[dict]:
         "template_id": strategy.get("template_id"),
         # 配置版本：热推时带上，节点用它做版本门（迟到的旧包直接丢弃）
         "config_version": version,
-        "rules": [dict(r) for r in (strategy.get("rules") or []) if isinstance(r, dict)],
+        "rules": [
+            _ensure_batch_coverage(r)
+            for r in (strategy.get("rules") or []) if isinstance(r, dict)
+        ],
     }
 
 

@@ -502,6 +502,9 @@ class GroupTaskDispatch(Base):
     # 各规则已开笔数（按规则类型分开，如 {"1": 3, "2": 0}）：前端校验
     # 「上限不能低于已开笔数」的依据，规则类型是动态键所以用 JSON 存
     add_counts_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # 各规则的加仓进度（当前第几批 / 还能再加几笔 / 下一批的间距与手数）：
+    # 前端展示「加到第几批第几仓」的唯一来源。规则类型是动态键，用 JSON 存
+    add_progress_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     total_orders: Mapped[int] = mapped_column(Integer, default=0)     # 累计下单笔数
     total_volume: Mapped[float] = mapped_column(Float, default=0.0)   # 累计手数
     realized_profit: Mapped[float] = mapped_column(Float, default=0.0)

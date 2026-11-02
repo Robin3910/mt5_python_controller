@@ -595,14 +595,40 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
       push('说明', '没有字段级变更')
       return rows
     }
-    // 逐字段结论：状态 + 说明
+    // 逐字段结论：采纳状态 + 节点执行结论 + 说明
     fields.forEach((f, i) => {
+      const execLabel = strategyUpdateExecLabel(f.exec)
       push(
         `字段 ${i + 1}`,
         `${strategyUpdateFieldLabel(f.status)} · ${f.field || '-'}` +
+          (execLabel ? ` · ${execLabel}` : '') +
           (f.message ? ` — ${f.message}` : ''),
       )
     })
+    // 加仓进度：加到第几批、还能再加几笔
+    const progress = detail.progress
+    if (progress && typeof progress === 'object') {
+      for (const [ruleType, p] of Object.entries(progress as Record<string, any>)) {
+        const label = RULE_TYPE_LABEL[Number(ruleType)] || `类型${ruleType}`
+        const added = Number(p?.added || 0)
+        const limit = Number(p?.limit || 0)
+        const remaining = Number(p?.remaining ?? -1)
+        const curIdx = Number(p?.current_level_index ?? -1)
+        const nextIdx = Number(p?.next_level_index ?? -1)
+        const parts: string[] = []
+        parts.push(limit > 0 ? `已加 ${added} / ${limit} 笔` : `已加 ${added} 笔（不限次数）`)
+        if (curIdx >= 0) parts.push(`当前第 ${curIdx + 1} 批`)
+        if (remaining === -1) parts.push('还能继续加')
+        else if (remaining > 0) parts.push(`还能再加 ${remaining} 笔`)
+        else parts.push('已到上限')
+        if (nextIdx >= 0) {
+          parts.push(
+            `下一批 ${Number(p?.next_gap_points || 0)} 点 × ${Number(p?.next_volume || 0)} 手`,
+          )
+        }
+        push(`${label}加仓进度`, parts.join('，'))
+      }
+    }
     return rows
   }
   if (detail.kind === 'account_risk') {
@@ -649,6 +675,14 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
   return rows
 }
 
+/** 规则类型名（与后端 strategy_templates 对齐） */
+const RULE_TYPE_LABEL: Record<number, string> = {
+  1: '逆势加仓',
+  2: '顺势加仓',
+  3: '以损定量趋势单',
+  4: '网格交易',
+}
+
 function strategyUpdateResultLabel(result?: string | null): string {
   const m: Record<string, string> = {
     applied: '✅ 全部生效',
@@ -673,12 +707,28 @@ function strategyUpdateFieldLabel(status?: string | null): string {
   const m: Record<string, string> = {
     applied: '✅ 生效',
     partial: '⚠️ 部分生效',
-    frozen: '❄️ 冻结',
     locked: '🔒 锁定',
-    no_effect: '➖ 无效果',
+    // no_effect 不是「没保存」——配置照常保存并下发了，只是节点按自身状态
+    // 决定不再产生动作。旧文案「无效果」会让人以为没保存。
+    no_effect: '➖ 已保存，不再新增批次',
   }
   const key = String(status || '').toLowerCase()
   return m[key] || (key ? key : '—')
+}
+
+/**
+ * 节点执行结论（exec）：这次改动节点会不会照着执行。
+ * 与 status（采纳与否）严格分离——status 说「保存了没有」，exec 说「节点会怎么做」。
+ */
+function strategyUpdateExecLabel(exec?: string | null): string {
+  const m: Record<string, string> = {
+    will_add: '节点会继续加仓',
+    no_more_adds: '本任务不再新增批次',
+    waiting_tp_sl: '现有仓位等待止盈止损',
+    locked_by_manual: '手动仓已成交，节点不执行这部分',
+  }
+  const key = String(exec || '').toLowerCase()
+  return m[key] || ''
 }
 
 /** 一律按东八区（北京时间）显示，不跟券商 MT5 钟面对齐。 */

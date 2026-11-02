@@ -150,6 +150,8 @@ class AddDecision:
     smc_received_at: float = 0.0
     # 波幅纳入当前 K 线时的明细；未开启时为 None
     adapt: Optional[dict] = None
+    # 档位没覆盖下一次加仓 → 沿用了最后一档的参数（要告诉用户）
+    level_fallback: bool = False
 
     @property
     def event_type(self) -> str:
@@ -213,17 +215,67 @@ def rule_base_price(rule_type: int, ctx: PositionCtx) -> float:
 
 
 def pick_batch_level(rule: dict, next_position_no: int) -> tuple[Optional[dict], Optional[int]]:
-    """按「本规则下一次加仓序号」命中分批档位；未启用或未命中返回 (None, None)。"""
+    """按「本规则下一次加仓序号」命中分批档位。
+
+    **兜底**：档位区间没覆盖到下一次加仓时（用户扩容忘了加档、手工改区间留了洞、
+    历史脏数据），回退到**最接近的档位**而不是 (None, None)。
+    原因：分批模式下没命中档位会让整条规则静默卡死——用户以为还有额度，
+    实际永远不再加仓。沿用相邻档位的参数至少让行为可预期（加出来的仓参数
+    可能不是最想要的，但节点会在事件里说明「沿用了档位#K」）。
+
+    兜底的落点：
+    - 下一次加仓在**所有档位之后**（扩容忘加档）→ 沿用**最后一档**
+    - 下一次加仓落在**两档之间的洞里** → 沿用**洞前面那一档**
+    - 下一次加仓在**第一档之前**（档位字面从 2 起步）→ 不兜底，返回 (None, None)
+      —— 这里必须尊重字面语义：用户把起点设在 2 就是说「第 1 次不要加」
+    - 档位列表为空 → 不兜底，返回 (None, None)
+    """
     if not rule.get("batch_enabled"):
         return None, None
-    for idx, level in enumerate(rule.get("batch_levels") or []):
-        if not isinstance(level, dict):
-            continue
+    levels = [lv for lv in (rule.get("batch_levels") or []) if isinstance(lv, dict)]
+    if not levels:
+        return None, None
+    for idx, level in enumerate(levels):
         lo = _as_int(level.get("pos_from"), 0)
         hi = _as_int(level.get("pos_to"), 0)
         if lo <= next_position_no <= hi:
             return level, idx
-    return None, None
+    return _fallback_batch_level(levels, next_position_no)
+
+
+def _fallback_batch_level(
+    levels: list[dict], next_position_no: int,
+) -> tuple[Optional[dict], Optional[int]]:
+    """档位没命中时的兜底落点（见 `pick_batch_level` 的说明）。"""
+    first_from = _as_int(levels[0].get("pos_from"), 0)
+    if next_position_no < first_from:
+        # 在第一档之前：字面语义就是「这几次不加」，不兜底
+        return None, None
+    # 洞里 → 沿用洞前面那一档（pos_from <= 本次序号 的最后一档）
+    prev_idx = -1
+    for idx, level in enumerate(levels):
+        if _as_int(level.get("pos_from"), 0) <= next_position_no:
+            prev_idx = idx
+        else:
+            break
+    if prev_idx < 0:
+        prev_idx = 0
+    return levels[prev_idx], prev_idx
+
+
+def batch_level_is_fallback(rule: dict, next_position_no: int) -> bool:
+    """本次命中是不是「档位未覆盖 → 兜底沿用相邻档位」的结果。"""
+    if not rule.get("batch_enabled"):
+        return False
+    levels = [lv for lv in (rule.get("batch_levels") or []) if isinstance(lv, dict)]
+    if not levels:
+        return False
+    for level in levels:
+        lo = _as_int(level.get("pos_from"), 0)
+        hi = _as_int(level.get("pos_to"), 0)
+        if lo <= next_position_no <= hi:
+            return False
+    return _fallback_batch_level(levels, next_position_no)[0] is not None
 
 
 def parse_add_rule_type(comment: object) -> Optional[int]:
@@ -478,6 +530,8 @@ class _AddPrep:
     rule_adds: int
     base: float
     volume: float
+    # 档位没覆盖下一次加仓 → 沿用了最后一档的参数（要告诉用户）
+    level_fallback: bool = False
 
 
 def _prepare_rule(rule: dict, ctx: PositionCtx) -> Optional[_AddPrep]:
@@ -496,6 +550,8 @@ def _prepare_rule(rule: dict, ctx: PositionCtx) -> Optional[_AddPrep]:
     rule_adds = ctx.rule_add_count(rule_type)
     # 档位按「本规则第几次加仓」命中（从 1 起，开仓不占格）；pos_from 一律按字面解释
     level, level_index = pick_batch_level(rule, rule_adds + 1)
+    # 档位没覆盖到这一次加仓 → 兜底沿用最后一档，要让用户知道
+    level_fallback = batch_level_is_fallback(rule, rule_adds + 1)
 
     if level is not None:
         # 分批模式：方向可独立配置，笔数上限用本规则已加次数，间距按档位解析
@@ -509,7 +565,10 @@ def _prepare_rule(rule: dict, ctx: PositionCtx) -> Optional[_AddPrep]:
         extra_lot = _as_float(level.get("extra_lot"), 0.0)
         limit_kind, limit_value = "total_lot_limit", limit
     else:
-        # 分批未启用（或已超出所有档位区间）：走基础参数 + 次数上限，基础参数只支持点数
+        # 分批开着但没法兜底：档位列表是空的，或下一次加仓落在第一档之前
+        # （用户把起点设在 2 就是说「第 1 次不要加」，字面语义优先）。
+        # 这两种情况都按「不加」处理，不回落到基础参数——基础参数只支持点数，
+        # 回落会让用户以为在按档位加仓。
         if rule.get("batch_enabled"):
             return None
         if not action_matches(rule.get("action"), ctx.direction):
@@ -538,6 +597,7 @@ def _prepare_rule(rule: dict, ctx: PositionCtx) -> Optional[_AddPrep]:
         rule_adds=rule_adds,
         base=rule_base_price(rule_type, ctx),
         volume=volume,
+        level_fallback=level_fallback,
     )
 
 
@@ -574,6 +634,7 @@ def _build_decision(
         smc_side=gap.smc_side,
         smc_received_at=gap.smc_received_at,
         adapt=gap.adapt,
+        level_fallback=prep.level_fallback,
     )
 
 

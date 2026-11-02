@@ -22,8 +22,6 @@ from . import (
     rbac_service,
     strategy_service,
     strategy_templates,
-    strategy_precheck,
-    strategy_validate,
 )
 from .deps import (
     client_ip,
@@ -226,41 +224,6 @@ async def get_strategy(
     return _to_strategy_out(d, await rbac_service.owner_names_for(p), hints)
 
 
-async def _precheck_running_tasks(strategy_id: str, rules: list) -> None:
-    """向在跑节点问一次「这么改行不行」；有阻断项就抛 400。
-
-    节点离线 / 超时不算阻断：离线节点重连后会拉最新快照自己判断，
-    在这拦下来只会让用户改不了配置。
-    """
-    subtasks = await group_persist.running_strategy_subtasks(strategy_id)
-    if not subtasks:
-        return
-    snapshot = {
-        "strategy_id": strategy_id,
-        "rules": [r.model_dump() for r in rules],
-    }
-    try:
-        result = await strategy_precheck.check_subtasks(subtasks, snapshot)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("strategy precheck failed %s: %s", strategy_id, e)
-        return
-    if result.get("ok"):
-        return
-    blocks = result.get("blocks") or []
-    codes = {str(b.get("code") or "") for b in blocks}
-    error = "sltp_crossed" if "sltp_crossed" in codes else (
-        str(codes.pop()) if codes else "precheck_rejected"
-    )
-    raise HTTPException(
-        status_code=400,
-        detail={
-            "error": error,
-            "message": result.get("message") or "该配置在运行中的任务上不成立，已拒绝保存",
-            "blocks": blocks,
-        },
-    )
-
-
 @router.patch("/{strategy_id}", response_model=StrategyOut)
 async def update_strategy(
     strategy_id: str,
@@ -282,25 +245,10 @@ async def update_strategy(
             name, exclude_strategy_id=strategy_id, owner_user_id=current.get("owner_user_id"),
         ):
             raise HTTPException(status_code=409, detail=f"策略名称已存在：{name}")
-    # 上限不能低于已开笔数：用库内各规则的已开笔数校验（前端也做一遍，这里兜底）
-    if body.rules is not None:
-        hints = await group_persist.strategy_runtime_hints(strategy_id)
-        blocks = strategy_validate.check_limit_below_added(
-            [r.model_dump() for r in body.rules],
-            max_added_by_rule=hints.get("max_added_by_rule"),
-        )
-        if blocks:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "error": "limit_below_added",
-                    "message": strategy_validate.summarize_blocks(blocks),
-                    "blocks": blocks,
-                },
-            )
-        # 节点侧预检：只有节点知道真实持仓与现价，算得出「改了之后 SL/TP
-        # 会不会已经越过现价」。有节点报阻断就拒掉这次保存，配置不落库。
-        await _precheck_running_tasks(strategy_id, body.rules)
+    # 配置无条件热推：保存路径上不再做任何拦截。
+    # 上限低于已开笔数、手动仓已成交、SL/TP 越过现价……这些都不再阻止保存——
+    # 字段值一律采纳并热推到节点，「加不加 / 怎么加」由节点自身状态决定，
+    # 结论通过逐字段回执（strategy_update_ack）告诉用户。
     before = _strategy_audit_snapshot(current)
     try:
         d = await strategy_service.update_strategy(store, strategy_id, body)
