@@ -61,7 +61,6 @@ def set_grid_columns(frame: ctk.CTkFrame, columns: int) -> None:
         widget.grid(row=index // columns, column=index % columns,
                     sticky="nsew", padx=6, pady=6)
 
-
 class NodeCard(ctk.CTkFrame):
     """一张节点卡片。`self.card` 是自己（外框），供选中态换边框色。"""
 
@@ -85,6 +84,8 @@ class NodeCard(ctk.CTkFrame):
             corner_radius=10,
         )
         self.card = self
+        # CTk 控件的真实点击目标是内部 canvas，暴露出来便于程序化触发。
+        self.canvas = getattr(self, "_canvas", None)
         self._vm = vm
         self._on_select = on_select
         self._on_open = on_open
@@ -96,6 +97,8 @@ class NodeCard(ctk.CTkFrame):
         self._pulse_on = False
 
         self._build(vm)
+        # 初始状态也要起脉冲（构造时还没走过 update）
+        self._sync_pulse(vm)
 
     # —— 构建 ——
 
@@ -178,12 +181,22 @@ class NodeCard(ctk.CTkFrame):
     # —— 交互 ——
 
     def _bind_interactions(self) -> None:
-        """把单击/双击/右键递归绑到整张卡片（按钮自身除外）。"""
+        """把单击/双击/右键递归绑到整张卡片（按钮自身除外）。
+
+        CTk 控件的 `bind` 实际绑在内部 canvas 上（CTk 自己的文档如此写），
+        所以真实鼠标点击会命中；这里额外把 `self.canvas` 暴露出来，
+        便于程序化触发与测试。
+        """
+        bindings = (
+            ("<Button-1>", self._handle_select),
+            ("<Double-Button-1>", self._handle_open),
+            ("<Button-3>", self._handle_context),
+        )
+
         def walk(widget):
             if not isinstance(widget, ctk.CTkButton):
-                widget.bind("<Button-1>", self._handle_select, add="+")
-                widget.bind("<Double-Button-1>", self._handle_open, add="+")
-                widget.bind("<Button-3>", self._handle_context, add="+")
+                for sequence, handler in bindings:
+                    widget.bind(sequence, handler, add="+")
             for child in widget.winfo_children():
                 walk(child)
 

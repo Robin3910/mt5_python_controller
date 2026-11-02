@@ -117,7 +117,9 @@ def test_set_grid_columns_switches_to_two_columns(root):
     positions = [(c.card.grid_info()["row"], c.card.grid_info()["column"]) for c in cards]
     assert positions == [(0, 0), (0, 1), (1, 0)]
     # 旧的 uniform 必须清掉，否则第 3 列的权重会串到前两列
-    assert grid.grid_columnconfigure(2)["uniform"] in ("", "gridcol")
+    # （Tk 里没有 uniform 的列读出来是 None）
+    assert grid.grid_columnconfigure(2)["uniform"] in ("", None, "gridcol")
+    assert grid.grid_columnconfigure(2)["weight"] == 0
 
 
 def test_set_grid_columns_one_column_stacks_vertically(root):
@@ -153,7 +155,12 @@ def test_card_context_binding_exists(root):
     vm = _vm(root, process_alive=True, health="ok")
     seen = []
     card = NodeCard(root, vm, on_context=lambda iid, ev=None: seen.append(iid))
-    card.card.event_generate("<Button-3>")
+    # 窗口必须可见且控件已映射：Tk 不会把事件派发给未映射的控件
+    card.pack(fill="x")
+    root.deiconify()
+    root.update()
+    # CTk 控件的真实点击目标是内部 canvas
+    card.canvas.event_generate("<Button-3>")
     root.update()
     assert seen == [vm.id]
 
