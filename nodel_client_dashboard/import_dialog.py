@@ -134,7 +134,7 @@ class ImportNodeDialog(SessionDialog):
         )
         ctk.CTkEntry(
             card, textvariable=self.dir_var, fg_color=BG_ELEVATED,
-            border_color=GLASS_BORDER, text_color=TEXT, height=36, corner_radius=10,
+            border_color=GLASS_BORDER, text_color=TEXT, height=34, corner_radius=6,
             placeholder_text=r"如 C:\Program Files\MetaTrader 5",
         ).grid(row=3, column=1, padx=(8, 4), pady=8, sticky="ew")
         ghost_btn(card, "浏览…", self._browse, width=76).grid(
@@ -146,7 +146,7 @@ class ImportNodeDialog(SessionDialog):
         )
         ctk.CTkEntry(
             card, textvariable=self.name_var, fg_color=BG_ELEVATED,
-            border_color=GLASS_BORDER, text_color=TEXT, height=36, corner_radius=10,
+            border_color=GLASS_BORDER, text_color=TEXT, height=34, corner_radius=6,
             placeholder_text="留空则取目录名",
         ).grid(row=4, column=1, columnspan=2, padx=(8, 16), pady=8, sticky="ew")
 

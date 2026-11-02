@@ -8,7 +8,8 @@ import customtkinter as ctk
 
 from auth_service import DashboardAPI, DashboardAuthError
 from store import load_app_url, load_panel_config, save_panel_config
-from theme import ACCENT, BG, BG_ELEVATED, DANGER, TEXT, TEXT_MUTED, font, glass_card, primary_btn
+from theme import (ACCENT, BG, BG_ELEVATED, DANGER, GOLD, LINE, TEXT, TEXT_MUTED,
+                   font, glass_card, primary_btn)
 
 
 class LoginView(ctk.CTkFrame):
@@ -25,18 +26,25 @@ class LoginView(ctk.CTkFrame):
         self.grid(row=0, column=0, rowspan=2, sticky="nsew")
         card = glass_card(self)
         card.place(relx=0.5, rely=0.5, anchor="center")
-        ctk.CTkLabel(card, text="亿点点登录", text_color=ACCENT, font=font(24, "bold")).pack(padx=42, pady=(30, 8))
+        ctk.CTkLabel(card, text="亿点点登录", text_color=GOLD, font=font(24, "bold")).pack(padx=42, pady=(30, 8))
         ctk.CTkLabel(card, text="使用后台账户，按本人节点权限进行管理", text_color=TEXT_MUTED).pack(pady=(0, 18))
         ctk.CTkLabel(card, text="后端地址", text_color=TEXT_MUTED, anchor="w").pack(fill="x", padx=34)
         self._base_label = ctk.CTkLabel(card, text=self._backend_text(), text_color=TEXT, anchor="w", wraplength=355, justify="left")
         self._base_label.pack(fill="x", padx=34, pady=(4, 12))
         for label, variable, secret in [("用户名", self.username, False), ("密码", self.password, True)]:
             ctk.CTkLabel(card, text=label, text_color=TEXT_MUTED, anchor="w").pack(fill="x", padx=34)
-            entry = ctk.CTkEntry(card, textvariable=variable, show="*" if secret else "", width=360, height=36, fg_color=BG_ELEVATED, text_color=TEXT)
+            entry = ctk.CTkEntry(
+                card, textvariable=variable, show="*" if secret else "",
+                width=360, height=34, fg_color=BG_ELEVATED, text_color=TEXT,
+                border_color=LINE, border_width=1, corner_radius=6,
+            )
             entry.pack(padx=34, pady=(4, 12))
             entry.bind("<Return>", lambda _event: self._login())
         self._code_label = ctk.CTkLabel(card, text="2FA 验证码", text_color=TEXT_MUTED, anchor="w")
-        self._code_entry = ctk.CTkEntry(card, textvariable=self.code, width=360, height=36, fg_color=BG_ELEVATED, text_color=TEXT)
+        self._code_entry = ctk.CTkEntry(
+            card, textvariable=self.code, width=360, height=34, fg_color=BG_ELEVATED,
+            text_color=TEXT, border_color=LINE, border_width=1, corner_radius=6,
+        )
         self._code_entry.bind("<Return>", lambda _event: self._login())
         missing = not load_app_url()
         hint = "未配置后端地址：请在程序目录的 .env 中设置 APP_URL" if missing else "请输入用户名和密码"

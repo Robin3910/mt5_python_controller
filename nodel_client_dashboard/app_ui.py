@@ -132,7 +132,7 @@ class EditInstanceDialog(SessionDialog):
         card.grid_rowconfigure(6, weight=1)
 
         ctk.CTkLabel(
-            card, text="安全编辑", text_color=ACCENT, font=font(11, "bold")
+            card, text="安全编辑", text_color=GOLD, font=font(11, "bold")
         ).grid(row=0, column=0, columnspan=3, padx=16, pady=(16, 2), sticky="w")
         ctk.CTkLabel(
             card, text="编辑节点实例", text_color=TEXT, font=font(18, "bold")
@@ -144,7 +144,7 @@ class EditInstanceDialog(SessionDialog):
         self.name_var = tk.StringVar(value=cfg.name)
         ctk.CTkEntry(
             card, textvariable=self.name_var, fg_color=BG_ELEVATED,
-            border_color=GLASS_BORDER, text_color=TEXT, height=36, corner_radius=10,
+            border_color=GLASS_BORDER, text_color=TEXT, height=34, corner_radius=6,
         ).grid(row=2, column=1, columnspan=2, padx=16, pady=8, sticky="ew")
 
         ctk.CTkLabel(card, text="客户端路径", text_color=TEXT_MUTED, font=font(12)).grid(
@@ -153,7 +153,7 @@ class EditInstanceDialog(SessionDialog):
         self.path_var = tk.StringVar(value=cfg.exe_path)
         ctk.CTkEntry(
             card, textvariable=self.path_var, fg_color=BG_ELEVATED,
-            border_color=GLASS_BORDER, text_color=TEXT, height=36, corner_radius=10,
+            border_color=GLASS_BORDER, text_color=TEXT, height=34, corner_radius=6,
         ).grid(row=3, column=1, padx=(16, 4), pady=8, sticky="ew")
         ghost_btn(card, "浏览…", self._browse_exe, width=72).grid(
             row=3, column=2, padx=(4, 16), pady=8
@@ -165,7 +165,7 @@ class EditInstanceDialog(SessionDialog):
         self.cwd_var = tk.StringVar(value=cfg.cwd)
         ctk.CTkEntry(
             card, textvariable=self.cwd_var, fg_color=BG_ELEVATED,
-            border_color=GLASS_BORDER, text_color=TEXT, height=36, corner_radius=10,
+            border_color=GLASS_BORDER, text_color=TEXT, height=34, corner_radius=6,
         ).grid(row=4, column=1, padx=(16, 4), pady=8, sticky="ew")
         ghost_btn(card, "浏览…", self._browse_cwd, width=72).grid(
             row=4, column=2, padx=(4, 16), pady=8
