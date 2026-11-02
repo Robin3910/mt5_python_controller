@@ -76,11 +76,14 @@ class HeroPanel(ctk.CTkFrame):
         title_box = ctk.CTkFrame(left, fg_color="transparent")
         title_box.pack(side="left")
         self._total_label = ctk.CTkLabel(
-            title_box, text="0", text_color=TEXT, font=font(30, "bold"), height=36
+            title_box, text="0", text_color=TEXT, font=font(30, "bold"),
+            height=38, width=60, anchor="w",
         )
         self._total_label.pack(anchor="w")
+        # 必须给定宽度，否则窄容器里「节点总数」会被折成两行
         ctk.CTkLabel(
-            title_box, text="节点总数", text_color=DIM, font=font(12), height=16
+            title_box, text="节点总数", text_color=DIM, font=font(12), height=16,
+            width=60, anchor="w",
         ).pack(anchor="w")
 
         chips = ctk.CTkFrame(head, fg_color="transparent")

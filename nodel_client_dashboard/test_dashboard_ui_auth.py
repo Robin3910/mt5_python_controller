@@ -103,6 +103,100 @@ def submit_login(app):
     return view
 
 
+def _login(app, api):
+    """把测试用的 app 变成已登录状态。desktop fixture 默认未登录。"""
+    api.principal["is_admin"] = True     # 管理员可拥有任意实例
+    app.session.establish(api, "synthetic-access-token")
+    app._authenticated()
+
+
+# —— 主窗口重排（hero + 节点网格）——
+
+
+def test_main_layout_has_hero_and_node_grid(desktop):
+    app, api, _tmp, _errs = desktop
+    _login(app, api)
+    assert hasattr(app, "hero_panel")
+    assert hasattr(app, "node_grid")
+    assert app.hero_panel is not None
+    assert app.node_grid is not None
+
+
+def test_node_cards_are_created_for_instances(desktop, tmp_path):
+    app, api, tmp, _errs = desktop
+    _login(app, api)
+    cfg = InstanceConfig.create(name="card-1", exe_path=str(tmp / "c1.exe"), cwd=str(tmp))
+    app.manager.add(cfg)
+    app._bind_list()
+    assert cfg.id in app._list_rows
+    assert isinstance(app._list_rows[cfg.id], app_ui.NodeCard)
+
+
+def test_grid_relayout_keeps_all_cards(desktop, tmp_path):
+    app, api, tmp, _errs = desktop
+    _login(app, api)
+    for i in range(4):
+        cfg = InstanceConfig.create(name=f"n{i}", exe_path=str(tmp / f"n{i}.exe"), cwd=str(tmp))
+        app.manager.add(cfg)
+    app._bind_list()
+    app._relayout_grid()
+    app._relayout_grid()
+    assert len(app._list_rows) == 4
+
+
+def test_empty_state_shows_when_no_instances(desktop):
+    app, api, _tmp, _errs = desktop
+    _login(app, api)
+    app._bind_list()
+    assert app._empty_label.winfo_exists()
+
+
+def test_clock_label_shows_current_time(desktop):
+    app, api, _tmp, _errs = desktop
+    _login(app, api)
+    app.update_idletasks()
+    text = app._clock_label.cget("text")
+    assert len(text) == 19
+    assert text[4] == "-" and text[10] == " "
+
+
+def test_card_context_menu_has_three_items(desktop, tmp_path):
+    """右键菜单只放三项：打开目录 / 刷新健康 / 移除。"""
+    app, api, tmp, _errs = desktop
+    _login(app, api)
+    cfg = InstanceConfig.create(name="ctx-1", exe_path=str(tmp / "x1.exe"), cwd=str(tmp))
+    app.manager.add(cfg)
+    app._bind_list()
+    calls = []
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(app, "_open_cwd_by_id", lambda iid: calls.append(("cwd", iid)))
+    try:
+        menu = app._build_card_menu(cfg.id)
+        menu.invoke(0)          # 第一项 = 打开目录
+    finally:
+        monkey.undo()
+    assert calls == [("cwd", cfg.id)]
+    assert app_ui.CARD_MENU_ITEMS == ("打开目录", "刷新健康", "移除实例")
+
+
+def test_hero_panel_reflects_instance_count(desktop, tmp_path):
+    app, api, tmp, _errs = desktop
+    _login(app, api)
+    for i in range(2):
+        cfg = InstanceConfig.create(name=f"h{i}", exe_path=str(tmp / f"h{i}.exe"), cwd=str(tmp))
+        app.manager.add(cfg)
+    app._bind_list()
+    assert app.hero_panel._total_label.cget("text").strip() == "2"
+
+
+def test_detail_controls_moved_off_main_window(desktop):
+    """主窗口不再有旧的左右分栏控件，详情改由弹窗承载。"""
+    app, api, _tmp, _errs = desktop
+    _login(app, api)
+    assert not hasattr(app, "btn_start")
+    assert not hasattr(app, "btn_stop")
+
+
 def test_unlogged_window_does_not_load_or_adopt_instances(desktop, monkeypatch):
     app, _api, _tmp_path, _errors = desktop
     load = MagicMock()

@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import subprocess
 import threading
+import time
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,9 +34,13 @@ from theme import (
     DANGER,
     DANGER_DIM,
     DEAD,
+    DIM,
     GLASS_BORDER,
     GLASS_BORDER_ACTIVE,
     GLASS_SOFT,
+    GOLD,
+    LINE,
+    MUTE,
     TEXT,
     TEXT_DIM,
     TEXT_MUTED,
@@ -50,21 +55,28 @@ from theme import (
     primary_btn,
     soft_card,
     status_chip,
+    toolbar_btn,
 )
 from viewmodels import (
     ALGO_TRADING_OFF_LABEL,
     DetailVM,
     ListItemVM,
     build_detail,
+    build_hero,
     build_list,
     list_order,
 )
+from hero_panel import HeroPanel
+from node_card import NodeCard, set_grid_columns
 
 
 # 顶栏「版本更新」按钮：无更新时的常态文案与宽度
 _VERSION_BTN_IDLE = "版本更新"
 _VERSION_BTN_W = 100
 _VERSION_BTN_W_ALERT = 190
+
+# 节点卡右键菜单的项（顺序即菜单顺序）
+CARD_MENU_ITEMS = ("打开目录", "刷新健康", "移除实例")
 
 # 启动约 3 秒后查一次后端发布版本，之后每 1 分钟复检
 _VERSION_CHECK_INTERVAL_MS = 60 * 1000
@@ -80,6 +92,11 @@ _SWAP_PHASE_LABELS = {
 
 @dataclass
 class _ListRow:
+    """旧列表行的结构定义。
+
+    节点网格已改用 `node_card.NodeCard`，这里只保留类型占位以兼容旧引用。
+    """
+
     card: ctk.CTkFrame
     title: ctk.CTkLabel
     dot: ctk.CTkLabel
@@ -301,7 +318,7 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
         self.manager = ProcessManager(on_change=self._on_runtime_change, session=self.session)
         self.manager.set_visible(set())
         self._selected_id: str | None = None
-        self._list_rows: dict[str, _ListRow] = {}
+        self._list_rows: dict[str, NodeCard] = {}
         self._list_order: tuple[str, ...] = ()
         self._chip_widgets: dict[str, ctk.CTkLabel] = {}
         self._detail_snap: DetailVM | None = None
@@ -316,6 +333,9 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
         self._remote_version = ""
         self._header_busy_status: BusyStatus | None = None
         self._header_clear_job: str | None = None
+        # 顶栏时钟与详情弹窗：布局重建前也可能被定时器碰到，先置空
+        self._clock_label: ctk.CTkLabel | None = None
+        self._detail_dialog = None
 
         self._show_login()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -323,225 +343,187 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
         self.bind("<Unmap>", self._on_unmap)
         self.bind("<Map>", self._on_map)
         self.after(1000, self._tick_ui)
+        self.after(1000, self._tick_clock)
         self.after(200, self._setup_tray)
 
     def _build_layout(self) -> None:
+        """主窗口布局：顶栏 / hero 统计 / 节点卡片网格。
+
+        对齐参考稿 `UI/控制端UI.html`：左侧「亿点点 | 节点控制台」，右侧时钟、
+        用户名与操作按钮；主体是 hero 统计卡 + 节点网格。节点详情改由双击
+        弹出的弹窗承载（原右侧详情栏已移除）。
+        """
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
 
-        # —— 顶栏：品牌 + 安全徽章 ——
+        # —— 顶栏 ——
         header = glass_card(self, corner_radius=0, border_width=0, fg_color=BG_ELEVATED)
         header.grid(row=0, column=0, sticky="ew")
         header.grid_columnconfigure(1, weight=1)
 
         brand = ctk.CTkFrame(header, fg_color="transparent")
-        brand.grid(row=0, column=0, padx=20, pady=14, sticky="w")
+        brand.grid(row=0, column=0, padx=20, pady=12, sticky="w")
         ctk.CTkLabel(
-            brand, text="亿点点", text_color=ACCENT, font=font(22, "bold")
-        ).pack(anchor="w")
+            brand, text="亿点点", text_color=GOLD, font=font(20, "bold")
+        ).pack(side="left")
         ctk.CTkLabel(
-            brand,
-            text="本机安全控制  ·  节点进程编排与监护",
-            text_color=TEXT_MUTED,
-            font=font(12),
-        ).pack(anchor="w")
+            brand, text="│", text_color=LINE, font=font(18)
+        ).pack(side="left", padx=10)
+        ctk.CTkLabel(
+            brand, text="节点控制台", text_color=TEXT, font=font(15, "bold")
+        ).pack(side="left")
 
-        badges = ctk.CTkFrame(header, fg_color="transparent")
-        badges.grid(row=0, column=2, padx=20, pady=14, sticky="e")
+        right = ctk.CTkFrame(header, fg_color="transparent")
+        right.grid(row=0, column=2, padx=20, pady=12, sticky="e")
         # 长耗时操作（批量替换等）的状态条：转圈 + 文案，空闲时清空不占视觉
         self.header_status = ctk.CTkLabel(
-            badges, text="", text_color=TEXT_MUTED, font=font(12), anchor="e"
+            right, text="", text_color=TEXT_MUTED, font=font(12), anchor="e"
         )
         self.header_status.pack(side="left", padx=(0, 12))
         # 布局会随重新登录重建，旧指示器指向已销毁的标签，必须重置
         self._header_busy_status = None
+        self._clock_label = ctk.CTkLabel(
+            right,
+            text=time.strftime("%Y-%m-%d %H:%M:%S"),
+            text_color=DIM,
+            font=mono(12),
+            anchor="e",
+        )
+        self._clock_label.pack(side="left", padx=(0, 14))
+        self._user_label = ctk.CTkLabel(
+            right, text=self._session_username(), text_color=TEXT, font=font(12)
+        )
+        self._user_label.pack(side="left", padx=(0, 14))
         self.version_btn = ghost_btn(
-            badges, _VERSION_BTN_IDLE, self._open_version_update, width=_VERSION_BTN_W
+            right, _VERSION_BTN_IDLE, self._open_version_update, width=_VERSION_BTN_W
         )
         self.version_btn.pack(side="left", padx=(0, 8))
-        ghost_btn(badges, "退出登录", self._logout, width=90).pack(side="left", padx=4)
-        ghost_btn(badges, "连接配置", self._open_connection_config, width=100).pack(
-            side="left", padx=(0, 12)
+        ghost_btn(right, "退出登录", self._logout, width=90).pack(side="left", padx=4)
+        ghost_btn(right, "连接配置", self._open_connection_config, width=100).pack(
+            side="left", padx=(0, 4)
         )
-        status_chip(badges, "仅本机回环", ACCENT).pack(side="left", padx=4)
-        status_chip(badges, "禁止公网绑定", CYAN).pack(side="left", padx=4)
-        status_chip(badges, "支持 TLS/WS", TEXT_MUTED).pack(side="left", padx=4)
 
-        # —— 主体 ——
-        body = ctk.CTkFrame(self, fg_color=BG)
-        body.grid(row=1, column=0, sticky="nsew", padx=14, pady=14)
-        body.grid_columnconfigure(1, weight=1)
-        body.grid_rowconfigure(0, weight=1)
+        # —— 主体：hero + 节点网格 ——
+        body = ctk.CTkScrollableFrame(
+            self,
+            fg_color=BG,
+            scrollbar_button_color=LINE,
+            scrollbar_button_hover_color=GOLD,
+        )
+        body.grid(row=1, column=0, sticky="nsew")
+        # 滚动区内层 frame 必须自己撑满宽度，否则内层网格会挤在左侧
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_rowconfigure(3, weight=1)
 
-        # 左侧实例列表卡片
-        left = glass_card(body, width=340)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        left.grid_propagate(False)
-        left.grid_rowconfigure(2, weight=1)
+        self.hero_panel = HeroPanel(body)
+        self.hero_panel.grid(row=0, column=0, sticky="ew", padx=14, pady=(14, 0))
 
-        left_head = ctk.CTkFrame(left, fg_color="transparent")
-        left_head.grid(row=0, column=0, sticky="ew", padx=14, pady=(14, 4))
         ctk.CTkLabel(
-            left_head, text="实例管理", text_color=ACCENT, font=font(11, "bold")
-        ).pack(anchor="w")
-        ctk.CTkLabel(
-            left_head, text="实例列表", text_color=TEXT, font=font(16, "bold")
-        ).pack(anchor="w")
-
-        self.list_frame = ctk.CTkScrollableFrame(
-            left, fg_color="transparent", scrollbar_button_color=GLASS_BORDER,
-            scrollbar_button_hover_color=ACCENT,
-        )
-        self.list_frame.grid(row=2, column=0, sticky="nsew", padx=10, pady=6)
-
-        btn_row = ctk.CTkFrame(left, fg_color="transparent")
-        btn_row.grid(row=3, column=0, sticky="ew", padx=12, pady=(4, 4))
-        primary_btn(btn_row, "导入节点", self._import_node, width=120).pack(
-            side="left", padx=2, fill="x", expand=True
-        )
-
-        # 本地操作同样经过用户权限校验与操作审计。
-        btn_row0 = ctk.CTkFrame(left, fg_color="transparent")
-        btn_row0.grid(row=6, column=0, sticky="ew", padx=12, pady=(0, 14))
-        ghost_btn(btn_row0, "手工添加", self._add_instance, width=120).pack(
-            side="left", padx=2
-        )
-        ghost_btn(btn_row0, "手工替换全部", self._batch_replace, width=120).pack(
-            side="left", padx=2
-        )
-        account_actions = ctk.CTkFrame(left, fg_color="transparent")
-        account_actions.grid(row=7, column=0, padx=12, pady=(0, 8))
-        ghost_btn(account_actions, "绑定后台节点", self._bind_instance, width=120).pack(side="left", padx=2)
-        ghost_btn(account_actions, "重置专属令牌", self._rotate_credential, width=120).pack(side="left", padx=2)
-
-        btn_row2 = ctk.CTkFrame(left, fg_color="transparent")
-        btn_row2.grid(row=4, column=0, sticky="ew", padx=12, pady=(0, 4))
-        primary_btn(btn_row2, "全部启动", self._batch_start, width=120).pack(
-            side="left", padx=2
-        )
-        danger_btn(btn_row2, "全部停止", self._batch_stop, width=120).pack(
-            side="left", padx=2
-        )
-
-        btn_row3 = ctk.CTkFrame(left, fg_color="transparent")
-        btn_row3.grid(row=5, column=0, sticky="ew", padx=12, pady=(0, 4))
-        ghost_btn(btn_row3, "全部开守护", self._batch_daemon_on, width=120).pack(
-            side="left", padx=2
-        )
-        ghost_btn(btn_row3, "全部关守护", self._batch_daemon_off, width=120).pack(
-            side="left", padx=2
-        )
-
-        # 右侧详情
-        right = ctk.CTkFrame(body, fg_color="transparent")
-        right.grid(row=0, column=1, sticky="nsew")
-        right.grid_columnconfigure(0, weight=1)
-        right.grid_rowconfigure(3, weight=1)
-
-        # 标题卡
-        title_card = glass_card(right)
-        title_card.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        title_card.grid_columnconfigure(0, weight=1)
-
-        self.detail_title = ctk.CTkLabel(
-            title_card, text="未选择实例", text_color=TEXT, font=font(20, "bold"), anchor="w"
-        )
-        self.detail_title.grid(row=0, column=0, sticky="w", padx=16, pady=(14, 2))
-        self.detail_sub = ctk.CTkLabel(
-            title_card,
-            text="请选择左侧实例，查看安全状态与运行快照",
-            text_color=TEXT_MUTED,
-            font=font(12),
+            body,
+            text="仅本机回环 · 禁止公网绑定 · 支持 TLS/WS",
+            text_color=MUTE,
+            font=font(11),
             anchor="w",
-        )
-        self.detail_sub.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 8))
+        ).grid(row=1, column=0, sticky="w", padx=18, pady=(8, 0))
 
-        self.chip_row = ctk.CTkFrame(title_card, fg_color="transparent")
-        self.chip_row.grid(row=2, column=0, sticky="w", padx=14, pady=(0, 12))
+        # —— 区段头：标题 + 工具条 ——
+        head = ctk.CTkFrame(body, fg_color="transparent")
+        head.grid(row=2, column=0, sticky="ew", padx=14, pady=(16, 4))
+        head.grid_columnconfigure(1, weight=1)
 
-        # 操作卡
-        actions_card = glass_card(right)
-        actions_card.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-        actions = ctk.CTkFrame(actions_card, fg_color="transparent")
-        actions.pack(fill="x", padx=12, pady=12)
-        self.btn_start = primary_btn(actions, "启动", self._start, width=92)
-        self.btn_start.pack(side="left", padx=4)
-        self.btn_stop = danger_btn(actions, "停止", self._stop, width=92)
-        self.btn_stop.pack(side="left", padx=4)
-        ghost_btn(actions, "节点配置", self._edit_node_env, width=100).pack(side="left", padx=4)
-        ghost_btn(actions, "刷新健康", self._refresh_health, width=100).pack(side="left", padx=4)
-        ghost_btn(actions, "打开目录", self._open_cwd, width=100).pack(side="left", padx=4)
-        self.daemon_var = ctk.BooleanVar(value=False)
-        self.daemon_switch = ctk.CTkSwitch(
-            actions,
-            text="守护进程",
-            variable=self.daemon_var,
-            command=self._toggle_daemon,
-            progress_color=ACCENT,
-            button_color=TEXT,
-            button_hover_color=ACCENT,
-            text_color=TEXT,
+        ctk.CTkLabel(
+            head, text="MT5 节点", text_color=TEXT, font=font(16, "bold"), anchor="w"
+        ).grid(row=0, column=0, sticky="w")
+
+        tools = ctk.CTkFrame(head, fg_color="transparent")
+        tools.grid(row=0, column=1, sticky="e")
+        for text, command, width in (
+            ("全部启动", self._batch_start, 80),
+            ("全部停止", self._batch_stop, 80),
+            ("全部开守护", self._batch_daemon_on, 92),
+            ("全部关守护", self._batch_daemon_off, 92),
+            ("导入节点", self._import_node, 80),
+            ("手工添加", self._add_instance, 80),
+            ("手工替换全部", self._batch_replace, 104),
+        ):
+            toolbar_btn(tools, text, command, width=width).pack(side="left", padx=3)
+
+        account_tools = ctk.CTkFrame(head, fg_color="transparent")
+        account_tools.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ghost_btn(
+            account_tools, "绑定后台节点", self._bind_instance, width=112, height=26
+        ).pack(side="left", padx=(0, 6))
+        ghost_btn(
+            account_tools, "重置专属令牌", self._rotate_credential, width=112, height=26
+        ).pack(side="left", padx=(0, 6))
+
+        # —— 节点网格 ——
+        self.node_grid = ctk.CTkFrame(body, fg_color="transparent")
+        self.node_grid.grid(row=3, column=0, sticky="nsew")
+        for col in range(3):
+            self.node_grid.grid_columnconfigure(col, weight=1, uniform="gridcol")
+
+        self._empty_label = ctk.CTkLabel(
+            self.node_grid,
+            text="暂无节点 · 点击「导入节点」或「手工添加」开始",
+            text_color=MUTE,
             font=font(13),
         )
-        self.daemon_switch.pack(side="left", padx=14)
 
-        # 摘要卡
-        summary_card = soft_card(right)
-        summary_card.grid(row=2, column=0, sticky="ew", pady=(0, 10))
-        self.summary = ctk.CTkLabel(
-            summary_card,
-            text="",
-            justify="left",
-            anchor="w",
-            text_color=TEXT_MUTED,
-            font=mono(12),
-        )
-        self.summary.pack(fill="x", padx=14, pady=12)
+        # 旧左右分栏的控件已移除，详情改由弹窗承载；保留同名占位避免
+        # 其它逻辑访问时 AttributeError。
+        self.detail_title = None
+        self.detail_sub = None
+        self.chip_row = None
+        self.summary = None
+        self.tasks = None
+        self.log_box = None
+        self.daemon_var = ctk.BooleanVar(value=False)
 
-        # —— 任务 + 日志 区域已按需隐藏（先注释入口，代码不删） ——
-        # 暂时禁用整个策略任务 + 运行日志卡片；恢复时把下面 if False 改回 if True 即可。
-        if False:
-            mid = glass_card(right)
-            mid.grid(row=3, column=0, sticky="nsew")
-            mid.grid_columnconfigure(0, weight=1)
-            mid.grid_rowconfigure(1, weight=1)
-            mid.grid_rowconfigure(3, weight=2)
+        # 兼容旧引用：列表容器即节点网格
+        self.list_frame = self.node_grid
 
-            ctk.CTkLabel(
-                mid, text="策略任务", text_color=ACCENT, font=font(11, "bold"), anchor="w"
-            ).grid(row=0, column=0, sticky="w", padx=14, pady=(12, 2))
-            self.tasks = ctk.CTkTextbox(
-                mid,
-                height=110,
-                fg_color=BG_ELEVATED,
-                text_color=TEXT,
-                border_color=GLASS_BORDER,
-                border_width=1,
-                corner_radius=10,
-                font=mono(12),
-            )
-            self.tasks.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 8))
+        self._grid_columns_cache = 0
+        self.bind("<Configure>", self._on_window_resize, add="+")
 
-            log_bar = ctk.CTkFrame(mid, fg_color="transparent")
-            log_bar.grid(row=2, column=0, sticky="ew", padx=14)
-            ctk.CTkLabel(
-                log_bar, text="运行日志", text_color=ACCENT, font=font(11, "bold")
-            ).pack(side="left")
-            ghost_btn(log_bar, "清空显示", self._clear_log, width=96).pack(side="right")
-            self.log_box = ctk.CTkTextbox(
-                mid,
-                fg_color=BG_ELEVATED,
-                text_color=TEXT,
-                border_color=GLASS_BORDER,
-                border_width=1,
-                corner_radius=10,
-                font=mono(12),
-            )
-            self.log_box.grid(row=3, column=0, sticky="nsew", padx=12, pady=(4, 12))
-        else:
-            # 隐藏期占位：保留同名属性，避免差分绑定/清空等逻辑访问时 AttributeError。
-            self.tasks = None
-            self.log_box = None
+    def _session_username(self) -> str:
+        """顶栏显示的当前登录用户名。"""
+        principal = getattr(self.session, "principal", None) or {}
+        return str(principal.get("username") or "")
+
+    def _on_window_resize(self, event) -> None:
+        """窗口尺寸变化时按断点重排网格列数。"""
+        if event.widget is not self:
+            return
+        columns = self._grid_columns()
+        if columns == self._grid_columns_cache:
+            return
+        self._relayout_grid()
+
+    def _grid_columns(self) -> int:
+        """按窗口宽度算列数：>=1180 三列，>=820 两列，否则一列。"""
+        width = self.winfo_width() or 1200
+        if width >= 1180:
+            return 3
+        if width >= 820:
+            return 2
+        return 1
+
+    def _relayout_grid(self) -> None:
+        """按窗口宽度重排网格列数。只改位置，不重建控件。"""
+        columns = self._grid_columns()
+        self._grid_columns_cache = columns
+        set_grid_columns(self.node_grid, columns)
+        self._place_cards(columns)
+
+    def _place_cards(self, columns: int) -> None:
+        """按 `self._list_order` 把卡片摆进网格。"""
+        for index, iid in enumerate(self._list_order):
+            card = self._list_rows.get(iid)
+            if card is None:
+                continue
+            row, col = divmod(index, columns)
+            card.grid(row=row, column=col, sticky="nsew", padx=6, pady=6)
 
     def _persist(self) -> None:
         DashboardAuthUI._persist(self)
@@ -559,125 +541,24 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
             return TEXT_MUTED
         return DEAD
 
-    def _create_list_row(self, vm: ListItemVM) -> _ListRow:
-        color = health_color(vm.health, vm.alive)
-        card = ctk.CTkFrame(
-            self.list_frame,
-            fg_color=ACCENT_SOFT if vm.selected else GLASS_SOFT,
-            border_width=1,
-            border_color=GLASS_BORDER_ACTIVE if vm.selected else GLASS_BORDER,
-            corner_radius=12,
-        )
-        inner = ctk.CTkFrame(card, fg_color="transparent")
-        inner.pack(fill="x", padx=12, pady=10)
-        algo_warning = ctk.CTkLabel(
-            inner, text=ALGO_TRADING_OFF_LABEL, text_color=DANGER, font=font(11, "bold"),
-            anchor="e", height=18,
-        )
-        if vm.algo_trading_disabled:
-            algo_warning.pack(fill="x", pady=(0, 2))
-        top = ctk.CTkFrame(inner, fg_color="transparent")
-        top.pack(fill="x", pady=(0, 2))
-        title = ctk.CTkLabel(
-            top, text=vm.title, text_color=TEXT, font=font(14, "bold"),
-            anchor="w", height=22,
-        )
-        title.pack(side="left")
-        # 交易账号 ID：与状态点同排右侧；未配置时显示「账号 -」
-        account_text = f"账号 {vm.mt5_login}" if vm.mt5_login else "账号 -"
-        account = ctk.CTkLabel(
-            top, text=account_text, text_color=TEXT_MUTED, font=mono(11),
-            anchor="e", height=22,
-        )
-        account.pack(side="right", padx=(8, 22))
-        dot = ctk.CTkLabel(
-            top, text="●", text_color=color, font=font(12), width=18, height=22,
-        )
-        dot.pack(side="right")
-        path = ctk.CTkLabel(
-            inner, text=vm.path_short, text_color=TEXT_DIM, font=mono(11),
-            anchor="w", height=20,
-        )
-        path.pack(fill="x", pady=(0, 2))
-        status = ctk.CTkLabel(
-            inner,
-            text=vm.status_line,
-            text_color=color,
-            font=font(11, "bold"),
-            anchor="w",
-            height=22,
-        )
-        status.pack(fill="x")
-
-        def _bind(widget, iid=vm.id):
-            widget.bind("<Button-1>", lambda _e, i=iid: self._select(i))
-            for child in widget.winfo_children():
-                _bind(child, iid)
-
-        _bind(card)
-        # 编辑/移除放在列表项内；放在 _bind 之后，避免覆盖按钮自身点击。
-        actions = ctk.CTkFrame(inner, fg_color="transparent")
-        actions.pack(fill="x", pady=(6, 0))
-        ghost_btn(
-            actions,
-            "编辑",
-            lambda iid=vm.id: self._edit_instance(iid),
-            width=56,
-            height=26,
-            font=font(12),
-        ).pack(side="left", padx=(0, 4))
-        danger_btn(
-            actions,
-            "移除",
-            lambda iid=vm.id: self._remove_instance(iid),
-            width=56,
-            height=26,
-            font=font(12),
-        ).pack(side="left")
-        return _ListRow(
-            card=card, title=title, dot=dot, path=path, status=status,
-            account=account, algo_warning=algo_warning, snapshot=vm,
+    def _create_node_card(self, vm: ListItemVM) -> NodeCard:
+        """建一张节点卡：单击选中、双击开详情、右键出菜单、启停与删除走卡片按钮。"""
+        return NodeCard(
+            self.node_grid,
+            vm,
+            on_select=self._select,
+            on_open=lambda iid=vm.id: self._open_detail_for(iid),
+            on_start=lambda iid=vm.id: self._start_by_id(iid),
+            on_stop=lambda iid=vm.id: self._stop_by_id(iid),
+            on_remove=lambda iid=vm.id: self._remove_instance(iid),
+            on_context=lambda iid=vm.id, ev=None: self._show_card_menu(iid, ev),
         )
 
-    def _apply_list_row(self, row: _ListRow, vm: ListItemVM) -> None:
-        if row.snapshot == vm:
-            return
-        color = health_color(vm.health, vm.alive)
-        if row.snapshot is None or row.snapshot.title != vm.title:
-            row.title.configure(text=vm.title)
-        if row.snapshot is None or row.snapshot.path_short != vm.path_short:
-            row.path.configure(text=vm.path_short)
-        if (
-            row.snapshot is None
-            or row.snapshot.status_line != vm.status_line
-            or row.snapshot.health != vm.health
-            or row.snapshot.alive != vm.alive
-        ):
-            row.status.configure(text=vm.status_line, text_color=color)
-            row.dot.configure(text_color=color)
-        # 交易账号 ID 变化时刷新（节点从 status_port 拉到真实账号后会更新）。
-        if row.snapshot is None or row.snapshot.mt5_login != vm.mt5_login:
-            if row.account is not None:
-                row.account.configure(
-                    text=f"账号 {vm.mt5_login}" if vm.mt5_login else "账号 -"
-                )
-        if row.algo_warning is not None and (
-            row.snapshot is None or row.snapshot.algo_trading_disabled != vm.algo_trading_disabled
-        ):
-            if vm.algo_trading_disabled:
-                row.algo_warning.configure(text=ALGO_TRADING_OFF_LABEL)
-                row.algo_warning.pack(fill="x", pady=(0, 2), before=row.title.master)
-            else:
-                row.algo_warning.pack_forget()
-        if row.snapshot is None or row.snapshot.selected != vm.selected:
-            row.card.configure(
-                fg_color=ACCENT_SOFT if vm.selected else GLASS_SOFT,
-                border_color=GLASS_BORDER_ACTIVE if vm.selected else GLASS_BORDER,
-            )
-        row.snapshot = vm
+    def _apply_node_card(self, card: NodeCard, vm: ListItemVM) -> None:
+        card.update(vm)
 
     def _bind_list(self) -> None:
-        """按 ViewModel 差分同步左侧列表：复用卡片，避免整表销毁闪烁。"""
+        """按 ViewModel 差分同步节点网格：复用卡片，避免整表销毁闪烁。"""
         if not self.session.active:
             return
         items = build_list(self.manager, self._selected_id)
@@ -685,68 +566,42 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
         wanted = {vm.id for vm in items}
         for iid in list(self._list_rows):
             if iid not in wanted:
-                self._list_rows[iid].card.destroy()
+                self._list_rows[iid].destroy()
                 del self._list_rows[iid]
         for vm in items:
-            row = self._list_rows.get(vm.id)
-            if row is None:
-                self._list_rows[vm.id] = self._create_list_row(vm)
+            card = self._list_rows.get(vm.id)
+            if card is None:
+                self._list_rows[vm.id] = self._create_node_card(vm)
             else:
-                self._apply_list_row(row, vm)
+                self._apply_node_card(card, vm)
         if order != self._list_order:
-            for iid in order:
-                self._list_rows[iid].card.pack_forget()
-            for iid in order:
-                self._list_rows[iid].card.pack(fill="x", pady=5, padx=2)
             self._list_order = order
-
-    def _ensure_chip(self, key: str) -> ctk.CTkLabel:
-        chip = self._chip_widgets.get(key)
-        if chip is not None:
-            return chip
-        chip = status_chip(self.chip_row, "", TEXT_DIM)
-        self._chip_widgets[key] = chip
-        return chip
-
-    def _bind_chips(self, detail: DetailVM) -> None:
-        for widget in self._chip_widgets.values():
-            widget.pack_forget()
-        for chip_vm in detail.chips:
-            widget = self._ensure_chip(chip_vm.key)
-            if not chip_vm.visible or not chip_vm.text:
-                continue
-            color = self._tone_color(
-                chip_vm.tone, alive=detail.alive, health=detail.health
-            )
-            widget.configure(text=f"  {chip_vm.text}  ", text_color=color)
-            widget.pack(side="left", padx=3)
+            self._place_cards(self._grid_columns())
+        # 空态提示
+        if not items:
+            if not self._empty_label.winfo_ismapped():
+                self._empty_label.grid(row=0, column=0, columnspan=3, pady=40)
+        elif self._empty_label.winfo_ismapped():
+            self._empty_label.grid_remove()
+        # hero 统计
+        try:
+            self.hero_panel.update(build_hero(self.manager))
+        except tk.TclError:
+            pass
 
     def _bind_detail(self, *, refresh_log: bool = False) -> None:
-        """按 DetailVM 就地更新右侧；未变化则跳过。"""
+        """更新详情快照。
+
+        右侧详情栏已移除，详情改由弹窗承载；这里只维护 `_detail_snap`，
+        供弹窗读取数据。
+        """
         if not self.session.active:
             return
         mp = self._selected()
         detail = build_detail(mp)
-        prev = self._detail_snap
-        if prev != detail:
-            self.detail_title.configure(text=detail.title)
-            self.detail_sub.configure(text=detail.subtitle)
-            if not detail.empty:
-                self.daemon_switch.configure(command=None)
-                self.daemon_var.set(detail.daemon)
-                self.daemon_switch.configure(command=self._toggle_daemon)
-            if prev is None or prev.chips != detail.chips:
-                self._bind_chips(detail)
-            if (
-                prev is None
-                or prev.busy != detail.busy
-                or prev.alive != detail.alive
-                or prev.empty != detail.empty
-            ):
-                self._sync_action_buttons(mp)
-            if prev is None or prev.summary != detail.summary:
-                self.summary.configure(text=detail.summary)
-            self._detail_snap = detail
+        if not detail.empty:
+            self.daemon_var.set(detail.daemon)
+        self._detail_snap = detail
 
         # 运行日志轮询入口已隐藏（任务 + 日志卡片整块被注释）。
         if False:
@@ -787,44 +642,6 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
         if not self._selected_id:
             return None
         return self.manager.get(self._selected_id)
-
-    def _sync_action_buttons(self, mp) -> None:
-        """启动=青绿强调（可启时）；停止=红色强调（可停时）；否则灰色弱化。"""
-        muted = {
-            "fg_color": DEAD,
-            "hover_color": TEXT_DIM,
-            "text_color": TEXT,
-            "state": "disabled",
-        }
-        start_on = {
-            "fg_color": ACCENT_DIM,
-            "hover_color": ACCENT,
-            "text_color": "#04140F",
-            "state": "normal",
-        }
-        stop_on = {
-            "fg_color": DANGER_DIM,
-            "hover_color": DANGER,
-            "text_color": TEXT,
-            "state": "normal",
-        }
-        if mp is None:
-            self.btn_start.configure(**muted)
-            self.btn_stop.configure(**muted)
-            return
-        busy = bool(mp.runtime.busy)
-        alive = bool(mp.runtime.process_alive)
-        if busy:
-            self.btn_start.configure(**muted)
-            self.btn_stop.configure(**muted)
-            return
-        if alive:
-            self.btn_start.configure(**muted)
-            self.btn_stop.configure(**stop_on)
-        else:
-            permitted = bool(mp.cfg.approval_status == "approved" and mp.cfg.enabled)
-            self.btn_start.configure(**(start_on if permitted else muted))
-            self.btn_stop.configure(**muted)
 
     def _on_runtime_change(self, _instance_id: str) -> None:
         if self._refresh_scheduled:
@@ -1390,6 +1207,83 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
                 subprocess.Popen(["xdg-open", path])
         self.session.perform("open_cwd", mp.cfg, open_folder)
 
+    # —— 按 id 的操作入口（节点卡的按钮与右键菜单用）——
+
+    def _open_detail_for(self, instance_id: str) -> None:
+        """双击节点卡：打开该节点的详情弹窗。"""
+        self._select(instance_id)
+        self._open_detail_dialog()
+
+    def _open_detail_dialog(self) -> None:
+        """打开当前选中节点的详情弹窗。"""
+        mp = self._selected()
+        if mp is None:
+            return
+        from node_detail_dialog import NodeDetailDialog
+        if self._detail_dialog is not None:
+            try:
+                self._detail_dialog.destroy()
+            except tk.TclError:
+                pass
+        dlg = NodeDetailDialog(self, mp, on_refresh=self._safe_refresh)
+        self._detail_dialog = dlg
+
+    def _start_by_id(self, instance_id: str) -> None:
+        self._selected_id = instance_id
+        self._start()
+
+    def _stop_by_id(self, instance_id: str) -> None:
+        self._selected_id = instance_id
+        self._stop()
+
+    def _open_cwd_by_id(self, instance_id: str) -> None:
+        self._selected_id = instance_id
+        self._open_cwd()
+
+    def _refresh_health_by_id(self, instance_id: str) -> None:
+        self._selected_id = instance_id
+        self._refresh_health()
+
+    # —— 节点卡右键菜单 ——
+
+    def _build_card_menu(self, instance_id: str) -> tk.Menu:
+        """构造节点卡右键菜单：打开目录 / 刷新健康 / 移除实例。"""
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(
+            label=CARD_MENU_ITEMS[0], command=lambda: self._open_cwd_by_id(instance_id)
+        )
+        menu.add_command(
+            label=CARD_MENU_ITEMS[1], command=lambda: self._refresh_health_by_id(instance_id)
+        )
+        menu.add_separator()
+        menu.add_command(
+            label=CARD_MENU_ITEMS[2], command=lambda: self._remove_instance(instance_id)
+        )
+        return menu
+
+    def _show_card_menu(self, instance_id: str, event) -> None:
+        """弹出节点卡右键菜单。"""
+        menu = self._build_card_menu(instance_id)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            # 必须释放 grab，否则主窗口会失去输入权
+            menu.grab_release()
+
+    # —— 顶栏时钟 ——
+
+    def _tick_clock(self) -> None:
+        """顶栏时钟：每秒走动。"""
+        if self._quitting:
+            return
+        try:
+            label = self._clock_label
+            if label is not None and label.winfo_exists():
+                label.configure(text=time.strftime("%Y-%m-%d %H:%M:%S"))
+        except tk.TclError:
+            return
+        self.after(1000, self._tick_clock)
+
     def _setup_tray(self) -> None:
         if not tray_available():
             return
@@ -1462,8 +1356,6 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
             # 使快照失效，重绑文本类控件（CTkTextbox 残影主要靠重写内容清除）
             self._detail_snap = None
             self._log_snap = None
-            for row in self._list_rows.values():
-                row.snapshot = None
             self._bind_list()
             self._bind_detail(refresh_log=True)
             self._nudge_win_composite()

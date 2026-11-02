@@ -46,6 +46,14 @@ class DashboardAuthUI:
         self._chip_widgets = {}
         self._list_order = ()
         self._detail_snap = self._log_snap = None
+        # 详情弹窗是 CTkToplevel，不是子控件，不会被上面那次 destroy 清掉，
+        # 必须显式关掉，否则登录页会浮在弹窗之下。
+        if getattr(self, "_detail_dialog", None) is not None:
+            try:
+                self._detail_dialog.destroy()
+            except tk.TclError:
+                pass
+            self._detail_dialog = None
         if self._login_view is not None:
             self._login_view.destroy()
         self._login_view = LoginView(self, self._authenticated, reason)
