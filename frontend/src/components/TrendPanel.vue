@@ -453,18 +453,28 @@ onBeforeUnmount(() => {
       <div v-if="compact" class="trend-compact-tools">
         <!-- 品种芯片：标题与芯片分层。标题之前混在 chips 容器里，
              会和按钮并排显示，按钮放大后更明显。 -->
-        <div v-if="symbolOptions?.length" class="trend-compact-block">
-          <span class="trend-field-k">标的趋势 - 多空值</span>
-          <div class="trend-chips">
-            <button
-              v-for="s in symbolOptions"
-              :key="s"
-              class="trend-chip"
-              :class="{ active: s === symbol }"
-              @click="pickSymbol(s)"
-            >
-              {{ s }}
-            </button>
+        <div class="trend-compact-block">
+          <span v-if="symbolOptions?.length" class="trend-field-k">标的趋势 - 多空值</span>
+          <!-- 芯片行：当前价与芯片并排在同一行 -->
+          <div class="trend-compact-row">
+            <div v-if="symbolOptions?.length" class="trend-chips">
+              <button
+                v-for="s in symbolOptions"
+                :key="s"
+                class="trend-chip"
+                :class="{ active: s === symbol }"
+                @click="pickSymbol(s)"
+              >
+                {{ s }}
+              </button>
+            </div>
+            <!-- 当前价：紧凑模式下与品种芯片同一行，靠右 -->
+            <div class="trend-compact-price">
+              <div class="trend-price">{{ fmtPrice(data?.price) }}</div>
+              <div class="muted trend-sub trend-compact-price-k">
+                当前价<template v-if="data?.price_source === 'close'">（报价缺失，取收盘价）</template>
+              </div>
+            </div>
           </div>
         </div>
         <!-- <label class="trend-field">
@@ -479,7 +489,7 @@ onBeforeUnmount(() => {
           <strong>{{ data?.symbol || symbol || '—' }}</strong>
           <span class="muted trend-sub">{{ timeframeLabel(cfg.timeframe) }}</span>
         </div> -->
-        <div class="right">
+        <div v-if="!compact" class="right">
           <div class="trend-price">{{ fmtPrice(data?.price) }}</div>
           <div class="muted trend-sub">
             当前价<template v-if="data?.price_source === 'close'">（报价缺失，取收盘价）</template>
@@ -727,6 +737,13 @@ onBeforeUnmount(() => {
   margin-top: 12px;
   flex-wrap: wrap;
 }
+/* 芯片 + 当前价：同一行并排，芯片可滚动，当前价靠右固定 */
+.trend-compact-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
 /* 品种块：内部纵向排列（标题 + 芯片），整体作为一个 flex item */
 .trend-compact-block {
   display: flex;
@@ -734,7 +751,22 @@ onBeforeUnmount(() => {
   gap: 6px;
   min-width: 0;
   flex: 1 1 240px;
-}.trend-compact .trend-score { font-size: 26px; }
+}
+/* 当前价：紧凑模式下贴在品种芯片行右侧 */
+.trend-compact-price {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  flex: 0 0 auto;
+  text-align: right;
+}
+/* 芯片区占据剩余空间并可滚动，当前列不参与滚动 */
+.trend-compact-row > .trend-chips {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.trend-compact-price-k { margin-left: 0; }.trend-compact .trend-score { font-size: 26px; }
 .trend-compact .trend-chips { margin-top: 0; }
 .trend-saved { color: var(--primary); font-size: 12px; margin: 0 0 10px; }
 .trend-sub { font-size: 12px; margin-left: 8px; }
@@ -837,6 +869,23 @@ onBeforeUnmount(() => {
     width: 100%;
     min-width: 0;
     max-width: 100%;
+  }
+
+  /* 窄屏下当前价仍固定在芯片行右侧（不换行、不撑满） */
+  .trend-compact-price {
+    align-items: flex-end;
+    flex: 0 0 auto;
+    max-width: 45%;
+    margin-left: 0;
+  }
+  /* 芯片行：芯片占满剩余空间并可横向滚动，当前列保持可见 */
+  .trend-compact-row {
+    width: 100%;
+    min-width: 0;
+  }
+  .trend-compact-row > .trend-chips {
+    flex: 1 1 auto;
+    min-width: 0;
   }
 
   /* 周期：横向滑动，避免 9 个按钮撑破卡片换行成三行 */
