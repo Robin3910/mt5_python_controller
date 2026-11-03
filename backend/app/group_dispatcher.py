@@ -628,6 +628,46 @@ class GroupDispatcher:
             "total": closing + forced,
         }
 
+    async def stop_magics_on_node(
+        self, node_id: str, magics: list[int], *, signal_id: str,
+        reason: str = "manual_close_channel",
+    ) -> dict:
+        """只终止该节点上这些魔术号对应的未收口子任务。
+
+        频道平仓 / 频道删挂单用它：同一节点上另一个频道的任务保持运行。
+        """
+        want = {int(m) for m in magics}
+        if not node_id or not want:
+            return {"stopped": 0, "forced": 0, "total": 0}
+        subs = await group_persist.active_subtasks_for_node(node_id)
+        closing = 0
+        forced = 0
+        for sub in subs:
+            if sub.get("status") in group_rules.SUBTASK_TERMINAL:
+                continue
+            magic = sub.get("magic")
+            try:
+                magic_i = int(magic) if magic is not None else 0
+            except (TypeError, ValueError):
+                continue
+            if magic_i not in want:
+                continue
+            outcome = await self._stop_subtask(sub, signal_id=signal_id, reason=reason)
+            if outcome["status"] == "closing":
+                closing += 1
+            elif outcome["status"] == "forced":
+                forced += 1
+        if closing or forced:
+            logger.info(
+                "node %s channel close -> %d strategy task(s) closing, %d forced",
+                node_id, closing, forced,
+            )
+        return {
+            "stopped": closing,
+            "forced": forced,
+            "total": closing + forced,
+        }
+
     async def _stop_subtask(
         self, sub: dict, *, signal_id: str, reason: str,
     ) -> dict:

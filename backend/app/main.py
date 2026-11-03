@@ -22,6 +22,7 @@ from . import (
     deals_api,
     events,
     follow_api,
+    follow_channel_api,
     grid_sizing_api,
     group_persist,
     group_service,
@@ -157,6 +158,7 @@ for r in (
     admin_ws.router,
     trading_api.router,
     follow_api.router,
+    follow_channel_api.router,
     ai_follow_api.router,
     deals_api.router,
 ):

@@ -22,6 +22,12 @@ const router = createRouter({
       meta: { menu: 'home' },
     },
     {
+      path: '/home/nodes/:id',
+      name: 'home-node',
+      component: () => import('@/views/HomeNodeView.vue'),
+      meta: { menu: 'home' },
+    },
+    {
       path: '/trading',
       name: 'trading',
       component: () => import('@/views/TradingView.vue'),

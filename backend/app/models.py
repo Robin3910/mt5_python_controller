@@ -889,9 +889,58 @@ class CloseBatchRequest(CloseRequest):
 # ------------------------- 删挂单请求 -----------------------
 class CancelPendingRequest(BaseModel):
     """远程批量撤挂单请求（只撤未成交挂单，不动持仓）。"""
-    # all（默认，撤光）/ manual（只撤手工单）/ strategy（只撤指定魔术号，暂不开放）
+    # all（默认，撤光）/ manual（只撤手工单）/ strategy（只撤 magics 里的策略单）
+    # strategy 且带 magics 时，只停这些魔术号的子任务，不影响同节点其它频道。
     scope: str = "all"
     magics: Optional[list[int]] = None
+
+
+class FollowMagicChannel(BaseModel):
+    """一个策略魔术号属于哪个频道，以及它的子任务是否还在跑。"""
+    magic: int
+    market: str
+    template_id: str
+    group_id: str
+    dispatch_id: int
+    active: bool
+
+
+class FollowClosedPosition(BaseModel):
+    """频道历史持仓：同一笔仓的开平仓成交收成一行。"""
+    position_id: int
+    symbol: str
+    direction: str
+    volume: float
+    price_open: float
+    price_close: float
+    closed_at: int
+    status: str
+    status_label: str
+    profit: float
+
+
+class FollowChannelsOut(BaseModel):
+    """节点主页频道数据。实时持仓不在这里，前端用账户快照按 magic 过滤。"""
+    magics: list[FollowMagicChannel] = Field(default_factory=list)
+    ai_history: list[FollowClosedPosition] = Field(default_factory=list)
+    follow_history: list[FollowClosedPosition] = Field(default_factory=list)
+
+
+class FollowChannelCloseRequest(BaseModel):
+    """按频道平仓。all 停该频道子任务；profit / ticket 只平仓、不停策略。"""
+    market: str
+    mode: str = "all"
+    ticket: Optional[int] = None
+
+
+class FollowChannelCloseResult(BaseModel):
+    status: str
+    node_id: str
+    market: str
+    mode: str
+    closed: int = 0
+    failed: list[int] = Field(default_factory=list)
+    strategies: dict = Field(default_factory=dict)
 
 
 # ----------------------- 中控台手动触发 -----------------------

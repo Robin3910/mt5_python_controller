@@ -370,6 +370,46 @@ export interface CancelPendingRequest {
   magics?: number[] | null
 }
 
+/** 节点主页：一个策略魔术号属于 AI 交易还是带单，以及子任务是否还在跑。 */
+export interface FollowMagicChannel {
+  magic: number
+  market: 'ai' | 'follow' | string
+  template_id: string
+  group_id: string
+  dispatch_id: number
+  active: boolean
+}
+
+/** 频道历史持仓：同一笔仓的开平仓成交收成一行。 */
+export interface FollowClosedPosition {
+  position_id: number
+  symbol: string
+  direction: string
+  volume: number
+  price_open: number
+  price_close: number
+  closed_at: number
+  status: 'tp' | 'sl' | 'closed' | string
+  status_label: string
+  profit: number
+}
+
+export interface FollowChannelsOut {
+  magics: FollowMagicChannel[]
+  ai_history: FollowClosedPosition[]
+  follow_history: FollowClosedPosition[]
+}
+
+export interface FollowChannelCloseResult {
+  status: string
+  node_id: string
+  market: string
+  mode: string
+  closed: number
+  failed: number[]
+  strategies?: { stopped: number; forced: number; total: number }
+}
+
 export interface CancelPendingResult {
   status: 'ok' | 'partial' | 'regenerated' | 'error' | string
   node_id: string

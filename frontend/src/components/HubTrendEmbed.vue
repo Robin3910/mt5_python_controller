@@ -12,6 +12,8 @@ const DEFAULT_SYMBOL = 'XAUUSD'
 defineProps<{
   /** 总览嵌入：精简标题 + 只展示得分条 */
   compact?: boolean
+  /** 首页设计稿外观，传给 TrendPanel，不走总览 compact 布局 */
+  home?: boolean
 }>()
 
 const hub = useHubStore()
@@ -92,7 +94,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div :class="{ 'hub-trend-compact': compact }">
+  <div :class="{ 'hub-trend-compact': compact && !home, 'hub-trend-home': home }">
     <div class="row between hub-trend-head">
       <!-- <div>
         <h2 v-if="!compact" style="margin: 0">趋势面板</h2>
@@ -141,8 +143,8 @@ onUnmounted(() => {
       </div> -->
     </div>
 
-    <div v-if="loading" class="card card-pad muted">正在加载节点列表…</div>
-    <div v-else-if="!selectedNodeId" class="card card-pad muted">
+    <div v-if="loading" class="card card-pad muted" :class="{ 'hub-home-note': home }">正在加载节点列表…</div>
+    <div v-else-if="!selectedNodeId" class="card card-pad muted" :class="{ 'hub-home-note': home }">
       暂无可用节点。请先在「节点」接入至少一个节点后再查看趋势。
     </div>
     <TrendPanel
@@ -154,7 +156,8 @@ onUnmounted(() => {
       :default-symbol="DEFAULT_SYMBOL"
       symbol-storage-prefix="trend:hub:symbol"
       :online="online"
-      :compact="compact"
+      :compact="compact && !home"
+      :home="home"
     />
   </div>
 </template>
@@ -166,6 +169,14 @@ onUnmounted(() => {
 }
 .hub-trend-compact .hub-trend-head {
   margin-bottom: 10px;
+}
+.hub-trend-home .hub-trend-head { display: none; }
+.hub-home-note {
+  background: #101828;
+  border: 1px solid #1C2740;
+  border-radius: 12px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
+  color: #8B96A8;
 }
 .hub-trend-title {
   font-size: 15px;

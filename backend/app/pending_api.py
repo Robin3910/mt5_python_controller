@@ -30,7 +30,7 @@ from .group_dispatcher import GroupDispatcher
 from .group_persist import active_subtasks_for_node
 from .limit_watch import node_has_watch
 from .models import CancelPendingRequest, build_cancel_all_command
-from .permissions import MENU_DASHBOARD, MENU_NODES, Principal
+from .permissions import MENU_DASHBOARD, MENU_HOME, MENU_NODES, Principal
 from .redis_store import RedisStore
 
 logger = logging.getLogger(__name__)
@@ -107,9 +107,12 @@ async def cancel_pending_on_node_route(
     request: Request,
     store: RedisStore = Depends(get_store),
     group_dispatcher: GroupDispatcher = Depends(get_group_dispatcher),
-    p: Principal = Depends(require_menu(MENU_NODES, MENU_DASHBOARD)),
+    p: Principal = Depends(require_menu(MENU_HOME, MENU_NODES, MENU_DASHBOARD)),
 ):
-    """删掉该节点的挂单：先停策略（否则策略会补单），再全量撤单，已有没有持仓不受影响。
+    """删掉该节点的挂单：先停策略（否则策略会补单），再撤单，已有持仓不受影响。
+
+    scope=all 停该节点全部子任务。scope=strategy 且带 magics 时只停这些魔术号，
+    供节点主页按频道删挂单，不波及另一个频道。
 
     撤完复扫一次：若挂单又长回来（多半是限价监听自动触发），停止重试并在结果里说明。
     """
@@ -136,9 +139,15 @@ async def cancel_pending_on_node_route(
     try:
         # [2] 先停策略 —— 顺序不可颠倒，否则 strategy_runner 会把刚撤掉的单补回来
         signal_id = _cmd_id()
-        strategies = await group_dispatcher.stop_all_on_node(
-            node_id, signal_id=signal_id, reason=_STOP_REASON,
-        )
+        magics = [int(m) for m in (body.magics or []) if m is not None]
+        if scope == "strategy" and magics:
+            strategies = await group_dispatcher.stop_magics_on_node(
+                node_id, magics, signal_id=signal_id, reason=_STOP_REASON,
+            )
+        else:
+            strategies = await group_dispatcher.stop_all_on_node(
+                node_id, signal_id=signal_id, reason=_STOP_REASON,
+            )
         settled = await _wait_subtasks_settled(node_id)
 
         # [3]+[4] 撤单 + 复扫：remaining 由节点侧撤完复读挂单簿给出，是权威判据
@@ -178,7 +187,7 @@ async def cancel_pending_on_node_route(
         # [5] 审计
         await persist.audit(
             admin, "cancel_pending_node", node_id,
-            {"scope": scope}, result["status"], ip,
+            {"scope": scope, "magics": magics}, result["status"], ip,
             category="node",
             before={"orders": before_orders},
             after={

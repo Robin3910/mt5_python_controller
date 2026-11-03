@@ -18,6 +18,42 @@ const route = useRoute()
 const authed = computed(() => auth.isAuthed)
 const userLabel = computed(() => auth.me?.display_name || auth.me?.username || '')
 
+const PAGE_TITLES: Record<string, string> = {
+  home: '首页',
+  'home-node': '节点主页',
+  trading: '交易',
+  'ai-trade': 'AI交易',
+  follow: '带单',
+  me: '我的',
+  config: '配置',
+  nodes: '节点',
+  'node-detail': '节点',
+  trend: '趋势',
+  groups: '分组',
+  'group-signals': '分组信号',
+  strategies: '策略',
+  'user-strategies': '策略',
+  events: '事件',
+  audits: '审计',
+  console: '控制台',
+  permissions: '用户权限',
+  dashboard: '总览',
+  'client-versions': '客户端版本',
+}
+const pageTitle = computed(() => PAGE_TITLES[String(route.name || '')] || '')
+const trendConfigOpen = computed(() => route.name === 'home' && route.query.config === 'trend')
+const nodeHomeOpen = computed(() => route.name === 'home-node')
+const homeNavActive = computed(() => route.name === 'home' || route.name === 'home-node')
+const customerBackTitle = computed(() => {
+  if (trendConfigOpen.value) return '参数配置'
+  if (route.name === 'home') return ''
+  if (nodeHomeOpen.value) return '节点主页'
+  return pageTitle.value
+})
+function onCustomerBack(): void {
+  router.push({ name: 'home' })
+}
+
 watch(
   () => auth.me,
   (me) => {
@@ -48,8 +84,45 @@ watch(() => auth.token, setupWs)
 </script>
 
 <template>
-  <div class="app-shell">
-    <header v-if="authed" class="topbar glass-bar">
+  <div class="app-shell" :class="{ 'is-customer': authed && !auth.isAdmin }">
+    <header v-if="authed && !auth.isAdmin" class="topbar topbar-customer">
+      <div class="topbar-customer-inner">
+        <div class="brand brand-customer">
+          <button v-if="customerBackTitle" type="button" class="brand-back" @click="onCustomerBack">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg>
+            <span>{{ customerBackTitle }}</span>
+          </button>
+          <template v-else>
+            <span class="brand-mark" aria-hidden="true">T</span>
+            <p v-if="pageTitle" class="brand-page">{{ pageTitle }}</p>
+          </template>
+        </div>
+        <nav class="nav nav-customer" aria-label="顶部导航">
+          <RouterLink v-if="auth.hasMenu('home')" to="/home" :class="{ 'router-link-active': homeNavActive }">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>
+            <span>首页</span>
+          </RouterLink>
+          <RouterLink v-if="auth.hasMenu('trading')" to="/trading">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M6.99 11 3 15l3.99 4v-3H14v-2H6.99v-3zM21 9l-3.99-4v3H10v2h7.01v3L21 9z"/></svg>
+            <span>交易</span>
+          </RouterLink>
+          <RouterLink v-if="auth.hasMenu('ai_trade')" to="/ai-trade">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M20 9V7c0-1.1-.9-2-2-2h-3c0-1.66-1.34-3-3-3S9 3.34 9 5H6c-1.1 0-2 .9-2 2v2c-1.66 0-3 1.34-3 3s1.34 3 3 3v4c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2v-4c1.66 0 3-1.34 3-3s-1.34-3-3-3zM7.5 11.5c0-.83.67-1.5 1.5-1.5s1.5.67 1.5 1.5S9.83 13 9 13s-1.5-.67-1.5-1.5zM16 17H8v-2h8v2zm-1-4c-.83 0-1.5-.67-1.5-1.5S14.17 10 15 10s1.5.67 1.5 1.5S15.83 13 15 13z"/></svg>
+            <span>AI交易</span>
+          </RouterLink>
+          <RouterLink v-if="auth.hasMenu('follow')" to="/follow">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/></svg>
+            <span>带单</span>
+          </RouterLink>
+          <RouterLink to="/me">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>
+            <span>我的</span>
+          </RouterLink>
+        </nav>
+      </div>
+    </header>
+
+    <header v-else-if="authed" class="topbar glass-bar">
       <div class="brand">
         <span class="brand-icon" aria-hidden="true">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -64,27 +137,8 @@ watch(() => auth.token, setupWs)
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 11l9-8 9 8"/><path d="M5 10v10a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1V10"/></svg>
           <span>首页</span>
         </RouterLink>
-        <RouterLink v-if="!auth.isAdmin && auth.hasMenu('trading')" to="/trading">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 17l6-6 4 4 8-8"/><path d="M14 7h7v7"/></svg>
-          <span>交易</span>
-        </RouterLink>
-        <RouterLink v-if="!auth.isAdmin && auth.hasMenu('follow')" to="/follow">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
-          <span>带单</span>
-        </RouterLink>
-        <RouterLink v-if="!auth.isAdmin && auth.hasMenu('ai_trade')" to="/ai-trade">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="8" width="16" height="12" rx="2"/><path d="M12 8V4"/><circle cx="12" cy="3" r="1.5"/><path d="M9 14h.01M15 14h.01M9.5 17h5"/></svg>
-          <span>AI 交易</span>
-        </RouterLink>
-        <!-- 普通用户：其他菜单全收进「我的」枢纽页，仅保留首页/交易/带单/AI交易/我的五个入口 -->
-        <template v-if="!auth.isAdmin">
-          <RouterLink to="/me">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-            <span>我的</span>
-          </RouterLink>
-        </template>
-        <!-- 管理员：仅保留 首页 / 总览 / 节点 / 分组管理 / 策略管理 / 我的；带单、AI 交易、用户权限暂时隐藏 -->
-        <template v-else>
+        <!-- 管理员：仅显示总览、节点、分组管理、策略管理、首页、我的 -->
+        <template v-if="auth.isAdmin">
           <RouterLink v-if="auth.hasMenu('dashboard')" to="/">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
             <span>总览</span>

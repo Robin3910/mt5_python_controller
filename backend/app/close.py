@@ -19,7 +19,7 @@ from .deps import (
 )
 from .group_dispatcher import GroupDispatcher
 from .models import CloseBatchRequest, CloseRequest, build_close_command
-from .permissions import MENU_DASHBOARD, MENU_NODES, Principal
+from .permissions import MENU_DASHBOARD, MENU_HOME, MENU_NODES, Principal
 from .redis_store import RedisStore
 
 router = APIRouter(prefix="/api", tags=["close"])
@@ -52,9 +52,11 @@ async def close_node(
     request: Request,
     store: RedisStore = Depends(get_store),
     group_dispatcher: GroupDispatcher = Depends(get_group_dispatcher),
-    p: Principal = Depends(require_menu(MENU_NODES, MENU_DASHBOARD)),
+    p: Principal = Depends(require_menu(MENU_HOME, MENU_NODES, MENU_DASHBOARD)),
 ):
     """对单个节点下发平仓（全平 / 按品种 / 按订单）。
+
+    首页节点主页的账户级平仓、平盈也走这里；频道平仓走 follow-channels。
 
     全平会先终止该节点上所有未收口的策略子任务，再下发 close，避免网格/限价监控把仓补回来。
     """
