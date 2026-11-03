@@ -1019,16 +1019,22 @@ class TwoFAPasswordRequest(BaseModel):
 
 # ------------------------- 手机号注册 / 验证码登录 -------------------------
 class PhoneSmsSendRequest(BaseModel):
-    """发送验证码。purpose 决定验证码的用途（register / login 互不可用）。"""
+    """发送验证码。
+
+    purpose 目前只有 auth 一个取值（登录与注册共用同一种验证码）。
+    captcha_verify_param 是阿里云验证码的回传参数，**仅在服务端返回 428
+    （需要人机验证）时**才需要带上。
+    """
     phone: str = Field(min_length=1, max_length=32)
-    purpose: str = Field(default="login", max_length=16)
+    purpose: str = Field(default="auth", max_length=16)
+    captcha_verify_param: Optional[str] = Field(default=None, max_length=4096)
 
 
 class PhoneSmsVerifyRequest(BaseModel):
-    """校验验证码；通过后返回 ticket。"""
+    """校验验证码；通过后返回 ticket 与 next_action。"""
     phone: str = Field(min_length=1, max_length=32)
     code: str = Field(min_length=1, max_length=16)
-    purpose: str = Field(default="login", max_length=16)
+    purpose: str = Field(default="auth", max_length=16)
 
 
 class PhoneRegisterRequest(BaseModel):
@@ -1056,9 +1062,15 @@ class PhoneRegisterResult(BaseModel):
 
 
 class PhoneSmsLoginRequest(BaseModel):
-    """验证码登录。"""
+    """验证码登录。
+
+    code 与 ticket 二选一：
+    - code：验证码明文，服务端自行校验
+    - ticket：/sms/verify 已校验过的票据，服务端直接采信（省一次往返）
+    """
     phone: str = Field(min_length=1, max_length=32)
-    code: str = Field(min_length=1, max_length=16)
+    code: Optional[str] = Field(default=None, max_length=16)
+    ticket: Optional[str] = Field(default=None, max_length=4096)
 
 
 class SmsConfigOut(BaseModel):
@@ -1074,6 +1086,15 @@ class SmsConfigOut(BaseModel):
     daily_limit_per_phone: int = 10
     hourly_limit_per_ip: int = 20
     max_verify_attempts: int = 5
+    daily_limit_total: int = 500
+    daily_limit_per_ip: int = 50
+    captcha_enabled: bool = False
+    captcha_prefix: str = ""
+    captcha_scene_id: str = ""
+    captcha_endpoint: str = "captcha.cn-shanghai.aliyuncs.com"
+    captcha_phone_threshold: int = 3
+    captcha_ip_threshold: int = 5
+    captcha_new_account: bool = True
     # 今日已发送条数（Redis 计数，只读）
     today_sent: int = 0
     # AccessKey 是否已注入 env（只回显「有没有」，不回显内容）

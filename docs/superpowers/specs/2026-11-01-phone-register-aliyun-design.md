@@ -597,6 +597,171 @@ POST /api/auth/sms/send {purpose: login}
 
 ---
 
+## 附录 A. 修订：统一认证流程 + 自适应人机验证（2026-11-02）
+
+> 本附录记录 §4 之后对方案的三处修订（已实施并通过测试），与上文冲突处以本附录为准。
+
+### A.1 背景
+
+初版设计里登录与注册各发一种验证码（`purpose=register` / `purpose=login`）。
+实际使用中发现两个问题：
+
+1. **用户要收两次短信**：从登录入口进来的人还不知道自己有没有账号 —— 未注册时
+   得先收登录码，再收注册码。
+2. **发码接口可被脚本刷**：短信有成本，刷量会造成直接经济损失与账号风控。
+
+### A.2 修订一：`purpose` 合并为 `auth`（直接废弃 register / login）
+
+**问题**：`purpose` 隔离的初衷是防止「用登录验证码去注册」。但对用户而言，
+「收一次码 → 服务端判断你是谁」才是正确的产品形态 —— 隔离的前提是用户**已经知道**
+自己要注册还是登录，而这恰恰是用户不知道的事。
+
+**改法**：
+
+| 项 | 原 | 现 |
+|---|---|---|
+| 验证码用途 | `register` / `login` 两种 | **`auth` 一种** |
+| 用途隔离 | Redis key 带 purpose | 保留 key 隔离（只有一个值），**真正的隔离改由票据承担** |
+| 票据用途 | `register` / `login` 严格单值 | 集合语义：`auth` 票据可用于 login **或** register |
+
+`/api/auth/sms/verify` 校验通过后返回 `next_action` 分流：
+
+```
+next_action = "login"             已注册且已启用 → 前端用票据换 token
+next_action = "register"          未注册       → 前端直接进注册第二步（不再收码）
+next_action = "pending_approval"  已注册但待审核 → 提示等待管理员审核
+```
+
+**这不是号码枚举漏洞**：调用方已经通过验证码证明了持有该号码，
+号码是否注册是调用方本来就知道的信息。发送接口的响应体仍然完全一致（§8.3 不变）。
+
+**「不用再收一次验证码」如何落地**：`/sms/verify` 签发的是 `auth` 票据，
+`/api/auth/register` 与 `/api/auth/sms/login` 都接受它。前端从登录页发现
+`next_action=register` 时，把票据交给注册页（走 Pinia store，**不放 URL** ——
+JWT 进 URL 会进浏览器历史与 Referer 头），注册页直接渲染第二步。
+
+### A.3 修订二：重复注册直接拒绝（`pending_approval` 账号）
+
+原设计 §16.3 留了个开放问题：「审核期间用户是否允许重复提交注册」。
+现明确：**直接拒绝**（409「该手机号已注册，请直接登录」）。
+
+理由：允许重复注册会让审核状态变成可被反复触发的状态机，用户能靠反复提交
+把「未审核」这个状态刷下去；而且覆盖更新资料本就可以通过用户管理页做，
+不需要开放给未通过认证的调用方。
+
+### A.4 修订三：自适应人机验证（阿里云验证码 2.0）
+
+**产品**：阿里云验证码 2.0（`alibabacloud_captcha20230305`，服务端接口
+`VerifyIntelligentCaptcha`）。注意它与「号码认证服务（PNVS）」是**两个独立产品**，
+需分别开通与计费，号码认证赠送的额度不能用于验证码。
+
+**自适应触发** —— 默认直接放行，命中阈值才要求滑块，正常用户全程无感：
+
+| 维度 | 默认阈值 | 含义 |
+|---|---|---|
+| 号码 24h 发送次数 | ≥ 3 | 同号反复要码 |
+| IP 1h 发送次数 | ≥ 5 | 同源批量轰炸 |
+| 新账号（注册 < 24h） | 开启 | 新号是典型刷量工具 |
+| 人机验证连续失败 | ≥ 5 | 疑似脚本，直接强制滑块 |
+
+**交互**：
+
+```
+前端 → POST /api/auth/sms/send {phone, purpose:"auth"}
+     ← 428 {detail:"需要完成人机验证"}     # 命中风控
+前端 → 弹阿里云滑块 → 拿到 captchaVerifyParam
+前端 → POST /api/auth/sms/send {phone, purpose:"auth", captcha_verify_param:"..."}
+     ← 200 {ok:true, expire_in, cooldown}
+```
+
+**必须服务端二次校验**：前端回传的 `captcha_verify_param` 是攻击者可控的，
+只信前端等于没做验证。服务端调 `VerifyIntelligentCaptcha` 拿到 `VerifyResult`，
+`false` 才拦截。`captcha_verify_param` 必须**原样透传**给阿里云，任何改写都会导致
+校验失败（官方返回 F003）。同一份 param 只能校验一次（重放返回 F008）。
+
+**厂商异常按放行处理**：阿里云官方示例同样是「接口调用异常，默认放行」——
+人机验证是风控增强手段，不该因为厂商抖动就把正常用户挡在门外。
+只有明确的 `VerifyResult=false`（风控判定不通过）才拦截。
+
+### A.5 修订四：加密模式（EncryptedSceneId）
+
+V3 架构的**可选安全增强**（阿里云 2025-12 上线）。问题：SceneId 明文写在
+前端 JS 里，谁都能拿走白嫖你账号的验证码额度。
+
+**工作流程**：
+
+```
+服务端 → 用 ekey 加密 "sceneId&timestamp&expireTime"（AES-256-CBC + PKCS7）
+       → IV(16B) + 密文 → 标准 Base64 → EncryptedSceneId
+前端 → 从服务端取 EncryptedSceneId → 传给 initAliyunCaptcha
+```
+
+**算法**（与阿里云官方文档一致）：
+
+| 步骤 | 细节 |
+|---|---|
+| 明文 | `f"{sceneId}&{timestamp}&{expireTime}"`，timestamp 是当前 Unix 秒，expireTime 取值 1~86400 |
+| 加密 | AES-256-CBC + PKCS7Padding，密钥 = ekey（Base64 解码后 32 字节） |
+| IV | **每次调用都用全新的 16 字节密码学随机数**（复用 IV 会让相同明文产生相同密文，等于泄露 SceneId） |
+| 编码 | `IV + 密文` 拼接后标准 Base64 |
+
+**本项目的处理**：
+
+- ekey 是密钥 → 走 env 注入（`ALIYUN_CAPTCHA_EKEY`），**不进 DB、不进仓库**
+- **加密模式是否启用由「有没有配 ekey」自动决定**，不设独立开关 —— 多一个开关
+  就多一处可能与实际状态不一致
+- 加密模式下 `/api/auth/sms/status` **不再下发明文 SceneId**，前端只能拿到加密串
+- 加密串有有效期 → 前端每次弹滑块都重新 init 取新的，不复用实例
+- ekey 配错（比如长度不对）→ 降级到明文模式并记日志，不让整个验证码功能挂掉
+
+**注意**：加密模式需要**在控制台场景管理里手动打开开关**才生效。开关打开后，
+验证码服务端会对所有请求强制解密校验 —— 加密逻辑没实现好之前千万别开。
+
+### A.6 修订五：新增限频维度
+
+在原有的「同号发送间隔 / 同号每日 / 同 IP 每小时」之外补两道闸：
+
+- **每 IP 每日上限**（默认 50）：换 IP 也绕不开号/日的双闸。
+- **全局每日上限**（默认 500）：费用失控的最后一道闸，0 = 不限。
+
+### A.7 实施清单
+
+| 文件 | 改动 |
+|---|---|
+| `backend/app/sms_config.py` | `PURPOSE_AUTH`；新增 captcha_* 与日限字段 |
+| `backend/app/captcha_provider.py` | **新增**：阿里云验证码服务端校验封装（含失败放行策略）+ `encrypt_scene_id` |
+| `backend/app/security.py` | 票据校验改集合语义 |
+| `backend/app/sms_service.py` | `needs_captcha()`、新增限频维度、人机验证失败计数 |
+| `backend/app/phone_auth.py` | `/sms/verify` 返回 `next_action`；`/sms/send` 428 分支；注册接受 auth 票据；`/sms/captcha-scene` 下发加密串 |
+| `backend/app/models.py` | `captcha_verify_param` 入参；`/sms/login` 支持 ticket |
+| `backend/app/settings.py` | `aliyun_captcha_ekey`（env 注入的密钥） |
+| `frontend/src/utils/aliyunCaptcha.ts` | **新增**：阿里云验证码前端封装（无官方 npm 包，脚本注入）+ 支持 EncryptedSceneId |
+| `frontend/src/stores/register.ts` | **新增**：登录 → 注册的票据交接（内存传递，不进 URL） |
+| `frontend/src/views/LoginView.vue` | 验证码登录 Tab；`next_action` 分流；428 → 弹滑块重试 |
+| `frontend/src/views/RegisterView.vue` | 支持票据交接直跳第二步 |
+| `frontend/src/views/ConfigView.vue` | 人机验证配置面板 |
+| `backend/tests/test_phone_auth.py` | 47 个用例，覆盖分流、票据越权、428、限频各维度、加密模式 |
+
+### A.8 验证结果
+
+- 后端全量：**1074 passed**（含新增 47 个手机号用例）
+- 前端：`vue-tsc --noEmit` 通过、`vite build` 通过
+- 真实 HTTP 端到端脚本：注册 / 待审核 / 审核后登录 / 票据登录 / 428 触发全部通过
+- 加密实现按阿里云规范逐项验证：round-trip 解密还原、20 次加密 IV 全不同、
+  密文长度为块大小整数倍、ekey 长度错误明确报错、TTL 越界夹取
+- 容器构建：`alibabacloud_captcha20230305-1.1.4` 安装成功
+
+### A.9 剩余待办
+
+1. **创建验证场景**：控制台「场景管理 → 新建场景」，接入方式选 **Web/H5**，
+   形态选 **滑块验证**，拿到 SceneId 填进配置页。
+2. **开启加密模式**（可选但建议）：确认加密链路测试通过后，在场景列表里打开
+   「加密模式」开关。
+3. **RAM 授权**：给 AccessKey 加 `captcha:*` 权限（与号码认证的
+   `dypns:SendSmsVerifyCode` 并存，互不影响）。
+
+---
+
 ## 15. 风险与缓解
 
 | 风险 | 等级 | 缓解 |

@@ -1,8 +1,13 @@
 <script setup lang="ts">
 // 注册页：手机号 → 验证码 → 昵称 / 密码，两屏式
+//
+// **从登录页跳转过来时可以跳过验证码**：登录页校验通过后若发现该号码未注册，
+// 会把「手机号 + 票据」交给本页（见 stores/register.ts），本页直接进第二步。
 import { onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
+import { useRegisterStore } from '@/stores/register'
+import { useAliyunCaptcha } from '@/utils/aliyunCaptcha'
 
 const phone = ref('')
 const code = ref('')
@@ -23,15 +28,49 @@ const done = ref(false)
 const pendingApproval = ref(false)
 /** 短信服务未配置（前端直接隐藏注册入口） */
 const unavailable = ref(false)
+/** 阿里云验证码配置（自适应：有风险时才弹滑块） */
+const captchaPrefix = ref('')
+const captchaSceneId = ref('')
+/** 加密模式下的短效串（服务端动态生成）；空串 = 非加密模式 */
+const captchaEncrypted = ref('')
 
 const auth = useAuthStore()
+const registerStore = useRegisterStore()
 const router = useRouter()
 
 let cooldownTimer: number | undefined
 
+const captcha = useAliyunCaptcha({
+  get prefix() {
+    return captchaPrefix.value
+  },
+  get sceneId() {
+    return captchaSceneId.value
+  },
+  encryptedSceneId: async () => {
+    const scene = await auth.fetchCaptchaScene()
+    captchaSceneId.value = scene.sceneId
+    captchaEncrypted.value = scene.encrypted
+    return scene.encrypted
+  },
+})
+
 onMounted(async () => {
   const status = await auth.fetchSmsStatus()
-  if (!status.enabled) unavailable.value = true
+  if (!status.enabled) {
+    unavailable.value = true
+    return
+  }
+  captchaPrefix.value = status.captcha_prefix || ''
+  captchaSceneId.value = status.captcha_scene_id || ''
+
+  // 登录页发现「未注册」后交接过来的票据 —— 直接进第二步，不用再收验证码
+  const handoff = registerStore.takeHandoff()
+  if (handoff) {
+    phone.value = handoff.phone
+    ticket.value = handoff.ticket
+    verified.value = true
+  }
 })
 
 onUnmounted(() => {
@@ -49,6 +88,8 @@ function mapError(detail?: string): string {
   if (detail === '该用户名已被占用，请自定义') return '该用户名已被占用，请换一个'
   if (detail === '手机号格式不正确') return '请输入正确的 11 位手机号'
   if (detail === 'invalid or expired ticket') return '验证已过期，请重新获取验证码'
+  if (detail === '需要完成人机验证') return '请完成滑块验证'
+  if (detail === '人机验证未通过，请重试') return '人机验证未通过，请重试'
   if (detail === 'not found') return '短信服务未配置'
   return detail || '操作失败，请稍后重试'
 }
@@ -69,7 +110,11 @@ function validPhone(): boolean {
   return /^1[3-9]\d{9}$/.test(phone.value.trim())
 }
 
-/** 发送验证码 */
+/**
+ * 发送验证码（自适应人机验证）。
+ *
+ * 默认直接发；服务端返回 428（需要人机验证）时才弹滑块，通过后带参数重试。
+ */
 async function sendCode(): Promise<void> {
   error.value = ''
   if (!validPhone()) {
@@ -78,11 +123,29 @@ async function sendCode(): Promise<void> {
   }
   sending.value = true
   try {
-    const { cooldown: cd } = await auth.sendSmsCode(phone.value.trim(), 'register')
+    const { cooldown: cd } = await auth.sendSmsCode(phone.value.trim(), 'auth')
     sent.value = true
     startCooldown(cd)
   } catch (e: unknown) {
-    error.value = mapError(detailOf(e))
+    const detail = detailOf(e)
+    if (detail === '需要完成人机验证') {
+      const param = captcha.ready() ? await captcha.run() : ''
+      if (!param) {
+        error.value = '人机验证未通过，请重试'
+        sending.value = false
+        return
+      }
+      try {
+        const { cooldown: cd } = await auth.sendSmsCode(phone.value.trim(), 'auth', param)
+        sent.value = true
+        startCooldown(cd)
+      } catch (retryErr: unknown) {
+        error.value = mapError(detailOf(retryErr))
+      }
+      sending.value = false
+      return
+    }
+    error.value = mapError(detail)
   } finally {
     sending.value = false
   }
@@ -101,8 +164,16 @@ async function verifyCode(): Promise<void> {
   }
   loading.value = true
   try {
-    ticket.value = await auth.verifySmsCode(phone.value.trim(), code.value.trim(), 'register')
+    const result = await auth.verifySmsCode(phone.value.trim(), code.value.trim(), 'auth')
+    ticket.value = result.ticket
     verified.value = true
+    // 校验通过但发现已注册：直接引导去登录，别让用户白填一遍资料
+    if (result.next_action === 'login' || result.next_action === 'pending_approval') {
+      error.value =
+        result.next_action === 'login'
+          ? '该手机号已注册，请返回登录'
+          : '该手机号已注册，等待管理员审核通过后即可登录'
+    }
   } catch (e: unknown) {
     error.value = mapError(detailOf(e))
   } finally {
@@ -280,5 +351,9 @@ function backToPhone(): void {
         </span>
       </div>
     </div>
+
+    <!-- 阿里云验证码需要的占位元素 -->
+    <div id="aliyun-captcha-element" class="aliyun-captcha-holder" aria-hidden="true"></div>
+    <button id="aliyun-captcha-button" type="button" class="aliyun-captcha-holder" tabindex="-1" aria-hidden="true"></button>
   </div>
 </template>

@@ -68,10 +68,14 @@ K_SMS_CODE = "sms:code:{}:{}"
 K_SMS_SEND_PHONE = "sms:send:{}:{}"
 # 每 IP 每小时发送计数：{ip}:{YYYYMMDDHH} -> int（防批量轰炸）
 K_SMS_SEND_IP = "sms:sendip:{}:{}"
+# 每 IP 每日发送计数：{ip}:{YYYYMMDD} -> int（换 IP 也要付出代价）
+K_SMS_SEND_IP_DAY = "sms:sendipday:{}:{}"
 # 发送冷却：{phone} -> "1"（防连点）
 K_SMS_LOCK = "sms:lock:{}"
 # 全局每日发送总数：{YYYYMMDD} -> int（配置页展示「今日已发送条数」）
 K_SMS_SEND_TOTAL = "sms:sendtotal:{}"
+# 人机验证失败计数：{ip}:{YYYYMMDDHH} -> int（连续失败多则强制滑块）
+K_SMS_CAPTCHA_FAIL = "sms:capfail:{}:{}"
 
 
 class RedisStore:

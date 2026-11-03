@@ -7,6 +7,7 @@ import type {
   ProfileUpdate,
   SmsPurpose,
   SmsStatus,
+  SmsVerifyResult,
 } from '@/api/types'
 
 interface AuthState {
@@ -125,20 +126,63 @@ export const useAuthStore = defineStore('auth', {
           require_approval: true,
           code_ttl_seconds: 300,
           send_interval_seconds: 60,
+          captcha_enabled: false,
+          captcha_prefix: '',
+          captcha_scene_id: '',
+          captcha_encrypted: false,
         }
         smsStatusCache = fallback
         return fallback
       }
     },
-    /** 发送验证码；返回有效期与重发冷却（秒） */
-    async sendSmsCode(phone: string, purpose: SmsPurpose): Promise<{ expire_in: number; cooldown: number }> {
-      const { data } = await api.post('/api/auth/sms/send', { phone, purpose })
+    /**
+     * 发送验证码；返回有效期与重发冷却（秒）。
+     *
+     * 人机验证是**自适应**的：默认直接放行；服务端判定有风险时返回 428，
+     * 前端据此弹滑块，带 captchaVerifyParam 重试。
+     */
+    async sendSmsCode(
+      phone: string,
+      purpose: SmsPurpose,
+      captchaVerifyParam?: string,
+    ): Promise<{ expire_in: number; cooldown: number }> {
+      const payload: Record<string, unknown> = { phone, purpose }
+      if (captchaVerifyParam) payload.captcha_verify_param = captchaVerifyParam
+      const { data } = await api.post('/api/auth/sms/send', payload)
       return { expire_in: data.expire_in, cooldown: data.cooldown }
     },
-    /** 校验验证码；通过则返回「手机号已验证」票据 */
-    async verifySmsCode(phone: string, code: string, purpose: SmsPurpose): Promise<string> {
-      const { data } = await api.post('/api/auth/sms/verify', { phone, code, purpose })
-      return data.ticket
+    /**
+     * 校验验证码；通过则返回「手机号已验证」票据 + 下一步走向。
+     *
+     * next_action 由服务端根据该号码是否已注册决定：
+     * - login            已注册且已启用
+     * - register         未注册（前端可直接进注册第二步，不用再收码）
+     * - pending_approval 已注册但待审核
+     */
+    async verifySmsCode(phone: string, code: string, purpose: SmsPurpose): Promise<SmsVerifyResult> {
+      const { data } = await api.post<SmsVerifyResult>('/api/auth/sms/verify', {
+        phone,
+        code,
+        purpose,
+      })
+      return data
+    },
+    /**
+     * 获取人机验证的场景凭据。
+     *
+     * 加密模式（服务端配了 ekey）：返回一次性短效的 EncryptedSceneId，
+     * 明文 SceneId 不下发 —— SceneId 明文进 JS 的话谁都能白嫖额度。
+     * 非加密模式：返回明文 SceneId，encrypted 为空串。
+     */
+    async fetchCaptchaScene(): Promise<{ sceneId: string; encrypted: string }> {
+      try {
+        const { data } = await api.get<{ scene_id: string; encrypted_scene_id: string }>(
+          '/api/auth/sms/captcha-scene',
+        )
+        return { sceneId: data.scene_id || '', encrypted: data.encrypted_scene_id || '' }
+      } catch {
+        return { sceneId: '', encrypted: '' }
+      }
     },
     /** 手机号注册；待审核时 pending_approval=true 且没有 token */
     async registerByPhone(payload: PhoneRegisterPayload): Promise<PhoneRegisterResult> {
@@ -147,8 +191,11 @@ export const useAuthStore = defineStore('auth', {
       return data
     },
     /** 验证码登录；2FA 用户返回 requires2fa + loginToken（复用现有 2FA 分支） */
-    async loginBySms(phone: string, code: string): Promise<LoginResult> {
-      const { data } = await api.post('/api/auth/sms/login', { phone, code })
+    async loginBySms(phone: string, code?: string, ticket?: string): Promise<LoginResult> {
+      const payload: Record<string, unknown> = { phone }
+      if (code) payload.code = code
+      if (ticket) payload.ticket = ticket
+      const { data } = await api.post('/api/auth/sms/login', payload)
       if (data.requires_2fa) {
         return { requires2fa: true, loginToken: data.login_token }
       }

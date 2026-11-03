@@ -29,11 +29,19 @@ PROVIDER_ALIYUN_SMS_AUTH = "aliyun_sms_auth"
 PROVIDER_TENCENTCLOUD_SMS = "tencentcloud_sms"
 SUPPORTED_PROVIDERS = (PROVIDER_ALIYUN_SMS_AUTH, PROVIDER_TENCENTCLOUD_SMS)
 
-# 用途：验证码的用途隔离。register 与 login 的验证码是不同的（Redis key 里带 purpose），
-# 因此「用登录验证码去注册」这种跨用途复用会被直接拒绝。
-PURPOSE_REGISTER = "register"
-PURPOSE_LOGIN = "login"
-SMS_PURPOSES = (PURPOSE_REGISTER, PURPOSE_LOGIN)
+# 用途：验证码的用途隔离。Redis key 里带 purpose，防止跨用途复用。
+#
+# **只有一个用途 auth**：登录与注册共用同一种验证码。
+#
+# 为什么合并（而不是 register / login 各一个）：
+# 用户从登录入口点「获取验证码」时，还不知道这个号有没有注册过 —— 如果登录发 login 码、
+# 未注册再发 register 码，用户就得收两次短信。合并成一个用途后，一次验证码即可
+# 同时支撑「登录」与「注册」，由服务端在校验通过后根据该号码是否已注册来决定走向。
+#
+# 用途隔离本身仍然保留（key 里仍带 purpose），只是取值从两个收敛为一个。
+# 真正的防跨用改由「票据」承担：登录票据与注册票据的允许用途不同（见 security.py）。
+PURPOSE_AUTH = "auth"
+SMS_PURPOSES = (PURPOSE_AUTH,)
 
 DEFAULTS: dict = {
     "enabled": False,
@@ -48,6 +56,20 @@ DEFAULTS: dict = {
     "daily_limit_per_phone": 10,
     "hourly_limit_per_ip": 20,
     "max_verify_attempts": 5,
+    # —— 全局每日发送上限（费用失控的最后一道闸；0 = 不限）——
+    "daily_limit_total": 500,
+    # —— 每 IP 每日发送上限（换 IP 也绕不开号/日的双闸）——
+    "daily_limit_per_ip": 50,
+    # —— 阿里云验证码（人机验证）——
+    # 未开通时 captcha_enabled=false，整条人机验证链路不生效。
+    "captcha_enabled": False,
+    "captcha_prefix": "",       # 身份标（控制台概览页获取）
+    "captcha_scene_id": "",     # 场景 ID（控制台场景管理获取）
+    "captcha_endpoint": "captcha.cn-shanghai.aliyuncs.com",
+    # 自适应：达到这些阈值才要求人机验证（低于阈值直接放行，正常用户无感）
+    "captcha_phone_threshold": 3,   # 该号码 24h 内已发送次数
+    "captcha_ip_threshold": 5,      # 该 IP 1h 内已发送次数
+    "captcha_new_account": True,    # 新注册账号（< 24h）发码也要人机验证
 }
 
 # 配置项的合法区间；越界值夹回区间，避免运维手滑写出一个能把自己锁死的配置。
@@ -57,6 +79,12 @@ _LIMITS: dict[str, tuple[int, int]] = {
     "daily_limit_per_phone": (1, 1000),
     "hourly_limit_per_ip": (1, 5000),
     "max_verify_attempts": (1, 20),
+    # 0 = 不限（允许关掉总闸，但配置页会提示风险）
+    "daily_limit_total": (0, 1000000),
+    "daily_limit_per_ip": (0, 100000),
+    # 自适应阈值：0 = 该维度永远不触发人机验证
+    "captcha_phone_threshold": (0, 100),
+    "captcha_ip_threshold": (0, 1000),
 }
 
 
@@ -83,6 +111,16 @@ def normalize_config(raw: Optional[dict]) -> dict:
     out["endpoint"] = str(src.get("endpoint") or DEFAULTS["endpoint"]).strip()
     provider = str(src.get("provider") or DEFAULTS["provider"]).strip()
     out["provider"] = provider if provider in SUPPORTED_PROVIDERS else DEFAULTS["provider"]
+    # 人机验证相关
+    out["captcha_enabled"] = bool(src.get("captcha_enabled", DEFAULTS["captcha_enabled"]))
+    out["captcha_new_account"] = bool(
+        src.get("captcha_new_account", DEFAULTS["captcha_new_account"])
+    )
+    out["captcha_prefix"] = str(src.get("captcha_prefix") or "").strip()
+    out["captcha_scene_id"] = str(src.get("captcha_scene_id") or "").strip()
+    out["captcha_endpoint"] = str(
+        src.get("captcha_endpoint") or DEFAULTS["captcha_endpoint"]
+    ).strip()
     for name in _LIMITS:
         out[name] = _clamp(name, src.get(name, DEFAULTS[name]))
     return out

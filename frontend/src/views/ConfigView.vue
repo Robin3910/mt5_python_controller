@@ -36,6 +36,15 @@ const sms = reactive({
   daily_limit_per_phone: 10,
   hourly_limit_per_ip: 20,
   max_verify_attempts: 5,
+  daily_limit_total: 500,
+  daily_limit_per_ip: 50,
+  captcha_enabled: false,
+  captcha_prefix: '',
+  captcha_scene_id: '',
+  captcha_endpoint: 'captcha.cn-shanghai.aliyuncs.com',
+  captcha_phone_threshold: 3,
+  captcha_ip_threshold: 5,
+  captcha_new_account: true,
   today_sent: 0,
   credentials_present: false,
 })
@@ -79,6 +88,14 @@ function onSmsEnabledChange(value: boolean | string | number): void {
 
 function onSmsApprovalChange(value: boolean | string | number): void {
   sms.require_approval = value === true || value === 'true' || value === 1
+}
+
+function onSmsCaptchaChange(value: boolean | string | number): void {
+  sms.captcha_enabled = value === true || value === 'true' || value === 1
+}
+
+function onSmsCaptchaNewAccountChange(value: boolean | string | number): void {
+  sms.captcha_new_account = value === true || value === 'true' || value === 1
 }
 
 async function loadNodeToken(): Promise<void> {
@@ -286,6 +303,20 @@ function flash(msg: string): void {
           <label>验证码最大校验次数</label>
           <input v-model.number="sms.max_verify_attempts" type="number" min="1" max="20" />
         </div>
+        <div>
+          <label>全局每日上限（0 = 不限）</label>
+          <input v-model.number="sms.daily_limit_total" type="number" min="0" max="1000000" />
+          <p class="muted" style="font-size: 12px; margin: 4px 0 0">
+            费用失控的最后一道闸：所有号码加起来一天最多发这么多条。
+          </p>
+        </div>
+        <div>
+          <label>每 IP 每日上限（0 = 不限）</label>
+          <input v-model.number="sms.daily_limit_per_ip" type="number" min="0" max="100000" />
+          <p class="muted" style="font-size: 12px; margin: 4px 0 0">
+            换 IP 也绕不开的那道闸。
+          </p>
+        </div>
         <div v-if="smsError" style="color: var(--red); font-size: 13px">{{ smsError }}</div>
         <div class="row" style="gap: 8px">
           <button class="btn-primary" :disabled="smsLoading" @click="saveSmsConfig">
@@ -295,7 +326,69 @@ function flash(msg: string): void {
       </div>
     </div>
 
+    <!-- 阿里云验证码（人机验证 / 滑块）—— 独立产品，需单独开通 -->
+    <div v-if="auth.isAdmin" class="card card-pad span-full">
+      <div class="row between">
+        <strong>人机验证（阿里云验证码 2.0 · 滑块）</strong>
+        <span class="muted" style="font-size: 12px">自适应触发，正常用户无感</span>
       </div>
+      <p class="muted" style="font-size: 12px">
+        防止接口被脚本刷：默认直接放行，只有命中下方阈值时才弹滑块，滑块结果由后端二次校验。
+        注意「阿里云验证码」与「号码认证服务」是**两个独立产品**，需分别开通与计费。
+      </p>
+      <div class="webhook-auth-row">
+        <span class="webhook-auth-label">启用人机验证</span>
+        <ElSwitch
+          :model-value="sms.captcha_enabled"
+          :disabled="smsLoading"
+          @change="onSmsCaptchaChange"
+        />
+        <span class="muted webhook-auth-hint">
+          {{ sms.captcha_enabled ? '已启用：命中风控阈值时要求滑块' : '已停用：不做人机验证' }}
+        </span>
+      </div>
+      <div class="webhook-auth-row">
+        <span class="webhook-auth-label">新账号也要验证</span>
+        <ElSwitch
+          :model-value="sms.captcha_new_account"
+          :disabled="smsLoading"
+          @change="onSmsCaptchaNewAccountChange"
+        />
+        <span class="muted webhook-auth-hint">
+          {{ sms.captcha_new_account ? '开启：24 小时内注册的新号发码也要滑块' : '关闭：新号可直接发码' }}
+        </span>
+      </div>
+      <div class="form-grid">
+        <div>
+          <label>身份标（prefix）</label>
+          <input v-model="sms.captcha_prefix" placeholder="验证码控制台概览页获取" />
+        </div>
+        <div>
+          <label>场景 ID（SceneId）</label>
+          <input v-model="sms.captcha_scene_id" placeholder="验证码控制台场景管理获取" />
+        </div>
+        <div>
+          <label>服务端 Endpoint</label>
+          <input v-model="sms.captcha_endpoint" placeholder="captcha.cn-shanghai.aliyuncs.com" />
+        </div>
+        <div>
+          <label>号码 24h 阈值（0 = 不触发）</label>
+          <input v-model.number="sms.captcha_phone_threshold" type="number" min="0" max="100" />
+        </div>
+        <div>
+          <label>IP 1h 阈值（0 = 不触发）</label>
+          <input v-model.number="sms.captcha_ip_threshold" type="number" min="0" max="1000" />
+        </div>
+        <div class="row" style="gap: 8px">
+          <button class="btn-primary" :disabled="smsLoading" @click="saveSmsConfig">
+            {{ smsLoading ? '保存中…' : '保存人机验证配置' }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+
+  </div>
 </template>
 
 <style scoped>

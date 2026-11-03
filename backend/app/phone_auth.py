@@ -1,14 +1,28 @@
 """手机号注册 / 验证码登录 API（公开、无鉴权）。
 
 四个接口：
-- POST /api/auth/sms/send    发送验证码
-- POST /api/auth/sms/verify  校验验证码 → 签发票据
+- POST /api/auth/sms/send    发送验证码（自适应人机验证）
+- POST /api/auth/sms/verify  校验验证码 → 签发票据 + 告知下一步走向
 - POST /api/auth/register    手机号注册（需票据）
 - POST /api/auth/sms/login   验证码登录
 
 **不改现有 /api/login 的任何行为**，不改 JWT 结构，不改 users.username 的主键语义。
+
 手机号是新增的唯一别名 + 登录凭据：所有 JWT 的 sub、RBAC 的 user_id、审计的 operator
 仍以 username 为主（下游零改动、零回归风险）。
+
+## 「一次验证码，两种去向」
+
+登录与注册**共用同一种验证码**（purpose=auth）。用户从登录入口点「获取验证码」时
+还不知道自己有没有账号 —— 如果分两种用途，未注册的用户就得收两次短信。
+
+验证码校验通过后，服务端查该号码是否已注册，据此告诉前端该走哪条路：
+
+    next_action = "login"             已注册且已启用 → 前端换 token 登录
+    next_action = "register"          未注册       → 前端直接进注册第二步（不再收码）
+    next_action = "pending_approval"  已注册但待审核 → 提示等待管理员审核
+
+这一步不构成号码枚举：调用方已经通过验证码证明了持有该号码。
 """
 from __future__ import annotations
 
@@ -20,6 +34,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.exc import IntegrityError
 
 from . import persist, rbac_service, user_service
+from .captcha_provider import encrypt_scene_id, get_verifier
 from .deps import client_ip, get_store
 from .models import (
     PhoneRegisterRequest,
@@ -30,10 +45,10 @@ from .models import (
 )
 from .redis_store import RedisStore
 from .security import create_jwt, create_phone_pending_jwt, verify_phone_pending_jwt
+from .settings import settings
 from .sms_config import (
     KEY_SMS_CONFIG,
-    PURPOSE_LOGIN,
-    PURPOSE_REGISTER,
+    PURPOSE_AUTH,
     SMS_PURPOSES,
     get_sms_config,
     is_configured,
@@ -44,7 +59,9 @@ from .sms_service import (
     check_rate_limits,
     issue_code,
     mask_phone,
+    needs_captcha,
     normalize_phone,
+    record_captcha_failure,
     verify_code,
 )
 
@@ -54,6 +71,19 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 # 审计里记录的操作人（手机号注册场景下还没有 username，用脱敏手机号）
 _AUDIT_NAME_MAX = 64
+
+# 票据用途：
+# - auth 票据由 /sms/verify 签发，可用于「登录」或「注册」两个动作
+# - register 票据只允许注册（防止把注册票据拿去登录）
+TICKET_PURPOSE_AUTH = "auth"
+TICKET_PURPOSE_REGISTER = "register"
+_TICKET_ALLOWED_FOR_REGISTER = frozenset({TICKET_PURPOSE_AUTH, TICKET_PURPOSE_REGISTER})
+_TICKET_ALLOWED_FOR_LOGIN = frozenset({TICKET_PURPOSE_AUTH})
+
+# 下一步走向
+NEXT_ACTION_LOGIN = "login"
+NEXT_ACTION_REGISTER = "register"
+NEXT_ACTION_PENDING = "pending_approval"
 
 
 def _masked_operator(phone: str) -> str:
@@ -85,12 +115,39 @@ async def send_sms_code(
 
     **无论手机号是否已注册，响应体与状态码完全一致**（号码枚举防护）。
     差异只在验证码校验通过之后才体现 —— 此时请求方已证明持有该号码。
+
+    **自适应人机验证**：默认直接放行；只有命中风控阈值时才返回 428 要求前端
+    弹滑块（带 captcha_verify_param 重试）。这样正常用户全程无感，
+    而自动化脚本会被拦在发码之前。
     """
     cfg = await _require_sms_enabled()
     if body.purpose not in SMS_PURPOSES:
         raise HTTPException(status_code=400, detail="invalid purpose")
     phone = _normalize_or_400(body.phone)
     ip = client_ip(request)
+
+    # —— 人机验证（自适应）——
+    if await needs_captcha(store, phone=phone, ip=ip, cfg=cfg):
+        if not body.captcha_verify_param:
+            # 需要滑块但前端没带验证参数：告诉前端去弹滑块（428）
+            await persist.audit(
+                _masked_operator(phone), "sms_send_captcha_required",
+                _masked_operator(phone), {"purpose": body.purpose}, "fail", ip,
+                category="auth",
+            )
+            raise HTTPException(status_code=428, detail="需要完成人机验证")
+        verifier = get_verifier(str(cfg.get("captcha_endpoint") or ""))
+        captcha = verifier.verify(
+            body.captcha_verify_param, str(cfg.get("captcha_scene_id") or "")
+        )
+        if not captcha.ok:
+            await record_captcha_failure(store, ip)
+            await persist.audit(
+                _masked_operator(phone), "sms_send_captcha_failed",
+                _masked_operator(phone),
+                {"verify_code": captcha.verify_code}, "fail", ip, category="auth",
+            )
+            raise HTTPException(status_code=400, detail="人机验证未通过，请重试")
 
     try:
         await check_rate_limits(store, phone=phone, ip=ip, cfg=cfg)
@@ -144,7 +201,14 @@ async def verify_sms_code(
     request: Request,
     store: RedisStore = Depends(get_store),
 ):
-    """校验验证码：通过则签发「手机号已验证」票据（验证码即焚）。"""
+    """校验验证码：通过则签发「手机号已验证」票据（验证码即焚），并告知下一步走向。
+
+    返回的 next_action 由服务端根据「该号码是否已注册」决定：
+
+    - login            已注册且已启用，前端可用同一张票据换 token
+    - register         未注册，前端直接进注册第二步（**不用再收验证码**）
+    - pending_approval 已注册但尚未通过管理员审核
+    """
     cfg = await _require_sms_enabled()
     if body.purpose not in SMS_PURPOSES:
         raise HTTPException(status_code=400, detail="invalid purpose")
@@ -160,7 +224,18 @@ async def verify_sms_code(
     )
     if not ok:
         raise HTTPException(status_code=400, detail="验证码错误或已过期")
-    return {"ticket": create_phone_pending_jwt(phone, body.purpose)}
+
+    ticket = create_phone_pending_jwt(phone, TICKET_PURPOSE_AUTH)
+    user = await user_service.get_user_by_phone(phone)
+    if user is None:
+        return {"ticket": ticket, "next_action": NEXT_ACTION_REGISTER}
+    if not user.is_active:
+        return {
+            "ticket": ticket,
+            "next_action": NEXT_ACTION_PENDING,
+            "username": user.username,
+        }
+    return {"ticket": ticket, "next_action": NEXT_ACTION_LOGIN}
 
 
 async def _generate_username(phone: str) -> Optional[str]:
@@ -203,7 +278,10 @@ async def register_by_phone(
     ip = client_ip(request)
 
     # 1. 验票据：类型 / 手机号 / 用途都必须对上
-    ticket_phone = verify_phone_pending_jwt(body.ticket or "", PURPOSE_REGISTER)
+    #    auth 票据（登录页发现未注册时签发的）也允许用于注册
+    ticket_phone = verify_phone_pending_jwt(
+        body.ticket or "", _TICKET_ALLOWED_FOR_REGISTER
+    )
     if not ticket_phone or ticket_phone != phone:
         raise HTTPException(status_code=401, detail="invalid or expired ticket")
 
@@ -282,18 +360,33 @@ async def login_by_sms(
 
     已开启 2FA 的用户**仍走 2FA 第二步**（返回 requires_2fa + login_token），
     不降低安全等级。
+
+    code 与 ticket 二选一即可：
+    - 只给 code：服务端自己校验验证码（前端一步到位）
+    - 只给 ticket：复用 /sms/verify 已校验过的票据（省一次往返）
     """
     cfg = await _require_sms_enabled()
     phone = _normalize_or_400(body.phone)
     ip = client_ip(request)
 
-    ok = await verify_code(store, phone=phone, code=body.code, purpose=PURPOSE_LOGIN, cfg=cfg)
-    await persist.audit(
-        _masked_operator(phone), "sms_verify", _masked_operator(phone),
-        {"purpose": PURPOSE_LOGIN, "ok": ok}, "ok" if ok else "fail", ip, category="auth",
-    )
-    if not ok:
-        raise HTTPException(status_code=400, detail="验证码错误或已过期")
+    ticket_phone = None
+    if body.ticket:
+        ticket_phone = verify_phone_pending_jwt(body.ticket, _TICKET_ALLOWED_FOR_LOGIN)
+        if not ticket_phone or ticket_phone != phone:
+            raise HTTPException(status_code=401, detail="invalid or expired ticket")
+
+    if not ticket_phone:
+        if not body.code:
+            raise HTTPException(status_code=400, detail="请输入验证码")
+        ok = await verify_code(
+            store, phone=phone, code=body.code, purpose=PURPOSE_AUTH, cfg=cfg
+        )
+        await persist.audit(
+            _masked_operator(phone), "sms_verify", _masked_operator(phone),
+            {"purpose": PURPOSE_AUTH, "ok": ok}, "ok" if ok else "fail", ip, category="auth",
+        )
+        if not ok:
+            raise HTTPException(status_code=400, detail="验证码错误或已过期")
 
     user = await user_service.get_user_by_phone(phone)
     if user is None:
@@ -326,11 +419,52 @@ async def sms_status():
     """短信服务是否可用（前端据此决定是否展示验证码入口）。
 
     未配置 / 已关闭时返回 enabled=false，不返回原因。
+
+    captcha_* 字段供前端初始化阿里云验证码 SDK 用；captcha_enabled=false 时
+    前端不加载验证码 JS（省一次外部请求）。
+
+    **captcha_scene_id 只在非加密模式下直接下发**：加密模式下前端必须用
+    服务端生成的 EncryptedSceneId，明文 SceneId 不进浏览器。
     """
     cfg = await get_sms_config()
+    captcha_enabled = bool(cfg.get("captcha_enabled")) and bool(
+        cfg.get("captcha_prefix") and cfg.get("captcha_scene_id")
+    )
+    encrypted = captcha_enabled and bool(settings.aliyun_captcha_ekey)
     return {
         "enabled": bool(cfg.get("enabled")) and is_configured(cfg),
         "require_approval": bool(cfg.get("require_approval")),
         "code_ttl_seconds": int(cfg.get("code_ttl_seconds") or 300),
         "send_interval_seconds": int(cfg.get("send_interval_seconds") or 60),
+        "captcha_enabled": captcha_enabled,
+        "captcha_prefix": str(cfg.get("captcha_prefix") or ""),
+        # 加密模式下不下发明文 SceneId
+        "captcha_scene_id": "" if encrypted else str(cfg.get("captcha_scene_id") or ""),
+        "captcha_encrypted": encrypted,
     }
+
+
+@router.get("/sms/captcha-scene")
+async def captcha_scene():
+    """下发 EncryptedSceneId（阿里云验证码「加密模式」）。
+
+    **加密模式**（V3 架构可选增强，默认建议开启）：SceneId 明文写在 JS 里
+    的话，谁都能拿走白嫖你账号的验证码额度。开启后由服务端用 ekey 动态
+    加密 SceneId + 时间戳 + 有效期，前端拿到的只是一次性短效串。
+
+    未配置 ekey 时返回明文 SceneId（兼容未开启加密模式的场景）。
+    """
+    cfg = await get_sms_config()
+    scene_id = str(cfg.get("captcha_scene_id") or "")
+    ekey = settings.aliyun_captcha_ekey
+    if not scene_id:
+        raise HTTPException(status_code=404, detail="not found")
+    if not ekey:
+        return {"scene_id": scene_id, "encrypted_scene_id": ""}
+    try:
+        encrypted = encrypt_scene_id(scene_id, ekey)
+    except Exception as exc:  # noqa: BLE001
+        # ekey 配错（比如长度不对）不该让整个验证码不可用 —— 降级到明文
+        logger.error("encrypt scene id failed: %s", exc)
+        return {"scene_id": scene_id, "encrypted_scene_id": ""}
+    return {"scene_id": scene_id, "encrypted_scene_id": encrypted}

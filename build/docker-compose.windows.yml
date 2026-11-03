@@ -66,6 +66,11 @@ services:
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis_data:/data
+    ports:
+      # 映射到宿主机，供「本机直接跑 uvicorn」的本地开发连。
+      # 只绑 127.0.0.1 —— Redis 没开认证，暴露到 0.0.0.0 等于把后门开到网上。
+      # 容器内部通信仍走 redis:6379，不受影响。
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s

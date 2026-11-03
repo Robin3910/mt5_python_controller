@@ -2021,8 +2021,16 @@ export interface UserUpdatePayload {
 
 // ----------------------------- 手机号注册 / 验证码登录 -----------------------------
 
-/** 验证码用途：注册与登录的验证码互相隔离（Redis key 里带 purpose） */
-export type SmsPurpose = 'register' | 'login'
+/**
+ * 验证码用途：登录与注册**共用**同一种验证码（purpose=auth）。
+ *
+ * 用户从登录入口点「获取验证码」时还不知道自己有没有注册过 —— 如果分两种用途，
+ * 未注册的用户就得收两次短信。校验通过后由服务端返回 next_action 决定走向。
+ */
+export type SmsPurpose = 'auth'
+
+/** 校验通过后的下一步走向（服务端根据该号码是否已注册决定） */
+export type SmsNextAction = 'login' | 'register' | 'pending_approval'
 
 /** GET /api/auth/sms/status：短信服务是否可用（前端据此隐藏验证码入口） */
 export interface SmsStatus {
@@ -2030,6 +2038,22 @@ export interface SmsStatus {
   require_approval: boolean
   code_ttl_seconds: number
   send_interval_seconds: number
+  /** 是否启用了阿里云验证码（人机验证） */
+  captcha_enabled: boolean
+  /** 阿里云验证码身份标（前端初始化 SDK 用） */
+  captcha_prefix: string
+  /** 阿里云验证码场景 ID；加密模式下服务端会刻意置空 */
+  captcha_scene_id: string
+  /** 是否处于加密模式（服务端配了 ekey） */
+  captcha_encrypted: boolean
+}
+
+/** GET /api/auth/sms/captcha-scene：人机验证的场景凭据 */
+export interface SmsCaptchaScene {
+  /** 明文场景 ID（加密模式下可能为空） */
+  scene_id: string
+  /** 加密串（加密模式下的短效凭据；非加密模式为空串） */
+  encrypted_scene_id: string
 }
 
 /** POST /api/auth/sms/send 的响应 */
@@ -2039,6 +2063,16 @@ export interface SmsSendResult {
   expire_in: number
   /** 重发冷却（秒） */
   cooldown: number
+}
+
+/** POST /api/auth/sms/verify 的响应 */
+export interface SmsVerifyResult {
+  /** 「手机号已验证」票据（登录与注册两个动作都可用） */
+  ticket: string
+  /** 下一步走向 */
+  next_action: SmsNextAction
+  /** 已注册时的用户名（pending_approval 分支才有） */
+  username?: string | null
 }
 
 /** POST /api/auth/register 的响应 */
@@ -2074,6 +2108,24 @@ export interface SmsConfig {
   daily_limit_per_phone: number
   hourly_limit_per_ip: number
   max_verify_attempts: number
+  /** 全局每日发送上限（0 = 不限） */
+  daily_limit_total: number
+  /** 每 IP 每日发送上限（0 = 不限） */
+  daily_limit_per_ip: number
+  /** 是否启用阿里云验证码（人机验证） */
+  captcha_enabled: boolean
+  /** 阿里云验证码身份标 */
+  captcha_prefix: string
+  /** 阿里云验证码场景 ID */
+  captcha_scene_id: string
+  /** 阿里云验证码服务端 endpoint */
+  captcha_endpoint: string
+  /** 该号码 24h 内发送次数达到该值时要求人机验证（0 = 不触发） */
+  captcha_phone_threshold: number
+  /** 该 IP 1h 内发送次数达到该值时要求人机验证（0 = 不触发） */
+  captcha_ip_threshold: number
+  /** 新注册账号（24h 内）发码是否要求人机验证 */
+  captcha_new_account: boolean
   /** 今日已发送条数（只读） */
   today_sent: number
   /** AccessKey 是否已注入 env（只回显有没有，不回显内容） */
