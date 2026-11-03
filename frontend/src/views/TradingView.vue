@@ -724,157 +724,193 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="trading-page">
+  <div class="pf-page tr-page">
     <!-- 空态：无主节点 -->
-    <div v-if="!primaryNode" class="empty-state card card-pad">
-      <div class="empty-title">尚未设置主节点</div>
-      <div class="empty-desc">请先在【节点】页将一个节点标记为主节点，再回到此页面触发开仓。</div>
-      <button class="btn-primary" @click="router.push('/nodes')">前往节点页</button>
+    <div v-if="!primaryNode" class="pf-card tr-empty">
+      <span class="tr-empty-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="3" width="18" height="6" rx="2" />
+          <rect x="3" y="15" width="18" height="6" rx="2" />
+          <path d="M7 6h.01M7 18h.01" />
+        </svg>
+      </span>
+      <p class="tr-empty-title">尚未设置主节点</p>
+      <p class="pf-hint">请先在【节点】页将一个节点标记为主节点，再回到此页面触发开仓。</p>
+      <button class="pf-btn pf-btn-primary" @click="router.push('/nodes')">前往节点页</button>
     </div>
 
     <template v-else>
-      
-      <!-- 单品种报价 -->
-      <div class="quote-board card card-pad">
-        <div class="quote-col">
-          <div class="quote-head">
-            <span class="quote-sym">{{ currentSymbol }}</span>
-          </div>
-          <div class="quote-mid">{{ fmtPrice(currentQuote()?.mid, currentSymbol) }}</div>
-          <div class="quote-bidask">
-            <div class="ba-row chg">
-              <span class="ba-k">涨跌</span>
-              <span
-                class="ba-v"
-                :class="(currentQuote()?.change ?? 0) >= 0 ? 'pos' : 'neg'"
-              >{{ fmtDailyChangeAbs(currentQuote(), currentSymbol) ?? '—' }}</span>
-              <span
-                class="ba-v"
-                :class="(currentQuote()?.change ?? 0) >= 0 ? 'pos' : 'neg'"
-              >{{ fmtDailyChangePct(currentQuote()) ?? '—' }}</span>
-              <span class="tag" :class="trendReady ? trendClass(trendVerdict) : ''">
-                {{ trendReady ? trendText(trendVerdict) : '—' }}
-              </span>
+      <!-- 状态条：主节点身份 + 在线状态 + 账户汇总 -->
+      <section class="pf-card">
+        <div class="pf-card-head">
+          <div class="pf-card-head-main">
+            <span class="pf-card-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="3" width="18" height="6" rx="2" />
+                <rect x="3" y="15" width="18" height="6" rx="2" />
+                <path d="M7 6h.01M7 18h.01" />
+              </svg>
+            </span>
+            <div>
+              <p class="pf-card-title">{{ primaryNode.name }}</p>
+              <p class="pf-card-sub">MT5 <b>{{ primaryNode.mt5_login ?? '—' }}</b></p>
             </div>
           </div>
-          <div class="quote-position" v-if="symbolPosCount > 0">
-            <div class="qp-row">
-              <span class="qp-k">{{ currentSymbol }} 持仓</span>
-              <span class="qp-v">{{ symbolPosCount }} 笔 · {{ symbolPosVolume.toFixed(2) }} 手</span>
-            </div>
-            <div class="qp-row">
-              <span class="qp-k">浮盈</span>
-              <span class="qp-v" :class="symbolPosPnl >= 0 ? 'pos' : 'neg'">
-                {{ symbolPosPnl >= 0 ? '+' : '' }}{{ symbolPosPnl.toFixed(2) }}
-              </span>
-            </div>
-          </div>
-          <div class="quote-sym-picker" v-if="availableSymbols.length > 0">
-            <button
-              v-for="sym in availableSymbols"
-              :key="sym"
-              class="sym-chip"
-              :class="{ active: currentSymbol === sym }"
-              @click="pickSymbol(sym)"
-            >{{ sym }}</button>
-          </div>
-          <div v-else class="sym-empty muted">主节点尚未上报任何品种报价</div>
+          <span class="pf-pill" :class="isOnline ? 'green' : 'grey'">
+            <span v-if="isOnline" class="pf-pill-dot" aria-hidden="true"></span>
+            {{ isOnline ? '在线' : '离线' }}
+          </span>
         </div>
-      </div>
 
-      <!-- 底部：三个策略按钮 -->
-      <div class="action-bar">
+        <div class="pf-kv-grid" style="margin-top: 10px">
+          <div class="pf-kv">
+            <span class="k">当前持仓</span>
+            <span class="v">{{ totalPosCount }} 笔</span>
+          </div>
+          <div class="pf-kv">
+            <span class="k">合计手数</span>
+            <span class="v">{{ totalPosVolume.toFixed(2) }}</span>
+          </div>
+          <div class="pf-kv">
+            <span class="k">浮动盈亏</span>
+            <span class="v" :class="totalPosPnl >= 0 ? 'pos' : 'neg'">
+              {{ totalPosPnl >= 0 ? '+' : '' }}{{ totalPosPnl.toFixed(2) }}
+            </span>
+          </div>
+          <div class="pf-kv">
+            <span class="k">净值</span>
+            <span class="v">{{ accountEquity.toFixed(2) }}</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- 单品种报价 -->
+      <section class="pf-card">
+        <div class="pf-card-head">
+          <div class="pf-card-head-main">
+            <span class="pf-card-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M3 17l5-6 4 4 5-7 4 4" />
+                <path d="M3 21h18" />
+              </svg>
+            </span>
+            <div>
+              <p class="pf-card-title">报价</p>
+              <p class="pf-card-sub">{{ currentSymbol }} · 主节点最新快照</p>
+            </div>
+          </div>
+          <span class="pf-pill" :class="trendReady ? (trendClass(trendVerdict) || 'grey') : 'grey'">
+            {{ trendReady ? trendText(trendVerdict) : '暂无结论' }}
+          </span>
+        </div>
+
+        <!-- 品种切换 -->
+        <div v-if="availableSymbols.length" class="tr-syms" role="tablist" aria-label="品种">
+          <button
+            v-for="sym in availableSymbols"
+            :key="sym"
+            type="button"
+            class="tr-sym"
+            :class="{ active: currentSymbol === sym }"
+            :aria-pressed="currentSymbol === sym"
+            @click="pickSymbol(sym)"
+          >{{ sym }}</button>
+        </div>
+        <p v-else class="pf-hint">主节点尚未上报任何品种报价</p>
+
+        <!-- 价格 + 涨跌 -->
+        <div class="tr-quote">
+          <p class="tr-price">{{ fmtPrice(currentQuote()?.mid, currentSymbol) }}</p>
+          <div class="tr-chg">
+            <span
+              class="tr-chg-pill"
+              :class="(currentQuote()?.change ?? 0) >= 0 ? 'pos' : 'neg'"
+            >{{ fmtDailyChangeAbs(currentQuote(), currentSymbol) ?? '—' }}</span>
+            <span
+              class="tr-chg-pct"
+              :class="(currentQuote()?.change ?? 0) >= 0 ? 'pos' : 'neg'"
+            >{{ fmtDailyChangePct(currentQuote()) ?? '—' }}</span>
+          </div>
+        </div>
+
+        <!-- 当前品种持仓摘要 -->
+        <div v-if="symbolPosCount > 0" class="pf-kv-grid" style="margin-top: 10px">
+          <div class="pf-kv">
+            <span class="k">{{ currentSymbol }} 持仓</span>
+            <span class="v">{{ symbolPosCount }} 笔 · {{ symbolPosVolume.toFixed(2) }} 手</span>
+          </div>
+          <div class="pf-kv">
+            <span class="k">浮动盈亏</span>
+            <span class="v" :class="symbolPosPnl >= 0 ? 'pos' : 'neg'">
+              {{ symbolPosPnl >= 0 ? '+' : '' }}{{ symbolPosPnl.toFixed(2) }}
+            </span>
+          </div>
+        </div>
+      </section>
+
+      <!-- 三个策略按钮 -->
+      <div class="tr-actions">
         <button
-          class="action-btn"
-          :class="{ 'action-btn-disabled': !isOnline }"
+          type="button"
+          class="tr-action"
           :disabled="!isOnline"
           @click="openDialog('trend_market')"
         >
-          <svg class="action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z" />
-          </svg>
-          <span class="action-label">市价开仓</span>
+          <span class="tr-action-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z" />
+            </svg>
+          </span>
+          <span class="tr-action-label">市价开仓</span>
         </button>
-        <div class="action-sep"></div>
         <button
-          class="action-btn"
-          :class="{ 'action-btn-disabled': !isOnline }"
+          type="button"
+          class="tr-action"
           :disabled="!isOnline"
           @click="openDialog('trend_limit')"
         >
-          <svg class="action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <circle cx="12" cy="12" r="9" />
-            <circle cx="12" cy="12" r="5" />
-            <circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none" />
-            <path d="M12 1.5v3M12 19.5v3M1.5 12h3M19.5 12h3" />
-          </svg>
-          <span class="action-label">限价开仓</span>
+          <span class="tr-action-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="9" />
+              <circle cx="12" cy="12" r="5" />
+              <circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none" />
+              <path d="M12 1.5v3M12 19.5v3M1.5 12h3M19.5 12h3" />
+            </svg>
+          </span>
+          <span class="tr-action-label">限价开仓</span>
         </button>
-        <div class="action-sep"></div>
         <button
-          class="action-btn"
-          :class="{ 'action-btn-disabled': !isOnline }"
+          type="button"
+          class="tr-action"
           :disabled="!isOnline"
           @click="openDialog('grid')"
         >
-          <svg data-v-52e09d8a="" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path data-v-52e09d8a="" d="M3 6h18M3 12h18M3 18h18"></path><path data-v-52e09d8a="" d="M6 4v16M12 4v16M18 4v16"></path></svg>
-          <span class="action-label">智能吸筹</span>
+          <span class="tr-action-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 6h18M3 12h18M3 18h18" />
+              <path d="M6 4v16M12 4v16M18 4v16" />
+            </svg>
+          </span>
+          <span class="tr-action-label">智能吸筹</span>
         </button>
       </div>
-      <div v-if="!isOnline" class="offline-tip">主节点离线，无法触发</div>
+      <p v-if="!isOnline" class="pf-hint tr-offline">主节点离线，无法触发</p>
 
-      <!-- 顶部状态条 -->
-      <div class="status-bar card card-pad">
-        <div class="status-row">
-          <div class="status-left">
-            <span class="status-pill" :class="isOnline ? 'on' : 'off'">
-              <span class="dot" :class="isOnline ? 'online' : 'offline'"></span>
-              {{ isOnline ? '在线' : '离线' }}
-            </span>
-            <span class="status-node">{{ primaryNode.name }}</span>
-          </div>
-          <div class="status-right">
-            <span class="status-muted">MT5 {{ primaryNode.mt5_login ?? '—' }}</span>
-          </div>
-        </div>
-        <div class="status-summary">
-          <div class="ss-item">
-            <span class="ss-k">当前持仓</span>
-            <span class="ss-v">{{ totalPosCount }} 笔</span>
-          </div>
-          <div class="ss-sep" aria-hidden="true"></div>
-          <div class="ss-item">
-            <span class="ss-k">合计手数</span>
-            <span class="ss-v">{{ totalPosVolume.toFixed(2) }}</span>
-          </div>
-          <div class="ss-sep" aria-hidden="true"></div>
-          <div class="ss-item">
-            <span class="ss-k">浮动盈亏</span>
-            <span
-              class="ss-v"
-              :class="totalPosPnl >= 0 ? 'pos' : 'neg'"
-            >{{ totalPosPnl >= 0 ? '+' : '' }}{{ totalPosPnl.toFixed(2) }}</span>
-          </div>
-        </div>
-      </div>
-
-
-      <!-- 持仓 / 资产详情（Tab 切换） -->
-      <div class="detail-panel card card-pad">
-        <!-- Tab 切换 -->
-        <div class="detail-tabs" role="tablist">
+      <!-- 持仓 / 资产 / 历史订单 / 吸筹策略 -->
+      <section class="pf-card">
+        <div class="pf-tabs tr-tabs" role="tablist">
           <button
-            class="detail-tab"
+            class="pf-tab"
             :class="{ active: detailTab === 'positions' }"
             role="tab"
             :aria-selected="detailTab === 'positions'"
             @click="detailTab = 'positions'"
           >
             当前持仓
-            <span v-if="totalPosCount > 0" class="tab-badge">{{ totalPosCount }}</span>
+            <span v-if="totalPosCount > 0" class="tr-tab-count">{{ totalPosCount }}</span>
           </button>
           <button
-            class="detail-tab"
+            class="pf-tab"
             :class="{ active: detailTab === 'assets' }"
             role="tab"
             :aria-selected="detailTab === 'assets'"
@@ -883,293 +919,229 @@ onBeforeUnmount(() => {
             资产
           </button>
           <button
-            class="detail-tab"
+            class="pf-tab"
             :class="{ active: detailTab === 'history' }"
             role="tab"
             :aria-selected="detailTab === 'history'"
             @click="detailTab = 'history'"
           >
             历史订单
-            <span v-if="dealsTotal > 0" class="tab-badge tab-badge-muted">{{ dealsTotal }}</span>
+            <span v-if="dealsTotal > 0" class="tr-tab-count muted">{{ dealsTotal }}</span>
           </button>
           <button
-            class="detail-tab"
+            class="pf-tab"
             :class="{ active: detailTab === 'grid' }"
             role="tab"
             :aria-selected="detailTab === 'grid'"
             @click="detailTab = 'grid'"
           >
             吸筹策略
-            <span v-if="gridTasks.length > 0" class="tab-badge tab-badge-muted">{{ gridTasks.length }}</span>
+            <span v-if="gridTasks.length > 0" class="tr-tab-count muted">{{ gridTasks.length }}</span>
           </button>
         </div>
 
-        <!-- Tab 内容 -->
-        <div class="detail-body">
-
+        <div class="tr-body">
           <!-- 当前持仓 -->
           <div v-if="detailTab === 'positions'" role="tabpanel">
-            <div v-if="allPositions.length === 0" class="detail-empty">
-              <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M3 3h18M3 9h18M3 15h12M3 21h6" />
-              </svg>
-              <div>暂无持仓</div>
-            </div>
-            <template v-else>
-              <!-- 桌面端：表格 -->
-              <div class="pos-table-wrap">
-                <table class="pos-table">
-                  <thead>
-                    <tr>
-                      <th class="num">#</th>
-                      <th>品种</th>
-                      <th>方向</th>
-                      <th class="num">手数</th>
-                      <th class="num">开仓价</th>
-                      <th class="num">现价</th>
-                      <th class="num">止损</th>
-                      <th class="num">止盈</th>
-                      <th class="num">开仓时间</th>
-                      <th class="num pnl">浮盈</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr v-for="p in sortedPositions" :key="p.ticket">
-                      <td class="num mono muted">{{ p.ticket }}</td>
-                      <td>
-                        <div class="sym-cell">
-                          <span class="mono strong">{{ p.symbol }}</span>
-                          <button
-                            class="pos-close-btn"
-                            :class="{ busy: isClosing(p.ticket) }"
-                            :disabled="isClosing(p.ticket)"
-                            :title="`平仓 #${p.ticket}`"
-                            @click="closePosition(p)"
-                          >
-                            <svg v-if="!isClosing(p.ticket)" viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                              <path d="M4 4l8 8M12 4l-8 8" />
-                            </svg>
-                            <span v-else class="dot-spin" aria-hidden="true"></span>
-                            <span>平仓</span>
-                          </button>
-                        </div>
-                      </td>
-                      <td>
-                        <span
-                          class="dir-tag"
-                          :class="(p.type || '').toLowerCase() === 'buy' ? 'buy' : 'sell'"
-                        >{{ fmtPosType(p.type) }}</span>
-                      </td>
-                      <td class="num mono">{{ (p.volume || 0).toFixed(2) }}</td>
-                      <td class="num mono">{{ fmtPrice(p.price_open, p.symbol) }}</td>
-                      <td class="num mono">{{ fmtPrice(p.price_current, p.symbol) }}</td>
-                      <td class="num mono muted">{{ p.sl ? fmtPrice(p.sl, p.symbol) : '—' }}</td>
-                      <td class="num mono muted">{{ p.tp ? fmtPrice(p.tp, p.symbol) : '—' }}</td>
-                      <td class="num mono muted">{{ fmtPosTime(p.time) }}</td>
-                      <td class="num mono pnl" :class="(p.profit || 0) >= 0 ? 'pos' : 'neg'">
-                        {{ (p.profit || 0) >= 0 ? '+' : '' }}{{ (p.profit || 0).toFixed(2) }}
-                      </td>
-                    </tr>
-                  </tbody>
-                </table>
+            <template v-if="allPositions.length">
+              <!-- 桌面端：分隔行表格 -->
+              <div class="pf-rows tr-rows tr-rows-pos">
+                <div class="pf-rows-inner">
+                  <div class="pf-row pf-row-head">
+                    <span>品种</span>
+                    <span>方向</span>
+                    <span>手数</span>
+                    <span>开仓价</span>
+                    <span>现价</span>
+                    <span>止损</span>
+                    <span>止盈</span>
+                    <span>开仓时间</span>
+                    <span>浮盈</span>
+                    <span></span>
+                  </div>
+                  <div v-for="p in sortedPositions" :key="p.ticket" class="pf-row">
+                    <span class="c-strong">{{ p.symbol }}</span>
+                    <span>
+                      <span class="pf-pill" :class="(p.type || '').toLowerCase() === 'buy' ? 'green' : 'red'">
+                        {{ fmtPosType(p.type) }}
+                      </span>
+                    </span>
+                    <span class="c-mono">{{ (p.volume || 0).toFixed(2) }}</span>
+                    <span class="c-mono">{{ fmtPrice(p.price_open, p.symbol) }}</span>
+                    <span class="c-mono">{{ fmtPrice(p.price_current, p.symbol) }}</span>
+                    <span class="c-muted">{{ p.sl ? fmtPrice(p.sl, p.symbol) : '—' }}</span>
+                    <span class="c-muted">{{ p.tp ? fmtPrice(p.tp, p.symbol) : '—' }}</span>
+                    <span class="c-muted">{{ fmtPosTime(p.time) }}</span>
+                    <span class="c-mono" :class="(p.profit || 0) >= 0 ? 'c-green' : 'c-red'">
+                      {{ (p.profit || 0) >= 0 ? '+' : '' }}{{ (p.profit || 0).toFixed(2) }}
+                    </span>
+                    <span>
+                      <button
+                        class="pf-btn pf-btn-mini pf-btn-danger"
+                        :disabled="isClosing(p.ticket)"
+                        :title="`平仓 #${p.ticket}`"
+                        @click="closePosition(p)"
+                      >{{ isClosing(p.ticket) ? '中…' : '平' }}</button>
+                    </span>
+                  </div>
+                </div>
               </div>
               <!-- 手机端：卡片列表 -->
-              <div class="pos-cards">
-                <div v-for="p in sortedPositions" :key="p.ticket" class="pos-card">
-                  <div class="pos-card-row1">
-                    <div class="pos-card-left">
-                      <span class="mono strong">{{ p.symbol }}</span>
-                      <span class="dir-tag" :class="(p.type || '').toLowerCase() === 'buy' ? 'buy' : 'sell'">{{ fmtPosType(p.type) }}</span>
+              <div class="tr-cards mobile-only">
+                <div v-for="p in sortedPositions" :key="p.ticket" class="tr-card">
+                  <div class="tr-card-head">
+                    <div class="tr-card-left">
+                      <span class="c-strong">{{ p.symbol }}</span>
+                      <span class="pf-pill" :class="(p.type || '').toLowerCase() === 'buy' ? 'green' : 'red'">
+                        {{ fmtPosType(p.type) }}
+                      </span>
                     </div>
-                    <div class="pos-card-right">
+                    <div class="tr-card-right">
+                      <span class="tr-card-pnl" :class="(p.profit || 0) >= 0 ? 'pos' : 'neg'">
+                        {{ (p.profit || 0) >= 0 ? '+' : '' }}{{ (p.profit || 0).toFixed(2) }}
+                      </span>
                       <button
-                        class="pos-close-btn"
-                        :class="{ busy: isClosing(p.ticket) }"
+                        class="pf-btn pf-btn-mini pf-btn-danger"
                         :disabled="isClosing(p.ticket)"
                         @click="closePosition(p)"
-                      >
-                        <svg v-if="!isClosing(p.ticket)" viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                          <path d="M4 4l8 8M12 4l-8 8" />
-                        </svg>
-                        <span v-else class="dot-spin" aria-hidden="true"></span>
-                        <span>平仓</span>
-                      </button>
-                      <div class="pos-card-pnl" :class="(p.profit || 0) >= 0 ? 'pos' : 'neg'">
-                        {{ (p.profit || 0) >= 0 ? '+' : '' }}{{ (p.profit || 0).toFixed(2) }}
-                      </div>
+                      >{{ isClosing(p.ticket) ? '中…' : '平' }}</button>
                     </div>
                   </div>
-                  <div class="pos-card-row2">
-                    <span class="kv"><span class="k">#</span><span class="v mono muted">{{ p.ticket }}</span></span>
-                    <span class="kv"><span class="k">手数</span><span class="v mono">{{ (p.volume || 0).toFixed(2) }}</span></span>
-                    <span class="kv"><span class="k">开仓</span><span class="v mono">{{ fmtPrice(p.price_open, p.symbol) }}</span></span>
-                    <span class="kv"><span class="k">现价</span><span class="v mono">{{ fmtPrice(p.price_current, p.symbol) }}</span></span>
-                    <span class="kv"><span class="k">止损</span><span class="v mono muted">{{ p.sl ? fmtPrice(p.sl, p.symbol) : '—' }}</span></span>
-                    <span class="kv"><span class="k">止盈</span><span class="v mono muted">{{ p.tp ? fmtPrice(p.tp, p.symbol) : '—' }}</span></span>
+                  <div class="tr-card-grid">
+                    <div class="pf-kv"><span class="k">手数</span><span class="v">{{ (p.volume || 0).toFixed(2) }}</span></div>
+                    <div class="pf-kv"><span class="k">开仓</span><span class="v">{{ fmtPrice(p.price_open, p.symbol) }}</span></div>
+                    <div class="pf-kv"><span class="k">现价</span><span class="v">{{ fmtPrice(p.price_current, p.symbol) }}</span></div>
+                    <div class="pf-kv"><span class="k">止损</span><span class="v dim">{{ p.sl ? fmtPrice(p.sl, p.symbol) : '—' }}</span></div>
+                    <div class="pf-kv"><span class="k">止盈</span><span class="v dim">{{ p.tp ? fmtPrice(p.tp, p.symbol) : '—' }}</span></div>
+                    <div class="pf-kv"><span class="k">开仓时间</span><span class="v dim">{{ fmtPosTime(p.time) }}</span></div>
                   </div>
-                  <div class="pos-card-row3 muted">{{ fmtPosTime(p.time) }}</div>
                 </div>
               </div>
             </template>
+            <p v-else class="pf-empty">暂无持仓</p>
           </div>
 
           <!-- 资产 -->
           <div v-if="detailTab === 'assets'" role="tabpanel">
-            <div class="asset-grid">
-              <div class="asset-item asset-highlight">
-                <div class="asset-label">净值（Equity）</div>
-                <div class="asset-value mono" :class="accountEquity >= 0 ? 'pos' : 'neg'">
+            <div class="pf-kv-grid">
+              <div class="pf-kv">
+                <span class="k">净值（Equity）</span>
+                <span class="v" :class="accountEquity >= 0 ? 'pos' : 'neg'">
                   {{ accountEquity >= 0 ? '+' : '' }}{{ accountEquity.toFixed(2) }}
-                </div>
+                </span>
               </div>
-              <div class="asset-item asset-highlight">
-                <div class="asset-label">浮动盈亏</div>
-                <div class="asset-value mono" :class="accountProfit >= 0 ? 'pos' : 'neg'">
+              <div class="pf-kv">
+                <span class="k">浮动盈亏</span>
+                <span class="v" :class="accountProfit >= 0 ? 'pos' : 'neg'">
                   {{ accountProfit >= 0 ? '+' : '' }}{{ accountProfit.toFixed(2) }}
-                </div>
+                </span>
               </div>
-              <div class="asset-item">
-                <div class="asset-label">余额（Balance）</div>
-                <div class="asset-value mono">{{ accountBalance.toFixed(2) }}</div>
+              <div class="pf-kv">
+                <span class="k">余额（Balance）</span>
+                <span class="v">{{ accountBalance.toFixed(2) }}</span>
               </div>
-              <div class="asset-item">
-                <div class="asset-label">已用保证金（Margin）</div>
-                <div class="asset-value mono muted">{{ accountMargin.toFixed(2) }}</div>
+              <div class="pf-kv">
+                <span class="k">已用保证金（Margin）</span>
+                <span class="v dim">{{ accountMargin.toFixed(2) }}</span>
               </div>
-              <div class="asset-item">
-                <div class="asset-label">可用保证金（Free）</div>
-                <div class="asset-value mono">{{ accountFreeMargin.toFixed(2) }}</div>
+              <div class="pf-kv">
+                <span class="k">可用保证金（Free）</span>
+                <span class="v">{{ accountFreeMargin.toFixed(2) }}</span>
               </div>
-              <div class="asset-item">
-                <div class="asset-label">杠杆</div>
-                <div class="asset-value mono">1:{{ accountLeverage }}</div>
+              <div class="pf-kv">
+                <span class="k">杠杆</span>
+                <span class="v">1:{{ accountLeverage }}</span>
               </div>
             </div>
           </div>
 
-          <!-- 历史订单：成交明细（唯一视图，无视图切换） -->
+          <!-- 历史订单：成交明细 -->
           <div v-if="detailTab === 'history'" role="tabpanel">
             <DealsTable :node-id="primaryNode?.node_id ?? null" @total="dealsTotal = $event" />
           </div>
 
-          <!-- 吸筹策略（运行中网格任务 · 一行一任务） -->
+          <!-- 吸筹策略（运行中的网格任务） -->
           <div v-if="detailTab === 'grid'" role="tabpanel">
-            <div v-if="gridLoading && gridTasks.length === 0" class="detail-empty">
-              <div class="dot-spin-lg" aria-hidden="true"></div>
-              <div>加载中…</div>
-            </div>
-            <div v-else-if="!gridLoading && gridTasks.length === 0" class="detail-empty">
-              <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M3 6h18M3 12h18M3 18h18" />
-                <path d="M6 4v16M12 4v16M18 4v16" />
-              </svg>
-              <div>暂无运行中的网格策略</div>
-            </div>
+            <div v-if="gridLoading && gridTasks.length === 0" class="pf-empty">加载中…</div>
+            <div v-else-if="!gridLoading && gridTasks.length === 0" class="pf-empty">暂无运行中的网格策略</div>
             <template v-else>
-              <div v-if="gridRefreshing" class="grid-refresh-hint muted">刷新中…</div>
-              <!-- 桌面端：表格（一行一任务） -->
-              <div class="pos-table-wrap">
-                <table class="pos-table grid-task-table">
-                  <thead>
-                    <tr>
-                      <th>品种</th>
-                      <th>方向</th>
-                      <th>节点</th>
-                      <th class="num">持仓</th>
-                      <th class="num">挂单</th>
-                      <th class="num">盈亏</th>
-                      <th class="num">启动</th>
-                      <th>信号 ID</th>
-                      <th>操作</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr v-for="t in gridTasks" :key="t.task_id">
-                      <td class="mono strong">{{ t.symbol || '—' }}</td>
-                      <td>
-                        <span class="dir-tag" :class="gridDirTagClass(t.action)">
-                          {{ fmtPosType(t.action) }}
-                        </span>
-                      </td>
-                      <td class="muted" :title="gridTaskNodeNames(t)">{{ gridTaskNodeNames(t) }}</td>
-                      <td class="num mono">{{ gridTaskPositionCount(t) }}</td>
-                      <td class="num mono muted">{{ gridTaskPendingCount(t) || '—' }}</td>
-                      <td
-                        class="num mono"
-                        :class="gridTaskProfit(t) >= 0 ? 'pos' : 'neg'"
-                      >
-                        {{ gridTaskProfit(t) >= 0 ? '+' : '' }}{{ gridTaskProfit(t).toFixed(2) }}
-                      </td>
-                      <td class="num mono muted">{{ fmtHistoryTime(t.opened_at || t.created_at) }}</td>
-                      <td class="mono muted grid-signal-cell" :title="t.signal_id">{{ t.signal_id }}</td>
-                      <td>
-                        <button
-                          class="pos-close-btn"
-                          :class="{ busy: isClosingGridTask(t.task_id) }"
-                          :disabled="isClosingGridTask(t.task_id) || !isGridTaskStoppable(t)"
-                          :title="isGridTaskStoppable(t) ? `停止 ${t.symbol} 网格任务` : '该任务已结束'"
-                          @click="stopGridTask(t)"
-                        >
-                          <svg v-if="!isClosingGridTask(t.task_id)" viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                            <rect x="4" y="4" width="8" height="8" rx="1" />
-                          </svg>
-                          <span v-else class="dot-spin" aria-hidden="true"></span>
-                          <span>{{ isClosingGridTask(t.task_id) ? '下发中…' : '停止' }}</span>
-                        </button>
-                      </td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-              <!-- 手机端：卡片（一卡一任务） -->
-              <div class="pos-cards">
-                <div v-for="t in gridTasks" :key="`m-${t.task_id}`" class="pos-card">
-                  <div class="pos-card-row1">
-                    <div class="pos-card-left">
-                      <span class="mono strong">{{ t.symbol || '—' }}</span>
-                      <span class="dir-tag" :class="gridDirTagClass(t.action)">
+              <p v-if="gridRefreshing" class="pf-hint tr-refresh">刷新中…</p>
+              <div class="pf-rows tr-rows tr-rows-grid">
+                <div class="pf-rows-inner">
+                  <div class="pf-row pf-row-head">
+                    <span>品种</span>
+                    <span>方向</span>
+                    <span>节点</span>
+                    <span>持仓</span>
+                    <span>挂单</span>
+                    <span>盈亏</span>
+                    <span>启动</span>
+                    <span>信号 ID</span>
+                    <span></span>
+                  </div>
+                  <div v-for="t in gridTasks" :key="t.task_id" class="pf-row">
+                    <span class="c-strong">{{ t.symbol || '—' }}</span>
+                    <span>
+                      <span class="pf-pill" :class="gridDirTagClass(t.action) === 'buy' ? 'green' : 'red'">
                         {{ fmtPosType(t.action) }}
                       </span>
-                      <span class="tag" style="font-size: 10px">网格</span>
-                    </div>
-                    <div class="pos-card-right">
+                    </span>
+                    <span class="c-muted" :title="gridTaskNodeNames(t)">{{ gridTaskNodeNames(t) }}</span>
+                    <span class="c-mono">{{ gridTaskPositionCount(t) }}</span>
+                    <span class="c-mono c-muted">{{ gridTaskPendingCount(t) || '—' }}</span>
+                    <span class="c-mono" :class="gridTaskProfit(t) >= 0 ? 'c-green' : 'c-red'">
+                      {{ gridTaskProfit(t) >= 0 ? '+' : '' }}{{ gridTaskProfit(t).toFixed(2) }}
+                    </span>
+                    <span class="c-muted">{{ fmtHistoryTime(t.opened_at || t.created_at) }}</span>
+                    <span class="c-mono c-muted" :title="t.signal_id">{{ t.signal_id }}</span>
+                    <span>
                       <button
-                        class="pos-close-btn"
-                        :class="{ busy: isClosingGridTask(t.task_id) }"
+                        class="pf-btn pf-btn-mini pf-btn-danger"
+                        :disabled="isClosingGridTask(t.task_id) || !isGridTaskStoppable(t)"
+                        :title="isGridTaskStoppable(t) ? `停止 ${t.symbol} 网格任务` : '该任务已结束'"
+                        @click="stopGridTask(t)"
+                      >{{ isClosingGridTask(t.task_id) ? '中…' : '停' }}</button>
+                    </span>
+                  </div>
+                </div>
+              </div>
+              <div class="tr-cards mobile-only">
+                <div v-for="t in gridTasks" :key="`m-${t.task_id}`" class="tr-card">
+                  <div class="tr-card-head">
+                    <div class="tr-card-left">
+                      <span class="c-strong">{{ t.symbol || '—' }}</span>
+                      <span class="pf-pill" :class="gridDirTagClass(t.action) === 'buy' ? 'green' : 'red'">
+                        {{ fmtPosType(t.action) }}
+                      </span>
+                      <span class="pf-pill grey">网格</span>
+                    </div>
+                    <div class="tr-card-right">
+                      <button
+                        class="pf-btn pf-btn-mini pf-btn-danger"
                         :disabled="isClosingGridTask(t.task_id) || !isGridTaskStoppable(t)"
                         @click="stopGridTask(t)"
-                      >
-                        <svg v-if="!isClosingGridTask(t.task_id)" viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                          <rect x="4" y="4" width="8" height="8" rx="1" />
-                        </svg>
-                        <span v-else class="dot-spin" aria-hidden="true"></span>
-                        <span>{{ isClosingGridTask(t.task_id) ? '下发中…' : '停止' }}</span>
-                      </button>
+                      >{{ isClosingGridTask(t.task_id) ? '中…' : '停' }}</button>
                     </div>
                   </div>
-                  <div class="pos-card-row2">
-                    <span class="kv"><span class="k">节点</span><span class="v" :title="gridTaskNodeNames(t)">{{ gridTaskNodeNames(t) }}</span></span>
-                    <span class="kv"><span class="k">持仓</span><span class="v mono">{{ gridTaskPositionCount(t) }}</span></span>
-                    <span class="kv"><span class="k">挂单</span><span class="v mono muted">{{ gridTaskPendingCount(t) || '—' }}</span></span>
-                    <span class="kv"><span class="k">启动</span><span class="v mono muted">{{ fmtHistoryTime(t.opened_at || t.created_at) }}</span></span>
-                    <span class="kv"><span class="k">盈亏</span><span class="v mono" :class="gridTaskProfit(t) >= 0 ? 'pos' : 'neg'">
+                  <div class="tr-card-grid">
+                    <div class="pf-kv"><span class="k">节点</span><span class="v">{{ gridTaskNodeNames(t) }}</span></div>
+                    <div class="pf-kv"><span class="k">持仓</span><span class="v">{{ gridTaskPositionCount(t) }}</span></div>
+                    <div class="pf-kv"><span class="k">挂单</span><span class="v dim">{{ gridTaskPendingCount(t) || '—' }}</span></div>
+                    <div class="pf-kv"><span class="k">盈亏</span><span class="v" :class="gridTaskProfit(t) >= 0 ? 'pos' : 'neg'">
                       {{ gridTaskProfit(t) >= 0 ? '+' : '' }}{{ gridTaskProfit(t).toFixed(2) }}
-                    </span></span>
-                    <span class="kv" style="grid-column: 1 / -1"><span class="k">信号</span><span class="v mono muted" style="font-size: 11px">{{ t.signal_id }}</span></span>
+                    </span></div>
+                    <div class="pf-kv span-full"><span class="k">信号 ID</span><span class="v dim">{{ t.signal_id }}</span></div>
+                    <div class="pf-kv span-full"><span class="k">启动</span><span class="v dim">{{ fmtHistoryTime(t.opened_at || t.created_at) }}</span></div>
                   </div>
                 </div>
               </div>
             </template>
           </div>
-
         </div>
-      </div>
-
-
-
+      </section>
     </template>
 
-    <!-- 触发弹窗：开仓参数（新 UI） -->
+    <!-- 触发弹窗：开仓参数 -->
     <OrderDialog
       ref="orderDialogRef"
       v-model="dialogVisible"
@@ -1190,692 +1162,242 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-/* ── Page frame ── */
-.trading-page {
-  display: flex;
-  flex-direction: column;
+/* ── 页面骨架（对齐 UI/H5.html 原型的深色卡片语言）── */
+.tr-page {
   gap: 12px;
-  /* 移动端风格：底部留出触达区 */
-  padding-bottom: 8px;
 }
 
-/* ── Empty state ── */
-.empty-state { text-align: center; padding: 40px 20px; }
-.empty-title { font-size: 18px; font-weight: 600; margin-bottom: 8px; }
-.empty-desc { color: var(--muted); margin-bottom: 16px; }
-
-/* ── Status bar ── */
-.status-bar {
+/* ── 空态 ── */
+.tr-empty {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 12px 16px;
+  align-items: center;
+  gap: 8px;
+  padding: 40px 20px;
+  text-align: center;
 }
-.status-row {
+.tr-empty-icon {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  background: rgba(37, 99, 235, 0.15);
+  color: #60a5fa;
 }
-.status-left, .status-right {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-width: 0;
-}
-.status-summary {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 8px 10px;
-  background: var(--glass);
-  border: 1px solid var(--glass-border);
-  border-radius: var(--radius-sm);
-  flex-wrap: wrap;
-}
-.ss-item {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-  flex: 1 1 auto;
-}
-.ss-k {
-  font-size: 11px;
-  color: var(--muted);
-  letter-spacing: 0.02em;
-}
-.ss-v {
-  font-size: 13px;
-  font-weight: 700;
-  font-family: var(--mono);
-  color: var(--text);
-}
-.ss-v.pos { color: var(--green); }
-.ss-v.neg { color: var(--red); }
-.ss-sep {
-  width: 1px;
-  height: 18px;
-  background: var(--glass-border);
-  flex-shrink: 0;
-}
-.status-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 10px;
-  border-radius: 999px;
-  font-size: 12px;
-  font-weight: 600;
-  background: var(--glass);
-  border: 1px solid var(--glass-border);
-  color: var(--muted);
-}
-.status-pill.on { color: var(--green); border-color: rgba(16, 185, 129, 0.28); background: rgba(16, 185, 129, 0.08); }
-.status-pill.off { color: #9ca3af; }
-.status-node {
+.tr-empty-icon svg { width: 22px; height: 22px; }
+.tr-empty-title {
+  margin: 4px 0 0;
   font-size: 14px;
-  font-weight: 600;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.status-muted { font-size: 12px; color: var(--muted); font-family: var(--mono); }
-.status-sep { color: rgba(255, 255, 255, 0.18); }
-
-/* ── Quote board (双柱) ── */
-.quote-board {
-  display: flex;
-  align-items: stretch;
-  padding: 0;
-  overflow: hidden;
-}
-.quote-col {
-  flex: 1 1 0;
-  min-width: 0;
-  padding: 18px 16px 14px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.quote-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 8px;
-}
-.quote-sym {
-  font-size: 18px;
   font-weight: 700;
-  letter-spacing: 0.02em;
+  color: var(--pf-text);
 }
-.quote-pct {
-  font-size: 11px;
-  color: var(--muted);
-  font-family: var(--mono);
-}
-.quote-mid {
-  font-size: 32px;
-  font-weight: 700;
-  line-height: 1.1;
-  font-family: var(--mono);
-  letter-spacing: -0.01em;
-  color: var(--text);
-  margin: 2px 0 6px;
-}
-.quote-bidask {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 8px 10px;
-  background: var(--glass);
-  border: 1px solid var(--glass-border);
-  border-radius: var(--radius-sm);
-}
-.ba-row {
-  display: flex;
-  justify-content: space-between;
-  font-size: 12px;
-  font-family: var(--mono);
-}
-.ba-k { color: var(--muted); }
-.ba-v { color: var(--text); font-weight: 600; }
-.ba-v.pos { color: var(--green); }
-.ba-v.neg { color: var(--red); }
+.tr-empty .pf-btn { margin-top: 8px; }
 
-/* 涨跌 / 涨跌幅 / 多空结论：三者挤在一行，中间用细分隔线断开 */
-.ba-row.chg {
-  align-items: center;
-  justify-content: flex-start;
-  gap: 10px;
-}
-.ba-row.chg .ba-v + .ba-v,
-.ba-row.chg .ba-v + .tag {
-  padding-left: 10px;
-  border-left: 1px solid var(--glass-border);
-}
-
-.quote-position {
+/* ── 品种切换条（横向滚动，不换行挤压）── */
+.tr-syms {
   display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: 8px 10px;
-  background: rgba(37, 99, 235, 0.06);
-  border: 1px solid rgba(37, 99, 235, 0.18);
-  border-radius: var(--radius-sm);
-}
-.qp-row {
-  display: flex;
-  justify-content: space-between;
-  font-size: 12px;
-  font-family: var(--mono);
-}
-.qp-k { color: var(--muted); }
-.qp-v { color: var(--text); font-weight: 600; }
-.qp-v.pos { color: var(--green); }
-.qp-v.neg { color: var(--red); }
-
-.quote-sym-picker {
-  display: flex;
-  flex-wrap: wrap;
   gap: 6px;
-  margin-top: 6px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  margin-top: 10px;
 }
-.sym-chip {
-  padding: 7px 12px;
-  font-size: 13px;
-  font-weight: 700;
+.tr-syms::-webkit-scrollbar { display: none; }
+.tr-sym {
+  flex: 0 0 auto;
+  padding: 6px 12px;
   border-radius: 8px;
-  background: var(--glass);
-  color: var(--muted);
-  border: 1px solid var(--glass-border);
+  border: 1px solid var(--pf-border-2);
+  background: var(--pf-soft);
+  color: var(--pf-muted);
+  font-size: 12px;
+  font-weight: 500;
   font-family: var(--mono);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s, border-color 0.15s;
 }
-.sym-chip:hover { color: var(--text); border-color: var(--glass-highlight); }
-.sym-chip.active {
-  background: linear-gradient(135deg, var(--primary) 0%, var(--primary-d) 100%);
-  color: #ffffff;
+.tr-sym:hover { color: var(--pf-text); }
+.tr-sym.active {
   border-color: transparent;
-  box-shadow: 0 0 12px rgba(37, 99, 235, 0.32);
-}
-.sym-empty {
-  margin-top: 4px;
-  font-size: 12px;
-  padding: 6px 0 2px;
+  background: var(--pf-blue);
+  color: #fff;
+  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.35);
 }
 
-/* ── Action bar (3 个策略按钮) ── */
-.action-bar {
-  position: sticky;
-  bottom: 12px;
+/* ── 价格区 ── */
+.tr-quote {
   display: flex;
-  align-items: stretch;
-  gap: 8px;
-  padding: 10px 12px;
-  margin-top: 8px;
-  background: var(--panel);
-  border: 1px solid var(--glass-border);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow), 0 0 24px rgba(0, 0, 0, 0.45);
-  backdrop-filter: blur(var(--blur)) saturate(1.4);
-  -webkit-backdrop-filter: blur(var(--blur)) saturate(1.4);
-}
-.action-btn {
-  flex: 1 1 0;
-  height: 64px;
-  padding: 4px 8px;
-  border-radius: var(--radius-sm);
-  font-size: 14px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  color: #ffffff;
-  border: none;
-  cursor: pointer;
-  background: linear-gradient(135deg, var(--primary) 0%, var(--primary-d) 100%);
-  box-shadow: 0 6px 20px rgba(37, 99, 235, 0.28);
-  transition: transform 0.1s, box-shadow var(--transition), filter var(--transition);
-  display: inline-flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-}
-.action-icon {
-  width: 22px;
-  height: 22px;
-  opacity: 0.85;
-  transition: transform var(--transition), opacity var(--transition);
-}
-.action-label {
-  line-height: 1.1;
-  font-size: 13px;
-}
-.action-btn:hover { filter: brightness(1.08); }
-.action-btn:hover .action-icon { opacity: 1; transform: translateY(-1px); }
-.action-btn:active { transform: translateY(1px); }
-.action-btn:disabled, .action-btn.action-btn-disabled { opacity: 0.45; cursor: not-allowed; box-shadow: none; }
-.action-btn:disabled .action-icon, .action-btn.action-btn-disabled .action-icon { opacity: 0.5; }
-.action-sep { width: 1px; background: var(--glass-border); flex-shrink: 0; }
-
-.offline-tip {
-  font-size: 12px;
-  color: #fbbf24;
-  text-align: center;
-  padding: 4px 0 0;
-}
-
-/* ── Dialog form 样式已迁出到 OrderDialog.vue ── */
-
-/* ── 持仓 / 资产详情（Tab 切换） ── */
-.detail-panel {
-  display: flex;
-  flex-direction: column;
-  gap: 0;
-  padding: 0;
-  overflow: hidden;
-}
-
-/* Tab 切换条 */
-.detail-tabs {
-  display: flex;
-  gap: 4px;
-  padding: 10px 14px 0;
-  border-bottom: 1px solid var(--glass-border);
-  flex-shrink: 0;
-}
-.detail-tab {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 8px 14px;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--muted);
-  background: transparent;
-  border: none;
-  border-bottom: 2px solid transparent;
-  border-radius: 8px 8px 0 0;
-  cursor: pointer;
-  transition: color 0.15s, border-color 0.15s, background 0.15s;
-  letter-spacing: 0.01em;
-  position: relative;
-  top: 1px;
-}
-.detail-tab:hover { color: var(--text); background: rgba(255,255,255,0.04); }
-.detail-tab.active {
-  color: var(--primary);
-  border-bottom-color: var(--primary);
-  background: rgba(37, 99, 235, 0.06);
-}
-.tab-badge {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 18px;
-  height: 18px;
-  padding: 0 5px;
-  font-size: 11px;
-  font-weight: 700;
-  background: var(--primary);
-  color: #ffffff;
-  border-radius: 999px;
-  line-height: 1;
-}
-.tab-badge-muted {
-  background: var(--glass);
-  color: var(--muted);
-  border: 1px solid var(--glass-border);
-}
-
-/* Tab 内容区 */
-.detail-body {
-  flex: 1 1 auto;
-  min-height: 0;
-  overflow-y: auto;
-  padding-bottom: 2px;
-}
-
-/* 空态 */
-.detail-empty {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  padding: 32px 20px;
-  color: var(--muted);
-  font-size: 13px;
-}
-.detail-empty svg { opacity: 0.35; }
-
-.dot-spin-lg {
-  width: 22px;
-  height: 22px;
-  border: 2px solid var(--glass-border);
-  border-top-color: var(--primary);
-  border-radius: 50%;
-  animation: pos-spin 0.8s linear infinite;
-}
-
-/* ── 主节点持仓列表（桌面表格） ── */
-.pos-table-wrap { overflow-x: auto; }
-.pos-cards { display: none; }
-
-.pos-table {
-  width: 100%;
-  border-collapse: separate;
-  border-spacing: 0;
-  font-size: 12px;
-  min-width: 720px;
-}
-.pos-table thead th {
-  text-align: left;
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--muted);
-  letter-spacing: 0.04em;
-  padding: 8px 10px;
-  background: var(--glass);
-  border-bottom: 1px solid var(--glass-border);
-  position: sticky;
-  top: 0;
-  z-index: 1;
-}
-.pos-table thead th.num { text-align: right; }
-.pos-table thead th.pnl { text-align: right; }
-.pos-table tbody td {
-  padding: 9px 10px;
-  border-bottom: 1px solid var(--glass-border);
-  color: var(--text);
-  font-size: 12px;
-  vertical-align: middle;
-}
-.pos-table tbody tr:last-child td { border-bottom: none; }
-.pos-table tbody tr:hover { background: rgba(255, 255, 255, 0.02); }
-.pos-table td.num { text-align: right; }
-.pos-table td.pnl { text-align: right; font-weight: 700; }
-.pos-table td.mono { font-family: var(--mono); }
-.pos-table td.strong { font-weight: 700; }
-.pos-table td.muted { color: var(--muted); }
-.pos-table td.pnl.pos { color: var(--green); }
-.pos-table td.pnl.neg { color: var(--red); }
-
-/* 品种单元格：品种名 + 平仓按钮并排 */
-.sym-cell {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  white-space: nowrap;
-}
-.pos-close-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 3px 8px;
-  font-size: 11px;
-  font-weight: 600;
-  color: #fca5a5;
-  background: rgba(239, 68, 68, 0.08);
-  border: 1px solid rgba(239, 68, 68, 0.28);
-  border-radius: 6px;
-  cursor: pointer;
-  line-height: 1;
-  transition: background 0.15s, color 0.15s, border-color 0.15s, transform 0.1s;
-}
-.pos-close-btn:hover {
-  background: rgba(239, 68, 68, 0.18);
-  color: #fecaca;
-  border-color: rgba(239, 68, 68, 0.5);
-}
-.pos-close-btn:active { transform: translateY(1px); }
-.pos-close-btn:disabled,
-.pos-close-btn.busy {
-  cursor: not-allowed;
-  opacity: 0.6;
-  background: rgba(239, 68, 68, 0.05);
-}
-.pos-close-btn.busy .dot-spin {
-  display: inline-block;
-  width: 10px;
-  height: 10px;
-  border: 1.5px solid currentColor;
-  border-top-color: transparent;
-  border-radius: 50%;
-  animation: pos-spin 0.8s linear infinite;
-}
-@keyframes pos-spin {
-  to { transform: rotate(360deg); }
-}
-
-/* 方向 tag */
-.dir-tag {
-  display: inline-block;
-  padding: 2px 8px;
-  border-radius: 6px;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.05em;
-  border: 1px solid transparent;
-}
-.dir-tag.buy { color: #fca5a5; background: rgba(239, 68, 68, 0.10); border-color: rgba(239, 68, 68, 0.28); }
-.dir-tag.sell { color: #6ee7b7; background: rgba(16, 185, 129, 0.10); border-color: rgba(16, 185, 129, 0.28); }
-
-/* ── 历史订单 ── */
-/* 状态色块（不区分成功颜色，保持语义化） */
-.hist-status {
-  display: inline-block;
-  padding: 2px 8px;
-  border-radius: 6px;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  background: var(--glass);
-  color: var(--muted);
-  border: 1px solid var(--glass-border);
-  font-family: var(--mono);
-}
-.hist-status.ok {
-  color: #6ee7b7;
-  background: rgba(16, 185, 129, 0.10);
-  border-color: rgba(16, 185, 129, 0.28);
-}
-.hist-status.pending {
-  color: #fbbf24;
-  background: rgba(251, 191, 36, 0.08);
-  border-color: rgba(251, 191, 36, 0.28);
-}
-.hist-status.err {
-  color: #fca5a5;
-  background: rgba(239, 68, 68, 0.10);
-  border-color: rgba(239, 68, 68, 0.28);
-}
-
-/* 历史表比当前持仓表多一列错误，加宽一点 */
-.hist-table { min-width: 860px; }
-.hist-err {
-  max-width: 240px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 11px;
-}
-.hist-err-kv { grid-column: 1 / -1; }
-.err-text { color: var(--red); }
-
-/* 翻页器 */
-.hist-pager {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 10px 12px;
-  font-size: 12px;
-  border-top: 1px solid var(--glass-border);
-  background: var(--glass);
-}
-.pager-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 28px;
-  height: 26px;
-  padding: 0 8px;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text);
-  background: transparent;
-  border: 1px solid var(--glass-border);
-  border-radius: 6px;
-  cursor: pointer;
-  transition: background 0.15s, border-color 0.15s, color 0.15s;
-}
-.pager-btn:hover:not(:disabled) {
-  background: rgba(37, 99, 235, 0.10);
-  border-color: rgba(37, 99, 235, 0.4);
-  color: var(--primary);
-}
-.pager-btn:disabled { opacity: 0.35; cursor: not-allowed; }
-.pager-info {
-  font-family: var(--mono);
-  font-weight: 600;
-  color: var(--text);
-  padding: 0 4px;
-  min-width: 50px;
-  text-align: center;
-}
-.pager-total {
-  margin-left: auto;
-  font-size: 11px;
-  font-family: var(--mono);
-}
-
-/* 手机持仓卡片 */
-.pos-card {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 10px 14px;
-  background: var(--glass);
-  border-bottom: 1px solid var(--glass-border);
-}
-.pos-card + .pos-card { margin-top: 0; }
-.pos-card-row1 {
-  display: flex;
-  align-items: center;
+  align-items: flex-end;
   justify-content: space-between;
-  gap: 10px;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 12px;
 }
-.pos-card-left { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
-.pos-card-right { display: inline-flex; align-items: center; gap: 8px; flex-shrink: 0; }
-.pos-card-pnl { font-size: 14px; font-weight: 700; font-family: var(--mono); }
-.pos-card-pnl.pos { color: var(--green); }
-.pos-card-pnl.neg { color: var(--red); }
-.pos-card-row2 {
+.tr-price {
+  margin: 0;
+  font-size: 30px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: -0.02em;
+  font-family: var(--mono);
+  color: var(--pf-text);
+}
+@media (min-width: 640px) {
+  .tr-price { font-size: 36px; }
+}
+.tr-chg {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.tr-chg-pill {
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: var(--mono);
+}
+.tr-chg-pill.pos { background: rgba(34, 197, 94, 0.15); color: #4ade80; }
+.tr-chg-pill.neg { background: rgba(246, 70, 93, 0.15); color: #f87171; }
+.tr-chg-pct {
+  font-size: 12px;
+  font-family: var(--mono);
+}
+.tr-chg-pct.pos { color: #22c55e; }
+.tr-chg-pct.neg { color: #f6465d; }
+
+/* ── 三个策略按钮 ── */
+.tr-actions {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 4px 8px;
+  gap: 8px;
 }
-.pos-card-row2 .kv { display: flex; justify-content: space-between; gap: 6px; min-width: 0; font-size: 12px; }
-.pos-card-row2 .k { color: var(--muted); }
-.pos-card-row2 .v { color: var(--text); font-weight: 600; }
-.pos-card-row2 .v.muted { color: var(--muted); }
-.pos-card-row3 { font-size: 11px; font-family: var(--mono); }
-
-/* ── 资产 ── */
-.asset-grid {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 1px;
-  background: var(--glass-border);
-}
-.asset-item {
-  display: flex;
+.tr-action {
+  display: inline-flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 14px 16px;
-  background: var(--glass);
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 64px;
+  padding: 10px 8px;
+  border-radius: 12px;
+  border: 1px solid var(--pf-border-2);
+  background: var(--pf-soft);
+  color: var(--pf-text);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s, opacity 0.15s;
 }
-.asset-item.asset-highlight {
-  background: rgba(37, 99, 235, 0.04);
+.tr-action:hover:not(:disabled) {
+  border-color: rgba(37, 99, 235, 0.6);
+  background: #111a2c;
 }
-.asset-label {
-  font-size: 12px;
-  color: var(--muted);
-  font-weight: 500;
+.tr-action:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
-.asset-value {
-  font-size: 18px;
-  font-weight: 700;
-  color: var(--text);
-  letter-spacing: -0.01em;
+.tr-action-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  color: #60a5fa;
 }
-.asset-value.pos { color: var(--green); }
-.asset-value.neg { color: var(--red); }
-.asset-value.muted { color: var(--muted); font-size: 15px; font-weight: 600; }
+.tr-action-icon svg { width: 20px; height: 20px; }
+.tr-action-label { line-height: 1.1; }
+.tr-offline {
+  margin: -4px 0 0;
+  color: #fbbf24;
+  text-align: center;
+}
 
-.mono { font-family: var(--mono); }
-.strong { font-weight: 700; }
+/* ── Tab 条 ── */
+.tr-tabs {
+  margin-bottom: 10px;
+}
+.tr-tab-count {
+  padding: 0 5px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.18);
+  font-size: 9px;
+  font-family: var(--mono);
+  line-height: 15px;
+}
+.tr-tab-count.muted {
+  background: rgba(255, 255, 255, 0.1);
+}
+.tr-body {
+  min-height: 0;
+}
 
-/* ── Responsive ── */
+/* ── 数据表 ── */
+.tr-rows .pf-rows-inner { min-width: 900px; }
+.tr-rows-pos .pf-row-head,
+.tr-rows-pos .pf-row {
+  grid-template-columns:
+    minmax(0, 1fr) 64px 64px 92px 92px 84px 84px 120px 92px 48px;
+}
+.tr-rows-grid .pf-row-head,
+.tr-rows-grid .pf-row {
+  grid-template-columns:
+    minmax(0, 0.9fr) 64px minmax(0, 1.2fr) 64px 64px 92px 130px minmax(0, 1fr) 48px;
+}
+.tr-rows .pf-row { cursor: default; }
+.tr-refresh {
+  margin: 0 0 6px;
+  text-align: right;
+}
+
+/* ── 手机端卡片 ── */
+.tr-cards { display: block; }
+.tr-card {
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid var(--pf-border);
+  background: var(--pf-soft);
+}
+.tr-card + .tr-card { margin-top: 8px; }
+.tr-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.tr-card-left,
+.tr-card-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.tr-card-pnl {
+  font-size: 13px;
+  font-weight: 600;
+  font-family: var(--mono);
+}
+.tr-card-pnl.pos { color: #22c55e; }
+.tr-card-pnl.neg { color: #f6465d; }
+.tr-card-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+.tr-card-grid .pf-kv .v { font-size: 12px; }
+
 @media (max-width: 640px) {
-  .quote-mid { font-size: 26px; }
-  .quote-col { padding: 14px 10px 12px; }
-  .action-btn { height: 56px; }
-  .action-icon { width: 18px; height: 18px; }
-  .action-label { font-size: 12px; }
-  /* 手机端：隐藏表格，展示卡片 */
-  .pos-table-wrap { display: none; }
-  .pos-cards { display: block; }
-  /* 资产 3 列 → 2 列 */
-  .asset-grid { grid-template-columns: repeat(2, 1fr); }
-  /* 手机端：详情 tab 标题缩小并压缩内边距，四个 tab 一行放下 */
-  .detail-tabs { padding: 8px 8px 0; gap: 2px; }
-  .detail-tab {
-    gap: 4px;
-    padding: 7px 8px;
-    font-size: 12px;
-    white-space: nowrap;
-  }
-  .tab-badge {
-    min-width: 16px;
-    height: 16px;
-    padding: 0 4px;
-    font-size: 10px;
-  }
-  /* 历史订单翻页器更紧凑 */
-  .hist-pager { flex-wrap: wrap; }
-  .pager-total { width: 100%; margin-left: 0; text-align: right; }
-  /* 报价行塞了三项，手机端收紧间距与 tag 尺寸 */
-  .ba-row { font-size: 11.5px; }
-  .ba-row.chg { gap: 7px; }
-  .ba-row.chg .ba-v + .ba-v,
-  .ba-row.chg .ba-v + .tag { padding-left: 7px; }
-  .ba-row.chg .tag { font-size: 10px; padding: 2px 6px; }
+  .tr-price { font-size: 26px; }
+  .tr-action { min-height: 56px; font-size: 12px; }
+  .tr-action-icon svg { width: 18px; height: 18px; }
+  .tr-rows { display: none; }
 }
 @media (max-width: 420px) {
-  .quote-mid { font-size: 24px; }
-  .action-bar { padding: 8px; gap: 6px; }
-  .action-btn { height: 52px; }
-  .pos-card-row2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  /* 资产单列 */
-  .asset-grid { grid-template-columns: 1fr; }
-}
-@media (max-width: 360px) {
-  /* 资产在更窄屏时高亮项放大字号 */
-  .asset-value { font-size: 20px; }
-}
-
-/* ── 吸筹策略 tab 表格 ── */
-.grid-task-table { min-width: 860px; }
-.grid-signal-cell {
-  max-width: 220px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 11px;
-}
-.grid-refresh-hint {
-  font-size: 11px;
-  padding: 4px 14px 0;
-  text-align: right;
+  .tr-price { font-size: 24px; }
+  .tr-actions { gap: 6px; }
+  .tr-action { min-height: 52px; padding: 8px 4px; }
 }
 </style>

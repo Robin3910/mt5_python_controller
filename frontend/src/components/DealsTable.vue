@@ -429,23 +429,23 @@ function updatedText(): string {
 .mono { font-family: var(--mono); }
 .strong { font-weight: 700; }
 
-/* ── 统计条 ── */
+/* ── 统计条（pf 令牌：柔和底 + 细边框）── */
 .deals-stats {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 8px 18px;
   padding: 10px 12px;
-  background: var(--glass);
-  border: 1px solid var(--glass-border);
-  border-radius: var(--radius-sm);
+  background: var(--pf-soft);
+  border: 1px solid var(--pf-border);
+  border-radius: 8px;
 }
 .ds-item { display: flex; align-items: baseline; gap: 6px; }
-.ds-k { font-size: 11px; color: var(--muted); }
-.ds-v { font-size: 13px; font-weight: 700; }
-.ds-v.pos { color: var(--green); }
-.ds-v.neg { color: var(--red); }
-.ds-updated { margin-left: auto; font-size: 11px; }
+.ds-k { font-size: 10px; color: var(--pf-dim); }
+.ds-v { font-size: 13px; font-weight: 700; color: var(--pf-text); }
+.ds-v.pos { color: #22c55e; }
+.ds-v.neg { color: #f6465d; }
+.ds-updated { margin-left: auto; font-size: 10px; color: var(--pf-faint); }
 
 /* ── 筛选器 ── */
 .deals-filters {
@@ -458,23 +458,26 @@ function updatedText(): string {
   /* 全局 input/select 有 width:100%，这里必须显式覆盖，否则下拉框占满整行 */
   width: auto;
   height: 30px;
-  padding: 0 8px;
+  padding: 0 10px;
   font-size: 12px;
-  color: var(--text);
-  background: var(--glass);
-  border: 1px solid var(--glass-border);
-  border-radius: var(--radius-sm);
+  color: var(--pf-text);
+  background: var(--pf-soft);
+  border: 1px solid var(--pf-border-2);
+  border-radius: 8px;
   outline: none;
+  transition: border-color 0.15s;
 }
 .df-input { width: 96px; }
-.df-select:focus, .df-input:focus { border-color: var(--primary); }
+.df-select:focus, .df-input:focus { border-color: var(--pf-blue); }
+.df-select option { background: #101828; color: var(--pf-text); }
 .df-clear { height: 30px; }
 
-/* ── 桌面表格 ── */
+/* ── 桌面表格（分隔行语言）── */
 .deals-table-wrap {
   overflow-x: auto;
-  border: 1px solid var(--glass-border);
-  border-radius: var(--radius-sm);
+  border: 1px solid var(--pf-border);
+  border-radius: 12px;
+  background: var(--pf-card);
   -webkit-overflow-scrolling: touch;
 }
 .deals-table {
@@ -486,13 +489,13 @@ function updatedText(): string {
 }
 .deals-table thead th {
   text-align: left;
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 600;
-  color: var(--muted);
+  color: var(--pf-dim);
   letter-spacing: 0.04em;
   padding: 8px 10px;
-  background: var(--glass);
-  border-bottom: 1px solid var(--glass-border);
+  background: var(--pf-soft);
+  border-bottom: 1px solid var(--pf-border-2);
   position: sticky;
   top: 0;
   z-index: 1;
@@ -502,39 +505,39 @@ function updatedText(): string {
 .deals-table thead th.pnl { text-align: right; }
 .deals-table tbody td {
   padding: 9px 10px;
-  border-bottom: 1px solid var(--glass-border);
-  color: var(--text);
+  border-bottom: 1px solid #161f30;
+  color: var(--pf-text);
   font-size: 12px;
   vertical-align: middle;
   white-space: nowrap;
 }
 .deals-table tbody tr:last-child td { border-bottom: none; }
-.deals-table tbody tr:hover { background: rgba(255, 255, 255, 0.02); }
+.deals-table tbody tr:hover { background: var(--pf-soft); }
 .deals-table td.num { text-align: right; }
 .deals-table td.pnl { text-align: right; font-weight: 700; }
 .deals-table td.mono { font-family: var(--mono); }
 .deals-table td.strong { font-weight: 700; }
-.deals-table td.muted { color: var(--muted); }
-.deals-table td.pnl.pos { color: var(--green); }
-.deals-table td.pnl.neg { color: var(--red); }
+.deals-table td.muted { color: var(--pf-muted); }
+.deals-table td.pnl.pos { color: #22c55e; }
+.deals-table td.pnl.neg { color: #f6465d; }
 
 /* ── 标签 ── */
 .deal-entry {
   display: inline-block;
-  padding: 2px 6px;
-  border-radius: 5px;
-  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 10px;
   font-weight: 600;
-  background: var(--glass);
-  color: var(--muted);
-  border: 1px solid var(--glass-border);
+  background: var(--pf-soft);
+  color: var(--pf-muted);
+  border: 1px solid var(--pf-border-2);
 }
-.deal-entry.in { color: #93c5fd; border-color: rgba(147, 197, 253, 0.28); }
-.deal-entry.out { color: #fbbf24; border-color: rgba(251, 191, 36, 0.28); }
-.deal-entry.inout { color: #a78bfa; border-color: rgba(167, 139, 250, 0.28); }
-.deal-entry.out_by { color: #f472b6; border-color: rgba(244, 114, 182, 0.28); }
+.deal-entry.in { color: #60a5fa; border-color: rgba(37, 99, 235, 0.4); background: rgba(37, 99, 235, 0.15); }
+.deal-entry.out { color: #fbbf24; border-color: rgba(245, 158, 11, 0.4); background: rgba(245, 158, 11, 0.15); }
+.deal-entry.inout { color: #a78bfa; border-color: rgba(124, 58, 237, 0.4); background: rgba(124, 58, 237, 0.15); }
+.deal-entry.out_by { color: #f472b6; border-color: rgba(236, 72, 153, 0.4); background: rgba(236, 72, 153, 0.15); }
 .deal-reason { margin-left: 6px; font-size: 11px; }
-.deal-source { font-size: 11px; color: var(--muted); }
+.deal-source { font-size: 11px; color: var(--pf-muted); }
 
 .dir-tag {
   display: inline-block;
@@ -545,8 +548,8 @@ function updatedText(): string {
   letter-spacing: 0.05em;
   border: 1px solid transparent;
 }
-.dir-tag.buy { color: #fca5a5; background: rgba(239, 68, 68, 0.10); border-color: rgba(239, 68, 68, 0.28); }
-.dir-tag.sell { color: #6ee7b7; background: rgba(16, 185, 129, 0.10); border-color: rgba(16, 185, 129, 0.28); }
+.dir-tag.buy { color: #f87171; background: rgba(239, 68, 68, 0.15); border-color: rgba(239, 68, 68, 0.28); }
+.dir-tag.sell { color: #4ade80; background: rgba(34, 197, 94, 0.15); border-color: rgba(34, 197, 94, 0.28); }
 
 /* ── 手机端卡片 ── */
 .deals-cards { display: none; }
@@ -554,10 +557,10 @@ function updatedText(): string {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  padding: 10px 12px;
-  background: var(--glass);
-  border: 1px solid var(--glass-border);
-  border-radius: var(--radius-sm);
+  padding: 10px;
+  background: var(--pf-soft);
+  border: 1px solid var(--pf-border);
+  border-radius: 8px;
 }
 .deal-card + .deal-card { margin-top: 8px; }
 .deal-card-top {
@@ -585,23 +588,23 @@ function updatedText(): string {
   font-weight: 700;
   flex-shrink: 0;
 }
-.deal-card-pnl.pos { color: var(--green); }
-.deal-card-pnl.neg { color: var(--red); }
+.deal-card-pnl.pos { color: #22c55e; }
+.deal-card-pnl.neg { color: #f6465d; }
 .deal-card-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
   gap: 6px 10px;
 }
 .dc-kv { display: flex; align-items: baseline; gap: 6px; min-width: 0; font-size: 12px; }
-.dc-k { color: var(--muted); font-size: 11px; flex-shrink: 0; }
+.dc-k { color: var(--pf-dim); font-size: 10px; flex-shrink: 0; }
 .dc-v {
-  color: var(--text);
+  color: var(--pf-text);
   font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.dc-v.muted { color: var(--muted); font-weight: 500; }
+.dc-v.muted { color: var(--pf-muted); font-weight: 500; }
 
 /* ── 空状态 / 加载 ── */
 .detail-empty {
@@ -611,15 +614,15 @@ function updatedText(): string {
   justify-content: center;
   gap: 8px;
   padding: 32px 20px;
-  color: var(--muted);
-  font-size: 13px;
+  color: var(--pf-muted);
+  font-size: 12px;
 }
 .detail-empty svg { opacity: 0.35; }
 .dot-spin-lg {
   width: 22px;
   height: 22px;
-  border: 2px solid var(--glass-border);
-  border-top-color: var(--primary);
+  border: 2px solid var(--pf-border-2);
+  border-top-color: var(--pf-blue);
   border-radius: 50%;
   animation: deals-spin 0.8s linear infinite;
 }
@@ -634,9 +637,9 @@ function updatedText(): string {
   gap: 6px;
   padding: 10px 12px;
   font-size: 12px;
-  border: 1px solid var(--glass-border);
-  border-radius: var(--radius-sm);
-  background: var(--glass);
+  border: 1px solid var(--pf-border);
+  border-radius: 8px;
+  background: var(--pf-soft);
 }
 .pager-btn {
   display: inline-flex;
@@ -647,30 +650,32 @@ function updatedText(): string {
   padding: 0 8px;
   font-size: 13px;
   font-weight: 600;
-  color: var(--text);
+  color: var(--pf-text);
   background: transparent;
-  border: 1px solid var(--glass-border);
-  border-radius: 6px;
+  border: 1px solid var(--pf-border-2);
+  border-radius: 8px;
   cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
 }
 .pager-btn:hover:not(:disabled) {
-  background: rgba(37, 99, 235, 0.10);
+  background: rgba(37, 99, 235, 0.1);
   border-color: rgba(37, 99, 235, 0.4);
-  color: var(--primary);
+  color: #60a5fa;
 }
 .pager-btn:disabled { opacity: 0.35; cursor: not-allowed; }
 .pager-info {
   font-family: var(--mono);
   font-weight: 600;
-  color: var(--text);
+  color: var(--pf-text);
   padding: 0 4px;
   min-width: 50px;
   text-align: center;
 }
 .pager-total {
   margin-left: auto;
-  font-size: 11px;
+  font-size: 10px;
   font-family: var(--mono);
+  color: var(--pf-dim);
 }
 
 /* ── Responsive ── */

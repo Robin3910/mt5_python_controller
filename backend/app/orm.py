@@ -248,6 +248,8 @@ class SignalHistory(Base):
     source: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # 信号处理模型：normal（按币种分发，默认）/ strategy（按分组分发）；历史为空按 normal 展示
     model: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    # 整体拒收原因的结构化编码（见 signal_codes.REJECT_CODES）；NULL = 未被拒收
+    reject_code: Mapped[str | None] = mapped_column(String(24), nullable=True, index=True)
 
 
 class SignalDispatch(Base):
@@ -260,6 +262,8 @@ class SignalDispatch(Base):
     decided_vol: Mapped[float | None] = mapped_column(Float, nullable=True)  # 实际决策手数
     gate_result: Mapped[str] = mapped_column(String(16), default="passed")   # passed / skipped
     skip_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 跳过原因的结构化编码（见 signal_codes.SKIP_CODES）；统计一律按它聚合，不解析中文
+    skip_code: Mapped[str | None] = mapped_column(String(24), nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
     retcode: Mapped[int | None] = mapped_column(Integer, nullable=True)      # MT5 返回码
     order_ticket: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -465,6 +469,8 @@ class GroupSignalTask(Base):
     # pending / dispatching / running / done / partial / failed / skipped
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
     skip_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # 主任务级跳过原因的结构化编码（分组禁用 / 无成员 / 无有效节点等）
+    skip_code: Mapped[str | None] = mapped_column(String(24), nullable=True, index=True)
     # —— 策略运行期汇总（各子任务累加）——
     opened_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     total_orders: Mapped[int] = mapped_column(Integer, default=0)
@@ -500,11 +506,16 @@ class GroupTaskDispatch(Base):
     node_id: Mapped[str] = mapped_column(String(32), index=True)
     # 冗余存一份品种：释放节点互斥占位、按品种对账时不必回查主任务
     symbol: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    # 冗余存一份动作（BUY / SELL / CLOSE）：信号中心的统一统计要把两张分发表
+    # UNION 成一张视图，带上它就不必每次统计都 join 主任务表
+    action: Mapped[str | None] = mapped_column(String(8), nullable=True, index=True)
     magic: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
     decided_vol: Mapped[float | None] = mapped_column(Float, nullable=True)
     # pending / sent / opened / running / closing / done / failed / skipped / offline
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
     skip_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # 跳过原因的结构化编码（见 signal_codes.SKIP_CODES）；统计一律按它聚合，不解析中文
+    skip_code: Mapped[str | None] = mapped_column(String(24), nullable=True, index=True)
     retcode: Mapped[int | None] = mapped_column(Integer, nullable=True)
     order_ticket: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     deal: Mapped[int | None] = mapped_column(BigInteger, nullable=True)

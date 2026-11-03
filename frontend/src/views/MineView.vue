@@ -54,11 +54,11 @@ const ALL_MODULES: ProfileHubModule[] = [
   },
   {
     code: 'strategies',
-    label: '策略管理',
-    description: '策略模版配置与启用控制',
+    label: '策略配置',
+    description: '市价开仓 · 限价开仓 · 智能吸筹',
     path: auth.isAdmin ? '/strategies' : '/user-strategies',
-    icon: '<path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>',
-    accent: '#FBBF24',
+    icon: '<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3"/><path d="M1 14h6M9 8h6M17 16h6"/>',
+    accent: '#22C55E',
   },
   {
     code: 'follow',
@@ -94,8 +94,8 @@ const ALL_MODULES: ProfileHubModule[] = [
   },
   {
     code: 'events',
-    label: '事件',
-    description: '实时事件流与告警通知',
+    label: '信号中心',
+    description: '信号全链路统计与时延分析',
     path: '/events',
     icon: '<path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/>',
     accent: '#F59E0B',

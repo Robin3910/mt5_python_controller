@@ -124,6 +124,40 @@ def _migrate_signal_source_column(sync_conn) -> None:
         sync_conn.execute(text("ALTER TABLE signal_history ADD COLUMN model VARCHAR(16)"))
 
 
+def _migrate_signal_center_columns(sync_conn) -> None:
+    """信号中心所需的新增列（全部可空，不影响任何交易逻辑）。
+
+    - signal_history.reject_code：信号整体拒收原因的结构化编码
+    - signal_dispatch.skip_code：逐节点跳过原因的结构化编码
+    - group_task_dispatch.skip_code：同上（strategy 链路）
+    - group_task_dispatch.action：冗余存一份动作，统计 UNION 时不必 join 主任务表
+
+    这些列只服务于统计，写漏 / 写坏都不影响信号下发与成交。
+    """
+    inspector = inspect(sync_conn)
+    tables = set(inspector.get_table_names())
+    additions = {
+        "signal_history": {"reject_code": "VARCHAR(24)"},
+        "signal_dispatch": {"skip_code": "VARCHAR(24)"},
+        "group_task_dispatch": {"skip_code": "VARCHAR(24)", "action": "VARCHAR(8)"},
+        "group_signal_task": {"skip_code": "VARCHAR(24)"},
+    }
+    for table, cols_map in additions.items():
+        if table not in tables:
+            continue
+        cols = {c["name"] for c in inspector.get_columns(table)}
+        for name, ddl in cols_map.items():
+            if name in cols:
+                continue
+            sync_conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+        # 统计要按 skip_code 聚合，补一个普通索引
+        if "skip_code" in cols_map:
+            index = f"ix_{table}_skip_code"
+            existing = {i.get("name") for i in inspector.get_indexes(table)}
+            if index not in existing:
+                sync_conn.execute(text(f"CREATE INDEX {index} ON {table} (skip_code)"))
+
+
 # 时延埋点列：sent_at / recv_at / order_at / filled_at + 两段耗时（毫秒）
 # signal_dispatch（normal 链路）与 group_task_dispatch（strategy 链路）共用同一组列名，
 # 便于后台用同一套口径展示两条链路的时延分解。
@@ -527,6 +561,7 @@ async def init_db() -> None:
         await conn.run_sync(_migrate_users_profile_columns)
         await conn.run_sync(_migrate_dispatch_price_column)
         await conn.run_sync(_migrate_signal_source_column)
+        await conn.run_sync(_migrate_signal_center_columns)
         await conn.run_sync(_migrate_latency_marks)
         await conn.run_sync(_migrate_audit_columns)
         await conn.run_sync(_migrate_node_group_strategy_id)

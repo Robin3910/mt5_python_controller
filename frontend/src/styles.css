@@ -2717,6 +2717,232 @@ textarea.pf-input {
   background: #1a2436;
 }
 
+/* ============================================================
+ * 策略配置页共用样式 —— 1:1 复刻 UI/H5.html 原型
+ *
+ * 对应原型的「策略配置」tab：频道切换条（开仓策略 / AI交易）
+ * + 三张入口卡（市价开仓 / 限价开仓 / 智能吸筹）。
+ * ============================================================ */
+
+/* ── 频道切换条（原型 zh：带图标的两段切换）── */
+.pf-tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 12px;
+  border: 1px solid #161f30;
+  background: #0c1220;
+}
+.pf-tab {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 32px;
+  flex: 1 1 0;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--pf-muted);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.pf-tab:hover:not(.active) {
+  background: #16213a;
+  color: var(--pf-text);
+}
+.pf-tab.active {
+  background: var(--pf-blue);
+  color: #fff;
+  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.35);
+}
+.pf-tab.active.purple {
+  background: #7c3aed;
+  box-shadow: 0 2px 8px rgba(124, 58, 237, 0.35);
+}
+.pf-tab svg { width: 14px; height: 14px; flex-shrink: 0; }
+
+/* ── 入口卡（原型 uo：图标 + 标题 + 描述 + 状态块）── */
+.pf-entry-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 1fr;
+}
+@media (min-width: 640px) {
+  .pf-entry-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+.pf-entry {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  padding: 12px;
+  text-align: left;
+  border-radius: 12px;
+  border: 1px solid var(--pf-border);
+  background: var(--pf-card);
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
+  transition: border-color 0.15s;
+  cursor: pointer;
+}
+.pf-entry:hover { border-color: rgba(37, 99, 235, 0.5); }
+.pf-entry:disabled { opacity: 0.55; cursor: not-allowed; }
+.pf-entry:disabled:hover { border-color: var(--pf-border); }
+
+.pf-entry-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+.pf-entry-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  flex-shrink: 0;
+  border-radius: 12px;
+  color: var(--entry-accent, var(--pf-blue));
+  background: color-mix(in srgb, var(--entry-accent, var(--pf-blue)) 15%, transparent);
+}
+.pf-entry-icon svg { width: 20px; height: 20px; }
+.pf-entry-body { flex: 1; min-width: 0; }
+.pf-entry-title {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--pf-text);
+}
+.pf-entry-desc {
+  margin: 2px 0 0;
+  font-size: 10px;
+  color: var(--pf-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pf-entry-chevron {
+  flex-shrink: 0;
+  color: var(--pf-faint);
+  transition: color 0.15s;
+}
+.pf-entry:hover .pf-entry-chevron { color: #60a5fa; }
+.pf-entry-chevron svg { width: 16px; height: 16px; }
+
+/* 卡片底部状态块：已配置 / 未配置 */
+.pf-entry-state {
+  border-radius: 8px;
+  border: 1px solid #16213a;
+  background: #0c1220;
+  padding: 8px 10px;
+}
+.pf-entry-state.done { border-color: rgba(22, 163, 74, 0.4); }
+.pf-entry-state.empty {
+  border-style: dashed;
+  border-color: var(--pf-border-2);
+}
+.pf-entry-state-title {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0;
+  font-size: 10px;
+  font-weight: 600;
+  color: #22c55e;
+}
+.pf-entry-state.empty .pf-entry-state-title { color: var(--pf-faint); }
+.pf-entry-state-title svg { width: 12px; height: 12px; }
+.pf-entry-state-params {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-top: 6px;
+}
+.pf-entry-param {
+  font-size: 10px;
+  color: var(--pf-muted);
+}
+.pf-entry-param b {
+  margin-left: 4px;
+  font-weight: 600;
+  color: var(--pf-text);
+}
+.pf-entry-hint {
+  font-size: 10px;
+  color: var(--pf-faint);
+}
+
+/* ── 参数行（原型 Lt：左标签 + 右控件）── */
+.pf-param-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid #16213a;
+}
+.pf-param-row:last-child { border-bottom: none; }
+.pf-param-text { min-width: 0; flex: 1; }
+.pf-param-label {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--pf-text);
+}
+.pf-param-hint {
+  margin: 2px 0 0;
+  font-size: 10px;
+  color: var(--pf-dim);
+  line-height: 1.5;
+}
+.pf-param-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+/* 数字输入 + 单位后缀（原型 Yt）*/
+.pf-number {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 8px;
+  border: 1px solid var(--pf-border-2);
+  background: #0a0f1a;
+  transition: border-color 0.15s;
+}
+.pf-number:focus-within { border-color: var(--pf-blue); }
+.pf-number input {
+  width: 96px;
+  height: 32px;
+  padding: 0 8px;
+  border: none;
+  background: transparent;
+  color: var(--pf-text);
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  text-align: right;
+  outline: none;
+}
+.pf-number input::-webkit-outer-spin-button,
+.pf-number input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.pf-number input[type='number'] { -moz-appearance: textfield; }
+.pf-number-unit {
+  padding-right: 8px;
+  font-size: 10px;
+  color: var(--pf-dim);
+}
+
 /* ── 文件选择框（虚线）── */
 .pf-file-picker {
   display: flex;
@@ -2750,3 +2976,322 @@ textarea.pf-input {
 }
 .pf-file-picker > svg { width: 15px; height: 15px; flex-shrink: 0; }
 
+/* ============================================================
+ * 信号管理中心（Signal Center）共用样式
+ *
+ * 对应 UI/H5.html 原型的首页 hero（stat-hero / stat-dist-bar /
+ * stat-hero-metrics），但配色与间距沿用本项目既有的 pf- 设计令牌，
+ * 这样信号中心与「我的」「策略配置」等页面看起来是一套东西。
+ * ============================================================ */
+
+/* ── Hero 大数字卡 ── */
+.pf-hero {
+  border-radius: 12px;
+  border: 1px solid var(--pf-border);
+  background: var(--pf-card);
+  padding: 14px 16px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
+}
+
+.pf-hero-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.pf-hero-label {
+  margin: 0;
+  font-size: 11px;
+  color: var(--pf-muted);
+  font-weight: 500;
+}
+
+.pf-hero-value {
+  margin: 4px 0 0;
+  font-size: 30px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: -0.02em;
+  color: var(--pf-text);
+  font-family: var(--mono);
+}
+@media (min-width: 640px) {
+  .pf-hero-value { font-size: 36px; }
+}
+
+.pf-hero-unit {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--pf-dim);
+  margin-left: 4px;
+}
+
+/* ── 状态药丸组 ── */
+.pf-hero-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* ── 状态分布条（一条横条按占比切成多段）── */
+.pf-dist-bar {
+  display: flex;
+  width: 100%;
+  height: 8px;
+  margin-top: 12px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: #0a0f1a;
+}
+.pf-dist-seg {
+  height: 100%;
+  transition: width 0.3s ease;
+}
+.pf-dist-seg + .pf-dist-seg {
+  border-left: 1px solid rgba(10, 15, 26, 0.85);
+}
+
+.pf-dist-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 8px;
+}
+.pf-dist-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10px;
+  color: var(--pf-muted);
+}
+.pf-dist-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
+/* ── Hero 指标格（复用 .pf-metrics / .pf-metric，额外加图标位）── */
+.pf-hero-metrics {
+  margin-top: 12px;
+}
+
+.pf-metric-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  margin-right: 4px;
+  vertical-align: -3px;
+}
+.pf-metric-icon svg {
+  width: 14px;
+  height: 14px;
+}
+.pf-metric-icon.ok { color: var(--pf-green); }
+.pf-metric-icon.warn { color: #f59e0b; }
+.pf-metric-icon.bad { color: #f87171; }
+.pf-metric-icon.info { color: #60a5fa; }
+
+/* ── 图表容器 ── */
+.pf-chart {
+  width: 100%;
+  min-width: 0;
+}
+.pf-chart-160 { height: 160px; }
+.pf-chart-200 { height: 200px; }
+.pf-chart-240 { height: 240px; }
+
+@media (max-width: 640px) {
+  .pf-chart-160,
+  .pf-chart-200,
+  .pf-chart-240 { height: 160px; }
+}
+
+/* ── 两列 / 三列栅格 ── */
+.pf-grid-2 {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 1fr;
+}
+@media (min-width: 900px) {
+  .pf-grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+.pf-grid-3 {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 1fr;
+}
+@media (min-width: 640px) {
+  .pf-grid-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (min-width: 1024px) {
+  .pf-grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+/* ── 节点命中卡（原型节点分组卡的语汇）── */
+.pf-owner-group {
+  border-radius: 12px;
+  border: 1px solid var(--pf-border);
+  background: rgba(12, 18, 32, 0.6);
+  overflow: hidden;
+}
+.pf-owner-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--pf-border);
+  background: rgba(16, 24, 40, 0.8);
+}
+.pf-owner-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.pf-owner-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  border-radius: 999px;
+  background: rgba(37, 99, 235, 0.2);
+  color: #93c5fd;
+  font-size: 11px;
+  font-weight: 700;
+}
+.pf-owner-title {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--pf-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pf-owner-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 10px;
+  color: var(--pf-dim);
+  white-space: nowrap;
+}
+.pf-owner-body {
+  display: grid;
+  gap: 6px;
+  padding: 8px 10px;
+}
+
+/* ── 口径提示条 ── */
+.pf-scope-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(245, 158, 11, 0.28);
+  background: rgba(245, 158, 11, 0.08);
+  color: #fbbf24;
+  font-size: 10px;
+  line-height: 1.6;
+}
+.pf-scope-note.info {
+  border-color: rgba(37, 99, 235, 0.28);
+  background: rgba(37, 99, 235, 0.08);
+  color: #93c5fd;
+}
+.pf-scope-note svg {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+/* ── 时延分位卡 ── */
+.pf-lat-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+@media (min-width: 640px) {
+  .pf-lat-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}
+
+.pf-lat-card {
+  border-radius: 8px;
+  border: 1px solid var(--pf-border-2);
+  background: var(--pf-soft);
+  padding: 8px 10px;
+  min-width: 0;
+}
+.pf-lat-k {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin: 0;
+  font-size: 9px;
+  color: var(--pf-dim);
+}
+.pf-lat-v {
+  margin: 3px 0 0;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--pf-text);
+  font-family: var(--mono);
+  line-height: 1.2;
+}
+.pf-lat-sub {
+  margin: 2px 0 0;
+  font-size: 9px;
+  color: var(--pf-faint);
+}
+
+/* ── 筛选条 ── */
+.pf-filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.pf-filter-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.pf-filter-label {
+  font-size: 11px;
+  color: var(--pf-dim);
+  white-space: nowrap;
+}
+.pf-filter-input {
+  height: 30px;
+  padding: 0 9px;
+  border-radius: 8px;
+  border: 1px solid var(--pf-border-2);
+  background: var(--pf-soft);
+  color: var(--pf-text);
+  font-size: 12px;
+  min-width: 0;
+}
+.pf-filter-input::placeholder { color: var(--pf-faint); }
+.pf-filter-input:focus { border-color: var(--pf-blue); outline: none; }
+.pf-filter-input.select {
+  padding-right: 22px;
+  appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, var(--pf-dim) 50%),
+    linear-gradient(135deg, var(--pf-dim) 50%, transparent 50%);
+  background-position: calc(100% - 12px) 13px, calc(100% - 8px) 13px;
+  background-size: 4px 4px, 4px 4px;
+  background-repeat: no-repeat;
+}

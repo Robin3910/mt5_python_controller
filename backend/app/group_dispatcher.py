@@ -42,6 +42,7 @@ from . import (
     permissions,
     persist,
     rbac_service,
+    signal_codes,
     strategy_templates,
     system_settings,
     trend_indicators,
@@ -699,7 +700,10 @@ class GroupDispatcher:
                     f"{pause_note}（主节点当前不可用，本次未下发）"
                     if not effective else pause_note
                 )
-            await group_persist.mark_task_skipped(task_id, skip_reason)
+            await group_persist.mark_task_skipped(
+                task_id, skip_reason,
+                skip_code=signal_codes.classify_group_skip_reason(skip_reason),
+            )
             logger.info("group %s skipped: %s", group["group_id"], skip_reason)
             return self._result(group, mode, 0, "skipped", skip_reason, task_id)
 
@@ -721,7 +725,10 @@ class GroupDispatcher:
 
         if not sent:
             status, reason = self._no_target(outcomes)
-            await group_persist.mark_task_skipped(task_id, reason)
+            await group_persist.mark_task_skipped(
+                task_id, reason,
+                skip_code=signal_codes.classify_group_skip_reason(reason),
+            )
             return self._result(group, mode, 0, status, reason, task_id)
         return self._result(group, mode, len(sent), "dispatching", None, task_id)
 
@@ -809,6 +816,7 @@ class GroupDispatcher:
             "task_id": task_id, "signal_id": command["signal_id"],
             "group_id": group_id, "node_id": node_id,
             "symbol": signal.symbol, "decided_vol": volume,
+            "action": signal.action,
         }
         # 全员同步 + 信号并发：不抢、不写单槽占位，允许同节点多条开仓并存
         # （仅网格 / 趋势策略可用；存量分组上的陈旧开关在此兜底，按单槽互斥走）
@@ -825,6 +833,7 @@ class GroupDispatcher:
                 reason = await self._busy_reason(group_id, node_id)
                 await group_persist.record_skipped_dispatch(
                     **base, status="skipped", skip_reason=reason,
+                    skip_code=signal_codes.SKIP_CONFLICT_BUSY,
                 )
                 logger.info("group %s node %s busy: %s", group_id, node_id, reason)
                 return {"node_id": node_id, "status": "skipped", "magic": None,
@@ -840,6 +849,7 @@ class GroupDispatcher:
                 reason = f"该节点在本分组内已有进行中的子任务 #{stale}，本次跳过"
                 await group_persist.record_skipped_dispatch(
                     **base, status="skipped", skip_reason=reason,
+                    skip_code=signal_codes.SKIP_CONFLICT_BUSY,
                 )
                 logger.info("group %s node %s busy (db): %s", group_id, node_id, reason)
                 return {"node_id": node_id, "status": "skipped", "magic": None,
@@ -917,6 +927,7 @@ class GroupDispatcher:
             await self.store.release_group_node_busy(group_id, node_id)
         await group_persist.record_skipped_dispatch(
             **base, status="skipped", skip_reason=reason,
+            skip_code=signal_codes.SKIP_RISK_TREND,
         )
         logger.info("group %s node %s trend risk skip: %s", group_id, node_id, reason)
         return {
@@ -966,7 +977,10 @@ class GroupDispatcher:
                     "dispatch_id": dispatch_id, "volume": volume, "reason": None}
 
         reason = "下发失败：节点连接已断开"
-        await group_persist.set_dispatch_status(dispatch_id, "offline", skip_reason=reason)
+        await group_persist.set_dispatch_status(
+            dispatch_id, "offline", skip_reason=reason,
+            skip_code=signal_codes.SKIP_UNAVAILABLE,
+        )
         if hold_busy:
             await self.store.release_group_node_busy(group_id, node_id)
         return {"node_id": node_id, "status": "offline", "magic": magic,

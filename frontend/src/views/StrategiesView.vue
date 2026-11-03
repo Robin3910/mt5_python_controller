@@ -343,35 +343,52 @@ function fmtTime(sec: number | null | undefined): string {
 
 <template>
   <div class="strategies-page">
-    <div class="row between page-header">
-      <div>
-        <div class="h1">策略管理</div>
-        <p class="muted" style="font-size: 13px; margin-top: 4px">
-          基于策略模版创建实例并绑定品种；AI智能加仓策略配顺势 / 逆势加仓，模版2 配以损定量趋势单，模版3 配网格交易
-        </p>
+    <!-- 页面标题卡（1:1 复刻 UI/H5.html 原型「策略配置」头部） -->
+    <section class="pf-card strategies-header">
+      <div class="pf-card-head">
+        <div class="pf-card-head-main">
+          <span class="pf-card-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3" />
+              <path d="M1 14h6M9 8h6M17 16h6" />
+            </svg>
+          </span>
+          <div>
+            <p class="pf-card-title">
+              策略配置
+              <span class="pf-count ok" style="background: rgba(34, 197, 94, 0.15); border-color: rgba(34, 197, 94, 0.3); color: #22c55e">
+                {{ hub.strategies.length }} 个策略
+              </span>
+            </p>
+            <p class="pf-card-sub">
+              基于策略模版创建实例并绑定品种；AI智能加仓策略配顺势 / 逆势加仓，模版2 配以损定量趋势单，模版3 配网格交易
+            </p>
+          </div>
+        </div>
+        <div class="row" style="gap: 8px">
+          <button class="pf-btn" @click="router.push('/groups')">← 返回分组</button>
+          <button class="pf-btn pf-btn-primary" @click="openCreate">+ 新增策略</button>
+        </div>
       </div>
-      <div class="row" style="gap: 8px">
-        <button class="btn-ghost" @click="router.push('/groups')">← 返回分组</button>
-        <button class="btn-primary" @click="openCreate">+ 新增策略</button>
-      </div>
-    </div>
+    </section>
 
-    <div class="card card-pad" style="margin-bottom: 12px">
+    <div class="pf-card" style="margin-bottom: 12px">
       <div class="row" style="gap: 8px">
         <input
           v-model="searchQuery"
           type="search"
+          class="pf-input"
           placeholder="搜索策略名称 / 品种…"
           aria-label="搜索策略"
           :disabled="loading"
           style="width: 25%"
           @keydown.enter="runSearch"
         />
-        <button class="btn-primary btn-sm" :disabled="loading" @click="runSearch">
+        <button class="pf-btn pf-btn-primary" :disabled="loading" @click="runSearch">
           {{ loading ? '搜索中…' : '搜索' }}
         </button>
       </div>
-      <p v-if="appliedQuery" class="muted" style="font-size: 12px; margin: 8px 0 0">
+      <p v-if="appliedQuery" class="pf-hint">
         {{ hub.strategies.length ? `找到 ${hub.strategies.length} 个策略` : '无匹配策略' }}
       </p>
     </div>
@@ -389,7 +406,10 @@ function fmtTime(sec: number | null | undefined): string {
             <span class="muted" style="margin-right: 6px">{{ isExpanded(s.strategy_id) ? '▾' : '▸' }}</span>
             {{ s.name }}
           </strong>
-          <span class="tag" :class="s.enabled ? 'green' : ''">{{ s.enabled ? '已启用' : '已禁用' }}</span>
+          <span class="pf-pill" :class="s.enabled ? 'green' : 'grey'">
+            <span class="pf-pill-dot" :style="{ background: s.enabled ? '#22c55e' : '#8b96a8' }"></span>
+            {{ s.enabled ? '已启用' : '已禁用' }}
+          </span>
         </div>
         <div class="list-field"><span class="k">策略 ID</span><span class="v muted" style="font-size: 12px">{{ s.strategy_id }}</span></div>
         <div v-if="auth.isAdmin" class="list-field"><span class="k">所有者</span><span class="v">{{ s.owner_username || '管理员' }}</span></div>
@@ -453,131 +473,119 @@ function fmtTime(sec: number | null | undefined): string {
           </div>
         </div>
         <div class="list-card-actions" @click.stop>
-          <button class="btn-sm btn-ghost" :disabled="isAiStrategyLocked(s)" @click="openEdit(s)">编辑</button>
-          <button class="btn-sm" :class="s.enabled ? 'btn-ghost' : 'btn-danger'" :disabled="isAiStrategyLocked(s)" @click="toggleEnabled(s)">
+          <button class="pf-btn pf-btn-mini" :disabled="isAiStrategyLocked(s)" @click="openEdit(s)">编辑</button>
+          <button class="pf-btn pf-btn-mini" :disabled="isAiStrategyLocked(s)" @click="toggleEnabled(s)">
             {{ s.enabled ? '禁用' : '启用' }}
           </button>
-          <button class="btn-sm btn-danger" :disabled="isAiStrategyLocked(s)" @click="remove(s)">删除</button>
+          <button class="pf-btn pf-btn-mini pf-btn-danger" :disabled="isAiStrategyLocked(s)" @click="remove(s)">删除</button>
         </div>
       </div>
-      <div v-if="!hub.strategies.length && !loading" class="card card-pad muted">
+      <div v-if="!hub.strategies.length && !loading" class="pf-card pf-empty">
         {{ appliedQuery ? '无匹配策略' : '暂无策略' }}
       </div>
     </div>
 
-    <!-- 桌面端表格 -->
-    <div class="card table-scroll desktop-only">
-      <table>
-        <thead>
-          <tr>
-            <th style="width: 28px"></th>
-            <th>名称</th>
-            <th v-if="auth.isAdmin">所有者</th>
-            <th>模版</th>
-            <th>绑定品种</th>
-            <th>规则</th>
-            <th>创建时间</th>
-            <th>启用</th>
-            <th class="right">操作</th>
-          </tr>
-        </thead>
-        <tbody>
+    <!-- 桌面端：原型 pf-rows 网格行 -->
+    <div class="pf-card desktop-only">
+      <div class="pf-rows st-rows">
+        <div class="pf-rows-inner">
+          <div class="pf-row-head st-thead" :class="{ admin: auth.isAdmin }">
+            <span>名称</span>
+            <span v-if="auth.isAdmin">所有者</span>
+            <span>模版</span>
+            <span>绑定品种</span>
+            <span>规则</span>
+            <span>创建时间</span>
+            <span>状态</span>
+            <span class="st-col-actions">操作</span>
+          </div>
+
           <template v-for="s in hub.strategies" :key="s.strategy_id">
-            <tr class="clickable" @click="toggleExpand(s.strategy_id)">
-              <td class="muted">{{ isExpanded(s.strategy_id) ? '▾' : '▸' }}</td>
-              <td>
-                {{ s.name }}
-                <div class="muted" style="font-size: 11px">{{ s.strategy_id }}</div>
-              </td>
-              <td v-if="auth.isAdmin" style="font-size: 12px">{{ s.owner_username || '管理员' }}</td>
-              <td><span class="tag blue">{{ s.template_name }}</span></td>
-              <td><code>{{ s.symbol }}</code></td>
-              <td class="muted" style="font-size: 12px">{{ ruleSummary(s.rules) }}</td>
-              <td class="muted" style="font-size: 12px">{{ fmtTime(s.created_at) }}</td>
-              <td @click.stop>
-                <button class="btn-sm" :class="s.enabled ? 'btn-ghost' : 'btn-danger'" @click="toggleEnabled(s)">
+            <div class="pf-row st-row" :class="{ admin: auth.isAdmin }" @click="toggleExpand(s.strategy_id)">
+              <span class="c-strong" :title="s.name">{{ s.name }}</span>
+              <span v-if="auth.isAdmin" class="c-muted">{{ s.owner_username || '管理员' }}</span>
+              <span>
+                <span class="pf-pill blue">{{ s.template_name }}</span>
+              </span>
+              <span class="c-mono">{{ s.symbol }}</span>
+              <span class="c-dim" :title="ruleSummary(s.rules)">{{ ruleSummary(s.rules) }}</span>
+              <span class="c-muted">{{ fmtTime(s.created_at) }}</span>
+              <span>
+                <span class="pf-pill" :class="s.enabled ? 'green' : 'grey'">
+                  <span class="pf-pill-dot" :style="{ background: s.enabled ? '#22c55e' : '#8b96a8' }"></span>
                   {{ s.enabled ? '已启用' : '已禁用' }}
+                </span>
+              </span>
+              <span class="st-col-actions" @click.stop>
+                <button class="pf-btn pf-btn-mini" :disabled="isAiStrategyLocked(s)" @click="openEdit(s)">编辑</button>
+                <button class="pf-btn pf-btn-mini" :disabled="isAiStrategyLocked(s)" @click="toggleEnabled(s)">
+                  {{ s.enabled ? '禁用' : '启用' }}
                 </button>
-              </td>
-              <td class="right" @click.stop>
-                <div class="row" style="gap: 6px; justify-content: flex-end">
-                  <button class="btn-sm btn-ghost" :disabled="isAiStrategyLocked(s)" @click="openEdit(s)">编辑</button>
-                  <button class="btn-sm btn-danger" :disabled="isAiStrategyLocked(s)" @click="remove(s)">删除</button>
+                <button class="pf-btn pf-btn-mini pf-btn-danger" :disabled="isAiStrategyLocked(s)" @click="remove(s)">删除</button>
+              </span>
+            </div>
+
+            <!-- 展开：规则详情 -->
+            <div v-if="isExpanded(s.strategy_id)" class="st-detail">
+              <div v-if="s.remark" class="pf-hint" style="margin-bottom: 10px">备注：{{ s.remark }}</div>
+              <div v-if="!s.rules.length" class="pf-hint">暂无规则</div>
+              <div v-for="(r, ri) in displayRules(s.rules)" :key="ri" class="strategy-rule-block">
+                <div class="row between" style="margin-bottom: 8px">
+                  <strong style="font-size: 12px">{{ RULE_TYPE_LABEL[r.type] || `规则 ${ri + 1}` }}</strong>
+                  <span class="pf-pill" :class="r.status === 1 ? 'green' : 'grey'">
+                    {{ r.status === 1 ? '启用' : '关闭' }}
+                  </span>
                 </div>
-              </td>
-            </tr>
-            <tr v-if="isExpanded(s.strategy_id)" class="detail-row">
-              <td></td>
-              <td :colspan="auth.isAdmin ? 8 : 7">
-                <div class="strategy-detail">
-                  <div v-if="s.remark" class="muted" style="font-size: 12px; margin-bottom: 10px">
-                    备注：{{ s.remark }}
-                  </div>
-                  <div v-if="!s.rules.length" class="muted" style="font-size: 12px">暂无规则</div>
-                  <div v-for="(r, ri) in displayRules(s.rules)" :key="ri" class="strategy-rule-block">
-                    <div class="row between" style="margin-bottom: 8px">
-                      <strong style="font-size: 13px">{{ RULE_TYPE_LABEL[r.type] || `规则 ${ri + 1}` }}</strong>
-                      <span class="tag" :class="r.status === 1 ? 'green' : ''">
-                        {{ r.status === 1 ? '启用' : '关闭' }}
-                      </span>
-                    </div>
-                    <div class="kv-grid" style="margin-bottom: 8px">
-                      <div v-for="kv in ruleDetailRows(r)" :key="kv.k" class="kv">
-                        <span class="k">{{ kv.k }}</span><span class="v">{{ kv.v }}</span>
-                      </div>
-                    </div>
-                    <template v-if="isRiskSized(r)">
-                      <div class="muted" style="font-size: 12px">
-                        {{ riskSizedFootnote(r) }}
-                      </div>
-                    </template>
-                    <template v-else-if="isGrid(r)">
-                      <div class="muted" style="font-size: 12px">
-                        网格空仓是正常运行态；只由止损 / 止盈 / 终止信号收口
-                      </div>
-                    </template>
-                    <template v-else-if="r.batch_enabled">
-                      <div class="muted" style="font-size: 12px; margin-bottom: 6px">
-                        分批加仓 · 方向 {{ actionLabel(r.batch_action) }} ·
-                        {{ r.batch_count ?? 0 }} 批 · 加仓笔数上限 {{ r.total_lot_limit ?? 0 }}
-                      </div>
-                      <div v-if="r.batch_levels?.length" class="table-scroll">
-                        <table class="strategy-levels-table">
-                          <thead>
-                            <tr>
-                              <th>加仓次数</th>
-                              <th>计算方式</th>
-                              <th>间距</th>
-                              <th class="right">倍数</th>
-                              <th class="right">额外手数</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            <tr v-for="(lv, li) in r.batch_levels" :key="li">
-                              <td>{{ lv.pos_from }}–{{ lv.pos_to }}</td>
-                              <td>{{ calcTypeLabel(lv.calc_type) }}</td>
-                              <td class="muted" style="font-size: 12px">{{ levelSpacingText(lv) }}</td>
-                              <td class="right">{{ lv.lot_times }}</td>
-                              <td class="right">{{ lv.extra_lot }}</td>
-                            </tr>
-                          </tbody>
-                        </table>
-                      </div>
-                      <div v-else class="muted" style="font-size: 12px">暂无分批档位</div>
-                    </template>
-                    <div v-else class="muted" style="font-size: 12px">分批加仓：未启用</div>
+                <div class="kv-grid" style="margin-bottom: 8px">
+                  <div v-for="kv in ruleDetailRows(r)" :key="kv.k" class="kv">
+                    <span class="k">{{ kv.k }}</span><span class="v">{{ kv.v }}</span>
                   </div>
                 </div>
-              </td>
-            </tr>
+                <template v-if="isRiskSized(r)">
+                  <div class="pf-hint">{{ riskSizedFootnote(r) }}</div>
+                </template>
+                <template v-else-if="isGrid(r)">
+                  <div class="pf-hint">网格空仓是正常运行态；只由止损 / 止盈 / 终止信号收口</div>
+                </template>
+                <template v-else-if="r.batch_enabled">
+                  <div class="pf-hint" style="margin-bottom: 6px">
+                    分批加仓 · 方向 {{ actionLabel(r.batch_action) }} ·
+                    {{ r.batch_count ?? 0 }} 批 · 加仓笔数上限 {{ r.total_lot_limit ?? 0 }}
+                  </div>
+                  <div v-if="r.batch_levels?.length" class="table-scroll">
+                    <table class="strategy-levels-table">
+                      <thead>
+                        <tr>
+                          <th>加仓次数</th>
+                          <th>计算方式</th>
+                          <th>间距</th>
+                          <th class="right">倍数</th>
+                          <th class="right">额外手数</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr v-for="(lv, li) in r.batch_levels" :key="li">
+                          <td>{{ lv.pos_from }}–{{ lv.pos_to }}</td>
+                          <td>{{ calcTypeLabel(lv.calc_type) }}</td>
+                          <td class="muted" style="font-size: 12px">{{ levelSpacingText(lv) }}</td>
+                          <td class="right">{{ lv.lot_times }}</td>
+                          <td class="right">{{ lv.extra_lot }}</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                  <div v-else class="pf-hint">暂无分批档位</div>
+                </template>
+                <div v-else class="pf-hint">分批加仓：未启用</div>
+              </div>
+            </div>
           </template>
-          <tr v-if="!hub.strategies.length && !loading">
-            <td :colspan="auth.isAdmin ? 9 : 8" class="muted" style="padding: 18px">
-              {{ appliedQuery ? '无匹配策略' : '暂无策略，点击右上角「新增策略」开始配置' }}
-            </td>
-          </tr>
-        </tbody>
-      </table>
+
+          <div v-if="!hub.strategies.length && !loading" class="pf-empty">
+            {{ appliedQuery ? '无匹配策略' : '暂无策略，点击右上角「新增策略」开始配置' }}
+          </div>
+        </div>
+      </div>
     </div>
 
     <StrategyFormModal
@@ -590,9 +598,39 @@ function fmtTime(sec: number | null | undefined): string {
 </template>
 
 <style scoped>
-.page-header {
-  margin-bottom: 14px;
-  align-items: flex-start;
+.strategies-page {
+  width: 100%;
+  max-width: 1080px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.strategies-header {
+  margin-bottom: 12px;
+}
+
+/* ── 策略列表网格行（原型 pf-rows）── */
+.st-rows-inner { min-width: 860px; }
+.st-thead,
+.st-row {
+  grid-template-columns: 1.4fr 1fr 0.8fr 1.6fr 1fr 0.7fr 1.3fr;
+}
+.st-thead.admin,
+.st-row.admin {
+  grid-template-columns: 1.4fr 0.9fr 1fr 0.8fr 1.6fr 1fr 0.7fr 1.3fr;
+}
+.st-row { cursor: pointer; }
+.st-col-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.st-detail {
+  padding: 12px 8px;
+  border-bottom: 1px solid #161f30;
+  background: rgba(6, 10, 18, 0.4);
 }
 
 .strategy-detail {

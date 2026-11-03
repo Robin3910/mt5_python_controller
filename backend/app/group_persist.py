@@ -20,7 +20,7 @@ from typing import Optional
 
 from sqlalchemy import func, or_, select, update
 
-from . import group_rules, latency_marks
+from . import group_rules, latency_marks, signal_codes
 from .db import SessionLocal
 from .orm import (
     GroupSignalTask,
@@ -127,6 +127,7 @@ async def create_dispatch(
     symbol: Optional[str],
     decided_vol: Optional[float],
     hold_when_empty: bool = False,
+    action: Optional[str] = None,
 ) -> Optional[dict]:
     """创建一条节点子任务并分配魔术号，返回 {dispatch_id, magic}。
 
@@ -149,6 +150,7 @@ async def create_dispatch(
                 symbol=symbol,
                 decided_vol=decided_vol,
                 hold_when_empty=bool(hold_when_empty),
+                action=action,
                 status="pending",
                 dispatched_at=datetime.now(),
             )
@@ -629,14 +631,21 @@ async def mark_task_dispatched(
         logger.warning("mark_task_dispatched failed: %s", e)
 
 
-async def mark_task_skipped(task_id: int, reason: Optional[str]) -> None:
+async def mark_task_skipped(task_id: int, reason: Optional[str],
+                           skip_code: Optional[str] = None) -> None:
     """主任务未产生任何下发（分组无有效节点等）。"""
     try:
         async with SessionLocal() as s:
+            values: dict = {
+                "status": "skipped", "skip_reason": reason,
+                "finished_at": datetime.now(),
+            }
+            if skip_code:
+                values["skip_code"] = skip_code
             await s.execute(
                 update(GroupSignalTask)
                 .where(GroupSignalTask.task_id == task_id)
-                .values(status="skipped", skip_reason=reason, finished_at=datetime.now())
+                .values(**values)
             )
             await s.commit()
     except Exception as e:  # noqa: BLE001
@@ -653,10 +662,13 @@ async def record_skipped_dispatch(
     decided_vol: Optional[float],
     status: str,
     skip_reason: Optional[str] = None,
+    skip_code: Optional[str] = None,
+    action: Optional[str] = None,
 ) -> None:
     """落库一条未真正执行的节点明细（节点忙 / 连接断开）。
 
     这类子任务不分配魔术号——它没有也不会有 MT5 订单，留个记录只为可追溯。
+    skip_code：结构化跳过编码（见 signal_codes.SKIP_CODES），统计按它聚合。
     """
     try:
         async with SessionLocal() as s:
@@ -668,8 +680,10 @@ async def record_skipped_dispatch(
                     node_id=node_id,
                     symbol=symbol,
                     decided_vol=decided_vol,
+                    action=action,
                     status=status,
                     skip_reason=skip_reason,
+                    skip_code=skip_code,
                     dispatched_at=datetime.now(),
                     finished_at=datetime.now(),
                 )
@@ -685,10 +699,12 @@ async def record_skipped_dispatch(
 async def set_dispatch_status(
     dispatch_id: int, status: str, *, skip_reason: Optional[str] = None,
     sent_at: Optional[datetime] = None,
+    skip_code: Optional[str] = None,
 ) -> Optional[dict]:
     """更新子任务状态（下发成功 / 失败）。终态时回传需要释放的节点占位。
 
     sent_at：服务端发包时刻，写入后成为跨节点唯一可比的时间轴。
+    skip_code：结构化跳过编码（见 signal_codes.SKIP_CODES）。
     """
     try:
         async with SessionLocal() as s:
@@ -698,6 +714,8 @@ async def set_dispatch_status(
             row.status = status
             if skip_reason:
                 row.skip_reason = skip_reason
+            if skip_code:
+                row.skip_code = skip_code
             if sent_at is not None:
                 row.sent_at = sent_at
             terminal = status in _TERMINAL
@@ -776,6 +794,7 @@ async def update_dispatch_result(
                 else:
                     row.status = "failed"
                     row.finish_reason = "open_failed"
+                    row.skip_code = signal_codes.SKIP_ERROR_MT5
                     row.finished_at = now
                     released.extend(_released(row))
             await s.flush()
