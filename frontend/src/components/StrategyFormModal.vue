@@ -1812,8 +1812,12 @@ function validateRules(rules: EditableRule[]): string | null {
         return `${at}：请选择 K 线周期`
       }
       if (lv.point < 0) return `${at}：点数不能为负`
-      if (lv.lot_times < 0) return `${at}：倍数不能为负`
-      if (lv.extra_lot < 0) return `${at}：手数不能为负`
+      // 指定价档位的手数不按「倍数 / 手数」算（走「按阶梯止盈 1 金额反推」），
+      // 这两个字段对它无效：表单里也不展示，不该拦保存。
+      if (lv.calc_type !== 'price') {
+        if (lv.lot_times < 0) return `${at}：倍数不能为负`
+        if (lv.extra_lot < 0) return `${at}：手数不能为负`
+      }
       // 波幅纳入当前 K 线：由表单自动决定并固定参数，这里只兜底检查一致性
       if (lv.range_include_live && !shouldAutoRangeLive(r, lv)) {
         return `${at}：只有逆势加仓的波幅档位才能纳入当前 K 线波幅`
@@ -3092,7 +3096,9 @@ function resetRuleToTemplate(idx: number): void {
                           step="1"
                         />
                       </div>
-                      <div class="field">
+                      <!-- 指定价档位的手数不按「倍数 / 手数」算：走「按阶梯止盈 1
+                           金额反推」，这两个字段对它无效，展示出来只会误导。 -->
+                      <div v-if="lv.calc_type !== 'price'" class="field">
                         <FormLabel
                           :field-id="`rule-${idx}-lv-${li}-times`"
                           text="倍数"
@@ -3106,7 +3112,7 @@ function resetRuleToTemplate(idx: number): void {
                           step="0.01"
                         />
                       </div>
-                      <div class="field">
+                      <div v-if="lv.calc_type !== 'price'" class="field">
                         <FormLabel
                           :field-id="`rule-${idx}-lv-${li}-extra`"
                           text="手数"
@@ -3130,6 +3136,12 @@ function resetRuleToTemplate(idx: number): void {
                           删除
                         </button>
                       </div>
+                      <!-- 指定价档位不显示「倍数 / 手数」：手数是按阶梯止盈 1 的
+                           目标金额反推出来的，与这两个字段无关。独占一行说明。 -->
+                      <p v-if="lv.calc_type === 'price'" class="muted batch-level-note">
+                        手数按「阶梯止盈第 1 档的目标金额」反推：这一档成交后，
+                        到止盈价时全场合计盈亏正好等于该目标金额（存量浮盈抵扣、浮亏补上）。
+                      </p>
                     </div>
                     <div
                       v-if="r.manual_scatter.enabled"
@@ -3673,6 +3685,14 @@ function resetRuleToTemplate(idx: number): void {
   margin: 0;
   font-size: 12px;
   line-height: 1.4;
+}
+
+/* 指定价档位的手数说明：占满整行，不挤在输入框旁边 */
+.batch-level-note {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .batch-top-grid {

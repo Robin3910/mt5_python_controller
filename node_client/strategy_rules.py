@@ -208,6 +208,9 @@ class PriceLevelPlan:
     volume_formula: str = ""
     # 每手止盈金额（入场价 → 止盈价），反推手数用
     profit_per_lot: float = 0.0
+    # 反推手数用的 tier1 目标金额：手数是按它算的，
+    # 成交后立起「按指定价算止盈」分支时要记下它（分支价代表的金额）。
+    tier_amount: float = 0.0
 
     @property
     def type_label(self) -> str:
@@ -830,7 +833,7 @@ def counter_limit_price(direction: str, base: float, point: float, gap: Threshol
 
 def plan_price_level(
     rule: dict, ctx: PositionCtx, *, level: dict, level_index: int,
-    volume: float, limit_kind: str, digits: int = 0,
+    volume: float, limit_kind: str, digits: int = 0, tier_amount: float = 0.0,
 ) -> Optional[PriceLevelPlan]:
     """组装指定价档位的挂单计划。
 
@@ -839,6 +842,9 @@ def plan_price_level(
 
     `limit_kind` 为 None（现价正好压在入场价上，两种单都挂不上）时返回 None，
     调用方本拍跳过。
+
+    `tier_amount`：反推手数用的 tier1 目标金额。手数是按它算的，
+    成交后立起「按指定价算止盈」分支时要记下它（分支价代表的金额）。
     """
     if not limit_kind:
         return None
@@ -874,6 +880,8 @@ def plan_price_level(
         limit_kind_name=limit_kind_name,
         limit_value=limit_value,
         position_count=ctx.position_count,
+        # 反推手数用的 tier1 目标金额：手数是按它算的。
+        tier_amount=abs(_as_float(tier_amount, 0.0)),
     )
 
 
