@@ -560,7 +560,25 @@ class StrategyBatchLevel(BaseModel):
         ),
     )
     point: float = Field(default=100, ge=0, description="calc_type=point 时的触发点数")
-    price: float = Field(default=0.0, ge=0, description="calc_type=price 时的绝对价位")
+    price: float = Field(
+        default=0.0, ge=0,
+        description="calc_type=price 时的绝对价位；指定价档位下它就是这一档的入场价",
+    )
+    price_tp: float = Field(
+        default=0.0, ge=0,
+        description=(
+            "指定价档位的止盈参考价（绝对价位）：**只用于反推这一档的手数**"
+            "（按阶梯止盈第 1 档的目标金额）；这一档不单独止盈，"
+            "成交后出场跟随大部队的阶梯止盈"
+        ),
+    )
+    price_sl: float = Field(
+        default=0.0, ge=0,
+        description=(
+            "指定价档位的自有止损（绝对价位），0=不设。成交后锁定不可改；"
+            "与大部队的共同止损并存，离现价更近的那道生效"
+        ),
+    )
     timeframe: str = Field(
         default="M5",
         description="atr / range 的统计周期，或 fvg / ob / pdz / fibo 用来匹配推送的周期标识",

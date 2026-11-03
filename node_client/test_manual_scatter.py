@@ -2596,3 +2596,63 @@ async def test_runner_keeps_pending_when_cancel_not_confirmed():
     assert not _progress(sent, ms.PENDING_OFF_EVENT), \
         "撤单没确认时不该发 manual_off 事件"
     runner.cancel()
+
+
+# --------------------------- 指定价档位的手数反推 ---------------------------
+def test_price_level_volume_from_tier1_target():
+    """手数 = 阶梯止盈 1 的目标金额 / 每手止盈（指定价 → 止盈参考价）。"""
+    # tick_size=0.01, tick_value=1 → 每手每 1 点 = 1 美元
+    # 指定价 2399 → 止盈参考价 2410：11 点 = 1100 跳 = 1100 美元/手
+    # 阶梯 1 目标 500 → 500/1100 = 0.4545… → 向上取整到 0.01 = 0.46
+    vol = ms.price_level_volume(
+        entry=2399.0, tp_ref=2410.0,
+        lot_pl_tiers=_gold_tiers(pl_lo=500.0),
+        tick_size=0.01, tick_value=1.0,
+        volume_step=0.01, volume_min=0.01, volume_max=100.0,
+    )
+    assert vol is not None
+    assert abs(vol - 0.46) < 0.001
+
+
+def test_price_level_volume_subtracts_projected_profit():
+    """存量浮盈要抵扣目标金额 → 手数收薄。"""
+    base = dict(
+        entry=2399.0, tp_ref=2410.0,
+        lot_pl_tiers=_gold_tiers(pl_lo=500.0),
+        tick_size=0.01, tick_value=1.0,
+        volume_step=0.01, volume_min=0.01, volume_max=100.0,
+    )
+    full = ms.price_level_volume(**base)
+    half = ms.price_level_volume(**base, projected_pl=250.0)
+    assert full is not None and half is not None
+    assert half < full
+    # 浮亏 → 手数加厚
+    loss = ms.price_level_volume(**base, projected_pl=-250.0)
+    assert loss is not None and loss > full
+
+
+def test_price_level_volume_returns_none_without_tier1():
+    """阶梯止盈没启用 → 算不出手数 → 跳过这一档（不挂手数瞎猜的单）。"""
+    assert ms.price_level_volume(
+        entry=2399.0, tp_ref=2410.0,
+        lot_pl_tiers={"enabled": False, "tiers": []},
+        tick_size=0.01, tick_value=1.0,
+    ) is None
+    # 止盈参考价与指定价相同 → 每手止盈为 0 → 算不出
+    assert ms.price_level_volume(
+        entry=2399.0, tp_ref=2399.0,
+        lot_pl_tiers=_gold_tiers(pl_lo=500.0),
+        tick_size=0.01, tick_value=1.0,
+    ) is None
+
+
+def test_price_level_volume_falls_back_to_min_lot():
+    """存量在这个价已经赚到目标金额 → 按最小手数开。"""
+    vol = ms.price_level_volume(
+        entry=2399.0, tp_ref=2410.0,
+        lot_pl_tiers=_gold_tiers(pl_lo=500.0),
+        tick_size=0.01, tick_value=1.0,
+        volume_step=0.01, volume_min=0.01, volume_max=100.0,
+        projected_pl=999.0,
+    )
+    assert vol == 0.01

@@ -31,6 +31,10 @@ EXEC_NO_MORE_ADDS = "no_more_adds"
 EXEC_WAITING_TP_SL = "waiting_tp_sl"
 EXEC_LOCKED_BY_MANUAL = "locked_by_manual"
 
+# 运行期锁死：指定价档位已成交，它的入场价 / 自有止损 / 止盈参考价
+# 已经落在已开的仓位上，改配置不改已开仓位。
+EXEC_LOCKED_BY_PRICE_LEVEL = "locked_by_price_level"
+
 # 运行期锁死：规则类型、模版
 LOCKED_RULE_FIELDS = ("type",)
 LOCKED_MANUAL_FIELDS = (
@@ -63,6 +67,13 @@ MONITOR_TIMES = "times"
 def _as_int(value: Any, default: int = 0) -> int:
     try:
         return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
     except (TypeError, ValueError):
         return default
 
@@ -284,12 +295,85 @@ def _pl_tiers_fields(old_rule: dict, new_rule: dict) -> list[dict]:
     return out
 
 
+def _price_level_cfg(rule: dict) -> list[dict]:
+    """规则里的指定价档位（calc_type=price 且填了入场价）。"""
+    levels = (rule or {}).get("batch_levels")
+    out: list[dict] = []
+    for idx, lv in enumerate(levels or []):
+        if not isinstance(lv, dict):
+            continue
+        if str(lv.get("calc_type") or "").strip().lower() != "price":
+            continue
+        if _as_float(lv.get("price")) <= 0:
+            continue
+        out.append({"index": idx, "level": lv})
+    return out
+
+
+def _price_level_fields(
+    old_rule: dict, new_rule: dict,
+    *, price_locked: set, path: str, label: str,
+) -> list[dict]:
+    """指定价档位的变更结论（逐档位、逐字段）。
+
+    两种结论：
+    - **在途未成交** → `applied`：节点会撤掉旧挂单、按新参数重挂；
+    - **已成交** → `locked`：这一档的入场价 / 自有止损 / 止盈参考价都已
+      锁定在已开的仓位上，改配置不影响已开仓位（也不该改）。
+
+    `price_locked` 是「已成交的指定价档位」集合：(规则类型, 档位下标)。
+    """
+    out: list[dict] = []
+    old_levels = {item["index"]: item["level"] for item in _price_level_cfg(old_rule)}
+    new_levels = {item["index"]: item["level"] for item in _price_level_cfg(new_rule)}
+    rule_type = _rule_type(new_rule)
+    for idx in sorted(set(old_levels) | set(new_levels)):
+        old_lv = old_levels.get(idx, {})
+        new_lv = new_levels.get(idx, {})
+        locked = (rule_type, idx) in price_locked
+        for field, text in (
+            ("price", "指定价"),
+            ("price_tp", "止盈参考价"),
+            ("price_sl", "自有止损"),
+        ):
+            old_v = _as_float(old_lv.get(field))
+            new_v = _as_float(new_lv.get(field))
+            if not _changed(old_v, new_v):
+                continue
+            field_path = f"{path}.batch_levels[{idx}].{field}"
+            if locked:
+                out.append({
+                    "field": field_path,
+                    "status": "locked",
+                    "exec": EXEC_LOCKED_BY_PRICE_LEVEL,
+                    "old": old_v,
+                    "new": new_v,
+                    "message": (
+                        f"{label}档位#{idx + 1}的{text}已随成交锁定在已开仓位上"
+                        f"（{old_v}），本次调整（{new_v}）不影响已开仓位"
+                    ),
+                })
+            else:
+                out.append({
+                    "field": field_path,
+                    "status": "applied",
+                    "old": old_v,
+                    "new": new_v,
+                    "message": (
+                        f"{label}档位#{idx + 1}的{text}从 {old_v} 调整为 {new_v}；"
+                        "节点会撤掉盘上的挂单并按新参数重挂"
+                    ),
+                })
+    return out
+
+
 def reconcile_rules(
     old_rules: list, new_rules: list,
     *, added_by_rule: Optional[dict] = None,
     closed_rules: Optional[set] = None,
     manual_locked: Optional[set] = None,
     manual_pending: Optional[set] = None,
+    price_locked: Optional[set] = None,
 ) -> tuple[list[dict], list[dict]]:
     """逐条规则、逐字段比对。
 
@@ -305,11 +389,15 @@ def reconcile_rules(
     manual_pending：手动分散仓**挂单在盘上**的规则类型。客户在这期间把手动单
                    删掉时，节点会撤掉盘上那张挂单——这里给出逐字段结论，
                    让客户知道「保存后那张单会被撤掉」。
+    price_locked  ：**已成交**的指定价档位（(规则类型, 档位下标) 集合）。
+                   这些档位的入场价 / 自有止损 / 止盈参考价已锁定在已开仓位上，
+                   改配置不影响已开仓位；在途未成交的不锁（可改 → 撤单重挂）。
     """
     added_by_rule = added_by_rule or {}
     closed_rules = closed_rules or set()
     manual_locked = manual_locked or set()
     manual_pending = manual_pending or set()
+    price_locked = price_locked or set()
     out: list[dict] = []
 
     old_list = [r for r in (old_rules or []) if isinstance(r, dict)]
@@ -453,6 +541,33 @@ def reconcile_rules(
             seen_pl.add(key)
             out.append(pl_field)
 
+        # 指定价档位：在途未成交的可改（撤单重挂），已成交的锁定。
+        price_fields = _price_level_fields(
+            old_rule, new_rule,
+            price_locked=price_locked, path=path, label=label,
+        )
+        if price_fields:
+            out.extend(price_fields)
+            # 锁定的档位：生效配置里保留旧值（已开仓位不受影响）
+            locked_idx = {
+                idx for (rt, idx) in price_locked if rt == rule_type
+            }
+            if locked_idx:
+                old_by_idx = {
+                    item["index"]: item["level"] for item in _price_level_cfg(old_rule)
+                }
+                levels = list(applied_rule.get("batch_levels") or [])
+                for idx in locked_idx:
+                    if idx >= len(levels) or idx not in old_by_idx:
+                        continue
+                    old_lv = dict(old_by_idx[idx])
+                    new_lv = dict(levels[idx])
+                    for field in ("price", "price_tp", "price_sl"):
+                        if field in old_lv:
+                            new_lv[field] = old_lv[field]
+                    levels[idx] = new_lv
+                applied_rule["batch_levels"] = levels
+
         effective.append(applied_rule)
 
     # 旧有新无的规则被删了：**采纳删除**。
@@ -481,6 +596,7 @@ def reconcile_snapshot(
     closed_rules: Optional[set] = None,
     manual_locked: Optional[set] = None,
     manual_pending: Optional[set] = None,
+    price_locked: Optional[set] = None,
 ) -> tuple[list[dict], dict]:
     """整体快照的逐字段结论。
 
@@ -494,6 +610,7 @@ def reconcile_snapshot(
         closed_rules=closed_rules,
         manual_locked=manual_locked,
         manual_pending=manual_pending,
+        price_locked=price_locked,
     )
 
     effective = dict(new)

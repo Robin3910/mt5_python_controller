@@ -271,7 +271,10 @@ class BatchLevel:
     pos_to: int = 4
     calc_type: str = BATCH_CALC_POINT
     point: float = 100.0            # calc_type=point：触发点数
-    price: float = 0.0              # calc_type=price：指定的绝对价位
+    price: float = 0.0              # calc_type=price：指定的绝对价位（指定价档位下=入场价）
+    # 指定价档位的出场参数（只在 calc_type=price 时有意义）
+    price_tp: float = 0.0           # 止盈参考价：只用于反推手数，出场随大部队阶梯止盈
+    price_sl: float = 0.0           # 自有止损（绝对价位），0=不设
     timeframe: str = DEFAULT_BATCH_TIMEFRAME  # atr / range 的统计周期；SMC 标识的匹配周期
     # 波幅纳入当前 K 线（仅逆势）
     range_include_live: bool = False
@@ -789,6 +792,16 @@ def normalize_batch_level(raw: dict) -> dict[str, Any]:
         "point": max(0.0, _as_float(raw.get("point", 100), 100.0)),
         # 指定价位是绝对价格，允许为 0（表示未设置，节点侧据此跳过该档）
         "price": max(0.0, _as_float(raw.get("price", 0.0), 0.0)),
+        # 指定价档位的止盈参考价与自有止损：只在 calc_type=price 时有意义，
+        # 其余口径一律清零（与「按 type 只保留该类型字段」的既有口径一致）
+        "price_tp": (
+            max(0.0, _as_float(raw.get("price_tp", 0.0), 0.0))
+            if calc_type == BATCH_CALC_PRICE else 0.0
+        ),
+        "price_sl": (
+            max(0.0, _as_float(raw.get("price_sl", 0.0), 0.0))
+            if calc_type == BATCH_CALC_PRICE else 0.0
+        ),
         "timeframe": normalize_timeframe(raw.get("timeframe")),
         # 波幅纳入当前 K 线：只对波幅口径有意义，其余计算方式一律关闭
         "range_include_live": bool(

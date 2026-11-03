@@ -248,3 +248,25 @@ def test_opening_stops_respect_side_and_min_lot():
         tp_amount=10, sl_amount=20,
         tick_size=0.01, tick_value=1.0, digits=2,
     ) is None
+
+
+# --------------------------- 双止损：取更近的那道 ---------------------------
+def test_nearer_stop_takes_the_closer_one():
+    """多单取更高（离现价更近），空单取更低。"""
+    # 多单：自有 4300 更近 → 留自有
+    assert sp.nearer_stop("BUY", 4300.0, 4250.0) == 4300.0
+    # 多单：共同止损 4250 更近 → 留共同
+    assert sp.nearer_stop("BUY", 4200.0, 4250.0) == 4250.0
+    # 空单：自有 4500 更近 → 留自有
+    assert sp.nearer_stop("SELL", 4500.0, 4550.0) == 4500.0
+    # 空单：共同止损 4550 更近 → 留共同
+    assert sp.nearer_stop("SELL", 4600.0, 4550.0) == 4550.0
+
+
+def test_nearer_stop_handles_missing_side():
+    """只有一道止损时直接用它。"""
+    assert sp.nearer_stop("BUY", 0.0, 4250.0) == 4250.0
+    assert sp.nearer_stop("BUY", 4300.0, 0.0) == 4300.0
+    assert sp.nearer_stop("BUY", 0.0, 0.0) == 0.0
+    # 方向缺失时按空单口径（取更低）——宁可保守
+    assert sp.nearer_stop("", 4300.0, 4250.0) == 4250.0

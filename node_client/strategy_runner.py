@@ -55,11 +55,20 @@ from strategy_rules import (
     decision_detail,
     describe_counter_limit,
     describe_decision,
+    describe_price_level,
     deviation_points,
     evaluate,
+    is_price_level,
     metric_key,
     parse_add_rule_type,
+    parse_price_level,
+    pick_batch_level,
     plan_counter_limit,
+    plan_price_level,
+    price_level_active,
+    price_level_comment,
+    price_level_order_key,
+    price_level_params,
     range_adapt_enabled,
     smc_key_from_comment,
 )
@@ -160,6 +169,15 @@ def _fmt_stop(value: object) -> str:
     return f"{number:g}"
 
 
+def _trim_price(value: object, digits: int = 5) -> str:
+    """价格按位数格式化并去掉尾随零（说明里不要出现 2399.00000）。"""
+    number = _as_float(value)
+    if number == 0:
+        return "0"
+    text = f"{number:.{digits}f}"
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
 def _trade_error_text(res: object, *, fallback: str = "改单失败") -> str:
     """从单笔或批量 order_send 回包抽出券商原文（comment + retcode）。
 
@@ -242,6 +260,14 @@ class StrategyRunner:
         self._counter_seen: set[int] = set()
         self._counter_skip_fills = 0
         self._counter_resync = False
+        # 指定价档位（price level）：
+        # - 在途挂单：ticket → 计划快照（重启后据此还原，不重复挂单）
+        # - 已成交持仓：ticket → 档位参数（自有止损从这里取，成交后锁定）
+        self._price_pending: dict[int, dict] = {}
+        self._price_filled: dict[int, dict] = {}
+        # 指定价档位的自有止损被打掉了（票号从持仓里消失）：
+        # 置上后由 `_lot_sltp_sync` 消费一次（触发 TP/SL 重算 + 重读余额）。
+        self._price_sl_dropped: bool = False
         # 热推后需要立刻做一次「加仓对齐检查」：扩容时不等价格触发就续挂下一档，
         # 缩容时立刻撤掉在途限价单。对齐完成后清掉这个标记。
         self._add_align_pending = False
@@ -328,6 +354,8 @@ class StrategyRunner:
         self._lot_sltp_sl_only_sig: tuple = ()
         # 重连后的第一份持仓是已有单，不算新开仓，不重算止损
         self._lot_sltp_seed_existing = False
+        # 各方向上一轮的总手数：用来识别「仓位减少」（指定价自有止损被打掉）
+        self._lot_sltp_volume: dict[str, float] = {}
         # —— 出入金 → 止损重算 ——
         # 记下「当前止损是按多少余额算出来的」。余额变了才需要重算止损。
         # 重连时从 runtime 还原：节点重启后要知道这笔止损的基准余额。
@@ -407,6 +435,31 @@ class StrategyRunner:
             tp = _as_float(snap.get("tp"), 0.0)
             if tp > 0:
                 self._manual_tp_authority[int(rule_type)] = tp
+        # 指定价档位（price level）：在途挂单与已成交持仓。
+        #
+        # 重连后靠这两份快照还原：
+        # - 在途挂单 → 不重复挂（重复挂 = 双倍手数）；
+        # - 已成交持仓 → 「自有止损已锁定」（热推回执据此判 locked）。
+        #
+        # 两份快照都是「列表 of dict」，键是字符串（JSON 的限制）。
+        for item in self._resume_runtime.get("price_pending") or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                ticket = int(item.get("ticket") or 0)
+            except (TypeError, ValueError):
+                continue
+            if ticket > 0:
+                self._price_pending[ticket] = dict(item)
+        for item in self._resume_runtime.get("price_filled") or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                ticket = int(item.get("ticket") or 0)
+            except (TypeError, ValueError):
+                continue
+            if ticket > 0:
+                self._price_filled[ticket] = dict(item)
         # TradingView SMC 价位副本，以及本任务在本节点已经用过的记录
         self._smc: dict = {}
         self._smc_used: set[str] = set()
@@ -548,6 +601,7 @@ class StrategyRunner:
             closed_rules=self._closed_rule_types(),
             manual_locked=self._manual_locked_rule_types(),
             manual_pending=self._manual_pending_rule_types(),
+            price_locked=self._price_locked_levels(),
         )
         result = strategy_reconcile.summarize(fields)
 
@@ -827,6 +881,10 @@ class StrategyRunner:
             # 客户在 MT5 里手动出入金 → 余额变了 → 止损要跟着重算。
             # 放在热推同步之前：探测到入金后，这一拍的重算就能带上新余额。
             await self._probe_balance()
+            # 指定价档位：认成交 / 认消失。
+            # **必须在 `_lot_sltp_sync` 之前**：自有止损被打掉的判定要靠它，
+            # 认晚一拍就会漏掉那一拍的 TP/SL 重算。
+            await self._observe_price_level_fills(positions)
             # 热推后同步在途的手动挂单：客户改了参数就撤旧单重算重挂。
             # 放在成交判定之前：撤单后这一拍不再挂，等下一拍重新走挂单路径。
             if self._manual_resync:
@@ -1153,6 +1211,90 @@ class StrategyRunner:
         ratio = abs(signal_pl.float_pl_ratio_value(self._signal_pl))
         return (signal_pl.float_pl_enabled(self._signal_pl), round(ratio, 6))
 
+    def _price_locked_levels(self) -> set[tuple[int, int]]:
+        """**已成交**的指定价档位：(规则类型, 档位下标)。
+
+        成交的档位：入场价 / 自有止损 / 止盈参考价已锁定在已开的仓位上，
+        热推改这些字段不影响已开仓位（也不会改到仓位上）。
+        """
+        out: set[tuple[int, int]] = set()
+        for info in self._price_filled.values():
+            idx = _as_int((info or {}).get("level_index"), -1)
+            if idx < 0:
+                continue
+            out.add((RULE_TYPE_COUNTER, idx))
+        return out
+
+    def _own_sl_by_ticket(self, positions: list[dict]) -> dict[int, float]:
+        """指定价档位持仓的自有止损：票号 → 止损价。
+
+        自有止损的来源有两条，优先级：
+        1. **成交时记下的**（`self._price_filled`）——这是「锁定」的那一道，
+           之后热推改配置也不动它；
+        2. 持仓上 broker 侧现存的 `sl` ——重连后内存态丢了，用它兜底。
+
+        只认**指定价档位**的持仓（备注 `R1L2X`）。普通加仓没有自有止损，
+        它们只有共同止损。
+        """
+        out: dict[int, float] = {}
+        for pos in positions or []:
+            if not isinstance(pos, dict):
+                continue
+            if parse_price_level(pos.get("comment")) is None:
+                continue
+            ticket = int(pos.get("ticket") or 0)
+            if ticket <= 0:
+                continue
+            own = _as_float((self._price_filled.get(ticket) or {}).get("own_sl"), 0.0)
+            if own <= 0:
+                own = _as_float(pos.get("sl"), 0.0)
+            if own > 0:
+                out[ticket] = own
+        return out
+
+    def _lot_sltp_volume_by_side(self, positions: list[dict]) -> dict[str, float]:
+        """各方向当前的总手数（用于识别「仓位减少」）。"""
+        out: dict[str, float] = {}
+        for pos in positions or []:
+            if not isinstance(pos, dict):
+                continue
+            side = str(pos.get("type") or "").upper()
+            if side not in ("BUY", "SELL"):
+                continue
+            out[side] = out.get(side, 0.0) + _as_float(pos.get("volume"), 0.0)
+        return out
+
+    def _lot_sltp_volume_dropped(self, positions: list[dict]) -> bool:
+        """这一轮有没有**指定价档位的自有止损**被打掉。
+
+        场景：指定价档位的**自有止损被打掉**——只走掉一笔，剩余仓位继续跑，
+        但加权均价、总手数、余额都变了，TP/SL 必须按新的仓位重算，
+        而且**不收口**（剩余仓位继续按新 TP/SL 跑）。
+
+        只认「指定价档位 + 设了自有止损 + 刚刚消失」的持仓。
+        **普通的平仓不触发**：既有语义是「平仓不重算止损」
+        （`test_signal_stop_recalculates_on_open_not_on_close`），
+        只有指定价的自有止损被打掉才是例外。
+
+        判定放在 `_observe_price_level_fills`（每拍都跑）里，这里只取结果：
+        标记一旦置上就**保留到被消费**，不能只看当前这一拍——
+        持仓消失的那一拍可能正好没有可写的东西（没启用盈亏比），
+        那一拍算不了，这一拍就不能把标记清掉。
+
+        「在场」的判断用**全部持仓**（不限方向、不限是否被盈亏配置过滤）：
+        指定价仓可能被盈亏的 `close_action` 过滤掉（只平多单时，空单侧的
+        指定价仓不进 `scoped`），拿过滤后的列表当「在场」会把没被打掉的仓位
+        误判成被打掉。
+        """
+        return self._price_sl_dropped
+
+    def _consume_price_sl_dropped(self) -> bool:
+        """取走「自有止损被打掉」的标记（消费一次就清掉）。"""
+        if not self._price_sl_dropped:
+            return False
+        self._price_sl_dropped = False
+        return True
+
     async def _lot_sltp_apply_plans(
         self, event: MarketEvent, positions: list[dict], plans: list[dict],
         *, allow_keep: bool = True, allow_keep_sl: Optional[bool] = None,
@@ -1326,12 +1468,26 @@ class StrategyRunner:
         # 客户入金了：余额变了 → 止损金额要按新余额重算。
         # 与配置改动同类 —— 是一次的、明确的外部事件，不是价格事件的延伸。
         balance_changed = self._balance_dirty
+        # **仓位减少也要重算**：指定价档位的自有止损被打掉时，只走掉一笔，
+        # 剩下的仓位的加权均价与总手数都变了 → TP/SL 必须按新的仓位重算。
+        #
+        # 止损金额还要按**新余额**重算（余额在被打掉那笔的浮动亏损后变了），
+        # 所以这里必须重新读一次余额。
+        #
+        # 「在场」的判断用**全部持仓**（不限方向、不限是否被盈亏配置过滤）：
+        # 指定价仓可能被盈亏的 `close_action` 过滤掉（只平多单时，空单侧的
+        # 指定价仓不进 `scoped`），拿过滤后的列表当「在场」会把没被打掉的仓位
+        # 误判成被打掉。
+        #
+        # 标记是**消费式**的：这一拍算了就清掉（不能重复触发重算）。
+        volume_dropped = self._consume_price_sl_dropped()
         # 2b（越价保留旧值）只针对**配置改动**：加仓后重算出的价落到现价
         # 错误一侧是价格事件的延伸，那一轮仍然按原逻辑市价平掉。
         allow_keep = sl_cfg_changed or tp_cfg_changed
         if (
             not self._lot_sltp_dirty and sig == self._lot_sltp_sig
             and not sl_cfg_changed and not tp_cfg_changed and not balance_changed
+            and not volume_dropped
         ):
             # 仓位构成没变：只可能是价格动了。要判的是「现价冲过了已经落下的
             # 共同止盈/止损」——这是价格事件，不能因为签名没变就不看。
@@ -1349,6 +1505,8 @@ class StrategyRunner:
         sl_balance: Optional[float] = None
         if ratio_on and (
             opened or (sl_cfg_changed and not suppress_open) or balance_changed
+            # 仓位减少（自有止损被打掉）→ 余额变了 → 止损金额要按新余额重算
+            or volume_dropped
         ):
             balance = await self._read_balance()
             if balance is None:
@@ -1370,6 +1528,8 @@ class StrategyRunner:
             bid=_as_float(event.bid),
             ask=_as_float(event.ask),
             fallback_price=_as_float(event.price),
+            # 指定价档位持仓的自有止损：取「更近的那道」靠它
+            own_sl_by_ticket=self._own_sl_by_ticket(scoped),
         )
         applied = await self._lot_sltp_apply_plans(
             event, positions, plans,
@@ -1567,17 +1727,41 @@ class StrategyRunner:
         return "done" if await self._close_all() else "hit"
 
     async def _lot_sltp_modify(self, plan: dict) -> tuple[bool, bool]:
-        """写入这一侧算出的止盈和/或止损。没算的一侧沿用持仓上的现价。"""
+        """写入这一侧算出的止盈和/或止损。没算的一侧沿用持仓上的现值。
+
+        **指定价档位的持仓走逐票止损**（`plan["sl_by_ticket"]`）：
+        - 票号在表里且值为 None → 沿用 broker 上的自有止损（这一票归「自有止损
+          更近」管，不写共同止损）；
+        - 票号在表里且有值 → 写这道共同止损（共同止损更近）；
+        - 票号不在表里 → 用这一侧的共同止损。
+
+        注意 `None` 的语义是「沿用持仓现值」，**不是「不设止损」**——
+        两者混淆会把指定价仓的自有止损清掉。
+        """
         sl = plan.get("sl")
         tp = plan.get("tp")
         digits = int(plan.get("digits") or 0)
+        sl_by_ticket = plan.get("sl_by_ticket")
+        if not isinstance(sl_by_ticket, dict):
+            sl_by_ticket = {}
         changed = False
         ok = True
         for pos in plan.get("positions") or []:
-            if signal_pl.stops_match(pos, sl, tp, digits):
+            ticket = int(pos.get("ticket") or 0)
+            # 这一票该带哪道止损
+            if ticket in sl_by_ticket:
+                per_sl = sl_by_ticket[ticket]
+                # None = 沿用持仓上已有的自有止损
+                want_sl = (
+                    _as_float(pos.get("sl"), 0.0)
+                    if per_sl is None else float(per_sl)
+                )
+            else:
+                want_sl = float(sl) if sl is not None else _as_float(pos.get("sl"), 0.0)
+            if signal_pl.stops_match(pos, want_sl, tp, digits):
                 continue
             changed = True
-            send_sl = float(sl) if sl is not None else _as_float(pos.get("sl"), 0.0)
+            send_sl = want_sl
             send_tp = float(tp) if tp is not None else None
             try:
                 res = dict(await self._exec(
@@ -2227,6 +2411,15 @@ class StrategyRunner:
             metrics, lives = await self._read_bars()
             ctx.bar_metrics = metrics
             ctx.bar_live = lives
+
+        # 指定价档位：走自己的挂单路径，**不**进下面的「逆势限价」流程。
+        #
+        # 两条路径互斥的原因：指定价档位靠**挂单到指定价成交**触发，
+        # 逆势限价靠「挂单价被波幅自适应推远」触发。同一档走两条路会让手数
+        # 被算两次，也会挂出两张单。
+        if await self._sync_price_level(event, filtered, ctx):
+            return
+
         spec = await self._manual_symbol_spec()
         digits = int((spec or {}).get("digits") or 0)
         plan = plan_counter_limit(self._rules or [], ctx, digits=digits)
@@ -2247,6 +2440,359 @@ class StrategyRunner:
         live2 = await self._magic_positions()
         if live2 is not None:
             await self._observe_counter_fills(list(live2))
+
+    # ------------------------------------------------------------------
+    # 指定价档位（price level）
+    #
+    # 与「逆势限价」的区别：
+    # - 逆势限价：挂单价会随波幅自适应被推远，**不写止损止盈**，成交后重算；
+    # - 指定价档位：挂单价**固定就是指定价**（成交价正好等于它），**带一道
+    #   自己的止损**，出场跟大部队的阶梯止盈。
+    # ------------------------------------------------------------------
+
+    def _price_level_target(self, ctx: PositionCtx) -> Optional[tuple[dict, int, dict]]:
+        """命中指定价档位时的 (规则, 档位下标, 档位)；没命中返回 None。
+
+        只认**逆势**规则（决策 3：顺势的指定价不改）。
+
+        **已经成交过的档位不再命中**：成交后本规则的加仓次数 +1，
+        命中的是下一档；但如果下一档也是指定价档位，它会重新被挂一张单——
+        这是对的（用户可以配多个指定价档位）。已经成交的那个档位本身
+        不会被重复挂单，因为加仓序号已经走过它。
+
+        **笔数上限要在这里判**（与 `_prepare_rule` 同一口径）：
+        档位区间可能比 `total_lot_limit` 宽（用户自己填的），命中了档位
+        不等于还能加。不判的话会挂出超出上限的那一笔。
+        """
+        for index, rule in enumerate(self._rules or []):
+            if not isinstance(rule, dict):
+                continue
+            if _as_int(rule.get("type"), RULE_TYPE_COUNTER) != RULE_TYPE_COUNTER:
+                continue
+            if not _as_int(rule.get("status"), 0):
+                continue
+            added = ctx.rule_add_count(RULE_TYPE_COUNTER)
+            limit = _as_int(rule.get("total_lot_limit"), 0)
+            if limit and added >= limit:
+                continue
+            level, level_index = pick_batch_level(rule, added + 1)
+            if level is None or level_index is None:
+                continue
+            if not price_level_active(level):
+                continue
+            return rule, level_index, level
+        return None
+
+    async def _price_level_plan(
+        self, ctx: PositionCtx, book: list[dict], spec: dict, event: MarketEvent,
+    ) -> Optional[tuple]:
+        """组装指定价档位的挂单计划；本拍不该挂（算不出手数 / 现价压在入场价）返回 None。
+
+        返回 (计划, 原因)：原因是「本拍跳过」的人话说明，用于日志与事件。
+        """
+        hit = self._price_level_target(ctx)
+        if hit is None:
+            return None
+        rule, level_index, level = hit
+        params = price_level_params(level)
+        entry = params["entry"]
+        tp_ref = params["tp_ref"]
+        own_sl = params["own_sl"]
+        direction = str(ctx.direction).upper()
+
+        # 手数：按阶梯止盈 1 的目标金额反推。
+        # 存量仓位到「止盈参考价」那一刻的预估盈亏要算进去：
+        # 存量浮盈抵扣目标、浮亏补进目标，两种情况净额都等于阶梯 1 的目标金额。
+        # 手动分散仓不进基数（它有自己的止盈价与目标金额，混进来会重复计算）。
+        target = manual_scatter.tier0_pl_amount(rule.get("lot_pl_tiers"))
+        projected = manual_scatter.projected_profit(
+            manual_scatter.exclude_manual(book),
+            tp_ref,
+            _as_float(spec.get("tick_size")),
+            _as_float(spec.get("tick_value")),
+        )
+        projected_pl = projected if target is not None else 0.0
+        volume = manual_scatter.price_level_volume(
+            entry=entry,
+            tp_ref=tp_ref,
+            lot_pl_tiers=rule.get("lot_pl_tiers"),
+            tick_size=_as_float(spec.get("tick_size")),
+            tick_value=_as_float(spec.get("tick_value")),
+            volume_step=_as_float(spec.get("volume_step"), 0.01),
+            volume_min=_as_float(spec.get("volume_min"), 0.01),
+            volume_max=_as_float(spec.get("volume_max"), 100.0),
+            projected_pl=projected_pl,
+        )
+        if volume is None or volume <= 0:
+            logger.info(
+                "task %s price level skipped: no volume (tier1 %s, tp_ref %s)",
+                self.task_id, target, tp_ref,
+            )
+            return None
+
+        # 单型：现价在入场价哪一侧 → 限价单（等回落）还是止损单（等反弹）。
+        # 两种单都在入场价上成交，区别只是等待的方向。
+        # 现价正好压在入场价上时两种单都挂不上（券商硬约束），本拍跳过。
+        price = manual_scatter.fill_side_price(
+            direction,
+            bid=_as_float(event.bid),
+            ask=_as_float(event.ask),
+            fallback=_as_float(event.price),
+        )
+        kind = manual_scatter.pending_kind(direction, price, entry)
+        if kind is None:
+            logger.debug(
+                "task %s price level skipped: price %s on entry %s",
+                self.task_id, price, entry,
+            )
+            return None
+
+        plan = plan_price_level(
+            rule, ctx, level=level, level_index=level_index,
+            volume=volume, limit_kind=kind,
+        )
+        if plan is None:
+            return None
+        plan.volume_formula = (
+            f"阶梯止盈1 目标 {target} − 存量到 {_trim_price(tp_ref)} 的预估盈亏 "
+            f"{round(projected_pl, 2)} = {round(abs(target) - projected_pl, 2)}，"
+            f"每手止盈 {_trim_price(manual_scatter.profit_per_lot(entry, tp_ref, _as_float(spec.get('tick_size')), _as_float(spec.get('tick_value'))))}"
+            f"，手数 {plan.volume}"
+        )
+        plan.profit_per_lot = manual_scatter.profit_per_lot(
+            entry, tp_ref,
+            _as_float(spec.get("tick_size")),
+            _as_float(spec.get("tick_value")),
+        )
+        # 自有止损：配了就带上，但必须落在入场价的反方向，否则券商拒掉整张单
+        order_sl = None
+        if own_sl > 0:
+            if manual_scatter.sl_is_sendable(
+                direction, own_sl, entry,
+                stops_level=int(spec.get("stops_level") or 0),
+                point=_as_float(spec.get("point"), 0.0),
+            ):
+                order_sl = own_sl
+            else:
+                logger.info(
+                    "task %s price level pending without stop loss: %s %s entry %s sl %s",
+                    self.task_id, direction, kind, entry, own_sl,
+                )
+        plan.own_sl = float(order_sl or 0.0)
+        return plan
+
+    async def _place_price_level(
+        self, plan, positions: list[dict], book: list[dict],
+    ) -> bool:
+        """挂出指定价档位的挂单。
+
+        - 挂单价 = 指定价（固定，**不改价**——改了就违背「成交价正好等于指定价」）
+        - 止损 = 自有止损（可能没有：配的不合法时券商会拒掉整张单）
+        - 止盈 = 不写：出场跟大部队的阶梯止盈，由 `_lot_sltp_sync` 统一同步
+        """
+        try:
+            res = dict(await self._exec(
+                self._mt5.place_pending_order,
+                self.symbol, plan.action, plan.volume, plan.entry,
+                plan.own_sl or None, None,
+                plan.comment, self.magic, plan.limit_kind,
+            ) or {})
+        except Exception as e:  # noqa: BLE001
+            logger.warning("task %s place price level failed: %s", self.task_id, e)
+            res = {"success": False, "error": str(e)}
+        if not res.get("success"):
+            await self._emit_progress(
+                "error", phase="running", positions=positions,
+                message=f"指定价挂单失败：{res.get('error') or 'pending order failed'}",
+                detail={
+                    "kind": "price_level",
+                    "limit_action": "place",
+                    "price_level": True,
+                    "entry_price": plan.entry,
+                    "tp_ref": plan.tp_ref,
+                    "own_sl": plan.own_sl or None,
+                    "volume": plan.volume,
+                    "error": str(res.get("error") or ""),
+                },
+            )
+            return False
+        ticket = int(res.get("order") or res.get("ticket") or 0)
+        # 记下这张单：重连后靠它知道已经挂过，不重复挂；
+        # 成交后靠它把「档位参数」接续到持仓上（自有止损从这里锁定）。
+        self._price_pending[ticket] = {
+            "ticket": ticket,
+            "type": plan.action,
+            "volume": plan.volume,
+            "entry": plan.entry,
+            "tp_ref": plan.tp_ref,
+            "own_sl": plan.own_sl,
+            "kind": plan.limit_kind,
+            "level_index": plan.level_index,
+            "comment": plan.comment,
+            "time": time.time(),
+        }
+        self._pending_orders = len(self._price_pending)
+        await self._emit_progress(
+            "cnt_limit", phase="running", positions=positions,
+            last_order={"ticket": ticket, "price": plan.entry, "volume": plan.volume},
+            message=describe_price_level(plan, verb="挂出"),
+            detail={
+                "kind": "price_level",
+                "limit_action": "place",
+                "price_level": True,
+                "level_index": plan.level_index,
+                "entry_price": plan.entry,
+                "tp_ref": plan.tp_ref,
+                "own_sl": plan.own_sl or None,
+                "volume": plan.volume,
+                "volume_formula": plan.volume_formula,
+                "profit_per_lot": plan.profit_per_lot,
+            },
+        )
+        return True
+
+    async def _sync_price_level(
+        self, event: MarketEvent, positions: list[dict], ctx: PositionCtx,
+    ) -> bool:
+        """维持指定价档位的那一张挂单；返回 True 表示这一档走的是指定价路径。
+
+        在途挂单身份（手数 + 档位号）没变就留着；变了就撤掉重挂。
+        **价格永远不改**：指定价的成交价必须正好等于指定价，改价就违背了
+        「手数按这个价反推」的前提。
+
+        返回 False = 这一档不是指定价档位 → 调用方继续走正常的逆势限价流程。
+        """
+        if self._price_level_target(ctx) is None:
+            return False
+        spec = await self._manual_symbol_spec()
+        if spec is None:
+            logger.warning("task %s price level skipped: missing symbol spec", self.task_id)
+            return True
+        plan = await self._price_level_plan(ctx, positions, spec, event)
+        if plan is None:
+            # 这一档算不出来（没手数 / 现价压在入场价上）：把在途的单撤掉，
+            # 否则会挂着一张永远等不到的正确单，而用户以为它在等。
+            await self._cancel_price_levels(
+                positions, reason="指定价档位暂时挂不了（算不出手数或现价压在入场价上）",
+            )
+            return True
+        resting = [
+            o for o in (await self._magic_orders() or [])
+            if parse_price_level(o.get("comment")) is not None
+        ]
+        want = price_level_order_key(plan.level_index, plan.volume)
+        if len(resting) > 1:
+            await self._cancel_price_levels(
+                positions, reason="指定价挂单只保留一张",
+            )
+            resting = []
+        current = resting[0] if resting else None
+        if current is not None:
+            have = counter_pending_key(current.get("comment"), current.get("volume"))
+            if have != want:
+                await self._cancel_price_levels(
+                    positions, reason="指定价档位的手数或档位变了，撤下重挂",
+                )
+                current = None
+        if current is None:
+            await self._place_price_level(plan, positions, positions)
+            return True
+        # 身份没变 → 留着不动。价格固定，不改单。
+        return True
+
+    async def _cancel_price_levels(
+        self, positions: list[dict], *, reason: str,
+    ) -> bool:
+        """撤掉在途的指定价挂单。"""
+        resting = [
+            o for o in (await self._magic_orders() or [])
+            if parse_price_level(o.get("comment")) is not None
+        ]
+        if not resting:
+            self._price_pending.clear()
+            return True
+        ok = True
+        for order in resting:
+            ticket = int(order.get("ticket") or 0)
+            try:
+                res = dict(await self._exec(self._mt5.cancel_order, ticket) or {})
+            except Exception as e:  # noqa: BLE001
+                logger.warning("task %s cancel price level failed: %s", self.task_id, e)
+                ok = False
+                continue
+            if not res.get("success"):
+                logger.warning(
+                    "task %s cancel price level failed: %s", self.task_id, res.get("error"),
+                )
+                ok = False
+                continue
+            self._price_pending.pop(ticket, None)
+        if not ok:
+            return False
+        self._pending_orders = len(self._price_pending)
+        await self._emit_progress(
+            "cnt_limit_off", phase="running", positions=positions,
+            message=reason,
+            detail={
+                "kind": "price_level",
+                "limit_action": "cancel",
+                "price_level": True,
+                "ticket": int(resting[0].get("ticket") or 0),
+                "price": _as_float(resting[0].get("price_open")),
+                "comment": resting[0].get("comment"),
+            },
+        )
+        return True
+
+    async def _observe_price_level_fills(self, positions: list[dict]) -> None:
+        """指定价档位的挂单成交后：记账 + 把档位参数接到持仓上。
+
+        「自有止损已锁定」这件事就靠这里落地：成交后把挂单上的自有止损
+        记进 `_price_filled`，之后热推改配置也不会动它。
+
+        同时盯住「自有止损被打掉」：票号从持仓里消失 → 置标记（`_price_sl_dropped`），
+        标记会被 `_lot_sltp_sync` 消费一次（触发 TP/SL 重算 + 重读余额）。
+        """
+        alive = {
+            int(p.get("ticket") or 0)
+            for p in positions or []
+            if isinstance(p, dict)
+        }
+        # 先认成交（把挂单上的档位参数接到持仓上），再认消失
+        for pos in positions:
+            parsed = parse_price_level(pos.get("comment"))
+            if parsed is None:
+                continue
+            ticket = int(pos.get("ticket") or 0)
+            if ticket <= 0 or ticket in self._price_filled:
+                continue
+            pending = self._price_pending.pop(ticket, None)
+            if pending is None:
+                # 重启后接上的持仓：从持仓自身的 sl / 开仓价还原
+                pending = {
+                    "level_index": parsed[1],
+                    "entry": _as_float(pos.get("price_open")),
+                    "tp_ref": 0.0,
+                    "own_sl": _as_float(pos.get("sl")),
+                    "kind": "",
+                }
+            self._price_filled[ticket] = {
+                "ticket": ticket,
+                "level_index": pending.get("level_index", parsed[1]),
+                "entry": _as_float(pos.get("price_open")),
+                "tp_ref": _as_float(pending.get("tp_ref")),
+                "own_sl": _as_float(pending.get("own_sl")),
+                "volume": _as_float(pos.get("volume")),
+                "comment": str(pos.get("comment") or ""),
+            }
+        # 再认消失：设了自有止损的指定价仓不见了 → 自有止损被打掉
+        for ticket, info in list(self._price_filled.items()):
+            if ticket in alive:
+                continue
+            if _as_float((info or {}).get("own_sl"), 0.0) > 0:
+                self._price_sl_dropped = True
+            # 已经不在盘上了，清理掉
+            self._price_filled.pop(ticket, None)
 
     async def _add_position(
         self, decision, positions: list[dict], *, message: Optional[str] = None,
@@ -2893,6 +3439,19 @@ class StrategyRunner:
             }
         if self._smc_used:
             payload["smc_used"] = sorted(self._smc_used)
+        # 指定价档位：在途挂单与已成交持仓都要落库。
+        # - 在途：重连后靠它知道已经挂过，不重复挂（重复挂 = 双倍手数）；
+        # - 已成交：靠它还原「自有止损已锁定」这件事（热推回执要据此判定锁定）。
+        if self._price_pending:
+            payload["price_pending"] = [
+                {str(k): v for k, v in sorted(item.items())}
+                for _k, item in sorted(self._price_pending.items())
+            ]
+        if self._price_filled:
+            payload["price_filled"] = [
+                {str(k): v for k, v in sorted(item.items())}
+                for _k, item in sorted(self._price_filled.items())
+            ]
         # 止损基准余额：重连后要知道「当前止损是按多少余额算的」，
         # 才能判断客户入金后该不该重算。
         if self._lot_sltp_sl_balance is not None:
@@ -2916,7 +3475,7 @@ class StrategyRunner:
         各自的共同止盈——那套价是按加权开仓价算的，和手动仓的绝对价对不上，
         会出现存量仓位先被平掉、手动仓还挂着的情况。
 
-        返回本次改成功���票号列表（空列表表示这次没有改动）。
+        返回本次改成功的票号列表（空列表表示这次没有改动）。
         """
         tp = self._manual_authority_tp()
         if tp is None:
@@ -4070,6 +4629,14 @@ class StrategyRunner:
 
         # 2) 逆势加仓限价（带 cnt_limit_off 事件，前端能看到撤单过程）
         if not await self._cancel_open_counter_limits(reason="持仓已清空，撤下逆势限价"):
+            return False
+
+        # 2b) 指定价档位的挂单（同样带 cnt_limit_off 事件）。
+        #     指定价档位**不是最后一仓**，但阶梯止盈先到时它必须撤掉：
+        #     大部队已经走了，还挂着的指定价单会在之后单独成交成一笔孤儿仓。
+        if not await self._cancel_price_levels(
+            [], reason="阶梯止盈先到，撤下在途的指定价挂单",
+        ):
             return False
 
         # 3) 兜底：把本魔术号下其余挂单一并撤掉（语义不明的单没有事件，

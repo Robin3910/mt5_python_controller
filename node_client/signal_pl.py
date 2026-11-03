@@ -596,6 +596,32 @@ def _price_distance(amount: float, money_per_price: float) -> Optional[float]:
     return target / money_per_price
 
 
+def nearer_stop(side: str, own_sl: float, common_sl: float) -> float:
+    """指定价仓该带哪道止损：取离现价更近的那道。
+
+    MT5 一个持仓只有一个 SL，「两道止损」是节点侧模拟出来的：
+    - 指定价档位挂单时在 broker 侧写进了自己的止损（`own_sl`）；
+    - 大部队有一道共同止损（盈亏比 × 余额反推，`common_sl`）。
+
+    两者只能留一道，取**离现价更近**的那道：
+    - 自有止损通常更近（客户是按指定价算的），留它 = 客户真正想要的那道防线生效；
+    - 共同止损反而更近时，说明自有止损根本够不到，共同止损先被打掉 →
+      整个方向平掉，「自有止损触发后重算」这个场景自然不会发生，逻辑自洽。
+
+    多单取更高（离现价更近），空单取更低。
+    """
+    own = _as_float(own_sl, 0.0)
+    common = _as_float(common_sl, 0.0)
+    if own <= 0:
+        return common
+    if common <= 0:
+        return own
+    side = str(side or "").strip().upper()
+    if side == "BUY":
+        return max(own, common)
+    return min(own, common)
+
+
 def plan_common_stops(
     positions: list | None,
     *,
@@ -608,6 +634,7 @@ def plan_common_stops(
     bid: float = 0.0,
     ask: float = 0.0,
     fallback_price: float = 0.0,
+    own_sl_by_ticket: dict | None = None,
 ) -> list[dict]:
     """按方向算共同止盈和/或止损。
 
@@ -615,6 +642,13 @@ def plan_common_stops(
     距离 D = 金额 / ((tick_value / tick_size) × Σ手数)。
     止盈金额来自分档批次1，且该方向总手数达到 tp_min_lot 才计算；止损金额来自盈亏比 × 余额。
     多单止盈在 W 之上、止损在 W 之下；空单相反。
+
+    `own_sl_by_ticket`：指定价档位持仓的**自有止损**（票号 → 止损价）。
+    传入后会额外产出 `sl_by_ticket`：票号 → 这一票该带哪道止损。
+    取「离现价更近的那道」（见 `nearer_stop`）：
+    - 自有止损更近 → 记 `None`，表示**沿用 broker 上已经写好的自有止损**
+      （注意：`None` 是「沿用现值」，不是「不设止损」）；
+    - 共同止损更近 → 记共同止损价，改单时把它写上去。
     """
     size = _as_float(tick_size, 0.0)
     value = _as_float(tick_value, 0.0)
@@ -622,6 +656,7 @@ def plan_common_stops(
         return []
     if _price_distance(tp_amount or 0, 1) is None and _price_distance(sl_amount or 0, 1) is None:
         return []
+    own_map = own_sl_by_ticket if isinstance(own_sl_by_ticket, dict) else {}
     grouped: dict[str, list[dict]] = {"BUY": [], "SELL": []}
     for pos in positions or []:
         if not isinstance(pos, dict):
@@ -659,6 +694,22 @@ def plan_common_stops(
             tp = _round_price(anchor - d_tp, digits) if d_tp is not None else None
             sl = _round_price(anchor + d_sl, digits) if d_sl is not None else None
         market = _market_for_side(side, bid=bid, ask=ask, fallback=fallback_price)
+        # 指定价档位的逐票止损：取更近的那道。
+        #
+        # 「更近」的口径是**止损价的高低**（多单取更高、空单取更低）——
+        # 与 `nearer_stop` 的口径一致：止损是保护价位的，多单的止损位越高，
+        # 行情回落时越先被打到，也就是「更近的那道防线」。
+        sl_by_ticket: dict[int, float | None] = {}
+        for pos in rows:
+            ticket = int(pos.get("ticket") or 0)
+            if ticket <= 0 or ticket not in own_map:
+                continue
+            own_sl = _as_float(own_map.get(ticket), 0.0)
+            if own_sl <= 0:
+                continue
+            picked = nearer_stop(side, own_sl, sl or 0.0)
+            # picked == own_sl → 沿用 broker 上的自有止损（None = 沿用现值）
+            sl_by_ticket[ticket] = None if picked == own_sl else picked
         plans.append({
             "rule": RULE_LOT_PL_TIERS if d_tp is not None else RULE_FLOAT_PL_RATIO,
             "side": side,
@@ -672,6 +723,8 @@ def plan_common_stops(
             "volume": volume,
             "digits": max(0, int(digits)),
             "positions": rows,
+            # 指定价档位的逐票止损（票号 → 止损价 / None=沿用自有止损）
+            "sl_by_ticket": sl_by_ticket,
             "crossed": _cross_side(side, sl, tp, market),
             # 两侧各自的越价情况：止盈和止损要分别决定写不写
             "crossed_sides": sorted(crossed_sides(side, sl, tp, market)),

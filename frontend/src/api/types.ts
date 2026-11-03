@@ -620,8 +620,12 @@ export interface StrategyBatchLevel {
   calc_type: BatchCalcType
   /** calc_type=point 时的触发点数 */
   point: number
-  /** calc_type=price 时的绝对价位 */
+  /** calc_type=price 时的绝对价位；指定价档位下它就是这一档的入场价 */
   price: number
+  /** 指定价档位的止盈参考价：只用于反推手数，出场随大部队阶梯止盈 */
+  price_tp?: number
+  /** 指定价档位的自有止损（绝对价位），0=不设；成交后锁定 */
+  price_sl?: number
   /** atr / range 的统计周期，或 SMC 标识用来匹配推送的周期 */
   timeframe: BatchTimeframe
   /** 波幅间距是否纳入当前未收盘 K 线的实时高低差（仅逆势可用） */

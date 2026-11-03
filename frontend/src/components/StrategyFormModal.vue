@@ -504,7 +504,19 @@ const FIELD_HELP = {
     '可选 M1 / M5 / M15 / M30 / H1 / H4 / D1 / W1 / MN。',
   batch_price:
     '本档的指定价位（绝对价格）。逆势时多单需低于参考价、空单需高于参考价；' +
-    '顺势方向相反。价位方向不符或留空时本档不会触发。',
+    '顺势方向相反。价位方向不符或留空时本档不会触发。' +
+    '逆势时节点把这一档挂成限价/止损单，成交价**正好等于**指定价（不滑点）；' +
+    '顺势的指定价仍是「到价后市价成交」，成交价可能有滑点，不保证等于指定价。',
+  batch_price_tp:
+    '这一档的止盈**参考价**（绝对价格）：**只用来反推这一档的手数**' +
+    '（按阶梯止盈第 1 档的目标金额，减去存量仓位到该价时的预估盈亏，再除以每手止盈）。' +
+    '这一档**不单独止盈**——成交后出场跟随大部队的阶梯止盈，一块走。' +
+    '留空则无法算出手数，该档不会挂单。',
+  batch_price_sl:
+    '这一档**自己的止损**（绝对价格），0 = 不设。必须落在入场价的反方向，否则券商会拒掉整张挂单。' +
+    '成交后这一道止损会锁定，之后改配置不影响已开仓位。' +
+    '它与大部队的共同止损（信号盈亏比 × 余额）同时存在，**离现价更近的那道生效**。' +
+    '这一道被打掉后不收口：剩余仓位按新的加权均价与阶梯止盈金额重算 TP / SL 继续跑。',
   batch_timeframe:
     `统计 ATR / 波幅用的 K 线周期，固定取最近 ${BATCH_BAR_PERIOD} 根**已收盘** K 线（不含当前未走完的那根）。` +
     '算出的价格距离会换算成点数，再与实际偏离比较。' +
@@ -721,6 +733,9 @@ function cloneRules(rules: StrategyRule[]): EditableRule[] {
         range_include_live: lv.range_include_live ?? false,
         range_live_cap: lv.range_live_cap ?? RANGE_LIVE_CAP_DEFAULT,
         range_live_refresh: lv.range_live_refresh ?? RANGE_LIVE_REFRESH_DEFAULT,
+        // 指定价档位的止盈参考价与自有止损：老配置没有，补 0
+        price_tp: lv.price_tp ?? 0,
+        price_sl: lv.price_sl ?? 0,
       })),
       manual_scatter: r.manual_scatter?.enabled
         ? { ...defaultManualScatter(), ...r.manual_scatter, enabled: true }
@@ -968,6 +983,8 @@ type LevelParams = Pick<
   | 'calc_type'
   | 'point'
   | 'price'
+  | 'price_tp'
+  | 'price_sl'
   | 'timeframe'
   | 'range_include_live'
   | 'range_live_cap'
@@ -982,6 +999,8 @@ function defaultLevelParams(index: number, prev?: StrategyBatchLevel): LevelPara
       calc_type: prev.calc_type || 'point',
       point: prev.point,
       price: prev.price ?? 0,
+      price_tp: prev.price_tp ?? 0,
+      price_sl: prev.price_sl ?? 0,
       timeframe: prev.timeframe || 'M5',
       // 存量配置原样带入，实际生效值由提交前的 normalizeRangeLive 统一归一
       range_include_live: prev.range_include_live ?? false,
@@ -995,6 +1014,8 @@ function defaultLevelParams(index: number, prev?: StrategyBatchLevel): LevelPara
     calc_type: 'point',
     point: 100 + index * 100,
     price: 0,
+    price_tp: 0,
+    price_sl: 0,
     timeframe: 'M5',
     range_include_live: false,
     range_live_cap: RANGE_LIVE_CAP_DEFAULT,
@@ -1889,6 +1910,18 @@ function collectWarnings(rules: EditableRule[]): string[] {
           )
         }
       }
+      // 指定价档位：缺止盈参考价就算不出手数，节点不会挂这一档的单。
+      // 这里只提示不拦保存（保存路径上不再有拦截），由用户决定要不要补。
+      levels.forEach((lv, i) => {
+        if (lv.calc_type !== 'price') return
+        if (!(lv.price > 0)) return
+        if (!(Number(lv.price_tp) > 0)) {
+          out.push(
+            `${label} 档位 ${i + 1}：指定价档位没有填止盈参考价，` +
+              '节点无法反推手数，这一档不会挂单（其它档位照常）。',
+          )
+        }
+      })
     }
   }
   return out
@@ -2970,6 +3003,34 @@ function resetRuleToTemplate(idx: number): void {
                           type="number"
                           min="0"
                           step="0.00001"
+                        />
+                      </div>
+                      <div v-if="lv.calc_type === 'price'" class="field">
+                        <FormLabel
+                          :field-id="`rule-${idx}-lv-${li}-price-tp`"
+                          text="止盈参考价"
+                          :help="FIELD_HELP.batch_price_tp"
+                        />
+                        <input
+                          :id="`rule-${idx}-lv-${li}-price-tp`"
+                          v-model.number="lv.price_tp"
+                          type="number"
+                          min="0"
+                          step="any"
+                        />
+                      </div>
+                      <div v-if="lv.calc_type === 'price'" class="field">
+                        <FormLabel
+                          :field-id="`rule-${idx}-lv-${li}-price-sl`"
+                          text="自有止损"
+                          :help="FIELD_HELP.batch_price_sl"
+                        />
+                        <input
+                          :id="`rule-${idx}-lv-${li}-price-sl`"
+                          v-model.number="lv.price_sl"
+                          type="number"
+                          min="0"
+                          step="any"
                         />
                       </div>
                       <div v-else-if="isBarCalc(lv.calc_type) || isSmcCalc(lv.calc_type)" class="field">

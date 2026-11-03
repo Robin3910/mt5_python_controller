@@ -683,3 +683,86 @@ def test_pl_config_deduped_across_rules():
     ])
     fields, _effective = sr.reconcile_snapshot(old, new)
     assert len(_pl_fields(fields, "rules[float_pl_ratio].ratio")) == 1
+
+
+# --------------------------- 指定价档位的锁定 ---------------------------
+def _price_level_rule(rule_type: int = 1, **over) -> dict:
+    """带一个指定价档位的规则。"""
+    rule = _rule(rule_type, batch_enabled=True, batch_count=1, batch_levels=[{
+        "pos_from": 1, "pos_to": 5, "calc_type": "price",
+        "price": 4390.0, "price_tp": 4410.0, "price_sl": 4380.0,
+        "lot_times": 1.0, "extra_lot": 0.0,
+    }])
+    rule.update(over)
+    return rule
+
+
+def test_price_level_change_is_applied_when_still_pending():
+    """在途未成交 → 改动采纳（节点会撤单重挂）。"""
+    old = _snap([_price_level_rule()])
+    new = _snap([_price_level_rule(batch_levels=[{
+        "pos_from": 1, "pos_to": 5, "calc_type": "price",
+        "price": 4380.0, "price_tp": 4410.0, "price_sl": 4380.0,
+        "lot_times": 1.0, "extra_lot": 0.0,
+    }])])
+    fields, effective = sr.reconcile_snapshot(old, new)
+    hits = [f for f in fields if f.get("field", "").endswith("batch_levels[0].price")]
+    assert len(hits) == 1
+    assert hits[0]["status"] == "applied"
+    assert "撤掉盘上的挂单" in hits[0]["message"]
+    # 生效配置用新值
+    assert effective["rules"][0]["batch_levels"][0]["price"] == 4380.0
+
+
+def test_price_level_change_is_locked_after_fill():
+    """已成交 → 改动锁定，不影响已开仓位。"""
+    old = _snap([_price_level_rule()])
+    new = _snap([_price_level_rule(batch_levels=[{
+        "pos_from": 1, "pos_to": 5, "calc_type": "price",
+        "price": 4380.0, "price_tp": 4410.0, "price_sl": 4380.0,
+        "lot_times": 1.0, "extra_lot": 0.0,
+    }])])
+    fields, effective = sr.reconcile_snapshot(
+        old, new, price_locked={(1, 0)},
+    )
+    hits = [f for f in fields if f.get("field", "").endswith("batch_levels[0].price")]
+    assert len(hits) == 1
+    assert hits[0]["status"] == "locked"
+    assert hits[0]["exec"] == sr.EXEC_LOCKED_BY_PRICE_LEVEL
+    # 生效配置保留旧值（已开仓位不受影响）
+    assert effective["rules"][0]["batch_levels"][0]["price"] == 4390.0
+
+
+def test_price_level_locked_only_applies_to_locked_levels():
+    """锁定的只有那一档；没成交的档位照样能改。"""
+    old = _snap([_price_level_rule()])
+    new = _snap([_price_level_rule(batch_levels=[{
+        "pos_from": 1, "pos_to": 5, "calc_type": "price",
+        "price": 4380.0, "price_tp": 4410.0, "price_sl": 4380.0,
+        "lot_times": 1.0, "extra_lot": 0.0,
+    }])])
+    # 锁的是档位1（不存在），档位0 没锁
+    fields, effective = sr.reconcile_snapshot(
+        old, new, price_locked={(1, 1)},
+    )
+    hits = [f for f in fields if f.get("field", "").endswith("batch_levels[0].price")]
+    assert len(hits) == 1
+    assert hits[0]["status"] == "applied"
+    assert effective["rules"][0]["batch_levels"][0]["price"] == 4380.0
+
+
+def test_price_level_stop_loss_change_is_locked_after_fill():
+    """已成交档位的自有止损也锁定（它是那笔仓位上的防线）。"""
+    old = _snap([_price_level_rule()])
+    new = _snap([_price_level_rule(batch_levels=[{
+        "pos_from": 1, "pos_to": 5, "calc_type": "price",
+        "price": 4390.0, "price_tp": 4410.0, "price_sl": 4370.0,
+        "lot_times": 1.0, "extra_lot": 0.0,
+    }])])
+    fields, effective = sr.reconcile_snapshot(
+        old, new, price_locked={(1, 0)},
+    )
+    hits = [f for f in fields if f.get("field", "").endswith("batch_levels[0].price_sl")]
+    assert len(hits) == 1
+    assert hits[0]["status"] == "locked"
+    assert effective["rules"][0]["batch_levels"][0]["price_sl"] == 4380.0
