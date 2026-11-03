@@ -192,14 +192,11 @@ const lastStrategyError = ref('')
 const isSaveMode = computed(() => props.mode === 'save')
 
 /**
- * 是否展示「带单」开关：非保存模式（保存不发信号，无需选投递范围）
- * 且持有 follow_leader 能力（管理员自动放行）。
- *
- * 能力语义与后端 permissions.can_be_leader 同口径：跟单方向人人可做，
- * 带单能力只决定「我能否被别人跟」。没有该能力的客户看不到开关，
- * carry 恒为 false，信号仍按原逻辑只投递主节点，行为与隐藏前一致。
+ * 是否展示「带单」开关：交易弹窗里始终展示（保存模式不发信号，不展示）。
+ * 关闭 = 只发给主节点；打开 = 发给分组里的全部节点（含跟单节点）。
+ * follow_leader 能力决定的是「能不能出现在带单广场被别人跟」，不决定这个开关出不出现。
  */
-const canCarry = computed(() => !isSaveMode.value && auth.canBeFollowLeader)
+const canCarry = computed(() => !isSaveMode.value)
 
 /**
  * 我是否已暂停【带单】市场。
@@ -213,10 +210,10 @@ const canCarry = computed(() => !isSaveMode.value && auth.canBeFollowLeader)
  */
 const pausedInMarket = computed<string>(() => (auth.me?.follow_paused ? '带单' : ''))
 
-const STRATEGIES: { key: OrderStrategy; label: string; icon: string }[] = [
-  { key: 'trend_market', label: '市价开仓', icon: '⚡' },
-  { key: 'trend_limit', label: '限价开仓', icon: '◎' },
-  { key: 'grid', label: '智能吸筹', icon: '▦' },
+const STRATEGIES: { key: OrderStrategy; label: string }[] = [
+  { key: 'trend_market', label: '市价开仓' },
+  { key: 'trend_limit', label: '限价开仓' },
+  { key: 'grid', label: '智能吸筹' },
 ]
 
 /** 策略中文名（底部脚注用） */
@@ -1217,7 +1214,7 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
 <template>
   <ElDialog
     v-model="visible"
-    width="460px"
+    width="760px"
     :close-on-click-modal="false"
     :show-close="false"
     align-center
@@ -1228,20 +1225,14 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
       <div class="od-header">
         <div class="od-title">
           <span class="od-title-main">
-            策略配置
-            <span style="color: var(--pf-dim)">·</span>
-            <span style="color: #3b82f6">{{ (localForm.symbol || '').toUpperCase() }}</span>
+            创建交易
+            <span class="od-title-dot">·</span>
+            <span class="od-title-sym">{{ (localForm.symbol || '').toUpperCase() }}</span>
           </span>
           <span class="od-title-sub">开仓参数配置</span>
         </div>
-        <button class="od-close" aria-label="关闭" @click="close" title="关闭">
-          X
-        </button>
+        <button class="od-close" aria-label="关闭" @click="close" title="关闭">×</button>
       </div>
-    </template>
-
-    <div class="od-body">
-      <!-- 策略切换 Tab -->
       <div class="od-tabs" role="tablist">
         <button
           v-for="s in STRATEGIES"
@@ -1252,11 +1243,17 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
           :aria-selected="strategy === s.key"
           @click="strategyRef = s.key"
         >
-          <span class="od-tab-icon">{{ s.icon }}</span>
+          <span class="od-tab-icon" aria-hidden="true">
+            <svg v-if="s.key === 'trend_market'" viewBox="0 0 24 24"><path fill="currentColor" d="M11 21h-1l1-7H7.5c-.58 0-.57-.32-.38-.66l.07-.12C8.48 10.94 10.42 7.54 13 3h1l-1 7h3.5c.49 0 .56.33.47.51l-.07.15C12.96 17.55 11 21 11 21z"/></svg>
+            <svg v-else-if="s.key === 'trend_limit'" viewBox="0 0 24 24"><path fill="currentColor" d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67z"/></svg>
+            <svg v-else viewBox="0 0 24 24"><path fill="currentColor" d="M21 8c-1.45 0-2.26 1.44-1.93 2.51l-3.55 3.56c-.3-.09-.74-.09-1.04 0l-2.55-2.55C12.27 10.45 11.46 9 10 9c-1.45 0-2.27 1.44-1.93 2.52l-4.56 4.55C2.44 15.74 1 16.55 1 18c0 1.1.9 2 2 2 1.45 0 2.26-1.44 1.93-2.51l4.55-4.56c.3.09.74.09 1.04 0l2.55 2.55C12.73 16.55 13.54 18 15 18c1.45 0 2.27-1.44 1.93-2.52l3.56-3.55C22.56 12.26 24 11.45 24 10c0-1.1-.9-2-2-2z"/></svg>
+          </span>
           <span class="od-tab-label">{{ s.label }}</span>
         </button>
       </div>
+    </template>
 
+    <div class="od-body">
       <!-- 基础信息（分组）：非市价模式才显示。市价开仓的分组信息在底部 footer 已通过 groupName / 触发按钮体现 -->
       <!-- <div v-if="!isMarket && !isLimit" class="od-row">
         <div class="od-row-text">
@@ -1317,40 +1314,71 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
         </div>
       </div> -->
 
-      <!-- 入场价（限价） -->
-      <div v-if="isLimit" class="od-row">
-        <div class="od-row-text">
-          <div class="od-row-label required">入场价（必填）</div>
-          <!-- <div class="od-row-sub">价格到达时再触发</div> -->
-        </div>
-        <div class="od-row-control od-input-affix">
-          <input v-model.number="localForm.entry_price" class="od-input" type="number" step="0.0001" min="0" placeholder="如 3150.50" />
-          <span class="od-affix">USD</span>
-        </div>
-      </div>
-
-      <!-- 止损 / 止盈（限价+市价）：市价模式下只展示止损，止盈在底仓上为 0、分散仓按盈亏比阶梯止盈 -->
       <template v-if="!isGrid">
         <div class="od-row">
           <div class="od-row-text">
-            <div class="od-row-label required">止损价（必填）</div>
-            <!-- <div class="od-row-sub">
-              {{ isMarket ? '用于按风险金额反推总手数 + 分散仓按盈亏比挂阶梯止盈' : '同时用于自动判定方向' }}
-            </div> -->
+            <div class="od-row-label">以损定量</div>
+            <div class="od-row-sub">按单笔最大亏损额计算手数</div>
           </div>
           <div class="od-row-control od-input-affix">
-            <input v-model.number="localForm.sl" class="od-input" type="number" step="0.0001" min="0" placeholder="如 3140.00" />
+            <input v-model.number="riskParams.risk_amount" class="od-input" type="number" min="1" step="10" />
             <span class="od-affix">USD</span>
           </div>
         </div>
-        <div v-if="!isMarket && !isLimit" class="od-row">
+        <div class="od-row">
           <div class="od-row-text">
-            <div class="od-row-label">止盈价</div>
-            <div class="od-row-sub">不填则不设止盈</div>
+            <div class="od-row-label">底仓比例</div>
+            <div class="od-row-sub">底仓占总仓位比例</div>
           </div>
           <div class="od-row-control od-input-affix">
-            <input v-model.number="localForm.tp" class="od-input" type="number" step="0.0001" min="0" placeholder="如 3180.00" />
-            <span class="od-affix">USD</span>
+            <input v-model.number="riskParams.base_ratio" class="od-input" type="number" min="1" max="100" step="1" />
+            <span class="od-affix">%</span>
+          </div>
+        </div>
+        <div class="od-row">
+          <div class="od-row-text">
+            <div class="od-row-label">盈亏比</div>
+            <div class="od-row-sub">止盈与止损的比例，如 1:2.5</div>
+          </div>
+          <div class="od-row-control od-input-affix">
+            <input v-model.number="riskParams.rr_ratio" class="od-input" type="number" min="0" step="0.1" placeholder="如 2.5" />
+          </div>
+        </div>
+        <div class="od-row">
+          <div class="od-row-text">
+            <div class="od-row-label">保本触发</div>
+            <div class="od-row-sub">价格达到止损距离的几倍后，将止损移至保本价</div>
+          </div>
+          <div class="od-row-control od-input-affix">
+            <input v-model.number="riskParams.breakeven_times" class="od-input" type="number" min="0" step="0.5" />
+            <span class="od-affix">倍</span>
+          </div>
+        </div>
+        <div class="od-row">
+          <div class="od-row-text">
+            <div class="od-row-label">止盈价格</div>
+            <div class="od-row-sub">开仓后挂出的止盈价格，默认不填</div>
+          </div>
+          <div class="od-row-control od-input-affix">
+            <input v-model.number="localForm.tp" class="od-input" type="number" step="0.0001" min="0" placeholder="如 4250.00" />
+          </div>
+        </div>
+        <div v-if="isLimit" class="od-row">
+          <div class="od-row-text">
+            <div class="od-row-label">挂单价格<span class="od-req">必选</span></div>
+            <div class="od-row-sub">限价单触发开仓的委托价格</div>
+          </div>
+          <div class="od-row-control od-input-affix" :class="{ need: !localForm.entry_price }">
+            <input v-model.number="localForm.entry_price" class="od-input" type="number" step="0.0001" min="0" placeholder="如 4150.00" />
+          </div>
+        </div>
+        <div class="od-row">
+          <div class="od-row-text">
+            <div class="od-row-label">止损价格<span class="od-req">必选</span></div>
+            <div class="od-row-sub">开仓后挂出的止损价格</div>
+          </div>
+          <div class="od-row-control od-input-affix" :class="{ need: !localForm.sl }">
+            <input v-model.number="localForm.sl" class="od-input" type="number" step="0.0001" min="0" placeholder="如 4140.00" />
           </div>
         </div>
       </template>
@@ -1384,8 +1412,8 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
         <!-- 区间下限 -->
         <div class="od-row">
           <div class="od-row-text">
-            <div class="od-row-label required">区间下限（必填）</div>
-            <div class="od-row-sub">价格跌破此值后网格终止</div>
+            <div class="od-row-label">价格下限<span class="od-req">必选</span></div>
+            <div class="od-row-sub">吸筹买入价格的下限</div>
           </div>
           <div class="od-row-control od-input-affix">
             <input v-model.number="gridParams.price_lower" class="od-input" type="number" step="0.0001" min="0" placeholder="如 3000.00" />
@@ -1395,8 +1423,8 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
         <!-- 区间上限 -->
         <div class="od-row">
           <div class="od-row-text">
-            <div class="od-row-label required">区间上限（必填）</div>
-            <div class="od-row-sub">价格涨破此值后网格终止</div>
+            <div class="od-row-label">价格上限<span class="od-req">必选</span></div>
+            <div class="od-row-sub">吸筹买入价格的上限</div>
           </div>
           <div class="od-row-control od-input-affix">
             <input v-model.number="gridParams.price_upper" class="od-input" type="number" step="0.0001" min="0" placeholder="如 3300.00" />
@@ -1406,8 +1434,8 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
         <!-- 止损价（方向相关标签） -->
         <div class="od-row">
           <div class="od-row-text">
-            <div class="od-row-label">{{ gridParams.grid_side === 'short' ? '止损价（空头）' : '止损价（多头）' }}</div>
-            <div class="od-row-sub">{{ gridParams.grid_side === 'short' ? '跌破区间下限触发' : '跌破区间下限触发' }}</div>
+            <div class="od-row-label">止损价格<span class="od-req">必选</span></div>
+            <div class="od-row-sub">开仓后挂出的止损价格</div>
           </div>
           <div class="od-row-control od-input-affix">
             <input v-model.number="gridParams.stop_lower" class="od-input" type="number" step="0.0001" min="0" placeholder="如 2950.00" />
@@ -1418,8 +1446,8 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
         <!-- 最大可接受亏损 -->
         <div class="od-row">
           <div class="od-row-text">
-            <div class="od-row-label">最大可接受亏损</div>
-            <div class="od-row-sub">账户货币，0 = 不限制</div>
+            <div class="od-row-label">以损定量</div>
+            <div class="od-row-sub">按单笔最大亏损额计算手数</div>
           </div>
           <div class="od-row-control od-input-affix">
             <input v-model.number="gridParams.max_allow_loss" class="od-input" type="number" step="10" min="0" placeholder="如 100" />
@@ -1582,101 +1610,12 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
            没开就只展示参数，不影响原 quickTrigger 路径。
            「策略复用」开关决定提交时是 save 策略 + 触发 strategy 信号，
            还是仅用参数走 quickTrigger。-->
-      <template v-if="(isMarket || isLimit) && currentGroup">
-        <!-- <div class="od-section">策略参数</div> -->
-        <!-- 加载状态 -->
-        <div v-if="strategyLoading" class="od-loading">
-          <span class="od-loading-dot"></span>
-          <span class="od-loading-dot"></span>
-          <span class="od-loading-dot"></span>
-          加载策略数据…
-        </div>
-        <template v-else>
-          <!-- 无分组时的提示（实际上 currentGroup 有值时不会走到这里） -->
-          <div v-if="!currentGroup" class="od-error">
-            分组未就绪，请稍后重试
-          </div>
-          <template v-else>
-            <!-- 风险金额 -->
-            <div class="od-row">
-              <div class="od-row-text">
-                <div class="od-row-label">风险金额（USD）</div>
-                <!-- <div class="od-row-sub">本次交易愿意承担的亏损金额</div> -->
-              </div>
-              <div class="od-row-control od-input-affix">
-                <input
-                  v-model.number="riskParams.risk_amount"
-                  class="od-input"
-                  type="number"
-                  min="1"
-                  step="10"
-                  placeholder="如 100"
-                />
-                <span class="od-affix">USD</span>
-              </div>
-            </div>
-            <!-- 盈亏比 -->
-            <div class="od-row">
-              <div class="od-row-text">
-                <div class="od-row-label">盈亏比</div>
-                <!-- <div class="od-row-sub">止盈 = 止损 × 盈亏比</div> -->
-              </div>
-              <div class="od-row-control">
-                <input
-                  v-model.number="riskParams.rr_ratio"
-                  class="od-input"
-                  type="number"
-                  min="0"
-                  step="0.1"
-                  placeholder="如 2.5"
-                />
-              </div>
-            </div>
-            <!-- 底仓占比 -->
-            <div class="od-row">
-              <div class="od-row-text">
-                <div class="od-row-label">底仓占比</div>
-                <!-- <div class="od-row-sub">底仓占总手数的百分比</div> -->
-              </div>
-              <div class="od-row-control od-input-affix">
-                <input
-                  v-model.number="riskParams.base_ratio"
-                  class="od-input"
-                  type="number"
-                  min="1"
-                  max="100"
-                  step="1"
-                  placeholder="如 30"
-                />
-                <span class="od-affix">%</span>
-              </div>
-            </div>
-            <!-- 保本止损距倍数 -->
-            <div class="od-row">
-              <div class="od-row-text">
-                <div class="od-row-label">保本倍数</div>
-                <!-- <div class="od-row-sub">浮盈 ≥ 止损距 × 倍数时保本（0=不启用）</div> -->
-              </div>
-              <div class="od-row-control">
-                <input
-                  v-model.number="riskParams.breakeven_times"
-                  class="od-input"
-                  type="number"
-                  min="0"
-                  step="0.5"
-                  placeholder="如 2"
-                />
-              </div>
-            </div>
-            <!-- 手数试算提示 -->
-            <!-- <div class="od-hint">
-              总手数 = 风险金额 ÷ 每手止损亏损（由信号止损价与品种规格算出）<br />
-              底仓 {{ riskParams.base_ratio }}% 先市价成交（TP=0）；<br />
-              分散仓按盈亏比 {{ riskParams.rr_ratio }} 倍阶梯止盈
-            </div> -->
-          </template>
-        </template>
-      </template>
+      <div v-if="(isMarket || isLimit) && strategyLoading" class="od-loading">
+        <span class="od-loading-dot"></span>
+        <span class="od-loading-dot"></span>
+        <span class="od-loading-dot"></span>
+        加载策略数据…
+      </div>
 
       <!-- 网格策略参数（走 strategy 模型） -->
       <template v-if="isGrid && currentGroup">
@@ -1711,17 +1650,15 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
 
       <!-- 底部脚注（原型 Oh 的 parameter 摘要行）-->
       <p class="od-footnote">
-        {{ STRATEGY_LABEL[strategy] }} ·
-        {{ (localForm.symbol || '').toUpperCase() }} ·
-        以损定量 {{ riskParams.risk_amount }} USD
+        {{ STRATEGY_LABEL[strategy] }} · 以损定量 {{ isGrid ? gridParams.max_allow_loss : riskParams.risk_amount }} USD
       </p>
     </div>
 
     <template #footer>
       <div class="od-footer">
-        <!-- 「带单」开关：开启 → 信号下发到分组全部节点（含跟单员）；关闭 → 仅主节点。
-             仅对持有 follow_leader 能力的用户展示（无权限的客户看不到，也无法被别人跟）。 -->
+        <!-- 「带单」开关：开启 → 信号下发到分组全部节点（含跟单员）；关闭 → 仅主节点。 -->
         <div v-if="canCarry" class="od-carry">
+          <span class="od-carry-label">带单</span>
           <button
             type="button"
             class="pf-switch"
@@ -1731,8 +1668,6 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
             aria-label="带单"
             @click="carry = !carry"
           ></button>
-          <span class="od-carry-label">带单</span>
-          <!-- <span class="od-carry-sub">{{ carry ? '推到本分组全部节点' : '只推本分组主节点' }}</span> -->
         </div>
         <!-- 暂停提示：主人点了「暂停带单 / 暂停 AI 跟单」后，
              这个开关打开也不会下发给跟单节点 —— 收窄在**服务端**做，
@@ -1760,17 +1695,7 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
               :disabled="!canTriggerStrategy"
               @click="triggerStrategy"
             >
-              <span class="od-btn-primary-main">{{ strategySubmitting ? '触发中…' : '触发' }}</span>
-              <span v-if="derivedAction" class="od-btn-primary-sub">
-                {{ derivedAction === 'BUY' ? 'BUY 多' : 'SELL 空' }}
-                · {{ (localForm.symbol || '').toUpperCase() }}
-              </span>
-              <span v-else-if="isLimit" class="od-btn-primary-sub muted">
-                请填写入场价与止损价
-              </span>
-              <span v-else class="od-btn-primary-sub muted">
-                请填写止损价并等待报价
-              </span>
+              <span class="od-btn-primary-main">{{ strategySubmitting ? '提交中…' : STRATEGY_LABEL[strategy] }}</span>
             </button>
           </template>
           <!-- 网格：走 strategy 模型，与市价/限价统一 -->
@@ -1791,13 +1716,7 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
               :disabled="!canTriggerGridStrategy || strategySubmitting"
               @click="triggerStrategy"
             >
-              <span class="od-btn-primary-main">
-                {{ strategySubmitting ? '触发中…' : '触发' }}
-              </span>
-              <span class="od-btn-primary-sub">
-                {{ gridParams.grid_side === 'long' ? '多' : '空' }}
-                · {{ (localForm.symbol || '').toUpperCase() }}
-              </span>
+              <span class="od-btn-primary-main">{{ strategySubmitting ? '提交中…' : STRATEGY_LABEL[strategy] }}</span>
             </button>
           </template>
         </div>
@@ -1836,12 +1755,14 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
   background: transparent;
 }
 .order-dialog .el-dialog {
-  border-radius: var(--order-radius, 16px);
+  width: min(760px, calc(100vw - 32px)) !important;
+  border-radius: 16px;
   overflow: hidden;
-  max-height: calc(100vh - 32px);
+  max-height: 88vh;
+  margin: 6vh auto;
   background: #0d1626;
   border: 1px solid #1e2b47;
-  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
 }
 .order-dialog .el-dialog__body {
   max-height: calc(100vh - 200px);
@@ -1887,13 +1808,14 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
 }
 .od-title-main {
   font-size: 14px;
-  font-weight: 700;
-  color: var(--pf-text);
-  letter-spacing: 0.01em;
+  font-weight: 650;
+  color: #E6EBF4;
 }
+.od-title-dot { color: #5B6B85; margin: 0 4px; }
+.od-title-sym { color: #3B82F6; }
 .od-title-sub {
   font-size: 10px;
-  color: var(--pf-dim);
+  color: #5B6B85;
 }
 .od-close {
   width: 28px;
@@ -1931,24 +1853,25 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
 
 /* ── Tabs（原型：三个等宽分段按钮）── */
 .od-tabs {
-  display: flex;
-  gap: 6px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 12px;
 }
 .od-tab {
-  flex: 1 1 0;
-  display: inline-flex;
+  display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 6px;
-  height: 36px;
-  border: 1px solid var(--pf-border-2);
-  background: #0a0f1a;
-  border-radius: 8px;
+  gap: 2px;
+  height: 44px;
+  border: 1px solid #22304A;
+  background: #0A0F1A;
+  border-radius: 12px;
   font-size: 12px;
-  font-weight: 600;
-  color: var(--pf-muted);
+  font-weight: 650;
+  color: #8B96A8;
   cursor: pointer;
-  transition: background 0.15s, color 0.15s, border-color 0.15s;
 }
 .od-tab:hover:not(.active) {
   border-color: #2b3a5c;
@@ -1960,7 +1883,8 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
   color: #fff;
   box-shadow: 0 2px 8px rgba(37, 99, 235, 0.4);
 }
-.od-tab-icon { font-size: 14px; line-height: 1; }
+.od-tab-icon { display: flex; width: 16px; height: 16px; }
+.od-tab-icon svg { width: 16px; height: 16px; }
 .od-tab-label { letter-spacing: 0.02em; }
 
 /* ── Row（label 左 / control 右）── */
@@ -1980,10 +1904,16 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
   color: var(--pf-text);
   line-height: 1.3;
 }
-.od-row-label.required::before {
-  content: '*';
-  color: #f6465d;
-  margin-right: 2px;
+.od-req {
+  margin-left: 6px;
+  border-radius: 4px;
+  background: rgba(245, 158, 11, 0.15);
+  color: #FBBF24;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+  padding: 2px 4px;
+  vertical-align: 1px;
 }
 .od-row-sub {
   font-size: 10px;
@@ -2149,7 +2079,18 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
   border-radius: 8px;
   transition: border-color 0.15s;
 }
-.od-input-affix:focus-within { border-color: var(--pf-blue); }
+.od-input-affix:focus-within { border-color: #2563EB; }
+.od-input-affix.need {
+  border-color: #F59E0B;
+  background: #1A1505;
+  box-shadow: 0 0 12px rgba(245, 158, 11, 0.45);
+}
+.od-input-affix.need:focus-within {
+  border-color: #FBBF24;
+  box-shadow: 0 0 16px rgba(251, 191, 36, 0.6);
+}
+.od-input-affix.need .od-input { color: #FDE68A; }
+.od-input-affix.need .od-input::placeholder { color: rgba(245, 158, 11, 0.5); }
 .od-input-affix .od-input {
   border: none;
   outline: none;
