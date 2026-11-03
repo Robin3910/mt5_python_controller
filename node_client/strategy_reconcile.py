@@ -1,21 +1,39 @@
 """热推配置的逐字段 reconcile：把「新快照」拆成每个字段的结论。
 
-热推不是整体替换：有的字段改了立刻生效（HOT），有的只能调大不能调小（上限类），
-有的是运行期锁死不允许改（LOCKED）。这个模块负责纯逻辑的分类与结论生成，
-不碰 I/O，节点执行器拿着新旧快照调它就能得到一份逐字段回执。
+热推不是整体替换，而是**逐字段采纳 + 逐字段说明**：
+- 字段值一律采纳用户填的新值（配置无条件热推，保存路径上没有拦截）；
+- 「加不加 / 怎么加」由节点自身状态决定，结论写在每条结论的 `exec` 里。
 
-字段级结论状态：
+这个模块负责纯逻辑的分类与结论生成，不碰 I/O，节点执行器拿着新旧快照
+调它就能得到一份逐字段回执。
+
+字段级结论状态（**采纳与否**）：
 - applied   —— 已采纳，下一拍生效
-- frozen    —— 缩容类字段：低于已开笔数，保存前就该被拒（正常路径下不该出现）
-- locked    —— 运行期锁死字段被改（正常路径下不该出现，precheck 已拦）
-- no_effect —— 改了也不会产生效果（如加仓已收口时改上限）
+- no_effect —— 已采纳，但节点当前状态决定它不再产生新的动作
+- locked    —— 已采纳为新值，但该字段被运行期状态锁死（手动仓已成交）
+
+字段级结论里的 `exec`（**节点会不会执行**）：
+- will_add         —— 节点会按此继续加仓
+- no_more_adds     —— 本规则不再新增批次（已加 ≥ 上限，或该规则已收口）
+- waiting_tp_sl    —— 本规则不再加仓，现有仓位等待止盈止损
+- locked_by_manual —— 该规则手动分散仓已成交，节点不执行这部分
 """
 from __future__ import annotations
 
 from typing import Any, Optional
 
-# 上限类字段：可以调大也可以调小，但新值不能低于该规则已开笔数
+# 上限类字段：可以调大也可以调小，任何值都允许保存并热推
 LIMIT_FIELDS = ("total_lot_limit", "max_allow_num")
+
+# 节点执行结论（写在每条字段结论的 exec 里）
+EXEC_WILL_ADD = "will_add"
+EXEC_NO_MORE_ADDS = "no_more_adds"
+EXEC_WAITING_TP_SL = "waiting_tp_sl"
+EXEC_LOCKED_BY_MANUAL = "locked_by_manual"
+
+# 运行期锁死：指定价档位已成交，它的入场价 / 自有止损 / 止盈价
+# 已经落在已开的仓位上，改配置不改已开仓位。
+EXEC_LOCKED_BY_PRICE_LEVEL = "locked_by_price_level"
 
 # 运行期锁死：规则类型、模版
 LOCKED_RULE_FIELDS = ("type",)
@@ -49,6 +67,13 @@ MONITOR_TIMES = "times"
 def _as_int(value: Any, default: int = 0) -> int:
     try:
         return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
     except (TypeError, ValueError):
         return default
 
@@ -270,12 +295,85 @@ def _pl_tiers_fields(old_rule: dict, new_rule: dict) -> list[dict]:
     return out
 
 
+def _price_level_cfg(rule: dict) -> list[dict]:
+    """规则里的指定价档位（calc_type=price 且填了入场价）。"""
+    levels = (rule or {}).get("batch_levels")
+    out: list[dict] = []
+    for idx, lv in enumerate(levels or []):
+        if not isinstance(lv, dict):
+            continue
+        if str(lv.get("calc_type") or "").strip().lower() != "price":
+            continue
+        if _as_float(lv.get("price")) <= 0:
+            continue
+        out.append({"index": idx, "level": lv})
+    return out
+
+
+def _price_level_fields(
+    old_rule: dict, new_rule: dict,
+    *, price_locked: set, path: str, label: str,
+) -> list[dict]:
+    """指定价档位的变更结论（逐档位、逐字段）。
+
+    两种结论：
+    - **在途未成交** → `applied`：节点会撤掉旧挂单、按新参数重挂；
+    - **已成交** → `locked`：这一档的入场价 / 自有止损 / 止盈价都已
+      锁定在已开的仓位上，改配置不影响已开仓位（也不该改）。
+
+    `price_locked` 是「已成交的指定价档位」集合：(规则类型, 档位下标)。
+    """
+    out: list[dict] = []
+    old_levels = {item["index"]: item["level"] for item in _price_level_cfg(old_rule)}
+    new_levels = {item["index"]: item["level"] for item in _price_level_cfg(new_rule)}
+    rule_type = _rule_type(new_rule)
+    for idx in sorted(set(old_levels) | set(new_levels)):
+        old_lv = old_levels.get(idx, {})
+        new_lv = new_levels.get(idx, {})
+        locked = (rule_type, idx) in price_locked
+        for field, text in (
+            ("price", "指定价"),
+            ("price_tp", "止盈价"),
+            ("price_sl", "自有止损"),
+        ):
+            old_v = _as_float(old_lv.get(field))
+            new_v = _as_float(new_lv.get(field))
+            if not _changed(old_v, new_v):
+                continue
+            field_path = f"{path}.batch_levels[{idx}].{field}"
+            if locked:
+                out.append({
+                    "field": field_path,
+                    "status": "locked",
+                    "exec": EXEC_LOCKED_BY_PRICE_LEVEL,
+                    "old": old_v,
+                    "new": new_v,
+                    "message": (
+                        f"{label}档位#{idx + 1}的{text}已随成交锁定在已开仓位上"
+                        f"（{old_v}），本次调整（{new_v}）不影响已开仓位"
+                    ),
+                })
+            else:
+                out.append({
+                    "field": field_path,
+                    "status": "applied",
+                    "old": old_v,
+                    "new": new_v,
+                    "message": (
+                        f"{label}档位#{idx + 1}的{text}从 {old_v} 调整为 {new_v}；"
+                        "节点会撤掉盘上的挂单并按新参数重挂"
+                    ),
+                })
+    return out
+
+
 def reconcile_rules(
     old_rules: list, new_rules: list,
     *, added_by_rule: Optional[dict] = None,
     closed_rules: Optional[set] = None,
     manual_locked: Optional[set] = None,
     manual_pending: Optional[set] = None,
+    price_locked: Optional[set] = None,
 ) -> tuple[list[dict], list[dict]]:
     """逐条规则、逐字段比对。
 
@@ -291,11 +389,15 @@ def reconcile_rules(
     manual_pending：手动分散仓**挂单在盘上**的规则类型。客户在这期间把手动单
                    删掉时，节点会撤掉盘上那张挂单——这里给出逐字段结论，
                    让客户知道「保存后那张单会被撤掉」。
+    price_locked  ：**已成交**的指定价档位（(规则类型, 档位下标) 集合）。
+                   这些档位的入场价 / 自有止损 / 止盈价已锁定在已开仓位上，
+                   改配置不影响已开仓位；在途未成交的不锁（可改 → 撤单重挂）。
     """
     added_by_rule = added_by_rule or {}
     closed_rules = closed_rules or set()
     manual_locked = manual_locked or set()
     manual_pending = manual_pending or set()
+    price_locked = price_locked or set()
     out: list[dict] = []
 
     old_list = [r for r in (old_rules or []) if isinstance(r, dict)]
@@ -334,16 +436,22 @@ def reconcile_rules(
             applied_rule["type"] = old_rule.get("type")
 
         # 上限类字段
+        #
+        # 配置无条件热推：**字段值一律采纳用户填的新值**，不再保留旧上限。
+        # 「还加不加」由节点自己的已开笔数决定——判定侧现成的
+        # `rule_adds >= limit` 就会自然停止；本分支只负责把结论说清楚。
         for field in LIMIT_FIELDS:
             old_v = _limit_value(old_rule, field)
             new_v = _limit_value(new_rule, field)
             if not _changed(old_v, new_v):
                 continue
             added = _as_int(added_by_rule.get(rule_type), 0)
+            applied_rule[field] = new_v
             if rule_type in closed_rules:
                 out.append({
                     "field": f"{path}.{field}",
                     "status": "no_effect",
+                    "exec": EXEC_NO_MORE_ADDS,
                     "old": old_v,
                     "new": new_v,
                     "message": (
@@ -351,32 +459,43 @@ def reconcile_rules(
                         f"调整{field}不会新增批次"
                     ),
                 })
-                # 加仓已收口：改上限不产生效果，但保留新值（下次新建任务时生效）
-            elif new_v and added and new_v < added:
-                out.append({
-                    "field": f"{path}.{field}",
-                    "status": "frozen",
-                    "old": old_v,
-                    "new": new_v,
-                    "message": (
-                        f"{label}已开 {added} 笔，新上限 {new_v} 笔低于已开笔数，"
-                        f"本任务不再加仓；已开仓位保持不动"
-                    ),
-                })
-                # 低于已开笔数：保留旧上限，避免把任务推进非法状态
-                applied_rule[field] = old_v
-            else:
-                extra = ""
-                if new_v and added:
-                    extra = f"，本任务还能再开 {max(0, new_v - added)} 笔"
+            elif new_v <= 0:
+                # 0 = 不限
                 out.append({
                     "field": f"{path}.{field}",
                     "status": "applied",
+                    "exec": EXEC_WILL_ADD,
                     "old": old_v,
                     "new": new_v,
                     "message": (
-                        f"{label}上限已从 {old_v} 调整为 {new_v}{extra}；"
-                        f"已开仓位保持不动"
+                        f"{label}上限已从 {old_v} 调整为不限（0）；"
+                        f"本任务按规则继续加仓"
+                    ),
+                })
+            elif new_v > added:
+                out.append({
+                    "field": f"{path}.{field}",
+                    "status": "applied",
+                    "exec": EXEC_WILL_ADD,
+                    "old": old_v,
+                    "new": new_v,
+                    "message": (
+                        f"{label}上限已从 {old_v} 调整为 {new_v}，"
+                        f"本任务已加 {added} 笔，还能再开 {new_v - added} 笔"
+                    ),
+                })
+            else:
+                # 新上限 ≤ 已开笔数：配置照常采纳，但节点不会再新增批次。
+                # 已开仓位保持不动，继续由止盈止损管理。
+                out.append({
+                    "field": f"{path}.{field}",
+                    "status": "no_effect",
+                    "exec": EXEC_NO_MORE_ADDS,
+                    "old": old_v,
+                    "new": new_v,
+                    "message": (
+                        f"{label}上限 {new_v} 笔 ≤ 已开 {added} 笔，"
+                        f"本任务不再新增批次；现有 {added} 笔继续由止盈止损管理"
                     ),
                 })
 
@@ -386,8 +505,10 @@ def reconcile_rules(
             out.append({
                 "field": f"{path}.manual_scatter",
                 "status": "locked",
+                "exec": EXEC_LOCKED_BY_MANUAL,
                 "message": (
-                    f"{label}手动分散仓已成交，配置锁定，不影响已开仓位"
+                    f"{label}手动分散仓已成交，配置已保存并热推，"
+                    f"但节点不再执行这部分改动；已开仓位不受影响"
                 ),
             })
             applied_rule["manual_scatter"] = dict(_manual_cfg(old_rule))
@@ -420,20 +541,51 @@ def reconcile_rules(
             seen_pl.add(key)
             out.append(pl_field)
 
+        # 指定价档位：在途未成交的可改（撤单重挂），已成交的锁定。
+        price_fields = _price_level_fields(
+            old_rule, new_rule,
+            price_locked=price_locked, path=path, label=label,
+        )
+        if price_fields:
+            out.extend(price_fields)
+            # 锁定的档位：生效配置里保留旧值（已开仓位不受影响）
+            locked_idx = {
+                idx for (rt, idx) in price_locked if rt == rule_type
+            }
+            if locked_idx:
+                old_by_idx = {
+                    item["index"]: item["level"] for item in _price_level_cfg(old_rule)
+                }
+                levels = list(applied_rule.get("batch_levels") or [])
+                for idx in locked_idx:
+                    if idx >= len(levels) or idx not in old_by_idx:
+                        continue
+                    old_lv = dict(old_by_idx[idx])
+                    new_lv = dict(levels[idx])
+                    for field in ("price", "price_tp", "price_sl"):
+                        if field in old_lv:
+                            new_lv[field] = old_lv[field]
+                    levels[idx] = new_lv
+                applied_rule["batch_levels"] = levels
+
         effective.append(applied_rule)
 
-    # 旧有新无的规则被删了：锁定，保留旧规则
+    # 旧有新无的规则被删了：**采纳删除**。
+    # 该规则不再参与加仓判定，节点会把它的在途逆势限价单撤掉；
+    # 已开仓位照旧由止盈止损管理，**不平仓**。
     for rule_type, old_rule in old_by_type.items():
         if rule_type in new_by_type:
             continue
+        added = _as_int(added_by_rule.get(rule_type), 0)
         out.append({
             "field": f"rules[type={rule_type}]",
-            "status": "locked",
+            "status": "applied",
+            "exec": EXEC_WAITING_TP_SL if added else EXEC_NO_MORE_ADDS,
             "message": (
-                f"{rule_type_label(rule_type)}规则不允许在运行期删除"
+                f"{rule_type_label(rule_type)}规则已移除，不再参与加仓判定；"
+                f"已开 {added} 笔仓位继续由止盈止损管理，不平仓"
             ),
         })
-        effective.append(dict(old_rule))
 
     return out, effective
 
@@ -444,6 +596,7 @@ def reconcile_snapshot(
     closed_rules: Optional[set] = None,
     manual_locked: Optional[set] = None,
     manual_pending: Optional[set] = None,
+    price_locked: Optional[set] = None,
 ) -> tuple[list[dict], dict]:
     """整体快照的逐字段结论。
 
@@ -457,6 +610,7 @@ def reconcile_snapshot(
         closed_rules=closed_rules,
         manual_locked=manual_locked,
         manual_pending=manual_pending,
+        price_locked=price_locked,
     )
 
     effective = dict(new)
@@ -480,14 +634,14 @@ def reconcile_snapshot(
 def summarize(fields: list[dict]) -> str:
     """整体结论：全部生效 / 部分生效 / 被拒。
 
-    字段级 locked / frozen / no_effect 都只是「这个字段没按新值生效」，
-    不影响其它字段——所以整体是 partial，不是 rejected。
+    字段级 no_effect / locked 都只是「这个字段按新值采纳了，但节点当前状态
+    决定它不再产生动作」，不影响其它字段——所以整体是 partial，不是 rejected。
     整体 rejected 只发生在版本倒退、模式切换这类运行态整体不可用的情况，
     由调用方直接给出。
     """
     items = fields or []
     if not items:
         return "applied"
-    if any(f.get("status") in ("frozen", "no_effect", "locked") for f in items):
+    if any(f.get("status") in ("no_effect", "locked") for f in items):
         return "partial"
     return "applied"

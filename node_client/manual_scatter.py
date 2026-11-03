@@ -574,6 +574,52 @@ def compute_volume(
     return sized if sized > 0 else None
 
 
+def price_level_volume(
+    *,
+    entry: float,
+    tp_ref: float,
+    lot_pl_tiers: object,
+    tick_size: float,
+    tick_value: float,
+    volume_step: float = 0.01,
+    volume_min: float = 0.01,
+    volume_max: float = 100.0,
+    projected_pl: float = 0.0,
+) -> Optional[float]:
+    """指定价档位的手数：按阶梯止盈 1 的目标金额反推。
+
+    与手动分散仓的口径一致（见 `compute_volume`），只是入场价 / 止盈价
+    换成这一档自己的「指定价」与「止盈价」：
+
+    目标金额 = 分档批次1的 pl_amount − 存量仓位到该止盈价时的预估盈亏；
+    每手止盈 = |止盈价 − 指定价| / tick_size × tick_value；
+    手数 = 目标金额 / 每手止盈（向上取整到 step，再夹到 min/max）。
+
+    **止盈权威**：这一档成交后，它填的止盈价会接管该方向的止盈——
+    存量的止盈也全部对齐到它。所以「按这个价算账时，存量 + 这一档
+    刚好凑够阶梯 1 的目标金额」不是巧合，而是这套设计的直接结果：
+    价格打到该止盈价时，全场合计盈亏正好是阶梯 1 的目标金额。
+
+    算不出来（没填止盈价 / 阶梯止盈没启用 / 每手止盈为 0）时返回 None，
+    调用方据此跳过这一档（不挂单）——宁可少挂一档，也不能挂一个手数瞎猜的单。
+    """
+    target = tier0_pl_amount(lot_pl_tiers)
+    if target is None:
+        return None
+    per = profit_per_lot(entry, tp_ref, tick_size, tick_value)
+    if per <= 0:
+        return None
+    # 存量在止盈价时刻的预估盈亏：浮盈抵扣、浮亏补上
+    remaining = abs(target) - float(projected_pl or 0.0)
+    if remaining <= 0:
+        # 存量仓位在这个价已经赚到目标金额（或更多）：按最小手数开，
+        # 净额会略超目标，但这一档不能没有（大部队的止盈要在它出场时算它的份）。
+        return ceil_to_step(volume_min, volume_step, volume_min, volume_max)
+    raw = remaining / per
+    sized = ceil_to_step(raw, volume_step, volume_min, volume_max)
+    return sized if sized > 0 else None
+
+
 def extract_watches(rules: object) -> list[dict[str, Any]]:
     """启用中的手动分散仓监视项；规则 status=0 的忽略。顺势/逆势各至多一条。"""
     out: list[dict[str, Any]] = []

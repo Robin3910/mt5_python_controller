@@ -596,6 +596,32 @@ def _price_distance(amount: float, money_per_price: float) -> Optional[float]:
     return target / money_per_price
 
 
+def nearer_stop(side: str, own_sl: float, common_sl: float) -> float:
+    """指定价仓该带哪道止损：取离现价更近的那道。
+
+    MT5 一个持仓只有一个 SL，「两道止损」是节点侧模拟出来的：
+    - 指定价档位挂单时在 broker 侧写进了自己的止损（`own_sl`）；
+    - 大部队有一道共同止损（盈亏比 × 余额反推，`common_sl`）。
+
+    两者只能留一道，取**离现价更近**的那道：
+    - 自有止损通常更近（客户是按指定价算的），留它 = 客户真正想要的那道防线生效；
+    - 共同止损反而更近时，说明自有止损根本够不到，共同止损先被打掉 →
+      整个方向平掉，「自有止损触发后重算」这个场景自然不会发生，逻辑自洽。
+
+    多单取更高（离现价更近），空单取更低。
+    """
+    own = _as_float(own_sl, 0.0)
+    common = _as_float(common_sl, 0.0)
+    if own <= 0:
+        return common
+    if common <= 0:
+        return own
+    side = str(side or "").strip().upper()
+    if side == "BUY":
+        return max(own, common)
+    return min(own, common)
+
+
 def plan_common_stops(
     positions: list | None,
     *,
@@ -608,6 +634,8 @@ def plan_common_stops(
     bid: float = 0.0,
     ask: float = 0.0,
     fallback_price: float = 0.0,
+    own_sl_by_ticket: dict | None = None,
+    tp_override: dict | None = None,
 ) -> list[dict]:
     """按方向算共同止盈和/或止损。
 
@@ -615,12 +643,36 @@ def plan_common_stops(
     距离 D = 金额 / ((tick_value / tick_size) × Σ手数)。
     止盈金额来自分档批次1，且该方向总手数达到 tp_min_lot 才计算；止损金额来自盈亏比 × 余额。
     多单止盈在 W 之上、止损在 W 之下；空单相反。
+
+    `own_sl_by_ticket`：指定价档位持仓的**自有止损**（票号 → 止损价）。
+    传入后会额外产出 `sl_by_ticket`：票号 → 这一票该带哪道止损。
+    取「离现价更近的那道」（见 `nearer_stop`）：
+    - 自有止损更近 → 记自有止损价；
+    - 共同止损更近 → 记共同止损价。
+
+    两道止损只能留一道（MT5 一个持仓只有一个 SL），所以每轮都**显式写死**
+    该留的那道，而不是「沿用持仓现值」——沿用会让上一轮写上去的共同止损
+    留下来，自有止损再也切不回来。
+
+    `tp_override`：方向 → 止盈权威价（指定价档位成交后由它的 `price_tp` 接管）。
+    某一方向有权威价时，**该方向的止盈直接用这个绝对价**，不再按
+    「加权均价 + 阶梯金额」反推——权威价是用户填的绝对价位，与仓位构成无关，
+    加仓后它也不动。金额口径（tier1）仍然成立：手数就是按这个价反推出来的。
     """
     size = _as_float(tick_size, 0.0)
     value = _as_float(tick_value, 0.0)
     if size <= 0 or value <= 0:
         return []
-    if _price_distance(tp_amount or 0, 1) is None and _price_distance(sl_amount or 0, 1) is None:
+    own_map = own_sl_by_ticket if isinstance(own_sl_by_ticket, dict) else {}
+    override = tp_override if isinstance(tp_override, dict) else {}
+    # 权威止盈价也算「有东西可写」：它本身就是止盈，
+    # 不需要 tier1 金额（阶梯止盈没启用）也不需要止损金额。
+    has_override = any(_as_float(v, 0.0) > 0 for v in override.values())
+    if (
+        _price_distance(tp_amount or 0, 1) is None
+        and _price_distance(sl_amount or 0, 1) is None
+        and not has_override
+    ):
         return []
     grouped: dict[str, list[dict]] = {"BUY": [], "SELL": []}
     for pos in positions or []:
@@ -645,33 +697,75 @@ def plan_common_stops(
         money_per_price = (value / size) * volume
         if volume <= 0 or money_per_price <= 0:
             continue
-        d_tp = _price_distance(tp_amount or 0, money_per_price)
-        if d_tp is not None and volume + 1e-8 < max(0.0, _as_float(tp_min_lot, 0.0)):
+        # 止盈权威价：这一方向有指定价档位接管止盈 → 直接用那个绝对价，
+        # 不按「加权均价 + 阶梯金额」反推（金额口径已经体现在手数里）。
+        #
+        # 权威价与 `tp_amount`/`tp_min_lot` 的关系：权威价是**绝对价位**，
+        # 与总手数无关，所以 `tp_min_lot` 门槛对它不适用——
+        # 手数就是按这个价反推出来的，门槛早就体现在那一笔上了。
+        auth_tp = _as_float(override.get(side), 0.0)
+        if auth_tp > 0:
             d_tp = None
+        else:
+            d_tp = _price_distance(tp_amount or 0, money_per_price)
+            if d_tp is not None and volume + 1e-8 < max(0.0, _as_float(tp_min_lot, 0.0)):
+                d_tp = None
         d_sl = _price_distance(sl_amount or 0, money_per_price)
-        if d_tp is None and d_sl is None:
+        if auth_tp <= 0 and d_tp is None and d_sl is None:
             continue
         anchor = weighted / volume
         if side == "BUY":
-            tp = _round_price(anchor + d_tp, digits) if d_tp is not None else None
+            tp = auth_tp if auth_tp > 0 else (
+                _round_price(anchor + d_tp, digits) if d_tp is not None else None
+            )
             sl = _round_price(anchor - d_sl, digits) if d_sl is not None else None
         else:
-            tp = _round_price(anchor - d_tp, digits) if d_tp is not None else None
+            tp = auth_tp if auth_tp > 0 else (
+                _round_price(anchor - d_tp, digits) if d_tp is not None else None
+            )
             sl = _round_price(anchor + d_sl, digits) if d_sl is not None else None
         market = _market_for_side(side, bid=bid, ask=ask, fallback=fallback_price)
+        # 指定价档位的逐票止损：取更近的那道。
+        #
+        # 「更近」的口径是**止损价的高低**（多单取更高、空单取更低）——
+        # 与 `nearer_stop` 的口径一致：止损是保护价位的，多单的止损位越高，
+        # 行情回落时越先被打到，也就是「更近的那道防线」。
+        sl_by_ticket: dict[int, float | None] = {}
+        for pos in rows:
+            ticket = int(pos.get("ticket") or 0)
+            if ticket <= 0 or ticket not in own_map:
+                continue
+            own_sl = _as_float(own_map.get(ticket), 0.0)
+            if own_sl <= 0:
+                continue
+            picked = nearer_stop(side, own_sl, sl or 0.0)
+            # 「自有止损更近」→ **显式写自有止损**（不是「沿用持仓现值」）。
+            #
+            # 沿用现值是不对的：持仓上的 `sl` 可能是**共同止损**（上一轮
+            # 共同止损更近时写上去的）。那一轮改成共同止损后，这一轮又轮到
+            # 自有止损更近，沿用现值就会把共同止损留下来 —— 自有止损再也
+            # 回不来。显式写死才是幂等的：每一轮都按「哪道更近」重新决定。
+            sl_by_ticket[ticket] = picked
         plans.append({
-            "rule": RULE_LOT_PL_TIERS if d_tp is not None else RULE_FLOAT_PL_RATIO,
+            "rule": RULE_LOT_PL_TIERS if (d_tp is not None or auth_tp > 0) else RULE_FLOAT_PL_RATIO,
             "side": side,
             "sl": sl,
             "tp": tp,
             "weighted_open": anchor,
             "tp_distance": d_tp,
             "sl_distance": d_sl,
-            "amount": abs(_as_float(tp_amount, 0.0)) if d_tp is not None else None,
+            "amount": (
+                abs(_as_float(tp_amount, 0.0))
+                if (d_tp is not None or auth_tp > 0) else None
+            ),
             "sl_amount": abs(_as_float(sl_amount, 0.0)) if d_sl is not None else None,
             "volume": volume,
             "digits": max(0, int(digits)),
             "positions": rows,
+            # 指定价档位的逐票止损（票号 → 止损价 / None=沿用自有止损）
+            "sl_by_ticket": sl_by_ticket,
+            # 这一方向的止盈由指定价档位的 price_tp 接管（权威价）
+            "tp_authority": auth_tp if auth_tp > 0 else None,
             "crossed": _cross_side(side, sl, tp, market),
             # 两侧各自的越价情况：止盈和止损要分别决定写不写
             "crossed_sides": sorted(crossed_sides(side, sl, tp, market)),
@@ -722,12 +816,17 @@ def opening_stops(
     ask: float = 0.0,
     stops_level: int = 0,
     point: float = 0.0,
+    tp_override: dict | None = None,
 ) -> Optional[tuple[Optional[float], Optional[float]]]:
     """新开这一笔要带上的 (止损, 止盈)。
 
     预计成交价算进同方向加权开仓价，口径与事后改单相同。
     该方向不在分档范围内、或缺少价格 / 规格 / 金额时返回 None，调用方沿用原有止损止盈。
     返回元组时，其中的 None 表示这一侧不挂，避免非法价把整张市价单拒掉。
+
+    `tp_override`：方向 → 止盈权威价（指定价档位成交后由它的 `price_tp` 接管）。
+    新加的这一笔也要带同一个权威价——否则它会带一个按加权均价反推的止盈，
+    和其它持仓的权威止盈对不上。
     """
     action_side = str(side or "").upper()
     vol = _as_float(volume, 0.0)
@@ -738,8 +837,6 @@ def opening_stops(
     if selected == "buy" and action_side != "BUY":
         return None
     if selected == "sell" and action_side != "SELL":
-        return None
-    if _price_distance(tp_amount or 0, 1) is None and _price_distance(sl_amount or 0, 1) is None:
         return None
     book = filter_lot_side(positions, selected)
     book.append({"type": action_side, "volume": vol, "price_open": fill})
@@ -754,6 +851,7 @@ def opening_stops(
         bid=bid,
         ask=ask,
         fallback_price=fill,
+        tp_override=tp_override,
     )
     plan = next((row for row in plans if row.get("side") == action_side), None)
     if plan is None:

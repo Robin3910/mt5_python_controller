@@ -17,11 +17,19 @@ from strategy_rules import (
     deviation_points,
     evaluate,
     evaluate_rule,
+    is_price_level,
+    parse_price_level,
+    pick_batch_level,
+    pick_smc_level,
     plan_counter_limit,
     metric_key,
     parse_add_rule_type,
-    pick_batch_level,
-    pick_smc_level,
+    price_level_active,
+    price_level_comment,
+    price_level_order_key,
+    price_level_params,
+    price_level_tp_ok,
+    price_level_valid,
     range_adapt_enabled,
     resolve_threshold,
     rule_base_price,
@@ -161,7 +169,8 @@ def test_pick_batch_level_by_next_position_no():
     assert pick_batch_level(rule, 1)[1] == 0
     assert pick_batch_level(rule, 5)[1] == 1
     assert pick_batch_level(rule, 10)[1] == 2
-    assert pick_batch_level(rule, 11)[1] is None
+    # 超出所有档位 → 兜底沿用最后一档（不再返回 None）
+    assert pick_batch_level(rule, 11)[1] == 2
 
 
 def test_batch_level_params_apply_per_tier():
@@ -190,10 +199,32 @@ def test_total_lot_limit_caps_this_rule_adds():
     assert evaluate_rule(rule, ctx(add_count=9, price=2390.0)) is None
 
 
-def test_batch_enabled_but_out_of_levels_does_not_fallback():
-    """开了分批却超出所有档位区间时不应回落到基础参数继续加。"""
+def test_batch_enabled_but_out_of_levels_falls_back_to_last_level():
+    """档位没覆盖下一次加仓 → 沿用最后一档继续加，不静默卡死。
+
+    旧行为是 return None：用户以为「不限次数」，实际第 10 次之后永远不加。
+    现在沿用最后一档的参数（300 点 / 1.3 倍），并在决策里标记 level_fallback。
+    """
     rule = batched_counter_rule(total_lot_limit=0)
-    assert evaluate_rule(rule, ctx(add_count=10, price=2390.0)) is None
+    d = evaluate_rule(rule, ctx(add_count=10, price=2390.0))
+    assert d is not None, "档位未覆盖时不应静默卡死"
+    assert d.level_index == 2, "应沿用最后一档"
+    assert d.volume == 0.13
+    assert d.level_fallback is True
+
+
+def test_batch_level_not_covered_still_honors_limit():
+    """兜底沿用最后一档不能绕过上限：缩容后仍然不再加仓。"""
+    rule = batched_counter_rule(total_lot_limit=5)
+    assert evaluate_rule(rule, ctx(add_count=5, price=2390.0)) is None
+    assert evaluate_rule(rule, ctx(add_count=4, price=2390.0)) is not None
+
+
+def test_batch_level_covered_is_not_marked_fallback():
+    """正常命中档位时不该带兜底标记。"""
+    rule = batched_counter_rule()
+    d = evaluate_rule(rule, ctx(position_count=1, add_count=0, price=2399.0))
+    assert d.level_fallback is False
 
 
 def test_batch_action_can_differ_from_base_action():
@@ -889,4 +920,184 @@ def test_max_allow_num_is_per_rule():
         add_counts={RULE_TYPE_COUNTER: 1, RULE_TYPE_TREND: 3},
         add_count=4, price=2399.0,
     )) is None
+
+
+# --------------------------- 指定价档位（price level） ---------------------------
+def price_level_rule(level: dict, **kw):
+    """单档分批规则 + 指定价档位参数。"""
+    base = {"pos_from": 1, "pos_to": 4, "lot_times": 1.0, "extra_lot": 0.0}
+    base.update(level)
+    return leveled_rule(base, **kw)
+
+
+def test_is_price_level_requires_calc_type_and_entry():
+    assert is_price_level({"calc_type": "price", "price": 4400.0}) is True
+    assert is_price_level({"calc_type": "price", "price": 0}) is False
+    assert is_price_level({"calc_type": "point", "price": 4400.0}) is False
+    assert is_price_level({}) is False
+    assert is_price_level(None) is False
+
+
+def test_price_level_params_reads_entry_tp_and_own_sl():
+    params = price_level_params({
+        "calc_type": "price", "price": 4400.0,
+        "price_tp": 4500.0, "price_sl": 4300.0,
+    })
+    assert params == {"entry": 4400.0, "tp_ref": 4500.0, "own_sl": 4300.0}
+    # 缺字段时给 0，不报错
+    assert price_level_params({}) == {"entry": 0.0, "tp_ref": 0.0, "own_sl": 0.0}
+
+
+def test_price_level_active_needs_tp_ref():
+    """没有止盈价就算不出手数 → 这一档继续走老口径（向后兼容）。"""
+    assert price_level_active({"calc_type": "price", "price": 4400.0}) is False
+    assert price_level_active(
+        {"calc_type": "price", "price": 4400.0, "price_tp": 4500.0}
+    ) is True
+    # 入场价没填也不算
+    assert price_level_active(
+        {"calc_type": "price", "price": 0, "price_tp": 4500.0}
+    ) is False
+
+
+def test_price_level_tp_must_be_on_the_profit_side():
+    """止盈价必须在入场价的盈利侧：多单高于入场价、空单低于入场价。"""
+    # 多单：止盈价高于入场价 ✓
+    assert price_level_tp_ok("BUY", 2399.0, 2410.0) is True
+    # 多单：止盈价低于入场价 ✗（方向反了，手数公式的符号也反）
+    assert price_level_tp_ok("BUY", 2399.0, 2380.0) is False
+    # 空单：止盈价低于入场价 ✓
+    assert price_level_tp_ok("SELL", 2410.0, 2399.0) is True
+    # 空单：止盈价高于入场价 ✗
+    assert price_level_tp_ok("SELL", 2399.0, 2410.0) is False
+    # 止盈价与入场价相同 ✗（每手止盈为 0，手数算不出来）
+    assert price_level_tp_ok("BUY", 2400.0, 2400.0) is False
+    # 缺值 / 方向不明 ✗
+    assert price_level_tp_ok("BUY", 0.0, 2410.0) is False
+    assert price_level_tp_ok("BUY", 2399.0, 0.0) is False
+    assert price_level_tp_ok("", 2399.0, 2410.0) is False
+
+
+def test_price_level_valid_matches_side():
+    """`price_level_valid` 按方向判定止盈价是否成立。"""
+    level = {"calc_type": "price", "price": 2399.0, "price_tp": 2410.0}
+    assert price_level_valid(level, "BUY") is True
+    assert price_level_valid(level, "SELL") is False
+
+
+def test_price_level_gives_no_market_threshold():
+    """指定价档位走挂单到价成交，市价阈值必须是 0（否则会被市价路径重复命中）。"""
+    level = {"calc_type": "price", "price": 2399.0, "price_tp": 2410.0}
+    gap = resolve_threshold(RULE_TYPE_COUNTER, level, ctx(price=2399.5))
+    assert gap.points == 0.0
+    # 入场价仍要带出来：挂单计划要用它
+    assert gap.target_price == 2399.0
+
+
+def test_price_level_never_triggers_market_add():
+    """指定价档位不该被市价路径触发——挂单才是它的入口。"""
+    rule = price_level_rule({"calc_type": "price", "price": 2399.0, "price_tp": 2410.0})
+    assert evaluate_rule(rule, ctx(price=2399.0)) is None
+
+
+def test_legacy_price_level_keeps_old_spacing_semantics():
+    """存量配置（没填止盈参考价）行为不变：到价仍按偏离折算点数触发。"""
+    rule = price_level_rule({"calc_type": "price", "price": 2399.0})
+    assert evaluate_rule(rule, ctx(price=2399.5)) is None
+    d = evaluate_rule(rule, ctx(price=2399.0))
+    assert d is not None
+    assert (d.target_price, d.threshold) == (2399.0, 100)
+
+
+def test_trend_price_level_keeps_old_semantics():
+    """决策 3：顺势的指定价不改，仍按老口径到价市价触发。"""
+    rule = new_batched_rule(
+        rule_type=RULE_TYPE_TREND,
+        batch_levels=[{
+            "pos_from": 1, "pos_to": 2, "calc_type": "price",
+            "price": 2399.0, "price_tp": 2380.0,
+            "lot_times": 1.0, "extra_lot": 0,
+        }],
+    )
+    # 空单顺势：指定价要低于参考价（有利侧）
+    d = evaluate_rule(rule, ctx(price=2399.0, direction="SELL"))
+    assert d is not None
+    assert d.calc_type == "price"
+    assert d.threshold > 0
+
+
+def test_price_level_comment_round_trip():
+    """指定价档位的备注：R{1|2}L{档位号}X，能解析回来。"""
+    assert price_level_comment(1, 2) == "R1L2X"
+    assert price_level_comment(2, 0) == "R2L0X"
+    assert parse_price_level("R1L2X") == (1, 2)
+    assert parse_price_level("R2L0X") == (2, 0)
+
+
+def test_parse_price_level_ignores_legacy_comments():
+    """旧的 `R1L2P135`（间距口径=指定价）不是指定价档位。"""
+    assert parse_price_level("R1L2P135") is None
+    assert parse_price_level("R1L2D100") is None
+    assert parse_price_level("R3B") is None
+    assert parse_price_level("") is None
+    assert parse_price_level(None) is None
+
+
+def test_price_level_comment_is_recognized_by_add_rule_parser():
+    """指定价档位的备注也要能被加仓分类认出来（否则逆势计数会漏掉它）。"""
+    assert parse_add_rule_type("R1L2X") == RULE_TYPE_COUNTER
+    assert parse_add_rule_type("R2L2X") == RULE_TYPE_TREND
+
+
+def test_price_level_pending_key_recognizes_x_code():
+    """在途挂单的身份键要能认出 X（否则改了参数却判成「身份没变」）。"""
+    key = counter_pending_key("R1L2X", 0.1)
+    assert key == (0.1, 2, "price_level", "")
+    # 旧的 P 仍然是「指定价」这个间距口径，两者不能混
+    assert counter_pending_key("R1L2P135", 0.1) == (0.1, 2, "price", "")
+
+
+def test_price_level_order_key_identity():
+    """指定价档位挂单的身份：手数 + 档位号（入场价固定，不参与比较）。"""
+    assert price_level_order_key(2, 0.1) == (0.1, 2, "price_level", "")
+    # 手数变了 → 身份变了 → 要撤单重挂
+    assert price_level_order_key(2, 0.2) != price_level_order_key(2, 0.1)
+
+
+def test_batch_fallback_never_lands_on_price_level():
+    """兜底落点不能是指定价档位——否则用户没配的那一档会被挂出没预期的单。"""
+    rule = batched_counter_rule(batch_levels=[
+        # 档位0：间距型，覆盖第 1 次加仓
+        {"pos_from": 1, "pos_to": 1, "calc_type": "point", "point": 100,
+         "lot_times": 1.0, "extra_lot": 0},
+        # 档位1：指定价档位，覆盖第 2 次加仓
+        {"pos_from": 2, "pos_to": 2, "calc_type": "price", "price": 2399.0,
+         "price_tp": 2410.0, "lot_times": 1.0, "extra_lot": 0},
+    ])
+    # 第 3 次加仓没有档位覆盖 → 兜底往回找 → 跳过档位1（指定价）→ 落到档位0
+    level, idx = pick_batch_level(rule, 3)
+    assert level is not None
+    assert idx == 0
+    assert level["calc_type"] == "point"
+
+
+def test_batch_fallback_returns_none_when_only_price_levels():
+    """没有可兜底的间距型档位 → 不加仓（宁可不加，也不挂用户没预期的单）。"""
+    rule = batched_counter_rule(batch_levels=[
+        {"pos_from": 1, "pos_to": 1, "calc_type": "price", "price": 2399.0,
+         "price_tp": 2410.0, "lot_times": 1.0, "extra_lot": 0},
+    ])
+    level, idx = pick_batch_level(rule, 5)
+    assert level is None and idx is None
+
+
+def test_batch_fallback_can_land_on_legacy_price_level():
+    """存量配置里的指定价档位（没填止盈参考价）是**间距型**的，可以当兜底落点。"""
+    rule = batched_counter_rule(batch_levels=[
+        {"pos_from": 1, "pos_to": 1, "calc_type": "price", "price": 2399.0,
+         "lot_times": 1.0, "extra_lot": 0},
+    ])
+    level, idx = pick_batch_level(rule, 5)
+    assert level is not None
+    assert idx == 0
 

@@ -620,8 +620,6 @@ class NodeClient:
             await self._do_strategy_update(msg)
         elif cmd == "strategy_smc":
             await self._do_strategy_smc(msg)
-        elif cmd == "strategy_precheck":
-            await self._do_strategy_precheck(ws, msg)
         elif cmd == "cancel_pending":
             await self._do_cancel_pending(ws, msg)
         elif cmd == "cancel_pending_all":
@@ -902,48 +900,6 @@ class NodeClient:
             version = None
         outcome = runner.apply_strategy_detailed(snapshot, config_version=version)
         await runner.send_update_ack(outcome, config_version=version)
-
-    async def _do_strategy_precheck(self, ws, msg: dict) -> None:
-        """预检一份新策略快照：只算不改，回包给服务端做保存前的拦截。"""
-        req_id = str(msg.get("req_id") or "")
-        try:
-            task_id = int(msg.get("task_id"))
-        except (TypeError, ValueError):
-            task_id = 0
-        runner = self.runners.get(task_id) if task_id else None
-        snapshot = msg.get("strategy") if isinstance(msg.get("strategy"), dict) else {}
-
-        if runner is None or runner.done:
-            payload = {
-                "type": "strategy_precheck_result",
-                "data": {"req_id": req_id, "ok": True, "blocks": [], "message": ""},
-            }
-        else:
-            try:
-                result = await runner.precheck_strategy(snapshot)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("task %s precheck failed: %s", task_id, e)
-                payload = {
-                    "type": "strategy_precheck_result",
-                    "data": {
-                        "req_id": req_id, "error": f"预检失败：{e}",
-                        "ok": True, "blocks": [], "message": "",
-                    },
-                }
-            else:
-                payload = {
-                    "type": "strategy_precheck_result",
-                    "data": {
-                        "req_id": req_id,
-                        "ok": bool(result.get("ok")),
-                        "blocks": list(result.get("blocks") or []),
-                        "message": str(result.get("message") or ""),
-                    },
-                }
-        try:
-            await ws.send(json.dumps(payload))
-        except Exception as e:  # noqa: BLE001
-            logger.warning("strategy_precheck reply failed: %s", e)
 
     async def _do_strategy_smc(self, msg: dict) -> None:
         """热推本任务的 SMC 价位副本。离线期间的副本由 resume 带上，这里只更新在跑的任务。"""

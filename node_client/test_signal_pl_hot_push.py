@@ -11,7 +11,6 @@ import market_hub as mh
 from mock_mt5 import MockMT5Client
 
 import signal_pl as sp
-import strategy_precheck
 from strategy_runner import StrategyRunner
 
 MAGIC = 900000001
@@ -404,42 +403,6 @@ def test_stop_side_decision_keep_vs_close():
         "BUY", "sl", new_value=4450.0, positions=[], market=4400.0,
     )
     assert dec["action"] == "close"
-
-
-def test_precheck_describe_has_real_market():
-    text = strategy_precheck.describe_crossed({
-        "side": "BUY", "crossed": "tp", "crossed_sides": ["tp"],
-        "tp": 4410.0, "sl": None, "market": 4412.0,
-    })
-    assert "4412" in text
-    assert "现价 0" not in text
-
-
-def test_precheck_manual_authority_only_checks_stop():
-    """手动止盈权威在场：共同止盈不写，预检不该因为止盈越价而拦。"""
-    pos = [{"type": "BUY", "volume": 0.1, "price_open": 4400.0, "sl": 4390.0, "tp": 4410.0}]
-    rules = [{
-        "type": 1, "status": 1,
-        "float_pl_ratio": {
-            "enabled": True, "ratio": -20.0, "monitor_mode": "loop", "max_times": 1,
-        },
-        "lot_pl_tiers": {
-            "enabled": True, "batch_count": 2, "close_action": "all",
-            "tiers": [
-                {"min_lot": 0.1, "pl_amount": 50.0},
-                {"min_lot": 0.5, "pl_amount": 100.0},
-            ],
-        },
-    }]
-    common = {"tick_size": 0.01, "tick_value": 1.0, "digits": 2,
-              "bid": 4415.0, "ask": 4415.0, "fallback_price": 4415.0}
-    normal = strategy_precheck.check_sltp_crossed(pos, rules=rules, **common)
-    assert any(b["crossed"] == "tp" for b in normal), "无手动权威时应拦止盈越价"
-
-    manual = strategy_precheck.check_sltp_crossed(
-        pos, rules=rules, manual_authority=True, **common,
-    )
-    assert not any(b["crossed"] == "tp" for b in manual), "手动权威在场时不该拦共同止盈"
 
 
 def test_stop_side_decision_allow_keep_false_always_closes():

@@ -77,6 +77,7 @@ def test_limit_increase_is_applied():
     assert sr.summarize(fields) == "applied"
     assert effective["rules"][0]["total_lot_limit"] == 10
     assert "还能再开 7 笔" in fields[0]["message"]
+    assert fields[0]["exec"] == "will_add"
 
 
 def test_limit_decrease_above_added_is_applied():
@@ -87,16 +88,24 @@ def test_limit_decrease_above_added_is_applied():
     assert sr.summarize(fields) == "applied"
     assert effective["rules"][0]["total_lot_limit"] == 4
     assert "还能再开 1 笔" in fields[0]["message"]
+    assert fields[0]["exec"] == "will_add"
 
 
-def test_limit_below_added_is_frozen_and_keeps_old_value():
-    """缩容到 < 已开笔数：冻结，保留旧上限，不把任务推进非法状态。"""
+def test_limit_below_added_is_accepted_but_no_more_adds():
+    """缩容到 < 已开笔数：新值照样采纳，节点不再新增批次。
+
+    配置无条件热推：不保留旧上限（那等于偷偷改了用户填的 2），
+    判定侧现成的 `rule_adds >= limit` 会自然停止加仓。
+    """
     old = _snap([_rule(1, total_lot_limit=5)])
     new = _snap([_rule(1, total_lot_limit=2)])
     fields, effective = sr.reconcile_snapshot(old, new, added_by_rule={1: 3})
-    assert fields[0]["status"] == "frozen"
+    assert fields[0]["status"] == "no_effect"
+    assert fields[0]["exec"] == "no_more_adds"
     assert sr.summarize(fields) == "partial"
-    assert effective["rules"][0]["total_lot_limit"] == 5, "冻结时应保留旧上限"
+    assert effective["rules"][0]["total_lot_limit"] == 2, "新值必须被采纳，不能保留旧的 5"
+    assert "不再新增批次" in fields[0]["message"]
+    assert "止盈止损" in fields[0]["message"]
 
 
 def test_limit_zero_is_treated_as_unlimited():
@@ -105,6 +114,7 @@ def test_limit_zero_is_treated_as_unlimited():
     new = _snap([_rule(1, total_lot_limit=0)])
     fields, effective = sr.reconcile_snapshot(old, new, added_by_rule={1: 3})
     assert fields[0]["status"] == "applied"
+    assert fields[0]["exec"] == "will_add"
     assert effective["rules"][0]["total_lot_limit"] == 0
 
 
@@ -119,6 +129,7 @@ def test_limit_change_after_manual_closed_is_no_effect():
         old, new, added_by_rule={1: 3}, closed_rules={1},
     )
     assert fields[0]["status"] == "no_effect"
+    assert fields[0]["exec"] == "no_more_adds"
     assert sr.summarize(fields) == "partial"
     assert "加仓已收口" in fields[0]["message"]
 
@@ -213,14 +224,17 @@ def test_manual_removed_after_filled_stays_locked():
 # ----------------------------------------------------------------------
 # 规则增删
 # ----------------------------------------------------------------------
-def test_rule_deletion_is_locked_and_keeps_old_rule():
+def test_rule_deletion_is_applied_and_rule_disappears():
+    """删规则 = 采纳删除：该规则不再参与加仓判定，已开仓位不平仓。"""
     old = _snap([_rule(1), _rule(2)])
     new = _snap([_rule(1)])
-    fields, effective = sr.reconcile_snapshot(old, new)
-    locked = [f for f in fields if f["status"] == "locked"]
-    assert len(locked) == 1
-    assert "不允许在运行期删除" in locked[0]["message"]
-    assert len(effective["rules"]) == 2, "被删的规则应保留"
+    fields, effective = sr.reconcile_snapshot(old, new, added_by_rule={2: 3})
+    deleted = [f for f in fields if f["field"] == "rules[type=2]"]
+    assert len(deleted) == 1
+    assert deleted[0]["status"] == "applied"
+    assert "不再参与加仓判定" in deleted[0]["message"]
+    assert "不平仓" in deleted[0]["message"]
+    assert len(effective["rules"]) == 1, "被删的规则应从生效快照里消失"
 
 
 def test_new_rule_is_applied():
@@ -456,6 +470,108 @@ async def test_send_update_ack_emits_payload():
     assert data["config_version"] == 3
     assert data["result"] == "partial"
     assert data["fields"][0]["status"] == "locked"
+    # 回执顺带带上加仓进度
+    assert "progress" in data
+
+
+# ----------------------------------------------------------------------
+# 执行器：配置无条件热推
+# ----------------------------------------------------------------------
+def test_apply_strategy_takes_new_limit_below_added():
+    """上限缩到已开笔数以下：新值必须被采纳（不保留旧值）。
+
+    保留旧值等于偷偷改了用户填的数字，而判定侧现成的
+    `rule_adds >= limit` 会自然停止加仓。
+    """
+    sent: list = []
+    runner, _hub = _runner(sent)
+    runner.add_counts[1] = 3
+    outcome = runner.apply_strategy_detailed({
+        "template_id": "tpl_1",
+        "rules": [_rule(1, total_lot_limit=2)],
+    })
+    assert outcome["result"] == "partial"
+    assert outcome["fields"][0]["exec"] == "no_more_adds"
+    effective = runner.strategy["rules"][0]
+    assert effective["total_lot_limit"] == 2, "新值必须被采纳"
+
+
+def test_apply_strategy_marks_align_pending():
+    """热推后要立刻做一次加仓对齐（扩容不等价格触发）。"""
+    sent: list = []
+    runner, _hub = _runner(sent)
+    assert runner._add_align_pending is False
+    runner.apply_strategy_detailed({
+        "template_id": "tpl_1",
+        "rules": [_rule(1, total_lot_limit=8)],
+    })
+    assert runner._add_align_pending is True
+
+
+def test_add_progress_reports_level_and_remaining():
+    """进度上报：当前第几批、还能再加几笔、下一批参数。"""
+    sent: list = []
+    runner, _hub = _runner(sent)
+    runner.strategy = {
+        "template_id": "tpl_1",
+        "rules": [_rule(1, batch_enabled=True, total_lot_limit=5, batch_levels=[
+            {"pos_from": 1, "pos_to": 3, "point": 100, "lot_times": 1.1, "extra_lot": 0},
+            {"pos_from": 4, "pos_to": 5, "point": 200, "lot_times": 1.2, "extra_lot": 0},
+        ])],
+    }
+    runner.add_counts[1] = 3
+    prog = runner._add_progress()["1"]
+    assert prog["added"] == 3
+    assert prog["limit"] == 5
+    assert prog["remaining"] == 2
+    assert prog["current_level_index"] == 0
+    assert prog["next_level_index"] == 1
+    assert prog["next_gap_points"] == 200
+    # 手数 = 倍数 × 基础手数（0.1）+ 额外手数
+    assert abs(prog["next_volume"] - 0.12) < 1e-6
+
+
+def test_add_progress_remaining_is_minus_one_when_unlimited():
+    """上限 0（不限）时 remaining 必须是 -1，不能写 0（会误导成不能再加）。"""
+    sent: list = []
+    runner, _hub = _runner(sent)
+    runner.strategy = {
+        "template_id": "tpl_1",
+        "rules": [_rule(1, batch_enabled=True, total_lot_limit=0, batch_levels=[
+            {"pos_from": 1, "pos_to": 3, "point": 100, "lot_times": 1.1, "extra_lot": 0},
+        ])],
+    }
+    runner.add_counts[1] = 1
+    prog = runner._add_progress()["1"]
+    assert prog["limit"] == 0
+    assert prog["remaining"] == -1
+
+
+def test_snapshot_includes_add_progress():
+    """_snapshot 里带 add_progress（心跳上报要用）。"""
+    sent: list = []
+    runner, _hub = _runner(sent)
+    snap = runner._snapshot([])
+    assert "add_progress" in snap
+
+
+def test_counter_no_next_reason_distinguishes_limit():
+    """撤单原因要区分「上限已低于已开笔数」与「档位用尽」。"""
+    sent: list = []
+    runner, _hub = _runner(sent)
+    runner.strategy = {
+        "template_id": "tpl_1",
+        "rules": [_rule(1, total_lot_limit=2)],
+    }
+    runner.add_counts[1] = 3
+
+    class _Ctx:
+        def rule_add_count(self, rt):
+            return 3
+
+    reason = runner._counter_no_next_reason(_Ctx())
+    assert "不再新增批次" in reason
+    assert "上限" in reason
 
 
 # ----------------------------------------------------------------------
@@ -567,3 +683,86 @@ def test_pl_config_deduped_across_rules():
     ])
     fields, _effective = sr.reconcile_snapshot(old, new)
     assert len(_pl_fields(fields, "rules[float_pl_ratio].ratio")) == 1
+
+
+# --------------------------- 指定价档位的锁定 ---------------------------
+def _price_level_rule(rule_type: int = 1, **over) -> dict:
+    """带一个指定价档位的规则。"""
+    rule = _rule(rule_type, batch_enabled=True, batch_count=1, batch_levels=[{
+        "pos_from": 1, "pos_to": 5, "calc_type": "price",
+        "price": 4390.0, "price_tp": 4410.0, "price_sl": 4380.0,
+        "lot_times": 1.0, "extra_lot": 0.0,
+    }])
+    rule.update(over)
+    return rule
+
+
+def test_price_level_change_is_applied_when_still_pending():
+    """在途未成交 → 改动采纳（节点会撤单重挂）。"""
+    old = _snap([_price_level_rule()])
+    new = _snap([_price_level_rule(batch_levels=[{
+        "pos_from": 1, "pos_to": 5, "calc_type": "price",
+        "price": 4380.0, "price_tp": 4410.0, "price_sl": 4380.0,
+        "lot_times": 1.0, "extra_lot": 0.0,
+    }])])
+    fields, effective = sr.reconcile_snapshot(old, new)
+    hits = [f for f in fields if f.get("field", "").endswith("batch_levels[0].price")]
+    assert len(hits) == 1
+    assert hits[0]["status"] == "applied"
+    assert "撤掉盘上的挂单" in hits[0]["message"]
+    # 生效配置用新值
+    assert effective["rules"][0]["batch_levels"][0]["price"] == 4380.0
+
+
+def test_price_level_change_is_locked_after_fill():
+    """已成交 → 改动锁定，不影响已开仓位。"""
+    old = _snap([_price_level_rule()])
+    new = _snap([_price_level_rule(batch_levels=[{
+        "pos_from": 1, "pos_to": 5, "calc_type": "price",
+        "price": 4380.0, "price_tp": 4410.0, "price_sl": 4380.0,
+        "lot_times": 1.0, "extra_lot": 0.0,
+    }])])
+    fields, effective = sr.reconcile_snapshot(
+        old, new, price_locked={(1, 0)},
+    )
+    hits = [f for f in fields if f.get("field", "").endswith("batch_levels[0].price")]
+    assert len(hits) == 1
+    assert hits[0]["status"] == "locked"
+    assert hits[0]["exec"] == sr.EXEC_LOCKED_BY_PRICE_LEVEL
+    # 生效配置保留旧值（已开仓位不受影响）
+    assert effective["rules"][0]["batch_levels"][0]["price"] == 4390.0
+
+
+def test_price_level_locked_only_applies_to_locked_levels():
+    """锁定的只有那一档；没成交的档位照样能改。"""
+    old = _snap([_price_level_rule()])
+    new = _snap([_price_level_rule(batch_levels=[{
+        "pos_from": 1, "pos_to": 5, "calc_type": "price",
+        "price": 4380.0, "price_tp": 4410.0, "price_sl": 4380.0,
+        "lot_times": 1.0, "extra_lot": 0.0,
+    }])])
+    # 锁的是档位1（不存在），档位0 没锁
+    fields, effective = sr.reconcile_snapshot(
+        old, new, price_locked={(1, 1)},
+    )
+    hits = [f for f in fields if f.get("field", "").endswith("batch_levels[0].price")]
+    assert len(hits) == 1
+    assert hits[0]["status"] == "applied"
+    assert effective["rules"][0]["batch_levels"][0]["price"] == 4380.0
+
+
+def test_price_level_stop_loss_change_is_locked_after_fill():
+    """已成交档位的自有止损也锁定（它是那笔仓位上的防线）。"""
+    old = _snap([_price_level_rule()])
+    new = _snap([_price_level_rule(batch_levels=[{
+        "pos_from": 1, "pos_to": 5, "calc_type": "price",
+        "price": 4390.0, "price_tp": 4410.0, "price_sl": 4370.0,
+        "lot_times": 1.0, "extra_lot": 0.0,
+    }])])
+    fields, effective = sr.reconcile_snapshot(
+        old, new, price_locked={(1, 0)},
+    )
+    hits = [f for f in fields if f.get("field", "").endswith("batch_levels[0].price_sl")]
+    assert len(hits) == 1
+    assert hits[0]["status"] == "locked"
+    assert effective["rules"][0]["batch_levels"][0]["price_sl"] == 4380.0

@@ -660,8 +660,12 @@ export interface StrategyBatchLevel {
   calc_type: BatchCalcType
   /** calc_type=point 时的触发点数 */
   point: number
-  /** calc_type=price 时的绝对价位 */
+  /** calc_type=price 时的绝对价位；指定价档位下它就是这一档的入场价 */
   price: number
+  /** 指定价档位的止盈价：成交后接管该方向的止盈（存量一起对齐到它） */
+  price_tp?: number
+  /** 指定价档位的自有止损（绝对价位），0=不设；成交后锁定 */
+  price_sl?: number
   /** atr / range 的统计周期，或 SMC 标识用来匹配推送的周期 */
   timeframe: BatchTimeframe
   /** 波幅间距是否纳入当前未收盘 K 线的实时高低差（仅逆势可用） */
@@ -883,7 +887,36 @@ export interface StrategyRuntimeHints {
   manual_state?: Record<string, ManualScatterState>
   /** 键是规则类型字符串，值是挂单被撤销的原因 */
   manual_off_reason?: Record<string, ManualScatterOffReason>
+  /** 键是规则类型字符串，值是该规则的加仓进度 */
+  add_progress?: Record<string, StrategyAddProgress>
   nodes_offline: number
+}
+
+/**
+ * 一条规则的加仓进度：加到第几批、还能再加几笔、下一批按什么参数加。
+ * 键是规则类型字符串（"1" 逆势 / "2" 顺势）。
+ */
+export interface StrategyAddProgress {
+  /** 已加仓笔数（不含开仓、不含手动仓） */
+  added: number
+  /** 当前生效的上限；0 = 不限 */
+  limit: number
+  /** 还能再加几笔；-1 = 不限（limit 为 0 时） */
+  remaining: number
+  /** 该规则是否已收口（手动分散仓已成交） */
+  closed?: boolean
+  /** 当前处在第几批（档位序号，从 0 起）；-1 = 还没加过 */
+  current_level_index: number
+  /** 当前批覆盖的加仓次数区间 */
+  current_level_range?: [number, number]
+  /** 下一批的档位序号；-1 = 没有下一批 */
+  next_level_index: number
+  /** 下一批覆盖的加仓次数区间 */
+  next_level_range?: [number, number]
+  /** 下一批的间距（点数口径） */
+  next_gap_points: number
+  /** 下一批的手数 */
+  next_volume: number
 }
 
 export interface StrategyCreatePayload {
@@ -1022,6 +1055,12 @@ export interface StrategyUpdateField {
   new?: unknown
   /** 人类可读的说明 */
   message?: string
+  /**
+   * 本字段带来的执行结论：
+   * will_add=还能继续加 / no_more_adds=已达上限不再加 /
+   * waiting_tp_sl=等止盈止损 / locked_by_manual=被手动单锁定
+   */
+  exec?: string
 }
 
 /** 事件的计算依据明细。字段随 kind 不同 */
@@ -1185,6 +1224,8 @@ export interface GroupTaskEventDetail {
   config_version?: number | null
   /** 逐字段结论 */
   fields?: StrategyUpdateField[]
+  /** 热推后的加仓进度：各规则加到第几批、还能再加几笔、下一批参数 */
+  progress?: Record<string, StrategyAddProgress>
   message_core?: string
   monitor_mode?: string
   item_id?: string

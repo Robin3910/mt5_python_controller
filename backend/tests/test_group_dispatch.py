@@ -633,6 +633,49 @@ async def test_manual_off_reason_reaches_runtime_hints(store, monkeypatch):
     assert hints["manual_off_reason"]["2"] == "removed", "撤销原因必须能进 hints"
 
 
+async def test_add_progress_reaches_runtime_hints(store, monkeypatch):
+    """加仓进度要一路送到 hints：前端据此显示「加到第几批、还能再加几笔」。
+
+    链路：节点上报 add_progress → 落 add_progress_json →
+    strategy_runtime_hints 汇总 → 前端读 add_progress。
+    """
+    await online(store, mk_node("nd_a"))
+    strategy = await mk_strategy(store, name="进度策略")
+    await mk_group(store, "进度组", ["nd_a"], strategy=strategy)
+    monkeypatch.setattr(manager, "send_to_node", capture_sender([]))
+    d = GroupDispatcher(store)
+    await d.dispatch(TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_prog")
+    task = (await fetch_tasks("sig_prog"))[0]
+    await open_first_orders(task.task_id, ["nd_a"])
+    row = (await fetch_dispatches(task.task_id))[0]
+
+    await group_persist.record_strategy_progress(
+        node_id="nd_a", dispatch_id=row.id, task_id=task.task_id,
+        data={
+            "event": "heartbeat", "phase": "running",
+            "add_counts": {"1": 3},
+            "add_progress": {
+                "1": {
+                    "added": 3, "limit": 5, "remaining": 2,
+                    "current_level_index": 1, "current_level_range": [3, 4],
+                    "next_level_index": 2, "next_level_range": [5, 5],
+                    "next_gap_points": 200.0, "next_volume": 0.15,
+                },
+            },
+        },
+    )
+    row = (await fetch_dispatches(task.task_id))[0]
+    assert row.add_progress_json, "add_progress 必须落库"
+
+    hints = await group_persist.strategy_runtime_hints(strategy["strategy_id"])
+    prog = hints["add_progress"]["1"]
+    assert prog["added"] == 3
+    assert prog["limit"] == 5
+    assert prog["remaining"] == 2
+    assert prog["next_level_index"] == 2
+    assert prog["next_gap_points"] == 200.0
+
+
 async def test_grid_signal_needs_no_stop_loss(store, monkeypatch):
     """网格不靠止损距离算手数，缺 sl 也照常下发（与模版2 相反）。"""
     await online(store, mk_node("nd_a"))

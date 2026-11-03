@@ -224,6 +224,37 @@ def test_batch_level_range_live_fields_are_persisted(client):
     assert level["range_live_refresh"] == 3
 
 
+def test_price_level_keeps_tp_reference_and_own_stop_loss(client):
+    """指定价档位的止盈参考价与自有止损要能原样存下来。"""
+    h = auth_headers(client)
+    level = _created_level(client, h, "指定价独立加仓", {
+        "calc_type": "price", "price": 2399.5,
+        "price_tp": 2410.0, "price_sl": 2390.0,
+    })
+    assert level["price"] == 2399.5
+    assert level["price_tp"] == 2410.0
+    assert level["price_sl"] == 2390.0
+
+
+def test_price_tp_and_sl_are_cleared_for_other_calc_types(client):
+    """非指定价档位：这两个字段一律清零（与「按 type 只保留该类型字段」一致）。"""
+    h = auth_headers(client)
+    level = _created_level(client, h, "点数策略带多余字段", {
+        "calc_type": "point", "point": 250,
+        "price_tp": 2410.0, "price_sl": 2390.0,
+    })
+    assert level["price_tp"] == 0
+    assert level["price_sl"] == 0
+
+
+def test_price_level_fields_default_to_zero(client):
+    """老配置没有这两个字段时默认补 0（不是 None）。"""
+    h = auth_headers(client)
+    level = _created_level(client, h, "老指定价策略", {"calc_type": "price", "price": 2399.5})
+    assert level["price_tp"] == 0
+    assert level["price_sl"] == 0
+
+
 def test_batch_level_range_live_defaults_to_off(client):
     """老配置没有这三个字段时补默认值，行为与上线前一致。"""
     h = auth_headers(client)

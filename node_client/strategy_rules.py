@@ -150,6 +150,8 @@ class AddDecision:
     smc_received_at: float = 0.0
     # 波幅纳入当前 K 线时的明细；未开启时为 None
     adapt: Optional[dict] = None
+    # 档位没覆盖下一次加仓 → 沿用了最后一档的参数（要告诉用户）
+    level_fallback: bool = False
 
     @property
     def event_type(self) -> str:
@@ -168,6 +170,56 @@ class AddDecision:
     def next_position_no(self) -> int:
         """本次加仓将成为该魔术号下的第几笔持仓（说明用）。"""
         return self.position_count + 1
+
+
+@dataclass
+class PriceLevelPlan:
+    """指定价档位的挂单计划。
+
+    与 `AddDecision` 的区别：指定价档位不是「现价偏离达到阈值后市价加仓」，
+    而是**挂一张单到指定价成交**——成交价正好等于指定价（不滑点），挂单自带
+    一道自己的止损，出场跟大部队的阶梯止盈。
+
+    字段与 `AddDecision` 对齐的部分保留同样的名字，便于共用说明生成与事件上报。
+    """
+
+    rule_type: int
+    level_index: int
+    action: str            # BUY / SELL
+    entry: float           # 入场价（= 档位的 price）
+    tp_ref: float          # 止盈价（= 档位的 price_tp）：反推手数 + 成交后接管该方向的止盈
+    own_sl: float          # 自有止损（= 档位的 price_sl），0 = 不设
+    volume: float
+    limit_kind: str        # "limit" | "stop"：按现价在入场价哪一侧决定
+    comment: str           # R1L2X
+    direction: str
+    base_price: float
+    price: float           # 现价
+    point: float
+    base_volume: float
+    lot_times: float
+    extra_lot: float
+    add_count: int
+    limit_kind_name: str   # total_lot_limit / max_allow_num
+    limit_value: int
+    position_count: int = 0
+    level_fallback: bool = False
+    # 手数是怎么算出来的（人话说明，随事件上报）
+    volume_formula: str = ""
+    # 每手止盈金额（入场价 → 止盈价），反推手数用
+    profit_per_lot: float = 0.0
+    # 反推手数用的 tier1 目标金额：手数是按它算的，
+    # 成交后立起「按指定价算止盈」分支时要记下它（分支价代表的金额）。
+    tier_amount: float = 0.0
+
+    @property
+    def type_label(self) -> str:
+        return "逆势加仓" if self.rule_type == RULE_TYPE_COUNTER else "顺势加仓"
+
+    @property
+    def next_rule_add_no(self) -> int:
+        """本次将是本规则的第几次加仓（从 1 起，不含开仓）。"""
+        return self.add_count + 1
 
 
 def _as_float(value: object, default: float = 0.0) -> float:
@@ -212,18 +264,175 @@ def rule_base_price(rule_type: int, ctx: PositionCtx) -> float:
     return ctx.base_price
 
 
+# ----------------------------------------------------------------------
+# 指定价档位：不是「间距口径」，而是一笔有独立入场价与自有止损的加仓单
+# ----------------------------------------------------------------------
+def is_price_level(level: dict) -> bool:
+    """这一档是不是「指定价档位」。
+
+    口径：calc_type=price 且入场价 > 0。
+
+    指定价档位与其它档位的差别（见 docs/superpowers/specs/2026-11-02-price-level-design.md）：
+    - 间距型档位靠「现价偏离达到阈值」触发；
+    - 指定价档位靠**挂单到价成交**触发，成交价正好等于指定价，
+      并且带一道自己的止损（`price_sl`）、出手数按阶梯止盈 1 的金额反推。
+    """
+    if not isinstance(level, dict):
+        return False
+    calc = str(level.get("calc_type") or "").strip().lower()
+    return calc == CALC_PRICE and _as_float(level.get("price"), 0.0) > 0
+
+
+def price_level_params(level: dict) -> dict:
+    """指定价档位的出场参数：入场价 / 止盈价 / 自有止损。
+
+    `tp_ref`（止盈价）有两个用途：
+    1. **反推手数**：这一档开多大，按阶梯止盈 1 的目标金额倒推；
+    2. **成交后接管该方向的止盈**：它是权威绝对价位，存量仓位的止盈
+       也全部对齐到它，价格打到它时全场合计盈亏正好是 tier1 金额。
+    """
+    src = level if isinstance(level, dict) else {}
+    return {
+        "entry": _as_float(src.get("price"), 0.0),
+        "tp_ref": _as_float(src.get("price_tp"), 0.0),
+        "own_sl": _as_float(src.get("price_sl"), 0.0),
+    }
+
+
+def price_level_tp_ok(side: str, entry: float, tp_ref: float) -> bool:
+    """指定价档位的止盈价是否落在**盈利侧**。
+
+    止盈价必须在入场价的盈利侧：多单 tp > entry，空单 tp < entry。
+
+    这不是「填没填错」的形式检查，而是**手数公式的前提**：
+    手数按 `|tp − entry|` 反推，止盈价在亏损侧时这个绝对值算出来的手数
+    是反的（挂上去方向与出场价对不上），所以这一档不能挂单。
+
+    与入场价相同也不成立（每手止盈为 0，手数算不出来）。
+    """
+    action = str(side or "").strip().upper()
+    entry_px = _as_float(entry, 0.0)
+    tp_px = _as_float(tp_ref, 0.0)
+    if action not in ("BUY", "SELL") or entry_px <= 0 or tp_px <= 0:
+        return False
+    if abs(tp_px - entry_px) < 1e-12:
+        return False
+    if action == "BUY":
+        return tp_px > entry_px
+    return tp_px < entry_px
+
+
+def price_level_active(level: dict) -> bool:
+    """这一档要走「指定价档位」的新执行路径吗？
+
+    需要三样齐全：
+    - `calc_type=price`（是指定价口径）；
+    - 入场价 > 0（指定价本身填了）；
+    - **止盈价 > 0**（没有它算不出手数——新路径的手数按阶梯止盈 1 的
+      目标金额反推）。
+
+    最后一条同时承担**向后兼容**的职责：存量配置里的 `calc_type=price` 档位
+    没有「止盈价」这个字段，它们一直是按「到价挂逆势限价」的老口径跑的。
+    这类档位继续走老口径，行为一个字都不变；只有填了止盈价的档位才切到
+    新路径（挂单到指定价成交 + 自有止损 + 按阶梯止盈 1 反推手数 +
+    成交后接管该方向的止盈）。
+
+    顺势加仓的指定价档位**永远走老口径**（决策 3：顺势不改）。
+    """
+    if not is_price_level(level):
+        return False
+    return price_level_params(level)["tp_ref"] > 0
+
+
+def price_level_valid(level: dict, side: str) -> bool:
+    """这一档的入场价 / 止盈价组合对该方向是否成立。
+
+    止盈价必须落在入场价的**盈利侧**且不等于入场价（见 `price_level_tp_ok`）。
+    不成立时这一档不挂单：方向定不下来，或每手止盈为 0，手数根本算不出来。
+    """
+    params = price_level_params(level)
+    return price_level_tp_ok(side, params["entry"], params["tp_ref"])
+
+
 def pick_batch_level(rule: dict, next_position_no: int) -> tuple[Optional[dict], Optional[int]]:
-    """按「本规则下一次加仓序号」命中分批档位；未启用或未命中返回 (None, None)。"""
+    """按「本规则下一次加仓序号」命中分批档位。
+
+    **兜底**：档位区间没覆盖到下一次加仓时（用户扩容忘了加档、手工改区间留了洞、
+    历史脏数据），回退到**最接近的档位**而不是 (None, None)。
+    原因：分批模式下没命中档位会让整条规则静默卡死——用户以为还有额度，
+    实际永远不再加仓。沿用相邻档位的参数至少让行为可预期（加出来的仓参数
+    可能不是最想要的，但节点会在事件里说明「沿用了档位#K」）。
+
+    兜底的落点：
+    - 下一次加仓在**所有档位之后**（扩容忘加档）→ 沿用**最后一档**
+    - 下一次加仓落在**两档之间的洞里** → 沿用**洞前面那一档**
+    - 下一次加仓在**第一档之前**（档位字面从 2 起步）→ 不兜底，返回 (None, None)
+      —— 这里必须尊重字面语义：用户把起点设在 2 就是说「第 1 次不要加」
+    - 档位列表为空 → 不兜底，返回 (None, None)
+    """
     if not rule.get("batch_enabled"):
         return None, None
-    for idx, level in enumerate(rule.get("batch_levels") or []):
-        if not isinstance(level, dict):
-            continue
+    levels = [lv for lv in (rule.get("batch_levels") or []) if isinstance(lv, dict)]
+    if not levels:
+        return None, None
+    for idx, level in enumerate(levels):
         lo = _as_int(level.get("pos_from"), 0)
         hi = _as_int(level.get("pos_to"), 0)
         if lo <= next_position_no <= hi:
             return level, idx
+    return _fallback_batch_level(levels, next_position_no)
+
+
+def _fallback_batch_level(
+    levels: list[dict], next_position_no: int,
+) -> tuple[Optional[dict], Optional[int]]:
+    """档位没命中时的兜底落点（见 `pick_batch_level` 的说明）。
+
+    **兜底落点不能是「指定价档位」**：指定价档位挂的是一张**指定价的单**，
+    兜底落上去等于用户没配这一档、节点却替他挂了一张他没预期的单。
+    所以兜底只在**间距型档位**里找：
+    - 落点在指定价档位 → 往回找最近的间距型档位；
+    - 往回找不到间距型档位 → 返回 (None, None)（这一笔不加）。
+
+    注意「指定价档位」用的是 `price_level_active` 而不是 `is_price_level`：
+    存量配置里的 `calc_type=price` 档位（没填止盈价）走的是老口径
+    ——它是**间距型**的（到价按偏离触发），当兜底落点是合法的。
+    """
+    first_from = _as_int(levels[0].get("pos_from"), 0)
+    if next_position_no < first_from:
+        # 在第一档之前：字面语义就是「这几次不加」，不兜底
+        return None, None
+    # 洞里 → 沿用洞前面那一档（pos_from <= 本次序号 的最后一档）
+    prev_idx = -1
+    for idx, level in enumerate(levels):
+        if _as_int(level.get("pos_from"), 0) <= next_position_no:
+            prev_idx = idx
+        else:
+            break
+    if prev_idx < 0:
+        prev_idx = 0
+    # 往回找最近的**间距型**档位
+    while prev_idx >= 0:
+        candidate = levels[prev_idx]
+        if not price_level_active(candidate):
+            return candidate, prev_idx
+        prev_idx -= 1
     return None, None
+
+
+def batch_level_is_fallback(rule: dict, next_position_no: int) -> bool:
+    """本次命中是不是「档位未覆盖 → 兜底沿用相邻档位」的结果。"""
+    if not rule.get("batch_enabled"):
+        return False
+    levels = [lv for lv in (rule.get("batch_levels") or []) if isinstance(lv, dict)]
+    if not levels:
+        return False
+    for level in levels:
+        lo = _as_int(level.get("pos_from"), 0)
+        hi = _as_int(level.get("pos_to"), 0)
+        if lo <= next_position_no <= hi:
+            return False
+    return _fallback_batch_level(levels, next_position_no)[0] is not None
 
 
 def parse_add_rule_type(comment: object) -> Optional[int]:
@@ -413,8 +622,8 @@ def resolve_threshold(rule_type: int, level: dict, ctx: PositionCtx) -> Threshol
 
     点数、指定价、ATR / 波幅，以及 SMC 价位，最后都归一到点数，后面的偏离比较共用一套逻辑：
     - 点数：配置值即阈值；
-    - 指定价：换算成该价位相对基准价的偏离，方向必须与本规则一致，否则等于要求
-      行情反向到价、永远不会成立，此时返回 0 表示本档不可用；
+    - 指定价：**不给阈值**——指定价档位靠挂单到价成交触发，不是市价触发
+      （阈值给 0 表示本档不可用于市价判定；`target_price` 仍带出指定价）；
     - ATR / 波幅：行情算出的价格距离除以 point 得到点数；
     - fvg / ob / pdz / fibo：从推送副本里选出一条价位，再按指定价同样折成偏离点数。
 
@@ -443,6 +652,20 @@ def resolve_threshold(rule_type: int, level: dict, ctx: PositionCtx) -> Threshol
         target = _as_float(level.get("price"), 0.0)
         if target <= 0:
             return Threshold(0.0, calc_type)
+        # **指定价档位（填了止盈价的那些）不产生可用的市价阈值**。
+        #
+        # 它们走的是「挂单到价成交」路径（成交价正好等于指定价），不是
+        # 「现价偏离达到阈值后市价成交」。这里若还给出阈值，市价判定与挂单
+        # 判定会同时命中同一档，手数被算两次。
+        #
+        # `target_price` 仍要带上：挂单计划要用它当入场价。
+        #
+        # 注意只对**逆势**生效：决策 3 说顺势的指定价不改，
+        # 顺势的指定价档位（哪怕填了止盈价）仍走老口径。
+        if rule_type == RULE_TYPE_COUNTER and price_level_active(level):
+            return Threshold(0.0, calc_type, target_price=target)
+        # 老口径（存量配置：没填止盈价）：到指定价的偏离折成点数，
+        # 方向必须与本规则一致，否则等于要求行情反向到价、永远不会成立。
         base = rule_base_price(rule_type, ctx)
         points = deviation_points(rule_type, ctx.direction, base, target, ctx.point)
         return Threshold(max(points, 0.0), calc_type, target_price=target)
@@ -478,6 +701,10 @@ class _AddPrep:
     rule_adds: int
     base: float
     volume: float
+    # 档位没覆盖下一次加仓 → 沿用了最后一档的参数（要告诉用户）
+    level_fallback: bool = False
+    # 这一档是「指定价档位」：走挂单到价成交，不参与市价偏离判定
+    price_level: bool = False
 
 
 def _prepare_rule(rule: dict, ctx: PositionCtx) -> Optional[_AddPrep]:
@@ -496,6 +723,13 @@ def _prepare_rule(rule: dict, ctx: PositionCtx) -> Optional[_AddPrep]:
     rule_adds = ctx.rule_add_count(rule_type)
     # 档位按「本规则第几次加仓」命中（从 1 起，开仓不占格）；pos_from 一律按字面解释
     level, level_index = pick_batch_level(rule, rule_adds + 1)
+    # 档位没覆盖到这一次加仓 → 兜底沿用最后一档，要让用户知道
+    level_fallback = batch_level_is_fallback(rule, rule_adds + 1)
+    # 指定价档位：走挂单到价成交路径，不参与市价偏离判定。
+    # 只对逆势规则生效（决策 3：顺势的指定价不改）。
+    price_level = (
+        rule_type == RULE_TYPE_COUNTER and price_level_active(level)
+    )
 
     if level is not None:
         # 分批模式：方向可独立配置，笔数上限用本规则已加次数，间距按档位解析
@@ -509,7 +743,10 @@ def _prepare_rule(rule: dict, ctx: PositionCtx) -> Optional[_AddPrep]:
         extra_lot = _as_float(level.get("extra_lot"), 0.0)
         limit_kind, limit_value = "total_lot_limit", limit
     else:
-        # 分批未启用（或已超出所有档位区间）：走基础参数 + 次数上限，基础参数只支持点数
+        # 分批开着但没法兜底：档位列表是空的，或下一次加仓落在第一档之前
+        # （用户把起点设在 2 就是说「第 1 次不要加」，字面语义优先）。
+        # 这两种情况都按「不加」处理，不回落到基础参数——基础参数只支持点数，
+        # 回落会让用户以为在按档位加仓。
         if rule.get("batch_enabled"):
             return None
         if not action_matches(rule.get("action"), ctx.direction):
@@ -522,10 +759,12 @@ def _prepare_rule(rule: dict, ctx: PositionCtx) -> Optional[_AddPrep]:
         extra_lot = _as_float(rule.get("extra_lot"), 0.0)
         limit_kind, limit_value = "max_allow_num", max_allow
 
-    if gap.points <= 0:
+    if gap.points <= 0 and not price_level:
         return None
+    # 指定价档位的手数不按档位倍率算（走「按阶梯止盈 1 金额反推」），
+    # 这里的 volume 只是占位：真正的手数由挂单计划用 manual_scatter 算。
     volume = round(lot_times * ctx.base_volume + extra_lot, 2)
-    if volume <= 0:
+    if volume <= 0 and not price_level:
         return None
     return _AddPrep(
         rule_type=rule_type,
@@ -538,6 +777,8 @@ def _prepare_rule(rule: dict, ctx: PositionCtx) -> Optional[_AddPrep]:
         rule_adds=rule_adds,
         base=rule_base_price(rule_type, ctx),
         volume=volume,
+        level_fallback=level_fallback,
+        price_level=price_level,
     )
 
 
@@ -574,6 +815,7 @@ def _build_decision(
         smc_side=gap.smc_side,
         smc_received_at=gap.smc_received_at,
         adapt=gap.adapt,
+        level_fallback=prep.level_fallback,
     )
 
 
@@ -589,15 +831,90 @@ def counter_limit_price(direction: str, base: float, point: float, gap: Threshol
     return base + distance
 
 
+def plan_price_level(
+    rule: dict, ctx: PositionCtx, *, level: dict, level_index: int,
+    volume: float, limit_kind: str, digits: int = 0, tier_amount: float = 0.0,
+) -> Optional[PriceLevelPlan]:
+    """组装指定价档位的挂单计划。
+
+    调用方（执行器）已经算好了手数与单型（限价 / 止损），这里只负责把它们
+    和档位参数拼成一份完整的计划，供下单与事件上报共用。
+
+    `limit_kind` 为 None（现价正好压在入场价上，两种单都挂不上）时返回 None，
+    调用方本拍跳过。
+
+    `tier_amount`：反推手数用的 tier1 目标金额。手数是按它算的，
+    成交后立起「按指定价算止盈」分支时要记下它（分支价代表的金额）。
+    """
+    if not limit_kind:
+        return None
+    params = price_level_params(level)
+    entry = params["entry"]
+    if entry <= 0 or volume <= 0:
+        return None
+    action = str(ctx.direction).upper()
+    limit_kind_name, limit_value = "total_lot_limit", 0
+    limit = _as_int(rule.get("total_lot_limit"), 0)
+    if limit:
+        limit_kind_name, limit_value = "total_lot_limit", limit
+    else:
+        limit_kind_name, limit_value = "max_allow_num", _as_int(rule.get("max_allow_num"), 0)
+    return PriceLevelPlan(
+        rule_type=RULE_TYPE_COUNTER,
+        level_index=level_index,
+        action=action,
+        entry=entry,
+        tp_ref=params["tp_ref"],
+        own_sl=params["own_sl"],
+        volume=round(float(volume), 2),
+        limit_kind=limit_kind,
+        comment=price_level_comment(RULE_TYPE_COUNTER, level_index),
+        direction=action,
+        base_price=rule_base_price(RULE_TYPE_COUNTER, ctx),
+        price=ctx.price,
+        point=ctx.point,
+        base_volume=ctx.base_volume,
+        lot_times=_as_float(level.get("lot_times"), 1.0),
+        extra_lot=_as_float(level.get("extra_lot"), 0.0),
+        add_count=ctx.rule_add_count(RULE_TYPE_COUNTER),
+        limit_kind_name=limit_kind_name,
+        limit_value=limit_value,
+        position_count=ctx.position_count,
+        # 反推手数用的 tier1 目标金额：手数是按它算的。
+        tier_amount=abs(_as_float(tier_amount, 0.0)),
+    )
+
+
+def describe_price_level(plan: PriceLevelPlan, *, verb: str) -> str:
+    """指定价档位的挂出 / 撤下说明（人话）。"""
+    sl_text = (
+        f"，自有止损 {_trim(plan.own_sl, 5)}"
+        if plan.own_sl > 0 else "，不设自有止损"
+    )
+    return (
+        f"指定价加仓 · 规则#{RULE_TYPE_COUNTER} · 分批档位#{plan.level_index}："
+        f"{verb} {plan.action} 挂单价 {_trim(plan.entry, 5)}"
+        f"（指定价，成交价正好等于它，不滑点）"
+        f"{sl_text}，止盈价 {_trim(plan.tp_ref, 5)}"
+        f"（成交后接管该方向的止盈：存量与它一起在这个价出场，"
+        f"合计正好是阶梯止盈1的目标金额），手数 {plan.volume}"
+    )
+
+
 def evaluate_rule(rule: dict, ctx: PositionCtx, rule_index: int = 0) -> Optional[AddDecision]:
     """单条规则的市价加仓判定；现价偏离不够返回 None。
 
     逆势的常态路径不走这里，见 plan_counter_limit。本函数仍保留逆势判定，
     供「偏离是否已经够」的单元测试使用。
     rule_index 是该规则在策略快照中的原始下标，只用于在说明里指明是哪条规则命中。
+
+    **指定价档位（填了止盈价的那些）永远不走市价路径**：
+    它们的入口是「挂单到指定价成交」，市价触发会让同一档被算两次手数。
     """
     prep = _prepare_rule(rule, ctx)
     if prep is None:
+        return None
+    if prep.price_level:
         return None
     moved = deviation_points(prep.rule_type, ctx.direction, prep.base, ctx.price, ctx.point)
     if moved < prep.gap.points:
@@ -678,7 +995,28 @@ _CALC_COMMENT_CODE = {
 }
 _COMMENT_CODE_CALC = {code: name for name, code in _CALC_COMMENT_CODE.items()}
 # 逆势挂单备注：R1、可选档位、计算方式字母，SMC 再接 8 位哈希。偏离数字不参与身份比较。
-_COUNTER_PENDING_RE = re.compile(r"^R1(?:L(\d+))?([DPAWFOZB])([0-9a-f]{8})?")
+_COUNTER_PENDING_RE = re.compile(r"^R1(?:L(\d+))?([DPAWFOZBX])([0-9a-f]{8})?")
+
+# 指定价档位的备注：R{1|2}L{档位号}X
+#
+# 与旧的 `R1L2P{数字}`（间距口径=指定价）**刻意区分**：
+#   - `P`：这一档靠「现价偏离达到指定价的距离」触发（旧的间距口径）；
+#   - `X`：这一档是**指定价档位**，靠挂单到价成交触发，成交价正好等于指定价。
+# 旧挂单 / 旧持仓按旧逻辑处理，新逻辑只认 `X`。
+PRICE_LEVEL_COMMENT_CODE = "X"
+CALC_PRICE_LEVEL = "price_level"
+# `X` 不在 _CALC_COMMENT_CODE 里（它不是「间距来历」，而是「指定价档位」标记），
+# 这里单独补一条映射，让 counter_pending_key 能把在途单还原成指定价档位的身份。
+_COMMENT_CODE_CALC[PRICE_LEVEL_COMMENT_CODE] = CALC_PRICE_LEVEL
+_PRICE_LEVEL_RE = re.compile(r"^R([12])L(\d+)X")
+
+
+def parse_price_level(comment: object) -> Optional[tuple[int, int]]:
+    """从持仓 / 挂单备注解析 (规则类型, 档位号)；不是指定价档位返回 None。"""
+    matched = _PRICE_LEVEL_RE.match(str(comment or "").strip())
+    if matched is None:
+        return None
+    return int(matched.group(1)), int(matched.group(2))
 
 
 def _trim(value: float, digits: int) -> str:
@@ -815,6 +1153,26 @@ def decision_comment(decision: AddDecision) -> str:
     else:
         parts.append(f"{code}{int(round(decision.deviation))}")
     return "".join(parts)[:MT5_COMMENT_LIMIT]
+
+
+def price_level_comment(rule_type: int, level_index: int) -> str:
+    """指定价档位的挂单 / 成交备注：R{1|2}L{档位号}X。
+
+    与 `decision_comment` 的 `P`（间距口径=指定价）刻意区分，见 `parse_price_level`。
+    """
+    parts = [f"R{int(rule_type)}", f"L{int(level_index)}", PRICE_LEVEL_COMMENT_CODE]
+    return "".join(parts)[:MT5_COMMENT_LIMIT]
+
+
+def price_level_order_key(level_index: int, volume: float) -> tuple:
+    """指定价档位挂单的身份：手数 + 档位号。
+
+    入场价固定（= 档位的 price），不参与身份比较；价格变了要靠撤单重挂，
+    不靠改价。身份里只有手数与档位号，是因为**只有这两个会变**：
+    - 手数：阶梯止盈 1 的金额改了 → 手数要重算；
+    - 档位号：用户改了档位区间 → 命中了别的档位。
+    """
+    return (round(float(volume), 2), int(level_index), CALC_PRICE_LEVEL, "")
 
 
 def counter_order_key(decision: AddDecision) -> tuple:

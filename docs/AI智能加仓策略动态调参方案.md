@@ -1,6 +1,10 @@
 # AI智能加仓策略 · 运行期动态调参技术方案
 
 > 状态：**已实施**（P0-0 ~ P3 全部落地并通过测试）
+> ⚠️ **v2 修订（2026-11-02）**：本文的「保存前拦截」与「缩容冻结」两条核心口径**已被推翻**。
+> 最新口径见 **[`docs/superpowers/specs/2026-11-02-hot-push-always-apply-design.md`](superpowers/specs/2026-11-02-hot-push-always-apply-design.md)**：
+> **配置无条件生效**（保存/下发零拦截），**节点自决是否继续加仓**（已超上限就停、等止盈止损）。
+> 本文以下章节保留为历史设计记录；与 v2 冲突处以 v2 为准。
 > 实施记录见 [§13 实施落地记录](#13-实施落地记录)
 > 适用模版：`tpl_1`「AI智能加仓策略」（规则 type=1 逆势加仓 / type=2 顺势加仓）
 > 关联代码：前端 `frontend/src/components/StrategyFormModal.vue`、`backend/app/strategies.py`、`backend/app/group_rules.py`、`backend/app/group_dispatcher.py`、`backend/app/group_persist.py`、`node_client/node_client.py`、`node_client/strategy_runner.py`、`node_client/strategy_rules.py`、`node_client/manual_scatter.py`、`node_client/signal_pl.py`
@@ -8,6 +12,10 @@
 ---
 
 ## 0. 已锁定的四条产品语义
+
+> ⚠️ 下表是 **v1 口径**。v2 修订后：
+> - 决策 1 → 「新值 ≥ 已开笔数才允许」**取消**；上限一律采纳，低于已开笔数时节点不再新增批次（回执 `no_effect` + `exec=no_more_adds`）。
+> - 决策 2 → 「保存时就拦截」**取消**；改为节点侧保留旧值 + 告警事件。
 
 本方案基于以下四条已确认的产品决策，后续所有设计围绕它们展开。
 | # | 决策 | 影响的设计 |
@@ -873,3 +881,63 @@ self._manual_fired |= manual_scatter.fired_rule_types(positions)
 
 §11 的「离线节点预校验」仍按方案默认处理（离线节点不阻断保存），等待需求方确认后再调整。
 §11 的「次数型浮盈」已按「热推保持已消耗次数」实现并写进回执。
+
+---
+
+## 14. v2 修订实施记录（2026-11-02 · 配置无条件热推）
+
+设计文档：[`docs/superpowers/specs/2026-11-02-hot-push-always-apply-design.md`](superpowers/specs/2026-11-02-hot-push-always-apply-design.md)
+实施计划：[`docs/superpowers/plans/2026-11-02-hot-push-always-apply-plan.md`](superpowers/plans/2026-11-02-hot-push-always-apply-plan.md)
+
+### 14.1 口径变更
+
+| v1 口径 | v2 口径 |
+|---|---|
+| 上限低于已开笔数 → 前端拒存 + 后端 400 `limit_below_added` | **一律保存、一律下发**；节点自行判断：已加 ≥ 上限 → 不再新增批次，回执 `no_effect` + `exec=no_more_adds` |
+| 保存前向节点发 `strategy_precheck`，有阻断项 → 400 | **预检链路整体删除**（后端 / 节点 / WS 三处） |
+| SL/TP 越价 → 保存时拒（400 `sltp_crossed`） | 节点侧保留旧值 + 告警事件；保存放行 |
+| 上限类字段在节点侧被标 `frozen`、保留旧值 | **`frozen` 退役**；上限类字段**一律采纳新值** |
+| 删除规则 → 保留旧规则并标 `locked` | **采纳删除**：该规则不再参与加仓判定；在途限价单撤掉；已开仓位不平仓 |
+| 档位没覆盖下一次加仓 → 节点静默卡死 | 节点**沿用相邻/最后一档**兜底；服务端**自动补齐**档位到覆盖上限 |
+| 热推后等价格触发才生效 | 热推后**下一拍立刻对齐**（扩容续挂下一档 / 缩容撤掉在途单） |
+| 前端只显示「已开笔数」 | 新增 **`add_progress`**：当前第几批、还能再加几笔、下一批间距与手数 |
+
+### 14.2 关键代码变更
+
+**后端**
+
+| 文件 | 变更 |
+|---|---|
+| `backend/app/strategies.py` | 删除 `limit_below_added` 400 分支与 `_precheck_running_tasks` 调用；PATCH 一律 200 |
+| `backend/app/strategy_precheck.py` | **删除** |
+| `backend/app/strategy_validate.py` | **删除** |
+| `backend/app/ws_gateway.py` | 删除 `strategy_precheck_result` 分支与 import |
+| `backend/app/group_rules.py` | 新增 `_ensure_batch_coverage`：档位自动补齐到覆盖 `[1, total_lot_limit]` |
+| `backend/app/group_persist.py` | `record_strategy_progress` / `record_strategy_update_ack` 落 `add_progress`；`strategy_runtime_hints` 合并 `add_progress` |
+| `backend/app/orm.py` / `backend/app/db.py` | `GroupTaskDispatch.add_progress_json` + 迁移 `_migrate_group_dispatch_add_progress` |
+
+**节点侧**
+
+| 文件 | 变更 |
+|---|---|
+| `node_client/strategy_reconcile.py` | 退役 `frozen`；上限类字段一律采纳新值；规则删除采纳；逐字段加 `exec` 结论（`will_add` / `no_more_adds` / `waiting_tp_sl` / `locked_by_manual`） |
+| `node_client/strategy_rules.py` | `pick_batch_level` 命中失败改为兜底（沿用相邻/最后一档），新增 `batch_level_is_fallback`；`_prepare_rule` 同步调整 |
+| `node_client/strategy_runner.py` | 新增 `_add_align_pending` / `_align_adds_after_update` / `_counter_no_next_reason` / `_add_progress` / `_level_at`；删除 `precheck_strategy` / `_precheck_sltp_crossed` |
+| `node_client/strategy_precheck.py` / `node_client/test_strategy_precheck.py` | **删除** |
+| `node_client/node_client.py` | 删除 `_do_strategy_precheck` |
+
+**前端**
+
+| 文件 | 变更 |
+|---|---|
+| `frontend/src/api/types.ts` | 新增 `StrategyAddProgress`；`StrategyRuntimeHints.add_progress`；`StrategyUpdateField.exec`；`GroupTaskEventDetail.progress` |
+| `frontend/src/components/StrategyFormModal.vue` | 删除 `limitFloor` 拦截，改为黄色提示 `formWarnings`；`ensureBatchCoverage` 自动追加档位；`runtimeBanner` 展示加仓进度 |
+| `frontend/src/views/GroupSignalsView.vue` | 回执渲染支持 `exec`；`no_effect` 文案改为「➖ 已保存，不再新增批次」；展示 `add_progress` |
+
+### 14.3 验证结果
+
+| 范围 | 结果 |
+|---|---|
+| `node_client` 单元测试 | **769 项全部通过** |
+| `backend` 单元测试 | **1032 项全部通过** |
+| 前端 `npm run build`（含 `vue-tsc --noEmit`） | 通过（0 错误） |

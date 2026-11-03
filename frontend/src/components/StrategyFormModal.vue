@@ -102,6 +102,14 @@ const editingTemplateName = ref('')
 const saving = ref(false)
 const formError = ref('')
 /**
+ * 保存前的**提醒**（不阻止保存）。
+ *
+ * 配置无条件热推：字段值一律采纳用户填的值，「加不加 / 怎么加」由节点
+ * 自身状态决定。所以「上限低于已开笔数」这类情况不再是错误，只是一条
+ * 提醒——告诉用户保存后会怎样，但拦不住他。
+ */
+const formWarnings = ref<string[]>([])
+/**
  * 运行态提示（编辑态从详情接口取）：在跑任务的已开笔数、手动仓是否已开。
  * 用来在保存前拦下「上限低于已开笔数」这类非法修改，并把锁定区标出来。
  */
@@ -287,7 +295,32 @@ const runtimeBanner = computed<{ title: string; lines: string[] } | null>(() => 
   }
   for (const [ruleType, added] of Object.entries(addedByRule.value)) {
     const label = RULE_TYPE_LABEL[Number(ruleType)] || `类型${ruleType}`
-    lines.push(`${label}已开 ${added} 笔，「最多加仓笔数」不能低于 ${added}。`)
+    lines.push(
+      `${label}已开 ${added} 笔：把「最多加仓笔数」改到 ${added} 以下也可以保存，` +
+        '保存后本任务不再新增批次，现有仓位继续由止盈止损管理。',
+    )
+  }
+  // 加仓进度：加到第几批、还能再加几笔、下一批按什么参数加
+  const progress = hints.add_progress || {}
+  for (const [ruleType, p] of Object.entries(progress)) {
+    const label = RULE_TYPE_LABEL[Number(ruleType)] || `类型${ruleType}`
+    const added = Number(p.added || 0)
+    const limit = Number(p.limit || 0)
+    const remaining = Number(p.remaining ?? -1)
+    const curIdx = Number(p.current_level_index ?? -1)
+    const nextIdx = Number(p.next_level_index ?? -1)
+    const nextGap = Number(p.next_gap_points || 0)
+    const nextVol = Number(p.next_volume || 0)
+    const parts: string[] = []
+    parts.push(limit > 0 ? `已加 ${added} / ${limit} 笔` : `已加 ${added} 笔（不限次数）`)
+    if (curIdx >= 0) parts.push(`当前第 ${curIdx + 1} 批`)
+    if (remaining === -1) parts.push('还能继续加')
+    else if (remaining > 0) parts.push(`还能再加 ${remaining} 笔`)
+    else parts.push('已到上限，不再新增批次')
+    if (nextIdx >= 0) {
+      parts.push(`下一批 ${nextGap} 点 × ${nextVol} 手`)
+    }
+    lines.push(`${label}加仓进度：${parts.join('，')}。`)
   }
   const fired = hints.manual_fired || []
   if (fired.length) {
@@ -471,7 +504,24 @@ const FIELD_HELP = {
     '可选 M1 / M5 / M15 / M30 / H1 / H4 / D1 / W1 / MN。',
   batch_price:
     '本档的指定价位（绝对价格）。逆势时多单需低于参考价、空单需高于参考价；' +
-    '顺势方向相反。价位方向不符或留空时本档不会触发。',
+    '顺势方向相反。价位方向不符或留空时本档不会触发。' +
+    '逆势时节点把这一档挂成限价/止损单，成交价**正好等于**指定价（不滑点）；' +
+    '顺势的指定价仍是「到价后市价成交」，成交价可能有滑点，不保证等于指定价。',
+  batch_price_tp:
+    '这一档的**止盈价**（绝对价格）。指定价档位成交后，它会**接管该方向的止盈**：' +
+    '本魔术号该方向的所有持仓（含之前已经开着的存量仓）的止盈统一对齐到这个价。' +
+    '因为这一档的手数就是按「阶梯止盈第 1 档的目标金额」反推出来的，' +
+    '所以价格打到这里出场时，全场合计盈亏正好等于第 1 档的目标金额。' +
+    '**这只是止盈计算里的一个分支、不是全局权威**：之后如果又加了别的仓' +
+    '（顺势 / 间距档 / 市价兜底），大部队的止盈点就重新按加权均价反推，' +
+    '这一档的仓位也会一起参与重算。' +
+    '止盈价必须落在入场价的**盈利侧**（多单高于入场价、空单低于入场价），' +
+    '否则方向对不上、手数算不出来，该档不会挂单。留空则无法算出手数，该档不会挂单。',
+  batch_price_sl:
+    '这一档**自己的止损**（绝对价格），0 = 不设。必须落在入场价的反方向，否则券商会拒掉整张挂单。' +
+    '成交后这一道止损会锁定，之后改配置不影响已开仓位。' +
+    '它与大部队的共同止损（信号盈亏比 × 余额）同时存在，**离现价更近的那道生效**。' +
+    '这一道被打掉后不收口：剩余仓位按新的加权均价与阶梯止盈金额重算 TP / SL 继续跑。',
   batch_timeframe:
     `统计 ATR / 波幅用的 K 线周期，固定取最近 ${BATCH_BAR_PERIOD} 根**已收盘** K 线（不含当前未走完的那根）。` +
     '算出的价格距离会换算成点数，再与实际偏离比较。' +
@@ -688,6 +738,9 @@ function cloneRules(rules: StrategyRule[]): EditableRule[] {
         range_include_live: lv.range_include_live ?? false,
         range_live_cap: lv.range_live_cap ?? RANGE_LIVE_CAP_DEFAULT,
         range_live_refresh: lv.range_live_refresh ?? RANGE_LIVE_REFRESH_DEFAULT,
+        // 指定价档位的止盈参考价与自有止损：老配置没有，补 0
+        price_tp: lv.price_tp ?? 0,
+        price_sl: lv.price_sl ?? 0,
       })),
       manual_scatter: r.manual_scatter?.enabled
         ? { ...defaultManualScatter(), ...r.manual_scatter, enabled: true }
@@ -935,6 +988,8 @@ type LevelParams = Pick<
   | 'calc_type'
   | 'point'
   | 'price'
+  | 'price_tp'
+  | 'price_sl'
   | 'timeframe'
   | 'range_include_live'
   | 'range_live_cap'
@@ -949,6 +1004,8 @@ function defaultLevelParams(index: number, prev?: StrategyBatchLevel): LevelPara
       calc_type: prev.calc_type || 'point',
       point: prev.point,
       price: prev.price ?? 0,
+      price_tp: prev.price_tp ?? 0,
+      price_sl: prev.price_sl ?? 0,
       timeframe: prev.timeframe || 'M5',
       // 存量配置原样带入，实际生效值由提交前的 normalizeRangeLive 统一归一
       range_include_live: prev.range_include_live ?? false,
@@ -962,6 +1019,8 @@ function defaultLevelParams(index: number, prev?: StrategyBatchLevel): LevelPara
     calc_type: 'point',
     point: 100 + index * 100,
     price: 0,
+    price_tp: 0,
+    price_sl: 0,
     timeframe: 'M5',
     range_include_live: false,
     range_live_cap: RANGE_LIVE_CAP_DEFAULT,
@@ -1054,11 +1113,43 @@ function onBatchMetaChange(r: EditableRule): void {
 
 /**
  * 当前该用哪种档位编辑模式。
- * 有在跑任务时一律 append——重新均分会改变后续加仓命中的档位参数，
- * 等于在运行中偷偷改了策略。空闲时 redistribute 更顺手。
+ *
+ * 原来是「有在跑任务时一律 append」（重新均分会改变后续加仓命中的档位参数，
+ * 等于在运行中偷偷改了策略）。现在配置无条件热推，均分出来的参数一样会生效，
+ * 所以两种模式都放开——但界面上要说明均分的影响，让用户自己选。
  */
 function batchEditMode(): BatchEditMode {
-  return hasRunningTask.value ? 'append' : 'redistribute'
+  return 'redistribute'
+}
+
+/**
+ * 档位区间没覆盖到新的加仓笔数上限时，自动在末尾补档。
+ *
+ * 补出来的参数沿用最后一档——用户扩容时最常见的意图就是「照着上一档继续加」。
+ * 服务端下发快照时也会做同样的补齐，这里的补是为了让界面上看到的就是最终会下发的。
+ */
+function ensureBatchCoverage(r: EditableRule): boolean {
+  if (!r.batch_enabled) return false
+  const limit = Math.floor(Number(r.total_lot_limit) || 0)
+  if (limit <= 0) return false
+  const levels = r.batch_levels
+  if (!levels.length) return false
+  const last = levels[levels.length - 1]
+  const covered = Math.max(
+    ...levels.map((lv) => Math.max(1, Math.floor(Number(lv.pos_to) || 1))),
+  )
+  if (covered >= limit) return false
+  // 末尾补档：沿用最后一档的参数，区间接续
+  const cursor = Math.max(covered + 1, 1)
+  for (let pos = cursor; pos <= limit; pos++) {
+    levels.push({
+      ...last,
+      pos_from: pos,
+      pos_to: pos,
+    })
+  }
+  r.batch_count = levels.length
+  return true
 }
 
 function syncBatchMetaFromLevels(r: EditableRule): void {
@@ -1678,15 +1769,6 @@ function validateRules(rules: EditableRule[]): string | null {
     if (r.lot_times < 0) return `${label}：倍数不能为负`
     if (r.extra_lot < 0) return `${label}：手数不能为负`
     if (r.max_allow_num < 0) return `${label}：次数不能为负`
-    // 上限不能低于该规则已开笔数：缩容只能缩减剩余额度，不能砍掉已开的仓。
-    // （后端 PATCH 会再兜底一次，这里是为了当场拦下，不让用户白等一次请求。）
-    const floor = limitFloor(r.type)
-    if (floor > 0) {
-      const limit = Math.floor(Number(r.total_lot_limit) || 0)
-      if (limit > 0 && limit < floor) {
-        return `${label}：已开 ${floor} 笔，最多加仓笔数不能低于已开笔数，请填写 ≥ ${floor} 的值`
-      }
-    }
     const ms = r.manual_scatter
     if (ms?.enabled) {
       if (!(ms.entry_price > 0) || !(ms.take_profit > 0)) {
@@ -1730,8 +1812,12 @@ function validateRules(rules: EditableRule[]): string | null {
         return `${at}：请选择 K 线周期`
       }
       if (lv.point < 0) return `${at}：点数不能为负`
-      if (lv.lot_times < 0) return `${at}：倍数不能为负`
-      if (lv.extra_lot < 0) return `${at}：手数不能为负`
+      // 指定价档位的手数不按「倍数 / 手数」算（走「按阶梯止盈 1 金额反推」），
+      // 这两个字段对它无效：表单里也不展示，不该拦保存。
+      if (lv.calc_type !== 'price') {
+        if (lv.lot_times < 0) return `${at}：倍数不能为负`
+        if (lv.extra_lot < 0) return `${at}：手数不能为负`
+      }
       // 波幅纳入当前 K 线：由表单自动决定并固定参数，这里只兜底检查一致性
       if (lv.range_include_live && !shouldAutoRangeLive(r, lv)) {
         return `${at}：只有逆势加仓的波幅档位才能纳入当前 K 线波幅`
@@ -1799,6 +1885,74 @@ interface PreparedStrategy {
   rules: StrategyRule[]
 }
 
+/**
+ * 收集保存前的提醒（不阻止保存）。
+ *
+ * 配置无条件热推之后，这些情况不再是「非法修改」，只是「保存后会发生什么」：
+ * - 上限低于已开笔数 → 本任务不再新增批次，现有仓位继续由止盈止损管理
+ * - 档位没覆盖到新的上限 → 自动补档（沿用最后一档参数）
+ * - 重切了档位 → 后续加仓命中的参数会变，已开仓位不受影响
+ */
+function collectWarnings(rules: EditableRule[]): string[] {
+  const out: string[] = []
+  for (const r of rules) {
+    const label = RULE_TYPE_LABEL[r.type] || `类型${r.type}`
+    if (isRiskSized(r) || isGrid(r)) continue
+    const floor = limitFloor(r.type)
+    const limit = Math.floor(Number(r.total_lot_limit) || 0)
+    if (floor > 0 && limit > 0 && limit < floor) {
+      out.push(
+        `${label}：已开 ${floor} 笔，新上限 ${limit} 笔低于已开笔数；` +
+          '保存后本任务不再新增批次，现有仓位继续由止盈止损管理（不平仓）。',
+      )
+    }
+    if (r.batch_enabled) {
+      const levels = r.batch_levels || []
+      if (levels.length && limit > 0) {
+        const covered = Math.max(
+          ...levels.map((lv) => Math.max(1, Math.floor(Number(lv.pos_to) || 1))),
+        )
+        if (covered < limit) {
+          out.push(
+            `${label}：档位只覆盖到第 ${covered} 次加仓，新上限 ${limit} 笔；` +
+              '已自动补档（沿用最后一档的参数），保存后节点会按补出来的档位继续加。',
+          )
+        }
+      }
+      // 指定价档位：缺止盈价就算不出手数，节点不会挂这一档的单。
+      // 这里只提示不拦保存（保存路径上不再有拦截），由用户决定要不要补。
+      levels.forEach((lv, i) => {
+        if (lv.calc_type !== 'price') return
+        if (!(lv.price > 0)) return
+        const tp = Number(lv.price_tp) || 0
+        if (!(tp > 0)) {
+          out.push(
+            `${label} 档位 ${i + 1}：指定价档位没有填止盈价，` +
+              '节点无法反推手数，这一档不会挂单（其它档位照常）。',
+          )
+          return
+        }
+        // 止盈价必须落在入场价的盈利侧，否则手数公式的符号是反的。
+        // 方向按分批方向判定：多单止盈价要高于入场价、空单要低于入场价。
+        const side = String(r.batch_action || '').toUpperCase()
+        const entry = Number(lv.price) || 0
+        if (side === 'BUY' && tp <= entry) {
+          out.push(
+            `${label} 档位 ${i + 1}：多单的止盈价 ${tp} 必须高于指定价 ${entry}，` +
+              '否则方向对不上、手数算不出来，这一档不会挂单。',
+          )
+        } else if (side === 'SELL' && tp >= entry) {
+          out.push(
+            `${label} 档位 ${i + 1}：空单的止盈价 ${tp} 必须低于指定价 ${entry}，` +
+              '否则方向对不上、手数算不出来，这一档不会挂单。',
+          )
+        }
+      })
+    }
+  }
+  return out
+}
+
 function prepareStrategy(): PreparedStrategy | null {
   if (!form.template_id) {
     showSaveError('请选择策略模版')
@@ -1822,6 +1976,12 @@ function prepareStrategy(): PreparedStrategy | null {
     showSaveError(rulesErr)
     return null
   }
+  // 档位没覆盖到新的上限 → 自动补档（不阻止保存，补完让用户看得见）
+  for (const r of form.rules) {
+    if (isRiskSized(r) || isGrid(r)) continue
+    ensureBatchCoverage(r)
+  }
+  formWarnings.value = collectWarnings(form.rules)
   if (isTpl1.value) {
     const plErr = validateSignalPl(signalPl)
     if (plErr) {
@@ -2734,8 +2894,9 @@ function resetRuleToTemplate(idx: number): void {
                         （分散仓 {{ r.batch_count }} · 手动分散仓 1）
                       </template>
                     </span>
+                    <!-- 手动单入口已下线：功能保留在节点侧（不再使用），前端不再提供入口 -->
                     <button
-                      v-if="!r.batch_enabled"
+                      v-if="false"
                       type="button"
                       class="btn-sm btn-ghost"
                       :disabled="r.manual_scatter.enabled || manualScatterLocked(r.type)"
@@ -2796,10 +2957,14 @@ function resetRuleToTemplate(idx: number): void {
                       <p v-if="r.manual_scatter.enabled" class="muted batch-split-hint">
                         分散仓加仓笔数 {{ Math.floor(r.total_lot_limit) }} · 手动分散仓 1
                       </p>
-                      <!-- 已开笔数下限提示：上限只能缩减剩余额度，不能砍掉已开的仓 -->
+                      <!-- 已开笔数提示：上限可以改到已开笔数以下，只是那样就不再新增批次 -->
                       <p v-if="limitFloor(r.type) > 0" class="muted batch-split-hint">
-                        已开 {{ limitFloor(r.type) }} 笔，剩余额度最多再开
-                        {{ Math.max(0, Math.floor(r.total_lot_limit) - limitFloor(r.type)) }} 笔
+                        已开 {{ limitFloor(r.type) }} 笔，
+                        <template v-if="Math.floor(r.total_lot_limit) > limitFloor(r.type)">
+                          还能再开
+                          {{ Math.floor(r.total_lot_limit) - limitFloor(r.type) }} 笔
+                        </template>
+                        <template v-else>保存后本任务不再新增批次，现有仓位继续由止盈止损管理</template>
                       </p>
                     </div>
                   </div>
@@ -2867,6 +3032,34 @@ function resetRuleToTemplate(idx: number): void {
                           step="0.00001"
                         />
                       </div>
+                      <div v-if="lv.calc_type === 'price'" class="field">
+                        <FormLabel
+                          :field-id="`rule-${idx}-lv-${li}-price-tp`"
+                          text="止盈价"
+                          :help="FIELD_HELP.batch_price_tp"
+                        />
+                        <input
+                          :id="`rule-${idx}-lv-${li}-price-tp`"
+                          v-model.number="lv.price_tp"
+                          type="number"
+                          min="0"
+                          step="any"
+                        />
+                      </div>
+                      <div v-if="lv.calc_type === 'price'" class="field">
+                        <FormLabel
+                          :field-id="`rule-${idx}-lv-${li}-price-sl`"
+                          text="自有止损"
+                          :help="FIELD_HELP.batch_price_sl"
+                        />
+                        <input
+                          :id="`rule-${idx}-lv-${li}-price-sl`"
+                          v-model.number="lv.price_sl"
+                          type="number"
+                          min="0"
+                          step="any"
+                        />
+                      </div>
                       <div v-else-if="isBarCalc(lv.calc_type) || isSmcCalc(lv.calc_type)" class="field">
                         <FormLabel
                           :field-id="`rule-${idx}-lv-${li}-tf`"
@@ -2903,7 +3096,9 @@ function resetRuleToTemplate(idx: number): void {
                           step="1"
                         />
                       </div>
-                      <div class="field">
+                      <!-- 指定价档位的手数不按「倍数 / 手数」算：走「按阶梯止盈 1
+                           金额反推」，这两个字段对它无效，展示出来只会误导。 -->
+                      <div v-if="lv.calc_type !== 'price'" class="field">
                         <FormLabel
                           :field-id="`rule-${idx}-lv-${li}-times`"
                           text="倍数"
@@ -2917,7 +3112,7 @@ function resetRuleToTemplate(idx: number): void {
                           step="0.01"
                         />
                       </div>
-                      <div class="field">
+                      <div v-if="lv.calc_type !== 'price'" class="field">
                         <FormLabel
                           :field-id="`rule-${idx}-lv-${li}-extra`"
                           text="手数"
@@ -2941,6 +3136,12 @@ function resetRuleToTemplate(idx: number): void {
                           删除
                         </button>
                       </div>
+                      <!-- 指定价档位不显示「倍数 / 手数」：手数是按阶梯止盈 1 的
+                           目标金额反推出来的，与这两个字段无关。独占一行说明。 -->
+                      <p v-if="lv.calc_type === 'price'" class="muted batch-level-note">
+                        手数按「阶梯止盈第 1 档的目标金额」反推：这一档成交后，
+                        到止盈价时全场合计盈亏正好等于该目标金额（存量浮盈抵扣、浮亏补上）。
+                      </p>
                     </div>
                     <div
                       v-if="r.manual_scatter.enabled"
@@ -3088,7 +3289,9 @@ function resetRuleToTemplate(idx: number): void {
                     >
                       + 添加档位
                     </button>
+                    <!-- 手动单入口已下线：功能保留在节点侧（不再使用），前端不再提供入口 -->
                     <button
+                      v-if="false"
                       type="button"
                       class="btn-sm btn-ghost"
                       :disabled="r.manual_scatter.enabled"
@@ -3251,6 +3454,14 @@ function resetRuleToTemplate(idx: number): void {
         <p v-if="formError" class="form-error" style="margin-top: 10px">{{ formError }}</p>
         <div v-if="isTpl1LockedForCurrentUser" class="form-error" style="margin-top: 10px">
           AI 智能加仓策略需管理员授权后才能使用，当前角色未获授权
+        </div>
+
+        <!-- 保存提醒：不阻止保存，只说明「保存后会发生什么」 -->
+        <div v-if="formWarnings.length" class="form-warnings" style="margin-top: 10px">
+          <p class="form-warnings-title">保存提醒</p>
+          <ul class="form-warnings-list">
+            <li v-for="(w, i) in formWarnings" :key="i">{{ w }}</li>
+          </ul>
         </div>
 
         <!-- 运行态提示：有在跑任务时，配置改动会立刻热推到节点 -->
@@ -3476,6 +3687,14 @@ function resetRuleToTemplate(idx: number): void {
   line-height: 1.4;
 }
 
+/* 指定价档位的手数说明：占满整行，不挤在输入框旁边 */
+.batch-level-note {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .batch-top-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -3548,6 +3767,30 @@ function resetRuleToTemplate(idx: number): void {
 }
 
 .runtime-banner-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--muted, #666);
+}
+
+/* 保存提醒：不阻止保存，只说明「保存后会发生什么」 */
+.form-warnings {
+  padding: 10px 12px;
+  border: 1px solid rgba(230, 162, 60, 0.35);
+  border-left: 3px solid #e6a23c;
+  border-radius: 4px;
+  background: rgba(230, 162, 60, 0.07);
+}
+
+.form-warnings-title {
+  margin: 0 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text, inherit);
+}
+
+.form-warnings-list {
   margin: 0;
   padding-left: 18px;
   font-size: 12px;

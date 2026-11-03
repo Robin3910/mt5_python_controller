@@ -248,3 +248,135 @@ def test_opening_stops_respect_side_and_min_lot():
         tp_amount=10, sl_amount=20,
         tick_size=0.01, tick_value=1.0, digits=2,
     ) is None
+
+
+# --------------------------- 双止损：取更近的那道 ---------------------------
+def test_nearer_stop_takes_the_closer_one():
+    """多单取更高（离现价更近），空单取更低。"""
+    # 多单：自有 4300 更近 → 留自有
+    assert sp.nearer_stop("BUY", 4300.0, 4250.0) == 4300.0
+    # 多单：共同止损 4250 更近 → 留共同
+    assert sp.nearer_stop("BUY", 4200.0, 4250.0) == 4250.0
+    # 空单：自有 4500 更近 → 留自有
+    assert sp.nearer_stop("SELL", 4500.0, 4550.0) == 4500.0
+    # 空单：共同止损 4550 更近 → 留共同
+    assert sp.nearer_stop("SELL", 4600.0, 4550.0) == 4550.0
+
+
+def test_nearer_stop_handles_missing_side():
+    """只有一道止损时直接用它。"""
+    assert sp.nearer_stop("BUY", 0.0, 4250.0) == 4250.0
+    assert sp.nearer_stop("BUY", 4300.0, 0.0) == 4300.0
+    assert sp.nearer_stop("BUY", 0.0, 0.0) == 0.0
+    # 方向缺失时按空单口径（取更低）——宁可保守
+    assert sp.nearer_stop("", 4300.0, 4250.0) == 4250.0
+
+
+# --------------------------- 止盈权威价（指定价档位接管） ---------------------------
+def test_tp_override_takes_absolute_price_instead_of_tier_distance():
+    """有权威止盈价时，该方向的止盈直接用它，不按「加权均价 + 阶梯金额」反推。"""
+    positions = [
+        {"type": "BUY", "ticket": 1, "volume": 0.1, "price_open": 2400.0},
+        {"type": "BUY", "ticket": 2, "volume": 0.37, "price_open": 2399.0},
+    ]
+    plans = sp.plan_common_stops(
+        positions, tp_amount=500.0, sl_amount=None,
+        tick_size=0.01, tick_value=1.0, digits=2,
+        bid=2399.5, ask=2400.5, fallback_price=2400.0,
+        tp_override={"BUY": 2410.0},
+    )
+    assert len(plans) == 1
+    plan = plans[0]
+    assert plan["tp"] == 2410.0
+    assert plan["tp_authority"] == 2410.0
+    # 权威价是绝对价位，不按加权均价偏移
+    assert plan["tp"] != plan["weighted_open"] + 500.0 / ((1 / 0.01) * 0.47)
+
+
+def test_tp_override_applies_without_any_tier_amount():
+    """阶梯止盈没启用时，权威止盈价照样能写（它本身就是止盈）。"""
+    positions = [{"type": "BUY", "ticket": 1, "volume": 0.1, "price_open": 2400.0}]
+    plans = sp.plan_common_stops(
+        positions, tp_amount=None, sl_amount=None,
+        tick_size=0.01, tick_value=1.0, digits=2,
+        bid=2399.5, ask=2400.5, fallback_price=2400.0,
+        tp_override={"BUY": 2410.0},
+    )
+    assert len(plans) == 1
+    assert plans[0]["tp"] == 2410.0
+
+
+def test_tp_override_only_applies_to_its_own_side():
+    """权威价只管它自己的方向，另一侧仍按阶梯金额反推。"""
+    positions = [
+        {"type": "BUY", "ticket": 1, "volume": 0.1, "price_open": 2400.0},
+        {"type": "SELL", "ticket": 2, "volume": 0.1, "price_open": 2400.0},
+    ]
+    plans = sp.plan_common_stops(
+        positions, tp_amount=500.0, sl_amount=None,
+        tick_size=0.01, tick_value=1.0, digits=2,
+        bid=2399.5, ask=2400.5, fallback_price=2400.0,
+        tp_override={"BUY": 2410.0},
+    )
+    by_side = {p["side"]: p for p in plans}
+    assert by_side["BUY"]["tp"] == 2410.0
+    # 空单方向没有权威价：仍按加权均价 + 阶梯距离（往下）
+    # D_tp = 500 / ((1/0.01) × 0.1) = 50 → 2400 − 50 = 2350
+    assert by_side["SELL"]["tp"] == 2350.0
+
+
+def test_opening_stops_carry_the_tp_authority():
+    """新加的这一笔也要带同一个权威止盈价，否则它会带一个对不上的止盈。"""
+    held = [{"type": "BUY", "volume": 0.1, "price_open": 2400.0}]
+    sl, tp = sp.opening_stops(
+        held, side="BUY", volume=0.37, fill_price=2399.0,
+        tp_amount=500.0, sl_amount=None,
+        tick_size=0.01, tick_value=1.0, digits=2,
+        bid=2399.5, ask=2400.0,
+        tp_override={"BUY": 2410.0},
+    )
+    assert tp == 2410.0
+
+
+def test_without_override_tp_falls_back_to_weighted_average():
+    """分支撤销后 → 回到「加权均价 + tier1 距离」口径，指定价仓位一起参与。
+
+    这是「指定价之后其它类型加仓 → 重新按加权均价反推」的底层算式：
+    三笔仓位（含指定价那笔）一起算加权均价与总手数。
+    """
+    positions = [
+        {"type": "BUY", "ticket": 1, "volume": 0.1, "price_open": 2400.0},
+        {"type": "BUY", "ticket": 2, "volume": 0.37, "price_open": 2399.0},
+        {"type": "BUY", "ticket": 3, "volume": 0.1, "price_open": 2402.0},
+    ]
+    plans = sp.plan_common_stops(
+        positions, tp_amount=500.0, sl_amount=None,
+        tick_size=0.01, tick_value=1.0, digits=2,
+        bid=2399.5, ask=2400.5, fallback_price=2400.0,
+    )
+    assert len(plans) == 1
+    plan = plans[0]
+    total = 0.1 + 0.37 + 0.1
+    weighted = (0.1 * 2400.0 + 0.37 * 2399.0 + 0.1 * 2402.0) / total
+    expected = weighted + 500.0 / ((1 / 0.01) * total)
+    assert abs(plan["tp"] - expected) < 0.01
+    # 指定价那笔（ticket 2）确实参与了重算（总手数里算它）
+    assert abs(plan["weighted_open"] - weighted) < 1e-9
+
+
+def test_opening_stops_without_override_use_weighted_average():
+    """分支撤销后新开的一笔，止盈按加权均价口径（它自己也在重算里）。"""
+    held = [
+        {"type": "BUY", "volume": 0.1, "price_open": 2400.0},
+        {"type": "BUY", "volume": 0.37, "price_open": 2399.0},
+    ]
+    sl, tp = sp.opening_stops(
+        held, side="BUY", volume=0.1, fill_price=2402.0,
+        tp_amount=500.0, sl_amount=None,
+        tick_size=0.01, tick_value=1.0, digits=2,
+        bid=2399.5, ask=2400.0,
+    )
+    total = 0.1 + 0.37 + 0.1
+    weighted = (0.1 * 2400.0 + 0.37 * 2399.0 + 0.1 * 2402.0) / total
+    expected = weighted + 500.0 / ((1 / 0.01) * total)
+    assert abs(tp - expected) < 0.01

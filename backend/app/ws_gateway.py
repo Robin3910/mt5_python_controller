@@ -28,7 +28,6 @@ from . import (
     risk_control,
     rules,
     signal_codes,
-    strategy_precheck,
     system_settings,
 )
 from .connections import manager
@@ -294,10 +293,6 @@ async def _session(node_id: str, ws: WebSocket) -> None:
         elif mtype == "market_probe_result":
             # 只读行情探针回包（趋势面板），按 req_id 唤醒等待中的请求
             market_probe.resolve(data.get("req_id"), data)
-
-        elif mtype == "strategy_precheck_result":
-            # 策略配置预检回包，按 req_id 唤醒等待中的保存请求
-            strategy_precheck.resolve(data.get("req_id"), data)
 
         elif mtype in ("cancel_pending_result", "cancel_pending_all_result"):
             # 单张撤单（限价监听）与批量撤单（人工删挂单）共用 req_id 配对
