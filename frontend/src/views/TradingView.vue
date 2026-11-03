@@ -994,7 +994,7 @@ onBeforeUnmount(() => {
               </span>
               <span v-if="trendReady" class="pill" :class="trendClass(trendVerdict)">{{ trendText(trendVerdict) }}</span>
             </p>
-          </div>
+            </div>
           <div class="tr-meta">
             <span class="tr-meta-id">MT5 ID {{ primaryNode.mt5_login ?? '—' }}</span>
             <span><i class="tr-dot" :class="isOnline ? 'on' : ''"></i>已连接 {{ hub.onlineCount }} 节点</span>
@@ -1002,15 +1002,15 @@ onBeforeUnmount(() => {
           </div>
         </div>
         <div v-if="availableSymbols.length" class="tr-chips">
-          <button
-            v-for="sym in availableSymbols"
-            :key="sym"
+            <button
+              v-for="sym in availableSymbols"
+              :key="sym"
             type="button"
             class="tr-chip"
             :class="{ on: currentSymbol === sym }"
-            @click="pickSymbol(sym)"
-          >{{ sym }}</button>
-        </div>
+              @click="pickSymbol(sym)"
+            >{{ sym }}</button>
+          </div>
         <p v-else class="tr-muted">主节点尚未上报任何品种报价</p>
       </section>
 
@@ -1024,24 +1024,24 @@ onBeforeUnmount(() => {
             <button type="button" :disabled="!isOnline" @click="openDialog('trend_market')">
               <svg viewBox="0 0 24 24"><path fill="currentColor" d="M13 2 4 14h7l-1 8 9-12h-7l1-8z"/></svg>
               <span>市价开仓</span>
-            </button>
+        </button>
             <button type="button" :disabled="!isOnline" @click="openDialog('trend_limit')">
               <svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm1 11h-2V7h2zm0 4h-2v-2h2z"/></svg>
               <span>限价开仓</span>
-            </button>
+        </button>
             <button type="button" :disabled="!isOnline" @click="openDialog('grid')">
               <svg viewBox="0 0 24 24"><path fill="currentColor" d="M3 17h2v-7H3v7zm4 0h2V7H7v10zm4 0h2v-4h-2v4zm4 0h2V4h-2v13zm4 0h2v-7h-2v7z"/></svg>
               <span>智能吸筹</span>
-            </button>
-          </div>
+        </button>
+      </div>
           <p class="tr-hint">配置完成后，下方将展示对应的订单配置与当前交易、资产、历史交易。</p>
           <p v-if="!isOnline" class="tr-hint">主节点离线，无法触发</p>
-        </div>
+          </div>
         <div class="tr-sum">
           <div><span>当前持仓</span><strong>{{ totalPosCount }} 笔</strong></div>
           <div><span>合计手数</span><strong>{{ totalPosVolume.toFixed(2) }} 手</strong></div>
           <div><span>浮动盈亏</span><strong :class="totalPosPnl >= 0 ? 'up' : 'down'">{{ fmtSigned(totalPosPnl) }}</strong></div>
-        </div>
+          </div>
       </section>
 
       <section class="tr-card tr-panel">
@@ -1067,12 +1067,12 @@ onBeforeUnmount(() => {
                 <em v-if="symbolAlias(book.symbol)">{{ symbolAlias(book.symbol) }}</em>
                 <span>{{ book.rows.length }} 笔 · {{ book.volume.toFixed(2) }} 手</span>
                 <span class="wide">多 {{ book.buy }} / 空 {{ book.sell }}</span>
-              </div>
+            </div>
               <strong :class="book.profit >= 0 ? 'up' : 'down'">{{ fmtSigned(book.profit) }}</strong>
             </header>
             <div class="tr-grid tr-pos-grid tr-head">
               <span>#</span><span>方向</span><span>手数</span><span>开仓价</span><span>止盈/止损</span><span>浮动盈亏</span><span>操作</span>
-            </div>
+                        </div>
             <div v-for="(p, i) in book.rows" :key="p.ticket" class="tr-grid tr-pos-grid tr-line">
               <span class="dim">{{ i + 1 }}</span>
               <span><i class="dir" :class="isBuySide(p.type) ? 'buy' : 'sell'">{{ fmtPosType(p.type) }}</i></span>
@@ -1083,9 +1083,9 @@ onBeforeUnmount(() => {
               <span>
                 <button type="button" class="tr-x" :disabled="isClosing(p.ticket) || !!actionBusy" @click="closePosition(p)">
                   {{ isClosing(p.ticket) ? '…' : '平仓' }}
-                </button>
+                      </button>
               </span>
-            </div>
+                      </div>
             <footer class="tr-book-actions">
               <button type="button" class="chip green" :disabled="!!actionBusy || !book.rows.some((p) => (p.profit || 0) > 0)" @click="closeSymbolProfit(book.symbol)">平盈</button>
               <button type="button" class="chip amber" :disabled="!!actionBusy || !pendingOf(book.symbol).length" @click="cancelSymbolPending(book.symbol)">删挂单</button>
@@ -1095,7 +1095,7 @@ onBeforeUnmount(() => {
           <p v-if="positionBooks.length" class="tr-foot-note">
             当前持仓 {{ totalPosCount }} 笔 · 合计手数 {{ totalPosVolume.toFixed(2) }} · 浮动盈亏 {{ fmtSigned(totalPosPnl) }}
           </p>
-        </div>
+          </div>
 
         <div v-else-if="detailTab === 'grid'" class="tr-body">
           <p v-if="gridLoading && !gridTasks.length" class="tr-empty-line">加载中…</p>
@@ -1106,12 +1106,12 @@ onBeforeUnmount(() => {
                 <b>{{ book.symbol }}</b>
                 <em v-if="symbolAlias(book.symbol)">{{ symbolAlias(book.symbol) }}</em>
                 <span>{{ book.positions }} 笔持仓 · {{ book.volumeLabel }}</span>
-              </div>
+                </div>
               <strong :class="book.profit >= 0 ? 'up' : 'down'">{{ fmtSigned(book.profit) }}</strong>
             </header>
             <div class="tr-grid tr-grid-grid tr-head">
               <span>方向</span><span>节点</span><span>持仓</span><span>挂单</span><span>盈亏</span><span>操作</span>
-            </div>
+              </div>
             <div v-for="t in book.tasks" :key="t.task_id" class="tr-grid tr-grid-grid tr-line">
               <span><i class="dir" :class="gridDirTagClass(t.action)">{{ fmtPosType(t.action) }}</i></span>
               <span class="num dim" :title="gridTaskNodeNames(t)">{{ gridTaskNodeNames(t) }}</span>
@@ -1119,16 +1119,16 @@ onBeforeUnmount(() => {
               <span class="num dim">{{ gridTaskPendingCount(t) || '—' }}</span>
               <strong :class="gridTaskProfit(t) >= 0 ? 'up' : 'down'">{{ fmtSigned(gridTaskProfit(t)) }}</strong>
               <span>
-                <button
+                        <button
                   type="button"
                   class="tr-x"
-                  :disabled="isClosingGridTask(t.task_id) || !isGridTaskStoppable(t)"
-                  @click="stopGridTask(t)"
+                          :disabled="isClosingGridTask(t.task_id) || !isGridTaskStoppable(t)"
+                          @click="stopGridTask(t)"
                 >{{ isClosingGridTask(t.task_id) ? '…' : '停止' }}</button>
-              </span>
-            </div>
+                      </span>
+                    </div>
           </section>
-        </div>
+                    </div>
 
         <div v-else-if="detailTab === 'assets'" class="tr-body">
           <div class="tr-assets">
@@ -1138,24 +1138,24 @@ onBeforeUnmount(() => {
             <div><span>可用保证金</span><strong>{{ accountFreeMargin.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) }}</strong></div>
             <div><span>浮动盈亏</span><strong :class="accountProfit >= 0 ? 'up' : 'down'">{{ fmtSigned(accountProfit) }}</strong></div>
             <div><span>今日盈亏</span><strong :class="todayPnl >= 0 ? 'up' : 'down'">{{ historyDeals.length || historyWinRate != null ? fmtSigned(todayPnl) : '—' }}</strong></div>
-          </div>
+                  </div>
           <p class="tr-dist-title">持仓品种分布</p>
           <div v-for="item in assetDist" :key="item.symbol" class="tr-dist">
             <div class="tr-dist-top">
               <span>{{ item.symbol }}</span>
               <span>{{ item.volume > 0 ? `${item.volume.toFixed(2)} 手 · ${item.pct}%` : `空仓 · ${item.pct}%` }}</span>
-            </div>
+                  </div>
             <div class="tr-bar"><i :style="{ width: `${item.pct}%` }"></i></div>
-          </div>
+                </div>
           <p v-if="!assetDist.length" class="tr-empty-line">暂无品种</p>
-        </div>
+          </div>
 
         <div v-else class="tr-body">
           <div class="tr-hist-pills">
             <span>近 7 日 {{ dealsTotal }} 笔</span>
             <span>胜率 {{ historyWinRate == null ? '—' : `${historyWinRate.toFixed(0)}%` }}</span>
             <span :class="historyProfit >= 0 ? 'up' : 'down'">累计盈亏 {{ fmtSigned(historyProfit) }}</span>
-          </div>
+        </div>
           <p v-if="historyLoading && !historyBooks.length" class="tr-empty-line">加载中…</p>
           <p v-else-if="!historyBooks.length" class="tr-empty-line">近 7 日暂无已平仓记录</p>
           <section v-for="book in historyBooks" :key="book.symbol" class="tr-book">
@@ -1165,7 +1165,7 @@ onBeforeUnmount(() => {
                 <em v-if="symbolAlias(book.symbol)">{{ symbolAlias(book.symbol) }}</em>
                 <span>{{ book.rows.length }} 笔 · {{ book.volume.toFixed(2) }} 手</span>
                 <span class="wide">平盈 {{ book.wins }} / 平损 {{ book.losses }}</span>
-              </div>
+      </div>
               <strong :class="book.profit >= 0 ? 'up' : 'down'">{{ fmtSigned(book.profit) }}</strong>
             </header>
             <div class="tr-grid tr-hist-grid tr-head">
@@ -1212,8 +1212,14 @@ onBeforeUnmount(() => {
 .tr-go, .tr-modes button, .tr-chip, .tr-x, .chip { cursor: pointer; }
 .tr-go { margin-top: 12px; border: 0; border-radius: 8px; background: #2563EB; color: #fff; padding: 8px 14px; }
 .tr-quote, .tr-create, .tr-body { padding: 12px; }
-.tr-quote-top, .tr-create, .tr-book-head, .tr-book-actions, .tr-meta, .tr-chg, .tr-chips, .tr-hist-pills { display: flex; align-items: center; gap: 8px; }
-.tr-quote-top, .tr-create { justify-content: space-between; align-items: flex-end; flex-wrap: wrap; }
+.tr-quote-top, .tr-book-head, .tr-book-actions, .tr-meta, .tr-chg, .tr-chips, .tr-hist-pills { display: flex; align-items: center; gap: 8px; }
+.tr-quote-top { justify-content: space-between; align-items: flex-end; flex-wrap: wrap; }
+.tr-create {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
 .tr-kicker, .tr-hint, .tr-muted, .tr-foot-note, .tr-empty-line { color: #8B96A8; }
 .tr-kicker { margin: 0; font-size: 12px; }
 .tr-price { margin: 4px 0 0; font-size: 30px; font-weight: 650; line-height: 1; letter-spacing: -0.03em; font-variant-numeric: tabular-nums; }
@@ -1233,7 +1239,7 @@ onBeforeUnmount(() => {
 .tr-chips { margin-top: 12px; overflow-x: auto; }
 .tr-chip { flex: 0 0 auto; border: 1px solid #22304A; background: #0C1220; color: #8B96A8; border-radius: 8px; padding: 6px 12px; font-size: 12px; }
 .tr-chip.on { border-color: #2563EB; background: #2563EB; color: #fff; }
-.tr-create-main { flex: 1 1 420px; min-width: 0; }
+.tr-create-main { min-width: 0; }
 .tr-create-title { margin: 0; display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 650; }
 .tr-create-title svg, .tr-modes svg { width: 16px; height: 16px; color: #2563EB; }
 .tr-modes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
@@ -1243,9 +1249,19 @@ onBeforeUnmount(() => {
 }
 .tr-modes button:disabled { opacity: .45; cursor: not-allowed; }
 .tr-hint { margin: 10px 0 0; font-size: 10px; line-height: 1.5; color: #4A5568; }
-.tr-sum { flex: 0 1 240px; border: 1px solid #22304A; background: #0C1220; border-radius: 8px; padding: 10px; }
-.tr-sum div { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; color: #5B6B85; padding: 3px 0; }
-.tr-sum strong { color: #E6EBF4; font-variant-numeric: tabular-nums; }
+.tr-sum {
+  width: 100%;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid #22304A;
+  background: #0C1220;
+  border-radius: 8px;
+  padding: 10px;
+}
+.tr-sum div { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11px; line-height: 1.25; color: #5B6B85; }
+.tr-sum strong { color: #E6EBF4; font-weight: 650; font-variant-numeric: tabular-nums; }
 .tr-tabs { display: flex; gap: 2px; border-bottom: 1px solid #1C2740; padding: 0 8px; overflow-x: auto; }
 .tr-tabs button { position: relative; border: 0; background: transparent; color: #5B6B85; font-size: 12px; font-weight: 650; padding: 10px 12px; white-space: nowrap; }
 .tr-tabs button span { margin-left: 4px; color: #4A5568; font-size: 10px; font-weight: 550; }
@@ -1296,5 +1312,9 @@ onBeforeUnmount(() => {
   .wide { display: inline; }
   .tr-assets { grid-template-columns: repeat(3, minmax(0,1fr)); }
   .tr-quote, .tr-body { padding: 16px; }
+}
+@media (min-width: 1024px) {
+  .tr-create { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: 24px; padding: 16px; }
+  .tr-sum { align-self: start; }
 }
 </style>
