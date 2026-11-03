@@ -19,14 +19,16 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from .redis_store import (
+    K_SMS_CAPTCHA_FAIL,
     K_SMS_SEND_IP,
+    K_SMS_SEND_IP_DAY,
     K_SMS_SEND_PHONE,
     K_SMS_SEND_TOTAL,
     RedisStore,
 )
 from .security import compare_secret
 from .settings import settings
-from .sms_config import PURPOSE_LOGIN, PURPOSE_REGISTER, SMS_PURPOSES
+from .sms_config import PURPOSE_AUTH, SMS_PURPOSES
 from .sms_provider import SmsResult, current_provider
 
 logger = logging.getLogger(__name__)
@@ -130,10 +132,14 @@ async def check_rate_limits(
     - 同手机号发送间隔：send_interval_seconds（防连点）
     - 同手机号每日发送：daily_limit_per_phone（防刷费）
     - 同 IP 每小时发送：hourly_limit_per_ip（防批量轰炸）
+    - 同 IP 每日发送：daily_limit_per_ip（换 IP 也要付出代价）
+    - 全局每日发送：daily_limit_total（费用失控的最后一道闸；0 = 不限）
     """
     interval = int(cfg.get("send_interval_seconds") or 60)
     daily = int(cfg.get("daily_limit_per_phone") or 10)
     hourly = int(cfg.get("hourly_limit_per_ip") or 20)
+    daily_ip = int(cfg.get("daily_limit_per_ip") or 0)
+    daily_total = int(cfg.get("daily_limit_total") or 0)
 
     # 冷却锁：存在即说明上一次发送还没过间隔
     if not await store.acquire_sms_lock(phone, interval):
@@ -155,6 +161,16 @@ async def check_rate_limits(
             raise SmsRateLimited(interval, f"该手机号今日发送次数已达上限（{daily} 条）")
         if ip_count > hourly:
             raise SmsRateLimited(interval, f"当前来源今日发送次数已达上限（{hourly} 条）")
+        if daily_ip:
+            ip_day_count = await store.incr_sms_send_counter(
+                K_SMS_SEND_IP_DAY.format(ip or "unknown", day), _end_of_day_seconds(now)
+            )
+            if ip_day_count > daily_ip:
+                raise SmsRateLimited(
+                    interval, f"当前来源今日发送次数已达上限（{daily_ip} 条）"
+                )
+        if daily_total and total_count > daily_total:
+            raise SmsRateLimited(interval, "今日短信发送总量已达上限，请稍后再试")
     except SmsRateLimited:
         # 超限时把刚加的计数退回去一点没意义（宁可略严），但冷却锁要放开，
         # 否则用户要等 interval 才能重试。
@@ -165,6 +181,87 @@ async def check_rate_limits(
 async def today_send_count(store: RedisStore, now: Optional[datetime] = None) -> int:
     """今日已发送条数（配置页展示用，只读）。"""
     return await store.get_sms_send_counter(K_SMS_SEND_TOTAL.format(_day_stamp(now)))
+
+
+async def needs_captcha(
+    store: RedisStore, *, phone: str, ip: str, cfg: dict, now: Optional[datetime] = None,
+) -> bool:
+    """自适应人机验证判定：只在「有风险」时才要求滑块，正常用户无感放行。
+
+    触发条件（任一命中即需要）：
+    - 该号码 24h 内已发送 >= captcha_phone_threshold 次
+    - 该 IP 1h 内已发送 >= captcha_ip_threshold 次
+    - 该号码是刚注册的新账号（< 24h）且 captcha_new_account 开启
+    - 该 IP 近期人机验证连续失败过多（疑似脚本）
+
+    captcha_enabled=false 或未配 prefix/scene_id 时永远返回 False
+    （没开通验证码产品时不能让发码功能挂掉）。
+    """
+    if not cfg.get("captcha_enabled"):
+        return False
+    if not (cfg.get("captcha_prefix") and cfg.get("captcha_scene_id")):
+        return False
+
+    phone_threshold = int(cfg.get("captcha_phone_threshold") or 0)
+    ip_threshold = int(cfg.get("captcha_ip_threshold") or 0)
+
+    if phone_threshold:
+        phone_day = await store.get_sms_send_counter(
+            K_SMS_SEND_PHONE.format(phone, _day_stamp(now))
+        )
+        if phone_day >= phone_threshold:
+            return True
+
+    if ip_threshold:
+        ip_hour = await store.get_sms_send_counter(
+            K_SMS_SEND_IP.format(ip or "unknown", _hour_stamp(now))
+        )
+        if ip_hour >= ip_threshold:
+            return True
+
+    if cfg.get("captcha_new_account"):
+        if await _is_new_account(store, phone):
+            return True
+
+    # 人机验证连续失败多次：疑似脚本，直接要求滑块（而不是继续放行）
+    fail_count = await store.get_sms_send_counter(
+        K_SMS_CAPTCHA_FAIL.format(ip or "unknown", _hour_stamp(now))
+    )
+    if fail_count >= 5:
+        return True
+
+    return False
+
+
+async def _is_new_account(store: RedisStore, phone: str) -> bool:
+    """该手机号对应账号是否是「刚注册的新号」（24h 内注册）。
+
+    新号是最典型的刷量工具（注册一个号就能开始发码），所以要额外加人机验证。
+
+    查不到用户（还没注册）不算新号 —— 未注册号码走的是「注册后」的路径。
+    """
+    from . import user_service
+
+    try:
+        user = await user_service.get_user_by_phone(phone)
+    except Exception:  # noqa: BLE001 - 用户表异常不该阻断发码
+        return False
+    if user is None:
+        return False
+    created = getattr(user, "created_at", None)
+    if created is None:
+        return False
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    age = datetime.now(timezone.utc) - created
+    return age < timedelta(hours=24)
+
+
+async def record_captcha_failure(store: RedisStore, ip: str, now: Optional[datetime] = None) -> None:
+    """记一次人机验证失败（按 IP 按小时计数）。"""
+    await store.incr_sms_send_counter(
+        K_SMS_CAPTCHA_FAIL.format(ip or "unknown", _hour_stamp(now)), 3600
+    )
 
 
 async def issue_code(
@@ -206,7 +303,7 @@ async def verify_code(
 ) -> bool:
     """校验验证码；通过即焚（一次性），失败则累加次数，超限立即作废。
 
-    purpose 进 key —— register 的码不能用来登录，反之亦然。
+    purpose 进 key —— 不同用途的码不能互相使用。
     """
     if purpose not in SMS_PURPOSES:
         return False
@@ -239,8 +336,7 @@ __all__ = [
     "CODE_LENGTH",
     "CODE_TTL_SECONDS",
     "MAX_VERIFY_ATTEMPTS",
-    "PURPOSE_LOGIN",
-    "PURPOSE_REGISTER",
+    "PURPOSE_AUTH",
     "SMS_PURPOSES",
     "SmsInvalidPhone",
     "SmsRateLimited",
@@ -249,7 +345,9 @@ __all__ = [
     "hash_code",
     "issue_code",
     "mask_phone",
+    "needs_captcha",
     "normalize_phone",
+    "record_captcha_failure",
     "today_send_count",
     "verify_code",
 ]

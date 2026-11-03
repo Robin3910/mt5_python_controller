@@ -3,6 +3,8 @@
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
+import { useRegisterStore } from '@/stores/register'
+import { useAliyunCaptcha } from '@/utils/aliyunCaptcha'
 
 const username = ref('admin')
 const password = ref('')
@@ -22,15 +24,38 @@ const smsCode = ref('')
 const smsSent = ref(false)
 const smsCooldown = ref(0)
 const smsLoading = ref(false)
+/** 阿里云验证码配置（自适应：有风险时才弹滑块） */
+const captchaPrefix = ref('')
+const captchaSceneId = ref('')
+/** 加密模式下的短效串（服务端动态生成）；空串 = 非加密模式 */
+const captchaEncrypted = ref('')
 
 const auth = useAuthStore()
+const registerStore = useRegisterStore()
 const router = useRouter()
 
 let cooldownTimer: number | undefined
 
+const captcha = useAliyunCaptcha({
+  get prefix() {
+    return captchaPrefix.value
+  },
+  get sceneId() {
+    return captchaSceneId.value
+  },
+  encryptedSceneId: async () => {
+    const scene = await auth.fetchCaptchaScene()
+    captchaSceneId.value = scene.sceneId
+    captchaEncrypted.value = scene.encrypted
+    return scene.encrypted
+  },
+})
+
 onMounted(async () => {
   const status = await auth.fetchSmsStatus()
   smsEnabled.value = status.enabled
+  captchaPrefix.value = status.captcha_prefix || ''
+  captchaSceneId.value = status.captcha_scene_id || ''
 })
 
 function mapError(detail?: string): string {
@@ -40,6 +65,8 @@ function mapError(detail?: string): string {
   if (detail === '验证码错误或已过期') return '验证码错误或已过期'
   if (detail === '该手机号尚未注册') return '该手机号尚未注册，请先注册'
   if (detail === '账号已被禁用，请联系管理员') return '账号已被禁用，请联系管理员'
+  if (detail === '需要完成人机验证') return '请完成滑块验证'
+  if (detail === '人机验证未通过，请重试') return '人机验证未通过，请重试'
   if (detail === 'not found') return '短信服务未配置，请使用账号密码登录'
   return detail || '登录失败'
 }
@@ -105,7 +132,18 @@ function backToCredentials(): void {
   error.value = ''
 }
 
-/** 发送短信验证码 */
+/** 需要人机验证时弹滑块；返回空串表示用户取消或验证失败 */
+async function runCaptcha(): Promise<string> {
+  if (!captcha.ready()) return ''
+  return captcha.run()
+}
+
+/**
+ * 发送验证码。
+ *
+ * 人机验证是**自适应**的：正常情况直接发码；服务端判定有风险时返回 428，
+ * 这时才弹滑块，带上验证参数重试一次。
+ */
 async function sendSmsCode(): Promise<void> {
   error.value = ''
   const phone = smsPhone.value.trim()
@@ -115,17 +153,43 @@ async function sendSmsCode(): Promise<void> {
   }
   smsLoading.value = true
   try {
-    const { cooldown } = await auth.sendSmsCode(phone, 'login')
+    const { cooldown } = await auth.sendSmsCode(phone, 'auth')
     smsSent.value = true
     startCooldown(cooldown)
   } catch (e: unknown) {
-    error.value = mapError(detailOf(e))
+    const detail = detailOf(e)
+    if (detail === '需要完成人机验证') {
+      // 服务端要求人机验证 → 弹滑块，通过后带参数重试
+      const param = await runCaptcha()
+      if (!param) {
+        error.value = '人机验证未通过，请重试'
+        smsLoading.value = false
+        return
+      }
+      try {
+        const { cooldown } = await auth.sendSmsCode(phone, 'auth', param)
+        smsSent.value = true
+        startCooldown(cooldown)
+      } catch (retryErr: unknown) {
+        error.value = mapError(detailOf(retryErr))
+      }
+      smsLoading.value = false
+      return
+    }
+    error.value = mapError(detail)
   } finally {
     smsLoading.value = false
   }
 }
 
-/** 验证码登录（2FA 用户走现有的两步流程） */
+/**
+ * 验证码登录。
+ *
+ * 校验通过后由服务端告知去向：
+ * - login            → 用票据换 token 登录（不再重复校验验证码）
+ * - register         → 该号码未注册 → 直接进注册第二步（**不用再收验证码**）
+ * - pending_approval → 已注册但待审核 → 提示等待
+ */
 async function submitSmsLogin(): Promise<void> {
   error.value = ''
   const phone = smsPhone.value.trim()
@@ -140,7 +204,20 @@ async function submitSmsLogin(): Promise<void> {
   }
   loading.value = true
   try {
-    const result = await auth.loginBySms(phone, code)
+    const verify = await auth.verifySmsCode(phone, code, 'auth')
+
+    if (verify.next_action === 'register') {
+      // 未注册：把票据交给注册页，直接进第二步（不再收验证码）
+      registerStore.setHandoff({ phone, ticket: verify.ticket })
+      router.push({ name: 'register' })
+      return
+    }
+    if (verify.next_action === 'pending_approval') {
+      error.value = '该账号已注册，等待管理员审核通过后即可登录'
+      return
+    }
+
+    const result = await auth.loginBySms(phone, undefined, verify.ticket)
     if (result.requires2fa) {
       loginToken.value = result.loginToken || ''
       step.value = '2fa'
@@ -309,7 +386,7 @@ function switchTab(next: 'password' | 'sms'): void {
 
       <div v-if="step === 'credentials'" class="login-alt-links">
         <RouterLink v-if="smsEnabled" to="/register" class="login-alt-link">还没有账号？手机号注册</RouterLink>
-        <RouterLink v-else-if="!smsEnabled" to="/register" class="login-alt-link">注册账号</RouterLink>
+        <RouterLink v-else to="/register" class="login-alt-link">注册账号</RouterLink>
       </div>
 
       <div class="login-footer">
@@ -319,5 +396,9 @@ function switchTab(next: 'password' | 'sms'): void {
         </span>
       </div>
     </div>
+
+    <!-- 阿里云验证码需要的占位元素（必须存在于页面上，样式在 styles.css 里隐藏） -->
+    <div id="aliyun-captcha-element" class="aliyun-captcha-holder" aria-hidden="true"></div>
+    <button id="aliyun-captcha-button" type="button" class="aliyun-captcha-holder" tabindex="-1" aria-hidden="true"></button>
   </div>
 </template>
