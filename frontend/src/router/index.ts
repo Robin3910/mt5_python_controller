@@ -96,7 +96,14 @@ const router = createRouter({
     {
       path: '/events',
       name: 'events',
-      component: () => import('@/views/EventsView.vue'),
+      component: () => import('@/views/SignalCenterView.vue'),
+      meta: { menu: 'events' },
+    },
+    {
+      // 「信号中心」别名路径：老链接 /events 继续有效，新入口用更语义化的路径
+      path: '/signal-center',
+      name: 'signal-center',
+      component: () => import('@/views/SignalCenterView.vue'),
       meta: { menu: 'events' },
     },
     {

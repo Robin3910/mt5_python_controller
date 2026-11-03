@@ -15,9 +15,8 @@
  *    仅用弹窗里手填的 volume/sl/tp/entry_price/remark 作为本次信号值。
  */
 import { computed, reactive, ref, watch } from 'vue'
-import { ElDialog, ElMessage, ElSwitch } from 'element-plus'
+import { ElDialog, ElMessage } from 'element-plus'
 import 'element-plus/es/components/dialog/style/css'
-import 'element-plus/es/components/switch/style/css'
 import { useHubStore } from '@/stores/hub'
 import { useAuthStore } from '@/stores/auth'
 import type {
@@ -219,6 +218,13 @@ const STRATEGIES: { key: OrderStrategy; label: string; icon: string }[] = [
   { key: 'trend_limit', label: '限价开仓', icon: '◎' },
   { key: 'grid', label: '智能吸筹', icon: '▦' },
 ]
+
+/** 策略中文名（底部脚注用） */
+const STRATEGY_LABEL: Record<OrderStrategy, string> = {
+  trend_market: '市价开仓',
+  trend_limit: '限价开仓',
+  grid: '智能吸筹',
+}
 
 const GRID_MODE_OPTIONS: readonly { value: GridMode; label: string }[] = [
   { value: 'arithmetic', label: '等差' },
@@ -1221,8 +1227,12 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
     <template #header>
       <div class="od-header">
         <div class="od-title">
-          <span class="od-title-main">创建交易 · {{ localForm.symbol }}</span>
-          <!-- <span class="od-title-sub">{{ STRATEGY_LABEL[strategy] }} · 界面演示，不产生真实订单</span> -->
+          <span class="od-title-main">
+            策略配置
+            <span style="color: var(--pf-dim)">·</span>
+            <span style="color: #3b82f6">{{ (localForm.symbol || '').toUpperCase() }}</span>
+          </span>
+          <span class="od-title-sub">开仓参数配置</span>
         </div>
         <button class="od-close" aria-label="关闭" @click="close" title="关闭">
           X
@@ -1275,7 +1285,13 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
       </div> -->
 
       <!-- 开仓参数（网格模式隐藏整个节；市价/限价均显示） -->
-      <div v-if="!isGrid" class="od-section">开仓参数</div>
+      <div
+        v-if="!isGrid"
+        class="od-section"
+        :style="{ borderLeftColor: isLimit ? '#F59E0B' : '#2563EB' }"
+      >
+        {{ isLimit ? '限价开仓参数' : '市价开仓参数' }}
+      </div>
 
       <!-- 品种（非市价才显示输入框） -->
       <!-- <div v-if="!isMarket && !isLimit" class="od-row">
@@ -1341,7 +1357,7 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
 
       <!-- 网格策略参数（完整版） -->
       <template v-if="isGrid">
-        <div class="od-section">网格参数</div>
+        <div class="od-section" style="border-left-color: #22C55E">智能吸筹参数</div>
         <!-- 网格方向（按钮组：多 / 空） -->
         <div class="od-row">
           <div class="od-row-text">
@@ -1492,7 +1508,15 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
             <div class="od-row-sub">按现价上方格位预先开仓</div>
           </div>
           <div class="od-row-control">
-            <ElSwitch v-model="gridParams.prefill_enabled" />
+            <button
+              type="button"
+              class="pf-switch"
+              :class="{ on: gridParams.prefill_enabled }"
+              role="switch"
+              :aria-checked="gridParams.prefill_enabled"
+              aria-label="初始建仓"
+              @click="gridParams.prefill_enabled = !gridParams.prefill_enabled"
+            ></button>
           </div>
         </div>
         <!-- 触发价 -->
@@ -1525,7 +1549,15 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
             <div class="od-row-sub">突破区间外沿时网格整体平移</div>
           </div>
           <div class="od-row-control">
-            <ElSwitch v-model="gridParams.trailing_up" />
+            <button
+              type="button"
+              class="pf-switch"
+              :class="{ on: gridParams.trailing_up }"
+              role="switch"
+              :aria-checked="gridParams.trailing_up"
+              aria-label="向上追踪"
+              @click="gridParams.trailing_up = !gridParams.trailing_up"
+            ></button>
           </div>
         </div>
         <!-- 最大平移格数（仅追踪开启时显示） -->
@@ -1676,6 +1708,13 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
         {{ lastError || lastStrategyError }}
       </div>
       <!-- <div v-else class="od-hint">提示：首次触发会按 (策略类型-用户名-MT5 登录号-品种) 自动创建「分组+策略」并把主节点加入；后续直接复用。</div> -->
+
+      <!-- 底部脚注（原型 Oh 的 parameter 摘要行）-->
+      <p class="od-footnote">
+        {{ STRATEGY_LABEL[strategy] }} ·
+        {{ (localForm.symbol || '').toUpperCase() }} ·
+        以损定量 {{ riskParams.risk_amount }} USD
+      </p>
     </div>
 
     <template #footer>
@@ -1683,7 +1722,15 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
         <!-- 「带单」开关：开启 → 信号下发到分组全部节点（含跟单员）；关闭 → 仅主节点。
              仅对持有 follow_leader 能力的用户展示（无权限的客户看不到，也无法被别人跟）。 -->
         <div v-if="canCarry" class="od-carry">
-          <ElSwitch v-model="carry" />
+          <button
+            type="button"
+            class="pf-switch"
+            :class="{ on: carry }"
+            role="switch"
+            :aria-checked="carry"
+            aria-label="带单"
+            @click="carry = !carry"
+          ></button>
           <span class="od-carry-label">带单</span>
           <!-- <span class="od-carry-sub">{{ carry ? '推到本分组全部节点' : '只推本分组主节点' }}</span> -->
         </div>
@@ -1764,30 +1811,45 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
 
 /* 整个 dialog 内的边框统一淡化、透明感更强 */
 .order-dialog {
-  --el-border-color-lighter: rgba(212, 205, 205, 0.06);
-  --el-border-color: rgba(231, 218, 218, 0.1);
+  --el-border-color-lighter: rgba(34, 48, 74, 0.6);
+  --el-border-color: rgba(34, 48, 74, 1);
+  --el-bg-color: #0d1626;
+  --el-bg-color-overlay: #0d1626;
+  --el-text-color-primary: #e6ebf4;
+  --el-text-color-regular: #b8c4d9;
+  --el-text-color-secondary: #8b96a8;
+  --el-fill-color-blank: #0a0f1a;
+  --el-fill-color-light: #16213a;
+  --el-color-primary: #2563eb;
 }
 .order-dialog .el-dialog__header {
-  padding: 16px 18px 12px;
+  padding: 14px 16px 12px;
   margin-right: 0;
-  border-bottom: 1px solid var(--el-border-color-lighter, rgba(0, 0, 0, 0.06));
+  border-bottom: 1px solid var(--el-border-color-lighter);
 }
 .order-dialog .el-dialog__body {
-  padding: 12px 18px 0;
+  padding: 12px 16px 0;
 }
 .order-dialog .el-dialog__footer {
-  padding: 12px 18px 16px;
-  border-top: 1px solid var(--el-border-color-lighter, rgba(0, 0, 0, 0.06));
+  padding: 12px 16px 14px;
+  border-top: 1px solid var(--el-border-color-lighter);
   background: transparent;
 }
 .order-dialog .el-dialog {
   border-radius: var(--order-radius, 16px);
   overflow: hidden;
   max-height: calc(100vh - 32px);
+  background: #0d1626;
+  border: 1px solid #1e2b47;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
 }
 .order-dialog .el-dialog__body {
   max-height: calc(100vh - 200px);
   overflow-y: auto;
+}
+.order-dialog .el-overlay {
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(2px);
 }
 
 /* ── 手机端：撑满全屏、贴顶贴底、无圆角 ── */
@@ -1824,33 +1886,34 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
   min-width: 0;
 }
 .od-title-main {
-  font-size: 17px;
+  font-size: 14px;
   font-weight: 700;
-  color: var(--el-text-color-primary, #111827);
+  color: var(--pf-text);
   letter-spacing: 0.01em;
 }
 .od-title-sub {
-  font-size: 12px;
-  color: var(--el-text-color-secondary, #6b7280);
+  font-size: 10px;
+  color: var(--pf-dim);
 }
 .od-close {
-  width: 36px;
-  height: 36px;
-  border-radius: 10px;
-  border: 1px solid rgb(250, 250, 250);
-  background: rgba(0, 0, 0, 0.03);
-  color: var(--el-text-color-secondary, #6b7280);
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  border: 1px solid var(--pf-border-2);
+  background: #0a0f1a;
+  color: var(--pf-muted);
   display: inline-flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
   transition: background 0.15s, color 0.15s, border-color 0.15s, transform 0.1s;
   flex-shrink: 0;
+  font-size: 14px;
 }
 .od-close:hover {
-  background: #fef2f2;
-  color: #dc2626;
-  border-color: #fecaca;
+  background: #16213a;
+  color: var(--pf-text);
+  border-color: #2b3a5c;
 }
 .od-close:active { transform: scale(0.94); }
 .od-close:focus-visible {
@@ -1866,14 +1929,10 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
   padding-bottom: 6px;
 }
 
-/* ── Tabs ── */
+/* ── Tabs（原型：三个等宽分段按钮）── */
 .od-tabs {
   display: flex;
-  gap: 8px;
-  padding: 4px;
-  background: var(--el-fill-color-blank, #f3f4f6);
-  border-radius: 12px;
-  border: 1px solid var(--el-border-color-lighter, #e5e7eb);
+  gap: 6px;
 }
 .od-tab {
   flex: 1 1 0;
@@ -1881,23 +1940,27 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
   align-items: center;
   justify-content: center;
   gap: 6px;
-  height: 40px;
-  border: none;
-  background: transparent;
+  height: 36px;
+  border: 1px solid var(--pf-border-2);
+  background: #0a0f1a;
   border-radius: 8px;
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 600;
-  color: var(--el-text-color-secondary, #6b7280);
+  color: var(--pf-muted);
   cursor: pointer;
-  transition: background 0.15s, color 0.15s, box-shadow 0.15s, transform 0.1s;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
 }
-.od-tab:hover { color: var(--el-text-color-primary, #111827); }
+.od-tab:hover:not(.active) {
+  border-color: #2b3a5c;
+  color: var(--pf-text);
+}
 .od-tab.active {
-  background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);
-  color: #ffffff;
-  box-shadow: 0 4px 14px rgba(37, 99, 235, 0.32);
+  background: var(--pf-blue);
+  border-color: transparent;
+  color: #fff;
+  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.4);
 }
-.od-tab-icon { font-size: 15px; line-height: 1; }
+.od-tab-icon { font-size: 14px; line-height: 1; }
 .od-tab-label { letter-spacing: 0.02em; }
 
 /* ── Row（label 左 / control 右）── */
@@ -1906,28 +1969,27 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 12px;
-  background: var(--el-bg-color, #ffffff);
-  border: 1px solid var(--el-border-color-lighter, #e5e7eb);
-  border-radius: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid #16213a;
 }
+.od-row:last-child { border-bottom: none; }
 .od-row-text { min-width: 0; flex: 1 1 auto; }
 .od-row-label {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--el-text-color-primary, #111827);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--pf-text);
   line-height: 1.3;
 }
 .od-row-label.required::before {
   content: '*';
-  color: #ef4444;
+  color: #f6465d;
   margin-right: 2px;
 }
 .od-row-sub {
-  font-size: 12px;
-  color: var(--el-text-color-secondary, #6b7280);
+  font-size: 10px;
+  color: var(--pf-dim);
   margin-top: 2px;
-  line-height: 1.4;
+  line-height: 1.5;
 }
 .od-row-control {
   display: inline-flex;
@@ -1938,40 +2000,40 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
 }
 .od-row-control.readonly {
   padding: 6px 10px;
-  background: var(--el-fill-color-blank, #f3f4f6);
+  background: #0a0f1a;
+  border: 1px solid var(--pf-border-2);
   border-radius: 8px;
-  font-size: 13px;
-  color: var(--el-text-color-primary, #111827);
+  font-size: 12px;
+  color: var(--pf-text);
   font-family: var(--mono);
 }
-.od-row-control.muted { color: var(--el-text-color-secondary, #6b7280); }
+.od-row-control.muted { color: var(--pf-dim); }
 .od-hint-inline {
-  font-size: 11px;
-  color: #ef4444;
+  font-size: 10px;
+  color: #f6465d;
   margin-left: 6px;
 }
 
 .od-select,
 .od-input {
-  height: 36px;
+  height: 32px;
   padding: 0 10px;
-  border: 1px solid var(--el-border-color, #d1d5db);
-  background: var(--el-bg-color, #ffffff);
+  border: 1px solid var(--pf-border-2);
+  background: #0a0f1a;
   border-radius: 8px;
-  font-size: 14px;
-  color: var(--el-text-color-primary, #111827);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--pf-text);
   outline: none;
-  transition: border-color 0.15s, box-shadow 0.15s;
+  transition: border-color 0.15s;
   min-width: 0;
 }
 .od-input { width: 110px; }
 .od-input.center { text-align: center; }
 .od-select { width: 130px; }
 .od-select:focus,
-.od-input:focus {
-  border-color: #2563eb;
-  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.18);
-}
+.od-input:focus { border-color: var(--pf-blue); }
+.od-input::placeholder { color: var(--pf-faint); }
 
 /* 单选按钮组（网格模式 / 网格方向） */
 .od-seg {
@@ -1980,8 +2042,8 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
   gap: 0;
   height: 32px;
   padding: 2px;
-  background: var(--el-fill-color-blank, #f3f4f6);
-  border: 1px solid var(--el-border-color, #d1d5db);
+  background: #0a0f1a;
+  border: 1px solid var(--pf-border-2);
   border-radius: 8px;
 }
 .od-seg-btn {
@@ -1989,23 +2051,21 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
   border: 0;
   background: transparent;
   font: inherit;
-  font-size: 13px;
-  color: var(--el-text-color-regular, #374151);
-  padding: 0 14px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--pf-muted);
+  padding: 0 10px;
   height: 100%;
   border-radius: 6px;
   cursor: pointer;
-  transition: background-color 0.15s, color 0.15s, box-shadow 0.15s;
+  transition: background-color 0.15s, color 0.15s;
   white-space: nowrap;
 }
-.od-seg-btn:hover:not(.active) {
-  color: #2563eb;
-}
+.od-seg-btn:hover:not(.active) { color: var(--pf-text); }
 .od-seg-btn.active {
-  background: #ffffff;
-  color: #2563eb;
-  font-weight: 600;
-  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+  background: var(--pf-blue);
+  color: #fff;
+  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.35);
 }
 .od-seg-btn:focus-visible {
   outline: 2px solid rgba(37, 99, 235, 0.35);
@@ -2015,47 +2075,47 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
 /* ── 网格试算提示 ── */
 .od-grid-sizing {
   margin: 2px 0 8px;
-  padding: 10px 12px;
-  background: rgba(37, 99, 235, 0.04);
-  border: 1px solid rgba(37, 99, 235, 0.15);
+  padding: 8px 10px;
+  background: rgba(37, 99, 235, 0.08);
+  border: 1px solid rgba(37, 99, 235, 0.25);
   border-radius: 8px;
-  font-size: 12px;
-  color: var(--el-text-color-secondary, #6b7280);
+  font-size: 10px;
+  color: var(--pf-muted);
 }
 .od-grid-sizing-row {
   display: flex;
   align-items: center;
   gap: 8px;
-  min-height: 20px;
+  min-height: 18px;
 }
 .od-grid-sizing-state {
   flex: 1 1 auto;
-  line-height: 1.45;
+  line-height: 1.5;
   word-break: break-word;
 }
-.od-grid-sizing-state.muted { color: var(--el-text-color-secondary, #9ca3af); }
-.od-grid-sizing-state.ok { color: #15803d; }
-.od-grid-sizing-state.warn { color: #b91c1c; }
+.od-grid-sizing-state.muted { color: var(--pf-dim); }
+.od-grid-sizing-state.ok { color: #4ade80; }
+.od-grid-sizing-state.warn { color: #fbbf24; }
 .od-grid-sizing-reload {
   flex: 0 0 auto;
   appearance: none;
   border: 0;
   background: transparent;
-  width: 26px;
-  height: 26px;
+  width: 22px;
+  height: 22px;
   border-radius: 6px;
   cursor: pointer;
-  font-size: 16px;
+  font-size: 14px;
   line-height: 1;
-  color: var(--el-text-color-secondary, #6b7280);
+  color: var(--pf-muted);
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  transition: background-color 0.15s, color 0.15s;
+  transition: background 0.15s, color 0.15s;
 }
 .od-grid-sizing-reload:hover:not(:disabled) {
-  background: rgba(37, 99, 235, 0.12);
-  color: #2563eb;
+  background: rgba(37, 99, 235, 0.15);
+  color: #60a5fa;
 }
 .od-grid-sizing-reload:disabled {
   cursor: not-allowed;
@@ -2073,37 +2133,40 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
   margin: 6px 0 0;
   padding: 0;
   list-style: none;
-  font-size: 11px;
+  font-size: 10px;
   line-height: 1.5;
 }
-.od-grid-sizing-warns li.lvl-warn { color: #b45309; }
-.od-grid-sizing-warns li.lvl-info { color: var(--el-text-color-secondary, #6b7280); }
+.od-grid-sizing-warns li.lvl-warn { color: #fbbf24; }
+.od-grid-sizing-warns li.lvl-info { color: var(--pf-dim); }
+/* ── 数字输入 + 单位（原型 Yt：h-8 / 右对齐 / 等宽数字）── */
 .od-input-affix {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 0 10px;
-  background: var(--el-bg-color, #ffffff);
-  border: 1px solid var(--el-border-color, #d1d5db);
+  gap: 4px;
+  padding: 0 8px 0 0;
+  background: #0a0f1a;
+  border: 1px solid var(--pf-border-2);
   border-radius: 8px;
+  transition: border-color 0.15s;
 }
+.od-input-affix:focus-within { border-color: var(--pf-blue); }
 .od-input-affix .od-input {
   border: none;
   outline: none;
   background: transparent;
-  padding: 0;
+  padding: 0 8px;
   height: 32px;
   flex: 1 1 auto;
-  width: 110px;
+  width: 96px;
   text-align: right;
-}
-.od-input-affix:focus-within {
-  border-color: #2563eb;
-  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.18);
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--pf-text);
 }
 .od-affix {
-  font-size: 11px;
-  color: var(--el-text-color-secondary, #6b7280);
+  font-size: 10px;
+  color: var(--pf-dim);
   letter-spacing: 0.04em;
 }
 
@@ -2111,63 +2174,68 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
   display: inline-flex;
   align-items: center;
   gap: 0;
-  border: 1px solid var(--el-border-color, #d1d5db);
+  border: 1px solid var(--pf-border-2);
   border-radius: 8px;
   overflow: hidden;
-  background: var(--el-bg-color, #ffffff);
+  background: #0a0f1a;
 }
 .od-step {
-  width: 32px;
-  height: 36px;
+  width: 28px;
+  height: 32px;
   border: none;
   background: transparent;
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 600;
-  color: var(--el-text-color-secondary, #6b7280);
+  color: var(--pf-muted);
   cursor: pointer;
   transition: background 0.15s, color 0.15s;
 }
 .od-step:hover {
-  background: var(--el-fill-color-light, #f3f4f6);
-  color: var(--el-text-color-primary, #111827);
+  background: #16213a;
+  color: var(--pf-text);
 }
 .od-stepper .od-input {
   border: none;
-  border-left: 1px solid var(--el-border-color-lighter, #e5e7eb);
-  border-right: 1px solid var(--el-border-color-lighter, #e5e7eb);
+  border-left: 1px solid var(--pf-border-2);
+  border-right: 1px solid var(--pf-border-2);
   border-radius: 0;
-  width: 70px;
-  height: 36px;
+  width: 64px;
+  height: 32px;
   box-shadow: none;
+  font-family: var(--mono);
+  text-align: center;
 }
 
-/* ── Section header ── */
+/* ── Section header（原型：左侧色条 + 小标题）── */
 .od-section {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   font-size: 12px;
-  font-weight: 700;
-  color: var(--el-text-color-secondary, #6b7280);
-  letter-spacing: 0.04em;
-  padding-left: 10px;
-  border-left: 3px solid #2563eb;
+  font-weight: 600;
+  color: var(--pf-text);
+  letter-spacing: 0.02em;
+  padding-left: 8px;
+  border-left: 3px solid var(--pf-blue);
   margin-top: 4px;
-  text-transform: uppercase;
 }
 
 /* ── Hint / Error ── */
 .od-hint {
-  font-size: 12px;
-  color: var(--el-text-color-secondary, #6b7280);
-  background: var(--el-fill-color-blank, #f3f4f6);
-  padding: 10px 12px;
+  font-size: 10px;
+  color: var(--pf-dim);
+  background: var(--pf-soft);
+  border: 1px solid var(--pf-border-2);
+  padding: 8px 10px;
   border-radius: 8px;
-  line-height: 1.5;
+  line-height: 1.6;
 }
 .od-error {
-  font-size: 12px;
-  color: #b91c1c;
-  background: #fef2f2;
-  border: 1px solid #fecaca;
-  padding: 10px 12px;
+  font-size: 11px;
+  color: #f87171;
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  padding: 8px 10px;
   border-radius: 8px;
   line-height: 1.5;
 }
@@ -2179,14 +2247,14 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
   justify-content: center;
   gap: 6px;
   padding: 16px;
-  color: var(--el-text-color-secondary, #6b7280);
-  font-size: 13px;
+  color: var(--pf-dim);
+  font-size: 12px;
 }
 .od-loading-dot {
-  width: 8px;
-  height: 8px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
-  background: #2563eb;
+  background: var(--pf-blue);
   animation: od-bounce 1.4s ease-in-out infinite both;
 }
 .od-loading-dot:nth-child(1) { animation-delay: -0.32s; }
@@ -2196,55 +2264,14 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
   40% { transform: scale(1); opacity: 1; }
 }
 
-/* ── 概要行（仅市价开仓展示品种/分组/方向） ── */
-.od-summary {
-  display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
-  margin-bottom: 4px;
-}
-.od-summary-item {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  background: var(--el-fill-color-blank, #f3f4f6);
-  border-radius: 6px;
-  padding: 4px 10px;
-  font-size: 12px;
-}
-.od-summary-k {
-  color: var(--el-text-color-secondary, #6b7280);
-}
-.od-summary-v {
-  color: var(--el-text-color-primary, #111827);
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-}
-
-
-/* ── 概要行（仅市价开仓展示品种/分组/方向） ── */
-.od-summary {
-  display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
-  margin-bottom: 4px;
-}
-.od-summary-item {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  background: var(--el-fill-color-blank, #f3f4f6);
-  border-radius: 6px;
-  padding: 4px 10px;
-  font-size: 12px;
-}
-.od-summary-k {
-  color: var(--el-text-color-secondary, #6b7280);
-}
-.od-summary-v {
-  color: var(--el-text-color-primary, #111827);
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
+/* ── 底部脚注（原型 Oh 的参数摘要行）── */
+.od-footnote {
+  margin: 4px 0 0;
+  padding-top: 10px;
+  border-top: 1px solid #16213a;
+  font-size: 10px;
+  line-height: 1.6;
+  color: var(--pf-faint);
 }
 
 /* ── Footer ── */
@@ -2259,17 +2286,17 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  font-size: 12px;
-  color: var(--el-text-color-secondary, #6b7280);
+  font-size: 10px;
+  color: var(--pf-muted);
 }
-.od-carry-label { font-weight: 600; color: var(--el-text-color-primary, #111827); }
-.od-carry-sub { font-size: 11px; }
+.od-carry-label { font-weight: 600; color: var(--pf-text); font-size: 12px; }
+.od-carry-sub { font-size: 10px; }
 
 /* 暂停提示：主人已暂停接单时，「带单」开关看着能开但实际只发主节点。
    摆在这里说清楚，免得主人以为开关失灵。 */
 .od-carry-note {
-  font-size: 11px;
-  color: #b45309;
+  font-size: 10px;
+  color: #fbbf24;
   line-height: 1.5;
   max-width: 220px;
 }
@@ -2286,25 +2313,25 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  height: 36px;
-  padding: 0 18px;
+  height: 38px;
+  padding: 0 22px;
   border: none;
-  border-radius: 10px;
+  border-radius: 8px;
   font-size: 13px;
   font-weight: 700;
   color: #ffffff;
   background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);
-  box-shadow: 0 4px 14px rgba(37, 99, 235, 0.28);
+  box-shadow: 0 2px 10px rgba(37, 99, 235, 0.4);
   cursor: pointer;
   transition: transform 0.1s, box-shadow 0.15s, opacity 0.15s;
   white-space: nowrap;
 }
-.od-btn-primary:hover { box-shadow: 0 6px 18px rgba(37, 99, 235, 0.36); }
+.od-btn-primary:hover { box-shadow: 0 4px 14px rgba(37, 99, 235, 0.5); }
 .od-btn-primary:active { transform: translateY(1px); }
 .od-btn-primary:disabled { opacity: 0.55; cursor: not-allowed; box-shadow: none; }
 .od-btn-primary-main { font-size: 13px; }
 .od-btn-primary-sub {
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 500;
   opacity: 0.85;
   letter-spacing: 0.02em;

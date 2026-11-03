@@ -28,12 +28,15 @@ async def record_signal(signal_id, signal, source_ip=None, parsed_ok=True,
                         dispatch_mode=None, status="dispatching",
                         raw_payload: Optional[str] = None,
                         source: str = "tradingview",
-                        model: str = "normal") -> None:
+                        model: str = "normal",
+                        reject_code: Optional[str] = None) -> None:
     """落库一条信号历史。
 
     source：tradingview（外部 Webhook）/ manual（中控台手动触发）/
     limit_watch（分组限价挂单监听）。
     model：处理模型，normal（按币种分发）/ strategy（按分组分发）。
+    reject_code：整体拒收原因的结构化编码（见 signal_codes.REJECT_CODES）；
+    仅统计用，写漏不影响交易。
     """
     payload_str = raw_payload
     if payload_str is None and signal is not None:
@@ -56,6 +59,7 @@ async def record_signal(signal_id, signal, source_ip=None, parsed_ok=True,
                     status=status,
                     source=source,
                     model=model,
+                    reject_code=reject_code,
                 )
             )
             await s.commit()
@@ -64,11 +68,13 @@ async def record_signal(signal_id, signal, source_ip=None, parsed_ok=True,
 
 
 async def record_dispatch(signal_id, node_id, decided_vol, gate_result,
-                          skip_reason, status, sent_at: Optional[datetime] = None) -> None:
+                          skip_reason, status, sent_at: Optional[datetime] = None,
+                          skip_code: Optional[str] = None) -> None:
     """落库一条分发明细（pending / skipped），终态时尝试收口信号整体状态。
 
     sent_at：服务端把命令交给节点的时刻（发包时刻）。它是跨节点唯一可比的时间轴，
     缺省时不写该列。
+    skip_code：跳过原因的结构化编码（见 signal_codes.SKIP_CODES）；统计按它聚合。
     """
     try:
         async with SessionLocal() as s:
@@ -82,6 +88,7 @@ async def record_dispatch(signal_id, node_id, decided_vol, gate_result,
                     status=status,
                     dispatched_at=datetime.now(),
                     sent_at=sent_at,
+                    skip_code=skip_code,
                 )
             )
             if status in _DISPATCH_TERMINAL:
@@ -154,11 +161,13 @@ async def update_signal_status(signal_id: str, status: str) -> None:
         logger.warning("update_signal_status failed: %s", e)
 
 
-async def update_dispatch_result(signal_id, node_id, status, result: Optional[dict] = None) -> None:
+async def update_dispatch_result(signal_id, node_id, status, result: Optional[dict] = None,
+                                 skip_code: Optional[str] = None) -> None:
     """根据节点回报更新分发明细的最终结果，并尝试收口信号整体状态。
 
     回报里若带时延埋点（recv_at / order_at / filled_at / queued_ms /
     order_to_fill_ms），一并落库——这些是观测字段，缺失或非法都不影响交易逻辑。
+    skip_code：失败 / 跳过时的结构化编码（见 signal_codes.SKIP_CODES）。
     """
     result = result or {}
     try:
@@ -172,6 +181,8 @@ async def update_dispatch_result(signal_id, node_id, status, result: Optional[di
                 "error": result.get("error"),
                 "finished_at": datetime.now(),
             }
+            if skip_code:
+                values["skip_code"] = skip_code
             values.update(latency_marks.extract(result))
             await s.execute(
                 update(SignalDispatch)

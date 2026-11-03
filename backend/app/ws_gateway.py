@@ -27,6 +27,7 @@ from . import (
     results,
     risk_control,
     rules,
+    signal_codes,
     strategy_precheck,
     system_settings,
 )
@@ -435,7 +436,10 @@ async def _on_trade_result(node_id: str, data: dict) -> None:
     )
     if handled is None:
         status = "done" if data.get("success") else "failed"
-        await persist.update_dispatch_result(signal_id, node_id, status, data)
+        await persist.update_dispatch_result(
+            signal_id, node_id, status, data,
+            skip_code=None if data.get("success") else signal_codes.SKIP_ERROR_MT5,
+        )
     else:
         # 首单失败会让子任务直接收口，此时要放开该节点该品种的占位
         await _release_node_busy(handled)

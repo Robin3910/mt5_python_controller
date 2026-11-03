@@ -1521,6 +1521,346 @@ export interface PaginatedSignalEvents {
   page_size: number
 }
 
+/* ══════════════════════════════════════════════════════════════════════
+   信号管理中心（Signal Center）
+   —— 后端 `signal_stats` 是这套口径的唯一实现，前端只展示，不再自己算。
+   ══════════════════════════════════════════════════════════════════════ */
+
+/** 概览总量。
+ *
+ * 注意两套成功率口径不可混用：
+ * - `signal_success_rate`：信号级，分母 = 非拒收信号数
+ * - `dispatch_success_rate`：分发级，分母 = 投递总数
+ */
+export interface SignalCenterTotals {
+  signals: number
+  accepted: number
+  rejected: number
+  /** 去重抑制次数：本期不采集（恒为 0），`duplicate_collected=false` 时前端显示「—」 */
+  duplicate: number
+  duplicate_collected: boolean
+  dispatch_total: number
+  passed: number
+  skipped: number
+  failed: number
+  pending: number
+  signal_success_rate: number
+  dispatch_success_rate: number
+  avg_targets_per_signal: number
+}
+
+export interface SignalStatusCount {
+  status: string
+  count: number
+}
+
+export interface SignalSourceCount {
+  source: string
+  count: number
+}
+
+export interface SignalModelCount {
+  model: string
+  count: number
+}
+
+export interface SignalSymbolCount {
+  symbol: string
+  count: number
+  success_rate: number
+}
+
+/** 拦截原因（按结构化 skip_code 聚合，不解析中文文案） */
+export interface SignalSkipReasonCount {
+  code: string
+  label: string
+  count: number
+}
+
+/** 每日信号量（后端已按 UTC+8 自然日分好，前端不再本地换算） */
+export interface SignalDailyPoint {
+  date: string
+  ts: number
+  signals: number
+  accepted: number
+  failed: number
+  success_rate: number
+}
+
+export interface SignalCenterOverview {
+  window: string
+  from_ts: number | null
+  totals: SignalCenterTotals
+  status_distribution: SignalStatusCount[]
+  by_source: SignalSourceCount[]
+  by_model: SignalModelCount[]
+  by_symbol: SignalSymbolCount[]
+  skip_reasons: SignalSkipReasonCount[]
+  daily: SignalDailyPoint[]
+  updated_at: number
+}
+
+/** 统一信号流里的一条分发明细 */
+export interface SignalStreamDispatch {
+  node_id: string
+  model: string
+  status: string
+  skip_code: string | null
+  skip_label: string | null
+  skip_reason: string | null
+  decided_vol: number | null
+  error: string | null
+}
+
+/** 统一信号流里的一条信号（normal + strategy 混排） */
+export interface SignalStreamItem {
+  signal_id: string
+  received_at: number | null
+  source: string
+  model: string
+  action: string | null
+  symbol: string | null
+  volume: number | null
+  status: string
+  reject_code: string | null
+  reject_label: string | null
+  targets: number
+  done: number
+  skipped: number
+  failed: number
+  /** 端到端耗时（毫秒，服务端时钟） */
+  elapsed_ms: number | null
+  dispatches: SignalStreamDispatch[]
+}
+
+export interface SignalCenterStream {
+  items: SignalStreamItem[]
+  next_cursor: string | null
+}
+
+/** 单条信号明细里的分发明细 */
+export interface SignalDetailDispatch {
+  node_id: string
+  model: string
+  status: string
+  gate_result: string
+  skip_code: string | null
+  skip_label: string | null
+  skip_reason: string | null
+  decided_vol: number | null
+  sent_at: number | null
+  finished_at: number | null
+  /** 节点内排队（仅节点内可比） */
+  queued_ms: number | null
+  /** 券商往返（仅节点内可比） */
+  order_to_fill_ms: number | null
+  error: string | null
+}
+
+/** strategy 链路的主任务摘要 */
+export interface SignalDetailGroupTask {
+  task_id: number
+  group_id: string
+  group_name: string | null
+  strategy_name: string | null
+  status: string
+  skip_code: string | null
+  skip_label: string | null
+  skip_reason: string | null
+  node_count: number
+  total_orders: number
+  total_volume: number
+  /** 口径：group_signal_task.realized_profit，与成交侧净盈亏不可加总 */
+  realized_profit: number
+  opened_at: number | null
+  finished_at: number | null
+}
+
+/** 单条信号的完整明细（含原始 Webhook 载荷） */
+export interface SignalCenterDetail {
+  signal_id: string
+  received_at: number | null
+  source_ip: string | null
+  raw_payload: string | null
+  action: string | null
+  symbol: string | null
+  volume: number | null
+  sl: number | null
+  tp: number | null
+  comment: string | null
+  parsed_ok: boolean
+  dispatch_mode: string | null
+  status: string
+  source: string
+  model: string
+  reject_code: string | null
+  reject_label: string | null
+  dispatches: SignalDetailDispatch[]
+  group_tasks: SignalDetailGroupTask[]
+}
+
+/** 一个节点的命中统计 */
+export interface SignalNodeHit {
+  node_id: string
+  node_name: string
+  signal_count: number
+  dispatch_count: number
+  done: number
+  skipped: number
+  failed: number
+  pending: number
+  success_rate: number
+  /** 端到端时延分位（服务端时钟，跨节点可比） */
+  latency_p50_ms: number | null
+  latency_p90_ms: number | null
+  top_skip_code: string | null
+  top_skip_label: string | null
+  /** 节点内两段耗时：只在同一节点内部可比，不可跨节点比较 */
+  queued_p50_ms: number | null
+  queued_p90_ms: number | null
+  fill_p50_ms: number | null
+  fill_p90_ms: number | null
+}
+
+export interface SignalCenterNodes {
+  items: SignalNodeHit[]
+}
+
+export interface SignalLatencyBucket {
+  p50: number | null
+  p90: number | null
+  samples: number
+  /** server_clock（跨节点可比）/ node_local（仅节点内可比） */
+  scope: string
+  note?: string | null
+}
+
+export interface SignalLatencyEndToEnd extends SignalLatencyBucket {
+  p99: number | null
+}
+
+export interface SignalNodeLatencyRow {
+  node_id: string
+  queued_p50: number | null
+  queued_p90: number | null
+  fill_p50: number | null
+  fill_p90: number | null
+}
+
+export interface SignalSlowNode {
+  node_id: string
+  p50: number | null
+  p90: number | null
+  samples: number
+}
+
+export interface SignalDailyLatencyPoint {
+  date: string
+  ts: number
+  p50: number | null
+  p90: number | null
+  samples: number
+}
+
+export interface SignalCenterLatency {
+  window: string
+  end_to_end: SignalLatencyEndToEnd
+  queued_ms: SignalLatencyBucket
+  order_to_fill_ms: SignalLatencyBucket
+  by_node: SignalNodeLatencyRow[]
+  slow_nodes: SignalSlowNode[]
+  daily: SignalDailyLatencyPoint[]
+  note: string
+}
+
+/** 一个分组的策略任务汇总 */
+export interface SignalStrategyTaskItem {
+  group_id: string
+  group_name: string
+  tasks: number
+  orders: number
+  volume: number
+  /**
+   * 口径：`group_signal_task.realized_profit`（任务收口时节点上报的累计值）。
+   * 与成交侧逐笔净盈亏（deal_stats）**不是同一口径**，两者不可加总。
+   */
+  realized_profit: number
+  statuses: Record<string, number>
+}
+
+export interface SignalStrategyTaskTotals {
+  tasks: number
+  orders: number
+  volume: number
+  realized_profit: number
+}
+
+/** 主任务下的节点子任务 */
+export interface SignalStrategyTaskDispatch {
+  node_id: string
+  status: string
+  skip_code: string | null
+  skip_label: string | null
+  skip_reason: string | null
+  decided_vol: number | null
+  total_orders: number
+  total_volume: number
+  realized_profit: number
+  finish_reason: string | null
+  error: string | null
+  queued_ms: number | null
+  order_to_fill_ms: number | null
+  dispatched_at: number | null
+  finished_at: number | null
+}
+
+/** 一个策略主任务（含子任务明细） */
+export interface SignalStrategyTaskDetail {
+  task_id: number
+  signal_id: string
+  group_id: string
+  group_name: string
+  strategy_name: string | null
+  symbol: string | null
+  action: string | null
+  volume: number | null
+  status: string
+  skip_code: string | null
+  skip_label: string | null
+  skip_reason: string | null
+  node_count: number
+  total_orders: number
+  total_volume: number
+  /** 口径：group_signal_task.realized_profit，与成交侧净盈亏不可加总 */
+  realized_profit: number
+  created_at: number | null
+  opened_at: number | null
+  finished_at: number | null
+  dispatches: SignalStrategyTaskDispatch[]
+}
+
+export interface SignalCenterTasks {
+  items: SignalStrategyTaskItem[]
+  totals: SignalStrategyTaskTotals
+  /** 主任务列表（含子任务），用于从汇总下钻到具体任务 */
+  tasks: SignalStrategyTaskDetail[]
+  /** 明确标注这批盈亏的口径来源 */
+  profit_scope: string
+}
+
+/** 信号中心的统一筛选参数（四个接口共用同一套语义） */
+export interface SignalCenterQuery {
+  window?: string
+  source?: string | null
+  model?: string | null
+  symbol?: string | null
+  action?: string | null
+  status?: string | null
+  node_id?: string | null
+  group_id?: string | null
+  keyword?: string | null
+}
+
 export interface AuditRecord {
   id: number
   ts: number | null

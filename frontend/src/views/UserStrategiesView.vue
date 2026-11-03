@@ -20,6 +20,7 @@ import type {
   NodeOut,
   QuoteInfo,
   StrategyOut,
+  StrategyRule,
 } from '@/api/types'
 
 /** AI 智能加仓策略模版 ID（与后端 strategy_templates.TEMPLATE_1_ID 对齐） */
@@ -236,6 +237,40 @@ const activeTab = ref<'strategy' | 'ai'>('strategy')
 /** 是否有 AI 智能加仓策略权限 */
 const canUseAi = computed(() => auth.canUseAiStrategy)
 
+/**
+ * 三个开仓策略入口卡（1:1 复刻 UI/H5.html 原型「开仓策略」区的三张卡）。
+ * icon 为 inline SVG path，accent 为图标色 / 底色（15% 透明度）。
+ */
+const OPEN_STRATEGY_ENTRIES: ReadonlyArray<{
+  key: TradingStrategyType
+  title: string
+  desc: string
+  accent: string
+  icon: string
+}> = [
+  {
+    key: 'trend_market',
+    title: '市价开仓',
+    desc: '以损定量 · 底仓比例 · 盈亏比 · 保本触发 · 底仓追踪止盈',
+    accent: '#3B82F6',
+    icon: '<path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z" stroke-linejoin="round"/>',
+  },
+  {
+    key: 'trend_limit',
+    title: '限价开仓',
+    desc: '以损定量 · 底仓比例 · 盈亏比 · 保本触发 · 底仓追踪止盈',
+    accent: '#F59E0B',
+    icon: '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/><path d="M12 1.5v3M12 19.5v3M1.5 12h3M19.5 12h3"/>',
+  },
+  {
+    key: 'grid',
+    title: '智能吸筹',
+    desc: '以损定量 · 向上追踪 · 网格模式',
+    accent: '#22C55E',
+    icon: '<path d="M3 6h18M3 12h18M3 18h18"/><path d="M6 4v16M12 4v16M18 4v16"/><path d="M4 8l4 4M8 8l-4 4M16 8l4 4M20 8l-4 4M4 16l4-2M8 16l-4-2M16 14l4 4M20 14l-4 4"/>',
+  },
+]
+
 const dialogVisible = ref(false)
 const submitting = ref(false)
 const lastError = ref('')
@@ -404,6 +439,85 @@ watch(activeTab, (tab) => {
 })
 
 /**
+ * 当前品种下已配置的开仓策略（按 entry_mode 归类）。
+ *
+ * 开仓策略的「已配置」口径 = 该品种下存在一条对应 entry_mode 的以损定量 / 网格规则。
+ * entry_mode 是策略被创建时锁死的，市价与限价各用各的策略，互不复用。
+ */
+const symbolStrategies = ref<StrategyOut[]>([])
+
+/** 拉当前品种的策略列表（用于统计已配置项） */
+async function fetchSymbolStrategies(): Promise<void> {
+  try {
+    await hub.fetchStrategies()
+    const sym = (currentSymbol.value || '').toUpperCase()
+    symbolStrategies.value = (hub.strategies || []).filter(
+      (s) => (s.symbol || '').toUpperCase() === sym,
+    )
+  } catch {
+    symbolStrategies.value = []
+  }
+}
+
+/** 当前品种已配置的开仓策略数量（市价 + 限价 + 智能吸筹） */
+const configuredStrategyCount = computed(() => {
+  if (activeTab.value === 'ai') {
+    return aiStrategies.value.filter(
+      (s) => (s.symbol || '').toUpperCase() === (currentSymbol.value || '').toUpperCase(),
+    ).length
+  }
+  return OPEN_STRATEGY_ENTRIES.filter((e) => !!entryConfiguredRule(e.key)).length
+})
+
+/**
+ * 某个开仓策略入口对应的「已配置规则」。
+ * - 市价 / 限价：type=3 以损定量规则，按 entry_mode（market / limit）区分
+ * - 智能吸筹：type=4 网格规则
+ */
+function entryConfiguredRule(key: TradingStrategyType): StrategyRule | null {
+  for (const s of symbolStrategies.value) {
+    for (const r of s.rules || []) {
+      if (key === 'grid') {
+        if (r.type === 4) return r
+        continue
+      }
+      if (r.type === 3) {
+        const mode = key === 'trend_market' ? 'market' : 'limit'
+        if ((r.entry_mode ?? 'market') === mode) return r
+      }
+    }
+  }
+  return null
+}
+
+/** 入口卡底部的配置摘要：已配置 → 参数摘要；未配置 → 引导文案 */
+function entryStateParams(key: TradingStrategyType): Array<{ label: string; value: string }> {
+  const r = entryConfiguredRule(key)
+  if (!r) return []
+  const out: Array<{ label: string; value: string }> = []
+  if (key === 'grid') {
+    if (r.price_lower != null) out.push({ label: '下限', value: String(r.price_lower) })
+    if (r.price_upper != null) out.push({ label: '上限', value: String(r.price_upper) })
+    if (r.grid_count != null) out.push({ label: '格数', value: String(r.grid_count) })
+    return out
+  }
+  if (r.risk_amount != null) out.push({ label: '以损定量', value: `${r.risk_amount} USD` })
+  if (r.rr_ratio != null) out.push({ label: '盈亏比', value: `1:${r.rr_ratio}` })
+  return out
+}
+
+/** 可配置项总数：开仓策略 3 项 / AI 智能交易策略按已配置机器人数 */
+const totalStrategyCount = computed(() =>
+  activeTab.value === 'ai'
+    ? Math.max(symbolStrategies.value.length, configuredStrategyCount.value)
+    : OPEN_STRATEGY_ENTRIES.length,
+)
+
+watch(currentSymbol, () => {
+  void fetchSymbolStrategies()
+})
+
+/**
  * AI 策略保存成功后：按 (AI-Augmentation-用户名-MT5登录号-品种) 幂等创建分组，并把主节点加入、绑定该策略。
  * 已有同名分组则复用（补绑策略 + 补齐主节点）。
  */
@@ -509,6 +623,7 @@ onMounted(async () => {
       /* 节点尚未上报快照，忽略 */
     }
   }
+  void fetchSymbolStrategies()
   pollTimer = window.setInterval(() => {
     if (primaryNode.value) {
       hub.fetchNodeAccount(primaryNode.value.node_id).catch(() => {})
@@ -537,7 +652,33 @@ onBeforeUnmount(() => {
     </div>
 
     <template v-else>
-      
+      <!-- 页面标题卡（1:1 复刻 UI/H5.html 原型「策略配置」头部） -->
+      <section class="pf-card us-header">
+        <div class="pf-card-head">
+          <div class="pf-card-head-main">
+            <span class="pf-card-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3" />
+                <path d="M1 14h6M9 8h6M17 16h6" />
+              </svg>
+            </span>
+            <div>
+              <p class="pf-card-title">
+                策略配置
+                <span class="pf-count ok" style="background: rgba(34, 197, 94, 0.15); border-color: rgba(34, 197, 94, 0.3); color: #22c55e">
+                  {{ configuredStrategyCount }} / {{ totalStrategyCount }} 已配置
+                </span>
+              </p>
+              <p class="pf-card-sub">开仓策略与 AI 交易策略分频道管理，每个策略独立保存开仓参数</p>
+            </div>
+          </div>
+        </div>
+        <p class="us-header-note">
+          每个策略独立保存开仓参数，配置后自动应用到对应品种（当前
+          <span class="us-header-sym">{{ currentSymbol }}</span>）。
+        </p>
+      </section>
+
       <!-- 单品种报价 -->
       <div class="quote-board card card-pad">
         <div class="quote-col">
@@ -589,63 +730,89 @@ onBeforeUnmount(() => {
       </div>
 
       <!-- 底部 Tab 切换：开仓策略 / AI 交易 -->
-      <div class="strategy-tabs">
+      <div class="pf-tabs">
         <button
-          class="strategy-tab"
+          class="pf-tab"
           :class="{ active: activeTab === 'strategy' }"
+          role="tab"
+          :aria-selected="activeTab === 'strategy'"
           @click="activeTab = 'strategy'"
-        >开仓策略</button>
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z" />
+          </svg>
+          开仓策略
+        </button>
         <button
           v-if="canUseAi"
-          class="strategy-tab"
-          :class="{ active: activeTab === 'ai' }"
+          class="pf-tab"
+          :class="{ active: activeTab === 'ai', purple: true }"
+          role="tab"
+          :aria-selected="activeTab === 'ai'"
           @click="activeTab = 'ai'"
-        >AI 交易</button>
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 3v3M12 18v3M3 12h3M18 12h3" />
+            <circle cx="12" cy="12" r="4" />
+            <path d="m5.6 5.6 2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1" />
+          </svg>
+          AI 交易
+        </button>
       </div>
 
       <!-- Tab 内容 -->
       <template v-if="activeTab === 'strategy'">
-        <!-- 三个策略按钮 -->
-        <div class="action-bar">
+        <!-- 三个开仓策略入口卡 -->
+        <section class="pf-section-head">
+          <p class="pf-section-title"><span class="pf-bar"></span>开仓策略</p>
+          <span class="pf-count">{{ OPEN_STRATEGY_ENTRIES.length }} 项</span>
+        </section>
+
+        <div class="pf-entry-grid">
           <button
-            class="action-btn"
-            :class="{ 'action-btn-disabled': !isOnline }"
+            v-for="e in OPEN_STRATEGY_ENTRIES"
+            :key="e.key"
+            type="button"
+            class="pf-entry"
+            :style="{ '--entry-accent': e.accent }"
             :disabled="!isOnline"
-            @click="openDialog('trend_market')"
+            @click="openDialog(e.key)"
           >
-            <svg class="action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z" />
-            </svg>
-            <span class="action-label">市价开仓</span>
-          </button>
-          <div class="action-sep"></div>
-          <button
-            class="action-btn"
-            :class="{ 'action-btn-disabled': !isOnline }"
-            :disabled="!isOnline"
-            @click="openDialog('trend_limit')"
-          >
-            <svg class="action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <circle cx="12" cy="12" r="9" />
-              <circle cx="12" cy="12" r="5" />
-              <circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none" />
-              <path d="M12 1.5v3M12 19.5v3M1.5 12h3M19.5 12h3" />
-            </svg>
-            <span class="action-label">限价开仓</span>
-          </button>
-          <div class="action-sep"></div>
-          <button
-            class="action-btn"
-            :class="{ 'action-btn-disabled': !isOnline }"
-            :disabled="!isOnline"
-            @click="openDialog('grid')"
-          >
-            <svg class="action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M3 6h18M3 12h18M3 18h18" />
-              <path d="M6 4v16M12 4v16M18 4v16" />
-              <path d="M4 8l4 4M8 8l-4 4M16 8l4 4M20 8l-4 4M4 16l4-2M8 16l-4-2M16 14l4 4M20 14l-4 4" />
-            </svg>
-            <span class="action-label">智能吸筹</span>
+            <div class="pf-entry-head">
+              <span class="pf-entry-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" v-html="e.icon"></svg>
+              </span>
+              <div class="pf-entry-body">
+                <p class="pf-entry-title">{{ e.title }}</p>
+                <p class="pf-entry-desc">{{ e.desc }}</p>
+              </div>
+              <span class="pf-entry-chevron" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="m9 18 6-6-6-6" />
+                </svg>
+              </span>
+            </div>
+            <div
+              class="pf-entry-state"
+              :class="entryConfiguredRule(e.key) ? 'done' : 'empty'"
+            >
+              <p class="pf-entry-state-title">
+                <svg v-if="entryConfiguredRule(e.key)" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <circle cx="12" cy="12" r="9" />
+                  <path d="m8.5 12.5 2.5 2.5 4.5-5" />
+                </svg>
+                <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <circle cx="12" cy="12" r="9" />
+                  <path d="M12 8v8M8 12h8" />
+                </svg>
+                {{ entryConfiguredRule(e.key) ? '已配置' : `点击设置 ${e.title} 参数` }}
+              </p>
+              <div v-if="entryStateParams(e.key).length" class="pf-entry-state-params">
+                <span v-for="p in entryStateParams(e.key)" :key="p.label" class="pf-entry-param">
+                  {{ p.label }}<b>{{ p.value }}</b>
+                </span>
+              </div>
+            </div>
           </button>
         </div>
         <div v-if="!isOnline" class="offline-tip">主节点离线，无法触发</div>
@@ -653,30 +820,12 @@ onBeforeUnmount(() => {
 
       <!-- AI 交易 Tab（仅有权限者可见） -->
       <template v-else-if="activeTab === 'ai'">
-        <div class="ai-panel card card-pad">
-          <div class="ai-panel-head">
-            <div class="ai-panel-title">AI 智能加仓策略</div>
-            <!-- <div class="ai-panel-sub">
-              选择品种并配置加仓参数，保存后自动创建分组「{{ aiGroupName }}」并把你的主节点加入
-            </div> -->
-          </div>
+        <section class="pf-section-head">
+          <p class="pf-section-title"><span class="pf-bar" style="background: #7c3aed"></span>AI 智能交易策略</p>
+          <span class="pf-count" style="border-color: rgba(124, 58, 237, 0.4); color: #a78bfa">每个机器人独立配置</span>
+        </section>
 
-          <!-- <div class="ai-panel-sym">
-            <span class="ai-panel-sym-label">目标品种</span>
-            <div class="ai-panel-sym-chips">
-              <button
-                v-for="sym in availableSymbols"
-                :key="sym"
-                class="sym-chip"
-                :class="{ active: currentSymbol === sym }"
-                @click="pickSymbol(sym)"
-              >{{ sym }}</button>
-            </div>
-            <span v-if="!availableSymbols.length" class="muted" style="font-size: 12px">
-              主节点尚未上报任何品种报价
-            </span>
-          </div> -->
-
+        <div class="ai-panel">
           <!-- 该品种下已配置的 AI 策略：可点「编辑」改参数 -->
           <div v-if="symbolAiStrategies.length" class="ai-strategy-list">
             <div class="ai-list-head">
@@ -704,7 +853,7 @@ onBeforeUnmount(() => {
           </div>
 
           <button
-            class="btn-primary ai-panel-btn"
+            class="pf-btn pf-btn-primary ai-panel-btn"
             :disabled="aiGroupCreating || !availableSymbols.length"
             @click="openAiForm"
           >
@@ -753,6 +902,27 @@ onBeforeUnmount(() => {
   gap: 12px;
   /* 移动端风格：底部留出触达区 */
   padding-bottom: 8px;
+}
+
+/* ── 页面标题卡（原型「策略配置」头部）── */
+.us-header {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.us-header-note {
+  margin: 0;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--pf-border-2);
+  background: var(--pf-soft);
+  font-size: 10px;
+  line-height: 1.6;
+  color: var(--pf-dim);
+}
+.us-header-sym {
+  font-weight: 600;
+  color: #3b82f6;
 }
 
 /* ── Empty state ── */
@@ -948,48 +1118,21 @@ onBeforeUnmount(() => {
   padding: 6px 0 2px;
 }
 
-/* ── Action bar (3 个策略按钮) ── */
-/* ── 底部 Tab 切换 ── */
-.strategy-tabs {
-  display: flex;
-  gap: 4px;
-  padding: 4px;
-  margin-top: 8px;
-  background: var(--panel);
-  border: 1px solid var(--glass-border);
-  border-radius: var(--radius);
-  backdrop-filter: blur(var(--blur)) saturate(1.4);
-  -webkit-backdrop-filter: blur(var(--blur)) saturate(1.4);
-}
-.strategy-tab {
-  flex: 1 1 0;
-  appearance: none;
-  border: none;
-  background: transparent;
-  border-radius: var(--radius-sm);
-  padding: 10px 8px;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--muted);
-  cursor: pointer;
-  transition: background 0.15s, color 0.15s;
-  white-space: nowrap;
-}
-.strategy-tab:hover { color: var(--text); }
-.strategy-tab.active {
-  background: rgba(37, 99, 235, 0.18);
-  color: var(--primary);
-}
-
-/* ── AI 交易面板 ── */
+/* ── AI 交易面板（1:1 复刻 UI/H5.html 原型「AI 智能交易策略」区）── */
 .ai-panel {
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 10px;
+  margin-top: 8px;
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid #2a2147;
+  background: var(--pf-soft);
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
 }
 .ai-panel-head { display: flex; flex-direction: column; gap: 4px; }
-.ai-panel-title { font-size: 15px; font-weight: 700; color: var(--text); }
-.ai-panel-sub { font-size: 12px; color: var(--muted); line-height: 1.6; }
+.ai-panel-title { font-size: 12px; font-weight: 700; color: var(--pf-text); }
+.ai-panel-sub { font-size: 10px; color: var(--pf-dim); line-height: 1.6; }
 .ai-panel-sym { display: flex; flex-direction: column; gap: 8px; }
 .ai-panel-sym-label { font-size: 12px; color: var(--muted); }
 .ai-panel-sym-chips {
@@ -997,7 +1140,7 @@ onBeforeUnmount(() => {
   flex-wrap: wrap;
   gap: 8px;
 }
-.ai-panel-btn { width: 100%; padding: 12px; font-size: 14px; font-weight: 600; }
+.ai-panel-btn { width: 100%; height: 38px; font-size: 13px; font-weight: 600; }
 
 /* ── 已配置 AI 策略列表 ── */
 .ai-strategy-list {
@@ -1009,24 +1152,24 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  font-size: 12px;
-  color: var(--muted);
+  font-size: 10px;
+  color: var(--pf-dim);
 }
 .ai-strategy-item {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 10px 12px;
-  background: var(--panel-2, rgba(255, 255, 255, 0.03));
-  border: 1px solid var(--border);
+  padding: 10px;
+  background: var(--pf-card);
+  border: 1px solid #2a2147;
   border-radius: 10px;
 }
 .ai-item-main { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .ai-item-name {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--pf-text);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1034,14 +1177,14 @@ onBeforeUnmount(() => {
 .ai-item-meta { display: flex; flex-wrap: wrap; gap: 6px; }
 .ai-item-tag {
   padding: 2px 7px;
-  font-size: 11px;
-  color: var(--muted);
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid var(--border);
-  border-radius: 5px;
+  font-size: 10px;
+  color: #a78bfa;
+  background: rgba(124, 58, 237, 0.15);
+  border: 1px solid rgba(124, 58, 237, 0.4);
+  border-radius: 999px;
   line-height: 1.4;
 }
-.ai-item-tag.off { color: var(--muted); opacity: 0.75; }
+.ai-item-tag.off { color: var(--pf-muted); background: rgba(107, 122, 147, 0.15); border-color: var(--pf-border-2); }
 .ai-item-edit {
   flex-shrink: 0;
   padding: 6px 14px;
@@ -1066,58 +1209,6 @@ onBeforeUnmount(() => {
   border: 1px dashed var(--border);
   border-radius: 10px;
 }
-
-.action-bar {
-  position: sticky;
-  bottom: 12px;
-  display: flex;
-  align-items: stretch;
-  gap: 8px;
-  padding: 10px 12px;
-  margin-top: 8px;
-  background: var(--panel);
-  border: 1px solid var(--glass-border);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow), 0 0 24px rgba(0, 0, 0, 0.45);
-  backdrop-filter: blur(var(--blur)) saturate(1.4);
-  -webkit-backdrop-filter: blur(var(--blur)) saturate(1.4);
-}
-.action-btn {
-  flex: 1 1 0;
-  height: 64px;
-  padding: 4px 8px;
-  border-radius: var(--radius-sm);
-  font-size: 14px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  color: #ffffff;
-  border: none;
-  cursor: pointer;
-  background: linear-gradient(135deg, var(--primary) 0%, var(--primary-d) 100%);
-  box-shadow: 0 6px 20px rgba(37, 99, 235, 0.28);
-  transition: transform 0.1s, box-shadow var(--transition), filter var(--transition);
-  display: inline-flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-}
-.action-icon {
-  width: 22px;
-  height: 22px;
-  opacity: 0.85;
-  transition: transform var(--transition), opacity var(--transition);
-}
-.action-label {
-  line-height: 1.1;
-  font-size: 13px;
-}
-.action-btn:hover { filter: brightness(1.08); }
-.action-btn:hover .action-icon { opacity: 1; transform: translateY(-1px); }
-.action-btn:active { transform: translateY(1px); }
-.action-btn:disabled, .action-btn.action-btn-disabled { opacity: 0.45; cursor: not-allowed; box-shadow: none; }
-.action-btn:disabled .action-icon, .action-btn.action-btn-disabled .action-icon { opacity: 0.5; }
-.action-sep { width: 1px; background: var(--glass-border); flex-shrink: 0; }
 
 .offline-tip {
   font-size: 12px;
@@ -1481,9 +1572,6 @@ onBeforeUnmount(() => {
 @media (max-width: 640px) {
   .quote-mid { font-size: 26px; }
   .quote-col { padding: 14px 10px 12px; }
-  .action-btn { height: 56px; }
-  .action-icon { width: 18px; height: 18px; }
-  .action-label { font-size: 12px; }
   /* 手机端：隐藏表格，展示卡片 */
   .pos-table-wrap { display: none; }
   .pos-cards { display: block; }
@@ -1495,8 +1583,6 @@ onBeforeUnmount(() => {
 }
 @media (max-width: 420px) {
   .quote-mid { font-size: 24px; }
-  .action-bar { padding: 8px; gap: 6px; }
-  .action-btn { height: 52px; }
   .pos-card-row2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   /* 资产单列 */
   .asset-grid { grid-template-columns: 1fr; }
