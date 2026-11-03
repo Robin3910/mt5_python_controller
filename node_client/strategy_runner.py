@@ -1298,13 +1298,16 @@ class StrategyRunner:
     def _own_sl_by_ticket(self, positions: list[dict]) -> dict[int, float]:
         """指定价档位持仓的自有止损：票号 → 止损价。
 
-        自有止损的来源有两条，优先级：
-        1. **成交时记下的**（`self._price_filled`）——这是「锁定」的那一道，
-           之后热推改配置也不动它；
-        2. 持仓上 broker 侧现存的 `sl` ——重连后内存态丢了，用它兜底。
+        自有止损的来源只有一条：**成交时记下的**（`self._price_filled`）。
+        那是用户为这一档配的 `price_sl`，成交后锁定，热推改配置也不动它。
 
-        只认**指定价档位**的持仓（备注 `R1L2X`）。普通加仓没有自有止损，
-        它们只有共同止损。
+        **绝不从持仓上 broker 侧的 `sl` 兜底**：那个值可能是**共同止损**
+        （盈亏比 × 余额反推出来的），不是用户配的自有止损。把它当成「自有
+        止损」会导致：改了盈亏比后，共同止损变了，但这笔被当成「自有止损
+        更近」而保持旧值——指定价那笔的止损从此不再跟着盈亏比动。
+
+        自有止损没配 / 不合法（`price_sl` 落在入场价同侧，挂单时没带上）时，
+        这一笔**没有自有止损**，只受共同止损管 → 不进这张表，走共同止损。
         """
         out: dict[int, float] = {}
         for pos in positions or []:
@@ -1316,8 +1319,6 @@ class StrategyRunner:
             if ticket <= 0:
                 continue
             own = _as_float((self._price_filled.get(ticket) or {}).get("own_sl"), 0.0)
-            if own <= 0:
-                own = _as_float(pos.get("sl"), 0.0)
             if own > 0:
                 out[ticket] = own
         return out
@@ -1504,6 +1505,39 @@ class StrategyRunner:
                 continue
             return price_level_params(level)["tp_ref"]
         return 0.0
+
+    def _price_level_sl_tp_refs(
+        self, rule_type: int, level_index: int,
+    ) -> tuple[float, float]:
+        """按 (规则类型, 档位号) 从当前配置里取指定价档位的 (自有止损, 止盈价)。
+
+        用于 runtime 丢了挂单记录时还原这一档的参数：
+        档位号能唯一定位一档，配置里的 `price_sl` / `price_tp` 就是成交时
+        那个值（成交后这两个字段被锁定，不会与已开仓位不一致）。
+
+        自有止损要取**配置里的值**，不能取持仓上的 `sl`——后者可能已经被
+        共同止损改写了（盈亏比 × 余额），当成自有止损会把这一笔的止损
+        冻结在旧盈亏比上，改了盈亏比也不动。
+        """
+        for rule in self._rules or []:
+            if not isinstance(rule, dict):
+                continue
+            if _as_int(rule.get("type"), RULE_TYPE_COUNTER) != int(rule_type):
+                continue
+            levels = rule.get("batch_levels")
+            if not isinstance(levels, list):
+                continue
+            idx = int(level_index)
+            if idx < 0 or idx >= len(levels):
+                continue
+            level = levels[idx]
+            if not isinstance(level, dict):
+                continue
+            if not price_level_active(level):
+                continue
+            params = price_level_params(level)
+            return _as_float(params.get("own_sl"), 0.0), _as_float(params.get("tp_ref"), 0.0)
+        return 0.0, 0.0
 
     def _lot_sltp_volume_by_side(self, positions: list[dict]) -> dict[str, float]:
         """各方向当前的总手数（用于识别「仓位减少」）。"""
@@ -1989,13 +2023,12 @@ class StrategyRunner:
         """写入这一侧算出的止盈和/或止损。没算的一侧沿用持仓上的现值。
 
         **指定价档位的持仓走逐票止损**（`plan["sl_by_ticket"]`）：
-        - 票号在表里且值为 None → 沿用 broker 上的自有止损（这一票归「自有止损
-          更近」管，不写共同止损）；
-        - 票号在表里且有值 → 写这道共同止损（共同止损更近）；
+        - 票号在表里 → 写表里那道（自有止损更近就写自有止损，共同止损更近
+          就写共同止损）；
         - 票号不在表里 → 用这一侧的共同止损。
 
-        注意 `None` 的语义是「沿用持仓现值」，**不是「不设止损」**——
-        两者混淆会把指定价仓的自有止损清掉。
+        表里的值**总是要写死的**（不写「沿用持仓现值」）：持仓上的 `sl`
+        可能是上一轮写上去的共同止损，沿用它就再也切不回自有止损了。
         """
         sl = plan.get("sl")
         tp = plan.get("tp")
@@ -2009,12 +2042,7 @@ class StrategyRunner:
             ticket = int(pos.get("ticket") or 0)
             # 这一票该带哪道止损
             if ticket in sl_by_ticket:
-                per_sl = sl_by_ticket[ticket]
-                # None = 沿用持仓上已有的自有止损
-                want_sl = (
-                    _as_float(pos.get("sl"), 0.0)
-                    if per_sl is None else float(per_sl)
-                )
+                want_sl = float(sl_by_ticket[ticket])
             else:
                 want_sl = float(sl) if sl is not None else _as_float(pos.get("sl"), 0.0)
             if signal_pl.stops_match(pos, want_sl, tp, digits):
@@ -3063,12 +3091,20 @@ class StrategyRunner:
                 continue
             pending = self._price_pending.pop(ticket, None)
             if pending is None:
-                # 重启后接上的持仓：从持仓自身的 sl / 开仓价还原
+                # 重启后接上的持仓：从配置里按档位号把这一档的参数还原。
+                #
+                # 自有止损要取**配置里的 `price_sl`**（用户配的那一道），不是
+                # 持仓上的 `sl`——后者可能已经被共同止损改写了（盈亏比 ×
+                # 余额），当成自有止损会把这一笔的止损冻结在旧盈亏比上。
+                #
+                # 档位号能唯一定位一档：成交后该档的 `price_sl` 已锁定，
+                # 不会与已开仓位不一致。
+                cfg_sl, cfg_tp = self._price_level_sl_tp_refs(parsed[0], parsed[1])
                 pending = {
                     "level_index": parsed[1],
                     "entry": _as_float(pos.get("price_open")),
-                    "tp_ref": 0.0,
-                    "own_sl": _as_float(pos.get("sl")),
+                    "tp_ref": cfg_tp,
+                    "own_sl": cfg_sl,
                     "kind": "",
                 }
             tp_ref = _as_float(pending.get("tp_ref"), 0.0)

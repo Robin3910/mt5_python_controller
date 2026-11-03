@@ -3932,3 +3932,270 @@ async def test_pending_price_level_records_the_tier_used_for_volume():
     pending = runner._price_pending[orders[0]["ticket"]]
     assert pending["tier_amount"] == 500.0
     runner.cancel()
+
+
+async def test_sl_ratio_hot_push_moves_the_price_level_stop_loss():
+    """指定价成交后改止损盈亏比 → 指定价那笔的止损也要跟着变。
+
+    共同止损金额 = 盈亏比% × 余额，距离按含指定价仓的加权均价与总手数反推。
+    比例一改，共同止损就动；指定价那笔参与其中，止损必须一起重写——
+    否则它停在旧比例算出来的价位上，等于「改了配置没生效」。
+    """
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.balance = 10000.0
+    mt5.auto_fill_pending = False
+    mt5.prices_map["XAUUSD"] = 2400.0
+    rule = _price_level_rule()
+    # 自有止损设得很远（2399.9）→ 共同止损更近 → 指定价那笔带共同止损
+    rule["batch_levels"][0]["price_sl"] = 2399.9
+    rule["float_pl_ratio"] = {
+        "enabled": True, "ratio": -20, "monitor_mode": "loop", "max_times": 1,
+    }
+    runner, hub = _runner(sent, mt5=mt5, strategy={"rules": [rule]})
+    runner.start()
+    await _settle()
+
+    def tick(price=2400.0):
+        hub.sub.offer(mh.MarketEvent(
+            kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+            positions=tuple(mt5.positions_by_magic(MAGIC)),
+            price=price, point=0.01, bid=price - 0.5, ask=price + 0.5,
+        ))
+
+    tick()
+    await _settle()
+    ticket = mt5.pending_orders_by_magic(MAGIC)[0]["ticket"]
+    assert mt5.fill_pending_order(ticket) is True
+    await _settle()
+    tick()
+    await _settle()
+
+    price_pos = next(p for p in mt5.positions_by_magic(MAGIC) if p["comment"] == "R1L0X")
+    old_sl = price_pos["sl"]
+    assert old_sl > 0 and old_sl != 2399.9, "此时应带的是共同止损"
+
+    # 热推：盈亏比 20% → 40%（亏损金额翻倍 → 止损距离翻倍 → 更远）
+    rule["float_pl_ratio"] = {
+        "enabled": True, "ratio": -40, "monitor_mode": "loop", "max_times": 1,
+    }
+    runner.apply_strategy({"rules": [rule]})
+    await _settle()
+    tick()
+    await _settle()
+
+    price_pos = next(p for p in mt5.positions_by_magic(MAGIC) if p["comment"] == "R1L0X")
+    assert price_pos["sl"] != old_sl, "改了盈亏比后指定价的止损必须跟着变"
+    # 新止损 = 加权均价 − 4000 / ((1/0.01) × 总手数)
+    positions = mt5.positions_by_magic(MAGIC)
+    total = sum(p["volume"] for p in positions)
+    weighted = sum(p["volume"] * p["price_open"] for p in positions) / total
+    expected = weighted - 4000.0 / ((1 / 0.01) * total)
+    assert abs(price_pos["sl"] - expected) < 0.02
+    runner.cancel()
+
+
+async def test_sl_ratio_change_keeps_the_configured_own_stop_loss():
+    """配了合法自有止损时 → 仍然用自有止损那道（更近的那道），不受盈亏比影响。
+
+    自有止损（2390）与共同止损（远）并存 → 取更近的 = 自有止损。
+    改盈亏比不改变这个判断：自有止损没变近，仍是更近的那道。
+    """
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.balance = 10000.0
+    mt5.auto_fill_pending = False
+    mt5.prices_map["XAUUSD"] = 2400.0
+    rule = _price_level_rule()   # price_sl = 2390（多单，低于入场价 2399 → 合法）
+    rule["float_pl_ratio"] = {
+        "enabled": True, "ratio": -20, "monitor_mode": "loop", "max_times": 1,
+    }
+    runner, hub = _runner(sent, mt5=mt5, strategy={"rules": [rule]})
+    runner.start()
+    await _settle()
+
+    def tick(price=2400.0):
+        hub.sub.offer(mh.MarketEvent(
+            kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+            positions=tuple(mt5.positions_by_magic(MAGIC)),
+            price=price, point=0.01, bid=price - 0.5, ask=price + 0.5,
+        ))
+
+    tick()
+    await _settle()
+    ticket = mt5.pending_orders_by_magic(MAGIC)[0]["ticket"]
+    assert mt5.fill_pending_order(ticket) is True
+    await _settle()
+    tick()
+    await _settle()
+
+    price_pos = next(p for p in mt5.positions_by_magic(MAGIC) if p["comment"] == "R1L0X")
+    assert price_pos["sl"] == 2390.0, "自有止损更近 → 保留自有止损"
+
+    # 热推：盈亏比 20% → 40%
+    rule["float_pl_ratio"] = {
+        "enabled": True, "ratio": -40, "monitor_mode": "loop", "max_times": 1,
+    }
+    runner.apply_strategy({"rules": [rule]})
+    await _settle()
+    tick()
+    await _settle()
+
+    price_pos = next(p for p in mt5.positions_by_magic(MAGIC) if p["comment"] == "R1L0X")
+    assert price_pos["sl"] == 2390.0, "自有止损仍更近 → 仍是它"
+    runner.cancel()
+
+
+async def test_price_level_stop_loss_switches_both_ways_idempotently():
+    """两道止损「取更近的那道」要能来回切，不能粘住上一轮的值。
+
+    自有止损更近 → 写自有止损；共同止损更近 → 写共同止损；
+    再切回自有止损更近 → 要真的写回自有止损（不能沿用上一轮的共同止损）。
+    """
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.balance = 10000.0
+    mt5.auto_fill_pending = False
+    mt5.prices_map["XAUUSD"] = 2400.0
+    rule = _price_level_rule()
+    rule["float_pl_ratio"] = {
+        "enabled": True, "ratio": -20, "monitor_mode": "loop", "max_times": 1,
+    }
+    runner, hub = _runner(sent, mt5=mt5, strategy={"rules": [rule]})
+    runner.start()
+    await _settle()
+
+    def tick(price=2400.0):
+        hub.sub.offer(mh.MarketEvent(
+            kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+            positions=tuple(mt5.positions_by_magic(MAGIC)),
+            price=price, point=0.01, bid=price - 0.5, ask=price + 0.5,
+        ))
+
+    def price_sl() -> float:
+        pos = next(p for p in mt5.positions_by_magic(MAGIC) if p["comment"] == "R1L0X")
+        return pos["sl"]
+
+    async def push_ratio(ratio: int) -> None:
+        rule["float_pl_ratio"] = {
+            "enabled": True, "ratio": ratio,
+            "monitor_mode": "loop", "max_times": 1,
+        }
+        runner.apply_strategy({"rules": [rule]})
+        await _settle()
+        tick()
+        await _settle()
+
+    tick()
+    await _settle()
+    ticket = mt5.pending_orders_by_magic(MAGIC)[0]["ticket"]
+    assert mt5.fill_pending_order(ticket) is True
+    await _settle()
+    tick()
+    await _settle()
+
+    assert price_sl() == 2390.0, "自有止损更近 → 写自有止损"
+    await push_ratio(-1)            # 共同止损更近
+    common_sl = price_sl()
+    assert common_sl != 2390.0, "共同止损更近 → 写共同止损"
+    await push_ratio(-20)           # 又切回自有止损更近
+    assert price_sl() == 2390.0, "必须真的切回自有止损，不能沿用上一轮的共同止损"
+    await push_ratio(-1)
+    assert price_sl() == common_sl, "再切回共同止损也要一致"
+    runner.cancel()
+
+
+async def test_price_level_own_sl_is_not_taken_from_the_broker_side_sl():
+    """broker 侧持仓上的 sl 可能是共同止损，不能当成自有止损。
+
+    这一笔没有配自有止损（price_sl 落在入场价同侧 → 挂单时没带上），
+    所以它只受共同止损管：改了盈亏比就要跟着变。
+    """
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.balance = 10000.0
+    mt5.auto_fill_pending = False
+    mt5.prices_map["XAUUSD"] = 2400.0
+    rule = _price_level_rule()
+    # 多单入场 2399，自有止损 2399.9 在入场价**上方** → 挂单时不带止损
+    rule["batch_levels"][0]["price_sl"] = 2399.9
+    rule["float_pl_ratio"] = {
+        "enabled": True, "ratio": -20, "monitor_mode": "loop", "max_times": 1,
+    }
+    runner, hub = _runner(sent, mt5=mt5, strategy={"rules": [rule]})
+    runner.start()
+    await _settle()
+
+    def tick(price=2400.0):
+        hub.sub.offer(mh.MarketEvent(
+            kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+            positions=tuple(mt5.positions_by_magic(MAGIC)),
+            price=price, point=0.01, bid=price - 0.5, ask=price + 0.5,
+        ))
+
+    tick()
+    await _settle()
+    ticket = mt5.pending_orders_by_magic(MAGIC)[0]["ticket"]
+    assert mt5.fill_pending_order(ticket) is True
+    await _settle()
+    tick()
+    await _settle()
+
+    # 这一笔没有自有止损 → 不该进「自有止损」表
+    assert runner._own_sl_by_ticket(mt5.positions_by_magic(MAGIC)) == {}
+    runner.cancel()
+
+
+async def test_restart_restores_own_sl_from_the_config_not_the_broker_sl():
+    """重启后还原指定价档位的自有止损 → 取配置里的 `price_sl`。
+
+    持仓上的 `sl` 可能已被共同止损改写；当成自有止损会让这一笔的止损
+    冻结在旧盈亏比上。
+    """
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.balance = 10000.0
+    mt5.auto_fill_pending = False
+    mt5.prices_map["XAUUSD"] = 2400.0
+    rule = _price_level_rule()
+    rule["batch_levels"][0]["price_sl"] = 2390.0
+    runner, hub = _runner(sent, mt5=mt5, strategy={"rules": [rule]})
+    runner.start()
+    await _settle()
+
+    def tick(price=2400.0):
+        hub.sub.offer(mh.MarketEvent(
+            kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+            positions=tuple(mt5.positions_by_magic(MAGIC)),
+            price=price, point=0.01, bid=price - 0.5, ask=price + 0.5,
+        ))
+
+    tick()
+    await _settle()
+    ticket = mt5.pending_orders_by_magic(MAGIC)[0]["ticket"]
+    assert mt5.fill_pending_order(ticket) is True
+    await _settle()
+    tick()
+    await _settle()
+
+    # 模拟重启：runtime 里有这一笔，但挂单记录没了
+    payload = runner._manual_runtime_payload()
+    filled = [dict(item) for item in payload["price_filled"]]
+    price_pos = next(p for p in mt5.positions_by_magic(MAGIC) if p["comment"] == "R1L0X")
+    # 把持仓上的 sl 改掉（模拟已被共同止损改写）
+    price_pos["sl"] = 2356.66
+
+    runner2, _hub2 = _runner(
+        sent, mt5=mt5, strategy={"rules": [rule]},
+        runtime={"price_filled": filled},
+    )
+    runner2.start()
+    await _settle()
+    tick()
+    await _settle()
+
+    own = runner2._own_sl_by_ticket(mt5.positions_by_magic(MAGIC))
+    # 还原出的自有止损应是配置里的 2390，而不是持仓上那个 2356.66
+    assert list(own.values()) == [2390.0]
+    runner.cancel()
+    runner2.cancel()

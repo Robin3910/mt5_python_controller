@@ -647,9 +647,12 @@ def plan_common_stops(
     `own_sl_by_ticket`：指定价档位持仓的**自有止损**（票号 → 止损价）。
     传入后会额外产出 `sl_by_ticket`：票号 → 这一票该带哪道止损。
     取「离现价更近的那道」（见 `nearer_stop`）：
-    - 自有止损更近 → 记 `None`，表示**沿用 broker 上已经写好的自有止损**
-      （注意：`None` 是「沿用现值」，不是「不设止损」）；
-    - 共同止损更近 → 记共同止损价，改单时把它写上去。
+    - 自有止损更近 → 记自有止损价；
+    - 共同止损更近 → 记共同止损价。
+
+    两道止损只能留一道（MT5 一个持仓只有一个 SL），所以每轮都**显式写死**
+    该留的那道，而不是「沿用持仓现值」——沿用会让上一轮写上去的共同止损
+    留下来，自有止损再也切不回来。
 
     `tp_override`：方向 → 止盈权威价（指定价档位成交后由它的 `price_tp` 接管）。
     某一方向有权威价时，**该方向的止盈直接用这个绝对价**，不再按
@@ -736,8 +739,13 @@ def plan_common_stops(
             if own_sl <= 0:
                 continue
             picked = nearer_stop(side, own_sl, sl or 0.0)
-            # picked == own_sl → 沿用 broker 上的自有止损（None = 沿用现值）
-            sl_by_ticket[ticket] = None if picked == own_sl else picked
+            # 「自有止损更近」→ **显式写自有止损**（不是「沿用持仓现值」）。
+            #
+            # 沿用现值是不对的：持仓上的 `sl` 可能是**共同止损**（上一轮
+            # 共同止损更近时写上去的）。那一轮改成共同止损后，这一轮又轮到
+            # 自有止损更近，沿用现值就会把共同止损留下来 —— 自有止损再也
+            # 回不来。显式写死才是幂等的：每一轮都按「哪道更近」重新决定。
+            sl_by_ticket[ticket] = picked
         plans.append({
             "rule": RULE_LOT_PL_TIERS if (d_tp is not None or auth_tp > 0) else RULE_FLOAT_PL_RATIO,
             "side": side,
