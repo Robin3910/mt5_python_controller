@@ -622,7 +622,7 @@ export interface StrategyBatchLevel {
   point: number
   /** calc_type=price 时的绝对价位；指定价档位下它就是这一档的入场价 */
   price: number
-  /** 指定价档位的止盈参考价：只用于反推手数，出场随大部队阶梯止盈 */
+  /** 指定价档位的止盈价：成交后接管该方向的止盈（存量一起对齐到它） */
   price_tp?: number
   /** 指定价档位的自有止损（绝对价位），0=不设；成交后锁定 */
   price_sl?: number

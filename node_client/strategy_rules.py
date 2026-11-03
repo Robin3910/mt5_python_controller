@@ -187,7 +187,7 @@ class PriceLevelPlan:
     level_index: int
     action: str            # BUY / SELL
     entry: float           # 入场价（= 档位的 price）
-    tp_ref: float          # 止盈参考价（= 档位的 price_tp）：只用于反推手数
+    tp_ref: float          # 止盈价（= 档位的 price_tp）：反推手数 + 成交后接管该方向的止盈
     own_sl: float          # 自有止损（= 档位的 price_sl），0 = 不设
     volume: float
     limit_kind: str        # "limit" | "stop"：按现价在入场价哪一侧决定
@@ -206,7 +206,7 @@ class PriceLevelPlan:
     level_fallback: bool = False
     # 手数是怎么算出来的（人话说明，随事件上报）
     volume_formula: str = ""
-    # 每手止盈金额（入场价 → 止盈参考价），反推手数用
+    # 每手止盈金额（入场价 → 止盈价），反推手数用
     profit_per_lot: float = 0.0
 
     @property
@@ -281,10 +281,12 @@ def is_price_level(level: dict) -> bool:
 
 
 def price_level_params(level: dict) -> dict:
-    """指定价档位的出场参数：入场价 / 止盈参考价 / 自有止损。
+    """指定价档位的出场参数：入场价 / 止盈价 / 自有止损。
 
-    `tp_ref`（止盈参考价）**只用于反推手数**：这一档不单独止盈，
-    成交后出场跟随大部队的阶梯止盈。
+    `tp_ref`（止盈价）有两个用途：
+    1. **反推手数**：这一档开多大，按阶梯止盈 1 的目标金额倒推；
+    2. **成交后接管该方向的止盈**：它是权威绝对价位，存量仓位的止盈
+       也全部对齐到它，价格打到它时全场合计盈亏正好是 tier1 金额。
     """
     src = level if isinstance(level, dict) else {}
     return {
@@ -294,25 +296,59 @@ def price_level_params(level: dict) -> dict:
     }
 
 
+def price_level_tp_ok(side: str, entry: float, tp_ref: float) -> bool:
+    """指定价档位的止盈价是否落在**盈利侧**。
+
+    止盈价必须在入场价的盈利侧：多单 tp > entry，空单 tp < entry。
+
+    这不是「填没填错」的形式检查，而是**手数公式的前提**：
+    手数按 `|tp − entry|` 反推，止盈价在亏损侧时这个绝对值算出来的手数
+    是反的（挂上去方向与出场价对不上），所以这一档不能挂单。
+
+    与入场价相同也不成立（每手止盈为 0，手数算不出来）。
+    """
+    action = str(side or "").strip().upper()
+    entry_px = _as_float(entry, 0.0)
+    tp_px = _as_float(tp_ref, 0.0)
+    if action not in ("BUY", "SELL") or entry_px <= 0 or tp_px <= 0:
+        return False
+    if abs(tp_px - entry_px) < 1e-12:
+        return False
+    if action == "BUY":
+        return tp_px > entry_px
+    return tp_px < entry_px
+
+
 def price_level_active(level: dict) -> bool:
     """这一档要走「指定价档位」的新执行路径吗？
 
     需要三样齐全：
     - `calc_type=price`（是指定价口径）；
     - 入场价 > 0（指定价本身填了）；
-    - **止盈参考价 > 0**（没有它算不出手数——新路径的手数按阶梯止盈 1 的
+    - **止盈价 > 0**（没有它算不出手数——新路径的手数按阶梯止盈 1 的
       目标金额反推）。
 
     最后一条同时承担**向后兼容**的职责：存量配置里的 `calc_type=price` 档位
-    没有「止盈参考价」这个字段，它们一直是按「到价挂逆势限价」的老口径跑的。
-    这类档位继续走老口径，行为一个字都不变；只有填了止盈参考价的档位才切到
-    新路径（挂单到指定价成交 + 自有止损 + 按阶梯止盈 1 反推手数）。
+    没有「止盈价」这个字段，它们一直是按「到价挂逆势限价」的老口径跑的。
+    这类档位继续走老口径，行为一个字都不变；只有填了止盈价的档位才切到
+    新路径（挂单到指定价成交 + 自有止损 + 按阶梯止盈 1 反推手数 +
+    成交后接管该方向的止盈）。
 
     顺势加仓的指定价档位**永远走老口径**（决策 3：顺势不改）。
     """
     if not is_price_level(level):
         return False
     return price_level_params(level)["tp_ref"] > 0
+
+
+def price_level_valid(level: dict, side: str) -> bool:
+    """这一档的入场价 / 止盈价组合对该方向是否成立。
+
+    止盈价必须落在入场价的**盈利侧**且不等于入场价（见 `price_level_tp_ok`）。
+    不成立时这一档不挂单：方向定不下来，或每手止盈为 0，手数根本算不出来。
+    """
+    params = price_level_params(level)
+    return price_level_tp_ok(side, params["entry"], params["tp_ref"])
 
 
 def pick_batch_level(rule: dict, next_position_no: int) -> tuple[Optional[dict], Optional[int]]:
@@ -356,7 +392,7 @@ def _fallback_batch_level(
     - 往回找不到间距型档位 → 返回 (None, None)（这一笔不加）。
 
     注意「指定价档位」用的是 `price_level_active` 而不是 `is_price_level`：
-    存量配置里的 `calc_type=price` 档位（没填止盈参考价）走的是老口径
+    存量配置里的 `calc_type=price` 档位（没填止盈价）走的是老口径
     ——它是**间距型**的（到价按偏离触发），当兜底落点是合法的。
     """
     first_from = _as_int(levels[0].get("pos_from"), 0)
@@ -613,7 +649,7 @@ def resolve_threshold(rule_type: int, level: dict, ctx: PositionCtx) -> Threshol
         target = _as_float(level.get("price"), 0.0)
         if target <= 0:
             return Threshold(0.0, calc_type)
-        # **指定价档位（填了止盈参考价的那些）不产生可用的市价阈值**。
+        # **指定价档位（填了止盈价的那些）不产生可用的市价阈值**。
         #
         # 它们走的是「挂单到价成交」路径（成交价正好等于指定价），不是
         # 「现价偏离达到阈值后市价成交」。这里若还给出阈值，市价判定与挂单
@@ -622,10 +658,10 @@ def resolve_threshold(rule_type: int, level: dict, ctx: PositionCtx) -> Threshol
         # `target_price` 仍要带上：挂单计划要用它当入场价。
         #
         # 注意只对**逆势**生效：决策 3 说顺势的指定价不改，
-        # 顺势的指定价档位（哪怕填了止盈参考价）仍走老口径。
+        # 顺势的指定价档位（哪怕填了止盈价）仍走老口径。
         if rule_type == RULE_TYPE_COUNTER and price_level_active(level):
             return Threshold(0.0, calc_type, target_price=target)
-        # 老口径（存量配置：没填止盈参考价）：到指定价的偏离折成点数，
+        # 老口径（存量配置：没填止盈价）：到指定价的偏离折成点数，
         # 方向必须与本规则一致，否则等于要求行情反向到价、永远不会成立。
         base = rule_base_price(rule_type, ctx)
         points = deviation_points(rule_type, ctx.direction, base, target, ctx.point)
@@ -851,8 +887,9 @@ def describe_price_level(plan: PriceLevelPlan, *, verb: str) -> str:
         f"指定价加仓 · 规则#{RULE_TYPE_COUNTER} · 分批档位#{plan.level_index}："
         f"{verb} {plan.action} 挂单价 {_trim(plan.entry, 5)}"
         f"（指定价，成交价正好等于它，不滑点）"
-        f"{sl_text}，止盈参考价 {_trim(plan.tp_ref, 5)}"
-        f"（只用于算手数，出场跟大部队的阶梯止盈），手数 {plan.volume}"
+        f"{sl_text}，止盈价 {_trim(plan.tp_ref, 5)}"
+        f"（成交后接管该方向的止盈：存量与它一起在这个价出场，"
+        f"合计正好是阶梯止盈1的目标金额），手数 {plan.volume}"
     )
 
 
@@ -863,7 +900,7 @@ def evaluate_rule(rule: dict, ctx: PositionCtx, rule_index: int = 0) -> Optional
     供「偏离是否已经够」的单元测试使用。
     rule_index 是该规则在策略快照中的原始下标，只用于在说明里指明是哪条规则命中。
 
-    **指定价档位（填了止盈参考价的那些）永远不走市价路径**：
+    **指定价档位（填了止盈价的那些）永远不走市价路径**：
     它们的入口是「挂单到指定价成交」，市价触发会让同一档被算两次手数。
     """
     prep = _prepare_rule(rule, ctx)

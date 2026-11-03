@@ -508,10 +508,15 @@ const FIELD_HELP = {
     '逆势时节点把这一档挂成限价/止损单，成交价**正好等于**指定价（不滑点）；' +
     '顺势的指定价仍是「到价后市价成交」，成交价可能有滑点，不保证等于指定价。',
   batch_price_tp:
-    '这一档的止盈**参考价**（绝对价格）：**只用来反推这一档的手数**' +
-    '（按阶梯止盈第 1 档的目标金额，减去存量仓位到该价时的预估盈亏，再除以每手止盈）。' +
-    '这一档**不单独止盈**——成交后出场跟随大部队的阶梯止盈，一块走。' +
-    '留空则无法算出手数，该档不会挂单。',
+    '这一档的**止盈价**（绝对价格）。指定价档位成交后，它会**接管该方向的止盈**：' +
+    '本魔术号该方向的所有持仓（含之前已经开着的存量仓）的止盈统一对齐到这个价。' +
+    '因为这一档的手数就是按「阶梯止盈第 1 档的目标金额」反推出来的，' +
+    '所以价格打到这里出场时，全场合计盈亏正好等于第 1 档的目标金额。' +
+    '**这只是止盈计算里的一个分支、不是全局权威**：之后如果又加了别的仓' +
+    '（顺势 / 间距档 / 市价兜底），大部队的止盈点就重新按加权均价反推，' +
+    '这一档的仓位也会一起参与重算。' +
+    '止盈价必须落在入场价的**盈利侧**（多单高于入场价、空单低于入场价），' +
+    '否则方向对不上、手数算不出来，该档不会挂单。留空则无法算出手数，该档不会挂单。',
   batch_price_sl:
     '这一档**自己的止损**（绝对价格），0 = 不设。必须落在入场价的反方向，否则券商会拒掉整张挂单。' +
     '成交后这一道止损会锁定，之后改配置不影响已开仓位。' +
@@ -1910,15 +1915,32 @@ function collectWarnings(rules: EditableRule[]): string[] {
           )
         }
       }
-      // 指定价档位：缺止盈参考价就算不出手数，节点不会挂这一档的单。
+      // 指定价档位：缺止盈价就算不出手数，节点不会挂这一档的单。
       // 这里只提示不拦保存（保存路径上不再有拦截），由用户决定要不要补。
       levels.forEach((lv, i) => {
         if (lv.calc_type !== 'price') return
         if (!(lv.price > 0)) return
-        if (!(Number(lv.price_tp) > 0)) {
+        const tp = Number(lv.price_tp) || 0
+        if (!(tp > 0)) {
           out.push(
-            `${label} 档位 ${i + 1}：指定价档位没有填止盈参考价，` +
+            `${label} 档位 ${i + 1}：指定价档位没有填止盈价，` +
               '节点无法反推手数，这一档不会挂单（其它档位照常）。',
+          )
+          return
+        }
+        // 止盈价必须落在入场价的盈利侧，否则手数公式的符号是反的。
+        // 方向按分批方向判定：多单止盈价要高于入场价、空单要低于入场价。
+        const side = String(r.batch_action || '').toUpperCase()
+        const entry = Number(lv.price) || 0
+        if (side === 'BUY' && tp <= entry) {
+          out.push(
+            `${label} 档位 ${i + 1}：多单的止盈价 ${tp} 必须高于指定价 ${entry}，` +
+              '否则方向对不上、手数算不出来，这一档不会挂单。',
+          )
+        } else if (side === 'SELL' && tp >= entry) {
+          out.push(
+            `${label} 档位 ${i + 1}：空单的止盈价 ${tp} 必须低于指定价 ${entry}，` +
+              '否则方向对不上、手数算不出来，这一档不会挂单。',
           )
         }
       })
@@ -2868,8 +2890,9 @@ function resetRuleToTemplate(idx: number): void {
                         （分散仓 {{ r.batch_count }} · 手动分散仓 1）
                       </template>
                     </span>
+                    <!-- 手动单入口已下线：功能保留在节点侧（不再使用），前端不再提供入口 -->
                     <button
-                      v-if="!r.batch_enabled"
+                      v-if="false"
                       type="button"
                       class="btn-sm btn-ghost"
                       :disabled="r.manual_scatter.enabled || manualScatterLocked(r.type)"
@@ -3008,7 +3031,7 @@ function resetRuleToTemplate(idx: number): void {
                       <div v-if="lv.calc_type === 'price'" class="field">
                         <FormLabel
                           :field-id="`rule-${idx}-lv-${li}-price-tp`"
-                          text="止盈参考价"
+                          text="止盈价"
                           :help="FIELD_HELP.batch_price_tp"
                         />
                         <input
@@ -3254,7 +3277,9 @@ function resetRuleToTemplate(idx: number): void {
                     >
                       + 添加档位
                     </button>
+                    <!-- 手动单入口已下线：功能保留在节点侧（不再使用），前端不再提供入口 -->
                     <button
+                      v-if="false"
                       type="button"
                       class="btn-sm btn-ghost"
                       :disabled="r.manual_scatter.enabled"

@@ -31,7 +31,7 @@ EXEC_NO_MORE_ADDS = "no_more_adds"
 EXEC_WAITING_TP_SL = "waiting_tp_sl"
 EXEC_LOCKED_BY_MANUAL = "locked_by_manual"
 
-# 运行期锁死：指定价档位已成交，它的入场价 / 自有止损 / 止盈参考价
+# 运行期锁死：指定价档位已成交，它的入场价 / 自有止损 / 止盈价
 # 已经落在已开的仓位上，改配置不改已开仓位。
 EXEC_LOCKED_BY_PRICE_LEVEL = "locked_by_price_level"
 
@@ -318,7 +318,7 @@ def _price_level_fields(
 
     两种结论：
     - **在途未成交** → `applied`：节点会撤掉旧挂单、按新参数重挂；
-    - **已成交** → `locked`：这一档的入场价 / 自有止损 / 止盈参考价都已
+    - **已成交** → `locked`：这一档的入场价 / 自有止损 / 止盈价都已
       锁定在已开的仓位上，改配置不影响已开仓位（也不该改）。
 
     `price_locked` 是「已成交的指定价档位」集合：(规则类型, 档位下标)。
@@ -333,7 +333,7 @@ def _price_level_fields(
         locked = (rule_type, idx) in price_locked
         for field, text in (
             ("price", "指定价"),
-            ("price_tp", "止盈参考价"),
+            ("price_tp", "止盈价"),
             ("price_sl", "自有止损"),
         ):
             old_v = _as_float(old_lv.get(field))
@@ -390,7 +390,7 @@ def reconcile_rules(
                    删掉时，节点会撤掉盘上那张挂单——这里给出逐字段结论，
                    让客户知道「保存后那张单会被撤掉」。
     price_locked  ：**已成交**的指定价档位（(规则类型, 档位下标) 集合）。
-                   这些档位的入场价 / 自有止损 / 止盈参考价已锁定在已开仓位上，
+                   这些档位的入场价 / 自有止损 / 止盈价已锁定在已开仓位上，
                    改配置不影响已开仓位；在途未成交的不锁（可改 → 撤单重挂）。
     """
     added_by_rule = added_by_rule or {}

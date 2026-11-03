@@ -8,6 +8,7 @@ import asyncio
 import pytest
 
 import market_hub as mh
+import manual_scatter
 from mock_mt5 import MockMT5Client
 from strategy_runner import StrategyRunner, _trade_error_text
 
@@ -2997,7 +2998,7 @@ async def test_legacy_price_level_still_uses_counter_limit_path():
 
 
 async def test_price_level_position_follows_common_take_profit():
-    """指定价仓成交后，出场跟随大部队的阶梯止盈（TP 写进持仓，单独算它的份）。"""
+    """指定价仓成交后，按「指定价算止盈」的分支出场（TP 写进持仓）。"""
     sent: list = []
     mt5 = MockMT5Client()
     mt5.balance = 10000.0
@@ -3037,11 +3038,57 @@ async def test_price_level_position_follows_common_take_profit():
     ))
     await _settle()
 
-    # 指定价仓拿到共同止盈（跟着大部队走），不是它自己的「止盈参考价」
+    # 指定价仓与存量一起按「指定价算止盈」的分支出场：TP = price_tp = 2410
     price_pos = next(p for p in mt5.positions_by_magic(MAGIC) if p["comment"] == "R1L0X")
-    assert price_pos["tp"] > 0
-    # 止盈参考价 2410 只是算手数用的，不是出场价 —— 出场价按加权均价 + 阶梯金额
-    assert price_pos["tp"] != 2410.0
+    assert price_pos["tp"] == 2410.0
+    # 存量仓位的止盈也一起对齐过去（否则存量会先被各自的共同止盈平掉）
+    first_pos = next(p for p in mt5.positions_by_magic(MAGIC) if p["comment"] != "R1L0X")
+    assert first_pos["tp"] == 2410.0
+    runner.cancel()
+
+
+async def test_price_level_take_profit_branch_yields_tier1_amount():
+    """打到指定价止盈价时，全场合计盈亏正好等于阶梯止盈 1 的目标金额。
+
+    这是「手数按 tier1 反推 + 按指定价算止盈」的联合结果：
+    存量盈亏 + 这一档的盈亏 = tier1 金额。
+    """
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.balance = 10000.0
+    mt5.auto_fill_pending = False
+    mt5.prices_map["XAUUSD"] = 2400.0
+    runner, hub = _runner(sent, mt5=mt5, strategy={"rules": [_price_level_rule()]})
+    runner.start()
+    await _settle()
+
+    held = mt5.positions_by_magic(MAGIC)
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(held), price=2400.0, point=0.01,
+        bid=2399.5, ask=2400.5,
+    ))
+    await _settle()
+    ticket = mt5.pending_orders_by_magic(MAGIC)[0]["ticket"]
+    assert mt5.fill_pending_order(ticket) is True
+    await _settle()
+
+    held = mt5.positions_by_magic(MAGIC)
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(held), price=2400.0, point=0.01,
+        bid=2399.5, ask=2400.5,
+    ))
+    await _settle()
+
+    # 到止盈价 2410 时，全场合计盈亏 ≈ tier1 金额 500
+    # （手数向上取整到 0.01 带来的残差：0.37 vs 精确的 0.3636…）
+    book = [
+        {"type": p["type"], "volume": p["volume"], "price_open": p["price_open"]}
+        for p in mt5.positions_by_magic(MAGIC)
+    ]
+    total_pl = manual_scatter.projected_profit(book, 2410.0, 0.01, 1.0)
+    assert 495.0 < total_pl < 515.0
     runner.cancel()
 
 
@@ -3085,14 +3132,205 @@ async def test_price_level_position_is_included_in_common_take_profit_volume():
 
     price_pos = next(p for p in mt5.positions_by_magic(MAGIC) if p["comment"] == "R1L0X")
     assert price_pos["volume"] == 0.37
-    # 0.1 手 @2400 + 0.37 手 @2399 → 加权均价 W = (0.1×2400 + 0.37×2399)/0.47
-    # D = 500 / ((1/0.01) × 0.47) → TP = W + D
-    total = 0.1 + 0.37
-    weighted = (0.1 * 2400.0 + 0.37 * 2399.0) / total
-    expected = weighted + 500.0 / ((1 / 0.01) * total)
-    assert abs(price_pos["tp"] - expected) < 0.02
+    # 止盈走「按指定价算止盈」的分支：TP = 档位填的 price_tp = 2410
+    # （不是按加权均价 + 阶梯金额反推）
+    assert price_pos["tp"] == 2410.0
+    # 存量仓位的止盈也一起对齐过去（否则存量会先被各自的共同止盈平掉）
+    first_pos = next(p for p in mt5.positions_by_magic(MAGIC) if p["comment"] != "R1L0X")
+    assert first_pos["tp"] == 2410.0
     # 自有止损仍在（挂单时写进去的）
     assert price_pos["sl"] == 2390.0
+    runner.cancel()
+
+
+async def test_price_level_branch_persists_to_runtime_and_restores():
+    """「按指定价算止盈」的分支要落库，重连后恢复。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.balance = 10000.0
+    mt5.auto_fill_pending = False
+    mt5.prices_map["XAUUSD"] = 2400.0
+    runner, hub = _runner(sent, mt5=mt5, strategy={"rules": [_price_level_rule()]})
+    runner.start()
+    await _settle()
+
+    held = mt5.positions_by_magic(MAGIC)
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(held), price=2400.0, point=0.01,
+        bid=2399.5, ask=2400.5,
+    ))
+    await _settle()
+    ticket = mt5.pending_orders_by_magic(MAGIC)[0]["ticket"]
+    assert mt5.fill_pending_order(ticket) is True
+    await _settle()
+    held = mt5.positions_by_magic(MAGIC)
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(held), price=2400.0, point=0.01,
+        bid=2399.5, ask=2400.5,
+    ))
+    await _settle()
+
+    assert runner._price_tp_override_by_side == {"BUY": 2410.0}
+    payload = runner._manual_runtime_payload()
+    assert payload["price_tp_override"] == {"BUY": 2410.0}
+    runner.cancel()
+
+
+async def test_price_level_branch_survives_close_action_filtering():
+    """分支不受 `close_action` 过滤影响。
+
+    `lot_pl_tiers.close_action` 只说「止盈时平哪一侧」，不该影响「按指定价算止盈」：
+    只平空单时，多单侧的指定价档位成交后，多单侧仍然要拿到这个止盈价。
+    """
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.balance = 10000.0
+    mt5.auto_fill_pending = False
+    mt5.prices_map["XAUUSD"] = 2400.0
+    rule = _price_level_rule()
+    rule["lot_pl_tiers"] = {
+        "enabled": True, "batch_count": 2, "close_action": "sell",
+        "tiers": [
+            {"min_lot": 0.1, "pl_amount": 500.0},
+            {"min_lot": 0.5, "pl_amount": 800.0},
+        ],
+    }
+    runner, hub = _runner(sent, mt5=mt5, strategy={"rules": [rule]})
+    runner.start()
+    await _settle()
+
+    held = mt5.positions_by_magic(MAGIC)
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(held), price=2400.0, point=0.01,
+        bid=2399.5, ask=2400.5,
+    ))
+    await _settle()
+    ticket = mt5.pending_orders_by_magic(MAGIC)[0]["ticket"]
+    assert mt5.fill_pending_order(ticket) is True
+    await _settle()
+    held = mt5.positions_by_magic(MAGIC)
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(held), price=2400.0, point=0.01,
+        bid=2399.5, ask=2400.5,
+    ))
+    await _settle()
+
+    assert runner._price_tp_override_by_side == {"BUY": 2410.0}
+    for p in mt5.positions_by_magic(MAGIC):
+        assert p["tp"] == 2410.0
+    runner.cancel()
+
+
+async def test_price_level_branch_only_touches_its_own_side():
+    """分支只管自己那一侧，另一侧仍按阶梯金额各自反推。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.balance = 10000.0
+    mt5.auto_fill_pending = False
+    mt5.prices_map["XAUUSD"] = 2400.0
+    runner, hub = _runner(sent, mt5=mt5, strategy={"rules": [_price_level_rule()]})
+    runner.start()
+    await _settle()
+
+    held = mt5.positions_by_magic(MAGIC)
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(held), price=2400.0, point=0.01,
+        bid=2399.5, ask=2400.5,
+    ))
+    await _settle()
+    ticket = mt5.pending_orders_by_magic(MAGIC)[0]["ticket"]
+    assert mt5.fill_pending_order(ticket) is True
+    await _settle()
+    held = mt5.positions_by_magic(MAGIC)
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(held), price=2400.0, point=0.01,
+        bid=2399.5, ask=2400.5,
+    ))
+    await _settle()
+
+    # 塞一笔空单进去：它不该被 BUY 侧的分支出场价影响
+    mt5._positions.append({
+        "ticket": 9999, "magic": MAGIC, "symbol": "XAUUSD", "type": "SELL",
+        "volume": 0.2, "price_open": 2401.0, "price_current": 2400.0,
+        "sl": 0.0, "tp": 0.0, "profit": 0.0, "comment": "SELL1",
+    })
+    held = mt5.positions_by_magic(MAGIC)
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(held), price=2400.0, point=0.01,
+        bid=2399.5, ask=2400.5,
+    ))
+    await _settle()
+
+    buy_tp = {p["tp"] for p in mt5.positions_by_magic(MAGIC) if p["type"] == "BUY"}
+    sell_tp = {p["tp"] for p in mt5.positions_by_magic(MAGIC) if p["type"] == "SELL"}
+    assert buy_tp == {2410.0}
+    # 空单侧按自己的阶梯金额反推：2401 − 500/((1/0.01)×0.2) = 2401 − 25 = 2376
+    assert sell_tp == {2376.0}
+    runner.cancel()
+
+
+async def test_other_add_revokes_the_price_tp_branch():
+    """其它类型的加仓进来后，撤销分支：大部队的止盈点重新按加权均价反推。
+
+    指定价那笔**一起参与重算**（它不是手动仓，不会被排除）。
+    """
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.balance = 10000.0
+    mt5.auto_fill_pending = False
+    mt5.prices_map["XAUUSD"] = 2400.0
+    rule = _price_level_rule()
+    # 加一条顺势规则：价格上行 200 点（= 2.0 美元）才顺势加仓，
+    # 这样指定价档位成交的那一拍它不会抢跑。
+    trend = {
+        "type": 2, "status": 1, "action": "all",
+        "point": 200.0, "lot_times": 1.0, "extra_lot": 0.0,
+        "max_allow_num": 10, "batch_enabled": False, "batch_levels": [],
+    }
+    runner, hub = _runner(sent, mt5=mt5, strategy={"rules": [rule, trend]})
+    runner.start()
+    await _settle()
+
+    def tick(price):
+        mt5.prices_map["XAUUSD"] = price
+        hub.sub.offer(mh.MarketEvent(
+            kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+            positions=tuple(mt5.positions_by_magic(MAGIC)),
+            price=price, point=0.01, bid=price - 0.5, ask=price + 0.5,
+        ))
+
+    tick(2400.0)
+    await _settle()
+    ticket = mt5.pending_orders_by_magic(MAGIC)[0]["ticket"]
+    assert mt5.fill_pending_order(ticket) is True
+    await _settle()
+    tick(2400.0)
+    await _settle()
+    assert runner._price_tp_override_by_side == {"BUY": 2410.0}
+    for p in mt5.positions_by_magic(MAGIC):
+        assert p["tp"] == 2410.0
+
+    # 价格上行 → 顺势加仓（其它类型）
+    for _ in range(4):
+        tick(2402.0)
+        await _settle()
+
+    assert runner._price_tp_override_by_side == {}
+    # 止盈点重新按加权均价反推：指定价那笔一起参与
+    positions = mt5.positions_by_magic(MAGIC)
+    assert len(positions) == 3
+    total = sum(p["volume"] for p in positions)
+    weighted = sum(p["volume"] * p["price_open"] for p in positions) / total
+    expected = weighted + 500.0 / ((1 / 0.01) * total)
+    for p in positions:
+        assert abs(p["tp"] - expected) < 0.02
     runner.cancel()
 
 

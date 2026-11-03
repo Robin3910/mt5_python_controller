@@ -28,6 +28,8 @@ from strategy_rules import (
     price_level_comment,
     price_level_order_key,
     price_level_params,
+    price_level_tp_ok,
+    price_level_valid,
     range_adapt_enabled,
     resolve_threshold,
     rule_base_price,
@@ -947,7 +949,7 @@ def test_price_level_params_reads_entry_tp_and_own_sl():
 
 
 def test_price_level_active_needs_tp_ref():
-    """没有止盈参考价就算不出手数 → 这一档继续走老口径（向后兼容）。"""
+    """没有止盈价就算不出手数 → 这一档继续走老口径（向后兼容）。"""
     assert price_level_active({"calc_type": "price", "price": 4400.0}) is False
     assert price_level_active(
         {"calc_type": "price", "price": 4400.0, "price_tp": 4500.0}
@@ -956,6 +958,31 @@ def test_price_level_active_needs_tp_ref():
     assert price_level_active(
         {"calc_type": "price", "price": 0, "price_tp": 4500.0}
     ) is False
+
+
+def test_price_level_tp_must_be_on_the_profit_side():
+    """止盈价必须在入场价的盈利侧：多单高于入场价、空单低于入场价。"""
+    # 多单：止盈价高于入场价 ✓
+    assert price_level_tp_ok("BUY", 2399.0, 2410.0) is True
+    # 多单：止盈价低于入场价 ✗（方向反了，手数公式的符号也反）
+    assert price_level_tp_ok("BUY", 2399.0, 2380.0) is False
+    # 空单：止盈价低于入场价 ✓
+    assert price_level_tp_ok("SELL", 2410.0, 2399.0) is True
+    # 空单：止盈价高于入场价 ✗
+    assert price_level_tp_ok("SELL", 2399.0, 2410.0) is False
+    # 止盈价与入场价相同 ✗（每手止盈为 0，手数算不出来）
+    assert price_level_tp_ok("BUY", 2400.0, 2400.0) is False
+    # 缺值 / 方向不明 ✗
+    assert price_level_tp_ok("BUY", 0.0, 2410.0) is False
+    assert price_level_tp_ok("BUY", 2399.0, 0.0) is False
+    assert price_level_tp_ok("", 2399.0, 2410.0) is False
+
+
+def test_price_level_valid_matches_side():
+    """`price_level_valid` 按方向判定止盈价是否成立。"""
+    level = {"calc_type": "price", "price": 2399.0, "price_tp": 2410.0}
+    assert price_level_valid(level, "BUY") is True
+    assert price_level_valid(level, "SELL") is False
 
 
 def test_price_level_gives_no_market_threshold():
