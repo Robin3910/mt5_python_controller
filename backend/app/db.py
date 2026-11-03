@@ -78,6 +78,30 @@ def _migrate_users_follow_paused(sync_conn) -> None:
             sync_conn.execute(text(f"ALTER TABLE users ADD COLUMN {name} DATETIME"))
 
 
+def _migrate_users_profile_columns(sync_conn) -> None:
+    """users 的个人中心自助维护列：email / leader_name / leader_intro。
+
+    - email：联系邮箱，**不参与登录**，故不设唯一约束（允许重复）。
+    - leader_name：带单员展示名。为 NULL 时前端回退显示 display_name，
+      所以不强制填 —— 存量用户不填也不影响带单广场显示名字。
+    - leader_intro：带单员介绍（自由文本），目前只在个人中心自己可见。
+
+    三列都可空且**没有默认值**：存量用户一律 NULL —— 零行为变化。
+    """
+    inspector = inspect(sync_conn)
+    if "users" not in inspector.get_table_names():
+        return
+    cols = {c["name"] for c in inspector.get_columns("users")}
+    additions = {
+        "email": "VARCHAR(128)",
+        "leader_name": "VARCHAR(64)",
+        "leader_intro": "TEXT",
+    }
+    for name, ddl in additions.items():
+        if name not in cols:
+            sync_conn.execute(text(f"ALTER TABLE users ADD COLUMN {name} {ddl}"))
+
+
 def _migrate_dispatch_price_column(sync_conn) -> None:
     """为已存在的 signal_dispatch 表补充成交价位列（create_all 不会改已存在的表）。"""
     inspector = inspect(sync_conn)
@@ -500,6 +524,7 @@ async def init_db() -> None:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_migrate_user_totp_columns)
         await conn.run_sync(_migrate_users_follow_paused)
+        await conn.run_sync(_migrate_users_profile_columns)
         await conn.run_sync(_migrate_dispatch_price_column)
         await conn.run_sync(_migrate_signal_source_column)
         await conn.run_sync(_migrate_latency_marks)

@@ -156,6 +156,36 @@ async def create_user(
         return user
 
 
+async def update_profile(
+    user_id: int, *, display_name: Optional[str] = None, email: Optional[str] = None,
+    leader_name: Optional[str] = None, leader_intro: Optional[str] = None,
+) -> Optional[User]:
+    """更新个人中心的自助维护字段（只改自己）。
+
+    与 `update_user` 的区别：这里**不碰** is_active / phone / 角色 ——
+    那三样要么是管理员的事，要么要走短信验证，不能由自助入口改。
+
+    字段级语义与 update_user 一致：
+    - 传 None（不传）-> 不改该字段
+    - 传空串 -> 清空（置 NULL）
+    """
+    async with SessionLocal() as s:
+        user = await s.get(User, int(user_id))
+        if not user:
+            return None
+        if display_name is not None:
+            user.display_name = display_name.strip() or None
+        if email is not None:
+            user.email = email.strip() or None
+        if leader_name is not None:
+            user.leader_name = leader_name.strip() or None
+        if leader_intro is not None:
+            user.leader_intro = leader_intro.strip() or None
+        await s.commit()
+        await s.refresh(user)
+        return user
+
+
 async def update_user(
     user_id: int, *, display_name: Optional[str] = None, is_active: Optional[bool] = None,
     phone: Optional[str] = None, phone_verified: Optional[bool] = None,

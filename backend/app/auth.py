@@ -1,11 +1,23 @@
 """后台登录 -> 签发 JWT；支持 2FA、运行期修改密码与当前用户信息。"""
-from fastapi import APIRouter, Depends, HTTPException, Request
+import re
+from typing import Optional
 
-from . import permissions, persist, rbac_service
+from fastapi import APIRouter, Depends, HTTPException, Request
+from sqlalchemy.exc import SQLAlchemyError
+
+from . import permissions, persist, rbac_service, user_service
 from .deps import client_ip, get_current_admin, get_principal
-from .models import ChangePasswordRequest, Login2FARequest, LoginRequest, MeOut, RoleRef
+from .models import (
+    ChangePasswordRequest,
+    Login2FARequest,
+    LoginRequest,
+    MeOut,
+    ProfileUpdate,
+    RoleRef,
+)
 from .permissions import Principal
 from .security import create_2fa_pending_jwt, create_jwt, verify_2fa_pending_jwt
+from .sms_service import mask_phone
 from .state import state
 from .user_service import (
     get_user_by_username,
@@ -20,6 +32,9 @@ router = APIRouter(prefix="/api", tags=["auth"])
 MIN_PASSWORD_LEN = 6
 # 登录失败时审计里记录的用户名是调用方随意填的，截断到操作人列宽
 _AUDIT_NAME_MAX = 64
+
+# 邮箱格式：够用即可，不追求 RFC 5322 全集。空串是合法的（表示清空）。
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 async def _issue_token(username: str) -> str:
@@ -87,7 +102,96 @@ async def me(p: Principal = Depends(get_principal)):
         # 我自己的两个「暂停接单」开关（两个市场各自独立）
         follow_paused=bool(getattr(user, "follow_paused", False)),
         ai_follow_paused=bool(getattr(user, "ai_follow_paused", False)),
+        # 个人中心自助维护字段（存量用户一律 None / False）
+        email=getattr(user, "email", None) if user else None,
+        leader_name=getattr(user, "leader_name", None) if user else None,
+        leader_intro=getattr(user, "leader_intro", None) if user else None,
+        # 手机号脱敏：完整号码只留在库里，不进任何列表 / 详情接口
+        phone=mask_phone(user.phone) if user and user.phone else None,
+        phone_verified=bool(getattr(user, "phone_verified", False)),
     )
+
+
+def _normalize_profile_field(name: str, raw: Optional[str]) -> Optional[str]:
+    """规范化个人中心的一个字段：去空白；空串 -> None（清空）。
+
+    返回 None 有两种含义，需要调用方区分：
+    - 「不传」（None）-> 不改该字段
+    - 「清空」（字段存在但值为空串）-> 置 NULL
+    所以这里对「清空」返回空串，由调用方判断是否写入。
+    """
+    if raw is None:
+        return None
+    return raw.strip()
+
+
+@router.patch("/me/profile", response_model=MeOut)
+async def update_profile(
+    body: ProfileUpdate,
+    request: Request,
+    p: Principal = Depends(get_principal),
+):
+    """个人中心自助修改资料：只改自己。
+
+    字段级「传什么改什么」—— 不传的字段保持原值。传空串表示清空该字段。
+
+    带单员资料（leader_name / leader_intro）**只有持有带单能力的人才允许写**：
+    带单广场是公开页，任意用户都能改自己的带单员文案会让广场内容失真。
+    """
+    user = await user_service.get_user_by_id(p.user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="user not found")
+
+    # —— 带单员资料：能力校验 ——
+    wants_leader = body.leader_name is not None or body.leader_intro is not None
+    if wants_leader:
+        can_leader = p.is_admin or permissions.can_capability(p, permissions.CAP_FOLLOW_LEADER)
+        can_ai = p.is_admin or permissions.can_capability(p, permissions.CAP_AI_STRATEGY)
+        if not (can_leader or can_ai):
+            raise HTTPException(status_code=403, detail="只有带单员才能修改带单员资料")
+
+    # —— 邮箱格式校验（空串 = 清空，合法）——
+    email: Optional[str] = None
+    if body.email is not None:
+        email = body.email.strip()
+        if email and not _EMAIL_RE.match(email):
+            raise HTTPException(status_code=400, detail="邮箱格式不正确")
+
+    display_name = _normalize_profile_field("display_name", body.display_name)
+    leader_name = _normalize_profile_field("leader_name", body.leader_name)
+    leader_intro = _normalize_profile_field("leader_intro", body.leader_intro)
+
+    before = {
+        "display_name": user.display_name,
+        "email": user.email,
+        "leader_name": user.leader_name,
+        "leader_intro": user.leader_intro,
+    }
+
+    try:
+        updated = await user_service.update_profile(
+            p.user_id,
+            display_name=display_name,
+            email=email,
+            leader_name=leader_name,
+            leader_intro=leader_intro,
+        )
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=500, detail="保存失败，请稍后重试") from exc
+    if updated is None:
+        raise HTTPException(status_code=404, detail="user not found")
+
+    await persist.audit(
+        p.username, "update_profile", p.username, None, "ok", client_ip(request),
+        category="auth", before=before,
+        after={
+            "display_name": updated.display_name,
+            "email": updated.email,
+            "leader_name": updated.leader_name,
+            "leader_intro": updated.leader_intro,
+        },
+    )
+    return await me(p)
 
 
 @router.post("/change-password")

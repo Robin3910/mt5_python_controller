@@ -721,8 +721,13 @@ def test_encrypt_scene_id_bad_ekey_raises():
         encrypt_scene_id("scene-abc", bad)
 
 
-def test_captcha_scene_endpoint_plain_without_ekey(client):
+def test_captcha_scene_endpoint_plain_without_ekey(client, monkeypatch):
     """没配 ekey 时下发明文 SceneId（兼容非加密模式）。"""
+    from app import settings as settings_mod
+
+    # 显式清空 ekey：本机 .env 可能配了，避免受环境影响
+    monkeypatch.setattr(settings_mod.settings, "aliyun_captcha_ekey", "")
+
     h = auth_headers(client)
     _enable_sms(client, h, captcha_enabled=True, captcha_prefix="pfx",
                 captcha_scene_id="scene-1")
@@ -804,3 +809,32 @@ def test_admin_bind_invalid_phone_400(client, provider):
     a = client.post("/api/users", json={"username": "user_x", "password": "pass1234"}, headers=h).json()
     r = client.patch(f"/api/users/{a['id']}", json={"phone": "123"}, headers=h)
     assert r.status_code == 400, r.text
+
+
+# ---------------------------------------------------------------------------
+# 回归：原登录链路不变
+# ---------------------------------------------------------------------------
+def test_original_login_and_me_unchanged(client, provider):
+    h = auth_headers(client)
+    r = client.get("/api/me", headers=h)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # MeOut 里的 phone 是**脱敏值**（个人中心只读展示用），不是完整号码。
+    # 未绑定手机号时为 None。
+    assert body.get("phone") is None
+    assert body.get("phone_verified") is False
+    assert body["username"] == "admin"
+    assert body["is_admin"] is True
+
+
+def test_sms_config_admin_only(client, provider):
+    """短信配置只对管理员开放。"""
+    h = auth_headers(client)
+    r = client.post("/api/users", json={"username": "normaluser", "password": "pass1234"}, headers=h)
+    uid = r.json()["id"]
+    nh = {"Authorization": "Bearer " + client.post(
+        "/api/login", json={"username": "normaluser", "password": "pass1234"}
+    ).json()["token"]}
+    assert client.get("/api/config/sms", headers=nh).status_code == 403
+    assert client.put("/api/config/sms", json={"enabled": True}, headers=nh).status_code == 403
+    assert client.get("/api/config/sms", headers=h).status_code == 200
