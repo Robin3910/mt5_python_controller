@@ -1,4 +1,4 @@
-"""策略托管执行器：一个分组任务一个实例，事件驱动，直到魔术号持仓全平。
+﻿"""策略托管执行器：一个分组任务一个实例，事件驱动，直到魔术号持仓全平。
 
 职责：
 1. 收到 strategy_start 后下首单（魔术号 = 服务端下发的任务魔术号）；
@@ -267,26 +267,6 @@ class StrategyRunner:
         # - 已成交持仓：ticket → 档位参数（自有止损从这里取，成交后锁定）
         self._price_pending: dict[int, dict] = {}
         self._price_filled: dict[int, dict] = {}
-        # 指定价档位成交后的**「按指定价算止盈」分支**：方向 → 止盈价。
-        #
-        # 这**不是**一个全局的止盈权威价，而是止盈计算里的一个**分支**：
-        # 指定价档位成交那一拍，该笔 + 当时的存量按这个绝对价出场
-        # （价格打到它时全场合计盈亏正好等于阶梯止盈 1 的目标金额——
-        # 这是「手数按 tier1 反推」的直接结果）。
-        #
-        # 之后如果又加了**其它类型**的仓（顺势、间距档、市价兜底），
-        # 大部队的止盈点就重新按加权均价反推（指定价那笔**一起参与**重算），
-        # 这个分支随之撤销。
-        #
-        # 键是方向（BUY / SELL），不是规则类型：止盈是按方向算的。
-        self._price_tp_override_by_side: dict[str, float] = {}
-        # 立起分支时的阶梯止盈 1 金额（方向 → 金额）。
-        #
-        # 分支价是**按这个金额反推手数**得到的：价格打到它时，全场合计盈亏
-        # 正好等于 tier1 的目标金额。所以 tier1 一改，这个分支价就**过期了**
-        # ——它代表的还是旧金额。必须撤销分支，回到加权均价口径重算，
-        # 否则用户改了 tier1 却发现止盈价一动不动。
-        self._price_tp_override_tier: dict[str, float] = {}
         # 指定价档位的自有止损被打掉了（票号从持仓里消失）：
         # 置上后由 `_lot_sltp_sync` 消费一次（触发 TP/SL 重算 + 重读余额）。
         self._price_sl_dropped: bool = False
@@ -482,47 +462,6 @@ class StrategyRunner:
                 continue
             if ticket > 0:
                 self._price_filled[ticket] = dict(item)
-        # 「按指定价算止盈」的分支（方向 → 止盈价）：重连后要恢复它，
-        # 否则存量的止盈会被改回「加权均价 + 阶梯金额」反推出来的价。
-        raw_override = self._resume_runtime.get("price_tp_override")
-        if isinstance(raw_override, dict):
-            for side, value in raw_override.items():
-                tp = _as_float(value, 0.0)
-                key = str(side or "").strip().upper()
-                if key in ("BUY", "SELL") and tp > 0:
-                    self._price_tp_override_by_side[key] = tp
-            # 分支是按哪个 tier1 金额反推出来的：重连后要能判断它是否过期。
-            raw_tier = self._resume_runtime.get("price_tp_override_tier")
-            if isinstance(raw_tier, dict):
-                for side, value in raw_tier.items():
-                    key = str(side or "").strip().upper()
-                    if key in ("BUY", "SELL"):
-                        self._price_tp_override_tier[key] = _as_float(value, 0.0)
-            else:
-                # 旧快照没有这一项：分支价是按「当时的 tier1」反推的，
-                # 用当前的 tier1 顶上（旧的分支多半还是当前金额）。
-                current = signal_pl.lot_pl_amount(self._signal_pl) or 0.0
-                for key in self._price_tp_override_by_side:
-                    self._price_tp_override_tier[key] = current
-        else:
-            # 旧快照没有这一项：从已成交的指定价档位里还原。
-            # 分支是一次性的：只在**该方向还没有被其它加仓撤销过**时才还原，
-            # 否则旧快照会把已经作废的分支复活。
-            best: dict[str, tuple[int, float]] = {}
-            for ticket, info in self._price_filled.items():
-                side = str((info or {}).get("side") or "").upper()
-                tp_ref = _as_float((info or {}).get("tp_ref"), 0.0)
-                if side not in ("BUY", "SELL") or tp_ref <= 0:
-                    continue
-                prev = best.get(side)
-                if prev is None or int(ticket) > prev[0]:
-                    best[side] = (int(ticket), tp_ref)
-            self._price_tp_override_by_side = {
-                side: tp for side, (_ticket, tp) in best.items()
-            }
-            current = signal_pl.lot_pl_amount(self._signal_pl) or 0.0
-            for key in self._price_tp_override_by_side:
-                self._price_tp_override_tier[key] = current
         # TradingView SMC 价位副本，以及本任务在本节点已经用过的记录
         self._smc: dict = {}
         self._smc_used: set[str] = set()
@@ -687,9 +626,8 @@ class StrategyRunner:
         if new_mode != signal_pl.MONITOR_TIMES or prev_mode != signal_pl.MONITOR_TIMES:
             keep_remaining = None  # 监控方式变了：从头起算
         self._signal_pl = signal_pl.prepare_runtime(new_cfg, keep_remaining=keep_remaining)
-        # 阶梯止盈 tier1 金额改了 → 「按指定价算止盈」的分支价过期了
-        # （它是按旧金额反推手数得到的）→ 撤销分支，回加权均价口径重算。
-        self._invalidate_price_tp_override_on_tier_change()
+        # 止盈金额是按「当前手数命中的档位」算的：改了任意一档的门槛或金额，
+        # 命中的档位可能变 → 止盈价要重算（`lot_pl_cfg_sig` 已覆盖全部档位）。
         self._lot_sltp_dirty = True
         self._lot_sltp_fail_at = 0.0
         self._metric_specs = None
@@ -951,10 +889,6 @@ class StrategyRunner:
             # **必须在 `_lot_sltp_sync` 之前**：自有止损被打掉的判定要靠它，
             # 认晚一拍就会漏掉那一拍的 TP/SL 重算。
             await self._observe_price_level_fills(positions)
-            # 指定价档位成交后，它的止盈价接管该方向的止盈：把同方向的存量
-            # 全部对齐过去。**独立于 `close_action`**——只平多单时 BUY 侧的仓位
-            # 不在 `filter_lot_side` 的结果里，走那条路会永远改不到它们。
-            await self._align_positions_to_price_tp(positions, event)
             # 热推后同步在途的手动挂单：客户改了参数就撤旧单重算重挂。
             # 放在成交判定之前：撤单后这一拍不再挂，等下一拍重新走挂单路径。
             if self._manual_resync:
@@ -1281,6 +1215,15 @@ class StrategyRunner:
         ratio = abs(signal_pl.float_pl_ratio_value(self._signal_pl))
         return (signal_pl.float_pl_enabled(self._signal_pl), round(ratio, 6))
 
+    def _lot_pl_tiers(self) -> dict:
+        """当前的信号分档配置（`{enabled, tiers, close_action}`）。
+
+        止盈金额按**每个方向当前总手数命中的档位**取（`signal_pl.tier_amount_for_lot`），
+        所以要传的是**整份档位配置**，不是某一个标量金额。
+        """
+        rule = self._signal_pl.get(signal_pl.RULE_LOT_PL_TIERS)
+        return dict(rule) if isinstance(rule, dict) else {}
+
     def _price_locked_levels(self) -> set[tuple[int, int]]:
         """**已成交**的指定价档位：(规则类型, 档位下标)。
 
@@ -1323,169 +1266,15 @@ class StrategyRunner:
                 out[ticket] = own
         return out
 
-    def _price_tp_override(self) -> dict[str, float]:
-        """指定价档位的「按它算止盈」分支：方向 → 止盈价。
-
-        这**不是**一个全局的止盈权威价，而是止盈计算里的一个**分支**：
-        指定价档位成交时，该笔 + 当时的存量按这个绝对价出场；成交之后如果
-        又加了**其他类型**的仓（顺势、间距档、市价兜底），大部队的止盈点
-        就重新按加权均价反推，分支随之撤销。
-
-        交给 `signal_pl.plan_common_stops` / `opening_stops`：某一方向有分支价时，
-        那一方向的止盈直接用这个绝对价。
-
-        **手动单优先**：手动单是最后一仓，它的止盈权威与「止盈联动清仓」都挂在
-        它身上，权威性更强。所以手动单在场时，这里返回空字典——
-        手动单接管止盈，指定价档位不与之争。
-        """
-        if self._manual_authority_tp() is not None:
-            return {}
-        return {
-            side: float(tp) for side, tp in self._price_tp_override_by_side.items()
-            if float(tp or 0.0) > 0
-        }
-
-    def _price_tp_override_side(self, side: str) -> Optional[float]:
-        """某一方向当前的「按指定价算止盈」分支价；没有则返回 None。"""
-        tp = _as_float(self._price_tp_override_by_side.get(str(side or "").upper()), 0.0)
-        return tp if tp > 0 else None
-
-    def _clear_price_tp_override(self, side: Optional[str] = None) -> None:
-        """撤销「按指定价算止盈」的分支。
-
-        调用时机：
-        - **其它类型的加仓**成交之后：大部队的止盈点要重新按加权均价
-          反推——指定价档位那笔的止盈价不再管着全场。
-        - **阶梯止盈 tier1 金额改了之后**：分支价是按旧金额反推手数得到的，
-          它代表的还是旧目标金额，跟着改就没有意义。
-
-        `side=None` 表示撤销全部分支。
-        """
-        if side is None:
-            self._price_tp_override_by_side.clear()
-            self._price_tp_override_tier.clear()
-            return
-        key = str(side).upper()
-        self._price_tp_override_by_side.pop(key, None)
-        self._price_tp_override_tier.pop(key, None)
-
-    def _invalidate_price_tp_override_on_tier_change(self) -> None:
-        """阶梯止盈 tier1 金额改了 → 撤销「按指定价算止盈」的分支。
-
-        **为什么必须撤销**：分支价（指定价的 `price_tp`）是**按 tier1 目标金额
-        反推手数**得到的——价格打到它时，全场合计盈亏正好等于 tier1 金额。
-        tier1 一改，这个分支价代表的还是**旧金额**：继续拿它当止盈，
-        用户改了 tier1 却发现止盈价一动不动，而且出场金额也不是新 tier1。
-
-        撤销后回到加权均价口径：TP = W ± tier1 ÷ (每手每价金额 × 总手数)，
-        正好按**新** tier1 重算，指定价那笔一起参与。
-
-        只有**金额**变了才撤销：`min_lot`（手数门槛）不影响分支价的含义，
-        `close_action`（平仓方向）是另一条独立的语义。
-        """
-        current = signal_pl.lot_pl_amount(self._signal_pl)
-        if current is None:
-            # 阶梯止盈被关掉了：分支没有依据了，一起撤销。
-            if self._price_tp_override_by_side:
-                logger.info(
-                    "task %s price tp override revoked: lot_pl tiers disabled",
-                    self.task_id,
-                )
-                self._clear_price_tp_override()
-            return
-        for side, tier in list(self._price_tp_override_tier.items()):
-            if abs(float(tier or 0.0) - float(current)) <= 1e-9:
-                continue
-            if side not in self._price_tp_override_by_side:
-                continue
-            logger.info(
-                "task %s price tp override revoked for %s: tier1 %s -> %s",
-                self.task_id, side, tier, current,
-            )
-            self._clear_price_tp_override(side)
-
-    async def _align_positions_to_price_tp(
-        self, positions: list[dict], event: MarketEvent,
-    ) -> list[int]:
-        """把本魔术号下**同方向**的仓位止盈对齐到指定价档位的止盈价。
-
-        与 `_align_positions_to_manual_tp` 同一套机制，但**只动自己方向**的仓位
-        （止盈是按方向算的，另一方向各有各的止盈）。
-
-        **为什么不走 `plan_common_stops`**：那条路先按 `close_action` 过滤持仓
-        （`filter_lot_side`），只平多单时 BUY 侧的仓位根本不在里面——指定价档位
-        成交后那一侧就永远拿不到这个止盈价。它是**成交事件的直接后果**，
-        不该被「只平哪一侧」的配置挡掉。
-
-        返回本次改成功的票号列表（空列表表示这次没有改动）。
-        """
-        changed: list[int] = []
-        if not self._price_tp_override_by_side:
-            return changed
-        spec = await self._manual_symbol_spec()
-        if spec is None:
-            return changed
-        digits = int(spec.get("digits") or 0)
-        stops_level = int(spec.get("stops_level") or 0)
-        point = _as_float(spec.get("point"), 0.0)
-        for pos in positions:
-            if not isinstance(pos, dict):
-                continue
-            ticket = int(pos.get("ticket") or 0)
-            if ticket <= 0:
-                continue
-            side = str(pos.get("type") or "").upper()
-            tp = self._price_tp_override_side(side)
-            if tp is None:
-                continue
-            cur_tp = _as_float(pos.get("tp"), 0.0)
-            if abs(cur_tp - tp) <= 1e-9:
-                continue
-            # 止盈价已经落在现价错误一侧时券商会拒单：这次先不改，等价格回来
-            if not manual_scatter.tp_is_sendable(
-                side, tp, _as_float(event.price),
-                stops_level=stops_level, point=point,
-            ):
-                continue
-            try:
-                res = dict(await self._exec(
-                    self._mt5.modify_position_sl, ticket,
-                    _as_float(pos.get("sl"), 0.0), tp,
-                ) or {})
-            except Exception as e:  # noqa: BLE001
-                logger.warning("task %s price tp align failed: %s", self.task_id, e)
-                continue
-            if not res.get("success"):
-                logger.warning(
-                    "task %s price tp align failed: %s", self.task_id, res.get("error"),
-                )
-                continue
-            changed.append(ticket)
-        if changed:
-            logger.info(
-                "task %s price tp applied to %d position(s)",
-                self.task_id, len(changed),
-            )
-            await self._emit_progress(
-                "price_tp_align", phase="running", positions=positions,
-                message=f"指定价止盈价已同步到 {len(changed)} 笔持仓",
-                detail={
-                    "kind": "price_level",
-                    "price_level": True,
-                    "aligned_tickets": changed,
-                    "override": {
-                        k: float(v) for k, v in self._price_tp_override_by_side.items()
-                    },
-                },
-            )
-        return changed
-
     def _price_level_tp_ref(self, rule_type: int, level_index: int) -> float:
-        """按 (规则类型, 档位号) 从当前配置里取指定价档位的止盈价。
+        """按 (规则类型, 档位号) 从当前配置里取指定价档位的**参考止盈价**。
 
-        用于 runtime 丢了挂单记录时恢复止盈分支价：
-        档位号能唯一定位一档，配置里的 `price_tp` 就是成交时的那个值
+        用于 runtime 丢了挂单记录时还原这一档的参数：
+        档位号能唯一定位一档，配置里的 `price_tp` 就是挂单时的那个值
         （成交后该字段被锁定，不会与已开仓位不一致）。
+
+        **它只是「反推手数的参考价」**，不是出场价：出场价按「当前手数命中的
+        档位金额」算（见 `signal_pl.plan_common_stops`）。
         """
         for rule in self._rules or []:
             if not isinstance(rule, dict):
@@ -1735,11 +1524,10 @@ class StrategyRunner:
         ratio_on = signal_pl.float_pl_enabled(self._signal_pl)
         sl_cfg_sig = self._sl_cfg_sig()
         tp_cfg_sig = signal_pl.lot_pl_cfg_sig(self._signal_pl)
-        # 「按指定价算止盈」的分支存在时也算「有东西可写」：指定价档位成交后
-        # 接管了止盈，即使阶梯止盈没启用（或 tier1 金额为 0），也要把分支价
-        # 写进存量仓位。
-        tp_override = self._price_tp_override()
-        if (tp_amount is None and not ratio_on and not tp_override) or not positions:
+        # 分档止盈启用与否决定「有没有止盈可写」。金额是**按每个方向的手数
+        # 命中的档位**动态选的，所以这里只看「配没配金额」，不看具体数值。
+        tp_enabled = signal_pl.lot_pl_tiers_enabled(self._signal_pl)
+        if (not tp_enabled and not ratio_on) or not positions:
             # 没有可写的东西：把指纹记成当前配置，这样下次启用时能被认出来
             self._lot_sltp_sl_cfg_sig = sl_cfg_sig
             self._lot_sltp_tp_cfg_sig = tp_cfg_sig
@@ -1810,7 +1598,8 @@ class StrategyRunner:
             sl_balance = balance
         plans = signal_pl.plan_common_stops(
             scoped,
-            tp_amount=tp_amount,
+            # 整份分档配置：金额按每个方向自己的手数命中的档位选
+            tp_tiers=self._lot_pl_tiers(),
             sl_amount=sl_amount,
             tp_min_lot=signal_pl.lot_pl_min_lot(self._signal_pl),
             tick_size=_as_float(spec.get("tick_size")),
@@ -1821,8 +1610,6 @@ class StrategyRunner:
             fallback_price=_as_float(event.price),
             # 指定价档位持仓的自有止损：取「更近的那道」靠它
             own_sl_by_ticket=self._own_sl_by_ticket(scoped),
-            # 指定价档位成交后接管的「按指定价算止盈」分支价：该方向的止盈直接用它
-            tp_override=self._price_tp_override(),
         )
         applied = await self._lot_sltp_apply_plans(
             event, positions, plans,
@@ -1923,7 +1710,8 @@ class StrategyRunner:
             return None
         plans = signal_pl.plan_common_stops(
             scoped,
-            tp_amount=None,
+            # 这一路只写止损：止盈听手动仓权威，所以不给分档配置
+            tp_tiers=None,
             sl_amount=sl_amount,
             tp_min_lot=0.0,
             tick_size=_as_float(spec.get("tick_size")),
@@ -2174,18 +1962,13 @@ class StrategyRunner:
         返回 None 表示这次没算出来，调用方沿用信号自带的止损止盈（加仓则不挂）。
         返回元组时，其中的 None 表示这一侧不写进订单。
 
-        **「按指定价算止盈」的分支**：指定价档位成交后接管了某个方向的止盈时，
-        新加的这一笔也要带同一个分支价——否则它带一个按加权均价反推的止盈，
-        和其它持仓的止盈对不上（会出现「存量先走、这一笔挂着」）。
-
-        注意这个分支**只对指定价那一拍有效**：`_add_position` 会在算止损止盈
-        **之前**撤销它（这一笔是其它类型的加仓），所以这里算出来的已经是
-        撤销后的加权均价口径。
+        止盈金额按**加上这一笔之后**的该方向总手数命中的档位算：
+        这一笔自己也在重算里，它带来的手数可能让方向跳档（金额变大、
+        止盈价变远），止盈必须跟着跳，不能用旧的档位金额。
         """
-        tp_amount = signal_pl.lot_pl_amount(self._signal_pl)
+        tp_enabled = signal_pl.lot_pl_tiers_enabled(self._signal_pl)
         ratio_on = signal_pl.float_pl_enabled(self._signal_pl)
-        tp_override = self._price_tp_override()
-        if tp_amount is None and not ratio_on and not tp_override:
+        if not tp_enabled and not ratio_on:
             return None
         try:
             spec = await self._manual_symbol_spec()
@@ -2201,14 +1984,14 @@ class StrategyRunner:
                 balance = await self._read_balance()
                 if balance is not None:
                     sl_amount = signal_pl.float_pl_loss_amount(self._signal_pl, balance)
-            if tp_amount is None and sl_amount is None and not tp_override:
+            if not tp_enabled and sl_amount is None:
                 return None
             return signal_pl.opening_stops(
                 manual_scatter.exclude_manual(positions),
                 side=action,
                 volume=volume,
                 fill_price=fill,
-                tp_amount=tp_amount,
+                tp_tiers=self._lot_pl_tiers(),
                 sl_amount=sl_amount,
                 tp_min_lot=signal_pl.lot_pl_min_lot(self._signal_pl),
                 close_action=signal_pl.lot_pl_close_action(self._signal_pl),
@@ -2219,7 +2002,6 @@ class StrategyRunner:
                 ask=ask,
                 stops_level=int(spec.get("stops_level") or 0),
                 point=_as_float(spec.get("point")),
-                tp_override=tp_override,
             )
         except Exception:  # noqa: BLE001
             logger.debug("task %s opening stops failed", self.task_id, exc_info=True)
@@ -2236,7 +2018,7 @@ class StrategyRunner:
         sl, tp = computed
         if sl is None and not signal_pl.float_pl_enabled(self._signal_pl):
             sl = signal_sl
-        if tp is None and signal_pl.lot_pl_amount(self._signal_pl) is None:
+        if tp is None and not signal_pl.lot_pl_tiers_enabled(self._signal_pl):
             tp = signal_tp
         return sl, tp
 
@@ -2452,14 +2234,6 @@ class StrategyRunner:
                 self._counter_skip_fills -= 1
                 continue
             comment = str(pos.get("comment") or "")
-            # 逆势限价成交也是**其它类型**的加仓 → 撤销「按指定价算止盈」的
-            # 分支，大部队的止盈点重新按加权均价反推。
-            #
-            # 但**指定价档位不算**：它就是分支的来源，那一拍才刚立起分支。
-            if parse_price_level(comment) is None:
-                self._revoke_price_tp_override_on_other_add(
-                    str(pos.get("type") or self.direction),
-                )
             volume = _as_float(pos.get("volume"))
             price = _as_float(pos.get("price_open"))
             self.add_counts[RULE_TYPE_COUNTER] = self.add_counts.get(RULE_TYPE_COUNTER, 0) + 1
@@ -2814,11 +2588,20 @@ class StrategyRunner:
             )
             return None
 
-        # 手数：按阶梯止盈 1 的目标金额反推。
-        # 存量仓位到「止盈价」那一刻的预估盈亏要算进去：
-        # 存量浮盈抵扣目标、浮亏补进目标，两种情况净额都等于阶梯 1 的目标金额。
+        # 手数：按**该方向存量手数命中的档位金额**反推。
+        # 存量仓位到「参考价」那一刻的预估盈亏要算进去：
+        # 存量浮盈抵扣目标、浮亏补进目标，两种情况净额都等于那个档位的目标金额。
         # 手动分散仓不进基数（它有自己的止盈价与目标金额，混进来会重复计算）。
-        target = manual_scatter.tier0_pl_amount(rule.get("lot_pl_tiers"))
+        #
+        # **命中哪一档**按「挂单时该方向已有的手数」算（`current_lot`）：
+        # 这一档的手数只按它成交时已经有的仓位决定，不做「成交后跳档」的
+        # 不动点迭代。成交之后仓位变了 → 下一拍命中新的档位 → 止盈价重算。
+        tiers = rule.get("lot_pl_tiers")
+        current_lot = manual_scatter.current_lot(
+            manual_scatter.exclude_manual(book),
+            side=direction,
+        )
+        target = manual_scatter.tier_amount_for_lot(tiers, current_lot)
         projected = manual_scatter.projected_profit(
             manual_scatter.exclude_manual(book),
             tp_ref,
@@ -2829,18 +2612,19 @@ class StrategyRunner:
         volume = manual_scatter.price_level_volume(
             entry=entry,
             tp_ref=tp_ref,
-            lot_pl_tiers=rule.get("lot_pl_tiers"),
+            lot_pl_tiers=tiers,
             tick_size=_as_float(spec.get("tick_size")),
             tick_value=_as_float(spec.get("tick_value")),
             volume_step=_as_float(spec.get("volume_step"), 0.01),
             volume_min=_as_float(spec.get("volume_min"), 0.01),
             volume_max=_as_float(spec.get("volume_max"), 100.0),
             projected_pl=projected_pl,
+            current_lot=current_lot,
         )
         if volume is None or volume <= 0:
             logger.info(
-                "task %s price level skipped: no volume (tier1 %s, tp_ref %s)",
-                self.task_id, target, tp_ref,
+                "task %s price level skipped: no volume (target %s, lot %s, tp_ref %s)",
+                self.task_id, target, current_lot, tp_ref,
             )
             return None
 
@@ -2864,14 +2648,13 @@ class StrategyRunner:
         plan = plan_price_level(
             rule, ctx, level=level, level_index=level_index,
             volume=volume, limit_kind=kind,
-            # 手数是按这个 tier1 金额反推的 → 记在计划上，
-            # 成交后立起分支时要记下它（分支价代表的金额）。
+            # 手数是按这个金额反推的 → 记在计划上，供事件与诊断查看
             tier_amount=float(target or 0.0),
         )
         if plan is None:
             return None
         plan.volume_formula = (
-            f"阶梯止盈1 目标 {target} − 存量到 {_trim_price(tp_ref)} 的预估盈亏 "
+            f"命中档目标 {target}（存量 {current_lot} 手）− 存量到 {_trim_price(tp_ref)} 的预估盈亏 "
             f"{round(projected_pl, 2)} = {round(abs(target) - projected_pl, 2)}，"
             f"每手止盈 {_trim_price(manual_scatter.profit_per_lot(entry, tp_ref, _as_float(spec.get('tick_size')), _as_float(spec.get('tick_value'))))}"
             f"，手数 {plan.volume}"
@@ -2948,9 +2731,8 @@ class StrategyRunner:
             "kind": plan.limit_kind,
             "level_index": plan.level_index,
             "comment": plan.comment,
-            # 挂单时用的 tier1 金额：手数是按它反推的。成交后立起分支时要用
-            # **这个**金额（不是成交那一刻的 tier1）——中间热推改过 tier1 的话，
-            # 分支价代表的仍然是挂单时那个金额。
+            # 挂单时用的目标金额：手数是按它反推的。记下来供诊断查看
+            # （成交后的止盈价按「成交后手数命中的档位」重算，不依赖它）。
             "tier_amount": float(plan.tier_amount or 0.0),
             "time": time.time(),
         }
@@ -3110,7 +2892,8 @@ class StrategyRunner:
             tp_ref = _as_float(pending.get("tp_ref"), 0.0)
             if tp_ref <= 0:
                 # runtime 丢了这一笔的挂单记录 → 从配置里按档位号找回来。
-                # 止盈分支靠它，没有它这一笔就只是普通仓（出场跟随共同阶梯止盈）。
+                # 它只是「反推手数的参考价」，没有它这一笔就只是普通仓
+                # （出场跟随共同阶梯止盈）。
                 tp_ref = self._price_level_tp_ref(parsed[0], parsed[1])
             self._price_filled[ticket] = {
                 "ticket": ticket,
@@ -3122,29 +2905,9 @@ class StrategyRunner:
                 "side": str(pos.get("type") or "").upper(),
                 "comment": str(pos.get("comment") or ""),
             }
-            # 「按指定价算止盈」的分支在此立起：指定价档位成交 → 该方向的
-            # 止盈改用它的 `price_tp`（这一笔 + 当时的存量一起）。
-            #
-            # 手数是按这个价反推出来的（tier1 金额口径），所以价格打到它时，
-            # 全场合计盈亏正好等于阶梯止盈 1 的目标金额。存量仓位的止盈也
-            # 全部对齐到它——否则存量可能先被各自的共同止盈平掉，
-            # 剩下这一笔孤零零地挂着。
-            #
-            # **只在成交那一拍立起**：之后其它类型的加仓会撤销它，
-            # 那时不能再从还在场的指定价仓位把它复活（分支是一次性的）。
-            if tp_ref > 0:
-                side = str(pos.get("type") or "").upper()
-                if side in ("BUY", "SELL"):
-                    self._price_tp_override_by_side[side] = tp_ref
-                    # 记下这个分支是按哪个 tier1 金额反推出来的：
-                    # 改了 tier1 就要撤销分支重算（分支价代表的是旧金额）。
-                    #
-                    # 用**挂单时**的金额，不是成交那一刻的 tier1：中间热推改过
-                    # tier1 的话，手数是按旧金额算的，分支价代表的也是旧金额。
-                    tier_amount = _as_float(pending.get("tier_amount"), 0.0)
-                    if tier_amount <= 0:
-                        tier_amount = signal_pl.lot_pl_amount(self._signal_pl) or 0.0
-                    self._price_tp_override_tier[side] = tier_amount
+            # 成交这一拍**不需要立任何分支**：止盈金额按「该方向当前总手数
+            # 命中的档位」算，成交后手数变了 → 命中的档位可能跳 → 止盈价
+            # 跟着重算（仓位构成变化会触发 `_lot_sltp_sync` 重算）。
         # 再认消失：设了自有止损的指定价仓不见了 → 自有止损被打掉
         for ticket, info in list(self._price_filled.items()):
             if ticket in alive:
@@ -3153,60 +2916,14 @@ class StrategyRunner:
                 self._price_sl_dropped = True
             # 已经不在盘上了，清理掉
             self._price_filled.pop(ticket, None)
-        # 指定价仓位全离场了 → 该方向的分支也该撤销（共同阶梯止盈重新接管）
-        self._prune_price_tp_override()
-
-    def _prune_price_tp_override(self) -> None:
-        """指定价档位已经不在场了 → 撤销对应方向的「按指定价算止盈」分支。
-
-        只在**该方向一个指定价仓位都不剩**时才撤销。指定价仓位还在、
-        只是分支被其它类型的加仓撤销过的，这里不动——分支是一次性的，
-        不会被还活着的指定价仓位复活。
-        """
-        if self._manual_authority_tp() is not None:
-            return
-        alive_sides = {
-            str((info or {}).get("side") or "").upper()
-            for info in self._price_filled.values()
-            if _as_float((info or {}).get("tp_ref"), 0.0) > 0
-        }
-        for side in list(self._price_tp_override_by_side):
-            if side not in alive_sides:
-                self._price_tp_override_by_side.pop(side, None)
-                self._price_tp_override_tier.pop(side, None)
-
-    def _revoke_price_tp_override_on_other_add(self, side: str) -> None:
-        """**其它类型**的仓位加进来之后，撤销该方向的「按指定价算止盈」分支。
-
-        这是分支语义的核心：指定价档位成交那一拍用它的 `price_tp` 出场；
-        之后一旦加了别的仓（顺势、间距档、市价兜底），大部队的止盈点就
-        重新按加权均价反推——**指定价那笔一起参与重算**（它本来就在
-        `scoped` 里，不是手动仓，不会被 `exclude_manual` 排除）。
-
-        只撤销**同方向**的分支：另一方向的止盈各算各的，不受影响。
-        """
-        key = str(side or "").strip().upper()
-        if key not in ("BUY", "SELL"):
-            return
-        if key not in self._price_tp_override_by_side:
-            return
-        self._clear_price_tp_override(key)
-        logger.info(
-            "task %s price tp override revoked for %s: other add joined the book",
-            self.task_id, key,
-        )
 
     async def _add_position(
         self, decision, positions: list[dict], *, message: Optional[str] = None,
     ) -> None:
         reason = message or describe_decision(decision)
-        # 「按指定价算止盈」的分支到此结束：这笔是**其它类型**的加仓
-        # （顺势 / 间距档 / 市价兜底），不是指定价档位。大部队的止盈点
-        # 要重新按加权均价反推（指定价那笔一起参与重算）。
-        #
-        # **必须在 `_stops_on_open` 之前撤销**：这一笔要带的止盈是重算后的
-        # 加权均价口径（它自己也在重算里），不能还挂着分支价。
-        self._revoke_price_tp_override_on_other_add(decision.action)
+        # 这一笔是**其它类型**的加仓（顺势 / 间距档 / 市价兜底）。
+        # 止盈按「加上这一笔之后该方向的总手数命中的档位」算 ——
+        # 这一笔带来的手数可能让方向跳档，止盈价跟着跳。
         order_sl, order_tp = await self._stops_on_open(
             decision.action, decision.volume, positions,
         ) or (None, None)
@@ -3861,20 +3578,6 @@ class StrategyRunner:
                 {str(k): v for k, v in sorted(item.items())}
                 for _k, item in sorted(self._price_filled.items())
             ]
-        # 「按指定价算止盈」的分支（方向 → 止盈价）：重连后要知道当前是不是
-        # 还处在「按指定价算止盈」这条分支上，否则存量仓位的止盈会被改回
-        # 「加权均价 + 阶梯金额」反推出来的价。
-        if self._price_tp_override_by_side:
-            payload["price_tp_override"] = {
-                str(k): round(float(v), 8)
-                for k, v in sorted(self._price_tp_override_by_side.items())
-            }
-            # 分支是按哪个 tier1 金额反推出来的：重连后要能判断它是否过期
-            # （tier1 改了 → 分支价代表的还是旧金额 → 要撤销重算）。
-            payload["price_tp_override_tier"] = {
-                str(k): round(float(v), 8)
-                for k, v in sorted(self._price_tp_override_tier.items())
-            }
         # 止损基准余额：重连后要知道「当前止损是按多少余额算的」，
         # 才能判断客户入金后该不该重算。
         if self._lot_sltp_sl_balance is not None:

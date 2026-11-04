@@ -9,6 +9,7 @@ import pytest
 
 import market_hub as mh
 import manual_scatter
+import signal_pl
 from mock_mt5 import MockMT5Client
 from strategy_runner import StrategyRunner, _trade_error_text
 
@@ -2403,11 +2404,16 @@ async def test_signal_stop_recalculates_on_open_not_on_close():
 
 
 def _lot_tiers(**over) -> dict:
+    """两档分档：0.05 手 → 10，0.5 手 → 20。
+
+    批次2 的门槛取 0.5：0.1 手的首单仍命中批次1（这些用例关心的是
+    「批次1 的金额怎么用」）；跨档的行为由 `test_signal_lot_pl_*` 单独覆盖。
+    """
     tiers = {
         "enabled": True, "batch_count": 2, "close_action": "all",
         "tiers": [
             {"min_lot": 0.05, "pl_amount": 10.0},
-            {"min_lot": 0.1, "pl_amount": 20.0},
+            {"min_lot": 0.5, "pl_amount": 20.0},
         ],
     }
     tiers.update(over)
@@ -3074,20 +3080,28 @@ async def test_price_level_position_follows_common_take_profit():
     ))
     await _settle()
 
-    # 指定价仓与存量一起按「指定价算止盈」的分支出场：TP = price_tp = 2410
+    # 止盈按「该方向当前手数命中的档位金额」反推，不再有「指定价绝对价分支」。
+    # 本例档位是 {0.05 → 10, 0.5 → 20}：成交后总手数 0.11 → 命中批次1（10）。
     price_pos = next(p for p in mt5.positions_by_magic(MAGIC) if p["comment"] == "R1L0X")
-    assert price_pos["tp"] == 2410.0
-    # 存量仓位的止盈也一起对齐过去（否则存量会先被各自的共同止盈平掉）
+    book = [
+        {"type": p["type"], "volume": p["volume"], "price_open": p["price_open"]}
+        for p in mt5.positions_by_magic(MAGIC)
+    ]
+    total = sum(p["volume"] for p in book)
+    weighted = sum(p["volume"] * p["price_open"] for p in book) / total
+    expected = weighted + 10.0 / ((1 / 0.01) * total)
+    assert abs(price_pos["tp"] - expected) < 0.02
+    # 存量仓位的止盈也是同一个价（它们一起参与重算）
     first_pos = next(p for p in mt5.positions_by_magic(MAGIC) if p["comment"] != "R1L0X")
-    assert first_pos["tp"] == 2410.0
+    assert abs(first_pos["tp"] - expected) < 0.02
     runner.cancel()
 
 
 async def test_price_level_take_profit_branch_yields_tier1_amount():
-    """打到指定价止盈价时，全场合计盈亏正好等于阶梯止盈 1 的目标金额。
+    """打到共同止盈价时，全场合计盈亏正好等于命中档位的目标金额。
 
-    这是「手数按 tier1 反推 + 按指定价算止盈」的联合结果：
-    存量盈亏 + 这一档的盈亏 = tier1 金额。
+    这是「止盈价 = 加权均价 ± 金额 / (k × 总手数)」的定义式：
+    打到那个价时，全场合计盈亏 == 那个金额（命中批次1 就是 tier1 金额）。
     """
     sent: list = []
     mt5 = MockMT5Client()
@@ -3117,13 +3131,14 @@ async def test_price_level_take_profit_branch_yields_tier1_amount():
     ))
     await _settle()
 
-    # 到止盈价 2410 时，全场合计盈亏 ≈ tier1 金额 500
+    # 到共同止盈价时，全场合计盈亏 ≈ 命中档位的金额 500
     # （手数向上取整到 0.01 带来的残差：0.37 vs 精确的 0.3636…）
     book = [
         {"type": p["type"], "volume": p["volume"], "price_open": p["price_open"]}
         for p in mt5.positions_by_magic(MAGIC)
     ]
-    total_pl = manual_scatter.projected_profit(book, 2410.0, 0.01, 1.0)
+    tp = mt5.positions_by_magic(MAGIC)[0]["tp"]
+    total_pl = manual_scatter.projected_profit(book, tp, 0.01, 1.0)
     assert 495.0 < total_pl < 515.0
     runner.cancel()
 
@@ -3168,19 +3183,30 @@ async def test_price_level_position_is_included_in_common_take_profit_volume():
 
     price_pos = next(p for p in mt5.positions_by_magic(MAGIC) if p["comment"] == "R1L0X")
     assert price_pos["volume"] == 0.37
-    # 止盈走「按指定价算止盈」的分支：TP = 档位填的 price_tp = 2410
-    # （不是按加权均价 + 阶梯金额反推）
-    assert price_pos["tp"] == 2410.0
-    # 存量仓位的止盈也一起对齐过去（否则存量会先被各自的共同止盈平掉）
+    # 止盈按「成交后该方向总手数命中的档位金额」反推：
+    # 总手数 0.47 → 命中批次1（门槛 0.1，金额 500）
+    book = [
+        {"type": p["type"], "volume": p["volume"], "price_open": p["price_open"]}
+        for p in mt5.positions_by_magic(MAGIC)
+    ]
+    total = sum(p["volume"] for p in book)
+    weighted = sum(p["volume"] * p["price_open"] for p in book) / total
+    expected = weighted + 500.0 / ((1 / 0.01) * total)
+    assert abs(price_pos["tp"] - expected) < 0.02
+    # 存量仓位的止盈是同一个价（一起参与重算）
     first_pos = next(p for p in mt5.positions_by_magic(MAGIC) if p["comment"] != "R1L0X")
-    assert first_pos["tp"] == 2410.0
+    assert abs(first_pos["tp"] - expected) < 0.02
     # 自有止损仍在（挂单时写进去的）
     assert price_pos["sl"] == 2390.0
     runner.cancel()
 
 
-async def test_price_level_branch_persists_to_runtime_and_restores():
-    """「按指定价算止盈」的分支要落库，重连后恢复。"""
+async def test_price_level_fill_record_persists_to_runtime():
+    """已成交的指定价档位要落库（重连后据此还原自有止损）。
+
+    **不再有「止盈分支」**：止盈金额按「当前手数命中的档位」算，止盈价是
+    重算出来的，不需要落库。runtime 里保留的是这一笔的档位参数。
+    """
     sent: list = []
     mt5 = MockMT5Client()
     mt5.balance = 10000.0
@@ -3208,17 +3234,19 @@ async def test_price_level_branch_persists_to_runtime_and_restores():
     ))
     await _settle()
 
-    assert runner._price_tp_override_by_side == {"BUY": 2410.0}
     payload = runner._manual_runtime_payload()
-    assert payload["price_tp_override"] == {"BUY": 2410.0}
+    assert payload.get("price_tp_override") is None
+    filled = payload["price_filled"]
+    assert len(filled) == 1
+    assert filled[0]["own_sl"] == 2390.0
     runner.cancel()
 
 
-async def test_price_level_branch_survives_close_action_filtering():
-    """分支不受 `close_action` 过滤影响。
+async def test_price_level_take_profit_follows_close_action():
+    """`close_action` 只说「止盈时平哪一侧」：只平空单时，多单侧不写止盈。
 
-    `lot_pl_tiers.close_action` 只说「止盈时平哪一侧」，不该影响「按指定价算止盈」：
-    只平空单时，多单侧的指定价档位成交后，多单侧仍然要拿到这个止盈价。
+    现在**没有**「按指定价算止盈」的分支了，所以 `close_action` 对多空两侧
+    一视同仁 —— 只平空单时，多单侧的仓位（含指定价那笔）不写止盈。
     """
     sent: list = []
     mt5 = MockMT5Client()
@@ -3255,14 +3283,15 @@ async def test_price_level_branch_survives_close_action_filtering():
     ))
     await _settle()
 
-    assert runner._price_tp_override_by_side == {"BUY": 2410.0}
+    # 多单侧不在平仓范围内 → 不写止盈
     for p in mt5.positions_by_magic(MAGIC):
-        assert p["tp"] == 2410.0
+        if p["type"] == "BUY":
+            assert p["tp"] == 0
     runner.cancel()
 
 
-async def test_price_level_branch_only_touches_its_own_side():
-    """分支只管自己那一侧，另一侧仍按阶梯金额各自反推。"""
+async def test_price_level_take_profit_is_scoped_per_side():
+    """多空两侧各自按自己的手数选档位、算止盈，互不影响。"""
     sent: list = []
     mt5 = MockMT5Client()
     mt5.balance = 10000.0
@@ -3290,7 +3319,7 @@ async def test_price_level_branch_only_touches_its_own_side():
     ))
     await _settle()
 
-    # 塞一笔空单进去：它不该被 BUY 侧的分支出场价影响
+    # 塞一笔空单进去：它不该被多单侧的止盈影响
     mt5._positions.append({
         "ticket": 9999, "magic": MAGIC, "symbol": "XAUUSD", "type": "SELL",
         "volume": 0.2, "price_open": 2401.0, "price_current": 2400.0,
@@ -3304,16 +3333,24 @@ async def test_price_level_branch_only_touches_its_own_side():
     ))
     await _settle()
 
-    buy_tp = {p["tp"] for p in mt5.positions_by_magic(MAGIC) if p["type"] == "BUY"}
-    sell_tp = {p["tp"] for p in mt5.positions_by_magic(MAGIC) if p["type"] == "SELL"}
-    assert buy_tp == {2410.0}
-    # 空单侧按自己的阶梯金额反推：2401 − 500/((1/0.01)×0.2) = 2401 − 25 = 2376
-    assert sell_tp == {2376.0}
+    positions = mt5.positions_by_magic(MAGIC)
+    buy = [p for p in positions if p["type"] == "BUY"]
+    sell = [p for p in positions if p["type"] == "SELL"]
+    # 多单侧：总手数 0.47 → 命中批次1（金额 500）
+    total = sum(p["volume"] for p in buy)
+    weighted = sum(p["volume"] * p["price_open"] for p in buy) / total
+    expected_buy = weighted + 500.0 / ((1 / 0.01) * total)
+    for p in buy:
+        assert abs(p["tp"] - expected_buy) < 0.02
+    # 空单侧：总手数 0.2 → 命中批次1（金额 500）
+    # 2401 − 500/((1/0.01)×0.2) = 2401 − 25 = 2376
+    for p in sell:
+        assert abs(p["tp"] - 2376.0) < 0.02
     runner.cancel()
 
 
-async def test_other_add_revokes_the_price_tp_branch():
-    """其它类型的加仓进来后，撤销分支：大部队的止盈点重新按加权均价反推。
+async def test_other_add_keeps_the_common_take_profit_formula():
+    """其它类型的加仓进来后，止盈仍按「加权均价 + 命中档位金额」算。
 
     指定价那笔**一起参与重算**（它不是手动仓，不会被排除）。
     """
@@ -3349,22 +3386,23 @@ async def test_other_add_revokes_the_price_tp_branch():
     await _settle()
     tick(2400.0)
     await _settle()
-    assert runner._price_tp_override_by_side == {"BUY": 2410.0}
     for p in mt5.positions_by_magic(MAGIC):
-        assert p["tp"] == 2410.0
+        assert p["tp"] != 0
 
     # 价格上行 → 顺势加仓（其它类型）
     for _ in range(4):
         tick(2402.0)
         await _settle()
 
-    assert runner._price_tp_override_by_side == {}
-    # 止盈点重新按加权均价反推：指定价那笔一起参与
+    # 止盈点按加权均价 + 命中档位金额反推：指定价那笔一起参与
     positions = mt5.positions_by_magic(MAGIC)
     assert len(positions) == 3
     total = sum(p["volume"] for p in positions)
     weighted = sum(p["volume"] * p["price_open"] for p in positions) / total
-    expected = weighted + 500.0 / ((1 / 0.01) * total)
+    # 金额按「当前总手数命中的档位」取（手数涨上来了，命中的档位可能变了）
+    amount = signal_pl.tier_amount_for_lot(rule["lot_pl_tiers"], total)
+    assert amount is not None
+    expected = weighted + amount / ((1 / 0.01) * total)
     for p in positions:
         assert abs(p["tp"] - expected) < 0.02
     runner.cancel()
@@ -3740,7 +3778,10 @@ async def test_tier1_hot_push_recalculates_take_profit_after_price_level_fill():
     positions = mt5.positions_by_magic(MAGIC)
     assert len(positions) == 2
     old_tp = {p["tp"] for p in positions}
-    assert old_tp == {2410.0}
+    # 成交后总手数 0.47 → 命中批次1（金额 500）
+    total0 = sum(p["volume"] for p in positions)
+    weighted0 = sum(p["volume"] * p["price_open"] for p in positions) / total0
+    assert abs(positions[0]["tp"] - (weighted0 + 500.0 / ((1 / 0.01) * total0))) < 0.02
 
     # 热推：tier1 从 500 改成 1000
     rule = _price_level_rule()
@@ -3768,11 +3809,10 @@ async def test_tier1_hot_push_recalculates_take_profit_after_price_level_fill():
     runner.cancel()
 
 
-async def test_unrelated_hot_push_keeps_the_price_tp_branch():
-    """tier1 金额没变 → 分支保留，止盈价不动。
+async def test_unrelated_hot_push_keeps_the_take_profit_price():
+    """改的字段不影响命中的档位 → 止盈价不动。
 
-    分支只对「金额」敏感：改别的字段（比如 min_lot 门槛、close_action、
-    指定价的入场价）不该把它撤销掉。
+    改 `min_lot` 门槛：当前手数仍然命中同一个档位、同一���金额 → 止盈价不动。
     """
     sent: list = []
     mt5 = MockMT5Client()
@@ -3797,7 +3837,7 @@ async def test_unrelated_hot_push_keeps_the_price_tp_branch():
     await _settle()
     tick()
     await _settle()
-    assert runner._price_tp_override_by_side == {"BUY": 2410.0}
+    before = {p["tp"] for p in mt5.positions_by_magic(MAGIC)}
 
     # 热推：只改 tier1 的手数门槛（min_lot），金额不动
     rule = _price_level_rule()
@@ -3813,18 +3853,16 @@ async def test_unrelated_hot_push_keeps_the_price_tp_branch():
     tick()
     await _settle()
 
-    # 分支还在，止盈价不变
-    assert runner._price_tp_override_by_side == {"BUY": 2410.0}
-    for p in mt5.positions_by_magic(MAGIC):
-        assert p["tp"] == 2410.0
+    # 命中的还是同一个档位、同一份金额 → 止盈价不变
+    after = {p["tp"] for p in mt5.positions_by_magic(MAGIC)}
+    assert after == before
     runner.cancel()
 
 
-async def test_tier2_change_keeps_the_price_tp_branch():
-    """只改 tier2（当前不参与共同止盈）→ 分支不动。
+async def test_tier2_change_moves_the_take_profit_when_it_is_the_hit_tier():
+    """改 tier2 → 命中 tier2 时止盈价跟着变（批次 2 现在是活配置）。
 
-    只有**批次 1** 的金额是实际生效的那个（`lot_pl_cfg_sig` / `lot_pl_amount`
-    都只看 tiers[0]），批次 2 改了不影响分支价的含义。
+    只有当当前手数**命中**的是 tier2 时才有影响；没命中就一动不动。
     """
     sent: list = []
     mt5 = MockMT5Client()
@@ -3850,12 +3888,15 @@ async def test_tier2_change_keeps_the_price_tp_branch():
     tick()
     await _settle()
 
+    before = {p["tp"] for p in mt5.positions_by_magic(MAGIC)}
+
+    # 把批次 2 的门槛压到当前手数以下 → 命中批次 2；金额也改掉
     rule = _price_level_rule()
     rule["lot_pl_tiers"] = {
         "enabled": True, "batch_count": 2, "close_action": "all",
         "tiers": [
             {"min_lot": 0.1, "pl_amount": 500.0},
-            {"min_lot": 0.5, "pl_amount": 999.0},   # 只改批次 2
+            {"min_lot": 0.4, "pl_amount": 999.0},   # 改成命中批次 2
         ],
     }
     runner.apply_strategy({"rules": [rule]})
@@ -3863,14 +3904,18 @@ async def test_tier2_change_keeps_the_price_tp_branch():
     tick()
     await _settle()
 
-    assert runner._price_tp_override_by_side == {"BUY": 2410.0}
-    for p in mt5.positions_by_magic(MAGIC):
-        assert p["tp"] == 2410.0
+    positions = mt5.positions_by_magic(MAGIC)
+    total = sum(p["volume"] for p in positions)
+    weighted = sum(p["volume"] * p["price_open"] for p in positions) / total
+    expected = weighted + 999.0 / ((1 / 0.01) * total)
+    for p in positions:
+        assert abs(p["tp"] - expected) < 0.02
+    assert {p["tp"] for p in positions} != before
     runner.cancel()
 
 
-async def test_price_tp_override_tier_survives_runtime_round_trip():
-    """分支连同它对应的 tier1 金额一起落库、重连后恢复。"""
+async def test_runtime_payload_has_no_price_tp_override():
+    """runtime 里不再有「止盈分支」字段（止盈价是重算出来的，不需要落库）。"""
     sent: list = []
     mt5 = MockMT5Client()
     mt5.balance = 10000.0
@@ -3899,8 +3944,8 @@ async def test_price_tp_override_tier_survives_runtime_round_trip():
     await _settle()
 
     payload = runner._manual_runtime_payload()
-    assert payload["price_tp_override"] == {"BUY": 2410.0}
-    assert payload["price_tp_override_tier"] == {"BUY": 500.0}
+    assert "price_tp_override" not in payload
+    assert "price_tp_override_tier" not in payload
     runner.cancel()
 
 

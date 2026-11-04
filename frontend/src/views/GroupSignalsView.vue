@@ -581,7 +581,10 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
     push('现价', detail.market)
     push('总手数', detail.volume)
     push('加权开仓价', detail.weighted_open)
-    push('批次1金额', detail.amount)
+    push(
+      '命中批次金额',
+      detail.amount == null ? null : `第${(detail.tier_index ?? 0) + 1}批 · ${detail.amount}`,
+    )
     push('盈亏比亏损金额', detail.sl_amount)
     push('说明', detail.kept_reason || detail.message_core)
     push('错误', detail.error)
