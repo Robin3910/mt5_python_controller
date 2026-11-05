@@ -10,6 +10,7 @@ from copy import deepcopy
 from typing import Any, Optional
 
 import account_risk as ar
+import manual_scatter
 # 资金操作（出入金等）的成交类型口径见 deal_types.py。
 from deal_types import FUNDING_DEAL_TYPES
 
@@ -327,17 +328,26 @@ def stop_side_decision(
 
 
 def lot_pl_cfg_sig(cfg: dict | None) -> tuple:
-    """止盈配置指纹：(开关, 批次1金额, 批次1门槛, 平仓方向)。
+    """止盈配置指纹：(开关, 各档 (门槛, 金额), 平仓方向)。
 
     改了就要重算共同止盈——与手数是否变化无关。
+
+    **覆盖全部档位**：止盈金额是按「当前手数命中的档位」取的（见
+    `tier_amount_for_lot`），改第 2 档及以后的金额同样会让止盈价变，
+    所以指纹必须把每一档都算进去。只比批次 1 的话，改 tier2 完全不生效。
     """
     rule = normalize_config(cfg)[RULE_LOT_PL_TIERS]
     tiers = rule.get("tiers") or []
-    first = tiers[0] if tiers else {}
     return (
         bool(rule.get("enabled")),
-        round(abs(_as_float(first.get("pl_amount"), 0.0)), 6),
-        round(_as_float(first.get("min_lot"), 0.0), 6),
+        tuple(
+            (
+                round(_as_float(tier.get("min_lot"), 0.0), 6),
+                round(abs(_as_float(tier.get("pl_amount"), 0.0)), 6),
+            )
+            for tier in tiers
+            if isinstance(tier, dict)
+        ),
         str(rule.get("close_action") or "all"),
     )
 
@@ -410,8 +420,69 @@ def funding_balance_delta(deals: list[dict] | None) -> float:
     return round(total, 8)
 
 
+def tier_pl_amount_for_lot(tiers: object, lot: float) -> Optional[float]:
+    """按当前总手数命中的档位，返回该档盈亏金额的**原值**（保留符号）。
+
+    命中规则的实现放在 `manual_scatter`（那边是分档匹配的归属地），
+    这里转发过去，保证两边口径同源。
+    """
+    return manual_scatter.tier_pl_amount_for_lot(tiers, lot)
+
+
+def tier_amount_for_lot(tiers: object, lot: float) -> Optional[float]:
+    """按当前总手数命中的档位，返回该档盈亏金额的**绝对值**。
+
+    命中规则：**从最高档往低档找，第一条 `min_lot <= 当前手数` 的档位**。
+    手数涨上去会自动跳档（高档优先），金额随之变大，止盈价相应变远。
+
+    - 金额为 0 的档位跳过，继续往下找（配了 0 金额的档不算「命中」）；
+    - 一条都没命中 → 返回 `None`（该方向不算止盈）。
+
+    这是「止盈金额按当前仓位算」的核心口径。`plan_common_stops` 按**每个方向
+    自己的手数**调它 —— 多空不共用金额。
+    """
+    return manual_scatter.tier_amount_for_lot(tiers, lot)
+
+
+def tier_index_for_lot(tiers: object, lot: float) -> Optional[int]:
+    """命中档位的下标（用于事件里说明「按第几档算」）。没命中返回 None。"""
+    return manual_scatter.tier_index_for_lot(tiers, lot)
+
+
+def lot_pl_target_for_lot(cfg: dict | None, lot: float) -> Optional[float]:
+    """整份信号配置 → 按当前手数命中的档位金额（绝对值）。
+
+    `cfg` 是 `prepare_runtime` 的运行态（顶层有 `RULE_LOT_PL_TIERS`）。
+    """
+    rule = normalize_config(cfg)[RULE_LOT_PL_TIERS]
+    return tier_amount_for_lot(rule, lot)
+
+
+def lot_pl_tiers_enabled(cfg: dict | None) -> bool:
+    """分档手数盈亏是否启用（且至少有一档配了非零金额）。
+
+    用于「有没有东西可写」的判断 —— 止盈金额现在按手数动态选，
+    不能只看批次 1 有没有金额。
+    """
+    rule = normalize_config(cfg)[RULE_LOT_PL_TIERS]
+    if not rule.get("enabled"):
+        return False
+    for tier in rule.get("tiers") or []:
+        if not isinstance(tier, dict):
+            continue
+        if abs(_as_float(tier.get("pl_amount"), 0.0)) > 0:
+            return True
+    return False
+
+
 def lot_pl_amount(cfg: dict | None) -> Optional[float]:
-    """启用时返回批次1盈亏金额的绝对值。未启用、无档或金额为 0 时返回 None。"""
+    """启用时返回批次1盈亏金额的绝对值。未启用、无档或金额为 0 时返回 None。
+
+    **注意**：这只代表「批次 1 的金额」，不是「当前生效的止盈金额」。
+    实际生效的金额按当前手数命中档位取（见 `tier_amount_for_lot`）。
+    这里保留给「配置有没有配金额」的判断与首单兜底（首单没有存量手数，
+    命中的就是批次 1）。
+    """
     rule = normalize_config(cfg)[RULE_LOT_PL_TIERS]
     if not rule.get("enabled"):
         return None
@@ -628,21 +699,30 @@ def plan_common_stops(
     tick_size: float,
     tick_value: float,
     digits: int,
-    tp_amount: float | None = None,
+    tp_tiers: dict | None = None,
     sl_amount: float | None = None,
     tp_min_lot: float = 0.0,
     bid: float = 0.0,
     ask: float = 0.0,
     fallback_price: float = 0.0,
     own_sl_by_ticket: dict | None = None,
-    tp_override: dict | None = None,
 ) -> list[dict]:
     """按方向算共同止盈和/或止损。
 
     加权开仓价 W = Σ(手数 × 开仓价) / Σ手数。
     距离 D = 金额 / ((tick_value / tick_size) × Σ手数)。
-    止盈金额来自分档批次1，且该方向总手数达到 tp_min_lot 才计算；止损金额来自盈亏比 × 余额。
     多单止盈在 W 之上、止损在 W 之下；空单相反。
+
+    `tp_tiers`：整份分档配置（`{enabled, tiers: [{min_lot, pl_amount}]}`）。
+    **止盈金额按每个方向自己的手数命中档位取**（`tier_amount_for_lot`）：
+    从最高档往低档找第一条 `min_lot ≤ 该方向总手数` 的档，用它的金额反推
+    止盈价。多空**不共用**金额 —— 0.5 手的多单和 0.05 手的空单命中的档不同。
+
+    `tp_min_lot`：**批次 1 的手数门槛**，「够不够格算止盈」的闸门。
+    该方向总手数不到这个门槛就不算止盈（与既有语义一致）。
+    注意它和「命中档位用的 `min_lot`」是两件事：前者决定算不算，后者决定用哪档。
+
+    止损金额来自盈亏比 × 余额（`sl_amount`），与手数无关。
 
     `own_sl_by_ticket`：指定价档位持仓的**自有止损**（票号 → 止损价）。
     传入后会额外产出 `sl_by_ticket`：票号 → 这一票该带哪道止损。
@@ -653,26 +733,19 @@ def plan_common_stops(
     两道止损只能留一道（MT5 一个持仓只有一个 SL），所以每轮都**显式写死**
     该留的那道，而不是「沿用持仓现值」——沿用会让上一轮写上去的共同止损
     留下来，自有止损再也切不回来。
-
-    `tp_override`：方向 → 止盈权威价（指定价档位成交后由它的 `price_tp` 接管）。
-    某一方向有权威价时，**该方向的止盈直接用这个绝对价**，不再按
-    「加权均价 + 阶梯金额」反推——权威价是用户填的绝对价位，与仓位构成无关，
-    加仓后它也不动。金额口径（tier1）仍然成立：手数就是按这个价反推出来的。
     """
     size = _as_float(tick_size, 0.0)
     value = _as_float(tick_value, 0.0)
     if size <= 0 or value <= 0:
         return []
     own_map = own_sl_by_ticket if isinstance(own_sl_by_ticket, dict) else {}
-    override = tp_override if isinstance(tp_override, dict) else {}
-    # 权威止盈价也算「有东西可写」：它本身就是止盈，
-    # 不需要 tier1 金额（阶梯止盈没启用）也不需要止损金额。
-    has_override = any(_as_float(v, 0.0) > 0 for v in override.values())
-    if (
-        _price_distance(tp_amount or 0, 1) is None
-        and _price_distance(sl_amount or 0, 1) is None
-        and not has_override
-    ):
+    tiers = tp_tiers if isinstance(tp_tiers, dict) else {}
+    # 分档止盈没启用 / 没配金额 → 只有止损可写
+    tp_enabled = bool(tiers.get("enabled")) and any(
+        abs(_as_float(t.get("pl_amount"), 0.0)) > 0
+        for t in (tiers.get("tiers") or []) if isinstance(t, dict)
+    )
+    if not tp_enabled and _price_distance(sl_amount or 0, 1) is None:
         return []
     grouped: dict[str, list[dict]] = {"BUY": [], "SELL": []}
     for pos in positions or []:
@@ -697,32 +770,23 @@ def plan_common_stops(
         money_per_price = (value / size) * volume
         if volume <= 0 or money_per_price <= 0:
             continue
-        # 止盈权威价：这一方向有指定价档位接管止盈 → 直接用那个绝对价，
-        # 不按「加权均价 + 阶梯金额」反推（金额口径已经体现在手数里）。
-        #
-        # 权威价与 `tp_amount`/`tp_min_lot` 的关系：权威价是**绝对价位**，
-        # 与总手数无关，所以 `tp_min_lot` 门槛对它不适用——
-        # 手数就是按这个价反推出来的，门槛早就体现在那一笔上了。
-        auth_tp = _as_float(override.get(side), 0.0)
-        if auth_tp > 0:
+        # 止盈金额：**按这一方向自己的手数**命中的档位。
+        # 手数涨上去会跳档（高档优先），金额随之变大，止盈价相应变远。
+        tp_amount = tier_amount_for_lot(tiers, volume) if tp_enabled else None
+        tier_index = tier_index_for_lot(tiers, volume) if tp_enabled else None
+        d_tp = _price_distance(tp_amount or 0, money_per_price)
+        # 门槛：批次 1 的手数门槛。不到就不算止盈。
+        if d_tp is not None and volume + 1e-8 < max(0.0, _as_float(tp_min_lot, 0.0)):
             d_tp = None
-        else:
-            d_tp = _price_distance(tp_amount or 0, money_per_price)
-            if d_tp is not None and volume + 1e-8 < max(0.0, _as_float(tp_min_lot, 0.0)):
-                d_tp = None
         d_sl = _price_distance(sl_amount or 0, money_per_price)
-        if auth_tp <= 0 and d_tp is None and d_sl is None:
+        if d_tp is None and d_sl is None:
             continue
         anchor = weighted / volume
         if side == "BUY":
-            tp = auth_tp if auth_tp > 0 else (
-                _round_price(anchor + d_tp, digits) if d_tp is not None else None
-            )
+            tp = _round_price(anchor + d_tp, digits) if d_tp is not None else None
             sl = _round_price(anchor - d_sl, digits) if d_sl is not None else None
         else:
-            tp = auth_tp if auth_tp > 0 else (
-                _round_price(anchor - d_tp, digits) if d_tp is not None else None
-            )
+            tp = _round_price(anchor - d_tp, digits) if d_tp is not None else None
             sl = _round_price(anchor + d_sl, digits) if d_sl is not None else None
         market = _market_for_side(side, bid=bid, ask=ask, fallback=fallback_price)
         # 指定价档位的逐票止损：取更近的那道。
@@ -747,25 +811,23 @@ def plan_common_stops(
             # 回不来。显式写死才是幂等的：每一轮都按「哪道更近」重新决定。
             sl_by_ticket[ticket] = picked
         plans.append({
-            "rule": RULE_LOT_PL_TIERS if (d_tp is not None or auth_tp > 0) else RULE_FLOAT_PL_RATIO,
+            "rule": RULE_LOT_PL_TIERS if d_tp is not None else RULE_FLOAT_PL_RATIO,
             "side": side,
             "sl": sl,
             "tp": tp,
             "weighted_open": anchor,
             "tp_distance": d_tp,
             "sl_distance": d_sl,
-            "amount": (
-                abs(_as_float(tp_amount, 0.0))
-                if (d_tp is not None or auth_tp > 0) else None
-            ),
+            # 生效的止盈金额 = 这一方向的手数命中的那一档的金额
+            "amount": abs(_as_float(tp_amount, 0.0)) if d_tp is not None else None,
+            # 命中的档位下标（0 基）：事件里说明「按第几档算」
+            "tier_index": tier_index if d_tp is not None else None,
             "sl_amount": abs(_as_float(sl_amount, 0.0)) if d_sl is not None else None,
             "volume": volume,
             "digits": max(0, int(digits)),
             "positions": rows,
             # 指定价档位的逐票止损（票号 → 止损价 / None=沿用自有止损）
             "sl_by_ticket": sl_by_ticket,
-            # 这一方向的止盈由指定价档位的 price_tp 接管（权威价）
-            "tp_authority": auth_tp if auth_tp > 0 else None,
             "crossed": _cross_side(side, sl, tp, market),
             # 两侧各自的越价情况：止盈和止损要分别决定写不写
             "crossed_sides": sorted(crossed_sides(side, sl, tp, market)),
@@ -808,7 +870,7 @@ def opening_stops(
     tick_size: float,
     tick_value: float,
     digits: int,
-    tp_amount: float | None = None,
+    tp_tiers: dict | None = None,
     sl_amount: float | None = None,
     tp_min_lot: float = 0.0,
     close_action: str = "all",
@@ -816,7 +878,6 @@ def opening_stops(
     ask: float = 0.0,
     stops_level: int = 0,
     point: float = 0.0,
-    tp_override: dict | None = None,
 ) -> Optional[tuple[Optional[float], Optional[float]]]:
     """新开这一笔要带上的 (止损, 止盈)。
 
@@ -824,9 +885,9 @@ def opening_stops(
     该方向不在分档范围内、或缺少价格 / 规格 / 金额时返回 None，调用方沿用原有止损止盈。
     返回元组时，其中的 None 表示这一侧不挂，避免非法价把整张市价单拒掉。
 
-    `tp_override`：方向 → 止盈权威价（指定价档位成交后由它的 `price_tp` 接管）。
-    新加的这一笔也要带同一个权威价——否则它会带一个按加权均价反推的止盈，
-    和其它持仓的权威止盈对不上。
+    `tp_tiers`：整份分档配置。止盈金额按**加上这一笔之后**的该方向总手数
+    命中的档位取 —— 这一笔自己也在重算里，它带来的手数可能让方向跳档，
+    止盈价必须跟着跳。
     """
     action_side = str(side or "").upper()
     vol = _as_float(volume, 0.0)
@@ -842,7 +903,7 @@ def opening_stops(
     book.append({"type": action_side, "volume": vol, "price_open": fill})
     plans = plan_common_stops(
         book,
-        tp_amount=tp_amount,
+        tp_tiers=tp_tiers,
         sl_amount=sl_amount,
         tp_min_lot=tp_min_lot,
         tick_size=tick_size,
@@ -851,7 +912,6 @@ def opening_stops(
         bid=bid,
         ask=ask,
         fallback_price=fill,
-        tp_override=tp_override,
     )
     plan = next((row for row in plans if row.get("side") == action_side), None)
     if plan is None:
@@ -886,7 +946,12 @@ def describe_lot_stops(plan: dict | None) -> str:
             bits.append(f"止损 {float(sl):g}")
         extra = []
         if plan.get("amount") is not None:
-            extra.append(f"批次1金额 {_as_float(plan.get('amount'), 0):g}")
+            tier_index = plan.get("tier_index")
+            # 命中的档位是按这一方向的手数选的：说清楚是第几档
+            if isinstance(tier_index, int) and tier_index >= 0:
+                extra.append(f"批次{tier_index + 1}金额 {_as_float(plan.get('amount'), 0):g}")
+            else:
+                extra.append(f"分档金额 {_as_float(plan.get('amount'), 0):g}")
         if plan.get("sl_amount") is not None:
             extra.append(f"盈亏比亏损 {_as_float(plan.get('sl_amount'), 0):g}")
         tail = f"（{'，'.join(extra)}，总手数 {volume:g}）" if extra else ""
@@ -910,7 +975,8 @@ def lot_stops_detail(plan: dict | None) -> Optional[dict]:
         "weighted_open": plan.get("weighted_open"),
         "distance": plan.get("distance"),
         "crossed": plan.get("crossed"),
-        "tier_index": 0,
+        # 命中的档位下标（0 基）：止盈金额按这一方向的手数选的
+        "tier_index": plan.get("tier_index"),
     }
     # 越价保留旧值时才有这些键：现价、保留的是哪一侧、为什么保留
     for key in (

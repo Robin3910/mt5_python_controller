@@ -374,7 +374,11 @@ def test_crossed_sides_reports_both():
 def test_plan_common_stops_carries_market():
     plan = sp.plan_common_stops(
         [{"type": "BUY", "volume": 0.1, "price_open": 4400.0}],
-        tp_amount=10.0, tick_size=0.01, tick_value=1.0, digits=2,
+        tp_tiers={
+            "enabled": True,
+            "tiers": [{"min_lot": 0.0, "pl_amount": 10.0}],
+        },
+        tick_size=0.01, tick_value=1.0, digits=2,
         bid=4400.0, ask=4400.0, fallback_price=4400.0,
     )[0]
     assert plan["market"] == 4400.0

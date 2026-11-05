@@ -146,10 +146,14 @@ def fired_rule_types(positions: list | tuple | None) -> set[int]:
     return found
 
 
-def current_lot(positions: list | tuple | None) -> float:
+def current_lot(positions: list | tuple | None, side: str = "") -> float:
+    """总手数。给了 `side` 时只算那个方向（止盈按方向算档位）。"""
+    want = str(side or "").strip().upper()
     total = 0.0
     for p in positions or []:
         if isinstance(p, dict):
+            if want and str(p.get("type") or "").upper() != want:
+                continue
             total += _as_float(p.get("volume"))
     return round(total, 4)
 
@@ -427,27 +431,98 @@ def describe_tp_passed(
     )
 
 
+def tier_rows(tiers: object) -> list[dict]:
+    """分档配置里生效的档位列表（未启用返回空表）。"""
+    src = tiers if isinstance(tiers, dict) else {}
+    if not src.get("enabled"):
+        return []
+    rows = src.get("tiers")
+    return [t for t in rows if isinstance(t, dict)] if isinstance(rows, list) else []
+
+
+def tier_pl_amount_for_lot(tiers: object, lot: float) -> Optional[float]:
+    """按当前总手数命中的档位，返回该档盈亏金额的**原值**（保留符号）。
+
+    命中规则：从最高档往低档找，第一条 `min_lot <= 当前手数` 的档位。
+    金额为 0 的档位跳过（继续往下找）；一条都没命中返回 None。
+
+    **这是「止盈金额按当前仓位算」的命中规则**：`signal_pl` 那边
+    （`tier_amount_for_lot`）只是它的绝对值版本，两边必须同源。
+    """
+    current = max(0.0, _as_float(lot, 0.0))
+    for tier in reversed(tier_rows(tiers)):
+        if current + 1e-12 < _as_float(tier.get("min_lot"), 0.0):
+            continue
+        amount = _as_float(tier.get("pl_amount"), 0.0)
+        if amount == 0:
+            continue
+        return amount
+    return None
+
+
+def tier_match_for_lot(tiers: object, lot: float) -> Optional[tuple[int, float]]:
+    """命中的档位：(下标, 金额原值)；没命中返回 None。
+
+    **回落规则**：一条都没命中（当前手数连批次 1 的门槛都没到）时，
+    回落��**批次 1**（最低档）。
+
+    为什么不返回 None：
+    - 指定价档位挂单时可能**一股仓位都没有**（首次开仓），这时手数必须
+      按批次 1 的金额反推 —— 否则第一档永远挂不出来；
+    - 止盈侧则由**批次 1 的手数门槛**（`tp_min_lot`）来挡「手数不够就不算
+      止盈」，不需要在这里挡。
+
+    批次 1 的金额也是 0 时才真的没有金额可用。
+    """
+    rows = tier_rows(tiers)
+    current = max(0.0, _as_float(lot, 0.0))
+    for idx in range(len(rows) - 1, -1, -1):
+        tier = rows[idx]
+        if current + 1e-12 < _as_float(tier.get("min_lot"), 0.0):
+            continue
+        amount = _as_float(tier.get("pl_amount"), 0.0)
+        if amount == 0:
+            continue
+        return idx, amount
+    if not rows:
+        return None
+    first = _as_float(rows[0].get("pl_amount"), 0.0)
+    if first == 0:
+        return None
+    return 0, first
+
+
+def tier_amount_for_lot(tiers: object, lot: float) -> Optional[float]:
+    """按当前总手数命中的档位，返回该档盈亏金额的**绝对值**。
+
+    命中规则：**从最高档往低档找，第一条 `min_lot <= 当前手数` 的档位**。
+    手数涨上去会自动跳档（高档优先），金额随之变大，止盈价相应变远。
+
+    - 金额为 0 的档位跳过，继续往下找（配了 0 金额的档不算「命中」）；
+    - 一条都没命中 → **回落批次 1**（见 `tier_match_for_lot`）；
+    - 连批次 1 的金额都没有 → 返回 `None`（该方向不算止盈）。
+
+    这是「止盈金额按当前仓位算」的核心口径。`signal_pl.plan_common_stops`
+    按**每个方向自己的手数**调它 —— 多空不共用金额。
+    """
+    hit = tier_match_for_lot(tiers, lot)
+    if hit is None:
+        return None
+    return abs(hit[1])
+
+
+def tier_index_for_lot(tiers: object, lot: float) -> Optional[int]:
+    """命中档位的下标（用于事件里说明「按第几档算」）。没命中返回 None。"""
+    hit = tier_match_for_lot(tiers, lot)
+    return None if hit is None else hit[0]
+
+
 def match_target_pl(lot_pl_tiers: object, current_lot_size: float) -> Optional[float]:
     """从高档往低档，第一条 current_lot >= min_lot 的 pl_amount。
 
     分档未启用或匹配不到返回 None（节点不开仓；表单提示手填）。
     """
-    src = lot_pl_tiers if isinstance(lot_pl_tiers, dict) else {}
-    if not src.get("enabled"):
-        return None
-    tiers = src.get("tiers") if isinstance(src.get("tiers"), list) else []
-    lot = max(0.0, float(current_lot_size or 0.0))
-    for idx in range(len(tiers) - 1, -1, -1):
-        tier = tiers[idx]
-        if not isinstance(tier, dict):
-            continue
-        min_lot = _as_float(tier.get("min_lot"))
-        pla = _as_float(tier.get("pl_amount"))
-        if pla == 0:
-            continue
-        if lot + 1e-12 >= min_lot:
-            return pla
-    return None
+    return tier_pl_amount_for_lot(lot_pl_tiers, current_lot_size)
 
 
 def tier0_pl_amount(lot_pl_tiers: object) -> Optional[float]:
@@ -585,31 +660,38 @@ def price_level_volume(
     volume_min: float = 0.01,
     volume_max: float = 100.0,
     projected_pl: float = 0.0,
+    current_lot: float = 0.0,
 ) -> Optional[float]:
-    """指定价档位的手数：按阶梯止盈 1 的目标金额反推。
+    """指定价档位的手数：按**该方向存量手数命中的档位金额**反推。
 
     与手动分散仓的口径一致（见 `compute_volume`），只是入场价 / 止盈价
-    换成这一档自己的「指定价」与「止盈价」：
+    换成这一档自己的「指定价」与「参考止盈价」：
 
-    目标金额 = 分档批次1的 pl_amount − 存量仓位到该止盈价时的预估盈亏；
-    每手止盈 = |止盈价 − 指定价| / tick_size × tick_value；
+    目标金额 = 命中档位的 pl_amount − 存量仓位到该参考价时的预估盈亏；
+    每手止盈 = |参考价 − 指定价| / tick_size × tick_value；
     手数 = 目标金额 / 每手止盈（向上取整到 step，再夹到 min/max）。
 
-    **止盈权威**：这一档成交后，它填的止盈价会接管该方向的止盈——
-    存量的止盈也全部对齐到它。所以「按这个价算账时，存量 + 这一档
-    刚好凑够阶梯 1 的目标金额」不是巧合，而是这套设计的直接结果：
-    价格打到该止盈价时，全场合计盈亏正好是阶梯 1 的目标金额。
+    **命中哪一档**：按 `current_lot`（该方向**挂单时已有**的持仓手数）从高到低
+    找第一条 `min_lot ≤ current_lot` 的档位。
 
-    算不出来（没填止盈价 / 阶梯止盈没启用 / 每手止盈为 0）时返回 None，
-    调用方据此跳过这一档（不挂单）——宁可少挂一档，也不能挂一个手数瞎猜的单。
+    这是**当场算死**的口径：这一档的手数只按它成交时已经有的仓位决定，
+    不做「成交后总手数会跳档」的不动点迭代。成交之后仓位变了 → 下一拍
+    按新的手数命中新的档位 → 止盈价重算（跳档）。
+
+    `tp_ref` 现在只是「参考价」：它决定「每手止盈」这个距离，不再是出场价。
+    成交后该方向的出场价 = 加权均价 ± 命中金额 ÷ ((tick_value/tick_size) × 总手数)。
+
+    算不出来（没填参考价 / 阶梯止盈没启用 / 每手止盈为 0 / 存量手数没命中任何档）
+    时返回 None，调用方据此跳过这一档（不挂单）——宁可少挂一档，
+    也不能挂一个手数瞎猜的单。
     """
-    target = tier0_pl_amount(lot_pl_tiers)
+    target = tier_amount_for_lot(lot_pl_tiers, current_lot)
     if target is None:
         return None
     per = profit_per_lot(entry, tp_ref, tick_size, tick_value)
     if per <= 0:
         return None
-    # 存量在止盈价时刻的预估盈亏：浮盈抵扣、浮亏补上
+    # 存量在参考价时刻的预估盈亏：浮盈抵扣、浮亏补上
     remaining = abs(target) - float(projected_pl or 0.0)
     if remaining <= 0:
         # 存量仓位在这个价已经赚到目标金额（或更多）：按最小手数开，
@@ -718,8 +800,11 @@ def tiers_target_changed(old_tiers: object, new_tiers: object) -> bool:
     所以阶梯止盈的金额改了，手数必须跟着重算，在途挂单要撤旧单重挂。
 
     **只比批次1 的 pl_amount**：
-    - 批次1 是**真正生效**的那个（批次2+ 当前版本不参与共同止盈计算），
-      改了它手数才真的要变；
+    - 手动分散仓的手数按**固定批次1** 反推（见 `compute_volume`），
+      所以只有批次1 的金额改了，手数才真的要变；
+    - 批次2+ 的金额影响的是**信号共同止盈**（按当前手数命中档位），
+      不影响手动仓手数 → 那一路重算由 `signal_pl.lot_pl_cfg_sig` 负责，
+      不走这里的撤单重挂；
     - `min_lot`（批次1 的手数门槛）只影响「达到多少手数才写止盈」，
       不影响手动仓手数；
     - `close_action`（平仓方向）与手数无关。

@@ -1244,7 +1244,7 @@ export interface GroupTaskEventDetail {
   min_lot?: number
   current_lot?: number
   // —— 信号盈亏控制（kind=signal_pl）——
-  /** 批次1盈亏金额 */
+  /** 生效的止盈金额（当前总手数命中的那一档） */
   amount?: number | null
   /** 盈亏比折出的亏损金额 */
   sl_amount?: number | null
