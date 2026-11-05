@@ -1153,11 +1153,15 @@ class PhoneSmsLoginRequest(BaseModel):
 
 
 class SmsConfigOut(BaseModel):
-    """短信配置（配置页展示）。密钥永不回显。"""
-    enabled: bool = False
+    """短信配置（配置页展示）。密钥永不回显。
+
+    sign_name / template_code 是写死的常量（见 sms_config.FIXED_*），只读展示，
+    管理员改了也没用 —— 后端写入时一律覆盖回常量。
+    """
+    enabled: bool = True
     provider: str = "aliyun_sms_auth"
     endpoint: str = "dypnsapi.aliyuncs.com"
-    sign_name: str = ""
+    sign_name: str = "恒创联众"
     template_code: str = "100001"
     require_approval: bool = True
     code_ttl_seconds: int = 300

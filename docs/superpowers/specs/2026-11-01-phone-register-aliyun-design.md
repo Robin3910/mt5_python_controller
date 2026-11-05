@@ -282,7 +282,7 @@ aliyun_access_key_secret: str = ""
   "enabled": true,
   "provider": "aliyun_sms_auth",
   "endpoint": "dypnsapi.aliyuncs.com",
-  "sign_name": "<控制台的赠送签名内容>",
+  "sign_name": "恒创联众",
   "template_code": "100001",
   "require_approval": true,
   "code_ttl_seconds": 300,
@@ -294,10 +294,18 @@ aliyun_access_key_secret: str = ""
 ```
 
 - **密钥永远不进 DB**，只从 env 读；配置页只回显 `sign_name` / `template_code`。
-- 开关与模板 Code 放 DB，是为了让运维能**临时关停注册**（出故障立刻止血）、以及不重启就能换模板。
+- **签名 / 模板码写死**（`sms_config.FIXED_SIGN_NAME = "恒创联众"`、`FIXED_TEMPLATE_CODE = "100001"`）：
+  这两个值对应阿里云侧已审核通过并绑定本账号的那一份，改了会被阿里云拒掉（`InvalidSignName` /
+  `InvalidTemplateCode`）导致发不出短信。因此它们**不进 DB、也不给管理员改** —— 前端只读展示，
+  后端 `normalize_config` 一律覆盖为常量，DB 里存的历史值在读取时被自动纠正。
+- **开关默认启用**（`DEFAULTS["enabled"] = True`）：短信是注册 / 验证码登录的主链路，
+  装好 AccessKey 就能用，不该要求管理员先去配置页点一下开关。停用随时可以（出故障一键止血）。
+- **可用性判断 `is_usable(cfg)`** = 开关打开 + 配置齐全 + **AccessKey 已注入**。
+  三者缺一，验证码入口就不该出现（点了也是 503），所以 `/api/auth/sms/status` 用它决定
+  `enabled` 字段，前端据此隐藏短信 Tab。
 - `provider` 字段是为将来切换厂商预留的（`aliyun_sms_auth` / `tencentcloud_sms`），切换只需改这一个配置项。
 - `require_approval` 默认 `true`（已确认的需求），运行时可切换为 `false` 实现免审核注册。
-- 需提供「配置缺失时的默认值」：全部字段有默认值；`sign_name` 或 `template_code` 为空时视为**未配置** → 所有短信接口返回 404（前端自动隐藏验证码入口）。
+- 全部字段都有默认值；`enabled` 为 false 时所有短信接口返回 404（前端自动隐藏验证码入口）。
 
 ---
 

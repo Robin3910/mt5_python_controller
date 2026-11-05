@@ -51,7 +51,7 @@ from .sms_config import (
     PURPOSE_AUTH,
     SMS_PURPOSES,
     get_sms_config,
-    is_configured,
+    is_usable,
 )
 from .sms_service import (
     SmsInvalidPhone,
@@ -94,9 +94,9 @@ def _masked_operator(phone: str) -> str:
 
 
 async def _require_sms_enabled() -> dict:
-    """短信服务是否可用；未配置 / 已关闭一律 404（不暴露原因）。"""
+    """短信服务是否可用；未配置 / 已关闭 / 没注入 AccessKey 一律 404（不暴露原因）。"""
     cfg = await get_sms_config()
-    if not cfg.get("enabled") or not is_configured(cfg):
+    if not is_usable(cfg):
         raise HTTPException(status_code=404, detail="not found")
     return cfg
 
@@ -537,7 +537,9 @@ async def sms_status():
     )
     encrypted = captcha_enabled and bool(settings.aliyun_captcha_ekey)
     return {
-        "enabled": bool(cfg.get("enabled")) and is_configured(cfg),
+        # 「可用」= 开关打开 + 配置齐全 + AccessKey 已注入。
+        # 前端据此决定是否展示验证码入口 —— 少任何一样都不展示（点了也是 503）。
+        "enabled": is_usable(cfg),
         "require_approval": bool(cfg.get("require_approval")),
         "code_ttl_seconds": int(cfg.get("code_ttl_seconds") or 300),
         "send_interval_seconds": int(cfg.get("send_interval_seconds") or 60),

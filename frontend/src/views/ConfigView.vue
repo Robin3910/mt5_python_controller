@@ -25,10 +25,10 @@ const webhookAuthEnabled = ref(true)
 const webhookAuthLoading = ref(false)
 
 const sms = reactive({
-  enabled: false,
+  enabled: true,
   provider: 'aliyun_sms_auth',
   endpoint: 'dypnsapi.aliyuncs.com',
-  sign_name: '',
+  sign_name: '恒创联众',
   template_code: '100001',
   require_approval: true,
   code_ttl_seconds: 300,
@@ -71,7 +71,9 @@ async function saveSmsConfig(): Promise<void> {
   smsError.value = ''
   smsLoading.value = true
   try {
-    const cfg = await hub.setSmsConfig({ ...sms })
+    // 签名 / 模板码是写死的常量，保存时不带上（后端也会强制覆盖）
+    const { sign_name: _sign, template_code: _tpl, ...rest } = { ...sms }
+    const cfg = await hub.setSmsConfig(rest)
     Object.assign(sms, cfg)
     flash('短信配置已保存')
   } catch (e: unknown) {
@@ -240,8 +242,8 @@ function flash(msg: string): void {
         <span class="muted" style="font-size: 12px">今日已发送：{{ sms.today_sent }} 条</span>
       </div>
       <p class="muted" style="font-size: 12px">
-        验证码由本系统生成并校验，阿里云短信认证只负责把短信送达。关闭开关后所有短信接口立即不可用，
-        前端会自动隐藏验证码入口，无需重启。
+        验证码由本系统生成并校验，阿里云短信认证只负责把短信送达。服务默认启用；
+        关闭开关后所有短信接口立即不可用，前端会自动隐藏验证码入口，无需重启。
       </p>
       <div class="webhook-auth-row">
         <span class="webhook-auth-label">启用短信服务</span>
@@ -267,12 +269,18 @@ function flash(msg: string): void {
       </div>
       <div class="form-grid">
         <div>
-          <label>短信签名</label>
-          <input v-model="sms.sign_name" placeholder="阿里云控制台已审核通过的签名" />
+          <label>短信签名（固定）</label>
+          <input :value="sms.sign_name" readonly class="input-fixed" />
+          <p class="muted" style="font-size: 12px; margin: 4px 0 0">
+            已绑定阿里云账号的签名，不可修改。
+          </p>
         </div>
         <div>
-          <label>模板 Code</label>
-          <input v-model="sms.template_code" placeholder="例如 SMS_123456789" />
+          <label>模板 Code（固定）</label>
+          <input :value="sms.template_code" readonly class="input-fixed" />
+          <p class="muted" style="font-size: 12px; margin: 4px 0 0">
+            已审核通过的模板 Code，不可修改。
+          </p>
         </div>
         <div>
           <label>AccessKey</label>
@@ -405,5 +413,15 @@ function flash(msg: string): void {
 }
 .webhook-auth-hint {
   font-size: 12px;
+}
+
+/* 写死不可改的字段（短信签名 / 模板 Code） */
+.input-fixed {
+  color: var(--pf-dim);
+  background: rgba(6, 10, 18, 0.5);
+  cursor: not-allowed;
+}
+.input-fixed:focus {
+  border-color: var(--pf-border);
 }
 </style>
