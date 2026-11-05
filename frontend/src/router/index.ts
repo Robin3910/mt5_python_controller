@@ -124,6 +124,13 @@ const router = createRouter({
       component: () => import('@/views/PermissionView.vue'),
       meta: { menu: 'permissions' },
     },
+    {
+      // 「用户注册审核」：仅管理员（user_audit 菜单 assignable=False）
+      path: '/user-audit',
+      name: 'user-audit',
+      component: () => import('@/views/UserAuditView.vue'),
+      meta: { menu: 'user_audit' },
+    },
     { path: '/config', name: 'config', component: () => import('@/views/ConfigView.vue') },
     // 「我的」枢纽页：账号卡片 + 模块入口
     { path: '/me', name: 'me', component: () => import('@/views/MineView.vue') },

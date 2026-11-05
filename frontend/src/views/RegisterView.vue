@@ -15,6 +15,9 @@ const ticket = ref('')
 const nickname = ref('')
 const username = ref('')
 const password = ref('')
+// —— KYC 实名材料（姓名 / 邮箱，都可选）——
+const realName = ref('')
+const email = ref('')
 
 const error = ref('')
 const loading = ref(false)
@@ -23,6 +26,10 @@ const sent = ref(false)
 const cooldown = ref(0)
 /** 已发送验证码并通过校验，进入第二步 */
 const verified = ref(false)
+/** 审核被驳回（next_action='rejected'）→ 允许继续到第二步重新提交 */
+const resubmitMode = ref(false)
+/** 驳回原因（提示用） */
+const rejectReason = ref('')
 /** 注册结果：待审核 / 已直接登录 */
 const done = ref(false)
 const pendingApproval = ref(false)
@@ -90,6 +97,8 @@ function mapError(detail?: string): string {
   if (detail === 'invalid or expired ticket') return '验证已过期，请重新获取验证码'
   if (detail === '需要完成人机验证') return '请完成滑块验证'
   if (detail === '人机验证未通过，请重试') return '人机验证未通过，请重试'
+  if (detail === '姓名长度不正确') return '姓名长度不正确'
+  if (detail === '邮箱格式不正确') return '邮箱格式不正确'
   if (detail === 'not found') return '短信服务未配置'
   return detail || '操作失败，请稍后重试'
 }
@@ -174,6 +183,13 @@ async function verifyCode(): Promise<void> {
           ? '该手机号已注册，请返回登录'
           : '该手机号已注册，等待管理员审核通过后即可登录'
     }
+    // 审核被驳回 → **放行**到第二步，让用户重新提交实名材料。
+    // 这与上面两个分支相反：那两个是「已注册，别重复注册」，
+    // 这个是「就是来重提的」。
+    if (result.next_action === 'rejected') {
+      resubmitMode.value = true
+      rejectReason.value = result.reject_reason || ''
+    }
   } catch (e: unknown) {
     error.value = mapError(detailOf(e))
   } finally {
@@ -192,6 +208,10 @@ async function submitRegister(): Promise<void> {
     error.value = '密码至少 6 位'
     return
   }
+  if (email.value.trim() && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email.value.trim())) {
+    error.value = '邮箱格式不正确'
+    return
+  }
   loading.value = true
   try {
     const result = await auth.registerByPhone({
@@ -200,6 +220,8 @@ async function submitRegister(): Promise<void> {
       nickname: nickname.value.trim() || null,
       username: username.value.trim() || null,
       password: password.value || null,
+      real_name: realName.value.trim() || null,
+      email: email.value.trim() || null,
     })
     done.value = true
     pendingApproval.value = result.pending_approval
@@ -267,7 +289,6 @@ function backToPhone(): void {
         <div v-else class="alert alert-ok">注册成功，正在进入控制台…</div>
         <RouterLink v-if="pendingApproval" to="/login" class="btn-primary btn-block">返回登录</RouterLink>
       </div>
-
       <!-- 第一步：手机号 + 验证码 -->
       <form v-else-if="!verified" class="form-grid" @submit.prevent="verifyCode">
         <div class="input-group">
@@ -330,8 +351,22 @@ function backToPhone(): void {
             placeholder="留空则只能用验证码登录"
           />
         </div>
+
+        <!-- KYC 实名材料（姓名 / 邮箱，都可选） -->
+        <div v-if="resubmitMode" class="alert alert-warn">
+          上次实名审核未通过：{{ rejectReason || '请重新提交实名材料' }}
+        </div>
+        <div class="input-group">
+          <label>姓名（选填，用于实名审核）</label>
+          <input v-model="realName" maxlength="64" placeholder="真实姓名" />
+        </div>
+        <div class="input-group">
+          <label>邮箱（选填）</label>
+          <input v-model="email" type="email" autocomplete="email" placeholder="用于接收通知" />
+        </div>
         <div class="muted register-hint">
-          留空密码时系统会生成随机强密码，该账号只能通过手机号验证码登录。
+          留空密码时系统会生成随机强密码，该账号只能通过手机号验证码登录。<br />
+          填写姓名后需经管理员实名审核通过才能登录。
         </div>
         <div v-if="error" class="alert alert-error">{{ error }}</div>
         <div class="row login-actions">

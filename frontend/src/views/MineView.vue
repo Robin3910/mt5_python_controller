@@ -116,6 +116,14 @@ const ALL_MODULES: ProfileHubModule[] = [
     icon: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><circle cx="12" cy="10" r="2.5"/><path d="M8.5 16a3.5 3.5 0 0 1 7 0"/>',
     accent: '#EC4899',
   },
+  {
+    code: 'user_audit',
+    label: '用户注册审核',
+    description: '注册用户 · KYC 实名审核 · 节点明细',
+    path: '/user-audit',
+    icon: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/>',
+    accent: '#38BDF8',
+  },
 ]
 
 // 管理员 / 普通用户：都按菜单权限过滤；管理员额外加「首页」「分组管理」入口

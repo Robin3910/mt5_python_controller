@@ -33,7 +33,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.exc import IntegrityError
 
-from . import persist, rbac_service, user_service
+from . import persist, rbac_service, user_review_service, user_service
 from .captcha_provider import encrypt_scene_id, get_verifier
 from .deps import client_ip, get_store
 from .models import (
@@ -64,6 +64,7 @@ from .sms_service import (
     record_captcha_failure,
     verify_code,
 )
+from .user_review_service import KycInvalid, validate_kyc
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,8 @@ _TICKET_ALLOWED_FOR_LOGIN = frozenset({TICKET_PURPOSE_AUTH})
 NEXT_ACTION_LOGIN = "login"
 NEXT_ACTION_REGISTER = "register"
 NEXT_ACTION_PENDING = "pending_approval"
+# KYC 实名被驳回 → 允许用户重新提交（不是「已注册，别碰」）
+NEXT_ACTION_REJECTED = "rejected"
 
 
 def _masked_operator(phone: str) -> str:
@@ -230,6 +233,16 @@ async def verify_sms_code(
     if user is None:
         return {"ticket": ticket, "next_action": NEXT_ACTION_REGISTER}
     if not user.is_active:
+        # 已注册但不可登录 → 区分「等审核」与「审核被驳回（可重新提交）」。
+        # 驳回时把原因一并返回，前端提示用户去注册页重新提交。
+        review = await user_review_service.latest_review(user.id)
+        if review is not None and review.status == user_review_service.STATUS_REJECTED:
+            return {
+                "ticket": ticket,
+                "next_action": NEXT_ACTION_REJECTED,
+                "username": user.username,
+                "reject_reason": review.reject_reason or "",
+            }
         return {
             "ticket": ticket,
             "next_action": NEXT_ACTION_PENDING,
@@ -271,7 +284,18 @@ async def register_by_phone(
     """手机号注册：需先通过短信校验拿到票据。
 
     require_approval=true 时新用户 is_active=false 且**不签发 token**，
-    等待管理员在用户管理页启用。
+    等待管理员在用户权限页审核。
+
+    **三条路径**：
+    1. 手机号未注册 → 新建用户 + （有实名材料时）建审核单；
+    2. 手机号已注册，但**最新审核单是 rejected** → **重新提交**（新建一张
+       审核单，旧的驳回单保留成历史）。这是驳回必须给出的补救路径 ——
+       否则用户永久卡死无法登录。
+    3. 手机号已注册且不是「驳回待重提」 → 409（提示直接登录）。
+
+    为什么第 2 条安全：能走到这一步的用户**已通过短信验证码验证**（持有该
+    号码）；重提只能把审核单打回 pending，**审核通过仍必须管理员点**，
+    「未审核」状态刷不成「已审核」。防刷目标不受影响。
     """
     cfg = await _require_sms_enabled()
     phone = _normalize_or_400(body.phone)
@@ -285,13 +309,17 @@ async def register_by_phone(
     if not ticket_phone or ticket_phone != phone:
         raise HTTPException(status_code=401, detail="invalid or expired ticket")
 
-    # 2. 手机号未被占用
-    if await user_service.get_user_by_phone(phone) is not None:
-        await persist.audit(
-            _masked_operator(phone), "phone_register", _masked_operator(phone),
-            {"reason": "phone_taken"}, "rejected", ip, category="auth",
+    # 2. 实名材料校验（姓名为空 = 不提交；邮箱格式错 → 400）
+    try:
+        kyc = validate_kyc(body.real_name, body.email)
+    except KycInvalid as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    existing = await user_service.get_user_by_phone(phone)
+    if existing is not None:
+        return await _resubmit_review(
+            existing, kyc=kyc, email=body.email, nickname=body.nickname, ip=ip
         )
-        raise HTTPException(status_code=409, detail="该手机号已注册，请直接登录")
 
     # 3. 用户名
     username = (body.username or "").strip()
@@ -324,9 +352,29 @@ async def register_by_phone(
     if default_id:
         await rbac_service.set_user_roles(user.id, [default_id])
 
+    # 6. 邮箱（create_user 不支持 email，注册完补一次）
+    email = (body.email or "").strip()
+    if email:
+        await user_service.update_profile(user.id, email=email)
+
+    # 7. 建审核单。
+    #    免审核模式（require_approval=false）**不建审核单** —— 该表只记录
+    #    走过审核流程的用户，保持语义干净。
+    review_id = None
+    if require_approval:
+        review = await user_review_service.create_review(
+            user.id,
+            real_name=kyc["real_name"] if kyc else None,
+            email=email or None,
+            phone=user_review_service.mask_phone_snapshot(phone),
+            kyc_submitted=bool(kyc),
+        )
+        review_id = review.id
+
     await persist.audit(
         _masked_operator(phone), "phone_register", user.username,
-        {"phone": mask_phone(phone), "pending_approval": require_approval},
+        {"phone": mask_phone(phone), "pending_approval": require_approval,
+         "kyc_submitted": bool(kyc)},
         "ok", ip, category="auth",
     )
 
@@ -336,6 +384,7 @@ async def register_by_phone(
             pending_approval=True,
             user_id=user.id,
             username=user.username,
+            review_id=review_id,
         )
 
     token = create_jwt(user.username, uid=user.id, ver=int(user.token_version or 0))
@@ -347,6 +396,62 @@ async def register_by_phone(
         token=token,
         token_type="bearer",
         requires_2fa=False,
+    )
+
+
+async def _resubmit_review(
+    user,
+    *,
+    kyc: Optional[dict],
+    email: str | None,
+    nickname: str | None,
+    ip: str | None,
+) -> PhoneRegisterResult:
+    """被驳回后重新提交实名材料。
+
+    只有「最新审核单 status == rejected」才允许重提；其他情况一律 409。
+
+    注意：**只更新用户自己可维护的字段**（昵称、邮箱），不动用户名、不动
+    密码、不动角色、不动 `is_active` —— 重提不等于通过，用户依旧不能登录。
+    """
+    review = await user_review_service.latest_review(user.id)
+    if review is None or review.status != user_review_service.STATUS_REJECTED:
+        await persist.audit(
+            _masked_operator(user.phone), "phone_register", _masked_operator(user.phone),
+            {"reason": "phone_taken"}, "rejected", ip, category="auth",
+        )
+        raise HTTPException(status_code=409, detail="该手机号已注册，请直接登录")
+
+    # 更新自己可维护的字段
+    profile: dict = {}
+    if nickname and nickname.strip():
+        profile["display_name"] = nickname.strip()
+    if email and email.strip():
+        profile["email"] = email.strip()
+    if profile:
+        await user_service.update_profile(user.id, **profile)
+
+    # 新建一张审核单；旧的驳回单保留成历史
+    new_review = await user_review_service.create_review(
+        user.id,
+        real_name=kyc["real_name"] if kyc else None,
+        email=(email or "").strip() or (profile.get("email")),
+        phone=user_review_service.mask_phone_snapshot(user.phone),
+        kyc_submitted=bool(kyc),
+    )
+
+    await persist.audit(
+        _masked_operator(user.phone), "phone_review_resubmit", user.username,
+        {"review_id": new_review.id, "kyc_submitted": bool(kyc)},
+        "ok", ip, category="auth",
+    )
+    return PhoneRegisterResult(
+        ok=True,
+        pending_approval=True,
+        user_id=user.id,
+        username=user.username,
+        review_id=new_review.id,
+        resubmitted=True,
     )
 
 

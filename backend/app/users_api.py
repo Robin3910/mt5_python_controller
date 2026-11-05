@@ -317,6 +317,25 @@ async def assign_nodes(
     store: RedisStore = Depends(get_store),
     p: Principal = Depends(require_admin),
 ):
+    """整体替换用户名下节点（路由壳）。核心逻辑见 `assign_nodes_core`。
+
+    审核通过时复用 `assign_nodes_core` —— 保证两条路径的校验口径完全一致。
+    """
+    return await assign_nodes_core(
+        user_id, body.node_ids, confirm=body.confirm,
+        p=p, ip=client_ip(request), store=store,
+    )
+
+
+async def assign_nodes_core(
+    user_id: int,
+    node_ids: list[str],
+    *,
+    confirm: bool = False,
+    p: Principal,
+    ip: str | None,
+    store: RedisStore,
+) -> dict:
     """整体替换用户名下节点：新增的从原所有者转来，移除的回到管理员名下。
 
     目标可以是超级管理员本人：超管同样可以把自己名下的节点（owner_user_id=admin.id）
@@ -333,7 +352,7 @@ async def assign_nodes(
     # 原先的「超管可见全部节点，无需分配」硬挡已移除；下面的 active_tasks /
     # confirm_required 校验与审计对所有目标一视同仁。
 
-    target = _dedup(body.node_ids)
+    target = _dedup(node_ids)
     nodemap = {n["node_id"]: n for n in await store.all_nodes()}
     missing = [nid for nid in target if nid not in nodemap]
     if missing:
@@ -345,7 +364,6 @@ async def assign_nodes(
     added = [nid for nid in target if nid not in current]
     removed = [nid for nid in current if nid not in target]
     changed = added + removed
-    ip = client_ip(request)
 
     busy = []
     for nid in changed:
@@ -386,7 +404,7 @@ async def assign_nodes(
                     "node_id": nid,
                     "node_name": nodemap[nid].get("name"),
                 })
-    if (memberships or following) and not body.confirm:
+    if (memberships or following) and not confirm:
         raise HTTPException(status_code=409, detail={
             "reason": "confirm_required",
             "message": "以下节点仍在分组中，确认后将把它们移出这些分组",
