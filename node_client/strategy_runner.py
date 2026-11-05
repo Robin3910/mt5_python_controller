@@ -2131,7 +2131,12 @@ class StrategyRunner:
         return True
 
     async def _counter_resting_orders(self) -> Optional[list[dict]]:
-        """该魔术号上备注为逆势加仓的在途限价。读失败返回 None。"""
+        """该魔术号上备注为逆势加仓的在途限价。读失败返回 None。
+
+        注意这里**包含**指定价档位的挂单（备注 `R1L0X` 同样匹配 `R1`）：
+        它们也是逆势加仓的在途单，计数与「本任务的加仓批次还没铺完」的判定
+        都要算上。撤单时则按路径分开撤（见 `_cancel_stale_counter_limits`）。
+        """
         rows = await self._magic_orders()
         if rows is None:
             return None
@@ -2139,6 +2144,43 @@ class StrategyRunner:
             o for o in rows
             if parse_add_rule_type(o.get("comment")) == RULE_TYPE_COUNTER
         ]
+
+    async def _cancel_stale_counter_limits(self, positions: list[dict]) -> bool:
+        """撤掉「逆势加仓但不是指定价档位」的在途限价单。
+
+        指定价档位与逆势限价是两条**互斥**的加仓路径，同一档只允许一张在途单。
+        用户把某一档从点数 / ATR / SMC 改成指定价后，原来那张逆势限价单还挂在
+        盘上；指定价路径只认 `R1L0X` 备注，看不见那张旧单 → 不撤就会两张单同时
+        在场，各自成交一次，同一档被加仓两次、手数被算两次。
+
+        反过来（指定价改成点数）不需要在这里处理：逆势限价路径按挂单身份
+        （手数 + 档位号 + 计算方式）比对，身份变了就会自己撤掉重挂。
+        """
+        rows = await self._magic_orders()
+        if rows is None:
+            return False
+        stale = [
+            o for o in rows
+            if parse_add_rule_type(o.get("comment")) == RULE_TYPE_COUNTER
+            and parse_price_level(o.get("comment")) is None
+        ]
+        if not stale:
+            return True
+        return await self._cancel_counter_orders(
+            stale, positions,
+            reason="这一档改成指定价加仓，撤下原来的逆势限价单",
+        )
+
+    async def _recount_pending_orders(self) -> None:
+        """按券商侧的真实在途挂单数刷新 `_pending_orders`。
+
+        撤单 / 挂单之后必须重数一次：`_cancel_counter_orders` 与
+        `_place_price_level` 各自维护的是**局部**计数，撤掉别的路径的单之后
+        那个值就不准了（上报的 pending_orders 会与盘上实际数量对不上）。
+        """
+        rows = await self._magic_orders()
+        if rows is not None:
+            self._pending_orders = len(rows)
 
     async def _cancel_counter_orders(
         self, resting: list[dict], positions: list[dict], *, reason: str,
@@ -2163,7 +2205,9 @@ class StrategyRunner:
                 ok = False
         if not ok:
             return False
-        self._pending_orders = 0
+        # 只撤了其中一部分时不能直接置 0：盘上可能还留着别的单
+        # （例如指定价路径与逆势限价路径各有一张）。按真实数量重数。
+        await self._recount_pending_orders()
         sample = resting[0]
         await self._emit_progress(
             "cnt_limit_off", phase="running", positions=positions,
@@ -2736,7 +2780,9 @@ class StrategyRunner:
             "tier_amount": float(plan.tier_amount or 0.0),
             "time": time.time(),
         }
-        self._pending_orders = len(self._price_pending)
+        # 按盘上真实数量重数（`_price_pending` 只记指定价这一类，
+        # 盘上还可能有逆势限价单等别的挂单）
+        await self._recount_pending_orders()
         await self._emit_progress(
             "cnt_limit", phase="running", positions=positions,
             last_order={"ticket": ticket, "price": plan.entry, "volume": plan.volume},
@@ -2769,9 +2815,14 @@ class StrategyRunner:
         """
         if self._price_level_target(ctx) is None:
             return False
+        # 这一档现在走指定价路径 → 盘上残留的「旧路径」逆势限价单必须撤掉。
+        # 两条路径互斥：留着它就会两张单同时在场，同一档被加仓两次。
+        if not await self._cancel_stale_counter_limits(positions):
+            return True
         spec = await self._manual_symbol_spec()
         if spec is None:
             logger.warning("task %s price level skipped: missing symbol spec", self.task_id)
+            await self._recount_pending_orders()
             return True
         plan = await self._price_level_plan(ctx, positions, spec, event)
         if plan is None:
@@ -2780,6 +2831,7 @@ class StrategyRunner:
             await self._cancel_price_levels(
                 positions, reason="指定价档位暂时挂不了（算不出手数或现价压在入场价上）",
             )
+            await self._recount_pending_orders()
             return True
         resting = [
             o for o in (await self._magic_orders() or [])
@@ -2801,8 +2853,10 @@ class StrategyRunner:
                 current = None
         if current is None:
             await self._place_price_level(plan, positions, positions)
+            await self._recount_pending_orders()
             return True
         # 身份没变 → 留着不动。价格固定，不改单。
+        await self._recount_pending_orders()
         return True
 
     async def _cancel_price_levels(
@@ -2834,7 +2888,9 @@ class StrategyRunner:
             self._price_pending.pop(ticket, None)
         if not ok:
             return False
-        self._pending_orders = len(self._price_pending)
+        # 按盘上真实数量重数（`_price_pending` 只记指定价这一类，
+        # 盘上还可能有逆势限价单等别的挂单）
+        await self._recount_pending_orders()
         await self._emit_progress(
             "cnt_limit_off", phase="running", positions=positions,
             message=reason,
