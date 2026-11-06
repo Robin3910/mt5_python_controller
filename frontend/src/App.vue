@@ -22,7 +22,7 @@ const PAGE_TITLES: Record<string, string> = {
   home: '首页',
   'home-node': '节点主页',
   trading: '交易',
-  'ai-trade': 'AI交易',
+  'ai-trade': 'AI 交易',
   follow: '带单',
   me: '我的',
   config: '配置',
@@ -90,7 +90,13 @@ watch(() => auth.token, setupWs)
     <header v-if="authed && !auth.isAdmin" class="topbar topbar-customer">
       <div class="topbar-customer-inner">
         <div class="brand brand-customer">
-          <button v-if="customerBackTitle" type="button" class="brand-back" @click="onCustomerBack">
+          <template v-if="route.name === 'ai-trade'">
+            <button type="button" class="brand-back brand-back-ai" aria-label="返回首页" @click="onCustomerBack">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg>
+            </button>
+            <p class="brand-page">{{ customerBackTitle }}</p>
+          </template>
+          <button v-else-if="customerBackTitle" type="button" class="brand-back" @click="onCustomerBack">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg>
             <span>{{ customerBackTitle }}</span>
           </button>

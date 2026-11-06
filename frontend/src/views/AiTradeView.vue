@@ -38,6 +38,7 @@ import type { FollowChannelsOut, Position } from '@/api/types'
 
 const robots = ref<AiRobotSummary[]>([])
 const loading = ref(false)
+const robotsError = ref('')
 const keyword = ref('')
 
 const auth = useAuthStore()
@@ -226,14 +227,6 @@ function followerCountOf(robot: AiRobotSummary): number {
   return robot.follower_count || robot.follower_node_count || 0
 }
 
-function fmtProfit(v: number): string {
-  const sign = v > 0 ? '+' : v < 0 ? '-' : ''
-  return sign + '$' + Math.abs(v).toFixed(2)
-}
-function fmtRate(v: number): string {
-  return (v >= 0 ? '+' : '') + v.toFixed(1) + '%'
-}
-
 /**
  * 手机端紧凑日期。
  *
@@ -264,11 +257,13 @@ function isNodeSelectable(nodeId: string): boolean {
 // ---------- 加载 ----------
 async function loadRobots() {
   loading.value = true
+  robotsError.value = ''
   try {
     const res = await fetchAiRobots(keyword.value.trim(), perfWindow.value)
     robots.value = res.robots
   } catch (e) {
-    ElMessage.error(errText(e, '加载机器人广场失败'))
+    robotsError.value = errText(e, '加载机器人信息失败')
+    ElMessage.error(robotsError.value)
   } finally {
     loading.value = false
   }
@@ -407,7 +402,7 @@ onMounted(() => {
   void refreshAll()
   // M3 跟单员收不到 WS 事件 —— 用 45s 轮询替代
   pollTimer = window.setInterval(() => {
-    if (document.visibilityState === 'visible') void loadMine()
+    if (document.visibilityState === 'visible') void refreshAll()
   }, 45_000)
 })
 
@@ -729,7 +724,7 @@ onMounted(() => { void hub.fetchNodes() })
     <section class="ai-hero">
       <div class="ai-hero-top">
         <span class="ai-mark" aria-hidden="true">
-          <svg viewBox="0 0 24 24"><path fill="currentColor" d="M20 9V7a2 2 0 0 0-2-2h-3a3 3 0 0 0-6 0H6a2 2 0 0 0-2 2v2a3 3 0 0 0 0 6v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4a3 3 0 0 0 0-6zM9 13a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm6 4H9v-2h6v2zm0-5a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3z"/></svg>
+          <svg viewBox="0 0 24 24"><path fill="currentColor" d="M20 9V7a2 2 0 0 0-2-2h-3a3 3 0 0 0-6 0H6a2 2 0 0 0-2 2v2a3 3 0 0 0 0 6v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4a3 3 0 0 0 0-6zM9 13a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm7 4H8v-2h8v2zm-1-4a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3z"/></svg>
         </span>
         <div class="ai-hero-text">
           <p>AI 智能交易机器人</p>
@@ -746,16 +741,23 @@ onMounted(() => { void hub.fetchNodes() })
 
       <div class="ai-sec">
         <p class="ai-kicker">机器人信息<span>{{ shownRobots.length }}</span></p>
-        <div class="ai-tools">
+        <div v-if="rankOn || keyword || perfWindow !== '30d'" class="ai-tools">
           <input v-model="keyword" placeholder="搜索名称" @keyup.enter="loadRobots" />
           <button v-for="opt in WINDOW_OPTIONS" :key="opt.value" type="button" :class="{ on: perfWindow === opt.value }" @click="perfWindow = opt.value">{{ opt.label }}</button>
         </div>
-        <p v-if="loading" class="ai-empty">加载中…</p>
-        <p v-else-if="!shownRobots.length" class="ai-empty">暂无开放的 AI 机器人</p>
+        <p v-if="loading && !robots.length" class="ai-empty">加载中…</p>
+        <div v-else-if="robotsError" class="ai-empty" role="alert">
+          <p>{{ robotsError }}</p>
+          <button type="button" class="ai-refresh" @click="loadRobots">重试</button>
+        </div>
+        <div v-else-if="!shownRobots.length" class="ai-empty">
+          <p>{{ keyword.trim() ? '未找到匹配的 AI 机器人' : '暂无开放的 AI 机器人' }}</p>
+          <p v-if="!keyword.trim()" class="ai-empty-hint">机器人主人需在策略分组中开启「开放 AI 跟单」，机器人才能在这里展示。</p>
+        </div>
         <div v-else class="ai-list">
           <div v-for="r in shownRobots" :key="r.leader_user_id" class="ai-row">
             <span class="ai-ico" aria-hidden="true">
-              <svg viewBox="0 0 24 24"><path fill="currentColor" d="M20 9V7a2 2 0 0 0-2-2h-3a3 3 0 0 0-6 0H6a2 2 0 0 0-2 2v2a3 3 0 0 0 0 6v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4a3 3 0 0 0 0-6z"/></svg>
+              <svg viewBox="0 0 24 24"><path fill="currentColor" d="M20 9V7a2 2 0 0 0-2-2h-3a3 3 0 0 0-6 0H6a2 2 0 0 0-2 2v2a3 3 0 0 0 0 6v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4a3 3 0 0 0 0-6zM9 13a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm7 4H8v-2h8v2zm-1-4a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3z"/></svg>
             </span>
             <div class="ai-row-text">
               <div class="ai-row-title">
@@ -763,7 +765,7 @@ onMounted(() => { void hub.fetchNodes() })
                 <span>{{ r.strategy_name || robotStrategyExtra(r) || 'AI智能交易' }}</span>
               </div>
               <p class="ai-desc">{{ r.strategy_names?.slice(0, 2).join(' · ') || primaryText(r) }}<template v-if="!r.marketable"> · 已下架</template><template v-if="r.ai_follow_paused"> · 已暂停</template></p>
-              <p class="ai-run"><i></i>{{ followerCountOf(r) }} 个节点跟随<template v-if="hasPerf(r)"> · {{ fmtProfit(perfOf(r).total_profit) }}</template></p>
+              <p class="ai-run"><i></i>{{ followerCountOf(r).toLocaleString('en-US') }} 个节点跟随</p>
             </div>
             <div class="ai-row-actions">
               <button type="button" class="ai-follow" :disabled="!r.marketable || r.ai_follow_paused" @click="openPicker(r, 'join')">
@@ -790,7 +792,7 @@ onMounted(() => { void hub.fetchNodes() })
       </div>
       <div class="ai-tabs">
         <button type="button" :class="{ on: mineTab === 'run' }" @click="mineTab = 'run'">
-          <svg viewBox="0 0 24 24"><path fill="currentColor" d="M20 9V7a2 2 0 0 0-2-2h-3a3 3 0 0 0-6 0H6a2 2 0 0 0-2 2v2a3 3 0 0 0 0 6v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4a3 3 0 0 0 0-6z"/></svg>
+          <svg viewBox="0 0 24 24"><path fill="currentColor" d="M20 9V7a2 2 0 0 0-2-2h-3a3 3 0 0 0-6 0H6a2 2 0 0 0-2 2v2a3 3 0 0 0 0 6v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4a3 3 0 0 0 0-6zM9 13a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm7 4H8v-2h8v2zm-1-4a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3z"/></svg>
           运行中<span>{{ runningMine.length }}</span>
         </button>
         <button type="button" :class="{ on: mineTab === 'hist' }" @click="mineTab = 'hist'">
@@ -808,32 +810,35 @@ onMounted(() => { void hub.fetchNodes() })
         <p v-else-if="!runningMine.length" class="ai-empty">还没有正在跟随的机器人</p>
         <article v-for="entry in runningMine" :key="entry.robot.leader_user_id" class="ai-card">
           <div class="ai-card-top">
-            <span class="ai-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M20 9V7a2 2 0 0 0-2-2h-3a3 3 0 0 0-6 0H6a2 2 0 0 0-2 2v2a3 3 0 0 0 0 6v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4a3 3 0 0 0 0-6z"/></svg></span>
-            <div>
-              <p>{{ robotTitle(entry.robot) }}</p>
-              <p>{{ entry.groups.map((g) => g.symbol || g.group_name).filter(Boolean).join(' · ') || '—' }}<template v-if="entry.nodes[0]?.joined_at"> · 开始于 {{ fmtJoinedShort(entry.nodes[0].joined_at) }}</template></p>
+            <div class="ai-card-heading">
+              <span class="ai-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M20 9V7a2 2 0 0 0-2-2h-3a3 3 0 0 0-6 0H6a2 2 0 0 0-2 2v2a3 3 0 0 0 0 6v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4a3 3 0 0 0 0-6zM9 13a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm7 4H8v-2h8v2zm-1-4a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3z"/></svg></span>
+              <div>
+                <p>{{ robotTitle(entry.robot) }}</p>
+                <p>{{ entry.groups.map((g) => g.symbol || g.group_name).filter(Boolean).join(' · ') || '—' }}<template v-if="entry.nodes[0]?.joined_at"> · 开始于 {{ fmtJoinedShort(entry.nodes[0].joined_at) }}</template></p>
+              </div>
             </div>
             <em :class="entry.robot.ai_follow_paused ? 'off' : 'on'"><i></i>{{ entry.robot.ai_follow_paused ? '已暂停' : '运行中' }}</em>
           </div>
           <div class="ai-stats">
-            <div><span>总浮动盈亏</span><strong :class="bookStats(robotPositions(entry)).profit >= 0 ? 'up' : 'down'">{{ fmtU(bookStats(robotPositions(entry)).profit) }}</strong></div>
+            <div><span>总浮动盈亏</span><strong :class="bookStats(robotPositions(entry)).profit >= 0 ? 'up' : 'down'">{{ fmtU(bookStats(robotPositions(entry)).profit) }} U</strong></div>
             <div><span>持仓笔数</span><strong>{{ bookStats(robotPositions(entry)).count }} 笔</strong></div>
             <div><span>合计手数</span><strong>{{ bookStats(robotPositions(entry)).volume.toFixed(2) }} 手</strong></div>
-            <div><span>跟单节点</span><strong>{{ entry.nodes.length }}</strong></div>
-            <div><span>总利润</span><strong :class="hasPerf(entry.robot) && perfOf(entry.robot).total_profit >= 0 ? 'up' : 'down'">{{ hasPerf(entry.robot) ? fmtProfit(perfOf(entry.robot).total_profit) : '—' }}</strong></div>
-            <div><span>收益率</span><strong :class="hasPerf(entry.robot) && perfOf(entry.robot).profit_rate >= 0 ? 'up' : ''">{{ hasPerf(entry.robot) ? fmtRate(perfOf(entry.robot).profit_rate) : '—' }}</strong></div>
+            <div><span>投资额</span><strong>—</strong></div>
+            <div><span>总利润</span><strong :class="hasPerf(entry.robot) ? (perfOf(entry.robot).total_profit >= 0 ? 'up' : 'down') : ''">{{ hasPerf(entry.robot) ? fmtU(perfOf(entry.robot).total_profit) : '—' }}</strong></div>
+            <div><span>月化收益</span><strong>—</strong></div>
           </div>
           <div class="ai-card-actions">
             <button type="button" class="link" @click="openPicker(entry.robot, 'settings')">查看详情<svg viewBox="0 0 24 24"><path fill="currentColor" d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg></button>
             <div>
               <button v-if="isMyRobot(entry.robot)" type="button" class="amber" :disabled="pauseBusy" @click="openRobot(entry.robot).then(() => togglePause())">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" :d="entry.robot.ai_follow_paused ? 'M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm-2 15V7l7 5-7 5z' : 'M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm-1 14H8V8h3v8zm5 0h-3V8h3v8z'"/></svg>
                 {{ entry.robot.ai_follow_paused ? '启动机器人' : '暂停机器人' }}
               </button>
-              <button type="button" class="solid" :disabled="closeBusy" @click="closeRobotAll(entry)">一键平仓</button>
+              <button type="button" class="solid" :disabled="closeBusy" @click="closeRobotAll(entry)"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="m11 21 1-7H7L13 3l-1 7h5l-6 11z"/></svg>一键平仓</button>
             </div>
           </div>
           <div v-if="robotPositions(entry).length" class="ai-table">
-            <p class="ai-trade-label">当前交易<span>{{ bookStats(robotPositions(entry)).count }} 笔 · {{ bookStats(robotPositions(entry)).volume.toFixed(2) }} 手</span></p>
+            <div class="ai-trade-label"><p><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M6.99 11 3 15l3.99 4v-3H14v-2H6.99v-3zM21 9l-3.99-4v3H10v2h7.01v3L21 9z"/></svg>当前交易</p><span>{{ bookStats(robotPositions(entry)).count }} 笔 · {{ bookStats(robotPositions(entry)).volume.toFixed(2) }} 手</span></div>
             <div class="ai-grid head"><span>#</span><span>方向</span><span>手数</span><span>开仓价</span><span>止盈/止损</span><span>浮动盈亏</span><span>操作</span></div>
             <div v-for="(p, i) in robotPositions(entry)" :key="p.nodeId + '-' + p.ticket" class="ai-grid">
               <span class="dim">{{ i + 1 }}</span>
@@ -844,7 +849,7 @@ onMounted(() => { void hub.fetchNodes() })
               <strong :class="(p.profit || 0) >= 0 ? 'up' : 'down'">{{ fmtU(p.profit || 0) }}</strong>
               <button type="button" :disabled="closeBusy" @click="closeRobotTicket(p.nodeId, p.ticket)">平仓</button>
             </div>
-            <footer>多 {{ bookStats(robotPositions(entry)).buy }} / 空 {{ bookStats(robotPositions(entry)).sell }}<b :class="bookStats(robotPositions(entry)).profit >= 0 ? 'up' : 'down'">合计 {{ fmtU(bookStats(robotPositions(entry)).profit) }}</b></footer>
+            <footer><span>多 {{ bookStats(robotPositions(entry)).buy }} / 空 {{ bookStats(robotPositions(entry)).sell }}</span><b :class="bookStats(robotPositions(entry)).profit >= 0 ? 'up' : 'down'">合计 {{ fmtU(bookStats(robotPositions(entry)).profit) }}</b></footer>
           </div>
         </article>
       </div>
@@ -914,10 +919,18 @@ onMounted(() => { void hub.fetchNodes() })
 </template>
 
 <style scoped>
-.ai { display: flex; flex-direction: column; gap: 12px; color: #E6EBF4; }
+:global(.app-shell.is-customer:has(.ai)) { color: #E6EBF4; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif; font-size: 16px; line-height: 1.5; }
+:global(.brand-back-ai) { width: 28px; height: 28px; flex-shrink: 0; margin-right: 4px; border-radius: 8px; color: #8B96A8; font-size: 16px; font-weight: 400; line-height: 24px; }
+:global(.brand-back-ai svg) { width: 19px; height: 19px; }
+:global(.brand-back-ai:hover) { background: #16213A; color: #E6EBF4; }
+:global(.app-shell.is-customer:has(.ai) .brand-page) { line-height: 20px; letter-spacing: normal; }
+:global(.app-shell.is-customer:has(.ai) .nav-customer a) { line-height: 16px; transition: color .15s, background-color .15s, border-color .15s; }
+.ai { display: flex; flex-direction: column; gap: 12px; color: #E6EBF4; font-size: 16px; line-height: 1.5; }
+:global(.app-shell.is-customer:has(.ai) .topbar-customer) { height: auto; }
+.ai button { line-height: 1.5; backdrop-filter: none; -webkit-backdrop-filter: none; }
 .ai-hero {
   border: 1px solid #1C2740; border-radius: 12px; padding: 12px;
-  background: linear-gradient(135deg, #101828, #0D1424);
+  background: linear-gradient(to bottom right, #101828, #0D1424);
   box-shadow: 0 2px 12px rgba(0,0,0,.35);
 }
 .ai-hero-top, .ai-hero-side, .ai-row, .ai-row-title, .ai-row-actions, .ai-kicker, .ai-mine-head, .ai-tabs, .ai-card-top, .ai-card-actions, .ai-run, .ai-dialog header, .ai-dialog footer, .ai-pick, .ai-node-line {
@@ -927,11 +940,12 @@ onMounted(() => { void hub.fetchNodes() })
 .ai-mark, .ai-ico { display: flex; align-items: center; justify-content: center; flex: 0 0 auto; color: #3B82F6; background: rgba(37,99,235,.15); border-radius: 8px; }
 .ai-mark { width: 36px; height: 36px; border-radius: 12px; color: #fff; background: linear-gradient(135deg, #2563EB, #7C3AED); box-shadow: 0 2px 10px rgba(99,102,241,.4); }
 .ai-ico { width: 32px; height: 32px; }
-.ai-mark svg { width: 19px; height: 19px; } .ai-ico svg, .ai-row-actions svg, .ai-refresh svg, .ai-tabs svg { width: 14px; height: 14px; }
+.ai-mark svg { width: 19px; height: 19px; } .ai-ico svg { width: 15px; height: 15px; } .ai-row-actions svg, .ai-tabs svg { width: 13px; height: 13px; } .ai-refresh svg { width: 12px; height: 12px; }
 .ai-hero-text { min-width: 0; }
-.ai-hero-text p:first-child { margin: 0; font-size: 14px; font-weight: 700; }
+.ai-hero-text p:first-child { margin: 0; font-size: 14px; font-weight: 700; line-height: 20px; }
 .ai-hero-text p:last-child, .ai-desc, .ai-run, .ai-empty, .ai-card-top p:last-child { margin: 2px 0 0; color: #5B6B85; font-size: 10px; }
-.ai-hero-side { margin-left: auto; }
+.ai-hero-text p:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ai-hero-side { margin-left: auto; flex-shrink: 0; }
 .ai-online { display: none; align-items: center; gap: 4px; border: 1px solid #22304A; background: #0C1220; border-radius: 999px; padding: 4px 10px; color: #8B96A8; font-size: 10px; }
 .ai-online i, .ai-run i, .ai-card-top em i { width: 6px; height: 6px; border-radius: 99px; background: #22C55E; display: inline-block; }
 .ai-rank, .ai-follow, .ai-set, .ai-refresh, .ai-tabs button, .ai-card-actions button, .ai-grid button, .ai-dialog button, .ai-node-line button { cursor: pointer; }
@@ -939,70 +953,93 @@ onMounted(() => { void hub.fetchNodes() })
 .ai-rank svg { width: 14px; height: 14px; }
 .ai-rank.on { background: rgba(245,158,11,.22); }
 .ai-sec { margin-top: 14px; }
-.ai-kicker { gap: 6px; margin: 0; font-size: 12px; font-weight: 650; }
+.ai-sec > .ai-kicker { padding: 0 2px; }
+.ai-kicker { gap: 6px; margin: 0; font-size: 12px; font-weight: 600; line-height: 16px; }
 .ai-kicker::before { content: ''; width: 2px; height: 12px; border-radius: 2px; background: #2563EB; }
-.ai-kicker span { border: 1px solid #22304A; background: #0C1220; color: #5B6B85; border-radius: 999px; padding: 0 6px; font-size: 10px; font-weight: 500; }
+.ai-kicker span { border: 1px solid #22304A; background: #0C1220; color: #5B6B85; border-radius: 999px; padding: 1px 6px; font-size: 10px; font-weight: 500; line-height: 16px; }
 .ai-tools { display: flex; gap: 4px; flex-wrap: wrap; margin: 8px 0; }
 .ai-tools input, .ai-tools button { height: 26px; border-radius: 8px; border: 1px solid #22304A; background: #0C1220; color: #8B96A8; font-size: 11px; }
 .ai-tools input { width: 120px; padding: 0 8px; color: #E6EBF4; }
 .ai-tools button.on { color: #fff; background: #2563EB; border-color: #2563EB; }
 .ai-list { display: flex; flex-direction: column; gap: 6px; }
+.ai-sec > .ai-list { margin-top: 8px; }
 .ai-row { gap: 10px; border: 1px solid #22304A; background: #0C1220; border-radius: 8px; padding: 8px 10px; }
 .ai-row:hover { border-color: rgba(37,99,235,.5); }
 .ai-row-text { flex: 1; min-width: 0; }
-.ai-row-title p { margin: 0; font-size: 12px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ai-row-title span { flex: 0 0 auto; border-radius: 4px; background: #16213A; color: #8B96A8; font-size: 9px; padding: 1px 6px; }
+.ai-row-title { gap: 6px; }
+.ai-row-title p { margin: 0; font-size: 12px; font-weight: 700; line-height: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ai-row-title span { flex: 0 0 auto; max-width: 50%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-radius: 4px; background: #16213A; color: #8B96A8; font-size: 9px; padding: 1px 6px; }
 .ai-desc, .ai-run { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ai-run { color: #8B96A8; }
+.ai-desc { line-height: 16px; }
+.ai-run { gap: 4px; color: #8B96A8; font-variant-numeric: tabular-nums; }
+.ai-run i { width: 4px; height: 4px; flex-shrink: 0; }
 .ai-row-actions { flex: 0 0 auto; gap: 6px; }
 .ai-follow { display: flex; align-items: center; gap: 4px; border: 0; border-radius: 8px; padding: 6px 12px; color: #fff; font-size: 11px; font-weight: 700; background: linear-gradient(90deg, #2563EB, #1D4ED8); box-shadow: 0 2px 8px rgba(37,99,235,.35); }
 .ai-set { display: flex; align-items: center; gap: 4px; border: 1px solid #22304A; background: #0C1220; color: #8B96A8; border-radius: 8px; padding: 6px 10px; font-size: 11px; font-weight: 700; }
 .ai-follow:disabled { opacity: .4; cursor: not-allowed; }
-.ai-mine-wrap { margin-top: 4px; }
-.ai-mine-head { justify-content: space-between; }
+.ai-follow:hover { background: linear-gradient(90deg, #1D4ED8, #1E40AF); }
+.ai-set:hover { border-color: rgba(37,99,235,.5); background: #0C1220; color: #3B82F6; }
+.ai-mine-head { justify-content: space-between; padding: 0 2px; }
 .ai-refresh { display: flex; align-items: center; gap: 4px; border: 1px solid #22304A; background: #0C1220; color: #8B96A8; border-radius: 8px; padding: 4px 8px; font-size: 10px; }
-.ai-tabs { margin-top: 10px; flex-wrap: wrap; }
-.ai-tabs button { display: flex; align-items: center; gap: 4px; border: 1px solid #22304A; background: #0C1220; color: #8B96A8; border-radius: 8px; padding: 6px 12px; font-size: 11px; font-weight: 650; }
+.ai-tabs { margin-top: 10px; flex-wrap: wrap; gap: 6px; padding: 0 2px; }
+.ai-tabs button { display: flex; align-items: center; gap: 4px; border: 1px solid #22304A; background: #0C1220; color: #8B96A8; border-radius: 8px; padding: 6px 12px; font-size: 11px; font-weight: 600; }
 .ai-tabs button span { border-radius: 999px; background: rgba(0,0,0,.2); padding: 0 6px; font-size: 9px; }
 .ai-tabs button.on { border: 0; color: #fff; background: linear-gradient(90deg, #2563EB, #1D4ED8); box-shadow: 0 2px 8px rgba(37,99,235,.35); }
 .ai-tabs .push { margin-left: auto; }
-.ai-cards { margin-top: 10px; display: grid; gap: 10px; }
+.ai-cards { margin-top: 8px; display: grid; gap: 10px; align-items: start; }
 .ai-card { min-width: 0; text-align: left; border: 1px solid #1C2740; background: #101828; border-radius: 12px; padding: 12px; box-shadow: 0 2px 12px rgba(0,0,0,.35); }
 .ai-card:hover { border-color: rgba(37,99,235,.5); }
 .ai-card-top { justify-content: space-between; }
-.ai-card-top > div { min-width: 0; }
-.ai-card-top p:first-child { margin: 0; font-size: 12px; font-weight: 700; }
-.ai-card-top em { display: inline-flex; align-items: center; gap: 4px; font-style: normal; font-size: 10px; font-weight: 650; border-radius: 999px; padding: 2px 8px; }
+.ai-card-heading { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.ai-card-heading > div { min-width: 0; }
+.ai-card-heading p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ai-card-top p:first-child { margin: 0; font-size: 12px; font-weight: 700; line-height: 16px; }
+.ai-card-top em { display: inline-flex; align-items: center; gap: 4px; flex-shrink: 0; font-style: normal; font-size: 10px; font-weight: 600; border-radius: 9999px; padding: 2px 8px; }
 .ai-card-top em.on { color: #22C55E; background: rgba(34,197,94,.15); }
 .ai-card-top em.off { color: #F59E0B; background: rgba(245,158,11,.15); }
 .ai-card-top em.off i { background: #F59E0B; }
-.ai-stats { margin-top: 6px; display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 6px; }
+.ai-stats { margin-top: 6px; display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 6px; font-variant-numeric: tabular-nums; }
 .ai-stats div { border: 1px solid #22304A; background: #0C1220; border-radius: 8px; padding: 6px 8px; }
 .ai-stats span { display: block; color: #5B6B85; font-size: 9px; }
-.ai-stats strong { display: block; margin-top: 2px; font-size: 11px; font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ai-stats strong { display: block; margin-top: 2px; font-size: 11px; font-weight: 600; font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .up { color: #22C55E; } .down { color: #F6465D; } .dim { color: #4A5568; }
 .ai-card-actions { margin-top: 10px; justify-content: space-between; border-top: 1px solid #1E2B47; padding-top: 8px; }
-.ai-card-actions .link { display: flex; align-items: center; border: 0; background: transparent; color: #3B82F6; font-size: 10px; padding: 0; }
+.ai-card-actions .link { display: flex; align-items: center; gap: 2px; border: 0; border-radius: 0; background: transparent; color: #3B82F6; font-size: 10px; font-weight: 500; padding: 0; }
 .ai-card-actions .link svg { width: 12px; height: 12px; }
-.ai-card-actions > div { display: flex; gap: 6px; }
-.ai-card-actions .amber { border: 1px solid rgba(245,158,11,.4); background: rgba(245,158,11,.1); color: #F59E0B; border-radius: 8px; padding: 6px 12px; font-size: 11px; font-weight: 650; }
-.ai-card-actions .solid, .ai-grid button { border: 0; background: #F6465D; color: #fff; border-radius: 8px; padding: 6px 12px; font-size: 11px; font-weight: 650; box-shadow: 0 2px 8px rgba(246,70,93,.35); }
-.ai-grid button { background: rgba(246,70,93,.1); color: #F6465D; box-shadow: none; border: 1px solid rgba(246,70,93,.4); padding: 2px 8px; font-size: 10px; }
-.ai-table { margin-top: 8px; }
-.ai-trade-label { display: flex; gap: 8px; margin: 0 0 6px; font-size: 11px; }
+.ai-card-actions > div { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.ai-card-actions .amber, .ai-card-actions .solid { display: flex; align-items: center; gap: 4px; }
+.ai-card-actions .amber svg, .ai-card-actions .solid svg { width: 13px; height: 13px; }
+.ai-card-actions .amber { border: 1px solid rgba(245,158,11,.4); background: rgba(245,158,11,.1); color: #F59E0B; border-radius: 8px; padding: 6px 12px; font-size: 11px; font-weight: 600; }
+.ai-card-actions .solid, .ai-grid button { border: 0; background: #F6465D; color: #fff; border-radius: 8px; padding: 6px 12px; font-size: 11px; font-weight: 600; box-shadow: 0 2px 8px rgba(246,70,93,.35); }
+.ai-grid button { background: rgba(246,70,93,.1); color: #F6465D; box-shadow: none; border: 1px solid rgba(246,70,93,.4); border-radius: 4px; padding: 2px 8px; font-size: 10px; font-weight: 500; }
+.ai-table { margin-top: 10px; overflow-x: auto; border: 1px solid #1E2B47; border-radius: 8px; background: #0A1120; }
+.ai-trade-label { display: flex; align-items: center; justify-content: space-between; padding: 6px 10px; border-bottom: 1px solid #16213A; }
+.ai-trade-label p { display: flex; align-items: center; gap: 4px; margin: 0; font-size: 11px; font-weight: 600; }
+.ai-trade-label svg { width: 13px; height: 13px; color: #3B82F6; }
 .ai-trade-label span { color: #5B6B85; font-size: 10px; }
-.ai-grid { display: grid; grid-template-columns: 16px 28px 40px minmax(56px,1fr) minmax(58px,1fr) minmax(64px,1fr) 42px; gap: 6px; align-items: center; padding: 4px 0; font-size: 11px; border-bottom: 1px dashed #1B2A48; }
-.ai-grid.head { color: #5B6B85; font-size: 10px; border-bottom: 1px solid #16213A; }
-.ai-grid i { font-style: normal; font-size: 10px; font-weight: 700; border-radius: 3px; padding: 0 3px; }
+.ai-grid { display: grid; grid-template-columns: 14px 22px 34px minmax(56px,1fr) minmax(58px,1fr) minmax(64px,1fr) 48px; min-width: 352px; gap: 6px; align-items: center; padding: 4px 10px; font-size: 11px; font-variant-numeric: tabular-nums; text-align: right; border-bottom: 1px dashed #1B2A48; }
+.ai-grid > :first-child { text-align: left; font-size: 10px; }
+.ai-grid > :nth-child(2) { text-align: center; }
+.ai-grid > :nth-child(3) { font-size: 10px; }
+.ai-grid > button { justify-self: end; }
+.ai-grid.head { color: #5B6B85; font-size: 10px; font-weight: 500; background: #0C1424; border-bottom: 1px solid #16213A; }
+.ai-grid:last-of-type { border-bottom: 0; }
+.ai-grid strong { font-weight: 600; }
+.ai-grid i { display: inline-flex; align-items: center; justify-content: center; height: 15px; min-width: 20px; font-style: normal; font-size: 10px; font-weight: 700; line-height: 1; border-radius: 3px; padding: 0 2px; }
 .ai-grid i.buy { color: #22C55E; background: rgba(34,197,94,.15); }
 .ai-grid i.sell { color: #F6465D; background: rgba(246,70,93,.15); }
-.sltp em { display: block; font-style: normal; font-size: 10px; }
-.ai-table footer { display: flex; justify-content: space-between; padding-top: 6px; color: #5B6B85; font-size: 10px; }
+.sltp em { display: block; font-style: normal; line-height: 1.25; }
+.ai-table footer { display: flex; justify-content: space-between; padding: 6px 10px; border-top: 1px solid #16213A; background: #0C1424; font-size: 10px; font-variant-numeric: tabular-nums; }
+.ai-table footer > span { color: #5B6B85; }
+.ai-table footer b { font-weight: 600; }
 .ai-node-card { border: 1px solid #22304A; background: #0C1220; border-radius: 8px; padding: 10px; }
 .ai-node-card > p { margin: 0 0 6px; font-size: 12px; font-weight: 700; }
 .ai-node-line { justify-content: space-between; gap: 8px; padding: 6px 0; border-top: 1px dashed #1B2A48; font-size: 12px; }
 .ai-node-line button { border: 1px solid rgba(246,70,93,.4); background: transparent; color: #F6465D; border-radius: 8px; padding: 2px 8px; }
 .ai-empty { padding: 8px 2px; }
+.ai-empty p { margin: 0; }
+.ai-empty .ai-empty-hint { margin-top: 4px; color: #8B96A8; }
+.ai-empty .ai-refresh { margin-top: 8px; }
 .ai-mask { position: fixed; inset: 0; z-index: 40; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; padding: 16px; }
 .ai-dialog { width: min(560px, 100%); max-height: 86vh; overflow: auto; padding: 14px; border: 1px solid #1E2B47; border-radius: 16px; background: #0D1626; }
 .ai-dialog header, .ai-dialog footer { display: flex; align-items: center; justify-content: space-between; }
@@ -1018,8 +1055,12 @@ onMounted(() => { void hub.fetchNodes() })
 .ai-dialog .primary { border: 0; background: #2563EB; color: #fff; border-radius: 8px; padding: 8px 12px; }
 .ai-warn { color: #FBBF24; font-size: 12px; }
 button:disabled { opacity: .45; cursor: not-allowed; }
-@media (min-width: 640px) { .ai-online { display: flex; } }
+@media (min-width: 640px) {
+  :global(.app-shell.is-customer:has(.ai) .nav-customer a) { padding: 0 10px; font-size: 12px; }
+  .ai-online { display: flex; }
+}
 @media (min-width: 1024px) {
+  :global(.app-shell.is-customer .content:has(> .ai)) { padding-top: 12px; }
   .ai-hero { padding: 20px; }
   .ai-cards { grid-template-columns: 1fr 1fr; }
 }
