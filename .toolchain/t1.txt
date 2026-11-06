@@ -1,0 +1,13 @@
+﻿        found = wr.find_runtime_dir()
+        assert found is not None
+>       assert found.name == wr.RUNTIME_ROOT_NAME
+E       AssertionError: assert 'flat' == 'webview2'
+E         
+E         - webview2
+E         + flat
+
+test_webview2_runtime.py:51: AssertionError
+=========================== short test summary info ===========================
+FAILED test_webview2_runtime.py::test_finds_runtime_flat_in_webview2_root - A...
+1 failed, 13 passed in 2.39s
+

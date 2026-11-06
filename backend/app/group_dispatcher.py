@@ -31,13 +31,13 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional
 
 from . import (
     follow_rules,
     group_persist,
     group_rules,
-    latency_marks,
     market_probe,
     permissions,
     persist,
@@ -1011,8 +1011,10 @@ class GroupDispatcher:
         sent_at = time.time()
         cmd["sent_at"] = round(sent_at, 6)
         if await manager.send_to_node(node_id, cmd):
+            # 落库的是**真正的发包时刻**（上面那个 epoch），不是 send_to_node
+            # 返回后的时刻：send_to_node 之后还有一次库往返，记那一时刻会把时延算高。
             await group_persist.set_dispatch_status(dispatch_id, "sent",
-                                                   sent_at=latency_marks.utcnow())
+                                                   sent_at=datetime.fromtimestamp(sent_at))
             return {"node_id": node_id, "status": "sent", "magic": magic,
                     "dispatch_id": dispatch_id, "volume": volume, "reason": None}
 

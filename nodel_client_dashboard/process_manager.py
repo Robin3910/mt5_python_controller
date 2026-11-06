@@ -332,6 +332,10 @@ class ManagedProcess:
         self.runtime.ws_state = data.get("ws_state")
         self.runtime.node_id = data.get("node_id")
         self.runtime.mt5_login = data.get("mt5_login")
+        # 券商服务器名：客户端上报的实测值优先；老客户端不上报时保留原值。
+        server = str(data.get("mt5_server") or "").strip()
+        if server:
+            self.runtime.mt5_server = server
         if "algo_trading_allowed" in data:
             allowed = data.get("algo_trading_allowed")
             self.runtime.algo_trading_allowed = allowed if isinstance(allowed, bool) else None

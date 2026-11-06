@@ -1,0 +1,9 @@
+pywebview>=6.0
+pythonnet>=3.0
+clr-loader>=0.2
+Pillow>=10.0.0
+# 导入节点留空账号时，用来附着本机终端并读取当前登录号。仅 Windows。
+# 注意：MetaTrader5 硬依赖 numpy（缺了它 import 会报
+# "numpy._core.multiarray failed to import"），numpy 由它一起带进来。
+# 打包时 dashboard_web.spec 必须 collect_all 两者，且 excludes 里不能排除 numpy。
+MetaTrader5>=5.0.45 ; platform_system == "Windows"

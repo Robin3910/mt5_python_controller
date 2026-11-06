@@ -116,6 +116,40 @@ class RedisStore:
                 out.append(n)
         return out
 
+    async def all_nodes_with_db_fallback(self) -> list[dict]:
+        """读节点列表；Redis 缓存为空时回落到 MySQL 并顺手把缓存补回来。
+
+        Redis 在本系统里是**易失缓存**，权威数据在 MySQL 的 nodes 表。容器重建、
+        Redis 数据卷被清、backend 刚启动还没预热完成，都会让缓存短暂为空；
+        这时如果只读缓存，节点列表会整个消失（本机面板因此认不出节点，
+        「移除节点」这类动作会因为缺 node_id 而被后端 422 挡下）。
+
+        这里在缓存为空时用库里的行重建缓存，保证「节点列表」不会因为缓存丢失而空。
+        """
+        items = await self.all_nodes()
+        if items:
+            return items
+        try:
+            from .db import SessionLocal
+            from .orm import Node
+            from sqlalchemy import select
+
+            async with SessionLocal() as session:
+                rows = (await session.execute(select(Node))).scalars().all()
+        except Exception:  # noqa: BLE001
+            return items
+        out: list[dict] = []
+        for row in rows:
+            from .node_service import node_row_to_dict
+
+            d = node_row_to_dict(row)
+            out.append(d)
+            try:
+                await self.cache_node(d)
+            except Exception:  # noqa: BLE001
+                pass
+        return out
+
     async def delete_node(self, node_id: str) -> None:
         """删除节点时，连带清理 mt5_login 反查索引、账户快照、在线标记。"""
         n = await self.get_node(node_id)

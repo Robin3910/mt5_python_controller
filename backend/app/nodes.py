@@ -96,7 +96,7 @@ async def list_nodes(
     p: Principal = Depends(get_principal),
 ):
     """节点列表（按创建时间排序）；可选 q 按名称 / MT5 账号模糊搜索。普通用户只看本人节点。"""
-    nodes = permissions.visible(p, await store.all_nodes())
+    nodes = permissions.visible(p, await store.all_nodes_with_db_fallback())
     if q and (term := q.strip()):
         nodes = [n for n in nodes if _node_matches_search(n, term)]
     nodes.sort(key=lambda n: n.get("created_at", 0))

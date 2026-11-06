@@ -1,0 +1,24 @@
+{
+  "instances": [
+    {
+      "id": "cfgkeep01",
+      "name": "mt5-prod-01",
+      "exe_path": "C:\\Mt5\\prod-01\\node_client.exe",
+      "cwd": "C:\\Mt5\\prod-01",
+      "status_port": 0,
+      "daemon": false,
+      "restart_delay_s": 5.0,
+      "enabled": true,
+      "node_id": "nd_9f21",
+      "mt5_login": 50231488,
+      "owner_user_id": 1,
+      "requested_by_user_id": null,
+      "approval_status": "approved",
+      "credential_generation": 1,
+      "legacy_allowed": true,
+      "has_credential": true,
+      "backend_base": "http://127.0.0.1:9/e2e",
+      "algo_trading_disabled": false
+    }
+  ]
+}

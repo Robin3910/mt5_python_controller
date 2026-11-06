@@ -432,3 +432,47 @@ def test_delete_purges_cache_when_ledger_row_is_gone(client):
     response = client.delete(f"/api/nodes/{node_id}", headers=admin)
     assert response.status_code == 200, response.text
     assert all(item["node_id"] != node_id for item in client.get("/api/nodes", headers=admin).json())
+
+
+def test_admin_can_remove_unbound_local_instance(client):
+    """未绑定后端节点的本机实例，管理员也能移除（纯本机动作，不该被 node_id 挡下）。
+
+    回归：本机面板的「垃圾桶」走 remove_instance。以前绑定一丢（后端节点缓存被清、
+    实例是历史遗留）就变成 422，点起来像是「没反应」。
+    """
+    admin = auth_headers(client)
+    _, h = user(client, admin)
+    payload = {"request_id": "remove-unbound-instance", "action": "remove_instance",
+               "instance_id": "legacy-local", "params": {"instance_id": "legacy-local"}}
+    response = client.post(f"{PREFIX}/actions", headers=admin, json=payload)
+    assert response.status_code == 200, response.text
+    assert response.json()["node_id"] is None
+    # 普通用户对本机实例没有这个权限，仍然是 422。
+    assert client.post(f"{PREFIX}/actions", headers=h, json=payload).status_code == 422
+    # 启动权不能顺带被打开。
+    assert client.post(f"{PREFIX}/actions", headers=admin, json={
+        "request_id": "start-unbound-instance", "action": "start", "instance_id": "legacy-local",
+    }).status_code == 422
+
+
+def test_node_list_survives_wiped_redis_cache(client, monkeypatch):
+    """Redis 缓存被清空时，节点列表仍要能从库里恢复。
+
+    Redis 只是缓存，权威数据在 MySQL。容器重建 / 数据卷被清都会让缓存短暂为空，
+    这时如果只读缓存，节点列表整个消失，本机面板就再也认不出节点，
+    「移除节点」这类动作也会因为缺 node_id 被后端 422 挡下。
+    """
+    from app.state import state
+
+    admin = auth_headers(client)
+    created = client.post("/api/nodes", headers=admin, json={"name": "probe", "mt5_login": 90000002})
+    assert created.status_code == 201, created.text
+    node_id = created.json()["node_id"]
+    assert any(item["node_id"] == node_id for item in client.get("/api/nodes", headers=admin).json())
+
+    # 模拟缓存被清：换成一个空的 store（等价于 Redis 数据卷被清）。
+    empty = RedisStore(fakeredis.FakeAsyncRedis(decode_responses=True))
+    monkeypatch.setattr(state, "store", empty)
+    listed = client.get("/api/nodes", headers=admin).json()
+    assert any(item["node_id"] == node_id for item in listed)
+

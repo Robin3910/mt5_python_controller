@@ -26,13 +26,26 @@ def test_palette_values():
     assert theme.LINE == "#1e2a3d"
     assert theme.GOLD == "#d9b36c"
     assert theme.GOLD_STRONG == "#e9c98a"
-    assert theme.ON_GOLD == "#1b1408"
+    assert theme.ON_GOLD == "#101826"
     assert theme.GREEN == "#2fd381"
     assert theme.AMBER == "#f2b84b"
     assert theme.RED == "#f2645f"
     assert theme.TEXT == "#e8ecf4"
     assert theme.DIM == "#8b96ab"
     assert theme.MUTE == "#5a6a82"
+
+
+def test_all_colors_are_tk_compatible():
+    """Tk 不认 8 位十六进制和 rgba()，所有颜色令牌必须是 6 位 #rrggbb。"""
+    import re
+
+    pattern = re.compile(r"^#[0-9a-fA-F]{6}$")
+    for name in dir(theme):
+        if name.startswith("_"):
+            continue
+        value = getattr(theme, name)
+        if isinstance(value, str) and value.startswith("#"):
+            assert pattern.match(value), f"{name}={value} 不是 Tk 能识别的颜色"
 
 
 def test_legacy_names_are_aliases():
@@ -65,9 +78,10 @@ def test_ghost_btn_is_transparent_with_line_border(root):
     assert btn.cget("border_color") == theme.LINE
 
 
-def test_glass_card_radius_is_10(root):
+def test_glass_card_radius_is_8(root):
+    """`.panel-card` 的圆角是 8px（参考稿 CSS 实测）。"""
     card = theme.glass_card(root)
-    assert card.cget("corner_radius") == 10
+    assert card.cget("corner_radius") == 8
     assert card.cget("fg_color") == theme.PANEL
     assert card.cget("border_color") == theme.LINE
 

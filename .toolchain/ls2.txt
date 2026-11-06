@@ -1,0 +1,11 @@
+﻿webview2_runtime.py exists=False
+prune_runtime.py exists=False
+fetch_runtime.py exists=False
+build_portable.py exists=False
+build_portable.bat exists=False
+verify_portable.py exists=False
+verify_runtime.py exists=True
+test_webview2_runtime.py exists=False
+--- portable 目录 ---
+portable exists=True
+--- 全盘找 webview2_runtime.py ---
