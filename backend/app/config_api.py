@@ -11,7 +11,13 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from . import persist, rules, system_settings
 from .connections import manager
 from .deps import client_ip, get_current_admin, get_store, require_admin
-from .models import NodeTokenInfo, WebhookAuthInfo, WebhookAuthUpdate
+from .models import (
+    FeatureSwitchInfo,
+    FeatureSwitchUpdate,
+    NodeTokenInfo,
+    WebhookAuthInfo,
+    WebhookAuthUpdate,
+)
 from .permissions import Principal
 from .settings import settings
 from .redis_store import RedisStore
@@ -109,6 +115,39 @@ async def set_webhook_auth(
         category="console", before={"enabled": before}, after={"enabled": enabled},
     )
     return WebhookAuthInfo(enabled=enabled, token=settings.auth_token or "")
+
+
+# ----------------- 指定价加仓「下发即消费」开关 -----------------
+@router.get("/consume-price-level", response_model=FeatureSwitchInfo)
+async def get_consume_price_level(
+    store: RedisStore = Depends(get_store),
+    _: Principal = Depends(require_admin),
+):
+    """读取「指定价下发一次即消费」开关。
+
+    开启：指定价加仓档位交付给节点一次后，自动从配置里摘除（一次生效）。
+    关闭：指定价档位一直留在配置里，每次下发都会带上。
+    """
+    enabled = await system_settings.is_consume_price_level_enabled(store)
+    return FeatureSwitchInfo(enabled=enabled)
+
+
+@router.put("/consume-price-level", response_model=FeatureSwitchInfo)
+async def set_consume_price_level(
+    body: FeatureSwitchUpdate,
+    request: Request,
+    store: RedisStore = Depends(get_store),
+    p: Principal = Depends(require_admin),
+):
+    """保存「指定价下发一次即消费」开关；立即生效，无需重启、无需发版。"""
+    before = await system_settings.is_consume_price_level_enabled(store)
+    enabled = await system_settings.set_consume_price_level_enabled(store, body.enabled)
+    await persist.audit(
+        p.username, "set_consume_price_level", None, {"enabled": enabled}, "ok",
+        client_ip(request), category="console",
+        before={"enabled": before}, after={"enabled": enabled},
+    )
+    return FeatureSwitchInfo(enabled=enabled)
 
 
 # ----------------- 趋势面板参数（全局共享，不分节点/币种）-----------------

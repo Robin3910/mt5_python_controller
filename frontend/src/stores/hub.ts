@@ -41,6 +41,7 @@ import type {
   TrendConfig,
   TrendPanelData,
   WebhookAuthInfo,
+  FeatureSwitchInfo,
 } from '@/api/types'
 
 /**
@@ -83,6 +84,8 @@ interface HubState {
   // node_id -> 成交入库计数（每次 +1）。概览面板监听它来触发重新拉取，
   // 这样节点上报新成交后页面能自动刷新，不必手动点刷新。
   dealVersions: Record<string, number>
+  // 策略列表当前的检索词：WS 触发的自动刷新要沿用它
+  strategyQuery: string
 }
 
 export const useHubStore = defineStore('hub', {
@@ -99,6 +102,7 @@ export const useHubStore = defineStore('hub', {
     riskFeed: {},
     limitWatchLogs: {},
     dealVersions: {},
+    strategyQuery: '',
   }),
   getters: {
     // 在线节点数（优先用实时状态，其次用 REST 字段）
@@ -357,6 +361,8 @@ export const useHubStore = defineStore('hub', {
     async fetchStrategies(options?: { q?: string }): Promise<void> {
       const q = options?.q?.trim()
       const params = q ? { q } : undefined
+      // 记下当前检索词：WS 触发的自动刷新要沿用它，否则列表页会突然显示全量
+      this.strategyQuery = q || ''
       this.strategies = (await api.get('/api/strategies', { params })).data
     },
     /**
@@ -482,6 +488,12 @@ export const useHubStore = defineStore('hub', {
     },
     async setWebhookAuth(enabled: boolean): Promise<WebhookAuthInfo> {
       return (await api.put('/api/config/webhook-auth', { enabled })).data
+    },
+    async fetchConsumePriceLevel(): Promise<FeatureSwitchInfo> {
+      return (await api.get('/api/config/consume-price-level')).data
+    },
+    async setConsumePriceLevel(enabled: boolean): Promise<FeatureSwitchInfo> {
+      return (await api.put('/api/config/consume-price-level', { enabled })).data
     },
     // ---- 远程平仓 ----
     async closeNode(id: string, body: CloseRequest): Promise<void> {
@@ -660,6 +672,12 @@ export const useHubStore = defineStore('hub', {
         const ev = d.event as string
         const kind = ev === 'ok' ? 'ok' : ev === 'rejected' || ev === 'cancel_failed' ? 'warn' : 'info'
         this.pushEvent(`限价监听 ${name} ${text}`, kind)
+      } else if (t === 'strategy_config_changed') {
+        // 后端把策略配置改了（指定价加仓下发一次即摘除）：重新拉一遍策略列表，
+        // 让客户在页面上立刻看到摘除后的配置，不必手动刷新页面。
+        void this.fetchStrategies({ q: this.strategyQuery }).catch(() => {
+          /* 拉取失败不打扰页面：用户手动刷新也能拿到最新配置 */
+        })
       } else if (t === 'deals') {
         // 节点上报了新的历史成交：把该节点的成交版本号 +1，
         // 概览面板监听它重新拉取绩效数据（否则页面会一直停在旧值，

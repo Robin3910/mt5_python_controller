@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import logging
 import time
 from typing import Optional
 
@@ -17,6 +18,8 @@ from .orm import TradingStrategy
 from .redis_store import RedisStore
 from .security import make_strategy_id
 from . import strategy_templates as templates
+
+logger = logging.getLogger(__name__)
 
 
 def strategy_row_to_dict(row: TradingStrategy) -> dict:
@@ -43,6 +46,39 @@ async def warm_cache(store: RedisStore) -> int:
     for row in rows:
         await store.cache_strategy(strategy_row_to_dict(row))
     return len(rows)
+
+
+async def reload_strategy_cache(store: RedisStore, strategy_id: str) -> Optional[dict]:
+    """重新读库并刷新 Redis 里的策略缓存；返回刷新后的策略（读不到返回 None）。
+
+    后端直接改写 `config_json`（如指定价加仓用一次即摘除）后必须调这里：
+    缓存是分发时读策略的权威入口（见 group_dispatcher 的 store.get_strategy），
+    不刷新的话下一条信号还会带上刚被摘掉的指定价档位。
+    """
+    sid = str(strategy_id or "").strip()
+    if not sid:
+        return None
+    try:
+        async with SessionLocal() as s:
+            row = await s.get(TradingStrategy, sid)
+            if row is None:
+                return None
+            d = strategy_row_to_dict(row)
+        await store.cache_strategy(d)
+        return d
+    except Exception as e:  # noqa: BLE001
+        logger.warning("reload strategy cache failed %s: %s", sid, e)
+        return None
+
+
+def strip_price_levels_from_rules(
+    rules: list[dict],
+) -> tuple[list[dict], bool]:
+    """把规则里的指定价档位摘掉（见 `templates.strip_price_levels`）。
+
+    保存路径上的包装：返回值与底层纯函数一致（(新规则, 是否有改动)）。
+    """
+    return templates.strip_price_levels(rules)
 
 
 def normalize_symbol(symbol: str) -> str:

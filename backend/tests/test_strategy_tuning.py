@@ -149,6 +149,30 @@ def test_snapshot_pads_gap_between_levels():
     assert cursor >= 7
 
 
+def test_snapshot_does_not_pad_price_level():
+    """末档是指定价时不补档：复制它会凭空多挂几张同价位的指定价单。
+
+    补档是把最后一档的参数复制到后面的空位；指定价档位挂的是一张
+    **指定价的单**，复制它等于替用户多挂了他没配的单。
+    """
+    from app import group_rules
+
+    levels = [
+        {"pos_from": 1, "pos_to": 1, "calc_type": "point", "point": 100,
+         "lot_times": 1.1, "extra_lot": 0},
+        {"pos_from": 2, "pos_to": 2, "calc_type": "price", "point": 100,
+         "price": 4067.0, "price_tp": 4072.0, "lot_times": 1.2, "extra_lot": 0},
+    ]
+    snap = group_rules.strategy_rules_snapshot({
+        "strategy_id": "s1", "name": "n", "symbol": "XAUUSD",
+        "template_id": TEMPLATE_1_ID, "rules": [_batched_rule(levels, limit=5)],
+    })
+    out = snap["rules"][0]["batch_levels"]
+    price_levels = [lv for lv in out if lv.get("calc_type") == "price"]
+    assert len(price_levels) == 1, "指定价档位只能有一档，不能被补档复制"
+    assert (price_levels[0]["pos_from"], price_levels[0]["pos_to"]) == (2, 2)
+
+
 def test_snapshot_does_not_pad_when_limit_unlimited():
     """上限 0（不限）→ 不往上补档。"""
     from app import group_rules
@@ -178,6 +202,143 @@ def test_snapshot_does_not_mutate_source_rule():
         "template_id": TEMPLATE_1_ID, "rules": [rule],
     })
     assert len(rule["batch_levels"]) == 1, "原始规则不该被补档改写"
+
+
+# ----------------------------------------------------------------------
+# 指定价加仓：一次生效，摘除
+# ----------------------------------------------------------------------
+def _price_level(pos_from, pos_to, *, price=4350.0, tp=4400.0, sl=4300.0) -> dict:
+    return {
+        "pos_from": pos_from, "pos_to": pos_to, "calc_type": "price",
+        "point": 100, "price": price, "price_tp": tp, "price_sl": sl,
+        "lot_times": 1.0, "extra_lot": 0.0,
+    }
+
+
+def _point_level(pos_from, pos_to, *, point=100) -> dict:
+    return {
+        "pos_from": pos_from, "pos_to": pos_to, "calc_type": "point",
+        "point": point, "price": 0.0, "price_tp": 0.0, "price_sl": 0.0,
+        "lot_times": 1.0, "extra_lot": 0.0,
+    }
+
+
+def test_strip_price_levels_removes_level_and_shifts_up():
+    """删整档 + 后续档位上移：1~1 / 2~2(指定价) / 3~3 → 1~1 / 2~2，上限 3→2。"""
+    from app.strategy_templates import strip_price_levels
+
+    rules = [_rule(
+        batch_enabled=True, batch_count=3, total_lot_limit=3,
+        batch_levels=[
+            _point_level(1, 1),
+            _price_level(2, 2),
+            _point_level(3, 3),
+        ],
+    )]
+    out, changed = strip_price_levels(rules)
+    assert changed is True
+    levels = out[0]["batch_levels"]
+    assert len(levels) == 2
+    assert all(lv["calc_type"] != "price" for lv in levels)
+    # 上移后首尾衔接、不留空洞，区间长度保持不变
+    assert (levels[0]["pos_from"], levels[0]["pos_to"]) == (1, 1)
+    assert (levels[1]["pos_from"], levels[1]["pos_to"]) == (2, 2)
+    assert out[0]["batch_count"] == 2
+    assert out[0]["total_lot_limit"] == 2
+
+
+def test_strip_price_levels_keeps_level_lengths():
+    """其余档位保持各自长度：删中间档后 3~4 变成 2~3。"""
+    from app.strategy_templates import strip_price_levels
+
+    rules = [_rule(
+        batch_enabled=True, batch_count=3, total_lot_limit=4,
+        batch_levels=[
+            _point_level(1, 1),
+            _price_level(2, 2),
+            _point_level(3, 4),
+        ],
+    )]
+    out, changed = strip_price_levels(rules)
+    assert changed is True
+    levels = out[0]["batch_levels"]
+    assert (levels[0]["pos_from"], levels[0]["pos_to"]) == (1, 1)
+    assert (levels[1]["pos_from"], levels[1]["pos_to"]) == (2, 3)
+    assert out[0]["total_lot_limit"] == 3
+
+
+def test_strip_price_levels_also_strips_legacy_price_level():
+    """老口径指定价档位（没填止盈价）也一并摘掉。"""
+    from app.strategy_templates import strip_price_levels
+
+    rules = [_rule(
+        batch_enabled=True, batch_count=2, total_lot_limit=2,
+        batch_levels=[
+            _point_level(1, 1),
+            {"pos_from": 2, "pos_to": 2, "calc_type": "price", "point": 100,
+             "price": 4350.0, "price_tp": 0.0, "price_sl": 0.0,
+             "lot_times": 1.0, "extra_lot": 0.0},
+        ],
+    )]
+    out, changed = strip_price_levels(rules)
+    assert changed is True
+    assert len(out[0]["batch_levels"]) == 1
+    assert out[0]["batch_levels"][0]["calc_type"] == "point"
+
+
+def test_strip_price_levels_disables_batch_when_all_removed():
+    """档位被摘光 → 关掉分批，否则节点侧整条规则会静默哑掉。"""
+    from app.strategy_templates import strip_price_levels
+
+    rules = [_rule(
+        batch_enabled=True, batch_count=1, total_lot_limit=1,
+        batch_levels=[_price_level(1, 1)],
+    )]
+    out, changed = strip_price_levels(rules)
+    assert changed is True
+    assert out[0]["batch_levels"] == []
+    assert out[0]["batch_enabled"] is False
+    assert out[0]["batch_count"] == 0
+    assert out[0]["total_lot_limit"] == 0
+
+
+def test_strip_price_levels_no_change_without_price_level():
+    """没有指定价档位 → 不算改动（幂等的前提）。"""
+    from app.strategy_templates import strip_price_levels
+
+    rules = [_rule(
+        batch_enabled=True, batch_count=2, total_lot_limit=2,
+        batch_levels=[_point_level(1, 1), _point_level(2, 2)],
+    )]
+    out, changed = strip_price_levels(rules)
+    assert changed is False
+    assert out == rules
+
+
+def test_strip_price_levels_does_not_mutate_input():
+    """入参不被修改（配置快照与已下发快照共用同一份字典时要安全）。"""
+    from app.strategy_templates import strip_price_levels
+
+    levels = [_point_level(1, 1), _price_level(2, 2), _point_level(3, 3)]
+    rules = [_rule(batch_enabled=True, batch_count=3, total_lot_limit=3,
+                   batch_levels=levels)]
+    strip_price_levels(rules)
+    assert len(rules[0]["batch_levels"]) == 3
+    assert rules[0]["batch_levels"][1]["calc_type"] == "price"
+    assert rules[0]["total_lot_limit"] == 3
+
+
+def test_strip_price_levels_ignores_non_batch_rules():
+    """网格 / 趋势规则没有分批档位 → 不受影响。"""
+    from app.strategy_templates import strip_price_levels
+
+    rules = [{
+        "type": 4, "status": 1, "action": "all", "price_lower": 2300,
+        "price_upper": 2400, "grid_count": 10,
+    }]
+    out, changed = strip_price_levels(rules)
+    assert changed is False
+    assert out == rules
 
 
 # ----------------------------------------------------------------------

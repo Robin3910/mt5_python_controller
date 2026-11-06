@@ -33,12 +33,15 @@ const nodeTokenLoading = ref(false)
 const nodeTokenError = ref('')
 const webhookAuthEnabled = ref(true)
 const webhookAuthLoading = ref(false)
+const consumePriceLevelEnabled = ref(true)
+const consumePriceLevelLoading = ref(false)
 
 onMounted(async () => {
   await load2faStatus()
   if (!auth.isAdmin) return
   await loadNodeToken()
   await loadWebhookAuth()
+  await loadConsumePriceLevel()
 })
 
 async function loadNodeToken(): Promise<void> {
@@ -109,6 +112,38 @@ async function onWebhookAuthChange(value: boolean | string | number): Promise<vo
     nodeTokenError.value = 'Webhook 鉴权开关保存失败'
   } finally {
     webhookAuthLoading.value = false
+  }
+}
+
+async function loadConsumePriceLevel(): Promise<void> {
+  try {
+    const info = await hub.fetchConsumePriceLevel()
+    consumePriceLevelEnabled.value = info.enabled
+  } catch {
+    nodeTokenError.value = nodeTokenError.value || '无法加载「指定价一次生效」开关'
+  }
+}
+
+async function onConsumePriceLevelChange(value: boolean | string | number): Promise<void> {
+  const next = value === true || value === 'true' || value === 1
+  if (next === consumePriceLevelEnabled.value || consumePriceLevelLoading.value) return
+  if (!next) {
+    const ok = await confirmAction(
+      '关闭后，AI 智能加仓策略里的指定价加仓档位不会再在下发后自动删除，会一直留在配置里，每次下发都会带上。',
+      '关闭「指定价一次生效」',
+    )
+    if (!ok) return
+  }
+  consumePriceLevelLoading.value = true
+  nodeTokenError.value = ''
+  try {
+    const info = await hub.setConsumePriceLevel(next)
+    consumePriceLevelEnabled.value = info.enabled
+    flash(info.enabled ? '已开启「指定价一次生效」' : '已关闭「指定价一次生效」')
+  } catch {
+    nodeTokenError.value = '「指定价一次生效」开关保存失败'
+  } finally {
+    consumePriceLevelLoading.value = false
   }
 }
 
@@ -311,6 +346,20 @@ async function changePassword(): Promise<void> {
         />
         <span class="muted webhook-auth-hint">
           {{ webhookAuthEnabled ? '开启：调用 /webhook 必须携带 AUTH_TOKEN' : '关闭：调用 /webhook 不校验 token' }}
+        </span>
+      </div>
+      <div class="webhook-auth-row">
+        <span class="webhook-auth-label">指定价一次生效</span>
+        <ElSwitch
+          :model-value="consumePriceLevelEnabled"
+          :loading="consumePriceLevelLoading"
+          :disabled="consumePriceLevelLoading"
+          @change="onConsumePriceLevelChange"
+        />
+        <span class="muted webhook-auth-hint">
+          {{ consumePriceLevelEnabled
+            ? '开启：指定价加仓档位下发一次后自动从配置中删除'
+            : '关闭：指定价加仓档位保留在配置中，每次下发都会带上' }}
         </span>
       </div>
       <div class="form-grid">

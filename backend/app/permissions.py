@@ -297,7 +297,9 @@ ADMIN_ONLY_EVENTS = frozenset({"node_registered"})
 
 
 def event_resource(message: object) -> Optional[tuple[str, str]]:
-    """推送事件归属的资源：("group", id) 或 ("node", id)；None = 只推给管理员。
+    """推送事件归属的资源：("group", id) / ("node", id) / ("strategy", id)。
+
+    None = 只推给管理员。
 
     同时带 group_id 与 node_id 时按分组算：分组成员与分组同一所有者，二者一致。
     """
@@ -312,6 +314,9 @@ def event_resource(message: object) -> Optional[tuple[str, str]]:
     nid = str(data.get("node_id") or "").strip()
     if nid:
         return ("node", nid)
+    sid = str(data.get("strategy_id") or "").strip()
+    if sid:
+        return ("strategy", sid)
     return None
 
 
