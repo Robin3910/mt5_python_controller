@@ -17,7 +17,7 @@ import time
 from datetime import datetime
 from typing import Optional
 
-from . import latency_marks, mt5_identity, persist, results, rules
+from . import latency_marks, mt5_identity, persist, results, rules, signal_codes
 from .config import Config
 from .connections import manager
 from .models import build_close_command, build_open_command
@@ -59,6 +59,7 @@ class Dispatcher:
             if not rules.node_has_symbol_config(n, symbol):
                 await self._skip(
                     signal_id, n["node_id"], rules.node_symbol_not_configured_reason(symbol),
+                    signal_codes.SKIP_CONFIG_MISSING,
                 )
                 continue
             if not rules.node_participates(n, symbol, follow, filters):
@@ -88,6 +89,7 @@ class Dispatcher:
             await persist.record_signal(
                 signal_id, signal, source_ip, True, None, status="rejected",
                 raw_payload=raw_payload, source=source,
+                reject_code=signal_codes.classify_reject_reason(reject_reason),
             )
             logger.info("signal rejected: %s", reject_reason)
             return {"mode": "rejected", "targets": 0, "reason": reject_reason}
@@ -165,7 +167,7 @@ class Dispatcher:
             node.get("mt5_login"), account.get("login"),
         )
         if mismatch:
-            await self._skip(signal_id, node_id, mismatch)
+            await self._skip(signal_id, node_id, mismatch, signal_codes.SKIP_LOGIN_MISMATCH)
             return {"status": "skipped", "reason": mismatch}
 
         # 9.2 多区间方向过滤
@@ -173,7 +175,7 @@ class Dispatcher:
         price = rules.pick_price(account, signal.symbol)
         ok, reason = rules.interval_filter(signal.action, signal.symbol, price, eff)
         if not ok:
-            await self._skip(signal_id, node_id, reason)
+            await self._skip(signal_id, node_id, reason, signal_codes.SKIP_RISK_INTERVAL)
             return {"status": "skipped", "reason": reason}
 
         # 9.3 持仓过滤
@@ -181,13 +183,13 @@ class Dispatcher:
             signal.action, signal.allow_position, positions, signal.symbol, scope
         )
         if not ok:
-            await self._skip(signal_id, node_id, reason)
+            await self._skip(signal_id, node_id, reason, signal_codes.SKIP_RISK_POSITION)
             return {"status": "skipped", "reason": reason}
 
         # 9.7 并发控制：同一 (节点, 品种) 同时只允许一笔在途订单
         if not await self.store.acquire_exec_lock(node_id, signal.symbol):
             reason = f"并发控制：{signal.symbol}已有在途订单未完成，跳过本次"
-            await self._skip(signal_id, node_id, reason)
+            await self._skip(signal_id, node_id, reason, signal_codes.SKIP_CONFLICT_BUSY)
             return {"status": "skipped", "reason": reason}
 
         vol = rules.resolve_volume(node, signal.volume, filters, signal.symbol)
@@ -221,7 +223,10 @@ class Dispatcher:
             await self.store.release_exec_lock(node_id, signal.symbol)
             if fut is not None:
                 results.discard(signal_id, node_id)
-            await persist.update_dispatch_result(signal_id, node_id, "failed", {"error": "offline"})
+            await persist.update_dispatch_result(
+                signal_id, node_id, "failed", {"error": "offline"},
+                skip_code=signal_codes.SKIP_UNAVAILABLE,
+            )
             return {"status": "failed", "reason": "offline"}
 
         if wait and fut is not None:
@@ -243,9 +248,18 @@ class Dispatcher:
         # 同步模式：发完即返回，回报由 ws_gateway 异步处理（锁靠 TTL 自动过期）
         return {"status": "sent"}
 
-    async def _skip(self, signal_id: str, node_id: str, reason: Optional[str]) -> None:
-        """记录一次“被过滤跳过”的分发，并推送到后台。"""
-        await persist.record_dispatch(signal_id, node_id, None, "skipped", reason, "skipped")
+    async def _skip(self, signal_id: str, node_id: str, reason: Optional[str],
+                    code: Optional[str] = None) -> None:
+        """记录一次“被过滤跳过”的分发，并推送到后台。
+
+        code：结构化跳过编码（见 signal_codes.SKIP_CODES）。缺省时用中文原因
+        兜底分类一次，保证统计不至于出现「有跳过但没有编码」的空洞。
+        """
+        skip_code = signal_codes.safe_code(code) or signal_codes.classify_skip_reason(reason)
+        await persist.record_dispatch(
+            signal_id, node_id, None, "skipped", reason, "skipped",
+            skip_code=skip_code,
+        )
         await manager.broadcast_admin(
             {"type": "dispatch", "data": {"signal_id": signal_id, "node_id": node_id,
                                           "status": "skipped", "reason": reason}}

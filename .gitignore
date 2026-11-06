@@ -8,6 +8,7 @@ venv/
 *.db-shm
 *.db-wal
 scripts/
+*.log
 test-screenshots/
 
 # Env / secrets

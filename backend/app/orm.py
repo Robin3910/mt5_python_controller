@@ -135,6 +135,22 @@ class User(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     totp_secret: Mapped[str | None] = mapped_column(String(32), nullable=True)
     totp_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 手机号：手机号注册 / 验证码登录的唯一凭据。存归一化后的 E.164（+86xxxxxxxxxxx）。
+    # 存量用户为 NULL（MySQL / SQLite 的唯一索引都允许多个 NULL），因此加列零影响。
+    phone: Mapped[str | None] = mapped_column(String(20), nullable=True, unique=True, index=True)
+    # 是否已通过短信验证：注册路径为 True；管理员手工绑定手机号时为 False
+    # （手工绑定的用户同样可用验证码登录，登录不要求 phone_verified）。
+    phone_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    # —— 个人中心自助维护字段（后加列，存量用户一律 NULL）——
+    # email：联系邮箱，**不参与任何登录流程**（登录凭据是用户名+密码 / 手机号验证码）。
+    #   不设唯一约束 —— 邮箱不作为身份标识，允许重复。
+    email: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # leader_name：带单员对外展示名。为 NULL 时前端回退显示 display_name，
+    #   所以不强制填 —— 不填也不会让带单广场显示不出名字。
+    leader_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # leader_intro：带单员介绍（自由文本）。目前只在个人中心自己可见，
+    #   带单广场暂不公开展示（公开页展示用户自由文本需要内容审核）。
+    leader_intro: Mapped[str | None] = mapped_column(Text, nullable=True)
     # 会话版本：禁用 / 改密 / 重置密码时 +1，签发时写进 JWT 的 ver，旧 token 随即失效
     token_version: Mapped[int] = mapped_column(Integer, default=0)
     # —— 暂停接单（两个市场各自独立，互不影响）——
@@ -238,6 +254,8 @@ class SignalHistory(Base):
     source: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # 信号处理模型：normal（按币种分发，默认）/ strategy（按分组分发）；历史为空按 normal 展示
     model: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    # 整体拒收原因的结构化编码（见 signal_codes.REJECT_CODES）；NULL = 未被拒收
+    reject_code: Mapped[str | None] = mapped_column(String(24), nullable=True, index=True)
 
 
 class SignalDispatch(Base):
@@ -250,6 +268,8 @@ class SignalDispatch(Base):
     decided_vol: Mapped[float | None] = mapped_column(Float, nullable=True)  # 实际决策手数
     gate_result: Mapped[str] = mapped_column(String(16), default="passed")   # passed / skipped
     skip_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 跳过原因的结构化编码（见 signal_codes.SKIP_CODES）；统计一律按它聚合，不解析中文
+    skip_code: Mapped[str | None] = mapped_column(String(24), nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
     retcode: Mapped[int | None] = mapped_column(Integer, nullable=True)      # MT5 返回码
     order_ticket: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -456,6 +476,8 @@ class GroupSignalTask(Base):
     # pending / dispatching / running / done / partial / failed / skipped
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
     skip_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # 主任务级跳过原因的结构化编码（分组禁用 / 无成员 / 无有效节点等）
+    skip_code: Mapped[str | None] = mapped_column(String(24), nullable=True, index=True)
     # —— 策略运行期汇总（各子任务累加）——
     opened_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     total_orders: Mapped[int] = mapped_column(Integer, default=0)
@@ -491,11 +513,16 @@ class GroupTaskDispatch(Base):
     node_id: Mapped[str] = mapped_column(String(32), index=True)
     # 冗余存一份品种：释放节点互斥占位、按品种对账时不必回查主任务
     symbol: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    # 冗余存一份动作（BUY / SELL / CLOSE）：信号中心的统一统计要把两张分发表
+    # UNION 成一张视图，带上它就不必每次统计都 join 主任务表
+    action: Mapped[str | None] = mapped_column(String(8), nullable=True, index=True)
     magic: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
     decided_vol: Mapped[float | None] = mapped_column(Float, nullable=True)
     # pending / sent / opened / running / closing / done / failed / skipped / offline
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
     skip_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # 跳过原因的结构化编码（见 signal_codes.SKIP_CODES）；统计一律按它聚合，不解析中文
+    skip_code: Mapped[str | None] = mapped_column(String(24), nullable=True, index=True)
     retcode: Mapped[int | None] = mapped_column(Integer, nullable=True)
     order_ticket: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     deal: Mapped[int | None] = mapped_column(BigInteger, nullable=True)

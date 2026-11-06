@@ -34,6 +34,7 @@ from .models import (
 from .orm import User
 from .permissions import ADMIN_ROLE_CODE, Principal
 from .redis_store import RedisStore
+from .sms_service import mask_phone, normalize_phone, SmsInvalidPhone
 
 router = APIRouter(prefix="/api/users", tags=["users"])
 
@@ -71,6 +72,9 @@ def _to_user_out(user: User, roles: list[dict], ownership) -> UserOut:
         is_active=bool(user.is_active),
         is_admin=_is_admin_roles(roles),
         totp_enabled=bool(user.totp_enabled and user.totp_secret),
+        # 手机号脱敏展示（完整号码只在库里，不进列表接口）
+        phone=mask_phone(user.phone) if user.phone else None,
+        phone_verified=bool(user.phone_verified),
         roles=[RoleRef(**r) for r in roles],
         node_ids=nodes.get(user.id, []),
         group_count=groups.get(user.id, 0),
@@ -176,7 +180,11 @@ async def update_user(
     store: RedisStore = Depends(get_store),
     p: Principal = Depends(require_admin),
 ):
-    """修改显示名 / 启用状态。禁用即吊销其全部会话；名下分组不会被自动停止。"""
+    """修改显示名 / 启用状态 / 手机号绑定。禁用即吊销其全部会话；名下分组不会被自动停止。
+
+    手机号：传 11 位号码即绑定（phone_verified=False，表示未走短信验证，
+    但该用户**仍可用验证码登录**）；传空串即解绑。
+    """
     user = await _user_or_404(user_id)
     roles = (await rbac_service.roles_by_user()).get(user.id, [])
     deactivating = body.is_active is False and bool(user.is_active)
@@ -185,9 +193,21 @@ async def update_user(
             raise HTTPException(status_code=400, detail="不能禁用自己")
         await _ensure_not_last_admin(user, action="禁用")
     before = _snapshot(user, roles)
-    updated = await user_service.update_user(
-        user.id, display_name=body.display_name, is_active=body.is_active,
-    )
+    phone_arg: Optional[str] = None
+    if body.phone is not None:
+        phone_arg = body.phone.strip()
+        if phone_arg:
+            try:
+                phone_arg = normalize_phone(phone_arg)
+            except SmsInvalidPhone as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        updated = await user_service.update_user(
+            user.id, display_name=body.display_name, is_active=body.is_active,
+            phone=phone_arg,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     if updated is None:
         raise HTTPException(status_code=404, detail="user not found")
     if deactivating:

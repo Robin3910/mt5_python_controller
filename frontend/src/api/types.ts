@@ -370,6 +370,46 @@ export interface CancelPendingRequest {
   magics?: number[] | null
 }
 
+/** 节点主页：一个策略魔术号属于 AI 交易还是带单，以及子任务是否还在跑。 */
+export interface FollowMagicChannel {
+  magic: number
+  market: 'ai' | 'follow' | string
+  template_id: string
+  group_id: string
+  dispatch_id: number
+  active: boolean
+}
+
+/** 频道历史持仓：同一笔仓的开平仓成交收成一行。 */
+export interface FollowClosedPosition {
+  position_id: number
+  symbol: string
+  direction: string
+  volume: number
+  price_open: number
+  price_close: number
+  closed_at: number
+  status: 'tp' | 'sl' | 'closed' | string
+  status_label: string
+  profit: number
+}
+
+export interface FollowChannelsOut {
+  magics: FollowMagicChannel[]
+  ai_history: FollowClosedPosition[]
+  follow_history: FollowClosedPosition[]
+}
+
+export interface FollowChannelCloseResult {
+  status: string
+  node_id: string
+  market: string
+  mode: string
+  closed: number
+  failed: number[]
+  strategies?: { stopped: number; forced: number; total: number }
+}
+
 export interface CancelPendingResult {
   status: 'ok' | 'partial' | 'regenerated' | 'error' | string
   node_id: string
@@ -1481,6 +1521,346 @@ export interface PaginatedSignalEvents {
   page_size: number
 }
 
+/* ══════════════════════════════════════════════════════════════════════
+   信号管理中心（Signal Center）
+   —— 后端 `signal_stats` 是这套口径的唯一实现，前端只展示，不再自己算。
+   ══════════════════════════════════════════════════════════════════════ */
+
+/** 概览总量。
+ *
+ * 注意两套成功率口径不可混用：
+ * - `signal_success_rate`：信号级，分母 = 非拒收信号数
+ * - `dispatch_success_rate`：分发级，分母 = 投递总数
+ */
+export interface SignalCenterTotals {
+  signals: number
+  accepted: number
+  rejected: number
+  /** 去重抑制次数：本期不采集（恒为 0），`duplicate_collected=false` 时前端显示「—」 */
+  duplicate: number
+  duplicate_collected: boolean
+  dispatch_total: number
+  passed: number
+  skipped: number
+  failed: number
+  pending: number
+  signal_success_rate: number
+  dispatch_success_rate: number
+  avg_targets_per_signal: number
+}
+
+export interface SignalStatusCount {
+  status: string
+  count: number
+}
+
+export interface SignalSourceCount {
+  source: string
+  count: number
+}
+
+export interface SignalModelCount {
+  model: string
+  count: number
+}
+
+export interface SignalSymbolCount {
+  symbol: string
+  count: number
+  success_rate: number
+}
+
+/** 拦截原因（按结构化 skip_code 聚合，不解析中文文案） */
+export interface SignalSkipReasonCount {
+  code: string
+  label: string
+  count: number
+}
+
+/** 每日信号量（后端已按 UTC+8 自然日分好，前端不再本地换算） */
+export interface SignalDailyPoint {
+  date: string
+  ts: number
+  signals: number
+  accepted: number
+  failed: number
+  success_rate: number
+}
+
+export interface SignalCenterOverview {
+  window: string
+  from_ts: number | null
+  totals: SignalCenterTotals
+  status_distribution: SignalStatusCount[]
+  by_source: SignalSourceCount[]
+  by_model: SignalModelCount[]
+  by_symbol: SignalSymbolCount[]
+  skip_reasons: SignalSkipReasonCount[]
+  daily: SignalDailyPoint[]
+  updated_at: number
+}
+
+/** 统一信号流里的一条分发明细 */
+export interface SignalStreamDispatch {
+  node_id: string
+  model: string
+  status: string
+  skip_code: string | null
+  skip_label: string | null
+  skip_reason: string | null
+  decided_vol: number | null
+  error: string | null
+}
+
+/** 统一信号流里的一条信号（normal + strategy 混排） */
+export interface SignalStreamItem {
+  signal_id: string
+  received_at: number | null
+  source: string
+  model: string
+  action: string | null
+  symbol: string | null
+  volume: number | null
+  status: string
+  reject_code: string | null
+  reject_label: string | null
+  targets: number
+  done: number
+  skipped: number
+  failed: number
+  /** 端到端耗时（毫秒，服务端时钟） */
+  elapsed_ms: number | null
+  dispatches: SignalStreamDispatch[]
+}
+
+export interface SignalCenterStream {
+  items: SignalStreamItem[]
+  next_cursor: string | null
+}
+
+/** 单条信号明细里的分发明细 */
+export interface SignalDetailDispatch {
+  node_id: string
+  model: string
+  status: string
+  gate_result: string
+  skip_code: string | null
+  skip_label: string | null
+  skip_reason: string | null
+  decided_vol: number | null
+  sent_at: number | null
+  finished_at: number | null
+  /** 节点内排队（仅节点内可比） */
+  queued_ms: number | null
+  /** 券商往返（仅节点内可比） */
+  order_to_fill_ms: number | null
+  error: string | null
+}
+
+/** strategy 链路的主任务摘要 */
+export interface SignalDetailGroupTask {
+  task_id: number
+  group_id: string
+  group_name: string | null
+  strategy_name: string | null
+  status: string
+  skip_code: string | null
+  skip_label: string | null
+  skip_reason: string | null
+  node_count: number
+  total_orders: number
+  total_volume: number
+  /** 口径：group_signal_task.realized_profit，与成交侧净盈亏不可加总 */
+  realized_profit: number
+  opened_at: number | null
+  finished_at: number | null
+}
+
+/** 单条信号的完整明细（含原始 Webhook 载荷） */
+export interface SignalCenterDetail {
+  signal_id: string
+  received_at: number | null
+  source_ip: string | null
+  raw_payload: string | null
+  action: string | null
+  symbol: string | null
+  volume: number | null
+  sl: number | null
+  tp: number | null
+  comment: string | null
+  parsed_ok: boolean
+  dispatch_mode: string | null
+  status: string
+  source: string
+  model: string
+  reject_code: string | null
+  reject_label: string | null
+  dispatches: SignalDetailDispatch[]
+  group_tasks: SignalDetailGroupTask[]
+}
+
+/** 一个节点的命中统计 */
+export interface SignalNodeHit {
+  node_id: string
+  node_name: string
+  signal_count: number
+  dispatch_count: number
+  done: number
+  skipped: number
+  failed: number
+  pending: number
+  success_rate: number
+  /** 端到端时延分位（服务端时钟，跨节点可比） */
+  latency_p50_ms: number | null
+  latency_p90_ms: number | null
+  top_skip_code: string | null
+  top_skip_label: string | null
+  /** 节点内两段耗时：只在同一节点内部可比，不可跨节点比较 */
+  queued_p50_ms: number | null
+  queued_p90_ms: number | null
+  fill_p50_ms: number | null
+  fill_p90_ms: number | null
+}
+
+export interface SignalCenterNodes {
+  items: SignalNodeHit[]
+}
+
+export interface SignalLatencyBucket {
+  p50: number | null
+  p90: number | null
+  samples: number
+  /** server_clock（跨节点可比）/ node_local（仅节点内可比） */
+  scope: string
+  note?: string | null
+}
+
+export interface SignalLatencyEndToEnd extends SignalLatencyBucket {
+  p99: number | null
+}
+
+export interface SignalNodeLatencyRow {
+  node_id: string
+  queued_p50: number | null
+  queued_p90: number | null
+  fill_p50: number | null
+  fill_p90: number | null
+}
+
+export interface SignalSlowNode {
+  node_id: string
+  p50: number | null
+  p90: number | null
+  samples: number
+}
+
+export interface SignalDailyLatencyPoint {
+  date: string
+  ts: number
+  p50: number | null
+  p90: number | null
+  samples: number
+}
+
+export interface SignalCenterLatency {
+  window: string
+  end_to_end: SignalLatencyEndToEnd
+  queued_ms: SignalLatencyBucket
+  order_to_fill_ms: SignalLatencyBucket
+  by_node: SignalNodeLatencyRow[]
+  slow_nodes: SignalSlowNode[]
+  daily: SignalDailyLatencyPoint[]
+  note: string
+}
+
+/** 一个分组的策略任务汇总 */
+export interface SignalStrategyTaskItem {
+  group_id: string
+  group_name: string
+  tasks: number
+  orders: number
+  volume: number
+  /**
+   * 口径：`group_signal_task.realized_profit`（任务收口时节点上报的累计值）。
+   * 与成交侧逐笔净盈亏（deal_stats）**不是同一口径**，两者不可加总。
+   */
+  realized_profit: number
+  statuses: Record<string, number>
+}
+
+export interface SignalStrategyTaskTotals {
+  tasks: number
+  orders: number
+  volume: number
+  realized_profit: number
+}
+
+/** 主任务下的节点子任务 */
+export interface SignalStrategyTaskDispatch {
+  node_id: string
+  status: string
+  skip_code: string | null
+  skip_label: string | null
+  skip_reason: string | null
+  decided_vol: number | null
+  total_orders: number
+  total_volume: number
+  realized_profit: number
+  finish_reason: string | null
+  error: string | null
+  queued_ms: number | null
+  order_to_fill_ms: number | null
+  dispatched_at: number | null
+  finished_at: number | null
+}
+
+/** 一个策略主任务（含子任务明细） */
+export interface SignalStrategyTaskDetail {
+  task_id: number
+  signal_id: string
+  group_id: string
+  group_name: string
+  strategy_name: string | null
+  symbol: string | null
+  action: string | null
+  volume: number | null
+  status: string
+  skip_code: string | null
+  skip_label: string | null
+  skip_reason: string | null
+  node_count: number
+  total_orders: number
+  total_volume: number
+  /** 口径：group_signal_task.realized_profit，与成交侧净盈亏不可加总 */
+  realized_profit: number
+  created_at: number | null
+  opened_at: number | null
+  finished_at: number | null
+  dispatches: SignalStrategyTaskDispatch[]
+}
+
+export interface SignalCenterTasks {
+  items: SignalStrategyTaskItem[]
+  totals: SignalStrategyTaskTotals
+  /** 主任务列表（含子任务），用于从汇总下钻到具体任务 */
+  tasks: SignalStrategyTaskDetail[]
+  /** 明确标注这批盈亏的口径来源 */
+  profit_scope: string
+}
+
+/** 信号中心的统一筛选参数（四个接口共用同一套语义） */
+export interface SignalCenterQuery {
+  window?: string
+  source?: string | null
+  model?: string | null
+  symbol?: string | null
+  action?: string | null
+  status?: string | null
+  node_id?: string | null
+  group_id?: string | null
+  keyword?: string | null
+}
+
 export interface AuditRecord {
   id: number
   ts: number | null
@@ -1577,6 +1957,25 @@ export interface MeInfo {
    */
   follow_paused?: boolean
   ai_follow_paused?: boolean
+  // —— 个人中心自助维护字段 ——
+  /** 联系邮箱，不参与登录，允许重复 */
+  email?: string | null
+  /** 带单员展示名；为空时回退显示 display_name */
+  leader_name?: string | null
+  /** 带单员介绍；目前只在个人中心自己可见 */
+  leader_intro?: string | null
+  /** 绑定的手机号（脱敏 138****8000）；未绑定为 null */
+  phone?: string | null
+  /** 是否已通过短信验证 */
+  phone_verified?: boolean
+}
+
+/** PATCH /api/me/profile 的请求体：字段级「传什么改什么」，传空串表示清空 */
+export interface ProfileUpdate {
+  display_name?: string
+  email?: string
+  leader_name?: string
+  leader_intro?: string
 }
 
 /** 「我的」枢纽页模块卡片 */
@@ -1632,6 +2031,10 @@ export interface UserOut {
   is_active: boolean
   is_admin: boolean
   totp_enabled: boolean
+  /** 绑定的手机号（脱敏：138****8000）；未绑定为 null */
+  phone: string | null
+  /** 是否已通过短信验证（管理员手工绑定时为 false） */
+  phone_verified: boolean
   roles: RoleRef[]
   node_ids: string[]
   group_count: number
@@ -1652,6 +2055,121 @@ export interface UserCreatePayload {
 export interface UserUpdatePayload {
   display_name?: string | null
   is_active?: boolean
+  /** 绑定手机号（11 位）；传空串表示解绑；不传表示不改 */
+  phone?: string | null
+}
+
+// ----------------------------- 手机号注册 / 验证码登录 -----------------------------
+
+/**
+ * 验证码用途：登录与注册**共用**同一种验证码（purpose=auth）。
+ *
+ * 用户从登录入口点「获取验证码」时还不知道自己有没有注册过 —— 如果分两种用途，
+ * 未注册的用户就得收两次短信。校验通过后由服务端返回 next_action 决定走向。
+ */
+export type SmsPurpose = 'auth'
+
+/** 校验通过后的下一步走向（服务端根据该号码是否已注册决定） */
+export type SmsNextAction = 'login' | 'register' | 'pending_approval'
+
+/** GET /api/auth/sms/status：短信服务是否可用（前端据此隐藏验证码入口） */
+export interface SmsStatus {
+  enabled: boolean
+  require_approval: boolean
+  code_ttl_seconds: number
+  send_interval_seconds: number
+  /** 是否启用了阿里云验证码（人机验证） */
+  captcha_enabled: boolean
+  /** 阿里云验证码身份标（前端初始化 SDK 用） */
+  captcha_prefix: string
+  /** 阿里云验证码场景 ID；加密模式下服务端会刻意置空 */
+  captcha_scene_id: string
+  /** 是否处于加密模式（服务端配了 ekey） */
+  captcha_encrypted: boolean
+}
+
+/** GET /api/auth/sms/captcha-scene：人机验证的场景凭据 */
+export interface SmsCaptchaScene {
+  /** 明文场景 ID（加密模式下可能为空） */
+  scene_id: string
+  /** 加密串（加密模式下的短效凭据；非加密模式为空串） */
+  encrypted_scene_id: string
+}
+
+/** POST /api/auth/sms/send 的响应 */
+export interface SmsSendResult {
+  ok: boolean
+  /** 验证码有效期（秒） */
+  expire_in: number
+  /** 重发冷却（秒） */
+  cooldown: number
+}
+
+/** POST /api/auth/sms/verify 的响应 */
+export interface SmsVerifyResult {
+  /** 「手机号已验证」票据（登录与注册两个动作都可用） */
+  ticket: string
+  /** 下一步走向 */
+  next_action: SmsNextAction
+  /** 已注册时的用户名（pending_approval 分支才有） */
+  username?: string | null
+}
+
+/** POST /api/auth/register 的响应 */
+export interface PhoneRegisterResult {
+  ok: boolean
+  /** true = 等待管理员审核（此时没有 token） */
+  pending_approval: boolean
+  user_id: number | null
+  username: string | null
+  token: string | null
+  token_type: string | null
+  requires_2fa: boolean
+}
+
+export interface PhoneRegisterPayload {
+  phone: string
+  ticket: string
+  nickname?: string | null
+  username?: string | null
+  password?: string | null
+}
+
+/** 短信服务配置（管理员配置页；密钥永不回显） */
+export interface SmsConfig {
+  enabled: boolean
+  provider: string
+  endpoint: string
+  sign_name: string
+  template_code: string
+  require_approval: boolean
+  code_ttl_seconds: number
+  send_interval_seconds: number
+  daily_limit_per_phone: number
+  hourly_limit_per_ip: number
+  max_verify_attempts: number
+  /** 全局每日发送上限（0 = 不限） */
+  daily_limit_total: number
+  /** 每 IP 每日发送上限（0 = 不限） */
+  daily_limit_per_ip: number
+  /** 是否启用阿里云验证码（人机验证） */
+  captcha_enabled: boolean
+  /** 阿里云验证码身份标 */
+  captcha_prefix: string
+  /** 阿里云验证码场景 ID */
+  captcha_scene_id: string
+  /** 阿里云验证码服务端 endpoint */
+  captcha_endpoint: string
+  /** 该号码 24h 内发送次数达到该值时要求人机验证（0 = 不触发） */
+  captcha_phone_threshold: number
+  /** 该 IP 1h 内发送次数达到该值时要求人机验证（0 = 不触发） */
+  captcha_ip_threshold: number
+  /** 新注册账号（24h 内）发码是否要求人机验证 */
+  captcha_new_account: boolean
+  /** 今日已发送条数（只读） */
+  today_sent: number
+  /** AccessKey 是否已注入 env（只回显有没有，不回显内容） */
+  credentials_present: boolean
 }
 
 export interface UserNodesResult {

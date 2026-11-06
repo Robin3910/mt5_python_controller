@@ -136,104 +136,98 @@ async function onManualTrigger(payload: {
 </script>
 
 <template>
-  <div class="console-page">
-    <div class="row between page-header">
-      <div class="h1">中控台</div>
-      <div class="row" style="gap: 8px">
-        <span v-if="isDirty" class="tag amber">未保存</span>
-        <span v-if="savedFlag" class="tag green">{{ savedFlag }}</span>
-      </div>
-    </div>
+  <div class="pf-page cv-console-page">
+    <section class="pf-card">
+      <p class="pf-hint cv-console-desc">
+        按品种配置操作中控台：信号到达后按判定结果执行分发，命中拦截时不下发到节点。
+      </p>
 
-    <div class="grid layout-config console-body">
-      <div class="card card-pad span-full console-card">
-        <div class="console-card-head">
-          <strong>多区间方向过滤</strong>
+      <div class="cv-console-body">
+        <FilterRulesEditor v-model="filters" mode="global" @trigger="onManualTrigger" />
+      </div>
+
+      <p v-if="filtersError" class="pf-error cv-console-error">{{ filtersError }}</p>
+
+      <div class="pf-divider"></div>
+
+      <div class="cv-console-foot">
+        <div class="cv-console-status">
+          <span v-if="isDirty" class="pf-pill amber">未保存</span>
+          <span v-else-if="savedFlag" class="pf-pill green">{{ savedFlag }}</span>
+          <span v-else class="pf-hint">过滤规则已与后台同步</span>
         </div>
-        <div class="console-card-scroll">
-          <FilterRulesEditor v-model="filters" mode="global" @trigger="onManualTrigger" />
-        </div>
-        <div class="console-card-foot">
-          <div v-if="filtersError" class="console-card-error">{{ filtersError }}</div>
-          <div class="row">
-            <button class="btn-primary" @click="saveFilters()">保存过滤规则</button>
-          </div>
+        <div class="cv-console-actions">
+          <button type="button" class="pf-btn pf-btn-primary cv-save-btn" @click="saveFilters()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" />
+              <path d="M17 21v-8H7v8M7 3v5h8" />
+            </svg>
+            保存过滤规则
+          </button>
         </div>
       </div>
+    </section>
+
+    <div class="pf-note cv-console-note">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="10" />
+        <path d="M12 16v-4M12 8h.01" />
+      </svg>
+      <p>
+        未登记或取消「启用」的品种信号将被直接拒收（含平仓）；后台手动平仓不受影响。
+        节点手数策略为「跟随中控台」时使用中控台配置的手数。
+      </p>
     </div>
   </div>
 </template>
 
 <style scoped>
-/* 中控台整体：撑满可视区高度，内部 flex 布局，仅规则列表滚动 */
-.console-page {
-  display: flex;
-  flex-direction: column;
-  /* 60px topbar + 24px*2 content padding = 108px */
-  height: calc(100vh - 108px);
-  min-height: 420px;
+/* 版式 1:1 复刻 UI/H5.html 的「操作中控台」tab；
+   卡片 / 按钮 / 分段 / 开关等共用外观见 styles.css 的 pf- 前缀类。 */
+.cv-console-page {
+  max-width: 760px;
 }
 
-.console-body {
-  flex: 1;
-  min-height: 0;
+.cv-console-desc {
+  margin: 0;
 }
 
-/* 卡片撑满 console-body，内部三段式 flex：头 / 滚动区 / 底 */
-.console-card {
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  height: 100%;
+.cv-console-body {
+  margin-top: 16px;
 }
 
-.console-card-head {
-  flex-shrink: 0;
-  padding-bottom: 12px;
-  border-bottom: 1px solid var(--glass-border);
-}
-
-.console-card-scroll {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  /* 让 sticky 工具栏与滚动条对齐，同时保留内部 padding */
-  margin: 12px -8px 0;
-  padding: 0 8px;
-}
-
-.console-card-foot {
-  flex-shrink: 0;
-  padding-top: 12px;
+.cv-console-error {
   margin-top: 12px;
-  border-top: 1px solid var(--glass-border);
+}
+
+.cv-console-foot {
   display: flex;
-  flex-direction: column;
-  gap: 10px;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
 }
 
-.console-card-error {
-  color: var(--red);
-  font-size: 12px;
+.cv-console-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
 }
 
-/* 移动端：视口偏矮时，回退为自然高度，避免可视区被压得太小 */
-@media (max-width: 768px) {
-  .console-page {
-    height: auto;
-    min-height: 0;
-  }
-  .console-body {
-    flex: initial;
-    min-height: 0;
-  }
-  .console-card {
-    height: auto;
-  }
-  .console-card-scroll {
-    overflow-y: visible;
-    margin: 12px 0 0;
-    padding: 0;
-  }
+.cv-console-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.cv-save-btn {
+  height: 38px;
+  padding: 0 24px;
+  font-size: 13px;
+}
+
+.cv-console-note {
+  margin-top: 0;
 }
 </style>

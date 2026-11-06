@@ -4,7 +4,9 @@
 // （trend_indicators），前端不承载任何交易决策。
 // 打开面板后按选定间隔轮询 GET /api/nodes/{id}/trend；改参数会立刻带覆盖项重取一次
 // （后端行情缓存会拦住重复的终端查询），点保存才写入全局配置（全后台共用）。
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import HomeTrendConfig from '@/components/HomeTrendConfig.vue'
 import * as echarts from 'echarts/core'
 import { CandlestickChart, LineChart } from 'echarts/charts'
 import {
@@ -56,10 +58,25 @@ const props = defineProps<{
   online?: boolean
   /** 总览等嵌入场景：只展示得分条，不加载 K 线与参数表单 */
   compact?: boolean
+  /** 首页设计稿外观。与总览 compact、趋势页完整面板分开，不改它们的布局 */
+  home?: boolean
 }>()
 
 const hub = useHubStore()
 const auth = useAuthStore()
+const route = useRoute()
+const router = useRouter()
+const homeConfigOpen = computed(() => props.home && route.query.config === 'trend')
+const showMa5 = ref(true)
+const showMa10 = ref(true)
+const showMa20 = ref(false)
+
+function openHomeConfig(): void {
+  router.push({ name: 'home', query: { config: 'trend' } })
+}
+function closeHomeConfig(): void {
+  router.push({ name: 'home' })
+}
 
 const symbol = ref('')
 const symbolInput = ref('')
@@ -181,18 +198,28 @@ function resetToDefaults(): void {
   Object.assign(form, TREND_DEFAULTS)
 }
 
-async function save(): Promise<void> {
+async function save(): Promise<boolean> {
   saving.value = true
   try {
     const saved = await hub.saveTrendConfig({ ...form })
     Object.assign(form, toTrendForm(saved))
     savedTip.value = '已保存为全局默认参数（所有节点共用）'
     setTimeout(() => (savedTip.value = ''), 2500)
+    return true
   } catch (e) {
     error.value = extractError(e)
+    return false
   } finally {
     saving.value = false
   }
+}
+
+async function saveHomeConfig(): Promise<void> {
+  if (auth.isAdmin) {
+    const ok = await save()
+    if (!ok) return
+  }
+  closeHomeConfig()
 }
 
 // ---------------------------- 格式化 ----------------------------
@@ -234,6 +261,52 @@ const scale = computed(() => {
     bullish,
   }
 })
+
+const HOME_TIMEFRAMES: Record<string, string> = {
+  M1: '1分钟',
+  M5: '5分钟',
+  M15: '15分钟',
+  M30: '30分钟',
+  H1: '1小时',
+  H4: '4小时',
+  D1: '日线',
+  W1: '周线',
+  MN: '月线',
+}
+const homeTimeframe = computed(() => HOME_TIMEFRAMES[cfg.value.timeframe] || cfg.value.timeframe)
+const homeRunLabel = computed(() => {
+  const trend = data.value?.trend
+  if (trend === 'bullish') return '偏多运行'
+  if (trend === 'bearish') return '偏空运行'
+  if (trend === 'neutral') return '中性'
+  if (trend === 'unknown') return '数据不足'
+  return ''
+})
+/** 得分 -100~100 线性映射成多头占比，空头为剩余。未就绪时不填数。 */
+const homeBias = computed(() => {
+  const ready = data.value
+  if (!ready?.ready || !Number.isFinite(ready.score)) return null
+  const score = Math.min(100, Math.max(-100, ready.score))
+  const bull = (score + 100) / 2
+  return { bull, bear: 100 - bull }
+})
+/** 现价相对上一根已收盘 K 线收盘价。 */
+const homeDelta = computed(() => {
+  const ready = data.value
+  if (!ready || ready.bars.length < 2 || !Number.isFinite(ready.price)) return null
+  const prev = ready.bars[ready.bars.length - 2]?.close
+  if (!prev) return null
+  const delta = ready.price - prev
+  return { delta, pct: (delta / prev) * 100 }
+})
+const homeMoveDigits = computed(() => (Math.abs(data.value?.price ?? 0) >= 100 ? 2 : 5))
+
+function fmtHomeMove(value: number, digits: number): string {
+  const abs = Math.abs(value).toFixed(digits)
+  if (value > 0) return `+${abs}`
+  if (value < 0) return `-${abs}`
+  return abs
+}
 
 // ---------------------------- 图表 ----------------------------
 const CHART_COLORS = {
@@ -368,10 +441,129 @@ function buildOption(d: TrendPanelData) {
   }
 }
 
+function sma(closes: number[], period: number): Array<number | null> {
+  return closes.map((_, index) => {
+    if (index < period - 1) return null
+    let sum = 0
+    for (let j = 0; j < period; j++) sum += closes[index - j]
+    return sum / period
+  })
+}
+
+/** 首页 K 线：主图 + MA5/MA10。接口没有成交量，不画量柱。 */
+function buildHomeOption(d: TrendPanelData) {
+  const labels = d.bars.map((b) => barLabel(b.time, d.config.timeframe))
+  const candles = d.bars.map((b) => [b.open, b.close, b.low, b.high])
+  const closes = d.bars.map((b) => b.close)
+  const last = d.price
+  const prev = d.bars.length >= 2 ? d.bars[d.bars.length - 2].close : last
+  const priceText = Math.abs(last) >= 100 ? last.toFixed(2) : last.toFixed(5)
+  return {
+    animation: false,
+    backgroundColor: 'transparent',
+    tooltip: {
+      trigger: 'axis',
+      axisPointer: { type: 'cross' },
+      backgroundColor: 'rgba(12, 18, 32, 0.94)',
+      borderColor: 'rgba(34, 48, 74, 0.9)',
+      textStyle: { color: '#E6EBF4', fontSize: 11 },
+    },
+    grid: { left: 8, right: 8, top: 16, bottom: 24, containLabel: true },
+    xAxis: {
+      type: 'category',
+      data: labels,
+      axisLine: { lineStyle: { color: 'rgba(255,255,255,0.06)' } },
+      axisTick: { show: false },
+      axisLabel: { color: '#5B6B85', fontSize: 10, hideOverlap: true },
+    },
+    yAxis: {
+      scale: true,
+      position: 'right',
+      splitLine: { lineStyle: { color: 'rgba(255,255,255,0.06)', type: 'dashed' } },
+      axisLine: { show: false },
+      axisTick: { show: false },
+      axisLabel: { color: '#5B6B85', fontSize: 10 },
+    },
+    dataZoom: [{ type: 'inside' }],
+    series: [
+      {
+        type: 'candlestick',
+        name: 'K线',
+        data: candles,
+        itemStyle: {
+          color: '#22c55e',
+          color0: '#ef4444',
+          borderColor: '#22c55e',
+          borderColor0: '#ef4444',
+        },
+        markLine: {
+          symbol: 'none',
+          silent: true,
+          data: [{
+            yAxis: last,
+            lineStyle: { color: 'rgba(230,235,244,0.2)', type: 'dashed', width: 1 },
+            label: {
+              show: true,
+              position: 'end',
+              formatter: priceText,
+              color: '#06281a',
+              backgroundColor: last >= prev ? '#34d399' : '#f87171',
+              padding: [2, 6],
+              borderRadius: 4,
+              fontSize: 11,
+            },
+          }],
+        },
+      },
+      ...([
+        showMa5.value ? { name: 'MA5', color: '#eab308', period: 5 } : null,
+        showMa10.value ? { name: 'MA10', color: '#60a5fa', period: 10 } : null,
+        showMa20.value ? { name: 'MA20', color: '#c084fc', period: 20 } : null,
+      ].filter((item): item is { name: string; color: string; period: number } => item != null).map((item) => ({
+        type: 'line',
+        name: item.name,
+        data: sma(closes, item.period),
+        showSymbol: false,
+        lineStyle: { color: item.color, width: 1.4 },
+      }))),
+    ],
+  }
+}
+
+function paintChart(next: TrendPanelData): void {
+  if (!chartEl.value) return
+  if (!chart) {
+    chart = echarts.init(chartEl.value)
+    if (!resizeObserver && typeof ResizeObserver !== 'undefined') {
+      resizeObserver = new ResizeObserver(() => chart?.resize())
+      resizeObserver.observe(chartEl.value)
+    }
+  }
+  if (props.home) chart.setOption(buildHomeOption(next), { replaceMerge: ['series'] })
+  else chart.setOption(buildOption(next))
+}
+
 watch(data, (next) => {
   if (!next || !next.bars.length) return
-  if (!chart && chartEl.value) chart = echarts.init(chartEl.value)
-  chart?.setOption(buildOption(next))
+  paintChart(next)
+})
+
+watch(homeConfigOpen, async (open) => {
+  if (!props.home) return
+  if (open) {
+    resizeObserver?.disconnect()
+    resizeObserver = undefined
+    chart?.dispose()
+    chart = undefined
+    return
+  }
+  await nextTick()
+  if (data.value?.bars.length) paintChart(data.value)
+})
+
+watch([showMa5, showMa10, showMa20], () => {
+  if (!props.home || !data.value?.bars.length) return
+  paintChart(data.value)
 })
 
 onMounted(() => {
@@ -400,7 +592,100 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div :class="{ 'trend-compact': compact }">
+  <div v-if="home" class="home-trend">
+    <HomeTrendConfig
+      v-if="homeConfigOpen"
+      :form="form"
+      :refresh-ms="refreshMs"
+      :ma5="showMa5"
+      :ma10="showMa10"
+      :ma20="showMa20"
+      :saving="saving"
+      :is-admin="auth.isAdmin"
+      :error="error"
+      @update:refresh-ms="refreshMs = $event"
+      @update:ma5="showMa5 = $event"
+      @update:ma10="showMa10 = $event"
+      @update:ma20="showMa20 = $event"
+      @save="saveHomeConfig"
+      @reset="resetToDefaults"
+      @back="closeHomeConfig"
+    />
+    <template v-else>
+    <section class="home-card">
+      <div class="home-card-head">
+        <p class="home-kicker">标的趋势 · 多空值</p>
+        <span v-if="homeRunLabel" class="home-run" :class="data?.trend">
+          <i></i>{{ homeRunLabel }}
+        </span>
+      </div>
+      <div v-if="symbolOptions?.length" class="home-symbols">
+        <button
+          v-for="s in symbolOptions"
+          :key="s"
+          type="button"
+          class="home-sym"
+          :class="{ active: s === symbol }"
+          @click="pickSymbol(s)"
+        >{{ s }}</button>
+      </div>
+      <p v-else class="home-hint">该节点暂无报价与持仓品种。</p>
+
+      <div class="home-price-row">
+        <div>
+          <div class="home-price">{{ fmtPrice(data?.price) }}</div>
+          <div v-if="homeDelta" class="home-delta" :class="homeDelta.delta >= 0 ? 'is-up' : 'is-down'">
+            <span>{{ fmtHomeMove(homeDelta.delta, homeMoveDigits) }}</span>
+            <span class="home-delta-pct">{{ fmtHomeMove(homeDelta.pct, 2) }}%</span>
+          </div>
+        </div>
+        <button type="button" class="home-config-hint" @click="openHomeConfig">
+          权重 / 阈值 / 更新时间<br>请在配置页查看
+        </button>
+      </div>
+
+      <div v-if="homeBias" class="home-bias">
+        <div class="home-bias-top">
+          <span class="is-up">多头 {{ homeBias.bull.toFixed(1) }}</span>
+          <span class="is-down">空头 {{ homeBias.bear.toFixed(1) }}</span>
+        </div>
+        <div class="home-bias-track">
+          <span class="bull" :style="{ width: `${homeBias.bull}%` }"></span>
+          <span class="bear" :style="{ width: `${homeBias.bear}%` }"></span>
+        </div>
+        <div class="home-bias-foot">
+          <span>多空比 {{ homeBias.bull.toFixed(1) }} : {{ homeBias.bear.toFixed(1) }}</span>
+        </div>
+      </div>
+      <p v-else-if="data" class="home-hint">
+        已收盘 K 线只有 {{ data.bar_count }} 根，不足以算出 EMA({{ cfg.ema_period }}) 与
+        RSI({{ cfg.rsi_period }})，请缩短周期或减小指标周期。
+      </p>
+      <p v-else class="home-hint">选择品种后显示趋势得分。</p>
+      <p v-if="!online" class="home-warn">节点当前离线，无法读取实时行情。</p>
+      <p v-else-if="error" class="home-warn">{{ error }}</p>
+    </section>
+
+    <section class="home-card">
+      <div class="home-card-head">
+        <div class="home-kline-title">
+          <span>K线 · {{ data?.symbol || symbol || '—' }}</span>
+          <span v-if="showMa5" class="home-legend"><i class="ma5"></i>MA5</span>
+          <span v-if="showMa10" class="home-legend"><i class="ma10"></i>MA10</span>
+          <span v-if="showMa20" class="home-legend"><i class="ma20"></i>MA20</span>
+        </div>
+        <button type="button" class="home-tf" @click="openHomeConfig">
+          {{ homeTimeframe }}
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M3 17v2h6v-2H3zM3 5v2h10V5H3zm10 16v-2h8v-2h-8v-2h-2v6h2zM7 9v2H3v2h4v2h2V9H7zm14 4v-2H11v2h10zm-6-4h2V7h4V5h-4V3h-2v6z"/></svg>
+        </button>
+      </div>
+      <div ref="chartEl" class="home-chart"></div>
+      <p v-if="!data?.bars?.length" class="home-hint">暂无 K 线数据。</p>
+      <p class="home-kline-note">周期在配置页设置</p>
+    </section>
+    </template>
+  </div>
+  <div v-else :class="{ 'trend-compact': compact }">
 
     <!-- 品种 / 周期 / 刷新 -->
     <div v-if="!compact" class="card card-pad" style="margin-bottom: 16px">
@@ -841,6 +1126,136 @@ onBeforeUnmount(() => {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 14px;
+}
+
+.home-trend { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.home-card {
+  border: 1px solid #1C2740;
+  background: #101828;
+  border-radius: 12px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
+  padding: 16px;
+  min-width: 0;
+}
+.home-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.home-kicker { margin: 0; color: #8B96A8; font-size: 12px; font-weight: 500; }
+.home-run { display: inline-flex; align-items: center; gap: 6px; font-size: 10px; color: #8B96A8; }
+.home-run i { width: 6px; height: 6px; border-radius: 50%; background: #8B96A8; }
+.home-run.bearish { color: #f87171; }
+.home-run.bearish i { background: #ef4444; }
+.home-run.bullish { color: #34d399; }
+.home-run.bullish i { background: #22c55e; }
+.home-symbols {
+  display: flex;
+  gap: 6px;
+  margin-top: 10px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.home-symbols::-webkit-scrollbar { display: none; }
+.home-sym {
+  flex-shrink: 0;
+  border-radius: 8px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  border: 1px solid #22304A;
+  background: #0C1220;
+  color: #8B96A8;
+  backdrop-filter: none;
+}
+.home-sym:hover { color: #E6EBF4; background: #16213A; }
+.home-sym.active,
+.home-sym.active:hover {
+  background: #2563EB;
+  border-color: transparent;
+  color: #fff;
+  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.4);
+}
+.home-price-row {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 14px;
+}
+.home-price {
+  font-size: 36px;
+  line-height: 1;
+  font-weight: 650;
+  color: #E6EBF4;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.03em;
+}
+.home-delta { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.home-delta.is-up { color: #34d399; }
+.home-delta.is-down { color: #f87171; }
+.home-delta-pct { border-radius: 6px; padding: 1px 6px; background: rgba(255, 255, 255, 0.06); }
+.home-config-hint {
+  margin: 0;
+  max-width: 150px;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  text-align: right;
+  color: #4A5568;
+  font-size: 10px;
+  line-height: 1.45;
+  backdrop-filter: none;
+}
+.home-config-hint:hover { background: transparent; color: #8B96A8; }
+.home-bias { margin-top: 16px; }
+.home-bias-top, .home-bias-foot {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.home-bias-foot { margin-top: 6px; color: #5B6B85; }
+.home-bias-track {
+  display: flex;
+  height: 6px;
+  margin-top: 6px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: #0C1220;
+}
+.home-bias-track .bull { background: #22c55e; }
+.home-bias-track .bear { background: #ef4444; }
+.is-up { color: #34d399; }
+.is-down { color: #f87171; }
+.home-hint { margin: 10px 0 0; color: #5B6B85; font-size: 12px; line-height: 1.5; }
+.home-warn { margin: 10px 0 0; color: #fbbf24; font-size: 12px; }
+.home-kline-title { display: flex; align-items: center; gap: 10px; min-width: 0; color: #E6EBF4; font-size: 13px; font-weight: 600; }
+.home-legend { display: inline-flex; align-items: center; gap: 4px; color: #8B96A8; font-size: 11px; font-weight: 500; }
+.home-legend i { width: 12px; height: 2px; border-radius: 2px; }
+.home-legend .ma5 { background: #eab308; }
+.home-legend .ma10 { background: #60a5fa; }
+.home-tf {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  height: 28px;
+  padding: 0 8px;
+  border-radius: 8px;
+  border: 1px solid #22304A;
+  background: #0C1220;
+  color: #8B96A8;
+  font-size: 12px;
+  backdrop-filter: none;
+}
+.home-tf:hover { background: #16213A; color: #E6EBF4; }
+.home-tf svg { width: 14px; height: 14px; }
+.home-legend .ma20 { background: #c084fc; }
+.home-chart { width: 100%; height: 420px; }
+.home-kline-note { margin: 4px 0 0; text-align: right; color: #4A5568; font-size: 10px; }
+@media (max-width: 1023px) {
+  .home-trend { gap: 12px; }
+  .home-card { padding: 12px; }
+  .home-price { font-size: 32px; }
+  .home-chart { height: 300px; }
 }
 
 @media (max-width: 720px) {

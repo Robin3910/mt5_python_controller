@@ -307,3 +307,44 @@ async def test_unknown_scope_falls_back_to_all(store, dispatcher, monkeypatch):
 
     assert res["scope"] == "all"
     assert sent[0]["cmd"]["scope"] == "all"
+
+
+async def test_strategy_scope_stops_only_named_magics(store, monkeypatch):
+    """频道删挂单只停指定魔术号，不能把同节点另一个频道的任务一起停掉。"""
+    sent = _patch_cancel(monkeypatch, [
+        {"success": True, "cancelled": 1, "failed": [], "results": [], "remaining": 0},
+    ])
+    monkeypatch.setattr(pending_api, "_wait_subtasks_settled", _settled_now)
+
+    class _Scoped:
+        def __init__(self):
+            self.all_calls = 0
+            self.magics = None
+
+        async def stop_all_on_node(self, node_id, *, signal_id, reason):
+            self.all_calls += 1
+            return {"stopped": 0, "forced": 0, "total": 0}
+
+        async def stop_magics_on_node(self, node_id, magics, *, signal_id, reason):
+            self.magics = list(magics)
+            return {"stopped": 1, "forced": 0, "total": 1}
+
+    scoped = _Scoped()
+    manager.nodes.setdefault("nd_a", object())
+    try:
+        res = await pending_api.cancel_pending_on_node_route(
+            "nd_a",
+            CancelPendingRequest(scope="strategy", magics=[900000001]),
+            _Req(),
+            store=store,
+            group_dispatcher=scoped,
+            p=_Principal(),
+        )
+    finally:
+        manager.nodes.pop("nd_a", None)
+
+    assert scoped.all_calls == 0
+    assert scoped.magics == [900000001]
+    assert sent[0]["cmd"]["scope"] == "strategy"
+    assert sent[0]["cmd"]["magics"] == [900000001]
+    assert res["strategies"]["stopped"] == 1

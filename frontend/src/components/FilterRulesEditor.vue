@@ -1,9 +1,9 @@
 ﻿<script setup lang="ts">
+// 中控台 / 节点详情共用：按品种配置分发策略、价格区间、允许方向与手数。
+// 样式 1:1 复刻 UI/H5.html 原型（品种卡片 + 区间卡片 + 分段选择 + 开关 + 步进器）。
 import { computed, ref } from 'vue'
-import { ElMessageBox, ElSwitch } from 'element-plus'
-import 'element-plus/es/components/switch/style/css'
+import { ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/message-box/style/css'
-import 'element-plus/theme-chalk/dark/css-vars.css'
 import type {
   FilterDirection,
   FilterRulesConfig,
@@ -21,8 +21,6 @@ import {
 } from '@/utils/filterRules'
 import { confirmAction } from '@/utils/confirm'
 import { useHubStore } from '@/stores/hub'
-import TagSelect from '@/components/TagSelect.vue'
-import type { TagOption } from '@/components/tagOption'
 
 const props = withDefaults(defineProps<{ mode?: 'global' | 'node' }>(), { mode: 'global' })
 
@@ -35,27 +33,25 @@ const hub = useHubStore()
 
 const isGlobal = computed(() => props.mode === 'global')
 
-const DISPATCH_MODE_TAGS: TagOption<'sync' | 'poll'>[] = [
-  { value: 'sync', label: '全员同步' },
-  { value: 'poll', label: '轮询轮转（单节点领取）' },
+/** 分发模式：sync = 全员同步，poll = 轮询轮转（单节点领取） */
+const DISPATCH_MODE_OPTIONS: { key: 'sync' | 'poll'; label: string }[] = [
+  { key: 'sync', label: '全员同步' },
+  { key: 'poll', label: '轮询轮转' },
 ]
-const POSITION_SCOPE_TAGS: TagOption<'symbol' | 'account'>[] = [
-  { value: 'symbol', label: '按品种（同品种无持仓才开）' },
-  { value: 'account', label: '按账户（账户无任何持仓才开）' },
+const POSITION_SCOPE_OPTIONS: { key: 'symbol' | 'account'; label: string }[] = [
+  { key: 'symbol', label: '按品种' },
+  { key: 'account', label: '按账户' },
 ]
-const DEFAULT_ACTION_TAGS: TagOption<'block' | 'pass'>[] = [
-  { value: 'block', label: '拦截 (block)' },
-  { value: 'pass', label: '放行 (pass)' },
+const DEFAULT_ACTION_OPTIONS: { key: 'block' | 'pass'; label: string }[] = [
+  { key: 'block', label: '拦截' },
+  { key: 'pass', label: '放行' },
 ]
-const LOT_ENABLED_TAGS: TagOption<boolean>[] = [
-  { value: false, label: '关闭', tone: 'off' },
-  { value: true, label: '启用', tone: 'on' },
+const LOT_MODE_OPTIONS: { key: 'global' | 'fixed' | 'signal'; label: string }[] = [
+  { key: 'global', label: '跟随中控台' },
+  { key: 'fixed', label: '固定手数' },
+  { key: 'signal', label: '跟随信号' },
 ]
-const LOT_MODE_TAGS: TagOption<'global' | 'fixed' | 'signal'>[] = [
-  { value: 'global', label: '跟随中控台' },
-  { value: 'fixed', label: '固定手数' },
-  { value: 'signal', label: '跟随信号' },
-]
+
 const addingSymbol = ref(false)
 const newSymbol = ref('')
 const filterKeyword = ref('')
@@ -126,7 +122,7 @@ async function confirmAddSymbol(): Promise<void> {
   const key = newSymbol.value.trim().toUpperCase()
   if (!key) return
   if (model.value[key]) {
-    alert(`品种 ${key} 已存在`)
+    ElMessageBox.alert(`品种 ${key} 已存在`, '无法添加', { type: 'warning', confirmButtonText: '知道了' })
     return
   }
   const label = isGlobal.value ? '过滤规则' : '分发配置'
@@ -182,16 +178,20 @@ async function removeInterval(symbol: string, index: number): Promise<void> {
 
 async function loadExample(): Promise<void> {
   if (!isGlobal.value) return
-  if (Object.keys(model.value).length && !(await confirmAction('载入示例将覆盖当前配置，是否继续？', '确认载入示例'))) return
+  if (
+    Object.keys(model.value).length &&
+    !(await confirmAction('载入示例将覆盖当前配置，是否继续？', '确认载入示例'))
+  )
+    return
   model.value = exampleFilterRules()
 }
 
-function setAllowBuy(symbol: string, value: string | number | boolean): void {
-  updateRule(symbol, { allow_buy: Boolean(value) })
+function setAllowBuy(symbol: string, value: boolean): void {
+  updateRule(symbol, { allow_buy: value })
 }
 
-function setAllowSell(symbol: string, value: string | number | boolean): void {
-  updateRule(symbol, { allow_sell: Boolean(value) })
+function setAllowSell(symbol: string, value: boolean): void {
+  updateRule(symbol, { allow_sell: value })
 }
 
 /** 关闭「启用全局手数」前检查是否有节点仍跟随中控台。 */
@@ -202,9 +202,7 @@ async function setLotEnabled(symbol: string, enabled: boolean): Promise<void> {
     if (dependents.length) {
       const shown = dependents.slice(0, 5).join('、')
       const suffix =
-        dependents.length > 5
-          ? `（${shown} 等共 ${dependents.length} 个节点）`
-          : `（${shown}）`
+        dependents.length > 5 ? `（${shown} 等共 ${dependents.length} 个节点）` : `（${shown}）`
       await ElMessageBox.alert(
         `${symbol}：以下节点手数策略为「跟随中控台」，无法关闭全局手数${suffix}\n\n请先将这些节点改为「固定手数」或「跟随信号」后再关闭。`,
         '无法关闭全局手数',
@@ -216,19 +214,16 @@ async function setLotEnabled(symbol: string, enabled: boolean): Promise<void> {
   updateRule(symbol, { lot_enabled: enabled })
 }
 
-function setFollowSync(symbol: string, value: string | number | boolean): void {
-  updateNodeRule(symbol, { follow_sync: Boolean(value) })
+function setFollowSync(symbol: string, value: boolean): void {
+  updateNodeRule(symbol, { follow_sync: value })
 }
 
-function setFollowPoll(symbol: string, value: string | number | boolean): void {
-  updateNodeRule(symbol, { follow_poll: Boolean(value) })
+function setFollowPoll(symbol: string, value: boolean): void {
+  updateNodeRule(symbol, { follow_poll: value })
 }
 
 /** 节点手数策略改为「跟随中控台」前检查中控台是否已启用全局手数。 */
-async function setLotMode(
-  symbol: string,
-  mode: 'global' | 'fixed' | 'signal',
-): Promise<void> {
+async function setLotMode(symbol: string, mode: 'global' | 'fixed' | 'signal'): Promise<void> {
   if (mode === 'global') {
     if (!Object.keys(hub.filters).length) await hub.fetchConfig()
     const globalRules = parseFilterRules(hub.filters)
@@ -250,6 +245,14 @@ async function setLotMode(
     }
   }
   updateNodeRule(symbol, { lot_mode: mode })
+}
+
+/** 全局手数步进：每次 0.01，范围 [0.01, 1] */
+function stepLot(symbol: string, delta: number): void {
+  const rule = (model.value as FilterRulesConfig)[symbol]
+  if (!rule) return
+  const next = Math.min(1, Math.max(0.01, Math.round((Number(rule.lot) + delta) * 100) / 100))
+  updateRule(symbol, { lot: next })
 }
 
 // 手动触发信号：弹窗确认并可自定义手数。
@@ -278,7 +281,7 @@ async function manualTrigger(symbol: string, action: 'BUY' | 'SELL'): Promise<vo
     return // 用户取消
   }
   if (!(volume > 0)) {
-    alert('手数必须大于 0')
+    ElMessageBox.alert('手数必须大于 0', '无法触发', { type: 'warning', confirmButtonText: '知道了' })
     return
   }
   emit('trigger', { symbol, action, volume })
@@ -289,368 +292,452 @@ defineExpose({ loadExample })
 
 <template>
   <div class="filter-editor">
-    <div class="row between filter-toolbar">
-      <p v-if="isGlobal" class="muted filter-hint">
-        按品种设置分发策略、价格区间、允许方向与全局手数。未登记或取消「启用」的品种信号将被直接拒收（含平仓）；后台手动平仓不受影响。节点手数策略为「跟随中控台」时使用此处配置的手数。
-      </p>
-      <p v-else class="muted filter-hint">
-        按品种配置该节点的分发参与、手数策略与轮询顺序。未配置品种将回退节点默认策略（固定 0.01、轮询序 0）。
-      </p>
-      <div class="row filter-toolbar-actions">
-        <div v-if="totalSymbolCount > 0" class="filter-symbol-search">
-          <svg class="filter-symbol-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-            <circle cx="11" cy="11" r="7" />
-            <path d="m20 20-3.5-3.5" stroke-linecap="round" />
-          </svg>
-          <input
-            v-model="filterKeyword"
-            class="filter-symbol-search-input"
-            type="search"
-            :placeholder="`筛选品种（共 ${totalSymbolCount}）`"
-            @keyup.esc="clearFilterKeyword"
-          />
-          <button
-            v-if="hasKeyword"
-            type="button"
-            class="filter-symbol-search-clear"
-            aria-label="清除筛选"
-            @click="clearFilterKeyword"
-          >×</button>
-          <span v-if="hasKeyword" class="filter-symbol-search-count">
-            {{ visibleSymbolCount }} / {{ totalSymbolCount }}
-          </span>
-        </div>
-        <button v-if="isGlobal" type="button" class="btn-sm btn-ghost" @click="loadExample">载入示例</button>
-        <button type="button" class="btn-sm btn-primary" @click="addingSymbol = true">+ 添加品种</button>
+    <!-- 工具栏：搜索 / 载入示例 / 添加品种 -->
+    <div class="filter-toolbar">
+      <div class="filter-symbol-search">
+        <svg class="filter-symbol-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+          <circle cx="11" cy="11" r="7" />
+          <path d="m20 20-3.5-3.5" stroke-linecap="round" />
+        </svg>
+        <input
+          v-model="filterKeyword"
+          class="filter-symbol-search-input"
+          type="search"
+          :placeholder="`筛选品种（共 ${totalSymbolCount}）`"
+          @keyup.esc="clearFilterKeyword"
+        />
+        <button
+          v-if="hasKeyword"
+          type="button"
+          class="filter-symbol-search-clear"
+          aria-label="清除筛选"
+          @click="clearFilterKeyword"
+        >
+          ×
+        </button>
+        <span v-if="hasKeyword" class="filter-symbol-search-count">
+          {{ visibleSymbolCount }} / {{ totalSymbolCount }}
+        </span>
+      </div>
+      <div class="filter-toolbar-actions">
+        <button v-if="isGlobal" type="button" class="pf-btn" @click="loadExample">载入示例</button>
+        <button type="button" class="pf-btn pf-btn-primary" @click="addingSymbol = true">添加品种</button>
       </div>
     </div>
 
-    <div v-if="addingSymbol" class="filter-add-symbol card card-pad">
-      <div class="form-grid two">
-        <div>
-          <label>品种代码</label>
-          <input v-model="newSymbol" placeholder="如 XAUUSD" @keyup.enter="confirmAddSymbol" />
-        </div>
-        <div class="row" style="align-items: flex-end; gap: 8px">
-          <button type="button" class="btn-primary btn-sm" @click="confirmAddSymbol">确认添加</button>
-          <button type="button" class="btn-sm btn-ghost" @click="cancelAddSymbol">取消</button>
-        </div>
+    <!-- 添加品种 -->
+    <div v-if="addingSymbol" class="filter-add-row">
+      <div class="filter-add-input">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+          <path d="M3 3v18h18" />
+          <path d="m19 9-5 5-4-4-3 3" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+        <input
+          v-model="newSymbol"
+          type="text"
+          placeholder="输入品种代码，如 XAUUSD"
+          @keyup.enter="confirmAddSymbol"
+        />
       </div>
+      <button type="button" class="pf-btn pf-btn-primary" @click="confirmAddSymbol">添加品种</button>
+      <button type="button" class="pf-btn" @click="cancelAddSymbol">取消</button>
     </div>
 
+    <!-- ── 全局模式：中控台 ── -->
     <template v-if="isGlobal">
-      <div v-if="!totalSymbolCount" class="filter-empty muted">
+      <div v-if="!totalSymbolCount" class="pf-empty">
         尚未配置任何品种。点击「添加品种」开始，或「载入示例」查看 XAUUSD 示范。
       </div>
-      <div v-else-if="!globalSymbolList.length" class="filter-empty muted">
+      <div v-else-if="!globalSymbolList.length" class="pf-empty">
         无匹配「{{ filterKeyword }}」的品种。
-        <button type="button" class="btn-sm btn-ghost" style="margin-left: 8px" @click="clearFilterKeyword">清除筛选</button>
+        <button type="button" class="pf-btn pf-btn-mini" @click="clearFilterKeyword">清除筛选</button>
       </div>
 
-      <div v-for="{ symbol, rule } in globalSymbolList" :key="symbol" class="filter-symbol-card card card-pad">
-        <div class="row between filter-symbol-head">
-          <div class="row filter-symbol-switches" style="gap: 10px; flex-wrap: wrap">
-            <strong class="filter-symbol-name">{{ symbol }}</strong>
-            <label class="filter-enabled">
-              <input
-                type="checkbox"
-                :checked="rule.enabled"
-                @change="updateRule(symbol, { enabled: ($event.target as HTMLInputElement).checked })"
-              />
-              启用
-            </label>
-            <div class="filter-dir-switch">
-              <span class="filter-switch-label">允许做多 (BUY)</span>
-              <el-switch :model-value="rule.allow_buy" @change="setAllowBuy(symbol, $event)" />
-            </div>
-            <div class="filter-dir-switch">
-              <span class="filter-switch-label">允许做空 (SELL)</span>
-              <el-switch :model-value="rule.allow_sell" @change="setAllowSell(symbol, $event)" />
-            </div>
+      <article v-for="{ symbol, rule } in globalSymbolList" :key="symbol" class="filter-symbol">
+        <!-- 品种头 -->
+        <header class="filter-symbol-head">
+          <div class="filter-symbol-title">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <path d="m12 3 2.9 5.9 6.5.9-4.7 4.6 1.1 6.5L12 17.8 6.2 20.9l1.1-6.5L2.6 9.8l6.5-.9Z" stroke-linejoin="round" />
+            </svg>
+            <span class="filter-symbol-name">{{ symbol }}</span>
+            <span v-if="!rule.enabled" class="pf-pill grey">已停用</span>
           </div>
-          <div class="row filter-symbol-actions">
-            <span class="filter-manual-label">手动触发</span>
-            <button type="button" class="btn-sm btn-manual btn-manual-buy" @click="manualTrigger(symbol, 'BUY')">BUY</button>
-            <button type="button" class="btn-sm btn-manual btn-manual-sell" @click="manualTrigger(symbol, 'SELL')">SELL</button>
-            <button type="button" class="btn-sm btn-ghost" @click="removeSymbol(symbol)">删除品种</button>
+          <div class="filter-symbol-actions">
+            <button type="button" class="pf-btn pf-btn-mini" @click="removeSymbol(symbol)">删除</button>
+          </div>
+        </header>
+
+        <!-- 方向规则 -->
+        <div class="filter-section">
+          <p class="pf-section-title"><span class="pf-bar"></span>方向规则</p>
+          <div class="filter-switch-grid">
+            <div class="pf-switch-row">
+              <span class="pf-switch-label">启用该品种</span>
+              <button
+                type="button"
+                role="switch"
+                :aria-checked="rule.enabled"
+                class="pf-switch"
+                :class="{ on: rule.enabled }"
+                @click="updateRule(symbol, { enabled: !rule.enabled })"
+              ></button>
+            </div>
+            <div class="pf-switch-row">
+              <span class="pf-switch-label">允许做多 (BUY)</span>
+              <button
+                type="button"
+                role="switch"
+                :aria-checked="rule.allow_buy"
+                class="pf-switch"
+                :class="{ on: rule.allow_buy }"
+                @click="setAllowBuy(symbol, !rule.allow_buy)"
+              ></button>
+            </div>
+            <div class="pf-switch-row">
+              <span class="pf-switch-label">允许做空 (SELL)</span>
+              <button
+                type="button"
+                role="switch"
+                :aria-checked="rule.allow_sell"
+                class="pf-switch"
+                :class="{ on: rule.allow_sell }"
+                @click="setAllowSell(symbol, !rule.allow_sell)"
+              ></button>
+            </div>
           </div>
         </div>
 
-        <div class="form-grid two" style="margin-top: 12px">
-          <div>
-            <label>分发模式</label>
-            <TagSelect
-              :model-value="rule.dispatch_mode"
-              :options="DISPATCH_MODE_TAGS"
-              aria-label="分发模式"
-              @change="updateRule(symbol, { dispatch_mode: $event })"
-            />
+        <!-- 分发设置 -->
+        <div class="filter-section">
+          <p class="pf-section-title"><span class="pf-bar"></span>分发设置</p>
+          <div class="filter-field">
+            <span class="pf-label">分发模式</span>
+            <div class="pf-seg">
+              <button
+                v-for="opt in DISPATCH_MODE_OPTIONS"
+                :key="opt.key"
+                type="button"
+                class="pf-seg-item"
+                :class="{ active: rule.dispatch_mode === opt.key }"
+                @click="updateRule(symbol, { dispatch_mode: opt.key })"
+              >
+                {{ opt.label }}
+              </button>
+            </div>
           </div>
-          <div>
-            <label>持仓判定范围</label>
-            <TagSelect
-              :model-value="rule.position_scope"
-              :options="POSITION_SCOPE_TAGS"
-              aria-label="持仓判定范围"
-              @change="updateRule(symbol, { position_scope: $event })"
-            />
+          <div class="filter-field">
+            <span class="pf-label">持仓判定范围</span>
+            <div class="pf-seg">
+              <button
+                v-for="opt in POSITION_SCOPE_OPTIONS"
+                :key="opt.key"
+                type="button"
+                class="pf-seg-item"
+                :class="{ active: rule.position_scope === opt.key }"
+                @click="updateRule(symbol, { position_scope: opt.key })"
+              >
+                {{ opt.label }}
+              </button>
+            </div>
           </div>
-          <div>
-            <label>默认动作（价格不在任何区间内）</label>
-            <TagSelect
-              :model-value="rule.default_action"
-              :options="DEFAULT_ACTION_TAGS"
-              aria-label="默认动作"
-              @change="updateRule(symbol, { default_action: $event })"
-            />
-          </div>
-          <div>
-            <label>启用全局手数</label>
-            <TagSelect
-              :model-value="rule.lot_enabled"
-              :options="LOT_ENABLED_TAGS"
-              aria-label="启用全局手数"
-              @change="setLotEnabled(symbol, $event)"
-            />
-          </div>
-          <div>
-            <label>全局手数</label>
-            <input
-              :value="rule.lot"
-              type="number"
-              step="0.01"
-              min="0.01"
-              :disabled="!rule.lot_enabled"
-              @input="updateRule(symbol, { lot: Number(($event.target as HTMLInputElement).value) })"
-            />
+          <div class="filter-field">
+            <span class="pf-label">默认动作（价格不在任何区间内）</span>
+            <div class="pf-seg">
+              <button
+                v-for="opt in DEFAULT_ACTION_OPTIONS"
+                :key="opt.key"
+                type="button"
+                class="pf-seg-item"
+                :class="{ active: rule.default_action === opt.key, danger: opt.key === 'block', success: opt.key === 'pass' }"
+                @click="updateRule(symbol, { default_action: opt.key })"
+              >
+                {{ opt.label }}
+              </button>
+            </div>
           </div>
         </div>
 
-        <div class="filter-intervals">
-          <div class="row between" style="margin: 14px 0 8px">
-            <span class="muted" style="font-size: 12px">价格区间列表</span>
-            <button type="button" class="btn-sm btn-ghost" @click="addInterval(symbol)">+ 添加区间</button>
+        <!-- 价格区间 -->
+        <div class="filter-section">
+          <div class="pf-section-head">
+            <p class="pf-section-title"><span class="pf-bar"></span>价格区间</p>
+            <button type="button" class="pf-btn pf-btn-mini" @click="addInterval(symbol)">添加区间</button>
           </div>
 
-          <div v-if="!rule.intervals.length" class="muted" style="font-size: 12px; padding: 8px 0">
+          <p v-if="!rule.intervals.length" class="pf-hint filter-empty-line">
             暂无区间。添加后，仅当价格落在区间内才会按允许方向过滤。
-          </div>
+          </p>
 
-          <div v-else class="table-scroll desktop-only">
-            <table class="filter-interval-table">
-              <thead>
-                <tr>
-                  <th>价格下限</th>
-                  <th>价格上限</th>
-                  <th>允许方向</th>
-                  <th class="right">操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr v-for="(iv, idx) in rule.intervals" :key="idx">
-                  <td>
-                    <input
-                      :value="iv.low"
-                      type="number"
-                      step="any"
-                      class="filter-num-input"
-                      @input="updateInterval(symbol, idx, { low: Number(($event.target as HTMLInputElement).value) })"
-                    />
-                  </td>
-                  <td>
-                    <input
-                      :value="iv.high"
-                      type="number"
-                      step="any"
-                      class="filter-num-input"
-                      @input="updateInterval(symbol, idx, { high: Number(($event.target as HTMLInputElement).value) })"
-                    />
-                  </td>
-                  <td>
-                    <div class="row filter-dir-row">
-                      <label class="filter-dir">
-                        <input
-                          type="checkbox"
-                          :checked="iv.allow.includes('BUY')"
-                          @change="toggleDirection(symbol, idx, 'BUY', ($event.target as HTMLInputElement).checked)"
-                        />
-                        做多 (BUY)
-                      </label>
-                      <label class="filter-dir">
-                        <input
-                          type="checkbox"
-                          :checked="iv.allow.includes('SELL')"
-                          @change="toggleDirection(symbol, idx, 'SELL', ($event.target as HTMLInputElement).checked)"
-                        />
-                        做空 (SELL)
-                      </label>
-                    </div>
-                  </td>
-                  <td class="right">
-                    <button type="button" class="btn-sm btn-ghost" @click="removeInterval(symbol, idx)">删除</button>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
+          <div v-for="(iv, idx) in rule.intervals" :key="idx" class="filter-range">
+            <div class="filter-range-head">
+              <p class="filter-range-title">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                  <path d="m7 8 4 4-4 4M13 16h4" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+                区间 {{ idx + 1 }}
+                <span class="filter-range-desc">· 价格落入区间时按方向规则执行</span>
+              </p>
+              <button type="button" class="filter-range-del" @click="removeInterval(symbol, idx)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                  <path d="M18 6 6 18M6 6l12 12" stroke-linecap="round" />
+                </svg>
+                移除区间
+              </button>
+            </div>
 
-          <div v-if="rule.intervals.length" class="mobile-only list-cards">
-            <div v-for="(iv, idx) in rule.intervals" :key="idx" class="list-card-nested">
-              <div class="list-field">
-                <span class="k">价格下限</span>
+            <div class="filter-range-grid">
+              <label class="filter-range-field">
+                <span class="pf-label">价格下限</span>
                 <input
                   :value="iv.low"
                   type="number"
                   step="any"
+                  class="pf-input filter-num-input"
                   @input="updateInterval(symbol, idx, { low: Number(($event.target as HTMLInputElement).value) })"
                 />
-              </div>
-              <div class="list-field">
-                <span class="k">价格上限</span>
+              </label>
+              <label class="filter-range-field">
+                <span class="pf-label">价格上限</span>
                 <input
                   :value="iv.high"
                   type="number"
                   step="any"
+                  class="pf-input filter-num-input"
                   @input="updateInterval(symbol, idx, { high: Number(($event.target as HTMLInputElement).value) })"
                 />
+              </label>
+            </div>
+
+            <div class="filter-range-switches">
+              <div class="pf-switch-row">
+                <span class="pf-switch-label">做多 (BUY)</span>
+                <button
+                  type="button"
+                  role="switch"
+                  :aria-checked="iv.allow.includes('BUY')"
+                  class="pf-switch"
+                  :class="{ on: iv.allow.includes('BUY') }"
+                  @click="toggleDirection(symbol, idx, 'BUY', !iv.allow.includes('BUY'))"
+                ></button>
               </div>
-              <div class="list-field">
-                <span class="k">允许方向</span>
-                <div class="row filter-dir-row">
-                  <label class="filter-dir">
-                    <input
-                      type="checkbox"
-                      :checked="iv.allow.includes('BUY')"
-                      @change="toggleDirection(symbol, idx, 'BUY', ($event.target as HTMLInputElement).checked)"
-                    />
-                    做多
-                  </label>
-                  <label class="filter-dir">
-                    <input
-                      type="checkbox"
-                      :checked="iv.allow.includes('SELL')"
-                      @change="toggleDirection(symbol, idx, 'SELL', ($event.target as HTMLInputElement).checked)"
-                    />
-                    做空
-                  </label>
-                </div>
-              </div>
-              <div class="list-card-actions">
-                <button type="button" class="btn-sm btn-ghost" @click="removeInterval(symbol, idx)">删除区间</button>
+              <div class="pf-switch-row">
+                <span class="pf-switch-label">做空 (SELL)</span>
+                <button
+                  type="button"
+                  role="switch"
+                  :aria-checked="iv.allow.includes('SELL')"
+                  class="pf-switch"
+                  :class="{ on: iv.allow.includes('SELL') }"
+                  @click="toggleDirection(symbol, idx, 'SELL', !iv.allow.includes('SELL'))"
+                ></button>
               </div>
             </div>
           </div>
         </div>
-      </div>
+
+        <!-- 全局手数 -->
+        <div class="filter-section">
+          <p class="pf-section-title"><span class="pf-bar"></span>全局手数</p>
+          <div class="pf-switch-row filter-lot-switch">
+            <span class="pf-switch-label">启用全局手数</span>
+            <button
+              type="button"
+              role="switch"
+              :aria-checked="rule.lot_enabled"
+              class="pf-switch"
+              :class="{ on: rule.lot_enabled }"
+              @click="setLotEnabled(symbol, !rule.lot_enabled)"
+            ></button>
+          </div>
+          <div class="filter-field">
+            <span class="pf-label">默认开仓手数</span>
+            <div class="pf-stepper">
+              <button type="button" class="pf-stepper-btn" :disabled="!rule.lot_enabled" @click="stepLot(symbol, -0.01)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                  <path d="M5 12h14" stroke-linecap="round" />
+                </svg>
+              </button>
+              <input
+                :value="rule.lot"
+                type="number"
+                step="0.01"
+                min="0.01"
+                max="1"
+                class="pf-stepper-input"
+                :disabled="!rule.lot_enabled"
+                @input="updateRule(symbol, { lot: Number(($event.target as HTMLInputElement).value) })"
+              />
+              <button type="button" class="pf-stepper-btn" :disabled="!rule.lot_enabled" @click="stepLot(symbol, 0.01)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                  <path d="M12 5v14M5 12h14" stroke-linecap="round" />
+                </svg>
+              </button>
+            </div>
+          </div>
+          <p class="pf-hint">节点手数策略为「跟随中控台」时使用此处配置的手数。</p>
+        </div>
+
+        <!-- 手动触发 -->
+        <div class="filter-section filter-section-last">
+          <p class="pf-section-title"><span class="pf-bar"></span>手动触发</p>
+          <div class="filter-manual">
+            <button type="button" class="pf-btn pf-btn-buy" @click="manualTrigger(symbol, 'BUY')">BUY</button>
+            <button type="button" class="pf-btn pf-btn-sell" @click="manualTrigger(symbol, 'SELL')">SELL</button>
+          </div>
+        </div>
+      </article>
     </template>
 
+    <!-- ── 节点模式：节点详情「按币种配置」── -->
     <template v-else>
-      <div v-if="!totalSymbolCount" class="filter-empty muted">
+      <div v-if="!totalSymbolCount" class="pf-empty">
         尚未配置任何品种。点击「添加品种」为该节点设置各币种的分发、手数与轮询顺序。
       </div>
-      <div v-else-if="!nodeSymbolList.length" class="filter-empty muted">
+      <div v-else-if="!nodeSymbolList.length" class="pf-empty">
         无匹配「{{ filterKeyword }}」的品种。
-        <button type="button" class="btn-sm btn-ghost" style="margin-left: 8px" @click="clearFilterKeyword">清除筛选</button>
+        <button type="button" class="pf-btn pf-btn-mini" @click="clearFilterKeyword">清除筛选</button>
       </div>
 
-      <div v-for="{ symbol, rule } in nodeSymbolList" :key="symbol" class="filter-symbol-card card card-pad">
-        <div class="row between filter-symbol-head">
-          <div class="row filter-symbol-switches" style="gap: 10px; flex-wrap: wrap">
-            <strong class="filter-symbol-name">{{ symbol }}</strong>
-            <div class="filter-dir-switch">
-              <span class="filter-switch-label">参与同步</span>
-              <el-switch :model-value="rule.follow_sync" @change="setFollowSync(symbol, $event)" />
+      <article v-for="{ symbol, rule } in nodeSymbolList" :key="symbol" class="filter-symbol">
+        <header class="filter-symbol-head">
+          <div class="filter-symbol-title">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <path d="m12 3 2.9 5.9 6.5.9-4.7 4.6 1.1 6.5L12 17.8 6.2 20.9l1.1-6.5L2.6 9.8l6.5-.9Z" stroke-linejoin="round" />
+            </svg>
+            <span class="filter-symbol-name">{{ symbol }}</span>
+          </div>
+          <div class="filter-symbol-actions">
+            <button type="button" class="pf-btn pf-btn-mini" @click="removeSymbol(symbol)">删除</button>
+          </div>
+        </header>
+
+        <div class="filter-section">
+          <p class="pf-section-title"><span class="pf-bar"></span>分发参与</p>
+          <div class="filter-switch-grid">
+            <div class="pf-switch-row">
+              <span class="pf-switch-label">参与同步</span>
+              <button
+                type="button"
+                role="switch"
+                :aria-checked="rule.follow_sync"
+                class="pf-switch"
+                :class="{ on: rule.follow_sync }"
+                @click="setFollowSync(symbol, !rule.follow_sync)"
+              ></button>
             </div>
-            <div class="filter-dir-switch">
-              <span class="filter-switch-label">参与轮询</span>
-              <el-switch :model-value="rule.follow_poll" @change="setFollowPoll(symbol, $event)" />
+            <div class="pf-switch-row">
+              <span class="pf-switch-label">参与轮询</span>
+              <button
+                type="button"
+                role="switch"
+                :aria-checked="rule.follow_poll"
+                class="pf-switch"
+                :class="{ on: rule.follow_poll }"
+                @click="setFollowPoll(symbol, !rule.follow_poll)"
+              ></button>
             </div>
           </div>
-          <button type="button" class="btn-sm btn-ghost" @click="removeSymbol(symbol)">删除品种</button>
         </div>
-        <div class="form-grid three" style="margin-top: 12px">
-          <div>
-            <label>手数策略</label>
-            <TagSelect
-              :model-value="rule.lot_mode"
-              :options="LOT_MODE_TAGS"
-              aria-label="手数策略"
-              @change="setLotMode(symbol, $event)"
-            />
+
+        <div class="filter-section filter-section-last">
+          <p class="pf-section-title"><span class="pf-bar"></span>手数与顺序</p>
+          <div class="filter-field">
+            <span class="pf-label">手数策略</span>
+            <div class="pf-seg">
+              <button
+                v-for="opt in LOT_MODE_OPTIONS"
+                :key="opt.key"
+                type="button"
+                class="pf-seg-item"
+                :class="{ active: rule.lot_mode === opt.key }"
+                @click="setLotMode(symbol, opt.key)"
+              >
+                {{ opt.label }}
+              </button>
+            </div>
           </div>
-          <div>
-            <label>固定手数</label>
+          <div class="filter-field">
+            <span class="pf-label">固定手数</span>
             <input
               :value="rule.lot ?? ''"
               type="number"
               step="0.01"
+              class="pf-input filter-num-input"
               :disabled="rule.lot_mode !== 'fixed'"
               @input="updateNodeRule(symbol, { lot: Number(($event.target as HTMLInputElement).value) })"
             />
           </div>
-          <div>
-            <label>轮询初始顺序（越小越先轮到）</label>
+          <div class="filter-field">
+            <span class="pf-label">轮询初始顺序（越小越先轮到）</span>
             <input
               :value="rule.poll_order"
               type="number"
               step="1"
+              class="pf-input filter-num-input"
               @input="updateNodeRule(symbol, { poll_order: Number(($event.target as HTMLInputElement).value) })"
             />
           </div>
         </div>
-      </div>
+      </article>
     </template>
   </div>
 </template>
 
 <style scoped>
-.filter-editor { display: flex; flex-direction: column; gap: 12px; }
-.filter-hint { font-size: 12px; margin: 0; flex: 1; min-width: 200px; }
-/* 工具栏 sticky 到滚动容器顶部；无滚动容器时也无副作用 */
-.filter-toolbar {
-  align-items: flex-start;
+/* 版式 1:1 复刻 UI/H5.html 原型；
+   卡片 / 分段 / 开关 / 步进器等共用外观见 styles.css 的 pf- 前缀类。 */
+.filter-editor {
+  display: flex;
+  flex-direction: column;
   gap: 12px;
-  position: sticky;
-  top: 0;
-  z-index: 5;
-  padding: 10px 14px 12px;
-  /* 实心背景，避免 sticky 时下方卡片透视重叠；border + shadow 与内容分层 */
-  background: var(--bg-soft);
-  border-bottom: 1px solid var(--glass-border);
-  box-shadow: 0 6px 10px -8px rgba(0, 0, 0, 0.45);
 }
-.filter-toolbar-actions { flex-shrink: 0; }
 
-/* 品种筛选输入框 */
+/* ── 工具栏 ── */
+.filter-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.filter-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
 .filter-symbol-search {
   position: relative;
   display: inline-flex;
   align-items: center;
   min-width: 200px;
+  flex: 1 1 220px;
+  max-width: 320px;
 }
 .filter-symbol-search-icon {
   position: absolute;
   left: 10px;
   width: 14px;
   height: 14px;
-  color: var(--muted);
+  color: var(--pf-dim);
   pointer-events: none;
 }
 .filter-symbol-search-input {
   width: 100%;
-  padding: 6px 60px 6px 30px;
+  height: 32px;
+  padding: 0 60px 0 30px;
+  border-radius: 8px;
+  border: 1px solid var(--pf-border-2);
+  background: var(--pf-soft);
+  color: var(--pf-text);
   font-size: 12px;
-  border-radius: var(--radius-sm);
-  background: rgba(6, 10, 18, 0.5);
-  border: 1px solid var(--border);
-  color: var(--text);
-  transition: border-color var(--transition), box-shadow var(--transition);
-}
-.filter-symbol-search-input:focus {
   outline: none;
-  border-color: var(--primary);
-  box-shadow: 0 0 0 3px rgba(37, 99, 234, 0.12);
+  transition: border-color 0.15s;
 }
+.filter-symbol-search-input:focus { border-color: var(--pf-blue); }
 .filter-symbol-search-input::-webkit-search-cancel-button { display: none; }
 .filter-symbol-search-clear {
   position: absolute;
@@ -659,93 +746,200 @@ defineExpose({ loadExample })
   height: 20px;
   padding: 0;
   border-radius: 50%;
-  background: var(--glass);
-  border: 1px solid var(--glass-border);
-  color: var(--muted);
+  background: var(--pf-card);
+  border: 1px solid var(--pf-border-2);
+  color: var(--pf-muted);
   font-size: 14px;
   line-height: 1;
   display: inline-flex;
   align-items: center;
   justify-content: center;
 }
-.filter-symbol-search-clear:hover {
-  color: var(--text);
-  border-color: var(--glass-highlight);
-}
+.filter-symbol-search-clear:hover { color: var(--pf-text); }
 .filter-symbol-search-count {
   position: absolute;
   right: 32px;
   font-size: 11px;
   font-family: var(--mono);
-  color: var(--muted);
+  color: var(--pf-dim);
   pointer-events: none;
   white-space: nowrap;
 }
 
-.filter-add-symbol { background: var(--bg-soft); }
-.filter-empty {
-  padding: 24px 16px;
-  text-align: center;
-  border: 1px dashed var(--border);
-  border-radius: var(--radius);
-  font-size: 13px;
-}
-.filter-symbol-card { background: var(--bg-soft); }
-.filter-symbol-name { font-size: 15px; letter-spacing: 0.3px; }
-.filter-symbol-head { flex-wrap: wrap; gap: 10px; }
-.filter-symbol-switches { align-items: center; }
-.filter-symbol-actions { align-items: center; gap: 8px; flex-shrink: 0; }
-.filter-manual-label { font-size: 12px; color: var(--muted); white-space: nowrap; }
-.btn-manual {
-  min-width: 52px;
-  font-weight: 700;
-  letter-spacing: 0.5px;
-  color: #fff;
-  border: 1px solid transparent;
-}
-.btn-manual-buy { background: var(--green); }
-.btn-manual-buy:hover { filter: brightness(1.08); }
-.btn-manual-sell { background: var(--red); }
-.btn-manual-sell:hover { filter: brightness(1.08); }
-.filter-dir-switch {
-  display: inline-flex;
+/* ── 添加品种行 ── */
+.filter-add-row {
+  display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
 }
-.filter-switch-label {
+.filter-add-input {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex: 1 1 220px;
+  min-width: 0;
+}
+.filter-add-input svg {
+  position: absolute;
+  left: 10px;
+  width: 14px;
+  height: 14px;
+  color: var(--pf-dim);
+  pointer-events: none;
+}
+.filter-add-input input {
+  width: 100%;
+  height: 34px;
+  padding: 0 12px 0 32px;
+  border-radius: 8px;
+  border: 1px solid var(--pf-border-2);
+  background: var(--pf-soft);
+  color: var(--pf-text);
   font-size: 12px;
-  color: var(--muted);
-  white-space: nowrap;
+  outline: none;
 }
-:deep(.el-switch.is-checked .el-switch__core) {
-  background-color: var(--primary);
-  border-color: var(--primary);
+.filter-add-input input:focus { border-color: var(--pf-blue); }
+
+/* ── 品种卡片 ── */
+.filter-symbol {
+  border-radius: 12px;
+  border: 1px solid var(--pf-border-2);
+  background: var(--pf-soft);
+  padding: 10px;
 }
-.filter-enabled {
-  display: inline-flex;
+
+.filter-symbol-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #1a2436;
+}
+
+.filter-symbol-title {
+  display: flex;
   align-items: center;
   gap: 6px;
-  margin: 0;
-  color: var(--muted);
-  font-size: 12px;
-  cursor: pointer;
+  min-width: 0;
 }
-.filter-interval-table { min-width: 520px; }
-.filter-num-input { min-width: 100px; }
-.filter-dir-row { gap: 16px; flex-wrap: wrap; }
-.filter-dir {
-  display: inline-flex;
+.filter-symbol-title svg {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  color: var(--pf-dim);
+}
+
+.filter-symbol-name {
+  font-family: var(--mono);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--pf-text);
+}
+
+.filter-symbol-actions {
+  display: flex;
   align-items: center;
   gap: 6px;
-  margin: 0;
-  font-size: 13px;
-  color: var(--text);
-  cursor: pointer;
-  white-space: nowrap;
+  flex-shrink: 0;
 }
-@media (max-width: 768px) {
-  .filter-toolbar { flex-direction: column; }
-  .filter-toolbar-actions { width: 100%; justify-content: flex-end; flex-wrap: wrap; }
-  .filter-symbol-search { flex: 1 1 100%; min-width: 0; }
+
+/* ── 区块 ── */
+.filter-section {
+  padding: 12px 0;
+  border-bottom: 1px solid #1a2436;
+}
+.filter-section-last { border-bottom: none; padding-bottom: 0; }
+
+.filter-switch-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.filter-field { margin-top: 10px; }
+.filter-field:first-of-type { margin-top: 8px; }
+
+.filter-lot-switch {
+  margin-top: 8px;
+  max-width: 260px;
+}
+
+/* ── 区间卡片 ── */
+.filter-range {
+  margin-top: 10px;
+  border-radius: 8px;
+  border: 1px solid var(--pf-border);
+  background: rgba(6, 10, 18, 0.6);
+  padding: 8px;
+}
+
+.filter-range-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.filter-range-title {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--pf-dim);
+}
+.filter-range-title svg { width: 12px; height: 12px; }
+.filter-range-desc { color: var(--pf-faint); font-weight: 400; }
+
+.filter-range-del {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex-shrink: 0;
+  padding: 2px 6px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: rgba(248, 113, 113, 0.8);
+  font-size: 10px;
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s;
+}
+.filter-range-del:hover { color: #f87171; background: rgba(239, 68, 68, 0.1); }
+.filter-range-del svg { width: 12px; height: 12px; }
+
+.filter-range-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 6px;
+}
+.filter-range-field { display: block; min-width: 0; }
+
+.filter-num-input {
+  height: 30px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.filter-range-switches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 24px;
+  margin-top: 8px;
+}
+.filter-range-switches .pf-switch-row { min-width: 140px; }
+
+.filter-empty-line { margin-top: 8px; }
+
+/* ── 手动触发 ── */
+.filter-manual {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
 }
 </style>

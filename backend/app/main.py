@@ -22,6 +22,7 @@ from . import (
     deals_api,
     events,
     follow_api,
+    follow_channel_api,
     grid_sizing_api,
     group_persist,
     group_service,
@@ -30,8 +31,10 @@ from . import (
     node_dashboard_api,
     nodes,
     pending_api,
+    phone_auth,
     rbac_service,
     roles_api,
+    signal_center_api,
     strategies,
     strategy_service,
     system_settings,
@@ -133,6 +136,7 @@ app.add_middleware(
 # 注册所有路由
 for r in (
     auth.router,
+    phone_auth.router,
     node_dashboard_api.router,
     twofa.router,
     users_api.router,
@@ -148,6 +152,7 @@ for r in (
     console_api.router,
     client_version_api.router,
     events.router,
+    signal_center_api.router,
     audit_api.router,
     accounts.router,
     close.router,
@@ -155,6 +160,7 @@ for r in (
     admin_ws.router,
     trading_api.router,
     follow_api.router,
+    follow_channel_api.router,
     ai_follow_api.router,
     deals_api.router,
 ):

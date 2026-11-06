@@ -26,6 +26,7 @@ import type {
   NodeTokenInfo,
   NodeUpdatePayload,
   RiskFeedItem,
+  SmsConfig,
   GroupTaskEventRecord,
   LimitWatchLogOut,
   PaginatedAudits,
@@ -34,6 +35,13 @@ import type {
   PaginatedLimitWatchLogs,
   PaginatedNodeDispatches,
   PaginatedSignalEvents,
+  SignalCenterLatency,
+  SignalCenterNodes,
+  SignalCenterOverview,
+  SignalCenterQuery,
+  SignalCenterDetail,
+  SignalCenterStream,
+  SignalCenterTasks,
   StrategyCreatePayload,
   StrategyOut,
   StrategyTemplateOut,
@@ -65,6 +73,23 @@ function EMPTY_DEAL_SUMMARY() {
     data_available: false,
     updated_at: null,
   }
+}
+
+/**
+ * 去掉筛选参数里的空值。
+ *
+ * 后端对 `source=""` 与「不传」的处理一致（都当无筛选），但把空串发过去
+ * 会让后端生成无意义的缓存 key（每个空串组合一份缓存），所以这里统一清掉。
+ */
+function cleanQuery(query?: SignalCenterQuery): Record<string, string> {
+  const out: Record<string, string> = {}
+  if (!query) return out
+  if (query.window) out.window = query.window
+  for (const key of ['source', 'model', 'symbol', 'action', 'status', 'node_id', 'group_id', 'keyword'] as const) {
+    const v = query[key]
+    if (v) out[key] = v
+  }
+  return out
 }
 
 // 业务总线 store：集中保存节点、账户、配置与实时事件
@@ -261,6 +286,79 @@ export const useHubStore = defineStore('hub', {
         ).data
       } catch {
         return { items: [], total: 0, page, page_size: pageSize }
+      }
+    },
+    // ---- 信号管理中心 ----
+    // 四个接口共用同一套筛选语义（signal_stats.SignalFilters），
+    // 前端不再自己拼参数，免得概览过滤了、信号流却没过滤。
+    async fetchSignalCenterOverview(
+      query?: SignalCenterQuery,
+    ): Promise<SignalCenterOverview | null> {
+      try {
+        return (
+          await api.get('/api/signal-center/overview', { params: cleanQuery(query) })
+        ).data
+      } catch {
+        return null
+      }
+    },
+    async fetchSignalCenterStream(
+      query?: SignalCenterQuery,
+      cursor?: string | null,
+      limit = 20,
+    ): Promise<SignalCenterStream> {
+      try {
+        return (
+          await api.get('/api/signal-center/stream', {
+            params: { ...cleanQuery(query), cursor: cursor || undefined, limit },
+          })
+        ).data
+      } catch {
+        return { items: [], next_cursor: null }
+      }
+    },
+    async fetchSignalCenterNodes(
+      query?: SignalCenterQuery,
+    ): Promise<SignalCenterNodes> {
+      try {
+        return (await api.get('/api/signal-center/nodes', { params: cleanQuery(query) })).data
+      } catch {
+        return { items: [] }
+      }
+    },
+    async fetchSignalCenterLatency(
+      query?: SignalCenterQuery,
+    ): Promise<SignalCenterLatency | null> {
+      try {
+        return (
+          await api.get('/api/signal-center/latency', { params: cleanQuery(query) })
+        ).data
+      } catch {
+        return null
+      }
+    },
+    async fetchSignalCenterTasks(
+      query?: SignalCenterQuery,
+    ): Promise<SignalCenterTasks> {
+      try {
+        return (await api.get('/api/signal-center/tasks', { params: cleanQuery(query) })).data
+      } catch {
+        return {
+          items: [],
+          totals: { tasks: 0, orders: 0, volume: 0, realized_profit: 0 },
+          tasks: [],
+          profit_scope: '',
+        }
+      }
+    },
+    /** 单条信号明细（含原始 Webhook 载荷）；按需拉取，列表页不带 */
+    async fetchSignalCenterDetail(
+      signalId: string,
+    ): Promise<SignalCenterDetail | null> {
+      try {
+        return (await api.get(`/api/signal-center/signal/${signalId}`)).data
+      } catch {
+        return null
       }
     },
     async fetchAudits(
@@ -482,6 +580,13 @@ export const useHubStore = defineStore('hub', {
     },
     async setWebhookAuth(enabled: boolean): Promise<WebhookAuthInfo> {
       return (await api.put('/api/config/webhook-auth', { enabled })).data
+    },
+    // ---- 短信服务配置（手机号注册 / 验证码登录）----
+    async fetchSmsConfig(): Promise<SmsConfig> {
+      return (await api.get('/api/config/sms')).data
+    },
+    async setSmsConfig(payload: Partial<SmsConfig>): Promise<SmsConfig> {
+      return (await api.put('/api/config/sms', payload)).data
     },
     // ---- 远程平仓 ----
     async closeNode(id: string, body: CloseRequest): Promise<void> {

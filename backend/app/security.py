@@ -96,3 +96,42 @@ def verify_2fa_pending_jwt(token: str) -> Optional[str]:
         return data.get("sub")
     except Exception:
         return None
+
+
+def create_phone_pending_jwt(phone: str, purpose: str) -> str:
+    """签发「手机号已验证」票据（验证码校验通过后签发），有效期 10 分钟。
+
+    typ=phone_pending；sub 是归一化后的手机号；purpose 记用途。
+
+    票据用 JWT 而非 Redis：与 2FA 中间态保持同一套做法，无状态、少一次 IO。
+    """
+    payload = {
+        "sub": phone,
+        "typ": "phone_pending",
+        "purpose": purpose,
+        "exp": int(time.time()) + 600,
+    }
+    return jwt.encode(payload, settings.jwt_secret, algorithm="HS256")
+
+
+def verify_phone_pending_jwt(token: str, purpose: str | set[str] | frozenset[str]) -> Optional[str]:
+    """校验手机号票据；类型不符或用途不被允许一律返回 None。
+
+    purpose 允许传单值或集合（如 {"login"} / {"register"}）—— 票据携带的用途
+    只要落在允许集合内即通过。
+
+    这样「一次验证码、两种去向」才能成立：
+    - 校验通过时签发的 auth 票据，允许用于 login 与 register 两个动作
+    - 注册票据只允许 register，不允许拿去登录（防止越权登录）
+    """
+    try:
+        data = jwt.decode(token, settings.jwt_secret, algorithms=["HS256"])
+    except Exception:
+        return None
+    if data.get("typ") != "phone_pending":
+        return None
+    allowed = {purpose} if isinstance(purpose, str) else set(purpose or ())
+    if data.get("purpose") not in allowed:
+        return None
+    sub = data.get("sub")
+    return str(sub) if sub else None

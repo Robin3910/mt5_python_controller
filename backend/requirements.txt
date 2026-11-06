@@ -14,3 +14,13 @@ PyJWT>=2.8
 python-multipart>=0.0.9
 pyotp>=2.9
 qrcode[pil]>=7.4
+# 阿里云号码认证（PNVS / 短信认证）SDK。
+# 版本上限 2.0.0 —— 这是 PyPI 与腾讯云镜像上的最新版本，写死上限避免
+# 镜像同步不及时导致构建失败（上限内仍可拿到补丁版修复）。
+alibabacloud_dypnsapi20170525>=2.0.0,<2.1.0
+# 阿里云验证码 2.0（人机验证 / 滑块）—— 与号码认证是两个独立产品，需分别开通。
+alibabacloud_captcha20230305>=1.1.0,<2.0.0
+# AES-256-CBC 加密 SceneId（阿里云验证码「加密模式」，防 SceneId 泄露被白嫖）。
+# 目前是阿里云 SDK 的传递依赖，但本项目直接引用它，必须显式声明 ——
+# 传递依赖随时可能变，缺了就直接 ImportError。
+cryptography>=42.0

@@ -54,7 +54,7 @@ MENU_REGISTRY: tuple[MenuDef, ...] = (
     MenuDef(MENU_AUDITS, "操作审计", "/audits", True),
     MenuDef(MENU_CONSOLE, "中控台", "/console", False),
     MenuDef(MENU_CLIENT_VERSIONS, "客户端版本", "/client-versions", False),
-    MenuDef(MENU_EVENTS, "事件", "/events", False),
+    MenuDef(MENU_EVENTS, "信号中心", "/events", False),
     MenuDef(MENU_PERMISSIONS, "用户权限", "/permissions", False),
 )
 

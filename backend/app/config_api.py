@@ -8,13 +8,14 @@
 """
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from . import persist, rules, system_settings
+from . import persist, rules, sms_config, system_settings
 from .connections import manager
 from .deps import client_ip, get_current_admin, get_store, require_admin
-from .models import NodeTokenInfo, WebhookAuthInfo, WebhookAuthUpdate
+from .models import NodeTokenInfo, SmsConfigOut, WebhookAuthInfo, WebhookAuthUpdate
 from .permissions import Principal
 from .settings import settings
 from .redis_store import RedisStore
+from .sms_service import today_send_count
 
 router = APIRouter(prefix="/api/config", tags=["config"])
 
@@ -132,3 +133,43 @@ async def set_trend_config(
         category="console", before=before, after=after,
     )
     return after
+
+
+# ----------------- 短信服务配置（手机号注册 / 验证码登录）-----------------
+@router.get("/sms", response_model=SmsConfigOut)
+async def get_sms_config(
+    store: RedisStore = Depends(get_store),
+    _: Principal = Depends(require_admin),
+):
+    """读取短信配置。**密钥永不回显**，只回显「是否已注入」。"""
+    cfg = await sms_config.get_sms_config()
+    return SmsConfigOut(
+        **cfg,
+        today_sent=await today_send_count(store),
+        credentials_present=sms_config.has_credentials(),
+    )
+
+
+@router.put("/sms", response_model=SmsConfigOut)
+async def set_sms_config(
+    body: dict,
+    request: Request,
+    store: RedisStore = Depends(get_store),
+    p: Principal = Depends(require_admin),
+):
+    """保存短信配置（开关 / 签名 / 模板 / 限频阈值 / 是否需要审核）。
+
+    开关随时可切：出故障把 enabled 置 false，所有短信接口立刻 404，前端自动
+    隐藏验证码入口 —— 一键止血，不用重启。
+    """
+    before = await sms_config.get_sms_config()
+    after = await sms_config.set_sms_config(body or {})
+    await persist.audit(
+        p.username, "set_sms_config", None, None, "ok", client_ip(request),
+        category="system", before=before, after=after,
+    )
+    return SmsConfigOut(
+        **after,
+        today_sent=await today_send_count(store),
+        credentials_present=sms_config.has_credentials(),
+    )

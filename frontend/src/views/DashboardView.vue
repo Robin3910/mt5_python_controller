@@ -331,7 +331,7 @@ async function closeTicket(n: NodeOut, ticket: number): Promise<void> {
           </div>
           <div v-if="!filteredEvents.length" class="muted" style="font-size: 12px; padding: 12px 0">暂无事件</div>
         </div>
-        <RouterLink class="dash-link dash-events-foot" to="/events">查看全部事件 →</RouterLink>
+        <RouterLink class="dash-link dash-events-foot" to="/events">查看信号中心 →</RouterLink>
       </aside>
     </div>
   </div>

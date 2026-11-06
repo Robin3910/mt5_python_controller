@@ -19,7 +19,7 @@ from .deps import (
 from .models import LotBatch, NodeCreate, NodeOut, NodePrimaryUpdate, NodeUpdate, PaginatedNodeDispatches
 from .db import SessionLocal
 from .orm import NodeCredential
-from .permissions import MENU_NODES, Principal
+from .permissions import MENU_HOME, MENU_NODES, Principal
 from .redis_store import RedisStore
 
 router = APIRouter(prefix="/api/nodes", tags=["nodes"])
@@ -236,7 +236,7 @@ async def set_primary_node(
     request: Request,
     out_response: Response,
     store: RedisStore = Depends(get_store),
-    p: Principal = Depends(require_menu(MENU_NODES)),
+    p: Principal = Depends(require_menu(MENU_HOME, MENU_NODES)),
 ):
     """设置 / 取消某节点的主节点标记。
 
@@ -283,7 +283,7 @@ async def set_primary_node(
 async def list_node_followings(
     node_id: str,
     store: RedisStore = Depends(get_store),
-    p: Principal = Depends(require_menu(MENU_NODES)),
+    p: Principal = Depends(require_menu(MENU_HOME, MENU_NODES)),
 ):
     """某节点当前的跟单关系（精简明细）。
 
@@ -306,7 +306,7 @@ async def list_node_followings(
 async def list_node_active_tasks(
     node_id: str,
     store: RedisStore = Depends(get_store),
-    p: Principal = Depends(require_menu(MENU_NODES)),
+    p: Principal = Depends(require_menu(MENU_HOME, MENU_NODES)),
 ):
     """某节点当前 in-flight 的子任务（精简明细）。
 

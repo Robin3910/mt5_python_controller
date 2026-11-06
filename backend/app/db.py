@@ -78,6 +78,30 @@ def _migrate_users_follow_paused(sync_conn) -> None:
             sync_conn.execute(text(f"ALTER TABLE users ADD COLUMN {name} DATETIME"))
 
 
+def _migrate_users_profile_columns(sync_conn) -> None:
+    """users 的个人中心自助维护列：email / leader_name / leader_intro。
+
+    - email：联系邮箱，**不参与登录**，故不设唯一约束（允许重复）。
+    - leader_name：带单员展示名。为 NULL 时前端回退显示 display_name，
+      所以不强制填 —— 存量用户不填也不影响带单广场显示名字。
+    - leader_intro：带单员介绍（自由文本），目前只在个人中心自己可见。
+
+    三列都可空且**没有默认值**：存量用户一律 NULL —— 零行为变化。
+    """
+    inspector = inspect(sync_conn)
+    if "users" not in inspector.get_table_names():
+        return
+    cols = {c["name"] for c in inspector.get_columns("users")}
+    additions = {
+        "email": "VARCHAR(128)",
+        "leader_name": "VARCHAR(64)",
+        "leader_intro": "TEXT",
+    }
+    for name, ddl in additions.items():
+        if name not in cols:
+            sync_conn.execute(text(f"ALTER TABLE users ADD COLUMN {name} {ddl}"))
+
+
 def _migrate_dispatch_price_column(sync_conn) -> None:
     """为已存在的 signal_dispatch 表补充成交价位列（create_all 不会改已存在的表）。"""
     inspector = inspect(sync_conn)
@@ -98,6 +122,40 @@ def _migrate_signal_source_column(sync_conn) -> None:
         sync_conn.execute(text("ALTER TABLE signal_history ADD COLUMN source VARCHAR(16)"))
     if "model" not in cols:
         sync_conn.execute(text("ALTER TABLE signal_history ADD COLUMN model VARCHAR(16)"))
+
+
+def _migrate_signal_center_columns(sync_conn) -> None:
+    """信号中心所需的新增列（全部可空，不影响任何交易逻辑）。
+
+    - signal_history.reject_code：信号整体拒收原因的结构化编码
+    - signal_dispatch.skip_code：逐节点跳过原因的结构化编码
+    - group_task_dispatch.skip_code：同上（strategy 链路）
+    - group_task_dispatch.action：冗余存一份动作，统计 UNION 时不必 join 主任务表
+
+    这些列只服务于统计，写漏 / 写坏都不影响信号下发与成交。
+    """
+    inspector = inspect(sync_conn)
+    tables = set(inspector.get_table_names())
+    additions = {
+        "signal_history": {"reject_code": "VARCHAR(24)"},
+        "signal_dispatch": {"skip_code": "VARCHAR(24)"},
+        "group_task_dispatch": {"skip_code": "VARCHAR(24)", "action": "VARCHAR(8)"},
+        "group_signal_task": {"skip_code": "VARCHAR(24)"},
+    }
+    for table, cols_map in additions.items():
+        if table not in tables:
+            continue
+        cols = {c["name"] for c in inspector.get_columns(table)}
+        for name, ddl in cols_map.items():
+            if name in cols:
+                continue
+            sync_conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+        # 统计要按 skip_code 聚合，补一个普通索引
+        if "skip_code" in cols_map:
+            index = f"ix_{table}_skip_code"
+            existing = {i.get("name") for i in inspector.get_indexes(table)}
+            if index not in existing:
+                sync_conn.execute(text(f"CREATE INDEX {index} ON {table} (skip_code)"))
 
 
 # 时延埋点列：sent_at / recv_at / order_at / filled_at + 两段耗时（毫秒）
@@ -394,6 +452,50 @@ def _migrate_node_client_version(sync_conn) -> None:
         sync_conn.execute(text("ALTER TABLE nodes ADD COLUMN client_version_at DATETIME"))
 
 
+def _migrate_user_phone(sync_conn) -> None:
+    """users.phone / users.phone_verified：手机号登录凭据。
+
+    - phone：归一化后的 E.164（+86xxxxxxxxxxx），唯一索引；存量用户为 NULL，不受影响
+    - phone_verified：是否已通过短信验证（管理员手工绑定时为 False）
+
+    MySQL 不支持 `CREATE UNIQUE INDEX IF NOT EXISTS`，需按方言分支。
+    """
+    inspector = inspect(sync_conn)
+    if "users" not in inspector.get_table_names():
+        return
+    cols = {c["name"] for c in inspector.get_columns("users")}
+    dialect = sync_conn.engine.dialect.name
+    if "phone" not in cols:
+        sync_conn.execute(text("ALTER TABLE users ADD COLUMN phone VARCHAR(20)"))
+    # 唯一索引单独处理：存量列已存在但索引缺失（手工加过列的库）时也要补上。
+    # 索引名与 ORM 的 index=True 生成的一致（ix_users_phone），新库与升级库结构相同。
+    indexes = {i["name"] for i in inspector.get_indexes("users") if i.get("unique")}
+    if "ix_users_phone" not in indexes:
+        # 建唯一索引前先扫重：存量全 NULL 不会冲突，但手工绑过手机号的库可能有重复
+        dup = sync_conn.execute(
+            text(
+                "SELECT phone, COUNT(*) AS c FROM users "
+                "WHERE phone IS NOT NULL GROUP BY phone HAVING c > 1"
+            )
+        ).fetchall()
+        if dup:
+            logger.warning(
+                "users.phone has %d duplicate value(s); unique index skipped", len(dup)
+            )
+        elif dialect == "mysql":
+            sync_conn.execute(text("CREATE UNIQUE INDEX ix_users_phone ON users (phone)"))
+        else:
+            sync_conn.execute(
+                text("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_phone ON users (phone)")
+            )
+    if "phone_verified" not in cols:
+        col_type = (
+            "TINYINT(1) NOT NULL DEFAULT 0" if dialect == "mysql"
+            else "BOOLEAN NOT NULL DEFAULT 0"
+        )
+        sync_conn.execute(text(f"ALTER TABLE users ADD COLUMN phone_verified {col_type}"))
+
+
 def _migrate_user_rbac_columns(sync_conn) -> None:
     """users.token_version / display_name：会话吊销版本号与显示名。"""
     inspector = inspect(sync_conn)
@@ -491,8 +593,10 @@ async def init_db() -> None:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_migrate_user_totp_columns)
         await conn.run_sync(_migrate_users_follow_paused)
+        await conn.run_sync(_migrate_users_profile_columns)
         await conn.run_sync(_migrate_dispatch_price_column)
         await conn.run_sync(_migrate_signal_source_column)
+        await conn.run_sync(_migrate_signal_center_columns)
         await conn.run_sync(_migrate_latency_marks)
         await conn.run_sync(_migrate_latency_precision)
         await conn.run_sync(_migrate_audit_columns)
@@ -507,6 +611,7 @@ async def init_db() -> None:
         await conn.run_sync(_migrate_node_trend_json)
         await conn.run_sync(_migrate_node_client_version)
         await conn.run_sync(_migrate_user_rbac_columns)
+        await conn.run_sync(_migrate_user_phone)
         await conn.run_sync(_migrate_owner_columns)
         await conn.run_sync(_migrate_strategy_config_version)
         await conn.run_sync(_migrate_group_dispatch_add_counts)

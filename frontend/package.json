@@ -5,8 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vue-tsc --noEmit && vite build",
+    "build": "vue-tsc --noEmit && vite build && node verify-build.mjs dist",
     "typecheck": "vue-tsc --noEmit",
+    "verify:build": "node verify-build.mjs dist",
     "preview": "vite preview"
   },
   "dependencies": {

@@ -16,10 +16,15 @@ export const MENU_PATHS: ReadonlyArray<{ code: string; path: string }> = [
   { code: 'permissions', path: '/permissions' },
 ]
 
-/** 配置页（个人设置）不挂菜单码，所有登录用户都能进，是最终回退页 */
-export const FALLBACK_PATH = '/config'
+/**
+ * 个人中心不挂菜单码，所有登录用户都能进，是最终回退页。
+ *
+ * 用 /profile 而不是 /config —— 配置页是**系统级**配置（节点令牌 / Webhook /
+ * 短信），普通用户看到一堆管理员才用得上的东西不合适；个人中心才是个人自己的地方。
+ */
+export const FALLBACK_PATH = '/profile'
 
-/** 第一个有权限的菜单路径；一个菜单都没有时回到配置页 */
+/** 第一个有权限的菜单路径；一个菜单都没有时回到个人中心 */
 export function firstAllowedPath(hasMenu: (code: string) => boolean): string {
   return MENU_PATHS.find((m) => hasMenu(m.code))?.path ?? FALLBACK_PATH
 }

@@ -13,10 +13,18 @@ const router = createRouter({
   history: createWebHistory(),
   routes: [
     { path: '/login', name: 'login', component: () => import('@/views/LoginView.vue') },
+    // 注册页是公开路由（不加 meta.menu）；已登录访问它会被守卫弹回首页
+    { path: '/register', name: 'register', component: () => import('@/views/RegisterView.vue') },
     {
       path: '/home',
       name: 'home',
       component: () => import('@/views/HomeView.vue'),
+      meta: { menu: 'home' },
+    },
+    {
+      path: '/home/nodes/:id',
+      name: 'home-node',
+      component: () => import('@/views/HomeNodeView.vue'),
       meta: { menu: 'home' },
     },
     {
@@ -88,7 +96,14 @@ const router = createRouter({
     {
       path: '/events',
       name: 'events',
-      component: () => import('@/views/EventsView.vue'),
+      component: () => import('@/views/SignalCenterView.vue'),
+      meta: { menu: 'events' },
+    },
+    {
+      // 「信号中心」别名路径：老链接 /events 继续有效，新入口用更语义化的路径
+      path: '/signal-center',
+      name: 'signal-center',
+      component: () => import('@/views/SignalCenterView.vue'),
       meta: { menu: 'events' },
     },
     {
@@ -110,7 +125,10 @@ const router = createRouter({
       meta: { menu: 'permissions' },
     },
     { path: '/config', name: 'config', component: () => import('@/views/ConfigView.vue') },
-    { path: '/me', name: 'me', component: () => import('@/views/ProfileView.vue') },
+    // 「我的」枢纽页：账号卡片 + 模块入口
+    { path: '/me', name: 'me', component: () => import('@/views/MineView.vue') },
+    // 「个人中心」：个人信息 / 带单员 / 修改密码 / 2FA（登录即可进，不限菜单）
+    { path: '/profile', name: 'profile', component: () => import('@/views/ProfileView.vue') },
     {
       path: '/user-strategies',
       name: 'user-strategies',
@@ -120,12 +138,15 @@ const router = createRouter({
   ],
 })
 
-// 全局守卫：未登录只能进 /login；已登录先拉当前用户，再按菜单权限放行，
+// 全局守卫：未登录只能进 /login / register；已登录先拉当前用户，再按菜单权限放行，
 // 无权限时跳到第一个有权限的菜单（都没有则到配置页）
 router.beforeEach(async (to) => {
   const auth = useAuthStore()
-  if (to.name !== 'login' && !auth.isAuthed) return { name: 'login' }
-  if (to.name === 'login') return auth.isAuthed ? { name: 'home' } : true
+  const isPublic = to.name === 'login' || to.name === 'register'
+  if (!isPublic && !auth.isAuthed) return { name: 'login' }
+  // 已登录不该再看到登录 / 注册页
+  if (isPublic && auth.isAuthed) return { name: 'home' }
+  if (to.name === 'login' || to.name === 'register') return true
   if (!auth.me) {
     try {
       await auth.fetchMe()

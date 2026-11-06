@@ -31,6 +31,34 @@ async def get_user_by_username(username: str) -> Optional[User]:
         ).scalar_one_or_none()
 
 
+async def get_user_by_phone(phone: str) -> Optional[User]:
+    """按手机号查用户；phone 存归一化后的 E.164。"""
+    if not phone:
+        return None
+    async with SessionLocal() as s:
+        return (
+            await s.execute(select(User).where(User.phone == phone))
+        ).scalar_one_or_none()
+
+
+async def bind_phone(user_id: int, phone: str, *, verified: bool = False) -> Optional[User]:
+    """给用户绑定手机号；已绑定到别人时返回 None（唯一索引冲突由调用方兜底）。"""
+    async with SessionLocal() as s:
+        user = await s.get(User, int(user_id))
+        if user is None:
+            return None
+        owner = (
+            await s.execute(select(User).where(User.phone == phone, User.id != int(user_id)))
+        ).scalar_one_or_none()
+        if owner is not None:
+            return None
+        user.phone = phone
+        user.phone_verified = bool(verified)
+        await s.commit()
+        await s.refresh(user)
+        return user
+
+
 async def verify_user_password(username: str, password: str) -> bool:
     """校验用户名与密码（常量时间比较哈希）。"""
     user = await get_user_by_username(username)
@@ -104,10 +132,12 @@ async def set_ai_follow_paused(user_id: int, paused: bool) -> Optional[User]:
 
 async def create_user(
     username: str, password: str, *, display_name: Optional[str] = None, is_active: bool = True,
+    phone: Optional[str] = None, phone_verified: bool = False,
 ) -> User:
     """新建后台用户。旧 role 字段写 user：它只在首次升级 RBAC 时被读取，不能写成 admin。
 
     用户名重复会触发 IntegrityError，由路由层转成 409。
+    phone 传了就一并写入（手机号注册路径用），避免「建号后再补手机号」的两步竞态。
     """
     async with SessionLocal() as s:
         user = User(
@@ -117,6 +147,8 @@ async def create_user(
             role="user",
             is_active=is_active,
             token_version=0,
+            phone=phone,
+            phone_verified=bool(phone_verified),
         )
         s.add(user)
         await s.commit()
@@ -124,10 +156,44 @@ async def create_user(
         return user
 
 
+async def update_profile(
+    user_id: int, *, display_name: Optional[str] = None, email: Optional[str] = None,
+    leader_name: Optional[str] = None, leader_intro: Optional[str] = None,
+) -> Optional[User]:
+    """更新个人中心的自助维护字段（只改自己）。
+
+    与 `update_user` 的区别：这里**不碰** is_active / phone / 角色 ——
+    那三样要么是管理员的事，要么要走短信验证，不能由自助入口改。
+
+    字段级语义与 update_user 一致：
+    - 传 None（不传）-> 不改该字段
+    - 传空串 -> 清空（置 NULL）
+    """
+    async with SessionLocal() as s:
+        user = await s.get(User, int(user_id))
+        if not user:
+            return None
+        if display_name is not None:
+            user.display_name = display_name.strip() or None
+        if email is not None:
+            user.email = email.strip() or None
+        if leader_name is not None:
+            user.leader_name = leader_name.strip() or None
+        if leader_intro is not None:
+            user.leader_intro = leader_intro.strip() or None
+        await s.commit()
+        await s.refresh(user)
+        return user
+
+
 async def update_user(
     user_id: int, *, display_name: Optional[str] = None, is_active: Optional[bool] = None,
+    phone: Optional[str] = None, phone_verified: Optional[bool] = None,
 ) -> Optional[User]:
-    """更新显示名 / 启用状态；由启用改为禁用时吊销其全部旧会话。"""
+    """更新显示名 / 启用状态 / 手机号；由启用改为禁用时吊销其全部旧会话。
+
+    phone 传空串表示解绑手机号（置 NULL）；不传（None）表示不改。
+    """
     async with SessionLocal() as s:
         user = await s.get(User, int(user_id))
         if not user:
@@ -138,6 +204,21 @@ async def update_user(
             if user.is_active and not is_active:
                 user.token_version = int(user.token_version or 0) + 1
             user.is_active = is_active
+        if phone is not None:
+            new_phone = phone.strip() or None
+            if new_phone is not None:
+                owner = (
+                    await s.execute(
+                        select(User).where(User.phone == new_phone, User.id != int(user_id))
+                    )
+                ).scalar_one_or_none()
+                if owner is not None:
+                    raise ValueError("该手机号已被其他用户绑定")
+            user.phone = new_phone
+            # 换绑手机号等于放弃旧的短信验证身份，除非调用方显式声明已验证
+            user.phone_verified = bool(phone_verified) if phone_verified is not None else False
+        elif phone_verified is not None:
+            user.phone_verified = bool(phone_verified)
         await s.commit()
         await s.refresh(user)
         return user
