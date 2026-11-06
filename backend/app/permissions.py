@@ -30,6 +30,9 @@ MENU_CONSOLE = "console"
 MENU_CLIENT_VERSIONS = "client_versions"
 MENU_EVENTS = "events"
 MENU_PERMISSIONS = "permissions"
+# 注册用户 KYC 实名审核。仅管理员可见：该页汇聚全部用户的实名材料与名下
+# 节点明细，属全局数据，分配给普通角色会越过数据归属。
+MENU_USER_AUDIT = "user_audit"
 
 
 @dataclass(frozen=True)
@@ -56,6 +59,7 @@ MENU_REGISTRY: tuple[MenuDef, ...] = (
     MenuDef(MENU_CLIENT_VERSIONS, "客户端版本", "/client-versions", False),
     MenuDef(MENU_EVENTS, "信号中心", "/events", False),
     MenuDef(MENU_PERMISSIONS, "用户权限", "/permissions", False),
+    MenuDef(MENU_USER_AUDIT, "用户注册审核", "/user-audit", False),
 )
 
 ALL_MENU_CODES: tuple[str, ...] = tuple(m.code for m in MENU_REGISTRY)

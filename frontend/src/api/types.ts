@@ -1244,7 +1244,7 @@ export interface GroupTaskEventDetail {
   min_lot?: number
   current_lot?: number
   // —— 信号盈亏控制（kind=signal_pl）——
-  /** 批次1盈亏金额 */
+  /** 生效的止盈金额（当前总手数命中的那一档） */
   amount?: number | null
   /** 盈亏比折出的亏损金额 */
   sl_amount?: number | null
@@ -2111,7 +2111,7 @@ export interface UserUpdatePayload {
 export type SmsPurpose = 'auth'
 
 /** 校验通过后的下一步走向（服务端根据该号码是否已注册决定） */
-export type SmsNextAction = 'login' | 'register' | 'pending_approval'
+export type SmsNextAction = 'login' | 'register' | 'pending_approval' | 'rejected'
 
 /** GET /api/auth/sms/status：短信服务是否可用（前端据此隐藏验证码入口） */
 export interface SmsStatus {
@@ -2152,8 +2152,10 @@ export interface SmsVerifyResult {
   ticket: string
   /** 下一步走向 */
   next_action: SmsNextAction
-  /** 已注册时的用户名（pending_approval 分支才有） */
+  /** 已注册时的用户名（pending_approval / rejected 分支才有） */
   username?: string | null
+  /** 驳回原因（next_action === 'rejected' 时有值） */
+  reject_reason?: string | null
 }
 
 /** POST /api/auth/register 的响应 */
@@ -2166,6 +2168,10 @@ export interface PhoneRegisterResult {
   token: string | null
   token_type: string | null
   requires_2fa: boolean
+  /** 新建的 KYC 审核单 id（提交了实名材料时才有值） */
+  review_id?: number | null
+  /** true = 本次是「驳回后重新提交」而非首次注册 */
+  resubmitted?: boolean
 }
 
 export interface PhoneRegisterPayload {
@@ -2174,7 +2180,69 @@ export interface PhoneRegisterPayload {
   nickname?: string | null
   username?: string | null
   password?: string | null
+  // —— 实名材料（姓名 / 邮箱，都可选）——
+  real_name?: string | null
+  email?: string | null
 }
+
+// ---------------------------------------------------------------------------
+// 注册用户 KYC 实名审核
+// ---------------------------------------------------------------------------
+
+export type UserReviewStatus = 'pending' | 'approved' | 'rejected'
+
+/** 审核卡片里的「名下节点」条目 */
+export interface ReviewNodeOut {
+  node_id: string
+  name: string
+  status: 'online' | 'offline'
+  balance: number
+}
+
+/** 审核页顶部统计块。始终是全局数，不受 status / keyword 筛选影响。 */
+export interface UserReviewStats {
+  total: number
+  pending: number
+  approved: number
+  rejected: number
+  node_total: number
+  node_online: number
+}
+
+/** 一张审核单 + 该用户的最新状态 */
+export interface UserReviewOut {
+  id: number
+  user_id: number
+  username: string
+  display_name: string | null
+  account: string
+  /** 脱敏 138****8000 */
+  phone: string | null
+  email: string | null
+  real_name: string | null
+  /** false = 用户未自填姓名，由管理员补录 */
+  kyc_submitted: boolean
+  status: UserReviewStatus
+  register_time: number | null
+  submit_time: number | null
+  audit_time: number | null
+  audited_by: string | null
+  reject_reason: string | null
+  nodes: ReviewNodeOut[]
+}
+
+export interface UserReviewList {
+  stats: UserReviewStats
+  items: UserReviewOut[]
+}
+
+/** 驳回原因预设文案 */
+export const REJECT_REASONS: readonly string[] = [
+  '姓名信息填写不完整，请补充后重新提交',
+  '姓名与手机号实名认证信息不一致',
+  '邮箱无效或无法接收通知，请更换',
+  '注册信息存在明显异常，请补充说明',
+]
 
 /** 短信服务配置（管理员配置页；密钥永不回显） */
 export interface SmsConfig {

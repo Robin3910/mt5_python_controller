@@ -116,11 +116,28 @@ const ALL_MODULES: ProfileHubModule[] = [
     icon: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><circle cx="12" cy="10" r="2.5"/><path d="M8.5 16a3.5 3.5 0 0 1 7 0"/>',
     accent: '#EC4899',
   },
+  {
+    code: 'user_audit',
+    label: '用户注册审核',
+    description: '注册用户 · KYC 实名审核 · 节点明细',
+    path: '/user-audit',
+    icon: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/>',
+    accent: '#38BDF8',
+  },
+  {
+    // 「系统配置」：仅管理员可见（config 不是后端菜单码，普通用户 hasMenu('config') 为 false）
+    code: 'config',
+    label: '系统配置',
+    description: '节点令牌 · Webhook 校验 · 短信服务',
+    path: '/config',
+    icon: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>',
+    accent: '#F59E0B',
+  },
 ]
 
 // 管理员 / 普通用户：都按菜单权限过滤；管理员额外加「首页」「分组管理」入口
 const visibleModules = computed<ProfileHubModule[]>(() => {
-  let base = auth.isAdmin ? ALL_MODULES : ALL_MODULES.filter((m) => auth.hasMenu(m.code))
+  let base = auth.isAdmin ? ALL_MODULES : ALL_MODULES.filter((m) => m.code !== 'config' && auth.hasMenu(m.code))
   if (auth.isAdmin) {
     base = [
       {
@@ -190,6 +207,7 @@ function logout(): void {
         </div>
         <div class="mine-actions">
           <RouterLink to="/profile" class="pf-btn">个人中心</RouterLink>
+          <button v-if="auth.isAdmin" type="button" class="pf-btn" @click="go('/config')">系统配置</button>
           <button type="button" class="pf-btn" @click="copyWebhook">复制 webhook</button>
           <button type="button" class="pf-btn pf-btn-danger" @click="logout">退出登录</button>
         </div>

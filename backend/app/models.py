@@ -1109,12 +1109,20 @@ class PhoneRegisterRequest(BaseModel):
 
     username / password 均可省略：省略 username 时自动生成 m{手机号}，
     省略 password 时生成随机强密码（该用户只能走验证码登录）。
+
+    **实名材料**：只有「姓名」与「邮箱」两项，都可选。
+    - 填了姓名 → 提交 KYC 审核单，等管理员审核通过才能登录；
+    - 没填姓名 → 审核单仍会建（`kyc_submitted=False`），管理员可手工补录；
+    - 邮箱只做格式校验，不填不报错。
     """
     phone: str = Field(min_length=1, max_length=32)
     ticket: str = Field(min_length=1)
     nickname: Optional[str] = Field(default=None, max_length=64)
     username: Optional[str] = Field(default=None, max_length=64)
     password: Optional[str] = Field(default=None, max_length=128)
+    # —— 实名材料（可选）——
+    real_name: Optional[str] = Field(default=None, max_length=64)
+    email: Optional[str] = Field(default=None, max_length=128)
 
 
 class PhoneRegisterResult(BaseModel):
@@ -1126,6 +1134,10 @@ class PhoneRegisterResult(BaseModel):
     token: Optional[str] = None
     token_type: Optional[str] = None
     requires_2fa: bool = False
+    # 新建的 KYC 审核单 id（require_approval 且提交了实名材料时才有值）
+    review_id: Optional[int] = None
+    # 本次是「驳回后重新提交」（True）而非首次注册
+    resubmitted: bool = False
 
 
 class PhoneSmsLoginRequest(BaseModel):
@@ -1141,11 +1153,15 @@ class PhoneSmsLoginRequest(BaseModel):
 
 
 class SmsConfigOut(BaseModel):
-    """短信配置（配置页展示）。密钥永不回显。"""
-    enabled: bool = False
+    """短信配置（配置页展示）。密钥永不回显。
+
+    sign_name / template_code 是写死的常量（见 sms_config.FIXED_*），只读展示，
+    管理员改了也没用 —— 后端写入时一律覆盖回常量。
+    """
+    enabled: bool = True
     provider: str = "aliyun_sms_auth"
     endpoint: str = "dypnsapi.aliyuncs.com"
-    sign_name: str = ""
+    sign_name: str = "恒创联众"
     template_code: str = "100001"
     require_approval: bool = True
     code_ttl_seconds: int = 300
@@ -1604,6 +1620,87 @@ class UserOut(BaseModel):
     # 启用角色的能力码并集（如 ["follow_leader"]）；管理员固定全部能力。供用户列表「能力」列展示，
     # **不**参与鉴权（鉴权走 Principal，与 menus 是同一口径：只用于显示控制）。
     capabilities: list[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# 注册用户 KYC 实名审核
+# ---------------------------------------------------------------------------
+
+
+class ReviewNodeOut(BaseModel):
+    """审核卡片里的「名下节点」条目。"""
+    node_id: str
+    name: str
+    status: str = "offline"      # online / offline
+    balance: float = 0.0
+
+
+class UserReviewStats(BaseModel):
+    """审核页顶部的统计块。**始终是全局数**，不受 status / keyword 筛选影响。"""
+    total: int = 0
+    pending: int = 0
+    approved: int = 0
+    rejected: int = 0
+    node_total: int = 0
+    node_online: int = 0
+
+
+class UserReviewOut(BaseModel):
+    """一张审核单 + 该用户的最新状态。"""
+    id: int                       # review id
+    user_id: int
+    username: str
+    display_name: Optional[str] = None
+    account: str                  # 展示编号，如 "U-12"
+    phone: Optional[str] = None   # 脱敏 138****8000
+    email: Optional[str] = None
+    real_name: Optional[str] = None
+    kyc_submitted: bool = False   # False = 用户未自填姓名，由管理员补录
+    status: str = "pending"       # pending / approved / rejected
+    register_time: Optional[float] = None
+    submit_time: Optional[float] = None
+    audit_time: Optional[float] = None
+    audited_by: Optional[str] = None
+    reject_reason: Optional[str] = None
+    nodes: list[ReviewNodeOut] = Field(default_factory=list)
+
+
+class UserReviewList(BaseModel):
+    stats: UserReviewStats = Field(default_factory=UserReviewStats)
+    items: list[UserReviewOut] = Field(default_factory=list)
+
+
+class UserReviewApproveRequest(BaseModel):
+    """审核通过。
+
+    `node_ids` 为空 = 不改节点归属；非空 = 通过的同时把节点分配给该用户
+    （复用 users_api.assign_nodes_core 的既有校验）。
+    """
+    node_ids: list[str] = Field(default_factory=list)
+    # 节点仍在分组里时需 confirm=True 才会把它移出这些分组
+    confirm: bool = False
+
+
+class UserReviewRejectRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=256)
+
+
+class UserReviewBulkApproveRequest(BaseModel):
+    """批量通过；`review_ids` 为空 = 全部 pending。"""
+    review_ids: list[int] = Field(default_factory=list)
+
+
+class UserReviewApproveResult(BaseModel):
+    ok: bool = True
+    user_id: Optional[int] = None
+    is_active: bool = False
+    assigned_node_ids: list[str] = Field(default_factory=list)
+
+
+class UserReviewBulkApproveResult(BaseModel):
+    ok: bool = True
+    approved: int = 0
+    failed: list[dict] = Field(default_factory=list)
 
 
 class UserCreate(BaseModel):

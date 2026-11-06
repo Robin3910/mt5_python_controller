@@ -4,7 +4,7 @@ import logging
 from sqlalchemy import event, inspect, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from .orm import Base
+from .orm import Base, UserReview
 from .settings import settings
 
 logger = logging.getLogger(__name__)
@@ -640,6 +640,7 @@ async def init_db() -> None:
         await conn.run_sync(_migrate_node_primary)
         await conn.run_sync(_migrate_role_capabilities)
         await conn.run_sync(_migrate_mt5_deal_columns)
+        await conn.run_sync(_migrate_user_reviews)
     logger.info("Database initialized (%s)", engine.url.render_as_string(hide_password=True))
 
 
@@ -750,3 +751,64 @@ def _migrate_node_primary(sync_conn) -> None:
     sync_conn.execute(text(
         f"CREATE INDEX IF NOT EXISTS ix_nodes_is_primary ON nodes (is_primary)"
     ))
+
+
+def _migrate_user_reviews(sync_conn) -> None:
+    """user_reviews 表：注册用户的 KYC 实名审核单。
+
+    首次引入时是**新表**，用 SQLAlchemy 按方言建表（而不是手写 DDL）——
+    手写的话 MySQL 与 SQLite 在「自增主键语法」「CREATE INDEX IF NOT EXISTS」
+    上都不兼容（AUTOINCREMENT 是 SQLite 专有，IF NOT EXISTS 的索引 MySQL
+    不支持），得写两套方言分支。
+
+    **实名材料从「姓名 / 证件类型 / 证件号 / 邮箱」简化为「姓名 / 邮箱 / 手机号」**
+    （2026-11-05），所以旧表里的 `cert_type` / `cert_no_masked` /
+    `cert_no_hash` 三列要删掉，并补一列 `phone`。
+
+    ⚠️ **删列前必须先删索引**：MySQL 删列会连带删掉该列上的索引，但
+    **SQLite 不会** —— 留着 `ix_user_reviews_cert_no_hash` 再删
+    `cert_no_hash` 列，SQLite 会报
+    `error in index ix_user_reviews_cert_no_hash after drop column:
+    no such column: cert_no_hash`，整条迁移直接失败。
+
+    ⚠️ **DROP INDEX 的语法两方言不同**：
+    - MySQL：`DROP INDEX <name> ON <table>`（**没有** `IF EXISTS`）
+    - SQLite：`DROP INDEX IF EXISTS <name>`
+    所以这里必须按方言分支。
+
+    这三列上没有外键约束，删列不会牵连别的表。
+    """
+    inspector = inspect(sync_conn)
+    if "user_reviews" not in inspector.get_table_names():
+        UserReview.__table__.create(bind=sync_conn, checkfirst=True)
+        return
+
+    cols = {c["name"] for c in inspector.get_columns("user_reviews")}
+    dialect = sync_conn.engine.dialect.name
+
+    # 1. 先删掉挂在旧证件列上的索引（SQLite 删列不会连带删索引）
+    legacy_cols = ("cert_type", "cert_no_masked", "cert_no_hash")
+    for idx in inspector.get_indexes("user_reviews"):
+        indexed = set(idx.get("column_names") or [])
+        name = idx.get("name") or ""
+        # 单列索引且落在待删列上 → 先删掉
+        if len(indexed) != 1 or not (indexed & set(legacy_cols)):
+            continue
+        # SQLite 的 UNIQUE 约束会生成 `sqlite_autoindex_*` 隐式索引，
+        # 那种索引 DROP 不了（会报「no such index」）；跳过即可 ——
+        # 删列时 SQLite 会自动把它一并处理掉。
+        if name.startswith("sqlite_autoindex"):
+            continue
+        if dialect == "mysql":
+            sync_conn.execute(text(f"DROP INDEX {name} ON user_reviews"))
+        else:
+            sync_conn.execute(text(f"DROP INDEX IF EXISTS {name}"))
+
+    # 2. 删掉旧的证件相关列
+    for legacy in legacy_cols:
+        if legacy in cols:
+            sync_conn.execute(text(f"ALTER TABLE user_reviews DROP COLUMN {legacy}"))
+
+    # 3. 补上手机号快照列
+    if "phone" not in cols:
+        sync_conn.execute(text("ALTER TABLE user_reviews ADD COLUMN phone VARCHAR(20) NULL"))

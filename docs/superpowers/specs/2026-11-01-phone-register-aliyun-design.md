@@ -282,7 +282,7 @@ aliyun_access_key_secret: str = ""
   "enabled": true,
   "provider": "aliyun_sms_auth",
   "endpoint": "dypnsapi.aliyuncs.com",
-  "sign_name": "<控制台的赠送签名内容>",
+  "sign_name": "恒创联众",
   "template_code": "100001",
   "require_approval": true,
   "code_ttl_seconds": 300,
@@ -294,10 +294,18 @@ aliyun_access_key_secret: str = ""
 ```
 
 - **密钥永远不进 DB**，只从 env 读；配置页只回显 `sign_name` / `template_code`。
-- 开关与模板 Code 放 DB，是为了让运维能**临时关停注册**（出故障立刻止血）、以及不重启就能换模板。
+- **签名 / 模板码写死**（`sms_config.FIXED_SIGN_NAME = "恒创联众"`、`FIXED_TEMPLATE_CODE = "100001"`）：
+  这两个值对应阿里云侧已审核通过并绑定本账号的那一份，改了会被阿里云拒掉（`InvalidSignName` /
+  `InvalidTemplateCode`）导致发不出短信。因此它们**不进 DB、也不给管理员改** —— 前端只读展示，
+  后端 `normalize_config` 一律覆盖为常量，DB 里存的历史值在读取时被自动纠正。
+- **开关默认启用**（`DEFAULTS["enabled"] = True`）：短信是注册 / 验证码登录的主链路，
+  装好 AccessKey 就能用，不该要求管理员先去配置页点一下开关。停用随时可以（出故障一键止血）。
+- **可用性判断 `is_usable(cfg)`** = 开关打开 + 配置齐全 + **AccessKey 已注入**。
+  三者缺一，验证码入口就不该出现（点了也是 503），所以 `/api/auth/sms/status` 用它决定
+  `enabled` 字段，前端据此隐藏短信 Tab。
 - `provider` 字段是为将来切换厂商预留的（`aliyun_sms_auth` / `tencentcloud_sms`），切换只需改这一个配置项。
 - `require_approval` 默认 `true`（已确认的需求），运行时可切换为 `false` 实现免审核注册。
-- 需提供「配置缺失时的默认值」：全部字段有默认值；`sign_name` 或 `template_code` 为空时视为**未配置** → 所有短信接口返回 404（前端自动隐藏验证码入口）。
+- 全部字段都有默认值；`enabled` 为 false 时所有短信接口返回 404（前端自动隐藏验证码入口）。
 
 ---
 
@@ -380,6 +388,15 @@ POST /api/auth/sms/login
 - `DELETE /api/users/{id}` → 拒绝（名下无资源时可以删）。
 
 > **需在 `UserOut` 上补充 `phone`（脱敏）与 `phone_verified` 两个字段**，前端用户管理页才能展示「待审核用户」并显示绑定手机号。
+
+> **2026-11-04 修订**：改为**新增独立审核接口**（`/api/user-reviews/*`）。
+>
+> 理由：`users.is_active` 只能表达「启用 / 禁用」，**无法表达「已驳回」**，
+> 也不记录审核时间、审核人、驳回原因。详见
+> `docs/superpowers/specs/2026-11-04-user-registration-review-design.md` §3.1。
+>
+> 上面列的 `users_api` 能力**仍然保留可用**（管理员在「用户权限」页启用/禁用
+> 用户依旧有效），只是审核动作多了一条更完整的路径。
 
 ### 6.6 接口汇总
 
@@ -549,7 +566,7 @@ POST /api/auth/sms/send {purpose: login}
 ### 12.2 集成测试
 
 - 注册全流程 → `pending_approval=true` → 管理员启用 → 验证码登录成功。
-- 重复注册 → 409。
+- 重复注册 → 409（**例外**：最新审核单为 `rejected` 时允许重新提交，见 §A.3 修订）。
 - 已注册手机号发短信，响应体与未注册**逐字节一致**。
 - 验证码 5 次错误后失效；验证码一次性（二次使用失败）。
 - 2FA 用户走验证码登录后**仍需** 2FA。
@@ -630,6 +647,7 @@ POST /api/auth/sms/send {purpose: login}
 next_action = "login"             已注册且已启用 → 前端用票据换 token
 next_action = "register"          未注册       → 前端直接进注册第二步（不再收码）
 next_action = "pending_approval"  已注册但待审核 → 提示等待管理员审核
+next_action = "rejected"          已注册但 KYC 审核被驳回 → 引导去注册页重新提交
 ```
 
 **这不是号码枚举漏洞**：调用方已经通过验证码证明了持有该号码，
@@ -648,6 +666,18 @@ JWT 进 URL 会进浏览器历史与 Referer 头），注册页直接渲染第�
 理由：允许重复注册会让审核状态变成可被反复触发的状态机，用户能靠反复提交
 把「未审核」这个状态刷下去；而且覆盖更新资料本就可以通过用户管理页做，
 不需要开放给未通过认证的调用方。
+
+> **2026-11-04 修订**：本节所述「直接拒绝」新增**一个例外** —— 若该手机号
+> 对应的**最新 KYC 审核单状态为 `rejected`**，允许用户**重新提交实名材料**
+> （新建一张审核单，旧的被驳回单保留为历史）。
+>
+> 理由：驳回必须给出补救路径，否则用户永久卡死无法登录。
+>
+> 为什么安全：能走到这一步的用户**已通过短信验证码验证**（持有该号码）；
+> 重提只能把审核单打回 `pending`，**审核通过仍必须由管理员点**，「未审核」
+> 状态无法被反复提交刷成「已审核」。防刷目标不受影响。
+>
+> 详见 `docs/superpowers/specs/2026-11-04-user-registration-review-design.md` §3.5。
 
 ### A.4 修订三：自适应人机验证（阿里云验证码 2.0）
 

@@ -171,6 +171,46 @@ class User(Base):
     )
 
 
+class UserReview(Base):
+    """注册用户的一次 KYC 实名审核单。
+
+    与 `users.is_active` 的分工（两者不可互相替代）：
+      - `status`         = 业务审核状态（pending / approved / rejected）
+      - `users.is_active` = 登录闸门（审核通过才置 True）
+
+    `is_active` 表达不了「已驳回」—— 它只有启用 / 禁用两态，也没有地方存
+    审核时间、审核人、驳回原因。所以审核状态独立成表，`is_active` 退化为
+    纯登录闸门。两个维度正交：审核通过后管理员仍可在用户权限页禁用该用户
+    （表现为 status='approved' + is_active=False）。
+
+    一人可有多张单：被驳回后重新提交会**新建**一张，旧单保留，审核历史可追溯。
+
+    **实名材料只有三项**：姓名 / 邮箱 / 手机号。
+    手机号在这里是**快照**（提交审核那一刻的号码）—— 用户之后改绑手机号
+    不影响历史单据展示的当时信息。
+    """
+    __tablename__ = "user_reviews"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    status: Mapped[str] = mapped_column(
+        String(16), default="pending", server_default="pending", index=True
+    )
+    # —— 实名材料：姓名 / 邮箱 / 手机号 ——
+    real_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    email: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # 提交时的手机号快照（脱敏展示用：138****8000）
+    phone: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # 用户是否自填了姓名（False = 由管理员在审核时手工补录）
+    kyc_submitted: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    # —— 审核流转 ——
+    submit_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    audited_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    audited_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    reject_reason: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 class Role(Base):
     """角色：一组菜单 + 一组能力。内置角色（admin / user）由启动种子创建，不可删除。
 

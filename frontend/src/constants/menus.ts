@@ -14,6 +14,7 @@ export const MENU_PATHS: ReadonlyArray<{ code: string; path: string }> = [
   { code: 'events', path: '/events' },
   { code: 'audits', path: '/audits' },
   { code: 'permissions', path: '/permissions' },
+  { code: 'user_audit', path: '/user-audit' },
 ]
 
 /**

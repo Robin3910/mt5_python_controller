@@ -1,4 +1,4 @@
-"""策略加仓的纯判定逻辑（无 I/O，可单独单元测试）。
+﻿"""策略加仓的纯判定逻辑（无 I/O，可单独单元测试）。
 
 规则来自服务端随 strategy_start 下发的快照，字段与后台「策略模版」一致：
 
@@ -206,10 +206,9 @@ class PriceLevelPlan:
     level_fallback: bool = False
     # 手数是怎么算出来的（人话说明，随事件上报）
     volume_formula: str = ""
-    # 每手止盈金额（入场价 → 止盈价），反推手数用
+    # 每手止盈金额（入场价 → 参考止盈价），反推手数用
     profit_per_lot: float = 0.0
-    # 反推手数用的 tier1 目标金额：手数是按它算的，
-    # 成交后立起「按指定价算止盈」分支时要记下它（分支价代表的金额）。
+    # 反推手数用的目标金额：按「挂单时该方向存量手数命中的档位」取。
     tier_amount: float = 0.0
 
     @property
@@ -284,12 +283,14 @@ def is_price_level(level: dict) -> bool:
 
 
 def price_level_params(level: dict) -> dict:
-    """指定价档位的出场参数：入场价 / 止盈价 / 自有止损。
+    """指定价档位的出场参数：入场价 / 参考止盈价 / 自有止损。
 
-    `tp_ref`（止盈价）有两个用途：
-    1. **反推手数**：这一档开多大，按阶梯止盈 1 的目标金额倒推；
-    2. **成交后接管该方向的止盈**：它是权威绝对价位，存量仓位的止盈
-       也全部对齐到它，价格打到它时全场合计盈亏正好是 tier1 金额。
+    `tp_ref`（参考止盈价）只有一个用途：**反推手数**——它决定「每手止盈」
+    这个距离（|tp_ref - entry| / tick_size x tick_value）。
+
+    **它不是出场价**：成交后该方向的出场价按「当前总手数命中的档位金额」
+    算（加权均价 ± 金额 / ((tick_value/tick_size) x 总手数)），见
+    `signal_pl.plan_common_stops`。
     """
     src = level if isinstance(level, dict) else {}
     return {
@@ -843,8 +844,7 @@ def plan_price_level(
     `limit_kind` 为 None（现价正好压在入场价上，两种单都挂不上）时返回 None，
     调用方本拍跳过。
 
-    `tier_amount`：反推手数用的 tier1 目标金额。手数是按它算的，
-    成交后立起「按指定价算止盈」分支时要记下它（分支价代表的金额）。
+    `tier_amount`：反推手数用的目标金额（按该方向存量手数命中的档位取）。
     """
     if not limit_kind:
         return None

@@ -6,6 +6,8 @@ declare module 'vue-router' {
   interface RouteMeta {
     /** 进入该页需要的菜单 code（与后端菜单注册表一致）；不填表示登录即可 */
     menu?: string
+    /** 仅超级管理员可进入（如系统级配置页） */
+    adminOnly?: boolean
   }
 }
 
@@ -124,7 +126,20 @@ const router = createRouter({
       component: () => import('@/views/PermissionView.vue'),
       meta: { menu: 'permissions' },
     },
-    { path: '/config', name: 'config', component: () => import('@/views/ConfigView.vue') },
+    {
+      // 「用户注册审核」：仅管理员（user_audit 菜单 assignable=False）
+      path: '/user-audit',
+      name: 'user-audit',
+      component: () => import('@/views/UserAuditView.vue'),
+      meta: { menu: 'user_audit' },
+    },
+    // 「配置」是系统级配置（节点令牌 / Webhook / 短信），仅管理员可进
+    {
+      path: '/config',
+      name: 'config',
+      component: () => import('@/views/ConfigView.vue'),
+      meta: { adminOnly: true },
+    },
     // 「我的」枢纽页：账号卡片 + 模块入口
     { path: '/me', name: 'me', component: () => import('@/views/MineView.vue') },
     // 「个人中心」：个人信息 / 带单员 / 修改密码 / 2FA（登录即可进，不限菜单）
@@ -139,7 +154,7 @@ const router = createRouter({
 })
 
 // 全局守卫：未登录只能进 /login / register；已登录先拉当前用户，再按菜单权限放行，
-// 无权限时跳到第一个有权限的菜单（都没有则到配置页）
+// 无权限时跳到第一个有权限的菜单（都没有则到个人中心）
 router.beforeEach(async (to) => {
   const auth = useAuthStore()
   const isPublic = to.name === 'login' || to.name === 'register'
@@ -156,6 +171,11 @@ router.beforeEach(async (to) => {
     }
   }
   if (to.meta.menu && !auth.hasMenu(to.meta.menu)) {
+    const fallback = firstAllowedPath(auth.hasMenu)
+    return fallback === to.path ? true : fallback
+  }
+  // 仅管理员页面（如系统级配置）：普通用户打不开，退回第一个有权限的菜单
+  if (to.meta.adminOnly && !auth.isAdmin) {
     const fallback = firstAllowedPath(auth.hasMenu)
     return fallback === to.path ? true : fallback
   }

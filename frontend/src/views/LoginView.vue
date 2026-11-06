@@ -16,6 +16,8 @@ const loginToken = ref('')
 
 /** 登录方式 Tab：password = 账号密码；sms = 手机验证码 */
 const tab = ref<'password' | 'sms'>('password')
+/** 实名审核被驳回 → 显示「重新提交实名材料」入口 */
+const resubmitHint = ref(false)
 /** 短信服务是否可用（未配置时隐藏验证码入口） */
 const smsEnabled = ref(false)
 /** 短信登录表单 */
@@ -216,6 +218,12 @@ async function submitSmsLogin(): Promise<void> {
       error.value = '该账号已注册，等待管理员审核通过后即可登录'
       return
     }
+    if (verify.next_action === 'rejected') {
+      // 实名审核被驳回 → 引导去注册页重新提交材料（不放行到登录）
+      error.value = `实名审核未通过：${verify.reject_reason || '请重新提交实名材料'}`
+      resubmitHint.value = true
+      return
+    }
 
     const result = await auth.loginBySms(phone, undefined, verify.ticket)
     if (result.requires2fa) {
@@ -356,6 +364,9 @@ function switchTab(next: 'password' | 'sms'): void {
           </div>
         </div>
         <div v-if="error" class="alert alert-error">{{ error }}</div>
+        <RouterLink v-if="resubmitHint" to="/register" class="btn-ghost btn-block">
+          重新提交实名材料
+        </RouterLink>
         <button class="btn-primary btn-block" :disabled="loading">
           {{ loading ? '登录中…' : '验证码登录' }}
         </button>
