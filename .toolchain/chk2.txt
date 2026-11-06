@@ -1,6 +1,0 @@
-﻿运行时目录存在: True
-msedgewebview2.exe: True
-文件数: 257
-体积: 677.8 MB
---- portable/webview2 内容 ---
-  Microsoft.WebView2.FixedVersionRuntime.157.0.4341.42.x64 : 37 files, 429.9 MB

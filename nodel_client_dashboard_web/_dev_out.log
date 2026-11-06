@@ -1,5 +1,0 @@
-[dev] bridge on 127.0.0.1:11281
-[dev] 直接打开: http://127.0.0.1:11281/?token=LWk8alc7EbJS06jEwufpLkjjTeauCbYXvUZ7uXzZpPI
-[dev] 或用 vite dev server（token 走同一个 query）:
-      http://127.0.0.1:5178/?token=LWk8alc7EbJS06jEwufpLkjjTeauCbYXvUZ7uXzZpPI
-[dev] Ctrl+C to stop

@@ -59,10 +59,23 @@ deploy/nginx/certs/*.crt
 node_modules/
 frontend/dist/
 
-# WebView 面板可携带目录（构建产物：exe + 随包 WebView2 运行时，430MB+）
-nodel_client_dashboard_web/portable/
 # WebView2 运行时源目录（构建工具链，600MB+）
 .toolchain/wv2_rt/
+
+# 构建工具链（InnoSetup 等第三方二进制，不入库）
+.toolchain/
+# superpowers 临时下载目录（whl 等）
+.superpowers/tmp*/
+
+# WebView 面板可携带目录（构建产物：exe + 随包 WebView2 运行时，430MB+）
+nodel_client_dashboard_web/portable/
+nodel_client_dashboard_web/portable.rar
+nodel_client_dashboard_web/portable.zip
+
+# 本地开发/E2E 临时产物（日志、pid、截图、夹具目录）
+nodel_client_dashboard_web/_dev_*.log
+nodel_client_dashboard_web/_e2e_*
+nodel_client_dashboard_web/e2e_*.png
 
 # OS / IDE
 .DS_Store

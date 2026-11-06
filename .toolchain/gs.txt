@@ -1,8 +1,0 @@
-﻿=== git status (nodel_client_dashboard_web 相关) ===
-  ?? nodel_client_dashboard_web/
-=== app_web.py 是否有随包运行时接入 ===
-  有
-=== diagnostics.py 是否有 bundled_runtime ===
-  有
-=== main.py selftest 是否铺日志 ===
-  没有

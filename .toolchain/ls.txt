@@ -1,6 +1,0 @@
-﻿build_exe.bat  2868
-build_package.py  7979
-build_version.py  2988
-portable.zip  256812612
-verify_runtime.py  5727
-_build_info.py  162
