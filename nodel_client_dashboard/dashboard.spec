@@ -10,6 +10,12 @@ datas: list = []
 _logo = Path("logo.ico")
 if _logo.is_file():
     datas.append((str(_logo.resolve()), "."))
+# 顶栏 / 登录页的圆形 logo（login_view / app_ui 会按 __file__ 旁的 assets/ 找）
+_assets = Path("assets")
+if _assets.is_dir():
+    for _asset in sorted(_assets.iterdir()):
+        if _asset.is_file():
+            datas.append((str(_asset.resolve()), "assets"))
 binaries: list = []
 hiddenimports: list = [
     # 打包前由 build_version.py stamp 生成；version.py 在 try 里导入，缺它只会回落到数字版本号

@@ -14,6 +14,7 @@ import asyncio
 import dataclasses
 import logging
 import time
+from datetime import datetime
 from typing import Optional
 
 from . import latency_marks, mt5_identity, persist, results, rules
@@ -203,8 +204,10 @@ class Dispatcher:
         # 轮询模式下先注册“等待回报”的 future
         fut = results.register(signal_id, node_id) if wait else None
         sent = await manager.send_to_node(node_id, cmd)
+        # sent_at 落库的是**真正的发包时刻**（sent_at 那个 epoch），不是 send_to_node
+        # 返回后的时刻：send_to_node 之后还有一次库往返，记那一时刻会把时延算高。
         await persist.record_dispatch(signal_id, node_id, vol, "passed", None, "pending",
-                                      sent_at=latency_marks.utcnow())
+                                      sent_at=datetime.fromtimestamp(sent_at))
         # 推送给后台前端做实时展示
         await manager.broadcast_admin(
             {"type": "dispatch", "data": {"signal_id": signal_id, "node_id": node_id,

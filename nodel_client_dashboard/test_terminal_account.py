@@ -10,6 +10,7 @@ from terminal_account import (
     enroll_import_login,
     read_algo_trading_allowed,
     read_terminal_account,
+    read_terminal_snapshot,
     resolve_import_login,
 )
 
@@ -126,3 +127,61 @@ def test_read_terminal_account_reports_logged_out(tmp_path, monkeypatch):
     with pytest.raises(TerminalAccountError, match="未登录"):
         read_terminal_account(tmp_path)
     assert fake.closed is True
+
+
+def test_read_terminal_snapshot_reports_server_and_algo_flag(tmp_path, monkeypatch):
+    """一次 attach 拿到券商服务器名与算法交易开关。"""
+    (tmp_path / "terminal64.exe").write_bytes(b"MZ")
+
+    class FakeMT5:
+        def initialize(self, path):
+            return True
+
+        def terminal_info(self):
+            return type("Info", (), {"trade_allowed": True})()
+
+        def account_info(self):
+            return type("Info", (), {"login": 88001234, "server": "trademaxglobal"})()
+
+        def shutdown(self):
+            self.closed = True
+
+    fake = FakeMT5()
+    monkeypatch.setattr(ta, "_load_mt5", lambda: fake)
+    snapshot = read_terminal_snapshot(tmp_path)
+    assert snapshot["mt5_server"] == "trademaxglobal"
+    assert snapshot["login"] == 88001234
+    assert snapshot["algo_trading_allowed"] is True
+    assert fake.closed is True
+
+
+def test_read_terminal_snapshot_is_empty_when_terminal_missing(tmp_path):
+    """没有终端时只返回空位，不抛异常。"""
+    snapshot = read_terminal_snapshot(tmp_path / "missing")
+    assert snapshot["mt5_server"] == ""
+    assert snapshot["login"] == 0
+    assert snapshot["algo_trading_allowed"] is None
+
+
+def test_read_terminal_snapshot_keeps_server_when_logged_out(tmp_path, monkeypatch):
+    """终端未登录时服务器名为空，算法交易状态仍照常读。"""
+    (tmp_path / "terminal64.exe").write_bytes(b"MZ")
+
+    class FakeMT5:
+        def initialize(self, path):
+            return True
+
+        def terminal_info(self):
+            return type("Info", (), {"trade_allowed": False})()
+
+        def account_info(self):
+            return None
+
+        def shutdown(self):
+            self.closed = True
+
+    monkeypatch.setattr(ta, "_load_mt5", lambda: FakeMT5())
+    snapshot = read_terminal_snapshot(tmp_path)
+    assert snapshot["mt5_server"] == ""
+    assert snapshot["login"] == 0
+    assert snapshot["algo_trading_allowed"] is False

@@ -126,6 +126,41 @@ def _migrate_latency_marks(sync_conn) -> None:
                 sync_conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
 
 
+# 时延埋点列需要毫秒精度的表 / 列：
+#   signal_dispatch    —— sent_at → finished_at 是普通信号分发的「命令往返时延」
+#   group_task_dispatch —— sent_at → opened_at 是策略任务的「命令往返时延」
+#                         （opened_at = 节点首次回报开仓；finished_at 是策略平仓收口，
+#                          那是持仓时长，不是时延，两者语义完全不同）
+# MySQL 的 DATETIME 默认整秒，发包与回报同秒就记成 0ms，跨机往返时延根本算不出来，
+# 所以这几列要 ALTER 成 DATETIME(3)。SQLite 的 DateTime 本身就存微秒，不用动。
+_MS_PRECISION_COLUMNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("signal_dispatch", ("sent_at", "finished_at", "recv_at", "order_at", "filled_at")),
+    ("group_task_dispatch", ("sent_at", "opened_at", "recv_at", "order_at", "filled_at")),
+)
+
+
+def _migrate_latency_precision(sync_conn) -> None:
+    """把时延埋点列放宽到毫秒精度（MySQL DATETIME → DATETIME(3)）。"""
+    inspector = inspect(sync_conn)
+    if sync_conn.engine.dialect.name != "mysql":
+        return
+    tables = set(inspector.get_table_names())
+    for table, columns in _MS_PRECISION_COLUMNS:
+        if table not in tables:
+            continue
+        for col in inspector.get_columns(table):
+            name = col["name"]
+            if name not in columns:
+                continue
+            # 已经是毫秒精度就跳过：新建库的列本来就是 DATETIME(3)，
+            # 每次启动都 ALTER 一遍会白白锁表。
+            if getattr(col.get("type"), "fsp", None) == 3:
+                continue
+            sync_conn.execute(
+                text(f"ALTER TABLE {table} MODIFY COLUMN {name} DATETIME(3) NULL")
+            )
+
+
 def _migrate_audit_columns(sync_conn) -> None:
     """为已存在的 audit_log 表补充分类与操作前后数据列。"""
     inspector = inspect(sync_conn)
@@ -459,6 +494,7 @@ async def init_db() -> None:
         await conn.run_sync(_migrate_dispatch_price_column)
         await conn.run_sync(_migrate_signal_source_column)
         await conn.run_sync(_migrate_latency_marks)
+        await conn.run_sync(_migrate_latency_precision)
         await conn.run_sync(_migrate_audit_columns)
         await conn.run_sync(_migrate_node_group_strategy_id)
         await conn.run_sync(_migrate_node_group_trend_risk)

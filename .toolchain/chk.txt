@@ -1,0 +1,15 @@
+﻿运行时缓存存在: True
+  版本目录: Microsoft.WebView2.FixedVersionRuntime.157.0.4341.42.x64
+--- .env 候选 ---
+D:\work_space\mt5_python_controller\nodel_client_dashboard_web\.env exists=False
+D:\work_space\mt5_python_controller\nodel_client_dashboard_web\dist\.env exists=True
+--- dist 现有内容 ---
+  log
+  logs
+  .env
+  dist.rar
+  err.log
+  instances.json
+  out.log
+  version.txt
+  亿点点控制台 - WebView.exe

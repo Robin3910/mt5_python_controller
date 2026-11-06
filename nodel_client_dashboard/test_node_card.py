@@ -5,6 +5,7 @@ import tkinter as tk
 
 import pytest
 
+import theme
 from models import InstanceConfig
 from process_manager import ProcessManager
 from viewmodels import build_list
@@ -68,12 +69,22 @@ def test_card_uptime_none_shows_dash(root):
 
 
 def test_card_server_and_id_labels(root):
+    """卡片左位是券商服务器名，右位金色胶囊是交易账号。"""
     from node_card import NodeCard
     vm = _vm(root, process_alive=True, health="ok", mt5_login=88001234,
-             node_id="TID-9")
+             node_id="TID-9", mt5_server="gtcglobal-sa-server5")
     card = NodeCard(root, vm)
-    assert "88001234" in card._server_label.cget("text")
-    assert "TID-9" in card._id_label.cget("text")
+    assert "gtcglobal-sa-server5" in card._server_label.cget("text")
+    assert "88001234" in card._id_label.cget("text")
+
+
+def test_card_falls_back_to_placeholder_when_server_unknown(root):
+    """读不到券商服务器名时显示占位符，不用账号顶替（账号在右边胶囊里）。"""
+    from node_card import NodeCard
+    vm = _vm(root, process_alive=True, health="ok", mt5_login=88001234)
+    card = NodeCard(root, vm)
+    assert "服务器 -" in card._server_label.cget("text")
+    assert "88001234" in card._id_label.cget("text")
 
 
 def test_selected_card_uses_gold_border(root):
@@ -81,9 +92,26 @@ def test_selected_card_uses_gold_border(root):
     import theme
     vm = _vm(root, process_alive=True, health="ok")
     card = NodeCard(root, vm)
-    assert card.card.cget("border_color") == theme.LINE
+    # 在线卡片按 CSS 用微绿描边（.node-card.online {border-color:#2fd38138}）
+    assert card.card.cget("border_color") == theme.BORDER_ONLINE
     card.update(_replace_selected(vm, True))
     assert card.card.cget("border_color") == theme.GOLD
+
+
+def test_offline_card_uses_line_border(root):
+    from node_card import NodeCard
+    import theme
+    card = NodeCard(root, _vm(root, process_alive=False, health="dead"))
+    assert card.card.cget("border_color") == theme.LINE
+
+
+def test_starting_card_uses_amber_border(root):
+    from node_card import NodeCard
+    import theme
+    vm = _vm(root, process_alive=False, busy="starting", health="starting")
+    card = NodeCard(root, vm)
+    assert card.card.cget("border_color") == theme.BORDER_STARTING
+    card.stop_animation()
 
 
 def test_algo_trading_unknown_is_not_ok(root):
@@ -168,3 +196,62 @@ def test_card_context_binding_exists(root):
 def _replace_selected(vm, selected: bool):
     import dataclasses
     return dataclasses.replace(vm, selected=selected)
+
+
+# ─────────────────────────────────────────────────── CSS 规格对齐
+
+def test_card_uses_css_radius_and_padding(root):
+    """`.node-card` 的圆角是 10px（CSS 实测值，不是 8）。"""
+    from node_card import NodeCard
+    card = NodeCard(root, _vm(root, process_alive=True, health="ok"))
+    assert card.card.cget("corner_radius") == 10
+    assert card.card.cget("fg_color") == theme.PANEL
+
+
+def test_info_cell_uses_css_colors(root):
+    """`.info-value.ok` 绿色；`.info-value.no` 是 --dim(灰)，不是红色。"""
+    from node_card import NodeCard
+    # 已鉴权由 ws_state == "authenticated" 推出
+    card = NodeCard(root, _vm(root, process_alive=True, health="ok",
+                              ws_state="authenticated"))
+    ok_cell = card._cells[1]
+    assert ok_cell.value_label.cget("text") == "已鉴权"
+    assert ok_cell.value_label.cget("text_color") == theme.GREEN
+    assert ok_cell.mark_label.cget("text") == "✓"
+    assert ok_cell.mark_frame.cget("fg_color") == theme.GREEN_ICO_BG
+
+    card.update(_vm(root, process_alive=True, health="ok", ws_state="connecting"))
+    bad_cell = card._cells[1]
+    assert bad_cell.value_label.cget("text") == "未鉴权"
+    assert bad_cell.value_label.cget("text_color") == theme.DIM
+    assert bad_cell.mark_label.cget("text") == "✕"
+    assert bad_cell.mark_frame.cget("fg_color") == theme.RED_ICO_BG
+
+
+def test_id_caption_is_gold_pill(root):
+    """`.mt5-id-inline` 是金色文字 + 7px 圆角 + 淡琥珀底。"""
+    from node_card import NodeCard
+    vm = _vm(root, process_alive=True, health="ok", mt5_login=88001234)
+    card = NodeCard(root, vm)
+    assert card._id_label.cget("text") == "ID 88001234"
+    assert card._id_label.cget("text_color") == theme.GOLD_LIGHT
+    assert card._id_label.cget("corner_radius") == 7
+    assert card._id_label.cget("fg_color") == theme.AMBER_BADGE_BG
+
+
+def test_toggle_button_text_follows_alive_state(root):
+    """参考稿文案：运行中显示「暂停」，已停止显示「启动」。"""
+    from node_card import NodeCard
+    card = NodeCard(root, _vm(root, process_alive=True, health="ok"))
+    assert card._toggle_btn.cget("text") == "暂停"
+    card.update(_vm(root, process_alive=False, health="dead"))
+    assert card._toggle_btn.cget("text") == "启动"
+
+
+def test_status_dot_is_8px(root):
+    """`.status-dot` 是 8px 圆点。"""
+    import theme
+    from node_card import NodeCard
+    card = NodeCard(root, _vm(root, process_alive=True, health="ok"))
+    assert card._dot.cget("width") == theme.H_DOT == 8
+    assert card._dot.cget("height") == 8

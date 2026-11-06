@@ -303,37 +303,96 @@ def test_pending_node_auto_issues_only_after_approval_and_enable(login, tmp_path
     assert cfg.has_credential and session.nodes["nd_one"]["has_credential"]
 
 
-@pytest.mark.parametrize("invalid", [False, "forbidden"])
-def test_existing_bad_scoped_token_never_auto_rotates(login, tmp_path, invalid):
+def test_revoked_scoped_token_is_auto_rotated_without_user_action(login, tmp_path):
+    """本机专属令牌被作废 → 面板自己轮换一枚新的写回 .env，不让用户管令牌。"""
     session, api = login
     api.items[0]["has_credential"] = True
     session.review()
     cfg = config(session, tmp_path)
-    initial = "NODE_TOKEN=ndv1.nd_one.synthetic-invalid-node-token\n"
     env = tmp_path / ".env"
-    env.write_text(initial, encoding="utf-8")
-    if invalid == "forbidden":
-        api.credential.side_effect = DashboardAuthError("令牌已撤销", status=403)
-    else:
-        api.credential.return_value = {**api.credential.return_value, "valid": False}
-    assert not session.sync_credential(cfg)
-    assert env.read_text(encoding="utf-8") == initial
-    assert api.credential.call_args.args[1] == "verify"
+    env.write_text("NODE_TOKEN=ndv1.nd_one.synthetic-invalid-node-token\n", encoding="utf-8")
+    api.credential.side_effect = [
+        {"valid": False, "node_id": "nd_one", "mt5_login": 12345, "generation": 1},
+        {"node_id": "nd_one", "mt5_login": 12345, "generation": 2,
+         "token": "ndv1.nd_one.synthetic-rotated-token"},
+    ]
+    assert session.sync_credential(cfg)
+    assert "NODE_TOKEN=ndv1.nd_one.synthetic-rotated-token" in env.read_text(encoding="utf-8")
+    assert [call.args[1] for call in api.credential.call_args_list] == ["verify", "rotate"]
     assert session.active
 
 
-def test_missing_existing_token_requires_user_rotation_confirmation(login, tmp_path):
+def test_rotation_is_refused_when_another_machine_holds_the_node(login, tmp_path):
+    """别处正连着这个节点时不能轮换：轮换会把对方的节点踢下线。"""
+    session, api = login
+    api.items[0]["has_credential"] = True
+    api.items[0]["status"] = "online"
+    session.review()
+    cfg = config(session, tmp_path)
+    env = tmp_path / ".env"
+    env.write_text("NODE_TOKEN=ndv1.nd_one.synthetic-invalid-node-token\n", encoding="utf-8")
+    api.credential.side_effect = [
+        {"valid": False, "node_id": "nd_one", "mt5_login": 12345, "generation": 1},
+    ]
+    repair = session.ensure_local_credential(cfg, rotate_allowed=False)
+    assert not repair.ok
+    assert "其他终端" in repair.reason
+    assert env.read_text(encoding="utf-8") == "NODE_TOKEN=ndv1.nd_one.synthetic-invalid-node-token\n"
+    assert [call.args[1] for call in api.credential.call_args_list] == ["verify"]
+
+
+def test_own_online_node_may_still_be_rotated(login, tmp_path):
+    """本机自己正在跑这个节点时允许轮换 —— 轮换后由面板重启自己。"""
+    session, api = login
+    api.items[0]["has_credential"] = True
+    api.items[0]["status"] = "online"
+    session.review()
+    cfg = config(session, tmp_path)
+    env = tmp_path / ".env"
+    env.write_text("NODE_TOKEN=ndv1.nd_one.synthetic-invalid-node-token\n", encoding="utf-8")
+    api.credential.side_effect = [
+        {"valid": False, "node_id": "nd_one", "mt5_login": 12345, "generation": 1},
+        {"node_id": "nd_one", "mt5_login": 12345, "generation": 2,
+         "token": "ndv1.nd_one.synthetic-rotated-token"},
+    ]
+    mp = SimpleNamespace(cfg=cfg, daemon_grant=None,
+                         runtime=SimpleNamespace(ws_state="authenticated", node_id="nd_one"))
+    assert session.rotation_allowed(cfg, mp)
+    assert session.sync_credential(cfg)
+    assert "NODE_TOKEN=ndv1.nd_one.synthetic-rotated-token" in env.read_text(encoding="utf-8")
+
+
+def test_missing_local_token_is_auto_reissued_on_start(login, tmp_path):
+    """本机令牌缺失（后端已签发过）→ 启动时自动轮换，不要求用户确认。"""
     session, api = login
     api.items[0]["has_credential"] = True
     session.review()
     cfg = config(session, tmp_path)
-    assert not session.sync_credential(cfg)
-    api.credential.assert_not_called()
-    api.credential.side_effect = DashboardAuthError("凭证已签发", status=409)
-    with pytest.raises(DashboardAuthError, match="确认|重置"):
-        session.prepare_start(SimpleNamespace(cfg=cfg, daemon_grant=None))
-    assert not (tmp_path / ".env").exists()
-    assert all(call.args[1] != "rotate" for call in api.credential.call_args_list)
+    api.credential.side_effect = [
+        {"node_id": "nd_one", "mt5_login": 12345, "generation": 2,
+         "token": "ndv1.nd_one.synthetic-rotated-token"},
+    ]
+    mp = SimpleNamespace(cfg=cfg, daemon_grant=None)
+    session.prepare_start(mp)
+    text = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert "NODE_TOKEN=ndv1.nd_one.synthetic-rotated-token" in text
+    assert [call.args[1] for call in api.credential.call_args_list] == ["rotate"]
+    assert mp.daemon_grant is not None
+
+
+def test_issue_conflict_falls_back_to_rotate(login, tmp_path):
+    """后端报「已签发」时自动改走轮换，而不是让用户去点按钮。"""
+    session, api = login
+    session.review()
+    cfg = config(session, tmp_path)
+    api.credential.side_effect = [
+        DashboardAuthError("凭证已签发", status=409),
+        {"node_id": "nd_one", "mt5_login": 12345, "generation": 2,
+         "token": "ndv1.nd_one.synthetic-rotated-token"},
+    ]
+    assert session.sync_credential(cfg)
+    assert [call.args[1] for call in api.credential.call_args_list] == ["issue", "rotate"]
+    assert "NODE_TOKEN=ndv1.nd_one.synthetic-rotated-token" in (tmp_path / ".env").read_text(encoding="utf-8")
 
 
 def test_legacy_global_node_keeps_original_token_and_does_not_convert(login, tmp_path):
@@ -389,3 +448,22 @@ def test_admin_load_does_not_recover_instance_from_another_backend(login, tmp_pa
     manager.load([cfg])
     recovered.assert_not_called()
     api.daemon_grant.assert_not_called()
+
+
+def test_backend_node_record_fills_broker_server_name(login, tmp_path):
+    """后台节点记录里带券商服务器名时，实例配置要拿到它。"""
+    session, api = login
+    api.items[0]["mt5_server"] = "gtcglobal-sa-server5"
+    session.review()
+    cfg = config(session, tmp_path)
+    assert cfg.mt5_server == "gtcglobal-sa-server5"
+
+
+def test_missing_backend_server_name_keeps_existing_value(login, tmp_path):
+    """后台没带服务器名时不能把已知值冲掉（老后端版本就没有这个字段）。"""
+    session, api = login
+    session.review()
+    cfg = config(session, tmp_path)
+    cfg.mt5_server = "trademaxglobal"
+    session.apply_node(cfg, {**session.nodes["nd_one"], "mt5_server": ""})
+    assert cfg.mt5_server == "trademaxglobal"

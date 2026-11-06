@@ -735,3 +735,9 @@ async def _update_node_mt5(node_id: str, ws: WebSocket, data: dict) -> None:
     if server:
         node["mt5_server"] = server
         await store.cache_node(node)
+        # 同时落库：Redis 只是缓存，缓存被清或节点离线后服务器名就不见了，
+        # 面板上的「服务器」位会变空。落库后它一直可查。
+        try:
+            await node_service.report_mt5_server(store, node_id, server)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("persist mt5_server for node %s failed: %s", node_id, exc)

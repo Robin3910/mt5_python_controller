@@ -13,6 +13,7 @@ from tkinter import filedialog, messagebox, simpledialog
 import customtkinter as ctk
 
 import version_service as vs
+from assets_path import logo_path
 from busy_status import BusyStatus
 from client_deploy import count_pending_upgrades, read_version_near
 from models import InstanceConfig, default_label_from_path, shorten_path
@@ -21,7 +22,7 @@ from dashboard_auth_ui import DashboardAuthUI
 from auth_service import DashboardAuthError
 from session_ui import SessionDialog, secured, requires_session
 from store import load_instances, load_panel_config, save_instances
-from terminal_account import read_algo_trading_allowed
+from terminal_account import read_terminal_snapshot
 from tray_icon import TrayController, apply_window_icon, tray_available
 from version import get_version
 from theme import (
@@ -41,10 +42,14 @@ from theme import (
     GOLD,
     LINE,
     MUTE,
+    PANEL,
+    PANEL2,
     TEXT,
     TEXT_DIM,
     TEXT_MUTED,
     WARNING,
+    W_AVATAR,
+    W_LOGO,
     apply_theme,
     danger_btn,
     font,
@@ -357,24 +362,31 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
         self.grid_rowconfigure(1, weight=1)
 
         # —— 顶栏 ——
-        header = glass_card(self, corner_radius=0, border_width=0, fg_color=BG_ELEVATED)
+        # .console-header {height:54px;background:var(--panel);border-bottom:1px solid var(--line)}
+        header = glass_card(self, corner_radius=0, border_width=0, fg_color=PANEL)
         header.grid(row=0, column=0, sticky="ew")
         header.grid_columnconfigure(1, weight=1)
 
+        # .header-brand {display:flex;align-items:center;gap:10px}
         brand = ctk.CTkFrame(header, fg_color="transparent")
-        brand.grid(row=0, column=0, padx=20, pady=12, sticky="w")
+        brand.grid(row=0, column=0, padx=18, pady=12, sticky="w")
+        self._build_header_logo(brand)
+        # .header-name {font-size:15px;font-weight:700;letter-spacing:.04em}
         ctk.CTkLabel(
-            brand, text="亿点点", text_color=GOLD, font=font(20, "bold")
+            brand, text="亿点点交易", text_color=TEXT, font=font(15, "bold")
         ).pack(side="left")
+        # .header-divider {width:1px;height:18px;background:var(--line);margin:0 2px}
+        ctk.CTkFrame(brand, width=1, height=18, fg_color=LINE, border_width=0).pack(
+            side="left", padx=(10, 10)
+        )
+        # .header-module {font-size:13px;color:var(--dim)}
         ctk.CTkLabel(
-            brand, text="│", text_color=LINE, font=font(18)
-        ).pack(side="left", padx=10)
-        ctk.CTkLabel(
-            brand, text="节点控制台", text_color=TEXT, font=font(15, "bold")
+            brand, text="节点控制台", text_color=DIM, font=font(13)
         ).pack(side="left")
 
+        # .header-right {display:flex;align-items:center;gap:14px}
         right = ctk.CTkFrame(header, fg_color="transparent")
-        right.grid(row=0, column=2, padx=20, pady=12, sticky="e")
+        right.grid(row=0, column=2, padx=18, pady=12, sticky="e")
         # 长耗时操作（批量替换等）的状态条：转圈 + 文案，空闲时清空不占视觉
         self.header_status = ctk.CTkLabel(
             right, text="", text_color=TEXT_MUTED, font=font(12), anchor="e"
@@ -382,18 +394,16 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
         self.header_status.pack(side="left", padx=(0, 12))
         # 布局会随重新登录重建，旧指示器指向已销毁的标签，必须重置
         self._header_busy_status = None
+        # .header-clock {font-size:12px;color:var(--mute)}
         self._clock_label = ctk.CTkLabel(
             right,
             text=time.strftime("%Y-%m-%d %H:%M:%S"),
-            text_color=DIM,
+            text_color=MUTE,
             font=mono(12),
             anchor="e",
         )
         self._clock_label.pack(side="left", padx=(0, 14))
-        self._user_label = ctk.CTkLabel(
-            right, text=self._session_username(), text_color=TEXT, font=font(12)
-        )
-        self._user_label.pack(side="left", padx=(0, 14))
+        self._build_header_user(right)
         self.version_btn = ghost_btn(
             right, _VERSION_BTN_IDLE, self._open_version_update, width=_VERSION_BTN_W
         )
@@ -427,12 +437,14 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
         ).grid(row=1, column=0, sticky="w", padx=18, pady=(8, 0))
 
         # —— 区段头：标题 + 工具条 ——
+        # .section-head {display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px}
         head = ctk.CTkFrame(body, fg_color="transparent")
         head.grid(row=2, column=0, sticky="ew", padx=14, pady=(16, 4))
         head.grid_columnconfigure(1, weight=1)
 
+        # .section-head h2 {font-size:15px;font-weight:700;letter-spacing:.02em}
         ctk.CTkLabel(
-            head, text="MT5 节点", text_color=TEXT, font=font(16, "bold"), anchor="w"
+            head, text="MT5 节点", text_color=TEXT, font=font(15, "bold"), anchor="w"
         ).grid(row=0, column=0, sticky="w")
 
         tools = ctk.CTkFrame(head, fg_color="transparent")
@@ -452,9 +464,6 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
         account_tools.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
         ghost_btn(
             account_tools, "绑定后台节点", self._bind_instance, width=112, height=26
-        ).pack(side="left", padx=(0, 6))
-        ghost_btn(
-            account_tools, "重置专属令牌", self._rotate_credential, width=112, height=26
         ).pack(side="left", padx=(0, 6))
 
         # —— 节点网格 ——
@@ -485,6 +494,76 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
 
         self._grid_columns_cache = 0
         self.bind("<Configure>", self._on_window_resize, add="+")
+
+    def _build_header_logo(self, master) -> None:
+        """顶栏圆形 logo。
+
+        参考稿 `.header-logo` 是 32px 圆形容器，内嵌一张圆形裁切的图片，
+        外圈是金色渐变环（`linear-gradient(135deg,gold-strong,gold)`）。
+        """
+        outer = ctk.CTkFrame(
+            master, width=W_LOGO, height=W_LOGO, corner_radius=W_LOGO // 2,
+            fg_color=GOLD, border_width=0,
+        )
+        outer.pack(side="left", padx=(0, 10))
+        outer.pack_propagate(False)
+        inner = ctk.CTkFrame(
+            outer, fg_color="#0b0f1a", corner_radius=W_LOGO // 2 - 2, border_width=0,
+        )
+        inner.pack(fill="both", expand=True, padx=2, pady=2)
+        inner.pack_propagate(False)
+        label = ctk.CTkLabel(inner, text="")
+        label.pack(fill="both", expand=True)
+        self._header_logo_label = label
+        self._load_header_logo(label)
+
+    def _load_header_logo(self, label) -> None:
+        """把 logo 裁成圆形贴上去；缺资源时退化成金色文字。"""
+        path = logo_path()
+        if path is None:
+            label.configure(text="亿", text_color=GOLD, font=font(13, "bold"))
+            return
+        try:
+            from PIL import Image, ImageDraw, ImageOps
+            from customtkinter import CTkImage
+
+            size = W_LOGO * 4
+            image = Image.open(path).convert("RGBA")
+            image = ImageOps.fit(image, (size, size), method=Image.LANCZOS)
+            mask = Image.new("L", (size, size), 0)
+            ImageDraw.Draw(mask).ellipse((0, 0, size, size), fill=255)
+            image.putalpha(mask)
+            label.configure(
+                image=CTkImage(light_image=image, dark_image=image,
+                              size=(W_LOGO, W_LOGO)),
+                text="",
+            )
+        except Exception:  # noqa: BLE001
+            label.configure(text="亿", text_color=GOLD, font=font(13, "bold"))
+
+    def _build_header_user(self, master) -> None:
+        """顶栏的用户头像按钮。
+
+        参考稿 `.header-user` 里是一个 24px 圆形头像（PANEL2 底 + 金色字）
+        加用户名；点击进个人中心。
+        """
+        wrap = ctk.CTkFrame(master, fg_color="transparent")
+        wrap.pack(side="left", padx=(0, 14))
+        avatar = ctk.CTkFrame(
+            wrap, width=W_AVATAR, height=W_AVATAR, corner_radius=W_AVATAR // 2,
+            fg_color=PANEL2, border_width=1, border_color=LINE,
+        )
+        avatar.pack(side="left", padx=(0, 7))
+        avatar.pack_propagate(False)
+        username = self._session_username()
+        ctk.CTkLabel(
+            avatar, text=(username[:1] or "A").upper(), text_color=GOLD,
+            font=font(12, "bold"), width=W_AVATAR, height=W_AVATAR,
+        ).pack()
+        self._user_label = ctk.CTkLabel(
+            wrap, text=username, text_color=DIM, font=font(13)
+        )
+        self._user_label.pack(side="left")
 
     def _session_username(self) -> str:
         """顶栏显示的当前登录用户名。"""
@@ -695,8 +774,25 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
         self._probe_algo_trading()
         self.after(2000, self._tick_ui)
 
+    @staticmethod
+    def _server_matches(mp, login: int) -> bool:
+        """终端里读到的服务器名是不是这个实例的。
+
+        终端可能已经换过账号：读到的服务器名属于另一个账号时不能写进来，
+        否则卡片上会显示别人的券商服务器。账号对不上就放弃这次读数。
+        """
+        expected = int(mp.cfg.mt5_login or 0)
+        if not expected or not login:
+            # 没绑定账号（手工添加的实例）时无从比对，放行。
+            return True
+        return expected == login
+
     def _probe_algo_trading(self) -> None:
-        """直接读各实例目录里的 MT5 终端，不依赖节点客户端是否上报。"""
+        """直接读各实例目录里的 MT5 终端，不依赖节点客户端是否上报。
+
+        一次 attach 同时取「算法交易开关」与「券商服务器名」——两者都在
+        同一个终端上，分开读要连两次 MT5。
+        """
         if getattr(self, "_algo_probe_running", False) or not self.session.active:
             return
         targets = [
@@ -709,26 +805,33 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
         generation = self.session.generation
 
         def work() -> None:
-            results: list[tuple[str, bool]] = []
+            results: list[tuple[str, bool | None, str]] = []
             for instance_id, directory in targets:
                 try:
-                    allowed = read_algo_trading_allowed(directory)
+                    snapshot = read_terminal_snapshot(directory)
                 except Exception:  # noqa: BLE001
-                    allowed = None
-                if isinstance(allowed, bool):
-                    results.append((instance_id, allowed))
+                    snapshot = {"algo_trading_allowed": None, "mt5_server": "", "login": 0}
+                allowed = snapshot.get("algo_trading_allowed")
+                server = str(snapshot.get("mt5_server") or "")
+                login = int(snapshot.get("login") or 0)
+                if isinstance(allowed, bool) or server:
+                    results.append((instance_id, allowed, server, login))
 
             def apply() -> None:
                 self._algo_probe_running = False
                 if generation != self.session.generation or not self.session.active:
                     return
                 changed = False
-                for instance_id, allowed in results:
+                for instance_id, allowed, server, login in results:
                     mp = self.manager.get(instance_id)
-                    if mp is None or mp.runtime.algo_trading_allowed == allowed:
+                    if mp is None:
                         continue
-                    mp.runtime.algo_trading_allowed = allowed
-                    changed = True
+                    if isinstance(allowed, bool) and mp.runtime.algo_trading_allowed != allowed:
+                        mp.runtime.algo_trading_allowed = allowed
+                        changed = True
+                    if server and self._server_matches(mp, login) and mp.runtime.mt5_server != server:
+                        mp.runtime.mt5_server = server
+                        changed = True
                 if changed:
                     self._safe_refresh()
 

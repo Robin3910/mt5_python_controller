@@ -40,6 +40,9 @@ class InstanceConfig:
     enabled: bool = True
     node_id: str | None = None
     mt5_login: int = 0
+    # 券商服务器名（如 trademaxglobal / gtcglobal-sa-server5）。
+    # 来源：后台节点记录（节点鉴权首包上报）或本机终端探测。
+    mt5_server: str = ""
     owner_user_id: int | None = None
     requested_by_user_id: int | None = None
     approval_status: str = "unbound"
@@ -95,6 +98,7 @@ class InstanceConfig:
             enabled=bool(data.get("enabled", True)),
             node_id=str(data["node_id"]) if data.get("node_id") else None,
             mt5_login=int(data.get("mt5_login") or 0),
+            mt5_server=str(data.get("mt5_server") or "").strip(),
             owner_user_id=data.get("owner_user_id"),
             requested_by_user_id=data.get("requested_by_user_id"),
             approval_status=str(data.get("approval_status") or "unbound"),
@@ -115,6 +119,8 @@ class RuntimeState:
     ws_state: str | None = None
     node_id: str | None = None
     mt5_login: int | None = None
+    # 券商服务器名（本机终端实时读数）；读不到时为空字符串。
+    mt5_server: str = ""
     runners: list[dict[str, Any]] = field(default_factory=list)
     last_error: str = ""
     uptime_s: float | None = None

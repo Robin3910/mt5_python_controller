@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import threading
+from dataclasses import dataclass
 from uuid import uuid4
 
 from auth_service import DashboardAPI, DashboardAuthError
@@ -10,6 +11,25 @@ from env_policy import env_values
 from store import load_audit_queue, save_audit_queue, load_daemon_events, save_daemon_events
 
 _DAEMON_QUEUE_LOCK = threading.RLock()
+
+# 后端那枚专属令牌正被别的机器使用时，不能轮换：轮换会把对方的节点踢下线。
+ROTATION_BLOCKED_REASON = "节点正在被其他终端使用，请稍后重试"
+
+
+@dataclass
+class CredentialRepair:
+    """本机专属令牌的自愈结果。
+
+    `ok`      —— 本机 .env 里的令牌可用（或已被自动修好）
+    `token`   —— 当前生效的令牌（供启动流程复用）
+    `reissued` —— 本次发生了重签：后端旧令牌已作废，运行中的客户端需要重启才用得上
+    `reason`  —— 修不好的原因，直接给用户看
+    """
+
+    ok: bool
+    token: str = ""
+    reissued: bool = False
+    reason: str = ""
 
 
 class DashboardSession:
@@ -113,6 +133,12 @@ class DashboardSession:
     def apply_node(self, cfg, node: dict) -> None:
         cfg.node_id = str(node["node_id"])
         cfg.mt5_login = int(node.get("mt5_login") or 0)
+        # 后端记着的券商服务器名（节点鉴权首包上报，落库后一直可查）。
+        # 后端没给时不覆盖：可能只是这一版后端还没这个字段，本机终端探测
+        # 读到的实时服务器名更准，不能被空值冲掉。
+        server = str(node.get("mt5_server") or "").strip()
+        if server:
+            cfg.mt5_server = server
         cfg.owner_user_id = node.get("owner_user_id")
         cfg.requested_by_user_id = node.get("requested_by_user_id")
         cfg.approval_status = str(node.get("approval_status") or ("approved" if node.get("enabled") else "pending"))
@@ -225,34 +251,186 @@ class DashboardSession:
         self.check(generation)
         return result
 
-    def sync_credential(self, cfg) -> bool:
-        """登录/定时复核时同步开通状态。凭证无效只阻止该实例，保留用户会话。"""
+    def _write_local_token(self, cfg, text: str, token: str) -> None:
+        """把专属令牌写回实例目录的 .env（面板内部动作，不惊动用户）。"""
         import env_file as ef
+
+        updates = {
+            "NODE_TOKEN": token,
+            "MANAGER_WS_URL": ef.ws_url_from_backend_base(self.api.base),
+            "DASHBOARD_EXPECTED_MT5_LOGIN": str(cfg.mt5_login),
+        }
+        self.perform(
+            "edit_env",
+            cfg,
+            lambda: ef.write_env(cfg.cwd, ef.update_env_text(text, updates)),
+        )
+
+    def _rotate_local_credential(self, cfg, text: str) -> CredentialRepair:
+        """轮换一枚专属令牌。
+
+        rotate 要带 `expected_generation`，后端据此做乐观锁：期间若有人
+        （另一个面板 / 管理员）动过凭证，就会 409。这里先用后端最新的
+        generation 重试一次，把「别人先动了」这种竞态也自动消化掉。
+        """
+        for attempt in (0, 1):
+            try:
+                issued = self.credential(cfg, "rotate")
+            except DashboardAuthError as exc:
+                if exc.status != 409 or attempt:
+                    return CredentialRepair(
+                        ok=False,
+                        reason="节点凭证状态已变化，请刷新后重试",
+                    )
+                node = self.nodes.get(str(cfg.node_id or ""))
+                if node is None:
+                    return CredentialRepair(ok=False, reason="节点已不可访问")
+                latest = int(node.get("credential_generation") or 0)
+                if latest == cfg.credential_generation:
+                    return CredentialRepair(
+                        ok=False, reason="节点凭证状态已变化，请刷新后重试"
+                    )
+                cfg.credential_generation = latest
+                continue
+            token = str(issued.get("token") or "")
+            if not token:
+                return CredentialRepair(ok=False, reason="后端未返回专属令牌")
+            try:
+                self._write_local_token(cfg, text, token)
+            except (DashboardAuthError, OSError) as exc:
+                return CredentialRepair(ok=False, reason=f"写入节点配置失败：{exc}")
+            cfg.credential_generation = int(issued.get("generation") or cfg.credential_generation)
+            cfg.has_credential = True
+            cfg.legacy_allowed = False
+            node = self.nodes.get(str(cfg.node_id or ""))
+            if node is not None:
+                node.update({
+                    "credential_generation": cfg.credential_generation,
+                    "has_credential": True,
+                    "legacy_allowed": False,
+                })
+            return CredentialRepair(ok=True, token=token, reissued=True)
+        return CredentialRepair(ok=False, reason="节点凭证状态已变化，请刷新后重试")
+
+    def _issue_local_credential(self, cfg, text: str, *, reissue: bool) -> CredentialRepair:
+        """后端签发 / 轮换一枚专属令牌，并写回本机 .env。
+
+        `reissue=True` 表示后端已经签过一枚、只是本机丢了 —— 必须走 rotate
+        显式作废旧令牌（issue 会被后端以 409 挡住）。轮换是不可逆的
+        （旧令牌即刻失效），但**本机令牌本就已经不可用**，不轮换就永远起不来，
+        因此这条路径不再需要用户确认。
+        """
+        if reissue:
+            return self._rotate_local_credential(cfg, text)
+        try:
+            issued = self.credential(cfg, "issue")
+        except DashboardAuthError as exc:
+            # issue 撞上「已签发」= 本机令牌丢失：改走 rotate。
+            if exc.status == 409:
+                return self._rotate_local_credential(cfg, text)
+            reason = {
+                403: "节点归属校验未通过，请联系管理员确认该节点归属",
+                404: "节点已不存在，请重新导入",
+            }.get(exc.status, str(exc))
+            return CredentialRepair(ok=False, reason=reason)
+        token = str(issued.get("token") or "")
+        if not token:
+            return CredentialRepair(ok=False, reason="后端未返回专属令牌")
+        try:
+            self._write_local_token(cfg, text, token)
+        except (DashboardAuthError, OSError) as exc:
+            return CredentialRepair(ok=False, reason=f"写入节点配置失败：{exc}")
+        cfg.credential_generation = int(issued.get("generation") or cfg.credential_generation)
+        cfg.has_credential = True
+        cfg.legacy_allowed = False
+        node = self.nodes.get(str(cfg.node_id or ""))
+        if node is not None:
+            node.update({
+                "credential_generation": cfg.credential_generation,
+                "has_credential": True,
+                "legacy_allowed": False,
+            })
+        return CredentialRepair(ok=True, token=token)
+
+    def node_is_online_elsewhere(self, cfg, mp=None) -> bool:
+        """该节点当前是否有一台**别的**机器在跑。
+
+        后端那枚专属令牌正被别处使用时，轮换会作废它 —— 那台机器下一次
+        重连就会失败，等于把别人的节点踢下线。这种情况不能自动轮换。
+
+        `mp` 是本机的实例：若状态口显示正是本机这台在连（ws 已鉴权、
+        节点编号一致），那就是「我们自己」，轮换后重启自己即可。
+        """
+        node = self.nodes.get(str(cfg.node_id or ""))
+        if not node or node.get("status") != "online":
+            return False
+        if mp is not None:
+            runtime = getattr(mp, "runtime", None)
+            if runtime is not None and runtime.ws_state == "authenticated" \
+                    and str(runtime.node_id or "") == str(cfg.node_id or ""):
+                return False
+        return True
+
+    def rotation_allowed(self, cfg, mp=None) -> bool:
+        """能不能安全地轮换这枚专属令牌。"""
+        return not self.node_is_online_elsewhere(cfg, mp)
+
+    def ensure_local_credential(self, cfg, *, rotate_allowed: bool = True) -> CredentialRepair:
+        """确保本机 .env 里有一枚可用的专属令牌；失效就自动重签。
+
+        这是「客户只管导入 + 启动」的落点：专属令牌是面板与后端之间的
+        内部凭据，本机丢了、过期了、被旧全局令牌覆盖了，都由面板自己修，
+        不把令牌管理甩给用户。
+
+        轮换会作废后端那一枚旧令牌 —— 只有在它已经无法被本机使用时才做，
+        否则没有副作用可言。`rotate_allowed=False` 用于「后端那边这枚令牌
+        正被另一台机器用着」的情况：这时轮换会把别人的节点踢下线，
+        必须拒绝。
+        """
+        import env_file as ef
+
         self.check()
         node = self.nodes.get(str(cfg.node_id or ""))
         if not node or cfg.approval_status != "approved" or not cfg.enabled:
-            return False
-        text, values = ef.read_env(cfg.cwd)
+            return CredentialRepair(ok=False, reason="节点尚未审核开通")
+        text, _ = ef.read_env(cfg.cwd)
         values = env_values(text)
         local_token = str(values.get("NODE_TOKEN") or "")
         if cfg.legacy_allowed and not local_token.startswith("ndv1."):
-            return bool(local_token)
+            # 旧节点沿用全局令牌：不签专属令牌，也不改它的令牌。
+            if not local_token:
+                return CredentialRepair(ok=False, reason="节点接入令牌缺失")
+            return CredentialRepair(ok=True, token=local_token)
+        if local_token.startswith("ndv1."):
+            try:
+                verified = self.credential(cfg, "verify", local_token)
+            except DashboardAuthError as exc:
+                if exc.status not in (401, 403, 404, 409):
+                    self.lock(str(exc))
+                    raise
+                verified = {}
+            if (verified.get("valid") is True
+                    and int(verified.get("mt5_login") or 0) == cfg.mt5_login):
+                cfg.credential_generation = int(verified.get("generation") or cfg.credential_generation)
+                return CredentialRepair(ok=True, token=local_token)
+            # 本机这枚专属令牌已被后端作废或绑错了账号 → 自动轮换一枚新的。
+            if not rotate_allowed:
+                return CredentialRepair(ok=False, reason=ROTATION_BLOCKED_REASON)
+            return self._issue_local_credential(cfg, text, reissue=True)
+        # 本机没有专属令牌（还是旧全局令牌，或压根是空的）：
+        # 后端没签过就签一枚；签过（= 本机那枚丢了）就轮换一枚。
+        if cfg.has_credential and not rotate_allowed:
+            return CredentialRepair(ok=False, reason=ROTATION_BLOCKED_REASON)
+        return self._issue_local_credential(cfg, text, reissue=bool(cfg.has_credential))
+
+    def sync_credential(self, cfg) -> bool:
+        """登录 / 定时复核时同步开通状态并自愈本机专属令牌。
+
+        凭证无效只阻止该实例，保留用户会话；令牌本身由面板自动修好，
+        用户不需要参与令牌管理。
+        """
         try:
-            if local_token.startswith("ndv1."):
-                data = self.credential(cfg, "verify", local_token)
-                if data.get("valid") is not True or int(data.get("mt5_login") or 0) != cfg.mt5_login:
-                    return False
-            else:
-                if cfg.has_credential:
-                    return False
-                data = self.credential(cfg, "issue")
-                self.check()
-                self.perform("edit_env", cfg, lambda: ef.write_env(cfg.cwd, ef.update_env_text(text, {"NODE_TOKEN": str(data["token"]), "MANAGER_WS_URL": ef.ws_url_from_backend_base(self.api.base), "DASHBOARD_EXPECTED_MT5_LOGIN": str(cfg.mt5_login)})))
-            cfg.credential_generation = int(data["generation"])
-            cfg.has_credential = True
-            cfg.legacy_allowed = False
-            node.update({"credential_generation": cfg.credential_generation, "has_credential": True, "legacy_allowed": False})
-            return True
+            return self.ensure_local_credential(cfg).ok
         except DashboardAuthError as exc:
             if exc.status in (401, 403, 404, 409):
                 return False
@@ -260,7 +438,11 @@ class DashboardSession:
             raise
 
     def prepare_start(self, mp) -> None:
-        """开通后配置专属令牌；旧令牌丢失必须由用户确认轮换，绝不暗中重签。"""
+        """启动前把专属令牌准备好；本机令牌失效由面板自动重签。
+
+        旧节点接入令牌缺失是人工配置问题，只能报错；专属令牌则是面板的
+        内部凭据，丢了就自动轮换，用户不需要参与。
+        """
         import env_file as ef
         self.check()
         generation = self.generation
@@ -277,22 +459,16 @@ class DashboardSession:
         if cfg.legacy_allowed and not token.startswith("ndv1."):
             if not token:
                 raise DashboardAuthError("旧节点接入令牌缺失，请管理员恢复配置", status=409)
-        elif not token.startswith("ndv1."):
-            try:
-                issued = self.credential(cfg, "issue")
-            except DashboardAuthError as exc:
-                if exc.status == 409:
-                    raise DashboardAuthError("本机专属令牌丢失，请使用「重置专属令牌」确认轮换", status=409) from exc
-                raise
-            token = str(issued["token"])
-            cfg.credential_generation = int(issued["generation"])
-            cfg.has_credential = True
-            cfg.legacy_allowed = False
         else:
-            verified = self.credential(cfg, "verify", token)
-            if verified.get("valid") is not True or int(verified.get("mt5_login") or 0) != cfg.mt5_login:
-                raise DashboardAuthError("本机令牌绑定的 MT5 账号不符", status=403)
-            cfg.credential_generation = int(verified["generation"])
+            repair = self.ensure_local_credential(
+                cfg, rotate_allowed=self.rotation_allowed(cfg, mp)
+            )
+            if not repair.ok:
+                raise DashboardAuthError(repair.reason or "节点专属令牌不可用", status=409)
+            token = repair.token
+            if repair.reissued:
+                # 自愈时已经把新令牌写进 .env 了；重读一次，避免用旧文本覆盖回去。
+                text, _ = ef.read_env(cfg.cwd)
         self.check(generation)
         data = self.api.daemon_grant(self.token, str(cfg.node_id))
         self.check(generation)

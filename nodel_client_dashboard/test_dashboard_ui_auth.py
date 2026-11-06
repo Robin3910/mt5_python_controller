@@ -460,6 +460,10 @@ def test_online_review_does_not_automatically_revive_revoked_guard(desktop, monk
     app.session.grant_for_recovery.reset_mock()
     api.items[0]["enabled"] = True
     monkeypatch.setattr(app.session, "sync_credential", lambda _cfg: True)
+    monkeypatch.setattr(app.session, "ensure_local_credential",
+                        lambda _cfg, **_kw: SimpleNamespace(ok=True, token="synthetic-token",
+                                                            reissued=False, reason=""))
+    monkeypatch.setattr(app.session, "rotation_allowed", lambda _cfg, _mp=None: True)
     app._apply_review(app.session.generation)
     app.session.grant_for_recovery.assert_not_called()
     assert not mp.daemon_grant.allowed

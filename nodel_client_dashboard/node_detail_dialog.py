@@ -6,7 +6,7 @@
     操作卡   启动 / 停止 / 节点配置 / 刷新健康 / 打开目录 / 守护开关
     摘要卡   运行快照（等宽字体，左对齐）
     任务区   策略任务 + 运行日志（默认收起）
-    底部行   编辑实例 / 绑定后台节点 / 重置专属令牌 / 移除实例 / 关闭
+    底部行   编辑实例 / 绑定后台节点 / 移除实例 / 关闭
 """
 from __future__ import annotations
 
@@ -119,7 +119,6 @@ class NodeDetailDialog(SessionDialog):
         foot.pack(fill="x", pady=(10, 0))
         ghost_btn(foot, "编辑实例", self._edit_instance, width=88).pack(side="left", padx=3)
         ghost_btn(foot, "绑定后台节点", self._bind_instance, width=112).pack(side="left", padx=3)
-        ghost_btn(foot, "重置专属令牌", self._rotate_credential, width=112).pack(side="left", padx=3)
         ghost_btn(
             foot, "移除实例", self._remove_instance, width=92,
             text_color=RED, border_color=RED,
@@ -163,7 +162,9 @@ class NodeDetailDialog(SessionDialog):
             if widget is None:
                 widget = status_chip(self.chip_row, "", color)
                 self._chip_widgets[chip_vm.key] = widget
-            widget.configure(text=f"  {chip_vm.text}  ", text_color=color)
+            widget.label.configure(text=chip_vm.text)
+            widget.dot.configure(fg_color=color)
+            widget.label.configure(text_color=color)
             widget.pack(side="left", padx=3)
 
     def _tone_color(self, tone: str, *, alive: bool = True, health: str = "unknown") -> str:
@@ -258,11 +259,6 @@ class NodeDetailDialog(SessionDialog):
         dashboard = self.dashboard
         dashboard._selected_id = self.mp.cfg.id
         dashboard._bind_instance()
-
-    def _rotate_credential(self) -> None:
-        dashboard = self.dashboard
-        dashboard._selected_id = self.mp.cfg.id
-        dashboard._rotate_credential()
 
     def _remove_instance(self) -> None:
         dashboard = self.dashboard

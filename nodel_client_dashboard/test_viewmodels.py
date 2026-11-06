@@ -146,9 +146,27 @@ def test_card_fields_reflect_runtime():
     assert item.algo_trading_known is True
     assert item.uptime_text == "1天 1小时"
     assert item.node_id == "TID-1"
-    assert item.server_label == "账号 88001234"
+    # 卡片左位是券商服务器名，右位金色胶囊是交易账号。
+    assert item.server_label == ""
+    assert item.account_label == "88001234"
     assert item.badge_text == "运行中"
     assert item.badge_tone == "online"
+
+
+def test_card_server_label_prefers_runtime_then_config():
+    """券商服务器名：本机实测值优先，回退到后台节点记录里存的值。"""
+    from viewmodels import build_list
+    mgr = ProcessManager()
+    cfg = InstanceConfig.create(name="a", exe_path="/x/a.exe", cwd="/x")
+    cfg.mt5_server = "gtcglobal-sa-server5"
+    mp = mgr.add(cfg)
+    mp.runtime = RuntimeState(process_alive=True, health="ok", mt5_login=88001234)
+    item = build_list(mgr, None)[0]
+    assert item.server_label == "gtcglobal-sa-server5"
+
+    mp.runtime.mt5_server = "trademaxglobal"
+    item = build_list(mgr, None)[0]
+    assert item.server_label == "trademaxglobal"
 
 
 def test_card_algo_unknown_is_not_ok():

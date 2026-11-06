@@ -27,6 +27,24 @@ nodel_client_dashboard/logs/
 nodel_client_dashboard/instances.json
 nodel_client_dashboard/.dashboard.lock
 nodel_client_dashboard/_build_info.py
+nodel_client_dashboard_web/dist/
+nodel_client_dashboard_web/build/
+nodel_client_dashboard_web/packages/
+nodel_client_dashboard_web/logs/
+nodel_client_dashboard_web/_build_info.py
+nodel_client_dashboard_web/e2e_login.png
+nodel_client_dashboard_web/e2e_console.png
+nodel_client_dashboard_web/e2e_console_detail.png
+nodel_client_dashboard_web/e2e_pick_dialog.png
+nodel_client_dashboard_web/e2e_pick_dir2.png
+nodel_client_dashboard_web/frozen_report.json
+nodel_client_dashboard_web/selftest.json
+nodel_client_dashboard_web/dist/exe_window.png
+nodel_client_dashboard_web/dist/logs/
+nodel_client_dashboard_web/dist/.env
+nodel_client_dashboard_web/dist/instances.json
+nodel_client_dashboard_web/login_page.png
+frontend-console/dist/
 .vscode/
 .opencode/
 AGENTS.md
@@ -39,6 +57,11 @@ deploy/nginx/certs/*.crt
 # Node / frontend
 node_modules/
 frontend/dist/
+
+# WebView 面板可携带目录（构建产物：exe + 随包 WebView2 运行时，430MB+）
+nodel_client_dashboard_web/portable/
+# WebView2 运行时源目录（构建工具链，600MB+）
+.toolchain/wv2_rt/
 
 # OS / IDE
 .DS_Store

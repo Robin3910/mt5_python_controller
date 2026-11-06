@@ -12,7 +12,7 @@ from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from . import dashboard_audit as audit
-from . import dashboard_grants, node_credentials as credentials, node_service, permissions, rbac_service
+from . import dashboard_grants, dashboard_stats, node_credentials as credentials, node_service, permissions, rbac_service
 from .connections import manager
 from .db import SessionLocal
 from .deps import client_ip, get_principal, get_store, require_menu
@@ -95,8 +95,11 @@ PENDING_ACTIONS = PREPARE_ACTIONS | frozenset({
     "rollback", "rollback_client", "replace", "replace_client",
 })
 # 未绑定后端节点的本机实例：管理员可查看并替换客户端文件，不能因此获得启动权。
+# remove_instance 也在内：本机摘除一个没绑后端节点的实例是纯本机动作，
+# 不能因为绑定缺失（后端节点缓存被清、实例是历史遗留）就把「移除」堵死。
 LOCAL_INVENTORY_ACTIONS = frozenset({
     "view_status", "update", "update_client", "rollback", "rollback_client", "replace", "replace_client",
+    "remove_instance",
 })
 
 
@@ -137,6 +140,57 @@ async def owned_node(session, p, node_id, *, application=False, active=False, lo
     if active:
         credentials.require_active(node)
     return node
+
+
+@router.get("/stats")
+async def stats(store: RedisStore = Depends(get_store), p: Principal = Depends(require_menu(MENU_NODES))):
+    """本机面板的汇总统计：可见节点的今日信号数、平均延迟与服务器名。
+
+    口径见 `dashboard_stats.py`：
+    - 今日信号 = 今天（UTC+8 自然日）内下发到节点的信号条数（两条链路相加）；
+    - 平均延迟 = 命令往返时延（`sent_at` → 节点回报时刻）的加权平均（毫秒），
+      服务端时间轴两端。
+
+    只统计**调用方可见**的节点：管理员看全部，普通用户只看本人名下。
+    """
+    nodes = permissions.visible(p, await store.all_nodes_with_db_fallback())
+    node_ids = [str(n.get("node_id") or "") for n in nodes if n.get("node_id")]
+    stats_map = await dashboard_stats.node_daily_stats(node_ids)
+    db_servers = await _db_servers(node_ids)
+    items = []
+    for n in nodes:
+        nid = str(n.get("node_id") or "")
+        st = stats_map.get(nid) or {}
+        # 服务器名三处兜底：Redis 节点缓存 → 账户快照 → 库里的历史值。
+        # 最后一处是「节点连过但现在离线」时唯一还有服务器名的地方。
+        acct = await store.get_account(nid) or {}
+        items.append({
+            "node_id": nid,
+            "mt5_login": n.get("mt5_login"),
+            "mt5_server": n.get("mt5_server") or acct.get("server") or db_servers.get(nid, ""),
+            "today_signals": int(st.get("today_signals") or 0),
+            "avg_latency_ms": st.get("avg_latency_ms"),
+        })
+    return {"items": items}
+
+
+async def _db_servers(node_ids: list[str]) -> dict[str, str]:
+    """批量读库里记着的券商服务器名（节点离线时的最后兜底）。
+
+    一次查询取回全部，而不是每个节点查一次 —— 节点多了会变成 N+1 查询。
+    """
+    if not node_ids:
+        return {}
+    try:
+        async with SessionLocal() as session:
+            rows = (
+                await session.execute(
+                    select(Node.node_id, Node.mt5_server).where(Node.node_id.in_(node_ids))
+                )
+            ).all()
+            return {str(nid): (srv or "") for nid, srv in rows}
+    except SQLAlchemyError:
+        return {}
 
 
 @router.get("/enrollments")
