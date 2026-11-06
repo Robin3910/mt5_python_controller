@@ -127,14 +127,16 @@ def test_busy_status_update_without_animation_writes_plain_text():
 
 
 def test_busy_status_stop_writes_final_text_and_stops():
+    import theme
+
     label = _FakeLabel()
     owner = _FakeOwner()
     busy = BusyStatus(label, owner=owner)
 
     busy.start("处理中")
-    busy.stop("✓ 完成", "#2EE6A8")
+    busy.stop("✓ 完成", theme.GREEN)
     assert label.text == "✓ 完成"
-    assert label.color == "#2EE6A8"
+    assert label.color == theme.GREEN
     assert busy.running is False
 
     # 停掉后残留的回调不能再写

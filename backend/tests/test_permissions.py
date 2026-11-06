@@ -102,6 +102,18 @@ def test_event_resource():
     assert perm.event_resource("junk") is None
 
 
+def test_event_resource_resolves_strategy():
+    """策略配置变更事件按策略归属：只有策略所有者能看到。"""
+    assert perm.event_resource(
+        {"type": "strategy_config_changed", "data": {"strategy_id": "s1"}}
+    ) == ("strategy", "s1")
+    # 分组优先于策略：同一条消息里带了 group_id 就按分组算
+    assert perm.event_resource(
+        {"type": "strategy_config_changed",
+         "data": {"strategy_id": "s1", "group_id": "g1"}}
+    ) == ("group", "g1")
+
+
 def test_event_visible():
     res = ("node", "n1")
     assert perm.event_visible(ADMIN, None, None)

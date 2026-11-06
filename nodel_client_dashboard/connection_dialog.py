@@ -46,7 +46,7 @@ class ConnectionConfigDialog(SessionDialog):
         ctk.CTkLabel(card, text="API 地址", text_color=TEXT_MUTED).pack(anchor="w", padx=20)
         self.base_entry = ctk.CTkEntry(
             card, textvariable=self.base_var, fg_color=BG_ELEVATED, border_color=GLASS_BORDER,
-            text_color=TEXT, height=36, state="disabled",
+            text_color=TEXT, height=34, corner_radius=6, state="disabled",
         )
         self.base_entry.pack(fill="x", padx=20, pady=(6, 12))
         ctk.CTkLabel(

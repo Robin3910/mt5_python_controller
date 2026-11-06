@@ -104,7 +104,7 @@ class EnvConfigDialog(SessionDialog):
             segmented_button_selected_color=ACCENT,
             segmented_button_selected_hover_color=ACCENT,
             segmented_button_unselected_color=BG_ELEVATED,
-            text_color=TEXT, border_color=GLASS_BORDER, border_width=1, corner_radius=12,
+            text_color=TEXT, border_color=GLASS_BORDER, border_width=1, corner_radius=6,
         )
         tabs.grid(row=3, column=0, sticky="nsew", padx=12, pady=(10, 6))
         form_tab = tabs.add("常用字段")
@@ -158,7 +158,7 @@ class EnvConfigDialog(SessionDialog):
             else:
                 entry = ctk.CTkEntry(
                     scroll, textvariable=self._vars[field.key], fg_color=BG_ELEVATED,
-                    border_color=GLASS_BORDER, text_color=TEXT, height=34, corner_radius=10,
+                    border_color=GLASS_BORDER, text_color=TEXT, height=34, corner_radius=6,
                     show="*" if field.secret else "",
                 )
                 entry.grid(row=row, column=1, padx=8, pady=6, sticky="ew")
@@ -191,7 +191,7 @@ class EnvConfigDialog(SessionDialog):
         ).pack(fill="x", padx=8, pady=(8, 4))
         self.raw_box = ctk.CTkTextbox(
             master, fg_color=BG_ELEVATED, text_color=TEXT, border_color=GLASS_BORDER,
-            border_width=1, corner_radius=10, font=mono(12),
+            border_width=1, corner_radius=6, font=mono(12),
         )
         self.raw_box.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         displayed = self._raw_text if self.session.is_admin else redact_env(self._raw_text)

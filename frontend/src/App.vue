@@ -59,6 +59,8 @@ watch(
   (me) => {
     const menu = route.meta.menu
     if (me && menu && !auth.hasMenu(menu)) router.replace(firstAllowedPath(auth.hasMenu))
+    // 仅管理员页面（如系统级配置）：普通用户直接跳走
+    if (me && route.meta.adminOnly && !auth.isAdmin) router.replace(firstAllowedPath(auth.hasMenu))
   },
 )
 

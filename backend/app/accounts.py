@@ -16,7 +16,7 @@ async def all_accounts(
 ):
     """汇总可见节点的账户快照（含在线状态）。"""
     out = []
-    for n in permissions.visible(p, await store.all_nodes()):
+    for n in permissions.visible(p, await store.all_nodes_with_db_fallback()):
         acct = await store.get_account(n["node_id"]) or {}
         out.append(
             {

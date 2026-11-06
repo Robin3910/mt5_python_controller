@@ -1037,6 +1037,93 @@ def normalize_rules(rules: object) -> list[dict[str, Any]]:
     return [normalize_rule(r) for r in rules if isinstance(r, dict)]
 
 
+# ---------------------------------------------------------------------------
+# 指定价加仓：一次生效，摘除
+# ---------------------------------------------------------------------------
+
+# 分批档位从本规则第 1 次加仓起算（开仓不占格）；与前端 BATCH_POS_START 对齐
+_BATCH_POS_START = 1
+
+
+def _is_price_level(raw: dict) -> bool:
+    """这一档是不是「指定价档位」。
+
+    口径：`calc_type == "price"`（**不要求** `price_tp > 0`）。
+
+    前端下拉里「指定价」就是这一个选项，客户不区分新老口径：
+    - 新口径（填了 `price_tp`）：走挂单到价成交 + 自有止损；
+    - 老口径（没填 `price_tp`）：走「到价挂逆势限价」。
+
+    两者都是「指定价加仓」，摘除时一并摘掉。
+    """
+    if not isinstance(raw, dict):
+        return False
+    return str(raw.get("calc_type") or "").strip().lower() == BATCH_CALC_PRICE
+
+
+def strip_price_levels(rules: object) -> tuple[list[dict[str, Any]], bool]:
+    """把规则里的指定价档位摘掉（删整档 + 后续档位自动上移）。
+
+    客户的要求：指定价加仓**下发一次之后**就从配置里删掉——配置这次已经
+    下发出去了，节点按下发时的快照执行；配置这边立刻摘掉，前端与后续信号
+    都不再带指定价。
+
+    删档口径与前端 `removeBatchLevel`（无在跑任务分支）**完全一致**：
+    - 被删档的区间整段丢弃；
+    - 其余档位保持各自的**长度**，整体往前补位，首尾衔接、不留空洞；
+    - 加仓笔数上限收紧到末档终点。
+
+    例：`1~1 / 2~2(指定价) / 3~3` → `1~1 / 2~2`，上限 `3 → 2`。
+
+    只动有 `batch_levels` 的加仓类规则（type 1 / 2）；网格 / 趋势规则天然
+    没有分批档位，不受影响。
+
+    返回 (新规则列表, 是否有改动)。**入参不被修改**。
+    """
+    if not isinstance(rules, list):
+        return [], False
+    out: list[dict[str, Any]] = []
+    changed = False
+    for raw in rules:
+        if not isinstance(raw, dict):
+            out.append(raw)
+            continue
+        levels = raw.get("batch_levels")
+        if not isinstance(levels, list) or not any(
+            _is_price_level(lv) for lv in levels if isinstance(lv, dict)
+        ):
+            out.append(raw)
+            continue
+        # 只摘指定价档位，其余档位原样保留
+        kept = [dict(lv) for lv in levels if isinstance(lv, dict) and not _is_price_level(lv)]
+        new_rule = dict(raw)
+        if kept:
+            # 其余档位保持各自长度、整体前移，首尾衔接、不留空洞
+            cursor = _BATCH_POS_START
+            for lv in kept:
+                length = max(
+                    1,
+                    _as_int(lv.get("pos_to"), 0) - _as_int(lv.get("pos_from"), 0) + 1,
+                )
+                lv["pos_from"] = cursor
+                lv["pos_to"] = cursor + length - 1
+                cursor = lv["pos_to"] + 1
+            new_rule["batch_levels"] = kept
+            new_rule["batch_count"] = len(kept)
+            # 加仓笔数上限收紧到末档终点（被删的那一段直接从上限里扣掉）
+            new_rule["total_lot_limit"] = float(max(_BATCH_POS_START, kept[-1]["pos_to"]))
+        else:
+            # 档位被摘光：分批开着但档位为空的话，节点侧 `_prepare_rule` 会
+            # 直接返回 None，整条规则静默哑掉 —— 关掉分批，退回规则级点数间距
+            new_rule["batch_levels"] = []
+            new_rule["batch_enabled"] = False
+            new_rule["batch_count"] = 0
+            new_rule["total_lot_limit"] = 0.0
+        out.append(new_rule)
+        changed = True
+    return out, changed
+
+
 def validate_rules_for_template(template_id: str, rules: list[dict]) -> Optional[str]:
     """模版与规则一致性校验；通过返回 None，否则返回人读的拒收原因。
 

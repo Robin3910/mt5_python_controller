@@ -60,7 +60,11 @@ class ListItemVM:
     algo_trading_disabled: bool = False
     # —— 卡片网格需要的字段 ——
     node_id: str = ""
+    # 券商服务器名（如 trademaxglobal / gtcglobal-sa-server5）；
+    # 后端节点记录与本机终端都没给时留空。
     server_label: str = ""
+    # 交易账号（如 88001234）；没有则留空。
+    account_label: str = ""
     uptime_text: str = "--"
     mt5_connected: bool = False
     mt5_authenticated: bool = False
@@ -173,7 +177,10 @@ def build_list_item(mp: "ManagedProcess", selected_id: str | None) -> ListItemVM
             cfg.algo_trading_disabled, rt.algo_trading_allowed,
         ),
         node_id=node_id,
-        server_label=f"账号 {mt5_login}" if mt5_login else "账号 -",
+        # 券商服务器名：本机终端实时读数优先，回退到后台节点记录里存的值。
+        server_label=(rt.mt5_server or cfg.mt5_server or "").strip(),
+        # 「ID」位放交易账号（参考稿的 mt5-id-inline 位）。
+        account_label=str(mt5_login) if mt5_login else "",
         uptime_text=format_uptime(rt.uptime_s),
         mt5_connected=rt.ws_state in _CONNECTED_WS_STATES,
         mt5_authenticated=rt.ws_state == "authenticated",
@@ -272,6 +279,7 @@ def build_detail(mp: "ManagedProcess | None") -> DetailVM:
             visible=rt.busy in ("starting", "stopping"),
         ),
     )
+    server = (rt.mt5_server or cfg.mt5_server or "").strip()
     summary = (
         f"标签      {cfg.name}\n"
         f"版本      {rt.version or '-'}\n"
@@ -283,6 +291,7 @@ def build_detail(mp: "ManagedProcess | None") -> DetailVM:
         f"节点编号  {rt.node_id if rt.node_id is not None else '-'}    "
         f"MT5账号 {rt.mt5_login if rt.mt5_login is not None else '-'}    "
         f"运行时长 {rt.uptime_s if rt.uptime_s is not None else '-'}\n"
+        f"券商服务器 {server or '-'}\n"
         f"错误      {rt.last_error or '-'}"
     )
     if not rt.runners:

@@ -31,13 +31,13 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional
 
 from . import (
     follow_rules,
     group_persist,
     group_rules,
-    latency_marks,
     market_probe,
     permissions,
     persist,
@@ -770,7 +770,36 @@ class GroupDispatcher:
                 skip_code=signal_codes.classify_group_skip_reason(reason),
             )
             return self._result(group, mode, 0, status, reason, task_id)
+        # 指定价加仓**下发一次即消费**：这份配置已经交到节点手上了（节点按下发
+        # 时的快照执行），配置这边立刻把指定价档位摘掉，前端与后续信号都不再
+        # 带指定价。摘除只改配置，不改已下发的快照。
+        await self._consume_price_levels(strategy)
         return self._result(group, mode, len(sent), "dispatching", None, task_id)
+
+    async def _consume_price_levels(self, strategy: dict) -> bool:
+        """指定价加仓用一次即摘除：改库 + 刷新缓存 + 通知前端刷新。
+
+        幂等：`consume_price_levels` 在没有指定价档位时返回 False（不改版本）。
+        刷新缓存是必须的——缓存是分发时读策略的权威入口，不刷新的话下一条
+        信号还会带上刚被摘掉的指定价档位。
+        """
+        sid = str((strategy or {}).get("strategy_id") or "").strip()
+        if not sid:
+            return False
+        try:
+            ok = await group_persist.consume_price_levels_with_cache(
+                self.store, sid, notify=True,
+            )
+            if ok:
+                logger.info(
+                    "strategy %s price levels consumed after dispatch", sid,
+                )
+            return ok
+        except Exception as e:  # noqa: BLE001
+            # 摘除失败不影响本次下发：节点已经拿到快照在执行了，
+            # 配置摘不掉只是下一次信号还会再带一次指定价。
+            logger.warning("consume price levels failed %s: %s", sid, e)
+            return False
 
     @staticmethod
     def _no_target(outcomes: list[dict]) -> tuple[str, str]:
@@ -1011,8 +1040,10 @@ class GroupDispatcher:
         sent_at = time.time()
         cmd["sent_at"] = round(sent_at, 6)
         if await manager.send_to_node(node_id, cmd):
+            # 落库的是**真正的发包时刻**（上面那个 epoch），不是 send_to_node
+            # 返回后的时刻：send_to_node 之后还有一次库往返，记那一时刻会把时延算高。
             await group_persist.set_dispatch_status(dispatch_id, "sent",
-                                                   sent_at=latency_marks.utcnow())
+                                                   sent_at=datetime.fromtimestamp(sent_at))
             return {"node_id": node_id, "status": "sent", "magic": magic,
                     "dispatch_id": dispatch_id, "volume": volume, "reason": None}
 

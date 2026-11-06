@@ -459,6 +459,12 @@ def _ensure_batch_coverage(rule: dict) -> dict:
 
     补档参数沿用最后一档（间距 / 倍数 / 手数原样带过去）——用户扩容时最
     常见的意图就是「照着上一档继续加」。
+
+    **指定价档位不参与补档**：补档是把最后一档的参数复制到后面的空位，
+    而指定价档位挂的是一张**指定价的单**。复制它等于替用户多挂了几张
+    他没配的单（同一个价位挂好几张）。所以末档是指定价时**不往后补**：
+    超出部分由节点侧的兜底逻辑处理（`_fallback_batch_level` 会往回找
+    最近的间距型档位；实在没有就不加仓）——不会凭空多挂指定价单。
     """
     if not isinstance(rule, dict):
         return rule
@@ -487,6 +493,11 @@ def _ensure_batch_coverage(rule: dict) -> dict:
             lv["pos_from"] = cursor
         cursor = max(cursor, hi + 1)
     last = levels[-1]
+    # 末档是指定价档位时不补档（复制它会凭空多挂指定价单）
+    if str(last.get("calc_type") or "").strip().lower() == strategy_templates.BATCH_CALC_PRICE:
+        out = dict(rule)
+        out["batch_levels"] = levels
+        return out
     while cursor <= limit:
         levels.append({
             **dict(last),

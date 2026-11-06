@@ -89,6 +89,45 @@ def read_algo_trading_allowed(directory: str | Path) -> bool | None:
             mt5.shutdown()
 
 
+def read_terminal_snapshot(directory: str | Path) -> dict:
+    """一次附着终端，同时读出「算法交易开关」与「券商服务器名」。
+
+    两者都要 attach 同一个终端，分开读等于多连一次 MT5。这里合并成一次，
+    面板的周期探测才不会因为多一项而变慢。
+
+    返回 {"algo_trading_allowed": bool | None, "mt5_server": str, "login": int}；
+    连不上终端时 algo_trading_allowed 为 None、mt5_server 为空串、login 为 0。
+    """
+    terminal = ef.find_terminal(directory)
+    if terminal is None:
+        return {"algo_trading_allowed": None, "mt5_server": "", "login": 0}
+    try:
+        mt5 = _load_mt5()
+    except TerminalAccountError:
+        return {"algo_trading_allowed": None, "mt5_server": "", "login": 0}
+    with _MT5_LOCK:
+        if not mt5.initialize(path=str(terminal)):
+            return {"algo_trading_allowed": None, "mt5_server": "", "login": 0}
+        try:
+            allowed = algo_trading_allowed(mt5.terminal_info())
+            info = mt5.account_info()
+            if info is None:
+                return {
+                    "algo_trading_allowed": allowed,
+                    "mt5_server": "",
+                    "login": 0,
+                }
+            return {
+                "algo_trading_allowed": allowed,
+                "mt5_server": str(getattr(info, "server", "") or "").strip(),
+                "login": int(getattr(info, "login", 0) or 0),
+            }
+        except Exception:  # noqa: BLE001
+            return {"algo_trading_allowed": None, "mt5_server": "", "login": 0}
+        finally:
+            mt5.shutdown()
+
+
 def read_terminal_account(directory: str | Path) -> dict:
     """附着所选目录中的终端，读取当前已登录账号。未登录或连不上则失败。"""
     terminal = ef.find_terminal(directory)

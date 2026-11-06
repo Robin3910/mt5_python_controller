@@ -478,10 +478,15 @@ async def owner_names_for(p: Principal) -> dict[int, str]:
 # 后台推送：事件所属资源的所有者
 # ---------------------------------------------------------------------------
 async def resolve_owner(store: RedisStore, resource: tuple[str, str]) -> Optional[int]:
-    """("group"|"node", id) -> owner_user_id；资源已不存在时返回 None（只有管理员可见）。"""
+    """("group"|"node"|"strategy", id) -> owner_user_id；资源已不存在时返回 None（只有管理员可见）。"""
     kind, rid = resource
     try:
-        d = await (store.get_group(rid) if kind == "group" else store.get_node(rid))
+        if kind == "group":
+            d = await store.get_group(rid)
+        elif kind == "strategy":
+            d = await store.get_strategy(rid)
+        else:
+            d = await store.get_node(rid)
     except Exception:  # noqa: BLE001
         return None
     return permissions.normalize_owner((d or {}).get("owner_user_id"))

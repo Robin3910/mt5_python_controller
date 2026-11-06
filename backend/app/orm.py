@@ -16,12 +16,18 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
+from sqlalchemy.dialects import mysql
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import JSON
 
 # 自增主键类型：MySQL 用 BIGINT AUTO_INCREMENT；SQLite 只有声明为 INTEGER 的主键
 # 才是 rowid 别名（BIGINT 主键不会自增，插入会撞 NOT NULL），故按方言取变体。
 AutoPK = BigInteger().with_variant(Integer, "sqlite")
+
+# 毫秒精度时间戳：MySQL 的 DATETIME 默认不带小数秒（DATETIME(0)），
+# 时延埋点会被整秒截断（发包与回报同秒就记成 0ms），跨机往返时延算不准。
+# MySQL 用 DATETIME(3) 存毫秒；SQLite 的 DateTime 本身就存微秒，不用变体。
+MsDateTime = DateTime().with_variant(mysql.DATETIME(fsp=3), "mysql")
 
 
 class Base(DeclarativeBase):
@@ -311,17 +317,18 @@ class SignalDispatch(Base):
     price: Mapped[float | None] = mapped_column(Float, nullable=True)         # 成交价位
     error: Mapped[str | None] = mapped_column(String(255), nullable=True)
     dispatched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # 毫秒精度：sent_at → finished_at 是「命令往返时延」的两端，秒级精度算不出真实时延
+    finished_at: Mapped[datetime | None] = mapped_column(MsDateTime, nullable=True)
     # —— 时延埋点（观测用，不参与任何交易判断）——
     # sent_at：服务端把命令交给节点的时刻（UTC）。与 dispatched_at 不同——
     # 后者是落库时刻，落在 send_to_node 之后，语义不够准。
-    sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    sent_at: Mapped[datetime | None] = mapped_column(MsDateTime, nullable=True)
     # recv_at：节点从 WS 读到命令的时刻（节点本地时钟，与 sent_at 跨机不可比）
-    recv_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    recv_at: Mapped[datetime | None] = mapped_column(MsDateTime, nullable=True)
     # order_at：节点真正调 order_send 之前的时刻
-    order_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    order_at: Mapped[datetime | None] = mapped_column(MsDateTime, nullable=True)
     # filled_at：order_send 返回（拿到成交价）的时刻
-    filled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    filled_at: Mapped[datetime | None] = mapped_column(MsDateTime, nullable=True)
     # queued_ms：order_at - recv_at，节点内部排队耗时（单线程 MT5 队列抢占）
     queued_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
     # order_to_fill_ms：filled_at - order_at，券商往返耗时
@@ -586,18 +593,19 @@ class GroupTaskDispatch(Base):
     # 终止意图落库时刻：跨服务重启也不会把 closing 的子任务又恢复成继续跑
     stop_requested_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     dispatched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    opened_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # 毫秒精度：sent_at → opened_at 是「策略命令往返时延」的两端（节点首次回报开仓）
+    opened_at: Mapped[datetime | None] = mapped_column(MsDateTime, nullable=True)
     last_report_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     # —— 时延埋点（观测用，不参与任何交易判断）——
     # sent_at：服务端把 strategy_start 交给节点的时刻（UTC）
-    sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    sent_at: Mapped[datetime | None] = mapped_column(MsDateTime, nullable=True)
     # recv_at：节点从 WS 读到命令的时刻（节点本地时钟，与 sent_at 跨机不可比）
-    recv_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    recv_at: Mapped[datetime | None] = mapped_column(MsDateTime, nullable=True)
     # order_at：节点真正调 order_send 之前的时刻
-    order_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    order_at: Mapped[datetime | None] = mapped_column(MsDateTime, nullable=True)
     # filled_at：order_send 返回（拿到成交价）的时刻
-    filled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    filled_at: Mapped[datetime | None] = mapped_column(MsDateTime, nullable=True)
     # queued_ms：order_at - recv_at，节点内部排队耗时（单线程 MT5 队列抢占）
     queued_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
     # order_to_fill_ms：filled_at - order_at，券商往返耗时

@@ -56,6 +56,13 @@ class Settings(BaseSettings):
     poll_max_retry: int = 3             # 轮询模式单节点最大重试次数
     dedup_window: int = 5               # 信号去重窗口（秒）
 
+    # —— 指定价加仓「下发即消费」开关 ——
+    # AI 智能加仓策略（tpl_1）的指定价加仓档位，交付给节点一次后自动从配置里
+    # 摘除（一次生效）。本开关用于在不改代码、不发版的前提下随时关掉该行为：
+    # 关闭后指定价档位会一直留在配置里，每次下发都会带上。
+    # 配置页保存过则以数据库为准（见 system_settings），否则用本环境变量。
+    consume_price_level_enabled: bool = True
+
     # —— 客户端版本管理 ——
     # 安装包落盘目录；Docker 部署必须挂卷持久化，否则重建镜像后已上传的包会丢
     client_package_dir: str = "./data/client_packages"

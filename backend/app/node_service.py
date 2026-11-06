@@ -682,6 +682,30 @@ async def report_client_version(
     return d
 
 
+async def report_mt5_server(
+    store: RedisStore, node_id: str, server: str
+) -> Optional[dict]:
+    """记录节点鉴权首包上报的 MT5 券商服务器名（写库 + 刷新缓存）。
+
+    与客户端版本同理：只写回**变化的**值，节点每次重连都会带这个字段，
+    没变就不落库。写库是必要的 —— Redis 只是缓存，节点离线或缓存被清之后
+    服务器名就没了，面板上的「服务器」位会变空；落库后它就一直可查。
+    """
+    v = (server or "").strip()[:64]
+    if not v:
+        return None
+    async with SessionLocal() as s:
+        row = await s.get(Node, node_id)
+        if row is None or row.mt5_server == v:
+            return None
+        row.mt5_server = v
+        await s.commit()
+        await s.refresh(row)
+        d = node_row_to_dict(row)
+    await store.cache_node(d)
+    return d
+
+
 async def delete_node(store: RedisStore, node_id: str) -> bool:
     """删除节点：先删库，再清理 Redis 缓存/快照/在线标记与分组成员关联。
 

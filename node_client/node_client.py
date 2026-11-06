@@ -172,9 +172,16 @@ class NodeClient:
             "uptime_s": round(time.time() - self.started_at, 1),
             "node_id": self.node_id,
             "mt5_login": self.expected_mt5_login,
+            # 券商服务器名（如 trademaxglobal）：面板用它显示节点卡上的服务器位。
+            "mt5_server": self._mt5_server_name(),
             "algo_trading_allowed": self._algo_trading_allowed,
             "runners": [r.status_dict() for r in self.runners.values()],
         }
+
+    def _mt5_server_name(self) -> str:
+        """当前连着的 MT5 券商服务器名；取不到时返回空串。"""
+        server = getattr(self.mt5, "server", "")
+        return server.strip() if isinstance(server, str) else ""
 
     def request_shutdown(self) -> None:
         """面板 POST /stop：置停止标志并关闭当前 WS，使主循环退出。"""

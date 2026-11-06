@@ -23,12 +23,14 @@ const nodeTokenLoading = ref(false)
 const nodeTokenError = ref('')
 const webhookAuthEnabled = ref(true)
 const webhookAuthLoading = ref(false)
+const consumePriceLevelEnabled = ref(true)
+const consumePriceLevelLoading = ref(false)
 
 const sms = reactive({
-  enabled: false,
+  enabled: true,
   provider: 'aliyun_sms_auth',
   endpoint: 'dypnsapi.aliyuncs.com',
-  sign_name: '',
+  sign_name: '恒创联众',
   template_code: '100001',
   require_approval: true,
   code_ttl_seconds: 300,
@@ -56,6 +58,7 @@ onMounted(async () => {
   await loadNodeToken()
   await loadWebhookAuth()
   await loadSmsConfig()
+  await loadConsumePriceLevel()
 })
 
 async function loadSmsConfig(): Promise<void> {
@@ -71,7 +74,9 @@ async function saveSmsConfig(): Promise<void> {
   smsError.value = ''
   smsLoading.value = true
   try {
-    const cfg = await hub.setSmsConfig({ ...sms })
+    // 签名 / 模板码是写死的常量，保存时不带上（后端也会强制覆盖）
+    const { sign_name: _sign, template_code: _tpl, ...rest } = { ...sms }
+    const cfg = await hub.setSmsConfig(rest)
     Object.assign(sms, cfg)
     flash('短信配置已保存')
   } catch (e: unknown) {
@@ -169,6 +174,38 @@ async function onWebhookAuthChange(value: boolean | string | number): Promise<vo
   }
 }
 
+async function loadConsumePriceLevel(): Promise<void> {
+  try {
+    const info = await hub.fetchConsumePriceLevel()
+    consumePriceLevelEnabled.value = info.enabled
+  } catch {
+    nodeTokenError.value = nodeTokenError.value || '无法加载「指定价一次生效」开关'
+  }
+}
+
+async function onConsumePriceLevelChange(value: boolean | string | number): Promise<void> {
+  const next = value === true || value === 'true' || value === 1
+  if (next === consumePriceLevelEnabled.value || consumePriceLevelLoading.value) return
+  if (!next) {
+    const ok = await confirmAction(
+      '关闭后，AI 智能加仓策略里的指定价加仓档位不会再在下发后自动删除，会一直留在配置里，每次下发都会带上。',
+      '关闭「指定价一次生效」',
+    )
+    if (!ok) return
+  }
+  consumePriceLevelLoading.value = true
+  nodeTokenError.value = ''
+  try {
+    const info = await hub.setConsumePriceLevel(next)
+    consumePriceLevelEnabled.value = info.enabled
+    flash(info.enabled ? '已开启「指定价一次生效」' : '已关闭「指定价一次生效」')
+  } catch {
+    nodeTokenError.value = '「指定价一次生效」开关保存失败'
+  } finally {
+    consumePriceLevelLoading.value = false
+  }
+}
+
 function fmtTokenUpdatedAt(): string {
   if (!nodeToken.updated_at) return '—'
   return new Date(nodeToken.updated_at * 1000).toLocaleString()
@@ -209,6 +246,20 @@ function flash(msg: string): void {
           {{ webhookAuthEnabled ? '开启：调用 /webhook 必须携带 AUTH_TOKEN' : '关闭：调用 /webhook 不校验 token' }}
         </span>
       </div>
+      <div class="webhook-auth-row">
+        <span class="webhook-auth-label">指定价一次生效</span>
+        <ElSwitch
+          :model-value="consumePriceLevelEnabled"
+          :loading="consumePriceLevelLoading"
+          :disabled="consumePriceLevelLoading"
+          @change="onConsumePriceLevelChange"
+        />
+        <span class="muted webhook-auth-hint">
+          {{ consumePriceLevelEnabled
+            ? '开启：指定价加仓档位下发一次后自动从配置中删除'
+            : '关闭：指定价加仓档位保留在配置中，每次下发都会带上' }}
+        </span>
+      </div>
       <div class="form-grid">
         <div>
           <label>当前令牌</label>
@@ -240,8 +291,8 @@ function flash(msg: string): void {
         <span class="muted" style="font-size: 12px">今日已发送：{{ sms.today_sent }} 条</span>
       </div>
       <p class="muted" style="font-size: 12px">
-        验证码由本系统生成并校验，阿里云短信认证只负责把短信送达。关闭开关后所有短信接口立即不可用，
-        前端会自动隐藏验证码入口，无需重启。
+        验证码由本系统生成并校验，阿里云短信认证只负责把短信送达。服务默认启用；
+        关闭开关后所有短信接口立即不可用，前端会自动隐藏验证码入口，无需重启。
       </p>
       <div class="webhook-auth-row">
         <span class="webhook-auth-label">启用短信服务</span>
@@ -267,12 +318,18 @@ function flash(msg: string): void {
       </div>
       <div class="form-grid">
         <div>
-          <label>短信签名</label>
-          <input v-model="sms.sign_name" placeholder="阿里云控制台已审核通过的签名" />
+          <label>短信签名（固定）</label>
+          <input :value="sms.sign_name" readonly class="input-fixed" />
+          <p class="muted" style="font-size: 12px; margin: 4px 0 0">
+            已绑定阿里云账号的签名，不可修改。
+          </p>
         </div>
         <div>
-          <label>模板 Code</label>
-          <input v-model="sms.template_code" placeholder="例如 SMS_123456789" />
+          <label>模板 Code（固定）</label>
+          <input :value="sms.template_code" readonly class="input-fixed" />
+          <p class="muted" style="font-size: 12px; margin: 4px 0 0">
+            已审核通过的模板 Code，不可修改。
+          </p>
         </div>
         <div>
           <label>AccessKey</label>
@@ -405,5 +462,15 @@ function flash(msg: string): void {
 }
 .webhook-auth-hint {
   font-size: 12px;
+}
+
+/* 写死不可改的字段（短信签名 / 模板 Code） */
+.input-fixed {
+  color: var(--pf-dim);
+  background: rgba(6, 10, 18, 0.5);
+  cursor: not-allowed;
+}
+.input-fixed:focus {
+  border-color: var(--pf-border);
 }
 </style>

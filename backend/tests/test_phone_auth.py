@@ -161,6 +161,55 @@ def _register(client, provider, phone=_PHONE, **extra):
 
 
 # ---------------------------------------------------------------------------
+# 签名 / 模板码写死，管理员改不动
+# ---------------------------------------------------------------------------
+def test_sms_sign_and_template_are_fixed(client):
+    """签名 / 模板码是写死的常量：管理员传什么都无效。
+
+    这两个值对应阿里云侧已审核通过并绑定本账号的签名与模板，改了会被阿里云拒掉。
+    """
+    from app.sms_config import FIXED_SIGN_NAME, FIXED_TEMPLATE_CODE
+
+    h = auth_headers(client)
+    _enable_sms(client, h, sign_name="被改掉的签名", template_code="SMS_999999999")
+    body = client.get("/api/config/sms", headers=h).json()
+    assert body["sign_name"] == FIXED_SIGN_NAME
+    assert body["template_code"] == FIXED_TEMPLATE_CODE
+
+
+def test_sms_fixed_values_are_applied_on_send(client, provider):
+    """下发短信时用的也是写死的签名 / 模板码。"""
+    from app.sms_config import FIXED_SIGN_NAME, FIXED_TEMPLATE_CODE
+
+    h = auth_headers(client)
+    _enable_sms(client, h, sign_name="被改掉的签名", template_code="SMS_999999999")
+    _send(client)
+    assert provider.sent[0]["sign_name"] == FIXED_SIGN_NAME
+    assert provider.sent[0]["template_code"] == FIXED_TEMPLATE_CODE
+
+
+# ---------------------------------------------------------------------------
+# 短信服务开关默认启用
+# ---------------------------------------------------------------------------
+def test_sms_enabled_by_default(client):
+    """从没保存过配置时，短信服务默认就是启用的（不需管理员先去点开关）。"""
+    from app.sms_config import DEFAULTS
+
+    assert DEFAULTS["enabled"] is True
+    h = auth_headers(client)
+    assert client.get("/api/config/sms", headers=h).json()["enabled"] is True
+    assert client.get("/api/auth/sms/status").json()["enabled"] is True
+
+
+def test_sms_switch_off_disables_entry(client):
+    """管理员把开关关掉后，验证码入口消失、接口 404。"""
+    h = auth_headers(client)
+    _enable_sms(client, h, enabled=False)
+    assert client.get("/api/auth/sms/status").json()["enabled"] is False
+    assert _send(client).status_code == 404
+
+
+# ---------------------------------------------------------------------------
 # 号码归一化（单元）
 # ---------------------------------------------------------------------------
 def test_normalize_phone_variants():

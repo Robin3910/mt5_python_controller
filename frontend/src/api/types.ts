@@ -329,6 +329,10 @@ export interface WebhookAuthInfo {
   token: string
 }
 
+export interface FeatureSwitchInfo {
+  enabled: boolean
+}
+
 export interface NodeCreatePayload {
   // 留空时后端会自动生成 "{序号}-{mt5_login}"（序号从 1 起按节点位置递增）
   name?: string

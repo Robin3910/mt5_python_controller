@@ -22,6 +22,8 @@ K_ACCOUNT = "node:account:{}"    # 账户快照（JSON）
 K_FILTERS = "config:filters"     # 多区间方向过滤配置
 K_NODE_TOKEN = "config:node_token"   # 全局节点接入令牌（明文）
 K_WEBHOOK_AUTH = "config:webhook_auth_enabled"  # Webhook 是否校验 AUTH_TOKEN（"1"/"0"）
+# 指定价加仓「下发即消费」开关（"1"/"0"）：关掉后指定价档位不再自动摘除
+K_CONSUME_PRICE_LEVEL = "config:consume_price_level_enabled"
 K_DEDUP = "dedup:{}"             # 信号去重指纹（带 TTL）
 K_EXEC_LOCK = "lock:exec:{}:{}"  # (node, symbol) 执行锁
 K_POLL_PENDING = "signal:poll:pending"  # 轮询待处理队列（List）
@@ -116,6 +118,40 @@ class RedisStore:
                 out.append(n)
         return out
 
+    async def all_nodes_with_db_fallback(self) -> list[dict]:
+        """读节点列表；Redis 缓存为空时回落到 MySQL 并顺手把缓存补回来。
+
+        Redis 在本系统里是**易失缓存**，权威数据在 MySQL 的 nodes 表。容器重建、
+        Redis 数据卷被清、backend 刚启动还没预热完成，都会让缓存短暂为空；
+        这时如果只读缓存，节点列表会整个消失（本机面板因此认不出节点，
+        「移除节点」这类动作会因为缺 node_id 而被后端 422 挡下）。
+
+        这里在缓存为空时用库里的行重建缓存，保证「节点列表」不会因为缓存丢失而空。
+        """
+        items = await self.all_nodes()
+        if items:
+            return items
+        try:
+            from .db import SessionLocal
+            from .orm import Node
+            from sqlalchemy import select
+
+            async with SessionLocal() as session:
+                rows = (await session.execute(select(Node))).scalars().all()
+        except Exception:  # noqa: BLE001
+            return items
+        out: list[dict] = []
+        for row in rows:
+            from .node_service import node_row_to_dict
+
+            d = node_row_to_dict(row)
+            out.append(d)
+            try:
+                await self.cache_node(d)
+            except Exception:  # noqa: BLE001
+                pass
+        return out
+
     async def delete_node(self, node_id: str) -> None:
         """删除节点时，连带清理 mt5_login 反查索引、账户快照、在线标记。"""
         n = await self.get_node(node_id)
@@ -149,6 +185,15 @@ class RedisStore:
 
     async def set_webhook_auth_enabled(self, enabled: bool) -> None:
         await self.r.set(K_WEBHOOK_AUTH, "1" if enabled else "0")
+
+    async def get_consume_price_level_enabled(self) -> Optional[bool]:
+        raw = await self.r.get(K_CONSUME_PRICE_LEVEL)
+        if raw is None:
+            return None
+        return raw == "1"
+
+    async def set_consume_price_level_enabled(self, enabled: bool) -> None:
+        await self.r.set(K_CONSUME_PRICE_LEVEL, "1" if enabled else "0")
 
     # ----------------- 在线状态 / 心跳 -----------------
     async def touch_online(self, node_id: str) -> None:

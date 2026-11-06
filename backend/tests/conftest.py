@@ -11,3 +11,7 @@ os.environ.setdefault("ADMIN_PASSWORD", "admin123")
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/15")
 # 产品默认开启 Webhook token 校验；用例仍按「未开启」编写，由 _enable_auth 显式打开。
 os.environ.setdefault("ENABLE_AUTH", "false")
+# 注入占位 AccessKey：短信服务默认启用后，「是否可用」的判断会看密钥是否就位。
+# 用例真正发码时走 FakeSmsProvider，不会真的调阿里云。
+os.environ.setdefault("ALIYUN_ACCESS_KEY_ID", "test-access-key-id")
+os.environ.setdefault("ALIYUN_ACCESS_KEY_SECRET", "test-access-key-secret")

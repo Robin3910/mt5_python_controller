@@ -46,6 +46,14 @@ class DashboardAuthUI:
         self._chip_widgets = {}
         self._list_order = ()
         self._detail_snap = self._log_snap = None
+        # 详情弹窗是 CTkToplevel，不是子控件，不会被上面那次 destroy 清掉，
+        # 必须显式关掉，否则登录页会浮在弹窗之下。
+        if getattr(self, "_detail_dialog", None) is not None:
+            try:
+                self._detail_dialog.destroy()
+            except tk.TclError:
+                pass
+            self._detail_dialog = None
         if self._login_view is not None:
             self._login_view.destroy()
         self._login_view = LoginView(self, self._authenticated, reason)
@@ -143,11 +151,46 @@ class DashboardAuthUI:
             self._inventory[cfg.id] = cfg
             mp = self.manager._items[cfg.id]
             if cfg.approval_status == "approved" and cfg.enabled:
-                if not self.session.sync_credential(cfg):
-                    mp.runtime.last_error = "本机专属令牌缺失或失效，请确认后重置专属令牌"
-                    if mp.daemon_grant is not None:
-                        mp.daemon_grant.allowed = False
+                self._reconcile_credential(cfg, mp)
         self._persist()
+
+    def _reconcile_credential(self, cfg, mp) -> None:
+        """同步本机专属令牌；本机令牌失效由面板自动重签并让客户端重启。
+
+        用户只需要「导入 + 启动」：专属令牌是面板与后端之间的内部凭据，
+        本机丢了就自己补，不把令牌管理甩给使用者。
+        """
+        try:
+            repair = self.session.ensure_local_credential(
+                cfg, rotate_allowed=self.session.rotation_allowed(cfg, mp)
+            )
+        except Exception:  # noqa: BLE001
+            # 复核失败不该把整个面板拖垮；下次启动前还会再试一次。
+            return
+        if not repair.ok:
+            mp.runtime.last_error = repair.reason or "节点专属令牌不可用"
+            if mp.daemon_grant is not None:
+                mp.daemon_grant.allowed = False
+            return
+        mp.runtime.last_error = ""
+        if not repair.reissued:
+            return
+        # 后端那一枚旧令牌已被作废：运行中的客户端还在用旧令牌，
+        # 必须重启才能读到新的 .env；守护授权也随轮换失效，一并重取。
+        try:
+            self.session.grant_for_recovery(mp)
+        except Exception:  # noqa: BLE001
+            pass
+        if not mp.runtime.process_alive:
+            return
+        try:
+            mp.stop(graceful=True)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            mp.start()
+        except Exception as exc:  # noqa: BLE001
+            mp.runtime.last_error = f"专属令牌已自动更新，但节点重启失败：{exc}"
 
     def _review_session(self, generation):
         if self._quitting or generation != self.session.generation or not self.session.active:
@@ -183,10 +226,7 @@ class DashboardAuthUI:
             if self.session.owns(mp.cfg):
                 visible.add(iid)
                 if node and mp.cfg.approval_status == "approved" and mp.cfg.enabled:
-                    if not self.session.sync_credential(mp.cfg):
-                        mp.runtime.last_error = "本机专属令牌缺失或失效，请确认后重置专属令牌"
-                        if mp.daemon_grant is not None:
-                            mp.daemon_grant.allowed = False
+                    self._reconcile_credential(mp.cfg, mp)
             if mp.daemon_grant is not None and (not node or not node.get("enabled") or node.get("approval_status") not in (None, "approved")):
                 mp.daemon_grant.allowed = False
         self.manager.set_visible(visible)
@@ -235,32 +275,6 @@ class DashboardAuthUI:
             self._persist()
         self.session.perform("bind_instance", mp.cfg, save, params={"node_id": node_id.strip(), "mt5_login": node.get("mt5_login")})
         self._safe_refresh()
-
-    @requires_session
-    def _rotate_credential(self):
-        mp = self._selected()
-        if mp is None:
-            return
-        self.session.check()
-        if not messagebox.askyesno("确认重置专属令牌", "旧令牌将立即失效；请确认本机令牌确实丢失或需要更换。是否继续？", parent=self):
-            return
-        generation = self.session.generation
-        def work():
-            import env_file as ef
-            self.session.check(generation)
-            issued = self.session.credential(mp.cfg, "rotate")
-            self.session.check(generation)
-            text, _ = ef.read_env(mp.cfg.cwd)
-            self.session.perform("edit_env", mp.cfg, lambda: ef.write_env(mp.cfg.cwd, ef.update_env_text(text, {"NODE_TOKEN": str(issued["token"]), "MANAGER_WS_URL": ef.ws_url_from_backend_base(self.session.api.base), "DASHBOARD_EXPECTED_MT5_LOGIN": str(issued["mt5_login"])})), generation=generation)
-            mp.cfg.credential_generation = int(issued["generation"])
-            node = self.session.nodes.get(str(mp.cfg.node_id))
-            if node is not None:
-                node["credential_generation"] = mp.cfg.credential_generation
-                node["has_credential"] = True
-                node["legacy_allowed"] = False
-            self.session.grant_for_recovery(mp)
-            self.after(0, self._persist)
-        self._run_async("重置专属令牌", work)
 
     def validate_instance_location(self, cfg, exe_path: str, cwd: str):
         exe, directory = Path(exe_path).resolve(), Path(cwd).resolve()
