@@ -76,6 +76,16 @@ class WebhookAuthUpdate(BaseModel):
     enabled: bool
 
 
+class FeatureSwitchInfo(BaseModel):
+    """单个功能开关的当前状态（配置页展示用）。"""
+    enabled: bool
+
+
+class FeatureSwitchUpdate(BaseModel):
+    """配置页开关：开关某个全局行为。"""
+    enabled: bool
+
+
 class ClientVersionOut(BaseModel):
     """客户端安装包版本条目。"""
     version: str

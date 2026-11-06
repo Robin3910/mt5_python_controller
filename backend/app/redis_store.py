@@ -22,6 +22,8 @@ K_ACCOUNT = "node:account:{}"    # 账户快照（JSON）
 K_FILTERS = "config:filters"     # 多区间方向过滤配置
 K_NODE_TOKEN = "config:node_token"   # 全局节点接入令牌（明文）
 K_WEBHOOK_AUTH = "config:webhook_auth_enabled"  # Webhook 是否校验 AUTH_TOKEN（"1"/"0"）
+# 指定价加仓「下发即消费」开关（"1"/"0"）：关掉后指定价档位不再自动摘除
+K_CONSUME_PRICE_LEVEL = "config:consume_price_level_enabled"
 K_DEDUP = "dedup:{}"             # 信号去重指纹（带 TTL）
 K_EXEC_LOCK = "lock:exec:{}:{}"  # (node, symbol) 执行锁
 K_POLL_PENDING = "signal:poll:pending"  # 轮询待处理队列（List）
@@ -183,6 +185,15 @@ class RedisStore:
 
     async def set_webhook_auth_enabled(self, enabled: bool) -> None:
         await self.r.set(K_WEBHOOK_AUTH, "1" if enabled else "0")
+
+    async def get_consume_price_level_enabled(self) -> Optional[bool]:
+        raw = await self.r.get(K_CONSUME_PRICE_LEVEL)
+        if raw is None:
+            return None
+        return raw == "1"
+
+    async def set_consume_price_level_enabled(self, enabled: bool) -> None:
+        await self.r.set(K_CONSUME_PRICE_LEVEL, "1" if enabled else "0")
 
     # ----------------- 在线状态 / 心跳 -----------------
     async def touch_online(self, node_id: str) -> None:

@@ -527,6 +527,40 @@ def test_webhook_auth_switch_overrides_env(client, monkeypatch):
     assert again.json()["enabled"] is True
 
 
+def test_consume_price_level_requires_admin(client):
+    assert client.get("/api/config/consume-price-level").status_code == 401
+
+
+def test_consume_price_level_defaults_to_env(client, monkeypatch):
+    """未保存过时用 CONSUME_PRICE_LEVEL_ENABLED 作为默认值。"""
+    from app.settings import settings
+
+    monkeypatch.setattr(settings, "consume_price_level_enabled", False)
+    h = _auth(client)
+    r = client.get("/api/config/consume-price-level", headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json() == {"enabled": False}
+
+
+def test_consume_price_level_switch_overrides_env(client, monkeypatch):
+    """配置页保存后以数据库为准，覆盖环境变量的默认值。"""
+    from app.settings import settings
+
+    monkeypatch.setattr(settings, "consume_price_level_enabled", True)
+    h = _auth(client)
+
+    off = client.put("/api/config/consume-price-level", json={"enabled": False}, headers=h)
+    assert off.status_code == 200, off.text
+    assert off.json()["enabled"] is False
+
+    again = client.get("/api/config/consume-price-level", headers=h)
+    assert again.json()["enabled"] is False
+
+    on = client.put("/api/config/consume-price-level", json={"enabled": True}, headers=h)
+    assert on.status_code == 200, on.text
+    assert on.json()["enabled"] is True
+
+
 def test_node_token_rotate(client):
     """重置令牌后，旧令牌应失效，新令牌可用。"""
     h = _auth(client)

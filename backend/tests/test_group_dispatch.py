@@ -2318,6 +2318,349 @@ async def test_strategy_update_skips_finished_tasks(store, monkeypatch):
     assert refreshed == old
 
 
+# ----------------------------------------------------------------------
+# 指定价加仓：下发一次即消费（摘除）
+# ----------------------------------------------------------------------
+def _price_level(pos_from, pos_to, *, price=4350.0) -> dict:
+    return {
+        "pos_from": pos_from, "pos_to": pos_to, "calc_type": "price",
+        "point": 100, "price": price, "price_tp": 4400.0, "price_sl": 4300.0,
+        "lot_times": 1.0, "extra_lot": 0.0,
+    }
+
+
+def _point_level(pos_from, pos_to) -> dict:
+    return {
+        "pos_from": pos_from, "pos_to": pos_to, "calc_type": "point",
+        "point": 100, "price": 0.0, "price_tp": 0.0, "price_sl": 0.0,
+        "lot_times": 1.0, "extra_lot": 0.0,
+    }
+
+
+def _price_level_rule() -> dict:
+    return {
+        "type": 1, "status": 1, "action": "all",
+        "point": 100, "lot_times": 1.0, "extra_lot": 0.0, "max_allow_num": 5,
+        "batch_enabled": True, "batch_count": 3, "total_lot_limit": 3,
+        "batch_levels": [
+            _point_level(1, 1), _price_level(2, 2), _point_level(3, 3),
+        ],
+    }
+
+
+def _price_levels_of(rule: dict) -> list[dict]:
+    return [
+        lv for lv in (rule.get("batch_levels") or [])
+        if str(lv.get("calc_type") or "").lower() == "price"
+    ]
+
+
+async def _fetch_strategy_row(strategy_id: str) -> TradingStrategy:
+    async with SessionLocal() as s:
+        return await s.get(TradingStrategy, strategy_id)
+
+
+async def test_dispatch_consumes_price_level_from_config(store, monkeypatch):
+    """信号下发成功后：配置里指定价档位被摘掉，config_version +1。"""
+    await online(store, mk_node("nd_pl"))
+    strategy = await mk_strategy(
+        store, symbol="XAUUSD", rules=[_price_level_rule()],
+    )
+    await mk_group(store, "指定价组", ["nd_pl"], strategy=strategy)
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    engine = GroupDispatcher(store)
+
+    await engine.dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_pl_1",
+    )
+
+    row = await _fetch_strategy_row(strategy["strategy_id"])
+    rule = (row.config_json or [])[0]
+    assert _price_levels_of(rule) == [], "指定价档位应从配置里摘掉"
+    # 删整档 + 后续档位上移：1~1 / 3~3 → 1~1 / 2~2，上限 3→2
+    levels = rule["batch_levels"]
+    assert [(lv["pos_from"], lv["pos_to"]) for lv in levels] == [(1, 1), (2, 2)]
+    assert rule["total_lot_limit"] == 2
+    assert row.config_version == 1, "版本只 +1 一次"
+
+
+async def test_dispatch_broadcasts_strategy_config_changed(store, monkeypatch):
+    """摘除后广播配置变更事件，前端据此自动刷新（客户立刻看到 v2）。"""
+    await online(store, mk_node("nd_pl"))
+    strategy = await mk_strategy(
+        store, symbol="XAUUSD", rules=[_price_level_rule()],
+    )
+    await mk_group(store, "指定价组", ["nd_pl"], strategy=strategy)
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    broadcasts = []
+
+    async def fake_broadcast(msg):
+        broadcasts.append(msg)
+
+    monkeypatch.setattr(manager, "broadcast_admin", fake_broadcast)
+    engine = GroupDispatcher(store)
+
+    await engine.dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_pl_1b",
+    )
+
+    changed = [
+        m for m in broadcasts
+        if m.get("type") == "strategy_config_changed"
+        and (m.get("data") or {}).get("strategy_id") == strategy["strategy_id"]
+    ]
+    assert len(changed) == 1, "摘除后应广播一次配置变更"
+
+
+async def test_dispatch_snapshot_still_carries_price_level(store, monkeypatch):
+    """关键：节点拿到的是 v1（仍含指定价），摘除只改配置不改已下发的快照。"""
+    await online(store, mk_node("nd_pl"))
+    strategy = await mk_strategy(
+        store, symbol="XAUUSD", rules=[_price_level_rule()],
+    )
+    await mk_group(store, "指定价组", ["nd_pl"], strategy=strategy)
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    engine = GroupDispatcher(store)
+
+    await engine.dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_pl_2",
+    )
+
+    tasks = await fetch_tasks("sig_pl_2")
+    assert len(tasks) == 1
+    snap = tasks[0].strategy_snapshot_json or {}
+    snap_levels = (snap.get("rules") or [{}])[0].get("batch_levels") or []
+    assert len(_price_levels_of({"batch_levels": snap_levels})) == 1, (
+        "下发给节点的快照必须仍含指定价档位"
+    )
+    # 下发给节点的命令里也必须带指定价
+    cmds = [m for _, m in sent if m.get("cmd") == "strategy_start"]
+    assert len(cmds) == 1
+    cmd_levels = (
+        (cmds[0].get("strategy") or {}).get("rules", [{}])[0].get("batch_levels") or []
+    )
+    assert len(_price_levels_of({"batch_levels": cmd_levels})) == 1
+
+
+async def test_next_dispatch_after_consume_has_no_price_level(store, monkeypatch):
+    """摘除后下一条信号不再带指定价（缓存已刷新）。"""
+    await online(store, mk_node("nd_pl"))
+    strategy = await mk_strategy(
+        store, symbol="XAUUSD", rules=[_price_level_rule()],
+    )
+    await mk_group(store, "指定价组", ["nd_pl"], strategy=strategy)
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    engine = GroupDispatcher(store)
+
+    await engine.dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_pl_3a",
+    )
+    await engine.dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_pl_3b",
+    )
+
+    tasks = await fetch_tasks("sig_pl_3b")
+    snap = tasks[0].strategy_snapshot_json or {}
+    snap_levels = (snap.get("rules") or [{}])[0].get("batch_levels") or []
+    assert _price_levels_of({"batch_levels": snap_levels}) == [], (
+        "第二条信号不该再带指定价"
+    )
+
+
+async def test_consume_price_levels_is_idempotent(store, monkeypatch):
+    """没有指定价档位时不再改版本（幂等）。"""
+    await online(store, mk_node("nd_pl"))
+    strategy = await mk_strategy(
+        store, symbol="XAUUSD",
+        rules=[{
+            "type": 1, "status": 1, "action": "all",
+            "point": 100, "lot_times": 1.0, "extra_lot": 0.0, "max_allow_num": 5,
+            "batch_enabled": True, "batch_count": 2, "total_lot_limit": 2,
+            "batch_levels": [_point_level(1, 1), _point_level(2, 2)],
+        }],
+    )
+    await mk_group(store, "普通组", ["nd_pl"], strategy=strategy)
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    engine = GroupDispatcher(store)
+
+    await engine.dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_pl_4",
+    )
+    row = await _fetch_strategy_row(strategy["strategy_id"])
+    assert row.config_version == 0, "没有指定价档位就不该改版本"
+
+
+async def test_hot_push_consumes_price_level_from_config(store, monkeypatch):
+    """保存热推交付了指定价后，配置里也要摘掉（这是「重新打开还在」的成因）。
+
+    客户保存时任务已经在跑 → 指定价随 `strategy_update` 热推交付给节点，
+    不走新任务下发。热推路径不挂摘除的话，指定价就一直留在配置里。
+    """
+    from app.state import state as app_state
+    from app.strategies import _hot_push_running_snapshot
+
+    await online(store, mk_node("nd_pl"))
+    strategy = await mk_strategy(
+        store, symbol="XAUUSD", rules=[_price_level_rule()],
+    )
+    await mk_group(store, "指定价组", ["nd_pl"], strategy=strategy)
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    engine = GroupDispatcher(store)
+    monkeypatch.setattr("app.state.group_dispatcher", object(), raising=False)
+    app_state.group_dispatcher = engine
+    try:
+        await engine.dispatch(
+            TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_pl_hot",
+        )
+        tasks = await fetch_tasks("sig_pl_hot")
+        assert len(tasks) == 1
+        sent.clear()
+
+        # 客户保存：带上指定价。分发时已经把指定价摘掉了，所以这里重新加回来。
+        # 保存先把 v1 写进库（PATCH 的真实行为），再触发热推。
+        saved_rules = [{
+            **strategy["rules"][0],
+            "batch_levels": [
+                _point_level(1, 1),
+                _price_level(2, 2),
+            ],
+        }]
+        async with SessionLocal() as s:
+            row = await s.get(TradingStrategy, strategy["strategy_id"])
+            row.config_json = saved_rules
+            row.config_version = 1
+            await s.commit()
+
+        updated = {
+            **strategy,
+            "config_version": 1,
+            "rules": saved_rules,
+        }
+        await _hot_push_running_snapshot(updated)
+
+        # 热推确实把带指定价的配置推给了节点
+        cmds = [m for _, m in sent if m.get("cmd") == "strategy_update"]
+        assert len(cmds) == 1, "热推应发出 strategy_update"
+        pushed_levels = (
+            (cmds[0].get("strategy") or {}).get("rules", [{}])[0].get("batch_levels") or []
+        )
+        assert len(_price_levels_of({"batch_levels": pushed_levels})) == 1, (
+            "推给节点的必须是含指定价的 v1，且指定价只能有一档"
+        )
+
+        # 关键：配置这边摘掉了
+        row = await _fetch_strategy_row(strategy["strategy_id"])
+        rule = (row.config_json or [])[0]
+        assert _price_levels_of(rule) == [], "热推交付后配置里不该还留着指定价"
+        levels = rule["batch_levels"]
+        assert [(lv["pos_from"], lv["pos_to"]) for lv in levels] == [(1, 1)]
+        assert rule["total_lot_limit"] == 1
+    finally:
+        app_state.group_dispatcher = None
+
+
+async def test_hot_push_without_price_level_keeps_version(store, monkeypatch):
+    """热推的配置里没有指定价 → 不改版本（幂等）。"""
+    from app.state import state as app_state
+    from app.strategies import _hot_push_running_snapshot
+
+    await online(store, mk_node("nd_pl"))
+    strategy = await mk_strategy(
+        store, symbol="XAUUSD",
+        rules=[{
+            "type": 1, "status": 1, "action": "all",
+            "point": 100, "lot_times": 1.0, "extra_lot": 0.0, "max_allow_num": 5,
+            "batch_enabled": True, "batch_count": 1, "total_lot_limit": 1,
+            "batch_levels": [_point_level(1, 1)],
+        }],
+    )
+    await mk_group(store, "普通组", ["nd_pl"], strategy=strategy)
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    engine = GroupDispatcher(store)
+    monkeypatch.setattr("app.state.group_dispatcher", object(), raising=False)
+    app_state.group_dispatcher = engine
+    try:
+        await engine.dispatch(
+            TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_pl_hot2",
+        )
+        sent.clear()
+        await _hot_push_running_snapshot({**strategy, "config_version": 1})
+        row = await _fetch_strategy_row(strategy["strategy_id"])
+        assert row.config_version == 0, "没有指定价档位就不该改版本"
+    finally:
+        app_state.group_dispatcher = None
+
+
+async def test_switch_off_keeps_price_level_in_config(store, monkeypatch):
+    """开关关掉后：指定价档位不再被摘除，配置原样保留（可随时改回）。"""
+    from app import system_settings
+
+    await online(store, mk_node("nd_pl"))
+    strategy = await mk_strategy(
+        store, symbol="XAUUSD", rules=[_price_level_rule()],
+    )
+    await mk_group(store, "指定价组", ["nd_pl"], strategy=strategy)
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    await system_settings.set_consume_price_level_enabled(store, False)
+    engine = GroupDispatcher(store)
+
+    await engine.dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_pl_off",
+    )
+
+    row = await _fetch_strategy_row(strategy["strategy_id"])
+    rule = (row.config_json or [])[0]
+    assert len(_price_levels_of(rule)) == 1, "开关关掉后指定价应留在配置里"
+    assert row.config_version == 0, "开关关掉时不该改版本"
+
+    # 节点拿到的快照仍然带指定价（下发行为不受开关影响）
+    tasks = await fetch_tasks("sig_pl_off")
+    snap = tasks[0].strategy_snapshot_json or {}
+    snap_levels = (snap.get("rules") or [{}])[0].get("batch_levels") or []
+    assert len(_price_levels_of({"batch_levels": snap_levels})) == 1
+
+
+async def test_switch_on_again_resumes_consuming(store, monkeypatch):
+    """开关重新打开后：指定价又会被自动摘除。"""
+    from app import system_settings
+
+    await online(store, mk_node("nd_pl"))
+    strategy = await mk_strategy(
+        store, symbol="XAUUSD", rules=[_price_level_rule()],
+    )
+    await mk_group(store, "指定价组", ["nd_pl"], strategy=strategy)
+    sent = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    engine = GroupDispatcher(store)
+
+    await system_settings.set_consume_price_level_enabled(store, False)
+    await engine.dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_pl_sw1",
+    )
+    tasks = await fetch_tasks("sig_pl_sw1")
+    row = await _fetch_strategy_row(strategy["strategy_id"])
+    assert len(_price_levels_of((row.config_json or [])[0])) == 1
+    # 释放节点占位，否则第二条信号会被单槽互斥拦掉
+    await finish_task(store, tasks[0].task_id, ["nd_pl"])
+
+    await system_settings.set_consume_price_level_enabled(store, True)
+    await engine.dispatch(
+        TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1), "sig_pl_sw2",
+    )
+    row = await _fetch_strategy_row(strategy["strategy_id"])
+    rule = (row.config_json or [])[0]
+    assert _price_levels_of(rule) == [], "开关打开后指定价应被摘掉"
+    assert row.config_version == 1
+
+
 def test_note_absent_magics_needs_consecutive_misses():
     hits: dict[int, int] = {}
     watched = {31}

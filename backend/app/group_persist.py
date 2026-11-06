@@ -20,7 +20,7 @@ from typing import Optional
 
 from sqlalchemy import func, or_, select, update
 
-from . import group_rules, latency_marks, signal_codes
+from . import group_rules, latency_marks, signal_codes, strategy_templates
 from .db import SessionLocal
 from .orm import (
     GroupSignalTask,
@@ -948,6 +948,110 @@ async def consume_manual_scatter(strategy_id: str, rule_type: int) -> bool:
     except Exception as e:  # noqa: BLE001
         logger.warning("consume_manual_scatter failed %s: %s", sid, e)
         return False
+
+
+async def consume_price_levels(strategy_id: str) -> bool:
+    """把策略配置里的指定价加仓档位摘掉：下发一次即消费。
+
+    客户的要求：指定价加仓**交付给节点一次之后**，指定价的参数配置就从
+    配置里删掉。节点拿到的是交付那一刻的快照（v1），照它执行；配置这边
+    摘掉后（v2），前端与后续信号都不再带指定价。
+
+    这里做的是**删整档 + 后续档位上移**（口径见
+    `strategy_templates.strip_price_levels`，与前端 `removeBatchLevel` 一致）。
+
+    幂等：已经摘掉（或本来就没配）时返回 False，不重复改版本。
+
+    调用点有两个（都是「真正把配置交付给节点」的那一刻）：
+    - `group_dispatcher._dispatch_group`：新任务下发生效（`strategy_start`）；
+    - `strategies._hot_push_running_snapshot`：保存热推生效（`strategy_update`）。
+
+    两个路径都要挂：指定价档位既可能随新任务下发，也可能随客户保存时的
+    热推改到在跑任务上（存量任务还在跑时保存，就是走热推）。
+
+    本函数本身不判开关，开关判断在 `consume_price_levels_with_cache` 里
+    （那是两条路径唯一的公共入口）。
+    """
+    sid = str(strategy_id or "").strip()
+    if not sid:
+        return False
+    try:
+        async with SessionLocal() as s:
+            row = await s.get(TradingStrategy, sid)
+            if row is None:
+                return False
+            rules = list(row.config_json or [])
+            out, changed = strategy_templates.strip_price_levels(rules)
+            if not changed:
+                return False
+            row.config_json = out
+            row.config_version = int(row.config_version or 0) + 1
+            await s.commit()
+            logger.info(
+                "strategy %s price levels consumed, version %s",
+                sid, row.config_version,
+            )
+            return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("consume_price_levels failed %s: %s", sid, e)
+        return False
+
+
+async def consume_price_levels_with_cache(
+    store, strategy_id: str, *, notify: bool = False,
+) -> bool:
+    """摘掉指定价档位 + 刷新 Redis 缓存（+ 通知前端刷新）。
+
+    摘除改的是库里的 `config_json`，但分发时读策略的权威入口是 Redis 缓存
+    （见 group_dispatcher 的 store.get_strategy），所以必须一起刷新，否则
+    下一条信号还会带上刚被摘掉的指定价档位。
+
+    `notify=True` 时广播 `strategy_config_changed`，前端据此自动重拉策略
+    列表——客户在页面上立刻看到摘除后的配置，不必手动刷新页面。
+
+    **受开关控制**：`consume_price_level_enabled` 关闭时直接返回 False，
+    不摘除任何档位（指定价会一直留在配置里，每次下发都带上）。
+    开关可在配置页随时改，无需重启、无需发版。
+    """
+    sid = str(strategy_id or "").strip()
+    if not sid:
+        return False
+    if not await _consume_price_level_switch_on(store):
+        return False
+    if not await consume_price_levels(sid):
+        return False
+    try:
+        from . import strategy_service
+
+        await strategy_service.reload_strategy_cache(store, sid)
+        if notify:
+            from .connections import manager
+
+            await manager.broadcast_admin({
+                "type": "strategy_config_changed",
+                "data": {"strategy_id": sid},
+            })
+        return True
+    except Exception as e:  # noqa: BLE001
+        # 摘除已经落库了（配置已干净），只是缓存没刷上：记日志即可，
+        # 下次读缓存拿到旧值也只是多带一次指定价，不会出错。
+        logger.warning("refresh price level cache failed %s: %s", sid, e)
+        return True
+
+
+async def _consume_price_level_switch_on(store) -> bool:
+    """读「下发即消费」开关；读取失败时按开启处理（保持既有行为）。
+
+    读失败就摘除是更安全的默认：摘除最多让客户少配一档（可再加回来），
+    而不摘除会让指定价反复下单。
+    """
+    try:
+        from . import system_settings
+
+        return await system_settings.is_consume_price_level_enabled(store)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("read consume price level switch failed: %s", e)
+        return True
 
 
 async def record_strategy_progress(

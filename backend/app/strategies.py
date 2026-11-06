@@ -94,6 +94,28 @@ async def _hot_push_running_snapshot(strategy: dict) -> None:
         )
     except Exception as e:  # noqa: BLE001
         logger.warning("push strategy_update failed %s: %s", sid, e)
+        return
+    # 指定价加仓**一次生效**：这次热推把带指定价的配置（v1）交付给了节点，
+    # 节点照它执行；配置这边立刻把指定价档位摘掉（v2），客户在网页上看到
+    # 的是摘除后的配置，后续信号也不再带指定价。
+    #
+    # 热推路径必须也挂摘除：客户保存时任务已经在跑，指定价是随
+    # `strategy_update` 热推交付的，不走新任务下发。只挂分发路径的话，
+    # 热推交付的指定价会一直留在配置里（这就是「重新打开页面还在」的成因）。
+    #
+    # 摘除只在**确实推出去**（sent > 0）时做：没推给任何节点就不算交付，
+    # 配置原样留着，客户下次保存还能带上这一档。
+    if sent > 0:
+        try:
+            # 用分发器自己的 store：它就是分发时读策略的那个缓存层
+            # （state.store 在 lifespan 之前可能是 None，热推不该依赖它）。
+            await group_persist.consume_price_levels_with_cache(
+                engine.store, sid, notify=True,
+            )
+        except Exception as e:  # noqa: BLE001
+            # 摘除失败不影响热推：节点已经拿到配置在执行了，
+            # 配置摘不掉只是下一次还会再带一次指定价。
+            logger.warning("consume price levels after hot-push failed %s: %s", sid, e)
 
 
 def _strategy_audit_snapshot(d: dict | None) -> dict | None:
