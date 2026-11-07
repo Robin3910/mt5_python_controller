@@ -1997,8 +1997,8 @@ export interface MeInfo {
   /**
    * 我自己的两个「暂停接单」开关（两个市场各自独立）。
    *
-   * 暂停 = 新客户无法加入 + 新信号只发主节点；已有跟单关系与在跑任务不动。
-   * 交易页据此提示「即使打开带单开关，信号也只下发主节点」。
+   * 暂停后不接收新跟单，已有关系与在跑任务不动。
+   * 带单暂停仍只发主节点；AI 暂停拦截分组所有节点的新开仓。
    */
   follow_paused?: boolean
   ai_follow_paused?: boolean
@@ -2469,18 +2469,21 @@ export interface FollowPauseResponse {
 // AI 交易（ai_follow）：跟随 AI 智能加仓策略的机器人
 // ===========================================================================
 
-/** 机器人广场摘要。展示单位 = 主人主节点；一个机器人挂若干 tpl_1 分组。 */
+/** 每个绑定 AI 策略的分组对应一条机器人记录。 */
 export interface AiRobotSummary {
   leader_user_id: number
+  group_id: string
+  strategy_id: string | null
   username: string
   display_name: string | null
   primary_node: FollowNodeBrief | null
-  /** 已开放 AI 跟单的 tpl_1 分组数 */
+  /** 当前记录对应的 AI 分组数（每条为 1） */
   ai_group_count: number
-  /** 该机器人名下可跟分组的策略名称（列表/详情标题用）；无策略时为 null */
+  /** 当前分组绑定的策略名称；无策略时为 null */
   strategy_name: string | null
-  /** 该机器人名下可跟分组用到的全部策略名称（去重，按出现顺序） */
+  /** 当前分组的策略名，保留数组格式 */
   strategy_names: string[]
+  editable_strategy_id: string | null
   follower_node_count: number
   /** 我已跟其中几个分组（**只算 AI 市场** tpl_1，不含带单市场） */
   my_follow_group_count: number
@@ -2495,8 +2498,7 @@ export interface AiRobotSummary {
   /**
    * 绩效（由**主节点**的成交聚合，与订单历史页同一套口径）。
    *
-   * AI 机器人的展示单位就是主节点，所以绩效只算主节点 —— 混进主人名下
-   * 其它账户的盈亏会让机器人之间的横向对比失真。
+   * 广场绩效仅统计当前分组在主人主节点上的 AI 成交。
    *
    * `data_available=false` 表示**暂无成交数据**（节点未上线 / 同步未开），
    * 前端要显示「暂无数据」而不是 0。
@@ -2509,7 +2511,7 @@ export interface AiRobotSummary {
   /**
    * 是否已暂停【AI 交易】市场对外接单（AI 智能加仓分组）。
    *
-   * 暂停 = 新客户无法加入 + 新信号只发主节点；已有跟单关系与在跑任务不动。
+   * 暂停 = 新客户无法加入 + 分组所有节点不接收新开仓；已有关系与在跑任务不动。
    * 只影响 AI 市场，带单市场有独立的 `follow_paused`。
    */
   ai_follow_paused?: boolean
@@ -2573,6 +2575,7 @@ export interface AiMyGroup {
 }
 
 export interface AiMyRobot {
+  is_owner: boolean
   robot: AiRobotSummary
   groups: AiMyGroup[]
 }
@@ -2580,6 +2583,54 @@ export interface AiMyRobot {
 export interface AiMeResponse {
   following: AiMyRobot[]
   summary: Record<string, number>
+}
+
+export interface AiMyRobotDetailResponse extends AiMyRobot {
+  metrics: {
+    follow_node_count: number
+    node_count: number
+    snapshot_node_count: number
+    floating_profit: number | null
+    position_count: number | null
+    volume: number | null
+    profitable_node_count: number | null
+    investment_amount: number | null
+    profit_rate: number | null
+  }
+  performance: DealSummary
+  daily_profit: FollowDailyProfitPoint[]
+  started_at: number | null
+  updated_at: number | null
+  can_control: boolean
+}
+
+export type AiFollowNodeState = 'running' | 'paused' | 'stopped'
+
+export interface AiFollowNode {
+  node_id: string
+  name: string | null
+  mt5_login: number | null
+  mt5_server: string | null
+  symbols: string[]
+  follow_state: AiFollowNodeState
+  position_count: number | null
+  volume: number | null
+  floating_profit: number | null
+  balance: number | null
+  groups: { group_id: string; strategy_name: string | null; symbol: string | null; follow_state: AiFollowNodeState }[]
+}
+
+export interface AiFollowNodesResponse {
+  nodes: AiFollowNode[]
+  summary: {
+    node_count: number
+    active_node_count: number
+    position_count: number | null
+    volume: number | null
+    floating_profit: number | null
+    profitable_node_count: number | null
+    investment_amount: number | null
+  }
 }
 
 export interface AiJoinPayload {

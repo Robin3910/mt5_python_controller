@@ -81,10 +81,10 @@ def market_for_template(template_id: object | None) -> frozenset[str]:
 # 暂停接单（两个市场各一个开关）
 # ---------------------------------------------------------------------------
 #
-# 「暂停」的语义（两个市场完全一致）：
+# 「暂停」保留已有跟单关系与在跑任务，并拒绝新增跟单。
 #   ① 新的客户无法再加入该市场名下的跟单分组；
 #   ② 已有跟单关系与在跑任务**不动**，等跟单员自行移出；
-#   ③ 之后触发的信号只发主节点，不再下发给跟单节点。
+#   ③ AI 暂停拦截整组新开仓；带单暂停仍只发主节点。
 #
 # 两个市场各自一个开关（users.follow_paused / users.ai_follow_paused）：
 # 一个带单员可能同时做普通带单与 AI 机器人，合并成一个开关就无法表达
@@ -125,14 +125,26 @@ def paused_marketable_reason(
     return PAUSED_AI_REASON if ai else PAUSED_FOLLOW_REASON
 
 
+def group_for_follow_dispatch(group: dict, template_id: object | None) -> dict:
+    if not template_in_market(template_id, AI_MARKET_TEMPLATE_IDS):
+        return group
+    return {
+        **group,
+        "followers": [
+            follower for follower in group.get("followers") or []
+            if follower.get("follow_state", "running") == "running"
+        ],
+    }
+
+
 def paused_dispatch_note(template_id: object | None) -> str:
-    """暂停时写在任务上的提示语（说明为什么只发了主节点）。
+    """暂停时写在任务上的提示语，区分 AI 整组暂停与带单只发主节点。
 
     按分组所属模版取对应市场的文案 —— 任务列表里一眼能看出是哪个市场停了。
     """
     use_follow, use_ai = pause_flags_for_template(template_id)
     if use_ai:
-        return "主人已暂停 AI 跟单，本次信号只下发主节点"
+        return "主人已暂停 AI 机器人，分组所有节点暂停接收新开仓信号"
     return "主人已暂停带单，本次信号只下发主节点"
 
 
@@ -288,7 +300,7 @@ def has_leader_capability(capabilities: object) -> bool:
 # ---------------------------------------------------------------------------
 # 带单源
 # ---------------------------------------------------------------------------
-def primary_node_of(nodes: list[dict], user_id: int) -> Optional[dict]:
+def primary_node_of(nodes: list[dict], user_id: Optional[int]) -> Optional[dict]:
     """某用户的主节点**记录**；没有主节点返回 None。
 
     主节点按所有者唯一（`node_service.set_primary` 保证同 owner 至多一个），
@@ -469,7 +481,7 @@ def marketable_reason(
 
     判断顺序：能力 / 暂停在前（更根本），主节点其次，模版市场再次，分组禁用最后。
     暂停与能力撤销都是主人级的「对外接单」开关，能力撤销更强（连分组都不再对外接单），
-    暂停只是「接单但只发主节点」。
+    暂停保留存量关系与在跑任务，新开仓分发范围由对应市场决定。
 
     paused / ai 由调用方传入**对应市场**的暂停状态 —— 两个市场各用一个开关，
     传错市场会让 AI 暂停误报到带单市场（反之亦然）。

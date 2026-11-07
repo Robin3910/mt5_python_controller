@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -1451,21 +1451,21 @@ class FollowMeResponse(BaseModel):
 class AiRobotSummary(BaseModel):
     """机器人广场里一个「机器人」的摘要。
 
-    展示单位 = 主节点：一位带单员的主节点即一个机器人，其名下绑定 tpl_1
-    且已开放 AI 跟单的分组挂在它下面。
+    展示单位 = 绑定 AI 策略的分组；同一主人名下的不同分组独立展示。
     """
     leader_user_id: int
+    group_id: str = ""
+    strategy_id: Optional[str] = None
     username: str
     display_name: Optional[str] = None
     primary_node: Optional[dict] = None
-    # 已开放 AI 跟单的 tpl_1 分组数
+    # 当前记录对应一个 AI 分组
     ai_group_count: int = 0
-    # 该机器人名下可跟分组的**策略名称**（列表页标题用）。
-    # 可能有多个分组 → 多个策略名，这里给出去重后的第一个作为主标题；
-    # 前端展示策略名比展示用户名/主节点名更符合「机器人在跑什么策略」这个语义。
+    # 当前分组绑定的策略名称（列表页标题用）。
     strategy_name: Optional[str] = None
-    # 该机器人名下可跟分组用到的**全部策略名称**（去重，按出现顺序）。
+    # 当前分组策略名；保留数组格式供已有调用方使用。
     strategy_names: list[str] = Field(default_factory=list)
+    editable_strategy_id: Optional[str] = None
     # 被多少个节点跟随（全量跟单关系）
     follower_node_count: int = 0
     # 「我已跟」的分组数 —— **只算 AI 市场**（tpl_1）。
@@ -1482,16 +1482,14 @@ class AiRobotSummary(BaseModel):
     marketable: bool = True
     unmarketable_reason: Optional[str] = None
     # —— 绩效（由主节点的成交聚合而来）——
-    # 口径 = **主节点**（不是名下全部节点）：AI 机器人的展示单位就是主节点
-    # （见类注释），用户点进去看的也是主节点账号的实盘，用全部节点会把
-    # 与该机器人无关的账户盈亏混进来，横向对比就失真了。
+    # 广场绩效限定当前分组在主节点上的 AI 成交，不混入其它分组。
     performance: DealSummary = Field(default_factory=DealSummary)
     # 当前统计窗口（7d / 30d / 90d / all）
     perf_window: str = "30d"
     # 跟单人数（AI 市场内跟了该机器人的去重节点数）
     follower_count: int = 0
     # 是否已暂停【AI 交易】市场对外接单（AI 智能加仓分组）。
-    # 暂停 = 新客户无法加入 + 新信号只发主节点；已有跟单关系与在跑任务不动。
+    # 暂停 = 新客户无法加入 + 分组所有节点不接收新开仓；已有关系与在跑任务不动。
     # 只影响 AI 市场，带单市场有独立的 follow_paused。
     ai_follow_paused: bool = False
 
@@ -1556,6 +1554,7 @@ class AiMyGroup(BaseModel):
 
 
 class AiMyRobot(BaseModel):
+    is_owner: bool = False
     robot: AiRobotSummary
     groups: list[AiMyGroup]
 
@@ -1563,6 +1562,64 @@ class AiMyRobot(BaseModel):
 class AiMeResponse(BaseModel):
     following: list[AiMyRobot] = Field(default_factory=list)
     summary: dict = Field(default_factory=dict)
+
+
+class AiMyRobotMetrics(BaseModel):
+    follow_node_count: int = 0
+    node_count: int = 0
+    snapshot_node_count: int = 0
+    floating_profit: Optional[float] = None
+    position_count: Optional[int] = None
+    volume: Optional[float] = None
+    profitable_node_count: Optional[int] = None
+    investment_amount: Optional[float] = None
+    profit_rate: Optional[float] = None
+
+
+class AiMyRobotDetailResponse(AiMyRobot):
+    metrics: AiMyRobotMetrics
+    performance: DealSummary
+    daily_profit: list[FollowDailyProfitPoint] = Field(default_factory=list)
+    started_at: Optional[float] = None
+    updated_at: Optional[float] = None
+    can_control: bool = False
+
+
+class AiFollowNodeOut(BaseModel):
+    node_id: str
+    name: Optional[str] = None
+    mt5_login: Optional[int] = None
+    mt5_server: Optional[str] = None
+    symbols: list[str] = Field(default_factory=list)
+    follow_state: Literal["running", "paused", "stopped"] = "running"
+    position_count: Optional[int] = None
+    volume: Optional[float] = None
+    floating_profit: Optional[float] = None
+    balance: Optional[float] = None
+    groups: list[dict] = Field(default_factory=list)
+
+
+class AiFollowNodesSummary(BaseModel):
+    node_count: int = 0
+    active_node_count: int = 0
+    position_count: Optional[int] = None
+    volume: Optional[float] = None
+    floating_profit: Optional[float] = None
+    profitable_node_count: Optional[int] = None
+    investment_amount: Optional[float] = None
+
+
+class AiFollowNodesResponse(BaseModel):
+    nodes: list[AiFollowNodeOut] = Field(default_factory=list)
+    summary: AiFollowNodesSummary
+
+
+class AiFollowNodesRequest(BaseModel):
+    node_ids: list[str] = Field(min_length=1)
+
+
+class AiFollowNodeStateRequest(AiFollowNodesRequest):
+    state: Literal["running", "paused", "stopped"]
 
 
 class AiJoinRequest(BaseModel):

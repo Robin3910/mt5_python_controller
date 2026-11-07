@@ -12,6 +12,7 @@ group_follower_node 这一张跟单关系表。所有写操作遵循「先写库
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import delete, func, select
@@ -60,6 +61,7 @@ def _row_to_dict(row: GroupFollowerNode) -> dict:
         "group_id": row.group_id,
         "node_id": row.node_id,
         "follower_user_id": row.follower_user_id,
+        "follow_state": row.follow_state,
         "leader_user_id": row.leader_user_id,
         "leader_primary_node_id": row.leader_primary_node_id,
         "sort_order": row.sort_order or 0,
@@ -81,14 +83,15 @@ async def _refresh_groups(store: RedisStore, group_ids: set[str]) -> None:
 # ---------------------------------------------------------------------------
 # 查询
 # ---------------------------------------------------------------------------
-async def list_followings(follower_user_id: int) -> list[dict]:
+async def list_followings(follower_user_id: int, *, include_stopped: bool = False) -> list[dict]:
     """某跟单员的全部跟单关系（按加入时间正序）。"""
     async with SessionLocal() as s:
+        statement = select(GroupFollowerNode).where(GroupFollowerNode.follower_user_id == int(follower_user_id))
+        if not include_stopped:
+            statement = statement.where(GroupFollowerNode.follow_state != "stopped")
         rows = (
             await s.execute(
-                select(GroupFollowerNode)
-                .where(GroupFollowerNode.follower_user_id == int(follower_user_id))
-                .order_by(GroupFollowerNode.joined_at.asc(), GroupFollowerNode.id.asc())
+                statement.order_by(GroupFollowerNode.joined_at.asc(), GroupFollowerNode.id.asc())
             )
         ).scalars().all()
     return [_row_to_dict(r) for r in rows]
@@ -103,7 +106,7 @@ async def list_for_groups(group_ids: list[str]) -> list[dict]:
         rows = (
             await s.execute(
                 select(GroupFollowerNode)
-                .where(GroupFollowerNode.group_id.in_(ids))
+                .where(GroupFollowerNode.group_id.in_(ids), GroupFollowerNode.follow_state != "stopped")
                 .order_by(GroupFollowerNode.joined_at.asc(), GroupFollowerNode.id.asc())
             )
         ).scalars().all()
@@ -123,7 +126,7 @@ async def list_for_node(node_id: str) -> list[dict]:
         rows = (
             await s.execute(
                 select(GroupFollowerNode)
-                .where(GroupFollowerNode.node_id == nid)
+                .where(GroupFollowerNode.node_id == nid, GroupFollowerNode.follow_state != "stopped")
                 .order_by(GroupFollowerNode.joined_at.asc(), GroupFollowerNode.id.asc())
             )
         ).scalars().all()
@@ -139,7 +142,7 @@ async def list_for_leaders(leader_user_ids: set[int] | list[int]) -> list[dict]:
         rows = (
             await s.execute(
                 select(GroupFollowerNode)
-                .where(GroupFollowerNode.leader_user_id.in_(ids))
+                .where(GroupFollowerNode.leader_user_id.in_(ids), GroupFollowerNode.follow_state != "stopped")
                 .order_by(GroupFollowerNode.joined_at.asc(), GroupFollowerNode.id.asc())
             )
         ).scalars().all()
@@ -171,6 +174,7 @@ async def count_by_group() -> dict[str, int]:
             rows = (
                 await s.execute(
                     select(GroupFollowerNode.group_id, func.count())
+                    .where(GroupFollowerNode.follow_state != "stopped")
                     .group_by(GroupFollowerNode.group_id)
                 )
             ).all()
@@ -187,6 +191,7 @@ async def following_group_count(follower_user_id: int) -> int:
             await s.scalar(
                 select(func.count(func.distinct(GroupFollowerNode.group_id))).where(
                     GroupFollowerNode.follower_user_id == int(follower_user_id),
+                    GroupFollowerNode.follow_state != "stopped",
                 )
             )
             or 0
@@ -204,6 +209,8 @@ async def add_following(
     follower_user_id: int,
     leader_user_id: int,
     leader_primary_node_id: Optional[str],
+    follow_state: str = "running",
+    restart_stopped: bool = True,
 ) -> bool:
     """加入一个节点的跟单关系；返回 True 表示新加入，False 表示已存在（幂等）。
 
@@ -219,15 +226,22 @@ async def add_following(
             )
         ).scalar_one_or_none()
         if exists:
-            return False
-        s.add(GroupFollowerNode(
-            group_id=group_id,
-            node_id=node_id,
-            follower_user_id=int(follower_user_id),
-            leader_user_id=int(leader_user_id),
-            leader_primary_node_id=leader_primary_node_id,
-            sort_order=0,
-        ))
+            if not restart_stopped or exists.follow_state != "stopped" or exists.follower_user_id != int(follower_user_id):
+                return False
+            exists.follow_state = "running"
+            exists.joined_at = datetime.now()
+            exists.leader_user_id = int(leader_user_id)
+            exists.leader_primary_node_id = leader_primary_node_id
+        else:
+            s.add(GroupFollowerNode(
+                group_id=group_id,
+                node_id=node_id,
+                follower_user_id=int(follower_user_id),
+                follow_state=follow_state,
+                leader_user_id=int(leader_user_id),
+                leader_primary_node_id=leader_primary_node_id,
+                sort_order=0,
+            ))
         await s.commit()
     await _refresh_groups(store, {group_id})
     return True
@@ -283,6 +297,8 @@ async def adopt_followers_for_group(
             follower_user_id=int(follower_uid),
             leader_user_id=int(leader_uid),
             leader_primary_node_id=src.get("leader_primary_node_id"),
+            follow_state=src.get("follow_state", "running"),
+            restart_stopped=False,
         )
         row = {
             "node_id": nid,

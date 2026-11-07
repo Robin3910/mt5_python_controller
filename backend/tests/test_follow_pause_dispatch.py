@@ -1,12 +1,11 @@
 """「暂停接单」在**分发层**的保证。
 
-暂停的核心语义是第 ③ 条：**之后触发的信号只发主节点**，不再下发给跟单节点。
-这与【交易】界面把「带单」开关关掉时的行为同构，但这里是服务端持久状态，
-所以 webhook / 限价监听等非前端发起的信号同样必须被收窄。
+暂停带单后新开仓只发主节点；暂停 AI 后分组所有节点均不再接收新开仓。
+Webhook / 限价监听等非前端发起的信号遵循相同的服务端持久状态。
 
 覆盖三条红线：
 - 暂停带单（tpl_2 / tpl_3）-> 跟单节点不再收到信号，只发主节点；
-- 暂停 AI（tpl_1）-> AI 跟单节点不再收到信号，只发主节点；
+- 暂停 AI（tpl_1）-> 分组所有节点均不再接收新开仓；
 - 两个市场**互不串台**：暂停一边不影响另一边。
 
 这些用例是本次改造的**回归红线**：任何一个变红都说明市场隔离写错了。
@@ -263,7 +262,7 @@ async def _add_follower(store, group_id, node_id, *, leader_user_id=7,
 
 
 # ---------------------------------------------------------------------------
-# 语义 ③：暂停后新信号只发主节点
+# 语义 ③：带单暂停保留主节点，AI 暂停拦截所有节点
 # ---------------------------------------------------------------------------
 async def test_paused_follow_market_dispatches_only_primary(store, monkeypatch):
     """暂停带单市场后：跟单节点**不**收到信号，主节点照常收到。"""
@@ -291,8 +290,8 @@ async def test_paused_follow_market_dispatches_only_primary(store, monkeypatch):
     assert "nd_f" not in dispatched, "暂停后不得为跟单节点建子任务"
 
 
-async def test_paused_ai_market_dispatches_only_primary(store, monkeypatch):
-    """暂停 AI 市场后：AI 跟单节点**不**收到信号，主节点照常收到。"""
+async def test_paused_ai_market_dispatches_no_nodes(store, monkeypatch):
+    """暂停 AI 市场后：主节点和跟单节点都不接收新开仓。"""
     leader_id, _ = await mk_leader(store, ai_follow_paused=True)
     await leader_nodes(store, leader_id, "nd_leader")
     await online(store, mk_node("nd_f"))
@@ -309,9 +308,9 @@ async def test_paused_ai_market_dispatches_only_primary(store, monkeypatch):
     )
 
     assert res["mode"] == "group"
-    targets = {s[0] for s in sent}
-    assert "nd_f" not in targets, "暂停 AI 后跟单节点不得收到信号"
-    assert "nd_leader" in targets, "暂停 AI 后主节点仍应收信号"
+    assert sent == []
+    assert res["targets"] == 0
+    assert await fetch_dispatched_nodes("sig_pause_ai") == []
 
 
 async def test_paused_grid_group_dispatches_only_primary(store, monkeypatch):

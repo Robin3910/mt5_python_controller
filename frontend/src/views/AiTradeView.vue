@@ -14,11 +14,17 @@
 //
 // 跟单员收不到实时 WS 事件（M3）—— 用 45s 轮询替代。
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
+import StrategyFormModal from '@/components/StrategyFormModal.vue'
+import AiFollowNodesPanel from '@/components/AiFollowNodesPanel.vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
 import 'element-plus/es/components/message-box/style/css'
 import {
   fetchAiRobotDetail,
+  fetchAiFollowNodes,
+  setAiFollowNodeState,
+  closeAiFollowNodes,
   fetchAiRobots,
   fetchMyAiFollowings,
   joinAiFollow,
@@ -27,6 +33,8 @@ import {
 } from '@/api/aiFollow'
 import type {
   AiMyGroup,
+  AiFollowNodeState,
+  AiFollowNodesResponse,
   AiMyRobot,
   AiRobotDetailResponse,
   AiRobotSummary,
@@ -43,6 +51,7 @@ const keyword = ref('')
 
 const auth = useAuthStore()
 const hub = useHubStore()
+const router = useRouter()
 
 /** 绩效统计窗口（四档，与后端 deal_stats.WINDOWS 对齐） */
 const WINDOW_OPTIONS = [
@@ -61,11 +70,23 @@ const mine = ref({ following: [], summary: {} } as {
   summary: Record<string, number>
 })
 const mineLoading = ref(false)
+const nodeStats = ref<AiFollowNodesResponse | null>(null)
+const nodeStatsLoading = ref(false)
+const nodeStatsError = ref('')
+const nodeStateBusy = ref(false)
 let pollTimer: number | undefined
 
 const selectedGroupIds = ref<string[]>([])
 const selectedNodeIds = ref<string[]>([])
 const submitting = ref(false)
+const strategyFormVisible = ref(false)
+const editingStrategyId = ref('')
+
+function openStrategyEditor(robot: AiRobotSummary): void {
+  if (!robot.editable_strategy_id) return
+  editingStrategyId.value = robot.editable_strategy_id
+  strategyFormVisible.value = true
+}
 
 /** 当前可加入的分组 ID 集合（详情页按它筛） */
 const selectableGroups = computed(() =>
@@ -87,11 +108,12 @@ interface MyFollowedNode {
   joined_at: number | null
   active_task_count: number
   batch_limit: number
-  /** 该节点被跟随的**全部分组**（移出时必须一次性清掉，只清一个会留「半个跟单」） */
+  /** 当前机器人分组内的跟单关系 */
   groups: { group_id: string; group_name: string | null }[]
 }
 
 interface MyRobotEntry {
+  is_owner: boolean
   robot: AiRobotSummary
   marketable: boolean
   groups: AiMyGroup[]
@@ -109,8 +131,6 @@ const myFollowing = computed<MyRobotEntry[]>(() =>
         const prev = nodesById.get(n.node_id)
         if (prev) {
           prev.active_task_count += g.active_task_count
-          // 记全所属分组（去重）：同一节点可能在同一机器人下的多个分组被跟随，
-          // 移出时只清一个分组会残留「半个跟单」（仍在其它分组收信号）。
           if (!prev.groups.some((x) => x.group_id === g.group_id)) {
             prev.groups.push({ group_id: g.group_id, group_name: g.group_name ?? null })
           }
@@ -132,6 +152,7 @@ const myFollowing = computed<MyRobotEntry[]>(() =>
       }
     }
     return {
+      is_owner: r.is_owner,
       robot: r.robot,
       marketable: r.robot.marketable,
       groups,
@@ -141,14 +162,12 @@ const myFollowing = computed<MyRobotEntry[]>(() =>
 )
 
 /**
- * 该节点在**该机器人**下被跟随的全部分组 ID。
- *
- * 必须取**全部**而不是第一个：跟单关系是 (group_id, node_id) 维度的，
- * 同一节点可以同时跟同一个机器人的多个 AI 分组。移出时只发一个分组会
- * 残留「半个跟单」—— 节点仍在其它分组里收信号，用户以为已经退干净了。
+ * 当前机器人分组中该节点的跟单关系，不跨策略移出。
  */
+const followNodeCount = computed(() => nodeStats.value?.summary.node_count ?? new Set(myFollowing.value.flatMap((entry) => entry.nodes.map((node) => node.node_id))).size)
+
 function findGroupIdsForNode(robot: AiRobotSummary, nodeId: string): string[] {
-  const entry = myFollowing.value.find((x) => x.robot.leader_user_id === robot.leader_user_id)
+  const entry = myFollowing.value.find((entry) => entry.robot.group_id === robot.group_id)
   const node = entry?.nodes.find((n) => n.node_id === nodeId)
   if (!node) return []
   return node.groups.map((g) => g.group_id)
@@ -285,7 +304,7 @@ async function openRobot(r: AiRobotSummary) {
   selectedGroupIds.value = []
   selectedNodeIds.value = []
   try {
-    detail.value = await fetchAiRobotDetail(r.leader_user_id, perfWindow.value)
+    detail.value = await fetchAiRobotDetail(r.leader_user_id, perfWindow.value, r.group_id)
     selectedGroupIds.value = allSelectableGroupIds.value
   } catch (e) {
     detail.value = null
@@ -295,14 +314,24 @@ async function openRobot(r: AiRobotSummary) {
   }
 }
 
+async function loadNodeStats(): Promise<void> {
+  nodeStatsLoading.value = true
+  try {
+    nodeStats.value = await fetchAiFollowNodes()
+    nodeStatsError.value = ''
+  } catch (cause) {
+    nodeStatsError.value = errText(cause, '加载子节点统计失败')
+  } finally { nodeStatsLoading.value = false }
+}
+
 // ---------------------------------------------------------------------------
 // 暂停 AI 跟单（我的机器人才有的开关）
 // ---------------------------------------------------------------------------
 //
-// 「暂停」= 主人对外停止接单，但**不动**已有的跟单关系与在跑任务：
+// 「暂停」= 主人名下 AI 分组停止新开仓，但**不动**已有的跟单关系与在跑任务：
 //   ① 新客户无法再加入该机器人的 AI 分组（服务端写侧拦截，前端只做提示）；
 //   ② 已有跟单员与在跑任务**保留**，等他们自行移出；
-//   ③ 之后触发的信号只发主节点，不再下发给跟单节点（服务端分发侧收窄）。
+//   ③ 分组所有节点（含主节点）不再接收新开仓，CLOSE / 平仓仍可执行。
 //
 // 与【带单】页的「暂停带单」是**两个独立开关**：
 // 一个主人可能同时做普通带单与 AI 机器人，停一边不该连累另一边。
@@ -334,9 +363,7 @@ function isMyRobot(robot: AiRobotSummary): boolean {
  * 暂停是对外接单的动作 —— 跟单员点进来会看到「已暂停」，
  * 所以必须二次确认，把影响说清楚再执行。
  */
-async function togglePause() {
-  if (!detail.value) return
-  const robot = detail.value.robot
+async function togglePause(robot: AiRobotSummary) {
   const myId = auth.me?.user_id
   // 只有本人才能改这个开关 —— 服务端也会再校验一次。
   if (myId == null || robot.leader_user_id !== myId) return
@@ -346,18 +373,19 @@ async function togglePause() {
   try {
     if (next) {
       await ElMessageBox.confirm(
-        `暂停后，${name} 将不再接收新的 AI 跟单申请。\n\n` +
+        `暂停后，${name} 名下所有 AI 分组将停止接收新的开仓信号，并停止接收新的 AI 跟单申请。\n\n` +
           `· 已有跟单关系与在跑任务**保留**，等跟单员自行移出\n` +
-          `· 之后触发的信号只下发主节点，不再下发给跟单节点\n` +
+          `· 分组所有节点（包括主节点、自有成员和跟单节点）均暂停新开仓\n` +
+          `· 不自动平仓，已有任务继续运行，平仓 / CLOSE 仍可执行\n` +
           `· 只影响 AI 智能加仓分组，不影响普通带单（趋势 / 网格）\n\n` +
-          `确认暂停 AI 跟单吗？`,
-        '暂停 AI 跟单',
+          `确认暂停 AI 机器人吗？`,
+        '暂停 AI 机器人',
         { type: 'warning', confirmButtonText: '确认暂停', cancelButtonText: '再想想' },
       )
     } else {
       await ElMessageBox.confirm(
-        `恢复后，${name} 将重新接受新的 AI 跟单申请，新信号也会重新下发给跟单节点。`,
-        '恢复 AI 跟单',
+        `恢复后，${name} 名下所有 AI 分组将恢复接收新的开仓信号，并重新接受新的 AI 跟单申请。`,
+        '恢复 AI 机器人',
         { type: 'info', confirmButtonText: '确认恢复', cancelButtonText: '取消' },
       )
     }
@@ -370,23 +398,27 @@ async function togglePause() {
   try {
     const res = await setAiFollowPaused({ leader_user_id: robot.leader_user_id, paused: next })
     // 就地更新：详情页与列表共用同一份摘要，避免整页重拉。
-    detail.value.robot.ai_follow_paused = res.ai_follow_paused
-    const i = robots.value.findIndex((r) => r.leader_user_id === robot.leader_user_id)
-    if (i >= 0) robots.value[i].ai_follow_paused = res.ai_follow_paused
-    const mineRobot = mine.value.following.find((f) => f.robot.leader_user_id === robot.leader_user_id)
-    if (mineRobot) mineRobot.robot.ai_follow_paused = res.ai_follow_paused
-    ElMessage.success(res.ai_follow_paused ? '已暂停 AI 跟单' : '已恢复 AI 跟单')
+    if (detail.value?.robot.leader_user_id === robot.leader_user_id) {
+      detail.value.robot.ai_follow_paused = res.ai_follow_paused
+    }
+    for (const item of robots.value) {
+      if (item.leader_user_id === robot.leader_user_id) item.ai_follow_paused = res.ai_follow_paused
+    }
+    for (const item of mine.value.following) {
+      if (item.robot.leader_user_id === robot.leader_user_id) item.robot.ai_follow_paused = res.ai_follow_paused
+    }
+    ElMessage.success(res.ai_follow_paused ? '已暂停 AI 机器人' : '已恢复 AI 机器人')
     // 列表与「我的 AI 跟单」的不可跟单标记依赖服务端口径，重拉一次最保险。
     await refreshAll()
   } catch (e) {
-    ElMessage.error(errText(e, next ? '暂停 AI 跟单失败' : '恢复 AI 跟单失败'))
+    ElMessage.error(errText(e, next ? '暂停 AI 机器人失败' : '恢复 AI 机器人失败'))
   } finally {
     pauseBusy.value = false
   }
 }
 
 async function refreshAll() {
-  await Promise.all([loadRobots(), loadMine()])
+  await Promise.all([loadRobots(), loadMine(), loadNodeStats()])
 }
 
 // 统计窗口切换：重拉列表 + 当前详情（绩效是纯读缓存，切换零延迟）。
@@ -479,7 +511,7 @@ const nodeIds = (detail.value.my_nodes ?? [])
     })
     ElMessage.success(`已加入 ${res.joined.length} 个分组`)
     await refreshAll()
-    detail.value = await fetchAiRobotDetail(detail.value.robot.leader_user_id, perfWindow.value)
+    detail.value = await fetchAiRobotDetail(detail.value.robot.leader_user_id, perfWindow.value, detail.value.robot.group_id)
     selectedGroupIds.value = allSelectableGroupIds.value
     pickerOpen.value = false
   } catch (e) {
@@ -489,50 +521,43 @@ const nodeIds = (detail.value.my_nodes ?? [])
   }
 }
 
-async function confirmLeave(robot: AiRobotSummary, nodeId: string) {
-  const groupIds = findGroupIdsForNode(robot, nodeId)
-  if (!groupIds.length) return
-  const ok = await new Promise<boolean>((resolve) => {
-    ElMessageBox.confirm(
-      '确认移出 AI 跟单？',
-      '确认移出',
-      {
-        type: 'warning',
-        confirmButtonText: '移出',
-        cancelButtonText: '取消',
-        customClass: 'ai-leave-confirm',
-      },
-    )
-      .then(() => resolve(true))
-      .catch(() => resolve(false))
-  })
-  if (!ok) return
+async function changeNodeFollowState(nodeIds: string[], state: AiFollowNodeState): Promise<void> {
+  if (!nodeIds.length || nodeStateBusy.value || closeBusy.value) return
+  const action = { running: '恢复跟单', paused: '暂停跟单', stopped: '停止跟单' }[state]
   try {
-    const res = await leaveAiFollow({
-      leader_user_id: robot.leader_user_id,
-      // 发**全部分组**：同一节点可能同时跟了该机器人的多个 AI 分组，
-      // 只发一个会残留「半个跟单」（节点仍在其它分组收信号）。
-      group_ids: groupIds,
-      node_ids: [nodeId],
-      close_tasks: false,
-    })
-    const removedCount = res.removed.reduce((n, r) => n + r.node_ids.length, 0)
-    let msg = `已移出 ${removedCount} 个节点`
-    if (res.closing.length) msg += `，${res.closing.length} 个任务正在平仓`
-    if (res.forced.length) msg += `，${res.forced.length} 个离线节点已排队补发平仓`
-    if (res.warning) ElMessage.warning(res.warning)
-    // 跨市场分组：关系**未**被删除，单独提示（不能混进「已移出」的计数里）
-    if (res.skipped.length) {
-      ElMessage.warning(`有 ${res.skipped.length} 个分组属于【带单】市场，未在本次移出：${res.skipped[0].reason}`)
-    }
-    ElMessage.success(msg)
+    await ElMessageBox.confirm(
+      `确认对 ${nodeIds.length} 个子节点${action}？\n\n仅作用于这些节点的 AI 跟单，不影响主节点、其他节点或普通带单。\n${state === 'running' ? '恢复后接收后续新开仓，停止的关系需重新跟单。' : '停止接收新开仓；已有任务与持仓继续运行，平仓 / CLOSE 仍可执行。'}${state === 'stopped' ? '\n停止记录保留，可重新跟单。' : ''}`,
+      action, { type: 'warning', confirmButtonText: '确认', cancelButtonText: '取消' },
+    )
+  } catch { return }
+  nodeStateBusy.value = true
+  try {
+    await setAiFollowNodeState(nodeIds, state)
+    ElMessage.success(`已${action}`)
     await refreshAll()
-    if (detail.value?.robot.leader_user_id === robot.leader_user_id) {
-      detail.value = await fetchAiRobotDetail(robot.leader_user_id, perfWindow.value)
-    }
-  } catch (e) {
-    ElMessage.error(errText(e, '移出 AI 跟单失败'))
-  }
+  } catch (cause) {
+    ElMessage.error(errText(cause, `${action}失败`))
+  } finally { nodeStateBusy.value = false }
+}
+
+async function closeNodeFollowPositions(nodeIds: string[]): Promise<void> {
+  if (!nodeIds.length || nodeStateBusy.value || closeBusy.value) return
+  try {
+    await ElMessageBox.confirm(
+      `确认平掉 ${nodeIds.length} 个子节点上的 AI 跟单持仓？\n\n包含已停止节点保留的 AI 跟单持仓，仅处理这些节点当前关联的 AI 分组，不影响手工单、其他策略或普通带单。`,
+      '一键平仓', { type: 'warning', confirmButtonText: '确认平仓', cancelButtonText: '取消' },
+    )
+  } catch { return }
+  closeBusy.value = true
+  try {
+    const result = await closeAiFollowNodes(nodeIds)
+    if (result.failed.length) ElMessage.warning(`已提交 ${result.submitted} 笔平仓，${result.failed.length} 个节点未完成：${result.failed[0].detail}`)
+    else ElMessage.success(result.submitted ? `已提交 ${result.submitted} 笔 AI 跟单平仓` : '当前没有可平仓的 AI 跟单持仓')
+    await Promise.all(nodeIds.map((nodeId) => hub.fetchNodeAccount(nodeId).catch(() => {})))
+    await refreshAll()
+  } catch (cause) {
+    ElMessage.error(errText(cause, '子节点平仓失败'))
+  } finally { closeBusy.value = false }
 }
 
 const rankOn = ref(false)
@@ -549,10 +574,10 @@ const shownRobots = computed(() => {
   return list.sort((a, b) => (b.performance?.total_profit || 0) - (a.performance?.total_profit || 0))
 })
 const runningMine = computed(() =>
-  myFollowing.value.filter((e) => e.marketable || e.nodes.some((n) => n.active_task_count > 0)),
+  myFollowing.value.filter((entry) => entry.is_owner || entry.marketable || entry.nodes.some((node) => node.active_task_count > 0)),
 )
 const historyMine = computed(() =>
-  myFollowing.value.filter((e) => !e.marketable && e.nodes.every((n) => n.active_task_count === 0)),
+  myFollowing.value.filter((entry) => !entry.is_owner && !entry.marketable && entry.nodes.every((node) => node.active_task_count === 0)),
 )
 
 interface MagicHit { magic: number; group_id: string }
@@ -563,7 +588,6 @@ async function loadAiBooks(nodeIds: string[]) {
     if (!hub.accounts[id]) {
       try { await hub.fetchNodeAccount(id) } catch { /* 快照没有时持仓区留空 */ }
     }
-    if (aiMagics.value[id]) return
     try {
       const { data } = await api.get<FollowChannelsOut>(`/api/nodes/${id}/follow-channels`)
       aiMagics.value = {
@@ -574,19 +598,26 @@ async function loadAiBooks(nodeIds: string[]) {
   }))
 }
 
+function robotNodeIds(entry: MyRobotEntry): string[] {
+  const ids = entry.nodes.map((node) => node.node_id)
+  const primaryId = entry.robot.primary_node?.node_id
+  if (entry.is_owner && primaryId) ids.push(primaryId)
+  return [...new Set(ids)]
+}
+
 watch(myFollowing, (list) => {
-  const ids = [...new Set(list.flatMap((e) => e.nodes.map((n) => n.node_id)))]
+  const ids = [...new Set(list.flatMap(robotNodeIds))]
   if (ids.length) void loadAiBooks(ids)
 }, { immediate: true })
 
 function robotPositions(entry: MyRobotEntry): Array<Position & { nodeId: string }> {
   const groups = new Set(entry.groups.map((g) => g.group_id))
   const rows: Array<Position & { nodeId: string }> = []
-  for (const node of entry.nodes) {
-    const hits = (aiMagics.value[node.node_id] || []).filter((m) => !groups.size || groups.has(m.group_id))
+  for (const nodeId of robotNodeIds(entry)) {
+    const hits = (aiMagics.value[nodeId] || []).filter((m) => !groups.size || groups.has(m.group_id))
     const magics = new Set(hits.map((m) => m.magic))
-    for (const p of hub.accounts[node.node_id]?.positions || []) {
-      if (magics.has(p.magic)) rows.push({ ...p, nodeId: node.node_id })
+    for (const position of hub.accounts[nodeId]?.positions || []) {
+      if (magics.has(position.magic)) rows.push({ ...position, nodeId })
     }
   }
   return rows
@@ -710,7 +741,7 @@ async function closeRobotAll(entry: MyRobotEntry) {
       await api.post(`/api/nodes/${row.nodeId}/follow-channels/close`, { market: 'ai', mode: 'ticket', ticket: row.ticket })
     }
     ElMessage.success('已提交平仓')
-    await Promise.all(entry.nodes.map((n) => hub.fetchNodeAccount(n.node_id).catch(() => {})))
+    await Promise.all(robotNodeIds(entry).map((nodeId) => hub.fetchNodeAccount(nodeId).catch(() => {})))
   } catch (e) {
     ElMessage.error(errText(e, '平仓失败'))
   } finally { closeBusy.value = false }
@@ -755,7 +786,7 @@ onMounted(() => { void hub.fetchNodes() })
           <p v-if="!keyword.trim()" class="ai-empty-hint">机器人主人需在策略分组中开启「开放 AI 跟单」，机器人才能在这里展示。</p>
         </div>
         <div v-else class="ai-list">
-          <div v-for="r in shownRobots" :key="r.leader_user_id" class="ai-row">
+          <div v-for="r in shownRobots" :key="r.group_id" class="ai-row">
             <span class="ai-ico" aria-hidden="true">
               <svg viewBox="0 0 24 24"><path fill="currentColor" d="M20 9V7a2 2 0 0 0-2-2h-3a3 3 0 0 0-6 0H6a2 2 0 0 0-2 2v2a3 3 0 0 0 0 6v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4a3 3 0 0 0 0-6zM9 13a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm7 4H8v-2h8v2zm-1-4a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3z"/></svg>
             </span>
@@ -772,7 +803,7 @@ onMounted(() => { void hub.fetchNodes() })
                 <svg viewBox="0 0 24 24"><path fill="currentColor" d="M6.99 11 3 15l3.99 4v-3H14v-2H6.99v-3zM21 9l-3.99-4v3H10v2h7.01v3L21 9z"/></svg>
                 跟单
               </button>
-              <button type="button" class="ai-set" @click="openPicker(r, 'settings')">
+              <button v-if="r.editable_strategy_id" type="button" class="ai-set" @click="openStrategyEditor(r)">
                 <svg viewBox="0 0 24 24"><path fill="currentColor" d="M19.14 12.94a7.43 7.43 0 0 0 .05-.94 7.43 7.43 0 0 0-.05-.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.28 7.28 0 0 0-1.63-.94l-.36-2.54a.5.5 0 0 0-.5-.42h-3.84a.5.5 0 0 0-.5.42l-.36 2.54a7.28 7.28 0 0 0-1.63.94l-2.39-.96a.5.5 0 0 0-.6.22L2.71 8.84a.5.5 0 0 0 .12.64l2.03 1.58a7.43 7.43 0 0 0-.05.94c0 .32.02.63.05.94L2.83 14.5a.5.5 0 0 0-.12.64l1.92 3.32a.5.5 0 0 0 .6.22l2.39-.96c.5.39 1.05.71 1.63.94l.36 2.54a.5.5 0 0 0 .5.42h3.84a.5.5 0 0 0 .5-.42l.36-2.54c.58-.23 1.13-.55 1.63-.94l2.39.96a.5.5 0 0 0 .6-.22l1.92-3.32a.5.5 0 0 0-.12-.64l-2.03-1.58zM12 15.5A3.5 3.5 0 1 1 15.5 12 3.5 3.5 0 0 1 12 15.5z"/></svg>
                 设置
               </button>
@@ -784,7 +815,7 @@ onMounted(() => { void hub.fetchNodes() })
 
     <section class="ai-mine-wrap">
       <div class="ai-mine-head">
-        <p class="ai-kicker">我的机器人<span>{{ myFollowing.length }}</span></p>
+        <p class="ai-kicker">我的机器人<span>{{ mineTab === 'nodes' ? followNodeCount : myFollowing.length }}</span></p>
         <button type="button" class="ai-refresh" @click="refreshAll">
           <svg viewBox="0 0 24 24"><path fill="currentColor" d="M17.65 6.35A7.95 7.95 0 0 0 12 4V1L7 6l5 5V7a5 5 0 1 1-5 5H5a7 7 0 1 0 12.65-5.65z"/></svg>
           刷新
@@ -801,14 +832,14 @@ onMounted(() => { void hub.fetchNodes() })
         </button>
         <button type="button" class="push" :class="{ on: mineTab === 'nodes' }" @click="mineTab = 'nodes'">
           <svg viewBox="0 0 24 24"><path fill="currentColor" d="M22 11V3h-7v3H9V3H2v8h7V8h2v10h4v3h7v-8h-7v3h-2V8h2v3z"/></svg>
-          子节点跟单统计<span>{{ myFollowing.reduce((n, e) => n + e.nodes.length, 0) }}</span>
+          子节点跟单统计<span>{{ followNodeCount }}</span>
         </button>
       </div>
 
       <div v-if="mineTab === 'run'" class="ai-cards">
         <p v-if="mineLoading && !runningMine.length" class="ai-empty">加载中…</p>
         <p v-else-if="!runningMine.length" class="ai-empty">还没有正在跟随的机器人</p>
-        <article v-for="entry in runningMine" :key="entry.robot.leader_user_id" class="ai-card">
+        <article v-for="entry in runningMine" :key="entry.robot.group_id" class="ai-card">
           <div class="ai-card-top">
             <div class="ai-card-heading">
               <span class="ai-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M20 9V7a2 2 0 0 0-2-2h-3a3 3 0 0 0-6 0H6a2 2 0 0 0-2 2v2a3 3 0 0 0 0 6v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4a3 3 0 0 0 0-6zM9 13a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm7 4H8v-2h8v2zm-1-4a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3z"/></svg></span>
@@ -828,9 +859,9 @@ onMounted(() => { void hub.fetchNodes() })
             <div><span>月化收益</span><strong>—</strong></div>
           </div>
           <div class="ai-card-actions">
-            <button type="button" class="link" @click="openPicker(entry.robot, 'settings')">查看详情<svg viewBox="0 0 24 24"><path fill="currentColor" d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg></button>
+            <button type="button" class="link" @click="router.push({ name: 'ai-robot-detail', params: { leaderUserId: entry.robot.leader_user_id, groupId: entry.robot.group_id } })">查看详情<svg viewBox="0 0 24 24"><path fill="currentColor" d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg></button>
             <div>
-              <button v-if="isMyRobot(entry.robot)" type="button" class="amber" :disabled="pauseBusy" @click="openRobot(entry.robot).then(() => togglePause())">
+              <button v-if="isMyRobot(entry.robot) && entry.marketable" type="button" class="amber" :disabled="pauseBusy" @click="togglePause(entry.robot)">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" :d="entry.robot.ai_follow_paused ? 'M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm-2 15V7l7 5-7 5z' : 'M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm-1 14H8V8h3v8zm5 0h-3V8h3v8z'"/></svg>
                 {{ entry.robot.ai_follow_paused ? '启动机器人' : '暂停机器人' }}
               </button>
@@ -856,7 +887,7 @@ onMounted(() => { void hub.fetchNodes() })
 
       <div v-else-if="mineTab === 'hist'" class="ai-list">
         <p v-if="!historyMine.length" class="ai-empty">没有已结束的跟单</p>
-        <div v-for="entry in historyMine" :key="entry.robot.leader_user_id" class="ai-row">
+        <div v-for="entry in historyMine" :key="entry.robot.group_id" class="ai-row">
           <span class="ai-ico"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M13 3a9 9 0 1 0 9 9h-2a7 7 0 1 1-2.05-4.95L16 9h5V4l-1.64 1.64A8.96 8.96 0 0 0 13 3z"/></svg></span>
           <div class="ai-row-text">
             <div class="ai-row-title"><p>{{ robotTitle(entry.robot) }}</p></div>
@@ -865,20 +896,17 @@ onMounted(() => { void hub.fetchNodes() })
         </div>
       </div>
 
-      <div v-else class="ai-list">
-        <p v-if="!myFollowing.length" class="ai-empty">还没有跟单节点</p>
-        <div v-for="entry in myFollowing" :key="'n-' + entry.robot.leader_user_id" class="ai-node-card">
-          <p>{{ robotTitle(entry.robot) }}</p>
-          <div v-for="n in entry.nodes" :key="n.node_id" class="ai-node-line">
-            <span>{{ n.name || n.node_id }}</span>
-            <span>MT5 {{ n.mt5_login ?? '—' }}</span>
-            <span>任务 {{ n.active_task_count }}</span>
-            <span>{{ fmtJoinedShort(n.joined_at) }}</span>
-            <button type="button" @click="confirmLeave(entry.robot, n.node_id)">移出</button>
-          </div>
-        </div>
-      </div>
+      <AiFollowNodesPanel v-else :data="nodeStats" :loading="nodeStatsLoading" :error="nodeStatsError" :busy="nodeStateBusy || closeBusy" @retry="loadNodeStats" @state="changeNodeFollowState" @close="closeNodeFollowPositions" />
     </section>
+
+    <StrategyFormModal
+      v-model="strategyFormVisible"
+      mode="edit"
+      :strategy-id="editingStrategyId"
+      preset-template-id="tpl_1"
+      :preset-symbol-locked="true"
+      @saved="refreshAll"
+    />
 
     <div v-if="pickerOpen && detail" class="ai-mask" @click.self="pickerOpen = false">
       <section class="ai-dialog" role="dialog" aria-label="选择跟单节点">
@@ -1044,7 +1072,7 @@ onMounted(() => { void hub.fetchNodes() })
 .ai-dialog { width: min(560px, 100%); max-height: 86vh; overflow: auto; padding: 14px; border: 1px solid #1E2B47; border-radius: 16px; background: #0D1626; }
 .ai-dialog header, .ai-dialog footer { display: flex; align-items: center; justify-content: space-between; }
 .ai-dialog header p { margin: 4px 0 0; color: #8B96A8; font-size: 11px; }
-.ai-x { width: 28px; height: 28px; border-radius: 8px; border: 1px solid #22304A; background: #0A0F1A; color: #8B96A8; }
+.ai-x { display: flex; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 0; border-radius: 8px; border: 1px solid #22304A; background: #0A0F1A; color: #8B96A8; }
 .ai-pick { width: 100%; margin-top: 8px; padding: 8px; text-align: left; border-radius: 10px; border: 1px solid #22304A; background: #0C1220; color: inherit; }
 .ai-pick.on { border-color: #2563EB; }
 .ai-pick.off { opacity: .45; }

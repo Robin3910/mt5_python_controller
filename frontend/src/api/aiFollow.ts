@@ -5,6 +5,9 @@ import type {
   AiLeavePayload,
   AiLeaveResponse,
   AiMeResponse,
+  AiFollowNodeState,
+  AiFollowNodesResponse,
+  AiMyRobotDetailResponse,
   AiPausePayload,
   AiPauseResponse,
   AiRobotDetailResponse,
@@ -24,10 +27,11 @@ export async function fetchAiRobots(q = '', window = '30d'): Promise<AiRobotList
 export async function fetchAiRobotDetail(
   leaderUserId: number,
   window = '30d',
+  groupId = '',
 ): Promise<AiRobotDetailResponse> {
   const { data } = await api.get<AiRobotDetailResponse>(
     `/api/ai-follow/robots/${leaderUserId}`,
-    { params: window ? { window } : undefined },
+    { params: { ...(window ? { window } : {}), ...(groupId ? { group_id: groupId } : {}) } },
   )
   return data
 }
@@ -36,6 +40,27 @@ export async function fetchAiRobotDetail(
 export async function fetchMyAiFollowings(): Promise<AiMeResponse> {
   const { data } = await api.get<AiMeResponse>('/api/ai-follow/me')
   return data
+}
+
+export async function fetchMyAiRobotDetail(leaderUserId: number, groupId = ''): Promise<AiMyRobotDetailResponse> {
+  const { data } = await api.get<AiMyRobotDetailResponse>(`/api/ai-follow/me/${leaderUserId}`, {
+    params: groupId ? { group_id: groupId } : undefined,
+  })
+  return data
+}
+
+export async function fetchAiFollowNodes(): Promise<AiFollowNodesResponse> {
+  return (await api.get<AiFollowNodesResponse>('/api/ai-follow/nodes')).data
+}
+
+export async function setAiFollowNodeState(nodeIds: string[], state: AiFollowNodeState): Promise<void> {
+  await api.post('/api/ai-follow/nodes/state', { node_ids: nodeIds, state })
+}
+
+export async function closeAiFollowNodes(nodeIds: string[]): Promise<{
+  node_count: number; submitted: number; failed: { node_id: string; detail: string }[]
+}> {
+  return (await api.post('/api/ai-follow/nodes/close', { node_ids: nodeIds })).data
 }
 
 /** 加入 AI 跟单 */
@@ -53,7 +78,7 @@ export async function leaveAiFollow(payload: AiLeavePayload): Promise<AiLeaveRes
 /**
  * 暂停 / 恢复【AI 交易】市场对外接单。
  *
- * 暂停后：新客户无法加入 AI 分组；新信号只发主节点。
+ * 暂停后：新客户无法加入 AI 分组；分组所有节点停止接收新开仓，平仓仍可执行。
  * 已有跟单关系与在跑任务**不动** —— 等跟单员自行移出。
  * 只影响 AI 市场（AI 智能加仓），带单市场用 setFollowPaused。
  */

@@ -78,6 +78,15 @@ def _migrate_users_follow_paused(sync_conn) -> None:
             sync_conn.execute(text(f"ALTER TABLE users ADD COLUMN {name} DATETIME"))
 
 
+def _migrate_follow_node_state(sync_conn) -> None:
+    inspector = inspect(sync_conn)
+    if "group_follower_node" not in inspector.get_table_names():
+        return
+    columns = {column["name"] for column in inspector.get_columns("group_follower_node")}
+    if "follow_state" not in columns:
+        sync_conn.execute(text("ALTER TABLE group_follower_node ADD COLUMN follow_state VARCHAR(16) NOT NULL DEFAULT 'running'"))
+
+
 def _migrate_users_profile_columns(sync_conn) -> None:
     """users 的个人中心自助维护列：email / leader_name / leader_intro。
 
@@ -612,6 +621,7 @@ async def init_db() -> None:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_migrate_user_totp_columns)
         await conn.run_sync(_migrate_users_follow_paused)
+        await conn.run_sync(_migrate_follow_node_state)
         await conn.run_sync(_migrate_users_profile_columns)
         await conn.run_sync(_migrate_dispatch_price_column)
         await conn.run_sync(_migrate_signal_source_column)

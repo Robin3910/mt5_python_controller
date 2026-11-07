@@ -17,7 +17,7 @@ import logging
 import time
 from typing import Optional
 
-from sqlalchemy import case, func, select
+from sqlalchemy import and_, case, false, func, or_, select
 
 from .db import SessionLocal
 from .orm import Deal
@@ -121,6 +121,7 @@ async def leader_batch(
     to_ts: Optional[float] = None,
     *,
     symbol: Optional[str] = None,
+    node_magics: Optional[dict[str, set[int]]] = None,
 ) -> dict:
     """若干节点的合并汇总（带单员绩效 = 其**主节点**传入单个 node_id）。
 
@@ -135,6 +136,7 @@ async def leader_batch(
         return _empty_summary()
 
     conds = _base_conds(ids, from_ts, to_ts, symbol)
+    conds.extend(_magic_scope(node_magics))
     try:
         async with SessionLocal() as s:
             # —— 持仓级聚合（胜率的分子与分母）——
@@ -415,9 +417,20 @@ _DAY_OFFSET = 8 * 3600
 _DAY_SECONDS = 86400
 
 
+def _magic_scope(node_magics: Optional[dict[str, set[int]]]) -> list:
+    if node_magics is None:
+        return []
+    return [or_(false(), *[
+        and_(Deal.node_id == node_id, Deal.magic.in_(magics))
+        for node_id, magics in node_magics.items() if magics
+    ])]
+
+
 async def daily_net_profit(
     node_ids: list[str],
     days: int = 7,
+    *,
+    node_magics: Optional[dict[str, set[int]]] = None,
 ) -> list[dict]:
     """近 N 个自然日的每日已实现净盈亏序列。
 
@@ -456,6 +469,7 @@ async def daily_net_profit(
                         Deal.deal_time >= int(start) - 2 * _DAY_SECONDS,
                         Deal.deal_time < int(end) + 2 * _DAY_SECONDS,
                         Deal.entry_type.in_(OUT_ENTRIES),
+                        *_magic_scope(node_magics),
                     )
                 )
             ).all()

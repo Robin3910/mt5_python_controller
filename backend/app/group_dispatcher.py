@@ -216,7 +216,7 @@ class GroupDispatcher:
         用来在任务上留一句人话原因（否则主节点不在线时会误报「分组无有效节点」）。
 
         三种情况处理准入（带单员是否仍有 follow_leader 能力）：
-        1. 没有跟单成员 -> 跟改动前完全一致（owner 成员口径，零行为变化）；
+        1. 没有跟单成员 -> owner 成员口径；AI 暂停仍会拦截整组新开仓；
         2. 有跟单成员 + 带单员仍有能力 -> owner 成员 + 跟单成员；
         3. 带单员已被撤销能力 -> 退回 owner 成员口径；已在跑的任务继续跑。
 
@@ -227,10 +227,8 @@ class GroupDispatcher:
         天然互不串台。模版未知（两个市场都不收）时保守退回 owner 口径 ——
         宁可漏发也不误发。
 
-        暂停接单：主人暂停对应市场后，新信号**只发主节点**（与【交易】界面的
-        「带单开关关闭」同构，但这里是服务端持久状态，webhook / 限价监听等
-        非前端发起的信号也必须被收窄）。暂停按**分组所属模版**取对应市场的
-        标志 —— 暂停带单不影响 AI 分组，反之亦然。
+        暂停接单：AI 暂停时整组所有节点均不接收新开仓，带单暂停仍只发主节点。
+        暂停按分组所属模版读取对应市场的持久标志，webhook / 限价监听等入口同样生效。
         **只影响新信号**：已在跑的子任务不终止（由各自自然结束），
         CLOSE 信号走 `_dispatch_close`（按活动子任务筛），完全不受暂停影响 ——
         否则跟单节点的持仓会平不掉。
@@ -240,27 +238,29 @@ class GroupDispatcher:
         留一个稳定的可解释口径：「带单关 ⇒ 主节点」「带单开 ⇒ 全部参与者」。
         空列表视为不限制。
         """
+        template_id = (strategy or {}).get("template_id")
+        group = follow_rules.group_for_follow_dispatch(group, template_id)
         base = group_rules.effective_node_ids(group, nodemap, online_ids)
         pause_note: Optional[str] = None
-        if group_rules.has_followers(group):
-            template_id = (strategy or {}).get("template_id")
+        has_followers = group_rules.has_followers(group)
+        use_ai_pause = follow_rules.pause_flags_for_template(template_id)[1]
+        if has_followers or use_ai_pause:
             state = await self._leader_state(group, nodemap)
-            if not state.enabled:
-                base = group_rules.owner_effective_node_ids(group, nodemap, online_ids)
-            elif not follow_rules.market_for_template(template_id):
-                # 未知模版：两个跟单市场都不收，跟单节点不接收新信号（保守）
-                base = group_rules.owner_effective_node_ids(group, nodemap, online_ids)
-            elif self._paused_for(template_id, state):
-                # 暂停中：严格只发主节点（跟单成员与 owner 其它成员都不收）
-                if follow_rules.group_contains_primary(group, state.primary_node_id):
-                    base = follow_rules.paused_dispatch_targets(
-                        group, nodemap, online_ids, state.primary_node_id,
-                    )
-                else:
-                    # 本分组不含主节点（不是带单源分组，理论上不会有跟单成员）：
-                    # 退回 owner 口径，跟单节点照常不收信号
+            if use_ai_pause and state.ai_follow_paused:
+                return [], follow_rules.paused_dispatch_note(template_id)
+            if has_followers:
+                if not state.enabled:
                     base = group_rules.owner_effective_node_ids(group, nodemap, online_ids)
-                pause_note = follow_rules.paused_dispatch_note(template_id)
+                elif not follow_rules.market_for_template(template_id):
+                    base = group_rules.owner_effective_node_ids(group, nodemap, online_ids)
+                elif self._paused_for(template_id, state):
+                    if follow_rules.group_contains_primary(group, state.primary_node_id):
+                        base = follow_rules.paused_dispatch_targets(
+                            group, nodemap, online_ids, state.primary_node_id,
+                        )
+                    else:
+                        base = group_rules.owner_effective_node_ids(group, nodemap, online_ids)
+                    pause_note = follow_rules.paused_dispatch_note(template_id)
         if signal and getattr(signal, "node_ids", None):
             wanted = {str(n).strip().lower() for n in signal.node_ids if n}
             base = [nid for nid in base if nid.lower() in wanted]
@@ -733,13 +733,10 @@ class GroupDispatcher:
 
         skip_reason = group_rules.group_skip_reason(group, effective)
         if skip_reason:
-            # 暂停收窄后主节点恰好不在线时，group_skip_reason 会说「成员均未启用或不在线」，
-            # 那是误导 —— 真正的原因是主人暂停了接单。这条优先，附带说明主节点不可达。
             if pause_note:
-                skip_reason = (
-                    f"{pause_note}（主节点当前不可用，本次未下发）"
-                    if not effective else pause_note
-                )
+                skip_reason = pause_note
+                if not effective and not follow_rules.pause_flags_for_template(strategy.get("template_id"))[1]:
+                    skip_reason = f"{pause_note}（主节点当前不可用，本次未下发）"
             await group_persist.mark_task_skipped(
                 task_id, skip_reason,
                 skip_code=signal_codes.classify_group_skip_reason(skip_reason),

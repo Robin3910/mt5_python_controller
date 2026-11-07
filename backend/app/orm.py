@@ -157,8 +157,8 @@ class User(Base):
     # follow_paused：暂停【带单】市场（tpl_2 趋势 / tpl_3 网格）对外接单。
     #   语义 = 新客户无法加入跟单分组 + 之后的新信号只发主节点；
     #   已有跟单关系与在跑任务**不动**，等跟单员自行移出。
-    # ai_follow_paused：暂停【AI 交易】市场（tpl_1 AI 智能加仓）对外接单，
-    #   语义与上面一致，但只约束 tpl_1 分组。
+    # ai_follow_paused：暂停【AI 交易】市场对外接单及 tpl_1 分组所有节点的新开仓。
+    #   已有关系与在跑任务保留，CLOSE / 平仓仍可执行。
     # 两列分开而不是合成一个：一个带单员可能同时做普通带单与 AI 机器人，
     # 合并后无法表达「只停一边」。
     follow_paused: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -471,6 +471,7 @@ class GroupFollowerNode(Base):
     node_id: Mapped[str] = mapped_column(String(32), index=True)
     # 跟单员用户 ID（冗余自 nodes.owner_user_id，便于按人查询 / 审计）
     follower_user_id: Mapped[int] = mapped_column(Integer, index=True)
+    follow_state: Mapped[str] = mapped_column(String(16), default="running", server_default="running")
     # 带单源冗余快照：写入时取「分组 owner 的主节点」。
     # 只用于展示 / 审计 / 主节点切换后的存量排查，不参与运行时判定
     # （运行时一律按 group.owner_user_id 现算主节点，避免主节点切换后快照过期）。

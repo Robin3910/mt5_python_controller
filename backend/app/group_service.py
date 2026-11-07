@@ -72,12 +72,13 @@ def group_row_to_dict(
             {
                 "node_id": f.node_id,
                 "follower_user_id": f.follower_user_id,
+                "follow_state": getattr(f, "follow_state", None) or "running",
                 "leader_user_id": f.leader_user_id,
                 "leader_primary_node_id": f.leader_primary_node_id,
                 "sort_order": f.sort_order or 0,
                 "joined_at": f.joined_at.timestamp() if f.joined_at else None,
             }
-            for f in ordered_followers
+            for f in ordered_followers if getattr(f, "follow_state", "running") != "stopped"
         ],
     }
 

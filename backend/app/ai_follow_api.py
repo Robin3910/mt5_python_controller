@@ -29,6 +29,8 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from . import (
+    ai_follow_nodes,
+    ai_robot_detail,
     deal_stats,
     follow_rules,
     follow_service,
@@ -38,7 +40,7 @@ from . import (
     rbac_service,
     user_service,
 )
-from .deps import client_ip, get_store, require_menu
+from .deps import client_ip, get_group_dispatcher, get_store, require_menu
 from .models import (
     AiJoinRequest,
     AiJoinResponse,
@@ -47,6 +49,10 @@ from .models import (
     AiMeResponse,
     AiMyGroup,
     AiMyRobot,
+    AiMyRobotDetailResponse,
+    AiFollowNodesResponse,
+    AiFollowNodesRequest,
+    AiFollowNodeStateRequest,
     AiPauseRequest,
     AiPauseResponse,
     AiRobotDetailResponse,
@@ -84,7 +90,7 @@ def _node_brief(node: Optional[dict]) -> Optional[dict]:
     }
 
 
-def _primary_of(all_nodes: list[dict], user_id: int) -> Optional[dict]:
+def _primary_of(all_nodes: list[dict], user_id: Optional[int]) -> Optional[dict]:
     """某用户的主节点。
 
     委托 `follow_rules.primary_node_of` —— 与带单广场共用同一实现，
@@ -178,6 +184,32 @@ def _ai_groups_of(
     return [g for g in groups if g.get("accept_ai_follow")]
 
 
+def _group_robot_summary(user, primary: Optional[dict], group: dict, strategy: Optional[dict], p: Principal) -> dict:
+    strategy = strategy or {}
+    name = strategy.get("name")
+    risk = _risk_summary(strategy)
+    return {
+        "leader_user_id": user.id,
+        "group_id": group["group_id"],
+        "strategy_id": group.get("strategy_id"),
+        "username": user.username,
+        "display_name": user.display_name,
+        "primary_node": _node_brief(primary),
+        "ai_group_count": 1,
+        "strategy_name": name,
+        "strategy_names": [name] if name else [],
+        "editable_strategy_id": (
+            strategy.get("strategy_id")
+            if permissions.same_owner(strategy.get("owner_user_id"), permissions.owner_for_new(p))
+            and follow_rules.template_in_market(strategy.get("template_id"), follow_rules.AI_MARKET_TEMPLATE_IDS)
+            else None
+        ),
+        "max_allow_num": risk.get("max_allow_num"),
+        "total_lot_limit": risk.get("total_lot_limit"),
+        "ai_follow_paused": bool(getattr(user, "ai_follow_paused", False)),
+    }
+
+
 # ---------------------------------------------------------------------------
 # 机器人广场
 # ---------------------------------------------------------------------------
@@ -188,14 +220,7 @@ async def list_ai_robots(
     store: RedisStore = Depends(get_store),
     p: Principal = Depends(require_menu(MENU_AI_TRADE)),
 ) -> AiRobotListResponse:
-    """AI 机器人广场：持 ai_strategy + follow_leader + 有主节点 + 至少一个已开放 AI 跟单的 tpl_1 分组。
-
-    节点 / 分组 / 跟单关系都**批量预取一次**再在内存里筛，避免 N+1。
-
-    绩效口径 = **主节点**的成交聚合（AI 机器人的展示单位就是主节点）。
-    只读 deal_agg 预聚合的 Redis 缓存，**未命中不回源查库** —— 与带单广场
-    同一套策略，保证列表接口延迟恒定。
-    """
+    """每个已开放的 AI 策略分组一条记录，计数与主节点绩效均按分组隔离。"""
     users = await user_service.list_users()
     hosts = await _ai_host_ids_with_capability(store, users)
     if not hosts:
@@ -206,33 +231,17 @@ async def list_ai_robots(
     strategies = await follow_service._strategies_of(all_groups, store)
     tmpl_map = follow_service._template_ids_of(strategies)
 
-    mine_by_leader: dict[int, list[dict]] = {}
+    mine_by_group: dict[str, list[dict]] = {}
     for f in await follow_service.list_followings(p.user_id):
-        mine_by_leader.setdefault(int(f["leader_user_id"]), []).append(f)
-    followers_by_leader: dict[int, set[str]] = {}
+        mine_by_group.setdefault(f["group_id"], []).append(f)
+    followers_by_group: dict[str, set[str]] = {}
     for f in await follow_service.list_for_leaders(hosts):
-        followers_by_leader.setdefault(int(f["leader_user_id"]), set()).add(f["node_id"])
-    # 「我已跟」的计数必须**按市场隔离**（只算 AI 市场 tpl_1）：
-    # 两个市场共用同一张跟单关系表，不隔离的话，客户只跟了主人的
-    # tpl_2 开仓策略分组时，AI 卡片也会打上「已跟」—— 误导他以为已经跟了 AI。
+        followers_by_group.setdefault(f["group_id"], set()).add(f["node_id"])
     groups_by_id = {g["group_id"]: g for g in all_groups}
-    mine_counts: dict[int, tuple[int, int]] = {
-        uid: follow_rules.my_follow_counts_in_market(
-            items, groups_by_id, follow_rules.AI_MARKET_TEMPLATE_IDS, tmpl_map,
-        )
-        for uid, items in mine_by_leader.items()
-    }
-    # 绩效：一次 MGET 拿全部机器人的主节点预聚合结果（未命中就是 None）
     win = window if window in deal_stats.WINDOWS else deal_stats.DEFAULT_WINDOW
-    cached: dict[int, dict] = {}
-    for uid in hosts:
-        entry = await store.get_robot_stats(uid)
-        if entry and win in entry:
-            cached[uid] = entry[win]
-
     by_id = {u.id: u for u in users}
     needle = q.strip().lower()
-    out: list[dict] = []
+    candidates: list[tuple] = []
     for uid in hosts:
         u = by_id.get(uid)
         if not u:
@@ -241,58 +250,40 @@ async def list_ai_robots(
         if not primary:
             continue
         groups = _ai_groups_of(all_groups, tmpl_map, uid, primary.get("node_id"))
-        if not groups:
-            continue          # 没有已开放 AI 跟单的分组 -> 不进广场
-        if needle:
-            haystack = " ".join(str(x) for x in [
-                u.username, u.display_name or "",
-                primary.get("name") or "", primary.get("mt5_login") or "",
-            ]).lower()
-            if needle not in haystack:
-                continue
-        # 「我已跟」计数：**只算 AI 市场**（tpl_1）的跟单关系。
-        # 带单市场（tpl_2 开仓策略 / tpl_3 网格）的关系不算 ——
-        # 跟了开仓策略分组 ≠ 跟了 AI 机器人。
-        my_group_count, my_node_count = mine_counts.get(uid, (0, 0))
-        # 风险上限取各分组里的最大值，让用户一眼看到风险量级
-        risk = [
-            _risk_summary(strategies.get(g.get("strategy_id") or "")) for g in groups
-        ]
-        max_allow = [r["max_allow_num"] for r in risk if r["max_allow_num"] is not None]
-        lot_limits = [r["total_lot_limit"] for r in risk if r["total_lot_limit"] is not None]
-        # 策略名称（列表标题用）：按分组顺序去重，取第一个作为主标题。
-        # 分组未绑策略 / 策略已删除时该名字为空 —— 此时列表不显示标题文字，
-        # 前端会回落到用户名，不展示空白标题。
-        strategy_names: list[str] = []
-        for g in groups:
-            sname = (strategies.get(g.get("strategy_id") or "") or {}).get("name")
-            if sname and sname not in strategy_names:
-                strategy_names.append(str(sname))
-        # 绩效：主节点口径的预聚合（缓存未命中 -> 空统计，前端显示「暂无数据」）
-        perf = dict(cached.get(uid) or {})
+        for group in sorted(groups, key=follow_rules.leader_group_sort_key):
+            strategy = strategies.get(group.get("strategy_id") or "")
+            haystack = " ".join(str(value or "") for value in (
+                u.username, u.display_name, primary.get("name"), primary.get("mt5_login"),
+                group.get("name"), (strategy or {}).get("name"),
+            )).lower()
+            if not needle or needle in haystack:
+                candidates.append((u, primary, group, strategy))
+    scopes = await ai_robot_detail.group_node_magics(
+        [primary["node_id"] for user, primary, group, strategy in candidates],
+        [group["group_id"] for user, primary, group, strategy in candidates],
+    )
+    out: list[dict] = []
+    for user, primary, group, strategy in candidates:
+        gid = group["group_id"]
+        my_group_count, my_node_count = follow_rules.my_follow_counts_in_market(
+            mine_by_group.get(gid, []), groups_by_id, follow_rules.AI_MARKET_TEMPLATE_IDS, tmpl_map,
+        )
+        perf = await deal_stats.leader_batch(
+            [primary["node_id"]], None if win == "all" else deal_stats.window_start(win),
+            node_magics=scopes[gid],
+        )
+        follower_count = len(followers_by_group.get(gid, set()))
         out.append({
-            "leader_user_id": uid,
-            "username": u.username,
-            "display_name": u.display_name,
-            "primary_node": _node_brief(primary),
-            "ai_group_count": len(groups),
-            "strategy_name": strategy_names[0] if strategy_names else None,
-            "strategy_names": strategy_names,
-            "follower_node_count": len(followers_by_leader.get(uid, set())),
+            **_group_robot_summary(user, primary, group, strategy, p),
+            "follower_node_count": follower_count,
             "my_follow_group_count": my_group_count,
             "my_follow_node_count": my_node_count,
-            "max_allow_num": max(max_allow) if max_allow else None,
-            "total_lot_limit": max(lot_limits) if lot_limits else None,
             "marketable": True,
             "performance": perf,
             "perf_window": win,
-            # 跟单人数取预聚合里的值，回落到跟单关系表实时统计
-            "follower_count": len(followers_by_leader.get(uid, set())),
-            # 暂停 AI 跟单状态：暂停后不再接受新跟单，新信号只发主节点
-            "ai_follow_paused": bool(getattr(u, "ai_follow_paused", False)),
+            "follower_count": follower_count,
         })
-    # 已跟过的排前面，其余按用户名
-    out.sort(key=lambda x: (x["my_follow_group_count"] == 0, x["username"]))
+    out.sort(key=lambda item: (item["my_follow_group_count"] == 0, item["username"], item["group_id"]))
     return AiRobotListResponse(robots=out)
 
 
@@ -303,6 +294,7 @@ async def list_ai_robots(
 async def get_ai_robot_detail(
     leader_user_id: int,
     window: str = "30d",
+    group_id: Optional[str] = None,
     store: RedisStore = Depends(get_store),
     p: Principal = Depends(require_menu(MENU_AI_TRADE)),
 ) -> AiRobotDetailResponse:
@@ -323,6 +315,10 @@ async def get_ai_robot_detail(
     strategies = await follow_service._strategies_of(all_groups, store)
     tmpl_map = follow_service._template_ids_of(strategies)
     groups = _ai_groups_of(all_groups, tmpl_map, leader_user_id, primary.get("node_id"))
+    if group_id is not None:
+        groups = [group for group in groups if group["group_id"] == group_id]
+        if not groups:
+            raise HTTPException(status_code=404, detail="该 AI 策略分组不存在或未开放跟单")
     signal_counts = await group_persist.count_by_group()
     active_counts = await group_persist.count_active_by_group()
 
@@ -336,7 +332,7 @@ async def get_ai_robot_detail(
     # 带单市场（tpl_2 开仓策略 / tpl_3 网格）的关系不算 ——
     # 跟了开仓策略分组 ≠ 跟了 AI 机器人（该用户报的现象）。
     my_group_count, my_node_count = follow_rules.my_follow_counts_in_market(
-        my_followings_for_leader,
+        [item for item in my_followings_for_leader if group_id is None or item["group_id"] == group_id],
         {g["group_id"]: g for g in all_groups},
         follow_rules.AI_MARKET_TEMPLATE_IDS,
         tmpl_map,
@@ -390,14 +386,24 @@ async def get_ai_robot_detail(
     # 详情是单个人，缓存刚建立时可能还没有 —— 允许就地回源算一次兜底。
     win = window if window in deal_stats.WINDOWS else deal_stats.DEFAULT_WINDOW
     perf: dict = {}
-    cached = await store.get_robot_stats(leader_user_id) or {}
-    if win in cached:
-        perf = dict(cached[win])
+    node_magics = None
+    if group_id is not None:
+        scopes = await ai_robot_detail.group_node_magics([primary["node_id"]], [group_id])
+        node_magics = scopes[group_id]
+        perf = await deal_stats.leader_batch(
+            [primary["node_id"]], None if win == "all" else deal_stats.window_start(win),
+            node_magics=node_magics,
+        )
     else:
-        perf = await deal_stats.leader_batch([str(primary.get("node_id"))], deal_stats.window_start(win), None)
+        cached = await store.get_robot_stats(leader_user_id) or {}
+        if win in cached:
+            perf = dict(cached[win])
+        else:
+            perf = await deal_stats.leader_batch([str(primary.get("node_id"))], deal_stats.window_start(win), None)
 
     follower_count = len({
         f["node_id"] for f in await follow_service.list_for_leaders({leader_user_id})
+        if group_id is None or f["group_id"] == group_id
     })
     # 策略名称：与列表接口同一口径（按分组顺序去重，取第一个作主标题）
     strategy_names: list[str] = []
@@ -411,7 +417,7 @@ async def get_ai_robot_detail(
     # 两个市场各算一次必然漂移（「同一节点在跟单页与 AI 页收益不同」）。
     # 同样不回源缓存：日序列与四窗口汇总结构不同，塞进 K_ROBOT_STATS 会污染缓存语义。
     daily_profit = await deal_stats.daily_net_profit(
-        [str(primary.get("node_id"))], days=7,
+        [str(primary.get("node_id"))], days=7, node_magics=node_magics,
     )
 
     return AiRobotDetailResponse(
@@ -434,6 +440,7 @@ async def get_ai_robot_detail(
             "follower_count": follower_count,
             # 暂停 AI 跟单状态（详情页据此显示「暂停 / 恢复 AI 跟单」按钮）
             "ai_follow_paused": bool(getattr(user, "ai_follow_paused", False)),
+            **(_group_robot_summary(user, primary, groups[0], strategies.get(groups[0].get("strategy_id") or ""), p) if len(groups) == 1 else {}),
         },
         groups=detail_groups,
         my_nodes=[_node_brief(n) for n in _viewable_follow_nodes(all_nodes, p)],
@@ -449,17 +456,26 @@ async def list_my_ai_followings(
     store: RedisStore = Depends(get_store),
     p: Principal = Depends(require_menu(MENU_AI_TRADE)),
 ) -> AiMeResponse:
-    """我的 AI 跟单：按机器人主人分组；主人撤销能力时标 unmarketable 但仍可自行移出。"""
+    """我的机器人：合并自有主节点上的 AI 策略与既有 AI 跟单。"""
     followings = await follow_service.list_followings(p.user_id)
-    if not followings:
-        return AiMeResponse(
-            following=[], summary={"following_count": 0, "follow_node_count": 0},
-        )
     all_groups = {g["group_id"]: g for g in await store.all_groups()}
     all_nodes = await store.all_nodes()
     active_counts = await group_persist.count_active_by_group()
     strategies = await follow_service._strategies_of(list(all_groups.values()), store)
     tmpl_map = follow_service._template_ids_of(strategies)
+    owner = permissions.owner_for_new(p)
+    own_primary = _primary_of(all_nodes, owner)
+    owned_group_ids = {
+        gid for gid, group in all_groups.items()
+        if permissions.same_owner(group.get("owner_user_id"), owner)
+        and follow_rules.group_contains_primary(
+            group, own_primary.get("node_id") if own_primary else None,
+        )
+        and follow_rules.template_in_market(
+            tmpl_map.get(str(group.get("strategy_id") or "")),
+            follow_rules.AI_MARKET_TEMPLATE_IDS,
+        )
+    }
 
     by_leader: dict[int, list[dict]] = {}
     for f in followings:
@@ -481,6 +497,9 @@ async def list_my_ai_followings(
         for lid, items in by_leader.items()
     }
     by_leader = {lid: items for lid, items in by_leader.items() if items}
+    following_group_count = len({item["group_id"] for items in by_leader.values() for item in items})
+    if owned_group_ids:
+        by_leader.setdefault(p.user_id, [])
     if not by_leader:
         return AiMeResponse(
             following=[], summary={"following_count": 0, "follow_node_count": 0},
@@ -493,13 +512,16 @@ async def list_my_ai_followings(
             continue
         principal = await rbac_service.load_principal(store, user.username)
         has_cap = bool(principal) and permissions.can_host_ai_robot(principal)
-        primary = _primary_of(all_nodes, lid)
+        is_owner = lid == p.user_id and bool(owned_group_ids)
+        primary = own_primary if is_owner else _primary_of(all_nodes, lid)
 
         by_group: dict[str, list[dict]] = {}
         for it in items:
             by_group.setdefault(it["group_id"], []).append(it)
+        if is_owner:
+            for gid in sorted(owned_group_ids):
+                by_group.setdefault(gid, [])
 
-        groups_out: list[dict] = []
         for gid, fs in by_group.items():
             g = all_groups.get(gid)
             if not g:
@@ -516,10 +538,10 @@ async def list_my_ai_followings(
             if reason is None and not g.get("accept_ai_follow"):
                 reason = "该机器人已关闭 AI 跟单，不再接收新信号"
             risk = _risk_summary(strategies.get(g.get("strategy_id") or ""))
-            groups_out.append({
+            group_out = {
                 "group_id": gid,
                 "group_name": g.get("name"),
-                "symbol": g.get("strategy_symbol") or risk.get("symbol"),
+                "symbol": (strategies.get(g.get("strategy_id") or "") or {}).get("symbol") or g.get("strategy_symbol"),
                 "strategy_id": g.get("strategy_id"),
                 "strategy_name": (strategies.get(g.get("strategy_id") or "") or {}).get("name"),
                 "marketable": reason is None,
@@ -536,42 +558,80 @@ async def list_my_ai_followings(
                     }
                     for f in sorted(fs, key=lambda x: x.get("joined_at") or 0)
                 ],
+            }
+            my_group_count, my_node_count = follow_rules.my_follow_counts_in_market(
+                fs, all_groups, follow_rules.AI_MARKET_TEMPLATE_IDS, tmpl_map,
+            )
+            following_out.append({
+                "is_owner": lid == p.user_id and gid in owned_group_ids,
+                "robot": {
+                    **_group_robot_summary(user, primary, g, strategies.get(g.get("strategy_id") or ""), p),
+                    "my_follow_group_count": my_group_count,
+                    "my_follow_node_count": my_node_count,
+                    "marketable": has_cap,
+                },
+                "groups": [group_out],
             })
-        my_group_count, my_node_count = follow_rules.my_follow_counts_in_market(
-            items, all_groups, follow_rules.AI_MARKET_TEMPLATE_IDS, tmpl_map,
-        )
-        following_out.append({
-            "robot": {
-                "leader_user_id": lid,
-                "username": user.username,
-                "display_name": user.display_name,
-                "primary_node": _node_brief(primary),
-                "ai_group_count": len(by_group),
-                # 策略名称：与广场列表同一口径（按分组顺序去重，取第一个作主标题）
-                "strategy_name": (groups_out[0].get("strategy_name") if groups_out else None),
-                "strategy_names": [
-                    n for n in dict.fromkeys(
-                        str(g.get("strategy_name")) for g in groups_out if g.get("strategy_name")
-                    )
-                ],
-                "follower_node_count": 0,
-                # 「我已跟」计数：**只算 AI 市场**（tpl_1）的跟单关系。
-                "my_follow_group_count": my_group_count,
-                "my_follow_node_count": my_node_count,
-                "marketable": has_cap,
-                # 暂停状态：跟单员据此看到「该机器人主人已暂停 AI 跟单」
-                "ai_follow_paused": bool(getattr(user, "ai_follow_paused", False)),
-            },
-            "groups": groups_out,
-        })
     return AiMeResponse(
         following=following_out,
         summary={
-            "following_count": len(by_leader),
+            "following_count": following_group_count,
             # 计数也只算 AI 市场的关系（与上面过滤后的口径一致）
             "follow_node_count": sum(len(items) for items in by_leader.values()),
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# AI 跟单子节点统计与控制
+# ---------------------------------------------------------------------------
+@router.get("/nodes", response_model=AiFollowNodesResponse)
+async def list_ai_follow_nodes(
+    store: RedisStore = Depends(get_store),
+    p: Principal = Depends(require_menu(MENU_AI_TRADE)),
+):
+    return await ai_follow_nodes.node_stats(store, p)
+
+
+@router.post("/nodes/state")
+async def set_ai_follow_node_state(
+    body: AiFollowNodeStateRequest, request: Request,
+    store: RedisStore = Depends(get_store),
+    p: Principal = Depends(require_menu(MENU_AI_TRADE)),
+):
+    return await ai_follow_nodes.set_node_state(store, p, body.node_ids, body.state, client_ip(request))
+
+
+@router.post("/nodes/close")
+async def close_ai_follow_nodes(
+    body: AiFollowNodesRequest, request: Request,
+    store: RedisStore = Depends(get_store),
+    dispatcher=Depends(get_group_dispatcher),
+    p: Principal = Depends(require_menu(MENU_AI_TRADE)),
+):
+    return await ai_follow_nodes.close_nodes(store, p, body.node_ids, request, dispatcher, client_ip(request))
+
+
+# ---------------------------------------------------------------------------
+# 我的机器人详情
+# ---------------------------------------------------------------------------
+@router.get("/me/{leader_user_id}", response_model=AiMyRobotDetailResponse)
+async def get_my_ai_robot_detail(
+    leader_user_id: int,
+    group_id: Optional[str] = None,
+    store: RedisStore = Depends(get_store),
+    p: Principal = Depends(require_menu(MENU_AI_TRADE)),
+) -> AiMyRobotDetailResponse:
+    mine = await list_my_ai_followings(store=store, p=p)
+    entries = [item for item in mine.following if item.robot.leader_user_id == leader_user_id
+               and (group_id is None or item.robot.group_id == group_id)]
+    if not entries:
+        raise HTTPException(status_code=404, detail="机器人不存在或不属于我的机器人")
+    if len(entries) > 1:
+        raise HTTPException(status_code=400, detail="该主人有多个机器人，请指定 group_id")
+    entry = entries[0]
+    data = await ai_robot_detail.build_detail(store, p, entry)
+    return AiMyRobotDetailResponse(**entry.model_dump(), **data)
 
 
 # ---------------------------------------------------------------------------
@@ -708,13 +768,14 @@ async def set_ai_follow_paused(
     store: RedisStore = Depends(get_store),
     p: Principal = Depends(require_menu(MENU_AI_TRADE)),
 ) -> AiPauseResponse:
-    """暂停 / 恢复【AI 交易】市场的对外接单。
+    """暂停 / 恢复【AI 交易】市场的整组新开仓与对外接单。
 
-    语义（与带单市场一致）：
+    语义：
     ① 新的客户无法再加入该机器人主人名下的 AI 分组（写侧拦截 + 展示侧置灰）；
     ② 已有跟单关系与在跑任务**不动** —— 等跟单员自行移出，本接口不碰
        任何跟单数据、不平任何仓；
-    ③ 之后触发的信号只发主节点，不再下发给跟单节点（服务端在分发侧收窄）。
+    ③ 主人名下 AI 分组的所有节点均不再接收新开仓，包括没有跟单成员的分组。
+       已有任务继续运行，CLOSE / 平仓仍可执行。
 
     只作用于【AI 交易】市场（AI 智能加仓分组）。带单市场（趋势 / 网格分组）
     有独立的开关（/api/follow/pause），两边互不影响 —— 同一个主人可能同时
