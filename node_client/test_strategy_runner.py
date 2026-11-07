@@ -3164,6 +3164,88 @@ async def test_switch_price_level_to_point_level_keeps_one_pending():
     runner.cancel()
 
 
+async def test_switch_first_batch_first_position_leaves_one_pending():
+    """现场复现场景：开完第0仓、首个逆势限价单未成交时，把**首档**改成指定价。
+
+    现场观察到的现象是「出现 2 个挂单：一个点数加仓、一个指定价加仓」，
+    而且**只在首批的第一仓出现**，其它批次不会。原因是两条加仓路径互斥：
+
+    - 点数逆势加仓挂的是 `R1L0D…`（`_align_counter_order` 挂的逆势限价）；
+    - 指定价加仓挂的是 `R1L0X`（`_sync_price_level` 挂的指定价单）。
+
+    改档位后 `_sync_price_level` 只认 `R1L0X`，看不见盘上那张 `R1L0D…`，
+    不主动撤就会两张单同时在场，各自成交一次 → 同一档被加仓两次。
+
+    「只有首批的第一仓」是这个现象的判别特征：只有当改的那一档**正好是
+    下一档要加的档位**（第 0 仓已开、已加 0 笔 → 下一笔就是第 1 档）时，
+    两条路径才会同时对同一档生效；改后面的档位时逆势限价路径照旧，
+    指定价路径根本不会触发，所以看不出问题。
+
+    这里同时覆盖「行情静止、只靠 WAKE 生效」——现场改配置常常是盘口不动的
+    时候，改完等不到下一口价，必须靠 WAKE 立刻对齐。
+    """
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.balance = 10000.0
+    mt5.auto_fill_pending = False
+    mt5.prices_map["XAUUSD"] = 2400.0
+    tiers = {
+        "enabled": True,
+        "tiers": [{"min_lot": 0.1, "pl_amount": 500.0}],
+    }
+    point_rule = counter_rule(
+        batch_enabled=True, batch_count=2, total_lot_limit=3,
+        batch_levels=[
+            {"pos_from": 1, "pos_to": 1, "calc_type": "point", "point": 100.0,
+             "lot_times": 1.0, "extra_lot": 0.0},
+            {"pos_from": 2, "pos_to": 3, "calc_type": "point", "point": 100.0,
+             "lot_times": 1.0, "extra_lot": 0.0},
+        ],
+        lot_pl_tiers=tiers,
+    )
+    runner, hub = _runner(sent, mt5=mt5, strategy={"rules": [point_rule]})
+    runner.start()
+    await _settle()
+
+    # 触发信号：开完第0仓，挂上第一个逆势限价单（未成交）
+    held = mt5.positions_by_magic(MAGIC)
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(held), price=2400.0, point=0.01,
+        bid=2399.5, ask=2400.5,
+    ))
+    await _settle()
+
+    orders = mt5.pending_orders_by_magic(MAGIC)
+    assert len(orders) == 1
+    assert orders[0]["comment"] == "R1L0D100"      # 首档的点数逆势限价
+
+    # 把首档（第一批的第一仓）改成指定价加仓
+    price_rule = counter_rule(
+        batch_enabled=True, batch_count=2, total_lot_limit=3,
+        batch_levels=[
+            {"pos_from": 1, "pos_to": 1, "calc_type": "price",
+             "price": 2399.0, "price_tp": 2410.0, "price_sl": 2390.0,
+             "lot_times": 1.0, "extra_lot": 0.0},
+            {"pos_from": 2, "pos_to": 3, "calc_type": "point", "point": 100.0,
+             "lot_times": 1.0, "extra_lot": 0.0},
+        ],
+        lot_pl_tiers=tiers,
+    )
+    runner.apply_strategy({"rules": [price_rule]})
+    await _settle()
+
+    # 行情静止（不再喂 tick）：只靠 WAKE 也要立刻对齐
+    orders = mt5.pending_orders_by_magic(MAGIC)
+    assert len(orders) == 1, (
+        f"改档后同一档只允许一张在途单，实际 {len(orders)} 张："
+        f"{[o['comment'] for o in orders]}"
+    )
+    assert orders[0]["comment"] == "R1L0X"        # 点数那张已撤，只剩指定价
+    assert _progress(sent, "cnt_limit_off")       # 撤单有事件，前端能看到
+    runner.cancel()
+
+
 async def test_price_level_position_follows_common_take_profit():
     """指定价仓成交后，按「指定价算止盈」的分支出场（TP 写进持仓）。"""
     sent: list = []
