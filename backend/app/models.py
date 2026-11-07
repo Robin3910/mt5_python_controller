@@ -1620,6 +1620,7 @@ class AiFollowNodesRequest(BaseModel):
 
 class AiFollowNodeStateRequest(AiFollowNodesRequest):
     state: Literal["running", "paused", "stopped"]
+    group_id: Optional[str] = Field(default=None, min_length=1, max_length=32)
 
 
 class AiJoinRequest(BaseModel):

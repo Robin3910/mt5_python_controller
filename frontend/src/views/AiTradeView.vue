@@ -108,6 +108,7 @@ interface MyFollowedNode {
   joined_at: number | null
   active_task_count: number
   batch_limit: number
+  follow_state: AiFollowNodeState
   /** 当前机器人分组内的跟单关系 */
   groups: { group_id: string; group_name: string | null }[]
 }
@@ -146,6 +147,7 @@ const myFollowing = computed<MyRobotEntry[]>(() =>
             joined_at: n.joined_at ?? null,
             active_task_count: g.active_task_count,
             batch_limit: batchLimit,
+            follow_state: n.follow_state || 'running',
             groups: [{ group_id: g.group_id, group_name: g.group_name ?? null }],
           })
         }
@@ -357,6 +359,24 @@ function isMyRobot(robot: AiRobotSummary): boolean {
   return myId != null && robot.leader_user_id === myId
 }
 
+function robotControlPaused(entry: MyRobotEntry): boolean {
+  if (isMyRobot(entry.robot)) return !!entry.robot.ai_follow_paused
+  return entry.nodes.length > 0 && entry.nodes.every((node) => node.follow_state === 'paused')
+}
+
+async function toggleRobotPause(entry: MyRobotEntry): Promise<void> {
+  if (pauseBusy.value || nodeStateBusy.value || closeBusy.value) return
+  if (isMyRobot(entry.robot)) {
+    await togglePause(entry.robot)
+    return
+  }
+  if (entry.is_owner || !entry.nodes.length) return
+  await changeNodeFollowState(
+    entry.nodes.map((node) => node.node_id), robotControlPaused(entry) ? 'running' : 'paused',
+    entry.robot.group_id,
+  )
+}
+
 /**
  * 切换暂停状态。
  *
@@ -521,18 +541,18 @@ const nodeIds = (detail.value.my_nodes ?? [])
   }
 }
 
-async function changeNodeFollowState(nodeIds: string[], state: AiFollowNodeState): Promise<void> {
+async function changeNodeFollowState(nodeIds: string[], state: AiFollowNodeState, groupId?: string): Promise<void> {
   if (!nodeIds.length || nodeStateBusy.value || closeBusy.value) return
   const action = { running: '恢复跟单', paused: '暂停跟单', stopped: '停止跟单' }[state]
   try {
     await ElMessageBox.confirm(
-      `确认对 ${nodeIds.length} 个子节点${action}？\n\n仅作用于这些节点的 AI 跟单，不影响主节点、其他节点或普通带单。\n${state === 'running' ? '恢复后接收后续新开仓，停止的关系需重新跟单。' : '停止接收新开仓；已有任务与持仓继续运行，平仓 / CLOSE 仍可执行。'}${state === 'stopped' ? '\n停止记录保留，可重新跟单。' : ''}`,
+      `确认对 ${nodeIds.length} 个子节点${action}？\n\n${groupId ? '仅作用于本人节点在当前策略分组中的跟单，不影响其他策略、主节点或他人节点。' : '仅作用于这些节点的 AI 跟单，不影响主节点、其他节点或普通带单。'}\n${state === 'running' ? '恢复后接收后续新开仓，停止的关系需重新跟单。' : '停止接收新开仓；已有任务与持仓继续运行，平仓 / CLOSE 仍可执行。'}${state === 'stopped' ? '\n停止记录保留，可重新跟单。' : ''}`,
       action, { type: 'warning', confirmButtonText: '确认', cancelButtonText: '取消' },
     )
   } catch { return }
   nodeStateBusy.value = true
   try {
-    await setAiFollowNodeState(nodeIds, state)
+    await setAiFollowNodeState(nodeIds, state, groupId)
     ElMessage.success(`已${action}`)
     await refreshAll()
   } catch (cause) {
@@ -848,7 +868,7 @@ onMounted(() => { void hub.fetchNodes() })
                 <p>{{ entry.groups.map((g) => g.symbol || g.group_name).filter(Boolean).join(' · ') || '—' }}<template v-if="entry.nodes[0]?.joined_at"> · 开始于 {{ fmtJoinedShort(entry.nodes[0].joined_at) }}</template></p>
               </div>
             </div>
-            <em :class="entry.robot.ai_follow_paused ? 'off' : 'on'"><i></i>{{ entry.robot.ai_follow_paused ? '已暂停' : '运行中' }}</em>
+            <em :class="entry.robot.ai_follow_paused || robotControlPaused(entry) ? 'off' : 'on'"><i></i>{{ entry.robot.ai_follow_paused || robotControlPaused(entry) ? '已暂停' : '运行中' }}</em>
           </div>
           <div class="ai-stats">
             <div><span>总浮动盈亏</span><strong :class="bookStats(robotPositions(entry)).profit >= 0 ? 'up' : 'down'">{{ fmtU(bookStats(robotPositions(entry)).profit) }} U</strong></div>
@@ -861,9 +881,9 @@ onMounted(() => { void hub.fetchNodes() })
           <div class="ai-card-actions">
             <button type="button" class="link" @click="router.push({ name: 'ai-robot-detail', params: { leaderUserId: entry.robot.leader_user_id, groupId: entry.robot.group_id } })">查看详情<svg viewBox="0 0 24 24"><path fill="currentColor" d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg></button>
             <div>
-              <button v-if="isMyRobot(entry.robot) && entry.marketable" type="button" class="amber" :disabled="pauseBusy" @click="togglePause(entry.robot)">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" :d="entry.robot.ai_follow_paused ? 'M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm-2 15V7l7 5-7 5z' : 'M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm-1 14H8V8h3v8zm5 0h-3V8h3v8z'"/></svg>
-                {{ entry.robot.ai_follow_paused ? '启动机器人' : '暂停机器人' }}
+              <button v-if="(isMyRobot(entry.robot) && entry.marketable) || (!isMyRobot(entry.robot) && !entry.is_owner && entry.nodes.length)" type="button" class="amber" :disabled="pauseBusy || nodeStateBusy || closeBusy" @click="toggleRobotPause(entry)">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" :d="robotControlPaused(entry) ? 'M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm-2 15V7l7 5-7 5z' : 'M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm-1 14H8V8h3v8zm5 0h-3V8h3v8z'"/></svg>
+                {{ robotControlPaused(entry) ? '启动机器人' : '暂停机器人' }}
               </button>
               <button type="button" class="solid" :disabled="closeBusy" @click="closeRobotAll(entry)"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="m11 21 1-7H7L13 3l-1 7h5l-6 11z"/></svg>一键平仓</button>
             </div>

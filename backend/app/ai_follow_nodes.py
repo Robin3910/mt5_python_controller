@@ -82,7 +82,10 @@ async def node_stats(store, principal) -> dict:
     }
 
 
-async def set_node_state(store, principal, node_ids: list[str], target_state: str, ip: str | None) -> dict:
+async def set_node_state(
+    store, principal, node_ids: list[str], target_state: str, ip: str | None,
+    *, group_id: str | None = None,
+) -> dict:
     selected_ids = set(node_ids)
     owner = permissions.owner_for_new(principal)
     async with SessionLocal() as session:
@@ -100,6 +103,7 @@ async def set_node_state(store, principal, node_ids: list[str], target_state: st
                 GroupFollowerNode.follower_user_id == principal.user_id,
                 GroupFollowerNode.node_id.in_(selected_ids),
                 TradingStrategy.template_id.in_(follow_rules.AI_MARKET_TEMPLATE_IDS),
+                *([GroupFollowerNode.group_id == group_id] if group_id is not None else []),
             ).with_for_update()
         )).all()
         if {relation.node_id for relation in relations} != selected_ids:
@@ -120,7 +124,8 @@ async def set_node_state(store, principal, node_ids: list[str], target_state: st
         session.add(AuditLog(
             operator=principal.username, actor_user_id=principal.user_id,
             action={"running": "resume_ai_follow_nodes", "paused": "pause_ai_follow_nodes", "stopped": "stop_ai_follow_nodes"}[target_state],
-            target=None, params_json={"node_ids": node_ids, "state": target_state},
+            target=group_id,
+            params_json={"node_ids": node_ids, "state": target_state, **({"group_id": group_id} if group_id is not None else {})},
             result="ok", ip=ip, category="ai_follow", before_json=before,
             after_json={str(relation.id): relation.follow_state for relation in relations},
         ))

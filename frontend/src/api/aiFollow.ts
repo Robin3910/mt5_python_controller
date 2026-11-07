@@ -53,8 +53,10 @@ export async function fetchAiFollowNodes(): Promise<AiFollowNodesResponse> {
   return (await api.get<AiFollowNodesResponse>('/api/ai-follow/nodes')).data
 }
 
-export async function setAiFollowNodeState(nodeIds: string[], state: AiFollowNodeState): Promise<void> {
-  await api.post('/api/ai-follow/nodes/state', { node_ids: nodeIds, state })
+export async function setAiFollowNodeState(nodeIds: string[], state: AiFollowNodeState, groupId?: string): Promise<void> {
+  await api.post('/api/ai-follow/nodes/state', {
+    node_ids: nodeIds, state, ...(groupId ? { group_id: groupId } : {}),
+  })
 }
 
 export async function closeAiFollowNodes(nodeIds: string[]): Promise<{

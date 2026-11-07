@@ -4,6 +4,7 @@ import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
 import FormLabel from '@/components/FormLabel.vue'
+import RobotIcon from '@/components/RobotIcon.vue'
 import TagSelect from '@/components/TagSelect.vue'
 import type { TagOption } from '@/components/tagOption'
 import StrategySignalFields from '@/components/StrategySignalFields.vue'
@@ -142,6 +143,7 @@ function resetSignalDraft(symbol: string): void {
 }
 
 const isEditMode = computed(() => props.mode === 'edit')
+const isAiEditor = computed(() => props.presetTemplateId === TEMPLATE_1_ID)
 /** 锁定模版标识（模板里用于禁用模版选择器） */
 const presetTemplateId = computed(() => props.presetTemplateId)
 
@@ -2174,10 +2176,30 @@ function resetRuleToTemplate(idx: number): void {
 </script>
 
 <template>
-  <div v-if="modelValue" class="modal-mask">
-    <div class="card modal modal-lg strategy-form-modal">
-      <div class="modal-header card-pad" style="padding-bottom: 0">
-        <div class="h1">{{ isEditMode ? '编辑策略' : '新增策略' }}</div>
+  <div v-if="modelValue" class="modal-mask" :class="{ 'strategy-form-mask-ai': isAiEditor }">
+    <div
+      class="card modal modal-lg strategy-form-modal"
+      :class="{ 'strategy-form-ai': isAiEditor }"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="strategy-form-title"
+    >
+      <div v-if="isAiEditor" class="strategy-design-header">
+        <div>
+          <h2 id="strategy-form-title" class="strategy-design-title">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5L12 3Zm8-3 1 3 3 1-3 1-1 3-1-3-3-1 3-1 1-3Z" /></svg>
+            <span>{{ isEditMode ? '编辑' : '创建' }}AI智能交易机器人</span>
+            <span class="strategy-design-dot">·</span>
+            <span class="strategy-design-context">{{ form.name || 'AI智能交易' }}</span>
+            <span class="strategy-design-dot">·</span>
+            <span class="strategy-design-context">{{ form.symbol || presetSymbol }}</span>
+          </h2>
+          <p>设置机器人名称并独立配置 AI 策略参数 · 含调整参数模块</p>
+        </div>
+        <button type="button" class="strategy-design-close" aria-label="关闭" :disabled="saving" @click="close">×</button>
+      </div>
+      <div v-else class="modal-header card-pad" style="padding-bottom: 0">
+        <div id="strategy-form-title" class="h1">{{ isEditMode ? '编辑策略' : '新增策略' }}</div>
         <!-- <p class="muted" style="font-size: 12px; margin: 4px 0 0">
           {{
             isEditMode
@@ -2187,7 +2209,7 @@ function resetRuleToTemplate(idx: number): void {
         </p> -->
       </div>
 
-      <div class="modal-body card-pad" style="padding-top: 16px">
+      <div class="modal-body card-pad" :style="isAiEditor ? undefined : { paddingTop: '16px' }">
         <div v-if="triggerGroup" class="strategy-signal-block">
           <div class="strategy-signal-head">
             <strong>触发信号</strong>
@@ -2196,7 +2218,7 @@ function resetRuleToTemplate(idx: number): void {
           <StrategySignalFields v-model="signalDraft" id-prefix="bound-signal" />
         </div>
         <div class="form-grid">
-          <div class="field">
+          <div v-if="!isAiEditor" class="field">
             <FormLabel field-id="strategy-template" text="策略模版" :help="FIELD_HELP.template" />
             <TagSelect
               id="strategy-template"
@@ -2213,12 +2235,18 @@ function resetRuleToTemplate(idx: number): void {
             </p>
           </div>
 
-          <div class="field">
-            <FormLabel field-id="strategy-name" text="策略名称" :help="FIELD_HELP.name" />
-            <input id="strategy-name" v-model="form.name" type="text" maxlength="64" placeholder="例如：黄金逆势策略" />
+          <div class="field" :class="{ 'strategy-design-name': isAiEditor }">
+            <div class="strategy-name-label">
+              <RobotIcon v-if="isAiEditor" :size="12" variant="dome" />
+              <FormLabel field-id="strategy-name" :text="isAiEditor ? '机器人名称' : '策略名称'" :help="FIELD_HELP.name" />
+            </div>
+            <div class="strategy-name-input">
+              <svg v-if="isAiEditor" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="m16.8 3.2 4 4-12.6 12.6-5 1 1-5L16.8 3.2Zm1.4-1.4a2 2 0 0 1 2.8 0l1.2 1.2a2 2 0 0 1 0 2.8l-1 1-4-4 1-1Z" /></svg>
+              <input id="strategy-name" v-model="form.name" type="text" maxlength="64" :placeholder="isAiEditor ? '请输入机器人名称' : '例如：黄金逆势策略'" />
+            </div>
           </div>
 
-          <div class="field">
+          <div v-if="!isAiEditor || !presetSymbolLocked" class="field">
             <FormLabel field-id="strategy-symbol" text="绑定品种" :help="FIELD_HELP.symbol" />
             <input
               id="strategy-symbol"
@@ -2234,40 +2262,51 @@ function resetRuleToTemplate(idx: number): void {
 
         <div v-if="isTpl1" class="signal-pl-editor">
           <div class="rules-editor-head">
-            <FormLabel text="信号盈亏控制" :help="FIELD_HELP.signal_pl" />
+            <div v-if="isAiEditor" class="strategy-design-section-title">
+              <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="m12 2 10 7-10 7L2 9l10-7Zm-8.6 11L12 19l8.6-6 1.4 2-10 7L2 15l1.4-2Z" /></svg>
+              <span>分批止盈</span>
+            </div>
+            <FormLabel v-else text="信号盈亏控制" :help="FIELD_HELP.signal_pl" />
             <!-- <span class="muted" style="font-size: 12px">每个信号独立监控，触发只平该信号仓</span> -->
-            <span class="muted" style="font-size: 12px">止盈按分档金额，止损按盈亏比</span>
+            <input v-if="isAiEditor" v-model="signalPl.lot_pl_tiers.enabled" type="checkbox" role="switch" class="strategy-design-toggle" aria-label="分档手数盈亏" />
+            <span v-else class="muted" style="font-size: 12px">止盈按分档金额，止损按盈亏比</span>
           </div>
           <div class="signal-pl-rules">
             <div class="signal-pl-card">
               <div class="signal-pl-head">
                 <label class="signal-pl-switch">
-                  <input v-model="signalPl.float_pl_ratio.enabled" type="checkbox" />
+                  <input v-model="signalPl.float_pl_ratio.enabled" type="checkbox" :role="isAiEditor ? 'switch' : undefined" :class="{ 'strategy-design-toggle': isAiEditor }" aria-label="信号盈亏比" />
                   <span>信号盈亏比</span>
                 </label>
-                <span v-if="signalPl.float_pl_ratio.enabled" class="muted signal-pl-count">
+                <span v-if="signalPl.float_pl_ratio.enabled && !isAiEditor" class="muted signal-pl-count">
                   {{ signalPl.float_pl_ratio.monitor_mode === 'times'
                     ? `触发 ${signalPl.float_pl_ratio.max_times} 次后停止`
                     : '循环监控' }}
                 </span>
               </div>
-              <div v-if="signalPl.float_pl_ratio.enabled" class="signal-pl-fields">
-                <div class="field">
+              <p v-if="isAiEditor" class="strategy-design-loss-hint">{{ signalPl.float_pl_ratio.ratio < 0 ? '浮亏' : '浮盈' }}达该比例时全部平仓</p>
+              <div v-if="signalPl.float_pl_ratio.enabled || isAiEditor" class="signal-pl-fields" :class="{ 'is-off': !signalPl.float_pl_ratio.enabled }">
+                <div class="field signal-pl-ratio-field">
                   <FormLabel text="盈亏比例 %" :help="FIELD_HELP.signal_float_pl" />
-                  <input
-                    v-model.number="signalPl.float_pl_ratio.ratio"
-                    type="number"
-                    step="0.1"
-                    class="signal-pl-num"
-                    aria-label="信号盈亏比例"
-                  />
+                  <div class="strategy-design-unit">
+                    <input
+                      v-model.number="signalPl.float_pl_ratio.ratio"
+                      type="number"
+                      step="0.1"
+                      class="signal-pl-num"
+                      aria-label="信号盈亏比例"
+                      :disabled="!signalPl.float_pl_ratio.enabled"
+                    />
+                    <span v-if="isAiEditor">%</span>
+                  </div>
                 </div>
-                <div class="field">
-                  <FormLabel text="监控方式" :help="FIELD_HELP.signal_float_pl" />
+                <div class="field signal-pl-mode-field">
+                  <FormLabel :text="isAiEditor ? '清仓方式' : '监控方式'" :help="FIELD_HELP.signal_float_pl" />
                   <TagSelect
                     v-model="signalPl.float_pl_ratio.monitor_mode"
                     :options="MONITOR_MODE_TAGS"
                     aria-label="监控方式"
+                    :disabled="!signalPl.float_pl_ratio.enabled"
                   />
                 </div>
                 <div v-if="signalPl.float_pl_ratio.monitor_mode === 'times'" class="field">
@@ -2278,6 +2317,7 @@ function resetRuleToTemplate(idx: number): void {
                     min="1"
                     class="signal-pl-times"
                     aria-label="指定次数"
+                    :disabled="!signalPl.float_pl_ratio.enabled"
                   />
                 </div>
               </div>
@@ -2289,41 +2329,51 @@ function resetRuleToTemplate(idx: number): void {
             <div class="signal-pl-card">
               <div class="signal-pl-head">
                 <label class="signal-pl-switch">
-                  <input v-model="signalPl.lot_pl_tiers.enabled" type="checkbox" />
+                  <input v-if="!isAiEditor" v-model="signalPl.lot_pl_tiers.enabled" type="checkbox" />
                   <span>分档手数盈亏</span>
                 </label>
-                <span v-if="signalPl.lot_pl_tiers.enabled" class="muted signal-pl-count">
+                <span v-if="signalPl.lot_pl_tiers.enabled && !isAiEditor" class="muted signal-pl-count">
                   {{ signalPl.lot_pl_tiers.batch_count }} 档 · {{ signalPl.lot_pl_tiers.tiers.length }} 条
                 </span>
               </div>
-              <template v-if="signalPl.lot_pl_tiers.enabled">
-                <div class="signal-pl-fields">
-                  <div class="field">
+              <p v-if="isAiEditor" class="strategy-design-profit-hint">达对应总手数与盈亏条件时平该批</p>
+              <template v-if="signalPl.lot_pl_tiers.enabled || isAiEditor">
+                <div class="signal-pl-fields" :class="{ 'is-off': !signalPl.lot_pl_tiers.enabled }">
+                  <div class="field signal-pl-count-field">
                     <FormLabel text="批次数" :help="FIELD_HELP.signal_lot_pl" />
-                    <input
-                      v-model.number="signalPl.lot_pl_tiers.batch_count"
-                      type="number"
-                      min="1"
-                      max="10"
-                      class="signal-pl-times"
-                      aria-label="批次数"
-                    />
+                    <div class="strategy-design-unit">
+                      <input
+                        v-model.number="signalPl.lot_pl_tiers.batch_count"
+                        type="number"
+                        min="1"
+                        max="10"
+                        class="signal-pl-times"
+                        aria-label="批次数"
+                        :disabled="!signalPl.lot_pl_tiers.enabled"
+                      />
+                      <span v-if="isAiEditor">批</span>
+                    </div>
                   </div>
-                  <div class="field">
-                    <FormLabel text="平仓方向" :help="FIELD_HELP.signal_lot_pl" />
+                  <div class="field signal-pl-side-field">
+                    <FormLabel :text="isAiEditor ? '适用持仓' : '平仓方向'" :help="FIELD_HELP.signal_lot_pl" />
                     <TagSelect
                       v-model="signalPl.lot_pl_tiers.close_action"
                       :options="SIDE_ACTION_TAGS"
                       aria-label="平仓方向"
+                      :disabled="!signalPl.lot_pl_tiers.enabled"
                     />
                   </div>
                 </div>
 
                 <div class="signal-pl-tiers">
+                  <div v-if="isAiEditor" class="strategy-design-tiers-head">
+                    <strong>止盈批次</strong>
+                    <span>共 {{ signalPl.lot_pl_tiers.tiers.length }} 批 · 可增删</span>
+                  </div>
                   <div v-for="(tier, idx) in signalPl.lot_pl_tiers.tiers" :key="idx" class="signal-pl-tier">
                     <span class="signal-pl-tier-no">批次 {{ idx + 1 }}</span>
                     <div class="field">
-                      <FormLabel text="总 lot >=" :help="FIELD_HELP.signal_lot_pl" />
+                      <FormLabel :text="isAiEditor ? '总lot ≥' : '总 lot >='" :help="FIELD_HELP.signal_lot_pl" />
                       <input
                         v-model.number="tier.min_lot"
                         type="number"
@@ -2331,20 +2381,27 @@ function resetRuleToTemplate(idx: number): void {
                         step="0.01"
                         class="signal-pl-num"
                         :aria-label="`批次${idx + 1} 总手数阈值`"
+                        :disabled="!signalPl.lot_pl_tiers.enabled"
                       />
                     </div>
                     <div class="field">
-                      <FormLabel text="盈亏金额 >=" :help="FIELD_HELP.signal_lot_pl" />
-                      <input
-                        v-model.number="tier.pl_amount"
-                        type="number"
-                        step="1"
-                        class="signal-pl-num"
-                        :aria-label="`批次${idx + 1} 盈亏金额阈值`"
-                      />
+                      <FormLabel :text="isAiEditor ? '盈亏 ≥' : '盈亏金额 >='" :help="FIELD_HELP.signal_lot_pl" />
+                      <div class="strategy-design-unit">
+                        <input
+                          v-model.number="tier.pl_amount"
+                          type="number"
+                          step="1"
+                          class="signal-pl-num"
+                          :aria-label="`批次${idx + 1} 盈亏金额阈值`"
+                          :disabled="!signalPl.lot_pl_tiers.enabled"
+                        />
+                        <span v-if="isAiEditor">USDT</span>
+                      </div>
                     </div>
+                    <button v-if="isAiEditor" type="button" class="strategy-design-remove" :aria-label="`删除止盈批次${idx + 1}`" :disabled="!signalPl.lot_pl_tiers.enabled || signalPl.lot_pl_tiers.tiers.length <= 1" @click="signalPl.lot_pl_tiers.tiers.splice(idx, 1); signalPl.lot_pl_tiers.batch_count--">×</button>
                   </div>
-                  <p class="signal-pl-note">
+                  <button v-if="isAiEditor" type="button" class="strategy-design-add" :disabled="!signalPl.lot_pl_tiers.enabled || signalPl.lot_pl_tiers.tiers.length >= 10" @click="signalPl.lot_pl_tiers.batch_count++">＋ 添加批次</button>
+                  <p v-else class="signal-pl-note">
                     按所选方向统计该信号总手数与浮盈亏；负的盈亏金额表示亏损侧达阈值。优先匹配更高批次。
                   </p>
                 </div>
@@ -2357,7 +2414,7 @@ function resetRuleToTemplate(idx: number): void {
         </div>
 
         <div v-if="form.rules.length" class="rules-editor">
-          <div class="rules-editor-head">
+          <div v-if="!isAiEditor" class="rules-editor-head">
             <FormLabel text="规则参数" :help="FIELD_HELP.rules" />
             <span class="muted" style="font-size: 12px">
               {{ isEditMode ? '可按需调整规则；「恢复默认」将回退到模版默认值' : '切换模版会重新载入默认值' }}
@@ -2376,6 +2433,7 @@ function resetRuleToTemplate(idx: number): void {
               @click="toggleRuleCollapsed(r.type)"
             >
               <div class="rule-title-wrap">
+                <svg v-if="isAiEditor" class="strategy-design-rule-icon" :class="{ 'is-counter': r.type === RULE_TYPE_COUNTER }" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path :d="r.type === RULE_TYPE_COUNTER ? 'M2 6l7 7 4-4 8 8M15 17h6v-6' : 'M2 18l7-7 4 4 8-8M15 7h6v6'" /></svg>
                 <span v-if="isRuleFoldable(r.type)" class="rule-fold-caret" aria-hidden="true">
                   {{ isRuleCollapsed(r.type) ? '▸' : '▾' }}
                 </span>
@@ -2390,12 +2448,14 @@ function resetRuleToTemplate(idx: number): void {
                   <FormLabel text="启用" :help="FIELD_HELP.status" />
                   <input
                     type="checkbox"
+                    :role="isAiEditor ? 'switch' : undefined"
+                    :class="{ 'strategy-design-toggle': isAiEditor }"
                     :checked="r.status === 1"
                     aria-label="启用本条规则"
                     @change="r.status = ($event.target as HTMLInputElement).checked ? 1 : 0"
                   />
                 </div>
-                <button type="button" class="btn-sm btn-ghost" @click="resetRuleToTemplate(idx)">恢复默认</button>
+                <button type="button" class="btn-sm btn-ghost strategy-rule-reset" @click="resetRuleToTemplate(idx)"><span v-if="isAiEditor" aria-hidden="true">↻</span>恢复默认</button>
               </div>
             </div>
 
@@ -2881,16 +2941,19 @@ function resetRuleToTemplate(idx: number): void {
               <div class="batch-block">
                 <div class="batch-head">
                   <div class="rule-enable-wrap">
-                    <FormLabel text="分批加仓" :help="FIELD_HELP.batch_enabled" />
+                    <FormLabel :text="isAiEditor ? '分批设置' : '分批加仓'" :help="FIELD_HELP.batch_enabled" />
                     <input
                       type="checkbox"
+                      :class="{ 'strategy-design-toggle': isAiEditor }"
+                      :role="isAiEditor ? 'switch' : undefined"
                       :checked="r.batch_enabled"
                       :aria-label="`启用${RULE_TYPE_LABEL[r.type] || '本条规则'}分批加仓`"
                       @change="setBatchEnabled(r, ($event.target as HTMLInputElement).checked)"
                     />
                   </div>
                   <div class="batch-head-actions">
-                    <span v-if="r.batch_enabled" class="muted batch-count-hint">
+                    <TagSelect v-if="isAiEditor && r.batch_enabled" :id="`rule-${idx}-batch-action`" v-model="r.batch_action" :options="SIDE_TAGS" aria-label="分批方向" />
+                    <span v-if="r.batch_enabled && !isAiEditor" class="muted batch-count-hint">
                       共 {{ displayedBatchCount(r) }} 批
                       <template v-if="r.manual_scatter.enabled">
                         （分散仓 {{ r.batch_count }} · 手动分散仓 1）
@@ -2911,7 +2974,7 @@ function resetRuleToTemplate(idx: number): void {
 
                 <template v-if="r.batch_enabled">
                   <div class="batch-top-grid">
-                    <div class="field">
+                    <div v-if="!isAiEditor" class="field">
                       <FormLabel
                         :field-id="`rule-${idx}-batch-action`"
                         text="分批方向"
@@ -2924,38 +2987,44 @@ function resetRuleToTemplate(idx: number): void {
                         aria-label="分批方向"
                       />
                     </div>
-                    <div class="field">
+                    <div class="field strategy-batch-count">
                       <FormLabel
                         :field-id="`rule-${idx}-batch-count`"
                         :text="r.manual_scatter.enabled ? '总批数' : '批数'"
                         :help="FIELD_HELP.batch_count"
                       />
-                      <input
-                        :id="`rule-${idx}-batch-count`"
-                        :value="displayedBatchCount(r)"
-                        type="number"
-                        :min="r.manual_scatter.enabled ? 2 : 1"
-                        step="1"
-                        @change="onDisplayedBatchCountChange(r, $event)"
-                      />
+                      <div class="strategy-design-unit">
+                        <input
+                          :id="`rule-${idx}-batch-count`"
+                          :value="displayedBatchCount(r)"
+                          type="number"
+                          :min="r.manual_scatter.enabled ? 2 : 1"
+                          step="1"
+                          @change="onDisplayedBatchCountChange(r, $event)"
+                        />
+                        <span v-if="isAiEditor">批</span>
+                      </div>
                       <p v-if="r.manual_scatter.enabled" class="muted batch-split-hint">
                         分散仓 {{ r.batch_count }} · 手动分散仓 1
                       </p>
                     </div>
-                    <div class="field">
+                    <div class="field strategy-batch-total">
                       <FormLabel
                         :field-id="`rule-${idx}-total-lot`"
                         text="加仓笔数"
                         :help="FIELD_HELP.total_lot_limit"
                       />
-                      <input
-                        :id="`rule-${idx}-total-lot`"
-                        :value="displayedTotalLot(r)"
-                        type="number"
-                        :min="r.manual_scatter.enabled ? BATCH_POS_START + 1 : BATCH_POS_START"
-                        step="1"
-                        @change="onDisplayedTotalLotChange(r, $event)"
-                      />
+                      <div class="strategy-design-unit">
+                        <input
+                          :id="`rule-${idx}-total-lot`"
+                          :value="displayedTotalLot(r)"
+                          type="number"
+                          :min="r.manual_scatter.enabled ? BATCH_POS_START + 1 : BATCH_POS_START"
+                          step="1"
+                          @change="onDisplayedTotalLotChange(r, $event)"
+                        />
+                        <span v-if="isAiEditor">笔</span>
+                      </div>
                       <p v-if="r.manual_scatter.enabled" class="muted batch-split-hint">
                         分散仓加仓笔数 {{ Math.floor(r.total_lot_limit) }} · 手动分散仓 1
                       </p>
@@ -2971,10 +3040,14 @@ function resetRuleToTemplate(idx: number): void {
                     </div>
                   </div>
 
+                  <div v-if="isAiEditor" class="strategy-design-tiers-head">
+                    <strong>加仓次数档位</strong>
+                    <span>共 {{ r.batch_levels.length }} 档 · 首尾自动衔接</span>
+                  </div>
                   <div class="batch-levels">
                     <div v-for="(lv, li) in r.batch_levels" :key="li" class="batch-level">
                       <span class="batch-level-no">
-                        <span class="lv-mark">└{{ li + 1 }}</span>
+                        <span class="lv-mark">{{ isAiEditor ? 'L' : '└' }}{{ li + 1 }}</span>
                         <span class="lv-name">第 {{ li + 1 }} 档</span>
                         <span class="lv-sub">{{ lv.pos_from }}~{{ lv.pos_to }} 次</span>
                       </span>
@@ -3012,7 +3085,11 @@ function resetRuleToTemplate(idx: number): void {
                           text="计算方式"
                           :help="FIELD_HELP.calc_type"
                         />
+                        <select v-if="isAiEditor" :id="`rule-${idx}-lv-${li}-calc`" v-model="lv.calc_type" aria-label="计算方式" @change="onCalcTypeChange(r, lv)">
+                          <option v-for="option in calcTypeOptions(r.type)" :key="option.value" :value="option.value">{{ option.label }}</option>
+                        </select>
                         <TagSelect
+                          v-else
                           :id="`rule-${idx}-lv-${li}-calc`"
                           v-model="lv.calc_type"
                           :options="calcTypeOptions(r.type)"
@@ -3068,7 +3145,11 @@ function resetRuleToTemplate(idx: number): void {
                           text="K 线周期"
                           :help="isSmcCalc(lv.calc_type) ? FIELD_HELP.batch_smc_timeframe : FIELD_HELP.batch_timeframe"
                         />
+                        <select v-if="isAiEditor" :id="`rule-${idx}-lv-${li}-tf`" v-model="lv.timeframe" aria-label="K 线周期" @change="onTimeframeChange(r, lv)">
+                          <option v-for="timeframe in TIMEFRAME_OPTIONS" :key="timeframe" :value="timeframe">{{ timeframe }}</option>
+                        </select>
                         <TagSelect
+                          v-else
                           :id="`rule-${idx}-lv-${li}-tf`"
                           v-model="lv.timeframe"
                           :options="TIMEFRAME_TAGS"
@@ -3132,10 +3213,12 @@ function resetRuleToTemplate(idx: number): void {
                         <button
                           type="button"
                           class="btn-sm btn-ghost"
+                          :class="{ 'strategy-design-remove': isAiEditor }"
+                          :aria-label="`删除${RULE_TYPE_LABEL[r.type]}第${li + 1}档`"
                           :disabled="r.batch_levels.length <= 1"
                           @click="removeBatchLevel(r, li)"
                         >
-                          删除
+                          {{ isAiEditor ? '×' : '删除' }}
                         </button>
                       </div>
                       <!-- 指定价档位不显示「倍数 / 手数」：手数是按阶梯止盈 1 的
@@ -3475,7 +3558,7 @@ function resetRuleToTemplate(idx: number): void {
         </div>
       </div>
 
-      <div class="modal-footer card-pad" style="padding-top: 0">
+      <div class="modal-footer card-pad" :style="isAiEditor ? undefined : { paddingTop: '0' }">
         <span></span>
         <div class="row" style="gap: 8px">
           <button class="btn-ghost" :disabled="saving" @click="close">取消</button>
@@ -4380,3 +4463,5 @@ function resetRuleToTemplate(idx: number): void {
   }
 }
 </style>
+
+<style scoped src="./strategy-form-design.css"></style>

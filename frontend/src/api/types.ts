@@ -2571,7 +2571,7 @@ export interface AiMyGroup {
   /** 批次已用 / 批次上限 —— AI 跟单员最需要盯的指标 */
   batch_used: number
   batch_limit: number
-  my_nodes: (FollowNodeBrief & { joined_at: number | null })[]
+  my_nodes: (FollowNodeBrief & { joined_at: number | null; follow_state: AiFollowNodeState })[]
 }
 
 export interface AiMyRobot {

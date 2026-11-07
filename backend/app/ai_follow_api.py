@@ -555,6 +555,7 @@ async def list_my_ai_followings(
                             (n for n in all_nodes if n.get("node_id") == f["node_id"]), None
                         )),
                         "joined_at": f.get("joined_at"),
+                        "follow_state": f.get("follow_state") or "running",
                     }
                     for f in sorted(fs, key=lambda x: x.get("joined_at") or 0)
                 ],
@@ -599,7 +600,9 @@ async def set_ai_follow_node_state(
     store: RedisStore = Depends(get_store),
     p: Principal = Depends(require_menu(MENU_AI_TRADE)),
 ):
-    return await ai_follow_nodes.set_node_state(store, p, body.node_ids, body.state, client_ip(request))
+    return await ai_follow_nodes.set_node_state(
+        store, p, body.node_ids, body.state, client_ip(request), group_id=body.group_id,
+    )
 
 
 @router.post("/nodes/close")
