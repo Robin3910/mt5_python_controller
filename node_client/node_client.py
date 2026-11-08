@@ -873,12 +873,19 @@ class NodeClient:
             logger.warning("strategy_stop with invalid task_id: %s", msg)
             return
         runner = self.runners.get(task_id)
-        if runner:
+        if runner and not runner.done:
             runner.request_stop(msg.get("reason") or "stop_command")
             logger.info("strategy task %s stop requested", task_id)
             return
-        # 本地没有监控：节点重启过，或服务端补发了离线期间的终止指令。
+        # 本地已无监控：节点重启过、服务端补发了离线期间的终止指令，
+        # 或者任务已经结束（runner 还在字典里但 done=True）却留下了持仓。
+        # 最后这一种最危险 —— 任务收口时仓位其实还在，之后就没人管它了。
         # 此时按魔术号直接平掉残留持仓，否则这批仓位再也没人负责收口。
+        if runner is not None:
+            logger.warning(
+                "strategy task %s already finished but stop requested — "
+                "closing residual positions by magic", task_id,
+            )
         await self._close_orphan_strategy(ws, task_id, msg)
 
     async def _do_strategy_update(self, msg: dict) -> None:

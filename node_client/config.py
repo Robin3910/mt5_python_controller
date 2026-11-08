@@ -44,6 +44,17 @@ class NodeSettings(BaseSettings):
     strategy_idle_interval: float = 5.0     # 无变化时的保活事件间隔
     strategy_empty_confirm: int = 2         # 判定持仓已全平所需的连续确认轮数
 
+    # 首单失败后的「核实窗口」：下单失败不等于没成交。
+    #
+    # 券商回执只是**回执**：超时（10012）、order_send 返回 None 这类失败里，
+    # 订单其实可能已经成交。节点若据此立刻收口，任务就停了而仓位还在，
+    # 变成没人监控的孤儿单。所以失败后要留一段窗口反复读该魔术号的
+    # 持仓 / 挂单，确认真的没成交再收口。
+    #
+    # 窗口内**不重试下单**（重试只会放大重复成交），只观察。
+    strategy_open_verify_sec: float = 15.0      # 核实窗口总时长（秒）
+    strategy_open_verify_interval: float = 1.0  # 窗口内的轮询间隔（秒）
+
     log_level: str = "INFO"
 
     # 历史成交采集（订单历史 / 带单绩效 / 概览盈亏统计的数据源）
@@ -65,6 +76,12 @@ class NodeSettings(BaseSettings):
 ACCOUNT_REPORT_INTERVAL_MIN = 0.05
 ACCOUNT_REPORT_INTERVAL_DEFAULT = 5.0
 
+# 首单核实窗口的参数边界（秒）
+OPEN_VERIFY_SEC_MIN = 0.0
+OPEN_VERIFY_SEC_MAX = 120.0
+OPEN_VERIFY_INTERVAL_MIN = 0.1
+OPEN_VERIFY_INTERVAL_MAX = 10.0
+
 
 def clamp_account_report_interval(value) -> float:
     """账户上报间隔（秒）：支持小数；空/非正回退默认 5，下限 0.05。"""
@@ -75,6 +92,26 @@ def clamp_account_report_interval(value) -> float:
     if n <= 0:
         n = ACCOUNT_REPORT_INTERVAL_DEFAULT
     return max(ACCOUNT_REPORT_INTERVAL_MIN, n)
+
+
+def clamp_open_verify_sec(value) -> float:
+    """首单核实窗口时长（秒）：负数视为「不启用核实」，上限 120 秒。"""
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if n < 0:
+        return 0.0
+    return min(n, OPEN_VERIFY_SEC_MAX)
+
+
+def clamp_open_verify_interval(value) -> float:
+    """核实窗口的轮询间隔（秒）：下限 0.1 秒，上限 10 秒。"""
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    return max(OPEN_VERIFY_INTERVAL_MIN, min(n, OPEN_VERIFY_INTERVAL_MAX))
 
 
 @lru_cache

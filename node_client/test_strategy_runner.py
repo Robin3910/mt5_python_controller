@@ -62,7 +62,10 @@ def counter_rule(**over) -> dict:
     return rule
 
 
-def _runner(sent: list, *, mt5=None, strategy=None, runtime=None) -> tuple[StrategyRunner, FakeHub]:
+def _runner(
+    sent: list, *, mt5=None, strategy=None, runtime=None,
+    open_verify_sec: float = 0.05,
+) -> tuple[StrategyRunner, FakeHub]:
     hub = FakeHub()
 
     async def send(payload: dict) -> None:
@@ -78,6 +81,8 @@ def _runner(sent: list, *, mt5=None, strategy=None, runtime=None) -> tuple[Strat
         mt5=mt5 or MockMT5Client(),
         hub=hub, exec_fn=_exec, send_fn=send, report_interval=1.0,
         runtime=runtime,
+        open_verify_sec=open_verify_sec,
+        open_verify_interval=0.01,
     )
     return runner, hub
 
@@ -86,6 +91,11 @@ async def _settle(times: int = 5) -> None:
     """把控制权让给 runner 协程，直到它重新等在事件上。"""
     for _ in range(times):
         await asyncio.sleep(0)
+
+
+async def _wait(sec: float = 0.2) -> None:
+    """等真实时间过去（核实窗口走的是真实时钟，_settle 不管用）。"""
+    await asyncio.sleep(sec)
 
 
 def _of_type(sent: list, mtype: str) -> list[dict]:
@@ -129,6 +139,152 @@ async def test_first_order_failure_ends_without_finished():
     assert not _of_type(sent, "strategy_finished")  # 首单失败靠 trade_result 收口
     assert runner.done
     assert hub.unsubscribed is True
+
+
+# ---------------------------------------------------------------------------
+# 首单失败的核实窗口：失败回报不等于没成交
+# ---------------------------------------------------------------------------
+
+
+class _TimeoutMT5(MockMT5Client):
+    """下单回报超时，但单其实已经成交（券商回执丢了）。
+
+    模拟最典型的孤儿单成因：order_send 超时，订单其实成交了，
+    节点若据此收口，仓位就没人管了。
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.order_calls = 0
+
+    def place_market_order(self, symbol, action, volume, sl=None, tp=None,
+                           comment="", magic=None, max_retry=3):
+        self.order_calls += 1
+        # 单其实成交了（写进账本），但回报是超时
+        super().place_market_order(
+            symbol, action, volume, sl, tp, comment, magic, max_retry,
+        )
+        return {
+            "success": False, "symbol": symbol, "retcode": 10012,
+            "error": "Timeout", "uncertain": True,
+        }
+
+
+class _RejectedMT5(MockMT5Client):
+    """券商明确拒单：一定没成交。"""
+
+    def place_market_order(self, *a, **kw):
+        return {
+            "success": False, "symbol": "XAUUSD", "retcode": 10016,
+            "error": "Invalid stops", "uncertain": False,
+        }
+
+
+async def test_open_failure_with_timeout_recovers_when_position_exists():
+    """下单回报失败但账本里有仓位 → 按成功继续，绝不能收口成孤儿单。"""
+    sent: list = []
+    runner, hub = _runner(sent, mt5=_TimeoutMT5())
+    runner.start()
+    await _wait(0.2)
+
+    trade = _of_type(sent, "trade_result")
+    assert trade, "核实通过后必须补发成交回报"
+    assert trade[0]["success"] is True
+    assert trade[0]["recovered"] is True
+    assert trade[0]["original_error"] == "Timeout"
+    # 服务端要拿到真实票号，否则子任务记的是空订单
+    assert trade[0]["order"]
+
+    # 核实中要能看到一条事件，后台不会以为任务死了
+    assert _progress(sent, "open_verify")
+    # 任务继续跑：没收口
+    assert not _of_type(sent, "strategy_finished")
+    assert not runner.done
+
+
+async def test_open_failure_without_position_finishes_as_failed():
+    """核实窗口到期确实没有仓位 → 才按失败收口。"""
+
+    class EmptyTimeoutMT5(MockMT5Client):
+        def place_market_order(self, *a, **kw):
+            return {
+                "success": False, "symbol": "XAUUSD", "retcode": 10012,
+                "error": "Timeout", "uncertain": True,
+            }
+
+    sent: list = []
+    runner, hub = _runner(sent, mt5=EmptyTimeoutMT5())
+    runner.start()
+    await _wait(0.3)
+
+    # 失败回报照发，服务端据此收口
+    trade = _of_type(sent, "trade_result")
+    assert trade and trade[0]["success"] is False
+    assert trade[0]["uncertain"] is True
+    assert not _of_type(sent, "strategy_finished")
+    assert runner.done
+    assert hub.unsubscribed is True
+
+
+async def test_deterministic_open_failure_skips_verify_window():
+    """券商明确拒单（invalid stops）→ 不用浪费核实窗口，直接失败。"""
+
+    class CountingMT5(_RejectedMT5):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reads = 0
+
+        def positions_by_magic(self, magic):
+            self.reads += 1
+            return super().positions_by_magic(magic)
+
+    mt5 = CountingMT5()
+    sent: list = []
+    runner, hub = _runner(sent, mt5=mt5)
+    runner.start()
+    await _wait(0.2)
+
+    trade = _of_type(sent, "trade_result")
+    assert trade and trade[0]["success"] is False
+    # 确定性失败不读账本
+    assert mt5.reads == 0
+    assert not _progress(sent, "open_verify")
+    assert runner.done
+
+
+async def test_open_verify_disabled_keeps_old_behaviour():
+    """核实窗口时长传 0 → 保持旧行为：失败即收口。"""
+
+    class FailingMT5(MockMT5Client):
+        def place_market_order(self, *a, **kw):
+            return {
+                "success": False, "symbol": "XAUUSD", "retcode": 10012,
+                "error": "Timeout", "uncertain": True,
+            }
+
+    sent: list = []
+    hub = FakeHub()
+
+    async def send(payload: dict) -> None:
+        sent.append(payload)
+
+    async def _exec(fn, *args):
+        return fn(*args)
+
+    runner = StrategyRunner(
+        task_id=1, magic=MAGIC, group_id="g1", signal_id="s1",
+        entry={"action": "BUY", "symbol": "XAUUSD", "volume": 0.1},
+        strategy={"rules": [counter_rule()]},
+        mt5=FailingMT5(), hub=hub, exec_fn=_exec, send_fn=send,
+        report_interval=1.0, open_verify_sec=0.0,
+    )
+    runner.start()
+    await _settle(5)
+
+    trade = _of_type(sent, "trade_result")
+    assert trade and trade[0]["success"] is False
+    assert not _progress(sent, "open_verify")
+    assert runner.done
 
 
 async def test_gone_event_finishes_task():

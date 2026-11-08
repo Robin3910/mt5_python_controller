@@ -155,6 +155,27 @@ TRANSIENT = {
     RET_REQUOTE, RET_PRICE_CHANGED, RET_PRICE_OFF, RET_TIMEOUT, RET_TOO_MANY_REQUESTS,
 }  # 可重试的瞬时错误
 
+# 「结果不确定」的失败：下单**可能已经成交**，只是回执没拿到。
+#
+# 这些错误不能直接当成「没成交」：
+# - RET_TIMEOUT(10012)：没收到券商回应，订单可能已经成交；
+# - order_send 返回 None：连回执结构都没拿到，券商侧可能已经受理；
+# - retcode 缺失：本地异常路径，没有券商确认。
+#
+# 确定性失败（invalid stops / invalid price / 保证金不足 / 无报价）不在此列：
+# 那些情况下券商明确拒了单，订单一定没成交。
+#
+# 唯一能确认「成交了没」的权威是**账户账本**（持仓 / 挂单），
+# 不是 order_send 的返回值。详见 strategy_runner 的核实窗口。
+UNCERTAIN_RETCODES = {
+    RET_TIMEOUT,
+}
+# 明确拒单、一定没成交的返回码
+DETERMINISTIC_RETCODES = {
+    RET_INVALID_PRICE,
+    RET_INVALID_STOPS,
+}
+
 # 挂单方向。limit = 等价格回到更有利处成交；stop = 等价格突破后成交。
 PENDING_LIMIT = "limit"
 PENDING_STOP = "stop"
@@ -288,6 +309,38 @@ def _retryable_batch_fail(res: dict) -> bool:
         return False
     rc = res.get("retcode")
     return rc is None or rc in TRANSIENT
+
+
+def is_uncertain_open_failure(res: dict) -> bool:
+    """这次下单失败是否属于「结果不确定」——即订单可能其实已经成交。
+
+    返回 True 时调用方**不许**直接判定没成交：必须去读账户账本
+    （该魔术号的持仓 / 挂单）核实后才能收口，否则会留下无人监控的孤儿仓。
+
+    判定优先级：
+    1. MT5 客户端在下单层就知道结果是否明确，会直接给 `uncertain` 标记 ——
+       `order_send` 返回 None（连回执都没拿到）或超时（没收到券商回应）
+       都是「单可能已成交」；券商明确拒单则是 False。**这个标记最准**。
+    2. 没有该标记时按 retcode 兜底：超时（10012）视为不确定；
+       其余（含 retcode 缺失）视为确定没成交 —— 真客户端一定会给 `uncertain`，
+       走到这里的都是别的实现，缺 retcode 时按「没发出去」处理更贴近旧行为。
+
+    注意 `error` 文本不参与判定 —— 文案是券商自己写的，不可靠；
+    真正能确认「成交了没」的只有账户账本。
+    """
+    if not res or res.get("success"):
+        return False
+    flag = res.get("uncertain")
+    if flag is not None:
+        return bool(flag)
+    rc = res.get("retcode")
+    if rc is None:
+        return False
+    try:
+        rc = int(rc)
+    except (TypeError, ValueError):
+        return False
+    return rc in UNCERTAIN_RETCODES
 
 
 def pair_hedge_positions(positions: list[dict]) -> list[tuple[dict, dict]]:
@@ -624,6 +677,9 @@ class MT5Client:
 
         返回值额外带两个内部时刻（`_order_at` / `_filled_at`）：下单前与返回后的
         本地时刻，供上层算「券商往返耗时」。它们是观测字段，不参与任何交易判断。
+
+        失败时还带 `uncertain` 标记：True 表示**订单可能已经成交**，
+        上层必须去读账户账本核实后才能判定失败（见 `is_uncertain_open_failure`）。
         """
         self.ensure()
         resolved = self.resolve_symbol(symbol)
@@ -635,6 +691,9 @@ class MT5Client:
         fill_idx = 0     # 当前尝试的填充模式下标
         attempt = 0      # 瞬时错误重试计数
         last = None
+        # 订单是否「已交给券商但结果不明」：order_send 返回 None 或超时。
+        # 这两种情况下单可能已经成交，只是回执没拿到。
+        uncertain = False
         # 下单时刻（第一次真正调 order_send 之前）；填了也不会用
         order_at = 0.0
         filled_at = 0.0
@@ -668,6 +727,8 @@ class MT5Client:
             last = result
             if result is None:
                 logger.error("order_send returned None: %s", mt5.last_error())
+                # 连回执都没拿到：券商可能已经受理并成交了
+                uncertain = True
                 attempt += 1
                 continue
 
@@ -690,6 +751,9 @@ class MT5Client:
                 continue
             if rc in TRANSIENT:
                 # 瞬时错误：退避后重试（下一轮会刷新价格）
+                # 超时是唯一「结果不明」的瞬时错误：没收到券商回应，单可能已成交
+                if rc == RET_TIMEOUT:
+                    uncertain = True
                 attempt += 1
                 _backoff_sleep(attempt, max_retry)
                 continue
@@ -697,6 +761,7 @@ class MT5Client:
             return {
                 "success": False, "symbol": symbol, "retcode": rc,
                 "error": result.comment,
+                "uncertain": False,
                 "_order_at": order_at, "_filled_at": filled_at,
             }
 
@@ -705,6 +770,7 @@ class MT5Client:
             "symbol": symbol,
             "retcode": getattr(last, "retcode", None),
             "error": getattr(last, "comment", "order failed after retries"),
+            "uncertain": uncertain,
             "_order_at": order_at,
             "_filled_at": filled_at,
         }
@@ -794,6 +860,9 @@ class MT5Client:
         fill_idx = 0
         attempt = 0
         last = None
+        # 挂单是否「已交给券商但结果不明」：order_send 返回 None 或超时。
+        # 挂单超时尤其要当心：单可能已经挂在盘上。
+        uncertain = False
         order_at = 0.0
         filled_at = 0.0
 
@@ -820,6 +889,7 @@ class MT5Client:
             last = result
             if result is None:
                 logger.error("pending order_send returned None: %s", mt5.last_error())
+                uncertain = True
                 attempt += 1
                 continue
 
@@ -842,12 +912,15 @@ class MT5Client:
                 fill_idx += 1
                 continue
             if rc in TRANSIENT:
+                if rc == RET_TIMEOUT:
+                    uncertain = True
                 attempt += 1
                 _backoff_sleep(attempt, max_retry)
                 continue
             return {
                 "success": False, "symbol": symbol, "retcode": rc,
                 "error": result.comment,
+                "uncertain": False,
                 "_order_at": order_at, "_filled_at": filled_at,
             }
 
@@ -856,6 +929,7 @@ class MT5Client:
             "symbol": symbol,
             "retcode": getattr(last, "retcode", None),
             "error": getattr(last, "comment", "pending order failed after retries"),
+            "uncertain": uncertain,
             "_order_at": order_at,
             "_filled_at": filled_at,
         }

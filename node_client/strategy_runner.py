@@ -31,9 +31,11 @@ import logging
 import time
 from typing import Callable, Optional
 
+import config as node_config
 import grid_trading
 import latency_marks
 import manual_scatter
+import mt5_client
 import risk_sizing
 import signal_pl
 from market_hub import GONE, STALE, WAKE, MarketEvent, MarketHub, Subscription
@@ -98,6 +100,23 @@ _TERMINAL_STATUSES = ("done", "failed")
 _CLOSE_ALL_ATTEMPTS = 3
 # 分档改单被券商拒绝后，按行情保活间隔再试，避免跟着 0.5 秒报价连刷
 _LOT_SLTP_RETRY_SEC = 5.0
+
+# 首单失败后的核实窗口：失败回报**不等于**没成交。
+#
+# 券商回执只是回执：超时（10012）、order_send 返回 None 这类失败里，
+# 订单其实可能已经成交。节点若据此立刻收口，任务停了而仓位还在，
+# 就成了没人监控、没人改止损的孤儿单。
+#
+# 所以首单失败后要留一段窗口反复读该魔术号的持仓 / 挂单：
+# 确认有东西 → 判定「其实成交了」，按成功继续走监控；
+# 确认确实没有 → 才判定真失败，收口。
+#
+# 窗口内**不重试下单**（重试只会放大重复成交），只观察。
+# 默认值见 config.strategy_open_verify_sec / strategy_open_verify_interval。
+_OPEN_VERIFY_SEC_DEFAULT = 15.0
+_OPEN_VERIFY_INTERVAL_DEFAULT = 1.0
+# 核实窗口里至少要隔这么久再读一次，避免把 MT5 线程压满
+_OPEN_VERIFY_INTERVAL_MIN = 0.1
 
 # 出入金探测：客户在 MT5 里手动加保证金后，止损要在多久内跟着重算。
 #
@@ -234,6 +253,8 @@ class StrategyRunner:
         report_interval: float = 5.0,
         runtime: Optional[dict] = None,
         recv_at: Optional[float] = None,
+        open_verify_sec: Optional[float] = None,
+        open_verify_interval: Optional[float] = None,
     ) -> None:
         self.task_id = int(task_id)
         self.magic = int(magic)
@@ -250,6 +271,22 @@ class StrategyRunner:
         self.report_interval = max(1.0, float(report_interval or 5.0))
         # strategy_start 命令被读到的时刻（节点本地时钟）：首单时延埋点的起点
         self._recv_at = float(recv_at) if recv_at is not None else time.time()
+
+        # 首单失败后的核实窗口参数（秒）。传 None 时从配置读；
+        # 显式传 0 表示「不核实」，失败即收口（旧行为）。
+        settings = node_config.get_settings()
+        self._open_verify_sec = (
+            node_config.clamp_open_verify_sec(settings.strategy_open_verify_sec)
+            if open_verify_sec is None
+            else node_config.clamp_open_verify_sec(open_verify_sec)
+        )
+        self._open_verify_interval = (
+            node_config.clamp_open_verify_interval(settings.strategy_open_verify_interval)
+            if open_verify_interval is None
+            else node_config.clamp_open_verify_interval(open_verify_interval)
+        )
+        # 首单失败核实的结果：None=还没核实，True=其实成交了，False=确认没成交
+        self._open_verified: Optional[bool] = None
 
         self.symbol = str(self.entry.get("symbol") or "")
         self.direction = str(self.entry.get("action") or "BUY").upper()
@@ -2036,10 +2073,14 @@ class StrategyRunner:
         ))
 
     async def _open_first(self) -> bool:
-        """下首单；失败直接结束子任务（服务端会据此收口）。
+        """下首单；失败先核实，确认没成交才结束子任务。
 
         以损定量路径先反推手数，因此首单手数、止盈都与信号自带的值无关。
         网格路径可能先等触发价，再按现价上方格位初始建仓。
+
+        失败时**不立刻收口**：券商回执只是回执，超时这类失败里订单其实
+        可能已经成交。核实窗口内反复读账本，确认有仓位就按成功继续走监控；
+        确认真的没有才判定失败（详见 `_await_open_verification`）。
         """
         if self.is_grid:
             return await self._grid_open_first()
@@ -2060,11 +2101,25 @@ class StrategyRunner:
         res["magic"] = self.magic
         res.setdefault("symbol", self.symbol)
         self._attach_latency_marks(res)
-        await self._send({"type": "trade_result", "data": res})
 
         if not res.get("success"):
-            logger.warning("task %s first order failed: %s", self.task_id, res.get("error"))
-            return False
+            # 失败先核实，不急着把失败回报发出去：发出去服务端就会把子任务
+            # 落成终态并释放节点占位，那时仓位若已成交就成没人管的孤儿单了。
+            outcome = None
+            if mt5_client.is_uncertain_open_failure(res):
+                outcome = await self._await_open_verification(res=res)
+            else:
+                # 确定性失败（拒单 / 报价非法 / 保证金不足）：券商明确拒了，
+                # 订单一定没成交，不必浪费窗口。
+                logger.warning(
+                    "task %s first order failed: %s", self.task_id, res.get("error"),
+                )
+            if outcome is None:
+                await self._send({"type": "trade_result", "data": res})
+                return False
+            res = self._recovered_trade_result(res, outcome)
+
+        await self._send({"type": "trade_result", "data": res})
 
         self._opened = True
         self.total_orders += 1
@@ -3989,11 +4044,27 @@ class StrategyRunner:
         res["magic"] = self.magic
         res.setdefault("symbol", self.symbol)
         self._attach_latency_marks(res)
-        await self._send({"type": "trade_result", "data": res})
 
         if not res.get("success"):
-            logger.warning("task %s base order failed: %s", self.task_id, res.get("error"))
-            return False
+            # 失败先核实：限价底仓的失败可能是「挂上了但回执丢了」，
+            # 市价底仓的失败可能是「成交了但回执超时」——两种都不能直接收口。
+            outcome = None
+            if mt5_client.is_uncertain_open_failure(res):
+                outcome = await self._await_open_verification(
+                    res=res, pending_mode=bool(base.is_pending),
+                )
+            else:
+                logger.warning(
+                    "task %s base order failed: %s", self.task_id, res.get("error"),
+                )
+            if outcome is None:
+                await self._send({"type": "trade_result", "data": res})
+                return False
+            res = self._recovered_trade_result(
+                res, outcome, pending_mode=bool(base.is_pending),
+            )
+
+        await self._send({"type": "trade_result", "data": res})
 
         pending = bool(res.get("pending"))
         if not pending:
@@ -4782,6 +4853,139 @@ class StrategyRunner:
             logger.debug("task %s read pending orders failed", self.task_id, exc_info=True)
             return None
         return None if rows is None else list(rows)
+
+    # ------------------------------------------------------------------
+    # 首单失败的核实窗口
+    # ------------------------------------------------------------------
+    async def _verify_open_outcome(self) -> dict:
+        """核实首单到底成交没有。返回核实结论。
+
+        结论有三种：
+        - {"filled": True,  "positions": [...], "orders": [...]}：其实成交了
+          （限价路径则是「挂上了」），按成功继续；
+        - {"filled": False, "positions": [], "orders": []}：确认没成交，可以收口；
+        - {"filled": None,  ...}：**读不到**，不能作任何结论。
+
+        判据是账户账本（该魔术号的持仓 / 挂单），不是 order_send 的返回值——
+        券商回执只是回执，超时这类失败里订单其实可能已经成交。
+
+        窗口内**不重试下单**，只观察：重试只会放大重复成交的风险。
+        """
+        held = await self._magic_positions()
+        resting = await self._magic_orders()
+        if held is None or resting is None:
+            # 「读不到」不等于「没有」：这一轮不作结论，继续等
+            return {"filled": None, "positions": None, "orders": None}
+        return {
+            "filled": bool(held or resting),
+            "positions": held,
+            "orders": resting,
+        }
+
+    async def _await_open_verification(
+        self, *, res: dict, pending_mode: bool = False,
+    ) -> Optional[dict]:
+        """首单失败后进核实窗口，确认订单到底成交没有。
+
+        返回值：
+        - 非 None 的核实结论 dict：核实通过（其实成交了 / 挂上了）；
+        - None：确认没成交（或窗口未启用），调用方应按失败收口。
+
+        `pending_mode` 表示这是限价开仓路径：核实到「挂单在盘上」也算成功
+        （挂上了但没成交是正常态，后续由事件循环等成交）。
+
+        窗口到期仍然「读不到」账本时按**失败**处理：宁可让任务失败收口，
+        也不能在状态不明时继续 —— 服务端会按终态释放占位。
+        """
+        if self._open_verify_sec <= 0:
+            # 核实被显式关闭：保持旧行为，失败即收口
+            return None
+
+        deadline = time.time() + self._open_verify_sec
+        interval = max(_OPEN_VERIFY_INTERVAL_MIN, self._open_verify_interval)
+        reason = str(res.get("error") or "order failed")
+        logger.warning(
+            "task %s first order failed (%s), verifying for %.0fs",
+            self.task_id, reason, self._open_verify_sec,
+        )
+        # 上报一条「核实中」：后台能看到任务没死透，还在盯着这一单
+        await self._emit_progress(
+            "open_verify", phase="running",
+            message=f"开仓回报失败，正在核实订单是否已成交（{reason}）",
+            detail={
+                "kind": "open_verify",
+                "error": reason,
+                "retcode": res.get("retcode"),
+                "verify_seconds": self._open_verify_sec,
+            },
+        )
+
+        while True:
+            # 先读一次再看时间：刚失败时账本可能已经反映了成交，
+            # 不该白等一个完整间隔才确认。
+            outcome = await self._verify_open_outcome()
+            if outcome["filled"]:
+                if pending_mode and not outcome["positions"]:
+                    # 限价路径：只有挂单、还没成交 —— 挂上了本身就是成功，
+                    # 后续由事件循环等成交（limit_entry 的挂单成交才置 _opened）
+                    logger.info(
+                        "task %s verify: pending order resting, awaiting fill",
+                        self.task_id,
+                    )
+                self._open_verified = True
+                logger.warning(
+                    "task %s first order reported failure but order DID fill "
+                    "(%d position(s), %d pending) — recovering",
+                    self.task_id,
+                    len(outcome["positions"] or []),
+                    len(outcome["orders"] or []),
+                )
+                return outcome
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            # outcome["filled"] is None 表示读不到账本：不能作结论，继续等。
+            # outcome["filled"] is False 表示确实没有持仓也没有挂单：也没成交。
+            await asyncio.sleep(min(interval, remaining))
+
+        self._open_verified = False
+        logger.warning(
+            "task %s first order confirmed not filled after %.0fs: %s",
+            self.task_id, self._open_verify_sec, reason,
+        )
+        return None
+
+    def _recovered_trade_result(
+        self, res: dict, outcome: dict, *, pending_mode: bool = False,
+    ) -> dict:
+        """核实通过后合成一条「成功」的成交回报。
+
+        原回报是失败的（服务端据此会把子任务落成 failed 并释放节点占位），
+        这里把它改成成功，并补上真实成交信息：票号与成交价从账本里取，
+        否则服务端记的 order_ticket 是空的。
+        """
+        positions = outcome.get("positions") or []
+        orders = outcome.get("orders") or []
+        out = dict(res)
+        out["success"] = True
+        out["recovered"] = True
+        out["original_error"] = str(res.get("error") or "")
+        out.pop("error", None)
+        # 成交票号与成交价：以持仓为准，没有持仓（限价挂上了）就用挂单
+        source = positions[0] if positions else (orders[0] if orders else {})
+        ticket = source.get("ticket") or res.get("order") or res.get("ticket")
+        if ticket:
+            out["order"] = int(ticket)
+            out["ticket"] = int(ticket)
+        price = source.get("price_open")
+        if price is not None:
+            out["price"] = float(price)
+        volume = source.get("volume")
+        if volume is not None:
+            out["volume"] = float(volume)
+        if pending_mode and not positions:
+            out["pending"] = True
+        return out
 
     async def _cleanup_pending_before_finish(self, *, reason: str) -> bool:
         """收口前把本魔术号下残留的挂单撤掉。返回是否已确认撤干净。

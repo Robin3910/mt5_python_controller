@@ -280,6 +280,79 @@ async def test_strategy_stop_without_magic_is_ignored():
     assert ws.sent == []
 
 
+async def test_strategy_stop_with_finished_runner_closes_residual():
+    """runner 已结束但留下了持仓 —— 终止指令必须按魔术号兜底平掉。
+
+    这是孤儿单的最后一道路径：任务收口时仓位其实还在，之后没人监控它。
+    收到终止指令时要按魔术号平掉，否则这批仓位永远没人负责。
+    """
+    n = _node()
+    await n._exec(n.mt5.connect)
+    await n._exec(
+        n.mt5.place_market_order, "XAUUSD", "BUY", 0.1, None, None, "", 900000321,
+    )
+    ws = FakeWS()
+
+    class _DoneRunner:
+        """已经结束的任务监控：done=True，再 request_stop 也没用。"""
+
+        done = True
+
+        def __init__(self) -> None:
+            self.stop_calls = 0
+
+        def request_stop(self, *a, **kw) -> None:
+            self.stop_calls += 1
+
+    runner = _DoneRunner()
+    n.runners[321] = runner
+
+    await n._handle(ws, {
+        "cmd": "strategy_stop", "task_id": 321, "magic": 900000321,
+        "group_id": "g1", "signal_id": "s1", "symbol": "XAUUSD",
+        "reason": "close_signal",
+    })
+
+    # 残留持仓被平掉，任务不再留一个没人管的仓位
+    assert n.mt5.positions_by_magic(900000321) == []
+    fin = [m for m in ws.sent if m["type"] == "strategy_finished"]
+    assert len(fin) == 1
+    assert fin[0]["data"]["status"] == "done"
+
+
+async def test_strategy_stop_with_running_runner_does_not_double_close():
+    """监控还在跑时走正常停止流程，不按魔术号兜底平仓（避免重复平仓）。"""
+    n = _node()
+    await n._exec(n.mt5.connect)
+    await n._exec(
+        n.mt5.place_market_order, "XAUUSD", "BUY", 0.1, None, None, "", 900000654,
+    )
+    ws = FakeWS()
+
+    class _LiveRunner:
+        done = False
+
+        def __init__(self) -> None:
+            self.stop_calls = 0
+
+        def request_stop(self, *a, **kw) -> None:
+            self.stop_calls += 1
+
+    runner = _LiveRunner()
+    n.runners[654] = runner
+
+    await n._handle(ws, {
+        "cmd": "strategy_stop", "task_id": 654, "magic": 900000654,
+        "group_id": "g1", "signal_id": "s1", "symbol": "XAUUSD",
+        "reason": "close_signal",
+    })
+
+    assert runner.stop_calls == 1
+    # 走正常停止流程，兜底平仓不应插手
+    assert not [m for m in ws.sent if m["type"] == "strategy_finished"]
+    assert len(n.mt5.positions_by_magic(900000654)) == 1
+
+
 async def test_snapshot_shape():
     n = _node()
     await n._exec(n.mt5.connect)
