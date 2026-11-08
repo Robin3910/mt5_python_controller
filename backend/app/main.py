@@ -32,6 +32,7 @@ from . import (
     nodes,
     pending_api,
     phone_auth,
+    phone_rebind,
     rbac_service,
     roles_api,
     signal_center_api,
@@ -138,6 +139,7 @@ app.add_middleware(
 for r in (
     auth.router,
     phone_auth.router,
+    phone_rebind.router,
     node_dashboard_api.router,
     twofa.router,
     users_api.router,

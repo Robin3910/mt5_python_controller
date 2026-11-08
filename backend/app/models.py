@@ -1162,6 +1162,48 @@ class PhoneSmsLoginRequest(BaseModel):
     ticket: Optional[str] = Field(default=None, max_length=4096)
 
 
+# ------------------------- 自助改绑手机号 -------------------------
+class PhoneRebindSendRequest(BaseModel):
+    """改绑：发送验证码。
+
+    target 决定收码号码与验证码用途：
+    - "new"：码发到**新**号（用途 rebind_new），验证新号所有权
+    - "old"：码发到**当前绑定**的旧号（用途 rebind_old），验证本人身份
+
+    phone 只在 target="new" 时必填；target="old" 时**由服务端取当前绑定号码**
+    （前端拿到的 /api/me 里的号码是脱敏的，让前端回传完整旧号等于要求前端
+    持有明文 —— 没必要，也不安全）。
+
+    captcha_verify_param 与注册链路一致：仅在服务端返回 428 时才需要带上。
+    """
+    target: str = Field(default="new", max_length=8)
+    phone: Optional[str] = Field(default=None, max_length=32)
+    captcha_verify_param: Optional[str] = Field(default=None, max_length=4096)
+
+
+class PhoneRebindVerifyRequest(BaseModel):
+    """改绑：校验新号验证码 → 换发改绑票据。"""
+    phone: str = Field(min_length=1, max_length=32)
+    code: str = Field(min_length=1, max_length=16)
+
+
+class PhoneRebindRequest(BaseModel):
+    """改绑：最终提交。
+
+    ticket 是 verify 阶段换来的「新号已验证」票据（绑定 uid + 新号）。
+
+    auth_method 决定「本人身份」怎么确认（二选一）：
+    - "password"：用登录密码；账号开了 2FA 时还需 totp_code
+    - "old_code"：用旧手机号收到的验证码（手机号注册且未设密码的用户走这条）
+    """
+    new_phone: str = Field(min_length=1, max_length=32)
+    ticket: str = Field(min_length=1, max_length=4096)
+    auth_method: str = Field(default="password", max_length=16)
+    password: Optional[str] = Field(default=None, max_length=128)
+    totp_code: Optional[str] = Field(default=None, max_length=16)
+    old_code: Optional[str] = Field(default=None, max_length=16)
+
+
 class SmsConfigOut(BaseModel):
     """短信配置（配置页展示）。密钥永不回显。
 

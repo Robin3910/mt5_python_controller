@@ -135,3 +135,55 @@ def verify_phone_pending_jwt(token: str, purpose: str | set[str] | frozenset[str
         return None
     sub = data.get("sub")
     return str(sub) if sub else None
+
+
+# ---------------------------------------------------------------------------
+# 改绑手机号票据
+# ---------------------------------------------------------------------------
+# 改绑 = 转移账号控制权，所以票据比「手机号已验证」票据更强：
+# 它把「哪个用户」和「哪个新号码」一起钉死，缺一不可。
+TYP_PHONE_REBIND = "phone_rebind"
+# 票据有效期 10 分钟：够用户从容走完「验证新号 → 验证本人身份」两步。
+PHONE_REBIND_TICKET_TTL = 600
+
+
+def create_phone_rebind_jwt(phone: str, user_id: int) -> str:
+    """签发「新号已验证」票据（改绑专用），有效期 10 分钟。
+
+    payload：
+    - sub  = 归一化后的**新**手机号
+    - uid  = 要改绑的用户 id
+    - typ  = phone_rebind（与 phone_pending 类型隔离，不能互相顶替）
+    """
+    payload = {
+        "sub": phone,
+        "uid": int(user_id),
+        "typ": TYP_PHONE_REBIND,
+        "exp": int(time.time()) + PHONE_REBIND_TICKET_TTL,
+    }
+    return jwt.encode(payload, settings.jwt_secret, algorithm="HS256")
+
+
+def verify_phone_rebind_jwt(token: str, user_id: int, phone: str) -> Optional[str]:
+    """校验改绑票据；类型 / uid / 手机号三者都要对上才通过。
+
+    三者全对是必须的：
+    - 类型对：防止拿「手机号已验证」票据（登录 / 注册用）来改绑；
+    - uid 对：防止拿 A 用户的新号票据去改绑 B 的账号；
+    - 手机号对：防止票据里的号与提交的号不一致（票据被截胡/改号）。
+    """
+    try:
+        data = jwt.decode(token, settings.jwt_secret, algorithms=["HS256"])
+    except Exception:
+        return None
+    if data.get("typ") != TYP_PHONE_REBIND:
+        return None
+    try:
+        if int(data.get("uid")) != int(user_id):
+            return None
+    except (TypeError, ValueError):
+        return None
+    sub = data.get("sub")
+    if not sub or str(sub) != phone:
+        return None
+    return str(sub)

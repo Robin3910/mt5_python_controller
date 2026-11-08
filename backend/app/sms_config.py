@@ -47,8 +47,17 @@ SUPPORTED_PROVIDERS = (PROVIDER_ALIYUN_SMS_AUTH, PROVIDER_TENCENTCLOUD_SMS)
 #
 # 用途隔离本身仍然保留（key 里仍带 purpose），只是取值从两个收敛为一个。
 # 真正的防跨用改由「票据」承担：登录票据与注册票据的允许用途不同（见 security.py）。
+#
+# —— 改绑手机号用的两个用途 ——
+# rebind_new：验证**新**号所有权（码发到新号）
+# rebind_old：验证**旧**号所有权（码发到旧号，用于「我不是被抢号的人」之外的
+#             第二条身份确认路径）
+# 这两个用途必须与 auth 隔离：登录用的码不能拿来完成改绑，反之亦然 ——
+# 否则「能验证码登录」就等于「能改绑手机号」，等于把账号控制权交给短信通道。
 PURPOSE_AUTH = "auth"
-SMS_PURPOSES = (PURPOSE_AUTH,)
+PURPOSE_REBIND_NEW = "rebind_new"
+PURPOSE_REBIND_OLD = "rebind_old"
+SMS_PURPOSES = (PURPOSE_AUTH, PURPOSE_REBIND_NEW, PURPOSE_REBIND_OLD)
 
 DEFAULTS: dict = {
     # 默认启用：短信服务是注册 / 验证码登录的主链路，装好 AccessKey 就能用，
