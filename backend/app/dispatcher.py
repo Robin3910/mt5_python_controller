@@ -16,7 +16,7 @@ import logging
 import time
 from typing import Optional
 
-from . import latency_marks, mt5_identity, persist, results, rules
+from . import latency_marks, mt5_identity, mt5_link, persist, results, rules
 from .config import Config
 from .connections import manager
 from .models import build_close_command, build_open_command
@@ -166,6 +166,14 @@ class Dispatcher:
         if mismatch:
             await self._skip(signal_id, node_id, mismatch)
             return {"status": "skipped", "reason": mismatch}
+
+        # 链路一致性：终端与券商断联的节点不下发开仓指令。
+        # 断联期间下单回执不可靠，订单却可能已成交 —— 发了就可能留下孤儿仓。
+        # 判据是上报的滞后状态，过期或缺失一律放行（不误伤节点）。
+        link_reason = mt5_link.link_offline_reason(account)
+        if link_reason:
+            await self._skip(signal_id, node_id, link_reason)
+            return {"status": "skipped", "reason": link_reason}
 
         # 9.2 多区间方向过滤
         eff = rules.effective_filters(node, filters)

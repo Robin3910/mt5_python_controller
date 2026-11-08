@@ -287,7 +287,7 @@ async def test_snapshot_shape():
     # orders 是限价开仓的存活凭据：服务端对账少了它会在挂单成交前就收口任务
     assert set(snap.keys()) == {
         "account", "positions", "orders", "prices", "quotes", "server_time_offset",
-        "books_ok",
+        "books_ok", "mt5_link", "mt5_link_at",
     }
     assert snap["orders"] == []
     assert snap["books_ok"] is True
@@ -296,6 +296,8 @@ async def test_snapshot_shape():
     assert "EURUSD" in snap["quotes"]
     assert set(snap["quotes"]["EURUSD"].keys()) == {"bid", "ask", "mid", "change"}
     assert snap["account"]["login"]
+    # 链路状态随快照一起上报：服务端据此知道断联，不必等子任务失败才发现
+    assert snap["mt5_link"] == "online"
 
 
 async def test_snapshot_unreadable_positions_returns_none():
@@ -321,7 +323,14 @@ async def test_snapshot_unreadable_orders_returns_none():
     assert await n._snapshot() is None
 
 
-async def test_reporter_does_not_send_unreadable_snapshot(monkeypatch):
+async def test_reporter_sends_degraded_snapshot_when_books_unreadable(monkeypatch):
+    """账本读不到时要发降级快照，而不是什么都不发。
+
+    断联时 positions/orders 恰恰读不到。不发就没���服务端既收不到
+    「断联了」这个事实，节点的在线 TTL 也会断掉。
+    降级快照带 books_ok=False，服务端会保留上次快照并跳过对账，
+    不会把「读不到」当成「已平完」而错误收口任务。
+    """
     n = _node()
     ws = FakeWS()
     n._check_login = lambda acct: None  # type: ignore[method-assign]
@@ -337,7 +346,15 @@ async def test_reporter_does_not_send_unreadable_snapshot(monkeypatch):
     monkeypatch.setattr(nc.asyncio, "sleep", stop)
     with pytest.raises(asyncio.CancelledError):
         await n._reporter(ws)
-    assert ws.sent == []
+
+    accounts = [m for m in ws.sent if m["type"] == "account"]
+    assert len(accounts) == 1
+    data = accounts[0]["data"]
+    assert data["books_ok"] is False
+    assert data["mt5_link"] == "online"
+    # 账本字段必须为空，不能伪装成「读到了空仓」
+    assert data["positions"] == []
+    assert data["orders"] == []
 
 
 async def test_check_login_allows_match_and_empty():

@@ -42,6 +42,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("node")
 
+# 链路监视采样间隔（秒）。1 秒 × 3 次确认 ≈ 3 秒内判出断联。
+LINK_MONITOR_INTERVAL = 1.0
+
 # 仅用于面板识别本仓库固定开发入口；生产 exe 以构建期能力清单及文件哈希为准。
 ACCOUNT_BINDING_SUPPORTED = True
 
@@ -375,6 +378,8 @@ class NodeClient:
             "prices": prices,
             "server_time_offset": offset,
             "books_ok": True,
+            "mt5_link": self._link_state(),
+            "mt5_link_at": time.time(),
         }
 
     async def _pending_orders(self) -> list[dict]:
@@ -451,6 +456,7 @@ class NodeClient:
             asyncio.create_task(self._reporter(ws)),
             asyncio.create_task(self._heartbeat(ws)),
             asyncio.create_task(self._receiver(ws)),
+            asyncio.create_task(self._link_monitor()),
         ]
         if settings.deals_sync_enabled:
             tasks.append(asyncio.create_task(self._deals_reporter(ws)))
@@ -468,18 +474,125 @@ class NodeClient:
                 t.cancel()
             self._cancel_runners()
 
+    async def _link_monitor(self) -> None:
+        """链路监视：高频采样终端链路状态，让断联在秒级内被察觉。
+
+        为什么要有这个独立任务：账户上报默认 5 秒一轮，链路去抖又要连续 3 次
+        才判离线 —— 照着上报节奏走，断联最快要 ~15 秒才认出来。这段时间里
+        信号照样下发到断联的节点。
+
+        这里按 1 秒采样，3 次确认 ≈ 3 秒内判出断联。闸门本身另有「现读一次
+        不去抖」的判定（见 mt5_client._link_block），所以最坏情况也不会漏拦：
+        监视任务只是让**上报的状态**更及时，不承担把关职责。
+
+        终端进程死掉时 terminal_info() 抛异常 —— 这属于 IPC 层面的问题，
+        不是链路断连，不在此处处理（链路状态保持 unknown，交给各调用点自己
+        抛错处理）。
+        """
+        while True:
+            try:
+                await self._sample_terminal_status()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                logger.debug("link monitor sample failed", exc_info=True)
+            await asyncio.sleep(LINK_MONITOR_INTERVAL)
+
     async def _reporter(self, ws) -> None:
-        """定时上报账户快照；顺带检查账户级风控；发现换号则抛错结束会话。"""
+        """定时上报账户快照；顺带检查账户级风控；发现换号则抛错结束会话。
+
+        链路状态由独立的 _link_monitor 高频采样（1 秒一轮），这里不再重复
+        采样 —— 重复采样会让去抖计数跑得比设计快，判定时间就不准了。
+        """
         while True:
             snap = await self._snapshot()
             if snap is None:
-                await asyncio.sleep(clamp_account_report_interval(settings.account_report_interval))
-                continue
+                # 账本读不到（断联时正是如此）：不能空着不上报 ——
+                # 不上报就没有 mt5_link，服务端也拿不到「断联了」这个事实。
+                # 发一份降级快照：books_ok=False 让服务端保留上次快照、跳过
+                # 对账（不会误判成「已平完」而错误收口任务），但链路状态照常送达。
+                snap = await self._degraded_snapshot()
+                if snap is None:
+                    await asyncio.sleep(
+                        clamp_account_report_interval(settings.account_report_interval)
+                    )
+                    continue
             self._check_login(snap.get("account") or {})
-            self._algo_trading_allowed = await self._exec(self.mt5.algo_trading_allowed)
             await ws.send(json.dumps({"type": "account", "data": snap}))
-            await self._check_account_risk(ws, snap)
+            if snap.get("books_ok") is not False:
+                # 账本读不到时**不能**跑风控：降级快照的 positions 是空的，
+                # 拿空仓去推进保护状态机会把 armed 清掉（下次开仓就误触发收窄），
+                # 也会让「净值下限」这类规则在空仓下误判。等账本能读了再判断。
+                await self._check_account_risk(ws, snap)
             await asyncio.sleep(clamp_account_report_interval(settings.account_report_interval))
+
+    async def _sample_terminal_status(self) -> None:
+        """采样终端链路状态与算法交易开关（一次 terminal_info() 读三个字段）。
+
+        状态机在客户端侧一并推进，这里只取回结果 —— 两次 executor 往返
+        会让 1 秒的采样节奏实际变成 2 秒，没必要。
+        """
+        try:
+            status = await self._exec(self.mt5.terminal_status) or {}
+        except Exception:  # noqa: BLE001
+            logger.debug("terminal status probe failed", exc_info=True)
+            return
+        trade_allowed = status.get("trade_allowed")
+        if trade_allowed is not None:
+            self._algo_trading_allowed = trade_allowed
+
+    async def _degraded_snapshot(self) -> dict | None:
+        """账本读不到时的降级快照：只报链路状态与能读到的账户信息。
+
+        存在的意义：终端与券商断联时 positions/orders 恰恰读不到，若此时
+        直接不上报，服务端既收不到断联状态、节点的在线 TTL 也会断掉。
+        books_ok=False 是服务端已有的语义：保留上次快照并跳过对账，
+        **不会**把「读不到」当成「已平光」而错误收口任务。
+        """
+        try:
+            account = await self._exec(self.mt5.account_info) or {}
+        except Exception:  # noqa: BLE001
+            account = {}
+        link = self._link_state()
+        return {
+            "account": dict(account or {}),
+            "positions": [],
+            "orders": [],
+            "quotes": {},
+            "prices": {},
+            "server_time_offset": None,
+            "books_ok": False,
+            "mt5_link": link,
+            "mt5_link_at": time.time(),
+        }
+
+    def _link_state(self) -> str:
+        """当前链路状态（去抖后的上报口径）；客户端不支持时按 unknown。"""
+        getter = getattr(self.mt5, "link_state", None)
+        if not callable(getter):
+            return "unknown"
+        try:
+            state = str(getter() or "unknown")
+        except Exception:  # noqa: BLE001
+            return "unknown"
+        return state if state in ("online", "offline", "unknown") else "unknown"
+
+    async def _link_live_state(self) -> str:
+        """现读一次链路状态（不去抖），用于开仓前的闸门判定。
+
+        闸门必须用此刻的真实状态：上报口径有去抖（连续 N 次才认），等到
+        去抖判离线时其实已经断了好一会儿了。
+        """
+        try:
+            status = await self._exec(self.mt5.terminal_status) or {}
+        except Exception:  # noqa: BLE001
+            return "unknown"
+        connected = status.get("connected")
+        if connected is False:
+            return "offline"
+        if connected is True:
+            return "online"
+        return "unknown"
 
     async def _deals_reporter(self, ws) -> None:
         """定时采集 MT5 历史成交并上报服务端（订单历史 / 带单绩效 / 概览盈亏统计的数据源）。
@@ -835,6 +948,29 @@ class NodeClient:
         existing = self.runners.get(task_id)
         if existing and not existing.done:
             logger.info("task %s already running, ignore duplicate start", task_id)
+            return
+
+        # 链路闸门（闸门 A-1）：终端与券商断连时不建监控，直接判失败。
+        # 断连期间下单的回执不可靠，单却可能已成交 —— 这时建监控等于把
+        # 一个可能已经存在的孤儿仓放到没人看的地方。这里拦住的是
+        # 「确定没发单」，所以可以立即收口，不必等核实窗口。
+        if not resume and await self._link_live_state() == "offline":
+            logger.error(
+                "strategy task %s rejected: MT5 link offline, no order sent", task_id,
+            )
+            await ws.send(json.dumps({
+                "type": "trade_result",
+                "data": {
+                    "success": False,
+                    "task_id": task_id,
+                    "magic": int(magic),
+                    "signal_id": msg.get("signal_id") or "",
+                    "group_id": msg.get("group_id") or "",
+                    "symbol": (msg.get("entry") or {}).get("symbol"),
+                    "error": "MT5 终端与券商断连，本次开仓已拦截",
+                    "link_offline": True,
+                },
+            }))
             return
 
         async def send(payload: dict) -> None:
