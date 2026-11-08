@@ -10,7 +10,9 @@
 import itertools
 import logging
 import time
+from typing import Optional
 
+import mt5_client
 from deal_types import (
     DEAL_TYPE_BALANCE,
     DEAL_TYPE_BUY,
@@ -59,6 +61,11 @@ class MockMT5Client:
         self.stops_level = 0
         # 模拟环境没有券商钟面偏移，与 time.time() 同一套 UTC
         self._server_tz_offset = 0
+        # 链路状态机（与真实客户端同形状）：link_connected 置 False 即模拟断连
+        self._link_state = mt5_client.LINK_ONLINE
+        self._link_offline_hits = 0
+        self._link_online_hits = 0
+        self._link_at = 0.0
 
     def connect(self) -> bool:
         self.connected = True
@@ -70,6 +77,83 @@ class MockMT5Client:
 
     def algo_trading_allowed(self) -> bool | None:
         return getattr(self, "trade_allowed", True)
+
+    # ---------------------- 链路状态（终端 ↔ 券商）----------------------
+    def terminal_status(self) -> dict:
+        """一次读出链路连通性与算法交易开关（与真实客户端同形状）。
+
+        同时推进链路状态机，调用方不必再调一次 terminal_link_state。
+
+        测试用：把 self.link_connected 置 False 模拟终端与券商断连，
+        置 None 模拟「读不到链路状态」（IPC 抖动 / 终端进程异常）。
+        """
+        connected = getattr(self, "link_connected", True)
+        # 保持 None 的原样：None = 读不到，与 False（明确断开）是两件事
+        connected = None if connected is None else bool(connected)
+        return {
+            "connected": connected,
+            "trade_allowed": self.algo_trading_allowed(),
+            "link_state": self._advance_link_state(connected),
+        }
+
+    def _advance_link_state(self, connected: object) -> str:
+        """状态机推进（纯逻辑，不做 IPC）。"""
+        if connected is None:
+            if self._link_state != mt5_client.LINK_OFFLINE:
+                self._link_state = mt5_client.LINK_UNKNOWN
+            return self._link_state
+        if connected:
+            self._link_offline_hits = 0
+            self._link_online_hits += 1
+            if (
+                self._link_state != mt5_client.LINK_ONLINE
+                and self._link_online_hits >= mt5_client.LINK_ONLINE_CONFIRM
+            ):
+                self._link_state = mt5_client.LINK_ONLINE
+        else:
+            self._link_online_hits = 0
+            self._link_offline_hits += 1
+            if (
+                self._link_state != mt5_client.LINK_OFFLINE
+                and self._link_offline_hits >= mt5_client.LINK_OFFLINE_CONFIRM
+            ):
+                self._link_state = mt5_client.LINK_OFFLINE
+        return self._link_state
+
+    def terminal_link_state(self, connected: object = None) -> str:
+        """推进链路状态机；与真实客户端同样的去抖规则。
+
+        `connected` 显式传入时用它（复用同一次 terminal_info 读取的结果）。
+        """
+        if connected is None:
+            return self.terminal_status()["link_state"]
+        return self._advance_link_state(connected)
+
+    def link_state(self) -> str:
+        return self._link_state
+
+    def link_state_at(self) -> float:
+        return self._link_at
+
+    def _link_block(self, symbol: str) -> Optional[dict]:
+        """链路断连时拦住开仓；可开仓返回 None（与真实客户端同形状）。
+
+        与真实客户端一致：闸门**不去抖**，明确读到断开就拦（此刻没有链路
+        就没有撮合，拦下零风险）；去抖只用于上报的状态。
+        """
+        try:
+            connected = self.terminal_status()["connected"]
+        except Exception:  # noqa: BLE001
+            return None
+        if connected is not False:
+            return None
+        return {
+            "success": False,
+            "symbol": symbol,
+            "retcode": None,
+            "error": "MT5 终端与券商断连，本次开仓已拦截",
+            "link_offline": True,
+        }
 
     def account_info(self) -> dict:
         # 净值 = 余额 + 浮动盈亏（这里浮盈恒为 0，简化处理）
@@ -113,6 +197,9 @@ class MockMT5Client:
 
     def place_market_order(self, symbol, action, volume, sl=None, tp=None,
                            comment="", magic=None, max_retry=3) -> dict:
+        blocked = self._link_block(symbol)
+        if blocked is not None:
+            return blocked
         # 模拟“立即成交”，新增一笔持仓
         tk = next(self._tickets)
         price = self.prices_map.get(symbol.upper(), 1.0)
@@ -195,6 +282,9 @@ class MockMT5Client:
 
     def place_pending_order(self, symbol, action, volume, price, sl=None, tp=None,
                             comment="", magic=None, kind="limit", max_retry=3) -> dict:
+        blocked = self._link_block(symbol)
+        if blocked is not None:
+            return blocked
         kind = str(kind or "limit").strip().lower()
         reject = self.check_pending_price(symbol, action, float(price), kind)
         if reject:

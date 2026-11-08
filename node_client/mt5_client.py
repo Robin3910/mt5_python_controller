@@ -216,6 +216,38 @@ def trade_allowed_from_terminal(info: object | None) -> bool | None:
     return None
 
 
+def connected_from_terminal(info: object | None) -> bool | None:
+    """terminal_info().connected 即「终端与交易服务器的链路是否连通」。
+
+    与 trade_allowed 是两件事：前者是网络链路，后者是终端里的算法交易开关。
+    链路断了的时候下单回执不可靠（order_send 可能返回 None，也可能超时），
+    订单却可能已经在券商侧成交 —— 这正是孤儿单的成因。
+
+    字段缺失时返回 None（读不到），**不能当成 False**：
+    「读不到链路状态」与「链路确实断了」必须分开，否则一次 IPC 抖动
+    就会把所有节点的所有信号全拦掉。
+    """
+    if info is None:
+        return None
+    connected = getattr(info, "connected", None)
+    if isinstance(connected, bool):
+        return connected
+    if isinstance(connected, int):
+        return bool(connected)
+    return None
+
+
+# 链路三态
+LINK_ONLINE = "online"    # 终端与券商链路正常
+LINK_OFFLINE = "offline"  # 明确断连
+LINK_UNKNOWN = "unknown"  # 读不到链路状态（保守放行）
+
+# 链路状态去抖次数：连续读到同样状态多少次才认。
+# 单次抖动不该触发拦截 —— 一次误拦就是漏掉一个真实信号。
+LINK_OFFLINE_CONFIRM = 3
+LINK_ONLINE_CONFIRM = 2
+
+
 class MT5Error(RuntimeError):
     pass
 
@@ -351,6 +383,12 @@ class MT5Client:
         self._close_filling_by_symbol: dict[str, int] = {}
         # (cached_at, offset_sec)：券商服务器时区偏移，避免每秒快照都去扫品种
         self._server_tz_cache: tuple[float, Optional[int]] = (0.0, None)
+        # 链路状态机：连续几次读到 disconnected 才判断连，连续几次读到 connected
+        # 才判恢复。抖动不该反复触发拦截。
+        self._link_state: str = LINK_ONLINE
+        self._link_offline_hits = 0
+        self._link_online_hits = 0
+        self._link_at = 0.0
 
     # ----------------------- 连接 -----------------------
     def connect(self) -> bool:
@@ -407,6 +445,123 @@ class MT5Client:
         if mt5 is None or not self.connected:
             return None
         return trade_allowed_from_terminal(mt5.terminal_info())
+
+    # ---------------------- 链路状态（终端 ↔ 券商）----------------------
+    def terminal_status(self) -> dict:
+        """一次 terminal_info() 读出两个字段：链路连通性与算法交易开关，
+        并顺带推进链路状态机。
+
+        只调一次：terminal_info() 是 IPC 调用，在 MT5 专用线程上排队执行，
+        多调一次就多占一次执行器槽位。这里的两个字段必须来自**同一次**读，
+        否则会出现「链路是旧的、开关是新的」这种自相矛盾的组合。
+
+        状态机在这一并推进，调用方就不必再调一次 terminal_link_state ——
+        那会变成第二次 IPC 往返，白白多占一个执行器槽位。
+        """
+        info = None
+        if mt5 is not None and self.connected:
+            try:
+                info = mt5.terminal_info()
+            except Exception:  # noqa: BLE001
+                info = None
+        connected = connected_from_terminal(info)
+        return {
+            "connected": connected,
+            "trade_allowed": trade_allowed_from_terminal(info),
+            "link_state": self._advance_link_state(connected),
+        }
+
+    def terminal_link_state(self, connected: Optional[bool] = None) -> str:
+        """推进链路状态机并返回链路三态。
+
+        `connected` 为 None 时自己读一次 terminal_info()（会多一次 IPC 调用，
+        优先用 terminal_status() 的结果传入）。
+
+        去抖规则：
+        - 连续 LINK_OFFLINE_CONFIRM 次读到 disconnected 才判离线；
+        - 连续 LINK_ONLINE_CONFIRM 次读到 connected 才判恢复；
+        - 读不到（terminal_info 返回 None / 抛异常）算 unknown：
+          **不改变**已有的离线判定，但也不当成连通。
+
+        为什么恢复也要确认：终端刚重连时 connected 变 True，券商侧可能还没
+        完全就绪，第一单最容易失败。等它稳一稳再放行。
+        """
+        if connected is None:
+            connected = self.terminal_status()["connected"]
+        return self._advance_link_state(connected)
+
+    def _advance_link_state(self, connected: Optional[bool]) -> str:
+        """状态机推进（纯逻辑，不做 IPC）。"""
+        if connected is None:
+            # 读不到：保守。若当前已判离线就保持离线，避免把断联误判成恢复。
+            if self._link_state != LINK_OFFLINE:
+                self._link_state = LINK_UNKNOWN
+            self._link_at = time.time()
+            return self._link_state
+        if connected:
+            self._link_offline_hits = 0
+            self._link_online_hits += 1
+            if self._link_state != LINK_ONLINE and self._link_online_hits >= LINK_ONLINE_CONFIRM:
+                logger.info("MT5 link recovered: %s", self._link_state)
+                self._link_state = LINK_ONLINE
+        else:
+            self._link_online_hits = 0
+            self._link_offline_hits += 1
+            if self._link_state != LINK_OFFLINE and self._link_offline_hits >= LINK_OFFLINE_CONFIRM:
+                logger.error(
+                    "MT5 link lost: terminal not connected to trade server (%d hits)",
+                    self._link_offline_hits,
+                )
+                self._link_state = LINK_OFFLINE
+        self._link_at = time.time()
+        return self._link_state
+
+    def link_state(self) -> str:
+        """当前链路状态（不重新采样）。"""
+        return self._link_state
+
+    def link_state_at(self) -> float:
+        """链路状态最后一次更新的时刻。"""
+        return self._link_at
+
+    def _link_block(self, symbol: str) -> Optional[dict]:
+        """链路断连时拦住开仓；可开仓返回 None。
+
+        这是「杜绝孤儿单」的最后一道闸：断连期间下单，回执不可靠
+        （order_send 可能返回 None，也可能超时），订单却可能已在券商侧成交。
+        节点若据此判定失败并收口，仓位就没人管了。
+
+        拦下的是**确定没成交**（单根本没发出去），所以调用方可以立即按失败
+        收口，不需要再等核实窗口。
+
+        只拦开仓，不拦平仓/改单：断联时平仓本来就发不出去，拦它会让持仓
+        彻底无人照管。
+
+        这里**现读一次**链路状态，且**不走去抖**：明确读到 connected=False
+        就是「此刻终端确实没连着券商」，这是确定性事实 —— 没有链路就没有
+        撮合，这一单本来也成交不了，拦下它零风险。
+
+        去抖（连续 N 次才认）只用于**上报的状态**：状态抖动会让后台看到
+        断联/恢复反复横跳，但闸门本身不需要这层保护。
+        """
+        try:
+            connected = self.terminal_status()["connected"]
+        except Exception:  # noqa: BLE001
+            # 读不到就放行：闸门不能因为自己出错而误伤正常交易
+            return None
+        if connected is not False:
+            return None
+        logger.error(
+            "open blocked: MT5 link offline, symbol=%s (open order not sent)",
+            symbol,
+        )
+        return {
+            "success": False,
+            "symbol": symbol,
+            "retcode": None,
+            "error": "MT5 终端与券商断连，本次开仓已拦截",
+            "link_offline": True,
+        }
 
     def account_info(self) -> dict:
         """返回账户概况（余额/净值/保证金/杠杆等）。"""
@@ -629,6 +784,9 @@ class MT5Client:
         resolved = self.resolve_symbol(symbol)
         if not resolved:
             return {"success": False, "error": f"symbol not found: {symbol}"}
+        blocked = self._link_block(symbol)
+        if blocked is not None:
+            return blocked
 
         order_type = mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL
         fillings = self.filling_modes(resolved)
@@ -781,6 +939,9 @@ class MT5Client:
         resolved = self.resolve_symbol(symbol)
         if not resolved:
             return {"success": False, "error": f"symbol not found: {symbol}"}
+        blocked = self._link_block(symbol)
+        if blocked is not None:
+            return blocked
         kind = str(kind or PENDING_LIMIT).strip().lower()
         order_type = PENDING_ORDER_TYPES.get((action, kind))
         if order_type is None:
