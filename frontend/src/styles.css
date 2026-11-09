@@ -917,6 +917,11 @@ td:first-child, th:first-child { font-family: var(--font); }
 }
 .verified-phone svg { width: 16px; height: 16px; flex-shrink: 0; }
 .register-hint { font-size: 12px; line-height: 1.45; }
+/* 必填项星号 */
+.req-mark { color: var(--danger, #ef4444); margin-left: 2px; }
+/* 输入框下方的辅助/错误提示 */
+.field-hint { font-size: 12px; line-height: 1.4; margin-top: 4px; }
+.field-hint-error { color: var(--danger, #ef4444); }
 
 /* 阿里云验证码的占位元素：SDK 要求这两个 id 存在于页面上，
    但实际渲染是它自己创建的弹层，所以把它们藏起来即可。 */
