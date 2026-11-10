@@ -15,7 +15,9 @@ const ticket = ref('')
 const nickname = ref('')
 const username = ref('')
 const password = ref('')
-// —— KYC 实名材料（姓名 / 邮箱，都可选）——
+/** 确认密码（前端二次校验，服务端不接收） */
+const confirmPassword = ref('')
+// —— KYC 实名材料（姓名 / 邮箱，均为必填）——
 const realName = ref('')
 const email = ref('')
 
@@ -204,11 +206,31 @@ async function submitRegister(): Promise<void> {
     error.value = '请先完成短信验证'
     return
   }
-  if (password.value && password.value.length < 6) {
+  if (!username.value.trim()) {
+    error.value = '请输入用户名'
+    return
+  }
+  if (!password.value) {
+    error.value = '请输入密码'
+    return
+  }
+  if (password.value.length < 6) {
     error.value = '密码至少 6 位'
     return
   }
-  if (email.value.trim() && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email.value.trim())) {
+  if (password.value !== confirmPassword.value) {
+    error.value = '两次输入的密码不一致'
+    return
+  }
+  if (!realName.value.trim()) {
+    error.value = '请输入姓名'
+    return
+  }
+  if (!email.value.trim()) {
+    error.value = '请输入邮箱'
+    return
+  }
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email.value.trim())) {
     error.value = '邮箱格式不正确'
     return
   }
@@ -218,10 +240,10 @@ async function submitRegister(): Promise<void> {
       phone: phone.value.trim(),
       ticket: ticket.value,
       nickname: nickname.value.trim() || null,
-      username: username.value.trim() || null,
-      password: password.value || null,
-      real_name: realName.value.trim() || null,
-      email: email.value.trim() || null,
+      username: username.value.trim(),
+      password: password.value,
+      real_name: realName.value.trim(),
+      email: email.value.trim(),
     })
     done.value = true
     pendingApproval.value = result.pending_approval
@@ -339,34 +361,48 @@ function backToPhone(): void {
           <input v-model="nickname" maxlength="64" placeholder="展示名称" />
         </div>
         <div class="input-group">
-          <label>用户名（可选）</label>
-          <input v-model="username" maxlength="32" placeholder="留空则自动生成" />
+          <label>用户名 <span class="req-mark">*</span></label>
+          <input v-model="username" maxlength="32" autocomplete="username" placeholder="请输入用户名" />
         </div>
         <div class="input-group">
-          <label>密码（可选）</label>
+          <label>密码 <span class="req-mark">*</span></label>
           <input
             v-model="password"
             type="password"
             autocomplete="new-password"
-            placeholder="留空则只能用验证码登录"
+            placeholder="至少 6 位"
           />
         </div>
+        <div class="input-group">
+          <label>确认密码 <span class="req-mark">*</span></label>
+          <input
+            v-model="confirmPassword"
+            type="password"
+            autocomplete="new-password"
+            placeholder="再次输入密码"
+          />
+          <div
+            v-if="confirmPassword && password !== confirmPassword"
+            class="muted field-hint field-hint-error"
+          >
+            两次输入的密码不一致
+          </div>
+        </div>
 
-        <!-- KYC 实名材料（姓名 / 邮箱，都可选） -->
+        <!-- KYC 实名材料（姓名 / 邮箱，均为必填） -->
         <div v-if="resubmitMode" class="alert alert-warn">
           上次实名审核未通过：{{ rejectReason || '请重新提交实名材料' }}
         </div>
         <div class="input-group">
-          <label>姓名（选填，用于实名审核）</label>
+          <label>姓名 <span class="req-mark">*</span></label>
           <input v-model="realName" maxlength="64" placeholder="真实姓名" />
         </div>
         <div class="input-group">
-          <label>邮箱（选填）</label>
+          <label>邮箱 <span class="req-mark">*</span></label>
           <input v-model="email" type="email" autocomplete="email" placeholder="用于接收通知" />
         </div>
         <div class="muted register-hint">
-          留空密码时系统会生成随机强密码，该账号只能通过手机号验证码登录。<br />
-          填写姓名后需经管理员实名审核通过才能登录。
+          用户名、密码、姓名、邮箱均为必填项。填写姓名后需经管理员实名审核通过才能登录。
         </div>
         <div v-if="error" class="alert alert-error">{{ error }}</div>
         <div class="row login-actions">

@@ -21,6 +21,7 @@ from . import (
     group_rules,
     market_probe,
     mt5_identity,
+    mt5_link,
     node_service,
     node_credentials,
     node_lifecycle,
@@ -358,6 +359,10 @@ async def _save_account_active(node_id: str, ws: WebSocket, data: dict) -> None:
         "updated_at": time.time(),
         # 券商 MT5 服务器相对 UTC 的偏移（秒）；用于把后台 UTC 时间显示成终端订单时间
         "server_time_offset": data.get("server_time_offset"),
+        # 终端 ↔ 券商链路状态：online / offline / unknown。
+        # 断联时下单回执不可靠，节点据此在发单前拦下开仓（见 node_client 闸门）。
+        "mt5_link": mt5_link_state(data),
+        "mt5_link_at": data.get("mt5_link_at"),
     }
     await store.save_account(node_id, snapshot)
     if books_ok:
@@ -384,6 +389,15 @@ def _magics_of(rows: list) -> set[int]:
         except (TypeError, ValueError):
             continue
     return out
+
+
+def mt5_link_state(data: dict) -> str:
+    """节点上报的终端链路状态；缺失或非法一律按 unknown。
+
+    unknown 的含义是「不知道」：服务端据此照常下发，由节点侧闸门最终把关。
+    把 unknown 当成 offline 会误伤所有还没升级的旧节点。
+    """
+    return mt5_link.normalize_link_state((data or {}).get("mt5_link"))
 
 
 def _snapshot_books_readable(data: dict) -> bool:

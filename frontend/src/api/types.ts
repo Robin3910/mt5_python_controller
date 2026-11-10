@@ -2190,6 +2190,49 @@ export interface PhoneRegisterPayload {
 }
 
 // ---------------------------------------------------------------------------
+// 自助改绑手机号
+// ---------------------------------------------------------------------------
+
+/**
+ * 改绑发码的目标号码：
+ * - 'new' 码发到**新**号（验证新号所有权）
+ * - 'old' 码发到**当前绑定的旧**号（验证本人身份的第二条路径）
+ */
+export type PhoneRebindTarget = 'new' | 'old'
+
+/**
+ * 改绑的「本人身份」验证方式（二选一）：
+ * - 'password' 登录密码（开了 2FA 时还要 totp_code）
+ * - 'old_code' 旧手机号收到的验证码（手机号注册且未设密码的用户走这条）
+ */
+export type PhoneRebindAuthMethod = 'password' | 'old_code'
+
+/** POST /api/me/phone/verify-new 的响应 */
+export interface PhoneRebindTicketResult {
+  ok: boolean
+  /** 「新号已验证」票据（绑定 uid + 新号，10 分钟有效） */
+  ticket: string
+  /** 票据有效期（秒） */
+  expire_in: number
+}
+
+export interface PhoneRebindPayload {
+  new_phone: string
+  ticket: string
+  auth_method: PhoneRebindAuthMethod
+  password?: string
+  totp_code?: string
+  old_code?: string
+}
+
+/** POST /api/me/phone/rebind 的响应 */
+export interface PhoneRebindResult {
+  ok: boolean
+  /** 改绑后的脱敏号码（展示用） */
+  phone: string
+}
+
+// ---------------------------------------------------------------------------
 // 注册用户 KYC 实名审核
 // ---------------------------------------------------------------------------
 

@@ -8,6 +8,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { confirmAction } from '@/utils/confirm'
+import PhoneRebindModal from '@/components/PhoneRebindModal.vue'
 
 const auth = useAuthStore()
 const router = useRouter()
@@ -63,6 +64,22 @@ async function saveProfile(): Promise<void> {
     profileError.value = err?.response?.data?.detail || '保存失败，请稍后重试'
   } finally {
     profileSaving.value = false
+  }
+}
+
+// ── 修改绑定手机号 ──────────────────────────────────────────────
+const rebindOpen = ref(false)
+
+function openRebind(): void {
+  rebindOpen.value = true
+}
+
+/** 改绑成功后刷新当前用户（/api/me 返回脱敏号码，正好用于展示） */
+async function onRebindSuccess(): Promise<void> {
+  try {
+    await auth.fetchMe()
+  } catch {
+    /* 刷新失败不影响已完成的改绑，忽略 */
   }
 }
 
@@ -355,9 +372,9 @@ onMounted(load2faStatus)
               class="pf-input"
               :value="auth.me?.phone || '未绑定'"
               readonly
-              title="自助改绑需短信验证，暂未开放"
+              title="改绑需短信验证，请点击「修改手机号」"
             />
-            <p class="pf-hint">自助改绑需短信验证，暂未开放</p>
+            <p class="pf-hint">改绑需短信验证，请点击下方「修改手机号」</p>
           </div>
           <div>
             <label class="pf-label" for="pf-email">邮箱</label>
@@ -383,7 +400,10 @@ onMounted(load2faStatus)
         </li>
         <li>
           <span class="pf-list-k">电话</span>
-          <span class="pf-list-v">{{ auth.me?.phone || '未绑定' }}</span>
+          <span class="pf-list-v pf-list-phone">
+            {{ auth.me?.phone || '未绑定' }}
+            <button type="button" class="pf-btn pf-btn-mini" @click="openRebind">修改手机号</button>
+          </span>
         </li>
         <li>
           <span class="pf-list-k">邮箱</span>
@@ -565,6 +585,9 @@ onMounted(load2faStatus)
     </section>
 
     <p v-if="savedFlag" class="profile-flash">{{ savedFlag }}</p>
+
+    <!-- 自助改绑手机号 -->
+    <PhoneRebindModal :open="rebindOpen" @close="rebindOpen = false" @success="onRebindSuccess" />
   </div>
 </template>
 
@@ -679,6 +702,14 @@ onMounted(load2faStatus)
   text-align: center;
   font-size: 11px;
   color: #22c55e;
+}
+
+/* ── 电话行：号码 + 「修改手机号」按钮 ── */
+.pf-list-phone {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  overflow: visible;
 }
 
 /* ── 移动端 ── */

@@ -40,6 +40,7 @@ from . import (
     group_persist,
     group_rules,
     market_probe,
+    mt5_link,
     permissions,
     persist,
     rbac_service,
@@ -927,6 +928,15 @@ class GroupDispatcher:
                 return {"node_id": node_id, "status": "skipped", "magic": None,
                         "volume": volume, "reason": reason}
 
+        # 链路闸门（服务端侧）：终端与券商断联的节点不下发开仓指令。
+        # 断联期间下单回执不可靠，订单却可能已成交 —— 发了就可能留下孤儿仓。
+        # 这里只是「不浪费一次下发」，真正把关的是节点侧闸门（那里离下单最近）。
+        blocked = await self._link_offline_block(
+            node_id, base, volume, release_busy=not concurrent,
+        )
+        if blocked is not None:
+            return blocked
+
         # 趋势风控：建子任务前，按该节点终端行情做顺势门禁
         if group.get("trend_risk_enabled"):
             blocked = await self._trend_risk_block(
@@ -947,6 +957,38 @@ class GroupDispatcher:
             logger.warning("group %s node %s dispatch failed: %s", group_id, node_id, e)
             return {"node_id": node_id, "status": "offline", "magic": None,
                     "volume": volume, "reason": "下发失败：节点处理异常"}
+
+    async def _link_offline_block(
+        self, node_id: str, base: dict, volume: float, *, release_busy: bool = True,
+    ) -> Optional[dict]:
+        """终端与券商断联的节点不下发开仓指令；可下发返回 None。
+
+        判据是节点最近一次上报的账户快照里的 mt5_link 字段。**状态过期或
+        缺失一律放行** —— 服务端看到的是滞后信息，拿它当权威会把节点误伤。
+        真正把关的是节点侧闸门（离下单最近）。
+
+        这一层的价值在于：不给断联节点白白发指令、抢占位、建子任务，
+        并且后台能提前看到「这个节点现在断联了」。
+        """
+        try:
+            snapshot = await self.store.get_account(node_id) or {}
+        except Exception:  # noqa: BLE001
+            logger.debug("read account snapshot for %s failed", node_id, exc_info=True)
+            return None
+        reason = mt5_link.link_offline_reason(snapshot)
+        if not reason:
+            return None
+        if release_busy:
+            await self.store.release_group_node_busy(base["group_id"], node_id)
+        await group_persist.record_skipped_dispatch(
+            **base, status="skipped", skip_reason=reason,
+            skip_code=signal_codes.SKIP_LINK_OFFLINE,
+        )
+        logger.info("group node %s link offline, skip dispatch: %s", node_id, reason)
+        return {
+            "node_id": node_id, "status": "skipped", "magic": None,
+            "volume": volume, "reason": reason,
+        }
 
     async def _trend_risk_block(
         self,

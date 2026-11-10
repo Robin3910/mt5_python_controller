@@ -2,6 +2,10 @@ import { defineStore } from 'pinia'
 import api from '@/api/client'
 import type {
   MeInfo,
+  PhoneRebindPayload,
+  PhoneRebindResult,
+  PhoneRebindTarget,
+  PhoneRebindTicketResult,
   PhoneRegisterPayload,
   PhoneRegisterResult,
   ProfileUpdate,
@@ -201,6 +205,45 @@ export const useAuthStore = defineStore('auth', {
       }
       this.setToken(data.token)
       return { requires2fa: false }
+    },
+
+    // ----------------- 自助改绑手机号 -----------------
+    /**
+     * 发送改绑验证码。
+     *
+     * target='new' → 码发到新号（验证新号所有权）；
+     * target='old' → 码发到当前绑定的旧号（验证本人身份）。
+     *
+     * 走**改绑专属接口**而不是公开的 /api/auth/sms/send —— 后者无鉴权，
+     * 带不进「按账号」的改绑发码配额。
+     *
+     * target='old' 时不用传 phone：旧号由服务端按当前绑定号码取（前端只拿
+     * 得到脱敏号，不该让前端持有明文）。
+     */
+    async sendRebindCode(
+      target: PhoneRebindTarget,
+      phone: string,
+      captchaVerifyParam?: string,
+    ): Promise<{ expire_in: number; cooldown: number }> {
+      const payload: Record<string, unknown> = { target }
+      if (target === 'new' && phone) payload.phone = phone
+      if (captchaVerifyParam) payload.captcha_verify_param = captchaVerifyParam
+      const { data } = await api.post('/api/me/phone/send-code', payload)
+      return { expire_in: data.expire_in, cooldown: data.cooldown }
+    },
+    /** 校验新号验证码 → 换发改绑票据（绑定 uid + 新号，10 分钟有效） */
+    async verifyRebindNewPhone(phone: string, code: string): Promise<PhoneRebindTicketResult> {
+      const { data } = await api.post<PhoneRebindTicketResult>('/api/me/phone/verify-new', {
+        phone,
+        code,
+      })
+      return data
+    },
+    /** 最终提交改绑；成功后刷新 me（列表里的号码即时更新） */
+    async rebindPhone(payload: PhoneRebindPayload): Promise<PhoneRebindResult> {
+      const { data } = await api.post<PhoneRebindResult>('/api/me/phone/rebind', payload)
+      await this.fetchMe()
+      return data
     },
   },
 })

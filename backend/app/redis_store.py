@@ -78,6 +78,9 @@ K_SMS_LOCK = "sms:lock:{}"
 K_SMS_SEND_TOTAL = "sms:sendtotal:{}"
 # 人机验证失败计数：{ip}:{YYYYMMDDHH} -> int（连续失败多则强制滑块）
 K_SMS_CAPTCHA_FAIL = "sms:capfail:{}:{}"
+# 改绑发码配额：{user_id}:{YYYYMMDD} -> int（同一账号 24h 内改绑发码次数上限）
+# 与「按号码」的限频正交：一个被盗账号可以绑定多个号码，得按账号单独设闸。
+K_SMS_REBIND_QUOTA = "sms:rebindquota:{}:{}"
 
 
 class RedisStore:
@@ -616,4 +619,24 @@ class RedisStore:
         return bool(await self.r.set(K_SMS_LOCK.format(phone), "1", nx=True, ex=ttl))
 
     async def release_sms_lock(self, phone: str) -> None:
+        """释放发送冷却锁。"""
         await self.r.delete(K_SMS_LOCK.format(phone))
+
+    # ----------------- 改绑发码配额（按账号） -----------------
+    async def incr_rebind_quota(self, user_id: int, day: str, ttl: int) -> int:
+        """改绑发码配额 +1，返回当前值（已含本次）。
+
+        按 **账号** 而不是按号码统计：一个被盗账号可以换着号码发码，只按号码
+        设闸挡不住它。ttl 覆盖到当天结束。
+        """
+        key = K_SMS_REBIND_QUOTA.format(int(user_id), day)
+        value = await self.r.incr(key)
+        if int(value) == 1:
+            await self.r.expire(key, ttl)
+        return int(value)
+
+    async def get_rebind_quota(self, user_id: int, day: str) -> int:
+        """当前账号今日的改绑发码次数（只读）。"""
+        return await self.get_sms_send_counter(
+            K_SMS_REBIND_QUOTA.format(int(user_id), day)
+        )

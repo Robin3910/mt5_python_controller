@@ -214,8 +214,13 @@ async def update_user(
         await rbac_service.revoke_sessions(store, updated.username)
     elif body.is_active is not None:
         await rbac_service.invalidate_principals(store, [updated.username])
+    # 审计参数里的手机号要脱敏：明文号码只应留在 users.phone 一处，
+    # 否则操作审计表会变成明文号码的第二个副本。
+    audit_params = body.model_dump(exclude_none=True)
+    if audit_params.get("phone"):
+        audit_params["phone"] = mask_phone(phone_arg or "")
     await persist.audit(
-        p.username, "update_user", updated.username, body.model_dump(exclude_none=True), "ok",
+        p.username, "update_user", updated.username, audit_params, "ok",
         client_ip(request), category="auth", before=before, after=_snapshot(updated, roles),
     )
     return await _user_out(store, updated)

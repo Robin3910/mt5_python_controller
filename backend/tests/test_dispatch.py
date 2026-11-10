@@ -1,4 +1,6 @@
 """Integration tests for the dispatcher (sync + poll) using fakeredis + stub manager."""
+import time
+
 import fakeredis
 import pytest
 
@@ -138,6 +140,51 @@ async def test_position_gate_skips_node_with_position(store, monkeypatch):
     d = Dispatcher(store)
     await d.dispatch(TradingSignal(action="BUY", symbol="EURUSD", volume=0.1), "sig2")
     assert sent == []  # gated, nothing sent
+
+
+async def test_link_offline_node_is_not_sent(store, monkeypatch):
+    """终端与券商断联的节点不下发开仓指令。
+
+    断联期间下单回执不可靠，订单却可能已成交 —— 发了就可能留下孤儿仓。
+    """
+    await _online(store, mk_node("nd_a"))
+    await store.save_account("nd_a", {
+        "positions": [], "prices": dict(_DEFAULT_PRICES),
+        "mt5_link": "offline", "updated_at": time.time(),
+    })
+    await set_symbol_filters(store, "EURUSD", mode="sync")
+    sent = []
+
+    async def fake_send(node_id, msg):
+        sent.append((node_id, msg))
+        return True
+
+    monkeypatch.setattr(manager, "send_to_node", fake_send)
+
+    d = Dispatcher(store)
+    await d.dispatch(TradingSignal(action="BUY", symbol="EURUSD", volume=0.1), "sig_link")
+    assert sent == []
+
+
+async def test_link_unknown_node_is_still_sent(store, monkeypatch):
+    """状态不明（unknown / 缺失）照常下发：不能因为读不到就误伤节点。"""
+    await _online(store, mk_node("nd_a"))
+    await store.save_account("nd_a", {
+        "positions": [], "prices": dict(_DEFAULT_PRICES),
+        "mt5_link": "unknown", "updated_at": time.time(),
+    })
+    await set_symbol_filters(store, "EURUSD", mode="sync")
+    sent = []
+
+    async def fake_send(node_id, msg):
+        sent.append((node_id, msg))
+        return True
+
+    monkeypatch.setattr(manager, "send_to_node", fake_send)
+
+    d = Dispatcher(store)
+    await d.dispatch(TradingSignal(action="BUY", symbol="EURUSD", volume=0.1), "sig_link2")
+    assert [s[0] for s in sent] == ["nd_a"]
 
 
 async def test_global_lot_overrides_volume(store, monkeypatch):
