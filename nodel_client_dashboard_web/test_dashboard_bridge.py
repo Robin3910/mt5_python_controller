@@ -360,6 +360,343 @@ def test_auto_login_skipped_without_credentials(tmp_path, monkeypatch) -> None:
     print("[ok] 未配账号密码时不自动登录")
 
 
+# ── 手机验证码登录 ──
+
+
+def test_sms_status_disabled_when_backend_unreachable(tmp_path, monkeypatch) -> None:
+    """后端不可达时 /api/sms/status 必须说「不可用」，不能抛 500。
+
+    短信服务只是个**可选入口**：它没开不该让整个登录页报错，
+    前端据此隐藏 Tab 即可。
+    """
+    import store
+
+    monkeypatch.setattr(store, "data_dir", lambda: tmp_path)
+    (tmp_path / ".env").write_text(
+        "APP_URL=http://127.0.0.1:9/unreachable\n", encoding="utf-8"
+    )
+    bridge = DashboardBridge()
+    bridge.start()
+    try:
+        payload = _get(bridge, "/api/sms/status")
+        assert payload.get("enabled") is False, payload
+        assert payload.get("reason"), payload
+    finally:
+        bridge.stop()
+    print("[ok] 后端不可达时短信入口标记为不可用")
+
+
+def test_sms_status_disabled_by_env_switch(tmp_path, monkeypatch) -> None:
+    """DASHBOARD_SMS_LOGIN=0 时短信入口必须关闭，且**不**打后端。"""
+    import store
+
+    monkeypatch.setattr(store, "data_dir", lambda: tmp_path)
+    (tmp_path / ".env").write_text(
+        "APP_URL=http://example.test\nDASHBOARD_SMS_LOGIN=0\n", encoding="utf-8"
+    )
+    bridge = DashboardBridge()
+    bridge._load_auto_login()
+    assert bridge._sms_login_enabled is False
+    bridge.start()
+    try:
+        payload = _get(bridge, "/api/sms/status")
+        assert payload.get("enabled") is False, payload
+    finally:
+        bridge.stop()
+    print("[ok] DASHBOARD_SMS_LOGIN=0 时关闭验证码入口")
+
+
+def test_sms_status_enabled_by_default(tmp_path, monkeypatch) -> None:
+    """没配 DASHBOARD_SMS_LOGIN 时默认开启（缺省即开）。"""
+    import store
+
+    monkeypatch.setattr(store, "data_dir", lambda: tmp_path)
+    (tmp_path / ".env").write_text("APP_URL=http://example.test\n", encoding="utf-8")
+    bridge = DashboardBridge()
+    bridge._load_auto_login()
+    assert bridge._sms_login_enabled is True
+    print("[ok] 未配 DASHBOARD_SMS_LOGIN 时默认开启验证码登录")
+
+
+def test_sms_send_rejects_bad_phone(tmp_path, monkeypatch) -> None:
+    """手机号格式非法要拦在前面，给出中文文案，不打后端。"""
+    import store
+
+    monkeypatch.setattr(store, "data_dir", lambda: tmp_path)
+    (tmp_path / ".env").write_text("APP_URL=http://example.test\n", encoding="utf-8")
+    bridge = DashboardBridge()
+    bridge.start()
+    try:
+        try:
+            _post(bridge, "/api/sms/send", {"phone": "12345"})
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 400, f"期望 400，实际 {exc.code}"
+            payload = json.loads(exc.read().decode("utf-8"))
+            assert "手机号" in payload.get("error", ""), payload
+        else:
+            raise AssertionError("非法手机号竟返回了 200")
+    finally:
+        bridge.stop()
+    print("[ok] 非法手机号被拦下并给出中文文案")
+
+
+def test_sms_endpoints_reject_when_switch_off(tmp_path, monkeypatch) -> None:
+    """开关关掉后，所有短信接口都必须拒绝。"""
+    import store
+
+    monkeypatch.setattr(store, "data_dir", lambda: tmp_path)
+    (tmp_path / ".env").write_text(
+        "APP_URL=http://example.test\nDASHBOARD_SMS_LOGIN=0\n", encoding="utf-8"
+    )
+    bridge = DashboardBridge()
+    bridge._load_auto_login()
+    bridge.start()
+    try:
+        for path, body in (
+            ("/api/sms/send", {"phone": "13800138000"}),
+            ("/api/sms/verify", {"phone": "13800138000", "code": "123456"}),
+            ("/api/sms/login", {"phone": "13800138000", "ticket": "t"}),
+            ("/api/sms/2fa", {"login_token": "t", "code": "123456"}),
+        ):
+            try:
+                _post(bridge, path, body)
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 403, f"{path} 期望 403，实际 {exc.code}"
+            else:
+                raise AssertionError(f"{path} 在关闭状态下竟返回了 200")
+    finally:
+        bridge.stop()
+    print("[ok] 开关关闭时短信接口全部拒绝")
+
+
+def test_sms_verify_reports_unregistered_phone(tmp_path, monkeypatch) -> None:
+    """号码未注册时，桥接层原样透传「去管理后台注册」的提示。
+
+    面板只做登录，不做注册 —— 所以不能自己判定「已注册/未注册」，
+    只能采信后端的 next_action。
+    """
+    import store
+    import dashboard_bridge as bridge_mod
+
+    monkeypatch.setattr(store, "data_dir", lambda: tmp_path)
+    (tmp_path / ".env").write_text("APP_URL=http://example.test\n", encoding="utf-8")
+
+    class _FakeApi:
+        base = "http://example.test"
+
+        def sms_verify(self, phone, code, purpose="auth"):
+            return {"ticket": "tk", "next_action": "register"}
+
+    monkeypatch.setattr(bridge_mod, "DashboardAPI", lambda base, **kw: _FakeApi())
+
+    bridge = DashboardBridge()
+    bridge.start()
+    try:
+        payload = _post(
+            bridge, "/api/sms/verify", {"phone": "13800138000", "code": "123456"}
+        )
+        assert payload.get("ok") is False, payload
+        assert payload.get("next_action") == "register", payload
+        assert "管理后台" in payload.get("message", ""), payload
+        # 未注册时不该把票据递给前端。
+        assert payload.get("ticket") == "", payload
+    finally:
+        bridge.stop()
+    print("[ok] 号码未注册时提示去管理后台注册")
+
+
+def test_sms_login_requires_2fa_second_step(tmp_path, monkeypatch) -> None:
+    """开了 2FA 的用户：短信登录要停在 2FA 这一步，不能直接建会话。"""
+    import store
+    import dashboard_bridge as bridge_mod
+
+    monkeypatch.setattr(store, "data_dir", lambda: tmp_path)
+    (tmp_path / ".env").write_text("APP_URL=http://example.test\n", encoding="utf-8")
+
+    class _FakeApi:
+        base = "http://example.test"
+
+        def sms_login(self, phone, ticket="", code=""):
+            return {"requires_2fa": True, "login_token": "2fa-pending-token"}
+
+    monkeypatch.setattr(bridge_mod, "DashboardAPI", lambda base, **kw: _FakeApi())
+
+    bridge = DashboardBridge()
+    bridge.start()
+    try:
+        payload = _post(
+            bridge, "/api/sms/login", {"phone": "13800138000", "ticket": "tk"}
+        )
+        assert payload.get("ok") is False, payload
+        assert payload.get("requires_2fa") is True, payload
+        assert payload.get("login_token") == "2fa-pending-token", payload
+        # 中间态要被桥接层记住，供第二步 /api/sms/2fa 使用。
+        assert bridge._sms_pending_token == "2fa-pending-token"
+    finally:
+        bridge.stop()
+    print("[ok] 短信登录的 2FA 中间态被正确保存")
+
+
+def test_sms_2fa_establishes_session(tmp_path, monkeypatch) -> None:
+    """2FA 第二步通过后要真正建立会话（与账号密码链路一致）。"""
+    import store
+    import dashboard_bridge as bridge_mod
+    from e2e_support import FakeSession
+
+    monkeypatch.setattr(store, "data_dir", lambda: tmp_path)
+    (tmp_path / ".env").write_text("APP_URL=http://example.test\n", encoding="utf-8")
+
+    class _FakeApi:
+        base = "http://example.test"
+
+        def login_2fa(self, login_token, code):
+            assert login_token == "2fa-pending-token", login_token
+            return {"token": "final-jwt"}
+
+    monkeypatch.setattr(bridge_mod, "DashboardAPI", lambda base, **kw: _FakeApi())
+
+    bridge = DashboardBridge()
+    session = FakeSession()
+    bridge.session = session
+    bridge.manager.session = session
+    established: list[str] = []
+    session.establish = lambda api, token, **kw: established.append(token)
+    bridge._load_permitted_instances = lambda: None
+    bridge.start()
+    try:
+        payload = _post(
+            bridge,
+            "/api/sms/2fa",
+            {"login_token": "2fa-pending-token", "code": "123456"},
+        )
+        assert payload.get("ok") is True, payload
+        assert established == ["final-jwt"], established
+    finally:
+        bridge.stop()
+    print("[ok] 短信 2FA 第二步通过后建立会话")
+
+
+def test_sms_login_2fa_without_pending_token_rejected(tmp_path, monkeypatch) -> None:
+    """没有中间态就调 /api/sms/2fa 必须报 401，不能 500。"""
+    import store
+
+    monkeypatch.setattr(store, "data_dir", lambda: tmp_path)
+    (tmp_path / ".env").write_text("APP_URL=http://example.test\n", encoding="utf-8")
+    bridge = DashboardBridge()
+    bridge.start()
+    try:
+        try:
+            _post(bridge, "/api/sms/2fa", {"login_token": "", "code": "123456"})
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 401, f"期望 401，实际 {exc.code}"
+        else:
+            raise AssertionError("无中间态的 2FA 竟返回了 200")
+    finally:
+        bridge.stop()
+    print("[ok] 无 2FA 中间态时返回 401")
+
+
+def test_logout_clears_sms_pending_token(tmp_path, monkeypatch) -> None:
+    """退出登录要清掉短信的 2FA 中间态，不能留在内存里等人捡。"""
+    import store
+
+    monkeypatch.setattr(store, "data_dir", lambda: tmp_path)
+    (tmp_path / ".env").write_text("APP_URL=http://example.test\n", encoding="utf-8")
+
+    class _StubSession:
+        """只实现 logout 用到的两个成员。"""
+
+        def perform(self, action, cfg, fn, **kwargs):
+            return fn()
+
+        def lock(self, reason, *, clear_token=False):
+            return None
+
+    bridge = DashboardBridge()
+    bridge.session = _StubSession()
+    bridge._sms_pending_token = "2fa-pending-token"
+    try:
+        bridge.logout()
+        assert bridge._sms_pending_token == ""
+    finally:
+        bridge.stop()
+    print("[ok] 退出登录会清掉短信 2FA 中间态")
+
+
+def test_password_login_2fa_uses_pending_token(tmp_path, monkeypatch) -> None:
+    """账号密码链路的 2FA 第二步：桥接层用记住的中间态换 token。
+
+    前端第二步只带 TOTP 码（不带账号密码），中间态凭证只在桥接层内存里。
+    """
+    import store
+    import dashboard_bridge as bridge_mod
+
+    monkeypatch.setattr(store, "data_dir", lambda: tmp_path)
+    (tmp_path / ".env").write_text("APP_URL=http://example.test\n", encoding="utf-8")
+
+    calls: list[tuple] = []
+
+    class _FakeApi:
+        base = "http://example.test"
+
+        def login(self, username, password):
+            calls.append(("login", username, password))
+            return {"requires_2fa": True, "login_token": "pending-2fa"}
+
+        def login_2fa(self, login_token, code):
+            calls.append(("login_2fa", login_token, code))
+            return {"token": "final-jwt"}
+
+    monkeypatch.setattr(bridge_mod, "DashboardAPI", lambda base, **kw: _FakeApi())
+
+    bridge = DashboardBridge()
+    from e2e_support import FakeSession
+
+    session = FakeSession()
+    bridge.session = session
+    bridge.manager.session = session
+    bridge._load_permitted_instances = lambda: None
+    bridge.start()
+    try:
+        # 第一步：账号密码 → 要求 2FA
+        first = _post(bridge, "/api/login", {"username": "u", "password": "p"})
+        assert first.get("requires_2fa") is True, first
+        assert bridge._login_pending_token == "pending-2fa"
+
+        # 第二步：只带 TOTP 码
+        second = _post(bridge, "/api/login", {"username": "", "password": "", "code": "123456"})
+        assert second.get("requires_2fa") is False, second
+        assert ("login_2fa", "pending-2fa", "123456") in calls, calls
+    finally:
+        bridge.stop()
+    print("[ok] 账号密码链路的 2FA 第二步用中间态换 token")
+
+
+def test_password_login_2fa_without_pending_token_rejected(tmp_path, monkeypatch) -> None:
+    """没有中间态就只带 TOTP 码调 /api/login，必须报 401。
+
+    否则空账号密码会被当成密码登录，错误文案会误导用户。
+    """
+    import store
+
+    monkeypatch.setattr(store, "data_dir", lambda: tmp_path)
+    (tmp_path / ".env").write_text("APP_URL=http://example.test\n", encoding="utf-8")
+    bridge = DashboardBridge()
+    bridge.start()
+    try:
+        try:
+            _post(bridge, "/api/login", {"username": "", "password": "", "code": "123456"})
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 401, f"期望 401，实际 {exc.code}"
+            payload = json.loads(exc.read().decode("utf-8"))
+            assert "重新登录" in payload.get("error", ""), payload
+        else:
+            raise AssertionError("无中间态的 2FA 竟返回了 200")
+    finally:
+        bridge.stop()
+    print("[ok] 无 2FA 中间态的账号密码登录返回 401")
+
+
 # ── 面板指标（今日信号 / 平均延迟）与节点卡片字段 ──
 
 
@@ -671,6 +1008,18 @@ if __name__ == "__main__":
         test_config_status_reads_app_url,
         test_auto_login_reads_credentials,
         test_auto_login_skipped_without_credentials,
+        test_sms_status_disabled_when_backend_unreachable,
+        test_sms_status_disabled_by_env_switch,
+        test_sms_status_enabled_by_default,
+        test_sms_send_rejects_bad_phone,
+        test_sms_endpoints_reject_when_switch_off,
+        test_sms_verify_reports_unregistered_phone,
+        test_sms_login_requires_2fa_second_step,
+        test_sms_2fa_establishes_session,
+        test_sms_login_2fa_without_pending_token_rejected,
+        test_logout_clears_sms_pending_token,
+        test_password_login_2fa_uses_pending_token,
+        test_password_login_2fa_without_pending_token_rejected,
         test_snapshot_includes_stats_metrics,
         test_snapshot_without_stats_shows_placeholders,
         test_stats_cache_avoids_repeated_backend_calls,

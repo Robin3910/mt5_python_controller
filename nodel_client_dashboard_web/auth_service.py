@@ -24,6 +24,21 @@ _HTTP_DETAIL = {
         "missing bearer token": "登录已失效，请重新登录",
         "invalid or expired token": "登录已失效，请重新登录",
     },
+    # 短信登录链路的 detail（后端 phone_auth / sms_service）。
+    # 这些文案本身就是中文，映射过来是为了让面板文案统一，
+    # 同时避免把后端原始 detail 直出到界面。
+    400: {
+        "验证码错误或已过期": "验证码错误或已过期",
+        "手机号格式不正确": "请输入正确的 11 位手机号",
+        "手机号不能为空": "请输入正确的 11 位手机号",
+        "请输入验证码": "请输入验证码",
+    },
+    403: {
+        "账号已被禁用，请联系管理员": "账号已被禁用，请联系管理员",
+    },
+    404: {
+        "该手机号尚未注册": "该手机号尚未注册，请在管理后台注册",
+    },
 }
 _HTTP_STATUS = {
     401: "登录已失效，请重新登录",
@@ -35,10 +50,23 @@ _HTTP_STATUS = {
 
 def message_for_status(status: int, detail: str = "") -> str:
     """把后端状态码翻成面板文案。登录失败不能显示成会话过期。"""
-    known = _HTTP_DETAIL.get(status, {}).get(str(detail or "").strip())
+    text = str(detail or "").strip()
+    known = _HTTP_DETAIL.get(status, {}).get(text)
     if known:
         return known
+    # 后端中文 detail 本身就是给用户看的文案（如限频提示「操作过于频繁，请 60 秒后再试」，
+    # 短信的「手机号格式不正确」）。这类直接透传，不必逐条硬编码 ——
+    # 限频文案带动态数字，逐条枚举必然漏。
+    # 英文 detail（如 "not found"）不透传：它不是用户可读文案，
+    # 交给下面的状态码兜底。
+    if text and _has_cjk(text):
+        return text
     return _HTTP_STATUS.get(status, f"后端请求失败（HTTP {status}）")
+
+
+def _has_cjk(text: str) -> bool:
+    """判断字符串里是否含中日韩字符。"""
+    return any("一" <= ch <= "鿿" for ch in text)
 
 
 def _error_detail(exc: HTTPError) -> str:
@@ -92,6 +120,58 @@ class DashboardAPI:
 
     def login_2fa(self, login_token: str, code: str) -> dict:
         return self.request("/api/login/2fa", method="POST", body={"login_token": login_token, "totp_code": code})
+
+    # ── 手机号验证码登录 ──
+    # 后端接口见 backend/app/phone_auth.py：
+    #   GET  /api/auth/sms/status          短信服务是否可用
+    #   POST /api/auth/sms/send            发验证码
+    #   POST /api/auth/sms/verify          校验码 → 票据 + 下一步走向
+    #   POST /api/auth/sms/login           票据/码 → JWT（或要求 2FA）
+    #
+    # 「一次验证码、两种去向」：登录与注册共用同一种验证码，
+    # 校验通过后由服务端根据号码是否已注册告知去向（见 next_action）。
+    # 面板只做登录，不做注册 —— 未注册时提示去管理后台注册。
+
+    def sms_status(self) -> dict:
+        """短信服务可用性。
+
+        后端未配置短信时这个接口返回 404（detail="not found"）——
+        那是「没开这个功能」，不是错误，所以这里自己吞掉，
+        统一返回 enabled=False，让前端据此隐藏验证码入口。
+        """
+        try:
+            return self.request("/api/auth/sms/status")
+        except DashboardAuthError as exc:
+            if exc.status in (404, 405):
+                return {"enabled": False}
+            raise
+
+    def sms_send(self, phone: str, purpose: str = "auth") -> dict:
+        """发送验证码。返回 {ok, expire_in, cooldown}。"""
+        return self.request(
+            "/api/auth/sms/send", method="POST", body={"phone": phone, "purpose": purpose}
+        )
+
+    def sms_verify(self, phone: str, code: str, purpose: str = "auth") -> dict:
+        """校验验证码。返回 {ticket, next_action, ...}。"""
+        return self.request(
+            "/api/auth/sms/verify",
+            method="POST",
+            body={"phone": phone, "code": code, "purpose": purpose},
+        )
+
+    def sms_login(self, phone: str, ticket: str = "", code: str = "") -> dict:
+        """验证码登录：票据或明文码换 JWT。
+
+        已开启 2FA 的用户返回 {requires_2fa: True, login_token: ...}，
+        面板据此转第二步（见 login_2fa）。
+        """
+        body: dict = {"phone": phone}
+        if ticket:
+            body["ticket"] = ticket
+        if code:
+            body["code"] = code
+        return self.request("/api/auth/sms/login", method="POST", body=body)
 
     def me(self, token: str) -> dict:
         return self.request("/api/me", token=token)

@@ -114,6 +114,52 @@ export interface ConfigStatus {
   error: string
 }
 
+/**
+ * 短信登录可用性。
+ *
+ * `enabled` 为 false 时前端**不渲染**「验证码登录」Tab
+ * —— 短信服务没开时把入口露出来，点了只会报错。
+ */
+export interface SmsStatus {
+  enabled: boolean
+  /** 不可用的原因（enabled=false 时给用户看的一句话）。 */
+  reason: string
+  /** 验证码有效期（秒）。 */
+  code_ttl_seconds: number
+  /** 重发冷却（秒）。 */
+  send_interval_seconds: number
+}
+
+/**
+ * 验证码校验结果。
+ *
+ * next_action 由后端根据「该号码是否已注册」决定：
+ * - login            已注册且已启用 → 继续走 smsLogin
+ * - register         未注册       → 提示去管理后台注册
+ * - pending_approval 已注册但待审核
+ * - rejected         实名审核被驳回
+ */
+export interface SmsVerifyResult {
+  ok: boolean
+  next_action: 'login' | 'register' | 'pending_approval' | 'rejected' | string
+  ticket: string
+  message: string
+}
+
+/**
+ * 短信登录的结果。
+ *
+ * requires2fa 为 true 时 loginToken 是后端的 2FA 中间态凭证，
+ * 需要用户再输入 TOTP 验证码（走 /api/sms/2fa）。
+ * 否则 message 为空表示登录成功；非空表示一句要展示给用户的提示
+ * （如「该手机号尚未注册，请在管理后台注册后再登录」）。
+ */
+export interface SmsLoginOutcome {
+  requires2fa: boolean
+  loginToken: string
+  message: string
+}
+
 export interface EnvPayload {
   ok: boolean
   cwd: string
@@ -313,6 +359,38 @@ export const api = {
   logout: () => request<{ ok: boolean }>('/api/logout', { method: 'POST', body: '{}' }),
 
   config: () => request<ConfigStatus>('/api/config'),
+
+  // —— 手机验证码登录 ——
+  /** 短信登录是否可用；enabled=false 时前端不显示验证码入口。 */
+  smsStatus: () => request<SmsStatus>('/api/sms/status'),
+
+  /** 发送验证码；返回有效期与重发冷却（秒）。 */
+  smsSend: (phone: string) =>
+    request<{ ok: boolean; expire_in: number; cooldown: number }>('/api/sms/send', {
+      method: 'POST',
+      body: JSON.stringify({ phone }),
+    }),
+
+  /** 校验验证码；通过后按 next_action 决定下一步。 */
+  smsVerify: (phone: string, code: string) =>
+    request<SmsVerifyResult>('/api/sms/verify', {
+      method: 'POST',
+      body: JSON.stringify({ phone, code }),
+    }),
+
+  /** 用票据换 token；开了 2FA 的用户返回 requires_2fa + login_token。 */
+  smsLogin: (phone: string, ticket: string) =>
+    request<{ ok: boolean; requires_2fa: boolean; login_token?: string; error: string }>(
+      '/api/sms/login',
+      { method: 'POST', body: JSON.stringify({ phone, ticket }) },
+    ),
+
+  /** 短信登录的第二步：校验 TOTP 验证码。 */
+  smsLogin2fa: (loginToken: string, code: string) =>
+    request<{ ok: boolean; error: string }>('/api/sms/2fa', {
+      method: 'POST',
+      body: JSON.stringify({ login_token: loginToken, code }),
+    }),
 
   detail: (instanceId: string) =>
     request<DetailPayload>(`/api/detail?id=${encodeURIComponent(instanceId)}`),

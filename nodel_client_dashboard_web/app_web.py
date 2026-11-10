@@ -74,12 +74,46 @@ def _run_selftest(bridge: DashboardBridge, out_path: Path | None) -> int:
                 cardCount: document.querySelectorAll('.node-card').length,
                 bodyBg: getComputedStyle(document.body).backgroundColor,
                 title: document.title,
+                // 验证码登录入口：Tab（短信不可用时前端不渲染）
+                smsTabs: document.querySelectorAll('.login-tab').length,
+                smsTabLabels: Array.from(document.querySelectorAll('.login-tab'))
+                  .map((e) => e.textContent.trim()),
               });
             })()
             """
             report["dom"] = json.loads(window.evaluate_js(js))
         except Exception as exc:  # noqa: BLE001
             report["dom_error"] = repr(exc)
+
+        # 切到「验证码登录」Tab 再探一次：手机号 / 验证码输入框
+        # 只在默认渲染的 Tab 里，点一下才会出现。
+        dom = report.get("dom")
+        if isinstance(dom, dict) and int(dom.get("smsTabs") or 0) >= 2:
+            try:
+                window.evaluate_js(
+                    """
+                    (() => {
+                      const tabs = Array.from(document.querySelectorAll('.login-tab'));
+                      const target = tabs.find((t) => t.textContent.includes('验证码'));
+                      if (target) target.click();
+                      return true;
+                    })()
+                    """
+                )
+                time.sleep(0.6)
+                report["dom_sms"] = json.loads(
+                    window.evaluate_js(
+                        """
+                        JSON.stringify({
+                          hasPhone: !!document.querySelector('#login-phone'),
+                          hasSmsCode: !!document.querySelector('#login-sms-code'),
+                          hasSmsButton: !!document.querySelector('.btn-sms-code'),
+                        })
+                        """
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                report["dom_sms_error"] = repr(exc)
 
         try:
             window.destroy()
@@ -111,6 +145,24 @@ def _run_selftest(bridge: DashboardBridge, out_path: Path | None) -> int:
     else:
         login_view = console_view = False
     report["view"] = "login" if login_view else ("console" if console_view else "unknown")
+
+    # 验证码登录入口的检查：
+    # - 短信不可用（后端没开 / 面板开关关掉）→ 没有 Tab 是**正常**的，不算失败；
+    # - 短信可用 → 必须有 Tab，且切过去后手机号/验证码输入框都在。
+    #   缺任何一个都说明前端只做了一半，点「获取验证码」会像没反应。
+    sms_dom = report.get("dom_sms")
+    sms_tabs = int(dom.get("smsTabs") or 0) if isinstance(dom, dict) else 0
+    if sms_tabs >= 2:
+        report["sms_ui"] = "ok"
+        if not isinstance(sms_dom, dict) or not (
+            sms_dom.get("hasPhone")
+            and sms_dom.get("hasSmsCode")
+            and sms_dom.get("hasSmsButton")
+        ):
+            report["error"] = "验证码登录界面不完整：手机号/验证码输入框或获取按钮缺失"
+    else:
+        report["sms_ui"] = "absent"
+
     report["ok"] = bool(
         not mshtml_fallback
         and report.get("dist_ready")
@@ -118,6 +170,8 @@ def _run_selftest(bridge: DashboardBridge, out_path: Path | None) -> int:
         and dom.get("mounted")
         and (login_view or console_view)
         and dom.get("bodyBg") == "rgb(10, 14, 23)"
+        and report["sms_ui"] in ("ok", "absent")
+        and not report.get("error")
     )
 
     text = json.dumps(report, ensure_ascii=False, indent=2)
