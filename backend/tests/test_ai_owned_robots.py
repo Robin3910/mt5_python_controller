@@ -2,6 +2,7 @@
 import pytest
 
 from app import follow_service
+from tests.test_ai_follow_api import _approve_pending
 from tests.test_ai_follow_api import (
     CAP_AI,
     CAP_LEADER,
@@ -84,6 +85,7 @@ def test_owned_robot_merges_self_following_without_duplicate_or_primary_follower
         },
         headers=setup["host_h"],
     )
+    _approve_pending(client, setup["host_h"])
     assert response.status_code == 200, response.text
 
     response = client.get("/api/ai-follow/me", headers=setup["host_h"])
@@ -113,6 +115,7 @@ def test_owned_robot_keeps_following_other_robot(client):
         },
         headers=own["host_h"],
     )
+    _approve_pending(client, other["host_h"])
     assert response.status_code == 200, response.text
 
     response = client.get("/api/ai-follow/me", headers=own["host_h"])

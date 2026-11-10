@@ -454,7 +454,7 @@ class NodeGroupMember(Base):
 
 
 class GroupFollowerNode(Base):
-    """跟单成员：非主节点加入他人的带单源分组。
+    """跟单成员：普通带单仅非主节点，AI 跟单允许主节点。
 
     与 NodeGroupMember 严格分离，两者职责不可混用：
     - NodeGroupMember    = 分组所有者自己的节点（owner 可编辑 / 排序 / 开限价监听）；
@@ -472,6 +472,7 @@ class GroupFollowerNode(Base):
     # 跟单员用户 ID（冗余自 nodes.owner_user_id，便于按人查询 / 审计）
     follower_user_id: Mapped[int] = mapped_column(Integer, index=True)
     follow_state: Mapped[str] = mapped_column(String(16), default="running", server_default="running")
+    leader_paused: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     # 带单源冗余快照：写入时取「分组 owner 的主节点」。
     # 只用于展示 / 审计 / 主节点切换后的存量排查，不参与运行时判定
     # （运行时一律按 group.owner_user_id 现算主节点，避免主节点切换后快照过期）。
@@ -479,6 +480,50 @@ class GroupFollowerNode(Base):
     leader_primary_node_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     sort_order: Mapped[int] = mapped_column(Integer, default=0)  # 组内轮询顺序
     joined_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class AiFollowApplication(Base):
+    __tablename__ = "ai_follow_application"
+
+    id: Mapped[int] = mapped_column(AutoPK, primary_key=True, autoincrement=True)
+    group_id: Mapped[str] = mapped_column(String(32), index=True)
+    leader_user_id: Mapped[int] = mapped_column(Integer, index=True)
+    follower_user_id: Mapped[int] = mapped_column(Integer, index=True)
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    pending_key: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True)
+    source: Mapped[str] = mapped_column(String(16), default="join")
+    robot_name: Mapped[str] = mapped_column(String(128))
+    symbol: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    strategy_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    leader_primary_node_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    risk_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    reviewer_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class AiFollowApplicationNode(Base):
+    __tablename__ = "ai_follow_application_node"
+    __table_args__ = (UniqueConstraint("application_id", "node_id", name="uq_ai_application_node"),)
+
+    id: Mapped[int] = mapped_column(AutoPK, primary_key=True, autoincrement=True)
+    application_id: Mapped[int] = mapped_column(AutoPK, index=True)
+    node_id: Mapped[str] = mapped_column(String(32), index=True)
+    owner_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    snapshot: Mapped[dict] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    original_follow_state: Mapped[str] = mapped_column(String(16), default="running")
+    joined_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class DeletedNode(Base):
+    __tablename__ = "deleted_node"
+
+    mt5_login: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    node_id: Mapped[str] = mapped_column(String(32), index=True)
+    deleted_by_user_id: Mapped[int] = mapped_column(Integer)
+    deleted_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
 class GroupSignalTask(Base):

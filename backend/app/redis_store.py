@@ -153,17 +153,27 @@ class RedisStore:
         return out
 
     async def delete_node(self, node_id: str) -> None:
-        """删除节点时，连带清理 mt5_login 反查索引、账户快照、在线标记。"""
+        """删除节点及其运行态、监听标记和轮转引用，保留交易历史。"""
         n = await self.get_node(node_id)
         if n and n.get("mt5_login"):
             login_key = K_NODE_BY_LOGIN.format(int(n["mt5_login"]))
             # 同一登录号可能已被新节点占用；只在索引仍指向本节点时才删
             if await self.r.get(login_key) == node_id:
                 await self.r.delete(login_key)
-        await self.r.delete(K_NODE.format(node_id))
-        await self.r.delete(K_ACCOUNT.format(node_id))
-        await self.r.delete(K_ONLINE.format(node_id))
+        keys = [key.format(node_id) for key in (
+            K_NODE, K_ACCOUNT, K_ONLINE, K_NODE_PENDING_STOP, K_CANCEL_PENDING_LOCK, K_CANCEL_PENDING_BUSY,
+        )]
+        for pattern in (K_EXEC_LOCK.format(node_id, "*"), K_GROUP_NODE_BUSY.format("*", node_id),
+                        K_LIMIT_WATCH_LOCK.format(node_id, "*"), K_LIMIT_WATCH_DONE.format(node_id, "*"),
+                        K_LIMIT_WATCH_REJECT.format(node_id, "*"), K_CANCEL_PENDING_TICKET.format(node_id, "*")):
+            keys.extend([key async for key in self.r.scan_iter(match=pattern, count=100)])
+        await self.r.delete(*keys)
         await self.r.srem(K_NODES, node_id)
+        for pattern in (K_POLL_ROTATION.format("*"), K_GROUP_ROTATION.format("*")):
+            async for key in self.r.scan_iter(match=pattern, count=100):
+                order = json.loads(await self.r.get(key) or "[]")
+                if node_id in order:
+                    await self.r.set(key, json.dumps([nid for nid in order if nid != node_id]))
 
     # ----------------- mt5_login 反查 -----------------
     async def node_by_mt5_login(self, mt5_login: int) -> Optional[str]:

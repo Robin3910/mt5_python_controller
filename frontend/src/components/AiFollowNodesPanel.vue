@@ -35,7 +35,7 @@ const shownNodes = computed(() => {
   ].join(' ').toLowerCase().includes(keyword)))
 })
 const runningIds = computed(() => nodes.value.filter((node) => node.follow_state === 'running').map((node) => node.node_id))
-const activeIds = computed(() => nodes.value.filter((node) => node.follow_state !== 'stopped').map((node) => node.node_id))
+const activeIds = computed(() => nodes.value.filter((node) => !node.review_status && node.follow_state !== 'stopped').map((node) => node.node_id))
 const closableIds = computed(() => nodes.value.filter((node) => (node.position_count || 0) > 0).map((node) => node.node_id))
 
 function money(value: number | null | undefined, signed = false): string {
@@ -77,16 +77,16 @@ function money(value: number | null | undefined, signed = false): string {
           <header class="an-card-heading">
             <span class="an-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M22 11V3h-7v3H9V3H2v8h7V8h2v10h4v3h7v-8h-7v3h-2V8h2v3z"/></svg></span>
             <div class="an-name"><h3>{{ node.name || node.node_id }}</h3><p :title="node.groups.map((group) => group.strategy_name).filter(Boolean).join(' / ')">MT5 {{ node.mt5_login ?? '—' }} · {{ node.mt5_server || '—' }} · {{ node.symbols.join(' / ') || '—' }}</p></div>
-            <span class="an-state" :class="node.follow_state"><i></i>{{ stateNames[node.follow_state] }}</span>
+            <span class="an-state" :class="node.follow_state"><i></i>{{ node.review_status ? '尚未通过审核' : stateNames[node.follow_state] }}</span>
           </header>
           <div class="an-profit" :class="{ up: node.floating_profit != null && node.floating_profit >= 0, down: node.floating_profit != null && node.floating_profit < 0 }"><span><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="m3 17 6-6 4 4 7-7v4h2V4h-8v2h4l-5 6-4-4-8 8 2 1z"/></svg>浮动盈亏</span><strong>{{ money(node.floating_profit, true) }}</strong></div>
           <div class="an-stats"><div><span>持仓笔数</span><b>{{ node.position_count ?? '—' }} 笔</b></div><div><span>手数</span><b>{{ money(node.volume) }}</b></div><div><span>账户余额</span><b>{{ money(node.balance) }}</b></div></div>
           <div class="an-symbols"><span v-for="symbol in node.symbols" :key="symbol">{{ symbol }}</span></div>
           <footer :class="{ stopped: node.follow_state === 'stopped' }">
             <template v-if="node.follow_state !== 'stopped'">
-              <button type="button" class="an-pause" :disabled="busy" @click="emit('state', [node.node_id], node.follow_state === 'running' ? 'paused' : 'running')">{{ node.follow_state === 'running' ? '暂停跟单' : '恢复跟单' }}</button>
+              <button type="button" class="an-pause" :disabled="busy || !!node.review_status" @click="emit('state', [node.node_id], node.follow_state === 'running' ? 'paused' : 'running')">{{ node.review_status ? '等待审核' : node.follow_state === 'running' ? '暂停跟单' : '恢复跟单' }}</button>
               <button type="button" class="an-close" :disabled="busy || !(node.position_count && node.position_count > 0)" @click="emit('close', [node.node_id])">{{ node.position_count === 0 ? '已平仓' : '一键平仓' }}</button>
-              <button type="button" class="an-stop" :disabled="busy" @click="emit('state', [node.node_id], 'stopped')">停止跟单</button>
+              <button type="button" class="an-stop" :disabled="busy || !!node.review_status" @click="emit('state', [node.node_id], 'stopped')">停止跟单</button>
             </template>
             <template v-else><span class="an-stopped">已停止跟单</span><button v-if="node.position_count && node.position_count > 0" type="button" class="an-close" :disabled="busy" @click="emit('close', [node.node_id])">一键平仓</button></template>
           </footer>

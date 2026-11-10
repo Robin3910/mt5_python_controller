@@ -8,7 +8,7 @@ from sqlalchemy import select
 
 from . import permissions
 from .db import SessionLocal
-from .orm import Node, NodeCredential, Role, User, UserRole
+from .orm import DeletedNode, Node, NodeCredential, Role, User, UserRole
 from .security import compare_secret, hash_token
 
 
@@ -58,6 +58,12 @@ async def legacy_allowed(node_id: str) -> bool:
     async with SessionLocal() as session:
         row = await session.get(NodeCredential, node_id)
         return row is None or bool(row.legacy_allowed)
+
+
+async def deleted_login_denied(mt5_login: int, node_id: str | None) -> bool:
+    async with SessionLocal() as session:
+        row = await session.get(DeletedNode, mt5_login)
+        return row is not None and (node_id is None or row.node_id == node_id or await session.get(Node, node_id) is None)
 
 
 async def authenticate_scoped(token: str, mt5_login: int | None) -> dict | None:

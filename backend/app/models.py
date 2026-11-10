@@ -1554,6 +1554,7 @@ class AiMyGroup(BaseModel):
 
 
 class AiMyRobot(BaseModel):
+    review_status: Optional[str] = None
     is_owner: bool = False
     robot: AiRobotSummary
     groups: list[AiMyGroup]
@@ -1562,6 +1563,7 @@ class AiMyRobot(BaseModel):
 class AiMeResponse(BaseModel):
     following: list[AiMyRobot] = Field(default_factory=list)
     summary: dict = Field(default_factory=dict)
+    applications: list[dict] = Field(default_factory=list)
 
 
 class AiMyRobotMetrics(BaseModel):
@@ -1586,6 +1588,7 @@ class AiMyRobotDetailResponse(AiMyRobot):
 
 
 class AiFollowNodeOut(BaseModel):
+    review_status: Optional[str] = None
     node_id: str
     name: Optional[str] = None
     mt5_login: Optional[int] = None
@@ -1631,6 +1634,7 @@ class AiJoinRequest(BaseModel):
 
 class AiJoinResponse(BaseModel):
     joined: list[dict] = Field(default_factory=list)
+    pending: list[dict] = Field(default_factory=list)
     skipped: list[dict] = Field(default_factory=list)
     leader_primary_node_id: Optional[str] = None
 

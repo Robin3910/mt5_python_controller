@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 
 from app.redis_store import RedisStore
 from tests.test_helpers import auth_headers, drop_test_db, reset_test_db
+from tests.test_ai_follow_api import _approve_pending
 
 # 与 conftest 的 MYSQL_DSN 指向同一个库：全部 API 用例共用，必须复用同一个路径
 _TEST_DB = pathlib.Path(__file__).resolve().parent / "_test_api.db"
@@ -594,7 +595,10 @@ def test_delete_node_cascades_followings(client):
         json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [b_follow]},
         headers=bob_h,
     )
-    d = client.delete(f"/api/nodes/{b_follow}", headers=admin_h)
+    from tests.test_ai_channel_deletion import online
+    online(client, b_follow)
+    preview = client.get(f"/api/nodes/{b_follow}/deletion-preview", headers=admin_h).json()
+    d = client.request("DELETE", f"/api/nodes/{b_follow}", headers=admin_h, json={"version": preview["version"]})
     assert d.status_code == 200, d.text
     me = client.get("/api/follow/me", headers=bob_h)
     assert me.json()["summary"]["follow_node_count"] == 0, "节点删除应清理跟单"
@@ -1169,6 +1173,7 @@ def test_my_following_marks_ai_group_unmarketable(client):
         headers=bob_h,
     )
     assert j.status_code == 200, j.text
+    _approve_pending(client, _login(client, "alice"))
 
     r = client.get("/api/follow/me", headers=bob_h)
     assert r.status_code == 200, r.text
@@ -1200,6 +1205,7 @@ def test_leader_list_my_follow_count_excludes_ai_market(client):
               "node_ids": [b_follow]},
         headers=bob_h,
     ).status_code == 200
+    _approve_pending(client, _login(client, "alice"))
 
     r = client.get("/api/follow/leaders", headers=bob_h)
     assert r.status_code == 200, r.text
@@ -1220,6 +1226,7 @@ def test_leader_detail_my_follow_count_excludes_ai_market(client):
               "node_ids": [b_follow]},
         headers=bob_h,
     ).status_code == 200
+    _approve_pending(client, _login(client, "alice"))
 
     d = client.get(f"/api/follow/leaders/{alice['id']}", headers=bob_h)
     assert d.status_code == 200, d.text
@@ -1250,6 +1257,7 @@ def test_my_following_counts_only_follow_market(client):
         headers=bob_h,
     ).status_code == 200
 
+    _approve_pending(client, _login(client, "alice"))
     r = client.get("/api/follow/me", headers=bob_h)
     assert r.status_code == 200, r.text
     body = r.json()

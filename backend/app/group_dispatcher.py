@@ -35,6 +35,7 @@ from datetime import datetime
 from typing import Optional
 
 from . import (
+    node_lifecycle,
     follow_rules,
     group_persist,
     group_rules,
@@ -75,6 +76,7 @@ class LeaderState:
     follow_paused: bool      # 带单市场是否已暂停接单
     ai_follow_paused: bool  # AI 市场是否已暂停接单
     primary_node_id: Optional[str]  # 当前主节点 id（带单源）
+    ai_enabled: bool = True
 
 
 def build_strategy_start_command(
@@ -239,7 +241,7 @@ class GroupDispatcher:
         空列表视为不限制。
         """
         template_id = (strategy or {}).get("template_id")
-        group = follow_rules.group_for_follow_dispatch(group, template_id)
+        group = follow_rules.group_for_follow_dispatch(group, template_id, nodemap)
         base = group_rules.effective_node_ids(group, nodemap, online_ids)
         pause_note: Optional[str] = None
         has_followers = group_rules.has_followers(group)
@@ -249,7 +251,10 @@ class GroupDispatcher:
             if use_ai_pause and state.ai_follow_paused:
                 return [], follow_rules.paused_dispatch_note(template_id)
             if has_followers:
-                if not state.enabled:
+                if use_ai_pause and (not state.ai_enabled or not group.get("accept_ai_follow")
+                                     or not follow_rules.group_contains_primary(group, state.primary_node_id)):
+                    base = group_rules.owner_effective_node_ids(group, nodemap, online_ids)
+                elif not state.enabled:
                     base = group_rules.owner_effective_node_ids(group, nodemap, online_ids)
                 elif not follow_rules.market_for_template(template_id):
                     base = group_rules.owner_effective_node_ids(group, nodemap, online_ids)
@@ -320,6 +325,7 @@ class GroupDispatcher:
             follow_paused=bool(getattr(user, "follow_paused", False)),
             ai_follow_paused=bool(getattr(user, "ai_follow_paused", False)),
             primary_node_id=primary_id,
+            ai_enabled=permissions.can_host_ai_robot(principal),
         )
 
     # ------------------------------------------------------------------
@@ -1001,7 +1007,16 @@ class GroupDispatcher:
             "volume": volume, "reason": reason,
         }
 
-    async def _dispatch_locked_node(
+    async def _dispatch_locked_node(self, base: dict, command: dict, *, hold_busy: bool = True) -> dict:
+        async with node_lifecycle.locked(node_lifecycle.node_key(base["node_id"])):
+            if await self.store.get_node(base["node_id"]) is None:
+                if hold_busy:
+                    await self.store.release_group_node_busy(base["group_id"], base["node_id"])
+                return {"node_id": base["node_id"], "status": "skipped", "magic": None,
+                        "volume": base["decided_vol"], "reason": "节点已删除"}
+            return await self._dispatch_locked_node_active(base, command, hold_busy=hold_busy)
+
+    async def _dispatch_locked_node_active(
         self, base: dict, command: dict, *, hold_busy: bool = True,
     ) -> dict:
         """下发已通过互斥门禁的节点：建子任务拿魔术号 -> 发命令。

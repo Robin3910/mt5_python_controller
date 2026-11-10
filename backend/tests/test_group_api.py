@@ -403,7 +403,10 @@ def test_deleting_node_removes_it_from_groups(client):
     b = _mk_node(client, h, 5142)
     gid = _mk_group(client, h, name="级联组", node_ids=[a, b])["group_id"]
 
-    assert client.delete(f"/api/nodes/{a}", headers=h).status_code == 200
+    from tests.test_ai_channel_deletion import online
+    online(client, a)
+    preview = client.get(f"/api/nodes/{a}/deletion-preview", headers=h).json()
+    assert client.request("DELETE", f"/api/nodes/{a}", headers=h, json={"version": preview["version"]}).status_code == 200
 
     out = client.get(f"/api/groups/{gid}", headers=h).json()
     assert [n["node_id"] for n in out["nodes"]] == [b]

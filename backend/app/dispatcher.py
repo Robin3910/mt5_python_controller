@@ -17,7 +17,7 @@ import time
 from datetime import datetime
 from typing import Optional
 
-from . import latency_marks, mt5_identity, persist, results, rules, signal_codes
+from . import node_lifecycle, latency_marks, mt5_identity, persist, results, rules, signal_codes
 from .config import Config
 from .connections import manager
 from .models import build_close_command, build_open_command
@@ -151,13 +151,35 @@ class Dispatcher:
         return len(candidates)
 
     async def try_open(self, node: dict, signal: TradingSignal, signal_id: str,
+                       scope: str, filters: dict, wait: bool = False, timeout: int = 15) -> dict:
+        async with node_lifecycle.locked(node_lifecycle.node_key(node["node_id"])):
+            if await self.store.get_node(node["node_id"]) is None:
+                return {"status": "skipped", "reason": "节点已删除"}
+            outcome = await self._try_open_active(node, signal, signal_id, scope, filters, wait, timeout)
+        fut = outcome.pop("_future", None)
+        node_id = node["node_id"]
+        if wait and fut is not None:
+            # 轮询模式：等待节点回报或超时
+            try:
+                res = await asyncio.wait_for(fut, timeout=timeout)
+                await self.store.release_exec_lock(node_id, signal.symbol)
+                success = bool(res.get("success"))
+                await persist.update_dispatch_result(
+                    signal_id, node_id, "done" if success else "failed", res
+                )
+                return {"status": "done" if success else "failed", "result": res}
+            except asyncio.TimeoutError:
+                # 超时：丢弃 future、释放锁，交由上层决定是否重试
+                results.discard(signal_id, node_id)
+                await self.store.release_exec_lock(node_id, signal.symbol)
+                await persist.update_dispatch_result(signal_id, node_id, "failed", {"error": "timeout"})
+                return {"status": "timeout"}
+        return outcome
+
+    async def _try_open_active(self, node: dict, signal: TradingSignal, signal_id: str,
                        scope: str, filters: dict,
                        wait: bool = False, timeout: int = 15) -> dict:
-        """对单个节点执行“开仓”决策与下发。
-
-        wait=False（同步模式）：发完即返回 "sent"，不等回报；
-        wait=True （轮询模式）：注册 future 并等待节点回报或超时，返回最终状态。
-        """
+        """生命周期锁内完成准入与下发，回报等待留给调用方。"""
         node_id = node["node_id"]
         account = await self.store.get_account(node_id) or {}
         positions = account.get("positions", [])
@@ -229,24 +251,7 @@ class Dispatcher:
             )
             return {"status": "failed", "reason": "offline"}
 
-        if wait and fut is not None:
-            # 轮询模式：等待节点回报或超时
-            try:
-                res = await asyncio.wait_for(fut, timeout=timeout)
-                await self.store.release_exec_lock(node_id, signal.symbol)
-                success = bool(res.get("success"))
-                await persist.update_dispatch_result(
-                    signal_id, node_id, "done" if success else "failed", res
-                )
-                return {"status": "done" if success else "failed", "result": res}
-            except asyncio.TimeoutError:
-                # 超时：丢弃 future、释放锁，交由上层决定是否重试
-                results.discard(signal_id, node_id)
-                await self.store.release_exec_lock(node_id, signal.symbol)
-                await persist.update_dispatch_result(signal_id, node_id, "failed", {"error": "timeout"})
-                return {"status": "timeout"}
-        # 同步模式：发完即返回，回报由 ws_gateway 异步处理（锁靠 TTL 自动过期）
-        return {"status": "sent"}
+        return {"status": "sent", "_future": fut}
 
     async def _skip(self, signal_id: str, node_id: str, reason: Optional[str],
                     code: Optional[str] = None) -> None:

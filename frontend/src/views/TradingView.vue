@@ -1218,7 +1218,7 @@ onBeforeUnmount(() => {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: 16px;
-  align-items: start;
+  align-items: center;
 }
 .tr-kicker, .tr-hint, .tr-muted, .tr-foot-note, .tr-empty-line { color: #8B96A8; }
 .tr-kicker { margin: 0; font-size: 12px; }
@@ -1315,6 +1315,5 @@ onBeforeUnmount(() => {
 }
 @media (min-width: 1024px) {
   .tr-create { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: 24px; padding: 16px; }
-  .tr-sum { align-self: start; }
 }
 </style>

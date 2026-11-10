@@ -7,6 +7,7 @@ from app import deal_store
 from app.db import SessionLocal
 from app.orm import GroupSignalTask, GroupTaskDispatch
 from app.state import state
+from tests.test_ai_follow_api import _approve_pending
 from tests.test_ai_follow_api import (
     CAP_AI,
     CAP_LEADER,
@@ -69,6 +70,7 @@ def test_follow_and_leave_are_isolated_per_robot_group(client):
             json={"leader_user_id": setup["host"]["id"], "group_ids": [group_id], "node_ids": [setup["b_follow"]]},
             headers=headers,
         )
+        _approve_pending(client, setup["host_h"])
         assert response.status_code == 200, response.text
     response = client.get("/api/ai-follow/me", headers=headers)
     assert len(response.json()["following"]) == 2

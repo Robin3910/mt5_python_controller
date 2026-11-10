@@ -85,6 +85,8 @@ def _migrate_follow_node_state(sync_conn) -> None:
     columns = {column["name"] for column in inspector.get_columns("group_follower_node")}
     if "follow_state" not in columns:
         sync_conn.execute(text("ALTER TABLE group_follower_node ADD COLUMN follow_state VARCHAR(16) NOT NULL DEFAULT 'running'"))
+    if "leader_paused" not in columns:
+        sync_conn.execute(text("ALTER TABLE group_follower_node ADD COLUMN leader_paused BOOLEAN NOT NULL DEFAULT 0"))
 
 
 def _migrate_users_profile_columns(sync_conn) -> None:

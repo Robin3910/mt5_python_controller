@@ -7,6 +7,7 @@ from app import deal_store
 from app.state import state
 from app.db import SessionLocal
 from app.orm import GroupSignalTask, GroupTaskDispatch
+from tests.test_ai_follow_api import _approve_pending
 from tests.test_ai_follow_api import (
     CAP_AI,
     CAP_LEADER,
@@ -59,6 +60,7 @@ def test_followed_robot_detail_scopes_nodes_groups_and_template_snapshots(client
         json={"leader_user_id": setup["host"]["id"], "group_ids": [setup["ai_group_id"]], "node_ids": [setup["b_follow"]]},
         headers=bob_headers,
     )
+    _approve_pending(client, setup["host_h"])
     assert joined.status_code == 200, joined.text
     other_strategy = _mk_ai_strategy(client, setup["host_h"], "other-ai")
     other_group = _mk_group(

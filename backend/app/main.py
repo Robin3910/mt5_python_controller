@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import (
+    ai_channel_api,
     accounts,
     admin_ws,
     ai_follow_api,
@@ -69,6 +70,8 @@ logger = logging.getLogger("mt5hub")
 async def lifespan(app: FastAPI):
     """应用启动/关闭钩子：在此装配并回收所有共享资源。"""
     await init_db()
+    from .ai_application_store import migrate_legacy
+    await migrate_legacy()
     store = RedisStore.from_url()
     try:
         await store.r.ping()
@@ -136,6 +139,7 @@ app.add_middleware(
 
 # 注册所有路由
 for r in (
+    ai_channel_api.router,
     auth.router,
     phone_auth.router,
     node_dashboard_api.router,

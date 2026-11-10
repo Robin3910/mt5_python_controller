@@ -2320,6 +2320,10 @@ export interface FollowNodeBrief {
   is_primary?: boolean
   /** 主节点 / 机器人在场时附带；不带则表示未接入或离线聚合展示 */
   online?: boolean
+  balance?: number | null
+  owner_name?: string
+  selectable?: boolean
+  unselectable_reason?: string | null
 }
 
 /** 带单员摘要：他的主节点就是带单源 */
@@ -2571,10 +2575,11 @@ export interface AiMyGroup {
   /** 批次已用 / 批次上限 —— AI 跟单员最需要盯的指标 */
   batch_used: number
   batch_limit: number
-  my_nodes: (FollowNodeBrief & { joined_at: number | null; follow_state: AiFollowNodeState })[]
+  my_nodes: (FollowNodeBrief & { joined_at: number | null; follow_state: AiFollowNodeState; leader_paused?: boolean })[]
 }
 
 export interface AiMyRobot {
+  review_status?: string | null
   is_owner: boolean
   robot: AiRobotSummary
   groups: AiMyGroup[]
@@ -2583,6 +2588,7 @@ export interface AiMyRobot {
 export interface AiMeResponse {
   following: AiMyRobot[]
   summary: Record<string, number>
+  applications: import('./aiChannel').AiApplication[]
 }
 
 export interface AiMyRobotDetailResponse extends AiMyRobot {
@@ -2607,6 +2613,7 @@ export interface AiMyRobotDetailResponse extends AiMyRobot {
 export type AiFollowNodeState = 'running' | 'paused' | 'stopped'
 
 export interface AiFollowNode {
+  review_status?: string | null
   node_id: string
   name: string | null
   mt5_login: number | null
@@ -2640,6 +2647,7 @@ export interface AiJoinPayload {
 }
 
 export interface AiJoinResponse {
+  pending: { request_id: number; group_id: string; node_ids: string[] }[]
   joined: { group_id: string; group_name: string | null; node_ids: string[]; already_node_ids: string[] }[]
   skipped: { node_id: string; group_id?: string; reason: string }[]
   leader_primary_node_id: string | null

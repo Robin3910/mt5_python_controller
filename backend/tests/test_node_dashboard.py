@@ -410,13 +410,14 @@ def test_credentials_migration_backfills_snapshot_and_copies_iteration_table(tmp
 
 
 def test_delete_enrolled_node_removes_it_from_the_list(client):
-    admin = auth_headers(client)
-    _, headers = user(client, admin)
-    node = enrolled(client, headers)
-    response = client.delete(f"/api/nodes/{node['node_id']}", headers=admin)
+    admin, _, _, node_id = opened(client)
+    from tests.test_ai_channel_deletion import online
+    online(client, node_id)
+    preview = client.get(f"/api/nodes/{node_id}/deletion-preview", headers=admin).json()
+    response = client.request("DELETE", f"/api/nodes/{node_id}", headers=admin, json={"version": preview["version"]})
     assert response.status_code == 200, response.text
     listed = [item["node_id"] for item in client.get("/api/nodes", headers=admin).json()]
-    assert node["node_id"] not in listed
+    assert node_id not in listed
 
 
 def test_delete_purges_cache_when_ledger_row_is_gone(client):
@@ -429,7 +430,10 @@ def test_delete_purges_cache_when_ledger_row_is_gone(client):
         conn.execute("DELETE FROM nodes WHERE node_id = ?", (node_id,))
         conn.commit()
     assert any(item["node_id"] == node_id for item in client.get("/api/nodes", headers=admin).json())
-    response = client.delete(f"/api/nodes/{node_id}", headers=admin)
+    from tests.test_ai_channel_deletion import online
+    online(client, node_id)
+    preview = client.get(f"/api/nodes/{node_id}/deletion-preview", headers=admin).json()
+    response = client.request("DELETE", f"/api/nodes/{node_id}", headers=admin, json={"version": preview["version"]})
     assert response.status_code == 200, response.text
     assert all(item["node_id"] != node_id for item in client.get("/api/nodes", headers=admin).json())
 

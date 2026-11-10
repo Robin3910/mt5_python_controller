@@ -29,6 +29,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from . import (
+    ai_application_store,
     ai_follow_nodes,
     ai_robot_detail,
     deal_stats,
@@ -40,6 +41,9 @@ from . import (
     rbac_service,
     user_service,
 )
+from .connections import manager
+from .ai_channel_models import AiUiEvent
+from .db import SessionLocal
 from .deps import client_ip, get_group_dispatcher, get_store, require_menu
 from .models import (
     AiJoinRequest,
@@ -86,7 +90,7 @@ def _node_brief(node: Optional[dict]) -> Optional[dict]:
         "mt5_login": node.get("mt5_login"),
         "enabled": bool(node.get("enabled", True)),
         "is_primary": bool(node.get("is_primary")),
-        "online": bool(node.get("online", False)),
+        "online": manager.is_node_online(str(node.get("node_id"))),
     }
 
 
@@ -100,16 +104,12 @@ def _primary_of(all_nodes: list[dict], user_id: Optional[int]) -> Optional[dict]
 
 
 def _viewable_follow_nodes(all_nodes: list[dict], principal: Principal) -> list[dict]:
-    """当前用户可用于跟单的节点：自己的、已启用、**非主节点**。
-
-    主节点必须排除 —— 它同时是带单源（AI 机器人的载体），保持独立才有
-    「机器人 / 跟单」的方向性。
-    """
+    """AI 跟单允许主节点，归属与开通状态仍须有效。"""
     return [
         n for n in all_nodes
-        if permissions.normalize_owner(n.get("owner_user_id")) == principal.user_id
+        if permissions.same_owner(n.get("owner_user_id"), permissions.owner_for_new(principal))
         and n.get("enabled", True)
-        and not n.get("is_primary")
+        and n.get("approval_status", "approved") == "approved"
     ]
 
 
@@ -443,7 +443,14 @@ async def get_ai_robot_detail(
             **(_group_robot_summary(user, primary, groups[0], strategies.get(groups[0].get("strategy_id") or ""), p) if len(groups) == 1 else {}),
         },
         groups=detail_groups,
-        my_nodes=[_node_brief(n) for n in _viewable_follow_nodes(all_nodes, p)],
+        my_nodes=[{
+            **_node_brief(n),
+            "online": n["node_id"] in manager.nodes,
+            "balance": (await store.get_account(n["node_id"]) or {}).get("balance"),
+            "owner_name": p.username,
+            "selectable": not any(n["node_id"] == member.get("node_id") for group in groups for member in group.get("members", [])),
+            "unselectable_reason": "已是该机器人分组成员" if any(n["node_id"] == member.get("node_id") for group in groups for member in group.get("members", [])) else None,
+        } for n in _viewable_follow_nodes(all_nodes, p)],
         daily_profit=daily_profit,
     )
 
@@ -458,6 +465,9 @@ async def list_my_ai_followings(
 ) -> AiMeResponse:
     """我的机器人：合并自有主节点上的 AI 策略与既有 AI 跟单。"""
     followings = await follow_service.list_followings(p.user_id)
+    pairs = {(item["group_id"], item["node_id"]) for item in followings}
+    followings += [item for item in await ai_application_store.legacy_relations(p.user_id)
+                   if (item["group_id"], item["node_id"]) not in pairs]
     all_groups = {g["group_id"]: g for g in await store.all_groups()}
     all_nodes = await store.all_nodes()
     active_counts = await group_persist.count_active_by_group()
@@ -503,6 +513,7 @@ async def list_my_ai_followings(
     if not by_leader:
         return AiMeResponse(
             following=[], summary={"following_count": 0, "follow_node_count": 0},
+            applications=await ai_application_store.list_mine(p.user_id),
         )
 
     following_out: list[dict] = []
@@ -555,7 +566,8 @@ async def list_my_ai_followings(
                             (n for n in all_nodes if n.get("node_id") == f["node_id"]), None
                         )),
                         "joined_at": f.get("joined_at"),
-                        "follow_state": f.get("follow_state") or "running",
+                        "follow_state": "paused" if f.get("leader_paused") else f.get("follow_state") or "running",
+                        "leader_paused": bool(f.get("leader_paused")),
                     }
                     for f in sorted(fs, key=lambda x: x.get("joined_at") or 0)
                 ],
@@ -572,9 +584,11 @@ async def list_my_ai_followings(
                     "marketable": has_cap,
                 },
                 "groups": [group_out],
+                "review_status": next((f["review_status"] for f in fs if f.get("review_status")), None),
             })
     return AiMeResponse(
         following=following_out,
+        applications=await ai_application_store.list_mine(p.user_id),
         summary={
             "following_count": following_group_count,
             # 计数也只算 AI 市场的关系（与上面过滤后的口径一致）
@@ -647,118 +661,27 @@ async def join_ai_follow(
     store: RedisStore = Depends(get_store),
     p: Principal = Depends(require_menu(MENU_AI_TRADE)),
 ) -> AiJoinResponse:
-    """把当前用户的若干节点加入某个 AI 机器人的若干分组。
+    """提交 AI 接入申请，审核通过前不建立跟单关系。"""
+    try:
+        return AiJoinResponse(**await ai_application_store.submit(
+            store, p, body.leader_user_id, body.group_ids, body.node_ids, ip=client_ip(request),
+        ))
+    except HTTPException as exc:
+        from .node_deletion import failed
+        await failed(p, "ai_follow_request_create", body.leader_user_id, exc, client_ip(request))
+        if exc.status_code == 409:
+            raise HTTPException(400, exc.detail) from exc
+        raise
 
-    校验顺序固定：机器人主人有效性 -> 节点归属/主节点 -> 分组可跟单性。
-    越权与不存在一律 4xx，不透露对方名下有什么分组。
 
-    **市场隔离**：只接受 tpl_1 分组；且该分组必须已开放 AI 跟单
-    （accept_ai_follow）—— 开关校验在**写入侧**，不能只在展示侧过滤，
-    否则用户可绕过 UI 直接调 API 加入未开放的分组。
-    """
-    user = await user_service.get_user_by_id(body.leader_user_id)
-    if not user or not user.is_active:
-        raise HTTPException(status_code=404, detail="机器人主人不存在或已停用")
-    principal = await rbac_service.load_principal(store, user.username)
-    if not principal or not permissions.can_host_ai_robot(principal):
-        raise HTTPException(status_code=404, detail="该用户暂未开放 AI 跟单")
-    # 暂停 AI 跟单：写侧拦截。必须在**写入前**挡住 —— 只在展示侧过滤的话，
-    # 用户可以绕过 UI 直接调 API 加入已暂停的分组。
-    if getattr(user, "ai_follow_paused", False):
-        raise HTTPException(
-            status_code=400, detail=follow_rules.PAUSED_AI_REASON,
-        )
-
-    all_nodes = await store.all_nodes()
-    leader_primary = _primary_of(all_nodes, body.leader_user_id)
-    if not leader_primary:
-        raise HTTPException(status_code=404, detail="该机器人主人尚无主节点")
-
-    # 节点：必须是我的、启用、非主节点
-    my_follow_nodes = {
-        n["node_id"]: n for n in _viewable_follow_nodes(all_nodes, p)
-    }
-    node_ids: list[str] = []
-    skipped: list[dict] = []
-    for nid in body.node_ids:
-        nid = str(nid or "").strip()
-        if not nid or nid in node_ids:
-            continue
-        if nid in my_follow_nodes:
-            node_ids.append(nid)
-        else:
-            reason = follow_rules.node_join_reject_reason(
-                next((n for n in all_nodes if n.get("node_id") == nid), None),
-                existing_group=None,
-                group_id="",
-            )
-            skipped.append({"node_id": nid, "reason": reason or "节点不属于你"})
-    if not node_ids:
-        raise HTTPException(status_code=400, detail="没有可用于跟单的节点（主节点不可跟单）")
-
-    # 分组：必须是该主人名下、含其主节点、启用、tpl_1、且已开放 AI 跟单
-    all_groups = await store.all_groups()
-    strategies = await follow_service._strategies_of(all_groups, store)
-    tmpl_map = follow_service._template_ids_of(strategies)
-    followable = {
-        g["group_id"]: g for g in _ai_groups_of(
-            all_groups, tmpl_map, body.leader_user_id, leader_primary.get("node_id"),
-        )
-    }
-    joined: list[dict] = []
-    for gid in body.group_ids:
-        gid = str(gid or "").strip()
-        g = followable.get(gid)
-        if not g:
-            continue  # 不可跟的分组静默跳过，joined 里不出现
-        if g.get("strategy_id") and g["strategy_id"] not in strategies:
-            continue
-        added: list[str] = []
-        already: list[str] = []
-        for nid in node_ids:
-            reason = follow_rules.node_join_reject_reason(
-                my_follow_nodes[nid], existing_group=g, group_id=gid,
-            )
-            if reason:
-                skipped.append({"node_id": nid, "group_id": gid, "reason": reason})
-                continue
-            ok = await follow_service.add_following(
-                store,
-                group_id=gid, node_id=nid,
-                follower_user_id=p.user_id,
-                leader_user_id=body.leader_user_id,
-                leader_primary_node_id=leader_primary.get("node_id"),
-            )
-            (added if ok else already).append(nid)
-            g.setdefault("followers", []).append({"node_id": nid})
-        if added or already:
-            joined.append({
-                "group_id": gid,
-                "group_name": g.get("name"),
-                "node_ids": added,
-                "already_node_ids": already,
-            })
-
-    if not joined:
-        raise HTTPException(status_code=400, detail="没有可加入的分组（可能已全部跟过或已失效）")
-
-    await persist.audit(
-        p.username, "join_ai_follow", user.username,
-        {
-            "leader_user_id": body.leader_user_id,
-            "leader_primary_node_id": leader_primary.get("node_id"),
-            "group_ids": [j["group_id"] for j in joined],
-            "node_ids": node_ids,
-        },
-        "ok", client_ip(request), category="ai_follow",
-        before=None,
-        after={"joined": joined, "skipped": skipped},
-    )
-    return AiJoinResponse(
-        joined=joined,
-        skipped=skipped,
-        leader_primary_node_id=leader_primary.get("node_id"),
-    )
+@router.post("/ui-events")
+async def ui_event(body: AiUiEvent, request: Request,
+                   p: Principal = Depends(require_menu(MENU_AI_TRADE))):
+    async with SessionLocal() as session:
+        ai_application_store.audit(session, p, f"ai_ui_{body.action}", body.group_id,
+                                  params=body.model_dump(), ip=client_ip(request))
+        await session.commit()
+    return {"status": "ok"}
 
 
 # ---------------------------------------------------------------------------

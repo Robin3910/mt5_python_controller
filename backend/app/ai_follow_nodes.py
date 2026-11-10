@@ -6,7 +6,7 @@ import asyncio
 from fastapi import HTTPException
 from sqlalchemy import select
 
-from . import ai_robot_detail, follow_rules, follow_service, permissions, persist
+from . import ai_application_store, ai_robot_detail, follow_rules, follow_service, permissions, persist
 from .db import SessionLocal
 from .follow_channel_api import close_follow_channel
 from .models import FollowChannelCloseRequest
@@ -26,10 +26,14 @@ async def node_stats(store, principal) -> dict:
     owner = permissions.owner_for_new(principal)
     owned_nodes = {
         node["node_id"]: node for node in await store.all_nodes()
-        if permissions.same_owner(node.get("owner_user_id"), owner) and not node.get("is_primary")
+        if permissions.same_owner(node.get("owner_user_id"), owner)
     }
     by_node: dict[str, list[dict]] = {}
-    for relation in await follow_service.list_followings(principal.user_id, include_stopped=True):
+    relations = await follow_service.list_followings(principal.user_id, include_stopped=True)
+    pairs = {(row["group_id"], row["node_id"]) for row in relations}
+    relations += [row for row in await ai_application_store.legacy_relations(principal.user_id)
+                  if (row["group_id"], row["node_id"]) not in pairs]
+    for relation in relations:
         if relation["group_id"] in ai_groups and relation["node_id"] in owned_nodes:
             by_node.setdefault(relation["node_id"], []).append(relation)
     node_ids = list(by_node)
@@ -40,7 +44,7 @@ async def node_stats(store, principal) -> dict:
     for node_id, account in zip(node_ids, accounts):
         node = owned_nodes[node_id]
         relations = by_node[node_id]
-        states = {relation["follow_state"] for relation in relations}
+        states = {"paused" if relation.get("leader_paused") else relation["follow_state"] for relation in relations}
         follow_state = "running" if "running" in states else "paused" if "paused" in states else "stopped"
         magics = set().union(*(scopes[relation["group_id"]][node_id] for relation in relations))
         positions = [
@@ -60,6 +64,8 @@ async def node_stats(store, principal) -> dict:
             "mt5_login": node.get("mt5_login"), "mt5_server": node.get("mt5_server"),
             "symbols": list(dict.fromkeys(group["symbol"] for group in related_groups if group["symbol"])),
             "follow_state": follow_state,
+            "review_status": next((r["review_status"] for r in relations if r.get("review_status")), None)
+                if all(r.get("review_status") for r in relations) else None,
             "position_count": len(positions) if account is not None else None,
             "volume": round(sum(float(position.get("volume") or 0) for position in positions), 2) if account is not None else None,
             "floating_profit": round(sum(float(position.get("profit") or 0) for position in positions), 2) if account is not None else None,
@@ -90,7 +96,7 @@ async def set_node_state(
     owner = permissions.owner_for_new(principal)
     async with SessionLocal() as session:
         owned_ids = set((await session.scalars(select(Node.node_id).where(
-            Node.node_id.in_(selected_ids), Node.is_primary.is_(False),
+            Node.node_id.in_(selected_ids),
             Node.owner_user_id.is_(None) if owner is None else Node.owner_user_id == owner,
         ))).all())
         if owned_ids != selected_ids:

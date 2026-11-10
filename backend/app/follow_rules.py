@@ -125,7 +125,10 @@ def paused_marketable_reason(
     return PAUSED_AI_REASON if ai else PAUSED_FOLLOW_REASON
 
 
-def group_for_follow_dispatch(group: dict, template_id: object | None) -> dict:
+def group_for_follow_dispatch(group: dict, template_id: object | None, nodemap: dict | None = None) -> dict:
+    if template_in_market(template_id, FOLLOW_MARKET_TEMPLATE_IDS) and nodemap is not None:
+        return {**group, "followers": [row for row in group.get("followers") or []
+                                      if not nodemap.get(row["node_id"], {}).get("is_primary")]}
     if not template_in_market(template_id, AI_MARKET_TEMPLATE_IDS):
         return group
     return {
@@ -133,6 +136,7 @@ def group_for_follow_dispatch(group: dict, template_id: object | None) -> dict:
         "followers": [
             follower for follower in group.get("followers") or []
             if follower.get("follow_state", "running") == "running"
+            and not follower.get("leader_paused", False)
         ],
     }
 
@@ -439,6 +443,7 @@ NODE_JOIN_REJECT = {
 
 def node_join_reject_reason(
     node: Optional[dict], *, existing_group: Optional[dict], group_id: str,
+    allow_primary: bool = False,
 ) -> Optional[str]:
     """该节点能否加入本分组跟单；可加入返回 None，否则给人读原因。
 
@@ -447,7 +452,7 @@ def node_join_reject_reason(
     """
     if not node:
         return NODE_JOIN_REJECT["foreign"]
-    if node.get("is_primary"):
+    if node.get("is_primary") and not allow_primary:
         return NODE_JOIN_REJECT["primary"]
     if not node.get("enabled", True):
         return NODE_JOIN_REJECT["disabled"]

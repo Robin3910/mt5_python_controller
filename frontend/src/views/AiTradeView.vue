@@ -16,6 +16,10 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import StrategyFormModal from '@/components/StrategyFormModal.vue'
+import RobotIcon from '@/components/RobotIcon.vue'
+import { deleteNodeWithConfirmation } from '@/composables/useNodeDeletion'
+import { trackAiUi } from '@/utils/aiAudit'
+import type { AiApplication } from '@/api/aiChannel'
 import AiFollowNodesPanel from '@/components/AiFollowNodesPanel.vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
@@ -65,9 +69,10 @@ const perfWindow = ref<string>('30d')
 const detail = ref<AiRobotDetailResponse | null>(null)
 const detailLoading = ref(false)
 
-const mine = ref({ following: [], summary: {} } as {
+const mine = ref({ following: [], summary: {}, applications: [] } as {
   following: AiMyRobot[]
   summary: Record<string, number>
+  applications: AiApplication[]
 })
 const mineLoading = ref(false)
 const nodeStats = ref<AiFollowNodesResponse | null>(null)
@@ -102,6 +107,7 @@ const allSelectableGroupIds = computed<string[]>(() =>
 )
 
 interface MyFollowedNode {
+  leader_paused: boolean
   node_id: string
   name: string | null
   mt5_login: number | null
@@ -114,6 +120,7 @@ interface MyFollowedNode {
 }
 
 interface MyRobotEntry {
+  review_status?: string | null
   is_owner: boolean
   robot: AiRobotSummary
   marketable: boolean
@@ -131,6 +138,7 @@ const myFollowing = computed<MyRobotEntry[]>(() =>
       for (const n of g.my_nodes || []) {
         const prev = nodesById.get(n.node_id)
         if (prev) {
+          prev.leader_paused ||= !!n.leader_paused
           prev.active_task_count += g.active_task_count
           if (!prev.groups.some((x) => x.group_id === g.group_id)) {
             prev.groups.push({ group_id: g.group_id, group_name: g.group_name ?? null })
@@ -141,6 +149,7 @@ const myFollowing = computed<MyRobotEntry[]>(() =>
           }
         } else {
           nodesById.set(n.node_id, {
+            leader_paused: !!n.leader_paused,
             node_id: n.node_id,
             name: n.name ?? null,
             mt5_login: n.mt5_login ?? null,
@@ -154,6 +163,7 @@ const myFollowing = computed<MyRobotEntry[]>(() =>
       }
     }
     return {
+      review_status: r.review_status,
       is_owner: r.is_owner,
       robot: r.robot,
       marketable: r.robot.marketable,
@@ -262,17 +272,16 @@ function fmtJoinedShort(ts: number | null): string {
     : `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`
 }
 
-/**
- * 节点当前是否**可勾选**。
- *
- * 三个不可选原因：主节点（不可被跟单）、「已跟过该机器人的分组」、
- * 主人已暂停 AI 跟单（整体收口）。
- * 模板里到处要用这个判定（高亮 / 置灰 / aria 状态 / tabindex），
- * 各写一遍很容易走偏 —— 统一收敛到这里。
- */
+/** 已跟随、审核中和机器人自有成员不可选；AI 允许主节点申请。 */
 function isNodeSelectable(nodeId: string): boolean {
-  if (detailPaused.value) return false
+  if (detailPaused.value || hasPendingApplication.value) return false
   return selectableNodeIds.value.has(nodeId) && !alreadyFollowingNodeIds.value.has(nodeId)
+    && !pendingNodeIds.value.has(nodeId)
+    && (detail.value?.my_nodes.find((node) => node.node_id === nodeId)?.selectable ?? true)
+}
+
+function canPickNode(nodeId: string): boolean {
+  return isNodeSelectable(nodeId) || (pickerMode.value === 'settings' && alreadyFollowingNodeIds.value.has(nodeId))
 }
 
 // ---------- 加载 ----------
@@ -465,6 +474,10 @@ onUnmounted(() => {
 // ---------- 加入 / 移出 ----------
 async function submitJoin() {
   if (!detail.value) return
+  if (hasPendingApplication.value) {
+    ElMessage.warning('该机器人已有申请审核中，请等待审核后再新增节点')
+    return
+  }
   // 暂停判定放在最前面：暂停时所有分组都不可选，下面「没有可加入分组」的分支
   // 会先一步返回，跟单员就看不到任何原因提示了 —— 按钮虽然已置灰，
   // 但置灰的**理由**必须说清楚，不能让人猜。
@@ -489,7 +502,7 @@ const nodeIds = (detail.value.my_nodes ?? [])
   .filter((nid) => selectedNodeIds.value.includes(nid))
   .filter((nid) => !alreadyFollowingNodeIds.value.has(nid))
   if (!nodeIds.length) {
-    ElMessage.warning('请选择至少一个可用节点（主节点不可跟单）')
+    ElMessage.warning('请选择至少一个可用节点')
     return
   }
   // 预聚合勾选里混进了已跟过的节点（用户先勾后切分组导致）—— 告诉用户被剔除了哪些，
@@ -505,12 +518,12 @@ const nodeIds = (detail.value.my_nodes ?? [])
         { type: 'warning', confirmButtonText: '继续', cancelButtonText: '取消' },
       )
         .then(() => resolve(true))
-        .catch(() => resolve(false))
+        .catch(() => { trackAiUi('cancel_dialog', { value: 'duplicate_node_confirmation' }); resolve(false) })
     }))) return
   }
   if (!(await new Promise<boolean>((resolve) => {
     ElMessageBox.confirm(
-      '确认跟单该 AI 机器人？',
+      '确认提交该 AI 机器人的跟单申请？\n\n审核通过后才接收新信号；手数按机器人完整执行，发单人修改参数会实时作用到在跑任务。',
       '确认跟单',
       {
         type: 'warning',
@@ -520,7 +533,7 @@ const nodeIds = (detail.value.my_nodes ?? [])
       },
     )
       .then(() => resolve(true))
-      .catch(() => resolve(false))
+      .catch(() => { trackAiUi('cancel_dialog', { group_id: detail.value?.robot.group_id, value: 'join_confirmation' }); resolve(false) })
   }))) return
   submitting.value = true
   try {
@@ -529,7 +542,8 @@ const nodeIds = (detail.value.my_nodes ?? [])
       group_ids: groupIds,
       node_ids: nodeIds,
     })
-    ElMessage.success(`已加入 ${res.joined.length} 个分组`)
+    if (res.pending.length) ElMessage.success('申请已提交，等待审核')
+    else ElMessage.warning(res.skipped[0]?.reason || '没有新增申请')
     await refreshAll()
     detail.value = await fetchAiRobotDetail(detail.value.robot.leader_user_id, perfWindow.value, detail.value.robot.group_id)
     selectedGroupIds.value = allSelectableGroupIds.value
@@ -546,7 +560,7 @@ async function changeNodeFollowState(nodeIds: string[], state: AiFollowNodeState
   const action = { running: '恢复跟单', paused: '暂停跟单', stopped: '停止跟单' }[state]
   try {
     await ElMessageBox.confirm(
-      `确认对 ${nodeIds.length} 个子节点${action}？\n\n${groupId ? '仅作用于本人节点在当前策略分组中的跟单，不影响其他策略、主节点或他人节点。' : '仅作用于这些节点的 AI 跟单，不影响主节点、其他节点或普通带单。'}\n${state === 'running' ? '恢复后接收后续新开仓，停止的关系需重新跟单。' : '停止接收新开仓；已有任务与持仓继续运行，平仓 / CLOSE 仍可执行。'}${state === 'stopped' ? '\n停止记录保留，可重新跟单。' : ''}`,
+      `确认对 ${nodeIds.length} 个节点${action}？\n\n${groupId ? '仅作用于本人节点在当前策略分组中的 AI 跟单，不影响其他策略或他人节点。' : '仅作用于这些节点的 AI 跟单，不影响自有策略、其他节点或普通带单。'}\n${state === 'running' ? '恢复后接收后续新开仓，停止的关系需重新跟单。' : '停止接收新开仓；已有任务与持仓继续运行，平仓 / CLOSE 仍可执行。'}${state === 'stopped' ? '\n停止记录保留，可重新跟单。' : ''}`,
       action, { type: 'warning', confirmButtonText: '确认', cancelButtonText: '取消' },
     )
   } catch { return }
@@ -584,9 +598,54 @@ const rankOn = ref(false)
 const onlineRobotCount = computed(() =>
   robots.value.filter((r) => r.primary_node?.online || r.primary_node?.status === 'online').length,
 )
-const mineTab = ref<'run' | 'hist' | 'nodes'>('run')
+const mineTab = ref<'run' | 'hist' | 'nodes' | 'pending'>('run')
 const pickerOpen = ref(false)
 const pickerMode = ref<'join' | 'settings'>('join')
+const pickerSearch = ref('')
+const pendingApplications = computed(() => (mine.value.applications || []).filter((item) => item.status === 'pending'))
+const hasPendingApplication = computed(() => pendingApplications.value.some((item) => item.group_id === detail.value?.robot.group_id))
+const applicationHistory = computed(() => (mine.value.applications || []).filter((item) => item.status === 'rejected' || item.status === 'cancelled'))
+const pendingNodeIds = computed(() => new Set(pendingApplications.value
+  .filter((item) => item.group_id === detail.value?.robot.group_id)
+  .flatMap((item) => item.nodes.map((node) => node.node_id))))
+const pickerNodes = computed(() => (detail.value?.my_nodes || []).filter((node) =>
+  `${node.name || ''} ${node.mt5_login || ''} ${node.node_id}`.toLowerCase().includes(pickerSearch.value.toLowerCase()),
+))
+const pickerBusy = ref(false)
+let pickerSearchTimer: number | undefined
+function closePicker(): void {
+  pickerOpen.value = false
+  trackAiUi('cancel_dialog', { group_id: detail.value?.robot.group_id, value: 'node_picker' })
+}
+async function removePickerNode(nodeId: string): Promise<void> {
+  if (pickerBusy.value) return
+  pickerBusy.value = true
+  trackAiUi('open_delete', { node_ids: [nodeId] })
+  try {
+    if (await deleteNodeWithConfirmation(nodeId)) {
+      selectedNodeIds.value = selectedNodeIds.value.filter((id) => id !== nodeId)
+      await refreshAll()
+      if (detail.value) await openRobot(detail.value.robot)
+      ElMessage.success('系统节点已删除')
+    } else trackAiUi('cancel_dialog', { node_ids: [nodeId], value: 'node_deletion' })
+  } catch (cause) { ElMessage.error(errText(cause, '删除节点失败')) }
+  finally { pickerBusy.value = false }
+}
+function entryForApplication(application: AiApplication): MyRobotEntry | undefined {
+  return myFollowing.value.find((entry) => entry.robot.group_id === application.group_id)
+}
+function reopenApplication(application: AiApplication): void {
+  const robot = robots.value.find((item) => item.group_id === application.group_id)
+  if (robot) void openPicker(robot, 'join')
+  else ElMessage.warning('该机器人暂未开放跟单')
+}
+watch(pickerSearch, (value) => {
+  window.clearTimeout(pickerSearchTimer)
+  pickerSearchTimer = window.setTimeout(() => trackAiUi('search', { group_id: detail.value?.robot.group_id, value }), 350)
+})
+watch(mineTab, (value) => trackAiUi('filter', { value }))
+watch(rankOn, (value) => trackAiUi('filter', { value: value ? 'rank' : 'default_order' }))
+onUnmounted(() => window.clearTimeout(pickerSearchTimer))
 
 const shownRobots = computed(() => {
   const list = [...robots.value]
@@ -594,10 +653,10 @@ const shownRobots = computed(() => {
   return list.sort((a, b) => (b.performance?.total_profit || 0) - (a.performance?.total_profit || 0))
 })
 const runningMine = computed(() =>
-  myFollowing.value.filter((entry) => entry.is_owner || entry.marketable || entry.nodes.some((node) => node.active_task_count > 0)),
+  myFollowing.value.filter((entry) => !entry.review_status && (entry.is_owner || entry.marketable || entry.nodes.some((node) => node.active_task_count > 0))),
 )
 const historyMine = computed(() =>
-  myFollowing.value.filter((entry) => !entry.is_owner && !entry.marketable && entry.nodes.every((node) => node.active_task_count === 0)),
+  myFollowing.value.filter((entry) => !entry.review_status && !entry.is_owner && !entry.marketable && entry.nodes.every((node) => node.active_task_count === 0)),
 )
 
 interface MagicHit { magic: number; group_id: string }
@@ -664,11 +723,7 @@ function fmtPx(n: number | null | undefined): string {
   const digits = Math.abs(n) >= 50 ? 2 : 5
   return n.toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits })
 }
-function nodeBalance(id: string): string {
-  const n = hub.accounts[id]?.balance
-  if (n == null) return '—'
-  return n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-}
+
 
 async function openPicker(robot: AiRobotSummary, mode: 'join' | 'settings') {
   pickerMode.value = mode
@@ -678,12 +733,15 @@ async function openPicker(robot: AiRobotSummary, mode: 'join' | 'settings') {
   const ids = (detail.value.my_nodes || []).map((n) => n.node_id)
   void loadAiBooks(ids)
   pickerOpen.value = true
+  pickerSearch.value = ''
+  trackAiUi('open_picker', { group_id: robot.group_id })
 }
 function togglePick(nodeId: string) {
-  if (pickerMode.value === 'join' && !isNodeSelectable(nodeId)) return
+  if (!canPickNode(nodeId)) return
   const next = new Set(selectedNodeIds.value)
   next.has(nodeId) ? next.delete(nodeId) : next.add(nodeId)
   selectedNodeIds.value = [...next]
+  trackAiUi('select_nodes', { group_id: detail.value?.robot.group_id, node_ids: [...next] })
 }
 async function submitPicker() {
   if (pickerMode.value === 'join') {
@@ -699,7 +757,7 @@ async function submitPicker() {
   if (!add.length && !remove.length) { pickerOpen.value = false; return }
   if (detailPaused.value && add.length) { ElMessage.warning(PAUSED_AI_HINT); return }
   try {
-    await ElMessageBox.confirm('确认更新跟单节点？新增的节点开始跟随，取消的节点移出跟单。', '设置跟单', {
+    await ElMessageBox.confirm('确认更新跟单节点？新增节点提交审核，取消的节点移出跟单。', '设置跟单', {
       type: 'warning', confirmButtonText: '确认', cancelButtonText: '取消',
     })
   } catch { return }
@@ -767,7 +825,7 @@ async function closeRobotAll(entry: MyRobotEntry) {
   } finally { closeBusy.value = false }
 }
 
-onMounted(() => { void hub.fetchNodes() })
+onMounted(() => { void hub.fetchNodes(); trackAiUi('page_view', { value: 'ai-trade' }) })
 </script>
 
 <template>
@@ -836,7 +894,7 @@ onMounted(() => { void hub.fetchNodes() })
     <section class="ai-mine-wrap">
       <div class="ai-mine-head">
         <p class="ai-kicker">我的机器人<span>{{ mineTab === 'nodes' ? followNodeCount : myFollowing.length }}</span></p>
-        <button type="button" class="ai-refresh" @click="refreshAll">
+        <button type="button" class="ai-refresh" @click="trackAiUi('refresh'); refreshAll()">
           <svg viewBox="0 0 24 24"><path fill="currentColor" d="M17.65 6.35A7.95 7.95 0 0 0 12 4V1L7 6l5 5V7a5 5 0 1 1-5 5H5a7 7 0 1 0 12.65-5.65z"/></svg>
           刷新
         </button>
@@ -850,6 +908,7 @@ onMounted(() => { void hub.fetchNodes() })
           <svg viewBox="0 0 24 24"><path fill="currentColor" d="M13 3a9 9 0 1 0 9 9h-2a7 7 0 1 1-2.05-4.95L16 9h5V4l-1.64 1.64A8.96 8.96 0 0 0 13 3zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8z"/></svg>
           历史机器人<span>{{ historyMine.length }}</span>
         </button>
+        <button type="button" :class="{ on: mineTab === 'pending' }" @click="mineTab = 'pending'">⌛ 待审核<span>{{ pendingApplications.length }}</span></button>
         <button type="button" class="push" :class="{ on: mineTab === 'nodes' }" @click="mineTab = 'nodes'">
           <svg viewBox="0 0 24 24"><path fill="currentColor" d="M22 11V3h-7v3H9V3H2v8h7V8h2v10h4v3h7v-8h-7v3h-2V8h2v3z"/></svg>
           子节点跟单统计<span>{{ followNodeCount }}</span>
@@ -881,9 +940,9 @@ onMounted(() => { void hub.fetchNodes() })
           <div class="ai-card-actions">
             <button type="button" class="link" @click="router.push({ name: 'ai-robot-detail', params: { leaderUserId: entry.robot.leader_user_id, groupId: entry.robot.group_id } })">查看详情<svg viewBox="0 0 24 24"><path fill="currentColor" d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg></button>
             <div>
-              <button v-if="(isMyRobot(entry.robot) && entry.marketable) || (!isMyRobot(entry.robot) && !entry.is_owner && entry.nodes.length)" type="button" class="amber" :disabled="pauseBusy || nodeStateBusy || closeBusy" @click="toggleRobotPause(entry)">
+              <button v-if="(isMyRobot(entry.robot) && entry.marketable) || (!isMyRobot(entry.robot) && !entry.is_owner && entry.nodes.length)" type="button" class="amber" :disabled="pauseBusy || nodeStateBusy || closeBusy || (!entry.is_owner && entry.nodes.every(node => node.leader_paused))" @click="toggleRobotPause(entry)">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" :d="robotControlPaused(entry) ? 'M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm-2 15V7l7 5-7 5z' : 'M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm-1 14H8V8h3v8zm5 0h-3V8h3v8z'"/></svg>
-                {{ robotControlPaused(entry) ? '启动机器人' : '暂停机器人' }}
+                {{ !entry.is_owner && entry.nodes.every(node => node.leader_paused) ? '频道已暂停' : robotControlPaused(entry) ? '启动机器人' : '暂停机器人' }}
               </button>
               <button type="button" class="solid" :disabled="closeBusy" @click="closeRobotAll(entry)"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="m11 21 1-7H7L13 3l-1 7h5l-6 11z"/></svg>一键平仓</button>
             </div>
@@ -905,8 +964,27 @@ onMounted(() => { void hub.fetchNodes() })
         </article>
       </div>
 
+      <div v-else-if="mineTab === 'pending'" class="ai-cards">
+        <p v-if="!pendingApplications.length" class="ai-empty">暂无待审核申请</p>
+        <article v-for="application in pendingApplications" :key="application.request_id" class="ai-card ai-application">
+          <div class="ai-card-top"><strong>{{ application.robot_name }}</strong><em class="off">{{ application.source === 'legacy' ? '等待复审' : '审核中' }}</em></div>
+          <p>{{ application.symbol || '—' }} · {{ application.nodes.length }} 个节点 · {{ fmtJoinedShort(application.created_at) }}</p>
+          <p>{{ application.nodes.map((node) => node.name || node.node_id).join('、') }}</p>
+          <p class="ai-application-note">审核通过后才接收新的策略信号。<template v-if="application.source === 'legacy'">已有任务和持仓继续运行。</template></p>
+          <div v-if="entryForApplication(application)" class="ai-card-actions">
+            <button type="button" class="link" @click="router.push({ name: 'ai-robot-detail', params: { leaderUserId: application.leader_user_id, groupId: application.group_id } })">查看任务与持仓</button>
+            <button type="button" class="solid" :disabled="closeBusy" @click="closeRobotAll(entryForApplication(application)!)">平仓</button>
+          </div>
+        </article>
+      </div>
+
       <div v-else-if="mineTab === 'hist'" class="ai-list">
-        <p v-if="!historyMine.length" class="ai-empty">没有已结束的跟单</p>
+        <p v-if="!historyMine.length && !applicationHistory.length" class="ai-empty">没有已结束的跟单</p>
+        <article v-for="application in applicationHistory" :key="`application-${application.request_id}`" class="ai-card ai-application">
+          <div class="ai-card-top"><strong>{{ application.robot_name }}</strong><em class="off">{{ application.status === 'rejected' ? '已拒绝' : '申请已取消' }}</em></div>
+          <p>{{ application.reason || '可在机器人重新开放后再次申请' }}</p>
+          <div class="ai-card-actions"><button type="button" class="link" @click="reopenApplication(application)">重新申请</button><template v-if="entryForApplication(application)"><button type="button" class="link" @click="router.push({ name: 'ai-robot-detail', params: { leaderUserId: application.leader_user_id, groupId: application.group_id } })">查看已有任务与持仓</button><button type="button" class="solid" :disabled="closeBusy" @click="closeRobotAll(entryForApplication(application)!)">平仓</button></template></div>
+        </article>
         <div v-for="entry in historyMine" :key="entry.robot.group_id" class="ai-row">
           <span class="ai-ico"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M13 3a9 9 0 1 0 9 9h-2a7 7 0 1 1-2.05-4.95L16 9h5V4l-1.64 1.64A8.96 8.96 0 0 0 13 3z"/></svg></span>
           <div class="ai-row-text">
@@ -928,51 +1006,31 @@ onMounted(() => { void hub.fetchNodes() })
       @saved="refreshAll"
     />
 
-    <div v-if="pickerOpen && detail" class="ai-mask" @click.self="pickerOpen = false">
-      <section class="ai-dialog" role="dialog" aria-label="选择跟单节点">
-        <header>
-          <div>
-            <strong>选择跟单节点</strong>
-            <p>跟单对象：{{ robotTitle(detail.robot) }}</p>
+    <div v-if="pickerOpen && detail" class="ai-mask" @click.self="closePicker" @keydown.esc="closePicker">
+      <section class="ai-dialog ai-picker-dialog" role="dialog" aria-modal="true" aria-label="选择跟单节点">
+        <header><span class="ai-picker-icon">⇄</span><div><strong>选择跟单节点</strong><p>跟单对象：{{ robotTitle(detail.robot) }} · {{ detail.robot.strategy_name }}</p></div><button type="button" class="ai-x" aria-label="关闭" @click="closePicker">×</button></header>
+        <div class="ai-picker-body">
+          <div class="ai-picker-robot"><RobotIcon :size="32" variant="iconfont" boxed /><div><strong>{{ robotTitle(detail.robot) }}</strong><p>{{ detail.robot.strategy_name }} · {{ detail.groups.map((group) => group.symbol).filter(Boolean).join('、') }}</p></div></div>
+          <p v-if="detailPaused" class="ai-warn">{{ PAUSED_AI_HINT }}</p>
+          <p v-if="hasPendingApplication" class="ai-warn">该机器人已有申请审核中，请等待审核后再新增节点。</p>
+          <div class="ai-picker-heading"><span>▣ 选择跟单节点 <em>{{ detail.my_nodes.length }} 个</em></span><span>可多选</span></div>
+          <label class="ai-picker-search"><span>⌕</span><input v-model="pickerSearch" placeholder="搜索节点名称 / 账号" aria-label="搜索跟单节点"></label>
+          <div class="ai-picker-list">
+            <p v-if="!pickerNodes.length" class="ai-empty">{{ pickerSearch ? '没有匹配的节点' : '暂无已开通的自有节点' }}</p>
+            <div v-for="node in pickerNodes" :key="node.node_id" class="ai-pick" :class="{ on: selectedNodeIds.includes(node.node_id), off: !canPickNode(node.node_id) }">
+              <label><input type="checkbox" :checked="selectedNodeIds.includes(node.node_id) || (pickerMode === 'join' && (alreadyFollowingNodeIds.has(node.node_id) || pendingNodeIds.has(node.node_id)))" :disabled="submitting || !canPickNode(node.node_id)" @change="togglePick(node.node_id)"><i class="node-dot" :class="{ online: node.online }"></i><span><b>{{ node.name || node.node_id }} <em v-if="node.is_primary">♛ 主节点</em></b><small>{{ node.mt5_login || node.node_id }} · {{ node.owner_name || auth.me?.username }} · 余额 {{ node.balance == null ? '暂无数据' : node.balance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' U' }}</small><small v-if="pendingNodeIds.has(node.node_id)" class="ai-pending-hint">审核中</small><small v-else-if="alreadyFollowingNodeIds.has(node.node_id)">已跟随该机器人</small><small v-else-if="node.unselectable_reason">{{ node.unselectable_reason }}</small></span></label>
+              <button type="button" class="ai-picker-delete" :aria-label="`删除节点 ${node.name || node.node_id}`" :disabled="submitting || pickerBusy" @click.stop="removePickerNode(node.node_id)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7"/></svg></button>
+            </div>
           </div>
-          <button type="button" class="ai-x" @click="pickerOpen = false">×</button>
-        </header>
-        <p v-if="detailPaused" class="ai-warn">{{ PAUSED_AI_HINT }}</p>
-        <p v-else-if="detailLoading" class="ai-empty">加载节点…</p>
-        <p v-else-if="!(detail.my_nodes || []).length" class="ai-empty">没有可跟单的节点。主节点不能用于跟单。</p>
-        <button
-          v-for="n in detail.my_nodes"
-          :key="n.node_id"
-          type="button"
-          class="ai-pick"
-          :class="{ on: selectedNodeIds.includes(n.node_id), off: pickerMode === 'join' && !isNodeSelectable(n.node_id) }"
-          :disabled="pickerMode === 'join' && !isNodeSelectable(n.node_id)"
-          @click="togglePick(n.node_id)"
-        >
-          <span class="box">{{ selectedNodeIds.includes(n.node_id) ? '✓' : '' }}</span>
-          <span>
-            <b>{{ n.name || n.node_id }} <em v-if="n.is_primary">主节点</em></b>
-            <small>{{ n.node_id }} · 余额 {{ nodeBalance(n.node_id) }}</small>
-          </span>
-        </button>
-        <footer>
-          <button type="button" @click="pickerOpen = false">取消</button>
-          <button type="button" class="primary" :disabled="submitting || (detailPaused && pickerMode === 'join')" @click="submitPicker">
-            {{ pickerMode === 'settings' ? '保存设置' : `使用 ${selectedNodeIds.length} 个节点跟单` }}
-          </button>
-        </footer>
+        </div>
+        <footer><div><button type="button" @click="closePicker">取消</button><button type="button" class="primary" :disabled="submitting || pickerBusy || (!selectedNodeIds.length && pickerMode === 'join') || (detailPaused && pickerMode === 'join')" @click="submitPicker">{{ submitting ? '提交中…' : pickerMode === 'settings' ? '保存设置' : `⇄ 使用 ${selectedNodeIds.length} 个节点跟单` }}</button></div><p>可同时勾选多个节点，审核通过后同步所选机器人的新信号</p></footer>
       </section>
     </div>
   </div>
 </template>
 
 <style scoped>
-:global(.app-shell.is-customer:has(.ai)) { color: #E6EBF4; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif; font-size: 16px; line-height: 1.5; }
-:global(.brand-back-ai) { width: 28px; height: 28px; flex-shrink: 0; margin-right: 4px; border-radius: 8px; color: #8B96A8; font-size: 16px; font-weight: 400; line-height: 24px; }
-:global(.brand-back-ai svg) { width: 19px; height: 19px; }
-:global(.brand-back-ai:hover) { background: #16213A; color: #E6EBF4; }
-:global(.app-shell.is-customer:has(.ai) .brand-page) { line-height: 20px; letter-spacing: normal; }
-:global(.app-shell.is-customer:has(.ai) .nav-customer a) { line-height: 16px; transition: color .15s, background-color .15s, border-color .15s; }
+
 .ai { display: flex; flex-direction: column; gap: 12px; color: #E6EBF4; font-size: 16px; line-height: 1.5; }
 :global(.app-shell.is-customer:has(.ai) .topbar-customer) { height: auto; }
 .ai button { line-height: 1.5; backdrop-filter: none; -webkit-backdrop-filter: none; }
@@ -1112,4 +1170,48 @@ button:disabled { opacity: .45; cursor: not-allowed; }
   .ai-hero { padding: 20px; }
   .ai-cards { grid-template-columns: 1fr 1fr; }
 }
+.ai-picker-dialog { width: min(520px, calc(100vw - 24px)); max-height: 88dvh; padding: 0; display: flex; flex-direction: column; overflow: hidden; }
+.ai-picker-dialog > header { flex-shrink: 0; padding: 16px; gap: 12px; border-bottom: 1px solid #1c2740; margin: 0; }
+.ai-picker-dialog > header > div { flex: 1; min-width: 0; }
+.ai-picker-dialog > header strong { font-size: 14px; }
+.ai-picker-dialog > header p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ai-picker-icon { display: grid; place-items: center; width: 40px; height: 40px; border-radius: 12px; background: #8b5cf625; color: #a78bfa; font-size: 24px; }
+.ai-picker-body { padding: 12px 16px 0; min-height: 0; overflow: auto; }
+.ai-picker-robot { display: flex; align-items: center; gap: 10px; padding: 10px; border: 1px solid #22304a; border-radius: 10px; background: #0a101c; }
+.ai-picker-robot strong { font-size: 12px; }
+.ai-picker-robot p { margin: 4px 0 0; color: #5b6b85; font-size: 10px; }
+.ai-picker-heading { display: flex; align-items: center; gap: 6px; margin: 12px 0 8px; font-size: 11px; color: #8b96a8; }
+.ai-picker-heading > span:last-child { color: #22d3ee; font-size: 9px; }
+.ai-picker-heading em { font-style: normal; border: 1px solid #22304a; border-radius: 99px; padding: 1px 5px; font-size: 9px; }
+.ai-picker-search { display: flex; align-items: center; gap: 8px; border: 1px solid #22304a; border-radius: 9px; padding: 8px 10px; background: #0a101c; color: #5b6b85; margin-bottom: 8px; }
+.ai-picker-search input { width: 100%; background: none; border: 0; outline: none; color: #e6ebf4; font-size: 11px; }
+.ai-picker-search input::placeholder { color: #5b6b85; }
+.ai-picker-list .ai-pick { display: flex; align-items: center; padding: 0; margin: 6px 0; min-height: 58px; border: 1px solid #22304a; border-radius: 10px; background: #0c1220; }
+.ai-picker-list .ai-pick.on { border-color: #8b5cf6; background: #8b5cf612; box-shadow: 0 0 0 1px #8b5cf622; }
+.ai-picker-list .ai-pick.off { opacity: .65; }
+.ai-pick label { flex: 1; min-width: 0; display: flex; align-items: center; gap: 7px; padding: 10px; cursor: pointer; }
+.ai-pick label > span { min-width: 0; flex: 1; }
+.ai-pick input { accent-color: #8b5cf6; width: 15px; height: 15px; margin: 0; flex-shrink: 0; }
+.ai-pick .node-dot { width: 6px; height: 6px; border-radius: 50%; background: #64748b; flex-shrink: 0; }
+.ai-pick .node-dot.online { background: #22c55e; box-shadow: 0 0 6px #22c55e80; }
+.ai-pick small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 3px; }
+.ai-pick b em { color: #fbbf24; border: 1px solid #f59e0b50; background: #f59e0b15; border-radius: 4px; padding: 1px 4px; font-size: 9px; }
+.ai-pending-hint { color: #fbbf24!important; }
+.ai-picker-delete { display: grid; place-items: center; width: 32px; height: 32px; flex-shrink: 0; margin-right: 7px; color: #64748b; background: none; border: 0; border-radius: 6px; cursor: pointer; }
+.ai-picker-delete:hover { color: #f87171; background: #f6465d15; }
+.ai-picker-delete svg { width: 14px; height: 14px; }
+.ai-picker-dialog > footer { display: block; flex-shrink: 0; border-top: 1px solid #1c2740; padding: 10px 16px 12px; margin: 0; background: #101828; }
+.ai-picker-dialog > footer > div { display: flex; gap: 8px; }
+.ai-picker-dialog > footer button { flex: 1; padding: 10px; border: 1px solid #22304a; border-radius: 10px; background: #0c1220; color: #8b96a8; font-size: 11px; cursor: pointer; }
+.ai-picker-dialog > footer button.primary { flex: 2; border: 0; background: linear-gradient(90deg,#7c3aed,#2563eb); color: #fff; font-weight: 700; }
+.ai-picker-dialog > footer button:disabled { opacity: .4; cursor: not-allowed; }
+.ai-picker-dialog > footer p { text-align: center; font-size: 9px; color: #5b6b85; margin: 8px 0 0; }
+.ai-application > p { font-size: 11px; color: #8b96a8; margin: 8px 0 0; }
+.ai-application .ai-application-note { color: #fbbf24; font-size: 10px; }
+:global(.app-shell.is-customer:has(.ai)) { color: #E6EBF4; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif; font-size: 16px; line-height: 1.5; }
+:global(.brand-back-ai) { width: 28px; height: 28px; flex-shrink: 0; margin-right: 4px; border-radius: 8px; color: #8B96A8; font-size: 16px; font-weight: 400; line-height: 24px; }
+:global(.brand-back-ai svg) { width: 19px; height: 19px; }
+:global(.brand-back-ai:hover) { background: #16213A; color: #E6EBF4; }
+:global(.app-shell.is-customer:has(.ai) .brand-page) { line-height: 20px; letter-spacing: normal; }
+:global(.app-shell.is-customer:has(.ai) .nav-customer a) { line-height: 16px; transition: color .15s, background-color .15s, border-color .15s; }
 </style>

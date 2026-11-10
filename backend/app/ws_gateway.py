@@ -23,6 +23,7 @@ from . import (
     mt5_identity,
     node_service,
     node_credentials,
+    node_lifecycle,
     persist,
     results,
     risk_control,
@@ -153,6 +154,11 @@ async def node_ws(ws: WebSocket):
         # 兜底走 DB 直查（避免缓存未同步时误判为不存在）
         node = await node_service.find_by_mt5_login(client_login)
 
+    if await node_credentials.deleted_login_denied(client_login, node.get("node_id") if node else None):
+        await ws.send_json({"type": "auth_fail", "data": {"reason": "node_deleted", "message": "节点已删除，需要重新申请专属凭证"}})
+        await ws.close(code=4401)
+        return
+
     if not node:
         try:
             node = await node_service.auto_register(store, client_login)
@@ -199,28 +205,29 @@ async def node_ws(ws: WebSocket):
         await ws.close(code=4409)  # 4409：重复连接被拒绝
         return
 
-    # 客户端版本随鉴权首包上报（协议见 技术实现方案.md 的 auth.client_version）。
-    # 旧版本节点不带该字段，一律按「未知版本」放行，绝不因此拒绝接入。
-    await node_service.report_client_version(store, node_id, data.get("client_version") or "")
-
-    # 先登记连接再回 auth_ok，确保节点收到确认时即可被路由（消除竞态）
-    ws.scope["node_credential_kind"] = "scoped" if scoped else "legacy"
-    await manager.register_node(node_id, ws)
-    await store.touch_online(node_id)
-    watch_symbols = rules.filter_watch_symbols(await store.get_filters())
-    await ws.send_json(
-        {
-            "type": "auth_ok",
-            "data": {
-                "node_id": node_id,
-                "heartbeat": settings.heartbeat_interval,
-                "watch_symbols": watch_symbols,
-                # 登录成功即同步账户级风控，节点据此本地监控执行
-                "risk": risk_control.normalize_risk(node.get("risk")),
-            },
-        }
-    )
-    await manager.broadcast_admin({"type": "node_status", "data": {"node_id": node_id, "status": "online"}})
+    async with node_lifecycle.locked(node_lifecycle.node_key(node_id)):
+        if await node_credentials.deleted_login_denied(client_login, node_id):
+            await ws.send_json({"type": "auth_fail", "data": {"reason": "node_deleted"}})
+            await ws.close(code=4401)
+            return
+        await node_service.report_client_version(store, node_id, data.get("client_version") or "")
+        # 删除与最终登记互斥，避免已通过首轮鉴权的旧连接在删除后重新登记。
+        ws.scope["node_credential_kind"] = "scoped" if scoped else "legacy"
+        await manager.register_node(node_id, ws)
+        await store.touch_online(node_id)
+        watch_symbols = rules.filter_watch_symbols(await store.get_filters())
+        await ws.send_json(
+            {
+                "type": "auth_ok",
+                "data": {
+                    "node_id": node_id,
+                    "heartbeat": settings.heartbeat_interval,
+                    "watch_symbols": watch_symbols,
+                    "risk": risk_control.normalize_risk(node.get("risk")),
+                },
+            }
+        )
+        await manager.broadcast_admin({"type": "node_status", "data": {"node_id": node_id, "status": "online"}})
     await _flush_pending_stops(node_id, ws)
     await _resume_strategy_tasks(node_id, ws)
 
@@ -303,7 +310,16 @@ async def _session(node_id: str, ws: WebSocket) -> None:
             logger.debug("node %s unknown msg type=%s", node_id, mtype)
 
 
-async def _save_account(node_id: str, ws: WebSocket, data: dict) -> None:
+async def _save_account(node_id, ws, data):
+    from .node_lifecycle import locked, node_key
+    async with locked(node_key(node_id)):
+        if await state.store.get_node(node_id) is None:
+            await ws.close(code=4401)
+            return
+        await _save_account_active(node_id, ws, data)
+
+
+async def _save_account_active(node_id: str, ws: WebSocket, data: dict) -> None:
     """把节点上报的账户/持仓/报价整理成标准快照，存 Redis 并推送后台。
 
     若上报 login 与节点绑定不符，拒绝入库并断开连接。
@@ -334,6 +350,7 @@ async def _save_account(node_id: str, ws: WebSocket, data: dict) -> None:
         "free_margin": acct.get("free_margin", acct.get("margin_free", 0)),
         "leverage": acct.get("leverage", 0),
         "positions": positions,
+        "books_readable": books_ok and isinstance(data.get("positions"), list) and isinstance(data.get("orders"), list),
         # 未成交挂单：限价开仓的任务在成交前只有它，对账必须看得见
         "orders": orders,
         "prices": data.get("prices", {}),  # 供区间过滤取价
