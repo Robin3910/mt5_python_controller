@@ -29,6 +29,14 @@ onMounted(() => {
 // icon: inline SVG path，accent: 图标色 / 底色（15% 透明度）
 const ALL_MODULES: ProfileHubModule[] = [
   {
+    code: 'ai_channel',
+    label: 'AI交易机器人频道',
+    description: '机器人申请审核 · 频道管理',
+    path: '/my-ai-channel',
+    icon: '<rect x="4" y="8" width="16" height="12" rx="2"/><path d="M12 8V4M8 14h1M15 14h1M9 17h6"/>',
+    accent: '#22C55E',
+  },
+  {
     code: 'dashboard',
     label: '总览',
     description: '实时净值、持仓与事件流',
@@ -137,7 +145,9 @@ const ALL_MODULES: ProfileHubModule[] = [
 
 // 管理员 / 普通用户：都按菜单权限过滤；管理员额外加「首页」「分组管理」入口
 const visibleModules = computed<ProfileHubModule[]>(() => {
-  let base = auth.isAdmin ? ALL_MODULES : ALL_MODULES.filter((m) => m.code !== 'config' && auth.hasMenu(m.code))
+  let base = ALL_MODULES.filter((m) => m.code === 'ai_channel'
+    ? auth.hasMenu('ai_trade') && auth.canUseAiStrategy && auth.canBeFollowLeader
+    : auth.isAdmin || (m.code !== 'config' && auth.hasMenu(m.code)))
   if (auth.isAdmin) {
     base = [
       {

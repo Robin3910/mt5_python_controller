@@ -6,7 +6,8 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
-from . import node_service, permissions, persist, rbac_service, risk_control
+from . import node_deletion, node_service, permissions, persist, rbac_service, risk_control
+from .ai_channel_models import NodeDeleteRequest
 from .connections import manager
 from .deps import (
     client_ip,
@@ -189,22 +190,24 @@ async def update_node(
     return await _to_node_out(store, d, await rbac_service.owner_names_for(p))
 
 
+@router.get("/{node_id}/deletion-preview")
+async def preview_node_deletion(node_id: str, request: Request, store: RedisStore = Depends(get_store),
+                                p: Principal = Depends(get_principal)):
+    try:
+        return await node_deletion.preview(store, p, record=True, ip=client_ip(request), node_id=node_id)
+    except HTTPException as exc:
+        await node_deletion.failed(p, "preview_node_deletion", node_id, exc, client_ip(request))
+        raise
+
+
 @router.delete("/{node_id}")
-async def delete_node(
-    node_id: str,
-    request: Request,
-    store: RedisStore = Depends(get_store),
-    p: Principal = Depends(require_admin),
-):
-    before = _node_audit_snapshot(await store.get_node(node_id))
-    ok = await node_service.delete_node(store, node_id)
-    if not ok:
-        raise HTTPException(status_code=404, detail="node not found")
-    await persist.audit(
-        p.username, "delete_node", node_id, None, "ok", client_ip(request),
-        category="node", before=before, after=None,
-    )
-    return {"status": "deleted", "node_id": node_id}
+async def delete_node(node_id: str, body: NodeDeleteRequest, request: Request,
+                      store: RedisStore = Depends(get_store), p: Principal = Depends(get_principal)):
+    try:
+        return await node_deletion.execute(store, p, body.version, [node_id], ip=client_ip(request), node_id=node_id)
+    except HTTPException as exc:
+        await node_deletion.failed(p, "delete_node", node_id, exc, client_ip(request))
+        raise
 
 
 @router.post("/lot")
@@ -238,21 +241,8 @@ async def set_primary_node(
     store: RedisStore = Depends(get_store),
     p: Principal = Depends(require_menu(MENU_HOME, MENU_NODES)),
 ):
-    """设置 / 取消某节点的主节点标记。
-
-    每个所有者（普通用户 / 管理员）名下最多一个主节点；传 is_primary=True 时
-    同 owner 下其它节点的原主节点标记会被自动清掉，保证唯一性。归属校验沿用
-    owned_node_or_404 普通用户不能动管理员名下的节点。
-
-    阻塞前置（两种，都返回 409）：
-    1. 待晋升的节点当前**仍在跟单** -> code=primary_switch_following_blocked，
-       带 blocking_followings 明细。主节点不可用于跟单，跟单关系又是持久状态，
-       放任升主只会把用户的跟单配置静默删掉，所以这里显式拒绝。
-    2. 被替换 / 被取消的旧主节点上仍有 in-flight 子任务 -> code=primary_switch_blocked，
-       带 blocking_tasks 明细。
-
-    路由不接受任何 force / 强制绕过参数 —— 唯一放行条件是"无跟单 + 无 in-flight"。
-    分组和策略不做迁移：新主节点触发信号时会自动创建新分组和策略。
+    """按所有者切换唯一主节点；普通带单和旧主节点在途任务返回 409。
+    AI 跟单关系保留，不接受强制绕过参数。
     """
     await owned_node_or_404(store, p, node_id)
     try:
@@ -285,12 +275,7 @@ async def list_node_followings(
     store: RedisStore = Depends(get_store),
     p: Principal = Depends(require_menu(MENU_HOME, MENU_NODES)),
 ):
-    """某节点当前的跟单关系（精简明细）。
-
-    仅用于设置主节点前的轻量预查：前端在确认弹窗前先拉一次，若非空则禁用
-    提交按钮 / 改文案为「该节点有 N 个跟单，无法设为主节点」。权限与
-    set_primary 共享 owned_node_or_404。
-    """
+    """设置主节点前预查阻塞的普通带单关系，AI 关系不计入。"""
     await owned_node_or_404(store, p, node_id)
     items = await node_service.list_followings_for_node(node_id)
     node = await store.get_node(node_id) or {}

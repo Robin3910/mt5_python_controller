@@ -232,7 +232,8 @@ def test_node_scope(client):
     assert client.patch(f"/api/nodes/{n1}", json={"name": "我的节点"}, headers=ah).status_code == 200
     assert client.patch(f"/api/nodes/{n1}", json={"filters": {}}, headers=ah).status_code == 403
     assert client.patch(f"/api/nodes/{n2}", json={"name": "x"}, headers=ah).status_code == 404
-    assert client.delete(f"/api/nodes/{n1}", headers=ah).status_code == 403
+    assert client.get(f"/api/nodes/{n1}/deletion-preview", headers=ah).status_code == 200
+    assert client.delete(f"/api/nodes/{n1}", headers=ah).status_code == 422
 
     admin_view = {n["node_id"]: n for n in client.get("/api/nodes", headers=h).json()}
     assert admin_view[n1]["owner_user_id"] == alice["id"]

@@ -640,3 +640,10 @@ curl -X POST http://localhost:8000/webhook \
 > - `backend/tests/test_api.py` —— 含 webhook→分发→节点回报的全链路冒烟，以及 **`GET /api/events/signals`** 分页与 `raw_payload` 断言。
 >
 > 运行：`cd backend && python -m pytest tests/test_parser.py tests/test_webhook.py tests/test_group_dispatch.py -q`
+
+
+## AI 跟单审核对 strategy 分发的影响（2026-11-09）
+
+AI 市场（tpl_1）仅向审核通过且个人/频道均未暂停的跟单关系分发新开仓。待审、拒绝和待复审节点不参与新信号；自有分组成员沿用原规则。跟单节点可为主节点，normal 与普通带单的准入不变。
+
+本次不改变 webhook 入参、手数、幂等、busy 和魔术号；已有策略任务继续执行，CLOSE/strategy_stop 仍可用于收尾。真正删除系统节点会清理该节点在所有市场的绑定，并以交易状态检查、确认范围及审计约束执行。

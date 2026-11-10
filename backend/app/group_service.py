@@ -73,6 +73,7 @@ def group_row_to_dict(
                 "node_id": f.node_id,
                 "follower_user_id": f.follower_user_id,
                 "follow_state": getattr(f, "follow_state", None) or "running",
+                "leader_paused": bool(f.leader_paused),
                 "leader_user_id": f.leader_user_id,
                 "leader_primary_node_id": f.leader_primary_node_id,
                 "sort_order": f.sort_order or 0,
@@ -281,7 +282,13 @@ async def group_owner(group_id: str) -> tuple[bool, Optional[int]]:
         return True, permissions.normalize_owner(row.owner_user_id)
 
 
-async def create_group(
+async def create_group(store: RedisStore, payload: GroupCreate, *, owner_user_id: Optional[int] = None) -> dict:
+    from .node_lifecycle import locked, node_key
+    async with locked(*(node_key(nid) for nid in payload.node_ids)):
+        return await _create_group(store, payload, owner_user_id=owner_user_id)
+
+
+async def _create_group(
     store: RedisStore, payload: GroupCreate, *, owner_user_id: Optional[int] = None,
 ) -> dict:
     """创建分组：写库 + 刷新缓存。owner_user_id 为空 = 管理员名下。"""
@@ -336,6 +343,14 @@ async def create_group(
 
 
 async def update_group(store: RedisStore, group_id: str, patch: GroupUpdate) -> Optional[dict]:
+    from .node_lifecycle import group_key, locked, node_key
+    async with SessionLocal() as session:
+        members = (await session.scalars(select(NodeGroupMember.node_id).where(NodeGroupMember.group_id == group_id))).all()
+    async with locked(group_key(group_id), *(node_key(nid) for nid in {*members, *(patch.node_ids or [])})):
+        return await _update_group(store, group_id, patch)
+
+
+async def _update_group(store: RedisStore, group_id: str, patch: GroupUpdate) -> Optional[dict]:
     """更新分组：仅写入提供的字段；node_ids 传入即整体替换成员。
 
     成员与策略按分组原所有者校验（管理员编辑用户的分组时同样只能选该用户名下的）。
@@ -364,6 +379,7 @@ async def update_group(store: RedisStore, group_id: str, patch: GroupUpdate) -> 
         row = await s.get(NodeGroup, group_id)
         if not row:
             return None
+        previous_strategy_id = row.strategy_id
         if patch.name is not None and patch.name.strip():
             row.name = patch.name.strip()
         if patch.enabled is not None:
@@ -383,6 +399,9 @@ async def update_group(store: RedisStore, group_id: str, patch: GroupUpdate) -> 
             row.remark = patch.remark.strip() or None
         if update_strategy:
             row.strategy_id = strategy_id
+        if (update_strategy and previous_strategy_id != row.strategy_id) or patch.enabled is False or patch.accept_ai_follow is False:
+            from .ai_application_store import cancel_applications
+            await cancel_applications(s, "机器人配置已失效，请重新申请", group_ids=[group_id], pending_only=True)
         final_sid = row.strategy_id
         if row.signal_concurrent_enabled:
             sty = await _strategy_dict(store, final_sid)
@@ -435,6 +454,12 @@ async def update_group(store: RedisStore, group_id: str, patch: GroupUpdate) -> 
 
 
 async def delete_group(store: RedisStore, group_id: str) -> bool:
+    from .node_lifecycle import group_key, locked
+    async with locked(group_key(group_id)):
+        return await _delete_group(store, group_id)
+
+
+async def _delete_group(store: RedisStore, group_id: str) -> bool:
     """删除分组：先删库（成员关联 + 跟单关系级联），再清理 Redis 缓存与轮转顺序。
 
     跟单关系必须一并删：分组没了，留下来的跟单行就是永远不会被分发的脏数据。
@@ -443,6 +468,8 @@ async def delete_group(store: RedisStore, group_id: str) -> bool:
         row = await s.get(NodeGroup, group_id)
         if not row:
             return False
+        from .ai_application_store import cancel_applications
+        await cancel_applications(s, "机器人分组已删除", group_ids=[group_id])
         await s.execute(delete(NodeGroupMember).where(NodeGroupMember.group_id == group_id))
         await s.execute(delete(GroupFollowerNode).where(GroupFollowerNode.group_id == group_id))
         await s.delete(row)
@@ -465,6 +492,8 @@ async def clear_strategy_bindings(store: RedisStore, strategy_id: str) -> list[s
         affected = sorted(set(rows))
         if not affected:
             return []
+        from .ai_application_store import cancel_applications
+        await cancel_applications(s, "机器人策略已删除", group_ids=affected)
         await s.execute(
             update(NodeGroup).where(NodeGroup.strategy_id == sid).values(
                 strategy_id=None, limit_watch_enabled=False,

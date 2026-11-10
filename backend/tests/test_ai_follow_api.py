@@ -48,6 +48,17 @@ def _login(client, username: str) -> dict:
     return {"Authorization": f"Bearer {r.json()['token']}"}
 
 
+def _approve_pending(client, headers, request_ids=None):
+    """为测试后续运行行为建立已审核前置条件。"""
+    response = client.get("/api/ai-channel/requests", params={"page_size": 100}, headers=headers)
+    if response.status_code == 403:
+        return
+    assert response.status_code == 200, response.text
+    for request_id in response.json()["all_pending_request_ids"] if request_ids is None else request_ids:
+        approved = client.post(f"/api/ai-channel/requests/{request_id}/approve", headers=headers)
+        assert approved.status_code == 200, approved.text
+
+
 def _mk_user(client, h, username: str) -> dict:
     r = client.post("/api/users", json={"username": username, "password": _PWD}, headers=h)
     assert r.status_code == 201, r.text
@@ -312,8 +323,10 @@ def test_join_ai_follow_succeeds(client):
         },
         headers=bob_h,
     )
+    _approve_pending(client, s["host_h"])
     assert r.status_code == 200, r.text
-    assert len(r.json()["joined"]) == 1
+    assert r.json()["joined"] == []
+    assert len(r.json()["pending"]) == 1
 
     # 我的 AI 跟单里能看到
     m = client.get("/api/ai-follow/me", headers=bob_h)
@@ -337,6 +350,7 @@ def test_join_ai_follow_rejects_unopened_group(client):
         },
         headers=bob_h,
     )
+    _approve_pending(client, s["host_h"])
     assert r.status_code == 400, r.text
 
 
@@ -356,6 +370,7 @@ def test_join_ai_follow_rejects_grid_group(client):
         },
         headers=bob_h,
     )
+    _approve_pending(client, s["host_h"])
     assert r.status_code == 400, r.text
 
 
@@ -376,8 +391,8 @@ def test_follow_tab_rejects_ai_group(client):
     assert r.status_code == 400, r.text
 
 
-def test_join_ai_follow_rejects_primary_node(client):
-    """主节点不可用于跟单。"""
+def test_join_ai_follow_allows_primary_after_approval(client):
+    """AI 主节点可申请，审核通过后生效。"""
     admin_h = _login(client, "admin")
     s = _setup(client, admin_h, caps=[CAP_AI, CAP_LEADER])
     bob_h = _login(client, "bob")
@@ -390,7 +405,8 @@ def test_join_ai_follow_rejects_primary_node(client):
         },
         headers=bob_h,
     )
-    assert r.status_code == 400, r.text
+    _approve_pending(client, s["host_h"])
+    assert r.status_code == 200, r.text
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +426,7 @@ def test_leave_ai_follow_works(client):
         },
         headers=bob_h,
     )
+    _approve_pending(client, s["host_h"])
     r = client.post(
         "/api/ai-follow/leave",
         json={
@@ -440,6 +457,7 @@ def test_leave_ai_follow_default_keeps_running_tasks(client):
         },
         headers=bob_h,
     )
+    _approve_pending(client, s["host_h"])
     r = client.post(
         "/api/ai-follow/leave",
         json={
@@ -470,6 +488,7 @@ def test_leave_ai_follow_works_after_capability_revoked(client):
         },
         headers=bob_h,
     )
+    _approve_pending(client, s["host_h"])
     # 撤销能力
     roles = client.get("/api/roles", headers=admin_h).json()
     role = next(r for r in roles if r["code"] == "hostrole")
@@ -509,7 +528,7 @@ def test_robot_detail_returns_groups_and_my_nodes(client):
     assert body["groups"][0]["signal_concurrent_enabled"] is False
     assert body["groups"][0]["concurrent_unavailable_reason"]
     # 我的可跟单节点：只有非主节点
-    assert [n["node_id"] for n in body["my_nodes"]] == [s["b_follow"]]
+    assert {n["node_id"] for n in body["my_nodes"]} == {s["b_primary"], s["b_follow"]}
 
 
 def test_robot_detail_404_when_not_host(client):
@@ -573,6 +592,7 @@ def test_detail_my_follow_node_ids_reflects_own_group(client):
         },
         headers=bob_h,
     )
+    _approve_pending(client, s["host_h"])
     assert r.status_code == 200, r.text
 
     d = client.get(f"/api/ai-follow/robots/{s['host']['id']}", headers=bob_h)
@@ -669,6 +689,7 @@ def test_ai_my_follow_counts_only_ai_market(client):
               "node_ids": [s["b_follow"]]},
         headers=bob_h,
     ).status_code == 200
+    _approve_pending(client, s["host_h"])
 
     m = client.get("/api/ai-follow/me", headers=bob_h)
     assert m.status_code == 200, m.text
@@ -694,6 +715,7 @@ def test_ai_robot_list_my_follow_count_reflects_own_market(client):
         },
         headers=bob_h,
     ).status_code == 200
+    _approve_pending(client, s["host_h"])
 
     r = client.get("/api/ai-follow/robots", headers=bob_h)
     robot = next(x for x in r.json()["robots"] if x["leader_user_id"] == s["host"]["id"])
@@ -740,6 +762,7 @@ def test_ai_me_excludes_follow_market_groups(client):
         },
         headers=bob_h,
     ).status_code == 200
+    _approve_pending(client, s["host_h"])
 
     m = client.get("/api/ai-follow/me", headers=bob_h)
     assert m.status_code == 200, m.text
@@ -770,6 +793,7 @@ def test_leave_across_market_is_skipped_and_relation_kept(client):
         },
         headers=bob_h,
     ).status_code == 200
+    _approve_pending(client, s["host_h"])
 
     # 在带单 tab 移出 AI 分组
     r = client.post(
@@ -848,6 +872,7 @@ def test_leave_same_market_still_works(client):
         },
         headers=bob_h,
     ).status_code == 200
+    _approve_pending(client, s["host_h"])
 
     r = client.post(
         "/api/ai-follow/leave",

@@ -10,6 +10,7 @@
 这三个用例是本次改造的**回归红线**：任何一个变绿都说明市场隔离写错了。
 """
 
+import json
 import pytest
 from sqlalchemy import delete, select
 
@@ -19,6 +20,11 @@ from app.db import SessionLocal, init_db
 from app.group_dispatcher import GroupDispatcher
 from app.models import GroupCreate
 from app.orm import (
+    AiFollowApplication,
+    AiFollowApplicationNode,
+    DeletedNode,
+    Node,
+    NodeCredential,
     GroupFollowerNode,
     Role,
     RoleMenu,
@@ -47,6 +53,11 @@ from app.strategy_templates import (
 )
 
 _TABLES = (
+    AiFollowApplicationNode,
+    AiFollowApplication,
+    DeletedNode,
+    NodeCredential,
+    Node,
     GroupTaskEvent,
     GroupTaskDispatch,
     GroupSignalTask,
@@ -95,6 +106,12 @@ def mk_node(node_id, *, enabled=True, owner_user_id=None, **kw):
 
 
 async def online(store, *nodes):
+    async with SessionLocal() as session:
+        for node in nodes:
+            if await session.get(Node, node["node_id"]) is None:
+                session.add(Node(node_id=node["node_id"], name=node["name"], mt5_login=node["mt5_login"],
+                    owner_user_id=node.get("owner_user_id"), enabled=node.get("enabled", True), is_primary=node.get("is_primary", False)))
+        await session.commit()
     for n in nodes:
         await store.cache_node(n)
         manager.nodes[n["node_id"]] = object()
@@ -103,7 +120,7 @@ async def online(store, *nodes):
 async def leader_nodes(store, leader_id, *node_ids):
     """建带单员名下的节点并置为在线。"""
     await online(store, *[
-        mk_node(nid, owner_user_id=leader_id) for nid in node_ids
+        mk_node(nid, owner_user_id=leader_id, is_primary=(index == 0)) for index, nid in enumerate(node_ids)
     ])
 
 
@@ -172,6 +189,7 @@ async def mk_group(store, name, node_ids, *, symbol="XAUUSD", strategy=None,
         GroupCreate(
             name=name, enabled=True, dispatch_mode="sync",
             strategy_id=strategy["strategy_id"], node_ids=list(node_ids),
+            accept_ai_follow=strategy.get("template_id") == TEMPLATE_1_ID,
         ),
         owner_user_id=owner_user_id,
     )
@@ -197,6 +215,11 @@ async def fetch_tasks(signal_id):
 
 
 async def _ai_strategy(store, owner_user_id=None):
+    if owner_user_id is not None:
+        async with SessionLocal() as session:
+            role = await session.scalar(select(Role).join(UserRole, UserRole.role_id == Role.id).where(UserRole.user_id == owner_user_id))
+            role.capabilities = json.dumps(["follow_leader", "ai_strategy"])
+            await session.commit()
     return await mk_strategy(
         store, symbol="XAUUSD", name="AI加仓策略", rules=[],
         template_id=TEMPLATE_1_ID, template_name=TEMPLATE_1_NAME,
@@ -238,6 +261,10 @@ async def _grid_strategy(store, owner_user_id=None):
 
 async def _add_follower(store, group_id, node_id, *, leader_user_id=7,
                         leader_primary_node_id="nd_leader"):
+    async with SessionLocal() as session:
+        node = await session.get(Node, node_id)
+        node.owner_user_id = 99
+        await session.commit()
     await follow_service.add_following(
         store,
         group_id=group_id, node_id=node_id,

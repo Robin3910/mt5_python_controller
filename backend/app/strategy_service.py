@@ -146,7 +146,16 @@ async def create_strategy(
     return d
 
 
-async def update_strategy(
+async def update_strategy(store: RedisStore, strategy_id: str, patch: StrategyUpdate) -> Optional[dict]:
+    from .node_lifecycle import group_key, locked
+    from .orm import NodeGroup
+    async with SessionLocal() as session:
+        group_ids = (await session.scalars(select(NodeGroup.group_id).where(NodeGroup.strategy_id == strategy_id))).all()
+    async with locked(*(group_key(gid) for gid in group_ids)):
+        return await _update_strategy(store, strategy_id, patch)
+
+
+async def _update_strategy(
     store: RedisStore, strategy_id: str, patch: StrategyUpdate,
 ) -> Optional[dict]:
     async with SessionLocal() as s:
@@ -162,6 +171,12 @@ async def update_strategy(
             row.symbol = symbol
         if patch.enabled is not None:
             row.enabled = patch.enabled
+            if patch.enabled is False:
+                from .ai_application_store import cancel_applications
+                from .orm import NodeGroup
+                group_ids = (await s.scalars(select(NodeGroup.group_id).where(NodeGroup.strategy_id == strategy_id))).all()
+                await cancel_applications(s, "机器人策略已停用", group_ids=group_ids, pending_only=True)
+
         if patch.remark is not None:
             row.remark = patch.remark.strip() or None
         if patch.rules is not None:
@@ -181,6 +196,15 @@ async def update_strategy(
 
 
 async def delete_strategy(store: RedisStore, strategy_id: str) -> bool:
+    from .node_lifecycle import group_key, locked
+    from .orm import NodeGroup
+    async with SessionLocal() as session:
+        group_ids = (await session.scalars(select(NodeGroup.group_id).where(NodeGroup.strategy_id == strategy_id))).all()
+    async with locked(*(group_key(gid) for gid in group_ids)):
+        return await _delete_strategy(store, strategy_id)
+
+
+async def _delete_strategy(store: RedisStore, strategy_id: str) -> bool:
     from . import group_service
 
     async with SessionLocal() as s:

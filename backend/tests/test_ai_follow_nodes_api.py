@@ -7,6 +7,7 @@ from app.connections import manager
 from app.db import SessionLocal, _migrate_follow_node_state
 from app.orm import AuditLog, GroupFollowerNode, GroupSignalTask, GroupTaskDispatch
 from app.state import state
+from tests.test_ai_follow_api import _approve_pending
 from tests.test_ai_follow_api import _assign, _login, _mk_group, _mk_node, _mk_trend_strategy, client
 from tests.test_ai_robot_groups import setup_two_robots
 
@@ -17,6 +18,7 @@ def join_groups(client, setup, headers, node_ids, group_ids):
         json={"leader_user_id": setup["host"]["id"], "group_ids": group_ids, "node_ids": node_ids},
         headers=headers,
     )
+    _approve_pending(client, setup["host_h"], [item["request_id"] for item in response.json()["pending"]])
     assert response.status_code == 200, response.text
 
 
@@ -187,6 +189,9 @@ def test_automatic_adoption_preserves_pause_and_does_not_restart_stopped(client)
         return await follow_service.adopt_followers_for_group(state.store, target_group=target, source_group_ids=[setup["ai_group_id"]])
     adopted, skipped = client.portal.call(adopt)
     assert len(adopted) == 1
+    assert adopted[0]["status"] == "pending"
+    assert len(client.get("/api/ai-follow/nodes", headers=headers).json()["nodes"][0]["groups"]) == 1
+    _approve_pending(client, setup["host_h"], [adopted[0]["request_id"]])
     assert all(group["follow_state"] == "paused" for group in client.get("/api/ai-follow/nodes", headers=headers).json()["nodes"][0]["groups"])
     client.post("/api/ai-follow/nodes/state", json={"node_ids": [setup["b_follow"]], "state": "stopped"}, headers=headers)
     join_groups(client, setup, headers, [setup["b_follow"]], [setup["ai_group_id"]])

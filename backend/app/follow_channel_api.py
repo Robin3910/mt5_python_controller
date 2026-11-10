@@ -22,7 +22,7 @@ from .models import (
     FollowChannelsOut,
     build_close_command,
 )
-from .permissions import MENU_HOME, MENU_NODES, Principal
+from .permissions import MENU_AI_TRADE, MENU_HOME, MENU_NODES, Principal, can_menu
 from .redis_store import RedisStore
 
 router = APIRouter(prefix="/api/nodes", tags=["follow-channels"])
@@ -59,7 +59,7 @@ def _empty_strategies() -> dict:
 async def get_follow_channels(
     node_id: str,
     store: RedisStore = Depends(get_store),
-    p: Principal = Depends(require_menu(MENU_HOME, MENU_NODES)),
+    p: Principal = Depends(require_menu(MENU_HOME, MENU_NODES, MENU_AI_TRADE)),
 ):
     """节点主页的频道映射与历史持仓。实时持仓仍以账户快照为准，这里只负责归类。"""
     await owned_node_or_404(store, p, node_id)
@@ -75,7 +75,7 @@ async def close_follow_channel(
     request: Request,
     store: RedisStore = Depends(get_store),
     group_dispatcher: GroupDispatcher = Depends(get_group_dispatcher),
-    p: Principal = Depends(require_menu(MENU_HOME, MENU_NODES)),
+    p: Principal = Depends(require_menu(MENU_HOME, MENU_NODES, MENU_AI_TRADE)),
 ):
     """平掉该节点某一个频道的持仓。
 
@@ -84,6 +84,8 @@ async def close_follow_channel(
     """
     await owned_node_or_404(store, p, node_id)
     market = (body.market or "").strip().lower()
+    if market != CHANNEL_AI and not can_menu(p, MENU_HOME, MENU_NODES):
+        raise HTTPException(status_code=403, detail="无权操作该频道")
     mode = (body.mode or "all").strip().lower()
     if market not in _MARKETS:
         raise HTTPException(status_code=400, detail="未知频道")

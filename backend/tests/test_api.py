@@ -140,6 +140,19 @@ def test_full_flow(client):
             }
         )
 
+        ws.send_json({"type": "heartbeat", "data": {}})
+        assert ws.receive_json()["type"] == "pong"
+        preview = client.get(f"/api/nodes/{node_id}/deletion-preview", headers=h).json()
+        assert "缺少 60 秒内的可读账户快照" in preview["blocked"][0]["reasons"]
+        ws.send_json({"type": "account", "data": {
+            "account": {"login": 5001, "balance": 1000, "equity": 1000},
+            "positions": [], "orders": [], "prices": {"EURUSD": 1.0742},
+        }})
+        ws.send_json({"type": "heartbeat", "data": {}})
+        assert ws.receive_json()["type"] == "pong"
+        preview = client.get(f"/api/nodes/{node_id}/deletion-preview", headers=h).json()
+        assert preview["blocked"] == []
+
         seed_default_filters(client)
         # 保存 filters 后应向在线节点推送 watch_symbols
         pushed = ws.receive_json()

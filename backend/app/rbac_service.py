@@ -15,7 +15,7 @@ from sqlalchemy import delete, func, select
 from . import permissions
 from .connections import WS_CLOSE_PERM_CHANGED, WS_CLOSE_REVOKED, manager
 from .db import SessionLocal
-from .orm import Role, RoleMenu, User, UserRole
+from .orm import AiFollowApplication, Role, RoleMenu, User, UserRole
 from .permissions import ADMIN_ROLE_CODE, DEFAULT_ROLE_CODE, Principal
 from .redis_store import RedisStore
 from .security import decode_access_jwt
@@ -206,6 +206,19 @@ async def invalidate_principals(store: Optional[RedisStore], usernames: Iterable
         await store.delete_principal_cache(*names)
     except Exception:  # noqa: BLE001
         logger.warning("invalidate principal cache failed: %s", names)
+    from .ai_application_store import cancel_applications
+    async with SessionLocal() as session:
+        users = (await session.scalars(select(User).where(User.username.in_(names)))).all()
+        for user in users:
+            principal = await load_principal(store, user.username)
+            if not principal or not permissions.can_menu(principal, permissions.MENU_AI_TRADE):
+                await cancel_applications(session, "用户或 AI 跟单权限已失效", user_id=user.id, pending_only=True)
+            elif not permissions.can_host_ai_robot(principal):
+                pending = (await session.scalars(select(AiFollowApplication.group_id).where(
+                    AiFollowApplication.leader_user_id == user.id, AiFollowApplication.status == "pending",
+                ))).all()
+                await cancel_applications(session, "机器人主人权限已失效", group_ids=pending, pending_only=True)
+        await session.commit()
 
 
 async def revoke_sessions(store: Optional[RedisStore], username: str) -> None:

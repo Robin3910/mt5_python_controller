@@ -1,6 +1,7 @@
 <script setup lang="ts">
+import { deleteNodeWithConfirmation } from '@/composables/useNodeDeletion'
 // 节点管理页：创建/编辑/删除节点、启停、重置令牌、批量全平（令牌仅创建时显示一次）。
-// 普通用户只看到管理员分配给自己的节点，只能改名、启停；新建、删除与按币种配置仅管理员
+// 普通用户仅管理自有节点；新建与按币种配置仅管理员。
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -276,9 +277,8 @@ function errText(e: unknown, fallback: string): string {
 }
 
 async function remove(n: NodeOut): Promise<void> {
-  if (!(await confirmAction(`确认删除节点「${n.name}」？\n\n该操作不可恢复。`, '确认删除'))) return
   try {
-    await hub.deleteNode(n.node_id, currentSearchOptions())
+    await deleteNodeWithConfirmation(n.node_id, currentSearchOptions())
   } catch (e: unknown) {
     ElMessage.error(errText(e, '删除失败，请稍后重试'))
   }
@@ -370,7 +370,7 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
         </button>
         <button class="btn-sm btn-ghost" @click="goDetail(n)">详情</button>
         <button class="btn-sm btn-ghost" @click="openEdit(n)">编辑</button>
-        <button v-if="auth.isAdmin" class="btn-sm btn-danger" @click="remove(n)">删除</button>
+        <button v-if="auth.isAdmin || n.owner_user_id === auth.me?.user_id" class="btn-sm btn-danger" @click="remove(n)">删除</button>
       </div>
       <div v-if="isPendingNode(n)" class="node-hint muted">{{ nodeApprovalHint(n) }}</div>
     </div>
@@ -419,7 +419,7 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
           <td class="right">
             <button class="btn-sm btn-ghost" @click="goDetail(n)">详情</button>
             <button class="btn-sm btn-ghost" @click="openEdit(n)">编辑</button>
-            <button v-if="auth.isAdmin" class="btn-sm btn-danger" @click="remove(n)">删除</button>
+            <button v-if="auth.isAdmin || n.owner_user_id === auth.me?.user_id" class="btn-sm btn-danger" @click="remove(n)">删除</button>
           </td>
         </tr>
         <tr v-if="!hub.nodes.length && !searching">

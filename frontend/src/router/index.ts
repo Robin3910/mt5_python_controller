@@ -48,6 +48,12 @@ const router = createRouter({
       meta: { menu: 'ai_trade' },
     },
     {
+      path: '/my-ai-channel',
+      name: 'my-ai-channel',
+      component: () => import('@/views/MyAiChannelView.vue'),
+      meta: { menu: 'ai_trade' },
+    },
+    {
       path: '/ai-trade/robots/:leaderUserId/:groupId?',
       name: 'ai-robot-detail',
       component: () => import('@/views/AiRobotDetailView.vue'),
@@ -180,6 +186,7 @@ router.beforeEach(async (to) => {
     const fallback = firstAllowedPath(auth.hasMenu)
     return fallback === to.path ? true : fallback
   }
+  if (to.name === 'my-ai-channel' && !(auth.canUseAiStrategy && auth.canBeFollowLeader)) return { name: 'me' }
   // 仅管理员页面（如系统级配置）：普通用户打不开，退回第一个有权限的菜单
   if (to.meta.adminOnly && !auth.isAdmin) {
     const fallback = firstAllowedPath(auth.hasMenu)

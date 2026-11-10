@@ -394,8 +394,8 @@ export const useHubStore = defineStore('hub', {
       await api.patch(`/api/nodes/${id}`, patch)
       await this.fetchNodes(options)
     },
-    async deleteNode(id: string, options?: { q?: string }): Promise<void> {
-      await api.delete(`/api/nodes/${id}`)
+    async deleteNode(id: string, options: { q?: string } | undefined, version: string): Promise<void> {
+      await api.delete(`/api/nodes/${id}`, { data: { version } })
       await this.fetchNodes(options)
     },
     /**

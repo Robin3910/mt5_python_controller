@@ -16,7 +16,7 @@ from . import follow_service, group_persist, group_service
 from .db import SessionLocal
 from . import risk_control
 from .models import NodeCreate, NodeUpdate
-from .orm import Node, NodeCredential
+from .orm import DeletedNode, Node, NodeGroupMember, NodeCredential
 from .redis_store import RedisStore
 from .rules import validate_node_global_lot_mode
 from .security import make_node_id
@@ -69,13 +69,13 @@ async def _following_detail(store: RedisStore, followings: list[dict]) -> list[d
 
 
 async def list_followings_for_node(node_id: str) -> list[dict]:
-    """某节点当前的跟单关系（精简明细）。
-
-    与 precheck_following_blocking 同源（follow_service.list_for_node），
-    区别是这里不抛异常；用于前端在「设置主节点」前预查 —— 命中就提前禁用
-    提交按钮 / 改文案，避免用户点下去才吃一个 409。
-    """
-    return await follow_service.list_for_node(node_id)
+    """设置主节点前预查：仅普通带单关系构成阻塞。"""
+    from .orm import NodeGroup, TradingStrategy
+    async with SessionLocal() as session:
+        ai_groups = set((await session.scalars(select(NodeGroup.group_id).join(
+            TradingStrategy, TradingStrategy.strategy_id == NodeGroup.strategy_id,
+        ).where(TradingStrategy.template_id == "tpl_1"))).all())
+    return [row for row in await follow_service.list_for_node(node_id) if row["group_id"] not in ai_groups]
 
 
 async def precheck_following_blocking(
@@ -84,20 +84,8 @@ async def precheck_following_blocking(
     target_node_id: str,
     next_node_id: Optional[str],
 ) -> None:
-    """阶段 0：检查待晋升节点当前是否仍在跟单。命中阻塞即抛 PrimarySwitchBlocked。
-
-    阻塞判据：group_follower_node 中 node_id == target_node_id 存在记录，
-    即该节点正在作为「跟单方」参与别人的带单源分组。
-
-    为什么必须拦：主节点不可用于跟单（主节点要保持独立），而跟单关系是**持久
-    状态**。若放任升主，只能把跟单关系静默删掉 —— 用户的跟单配置无声消失，
-    且该节点将同时具备「带单源」与「跟单方」两种互斥身份。
-    因此这里选择**显式拒绝**，让用户先自己把节点移出跟单。
-
-    放行条件（唯一）：
-      该节点没有任何跟单关系 → 放行。
-    """
-    followings = await follow_service.list_for_node(target_node_id)
+    """普通带单关系阻止升主；AI 关系允许与主节点身份并存。"""
+    followings = await list_followings_for_node(target_node_id)
     if not followings:
         return
 
@@ -109,8 +97,8 @@ async def precheck_following_blocking(
     raise PrimarySwitchBlocked(
         code="primary_switch_following_blocked",
         message=(
-            f"节点 {node_name} 当前有 {len(followings)} 个跟单分组，"
-            "主节点不可用于跟单，请先到【带单】页把该节点移出跟单后再设置主节点"
+            f"节点 {node_name} 当前有 {len(followings)} 个普通带单分组，"
+            "请先到【带单】页把该节点移出普通带单后再设置主节点"
         ),
         node_id=target_node_id,
         node_name=node_name,
@@ -351,6 +339,8 @@ async def create_node(
             mt5_login=payload.mt5_login,
         )
         s.add(row)
+        if await s.get(DeletedNode, payload.mt5_login):
+            s.add(NodeCredential(node_id=node_id, legacy_allowed=False, owner_user_id=None))
         await s.commit()
         await s.refresh(row)
         d = node_row_to_dict(row)
@@ -368,6 +358,10 @@ async def auto_register(store: RedisStore, mt5_login: int) -> dict:
     existing = await find_by_mt5_login(mt5_login)
     if existing:
         return existing
+    from .orm import DeletedNode
+    async with SessionLocal() as session:
+        if await session.get(DeletedNode, mt5_login):
+            raise ValueError("节点已删除，禁止自动注册")
     global_filters = await store.get_filters()
     filters = default_node_filters_from_global(global_filters)
     payload = NodeCreate(
@@ -389,6 +383,14 @@ async def _locked_node(session, node_id: str):
 
 async def update_node(store: RedisStore, node_id: str, patch: NodeUpdate, *, admin_enable_intent: bool = False,
                       audit_principal=None, audit_ip: str | None = None) -> Optional[dict]:
+    from .node_lifecycle import locked, node_key
+    async with locked(node_key(node_id)):
+        return await _update_node(store, node_id, patch, admin_enable_intent=admin_enable_intent,
+                                  audit_principal=audit_principal, audit_ip=audit_ip)
+
+
+async def _update_node(store: RedisStore, node_id: str, patch: NodeUpdate, *, admin_enable_intent: bool = False,
+                       audit_principal=None, audit_ip: str | None = None) -> Optional[dict]:
     """更新节点：仅写入“非空”字段；成功后刷新缓存。"""
     if patch.filters is not None:
         err = validate_node_global_lot_mode(
@@ -441,7 +443,15 @@ async def update_node(store: RedisStore, node_id: str, patch: NodeUpdate, *, adm
     return d
 
 
-async def set_owner(
+async def set_owner(store: RedisStore, node_id: str, owner_user_id: Optional[int], *,
+                    audit_principal=None, audit_ip: str | None = None) -> Optional[dict]:
+    from .node_lifecycle import locked, node_key
+    async with locked(node_key(node_id)):
+        return await _set_owner(store, node_id, owner_user_id,
+                                audit_principal=audit_principal, audit_ip=audit_ip)
+
+
+async def _set_owner(
     store: RedisStore, node_id: str, owner_user_id: Optional[int], *, audit_principal=None,
     audit_ip: str | None = None,
 ) -> Optional[dict]:
@@ -458,6 +468,8 @@ async def set_owner(
             needs_strict_audit = row.approval_status == "pending" or bool(
                 credential and (credential.token_sha256 or not credential.legacy_allowed))
             await revoke_on_transfer(s, node_id, owner_user_id)
+            from .ai_application_store import cancel_nodes
+            await cancel_nodes(s, [node_id], "节点归属已变更")
             row.owner_user_id = owner_user_id
             await activate_if_ready(s, row)
             # 跨用户转交时即时清掉主节点标记：主节点是「按所有者」维度唯一，
@@ -522,23 +534,26 @@ async def _clear_primary_for_owner(
         r.is_primary = False
 
 
-async def set_primary(
+async def set_primary(store: RedisStore, node_id: str, is_primary: bool, *,
+                      audit_principal=None, audit_ip: str | None = None):
+    from .node_lifecycle import locked, node_key
+    async with SessionLocal() as session:
+        victims = await _collect_victim_node_ids(session, node_id=node_id, is_primary=is_primary)
+        group_ids = (await session.scalars(select(NodeGroupMember.group_id).where(
+            NodeGroupMember.node_id.in_([*victims, node_id]),
+        ))).all()
+    from .node_lifecycle import group_key
+    async with locked(*(node_key(nid) for nid in {*victims, node_id}), *(group_key(gid) for gid in group_ids)):
+        return await _set_primary(store, node_id, is_primary,
+                                  audit_principal=audit_principal, audit_ip=audit_ip)
+
+
+async def _set_primary(
     store: RedisStore, node_id: str, is_primary: bool,
     *, audit_principal=None, audit_ip: str | None = None,
 ) -> tuple[Optional[dict], list[str]]:
-    """设置 / 取消某节点的主节点标记；按 owner 唯一。
-
-    设置为 True 时会把同 owner 下其它节点的主节点标记全部清掉，保证唯一性。
-    取消时只清本节点。权限与归属校验由路由层完成（先 owned_node_or_404）。
-
-    阶段 0：两种阻塞前置，都用 PrimarySwitchBlocked 异常拦截。
-    A. 待晋升的节点当前**仍在跟单**（group_follower_node 有记录）-> 拒绝。
-       主节点不可用于跟单（主节点要保持独立），而跟单关系是持久状态；
-       放任升主只会把用户的跟单配置静默删掉，所以显式拒绝，让用户先自己移出。
-    B. 被替换 / 被取消的旧主节点上仍有非终态子任务
-       （GroupTaskDispatch.status NOT IN SUBTASK_TERMINAL）-> 拒绝。
-    两者都在事务内、外各做一次校验：事务外拦截绝大多数场景，事务内拦截
-    "阶段 0 通过后到 _locked_node 之间"极小窗口期新增的 in-flight / 跟单。
+    """设置 / 取消主节点，按 owner 唯一；普通带单及旧主节点在途任务阻塞切换。
+    AI 跟单关系允许保留，权限与归属由路由层校验。
     """
     # ── 收集 victim ── 阶段 0 和阶段 2 共用；必须在阶段 0 之前抓取，
     # 否则阶段 0 / 事务里把 victim 的 is_primary 清掉后，阶段 2 找不到 victim。
@@ -591,6 +606,14 @@ async def set_primary(
         if is_primary:
             await _clear_primary_for_owner(s, row.owner_user_id, exclude_node_id=node_id)
         row.is_primary = bool(is_primary)
+        if victims:
+            from .ai_application_store import cancel_applications
+            from .orm import AiFollowApplication
+            pending_groups = (await s.scalars(select(AiFollowApplication.group_id).where(
+                AiFollowApplication.status == "pending", AiFollowApplication.leader_primary_node_id.in_(victims),
+            ))).all()
+            await cancel_applications(s, "机器人主节点已变更", group_ids=pending_groups, pending_only=True)
+
         # 审计：业务写入前先占位，确保与 is_primary 一起提交。
         # 这里不能用 commit 之后的 begin_operation：commit 已结束，写入会留在外层
         # 但因为 begin_operation 内部只 flush、不 commit，会和业务行一起落到下一次提交。
@@ -624,14 +647,14 @@ async def set_primary(
     for r in affected:
         await store.cache_node(node_row_to_dict(r))
 
-    # 跟单关系清理（升为主节点时）：
-    # - 正常路径：阶段 0 的 precheck_following_blocking 已经拦下「仍在跟单」的节点，
-    #   不会走到这里，所以正常情况下这里是无操作。
-    # - 兜底：阶段 0 与本次清理之间的极小窗口期若新加入了跟单关系，
-    #   这里把它清掉，避免该节点同时当带单源和跟单方（语义冲突）。
-    # - 取消主节点：重新具备跟单资格，但不会自动重新加入，保持用户显式操作。
+    # 只清理竞态中新出现的普通带单关系，AI 关系保留。
     if is_primary:
-        await follow_service.remove_node_followings(store, node_id)
+        for relation in await follow_service.list_for_node(node_id):
+            group = await store.get_group(relation["group_id"]) or {}
+            strategy = await store.get_strategy(group.get("strategy_id")) if group.get("strategy_id") else None
+            if not strategy or strategy.get("template_id") != "tpl_1":
+                await follow_service.remove_following(store, group_id=relation["group_id"],
+                    node_ids=[node_id], follower_user_id=relation["follower_user_id"])
 
     return d, []
 
