@@ -2523,6 +2523,7 @@ export interface AiRobotSummary {
   strategy_id: string | null
   username: string
   display_name: string | null
+  description?: string | null
   primary_node: FollowNodeBrief | null
   /** 当前记录对应的 AI 分组数（每条为 1） */
   ai_group_count: number
@@ -2618,7 +2619,7 @@ export interface AiMyGroup {
   /** 批次已用 / 批次上限 —— AI 跟单员最需要盯的指标 */
   batch_used: number
   batch_limit: number
-  my_nodes: (FollowNodeBrief & { joined_at: number | null; follow_state: AiFollowNodeState; leader_paused?: boolean })[]
+  my_nodes: (FollowNodeBrief & { joined_at: number | null; follow_state: AiFollowNodeState; leader_paused?: boolean; settings?: AiFollowSettings })[]
 }
 
 export interface AiMyRobot {
@@ -2687,6 +2688,13 @@ export interface AiJoinPayload {
   leader_user_id: number
   group_ids: string[]
   node_ids: string[]
+  settings?: AiFollowSettings
+}
+
+export interface AiFollowSettings {
+  risk_mode: 'leader' | 'custom'
+  loss_ratio: number | null
+  run_mode: 'loop' | 'single'
 }
 
 export interface AiJoinResponse {

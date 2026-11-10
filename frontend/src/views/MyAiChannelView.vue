@@ -21,6 +21,7 @@ const loading = ref(false)
 const busy = ref(false)
 const error = ref('')
 const collapsed = ref(new Set<string>())
+const expandedRequests = ref(new Set<number>())
 let revision = 0
 let timer: number | undefined
 let searchTimer: number | undefined
@@ -76,6 +77,17 @@ async function confirm(message: string, title: string): Promise<boolean> {
     trackAiUi('cancel_dialog', { value: title })
     return false
   }
+}
+
+function toggleRequest(application: AiApplication): void {
+  const next = new Set(expandedRequests.value)
+  next.has(application.request_id) ? next.delete(application.request_id) : next.add(application.request_id)
+  expandedRequests.value = next
+  trackAiUi('collapse_group', { group_id: application.group_id, value: `request:${application.request_id}` })
+}
+
+function settingsText(settings?: AiApplication['nodes'][number]['settings']): string {
+  return `${settings?.risk_mode === 'custom' ? `信号盈亏比 ${settings.loss_ratio}%` : '跟随带单风控'} · ${settings?.run_mode === 'single' ? '单次' : '循环'}`
 }
 
 async function run(action: () => Promise<void>): Promise<void> {
@@ -167,8 +179,13 @@ onUnmounted(() => { window.clearInterval(timer); window.clearTimeout(searchTimer
       <div v-if="!collapsed.has(group.group_id)">
         <article v-for="application in group.requests" :key="application.request_id" class="applicant-row">
           <span class="applicant-avatar">{{ application.applicant_name.slice(0, 1) }}</span>
-          <div class="applicant-main"><h4>{{ application.applicant_name }} <span>{{ group.robot_name }}</span></h4><p>ID：{{ application.follower_user_id }} · {{ application.symbol || '—' }} · {{ application.nodes.length }} 个节点<template v-if="application.source === 'legacy'"> · 存量复审</template></p><details @toggle="trackAiUi('collapse_group', { group_id: group.group_id, value: `request:${application.request_id}` })"><summary>节点明细 · 加仓上限 {{ application.risk.max_allow_num ?? '—' }} · 总手数上限 {{ application.risk.total_lot_limit ?? '—' }}</summary><p v-for="node in application.nodes" :key="node.node_id">{{ node.name || node.node_id }} · {{ node.mt5_login || '—' }} <span v-if="node.is_primary">主节点</span><span v-if="!node.available"> · 已失效</span><span v-else-if="node.leader_paused"> · 频道已暂停</span><span v-else-if="node.follow_state === 'paused'"> · 跟单人已暂停</span></p></details><p v-if="application.reason" class="reason">{{ application.reason }}</p></div>
-          <div class="applicant-actions"><template v-if="application.status === 'pending'"><span class="status pending">● 待审核</span><button type="button" class="reject" aria-label="拒绝该申请" :disabled="busy" @click="reject(application)">×</button><button type="button" class="approve" :disabled="busy" @click="approve([application.request_id], application.nodes.length)">✓ 通过</button></template><template v-else><span class="status" :class="application.status">{{ application.status === 'rejected' ? '⊗ 已拒绝' : ownerPaused(application) ? '频道已暂停' : application.nodes.filter(node => node.status === 'approved').every(node => node.follow_state !== 'running') ? '跟单人已暂停' : '跟单中' }}</span><button v-if="application.status === 'approved'" type="button" role="switch" :aria-checked="!ownerPaused(application)" :aria-label="ownerPaused(application) ? '恢复跟单' : '暂停跟单'" class="pause-switch" :class="{ on: !ownerPaused(application) }" :disabled="busy" @click="pause(group, application)"><i></i></button><button type="button" class="icon-button danger" aria-label="删除该节点" :disabled="busy" @click="remove(group, application)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7"/></svg></button></template></div>
+          <div class="applicant-main">
+            <h4>{{ application.applicant_name }} <span>{{ group.robot_name }}</span></h4>
+            <div class="applicant-meta"><span>ID：{{ application.follower_user_id }} · {{ application.symbol || '—' }}</span><button type="button" class="node-details-toggle" :aria-expanded="expandedRequests.has(application.request_id)" @click="toggleRequest(application)">{{ application.nodes.length }} 个节点 {{ expandedRequests.has(application.request_id) ? '⌃' : '⌄' }}</button><span v-if="application.source === 'legacy'">存量复审</span></div>
+            <div v-if="expandedRequests.has(application.request_id)" class="request-details"><p>加仓上限 {{ application.risk.max_allow_num ?? '—' }} · 总手数上限 {{ application.risk.total_lot_limit ?? '—' }}</p><p v-for="node in application.nodes" :key="node.node_id">{{ node.name || node.node_id }} · {{ node.mt5_login || '—' }} <span v-if="node.is_primary">主节点</span> · {{ settingsText(node.settings) }}<span v-if="!node.available"> · 已失效</span><span v-else-if="node.follow_state === 'stopped'"> · 已停止跟单</span><span v-else-if="node.leader_paused"> · 频道已暂停</span><span v-else-if="node.follow_state === 'paused'"> · 跟单人已暂停</span></p></div>
+            <p v-if="application.reason" class="reason">{{ application.reason }}</p>
+          </div>
+          <div class="applicant-actions"><template v-if="application.status === 'pending'"><span class="status pending">● 待审核</span><button type="button" class="reject" aria-label="拒绝该申请" :disabled="busy" @click="reject(application)">×</button><button type="button" class="approve" :disabled="busy" @click="approve([application.request_id], application.nodes.length)">✓ 通过</button></template><template v-else><span class="status" :class="application.status">{{ application.status === 'rejected' ? '⊗ 已拒绝' : application.nodes.filter(node => node.status === 'approved').every(node => node.follow_state === 'stopped') ? '已停止跟单' : ownerPaused(application) ? '频道已暂停' : application.nodes.filter(node => node.status === 'approved').every(node => node.follow_state !== 'running') ? '跟单人已暂停' : '跟单中' }}</span><button v-if="application.status === 'approved'" type="button" role="switch" :aria-checked="!ownerPaused(application)" :aria-label="ownerPaused(application) ? '恢复跟单' : '暂停跟单'" class="pause-switch" :class="{ on: !ownerPaused(application) }" :disabled="busy" @click="pause(group, application)"><i></i></button><button type="button" class="icon-button danger" aria-label="删除该节点" :disabled="busy" @click="remove(group, application)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7"/></svg></button></template></div>
         </article>
       </div>
     </section>
@@ -215,7 +232,7 @@ h2 small{color:#22c55e}
 .robot-header{display:flex;align-items:center;gap:8px;padding:10px;background:#141e34;border-bottom:1px solid #1c2740}
 .robot-avatar,.applicant-avatar{display:flex;align-items:center;justify-content:center;width:34px;height:34px;flex-shrink:0;background:#f59e0b15;color:#fbbf24;border-radius:8px;font-size:15px;font-weight:700}
 .robot-heading,.applicant-main{min-width:0;flex:1}
-.robot-heading h3{font-size:12px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.robot-heading h3{font-size:13px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .robot-heading h3 span{font-size:9px;border:1px solid #38bdf850;color:#38bdf8;border-radius:99px;padding:1px 6px}
 .robot-heading em{font-size:9px;font-style:normal;color:#fbbf24;background:#f59e0b15;border-radius:99px;padding:2px 5px}
 .robot-heading p,.applicant-main p{margin-top:4px;font-size:9px;color:#5b6b85;overflow-wrap:anywhere}
@@ -224,11 +241,9 @@ h2 small{color:#22c55e}
 .danger{color:#f87171}
 .applicant-row{display:flex;align-items:center;gap:9px;padding:10px;border-bottom:1px solid #1c2740}
 .applicant-row:last-child{border:0}
-.applicant-avatar{width:28px;height:28px;font-size:12px}
-.applicant-main h4{font-size:11px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.applicant-avatar{width:32px;height:32px;font-size:13px}
+.applicant-main h4{font-size:12px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .applicant-main h4 span{font-size:9px;color:#4ade80;background:#22c55e18;padding:2px 5px;border-radius:99px}
-.applicant-main details{font-size:9px;color:#8b96a8;margin-top:5px}
-.applicant-main summary{cursor:pointer}
 .reason{color:#f87171!important}
 .status{font-size:9px;border-radius:99px;padding:3px 6px;white-space:nowrap}
 .status.pending{background:#f59e0b15;color:#fbbf24;border:1px solid #f59e0b40}
@@ -244,8 +259,8 @@ h2 small{color:#22c55e}
 .channel-pagination{display:flex;align-items:center;justify-content:center;gap:12px;margin:16px 0}
 .channel-page input:focus-visible,.channel-page button:focus-visible{outline:2px solid #3b82f6;outline-offset:2px}
 @media(max-width:520px){.channel-hero{padding:10px}
-.applicant-row{flex-wrap:wrap}
-.applicant-actions{margin-left:37px}
+.applicant-row{display:grid;grid-template-columns:32px minmax(0,1fr);align-items:start}
+.applicant-actions{grid-column:2;justify-self:end}
 .group-actions{gap:4px}
 .robot-header{gap:6px}
 .robot-heading h3{font-size:11px}
@@ -260,4 +275,10 @@ h2 small{color:#22c55e}
 .channel-icon :deep(.robot-icon) { color: #fff; }
 .icon-button svg { width: 14px; height: 14px; display: block; margin: auto; }
 .channel-tabs button.reviewed-active { background: #22304a; color: #e6ebf4; }
+.applicant-meta{display:flex;align-items:center;gap:7px;flex-wrap:wrap;color:#5b6b85;font-size:10px;margin-top:5px}
+.node-details-toggle{padding:0;border:0;background:none;color:#8b96a8;font-size:10px}
+.request-details{margin-top:8px;padding:8px 10px;border:1px solid #22304a;background:#0c1424;border-radius:8px}
+.request-details p{color:#8b96a8;font-size:10px;line-height:1.7}
+.applicant-row:has(.request-details){align-items:flex-start}
+.applicant-row:has(.request-details) .applicant-actions{padding-top:5px}
 </style>

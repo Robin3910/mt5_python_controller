@@ -24,6 +24,7 @@ const PAGE_TITLES: Record<string, string> = {
   trading: '交易',
   'ai-trade': 'AI 交易',
   'my-ai-channel': 'AI交易机器人频道',
+  'ai-follow-setup': '跟单设置',
   'ai-robot-detail': '机器人详情',
   follow: '带单',
   me: '我的',
@@ -53,6 +54,10 @@ const customerBackTitle = computed(() => {
   return pageTitle.value
 })
 function onCustomerBack(): void {
+  if (route.name === 'ai-follow-setup') {
+    router.push({ name: 'ai-trade', query: { pick_group: String(route.params.groupId), leader: String(route.params.leaderUserId) } })
+    return
+  }
   router.push({ name: route.name === 'ai-robot-detail' ? 'ai-trade' : route.name === 'my-ai-channel' ? 'me' : 'home' })
 }
 
@@ -116,7 +121,7 @@ watch(() => auth.token, setupWs)
             <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M6.99 11 3 15l3.99 4v-3H14v-2H6.99v-3zM21 9l-3.99-4v3H10v2h7.01v3L21 9z"/></svg>
             <span>交易</span>
           </RouterLink>
-          <RouterLink v-if="auth.hasMenu('ai_trade')" to="/ai-trade" :class="{ 'router-link-active': route.name === 'ai-robot-detail' }">
+          <RouterLink v-if="auth.hasMenu('ai_trade')" to="/ai-trade" :class="{ 'router-link-active': route.name === 'ai-robot-detail' || route.name === 'ai-follow-setup' }">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M20 9V7c0-1.1-.9-2-2-2h-3c0-1.66-1.34-3-3-3S9 3.34 9 5H6c-1.1 0-2 .9-2 2v2c-1.66 0-3 1.34-3 3s1.34 3 3 3v4c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2v-4c1.66 0 3-1.34 3-3s-1.34-3-3-3zM7.5 11.5c0-.83.67-1.5 1.5-1.5s1.5.67 1.5 1.5S9.83 13 9 13s-1.5-.67-1.5-1.5zM16 17H8v-2h8v2zm-1-4c-.83 0-1.5-.67-1.5-1.5S14.17 10 15 10s1.5.67 1.5 1.5S15.83 13 15 13z"/></svg>
             <span>AI交易</span>
           </RouterLink>

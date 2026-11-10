@@ -8,6 +8,7 @@ from sqlalchemy import select, update
 
 from . import follow_service, node_lifecycle, permissions, rbac_service
 from .db import SessionLocal
+from .ai_follow_settings import public_settings
 from .orm import (
     AiFollowApplication as Application,
     AiFollowApplicationNode as ApplicationNode,
@@ -75,7 +76,7 @@ async def validate_node(session, node_id: str, owner_user_id, group_id: str) -> 
     return node
 
 
-async def _create(session, group, strategy, primary_id, follower_id, nodes, *, leader_user_id, source="join", states=None):
+async def _create(session, group, strategy, primary_id, follower_id, nodes, *, leader_user_id, source="join", states=None, settings=None, node_settings=None):
     row = Application(
         group_id=group.group_id, leader_user_id=leader_user_id,
         follower_user_id=follower_id, pending_key=f"{group.group_id}:{follower_id}",
@@ -89,13 +90,14 @@ async def _create(session, group, strategy, primary_id, follower_id, nodes, *, l
         session.add(ApplicationNode(
             application_id=row.id, node_id=node.node_id, owner_user_id=node.owner_user_id,
             snapshot=node_snapshot(node), status="pending",
+            follow_settings_json=public_settings((node_settings or {}).get(node.node_id, settings)),
             original_follow_state=previous.get("follow_state", "running"),
             joined_at=previous.get("joined_at"),
         ))
     return row
 
 
-async def submit(store, principal, leader_user_id, group_ids, node_ids, *, ip=None, source="join", follow_states=None) -> dict:
+async def submit(store, principal, leader_user_id, group_ids, node_ids, *, ip=None, source="join", follow_states=None, settings=None, node_settings=None) -> dict:
     if not permissions.can_menu(principal, permissions.MENU_AI_TRADE):
         raise HTTPException(403, "无权申请 AI 跟单")
     group_ids, node_ids = list(dict.fromkeys(group_ids)), list(dict.fromkeys(node_ids))
@@ -125,10 +127,11 @@ async def submit(store, principal, leader_user_id, group_ids, node_ids, *, ip=No
                 continue
             row = await _create(session, group, strategy, primary.node_id, principal.user_id, nodes,
                                 leader_user_id=leader_user_id, source=source,
+                                settings=settings, node_settings=node_settings,
                                 states={nid: {"follow_state": state} for nid, state in (follow_states or {}).items()})
             pending.append({"request_id": row.id, "group_id": gid, "node_ids": [n.node_id for n in nodes]})
         audit(session, principal, "ai_follow_request_create", leader_user_id,
-              after={"pending": pending, "skipped": skipped}, ip=ip)
+              after={"pending": pending, "skipped": skipped}, params={"settings": public_settings(settings), "source": source}, ip=ip)
         await session.commit()
     return {"joined": [], "pending": pending, "skipped": skipped}
 
@@ -182,6 +185,8 @@ async def review(store, principal, request_id: int, *, approve: bool, reason="",
                     session.add(relation)
                 relation.follow_state = item.original_follow_state
                 relation.leader_paused = False
+                relation.follow_settings_json = {**public_settings(item.follow_settings_json), "application_id": row.id}
+                relation.single_dispatch_id = None
                 relation.joined_at = item.joined_at or datetime.now()
         for item in nodes:
             item.status = desired
@@ -220,6 +225,7 @@ async def serialize(session, rows) -> list[dict]:
             "source": row.source, "reason": row.reason, "risk": row.risk_snapshot or {},
             "created_at": row.created_at.timestamp(),
             "nodes": [{**item.snapshot, "status": item.status,
+                       "settings": public_settings(item.follow_settings_json),
                        "joined_at": item.joined_at.timestamp() if item.joined_at else row.created_at.timestamp(),
                        "available": item.node_id in nodes and permissions.same_owner(nodes[item.node_id].owner_user_id, item.owner_user_id)}
                       for item in visible_items],

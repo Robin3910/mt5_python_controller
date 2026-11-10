@@ -43,6 +43,7 @@ from . import (
 )
 from .connections import manager
 from .ai_channel_models import AiUiEvent
+from .ai_follow_settings import public_settings
 from .db import SessionLocal
 from .deps import client_ip, get_group_dispatcher, get_store, require_menu
 from .models import (
@@ -194,6 +195,7 @@ def _group_robot_summary(user, primary: Optional[dict], group: dict, strategy: O
         "strategy_id": group.get("strategy_id"),
         "username": user.username,
         "display_name": user.display_name,
+        "description": strategy.get("remark") or getattr(user, "leader_intro", None),
         "primary_node": _node_brief(primary),
         "ai_group_count": 1,
         "strategy_name": name,
@@ -464,7 +466,7 @@ async def list_my_ai_followings(
     p: Principal = Depends(require_menu(MENU_AI_TRADE)),
 ) -> AiMeResponse:
     """我的机器人：合并自有主节点上的 AI 策略与既有 AI 跟单。"""
-    followings = await follow_service.list_followings(p.user_id)
+    followings = await follow_service.list_followings(p.user_id, include_stopped=True)
     pairs = {(item["group_id"], item["node_id"]) for item in followings}
     followings += [item for item in await ai_application_store.legacy_relations(p.user_id)
                    if (item["group_id"], item["node_id"]) not in pairs]
@@ -566,8 +568,9 @@ async def list_my_ai_followings(
                             (n for n in all_nodes if n.get("node_id") == f["node_id"]), None
                         )),
                         "joined_at": f.get("joined_at"),
-                        "follow_state": "paused" if f.get("leader_paused") else f.get("follow_state") or "running",
+                        "follow_state": "paused" if f.get("leader_paused") and f.get("follow_state") != "stopped" else f.get("follow_state") or "running",
                         "leader_paused": bool(f.get("leader_paused")),
+                        "settings": public_settings(f.get("settings")),
                     }
                     for f in sorted(fs, key=lambda x: x.get("joined_at") or 0)
                 ],
@@ -665,6 +668,7 @@ async def join_ai_follow(
     try:
         return AiJoinResponse(**await ai_application_store.submit(
             store, p, body.leader_user_id, body.group_ids, body.node_ids, ip=client_ip(request),
+            settings=body.settings.model_dump(),
         ))
     except HTTPException as exc:
         from .node_deletion import failed

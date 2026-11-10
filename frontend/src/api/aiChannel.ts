@@ -1,4 +1,5 @@
 import api from './client'
+import type { AiFollowSettings } from './types'
 
 export interface AiApplicationNode {
   node_id: string
@@ -10,6 +11,7 @@ export interface AiApplicationNode {
   joined_at: number
   leader_paused?: boolean
   follow_state?: string | null
+  settings?: AiFollowSettings
 }
 
 export interface AiApplication {
@@ -87,7 +89,7 @@ export async function deleteAiChannelMembers(groupId: string, nodeIds: string[],
   await api.post('/api/ai-channel/members/delete', { group_id: groupId, node_ids: nodeIds, version, follower_user_id: followerUserId })
 }
 
-export type AiUiAction = 'page_view' | 'search' | 'filter' | 'open_picker' | 'select_nodes' | 'cancel_dialog' | 'collapse_group' | 'open_delete' | 'refresh'
+export type AiUiAction = 'page_view' | 'search' | 'filter' | 'open_picker' | 'select_nodes' | 'cancel_dialog' | 'collapse_group' | 'open_delete' | 'refresh' | 'follow_step' | 'follow_settings'
 
 export async function auditAiUi(action: AiUiAction, data: { group_id?: string; node_ids?: string[]; value?: string } = {}): Promise<void> {
   await api.post('/api/ai-follow/ui-events', { action, ...data })

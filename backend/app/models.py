@@ -5,6 +5,7 @@ import time
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
+from .ai_follow_settings import FollowSettings
 
 
 # ----------------------------- 节点 -----------------------------
@@ -1500,6 +1501,7 @@ class AiRobotSummary(BaseModel):
     strategy_id: Optional[str] = None
     username: str
     display_name: Optional[str] = None
+    description: Optional[str] = None
     primary_node: Optional[dict] = None
     # 当前记录对应一个 AI 分组
     ai_group_count: int = 0
@@ -1672,6 +1674,7 @@ class AiJoinRequest(BaseModel):
     leader_user_id: int = Field(ge=1)
     group_ids: list[str] = Field(min_length=1, max_length=50)
     node_ids: list[str] = Field(min_length=1, max_length=50)
+    settings: FollowSettings = Field(default_factory=FollowSettings)
 
 
 class AiJoinResponse(BaseModel):

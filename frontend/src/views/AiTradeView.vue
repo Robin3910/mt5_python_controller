@@ -14,7 +14,8 @@
 //
 // 跟单员收不到实时 WS 事件（M3）—— 用 45s 轮询替代。
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
+import { useAiFollowDraftStore } from '@/stores/aiFollowDraft'
 import StrategyFormModal from '@/components/StrategyFormModal.vue'
 import RobotIcon from '@/components/RobotIcon.vue'
 import { deleteNodeWithConfirmation } from '@/composables/useNodeDeletion'
@@ -42,6 +43,7 @@ import type {
   AiMyRobot,
   AiRobotDetailResponse,
   AiRobotSummary,
+  AiFollowSettings,
 } from '@/api/types'
 import { useAuthStore } from '@/stores/auth'
 import { useHubStore } from '@/stores/hub'
@@ -56,6 +58,8 @@ const keyword = ref('')
 const auth = useAuthStore()
 const hub = useHubStore()
 const router = useRouter()
+const route = useRoute()
+const followDraft = useAiFollowDraftStore()
 
 /** 绩效统计窗口（四档，与后端 deal_stats.WINDOWS 对齐） */
 const WINDOW_OPTIONS = [
@@ -107,6 +111,7 @@ const allSelectableGroupIds = computed<string[]>(() =>
 )
 
 interface MyFollowedNode {
+  settings?: AiFollowSettings
   leader_paused: boolean
   node_id: string
   name: string | null
@@ -149,6 +154,7 @@ const myFollowing = computed<MyRobotEntry[]>(() =>
           }
         } else {
           nodesById.set(n.node_id, {
+            settings: n.settings,
             leader_paused: !!n.leader_paused,
             node_id: n.node_id,
             name: n.name ?? null,
@@ -310,7 +316,7 @@ async function loadMine() {
   }
 }
 
-async function openRobot(r: AiRobotSummary) {
+async function openRobot(r: Pick<AiRobotSummary, 'leader_user_id' | 'group_id'>) {
   detailLoading.value = true
   selectedGroupIds.value = []
   selectedNodeIds.value = []
@@ -473,86 +479,19 @@ onUnmounted(() => {
 
 // ---------- 加入 / 移出 ----------
 async function submitJoin() {
-  if (!detail.value) return
-  if (hasPendingApplication.value) {
-    ElMessage.warning('该机器人已有申请审核中，请等待审核后再新增节点')
-    return
-  }
-  // 暂停判定放在最前面：暂停时所有分组都不可选，下面「没有可加入分组」的分支
-  // 会先一步返回，跟单员就看不到任何原因提示了 —— 按钮虽然已置灰，
-  // 但置灰的**理由**必须说清楚，不能让人猜。
-  if (detailPaused.value) {
-    ElMessage.warning(PAUSED_AI_HINT)
-    return
-  }
-  const groupIds = selectedGroupIds.value.filter((id) =>
-    selectableGroups.value.some((g) => g.group_id === id),
-  )
-  if (!groupIds.length) {
-    ElMessage.warning('请选择至少一个可加入的分组')
-    return
-  }
-  // 只提交「现在仍然可选」的节点。
-// 已跟过的节点虽然置灰禁用了，但 selectedNodeIds 里可能还留着它 —— 勾选是
-// 分组切换之前的事（先勾节点，再勾一个它已跟过的分组，那个勾就失效了）。
-// 这里再按禁用条件过滤一次，提交侧就不依赖 UI 有没有正确置灰。
-const nodeIds = (detail.value.my_nodes ?? [])
-  .filter((n) => selectableNodeIds.value.has(n.node_id))
-  .map((n) => n.node_id)
-  .filter((nid) => selectedNodeIds.value.includes(nid))
-  .filter((nid) => !alreadyFollowingNodeIds.value.has(nid))
-  if (!nodeIds.length) {
+  if (!detail.value || submitting.value) return
+  if (detailPaused.value) { ElMessage.warning(PAUSED_AI_HINT); return }
+  if (hasPendingApplication.value) { ElMessage.warning('该机器人已有申请审核中，请等待审核后再新增节点'); return }
+  const nodeIds = selectedNodeIds.value.filter(isNodeSelectable)
+  if (!nodeIds.length || !allSelectableGroupIds.value.length) {
     ElMessage.warning('请选择至少一个可用节点')
     return
   }
-  // 预聚合勾选里混进了已跟过的节点（用户先勾后切分组导致）—— 告诉用户被剔除了哪些，
-  // 而不是静默丢弃：静默少跟一个节点，用户事后对不上账。
-  const dropped = (detail.value.my_nodes ?? [])
-    .map((n) => n.node_id)
-    .filter((nid) => selectedNodeIds.value.includes(nid) && alreadyFollowingNodeIds.value.has(nid))
-  if (dropped.length) {
-    if (!(await new Promise<boolean>((resolve) => {
-      ElMessageBox.confirm(
-        `所选节点中 ${dropped.length} 个已跟过该机器人的分组，本次将自动跳过。是否继续？`,
-        '部分节点已跟',
-        { type: 'warning', confirmButtonText: '继续', cancelButtonText: '取消' },
-      )
-        .then(() => resolve(true))
-        .catch(() => { trackAiUi('cancel_dialog', { value: 'duplicate_node_confirmation' }); resolve(false) })
-    }))) return
-  }
-  if (!(await new Promise<boolean>((resolve) => {
-    ElMessageBox.confirm(
-      '确认提交该 AI 机器人的跟单申请？\n\n审核通过后才接收新信号；手数按机器人完整执行，发单人修改参数会实时作用到在跑任务。',
-      '确认跟单',
-      {
-        type: 'warning',
-        confirmButtonText: '确认跟单',
-        cancelButtonText: '取消',
-        customClass: 'ai-join-confirm',
-      },
-    )
-      .then(() => resolve(true))
-      .catch(() => { trackAiUi('cancel_dialog', { group_id: detail.value?.robot.group_id, value: 'join_confirmation' }); resolve(false) })
-  }))) return
-  submitting.value = true
-  try {
-    const res = await joinAiFollow({
-      leader_user_id: detail.value.robot.leader_user_id,
-      group_ids: groupIds,
-      node_ids: nodeIds,
-    })
-    if (res.pending.length) ElMessage.success('申请已提交，等待审核')
-    else ElMessage.warning(res.skipped[0]?.reason || '没有新增申请')
-    await refreshAll()
-    detail.value = await fetchAiRobotDetail(detail.value.robot.leader_user_id, perfWindow.value, detail.value.robot.group_id)
-    selectedGroupIds.value = allSelectableGroupIds.value
-    pickerOpen.value = false
-  } catch (e) {
-    ElMessage.error(errText(e, '加入 AI 跟单失败'))
-  } finally {
-    submitting.value = false
-  }
+  const robot = detail.value.robot
+  followDraft.select(auth.me!.user_id, robot.leader_user_id, robot.group_id, nodeIds)
+  trackAiUi('follow_step', { group_id: robot.group_id, node_ids: nodeIds, value: 'risk' })
+  pickerOpen.value = false
+  await router.push({ name: 'ai-follow-setup', params: { leaderUserId: robot.leader_user_id, groupId: robot.group_id } })
 }
 
 async function changeNodeFollowState(nodeIds: string[], state: AiFollowNodeState, groupId?: string): Promise<void> {
@@ -598,7 +537,7 @@ const rankOn = ref(false)
 const onlineRobotCount = computed(() =>
   robots.value.filter((r) => r.primary_node?.online || r.primary_node?.status === 'online').length,
 )
-const mineTab = ref<'run' | 'hist' | 'nodes' | 'pending'>('run')
+const mineTab = ref<'run' | 'hist' | 'nodes' | 'pending'>(route.query.tab === 'pending' ? 'pending' : 'run')
 const pickerOpen = ref(false)
 const pickerMode = ref<'join' | 'settings'>('join')
 const pickerSearch = ref('')
@@ -653,11 +592,19 @@ const shownRobots = computed(() => {
   return list.sort((a, b) => (b.performance?.total_profit || 0) - (a.performance?.total_profit || 0))
 })
 const runningMine = computed(() =>
-  myFollowing.value.filter((entry) => !entry.review_status && (entry.is_owner || entry.marketable || entry.nodes.some((node) => node.active_task_count > 0))),
+  myFollowing.value.filter((entry) => !entry.review_status && !followFinished(entry) && (entry.is_owner || entry.marketable || entry.nodes.some((node) => node.active_task_count > 0))),
 )
 const historyMine = computed(() =>
-  myFollowing.value.filter((entry) => !entry.review_status && !entry.is_owner && !entry.marketable && entry.nodes.every((node) => node.active_task_count === 0)),
+  myFollowing.value.filter((entry) => !entry.review_status && !entry.is_owner && (followFinished(entry) || (!entry.marketable && entry.nodes.every((node) => node.active_task_count === 0)))),
 )
+
+function followFinished(entry: MyRobotEntry): boolean {
+  return !entry.is_owner && entry.nodes.length > 0 && entry.nodes.every((node) => node.follow_state === 'stopped' && node.active_task_count === 0)
+}
+
+function singleFinished(entry: MyRobotEntry): boolean {
+  return followFinished(entry) && entry.nodes.every((node) => node.settings?.run_mode === 'single')
+}
 
 interface MagicHit { magic: number; group_id: string }
 const aiMagics = ref<Record<string, MagicHit[]>>({})
@@ -725,7 +672,7 @@ function fmtPx(n: number | null | undefined): string {
 }
 
 
-async function openPicker(robot: AiRobotSummary, mode: 'join' | 'settings') {
+async function openPicker(robot: Pick<AiRobotSummary, 'leader_user_id' | 'group_id'>, mode: 'join' | 'settings') {
   pickerMode.value = mode
   await openRobot(robot)
   if (!detail.value) return
@@ -824,6 +771,15 @@ async function closeRobotAll(entry: MyRobotEntry) {
     ElMessage.error(errText(e, '平仓失败'))
   } finally { closeBusy.value = false }
 }
+
+watch(() => route.query.pick_group, async (groupId) => {
+  const leaderId = Number(route.query.leader)
+  if (typeof groupId !== 'string' || !Number.isFinite(leaderId) || leaderId < 1) return
+  await openPicker({ leader_user_id: leaderId, group_id: groupId }, 'join')
+  if (followDraft.userId === auth.me?.user_id && followDraft.leaderId === leaderId && followDraft.groupId === groupId) {
+    selectedNodeIds.value = followDraft.nodeIds.filter(isNodeSelectable)
+  }
+}, { immediate: true })
 
 onMounted(() => { void hub.fetchNodes(); trackAiUi('page_view', { value: 'ai-trade' }) })
 </script>
@@ -989,7 +945,7 @@ onMounted(() => { void hub.fetchNodes(); trackAiUi('page_view', { value: 'ai-tra
           <span class="ai-ico"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M13 3a9 9 0 1 0 9 9h-2a7 7 0 1 1-2.05-4.95L16 9h5V4l-1.64 1.64A8.96 8.96 0 0 0 13 3z"/></svg></span>
           <div class="ai-row-text">
             <div class="ai-row-title"><p>{{ robotTitle(entry.robot) }}</p></div>
-            <p class="ai-desc">{{ entry.robot.unmarketable_reason || '已无进行中的任务' }}</p>
+            <p class="ai-desc">{{ singleFinished(entry) ? '单次跟单已完成，可重新申请' : entry.robot.unmarketable_reason || '已无进行中的任务' }}</p>
           </div>
         </div>
       </div>
@@ -1010,7 +966,7 @@ onMounted(() => { void hub.fetchNodes(); trackAiUi('page_view', { value: 'ai-tra
       <section class="ai-dialog ai-picker-dialog" role="dialog" aria-modal="true" aria-label="选择跟单节点">
         <header><span class="ai-picker-icon">⇄</span><div><strong>选择跟单节点</strong><p>跟单对象：{{ robotTitle(detail.robot) }} · {{ detail.robot.strategy_name }}</p></div><button type="button" class="ai-x" aria-label="关闭" @click="closePicker">×</button></header>
         <div class="ai-picker-body">
-          <div class="ai-picker-robot"><RobotIcon :size="32" variant="iconfont" boxed /><div><strong>{{ robotTitle(detail.robot) }}</strong><p>{{ detail.robot.strategy_name }} · {{ detail.groups.map((group) => group.symbol).filter(Boolean).join('、') }}</p></div></div>
+          <div class="ai-picker-robot"><RobotIcon :size="32" variant="iconfont" boxed /><div><strong>{{ robotTitle(detail.robot) }}</strong><p>{{ detail.robot.description || '策略自动运行，同步机器人信号' }} · {{ detail.groups.map((group) => group.symbol).filter(Boolean).join('、') }}</p></div></div>
           <p v-if="detailPaused" class="ai-warn">{{ PAUSED_AI_HINT }}</p>
           <p v-if="hasPendingApplication" class="ai-warn">该机器人已有申请审核中，请等待审核后再新增节点。</p>
           <div class="ai-picker-heading"><span>▣ 选择跟单节点 <em>{{ detail.my_nodes.length }} 个</em></span><span>可多选</span></div>

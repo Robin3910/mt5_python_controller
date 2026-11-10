@@ -35,6 +35,7 @@ from datetime import datetime
 from typing import Optional
 
 from . import (
+    ai_follow_settings,
     node_lifecycle,
     follow_rules,
     group_persist,
@@ -157,7 +158,7 @@ def build_strategy_resume_command(subtask: dict, smc: Optional[dict] = None) -> 
             "symbol": subtask.get("symbol"),
             "volume": subtask.get("volume"),
         },
-        "strategy": subtask.get("strategy_snapshot") or {},
+        "strategy": ai_follow_settings.apply_settings(subtask.get("strategy_snapshot") or {}, subtask.get("follow_settings")),
         "report_interval": Config.STRATEGY_REPORT_INTERVAL,
     }
     runtime = subtask.get("runtime")
@@ -1083,12 +1084,19 @@ class GroupDispatcher:
             return {"node_id": node_id, "status": "offline", "magic": None,
                     "volume": volume, "reason": reason}
 
+        if created.get("skip_reason"):
+            if hold_busy:
+                await self.store.release_group_node_busy(group_id, node_id)
+            await group_persist.record_skipped_dispatch(**base, status="skipped", skip_reason=created["skip_reason"])
+            return {"node_id": node_id, "status": "skipped", "magic": None,
+                    "volume": volume, "reason": created["skip_reason"]}
         dispatch_id, magic = created["dispatch_id"], created["magic"]
         if hold_busy:
             await self.store.set_group_node_busy(
                 group_id, node_id, str(dispatch_id), Config.NODE_BUSY_TTL,
             )
         cmd = for_node(command, dispatch_id=dispatch_id, magic=magic)
+        cmd["strategy"] = ai_follow_settings.apply_settings(cmd.get("strategy") or {}, created.get("follow_settings"))
         # 发包时刻：逐节点各记一次（同步模式下各节点的命令是分别发出的，
         # 记同一个时间会掩盖节点间的先后差）。跨节点唯一可比的时间轴。
         sent_at = time.time()
@@ -1139,7 +1147,7 @@ class GroupDispatcher:
                 task_id=task_id,
                 dispatch_id=dispatch_id,
                 magic=sub.get("magic"),
-                snapshot=snapshot,
+                snapshot=ai_follow_settings.apply_settings(snapshot, sub.get("follow_settings")),
             )
             try:
                 ok = await asyncio.wait_for(
@@ -1165,6 +1173,9 @@ class GroupDispatcher:
         """释放持久化层回传的组内节点占位。"""
         for group_id, node_id in (result or {}).get("released", []):
             await self.store.release_group_node_busy(group_id, node_id)
+        if (result or {}).get("released"):
+            from .follow_service import _refresh_groups
+            await _refresh_groups(self.store, {gid for gid, _ in result["released"]})
 
     @staticmethod
     def _result(group: dict, mode: str, targets: int, status: str,

@@ -48,6 +48,12 @@ const router = createRouter({
       meta: { menu: 'ai_trade' },
     },
     {
+      path: '/ai-trade/follow/:leaderUserId/:groupId',
+      name: 'ai-follow-setup',
+      component: () => import('@/views/AiFollowSetupView.vue'),
+      meta: { menu: 'ai_trade' },
+    },
+    {
       path: '/my-ai-channel',
       name: 'my-ai-channel',
       component: () => import('@/views/MyAiChannelView.vue'),

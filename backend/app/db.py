@@ -80,13 +80,22 @@ def _migrate_users_follow_paused(sync_conn) -> None:
 
 def _migrate_follow_node_state(sync_conn) -> None:
     inspector = inspect(sync_conn)
-    if "group_follower_node" not in inspector.get_table_names():
+    tables = set(inspector.get_table_names())
+    if "group_follower_node" not in tables:
         return
     columns = {column["name"] for column in inspector.get_columns("group_follower_node")}
     if "follow_state" not in columns:
         sync_conn.execute(text("ALTER TABLE group_follower_node ADD COLUMN follow_state VARCHAR(16) NOT NULL DEFAULT 'running'"))
     if "leader_paused" not in columns:
         sync_conn.execute(text("ALTER TABLE group_follower_node ADD COLUMN leader_paused BOOLEAN NOT NULL DEFAULT 0"))
+    if "single_dispatch_id" not in columns:
+        sync_conn.execute(text("ALTER TABLE group_follower_node ADD COLUMN single_dispatch_id BIGINT NULL"))
+    for table in ("group_follower_node", "ai_follow_application_node", "group_task_dispatch"):
+        if table not in tables:
+            continue
+        fields = {column["name"] for column in inspector.get_columns(table)}
+        if "follow_settings_json" not in fields:
+            sync_conn.execute(text(f"ALTER TABLE {table} ADD COLUMN follow_settings_json JSON NULL"))
 
 
 def _migrate_users_profile_columns(sync_conn) -> None:

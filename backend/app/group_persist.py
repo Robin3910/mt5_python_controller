@@ -21,6 +21,7 @@ from typing import Optional
 from sqlalchemy import func, or_, select, update
 
 from . import group_rules, latency_marks, signal_codes, strategy_templates
+from . import ai_follow_runtime
 from .db import SessionLocal
 from .orm import (
     GroupSignalTask,
@@ -142,6 +143,9 @@ async def create_dispatch(
     """
     try:
         async with SessionLocal() as s:
+            relation, settings, reason = await ai_follow_runtime.prepare_dispatch(s, task_id, group_id, node_id)
+            if reason:
+                return {"skip_reason": reason}
             row = GroupTaskDispatch(
                 task_id=task_id,
                 signal_id=signal_id,
@@ -153,14 +157,17 @@ async def create_dispatch(
                 action=action,
                 status="pending",
                 dispatched_at=datetime.now(),
+                follow_settings_json=settings,
             )
             s.add(row)
             await s.flush()
             magic = group_rules.subtask_magic(row.id)
             row.magic = magic
             dispatch_id = row.id
+            if relation and settings and settings.get("run_mode") == "single":
+                relation.single_dispatch_id = dispatch_id
             await s.commit()
-            return {"dispatch_id": dispatch_id, "magic": magic}
+            return {"dispatch_id": dispatch_id, "magic": magic, "follow_settings": settings}
     except Exception as e:  # noqa: BLE001
         logger.warning("create_dispatch failed: %s", e)
         return None
@@ -177,6 +184,7 @@ def _subtask_dict(r: GroupTaskDispatch) -> dict:
         "symbol": r.symbol,
         "magic": r.magic,
         "status": r.status,
+        "follow_settings": r.follow_settings_json,
     }
 
 
@@ -577,6 +585,7 @@ def _snapshot_subtask(d: GroupTaskDispatch, t: GroupSignalTask) -> dict:
         "symbol": d.symbol or t.symbol,
         "volume": d.decided_vol if d.decided_vol is not None else t.volume,
         "strategy_snapshot": t.strategy_snapshot_json,
+        "follow_settings": d.follow_settings_json,
         "status": d.status,
         "stop_requested_at": (
             d.stop_requested_at.timestamp()
@@ -1555,6 +1564,7 @@ async def _refresh_task_totals(session, task_id: int) -> None:
 
 async def _refresh_task_status(session, task_id: int) -> None:
     """按当前子任务状态收口主任务状态。"""
+    await ai_follow_runtime.complete_single_rounds(session, task_id)
     statuses = (
         await session.execute(
             select(GroupTaskDispatch.status).where(GroupTaskDispatch.task_id == task_id)

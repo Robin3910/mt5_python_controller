@@ -750,6 +750,9 @@ async def _release_node_busy(result: dict | None) -> None:
     for group_id, node_id in result.get("released", []):
         await store.release_group_node_busy(group_id, node_id)
         logger.info("group %s node %s released", group_id, node_id)
+    if result.get("released"):
+        from .follow_service import _refresh_groups
+        await _refresh_groups(store, {gid for gid, _ in result["released"]})
 
 
 async def _update_node_mt5(node_id: str, ws: WebSocket, data: dict) -> None:

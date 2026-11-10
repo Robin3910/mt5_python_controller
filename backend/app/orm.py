@@ -473,6 +473,8 @@ class GroupFollowerNode(Base):
     follower_user_id: Mapped[int] = mapped_column(Integer, index=True)
     follow_state: Mapped[str] = mapped_column(String(16), default="running", server_default="running")
     leader_paused: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    follow_settings_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    single_dispatch_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # 带单源冗余快照：写入时取「分组 owner 的主节点」。
     # 只用于展示 / 审计 / 主节点切换后的存量排查，不参与运行时判定
     # （运行时一律按 group.owner_user_id 现算主节点，避免主节点切换后快照过期）。
@@ -512,6 +514,7 @@ class AiFollowApplicationNode(Base):
     node_id: Mapped[str] = mapped_column(String(32), index=True)
     owner_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     snapshot: Mapped[dict] = mapped_column(JSON)
+    follow_settings_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="pending")
     original_follow_state: Mapped[str] = mapped_column(String(16), default="running")
     joined_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -591,6 +594,8 @@ class GroupTaskDispatch(Base):
     占位，同一节点同品种不会被重复下发（不同品种可并行）。
     """
     __tablename__ = "group_task_dispatch"
+
+    follow_settings_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     id: Mapped[int] = mapped_column(AutoPK, primary_key=True, autoincrement=True)
     task_id: Mapped[int] = mapped_column(BigInteger, index=True)

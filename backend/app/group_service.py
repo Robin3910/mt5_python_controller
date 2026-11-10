@@ -74,6 +74,7 @@ def group_row_to_dict(
                 "follower_user_id": f.follower_user_id,
                 "follow_state": getattr(f, "follow_state", None) or "running",
                 "leader_paused": bool(f.leader_paused),
+                "settings": f.follow_settings_json,
                 "leader_user_id": f.leader_user_id,
                 "leader_primary_node_id": f.leader_primary_node_id,
                 "sort_order": f.sort_order or 0,

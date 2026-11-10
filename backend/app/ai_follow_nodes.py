@@ -44,7 +44,7 @@ async def node_stats(store, principal) -> dict:
     for node_id, account in zip(node_ids, accounts):
         node = owned_nodes[node_id]
         relations = by_node[node_id]
-        states = {"paused" if relation.get("leader_paused") else relation["follow_state"] for relation in relations}
+        states = {"paused" if relation.get("leader_paused") and relation["follow_state"] != "stopped" else relation["follow_state"] for relation in relations}
         follow_state = "running" if "running" in states else "paused" if "paused" in states else "stopped"
         magics = set().union(*(scopes[relation["group_id"]][node_id] for relation in relations))
         positions = [

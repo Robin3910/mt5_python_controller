@@ -33,7 +33,7 @@ class NodeDeleteRequest(BaseModel):
 
 
 class AiUiEvent(BaseModel):
-    action: Literal["page_view", "search", "filter", "open_picker", "select_nodes", "cancel_dialog", "collapse_group", "open_delete", "refresh"]
+    action: Literal["page_view", "search", "filter", "open_picker", "select_nodes", "cancel_dialog", "collapse_group", "open_delete", "refresh", "follow_step", "follow_settings"]
     group_id: str | None = Field(default=None, max_length=32)
     node_ids: list[str] = Field(default_factory=list, max_length=50)
     value: str | None = Field(default=None, max_length=200)

@@ -977,7 +977,7 @@ def _migrate_leader_channel_table(sync_conn) -> None:
 
 ## 17. 实施契约与升级验收
 
-2026-11-09 实施版。以下规则及《技术实现方案》§18.64 为当前行为依据。
+2026-11-10 实施版。以下规则及《技术实现方案》§18.64、§18.65 为当前行为依据。
 
 ### 17.1 业务流程
 
@@ -988,6 +988,7 @@ def _migrate_leader_channel_table(sync_conn) -> None:
 ### 17.2 页面
 
 - `/ai-trade`：按策略分组展示机器人；跟单弹窗含机器人说明、节点名称/账号搜索、在线状态、余额、主节点标识、多选、已跟随/审核中标记及真实删除入口。
+- `/ai-trade/follow/:leaderUserId/:groupId`：选择节点后进入“参数风控 → 确认提交”，更换节点和上一步保留当前机器人本次配置。最后确认才调用申请接口，成功后进入待审核页签；申请人刷新页面需重新选择节点。
 - “我的机器人”增加待审核页签。存量待复审及被拒绝的存量任务仍能查看持仓并使用既有平仓入口。
 - `/my-ai-channel`：从“我的模块”进入，展示资料卡、等级、真实收益、待审/已审统计；按机器人折叠、按申请人合并展示节点明细。
 - 本组通过处理该机器人全部待审申请；全部通过处理搜索命中的全部待审申请，跨分页获取固定申请 ID 集合，确认后逐笔审批。
@@ -1012,8 +1013,8 @@ def _migrate_leader_channel_table(sync_conn) -> None:
 
 | 接口 | 契约 |
 | --- | --- |
-| `POST /api/ai-follow/join` | 请求仍为 `leader_user_id/group_ids/node_ids`；返回 `pending/skipped`，`joined=[]` |
-| `GET /api/ai-follow/me` | `following` 保留生效及存量任务视图，增加 `applications` |
+| `POST /api/ai-follow/join` | 保留 `leader_user_id/group_ids/node_ids`，可选 `settings={risk_mode,loss_ratio,run_mode}`；返回 `pending/skipped`，`joined=[]` |
+| `GET /api/ai-follow/me` | `following` 保留生效、已停止及存量任务视图，节点和 `applications` 返回获批/待审设置 |
 | `GET /api/ai-channel/profile` | 本人频道的派生资料和全局统计 |
 | `GET /api/ai-channel/requests` | `status=pending/reviewed`、`q`、`page/page_size`；返回机器人分组及跨页待审 ID |
 | `POST /api/ai-channel/requests/{id}/approve` | 整笔通过、幂等 |
@@ -1076,3 +1077,13 @@ def _migrate_leader_channel_table(sync_conn) -> None:
 上线前备份 MySQL，由用户停止旧单实例后端并启动新版本，避免新旧逻辑同时写关系表。确认存量待复审数量、在跑任务和审计记录，再由发单人审核。不得用旧版本回滚绕过审核；恢复采用备份或包含本版审核语义的前向修复。
 
 验证覆盖申请/并发审核、暂停叠加、迁移重启、跨市场隔离、主节点、真实节点删除及凭证重连，并执行前端类型检查、构建和浏览器桌面/手机验收。
+
+### 17.9 个人风控与一轮策略
+
+“一轮策略”指一个节点的一笔策略子任务从启动到终态的完整周期，包含其首单（含成功挂单）、加仓及收尾。“单次”表示该节点成功启动的一轮收口后停止接收后续信号；下发或首单失败不消耗这一次机会。“循环”表示收口后继续参与后续信号。该选择与旧 `float_pl_ratio.monitor_mode` 不是同一配置。
+
+`settings.risk_mode` 为 `leader/custom`，自定义 `loss_ratio` 必须大于 0 且不超过 100，按账户余额比例计算本信号共同止损；`run_mode` 为 `loop/single`。缺省为跟随带单、循环。手数完整跟随，不按风控百分比缩放。确认页告知策略实时同步，自定义比例独立保留。
+
+申请节点的 `follow_settings_json` 在通过时写入生效关系，并带内部申请 ID；创建子任务时复制配置，后续热推和恢复使用子任务配置。`single_dispatch_id` 与子任务在同一事务内领取，禁止并发领取两轮；终态且未成功启动则释放领取，已成功启动则将关系置为 `stopped` 并同事务审计。重新申请获批会切换批次并重置领取，旧任务不能停止新批次。节点与频道暂停分别保留，恢复不能重启已完成的单次关系。
+
+新增列通过启动增量迁移补齐，兼容旧表及重复执行；旧配置按缺省处理，不再次触发已完成的存量复审迁移。验收覆盖自定义风控下发、热推与重连保持、单次并发领取、下发及首单失败重试、单次完成进入历史及继承到新机器人仍待审。

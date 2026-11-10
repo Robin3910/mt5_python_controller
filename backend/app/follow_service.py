@@ -63,6 +63,7 @@ def _row_to_dict(row: GroupFollowerNode) -> dict:
         "follower_user_id": row.follower_user_id,
         "follow_state": row.follow_state,
         "leader_paused": bool(row.leader_paused),
+        "settings": row.follow_settings_json,
         "leader_user_id": row.leader_user_id,
         "leader_primary_node_id": row.leader_primary_node_id,
         "sort_order": row.sort_order or 0,
@@ -325,7 +326,8 @@ async def adopt_followers_for_group(
                 skipped.extend({"node_id": nid, "reason": "跟单用户已失效"} for nid in node_ids)
                 continue
             result = await ai_application_store.submit(store, principal, seen[node_ids[0]]["leader_user_id"],
-                [target_gid], node_ids, source="inherit", follow_states={nid: seen[nid]["follow_state"] for nid in node_ids})
+                [target_gid], node_ids, source="inherit", follow_states={nid: seen[nid]["follow_state"] for nid in node_ids},
+                node_settings={nid: seen[nid].get("settings") for nid in node_ids})
             for pending in result["pending"]:
                 adopted.extend({"node_id": nid, "follower_user_id": user_id,
                                 "request_id": pending["request_id"], "status": "pending"} for nid in pending["node_ids"])
