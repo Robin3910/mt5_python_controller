@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import re
 import secrets
 import socket
 import threading
@@ -66,6 +67,44 @@ def _free_port() -> int:
         return int(s.getsockname()[1])
 
 
+# 中国大陆手机号：1 开头、第二位 3-9、共 11 位。
+# 与后端 sms_service.CN_PHONE_RE 保持一致 —— 面板侧先拦一道，
+# 避免把明显非法的号码发到后端消耗一次请求。
+_CN_PHONE_RE = re.compile(r"^1[3-9]\d{9}$")
+
+
+def _normalize_phone(raw: str) -> str:
+    """把手机号归一化成 11 位国内号码。
+
+    接受 `13800138000` / `+8613800138000` / `8613800138000` / 带空格短横线。
+    非法号码直接抛 BridgeError(400)，文案给用户看。
+    """
+    text = re.sub(r"[\s\-]", "", str(raw or "").strip())
+    if text.startswith("+86"):
+        text = text[3:]
+    elif text.startswith("86") and len(text) == 13:
+        text = text[2:]
+    if not _CN_PHONE_RE.match(text):
+        raise BridgeError("请输入正确的 11 位手机号", status=400)
+    return text
+
+
+def _sms_next_action_message(next_action: str, result: dict[str, Any]) -> str:
+    """把后端的 next_action 翻成面板文案。
+
+    面板只做登录，不做注册 —— 未注册 / 待审核 / 被驳回都引导去管理后台。
+    """
+    if next_action == "register":
+        return "该手机号尚未注册，请在管理后台注册后再登录"
+    if next_action == "pending_approval":
+        return "该账号已注册，等待管理员审核通过后即可登录"
+    if next_action == "rejected":
+        reason = str(result.get("reject_reason") or "").strip()
+        base = "实名审核未通过，请在管理后台重新提交实名材料"
+        return f"{base}：{reason}" if reason else base
+    return "验证码校验未通过，请重试"
+
+
 class DashboardBridge:
     """Python 运维能力 <-> WebView 前端 的桥。
 
@@ -88,12 +127,17 @@ class DashboardBridge:
         self._inventory: dict[str, InstanceConfig] = {}
         self._inventory_loaded = False
         self._login_pending_token = ""
+        # 短信登录的 2FA 中间态单独放：与账号密码的中间态分开，
+        # 免得「短信登录到一半又去点账号密码登录」时走错分支。
+        self._sms_pending_token = ""
         self._lock_reason = ""
         self._busy: dict[str, str] = {}
         self._pending_login: dict[str, Any] = {}
         self._version_info: dict[str, Any] = {}
         self._auto_login_user = ""
         self._auto_login_password = ""
+        # 验证码登录开关（面板 .env 的 DASHBOARD_SMS_LOGIN，默认开）。
+        self._sms_login_enabled = True
         # 后端统计缓存（今日信号 / 平均延迟），见 `_node_stats`
         self._stats_cache: dict[str, dict] = {}
         self._stats_fetched_at = 0.0
@@ -326,7 +370,14 @@ class DashboardBridge:
     # ─────────────────────────────────────────────── 动作
 
     def login(self, username: str, password: str, code: str = "") -> dict[str, Any]:
-        """登录。返回 `{ok, requires_2fa, error}`。"""
+        """登录。返回 `{ok, requires_2fa, error}`。
+
+        两种调用方式：
+        1. 带账号密码 → 首次登录；后端要求 2FA 时把中间态凭证记在桥接层，
+           前端第二步再调一次本接口（不带账号密码）。
+        2. 只带 TOTP 码 → 2FA 第二步。此时**必须**已有中间态凭证，
+           否则报 401（否则会把空账号密码当密码登录，错误文案会误导）。
+        """
         base = self._backend_base()
         try:
             api = DashboardAPI(base)
@@ -335,9 +386,12 @@ class DashboardBridge:
 
         try:
             if self._login_pending_token:
+                # 2FA 第二步：用记住的中间态换 token。
                 result = api.login_2fa(self._login_pending_token, code)
-            else:
+            elif username or password:
                 result = api.login(username, password)
+            else:
+                raise BridgeError("2FA 会话已过期，请重新登录", status=401)
         except DashboardAuthError as exc:
             raise BridgeError(str(exc), status=exc.status or 401) from exc
 
@@ -361,6 +415,168 @@ class DashboardBridge:
                 "未配置后端地址：请在程序目录的 .env 中设置 APP_URL", status=400
             )
         return configured
+
+    # ─────────────────────────────────────────────── 手机验证码登录
+
+    def sms_status(self) -> dict[str, Any]:
+        """短信登录是否可用。
+
+        三个条件全满足才返回 enabled=True：
+        1. 面板 .env 里没把 DASHBOARD_SMS_LOGIN 关掉；
+        2. 后端地址已配置；
+        3. 后端短信服务本身可用（后端返回 enabled）。
+
+        后端不可达 / 未配置短信时都返回 enabled=False + 一句说明，
+        **不抛错** —— 前端据此隐藏「验证码登录」入口即可，
+        不该因为短信没开就让整个登录页报错。
+        """
+        if not self._sms_login_enabled:
+            return {
+                "enabled": False,
+                "reason": "面板 .env 里 DASHBOARD_SMS_LOGIN=0，已关闭验证码登录",
+            }
+        try:
+            base = self._backend_base()
+        except BridgeError as exc:
+            return {"enabled": False, "reason": str(exc)}
+
+        try:
+            api = DashboardAPI(base)
+            status = api.sms_status()
+        except DashboardAuthError as exc:
+            return {"enabled": False, "reason": str(exc)}
+
+        enabled = bool(status.get("enabled"))
+        return {
+            "enabled": enabled,
+            "reason": "" if enabled else "后端未启用短信服务，请使用账号密码登录",
+            "code_ttl_seconds": int(status.get("code_ttl_seconds") or 300),
+            "send_interval_seconds": int(status.get("send_interval_seconds") or 60),
+        }
+
+    def sms_send(self, phone: str) -> dict[str, Any]:
+        """发送验证码。
+
+        人机验证是**自适应**的（后端按风险决定要不要 428）。
+        本面板按约定**不启用**滑块：后端若返回 428，这里原样透传，
+        由前端提示「请到管理后台或网页端完成验证」——
+        面板跑在客户内网机器上，滑块 CDN（o.alicdn.com）常常不可达，
+        强推只会让发码彻底用不了。
+        """
+        if not self._sms_login_enabled:
+            raise BridgeError("面板已关闭验证码登录", status=403)
+        number = _normalize_phone(phone)
+        api = self._sms_api()
+        try:
+            result = api.sms_send(number)
+        except DashboardAuthError as exc:
+            raise BridgeError(str(exc), status=exc.status or 400) from exc
+        return {
+            "ok": True,
+            "expire_in": int(result.get("expire_in") or 300),
+            "cooldown": int(result.get("cooldown") or 60),
+        }
+
+    def sms_verify(self, phone: str, code: str) -> dict[str, Any]:
+        """校验验证码。
+
+        返回 next_action，由后端根据「该号码是否已注册」决定：
+        - login            已注册且已启用 → 前端继续走 sms_login
+        - register         未注册       → 提示去管理后台注册（面板不做注册）
+        - pending_approval 已注册但待审核 → 提示等待管理员审核
+        - rejected         实名审核被驳回 → 提示去管理后台重新提交
+        """
+        if not self._sms_login_enabled:
+            raise BridgeError("面板已关闭验证码登录", status=403)
+        number = _normalize_phone(phone)
+        api = self._sms_api()
+        try:
+            result = api.sms_verify(number, str(code or "").strip())
+        except DashboardAuthError as exc:
+            raise BridgeError(str(exc), status=exc.status or 400) from exc
+
+        next_action = str(result.get("next_action") or "")
+        ticket = str(result.get("ticket") or "")
+        if next_action != "login":
+            # 非登录走向一律不回传票据：面板不发起注册/审核相关的动作。
+            return {
+                "ok": False,
+                "next_action": next_action,
+                "ticket": "",
+                "message": _sms_next_action_message(next_action, result),
+            }
+        return {
+            "ok": True,
+            "next_action": "login",
+            "ticket": ticket,
+            "message": "",
+        }
+
+    def sms_login(self, phone: str, ticket: str) -> dict[str, Any]:
+        """用票据换 JWT。
+
+        已开启 2FA 的用户后端返回 requires_2fa + login_token，
+        这里把它暂存起来，前端再调 sms_login_2fa 走第二步。
+        """
+        if not self._sms_login_enabled:
+            raise BridgeError("面板已关闭验证码登录", status=403)
+        number = _normalize_phone(phone)
+        api = self._sms_api()
+        try:
+            result = api.sms_login(number, ticket=ticket)
+        except DashboardAuthError as exc:
+            raise BridgeError(str(exc), status=exc.status or 401) from exc
+
+        if result.get("requires_2fa"):
+            pending = str(result.get("login_token") or "")
+            if not pending:
+                raise BridgeError("后端未返回 2FA 中间态凭证", status=500)
+            self._sms_pending_token = pending
+            return {
+                "ok": False,
+                "requires_2fa": True,
+                "login_token": pending,
+                "error": "请输入 2FA 验证码",
+            }
+
+        token = str(result.get("token") or "")
+        if not token:
+            raise BridgeError("后端未返回登录凭证", status=500)
+        self._sms_pending_token = ""
+        self._establish(api, token)
+        return {"ok": True, "requires_2fa": False, "error": ""}
+
+    def sms_login_2fa(self, login_token: str, code: str) -> dict[str, Any]:
+        """短信登录的第二步：校验 TOTP 验证码。
+
+        独立于账号密码的 /api/login 分支：那条路径带着账号密码语义，
+        混用会让「短信登录到一半」的状态难以辨认。
+        """
+        if not self._sms_login_enabled:
+            raise BridgeError("面板已关闭验证码登录", status=403)
+        pending = str(login_token or "").strip() or self._sms_pending_token
+        if not pending:
+            raise BridgeError("2FA 会话已过期，请重新用验证码登录", status=401)
+        api = self._sms_api()
+        try:
+            result = api.login_2fa(pending, str(code or "").strip())
+        except DashboardAuthError as exc:
+            raise BridgeError(str(exc), status=exc.status or 401) from exc
+
+        token = str(result.get("token") or "")
+        if not token:
+            raise BridgeError("后端未返回登录凭证", status=500)
+        self._sms_pending_token = ""
+        self._establish(api, token)
+        return {"ok": True, "requires_2fa": False, "error": ""}
+
+    def _sms_api(self) -> DashboardAPI:
+        """短信链路用的后端客户端（与账号密码链路同一个后端）。"""
+        base = self._backend_base()
+        try:
+            return DashboardAPI(base)
+        except DashboardAuthError as exc:
+            raise BridgeError(str(exc), status=400) from exc
 
     def config_status(self) -> dict[str, Any]:
         """后端配置状态。登录页要靠它告诉用户「为什么连不上」。
@@ -403,7 +619,7 @@ class DashboardBridge:
             self._login_pending_token = ""
 
     def _load_auto_login(self) -> None:
-        """从面板 .env 读取自动登录账号。"""
+        """从面板 .env 读取自动登录账号与验证码登录开关。"""
         from store import dashboard_env_path
         from env_file import parse_env_text
 
@@ -414,6 +630,9 @@ class DashboardBridge:
         values = parse_env_text(text)
         self._auto_login_user = values.get("DASHBOARD_LOGIN_USER", "").strip()
         self._auto_login_password = values.get("DASHBOARD_LOGIN_PASSWORD", "").strip()
+        # 缺省视为开启；只有显式写成 0 / false / off / no 才关掉。
+        raw = values.get("DASHBOARD_SMS_LOGIN", "").strip()
+        self._sms_login_enabled = raw.lower() not in ("0", "false", "off", "no")
 
     def _establish(self, api: DashboardAPI, token: str) -> None:
         try:
@@ -551,6 +770,8 @@ class DashboardBridge:
             self.session.perform("logout", None, lambda: None)
         finally:
             self._persist()
+            self._login_pending_token = ""
+            self._sms_pending_token = ""
             self.session.lock("已退出登录，节点与既有守护继续运行", clear_token=True)
         return {"ok": True}
 
@@ -854,6 +1075,28 @@ class DashboardBridge:
 
         if path == "/api/config":
             return self.config_status()
+
+        # —— 手机验证码登录 ——
+        if path == "/api/sms/status":
+            return self.sms_status()
+
+        if path == "/api/sms/send":
+            return self.sms_send(str(body.get("phone") or ""))
+
+        if path == "/api/sms/verify":
+            return self.sms_verify(
+                str(body.get("phone") or ""), str(body.get("code") or "")
+            )
+
+        if path == "/api/sms/login":
+            return self.sms_login(
+                str(body.get("phone") or ""), str(body.get("ticket") or "")
+            )
+
+        if path == "/api/sms/2fa":
+            return self.sms_login_2fa(
+                str(body.get("login_token") or ""), str(body.get("code") or "")
+            )
 
         if path == "/api/client-logs":
             return self.client_logs()

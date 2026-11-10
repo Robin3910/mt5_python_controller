@@ -139,6 +139,7 @@ function confirmRemove(): void {
             {{ pendingUpdates }}
           </span>
         </button>
+        <!-- 系统设置入口：暂时隐藏，需要时把下面这段 button 恢复即可
         <button
           class="header-icon-btn"
           title="系统设置"
@@ -146,6 +147,7 @@ function confirmRemove(): void {
         >
           ⚙
         </button>
+        -->
         <button class="btn-sm logout" @click="emit('logout')">退出登录</button>
       </div>
     </header>
