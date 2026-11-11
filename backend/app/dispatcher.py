@@ -22,6 +22,8 @@ from . import (
     latency_marks,
     mt5_identity,
     mt5_link,
+    news_guard,
+    permissions,
     persist,
     results,
     rules,
@@ -224,6 +226,22 @@ class Dispatcher:
         if not ok:
             await self._skip(signal_id, node_id, reason, signal_codes.SKIP_RISK_POSITION)
             return {"status": "skipped", "reason": reason}
+
+        # 9.8 财经日历黑名单：高影响数据公布前后停止**新开仓**。
+        # 判定用的是**节点所有者**的个人设置（节点归谁，就用谁的开关）。
+        # 刻意放在抢占并发锁之前：被黑名单拦下的信号不该占住节点的执行锁，
+        # 否则黑名单期间会把节点的并发槽白占住。
+        # 平仓路径完全不经过这里（_dispatch_close 单独走），所以持仓的止损止盈
+        # 在黑名单期间照常运行 —— 这正是「只停新开仓」的本意。
+        news_reason = await news_guard.block_open_reason(
+            user_id=permissions.normalize_owner(node.get("owner_user_id")),
+            symbol=signal.symbol,
+        )
+        if news_reason:
+            await self._skip(
+                signal_id, node_id, news_reason, signal_codes.SKIP_NEWS_BLACKOUT,
+            )
+            return {"status": "skipped", "reason": news_reason}
 
         # 9.7 并发控制：同一 (节点, 品种) 同时只允许一笔在途订单
         if not await self.store.acquire_exec_lock(node_id, signal.symbol):

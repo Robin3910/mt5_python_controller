@@ -28,6 +28,7 @@ from . import (
     group_persist,
     group_service,
     groups,
+    news_api,
     node_service,
     node_dashboard_api,
     nodes,
@@ -54,6 +55,7 @@ from .connections import manager
 from .db import engine, init_db
 from .deal_agg import LeaderStatsAggregator
 from .dispatcher import Dispatcher
+from .economic_calendar import EconomicCalendarWorker
 from .group_dispatcher import GroupDispatcher
 from .poll_queue import PollWorker
 from .redis_store import RedisStore
@@ -109,6 +111,17 @@ async def lifespan(app: FastAPI):
     state.group_dispatcher = GroupDispatcher(store)
     state.poll_worker = PollWorker(store, state.dispatcher)
     state.poll_worker.start()
+    # 财经日历抓取 worker：拉 ForexFactory 公开日历落 economic_event 表，
+    # 供「财经日历黑名单」判定使用。拉不到数据时保留上次数据，不阻断交易。
+    # 测试环境关掉（ECONOMIC_CALENDAR_ENABLED=false）：抓取走外网，
+    # 会拖慢用例并可能被对方限流。
+    if settings.economic_calendar_enabled:
+        state.calendar_worker = EconomicCalendarWorker(
+            interval=settings.economic_calendar_interval,
+        )
+        state.calendar_worker.start()
+    else:
+        logger.info("economic calendar worker disabled by configuration")
     # 带单员绩效预聚合：后台把「所有带单员 × 四个窗口」的绩效算好写 Redis，
     # 列表接口只读缓存（未命中不回源查库，延迟恒定）。
     state.leader_stats_agg = LeaderStatsAggregator(store)
@@ -124,6 +137,8 @@ async def lifespan(app: FastAPI):
             await state.poll_worker.stop()
         if state.leader_stats_agg:
             await state.leader_stats_agg.stop()
+        if state.calendar_worker:
+            await state.calendar_worker.stop()
         await store.close()
         await engine.dispose()
 
@@ -171,6 +186,8 @@ for r in (
     follow_channel_api.router,
     ai_follow_api.router,
     deals_api.router,
+    news_api.router,
+    news_api.admin_router,
 ):
     app.include_router(r)
 

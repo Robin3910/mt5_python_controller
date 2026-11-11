@@ -1,6 +1,11 @@
 fastapi>=0.115
 uvicorn[standard]>=0.30
 redis>=5.0
+# HTTP 客户端 —— 财经日历抓取 ForexFactory 公开 JSON 用（app/economic_calendar.py）。
+# 必须显式声明：fastapi/starlette 的依赖链里**没有** httpx，
+# 本地开发机常被 openai/mcp 等无关包顺带装上，Docker 干净镜像里则完全没有，
+# 结果就是容器启动时 ModuleNotFoundError: No module named 'httpx'。
+httpx>=0.27
 SQLAlchemy==2.0.51
 greenlet>=3.1.1
 aiosqlite>=0.20

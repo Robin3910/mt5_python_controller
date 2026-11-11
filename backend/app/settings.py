@@ -68,6 +68,14 @@ class Settings(BaseSettings):
     client_package_dir: str = "./data/client_packages"
     client_package_max_mb: int = 300    # 单个安装包大小上限，超出即拒收
 
+    # —— 财经日历（新闻黑名单）——
+    # 是否启用日历定时抓取。关掉后不启动 worker（判定层照常工作，
+    # 只是没有新数据进来）。**测试环境必须关掉**：抓取走外网，
+    # 会拖慢用例并可能被对方限流（429）。
+    economic_calendar_enabled: bool = True
+    # 抓取周期（秒）。默认 30 分钟。
+    economic_calendar_interval: int = 1800
+
     log_level: str = "INFO"
 
     @property

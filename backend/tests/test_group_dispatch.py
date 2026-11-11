@@ -108,7 +108,8 @@ _strategy_seq = iter(range(1, 10_000))
 
 
 async def mk_strategy(store, *, symbol="XAUUSD", name=None, enabled=True, rules=None,
-                      template_id=TEMPLATE_1_ID, template_name=TEMPLATE_1_NAME):
+                      template_id=TEMPLATE_1_ID, template_name=TEMPLATE_1_NAME,
+                      owner_user_id=None):
     """建一条可绑定的策略（分组必须绑定策略才会参与 strategy 信号分发）。"""
     sid = f"sty_t{next(_strategy_seq)}"
     row = {
@@ -120,6 +121,7 @@ async def mk_strategy(store, *, symbol="XAUUSD", name=None, enabled=True, rules=
         "enabled": enabled,
         "rules": rules if rules is not None else [],
         "remark": None,
+        "owner_user_id": owner_user_id,
         "created_at": 0,
     }
     async with SessionLocal() as s:
@@ -132,6 +134,7 @@ async def mk_strategy(store, *, symbol="XAUUSD", name=None, enabled=True, rules=
                 symbol=symbol,
                 enabled=enabled,
                 config_json=row["rules"],
+                owner_user_id=owner_user_id,
             )
         )
         await s.commit()
@@ -141,11 +144,13 @@ async def mk_strategy(store, *, symbol="XAUUSD", name=None, enabled=True, rules=
 
 async def mk_group(store, name, node_ids, *, mode="sync", enabled=True,
                    symbol="XAUUSD", strategy=None, bind_strategy=True,
-                   signal_concurrent_enabled=False):
+                   signal_concurrent_enabled=False, owner_user_id=None):
     """建分组；默认自动绑定一条同品种策略，使其能接收 strategy 信号。"""
     strategy_id = None
     if bind_strategy:
-        strategy = strategy or await mk_strategy(store, symbol=symbol)
+        strategy = strategy or await mk_strategy(
+            store, symbol=symbol, owner_user_id=owner_user_id,
+        )
         strategy_id = strategy["strategy_id"]
     return await group_service.create_group(
         store,
@@ -154,6 +159,7 @@ async def mk_group(store, name, node_ids, *, mode="sync", enabled=True,
             signal_concurrent_enabled=signal_concurrent_enabled,
             strategy_id=strategy_id, node_ids=list(node_ids),
         ),
+        owner_user_id=owner_user_id,
     )
 
 

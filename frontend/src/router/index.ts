@@ -162,6 +162,8 @@ const router = createRouter({
     { path: '/me', name: 'me', component: () => import('@/views/MineView.vue') },
     // 「个人中心」：个人信息 / 带单员 / 修改密码 / 2FA（登录即可进，不限菜单）
     { path: '/profile', name: 'profile', component: () => import('@/views/ProfileView.vue') },
+    // 「财经日历」：新闻黑名单 + 停止做单开关（登录即可进，不限菜单）
+    { path: '/news-calendar', name: 'news-calendar', component: () => import('@/views/NewsCalendarView.vue') },
     {
       path: '/user-strategies',
       name: 'user-strategies',

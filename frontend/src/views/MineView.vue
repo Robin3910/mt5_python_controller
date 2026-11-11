@@ -29,6 +29,17 @@ onMounted(() => {
 // icon: inline SVG path，accent: 图标色 / 底色（15% 透明度）
 const ALL_MODULES: ProfileHubModule[] = [
   {
+    // 财经日历：新闻黑名单 + 停止做单开关。
+    // **不限菜单权限**（跟个人中心一样，登录即可进）—— 它是每个用户自己的
+    // 交易节奏设置，不是某个业务模块的附属功能。
+    code: 'news_calendar',
+    label: '财经日历',
+    description: '高影响数据黑名单 · 停止做单开关',
+    path: '/news-calendar',
+    icon: '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18M8 14h.01M12 14h.01M16 14h.01M8 18h.01M12 18h.01"/>',
+    accent: '#F43F5E',
+  },
+  {
     code: 'ai_channel',
     label: 'AI交易机器人频道',
     description: '机器人申请审核 · 频道管理',
@@ -144,10 +155,19 @@ const ALL_MODULES: ProfileHubModule[] = [
 ]
 
 // 管理员 / 普通用户：都按菜单权限过滤；管理员额外加「首页」「分组管理」入口
+//
+// 例外：**不限菜单码的模块**（财经日历）—— 它是用户自己的交易设置，
+// 不是某个业务模块的附属功能，所以不走 hasMenu 过滤，所有登录用户都能看到。
+const UNRESTRICTED_MODULES = new Set(['news_calendar'])
+
 const visibleModules = computed<ProfileHubModule[]>(() => {
-  let base = ALL_MODULES.filter((m) => m.code === 'ai_channel'
-    ? auth.hasMenu('ai_trade') && auth.canUseAiStrategy && auth.canBeFollowLeader
-    : auth.isAdmin || (m.code !== 'config' && auth.hasMenu(m.code)))
+  let base = ALL_MODULES.filter((m) => {
+    if (UNRESTRICTED_MODULES.has(m.code)) return true
+    if (m.code === 'ai_channel') {
+      return auth.hasMenu('ai_trade') && auth.canUseAiStrategy && auth.canBeFollowLeader
+    }
+    return auth.isAdmin || (m.code !== 'config' && auth.hasMenu(m.code))
+  })
   if (auth.isAdmin) {
     base = [
       {

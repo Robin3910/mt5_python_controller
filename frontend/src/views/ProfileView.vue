@@ -4,6 +4,9 @@
 //
 // 「修改密码」与「2FA」从 ConfigView 搬到这里 —— 它们是**个人**设置，
 // 而 ConfigView 现在只留管理员的系统配置（节点令牌 / Webhook / 短信）。
+//
+// 注：财经日历（新闻黑名单 + 停止做单开关）已独立成页 /news-calendar，
+// 入口在【我的】模块里 —— 不再是本页的第 3 个卡片。
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
@@ -317,7 +320,9 @@ function flash(msg: string): void {
   setTimeout(() => (savedFlag.value = ''), 1800)
 }
 
-onMounted(load2faStatus)
+onMounted(() => {
+  load2faStatus()
+})
 </script>
 
 <template>
@@ -411,6 +416,7 @@ onMounted(load2faStatus)
         </li>
       </ul>
     </section>
+
 
     <!-- 带单员 -->
     <section v-if="canBeLeader" class="pf-card">

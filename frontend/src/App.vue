@@ -10,6 +10,7 @@ import { useHubStore } from '@/stores/hub'
 import { connectAdminWs, disconnectAdminWs } from '@/services/ws'
 import { copyToClipboard } from '@/utils/clipboard'
 import { firstAllowedPath } from '@/constants/menus'
+import NewsTopBanner from '@/components/NewsTopBanner.vue'
 
 const auth = useAuthStore()
 const hub = useHubStore()
@@ -28,6 +29,7 @@ const PAGE_TITLES: Record<string, string> = {
   'ai-robot-detail': '机器人详情',
   follow: '带单',
   me: '我的',
+  'news-calendar': '财经日历',
   config: '配置',
   nodes: '节点',
   'node-detail': '节点',
@@ -214,6 +216,10 @@ watch(() => auth.token, setupWs)
         {{ userLabel }}
       </span>
     </header>
+
+    <!-- 财经日历黑名单提示条：当天有高影响数据公布时在最上方滚动警示。
+         放在 header 之后、main 之前 —— 它是全站横幅，不属于任何一个页面。 -->
+    <NewsTopBanner v-if="authed" />
 
     <main :class="authed ? 'content' : 'content-full'">
       <RouterView />

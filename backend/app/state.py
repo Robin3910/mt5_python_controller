@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     # deal_agg 会 import follow_service -> group_service -> limit_watch -> state，
     # 在这里真 import 会形成环（state 还没定义完）。只用类型标注，故走 TYPE_CHECKING。
     from .deal_agg import LeaderStatsAggregator
+    from .economic_calendar import EconomicCalendarWorker
 
 
 class AppState:
@@ -19,6 +20,8 @@ class AppState:
     poll_worker: Optional[PollWorker] = None  # 轮询后台 worker
     # 带单员绩效预聚合 worker（后台跑，落 Redis 缓存）
     leader_stats_agg: Optional["LeaderStatsAggregator"] = None
+    # 财经日历抓取 worker（拉 ForexFactory 日历，落 economic_event 表）
+    calendar_worker: Optional["EconomicCalendarWorker"] = None
 
 
 # 全局应用状态（在 main.py 的 lifespan 中初始化）

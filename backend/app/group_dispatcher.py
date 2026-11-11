@@ -42,6 +42,7 @@ from . import (
     group_rules,
     market_probe,
     mt5_link,
+    news_guard,
     permissions,
     persist,
     rbac_service,
@@ -929,6 +930,25 @@ class GroupDispatcher:
                 return {"node_id": node_id, "status": "skipped", "magic": None,
                         "volume": volume, "reason": reason}
 
+        # 财经日历黑名单：高影响数据公布前后停止**新开仓**。
+        # 判定用的是**这个节点对应的那个人的**个人设置：
+        #   - 分组 owner 自己的成员节点 → 分组所有者；
+        #   - 跟单员节点 → 跟单员本人（用他自己的开关，跟单员暂停不该影响带单员）。
+        # 与 follow_state / leader_paused 是**再叠加的一层**，不混进那套语义。
+        # 平仓走 _dispatch_close（按活动子任务筛），完全不受这里影响。
+        news_reason = await self._news_block_reason(group, node_id, signal)
+        if news_reason:
+            if not concurrent:
+                await self.store.release_group_node_busy(group_id, node_id)
+            await group_persist.record_skipped_dispatch(
+                **base, status="skipped", skip_reason=news_reason,
+                skip_code=signal_codes.SKIP_NEWS_BLACKOUT,
+            )
+            logger.info("group %s node %s news blackout skip: %s",
+                        group_id, node_id, news_reason)
+            return {"node_id": node_id, "status": "skipped", "magic": None,
+                    "volume": volume, "reason": news_reason}
+
         # 链路闸门（服务端侧）：终端与券商断联的节点不下发开仓指令。
         # 断联期间下单回执不可靠，订单却可能已成交 —— 发了就可能留下孤儿仓。
         # 这里只是「不浪费一次下发」，真正把关的是节点侧闸门（那里离下单最近）。
@@ -958,6 +978,32 @@ class GroupDispatcher:
             logger.warning("group %s node %s dispatch failed: %s", group_id, node_id, e)
             return {"node_id": node_id, "status": "offline", "magic": None,
                     "volume": volume, "reason": "下发失败：节点处理异常"}
+
+    async def _news_block_reason(
+        self, group: dict, node_id: str, signal: TradingSignal,
+    ) -> Optional[str]:
+        """财经日历黑名单判定：这个节点此刻是否禁止新开仓；禁止返回原因。
+
+        用户身份按节点在分组里的角色取：
+          - 跟单成员 → 跟单员本人（`GroupFollowerNode.follower_user_id`）；
+          - owner 成员 → 分组所有者（`group.owner_user_id`）。
+
+        没有归属（管理员名下 / 数据缺失）→ 放行：没有主人就没有开关，
+        按「不拦」处理比按「全站拦」安全。
+        """
+        user_id: Optional[int] = permissions.normalize_owner(group.get("owner_user_id"))
+        for follower in group.get("followers") or []:
+            if not isinstance(follower, dict):
+                continue
+            if str(follower.get("node_id") or "") != node_id:
+                continue
+            follower_id = permissions.normalize_owner(follower.get("follower_user_id"))
+            if follower_id is not None:
+                user_id = follower_id
+            break
+        if user_id is None:
+            return None
+        return await news_guard.block_open_reason(user_id=user_id, symbol=signal.symbol)
 
     async def _link_offline_block(
         self, node_id: str, base: dict, volume: float, *, release_busy: bool = True,

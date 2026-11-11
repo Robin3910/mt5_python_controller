@@ -625,6 +625,94 @@ def _migrate_group_dispatch_add_progress(sync_conn) -> None:
     )
 
 
+def _migrate_news_blackout_tables(sync_conn) -> None:
+    """财经日历黑名单的两张新表：economic_event / user_news_settings。
+
+    两张都是**新表**，`create_all` 会直接建好；这里只做「幂等补列」的兜底，
+    防止出现「先上线了旧版本、后补这一列」的库结构不完整情况。
+
+    - economic_event：event_time 走普通索引（按时间窗查询用）。
+    - user_news_settings：user_id 是主键（一人一行），没有额外索引需求。
+    """
+    inspector = inspect(sync_conn)
+    tables = set(inspector.get_table_names())
+    dialect = sync_conn.engine.dialect.name
+
+    if "economic_event" in tables:
+        cols = {c["name"] for c in inspector.get_columns("economic_event")}
+        additions = {
+            "event_time": "BIGINT NOT NULL DEFAULT 0",
+            "title": "VARCHAR(160) NOT NULL DEFAULT ''",
+            "country": "VARCHAR(8) NOT NULL DEFAULT ''",
+            "impact": "VARCHAR(8) NOT NULL DEFAULT 'low'",
+            "forecast": "VARCHAR(32) NULL",
+            "previous": "VARCHAR(32) NULL",
+            "source": "VARCHAR(24) NOT NULL DEFAULT 'forexfactory'",
+            "fetched_at": "DATETIME NULL",
+        }
+        for name, ddl in additions.items():
+            if name not in cols:
+                sync_conn.execute(text(f"ALTER TABLE economic_event ADD COLUMN {name} {ddl}"))
+        indexes = {i.get("name") for i in inspector.get_indexes("economic_event")}
+        # 按**列**判断是否已有索引，而不是按索引名。
+        # ORM 里 event_time/impact 都带 index=True，SQLAlchemy 自动建的索引名是
+        # `ix_economic_event_event_time` / `ix_economic_event_impact`；如果这里再按
+        # 自己起的名字建一遍，MySQL 会报「Duplicate index ... deprecated」。
+        indexed_cols: set[str] = set()
+        for idx in inspector.get_indexes("economic_event"):
+            for col in idx.get("column_names") or []:
+                indexed_cols.add(col)
+        for col in ("event_time", "impact"):
+            if col not in indexed_cols:
+                try:
+                    sync_conn.execute(
+                        text(
+                            f"CREATE INDEX ix_economic_event_{col} "
+                            f"ON economic_event ({col})"
+                        )
+                    )
+                except Exception:  # noqa: BLE001
+                    # MySQL 不支持 CREATE INDEX IF NOT EXISTS；重复建索引失败不影响启动
+                    pass
+        # 清理历史遗留的重复索引：早期版本按 ix_economic_event_time 手工建过一个，
+        # 而 create_all 同时建了 ix_economic_event_event_time —— 同一列两个索引，
+        # MySQL 启动时会刷 deprecation 警告。删掉手工那个，保留 ORM 生成的。
+        if (
+            "ix_economic_event_time" in indexes
+            and "ix_economic_event_event_time" in indexes
+        ):
+            try:
+                if dialect == "mysql":
+                    sync_conn.execute(
+                        text("ALTER TABLE economic_event DROP INDEX ix_economic_event_time")
+                    )
+                else:
+                    sync_conn.execute(text("DROP INDEX ix_economic_event_time"))
+                logger.info("dropped duplicate index ix_economic_event_time")
+            except Exception:  # noqa: BLE001
+                logger.warning("failed to drop duplicate index ix_economic_event_time")
+
+    if "user_news_settings" in tables:
+        cols = {c["name"] for c in inspector.get_columns("user_news_settings")}
+        bool_type = "TINYINT(1) NOT NULL DEFAULT 0" if dialect == "mysql" else "BOOLEAN NOT NULL DEFAULT 0"
+        additions = {
+            "enabled": "TINYINT(1) NOT NULL DEFAULT 1" if dialect == "mysql" else "BOOLEAN NOT NULL DEFAULT 1",
+            "before_min": "INTEGER NOT NULL DEFAULT 30",
+            "after_min": "INTEGER NOT NULL DEFAULT 30",
+            "min_impact": "VARCHAR(8) NOT NULL DEFAULT 'high'",
+            "currencies_json": "JSON NULL" if dialect == "mysql" else "TEXT NULL",
+            "symbols_json": "JSON NULL" if dialect == "mysql" else "TEXT NULL",
+            "manual_paused": bool_type,
+            "manual_paused_at": "DATETIME NULL",
+            "manual_pause_note": "VARCHAR(255) NULL",
+            # 顶部提示条的「当天已关闭」标记（北京时间 YYYY-MM-DD）
+            "banner_dismissed_date": "VARCHAR(10) NULL",
+        }
+        for name, ddl in additions.items():
+            if name not in cols:
+                sync_conn.execute(text(f"ALTER TABLE user_news_settings ADD COLUMN {name} {ddl}"))
+
+
 async def init_db() -> None:
     """不存在则建表。生产环境建议改用 Alembic 迁移而非 create_all。"""
     async with engine.begin() as conn:
@@ -662,6 +750,7 @@ async def init_db() -> None:
         await conn.run_sync(_migrate_role_capabilities)
         await conn.run_sync(_migrate_mt5_deal_columns)
         await conn.run_sync(_migrate_user_reviews)
+        await conn.run_sync(_migrate_news_blackout_tables)
     logger.info("Database initialized (%s)", engine.url.render_as_string(hide_password=True))
 
 

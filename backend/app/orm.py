@@ -171,6 +171,82 @@ class User(Base):
     )
 
 
+class EconomicEvent(Base):
+    """财经日历事件（**全局共享**，全站一份，所有用户看到同一批事件）。
+
+    数据源：ForexFactory 公开 JSON（`ff_calendar_thisweek.json`），无需 API key。
+
+    与 `user_news_settings` 的分工：
+      - 本表 = **公共财经数据**（谁都能看，管理员也只能看不能改）；
+      - 用户表 = **各自的开关与参数**（拦截窗口、关注币种、手动急停）。
+
+    **时间一律存 UTC epoch 整数**（`event_time`），不存时区字符串 ——
+    多用户 / 多节点 / 多时区下，裸时间字符串一改服务器时区就整体错位。
+    展示层再转 UTC+8（北京时间）。
+    """
+    __tablename__ = "economic_event"
+
+    # sha1(title|event_time|country) 截断：重复抓取天然幂等（同一事件覆盖写）
+    event_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # 事件发生时刻（UTC epoch 秒）—— 唯一权威时间
+    event_time: Mapped[int] = mapped_column(BigInteger, index=True)
+    title: Mapped[str] = mapped_column(String(160))
+    # 币种码（USD / EUR / ...）；"All" 表示全球性事件（对所有币种都生效）
+    country: Mapped[str] = mapped_column(String(8))
+    # 归一化后的小写：high / medium / low / holiday
+    impact: Mapped[str] = mapped_column(String(8), index=True)
+    forecast: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    previous: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    source: Mapped[str] = mapped_column(String(24), default="forexfactory")
+    # 最近一次抓取到该条的时间（用于「数据新鲜度」展示与陈旧提示）
+    fetched_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class UserNewsSettings(Base):
+    """用户的财经日历黑名单设置（每人一行）。
+
+    语义：
+      - `enabled`：新闻黑名单总开关（默认开）。关掉后完全不影响开单。
+      - `before_min` / `after_min`：事件前后多少分钟禁止**新开仓**（默认 30/30）。
+      - `min_impact`：最低影响等级（默认 "high"，即只拦高影响）。
+      - `currencies_json`：关注币种（默认 ["USD"]）。黄金 XAUUSD 归 USD。
+      - `symbols_json`：品种级覆盖（默认 []，空 = 按币种推导）。
+      - `manual_paused`：**手动停止做单**急停开关。与新闻黑名单是两层 ——
+        手动急停随时可拉，不受数据源故障、参数配置的任何影响。
+      - `banner_dismissed_date`：顶部滚动提示条被用户关闭的**当天**
+        （北京时间 YYYY-MM-DD）。记日期而不是布尔值 —— 提示条要求
+        「关闭后当天不再显示」，次日仍要重新提示，布尔值做不到这个语义。
+
+    **没有设置行 = 用默认值**：存量用户零配置即生效（开 / 30-30 / high / USD），
+    不需要给每个存量用户回填一行。
+    """
+    __tablename__ = "user_news_settings"
+
+    # 归属用户（users.id）。不 autoincrement：这是外键语义，由 users 分配。
+    user_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
+    before_min: Mapped[int] = mapped_column(Integer, default=30, server_default="30")
+    after_min: Mapped[int] = mapped_column(Integer, default=30, server_default="30")
+    min_impact: Mapped[str] = mapped_column(String(8), default="high", server_default="high")
+    currencies_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    symbols_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    manual_paused: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    manual_paused_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    manual_pause_note: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # 顶部滚动提示条被用户关闭的**当天**（北京时间 YYYY-MM-DD）。
+    # 记日期而不是布尔值：提示条要求「关闭后当天不再显示」，次日仍要重新提示，
+    # 布尔值做不到「每天一次」的语义。NULL = 当天还没关闭过。
+    banner_dismissed_date: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+
 class UserReview(Base):
     """注册用户的一次 KYC 实名审核单。
 

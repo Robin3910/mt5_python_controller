@@ -15,3 +15,6 @@ os.environ.setdefault("ENABLE_AUTH", "false")
 # 用例真正发码时走 FakeSmsProvider，不会真的调阿里云。
 os.environ.setdefault("ALIYUN_ACCESS_KEY_ID", "test-access-key-id")
 os.environ.setdefault("ALIYUN_ACCESS_KEY_SECRET", "test-access-key-secret")
+# 关掉财经日历定时抓取：抓取走外网（nfs.faireconomy.media），在测试里既拖慢
+# 用例又会被对方限流（429）。判定层本身不依赖 worker，照常可测。
+os.environ.setdefault("ECONOMIC_CALENDAR_ENABLED", "false")
