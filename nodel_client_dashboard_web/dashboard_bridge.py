@@ -52,6 +52,12 @@ _STATS_TTL_S = 10.0
 # 版本徽标的刷新间隔（秒）。徽标要走一次后端 HTTP，放在后台线程里算。
 BADGE_REFRESH_INTERVAL_S = 60.0
 
+# 会话复核间隔（秒）。节点归属 / 开通状态是**后端**说了算，
+# 而登录时把节点列表快照进了内存 —— 管理员在后台启用并分配节点后，
+# 面板不主动复核就一直拿着旧快照，表现为「启动节点被拒，
+# 关掉面板重开就好了」。这个定时复核就是 TK 版 `_review_session` 的等价物。
+SESSION_REVIEW_INTERVAL_S = 30.0
+
 
 class BridgeError(RuntimeError):
     """桥接层向用户可见的错误。`status` 用于 HTTP 状态码。"""
@@ -160,6 +166,8 @@ class DashboardBridge:
         # 打包后的窗口里没人看得到，所以前端把错误回传给本机桥落盘。
         self._client_logs: list[dict[str, Any]] = []
         self._client_log_lock = threading.RLock()
+        # 会话复核线程的停止信号（面板退出时用）
+        self._review_stop = threading.Event()
 
     # ─────────────────────────────────────────────── 生命周期
 
@@ -174,6 +182,7 @@ class DashboardBridge:
         ).start()
         threading.Thread(target=self._snapshot_loop, name="dashboard-snapshot", daemon=True).start()
         threading.Thread(target=self._badge_loop, name="dashboard-badge", daemon=True).start()
+        threading.Thread(target=self._review_loop, name="dashboard-session-review", daemon=True).start()
         # 自动登录：后端在途（网络 I/O），放后台线程，别拖慢 HTTP 服务起来。
         self._load_auto_login()
         if self._auto_login_user and self._auto_login_password:
@@ -185,6 +194,7 @@ class DashboardBridge:
     def stop(self) -> None:
         server = self._server
         self._server = None
+        self._review_stop.set()
         if server is not None:
             try:
                 server.shutdown()
@@ -237,6 +247,62 @@ class DashboardBridge:
                 self._version_update.refresh_badge()
             except Exception:  # noqa: BLE001
                 pass
+
+    def _review_loop(self) -> None:
+        """定时复核会话，把后端的节点开通状态同步到本机实例。
+
+        节点能不能启动，最终由**后端**说了算（管理员审核开通 + 分配归属）。
+        登录时把节点列表快照进了 `session.nodes`，之后一直没更新 ——
+        管理员在后台启用并分配节点后，面板这边还是旧的 `pending`，
+        于是 `session.perform("start", ...)` 被本地挡下，
+        表现为「后台明明开通了，面板还是启动不了，重开面板就好了」。
+
+        这里定时 `session.review()` 把后端状态拉回来，
+        再把新的开通 / 归属状态盖到本机实例上（`_apply_review`）。
+        """
+        while not self._review_stop.wait(timeout=SESSION_REVIEW_INTERVAL_S):
+            if not self.session.active:
+                continue
+            try:
+                self.session.review()
+            except DashboardAuthError:
+                # 会话失效/权限被撤 —— `review()` 内部已经锁会话，这里不用管。
+                continue
+            except Exception:  # noqa: BLE001
+                continue
+            try:
+                self._apply_review(self.session.generation)
+            except Exception:  # noqa: BLE001
+                continue
+            self._push_snapshot()
+
+    def _apply_review(self, generation: int) -> None:
+        """把复核到的后端节点状态盖到本机实例上。
+
+        与 TK 版 `_apply_review` 同源：只更新**归属与开通**相关字段，
+        不碰本机的运行态（进程、守护开关等由本机自己管）。
+        """
+        if generation != self.session.generation or not self.session.active:
+            return
+        visible: set[str] = set()
+        for iid, mp in self.manager._items.items():
+            if mp.cfg.backend_base and mp.cfg.backend_base.rstrip("/") != self.session.api.base:
+                continue
+            node = self.session.nodes.get(str(mp.cfg.node_id or ""))
+            if node:
+                self.session.apply_node(mp.cfg, node)
+            if self.session.owns(mp.cfg):
+                visible.add(iid)
+                if node and mp.cfg.approval_status == "approved" and mp.cfg.enabled:
+                    self._reconcile_credential(mp.cfg, mp)
+            if mp.daemon_grant is not None and (
+                not node
+                or not node.get("enabled")
+                or node.get("approval_status") not in (None, "approved")
+            ):
+                mp.daemon_grant.allowed = False
+        self.manager.set_visible(visible)
+        self._persist()
 
     def _push_snapshot(self) -> None:
         """通知所有 SSE 订阅者「状态有变」，由各自的连接线程重新取快照。
@@ -646,6 +712,28 @@ class DashboardBridge:
             target=self._version_update.refresh_badge, name="badge-refresh", daemon=True
         ).start()
 
+    def refresh_from_backend(self) -> None:
+        """从后端拉一次最新的节点状态，并重新装载本机实例。
+
+        「刷新」的语义是「重新看一眼后端现在什么样」，不是「把本机
+        内存里那份重新读一遍」。节点能不能启动由后端的审核 / 归属说了算，
+        所以这里必须先 `session.review()` 拿到最新的 `session.nodes`，
+        再 `_load_permitted_instances()` 把新的开通状态盖到本机实例上。
+
+        后端不可达时不能让刷新失败 —— 面板照常显示已有状态，
+        下一次定时复核再试。
+        """
+        if self.session.active:
+            try:
+                self.session.review()
+            except DashboardAuthError:
+                # 会话失效：review() 已经锁了会话，直接把锁显示出来。
+                raise
+            except Exception:  # noqa: BLE001
+                # 网络抖动：保留现有状态，别把面板整个搞挂。
+                pass
+        self._load_permitted_instances()
+
     def _load_permitted_instances(self) -> None:
         """按当前会话的权限装载可见实例（与 TK 版 `_load_permitted_instances` 同源）。"""
         stored = load_instances()
@@ -822,6 +910,33 @@ class DashboardBridge:
             raise BridgeError(str(exc) or exc.__class__.__name__, status=500) from exc
         self._persist()
         return {"ok": True}
+
+    def rename_instance(self, instance_id: str, name: str) -> dict[str, Any]:
+        """重命名本机实例（**只改本地显示名**，不回传后端）。
+
+        需求：节点卡片上的名字要能改，但只是本机的事 —— 后端节点名
+        （管理后台「节点管理」里显示的那个）保持不变。
+
+        实现上用独立的 `display_name` 字段，不动 `cfg.name`：
+          - `cfg.name` 是**后端节点名**（导入时带回来的），改它会让本机
+            与后端显示对不上，而且会被后续的 `apply_node()` 覆盖回去；
+          - `display_name` 是本机自定义名，只写本机 instances.json，
+            清空它就回到后端的名字。
+
+        刻意**不**走 `session.perform()`：那会向后端申请审计票据，等于把
+        「本机显示名」这个纯本地的事记到服务器上，而且断网时连改名都做不了。
+        这里只做本机内存修改 + 落盘，全程零网络请求。
+        """
+        mp = self.manager.get(instance_id)
+        if mp is None:
+            raise BridgeError("实例不存在", status=404)
+        self.session.check()
+        label = str(name or "").strip()
+        if len(label) > 64:
+            raise BridgeError("名称不能超过 64 个字符", status=400)
+        mp.cfg.display_name = label
+        self._persist()
+        return {"ok": True, "name": mp.cfg.label}
 
     def batch_action(self, action: str) -> dict[str, Any]:
         self.session.check()
@@ -1124,8 +1239,16 @@ class DashboardBridge:
         if path == "/api/batch":
             return self.batch_action(str(body.get("action") or ""))
 
+        if path == "/api/instance/rename":
+            return self.rename_instance(
+                str(body.get("id") or ""), str(body.get("name") or "")
+            )
+
         if path == "/api/refresh":
-            self._load_permitted_instances()
+            # 「刷新」必须回到后端取一次最新的节点开通状态。
+            # 只做 `_load_permitted_instances()` 的话，读的还是登录时的
+            # 旧快照 —— 管理员在后台刚开通的节点依然显示「待审核」。
+            self.refresh_from_backend()
             return {"ok": True}
 
         # —— 对话框类 ——

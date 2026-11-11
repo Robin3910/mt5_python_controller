@@ -80,6 +80,11 @@ PRUNE_FILES = (
 KEEP_LOCALES = ("zh-CN.pak", "en-US.pak", "en-GB.pak")
 
 # 必须保留的文件 —— 少一个 WebView2 就起不来
+#
+# `*.manifest` 尤其重要：它是 WebView2 Fixed Version 运行时的 **SxS 并行配置
+# 清单**。少了它，`msedgewebview2.exe` 启动时找不到自己的装配上下文，直接报
+# `0x800736B1`（ERROR_SXS_CANT_GEN_ACTCTX，「应用程序的并行配置不正确」），
+# 症状是窗口一片空白，而日志里只有一行 HRESULT，指不到是哪个文件被删了。
 REQUIRED_FILES = (
     "msedgewebview2.exe",
     "msedge.dll",
@@ -95,6 +100,11 @@ REQUIRED_FILES = (
     "Edge.dat",
     "EdgeWebView.dat",
 )
+
+# 必须保留的**清单**文件：`<版本>.manifest`。
+#
+# 不能写死版本号（运行时一升级就失效），所以按「.manifest 后缀」匹配。
+REQUIRED_GLOBS = ("*.manifest",)
 
 
 def find_runtime_dir(source: Path) -> Path:
@@ -116,9 +126,28 @@ def find_runtime_dir(source: Path) -> Path:
     return sorted(candidates, key=lambda p: p.name, reverse=True)[0]
 
 
+def verify(runtime_dir: Path) -> list[str]:
+    """检查关键文件还在，返回缺失项。"""
+    missing = [name for name in REQUIRED_FILES if not (runtime_dir / name).is_file()]
+    for pattern in REQUIRED_GLOBS:
+        if not list(runtime_dir.glob(pattern)):
+            missing.append(pattern)
+    return missing
+
+
 def prune(runtime_dir: Path) -> list[str]:
-    """按规则裁剪运行时，返回删除项列表。"""
+    """按规则裁剪运行时，返回删除项列表。
+
+    **绝不删关键文件** —— 裁剪规则一旦误伤，症状是 WebView2 初始化失败
+    （比如少了 SxS 清单就是 `0x800736B1`），而报错完全指不到是哪个文件
+    被删了。所以每删一项之前先确认它不在必保名单里。
+    """
     removed: list[str] = []
+
+    def _is_protected(name: str) -> bool:
+        if name in REQUIRED_FILES:
+            return True
+        return any(Path(name).match(p) for p in REQUIRED_GLOBS)
 
     for name in PRUNE_DIRS:
         p = runtime_dir / name
@@ -127,6 +156,8 @@ def prune(runtime_dir: Path) -> list[str]:
             removed.append(f"{name}/")
 
     for name in PRUNE_FILES:
+        if _is_protected(name):
+            continue
         p = runtime_dir / name
         if p.is_file():
             p.unlink()
@@ -141,12 +172,6 @@ def prune(runtime_dir: Path) -> list[str]:
                 removed.append(f"Locales/{p.name}")
 
     return removed
-
-
-def verify(runtime_dir: Path) -> list[str]:
-    """检查关键文件还在，返回缺失项。"""
-    missing = [name for name in REQUIRED_FILES if not (runtime_dir / name).is_file()]
-    return missing
 
 
 def stage_runtime(source: Path, dest_container: Path) -> Path:

@@ -94,6 +94,23 @@ async function refresh(): Promise<void> {
   }
 }
 
+/**
+ * 「刷新」按钮：回到后端取一次最新的节点开通状态，再拉本机快照。
+ *
+ * 只调 `api.state()` 的话读的是本机内存里那份 —— 管理员在后台刚审核
+ * 开通并分配了节点，面板这边还是登录时的旧快照，于是「启动节点」被拒。
+ * `api.refresh()` 会让桥接层先去后端复核，再重新装载实例。
+ */
+async function refreshFromBackend(): Promise<void> {
+  actionError.value = ''
+  try {
+    await api.refresh()
+  } catch (exc) {
+    actionError.value = exc instanceof Error ? exc.message : String(exc)
+  }
+  await refresh()
+}
+
 async function login(username: string, password: string, code: string): Promise<string> {
   const result = await api.login(username, password, code)
   if (result.requires_2fa) {
@@ -210,6 +227,23 @@ async function runBatch(action: string): Promise<void> {
   }
 }
 
+/**
+ * 重命名本机实例。
+ *
+ * 只改本机的显示名（存在本机 instances.json），**不回传后端** ——
+ * 管理后台里的节点名称保持原样。
+ */
+async function renameInstance(id: string, name: string): Promise<void> {
+  actionError.value = ''
+  try {
+    await api.renameInstance(id, name)
+  } catch (exc) {
+    actionError.value = exc instanceof Error ? exc.message : String(exc)
+  }
+  await refresh()
+  if (selectedId.value) await loadDetail(selectedId.value)
+}
+
 onMounted(async () => {
   await refresh()
   try {
@@ -261,7 +295,8 @@ onUnmounted(() => {
     @select="select"
     @action="runAction"
     @batch="runBatch"
-    @refresh="refresh"
+    @refresh="refreshFromBackend"
     @logout="logout"
+    @rename="renameInstance"
   />
 </template>

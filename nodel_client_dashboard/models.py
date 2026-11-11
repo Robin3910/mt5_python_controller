@@ -52,6 +52,17 @@ class InstanceConfig:
     backend_base: str = ""
     # 导入成功并连上终端后确认算法交易关闭。未知或已开启都不标红。
     algo_trading_disabled: bool = False
+    # 本机自定义显示名：**只存在本机** instances.json 里，不回传后端。
+    # 为空时界面用 name（导入时来自后端节点的名字）。
+    #
+    # 两个面板（TK 版 / WebView 版）共用同一份 instances.json，
+    # 所以这个字段必须两边都有 —— 否则从任一端保存都会把它抹掉。
+    display_name: str = ""
+
+    @property
+    def label(self) -> str:
+        """界面显示用的名字：本机自定义名优先，否则用导入时的名字。"""
+        return self.display_name or self.name
 
     @classmethod
     def create(
@@ -107,6 +118,7 @@ class InstanceConfig:
             has_credential=bool(data.get("has_credential", False)),
             backend_base=str(data.get("backend_base") or ""),
             algo_trading_disabled=bool(data.get("algo_trading_disabled", False)),
+            display_name=str(data.get("display_name") or "").strip(),
         )
 
 

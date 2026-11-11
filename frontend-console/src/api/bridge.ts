@@ -409,6 +409,13 @@ export const api = {
 
   refresh: () => request<{ ok: boolean }>('/api/refresh', { method: 'POST', body: '{}' }),
 
+  /** 重命名本机实例（只改本地显示名，不回传后端）。 */
+  renameInstance: (instanceId: string, name: string) =>
+    request<{ ok: boolean; name: string }>('/api/instance/rename', {
+      method: 'POST',
+      body: JSON.stringify({ id: instanceId, name }),
+    }),
+
   // —— 对话框类 ——
   connection: () => request<ConnectionInfo>('/api/connection'),
 

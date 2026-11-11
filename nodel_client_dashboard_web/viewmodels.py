@@ -168,7 +168,8 @@ def build_list_item(
     """
     cfg = mp.cfg
     rt = mp.runtime
-    title = cfg.name or default_label_from_path(cfg.exe_path)
+    # 卡片标题用「本机自定义名」优先（只在本机生效，不回传后端）。
+    title = cfg.label or default_label_from_path(cfg.exe_path)
     state = process_state_label(mp)
     daemon = "  ·  守护" if cfg.daemon else ""
     status_line = f"{state}  ·  {health_zh(rt.health)}{daemon}"
@@ -315,7 +316,7 @@ def build_detail(mp: "ManagedProcess | None") -> DetailVM:
         ),
     )
     summary = (
-        f"标签      {cfg.name}\n"
+        f"标签      {cfg.label}\n"
         f"版本      {rt.version or '-'}\n"
         f"程序路径  {cfg.exe_path}\n"
         f"工作目录  {cfg.cwd}\n"
@@ -341,7 +342,7 @@ def build_detail(mp: "ManagedProcess | None") -> DetailVM:
         tasks_text = "\n".join(lines)
     return DetailVM(
         empty=False,
-        title=cfg.name or default_label_from_path(cfg.exe_path),
+        title=cfg.label or default_label_from_path(cfg.exe_path),
         subtitle=f"{cfg.exe_path}  ·  工作目录 {cfg.cwd}",
         daemon=bool(cfg.daemon),
         summary=summary,

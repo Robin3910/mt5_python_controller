@@ -109,7 +109,13 @@ class DashboardSession:
             if generation != self.generation:
                 raise DashboardAuthError("会话已变化", status=401)
             self.principal = principal
-            self.nodes = {str(n["node_id"]): n for n in nodes}
+            # 后端返回空列表时**保留**原有快照：Redis 缓存被清 / 刚重启
+            # 还没预热都会让节点列表短暂为空，这不代表节点真没了。
+            # 直接覆盖会把本机实例的绑定一起抹掉（remove_instance 随后
+            # 就会因为缺 node_id 被后端 422 挡下）。
+            fresh = {str(n["node_id"]): n for n in nodes}
+            if fresh:
+                self.nodes = fresh
             if recover:
                 self.flush_results()
                 self._locked = False
@@ -129,6 +135,39 @@ class DashboardSession:
             return True
         node = self.nodes.get(str(cfg.node_id or ""))
         return bool(node and (node.get("owner_user_id") == self.principal.get("user_id") or (node.get("approval_status") == "pending" and node.get("requested_by_user_id") == self.principal.get("user_id"))))
+
+    def refresh_node_state(self, cfg) -> None:
+        """动作发生前，重新拉一次后端节点列表，把最新的开通 / 归属盖到 cfg 上。
+
+        节点能不能启动由**后端**说了算（管理员审核开通 + 分配归属），
+        而登录时把节点列表快照进了 `self.nodes` 就不再更新 ——
+        管理员在后台刚开通并分配完，面板这边还拿着旧快照，
+        于是 `perform("start", ...)` 在本地就被挡下，
+        表现为「后台明明开通了，面板却启动不了，重开面板就好了」。
+
+        所以在**启动 / 开启守护**这类真正依赖开通状态的动作之前，
+        必须以后端为准重新核对一次，不能只信内存里的快照。
+
+        后端连不上时保持原状：随后的 `authorize` 会给出更准确的报错。
+        """
+        if self.api is None or not self.token or cfg is None:
+            return
+        try:
+            nodes = self.api.nodes(self.token)
+        except DashboardAuthError as exc:
+            if exc.status in (401, 403):
+                raise
+            return
+        except Exception:  # noqa: BLE001
+            return
+        fresh = {str(n["node_id"]): n for n in (nodes or [])}
+        # 后端返回空列表（Redis 缓存被清 / 刚重启没预热）时保留原有快照 ——
+        # 抹掉会让 remove_instance 缺 node_id 被后端 422 挡下。
+        if fresh:
+            self.nodes = fresh
+        node = self.nodes.get(str(cfg.node_id or ""))
+        if node:
+            self.apply_node(cfg, node)
 
     def apply_node(self, cfg, node: dict) -> None:
         cfg.node_id = str(node["node_id"])
@@ -152,6 +191,15 @@ class DashboardSession:
         """先提交严格意图审计，再执行本机操作；结果失败落本地队列并锁新操作。"""
         with self._mutex:
             self.check(generation)
+            # 启动 / 重启 / 开启守护依赖「节点已审核开通且归属当前账号」，
+            # 而这两项都是**后端**说了算。登录时的快照可能已经过期
+            # （管理员刚在后台审核开通 / 重新分配归属），所以在判权限前
+            # 先以后端为准核对一次 —— 否则会拿着旧快照把操作挡下。
+            gated = action in {"start", "restart"} or (
+                action == "set_daemon" and (params or {}).get("enabled")
+            )
+            if gated and cfg is not None:
+                self.refresh_node_state(cfg)
             if cfg is not None and not self.owns(cfg):
                 raise DashboardAuthError("无权操作该实例", status=403)
             foreign_backend = bool(cfg is not None and cfg.backend_base and cfg.backend_base.rstrip("/") != self.api.base)
@@ -159,7 +207,7 @@ class DashboardSession:
                 raise DashboardAuthError("实例属于其他后端，需管理员先明确重新绑定", status=403)
             ticket_generation = self.generation
             # 同线程嵌套的同一动作共用已取得意图；独立异步线程必须重新准入。
-            if action in {"start", "restart"} or (action == "set_daemon" and (params or {}).get("enabled")):
+            if gated:
                 if cfg is None or not cfg.node_id or cfg.approval_status != "approved" or not cfg.enabled:
                     raise DashboardAuthError("节点需管理员审核开通后才能启动或开启守护", status=403)
                 require_binding(cfg.exe_path)
@@ -441,6 +489,9 @@ class DashboardSession:
         self.check()
         generation = self.generation
         cfg = mp.cfg
+        # 开通状态以**后端**为准：登录时的快照可能已经过期
+        # （管理员刚在后台审核开通 / 重新分配归属）。
+        self.refresh_node_state(cfg)
         node = self.nodes.get(str(cfg.node_id or ""))
         if not node:
             raise DashboardAuthError("节点已不可访问", status=403)

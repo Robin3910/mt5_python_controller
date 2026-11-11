@@ -27,6 +27,8 @@ const emit = defineEmits<{
   (e: 'batch', action: string): void
   (e: 'refresh'): void
   (e: 'logout'): void
+  /** 重命名本机实例（只改本地显示名，不回传后端）。 */
+  (e: 'rename', id: string, name: string): void
 }>()
 
 const clock = computed(() =>
@@ -84,6 +86,30 @@ const publishedVersion = computed(() => props.updateBadge?.published ?? '')
 
 /** 待移除的节点（垃圾桶按钮点开后置入，确认后才真正移除）。 */
 const removeTarget = ref<NodeItem | null>(null)
+
+/** 待重命名的节点（铅笔按钮点开后置入）。 */
+const renameTarget = ref<NodeItem | null>(null)
+/** 重命名输入框里的文字。 */
+const renameText = ref('')
+
+function askRename(node: NodeItem): void {
+  renameTarget.value = node
+  renameText.value = node.title
+}
+
+function closeRename(): void {
+  renameTarget.value = null
+  renameText.value = ''
+}
+
+/** 重命名确认。名字留空表示恢复默认（清空本机自定义名）。 */
+function confirmRename(): void {
+  const target = renameTarget.value
+  if (!target) return
+  const name = renameText.value.trim()
+  closeRename()
+  emit('rename', target.id, name)
+}
 
 function askRemove(node: NodeItem): void {
   removeTarget.value = node
@@ -226,7 +252,7 @@ function confirmRemove(): void {
                   <p class="stat-metric-value">
                     {{ latencyText }}<small v-if="hero.avg_latency_ms !== null && hero.avg_latency_ms !== undefined">ms</small>
                   </p>
-                  <p class="stat-metric-label">平均延迟</p>
+                  <p class="stat-metric-label">平均延迟(券商处理时间)</p>
                 </div>
               </div>
               <div class="stat-metric">
@@ -294,6 +320,22 @@ function confirmRemove(): void {
                   :class="node.alive ? 'online' : 'offline'"
                 />
                 <span class="node-name">{{ node.title }}</span>
+                <button
+                  class="btn-icon node-rename-btn"
+                  title="重命名（仅本机生效）"
+                  :aria-label="`重命名节点 ${node.title}`"
+                  @click.stop="askRename(node)"
+                >
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg" width="12" height="12"
+                    viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                    stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                    aria-hidden="true"
+                  >
+                    <path d="M12 20h9" />
+                    <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z" />
+                  </svg>
+                </button>
               </div>
               <div class="node-head-right">
                 <span class="badge" :class="node.badge_tone">{{ node.badge_text }}</span>
@@ -361,13 +403,19 @@ function confirmRemove(): void {
               </div>
               <div class="info-item">
                 <span class="info-label-row">
-                  <span class="status-ico" :class="node.algo_trading_ok ? 'ok' : 'no'">
-                    {{ node.algo_trading_ok ? '✓' : '✕' }}
+                  <span
+                    class="status-ico"
+                    :class="node.algo_trading_known ? (node.algo_trading_ok ? 'ok' : 'no') : 'pause'"
+                  >
+                    {{ node.algo_trading_known ? (node.algo_trading_ok ? '✓' : '✕') : '?' }}
                   </span>
                   <span class="info-label">算法交易</span>
                 </span>
-                <span class="info-value" :class="node.algo_trading_ok ? 'ok' : 'no'">
-                  {{ node.algo_trading_known ? (node.algo_trading_ok ? '已关闭' : '已开启') : '未知' }}
+                <span
+                  class="info-value"
+                  :class="node.algo_trading_known ? (node.algo_trading_ok ? 'ok' : 'no') : 'pause'"
+                >
+                  {{ node.algo_trading_known ? (node.algo_trading_ok ? '已开启' : '未开启') : '未知' }}
                 </span>
               </div>
             </div>
@@ -456,6 +504,33 @@ function confirmRemove(): void {
     />
 
     <AppModal
+      v-if="renameTarget"
+      title="重命名节点"
+      :subtitle="renameTarget.title"
+      @close="closeRename"
+    >
+      <div class="form-field">
+        <label for="rename-input">显示名称</label>
+        <input
+          id="rename-input"
+          v-model="renameText"
+          class="input-field"
+          type="text"
+          maxlength="64"
+          placeholder="留空则恢复默认名称"
+          @keyup.enter="confirmRename"
+        />
+      </div>
+      <p class="remove-confirm">
+        仅修改本机显示名，不会同步到服务器；管理后台里的节点名称保持不变。
+      </p>
+      <template #footer>
+        <button class="btn-sm" @click="closeRename">取消</button>
+        <button class="btn-sm primary" @click="confirmRename">保存</button>
+      </template>
+    </AppModal>
+
+    <AppModal
       v-if="removeTarget"
       title="移除节点"
       :subtitle="removeTarget.title"
@@ -499,6 +574,27 @@ function confirmRemove(): void {
   background: #f2645f1a;
   border: 1px solid rgba(242, 100, 95, 0.28);
   border-radius: 6px;
+}
+
+/* 节点名旁的重命名按钮：默认低调，悬停才亮起来。 */
+.node-rename-btn {
+  width: 22px;
+  height: 22px;
+  border-color: transparent;
+  background: transparent;
+  opacity: 0;
+  transition: opacity 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.node-card:hover .node-rename-btn,
+.node-rename-btn:focus-visible {
+  opacity: 1;
+}
+
+.node-rename-btn:hover {
+  color: var(--gold);
+  border-color: #d9b36c4d;
+  background: #d9b36c14;
 }
 
 /* 顶栏带文字的按钮（当前只有「版本更新」）。 */
