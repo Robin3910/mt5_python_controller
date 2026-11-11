@@ -396,8 +396,8 @@ async def adopt_followers(
 
     all_nodes = await store.all_nodes()
     primary = follow_rules.leader_primary_node_id(all_nodes, owner)
-    if not primary:
-        # 没有主节点就没有带单源，也就没有可继承的跟单关系
+    if not primary or not follow_rules.group_contains_primary(target, primary):
+        # 目标必须是包含主节点的带单源分组。
         return AdoptFollowersResponse(adopted=[], skipped=[], scanned_groups=0)
 
     all_groups = await store.all_groups()
@@ -438,6 +438,8 @@ async def adopt_followers(
         store,
         target_group=target,
         source_group_ids=[g["group_id"] for g in sources],
+        actor=p,
+        ip=client_ip(request),
     )
     await persist.audit(
         p.username, "adopt_followers", group_id, None, "ok", client_ip(request),

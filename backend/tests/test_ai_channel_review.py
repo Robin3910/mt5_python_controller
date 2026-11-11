@@ -177,12 +177,12 @@ def test_primary_switch_keeps_approved_ai_relation(client):
     assert client.portal.call(state.store.get_group, data["ai_group_id"])["followers"][0]["node_id"] == data["b_follow"]
 
 
-def test_normal_market_never_dispatches_primary_follower_after_template_switch():
+def test_both_markets_allow_approved_primary_followers():
     from app.follow_rules import group_for_follow_dispatch
     group = {"followers": [{"node_id": "primary"}, {"node_id": "secondary"}]}
     nodes = {"primary": {"is_primary": True}, "secondary": {"is_primary": False}}
     assert group_for_follow_dispatch(group, "tpl_1", nodes)["followers"] == group["followers"]
-    assert group_for_follow_dispatch(group, "tpl_2", nodes)["followers"] == [{"node_id": "secondary"}]
+    assert group_for_follow_dispatch(group, "tpl_2", nodes)["followers"] == group["followers"]
 
 
 def test_legacy_migration_once_preserves_paused_state_and_audit(client):

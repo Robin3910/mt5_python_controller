@@ -126,10 +126,7 @@ def paused_marketable_reason(
 
 
 def group_for_follow_dispatch(group: dict, template_id: object | None, nodemap: dict | None = None) -> dict:
-    if template_in_market(template_id, FOLLOW_MARKET_TEMPLATE_IDS) and nodemap is not None:
-        return {**group, "followers": [row for row in group.get("followers") or []
-                                      if not nodemap.get(row["node_id"], {}).get("is_primary")]}
-    if not template_in_market(template_id, AI_MARKET_TEMPLATE_IDS):
+    if not market_for_template(template_id):
         return group
     return {
         **group,

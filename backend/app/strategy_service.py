@@ -176,6 +176,8 @@ async def _update_strategy(
                 from .orm import NodeGroup
                 group_ids = (await s.scalars(select(NodeGroup.group_id).where(NodeGroup.strategy_id == strategy_id))).all()
                 await cancel_applications(s, "机器人策略已停用", group_ids=group_ids, pending_only=True)
+                from .follow_requests import cancel
+                await cancel(s, "带单策略已停用", group_ids=group_ids)
 
         if patch.remark is not None:
             row.remark = patch.remark.strip() or None

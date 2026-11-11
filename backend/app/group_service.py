@@ -403,6 +403,9 @@ async def _update_group(store: RedisStore, group_id: str, patch: GroupUpdate) ->
         if (update_strategy and previous_strategy_id != row.strategy_id) or patch.enabled is False or patch.accept_ai_follow is False:
             from .ai_application_store import cancel_applications
             await cancel_applications(s, "机器人配置已失效，请重新申请", group_ids=[group_id], pending_only=True)
+        if (update_strategy and previous_strategy_id != row.strategy_id) or patch.enabled is False:
+            from .follow_requests import cancel
+            await cancel(s, "带单分组配置已失效，请重新申请", group_ids=[group_id])
         final_sid = row.strategy_id
         if row.signal_concurrent_enabled:
             sty = await _strategy_dict(store, final_sid)
@@ -448,6 +451,11 @@ async def _update_group(store: RedisStore, group_id: str, patch: GroupUpdate) ->
             rewrite = False
         if rewrite:
             await _replace_members(s, group_id, target_ids, report_ids)
+        if node_ids is not None:
+            from .follow_requests import cancel
+            removed_sources = set(existing_ids) - set(target_ids)
+            if removed_sources:
+                await cancel(s, "带单源成员已移出分组", group_ids=[group_id], primary_ids=removed_sources)
         await s.commit()
         d = await _load_group(s, group_id)
     await store.cache_group(d)
@@ -471,6 +479,8 @@ async def _delete_group(store: RedisStore, group_id: str) -> bool:
             return False
         from .ai_application_store import cancel_applications
         await cancel_applications(s, "机器人分组已删除", group_ids=[group_id])
+        from .follow_requests import cancel
+        await cancel(s, "带单分组已删除", group_ids=[group_id], pending_only=False)
         await s.execute(delete(NodeGroupMember).where(NodeGroupMember.group_id == group_id))
         await s.execute(delete(GroupFollowerNode).where(GroupFollowerNode.group_id == group_id))
         await s.delete(row)
@@ -495,6 +505,8 @@ async def clear_strategy_bindings(store: RedisStore, strategy_id: str) -> list[s
             return []
         from .ai_application_store import cancel_applications
         await cancel_applications(s, "机器人策略已删除", group_ids=affected)
+        from .follow_requests import cancel
+        await cancel(s, "带单策略已删除", group_ids=affected)
         await s.execute(
             update(NodeGroup).where(NodeGroup.strategy_id == sid).values(
                 strategy_id=None, limit_watch_enabled=False,

@@ -7,6 +7,7 @@ from app.connections import manager
 from app.db import SessionLocal, _migrate_follow_node_state
 from app.orm import AuditLog, GroupFollowerNode, GroupSignalTask, GroupTaskDispatch
 from app.state import state
+from tests.test_helpers import approve_follow_requests
 from tests.test_ai_follow_api import _approve_pending
 from tests.test_ai_follow_api import _assign, _login, _mk_group, _mk_node, _mk_trend_strategy, client
 from tests.test_ai_robot_groups import setup_two_robots
@@ -50,6 +51,7 @@ def test_node_stats_deduplicates_and_excludes_other_market_and_primary(client):
     trend = _mk_trend_strategy(client, setup["host_h"], "trend-for-node-stats")
     trend_group = _mk_group(client, setup["host_h"], [setup["h_primary"]], "trend-node-group", strategy_id=trend)
     response = client.post("/api/follow/join", json={"leader_user_id": setup["host"]["id"], "group_ids": [trend_group], "node_ids": [setup["b_follow"]]}, headers=headers)
+    approve_follow_requests(client)
     assert response.status_code == 200, response.text
     response = client.get("/api/ai-follow/nodes", headers=headers)
     assert response.status_code == 200, response.text

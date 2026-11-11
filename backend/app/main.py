@@ -24,6 +24,7 @@ from . import (
     events,
     follow_api,
     follow_channel_api,
+    follow_review_api,
     grid_sizing_api,
     group_persist,
     group_service,
@@ -75,6 +76,8 @@ async def lifespan(app: FastAPI):
     await init_db()
     from .ai_application_store import migrate_legacy
     await migrate_legacy()
+    from .follow_requests import migrate_legacy as migrate_follow_legacy
+    await migrate_follow_legacy()
     store = RedisStore.from_url()
     try:
         await store.r.ping()
@@ -184,6 +187,7 @@ for r in (
     trading_api.router,
     follow_api.router,
     follow_channel_api.router,
+    follow_review_api.router,
     ai_follow_api.router,
     deals_api.router,
     news_api.router,

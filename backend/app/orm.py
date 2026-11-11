@@ -530,7 +530,7 @@ class NodeGroupMember(Base):
 
 
 class GroupFollowerNode(Base):
-    """跟单成员：普通带单仅非主节点，AI 跟单允许主节点。
+    """生效跟单成员：带单与 AI 跟单均允许本人的主节点。
 
     与 NodeGroupMember 严格分离，两者职责不可混用：
     - NodeGroupMember    = 分组所有者自己的节点（owner 可编辑 / 排序 / 开限价监听）；
@@ -558,6 +558,28 @@ class GroupFollowerNode(Base):
     leader_primary_node_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     sort_order: Mapped[int] = mapped_column(Integer, default=0)  # 组内轮询顺序
     joined_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class FollowRequest(Base):
+    """带单申请与生效关系分离；每个分组、节点独立审核。"""
+    __tablename__ = "follow_request"
+
+    id: Mapped[int] = mapped_column(AutoPK, primary_key=True, autoincrement=True)
+    group_id: Mapped[str] = mapped_column(String(32), index=True)
+    node_id: Mapped[str] = mapped_column(String(32), index=True)
+    follower_user_id: Mapped[int] = mapped_column(Integer, index=True)
+    leader_user_id: Mapped[int] = mapped_column(Integer, index=True)
+    owner_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    leader_primary_node_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    strategy_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    snapshot: Mapped[dict] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    pending_key: Mapped[str | None] = mapped_column(String(96), nullable=True, unique=True)
+    source: Mapped[str] = mapped_column(String(16), default="join")
+    reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    reviewer_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
 class AiFollowApplication(Base):
