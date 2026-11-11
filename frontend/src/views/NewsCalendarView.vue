@@ -58,8 +58,14 @@ const newsEventGroups = computed(() => {
   return Array.from(groups.entries()).map(([day, list]) => ({ day, list }))
 })
 
-/** 只看我的黑名单内事件 */
-const onlyMyBlackout = ref(false)
+/**
+ * 只看我的黑名单内事件。
+ *
+ * 默认**开启**：用户进这个页面的目的就是看「哪些数据会影响我的开单」，
+ * 默认展示全量事件列表会被上百条低影响事件淹没（实测近期 7 天约 50+ 条，
+ * 其中高影响只有个位数）。想看全量点「看全部」切换。
+ */
+const onlyMyBlackout = ref(true)
 const visibleNewsGroups = computed(() => {
   if (!onlyMyBlackout.value) return newsEventGroups.value
   return newsEventGroups.value
