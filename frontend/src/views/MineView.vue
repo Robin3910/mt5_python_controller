@@ -29,6 +29,14 @@ onMounted(() => {
 // icon: inline SVG path，accent: 图标色 / 底色（15% 透明度）
 const ALL_MODULES: ProfileHubModule[] = [
   {
+    code: 'follow_channel',
+    label: '我的带单频道',
+    description: '带单员信息 · 跟单节点审核',
+    path: '/my-follow-channel',
+    icon: '<circle cx="9" cy="8" r="3"/><path d="M3 21v-3a6 6 0 0 1 12 0v3M16 5a3 3 0 0 1 0 6M17 15a5 5 0 0 1 4 5"/>',
+    accent: '#10B981',
+  },
+  {
     // 财经日历：新闻黑名单 + 停止做单开关。
     // **不限菜单权限**（跟个人中心一样，登录即可进）—— 它是每个用户自己的
     // 交易节奏设置，不是某个业务模块的附属功能。
@@ -166,6 +174,7 @@ const visibleModules = computed<ProfileHubModule[]>(() => {
     if (m.code === 'ai_channel') {
       return auth.hasMenu('ai_trade') && auth.canUseAiStrategy && auth.canBeFollowLeader
     }
+    if (m.code === 'follow_channel') return auth.hasMenu('follow') && auth.canBeFollowLeader
     return auth.isAdmin || (m.code !== 'config' && auth.hasMenu(m.code))
   })
   if (auth.isAdmin) {

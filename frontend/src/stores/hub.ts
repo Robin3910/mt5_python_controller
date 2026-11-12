@@ -441,7 +441,7 @@ export const useHubStore = defineStore('hub', {
     /**
      * 分组 owner 认领自己其它分组的跟单节点（跨策略类型 / 品种继承）。
      * 带单员换品种或换策略类型时会新建分组，新分组默认只有主节点；
-     * 本接口把「已经跟我」的跟单节点一并带进来，不会引入没跟过我的节点。幂等。
+     * 为既有跟单节点生成待审申请，通过后才进入新分组。幂等。
      */
     async adoptFollowers(id: string): Promise<AdoptFollowersResult> {
       const { data } = await api.post<AdoptFollowersResult>(`/api/groups/${id}/adopt-followers`)

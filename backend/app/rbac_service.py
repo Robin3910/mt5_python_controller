@@ -211,6 +211,11 @@ async def invalidate_principals(store: Optional[RedisStore], usernames: Iterable
         users = (await session.scalars(select(User).where(User.username.in_(names)))).all()
         for user in users:
             principal = await load_principal(store, user.username)
+            from .follow_requests import cancel
+            if not principal or not permissions.can_menu(principal, permissions.MENU_FOLLOW):
+                await cancel(session, "用户或跟单权限已失效", user_id=user.id)
+            elif not permissions.can_be_leader(principal):
+                await cancel(session, "带单员权限已失效", leader_user_id=user.id)
             if not principal or not permissions.can_menu(principal, permissions.MENU_AI_TRADE):
                 await cancel_applications(session, "用户或 AI 跟单权限已失效", user_id=user.id, pending_only=True)
             elif not permissions.can_host_ai_robot(principal):

@@ -7,7 +7,7 @@ group_follower_node 这一张跟单关系表。所有写操作遵循「先写库
 关联节点生命周期时**必须**调用本模块的清理函数，否则会留下永远不会被分发的脏关系：
 - group_service.delete_group      -> 分组没了，级联删（已内置在删除事务里）
 - group_service.remove_node_from_all_groups -> 节点被删 / 归属转移
-- node_service.set_primary        -> 跟单节点升主节点后不再是可跟单节点
+- node_service.set_primary        -> 保留跟单关系，取消带单源变更的待审申请
 """
 from __future__ import annotations
 
@@ -231,42 +231,47 @@ async def _add_following(
     一个分组一个事务，失败即整条不写入，避免留下半条关系。
     """
     async with SessionLocal() as s:
-        node = await s.get(Node, node_id)
-        if node is None:
-            return False
-        if node.owner_user_id is None:
-            from .node_credentials import is_admin_user
-            if not await is_admin_user(s, follower_user_id):
-                return False
-        elif node.owner_user_id != int(follower_user_id):
-            return False
-        exists = (
-            await s.execute(
-                select(GroupFollowerNode).where(
-                    GroupFollowerNode.group_id == group_id,
-                    GroupFollowerNode.node_id == node_id,
-                )
-            )
-        ).scalar_one_or_none()
-        if exists:
-            if not restart_stopped or exists.follow_state != "stopped" or exists.follower_user_id != int(follower_user_id):
-                return False
-            exists.follow_state = "running"
-            exists.joined_at = datetime.now()
-            exists.leader_user_id = int(leader_user_id)
-            exists.leader_primary_node_id = leader_primary_node_id
-        else:
-            s.add(GroupFollowerNode(
-                group_id=group_id,
-                node_id=node_id,
-                follower_user_id=int(follower_user_id),
-                follow_state=follow_state,
-                leader_user_id=int(leader_user_id),
-                leader_primary_node_id=leader_primary_node_id,
-                sort_order=0,
-            ))
+        added = await write_following(s, group_id=group_id, node_id=node_id,
+            follower_user_id=follower_user_id, leader_user_id=leader_user_id,
+            leader_primary_node_id=leader_primary_node_id, follow_state=follow_state,
+            restart_stopped=restart_stopped)
         await s.commit()
     await _refresh_groups(store, {group_id})
+    return added
+
+
+async def write_following(
+    s, *, group_id: str, node_id: str, follower_user_id: int, leader_user_id: int,
+    leader_primary_node_id: Optional[str], follow_state: str = "running",
+    restart_stopped: bool = True,
+) -> bool:
+    """在调用方事务中写入关系，使审批与审计能一起提交。"""
+    node = await s.get(Node, node_id)
+    if node is None:
+        return False
+    if node.owner_user_id is None:
+        from .node_credentials import is_admin_user
+        if not await is_admin_user(s, follower_user_id):
+            return False
+    elif node.owner_user_id != int(follower_user_id):
+        return False
+    exists = await s.scalar(select(GroupFollowerNode).where(
+        GroupFollowerNode.group_id == group_id, GroupFollowerNode.node_id == node_id,
+    ))
+    if exists:
+        if not restart_stopped or exists.follow_state != "stopped" or exists.follower_user_id != int(follower_user_id):
+            return False
+        exists.follow_state = follow_state
+        exists.leader_paused = False
+        exists.joined_at = datetime.now()
+        exists.leader_user_id = int(leader_user_id)
+        exists.leader_primary_node_id = leader_primary_node_id
+    else:
+        s.add(GroupFollowerNode(
+            group_id=group_id, node_id=node_id, follower_user_id=int(follower_user_id),
+            follow_state=follow_state, leader_user_id=int(leader_user_id),
+            leader_primary_node_id=leader_primary_node_id, sort_order=0,
+        ))
     return True
 
 
@@ -275,21 +280,10 @@ async def adopt_followers_for_group(
     *,
     target_group: dict,
     source_group_ids: list[str],
+    actor=None,
+    ip: str | None = None,
 ) -> tuple[list[dict], list[dict]]:
-    """把来源分组里已存在的跟单节点写入目标分组；返回 (adopted, skipped)。
-
-    用于「带单员新建分组 + 策略时，把跟过自己其它分组的节点一并带进来」——
-    跨策略类型 / 品种都生效（分组名按 策略类型-用户名-MT5号-品种 生成）。
-
-    三条口径：
-    - **只搬运已存在的跟单关系**，绝不引入「本来就没跟我」的节点；
-    - 同一节点跟了多个来源分组时按 node_id 去重，follower_user_id 取首次出现的那条；
-    - 逐条走 add_following，已存在时返回 False 进 skipped，天然幂等。
-
-    leader_user_id / leader_primary_node_id **一律从源关系取**，不作入参：源关系里
-    已存了这两个字段（写入时快照），复用既避免管理员名下分组（owner 为 None）
-    触发 int(None) 崩溃，也保证与源关系完全一致。
-    """
+    """将来源已生效节点转为目标分组待审申请，按节点去重并保留运行状态。"""
     target_gid = str((target_group or {}).get("group_id") or "").strip()
     src_ids = [
         str(g).strip() for g in (source_group_ids or [])
@@ -333,28 +327,22 @@ async def adopt_followers_for_group(
                                 "request_id": pending["request_id"], "status": "pending"} for nid in pending["node_ids"])
             skipped.extend(result["skipped"])
         return adopted, skipped
-    for nid, src in seen.items():
-        follower_uid = src.get("follower_user_id")
-        leader_uid = src.get("leader_user_id")
-        if not follower_uid or not leader_uid:
-            skipped.append({"node_id": nid, "reason": "跟单关系缺少归属信息"})
+    from . import follow_requests, permissions, rbac_service, user_service
+    by_user: dict[int, list[str]] = {}
+    for nid, relation in seen.items():
+        by_user.setdefault(relation["follower_user_id"], []).append(nid)
+    for user_id, node_ids in by_user.items():
+        user = await user_service.get_user_by_id(user_id)
+        principal = await rbac_service.load_principal(store, user.username) if user and user.is_active else None
+        if not principal or not permissions.can_menu(principal, permissions.MENU_FOLLOW):
+            skipped.extend({"node_id": nid, "reason": "跟单用户已失效"} for nid in node_ids)
             continue
-        ok = await add_following(
-            store,
-            group_id=target_gid,
-            node_id=nid,
-            follower_user_id=int(follower_uid),
-            leader_user_id=int(leader_uid),
-            leader_primary_node_id=src.get("leader_primary_node_id"),
-            follow_state=src.get("follow_state", "running"),
-            restart_stopped=False,
-        )
-        row = {
-            "node_id": nid,
-            "follower_user_id": int(follower_uid),
-            "from_group_id": src.get("group_id"),
-        }
-        (adopted if ok else skipped).append(row)
+        result = await follow_requests.submit(store, principal, seen[node_ids[0]]["leader_user_id"],
+            [target_gid], node_ids, source="inherit", actor=actor, ip=ip,
+            follow_states={nid: seen[nid].get("follow_state", "running") for nid in node_ids})
+        adopted.extend({**row, "status": "pending", "follower_user_id": user_id,
+                        "from_group_id": seen[row["node_id"]]["group_id"]} for row in result["pending"])
+        skipped.extend(result["skipped"])
     return adopted, skipped
 
 
@@ -385,6 +373,8 @@ async def remove_following(
         await s.execute(stmt)
         from .ai_application_store import cancel_nodes
         await cancel_nodes(s, ids, "跟单已移出", group_id=group_id, follower_user_id=follower_user_id)
+        from .follow_requests import cancel
+        await cancel(s, "跟单已移出", node_ids=ids, group_ids=[group_id], follower_user_id=follower_user_id, pending_only=False)
         await s.commit()
     await _refresh_groups(store, {group_id})
     return ids
@@ -396,7 +386,7 @@ async def remove_following(
 async def remove_node_followings(store: RedisStore, node_id: str) -> list[str]:
     """把一个节点从所有跟单关系中摘出；返回受影响的分组 ID。
 
-    调用时机：节点被删除、节点归属转移（assign_nodes）、节点升为主节点。
+    调用时机：节点被删除、节点归属转移（assign_nodes）。
     """
     gid = str(node_id or "").strip()
     if not gid:
@@ -404,6 +394,9 @@ async def remove_node_followings(store: RedisStore, node_id: str) -> list[str]:
     async with SessionLocal() as s:
         from .ai_application_store import cancel_nodes
         await cancel_nodes(s, [gid], "节点已删除或归属已变更")
+        from .follow_requests import cancel
+        await cancel(s, "节点已删除或归属已变更", node_ids=[gid], pending_only=False)
+        await cancel(s, "带单源节点已删除或归属已变更", primary_ids=[gid])
         affected = [
             r for (r,) in (
                 await s.execute(
@@ -432,6 +425,8 @@ async def remove_user_followings(
     async with SessionLocal() as s:
         from .ai_application_store import cancel_applications
         await cancel_applications(s, "用户已删除", user_id=uid)
+        from .follow_requests import cancel
+        await cancel(s, "用户已删除", user_id=uid, pending_only=False)
         affected = [
             r for (r,) in (
                 await s.execute(

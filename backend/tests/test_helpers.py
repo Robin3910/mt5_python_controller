@@ -33,6 +33,27 @@ DEFAULT_TEST_FILTERS = {
 }
 
 
+def approve_follow_requests(client) -> None:
+    """显式完成待审步骤，供既有生效关系的回归场景使用。"""
+    async def pending():
+        from sqlalchemy import select
+        from app.db import SessionLocal
+        from app.orm import FollowRequest, User
+        async with SessionLocal() as session:
+            return (await session.execute(select(User.username, FollowRequest.id).join(
+                FollowRequest, FollowRequest.leader_user_id == User.id,
+            ).where(FollowRequest.status == "pending"))).all()
+    for username, request_id in client.portal.call(pending):
+        if username == "admin":
+            headers = auth_headers(client)
+        else:
+            login = client.post("/api/login", json={"username": username, "password": "pass1234"})
+            assert login.status_code == 200, login.text
+            headers = {"Authorization": f"Bearer {login.json()['token']}"}
+        response = client.post(f"/api/follow-channel/requests/{request_id}/approve", headers=headers)
+        assert response.status_code == 200, response.text
+
+
 def _unlink_db(db_path, *, attempts: int) -> bool:
     """尽力删除库文件与 WAL 边文件；全部删净返回 True。"""
     targets = [db_path, *(db_path.with_name(db_path.name + s) for s in ("-wal", "-shm"))]
