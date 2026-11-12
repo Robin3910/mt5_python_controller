@@ -514,9 +514,9 @@ function detailRows(detail: GroupTaskEventDetail): Array<{ k: string; v: string 
         const tp = short ? detail.stop_lower : detail.stop_upper
         push('止损 / 止盈', `${sl || '不设'} / ${tp || '不设'}`)
       }
-      push('初始建仓', detail.prefill_enabled === false ? '关闭' : '开启')
       push('等待触发', detail.waiting_trigger ? '是' : '')
-      push('预填格位', detail.prefill_levels?.length ? detail.prefill_levels.join(', ') : '')
+      push('挂单格位', detail.placed_levels?.length ? detail.placed_levels.join(', ') : '')
+      push('在途挂单', detail.pending_levels?.length ? detail.pending_levels.join(', ') : '')
       push('托管策略', detail.strategy_name)
       push('策略模版', detail.template_id)
       push('魔术号', detail.magic)

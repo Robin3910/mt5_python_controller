@@ -148,8 +148,6 @@ watch(
       gridSizing.data = null
       gridSizing.error = ''
       gridSizing.loading = false
-      // 初始建仓：每次打开强制重置为关闭（避免已有策略里的旧值干扰）
-      gridParams.prefill_enabled = false
       // 加载分组详情 + 策略模版 + 已有策略参数
       await loadGroupAndStrategy()
     }
@@ -311,7 +309,6 @@ const gridParams = reactive({
   grid_mode: 'arithmetic' as GridMode,  // 网格模式
   grid_side: 'long' as GridSide,        // 网格方向
   lot_per_grid: 0.01,                  // 每格手数
-  prefill_enabled: false,               // 初始建仓（默认关闭）
   trigger_price: 0 as number | null,    // 触发价（默认 0 = 立即启动）
   stop_lower: 0 as number | null,       // 止损价（多头止损 / 空头止盈）
   stop_upper: 0 as number | null,       // 止盈价（多头止盈 / 空头止损）
@@ -444,7 +441,6 @@ async function loadGroupAndStrategy(): Promise<void> {
           gridParams.grid_mode = gridRule.grid_mode ?? 'arithmetic'
           gridParams.grid_side = gridRule.grid_side ?? 'long'
           gridParams.lot_per_grid = gridRule.lot_per_grid ?? 0.01
-          gridParams.prefill_enabled = gridRule.prefill_enabled ?? false
           gridParams.trigger_price = gridRule.trigger_price ?? 0
           gridParams.stop_lower = gridRule.stop_lower ?? 0
           gridParams.stop_upper = gridRule.stop_upper ?? 0
@@ -475,7 +471,6 @@ async function loadGroupAndStrategy(): Promise<void> {
           gridParams.grid_mode = gRule.grid_mode ?? 'arithmetic'
           gridParams.grid_side = gRule.grid_side ?? 'long'
           gridParams.lot_per_grid = gRule.lot_per_grid ?? 0.01
-          gridParams.prefill_enabled = gRule.prefill_enabled ?? false
           gridParams.trigger_price = gRule.trigger_price ?? 0
           gridParams.stop_lower = gRule.stop_lower ?? 0
           gridParams.stop_upper = gRule.stop_upper ?? 0
@@ -562,7 +557,6 @@ function triggerGridSizing(withDebounce: boolean): void {
       stop_lower: Number(gridParams.stop_lower) || 0,
       stop_upper: Number(gridParams.stop_upper) || 0,
       max_loss: Number(gridParams.max_allow_loss) || 0,
-      prefill_enabled: gridParams.prefill_enabled,
       close_on_stop: true,
       trailing_up: gridParams.trailing_up,
       total_lot_limit: 0,
@@ -603,7 +597,6 @@ watch(
     gridParams.price_upper,
     gridParams.grid_mode,
     gridParams.grid_side,
-    gridParams.prefill_enabled,
     gridParams.trailing_up,
     gridParams.max_allow_loss,
     gridParams.stop_lower,
@@ -709,7 +702,6 @@ function buildGridStrategyPayload(): StrategyRule[] | null {
       stop_lower: gridParams.stop_lower ?? 0,
       stop_upper: gridParams.stop_upper ?? 0,
       close_on_stop: true,
-      prefill_enabled: gridParams.prefill_enabled,
       trailing_up: gridParams.trailing_up,
       trailing_max: gridParams.trailing_max,
       assist_enabled: false,
@@ -1529,24 +1521,6 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
           </div>
         </div>
 
-        <!-- 初始建仓 -->
-        <div class="od-row">
-          <div class="od-row-text">
-            <div class="od-row-label">初始建仓</div>
-            <div class="od-row-sub">按现价上方格位预先开仓</div>
-          </div>
-          <div class="od-row-control">
-            <button
-              type="button"
-              class="pf-switch"
-              :class="{ on: gridParams.prefill_enabled }"
-              role="switch"
-              :aria-checked="gridParams.prefill_enabled"
-              aria-label="初始建仓"
-              @click="gridParams.prefill_enabled = !gridParams.prefill_enabled"
-            ></button>
-          </div>
-        </div>
         <!-- 触发价 -->
         <div class="od-row">
           <div class="od-row-text">

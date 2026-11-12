@@ -602,12 +602,8 @@ const FIELD_HELP = {
     '触发止损/止盈或收到终止指令时是否清掉该任务全部持仓。\n' +
     '关闭后：停止网格交易与监控推进，但保留已有持仓；任务进入「已脱离」非终态，' +
     '占位不释放，直到这批仓位被外部平光才真正收口。',
-  prefill_enabled:
-    '开启后启动时按「仍有盈利空间的格位 × 每格手数」市价建底仓：\n' +
-    '多头买入卖出价仍高于现价的格；空头开空平仓价仍低于现价的格。\n' +
-    '关闭则只挂网格、等穿越再开仓；多头上涨时可能无货可卖。',
   grid_total_lot_limit:
-    '全部格位合计手数上限，0=不额外限制。初始建仓也会受此约束。\n' +
+    '全部格位合计手数上限，0=不额外限制。在途挂单也计入这个额度。\n' +
     '若填写，须不小于每格手数，否则策略无法保存 / 无法参与分发。',
   trailing_up:
     '向上追踪：价格越过区间外沿时网格不停机，' +
@@ -770,7 +766,6 @@ function cloneRules(rules: StrategyRule[]): EditableRule[] {
       stop_lower: r.stop_lower ?? 0,
       stop_upper: r.stop_upper ?? 0,
       close_on_stop: r.close_on_stop ?? true,
-      prefill_enabled: r.prefill_enabled ?? true,
       trailing_up: r.trailing_up ?? false,
       trailing_max: r.trailing_max ?? 0,
       assist_enabled: r.assist_enabled ?? false,
@@ -1657,7 +1652,6 @@ function sizingSignature(r: EditableRule): string {
     r.grid_side,
     r.stop_lower,
     r.stop_upper,
-    r.prefill_enabled,
     r.close_on_stop,
     r.trailing_up,
     r.total_lot_limit,
@@ -1707,7 +1701,6 @@ async function runSizing(idx: number, r: EditableRule): Promise<void> {
       grid_side: r.grid_side,
       stop_lower: r.stop_lower,
       stop_upper: r.stop_upper,
-      prefill_enabled: r.prefill_enabled,
       close_on_stop: r.close_on_stop,
       trailing_up: r.trailing_up,
       total_lot_limit: r.total_lot_limit,
@@ -2703,17 +2696,6 @@ function resetRuleToTemplate(idx: number): void {
                       min="0"
                       step="0.01"
                     />
-                  </div>
-                  <div class="field">
-                    <div class="rule-enable-wrap">
-                      <FormLabel text="初始建仓" :help="FIELD_HELP.prefill_enabled" />
-                      <input
-                        type="checkbox"
-                        :checked="r.prefill_enabled"
-                        aria-label="启用初始建仓"
-                        @change="r.prefill_enabled = ($event.target as HTMLInputElement).checked"
-                      />
-                    </div>
                   </div>
                 </div>
               </div>

@@ -20,7 +20,6 @@ export interface QuickTriggerRequest {
   grid_mode?: 'arithmetic' | 'geometric' | null
   grid_side?: 'long' | 'short' | null
   lot_per_grid?: number | null
-  prefill_enabled?: boolean | null
   trigger_price?: number | null
   stop_loss?: number | null
   stop_profit?: number | null

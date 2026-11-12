@@ -97,7 +97,7 @@ def _mk_strategy(client, h, name: str, template_id: str, symbol: str = "XAUUSD")
             "grid_side": "long", "lot_per_grid": 0.01,
             "total_lot_limit": 0.0, "trigger_price": 0.0,
             "stop_lower": 0.0, "stop_upper": 0.0,
-            "close_on_stop": True, "prefill_enabled": True,
+            "close_on_stop": True,
             "trailing_up": False, "trailing_max": 0,
         }]
     r = client.post("/api/strategies", json=payload, headers=h)

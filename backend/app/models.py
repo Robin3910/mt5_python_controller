@@ -732,9 +732,6 @@ class StrategyRule(BaseModel):
         description="上沿终止价（须高于区间上限；多头为止盈、空头为止损），0=不设",
     )
     close_on_stop: bool = Field(default=True, description="终止时是否清仓")
-    prefill_enabled: bool = Field(
-        default=True, description="是否按现价上方格位初始建仓",
-    )
     trailing_up: bool = Field(
         default=False,
         description="向上追踪：价格越过区间外沿时网格连同止损止盈整体平移一格",
@@ -1045,7 +1042,6 @@ class QuickTriggerRequest(BaseModel):
     grid_mode: Optional[str] = Field(default=None)
     grid_side: Optional[str] = Field(default=None)
     lot_per_grid: Optional[float] = Field(default=None, gt=0)
-    prefill_enabled: Optional[bool] = Field(default=None)
     trigger_price: Optional[float] = Field(default=None, ge=0)
     stop_loss: Optional[float] = Field(default=None, ge=0)
     stop_profit: Optional[float] = Field(default=None, ge=0)

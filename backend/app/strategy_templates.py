@@ -454,13 +454,14 @@ class GridTradingRule:
     """网格交易规则（独立模型）。
 
     在 [price_lower, price_upper] 区间按 grid_mode 切成 grid_count 格（grid_count+1
-    条网格线）。价格下跌穿越网格线时买入一格、上涨穿越时卖出对应格，反复吃差价。
-    空仓是正常运行态（价格涨出区间顶部时全部卖光，等回落再买），因此任务不会因
+    条网格线）。网格**全程用挂单**：入场是限价单，成交后出场价写在挂单的止盈上，
+    由券商到价自动平仓。价格跌到格线下方就成交一格、涨回上一条线就止盈平掉，
+    反复吃差价。
+
+    空仓是正常运行态（价格涨出区间顶部时全部平光，等回落再挂），因此任务不会因
     持仓归零而收口，只由止损 / 止盈 / strategy_stop 结束。
 
     lot_per_grid 是每格手数（MT5 原生口径）。
-    prefill_enabled 开启时，启动会先市价买入「现价上方格位数 × 每格手数」的底仓，
-    否则价格上涨时无货可卖、网格上半部分失效。
 
     trailing_up 开启时，价格突破区间外沿时不停机，整个网格连同止损止盈一起平移
     一格，继续在新区间运行。多头网格追涨（突破上限上移），空头网格追跌（跌破下限
@@ -483,7 +484,6 @@ class GridTradingRule:
     stop_lower: float = 0.0                     # 下沿终止价（多头止损 / 空头止盈），0=不设
     stop_upper: float = 0.0                     # 上沿终止价（多头止盈 / 空头止损），0=不设
     close_on_stop: bool = True                  # 终止时是否清仓
-    prefill_enabled: bool = True                # 是否按现价上方格位初始建仓
     trailing_up: bool = False                   # 向上追踪：突破区间外沿时平移网格
     trailing_max: int = 0                       # 最大平移格数，0=不限
     # --- 试算助手（仅配置期，执行层不读）---
@@ -513,7 +513,6 @@ class GridTradingRule:
             "stop_lower": self.stop_lower,
             "stop_upper": self.stop_upper,
             "close_on_stop": self.close_on_stop,
-            "prefill_enabled": self.prefill_enabled,
             "trailing_up": self.trailing_up,
             "trailing_max": self.trailing_max,
             "assist_enabled": self.assist_enabled,
@@ -620,7 +619,6 @@ def default_grid_rule() -> GridTradingRule:
         stop_lower=0.0,
         stop_upper=0.0,
         close_on_stop=True,
-        prefill_enabled=True,
         trailing_up=False,
         trailing_max=0,
         assist_enabled=False,
@@ -990,7 +988,6 @@ def _normalize_grid_rule(rule_type: int, raw: dict) -> dict[str, Any]:
         "stop_lower": stop_lower,
         "stop_upper": stop_upper,
         "close_on_stop": bool(raw.get("close_on_stop", defaults["close_on_stop"])),
-        "prefill_enabled": bool(raw.get("prefill_enabled", defaults["prefill_enabled"])),
         "trailing_up": bool(raw.get("trailing_up", defaults["trailing_up"])),
         "trailing_max": min(
             GRID_TRAILING_MAX,

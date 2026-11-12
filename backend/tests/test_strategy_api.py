@@ -725,7 +725,7 @@ def _grid_rule(**over) -> dict:
         "grid_side": "long", "lot_per_grid": 0.01,
         "total_lot_limit": 0.0, "trigger_price": 0.0,
         "stop_lower": 0.0, "stop_upper": 0.0,
-        "close_on_stop": True, "prefill_enabled": True,
+        "close_on_stop": True,
         "trailing_up": False, "trailing_max": 0,
     }
     rule.update(over)
@@ -743,7 +743,6 @@ def test_list_templates_contains_template_3(client):
     assert tpl["rules"][0]["type"] == RULE_TYPE_GRID
     assert tpl["rules"][0]["grid_mode"] == "arithmetic"
     assert tpl["rules"][0]["grid_side"] == "long"
-    assert tpl["rules"][0]["prefill_enabled"] is True
     assert tpl["rules"][0]["trailing_up"] is False
 
 
@@ -1241,7 +1240,7 @@ def test_patch_accepts_addon_form_payload_with_grid_fields(client):
                 "grid_mode": "arithmetic", "grid_side": "long",
                 "lot_per_grid": 0.01, "trigger_price": 0,
                 "stop_lower": 0, "stop_upper": 0, "close_on_stop": True,
-                "prefill_enabled": True, "trailing_up": False, "trailing_max": 0,
+                "trailing_up": False, "trailing_max": 0,
                 "assist_enabled": False, "assist_timeframe": "H1",
                 "assist_atr_mult": 1, "assist_spacing": 0, "assist_max_loss": 0,
                 "float_pl_ratio": {
@@ -1281,7 +1280,7 @@ def test_patch_accepts_addon_form_payload_with_grid_fields(client):
                 "grid_mode": "arithmetic", "grid_side": "long",
                 "lot_per_grid": 0.01, "trigger_price": 0,
                 "stop_lower": 0, "stop_upper": 0, "close_on_stop": True,
-                "prefill_enabled": True, "trailing_up": False, "trailing_max": 0,
+                "trailing_up": False, "trailing_max": 0,
                 "assist_enabled": False, "assist_timeframe": "H1",
                 "assist_atr_mult": 1, "assist_spacing": 0, "assist_max_loss": 0,
                 "float_pl_ratio": {

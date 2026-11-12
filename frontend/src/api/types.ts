@@ -785,8 +785,6 @@ export interface StrategyRule {
   stop_upper?: number
   /** 终止时是否清仓 */
   close_on_stop?: boolean
-  /** 是否按现价上方格位初始建仓 */
-  prefill_enabled?: boolean
   /** 向上追踪：价格越过区间外沿时整个网格连同止损止盈平移一格 */
   trailing_up?: boolean
   /** 最大平移格数，0=不限 */
@@ -1284,14 +1282,16 @@ export interface GroupTaskEventDetail {
   stop_lower?: number
   stop_upper?: number
   close_on_stop?: boolean
-  prefill_enabled?: boolean
   trailing_up?: boolean
   trailing_max?: number | null
   levels?: number[]
   level_price?: number
   exit_price?: number
   holding_count?: number
-  prefill_levels?: number[]
+  /** 已挂出的入场挂单所在格位 */
+  placed_levels?: number[]
+  /** 在途入场挂单所在格位（runtime 快照） */
+  pending_levels?: number[]
   waiting_trigger?: boolean
   ticket?: number | null
   // —— 网格平移（kind=grid_shift）——

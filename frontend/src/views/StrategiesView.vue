@@ -302,7 +302,6 @@ function ruleDetailRows(r: StrategyRule): Array<{ k: string; v: string }> {
         v: `${sl || '不设'} / ${tp || '不设'}`,
       },
       { k: '终止清仓', v: r.close_on_stop === false ? '否' : '是' },
-      { k: '初始建仓', v: r.prefill_enabled === false ? '关闭' : '开启' },
       {
         k: '向上追踪',
         v: r.trailing_up ? (r.trailing_max ? `开启 · 最多 ${r.trailing_max} 格` : '开启 · 不限') : '关闭',

@@ -158,7 +158,6 @@ class SizingInput:
     atr_mult: float = 1.0
     spacing: float = 0.0          # >0 表示手改覆盖，不再用 ATR×倍数
     max_loss: float = 0.0
-    prefill_enabled: bool = True
     close_on_stop: bool = True
     trailing_up: bool = False
     total_lot_limit: float = 0.0
@@ -179,7 +178,6 @@ class SizingInput:
             atr_mult=min(ATR_MULT_MAX, max(ATR_MULT_MIN, mult)) if mult > 0 else 1.0,
             spacing=max(0.0, _as_float(src.get("spacing"))),
             max_loss=max(0.0, _as_float(src.get("max_loss"))),
-            prefill_enabled=bool(src.get("prefill_enabled", True)),
             close_on_stop=bool(src.get("close_on_stop", True)),
             trailing_up=bool(src.get("trailing_up", False)),
             total_lot_limit=max(0.0, _as_float(src.get("total_lot_limit"))),
@@ -262,27 +260,15 @@ def grid_count_for_spacing(lower: float, upper: float, spacing: float) -> int:
     return max(GRID_COUNT_MIN, min(GRID_COUNT_MAX, raw))
 
 
-def entry_costs(levels: list[float], *, is_long: bool, prefill_enabled: bool,
-                price: float) -> list[float]:
+def entry_costs(levels: list[float], *, is_long: bool) -> list[float]:
     """满仓时每一格的成本价。
 
-    未预填的格将来在自己的网格线上成交：多头买 `levels[i]`、空头开空 `levels[i+1]`。
-    预填走的是**市价**，成本是现价而不是格线价，所以现价可用时要按现价计：现价上方
-    的格因此变便宜、下方的格变贵（开仓即浮亏），两边都要如实计入才算得准。预填格位
-    的判定与节点侧 `prefill_indices` 一致：多头取卖出线仍高于现价的格，空头取平仓线
-    仍低于现价的格。
+    网格全程用挂单：每一格都在自己的网格线上成交，多头买 `levels[i]`、
+    空头开空 `levels[i+1]`。成本就是格线价，没有市价建仓那一条路径，
+    所以不必再按现价调整。
     """
     count = max(0, len(levels) - 1)
-    costs: list[float] = []
-    usable_price = price > 0 and prefill_enabled
-    for i in range(count):
-        base = levels[i] if is_long else levels[i + 1]
-        if usable_price:
-            prefilled = levels[i + 1] > price if is_long else levels[i] < price
-            costs.append(price if prefilled else base)
-        else:
-            costs.append(base)
-    return costs
+    return [levels[i] if is_long else levels[i + 1] for i in range(count)]
 
 
 def loss_per_lot(costs: list[float], stop: float, *, is_long: bool,
@@ -386,9 +372,7 @@ def _size_lots(out: SizingResult, cfg: SizingInput, spec: SymbolSpec,
         out.warn("max_loss_missing", "请填写最大可接受亏损金额")
         return
 
-    costs = entry_costs(
-        out.levels, is_long=cfg.is_long, prefill_enabled=cfg.prefill_enabled, price=price,
-    )
+    costs = entry_costs(out.levels, is_long=cfg.is_long)
     per_lot = loss_per_lot(costs, stop, is_long=cfg.is_long, spec=spec)
     if per_lot <= 0:
         out.warn("stop_unreachable", f"{stop_name}相对区间的位置算不出亏损距离")
@@ -406,12 +390,6 @@ def _size_lots(out: SizingResult, cfg: SizingInput, spec: SymbolSpec,
     out.lot_per_grid = lot
     out.worst_lot = round(lot * out.grid_count, spec.volume_digits)
     out.worst_loss = round(per_lot * lot, 2)
-    if cfg.prefill_enabled and price > 0:
-        out.warn(
-            "prefill_market_cost",
-            f"已按初始建仓的市价成本（现价 {_trim(price, spec.digits)}）估算最坏亏损",
-            level="info",
-        )
 
 
 def _collect_risk_warnings(out: SizingResult, cfg: SizingInput, spec: SymbolSpec) -> None:

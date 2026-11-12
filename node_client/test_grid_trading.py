@@ -10,7 +10,7 @@ def _cfg(**over) -> gt.GridConfig:
         "grid_side": "long", "lot_per_grid": 0.01,
         "total_lot_limit": 0.0, "trigger_price": 0.0,
         "stop_lower": 0.0, "stop_upper": 0.0,
-        "close_on_stop": True, "prefill_enabled": True,
+        "close_on_stop": True,
         "trailing_up": False, "trailing_max": 0,
     }
     raw.update(over)
@@ -97,51 +97,159 @@ def test_resolve_side():
     assert gt.resolve_side(_cfg(grid_side="follow"), "BUY") == "BUY"
 
 
-def test_prefill_indices_long():
+def test_entry_and_exit_prices_long():
+    """多头：入场价在下侧，出场价在上侧，两条线之间就是这一格吃的差价。"""
     plan = gt.plan_grid(_cfg(grid_count=4), signal_action="BUY", spec=_spec())
-    # levels: 100, 102.5, 105, 107.5, 110；现价 106 是市价成本，
-    # 只有卖出线仍高于 106 的格能盈利兑现：格 2（卖 107.5）、格 3（卖 110）
-    assert gt.prefill_indices(plan, 106.0) == [2, 3]
+    # levels: 100, 102.5, 105, 107.5, 110
+    assert gt.entry_price(plan, 0) == 100.0
+    assert gt.exit_price(plan, 0) == 102.5
+    assert gt.entry_price(plan, 3) == 107.5
+    assert gt.exit_price(plan, 3) == 110.0
 
 
-def test_prefill_indices_short():
+def test_entry_and_exit_prices_short():
+    """空头：出场价在下侧，入场价在上侧。"""
     plan = gt.plan_grid(
         _cfg(grid_side="short", grid_count=4), signal_action="SELL", spec=_spec(),
     )
-    # 现价 106 市价开空，只有平仓线仍低于 106 的格能盈利兑现
-    assert gt.prefill_indices(plan, 106.0) == [0, 1, 2]
+    assert gt.entry_price(plan, 0) == 102.5
+    assert gt.exit_price(plan, 0) == 100.0
+    assert gt.entry_price(plan, 3) == 110.0
+    assert gt.exit_price(plan, 3) == 107.5
 
 
-def test_prefill_never_locks_in_a_loss():
-    """预填的每一格，退出线都必须在现价的盈利侧。"""
-    price = 106.0
-    long_plan = gt.plan_grid(_cfg(grid_count=4), signal_action="BUY", spec=_spec())
-    for i in gt.prefill_indices(long_plan, price):
-        assert long_plan.levels[i + 1] > price
+def test_exit_price_always_on_profit_side():
+    """出场价恒在入场价的盈利侧——否则那一格一成交就是浮亏。"""
+    for side, action in (("long", "BUY"), ("short", "SELL")):
+        plan = gt.plan_grid(
+            _cfg(grid_side=side, grid_count=4), signal_action=action, spec=_spec(),
+        )
+        for i in range(plan.grid_count):
+            ep, xp = gt.entry_price(plan, i), gt.exit_price(plan, i)
+            if plan.is_long:
+                assert xp > ep
+            else:
+                assert xp < ep
 
-    short_plan = gt.plan_grid(
+
+def test_placeable_levels_long_only_below_price():
+    """多头 BUY LIMIT 必须挂在现价下方；挂在上方会被券商直接拒单。"""
+    plan = gt.plan_grid(_cfg(grid_count=4), signal_action="BUY", spec=_spec())
+    # levels: 100, 102.5, 105, 107.5, 110；现价 106
+    assert gt.placeable_levels(plan, 106.0) == [0, 1, 2]
+    for i in gt.placeable_levels(plan, 106.0):
+        assert gt.entry_price(plan, i) < 106.0
+
+
+def test_placeable_levels_short_only_above_price():
+    """空头 SELL LIMIT 必须挂在现价上方。"""
+    plan = gt.plan_grid(
         _cfg(grid_side="short", grid_count=4), signal_action="SELL", spec=_spec(),
     )
-    for i in gt.prefill_indices(short_plan, price):
-        assert short_plan.levels[i] < price
+    assert gt.placeable_levels(plan, 106.0) == [2, 3]
+    for i in gt.placeable_levels(plan, 106.0):
+        assert gt.entry_price(plan, i) > 106.0
 
 
-def test_capped_prefill():
-    cfg = _cfg(grid_count=4, lot_per_grid=0.1, total_lot_limit=0.2)
+def test_placeable_levels_needs_price():
+    """没有现价就挂不了单：方向判不出来。"""
+    plan = gt.plan_grid(_cfg(grid_count=4), signal_action="BUY", spec=_spec())
+    assert gt.placeable_levels(plan, 0.0) == []
+
+
+def test_capped_levels_counts_pending_and_holdings():
+    """总手数上限把「在途挂单 + 已成交持仓」一起算进去。"""
+    cfg = _cfg(grid_count=4, lot_per_grid=0.1, total_lot_limit=0.3)
     plan = gt.plan_grid(cfg, signal_action="BUY", spec=_spec())
-    indices = gt.prefill_indices(plan, 101.0)
-    assert indices == [0, 1, 2, 3]
-    # 0.2 / 0.1 = 2 格；多头留卖出线离现价最近的两格
-    assert gt.capped_prefill(plan, cfg, indices) == [0, 1]
+    assert gt.capped_levels(plan, cfg, [0, 1, 2, 3]) == [0, 1, 2]
+    # 两格成交了（在途 0 + 持仓 2 格 = 0.2 手），只剩 0.1 手额度 → 还能挂 1 格
+    plan.holdings = {0: 1001, 1: 1002}
+    assert gt.capped_levels(plan, cfg, [2, 3]) == [2]
+    assert gt.can_place_more(plan, cfg) is True
+    # 三格在手（0.3 手）→ 额度用尽，一格都挂不了
+    plan.holdings = {0: 1001, 1: 1002, 2: 1003}
+    assert gt.capped_levels(plan, cfg, [3]) == []
+    assert gt.can_place_more(plan, cfg) is False
 
-    short_cfg = _cfg(
-        grid_side="short", grid_count=4, lot_per_grid=0.1, total_lot_limit=0.2,
+
+def test_tp_is_sendable_checks_direction_and_distance():
+    """出场价方向反了、或离入场价太近，都不能写进挂单（券商会拒整张单）。"""
+    plan = gt.plan_grid(_cfg(grid_count=4), signal_action="BUY", spec=_spec())
+    assert gt.tp_is_sendable(plan, 0) is True
+    # point=2.5、stops_level=2 → 出场价要离入场价至少 5.0
+    assert gt.tp_is_sendable(plan, 0, stops_level=2, point=2.5) is False
+    assert gt.tp_is_sendable(plan, 0, stops_level=1, point=2.5) is True
+
+
+def test_tp_is_sendable_rejects_wrong_side():
+    """出场价落到亏损侧就不能挂——这一格没有可兑现的差价。"""
+    plan = gt.plan_grid(_cfg(grid_count=4), signal_action="BUY", spec=_spec())
+    plan.levels = [100.0, 99.0, 105.0, 107.5, 110.0]
+    # 格 0 的出场价 99.0 低于入场价 100.0 → 不合法
+    assert gt.tp_is_sendable(plan, 0) is False
+
+
+def test_stop_price_follows_grid_direction():
+    """终止价就是止损价：多头取 stop_lower，空头取 stop_upper。"""
+    long_plan = gt.plan_grid(
+        _cfg(grid_count=4, stop_lower=95.0, stop_upper=120.0),
+        signal_action="BUY", spec=_spec(),
     )
-    short_plan = gt.plan_grid(short_cfg, signal_action="SELL", spec=_spec())
-    short_indices = gt.prefill_indices(short_plan, 109.0)
-    assert short_indices == [0, 1, 2, 3]
-    # 空头留平仓线离现价最近的两格
-    assert gt.capped_prefill(short_plan, short_cfg, short_indices) == [2, 3]
+    assert gt.stop_price(long_plan) == 95.0
+    short_plan = gt.plan_grid(
+        _cfg(grid_count=4, grid_side="short", stop_lower=95.0, stop_upper=120.0),
+        signal_action="SELL", spec=_spec(),
+    )
+    assert gt.stop_price(short_plan) == 120.0
+    # 没配终止价 → 不写止损
+    plain = gt.plan_grid(_cfg(grid_count=4), signal_action="BUY", spec=_spec())
+    assert gt.stop_price(plain) == 0.0
+
+
+def test_sl_is_sendable_checks_direction_and_distance():
+    """终止价方向反了、或离入场价太近，都不能写进挂单的止损。"""
+    plan = gt.plan_grid(
+        _cfg(grid_count=4, stop_lower=95.0), signal_action="BUY", spec=_spec(),
+    )
+    # 格 0 的入场价 100.0，终止价 95.0 在亏损侧 → 合法
+    assert gt.sl_is_sendable(plan, 0) is True
+    # point=2.5、stops_level=3 → 终止价要离入场价至少 7.5（实际只有 5.0）
+    assert gt.sl_is_sendable(plan, 0, stops_level=3, point=2.5) is False
+    assert gt.sl_is_sendable(plan, 0, stops_level=2, point=2.5) is True
+
+
+def test_sl_is_sendable_rejects_stop_above_entry_for_long():
+    """多头的终止价高于入场价就是「止损在盈利侧」，不合法。"""
+    plan = gt.plan_grid(
+        _cfg(grid_count=4, stop_lower=105.0), signal_action="BUY", spec=_spec(),
+    )
+    assert gt.sl_is_sendable(plan, 0) is False
+
+
+def test_sl_is_sendable_requires_configured_stop():
+    """没配终止价就没有止损可写。"""
+    plan = gt.plan_grid(_cfg(grid_count=4), signal_action="BUY", spec=_spec())
+    assert gt.sl_is_sendable(plan, 0) is False
+
+
+def test_stop_is_sendable_uses_reference_price():
+    """改单阶段按现价校验：终止价必须落在现价的正确一侧且足够远。"""
+    plan = gt.plan_grid(
+        _cfg(grid_count=4, stop_lower=95.0), signal_action="BUY", spec=_spec(),
+    )
+    # 现价 100.0，终止价 95.0 在下方 → 合法
+    assert gt.stop_is_sendable(plan, 100.0) is True
+    # 现价已经跌到 94.0（终止价之下），此时改止损会被券商拒
+    assert gt.stop_is_sendable(plan, 94.0) is False
+
+
+def test_level_of_maps_ticket_to_level():
+    """持仓票号 → 当前格位。"""
+    plan = gt.plan_grid(_cfg(grid_count=4), signal_action="BUY", spec=_spec())
+    plan.holdings = {0: 1001, 2: 1003}
+    assert plan.level_of(1001) == 0
+    assert plan.level_of(1003) == 2
+    assert plan.level_of(9999) is None
 
 
 def test_crossings_down_then_up_no_repeat():
@@ -158,19 +266,6 @@ def test_crossings_down_then_up_no_repeat():
     assert all(c.direction == "up" for c in ups)
 
     assert gt.crossings(plan, 105.0, 105.0) == []
-
-
-def test_buy_sell_level_for_crossing_long():
-    plan = gt.plan_grid(_cfg(grid_count=4), signal_action="BUY", spec=_spec())
-    down = gt.Crossing(level_index=2, direction="down", level_price=105.0)
-    assert gt.buy_level_for_crossing(plan, down) == 2
-    plan.holdings[2] = 1001
-    assert gt.buy_level_for_crossing(plan, down) is None
-
-    up = gt.Crossing(level_index=3, direction="up", level_price=107.5)
-    assert gt.sell_level_for_crossing(plan, up) == 2
-    plan.holdings.pop(2)
-    assert gt.sell_level_for_crossing(plan, up) is None
 
 
 def test_terminate_reason():
@@ -284,6 +379,19 @@ def test_trailing_shift_remaps_holdings_and_drops_outliers():
     assert shift.dropped == [(0, 1001)]      # 最低格被挤出网格，需兑现
 
 
+def test_trailing_shift_remaps_pending_and_drops_outliers():
+    """平移后挂单也要跟着换格位；被挤出去的单必须撤掉（留在盘上会成交成孤儿）。"""
+    cfg, plan = _trailing_plan()
+    plan.pending = {0: 2001, 2: 2003}
+    shift = gt.trailing_shift(plan, cfg, 111.0, digits=2)
+    assert shift.pending == {1: 2003}
+    assert shift.dropped_pending == [(0, 2001)]
+
+    gt.apply_shift(plan, shift)
+    # 在途挂单一律清空：调用方会撤单后按新格线重挂
+    assert plan.pending == {}
+
+
 def test_trailing_shift_short_moves_down():
     cfg, plan = _trailing_plan(grid_side="short")
     assert plan.side == "SELL"
@@ -334,6 +442,31 @@ def test_rebuild_holdings_from_comment_and_price():
     gt.rebuild_holdings(plan, positions)
     assert plan.holdings[1] == 11
     assert plan.holdings[2] == 22
+
+
+def test_rebuild_restores_pending_orders():
+    """断线恢复：在途挂单靠备注还原成格位映射，恢复后不会重复挂同一格。"""
+    plan = gt.plan_grid(_cfg(grid_count=4), signal_action="BUY", spec=_spec())
+    orders = [
+        {"ticket": 31, "comment": "G4L0", "price_open": 100.0},
+        {"ticket": 32, "comment": "G4L2", "price_open": 105.0},
+        # 认不出的挂单不认领：宁可当成没有，也不冒重挂出双份手数的险
+        {"ticket": 33, "comment": "junk", "price_open": 107.5},
+    ]
+    gt.rebuild_holdings(plan, [], orders)
+    assert plan.pending == {0: 31, 2: 32}
+    assert 33 not in plan.pending.values()
+
+
+def test_rebuild_reports_orphan_pending_after_shift():
+    """挂单的格位被平移挤出网格 → 报为孤儿，调用方要撤单。"""
+    cfg, plan = _trailing_plan()
+    gt.apply_shift(plan, gt.trailing_shift(plan, cfg, 111.0, digits=2))
+    orphans = gt.rebuild_holdings(plan, [], [
+        {"ticket": 31, "comment": "G4L0", "price_open": 100.0},
+    ])
+    assert orphans == [31]
+    assert plan.pending == {}
 
 
 def test_pick_grid_rule():

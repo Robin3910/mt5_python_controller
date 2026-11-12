@@ -112,7 +112,7 @@ def _apply_grid_params(rule: dict, body: "QuickTriggerRequest") -> None:
     """把请求里的网格详情写进 rule dict。已存在的策略走 update_strategy 时复用。
 
     必填：price_lower / price_upper / grid_count / grid_mode / grid_side / lot_per_grid。
-    可选：prefill_enabled / trigger_price / stop_loss / stop_profit / trailing_up / assist_max_loss。
+    可选：trigger_price / stop_loss / stop_profit / trailing_up / assist_max_loss。
     几何位置与方向的对应：
       grid_side=long：stop_loss → stop_lower、stop_profit → stop_upper
       grid_side=short：stop_loss → stop_upper、stop_profit → stop_lower
@@ -130,8 +130,6 @@ def _apply_grid_params(rule: dict, body: "QuickTriggerRequest") -> None:
         rule["grid_count"] = int(body.grid_count)
     if body.lot_per_grid is not None:
         rule["lot_per_grid"] = float(body.lot_per_grid)
-    if body.prefill_enabled is not None:
-        rule["prefill_enabled"] = bool(body.prefill_enabled)
     if body.trigger_price is not None:
         rule["trigger_price"] = float(body.trigger_price)
     if body.trailing_up is not None:

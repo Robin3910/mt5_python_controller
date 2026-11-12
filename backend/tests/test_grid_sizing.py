@@ -107,7 +107,6 @@ def _params(**over) -> dict:
         "atr_mult": 1.0,
         "spacing": 0.0,
         "max_loss": 550.0,
-        "prefill_enabled": False,
         "close_on_stop": True,
         "trailing_up": False,
         "total_lot_limit": 0.0,
@@ -170,29 +169,24 @@ def test_build_levels_matches_node_side():
 
 
 # --------------------------- 成本与手数 ---------------------------
-def test_entry_costs_use_grid_lines_without_prefill():
+def test_entry_costs_use_grid_lines_long():
+    """网格全程用挂单：多头在每条格线上买入，成本就是格线价。"""
     levels = grid_sizing.build_levels(2000, 2100, 10, "arithmetic", digits=2)
-    costs = grid_sizing.entry_costs(levels, is_long=True, prefill_enabled=False, price=2055)
+    costs = grid_sizing.entry_costs(levels, is_long=True)
     assert costs == [2000, 2010, 2020, 2030, 2040, 2050, 2060, 2070, 2080, 2090]
 
 
-def test_entry_costs_use_market_price_for_prefilled_levels():
-    """预填按市价成交：卖出线仍高于现价的格，成本是现价而不是格线价。"""
+def test_entry_costs_use_grid_lines_short():
+    """空头在每条上沿线开空，出场线在下侧：成本是上沿线。"""
     levels = grid_sizing.build_levels(2000, 2100, 10, "arithmetic", digits=2)
-    costs = grid_sizing.entry_costs(levels, is_long=True, prefill_enabled=True, price=2055)
-    assert costs[:5] == [2000, 2010, 2020, 2030, 2040]
-    assert costs[5:] == [2055] * 5
-
-    # 空头对称：平仓线仍低于现价的格按现价开空，其余在自己的上沿线开
-    short = grid_sizing.entry_costs(levels, is_long=False, prefill_enabled=True, price=2055)
-    assert short[:6] == [2055] * 6
-    assert short[6:] == [2070, 2080, 2090, 2100]
+    costs = grid_sizing.entry_costs(levels, is_long=False)
+    assert costs == [2010, 2020, 2030, 2040, 2050, 2060, 2070, 2080, 2090, 2100]
 
 
 def test_loss_per_lot_ignores_levels_already_in_profit():
     spec = grid_sizing.SymbolSpec.from_probe(_SPEC)
     levels = grid_sizing.build_levels(2000, 2100, 10, "arithmetic", digits=2)
-    costs = grid_sizing.entry_costs(levels, is_long=True, prefill_enabled=False, price=0)
+    costs = grid_sizing.entry_costs(levels, is_long=True)
     assert grid_sizing.loss_per_lot(costs, 1990, is_long=True, spec=spec) == pytest.approx(
         _FULL_LOSS_PER_LOT,
     )
@@ -322,12 +316,12 @@ def test_evaluate_geometric_notes_uneven_spacing():
     assert "geometric_spacing" in _codes(out)
 
 
-def test_evaluate_prefill_uses_market_cost():
-    """预填时最坏亏损按现价成本算，与不预填不是同一个数。"""
+def test_evaluate_worst_loss_uses_grid_line_costs():
+    """最坏亏损按格线成本算：每一格都在自己的网格线上成交。"""
     plain = _evaluate(max_loss=5500.0)
-    prefilled = _evaluate(max_loss=5500.0, prefill_enabled=True, price=2055.0)
-    assert prefilled["worst_loss"] != plain["worst_loss"]
-    assert "prefill_market_cost" in _codes(prefilled)
+    priced = _evaluate(max_loss=5500.0, price=2055.0)
+    # 现价不影响成本：入场永远发生在格线上
+    assert priced["worst_loss"] == plain["worst_loss"]
 
 
 # --------------------------- 探针透传合约规格 ---------------------------

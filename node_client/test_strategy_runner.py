@@ -8,6 +8,7 @@ import asyncio
 import pytest
 
 import market_hub as mh
+import grid_trading
 import manual_scatter
 import signal_pl
 from mock_mt5 import MockMT5Client
@@ -1712,7 +1713,7 @@ def grid_rule(**over) -> dict:
         "grid_side": "long", "lot_per_grid": 0.01,
         "total_lot_limit": 0.0, "trigger_price": 0.0,
         "stop_lower": 0.0, "stop_upper": 0.0,
-        "close_on_stop": True, "prefill_enabled": True,
+        "close_on_stop": True,
     }
     rule.update(over)
     return rule
@@ -1721,6 +1722,9 @@ def grid_rule(**over) -> dict:
 def _grid_runner(sent: list, *, mt5=None, **rule_over):
     client = mt5 or MockMT5Client()
     client.prices_map["XAUUSD"] = GRID_PRICE
+    # 挂单网格的出场靠券商端止盈：出场价写在挂单的止盈上，成交后到价自动平仓。
+    # 不打开它就验不到「网格吃差价」这条主链路。
+    client.auto_settle_sl_tp = True
     hub = FakeHub()
 
     async def send(payload: dict) -> None:
@@ -1751,8 +1755,8 @@ async def test_grid_mode_and_hold_when_empty_subscribe():
     runner.cancel()
 
 
-async def test_grid_prefill_opens_levels_above_price():
-    """初始建仓：现价上方（买线已跌破）的格位先买入。"""
+async def test_grid_places_pending_orders_below_price():
+    """挂单网格启动：现价下方的格位挂 BUY LIMIT，出场价写在止盈上。"""
     sent: list = []
     runner, hub, mt5 = _grid_runner(sent)
     runner.start()
@@ -1761,83 +1765,140 @@ async def test_grid_prefill_opens_levels_above_price():
     opened = _progress(sent, "open")
     assert opened
     assert opened[0]["detail"]["kind"] == "grid_plan"
-    # 2350 在 2300~2400、10 格时，卖出线仍高于 2350 的格（5~9）应被预填
-    assert opened[0]["detail"]["prefill_levels"] == [5, 6, 7, 8, 9]
-    assert runner.total_orders > 0
-    assert len(mt5.positions_by_magic(MAGIC)) == runner.total_orders
-    # 预填的每一格退出线都在现价上方，不会开仓即锁定亏损
-    plan = runner._grid_plan
-    for level in plan.holdings:
-        assert plan.levels[level + 1] > GRID_PRICE
+    # 2350 在 2300~2400、10 格（间距 10）时，入场价低于现价的格都可挂；
+    # 入场价正好等于现价的那一格（2350）挂上即成交，不留在盘上
+    assert opened[0]["detail"]["placed_levels"] == [0, 1, 2, 3, 4, 5]
+
+    orders = mt5.pending_orders_by_magic(MAGIC)
+    assert len(orders) == 5
+    for order in orders:
+        # 每张单都带出场价（出场价 = 入场价 + 一格）
+        assert order["tp"] > order["price_open"]
+        assert order["comment"].startswith("G4L")
+    # 入场价正好等于现价的那一格（2350）挂上即成交，其余还在盘上等
+    held = mt5.positions_by_magic(MAGIC)
+    assert len(held) == 1
+    assert held[0]["price_open"] == 2350.0
     assert not runner.done
+    runner.cancel()
+
+
+async def test_grid_pending_orders_carry_exit_price():
+    """每一格吃的差价 = 出场价 - 入场价，正好一格。"""
+    sent: list = []
+    runner, hub, mt5 = _grid_runner(sent)
+    runner.start()
+    await _settle()
+
+    plan = runner._grid_plan
+    for order in mt5.pending_orders_by_magic(MAGIC):
+        level = grid_trading.parse_grid_comment(order["comment"])
+        assert level is not None
+        assert order["price_open"] == grid_trading.entry_price(plan, level)
+        assert order["tp"] == grid_trading.exit_price(plan, level)
     runner.cancel()
 
 
 async def test_grid_empty_positions_do_not_finish():
     """空仓不收口：投递空持仓事件后任务继续存活。"""
     sent: list = []
-    runner, hub, mt5 = _grid_runner(sent, prefill_enabled=False)
+    runner, hub, mt5 = _grid_runner(sent)
     runner.start()
     await _settle()
-    assert runner.total_orders == 0
 
-    _tick(hub, [], GRID_PRICE)
+    _tick(hub, [], GRID_PRICE, mt5.pending_orders_by_magic(MAGIC))
     await _settle()
     assert not _of_type(sent, "strategy_finished")
     assert not runner.done
     runner.cancel()
 
 
-async def test_grid_buy_on_down_cross_and_sell_on_up_cross():
+async def test_grid_fill_moves_pending_to_holding():
+    """挂单成交：这一格从「在途」转成「持仓」，出场交给券商止盈。"""
     sent: list = []
     runner, hub, mt5 = _grid_runner(
-        sent, prefill_enabled=False, grid_count=4,
-        price_lower=100.0, price_upper=110.0,
+        sent, grid_count=4, price_lower=100.0, price_upper=110.0,
     )
     mt5.prices_map["XAUUSD"] = 106.0
     runner.start()
     await _settle()
 
-    # 106 → 104：下跌穿越 105 → 买入格位 2（levels: 100,102.5,105,107.5,110）
-    _tick(hub, mt5.positions_by_magic(MAGIC), 104.0)
-    await _settle()
-    buys = _progress(sent, "grid_add")
-    assert buys
-    assert runner.total_orders >= 1
-    held = mt5.positions_by_magic(MAGIC)
-    assert held
+    # 106 时挂入场价低于现价的格：100 / 102.5 / 105
+    plan = runner._grid_plan
+    assert set(plan.pending) == {0, 1, 2}
 
-    # 104 → 108：上涨穿越 107.5 → 卖出格位 2
-    _tick(hub, held, 108.0)
+    # 跌到 99 → 挂在 100 的那张单成交（BUY LIMIT 要 ask ≤ 挂单价才成交）
+    mt5.prices_map["XAUUSD"] = 99.0
+    positions = mt5.positions_by_magic(MAGIC)
+    assert positions, "跌到入场价时挂单应成交"
+    _tick(hub, positions, 99.0, mt5.pending_orders_by_magic(MAGIC))
     await _settle()
+
+    assert plan.holdings, "成交后这一格应转入持仓映射"
+    assert 0 not in plan.pending, "成交后不应还在途"
+    fills = _progress(sent, "grid_add")
+    assert fills
+    assert fills[0]["detail"]["kind"] == "grid_fill"
+    # 成交的持仓带着出场价（券商端止盈）
+    filled = positions[0]
+    assert filled["tp"] > filled["price_open"]
+    runner.cancel()
+
+
+async def test_grid_broker_tp_closes_level():
+    """价格涨到出场价：券商端止盈平掉这一格，节点只观察结果。"""
+    sent: list = []
+    runner, hub, mt5 = _grid_runner(
+        sent, grid_count=4, price_lower=100.0, price_upper=110.0,
+    )
+    mt5.prices_map["XAUUSD"] = 106.0
+    runner.start()
+    await _settle()
+
+    mt5.prices_map["XAUUSD"] = 99.0
+    positions = mt5.positions_by_magic(MAGIC)
+    assert positions
+    _tick(hub, positions, 99.0, mt5.pending_orders_by_magic(MAGIC))
+    await _settle()
+
+    # 涨到格 0 的出场价 102.5 → 券商止盈
+    mt5.prices_map["XAUUSD"] = 103.0
+    remaining = mt5.positions_by_magic(MAGIC)
+    _tick(hub, remaining, 103.0, mt5.pending_orders_by_magic(MAGIC))
+    await _settle()
+
+    plan = runner._grid_plan
+    assert 0 not in plan.holdings, "止盈后这一格应从持仓映射摘掉"
     closes = _progress(sent, "close_partial")
     assert closes
+    assert "止盈" in closes[0]["message"]
     runner.cancel()
 
 
 async def test_grid_stop_lower_terminates_and_closes():
     sent: list = []
-    runner, hub, mt5 = _grid_runner(
-        sent, prefill_enabled=True, stop_lower=2290.0, close_on_stop=True,
-    )
+    runner, hub, mt5 = _grid_runner(sent, stop_lower=2290.0, close_on_stop=True)
     runner.start()
     await _settle()
-    assert runner.total_orders > 0
+    assert mt5.pending_orders_by_magic(MAGIC)
 
-    _tick(hub, mt5.positions_by_magic(MAGIC), 2285.0)
+    _tick(hub, mt5.positions_by_magic(MAGIC), 2285.0,
+          mt5.pending_orders_by_magic(MAGIC))
     await _settle(10)
 
     finished = _of_type(sent, "strategy_finished")
     assert finished
     assert finished[0]["status"] == "done"
     assert mt5.positions_by_magic(MAGIC) == []
+    # 收口前盘上的挂单必须撤干净
+    assert mt5.pending_orders_by_magic(MAGIC) == []
 
 
 async def test_grid_breakout_without_trailing_keeps_range():
     """没开追踪时突破上限只是无格可卖，网格区间保持不变。"""
     sent: list = []
     runner, hub, mt5 = _grid_runner(
-        sent, prefill_enabled=False, grid_count=4,
+        sent, grid_count=4,
         price_lower=100.0, price_upper=110.0,
     )
     mt5.prices_map["XAUUSD"] = 106.0
@@ -1856,7 +1917,7 @@ async def test_grid_trailing_up_shifts_range_on_breakout():
     """开了向上追踪：突破上限不停机，网格整体上移一格继续跑。"""
     sent: list = []
     runner, hub, mt5 = _grid_runner(
-        sent, prefill_enabled=False, grid_count=4,
+        sent, grid_count=4,
         price_lower=100.0, price_upper=110.0, trailing_up=True,
         stop_lower=95.0,
     )
@@ -1879,106 +1940,157 @@ async def test_grid_trailing_up_shifts_range_on_breakout():
     runner.cancel()
 
 
-async def test_grid_gap_up_sells_before_trailing_shift():
-    """突破外沿的那一根 tick 同时穿过卖出线：先兑现穿越，再平移。"""
+async def test_grid_trailing_cancels_and_replaces_pending():
+    """平移：旧格线的挂单要撤掉，按新格线重挂（挂单价与出场价得对上）。"""
     sent: list = []
     runner, hub, mt5 = _grid_runner(
-        sent, prefill_enabled=True, grid_count=4,
-        price_lower=100.0, price_upper=110.0, trailing_up=True,
+        sent, grid_count=4, price_lower=100.0, price_upper=110.0,
+        trailing_up=True, stop_lower=95.0,
     )
     mt5.prices_map["XAUUSD"] = 106.0
     runner.start()
     await _settle()
-    # 预填卖出线仍高于 106 的格位：2（卖 107.5）、3（卖 110）
-    assert set(runner._grid_plan.holdings) == {2, 3}
 
-    _tick(hub, mt5.positions_by_magic(MAGIC), 111.0)
+    # 106 时能挂入场价低于 106 的格：100 / 102.5 / 105
+    before = mt5.pending_orders_by_magic(MAGIC)
+    assert {o["price_open"] for o in before} == {100.0, 102.5, 105.0}
+
+    _tick(hub, mt5.positions_by_magic(MAGIC), 111.0,
+          mt5.pending_orders_by_magic(MAGIC))
     await _settle(10)
 
-    # 两格都在平移前按穿越卖掉了，没有被平移丢进 dropped
-    assert len(_progress(sent, "close_partial")) == 2
-    assert mt5.positions_by_magic(MAGIC) == []
     shifts = _progress(sent, "grid_shift")
-    assert shifts and shifts[0]["detail"]["dropped_levels"] == []
-    assert runner._grid_plan.levels[-1] == 112.5
-    assert runner._grid_plan.holdings == {}
+    assert shifts
+    plan = runner._grid_plan
+    assert plan.levels[-1] == 112.5
+    # 平移后盘上的单必须全按新格线：旧价位一张都不留
+    after = mt5.pending_orders_by_magic(MAGIC)
+    for order in after:
+        assert order["price_open"] in plan.levels
+        # 出场价也跟着新格线走，两条线始终是相邻的两条
+        assert order["tp"] in plan.levels
     runner.cancel()
 
 
-async def test_grid_retries_failed_sell_on_next_event():
-    """卖出失败的格位不会再被同一条线触发，必须逐轮重试兑现。"""
+async def test_grid_pending_orders_carry_stop_price():
+    """挂单上带着终止价当止损：成交即武装，节点断线期间网格仍受保护。"""
     sent: list = []
-    runner, hub, mt5 = _grid_runner(
-        sent, prefill_enabled=True, grid_count=4,
-        price_lower=100.0, price_upper=110.0,
-    )
-    mt5.prices_map["XAUUSD"] = 106.0
-
-    real_close = mt5.close_ticket
-    calls = {"n": 0}
-
-    def flaky_close(ticket):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return {"success": False, "error": "requote"}
-        return real_close(ticket)
-
-    mt5.close_ticket = flaky_close
-
+    runner, hub, mt5 = _grid_runner(sent, stop_lower=2280.0)
     runner.start()
     await _settle()
-    assert set(runner._grid_plan.holdings) == {2, 3}
 
-    # 一次涨到 111：格 2 卖失败进重试队列，格 3 正常兑现
-    _tick(hub, mt5.positions_by_magic(MAGIC), 111.0)
-    await _settle(10)
-    assert runner._grid_pending_sells == {2}
-    assert len(mt5.positions_by_magic(MAGIC)) == 1
-
-    # 价格没有再穿越 107.5，靠重试队列把这一格平掉
-    _tick(hub, mt5.positions_by_magic(MAGIC), 111.5)
-    await _settle(10)
-    assert runner._grid_pending_sells == set()
-    assert mt5.positions_by_magic(MAGIC) == []
+    orders = mt5.pending_orders_by_magic(MAGIC)
+    assert orders
+    for order in orders:
+        # 多头：终止价（stop_lower）在入场价的亏损侧
+        assert order["sl"] == 2280.0
+        assert order["sl"] < order["price_open"]
     runner.cancel()
 
 
-async def test_grid_trailing_retries_failed_dropped_close():
-    """卖不掉的格位被平移挤出网格后不能脱管，后续事件要继续重试兑现。"""
+async def test_grid_pending_orders_have_no_stop_when_not_closing():
+    """「停止但保留持仓」的配置不能挂止损——那等于让券商替用户平仓。"""
     sent: list = []
-    runner, hub, mt5 = _grid_runner(
-        sent, prefill_enabled=True, grid_count=4,
-        price_lower=100.0, price_upper=110.0, trailing_up=True,
-    )
-    mt5.prices_map["XAUUSD"] = 106.0
-
-    real_close = mt5.close_ticket
-    calls = {"n": 0}
-
-    def flaky_close(ticket):
-        calls["n"] += 1
-        if calls["n"] <= 3:
-            return {"success": False, "error": "requote"}
-        return real_close(ticket)
-
-    mt5.close_ticket = flaky_close
-
+    runner, hub, mt5 = _grid_runner(sent, stop_lower=2280.0, close_on_stop=False)
     runner.start()
     await _settle()
-    assert set(runner._grid_plan.holdings) == {2, 3}
 
-    # 直接跳到 118：两格卖出都失败，随后被平移（4 格）挤出网格
-    _tick(hub, mt5.positions_by_magic(MAGIC), 118.0)
-    await _settle(10)
-    assert runner._grid_plan.shift_count == 4
-    assert runner._grid_pending_sells == set()   # 已挤出网格，改由 orphans 负责
-    assert len(runner._grid_orphans) == 1
+    orders = mt5.pending_orders_by_magic(MAGIC)
+    assert orders
+    for order in orders:
+        assert order["sl"] == 0.0
+    runner.cancel()
 
-    # 下一轮事件重试成功
-    _tick(hub, mt5.positions_by_magic(MAGIC), 118.5)
+
+async def test_grid_stop_price_aligns_positions_after_trailing():
+    """平移后终止价跟着移动，已成交持仓的止损要一起改。"""
+    sent: list = []
+    runner, hub, mt5 = _grid_runner(
+        sent, grid_count=4, price_lower=100.0, price_upper=110.0,
+        trailing_up=True, stop_lower=95.0,
+    )
+    mt5.prices_map["XAUUSD"] = 106.0
+    runner.start()
+    await _settle()
+
+    # 105 格成交：让价格走到 105 让那一格挂上并成交
+    mt5.prices_map["XAUUSD"] = 105.0
+    held = mt5.positions_by_magic(MAGIC)
+    assert held, "应有一格成交"
+    assert held[0]["sl"] == 95.0
+
+    # 突破上限 → 网格上移一格，终止价 95 → 97.5
+    mt5.prices_map["XAUUSD"] = 111.0
+    _tick(hub, mt5.positions_by_magic(MAGIC), 111.0,
+          mt5.pending_orders_by_magic(MAGIC))
     await _settle(10)
-    assert runner._grid_orphans == set()
+
+    plan = runner._grid_plan
+    assert plan is not None
+    assert plan.stop_lower == 97.5
+    # 持仓的止损要跟着新终止价走，不能还守着老价
+    for pos in mt5.positions_by_magic(MAGIC):
+        assert pos["sl"] == 97.5
+    runner.cancel()
+
+
+async def test_grid_broker_stop_hit_terminates_grid():
+    """券商端止损平掉某一格 → 整网该收，不能继续挂着单跑。
+
+    复现断线窗口：节点离线期间价格击穿终止价，券商按持仓上的止损把它平掉；
+    价格随后回升。节点重连后只看到「这一格没了」+ 出场原因是止损——
+    没有这层识别，网格会带着已被平掉的仓位继续跑。
+    """
+    sent: list = []
+    runner, hub, mt5 = _grid_runner(sent, stop_lower=2290.0)
+    mt5.prices_map["XAUUSD"] = 2300.0
+    runner.start()
+    await _settle()
+
+    # 第一拍：让节点看到成交，持仓进入格位映射
+    _tick(hub, mt5.positions_by_magic(MAGIC), 2300.0,
+          mt5.pending_orders_by_magic(MAGIC))
+    await _settle(10)
+    held = mt5.positions_by_magic(MAGIC)
+    assert held, "应有一格成交"
+    assert held[0]["sl"] == 2290.0
+
+    # 价格击穿终止价 → 券商按持仓上的止损平掉这一格
+    mt5.prices_map["XAUUSD"] = 2285.0
     assert mt5.positions_by_magic(MAGIC) == []
+    # 价格随后回升到终止价之上：节点侧的「现价触达终止价」判定不会触发，
+    # 只有「出场原因是券商止损」这条路径能认出网格该收了
+    mt5.prices_map["XAUUSD"] = 2305.0
+    _tick(hub, mt5.positions_by_magic(MAGIC), 2305.0,
+          mt5.pending_orders_by_magic(MAGIC))
+    await _settle(10)
+
+    finished = _of_type(sent, "strategy_finished")
+    assert finished and finished[0]["status"] == "done"
+    assert "终止价" in finished[0]["reason"]
+    # 盘上不能残留挂单
+    assert mt5.pending_orders_by_magic(MAGIC) == []
+
+
+async def test_grid_replaces_cancelled_pending():
+    """挂单被撤后要补挂回去——撤掉的那一格不能就空着。"""
+    sent: list = []
+    runner, hub, mt5 = _grid_runner(sent)
+    runner.start()
+    await _settle()
+
+    before = {o["ticket"] for o in mt5.pending_orders_by_magic(MAGIC)}
+    assert before
+
+    # 券商撤掉一张挂单：下一轮事件里它既不在盘上也不在持仓里
+    victim = sorted(before)[0]
+    mt5.cancel_order(victim)
+    _tick(hub, [], GRID_PRICE, mt5.pending_orders_by_magic(MAGIC))
+    await _settle(10)
+
+    after = {o["ticket"] for o in mt5.pending_orders_by_magic(MAGIC)}
+    assert victim not in after, "被撤的单不该还在盘上"
+    assert after, "撤掉后应补挂回来"
     runner.cancel()
 
 
@@ -2015,15 +2127,15 @@ async def test_grid_rejects_netting_account():
 async def test_grid_close_on_stop_false_detaches_with_positions():
     """不清仓的配置只停止交易；持仓还在就不能报终态，否则占位被放掉没人管。"""
     sent: list = []
-    runner, hub, mt5 = _grid_runner(
-        sent, prefill_enabled=True, stop_lower=2290.0, close_on_stop=False,
-    )
+    runner, hub, mt5 = _grid_runner(sent, stop_lower=2290.0, close_on_stop=False)
     runner.start()
     await _settle()
+    # 先让一格成交，才有持仓可留
+    mt5.prices_map["XAUUSD"] = 2300.0
     held = mt5.positions_by_magic(MAGIC)
     assert held
 
-    _tick(hub, held, 2285.0)
+    _tick(hub, held, 2285.0, mt5.pending_orders_by_magic(MAGIC))
     await _settle(10)
 
     finished = _of_type(sent, "strategy_finished")
@@ -2040,12 +2152,40 @@ async def test_grid_close_on_stop_false_detaches_with_positions():
     assert [f for f in _of_type(sent, "strategy_finished") if f["status"] == "done"]
 
 
+async def test_grid_close_on_stop_false_cancels_pending_orders():
+    """「停止但保留持仓」：网格不跑了，盘上的入场挂单必须撤掉。
+
+    留着它们等于网格还在跑——价格回来还会成交出新仓，而配置说了不清仓。
+    """
+    sent: list = []
+    runner, hub, mt5 = _grid_runner(sent, stop_lower=2290.0, close_on_stop=False)
+    runner.start()
+    await _settle()
+
+    # 2350 这一格已成交（入场价正好等于现价），其余格位还在盘上等成交
+    held = mt5.positions_by_magic(MAGIC)
+    assert held
+    assert mt5.pending_orders_by_magic(MAGIC), "应还有在途挂单"
+
+    # 价格跌破终止价。挂单还没成交就被撤掉——不能等它们成交成新仓。
+    _tick(hub, held, 2285.0, mt5.pending_orders_by_magic(MAGIC))
+    await _settle(10)
+
+    finished = _of_type(sent, "strategy_finished")
+    assert finished and finished[0]["status"] == "detached"
+    # 持仓原样保留，但挂单一张都不留
+    assert len(mt5.positions_by_magic(MAGIC)) == len(held)
+    assert mt5.pending_orders_by_magic(MAGIC) == []
+
+
 async def test_stop_with_residual_positions_reports_non_terminal():
     """平不干净时上报 stop_failed 并继续重试，不能当成已收口。"""
     sent: list = []
-    runner, hub, mt5 = _grid_runner(sent, prefill_enabled=True)
+    runner, hub, mt5 = _grid_runner(sent)
     runner.start()
     await _settle()
+    # 先让一格成交，才有持仓可留
+    mt5.prices_map["XAUUSD"] = 2299.0
     assert mt5.positions_by_magic(MAGIC)
 
     real_close_by_magic = mt5.close_by_magic
@@ -2070,29 +2210,32 @@ async def test_runner_crash_with_open_positions_reports_faulted():
     """崩溃时持仓还在：报非终态 faulted，别让服务端把占位放掉。"""
     sent: list = []
     runner, hub, mt5 = _grid_runner(
-        sent, prefill_enabled=False, grid_count=4,
-        price_lower=100.0, price_upper=110.0,
+        sent, grid_count=4, price_lower=100.0, price_upper=110.0,
     )
     mt5.prices_map["XAUUSD"] = 106.0
     runner.start()
     await _settle()
 
-    _tick(hub, [], 104.0)          # 下跌穿越 105 → 买入一格
-    await _settle()
+    # 跌到 99 → 挂在 100 / 102.5 / 105 的三张单成交
+    mt5.prices_map["XAUUSD"] = 99.0
     held = mt5.positions_by_magic(MAGIC)
-    assert len(held) == 1
+    assert len(held) == 3
+    _tick(hub, held, 99.0, mt5.pending_orders_by_magic(MAGIC))
+    await _settle()
 
     def boom(*_args, **_kwargs):
         raise RuntimeError("terminal gone")
 
-    mt5.place_market_order = boom
-    _tick(hub, held, 101.0)        # 再穿越 102.5 → 买入时崩溃
+    # 读品种规格时终端崩了：持仓还在，不能报终态
+    mt5.symbol_spec = boom
+    runner._grid_spec = None      # 清掉缓存，逼它重新读一次
+    _tick(hub, held, 99.5, mt5.pending_orders_by_magic(MAGIC))
     await _settle(10)
 
     finished = _of_type(sent, "strategy_finished")
     assert finished and finished[0]["status"] == "faulted"
-    assert finished[0]["residual_positions"] == 1
-    assert len(mt5.positions_by_magic(MAGIC)) == 1
+    assert finished[0]["residual_positions"] == 3
+    assert len(mt5.positions_by_magic(MAGIC)) == 3
 
 
 async def test_grid_resume_prefers_runtime_levels_over_price_guess():
@@ -2111,7 +2254,7 @@ async def test_grid_resume_prefers_runtime_levels_over_price_guess():
         "lot_per_grid": 0.01,
     }
     runner, hub, mt5 = _grid_runner(
-        sent, mt5=client, prefill_enabled=False, grid_count=4,
+        sent, mt5=client, grid_count=4,
         price_lower=100.0, price_upper=110.0, trailing_up=True, stop_lower=95.0,
     )
     runner._resume_runtime = runtime
@@ -2155,10 +2298,10 @@ async def test_grid_resume_terminates_when_price_already_past_stop():
 
 
 async def test_grid_trailing_comment_carries_absolute_level():
-    """平移后新买入的格位备注记绝对格位号，重连才对得上原来那一格。"""
+    """平移后新挂的格位备注记绝对格位号，重连才对得上原来那一格。"""
     sent: list = []
     runner, hub, mt5 = _grid_runner(
-        sent, prefill_enabled=False, grid_count=4,
+        sent, grid_count=4,
         price_lower=100.0, price_upper=110.0, trailing_up=True,
     )
     mt5.prices_map["XAUUSD"] = 106.0
@@ -2169,12 +2312,14 @@ async def test_grid_trailing_comment_carries_absolute_level():
     await _settle()
     assert runner._grid_plan.shift_count == 1
 
-    # 新区间 [102.5, 112.5]，跌破 110 → 买入相对格位 3，绝对格位 4
-    _tick(hub, [], 109.0)
-    await _settle()
-    held = mt5.positions_by_magic(MAGIC)
-    assert held
-    assert held[-1]["comment"] == "G4L4"
+    # 新区间 [102.5, 112.5]：平移后重挂的单按绝对格位编号
+    plan = runner._grid_plan
+    for order in mt5.pending_orders_by_magic(MAGIC):
+        level = grid_trading.parse_grid_comment(order["comment"])
+        assert level is not None
+        # 相对格位 + 平移格数 = 绝对格位
+        assert level == plan.absolute_index(plan.relative_index(level))
+        assert order["comment"] == grid_trading.grid_comment(level)
     runner.cancel()
 
 

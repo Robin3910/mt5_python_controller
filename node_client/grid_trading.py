@@ -13,11 +13,22 @@
 - stop_lower / stop_upper：下沿 / 上沿终止价，0=不设
   （多头：下沿=止损、上沿=止盈；空头相反）
 - close_on_stop：终止时是否清仓
-- prefill_enabled：是否按现价上方格位初始建仓
 - trailing_up / trailing_max：向上追踪开关与最大平移格数
 
-核心循环：价格下跌穿越网格线 → 买入一格；上涨穿越 → 卖出对应格。空仓是正常
+核心循环（挂单网格）：每个格位在**入场价**上挂一张限价单等成交，成交的同时由
+券商端止盈在**出场价**上自动平仓，券商端止损在**终止价**上自动止损。入场、出场、
+止损都不在节点侧抢时间，所以网格只吃「挂单价 → 出场价」这一段差价。空仓是正常
 运行态，任务不会因持仓归零而结束。
+
+挂单口径：多头在 levels[i] 挂 BUY LIMIT（买线下方），出场价 levels[i+1]；
+空头在 levels[i+1] 挂 SELL LIMIT（卖线上方），出场价 levels[i]。
+入场价必须落在成交侧——挂在错误一侧会被券商直接拒单，所以只有「买线在现价
+下方」的格位才会被挂上单。
+
+终止价（多头 stop_lower、空头 stop_upper）是**整网**的止损，而入场价逐格不同：
+离终止价最近的几格可能贴着它，券商按 stops_level 拒（130 invalid stops）。
+所以每格单独校验，贴不上的那几格只带止盈。终止价随网格一起平移，已成交的持仓
+要跟着改单，否则还守着旧止损价。
 
 开启向上追踪后，价格越过区间外沿不会停机，而是把整个网格连同止损止盈平移一格
 （多头追涨、空头追跌）。平移会丢弃最外侧一格，因此 MT5 备注里记的是**绝对格位
@@ -44,6 +55,10 @@ GRID_SIDE_LONG = "long"
 GRID_SIDE_SHORT = "short"
 GRID_SIDE_FOLLOW = "follow"
 GRID_SIDES = (GRID_SIDE_LONG, GRID_SIDE_SHORT, GRID_SIDE_FOLLOW)
+
+# 网格入场挂单类型：等价格回到格线再成交，所以一律是限价单。
+# 与 mt5_client.PENDING_LIMIT 同名同义，但这一层不依赖 MT5 包（可独立单测）。
+PENDING_LIMIT = "limit"
 
 # 单次 trailing_shift 调用的平移上限。只为兜住极端行情下的长循环——正常追踪一次
 # 只移几格，断线恢复时则要一次追回全部平移量，所以取值必须远大于网格格数。
@@ -98,6 +113,8 @@ class SymbolSpec:
     volume_min: float = 0.0
     volume_step: float = 0.0
     volume_max: float = 0.0
+    # 挂单价 / 止损价距现价的最小点数（券商要求），0 = 不限制
+    stops_level: int = 0
 
     @property
     def volume_digits(self) -> int:
@@ -133,7 +150,6 @@ class GridConfig:
     stop_lower: float = 0.0
     stop_upper: float = 0.0
     close_on_stop: bool = True
-    prefill_enabled: bool = True
     trailing_up: bool = False
     trailing_max: int = 0
 
@@ -158,7 +174,6 @@ class GridConfig:
             stop_lower=max(0.0, _as_float(rule.get("stop_lower"))),
             stop_upper=max(0.0, _as_float(rule.get("stop_upper"))),
             close_on_stop=bool(rule.get("close_on_stop", True)),
-            prefill_enabled=bool(rule.get("prefill_enabled", True)),
             trailing_up=bool(rule.get("trailing_up", False)),
             trailing_max=max(0, _as_int(rule.get("trailing_max"))),
         )
@@ -238,6 +253,8 @@ class GridPlan:
     # 格位 index → MT5 ticket；格位 i 对应「在 levels[i] 买入、在 levels[i+1] 卖出」
     # 即持有格位 i 意味着已在第 i 条线买入，等待涨到第 i+1 条线卖出
     holdings: dict[int, int] = field(default_factory=dict)
+    # 格位 index → 在途挂单票号（尚未成交的入场单）
+    pending: dict[int, int] = field(default_factory=dict)
     prev_price: float = 0.0
     triggered: bool = False                 # 是否已过触发价 / 无需触发
     reject: str = ""
@@ -262,6 +279,9 @@ class GridPlan:
     def holding_count(self) -> int:
         return len(self.holdings)
 
+    def pending_count(self) -> int:
+        return len(self.pending)
+
     def absolute_index(self, level: int) -> int:
         """相对格位 → 绝对格位。写进 MT5 备注，平移后仍能反查回原格。"""
         return int(level) + self.shift_count
@@ -270,6 +290,192 @@ class GridPlan:
         """绝对格位 → 当前网格的相对格位；已被平移挤出网格返回 None。"""
         level = int(absolute) - self.shift_count
         return level if 0 <= level < self.grid_count else None
+
+    def level_of(self, ticket: int) -> Optional[int]:
+        """持仓票号 → 当前格位下标；不在持仓映射里返回 None。"""
+        target = int(ticket)
+        for level, held in self.holdings.items():
+            if int(held) == target:
+                return int(level)
+        return None
+
+
+def entry_price(plan: GridPlan, level: int) -> float:
+    """格位 level 的**入场价**（挂单价）。
+
+    多头在 levels[level] 买入，空头在 levels[level+1] 开空。挂单必须落在成交侧：
+    多头的 BUY LIMIT 挂在现价下方，空头的 SELL LIMIT 挂在现价上方。
+    """
+    if not plan.ok or level < 0 or level >= plan.grid_count:
+        return 0.0
+    return plan.levels[level] if plan.is_long else plan.levels[level + 1]
+
+
+def exit_price(plan: GridPlan, level: int) -> float:
+    """格位 level 的**出场价**（券商端止盈价）。
+
+    多头在 levels[level+1] 止盈，空头在 levels[level] 止盈。出场价恒在入场价的
+    盈利侧：一格吃的就是这两条线之间的差价。
+    """
+    if not plan.ok or level < 0 or level >= plan.grid_count:
+        return 0.0
+    return plan.levels[level + 1] if plan.is_long else plan.levels[level]
+
+
+def stop_price(plan: GridPlan) -> float:
+    """网格的**终止价**（券商端止损价），0 表示不设。
+
+    多头：跌破 stop_lower 为止损 → 止损价就是 stop_lower；
+    空头：涨破 stop_upper 为止损 → 止损价就是 stop_upper。
+
+    这个价在挂单时就已确定（配置项），所以可以直接写进挂单的止损：成交即带着
+    止损，节点断线期间也有人管。开了向上追踪时它会随网格平移，见 `apply_shift`。
+    """
+    if not plan.ok:
+        return 0.0
+    return plan.stop_lower if plan.is_long else plan.stop_upper
+
+
+def pending_kind_for(plan: GridPlan) -> str:
+    """挂单类型：网格入场一律用限价单（等价格回到格线再成交）。"""
+    return PENDING_LIMIT
+
+
+def pending_action(plan: GridPlan) -> str:
+    """挂单方向：与网格方向一致（多头 BUY LIMIT、空头 SELL LIMIT）。"""
+    return plan.side
+
+
+def placeable_levels(plan: GridPlan, price: float) -> list[int]:
+    """当前可以挂单的格位下标（入场价落在现价的正确一侧）。
+
+    多头的 BUY LIMIT 必须挂在现价**下方**，空头的 SELL LIMIT 必须挂在现价**上方**，
+    挂在错误一侧会被券商直接拒单（10015 价格非法）。所以：
+
+    - 多头：入场价 levels[i] < 现价 → 可挂；
+    - 空头：入场价 levels[i+1] > 现价 → 可挂。
+
+    现价两侧都会有一半格位不可挂，这是网格的正常形态——另一半等价格走过去
+    之后再由下一轮补挂。
+    """
+    if not plan.ok or price <= 0:
+        return []
+    out: list[int] = []
+    for i in range(plan.grid_count):
+        ep = entry_price(plan, i)
+        if ep <= 0:
+            continue
+        if plan.is_long:
+            if ep < price:
+                out.append(i)
+        else:
+            if ep > price:
+                out.append(i)
+    return out
+
+
+def capped_levels(plan: GridPlan, cfg: GridConfig, indices: list[int]) -> list[int]:
+    """按 total_lot_limit 截断可挂格数。
+
+    与「在途挂单 + 已成交持仓」共同占用总手数额度，所以截断依据是两者之和。
+    """
+    if not indices or cfg.total_lot_limit <= 0 or plan.lot_per_grid <= 0:
+        return indices
+    used = (plan.holding_count() + plan.pending_count()) * plan.lot_per_grid
+    budget = cfg.total_lot_limit - used
+    max_grids = int(math.floor((budget + 1e-9) / plan.lot_per_grid))
+    if max_grids <= 0:
+        return []
+    if len(indices) <= max_grids:
+        return indices
+    # 优先保留离现价最近的格（最先能成交的那几格）：
+    # 多头的入场价随下标递增，取列表头部；空头同样递增，取尾部
+    if plan.is_long:
+        return indices[:max_grids]
+    return indices[-max_grids:]
+
+
+def can_place_more(plan: GridPlan, cfg: GridConfig) -> bool:
+    """是否还能再挂一格（受 total_lot_limit 约束）。"""
+    if cfg.total_lot_limit <= 0 or plan.lot_per_grid <= 0:
+        return True
+    used = (plan.holding_count() + plan.pending_count()) * plan.lot_per_grid
+    return used + plan.lot_per_grid <= cfg.total_lot_limit + 1e-9
+
+
+def tp_is_sendable(plan: GridPlan, level: int, *, stops_level: int = 0,
+                   point: float = 0.0) -> bool:
+    """这一格的出场价能不能写到入场挂单上。
+
+    券商拒掉的是**整张单**（error 130 invalid stops），所以条件不满足就不能把
+    止盈写进挂单——宁可不挂这一格，也不能让挂单挂不上去。
+
+    条件：
+    - 方向对：多头的出场价要高于入场价，空头的要低于；
+    - 离入场价足够远：不小于券商的 stops_level。
+    """
+    ep = entry_price(plan, level)
+    xp = exit_price(plan, level)
+    if ep <= 0 or xp <= 0:
+        return False
+    if plan.is_long:
+        if xp <= ep:
+            return False
+    else:
+        if xp >= ep:
+            return False
+    level_pts = max(0, int(stops_level))
+    step = float(point or 0.0)
+    if level_pts > 0 and step > 0 and abs(ep - xp) < level_pts * step:
+        return False
+    return True
+
+
+def sl_is_sendable(plan: GridPlan, level: int, *, stops_level: int = 0,
+                   point: float = 0.0) -> bool:
+    """这一格的终止价能不能写到入场挂单的止损上。
+
+    与 `tp_is_sendable` 同理：券商拒的是**整张单**（error 130 invalid stops），
+    止损不合法就不能写，宁可少写一个保护，也不能让挂单挂不上去。
+
+    条件：
+    - 终止价已配置（stop_price > 0）；
+    - 方向对：多头的终止价要低于入场价，空头的要高于；
+    - 离入场价足够远：不小于券商的 stops_level。
+
+    注意终止价是**整网**的止损，而入场价逐格不同：最靠近终止价的那几格可能
+    离得不够远，那些格就写不上止损——只影响那几格，不影响其余格。
+    """
+    return stop_is_sendable(
+        plan, entry_price(plan, level), stops_level=stops_level, point=point,
+    )
+
+
+def stop_is_sendable(plan: GridPlan, reference: float, *, stops_level: int = 0,
+                     point: float = 0.0) -> bool:
+    """网格终止价相对某个参考价能不能作为止损下发。
+
+    reference 是价格的下限判断基准：
+    - 挂单阶段用**入场价**（止损必须落在入场价的反方向）；
+    - 改单阶段用**现价**（券商校验持仓止损时看的是现价那一侧）。
+
+    两处的方向要求一致：多头的终止价要低于参考价，空头的要高。
+    """
+    ref = float(reference or 0.0)
+    sp = stop_price(plan)
+    if ref <= 0 or sp <= 0:
+        return False
+    if plan.is_long:
+        if sp >= ref:
+            return False
+    else:
+        if sp <= ref:
+            return False
+    level_pts = max(0, int(stops_level))
+    step = float(point or 0.0)
+    if level_pts > 0 and step > 0 and abs(ref - sp) < level_pts * step:
+        return False
+    return True
 
 
 def plan_grid(cfg: GridConfig, *, signal_action: object,
@@ -349,55 +555,16 @@ def trigger_reached(cfg: GridConfig, price: float, prev_price: float = 0.0) -> b
     return (prev_price - t) * (price - t) <= 0
 
 
-def prefill_indices(plan: GridPlan, price: float) -> list[int]:
-    """初始建仓应持有的格位下标列表（退出线还在现价盈利侧的格）。
-
-    格位 i 用两条线描述：多头在 levels[i] 买入、levels[i+1] 卖出；空头在 levels[i+1]
-    开空、levels[i] 平空。初始建仓走的是**市价**，成本就是现价，所以只有退出线仍在
-    现价的盈利侧，这一格将来才可能兑现收益：
-
-    - 多头：卖出线 levels[i+1] > 现价；
-    - 空头：平仓线 levels[i] < 现价。
-
-    这正是「按现价上方（空头为下方）的网格数量建底仓」：价格继续朝有利方向走时每穿
-    一条线兑现一格；不预填则那半边网格无货可卖。反过来若把退出线已在现价不利侧的格
-    也买进来，等于开仓即锁定亏损。
-    """
-    if not plan.ok or price <= 0:
-        return []
-    indices: list[int] = []
-    for i in range(plan.grid_count):
-        if plan.is_long:
-            if plan.levels[i + 1] > price:
-                indices.append(i)
-        else:
-            if plan.levels[i] < price:
-                indices.append(i)
-    return indices
-
-
-def capped_prefill(plan: GridPlan, cfg: GridConfig, indices: list[int]) -> list[int]:
-    """按 total_lot_limit 截断初始建仓格数。"""
-    if not indices or cfg.total_lot_limit <= 0 or plan.lot_per_grid <= 0:
-        return indices
-    max_grids = int(math.floor((cfg.total_lot_limit + 1e-9) / plan.lot_per_grid))
-    if max_grids <= 0:
-        return []
-    # 优先保留退出线离现价最近的格（最先能兑现的那几格）：
-    # 多头的卖出线随下标递增，取列表头部；空头的平仓线同样递增，取尾部
-    if len(indices) <= max_grids:
-        return indices
-    if plan.is_long:
-        return indices[:max_grids]
-    return indices[-max_grids:]
-
-
 # ---------------------------------------------------------------------------
 # 运行期判定
 # ---------------------------------------------------------------------------
 
 def crossings(plan: GridPlan, prev_price: float, price: float) -> list[Crossing]:
     """用上一次价格与本次价格判断穿越了哪些网格线及方向。
+
+    挂单网格不再靠「穿越」下单：入场单在挂出的那一刻就躺在盘上，价格碰到
+    挂单价由终端撮合成交。这个函数保留给「网格平移」的判定与断线恢复时的
+    价位还原使用——平移要看价格是否越过区间外沿，那仍然是穿越语义。
 
     同价位不重复触发：只有 prev 与 price 分居线的两侧才算穿越。
     返回按穿越顺序排列（下跌时从高到低，上涨时从低到高）。
@@ -429,62 +596,11 @@ def crossings(plan: GridPlan, prev_price: float, price: float) -> list[Crossing]
     return out
 
 
-def buy_level_for_crossing(plan: GridPlan, crossing: Crossing) -> Optional[int]:
-    """穿越事件对应的买入格位；无可买返回 None。
-
-    多头：下跌穿越第 i 线 → 买入格位 i（在 levels[i] 买入，等涨到 levels[i+1] 卖）。
-      注意：穿越下限（i=0）可买格位 0；穿越上限（i=N）不产生新买入格。
-    空头：上涨穿越第 i 线 → 买入（开空）格位 i-1。
-    """
-    i = crossing.level_index
-    if plan.is_long:
-        if crossing.direction != "down":
-            return None
-        # 下跌穿越线 i → 买入格位 i（需 i < N，即不是穿过上限之上）
-        if i >= plan.grid_count:
-            return None
-        level = i
-    else:
-        if crossing.direction != "up":
-            return None
-        # 上涨穿越线 i → 开空格位 i-1
-        if i <= 0:
-            return None
-        level = i - 1
-    if level in plan.holdings:
-        return None
-    return level
-
-
-def sell_level_for_crossing(plan: GridPlan, crossing: Crossing) -> Optional[int]:
-    """穿越事件对应的卖出格位；无可卖返回 None。
-
-    多头：上涨穿越第 i 线 → 卖出格位 i-1（该格的卖出价是 levels[i]）。
-    空头：下跌穿越第 i 线 → 平空格位 i。
-    """
-    i = crossing.level_index
-    if plan.is_long:
-        if crossing.direction != "up":
-            return None
-        if i <= 0:
-            return None
-        level = i - 1
-    else:
-        if crossing.direction != "down":
-            return None
-        if i >= plan.grid_count:
-            return None
-        level = i
-    if level not in plan.holdings:
-        return None
-    return level
-
-
 def can_buy_more(plan: GridPlan, cfg: GridConfig) -> bool:
     """是否还能再买一格（受 total_lot_limit 约束）。"""
     if cfg.total_lot_limit <= 0 or plan.lot_per_grid <= 0:
         return True
-    used = plan.holding_count() * plan.lot_per_grid
+    used = (plan.holding_count() + plan.pending_count()) * plan.lot_per_grid
     return used + plan.lot_per_grid <= cfg.total_lot_limit + 1e-9
 
 
@@ -523,6 +639,11 @@ class TrailingShift:
     stop_upper: float = 0.0
     holdings: dict[int, int] = field(default_factory=dict)      # 重映射后的格位→ticket
     dropped: list[tuple[int, int]] = field(default_factory=list)  # 被挤出网格的 (原格位, ticket)
+    # 平移后格位号要跟着改，入场挂单也要跟着改价。
+    # 挂在盘上的单改价后可能落到现价的错误一侧（券商会拒），所以这里只报出
+    # 「哪些单要撤、哪些格位要重挂」，由调用方撤单后按新格线重新挂。
+    pending: dict[int, int] = field(default_factory=dict)
+    dropped_pending: list[tuple[int, int]] = field(default_factory=list)
     from_lower: float = 0.0                             # 平移前的区间，用于说明
     from_upper: float = 0.0
 
@@ -615,19 +736,35 @@ def trailing_shift(plan: GridPlan, cfg: GridConfig, price: float,
             holdings[moved] = ticket
         else:
             dropped.append((level, ticket))
+    # 在途挂单同样要跟着平移重挂：被挤出网格的单必须撤掉
+    pending: dict[int, int] = {}
+    dropped_pending: list[tuple[int, int]] = []
+    for level, ticket in sorted(plan.pending.items()):
+        moved = level - signed
+        if 0 <= moved < len(levels) - 1:
+            pending[moved] = ticket
+        else:
+            dropped_pending.append((level, ticket))
     return TrailingShift(
         steps=signed, levels=levels, stop_lower=stop_lower, stop_upper=stop_upper,
         holdings=holdings, dropped=dropped,
+        pending=pending, dropped_pending=dropped_pending,
         from_lower=plan.levels[0], from_upper=plan.levels[-1],
     )
 
 
 def apply_shift(plan: GridPlan, shift: TrailingShift) -> None:
-    """把平移结果写回计划。dropped 的持仓须由调用方先行平掉。"""
+    """把平移结果写回计划。dropped 的持仓须由调用方先行平掉。
+
+    在途挂单在平移后**不能原地留着**：挂单价还是旧格线的价，而出场价已经跟着
+    平移了，两者对不上。所以调用方要先撤掉这些单，再按新格线重挂——本函数
+    因此把 pending 清空，让调用方的补挂流程重新挂一遍。
+    """
     plan.levels = list(shift.levels)
     plan.stop_lower = shift.stop_lower
     plan.stop_upper = shift.stop_upper
     plan.holdings = dict(shift.holdings)
+    plan.pending.clear()
     plan.shift_count += shift.steps
 
 
@@ -665,14 +802,20 @@ def nearest_level_index(plan: GridPlan, price: float) -> Optional[int]:
     return best_i
 
 
-def rebuild_holdings(plan: GridPlan, positions: list[dict]) -> list[int]:
+def rebuild_holdings(plan: GridPlan, positions: list[dict],
+                     orders: Optional[list[dict]] = None) -> list[int]:
     """按持仓 comment（失败则按开仓价就近）还原格位→ticket 映射。
 
     备注里存的是绝对格位号，网格平移过就要减掉 shift_count 才是当前格位。返回
     「备注可识别、但格位已被平移挤出网格」的 ticket 列表：这些持仓的卖出线已不
     在网格内，需要调用方平掉兑现，否则会一直挂到任务终止。
+
+    orders 是该魔术号下的在途挂单：挂单成交后备注会继承到持仓上，所以挂单
+    也带同一套 G4L{绝对格位号} 备注，据此还原「格位 → 在途单票号」的映射，
+    断线恢复后不会重复挂同一格。
     """
     plan.holdings.clear()
+    plan.pending.clear()
     orphans: list[int] = []
     for pos in positions or []:
         ticket = _as_int(pos.get("ticket"))
@@ -690,6 +833,23 @@ def rebuild_holdings(plan: GridPlan, positions: list[dict]) -> list[int]:
             continue
         if 0 <= level < plan.grid_count:
             plan.holdings[level] = ticket
+    for order in orders or []:
+        ticket = _as_int(order.get("ticket"))
+        if ticket <= 0:
+            continue
+        absolute = parse_grid_comment(order.get("comment"))
+        if absolute is None:
+            # 认不出的挂单不认领：宁可当成没有，避免重挂出双份手数
+            continue
+        level = plan.relative_index(absolute)
+        if level is None:
+            # 格位已被平移挤出网格：这张单留在盘上是孤儿单，调用方需撤掉
+            orphans.append(ticket)
+            continue
+        if level in plan.holdings or level in plan.pending:
+            continue
+        if 0 <= level < plan.grid_count:
+            plan.pending[level] = ticket
     return orphans
 
 
@@ -712,13 +872,13 @@ def describe_plan(plan: GridPlan, cfg: GridConfig, spec: SymbolSpec) -> str:
         else f"公比 1+{_trim(gap * 100, 4)}%"
     )
     return (
-        f"网格交易：区间 [{_trim(cfg.price_lower, spec.digits)}, "
+        f"挂单网格：区间 [{_trim(cfg.price_lower, spec.digits)}, "
         f"{_trim(cfg.price_upper, spec.digits)}]，"
         f"{cfg.grid_count} 格{cfg.grid_mode_label}（{gap_text}），"
         f"方向 {cfg.grid_side_label}→{plan.side}，"
         f"每格 {_trim(plan.lot_per_grid, spec.volume_digits)} 手"
         + (f"，总量上限 {_trim(cfg.total_lot_limit, spec.volume_digits)}" if cfg.total_lot_limit else "")
-        + ("；初始建仓开启" if cfg.prefill_enabled else "；不初始建仓")
+        + "；入场挂限价单、成交后由券商止盈出场"
         + (
             "；向上追踪开启"
             + (f"（最多 {cfg.trailing_max} 格）" if cfg.trailing_max else "")
@@ -745,11 +905,13 @@ def plan_detail(plan: GridPlan, cfg: GridConfig, spec: SymbolSpec) -> dict:
         "stop_lower": cfg.stop_lower or None,
         "stop_upper": cfg.stop_upper or None,
         "close_on_stop": cfg.close_on_stop,
-        "prefill_enabled": cfg.prefill_enabled,
+        "entry_mode": "pending",
         "trailing_up": cfg.trailing_up,
         "trailing_max": cfg.trailing_max or None,
         "shift_count": plan.shift_count,
         "levels": list(plan.levels),
+        # 在途入场挂单所在格位：前端事件明细直接展示，不必再去查 runtime
+        "pending_levels": sorted(plan.pending.keys()),
         "digits": spec.digits,
         "volume_step": spec.volume_step,
     }
@@ -772,6 +934,8 @@ def describe_shift(plan: GridPlan, shift: TrailingShift, *, price: float,
         )
     if shift.dropped:
         text += f"；{len(shift.dropped)} 格移出网格已兑现"
+    if shift.dropped_pending:
+        text += f"；{len(shift.dropped_pending)} 张挂单移出网格已撤销"
     return text
 
 
@@ -790,22 +954,38 @@ def shift_detail(plan: GridPlan, shift: TrailingShift, *, price: float) -> dict:
         "stop_upper": plan.stop_upper or None,
         "price": price,
         "dropped_levels": [lv for lv, _ in shift.dropped],
+        "dropped_pending_levels": [lv for lv, _ in shift.dropped_pending],
         "holding_count": plan.holding_count(),
+        "pending_count": plan.pending_count(),
         "grid_count": plan.grid_count,
     }
+
+
+def describe_place(plan: GridPlan, level: int, *, price: float,
+                   spec: SymbolSpec) -> str:
+    """一张网格入场挂单的开单原因。"""
+    ep = entry_price(plan, level)
+    xp = exit_price(plan, level)
+    verb = "买入" if plan.is_long else "卖出"
+    return (
+        f"网格{verb}挂单 · 格位 {level}："
+        f"入场 {_trim(ep, spec.digits)} / 出场 {_trim(xp, spec.digits)}，"
+        f"现价 {_trim(price, spec.digits)}；"
+        f"{_trim(plan.lot_per_grid, spec.volume_digits)} 手，"
+        f"当前持格 {plan.holding_count()}/{plan.grid_count}"
+        f"、在途挂单 {plan.pending_count()}"
+    )
 
 
 def describe_fill(plan: GridPlan, level: int, *, price: float,
                   action: str, spec: SymbolSpec) -> str:
     """一笔网格买入 / 卖出的开单原因。"""
-    buy_line = plan.levels[level] if 0 <= level < len(plan.levels) else 0.0
-    sell_line = (
-        plan.levels[level + 1] if 0 <= level + 1 < len(plan.levels) else 0.0
-    )
+    ep = entry_price(plan, level)
+    xp = exit_price(plan, level)
     verb = "买入" if action.upper() in ("BUY", "GRID_ADD") else "卖出"
     return (
         f"网格{verb} · 格位 {level}："
-        f"买线 {_trim(buy_line, spec.digits)} / 卖线 {_trim(sell_line, spec.digits)}，"
+        f"入场 {_trim(ep, spec.digits)} / 出场 {_trim(xp, spec.digits)}，"
         f"现价 {_trim(price, spec.digits)}；"
         f"{_trim(plan.lot_per_grid, spec.volume_digits)} 手，"
         f"当前持格 {plan.holding_count()}/{plan.grid_count}"
@@ -819,15 +999,34 @@ def fill_detail(plan: GridPlan, level: int, *, price: float,
     return {
         "kind": "grid_fill" if is_buy else "grid_close",
         "level_index": level,
-        "level_price": plan.levels[level] if 0 <= level < len(plan.levels) else None,
-        "exit_price": (
-            plan.levels[level + 1] if 0 <= level + 1 < len(plan.levels) else None
-        ),
+        "level_price": entry_price(plan, level) or None,
+        "exit_price": exit_price(plan, level) or None,
         "side": plan.side,
         "action": "BUY" if is_buy else "SELL",
         "price": price,
         "volume": plan.lot_per_grid,
         "ticket": ticket,
         "holding_count": plan.holding_count(),
+        "pending_count": plan.pending_count(),
+        "grid_count": plan.grid_count,
+    }
+
+
+def place_detail(plan: GridPlan, level: int, *, price: float,
+                 ticket: Optional[int] = None) -> dict:
+    """一张网格入场挂单的结构化明细。"""
+    return {
+        "kind": "grid_fill",
+        "level_index": level,
+        "level_price": entry_price(plan, level) or None,
+        "exit_price": exit_price(plan, level) or None,
+        "side": plan.side,
+        "action": plan.side,
+        "pending": True,
+        "price": price,
+        "volume": plan.lot_per_grid,
+        "ticket": ticket,
+        "holding_count": plan.holding_count(),
+        "pending_count": plan.pending_count(),
         "grid_count": plan.grid_count,
     }

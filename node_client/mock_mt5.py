@@ -57,6 +57,13 @@ class MockMT5Client:
         self.margin_mode = "hedging"
         # 现价触及挂单价时自动成交；置 False 可让测试完全手工驱动成交时点
         self.auto_fill_pending = True
+        # 现价触及持仓的止损 / 止盈时由「券商端」自动平仓；置 False 可让测试
+        # 完全手工驱动出场时点。
+        #
+        # 默认**关闭**：既有测试的出场时点大多由测试自己驱动（改价格 + 投递
+        # 事件），自动平仓会让它们在断言前就少掉仓位。挂单网格的测试显式打开
+        # ——那一套的出场就是券商端止盈干的活，不打开就验不到。
+        self.auto_settle_sl_tp = False
         # 券商要求挂单价离现价的最小点数；0 表示不限制
         self.stops_level = 0
         # 模拟环境没有券商钟面偏移，与 time.time() 同一套 UTC
@@ -172,7 +179,67 @@ class MockMT5Client:
 
     def positions(self) -> list[dict]:
         self._settle_pending()
+        self._settle_sl_tp()
         return [dict(p) for p in self._positions]
+
+    def _settle_sl_tp(self) -> int:
+        """券商端自动平仓：现价触及持仓的止损 / 止盈就把它平掉。
+
+        真实 MT5 里这部分是终端干的，节点只看到「持仓没了」。挂单网格完全依赖
+        这个机制出场——出场价写在挂单的止盈上，成交后到价自动平仓。
+        返回被平掉的笔数。
+        """
+        if not self.auto_settle_sl_tp or not self._positions:
+            return 0
+        hit: list[tuple[dict, str]] = []
+        for pos in self._positions:
+            sym = str(pos.get("symbol") or "").upper()
+            mid = float(self.prices_map.get(sym, 0.0))
+            if mid <= 0:
+                continue
+            quote = self.quotes([sym]).get(sym) or {}
+            bid = float(quote.get("bid") or mid)
+            ask = float(quote.get("ask") or mid)
+            sl = float(pos.get("sl") or 0.0)
+            tp = float(pos.get("tp") or 0.0)
+            is_buy = pos.get("type") == "BUY"
+            if sl > 0:
+                # 多头的止损看 bid（平多单要卖出），空头的止损看 ask
+                px = bid if is_buy else ask
+                if (is_buy and px <= sl) or (not is_buy and px >= sl):
+                    hit.append((pos, "sl"))
+                    continue
+            if tp > 0:
+                px = bid if is_buy else ask
+                if (is_buy and px >= tp) or (not is_buy and px <= tp):
+                    hit.append((pos, "tp"))
+        for pos, which in hit:
+            self._positions = [p for p in self._positions if p["ticket"] != pos["ticket"]]
+            sym = str(pos.get("symbol") or "").upper()
+            mid = float(self.prices_map.get(sym, 0.0))
+            quote = self.quotes([sym]).get(sym) or {}
+            is_buy = pos.get("type") == "BUY"
+            pos["price_current"] = float(
+                (quote.get("bid") or mid) if is_buy else (quote.get("ask") or mid)
+            ) or float(pos.get("price_open") or 0.0)
+            # DEAL_REASON：4=SL / 5=TP
+            self._record_exit(pos, reason=(4 if which == "sl" else 5),
+                              profit=self._pos_profit(pos))
+            logger.info(
+                "MOCK %s hit ticket %s @ %.5f", which.upper(), pos["ticket"],
+                pos["price_current"],
+            )
+        return len(hit)
+
+    def _pos_profit(self, pos: dict) -> float:
+        """持仓浮动盈亏（mock 里按 1 手 1 点 1 美元简化）。"""
+        mid = float(pos.get("price_current") or 0.0)
+        open_px = float(pos.get("price_open") or 0.0)
+        volume = float(pos.get("volume") or 0.0)
+        if mid <= 0 or open_px <= 0:
+            return 0.0
+        diff = (mid - open_px) if pos.get("type") == "BUY" else (open_px - mid)
+        return diff * volume * 100.0
 
     def server_time_offset_sec(self) -> int:
         """模拟终端与 UTC 无偏移。"""
@@ -338,7 +405,11 @@ class MockMT5Client:
         }
 
     def _touched(self, order: dict) -> bool:
-        """现价是否已触及挂单价。"""
+        """现价是否已触及挂单价。
+
+        按中价判断：与本模块既有的撮合口径一致（`_market_price` 只用于挂单
+        校验——校验看的是券商那一侧的报价，撮合看的是价格是否碰到了挂单价）。
+        """
         mid = float(self.prices_map.get(str(order.get("symbol") or "").upper(), 0.0))
         if mid <= 0:
             return False

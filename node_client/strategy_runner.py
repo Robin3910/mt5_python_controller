@@ -96,6 +96,10 @@ MESSAGE_LIMIT = 255
 _TERMINAL_STATUSES = ("done", "failed")
 # 一次停止流程内的「读持仓 -> 平仓」轮次；平仓本身在 mt5_client 层已有瞬时错误重试
 _CLOSE_ALL_ATTEMPTS = 3
+# 网格这一格被券商止损平掉时的原因文案（与 `_grid_exit_reason` 的返回值对应）。
+# 网格终止价写在挂单的止损上，所以价格击穿终止价时是**券商**平的仓，
+# 节点只是事后观察到「这一格没了」。
+_GRID_SL_EXIT_REASON = "网格止损出场"
 # 分档改单被券商拒绝后，按行情保活间隔再试，避免跟着 0.5 秒报价连刷
 _LOT_SLTP_RETRY_SEC = 5.0
 
@@ -323,12 +327,18 @@ class StrategyRunner:
         self._grid_plan: Optional[grid_trading.GridPlan] = None
         self._grid_spec: Optional[grid_trading.SymbolSpec] = None
         self._grid_prev_price: float = 0.0
-        # 平移后越界、但当时没平成的持仓：脱离了格位映射，只能逐轮重试兑现
+        # 平移后越界、但当时没处理掉的持仓 / 挂单：脱离了格位映射，只能逐轮重试
         self._grid_orphans: set[int] = set()
-        # 卖出失败的格位：价格不会再穿越同一条线，不重试这一格就永远卖不掉
-        self._grid_pending_sells: set[int] = set()
         # 已停止网格交易但持仓仍保留（close_on_stop=False）
         self._grid_detached = False
+        # 是否把网格终止价写进挂单的止损。
+        # 「终止即清仓」（close_on_stop=True）时写：成交即带止损，节点断线期间
+        # 网格仍受保护；「停止但保留持仓」（close_on_stop=False）时不写——
+        # 那条配置的意思就是不清仓，挂上止损等于让券商替用户平仓。
+        self._grid_sl_on_position = False
+        # 券商端止损已经平掉某一格：网格终止价被打穿，整网该收了。
+        # 节点断线期间也可能被券商平掉，重连后靠这个标记补上终止流程。
+        self._grid_stop_hit = False
         self._reported_stuck: Optional[tuple[str, int]] = None
         self._mode_reject = self._template_mode_reject()
         # 信号级盈亏控制：仅加仓路径消费；次数是本任务内存态
@@ -737,7 +747,9 @@ class StrategyRunner:
         sub = self._hub.subscribe(
             symbol=self.symbol, magic=self.magic, direction=self.direction,
             hold_when_empty=self.is_grid,
-            track_orders=self.limit_entry,
+            # 网格全程靠挂单活着：必须盯盘上的在途单，才能认出「成交了」与
+            # 「被撤了」的区别，也才能在平移后把旧单撤掉重挂。
+            track_orders=self.limit_entry or self.is_grid,
         )
         self._sub = sub
         try:
@@ -858,7 +870,7 @@ class StrategyRunner:
             if self.risk_sized:
                 await self._risk_rebuild_plan(positions, event.point)
             elif self.is_grid:
-                await self._grid_rebuild(positions)
+                await self._grid_rebuild(positions, list(event.orders))
 
         if self.is_grid:
             if await self._grid_advance(event, positions):
@@ -4248,6 +4260,7 @@ class StrategyRunner:
                 volume_min=_as_float(raw.get("volume_min")),
                 volume_step=_as_float(raw.get("volume_step")),
                 volume_max=_as_float(raw.get("volume_max")),
+                stops_level=int(raw.get("stops_level") or 0),
             )
         return self._grid_spec
 
@@ -4255,8 +4268,9 @@ class StrategyRunner:
         """取当前价。
 
         默认与 MarketHub 的口径一致（多头 bid / 空头 ask），保证 `_grid_prev_price`
-        与事件价在点差的同一侧，否则光是启动那一下就能造出一次假穿越。
-        entry=True 取真实入场价（多头 ask / 空头 bid），用于判断预填会不会开仓即亏。
+        与事件价在点差的同一侧。entry=True 取真实入场价（多头 ask / 空头 bid）——
+        挂单的成交侧就是这个价：BUY LIMIT 必须挂在 ask 下方、SELL LIMIT 必须挂在
+        bid 上方，用错一侧会被券商直接拒单。
         """
         quotes = dict(await self._exec(self._mt5.quotes, [self.symbol]) or {})
         quote = quotes.get(self.symbol) or next(iter(quotes.values()), {})
@@ -4280,7 +4294,7 @@ class StrategyRunner:
         return f"账户为 {mode} 模式，网格需要对冲（hedging）账户才能逐格持仓"
 
     async def _grid_open_first(self) -> bool:
-        """网格启动：建计划 → 等触发价 → 可选初始建仓。"""
+        """网格启动：建计划 → 等触发价 → 挂出入场单。"""
         cfg = self._grid_cfg
         assert cfg is not None
         spec = await self._grid_symbol_spec()
@@ -4305,6 +4319,8 @@ class StrategyRunner:
         self._grid_plan = plan
         self.direction = plan.side
         self.base_volume = plan.lot_per_grid
+        # 「终止即清仓」才把终止价写进挂单当止损；「保留持仓」那条不写
+        self._grid_sl_on_position = bool(cfg.close_on_stop)
 
         price = await self._grid_quote()
         self._grid_prev_price = price
@@ -4329,46 +4345,65 @@ class StrategyRunner:
             return True
 
         plan.triggered = True
-        return await self._grid_do_prefill(price)
+        return await self._grid_place_orders(price)
 
-    async def _grid_do_prefill(self, price: float) -> bool:
-        """按现价上方格位初始建仓（可关闭）。"""
+    async def _grid_place_orders(self, price: float) -> bool:
+        """按当前价把可挂的格位挂成入场限价单。
+
+        挂单口径：每一格在自己的**入场价**上挂一张限价单，成交后由券商端止盈在
+        **出场价**平掉。只有入场价落在现价正确一侧的格位才挂得上（多头的 BUY
+        LIMIT 在现价下方、空头的 SELL LIMIT 在现价上方），另一半等价格走过去
+        之后由下一轮补挂。
+
+        止盈写进挂单：成交即带着出场价，不需要节点抢时间，也省掉一次改单往返。
+        出场价不满足券商的 stops_level 时**不挂这一格**——券商拒的是整张单，
+        挂着止盈却挂不上去比少挂一格糟糕得多。
+        """
         cfg, plan = self._grid_cfg, self._grid_plan
         assert cfg is not None and plan is not None
         spec = await self._grid_symbol_spec()
+        first_run = not self._opened
 
-        if cfg.prefill_enabled and price > 0:
-            # 预填是市价成交，成本是入场价那一侧，按它判断哪些格位还能盈利兑现
-            entry_price = await self._grid_quote(entry=True) or price
-            indices = grid_trading.capped_prefill(
-                plan, cfg, grid_trading.prefill_indices(plan, entry_price),
-            )
-        else:
-            indices = []
-
-        opened_any = False
-        for level in indices:
-            ok = await self._grid_buy_level(level, price, positions=[])
-            if ok:
-                opened_any = True
+        placed: list[int] = []
+        if price > 0:
+            # 用成交侧报价判断挂单方向：BUY LIMIT 必须在 ask 下方、SELL LIMIT 在 bid 上方
+            entry_quote = await self._grid_quote(entry=True) or price
+            candidates = grid_trading.placeable_levels(plan, entry_quote)
+            for level in candidates:
+                if not grid_trading.can_place_more(plan, cfg):
+                    break
+                if level in plan.pending or level in plan.holdings:
+                    continue
+                if not grid_trading.tp_is_sendable(
+                    plan, level, stops_level=spec.stops_level, point=spec.point,
+                ):
+                    logger.info(
+                        "task %s grid L%s skipped: exit price too close to entry",
+                        self.task_id, level,
+                    )
+                    continue
+                if await self._grid_place_level(level, price, positions=[]):
+                    placed.append(level)
 
         self._opened = True
         self._grid_prev_price = price
+        if not first_run:
+            # 补挂是常规动作，不必每轮都上报一次「open」——
+            # 事件流里全是 open 会把真正的开仓信号淹掉。
+            return True
         msg = grid_trading.describe_plan(plan, cfg, spec)
-        if indices:
-            msg = f"网格初始建仓 {len(indices)} 格；{msg}"
-        elif cfg.prefill_enabled:
-            msg = f"网格启动（现价下方无格可预填）；{msg}"
+        if placed:
+            msg = f"网格挂出入场单 {len(placed)} 张；{msg}"
         else:
-            msg = f"网格启动（未开启初始建仓）；{msg}"
+            msg = f"网格启动（当前价位无格可挂）；{msg}"
         await self._emit_progress(
-            "open", phase="opened" if opened_any else "running",
+            "open", phase="opened" if placed else "running",
             message=msg,
             detail={
                 **self._open_detail(),
                 **grid_trading.plan_detail(plan, cfg, spec),
                 "kind": "grid_plan",
-                "prefill_levels": indices,
+                "placed_levels": placed,
             },
         )
         return True
@@ -4386,6 +4421,8 @@ class StrategyRunner:
             "stop_upper": plan.stop_upper or 0.0,
             "side": plan.side,
             "lot_per_grid": plan.lot_per_grid,
+            # 在途挂单的格位映射：断线恢复时靠它认出盘上已有的单，不重复挂
+            "pending_levels": sorted(plan.pending.keys()),
             "total_orders": self.total_orders,
             "total_volume": round(self.total_volume, 4),
             "started_at": self._started_at,
@@ -4417,8 +4454,14 @@ class StrategyRunner:
                 pass
         return True
 
-    async def _grid_rebuild(self, positions: list[dict]) -> None:
-        """恢复后按规则重建计划，优先用 runtime 还原，否则用持仓 / 现价猜测。"""
+    async def _grid_rebuild(self, positions: list[dict],
+                           orders: Optional[list[dict]] = None) -> None:
+        """恢复后按规则重建计划，优先用 runtime 还原，否则用持仓 / 现价猜测。
+
+        在途挂单也要还原：挂单成交后备注会继承到持仓上，所以盘上的挂单与持仓
+        带同一套 G4L{绝对格位号} 备注。还原出来的挂单不再重复挂——重复挂就是
+        双倍手数。
+        """
         cfg = self._grid_cfg
         if cfg is None:
             return
@@ -4437,6 +4480,8 @@ class StrategyRunner:
         self._grid_plan = plan
         self.direction = plan.side
         self.base_volume = plan.lot_per_grid
+        # 与首开同口径：只有「终止即清仓」才把终止价写进挂单当止损
+        self._grid_sl_on_position = bool(cfg.close_on_stop)
 
         price = await self._grid_quote()
         if price <= 0 and positions:
@@ -4462,15 +4507,24 @@ class StrategyRunner:
                     self.task_id, shift.steps, plan.levels[0], plan.levels[-1],
                 )
 
-        for ticket in grid_trading.rebuild_holdings(plan, positions):
-            if not await self._grid_close_orphan(ticket, price, positions):
+        orphans = grid_trading.rebuild_holdings(plan, positions, orders)
+        for ticket in orphans:
+            # 越界的不一定是持仓，也可能是被平移挤出网格的挂单：
+            # 挂单留在盘上随时可能成交成孤儿仓，所以照样要撤
+            if not await self._grid_cancel_orphan(ticket, price, positions):
                 self._grid_orphans.add(ticket)
         if price > 0:
             self._grid_prev_price = price
         # 止损止盈由同 tick 的 _grid_advance 立刻判定，这里只还原状态
+        # 断线期间可能有挂单被撤 / 被错过，补挂一次
+        if plan.triggered:
+            await self._grid_place_orders(price)
 
     async def _grid_advance(self, event: MarketEvent, positions: list[dict]) -> bool:
-        """推进网格：等触发 → 穿越买卖 → 止损止盈。返回 True 表示任务已收口。"""
+        """推进网格：等触发 → 同步成交与出场 → 补挂入场单 → 止损止盈。
+
+        返回 True 表示任务已收口。
+        """
         cfg, plan = self._grid_cfg, self._grid_plan
         if cfg is None or plan is None or not plan.ok:
             return False
@@ -4486,116 +4540,251 @@ class StrategyRunner:
         if price <= 0:
             return False
 
-        # 同步 holdings：外部平仓（止损单等）后清掉已不存在的 ticket
         live_tickets = {
             int(p.get("ticket") or 0) for p in positions if p.get("ticket")
         }
-        stale = [lv for lv, tk in plan.holdings.items() if tk not in live_tickets]
-        for lv in stale:
-            plan.holdings.pop(lv, None)
+        # 在途挂单：网格全程都有单在盘上（可能一张都没有，但必须读，
+        # 否则认不出「成交了」和「被撤了」的区别）
+        resting = {
+            int(o.get("ticket") or 0): o
+            for o in (event.orders or []) if o.get("ticket")
+        }
 
-        # 越界持仓不在格位映射里，没人会再触发它的卖出，只能在这里重试
-        self._grid_orphans &= live_tickets
+        await self._grid_sync_fills(plan, live_tickets, resting, price, positions)
+        await self._grid_sync_exits(plan, live_tickets, price, positions)
+
+        # 券商端止损平掉了某一格：网格终止价被打穿，整网该收了。
+        # 节点断线期间也可能被券商平掉，重连后靠这个标记补上终止流程——
+        # 否则网格会带着已被平掉的仓位继续跑。
+        if self._grid_stop_hit:
+            self._grid_stop_hit = False
+            return await self._grid_terminate("触发网格终止价（券商止损）")
+
+        # 越界的不在格位映射里，没人会再管，只能逐轮重试兑现 / 撤单
+        self._grid_orphans &= live_tickets | set(resting)
         for ticket in sorted(self._grid_orphans):
-            if await self._grid_close_orphan(ticket, price, positions):
+            if await self._grid_cancel_orphan(ticket, price, positions, live_tickets):
                 self._grid_orphans.discard(ticket)
-
-        # 上一轮卖失败的格位同理：价格不会再穿越同一条线，只能逐轮重试
-        self._grid_pending_sells &= set(plan.holdings)
-        for level in sorted(self._grid_pending_sells):
-            await self._grid_sell_level(level, price, positions)
 
         if not plan.triggered:
             if not grid_trading.trigger_reached(cfg, price, self._grid_prev_price):
                 self._grid_prev_price = price
                 return False
             plan.triggered = True
-            await self._grid_do_prefill(price)
+            await self._grid_place_orders(price)
             return False
 
         reason = grid_trading.terminate_reason(plan, price)
         if reason:
             return await self._grid_terminate(reason)
 
-        # 先按当前网格兑现本轮穿越，再平移：突破外沿的那一根 tick 往往同时穿过卖出线，
-        # 反过来先平移会把这一整根的成交连同格位映射一起丢掉
-        prev = self._grid_prev_price or price
-        for crossing in grid_trading.crossings(plan, prev, price):
-            buy_lv = grid_trading.buy_level_for_crossing(plan, crossing)
-            if buy_lv is not None and grid_trading.can_buy_more(plan, cfg):
-                await self._grid_buy_level(buy_lv, price, positions)
-                continue
-            sell_lv = grid_trading.sell_level_for_crossing(plan, crossing)
-            if sell_lv is not None:
-                await self._grid_sell_level(sell_lv, price, positions)
-
+        # 平移在前、补挂在后：平移会把旧格线的挂单撤掉重挂，顺序反了会先按旧
+        # 网格挂一遍再撤掉，白挂白撤。
         await self._grid_apply_trailing(price, positions)
+        # 补挂：价格走过之后，原本挂不了的格位现在可能能挂了
+        await self._grid_place_orders(price)
         self._grid_prev_price = price
         return False
 
-    async def _grid_buy_level(self, level: int, price: float,
-                              positions: list[dict]) -> bool:
-        """买入一格并登记 ticket。"""
+    async def _grid_sync_fills(self, plan: "grid_trading.GridPlan",
+                               live_tickets: set[int], resting: dict[int, dict],
+                               price: float, positions: list[dict]) -> None:
+        """认入场挂单成交：挂单票号变成持仓票号，这一格从「在途」转成「持仓」。
+
+        MT5 的成交持仓票号沿用挂单票号，所以「在途列表里没有、持仓列表里有」
+        就是刚成交。成交瞬间由券商按挂单上的出场价挂着止盈，之后到价自动平仓。
+
+        「在途与持仓里都没有」**不等于**单被撤了：可能是这一轮没采到挂单。
+        所以要回 MT5 查一次确认真没了，才把这格摘掉——宁可漏挂一轮，也不能
+        误判成撤单后把同一格挂出双份手数。
+        """
+        for level in sorted(list(plan.pending.keys())):
+            ticket = plan.pending[level]
+            if ticket in live_tickets:
+                # 成交了：转成持仓
+                plan.pending.pop(level, None)
+                plan.holdings[level] = ticket
+                self.add_count += 1
+                self.total_orders += 1
+                self.total_volume += plan.lot_per_grid
+                spec = await self._grid_symbol_spec()
+                reason = grid_trading.describe_fill(
+                    plan, level, price=price, action="BUY", spec=spec,
+                )
+                logger.info("task %s grid L%s filled: %s", self.task_id, level, reason)
+                await self._emit_progress(
+                    "grid_add", phase="running", positions=positions,
+                    last_order={
+                        "ticket": ticket,
+                        "price": grid_trading.entry_price(plan, level),
+                        "volume": plan.lot_per_grid,
+                    },
+                    message=reason,
+                    detail=grid_trading.fill_detail(
+                        plan, level, price=price, action="BUY", ticket=ticket,
+                    ),
+                )
+                continue
+            if ticket not in resting and not await self._grid_order_alive(ticket):
+                # 回查确认这张单真的不在盘上了（被撤 / 被拒）
+                # 摘掉这格，下一轮补挂
+                plan.pending.pop(level, None)
+                logger.info(
+                    "task %s grid L%s pending gone (cancelled), will re-place",
+                    self.task_id, level,
+                )
+
+    async def _grid_order_alive(self, ticket: int) -> bool:
+        """回查 MT5：这张挂单是否还在盘上。
+
+        事件里的挂单快照可能没采到这张单，靠它判断「被撤了」会误伤——误判的
+    代价是同一格挂出双份手数，所以这里以 MT5 的直接读数为准。
+        """
+        try:
+            rows = await self._exec(self._mt5.pending_orders_by_magic, self.magic)
+        except Exception:  # noqa: BLE001
+            logger.debug("task %s read pending orders failed", self.task_id, exc_info=True)
+            return True   # 读不到就当它还在，宁可少挂也不多挂
+        if rows is None:
+            return True
+        return any(int(o.get("ticket") or 0) == int(ticket) for o in rows)
+
+    async def _grid_sync_exits(self, plan: "grid_trading.GridPlan",
+                               live_tickets: set[int], price: float,
+                               positions: list[dict]) -> None:
+        """认出场：持仓消失 = 券商止盈（或人工平仓）兑现了这一格。
+
+        出场是券商端止盈干的活，节点只是观察到「这一格没了」，于是摘掉映射，
+        这一格重新变成可挂的格位。
+
+        返回 True 表示这一格是被**券商止损**平掉的（网格终止价触发）——
+        那不是一格正常兑现，而是整网该收了，调用方要据此终止网格。
+        """
+        stop_hit = False
+        for level in sorted(list(plan.holdings.keys())):
+            ticket = plan.holdings[level]
+            if ticket in live_tickets:
+                continue
+            plan.holdings.pop(level, None)
+            spec = await self._grid_symbol_spec()
+            reason = grid_trading.describe_fill(
+                plan, level, price=price, action="CLOSE", spec=spec,
+            )
+            exit_reason = await self._grid_exit_reason(ticket)
+            # 只有「网格自己写的止损」被触发才算终止价打穿。
+            # 「停止但保留持仓」那条没写止损，此时的止损出场是客户在 MT5 里
+            # 自己设的——那是单笔的事，不该把整网收掉。
+            if exit_reason == _GRID_SL_EXIT_REASON and self._grid_sl_on_position:
+                stop_hit = True
+            reason = f"{exit_reason}；{reason}"
+            logger.info("task %s grid L%s closed: %s", self.task_id, level, reason)
+            await self._emit_progress(
+                "close_partial", phase="running", positions=positions,
+                last_order={
+                    "ticket": ticket,
+                    "price": grid_trading.exit_price(plan, level),
+                    "volume": plan.lot_per_grid,
+                },
+                message=reason,
+                detail=grid_trading.fill_detail(
+                    plan, level, price=price, action="CLOSE", ticket=ticket,
+                ),
+            )
+        if stop_hit:
+            self._grid_stop_hit = True
+
+    async def _grid_exit_reason(self, ticket: int) -> str:
+        """这一格为什么没的：券商止盈出场 / 人工平仓 / 其它。
+
+        出场成交的 DEAL_REASON 才有这个信息（4=止损 5=止盈 0/1/2=人工）。
+        读不到就只说「网格出场」，不猜。
+        """
+        if not hasattr(self._mt5, "exit_deals_by_magic"):
+            return "网格出场"
+        try:
+            deals = await self._exec(self._mt5.exit_deals_by_magic, self.magic, 0)
+        except Exception:  # noqa: BLE001
+            logger.debug("task %s read exit deals failed", self.task_id, exc_info=True)
+            return "网格出场"
+        for deal in deals or []:
+            if int(deal.get("position_id") or 0) != int(ticket):
+                continue
+            reason = int(deal.get("reason") or 0)
+            if reason == close_reason.REASON_TP:
+                return "网格止盈出场"
+            if reason == close_reason.REASON_SL:
+                return "网格止损出场"
+            if reason in (close_reason.REASON_CLIENT, close_reason.REASON_MOBILE,
+                          close_reason.REASON_WEB):
+                return "人工平仓"
+            return "网格出场"
+        return "网格出场"
+
+    async def _grid_place_level(self, level: int, price: float,
+                                positions: list[dict]) -> bool:
+        """挂出一格的入场限价单（出场价写进止盈，终止价写进止损）。"""
         plan = self._grid_plan
-        if plan is None or level in plan.holdings:
+        if plan is None or level in plan.holdings or level in plan.pending:
             return False
         spec = await self._grid_symbol_spec()
-        reason = grid_trading.describe_fill(
-            plan, level, price=price, action="BUY", spec=spec,
-        )
+        entry = grid_trading.entry_price(plan, level)
+        exit_px = grid_trading.exit_price(plan, level)
+        if entry <= 0 or exit_px <= 0:
+            return False
+        # 终止价也写进挂单：成交即带着止损，节点断线期间网格仍受保护。
+        # 但「停止交易保留持仓」的配置不能写——那一条的语义就是不清仓，
+        # 挂上止损等于让券商替用户平仓，与配置直接冲突。
+        order_sl = None
+        if self._grid_sl_on_position:
+            if grid_trading.sl_is_sendable(
+                plan, level, stops_level=spec.stops_level, point=spec.point,
+            ):
+                order_sl = grid_trading.stop_price(plan)
+            else:
+                logger.info(
+                    "task %s grid L%s without stop loss: stop price unusable for entry %s",
+                    self.task_id, level, entry,
+                )
+        reason = grid_trading.describe_place(plan, level, price=price, spec=spec)
+        # 不吞异常：mt5_client 内部已经对瞬时错误重试了，能冒到这里说明终端
+        # 真的掉了。吞掉的话任务会带着「挂不出一张单」的状态一直空跑，
+        # 服务端还以为它在正常托管。
         res = dict(await self._exec(
-            self._mt5.place_market_order,
-            self.symbol, plan.side, plan.lot_per_grid,
-            None, None, grid_trading.grid_comment(plan.absolute_index(level)), self.magic,
+            self._mt5.place_pending_order,
+            self.symbol, grid_trading.pending_action(plan), plan.lot_per_grid,
+            entry, order_sl, exit_px,
+            grid_trading.grid_comment(plan.absolute_index(level)),
+            self.magic, grid_trading.pending_kind_for(plan),
         ) or {})
-        detail = grid_trading.fill_detail(
-            plan, level, price=price, action="BUY",
-            ticket=res.get("order") or res.get("ticket"),
-        )
+        ticket = int(res.get("order") or res.get("ticket") or 0)
         if not res.get("success"):
             logger.warning(
-                "task %s grid buy L%s failed: %s", self.task_id, level, res.get("error"),
+                "task %s grid place L%s failed: %s", self.task_id, level, res.get("error"),
             )
             await self._emit_progress(
                 "error", phase="running", positions=positions,
-                message=f"网格买入失败：{res.get('error') or 'order failed'}；{reason}",
-                detail={**detail, "error": str(res.get("error") or "")},
+                message=f"网格挂单失败：{res.get('error') or 'pending order failed'}；{reason}",
+                detail={
+                    **grid_trading.place_detail(plan, level, price=price, ticket=ticket),
+                    "error": str(res.get("error") or ""),
+                },
             )
             return False
-        ticket = int(res.get("order") or res.get("ticket") or 0)
         if ticket:
-            plan.holdings[level] = ticket
-        self.add_count += 1
-        self.total_orders += 1
-        self.total_volume += plan.lot_per_grid
-        logger.info("task %s grid buy L%s: %s", self.task_id, level, reason)
+            plan.pending[level] = ticket
+        self._pending_orders += 1
+        logger.info("task %s grid place L%s: %s", self.task_id, level, reason)
         await self._emit_progress(
-            "grid_add", phase="running",
+            "grid_add", phase="running", positions=positions,
             last_order={
                 "ticket": ticket or None,
-                "price": res.get("price"),
+                "price": entry,
                 "volume": plan.lot_per_grid,
             },
             message=reason,
-            detail=detail,
+            detail=grid_trading.place_detail(plan, level, price=price, ticket=ticket),
         )
         return True
-
-    async def _grid_sell_level(self, level: int, price: float,
-                               positions: list[dict]) -> bool:
-        """卖出（平掉）一格；失败的格位登记下来由后续事件重试。"""
-        plan = self._grid_plan
-        if plan is None:
-            return False
-        ticket = plan.holdings.get(level)
-        if not ticket:
-            self._grid_pending_sells.discard(level)
-            return False
-        if await self._grid_close_level(level, int(ticket), price, positions):
-            self._grid_pending_sells.discard(level)
-            return True
-        self._grid_pending_sells.add(level)
-        return False
 
     async def _grid_close_level(self, level: int, ticket: int, price: float,
                                 positions: list[dict], *, note: str = "") -> bool:
@@ -4663,8 +4852,146 @@ class StrategyRunner:
         )
         return ok
 
+    async def _grid_cancel_all_pending(self, *, price: float,
+                                       positions: list[dict]) -> bool:
+        """撤掉网格的全部在途入场挂单。返回是否已确认撤干净。
+
+        网格停止交易时必须做这件事：留在盘上的单随时可能成交，成交出来的持仓
+        没有人管（网格已经不跑了，出场价也不再有人维护）。撤不干净的挂单转成
+        orphans，由后续事件继续重试。
+        """
+        plan = self._grid_plan
+        if plan is None:
+            return True
+        ok = True
+        for level, ticket in list(plan.pending.items()):
+            if not await self._grid_cancel_pending(ticket, price, positions):
+                ok = False
+                self._grid_orphans.add(ticket)
+        plan.pending.clear()
+        return ok
+
+    async def _grid_cancel_pending(self, ticket: int, price: float,
+                                   positions: list[dict]) -> bool:
+        """撤掉一张网格入场挂单。
+
+        撤不掉的（网络抖动、券商拒单）要留在 orphans 里逐轮重试：留在盘上的挂单
+        随时可能成交，而成交后这一格已经没有对应的出场价了。
+        """
+        try:
+            res = dict(await self._exec(self._mt5.cancel_order, int(ticket)) or {})
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "task %s grid cancel pending #%s failed: %s", self.task_id, ticket, e,
+            )
+            return False
+        ok = bool(res.get("success"))
+        logger.info(
+            "task %s grid cancel pending #%s: %s",
+            self.task_id, ticket, "ok" if ok else res.get("error"),
+        )
+        if not ok:
+            await self._emit_progress(
+                "error", phase="running", positions=positions,
+                message=f"网格撤单失败：{res.get('error') or 'cancel failed'}（#{ticket}）",
+                detail={
+                    "kind": "grid_close",
+                    "ticket": ticket,
+                    "price": price,
+                    "pending": True,
+                    "error": str(res.get("error") or ""),
+                },
+            )
+        return ok
+
+    async def _grid_cancel_orphan(self, ticket: int, price: float,
+                                  positions: list[dict],
+                                  live_tickets: set[int]) -> bool:
+        """兑现越界的东西：它已被平移挤出网格，留着没人管。
+
+        持仓走市价平仓，挂单走撤单——两者语义不同，但同样地「不留孤儿在盘上」。
+        """
+        if ticket in live_tickets:
+            return await self._grid_close_orphan(ticket, price, positions)
+        return await self._grid_cancel_pending(ticket, price, positions)
+
+    async def _grid_align_position_sl(self, plan: "grid_trading.GridPlan",
+                                      positions: list[dict],
+                                      price: float = 0.0) -> None:
+        """把网格终止价同步到已成交持仓的止损上。
+
+        挂单上带着止损出场时，止损是**挂单当时**的终止价。网格平移后终止价跟着
+        一起移动，已成交的持仓却还守着老止损价——那样止损会比新网格早触发，
+        或者干脆永远不触发。
+
+        改单前先校验两件事：
+        - 终止价对这一格的方向成立（多头终止价要低于入场价，空头要高于）；
+        - 终止价离**现价**足够远。券商校验持仓止损时看的是现价那一侧，
+          新终止价若已贴着现价会被拒（130 invalid stops），这时宁可留着旧止损，
+          也不改到一半失败把持仓的止损抹掉。
+        """
+        if not self._grid_sl_on_position:
+            return
+        stop = grid_trading.stop_price(plan)
+        if stop <= 0:
+            return
+        spec = await self._grid_symbol_spec()
+        for pos in positions or []:
+            ticket = int(pos.get("ticket") or 0)
+            if ticket <= 0:
+                continue
+            cur_sl = _as_float(pos.get("sl"), 0.0)
+            if abs(cur_sl - stop) <= 1e-9:
+                continue
+            entry = _as_float(pos.get("price_open"), 0.0)
+            if entry <= 0:
+                continue
+            # 方向要对：终止价必须落在这一格的入场价的反方向
+            level = plan.level_of(ticket)
+            if level is None or not grid_trading.sl_is_sendable(
+                plan, level, stops_level=spec.stops_level, point=spec.point,
+            ):
+                logger.info(
+                    "task %s grid #%s keep old stop %s: new stop %s unusable for entry %s",
+                    self.task_id, ticket, cur_sl, stop, entry,
+                )
+                continue
+            # 距离要对：券商按现价校验持仓止损
+            ref = price if price > 0 else entry
+            if not grid_trading.stop_is_sendable(
+                plan, ref, stops_level=spec.stops_level, point=spec.point,
+            ):
+                logger.info(
+                    "task %s grid #%s keep old stop %s: new stop %s too close to %s",
+                    self.task_id, ticket, cur_sl, stop, ref,
+                )
+                continue
+            try:
+                res = dict(await self._exec(
+                    self._mt5.modify_position_sl, ticket, stop, None,
+                ) or {})
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "task %s grid align stop failed #%s: %s", self.task_id, ticket, e,
+                )
+                continue
+            if not res.get("success"):
+                logger.warning(
+                    "task %s grid align stop failed #%s: %s",
+                    self.task_id, ticket, res.get("error"),
+                )
+                continue
+            logger.info(
+                "task %s grid stop aligned #%s: %s -> %s", self.task_id, ticket, cur_sl, stop,
+            )
+
     async def _grid_apply_trailing(self, price: float, positions: list[dict]) -> bool:
-        """向上追踪：价格越过区间外沿时整体平移网格。返回是否发生了平移。"""
+        """向上追踪：价格越过区间外沿时整体平移网格。返回是否发生了平移。
+
+        平移后**在途挂单必须撤掉重挂**：挂单价还是旧格线的价，出场价却已经跟着
+        平移了，两者对不上；留在盘上的单会在旧价位成交，吃的已经不是新格子的
+        差价。所以这里先撤单，再由平移后的补挂流程按新格线重新挂上去。
+        """
         cfg, plan = self._grid_cfg, self._grid_plan
         if cfg is None or plan is None:
             return False
@@ -4673,18 +5000,25 @@ class StrategyRunner:
         if shift is None:
             return False
 
-        # 被挤出网格的格位先兑现：它们的卖出线已不在新区间内，不平就永远卖不掉。
+        # 被挤出网格的格位先兑现：它们的出场价已不在新区间内，不平就永远平不掉。
         # 这里平不掉的转入 orphans，由后续事件重试，避免持仓脱管到任务结束。
         for level, ticket in shift.dropped:
             if not await self._grid_close_level(
                 level, ticket, price, positions, note="网格平移移出",
             ):
                 self._grid_orphans.add(ticket)
+        # 在途挂单全部撤掉：挂单价还是旧格线的价，出场价却已经跟着平移了，
+        # 两者对不上；留在盘上的单会在旧价位成交，吃的已经不是新格子的差价。
+        for level, ticket in list(plan.pending.items()):
+            if not await self._grid_cancel_pending(ticket, price, positions):
+                self._grid_orphans.add(ticket)
+        # 撤完就把在途映射清空——被撤的单不该再占着格位，
+        # 否则补挂时会以为「这一格已经挂上了」而漏挂。
+        plan.pending.clear()
         grid_trading.apply_shift(plan, shift)
-        # 格位号整体平移了，待重试的卖出格位要跟着重新映射（被挤出网格的转 orphans）
-        self._grid_pending_sells = {
-            lv - shift.steps for lv in self._grid_pending_sells
-        } & set(plan.holdings)
+        # 已成交的持仓上带着**旧**终止价的止损，平移后终止价跟着移动了，
+        # 不改的话持仓还守着老止损价，与新网格的终止价对不上。
+        await self._grid_align_position_sl(plan, positions, price)
 
         message = grid_trading.describe_shift(plan, shift, price=price, spec=spec)
         logger.info("task %s %s", self.task_id, message)
@@ -4708,6 +5042,9 @@ class StrategyRunner:
         if cfg is None or cfg.close_on_stop:
             self._stopping = True
             return False
+        # 「停止但保留持仓」：网格不再交易，但盘上的入场挂单必须撤掉——
+        # 留着它们等于网格还在跑：价格回来还会成交出新仓，而配置说了不清仓。
+        await self._grid_cancel_all_pending(price=0.0, positions=[])
         self._grid_detached = True
         held = await self._magic_positions()
         if held:
