@@ -620,11 +620,11 @@ export interface GroupCreatePayload {
 
 /**
  * 认领跟单节点的结果（POST /api/groups/{id}/adopt-followers）。
- * 带单员新建分组时，把「已经跟我」的跟单节点一并带进来。
+ * 带单员新建分组时，为既有跟单节点生成待审申请。
  */
 export interface AdoptFollowersResult {
-  /** 实际新写入的跟单关系 */
-  adopted: { node_id: string; follower_user_id: number; from_group_id: string | null }[]
+  /** 审核通过后才进入生效分组。 */
+  adopted: { node_id: string; follower_user_id: number; from_group_id?: string | null; request_id: number; status: 'pending' }[]
   /** 因已存在或源信息缺失而未写入的条目 */
   skipped: { node_id: string; reason?: string }[]
   /** 参与扫描的来源分组数（不含目标分组自身） */
@@ -2444,7 +2444,7 @@ export interface FollowDetailResponse {
   groups: FollowGroupDetail[]
   /** 不在普通跟单市场内的分组（AI 加仓策略等）：仅提示，不可选 */
   hidden_groups?: FollowGroupDetail[]
-  /** 我可用于跟单的节点（已剔除主节点） */
+  /** 本人已开通的可申请节点，包含主节点。 */
   my_nodes: FollowNodeBrief[]
   /** 近 7 日每日收益（柱状图数据源）；固定 7 日，不随页面统计窗口变化 */
   daily_profit?: FollowDailyProfitPoint[]
@@ -2458,7 +2458,7 @@ export interface FollowMyGroup {
   marketable: boolean
   unmarketable_reason: string | null
   active_task_count: number
-  my_nodes: (FollowNodeBrief & { joined_at: number | null })[]
+  my_nodes: (FollowNodeBrief & { joined_at: number | null; follow_state?: string; leader_paused?: boolean })[]
 }
 
 export interface FollowMyLeader {
@@ -2468,7 +2468,33 @@ export interface FollowMyLeader {
 
 export interface FollowMeResponse {
   following: FollowMyLeader[]
-  summary: { following_count: number; follow_node_count: number }
+  applications: FollowApplication[]
+  summary: { following_count: number; follow_node_count: number; pending_node_count?: number }
+}
+
+export interface FollowApplication {
+  request_id: number
+  group_id: string
+  node_id: string
+  leader_user_id: number
+  follower_user_id: number
+  applicant_name: string
+  leader_name: string
+  name: string | null
+  mt5_login: number | null
+  is_primary: boolean
+  group_name: string | null
+  strategy_name: string | null
+  symbol: string | null
+  status: 'pending' | 'approved' | 'rejected' | 'cancelled'
+  source: 'join' | 'inherit' | 'legacy'
+  reason: string | null
+  created_at: number
+  reviewed_at: number | null
+  available: boolean
+  marketable: boolean
+  leader_paused: boolean
+  follow_state: string | null
 }
 
 export interface FollowJoinPayload {
@@ -2479,6 +2505,7 @@ export interface FollowJoinPayload {
 
 export interface FollowJoinResponse {
   joined: { group_id: string; group_name: string | null; node_ids: string[]; already_node_ids: string[] }[]
+  pending: { request_id: number; group_id: string; node_id: string }[]
   skipped: { node_id: string; group_id?: string; reason: string }[]
   leader_primary_node_id: string | null
 }

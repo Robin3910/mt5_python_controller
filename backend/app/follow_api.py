@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -82,16 +83,12 @@ def _primary_of(all_nodes: list[dict], user_id: int) -> Optional[dict]:
 
 
 def _viewable_follow_nodes(all_nodes: list[dict], principal: Principal) -> list[dict]:
-    """当前用户可用于跟单的节点：自己的、已启用、**非主节点**。
-
-    主节点必须排除 —— 它同时是带单源，保持独立才有「带单 / 跟单」的方向性。
-    服务端在此拦一次，join 时再按 nodes 表兜一次（防旧客户端）。
-    """
+    """只允许使用本人已开通节点，主节点与非主节点均可申请。"""
     return [
         n for n in all_nodes
-        if permissions.normalize_owner(n.get("owner_user_id")) == principal.user_id
+        if permissions.same_owner(n.get("owner_user_id"), permissions.owner_for_new(principal))
         and n.get("enabled", True)
-        and not n.get("is_primary")
+        and n.get("approval_status", "approved") == "approved"
     ]
 
 
@@ -313,7 +310,7 @@ async def get_leader_detail(
         gid = g["group_id"]
         strategy = strategies.get(g.get("strategy_id") or "")
         reason = None if g.get("enabled", True) else "分组已禁用"
-        if strategy is None and g.get("strategy_id"):
+        if (strategy is None or not strategy.get("enabled", True)) and g.get("strategy_id"):
             reason = "已停止接收新信号（策略已停用）"
         if reason is None and leader_paused:
             reason = follow_rules.PAUSED_FOLLOW_REASON
@@ -392,6 +389,9 @@ async def get_leader_detail(
     daily_profit = await deal_stats.daily_net_profit(
         [str(primary.get("node_id"))], days=7,
     )
+    from .connections import manager
+    my_nodes = _viewable_follow_nodes(all_nodes, p)
+    accounts = await asyncio.gather(*(store.get_account(n["node_id"]) for n in my_nodes))
 
     return FollowDetailOut(
         leader={
@@ -415,7 +415,8 @@ async def get_leader_detail(
         },
         groups=detail_groups,
         hidden_groups=hidden_groups,
-        my_nodes=[_node_brief(n) for n in _viewable_follow_nodes(all_nodes, p)],
+        my_nodes=[{**_node_brief(n), "online": manager.is_node_online(n["node_id"]),
+                   "balance": (account or {}).get("balance")} for n, account in zip(my_nodes, accounts)],
         daily_profit=daily_profit,
     )
 
@@ -429,10 +430,14 @@ async def list_my_followings(
     p: Principal = Depends(require_menu(MENU_FOLLOW)),
 ) -> FollowMeResponse:
     """我的跟单：按带单员分组；带单员已撤销能力时标 unmarketable 但仍可自行移出。"""
+    from .follow_requests import list_mine
+    applications = await list_mine(p.user_id)
     followings = await follow_service.list_followings(p.user_id)
     if not followings:
         return FollowMeResponse(
-            following=[], summary={"following_count": 0, "follow_node_count": 0},
+            following=[], applications=applications,
+            summary={"following_count": 0, "follow_node_count": 0,
+                     "pending_node_count": len({r["node_id"] for r in applications if r["status"] == "pending"})},
         )
     all_groups = {g["group_id"]: g for g in await store.all_groups()}
     all_nodes = await store.all_nodes()
@@ -476,8 +481,8 @@ async def list_my_followings(
             groups_out.append({
                 "group_id": gid,
                 "group_name": g.get("name"),
-                "symbol": g.get("strategy_symbol"),
-                "strategy_name": g.get("strategy_name"),
+                "symbol": (strategies.get(g.get("strategy_id")) or {}).get("symbol") or g.get("strategy_symbol"),
+                "strategy_name": (strategies.get(g.get("strategy_id")) or {}).get("name") or g.get("strategy_name"),
                 "marketable": reason is None,
                 "unmarketable_reason": reason,
                 "active_task_count": active_counts.get(gid, 0),
@@ -487,6 +492,8 @@ async def list_my_followings(
                             (n for n in all_nodes if n.get("node_id") == f["node_id"]), None
                         )),
                         "joined_at": f.get("joined_at"),
+                        "follow_state": f.get("follow_state", "running"),
+                        "leader_paused": f.get("leader_paused", False),
                     }
                     for f in sorted(fs, key=lambda x: x.get("joined_at") or 0)
                     if f["node_id"] in node_ids
@@ -516,10 +523,12 @@ async def list_my_followings(
         })
     return FollowMeResponse(
         following=following_out,
+        applications=applications,
         summary={
             "following_count": len(by_leader),
             # 计数也只算带单市场的关系（与 leader 上的口径一致）
             "follow_node_count": market_node_total,
+            "pending_node_count": len({r["node_id"] for r in applications if r["status"] == "pending"}),
         },
     )
 
@@ -534,122 +543,18 @@ async def join_follow(
     store: RedisStore = Depends(get_store),
     p: Principal = Depends(require_menu(MENU_FOLLOW)),
 ) -> FollowJoinResponse:
-    """把当前用户的若干节点加入带单员的若干分组。
-
-    校验顺序固定：带单员有效性 -> 节点归属/主节点 -> 分组可跟单性。
-    越权与不存在一律 4xx，不透露对方名下有什么分组。
-    """
-    user = await user_service.get_user_by_id(body.leader_user_id)
-    if not user or not user.is_active:
-        raise HTTPException(status_code=404, detail="带单员不存在或已停用")
-    principal = await rbac_service.load_principal(store, user.username)
-    if not principal or not permissions.can_be_leader(principal):
-        raise HTTPException(status_code=404, detail="该用户暂未开放带单")
-    # 暂停带单：写侧拦截。必须在**写入前**挡住 —— 只在展示侧过滤的话，
-    # 用户可以绕过 UI 直接调 API 加入已暂停的分组。
-    if getattr(user, "follow_paused", False):
-        raise HTTPException(
-            status_code=400, detail=follow_rules.PAUSED_FOLLOW_REASON,
-        )
-
-    all_nodes = await store.all_nodes()
-    leader_primary = _primary_of(all_nodes, body.leader_user_id)
-    if not leader_primary:
-        raise HTTPException(status_code=404, detail="该带单员尚无主节点")
-
-    # 节点：必须是我的、启用、非主节点
-    my_follow_nodes = {
-        n["node_id"]: n for n in _viewable_follow_nodes(all_nodes, p)
-    }
-    node_ids: list[str] = []
-    skipped: list[dict] = []
-    for nid in body.node_ids:
-        nid = str(nid or "").strip()
-        if not nid or nid in node_ids:
-            continue
-        if nid in my_follow_nodes:
-            node_ids.append(nid)
-        else:
-            reason = follow_rules.node_join_reject_reason(
-                next((n for n in all_nodes if n.get("node_id") == nid), None),
-                existing_group=None,
-                group_id="",
-            )
-            skipped.append({"node_id": nid, "reason": reason or "节点不属于你"})
-    if not node_ids:
-        raise HTTPException(status_code=400, detail="没有可用于跟单的节点（主节点不可跟单）")
-
-    # 分组：必须是该带单员名下、含其主节点、启用、策略启用、且模版在**带单市场**内。
-    # 这是唯一的写入路径 —— 收窄到带单市场后，AI 分组就写不进跟单关系了。
-    all_groups = await store.all_groups()
-    all_strategies = await _strategies_of(all_groups, store)
-    tmpl_map = _template_ids_of(all_strategies)
-    followable = {
-        g["group_id"]: g for g in follow_rules.followable_groups(
-            all_groups, body.leader_user_id, leader_primary.get("node_id"),
-            market=follow_rules.FOLLOW_MARKET_TEMPLATE_IDS,
-            strategy_templates_map=tmpl_map,
-        )
-    }
-    strategies = all_strategies
-    joined: list[dict] = []
-    for gid in body.group_ids:
-        gid = str(gid or "").strip()
-        g = followable.get(gid)
-        if not g:
-            continue  # 不可跟的分组静默跳过，joined 里不出现
-        if g.get("strategy_id") and g["strategy_id"] not in strategies:
-            continue
-        added: list[str] = []
-        already: list[str] = []
-        for nid in node_ids:
-            reason = follow_rules.node_join_reject_reason(
-                my_follow_nodes[nid], existing_group=g, group_id=gid,
-            )
-            if reason == follow_rules.NODE_JOIN_REJECT["duplicate"]:
-                already.append(nid)
-                continue
-            if reason:
-                skipped.append({"node_id": nid, "group_id": gid, "reason": reason})
-                continue
-            ok = await follow_service.add_following(
-                store,
-                group_id=gid, node_id=nid,
-                follower_user_id=p.user_id,
-                leader_user_id=body.leader_user_id,
-                leader_primary_node_id=leader_primary.get("node_id"),
-            )
-            (added if ok else already).append(nid)
-            g.setdefault("followers", []).append({"node_id": nid})
-        if added or already:
-            joined.append({
-                "group_id": gid,
-                "group_name": g.get("name"),
-                "node_ids": added,
-                "already_node_ids": already,
-            })
-
-    if not joined:
-        raise HTTPException(status_code=400, detail="没有可加入的分组（可能已全部跟过或已失效）")
-
-    await persist.audit(
-        p.username, "join_follow", user.username,
-        {
-            "leader_user_id": body.leader_user_id,
-            "leader_primary_node_id": leader_primary.get("node_id"),
-            "group_ids": [j["group_id"] for j in joined],
-            "node_ids": node_ids,
-        },
-        "ok", client_ip(request), category="follow",
-        before=None,
-        after={"joined": joined, "skipped": skipped},
-    )
-    return FollowJoinResponse(
-        joined=joined,
-        skipped=skipped,
-        leader_primary_node_id=leader_primary.get("node_id"),
-    )
-
+    """提交带单申请，审核通过前不建立生效关系。"""
+    from . import follow_requests
+    try:
+        return FollowJoinResponse(**await follow_requests.submit(
+            store, p, body.leader_user_id, body.group_ids, body.node_ids, ip=client_ip(request),
+        ))
+    except HTTPException as exc:
+        await persist.audit(p.username, "follow_request_create", str(body.leader_user_id),
+            {"detail": exc.detail}, "failed", client_ip(request), category="follow")
+        if exc.status_code == 409:
+            raise HTTPException(400, exc.detail) from exc
+        raise
 
 # ---------------------------------------------------------------------------
 # 暂停 / 恢复带单

@@ -16,7 +16,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.redis_store import RedisStore
-from tests.test_helpers import auth_headers, drop_test_db, reset_test_db
+from tests.test_helpers import approve_follow_requests, auth_headers, drop_test_db, reset_test_db
 from tests.test_ai_follow_api import _approve_pending
 
 # 与 conftest 的 MYSQL_DSN 指向同一个库：全部 API 用例共用，必须复用同一个路径
@@ -278,15 +278,16 @@ def test_join_requires_no_leader_capability(client):
         },
         headers=bob_h,
     )
+    approve_follow_requests(client)
     assert r.status_code == 200, r.text
     data = r.json()
     assert data["leader_primary_node_id"] == a_primary
-    assert data["joined"][0]["node_ids"] == [b_follow], "b_follow 应加入成功"
+    assert [row["node_id"] for row in data["pending"]] == [b_follow]
     assert data["skipped"] == [], "不应有跳过项"
 
 
-def test_join_rejects_primary_node(client):
-    """主节点不能用于跟单（主节点是带单源，必须保持独立）。"""
+def test_join_accepts_primary_node(client):
+    """本人的主节点也可提交跟单申请。"""
     admin_h = _login(client, "admin")
     alice, bob, a_primary, a_extra, b_primary, b_follow, a_group = _setup_leader_and_follower(
         client, admin_h,
@@ -301,9 +302,9 @@ def test_join_rejects_primary_node(client):
         },
         headers=bob_h,
     )
-    # 没有可用节点 -> 400
-    assert r.status_code == 400, r.text
-    assert "主节点" in r.json()["detail"]
+    approve_follow_requests(client)
+    assert r.status_code == 200, r.text
+    assert r.json()["pending"][0]["node_id"] == b_primary
 
 
 def test_join_rejects_foreign_node(client):
@@ -322,6 +323,7 @@ def test_join_rejects_foreign_node(client):
         },
         headers=bob_h,
     )
+    approve_follow_requests(client)
     assert r.status_code == 400, r.text
     assert "不属于" in r.json()["detail"] or "没有可用于跟单" in r.json()["detail"]
 
@@ -344,6 +346,7 @@ def test_join_rejects_group_without_leader_primary(client):
         },
         headers=bob_h,
     )
+    approve_follow_requests(client)
     assert r.status_code == 400, r.text  # 没有可加入的分组
 
 
@@ -358,10 +361,12 @@ def test_join_is_idempotent(client):
         "leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [b_follow],
     }
     r1 = client.post("/api/follow/join", json=body, headers=bob_h)
+    approve_follow_requests(client)
     assert r1.status_code == 200, r1.text
     r2 = client.post("/api/follow/join", json=body, headers=bob_h)
+    approve_follow_requests(client)
     assert r2.status_code == 200, r2.text
-    assert r2.json()["joined"][0]["already_node_ids"] == [b_follow], "第二次应为幂等跳过"
+    assert r2.json()["pending"] == [] and r2.json()["skipped"][0]["node_id"] == b_follow
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +391,7 @@ def test_self_follow_own_group_with_own_backup_node(client):
     assert a_group in {g["group_id"] for g in det.json()["groups"]}
     # 可用于跟单的节点里不含主节点，但含自己的备节点
     my_node_ids = {n["node_id"] for n in det.json()["my_nodes"]}
-    assert a_primary not in my_node_ids, "主节点不可用于跟单"
+    assert a_primary in my_node_ids, "本人的主节点允许选择，源分组自有成员由写侧拒绝"
     assert a_extra in my_node_ids, "自己的非主节点应可用于跟单"
 
     # 加入：自己 = 带单员
@@ -395,10 +400,11 @@ def test_self_follow_own_group_with_own_backup_node(client):
         json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [a_extra]},
         headers=alice_h,
     )
+    approve_follow_requests(client)
     assert r.status_code == 200, r.text
     data = r.json()
     assert data["leader_primary_node_id"] == a_primary
-    assert data["joined"][0]["node_ids"] == [a_extra]
+    assert [row["node_id"] for row in data["pending"]] == [a_extra]
     assert data["skipped"] == []
 
     # 我的跟单里能看到这条自跟单
@@ -423,8 +429,9 @@ def test_self_follow_rejects_primary_node(client):
         json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [a_primary]},
         headers=alice_h,
     )
+    approve_follow_requests(client)
     assert r.status_code == 400, r.text
-    assert "主节点" in r.json()["detail"]
+    assert "自有成员" in r.json()["detail"]
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +449,7 @@ def test_my_following_and_leave(client):
         json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [b_follow]},
         headers=bob_h,
     )
+    approve_follow_requests(client)
     me = client.get("/api/follow/me", headers=bob_h)
     assert me.status_code == 200, me.text
     data = me.json()
@@ -476,6 +484,7 @@ def test_leave_works_after_leader_capability_revoked(client):
         json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [b_follow]},
         headers=bob_h,
     )
+    approve_follow_requests(client)
     # 撤销 alice 的能力
     roles = client.get("/api/roles", headers=admin_h).json()
     leader_role = next(r for r in roles if r["code"] == "leader")
@@ -503,7 +512,7 @@ def test_leave_works_after_leader_capability_revoked(client):
 # 详情接口
 # ---------------------------------------------------------------------------
 def test_leader_detail_returns_groups_and_my_nodes(client):
-    """详情：分组含我的已跟标记；我的可跟单节点**排除主节点**。"""
+    """详情：分组含我的已跟标记；我的可跟单节点包含本人的主节点。"""
     admin_h = _login(client, "admin")
     alice, bob, a_primary, a_extra, b_primary, b_follow, a_group = _setup_leader_and_follower(
         client, admin_h,
@@ -514,6 +523,7 @@ def test_leader_detail_returns_groups_and_my_nodes(client):
         json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [b_follow]},
         headers=bob_h,
     )
+    approve_follow_requests(client)
     d = client.get(f"/api/follow/leaders/{alice['id']}", headers=bob_h)
     assert d.status_code == 200, d.text
     data = d.json()
@@ -523,7 +533,7 @@ def test_leader_detail_returns_groups_and_my_nodes(client):
     assert grp["my_follow_node_ids"] == [b_follow], "应标出我已跟的节点"
     my_ids = {n["node_id"] for n in data["my_nodes"]}
     assert b_follow in my_ids
-    assert b_primary not in my_ids, "我的主节点不应出现在可跟单节点里"
+    assert b_primary in my_ids, "本人的主节点可申请跟单"
 
 
 def test_leader_detail_404_for_unknown(client):
@@ -550,6 +560,7 @@ def test_owner_edit_members_keeps_followers(client):
         json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [b_follow]},
         headers=bob_h,
     )
+    approve_follow_requests(client)
     # alice 编辑自己的分组成员（替换为 a_extra）
     alice_h = _login(client, "alice")
     upd = client.patch(
@@ -576,6 +587,7 @@ def test_delete_group_cascades_followings(client):
         json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [b_follow]},
         headers=bob_h,
     )
+    approve_follow_requests(client)
     alice_h = _login(client, "alice")
     d = client.delete(f"/api/groups/{a_group}", headers=alice_h)
     assert d.status_code == 200, d.text
@@ -595,6 +607,7 @@ def test_delete_node_cascades_followings(client):
         json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [b_follow]},
         headers=bob_h,
     )
+    approve_follow_requests(client)
     from tests.test_ai_channel_deletion import online
     online(client, b_follow)
     preview = client.get(f"/api/nodes/{b_follow}/deletion-preview", headers=admin_h).json()
@@ -604,42 +617,20 @@ def test_delete_node_cascades_followings(client):
     assert me.json()["summary"]["follow_node_count"] == 0, "节点删除应清理跟单"
 
 
-def test_set_primary_blocked_by_followings(client):
-    """跟单节点升为主节点 -> **被拒绝**（主节点不可跟单，跟单关系不能被静默清掉）。"""
+def test_set_primary_keeps_existing_followings(client):
+    """升为主节点允许保留既有带单关系。"""
     admin_h = _login(client, "admin")
-    alice, bob, a_primary, a_extra, b_primary, b_follow, a_group = _setup_leader_and_follower(
-        client, admin_h,
-    )
+    alice, bob, a_primary, a_extra, b_primary, b_follow, a_group = _setup_leader_and_follower(client, admin_h)
     bob_h = _login(client, "bob")
-    client.post(
-        "/api/follow/join",
-        json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [b_follow]},
-        headers=bob_h,
-    )
-    me = client.get("/api/follow/me", headers=bob_h)
-    assert me.json()["summary"]["follow_node_count"] == 1
-
-    # 把仍在跟单的 b_follow 设为主节点 -> 应被拒绝
-    p = client.post(
-        f"/api/nodes/{b_follow}/primary", json={"is_primary": True}, headers=admin_h,
-    )
-    assert p.status_code == 409, p.text
-    detail = p.json()["detail"]
-    assert detail["code"] == "primary_switch_following_blocked", detail
-    assert detail["blocking_followings"], "应带跟单明细"
-    assert any(
-        f["group_id"] == a_group for f in detail["blocking_followings"]
-    ), f"明细应含被跟的分组：{detail}"
-
-    # 关键：跟单关系必须**原样保留**，不能被静默清掉
-    me2 = client.get("/api/follow/me", headers=bob_h)
-    assert me2.json()["summary"]["follow_node_count"] == 1, "被拒绝时跟单关系不能丢"
-
-    # 节点也没有被升为主节点
-    nodes = client.get("/api/nodes", headers=admin_h).json()
-    assert not any(
-        n["node_id"] == b_follow and n["is_primary"] for n in nodes
-    ), "被拒绝时不应升为主节点"
+    response = client.post("/api/follow/join", headers=bob_h,
+        json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [b_follow]})
+    assert response.status_code == 200
+    approve_follow_requests(client)
+    promoted = client.post(f"/api/nodes/{b_follow}/primary", headers=admin_h, json={"is_primary": True})
+    assert promoted.status_code == 200, promoted.text
+    assert promoted.json()["is_primary"]
+    mine = client.get("/api/follow/me", headers=bob_h).json()
+    assert mine["summary"]["follow_node_count"] == 1
 
 
 def test_set_primary_allowed_after_leaving_followings(client):
@@ -654,10 +645,7 @@ def test_set_primary_allowed_after_leaving_followings(client):
         json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [b_follow]},
         headers=bob_h,
     )
-    blocked = client.post(
-        f"/api/nodes/{b_follow}/primary", json={"is_primary": True}, headers=admin_h,
-    )
-    assert blocked.status_code == 409, blocked.text
+    approve_follow_requests(client)
 
     # 移出跟单
     leave = client.post(
@@ -692,6 +680,7 @@ def test_set_primary_precheck_endpoint(client):
         json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [b_follow]},
         headers=bob_h,
     )
+    approve_follow_requests(client)
     r1 = client.get(f"/api/nodes/{b_follow}/followings", headers=admin_h)
     assert r1.status_code == 200, r1.text
     body = r1.json()
@@ -711,6 +700,7 @@ def test_set_primary_unaffected_node_no_following(client):
         json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [b_follow]},
         headers=bob_h,
     )
+    approve_follow_requests(client)
     # b_primary 没有跟单 -> 可以升主
     p = client.post(
         f"/api/nodes/{b_primary}/primary", json={"is_primary": True}, headers=admin_h,
@@ -816,6 +806,7 @@ def test_adopt_followers_inherits_across_groups(client):
         json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [b_follow]},
         headers=bob_h,
     )
+    approve_follow_requests(client)
     assert r.status_code == 200, r.text
 
     # alice 换品种 -> 全新分组（分组名按 策略类型-用户名-MT5号-品种 生成，任一维度变化即新组）
@@ -823,6 +814,7 @@ def test_adopt_followers_inherits_across_groups(client):
     new_group = _group_with_primary(client, alice_h, [a_primary], "trend_market-alice-90001-XAUUSD")
 
     resp = _adopt(client, new_group, alice_h)
+    approve_follow_requests(client)
     assert resp.status_code == 200, resp.text
     data = resp.json()
     assert [a["node_id"] for a in data["adopted"]] == [b_follow]
@@ -852,13 +844,16 @@ def test_adopt_followers_is_idempotent(client):
         json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [b_follow]},
         headers=bob_h,
     ).status_code == 200
+    approve_follow_requests(client)
 
     alice_h = _login(client, "alice")
     new_group = _group_with_primary(client, alice_h, [a_primary], "grid-alice-90001-XAUUSD")
     first = _adopt(client, new_group, alice_h).json()
+    approve_follow_requests(client)
     assert len(first["adopted"]) == 1
 
     second = _adopt(client, new_group, alice_h).json()
+    approve_follow_requests(client)
     assert second["adopted"] == [], "第二次不应重复写入"
     assert [s["node_id"] for s in second["skipped"]] == [b_follow]
     assert _followers_of(client, new_group, alice_h) == [b_follow], "关系只有一条"
@@ -876,6 +871,7 @@ def test_adopt_followers_ignores_disabled_source_group(client):
         json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [b_follow]},
         headers=bob_h,
     ).status_code == 200
+    approve_follow_requests(client)
 
     # 禁用源分组
     alice_h = _login(client, "alice")
@@ -884,6 +880,7 @@ def test_adopt_followers_ignores_disabled_source_group(client):
 
     new_group = _group_with_primary(client, alice_h, [a_primary], "trend_market-alice-90001-EURUSD")
     data = _adopt(client, new_group, alice_h).json()
+    approve_follow_requests(client)
     assert [a["node_id"] for a in data["adopted"]] == [b_follow], "禁用不影响继承"
     assert _followers_of(client, new_group, alice_h) == [b_follow]
 
@@ -900,6 +897,7 @@ def test_adopt_followers_rejects_foreign_group(client):
 
     # bob 的角色只有 follow / trading，没有分组管理菜单 —— 菜单权限先挡下来
     assert _adopt(client, new_group, _login(client, "bob")).status_code == 403
+    approve_follow_requests(client)
 
     # 给 bob 分组管理菜单后，他仍不能认领 alice 名下的分组 -> 404，不泄露存在性
     groups_role = _make_role(
@@ -908,9 +906,11 @@ def test_adopt_followers_rejects_foreign_group(client):
     _bind_role(client, admin_h, bob["id"], groups_role["id"])
     bob_h = _login(client, "bob")
     resp = _adopt(client, new_group, bob_h)
+    approve_follow_requests(client)
     assert resp.status_code == 404, resp.text
     # 认领不存在的分组同样 404（不区分「不存在」与「非本人」）
     assert _adopt(client, "grp_missing", bob_h).status_code == 404
+    approve_follow_requests(client)
 
 
 def test_adopt_followers_only_uses_existing_followings(client):
@@ -925,6 +925,7 @@ def test_adopt_followers_only_uses_existing_followings(client):
     new_group = _group_with_primary(client, alice_h, [a_primary], "trend_market-alice-90001-XAUUSD")
 
     data = _adopt(client, new_group, alice_h).json()
+    approve_follow_requests(client)
     assert data["adopted"] == [], "没有任何已存在的跟单关系就不应写入"
     assert _followers_of(client, new_group, alice_h) == []
 
@@ -934,7 +935,9 @@ def test_adopt_followers_only_uses_existing_followings(client):
         json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [b_follow]},
         headers=bob_h,
     ).status_code == 200
+    approve_follow_requests(client)
     assert [a["node_id"] for a in _adopt(client, new_group, alice_h).json()["adopted"]] == [b_follow]
+    approve_follow_requests(client)
 
 
 def test_adopt_followers_dedupes_multi_group_followers(client):
@@ -957,9 +960,11 @@ def test_adopt_followers_dedupes_multi_group_followers(client):
         },
         headers=bob_h,
     ).status_code == 200
+    approve_follow_requests(client)
 
     new_group = _group_with_primary(client, alice_h, [a_primary], "grid-alice-90001-XAUUSD")
     data = _adopt(client, new_group, alice_h).json()
+    approve_follow_requests(client)
     assert len(data["adopted"]) == 1, "同一节点只应继承一次"
     assert data["adopted"][0]["node_id"] == b_follow
     assert _followers_of(client, new_group, alice_h) == [b_follow], "不得产生重复行"
@@ -977,14 +982,16 @@ def test_adopt_followers_skips_group_without_primary(client):
         json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [b_follow]},
         headers=bob_h,
     ).status_code == 200
+    approve_follow_requests(client)
 
     alice_h = _login(client, "alice")
     # 手工分组：只有 a_extra，没有主节点
     manual = _group_with_primary(client, alice_h, [a_extra], "alice-手工组")
     data = _adopt(client, manual, alice_h).json()
-    assert data["scanned_groups"] == 1, "来源只含 a_group（手工组不含主节点，不算来源）"
-    assert [a["from_group_id"] for a in data["adopted"]] == [a_group]
-    assert _followers_of(client, manual, alice_h) == [b_follow]
+    approve_follow_requests(client)
+    assert data["scanned_groups"] == 0
+    assert data["adopted"] == []
+    assert _followers_of(client, manual, alice_h) == []
 
 # ---------------------------------------------------------------------------
 # 跟单市场隔离（带单 tab 只收趋势 / 网格，AI 加仓走【AI 交易】tab）
@@ -1113,6 +1120,7 @@ def test_follow_join_rejects_ai_group(client):
         },
         headers=bob_h,
     )
+    approve_follow_requests(client)
     assert r.status_code == 400, r.text
 
 
@@ -1250,6 +1258,7 @@ def test_my_following_counts_only_follow_market(client):
               "node_ids": [b_follow]},
         headers=bob_h,
     ).status_code == 200
+    approve_follow_requests(client)
     assert client.post(
         "/api/ai-follow/join",
         json={"leader_user_id": alice["id"], "group_ids": [ai_group],
@@ -1282,6 +1291,7 @@ def test_leader_list_my_follow_count_reflects_own_market(client):
               "node_ids": [b_follow]},
         headers=bob_h,
     ).status_code == 200
+    approve_follow_requests(client)
 
     r = client.get("/api/follow/leaders", headers=bob_h)
     leader = next(x for x in r.json()["leaders"] if x["leader_user_id"] == alice["id"])
@@ -1308,10 +1318,12 @@ def test_adopt_followers_does_not_cross_market(client):
         },
         headers=bob_h,
     ).status_code == 200
+    approve_follow_requests(client)
 
     alice_h = _login(client, "alice")
     # 认领继承：AI 分组不应拿到网格分组的跟单节点
     data = _adopt(client, ai_group, alice_h).json()
+    approve_follow_requests(client)
     assert data["adopted"] == [], "AI 分组不得继承网格分组的跟单节点"
     assert _followers_of(client, ai_group, alice_h) == []
 
@@ -1331,6 +1343,7 @@ def test_adopt_followers_still_works_within_same_market(client):
         },
         headers=bob_h,
     ).status_code == 200
+    approve_follow_requests(client)
 
     alice_h = _login(client, "alice")
     # 一个策略只能绑一个分组 -> 另建一个同模版的网格策略来承载新分组
@@ -1339,6 +1352,7 @@ def test_adopt_followers_still_works_within_same_market(client):
         client, alice_h, [a_primary], "alice-网格组2", grid_sid2,
     )
     data = _adopt(client, another, alice_h).json()
+    approve_follow_requests(client)
     assert [a["node_id"] for a in data["adopted"]] == [b_follow], "同市场应继续继承"
 
 

@@ -6,14 +6,6 @@ import api from '@/api/client'
 import type { NodeOut } from '@/api/types'
 import { confirmAction } from '@/utils/confirm'
 
-async function fetchFollowings(nodeId: string): Promise<{
-  count: number
-  items: Array<{ group_id: string; leader_user_id: number | null; joined_at: number | null }>
-}> {
-  const { data } = await api.get(`/api/nodes/${nodeId}/followings`)
-  return data
-}
-
 async function fetchActiveTasks(nodeId: string): Promise<{
   count: number
   node_name: string
@@ -36,23 +28,6 @@ function findCurrentPrimaryId(nodes: NodeOut[], target: NodeOut): string | null 
       && (x.owner_user_id ?? null) === (target.owner_user_id ?? null),
   )
   return sameOwner[0]?.node_id ?? null
-}
-
-async function showFollowingBlocked(f: {
-  count: number
-  node_name: string
-  items: Array<{ group_id: string }>
-}): Promise<void> {
-  const lines = f.items.slice(0, 20).map((x) => `• ${x.group_id}`).join('\n')
-  const more = f.items.length > 20 ? `\n…（共 ${f.items.length} 个）` : ''
-  await ElMessageBox.alert(
-    `节点「${f.node_name}」当前有 ${f.count} 个跟单分组，\n` +
-      '主节点不可用于跟单（主节点需保持独立），主节点切换已被系统拒绝。\n' +
-      '请先到【带单】页把该节点移出跟单，再回来重试。\n\n' +
-      '跟单分组：\n' + lines + more,
-    '主节点切换被拦截',
-    { type: 'warning', confirmButtonText: '我知道了' },
-  )
 }
 
 async function showTasksBlocked(active: {
@@ -88,18 +63,6 @@ export async function setNodePrimary(opts: {
   const n = opts.node
   const next = !n.is_primary
   if (!next && !opts.isAdmin) return
-
-  if (next) {
-    try {
-      const fs = await fetchFollowings(n.node_id)
-      if (fs.count > 0) {
-        await showFollowingBlocked({ count: fs.count, node_name: n.name, items: fs.items })
-        return
-      }
-    } catch (e) {
-      console.warn('primary following precheck failed', e)
-    }
-  }
 
   const victimId = next ? findCurrentPrimaryId(opts.nodes, n) : n.is_primary ? n.node_id : null
   if (victimId) {
@@ -145,18 +108,7 @@ export async function setNodePrimary(opts: {
         })
         return
       }
-      if (code === 'primary_switch_following_blocked') {
-        const d = detail as {
-          node_name?: string
-          blocking_followings?: Array<{ group_id: string; leader_user_id: number | null; joined_at: number | null }>
-        }
-        await showFollowingBlocked({
-          count: d.blocking_followings?.length ?? 0,
-          node_name: d.node_name ?? '',
-          items: d.blocking_followings ?? [],
-        })
-        return
-      }
+
     }
     const text = typeof detail === 'string' ? detail : ''
     ElMessage.error(text || (next ? '设置主节点失败' : '取消主节点失败'))

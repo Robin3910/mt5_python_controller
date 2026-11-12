@@ -244,10 +244,10 @@ class GroupDispatcher:
         空列表视为不限制。
         """
         template_id = (strategy or {}).get("template_id")
+        has_followers = group_rules.has_followers(group)
         group = follow_rules.group_for_follow_dispatch(group, template_id, nodemap)
         base = group_rules.effective_node_ids(group, nodemap, online_ids)
         pause_note: Optional[str] = None
-        has_followers = group_rules.has_followers(group)
         use_ai_pause = follow_rules.pause_flags_for_template(template_id)[1]
         if has_followers or use_ai_pause:
             state = await self._leader_state(group, nodemap)

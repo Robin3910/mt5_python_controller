@@ -153,6 +153,9 @@ async def execute(store, principal, version, expected_ids, *, ip=None, **scope):
                 tombstone.deleted_by_user_id = principal.user_id
                 tombstone.deleted_at = datetime.now()
         await applications.cancel_nodes(session, ids, "系统节点已删除")
+        from .follow_requests import cancel
+        await cancel(session, "系统节点已删除", node_ids=ids, pending_only=False)
+        await cancel(session, "带单源节点已删除", primary_ids=ids)
         source_groups = (await session.scalars(select(AiFollowApplication.group_id).where(
             AiFollowApplication.leader_primary_node_id.in_(ids), AiFollowApplication.status == "pending",
         ))).all()

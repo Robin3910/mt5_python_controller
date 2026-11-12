@@ -37,7 +37,7 @@ export async function fetchMyFollowings(): Promise<FollowMeResponse> {
   return data
 }
 
-/** 加入跟单（不需要 follow_leader 能力 —— 跟单默认人人可做） */
+/** 提交跟单申请；需要带单员审核后生效。 */
 export async function joinFollow(payload: FollowJoinPayload): Promise<FollowJoinResponse> {
   const { data } = await api.post<FollowJoinResponse>('/api/follow/join', payload)
   return data

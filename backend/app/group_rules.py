@@ -225,8 +225,7 @@ def effective_node_ids(group: dict, nodemap: dict[str, dict], online_ids: set[st
 
     参与者 = owner 成员 + 跟单成员（跟单员加入的节点同样接收信号）。
     这里**不过滤主节点**：带单方自己的主节点本来就要接收信号。
-    主节点的排除只发生在「主节点不是某节点的 owner」这一种跟单场景，
-    由 follow_rules.node_is_followable 判定，不是这里的口径。
+    跟单准入由申请审批校验，这里只筛选分发时的节点可达性。
     """
     return [
         nid for nid in participant_ids(group)

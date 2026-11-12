@@ -14,6 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.redis_store import RedisStore
+from tests.test_helpers import approve_follow_requests
 from tests.test_helpers import auth_headers, drop_test_db, reset_test_db
 
 # 与 conftest 的 MYSQL_DSN 指向同一个库：全部 API 用例共用，必须复用同一个路径
@@ -388,6 +389,7 @@ def test_follow_tab_rejects_ai_group(client):
         },
         headers=bob_h,
     )
+    approve_follow_requests(client)
     assert r.status_code == 400, r.text
 
 
@@ -567,6 +569,7 @@ def test_detail_my_follow_node_ids_are_group_scoped(client):
         },
         headers=bob_h,
     )
+    approve_follow_requests(client)
     assert r.status_code == 200, r.text
 
     # AI 详情里，该节点**没有**跟任何 AI 分组
@@ -631,6 +634,7 @@ def test_ai_robot_list_my_follow_count_excludes_follow_market(client):
         },
         headers=bob_h,
     )
+    approve_follow_requests(client)
     assert r.status_code == 200, r.text
 
     # AI 广场：机器人卡片必须是「未跟」
@@ -659,6 +663,7 @@ def test_ai_robot_detail_my_follow_count_excludes_follow_market(client):
         },
         headers=bob_h,
     ).status_code == 200
+    approve_follow_requests(client)
 
     d = client.get(f"/api/ai-follow/robots/{s['host']['id']}", headers=bob_h)
     assert d.status_code == 200, d.text
@@ -683,6 +688,7 @@ def test_ai_my_follow_counts_only_ai_market(client):
               "node_ids": [s["b_follow"]]},
         headers=bob_h,
     ).status_code == 200
+    approve_follow_requests(client)
     assert client.post(
         "/api/ai-follow/join",
         json={"leader_user_id": s["host"]["id"], "group_ids": [s["ai_group_id"]],
@@ -753,6 +759,7 @@ def test_ai_me_excludes_follow_market_groups(client):
         },
         headers=bob_h,
     ).status_code == 200
+    approve_follow_requests(client)
     assert client.post(
         "/api/ai-follow/join",
         json={
@@ -835,6 +842,7 @@ def test_leave_ai_across_market_is_skipped_and_relation_kept(client):
         },
         headers=bob_h,
     ).status_code == 200
+    approve_follow_requests(client)
 
     r = client.post(
         "/api/ai-follow/leave",

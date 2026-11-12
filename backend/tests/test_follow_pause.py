@@ -17,7 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.redis_store import RedisStore
-from tests.test_helpers import auth_headers, drop_test_db, reset_test_db
+from tests.test_helpers import approve_follow_requests, auth_headers, drop_test_db, reset_test_db
 
 _TEST_DB = pathlib.Path(__file__).resolve().parent / "_test_api.db"
 _PWD = "pass1234"
@@ -263,6 +263,7 @@ def test_paused_leader_join_rejected(client):
         },
         headers=bob_h,
     )
+    approve_follow_requests(client)
     assert r.status_code == 200, r.text
 
     # 暂停后再加 -> 拒绝
@@ -288,6 +289,7 @@ def test_paused_leader_join_rejected(client):
         },
         headers=bob2_h,
     )
+    approve_follow_requests(client)
     assert r.status_code == 400, r.text
     assert "暂停" in r.json()["detail"]
 
@@ -312,6 +314,7 @@ def test_paused_ai_robot_join_rejected(client):
         },
         headers=bob_h,
     )
+    approve_follow_requests(client)
     assert r.status_code == 200, r.text
 
     assert client.post(
@@ -359,6 +362,7 @@ def test_pause_keeps_existing_follow_relationship(client):
         },
         headers=bob_h,
     )
+    approve_follow_requests(client)
     assert r.status_code == 200, r.text
 
     assert client.post(
@@ -400,6 +404,8 @@ def test_pause_keeps_existing_ai_follow_relationship(client):
         headers=bob_h,
     )
     assert r.status_code == 200, r.text
+    from tests.test_ai_follow_api import _approve_pending
+    _approve_pending(client, host_h)
 
     assert client.post(
         "/api/ai-follow/pause",

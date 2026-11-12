@@ -241,8 +241,8 @@ async def set_primary_node(
     store: RedisStore = Depends(get_store),
     p: Principal = Depends(require_menu(MENU_HOME, MENU_NODES)),
 ):
-    """按所有者切换唯一主节点；普通带单和旧主节点在途任务返回 409。
-    AI 跟单关系保留，不接受强制绕过参数。
+    """按所有者切换唯一主节点；旧主节点在途任务返回 409。
+    跟单关系保留，不接受强制绕过参数。
     """
     await owned_node_or_404(store, p, node_id)
     try:
@@ -275,7 +275,7 @@ async def list_node_followings(
     store: RedisStore = Depends(get_store),
     p: Principal = Depends(require_menu(MENU_HOME, MENU_NODES)),
 ):
-    """设置主节点前预查阻塞的普通带单关系，AI 关系不计入。"""
+    """读取该节点的普通带单关系；跟单关系不阻止主节点切换。"""
     await owned_node_or_404(store, p, node_id)
     items = await node_service.list_followings_for_node(node_id)
     node = await store.get_node(node_id) or {}

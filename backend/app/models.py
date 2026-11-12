@@ -1380,6 +1380,8 @@ class FollowGroupDetail(BaseModel):
     name: Optional[str] = None
     symbol: Optional[str] = None
     strategy_id: Optional[str] = None
+    strategy_name: Optional[str] = None
+    strategy_template: Optional[str] = None
     dispatch_mode: str = "sync"
     signal_concurrent_enabled: bool = False
     trend_risk_enabled: bool = False
@@ -1427,6 +1429,7 @@ class FollowJoinRequest(BaseModel):
 
 class FollowJoinResponse(BaseModel):
     joined: list[dict] = Field(default_factory=list)
+    pending: list[dict] = Field(default_factory=list)
     skipped: list[dict] = Field(default_factory=list)
     leader_primary_node_id: Optional[str] = None
 
@@ -1470,6 +1473,7 @@ class FollowMyGroup(BaseModel):
     group_name: Optional[str] = None
     symbol: Optional[str] = None
     strategy_id: Optional[str] = None
+    strategy_name: Optional[str] = None
     marketable: bool = True
     unmarketable_reason: Optional[str] = None
     active_task_count: int = 0
@@ -1483,6 +1487,7 @@ class FollowMyLeader(BaseModel):
 
 class FollowMeResponse(BaseModel):
     following: list[FollowMyLeader] = Field(default_factory=list)
+    applications: list[dict] = Field(default_factory=list)
     summary: dict = Field(default_factory=dict)
 
 

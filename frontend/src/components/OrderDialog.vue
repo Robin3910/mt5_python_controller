@@ -148,6 +148,12 @@ watch(
       gridSizing.data = null
       gridSizing.error = ''
       gridSizing.loading = false
+      // 止盈价 → 盈亏比联动：重置手动标记与市价入场价快照
+      rrManualEdited.value = false
+      marketEntrySnapshot.value =
+        props.currentMid != null && isFinite(props.currentMid) && props.currentMid > 0
+          ? props.currentMid
+          : null
       // 加载分组详情 + 策略模版 + 已有策略参数
       await loadGroupAndStrategy()
     }
@@ -226,11 +232,6 @@ const GRID_MODE_OPTIONS: readonly { value: GridMode; label: string }[] = [
   { value: 'geometric', label: '等比' },
 ]
 
-const GRID_SIDE_OPTIONS: readonly { value: GridSide; label: string }[] = [
-  { value: 'long', label: '只做多' },
-  { value: 'short', label: '只做空' },
-]
-
 const isGrid = computed(() => strategyRef.value === 'grid')
 const isLimit = computed(() => strategyRef.value === 'trend_limit')
 const isMarket = computed(() => strategyRef.value === 'trend_market')
@@ -257,32 +258,6 @@ const canTriggerGridStrategy = computed(
     !validateGridParams(),
 )
 
-/** 试算结果摘要文本（用于 UI hint） */
-const gridSizingHint = computed(() => {
-  const d = gridSizing.data
-  if (!d?.ready) return ''
-  const pl = Number(gridParams.price_lower) || 0
-  const pu = Number(gridParams.price_upper) || 0
-  const step =
-    d.grid_count > 0 ? (pu - pl) / d.grid_count : 0
-  const spacing =
-    d.grid_count > 0
-      ? gridParams.grid_mode === 'geometric'
-        ? `${(((pu / pl) ** (1 / d.grid_count) - 1) * 100).toFixed(4)}%`
-        : trimNum(step)
-      : '0'
-  return `M1 ATR ${trimNum(d.atr, 5)} → 间距 ≈ ${spacing}，` +
-    `${gridParams.grid_mode === 'geometric' ? '等比' : '等差'} ${d.grid_count} 格，` +
-    `每格 ${trimNum(d.lot_per_grid, 4)} 手；满仓约 ${trimNum(d.worst_loss, 2)} 美元`
-})
-
-/** 复刻 StrategyFormModal.trimNum：小数尾巴清零 */
-function trimNum(n: number, digits = 5): string {
-  if (!isFinite(n)) return '0'
-  const s = n.toFixed(digits)
-  return s.includes('.') ? s.replace(/0+$/, '').replace(/\.$/, '') : s
-}
-
 // ── 策略参数编辑（市价开仓专用） ──
 /**
  * 策略模版列表（从 hub 加载）
@@ -301,21 +276,230 @@ const riskParams = reactive({
   breakeven_times: 0, // 保本触发倍数（0=不启用）
 })
 
-/** 网格策略参数编辑状态（仅网格模式时渲染） */
+/* ── 止盈价 → 盈亏比联动 ──
+ * 客户一旦填了止盈价（选填），就等于指定了目标价，实际盈亏比不再等于配置里的
+ * rr_ratio —— 策略是按 rr_ratio 铺阶梯止盈的（最远一档 = 入场价 ± 止损距离 ×
+ * rr_ratio），所以这里自动反算「实际盈亏比」并同步进 riskParams.rr_ratio，
+ * 让阶梯最后一档正好落在客户填的止盈价上。
+ *
+ *   限价：入场价 = 挂单价（entry_price）
+ *   市价：入场价 = 客户填写止盈/止损那一刻的报价快照
+ *         （不跟随行情跳动，否则盈亏比会一直抖）
+ */
+const marketEntrySnapshot = ref<number | null>(null)
+
+/** 数字取值：空串 / NaN / null 一律按 0 处理 */
+function toNum(v: unknown): number {
+  const n = Number(v)
+  return isFinite(n) ? n : 0
+}
+
+/** 推算用的入场价 */
+const entryPriceForRr = computed<number | null>(() => {
+  if (isLimit.value) {
+    const ep = toNum(localForm.entry_price)
+    return ep > 0 ? ep : null
+  }
+  if (isMarket.value) {
+    // 用客户编辑那一刻的报价快照（不跟随行情跳动，否则盈亏比会一直抖）
+    return marketEntrySnapshot.value
+  }
+  return null
+})
+
+/** 反算出的实际盈亏比（止盈距离 ÷ 止损距离）；算不出来时为 null */
+const impliedRr = computed<number | null>(() => {
+  const tp = toNum(localForm.tp)
+  const sl = toNum(localForm.sl)
+  const entry = entryPriceForRr.value
+  if (tp <= 0 || sl <= 0 || entry == null) return null
+  const risk = Math.abs(entry - sl)
+  const reward = Math.abs(tp - entry)
+  if (risk <= 0 || reward <= 0) return null
+  return Math.round((reward / risk) * 100) / 100
+})
+
+/** 推算出的开仓方向（与 derivedAction 同口径，只是用推算入场价） */
+const rrDirection = computed<'BUY' | 'SELL' | null>(() => {
+  const sl = toNum(localForm.sl)
+  const entry = entryPriceForRr.value
+  if (sl <= 0 || entry == null) return null
+  return sl < entry ? 'BUY' : 'SELL'
+})
+
+/** 止盈方向是否与开仓方向一致（做多要止盈在入场价上方，做空相反） */
+const tpSideOk = computed<boolean | null>(() => {
+  const tp = toNum(localForm.tp)
+  const entry = entryPriceForRr.value
+  const dir = rrDirection.value
+  if (tp <= 0 || entry == null || dir == null) return null
+  return dir === 'BUY' ? tp > entry : tp < entry
+})
+
+/** 客户手动改过盈亏比 → 不再自动覆盖，只提示差异 */
+const rrManualEdited = ref(false)
+
+/** 把反算出的实际盈亏比同步进策略参数 */
+function syncRrFromTp(): void {
+  const rr = impliedRr.value
+  if (rr == null || rrManualEdited.value) return
+  if (Math.abs(toNum(riskParams.rr_ratio) - rr) < 0.005) return
+  riskParams.rr_ratio = rr
+}
+
+/** 客户点了「改用 1:x」：覆盖手动值，回到止盈价反算出来的盈亏比 */
+function applyImpliedRr(): void {
+  const rr = impliedRr.value
+  if (rr == null) return
+  riskParams.rr_ratio = rr
+  rrManualEdited.value = false
+}
+
+// 客户改止盈价 → 视为重新指定目标价，允许再次自动同步
+watch(
+  () => localForm.tp,
+  () => {
+    rrManualEdited.value = false
+  },
+)
+
+// 客户改止盈/止损/挂单价 → 刷新市价入场价快照 + 同步盈亏比
+watch(
+  () => [localForm.tp, localForm.sl, localForm.entry_price],
+  () => {
+    if (isMarket.value) {
+      const mid = props.currentMid
+      marketEntrySnapshot.value = mid != null && isFinite(mid) && mid > 0 ? mid : marketEntrySnapshot.value
+    }
+    syncRrFromTp()
+  },
+)
+
+// 报价后到时补一次快照（客户还没动价格，先有个入场价可用）
+watch(
+  () => props.currentMid,
+  (mid) => {
+    if (!isMarket.value) return
+    if (marketEntrySnapshot.value != null) return
+    if (mid != null && isFinite(mid) && mid > 0) marketEntrySnapshot.value = mid
+  },
+)
+
+/** 盈亏比提示（info / warn / error 三种） */
+interface RrNotice {
+  kind: 'info' | 'warn' | 'error'
+  text: string
+  /** 可选的「一键改用」动作 */
+  actionLabel?: string
+  action?: () => void
+}
+
+const rrNotice = computed<RrNotice | null>(() => {
+  if (isGrid.value) return null
+  const tp = toNum(localForm.tp)
+  if (tp <= 0) return null
+  const sl = toNum(localForm.sl)
+  if (sl <= 0) {
+    return { kind: 'warn', text: '已填写止盈价，请再填写止损价以便推算实际盈亏比。' }
+  }
+  const entry = entryPriceForRr.value
+  if (entry == null) {
+    return {
+      kind: 'warn',
+      text: isMarket.value
+        ? '已填写止盈价，等待当前报价以推算实际盈亏比。'
+        : '已填写止盈价，请填写挂单价以便推算实际盈亏比。',
+    }
+  }
+  if (tpSideOk.value === false) {
+    const dir = rrDirection.value === 'BUY' ? '做多' : '做空'
+    return {
+      kind: 'error',
+      text: `止盈价 ${tp} 与开仓方向（${dir}）相反，无法构成有效盈亏比，请检查止盈价。`,
+    }
+  }
+  const rr = impliedRr.value
+  if (rr == null) return null
+  const cur = toNum(riskParams.rr_ratio)
+  const basis = `（入场价 ${entry}、止损价 ${sl}）`
+  if (Math.abs(cur - rr) < 0.01) {
+    return rrManualEdited.value
+      ? { kind: 'info', text: `当前盈亏比 1:${cur} 与止盈价推算结果一致 ${basis}。` }
+      : { kind: 'info', text: `已按止盈价自动同步盈亏比为 1:${rr} ${basis}。` }
+  }
+  return {
+    kind: 'warn',
+    text: `止盈价对应的实际盈亏比为 1:${rr} ${basis}，与当前配置的 1:${cur} 不一致；提交后将按 1:${cur} 铺阶梯止盈。`,
+    actionLabel: `改用 1:${rr}`,
+    action: applyImpliedRr,
+  }
+})
+
+/**
+ * 网格策略参数编辑状态（仅网格模式时渲染）。
+ *
+ * 网格方向**不再由客户选择**，而是由「止损价 vs 价格区间」自动推导：
+ *   止损价 < 区间下限 → 只做多（止损落在区间下方）
+ *   止损价 > 区间上限 → 只做空（止损落在区间上方）
+ * 两者之间（落在区间内）属于非法几何，保存时会被后端判为未设。
+ *
+ * 因此这里只保留一个 stop_price（客户填的止损价），后端需要的
+ * stop_lower / stop_upper 由 derivedGridSide 映射得到。
+ */
 const gridParams = reactive({
   price_lower: 0 as number | null,      // 区间下限
   price_upper: 0 as number | null,      // 区间上限
-  grid_count: 10,                        // 网格数量
+  grid_count: 10,                        // 网格数量（自动试算回写）
   grid_mode: 'arithmetic' as GridMode,  // 网格模式
-  grid_side: 'long' as GridSide,        // 网格方向
-  lot_per_grid: 0.01,                  // 每格手数
+  lot_per_grid: 0.01,                  // 每格手数（自动试算回写）
   trigger_price: 0 as number | null,    // 触发价（默认 0 = 立即启动）
-  stop_lower: 0 as number | null,       // 止损价（多头止损 / 空头止盈）
-  stop_upper: 0 as number | null,       // 止盈价（多头止盈 / 空头止损）
+  stop_price: 0 as number | null,       // 止损价（客户填写；方向由此推导）
+  take_profit: 0 as number | null,      // 止盈价（界面上不展示，沿用存量规则的值）
   trailing_up: false,                  // 向上追踪（默认关闭）
   trailing_max: 0,                      // 最大平移格数（0=不限）
   max_allow_loss: 0,                     // 最大可接受亏损
 })
+
+/**
+ * 网格方向（自动推导）：止损价在区间下方=只做多，在区间上方=只做空。
+ * 无法判定时返回 null（止损价未填 / 区间非法 / 止损落在区间内）。
+ */
+const derivedGridSide = computed<GridSide | null>(() => {
+  const pl = Number(gridParams.price_lower) || 0
+  const pu = Number(gridParams.price_upper) || 0
+  const sp = Number(gridParams.stop_price) || 0
+  if (!(pl > 0) || !(pu > pl) || !(sp > 0)) return null
+  if (sp < pl) return 'long'
+  if (sp > pu) return 'short'
+  return null
+})
+
+/** 推导方向的中文标签（只读展示用，客户不再选择） */
+const derivedGridSideLabel = computed(() => {
+  const side = derivedGridSide.value
+  if (side === 'long') return '多头'
+  if (side === 'short') return '空头'
+  return '待判定'
+})
+
+/**
+ * 映射到后端规则的终止价：
+ *   只做多 → stop_lower = 止损价（区间下方），stop_upper = 止盈价
+ *   只做空 → stop_upper = 止损价（区间上方），stop_lower = 止盈价
+ * 与 node_client/grid_trading.terminate_reason 的方向语义一致。
+ * 止盈价界面已隐藏，新策略为 0（不设）；存量规则加载时保留原值，避免改一次参数
+ * 就把原来的止盈抹掉。
+ */
+const gridStopLower = computed(() =>
+  derivedGridSide.value === 'long'
+    ? Number(gridParams.stop_price) || 0
+    : Number(gridParams.take_profit) || 0,
+)
+const gridStopUpper = computed(() =>
+  derivedGridSide.value === 'short'
+    ? Number(gridParams.stop_price) || 0
+    : Number(gridParams.take_profit) || 0,
+)
 
 /** 网格试算结果（自动反算 grid_count / lot_per_grid） */
 const gridSizing = reactive<{
@@ -439,11 +623,18 @@ async function loadGroupAndStrategy(): Promise<void> {
           gridParams.price_upper = gridRule.price_upper ?? 0
           gridParams.grid_count = gridRule.grid_count ?? 10
           gridParams.grid_mode = gridRule.grid_mode ?? 'arithmetic'
-          gridParams.grid_side = gridRule.grid_side ?? 'long'
           gridParams.lot_per_grid = gridRule.lot_per_grid ?? 0.01
           gridParams.trigger_price = gridRule.trigger_price ?? 0
-          gridParams.stop_lower = gridRule.stop_lower ?? 0
-          gridParams.stop_upper = gridRule.stop_upper ?? 0
+          // 存量规则的 stop_lower / stop_upper 按方向还原成「止损价 + 止盈价」：
+          // 只做多 → stop_lower 是止损、stop_upper 是止盈；只做空 → 反之。
+          gridParams.stop_price =
+            gridRule.grid_side === 'short'
+              ? gridRule.stop_upper ?? 0
+              : gridRule.stop_lower ?? 0
+          gridParams.take_profit =
+            gridRule.grid_side === 'short'
+              ? gridRule.stop_lower ?? 0
+              : gridRule.stop_upper ?? 0
           gridParams.trailing_up = gridRule.trailing_up ?? false
           gridParams.trailing_max = gridRule.trailing_max ?? 0
           gridParams.max_allow_loss = gridRule.assist_max_loss ?? 0
@@ -469,11 +660,12 @@ async function loadGroupAndStrategy(): Promise<void> {
           gridParams.price_upper = gRule.price_upper ?? 0
           gridParams.grid_count = gRule.grid_count ?? 10
           gridParams.grid_mode = gRule.grid_mode ?? 'arithmetic'
-          gridParams.grid_side = gRule.grid_side ?? 'long'
           gridParams.lot_per_grid = gRule.lot_per_grid ?? 0.01
           gridParams.trigger_price = gRule.trigger_price ?? 0
-          gridParams.stop_lower = gRule.stop_lower ?? 0
-          gridParams.stop_upper = gRule.stop_upper ?? 0
+          gridParams.stop_price =
+            gRule.grid_side === 'short' ? gRule.stop_upper ?? 0 : gRule.stop_lower ?? 0
+          gridParams.take_profit =
+            gRule.grid_side === 'short' ? gRule.stop_lower ?? 0 : gRule.stop_upper ?? 0
           gridParams.trailing_up = gRule.trailing_up ?? false
           gridParams.trailing_max = gRule.trailing_max ?? 0
           gridParams.max_allow_loss = gRule.assist_max_loss ?? 0
@@ -488,9 +680,9 @@ async function loadGroupAndStrategy(): Promise<void> {
 // ── 网格试算 ──
 //
 // 用法：
-//   1. 监听 gridParams 关键字段 + symbol，debounce 500ms 自动调 scheduleGridSizing
-//   2. UI 上有显式「重算」按钮调 runGridSizing
-//   3. 试算成功 → gridSizing.data.ready 时把 grid_count / lot_per_grid 写回 gridParams
+//   1. 监听 gridParams 关键字段 + symbol，debounce 500ms 自动调 triggerGridSizing
+//   2. 试算成功 → gridSizing.data.ready 时把 grid_count / lot_per_grid 写回 gridParams
+//   3. 试算过程与结果**不对客户展示**（UI 已隐藏），只用于算出网格数量与每格手数
 //
 // 写死的入参（不暴露在弹窗里）：
 //   - timeframe = 'M1'
@@ -498,9 +690,9 @@ async function loadGroupAndStrategy(): Promise<void> {
 //   - spacing   = 0（让后端按 ATR×倍数算）
 //   - total_lot_limit = 0（不限）
 //
-// 行情源：用户已设置的主节点（is_primary && enabled）。没有则置灰 + 提示。
+// 行情源：用户已设置的主节点（is_primary && enabled）。没有则无法试算。
 
-/** 试算前置条件：symbol 合法 + 区间合法 + 至少一个止损/止盈 + 最大亏损 > 0 */
+/** 试算前置条件：symbol 合法 + 区间合法 + 止损价能判定方向 + 最大亏损 > 0 */
 const canRunGridSizing = computed(() => {
   if (!isGrid.value) return false
   const sym = (localForm.symbol || '').trim()
@@ -509,32 +701,27 @@ const canRunGridSizing = computed(() => {
   const pu = Number(gridParams.price_upper) || 0
   if (!(pl > 0) || !(pu > pl)) return false
   if (!(Number(gridParams.max_allow_loss) > 0)) return false
-  // 多头：必须填止损价；空头：必须填止盈价
-  const sl = Number(gridParams.stop_lower) || 0
-  const tp = Number(gridParams.stop_upper) || 0
-  if (gridParams.grid_side === 'long' && !(sl > 0)) return false
-  if (gridParams.grid_side === 'short' && !(tp > 0)) return false
+  // 止损价必须落在区间外（下方=只做多 / 上方=只做空），否则方向无法判定
+  if (!derivedGridSide.value) return false
   return true
 })
 
-/** 显式重算（来自「重算」按钮）：立即发请求 */
-function runGridSizing(): void {
-  void triggerGridSizing(false)
-}
-
-/** 自动试算（debounce 后调用）：带 8s 超时 */
-function triggerGridSizing(withDebounce: boolean): void {
-  if (!isGrid.value) return
-  if (!canRunGridSizing.value) return
+/** 自动试算（debounce 后调用）：带 8s 超时。返回 Promise 以便保存前等待结果。 */
+function triggerGridSizing(withDebounce: boolean): Promise<void> {
+  if (!isGrid.value) return Promise.resolve()
+  if (!canRunGridSizing.value) return Promise.resolve()
   if (withDebounce) {
     if (gridSizingTimer) clearTimeout(gridSizingTimer)
-    gridSizingTimer = setTimeout(() => void triggerGridSizing(false), 500)
-    return
+    return new Promise<void>((resolve) => {
+      gridSizingTimer = setTimeout(() => {
+        void triggerGridSizing(false).finally(() => resolve())
+      }, 500)
+    })
   }
   const node = primaryNode.value
   if (!node) {
     gridSizing.error = '未找到主节点，无法试算；请在「节点」页设置主节点'
-    return
+    return Promise.resolve()
   }
   // 取消上一笔未完成的请求
   if (gridSizingAbort) gridSizingAbort.abort()
@@ -544,7 +731,7 @@ function triggerGridSizing(withDebounce: boolean): void {
   gridSizing.loading = true
   gridSizing.error = ''
   const symbol = (localForm.symbol || '').trim().toUpperCase()
-  hub
+  return hub
     .fetchGridSizing(node.node_id, symbol, {
       timeframe: 'M1',
       atr_mult: 0.6,
@@ -553,9 +740,9 @@ function triggerGridSizing(withDebounce: boolean): void {
       price_lower: Number(gridParams.price_lower) || 0,
       price_upper: Number(gridParams.price_upper) || 0,
       grid_mode: gridParams.grid_mode,
-      grid_side: gridParams.grid_side,
-      stop_lower: Number(gridParams.stop_lower) || 0,
-      stop_upper: Number(gridParams.stop_upper) || 0,
+      grid_side: derivedGridSide.value ?? 'long',
+      stop_lower: gridStopLower.value,
+      stop_upper: gridStopUpper.value,
       max_loss: Number(gridParams.max_allow_loss) || 0,
       close_on_stop: true,
       trailing_up: gridParams.trailing_up,
@@ -567,13 +754,19 @@ function triggerGridSizing(withDebounce: boolean): void {
       // 试算结果：覆盖 grid_count / lot_per_grid
       if (data.ready) {
         if (data.grid_count >= 2) gridParams.grid_count = data.grid_count
-        if (data.lot_per_grid > 0) gridParams.lot_per_grid = data.lot_per_grid
+        if (data.lot_per_grid > 0) {
+          gridParams.lot_per_grid = data.lot_per_grid
+        } else {
+          // 手数算不出来时**不要沿用上一轮的值**（可能是按更大的亏损预算算的），
+          // 落到最小手数，保证保存下来的策略不会超出用户给的亏损上限。
+          gridParams.lot_per_grid = 0.01
+        }
       }
       if (!data.ready || data.lot_per_grid === 0) {
         const msgs = (data.warnings || [])
           .filter((w) => w.level === 'warn')
           .map((w) => w.message)
-        gridSizing.error = msgs[0] || '该品种试算失败，可手动填写网格参数'
+        gridSizing.error = msgs[0] || '该品种试算失败，请检查区间与止损价后重试'
       } else {
         gridSizing.error = ''
       }
@@ -596,11 +789,9 @@ watch(
     gridParams.price_lower,
     gridParams.price_upper,
     gridParams.grid_mode,
-    gridParams.grid_side,
     gridParams.trailing_up,
     gridParams.max_allow_loss,
-    gridParams.stop_lower,
-    gridParams.stop_upper,
+    gridParams.stop_price,
     (localForm.symbol || '').trim().toUpperCase(),
   ],
   () => {
@@ -670,7 +861,14 @@ function validateGridParams(): string | null {
   if (!(pu > pl)) return '区间上限须大于下限'
   if (gridParams.grid_count < 2 || gridParams.grid_count > 200) return '网格数量需在 2 ~ 200'
   if (!GRID_MODE_OPTIONS.some((o) => o.value === gridParams.grid_mode)) return '网格模式非法'
-  if (!GRID_SIDE_OPTIONS.some((o) => o.value === gridParams.grid_side)) return '网格方向非法'
+  // 止损价决定方向：落在区间下方=只做多，落在区间上方=只做空
+  if (!derivedGridSide.value) {
+    const sp = Number(gridParams.stop_price) || 0
+    if (!(sp > 0)) return '止损价需大于 0'
+    return '止损价须在价格区间之外：低于区间下限为只做多，高于区间上限为只做空'
+  }
+  // 每格手数由自动试算按最大亏损反推，所以最大亏损必须填
+  if (!(gridParams.max_allow_loss > 0)) return '以损定量需大于 0'
   if (!(gridParams.lot_per_grid > 0)) return '每格手数需大于 0'
   return null
 }
@@ -686,21 +884,22 @@ function buildGridStrategyPayload(): StrategyRule[] | null {
   }
   // 用模版3第一条网格规则的骨架，只替换网格相关字段
   const base = tpl3.rules[0]
+  const side = derivedGridSide.value ?? 'long'
   return [
     {
       ...base,
       type: 4,
       status: 1,
-      action: gridParams.grid_side === 'short' ? 'SELL' : 'BUY',
+      action: side === 'short' ? 'SELL' : 'BUY',
       price_lower: gridParams.price_lower ?? 0,
       price_upper: gridParams.price_upper ?? 0,
       grid_count: gridParams.grid_count,
       grid_mode: gridParams.grid_mode,
-      grid_side: gridParams.grid_side,
+      grid_side: side,
       lot_per_grid: gridParams.lot_per_grid,
       trigger_price: gridParams.trigger_price ?? 0,
-      stop_lower: gridParams.stop_lower ?? 0,
-      stop_upper: gridParams.stop_upper ?? 0,
+      stop_lower: gridStopLower.value,
+      stop_upper: gridStopUpper.value,
       close_on_stop: true,
       trailing_up: gridParams.trailing_up,
       trailing_max: gridParams.trailing_max,
@@ -831,6 +1030,8 @@ async function saveRiskStrategyOnly(): Promise<void> {
 async function saveGridStrategyOnly(): Promise<void> {
   const gpErr = validateGridParams()
   if (gpErr) { lastStrategyError.value = gpErr; return }
+  // 保存前等一次试算落定，保证写入的 grid_count / lot_per_grid 是按当前参数算出来的
+  await triggerGridSizing(false)
   const rules = buildGridStrategyPayload()
   if (!rules) return
   if (!currentGroup.value) {
@@ -911,6 +1112,7 @@ async function syncFollowersIntoGroup(): Promise<void> {
   try {
     const r = await hub.adoptFollowers(groupId)
     if (r.adopted?.length) {
+      ElMessage.info(`已生成 ${r.adopted.length} 条跟单申请，审核通过后生效`)
       const refreshed = (await hub.listGroups()).find((g) => g.group_id === groupId)
       if (refreshed) currentGroup.value = refreshed
     }
@@ -1038,6 +1240,10 @@ async function triggerMarketStrategy(): Promise<void> {
       group_ids: [currentGroup.value.group_id],
     }
     if (localForm.sl && localForm.sl > 0) payload.stop_loss = localForm.sl
+    // 止盈价：随信号带过去（后台会落库）。以损定量策略实际是按 rr_ratio 铺
+    // 阶梯止盈的，所以前端已经把 rr_ratio 同步成「止盈价反算出来的盈亏比」，
+    // 最远一档正好落在客户填的止盈价上。
+    if (localForm.tp && localForm.tp > 0) payload.take_profit = localForm.tp
     if (isLimit.value && localForm.entry_price && localForm.entry_price > 0) {
       payload.entry_price = localForm.entry_price
     }
@@ -1065,6 +1271,8 @@ async function triggerMarketStrategy(): Promise<void> {
 async function triggerGridStrategy(): Promise<void> {
   const gpErr = validateGridParams()
   if (gpErr) { lastStrategyError.value = gpErr; return }
+  // 保存前等一次试算落定，保证写入的 grid_count / lot_per_grid 是按当前参数算出来的
+  await triggerGridSizing(false)
   const rules = buildGridStrategyPayload()
   if (!rules) return
   if (!currentGroup.value) {
@@ -1137,7 +1345,7 @@ async function triggerGridStrategy(): Promise<void> {
     // 网格信号：方向由策略内的 grid_side 决定；payload 顶层 action 必须是大写
     // （后端 console_api._build_manual_signal 会校验 BUY / SELL / CLOSE）
     // 顶层 volume 后端会强制要求显式传入（每格手数已在 strategy.rules 内由策略链路消费）
-    const gridAction: ManualSignalAction = gridParams.grid_side === 'short' ? 'SELL' : 'BUY'
+    const gridAction: ManualSignalAction = derivedGridSide.value === 'short' ? 'SELL' : 'BUY'
     const payload: ManualSignalPayload = {
       symbol: (localForm.symbol || '').trim().toUpperCase(),
       action: gridAction,
@@ -1163,7 +1371,13 @@ async function triggerGridStrategy(): Promise<void> {
 /** 父级调用 strategy 回写结果 */
 function onStrategyResult(res: ManualSignalResult): void {
   strategySubmitting.value = false
-  reportStrategyResult(res, derivedAction.value ?? 'BUY', (localForm.symbol || '').toUpperCase())
+  // 网格方向由止损价推导（derivedAction 只覆盖市价/限价），这里按模式取正确的动作
+  const action: ManualAction = isGrid.value
+    ? derivedGridSide.value === 'short'
+      ? 'SELL'
+      : 'BUY'
+    : derivedAction.value ?? 'BUY'
+  reportStrategyResult(res, action, (localForm.symbol || '').toUpperCase())
 }
 /** 父级调用 strategy 回写错误 */
 function onStrategyError(message: string): void {
@@ -1330,10 +1544,23 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
         <div class="od-row">
           <div class="od-row-text">
             <div class="od-row-label">盈亏比</div>
-            <div class="od-row-sub">止盈与止损的比例，如 1:2.5</div>
+            <div class="od-row-sub">
+              止盈与止损的比例，如 1:2.5
+              <template v-if="impliedRr != null">
+                <br /><span class="od-sub-strong">按止盈价推算为 1:{{ impliedRr }}</span>
+              </template>
+            </div>
           </div>
           <div class="od-row-control od-input-affix">
-            <input v-model.number="riskParams.rr_ratio" class="od-input" type="number" min="0" step="0.1" placeholder="如 2.5" />
+            <input
+              v-model.number="riskParams.rr_ratio"
+              class="od-input"
+              type="number"
+              min="0"
+              step="0.1"
+              placeholder="如 2.5"
+              @input="rrManualEdited = true"
+            />
           </div>
         </div>
         <div class="od-row">
@@ -1373,39 +1600,42 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
             <input v-model.number="localForm.sl" class="od-input" type="number" step="0.0001" min="0" placeholder="如 4140.00" />
           </div>
         </div>
+
+        <!-- 止盈价提示：填了止盈价后，实际盈亏比已被止盈价「重新定义」，
+             这里明确告诉客户当前用的是哪一个，以及不一致时可一键改用。 -->
+        <div v-if="rrNotice" class="od-notice" :class="`is-${rrNotice.kind}`">
+          <span class="od-notice-text">{{ rrNotice.text }}</span>
+          <button
+            v-if="rrNotice.action && rrNotice.actionLabel"
+            type="button"
+            class="od-notice-btn"
+            @click="rrNotice.action()"
+          >
+            {{ rrNotice.actionLabel }}
+          </button>
+        </div>
       </template>
 
-      <!-- 网格策略参数（完整版） -->
+      <!-- 网格策略参数 -->
       <template v-if="isGrid">
         <div class="od-section" style="border-left-color: #22C55E">智能吸筹参数</div>
-        <!-- 网格方向（按钮组：多 / 空） -->
+        <!-- 网格方向：由「止损价 vs 价格区间」自动判定，只读展示，客户不需要选 -->
         <div class="od-row">
           <div class="od-row-text">
             <div class="od-row-label">网格方向</div>
-            <div class="od-row-sub">只做多=跌买涨卖；只做空=涨卖跌买</div>
+            <div class="od-row-sub">由止损价位置自动判定</div>
           </div>
-          <div class="od-row-control">
-            <div class="od-seg" role="radiogroup" aria-label="网格方向">
-              <button
-                v-for="o in GRID_SIDE_OPTIONS"
-                :key="o.value"
-                type="button"
-                role="radio"
-                class="od-seg-btn"
-                :class="{ active: gridParams.grid_side === o.value }"
-                :aria-checked="gridParams.grid_side === o.value"
-                @click="gridParams.grid_side = o.value"
-              >
-                {{ o.label }}
-              </button>
-            </div>
+          <div class="od-row-control readonly" :class="{ muted: !derivedGridSide }">
+            {{ derivedGridSideLabel }}
           </div>
         </div>
         <!-- 区间下限 -->
         <div class="od-row">
           <div class="od-row-text">
             <div class="od-row-label">价格下限<span class="od-req">必选</span></div>
-            <div class="od-row-sub">吸筹买入价格的下限</div>
+            <div class="od-row-sub">
+              {{ derivedGridSide === 'short' ? '网格的最低价位（跌到此处平空兑现）' : '网格的最低价位（跌到此处开始买入）' }}
+            </div>
           </div>
           <div class="od-row-control od-input-affix">
             <input v-model.number="gridParams.price_lower" class="od-input" type="number" step="0.0001" min="0" placeholder="如 3000.00" />
@@ -1416,21 +1646,25 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
         <div class="od-row">
           <div class="od-row-text">
             <div class="od-row-label">价格上限<span class="od-req">必选</span></div>
-            <div class="od-row-sub">吸筹买入价格的上限</div>
+            <div class="od-row-sub">
+              {{ derivedGridSide === 'short' ? '网格的最高价位（涨到此处开空）' : '网格的最高价位（涨到此处卖出兑现）' }}
+            </div>
           </div>
           <div class="od-row-control od-input-affix">
             <input v-model.number="gridParams.price_upper" class="od-input" type="number" step="0.0001" min="0" placeholder="如 3300.00" />
             <span class="od-affix">USD</span>
           </div>
         </div>
-        <!-- 止损价（方向相关标签） -->
+        <!-- 止损价（决定网格方向：低于区间下限=只做多，高于区间上限=只做空） -->
         <div class="od-row">
           <div class="od-row-text">
             <div class="od-row-label">止损价格<span class="od-req">必选</span></div>
-            <div class="od-row-sub">开仓后挂出的止损价格</div>
+            <div class="od-row-sub">
+              填在价格区间下方 → 只做多；填在价格区间上方 → 只做空
+            </div>
           </div>
           <div class="od-row-control od-input-affix">
-            <input v-model.number="gridParams.stop_lower" class="od-input" type="number" step="0.0001" min="0" placeholder="如 2950.00" />
+            <input v-model.number="gridParams.stop_price" class="od-input" type="number" step="0.0001" min="0" placeholder="如 2950.00" />
             <span class="od-affix">USD</span>
           </div>
         </div>
@@ -1447,135 +1681,15 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
           </div>
         </div>
 
-        <!-- 网格试算提示（自动覆盖网格数量 / 每格手数） -->
-        <div class="od-grid-sizing">
-          <div class="od-grid-sizing-row">
-            <span v-if="gridSizing.loading" class="od-grid-sizing-state">试算中…</span>
-            <span v-else-if="!primaryNode" class="od-grid-sizing-state muted">未设置主节点，无法自动试算</span>
-            <span v-else-if="!canRunGridSizing" class="od-grid-sizing-state muted">填好区间/止损/最大亏损后自动试算</span>
-            <!-- <span v-else-if="gridSizing.error" class="od-grid-sizing-state warn">{{ gridSizing.error }}</span> -->
-            <span v-else-if="gridSizing.data?.ready" class="od-grid-sizing-state ok">{{ gridSizingHint }}</span>
-            <span v-else class="od-grid-sizing-state muted">等待试算…</span>
-            <button
-              type="button"
-              class="od-grid-sizing-reload"
-              :disabled="!canRunGridSizing || gridSizing.loading || !primaryNode"
-              title="重新试算"
-              aria-label="重新试算"
-              @click="runGridSizing"
-            >
-              <span class="od-reload" :class="{ spin: gridSizing.loading }">↻</span>
-            </button>
-          </div>
-          <ul v-if="gridSizing.data?.warnings?.length" class="od-grid-sizing-warns">
-            <li v-for="(w, i) in gridSizing.data.warnings" :key="i" :class="`lvl-${w.level}`">
-              {{ w.message }}
-            </li>
-          </ul>
+        <!--
+          自动试算（后台执行，结果回写 grid_count / lot_per_grid）：
+          按需求不对客户展示 —— 网格数量 / 网格模式 / 每格手数 / 初始建仓 /
+          触发价 / 止盈价 / 向上追踪 全部隐藏，参数由试算与默认值给出。
+          试算失败时给一行提示，避免客户以为手数是按「以损定量」算出来的。
+        -->
+        <div v-if="gridSizing.error" class="od-error">
+          {{ gridSizing.error }}
         </div>
-
-        <!-- 网格数量 -->
-        <div class="od-row">
-          <div class="od-row-text">
-            <div class="od-row-label required">网格数量（必填）</div>
-            <div class="od-row-sub">2 ~ 200 格</div>
-          </div>
-          <div class="od-row-control od-input-affix">
-            <input v-model.number="gridParams.grid_count" class="od-input" type="number" step="1" min="2" max="200" placeholder="如 10" />
-            <span class="od-affix">格</span>
-          </div>
-        </div>
-        <!-- 网格模式（按钮组：等差 / 等比） -->
-        <div class="od-row">
-          <div class="od-row-text">
-            <div class="od-row-label">网格模式</div>
-            <div class="od-row-sub">等差=间距相等；等比=涨跌幅相等</div>
-          </div>
-          <div class="od-row-control">
-            <div class="od-seg" role="radiogroup" aria-label="网格模式">
-              <button
-                v-for="o in GRID_MODE_OPTIONS"
-                :key="o.value"
-                type="button"
-                role="radio"
-                class="od-seg-btn"
-                :class="{ active: gridParams.grid_mode === o.value }"
-                :aria-checked="gridParams.grid_mode === o.value"
-                @click="gridParams.grid_mode = o.value"
-              >
-                {{ o.label }}
-              </button>
-            </div>
-          </div>
-        </div>
-
-        <!-- 每格手数 -->
-        <div class="od-row">
-          <div class="od-row-text">
-            <div class="od-row-label required">每格手数（必填）</div>
-            <div class="od-row-sub">每格下单的手数</div>
-          </div>
-          <div class="od-row-control od-input-affix">
-            <input v-model.number="gridParams.lot_per_grid" class="od-input" type="number" step="0.01" min="0.01" placeholder="如 0.01" />
-            <span class="od-affix">手</span>
-          </div>
-        </div>
-
-        <!-- 触发价 -->
-        <div class="od-row">
-          <div class="od-row-text">
-            <div class="od-row-label">触发价</div>
-            <div class="od-row-sub">0 = 立即启动</div>
-          </div>
-          <div class="od-row-control od-input-affix">
-            <input v-model.number="gridParams.trigger_price" class="od-input" type="number" step="0.0001" min="0" placeholder="如 3100.00" />
-            <span class="od-affix">USD</span>
-          </div>
-        </div>
-
-        <!-- 止盈价（方向相关标签） -->
-        <div class="od-row">
-          <div class="od-row-text">
-            <div class="od-row-label">{{ gridParams.grid_side === 'short' ? '止盈价（空头）' : '止盈价（多头）' }}</div>
-            <div class="od-row-sub">{{ gridParams.grid_side === 'short' ? '涨破区间上限触发' : '涨破区间上限触发' }}</div>
-          </div>
-          <div class="od-row-control od-input-affix">
-            <input v-model.number="gridParams.stop_upper" class="od-input" type="number" step="0.0001" min="0" placeholder="如 3350.00" />
-            <span class="od-affix">USD</span>
-          </div>
-        </div>
-        <!-- 向上追踪 -->
-        <div class="od-row">
-          <div class="od-row-text">
-            <div class="od-row-label">向上追踪</div>
-            <div class="od-row-sub">突破区间外沿时网格整体平移</div>
-          </div>
-          <div class="od-row-control">
-            <button
-              type="button"
-              class="pf-switch"
-              :class="{ on: gridParams.trailing_up }"
-              role="switch"
-              :aria-checked="gridParams.trailing_up"
-              aria-label="向上追踪"
-              @click="gridParams.trailing_up = !gridParams.trailing_up"
-            ></button>
-          </div>
-        </div>
-        <!-- 最大平移格数（仅追踪开启时显示） -->
-        <template v-if="gridParams.trailing_up">
-          <div class="od-row">
-            <div class="od-row-text">
-              <div class="od-row-label">最大平移格数</div>
-              <div class="od-row-sub">0 = 不限</div>
-            </div>
-            <div class="od-row-control od-input-affix">
-              <input v-model.number="gridParams.trailing_max" class="od-input" type="number" step="1" min="0" placeholder="如 3" />
-              <span class="od-affix">格</span>
-            </div>
-          </div>
-        </template>
-
       </template>
 
       <!-- 策略参数（市价/限价均走 strategy 模型，按 riskParams 实时计算手数）
@@ -2154,6 +2268,51 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
   border-radius: 8px;
   line-height: 1.5;
 }
+
+/* ── 止盈价 → 盈亏比联动提示 ── */
+.od-notice {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 11px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  line-height: 1.5;
+}
+.od-notice-text { flex: 1 1 auto; min-width: 0; }
+.od-notice.is-info {
+  color: #93c5fd;
+  background: rgba(37, 99, 235, 0.12);
+  border: 1px solid rgba(37, 99, 235, 0.35);
+}
+.od-notice.is-warn {
+  color: #fbbf24;
+  background: rgba(245, 158, 11, 0.12);
+  border: 1px solid rgba(245, 158, 11, 0.4);
+}
+.od-notice.is-error {
+  color: #f87171;
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid rgba(239, 68, 68, 0.4);
+}
+.od-notice-btn {
+  flex: 0 0 auto;
+  height: 24px;
+  padding: 0 10px;
+  border-radius: 6px;
+  border: 1px solid currentColor;
+  background: transparent;
+  color: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.od-notice-btn:hover { background: rgba(255, 255, 255, 0.08); }
+
+/* 盈亏比副说明里的推算值 */
+.od-sub-strong { color: var(--pf-text); font-weight: 600; }
 
 /* Loading dots animation */
 .od-loading {

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // 带单（跟单）页：左侧带单员列表，右侧「我的跟单」
 // 能力语义：跟单默认人人可做；带单员由管理员授予 follow_leader 角色能力产生。
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElDialog, ElMessage, ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/dialog/style/css'
 import 'element-plus/es/components/message/style/css'
@@ -16,6 +16,8 @@ import { useAuthStore } from '@/stores/auth'
 import { useHubStore } from '@/stores/hub'
 import api from '@/api/client'
 import type { FollowChannelsOut, Position } from '@/api/types'
+import type { FollowApplication } from '@/api/types'
+import { trackFollowUi } from '@/utils/followAudit'
 
 /** 「我的跟单」聚合后的单条节点（已按 leader 聚合、按 node_id 去重） */
 interface MyFollowedNode {
@@ -52,8 +54,14 @@ const detail = ref<FollowDetailResponse | null>(null)
 const detailLoading = ref(false)
 const selectedNodes = ref<string[]>([])
 const submitting = ref(false)
+const pickerOpen = ref(false)
+const pickerQuery = ref('')
+const pickerPanel = ref<HTMLElement | null>(null)
+let pickerTrigger: HTMLElement | null = null
+let followTimer: number | undefined
+let pickerSearchTimer: number | undefined
 
-const mine = ref<FollowMeResponse>({ following: [], summary: { following_count: 0, follow_node_count: 0 } })
+const mine = ref<FollowMeResponse>({ following: [], applications: [], summary: { following_count: 0, follow_node_count: 0 } })
 const mineLoading = ref(false)
 
 // 已选分组集合（分组列表已移除，保留以备将来可选分组场景）
@@ -214,6 +222,11 @@ async function loadMine() {
   }
 }
 
+function refreshFollow(): void {
+  trackFollowUi('refresh')
+  void Promise.all([loadLeaders(), loadMine()])
+}
+
 async function openLeader(l: FollowLeaderSummary) {
   detailLoading.value = true
   selectedNodes.value = []
@@ -234,16 +247,10 @@ const allSelectableGroupIds = computed<string[]>(() =>
     .map((g) => g.group_id),
 )
 
-/**
- * 节点当前是否**可勾选**。
- *
- * 三个不可选原因：带单员已暂停（整体收口）、已跟随该带单员、主节点（后端已剔除）。
- * 模板里到处要用这个判定（高亮 / 置灰 / aria 状态 / tabindex），
- * 各写一遍很容易走偏 —— 统一收敛到这里。
- */
+// 至少一个可跟分组尚未生效或待审时，节点仍可补申请。
 function isNodeSelectable(id: string): boolean {
   if (detailPaused.value) return false
-  return !alreadyFollowingNodeIds.value.has(id)
+  return allSelectableGroupIds.value.some(gid => !occupiedPairs.value.has(`${gid}:${id}`))
 }
 
 function toggleNode(id: string) {
@@ -252,6 +259,7 @@ function toggleNode(id: string) {
   const s = new Set(selectedNodes.value)
   s.has(id) ? s.delete(id) : s.add(id)
   selectedNodes.value = [...s]
+  trackFollowUi('select_nodes', { node_ids: selectedNodes.value })
 }
 
 async function submitJoin() {
@@ -271,19 +279,21 @@ async function submitJoin() {
       group_ids: allSelectableGroupIds.value,
       node_ids: selectedNodes.value,
     })
-    const added = res.joined.reduce((n, j) => n + j.node_ids.length, 0)
-    const already = res.joined.reduce((n, j) => n + j.already_node_ids.length, 0)
-    let msg = `已加入 ${added} 个节点到 ${res.joined.length} 个分组`
-    if (already) msg += `，${already} 个节点此前已跟`
-    if (res.skipped.length) {
-      msg += `；${res.skipped.length} 项被跳过：${res.skipped[0].reason}`
+    const nodes = new Set(res.pending.map(row => row.node_id)).size
+    if (!res.pending.length) {
+      ElMessage.warning(res.skipped[0]?.reason || '所选节点已跟随或等待审核')
+      await loadMine()
+      selectedNodes.value = []
+      return
     }
-    ElMessage.success(msg)
+    ElMessage.success(`已提交 ${nodes} 个节点的 ${res.pending.length} 条跟单申请，等待带单员审核`)
+    if (res.skipped.length) ElMessage.warning(`${res.skipped.length} 项已跳过：${res.skipped[0]?.reason}`)
     selectedNodes.value = []
     pickerOpen.value = false
+    pickerTrigger?.focus()
+    pageMode.value = 'mine'
+    mineTab.value = 'list'
     await Promise.all([loadLeaders(), loadMine()])
-    // 手机端收起详情并跳到「我的跟单」：成功结果在那里才看得见。
-    // 桌面端保持留在详情页（detail 仍非空，原有行为不变）。
     if (mobileSheetOpen.value) afterJoinSettled()
   } catch (e) {
     ElMessage.error(errText(e, '加入跟单失败'))
@@ -393,16 +403,75 @@ const myFollowing = computed<MyFollowingEntry[]>(() =>
   }),
 )
 
-/** 详情卡片打开时："我已跟随该 leader 的节点"集合 → 用于置灰 */
-const alreadyFollowingNodeIds = computed<Set<string>>(() => {
-  const ids = new Set<string>()
-  if (!detail.value) return ids
-  const entry = myFollowing.value.find(
-    (x) => x.leader.leader_user_id === detail.value!.leader.leader_user_id,
-  )
-  if (entry) for (const n of entry.nodes) ids.add(n.node_id)
-  return ids
+const occupiedPairs = computed(() => {
+  const pairs = new Set<string>()
+  for (const leader of mine.value.following) {
+    for (const group of leader.groups) for (const node of group.my_nodes) pairs.add(`${group.group_id}:${node.node_id}`)
+  }
+  for (const row of mine.value.applications || []) if (row.status === 'pending') pairs.add(`${row.group_id}:${row.node_id}`)
+  return pairs
 })
+const pickerNodes = computed(() => {
+  const needle = pickerQuery.value.trim().toLowerCase()
+  return (detail.value?.my_nodes || []).filter(node =>
+    !needle || [node.name, node.node_id, node.mt5_login].some(value => String(value ?? '').toLowerCase().includes(needle)))
+})
+const pickerSymbols = computed(() => [...new Set((detail.value?.groups || []).filter(group => group.selectable).map(group => group.symbol).filter(Boolean))])
+const applicationGroups = computed(() => {
+  const grouped = new Map<number, { leader_user_id: number; leader_name: string; nodes: FollowApplication[] }>()
+  for (const row of mine.value.applications || []) {
+    if (row.status === 'approved') continue
+    if (!grouped.has(row.leader_user_id)) grouped.set(row.leader_user_id, { leader_user_id: row.leader_user_id, leader_name: row.leader_name, nodes: [] })
+    grouped.get(row.leader_user_id)!.nodes.push(row)
+  }
+  return [...grouped.values()]
+})
+const recordLeaderCount = computed(() => new Set([...myFollowing.value.map(row => row.leader.leader_user_id), ...applicationGroups.value.map(row => row.leader_user_id)]).size)
+const applicationOnlyGroups = computed(() => applicationGroups.value.filter(group => !myFollowing.value.some(entry => entry.leader.leader_user_id === group.leader_user_id)))
+
+function applicationRows(leaderId: number): FollowApplication[] {
+  return applicationGroups.value.find(group => group.leader_user_id === leaderId)?.nodes || []
+}
+
+function nodeFollowHint(id: string): string {
+  const groups = allSelectableGroupIds.value
+  if (!groups.length) return '暂无可申请分组'
+  const occupied = groups.filter(gid => occupiedPairs.value.has(`${gid}:${id}`)).length
+  if (!occupied) return ''
+  return occupied === groups.length ? '已跟随 / 待审核' : '部分已跟随 / 待审核'
+}
+function searchPicker(): void {
+  window.clearTimeout(pickerSearchTimer)
+  pickerSearchTimer = window.setTimeout(() => trackFollowUi('search', { value: pickerQuery.value }), 350)
+}
+function closePicker(): void {
+  if (submitting.value) return
+  pickerOpen.value = false
+  trackFollowUi('cancel_dialog', { value: 'follow-picker' })
+  pickerTrigger?.focus()
+}
+function trapPickerFocus(event: KeyboardEvent): void {
+  const elements = pickerPanel.value?.querySelectorAll<HTMLElement>('button:not(:disabled),input:not(:disabled)')
+  if (!elements?.length) return
+  const first = elements[0]!
+  const last = elements[elements.length - 1]!
+  if (event.shiftKey && (document.activeElement === first || document.activeElement === pickerPanel.value)) {
+    event.preventDefault(); last.focus()
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault(); first.focus()
+  }
+}
+async function retryApplication(row: FollowApplication): Promise<void> {
+  const leader = leaders.value.find(item => item.leader_user_id === row.leader_user_id)
+  if (!leader) { ElMessage.warning('该带单员目前未开放跟单'); return }
+  await openFollowPicker(leader)
+  if (isNodeSelectable(row.node_id)) selectedNodes.value = [row.node_id]
+}
+function groupIsRunning(entry: MyFollowingEntry, groupId: string): boolean {
+  if (entry.leader.follow_paused) return false
+  const group = mine.value.following.find(row => row.leader.leader_user_id === entry.leader.leader_user_id)?.groups.find(row => row.group_id === groupId)
+  return !!group?.marketable && group.my_nodes.some(node => (node.follow_state || 'running') === 'running' && !node.leader_paused)
+}
 
 // ---------------------------------------------------------------------------
 // 移出跟单（多选）
@@ -442,10 +511,12 @@ function openLeaveDialog(leader: FollowLeaderSummary, presetNodeId?: string) {
     entry,
     selected: presetNodeId ? [presetNodeId] : [],
   }
+  trackFollowUi('open_picker', { value: 'leave-picker' })
 }
 
 function closeLeaveDialog() {
   if (leaveSubmitting.value) return
+  trackFollowUi('cancel_dialog', { value: 'leave-picker' })
   leaveDialog.value = null
 }
 
@@ -455,12 +526,14 @@ function toggleLeaveNode(nodeId: string) {
   const s = new Set(d.selected)
   s.has(nodeId) ? s.delete(nodeId) : s.add(nodeId)
   d.selected = [...s]
+  trackFollowUi('select_nodes', { node_ids: d.selected, value: 'leave-picker' })
 }
 
 function toggleAllLeaveNodes() {
   const d = leaveDialog.value
   if (!d) return
   d.selected = d.selected.length === d.entry.nodes.length ? [] : d.entry.nodes.map((n) => n.node_id)
+  trackFollowUi('select_nodes', { node_ids: d.selected, value: 'leave-picker' })
 }
 
 /** 全选框的勾选态（空列表时不能显示为已全选） */
@@ -565,12 +638,14 @@ const mobileSheetOpen = ref(false)
 
 // 详情页打开时锁住背景滚动：手机端全屏页是 fixed 覆盖层，
 // 不锁的话手指在页面上滑会连带把背后的列表一起滚掉。
-watch(mobileSheetOpen, (open) => {
-  document.body.style.overflow = open ? 'hidden' : ''
+watch([mobileSheetOpen, pickerOpen], ([sheet, picker]) => {
+  document.body.style.overflow = sheet || picker ? 'hidden' : ''
 })
 
 onBeforeUnmount(() => {
   document.body.style.overflow = ''
+  window.clearInterval(followTimer)
+  window.clearTimeout(pickerSearchTimer)
 })
 
 // 跟单成功后：手机端收起详情页并切到「我的跟单」，让结果立刻可见。
@@ -581,16 +656,24 @@ function afterJoinSettled() {
 }
 
 onMounted(() => {
+  trackFollowUi('page_view', { value: 'follow' })
   void loadLeaders()
   void loadMine()
   void hub.fetchNodes()
+  followTimer = window.setInterval(() => {
+    if (document.visibilityState === 'visible' && !submitting.value && !leaveSubmitting.value) void loadMine()
+  }, 45_000)
 })
 
-const pickerOpen = ref(false)
 const pageMode = ref<'home' | 'mine'>('home')
 const mineTab = ref<'list' | 'nodes'>('list')
 const nodeQuery = ref('')
 const nodeFilter = ref<'all' | 'online' | 'pos' | 'win' | 'loss' | 'off'>('all')
+watch(nodeFilter, value => trackFollowUi('filter', { value: `nodes:${value}` }))
+watch(nodeQuery, value => {
+  window.clearTimeout(pickerSearchTimer)
+  pickerSearchTimer = window.setTimeout(() => trackFollowUi('search', { value }), 350)
+})
 const selfDetail = ref<FollowDetailResponse | null>(null)
 
 function leaderName(leader: FollowLeaderSummary): string {
@@ -661,12 +744,16 @@ function bookStats(rows: Array<Position & { nodeId: string }>) {
 }
 
 async function openFollowPicker(leader: FollowLeaderSummary) {
-  await openLeader(leader)
+  if (submitting.value || detailLoading.value) return
+  pickerTrigger = document.activeElement instanceof HTMLElement ? document.activeElement : null
+  await Promise.all([openLeader(leader), loadMine()])
   if (!detail.value) return
   selectedNodes.value = []
-  const ids = (detail.value.my_nodes || []).map((n) => n.node_id)
-  void loadFollowBooks(ids)
+  pickerQuery.value = ''
   pickerOpen.value = true
+  trackFollowUi('open_picker', { value: String(leader.leader_user_id) })
+  await nextTick()
+  pickerPanel.value?.focus()
 }
 async function pauseMine() {
   if (!myLeader.value) return
@@ -726,6 +813,8 @@ function entryGroupPositions(entry: MyFollowingEntry, groupId: string) {
 function openMine() {
   pageMode.value = 'mine'
   mineTab.value = 'list'
+  trackFollowUi('open_mine')
+  void loadMine()
 }
 
 const previewChips = computed(() => {
@@ -968,7 +1057,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
       <section class="fd-sec">
         <header>
           <p class="fd-kicker purple">带单广场<span>热门带单员</span></p>
-          <button type="button" class="fd-ghost" @click="loadLeaders"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M17.65 6.35A7.95 7.95 0 0 0 12 4V1L7 6l5 5V7c2.76 0 5 2.24 5 5a5 5 0 0 1-8.66 3.46l-1.42 1.42A7 7 0 0 0 19 12a6.96 6.96 0 0 0-1.35-5.65zM6 12a6 6 0 0 1 6-6v1.5A4.5 4.5 0 1 0 16.5 12H18a6 6 0 0 1-12 0z"/></svg>刷新</button>
+          <button type="button" class="fd-ghost" @click="refreshFollow"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M17.65 6.35A7.95 7.95 0 0 0 12 4V1L7 6l5 5V7c2.76 0 5 2.24 5 5a5 5 0 0 1-8.66 3.46l-1.42 1.42A7 7 0 0 0 19 12a6.96 6.96 0 0 0-1.35-5.65zM6 12a6 6 0 0 1 6-6v1.5A4.5 4.5 0 1 0 16.5 12H18a6 6 0 0 1-12 0z"/></svg>刷新</button>
         </header>
         <p v-if="loading" class="fd-empty">加载中…</p>
         <p v-else-if="!leaders.length" class="fd-empty">暂无开放的带单员</p>
@@ -992,7 +1081,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 
       <section class="fd-sec">
         <header>
-          <p class="fd-kicker green">我的跟单<span>{{ mine.summary.following_count }}</span></p>
+          <p class="fd-kicker green">我的跟单<span>{{ recordLeaderCount }}</span></p>
           <button type="button" class="fd-ghost" @click="openMine">查看全部<svg viewBox="0 0 24 24"><path fill="currentColor" d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg></button>
         </header>
         <button type="button" class="fd-preview" @click="openMine">
@@ -1000,7 +1089,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
             <span class="fd-swap"><svg viewBox="0 0 24 24"><path fill="currentColor" d="m6.99 11 2.51-2.5L8.09 7 3 12.09 8.09 17.2l1.41-1.41L6.99 13.2H14v-2.2zM21 6.91 15.91 1.8 14.5 3.21l2.51 2.5H10v2.2h7.01l-2.51 2.5 1.41 1.41z"/></svg></span>
             <span>
               <b>我跟随的带单员</b>
-              <small>{{ mine.summary.following_count }} 条跟单记录 · 点击查看收益与运行状态</small>
+              <small>{{ recordLeaderCount }} 位带单员 · {{ mine.summary.pending_node_count || 0 }} 个节点待审核 · 点击查看运行状态</small>
             </span>
             <svg class="fd-chev" viewBox="0 0 24 24"><path fill="currentColor" d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg>
           </span>
@@ -1011,7 +1100,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
               <small>{{ chip.hint }}</small>
             </span>
           </span>
-          <span v-else class="fd-preview-empty">还没有跟随的带单员</span>
+          <span v-else class="fd-preview-empty">{{ applicationGroups.length ? '跟单申请与审核状态 · 点击查看' : '还没有跟随的带单员' }}</span>
         </button>
       </section>
 
@@ -1080,24 +1169,35 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
           <div><p>我的跟单</p><small>我跟随的带单员 · 策略同步与收益一览</small></div>
         </div>
         <div class="fd-stat3">
-          <div><span><svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46A7.93 7.93 0 0 0 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74A7.93 7.93 0 0 0 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z"/></svg>跟单中</span><b class="up">{{ myFollowing.length }} 个</b></div>
+          <div><span><svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46A7.93 7.93 0 0 0 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74A7.93 7.93 0 0 0 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z"/></svg>跟单中</span><b class="up">{{ myFollowing.filter(entry => entry.groups.some(group => groupIsRunning(entry, group.group_id))).length }} 个</b></div>
           <div><span><svg viewBox="0 0 24 24"><path fill="currentColor" d="M16 6l2.29 2.29-4.88 4.88-4-4L2 16.59 3.41 18l6-6 4 4 6.3-6.29L22 12V6z"/></svg>累计收益</span><b :class="followStats.profitKnown ? (followStats.profit >= 0 ? 'up' : 'down') : ''">{{ followStats.profitKnown ? fmtU(followStats.profit) : '暂无数据' }}</b></div>
           <div><span><svg viewBox="0 0 24 24"><path fill="currentColor" d="M7 11h2v2H7zm4 0h2v2h-2zm4 0h2v2h-2zM5 5h2v2H5zm0 4h2v2H5zm0 4h2v2H5zM19 5h-8v2h8zm0 4h-8v2h8zm0 4h-8v2h8zM5 17h2v2H5zm4 0h10v2H9z"/></svg>平均收益率</span><b :class="followStats.rateKnown ? (followStats.rate >= 0 ? 'up' : 'down') : ''">{{ followStats.rateKnown ? (followStats.rate >= 0 ? '+' : '') + followStats.rate.toFixed(2) + '%' : '暂无数据' }}</b></div>
         </div>
-        <p class="fd-note"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M11 17h2v-6h-2zm0-8h2V7h-2zm1-7C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z"/></svg>跟单按分组同步开仓和平仓。主节点不能用来跟单，绩效与成交历史同一口径，没有成交时显示暂无数据。</p>
+        <p class="fd-note"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M11 17h2v-6h-2zm0-8h2V7h-2zm1-7C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z"/></svg>跟单申请经带单员审核后，按分组同步后续开仓和平仓。待审核的节点暂不接收信号。</p>
       </section>
 
       <div class="fd-tabs">
-        <button type="button" :class="{ on: mineTab === 'list' }" @click="mineTab = 'list'"><svg viewBox="0 0 24 24"><path fill="currentColor" d="m6.99 11 2.51-2.5L8.09 7 3 12.09 8.09 17.2l1.41-1.41L6.99 13.2H14v-2.2zM21 6.91 15.91 1.8 14.5 3.21l2.51 2.5H10v2.2h7.01l-2.51 2.5 1.41 1.41z"/></svg>跟单列表<span>{{ myFollowing.length }}</span></button>
-        <button type="button" :class="{ on: mineTab === 'nodes' }" @click="mineTab = 'nodes'"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M22 11V3h-7v3H9V3H2v8h7V8h2v10h4v3h7v-8h-7v3h-2V8h2v3z"/></svg>子节点跟单统计<span>{{ nodeCards.length }}</span></button>
+        <button type="button" :class="{ on: mineTab === 'list' }" @click="mineTab = 'list'; trackFollowUi('filter', { value: 'list' })"><svg viewBox="0 0 24 24"><path fill="currentColor" d="m6.99 11 2.51-2.5L8.09 7 3 12.09 8.09 17.2l1.41-1.41L6.99 13.2H14v-2.2zM21 6.91 15.91 1.8 14.5 3.21l2.51 2.5H10v2.2h7.01l-2.51 2.5 1.41 1.41z"/></svg>跟单列表<span>{{ recordLeaderCount }}</span></button>
+        <button type="button" :class="{ on: mineTab === 'nodes' }" @click="mineTab = 'nodes'; trackFollowUi('filter', { value: 'nodes' })"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M22 11V3h-7v3H9V3H2v8h7V8h2v10h4v3h7v-8h-7v3h-2V8h2v3z"/></svg>子节点跟单统计<span>{{ nodeCards.length }}</span></button>
       </div>
 
       <section v-if="mineTab === 'list'" class="fd-sec">
         <header>
-          <p class="fd-kicker blue">跟单列表<span>{{ myFollowing.length }} 位带单员</span></p>
+          <p class="fd-kicker blue">跟单列表<span>{{ recordLeaderCount }} 位带单员</span></p>
         </header>
+        <div v-if="applicationOnlyGroups.length" class="fd-grid">
+          <article v-for="group in applicationOnlyGroups" :key="'application-' + group.leader_user_id" class="fd-card fd-applications">
+            <header class="fd-card-top"><span class="fd-avatar lg">{{ group.leader_name.slice(0, 1) }}</span><div><b>{{ group.leader_name }}</b><small>跟单申请 · {{ group.nodes.filter(node => node.status === 'pending').length }} 条待通过</small></div></header>
+            <div v-for="node in group.nodes" :key="node.request_id" class="fd-item">
+              <div class="fd-item-top"><p><b>{{ node.strategy_name || node.group_name || '跟单申请' }}</b><em v-if="node.symbol">{{ node.symbol }}</em></p><em :class="node.status === 'pending' ? 'fd-pending' : 'off'">{{ node.status === 'pending' ? '待通过' : node.status === 'rejected' ? '已拒绝' : '已移出 / 失效' }}</em></div>
+              <p class="fd-application-node">{{ node.name || node.node_id }} <span v-if="node.is_primary">主节点</span> · {{ node.mt5_login || node.node_id }}</p>
+              <p class="fd-application-note">{{ node.status === 'pending' ? '⌛ 等待带单员通过申请' : node.reason || '可重新选择节点申请跟单' }}</p>
+              <button v-if="node.status !== 'pending' && node.available" type="button" class="fd-link" @click="retryApplication(node)">重新申请 ›</button>
+            </div>
+          </article>
+        </div>
         <p v-if="mineLoading && !myFollowing.length" class="fd-empty">加载中…</p>
-        <p v-else-if="!myFollowing.length" class="fd-empty">还没有跟随的带单员</p>
+        <p v-else-if="!myFollowing.length && !applicationGroups.length" class="fd-empty">还没有跟随的带单员</p>
         <div v-else class="fd-grid">
           <article v-for="entry in myFollowing" :key="entry.leader.leader_user_id" class="fd-card">
             <header class="fd-card-top">
@@ -1117,6 +1217,12 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
               </div>
             </header>
             <p v-if="entry.unmarketable_reason" class="fd-empty">{{ entry.unmarketable_reason }}</p>
+            <div v-for="node in applicationRows(entry.leader.leader_user_id)" :key="'request-' + node.request_id" class="fd-item">
+              <div class="fd-item-top"><p><b>{{ node.strategy_name || node.group_name || '跟单申请' }}</b><em v-if="node.symbol">{{ node.symbol }}</em></p><em :class="node.status === 'pending' ? 'fd-pending' : 'off'">{{ node.status === 'pending' ? '待通过' : node.status === 'rejected' ? '已拒绝' : '已移出 / 失效' }}</em></div>
+              <p class="fd-application-node">{{ node.name || node.node_id }} <span v-if="node.is_primary">主节点</span> · {{ node.mt5_login || node.node_id }}</p>
+              <p class="fd-application-note">{{ node.status === 'pending' ? '⌛ 等待带单员通过申请' : node.reason || '可重新选择节点申请跟单' }}</p>
+              <button v-if="node.status !== 'pending' && node.available" type="button" class="fd-link" @click="retryApplication(node)">重新申请 ›</button>
+            </div>
             <div v-for="g in entry.groups" :key="g.group_id" class="fd-item">
               <div class="fd-item-top">
                 <p>
@@ -1125,7 +1231,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
                   <em v-if="g.symbol">{{ g.symbol }}</em>
                   <span>进行中 {{ g.active_task_count }}</span>
                 </p>
-                <em :class="g.active_task_count ? 'on' : 'off'"><i></i>{{ g.active_task_count ? '跟单中' : '空闲' }}</em>
+                <em :class="groupIsRunning(entry, g.group_id) ? 'on' : 'off'"><i></i>{{ groupIsRunning(entry, g.group_id) ? '跟单中' : '已暂停' }}</em>
               </div>
               <div class="fd-book">
                 <div class="fd-book-head"><span>订单列表</span><span>{{ g.symbol || '—' }} · {{ bookStats(entryGroupPositions(entry, g.group_id)).count }} 笔持仓 · 浮动 {{ fmtU(bookStats(entryGroupPositions(entry, g.group_id)).profit) }} U</span></div>
@@ -1198,36 +1304,31 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
       </section>
     </template>
 
-    <div v-if="pickerOpen && detail" class="fd-mask" @click.self="pickerOpen = false">
-      <section class="fd-dialog" role="dialog" aria-label="选择跟单节点">
+    <div v-if="pickerOpen && detail" class="fd-mask" @click.self="closePicker">
+      <section ref="pickerPanel" class="fd-dialog" role="dialog" aria-modal="true" aria-labelledby="follow-picker-title" tabindex="-1" @keydown.esc.prevent="closePicker" @keydown.tab="trapPickerFocus">
         <header>
-          <div>
-            <strong>选择跟单节点</strong>
-            <p>跟单对象：{{ leaderName(detail.leader) }}</p>
-          </div>
-          <button type="button" class="fd-x" @click="pickerOpen = false">×</button>
+          <span class="fd-picker-mark"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M3 3h7v7H3zm11 11h7v7h-7zM8 12h4V8h2v6h-2v4H8v-2h2v-2H8z"/></svg></span>
+          <div><strong id="follow-picker-title">选择跟单节点</strong><p>跟单对象：{{ leaderName(detail.leader) }}</p></div>
+          <button type="button" class="fd-x" aria-label="关闭跟单节点选择" :disabled="submitting" @click="closePicker">×</button>
         </header>
-        <p v-if="detailPaused" class="fd-warn">{{ PAUSED_FOLLOW_HINT }}</p>
-        <p v-else-if="detailLoading" class="fd-empty">加载节点…</p>
-        <p v-else-if="!(detail.my_nodes || []).length" class="fd-empty">没有可跟单的节点。主节点不能用于跟单。</p>
-        <button
-          v-for="n in detail.my_nodes"
-          :key="n.node_id"
-          type="button"
-          class="fd-pick"
-          :class="{ on: selectedNodes.includes(n.node_id), off: !isNodeSelectable(n.node_id) }"
-          :disabled="!isNodeSelectable(n.node_id)"
-          @click="toggleNode(n.node_id)"
-        >
-          <span class="box">{{ selectedNodes.includes(n.node_id) ? '✓' : '' }}</span>
-          <span>
-            <b>{{ n.name || n.node_id }}</b>
-            <small>{{ n.node_id }} · 余额 {{ nodeBalance(n.node_id) }}</small>
-          </span>
-        </button>
+        <div class="fd-picker-body">
+          <div class="fd-picker-leader"><span class="fd-avatar">✦</span><div><b>{{ leaderName(detail.leader) }}</b><p>交易品种 {{ pickerSymbols.join(' / ') || '暂无绑定品种' }}</p></div><span v-if="pickerSymbols.length" class="fd-picker-symbol">{{ pickerSymbols.join(' / ') }}</span></div>
+          <p class="fd-picker-label"><span>▣ 选择跟单节点</span><em>{{ detail.my_nodes.length }} 个</em><small>可多选</small></p>
+          <label class="fd-picker-search"><svg viewBox="0 0 24 24"><circle cx="10" cy="10" r="6" fill="none" stroke="currentColor" stroke-width="2"/><path d="m15 15 5 5" fill="none" stroke="currentColor" stroke-width="2"/></svg><input v-model="pickerQuery" aria-label="搜索跟单节点" placeholder="搜索节点名称 / 账号" :disabled="submitting" @input="searchPicker"></label>
+          <p v-if="detailPaused" class="fd-warn">{{ PAUSED_FOLLOW_HINT }}</p>
+          <div class="fd-picker-list">
+            <p v-if="!detail.my_nodes.length" class="fd-empty">没有可用于跟单的已开通节点。</p>
+            <p v-else-if="!pickerNodes.length" class="fd-empty">没有匹配的节点</p>
+            <label v-for="n in pickerNodes" :key="n.node_id" class="fd-pick" :class="{ on: selectedNodes.includes(n.node_id), off: !isNodeSelectable(n.node_id) }">
+              <input type="checkbox" :checked="selectedNodes.includes(n.node_id)" :disabled="submitting || !isNodeSelectable(n.node_id)" :aria-label="`选择节点 ${n.name || n.node_id}`" @change="toggleNode(n.node_id)">
+              <i class="fd-online-dot" :class="{ online: n.online || n.status === 'online' }"></i>
+              <span class="fd-pick-info"><b>{{ n.name || n.node_id }} <em v-if="n.is_primary">♙ 主节点</em></b><small>{{ n.mt5_login || n.node_id }} · {{ auth.me?.roles.map(role => role.name).join(' / ') || '我的节点' }} · 余额 {{ n.balance != null ? n.balance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : nodeBalance(n.node_id) }} U</small><small v-if="nodeFollowHint(n.node_id)" class="fd-pick-hint">{{ nodeFollowHint(n.node_id) }}</small></span>
+            </label>
+          </div>
+        </div>
         <footer>
-          <button type="button" @click="pickerOpen = false">取消</button>
-          <button type="button" class="primary" :disabled="submitting || detailPaused || !selectedNodes.length" @click="submitJoin">使用 {{ selectedNodes.length }} 个节点跟单</button>
+          <div class="fd-picker-buttons"><button type="button" class="fd-picker-cancel" :disabled="submitting" @click="closePicker">取消</button><button type="button" class="primary" :disabled="submitting || detailPaused || !selectedNodes.some(isNodeSelectable)" @click="submitJoin">{{ submitting ? '提交中…' : `⇄ 使用 ${selectedNodes.length} 个节点跟单` }}</button></div>
+          <p>可同时勾选多个节点，审核通过后同步所选分组的策略信号</p>
         </footer>
       </section>
     </div>
@@ -1380,7 +1481,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 .fd-pnl.up { background: rgba(22,163,74,.16); }
 .fd-pnl.down { background: rgba(246,70,93,.12); }
 .fd-mask { position: fixed; inset: 0; z-index: 40; display: flex; align-items: center; justify-content: center; padding: 16px; background: rgba(0,0,0,.55); }
-.fd-dialog { width: min(560px, 100%); max-height: 86vh; overflow: auto; padding: 14px; background: #0D1626; }
+.fd-dialog { width: min(480px, 100%); max-height: calc(100dvh - 32px); display: flex; flex-direction: column; padding: 0; background: #0D1220; border-radius: 16px; box-shadow: 0 24px 80px #0008; outline: none; }
 .fd-dialog header, .fd-dialog footer { justify-content: space-between; }
 .fd-dialog p { margin: 2px 0 0; color: #8B96A8; font-size: 12px; }
 .fd-x { width: 28px; height: 28px; border-radius: 8px; border: 1px solid #22304A; background: #0A0F1A; color: #8B96A8; }
@@ -1390,6 +1491,24 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 .fd-pick .box { width: 16px; height: 16px; border: 1px solid #3D4C66; border-radius: 4px; display: inline-flex; align-items: center; justify-content: center; }
 .fd-pick small { display: block; color: #8B96A8; }
 .fd-dialog .primary, .fd :deep(.el-dialog__footer) .primary { background: #7C3AED; color: #fff; border: 0; border-radius: 8px; padding: 6px 12px; }
+.fd-dialog>header { padding: 12px 16px; border-bottom: 1px solid #263047; flex-shrink: 0; justify-content: flex-start; }
+.fd-dialog>header strong { font-size: 16px; }
+.fd-dialog>header p { font-size: 11px; margin-top: 3px; }
+.fd-dialog .fd-x { margin-left: auto; border: 0; background: transparent; font-size: 21px; }
+.fd-picker-mark { width: 40px; height: 40px; display: grid; place-items: center; border-radius: 12px; background: linear-gradient(135deg,#4c1d95,#172554); color: #c4b5fd; }
+.fd-picker-mark svg { width: 23px; height: 23px; }
+.fd-picker-body { padding: 12px 16px; overflow-y: auto; min-height: 0; }
+.fd-picker-leader { display: flex; gap: 10px; align-items: center; border: 1px solid #273147; border-radius: 10px; padding: 10px; background: #090f19; }
+.fd-picker-leader b { font-size: 12px; }.fd-picker-leader p { font-size: 10px; }
+.fd-picker-symbol { margin-left: auto; max-width: 45%; color: #94a3b8; background: #121b29; border: 1px solid #273147; border-radius: 5px; padding: 3px 6px; font-size: 10px; overflow-wrap: anywhere; }
+.fd-dialog .fd-picker-label { display: flex; gap: 7px; align-items: center; margin: 13px 0 8px; font-size: 11px; }
+.fd-picker-label>span { color: #cbd5e1; }.fd-picker-label>em { color: #7f8da5; font-style: normal; border: 1px solid #263047; border-radius: 12px; padding: 1px 6px; font-size: 10px; }.fd-picker-label>small { color: #22d3ee; font-size: 10px; }
+.fd-picker-search { display: flex; gap: 8px; align-items: center; border: 1px solid #263047; border-radius: 7px; padding: 8px 10px; background: #090f19; }.fd-picker-search svg { width: 14px; height: 14px; color: #64748b; }.fd-picker-search input { width: 100%; min-width: 0; border: 0; outline: none; background: transparent; color: #e2e8f0; font: inherit; font-size: 12px; }
+.fd-picker-list { max-height: 224px; overflow-y: auto; margin-top: 8px; padding-right: 5px; scrollbar-width: thin; scrollbar-color: #4b347c #141c2a; }
+.fd-picker-list .fd-pick { min-height: 56px; margin: 0 0 6px; padding: 9px 10px; cursor: pointer; gap: 7px; }.fd-picker-list .fd-pick.on { background: #23173d; box-shadow: inset 0 0 0 1px #7c3aed55; }.fd-picker-list input { width: 16px; height: 16px; margin: 0; accent-color: #7c3aed; flex-shrink: 0; }.fd-pick-info { min-width: 0; }.fd-pick-info>b { font-size: 13px; }.fd-pick-info em { display: inline-block; border: 1px solid #785b1e; border-radius: 4px; background: #4b3819; color: #fbbf24; font-size: 9px; padding: 1px 4px; font-style: normal; vertical-align: middle; }.fd-pick-info small { font-size: 10px; margin-top: 3px; overflow-wrap: anywhere; }.fd-pick-info .fd-pick-hint { color: #fbbf24; }.fd-online-dot { width: 7px; height: 7px; flex-shrink: 0; background: #64748b; border-radius: 50%; }.fd-online-dot.online { background: #22c55e; box-shadow: 0 0 5px #22c55e55; }
+.fd-dialog>footer { display: block; padding: 12px 16px; border-top: 1px solid #263047; flex-shrink: 0; }.fd-picker-buttons { display: flex; gap: 8px; }.fd-picker-cancel { flex: 1; border: 1px solid #263047; background: #111a2a; color: #a0aec0; border-radius: 10px; padding: 11px; }.fd-picker-buttons .primary { flex: 2; padding: 11px; background: linear-gradient(100deg,#7c3aed,#2563eb); font-weight: 600; box-shadow: 0 4px 12px #7c3aed33; }.fd-dialog button:disabled { opacity: .45; cursor: not-allowed; }.fd-dialog>footer>p { text-align: center; font-size: 10px; margin-top: 9px; line-height: 1.5; }.fd-picker-list .fd-pick.off { cursor: not-allowed; }.fd-pending { color: #fbbf24!important; background: #78350f33; border: 1px solid #92400e55; }.fd-application-node { font-size: 11px; color: #a5b4c9; margin-bottom: 4px; }.fd-application-node span { color: #fbbf24; font-size: 10px; }.fd-application-note { color: #94a3b8; font-size: 11px; margin: 8px 0; }.fd-applications .fd-item>button { padding: 2px 0; }
+.fd-picker-search input { height: 16px; padding: 0; line-height: 16px; box-shadow: none; }
+.fd-picker-list .fd-pick { text-transform: none; letter-spacing: normal; color-scheme: dark; }
 .fd-warn { color: #FBBF24; font-size: 12px; }
 @media (min-width: 1024px) {
   .fd-grid { grid-template-columns: 1fr 1fr; }
