@@ -148,6 +148,12 @@ watch(
       gridSizing.data = null
       gridSizing.error = ''
       gridSizing.loading = false
+      // 止盈价 → 盈亏比联动：重置手动标记与市价入场价快照
+      rrManualEdited.value = false
+      marketEntrySnapshot.value =
+        props.currentMid != null && isFinite(props.currentMid) && props.currentMid > 0
+          ? props.currentMid
+          : null
       // 加载分组详情 + 策略模版 + 已有策略参数
       await loadGroupAndStrategy()
     }
@@ -268,6 +274,165 @@ const riskParams = reactive({
   rr_ratio: 2.5,     // 盈亏比
   base_ratio: 30,     // 底仓占比 %
   breakeven_times: 0, // 保本触发倍数（0=不启用）
+})
+
+/* ── 止盈价 → 盈亏比联动 ──
+ * 客户一旦填了止盈价（选填），就等于指定了目标价，实际盈亏比不再等于配置里的
+ * rr_ratio —— 策略是按 rr_ratio 铺阶梯止盈的（最远一档 = 入场价 ± 止损距离 ×
+ * rr_ratio），所以这里自动反算「实际盈亏比」并同步进 riskParams.rr_ratio，
+ * 让阶梯最后一档正好落在客户填的止盈价上。
+ *
+ *   限价：入场价 = 挂单价（entry_price）
+ *   市价：入场价 = 客户填写止盈/止损那一刻的报价快照
+ *         （不跟随行情跳动，否则盈亏比会一直抖）
+ */
+const marketEntrySnapshot = ref<number | null>(null)
+
+/** 数字取值：空串 / NaN / null 一律按 0 处理 */
+function toNum(v: unknown): number {
+  const n = Number(v)
+  return isFinite(n) ? n : 0
+}
+
+/** 推算用的入场价 */
+const entryPriceForRr = computed<number | null>(() => {
+  if (isLimit.value) {
+    const ep = toNum(localForm.entry_price)
+    return ep > 0 ? ep : null
+  }
+  if (isMarket.value) {
+    // 用客户编辑那一刻的报价快照（不跟随行情跳动，否则盈亏比会一直抖）
+    return marketEntrySnapshot.value
+  }
+  return null
+})
+
+/** 反算出的实际盈亏比（止盈距离 ÷ 止损距离）；算不出来时为 null */
+const impliedRr = computed<number | null>(() => {
+  const tp = toNum(localForm.tp)
+  const sl = toNum(localForm.sl)
+  const entry = entryPriceForRr.value
+  if (tp <= 0 || sl <= 0 || entry == null) return null
+  const risk = Math.abs(entry - sl)
+  const reward = Math.abs(tp - entry)
+  if (risk <= 0 || reward <= 0) return null
+  return Math.round((reward / risk) * 100) / 100
+})
+
+/** 推算出的开仓方向（与 derivedAction 同口径，只是用推算入场价） */
+const rrDirection = computed<'BUY' | 'SELL' | null>(() => {
+  const sl = toNum(localForm.sl)
+  const entry = entryPriceForRr.value
+  if (sl <= 0 || entry == null) return null
+  return sl < entry ? 'BUY' : 'SELL'
+})
+
+/** 止盈方向是否与开仓方向一致（做多要止盈在入场价上方，做空相反） */
+const tpSideOk = computed<boolean | null>(() => {
+  const tp = toNum(localForm.tp)
+  const entry = entryPriceForRr.value
+  const dir = rrDirection.value
+  if (tp <= 0 || entry == null || dir == null) return null
+  return dir === 'BUY' ? tp > entry : tp < entry
+})
+
+/** 客户手动改过盈亏比 → 不再自动覆盖，只提示差异 */
+const rrManualEdited = ref(false)
+
+/** 把反算出的实际盈亏比同步进策略参数 */
+function syncRrFromTp(): void {
+  const rr = impliedRr.value
+  if (rr == null || rrManualEdited.value) return
+  if (Math.abs(toNum(riskParams.rr_ratio) - rr) < 0.005) return
+  riskParams.rr_ratio = rr
+}
+
+/** 客户点了「改用 1:x」：覆盖手动值，回到止盈价反算出来的盈亏比 */
+function applyImpliedRr(): void {
+  const rr = impliedRr.value
+  if (rr == null) return
+  riskParams.rr_ratio = rr
+  rrManualEdited.value = false
+}
+
+// 客户改止盈价 → 视为重新指定目标价，允许再次自动同步
+watch(
+  () => localForm.tp,
+  () => {
+    rrManualEdited.value = false
+  },
+)
+
+// 客户改止盈/止损/挂单价 → 刷新市价入场价快照 + 同步盈亏比
+watch(
+  () => [localForm.tp, localForm.sl, localForm.entry_price],
+  () => {
+    if (isMarket.value) {
+      const mid = props.currentMid
+      marketEntrySnapshot.value = mid != null && isFinite(mid) && mid > 0 ? mid : marketEntrySnapshot.value
+    }
+    syncRrFromTp()
+  },
+)
+
+// 报价后到时补一次快照（客户还没动价格，先有个入场价可用）
+watch(
+  () => props.currentMid,
+  (mid) => {
+    if (!isMarket.value) return
+    if (marketEntrySnapshot.value != null) return
+    if (mid != null && isFinite(mid) && mid > 0) marketEntrySnapshot.value = mid
+  },
+)
+
+/** 盈亏比提示（info / warn / error 三种） */
+interface RrNotice {
+  kind: 'info' | 'warn' | 'error'
+  text: string
+  /** 可选的「一键改用」动作 */
+  actionLabel?: string
+  action?: () => void
+}
+
+const rrNotice = computed<RrNotice | null>(() => {
+  if (isGrid.value) return null
+  const tp = toNum(localForm.tp)
+  if (tp <= 0) return null
+  const sl = toNum(localForm.sl)
+  if (sl <= 0) {
+    return { kind: 'warn', text: '已填写止盈价，请再填写止损价以便推算实际盈亏比。' }
+  }
+  const entry = entryPriceForRr.value
+  if (entry == null) {
+    return {
+      kind: 'warn',
+      text: isMarket.value
+        ? '已填写止盈价，等待当前报价以推算实际盈亏比。'
+        : '已填写止盈价，请填写挂单价以便推算实际盈亏比。',
+    }
+  }
+  if (tpSideOk.value === false) {
+    const dir = rrDirection.value === 'BUY' ? '做多' : '做空'
+    return {
+      kind: 'error',
+      text: `止盈价 ${tp} 与开仓方向（${dir}）相反，无法构成有效盈亏比，请检查止盈价。`,
+    }
+  }
+  const rr = impliedRr.value
+  if (rr == null) return null
+  const cur = toNum(riskParams.rr_ratio)
+  const basis = `（入场价 ${entry}、止损价 ${sl}）`
+  if (Math.abs(cur - rr) < 0.01) {
+    return rrManualEdited.value
+      ? { kind: 'info', text: `当前盈亏比 1:${cur} 与止盈价推算结果一致 ${basis}。` }
+      : { kind: 'info', text: `已按止盈价自动同步盈亏比为 1:${rr} ${basis}。` }
+  }
+  return {
+    kind: 'warn',
+    text: `止盈价对应的实际盈亏比为 1:${rr} ${basis}，与当前配置的 1:${cur} 不一致；提交后将按 1:${cur} 铺阶梯止盈。`,
+    actionLabel: `改用 1:${rr}`,
+    action: applyImpliedRr,
+  }
 })
 
 /**
@@ -1076,6 +1241,10 @@ async function triggerMarketStrategy(): Promise<void> {
       group_ids: [currentGroup.value.group_id],
     }
     if (localForm.sl && localForm.sl > 0) payload.stop_loss = localForm.sl
+    // 止盈价：随信号带过去（后台会落库）。以损定量策略实际是按 rr_ratio 铺
+    // 阶梯止盈的，所以前端已经把 rr_ratio 同步成「止盈价反算出来的盈亏比」，
+    // 最远一档正好落在客户填的止盈价上。
+    if (localForm.tp && localForm.tp > 0) payload.take_profit = localForm.tp
     if (isLimit.value && localForm.entry_price && localForm.entry_price > 0) {
       payload.entry_price = localForm.entry_price
     }
@@ -1376,10 +1545,23 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
         <div class="od-row">
           <div class="od-row-text">
             <div class="od-row-label">盈亏比</div>
-            <div class="od-row-sub">止盈与止损的比例，如 1:2.5</div>
+            <div class="od-row-sub">
+              止盈与止损的比例，如 1:2.5
+              <template v-if="impliedRr != null">
+                <br /><span class="od-sub-strong">按止盈价推算为 1:{{ impliedRr }}</span>
+              </template>
+            </div>
           </div>
           <div class="od-row-control od-input-affix">
-            <input v-model.number="riskParams.rr_ratio" class="od-input" type="number" min="0" step="0.1" placeholder="如 2.5" />
+            <input
+              v-model.number="riskParams.rr_ratio"
+              class="od-input"
+              type="number"
+              min="0"
+              step="0.1"
+              placeholder="如 2.5"
+              @input="rrManualEdited = true"
+            />
           </div>
         </div>
         <div class="od-row">
@@ -1418,6 +1600,20 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
           <div class="od-row-control od-input-affix" :class="{ need: !localForm.sl }">
             <input v-model.number="localForm.sl" class="od-input" type="number" step="0.0001" min="0" placeholder="如 4140.00" />
           </div>
+        </div>
+
+        <!-- 止盈价提示：填了止盈价后，实际盈亏比已被止盈价「重新定义」，
+             这里明确告诉客户当前用的是哪一个，以及不一致时可一键改用。 -->
+        <div v-if="rrNotice" class="od-notice" :class="`is-${rrNotice.kind}`">
+          <span class="od-notice-text">{{ rrNotice.text }}</span>
+          <button
+            v-if="rrNotice.action && rrNotice.actionLabel"
+            type="button"
+            class="od-notice-btn"
+            @click="rrNotice.action()"
+          >
+            {{ rrNotice.actionLabel }}
+          </button>
         </div>
       </template>
 
@@ -2073,6 +2269,51 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
   border-radius: 8px;
   line-height: 1.5;
 }
+
+/* ── 止盈价 → 盈亏比联动提示 ── */
+.od-notice {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 11px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  line-height: 1.5;
+}
+.od-notice-text { flex: 1 1 auto; min-width: 0; }
+.od-notice.is-info {
+  color: #93c5fd;
+  background: rgba(37, 99, 235, 0.12);
+  border: 1px solid rgba(37, 99, 235, 0.35);
+}
+.od-notice.is-warn {
+  color: #fbbf24;
+  background: rgba(245, 158, 11, 0.12);
+  border: 1px solid rgba(245, 158, 11, 0.4);
+}
+.od-notice.is-error {
+  color: #f87171;
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid rgba(239, 68, 68, 0.4);
+}
+.od-notice-btn {
+  flex: 0 0 auto;
+  height: 24px;
+  padding: 0 10px;
+  border-radius: 6px;
+  border: 1px solid currentColor;
+  background: transparent;
+  color: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.od-notice-btn:hover { background: rgba(255, 255, 255, 0.08); }
+
+/* 盈亏比副说明里的推算值 */
+.od-sub-strong { color: var(--pf-text); font-weight: 600; }
 
 /* Loading dots animation */
 .od-loading {
