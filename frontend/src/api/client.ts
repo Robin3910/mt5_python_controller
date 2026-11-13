@@ -27,4 +27,26 @@ api.interceptors.response.use(
   },
 )
 
+/**
+ * 从 axios 错误里取出后端给的中文提示。
+ *
+ * 后端有两种报错形态：
+ * - FastAPI 的 `HTTPException(detail="文字")` → `detail` 是字符串；
+ * - `HTTPException(detail={"message": "...", ...})` → `detail` 是对象（路由冲突会带 task_ids）。
+ *
+ * 都取不到时回落到调用方给的兜底文案 —— **不要把 axios 的英文报错透给用户**。
+ */
+export function extractApiError(error: unknown, fallback = '操作失败'): string {
+  const detail = (error as { response?: { data?: { detail?: unknown } } })?.response?.data
+    ?.detail
+  if (typeof detail === 'string' && detail.trim()) return detail.trim()
+  if (detail && typeof detail === 'object') {
+    const msg = (detail as { message?: unknown }).message
+    if (typeof msg === 'string' && msg.trim()) return msg.trim()
+  }
+  const raw = (error as { response?: { data?: unknown } })?.response?.data
+  if (typeof raw === 'string' && raw.trim()) return raw.trim()
+  return fallback
+}
+
 export default api

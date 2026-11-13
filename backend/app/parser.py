@@ -12,6 +12,13 @@
 
 注意：这里实现的是“参考仓库源码的真实行为”，而非其 README 描述。例如
 `{"signal": "buy EURUSD 0.1"}` 因为取不到 symbol 字段，实际会解析失败（返回 None）。
+
+**统计维度的两个可选字段**（纯新增，不改任何既有解析 / 校验行为）：
+- `timeframe`（别名 `tf` / `interval`）：信号级周期，来源是 TV 的 `{{interval}}`；
+- `signal_type`（别名 `stype` / `smc_type`）：首仓信号类型（ob / fvg / bos / …）。
+
+这两个字段**纯统计用途**：缺失、非法都归 None，**不进 `validate_signal`**，
+缺它们不影响信号受理与下单（详见 `signal_meta`）。
 """
 import logging
 import re
@@ -19,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from .config import Config
+from . import signal_meta
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +52,12 @@ class TradingSignal:
     group_ids: List[str] = field(default_factory=list)
     # 节点定向（仅 strategy 链路使用）：仅向 ID 在列表内的节点下发；空 = 不限制
     node_ids: List[str] = field(default_factory=list)
+    # 信号级周期（归一后：M15 / H1 / …）。纯统计维度，**缺失不影响下单**。
+    # 来源：TV 告警的 {{interval}}（别名 tf / timeframe / interval）。
+    timeframe: Optional[str] = None
+    # 首仓信号类型（ob / fvg / bos / …）。纯统计维度，**缺失不影响下单**。
+    # 未知类型保留原值（小写），这样 TV 新增结构类型无需改代码即可统计。
+    signal_type: Optional[str] = None
 
 
 class TradingViewParser:
@@ -129,6 +143,18 @@ class TradingViewParser:
         template_ids = self._extract_template_ids(normalized)
         group_ids = self._extract_group_ids(normalized)
         node_ids = self._extract_node_ids(normalized)
+        # 周期与信号类型：**纯统计维度**，缺失或非法都归 None，绝不影响受理。
+        # 不进 validate_signal —— 缺周期/类型不是「非法信号」。
+        timeframe = signal_meta.normalize_timeframe(
+            normalized.get("tf")
+            or normalized.get("timeframe")
+            or normalized.get("interval")
+        )
+        signal_type = signal_meta.normalize_signal_type(
+            normalized.get("signal_type")
+            or normalized.get("stype")
+            or normalized.get("smc_type")
+        )
 
         return TradingSignal(
             action=action,
@@ -143,6 +169,8 @@ class TradingViewParser:
             template_ids=template_ids,
             group_ids=group_ids,
             node_ids=node_ids,
+            timeframe=timeframe,
+            signal_type=signal_type,
         )
 
     def _parse_text(self, text: str) -> Optional[TradingSignal]:

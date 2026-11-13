@@ -10,11 +10,21 @@
 """
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+import time
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from . import signal_stats
-from .deps import get_store, require_admin
+from . import (
+    signal_ai_center,
+    signal_meta,
+    signal_perf,
+    signal_quality,
+    signal_routing,
+    signal_stats,
+)
+from .deps import client_ip, get_group_dispatcher, get_store, require_admin
+from .group_dispatcher import GroupDispatcher
 from .permissions import Principal
 from .redis_store import RedisStore
 
@@ -107,6 +117,26 @@ class StreamDispatch(BaseModel):
     error: Optional[str] = None
 
 
+class SignalQualityItem(BaseModel):
+    """单条信号的质量分。"""
+    # 质量分（0~100）；None = 没有可用先验（暂无历史），与「分数是 0」不同
+    score: Optional[float] = None
+    # 该桶的原始胜率（百分数）
+    win_rate: float = 0.0
+    # 样本量 / 赢数
+    n: int = 0
+    wins: int = 0
+    # 单信号平均净盈亏（参考用，不进分数）
+    avg_profit: float = 0.0
+    # 分数取自哪个桶（主键 / 类型|周期 / __global__）
+    basis: str = ""
+    basis_label: str = ""
+    # 回退层级：type_tf / type / global / none
+    level: str = "none"
+    # 样本充分度：sufficient / thin / insufficient / none
+    sample_level: str = "none"
+
+
 class StreamItem(BaseModel):
     """统一信号流里的一条信号。"""
     signal_id: str
@@ -117,6 +147,10 @@ class StreamItem(BaseModel):
     symbol: Optional[str] = None
     volume: Optional[float] = None
     status: str = "pending"
+    # 周期 / 信号类型 / 路由状态（缺失 = 未标注）
+    timeframe: Optional[str] = None
+    signal_type: Optional[str] = None
+    route_state: Optional[str] = None
     reject_code: Optional[str] = None
     reject_label: Optional[str] = None
     targets: int = 0
@@ -124,6 +158,8 @@ class StreamItem(BaseModel):
     skipped: int = 0
     failed: int = 0
     elapsed_ms: Optional[int] = None
+    # 质量分：历史同类信号的成功率（只展示，不参与交易决策）
+    quality: Optional[SignalQualityItem] = None
     dispatches: list[StreamDispatch] = Field(default_factory=list)
 
 
@@ -284,6 +320,299 @@ class StrategyTaskTotals(BaseModel):
     realized_profit: float = 0.0
 
 
+# ---------------------------------------------------------------------------
+# 绩效（信号级 / 持仓级胜率）
+# ---------------------------------------------------------------------------
+class PerfBucketItem(BaseModel):
+    """一个绩效聚合桶（按周期 / 按类型 / 按入场原因）。"""
+    key: str
+    label: str
+    # —— 信号级 ——
+    signals_total: int = 0
+    signals_closed: int = 0
+    signals_win: int = 0
+    signals_running: int = 0
+    signals_no_trade: int = 0
+    signal_win_rate: float = 0.0
+    signal_profit: float = 0.0
+    avg_signal_profit: float = 0.0
+    # 进行中浮盈：单列，不进胜率分母
+    running_profit: float = 0.0
+    # —— 持仓级 ——
+    positions_total: int = 0
+    positions_closed: int = 0
+    positions_win: int = 0
+    position_win_rate: float = 0.0
+    position_profit: float = 0.0
+    avg_position_profit: float = 0.0
+    running_position_profit: float = 0.0
+    volume: float = 0.0
+    orders: int = 0
+
+
+class EntryLegItem(BaseModel):
+    """一条入场明细（首仓 / 某一档加仓）。"""
+    signal_id: str
+    task_id: Optional[int] = None
+    node_id: Optional[str] = None
+    symbol: Optional[str] = None
+    action: Optional[str] = None
+    seq: int = 0
+    reason: str = ""
+    reason_label: str = ""
+    rule_type: Optional[int] = None
+    level_index: Optional[int] = None
+    # 入场级周期；点数 / 指定价加仓恒为 None（不依赖周期）
+    timeframe: Optional[str] = None
+    timeframe_label: str = ""
+    volume: Optional[float] = None
+    price: Optional[float] = None
+    realized_profit: Optional[float] = None
+    closed: bool = False
+
+
+class SignalCenterPerformance(BaseModel):
+    """绩效面板响应体。"""
+    window: str
+    from_ts: Optional[int] = None
+    totals: PerfBucketItem = Field(default_factory=PerfBucketItem)
+    by_timeframe: list[PerfBucketItem] = Field(default_factory=list)
+    by_signal_type: list[PerfBucketItem] = Field(default_factory=list)
+    by_entry_reason: list[PerfBucketItem] = Field(default_factory=list)
+    legs: list[EntryLegItem] = Field(default_factory=list)
+    updated_at: int = 0
+    # 口径说明：前端必须原样展示，避免用户把两套数字混为一谈
+    scope: str = (
+        "信号级=该信号全部持仓净盈亏合计>0；持仓级=单个持仓净盈亏>0；"
+        "进行中不入分母（单列）；不统计档位级胜率"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 质量分
+# ---------------------------------------------------------------------------
+class QualityBucketItem(BaseModel):
+    """先验表的一行（按「信号类型 × 周期」）。"""
+    key: str = ""
+    signal_type: Optional[str] = None
+    timeframe: Optional[str] = None
+    label: str = ""
+    n: int = 0
+    wins: int = 0
+    win_rate: float = 0.0
+    score: float = 0.0
+    avg_profit: float = 0.0
+    sample_level: str = "none"
+
+
+class SignalCenterQuality(BaseModel):
+    """质量分先验表响应体。"""
+    window: str = "30d"
+    global_: dict = Field(default_factory=dict, alias="global")
+    buckets: list[QualityBucketItem] = Field(default_factory=list)
+    updated_at: int = 0
+    # 口径说明：前端必须原样展示
+    scope: str = (
+        "质量分=历史同类信号（类型×周期）的信号级胜率，"
+        "小样本按贝叶斯收缩向全局回归；只展示，不参与任何交易决策"
+    )
+
+    model_config = {"populate_by_name": True}
+
+
+# ---------------------------------------------------------------------------
+# AI 信号管理中心（原型复刻）
+# ---------------------------------------------------------------------------
+class AiKpi(BaseModel):
+    """四个指标卡。"""
+    # 今日触发信号（UTC+8 自然日）
+    today_signals: int = 0
+    # 覆盖周期：只给个数，**不写分母**
+    timeframes_covered: int = 0
+    # 高可靠信号：等级为「高」的信号条数
+    high_reliability: int = 0
+    # 平均信号质量：有可用先验的信号的质量分均值
+    avg_quality: float = 0.0
+    # 窗口内信号总数 / 有可用先验的条数（分母说明用）
+    signals_total: int = 0
+    signals_scored: int = 0
+
+
+class AiReliabilityItem(BaseModel):
+    """可靠性等级分布的一档。"""
+    level: str = "none"
+    label: str = ""
+    count: int = 0
+    pct: float = 0.0
+    advice: str = ""
+
+
+class AiScoreBucketItem(BaseModel):
+    """质量分区间分布的一档。"""
+    key: str = ""
+    label: str = ""
+    count: int = 0
+    pct: float = 0.0
+
+
+class AiSignalRow(BaseModel):
+    """信号明细的一行（也用于 TOP 5 列表）。"""
+    signal_id: str = ""
+    received_at: Optional[float] = None
+    timeframe: Optional[str] = None
+    timeframe_label: str = ""
+    signal_type: Optional[str] = None
+    signal_type_label: str = ""
+    type_group: str = ""
+    name: str = ""
+    action: Optional[str] = None
+    action_label: str = ""
+    symbol: Optional[str] = None
+    quality: Optional[SignalQualityItem] = None
+    score: Optional[float] = None
+    # 可靠性等级：high / mid / low / none
+    level: str = "none"
+    advice: str = ""
+    # 马丁止盈档位（None = 未止盈 / 持仓中）
+    tp_level: Optional[int] = None
+    tp_level_label: Optional[str] = None
+    # tp / sl / running / none
+    tp_state: str = "none"
+    tp_units: list[dict] = Field(default_factory=list)
+
+
+class AiTypeQualityItem(BaseModel):
+    """信号类型质量对比的一栏（按业务分类聚合）。"""
+    key: str = ""
+    label: str = ""
+    count: int = 0
+    avg_score: float = 0.0
+    high_count: int = 0
+    level: str = "none"
+    advice: str = ""
+    best_signal: Optional[AiSignalRow] = None
+    # 该分类下的类型码（联动筛选用）
+    types: list[str] = Field(default_factory=list)
+
+
+class AiTimeframeQualityItem(BaseModel):
+    """周期质量总览的一张卡。"""
+    key: str = ""
+    label: str = ""
+    count: int = 0
+    avg_score: float = 0.0
+    high_count: int = 0
+    level: str = "none"
+    advice: str = ""
+    best_signal: Optional[AiSignalRow] = None
+
+
+class AiOverview(BaseModel):
+    """AI 信号管理中心上半屏。"""
+    window: str = "30d"
+    from_ts: Optional[int] = None
+    kpi: AiKpi = Field(default_factory=AiKpi)
+    reliability: list[AiReliabilityItem] = Field(default_factory=list)
+    score_buckets: list[AiScoreBucketItem] = Field(default_factory=list)
+    by_type: list[AiTypeQualityItem] = Field(default_factory=list)
+    by_timeframe: list[AiTimeframeQualityItem] = Field(default_factory=list)
+    top_signals: list[AiSignalRow] = Field(default_factory=list)
+    updated_at: int = 0
+    scope: str = signal_ai_center.QUALITY_SCOPE
+
+
+class AiTpBucket(BaseModel):
+    """一个止盈档位。"""
+    level: int = 0
+    label: str = ""
+    count: int = 0
+    pct: float = 0.0
+
+
+class AiTpNodeItem(BaseModel):
+    """一个节点的止盈档位分布（**按节点分开统计**）。"""
+    node_id: str = ""
+    node_name: str = ""
+    units: int = 0
+    buckets: list[AiTpBucket] = Field(default_factory=list)
+
+
+class AiTpDistribution(BaseModel):
+    """马丁止盈分布。"""
+    window: str = "30d"
+    # 窗口内信号总数（原型「全部信号」）
+    total_signals: int = 0
+    # 已止盈的统计单元数（分布分母）
+    closed_tp_units: int = 0
+    by_node: list[AiTpNodeItem] = Field(default_factory=list)
+    overall: dict = Field(default_factory=dict)
+    # tp / sl / running / none 的单元数
+    states: dict[str, int] = Field(default_factory=dict)
+    # 每个档位的重点信号 TOP 5（按质量分降序）
+    top_by_level: dict[str, list[AiSignalRow]] = Field(default_factory=dict)
+    updated_at: int = 0
+    scope: str = signal_ai_center.TP_SCOPE
+
+
+class AiSignalList(BaseModel):
+    """信号明细表（页码分页）。"""
+    window: str = "30d"
+    total: int = 0
+    total_signals: int = 0
+    page: int = 1
+    pages: int = 1
+    page_size: int = 10
+    items: list[AiSignalRow] = Field(default_factory=list)
+    updated_at: int = 0
+    scope: str = signal_ai_center.QUALITY_SCOPE
+
+
+# ---------------------------------------------------------------------------
+# 路由
+# ---------------------------------------------------------------------------
+class RouteRequest(BaseModel):
+    """路由一条（或多条）信号到指定分组。"""
+    group_ids: list[str] = Field(default_factory=list)
+    # 参数覆盖：缺省沿用信号原始值
+    volume: Optional[float] = None
+    sl: Optional[float] = None
+    tp: Optional[float] = None
+    note: Optional[str] = Field(default=None, max_length=255)
+
+
+class BatchRouteRequest(RouteRequest):
+    """批量路由：显式给 signal_ids。"""
+    signal_ids: list[str] = Field(default_factory=list)
+
+
+class RouteResultItem(BaseModel):
+    signal_id: str
+    groups: int = 0
+    targets: int = 0
+
+
+class BatchRouteResponse(BaseModel):
+    ok: list[RouteResultItem] = Field(default_factory=list)
+    conflicts: list[dict] = Field(default_factory=list)
+    failed: list[dict] = Field(default_factory=list)
+    summary: dict[str, int] = Field(default_factory=dict)
+
+
+class RouteResponse(BaseModel):
+    signal_id: str
+    groups: int = 0
+    targets: int = 0
+    tasks: list[dict] = Field(default_factory=list)
+    route_state: str = ""
+    note: Optional[str] = None
+
+
+class DropResponse(BaseModel):
+    signal_id: str
+    route_state: str = ""
+    note: Optional[str] = None
+
+
 class TaskDispatchItem(BaseModel):
     """主任务下的节点子任务。"""
     node_id: str
@@ -352,12 +681,18 @@ def _filters(
     node_id: Optional[str] = Query(None),
     group_id: Optional[str] = Query(None),
     keyword: Optional[str] = Query(None),
+    timeframe: Optional[str] = Query(None),
+    signal_type: Optional[str] = Query(None),
+    route_state: Optional[str] = Query(None),
+    direction: Optional[str] = Query(None),
 ) -> signal_stats.SignalFilters:
     """把查询参数收敛成统一筛选条件。"""
     return signal_stats.SignalFilters(
         window=window, source=source, model=model, symbol=symbol,
         action=action, status=status, node_id=node_id,
         group_id=group_id, keyword=keyword,
+        timeframe=timeframe, signal_type=signal_type,
+        route_state=route_state, direction=direction,
     )
 
 
@@ -430,3 +765,182 @@ async def signal_detail(
     if detail is None:
         raise HTTPException(status_code=404, detail="信号不存在")
     return detail
+
+
+# ---------------------------------------------------------------------------
+# 绩效
+# ---------------------------------------------------------------------------
+@router.get("/performance", response_model=SignalCenterPerformance)
+async def performance(
+    filters: signal_stats.SignalFilters = Depends(_filters),
+    _: Principal = Depends(require_admin),
+):
+    """绩效：信号级 + 持仓级胜率，按周期 / 信号类型 / 入场原因分桶。
+
+    只统计 **AI 智能加仓（tpl_1）** 的任务 —— 其它模版的加仓语义不同，
+    混在一起算出来的胜率没有可比性。
+    """
+    return await signal_perf.performance(filters)
+
+
+@router.get("/quality", response_model=SignalCenterQuality)
+async def quality(
+    window: str = Query(signal_quality.DEFAULT_PRIOR_WINDOW),
+    _: Principal = Depends(require_admin),
+):
+    """质量分先验表：按「信号类型 × 周期」列出历史成功率。
+
+    **与绩效面板同源同口径**（都走 `signal_perf._aggregate`），数字必须对得上。
+
+    注意：先验**不受信号中心的其它筛选条影响** —— 它是背景知识，
+    固定按 `window` 拉全量算（见 `signal_quality` 模块 docstring 铁律 3）。
+    """
+    prior = await signal_quality.get_prior(window)
+    return {
+        "window": prior.get("window") or window,
+        "global": prior.get("global") or {},
+        "buckets": prior.get("buckets") or [],
+        "updated_at": prior.get("updated_at") or 0,
+    }
+
+
+@router.get("/ai/overview", response_model=AiOverview)
+async def ai_overview(
+    filters: signal_stats.SignalFilters = Depends(_filters),
+    _: Principal = Depends(require_admin),
+):
+    """AI 信号管理中心 · 上半屏：指标卡 + 质量总览 + 类型对比 + 周期总览 + TOP5。
+
+    质量分**只有一个实现**（`signal_quality`），等级是绝对阈值
+    （≥60 高 / 50-60 中 / <50 低）。
+    """
+    return await signal_ai_center.overview(filters)
+
+
+@router.get("/ai/tp-distribution", response_model=AiTpDistribution)
+async def ai_tp_distribution(
+    filters: signal_stats.SignalFilters = Depends(_filters),
+    store: RedisStore = Depends(get_store),
+    _: Principal = Depends(require_admin),
+):
+    """AI 信号管理中心 · 马丁止盈分布。
+
+    **按节点分开统计**（统计单元 = 信号 × 节点），不合并。
+    止损与持仓中的单元不进分布分母。
+    """
+    all_nodes = await store.all_nodes()
+    names = {n["node_id"]: n.get("name") or n["node_id"] for n in all_nodes}
+    return await signal_ai_center.tp_distribution(filters, node_names=names)
+
+
+@router.get("/ai/signals", response_model=AiSignalList)
+async def ai_signals(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=200),
+    tp_level: Optional[int] = Query(None, ge=0, le=5),
+    node_id: Optional[str] = Query(None),
+    type_group: Optional[str] = Query(None),
+    filters: signal_stats.SignalFilters = Depends(_filters),
+    _: Principal = Depends(require_admin),
+):
+    """AI 信号管理中心 · 信号明细表（页码分页）。
+
+    - `tp_level`：1..5 按档位筛；0 = 未止盈（持仓中 / 止损）；不传 = 不限；
+    - `type_group`：按**业务分类**筛（结构分析 = ob + fvg + pdz）——
+      分类下的多个类型码会展开成 `IN (...)`，只取一个码会漏掉另外两个。
+    """
+    return await signal_ai_center.signals_page(
+        filters, page=page, page_size=page_size,
+        tp_level=tp_level, node_id=node_id, type_group=type_group,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 路由
+# ---------------------------------------------------------------------------
+@router.post("/signals/{signal_id}/route", response_model=RouteResponse)
+async def route_signal(
+    signal_id: str,
+    body: RouteRequest,
+    request: Request,
+    dispatcher: GroupDispatcher = Depends(get_group_dispatcher),
+    _: Principal = Depends(require_admin),
+):
+    """把一条信号路由到指定的分组。
+
+    幂等：同一信号在同一分组已有**未收口**任务 → 409，并返回已有 task_id。
+    """
+    try:
+        result = await signal_routing.route_signal(
+            signal_id,
+            group_ids=body.group_ids,
+            dispatcher=dispatcher,
+            source_ip=client_ip(request),
+            volume=body.volume,
+            stop_loss=body.sl,
+            take_profit=body.tp,
+            note=body.note,
+        )
+    except signal_routing.RouteConflict as e:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(e),
+                "task_ids": e.task_ids,
+            },
+        )
+    except signal_routing.RouteInputError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {
+        "signal_id": signal_id,
+        "groups": result.get("groups", 0),
+        "targets": result.get("targets", 0),
+        "tasks": result.get("tasks", []),
+        "route_state": result.get("route_state", signal_meta.ROUTE_ROUTED),
+        "note": result.get("note"),
+    }
+
+
+@router.post("/signals/batch-route", response_model=BatchRouteResponse)
+async def batch_route(
+    body: BatchRouteRequest,
+    request: Request,
+    dispatcher: GroupDispatcher = Depends(get_group_dispatcher),
+    _: Principal = Depends(require_admin),
+):
+    """批量路由：逐条独立处理，一条失败不影响其余。"""
+    if not body.signal_ids:
+        raise HTTPException(status_code=400, detail="未指定信号")
+    if not body.group_ids:
+        raise HTTPException(status_code=400, detail="未指定目标分组")
+    return await signal_routing.route_many(
+        body.signal_ids,
+        group_ids=body.group_ids,
+        dispatcher=dispatcher,
+        source_ip=client_ip(request),
+        volume=body.volume,
+        stop_loss=body.sl,
+        take_profit=body.tp,
+        note=body.note,
+    )
+
+
+@router.post("/signals/{signal_id}/drop", response_model=DropResponse)
+async def drop_signal(
+    signal_id: str,
+    body: RouteRequest,
+    _: Principal = Depends(require_admin),
+):
+    """丢弃一条信号：不再路由到 center 分组。
+
+    **不影响已在跑的仓位** —— 要平仓请走 CLOSE 信号。
+    """
+    try:
+        result = await signal_routing.drop_signal(signal_id, note=body.note)
+    except signal_routing.RouteInputError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {
+        "signal_id": result["signal_id"],
+        "route_state": result["route_state"],
+        "note": result.get("note"),
+    }

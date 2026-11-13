@@ -334,6 +334,10 @@ class GroupCreate(BaseModel):
     limit_watch_keyword: Optional[str] = Field(default=None, max_length=32)
     # 是否开放【AI 交易】广场的跟单（默认关）；只对绑定 tpl_1 的分组有意义
     accept_ai_follow: bool = False
+    # 信号来源模式：direct（TV / 手动信号直连触发，默认）/ center（只接受信号中心下发）。
+    # center 模式下该分组不会被 webhook 自动触发，只能由管理员在信号中心里
+    # 选中信号后手工路由过来。
+    signal_source: str = "direct"
     remark: Optional[str] = None
     # 一对一绑定交易策略；空 / null = 不绑定
     strategy_id: Optional[str] = Field(default=None, max_length=32)
@@ -353,6 +357,8 @@ class GroupUpdate(BaseModel):
     limit_watch_keyword: Optional[str] = Field(default=None, max_length=32)
     # 是否开放【AI 交易】广场的跟单（默认关）；只对绑定 tpl_1 的分组有意义
     accept_ai_follow: Optional[bool] = None
+    # 信号来源模式：direct / center；省略则不改
+    signal_source: Optional[str] = None
     remark: Optional[str] = None
     # 传入空字符串或 null 表示解除绑定；省略字段则不改
     strategy_id: Optional[str] = Field(default=None, max_length=32)
@@ -432,6 +438,8 @@ class GroupOut(BaseModel):
     limit_watch_keyword: str = "limit"
     # 是否开放【AI 交易】广场的跟单（只对绑定 tpl_1 的分组有意义）
     accept_ai_follow: bool = False
+    # 信号来源模式：direct（默认，TV / 手动信号直连触发）/ center（只接受信号中心下发）
+    signal_source: str = "direct"
     strategy_id: Optional[str] = None
     strategy_name: Optional[str] = None
     remark: Optional[str] = None

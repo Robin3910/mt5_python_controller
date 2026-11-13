@@ -143,9 +143,15 @@ async def process_signal(
     # 9.7 幂等：在 DEDUP_WINDOW 秒内，相同(处理模型/动作/品种/手数/止盈止损)的信号视为重复；
     # 指纹带上 model 与两个定向字段，避免面向不同分组的信号互相误判为重复。
     # dedup_key：限价监听按 ticket 加盐，避免两张同参数触发单互相吞掉。
+    #
+    # 指纹**额外带上 signal_type 与 timeframe**：SMC 结构点告警的 sl/tp 是按 ATR 算的，
+    # 同一根 K 上「OB 回踩」与「FVG 出现」可能算出完全相同的 sl/tp —— 不带结构类型
+    # 区分，第二条会被静默吞掉，那个 signal_type 的胜率就永远统计不到（统计失真）。
+    # 这两个字段缺失时为空串：不带它们的老告警指纹**逐字节不变**，老链路行为零影响。
     fp = (
         f"{model}:{signal.action}:{signal.symbol}:{signal.volume}"
         f":{signal.stop_loss}:{signal.take_profit}"
+        f":{signal.signal_type or ''}:{signal.timeframe or ''}"
         f":{','.join(signal.template_ids)}:{','.join(signal.group_ids)}"
         f":{','.join(signal.node_ids)}"
     )
@@ -172,6 +178,18 @@ async def process_signal(
     if result.get("mode") == "rejected":
         return {
             "status": "rejected",
+            "signal_id": signal_id,
+            "model": model,
+            "action": signal.action,
+            "symbol": signal.symbol,
+            "volume": signal.volume,
+            "reason": result.get("reason"),
+            **result,
+        }
+    if result.get("mode") == "pending":
+        # 信号已入库，等待管理员在信号中心路由（命中的分组是「信号中心模式」）
+        return {
+            "status": "pending",
             "signal_id": signal_id,
             "model": model,
             "action": signal.action,

@@ -18,6 +18,7 @@ from . import (
     permissions,
     persist,
     rbac_service,
+    signal_meta,
 )
 from .connections import manager
 from .deps import (
@@ -44,6 +45,7 @@ from .models import (
 )
 from .permissions import MENU_GROUPS, Principal
 from .redis_store import RedisStore
+from .signal_meta import normalize_signal_source
 
 router = APIRouter(prefix="/api/groups", tags=["groups"])
 
@@ -74,6 +76,24 @@ def _validate_dispatch_mode(mode: str | None) -> None:
         raise HTTPException(
             status_code=400,
             detail=f"分发模式非法：{mode}（应为 {' / '.join(GROUP_DISPATCH_MODES)}）",
+        )
+
+
+def _validate_signal_source(source: str | None) -> None:
+    """信号来源模式入参校验；非法值 400，绝不静默回落。
+
+    这是**用户显式填的开关**，静默回落会让人以为改成了 center、实际还是
+    direct —— 那会导致「分组没反应」，且极难排查。所以这里宁可报错。
+    """
+    if source is None:
+        return
+    if source not in signal_meta.ROUTE_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"信号来源模式非法：{source}"
+                f"（应为 {' / '.join(signal_meta.ROUTE_MODES)}）"
+            ),
         )
 
 
@@ -156,6 +176,7 @@ async def _to_group_out(
         limit_watch_enabled=bool(d.get("limit_watch_enabled", False)),
         limit_watch_keyword=normalize_keyword(d.get("limit_watch_keyword")),
         accept_ai_follow=bool(d.get("accept_ai_follow", False)),
+        signal_source=normalize_signal_source(d.get("signal_source")),
         strategy_id=strategy_id,
         strategy_name=strategy_name,
         remark=d.get("remark"),
@@ -215,6 +236,7 @@ async def create_group(
 ):
     """新建分组：归创建者所有（管理员建的归管理员名下），名称在同一所有者内唯一。"""
     _validate_dispatch_mode(body.dispatch_mode)
+    _validate_signal_source(body.signal_source)
     owner = permissions.owner_for_new(p)
     name = body.name.strip()
     if await group_service.name_exists(name, owner_user_id=owner):
@@ -465,6 +487,7 @@ async def update_group(
 ):
     """更新分组（名称 / 启用状态 / 分发模式 / 信号并发 / 趋势风控 / 限价监听 / 成员上报开关 / 绑定策略 / 备注 / 成员节点）。"""
     _validate_dispatch_mode(body.dispatch_mode)
+    _validate_signal_source(body.signal_source)
     current = await owned_group_or_404(store, p, group_id)
     if body.name is not None and (name := body.name.strip()):
         if await group_service.name_exists(

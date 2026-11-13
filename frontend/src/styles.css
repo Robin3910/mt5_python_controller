@@ -3468,3 +3468,405 @@ body:has(.app-shell.is-customer) {
 @media (max-width: 429px) {
   .brand-page { display: none; }
 }
+
+/* ═══════════════════════════════════════════════════════════════════════
+   AI 信号管理中心（原型复刻）
+   沿用 pf- 设计令牌，不另起色板。
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* ── 指标卡 ── */
+.ai-kpi-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+@media (min-width: 900px) {
+  .ai-kpi-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}
+.ai-kpi { padding: 14px 16px; }
+.ai-kpi-k {
+  margin: 0;
+  font-size: 11px;
+  color: var(--pf-muted);
+}
+.ai-kpi-v {
+  margin: 6px 0 2px;
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1.1;
+  color: var(--pf-text);
+  font-family: var(--pf-mono, 'JetBrains Mono', monospace);
+}
+.ai-kpi-sub {
+  margin: 0;
+  font-size: 10px;
+  color: var(--pf-dim);
+}
+
+/* ── 分布条（等级 / 区间）── */
+.ai-sub-title {
+  margin: 0 0 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--pf-muted);
+}
+.ai-dist { display: flex; flex-direction: column; gap: 7px; }
+.ai-dist-row {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr) 92px 58px;
+  align-items: center;
+  gap: 8px;
+}
+.ai-dist-label { display: flex; }
+.ai-dist-label-wide {
+  font-size: 11px;
+  color: var(--pf-text);
+  white-space: nowrap;
+}
+.ai-dist-bar-wrap {
+  display: block;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--pf-soft);
+  border: 1px solid var(--pf-border-2);
+  overflow: hidden;
+}
+.ai-dist-bar {
+  display: block;
+  height: 100%;
+  min-width: 2px;
+  border-radius: 999px;
+  background: var(--pf-blue);
+}
+.ai-dist-bar.green { background: var(--pf-green); }
+.ai-dist-bar.blue { background: var(--pf-blue); }
+.ai-dist-bar.amber { background: #f59e0b; }
+.ai-dist-bar.grey { background: #4a5568; }
+.ai-dist-val {
+  font-size: 11px;
+  color: var(--pf-text);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.ai-dist-val em {
+  font-style: normal;
+  font-size: 10px;
+  color: var(--pf-dim);
+}
+.ai-dist-advice {
+  font-size: 10px;
+  color: var(--pf-dim);
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* ── 类型质量对比卡 ── */
+.ai-type-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+@media (min-width: 900px) {
+  .ai-type-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}
+.ai-type-card {
+  text-align: left;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--pf-border-2);
+  background: var(--pf-soft);
+  color: var(--pf-text);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.ai-type-card:hover { border-color: #2b3a5c; }
+.ai-type-card.active {
+  border-color: var(--pf-blue);
+  background: rgba(37, 99, 235, 0.12);
+}
+.ai-type-name {
+  margin: 0 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.ai-type-score {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 18px;
+  font-weight: 700;
+  font-family: var(--pf-mono, 'JetBrains Mono', monospace);
+}
+.ai-type-sub {
+  margin: 4px 0 0;
+  font-size: 10px;
+  color: var(--pf-dim);
+}
+
+/* ── 周期质量卡 ── */
+.ai-tf-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+@media (min-width: 720px) {
+  .ai-tf-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}
+.ai-tf-card {
+  text-align: left;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--pf-border-2);
+  background: var(--pf-soft);
+  color: var(--pf-text);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.ai-tf-card:hover { border-color: #2b3a5c; }
+.ai-tf-card.active {
+  border-color: var(--pf-blue);
+  background: rgba(37, 99, 235, 0.12);
+}
+.ai-tf-name {
+  margin: 0 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.ai-tf-score {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 17px;
+  font-weight: 700;
+  font-family: var(--pf-mono, 'JetBrains Mono', monospace);
+}
+.ai-tf-sub {
+  margin: 4px 0 0;
+  font-size: 10px;
+  color: var(--pf-dim);
+}
+.ai-tf-best {
+  margin: 4px 0 0;
+  font-size: 10px;
+  color: var(--pf-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── TOP 列表 ── */
+.ai-top-list { display: flex; flex-direction: column; gap: 6px; }
+.ai-top-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 9px;
+  border: 1px solid var(--pf-border-2);
+  background: var(--pf-soft);
+  color: var(--pf-text);
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+.ai-top-item:hover { border-color: #2b3a5c; }
+.ai-top-rank {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  background: rgba(37, 99, 235, 0.16);
+  color: #93c5fd;
+  font-size: 10px;
+  font-weight: 700;
+}
+.ai-top-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.ai-top-name {
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ai-top-meta {
+  font-size: 10px;
+  color: var(--pf-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── 马丁止盈分布 ── */
+.ai-tp-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+.ai-tp-body {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: 1fr;
+}
+@media (min-width: 900px) {
+  .ai-tp-body { grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); }
+}
+.ai-tp-node {
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--pf-border-2);
+  background: var(--pf-soft);
+}
+/* 合并成一条分布条之后，单条也要撑满左栏宽度 */
+.ai-tp-main .ai-tp-node { width: 100%; }
+.ai-tp-node-head {
+  margin: 0 0 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.ai-tp-node-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--pf-text);
+}
+.ai-tp-bar {
+  display: flex;
+  height: 14px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: #16213a;
+}
+.ai-tp-seg { display: block; height: 100%; min-width: 0; }
+.ai-tp-seg.lv1 { background: #22c55e; }
+.ai-tp-seg.lv2 { background: #34d399; }
+.ai-tp-seg.lv3 { background: #fbbf24; }
+.ai-tp-seg.lv4 { background: #f97316; }
+.ai-tp-seg.lv5 { background: #f6465d; }
+.ai-tp-legend {
+  margin: 8px 0 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-size: 10px;
+  color: var(--pf-dim);
+}
+.ai-tp-legend span { display: inline-flex; align-items: center; gap: 4px; }
+.ai-tp-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.ai-tp-dot.lv1 { background: #22c55e; }
+.ai-tp-dot.lv2 { background: #34d399; }
+.ai-tp-dot.lv3 { background: #fbbf24; }
+.ai-tp-dot.lv4 { background: #f97316; }
+.ai-tp-dot.lv5 { background: #f6465d; }
+.ai-tp-states { display: flex; gap: 8px; }
+.ai-tp-state {
+  flex: 1;
+  padding: 8px 10px;
+  border-radius: 9px;
+  border: 1px solid var(--pf-border-2);
+  background: var(--pf-soft);
+}
+.ai-tp-state-k {
+  display: block;
+  font-size: 10px;
+  color: var(--pf-dim);
+}
+.ai-tp-state-v {
+  display: block;
+  margin-top: 2px;
+  font-size: 16px;
+  font-weight: 700;
+  font-family: var(--pf-mono, 'JetBrains Mono', monospace);
+  color: var(--pf-text);
+}
+
+/* ── 明细表 ── */
+.ai-table-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.ai-table-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+}
+.ai-table-wrap { overflow-x: auto; }
+.ai-table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 860px;
+}
+.ai-table th,
+.ai-table td {
+  padding: 7px 8px;
+  font-size: 11px;
+  text-align: left;
+  border-bottom: 1px solid var(--pf-border-2);
+  white-space: nowrap;
+}
+.ai-table th {
+  color: var(--pf-dim);
+  font-weight: 500;
+  font-size: 10px;
+}
+.ai-table tbody tr:hover { background: rgba(255, 255, 255, 0.02); }
+.ai-table tbody tr:last-child td { border-bottom: none; }
+.ai-cell-name {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ai-score {
+  font-family: var(--pf-mono, 'JetBrains Mono', monospace);
+  font-weight: 600;
+}
+.ai-score.green { color: var(--pf-green); }
+.ai-score.blue { color: #60a5fa; }
+.ai-score.amber { color: #fbbf24; }
+.ai-score.grey { color: var(--pf-dim); }
+.ai-good { color: var(--pf-green); }
+.ai-dim { color: var(--pf-dim); }
+
+/* ── 分页 ── */
+.ai-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 10px;
+  font-size: 10px;
+}
+.ai-pager-btns { display: flex; gap: 6px; }
+
+/* ── 页脚口径 ── */
+.ai-footer {
+  margin: 0;
+  padding: 8px 2px;
+  font-size: 10px;
+  line-height: 1.7;
+  color: var(--pf-faint);
+}

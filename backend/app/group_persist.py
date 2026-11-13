@@ -20,13 +20,14 @@ from typing import Optional
 
 from sqlalchemy import func, or_, select, update
 
-from . import group_rules, latency_marks, signal_codes, strategy_templates
+from . import group_rules, latency_marks, signal_codes, signal_meta, strategy_templates
 from . import ai_follow_runtime
 from .db import SessionLocal
 from .orm import (
     GroupSignalTask,
     GroupTaskDispatch,
     GroupTaskEvent,
+    SignalEntryLeg,
     SignalHistory,
     TradingStrategy,
 )
@@ -83,6 +84,8 @@ async def create_task(
     raw_payload: Optional[str] = None,
     strategy: Optional[dict] = None,
     strategy_snapshot: Optional[dict] = None,
+    trigger_source: Optional[str] = None,
+    route_mode: Optional[str] = None,
 ) -> Optional[int]:
     """在下发节点之前创建一条分组主任务（分发记录），返回 task_id。
 
@@ -108,15 +111,117 @@ async def create_task(
                 strategy_snapshot_json=strategy_snapshot,
                 dispatch_mode=dispatch_mode,
                 status="pending",
+                trigger_source=signal_meta.safe_trigger_source(trigger_source),
+                route_mode=signal_meta.safe_route_mode(route_mode),
             )
             s.add(row)
             await s.flush()
             task_id = row.task_id
             await s.commit()
+            _expand_entry_legs(
+                s,
+                signal_id=signal_id,
+                task_id=task_id,
+                signal=signal,
+                snapshot=strategy_snapshot,
+            )
+            await s.commit()
             return task_id
     except Exception as e:  # noqa: BLE001
         logger.warning("create_task failed: %s", e)
         return None
+
+
+# ---------------------------------------------------------------------------
+# 入场明细（signal_entry_leg）
+# ---------------------------------------------------------------------------
+def _leg_rows(
+    *,
+    signal_id: str,
+    task_id: int,
+    signal,
+    snapshot: Optional[dict],
+) -> list[SignalEntryLeg]:
+    """按策略快照展开「这一次信号会有哪些入场」。
+
+    展开的是**计划**（首仓 + 各档加仓），成交后的手数 / 成交价 / 盈亏由
+    `record_strategy_progress` 与成交入库回填。
+
+    周期语义（务必分清）：
+    - 首仓用**信号级**周期（TV 告警带的 tf）；
+    - 加仓档位用**档位自己的**周期，但**点数（point）与指定价（price）恒为 NULL**
+      —— 这两种加仓不依赖周期，配了也不读。硬凑一个周期会把「点数间距」
+      混进「ATR 间距」的分桶，统计出来的胜率没有意义。
+    """
+    action = str(getattr(signal, "action", None) or "").upper() or None
+    symbol = str(getattr(signal, "symbol", None) or "").upper() or None
+    signal_tf = signal_meta.normalize_timeframe(getattr(signal, "timeframe", None))
+    signal_type = signal_meta.normalize_signal_type(getattr(signal, "signal_type", None))
+
+    # 首仓：入场原因 = 信号类型（未标注时归 first）
+    first_reason = signal_type or signal_meta.ENTRY_FIRST
+    rows: list[SignalEntryLeg] = [
+        SignalEntryLeg(
+            signal_id=signal_id,
+            task_id=task_id,
+            symbol=symbol,
+            action=action,
+            seq=0,
+            reason=signal_meta.normalize_entry_reason(first_reason) or signal_meta.ENTRY_FIRST,
+            rule_type=None,
+            level_index=None,
+            timeframe=signal_meta.leg_timeframe(first_reason, signal_tf),
+        )
+    ]
+
+    rules = (snapshot or {}).get("rules") if isinstance(snapshot, dict) else None
+    if not isinstance(rules, list):
+        return rows
+
+    seq = 0
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        rule_type = _int_or_none(rule.get("type"))
+        if rule_type is None:
+            continue
+        levels = rule.get("batch_levels")
+        if not isinstance(levels, list) or not levels:
+            continue
+        for idx, level in enumerate(levels):
+            if not isinstance(level, dict):
+                continue
+            calc_type = str(level.get("calc_type") or "").strip().lower()
+            reason = calc_type or signal_meta.ENTRY_POINT
+            seq += 1
+            rows.append(
+                SignalEntryLeg(
+                    signal_id=signal_id,
+                    task_id=task_id,
+                    symbol=symbol,
+                    action=action,
+                    seq=seq,
+                    reason=signal_meta.normalize_entry_reason(reason),
+                    rule_type=rule_type,
+                    level_index=idx,
+                    timeframe=signal_meta.leg_timeframe(reason, level.get("timeframe")),
+                )
+            )
+    return rows
+
+
+def _expand_entry_legs(
+    session, *, signal_id: str, task_id: int, signal, snapshot: Optional[dict],
+) -> None:
+    """把入场明细写进 `signal_entry_leg`（best-effort，失败不影响主任务）。"""
+    try:
+        rows = _leg_rows(
+            signal_id=signal_id, task_id=task_id, signal=signal, snapshot=snapshot,
+        )
+        if rows:
+            session.add_all(rows)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("expand entry legs failed: %s", e)
 
 
 async def create_dispatch(
@@ -1152,6 +1257,12 @@ async def record_strategy_progress(
                         detail_json=detail if isinstance(detail, dict) else None,
                     )
                 )
+                # 入场明细回填：把这一笔的手数 / 成交价落到对应的入场行
+                if is_order:
+                    await _update_entry_legs(
+                        s, task_id=task_id, node_id=node_id, magic=row.magic,
+                        event_type=event_type, detail=detail, order=order,
+                    )
 
             await s.flush()
             await _refresh_task_status(s, task_id)
@@ -1161,6 +1272,74 @@ async def record_strategy_progress(
     except Exception as e:  # noqa: BLE001
         logger.warning("record_strategy_progress failed: %s", e)
         return False
+
+
+async def _update_entry_legs(
+    session, *, task_id: int, node_id: str, magic: Optional[int],
+    event_type: str, detail: Optional[dict], order: dict,
+) -> None:
+    """节点回报成交后，把手数 / 成交价回填到对应的入场明细行。
+
+    匹配规则（从窄到宽，先命中先算）：
+    1. `detail.level_index` 有值 → 匹配该规则下的第 N 档；
+    2. 事件是首仓（open）→ 匹配 seq=0；
+    3. 都没有 → 退化成「该任务下还没填过手数的第一条」（兜底）。
+
+    回填是**尽力而为**：匹配不上就跳过，绝不影响交易逻辑。
+    """
+    if not isinstance(detail, dict):
+        detail = {}
+    volume = _num(order.get("volume")) or _num(detail.get("volume"))
+    price = _num(order.get("price")) or _num(detail.get("price"))
+    if volume is None and price is None:
+        return
+
+    stmt = select(SignalEntryLeg).where(SignalEntryLeg.task_id == task_id)
+    if magic is not None:
+        stmt = stmt.where(
+            or_(
+                SignalEntryLeg.magic == magic,
+                SignalEntryLeg.magic.is_(None),
+            )
+        )
+    rows = (await session.execute(stmt)).scalars().all()
+    if not rows:
+        return
+
+    level_index = _int_or_none(detail.get("level_index"))
+    rule_type = _int_or_none(detail.get("rule_type"))
+    target: Optional[SignalEntryLeg] = None
+    if level_index is not None:
+        for r in rows:
+            if r.level_index == level_index and (
+                rule_type is None or r.rule_type == rule_type
+            ):
+                target = r
+                break
+    if target is None and event_type == "open":
+        for r in rows:
+            if r.seq == 0:
+                target = r
+                break
+    if target is None:
+        for r in rows:
+            if r.volume is None and r.price is None:
+                target = r
+                break
+    if target is None:
+        return
+
+    if magic is not None and target.magic is None:
+        target.magic = magic
+    if node_id and not target.node_id:
+        target.node_id = node_id
+    if volume is not None:
+        target.volume = volume
+    if price is not None:
+        target.price = price
+    ticket = _int_or_none(order.get("ticket"))
+    if ticket is not None and target.order_ticket is None:
+        target.order_ticket = ticket
 
 
 async def record_strategy_update_ack(

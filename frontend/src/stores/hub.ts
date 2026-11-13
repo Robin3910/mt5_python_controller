@@ -1,8 +1,11 @@
 import { defineStore } from 'pinia'
-import api from '@/api/client'
+import api, { extractApiError } from '@/api/client'
 import type {
   AccountSnapshot,
   AdoptFollowersResult,
+  AiSignalList,
+  AiSignalOverview,
+  AiTpDistribution,
   CloseRequest,
   CloseBatchResult,
   CancelPendingRequest,
@@ -35,13 +38,18 @@ import type {
   PaginatedLimitWatchLogs,
   PaginatedNodeDispatches,
   PaginatedSignalEvents,
+  SignalBatchRouteRequest,
+  SignalBatchRouteResult,
   SignalCenterLatency,
   SignalCenterNodes,
   SignalCenterOverview,
+  SignalCenterPerformance,
+  SignalCenterQuality,
   SignalCenterQuery,
   SignalCenterDetail,
   SignalCenterStream,
   SignalCenterTasks,
+  SignalRouteRequest,
   StrategyCreatePayload,
   StrategyOut,
   StrategyTemplateOut,
@@ -86,7 +94,10 @@ function cleanQuery(query?: SignalCenterQuery): Record<string, string> {
   const out: Record<string, string> = {}
   if (!query) return out
   if (query.window) out.window = query.window
-  for (const key of ['source', 'model', 'symbol', 'action', 'status', 'node_id', 'group_id', 'keyword'] as const) {
+  for (const key of [
+    'source', 'model', 'symbol', 'action', 'status', 'node_id', 'group_id',
+    'keyword', 'timeframe', 'signal_type', 'route_state', 'direction',
+  ] as const) {
     const v = query[key]
     if (v) out[key] = v
   }
@@ -363,6 +374,120 @@ export const useHubStore = defineStore('hub', {
         return (await api.get(`/api/signal-center/signal/${signalId}`)).data
       } catch {
         return null
+      }
+    },
+    /** 绩效：信号级 + 持仓级胜率（只统计 tpl_1） */
+    async fetchSignalCenterPerformance(
+      query?: SignalCenterQuery,
+    ): Promise<SignalCenterPerformance | null> {
+      try {
+        return (
+          await api.get('/api/signal-center/performance', { params: cleanQuery(query) })
+        ).data
+      } catch {
+        return null
+      }
+    },
+    /** 质量分先验表（历史同类信号的成功率） */
+    async fetchSignalCenterQuality(
+      query?: SignalCenterQuery,
+    ): Promise<SignalCenterQuality | null> {
+      try {
+        return (
+          await api.get('/api/signal-center/quality', { params: cleanQuery(query) })
+        ).data
+      } catch {
+        return null
+      }
+    },
+    /** AI 信号管理中心 · 上半屏（指标卡 / 质量总览 / 类型对比 / 周期总览 / TOP5） */
+    async fetchAiSignalOverview(
+      query?: SignalCenterQuery,
+    ): Promise<AiSignalOverview | null> {
+      try {
+        return (
+          await api.get('/api/signal-center/ai/overview', { params: cleanQuery(query) })
+        ).data
+      } catch {
+        return null
+      }
+    },
+    /** AI 信号管理中心 · 马丁止盈分布（按节点分开统计） */
+    async fetchAiTpDistribution(
+      query?: SignalCenterQuery,
+    ): Promise<AiTpDistribution | null> {
+      try {
+        return (
+          await api.get('/api/signal-center/ai/tp-distribution', {
+            params: cleanQuery(query),
+          })
+        ).data
+      } catch {
+        return null
+      }
+    },
+    /** AI 信号管理中心 · 信号明细表（页码分页） */
+    async fetchAiSignals(params: {
+      query?: SignalCenterQuery
+      page?: number
+      page_size?: number
+      tp_level?: number | null
+      node_id?: string | null
+      type_group?: string | null
+    }): Promise<AiSignalList | null> {
+      const { query, page, page_size, tp_level, node_id, type_group } = params
+      try {
+        const paramsObj: Record<string, unknown> = {
+          ...(cleanQuery(query) as Record<string, unknown>),
+          page: page ?? 1,
+          page_size: page_size ?? 10,
+        }
+        if (tp_level !== null && tp_level !== undefined) {
+          paramsObj.tp_level = tp_level
+        }
+        if (node_id) paramsObj.node_id = node_id
+        if (type_group) paramsObj.type_group = type_group
+        return (await api.get('/api/signal-center/ai/signals', { params: paramsObj }))
+          .data
+      } catch {
+        return null
+      }
+    },
+    /** 把一条信号路由到指定分组；重复路由时后端返回 409 */
+    async routeSignal(
+      signalId: string,
+      body: SignalRouteRequest,
+    ): Promise<{ ok: boolean; message: string }> {
+      try {
+        await api.post(`/api/signal-center/signals/${signalId}/route`, body)
+        return { ok: true, message: '已下发' }
+      } catch (e) {
+        return { ok: false, message: extractApiError(e, '路由失败') }
+      }
+    },
+    /** 批量路由：逐条独立处理 */
+    async batchRouteSignals(
+      body: SignalBatchRouteRequest,
+    ): Promise<SignalBatchRouteResult | null> {
+      try {
+        return (await api.post('/api/signal-center/signals/batch-route', body)).data
+      } catch {
+        return null
+      }
+    },
+    /** 丢弃一条信号（不再路由到 center 分组） */
+    async dropSignal(
+      signalId: string,
+      note?: string | null,
+    ): Promise<{ ok: boolean; message: string }> {
+      try {
+        await api.post(`/api/signal-center/signals/${signalId}/drop`, {
+          group_ids: [],
+          note: note ?? null,
+        })
+        return { ok: true, message: '已丢弃' }
+      } catch (e) {
+        return { ok: false, message: extractApiError(e, '丢弃失败') }
       }
     },
     async fetchAudits(

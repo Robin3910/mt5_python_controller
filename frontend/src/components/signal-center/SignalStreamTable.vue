@@ -7,6 +7,7 @@
 import { ref } from 'vue'
 import { useHubStore } from '@/stores/hub'
 import type { SignalCenterDetail, SignalStreamItem } from '@/api/types'
+import QualityBadge from '@/components/signal-center/QualityBadge.vue'
 
 defineProps<{
   items: SignalStreamItem[]
@@ -119,6 +120,9 @@ function dispatchTag(status: string): { cls: string; text: string } {
             <span class="c-muted">时间</span>
             <span class="c-muted">品种</span>
             <span class="c-muted">动作</span>
+            <span class="c-muted">周期</span>
+            <span class="c-muted">类型</span>
+            <span class="c-muted">质量</span>
             <span class="c-muted">来源</span>
             <span class="c-muted">链路</span>
             <span class="c-muted">状态</span>
@@ -139,6 +143,9 @@ function dispatchTag(status: string): { cls: string; text: string } {
                 >{{ row.action }}</span>
                 <span v-else class="c-dim">—</span>
               </span>
+              <span class="c-muted">{{ row.timeframe || '—' }}</span>
+              <span class="c-muted">{{ row.signal_type || '—' }}</span>
+              <span><QualityBadge :quality="row.quality" /></span>
               <span><span class="pf-pill" :class="sourceTag(row.source).cls">{{ sourceTag(row.source).text }}</span></span>
               <span><span class="pf-pill" :class="modelTag(row.model).cls">{{ modelTag(row.model).text }}</span></span>
               <span><span class="pf-pill" :class="statusTag(row.status).cls">{{ statusTag(row.status).text }}</span></span>

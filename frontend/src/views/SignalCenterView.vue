@@ -1,243 +1,229 @@
 <script setup lang="ts">
-// 信号中心：把「信号 → 受理 → 分发 → 节点处理 → 成交」这条链路
-// 从原来分散在【事件】【分组管理】【成交明细】三个页面，收敛成一条可下钻的时间线。
+// **AI 信号管理中心**（原型复刻版）
 //
-// 设计要点（与 spec 对齐）：
-// 1. 五个频道（概览 / 信号流 / 节点命中 / 策略任务 / 时延）共享同一套筛选条件；
-// 2. 筛选条件是「全局的」，切 tab 不重置（用户在对比不同维度）；
-// 3. 分页用游标，不用页码（实时数据写入会让 offset 漂移）；
-// 4. 盈亏口径分区展示：策略任务的 realized_profit 与成交侧净盈亏不合并。
+// 单页多区块看板，1:1 对齐原型（灵光闪应用原型【我的】→【AI信号管理中心】）：
+//   页头 → 口径说明 → 4 指标卡 → 信号质量总览 → 类型质量对比 →
+//   周期质量总览 → 质量 TOP5 → 马丁止盈分布 → 信号明细表
+//
+// 旧版的【概览 / 信号流 / 节点命中 / 策略任务 / 时延】**已移除**（原型没有、用户不要）；
+// 旧版的【绩效 / 路由】**保留在 `SignalCenterLegacyView.vue`**，暂时不挂路由，未来可恢复。
+//
+// 设计与口径：`docs/superpowers/specs/2026-11-13-ai-signal-center-prototype-design.md`
 import { computed, onMounted, ref, watch } from 'vue'
-import SignalFilters from '@/components/signal-center/SignalFilters.vue'
-import SignalHero from '@/components/signal-center/SignalHero.vue'
-import SignalOverviewCharts from '@/components/signal-center/SignalOverviewCharts.vue'
-import SignalStreamTable from '@/components/signal-center/SignalStreamTable.vue'
-import NodeHitCards from '@/components/signal-center/NodeHitCards.vue'
-import StrategyTaskPanel from '@/components/signal-center/StrategyTaskPanel.vue'
-import LatencyPanel from '@/components/signal-center/LatencyPanel.vue'
+import AiKpiRow from '@/components/signal-center/ai/AiKpiRow.vue'
+import AiPageHeader from '@/components/signal-center/ai/AiPageHeader.vue'
+import AiSignalTable from '@/components/signal-center/ai/AiSignalTable.vue'
+import MartingaleTpDistribution from '@/components/signal-center/ai/MartingaleTpDistribution.vue'
+import QualityOverview from '@/components/signal-center/ai/QualityOverview.vue'
+import TimeframeQuality from '@/components/signal-center/ai/TimeframeQuality.vue'
+import TopSignalList from '@/components/signal-center/ai/TopSignalList.vue'
+import TypeQualityCompare from '@/components/signal-center/ai/TypeQualityCompare.vue'
 import { useHubStore } from '@/stores/hub'
 import type {
-  SignalCenterLatency,
-  SignalCenterNodes,
-  SignalCenterOverview,
+  AiSignalList,
+  AiSignalOverview,
+  AiTpDistribution,
   SignalCenterQuery,
-  SignalCenterStream,
-  SignalCenterTasks,
-  SignalStreamItem,
 } from '@/api/types'
 
 const hub = useHubStore()
 
-type TabKey = 'overview' | 'stream' | 'nodes' | 'tasks' | 'latency'
+/** 顶部窗口选择（原型「当前档位」） */
+const windowKey = ref('30d')
+const query = computed<SignalCenterQuery>(() => ({ window: windowKey.value }))
 
-const TABS: { key: TabKey; label: string }[] = [
-  { key: 'overview', label: '概览' },
-  { key: 'stream', label: '信号流' },
-  { key: 'nodes', label: '节点命中' },
-  { key: 'tasks', label: '策略任务' },
-  { key: 'latency', label: '时延' },
+const WINDOWS: { key: string; label: string }[] = [
+  { key: '7d', label: '近 7 天' },
+  { key: '30d', label: '近 30 天' },
+  { key: '90d', label: '近 90 天' },
+  { key: 'all', label: '全部' },
 ]
 
-const tab = ref<TabKey>('overview')
+const overview = ref<AiSignalOverview | null>(null)
+const tpDist = ref<AiTpDistribution | null>(null)
+const list = ref<AiSignalList | null>(null)
 
-/** 全局筛选：切 tab 保留，方便横向对比 */
-const query = ref<SignalCenterQuery>({ window: '30d' })
+const loading = ref(false)
+const loadingList = ref(false)
 
-const overview = ref<SignalCenterOverview | null>(null)
-const stream = ref<SignalCenterStream>({ items: [], next_cursor: null })
-const nodes = ref<SignalCenterNodes | null>(null)
-const tasks = ref<SignalCenterTasks | null>(null)
-const latency = ref<SignalCenterLatency | null>(null)
+// —— 联动筛选（点击周期卡 / 类型卡 / 止盈档位 → 过滤明细表）——
+const linkedTimeframe = ref<string | null>(null)
+/** 选中的**业务分类**（结构分析 = ob + fvg + pdz），后端按分类展开成 IN 过滤 */
+const linkedGroup = ref<string | null>(null)
+const linkedLevel = ref<number | null>(null)
 
-const loadingOverview = ref(false)
-const loadingStream = ref(false)
-const loadingNodes = ref(false)
-const loadingTasks = ref(false)
-const loadingLatency = ref(false)
+const page = ref(1)
+const pageSize = ref(10)
 
-const streamItems = computed<SignalStreamItem[]>(() => stream.value.items ?? [])
+/** 联动筛选写进查询条件 */
+const listQuery = computed<SignalCenterQuery>(() => ({
+  ...query.value,
+  timeframe: linkedTimeframe.value ?? undefined,
+}))
 
-/** 节点 / 分组下拉的候选项（用名称，不用裸 id） */
-const nodeOptions = computed(() =>
-  hub.nodes.map((n) => ({ node_id: n.node_id, name: n.name })),
+const scopeLabel = computed(() =>
+  WINDOWS.find((w) => w.key === windowKey.value)?.label ?? '全部',
 )
-const groupOptions = computed(() =>
-  hub.groups.map((g) => ({ group_id: g.group_id, name: g.name })),
-)
 
-function onFilterUpdate(patch: Partial<SignalCenterQuery>): void {
-  query.value = { ...query.value, ...patch }
-}
-
-/** 筛选变化：概览 / 节点 / 任务 / 时延都要重算，信号流重置到第一页 */
-watch(
-  () => ({ ...query.value }),
-  () => {
-    void loadOverview()
-    void loadNodes()
-    void loadTasks()
-    void loadLatency()
-    void resetStream()
-  },
-  { deep: true },
-)
+const updatedAt = computed(() => overview.value?.updated_at ?? null)
 
 async function loadOverview(): Promise<void> {
-  loadingOverview.value = true
+  loading.value = true
   try {
-    overview.value = await hub.fetchSignalCenterOverview(query.value)
+    const [ov, dist] = await Promise.all([
+      hub.fetchAiSignalOverview(query.value),
+      hub.fetchAiTpDistribution(query.value),
+    ])
+    overview.value = ov
+    tpDist.value = dist
   } finally {
-    loadingOverview.value = false
+    loading.value = false
   }
 }
 
-async function loadNodes(): Promise<void> {
-  loadingNodes.value = true
+async function loadList(): Promise<void> {
+  loadingList.value = true
   try {
-    nodes.value = await hub.fetchSignalCenterNodes(query.value)
+    list.value = await hub.fetchAiSignals({
+      query: listQuery.value,
+      page: page.value,
+      page_size: pageSize.value,
+      tp_level: linkedLevel.value,
+      type_group: linkedGroup.value,
+    })
   } finally {
-    loadingNodes.value = false
+    loadingList.value = false
   }
 }
 
-async function loadTasks(): Promise<void> {
-  loadingTasks.value = true
-  try {
-    tasks.value = await hub.fetchSignalCenterTasks(query.value)
-  } finally {
-    loadingTasks.value = false
-  }
+/** 联动筛选一变 → 回到第一页重拉明细 */
+function resetAndLoad(): void {
+  page.value = 1
+  void loadList()
 }
 
-async function loadLatency(): Promise<void> {
-  loadingLatency.value = true
-  try {
-    latency.value = await hub.fetchSignalCenterLatency(query.value)
-  } finally {
-    loadingLatency.value = false
-  }
+watch(windowKey, async () => {
+  await loadOverview()
+  resetAndLoad()
+})
+
+watch([linkedTimeframe, linkedGroup, linkedLevel], resetAndLoad)
+
+function onTypeSelect(group: string | null): void {
+  linkedGroup.value = group
 }
 
-async function resetStream(): Promise<void> {
-  loadingStream.value = true
-  try {
-    stream.value = await hub.fetchSignalCenterStream(query.value, null, 20)
-  } finally {
-    loadingStream.value = false
-  }
+function onTimeframeSelect(key: string | null): void {
+  linkedTimeframe.value = key
 }
 
-/** 游标翻页：带上前一次的 next_cursor 追加，而不是按页码重查 */
-async function loadMoreStream(): Promise<void> {
-  if (!stream.value.next_cursor) return
-  loadingStream.value = true
-  try {
-    const next = await hub.fetchSignalCenterStream(
-      query.value,
-      stream.value.next_cursor,
-      20,
-    )
-    stream.value = {
-      items: [...streamItems.value, ...(next.items ?? [])],
-      next_cursor: next.next_cursor,
-    }
-  } finally {
-    loadingStream.value = false
-  }
+function onLevelSelect(level: number | null): void {
+  linkedLevel.value = level
+}
+
+function clearFilters(): void {
+  linkedTimeframe.value = null
+  linkedGroup.value = null
+  linkedLevel.value = null
+}
+
+function onPageSize(size: number): void {
+  pageSize.value = size
+  resetAndLoad()
 }
 
 async function refreshAll(): Promise<void> {
-  await Promise.all([loadOverview(), loadNodes(), loadTasks(), loadLatency(), resetStream()])
+  await loadOverview()
+  await loadList()
 }
 
-onMounted(async () => {
-  // 节点 / 分组候选要等 hub 拉完，否则筛选下拉会是空的
-  if (!hub.nodes.length) await hub.fetchNodes()
-  if (!hub.groups.length) await hub.fetchGroups()
-  await refreshAll()
-})
+onMounted(refreshAll)
 </script>
 
 <template>
   <div class="pf-page sc-page">
     <!-- 页头 -->
-    <section class="pf-card">
-      <div class="pf-card-head">
-        <div class="pf-card-head-main">
-          <span class="pf-card-icon" aria-hidden="true">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M3 12h4l3 8 4-16 3 8h4" />
-            </svg>
-          </span>
-          <div>
-            <p class="pf-card-title">信号中心</p>
-            <p class="pf-card-sub">
-              信号受理 → 分发 → 节点处理 → 成交，全链路统一视图（仅管理员可见）
-            </p>
-          </div>
-        </div>
-        <button type="button" class="pf-btn" :disabled="loadingOverview" @click="refreshAll">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M21 12a9 9 0 1 1-3-6.7M21 3v6h-6" />
-          </svg>
-          刷新
-        </button>
-      </div>
-    </section>
-
-    <!-- 筛选条（全 tab 共享） -->
-    <SignalFilters
-      :query="query"
-      :nodes="nodeOptions"
-      :groups="groupOptions"
-      @update="onFilterUpdate"
+    <AiPageHeader
+      :scope-label="scopeLabel"
+      :updated-at="updatedAt"
+      :loading="loading"
+      :scope="overview?.scope"
+      @refresh="refreshAll"
     />
 
-    <!-- 频道切换 -->
-    <div class="pf-tabs">
+    <!-- 窗口档位 -->
+    <div class="pf-seg" style="margin-top: 12px">
       <button
-        v-for="t in TABS"
-        :key="t.key"
-        class="pf-tab"
-        :class="{ active: tab === t.key }"
-        @click="tab = t.key"
+        v-for="w in WINDOWS"
+        :key="w.key"
+        type="button"
+        class="pf-seg-item"
+        :class="{ active: windowKey === w.key }"
+        @click="windowKey = w.key"
       >
-        {{ t.label }}
+        {{ w.label }}
       </button>
     </div>
 
-    <!-- 概览 -->
-    <div v-show="tab === 'overview'">
-      <SignalHero :overview="overview" :loading="loadingOverview" />
-      <div style="margin-top: 12px">
-        <SignalOverviewCharts :overview="overview" />
-      </div>
-    </div>
+    <!-- 四个指标卡 -->
+    <AiKpiRow :kpi="overview?.kpi ?? null" />
 
-    <!-- 信号流 -->
-    <div v-show="tab === 'stream'">
-      <SignalStreamTable
-        :items="streamItems"
-        :loading="loadingStream"
-        :has-more="!!stream.next_cursor"
-        @load-more="loadMoreStream"
+    <!-- 信号质量总览 -->
+    <QualityOverview
+      :reliability="overview?.reliability ?? []"
+      :score-buckets="overview?.score_buckets ?? []"
+      :loading="loading"
+    />
+
+    <!-- 信号类型质量对比 -->
+    <TypeQualityCompare
+      :rows="overview?.by_type ?? []"
+      :selected="linkedGroup"
+      :loading="loading"
+      @select="onTypeSelect"
+    />
+
+    <!-- 周期质量总览 -->
+    <TimeframeQuality
+      :rows="overview?.by_timeframe ?? []"
+      :selected="linkedTimeframe"
+      :loading="loading"
+      @select="onTimeframeSelect"
+    />
+
+    <!-- 重点关注 · 质量 TOP 5 -->
+    <div class="pf-card">
+      <TopSignalList
+        title="重点关注 · 质量 TOP 5"
+        :rows="overview?.top_signals ?? []"
+        hint="按质量分降序"
+        :loading="loading"
       />
     </div>
 
-    <!-- 节点命中 -->
-    <div v-show="tab === 'nodes'">
-      <NodeHitCards :items="nodes?.items ?? []" :loading="loadingNodes" />
-    </div>
+    <!-- 马丁止盈分布 -->
+    <MartingaleTpDistribution
+      :dist="tpDist"
+      :selected-level="linkedLevel"
+      :loading="loading"
+      @select="onLevelSelect"
+    />
 
-    <!-- 策略任务 -->
-    <div v-show="tab === 'tasks'">
-      <StrategyTaskPanel :tasks="tasks" :loading="loadingTasks" />
-    </div>
+    <!-- 信号明细 -->
+    <AiSignalTable
+      :list="list"
+      :loading="loadingList"
+      :selected-timeframe="linkedTimeframe"
+      :selected-group="linkedGroup"
+      :selected-level="linkedLevel"
+      :page-size="pageSize"
+      @page="(p) => { page = p; void loadList() }"
+      @page-size="onPageSize"
+      @clear-filter="clearFilters"
+    />
 
-    <!-- 时延 -->
-    <div v-show="tab === 'latency'">
-      <LatencyPanel :latency="latency" :loading="loadingLatency" />
-    </div>
+    <!-- 页脚口径 -->
+    <p v-if="list?.scope" class="ai-footer">{{ list.scope }}</p>
   </div>
 </template>
 

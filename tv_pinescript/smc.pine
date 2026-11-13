@@ -1,0 +1,1482 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo
+
+//@version=6
+indicator('亿点点-smc', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+//---------------------------------------------------------------------------------------------------------------------}
+//CONSTANTS & STRINGS & INPUTS
+//---------------------------------------------------------------------------------------------------------------------{
+BULLISH_LEG = 1
+BEARISH_LEG = 0
+
+BULLISH = +1
+BEARISH = -1
+
+GREEN = #089981
+RED = #F23645
+BLUE = #2157f3
+GRAY = #878b94
+MONO_BULLISH = #b2b5be
+MONO_BEARISH = #5d606b
+
+HISTORICAL = 'Historical'
+PRESENT = 'Present'
+
+COLORED = 'Colored'
+MONOCHROME = 'Monochrome'
+
+ALL = 'All'
+BOS = 'BOS'
+CHOCH = 'CHoCH'
+
+TINY = size.tiny
+SMALL = size.small
+NORMAL = size.normal
+
+ATR = 'Atr'
+RANGE = 'Cumulative Mean Range'
+
+CLOSE = 'Close'
+HIGHLOW = 'High/Low'
+
+SOLID = '⎯⎯⎯'
+DASHED = '----'
+DOTTED = '····'
+
+SMART_GROUP = 'Smart Money Concepts'
+INTERNAL_GROUP = 'Real Time Internal Structure'
+SWING_GROUP = 'Real Time Swing Structure'
+BLOCKS_GROUP = 'Order Blocks'
+EQUAL_GROUP = 'EQH/EQL'
+GAPS_GROUP = 'Fair Value Gaps'
+LEVELS_GROUP = 'Highs & Lows MTF'
+ZONES_GROUP = 'Premium & Discount Zones'
+FIBO_GROUP = 'Fibonacci Retracement'
+WEBHOOK_GROUP = 'Signal Center Webhook'
+
+modeTooltip = 'Allows to display historical Structure or only the recent ones'
+styleTooltip = 'Indicator color theme'
+showTrendTooltip = 'Display additional candles with a color reflecting the current trend detected by structure'
+showInternalsTooltip = 'Display internal market structure'
+internalFilterConfluenceTooltip = 'Filter non significant internal structure breakouts'
+showStructureTooltip = 'Display swing market Structure'
+showSwingsTooltip = 'Display swing point as labels on the chart'
+showHighLowSwingsTooltip = 'Highlight most recent strong and weak high/low points on the chart'
+showInternalOrderBlocksTooltip = 'Display internal order blocks on the chart\n\nNumber of internal order blocks to display on the chart'
+showSwingOrderBlocksTooltip = 'Display swing order blocks on the chart\n\nNumber of internal swing blocks to display on the chart'
+orderBlockFilterTooltip = 'Method used to filter out volatile order blocks \n\nIt is recommended to use the cumulative mean range method when a low amount of data is available'
+orderBlockMitigationTooltip = 'Select what values to use for order block mitigation'
+showEqualHighsLowsTooltip = 'Display equal highs and equal lows on the chart'
+equalHighsLowsLengthTooltip = 'Number of bars used to confirm equal highs and equal lows'
+equalHighsLowsThresholdTooltip = 'Sensitivity threshold in a range (0, 1) used for the detection of equal highs & lows\n\nLower values will return fewer but more pertinent results'
+showFairValueGapsTooltip = 'Display fair values gaps on the chart'
+fairValueGapsThresholdTooltip = 'Filter out non significant fair value gaps'
+fairValueGapsTimeframeTooltip = 'Fair value gaps timeframe'
+fairValueGapsExtendTooltip = 'Determine how many bars to extend the Fair Value Gap boxes on chart'
+showPremiumDiscountZonesTooltip = 'Display premium, discount, and equilibrium zones on chart'
+
+modeInput = input.string(HISTORICAL, 'Mode', group = SMART_GROUP, tooltip = modeTooltip, options = [HISTORICAL, PRESENT])
+styleInput = input.string(COLORED, 'Style', group = SMART_GROUP, tooltip = styleTooltip, options = [COLORED, MONOCHROME])
+showTrendInput = input(false, 'Color Candles', group = SMART_GROUP, tooltip = showTrendTooltip)
+
+showInternalsInput = input(true, 'Show Internal Structure', group = INTERNAL_GROUP, tooltip = showInternalsTooltip)
+showInternalBullInput = input.string(ALL, 'Bullish Structure', group = INTERNAL_GROUP, inline = 'ibull', options = [ALL, BOS, CHOCH])
+internalBullColorInput = input(GREEN, '', group = INTERNAL_GROUP, inline = 'ibull')
+showInternalBearInput = input.string(ALL, 'Bearish Structure', group = INTERNAL_GROUP, inline = 'ibear', options = [ALL, BOS, CHOCH])
+internalBearColorInput = input(RED, '', group = INTERNAL_GROUP, inline = 'ibear')
+internalFilterConfluenceInput = input(false, 'Confluence Filter', group = INTERNAL_GROUP, tooltip = internalFilterConfluenceTooltip)
+internalStructureSize = input.string(TINY, 'Internal Label Size', group = INTERNAL_GROUP, options = [TINY, SMALL, NORMAL])
+
+showStructureInput = input(true, 'Show Swing Structure', group = SWING_GROUP, tooltip = showStructureTooltip)
+showSwingBullInput = input.string(ALL, 'Bullish Structure', group = SWING_GROUP, inline = 'bull', options = [ALL, BOS, CHOCH])
+swingBullColorInput = input(GREEN, '', group = SWING_GROUP, inline = 'bull')
+showSwingBearInput = input.string(ALL, 'Bearish Structure', group = SWING_GROUP, inline = 'bear', options = [ALL, BOS, CHOCH])
+swingBearColorInput = input(RED, '', group = SWING_GROUP, inline = 'bear')
+swingStructureSize = input.string(SMALL, 'Swing Label Size', group = SWING_GROUP, options = [TINY, SMALL, NORMAL])
+showSwingsInput = input(false, 'Show Swings Points', group = SWING_GROUP, tooltip = showSwingsTooltip, inline = 'swings')
+swingsLengthInput = input.int(50, '', group = SWING_GROUP, minval = 10, inline = 'swings')
+showHighLowSwingsInput = input(true, 'Show Strong/Weak High/Low', group = SWING_GROUP, tooltip = showHighLowSwingsTooltip)
+
+showInternalOrderBlocksInput = input(true, 'Internal Order Blocks', group = BLOCKS_GROUP, tooltip = showInternalOrderBlocksTooltip, inline = 'iob')
+internalOrderBlocksSizeInput = input.int(5, '', group = BLOCKS_GROUP, minval = 1, maxval = 20, inline = 'iob')
+showSwingOrderBlocksInput = input(true, 'Swing Order Blocks', group = BLOCKS_GROUP, tooltip = showSwingOrderBlocksTooltip, inline = 'ob')
+swingOrderBlocksSizeInput = input.int(5, '', group = BLOCKS_GROUP, minval = 1, maxval = 20, inline = 'ob')
+orderBlockFilterInput = input.string('Atr', 'Order Block Filter', group = BLOCKS_GROUP, tooltip = orderBlockFilterTooltip, options = [ATR, RANGE])
+orderBlockMitigationInput = input.string(HIGHLOW, 'Order Block Mitigation', group = BLOCKS_GROUP, tooltip = orderBlockMitigationTooltip, options = [CLOSE, HIGHLOW])
+internalBullishOrderBlockColor = input.color(color.new(#3179f5, 80), 'Internal Bullish OB', group = BLOCKS_GROUP)
+internalBearishOrderBlockColor = input.color(color.new(#f77c80, 80), 'Internal Bearish OB', group = BLOCKS_GROUP)
+swingBullishOrderBlockColor = input.color(color.new(#1848cc, 80), 'Bullish OB', group = BLOCKS_GROUP)
+swingBearishOrderBlockColor = input.color(color.new(#b22833, 80), 'Bearish OB', group = BLOCKS_GROUP)
+
+// OB Retest Alert Settings
+showOBRetestAlertInput = input.bool(true, 'OB Retest Alert', group = BLOCKS_GROUP, tooltip = 'Enable Order Block retest alerts')
+obRetestMaxCountInput = input.int(1, 'Max Retest Count', group = BLOCKS_GROUP, minval = 1, maxval = 10, tooltip = 'Maximum number of retests before the alert stops firing for that OB (if OB is not broken)')
+
+showEqualHighsLowsInput = input(true, 'Equal High/Low', group = EQUAL_GROUP, tooltip = showEqualHighsLowsTooltip)
+equalHighsLowsLengthInput = input.int(3, 'Bars Confirmation', group = EQUAL_GROUP, tooltip = equalHighsLowsLengthTooltip, minval = 1)
+equalHighsLowsThresholdInput = input.float(0.1, 'Threshold', group = EQUAL_GROUP, tooltip = equalHighsLowsThresholdTooltip, minval = 0, maxval = 0.5, step = 0.1)
+equalHighsLowsSizeInput = input.string(TINY, 'Label Size', group = EQUAL_GROUP, options = [TINY, SMALL, NORMAL])
+
+showFairValueGapsInput = input(true, 'Fair Value Gaps', group = GAPS_GROUP, tooltip = showFairValueGapsTooltip)
+fairValueGapsThresholdInput = input(true, 'Auto Threshold', group = GAPS_GROUP, tooltip = fairValueGapsThresholdTooltip)
+fairValueGapsTimeframeInput = input.timeframe('', 'Timeframe', group = GAPS_GROUP, tooltip = fairValueGapsTimeframeTooltip)
+fairValueGapsBullColorInput = input.color(color.new(#00ff68, 70), 'Bullish FVG', group = GAPS_GROUP)
+fairValueGapsBearColorInput = input.color(color.new(#ff0008, 70), 'Bearish FVG', group = GAPS_GROUP)
+fairValueGapsExtendInput = input.int(1, 'Extend FVG', group = GAPS_GROUP, tooltip = fairValueGapsExtendTooltip, minval = 0)
+
+showDailyLevelsInput = input(false, 'Daily', group = LEVELS_GROUP, inline = 'daily')
+dailyLevelsStyleInput = input.string(SOLID, '', group = LEVELS_GROUP, inline = 'daily', options = [SOLID, DASHED, DOTTED])
+dailyLevelsColorInput = input(BLUE, '', group = LEVELS_GROUP, inline = 'daily')
+showWeeklyLevelsInput = input(false, 'Weekly', group = LEVELS_GROUP, inline = 'weekly')
+weeklyLevelsStyleInput = input.string(SOLID, '', group = LEVELS_GROUP, inline = 'weekly', options = [SOLID, DASHED, DOTTED])
+weeklyLevelsColorInput = input(BLUE, '', group = LEVELS_GROUP, inline = 'weekly')
+showMonthlyLevelsInput = input(false, 'Monthly', group = LEVELS_GROUP, inline = 'monthly')
+monthlyLevelsStyleInput = input.string(SOLID, '', group = LEVELS_GROUP, inline = 'monthly', options = [SOLID, DASHED, DOTTED])
+monthlyLevelsColorInput = input(BLUE, '', group = LEVELS_GROUP, inline = 'monthly')
+
+showPremiumDiscountZonesInput = input(true, 'Premium/Discount Zones', group = ZONES_GROUP, tooltip = showPremiumDiscountZonesTooltip)
+premiumZoneColorInput = input.color(RED, 'Premium Zone', group = ZONES_GROUP)
+equilibriumZoneColorInput = input.color(GRAY, 'Equilibrium Zone', group = ZONES_GROUP)
+discountZoneColorInput = input.color(GREEN, 'Discount Zone', group = ZONES_GROUP)
+pdzRetestMaxCountInput = input.int(1, 'Max Retest Count', group = ZONES_GROUP, minval = 1, maxval = 10, tooltip = 'Premium/Discount Zone 回踩的最大报警次数（trailing 极值变化时计数器自动重置）')
+
+// === Fibonacci Retracement 输入 ===
+showFiboInput = input(true, 'Show Fibonacci', group = FIBO_GROUP, tooltip = '显示基于 swing 高低点的斐波那契回调位')
+showFib236Input = input(false, '0.236', group = FIBO_GROUP, inline = 'fib_levels')
+showFib382Input = input(false, '0.382', group = FIBO_GROUP, inline = 'fib_levels')
+showFib500Input = input(true, '0.500', group = FIBO_GROUP, inline = 'fib_levels')
+showFib618Input = input(true, '0.618', group = FIBO_GROUP, inline = 'fib_levels')
+showFib786Input = input(false, '0.786', group = FIBO_GROUP, inline = 'fib_levels')
+showFibTextInput = input(true, 'Show Level Text', group = FIBO_GROUP, tooltip = '在每条 Fibo 线右侧显示比例文字')
+fibo236ColorInput = input.color(color.new(#00BCD4, 0), '0.236 Color', group = FIBO_GROUP, inline = 'fib_colors')
+fibo382ColorInput = input.color(color.new(#2196F3, 0), '0.382 Color', group = FIBO_GROUP, inline = 'fib_colors')
+fibo500ColorInput = input.color(color.new(#4CAF50, 0), '0.500 Color', group = FIBO_GROUP, inline = 'fib_colors')
+fibo618ColorInput = input.color(color.new(#FF9800, 0), '0.618 Color', group = FIBO_GROUP, inline = 'fib_colors')
+fibo786ColorInput = input.color(color.new(#9C27B0, 0), '0.786 Color', group = FIBO_GROUP, inline = 'fib_colors')
+fiboRetestMaxCountInput = input.int(1, 'Max Retest Count', group = FIBO_GROUP, minval = 1, maxval = 10, tooltip = 'Fibo 触达的最大报警次数（trailing 极值变化时计数器自动重置）')
+
+// === 信号中心 Webhook 输入 ===
+// 打开后，指标在 K 线收盘时把结构点事件以 JSON 推给信号中心（/api/signal-center 链路）。
+// 载荷字段与后端 parser.py 对齐：action / symbol / volume / sl / tp / tf / signal_type / model / template_ids / token。
+// 三个开关互不干扰：既可以只推「开仓信号」，也可以只推「支撑阻力快照」，也可以都推。
+enableWebhookInput = input.bool(false, '启用信号中心推送', group = WEBHOOK_GROUP, tooltip = '打开后，K 线收盘时用 alert() 推送 JSON 到信号中心 Webhook 地址')
+webhookTokenInput = input.string('vlq8iAXw3cJcj0laJJ0dvVDDj6GH_YUho5vosh48ggk', '鉴权 Token', group = WEBHOOK_GROUP, tooltip = '与后端 /api/webhook 配置的 token 一致')
+webhookVolumeInput = input.float(0.1, '默认手数', group = WEBHOOK_GROUP, minval = 0.01, step = 0.01, tooltip = '开仓信号缺省手数；后端会在超上限时自动封顶')
+webhookTemplateInput = input.string('tpl_1', '目标策略模版', group = WEBHOOK_GROUP, tooltip = '逗号分隔的模版 ID 列表，决定哪些分组能收到该信号')
+webhookSlAtrInput = input.float(0, '止损 ATR 倍数', group = WEBHOOK_GROUP, minval = 0, step = 0.1, tooltip = '0 = 不带 sl（由策略自行计算止损）；>0 时按 ATR 计算止损价')
+webhookTpAtrInput = input.float(0, '止盈 ATR 倍数', group = WEBHOOK_GROUP, minval = 0, step = 0.1, tooltip = '0 = 不带 tp（由策略自行计算止盈）；>0 时按 ATR 计算止盈价')
+webhookAtrPeriodInput = input.int(14, 'ATR 周期', group = WEBHOOK_GROUP, minval = 2, maxval = 100, tooltip = '计算 sl / tp 用的 ATR 长度')
+webhookSignalInput = input.bool(true, '推送开仓信号', group = WEBHOOK_GROUP, tooltip = 'OB/FVG/PDZ/Fibo 结构点触发时推送带 signal_type 的开仓信号')
+
+// 注：原有的支撑阻力快照推送（type=smc-data）**保持原样**（每根 K 收盘必发），
+// 不受本组开关影响 —— 那是既有部署在用的链路，不能因为加了新开关就断掉。
+
+//---------------------------------------------------------------------------------------------------------------------}
+//DATA STRUCTURES & VARIABLES
+//---------------------------------------------------------------------------------------------------------------------{
+// @type                            UDT representing alerts as bool fields
+// @field internalBullishBOS        internal structure custom alert
+// @field internalBearishBOS        internal structure custom alert
+// @field internalBullishCHoCH      internal structure custom alert
+// @field internalBearishCHoCH      internal structure custom alert
+// @field swingBullishBOS           swing structure custom alert
+// @field swingBearishBOS           swing structure custom alert
+// @field swingBullishCHoCH         swing structure custom alert
+// @field swingBearishCHoCH         swing structure custom alert
+// @field internalBullishOrderBlock internal order block custom alert
+// @field internalBearishOrderBlock internal order block custom alert
+// @field swingBullishOrderBlock    swing order block custom alert
+// @field swingBearishOrderBlock    swing order block custom alert
+// @field equalHighs                equal high low custom alert
+// @field equalLows                 equal high low custom alert
+// @field bullishFairValueGap       fair value gap custom alert
+// @field bearishFairValueGap       fair value gap custom alert
+type alerts
+	bool internalBullishBOS = false
+	bool internalBearishBOS = false
+	bool internalBullishCHoCH = false
+	bool internalBearishCHoCH = false
+	bool swingBullishBOS = false
+	bool swingBearishBOS = false
+	bool swingBullishCHoCH = false
+	bool swingBearishCHoCH = false
+	bool internalBullishOrderBlock = false
+	bool internalBearishOrderBlock = false
+	bool swingBullishOrderBlock = false
+	bool swingBearishOrderBlock = false
+	bool bullishOBRetest = false
+	bool bearishOBRetest = false
+	bool internalBullishOBRetest = false
+	bool internalBearishOBRetest = false
+	bool equalHighs = false
+	bool equalLows = false
+	bool bullishFairValueGap = false
+	bool bearishFairValueGap = false
+	bool bullishPDZRetest = false // Discount Zone 回踩
+	bool bearishPDZRetest = false // Premium Zone 回踩
+	bool fib236Retest = false // 0.236 回踩（上升趋势：阴线下行触达）
+	bool fib236Bounce = false // 0.236 反弹（下降趋势：阳线上行触达）
+	bool fib382Retest = false // 0.382 回踩（上升趋势：阴线下行触达）
+	bool fib382Bounce = false // 0.382 反弹（下降趋势：阳线上行触达）
+	bool fib500Retest = false // 0.500 回踩（上升趋势：阴线下行触达）
+	bool fib500Bounce = false // 0.500 反弹（下降趋势：阳线上行触达）
+	bool fib618Retest = false // 0.618 回踩（上升趋势：阴线下行触达）
+	bool fib618Bounce = false // 0.618 反弹（下降趋势：阳线上行触达）
+	bool fib786Retest = false // 0.786 回踩（上升趋势：阴线下行触达）
+	bool fib786Bounce = false // 0.786 反弹（下降趋势：阳线上行触达）
+
+// @type                            UDT representing last swing extremes (top & bottom)
+// @field top                       last top swing price
+// @field bottom                    last bottom swing price
+// @field barTime                   last swing bar time
+// @field barIndex                  last swing bar index
+// @field lastTopTime               last top swing time
+// @field lastBottomTime            last bottom swing time
+type trailingExtremes
+	float top
+	float bottom
+	int barTime
+	int barIndex
+	int lastTopTime
+	int lastBottomTime
+	int lastTopBarIndex // 最近一次 trailing.top 更新时的 bar_index（用于 Premium Zone 回踩起点）
+	int lastBottomBarIndex // 最近一次 trailing.bottom 更新时的 bar_index（用于 Discount Zone 回踩起点）
+
+// @type                            UDT representing Fair Value Gaps
+// @field top                       top price
+// @field bottom                    bottom price
+// @field bias                      bias (BULLISH or BEARISH)
+// @field topBox                    top box
+// @field bottomBox                 bottom box
+type fairValueGap
+	float top
+	float bottom
+	int bias
+	box topBox
+	box bottomBox
+
+// @type                            UDT representing trend bias
+// @field bias                      BULLISH or BEARISH
+type trend
+	int bias
+
+// @type                            UDT representing Equal Highs Lows display
+// @field l_ine                     displayed line
+// @field l_abel                    displayed label
+type equalDisplay
+	line l_ine = na
+	label l_abel = na
+
+// @type                            UDT representing a pivot point (swing point) 
+// @field currentLevel              current price level
+// @field lastLevel                 last price level
+// @field crossed                   true if price level is crossed
+// @field barTime                   bar time
+// @field barIndex                  bar index    
+type pivot
+	float currentLevel
+	float lastLevel
+	bool crossed
+	int barTime = time
+	int barIndex = bar_index
+
+// @type                            UDT representing an order block
+// @field barHigh                   bar high
+// @field barLow                    bar low
+// @field barTime                   bar time
+// @field bias                      BULLISH or BEARISH
+// @field retestCount               number of times this OB has been retested (for retest alert tracking)
+type orderBlock
+	float barHigh
+	float barLow
+	int barTime
+	int bias
+	int retestCount = 0
+
+// @variable                        current swing pivot high    
+var pivot swingHigh = pivot.new(na, na, false)
+// @variable                        current swing pivot low
+var pivot swingLow = pivot.new(na, na, false)
+// @variable                        current internal pivot high
+var pivot internalHigh = pivot.new(na, na, false)
+// @variable                        current internal pivot low
+var pivot internalLow = pivot.new(na, na, false)
+// @variable                        current equal high pivot
+var pivot equalHigh = pivot.new(na, na, false)
+// @variable                        current equal low pivot
+var pivot equalLow = pivot.new(na, na, false)
+// @variable                        swing trend bias
+var trend swingTrend = trend.new(0)
+// @variable                        internal trend bias
+var trend internalTrend = trend.new(0)
+// @variable                        equal high display
+var equalDisplay equalHighDisplay = equalDisplay.new()
+// @variable                        equal low display
+var equalDisplay equalLowDisplay = equalDisplay.new()
+// @variable                        storage for fairValueGap UDTs
+var array<fairValueGap> fairValueGaps = array.new<fairValueGap>()
+// @variable                        storage for parsed highs
+var array<float> parsedHighs = array.new<float>()
+// @variable                        storage for parsed lows
+var array<float> parsedLows = array.new<float>()
+// @variable                        storage for raw highs
+var array<float> highs = array.new<float>()
+// @variable                        storage for raw lows
+var array<float> lows = array.new<float>()
+// @variable                        storage for bar time values
+var array<int> times = array.new<int>()
+// @variable                        last trailing swing high and low
+var trailingExtremes trailing = trailingExtremes.new()
+// @variable                                storage for orderBlock UDTs (swing order blocks)
+var array<orderBlock> swingOrderBlocks = array.new<orderBlock>()
+// @variable                                storage for orderBlock UDTs (internal order blocks)
+var array<orderBlock> internalOrderBlocks = array.new<orderBlock>()
+// @variable                                storage for swing order blocks boxes
+var array<box> swingOrderBlocksBoxes = array.new<box>()
+// @variable                                storage for internal order blocks boxes
+var array<box> internalOrderBlocksBoxes = array.new<box>()
+// @variable                        color for swing bullish structures
+var swingBullishColor = styleInput == MONOCHROME ? MONO_BULLISH : swingBullColorInput
+// @variable                        color for swing bearish structures
+var swingBearishColor = styleInput == MONOCHROME ? MONO_BEARISH : swingBearColorInput
+// @variable                        color for bullish fair value gaps
+var fairValueGapBullishColor = styleInput == MONOCHROME ? color.new(MONO_BULLISH, 70) : fairValueGapsBullColorInput
+// @variable                        color for bearish fair value gaps
+var fairValueGapBearishColor = styleInput == MONOCHROME ? color.new(MONO_BEARISH, 70) : fairValueGapsBearColorInput
+// @variable                        color for premium zone
+var premiumZoneColor = styleInput == MONOCHROME ? MONO_BEARISH : premiumZoneColorInput
+// @variable                        color for discount zone
+var discountZoneColor = styleInput == MONOCHROME ? MONO_BULLISH : discountZoneColorInput
+// @variable                        bar index on current script iteration
+varip int currentBarIndex = bar_index
+// @variable                        bar index on last script iteration
+varip int lastBarIndex = bar_index
+// @variable                        alerts in current bar
+alerts currentAlerts = alerts.new()
+// @variable                        time at start of chart
+var initialTime = time
+// @variable                        Premium/Discount Zone 回踩计数器
+var int discountZoneRetestCount = 0
+var int premiumZoneRetestCount = 0
+
+// @variable                        Fibonacci 触达计数器
+var int fib236RetestCount = 0
+var int fib382RetestCount = 0
+var int fib500RetestCount = 0
+var int fib618RetestCount = 0
+var int fib786RetestCount = 0
+
+// we create the needed boxes for displaying order blocks at the first execution
+if barstate.isfirst
+    if showSwingOrderBlocksInput
+        for index = 1 to swingOrderBlocksSizeInput by 1
+            swingOrderBlocksBoxes.push(box.new(na, na, na, na, xloc = xloc.bar_time, extend = extend.right))
+    if showInternalOrderBlocksInput
+        for index = 1 to internalOrderBlocksSizeInput by 1
+            internalOrderBlocksBoxes.push(box.new(na, na, na, na, xloc = xloc.bar_time, extend = extend.right))
+
+// @variable                        source to use in bearish order blocks mitigation
+bearishOrderBlockMitigationSource = orderBlockMitigationInput == CLOSE ? close : high
+// @variable                        source to use in bullish order blocks mitigation
+bullishOrderBlockMitigationSource = orderBlockMitigationInput == CLOSE ? close : low
+// @variable                        default volatility measure
+atrMeasure = ta.atr(200)
+// @variable                        parsed volatility measure by user settings
+volatilityMeasure = orderBlockFilterInput == ATR ? atrMeasure : ta.cum(ta.tr) / bar_index
+// @variable                        true if current bar is a high volatility bar
+highVolatilityBar = high - low >= 2 * volatilityMeasure
+// @variable                        parsed high
+parsedHigh = highVolatilityBar ? low : high
+// @variable                        parsed low
+parsedLow = highVolatilityBar ? high : low
+
+// we store current values into the arrays at each bar
+parsedHighs.push(parsedHigh)
+parsedLows.push(parsedLow)
+highs.push(high)
+lows.push(low)
+times.push(time)
+
+//---------------------------------------------------------------------------------------------------------------------}
+//USER-DEFINED FUNCTIONS
+//---------------------------------------------------------------------------------------------------------------------{
+// @function            Get the value of the current leg, it can be 0 (bearish) or 1 (bullish)
+// @returns             int
+leg(int size) =>
+    var leg = 0
+    newLegHigh = high[size] > ta.highest(size)
+    newLegLow = low[size] < ta.lowest(size)
+
+    if newLegHigh
+        leg := BEARISH_LEG
+        leg
+    else if newLegLow
+        leg := BULLISH_LEG
+        leg
+    leg
+
+// @function            Identify whether the current value is the start of a new leg (swing)
+// @param leg           (int) Current leg value
+// @returns             bool
+startOfNewLeg(int leg) =>
+    ta.change(leg) != 0
+
+// @function            Identify whether the current level is the start of a new bearish leg (swing)
+// @param leg           (int) Current leg value
+// @returns             bool
+startOfBearishLeg(int leg) =>
+    ta.change(leg) == -1
+
+// @function            Identify whether the current level is the start of a new bullish leg (swing)
+// @param leg           (int) Current leg value
+// @returns             bool
+startOfBullishLeg(int leg) =>
+    ta.change(leg) == +1
+
+// @function            create a new label
+// @param labelTime     bar time coordinate
+// @param labelPrice    price coordinate
+// @param tag           text to display
+// @param labelColor    text color
+// @param labelStyle    label style
+// @returns             label ID
+drawLabel(int labelTime, float labelPrice, string tag, color labelColor, string labelStyle) =>
+    var label l_abel = na
+
+    if modeInput == PRESENT
+        l_abel.delete()
+
+    l_abel := label.new(chart.point.new(labelTime, na, labelPrice), tag, xloc.bar_time, color = color(na), textcolor = labelColor, style = labelStyle, size = size.small)
+    l_abel
+
+// @function            create a new line and label representing an EQH or EQL
+// @param p_ivot        starting pivot
+// @param level         price level of current pivot
+// @param size          how many bars ago was the current pivot detected
+// @param equalHigh     true for EQH, false for EQL
+// @returns             label ID
+drawEqualHighLow(pivot p_ivot, float level, int size, bool equalHigh) =>
+    equalDisplay e_qualDisplay = equalHigh ? equalHighDisplay : equalLowDisplay
+
+    string tag = 'EQL'
+    color equalColor = swingBullishColor
+    string labelStyle = label.style_label_up
+
+    if equalHigh
+        tag := 'EQH'
+        equalColor := swingBearishColor
+        labelStyle := label.style_label_down
+        labelStyle
+
+    if modeInput == PRESENT
+        line.delete(e_qualDisplay.l_ine)
+        label.delete(e_qualDisplay.l_abel)
+
+    e_qualDisplay.l_ine := line.new(chart.point.new(p_ivot.barTime, na, p_ivot.currentLevel), chart.point.new(time[size], na, level), xloc = xloc.bar_time, color = equalColor, style = line.style_dotted)
+    labelPosition = math.round(0.5 * (p_ivot.barIndex + bar_index - size))
+    e_qualDisplay.l_abel := label.new(chart.point.new(na, labelPosition, level), tag, xloc.bar_index, color = color(na), textcolor = equalColor, style = labelStyle, size = equalHighsLowsSizeInput)
+    e_qualDisplay.l_abel
+
+// @function            store current structure and trailing swing points, and also display swing points and equal highs/lows
+// @param size          (int) structure size
+// @param equalHighLow  (bool) true for displaying current highs/lows
+// @param internal      (bool) true for getting internal structures
+// @returns             label ID
+getCurrentStructure(int size, bool equalHighLow = false, bool internal = false) =>
+    currentLeg = leg(size)
+    newPivot = startOfNewLeg(currentLeg)
+    pivotLow = startOfBullishLeg(currentLeg)
+    pivotHigh = startOfBearishLeg(currentLeg)
+
+    if newPivot
+        if pivotLow
+            pivot p_ivot = equalHighLow ? equalLow : internal ? internalLow : swingLow
+
+            if equalHighLow and math.abs(p_ivot.currentLevel - low[size]) < equalHighsLowsThresholdInput * atrMeasure
+                drawEqualHighLow(p_ivot, low[size], size, false)
+                currentAlerts.equalLows := true
+                currentAlerts.equalLows
+
+            p_ivot.lastLevel := p_ivot.currentLevel
+            p_ivot.currentLevel := low[size]
+            p_ivot.crossed := false
+            p_ivot.barTime := time[size]
+            p_ivot.barIndex := bar_index[size]
+
+            if not equalHighLow and not internal
+                trailing.bottom := p_ivot.currentLevel
+                trailing.barTime := p_ivot.barTime
+                trailing.barIndex := p_ivot.barIndex
+                trailing.lastBottomTime := p_ivot.barTime
+                trailing.lastBottomBarIndex := p_ivot.barIndex
+                trailing.lastBottomBarIndex
+
+            if showSwingsInput and not internal and not equalHighLow
+                drawLabel(time[size], p_ivot.currentLevel, p_ivot.currentLevel < p_ivot.lastLevel ? 'LL' : 'HL', swingBullishColor, label.style_label_up)
+        else
+            pivot p_ivot = equalHighLow ? equalHigh : internal ? internalHigh : swingHigh
+
+            if equalHighLow and math.abs(p_ivot.currentLevel - high[size]) < equalHighsLowsThresholdInput * atrMeasure
+                drawEqualHighLow(p_ivot, high[size], size, true)
+                currentAlerts.equalHighs := true
+                currentAlerts.equalHighs
+
+            p_ivot.lastLevel := p_ivot.currentLevel
+            p_ivot.currentLevel := high[size]
+            p_ivot.crossed := false
+            p_ivot.barTime := time[size]
+            p_ivot.barIndex := bar_index[size]
+
+            if not equalHighLow and not internal
+                trailing.top := p_ivot.currentLevel
+                trailing.barTime := p_ivot.barTime
+                trailing.barIndex := p_ivot.barIndex
+                trailing.lastTopTime := p_ivot.barTime
+                trailing.lastTopBarIndex := p_ivot.barIndex
+                trailing.lastTopBarIndex
+
+            if showSwingsInput and not internal and not equalHighLow
+                drawLabel(time[size], p_ivot.currentLevel, p_ivot.currentLevel > p_ivot.lastLevel ? 'HH' : 'LH', swingBearishColor, label.style_label_down)
+
+// @function                draw line and label representing a structure
+// @param p_ivot            base pivot point
+// @param tag               test to display
+// @param structureColor    base color
+// @param lineStyle         line style
+// @param labelStyle        label style
+// @param labelSize         text size
+// @returns                 label ID
+drawStructure(pivot p_ivot, string tag, color structureColor, string lineStyle, string labelStyle, string labelSize) =>
+    var line l_ine = line.new(na, na, na, na, xloc = xloc.bar_time)
+    var label l_abel = label.new(na, na)
+
+    if modeInput == PRESENT
+        l_ine.delete()
+        l_abel.delete()
+
+    l_ine := line.new(chart.point.new(p_ivot.barTime, na, p_ivot.currentLevel), chart.point.new(time, na, p_ivot.currentLevel), xloc.bar_time, color = structureColor, style = lineStyle)
+    l_abel := label.new(chart.point.new(na, math.round(0.5 * (p_ivot.barIndex + bar_index)), p_ivot.currentLevel), tag, xloc.bar_index, color = color(na), textcolor = structureColor, style = labelStyle, size = labelSize)
+    l_abel
+
+// @function            delete order blocks
+// @param internal      true for internal order blocks
+// @returns             orderBlock ID
+deleteOrderBlocks(bool internal = false) =>
+    array<orderBlock> orderBlocks = internal ? internalOrderBlocks : swingOrderBlocks
+
+    for [index, eachOrderBlock] in orderBlocks
+        bool crossedOderBlock = false
+
+        if bearishOrderBlockMitigationSource > eachOrderBlock.barHigh and eachOrderBlock.bias == BEARISH
+            crossedOderBlock := true
+            if internal
+                currentAlerts.internalBearishOrderBlock := true
+                currentAlerts.internalBearishOrderBlock
+            else
+                currentAlerts.swingBearishOrderBlock := true
+                currentAlerts.swingBearishOrderBlock
+        else if bullishOrderBlockMitigationSource < eachOrderBlock.barLow and eachOrderBlock.bias == BULLISH
+            crossedOderBlock := true
+            if internal
+                currentAlerts.internalBullishOrderBlock := true
+                currentAlerts.internalBullishOrderBlock
+            else
+                currentAlerts.swingBullishOrderBlock := true
+                currentAlerts.swingBullishOrderBlock
+        if crossedOderBlock
+            orderBlocks.remove(index)
+
+// @function            detect and trigger OB retest alerts
+// @param internal      true for internal order blocks
+// @returns             void
+detectOBRetest(bool internal = false) =>
+    array<orderBlock> orderBlocks = internal ? internalOrderBlocks : swingOrderBlocks
+
+    for [index, eachOrderBlock] in orderBlocks
+        bool retestOccurred = false
+
+        // Bearish OB (Resistance) retest condition: price comes back to test barLow
+        // Condition: high > barLow (price entered the OB zone) and low < barLow (pierced through) and close > open (bullish candle)
+        if eachOrderBlock.bias == BEARISH
+            bool resistanceRetest = high > eachOrderBlock.barLow and low < eachOrderBlock.barLow and close > open
+            if resistanceRetest
+                retestOccurred := true
+                // Only increment and trigger alert if retest count is within limit
+                if eachOrderBlock.retestCount < obRetestMaxCountInput
+                    eachOrderBlock.retestCount := eachOrderBlock.retestCount + 1
+                    if internal
+                        currentAlerts.internalBearishOBRetest := true
+                        currentAlerts.internalBearishOBRetest
+                    else
+                        currentAlerts.bearishOBRetest := true
+                        currentAlerts.bearishOBRetest
+                    log.info('OB回踩 | 阻力块 | bar=' + str.tostring(bar_index) + ' | 价格=' + str.tostring(close) + ' | barLow=' + str.tostring(eachOrderBlock.barLow) + ' | retestCount=' + str.tostring(eachOrderBlock.retestCount))
+
+        // Bullish OB (Support) retest condition: price comes back to test barHigh
+        // Condition: low < barHigh (price entered the OB zone) and high > barHigh (pierced through) and close < open (bearish candle)
+        if eachOrderBlock.bias == BULLISH
+            bool supportRetest = low < eachOrderBlock.barHigh and high > eachOrderBlock.barHigh and close < open
+            if supportRetest
+                retestOccurred := true
+                // Only increment and trigger alert if retest count is within limit
+                if eachOrderBlock.retestCount < obRetestMaxCountInput
+                    eachOrderBlock.retestCount := eachOrderBlock.retestCount + 1
+                    if internal
+                        currentAlerts.internalBullishOBRetest := true
+                        currentAlerts.internalBullishOBRetest
+                    else
+                        currentAlerts.bullishOBRetest := true
+                        currentAlerts.bullishOBRetest
+                    log.info('OB回踩 | 支撑块 | bar=' + str.tostring(bar_index) + ' | 价格=' + str.tostring(close) + ' | barHigh=' + str.tostring(eachOrderBlock.barHigh) + ' | retestCount=' + str.tostring(eachOrderBlock.retestCount))
+
+// @function            detect Premium/Discount Zone retest (返回结果，不修改全局变量)
+// @param zoneTop                 current zone top price (trailing.top)
+// @param zoneBottom              current zone bottom price (trailing.bottom)
+// @param topStartBarIndex        Premium Zone 上沿对应的 bar_index（即 trailing.top 最近一次生成的 bar_index）
+// @param bottomStartBarIndex     Discount Zone 下沿对应的 bar_index（即 trailing.bottom 最近一次生成的 bar_index）
+// @returns                       [discountRetestOccurred, premiumRetestOccurred]
+detectPDZRetest(float zoneTop, float zoneBottom, int topStartBarIndex, int bottomStartBarIndex) =>
+    // Zone 边界
+    float premiumTop = zoneTop
+    float premiumBottom = 0.95 * zoneTop + 0.05 * zoneBottom
+    float discountTop = 0.95 * zoneBottom + 0.05 * zoneTop
+    float discountBottom = zoneBottom
+
+    // 判断当前K与 Zone 起点的距离
+    // Premium Zone 用 top 的最新生成点；Discount Zone 用 bottom 的最新生成点
+    int premiumBarDistance = bar_index - topStartBarIndex
+    int discountBarDistance = bar_index - bottomStartBarIndex
+    bool premiumBarDistanceOk = premiumBarDistance >= 30
+    bool discountBarDistanceOk = discountBarDistance >= 30
+
+// log.info('PDZ | bar_index=' + str.tostring(bar_index) + ' | topStart=' + str.tostring(topStartBarIndex) + ' | bottomStart=' + str.tostring(bottomStartBarIndex))
+
+    // Discount Zone（看涨回踩）：K线刺穿 zone 上沿
+    bool discountRetest = discountBarDistanceOk and high > discountTop and low < discountTop
+
+    // Premium Zone（看跌回踩）：K线刺穿 zone 下沿
+    bool premiumRetest = premiumBarDistanceOk and high > premiumBottom and low < premiumBottom
+
+    [discountRetest, premiumRetest]
+
+// @function            fetch and store order blocks
+// @param p_ivot        base pivot point
+// @param internal      true for internal order blocks
+// @param bias          BULLISH or BEARISH
+// @returns             void
+storeOrdeBlock(pivot p_ivot, bool internal = false, int bias) =>
+    if not internal and showSwingOrderBlocksInput or internal and showInternalOrderBlocksInput
+
+        array<float> a_rray = na
+        int parsedIndex = na
+
+        if bias == BEARISH
+            a_rray := parsedHighs.slice(p_ivot.barIndex, bar_index)
+            parsedIndex := p_ivot.barIndex + a_rray.indexof(a_rray.max())
+            parsedIndex
+        else
+            a_rray := parsedLows.slice(p_ivot.barIndex, bar_index)
+            parsedIndex := p_ivot.barIndex + a_rray.indexof(a_rray.min())
+            parsedIndex
+
+        orderBlock o_rderBlock = orderBlock.new(parsedHighs.get(parsedIndex), parsedLows.get(parsedIndex), times.get(parsedIndex), bias)
+        array<orderBlock> orderBlocks = internal ? internalOrderBlocks : swingOrderBlocks
+
+        if orderBlocks.size() >= 100
+            orderBlocks.pop()
+        orderBlocks.unshift(o_rderBlock)
+
+// @function            draw order blocks as boxes
+// @param internal      true for internal order blocks
+// @returns             void
+drawOrderBlocks(bool internal = false) =>
+    array<orderBlock> orderBlocks = internal ? internalOrderBlocks : swingOrderBlocks
+    orderBlocksSize = orderBlocks.size()
+
+    if orderBlocksSize > 0
+        maxOrderBlocks = internal ? internalOrderBlocksSizeInput : swingOrderBlocksSizeInput
+        array<orderBlock> parsedOrdeBlocks = orderBlocks.slice(0, math.min(maxOrderBlocks, orderBlocksSize))
+        array<box> b_oxes = internal ? internalOrderBlocksBoxes : swingOrderBlocksBoxes
+
+        for [index, eachOrderBlock] in parsedOrdeBlocks
+            orderBlockColor = styleInput == MONOCHROME ? eachOrderBlock.bias == BEARISH ? color.new(MONO_BEARISH, 80) : color.new(MONO_BULLISH, 80) : internal ? eachOrderBlock.bias == BEARISH ? internalBearishOrderBlockColor : internalBullishOrderBlockColor : eachOrderBlock.bias == BEARISH ? swingBearishOrderBlockColor : swingBullishOrderBlockColor
+
+            box b_ox = b_oxes.get(index)
+            b_ox.set_top_left_point(chart.point.new(eachOrderBlock.barTime, na, eachOrderBlock.barHigh))
+            b_ox.set_bottom_right_point(chart.point.new(last_bar_time, na, eachOrderBlock.barLow))
+            b_ox.set_border_color(internal ? na : orderBlockColor)
+            b_ox.set_bgcolor(orderBlockColor)
+
+// @function            detect and draw structures, also detect and store order blocks
+// @param internal      true for internal structures or order blocks
+// @returns             void
+displayStructure(bool internal = false) =>
+    var bullishBar = true
+    var bearishBar = true
+
+    if internalFilterConfluenceInput
+        bullishBar := high - math.max(close, open) > math.min(close, open - low)
+        bearishBar := high - math.max(close, open) < math.min(close, open - low)
+        bearishBar
+
+    pivot p_ivot = internal ? internalHigh : swingHigh
+    trend t_rend = internal ? internalTrend : swingTrend
+
+    lineStyle = internal ? line.style_dashed : line.style_solid
+    labelSize = internal ? internalStructureSize : swingStructureSize
+
+    extraCondition = internal ? internalHigh.currentLevel != swingHigh.currentLevel and bullishBar : true
+    bullishColor = styleInput == MONOCHROME ? MONO_BULLISH : internal ? internalBullColorInput : swingBullColorInput
+
+    if ta.crossover(close, p_ivot.currentLevel) and not p_ivot.crossed and extraCondition
+        string tag = t_rend.bias == BEARISH ? CHOCH : BOS
+
+        if internal
+            currentAlerts.internalBullishCHoCH := tag == CHOCH
+            currentAlerts.internalBullishBOS := tag == BOS
+            currentAlerts.internalBullishBOS
+        else
+            currentAlerts.swingBullishCHoCH := tag == CHOCH
+            currentAlerts.swingBullishBOS := tag == BOS
+            currentAlerts.swingBullishBOS
+
+        p_ivot.crossed := true
+        t_rend.bias := BULLISH
+
+        displayCondition = internal ? showInternalsInput and (showInternalBullInput == ALL or showInternalBullInput == BOS and tag != CHOCH or showInternalBullInput == CHOCH and tag == CHOCH) : showStructureInput and (showSwingBullInput == ALL or showSwingBullInput == BOS and tag != CHOCH or showSwingBullInput == CHOCH and tag == CHOCH)
+
+        if displayCondition
+            drawStructure(p_ivot, tag, bullishColor, lineStyle, label.style_label_down, labelSize)
+
+        if internal and showInternalOrderBlocksInput or not internal and showSwingOrderBlocksInput
+            storeOrdeBlock(p_ivot, internal, BULLISH)
+
+    p_ivot := internal ? internalLow : swingLow
+    extraCondition := internal ? internalLow.currentLevel != swingLow.currentLevel and bearishBar : true
+    bearishColor = styleInput == MONOCHROME ? MONO_BEARISH : internal ? internalBearColorInput : swingBearColorInput
+
+    if ta.crossunder(close, p_ivot.currentLevel) and not p_ivot.crossed and extraCondition
+        string tag = t_rend.bias == BULLISH ? CHOCH : BOS
+
+        if internal
+            currentAlerts.internalBearishCHoCH := tag == CHOCH
+            currentAlerts.internalBearishBOS := tag == BOS
+            currentAlerts.internalBearishBOS
+        else
+            currentAlerts.swingBearishCHoCH := tag == CHOCH
+            currentAlerts.swingBearishBOS := tag == BOS
+            currentAlerts.swingBearishBOS
+
+        p_ivot.crossed := true
+        t_rend.bias := BEARISH
+
+        displayCondition = internal ? showInternalsInput and (showInternalBearInput == ALL or showInternalBearInput == BOS and tag != CHOCH or showInternalBearInput == CHOCH and tag == CHOCH) : showStructureInput and (showSwingBearInput == ALL or showSwingBearInput == BOS and tag != CHOCH or showSwingBearInput == CHOCH and tag == CHOCH)
+
+        if displayCondition
+            drawStructure(p_ivot, tag, bearishColor, lineStyle, label.style_label_up, labelSize)
+
+        if internal and showInternalOrderBlocksInput or not internal and showSwingOrderBlocksInput
+            storeOrdeBlock(p_ivot, internal, BEARISH)
+
+// @function            draw one fair value gap box (each fair value gap has two boxes)
+// @param leftTime      left time coordinate
+// @param rightTime     right time coordinate
+// @param topPrice      top price level
+// @param bottomPrice   bottom price level
+// @param boxColor      box color
+// @returns             box ID
+fairValueGapBox(leftTime, rightTime, topPrice, bottomPrice, boxColor) =>
+    box.new(chart.point.new(leftTime, na, topPrice), chart.point.new(rightTime + fairValueGapsExtendInput * (time - time[1]), na, bottomPrice), xloc = xloc.bar_time, border_color = boxColor, bgcolor = boxColor)
+
+// @function            delete fair value gaps
+// @returns             fairValueGap ID
+deleteFairValueGaps() =>
+    for [index, eachFairValueGap] in fairValueGaps
+        if low < eachFairValueGap.bottom and eachFairValueGap.bias == BULLISH or high > eachFairValueGap.top and eachFairValueGap.bias == BEARISH
+            eachFairValueGap.topBox.delete()
+            eachFairValueGap.bottomBox.delete()
+            fairValueGaps.remove(index)
+
+// @function            draw fair value gaps
+// @returns             fairValueGap ID
+drawFairValueGaps() =>
+    [lastClose, lastOpen, lastTime, currentHigh, currentLow, currentTime, last2High, last2Low] = request.security(syminfo.tickerid, fairValueGapsTimeframeInput, [close[1], open[1], time[1], high[0], low[0], time[0], high[2], low[2]], lookahead = barmerge.lookahead_on)
+
+    barDeltaPercent = (lastClose - lastOpen) / (lastOpen * 100)
+    newTimeframe = timeframe.change(fairValueGapsTimeframeInput)
+    threshold = fairValueGapsThresholdInput ? ta.cum(math.abs(newTimeframe ? barDeltaPercent : 0)) / bar_index * 2 : 0
+
+    bullishFairValueGap = currentLow > last2High and lastClose > last2High and barDeltaPercent > threshold and newTimeframe
+    bearishFairValueGap = currentHigh < last2Low and lastClose < last2Low and -barDeltaPercent > threshold and newTimeframe
+
+    if bullishFairValueGap
+        currentAlerts.bullishFairValueGap := true
+        if barstate.isconfirmed
+            log.info('多头FVG出现 top=' + str.tostring(currentLow) + ' bottom=' + str.tostring(last2High) + ' time=' + str.tostring(currentTime))
+        fairValueGaps.unshift(fairValueGap.new(currentLow, last2High, BULLISH, fairValueGapBox(lastTime, currentTime, currentLow, math.avg(currentLow, last2High), fairValueGapBullishColor), fairValueGapBox(lastTime, currentTime, math.avg(currentLow, last2High), last2High, fairValueGapBullishColor)))
+    if bearishFairValueGap
+        currentAlerts.bearishFairValueGap := true
+        if barstate.isconfirmed
+            log.info('空头FVG出现 top=' + str.tostring(currentHigh) + ' bottom=' + str.tostring(last2Low) + ' time=' + str.tostring(currentTime))
+        fairValueGaps.unshift(fairValueGap.new(currentHigh, last2Low, BEARISH, fairValueGapBox(lastTime, currentTime, currentHigh, math.avg(currentHigh, last2Low), fairValueGapBearishColor), fairValueGapBox(lastTime, currentTime, math.avg(currentHigh, last2Low), last2Low, fairValueGapBearishColor)))
+
+
+// @function            get line style from string
+// @param style         line style
+// @returns             string
+getStyle(string style) =>
+    switch style
+        SOLID => line.style_solid
+        DASHED => line.style_dashed
+        DOTTED => line.style_dotted
+
+// @function            draw MultiTimeFrame levels
+// @param timeframe     base timeframe
+// @param sameTimeframe true if chart timeframe is same as base timeframe
+// @param style         line style
+// @param levelColor    line and text color
+// @returns             void
+drawLevels(string timeframe, bool sameTimeframe, string style, color levelColor) =>
+    [topLevel, bottomLevel, leftTime, rightTime] = request.security(syminfo.tickerid, timeframe, [high[1], low[1], time[1], time], lookahead = barmerge.lookahead_on)
+
+    float parsedTop = sameTimeframe ? high : topLevel
+    float parsedBottom = sameTimeframe ? low : bottomLevel
+
+    int parsedLeftTime = sameTimeframe ? time : leftTime
+    int parsedRightTime = sameTimeframe ? time : rightTime
+
+    int parsedTopTime = time
+    int parsedBottomTime = time
+
+    if not sameTimeframe
+        int leftIndex = times.binary_search_rightmost(parsedLeftTime)
+        int rightIndex = times.binary_search_rightmost(parsedRightTime)
+
+        array<int> timeArray = times.slice(leftIndex, rightIndex)
+        array<float> topArray = highs.slice(leftIndex, rightIndex)
+        array<float> bottomArray = lows.slice(leftIndex, rightIndex)
+
+        parsedTopTime := timeArray.size() > 0 ? timeArray.get(topArray.indexof(topArray.max())) : initialTime
+        parsedBottomTime := timeArray.size() > 0 ? timeArray.get(bottomArray.indexof(bottomArray.min())) : initialTime
+        parsedBottomTime
+
+    var line topLine = line.new(na, na, na, na, xloc = xloc.bar_time, color = levelColor, style = getStyle(style))
+    var line bottomLine = line.new(na, na, na, na, xloc = xloc.bar_time, color = levelColor, style = getStyle(style))
+    var label topLabel = label.new(na, na, xloc = xloc.bar_time, text = str.format('P{0}H', timeframe), color = color(na), textcolor = levelColor, size = size.small, style = label.style_label_left)
+    var label bottomLabel = label.new(na, na, xloc = xloc.bar_time, text = str.format('P{0}L', timeframe), color = color(na), textcolor = levelColor, size = size.small, style = label.style_label_left)
+
+    topLine.set_first_point(chart.point.new(parsedTopTime, na, parsedTop))
+    topLine.set_second_point(chart.point.new(last_bar_time + 20 * (time - time[1]), na, parsedTop))
+    topLabel.set_point(chart.point.new(last_bar_time + 20 * (time - time[1]), na, parsedTop))
+
+    bottomLine.set_first_point(chart.point.new(parsedBottomTime, na, parsedBottom))
+    bottomLine.set_second_point(chart.point.new(last_bar_time + 20 * (time - time[1]), na, parsedBottom))
+    bottomLabel.set_point(chart.point.new(last_bar_time + 20 * (time - time[1]), na, parsedBottom))
+
+// @function            true if chart timeframe is higher than provided timeframe
+// @param timeframe     timeframe to check
+// @returns             bool
+higherTimeframe(string timeframe) =>
+    timeframe.in_seconds() > timeframe.in_seconds(timeframe)
+
+// @function            update trailing swing points
+// @returns             int
+updateTrailingExtremes() =>
+    trailing.top := math.max(high, trailing.top)
+    trailing.lastTopTime := trailing.top == high ? time : trailing.lastTopTime
+    trailing.lastTopBarIndex := trailing.top == high ? bar_index : trailing.lastTopBarIndex
+    trailing.bottom := math.min(low, trailing.bottom)
+    trailing.lastBottomTime := trailing.bottom == low ? time : trailing.lastBottomTime
+    trailing.lastBottomBarIndex := trailing.bottom == low ? bar_index : trailing.lastBottomBarIndex
+    trailing.lastBottomBarIndex
+
+// @function            draw trailing swing points
+// @returns             void
+drawHighLowSwings() =>
+    var line topLine = line.new(na, na, na, na, color = swingBearishColor, xloc = xloc.bar_time)
+    var line bottomLine = line.new(na, na, na, na, color = swingBullishColor, xloc = xloc.bar_time)
+    var label topLabel = label.new(na, na, color = color(na), textcolor = swingBearishColor, xloc = xloc.bar_time, style = label.style_label_down, size = size.tiny)
+    var label bottomLabel = label.new(na, na, color = color(na), textcolor = swingBullishColor, xloc = xloc.bar_time, style = label.style_label_up, size = size.tiny)
+
+    rightTimeBar = last_bar_time + 20 * (time - time[1])
+
+    topLine.set_first_point(chart.point.new(trailing.lastTopTime, na, trailing.top))
+    topLine.set_second_point(chart.point.new(rightTimeBar, na, trailing.top))
+    topLabel.set_point(chart.point.new(rightTimeBar, na, trailing.top))
+    topLabel.set_text(swingTrend.bias == BEARISH ? 'Strong High' : 'Weak High')
+
+    bottomLine.set_first_point(chart.point.new(trailing.lastBottomTime, na, trailing.bottom))
+    bottomLine.set_second_point(chart.point.new(rightTimeBar, na, trailing.bottom))
+    bottomLabel.set_point(chart.point.new(rightTimeBar, na, trailing.bottom))
+    bottomLabel.set_text(swingTrend.bias == BULLISH ? 'Strong Low' : 'Weak Low')
+
+// @function            draw a zone with a label and a box
+// @param labelLevel    price level for label
+// @param labelIndex    bar index for label
+// @param top           top price level for box
+// @param bottom        bottom price level for box
+// @param tag           text to display
+// @param zoneColor     base color
+// @param style         label style
+// @returns             void
+drawZone(float labelLevel, int labelIndex, float top, float bottom, string tag, color zoneColor, string style) =>
+    var label l_abel = label.new(na, na, text = tag, color = color(na), textcolor = zoneColor, style = style, size = size.small)
+    var box b_ox = box.new(na, na, na, na, bgcolor = color.new(zoneColor, 80), border_color = color(na), xloc = xloc.bar_time)
+
+    b_ox.set_top_left_point(chart.point.new(trailing.barTime, na, top))
+    b_ox.set_bottom_right_point(chart.point.new(last_bar_time, na, bottom))
+
+    l_abel.set_point(chart.point.new(na, labelIndex, labelLevel))
+
+// @function            draw Fibonacci retracement levels based on trailing swing extremes
+// @returns             [fib236Touched, fib382Touched, fib500Touched, fib618Touched, fib786Touched, fib236Level, fib382Level, fib500Level, fib618Level, fib786Level, uptrend]
+drawFiboZones() =>
+    // 根据前高/前低出现的时间顺序，判断当前是上升还是下降趋势
+    bool uptrend = trailing.lastTopTime > trailing.lastBottomTime
+    bool downtrend = trailing.lastTopTime <= trailing.lastBottomTime
+
+    // 趋势方向决定 Fibo 比例的映射：
+    // 上升趋势（前低在前，前高在后）：Fibo 从前低向上测量，0.236 浅，0.786 深
+    // 下降趋势（前高在前，前低在后）：Fibo 从前高向下测量，比例对称反转
+    float range_ = trailing.top - trailing.bottom
+
+    float fib236Level = downtrend ? trailing.bottom + range_ * 0.236 : trailing.bottom + range_ * 0.764
+    float fib382Level = downtrend ? trailing.bottom + range_ * 0.382 : trailing.bottom + range_ * 0.618
+    float fib500Level = trailing.bottom + range_ * 0.5
+    float fib618Level = downtrend ? trailing.bottom + range_ * 0.618 : trailing.bottom + range_ * 0.382
+    float fib786Level = downtrend ? trailing.bottom + range_ * 0.786 : trailing.bottom + range_ * 0.214
+
+    float band = 0.01 * range_
+
+    // 绘制每条 Fibo 线（用 drawZone 实现：薄水平带 + 右侧标签）
+    if showFib236Input
+        drawZone(fib236Level, last_bar_index, fib236Level + band, fib236Level - band, showFibTextInput ? '0.236' : '', fibo236ColorInput, label.style_label_right)
+    if showFib382Input
+        drawZone(fib382Level, last_bar_index, fib382Level + band, fib382Level - band, showFibTextInput ? '0.382' : '', fibo382ColorInput, label.style_label_right)
+    if showFib500Input
+        drawZone(fib500Level, last_bar_index, fib500Level + band, fib500Level - band, showFibTextInput ? '0.500' : '', fibo500ColorInput, label.style_label_right)
+    if showFib618Input
+        drawZone(fib618Level, last_bar_index, fib618Level + band, fib618Level - band, showFibTextInput ? '0.618' : '', fibo618ColorInput, label.style_label_right)
+    if showFib786Input
+        drawZone(fib786Level, last_bar_index, fib786Level + band, fib786Level - band, showFibTextInput ? '0.786' : '', fibo786ColorInput, label.style_label_right)
+
+    // === Fibo 触达检测（仅返回触达状态，计数器自增 / 警报 / 日志放在主执行块，避免在函数内修改 var 变量）===
+    // 上升趋势中回踩（阴线触碰 Fibo 线）
+    // 下降趋势中反弹（阳线触碰 Fibo 线）
+    bool fib236Touched = false
+    bool fib382Touched = false
+    bool fib500Touched = false
+    bool fib618Touched = false
+    bool fib786Touched = false
+
+    if showFib236Input
+        fib236Touched := uptrend and low <= fib236Level and high >= fib236Level and close < open or downtrend and high >= fib236Level and low <= fib236Level and close > open
+        fib236Touched
+    if showFib382Input
+        fib382Touched := uptrend and low <= fib382Level and high >= fib382Level and close < open or downtrend and high >= fib382Level and low <= fib382Level and close > open
+        fib382Touched
+    if showFib500Input
+        fib500Touched := uptrend and low <= fib500Level and high >= fib500Level and close < open or downtrend and high >= fib500Level and low <= fib500Level and close > open
+        fib500Touched
+    if showFib618Input
+        fib618Touched := uptrend and low <= fib618Level and high >= fib618Level and close < open or downtrend and high >= fib618Level and low <= fib618Level and close > open
+        fib618Touched
+    if showFib786Input
+        fib786Touched := uptrend and low <= fib786Level and high >= fib786Level and close < open or downtrend and high >= fib786Level and low <= fib786Level and close > open
+        fib786Touched
+
+    [fib236Touched, fib382Touched, fib500Touched, fib618Touched, fib786Touched, fib236Level, fib382Level, fib500Level, fib618Level, fib786Level, uptrend]
+
+// @function            draw premium/discount zones
+// @returns             void
+drawPremiumDiscountZones() =>
+    drawZone(trailing.top, math.round(0.5 * (trailing.barIndex + last_bar_index)), trailing.top, 0.95 * trailing.top + 0.05 * trailing.bottom, 'Premium', premiumZoneColor, label.style_label_down)
+
+    equilibriumLevel = math.avg(trailing.top, trailing.bottom)
+    drawZone(equilibriumLevel, last_bar_index, 0.525 * trailing.top + 0.475 * trailing.bottom, 0.525 * trailing.bottom + 0.475 * trailing.top, 'Equilibrium', equilibriumZoneColorInput, label.style_label_left)
+
+    drawZone(trailing.bottom, math.round(0.5 * (trailing.barIndex + last_bar_index)), 0.95 * trailing.bottom + 0.05 * trailing.top, trailing.bottom, 'Discount', discountZoneColor, label.style_label_up)
+
+//---------------------------------------------------------------------------------------------------------------------}
+//MUTABLE VARIABLES & EXECUTION
+//---------------------------------------------------------------------------------------------------------------------{
+parsedOpen = showTrendInput ? open : na
+candleColor = internalTrend.bias == BULLISH ? swingBullishColor : swingBearishColor
+plotcandle(parsedOpen, high, low, close, color = candleColor, wickcolor = candleColor, bordercolor = candleColor)
+
+if showHighLowSwingsInput or showPremiumDiscountZonesInput or showFiboInput
+    updateTrailingExtremes()
+
+    // 当 trailing.top/bottom 更新时，重置 PDZ 回踩计数器
+    field_0 = trailing.top
+    field_1 = trailing.bottom
+    if trailing.top != field_0[1] or trailing.bottom != field_1[1]
+        discountZoneRetestCount := 0
+        premiumZoneRetestCount := 0
+        fib236RetestCount := 0
+        fib382RetestCount := 0
+        fib500RetestCount := 0
+        fib618RetestCount := 0
+        fib786RetestCount := 0
+        fib786RetestCount
+
+    if showHighLowSwingsInput
+        drawHighLowSwings()
+
+    if showPremiumDiscountZonesInput
+        drawPremiumDiscountZones()
+
+        // PDZ 回踩检测（计数器自增逻辑放在主执行块，避免在函数内修改 var 变量）
+        [discountRetestOccurred, premiumRetestOccurred] = detectPDZRetest(trailing.top, trailing.bottom, trailing.lastTopBarIndex, trailing.lastBottomBarIndex)
+
+        if discountRetestOccurred
+            if discountZoneRetestCount < pdzRetestMaxCountInput
+                discountZoneRetestCount := discountZoneRetestCount + 1
+                currentAlerts.bullishPDZRetest := true
+                log.info('Zone回踩 | Discount Zone | bar=' + str.tostring(bar_index) + ' | 价格=' + str.tostring(close) + ' | top=' + str.tostring(trailing.top) + ' | bottom=' + str.tostring(trailing.bottom) + ' | lastTopBarIndex=' + str.tostring(trailing.lastTopBarIndex) + ' | lastBottomBarIndex=' + str.tostring(trailing.lastBottomBarIndex) + ' | retestCount=' + str.tostring(discountZoneRetestCount))
+
+        if premiumRetestOccurred
+            if premiumZoneRetestCount < pdzRetestMaxCountInput
+                premiumZoneRetestCount := premiumZoneRetestCount + 1
+                currentAlerts.bearishPDZRetest := true
+                log.info('Zone回踩 | Premium Zone | bar=' + str.tostring(bar_index) + ' | 价格=' + str.tostring(close) + ' | top=' + str.tostring(trailing.top) + ' | bottom=' + str.tostring(trailing.bottom) + ' | lastTopBarIndex=' + str.tostring(trailing.lastTopBarIndex) + ' | lastBottomBarIndex=' + str.tostring(trailing.lastBottomBarIndex) + ' | retestCount=' + str.tostring(premiumZoneRetestCount))
+
+
+    if showFiboInput
+        // Fibo 触达检测（计数器自增逻辑放在主执行块，避免在函数内修改 var 变量）
+        [fib236Touched, fib382Touched, fib500Touched, fib618Touched, fib786Touched, fib236Level, fib382Level, fib500Level, fib618Level, fib786Level, uptrend] = drawFiboZones()
+
+        if fib236Touched
+            if fib236RetestCount < fiboRetestMaxCountInput
+                fib236RetestCount := fib236RetestCount + 1
+                if uptrend
+                    currentAlerts.fib236Retest := true
+                    log.info('Fibo回踩 | 0.236 | bar=' + str.tostring(bar_index) + ' | 价格=' + str.tostring(close) + ' | level=' + str.tostring(fib236Level) + ' | 趋势=上升 | touchCount=' + str.tostring(fib236RetestCount))
+                else
+                    currentAlerts.fib236Bounce := true
+                    log.info('Fibo反弹 | 0.236 | bar=' + str.tostring(bar_index) + ' | 价格=' + str.tostring(close) + ' | level=' + str.tostring(fib236Level) + ' | 趋势=下降 | touchCount=' + str.tostring(fib236RetestCount))
+
+        if fib382Touched
+            if fib382RetestCount < fiboRetestMaxCountInput
+                fib382RetestCount := fib382RetestCount + 1
+                if uptrend
+                    currentAlerts.fib382Retest := true
+                    log.info('Fibo回踩 | 0.382 | bar=' + str.tostring(bar_index) + ' | 价格=' + str.tostring(close) + ' | level=' + str.tostring(fib382Level) + ' | 趋势=上升 | touchCount=' + str.tostring(fib382RetestCount))
+                else
+                    currentAlerts.fib382Bounce := true
+                    log.info('Fibo反弹 | 0.382 | bar=' + str.tostring(bar_index) + ' | 价格=' + str.tostring(close) + ' | level=' + str.tostring(fib382Level) + ' | 趋势=下降 | touchCount=' + str.tostring(fib382RetestCount))
+
+        if fib500Touched
+            if fib500RetestCount < fiboRetestMaxCountInput
+                fib500RetestCount := fib500RetestCount + 1
+                if uptrend
+                    currentAlerts.fib500Retest := true
+                    log.info('Fibo回踩 | 0.500 | bar=' + str.tostring(bar_index) + ' | 价格=' + str.tostring(close) + ' | level=' + str.tostring(fib500Level) + ' | 趋势=上升 | touchCount=' + str.tostring(fib500RetestCount))
+                else
+                    currentAlerts.fib500Bounce := true
+                    log.info('Fibo反弹 | 0.500 | bar=' + str.tostring(bar_index) + ' | 价格=' + str.tostring(close) + ' | level=' + str.tostring(fib500Level) + ' | 趋势=下降 | touchCount=' + str.tostring(fib500RetestCount))
+
+        if fib618Touched
+            if fib618RetestCount < fiboRetestMaxCountInput
+                fib618RetestCount := fib618RetestCount + 1
+                if uptrend
+                    currentAlerts.fib618Retest := true
+                    log.info('Fibo回踩 | 0.618 | bar=' + str.tostring(bar_index) + ' | 价格=' + str.tostring(close) + ' | level=' + str.tostring(fib618Level) + ' | 趋势=上升 | touchCount=' + str.tostring(fib618RetestCount))
+                else
+                    currentAlerts.fib618Bounce := true
+                    log.info('Fibo反弹 | 0.618 | bar=' + str.tostring(bar_index) + ' | 价格=' + str.tostring(close) + ' | level=' + str.tostring(fib618Level) + ' | 趋势=下降 | touchCount=' + str.tostring(fib618RetestCount))
+
+        if fib786Touched
+            if fib786RetestCount < fiboRetestMaxCountInput
+                fib786RetestCount := fib786RetestCount + 1
+                if uptrend
+                    currentAlerts.fib786Retest := true
+                    log.info('Fibo回踩 | 0.786 | bar=' + str.tostring(bar_index) + ' | 价格=' + str.tostring(close) + ' | level=' + str.tostring(fib786Level) + ' | 趋势=上升 | touchCount=' + str.tostring(fib786RetestCount))
+                else
+                    currentAlerts.fib786Bounce := true
+                    log.info('Fibo反弹 | 0.786 | bar=' + str.tostring(bar_index) + ' | 价格=' + str.tostring(close) + ' | level=' + str.tostring(fib786Level) + ' | 趋势=下降 | touchCount=' + str.tostring(fib786RetestCount))
+
+if showFairValueGapsInput
+    deleteFairValueGaps()
+
+getCurrentStructure(swingsLengthInput, false)
+getCurrentStructure(5, false, true)
+
+if showEqualHighsLowsInput
+    getCurrentStructure(equalHighsLowsLengthInput, true)
+
+if showInternalsInput or showInternalOrderBlocksInput or showTrendInput
+    displayStructure(true)
+
+if showStructureInput or showSwingOrderBlocksInput or showHighLowSwingsInput
+    displayStructure()
+
+if showInternalOrderBlocksInput
+    deleteOrderBlocks(true)
+    if showOBRetestAlertInput
+        detectOBRetest(true)
+
+if showSwingOrderBlocksInput
+    deleteOrderBlocks()
+    if showOBRetestAlertInput
+        detectOBRetest(false)
+
+if showFairValueGapsInput
+    drawFairValueGaps()
+
+if barstate.islastconfirmedhistory or barstate.islast
+    if showInternalOrderBlocksInput
+        drawOrderBlocks(true)
+
+    if showSwingOrderBlocksInput
+        drawOrderBlocks()
+
+lastBarIndex := currentBarIndex
+currentBarIndex := bar_index
+newBar = currentBarIndex != lastBarIndex
+
+if barstate.islastconfirmedhistory or barstate.isrealtime and newBar
+    if showDailyLevelsInput and not higherTimeframe('D')
+        drawLevels('D', timeframe.isdaily, dailyLevelsStyleInput, dailyLevelsColorInput)
+
+    if showWeeklyLevelsInput and not higherTimeframe('W')
+        drawLevels('W', timeframe.isweekly, weeklyLevelsStyleInput, weeklyLevelsColorInput)
+
+    if showMonthlyLevelsInput and not higherTimeframe('M')
+        drawLevels('M', timeframe.ismonthly, monthlyLevelsStyleInput, monthlyLevelsColorInput)
+
+//---------------------------------------------------------------------------------------------------------------------}
+//K 线收盘时上报支撑阻力数据
+//---------------------------------------------------------------------------------------------------------------------{
+// 将 timeframe 字符串转换为标准时间框架名称
+// 支持 M1/M3/M5/M15/M30/M45/H1/H2/H3/H4/H6/H12/D1/W1/MN
+// Pine 的 timeframe.period 对于日/周/月返回 "D"/"W"/"M"，分钟返回数字字符串
+tfToName(string tf) =>
+    switch tf
+        '1' => 'M1'
+        '3' => 'M3'
+        '5' => 'M5'
+        '15' => 'M15'
+        '30' => 'M30'
+        '45' => 'M45'
+        '60' => 'H1'
+        '120' => 'H2'
+        '180' => 'H3'
+        '240' => 'H4'
+        '360' => 'H6'
+        '720' => 'H12'
+        'D' => 'D1'
+        'W' => 'W1'
+        'M' => 'MN'
+        => '?'
+
+// @function            归一任意 timeframe 字符串（图表周期或 timeframe 输入框的值）
+// @param tf            timeframe 字符串；空串表示「用图表自己的周期」
+// @returns             string，形如 M15 / H1 / D1
+// FVG 是在 fairValueGapsTimeframeInput 上检测的，周期可能与图表不同，
+// 所以 tf 必须跟着**信号本身的周期**走，不能一律用图表周期。
+resolveTfName(string tf) =>
+    string t = str.trim(tf)
+    t == '' ? tfToName(timeframe.period) : tfToName(t)
+
+// @function            把逗号分隔的模版 ID 列表转成 JSON 数组片段
+// @param raw            形如 "tpl_1" 或 "tpl_1,tpl_2"
+// @returns             string，形如 ["tpl_1","tpl_2"]
+buildTemplateIds(string raw) =>
+    string[] parts = str.split(raw, ",")
+    string[] ids = array.new<string>()
+    for i = 0 to array.size(parts) - 1
+        string p = str.trim(array.get(parts, i))
+        if p != ''
+            array.push(ids, '"' + p + '"')
+    '[' + array.join(ids, ",") + ']'
+
+// @function            构造信号中心的开仓信号载荷（动态 JSON）
+// @param action        BUY / SELL
+// @param signalType    ob / fvg / pdz / fibo
+// @param tfName        信号所在周期（M15 / H1 / ...）
+// @param slPrice       止损价（na = 不带 sl）
+// @param tpPrice       止盈价（na = 不带 tp）
+// @returns             string
+// 字段与后端 parser.py 的归一别名一一对应：
+//   action / symbol / volume / sl / tp / tf / signal_type / model / template_ids / token
+// 后端把 tf 与 signal_type 当**纯统计维度**：缺失或非法都不拒收、不影响下单。
+buildSignalPayload(string action, string signalType, string tfName, float slPrice, float tpPrice) =>
+    string slPart = na(slPrice) ? '' : ',"sl":' + str.tostring(slPrice, format.mintick)
+    string tpPart = na(tpPrice) ? '' : ',"tp":' + str.tostring(tpPrice, format.mintick)
+    '{"action":"' + action + '","symbol":"' + syminfo.ticker + '","volume":' + str.tostring(webhookVolumeInput) + slPart + tpPart + ',"tf":"' + tfName + '","signal_type":"' + signalType + '","model":"strategy","template_ids":' + buildTemplateIds(webhookTemplateInput) + ',"token":"' + webhookTokenInput + '"}'
+
+// 拼接 K 线收盘时的支撑阻力数据
+// 规则：
+//  - OB 支撑取 barHigh，OB 阻力取 barLow
+//  - FVG 多头取 top，FVG 空头取 bottom
+//  - PDZ 支撑取 Discount Zone 上沿，PDZ 阻力取 Premium Zone 下沿
+//  - PDZ 必须满足 K 棒间距（>=30）
+//  - Fibo 直接取对应 fib level，side 根据趋势（上升=支撑/1，下降=阻力/-1）
+
+if barstate.isconfirmed
+    array<string> dataItems = array.new<string>()
+
+    // === 1) Order Blocks ===
+    // Swing OB（结构性大 OB），最多取 5 个
+    if showSwingOrderBlocksInput and swingOrderBlocks.size() > 0
+        int maxSwingOB = math.min(swingOrderBlocksSizeInput, swingOrderBlocks.size())
+        maxSwingOB := math.min(maxSwingOB, 5)
+        for i = 0 to maxSwingOB - 1 by 1
+            orderBlock ob = swingOrderBlocks.get(i)
+            if ob.bias == BULLISH
+                dataItems.push('{"type":"ob","side":1,"price":' + str.tostring(ob.barHigh, '#.##') + '}')
+            else
+                dataItems.push('{"type":"ob","side":-1,"price":' + str.tostring(ob.barLow, '#.##') + '}')
+
+
+    // Internal OB（小结构 OB），最多取 5 个
+    if showInternalOrderBlocksInput and internalOrderBlocks.size() > 0
+        int maxIntOB = math.min(internalOrderBlocksSizeInput, internalOrderBlocks.size())
+        maxIntOB := math.min(maxIntOB, 5)
+        for i = 0 to maxIntOB - 1 by 1
+            orderBlock ob = internalOrderBlocks.get(i)
+            if ob.bias == BULLISH
+                dataItems.push('{"type":"ob","side":1,"price":' + str.tostring(ob.barHigh, '#.##') + '}')
+            else
+                dataItems.push('{"type":"ob","side":-1,"price":' + str.tostring(ob.barLow, '#.##') + '}')
+
+    // === 2) Fair Value Gaps ===
+    if showFairValueGapsInput and array.size(fairValueGaps) > 0
+        // 只上报最近若干个 FVG，避免 payload 过大（fairValueGaps 是 unshift 顺序，最新在下标 0）
+        int maxFvg = math.min(5, array.size(fairValueGaps))
+        for i = 0 to maxFvg - 1 by 1
+            fairValueGap fvg = fairValueGaps.get(i)
+            if fvg.bias == BULLISH
+                // 多头 FVG：上沿作为支撑参考
+                dataItems.push('{"type":"fvg","side":1,"price":' + str.tostring(fvg.top, '#.##') + '}')
+            else // 空头 FVG：下沿作为阻力参考
+                dataItems.push('{"type":"fvg","side":-1,"price":' + str.tostring(fvg.top, '#.##') + '}')
+
+    // === 3) Premium / Discount Zones ===
+    // 必须：1) 启用 PDZ  2) K 棒间距 >= 30
+    if showPremiumDiscountZonesInput and not na(trailing.top) and not na(trailing.bottom) and not na(trailing.lastTopBarIndex) and not na(trailing.lastBottomBarIndex)
+        int pdzTopBarDist = bar_index - trailing.lastTopBarIndex
+        int pdzBottomBarDist = bar_index - trailing.lastBottomBarIndex
+        bool pdzTopDistOk = pdzTopBarDist >= 30
+        bool pdzBotDistOk = pdzBottomBarDist >= 30
+
+        // Discount Zone（看涨支撑）：上沿 = 0.95 * trailing.bottom + 0.05 * trailing.top
+        float discountTopLine = 0.95 * trailing.bottom + 0.05 * trailing.top
+        if pdzBotDistOk
+            dataItems.push('{"type":"pdz","side":1,"price":' + str.tostring(discountTopLine, '#.##') + '}')
+
+        // Premium Zone（看跌阻力）：下沿 = 0.95 * trailing.top + 0.05 * trailing.bottom
+        float premiumBottomLine = 0.95 * trailing.top + 0.05 * trailing.bottom
+        if pdzTopDistOk
+            dataItems.push('{"type":"pdz","side":-1,"price":' + str.tostring(premiumBottomLine, '#.##') + '}')
+
+    // === 4) Fibonacci Retracement ===
+    // 仅上报 0.618
+    if showFiboInput and not na(trailing.top) and not na(trailing.bottom)
+        bool fiboUptrend = trailing.lastTopTime > trailing.lastBottomTime
+        bool fiboDowntrend = trailing.lastTopTime <= trailing.lastBottomTime
+        float fiboRange = trailing.top - trailing.bottom
+        if fiboRange > 0
+            int fiboSide = fiboUptrend ? 1 : -1 // 上升=支撑=1, 下降=阻力=-1
+
+            // 下降趋势：fib level 在 drawFiboZones 里已经做了对称映射，这里沿用同一逻辑
+            float fib618Level = fiboDowntrend ? trailing.bottom + fiboRange * 0.618 : trailing.bottom + fiboRange * 0.382
+
+            dataItems.push('{"type":"fibo","side":' + str.tostring(fiboSide) + ',"price":' + str.tostring(fib618Level, '#.##') + '}')
+
+    // 拼接最终 JSON 并写入日志（供 webhook 抓取）
+    string tfStr = timeframe.period
+    string tfName = tfToName(tfStr)
+    string dataJoined = array.join(dataItems, ',')
+    string payload = '{"type":"smc-data","symbol":"' + syminfo.ticker + '","token":"vlq8iAXw3cJcj0laJJ0dvVDDj6GH_YUho5vosh48ggk","tf":"' + tfName + '","data":[' + dataJoined + ']}'
+    log.info(payload)
+    alert(payload, alert.freq_once_per_bar_close)
+
+//---------------------------------------------------------------------------------------------------------------------}
+//SIGNAL CENTER WEBHOOK ALERTS（结构点 → 开仓信号）
+//---------------------------------------------------------------------------------------------------------------------{
+// 与上面「支撑阻力快照」是两条独立链路：
+//   - smc-data：每根 K 收盘都发，供中控台挑价位（既有链路，不动）；
+//   - 本区块：**只有结构点触发时**才发一条带 signal_type / tf 的开仓信号。
+//
+// 为什么用 alert() 而不是 alertcondition()：alertcondition() 的消息体是**固定文案**，
+// 带不了动态 JSON（拿不到周期、方向、结构类型）。alert() 的消息体是 series 字符串，
+// 可以运行时拼装 —— 这正是 smc-data 推送用的方式。
+//
+// 载荷契约（与后端 parser.py 的归一别名一一对应）：
+//   action / symbol / volume / sl / tp / tf / signal_type / model / template_ids / token
+// 后端把 tf 与 signal_type 当**纯统计维度**：缺失或非法都归 NULL，绝不拒收、不影响下单。
+//
+// ===== 展示开关 = 推送开关（本区块最重要的铁律）=====
+// **图上没展示的结构点，一律不推。**
+// 用户在图上关掉 OB，就不该有 OB 信号发到交易端 —— 否则「图上看到的」和「实际下单的」
+// 两套东西对不上，统计也会莫名其妙多出一批根本没在看的信号。
+//
+// 对应关系：
+//   OB   → 大结构看 showSwingOrderBlocksInput / 小结构看 showInternalOrderBlocksInput
+//          （还要 showOBRetestAlertInput 允许回踩检测）
+//   FVG  → showFairValueGapsInput
+//   PDZ  → showPremiumDiscountZonesInput
+//   Fibo → showFiboInput，且每个档位另有 showFibXXXInput
+//
+// 注意：检测层其实**已经**被这些开关挡住了（detectOBRetest / drawFairValueGaps /
+// detectPDZRetest / drawFiboZones 都只在开关为真时才跑）。这里再显式写一遍，
+// 是为了让「不展示就不推」这条规则**写在推送处**，而不是依赖上游的隐式副作用 ——
+// 上游以后重构（比如把 OB 检测挪到别处），这条规则不会悄悄失效。
+//
+// 频率：用 alert.freq_all，但整块被 barstate.isconfirmed 门控 —— 等价于「只在收盘那一轮触发」。
+// 为什么不用 alert.freq_once_per_bar_close：那个频率**每根 K 只允许发一条**，
+// 同一根 K 上同时触发多个结构点（例如既 OB 回踩又 FVG 出现）时，只有第一条会被送出去，
+// 其余的静默丢失。freq_all + isconfirmed 则保证「收盘确认时该发的都发」，互不吞。
+//
+// 注意：本区块与上面 smc-data 的 alert() 属于**同一个** TV 告警（TV 侧只有一个
+// “Any alert() function call” 选项），后端靠 type 字段分流：smc-data 走价位匹配，
+// 带 action/signal_type 的走信号分发。
+float webhookAtr = ta.atr(webhookAtrPeriodInput)
+if enableWebhookInput and webhookSignalInput and barstate.isconfirmed
+    float atrValue = webhookAtr
+    string chartTf = tfToName(timeframe.period)
+    // FVG 在 fairValueGapsTimeframeInput 上检测，周期可能与图表不同 —— tf 要跟信号走
+    string fvgTf = resolveTfName(fairValueGapsTimeframeInput)
+
+    // ===== 展示开关 → 推送开关（显式门控，图上没展示就不推）=====
+    // OB：图上显示了哪一类 OB，就推哪一类的回踩；
+    //     两类都没显示 → 一条 OB 信号都不推。
+    bool obSwingShown = showSwingOrderBlocksInput
+    bool obInternalShown = showInternalOrderBlocksInput
+    // FVG / PDZ / Fibo：整块展示开关（回踩检测本身还需要各自的允许开关）
+    bool fvgShown = showFairValueGapsInput
+    bool pdzShown = showPremiumDiscountZonesInput
+    bool fiboShown = showFiboInput
+    // Fibo 档位级开关：某个档位没画出来，就不该推那个档位的触达
+    bool fibo236Shown = fiboShown and showFib236Input
+    bool fibo382Shown = fiboShown and showFib382Input
+    bool fibo500Shown = fiboShown and showFib500Input
+    bool fibo618Shown = fiboShown and showFib618Input
+    bool fibo786Shown = fiboShown and showFib786Input
+
+    // —— OB 回踩（支撑=做多 / 阻力=做空）——
+    // 大结构（swing）回踩只在「Swing Order Blocks」打开时推；
+    // 小结构（internal）回踩只在「Internal Order Blocks」打开时推。
+    bool obLongHit = (obSwingShown and currentAlerts.bullishOBRetest) or (obInternalShown and currentAlerts.internalBullishOBRetest)
+    bool obShortHit = (obSwingShown and currentAlerts.bearishOBRetest) or (obInternalShown and currentAlerts.internalBearishOBRetest)
+    if obLongHit
+        float obLongSl = webhookSlAtrInput > 0 ? close - atrValue * webhookSlAtrInput : na
+        float obLongTp = webhookTpAtrInput > 0 ? close + atrValue * webhookTpAtrInput : na
+        string obLongPayload = buildSignalPayload('BUY', 'ob', chartTf, obLongSl, obLongTp)
+        log.info(obLongPayload)
+        alert(obLongPayload, alert.freq_all)
+
+    if obShortHit
+        float obShortSl = webhookSlAtrInput > 0 ? close + atrValue * webhookSlAtrInput : na
+        float obShortTp = webhookTpAtrInput > 0 ? close - atrValue * webhookTpAtrInput : na
+        string obShortPayload = buildSignalPayload('SELL', 'ob', chartTf, obShortSl, obShortTp)
+        log.info(obShortPayload)
+        alert(obShortPayload, alert.freq_all)
+
+    // —— FVG 出现（多头=做多 / 空头=做空）——
+    if fvgShown and currentAlerts.bullishFairValueGap
+        float fvgLongSl = webhookSlAtrInput > 0 ? close - atrValue * webhookSlAtrInput : na
+        float fvgLongTp = webhookTpAtrInput > 0 ? close + atrValue * webhookTpAtrInput : na
+        string fvgLongPayload = buildSignalPayload('BUY', 'fvg', fvgTf, fvgLongSl, fvgLongTp)
+        log.info(fvgLongPayload)
+        alert(fvgLongPayload, alert.freq_all)
+
+    if fvgShown and currentAlerts.bearishFairValueGap
+        float fvgShortSl = webhookSlAtrInput > 0 ? close + atrValue * webhookSlAtrInput : na
+        float fvgShortTp = webhookTpAtrInput > 0 ? close - atrValue * webhookTpAtrInput : na
+        string fvgShortPayload = buildSignalPayload('SELL', 'fvg', fvgTf, fvgShortSl, fvgShortTp)
+        log.info(fvgShortPayload)
+        alert(fvgShortPayload, alert.freq_all)
+
+    // —— Premium/Discount Zone 回踩（折扣区=做多 / 溢价区=做空）——
+    if pdzShown and currentAlerts.bullishPDZRetest
+        float pdzLongSl = webhookSlAtrInput > 0 ? close - atrValue * webhookSlAtrInput : na
+        float pdzLongTp = webhookTpAtrInput > 0 ? close + atrValue * webhookTpAtrInput : na
+        string pdzLongPayload = buildSignalPayload('BUY', 'pdz', chartTf, pdzLongSl, pdzLongTp)
+        log.info(pdzLongPayload)
+        alert(pdzLongPayload, alert.freq_all)
+
+    if pdzShown and currentAlerts.bearishPDZRetest
+        float pdzShortSl = webhookSlAtrInput > 0 ? close + atrValue * webhookSlAtrInput : na
+        float pdzShortTp = webhookTpAtrInput > 0 ? close - atrValue * webhookTpAtrInput : na
+        string pdzShortPayload = buildSignalPayload('SELL', 'pdz', chartTf, pdzShortSl, pdzShortTp)
+        log.info(pdzShortPayload)
+        alert(pdzShortPayload, alert.freq_all)
+
+    // —— Fibonacci 触达（回踩=顺趋势做多 / 反弹=顺趋势做空）——
+    // 5 个档位（0.236/0.382/0.500/0.618/0.786）共用同一个 signal_type=fibo，
+    // 统计侧不需要区分档位（信号级 + 持仓级胜率即可）。
+    // 但**档位开关是生效的**：没画出来的那条 Fibo 线，触达了也不推。
+    bool fiboLongHit = (fibo236Shown and currentAlerts.fib236Retest) or (fibo382Shown and currentAlerts.fib382Retest) or (fibo500Shown and currentAlerts.fib500Retest) or (fibo618Shown and currentAlerts.fib618Retest) or (fibo786Shown and currentAlerts.fib786Retest)
+    bool fiboShortHit = (fibo236Shown and currentAlerts.fib236Bounce) or (fibo382Shown and currentAlerts.fib382Bounce) or (fibo500Shown and currentAlerts.fib500Bounce) or (fibo618Shown and currentAlerts.fib618Bounce) or (fibo786Shown and currentAlerts.fib786Bounce)
+
+    if fiboLongHit
+        float fiboLongSl = webhookSlAtrInput > 0 ? close - atrValue * webhookSlAtrInput : na
+        float fiboLongTp = webhookTpAtrInput > 0 ? close + atrValue * webhookTpAtrInput : na
+        string fiboLongPayload = buildSignalPayload('BUY', 'fibo', chartTf, fiboLongSl, fiboLongTp)
+        log.info(fiboLongPayload)
+        alert(fiboLongPayload, alert.freq_all)
+
+    if fiboShortHit
+        float fiboShortSl = webhookSlAtrInput > 0 ? close + atrValue * webhookSlAtrInput : na
+        float fiboShortTp = webhookTpAtrInput > 0 ? close - atrValue * webhookTpAtrInput : na
+        string fiboShortPayload = buildSignalPayload('SELL', 'fibo', chartTf, fiboShortSl, fiboShortTp)
+        log.info(fiboShortPayload)
+        alert(fiboShortPayload, alert.freq_all)
+
+//---------------------------------------------------------------------------------------------------------------------}
+//ALERTS
+//---------------------------------------------------------------------------------------------------------------------{
+// OB 回踩警报
+// 注意：这里也套上同一套展示开关 —— 与上面的 alert() 推送保持一致，
+// 保证「图上没展示的结构点，TV 侧也不会弹警报」。
+// （检测层本来就挡住了，这里再写一遍是为了让规则显式可见、不依赖上游副作用。）
+// OB 回踩警报
+alertcondition(showSwingOrderBlocksInput and currentAlerts.bullishOBRetest, '大结构看涨OB回踩', '检测到看涨OB回踩 - 价格返回测试支撑位')
+alertcondition(showSwingOrderBlocksInput and currentAlerts.bearishOBRetest, '大结构看跌OB回踩', '检测到看跌OB回踩 - 价格返回测试阻力位')
+alertcondition(showInternalOrderBlocksInput and currentAlerts.internalBullishOBRetest, '小结构看涨OB回踩', '检测到内部看涨OB回踩')
+alertcondition(showInternalOrderBlocksInput and currentAlerts.internalBearishOBRetest, '小结构看跌OB回踩', '检测到内部看跌OB回踩')
+
+alertcondition(showFairValueGapsInput and currentAlerts.bullishFairValueGap, '多头FVG出现', 'Bullish FVG formed')
+alertcondition(showFairValueGapsInput and currentAlerts.bearishFairValueGap, '空头FVG出现', 'Bearish FVG formed')
+
+// Premium/Discount Zone 回踩警报
+alertcondition(showPremiumDiscountZonesInput and currentAlerts.bullishPDZRetest, '前低回踩', '价格回踩折扣区（Discount Zone）')
+alertcondition(showPremiumDiscountZonesInput and currentAlerts.bearishPDZRetest, '前高回踩', '价格回踩溢价区（Premium Zone）')
+
+// Fibonacci 触达警报 - 回踩（上升趋势：价格下行触达 Fibo）
+// 档位开关同样生效：没画出来的那条 Fibo 线，触达了也不报警。
+alertcondition(showFiboInput and showFib236Input and currentAlerts.fib236Retest, '上升趋势-回踩斐波那契 0.236', '上升趋势中价格回踩到 0.236 关键位')
+alertcondition(showFiboInput and showFib382Input and currentAlerts.fib382Retest, '上升趋势-回踩斐波那契 0.382', '上升趋势中价格回踩到 0.382 关键位')
+alertcondition(showFiboInput and showFib500Input and currentAlerts.fib500Retest, '上升趋势-回踩斐波那契 0.500', '上升趋势中价格回踩到 0.500 关键位')
+alertcondition(showFiboInput and showFib618Input and currentAlerts.fib618Retest, '上升趋势-回踩斐波那契 0.618', '上升趋势中价格回踩到 0.618 回调位')
+alertcondition(showFiboInput and showFib786Input and currentAlerts.fib786Retest, '上升趋势-回踩斐波那契 0.786', '上升趋势中价格回踩到 0.786 回调位')
+// Fibonacci 触达警报 - 反弹（下降趋势：价格上行触达 Fibo）
+alertcondition(showFiboInput and showFib236Input and currentAlerts.fib236Bounce, '下降趋势-反弹斐波那契 0.236', '下降趋势中价格反弹到 0.236 阻力位')
+alertcondition(showFiboInput and showFib382Input and currentAlerts.fib382Bounce, '下降趋势-反弹斐波那契 0.382', '下降趋势中价格反弹到 0.382 阻力位')
+alertcondition(showFiboInput and showFib500Input and currentAlerts.fib500Bounce, '下降趋势-反弹斐波那契 0.500', '下降趋势中价格反弹到 0.500 阻力位')
+alertcondition(showFiboInput and showFib618Input and currentAlerts.fib618Bounce, '下降趋势-反弹斐波那契 0.618', '下降趋势中价格反弹到 0.618 阻力位')
+alertcondition(showFiboInput and showFib786Input and currentAlerts.fib786Bounce, '下降趋势-反弹斐波那契 0.786', '下降趋势中价格反弹到 0.786 阻力位')
+
+// alertcondition(currentAlerts.internalBullishBOS,        'Internal Bullish BOS',         'Internal Bullish BOS formed')
+// alertcondition(currentAlerts.internalBullishCHoCH,      'Internal Bullish CHoCH',       'Internal Bullish CHoCH formed')
+// alertcondition(currentAlerts.internalBearishBOS,        'Internal Bearish BOS',         'Internal Bearish BOS formed')
+// alertcondition(currentAlerts.internalBearishCHoCH,      'Internal Bearish CHoCH',       'Internal Bearish CHoCH formed')
+
+// alertcondition(currentAlerts.swingBullishBOS,           'Bullish BOS',                  'Internal Bullish BOS formed')
+// alertcondition(currentAlerts.swingBullishCHoCH,         'Bullish CHoCH',                'Internal Bullish CHoCH formed')
+// alertcondition(currentAlerts.swingBearishBOS,           'Bearish BOS',                  'Bearish BOS formed')
+// alertcondition(currentAlerts.swingBearishCHoCH,         'Bearish CHoCH',                'Bearish CHoCH formed')
+
+// alertcondition(currentAlerts.internalBullishOrderBlock, 'Bullish Internal OB Breakout', 'Price broke bullish internal OB')
+// alertcondition(currentAlerts.internalBearishOrderBlock, 'Bearish Internal OB Breakout', 'Price broke bearish internal OB')
+// alertcondition(currentAlerts.swingBullishOrderBlock,    'Bullish Swing OB Breakout',    'Price broke bullish swing OB')
+// alertcondition(currentAlerts.swingBearishOrderBlock,    'Bearish Swing OB Breakout',    'Price broke bearish swing OB')
+
+// alertcondition(currentAlerts.equalHighs,                'Equal Highs',                  'Equal highs detected')
+// alertcondition(currentAlerts.equalLows,                 'Equal Lows',                   'Equal lows detected')
+
+
+//---------------------------------------------------------------------------------------------------------------------}

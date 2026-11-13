@@ -41,7 +41,7 @@ from typing import Any, Optional
 
 from sqlalchemy import func, select
 
-from . import signal_codes
+from . import signal_codes, signal_meta, signal_quality
 from .db import SessionLocal
 from .orm import (
     GroupSignalTask,
@@ -156,13 +156,21 @@ def percentile(values: list[float], q: float) -> Optional[float]:
 class SignalFilters:
     """信号中心的统一筛选条件。
 
-    刻意做成一个类而不是一堆散参：概览 / 流 / 节点 / 时延四个接口共用同一套
-    筛选语义，避免「概览按 symbol 过滤了，流却没过滤」这种对不上的情况。
+    刻意做成一个类而不是一堆散参：概览 / 流 / 节点 / 时延 / 绩效 / 路由
+    六个接口共用同一套筛选语义，避免「概览按 symbol 过滤了，流却没过滤」
+    这种对不上的情况。
+
+    **新增的四个维度**（信号中心路由中枢与绩效面板需要）：
+    - `timeframe`：信号级周期（M15 / H1 / …），归一后匹配；`"none"` 匹配未标注。
+    - `signal_type`：首仓信号类型（ob / fvg / …）；`"none"` 匹配未标注。
+    - `route_state`：路由状态（pending / auto / routed / dropped）。
+    - `direction`：多空（buy / sell），整合中控台的「只做多 / 只做空」筛选。
     """
 
     __slots__ = (
         "window", "source", "model", "symbol", "action", "status",
         "node_id", "group_id", "keyword",
+        "timeframe", "signal_type", "route_state", "direction",
     )
 
     def __init__(
@@ -176,6 +184,10 @@ class SignalFilters:
         node_id: Optional[str] = None,
         group_id: Optional[str] = None,
         keyword: Optional[str] = None,
+        timeframe: Optional[str] = None,
+        signal_type: Optional[str] = None,
+        route_state: Optional[str] = None,
+        direction: Optional[str] = None,
     ) -> None:
         self.window = normalize_window(window)
         self.source = _clean(source)
@@ -186,6 +198,12 @@ class SignalFilters:
         self.node_id = _clean(node_id)
         self.group_id = _clean(group_id)
         self.keyword = _clean(keyword)
+        # 周期 / 类型走 signal_meta 归一：认不出的一律 None（= 不按这个维度筛），
+        # 绝不因为一个统计维度写错就整页报错
+        self.timeframe = _clean_lower(timeframe)
+        self.signal_type = _clean_lower(signal_type)
+        self.route_state = _clean_lower(route_state)
+        self.direction = _clean_lower(direction)
 
     @property
     def from_ts(self) -> Optional[float]:
@@ -197,6 +215,8 @@ class SignalFilters:
             self.window, self.source or "", self.model or "", self.symbol or "",
             self.action or "", self.status or "", self.node_id or "",
             self.group_id or "", self.keyword or "",
+            self.timeframe or "", self.signal_type or "",
+            self.route_state or "", self.direction or "",
         ]
         return "|".join(parts)
 
@@ -254,6 +274,27 @@ def _signal_conds(f: SignalFilters) -> list:
             | SignalHistory.comment.like(like)
             | SignalHistory.source_ip.like(like)
         )
+    # —— 信号中心新增的四个维度 ——
+    # 周期 / 类型：认不出就不过滤（统计维度写错不该让整页空掉）
+    if f.timeframe:
+        tf = signal_meta.normalize_timeframe(f.timeframe)
+        if tf:
+            conds.append(SignalHistory.timeframe == tf)
+    if f.signal_type:
+        st = signal_meta.normalize_signal_type(f.signal_type)
+        if st:
+            conds.append(SignalHistory.signal_type == st)
+    if f.route_state:
+        rs = signal_meta.safe_route_state(f.route_state)
+        if rs:
+            conds.append(SignalHistory.route_state == rs)
+    if f.direction:
+        # 多空筛选：整合中控台的「只做多 / 只做空」
+        d = f.direction.lower()
+        if d in ("buy", "long"):
+            conds.append(SignalHistory.action == "BUY")
+        elif d in ("sell", "short"):
+            conds.append(SignalHistory.action == "SELL")
     return conds
 
 
@@ -617,9 +658,18 @@ async def _stream_items(rows: list[SignalHistory]) -> list[dict]:
     for d in dispatches:
         by_signal.setdefault(d["signal_id"], []).append(d)
 
+    # 质量分：历史同类信号的成功率。先验与筛选条无关（见 signal_quality 铁律 3）。
+    # 算不出先验时为 None —— 与「分数是 0」是两件事，前端要分开显示。
+    quality_by_key = await signal_quality.quality_map(rows)
+
     items: list[dict] = []
     for r in rows:
         ds = by_signal.get(r.signal_id, [])
+        qkey = (
+            signal_meta.normalize_signal_type(r.signal_type) or "",
+            signal_meta.normalize_timeframe(r.timeframe) or "",
+        )
+        quality = quality_by_key.get(qkey)
         done = sum(1 for d in ds if d["status"] == "done")
         skipped = sum(1 for d in ds if d["status"] == _DISPATCH_SKIPPED)
         failed = sum(1 for d in ds if d["status"] in (_DISPATCH_FAILED, "offline"))
@@ -641,10 +691,16 @@ async def _stream_items(rows: list[SignalHistory]) -> list[dict]:
             "symbol": r.symbol,
             "volume": r.volume,
             "status": r.status,
+            # 周期 / 信号类型 / 路由状态：统计与路由维度，缺失就是未标注
+            "timeframe": r.timeframe,
+            "signal_type": r.signal_type,
+            "route_state": r.route_state,
             "reject_code": r.reject_code,
             "reject_label": (
                 signal_codes.reject_label(r.reject_code) if r.reject_code else None
             ),
+            # 质量分：历史同类信号的成功率。None = 没有可用先验（暂无历史）
+            "quality": quality,
             "targets": len(ds),
             "done": done,
             "skipped": skipped,

@@ -1,8 +1,14 @@
 <script setup lang="ts">
 // 信号中心筛选条。
 //
-// **四个接口共用同一套筛选语义**（后端 `signal_stats.SignalFilters`），
+// **所有接口共用同一套筛选语义**（后端 `signal_stats.SignalFilters`），
 // 所以筛选状态由父组件持有，这里只负责编辑并 emit 变更。
+//
+// 后四个维度（周期 / 信号类型 / 路由状态 / 方向）是信号中心路由中枢与
+// 绩效面板新增的：
+// - 周期 / 类型：TV 告警带来的统计维度；
+// - 路由状态：待路由 / 已直连 / 已下发 / 已丢弃；
+// - 方向：整合中控台的「只做多 / 只做空」。
 import { computed } from 'vue'
 import type { SignalCenterQuery } from '@/api/types'
 
@@ -46,6 +52,44 @@ const STATUSES = [
   { value: 'rejected', label: '已拒收' },
 ]
 
+/** 信号级周期（与后端 `signal_meta.TIMEFRAMES` 同源） */
+const TIMEFRAMES = [
+  { value: '', label: '全部周期' },
+  { value: 'M1', label: 'M1' },
+  { value: 'M5', label: 'M5' },
+  { value: 'M15', label: 'M15' },
+  { value: 'M30', label: 'M30' },
+  { value: 'H1', label: 'H1' },
+  { value: 'H4', label: 'H4' },
+  { value: 'D1', label: 'D1' },
+  { value: 'W1', label: 'W1' },
+]
+
+/** 首仓信号类型（与后端 `signal_meta.SIGNAL_TYPES` 同源） */
+const SIGNAL_TYPES = [
+  { value: '', label: '全部类型' },
+  { value: 'ob', label: '订单块 OB' },
+  { value: 'fvg', label: '公允价值缺口 FVG' },
+  { value: 'pdz', label: '溢价折让区 PDZ' },
+  { value: 'fibo', label: '斐波那契' },
+]
+
+/** 路由状态 */
+const ROUTE_STATES = [
+  { value: '', label: '全部路由状态' },
+  { value: 'pending', label: '待路由' },
+  { value: 'auto', label: '已直连' },
+  { value: 'routed', label: '已中心下发' },
+  { value: 'dropped', label: '已丢弃' },
+]
+
+/** 多空方向（整合中控台） */
+const DIRECTIONS = [
+  { value: '', label: '全部方向' },
+  { value: 'buy', label: '只做多' },
+  { value: 'sell', label: '只做空' },
+]
+
 const currentWindow = computed(() => props.query.window ?? '30d')
 
 function setWindow(v: string): void {
@@ -72,6 +116,10 @@ function clearAll(): void {
     node_id: null,
     group_id: null,
     keyword: null,
+    timeframe: null,
+    signal_type: null,
+    route_state: null,
+    direction: null,
   })
 }
 
@@ -79,7 +127,8 @@ const hasFilter = computed(() => {
   const q = props.query
   return Boolean(
     q.source || q.model || q.symbol || q.action || q.status ||
-    q.node_id || q.group_id || q.keyword,
+    q.node_id || q.group_id || q.keyword ||
+    q.timeframe || q.signal_type || q.route_state || q.direction,
   )
 })
 </script>
@@ -171,6 +220,41 @@ const hasFilter = computed(() => {
         :value="query.keyword ?? ''"
         @change="onKeyword"
       />
+    </div>
+
+    <!-- 周期 / 类型 / 路由状态 / 方向 -->
+    <div class="pf-filter-bar">
+      <select
+        class="pf-filter-input select"
+        :value="query.timeframe ?? ''"
+        @change="setField('timeframe', ($event.target as HTMLSelectElement).value)"
+      >
+        <option v-for="t in TIMEFRAMES" :key="t.value" :value="t.value">{{ t.label }}</option>
+      </select>
+
+      <select
+        class="pf-filter-input select"
+        :value="query.signal_type ?? ''"
+        @change="setField('signal_type', ($event.target as HTMLSelectElement).value)"
+      >
+        <option v-for="t in SIGNAL_TYPES" :key="t.value" :value="t.value">{{ t.label }}</option>
+      </select>
+
+      <select
+        class="pf-filter-input select"
+        :value="query.route_state ?? ''"
+        @change="setField('route_state', ($event.target as HTMLSelectElement).value)"
+      >
+        <option v-for="s in ROUTE_STATES" :key="s.value" :value="s.value">{{ s.label }}</option>
+      </select>
+
+      <select
+        class="pf-filter-input select"
+        :value="query.direction ?? ''"
+        @change="setField('direction', ($event.target as HTMLSelectElement).value)"
+      >
+        <option v-for="d in DIRECTIONS" :key="d.value" :value="d.value">{{ d.label }}</option>
+      </select>
     </div>
   </div>
 </template>

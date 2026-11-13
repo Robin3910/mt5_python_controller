@@ -710,7 +710,76 @@ def _migrate_news_blackout_tables(sync_conn) -> None:
         }
         for name, ddl in additions.items():
             if name not in cols:
-                sync_conn.execute(text(f"ALTER TABLE user_news_settings ADD COLUMN {name} {ddl}"))
+                sync_conn.execute(text(f"ALTER TABLE user_news_settings ADD COLUMN {name} {ddl}")            )
+
+
+def _migrate_signal_meta_columns(sync_conn) -> None:
+    """信号元信息与路由状态的新增列（全部可空 / 有默认值，不影响交易逻辑）。
+
+    - signal_history.timeframe：信号级周期（统计维度；缺就 NULL，绝不拒收信号）
+    - signal_history.signal_type：首仓信号类型（未知类型保留原值小写）
+    - signal_history.route_state / route_mode：信号中心的 inbox 状态
+    - group_signal_task.trigger_source / route_mode：这条主任务是怎么被触发的
+    - node_group.signal_source：分组的信号来源模式（direct 默认 / center）
+
+    `signal_entry_leg` 是**新表**，create_all 会直接建好，不用 ALTER。
+    """
+    inspector = inspect(sync_conn)
+    tables = set(inspector.get_table_names())
+    additions = {
+        "signal_history": {
+            "timeframe": "VARCHAR(8)",
+            "signal_type": "VARCHAR(16)",
+            "route_state": "VARCHAR(16)",
+            "route_mode": "VARCHAR(16)",
+        },
+        "group_signal_task": {
+            "trigger_source": "VARCHAR(16)",
+            "route_mode": "VARCHAR(16)",
+        },
+    }
+    for table, cols_map in additions.items():
+        if table not in tables:
+            continue
+        cols = {c["name"] for c in inspector.get_columns(table)}
+        for name, ddl in cols_map.items():
+            if name in cols:
+                continue
+            sync_conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+        # 统计要按周期 / 类型 / 路由状态聚合，补普通索引
+        for name in cols_map:
+            index = f"ix_{table}_{name}"
+            existing = {i.get("name") for i in inspector.get_indexes(table)}
+            if index not in existing:
+                sync_conn.execute(text(f"CREATE INDEX {index} ON {table} ({name})"))
+
+    # node_group.signal_source：默认 direct —— 存量分组零行为变化
+    if "node_group" in tables:
+        cols = {c["name"] for c in inspector.get_columns("node_group")}
+        if "signal_source" not in cols:
+            sync_conn.execute(
+                text(
+                    "ALTER TABLE node_group ADD COLUMN "
+                    "signal_source VARCHAR(16) NOT NULL DEFAULT 'direct'"
+                )
+            )
+
+    # signal_entry_leg.order_ticket：早期版本没有这一列（用于反查 position_id）
+    if "signal_entry_leg" in tables:
+        cols = {c["name"] for c in inspector.get_columns("signal_entry_leg")}
+        if "order_ticket" not in cols:
+            sync_conn.execute(
+                text(
+                    "ALTER TABLE signal_entry_leg ADD COLUMN "
+                    "order_ticket BIGINT NULL"
+                )
+            )
+            sync_conn.execute(
+                text(
+                    "CREATE INDEX ix_signal_entry_leg_order_ticket "
+                    "ON signal_entry_leg (order_ticket)"
+                )
+            )
 
 
 async def init_db() -> None:
@@ -725,6 +794,7 @@ async def init_db() -> None:
         await conn.run_sync(_migrate_dispatch_price_column)
         await conn.run_sync(_migrate_signal_source_column)
         await conn.run_sync(_migrate_signal_center_columns)
+        await conn.run_sync(_migrate_signal_meta_columns)
         await conn.run_sync(_migrate_latency_marks)
         await conn.run_sync(_migrate_latency_precision)
         await conn.run_sync(_migrate_audit_columns)

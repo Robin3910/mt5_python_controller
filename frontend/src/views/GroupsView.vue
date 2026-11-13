@@ -20,6 +20,7 @@ import { useHubStore } from '@/stores/hub'
 import type {
   GroupDispatchMode,
   GroupOut,
+  GroupSignalSource,
   LimitWatchLogOut,
   NodeOut,
   StrategyOut,
@@ -88,6 +89,10 @@ const FIELD_HELP = {
   strategy:
     '一对一绑定交易策略。每个分组最多绑定一个策略，同一策略也不能挂到多个分组。' +
     '未绑定不影响分组本身的信号分发；可稍后在编辑中补绑或换绑。',
+  signal_source:
+    '信号来源模式。「直连」= TradingView 告警 / 手动触发后直接进本分组开仓（默认）；' +
+    '「信号中心」= 本分组不再被 webhook 自动触发，只有管理员在【信号中心】里选中信号并路由过来才开仓。' +
+    '两种模式可以混用：同一个分组先直连一段时间，再改成信号中心模式也不影响在跑任务。',
   remark: '备注，仅用于后台展示。',
   nodes:
     '加入本分组的节点。信号进入时只有「已启用且在线」的成员才算有效节点；勾选顺序即轮询轮转的初始顺序。',
@@ -110,6 +115,7 @@ const form = reactive({
   limit_watch_keyword: 'limit',
   limit_watch_node_ids: [] as string[],
   accept_ai_follow: false,
+  signal_source: 'direct' as GroupSignalSource,
   strategy_id: '' as string,
   remark: '',
   node_ids: [] as string[],
@@ -185,6 +191,12 @@ const SWITCH_TAGS: TagOption<boolean>[] = [
 const ENABLED_TAGS: TagOption<boolean>[] = [
   { value: true, label: '启用', tone: 'on' },
   { value: false, label: '禁用', tone: 'off' },
+]
+
+/** 信号来源模式：直连（默认）/ 信号中心 */
+const SIGNAL_SOURCE_TAGS: TagOption<GroupSignalSource>[] = [
+  { value: 'direct', label: '直连' },
+  { value: 'center', label: '信号中心' },
 ]
 
 watch(
@@ -270,6 +282,7 @@ function openCreate(): void {
     limit_watch_keyword: 'limit',
     limit_watch_node_ids: [],
     accept_ai_follow: false,
+    signal_source: 'direct' as GroupSignalSource,
     strategy_id: '',
     remark: '',
     node_ids: [],
@@ -293,6 +306,7 @@ function openEdit(g: GroupOut): void {
     limit_watch_keyword: g.limit_watch_keyword ?? '',
     limit_watch_node_ids: g.nodes.filter((n) => n.limit_watch_report).map((n) => n.node_id),
     accept_ai_follow: Boolean(g.accept_ai_follow),
+    signal_source: (g.signal_source ?? 'direct') as GroupSignalSource,
     strategy_id: g.strategy_id || '',
     remark: g.remark || '',
     node_ids: g.nodes.map((n) => n.node_id),
@@ -327,6 +341,7 @@ async function save(): Promise<void> {
       limit_watch_enabled: formIsTrendStrategy.value ? form.limit_watch_enabled : false,
       limit_watch_keyword: (form.limit_watch_keyword || '').trim(),
       accept_ai_follow: formIsAiStrategy.value ? form.accept_ai_follow : false,
+      signal_source: form.signal_source,
       strategy_id: strategyId,
       remark: form.remark.trim() || null,
       node_ids: form.node_ids,
@@ -349,6 +364,7 @@ async function save(): Promise<void> {
       (formIsAiStrategy.value
         ? `开放 AI 跟单：${form.accept_ai_follow ? '开启（会进入【AI 交易】广场）' : '关闭'}\n`
         : '') +
+      `信号来源：${form.signal_source === 'center' ? '信号中心（不由 webhook 自动触发）' : '直连'}\n` +
       `绑定策略：${styName}\n` +
       `成员节点：${form.node_ids.length} 个`
     const verb = formMode.value === 'create' ? '创建' : '更新'
@@ -814,6 +830,7 @@ async function onStrategyFormSaved(): Promise<void> {
             <span class="tag" :class="g.enabled ? 'green' : 'red'">{{ g.enabled ? '启用' : '禁用' }}</span>
             <span class="tag blue">{{ DISPATCH_MODE_SHORT[g.dispatch_mode] }}</span>
             <span v-if="g.signal_concurrent_enabled" class="tag">并发</span>
+            <span v-if="g.signal_source === 'center'" class="tag amber" title="信号中心模式：webhook 不再自动触发本分组">中心</span>
           </div>
           <span class="group-caret" :class="{ open: groupDetailOpen[g.group_id] }">▾</span>
         </div>
@@ -1415,6 +1432,15 @@ async function onStrategyFormSaved(): Promise<void> {
             <div>
               <FormLabel field-id="group-enabled" text="启用状态" :help="FIELD_HELP.enabled" />
               <TagSelect id="group-enabled" v-model="form.enabled" :options="ENABLED_TAGS" aria-label="启用状态" />
+            </div>
+            <div>
+              <FormLabel field-id="group-signal-source" text="信号来源" :help="FIELD_HELP.signal_source" />
+              <TagSelect
+                id="group-signal-source"
+                v-model="form.signal_source"
+                :options="SIGNAL_SOURCE_TAGS"
+                aria-label="信号来源"
+              />
             </div>
             <div>
               <FormLabel field-id="group-trend-risk" text="趋势风控" :help="FIELD_HELP.trend_risk" />

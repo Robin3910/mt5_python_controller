@@ -30,7 +30,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Optional
 
@@ -47,6 +47,7 @@ from . import (
     persist,
     rbac_service,
     signal_codes,
+    signal_meta,
     strategy_templates,
     system_settings,
     trend_indicators,
@@ -64,6 +65,22 @@ logger = logging.getLogger(__name__)
 SIGNAL_DISPATCH_MODE = "group"
 # 热推单节点发送封顶，避免半死 WS 拖住保存后的后台任务。
 STRATEGY_UPDATE_SEND_TIMEOUT = 2.0
+
+
+def _trigger_source_for(source: str) -> str:
+    """把信号来源（signal_history.source）映射成触发来源编码。
+
+    `signal_history.source` 是「谁发来的」，`group_signal_task.trigger_source` 是
+    「怎么触发的」。两者不总是同一个维度，所以单列一个映射，而不是直接复用。
+    """
+    code = str(source or "").strip().lower()
+    if code in ("tradingview", "tv", "webhook"):
+        return signal_meta.TRIGGER_TV_WEBHOOK
+    if code == "manual":
+        return signal_meta.TRIGGER_MANUAL
+    if code == "limit_watch":
+        return signal_meta.TRIGGER_LIMIT_WATCH
+    return signal_meta.TRIGGER_TV_WEBHOOK
 
 
 @dataclass(frozen=True)
@@ -398,18 +415,75 @@ class GroupDispatcher:
     async def dispatch(self, signal: TradingSignal, signal_id: str,
                        source_ip: Optional[str] = None,
                        raw_payload: Optional[str] = None,
-                       source: str = "tradingview") -> dict:
-        """分发入口：按绑定策略的品种筛选分组，各自独立处理本信号。"""
+                       source: str = "tradingview",
+                       route_mode: str = "direct",
+                       trigger_source: Optional[str] = None,
+                       group_ids: Optional[list[str]] = None) -> dict:
+        """分发入口：按绑定策略的品种筛选分组，各自独立处理本信号。
+
+        **双模式路由**（`group.signal_source`）：
+
+        | 分组模式 | 行为 |
+        |---|---|
+        | `direct`（默认） | 信号直接下发到该分组，立刻开仓 |
+        | `center` | 信号**不**自动下发，改为进入信号中心待路由队列 |
+
+        `route_mode='direct'`（webhook / 手动触发走这条路）：只有 `direct` 分组
+        被立即下发；`center` 分组的候选被**排除在本次下发之外**，但这条信号
+        仍会入库并标记 `route_state='pending'`，等待管理员在信号中心里路由。
+
+        `route_mode='center'`（信号中心下发走这条路）：**只**下发给 `group_ids`
+        点名的分组（可覆盖 volume / sl / tp），其余一律不下发。
+        """
         if signal.action == "CLOSE":
             return await self._dispatch_close(
                 signal, signal_id, source_ip=source_ip, raw_payload=raw_payload, source=source,
             )
 
+        if route_mode == "center":
+            return await self._dispatch_center(
+                signal, signal_id, source_ip=source_ip, raw_payload=raw_payload,
+                source=source, group_ids=group_ids or [],
+            )
+
         matched, reasons = await self._candidate_groups(signal)
-        if not matched:
+        # 双模式路由：把 center 分组从本次下发里摘出去。
+        # 摘出去不是丢弃 —— 这条信号仍然入库并标记 pending，管理员可在信号中心路由。
+        direct_groups: list[tuple[dict, dict]] = []
+        center_groups: list[tuple[dict, dict]] = []
+        for group, strategy in matched:
+            if signal_meta.normalize_signal_source(group.get("signal_source")) == "center":
+                center_groups.append((group, strategy))
+            else:
+                direct_groups.append((group, strategy))
+
+        if not direct_groups:
+            # 没有可直连的分组：若有 center 分组在等，这条信号进入待路由队列；
+            # 否则才是真正的「无处可去」。
+            if center_groups:
+                await persist.record_signal(
+                    signal_id, signal, source_ip, True, None, status="pending",
+                    raw_payload=raw_payload, source=source, model=SIGNAL_MODEL_STRATEGY,
+                    route_state=signal_meta.ROUTE_PENDING,
+                    route_mode=signal_meta.ROUTE_MODE_DIRECT,
+                )
+                names = [g.get("name") or g.get("group_id") for g, _ in center_groups]
+                reason = (
+                    f"已入库待路由：{'、'.join(names)} 为信号中心模式，"
+                    f"需在信号中心选中后下发"
+                )
+                logger.info("strategy signal pending route: %s", reason)
+                return {
+                    "mode": "pending", "targets": 0, "groups": 0,
+                    "reason": reason, "tasks": [],
+                    "route_state": signal_meta.ROUTE_PENDING,
+                    "pending_groups": [g.get("group_id") for g, _ in center_groups],
+                }
             await persist.record_signal(
                 signal_id, signal, source_ip, True, None, status="rejected",
                 raw_payload=raw_payload, source=source, model=SIGNAL_MODEL_STRATEGY,
+                route_state=signal_meta.ROUTE_DROPPED,
+                route_mode=signal_meta.ROUTE_MODE_DIRECT,
             )
             detail = "；".join(reasons) if reasons else "没有已启用且绑定该品种策略的分组"
             reason = f"无匹配分组：{detail}"
@@ -419,7 +493,69 @@ class GroupDispatcher:
         await persist.record_signal(
             signal_id, signal, source_ip, True, SIGNAL_DISPATCH_MODE,
             raw_payload=raw_payload, source=source, model=SIGNAL_MODEL_STRATEGY,
+            route_state=(
+                signal_meta.ROUTE_PENDING if center_groups
+                else signal_meta.ROUTE_AUTO
+            ),
+            route_mode=signal_meta.ROUTE_MODE_DIRECT,
         )
+
+        nodes = await self.store.all_nodes()
+        nodemap = {n["node_id"]: n for n in nodes}
+        online_ids = set(manager.online_node_ids())
+
+        tasks = []
+        for group, strategy in direct_groups:
+            tasks.append(
+                await self._dispatch_group(
+                    group, strategy, signal, signal_id, nodemap, online_ids,
+                    source_ip=source_ip, raw_payload=raw_payload,
+                    trigger_source=trigger_source or _trigger_source_for(source),
+                    route_mode=signal_meta.ROUTE_MODE_DIRECT,
+                )
+            )
+        return {
+            "mode": "group",
+            "groups": len(tasks),
+            "targets": sum(t.get("targets", 0) for t in tasks),
+            "tasks": tasks,
+            "route_state": (
+                signal_meta.ROUTE_PENDING if center_groups
+                else signal_meta.ROUTE_AUTO
+            ),
+            "pending_groups": [g.get("group_id") for g, _ in center_groups],
+        }
+
+    async def _dispatch_center(
+        self, signal: TradingSignal, signal_id: str, *,
+        source_ip: Optional[str], raw_payload: Optional[str], source: str,
+        group_ids: list[str],
+    ) -> dict:
+        """信号中心下发：只发给被点名的分组。
+
+        与直连路径共用同一套分组准入（绑定策略 / 品种匹配 / 策略准入），
+        区别只在**分组来源**：直连是「按规则挑分组」，这里是「按人点的分组」。
+        """
+        if not group_ids:
+            return {
+                "mode": "rejected", "targets": 0, "groups": 0,
+                "reason": "未指定目标分组", "tasks": [],
+            }
+        target = [str(g).strip().lower() for g in group_ids if str(g or "").strip()]
+        if not target:
+            return {
+                "mode": "rejected", "targets": 0, "groups": 0,
+                "reason": "未指定目标分组", "tasks": [],
+            }
+        # 复用信号的分组定向：只保留被点名的分组
+        scoped = replace(signal, group_ids=target)
+        matched, reasons = await self._candidate_groups(scoped)
+        if not matched:
+            detail = "；".join(reasons) if reasons else "没有匹配的分组"
+            return {
+                "mode": "rejected", "targets": 0, "groups": 0,
+                "reason": f"无可用分组：{detail}", "tasks": [],
+            }
 
         nodes = await self.store.all_nodes()
         nodemap = {n["node_id"]: n for n in nodes}
@@ -429,8 +565,10 @@ class GroupDispatcher:
         for group, strategy in matched:
             tasks.append(
                 await self._dispatch_group(
-                    group, strategy, signal, signal_id, nodemap, online_ids,
+                    group, strategy, scoped, signal_id, nodemap, online_ids,
                     source_ip=source_ip, raw_payload=raw_payload,
+                    trigger_source=signal_meta.TRIGGER_CENTER,
+                    route_mode=signal_meta.ROUTE_MODE_CENTER,
                 )
             )
         return {
@@ -438,6 +576,7 @@ class GroupDispatcher:
             "groups": len(tasks),
             "targets": sum(t.get("targets", 0) for t in tasks),
             "tasks": tasks,
+            "route_state": signal_meta.ROUTE_ROUTED,
         }
 
     # ------------------------------------------------------------------
@@ -722,6 +861,8 @@ class GroupDispatcher:
         self, group: dict, strategy: dict, signal: TradingSignal, signal_id: str,
         nodemap: dict[str, dict], online_ids: set[str],
         *, source_ip: Optional[str], raw_payload: Optional[str],
+        trigger_source: Optional[str] = None,
+        route_mode: str = "direct",
     ) -> dict:
         """单个分组的处理：建主任务 -> 选节点 -> 逐节点抢占位并下发。"""
         mode = group_rules.normalize_dispatch_mode(group.get("dispatch_mode"))
@@ -734,6 +875,8 @@ class GroupDispatcher:
             signal_id=signal_id, group=group, signal=signal, dispatch_mode=mode,
             source_ip=source_ip, raw_payload=raw_payload, strategy=strategy,
             strategy_snapshot=snapshot,
+            trigger_source=trigger_source,
+            route_mode=route_mode,
         )
         if task_id is None:
             logger.warning("group %s task creation failed, skip dispatch",

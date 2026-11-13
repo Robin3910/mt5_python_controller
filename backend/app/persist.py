@@ -29,7 +29,9 @@ async def record_signal(signal_id, signal, source_ip=None, parsed_ok=True,
                         raw_payload: Optional[str] = None,
                         source: str = "tradingview",
                         model: str = "normal",
-                        reject_code: Optional[str] = None) -> None:
+                        reject_code: Optional[str] = None,
+                        route_state: Optional[str] = None,
+                        route_mode: Optional[str] = None) -> None:
     """落库一条信号历史。
 
     source：tradingview（外部 Webhook）/ manual（中控台手动触发）/
@@ -37,6 +39,7 @@ async def record_signal(signal_id, signal, source_ip=None, parsed_ok=True,
     model：处理模型，normal（按币种分发）/ strategy（按分组分发）。
     reject_code：整体拒收原因的结构化编码（见 signal_codes.REJECT_CODES）；
     仅统计用，写漏不影响交易。
+    route_state / route_mode：信号中心的路由状态与路由方式（见 signal_meta）。
     """
     payload_str = raw_payload
     if payload_str is None and signal is not None:
@@ -60,6 +63,11 @@ async def record_signal(signal_id, signal, source_ip=None, parsed_ok=True,
                     source=source,
                     model=model,
                     reject_code=reject_code,
+                    # 周期 / 信号类型：纯统计维度，缺失就是 NULL（不拒收信号）
+                    timeframe=getattr(signal, "timeframe", None),
+                    signal_type=getattr(signal, "signal_type", None),
+                    route_state=route_state,
+                    route_mode=route_mode,
                 )
             )
             await s.commit()

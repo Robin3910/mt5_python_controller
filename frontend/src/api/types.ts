@@ -482,6 +482,13 @@ export type SignalModel = 'normal' | 'strategy'
 /** 分组分发模式：与中控台一致的两种模式，但作用于整个分组而非单个币种 */
 export type GroupDispatchMode = 'sync' | 'poll'
 
+/**
+ * 分组的信号来源模式：
+ * - `direct`：TV 告警 / 手动信号直接触发该分组（默认，存量行为不变）；
+ * - `center`：该分组只接受信号中心下发的信号，webhook 不再自动触发它。
+ */
+export type GroupSignalSource = 'direct' | 'center'
+
 /** 分组成员节点（含在线状态） */
 export interface GroupNodeRef {
   node_id: string
@@ -524,6 +531,12 @@ export interface GroupOut {
   limit_watch_keyword: string
   /** 是否开放【AI 交易】广场的跟单（默认关）；只对绑定 AI 智能加仓策略(tpl_1)的分组有意义 */
   accept_ai_follow: boolean
+  /**
+   * 信号来源模式：
+   * - `direct`（默认）：TV 告警 / 手动信号直接触发该分组开仓；
+   * - `center`：该分组**不**被 webhook 自动触发，只能由管理员在信号中心里路由过来。
+   */
+  signal_source: GroupSignalSource
   /** 一对一绑定的策略 ID；未绑定为 null */
   strategy_id?: string | null
   /** 绑定策略名称（展示用） */
@@ -610,6 +623,8 @@ export interface GroupCreatePayload {
   limit_watch_keyword?: string
   /** 是否开放【AI 交易】广场的跟单（默认关）；前端只对 tpl_1 分组展示。 */
   accept_ai_follow?: boolean
+  /** 信号来源模式：direct（默认）/ center */
+  signal_source?: GroupSignalSource
   remark?: string | null
   /** 一对一绑定策略；空 / null = 不绑定 */
   strategy_id?: string | null
@@ -641,6 +656,8 @@ export interface GroupUpdatePayload {
   limit_watch_keyword?: string
   /** 是否开放【AI 交易】广场的跟单（默认关） */
   accept_ai_follow?: boolean
+  /** 信号来源模式：direct（默认）/ center；省略则不改 */
+  signal_source?: GroupSignalSource
   remark?: string | null
   /** 传入空字符串或 null 表示解除绑定 */
   strategy_id?: string | null
@@ -1658,6 +1675,33 @@ export interface SignalStreamDispatch {
 }
 
 /** 统一信号流里的一条信号（normal + strategy 混排） */
+/** 单条信号的质量分：历史同类信号（类型×周期）的信号级胜率 */
+export interface SignalQuality {
+  /** 质量分（0~100）；null = 没有可用先验（暂无历史），与「分数是 0」不同 */
+  score: number | null
+  /** 该桶的原始胜率（百分数） */
+  win_rate: number
+  /** 样本量 / 赢数 */
+  n: number
+  wins: number
+  /** 单信号平均净盈亏（参考用，不进分数） */
+  avg_profit: number
+  /** 分数取自哪个桶（类型|周期 / 类型 / __global__） */
+  basis: string
+  basis_label: string
+  /** 回退层级：type_tf / type / global / none */
+  level: SignalQualityLevel
+  /** 样本充分度：sufficient / thin / insufficient / none */
+  sample_level: SignalQualitySampleLevel
+}
+
+export type SignalQualityLevel = 'type_tf' | 'type' | 'global' | 'none'
+export type SignalQualitySampleLevel =
+  | 'sufficient'
+  | 'thin'
+  | 'insufficient'
+  | 'none'
+
 export interface SignalStreamItem {
   signal_id: string
   received_at: number | null
@@ -1667,6 +1711,12 @@ export interface SignalStreamItem {
   symbol: string | null
   volume: number | null
   status: string
+  /** 信号级周期（TV 告警的 {{interval}}）；缺失 = 未标注 */
+  timeframe: string | null
+  /** 首仓信号类型（ob / fvg / …）；缺失 = 未标注 */
+  signal_type: string | null
+  /** 路由状态：pending / auto / routed / dropped */
+  route_state: string | null
   reject_code: string | null
   reject_label: string | null
   targets: number
@@ -1675,6 +1725,8 @@ export interface SignalStreamItem {
   failed: number
   /** 端到端耗时（毫秒，服务端时钟） */
   elapsed_ms: number | null
+  /** 质量分：历史同类信号的成功率（只展示，不参与交易决策） */
+  quality: SignalQuality | null
   dispatches: SignalStreamDispatch[]
 }
 
@@ -1893,7 +1945,7 @@ export interface SignalCenterTasks {
   profit_scope: string
 }
 
-/** 信号中心的统一筛选参数（四个接口共用同一套语义） */
+/** 信号中心的统一筛选参数（所有接口共用同一套语义） */
 export interface SignalCenterQuery {
   window?: string
   source?: string | null
@@ -1904,6 +1956,310 @@ export interface SignalCenterQuery {
   node_id?: string | null
   group_id?: string | null
   keyword?: string | null
+  /** 信号级周期（M15 / H1 / …） */
+  timeframe?: string | null
+  /** 首仓信号类型（ob / fvg / …） */
+  signal_type?: string | null
+  /** 路由状态（pending / auto / routed / dropped） */
+  route_state?: string | null
+  /** 多空（buy / sell） */
+  direction?: string | null
+}
+
+/**
+ * 一个绩效聚合桶（按周期 / 按信号类型 / 按入场原因）。
+ *
+ * **信号级与持仓级是两套分母，不可混用**：
+ * - 信号级：分母 = 已收口且有成交的信号数；该信号全部持仓净盈亏合计 > 0 即赢；
+ * - 持仓级：分母 = 已收口的持仓数；单个持仓净盈亏 > 0 即赢。
+ * 进行中的信号 / 持仓**不进分母**（单列在 signals_running / running_profit）。
+ */
+export interface SignalPerfBucket {
+  key: string
+  label: string
+  signals_total: number
+  signals_closed: number
+  signals_win: number
+  signals_running: number
+  signals_no_trade: number
+  signal_win_rate: number
+  signal_profit: number
+  avg_signal_profit: number
+  /** 进行中浮盈（单列，不进胜率分母） */
+  running_profit: number
+  positions_total: number
+  positions_closed: number
+  positions_win: number
+  position_win_rate: number
+  position_profit: number
+  avg_position_profit: number
+  running_position_profit: number
+  volume: number
+  orders: number
+}
+
+/** 一条入场明细（首仓 / 某一档加仓） */
+export interface SignalEntryLeg {
+  signal_id: string
+  task_id: number | null
+  node_id: string | null
+  symbol: string | null
+  action: string | null
+  seq: number
+  reason: string
+  reason_label: string
+  rule_type: number | null
+  level_index: number | null
+  /** 入场级周期；点数 / 指定价加仓恒为 null（不依赖周期） */
+  timeframe: string | null
+  timeframe_label: string
+  volume: number | null
+  price: number | null
+  realized_profit: number | null
+  closed: boolean
+}
+
+export interface SignalCenterPerformance {
+  window: string
+  from_ts: number | null
+  totals: SignalPerfBucket
+  by_timeframe: SignalPerfBucket[]
+  by_signal_type: SignalPerfBucket[]
+  by_entry_reason: SignalPerfBucket[]
+  legs: SignalEntryLeg[]
+  updated_at: number
+  /** 口径说明，前端需原样展示 */
+  scope: string
+}
+
+/** 质量分先验表的一行（按「信号类型 × 周期」） */
+export interface SignalQualityBucket {
+  key: string
+  signal_type: string | null
+  timeframe: string | null
+  label: string
+  n: number
+  wins: number
+  win_rate: number
+  score: number
+  avg_profit: number
+  sample_level: SignalQualitySampleLevel
+}
+
+/** 质量分先验表 */
+export interface SignalCenterQuality {
+  window: string
+  global: {
+    n: number
+    wins: number
+    win_rate: number
+    score: number
+    avg_profit: number
+    sample_level: SignalQualitySampleLevel
+  }
+  buckets: SignalQualityBucket[]
+  updated_at: number
+  /** 口径说明，前端需原样展示 */
+  scope: string
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// AI 信号管理中心（原型复刻）
+// ───────────────────────────────────────────────────────────────────────────
+
+/** 可靠性等级：绝对阈值（≥60 高 / 50-60 中 / <50 低） */
+export type SignalReliabilityLevel = 'high' | 'mid' | 'low' | 'none'
+
+/** 信号明细的一行（也用于 TOP 5 列表） */
+export interface AiSignalRow {
+  signal_id: string
+  received_at: number | null
+  timeframe: string | null
+  timeframe_label: string
+  signal_type: string | null
+  signal_type_label: string
+  /** 业务分类（结构分析 / 突破信号 / …） */
+  type_group: string
+  /** 可读信号名（前端拼装） */
+  name: string
+  action: string | null
+  action_label: string
+  symbol: string | null
+  quality: SignalQuality | null
+  score: number | null
+  level: SignalReliabilityLevel
+  /** 决策指导：关注 / 观察 / 暂不参与 / 暂无历史 */
+  advice: string
+  /** 马丁止盈档位（null = 未止盈 / 持仓中） */
+  tp_level: number | null
+  tp_level_label: string | null
+  /** tp / sl / running / none */
+  tp_state: string
+  tp_units: Array<{
+    node_id: string | null
+    tp_level: number | null
+    tp_state: string
+    tp_at: number | null
+  }>
+}
+
+/** 四个指标卡 */
+export interface AiKpi {
+  /** 今日触发信号（UTC+8 自然日） */
+  today_signals: number
+  /** 覆盖周期：只给个数，不写分母 */
+  timeframes_covered: number
+  /** 高可靠信号：等级为「高」的信号条数 */
+  high_reliability: number
+  /** 平均信号质量 */
+  avg_quality: number
+  signals_total: number
+  signals_scored: number
+}
+
+/** 可靠性等级分布的一档 */
+export interface AiReliabilityItem {
+  level: SignalReliabilityLevel
+  label: string
+  count: number
+  pct: number
+  advice: string
+}
+
+/** 质量分区间分布的一档 */
+export interface AiScoreBucket {
+  key: string
+  label: string
+  count: number
+  pct: number
+}
+
+/** 信号类型质量对比的一栏 */
+export interface AiTypeQualityItem {
+  key: string
+  label: string
+  count: number
+  avg_score: number
+  high_count: number
+  level: SignalReliabilityLevel
+  advice: string
+  best_signal: AiSignalRow | null
+  /** 该分类下的类型码（联动筛选用） */
+  types: string[]
+}
+
+/** 周期质量总览的一张卡 */
+export interface AiTimeframeQualityItem {
+  key: string
+  label: string
+  count: number
+  avg_score: number
+  high_count: number
+  level: SignalReliabilityLevel
+  advice: string
+  best_signal: AiSignalRow | null
+}
+
+/** AI 信号管理中心上半屏 */
+export interface AiSignalOverview {
+  window: string
+  from_ts: number | null
+  kpi: AiKpi
+  reliability: AiReliabilityItem[]
+  score_buckets: AiScoreBucket[]
+  by_type: AiTypeQualityItem[]
+  by_timeframe: AiTimeframeQualityItem[]
+  top_signals: AiSignalRow[]
+  updated_at: number
+  /** 口径说明，前端需原样展示 */
+  scope: string
+}
+
+/** 一个止盈档位 */
+export interface AiTpBucket {
+  level: number
+  label: string
+  count: number
+  pct: number
+}
+
+/**
+ * 一个节点的止盈档位分布。
+ *
+ * **接口保留、界面不再展示** —— 统计口径仍是「按节点分开算」，
+ * 但前端只画一条合并后的分布条（`overall`）。
+ * 保留这个字段是为了将来要看「哪个账户马丁加得深」时不用改后端。
+ */
+export interface AiTpNodeItem {
+  node_id: string
+  node_name: string
+  units: number
+  buckets: AiTpBucket[]
+}
+
+/** 马丁止盈分布 */
+export interface AiTpDistribution {
+  window: string
+  /** 窗口内信号总数 */
+  total_signals: number
+  /** 已止盈的统计单元数（分布分母） */
+  closed_tp_units: number
+  /** 各账户的分开统计（界面不展示，见 AiTpNodeItem 注释） */
+  by_node: AiTpNodeItem[]
+  /** 各账户汇总后的分布（界面展示这一条） */
+  overall: {
+    units: number
+    buckets: AiTpBucket[]
+  }
+  /** tp / sl / running / none 的单元数 */
+  states: Record<string, number>
+  /** 每个档位的重点信号 TOP 5（按质量分降序），键是档位号 */
+  top_by_level: Record<string, AiSignalRow[]>
+  updated_at: number
+  scope: string
+}
+
+/** 信号明细表（页码分页） */
+export interface AiSignalList {
+  window: string
+  total: number
+  total_signals: number
+  page: number
+  pages: number
+  page_size: number
+  items: AiSignalRow[]
+  updated_at: number
+  scope: string
+}
+
+/** 路由一条信号的入参 */
+export interface SignalRouteRequest {
+  group_ids: string[]
+  volume?: number | null
+  sl?: number | null
+  tp?: number | null
+  note?: string | null
+}
+
+/** 批量路由的入参 */
+export interface SignalBatchRouteRequest extends SignalRouteRequest {
+  signal_ids: string[]
+}
+
+export interface SignalRouteResult {
+  signal_id: string
+  groups: number
+  targets: number
+  tasks: unknown[]
+  route_state: string
+  note: string | null
+}
+
+export interface SignalBatchRouteResult {
+  ok: { signal_id: string; groups: number; targets: number }[]
+  conflicts: { signal_id: string; reason: string; task_ids: number[] }[]
+  failed: { signal_id: string; reason: string }[]
+  summary: { ok: number; conflicts: number; failed: number }
 }
 
 export interface AuditRecord {

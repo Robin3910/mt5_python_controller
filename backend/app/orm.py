@@ -372,6 +372,16 @@ class SignalHistory(Base):
     model: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
     # 整体拒收原因的结构化编码（见 signal_codes.REJECT_CODES）；NULL = 未被拒收
     reject_code: Mapped[str | None] = mapped_column(String(24), nullable=True, index=True)
+    # —— 信号元信息（统计维度，不参与任何交易判断）——
+    # 周期：TV 告警的 {{interval}} 归一后的值（M15 / H1 / …）。缺就 NULL，**绝不拒收信号**
+    timeframe: Mapped[str | None] = mapped_column(String(8), nullable=True, index=True)
+    # 首仓信号类型（ob / fvg / bos / …）。未知类型保留原值小写，不丢
+    signal_type: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    # —— 路由状态（信号中心的 inbox 层）——
+    # pending（待路由）/ auto（直连已消费）/ routed（被中心下发过）/ dropped（已丢弃）
+    route_state: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    # direct（分组直连）/ center（信号中心下发）
+    route_mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
 
 class SignalDispatch(Base):
@@ -504,6 +514,12 @@ class NodeGroup(Base):
     # 只对绑定 tpl_1（AI 智能加仓策略）的分组有意义；AI 加仓是持续加仓，
     # 暴露一个参数激进的老分组代价远高于普通带单，所以默认关闭、需显式开启。
     accept_ai_follow: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 信号来源模式：direct（TV / 手动信号直连触发，默认）/ center（只接受信号中心下发）。
+    # 路由策略挂在分组上而不是全局开关——这样存量分组零行为变化，
+    # 且可以在不同分组间混用两种模式。
+    signal_source: Mapped[str] = mapped_column(
+        String(16), default="direct", server_default="direct",
+    )
     # 一对一绑定 TradingStrategy；unique 保证同一策略不能挂到多个分组
     strategy_id: Mapped[str | None] = mapped_column(String(32), nullable=True, unique=True, index=True)
     remark: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -671,6 +687,56 @@ class GroupSignalTask(Base):
     total_volume: Mapped[float] = mapped_column(Float, default=0.0)
     realized_profit: Mapped[float] = mapped_column(Float, default=0.0)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # —— 路由（信号中心）——
+    # 触发来源：tv_webhook / manual / limit_watch / center（从信号中心下发）
+    trigger_source: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    # 路由方式：direct（分组直连自动触发）/ center（信号中心下发）
+    route_mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+
+class SignalEntryLeg(Base):
+    """信号入场明细：一条信号的一次入场（首仓 / 某一档加仓）。
+
+    把「每一次入场都有他的原因」落成**可聚合的窄行**，而不是每次统计都去解析
+    `group_signal_task.strategy_snapshot_json`（JSON 无法 group by，慢且脆）。
+
+    两级周期语义（务必分清）：
+    - `signal_history.timeframe` = **信号级**周期，来自 TV 告警，与加仓方式无关；
+    - 本表 `timeframe` = **入场级**周期，是这次入场实际生效的周期。
+      **点数（point）与指定价（price）加仓不依赖周期**（配了也不读），
+      所以它们的 `timeframe` 恒为 NULL —— 硬凑一个周期会把「点数间距」
+      混进「ATR 间距」的分桶，统计出来的数字没有意义。
+
+    `realized_profit` 是该入场对应持仓的已实现净盈亏（profit + swap + commission）。
+    """
+    __tablename__ = "signal_entry_leg"
+
+    id: Mapped[int] = mapped_column(AutoPK, primary_key=True, autoincrement=True)
+    signal_id: Mapped[str] = mapped_column(String(32), index=True)
+    task_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
+    node_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    magic: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
+    symbol: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    action: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    # 入场序号：0 = 首仓；1+ = 第 N 档加仓
+    seq: Mapped[int] = mapped_column(Integer, default=0)
+    # 入场原因：first / point / price / atr / range / fvg / ob / pdz / fibo / manual
+    reason: Mapped[str] = mapped_column(String(16), index=True)
+    # 规则类型：1 = 逆势加仓，2 = 顺势加仓（首仓为 NULL）
+    rule_type: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 档位号（首仓为 NULL）
+    level_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 实际生效的周期；point / price 恒为 NULL
+    timeframe: Mapped[str | None] = mapped_column(String(8), nullable=True, index=True)
+    # 该入场的手数与成交价（成交后回填）
+    volume: Mapped[float | None] = mapped_column(Float, nullable=True)
+    price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # 该入场对应的 MT5 订单票号（成交后回填）：用来反查 position_id，
+    # 再把该持仓的净盈亏归集回这一行
+    order_ticket: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
+    # 已实现净盈亏（成交入库后按持仓归集回填）
+    realized_profit: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
 class GroupTaskDispatch(Base):

@@ -24,6 +24,7 @@ from .models import GroupCreate, GroupUpdate
 from .orm import GroupFollowerNode, NodeGroup, NodeGroupMember, TradingStrategy
 from .redis_store import RedisStore
 from .security import make_group_id
+from .signal_meta import normalize_signal_source
 
 _LIMIT_WATCH_ONLY_TREND = "限价单监听仅适用于绑定趋势策略（模版2）的分组"
 _SIGNAL_CONCURRENT_ONLY_GRID_TREND = "信号并发仅适用于绑定网格策略（模版3）、趋势策略（模版2）的分组"
@@ -56,6 +57,10 @@ def group_row_to_dict(
             getattr(row, "limit_watch_keyword", None),
         ),
         "accept_ai_follow": bool(getattr(row, "accept_ai_follow", False)),
+        # 信号来源模式：direct（默认）/ center。存量分组没有这列时按 direct 处理。
+        "signal_source": normalize_signal_source(
+            getattr(row, "signal_source", None),
+        ),
         "strategy_id": row.strategy_id,
         "remark": row.remark,
         "owner_user_id": row.owner_user_id,
@@ -331,6 +336,7 @@ async def _create_group(
                 limit_watch_enabled=watch_enabled,
                 limit_watch_keyword=watch_keyword,
                 accept_ai_follow=bool(payload.accept_ai_follow),
+                signal_source=normalize_signal_source(payload.signal_source),
                 strategy_id=strategy_id,
                 remark=(payload.remark or "").strip() or None,
                 owner_user_id=owner,
@@ -396,6 +402,9 @@ async def _update_group(store: RedisStore, group_id: str, patch: GroupUpdate) ->
             row.trend_risk_enabled = bool(patch.trend_risk_enabled)
         if patch.accept_ai_follow is not None:
             row.accept_ai_follow = bool(patch.accept_ai_follow)
+        if patch.signal_source is not None:
+            # 非法值回落 direct，绝不抛异常（这个开关只影响路由，不影响交易）
+            row.signal_source = normalize_signal_source(patch.signal_source)
         if patch.remark is not None:
             row.remark = patch.remark.strip() or None
         if update_strategy:
