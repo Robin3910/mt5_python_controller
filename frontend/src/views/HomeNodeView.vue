@@ -31,6 +31,11 @@ const id = computed(() => String(route.params.id || ''))
 const node = computed<NodeOut | undefined>(() => hub.nodes.find((n) => n.node_id === id.value))
 const account = computed<AccountSnapshot | undefined>(() => hub.accounts[id.value])
 const online = computed(() => (hub.statuses[id.value] || node.value?.status) === 'online')
+/** MT5 交易账号：优先取实时上报快照的登录号，其次取节点配置值 */
+const mt5Account = computed(() => {
+  const login = account.value?.login ?? node.value?.mt5_login
+  return login ? String(login) : ''
+})
 const loadedNodes = ref(false)
 const channels = ref<FollowChannelsOut | null>(null)
 const channelError = ref('')
@@ -340,8 +345,8 @@ async function closeChannel(mode: 'all' | 'profit' | 'ticket', ticket?: number):
             </span>
             <div class="hn-id-text">
               <div class="hn-title">
-                <strong>{{ node.node_id }}</strong>
-                <em>{{ node.name }}</em>
+                <strong>{{ node.name }}</strong>
+                <em v-if="mt5Account">MT5 {{ mt5Account }}</em>
               </div>
               <p>
                 <i class="hn-dot" :class="online ? 'is-on' : 'is-off'"></i>
