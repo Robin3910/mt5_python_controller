@@ -125,6 +125,11 @@ function statusOf(n: NodeOut): 'online' | 'offline' {
 function acct(id: string): AccountSnapshot | undefined {
   return hub.accounts[id]
 }
+/** MT5 交易账号：优先取实时上报的登录号，其次取节点配置值 */
+function mt5Login(n: NodeOut): string {
+  const login = acct(n.node_id)?.login ?? n.mt5_login
+  return login ? String(login) : '—'
+}
 function fmtMoney(n: number | undefined): string {
   return (n ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 }
@@ -450,20 +455,19 @@ function reportCancelPending(res: CancelPendingResult): void {
               v-for="n in g.nodes"
               :key="n.node_id"
               class="home-node"
+              :class="{ 'is-primary': n.is_primary }"
               @click="goNode(n.node_id)"
             >
               <div class="home-node-top">
-                <span class="home-node-ico" :class="{ primary: n.is_primary }" aria-hidden="true">
-                  <svg v-if="n.is_primary" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2 9.2 8.4 2.4 9.2l5 4.6L6.2 21 12 17.6 17.8 21l-1.2-7.2 5-4.6-6.8-.8L12 2z"/></svg>
-                  <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M8 15V9M12 15v-3M16 15V8"/></svg>
+                <span class="home-node-line">
+                  <span class="home-dot" :class="statusOf(n)"></span>
+                  <svg v-if="n.is_primary" class="home-node-premium" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                    <path d="M12 2 9.2 8.4 2.4 9.2l5 4.6L6.2 21 12 17.6 17.8 21l-1.2-7.2 5-4.6-6.8-.8L12 2z" />
+                  </svg>
+                  <span class="home-node-title">{{ n.name }}</span>
+                  <span v-if="n.is_primary" class="home-node-badge">主节点</span>
+                  <span class="home-node-sub">MT5 {{ mt5Login(n) }}</span>
                 </span>
-                <div class="home-node-id">
-                  <div class="home-node-title">
-                    <span>{{ n.node_id }}</span>
-                    <em v-if="n.is_primary">主节点</em>
-                  </div>
-                  <p>{{ n.name }}</p>
-                </div>
                 <span class="home-status" :class="statusOf(n)">{{ statusOf(n) === 'online' ? '在线' : '离线' }}</span>
                 <div class="home-node-menu" @click.stop>
                   <button
@@ -498,8 +502,10 @@ function reportCancelPending(res: CancelPendingResult): void {
                 </div>
               </div>
               <div class="home-node-metrics">
-                <span><em>余额</em> {{ fmtMoney(acct(n.node_id)?.balance) }}</span>
-                <span><em>持仓</em> {{ acct(n.node_id)?.positions?.length || 0 }} · {{ fmtVol(nodeVolume(acct(n.node_id)?.positions)) }}手</span>
+                <span class="home-node-metric">
+                  余额 <b>{{ fmtMoney(acct(n.node_id)?.balance) }}</b>
+                </span>
+                <span class="home-node-metric">持仓 {{ acct(n.node_id)?.positions?.length || 0 }} · {{ fmtVol(nodeVolume(acct(n.node_id)?.positions)) }}手</span>
                 <strong :class="nodeProfit(acct(n.node_id)?.positions) >= 0 ? 'is-up' : 'is-down'">
                   {{ fmtSigned(nodeProfit(acct(n.node_id)?.positions)) }}
                 </strong>
@@ -750,70 +756,91 @@ function reportCancelPending(res: CancelPendingResult): void {
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
+/* ── 节点卡（对齐 UI/H5.html「首页」node-item：主节点带琥珀渐变底）── */
 .home-node {
+  display: block;
+  width: 100%;
   margin-top: 8px;
-  padding: 10px;
-  border-radius: 10px;
-  border: 1px solid #22304A;
+  padding: 8px 10px;
+  text-align: left;
+  border-radius: 8px;
+  border: 1px solid #1C2740;
   background: #0C1220;
   cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
 }
-.home-node:hover { border-color: #31425f; }
-.home-node-top { align-items: flex-start; }
-.home-node-ico {
-  width: 28px;
-  height: 28px;
-  border-radius: 8px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-  color: #8B96A8;
-  background: #101828;
+.home-node:hover { border-color: #2B3A5C; background: #111A2C; }
+/* 主节点：琥珀描边 + 从左到右的暖色渐变底 */
+.home-node.is-primary {
+  border-color: rgba(180, 83, 9, 0.6);
+  background: linear-gradient(90deg, rgba(59, 42, 16, 0.5), #0C1220);
 }
-.home-node-ico svg { width: 16px; height: 16px; }
-.home-node-ico.primary { color: #fbbf24; background: rgba(251, 191, 36, 0.12); }
-.home-node-id { flex: 1; min-width: 0; }
-.home-node-title {
+.home-node.is-primary:hover {
+  border-color: #F59E0B;
+  background: linear-gradient(90deg, rgba(42, 31, 14, 0.6), #0C1220);
+}
+.home-node-top { align-items: center; }
+/* 首行：状态点 + 主节点星标 + 节点名称 + 主节点徽标 + 编号/MT5 账号 */
+.home-node-line {
   display: flex;
   align-items: center;
   gap: 6px;
   min-width: 0;
-  color: #E6EBF4;
-  font-size: 13px;
-  font-weight: 600;
+  flex: 1;
 }
-.home-node-title span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.home-node-title em {
+.home-dot {
+  width: 6px;
+  height: 6px;
   flex-shrink: 0;
-  font-style: normal;
-  font-size: 10px;
-  font-weight: 600;
-  color: #fbbf24;
-  background: rgba(251, 191, 36, 0.12);
   border-radius: 999px;
-  padding: 1px 6px;
+  background: #8B96A8;
 }
-.home-node-id p {
-  margin: 2px 0 0;
-  color: #5B6B85;
-  font-size: 11px;
+.home-dot.online { background: #22C55E; }
+.home-dot.offline { background: #64748B; }
+.home-node-premium {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  color: #F59E0B;
+}
+.home-node-title {
+  flex-shrink: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  color: #E6EBF4;
+  font-size: 12px;
+  font-weight: 600;
+}
+.home-node.is-primary .home-node-title { color: #FBBF24; }
+.home-node-badge {
+  flex-shrink: 0;
+  border-radius: 4px;
+  padding: 1px 4px;
+  background: rgba(245, 158, 11, 0.15);
+  color: #FBBF24;
+  font-size: 9px;
+  font-weight: 700;
+}
+.home-node-sub {
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #5B6B85;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
 }
 .home-status {
   flex-shrink: 0;
-  border-radius: 999px;
-  padding: 2px 7px;
+  border-radius: 4px;
+  padding: 2px 6px;
   font-size: 10px;
-  font-weight: 600;
+  font-weight: 500;
 }
-.home-status.online { color: #34d399; background: rgba(16, 185, 129, 0.12); }
+.home-status.online { color: #22C55E; background: rgba(34, 197, 94, 0.15); }
 .home-status.offline { color: #8B96A8; background: rgba(139, 150, 168, 0.12); }
 .home-node-menu { position: relative; flex-shrink: 0; }
 .home-more {
@@ -850,21 +877,29 @@ function reportCancelPending(res: CancelPendingResult): void {
 }
 .home-menu-item:hover:not(:disabled) { background: #16213A; }
 .home-node-metrics {
-  margin-top: 8px;
+  margin-top: 4px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
   color: #8B96A8;
   font-size: 11px;
   font-variant-numeric: tabular-nums;
 }
-.home-node-metrics em {
-  font-style: normal;
-  color: #5B6B85;
-  margin-right: 4px;
+.home-node-metric {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.home-node-metrics span { white-space: nowrap; }
+.home-node-metric b {
+  color: #C7D2E5;
+  font-weight: 600;
+}
 .home-node-metrics strong {
   margin-left: auto;
-  font-size: 13px;
-  font-weight: 650;
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 600;
 }
 .is-up { color: #34d399; }
 .is-down { color: #f87171; }
