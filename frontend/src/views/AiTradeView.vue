@@ -648,6 +648,28 @@ function robotPositions(entry: MyRobotEntry): Array<Position & { nodeId: string 
   }
   return rows
 }
+function magicLabel(magic: number): string {
+  return magic ? `魔术号 ${magic}` : '手工单'
+}
+function magicBooks(rows: Array<Position & { nodeId: string }>) {
+  const map = new Map<number, Array<Position & { nodeId: string }>>()
+  for (const row of [...rows].sort((a, b) => (a.ticket || 0) - (b.ticket || 0))) {
+    const magic = row.magic || 0
+    const bucket = map.get(magic) || []
+    bucket.push(row)
+    map.set(magic, bucket)
+  }
+  return [...map.entries()].map(([magic, groupRows]) => ({
+    magic,
+    rows: groupRows,
+    volume: groupRows.reduce((sum, row) => sum + (row.volume || 0), 0),
+    profit: groupRows.reduce((sum, row) => sum + (row.profit || 0), 0),
+  })).sort((a, b) => {
+    if (!a.magic && b.magic) return 1
+    if (a.magic && !b.magic) return -1
+    return a.magic - b.magic
+  })
+}
 function bookStats(rows: Array<Position & { nodeId: string }>) {
   let buy = 0
   let sell = 0
@@ -906,15 +928,24 @@ onMounted(() => { void hub.fetchNodes(); trackAiUi('page_view', { value: 'ai-tra
           <div v-if="robotPositions(entry).length" class="ai-table">
             <div class="ai-trade-label"><p><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M6.99 11 3 15l3.99 4v-3H14v-2H6.99v-3zM21 9l-3.99-4v3H10v2h7.01v3L21 9z"/></svg>当前交易</p><span>{{ bookStats(robotPositions(entry)).count }} 笔 · {{ bookStats(robotPositions(entry)).volume.toFixed(2) }} 手</span></div>
             <div class="ai-grid head"><span>#</span><span>方向</span><span>手数</span><span>开仓价</span><span>止盈/止损</span><span>浮动盈亏</span><span>操作</span></div>
-            <div v-for="(p, i) in robotPositions(entry)" :key="p.nodeId + '-' + p.ticket" class="ai-grid">
-              <span class="dim">{{ i + 1 }}</span>
-              <span><i :class="(p.type || '').toLowerCase() === 'buy' ? 'buy' : 'sell'">{{ (p.type || '').toLowerCase() === 'buy' ? '多' : '空' }}</i></span>
-              <span>{{ (p.volume || 0).toFixed(2) }}</span>
-              <span>{{ fmtPx(p.price_open) }}</span>
-              <span class="sltp"><em class="up">{{ fmtPx(p.tp) }}</em><em class="down">{{ fmtPx(p.sl) }}</em></span>
-              <strong :class="(p.profit || 0) >= 0 ? 'up' : 'down'">{{ fmtU(p.profit || 0) }}</strong>
-              <button type="button" :disabled="closeBusy" @click="closeRobotTicket(p.nodeId, p.ticket)">平仓</button>
-            </div>
+            <template v-for="group in magicBooks(robotPositions(entry))" :key="group.magic">
+              <div class="ai-magic-head">
+                <div>
+                  <b>{{ magicLabel(group.magic) }}</b>
+                  <span>{{ group.rows.length }} 笔 · {{ group.volume.toFixed(2) }} 手</span>
+                </div>
+                <strong :class="group.profit >= 0 ? 'up' : 'down'">{{ fmtU(group.profit) }}</strong>
+              </div>
+              <div v-for="(p, i) in group.rows" :key="p.nodeId + '-' + p.ticket" class="ai-grid">
+                <span class="dim">{{ i + 1 }}</span>
+                <span><i :class="(p.type || '').toLowerCase() === 'buy' ? 'buy' : 'sell'">{{ (p.type || '').toLowerCase() === 'buy' ? '多' : '空' }}</i></span>
+                <span>{{ (p.volume || 0).toFixed(2) }}</span>
+                <span>{{ fmtPx(p.price_open) }}</span>
+                <span class="sltp"><em class="up">{{ fmtPx(p.tp) }}</em><em class="down">{{ fmtPx(p.sl) }}</em></span>
+                <strong :class="(p.profit || 0) >= 0 ? 'up' : 'down'">{{ fmtU(p.profit || 0) }}</strong>
+                <button type="button" :disabled="closeBusy" @click="closeRobotTicket(p.nodeId, p.ticket)">平仓</button>
+              </div>
+            </template>
             <footer><span>多 {{ bookStats(robotPositions(entry)).buy }} / 空 {{ bookStats(robotPositions(entry)).sell }}</span><b :class="bookStats(robotPositions(entry)).profit >= 0 ? 'up' : 'down'">合计 {{ fmtU(bookStats(robotPositions(entry)).profit) }}</b></footer>
           </div>
         </article>
@@ -1085,6 +1116,11 @@ onMounted(() => { void hub.fetchNodes(); trackAiUi('page_view', { value: 'ai-tra
 .ai-grid > :nth-child(3) { font-size: 10px; }
 .ai-grid > button { justify-self: end; }
 .ai-grid.head { color: #5B6B85; font-size: 10px; font-weight: 500; background: #0C1424; border-bottom: 1px solid #16213A; }
+.ai-magic-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 10px; background: #10192C; border-bottom: 1px solid #16213A; }
+.ai-magic-head div { display: flex; align-items: center; gap: 8px; min-width: 0; flex-wrap: wrap; }
+.ai-magic-head b { color: #93C5FD; font-size: 11px; font-weight: 650; }
+.ai-magic-head span { color: #5B6B85; font-size: 10px; }
+.ai-magic-head strong { font-size: 11px; font-variant-numeric: tabular-nums; }
 .ai-grid:last-of-type { border-bottom: 0; }
 .ai-grid strong { font-weight: 600; }
 .ai-grid i { display: inline-flex; align-items: center; justify-content: center; height: 15px; min-width: 20px; font-style: normal; font-size: 10px; font-weight: 700; line-height: 1; border-radius: 3px; padding: 0 2px; }

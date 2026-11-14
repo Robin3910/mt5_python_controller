@@ -428,13 +428,23 @@ function fmtHm(ts: number | null | undefined): string {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
+interface MagicGroup {
+  magic: number
+  rows: Position[]
+  volume: number
+  profit: number
+}
 interface SymbolBook {
   symbol: string
   rows: Position[]
+  groups: MagicGroup[]
   buy: number
   sell: number
   volume: number
   profit: number
+}
+function magicLabel(magic: number): string {
+  return magic ? `魔术号 ${magic}` : '手工单'
 }
 const positionBooks = computed<SymbolBook[]>(() => {
   const map = new Map<string, Position[]>()
@@ -446,6 +456,25 @@ const positionBooks = computed<SymbolBook[]>(() => {
   }
   return [...map.entries()].map(([symbol, rows]) => {
     const sorted = [...rows].sort((a, b) => (a.ticket || 0) - (b.ticket || 0))
+    const byMagic = new Map<number, Position[]>()
+    for (const row of sorted) {
+      const magic = row.magic || 0
+      const bucket = byMagic.get(magic) || []
+      bucket.push(row)
+      byMagic.set(magic, bucket)
+    }
+    const groups = [...byMagic.entries()]
+      .map(([magic, groupRows]) => ({
+        magic,
+        rows: groupRows,
+        volume: groupRows.reduce((sum, row) => sum + (row.volume || 0), 0),
+        profit: groupRows.reduce((sum, row) => sum + (row.profit || 0), 0),
+      }))
+      .sort((a, b) => {
+        if (!a.magic && b.magic) return 1
+        if (a.magic && !b.magic) return -1
+        return a.magic - b.magic
+      })
     let buy = 0
     let sell = 0
     let volume = 0
@@ -456,7 +485,7 @@ const positionBooks = computed<SymbolBook[]>(() => {
       volume += row.volume || 0
       profit += row.profit || 0
     }
-    return { symbol, rows: sorted, buy, sell, volume, profit }
+    return { symbol, rows: sorted, groups, buy, sell, volume, profit }
   }).sort((a, b) => a.symbol.localeCompare(b.symbol))
 })
 function pendingOf(symbol: string): PendingOrder[] {
@@ -566,12 +595,21 @@ const gridBooks = computed<GridBook[]>(() => {
 interface HistRow {
   key: string
   symbol: string
+  magic: number
   direction: string
   volume: number
   open: number
   close: number
   profit: number
   time: number
+}
+interface HistMagicGroup {
+  magic: number
+  rows: HistRow[]
+  volume: number
+  profit: number
+  wins: number
+  losses: number
 }
 const historyDeals = ref<DealRecord[]>([])
 const historyLoading = ref(false)
@@ -598,6 +636,7 @@ function buildHistoryRows(deals: DealRecord[]): HistRow[] {
     rows.push({
       key,
       symbol: last.symbol || ins[0]?.symbol || '—',
+      magic: last.magic || ins[0]?.magic || 0,
       direction,
       volume: outs.reduce((sum, deal) => sum + (deal.volume || 0), 0),
       open: ins[0]?.price || 0,
@@ -618,10 +657,33 @@ const historyBooks = computed(() => {
     map.set(row.symbol, bucket)
   }
   return [...map.entries()].map(([symbol, rows]) => {
+    const byMagic = new Map<number, HistRow[]>()
+    for (const row of rows) {
+      const magic = row.magic || 0
+      const bucket = byMagic.get(magic) || []
+      bucket.push(row)
+      byMagic.set(magic, bucket)
+    }
+    const groups: HistMagicGroup[] = [...byMagic.entries()].map(([magic, groupRows]) => {
+      const wins = groupRows.filter((row) => row.profit >= 0).length
+      return {
+        magic,
+        rows: groupRows,
+        volume: groupRows.reduce((sum, row) => sum + row.volume, 0),
+        profit: groupRows.reduce((sum, row) => sum + row.profit, 0),
+        wins,
+        losses: groupRows.length - wins,
+      }
+    }).sort((a, b) => {
+      if (!a.magic && b.magic) return 1
+      if (a.magic && !b.magic) return -1
+      return a.magic - b.magic
+    })
     const wins = rows.filter((row) => row.profit >= 0).length
     return {
       symbol,
       rows,
+      groups,
       volume: rows.reduce((sum, row) => sum + row.volume, 0),
       profit: rows.reduce((sum, row) => sum + row.profit, 0),
       wins,
@@ -654,26 +716,63 @@ const assetDist = computed(() => {
     }))
 })
 
+const HISTORY_TAB_REFRESH_MS = 5000
+let historyTimer: number | null = null
+let historySeq = 0
+
+function stopHistoryPoll(): void {
+  if (historyTimer !== null) {
+    window.clearInterval(historyTimer)
+    historyTimer = null
+  }
+}
+
 async function loadTradeHistory(): Promise<void> {
-  if (!primaryNode.value) return
-  historyLoading.value = true
+  const nodeId = primaryNode.value?.node_id
+  if (!nodeId) return
+  const seq = ++historySeq
+  const blank = historyDeals.value.length === 0
+  if (blank) historyLoading.value = true
   try {
     const from = Math.floor(Date.now() / 1000) - 7 * 24 * 3600
-    const page = await fetchNodeDeals(primaryNode.value.node_id, 1, 200, { from_time: from })
-    historyDeals.value = page.items
+    const page = await fetchNodeDeals(nodeId, 1, 200, { from_time: from })
+    if (seq !== historySeq || primaryNode.value?.node_id !== nodeId) return
+    historyDeals.value = page.items || []
     dealsTotal.value = page.total
     historyWinRate.value = page.summary?.data_available ? page.summary.win_rate : null
     historyProfit.value = page.summary?.total_profit || 0
   } catch {
+    if (seq !== historySeq || !blank) return
     historyDeals.value = []
+    dealsTotal.value = 0
+    historyWinRate.value = null
+    historyProfit.value = 0
   } finally {
-    historyLoading.value = false
+    if (seq === historySeq) historyLoading.value = false
   }
 }
 watch(
   () => primaryNode.value?.node_id,
   () => { void loadTradeHistory() },
   { immediate: true },
+)
+// 成交是平仓后异步入库的。停在历史页或持仓笔数变化时再拉，避免一直显示进页那一刻的空列表。
+watch(detailTab, (tab) => {
+  if (tab === 'history' && primaryNode.value) {
+    void loadTradeHistory()
+    if (historyTimer === null) {
+      historyTimer = window.setInterval(() => { void loadTradeHistory() }, HISTORY_TAB_REFRESH_MS)
+    }
+  } else {
+    stopHistoryPoll()
+  }
+})
+watch(
+  () => allPositions.value.length,
+  (count, prev) => {
+    if (prev == null || count === prev || !primaryNode.value) return
+    void loadTradeHistory()
+  },
 )
 
 // ── 弹窗（开仓参数）──
@@ -968,6 +1067,7 @@ onBeforeUnmount(() => {
     window.clearInterval(gridTimer)
     gridTimer = null
   }
+  stopHistoryPoll()
 })
 </script>
 
@@ -1071,21 +1171,31 @@ onBeforeUnmount(() => {
               <strong :class="book.profit >= 0 ? 'up' : 'down'">{{ fmtSigned(book.profit) }}</strong>
             </header>
             <div class="tr-grid tr-pos-grid tr-head">
-              <span>#</span><span>方向</span><span>手数</span><span>开仓价</span><span>止盈/止损</span><span>浮动盈亏</span><span>操作</span>
+              <span>#</span><span>魔术号</span><span>方向</span><span>手数</span><span>开仓价</span><span>止盈/止损</span><span>浮动盈亏</span><span>操作</span>
                         </div>
-            <div v-for="(p, i) in book.rows" :key="p.ticket" class="tr-grid tr-pos-grid tr-line">
-              <span class="dim">{{ i + 1 }}</span>
-              <span><i class="dir" :class="isBuySide(p.type) ? 'buy' : 'sell'">{{ fmtPosType(p.type) }}</i></span>
-              <span class="num">{{ (p.volume || 0).toFixed(2) }}</span>
-              <span class="num">{{ fmtPx(p.price_open, p.symbol) }}</span>
-              <span class="sltp"><em class="up">{{ fmtPx(p.tp, p.symbol) }}</em><em class="down">{{ fmtPx(p.sl, p.symbol) }}</em></span>
-              <strong :class="(p.profit || 0) >= 0 ? 'up' : 'down'">{{ fmtSigned(p.profit || 0) }}</strong>
-              <span>
-                <button type="button" class="tr-x" :disabled="isClosing(p.ticket) || !!actionBusy" @click="closePosition(p)">
-                  {{ isClosing(p.ticket) ? '…' : '平仓' }}
+            <template v-for="group in book.groups" :key="group.magic">
+              <div class="tr-magic-head">
+                <div>
+                  <b>{{ magicLabel(group.magic) }}</b>
+                  <span>{{ group.rows.length }} 笔 · {{ group.volume.toFixed(2) }} 手</span>
+                </div>
+                <strong :class="group.profit >= 0 ? 'up' : 'down'">{{ fmtSigned(group.profit) }}</strong>
+              </div>
+              <div v-for="(p, i) in group.rows" :key="p.ticket" class="tr-grid tr-pos-grid tr-line">
+                <span class="dim">{{ i + 1 }}</span>
+                <span class="tr-magic-col">{{ p.magic || '—' }}</span>
+                <span><i class="dir" :class="isBuySide(p.type) ? 'buy' : 'sell'">{{ fmtPosType(p.type) }}</i></span>
+                <span class="num">{{ (p.volume || 0).toFixed(2) }}</span>
+                <span class="num">{{ fmtPx(p.price_open, p.symbol) }}</span>
+                <span class="sltp"><em class="up">{{ fmtPx(p.tp, p.symbol) }}</em><em class="down">{{ fmtPx(p.sl, p.symbol) }}</em></span>
+                <strong :class="(p.profit || 0) >= 0 ? 'up' : 'down'">{{ fmtSigned(p.profit || 0) }}</strong>
+                <span>
+                  <button type="button" class="tr-x" :disabled="isClosing(p.ticket) || !!actionBusy" @click="closePosition(p)">
+                    {{ isClosing(p.ticket) ? '…' : '平仓' }}
                       </button>
-              </span>
+                </span>
                       </div>
+            </template>
             <footer class="tr-book-actions">
               <button type="button" class="chip green" :disabled="!!actionBusy || !book.rows.some((p) => (p.profit || 0) > 0)" @click="closeSymbolProfit(book.symbol)">平盈</button>
               <button type="button" class="chip amber" :disabled="!!actionBusy || !pendingOf(book.symbol).length" @click="cancelSymbolPending(book.symbol)">删挂单</button>
@@ -1169,17 +1279,28 @@ onBeforeUnmount(() => {
               <strong :class="book.profit >= 0 ? 'up' : 'down'">{{ fmtSigned(book.profit) }}</strong>
             </header>
             <div class="tr-grid tr-hist-grid tr-head">
-              <span>#</span><span>时间</span><span>方向</span><span>手数</span><span>开仓价</span><span>平仓价</span><span>盈亏</span>
+              <span>#</span><span>魔术号</span><span>时间</span><span>方向</span><span>手数</span><span>开仓价</span><span>平仓价</span><span>盈亏</span>
             </div>
-            <div v-for="(row, i) in book.rows" :key="row.key" class="tr-grid tr-hist-grid tr-line">
-              <span class="dim">{{ i + 1 }}</span>
-              <span class="dim">{{ fmtPosTime(row.time) }}</span>
-              <span><i class="dir" :class="isBuySide(row.direction) ? 'buy' : 'sell'">{{ fmtPosType(row.direction) }}</i></span>
-              <span class="num">{{ row.volume.toFixed(2) }}</span>
-              <span class="num">{{ fmtPx(row.open, row.symbol) }}</span>
-              <span class="num">{{ fmtPx(row.close, row.symbol) }}</span>
-              <strong :class="row.profit >= 0 ? 'up' : 'down'">{{ fmtSigned(row.profit) }}</strong>
-            </div>
+            <template v-for="group in book.groups" :key="group.magic">
+              <div class="tr-magic-head">
+                <div>
+                  <b>{{ magicLabel(group.magic) }}</b>
+                  <span>{{ group.rows.length }} 笔 · {{ group.volume.toFixed(2) }} 手</span>
+                  <span class="wide">平盈 {{ group.wins }} / 平损 {{ group.losses }}</span>
+                </div>
+                <strong :class="group.profit >= 0 ? 'up' : 'down'">{{ fmtSigned(group.profit) }}</strong>
+              </div>
+              <div v-for="(row, i) in group.rows" :key="row.key" class="tr-grid tr-hist-grid tr-line">
+                <span class="dim">{{ i + 1 }}</span>
+                <span class="tr-magic-col">{{ row.magic || '—' }}</span>
+                <span class="dim">{{ fmtPosTime(row.time) }}</span>
+                <span><i class="dir" :class="isBuySide(row.direction) ? 'buy' : 'sell'">{{ fmtPosType(row.direction) }}</i></span>
+                <span class="num">{{ row.volume.toFixed(2) }}</span>
+                <span class="num">{{ fmtPx(row.open, row.symbol) }}</span>
+                <span class="num">{{ fmtPx(row.close, row.symbol) }}</span>
+                <strong :class="row.profit >= 0 ? 'up' : 'down'">{{ fmtSigned(row.profit) }}</strong>
+              </div>
+            </template>
           </section>
         </div>
       </section>
@@ -1271,17 +1392,23 @@ onBeforeUnmount(() => {
 .tr-book-head { justify-content: space-between; gap: 8px; padding: 8px 12px; background: #0C1424; border-bottom: 1px solid #16213A; }
 .tr-book-head div { display: flex; align-items: center; gap: 8px; min-width: 0; flex-wrap: wrap; }
 .tr-book-head b { color: #3B82F6; background: rgba(37,99,235,.15); border-radius: 6px; padding: 1px 6px; font-size: 13px; }
+.tr-magic-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 12px; background: #0E1728; border-bottom: 1px solid #16213A; }
+.tr-magic-head div { display: flex; align-items: center; gap: 8px; min-width: 0; flex-wrap: wrap; }
+.tr-magic-head b { color: #93C5FD; font-size: 11px; font-weight: 650; }
+.tr-magic-head span { color: #5B6B85; font-size: 10px; }
+.tr-magic-head strong { font-size: 11px; font-variant-numeric: tabular-nums; }
 .tr-book-head em, .tr-book-head span { font-style: normal; color: #5B6B85; font-size: 10px; }
 .tr-book-head strong, .tr-line strong, .num { font-variant-numeric: tabular-nums; }
 .tr-grid { display: grid; align-items: center; gap: 6px; padding: 4px 12px; font-size: 11px; }
-.tr-pos-grid { grid-template-columns: 14px 28px 40px minmax(56px,1fr) minmax(58px,1fr) minmax(64px,1fr) 48px; }
+.tr-pos-grid { grid-template-columns: 14px minmax(78px,.9fr) 28px 40px minmax(56px,1fr) minmax(58px,1fr) minmax(64px,1fr) 48px; }
 .tr-grid-grid { grid-template-columns: 36px minmax(60px,1.2fr) 40px 40px minmax(64px,1fr) 48px; }
-.tr-hist-grid { grid-template-columns: 14px 72px 28px 40px minmax(56px,1fr) minmax(56px,1fr) minmax(64px,1fr); }
+.tr-hist-grid { grid-template-columns: 14px minmax(78px,.9fr) 72px 28px 40px minmax(56px,1fr) minmax(56px,1fr) minmax(64px,1fr); }
 .tr-head { color: #5B6B85; background: #0A1120; border-bottom: 1px solid #16213A; font-size: 10px; }
 .tr-line { border-bottom: 1px dashed #1B2A48; }
 .tr-line:last-of-type { border-bottom: 0; }
 .tr-head span:nth-child(n+2), .tr-line span:nth-child(n+3), .tr-line strong { text-align: right; }
-.tr-pos-grid span:nth-child(2), .tr-hist-grid span:nth-child(3) { text-align: center; }
+.tr-pos-grid span:nth-child(3), .tr-hist-grid span:nth-child(4) { text-align: center; }
+.tr-magic-col { text-align: right; font-variant-numeric: tabular-nums; color: #93C5FD; }
 .dim { color: #8B96A8; }
 .dir { display: inline-flex; min-width: 20px; height: 15px; align-items: center; justify-content: center; border-radius: 3px; font-style: normal; font-size: 10px; font-weight: 700; }
 .dir.buy, .dir.green { color: #22C55E; background: rgba(34,197,94,.15); }
