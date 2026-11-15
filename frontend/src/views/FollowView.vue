@@ -18,6 +18,7 @@ import api from '@/api/client'
 import type { FollowChannelsOut, Position } from '@/api/types'
 import type { FollowApplication } from '@/api/types'
 import { trackFollowUi } from '@/utils/followAudit'
+import { pageChrome } from '@/utils/pageChrome'
 
 /** 「我的跟单」聚合后的单条节点（已按 leader 聚合、按 node_id 去重） */
 interface MyFollowedNode {
@@ -78,16 +79,6 @@ const mineLoading = ref(false)
 
 /** 统计窗口。广场不放切换条，默认近 30 天，与后端 deal_stats 口径一致。 */
 const perfWindow = ref<string>('30d')
-
-/** 列表里每个带单员的绩效（后端已算好，这里只做取值） */
-function statsOf(leader: FollowLeaderSummary): FollowLeaderSummary['performance'] {
-  return leader.performance
-}
-
-/** 跟单人数：来自跟单关系表（与订单数据无关，可独立成立） */
-function followerCountOf(leader: FollowLeaderSummary): number {
-  return leader.follower_count || leader.follower_node_count || 0
-}
 
 /**
  * 这个带单员是不是我自己。
@@ -253,9 +244,15 @@ function toggleGroup(id: string): void {
   selectedGroupIds.value = [...next]
 }
 
+/** 跟自己的带单时，主节点已是带单源成员，不能再作为跟单节点加入同一分组。 */
+function isOwnSourceNode(id: string): boolean {
+  const leader = detail.value?.leader
+  return !!leader && isMyLeader(leader) && leader.primary_node?.node_id === id
+}
+
 // 至少一个目标分组尚未生效或待审时，节点仍可补申请。未选分组时先允许勾节点。
 function isNodeSelectable(id: string): boolean {
-  if (detailPaused.value) return false
+  if (detailPaused.value || isOwnSourceNode(id)) return false
   const groups = targetGroupIds.value
   if (!groups.length) return selectableGroups.value.length > 1
   return groups.some((gid) => !occupiedPairs.value.has(`${gid}:${id}`))
@@ -444,6 +441,7 @@ function applicationRows(leaderId: number): FollowApplication[] {
 }
 
 function nodeFollowHint(id: string): string {
+  if (isOwnSourceNode(id)) return '主节点已在带单分组内'
   const groups = targetGroupIds.value.length
     ? targetGroupIds.value
     : selectableGroups.value.map((g) => g.group_id)
@@ -661,6 +659,7 @@ onBeforeUnmount(() => {
   document.body.style.overflow = ''
   window.clearInterval(followTimer)
   window.clearTimeout(pickerSearchTimer)
+  if (pageChrome.value?.title === '带单员展示') pageChrome.value = null
 })
 
 // 跟单成功后：手机端收起详情页并切到「我的跟单」，让结果立刻可见。
@@ -680,7 +679,19 @@ onMounted(() => {
   }, 45_000)
 })
 
-const pageMode = ref<'home' | 'mine'>('home')
+const pageMode = ref<'home' | 'mine' | 'showcase'>('home')
+const showcaseMode = ref<'trend_market' | 'trend_limit' | 'grid'>('trend_market')
+function closeShowcase(): void {
+  pageMode.value = 'home'
+}
+watch(pageMode, (mode) => {
+  if (mode === 'showcase') {
+    pageChrome.value = { title: '带单员展示', back: closeShowcase }
+    window.scrollTo(0, 0)
+  } else if (pageChrome.value?.title === '带单员展示') {
+    pageChrome.value = null
+  }
+})
 const mineTab = ref<'list' | 'nodes'>('list')
 const nodeQuery = ref('')
 const nodeFilter = ref<'all' | 'online' | 'pos' | 'win' | 'loss' | 'off'>('all')
@@ -693,9 +704,6 @@ const selfDetail = ref<FollowDetailResponse | null>(null)
 
 function leaderName(leader: FollowLeaderSummary): string {
   return leader.display_name || leader.username
-}
-function hasPerf(leader: FollowLeaderSummary): boolean {
-  return !!leader.performance?.data_available
 }
 function fmtU(n: number): string {
   const abs = Math.abs(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
@@ -775,6 +783,19 @@ async function pauseMine() {
   await openLeader(myLeader.value)
   await togglePause()
 }
+async function openShowcase(): Promise<void> {
+  if (!myLeader.value || detailLoading.value) return
+  await openLeader(myLeader.value)
+  if (!detail.value) return
+  const first = SHOWCASE_MODES.find((key) => (detail.value?.groups || []).some((g) => showcaseGroupMode(g) === key))
+  showcaseMode.value = first || 'trend_market'
+  pageMode.value = 'showcase'
+  trackFollowUi('page_view', { value: 'leader-showcase' })
+}
+function applyShowcase(): void {
+  if (!detail.value) return
+  void openFollowPicker(detail.value.leader)
+}
 const closeBusy = ref(false)
 async function closeRows(rows: Array<Position & { nodeId: string }>, title: string) {
   if (!rows.length) { ElMessage.info('没有可平的持仓'); return }
@@ -796,12 +817,7 @@ async function closeRows(rows: Array<Position & { nodeId: string }>, title: stri
   } finally { closeBusy.value = false }
 }
 function leaderBlurb(leader: FollowLeaderSummary): string {
-  const node = leader.primary_node?.name || leader.primary_node?.node_id
-  const head = node ? `${node} · ${leader.followable_group_count} 个可跟分组` : `${leader.followable_group_count} 个可跟分组`
-  if (!hasPerf(leader)) return `${head} · ${followerCountOf(leader)} 人跟随`
-  const perf = statsOf(leader)
-  const rate = perf.profit_rate_valid ? ` · 收益率 ${(perf.profit_rate >= 0 ? '+' : '') + perf.profit_rate.toFixed(1)}%` : ''
-  return `${head} · 净盈亏 ${fmtU(perf.total_profit)}${rate} · ${followerCountOf(leader)} 人跟随`
+  return leader.intro?.trim() || '跟单申请经审核后生效，策略开平仓自动同步。'
 }
 function fmtTime(ts: number | null | undefined): string {
   if (!ts) return '—'
@@ -1048,6 +1064,47 @@ const SELF_MODE_LABEL: Record<string, string> = {
   trend_limit: '限价开仓',
   grid: '智能吸筹',
 }
+const SHOWCASE_MODES = ['trend_market', 'trend_limit', 'grid'] as const
+function showcaseGroupMode(g: { name: string | null; strategy_name?: string | null }): string {
+  for (const raw of [g.name, g.strategy_name]) {
+    const key = (raw || '').split('-')[0]
+    if (key in SELF_MODE_LABEL) return key
+  }
+  return ''
+}
+const showcaseCounts = computed(() => {
+  const counts: Record<string, number> = { trend_market: 0, trend_limit: 0, grid: 0 }
+  for (const g of detail.value?.groups || []) {
+    const key = showcaseGroupMode(g)
+    if (key in counts) counts[key] += 1
+  }
+  return counts
+})
+const showcaseCards = computed(() =>
+  (detail.value?.groups || []).filter((g) => showcaseGroupMode(g) === showcaseMode.value),
+)
+const showcaseDays = computed(() => {
+  const id = detail.value?.leader.primary_node?.node_id
+  const created = id ? hub.nodes.find((n) => n.node_id === id)?.created_at : 0
+  if (!created) return null
+  return Math.max(0, Math.floor((Date.now() / 1000 - created) / 86400))
+})
+const showcaseIntro = computed(() => {
+  const leader = detail.value?.leader
+  if (!leader || !isMyLeader(leader)) return '跟单申请经审核后生效，策略开平仓自动同步。'
+  return auth.me?.leader_intro?.trim() || '跟单申请经审核后生效，策略开平仓自动同步。'
+})
+const showcaseNodeCount = computed(() => detail.value?.leader.follower_node_count || 0)
+function pickShowcaseMode(key: 'trend_market' | 'trend_limit' | 'grid'): void {
+  showcaseMode.value = key
+  trackFollowUi('filter', { value: `showcase:${key}` })
+}
+const showcasePerf = computed(() => {
+  // 绩效是主节点口径，拆不到单个分组；只有一个分组时才能放到这张卡上。
+  if ((detail.value?.groups.length || 0) !== 1) return null
+  const perf = detail.value?.leader.performance
+  return perf?.data_available ? perf : null
+})
 function selfModeLabel(name: string | null | undefined): string {
   return SELF_MODE_LABEL[(name || '').split('-')[0]] || ''
 }
@@ -1142,7 +1199,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
               </p>
               <p class="fd-blurb">{{ leaderBlurb(l) }}</p>
             </div>
-            <button type="button" class="fd-follow" :disabled="!l.marketable || l.follow_paused || isMyLeader(l)" @click="openFollowPicker(l)">跟单<svg viewBox="0 0 24 24"><path fill="currentColor" d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg></button>
+            <button type="button" class="fd-follow" :disabled="!l.marketable || l.follow_paused" @click="openFollowPicker(l)">跟单<svg viewBox="0 0 24 24"><path fill="currentColor" d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg></button>
           </article>
         </div>
       </section>
@@ -1178,7 +1235,8 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
           <em class="fd-sec-note">仅带单员可见</em>
         </header>
         <p v-if="!myLeader" class="fd-empty">你有带单能力，但还没有可被跟随的主节点分组。</p>
-        <article v-else class="fd-card fd-self">
+        <div v-else class="fd-self-grid">
+        <article class="fd-card fd-self">
           <header class="fd-self-top">
             <span class="fd-avatar lg"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 12a5 5 0 1 0-5-5 5 5 0 0 0 5 5zm0 2c-3.33 0-10 1.67-10 5v3h20v-3c0-3.33-6.67-5-10-5z"/></svg></span>
             <div class="fd-self-id">
@@ -1191,7 +1249,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
             </div>
             <div class="fd-self-side">
               <em class="fd-self-run"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46A7.93 7.93 0 0 0 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74A7.93 7.93 0 0 0 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z"/></svg>{{ selfRunLabel }}</em>
-              <button type="button" class="fd-self-link" :disabled="pauseBusy" @click="pauseMine">{{ myLeader.follow_paused ? '恢复带单' : '暂停带单' }}<svg viewBox="0 0 24 24"><path fill="currentColor" d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg></button>
+              <button type="button" class="fd-self-link" @click="openShowcase">查看带单员<svg viewBox="0 0 24 24"><path fill="currentColor" d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg></button>
             </div>
           </header>
           <p v-if="!selfGroups.length" class="fd-empty">主节点上还没有可展示的带单分组。</p>
@@ -1243,10 +1301,11 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
             </div>
           </div>
         </article>
+        </div>
       </section>
     </template>
 
-    <template v-else>
+    <template v-else-if="pageMode === 'mine'">
       <button type="button" class="fd-back" @click="pageMode = 'home'">返回带单广场</button>
       <section class="fd-mine-hero">
         <div class="fd-mine-title">
@@ -1389,6 +1448,83 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
       </section>
     </template>
 
+    <template v-else-if="pageMode === 'showcase' && detail">
+      <section class="fd-card fd-show">
+        <div class="fd-show-banner"></div>
+        <div class="fd-show-body">
+          <div class="fd-show-id">
+            <div class="fd-show-who">
+              <span class="fd-show-avatar">{{ leaderName(detail.leader).slice(0, 1) }}</span>
+              <div>
+                <p>
+                  <b>{{ leaderName(detail.leader) }}</b>
+                  <svg class="fd-verified" viewBox="0 0 24 24"><path fill="currentColor" d="m12 2 2.4 2.2 3.2-.6.8 3.1 2.9 1.5-1.1 3 1.1 3-2.9 1.5-.8 3.1-3.2-.6L12 22l-2.4-2.2-3.2.6-.8-3.1L2.7 15.8l1.1-3-1.1-3 2.9-1.5.8-3.1 3.2.6z"/></svg>
+                </p>
+                <small>{{ showcaseDays == null ? '已运行 —' : `已运行 ${showcaseDays} 天` }}</small>
+              </div>
+            </div>
+            <em :class="detail.leader.marketable ? 'fd-show-cert' : 'pause'">{{ detail.leader.marketable ? '已认证' : '已结束' }}</em>
+          </div>
+          <div class="fd-show-nodes">
+            <span class="fd-show-mark"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M22 11V3h-7v3H9V3H2v8h7V8h2v10h4v3h7v-8h-7v3h-2V8h2v3z"/></svg></span>
+            <div>
+              <p><svg viewBox="0 0 24 24"><path fill="currentColor" d="M5 18h14v2H5zm9.84-3.47 4.24-4.24-1.41-1.41-2.83 2.83-2.12-2.12-1.41 1.41zM5 4h14v2H5z"/></svg>已加载跟单节点</p>
+              <strong>{{ showcaseNodeCount.toLocaleString() }}<span>个节点同步跟单</span></strong>
+            </div>
+            <em :class="showcaseNodeCount ? 'on' : 'off'"><i></i>{{ showcaseNodeCount ? '已加载' : '未加载' }}</em>
+          </div>
+          <p class="fd-show-bio">{{ showcaseIntro }}</p>
+          <div class="fd-show-actions">
+            <button type="button" class="fd-show-apply" :disabled="detailLoading" @click="applyShowcase"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M15 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zM6 10V7H4v3H1v2h3v3h2v-3h3v-2H6zm9 4c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>跟单申请</button>
+            <button type="button" class="fd-show-back" @click="closeShowcase">返回带单广场</button>
+          </div>
+        </div>
+      </section>
+      <section class="fd-sec">
+        <header>
+          <p class="fd-kicker">{{ leaderName(detail.leader) }} 的带单<span>{{ detail.groups.length }}</span></p>
+          <span class="fd-show-hint">打开带单状态后即可跟随</span>
+        </header>
+        <div class="fd-modes">
+          <button v-for="key in SHOWCASE_MODES" :key="key" type="button" :class="{ on: showcaseMode === key }" @click="pickShowcaseMode(key)">
+            <svg v-if="key === 'trend_market'" viewBox="0 0 24 24"><path fill="currentColor" d="M7 2v11h3v9l7-12h-4l4-8z"/></svg>
+            <svg v-else-if="key === 'trend_limit'" viewBox="0 0 24 24"><path fill="currentColor" d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67z"/></svg>
+            <svg v-else viewBox="0 0 24 24"><path fill="currentColor" d="m19 9 1.25-2.75L23 5l-2.75-1.25L19 1l-1.25 2.75L15 5l2.75 1.25L19 9zM11.5 9.5 9 4 6.5 9.5 1 12l5.5 2.5L9 20l2.5-5.5L17 12l-5.5-2.5z"/></svg>
+            <span>{{ SELF_MODE_LABEL[key] }}</span>
+            <em>{{ showcaseCounts[key] }}</em>
+          </button>
+        </div>
+        <p v-if="!showcaseCards.length" class="fd-empty">该方式下暂无带单</p>
+        <div v-else class="fd-show-grid">
+          <article v-for="g in showcaseCards" :key="g.group_id" class="fd-card fd-show-card">
+            <header>
+              <span class="fd-show-mark"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M18 11v2h4v-2h-4zm-2 6.61c.96.71 2.21 1.65 3.2 2.39.4-.53.8-1.07 1.2-1.6-.99-.74-2.24-1.68-3.2-2.4-.4.54-.8 1.08-1.2 1.61zM20.4 5.6c-.4-.53-.8-1.07-1.2-1.6-.99.74-2.24 1.68-3.2 2.4.4.53.8 1.07 1.2 1.6.96-.72 2.21-1.65 3.2-2.4zM4 9c-1.1 0-2 .9-2 2v2c0 1.1.9 2 2 2h1v4h2v-4h1l5 3V6L8 9H4zm11.5 3c0-1.33-.58-2.53-1.5-3.35v6.69c.92-.81 1.5-2.01 1.5-3.34z"/></svg></span>
+              <div>
+                <b>{{ g.symbol || '未绑定品种' }}</b>
+                <p>
+                  <svg v-if="showcaseGroupMode(g) === 'trend_market'" viewBox="0 0 24 24"><path fill="currentColor" d="M7 2v11h3v9l7-12h-4l4-8z"/></svg>
+                  <svg v-else-if="showcaseGroupMode(g) === 'trend_limit'" viewBox="0 0 24 24"><path fill="currentColor" d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67z"/></svg>
+                  <svg v-else viewBox="0 0 24 24"><path fill="currentColor" d="m19 9 1.25-2.75L23 5l-2.75-1.25L19 1l-1.25 2.75L15 5l2.75 1.25L19 9zM11.5 9.5 9 4 6.5 9.5 1 12l5.5 2.5L9 20l2.5-5.5L17 12l-5.5-2.5z"/></svg>
+                  {{ SELF_MODE_LABEL[showcaseGroupMode(g)] || '带单' }}
+                </p>
+              </div>
+              <em :class="detail.leader.follow_paused || !g.enabled ? 'off' : 'on'"><i></i>{{ detail.leader.follow_paused || !g.enabled ? '已暂停' : '带单中' }}</em>
+            </header>
+            <div class="fd-show-stats">
+              <div><span>跟单人数</span><b>{{ g.follower_count.toLocaleString() }}</b></div>
+              <div><span>累计收益</span><b :class="showcasePerf ? (showcasePerf.total_profit >= 0 ? 'up' : 'down') : 'muted'">{{ showcasePerf ? fmtU(showcasePerf.total_profit) + ' U' : '暂无数据' }}</b></div>
+              <div><span>收益率</span><b :class="showcasePerf?.profit_rate_valid ? (showcasePerf.profit_rate >= 0 ? 'up' : 'down') : 'muted'">{{ showcasePerf?.profit_rate_valid ? `${showcasePerf.profit_rate >= 0 ? '+' : ''}${showcasePerf.profit_rate.toFixed(1)}%` : '暂无数据' }}</b></div>
+              <div><span>胜率</span><b :class="showcasePerf ? '' : 'muted'">{{ showcasePerf ? `${showcasePerf.win_rate.toFixed(1)}%` : '暂无数据' }}</b></div>
+            </div>
+            <div class="fd-show-pair">
+              <div><span>跟单比例</span><b class="muted">暂无数据</b></div>
+              <div><span>最低跟单</span><b class="muted">暂无数据</b></div>
+            </div>
+          </article>
+        </div>
+      </section>
+    </template>
+
     <div v-if="pickerOpen && detail" class="fd-mask" @click.self="closePicker">
       <section ref="pickerPanel" class="fd-dialog" role="dialog" aria-modal="true" aria-labelledby="follow-picker-title" tabindex="-1" @keydown.esc.prevent="closePicker" @keydown.tab="trapPickerFocus">
         <header>
@@ -1509,7 +1645,9 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 .fd em.pause, .fd em.off { color: #8B96A8; background: rgba(91,107,133,.15); border: 1px solid #22304A; }
 .fd em.on, .fd em.off { display: inline-flex; align-items: center; gap: 4px; }
 .fd em i { width: 6px; height: 6px; border-radius: 99px; background: currentColor; }
-.fd-blurb { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; line-height: 1.5; }
+.fd-leader-text > p:first-child { flex-wrap: nowrap; }
+.fd-leader-text > p:first-child em, .fd-leader-text > p:first-child .fd-verified { flex: 0 0 auto; }
+.fd-leader-text p.fd-blurb { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; margin: 2px 0 0; color: #8B96A8; font-size: 10px; line-height: 1.625; white-space: normal; }
 .fd-follow { display: flex; align-items: center; gap: 2px; border: 0; border-radius: 8px; background: #7C3AED; color: #fff; font-size: 10px; font-weight: 700; padding: 6px 10px; }
 .fd-follow:disabled, .fd-close:disabled { opacity: .4; cursor: not-allowed; }
 .fd-preview { width: 100%; margin-top: 8px; text-align: left; padding: 12px; color: inherit; background: linear-gradient(90deg, #101828, #0F1E2E); }
@@ -1527,6 +1665,8 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 .fd-card { margin-top: 8px; }
 .fd-sec header em.fd-sec-note { border: 0; background: transparent; padding: 0; color: #5B6B85; font-size: 10px; font-weight: 400; }
 .fd-self-top, .fd-self-row, .fd-self-pos > div, .fd-self .fd-book-head > span, .fd-book-meta, .fd-book-meta b, .fd-self-link, .fd-self-run { display: flex; align-items: center; }
+.fd-self-grid { margin-top: 8px; display: grid; gap: 10px; }
+.fd-self-grid > .fd-card { margin-top: 0; }
 .fd-self { min-width: 0; max-width: 100%; }
 .fd-self-top { gap: 10px; min-width: 0; }
 .fd-self-id { min-width: 0; flex: 1; }
@@ -1663,8 +1803,73 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 .fd-picker-search input { height: 16px; padding: 0; line-height: 16px; box-shadow: none; }
 .fd-picker-list .fd-pick { text-transform: none; letter-spacing: normal; color-scheme: dark; }
 .fd-warn { color: #FBBF24; font-size: 12px; }
+.fd-show { padding: 0; overflow: hidden; }
+.fd-show-banner { height: 64px; background: linear-gradient(90deg, rgba(124,58,237,.4), rgba(37,99,235,.3), #101828); }
+.fd-show-body { padding: 0 12px 12px; }
+.fd-show-id, .fd-show-who, .fd-show-nodes, .fd-show-actions, .fd-show-card header, .fd-show-nodes p, .fd-show-nodes strong, .fd-show-card header p { display: flex; align-items: center; }
+.fd-show-id { align-items: flex-end; justify-content: space-between; gap: 8px; }
+.fd-show-who { align-items: flex-end; gap: 12px; min-width: 0; }
+.fd-show-avatar { width: 56px; height: 56px; margin-top: -20px; display: flex; align-items: center; justify-content: center; flex: 0 0 auto; border-radius: 16px; border: 2px solid #101828; background: linear-gradient(135deg, #7C3AED, #2563EB); color: #fff; font-size: 20px; font-weight: 700; box-shadow: 0 4px 16px rgba(124,58,237,.45); }
+.fd-show-who > div { min-width: 0; margin-bottom: 4px; }
+.fd-show-who p { gap: 4px; margin: 0; min-width: 0; }
+.fd-show-who b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
+.fd-show-who small { display: block; margin-top: 2px; color: #5B6B85; font-size: 10px; }
+.fd-show em.fd-show-cert, .fd-show em.pause { flex: 0 0 auto; border-radius: 999px; padding: 4px 10px; font-size: 10px; font-weight: 650; font-style: normal; }
+.fd-show em.fd-show-cert { border: 1px solid rgba(245,158,11,.4); background: rgba(245,158,11,.1); color: #F59E0B; }
+.fd-show-nodes { gap: 10px; margin-top: 10px; border: 1px solid #22304A; border-radius: 12px; padding: 10px 12px; background: linear-gradient(90deg, #0C1220, #131C30); }
+.fd-show-mark { width: 36px; height: 36px; display: flex; align-items: center; justify-content: center; flex: 0 0 auto; border-radius: 8px; background: rgba(34,211,238,.1); color: #22D3EE; }
+.fd-show-card .fd-show-mark { background: rgba(37,99,235,.15); color: #3B82F6; }
+.fd-show-nodes > div { min-width: 0; flex: 1; }
+.fd-show-nodes p { gap: 4px; margin: 0; color: #5B6B85; font-size: 10px; }
+.fd-show-nodes p svg { width: 11px; height: 11px; color: #22D3EE; }
+.fd-show-nodes strong { align-items: baseline; gap: 4px; margin-top: 2px; font-size: 16px; font-variant-numeric: tabular-nums; }
+.fd-show-nodes strong span { color: #5B6B85; font-size: 10px; font-weight: 500; }
+.fd-show .fd-show-nodes > em { flex: 0 0 auto; border-radius: 999px; padding: 4px 8px; font-size: 10px; }
+.fd-show-nodes > em i { width: 6px; height: 6px; border-radius: 99px; background: currentColor; }
+.fd-show-nodes > em.on i { animation: fd-pulse 1.6s ease-out infinite; }
+.fd-show-bio { margin: 10px 0 0; border: 1px solid #22304A; border-radius: 8px; background: #0C1220; padding: 10px 12px; color: #8B96A8; font-size: 11px; line-height: 1.625; }
+.fd-show-actions { align-items: stretch; flex-direction: column; gap: 8px; margin-top: 12px; }
+.fd-show-apply, .fd-show-back { border-radius: 12px; padding: 10px 16px; font-size: 12px; font-weight: 700; cursor: pointer; }
+.fd-show-apply { display: flex; flex: 1; align-items: center; justify-content: center; gap: 4px; border: 0; color: #fff; background: linear-gradient(90deg, #7C3AED, #6D28D9); box-shadow: 0 2px 10px rgba(124,58,237,.4); }
+.fd-show-apply svg { width: 15px; height: 15px; }
+.fd-show-apply:disabled { opacity: .45; cursor: not-allowed; }
+.fd-show-back { border: 1px solid #22304A; background: #0C1220; color: #8B96A8; }
+.fd-show-hint { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #5B6B85; font-size: 10px; }
+.fd-modes { margin-top: 8px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; border: 1px solid #1C2740; background: #101828; border-radius: 12px; padding: 6px; }
+.fd-modes button { display: flex; align-items: center; justify-content: center; gap: 4px; min-width: 0; border: 0; border-radius: 8px; background: transparent; color: #8B96A8; padding: 8px 4px; font-size: 11px; font-weight: 650; cursor: pointer; }
+.fd-modes button.on { color: #fff; background: linear-gradient(90deg, #7C3AED, #6D28D9); box-shadow: 0 2px 8px rgba(124,58,237,.35); }
+.fd-modes svg { width: 14px; height: 14px; }
+.fd-modes span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fd-modes em { flex: 0 0 auto; border: 0; border-radius: 999px; background: #1A2438; color: #5B6B85; padding: 0 6px; font-size: 9px; font-style: normal; font-weight: 650; }
+.fd-modes button.on em { background: rgba(255,255,255,.2); color: #fff; }
+.fd-show-grid { margin-top: 8px; display: grid; gap: 10px; }
+.fd-show-card { margin-top: 0; }
+.fd-show-card header { justify-content: space-between; gap: 8px; }
+.fd-show-card header > div { min-width: 0; flex: 1; }
+.fd-show-card header b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; letter-spacing: .02em; }
+.fd-show-card header p { gap: 4px; width: fit-content; max-width: 100%; margin: 2px 0 0; border-radius: 6px; background: rgba(124,58,237,.15); color: #A78BFA; padding: 1px 6px; font-size: 10px; font-weight: 500; }
+.fd-show-card header p svg { width: 11px; height: 11px; }
+.fd-show-card header > em { flex: 0 0 auto; padding: 2px 8px; font-size: 10px; }
+.fd-show-card header > em.on i { animation: fd-pulse 1.6s ease-out infinite; }
+.fd-show-stats, .fd-show-pair { display: grid; gap: 6px; margin-top: 10px; }
+.fd-show-stats { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.fd-show-pair { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.fd-show-stats > div, .fd-show-pair > div { min-width: 0; border: 1px solid #22304A; background: #0C1220; border-radius: 8px; padding: 8px 6px; }
+.fd-show-pair > div { padding: 8px 12px; }
+.fd-show-stats span, .fd-show-pair span { display: block; color: #5B6B85; font-size: 9px; }
+.fd-show-stats b, .fd-show-pair b { display: block; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #E6EBF4; font-size: 12px; font-variant-numeric: tabular-nums; }
+.fd-show-stats b.up, .fd-show-pair b.up { color: #22C55E; }
+.fd-show-stats b.down, .fd-show-pair b.down { color: #F6465D; }
+.fd-show-stats b.muted, .fd-show-pair b.muted { color: #8B96A8; font-weight: 650; }
+.fd-show-mark svg { width: 18px; height: 18px; }
+@media (min-width: 640px) {
+  .fd-show-banner { height: 80px; }
+  .fd-show-who b { font-size: 16px; }
+  .fd-show-actions { flex-direction: row; }
+  .fd-show-back { flex: 0 0 auto; }
+}
 @media (min-width: 1024px) {
-  .fd-grid { grid-template-columns: 1fr 1fr; }
+  .fd-grid, .fd-show-grid, .fd-self-grid { grid-template-columns: 1fr 1fr; }
   .fd-sum4 { grid-template-columns: 1fr 1fr; }
 }
 @media (max-width: 720px) {

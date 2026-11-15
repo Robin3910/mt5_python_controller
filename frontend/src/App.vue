@@ -11,6 +11,7 @@ import { connectAdminWs, disconnectAdminWs } from '@/services/ws'
 import { copyToClipboard } from '@/utils/clipboard'
 import { firstAllowedPath } from '@/constants/menus'
 import NewsTopBanner from '@/components/NewsTopBanner.vue'
+import { pageChrome } from '@/utils/pageChrome'
 
 const auth = useAuthStore()
 const hub = useHubStore()
@@ -51,12 +52,20 @@ const trendConfigOpen = computed(() => route.name === 'home' && route.query.conf
 const nodeHomeOpen = computed(() => route.name === 'home-node')
 const homeNavActive = computed(() => route.name === 'home' || route.name === 'home-node')
 const customerBackTitle = computed(() => {
+  if (pageChrome.value?.title) return pageChrome.value.title
   if (trendConfigOpen.value) return '参数配置'
   if (route.name === 'home') return ''
   if (nodeHomeOpen.value) return '节点主页'
   return pageTitle.value
 })
+function closePageChrome(): void {
+  pageChrome.value?.back()
+}
 function onCustomerBack(): void {
+  if (pageChrome.value?.back) {
+    pageChrome.value.back()
+    return
+  }
   if (route.name === 'ai-follow-setup') {
     router.push({ name: 'ai-trade', query: { pick_group: String(route.params.groupId), leader: String(route.params.leaderUserId) } })
     return
@@ -129,7 +138,7 @@ watch(() => auth.token, setupWs)
             <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M20 9V7c0-1.1-.9-2-2-2h-3c0-1.66-1.34-3-3-3S9 3.34 9 5H6c-1.1 0-2 .9-2 2v2c-1.66 0-3 1.34-3 3s1.34 3 3 3v4c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2v-4c1.66 0 3-1.34 3-3s-1.34-3-3-3zM7.5 11.5c0-.83.67-1.5 1.5-1.5s1.5.67 1.5 1.5S9.83 13 9 13s-1.5-.67-1.5-1.5zM16 17H8v-2h8v2zm-1-4c-.83 0-1.5-.67-1.5-1.5S14.17 10 15 10s1.5.67 1.5 1.5S15.83 13 15 13z"/></svg>
             <span>AI交易</span>
           </RouterLink>
-          <RouterLink v-if="auth.hasMenu('follow')" to="/follow">
+          <RouterLink v-if="auth.hasMenu('follow')" to="/follow" @click="closePageChrome">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/></svg>
             <span>带单</span>
           </RouterLink>

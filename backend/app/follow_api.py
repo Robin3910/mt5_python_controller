@@ -217,6 +217,7 @@ async def list_follow_leaders(
             "leader_user_id": uid,
             "username": u.username,
             "display_name": u.display_name,
+            "intro": (getattr(u, "leader_intro", None) or "").strip() or None,
             "primary_node": _node_brief(primary),
             "followable_group_count": len(followable),
             "follower_node_count": len(followers_by_leader.get(uid, set())),
@@ -398,6 +399,7 @@ async def get_leader_detail(
             "leader_user_id": leader_user_id,
             "username": user.username,
             "display_name": user.display_name,
+            "intro": (getattr(user, "leader_intro", None) or "").strip() or None,
             "primary_node": _node_brief(primary),
             "followable_group_count": len(followable),
             "follower_node_count": len({

@@ -1349,6 +1349,8 @@ class FollowLeaderSummary(BaseModel):
     leader_user_id: int
     username: str
     display_name: Optional[str] = None
+    # 带单广场第二行。空则前端用统一说明，不拿绩效句子去填。
+    intro: Optional[str] = None
     primary_node: Optional[dict] = None
     followable_group_count: int = 0
     follower_node_count: int = 0

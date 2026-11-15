@@ -2730,6 +2730,8 @@ export interface FollowLeaderSummary {
   leader_user_id: number
   username: string
   display_name: string | null
+  /** 带单广场卡片上的介绍；空则前端显示统一说明 */
+  intro?: string | null
   primary_node: FollowNodeBrief | null
   /** 可跟单分组数（启用 + 含其主节点） */
   followable_group_count: number

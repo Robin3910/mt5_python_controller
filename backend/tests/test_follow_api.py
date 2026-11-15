@@ -241,6 +241,7 @@ def test_leader_list_shows_capable_user(client):
     assert alice["primary_node"]["node_id"], "应带出主节点摘要"
     assert alice["followable_group_count"] >= 1
     assert alice["my_follow_group_count"] == 0
+    assert alice["intro"] is None
 
     # alice 自己看：应能看到自己（自跟单场景）
     alice_h = _login(client, "alice")
