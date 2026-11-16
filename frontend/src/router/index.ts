@@ -133,6 +133,14 @@ const router = createRouter({
       meta: { menu: 'events' },
     },
     {
+      // 【信号中心 · 旧版】（调试用）：原 7-tab 页面，保留未删。
+      // 走 `events` 菜单码 —— 权限与新页一致，省得在后端菜单表里再加一个码。
+      path: '/signal-center-legacy',
+      name: 'signal-center-legacy',
+      component: () => import('@/views/SignalCenterLegacyView.vue'),
+      meta: { menu: 'events' },
+    },
+    {
       path: '/audits',
       name: 'audits',
       component: () => import('@/views/AuditView.vue'),

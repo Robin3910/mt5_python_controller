@@ -157,19 +157,19 @@ fiboRetestMaxCountInput = input.int(1, 'Max Retest Count', group = FIBO_GROUP, m
 
 // === 信号中心 Webhook 输入 ===
 // 打开后，指标在 K 线收盘时把结构点事件以 JSON 推给信号中心（/api/signal-center 链路）。
-// 载荷字段与后端 parser.py 对齐：action / symbol / volume / sl / tp / tf / signal_type / model / template_ids / token。
-// 三个开关互不干扰：既可以只推「开仓信号」，也可以只推「支撑阻力快照」，也可以都推。
+// 载荷字段与后端 parser.py 对齐：action / symbol / volume / tf / signal_type / model / template_ids / token。
+// 只有一个总开关：打开后既推「开仓信号」，也维持既有的「支撑阻力快照」推送链路。
 enableWebhookInput = input.bool(false, '启用信号中心推送', group = WEBHOOK_GROUP, tooltip = '打开后，K 线收盘时用 alert() 推送 JSON 到信号中心 Webhook 地址')
-webhookTokenInput = input.string('vlq8iAXw3cJcj0laJJ0dvVDDj6GH_YUho5vosh48ggk', '鉴权 Token', group = WEBHOOK_GROUP, tooltip = '与后端 /api/webhook 配置的 token 一致')
+webhookDataInput = input.bool(true, '推送结构数据快照', group = WEBHOOK_GROUP, tooltip = '打开后，每根 K 线收盘推送 type=smc-data 的支撑阻力价位快照（供中控台挑价位）')
+// webhookTokenInput = input.string('vlq8iAXw3cJcj0laJJ0dvVDDj6GH_YUho5vosh48ggk', '鉴权 Token', group = WEBHOOK_GROUP, tooltip = '与后端 /api/webhook 配置的 token 一致')
+webhookTokenInput = "vlq8iAXw3cJcj0laJJ0dvVDDj6GH_YUho5vosh48ggk"
 webhookVolumeInput = input.float(0.1, '默认手数', group = WEBHOOK_GROUP, minval = 0.01, step = 0.01, tooltip = '开仓信号缺省手数；后端会在超上限时自动封顶')
-webhookTemplateInput = input.string('tpl_1', '目标策略模版', group = WEBHOOK_GROUP, tooltip = '逗号分隔的模版 ID 列表，决定哪些分组能收到该信号')
-webhookSlAtrInput = input.float(0, '止损 ATR 倍数', group = WEBHOOK_GROUP, minval = 0, step = 0.1, tooltip = '0 = 不带 sl（由策略自行计算止损）；>0 时按 ATR 计算止损价')
-webhookTpAtrInput = input.float(0, '止盈 ATR 倍数', group = WEBHOOK_GROUP, minval = 0, step = 0.1, tooltip = '0 = 不带 tp（由策略自行计算止盈）；>0 时按 ATR 计算止盈价')
-webhookAtrPeriodInput = input.int(14, 'ATR 周期', group = WEBHOOK_GROUP, minval = 2, maxval = 100, tooltip = '计算 sl / tp 用的 ATR 长度')
-webhookSignalInput = input.bool(true, '推送开仓信号', group = WEBHOOK_GROUP, tooltip = 'OB/FVG/PDZ/Fibo 结构点触发时推送带 signal_type 的开仓信号')
+// webhookTemplateInput = input.string('tpl_1', '目标策略模版', group = WEBHOOK_GROUP, tooltip = '逗号分隔的模版 ID 列表，决定哪些分组能收到该信号')
+webhookTemplateInput = "tpl_1"
+// 注：开仓信号**不带 sl / tp** —— 止损止盈由策略侧自行计算，指标只负责给方向与结构类型。
 
-// 注：原有的支撑阻力快照推送（type=smc-data）**保持原样**（每根 K 收盘必发），
-// 不受本组开关影响 —— 那是既有部署在用的链路，不能因为加了新开关就断掉。
+// 注：开仓信号（带 action/signal_type）与下面的支撑阻力快照（type=smc-data）是两条独立链路，
+// 共用「启用信号中心推送」总开关；快照链路另外有自己的「推送支撑阻力快照」开关。
 
 //---------------------------------------------------------------------------------------------------------------------}
 //DATA STRUCTURES & VARIABLES
@@ -1195,16 +1195,13 @@ buildTemplateIds(string raw) =>
 // @param action        BUY / SELL
 // @param signalType    ob / fvg / pdz / fibo
 // @param tfName        信号所在周期（M15 / H1 / ...）
-// @param slPrice       止损价（na = 不带 sl）
-// @param tpPrice       止盈价（na = 不带 tp）
 // @returns             string
 // 字段与后端 parser.py 的归一别名一一对应：
-//   action / symbol / volume / sl / tp / tf / signal_type / model / template_ids / token
+//   action / symbol / volume / tf / signal_type / model / template_ids / token
+// **不带 sl / tp**：止损止盈由策略侧自行计算，指标只负责方向与结构类型。
 // 后端把 tf 与 signal_type 当**纯统计维度**：缺失或非法都不拒收、不影响下单。
-buildSignalPayload(string action, string signalType, string tfName, float slPrice, float tpPrice) =>
-    string slPart = na(slPrice) ? '' : ',"sl":' + str.tostring(slPrice, format.mintick)
-    string tpPart = na(tpPrice) ? '' : ',"tp":' + str.tostring(tpPrice, format.mintick)
-    '{"action":"' + action + '","symbol":"' + syminfo.ticker + '","volume":' + str.tostring(webhookVolumeInput) + slPart + tpPart + ',"tf":"' + tfName + '","signal_type":"' + signalType + '","model":"strategy","template_ids":' + buildTemplateIds(webhookTemplateInput) + ',"token":"' + webhookTokenInput + '"}'
+buildSignalPayload(string action, string signalType, string tfName) =>
+    '{"action":"' + action + '","symbol":"' + syminfo.ticker + '","volume":' + str.tostring(webhookVolumeInput) + ',"tf":"' + tfName + '","signal_type":"' + signalType + '","model":"strategy","template_ids":' + buildTemplateIds(webhookTemplateInput) + ',"token":"' + webhookTokenInput + '"}'
 
 // 拼接 K 线收盘时的支撑阻力数据
 // 规则：
@@ -1213,8 +1210,10 @@ buildSignalPayload(string action, string signalType, string tfName, float slPric
 //  - PDZ 支撑取 Discount Zone 上沿，PDZ 阻力取 Premium Zone 下沿
 //  - PDZ 必须满足 K 棒间距（>=30）
 //  - Fibo 直接取对应 fib level，side 根据趋势（上升=支撑/1，下降=阻力/-1）
+//
+// 开关：「启用信号中心推送」为总开关，「推送支撑阻力快照」控制这条链路本身。
 
-if barstate.isconfirmed
+if webhookDataInput and barstate.isconfirmed
     array<string> dataItems = array.new<string>()
 
     // === 1) Order Blocks ===
@@ -1289,7 +1288,7 @@ if barstate.isconfirmed
     string tfStr = timeframe.period
     string tfName = tfToName(tfStr)
     string dataJoined = array.join(dataItems, ',')
-    string payload = '{"type":"smc-data","symbol":"' + syminfo.ticker + '","token":"vlq8iAXw3cJcj0laJJ0dvVDDj6GH_YUho5vosh48ggk","tf":"' + tfName + '","data":[' + dataJoined + ']}'
+    string payload = '{"type":"smc-data","symbol":"' + syminfo.ticker + '","token":"' + webhookTokenInput + '","tf":"' + tfName + '","data":[' + dataJoined + ']}'
     log.info(payload)
     alert(payload, alert.freq_once_per_bar_close)
 
@@ -1297,7 +1296,7 @@ if barstate.isconfirmed
 //SIGNAL CENTER WEBHOOK ALERTS（结构点 → 开仓信号）
 //---------------------------------------------------------------------------------------------------------------------{
 // 与上面「支撑阻力快照」是两条独立链路：
-//   - smc-data：每根 K 收盘都发，供中控台挑价位（既有链路，不动）；
+//   - smc-data：每根 K 收盘都发，供中控台挑价位（受「推送支撑阻力快照」开关控制）；
 //   - 本区块：**只有结构点触发时**才发一条带 signal_type / tf 的开仓信号。
 //
 // 为什么用 alert() 而不是 alertcondition()：alertcondition() 的消息体是**固定文案**，
@@ -1305,7 +1304,8 @@ if barstate.isconfirmed
 // 可以运行时拼装 —— 这正是 smc-data 推送用的方式。
 //
 // 载荷契约（与后端 parser.py 的归一别名一一对应）：
-//   action / symbol / volume / sl / tp / tf / signal_type / model / template_ids / token
+//   action / symbol / volume / tf / signal_type / model / template_ids / token
+// 开仓信号**不带 sl / tp**：止损止盈由策略侧自行计算。
 // 后端把 tf 与 signal_type 当**纯统计维度**：缺失或非法都归 NULL，绝不拒收、不影响下单。
 //
 // ===== 展示开关 = 推送开关（本区块最重要的铁律）=====
@@ -1333,9 +1333,7 @@ if barstate.isconfirmed
 // 注意：本区块与上面 smc-data 的 alert() 属于**同一个** TV 告警（TV 侧只有一个
 // “Any alert() function call” 选项），后端靠 type 字段分流：smc-data 走价位匹配，
 // 带 action/signal_type 的走信号分发。
-float webhookAtr = ta.atr(webhookAtrPeriodInput)
-if enableWebhookInput and webhookSignalInput and barstate.isconfirmed
-    float atrValue = webhookAtr
+if enableWebhookInput and barstate.isconfirmed
     string chartTf = tfToName(timeframe.period)
     // FVG 在 fairValueGapsTimeframeInput 上检测，周期可能与图表不同 —— tf 要跟信号走
     string fvgTf = resolveTfName(fairValueGapsTimeframeInput)
@@ -1362,48 +1360,36 @@ if enableWebhookInput and webhookSignalInput and barstate.isconfirmed
     bool obLongHit = (obSwingShown and currentAlerts.bullishOBRetest) or (obInternalShown and currentAlerts.internalBullishOBRetest)
     bool obShortHit = (obSwingShown and currentAlerts.bearishOBRetest) or (obInternalShown and currentAlerts.internalBearishOBRetest)
     if obLongHit
-        float obLongSl = webhookSlAtrInput > 0 ? close - atrValue * webhookSlAtrInput : na
-        float obLongTp = webhookTpAtrInput > 0 ? close + atrValue * webhookTpAtrInput : na
-        string obLongPayload = buildSignalPayload('BUY', 'ob', chartTf, obLongSl, obLongTp)
+        string obLongPayload = buildSignalPayload('BUY', 'ob', chartTf)
         log.info(obLongPayload)
-        alert(obLongPayload, alert.freq_all)
+        alert(obLongPayload, alert.freq_once_per_bar)
 
     if obShortHit
-        float obShortSl = webhookSlAtrInput > 0 ? close + atrValue * webhookSlAtrInput : na
-        float obShortTp = webhookTpAtrInput > 0 ? close - atrValue * webhookTpAtrInput : na
-        string obShortPayload = buildSignalPayload('SELL', 'ob', chartTf, obShortSl, obShortTp)
+        string obShortPayload = buildSignalPayload('SELL', 'ob', chartTf)
         log.info(obShortPayload)
-        alert(obShortPayload, alert.freq_all)
+        alert(obShortPayload, alert.freq_once_per_bar)
 
     // —— FVG 出现（多头=做多 / 空头=做空）——
     if fvgShown and currentAlerts.bullishFairValueGap
-        float fvgLongSl = webhookSlAtrInput > 0 ? close - atrValue * webhookSlAtrInput : na
-        float fvgLongTp = webhookTpAtrInput > 0 ? close + atrValue * webhookTpAtrInput : na
-        string fvgLongPayload = buildSignalPayload('BUY', 'fvg', fvgTf, fvgLongSl, fvgLongTp)
+        string fvgLongPayload = buildSignalPayload('BUY', 'fvg', fvgTf)
         log.info(fvgLongPayload)
-        alert(fvgLongPayload, alert.freq_all)
+        alert(fvgLongPayload, alert.freq_once_per_bar)
 
     if fvgShown and currentAlerts.bearishFairValueGap
-        float fvgShortSl = webhookSlAtrInput > 0 ? close + atrValue * webhookSlAtrInput : na
-        float fvgShortTp = webhookTpAtrInput > 0 ? close - atrValue * webhookTpAtrInput : na
-        string fvgShortPayload = buildSignalPayload('SELL', 'fvg', fvgTf, fvgShortSl, fvgShortTp)
+        string fvgShortPayload = buildSignalPayload('SELL', 'fvg', fvgTf)
         log.info(fvgShortPayload)
-        alert(fvgShortPayload, alert.freq_all)
+        alert(fvgShortPayload, alert.freq_once_per_bar)
 
     // —— Premium/Discount Zone 回踩（折扣区=做多 / 溢价区=做空）——
     if pdzShown and currentAlerts.bullishPDZRetest
-        float pdzLongSl = webhookSlAtrInput > 0 ? close - atrValue * webhookSlAtrInput : na
-        float pdzLongTp = webhookTpAtrInput > 0 ? close + atrValue * webhookTpAtrInput : na
-        string pdzLongPayload = buildSignalPayload('BUY', 'pdz', chartTf, pdzLongSl, pdzLongTp)
+        string pdzLongPayload = buildSignalPayload('BUY', 'pdz', chartTf)
         log.info(pdzLongPayload)
-        alert(pdzLongPayload, alert.freq_all)
+        alert(pdzLongPayload, alert.freq_once_per_bar)
 
     if pdzShown and currentAlerts.bearishPDZRetest
-        float pdzShortSl = webhookSlAtrInput > 0 ? close + atrValue * webhookSlAtrInput : na
-        float pdzShortTp = webhookTpAtrInput > 0 ? close - atrValue * webhookTpAtrInput : na
-        string pdzShortPayload = buildSignalPayload('SELL', 'pdz', chartTf, pdzShortSl, pdzShortTp)
+        string pdzShortPayload = buildSignalPayload('SELL', 'pdz', chartTf)
         log.info(pdzShortPayload)
-        alert(pdzShortPayload, alert.freq_all)
+        alert(pdzShortPayload, alert.freq_once_per_bar)
 
     // —— Fibonacci 触达（回踩=顺趋势做多 / 反弹=顺趋势做空）——
     // 5 个档位（0.236/0.382/0.500/0.618/0.786）共用同一个 signal_type=fibo，
@@ -1413,18 +1399,14 @@ if enableWebhookInput and webhookSignalInput and barstate.isconfirmed
     bool fiboShortHit = (fibo236Shown and currentAlerts.fib236Bounce) or (fibo382Shown and currentAlerts.fib382Bounce) or (fibo500Shown and currentAlerts.fib500Bounce) or (fibo618Shown and currentAlerts.fib618Bounce) or (fibo786Shown and currentAlerts.fib786Bounce)
 
     if fiboLongHit
-        float fiboLongSl = webhookSlAtrInput > 0 ? close - atrValue * webhookSlAtrInput : na
-        float fiboLongTp = webhookTpAtrInput > 0 ? close + atrValue * webhookTpAtrInput : na
-        string fiboLongPayload = buildSignalPayload('BUY', 'fibo', chartTf, fiboLongSl, fiboLongTp)
+        string fiboLongPayload = buildSignalPayload('BUY', 'fibo', chartTf)
         log.info(fiboLongPayload)
-        alert(fiboLongPayload, alert.freq_all)
+        alert(fiboLongPayload, alert.freq_once_per_bar)
 
     if fiboShortHit
-        float fiboShortSl = webhookSlAtrInput > 0 ? close + atrValue * webhookSlAtrInput : na
-        float fiboShortTp = webhookTpAtrInput > 0 ? close - atrValue * webhookTpAtrInput : na
-        string fiboShortPayload = buildSignalPayload('SELL', 'fibo', chartTf, fiboShortSl, fiboShortTp)
+        string fiboShortPayload = buildSignalPayload('SELL', 'fibo', chartTf)
         log.info(fiboShortPayload)
-        alert(fiboShortPayload, alert.freq_all)
+        alert(fiboShortPayload, alert.freq_once_per_bar)
 
 //---------------------------------------------------------------------------------------------------------------------}
 //ALERTS

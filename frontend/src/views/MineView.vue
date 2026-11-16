@@ -128,6 +128,16 @@ const ALL_MODULES: ProfileHubModule[] = [
     accent: '#F59E0B',
   },
   {
+    // 【信号中心 · 旧版】：原 7-tab 页面（概览/信号流/节点命中/策略任务/时延/绩效/路由），
+    // 保留未删，供路由调试用。走 `events` 菜单码 —— 权限与新页一致。
+    code: 'events_legacy',
+    label: '信号中心（旧版）',
+    description: '7-tab 全链路视图 · 绩效 · 路由（调试用）',
+    path: '/signal-center-legacy',
+    icon: '<path d="M3 12h4l3 8 4-16 3 8h4"/>',
+    accent: '#94A3B8',
+  },
+  {
     code: 'audits',
     label: '操作审计',
     description: '操作记录与变更历史',
@@ -175,6 +185,9 @@ const visibleModules = computed<ProfileHubModule[]>(() => {
       return auth.hasMenu('ai_trade') && auth.canUseAiStrategy && auth.canBeFollowLeader
     }
     if (m.code === 'follow_channel') return auth.hasMenu('follow') && auth.canBeFollowLeader
+    // 旧版信号中心：**跟着 `events` 的权限走**（路由 meta.menu 也是 events）——
+    // 它是新页面的同源旧版，不该多要一个后端菜单码。
+    if (m.code === 'events_legacy') return auth.hasMenu('events')
     return auth.isAdmin || (m.code !== 'config' && auth.hasMenu(m.code))
   })
   if (auth.isAdmin) {

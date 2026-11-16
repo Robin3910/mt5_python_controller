@@ -1,15 +1,16 @@
 <script setup lang="ts">
-// **信号中心 · 旧版（保留，不挂路由）**
+// **信号中心 · 旧版**
 //
 // 这个文件是 AI 信号管理中心上线前的原信号中心页面，**整体保留、一行功能未删**。
 //
 // 保留它的原因：原页面里的【绩效】【路由】两块功能（`PerformancePanel.vue` /
 // `RoutingPanel.vue`）是**已实现但暂时隐藏**的功能，未来要恢复时只需把路由指回本组件。
 //
-// **当前状态**：路由 `/events` 与 `/signal-center` 都指向新页面
-// `SignalCenterView.vue`（原型复刻版）。本组件**不在路由表里** ——
-// 想恢复时把 `frontend/src/router/index.ts` 里这两条路由的 component
-// 从 `@/views/SignalCenterView.vue` 改回 `@/views/SignalCenterLegacyView.vue` 即可。
+// **当前状态**：已挂在 `/signal-center-legacy`（调试用），并从【我的】页加了入口。
+// 新页面仍在 `/events` 与 `/signal-center`（`SignalCenterView.vue`，原型复刻版）。
+// 想把旧页换回主入口时，把 `frontend/src/router/index.ts` 里 `/events` 与
+// `/signal-center` 的 component 从 `@/views/SignalCenterView.vue` 改回
+// `@/views/SignalCenterLegacyView.vue` 即可。
 //
 // 原页面：把「信号 → 受理 → 分发 → 节点处理 → 成交」这条链路
 // 从原来分散在【事件】【分组管理】【成交明细】三个页面，收敛成一条可下钻的时间线。

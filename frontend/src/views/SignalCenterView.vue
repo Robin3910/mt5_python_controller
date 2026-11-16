@@ -2,8 +2,8 @@
 // **AI 信号管理中心**（原型复刻版）
 //
 // 单页多区块看板，1:1 对齐原型（灵光闪应用原型【我的】→【AI信号管理中心】）：
-//   页头 → 口径说明 → 4 指标卡 → 信号质量总览 → 类型质量对比 →
-//   周期质量总览 → 质量 TOP5 → 马丁止盈分布 → 信号明细表
+//   页头 → 口径说明 → 4 指标卡 → 信号质量总览（等级环形图 + 区间堆叠条 +
+//   类型质量对比 + 质量 TOP5）→ 周期质量总览 → 马丁止盈分布 → 信号明细表
 //
 // 旧版的【概览 / 信号流 / 节点命中 / 策略任务 / 时延】**已移除**（原型没有、用户不要）；
 // 旧版的【绩效 / 路由】**保留在 `SignalCenterLegacyView.vue`**，暂时不挂路由，未来可恢复。
@@ -16,8 +16,6 @@ import AiSignalTable from '@/components/signal-center/ai/AiSignalTable.vue'
 import MartingaleTpDistribution from '@/components/signal-center/ai/MartingaleTpDistribution.vue'
 import QualityOverview from '@/components/signal-center/ai/QualityOverview.vue'
 import TimeframeQuality from '@/components/signal-center/ai/TimeframeQuality.vue'
-import TopSignalList from '@/components/signal-center/ai/TopSignalList.vue'
-import TypeQualityCompare from '@/components/signal-center/ai/TypeQualityCompare.vue'
 import { useHubStore } from '@/stores/hub'
 import type {
   AiSignalList,
@@ -168,17 +166,14 @@ onMounted(refreshAll)
     <!-- 四个指标卡 -->
     <AiKpiRow :kpi="overview?.kpi ?? null" />
 
-    <!-- 信号质量总览 -->
+    <!-- 信号质量总览（原型复刻：等级环形图 + 区间堆叠条 + 类型对比 + 质量 TOP5） -->
     <QualityOverview
       :reliability="overview?.reliability ?? []"
       :score-buckets="overview?.score_buckets ?? []"
-      :loading="loading"
-    />
-
-    <!-- 信号类型质量对比 -->
-    <TypeQualityCompare
-      :rows="overview?.by_type ?? []"
-      :selected="linkedGroup"
+      :by-type="overview?.by_type ?? []"
+      :top-signals="overview?.top_signals ?? []"
+      :avg-quality="overview?.kpi?.avg_quality ?? 0"
+      :selected-group="linkedGroup"
       :loading="loading"
       @select="onTypeSelect"
     />
@@ -190,16 +185,6 @@ onMounted(refreshAll)
       :loading="loading"
       @select="onTimeframeSelect"
     />
-
-    <!-- 重点关注 · 质量 TOP 5 -->
-    <div class="pf-card">
-      <TopSignalList
-        title="重点关注 · 质量 TOP 5"
-        :rows="overview?.top_signals ?? []"
-        hint="按质量分降序"
-        :loading="loading"
-      />
-    </div>
 
     <!-- 马丁止盈分布 -->
     <MartingaleTpDistribution
