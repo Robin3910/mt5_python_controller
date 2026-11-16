@@ -57,7 +57,8 @@ def group_row_to_dict(
             getattr(row, "limit_watch_keyword", None),
         ),
         "accept_ai_follow": bool(getattr(row, "accept_ai_follow", False)),
-        # 信号来源模式：direct（默认）/ center。存量分组没有这列时按 direct 处理。
+        # 信号来源模式：direct（默认）/ auto。存量分组没有这列时按 direct 处理。
+        # 遗留的 center 原样保留（不回落 direct），由管理员显式改成 direct / auto。
         "signal_source": normalize_signal_source(
             getattr(row, "signal_source", None),
         ),

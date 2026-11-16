@@ -20,11 +20,10 @@ from . import (
     signal_meta,
     signal_perf,
     signal_quality,
-    signal_routing,
+    signal_route_rules,
     signal_stats,
 )
-from .deps import client_ip, get_group_dispatcher, get_store, require_admin
-from .group_dispatcher import GroupDispatcher
+from .deps import client_ip, get_store, require_admin
 from .permissions import Principal
 from .redis_store import RedisStore
 
@@ -568,51 +567,8 @@ class AiSignalList(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# 路由
+# 主任务下的节点子任务
 # ---------------------------------------------------------------------------
-class RouteRequest(BaseModel):
-    """路由一条（或多条）信号到指定分组。"""
-    group_ids: list[str] = Field(default_factory=list)
-    # 参数覆盖：缺省沿用信号原始值
-    volume: Optional[float] = None
-    sl: Optional[float] = None
-    tp: Optional[float] = None
-    note: Optional[str] = Field(default=None, max_length=255)
-
-
-class BatchRouteRequest(RouteRequest):
-    """批量路由：显式给 signal_ids。"""
-    signal_ids: list[str] = Field(default_factory=list)
-
-
-class RouteResultItem(BaseModel):
-    signal_id: str
-    groups: int = 0
-    targets: int = 0
-
-
-class BatchRouteResponse(BaseModel):
-    ok: list[RouteResultItem] = Field(default_factory=list)
-    conflicts: list[dict] = Field(default_factory=list)
-    failed: list[dict] = Field(default_factory=list)
-    summary: dict[str, int] = Field(default_factory=dict)
-
-
-class RouteResponse(BaseModel):
-    signal_id: str
-    groups: int = 0
-    targets: int = 0
-    tasks: list[dict] = Field(default_factory=list)
-    route_state: str = ""
-    note: Optional[str] = None
-
-
-class DropResponse(BaseModel):
-    signal_id: str
-    route_state: str = ""
-    note: Optional[str] = None
-
-
 class TaskDispatchItem(BaseModel):
     """主任务下的节点子任务。"""
     node_id: str
@@ -856,91 +812,163 @@ async def ai_signals(
 
 
 # ---------------------------------------------------------------------------
-# 路由
+# 自动路由规则
 # ---------------------------------------------------------------------------
-@router.post("/signals/{signal_id}/route", response_model=RouteResponse)
-async def route_signal(
-    signal_id: str,
-    body: RouteRequest,
-    request: Request,
-    dispatcher: GroupDispatcher = Depends(get_group_dispatcher),
-    _: Principal = Depends(require_admin),
-):
-    """把一条信号路由到指定的分组。
+class RouteRuleIn(BaseModel):
+    """自动路由规则的入参。
 
-    幂等：同一信号在同一分组已有**未收口**任务 → 409，并返回已有 task_id。
+    **空列表 = 不限制**（该条件不参与匹配）：
+    - `signal_types` 空 → 所有类型都收
+    - `timeframes` 空 → 所有周期都收
+    - `directions` 空 → 所有方向都收
+
+    `group_ids` 是**唯一必填**的：没有目标分组的规则没有意义，服务端直接拒收。
+    """
+    name: str = Field(min_length=1, max_length=64)
+    enabled: bool = True
+    signal_types: list[str] = Field(default_factory=list)
+    timeframes: list[str] = Field(default_factory=list)
+    directions: list[str] = Field(default_factory=list)
+    group_ids: list[str] = Field(default_factory=list)
+    priority: int = 100
+    # 参数覆盖：**当前未启用**，仅作结构预留
+    volume: Optional[float] = None
+    sl: Optional[float] = None
+    tp: Optional[float] = None
+
+
+class RouteRuleHit(BaseModel):
+    """规则的命中统计。"""
+    count: int = 0
+    last_hit_ts: Optional[float] = None
+    last_signal_id: str = ""
+
+
+class RouteRuleOut(BaseModel):
+    """自动路由规则的对外表示。"""
+    rule_id: str
+    name: str
+    enabled: bool = True
+    signal_types: list[str] = Field(default_factory=list)
+    timeframes: list[str] = Field(default_factory=list)
+    directions: list[str] = Field(default_factory=list)
+    group_ids: list[str] = Field(default_factory=list)
+    volume: Optional[float] = None
+    sl: Optional[float] = None
+    tp: Optional[float] = None
+    priority: int = 100
+    owner_user_id: Optional[int] = None
+    created_at: Optional[float] = None
+    updated_at: Optional[float] = None
+    hit: RouteRuleHit = Field(default_factory=RouteRuleHit)
+
+
+class RouteRuleList(BaseModel):
+    """规则列表。"""
+    items: list[RouteRuleOut] = Field(default_factory=list)
+
+
+def _rule_payload(body: RouteRuleIn) -> dict:
+    return {
+        "name": body.name,
+        "enabled": body.enabled,
+        "signal_types": body.signal_types,
+        "timeframes": body.timeframes,
+        "directions": body.directions,
+        "group_ids": body.group_ids,
+        "priority": body.priority,
+        "volume": body.volume,
+        "sl": body.sl,
+        "tp": body.tp,
+    }
+
+
+async def _rules_with_hits(rules: list[dict], store: RedisStore) -> list[RouteRuleOut]:
+    """给规则列表补上命中统计。
+
+    命中统计放在 Redis（热路径上写），读失败时返回空统计 ——
+    **统计挂了不影响规则本身可用**。
     """
     try:
-        result = await signal_routing.route_signal(
-            signal_id,
-            group_ids=body.group_ids,
-            dispatcher=dispatcher,
-            source_ip=client_ip(request),
-            volume=body.volume,
-            stop_loss=body.sl,
-            take_profit=body.tp,
-            note=body.note,
+        hits = await store.get_route_rule_hits([r["rule_id"] for r in rules])
+    except Exception:  # noqa: BLE001
+        hits = {}
+    out: list[RouteRuleOut] = []
+    for r in rules:
+        h = hits.get(r["rule_id"]) or {}
+        out.append(RouteRuleOut(
+            **r,
+            hit=RouteRuleHit(
+                count=int(h.get("count") or 0),
+                last_hit_ts=h.get("last_hit_ts"),
+                last_signal_id=str(h.get("last_signal_id") or ""),
+            ),
+        ))
+    return out
+
+
+@router.get("/route-rules", response_model=RouteRuleList)
+async def list_route_rules(
+    store: RedisStore = Depends(get_store),
+    _: Principal = Depends(require_admin),
+):
+    """列出自动路由规则（按优先级升序：数值小的先挑走分组）。"""
+    rules = await signal_route_rules.list_rules()
+    return {"items": await _rules_with_hits(rules, store)}
+
+
+@router.post("/route-rules", response_model=RouteRuleOut)
+async def create_route_rule(
+    body: RouteRuleIn,
+    store: RedisStore = Depends(get_store),
+    p: Principal = Depends(require_admin),
+):
+    """新建一条自动路由规则。"""
+    try:
+        rule = await signal_route_rules.create_rule(
+            _rule_payload(body), owner_user_id=p.user_id,
         )
-    except signal_routing.RouteConflict as e:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "message": str(e),
-                "task_ids": e.task_ids,
-            },
-        )
-    except signal_routing.RouteInputError as e:
+    except signal_route_rules.RuleInputError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    return {
-        "signal_id": signal_id,
-        "groups": result.get("groups", 0),
-        "targets": result.get("targets", 0),
-        "tasks": result.get("tasks", []),
-        "route_state": result.get("route_state", signal_meta.ROUTE_ROUTED),
-        "note": result.get("note"),
-    }
+    out = await _rules_with_hits([rule], store)
+    return out[0]
 
 
-@router.post("/signals/batch-route", response_model=BatchRouteResponse)
-async def batch_route(
-    body: BatchRouteRequest,
-    request: Request,
-    dispatcher: GroupDispatcher = Depends(get_group_dispatcher),
+@router.put("/route-rules/{rule_id}", response_model=RouteRuleOut)
+async def update_route_rule(
+    rule_id: str,
+    body: RouteRuleIn,
+    store: RedisStore = Depends(get_store),
     _: Principal = Depends(require_admin),
 ):
-    """批量路由：逐条独立处理，一条失败不影响其余。"""
-    if not body.signal_ids:
-        raise HTTPException(status_code=400, detail="未指定信号")
-    if not body.group_ids:
-        raise HTTPException(status_code=400, detail="未指定目标分组")
-    return await signal_routing.route_many(
-        body.signal_ids,
-        group_ids=body.group_ids,
-        dispatcher=dispatcher,
-        source_ip=client_ip(request),
-        volume=body.volume,
-        stop_loss=body.sl,
-        take_profit=body.tp,
-        note=body.note,
-    )
+    """更新一条自动路由规则。
 
-
-@router.post("/signals/{signal_id}/drop", response_model=DropResponse)
-async def drop_signal(
-    signal_id: str,
-    body: RouteRequest,
-    _: Principal = Depends(require_admin),
-):
-    """丢弃一条信号：不再路由到 center 分组。
-
-    **不影响已在跑的仓位** —— 要平仓请走 CLOSE 信号。
+    **入参按全量语义处理**：空列表 = 清空该条件（= 不限制），不是「不改」——
+    否则用户删不掉一个条件。
     """
     try:
-        result = await signal_routing.drop_signal(signal_id, note=body.note)
-    except signal_routing.RouteInputError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    return {
-        "signal_id": result["signal_id"],
-        "route_state": result["route_state"],
-        "note": result.get("note"),
-    }
+        rule = await signal_route_rules.update_rule(rule_id, _rule_payload(body))
+    except signal_route_rules.RuleInputError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if rule is None:
+        raise HTTPException(status_code=404, detail="规则不存在")
+    out = await _rules_with_hits([rule], store)
+    return out[0]
+
+
+@router.delete("/route-rules/{rule_id}")
+async def delete_route_rule(
+    rule_id: str,
+    store: RedisStore = Depends(get_store),
+    _: Principal = Depends(require_admin),
+):
+    """删除一条自动路由规则（连带清掉它的命中统计）。"""
+    ok = await signal_route_rules.delete_rule(rule_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="规则不存在")
+    try:
+        await store.delete_route_rule_hit(rule_id)
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "rule_id": rule_id}
+

@@ -38,6 +38,10 @@ K_GROUP_ROTATION = "group:poll:rotation:{}"  # 分组内轮询轮转顺序（JSO
 K_GROUP_NODE_BUSY = "group:node:busy:{}:{}"
 # 节点离线期间攒下的策略终止指令（List[JSON]），重连鉴权后补发
 K_NODE_PENDING_STOP = "node:pending_stop:{}"
+# 自动路由规则的命中统计：{rule_id} -> JSON {count, last_hit_ts, last_signal_id}
+# 用途：规则卡上要显示「命中 N 条 / 最近命中时间」——
+# 「配了但一条都没命中」是最容易发生的问题（条件写窄了），必须一眼可见。
+K_ROUTE_RULE_HIT = "route:rule:hit:{}"
 K_STRATEGY = "strategy:{}"              # 策略实例缓存（JSON）
 K_STRATEGIES = "strategies"             # 所有 strategy_id 的集合
 # SMC 价位副本：每个策略主任务一份，新推送整体覆写。丢失后等下一次推送即可。
@@ -304,6 +308,50 @@ class RedisStore:
         await self.r.delete(K_GROUP_ROTATION.format(group_id))
         await self.clear_group_node_busy(group_id)
         await self.r.srem(K_GROUPS, group_id)
+
+    # ----------------- 自动路由规则的命中统计 -----------------
+    async def record_route_rule_hit(
+        self, rule_id: str, signal_id: str, *, ts: float,
+    ) -> None:
+        """记录一条规则命中了一条信号。
+
+        只记「命中次数 + 最近命中时刻 + 最近命中的信号号」——
+        够回答「这条规则还在生效吗」和「它到底吃掉了哪条信号」两个问题，
+        不做逐条流水（那是 `signal_history` 的活）。
+        """
+        key = K_ROUTE_RULE_HIT.format(rule_id)
+        raw = await self.r.get(key)
+        try:
+            data = json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        data["count"] = int(data.get("count") or 0) + 1
+        data["last_hit_ts"] = float(ts)
+        data["last_signal_id"] = str(signal_id or "")
+        await self.r.set(key, json.dumps(data))
+
+    async def get_route_rule_hits(self, rule_ids: list[str]) -> dict[str, dict]:
+        """批量读规则的命中统计：{rule_id: {count, last_hit_ts, last_signal_id}}。"""
+        out: dict[str, dict] = {}
+        for rule_id in rule_ids:
+            raw = await self.r.get(K_ROUTE_RULE_HIT.format(rule_id))
+            if not raw:
+                out[rule_id] = {"count": 0, "last_hit_ts": None, "last_signal_id": ""}
+                continue
+            try:
+                data = json.loads(raw)
+            except (TypeError, ValueError):
+                data = {}
+            out[rule_id] = data if isinstance(data, dict) else {
+                "count": 0, "last_hit_ts": None, "last_signal_id": "",
+            }
+        return out
+
+    async def delete_route_rule_hit(self, rule_id: str) -> None:
+        """删除规则时清掉它的命中统计。"""
+        await self.r.delete(K_ROUTE_RULE_HIT.format(rule_id))
 
     # ---- 组内节点互斥（同一分组内一个节点只跑一个策略任务，跨分组各自独立）----
     async def acquire_group_node_busy(

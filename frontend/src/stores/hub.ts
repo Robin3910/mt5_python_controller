@@ -38,8 +38,6 @@ import type {
   PaginatedLimitWatchLogs,
   PaginatedNodeDispatches,
   PaginatedSignalEvents,
-  SignalBatchRouteRequest,
-  SignalBatchRouteResult,
   SignalCenterLatency,
   SignalCenterNodes,
   SignalCenterOverview,
@@ -49,7 +47,8 @@ import type {
   SignalCenterDetail,
   SignalCenterStream,
   SignalCenterTasks,
-  SignalRouteRequest,
+  SignalRouteRule,
+  SignalRouteRuleInput,
   StrategyCreatePayload,
   StrategyOut,
   StrategyTemplateOut,
@@ -117,6 +116,8 @@ interface HubState {
   nodeFeed: Record<string, NodeFeedItem[]>  // node_id -> 实时分发/回报（详情页“成交回报”用）
   riskFeed: Record<string, RiskFeedItem[]>  // node_id -> 账户级风控执行回报
   limitWatchLogs: Record<string, LimitWatchLogOut[]>  // group_id -> 限价监听日志（新→旧）
+  // 自动路由规则（信号中心配置）：一条规则 = 一组过滤条件 → 一组目标分组
+  routeRules: SignalRouteRule[]
   // node_id -> 成交入库计数（每次 +1）。概览面板监听它来触发重新拉取，
   // 这样节点上报新成交后页面能自动刷新，不必手动点刷新。
   dealVersions: Record<string, number>
@@ -137,6 +138,7 @@ export const useHubStore = defineStore('hub', {
     nodeFeed: {},
     riskFeed: {},
     limitWatchLogs: {},
+    routeRules: [],
     dealVersions: {},
     strategyQuery: '',
   }),
@@ -453,41 +455,45 @@ export const useHubStore = defineStore('hub', {
         return null
       }
     },
-    /** 把一条信号路由到指定分组；重复路由时后端返回 409 */
-    async routeSignal(
-      signalId: string,
-      body: SignalRouteRequest,
+    // ---- 自动路由规则 ----
+    /** 拉取自动路由规则列表（含命中统计） */
+    async fetchRouteRules(): Promise<void> {
+      const { data } = await api.get('/api/signal-center/route-rules')
+      this.routeRules = data?.items ?? []
+    },
+    /** 新建一条自动路由规则 */
+    async createRouteRule(
+      body: SignalRouteRuleInput,
     ): Promise<{ ok: boolean; message: string }> {
       try {
-        await api.post(`/api/signal-center/signals/${signalId}/route`, body)
-        return { ok: true, message: '已下发' }
+        await api.post('/api/signal-center/route-rules', body)
+        await this.fetchRouteRules()
+        return { ok: true, message: '规则已创建' }
       } catch (e) {
-        return { ok: false, message: extractApiError(e, '路由失败') }
+        return { ok: false, message: extractApiError(e, '创建规则失败') }
       }
     },
-    /** 批量路由：逐条独立处理 */
-    async batchRouteSignals(
-      body: SignalBatchRouteRequest,
-    ): Promise<SignalBatchRouteResult | null> {
-      try {
-        return (await api.post('/api/signal-center/signals/batch-route', body)).data
-      } catch {
-        return null
-      }
-    },
-    /** 丢弃一条信号（不再路由到 center 分组） */
-    async dropSignal(
-      signalId: string,
-      note?: string | null,
+    /** 更新一条自动路由规则 */
+    async updateRouteRule(
+      ruleId: string,
+      body: SignalRouteRuleInput,
     ): Promise<{ ok: boolean; message: string }> {
       try {
-        await api.post(`/api/signal-center/signals/${signalId}/drop`, {
-          group_ids: [],
-          note: note ?? null,
-        })
-        return { ok: true, message: '已丢弃' }
+        await api.put(`/api/signal-center/route-rules/${ruleId}`, body)
+        await this.fetchRouteRules()
+        return { ok: true, message: '规则已保存' }
       } catch (e) {
-        return { ok: false, message: extractApiError(e, '丢弃失败') }
+        return { ok: false, message: extractApiError(e, '保存规则失败') }
+      }
+    },
+    /** 删除一条自动路由规则 */
+    async deleteRouteRule(ruleId: string): Promise<{ ok: boolean; message: string }> {
+      try {
+        await api.delete(`/api/signal-center/route-rules/${ruleId}`)
+        await this.fetchRouteRules()
+        return { ok: true, message: '规则已删除' }
+      } catch (e) {
+        return { ok: false, message: extractApiError(e, '删除规则失败') }
       }
     },
     async fetchAudits(

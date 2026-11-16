@@ -122,14 +122,25 @@ def leg_timeframe(reason: str, timeframe: object) -> Optional[str]:
 ## 四、路由
 
 ```python
-ROUTE_PENDING = "pending"    # 已入信号中心，等待路由
-ROUTE_AUTO    = "auto"       # 直连模式已被分组自动消费
-ROUTE_ROUTED  = "routed"     # 被信号中心选中下发过（人工介入过）
-ROUTE_DROPPED = "dropped"    # 被信号中心的筛选规则丢弃
+ROUTE_AUTO    = "auto"       # 已被分组消费（直连消费 或 规则命中）
+ROUTE_DROPPED = "dropped"    # 没有分组接收（拒收）
 
 ROUTE_MODE_DIRECT = "direct"  # 分组直连（TV / 手动直接触发）
-ROUTE_MODE_CENTER = "center"  # 信号中心下发
+ROUTE_MODE_AUTO   = "auto"    # 按自动路由规则下发（无人干预）
 ```
+
+**`route_state` 与 `route_mode` 的分工**：
+
+- `route_state` 回答「这条信号被处理成什么样了」（已自动下发 / 丢弃）；
+- `route_mode` 回答「是**怎么**下发的」（直连 / 按规则自动）。
+
+自动路由**复用** `route_state='auto'`（它和直连消费一样，都是「没人干预就下发了」），
+靠 `route_mode='auto'` 与直连区分 —— 少一个状态值，统计口径也不用多开一档。
+
+> ⚠️ **已删除的 `pending` / `routed` 状态与 `center` 模式**：
+> 人工路由（信号中心里手动选信号 + 选分组下发）这条链路已经下线，
+> 分组不再有「只接受信号中心下发」的模式 —— 现在只有两种：
+> **直连**（无条件接收）与**自动（按规则）**（只接收命中规则的信号）。
 
 触发来源（`group_signal_task.trigger_source`）：
 
@@ -137,7 +148,6 @@ ROUTE_MODE_CENTER = "center"  # 信号中心下发
 TRIGGER_TV_WEBHOOK   = "tv_webhook"
 TRIGGER_MANUAL       = "manual"
 TRIGGER_LIMIT_WATCH  = "limit_watch"
-TRIGGER_CENTER       = "center"
 ```
 
 ---
@@ -423,84 +433,147 @@ def leg_timeframe(reason: object, timeframe: object) -> Optional[str]:
 # 路由
 # ---------------------------------------------------------------------------
 
-ROUTE_PENDING = "pending"
 ROUTE_AUTO = "auto"
-ROUTE_ROUTED = "routed"
 ROUTE_DROPPED = "dropped"
 
 ROUTE_STATES: tuple[str, ...] = (
-    ROUTE_PENDING, ROUTE_AUTO, ROUTE_ROUTED, ROUTE_DROPPED,
+    ROUTE_AUTO, ROUTE_DROPPED,
 )
 
-ROUTE_MODE_DIRECT = "direct"
-ROUTE_MODE_CENTER = "center"
+# —— 历史状态（人工路由链路已下线）——
+#
+# 只保留常量与标签，**不再写入**。存量 `signal_history.route_state` 里可能还有
+# 这些值（老数据），保留识别能力是为了让历史数据的标签和筛选不至于变成「—」。
+ROUTE_PENDING = "pending"
+ROUTE_ROUTED = "routed"
+_LEGACY_ROUTE_STATES: tuple[str, ...] = (ROUTE_PENDING, ROUTE_ROUTED)
 
-ROUTE_MODES: tuple[str, ...] = (ROUTE_MODE_DIRECT, ROUTE_MODE_CENTER)
+ROUTE_MODE_DIRECT = "direct"
+# 自动路由：分组仍由 webhook 自动触发，但**只接收命中自动路由规则的信号**。
+#
+# 为什么单独一个值而不是复用 direct：
+# - `direct` = 「无条件接收所有品种匹配的信号」——**广播**语义；
+# - `auto`   = 「有选择地接收」——**订阅**语义。
+# 两者对同一条信号的处置完全不同，混在一个值里会让 direct 分组的行为
+# 变得不可预测（要么 direct 也跑规则 → 存量分组行为突变；要么不跑 → auto 无意义）。
+#
+# 存量零行为变化：node_group.signal_source 的默认值是 direct，老行不受影响。
+ROUTE_MODE_AUTO = "auto"
+
+# 遗留模式：人工路由（信号中心里手动选信号 + 选分组下发）已下线。
+#
+# ⚠️ **存量 `center` 分组不能回落成 `direct`** —— 那等于在下架人工路由的同时，
+# 让这些分组**突然开始无条件接收所有信号**，直接产生真实交易。
+# 所以遗留 center 分组归一到这个值：**不接收任何信号**（既不直连也不参与规则匹配），
+# 前端显示醒目提示让管理员自己改成「直连」或「自动（按规则）」。
+ROUTE_MODE_LEGACY_CENTER = "center"
+
+# **可写入**的模式（新建 / 修改分组时只允许这两个）
+ROUTE_MODES: tuple[str, ...] = (
+    ROUTE_MODE_DIRECT, ROUTE_MODE_AUTO,
+)
+# 含遗留值的全部模式（用于识别存量数据，不用于校验入参）
+ROUTE_MODES_ALL: tuple[str, ...] = (
+    ROUTE_MODE_DIRECT, ROUTE_MODE_AUTO, ROUTE_MODE_LEGACY_CENTER,
+)
 
 ROUTE_STATE_LABELS: dict[str, str] = {
-    ROUTE_PENDING: "待路由",
-    ROUTE_AUTO: "已直连分发",
-    ROUTE_ROUTED: "已中心下发",
+    ROUTE_AUTO: "已自动下发",
     ROUTE_DROPPED: "已丢弃",
+    ROUTE_PENDING: "待路由（已下线）",
+    ROUTE_ROUTED: "已中心下发（已下线）",
 }
 
 ROUTE_MODE_LABELS: dict[str, str] = {
     ROUTE_MODE_DIRECT: "直连",
-    ROUTE_MODE_CENTER: "信号中心",
+    ROUTE_MODE_AUTO: "自动（按规则）",
+    ROUTE_MODE_LEGACY_CENTER: "信号中心（已下线）",
 }
 
 TRIGGER_TV_WEBHOOK = "tv_webhook"
 TRIGGER_MANUAL = "manual"
 TRIGGER_LIMIT_WATCH = "limit_watch"
+# 遗留触发来源（人工路由链路已下线，只用于读历史数据）
 TRIGGER_CENTER = "center"
 
 TRIGGER_SOURCES: tuple[str, ...] = (
-    TRIGGER_TV_WEBHOOK, TRIGGER_MANUAL, TRIGGER_LIMIT_WATCH, TRIGGER_CENTER,
+    TRIGGER_TV_WEBHOOK, TRIGGER_MANUAL, TRIGGER_LIMIT_WATCH,
 )
 
 TRIGGER_SOURCE_LABELS: dict[str, str] = {
     TRIGGER_TV_WEBHOOK: "TV 告警",
     TRIGGER_MANUAL: "手动触发",
     TRIGGER_LIMIT_WATCH: "限价监听",
-    TRIGGER_CENTER: "信号中心下发",
+    TRIGGER_CENTER: "信号中心下发（已下线）",
 }
 
 
 def safe_route_state(value: object) -> Optional[str]:
-    """路由状态收敛；非法值归 None（绝不抛异常）。"""
+    """路由状态收敛；非法值归 None（绝不抛异常）。
+
+    包含已下线的 `pending` / `routed` —— 存量历史行里还有这些值，
+    读历史数据时不能变成「—」。但**新写入**只用 `ROUTE_STATES`。
+    """
     if not value:
         return None
     code = str(value).strip().lower()
-    return code if code in ROUTE_STATES else None
+    if code in ROUTE_STATES:
+        return code
+    if code in _LEGACY_ROUTE_STATES:
+        return code
+    return None
 
 
 def safe_route_mode(value: object) -> Optional[str]:
-    """路由模式收敛；非法值归 None。"""
+    """路由模式收敛；非法值归 None。
+
+    包含已下线的 `center` —— 存量历史行里还有这个值，读历史数据时不能变成「—」。
+    但**新写入**只用 `ROUTE_MODES`。
+    """
     if not value:
         return None
     code = str(value).strip().lower()
-    return code if code in ROUTE_MODES else None
+    return code if code in ROUTE_MODES_ALL else None
 
 
 def safe_trigger_source(value: object) -> Optional[str]:
-    """触发来源收敛；非法值归 None。"""
+    """触发来源收敛；非法值归 None。
+
+    包含已下线的 `center` —— 存量 `group_signal_task.trigger_source` 里还有这个值，
+    读历史任务时不能变成「—」。但**新写入**只用 `TRIGGER_SOURCES`。
+    """
     if not value:
         return None
     code = str(value).strip().lower()
-    return code if code in TRIGGER_SOURCES else None
+    if code in TRIGGER_SOURCES:
+        return code
+    if code == TRIGGER_CENTER:
+        return code
+    return None
 
 
 def safe_signal_source(value: object) -> Optional[str]:
-    """分组信号来源模式收敛；非法值归 None（调用方按默认 direct 处理）。"""
+    """分组信号来源模式收敛；非法值归 None（调用方按默认处理）。"""
     if not value:
         return None
     code = str(value).strip().lower()
-    return code if code in ROUTE_MODES else None
+    return code if code in ROUTE_MODES_ALL else None
 
 
 def normalize_signal_source(value: object) -> str:
-    """分组信号来源模式归一；非法 / 缺省一律回落 direct（存量分组零行为变化）。"""
-    return safe_signal_source(value) or ROUTE_MODE_DIRECT
+    """分组信号来源模式归一。
+
+    - 缺省 / 非法 → `direct`（存量分组零行为变化）。
+    - 遗留的 `center` → `ROUTE_MODE_LEGACY_CENTER`（**不是** direct！）。
+
+    为什么遗留 center 不能回落 direct：那等于在下架人工路由的同一刻，
+    让这些分组开始**无条件接收所有信号**，直接产生真实交易。
+    遗留 center 分组保持「不接收任何信号」，由管理员显式改成直连或自动。
+    """
+    code = safe_signal_source(value)
+    if code == ROUTE_MODE_LEGACY_CENTER:
+        return ROUTE_MODE_LEGACY_CENTER
+    return code or ROUTE_MODE_DIRECT
 
 
 def route_state_label(value: object) -> str:

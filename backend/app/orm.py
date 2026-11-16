@@ -378,9 +378,10 @@ class SignalHistory(Base):
     # 首仓信号类型（ob / fvg / bos / …）。未知类型保留原值小写，不丢
     signal_type: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
     # —— 路由状态（信号中心的 inbox 层）——
-    # pending（待路由）/ auto（直连已消费）/ routed（被中心下发过）/ dropped（已丢弃）
+    # auto（已自动下发）/ dropped（已丢弃）。
+    # pending / routed 是人工路由的遗留值，只在存量历史行里读得到，不再写入。
     route_state: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
-    # direct（分组直连）/ center（信号中心下发）
+    # direct（分组直连）/ auto（按规则自动下发）
     route_mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
 
@@ -514,9 +515,12 @@ class NodeGroup(Base):
     # 只对绑定 tpl_1（AI 智能加仓策略）的分组有意义；AI 加仓是持续加仓，
     # 暴露一个参数激进的老分组代价远高于普通带单，所以默认关闭、需显式开启。
     accept_ai_follow: Mapped[bool] = mapped_column(Boolean, default=False)
-    # 信号来源模式：direct（TV / 手动信号直连触发，默认）/ center（只接受信号中心下发）。
+    # 信号来源模式：direct（TV / 手动信号直连触发，默认）/ auto（只接收命中
+    # 自动路由规则的信号）。
     # 路由策略挂在分组上而不是全局开关——这样存量分组零行为变化，
     # 且可以在不同分组间混用两种模式。
+    # 遗留的 center（只接受信号中心下发）已下线：存量分组仍可能存着这个值，
+    # 这类分组**不接收任何信号**（不会回落 direct），需管理员显式改成上面两种。
     signal_source: Mapped[str] = mapped_column(
         String(16), default="direct", server_default="direct",
     )
@@ -687,10 +691,11 @@ class GroupSignalTask(Base):
     total_volume: Mapped[float] = mapped_column(Float, default=0.0)
     realized_profit: Mapped[float] = mapped_column(Float, default=0.0)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    # —— 路由（信号中心）——
-    # 触发来源：tv_webhook / manual / limit_watch / center（从信号中心下发）
+    # —— 路由 ——
+    # 触发来源：tv_webhook / manual / limit_watch
+    # （center 是人工路由的遗留值，只在存量历史行里读得到，不再写入）
     trigger_source: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
-    # 路由方式：direct（分组直连自动触发）/ center（信号中心下发）
+    # 路由方式：direct（分组直连自动触发）/ auto（按规则自动下发）
     route_mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
 
@@ -905,6 +910,70 @@ class TradingStrategy(Base):
     # 迟到的旧版本包直接丢弃，避免乱序热推把新配置覆盖回旧的。
     config_version: Mapped[int] = mapped_column(Integer, default=0)
     # 数据归属：创建者；空 = 管理员名下
+    owner_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+
+# ===================== 自动路由规则 =====================
+
+
+class SignalRouteRule(Base):
+    """自动路由规则：一条规则 = 一组过滤条件 → 一组目标分组。
+
+    与「信号自带的 template_ids / group_ids 定向」是两回事，必须分清：
+
+    - `template_ids` / `group_ids` 是 **TV 告警自带**的（谁推的告警谁指定），
+      单次有效、不持久化、随信号一起流转；
+    - 本表是**管理员在信号中心里配置的持久规则**，对之后进来的**每一条**信号生效。
+
+    **过滤条件一律「空 = 不限制」**（与 template_ids / group_ids 的语义一致）：
+    `signal_types` 空 = 所有类型都收；`timeframes` 空 = 所有周期都收。
+    唯一的例外是 `group_ids`：它为空时整条规则没有意义，保存时直接拒收。
+
+    **用 JSON 列存数组而不是关联表**：过滤条件是「集合匹配」，没有多对多的实体
+    语义；规则数量级是几十条（不是几千条）；JSON 列在 MySQL / SQLite 都够用，
+    且省掉 3 张关联表的 join。
+
+    `priority` 的语义是「命中即占位」的顺序：一条分组被某条规则占用后，
+    从后续规则的候选集里移除，所以 priority 小的规则**先挑走分组**。
+
+    参数覆盖列（volume / sl / tp）**当前未启用**，仅作结构预留：
+    覆盖 sl 会改变策略的开仓准入（`entry_reject_reason` 要求信号带止损价），
+    覆盖 volume 会影响 AI 加仓的风险金额反推 —— 都属于另一个诉求，
+    启用前需要单独评估。
+    """
+    __tablename__ = "signal_route_rule"
+
+    rule_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    name: Mapped[str] = mapped_column(String(64))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    # —— 过滤条件（空 = 不限制）——
+    # 信号类型：既可写类型码（ob / fvg / …），也可写业务分类（结构分析）；
+    # 分类会在匹配时展开成它包含的类型码集合。
+    signal_types: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # 信号级周期（M15 / H1 / …），归一后比较
+    timeframes: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # 方向（BUY / SELL）
+    directions: Mapped[list | None] = mapped_column(JSON, nullable=True)
+
+    # —— 目标分组（必填，空 = 无效规则）——
+    group_ids: Mapped[list] = mapped_column(JSON)
+
+    # —— 参数覆盖（预留，当前未启用；空 = 沿用信号原值）——
+    volume: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    tp: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # 优先级：数值小的先挑走分组（命中即占位）
+    priority: Mapped[int] = mapped_column(Integer, default=100)
+
+    # 数据归属：创建者；空 = 管理员名下。
+    # 一期规则**全局生效**（跨 owner 分组是常态：管理员给所有分组配一条规则），
+    # 本列仅作预留，二期再决定是否按所有者隔离。
     owner_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(

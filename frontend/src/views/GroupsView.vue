@@ -91,8 +91,10 @@ const FIELD_HELP = {
     '未绑定不影响分组本身的信号分发；可稍后在编辑中补绑或换绑。',
   signal_source:
     '信号来源模式。「直连」= TradingView 告警 / 手动触发后直接进本分组开仓（默认）；' +
-    '「信号中心」= 本分组不再被 webhook 自动触发，只有管理员在【信号中心】里选中信号并路由过来才开仓。' +
-    '两种模式可以混用：同一个分组先直连一段时间，再改成信号中心模式也不影响在跑任务。',
+    '「自动（按规则）」= 本分组仍会被自动触发，但信号必须命中【信号中心 → 路由 → 自动路由规则】' +
+    '里配置的规则才会发到本分组（没命中规则的信号不会进这个分组）。' +
+    '两种模式可以混用：同一个分组先直连一段时间，再改成自动模式也不影响在跑任务。' +
+    '（原「信号中心」模式已下线：存量分组若仍是该模式，将不接收任何信号，需改成上面两种之一。）',
   remark: '备注，仅用于后台展示。',
   nodes:
     '加入本分组的节点。信号进入时只有「已启用且在线」的成员才算有效节点；勾选顺序即轮询轮转的初始顺序。',
@@ -193,11 +195,18 @@ const ENABLED_TAGS: TagOption<boolean>[] = [
   { value: false, label: '禁用', tone: 'off' },
 ]
 
-/** 信号来源模式：直连（默认）/ 信号中心 */
+/** 信号来源模式：直连（默认）/ 自动（按规则） */
 const SIGNAL_SOURCE_TAGS: TagOption<GroupSignalSource>[] = [
   { value: 'direct', label: '直连' },
-  { value: 'center', label: '信号中心' },
+  { value: 'auto', label: '自动（按规则）' },
 ]
+
+/** 信号来源模式 → 确认弹窗里的一句话摘要 */
+const SIGNAL_SOURCE_SUMMARY: Record<GroupSignalSource, string> = {
+  direct: '直连（webhook 告警直接进本分组）',
+  auto: '自动（按规则，只有命中自动路由规则的信号才进本分组）',
+  center: '信号中心（已下线，该模式不接收任何信号）',
+}
 
 watch(
   () => form.strategy_id,
@@ -364,7 +373,7 @@ async function save(): Promise<void> {
       (formIsAiStrategy.value
         ? `开放 AI 跟单：${form.accept_ai_follow ? '开启（会进入【AI 交易】广场）' : '关闭'}\n`
         : '') +
-      `信号来源：${form.signal_source === 'center' ? '信号中心（不由 webhook 自动触发）' : '直连'}\n` +
+      `信号来源：${SIGNAL_SOURCE_SUMMARY[form.signal_source] ?? '直连'}\n` +
       `绑定策略：${styName}\n` +
       `成员节点：${form.node_ids.length} 个`
     const verb = formMode.value === 'create' ? '创建' : '更新'
@@ -830,7 +839,8 @@ async function onStrategyFormSaved(): Promise<void> {
             <span class="tag" :class="g.enabled ? 'green' : 'red'">{{ g.enabled ? '启用' : '禁用' }}</span>
             <span class="tag blue">{{ DISPATCH_MODE_SHORT[g.dispatch_mode] }}</span>
             <span v-if="g.signal_concurrent_enabled" class="tag">并发</span>
-            <span v-if="g.signal_source === 'center'" class="tag amber" title="信号中心模式：webhook 不再自动触发本分组">中心</span>
+            <span v-if="g.signal_source === 'center'" class="tag amber" title="信号中心模式已下线：本分组不接收任何信号，请改成「直连」或「自动（按规则）」">待改模式</span>
+            <span v-else-if="g.signal_source === 'auto'" class="tag blue" title="自动模式：只有命中自动路由规则的信号才进本分组">自动</span>
           </div>
           <span class="group-caret" :class="{ open: groupDetailOpen[g.group_id] }">▾</span>
         </div>
@@ -1441,6 +1451,9 @@ async function onStrategyFormSaved(): Promise<void> {
                 :options="SIGNAL_SOURCE_TAGS"
                 aria-label="信号来源"
               />
+              <p v-if="form.signal_source === 'center'" style="color: var(--red); font-size: 12px; margin: 6px 0 0">
+                「信号中心」模式已下线：该分组目前不接收任何信号，请改成「直连」或「自动（按规则）」。
+              </p>
             </div>
             <div>
               <FormLabel field-id="group-trend-risk" text="趋势风控" :help="FIELD_HELP.trend_risk" />

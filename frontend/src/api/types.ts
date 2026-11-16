@@ -485,9 +485,14 @@ export type GroupDispatchMode = 'sync' | 'poll'
 /**
  * 分组的信号来源模式：
  * - `direct`：TV 告警 / 手动信号直接触发该分组（默认，存量行为不变）；
- * - `center`：该分组只接受信号中心下发的信号，webhook 不再自动触发它。
+ * - `auto`：该分组**会**被自动触发，但信号必须命中【信号中心】里配置的
+ *   自动路由规则才会发到这个分组（订阅语义，不同于 direct 的广播语义）。
+ *
+ * ⚠️ `center`（只接受信号中心人工下发）**已下线**：不可再写入。
+ * 存量分组可能仍返回这个值 —— 这类分组**不接收任何信号**（不会回落成 direct），
+ * 需要管理员显式改成 `direct` 或 `auto` 后才会重新生效。
  */
-export type GroupSignalSource = 'direct' | 'center'
+export type GroupSignalSource = 'direct' | 'auto' | 'center'
 
 /** 分组成员节点（含在线状态） */
 export interface GroupNodeRef {
@@ -534,7 +539,9 @@ export interface GroupOut {
   /**
    * 信号来源模式：
    * - `direct`（默认）：TV 告警 / 手动信号直接触发该分组开仓；
-   * - `center`：该分组**不**被 webhook 自动触发，只能由管理员在信号中心里路由过来。
+   * - `auto`：该分组**会**被自动触发，但信号必须命中【信号中心】里配置的
+   *   自动路由规则才会发到它（订阅语义，不同于 direct 的广播语义）。
+   * - `center`：**已下线**，仅存量分组可能仍是这个值（不接收任何信号）。
    */
   signal_source: GroupSignalSource
   /** 一对一绑定的策略 ID；未绑定为 null */
@@ -623,7 +630,7 @@ export interface GroupCreatePayload {
   limit_watch_keyword?: string
   /** 是否开放【AI 交易】广场的跟单（默认关）；前端只对 tpl_1 分组展示。 */
   accept_ai_follow?: boolean
-  /** 信号来源模式：direct（默认）/ center */
+  /** 信号来源模式：direct（默认）/ auto；center 已下线 */
   signal_source?: GroupSignalSource
   remark?: string | null
   /** 一对一绑定策略；空 / null = 不绑定 */
@@ -656,7 +663,7 @@ export interface GroupUpdatePayload {
   limit_watch_keyword?: string
   /** 是否开放【AI 交易】广场的跟单（默认关） */
   accept_ai_follow?: boolean
-  /** 信号来源模式：direct（默认）/ center；省略则不改 */
+  /** 信号来源模式：direct（默认）/ auto；center 已下线；省略则不改 */
   signal_source?: GroupSignalSource
   remark?: string | null
   /** 传入空字符串或 null 表示解除绑定 */
@@ -1715,7 +1722,7 @@ export interface SignalStreamItem {
   timeframe: string | null
   /** 首仓信号类型（ob / fvg / …）；缺失 = 未标注 */
   signal_type: string | null
-  /** 路由状态：pending / auto / routed / dropped */
+  /** 路由状态：auto（已自动下发）/ dropped（已丢弃）；pending / routed 已下线 */
   route_state: string | null
   reject_code: string | null
   reject_label: string | null
@@ -1960,7 +1967,7 @@ export interface SignalCenterQuery {
   timeframe?: string | null
   /** 首仓信号类型（ob / fvg / …） */
   signal_type?: string | null
-  /** 路由状态（pending / auto / routed / dropped） */
+  /** 路由状态（auto / dropped；pending / routed 已下线） */
   route_state?: string | null
   /** 多空（buy / sell） */
   direction?: string | null
@@ -2232,34 +2239,56 @@ export interface AiSignalList {
   scope: string
 }
 
-/** 路由一条信号的入参 */
-export interface SignalRouteRequest {
+/**
+ * 自动路由规则的过滤条件取值。
+ *
+ * `signal_types` 既可以是**类型码**（ob / fvg / pdz / …），
+ * 也可以是**业务分类**（结构分析 / 突破信号 / …）——
+ * 后端在匹配时会展开成它包含的类型码集合（见 `signal_meta.types_in_group`）。
+ */
+export type SignalRouteRuleType = string
+
+/** 自动路由规则的命中统计 */
+export interface SignalRouteRuleHit {
+  count: number
+  last_hit_ts: number | null
+  last_signal_id: string
+}
+
+/** 自动路由规则：一条规则 = 一组过滤条件 → 一组目标分组 */
+export interface SignalRouteRule {
+  rule_id: string
+  name: string
+  enabled: boolean
+  /** 信号类型条件；空数组 = 不限制（所有类型都收） */
+  signal_types: SignalRouteRuleType[]
+  /** 周期条件（M15 / H1 / …）；空数组 = 不限制 */
+  timeframes: string[]
+  /** 方向条件（BUY / SELL）；空数组 = 不限制 */
+  directions: string[]
+  /** 目标分组（必填） */
   group_ids: string[]
+  /** 参数覆盖：当前未启用，仅结构预留 */
   volume?: number | null
   sl?: number | null
   tp?: number | null
-  note?: string | null
+  /** 优先级：数值小的先挑走分组（命中即占位） */
+  priority: number
+  owner_user_id?: number | null
+  created_at?: number | null
+  updated_at?: number | null
+  hit: SignalRouteRuleHit
 }
 
-/** 批量路由的入参 */
-export interface SignalBatchRouteRequest extends SignalRouteRequest {
-  signal_ids: string[]
-}
-
-export interface SignalRouteResult {
-  signal_id: string
-  groups: number
-  targets: number
-  tasks: unknown[]
-  route_state: string
-  note: string | null
-}
-
-export interface SignalBatchRouteResult {
-  ok: { signal_id: string; groups: number; targets: number }[]
-  conflicts: { signal_id: string; reason: string; task_ids: number[] }[]
-  failed: { signal_id: string; reason: string }[]
-  summary: { ok: number; conflicts: number; failed: number }
+/** 自动路由规则的入参 */
+export interface SignalRouteRuleInput {
+  name: string
+  enabled?: boolean
+  signal_types?: SignalRouteRuleType[]
+  timeframes?: string[]
+  directions?: string[]
+  group_ids: string[]
+  priority?: number
 }
 
 export interface AuditRecord {

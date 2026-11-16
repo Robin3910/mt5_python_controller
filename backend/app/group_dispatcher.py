@@ -30,7 +30,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
@@ -48,6 +48,7 @@ from . import (
     rbac_service,
     signal_codes,
     signal_meta,
+    signal_route_rules,
     strategy_templates,
     system_settings,
     trend_indicators,
@@ -416,68 +417,83 @@ class GroupDispatcher:
                        source_ip: Optional[str] = None,
                        raw_payload: Optional[str] = None,
                        source: str = "tradingview",
-                       route_mode: str = "direct",
-                       trigger_source: Optional[str] = None,
-                       group_ids: Optional[list[str]] = None) -> dict:
+                       trigger_source: Optional[str] = None) -> dict:
         """分发入口：按绑定策略的品种筛选分组，各自独立处理本信号。
 
-        **双模式路由**（`group.signal_source`）：
+        **两种分组模式**（`group.signal_source`）：
 
         | 分组模式 | 行为 |
         |---|---|
         | `direct`（默认） | 信号直接下发到该分组，立刻开仓 |
-        | `center` | 信号**不**自动下发，改为进入信号中心待路由队列 |
+        | `auto` | 信号自动下发，但**只发给命中自动路由规则的分组** |
 
-        `route_mode='direct'`（webhook / 手动触发走这条路）：只有 `direct` 分组
-        被立即下发；`center` 分组的候选被**排除在本次下发之外**，但这条信号
-        仍会入库并标记 `route_state='pending'`，等待管理员在信号中心里路由。
+        遗留的 `center`（信号中心人工路由）模式**已下线**：这类分组**不接收任何信号**，
+        也不会回落成 direct（那等于让它们突然开始无条件开仓）。管理员需要显式
+        把它改成「直连」或「自动（按规则）」后才会重新生效。
 
-        `route_mode='center'`（信号中心下发走这条路）：**只**下发给 `group_ids`
-        点名的分组（可覆盖 volume / sl / tp），其余一律不下发。
+        **自动路由的落点**：规则匹配放在 `_candidate_groups` **之后** ——
+        准入（启用状态 / 绑定策略 / 品种匹配 / 模版定向 / 策略开仓准入）
+        已经过完，规则只回答「要不要它」这一个收窄问题。
+        这样自动路由对**所有信号来源**生效（webhook / 手动触发 / 限价监听），
+        且天然复用了全部准入校验。
         """
         if signal.action == "CLOSE":
             return await self._dispatch_close(
                 signal, signal_id, source_ip=source_ip, raw_payload=raw_payload, source=source,
             )
 
-        if route_mode == "center":
-            return await self._dispatch_center(
-                signal, signal_id, source_ip=source_ip, raw_payload=raw_payload,
-                source=source, group_ids=group_ids or [],
-            )
-
         matched, reasons = await self._candidate_groups(signal)
-        # 双模式路由：把 center 分组从本次下发里摘出去。
-        # 摘出去不是丢弃 —— 这条信号仍然入库并标记 pending，管理员可在信号中心路由。
+        # 两种分组模式：把 auto 分组从「无条件下发」里摘出去。
+        # 摘出去不是丢弃 —— 这条信号仍然入库，由自动路由规则决定 auto 分组要不要收。
         direct_groups: list[tuple[dict, dict]] = []
-        center_groups: list[tuple[dict, dict]] = []
+        auto_groups: list[tuple[dict, dict]] = []
+        legacy_center_groups: list[tuple[dict, dict]] = []
         for group, strategy in matched:
-            if signal_meta.normalize_signal_source(group.get("signal_source")) == "center":
-                center_groups.append((group, strategy))
+            src = signal_meta.normalize_signal_source(group.get("signal_source"))
+            if src == signal_meta.ROUTE_MODE_LEGACY_CENTER:
+                # 遗留 center 分组：不接收（也不回落 direct）。
+                legacy_center_groups.append((group, strategy))
+            elif src == signal_meta.ROUTE_MODE_AUTO:
+                auto_groups.append((group, strategy))
             else:
                 direct_groups.append((group, strategy))
 
+        # 自动路由：auto 分组按规则挑。命中即占位（同一分组不会被下发两次）。
+        auto_hit, auto_rule_owner = await self._match_auto_groups(auto_groups, signal)
+        direct_groups.extend(auto_hit)
+        # 每个分组的 route_mode 各自记：direct 分组是「直连」，
+        # auto 分组是「按规则自动下发」—— 分组主任务上要能区分这两种来源。
+        auto_hit_ids = {
+            str(g.get("group_id") or "").strip().lower() for g, _ in auto_hit
+        }
+
         if not direct_groups:
-            # 没有可直连的分组：若有 center 分组在等，这条信号进入待路由队列；
-            # 否则才是真正的「无处可去」。
-            if center_groups:
+            # 没有可下发的分组。
+            if auto_groups:
+                # 有 auto 分组，但**没有一条规则命中这条信号**。
+                # 这不是「信号有问题」—— 信号本身是好的，只是没有分组要它。
+                # 所以不能判 rejected（那会让用户看到一堆莫名「已拒收」），
+                # 而是正常入库、targets=0，并说明原因。
                 await persist.record_signal(
-                    signal_id, signal, source_ip, True, None, status="pending",
+                    signal_id, signal, source_ip, True, None, status="dispatching",
                     raw_payload=raw_payload, source=source, model=SIGNAL_MODEL_STRATEGY,
-                    route_state=signal_meta.ROUTE_PENDING,
-                    route_mode=signal_meta.ROUTE_MODE_DIRECT,
+                    route_state=signal_meta.ROUTE_AUTO,
+                    route_mode=signal_meta.ROUTE_MODE_AUTO,
                 )
-                names = [g.get("name") or g.get("group_id") for g, _ in center_groups]
+                names = [g.get("name") or g.get("group_id") for g, _ in auto_groups]
                 reason = (
-                    f"已入库待路由：{'、'.join(names)} 为信号中心模式，"
-                    f"需在信号中心选中后下发"
+                    f"已入库但未下发：无自动路由规则匹配这条信号"
+                    f"（{'、'.join(names)} 均为自动模式）"
                 )
-                logger.info("strategy signal pending route: %s", reason)
+                logger.info("strategy signal no auto rule matched: %s", reason)
                 return {
-                    "mode": "pending", "targets": 0, "groups": 0,
+                    "mode": "group", "targets": 0, "groups": 0,
                     "reason": reason, "tasks": [],
-                    "route_state": signal_meta.ROUTE_PENDING,
-                    "pending_groups": [g.get("group_id") for g, _ in center_groups],
+                    "route_state": signal_meta.ROUTE_AUTO,
+                    "route_mode": signal_meta.ROUTE_MODE_AUTO,
+                    "pending_groups": [],
+                    "auto_groups": [],
+                    "auto_rule_hits": {},
                 }
             await persist.record_signal(
                 signal_id, signal, source_ip, True, None, status="rejected",
@@ -486,19 +502,44 @@ class GroupDispatcher:
                 route_mode=signal_meta.ROUTE_MODE_DIRECT,
             )
             detail = "；".join(reasons) if reasons else "没有已启用且绑定该品种策略的分组"
+            if legacy_center_groups:
+                names = [g.get("name") or g.get("group_id") for g, _ in legacy_center_groups]
+                detail = (
+                    f"{detail}；{'、'.join(names)} 仍为已下线的「信号中心」模式，"
+                    f"请在分组设置里改为「直连」或「自动（按规则）」"
+                )
             reason = f"无匹配分组：{detail}"
             logger.info("strategy signal rejected: %s", reason)
             return {"mode": "rejected", "targets": 0, "groups": 0, "reason": reason, "tasks": []}
 
+        # route_state 复用 'auto'（两种自动场景都是「没人干预就下发了」），
+        # 用 route_mode 区分来源（direct 直连 / auto 规则命中）。
+        has_auto_hit = bool(auto_hit)
+        route_state = signal_meta.ROUTE_AUTO
+        # 信号级 route_mode：有 auto 命中就算 auto（这条信号确实走的是自动路由），
+        # 分组级 route_mode 各自算（见下面的 _dispatch_group 调用）。
+        route_mode = (
+            signal_meta.ROUTE_MODE_AUTO if has_auto_hit
+            else signal_meta.ROUTE_MODE_DIRECT
+        )
+
         await persist.record_signal(
             signal_id, signal, source_ip, True, SIGNAL_DISPATCH_MODE,
             raw_payload=raw_payload, source=source, model=SIGNAL_MODEL_STRATEGY,
-            route_state=(
-                signal_meta.ROUTE_PENDING if center_groups
-                else signal_meta.ROUTE_AUTO
-            ),
-            route_mode=signal_meta.ROUTE_MODE_DIRECT,
+            route_state=route_state,
+            route_mode=route_mode,
         )
+
+        # 命中统计：规则卡上要显示「命中 N 条 / 最近命中时间」。
+        for rule_id in set(auto_rule_owner.values()):
+            if not rule_id:
+                continue
+            try:
+                await self.store.record_route_rule_hit(
+                    rule_id, signal_id, ts=time.time(),
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("record_route_rule_hit failed: %s", e)
 
         nodes = await self.store.all_nodes()
         nodemap = {n["node_id"]: n for n in nodes}
@@ -506,12 +547,17 @@ class GroupDispatcher:
 
         tasks = []
         for group, strategy in direct_groups:
+            gid = str(group.get("group_id") or "").strip().lower()
+            group_route_mode = (
+                signal_meta.ROUTE_MODE_AUTO if gid in auto_hit_ids
+                else signal_meta.ROUTE_MODE_DIRECT
+            )
             tasks.append(
                 await self._dispatch_group(
                     group, strategy, signal, signal_id, nodemap, online_ids,
                     source_ip=source_ip, raw_payload=raw_payload,
                     trigger_source=trigger_source or _trigger_source_for(source),
-                    route_mode=signal_meta.ROUTE_MODE_DIRECT,
+                    route_mode=group_route_mode,
                 )
             )
         return {
@@ -519,65 +565,58 @@ class GroupDispatcher:
             "groups": len(tasks),
             "targets": sum(t.get("targets", 0) for t in tasks),
             "tasks": tasks,
-            "route_state": (
-                signal_meta.ROUTE_PENDING if center_groups
-                else signal_meta.ROUTE_AUTO
-            ),
-            "pending_groups": [g.get("group_id") for g, _ in center_groups],
+            "route_state": route_state,
+            "route_mode": route_mode,
+            "pending_groups": [],
+            "auto_groups": [g.get("group_id") for g, _ in auto_hit],
+            "auto_rule_hits": auto_rule_owner,
         }
 
-    async def _dispatch_center(
-        self, signal: TradingSignal, signal_id: str, *,
-        source_ip: Optional[str], raw_payload: Optional[str], source: str,
-        group_ids: list[str],
-    ) -> dict:
-        """信号中心下发：只发给被点名的分组。
+    async def _match_auto_groups(
+        self, auto_groups: list[tuple[dict, dict]], signal: TradingSignal,
+    ) -> tuple[list[tuple[dict, dict]], dict[str, str]]:
+        """自动路由：按规则挑出「这条信号要发给哪些 auto 分组」。
 
-        与直连路径共用同一套分组准入（绑定策略 / 品种匹配 / 策略准入），
-        区别只在**分组来源**：直连是「按规则挑分组」，这里是「按人点的分组」。
+        返回 `(命中的 (group, strategy) 列表, {group_id: 命中的规则 ID})`。
+
+        **命中即占位**：一个分组被某条规则占用后，从后续规则的候选集里移除，
+        所以同一个分组不会被下发两次（不去重会重复开仓）。
+
+        规则读取失败时**保守处理**：返回空命中（宁可不发也不乱发），
+        且不抛异常 —— 分发链路不能因为规则表出问题就整体挂掉。
         """
-        if not group_ids:
-            return {
-                "mode": "rejected", "targets": 0, "groups": 0,
-                "reason": "未指定目标分组", "tasks": [],
-            }
-        target = [str(g).strip().lower() for g in group_ids if str(g or "").strip()]
-        if not target:
-            return {
-                "mode": "rejected", "targets": 0, "groups": 0,
-                "reason": "未指定目标分组", "tasks": [],
-            }
-        # 复用信号的分组定向：只保留被点名的分组
-        scoped = replace(signal, group_ids=target)
-        matched, reasons = await self._candidate_groups(scoped)
-        if not matched:
-            detail = "；".join(reasons) if reasons else "没有匹配的分组"
-            return {
-                "mode": "rejected", "targets": 0, "groups": 0,
-                "reason": f"无可用分组：{detail}", "tasks": [],
-            }
+        if not auto_groups:
+            return [], {}
+        try:
+            rules = await signal_route_rules.list_rules(only_enabled=True)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("load auto route rules failed: %s", e)
+            return [], {}
 
-        nodes = await self.store.all_nodes()
-        nodemap = {n["node_id"]: n for n in nodes}
-        online_ids = set(manager.online_node_ids())
-
-        tasks = []
-        for group, strategy in matched:
-            tasks.append(
-                await self._dispatch_group(
-                    group, strategy, scoped, signal_id, nodemap, online_ids,
-                    source_ip=source_ip, raw_payload=raw_payload,
-                    trigger_source=signal_meta.TRIGGER_CENTER,
-                    route_mode=signal_meta.ROUTE_MODE_CENTER,
-                )
-            )
-        return {
-            "mode": "group",
-            "groups": len(tasks),
-            "targets": sum(t.get("targets", 0) for t in tasks),
-            "tasks": tasks,
-            "route_state": signal_meta.ROUTE_ROUTED,
+        candidate_ids = {
+            str(g.get("group_id") or "").strip().lower()
+            for g, _ in auto_groups
         }
+        hit_ids, owner = signal_route_rules.match_groups(
+            rules,
+            {
+                "signal_type": signal.signal_type,
+                "timeframe": signal.timeframe,
+                "action": signal.action,
+            },
+            candidate_ids,
+        )
+        hit_set = set(hit_ids)
+        hits = [
+            (g, s) for g, s in auto_groups
+            if str(g.get("group_id") or "").strip().lower() in hit_set
+        ]
+        if hits:
+            logger.info(
+                "auto route matched %d group(s) for signal %s: %s",
+                len(hits), signal.symbol, ", ".join(hit_ids),
+            )
+        return hits, owner
 
     # ------------------------------------------------------------------
     # CLOSE：终止指令，绕过互斥

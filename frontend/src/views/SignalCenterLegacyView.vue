@@ -4,7 +4,10 @@
 // 这个文件是 AI 信号管理中心上线前的原信号中心页面，**整体保留、一行功能未删**。
 //
 // 保留它的原因：原页面里的【绩效】【路由】两块功能（`PerformancePanel.vue` /
-// `RoutingPanel.vue`）是**已实现但暂时隐藏**的功能，未来要恢复时只需把路由指回本组件。
+// `RouteRulePanel.vue`）是**已实现但暂时隐藏**的功能，未来要恢复时只需把路由指回本组件。
+//
+// ⚠️ **【路由】tab 现在只剩「自动路由规则」**：人工路由（手动选信号 + 选分组下发）
+// 与 `center` 分组模式已下线，原来的 `RoutingPanel.vue` 已被删除。
 //
 // **当前状态**：已挂在 `/signal-center-legacy`（调试用），并从【我的】页加了入口。
 // 新页面仍在 `/events` 与 `/signal-center`（`SignalCenterView.vue`，原型复刻版）。
@@ -30,7 +33,7 @@ import NodeHitCards from '@/components/signal-center/NodeHitCards.vue'
 import StrategyTaskPanel from '@/components/signal-center/StrategyTaskPanel.vue'
 import LatencyPanel from '@/components/signal-center/LatencyPanel.vue'
 import PerformancePanel from '@/components/signal-center/PerformancePanel.vue'
-import RoutingPanel from '@/components/signal-center/RoutingPanel.vue'
+import RouteRulePanel from '@/components/signal-center/RouteRulePanel.vue'
 import { useHubStore } from '@/stores/hub'
 import type {
   SignalCenterLatency,
@@ -294,9 +297,9 @@ onMounted(async () => {
       />
     </div>
 
-    <!-- 路由 -->
+    <!-- 路由（自动路由规则） -->
     <div v-show="tab === 'routing'">
-      <RoutingPanel :items="streamItems" :loading="loadingStream" />
+      <RouteRulePanel />
     </div>
   </div>
 </template>

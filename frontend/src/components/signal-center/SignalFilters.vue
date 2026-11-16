@@ -7,7 +7,7 @@
 // 后四个维度（周期 / 信号类型 / 路由状态 / 方向）是信号中心路由中枢与
 // 绩效面板新增的：
 // - 周期 / 类型：TV 告警带来的统计维度；
-// - 路由状态：待路由 / 已直连 / 已下发 / 已丢弃；
+// - 路由状态：已自动下发 / 已丢弃（人工路由的「待路由 / 已下发」已下线）；
 // - 方向：整合中控台的「只做多 / 只做空」。
 import { computed } from 'vue'
 import type { SignalCenterQuery } from '@/api/types'
@@ -77,9 +77,7 @@ const SIGNAL_TYPES = [
 /** 路由状态 */
 const ROUTE_STATES = [
   { value: '', label: '全部路由状态' },
-  { value: 'pending', label: '待路由' },
-  { value: 'auto', label: '已直连' },
-  { value: 'routed', label: '已中心下发' },
+  { value: 'auto', label: '已自动下发' },
   { value: 'dropped', label: '已丢弃' },
 ]
 

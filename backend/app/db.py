@@ -720,7 +720,7 @@ def _migrate_signal_meta_columns(sync_conn) -> None:
     - signal_history.signal_type：首仓信号类型（未知类型保留原值小写）
     - signal_history.route_state / route_mode：信号中心的 inbox 状态
     - group_signal_task.trigger_source / route_mode：这条主任务是怎么被触发的
-    - node_group.signal_source：分组的信号来源模式（direct 默认 / center）
+    - node_group.signal_source：分组的信号来源模式（direct 默认 / auto；center 已下线）
 
     `signal_entry_leg` 是**新表**，create_all 会直接建好，不用 ALTER。
     """

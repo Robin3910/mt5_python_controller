@@ -161,16 +161,44 @@ def test_timeframe_independent_and_dependent_reasons_are_disjoint():
 # 路由 / 触发来源收敛
 # ---------------------------------------------------------------------------
 def test_safe_route_state_rejects_unknown():
-    assert signal_meta.safe_route_state("pending") == "pending"
-    assert signal_meta.safe_route_state("PENDING") == "pending"
+    assert signal_meta.safe_route_state("auto") == "auto"
+    assert signal_meta.safe_route_state("AUTO") == "auto"
     assert signal_meta.safe_route_state("nope") is None
     assert signal_meta.safe_route_state(None) is None
 
 
+def test_safe_route_state_keeps_legacy_readable():
+    """人工路由已下线，但**读**历史数据时 pending / routed 仍要能识别。
+
+    存量 signal_history 里还有这些值，识别不了就会在界面上变成「—」，
+    看起来像数据坏了。
+    """
+    assert signal_meta.safe_route_state("pending") == "pending"
+    assert signal_meta.safe_route_state("routed") == "routed"
+
+
+def test_route_states_no_longer_include_legacy():
+    """可写入的路由状态只剩 auto / dropped。"""
+    assert signal_meta.ROUTE_STATES == ("auto", "dropped")
+    assert "pending" not in signal_meta.ROUTE_STATES
+    assert "routed" not in signal_meta.ROUTE_STATES
+
+
 def test_safe_route_mode_rejects_unknown():
     assert signal_meta.safe_route_mode("direct") == "direct"
-    assert signal_meta.safe_route_mode("center") == "center"
+    assert signal_meta.safe_route_mode("auto") == "auto"
     assert signal_meta.safe_route_mode("nope") is None
+
+
+def test_safe_route_mode_keeps_legacy_center_readable():
+    """遗留 center 分组仍要能原样读出来（前端要显示「待改模式」）。"""
+    assert signal_meta.safe_route_mode("center") == "center"
+
+
+def test_route_modes_no_longer_accept_center():
+    """center 不可再写入 —— 只剩 direct / auto。"""
+    assert signal_meta.ROUTE_MODES == ("direct", "auto")
+    assert "center" not in signal_meta.ROUTE_MODES
 
 
 def test_safe_trigger_source_rejects_unknown():
@@ -178,20 +206,37 @@ def test_safe_trigger_source_rejects_unknown():
     assert signal_meta.safe_trigger_source("nope") is None
 
 
+def test_safe_trigger_source_keeps_legacy_center_readable():
+    """历史任务里 trigger_source='center' 仍要能识别。"""
+    assert signal_meta.safe_trigger_source("center") == "center"
+
+
 def test_normalize_signal_source_defaults_to_direct():
     """存量分组零行为变化：缺省 / 非法一律回落 direct。"""
     assert signal_meta.normalize_signal_source(None) == "direct"
     assert signal_meta.normalize_signal_source("") == "direct"
     assert signal_meta.normalize_signal_source("nope") == "direct"
+    assert signal_meta.normalize_signal_source("direct") == "direct"
+    assert signal_meta.normalize_signal_source("auto") == "auto"
+
+
+def test_normalize_signal_source_keeps_legacy_center_inert():
+    """遗留 center **不能**回落 direct —— 那会让它突然开始无条件开仓。
+
+    回落 direct = 让存量 center 分组在下架人工路由的同一刻开始接收所有信号，
+    直接产生真实交易。所以必须保持「不接收任何信号」的语义。
+    """
     assert signal_meta.normalize_signal_source("center") == "center"
     assert signal_meta.normalize_signal_source("CENTER") == "center"
+    assert signal_meta.normalize_signal_source("center") != "direct"
 
 
 def test_labels_fall_back_without_raising():
     """标签函数对任何输入都不抛异常（前端要直接渲染）。"""
-    assert signal_meta.route_state_label("pending") == "待路由"
+    assert signal_meta.route_state_label("auto") == "已自动下发"
+    assert signal_meta.route_state_label("pending") == "待路由（已下线）"
     assert signal_meta.route_state_label("nope") == "—"
-    assert signal_meta.route_mode_label("center") == "信号中心"
+    assert signal_meta.route_mode_label("center") == "信号中心（已下线）"
     assert signal_meta.route_mode_label(None) == "—"
     assert signal_meta.trigger_source_label("tv_webhook") == "TV 告警"
     assert signal_meta.trigger_source_label("nope") == "—"

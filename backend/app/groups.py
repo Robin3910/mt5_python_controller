@@ -82,16 +82,19 @@ def _validate_dispatch_mode(mode: str | None) -> None:
 def _validate_signal_source(source: str | None) -> None:
     """信号来源模式入参校验；非法值 400，绝不静默回落。
 
-    这是**用户显式填的开关**，静默回落会让人以为改成了 center、实际还是
+    这是**用户显式填的开关**，静默回落会让人以为改成了某模式、实际还是
     direct —— 那会导致「分组没反应」，且极难排查。所以这里宁可报错。
     """
     if source is None:
         return
     if source not in signal_meta.ROUTE_MODES:
+        hint = ""
+        if source == signal_meta.ROUTE_MODE_LEGACY_CENTER:
+            hint = "（信号中心人工路由已下线，请改为 direct 或 auto）"
         raise HTTPException(
             status_code=400,
             detail=(
-                f"信号来源模式非法：{source}"
+                f"信号来源模式非法：{source}{hint}"
                 f"（应为 {' / '.join(signal_meta.ROUTE_MODES)}）"
             ),
         )
