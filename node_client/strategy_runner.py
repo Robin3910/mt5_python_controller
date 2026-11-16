@@ -87,8 +87,26 @@ _TEMPLATE_MODES = {
     "tpl_3": _MODE_GRID,
 }
 
+# 模版1「AI智能加仓策略」。走加仓路径（没有对应规则时也回退到这条路径）。
+_TEMPLATE_AI_ADD_ON = "tpl_1"
+
 # 事件说明落库字段为 VARCHAR(255)，本地先截断，避免整条上报被后端丢弃
 MESSAGE_LIMIT = 255
+
+# 模版1「AI智能加仓」判定「持仓已归零」所需的连续空仓轮数。
+#
+# 与 hub 的 `STRATEGY_EMPTY_CONFIRM` 同量纲：MT5 偶发返回不完整持仓时，
+# 单轮读到空仓不代表真的平光了，要连着几轮都读到空仓才认。
+# 这里自己数而不用 hub 的 GONE，是为了覆盖「持仓在节点连上前就被平掉」
+# 这种 hub 永远观察不到的场景（见 `_maybe_finish_on_empty`）。
+_EMPTY_CONFIRM = 2
+
+# 模版1「AI智能加仓」判定「持仓已归零」的宽限期（秒）。
+#
+# 首单是市价单，下单成功不代表终端已经把它反映到 positions 里。
+# 宽限期内读到空仓不算「已平光」，否则刚开的任务会被立刻收掉。
+# 宽限期过了还空仓，说明首单成交后被立刻平掉（止损打得太快），照样收口。
+_EMPTY_GRACE_SEC = 10.0
 
 # 真正的终态：服务端收到后会清零持仓数、释放节点占位。
 # stop_failed / detached / faulted 表示「已停止交易但魔术号下仍有持仓」，
@@ -295,6 +313,25 @@ class StrategyRunner:
         # 逆势限价的改价限流：ticket -> 上次改价时刻
         self._counter_modify_at: dict[int, float] = {}
 
+        # 模版1「AI智能加仓」专属：**没持仓就结束任务**。
+        #
+        # 该模版的加仓全是「在现有持仓上叠」（逆势挂限价 / 顺势市价加），
+        # 没有持仓时加仓无从谈起，继续挂着只会留下一堆没人管的挂单。
+        # 所以一旦持仓归零，任务就自动收口，并把盘上的残留挂单撤掉。
+        #
+        # 这个计数器是**节点自己数的**，不依赖 hub 的 seen 标志：hub 只有在
+        # 观察到过持仓之后才会派发 GONE，而「持仓在节点连上前就被平掉」这种
+        # 场景 hub 永远观察不到，任务就会一直挂着等服务端对账。
+        self._empty_streak = 0
+        # 是否真的在终端里看到过这个任务的持仓（区别于「服务端说有持仓」）
+        self._saw_position = False
+        # 本任务是重连续跑：重启前就已经在跑，持仓可能早就被平掉了
+        self._resumed = False
+        # 首单下单成功的时刻：给「终端还没把持仓反映出来」留宽限期
+        self._opened_at = 0.0
+        # 宽限期（秒）：刚下的市价单可能还没反映到终端
+        self._empty_grace = _EMPTY_GRACE_SEC
+
         # 三条互斥执行路径：网格 > 以损定量 > 加仓（按规则 type 优先级）
         grid_rule = grid_trading.pick_grid_rule(self._rules)
         risk_rule = (
@@ -499,6 +536,17 @@ class StrategyRunner:
     def limit_entry(self) -> bool:
         """本任务是否走限价开仓（挂单在成交前只有挂单没有持仓）。"""
         return bool(self.risk_sized and self._risk_cfg and self._risk_cfg.is_limit_entry)
+
+    @property
+    def is_ai_add_on(self) -> bool:
+        """本任务是否是模版1「AI智能加仓策略」（`tpl_1`）。
+
+        模版1 有一条别的模版没有的规则：**没持仓就自动结束任务**。
+        网格（`tpl_3`）空仓是正常运行态，以损定量（`tpl_2`）的限价开仓
+        在成交前本来就没有持仓——两者都不能套用这条规则。
+        """
+        template_id = str((self.strategy or {}).get("template_id") or "").strip().lower()
+        return template_id == _TEMPLATE_AI_ADD_ON
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -739,6 +787,14 @@ class StrategyRunner:
             hold_when_empty=self.is_grid,
             track_orders=self.limit_entry,
         )
+        # 只有模版1「AI智能加仓」是「没持仓就结束任务」：
+        # 即使从没观察到过持仓也要能收口，否则首单成交后被立刻平掉的
+        # 任务会一直挂着。其它模版保持默认（先观察到持仓才谈得上全平）。
+        #
+        # 这里直接改订阅对象的字段而不改 subscribe() 的签名：
+        # 订阅契约被各个测试替身（FakeHub）实现过，加参数会让它们全部失效。
+        if self.is_ai_add_on:
+            sub.finish_on_empty = True
         self._sub = sub
         try:
             if not resume:
@@ -747,6 +803,7 @@ class StrategyRunner:
             else:
                 # 恢复场景：首单早已成交，按现有持仓续跑，计数待首个事件重建
                 self._opened = True
+                self._resumed = True
                 self._seed_pending = True
                 self._lot_sltp_seed_existing = True
                 await self._emit_progress("resume", phase="running")
@@ -826,6 +883,14 @@ class StrategyRunner:
                 return False
             if not self._opened:
                 return False
+            if self.is_ai_add_on:
+                # 模版1「AI智能加仓」：没持仓就结束任务。
+                # 走统一判定：hub 的 GONE 是「连续多轮读不到持仓」的确认，
+                # 但「从没观察到过持仓」时（GONE 由 finish_on_empty 触发）
+                # 还要过宽限期，避免把刚下的首单误判成已平光。
+                return await self._maybe_finish_on_empty(
+                    list(event.positions), confirmed=True,
+                )
             # 默认 positions_cleared 时查成交历史，区分止损 / 止盈 / 人工
             if self._stop_reason == close_reason.DEFAULT_CLEAR_REASON:
                 await self._resolve_passive_close_reason()
@@ -846,6 +911,13 @@ class StrategyRunner:
 
         positions = list(event.positions)
         self._pending_orders = len(event.orders)
+        if positions and self.is_ai_add_on:
+            # 终端里真的见到过这个任务的持仓了。
+            # 记下来是为了区分「持仓归零（已平光）」和「还没反映到终端」：
+            # 只有确认见过持仓，之后读到空仓才谈得上收口。
+            self._saw_position = True
+            # 之前记着的空仓轮数作废：刚才这拍是有持仓的
+            self._empty_streak = 0
         if self.limit_entry and positions and not self._opened:
             # 挂单成交了：此刻才算真正开仓，之后无持仓无挂单就可以判收口
             self._opened = True
@@ -864,6 +936,10 @@ class StrategyRunner:
             if await self._grid_advance(event, positions):
                 return True
         elif not positions:
+            # 模版1「AI智能加仓」：没持仓就结束任务，并撤掉盘上的残留挂单。
+            # 放在最前面：这条规则优先于底仓没了之后的其它处理。
+            if await self._maybe_finish_on_empty(positions):
+                return True
             if self.limit_entry:
                 # 挂单未成交期间也要把上次没挂上的档补齐，否则要等成交后才补
                 if await self._risk_advance(event, positions):
@@ -2067,6 +2143,7 @@ class StrategyRunner:
             return False
 
         self._opened = True
+        self._opened_at = time.time()
         self.total_orders += 1
         self.total_volume += self.base_volume
         await self._emit_progress(
@@ -4782,6 +4859,92 @@ class StrategyRunner:
             logger.debug("task %s read pending orders failed", self.task_id, exc_info=True)
             return None
         return None if rows is None else list(rows)
+
+    async def _maybe_finish_on_empty(
+        self, positions: list[dict], *, confirmed: bool = False,
+    ) -> bool:
+        """模版1「AI智能加仓」专属：**没持仓就自动结束任务**。
+
+        返回 True 表示任务已收口（调用方应停止处理本拍）。
+
+        为什么只有模版1 有这条规则：
+        - 模版1 的加仓是**在现有持仓上叠**（逆势挂限价 / 顺势市价加）。
+          没有持仓时加仓无从谈起，继续跑只会留下一堆没人管的挂单，
+          它们随时可能在不该成交的时候成交成一笔孤儿仓。
+        - 网格（模版3）空仓是正常运行态（等触发价 / 等回落），不能套用。
+        - 以损定量（模版2）限价开仓时，成交前本来就没有持仓，不能套用。
+
+        `confirmed=True` 表示 hub 已经确认「连续多轮读不到持仓」（GONE 事件）；
+        `confirmed=False` 表示只是这一拍读到空仓，由本方法自己数连续轮数。
+
+        判定用「连续 N 轮空仓」而不是单拍，容忍 MT5 偶发返回不完整持仓。
+        计数**自己做**而不只依赖 hub 的 GONE：hub 只有在观察到过持仓之后才会
+        派发 GONE，「持仓在节点连上前就被平掉」这种场景它永远观察不到，
+        任务就会一直挂着等服务端对账才收口。
+
+        前置条件（否则不动，避免把刚开的任务误收掉）：
+        1. 确实开过仓（`_opened`）——首单还没成交时不算空仓。
+        2. 要么在终端里真的见过持仓（`_saw_position`），要么是**重连续跑**
+           （`_resumed`）——后者允许「从没在这台节点上见过持仓」，
+           因为持仓可能是节点离线期间被平掉的。
+        3. 没见过持仓也不是重连续跑时，给首单一个宽限期：刚下的市价单
+           可能还没反映到终端（`_empty_grace`），不能立刻判收口。
+        """
+        if not self.is_ai_add_on:
+            return False
+        if positions:
+            self._empty_streak = 0
+            self._saw_position = True
+            return False
+        # 首单还没成交（MT5 还没反映出持仓）：那几拍不算空仓。
+        # 误判成「已全平」会把刚开的任务直接收掉。
+        if not self._opened:
+            return False
+
+        seen_before = self._saw_position or self._resumed
+        if not seen_before:
+            # 还没在这台节点上见过持仓：给首单一个宽限期，
+            # 让终端把刚下的市价单反映出来。过了宽限期仍然空仓，
+            # 说明首单刚成交就被平掉了（止损打得太快），同样要收口。
+            elapsed = time.time() - self._opened_at
+            if elapsed < self._empty_grace:
+                logger.debug(
+                    "task %s no position yet (%.1fs since open), waiting for grace",
+                    self.task_id, elapsed,
+                )
+                return False
+
+        if confirmed:
+            # hub 已经确认「连续多轮读不到持仓」，不用再数
+            self._empty_streak = max(self._empty_streak, _EMPTY_CONFIRM)
+        else:
+            self._empty_streak += 1
+            if self._empty_streak < _EMPTY_CONFIRM:
+                logger.debug(
+                    "task %s empty position %d/%d, holding judgement",
+                    self.task_id, self._empty_streak, _EMPTY_CONFIRM,
+                )
+                return False
+
+        # 连着几轮都没有持仓了：结束任务。先把盘上的挂单撤掉 ——
+        # 那些单是「在旧持仓上继续加仓」的挂单，持仓没了它们就没有意义，
+        # 留在盘上就是没人管的孤儿单。
+        reason = self._stop_reason or close_reason.DEFAULT_CLEAR_REASON
+        if reason == close_reason.DEFAULT_CLEAR_REASON:
+            # 被动全平（止损 / 止盈 / 人工）：查成交历史换成中文原因
+            await self._resolve_passive_close_reason()
+            reason = self._stop_reason
+        logger.info(
+            "task %s no position left (%d consecutive empty rounds), finishing: %s",
+            self.task_id, self._empty_streak, reason,
+        )
+        if not await self._cleanup_pending_before_finish(reason=reason):
+            # 撤不干净就不报终态：交给停止流程（_close_all）重试，
+            # 绝不带着残留挂单收口。
+            self._stopping = True
+            return False
+        await self._finish("done", reason)
+        return True
 
     async def _cleanup_pending_before_finish(self, *, reason: str) -> bool:
         """收口前把本魔术号下残留的挂单撤掉。返回是否已确认撤干净。

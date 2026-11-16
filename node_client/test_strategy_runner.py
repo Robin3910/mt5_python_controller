@@ -460,6 +460,257 @@ async def test_gone_cancels_counter_limit_before_finish():
     runner.cancel()
 
 
+# ------------------------------------------------------------------
+# 模版1「AI智能加仓」（tpl_1）专属规则：没持仓就自动结束任务并清理挂单
+#
+# 这条规则只有 tpl_1 有：它的加仓是在现有持仓上叠的，没有持仓时加仓
+# 无从谈起，继续挂着只会留下一堆没人管的挂单。网格（tpl_3）空仓是正常
+# 运行态，以损定量（tpl_2）的限价开仓在成交前本来就没有持仓。
+# ------------------------------------------------------------------
+
+def _tpl1_runner(sent: list, *, mt5=None, template_id: str = "tpl_1"):
+    return _runner(
+        sent, mt5=mt5,
+        strategy={"template_id": template_id, "rules": [counter_rule()]},
+    )
+
+
+async def test_tpl1_subscribes_with_finish_on_empty():
+    """只有 tpl_1 才让 hub 在「从未见过持仓」时也派发 GONE。"""
+    sent: list = []
+    runner, hub = _tpl1_runner(sent)
+    assert runner.is_ai_add_on is True
+    runner.start()
+    await _settle()
+    assert hub.sub is not None
+    assert hub.sub.finish_on_empty is True
+    runner.cancel()
+
+
+async def test_other_templates_do_not_subscribe_with_finish_on_empty():
+    """其它模版不能被这条规则带上：网格空仓是常态，限价开仓本来就没持仓。"""
+    sent: list = []
+    runner, hub = _tpl1_runner(sent, template_id="tpl_9")
+    assert runner.is_ai_add_on is False
+    runner.start()
+    await _settle()
+    assert hub.sub.finish_on_empty is False
+    runner.cancel()
+
+
+async def test_tpl1_finishes_when_position_disappears():
+    """持仓归零 → 任务自动收口，并把盘上的逆势限价挂单撤掉。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub = _tpl1_runner(sent, mt5=mt5)
+    runner.start()
+    await _settle()
+
+    open_px = mt5.positions_by_magic(MAGIC)[0]["price_open"]
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(mt5.positions_by_magic(MAGIC)),
+        price=open_px, point=0.01,
+    ))
+    await _settle()
+    assert len(mt5.pending_orders_by_magic(MAGIC)) == 1
+
+    # 持仓被止损打掉：hub 派发 GONE
+    mt5.clear_by_magic_with_reason(MAGIC, reason=4)
+    hub.sub.offer(mh.MarketEvent(kind=mh.GONE, symbol="XAUUSD", magic=MAGIC))
+    await _settle()
+
+    finished = _of_type(sent, "strategy_finished")
+    assert finished and finished[0]["status"] == "done"
+    # 挂单必须一起撤掉：留在盘上就是没人管的孤儿单
+    assert mt5.pending_orders_by_magic(MAGIC) == []
+    assert runner.done
+
+
+async def test_tpl1_finishes_on_empty_tick_without_gone():
+    """没有 GONE、只是读到空仓时也要收口（自己数连续空仓轮数）。
+
+    hub 的 GONE 只在「见过持仓」之后才派发；这里直接投空仓事件，
+    保证「没持仓就结束任务」这条规则不依赖 hub 的具体事件序列。
+    """
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub = _tpl1_runner(sent, mt5=mt5)
+    runner.start()
+    await _settle()
+
+    open_px = mt5.positions_by_magic(MAGIC)[0]["price_open"]
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(mt5.positions_by_magic(MAGIC)),
+        price=open_px, point=0.01,
+    ))
+    await _settle()
+    assert len(mt5.pending_orders_by_magic(MAGIC)) == 1
+
+    # 持仓没了，连着两拍读到空仓 → 收口
+    for _ in range(2):
+        hub.sub.offer(mh.MarketEvent(
+            kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+            positions=(), price=open_px, point=0.01,
+        ))
+        await _settle()
+
+    finished = _of_type(sent, "strategy_finished")
+    assert finished and finished[0]["status"] == "done"
+    assert mt5.pending_orders_by_magic(MAGIC) == []
+
+
+async def test_tpl1_needs_two_empty_rounds():
+    """单拍读到空仓不收口：MT5 偶发返回不完整持仓时要能自愈。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub = _tpl1_runner(sent, mt5=mt5)
+    runner.start()
+    await _settle()
+
+    open_px = mt5.positions_by_magic(MAGIC)[0]["price_open"]
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(mt5.positions_by_magic(MAGIC)),
+        price=open_px, point=0.01,
+    ))
+    await _settle()
+
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=(), price=open_px, point=0.01,
+    ))
+    await _settle()
+
+    assert not _of_type(sent, "strategy_finished")
+    assert not runner.done
+    runner.cancel()
+
+
+async def test_tpl1_resume_without_position_finishes_and_cleans_orders():
+    """重连恢复时持仓早已被平掉：任务要自己收口，并把残留挂单撤掉。
+
+    这是本规则最主要的价值：hub 只有在「见过持仓」之后才会派发 GONE，
+    持仓在节点离线期间被平掉的话它永远观察不到，任务会一直挂着，
+    挂单也会一直留在盘上。
+    """
+    sent: list = []
+    mt5 = MockMT5Client()
+    # 节点离线期间挂出的逆势限价，重连后还在盘上
+    mt5.place_pending_order(
+        "XAUUSD", "BUY", 0.1, 100.0, comment="R1D100", magic=MAGIC,
+    )
+    assert len(mt5.pending_orders_by_magic(MAGIC)) == 1
+
+    runner, hub = _tpl1_runner(sent, mt5=mt5)
+    runner.start(resume=True)
+    await _settle()
+
+    # 恢复后读到空仓：连续两轮才收口
+    for _ in range(2):
+        hub.sub.offer(mh.MarketEvent(
+            kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+            positions=(), price=100.0, point=0.01,
+        ))
+        await _settle()
+
+    finished = _of_type(sent, "strategy_finished")
+    assert finished and finished[0]["status"] == "done"
+    assert mt5.pending_orders_by_magic(MAGIC) == []
+    assert runner.done
+
+
+async def test_tpl1_resume_with_position_does_not_finish():
+    """恢复时持仓还在：绝不能误判成「已平光」。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    opened = mt5.place_market_order("XAUUSD", "BUY", 0.1, comment="S1", magic=MAGIC)
+    runner, hub = _tpl1_runner(sent, mt5=mt5)
+    runner.start(resume=True)
+    await _settle()
+
+    for _ in range(3):
+        hub.sub.offer(mh.MarketEvent(
+            kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+            positions=tuple(mt5.positions_by_magic(MAGIC)),
+            price=opened["price"], point=0.01,
+        ))
+        await _settle()
+
+    assert not _of_type(sent, "strategy_finished")
+    assert not runner.done
+    runner.cancel()
+
+
+async def test_non_tpl1_empty_positions_does_not_finish():
+    """没带模版1 标识的加仓任务不能被这条规则收口。"""
+    sent: list = []
+    mt5 = MockMT5Client()
+    runner, hub = _runner(sent, mt5=mt5)
+    assert runner.is_ai_add_on is False
+    runner.start()
+    await _settle()
+
+    open_px = mt5.positions_by_magic(MAGIC)[0]["price_open"]
+    hub.sub.offer(mh.MarketEvent(
+        kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+        positions=tuple(mt5.positions_by_magic(MAGIC)),
+        price=open_px, point=0.01,
+    ))
+    await _settle()
+
+    for _ in range(3):
+        hub.sub.offer(mh.MarketEvent(
+            kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+            positions=(), price=open_px, point=0.01,
+        ))
+        await _settle()
+
+    assert not _of_type(sent, "strategy_finished")
+    assert not runner.done
+    runner.cancel()
+
+
+async def test_grid_still_holds_when_empty():
+    """网格（tpl_3）空仓是正常运行态，不能被模版1 的规则带走。"""
+    sent: list = []
+    runner, hub, _ = _grid_runner(sent)
+    runner.start()
+    await _settle()
+
+    for _ in range(3):
+        hub.sub.offer(mh.MarketEvent(
+            kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+            positions=(), price=GRID_PRICE, point=0.01,
+        ))
+        await _settle()
+
+    assert not _of_type(sent, "strategy_finished")
+    assert not runner.done
+    runner.cancel()
+
+
+async def test_limit_entry_waits_for_fill_without_finishing():
+    """以损定量（tpl_2）的限价开仓：成交前本来就没有持仓，不能收口。"""
+    sent: list = []
+    runner, hub, mt5 = _limit_runner(sent)
+    runner.start()
+    await _settle()
+
+    for _ in range(3):
+        hub.sub.offer(mh.MarketEvent(
+            kind=mh.TICK, symbol="XAUUSD", magic=MAGIC,
+            positions=(), price=LIMIT_PRICE, point=0.01,
+            orders=tuple(mt5.pending_orders_by_magic(MAGIC)),
+        ))
+        await _settle()
+
+    assert not _of_type(sent, "strategy_finished")
+    assert not runner.done
+    runner.cancel()
+
+
 async def test_resume_adopts_existing_counter_limit():
     """重连认领已有的逆势限价，不另挂第二张。"""
     sent: list = []
