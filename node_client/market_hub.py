@@ -343,6 +343,29 @@ class MarketHub:
     # ------------------------------------------------------------------
     # MT5 访问
     # ------------------------------------------------------------------
+    async def _books_trustworthy(self) -> bool:
+        """账本（持仓 / 挂单）当前是否可信。
+
+        终端与券商断联时，`positions_get` / `orders_get` 可能**成功**返回空集合
+        —— 终端此刻没有在线账户，「没有持仓」是「读不到在线账户」造成的假象。
+        把它当成真空仓，策略监控会误发 GONE、任务被提前收口，盘上还活着的
+        仓位变成没人管的孤儿仓。
+
+        这个判断**现读**终端状态，不走链路状态机的去抖：去抖口径要连续 3 次
+        读到断开才认离线（1 秒一轮 → 约 3 秒），而误收口只要连续 2 轮空仓
+        就发生（0.5 秒一轮 → 1 秒）—— 等去抖判离线时任务早就收掉了。
+
+        客户端没有这个能力（旧版客户端）时按**可信**处理，保持原有行为。
+        """
+        reader = getattr(self._mt5, "books_trustworthy", None)
+        if reader is None:
+            return True
+        try:
+            return bool(await self._exec(reader))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("hub books trust check failed: %s", e)
+            return False
+
     async def _read_positions(self) -> tuple[bool, list[dict]]:
         """读全部持仓。返回 (是否读到, 持仓)，失败与「确实为空」必须能区分开。"""
         try:
@@ -352,7 +375,13 @@ class MarketHub:
             return False, []
         if rows is None:
             return False, []
-        return True, list(rows)
+        rows = list(rows)
+        if not rows and not await self._books_trustworthy():
+            # 断联时的假空仓：终端没有在线账户，空集合不代表「已平光」。
+            # 按「读不到」处理 → 整轮退化为 STALE，绝不派发 GONE。
+            logger.debug("hub read positions empty but link untrusted, treat as unreadable")
+            return False, []
+        return True, rows
 
     async def _read_orders(self) -> tuple[bool, list[dict]]:
         """读全部未成交挂单，口径与 _read_positions 一致。
@@ -370,7 +399,11 @@ class MarketHub:
             return False, []
         if rows is None:
             return False, []
-        return True, list(rows)
+        rows = list(rows)
+        if not rows and not await self._books_trustworthy():
+            # 同 _read_positions：断联时的空挂单是假象，按「读不到」处理
+            return False, []
+        return True, rows
 
     async def _read_quotes(self, symbols: list[str]) -> dict[str, dict]:
         wanted = sorted({s for s in symbols if s})

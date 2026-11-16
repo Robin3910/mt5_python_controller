@@ -378,6 +378,18 @@ class NodeClient:
         if positions is None or orders is None:
             logger.warning("snapshot books returned None, skip report")
             return None
+        positions = list(positions)
+        orders = list(orders)
+        if not positions and not await self._books_trustworthy():
+            # 断联时的假空仓：终端没有在线账户，positions_get 会**成功**返回
+            # 空集合。这时上报空账本，服务端会把它当成「已平光」而自动收口
+            # 任务 —— 盘上还活着的仓位就没人管了。
+            # 按降级快照处理（books_ok=False）：保留上次快照、跳过对账。
+            #
+            # 只在持仓为空时判：持仓非空本身就是「账户在线」的证据
+            # （没有在线账户不可能有持仓），这时账本可信，照常上报。
+            logger.warning("snapshot books empty but link untrusted, report degraded")
+            return None
         quotes: dict = {}
         prices: dict = {}
         try:
@@ -399,8 +411,8 @@ class NodeClient:
             logger.debug("snapshot account_info failed: %s", e)
         return {
             "account": account,
-            "positions": list(positions),
-            "orders": list(orders),
+            "positions": positions,
+            "orders": orders,
             "quotes": quotes,
             "prices": prices,
             "server_time_offset": offset,
@@ -408,6 +420,22 @@ class NodeClient:
             "mt5_link": self._link_state(),
             "mt5_link_at": time.time(),
         }
+
+    async def _books_trustworthy(self) -> bool:
+        """账本（持仓 / 挂单）当前是否可信：终端必须与券商连通。
+
+        断联时 positions_get / orders_get 可能**成功**返回空集合 ——
+        「没有持仓」只是「读不到在线账户」的假象。客户端没有这个能力
+        （旧版客户端）时按**可信**处理，保持原有行为。
+        """
+        reader = getattr(self.mt5, "books_trustworthy", None)
+        if reader is None:
+            return True
+        try:
+            return bool(await self._exec(reader))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("snapshot books trust check failed: %s", e)
+            return False
 
     async def _pending_orders(self) -> list[dict]:
         """读未成交挂单。读失败抛错，由快照路径跳过上报，避免空挂单被对账当成已撤。"""

@@ -891,6 +891,15 @@ class StrategyRunner:
                 return await self._maybe_finish_on_empty(
                     list(event.positions), confirmed=True,
                 )
+            # 收口前最后一次确认账本可信：断联时 positions_get 可能**成功**返回
+            # 空集合，那是「读不到在线账户」的假象，不是「已平光」。不确认就收口，
+            # 会把还活着的仓位判成已清空（真实发生过：断联 1 秒 → 任务报 done /
+            # positions_cleared，而 MT5 里仓位原封不动）。宁可多等几轮。
+            if not await self._books_trustworthy():
+                logger.warning(
+                    "task %s gone but link untrusted, keep waiting", self.task_id,
+                )
+                return False
             # 默认 positions_cleared 时查成交历史，区分止损 / 止盈 / 人工
             if self._stop_reason == close_reason.DEFAULT_CLEAR_REASON:
                 await self._resolve_passive_close_reason()
@@ -4839,6 +4848,24 @@ class StrategyRunner:
             "enabled_rule_count": self._enabled_rule_count(),
         }
 
+    async def _books_trustworthy(self) -> bool:
+        """账本（持仓 / 挂单）当前是否可信：终端必须与券商连通。
+
+        断联时 `positions_get` 可能**成功**返回空集合 —— 终端此刻没有在线
+        账户，「没有持仓」只是「读不到在线账户」的假象。收口判定必须先确认
+        账本可信，否则会把还活着的仓位判成已清空。
+
+        客户端没有这个能力（旧版客户端）时按**可信**处理，保持原有行为。
+        """
+        reader = getattr(self._mt5, "books_trustworthy", None)
+        if reader is None:
+            return True
+        try:
+            return bool(await self._exec(reader))
+        except Exception:  # noqa: BLE001
+            logger.debug("task %s books trust check failed", self.task_id, exc_info=True)
+            return False
+
     async def _magic_positions(self) -> Optional[list[dict]]:
         """读该魔术号当前持仓；读失败返回 None——「读不到」不等于「已平光」。"""
         try:
@@ -4929,6 +4956,18 @@ class StrategyRunner:
         # 连着几轮都没有持仓了：结束任务。先把盘上的挂单撤掉 ——
         # 那些单是「在旧持仓上继续加仓」的挂单，持仓没了它们就没有意义，
         # 留在盘上就是没人管的孤儿单。
+        #
+        # 收口前最后一次确认账本可信：断联时 positions_get 可能**成功**返回空集，
+        # 那是「读不到在线账户」的假象，不是「已平光」。不确认就收口，会把还活着
+        # 的仓位判成已清空（真实发生过：断联 1 秒 → 任务报 done / positions_cleared，
+        # 而 MT5 里仓位原封不动）。宁可多等几轮。
+        if not await self._books_trustworthy():
+            logger.warning(
+                "task %s empty book but link untrusted, keep waiting (streak=%d)",
+                self.task_id, self._empty_streak,
+            )
+            self._empty_streak = 0
+            return False
         reason = self._stop_reason or close_reason.DEFAULT_CLEAR_REASON
         if reason == close_reason.DEFAULT_CLEAR_REASON:
             # 被动全平（止损 / 止盈 / 人工）：查成交历史换成中文原因
@@ -5090,8 +5129,19 @@ class StrategyRunner:
                 left = len(held) + len(resting)
                 self._pending_orders = len(resting)
                 if not left:
-                    await self._finish("done", self._stop_reason)
-                    return True
+                    # 断联时 positions_by_magic 会**成功**返回空集合 —— 那是
+                    # 「读不到在线账户」的假象，不是「已经平干净了」。这时报
+                    # done 等于把还活着的仓位判成已清空（服务端会清零持仓数
+                    # 并释放节点占位，这批仓位就再没人负责了）。
+                    # 账本不可信时不能收口：继续重试，等链路恢复。
+                    if not await self._books_trustworthy():
+                        logger.warning(
+                            "task %s close-all: books empty but link untrusted, retry",
+                            self.task_id,
+                        )
+                    else:
+                        await self._finish("done", self._stop_reason)
+                        return True
                 # 平仓前先记下浮盈，成交历史查询失败时作为回退
                 self._last_floating_profit = round(
                     sum(_as_float(p.get("profit")) for p in held), 2,

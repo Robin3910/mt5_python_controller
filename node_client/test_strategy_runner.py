@@ -147,6 +147,40 @@ async def test_gone_event_finishes_task():
     assert runner.done
 
 
+async def test_gone_event_does_not_finish_task_when_link_untrusted():
+    """断联时的空仓是假象：GONE 到达时账本不可信就不能收口。
+
+    断联时 positions_get 会**成功**返回空集合，hub 可能据此派发 GONE。
+    此刻终端与券商没连着，终端里活着的仓位只是读不到 —— 收口就把它变成
+    没人管的孤儿仓。宁可多等几轮。
+    """
+    sent: list = []
+    mt5 = MockMT5Client()
+    mt5.connected = True
+    mt5.link_connected = True
+    runner, hub = _runner(sent, mt5=mt5)
+    runner.start()
+    await _settle(10)
+    assert mt5.positions_by_magic(MAGIC), "首单没有成交"
+
+    # 断联：终端里活着的仓位读不到了（positions_get 成功返回空集合）
+    mt5.link_connected = False
+    hub.sub.offer(mh.MarketEvent(kind=mh.GONE, symbol="XAUUSD", magic=MAGIC))
+    await _settle(10)
+
+    assert not _of_type(sent, "strategy_finished")
+    assert not runner.done
+
+    # 链路恢复后，同样的 GONE 照常收口（防护不能把规则改废）
+    mt5.link_connected = True
+    hub.sub.offer(mh.MarketEvent(kind=mh.GONE, symbol="XAUUSD", magic=MAGIC))
+    await _settle(10)
+
+    finished = _of_type(sent, "strategy_finished")
+    assert finished and finished[0]["status"] == "done"
+    assert runner.done
+
+
 async def test_gone_event_reports_stop_loss_reason_from_deals():
     """被动全平：从成交历史识别止损打掉，不再只报 positions_cleared。"""
     sent: list = []

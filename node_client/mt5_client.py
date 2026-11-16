@@ -605,6 +605,35 @@ class MT5Client:
         self._link_at = time.time()
         return self._link_state
 
+    def books_trustworthy(self) -> bool:
+        """账本（持仓 / 挂单）当前是否可信：终端必须与券商连通。
+
+        为什么需要这一层：终端与券商断连时，`positions_get` / `orders_get`
+        可能**成功**返回空集合 —— 终端此刻没有在线账户，「没有持仓」是
+        「读不到在线账户」造成的假象。把这种假空仓当成真空仓，策略监控会
+        误发 GONE、任务被提前收口，盘上还在的仓位就变成没人管的孤儿仓
+        （历史上已经因此误收口过：断联 2 秒 → 任务报 done / positions_cleared）。
+
+        这里**现读**一次 `terminal_info()`，不走链路状态机的去抖：去抖口径要
+        连续 3 次读到断开才认离线（1 秒一轮 → 3 秒），而误收口只要连续 2 轮
+        空仓就发生（0.5 秒一轮 → 1 秒）—— 等去抖判离线时任务早就收掉了。
+        读不到（`terminal_info()` 返回 None / 抛异常）按**不可信**处理：
+        宁可多等几轮，也不能把还活着的仓位判成已平光。
+
+        注意本方法只回答「这份账本可不可信」，不回答「有没有仓位」：
+        有仓位时账本本身就是证据，不需要额外判断。
+        """
+        if mt5 is None or not self.connected:
+            return False
+        info = None
+        try:
+            info = mt5.terminal_info()
+        except Exception:  # noqa: BLE001
+            logger.debug("terminal_info failed while checking book trust", exc_info=True)
+            return False
+        # connected is None = 读不到链路状态，同样按不可信处理
+        return connected_from_terminal(info) is True
+
     def link_state(self) -> str:
         """当前链路状态（不重新采样）。"""
         return self._link_state

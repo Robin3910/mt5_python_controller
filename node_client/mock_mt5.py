@@ -175,6 +175,18 @@ class MockMT5Client:
             "link_state": self._advance_link_state(connected),
         }
 
+    def books_trustworthy(self) -> bool:
+        """账本（持仓 / 挂单）当前是否可信：终端必须与券商连通。
+
+        真实客户端现读 `terminal_info().connected`：断联时 positions_get 会
+        **成功**返回空集合（「没有在线账户」），不能当成真空仓。
+
+        测试用：把 self.link_connected 置 False 模拟断联 → 账本不可信；
+        置 None 模拟「读不到链路状态」→ 同样不可信。
+        """
+        connected = getattr(self, "link_connected", True)
+        return connected is True
+
     def _advance_link_state(self, connected: object) -> str:
         """状态机推进（纯逻辑，不做 IPC）。"""
         if connected is None:
@@ -251,6 +263,12 @@ class MockMT5Client:
 
     def positions(self) -> list[dict]:
         self._settle_pending()
+        if getattr(self, "link_connected", True) is False:
+            # 明确断联时终端没有在线账户：positions_get 会**成功**返回空集合。
+            # 模拟真实行为（否则测不出「假空仓」这条路径）。
+            # 只在「明确断开」时模拟；读不到链路状态（None）不模拟，
+            # 那是另一种不确定，不该直接抹掉账本。
+            return []
         return [dict(p) for p in self._positions]
 
     def server_time_offset_sec(self) -> int:
