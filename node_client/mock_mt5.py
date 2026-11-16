@@ -73,14 +73,86 @@ class MockMT5Client:
         self._link_offline_hits = 0
         self._link_online_hits = 0
         self._link_at = 0.0
+        # 终端进程是否在跑（用户开关 MT5）
+        self._terminal_alive = True
+        # IPC 绑定是否还有效：终端进程没了 → 绑定失效；
+        # 进程还在但刚启动没就绪 → 绑定也可能失效（break_ipc）。
+        # 注意与 self.connected 区分：connected 是 Python 侧的「我以为我连着」
+        # 标志位，真实客户端里进程死了它仍然是 True。
+        self._ipc_ok = True
 
     def connect(self) -> bool:
         self.connected = True
+        self._ipc_ok = True
         logger.info("MOCK MT5 connected (login=%s server=%s)", self.login, self.server)
         return True
 
     def disconnect(self) -> None:
         self.connected = False
+        self._ipc_ok = False
+
+    @property
+    def terminal_alive(self) -> bool:
+        """MT5 终端**进程**是否在跑。
+
+        与「IPC 绑定还有效」是两件事：
+        - 进程没了 → 进程不在，且绑定必然失效；
+        - 进程还在但绑定断了 → 附不上（刚启动还没就绪）。
+
+        测试直接开关这个属性来模拟「用户把 MT5 关了 / 开了」。
+        """
+        return self._terminal_alive
+
+    @terminal_alive.setter
+    def terminal_alive(self, value: bool) -> None:
+        self._terminal_alive = bool(value)
+        if not value:
+            # 进程没了 → IPC 绑定随之失效（真实客户端就是这样：
+            # self.connected 这个 Python 侧标志位仍然是 True，坏的只是绑定）
+            self._ipc_ok = False
+
+    def break_ipc(self) -> None:
+        """模拟「进程还在，但绑定断了」（终端刚启动还没就绪）。"""
+        self._ipc_ok = False
+
+    @property
+    def ipc_ok(self) -> bool:
+        """IPC 绑定还有效吗（真实客户端里 terminal_info() 能不能读通）。"""
+        return self._ipc_ok
+
+    def reconnect(self) -> bool:
+        """模拟「终端进程重启后重新附着」。
+
+        与真实客户端同形状：先拆掉旧绑定，再重新附着。
+
+        测试开关：
+        - `terminal_alive=False` → 终端进程没了（用户把 MT5 关了）；
+        - `terminal_attach_fails=True` → 终端在，但暂时附不上（刚启动、
+          还没连上券商），重连会失败。
+        """
+        self.reconnect_calls = getattr(self, "reconnect_calls", 0) + 1
+        # 终端还没起来时重连失败：模拟用户还没重开 MT5。
+        if not self._terminal_alive:
+            return False
+        # 终端在但附不上：模拟终端刚启动、还没就绪。
+        if getattr(self, "terminal_attach_fails", False):
+            return False
+        self.connected = True
+        self._ipc_ok = True
+        # 重新附着后链路状态机复位（旧进程的状态对新进程没有意义）
+        self._link_state = mt5_client.LINK_ONLINE
+        self._link_offline_hits = 0
+        self._link_online_hits = 0
+        self._link_at = 0.0
+        logger.info("MOCK MT5 reattached (login=%s)", self.login)
+        return True
+
+    def terminal_process_running(self) -> bool | None:
+        """终端进程是否在跑。None = 探不到。
+
+        测试用 `terminal_alive` 开关模拟「用户把 MT5 关了 / 开了」。
+        """
+        return bool(self._terminal_alive)
 
     def algo_trading_allowed(self) -> bool | None:
         return getattr(self, "trade_allowed", True)
@@ -93,6 +165,12 @@ class MockMT5Client:
 
         测试用：把 self.link_connected 置 False 模拟终端与券商断连，
         置 None 模拟「读不到链路状态」（IPC 抖动 / 终端进程异常）。
+        把 self.terminal_alive 置 False 模拟**终端进程消失**（MT5 被关掉）。
+
+        `alive` 与真实客户端同义：**IPC 绑定还有效吗**。
+        真实客户端里它是「绑定还在且 terminal_info() 读得到」——
+        终端进程没了就返回 False。注意 `self.connected` 在终端进程消失后
+        **仍然是 True**（那是 Python 侧的标志位），失效的只是 IPC 绑定。
         """
         connected = getattr(self, "link_connected", True)
         # 保持 None 的原样：None = 读不到，与 False（明确断开）是两件事
@@ -100,8 +178,21 @@ class MockMT5Client:
         return {
             "connected": connected,
             "trade_allowed": self.algo_trading_allowed(),
+            "alive": bool(self._ipc_ok),
             "link_state": self._advance_link_state(connected),
         }
+
+    def books_trustworthy(self) -> bool:
+        """账本（持仓 / 挂单）当前是否可信：终端必须与券商连通。
+
+        真实客户端现读 `terminal_info().connected`：断联时 positions_get 会
+        **成功**返回空集合（「没有在线账户」），不能当成真空仓。
+
+        测试用：把 self.link_connected 置 False 模拟断联 → 账本不可信；
+        置 None 模拟「读不到链路状态」→ 同样不可信。
+        """
+        connected = getattr(self, "link_connected", True)
+        return connected is True
 
     def _advance_link_state(self, connected: object) -> str:
         """状态机推进（纯逻辑，不做 IPC）。"""
@@ -179,6 +270,14 @@ class MockMT5Client:
 
     def positions(self) -> list[dict]:
         self._settle_pending()
+        if getattr(self, "link_connected", True) is False:
+            # 明确断联时终端没有在线账户：positions_get 会**成功**返回空集合。
+            # 模拟真实行为（否则测不出「假空仓」这条路径）。
+            # 只在「明确断开」时模拟；读不到链路状态（None）不模拟，
+            # 那是另一种不确定，不该直接抹掉账本。
+            # 断联时也不做 SL/TP 自动平仓结算：连不上券商，止盈止损不会触发，
+            # 否则链路一恢复持仓就凭空消失了。
+            return []
         self._settle_sl_tp()
         return [dict(p) for p in self._positions]
 

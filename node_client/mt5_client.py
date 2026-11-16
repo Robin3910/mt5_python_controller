@@ -15,9 +15,12 @@
 order_send，不靠多线程并行发单。
 """
 import logging
+import os
 import time
 from typing import Optional
 
+import mt5_discover
+import process_probe
 from deal_types import (  # noqa: F401  （转出，供既有调用方继续从这里取）
     DEAL_TYPE_BALANCE,
     DEAL_TYPE_BUY,
@@ -434,10 +437,86 @@ class MT5Client:
             mt5.shutdown()
         self.connected = False
 
+    def reconnect(self) -> bool:
+        """终端进程重启后重新附着到 MT5。
+
+        场景：用户直接关掉 MT5 再打开。`MetaTrader5` 这个 C 扩展绑定的是
+        **当初那个终端进程**——进程没了之后，所有 IPC 调用（terminal_info /
+        positions_get / order_send）要么抛异常、要么静默返回 None。
+        只调 `connect()` 是不够的：它会再次 `initialize`，而 `initialize`
+        对同一个终端路径是幂等的，不会重新附着到新起的进程上。
+
+        所以这里先 `shutdown()` 拆掉旧绑定，再 `initialize` 重新附着。
+
+        **绝不擅自把终端拉起来**：按 MQL5 官方文档，`initialize()` 在终端
+        没运行时会自动启动它。但用户手动关掉 MT5 通常就是想停止交易，
+        节点擅自重开就违背了意图 —— 终端一开、策略就可能立刻下单。
+        所以这里自己先确认终端进程确实在跑，没在跑就直接放弃（返回 False），
+        等用户把 MT5 开回来之后由看门狗再调一次。
+
+        复用终端会话模式（reuse_terminal_session）下不重新登录：
+        新起的终端进程仍保留着登录状态，`account_info()` 能直接读到登录号。
+        非复用模式（保存了账号密码）则走正常登录流程。
+        """
+        if mt5 is None:
+            raise MT5Error("MetaTrader5 package not available on this host")
+
+        # 安全闸门：终端进程不在就别 initialize —— initialize 会把终端启动起来。
+        # 探不到进程状态（None）时不拦：拦了就永远恢复不了，
+        # 而 initialize 在终端已在跑时只是附着，不会启动它。
+        running = self.terminal_process_running()
+        if running is False:
+            logger.info(
+                "MT5 terminal process not running; skip reattach "
+                "(waiting for the user to start it)"
+            )
+            return False
+
+        # 先拆掉指向旧进程的绑定：不 shutdown 的话 initialize 可能复用旧连接，
+        # 结果是连上了已经死掉的那个进程。
+        try:
+            mt5.shutdown()
+        except Exception:  # noqa: BLE001
+            logger.debug("mt5.shutdown before reconnect failed", exc_info=True)
+        self.connected = False
+        # 链路状态机复位：旧进程的状态对新进程没有意义，
+        # 不复位的话「已离线」的判定会一直挂着，直到连续读够两次在线。
+        self._link_state = LINK_ONLINE
+        self._link_offline_hits = 0
+        self._link_online_hits = 0
+        self._link_at = 0.0
+        return self.connect()
+
     def ensure(self) -> None:
         """所有交易/查询前的连接断言。"""
         if mt5 is None or not self.connected:
             raise MT5Error("MT5 not connected")
+
+    def terminal_process_running(self) -> bool | None:
+        """MT5 终端进程是否在运行。None = 探不到（当前平台不支持）。
+
+        用途：重连之前必须确认「用户自己把终端开回来了」。
+        `mt5.initialize()` 在终端没跑的时候会**自动把它拉起来**（MQL5 官方
+        文档），而用户手动关掉 MT5 通常就是想停止交易 —— 节点擅自重开就
+        违背了意图，终端一开策略就可能立刻下单。
+
+        探到终端进程在跑，initialize() 就只是「附着」而不是「启动」。
+        """
+        return process_probe.process_running(self.terminal_exe_names())
+
+    def terminal_exe_names(self) -> list[str]:
+        """本客户端可能对应的终端可执行文件名（小写）。
+
+        同一台机器上可能装了多个券商终端，用「同一个 exe 名」判断会把
+        别的券商终端当成自己的 —— 那种情况下宁可不去重连。
+        """
+        names: list[str] = []
+        path = (self.path or "").strip()
+        if path:
+            names.append(os.path.basename(path).lower())
+        if not names:
+            names.extend(n.lower() for n in mt5_discover.TERMINAL_NAMES)
+        return names
 
     # ------------------------- 查询 -------------------------
     def algo_trading_allowed(self) -> bool | None:
@@ -448,26 +527,36 @@ class MT5Client:
 
     # ---------------------- 链路状态（终端 ↔ 券商）----------------------
     def terminal_status(self) -> dict:
-        """一次 terminal_info() 读出两个字段：链路连通性与算法交易开关，
-        并顺带推进链路状态机。
+        """一次 terminal_info() 读出三个字段：链路连通性、算法交易开关、
+        以及**终端进程是否还在**，并顺带推进链路状态机。
 
         只调一次：terminal_info() 是 IPC 调用，在 MT5 专用线程上排队执行，
-        多调一次就多占一次执行器槽位。这里的两个字段必须来自**同一次**读，
+        多调一次就多占一次执行器槽位。这里的字段必须来自**同一次**读，
         否则会出现「链路是旧的、开关是新的」这种自相矛盾的组合。
+
+        `alive` 用来区分两种「读不到」：
+        - 终端进程死了：terminal_info() 返回 None 或抛异常，绑定已经失效；
+        - 终端还在，只是这一次读不到（IPC 抖动）。
+
+        两者在 connected 上都表现为 None，只有 alive 能分开——节点据此判断
+        要不要重新附着到终端（见 node_client._terminal_watchdog）。
 
         状态机在这一并推进，调用方就不必再调一次 terminal_link_state ——
         那会变成第二次 IPC 往返，白白多占一个执行器槽位。
         """
         info = None
+        alive = False
         if mt5 is not None and self.connected:
             try:
                 info = mt5.terminal_info()
             except Exception:  # noqa: BLE001
                 info = None
+            alive = info is not None
         connected = connected_from_terminal(info)
         return {
             "connected": connected,
             "trade_allowed": trade_allowed_from_terminal(info),
+            "alive": alive,
             "link_state": self._advance_link_state(connected),
         }
 
@@ -515,6 +604,35 @@ class MT5Client:
                 self._link_state = LINK_OFFLINE
         self._link_at = time.time()
         return self._link_state
+
+    def books_trustworthy(self) -> bool:
+        """账本（持仓 / 挂单）当前是否可信：终端必须与券商连通。
+
+        为什么需要这一层：终端与券商断连时，`positions_get` / `orders_get`
+        可能**成功**返回空集合 —— 终端此刻没有在线账户，「没有持仓」是
+        「读不到在线账户」造成的假象。把这种假空仓当成真空仓，策略监控会
+        误发 GONE、任务被提前收口，盘上还在的仓位就变成没人管的孤儿仓
+        （历史上已经因此误收口过：断联 2 秒 → 任务报 done / positions_cleared）。
+
+        这里**现读**一次 `terminal_info()`，不走链路状态机的去抖：去抖口径要
+        连续 3 次读到断开才认离线（1 秒一轮 → 3 秒），而误收口只要连续 2 轮
+        空仓就发生（0.5 秒一轮 → 1 秒）—— 等去抖判离线时任务早就收掉了。
+        读不到（`terminal_info()` 返回 None / 抛异常）按**不可信**处理：
+        宁可多等几轮，也不能把还活着的仓位判成已平光。
+
+        注意本方法只回答「这份账本可不可信」，不回答「有没有仓位」：
+        有仓位时账本本身就是证据，不需要额外判断。
+        """
+        if mt5 is None or not self.connected:
+            return False
+        info = None
+        try:
+            info = mt5.terminal_info()
+        except Exception:  # noqa: BLE001
+            logger.debug("terminal_info failed while checking book trust", exc_info=True)
+            return False
+        # connected is None = 读不到链路状态，同样按不可信处理
+        return connected_from_terminal(info) is True
 
     def link_state(self) -> str:
         """当前链路状态（不重新采样）。"""

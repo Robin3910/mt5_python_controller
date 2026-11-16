@@ -44,6 +44,13 @@ class NodeSettings(BaseSettings):
     strategy_idle_interval: float = 5.0     # 无变化时的保活事件间隔
     strategy_empty_confirm: int = 2         # 判定持仓已全平所需的连续确认轮数
 
+    # 终端看门狗：MT5 被关掉再打开后，节点自己重新附着上去（免重启节点）
+    terminal_watch_enabled: bool = True     # 关掉后节点不再自动重新附着终端
+    terminal_watch_interval: float = 2.0    # 探测间隔（秒）
+    terminal_watch_confirm: int = 3         # 连续几轮读不到才判终端已死
+    terminal_reconnect_min: float = 3.0     # 重连退避下限（秒）
+    terminal_reconnect_max: float = 60.0    # 重连退避上限（秒）
+
     log_level: str = "INFO"
 
     # 历史成交采集（订单历史 / 带单绩效 / 概览盈亏统计的数据源）
