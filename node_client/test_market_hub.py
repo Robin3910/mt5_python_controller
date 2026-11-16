@@ -275,6 +275,89 @@ async def test_never_seen_positions_never_reports_gone():
     assert sub.seen is False
 
 
+# ---------------------------------------------------------------------------
+# finish_on_empty：只有模版1「AI智能加仓」用
+#
+# 该模版的规则是「没持仓就结束任务」，所以「从未观察到过持仓」也必须能收口：
+# 持仓可能在节点连上前就被平掉了，hub 永远观察不到它，不发 GONE 的话
+# 任务会一直挂着、挂单也会一直留在盘上。
+# ---------------------------------------------------------------------------
+
+async def test_finish_on_empty_reports_gone_without_ever_seen_position():
+    """从未见过持仓也要派发 GONE：覆盖「持仓在节点连上前就被平掉」。"""
+    mt5 = FakeMT5()
+    hub = _hub(mt5, empty_confirm=2)
+    sub = hub.subscribe(symbol="XAUUSD", magic=MAGIC, direction="BUY")
+    sub.finish_on_empty = True
+
+    await hub.sample()
+    assert await _next_or_none(sub) is None  # 第一轮空仓不作数
+
+    await hub.sample()
+    event = await sub.next_event()
+    assert event.kind == mh.GONE
+    assert event.positions == ()
+    assert sub.seen is False  # 确实从没观察到过持仓
+
+
+async def test_finish_on_empty_off_keeps_default_behaviour():
+    """默认关闭：没打开这个开关的订阅仍然要「见过持仓」才谈得上全平。"""
+    mt5 = FakeMT5()
+    hub = _hub(mt5, empty_confirm=1)
+    sub = hub.subscribe(symbol="XAUUSD", magic=MAGIC, direction="BUY")
+
+    for _ in range(5):
+        await hub.sample()
+
+    assert await _next_or_none(sub) is None
+
+
+async def test_finish_on_empty_still_reports_gone_after_being_seen():
+    """见过持仓后再清空：行为与原来一致，照样派发 GONE。"""
+    mt5 = FakeMT5()
+    mt5.add(ticket=1, magic=MAGIC)
+    hub = _hub(mt5, empty_confirm=1)
+    sub = hub.subscribe(symbol="XAUUSD", magic=MAGIC, direction="BUY")
+    sub.finish_on_empty = True
+
+    await hub.sample()
+    assert (await sub.next_event()).kind == mh.TICK
+
+    mt5.clear()
+    await hub.sample()
+    assert (await sub.next_event()).kind == mh.GONE
+
+
+async def test_finish_on_empty_read_failure_still_emits_stale():
+    """读不到持仓绝不能当成空仓：整轮退化为 STALE，空仓计数不前进。"""
+    mt5 = FakeMT5()
+    hub = _hub(mt5, interval=0.05, idle_interval=0.05, empty_confirm=1)
+    sub = hub.subscribe(symbol="XAUUSD", magic=MAGIC, direction="BUY")
+    sub.finish_on_empty = True
+
+    mt5.fail_positions = True
+    await asyncio.sleep(0.07)  # 越过 STALE 限流窗口
+    await hub.sample()
+
+    assert (await sub.next_event()).kind == mh.STALE
+    assert sub.empty_hits == 0
+
+
+async def test_hold_when_empty_takes_precedence_over_finish_on_empty():
+    """网格（hold_when_empty=True）优先：空仓是常态，绝不发 GONE。"""
+    mt5 = FakeMT5()
+    hub = _hub(mt5, empty_confirm=1)
+    sub = hub.subscribe(
+        symbol="XAUUSD", magic=MAGIC, direction="BUY", hold_when_empty=True,
+    )
+    sub.finish_on_empty = True
+
+    await hub.sample()
+    event = await sub.next_event()
+    assert event.kind == mh.TICK
+    assert event.positions == ()
+
+
 async def test_one_sample_serves_all_subscribers():
     mt5 = FakeMT5()
     mt5.add(ticket=1, magic=MAGIC)

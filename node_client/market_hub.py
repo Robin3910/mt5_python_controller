@@ -102,12 +102,20 @@ class Subscription:
 
     track_orders：限价开仓的任务在成交前只有挂单没有持仓，置 True 后本订阅会带上
     该魔术号的挂单，且挂单还在时不判 GONE。
+
+    finish_on_empty：**只有模版1「AI智能加仓」用**。该模版的规则是「没持仓就结束
+    任务」，所以即使从未观察到过持仓（首单成交后被立刻平掉、或重连时持仓早已
+    被平掉），也要照样派发 GONE 让执行器去收口。
+
+    默认关闭：绝大多数任务必须先观察到过持仓才谈得上「已全平」，
+    否则「首单还没反映到终端」会被误判成「已平光」。
     """
     symbol: str
     magic: int
     direction: str
     hold_when_empty: bool = False
     track_orders: bool = False
+    finish_on_empty: bool = False
 
     # —— 变更检测状态（仅 MarketHub 读写）——
     signature: tuple = ()
@@ -315,9 +323,12 @@ class MarketHub:
             if sub.hold_when_empty:
                 # 网格：空仓是常态（等待触发价 / 全部卖出后等回落），继续按价格变化派发
                 return self._price_event(sub, _signature([], []), price, now)
-            if not sub.seen:
+            if not sub.seen and not sub.finish_on_empty:
                 # 从未观察到过持仓或挂单：首单可能还没反映到终端，此时判全平会误收口，
                 # 真正的漏报交给服务端账户快照对账兜底
+                #
+                # finish_on_empty 的任务例外：它要的就是「没持仓就结束」，
+                # 等不到「曾经有过」这个前提。
                 return None
             sub.empty_hits += 1
             # 连续多轮确认为空才判全平，容忍 MT5 偶发返回不完整持仓
@@ -332,6 +343,29 @@ class MarketHub:
     # ------------------------------------------------------------------
     # MT5 访问
     # ------------------------------------------------------------------
+    async def _books_trustworthy(self) -> bool:
+        """账本（持仓 / 挂单）当前是否可信。
+
+        终端与券商断联时，`positions_get` / `orders_get` 可能**成功**返回空集合
+        —— 终端此刻没有在线账户，「没有持仓」是「读不到在线账户」造成的假象。
+        把它当成真空仓，策略监控会误发 GONE、任务被提前收口，盘上还活着的
+        仓位变成没人管的孤儿仓。
+
+        这个判断**现读**终端状态，不走链路状态机的去抖：去抖口径要连续 3 次
+        读到断开才认离线（1 秒一轮 → 约 3 秒），而误收口只要连续 2 轮空仓
+        就发生（0.5 秒一轮 → 1 秒）—— 等去抖判离线时任务早就收掉了。
+
+        客户端没有这个能力（旧版客户端）时按**可信**处理，保持原有行为。
+        """
+        reader = getattr(self._mt5, "books_trustworthy", None)
+        if reader is None:
+            return True
+        try:
+            return bool(await self._exec(reader))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("hub books trust check failed: %s", e)
+            return False
+
     async def _read_positions(self) -> tuple[bool, list[dict]]:
         """读全部持仓。返回 (是否读到, 持仓)，失败与「确实为空」必须能区分开。"""
         try:
@@ -341,7 +375,13 @@ class MarketHub:
             return False, []
         if rows is None:
             return False, []
-        return True, list(rows)
+        rows = list(rows)
+        if not rows and not await self._books_trustworthy():
+            # 断联时的假空仓：终端没有在线账户，空集合不代表「已平光」。
+            # 按「读不到」处理 → 整轮退化为 STALE，绝不派发 GONE。
+            logger.debug("hub read positions empty but link untrusted, treat as unreadable")
+            return False, []
+        return True, rows
 
     async def _read_orders(self) -> tuple[bool, list[dict]]:
         """读全部未成交挂单，口径与 _read_positions 一致。
@@ -359,7 +399,11 @@ class MarketHub:
             return False, []
         if rows is None:
             return False, []
-        return True, list(rows)
+        rows = list(rows)
+        if not rows and not await self._books_trustworthy():
+            # 同 _read_positions：断联时的空挂单是假象，按「读不到」处理
+            return False, []
+        return True, rows
 
     async def _read_quotes(self, symbols: list[str]) -> dict[str, dict]:
         wanted = sorted({s for s in symbols if s})

@@ -142,6 +142,12 @@ class NodeClient:
         # 算法交易按钮的最近一次读数。None 表示还没读到，面板不据此标红。
         self._algo_trading_allowed: bool | None = None
         self._algo_refresh_pending = False
+        # 终端看门狗状态（给本机状态口看）：
+        # _terminal_ok 绑定有效；_terminal_reconnecting 正在重新附着；
+        # _terminal_waiting 终端没在跑，等用户自己把 MT5 开回来。
+        self._terminal_ok = False
+        self._terminal_reconnecting = False
+        self._terminal_waiting = False
 
     def _schedule_algo_refresh(self) -> None:
         """在 MT5 专用线程上刷新算法交易开关，不阻塞状态口。"""
@@ -176,8 +182,19 @@ class NodeClient:
             "node_id": self.node_id,
             "mt5_login": self.expected_mt5_login,
             "algo_trading_allowed": self._algo_trading_allowed,
+            # 终端看门狗状态：attached=绑定有效；reconnecting=正在重新附着；
+            # waiting_terminal=终端没在跑，等用户自己把 MT5 开回来。
+            "mt5_terminal": self._terminal_state(),
             "runners": [r.status_dict() for r in self.runners.values()],
         }
+
+    def _terminal_state(self) -> str:
+        """终端看门狗的状态（给本机状态口看）。"""
+        if self._terminal_reconnecting:
+            return "reconnecting"
+        if self._terminal_waiting:
+            return "waiting_terminal"
+        return "attached" if self._terminal_ok else "unknown"
 
     def request_shutdown(self) -> None:
         """面板 POST /stop：置停止标志并关闭当前 WS，使主循环退出。"""
@@ -203,7 +220,17 @@ class NodeClient:
             await self._status_server.start(status_sock)
             await self._connect_mt5()
             self._ensure_hub()
-            await self._connect_loop()
+            # 终端看门狗与 WS 连接无关：MT5 被关掉再打开时，
+            # 不管 WS 断没断，节点都要能自己重新附着到终端上。
+            watchdog = (
+                asyncio.create_task(self._terminal_watchdog())
+                if settings.terminal_watch_enabled else None
+            )
+            try:
+                await self._connect_loop()
+            finally:
+                if watchdog is not None:
+                    watchdog.cancel()
         finally:
             if self._status_server is not None:
                 await self._status_server.close()
@@ -351,6 +378,18 @@ class NodeClient:
         if positions is None or orders is None:
             logger.warning("snapshot books returned None, skip report")
             return None
+        positions = list(positions)
+        orders = list(orders)
+        if not positions and not await self._books_trustworthy():
+            # 断联时的假空仓：终端没有在线账户，positions_get 会**成功**返回
+            # 空集合。这时上报空账本，服务端会把它当成「已平光」而自动收口
+            # 任务 —— 盘上还活着的仓位就没人管了。
+            # 按降级快照处理（books_ok=False）：保留上次快照、跳过对账。
+            #
+            # 只在持仓为空时判：持仓非空本身就是「账户在线」的证据
+            # （没有在线账户不可能有持仓），这时账本可信，照常上报。
+            logger.warning("snapshot books empty but link untrusted, report degraded")
+            return None
         quotes: dict = {}
         prices: dict = {}
         try:
@@ -372,8 +411,8 @@ class NodeClient:
             logger.debug("snapshot account_info failed: %s", e)
         return {
             "account": account,
-            "positions": list(positions),
-            "orders": list(orders),
+            "positions": positions,
+            "orders": orders,
             "quotes": quotes,
             "prices": prices,
             "server_time_offset": offset,
@@ -381,6 +420,22 @@ class NodeClient:
             "mt5_link": self._link_state(),
             "mt5_link_at": time.time(),
         }
+
+    async def _books_trustworthy(self) -> bool:
+        """账本（持仓 / 挂单）当前是否可信：终端必须与券商连通。
+
+        断联时 positions_get / orders_get 可能**成功**返回空集合 ——
+        「没有持仓」只是「读不到在线账户」的假象。客户端没有这个能力
+        （旧版客户端）时按**可信**处理，保持原有行为。
+        """
+        reader = getattr(self.mt5, "books_trustworthy", None)
+        if reader is None:
+            return True
+        try:
+            return bool(await self._exec(reader))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("snapshot books trust check failed: %s", e)
+            return False
 
     async def _pending_orders(self) -> list[dict]:
         """读未成交挂单。读失败抛错，由快照路径跳过上报，避免空挂单被对账当成已撤。"""
@@ -497,6 +552,141 @@ class NodeClient:
             except Exception:  # noqa: BLE001
                 logger.debug("link monitor sample failed", exc_info=True)
             await asyncio.sleep(LINK_MONITOR_INTERVAL)
+
+    async def _terminal_watchdog(self) -> None:
+        """终端看门狗：MT5 进程没了又回来时，节点自己重新附着上去。
+
+        要解决的问题：用户直接关掉 MT5 再打开，节点不会自动恢复 ——
+        `MetaTrader5` 这个 C 扩展绑定的是**当初那个终端进程**，进程没了之后
+        所有 IPC 调用都失效（抛异常或返回 None），必须重新 `initialize` 才能
+        附着到新起的进程上。以前只能重启 node_client，代价太大。
+
+        这里做两件事：
+        1. **探测**：定期读一次终端状态。读不到（`terminal_info()` 返回 None
+           或抛异常）连续 `terminal_watch_confirm` 轮才判「终端没了」——
+           单次 IPC 抖动不该触发重连。
+        2. **重连**：判死后按指数退避反复尝试 `reconnect()`，直到成功。
+
+        为什么不在终端断链（终端在、券商不通）时重连：那种情况终端进程还活着，
+        `initialize` 只会重新绑到同一个进程上，没有意义，还会打断正在跑的
+        策略监控。真正需要重连的只有「终端进程本身没了」。
+
+        终端在但券商断链由 `_link_monitor` 与闸门 A-1 负责，与本任务无关。
+        """
+        interval = max(0.2, float(settings.terminal_watch_interval))
+        confirm = max(1, int(settings.terminal_watch_confirm))
+        backoff = max(1.0, float(settings.terminal_reconnect_min))
+        max_backoff = max(backoff, float(settings.terminal_reconnect_max))
+        misses = 0
+        while True:
+            try:
+                alive = await self._terminal_alive()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                logger.debug("terminal watchdog probe failed", exc_info=True)
+                alive = False
+
+            if alive:
+                if misses:
+                    logger.info("MT5 terminal recovered")
+                misses = 0
+                backoff = max(1.0, float(settings.terminal_reconnect_min))
+                self._terminal_ok = True
+                self._terminal_reconnecting = False
+                self._terminal_waiting = False
+                await asyncio.sleep(interval)
+                continue
+
+            misses += 1
+            self._terminal_ok = False
+            if misses < confirm:
+                await asyncio.sleep(interval)
+                continue
+
+            # 连续多轮读不到终端：绑定多半已经失效，准备重新附着。
+            #
+            # 关键安全约束：**只在用户自己把终端开回来之后才重连**。
+            # mt5.initialize() 在终端没跑的时候会自动把它启动起来，而用户
+            # 手动关掉 MT5 通常就是想停止交易 —— 擅自重开会让策略立刻恢复
+            # 下单，是最不能接受的行为。所以先用进程探针确认终端进程在跑。
+            running = await self._terminal_process_running()
+            if running is False:
+                # 终端确实没在跑：用户可能就是想让它关着，不重连、不启动。
+                # 继续等——用户什么时候把 MT5 开回来，我们就什么时候跟上。
+                self._terminal_waiting = True
+                self._terminal_reconnecting = False
+                await asyncio.sleep(interval)
+                continue
+            if running is None:
+                # 探不到（平台不支持/枚举失败）：不能因此跳过重连，
+                # 否则在不支持探针的平台上永远恢复不了。
+                logger.debug("terminal process probe unavailable, attempting reconnect")
+
+            self._terminal_reconnecting = True
+            self._terminal_waiting = False
+            ok = await self._reconnect_terminal()
+            self._terminal_reconnecting = False
+            if ok:
+                misses = 0
+                backoff = max(1.0, float(settings.terminal_reconnect_min))
+                self._terminal_ok = True
+                continue
+            # 终端还没就绪（刚启动、还没连上券商）：退避后重试。
+            logger.info(
+                "MT5 terminal unavailable, retry reconnect in %.0fs", backoff,
+            )
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
+
+    async def _terminal_alive(self) -> bool:
+        """终端绑定是否还有效（能读到 terminal_info 即为有效）。
+
+        读不到返回 False：终端进程消失后 `terminal_info()` 要么返回 None、
+        要么直接抛异常，两种都说明绑定已经失效。
+        """
+        try:
+            status = await self._exec(self.mt5.terminal_status) or {}
+        except Exception:  # noqa: BLE001
+            return False
+        # terminal_status 内部已经把 terminal_info 读过一次，读不到时
+        # alive=False、connected=None、trade_allowed=None。
+        return bool(status.get("alive"))
+
+    async def _terminal_process_running(self) -> bool | None:
+        """MT5 终端进程是否在跑。None = 探不到。
+
+        这是「该不该重连」的闸门：用户手动关掉 MT5 通常是想停止交易，
+        节点绝不能擅自把终端再开起来（initialize 会自动启动它）。
+        """
+        probe = getattr(self.mt5, "terminal_process_running", None)
+        if not callable(probe):
+            return None
+        try:
+            return await self._exec(probe)
+        except Exception:  # noqa: BLE001
+            logger.debug("terminal process probe failed", exc_info=True)
+            return None
+
+    async def _reconnect_terminal(self) -> bool:
+        """重新附着到 MT5 终端。返回是否成功。
+
+        成功之后策略监控会自己恢复：终端消失期间，策略任务的监控协程一直在跑
+        但读不到账本（hub 派发 STALE），它们并没有死；重新附着后 hub 读回
+        持仓，监控继续跑。
+        """
+        try:
+            ok = await self._exec(self.mt5.reconnect)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("MT5 terminal reconnect failed: %s", e)
+            return False
+        if not ok:
+            logger.warning("MT5 terminal reconnect returned false")
+            return False
+        logger.info("MT5 terminal reattached")
+        # 重新附着后，算法交易开关可能又被用户关掉，这里刷一次状态上报。
+        self._schedule_algo_refresh()
+        return True
 
     async def _reporter(self, ws) -> None:
         """定时上报账户快照；顺带检查账户级风控；发现换号则抛错结束会话。
