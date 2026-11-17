@@ -1854,6 +1854,7 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
 }
 .order-dialog .el-dialog__body {
   max-height: calc(100vh - 200px);
+  max-height: calc(100dvh - 200px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
   overflow-y: auto;
 }
 .order-dialog .el-overlay {
@@ -1869,13 +1870,20 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
   .order-dialog .el-dialog {
     width: 100vw !important;
     max-width: 100vw !important;
+    /* dvh：standalone 下 100vh 会多出一截空白或压住底部手势条。
+       顶部/底部各留出安全区，body 高度同步减去这两个值。 */
     height: 100vh !important;
+    height: 100dvh !important;
     max-height: 100vh !important;
+    max-height: 100dvh !important;
     border-radius: 0 !important;
     margin: 0 !important;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
   }
   .order-dialog .el-dialog__body {
     max-height: calc(100vh - 168px);
+    max-height: calc(100dvh - 168px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
   }
 }
 </style>

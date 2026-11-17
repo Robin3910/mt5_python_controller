@@ -43,19 +43,66 @@
   --el-text-color-primary: #e8edf5;
   --el-text-color-regular: #a8b4c8;
   --el-fill-color-blank: rgba(12, 18, 32, 0.6);
+
+  /* ── 安全区（刘海屏 / 灵动岛 / 底部手势区）─────────────────────────
+     index.html 已设 viewport-fit=cover，这些变量才会有非零值；
+     桌面浏览器与普通标签页里全为 0，所以可以**无条件**套用，
+     不必为 standalone 单独写一套样式。
+
+     顶部策略：状态栏用不透明样式（iOS black / Android standalone），
+     应用视口从状态栏下沿开始，--sat 恒为 0 —— 这样顶栏高度与
+     各处 sticky 偏移（top: 76px 等）都不用动，零 UI 回归。
+     底部 --sab 是真正要处理的：iOS Home Indicator 约 34px，
+     内容滚到底时不能被手势条盖住。
+
+     左右 --sal/--sar：仅横屏时非零（刘海/挖孔在侧面），竖屏为 0。 */
+  --sat: env(safe-area-inset-top, 0px);
+  --sar: env(safe-area-inset-right, 0px);
+  --sab: env(safe-area-inset-bottom, 0px);
+  --sal: env(safe-area-inset-left, 0px);
+
+  /* 内容区安全区内边距：横向让开横屏刘海，纵向让开底部手势条。
+     横向用 max() 取「常规内边距」与「安全区」的较大者，两者相加
+     会让正常竖屏（安全区为 0）的留白比原来大，故取较大值而非相加。 */
+  --pad-x: max(0px, var(--sal));
+  --pad-r: max(0px, var(--sar));
+  --pad-b: var(--sab);
+
+  /* 顶栏高度（不含安全区）。顶栏在安全区下方部分由 padding-top 让出，
+     因此实际占位 = --topbar-h + --sat。
+     客户版顶栏 48px（见 .topbar-customer），手机端 52px（见 @media 640px）。 */
+  --topbar-h: 60px;
 }
 
 * { box-sizing: border-box; }
 
 html, body, #app {
   margin: 0;
-  height: 100%;
+  /* 100dvh = 动态视口高度（地址栏收起/展开时随内容变化），避免
+     PWA standalone 下用 100vh 导致底部多出一截空白或被手势区遮挡。
+     保留 100vh 作为老浏览器回退。 */
+  height: 100vh;
+  height: 100dvh;
   background: var(--bg);
   color: var(--text);
   font-family: var(--font);
   font-size: 14px;
   overflow-x: hidden;
   -webkit-font-smoothing: antialiased;
+}
+
+/* PWA standalone：视口高度跟随动态视口（standalone 下没有地址栏，
+   100dvh 与 100vh 等价，但保留动态视口语义，后续切 fullscreen 也稳）。
+   注意不要给 html/body 加 overflow:hidden —— 那会连带干掉整页滚动，
+   长页面（节点列表、信号表格）就滚不动了。
+   overscroll-behavior:none 屏蔽 Android 独立应用里下拉露出的白边与
+   下拉刷新手势：独立应用没有浏览器工具栏，刷新应由 App 内部提供，
+   下拉既不会刷新页面，又会露出难看的底色。 */
+@media (display-mode: standalone), (display-mode: fullscreen) {
+  html, body, #app {
+    height: 100dvh;
+    overscroll-behavior: none;
+  }
 }
 
 /* 全局背景保持纯色（--bg）；如需装饰性光球请用页面级 .home-hero-orb-*
@@ -65,6 +112,7 @@ html, body, #app {
   display: flex;
   flex-direction: column;
   min-height: 100vh;
+  min-height: 100dvh;
   position: relative;
 }
 
@@ -273,7 +321,13 @@ label {
 
 .topbar {
   display: flex; align-items: center; gap: 16px;
-  padding: 0 20px; height: 60px;
+  /* 上内边距让开状态栏/刘海（--sat 在普通标签页里为 0，所以无副作用）；
+     左右内边距让开刘海屏横屏时的挖孔区域（--sar）。
+     height 用 calc 把安全区高度算在总高之外，padding 只占内部空间，
+     顶栏实际内容高度恒为 60px —— 各处 sticky top: 76px 的偏移不用改。 */
+  padding: var(--sat) max(20px, var(--sar)) 0 max(20px, var(--sal));
+  height: 60px;
+  height: calc(60px + var(--sat));
   position: sticky; top: 0; z-index: 20;
 }
 
@@ -411,6 +465,11 @@ button.secure-badge.webhook-copy:focus-visible {
 
 .content {
   padding: 24px;
+  /* 安全区：底部让开 iOS Home Indicator，横屏时左右让开刘海/挖孔。
+     左右用 max() 而非相加 —— 竖屏安全区为 0，相加会让常规留白变大。 */
+  padding-left: max(24px, var(--pad-x));
+  padding-right: max(24px, var(--pad-r));
+  padding-bottom: calc(24px + var(--pad-b));
   max-width: 1320px;
   margin: 0 auto;
   width: 100%;
@@ -724,8 +783,15 @@ td:first-child, th:first-child { font-family: var(--font); }
   display: flex;
   align-items: center;
   justify-content: center;
+  /* 视口高度就是 100dvh（含手势条区域），底部靠 padding-bottom 让开，
+     让最后一行内容停在手势条上方。不要给 min-height 再加 --pad-b：
+     那只会多出一段空白滚动区，并不能把内容再往上推。 */
   min-height: 100vh;
+  min-height: 100dvh;
   padding: 24px;
+  padding-left: max(24px, var(--pad-x));
+  padding-right: max(24px, var(--pad-r));
+  padding-bottom: calc(24px + var(--pad-b));
   gap: 48px;
 }
 
@@ -1277,7 +1343,10 @@ a.dash-link { display: inline-block; }
 .dash-events {
   position: sticky;
   top: 76px;
+  /* dvh：sticky 面板的可视高度要跟着动态视口走，独立应用下 100vh
+     会让面板底部超出屏幕；同时让开底部安全区。 */
   max-height: calc(100vh - 96px);
+  max-height: calc(100dvh - 96px - var(--sat) - var(--sab));
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -1373,6 +1442,9 @@ a.dash-link { display: inline-block; }
     flex-direction: column;
     gap: 28px;
     padding: 20px 16px;
+    padding-left: max(16px, var(--pad-x));
+    padding-right: max(16px, var(--pad-r));
+    padding-bottom: calc(20px + var(--pad-b));
   }
   .login-hero {
     max-width: 400px;
@@ -1395,7 +1467,11 @@ a.dash-link { display: inline-block; }
 /* 紧一点：带单页是宽卡片流，挤掉一层横向内边距后能多出 24px 可用宽度。
      只作用于本页（:has 命中 .follow-page），其他页面间距不动。 */
 @media (max-width: 768px) {
-  .content:has(.follow-page) { padding: 10px 8px calc(8px + env(safe-area-inset-bottom, 0px)); }
+  .content:has(.follow-page) {
+    padding: 10px 8px calc(8px + var(--pad-b));
+    padding-left: max(8px, var(--pad-x));
+    padding-right: max(8px, var(--pad-r));
+  }
 }
 
 @media (max-width: 768px) {
@@ -1493,9 +1569,10 @@ a.dash-link { display: inline-block; }
 
   /* 手机端：隐藏顶栏的品牌区/在线状态/用户名/退出，只保留一行图标导航 */
   .topbar {
-    padding: 0 8px;
-    height: 54px;
-    min-height: 54px;
+    /* 保留左右安全区（横屏刘海/挖孔），顶部继续让开状态栏 */
+    padding: var(--sat) max(8px, var(--pad-r)) 0 max(8px, var(--pad-x));
+    height: calc(54px + var(--sat));
+    min-height: calc(54px + var(--sat));
     gap: 4px;
   }
   .topbar .brand,
@@ -1526,9 +1603,9 @@ a.dash-link { display: inline-block; }
 @media (max-width: 640px) {
   .topbar {
     gap: 4px;
-    padding: 0 6px;
-    height: 52px;
-    min-height: 52px;
+    padding: var(--sat) max(6px, var(--pad-r)) 0 max(6px, var(--pad-x));
+    height: calc(52px + var(--sat));
+    min-height: calc(52px + var(--sat));
     flex-wrap: nowrap;
   }
   .brand-text { font-size: 13px; }
@@ -1554,7 +1631,13 @@ a.dash-link { display: inline-block; }
   .topbar .btn-logout { display: none; }
   .topbar-user { display: none; }
   .pill { font-size: 10px; padding: 4px 8px; }
-  .content { padding: 14px; }
+  .content {
+    padding: 14px;
+    /* 窄屏同样要让开安全区（上面的简写 padding 会覆盖 .content 的长写法） */
+    padding-left: max(14px, var(--pad-x));
+    padding-right: max(14px, var(--pad-r));
+    padding-bottom: calc(14px + var(--pad-b));
+  }
   .two { grid-template-columns: 1fr; }
   .h1 { font-size: 18px; }
   .events { max-height: 260px; }
@@ -3323,11 +3406,19 @@ body:has(.app-shell.is-customer) {
 .app-shell.is-customer .content {
   max-width: 1200px;
   padding: 12px;
+  /* 客户版（普通用户）内容区同样要让开底部手势条与横屏刘海 */
+  padding-left: max(12px, var(--pad-x));
+  padding-right: max(12px, var(--pad-r));
+  padding-bottom: calc(12px + var(--pad-b));
 }
 .topbar-customer {
-  height: 48px;
-  min-height: 48px;
-  padding: 0;
+  /* 顶部让开状态栏（当前用不透明状态栏，--sat 恒为 0，等价于原来的
+     padding: 0；写成 calc 是为了将来若切到 translucent 也不用改高度逻辑）。
+     box-sizing: border-box，所以 padding-top 占用的是 height 内部空间，
+     实际内容高度仍为 48px。左右由 .topbar-customer-inner 的内边距控制。 */
+  padding: var(--sat) 0 0;
+  height: calc(48px + var(--sat));
+  min-height: calc(48px + var(--sat));
   gap: 0;
   background: rgba(10, 14, 22, 0.95);
   border-bottom: 1px solid #161F30;
@@ -3343,7 +3434,8 @@ body:has(.app-shell.is-customer) {
   max-width: 1200px;
   height: 48px;
   margin: 0 auto;
-  padding: 0 12px;
+  /* 左右让开横屏时的刘海/挖孔（--sal/--sar，竖屏为 0） */
+  padding: 0 max(12px, var(--pad-r)) 0 max(12px, var(--pad-x));
   gap: 12px;
   min-width: 0;
 }
@@ -3436,16 +3528,22 @@ body:has(.app-shell.is-customer) {
   .topbar-customer .nav a svg { width: 15px; height: 15px; }
 }
 @media (min-width: 1024px) {
-  .app-shell.is-customer .content { padding: 16px 24px 32px; }
-  .topbar-customer-inner { padding: 0 24px; }
+  .app-shell.is-customer .content {
+    padding: 16px 24px 32px;
+    padding-left: max(24px, var(--pad-x));
+    padding-right: max(24px, var(--pad-r));
+    padding-bottom: calc(32px + var(--pad-b));
+  }
+  .topbar-customer-inner { padding: 0 max(24px, var(--pad-r)) 0 max(24px, var(--pad-x)); }
 }
 @media (max-width: 960px) {
   .topbar-customer,
   .topbar.topbar-customer {
     display: flex;
-    height: 48px;
-    min-height: 48px;
-    padding: 0;
+    /* 保持与基础规则一致的 --sat 补偿，避免窄屏下顶部安全区失效 */
+    height: calc(48px + var(--sat));
+    min-height: calc(48px + var(--sat));
+    padding: var(--sat) 0 0;
     gap: 0;
   }
   .topbar-customer .brand { display: flex; }
@@ -3462,7 +3560,12 @@ body:has(.app-shell.is-customer) {
   }
 }
 @media (max-width: 640px) {
-  .topbar-customer { height: 48px; min-height: 48px; padding: 0; gap: 0; }
+  .topbar-customer {
+    height: calc(48px + var(--sat));
+    min-height: calc(48px + var(--sat));
+    padding: var(--sat) 0 0;
+    gap: 0;
+  }
   .topbar-customer .brand { display: flex; }
 }
 @media (max-width: 429px) {

@@ -4,6 +4,18 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover" />
     <meta name="theme-color" content="#060a12" />
+    <!-- ── PWA / 独立应用模式（iOS 专项）──────────────────────────────
+         iOS Safari 不认 manifest 的 display 字段，只认下面这组 meta：
+         apple-mobile-web-app-capable=yes 让「添加到主屏幕」启动时不显示
+         地址栏与底部工具栏；status-bar-style=black 让状态栏不透明，
+         应用视口从状态栏下沿开始（--sat 恒为 0，顶栏 sticky 偏移不用动）；
+         apple-mobile-web-app-title 决定桌面图标下方显示的名字。
+         apple-touch-icon 是 iOS 唯一认的图标（1 个就够，180x180）。 -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+    <meta name="apple-mobile-web-app-title" content="亿点点" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon-180.png" />
     <title>亿点点</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />

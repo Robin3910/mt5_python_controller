@@ -820,7 +820,9 @@ async function confirmSubmitTrigger(): Promise<void> {
 
 .trigger-confirm-modal {
   width: min(560px, calc(100vw - 32px));
-  max-height: calc(100dvh - 48px);
+  max-height: calc(100vh - 48px);
+  /* dvh + 安全区：standalone 下底部按钮不能被 Home Indicator 压住 */
+  max-height: calc(100dvh - 48px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
   display: flex;
   flex-direction: column;
 }

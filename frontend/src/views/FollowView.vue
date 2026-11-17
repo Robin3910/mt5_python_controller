@@ -1772,8 +1772,9 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 .fd-pnl { display: flex; justify-content: space-between; margin-top: 8px; border-radius: 8px; padding: 8px 10px; font-size: 12px; }
 .fd-pnl.up { background: rgba(22,163,74,.16); }
 .fd-pnl.down { background: rgba(246,70,93,.12); }
-.fd-mask { position: fixed; inset: 0; z-index: 40; display: flex; align-items: center; justify-content: center; padding: 16px; background: rgba(0,0,0,.55); }
-.fd-dialog { width: min(480px, 100%); max-height: calc(100dvh - 32px); display: flex; flex-direction: column; padding: 0; background: #0D1220; border-radius: 16px; box-shadow: 0 24px 80px #0008; outline: none; }
+.fd-mask { position: fixed; inset: 0; z-index: 40; display: flex; align-items: center; justify-content: center; padding: 16px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-bottom: max(16px, env(safe-area-inset-bottom, 0px)); }
+/* dvh + 安全区：底部按钮要让开 iOS Home Indicator */
+.fd-dialog { width: min(480px, 100%); max-height: calc(100dvh - 32px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)); display: flex; flex-direction: column; padding: 0; background: #0D1220; border-radius: 16px; box-shadow: 0 24px 80px #0008; outline: none; }
 .fd-dialog header, .fd-dialog footer { justify-content: space-between; }
 .fd-dialog p { margin: 2px 0 0; color: #8B96A8; font-size: 12px; }
 .fd-x { width: 28px; height: 28px; border-radius: 8px; border: 1px solid #22304A; background: #0A0F1A; color: #8B96A8; }

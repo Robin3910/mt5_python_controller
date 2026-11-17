@@ -1138,8 +1138,9 @@ onMounted(() => { void hub.fetchNodes(); trackAiUi('page_view', { value: 'ai-tra
 .ai-empty p { margin: 0; }
 .ai-empty .ai-empty-hint { margin-top: 4px; color: #8B96A8; }
 .ai-empty .ai-refresh { margin-top: 8px; }
-.ai-mask { position: fixed; inset: 0; z-index: 40; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; padding: 16px; }
-.ai-dialog { width: min(560px, 100%); max-height: 86vh; overflow: auto; padding: 14px; border: 1px solid #1E2B47; border-radius: 16px; background: #0D1626; }
+.ai-mask { position: fixed; inset: 0; z-index: 40; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; padding: 16px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-bottom: max(16px, env(safe-area-inset-bottom, 0px)); }
+/* dvh + 安全区：standalone 下 86vh 会算错动态视口，底部按钮会被手势条盖住 */
+.ai-dialog { width: min(560px, 100%); max-height: 86vh; max-height: calc(86dvh - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)); overflow: auto; padding: 14px; border: 1px solid #1E2B47; border-radius: 16px; background: #0D1626; }
 .ai-dialog header, .ai-dialog footer { display: flex; align-items: center; justify-content: space-between; }
 .ai-dialog header p { margin: 4px 0 0; color: #8B96A8; font-size: 11px; }
 .ai-x { display: flex; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 0; border-radius: 8px; border: 1px solid #22304A; background: #0A0F1A; color: #8B96A8; }
