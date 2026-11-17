@@ -1,5 +1,15 @@
 import axios from 'axios'
 
+/**
+ * 登录态失效事件名。
+ *
+ * 为什么用「事件」而不是在这里直接改 location：
+ * 401 拦截器在 api 模块内，而路由实例在 router 模块 —— router 又 import
+ * stores/auth → stores/auth import api/client，直接 import router 会形成
+ * 循环依赖。这里只广播事件，由 main.ts 里的路由实例来跳转。
+ */
+export const AUTH_EXPIRED_EVENT = 'app:auth-expired'
+
 // 全局 axios 实例：同源部署时 baseURL 留空，由 nginx 把 /api 转发到后端
 const api = axios.create({
   baseURL: import.meta.env.VITE_API_BASE || '',
@@ -15,13 +25,20 @@ api.interceptors.request.use((cfg) => {
   return cfg
 })
 
-// 响应拦截器：遇到 401（令牌失效）则清除并跳回登录页
+// 响应拦截器：遇到 401（令牌失效）则清除登录态并跳回登录页。
+//
+// ⚠️ 这里**不能**用 location.href = '/login'：那是整页硬导航，在 iOS 主屏
+// 独立应用里会被踢回 Safari，浏览器的地址栏和底部工具栏就回来了（正是
+// 「登录页正常、登录后浏览器 UI 复现」的根因）。必须走 vue-router 的软路由
+// 跳转（pushState），才能一直待在独立应用容器内。
 api.interceptors.response.use(
   (resp) => resp,
   (error) => {
     if (error?.response?.status === 401) {
       localStorage.removeItem('token')
-      if (location.pathname !== '/login') location.href = '/login'
+      if (location.pathname !== '/login') {
+        window.dispatchEvent(new CustomEvent(AUTH_EXPIRED_EVENT))
+      }
     }
     return Promise.reject(error)
   },

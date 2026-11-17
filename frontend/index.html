@@ -16,6 +16,11 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black" />
     <meta name="apple-mobile-web-app-title" content="亿点点" />
     <link rel="apple-touch-icon" href="/icons/apple-touch-icon-180.png" />
+    <!-- Web App Manifest：Android Chrome 装成独立应用（无地址栏/工具栏）靠它；
+         scope="/" 界定独立应用的可用范围，start_url 是点桌面图标后的落地页。
+         iOS Safari 不读 manifest，但它会用 manifest 的 scope 约束
+         「添加到主屏幕」后的导航范围 —— 这是防止跳出独立应用的关键。 -->
+    <link rel="manifest" href="/manifest.webmanifest" />
     <title>亿点点</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
