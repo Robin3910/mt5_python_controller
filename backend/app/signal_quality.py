@@ -100,10 +100,10 @@ SAMPLE_NONE_LEVEL = "none"
 # ---------------------------------------------------------------------------
 # 等级是对**已有质量分**的一层分级，**不参与打分** ——
 # 打分口径只有上面那一个（历史同类信号的信号级胜率 + 贝叶斯收缩），
-# 等级只是把分数翻译成「高 / 中 / 低」三档给人看。
+# 等级只是把分数翻译成「高 / 中等 / 低」三档给人看。
 #
 # 阈值用**绝对值**而不是相对全局先验：
-# 相对阈值会随全局先验漂移（同一个 58 分上周算「高」这周算「中」），
+# 相对阈值会随全局先验漂移（同一个 78 分上周算「高」这周算「中等」），
 # 管理员对不上号；绝对阈值稳定、可解释、可复述。
 LEVEL_HIGH = "high"
 LEVEL_MID = "mid"
@@ -111,9 +111,9 @@ LEVEL_LOW = "low"
 LEVEL_NONE = "none"
 
 #: ≥ 该分数 → 高
-LEVEL_HIGH_MIN = 60.0
-#: ≥ 该分数 → 中（低于它 → 低）
-LEVEL_MID_MIN = 50.0
+LEVEL_HIGH_MIN = 85.0
+#: ≥ 该分数 → 中等（低于它 → 低）
+LEVEL_MID_MIN = 70.0
 
 #: 等级 → 决策指导文案
 LEVEL_ADVICE: dict[str, str] = {
@@ -126,7 +126,7 @@ LEVEL_ADVICE: dict[str, str] = {
 #: 等级 → 中文标签
 LEVEL_LABELS: dict[str, str] = {
     LEVEL_HIGH: "高",
-    LEVEL_MID: "中",
+    LEVEL_MID: "中等",
     LEVEL_LOW: "低",
     LEVEL_NONE: "暂无",
 }
@@ -466,9 +466,9 @@ def level_for(score: Optional[float]) -> str:
     """把质量分翻译成可靠性等级。
 
     **绝对阈值**：
-    - `score >= 60` → 高（`high`）
-    - `50 <= score < 60` → 中（`mid`）
-    - `score < 50` → 低（`low`）
+    - `score >= 85` → 高（`high`）
+    - `70 <= score < 85` → 中等（`mid`）
+    - `score < 70` → 低（`low`）
     - `score is None` → 无（`none`，即「暂无历史」）
 
     等级**不参与打分**，只是展示层的一层翻译；

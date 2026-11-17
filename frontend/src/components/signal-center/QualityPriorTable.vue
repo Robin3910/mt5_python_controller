@@ -22,10 +22,10 @@ function fmtPct(v: number | null | undefined): string {
   return `${Number(v).toFixed(2)}%`
 }
 
-/** 质量分配色：>= 60 绿 / >= 50 琥珀 / 否则红 */
+/** 质量分配色：>= 85 绿 / >= 70 琥珀 / 否则红 */
 function scoreClass(score: number): string {
-  if (score >= 60) return 'good'
-  if (score >= 50) return 'mid'
+  if (score >= 85) return 'good'
+  if (score >= 70) return 'mid'
   return 'bad'
 }
 

@@ -19,11 +19,11 @@ const props = withDefaults(
   { compact: false },
 )
 
-/** 色带：≥60 绿 / 50~60 蓝灰 / <50 橙红 */
+/** 色带：≥85 绿 / 70~84 蓝灰 / <70 橙红 */
 function toneClass(score: number | null): string {
   if (score === null || score === undefined) return 'grey'
-  if (score >= 60) return 'green'
-  if (score >= 50) return 'blue'
+  if (score >= 85) return 'green'
+  if (score >= 70) return 'blue'
   return 'amber'
 }
 

@@ -4,10 +4,10 @@
 // 质量分怎么算、等级怎么分、类型怎么归类，前端一律**原样展示**，
 // 这里只管「怎么显示」—— 前端自己再算一遍必然与后端对不上。
 
-/** 可靠性等级 → 中文标签（绝对阈值：≥60 高 / 50-60 中 / <50 低） */
+/** 可靠性等级 → 中文标签（绝对阈值：≥85 高 / 70-84 中 / <70 低） */
 export const LEVEL_LABELS: Record<string, string> = {
   high: '高',
-  mid: '中',
+  mid: '中等',
   low: '低',
   none: '暂无',
 }
@@ -53,29 +53,27 @@ export const LEVEL_CHART_COLORS: Record<string, string> = {
  * 改后端区间必须同步改这里。
  */
 export const SCORE_BAND_COLORS: Record<string, string> = {
-  gte90: '#22c55e',
-  '80_89': '#3b82f6',
-  '70_79': '#f59e0b',
+  gte85: '#22c55e',
+  '70_84': '#f59e0b',
   lt70: '#f6465d',
 }
 
 /**
  * 质量分 → 文字配色类名。
  *
- * 阈值与后端等级阈值一致（≥60 高 / ≥50 中 / 其余低），
- * **不用**原型文案里的 85 / 70 —— 那跟我们的等级口径对不上，
- * 同一个数字在两块地方显示不同颜色会让人以为算错了。
+ * 阈值与后端等级阈值一致（≥85 高 / ≥70 中等 / 其余低），
+ * 与后端 `signal_quality.LEVEL_HIGH_MIN` / `LEVEL_MID_MIN` 对齐。
  */
 export function scoreTone(score: number): string {
-  if (score >= 60) return 'green'
-  if (score >= 50) return 'amber'
+  if (score >= 85) return 'green'
+  if (score >= 70) return 'amber'
   return 'red'
 }
 
 /** 质量分 → 条形填充配色类名（`.ai-bar-green` / `.ai-bar-amber` / `.ai-bar-red`） */
 export function scoreBarTone(score: number): string {
-  if (score >= 60) return 'green'
-  if (score >= 50) return 'amber'
+  if (score >= 85) return 'green'
+  if (score >= 70) return 'amber'
   return 'red'
 }
 

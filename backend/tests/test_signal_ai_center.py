@@ -146,7 +146,7 @@ def test_overview_empty_database_returns_zeroed_shape():
     assert ov["kpi"]["high_reliability"] == 0
     assert ov["kpi"]["avg_quality"] == 0.0
     assert len(ov["reliability"]) == 3
-    assert len(ov["score_buckets"]) == 4
+    assert len(ov["score_buckets"]) == 3
     assert ov["by_type"] == []
     assert ov["by_timeframe"] == []
     assert ov["top_signals"] == []
@@ -256,9 +256,9 @@ def test_reliability_distribution_matches_signal_level():
 
 
 def test_high_reliability_matches_absolute_threshold():
-    """高可靠 = 质量分 ≥ 60（绝对阈值）。"""
+    """高可靠 = 质量分 ≥ 85（绝对阈值）。"""
     async def _main():
-        # 6 赢 → 先验分约 58.2（收缩后），落在「中」区间
+        # 6 赢 → 先验分约 58.2（收缩后），落在「低」区间
         for i in range(6):
             await _seed_win(f"w{i}", 400 + i, timeframe="M15", signal_type="ob")
         from app import signal_ai_center, signal_stats

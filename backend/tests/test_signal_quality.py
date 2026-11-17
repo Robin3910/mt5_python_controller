@@ -516,19 +516,19 @@ def test_signal_name_and_action_label():
 # 6. 可靠性等级（绝对阈值）
 # ---------------------------------------------------------------------------
 def test_level_thresholds_are_absolute():
-    """等级用**绝对阈值**：≥60 高 / 50-60 中 / <50 低。
+    """等级用**绝对阈值**：≥85 高 / 70-84 中等 / <70 低。
 
     刻意不用「相对全局先验」—— 相对阈值会随全局先验漂移，
-    同一个 58 分这周算「高」下周算「中」，管理员对不上号。
+    同一个 78 分这周算「高」下周算「中」，管理员对不上号。
     """
     from app import signal_quality
 
-    assert signal_quality.level_for(60.0) == "high"
-    assert signal_quality.level_for(75.5) == "high"
+    assert signal_quality.level_for(85.0) == "high"
+    assert signal_quality.level_for(95.5) == "high"
     assert signal_quality.level_for(100.0) == "high"
-    assert signal_quality.level_for(50.0) == "mid"
-    assert signal_quality.level_for(59.99) == "mid"
-    assert signal_quality.level_for(49.99) == "low"
+    assert signal_quality.level_for(70.0) == "mid"
+    assert signal_quality.level_for(84.99) == "mid"
+    assert signal_quality.level_for(69.99) == "low"
     assert signal_quality.level_for(0.0) == "low"
 
 
@@ -557,7 +557,7 @@ def test_level_advice_and_labels():
     assert signal_quality.advice_for("low") == "暂不参与"
     assert signal_quality.advice_for("none") == "暂无历史"
     assert signal_quality.level_label("high") == "高"
-    assert signal_quality.level_label("mid") == "中"
+    assert signal_quality.level_label("mid") == "中等"
     assert signal_quality.level_label("low") == "低"
 
 
@@ -565,7 +565,7 @@ def test_score_levels_bundle():
     """一次拿到分数 + 等级 + 文案。"""
     from app import signal_quality
 
-    out = signal_quality.score_levels(72.3)
+    out = signal_quality.score_levels(90.3)
     assert out["level"] == "high"
     assert out["level_label"] == "高"
     assert out["advice"] == "关注"

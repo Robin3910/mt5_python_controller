@@ -768,7 +768,7 @@ async def ai_overview(
     """AI 信号管理中心 · 上半屏：指标卡 + 质量总览 + 类型对比 + 周期总览 + TOP5。
 
     质量分**只有一个实现**（`signal_quality`），等级是绝对阈值
-    （≥60 高 / 50-60 中 / <50 低）。
+    （≥85 高 / 70-84 中 / <70 低）。
     """
     return await signal_ai_center.overview(filters)
 

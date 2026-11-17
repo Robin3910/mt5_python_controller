@@ -7,7 +7,7 @@
 // 信号是历史数据、写入频率低，offset 漂移可接受 —— 不为此引入第二套分页语义。
 import { computed } from 'vue'
 import type { AiSignalList } from '@/api/types'
-import { LEVEL_TONE, fmtTime, tpLevelLabel, tpStateLabel } from '@/constants/signalCenter'
+import { LEVEL_LABELS, LEVEL_TONE, fmtTime, tpLevelLabel, tpStateLabel } from '@/constants/signalCenter'
 
 const props = defineProps<{
   list: AiSignalList | null
@@ -125,7 +125,7 @@ function go(delta: number): void {
             </td>
             <td>
               <span class="pf-pill" :class="LEVEL_TONE[row.level]">
-                {{ row.level === 'none' ? '—' : row.level === 'high' ? '高' : row.level === 'mid' ? '中' : '低' }}
+                {{ row.level === 'none' ? '—' : LEVEL_LABELS[row.level] ?? '—' }}
               </span>
             </td>
             <td :class="row.level === 'high' ? 'ai-good' : 'ai-dim'">{{ row.advice }}</td>

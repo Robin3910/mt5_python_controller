@@ -257,11 +257,11 @@ def test_ai_overview_shape(client):
     levels = [x["level"] for x in body["reliability"]]
     assert levels == ["high", "mid", "low"]
 
-    # 质量分区间分布四档
-    assert len(body["score_buckets"]) == 4
+    # 质量分区间分布三档（与等级阈值 85 / 70 对齐）
+    assert len(body["score_buckets"]) == 3
 
     # 口径说明必须说清等级阈值
-    assert "60" in body["scope"]
+    assert "85" in body["scope"]
 
 
 def test_ai_tp_distribution_shape(client):

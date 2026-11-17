@@ -8,11 +8,10 @@
 //   4. 重点关注 · 质量 TOP 5（排名列表）
 //
 // **两个分布是两回事**，别混读：
-// - 等级分布：**按绝对阈值**分的高/中/低三档（60 / 50 分界）；
-// - 区间分布：**按分数高低**分的四档（90+ / 80-89 / 70-79 / <70）。
+// - 等级分布：**按绝对阈值**分的高/中等/低三档（85 / 70 分界）；
+// - 区间分布：**按分数高低**分的三档（85+ / 70-84 / <70）。
 //
-// ⚠️ 口径以现有实现为准（`signal_quality`）：等级阈值是 60/50，
-// **不是**原型文案里的 85/70 —— 详见 `docs/superpowers/specs/2026-11-13-ai-signal-center-prototype-design.md`。
+// ⚠️ 口径以现有实现为准（`signal_quality`）：等级阈值是 85/70 —— 详见 `docs/superpowers/specs/2026-11-13-ai-signal-center-prototype-design.md`。
 import { computed } from 'vue'
 import type {
   AiReliabilityItem,
@@ -155,7 +154,7 @@ function share(count: number): number {
         </div>
 
         <p class="ai-q-note">
-          质量分 ≥ 60 为高可靠（重点跟踪），50 - 59 为中等（轻仓观察），低于 50 建议暂不参与。
+          质量分 ≥ 85 为高可靠（重点跟踪），70 - 84 为中等（轻仓观察），低于 70 建议暂不参与。
         </p>
       </div>
     </div>

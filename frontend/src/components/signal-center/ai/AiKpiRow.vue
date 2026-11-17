@@ -27,7 +27,7 @@ defineProps<{ kpi: AiKpi | null }>()
     <div class="pf-card ai-kpi">
       <p class="ai-kpi-k">高可靠信号</p>
       <p class="ai-kpi-v ai-good">{{ kpi?.high_reliability ?? 0 }}</p>
-      <p class="ai-kpi-sub">质量分 60 分以上</p>
+      <p class="ai-kpi-sub">质量分 85 分以上</p>
     </div>
     <div class="pf-card ai-kpi">
       <p class="ai-kpi-k">平均信号质量</p>
