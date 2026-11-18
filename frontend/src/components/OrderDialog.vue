@@ -2295,9 +2295,9 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
 
 /* ── 手机端：撑满全屏、贴顶贴底、无圆角 ── */
 @media (max-width: 600px) {
-  .order-dialog {
+  /* .order-dialog {
     margin: 0 !important;
-  }
+  } */
   .order-dialog .el-dialog {
     width: 100vw !important;
     max-width: 100vw !important;
