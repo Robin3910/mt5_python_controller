@@ -28,6 +28,7 @@ import websockets
 import account_risk
 import config
 from config import clamp_account_report_interval, get_settings
+from console_io import configure_console
 from deal_cursor import DealCursor
 import latency_marks
 from local_status import LocalStatusServer, StatusPortBusy, bind_status_socket
@@ -37,6 +38,7 @@ from strategy_runner import StrategyRunner
 from version import get_version
 
 settings = get_settings()
+configure_console()
 logging.basicConfig(
     level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
