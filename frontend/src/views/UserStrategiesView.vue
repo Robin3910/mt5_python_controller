@@ -18,9 +18,10 @@ import type {
   GroupOut,
   GroupSignalTaskRecord,
   NodeOut,
+  OrderPreset,
+  OrderPresetStrategyType,
   QuoteInfo,
   StrategyOut,
-  StrategyRule,
 } from '@/api/types'
 
 /** AI 智能加仓策略模版 ID（与后端 strategy_templates.TEMPLATE_1_ID 对齐） */
@@ -466,43 +467,37 @@ const configuredStrategyCount = computed(() => {
       (s) => (s.symbol || '').toUpperCase() === (currentSymbol.value || '').toUpperCase(),
     ).length
   }
-  return OPEN_STRATEGY_ENTRIES.filter((e) => !!entryConfiguredRule(e.key)).length
+  return OPEN_STRATEGY_ENTRIES.filter((e) => !!entryPreset(e.key)).length
 })
 
 /**
- * 某个开仓策略入口对应的「已配置规则」。
- * - 市价 / 限价：type=3 以损定量规则，按 entry_mode（market / limit）区分
- * - 智能吸筹：type=4 网格规则
+ * 某个开仓策略入口对应的**预设**（我下单时的默认值）。
+ *
+ * 解析口径与后端 `order_presets.resolve_preset` 一致：
+ * 精确品种的预设优先，其次 '*' 通用模板。
  */
-function entryConfiguredRule(key: TradingStrategyType): StrategyRule | null {
-  for (const s of symbolStrategies.value) {
-    for (const r of s.rules || []) {
-      if (key === 'grid') {
-        if (r.type === 4) return r
-        continue
-      }
-      if (r.type === 3) {
-        const mode = key === 'trend_market' ? 'market' : 'limit'
-        if ((r.entry_mode ?? 'market') === mode) return r
-      }
-    }
-  }
-  return null
+function entryPreset(key: TradingStrategyType): OrderPreset | null {
+  const st = key as OrderPresetStrategyType
+  const sym = (currentSymbol.value || '').toUpperCase()
+  const exact = hub.presets.find((p) => p.symbol === sym && p.strategy_type === st)
+  if (exact) return exact
+  return hub.presets.find((p) => p.symbol === '*' && p.strategy_type === st) ?? null
 }
 
 /** 入口卡底部的配置摘要：已配置 → 参数摘要；未配置 → 引导文案 */
 function entryStateParams(key: TradingStrategyType): Array<{ label: string; value: string }> {
-  const r = entryConfiguredRule(key)
-  if (!r) return []
+  const p = entryPreset(key)
+  if (!p) return []
   const out: Array<{ label: string; value: string }> = []
   if (key === 'grid') {
-    if (r.price_lower != null) out.push({ label: '下限', value: String(r.price_lower) })
-    if (r.price_upper != null) out.push({ label: '上限', value: String(r.price_upper) })
-    if (r.grid_count != null) out.push({ label: '格数', value: String(r.grid_count) })
+    out.push({ label: '模式', value: p.grid_mode === 'geometric' ? '等比' : '等差' })
+    out.push({ label: '预算', value: `${p.max_allow_loss} USD` })
+    if (p.trailing_up) out.push({ label: '追踪', value: '向上' })
     return out
   }
-  if (r.risk_amount != null) out.push({ label: '以损定量', value: `${r.risk_amount} USD` })
-  if (r.rr_ratio != null) out.push({ label: '盈亏比', value: `1:${r.rr_ratio}` })
+  out.push({ label: '以损定量', value: `${p.risk_amount} USD` })
+  out.push({ label: '盈亏比', value: `1:${p.rr_ratio}` })
+  out.push({ label: '底仓', value: `${p.base_ratio}%` })
   return out
 }
 
@@ -516,6 +511,19 @@ const totalStrategyCount = computed(() =>
 watch(currentSymbol, () => {
   void fetchSymbolStrategies()
 })
+
+/**
+ * 拉取我的开仓参数预设（【策略配置】页的「已配置」判定与摘要都读它）。
+ *
+ * 拉不到不报错 —— 没有预设时入口卡显示「点击设置参数」。
+ */
+async function fetchOrderPresets(): Promise<void> {
+  try {
+    await hub.fetchPresets()
+  } catch {
+    /* 忽略，沿用旧缓存 */
+  }
+}
 
 /**
  * AI 策略保存成功后：按 (AI-Augmentation-用户名-MT5登录号-品种) 幂等创建分组，并把主节点加入、绑定该策略。
@@ -624,6 +632,7 @@ onMounted(async () => {
     }
   }
   void fetchSymbolStrategies()
+  void fetchOrderPresets()
   pollTimer = window.setInterval(() => {
     if (primaryNode.value) {
       hub.fetchNodeAccount(primaryNode.value.node_id).catch(() => {})
@@ -669,13 +678,14 @@ onBeforeUnmount(() => {
                   {{ configuredStrategyCount }} / {{ totalStrategyCount }} 已配置
                 </span>
               </p>
-              <p class="pf-card-sub">开仓策略与 AI 交易策略分频道管理，每个策略独立保存开仓参数</p>
+              <p class="pf-card-sub">开仓预设与 AI 交易策略分频道管理，每个策略独立保存开仓参数</p>
             </div>
           </div>
         </div>
         <p class="us-header-note">
-          每个策略独立保存开仓参数，配置后自动应用到对应品种（当前
-          <span class="us-header-sym">{{ currentSymbol }}</span>）。
+          这里配的是<strong>你下单时的默认参数</strong>，去【交易】页开仓时会自动带入；
+          止损价 / 止盈价 / 挂单价等随行情变化的实时价格仍需现场填写。
+          当前品种：<span class="us-header-sym">{{ currentSymbol }}</span>。
         </p>
       </section>
 
@@ -794,10 +804,10 @@ onBeforeUnmount(() => {
             </div>
             <div
               class="pf-entry-state"
-              :class="entryConfiguredRule(e.key) ? 'done' : 'empty'"
+              :class="entryPreset(e.key) ? 'done' : 'empty'"
             >
               <p class="pf-entry-state-title">
-                <svg v-if="entryConfiguredRule(e.key)" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <svg v-if="entryPreset(e.key)" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   <circle cx="12" cy="12" r="9" />
                   <path d="m8.5 12.5 2.5 2.5 4.5-5" />
                 </svg>
@@ -805,7 +815,7 @@ onBeforeUnmount(() => {
                   <circle cx="12" cy="12" r="9" />
                   <path d="M12 8v8M8 12h8" />
                 </svg>
-                {{ entryConfiguredRule(e.key) ? '已配置' : `点击设置 ${e.title} 参数` }}
+                {{ entryPreset(e.key) ? '已配置' : `点击设置 ${e.title} 参数` }}
               </p>
               <div v-if="entryStateParams(e.key).length" class="pf-entry-state-params">
                 <span v-for="p in entryStateParams(e.key)" :key="p.label" class="pf-entry-param">
@@ -875,7 +885,7 @@ onBeforeUnmount(() => {
       :last-error="lastError"
       :can-submit="canSubmit"
       :current-mid="currentMid"
-      mode="save"
+      mode="preset"
       @update:form="(v) => Object.assign(form, v)"
       @submit="submit"
       @cancel="closeDialog"

@@ -108,6 +108,24 @@ def _build_default_rules(strategy_type: str) -> tuple[str, list[dict]]:
     raise ValueError(f"未知策略类型：{strategy_type}")
 
 
+_STRATEGY_TYPE_LABEL = {
+    "trend_market": "市价开仓",
+    "trend_limit": "限价开仓",
+    "grid": "智能吸筹",
+}
+
+
+def _expected_template_id(strategy_type: str) -> str:
+    """开仓方式 → 应绑定的策略模版 ID。
+
+    市价 / 限价 → 模版2（以损定量）；网格 → 模版3（网格交易）。
+    与 strategy_templates.TEMPLATE_RULE_TYPES 一致。
+    """
+    if strategy_type == "grid":
+        return TEMPLATE_3_ID
+    return TEMPLATE_2_ID
+
+
 def _apply_grid_params(rule: dict, body: "QuickTriggerRequest") -> None:
     """把请求里的网格详情写进 rule dict。已存在的策略走 update_strategy 时复用。
 
@@ -297,6 +315,21 @@ async def quick_trigger(
                         strategy = updated
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=f"更新网格策略失败：{e}")
+
+    # 4b. **模版一致性守卫**：策略实例的模版必须与开仓方式对应。
+    # 历史上分组可能被误绑到别的模版（例如市价开仓的分组绑了网格策略 tpl_3），
+    # 这时后续 PATCH 规则会被后端 validate_rules_for_template 拒收
+    # （「策略模版 tpl_3 不允许规则类型 3」）。这里提前拦下来并给出可读原因。
+    want_tpl = _expected_template_id(body.strategy_type)
+    got_tpl = str((strategy or {}).get("template_id") or "").strip()
+    if got_tpl and got_tpl != want_tpl:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"该分组的策略模版（{got_tpl}）与{_STRATEGY_TYPE_LABEL.get(body.strategy_type, body.strategy_type)}"
+                f"不匹配（应为 {want_tpl}），请在分组/策略页重新绑定后再试"
+            ),
+        )
 
     # 5. 找/建分组
     group = await _find_group_by_name(store, name, owner_user_id=owner)

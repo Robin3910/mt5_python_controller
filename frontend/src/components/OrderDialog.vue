@@ -14,7 +14,7 @@
  *    与 StrategyFormModal.triggerBoundGroup 行为一致，但**不持久化**模版参数，
  *    仅用弹窗里手填的 volume/sl/tp/entry_price/remark 作为本次信号值。
  */
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, nextTick, reactive, ref, watch } from 'vue'
 import { ElDialog, ElMessage } from 'element-plus'
 import 'element-plus/es/components/dialog/style/css'
 import { useHubStore } from '@/stores/hub'
@@ -27,6 +27,8 @@ import type {
   ManualSignalPayload,
   ManualSignalResult,
   GroupOut,
+  OrderPreset,
+  OrderPresetStrategyType,
   StrategyOut as StrategyOutType,
   StrategyRule,
   StrategyTemplateOut,
@@ -69,8 +71,20 @@ const props = defineProps<{
    * 模式：
    *   'trigger' - 点按钮保存策略并 emit 'trigger-strategy' 发信号（TradingView 等管理员场景）
    *   'save'    - 点按钮只保存策略参数，不发信号（UserStrategiesView 等用户场景）
+   *   'preset'  - 点按钮只保存「开仓参数预设」，不发信号、不建分组/策略
+   *              （【策略配置】页配置「我下单时的默认值」）
    */
-  mode?: 'trigger' | 'save'
+  mode?: 'trigger' | 'save' | 'preset'
+  /**
+   * 开仓参数预设（我的下单默认值）。
+   *
+   * 语义：预设是**初始值**，不是强制值 —— 每次开仓时按预设填好，用户当场可改，
+   * 但**改动不写回预设**（下次开仓仍回到预设值）。
+   *
+   * 父级可显式传入；不传时组件内部按 (symbol, strategyType) 从 hub.presets 解析
+   * （精确品种优先，其次 '*' 通用模板）。
+   */
+  preset?: OrderPreset | null
 }>()
 
 const emit = defineEmits<{
@@ -154,8 +168,29 @@ watch(
         props.currentMid != null && isFinite(props.currentMid) && props.currentMid > 0
           ? props.currentMid
           : null
-      // 加载分组详情 + 策略模版 + 已有策略参数
-      await loadGroupAndStrategy()
+      // 「保存预设」模式：不碰分组 / 策略实例（那会产生副作用），
+      // 只拉预设列表并回填固定参数。
+      if (isPresetMode.value) {
+        await loadPresets()
+        applyPresetToForm()
+        // 默认落在「当前品种」：若已存在通用模板（'*'），默认落在通用模板，
+        // 免得用户不小心把品种专属的参数覆盖到通用模板上。
+        const sym = (localForm.symbol || '').trim().toUpperCase()
+        const st = strategyRef.value as OrderPresetStrategyType
+        const hasWildcard = hub.presets.some(
+          (p) => p.symbol === '*' && p.strategy_type === st,
+        )
+        const hasExact = hub.presets.some(
+          (p) => p.symbol === sym && p.strategy_type === st,
+        )
+        presetScope.value = hasWildcard && !hasExact ? 'wildcard' : 'symbol'
+      } else {
+        // 加载分组详情 + 策略模版 + 已有策略参数
+        await loadGroupAndStrategy()
+        // 预设回填（放在策略实例参数之后 —— 预设优先级更高）
+        await loadPresets()
+        applyPresetToForm()
+      }
     }
   },
 )
@@ -196,11 +231,97 @@ const lastStrategyError = ref('')
 const isSaveMode = computed(() => props.mode === 'save')
 
 /**
+ * 是否「保存预设」模式：只写开仓参数预设，不建分组、不建/改策略实例、不发信号。
+ */
+const isPresetMode = computed(() => props.mode === 'preset')
+
+/**
+ * 当前生效的预设：父级显式传入的优先，否则按 (品种, 开仓方式) 从 hub.presets 解析。
+ *
+ * 解析口径与后端 `order_presets.resolve_preset` 一致：精确品种优先，其次 '*' 通用模板。
+ */
+const activePreset = computed<OrderPreset | null>(() => {
+  if (props.preset) return props.preset
+  const sym = (localForm.symbol || '').trim().toUpperCase()
+  if (!sym) return null
+  const st = strategyRef.value as OrderPresetStrategyType
+  return hub.resolvePreset(sym, st)
+})
+
+/**
+ * 「恢复预设」按钮是否可用：当前值与预设值不一致才有意义。
+ *
+ * 这是「预设是初始值」的心智补齐：会话里改乱了固定参数，一键回滚到预设值。
+ */
+const canRestorePreset = computed(() => {
+  const p = activePreset.value
+  if (!p) return false
+  if (isGrid.value) {
+    return (
+      gridParams.grid_mode !== p.grid_mode ||
+      Number(gridParams.max_allow_loss) !== p.max_allow_loss ||
+      gridParams.trailing_up !== p.trailing_up
+    )
+  }
+  return (
+    Number(riskParams.risk_amount) !== p.risk_amount ||
+    Number(riskParams.rr_ratio) !== p.rr_ratio ||
+    Number(riskParams.base_ratio) !== p.base_ratio ||
+    Number(riskParams.breakeven_times) !== p.breakeven_times
+  )
+})
+
+/** 把固定参数恢复到预设值 */
+function restorePreset(): void {
+  const p = activePreset.value
+  if (!p) return
+  if (isGrid.value) {
+    gridParams.grid_mode = p.grid_mode
+    gridParams.max_allow_loss = p.max_allow_loss
+    gridParams.trailing_up = p.trailing_up
+  } else {
+    riskParams.risk_amount = p.risk_amount
+    riskParams.rr_ratio = p.rr_ratio
+    riskParams.base_ratio = p.base_ratio
+    riskParams.breakeven_times = p.breakeven_times
+    // 恢复预设 = 重新采用预设的盈亏比，止盈价反算的联动重新生效
+    rrManualEdited.value = false
+  }
+  ElMessage.success('已恢复为预设参数')
+}
+
+/**
+ * 预设回填：把预设的固定参数写进表单。
+ *
+ * **只回填固定参数**，动态价一律留空（止损价 / 止盈价 / 挂单价；网格的区间与止损价）
+ * —— 这些随行情变化，每次开仓现填。
+ *
+ * 调用时机：弹窗打开、策略实例参数加载完成之后（loadGroupAndStrategy 末尾）。
+ * 放在其后是为了让「策略实例里的规则」先填好，预设再覆盖它 —— 预设优先级更高。
+ */
+function applyPresetToForm(): void {
+  const p = activePreset.value
+  if (!p) return
+  if (isGrid.value) {
+    gridParams.grid_mode = p.grid_mode
+    gridParams.max_allow_loss = p.max_allow_loss
+    gridParams.trailing_up = p.trailing_up
+  } else {
+    riskParams.risk_amount = p.risk_amount
+    riskParams.rr_ratio = p.rr_ratio
+    riskParams.base_ratio = p.base_ratio
+    riskParams.breakeven_times = p.breakeven_times
+    // 预设回填时 tp 尚未填（动态价留空），impliedRr 为 null，不会覆盖 rr_ratio
+    rrManualEdited.value = false
+  }
+}
+
+/**
  * 是否展示「带单」开关：交易弹窗里始终展示（保存模式不发信号，不展示）。
  * 关闭 = 只发给主节点；打开 = 发给分组里的全部节点（含跟单节点）。
  * follow_leader 能力决定的是「能不能出现在带单广场被别人跟」，不决定这个开关出不出现。
  */
-const canCarry = computed(() => !isSaveMode.value)
+const canCarry = computed(() => !isSaveMode.value && !isPresetMode.value)
 
 /**
  * 我是否已暂停【带单】市场。
@@ -225,6 +346,42 @@ const STRATEGY_LABEL: Record<OrderStrategy, string> = {
   trend_market: '市价开仓',
   trend_limit: '限价开仓',
   grid: '智能吸筹',
+}
+
+/**
+ * 每个开仓方式对应的策略模版 ID。
+ *
+ * 市价 / 限价共用模版2（趋势 · 以损定量），网格用模版3（网格交易）。
+ * 与后端 `strategy_templates.TEMPLATE_RULE_TYPES` 一致。
+ */
+const STRATEGY_TEMPLATE_ID: Record<OrderStrategy, string> = {
+  trend_market: 'tpl_2',
+  trend_limit: 'tpl_2',
+  grid: 'tpl_3',
+}
+
+/**
+ * 当前开仓方式**应该**绑定的模版 ID。
+ *
+ * 用途：守卫「拿到的策略实例是不是这一路的策略」。
+ * 三个开仓方式各自有独立的分组 / 策略实例（分组名带 strategy_type 前缀），
+ * 一旦拿串了，用错模版的规则去 PATCH 会被后端按模版-规则一致性拒收
+ * （如「策略模版 tpl_3 不允许规则类型 3」）。
+ */
+const expectedTemplateId = computed<string>(() => STRATEGY_TEMPLATE_ID[strategyRef.value])
+
+/**
+ * 策略实例的模版是否与当前开仓方式匹配。
+ *
+ * 三个开仓方式各自独立：市价/限价 → tpl_2（以损定量），网格 → tpl_3（网格）。
+ * 模版决定该策略实例能接受哪些规则类型（后端 validate_rules_for_template 强校验），
+ * 模版对不上就绝不能拿它去 PATCH 规则。
+ */
+function strategyTemplateMatches(strat: StrategyOutType | null | undefined): boolean {
+  if (!strat) return false
+  const tpl = String(strat.template_id || '').trim()
+  if (!tpl) return false
+  return tpl === expectedTemplateId.value
 }
 
 const GRID_MODE_OPTIONS: readonly { value: GridMode; label: string }[] = [
@@ -524,6 +681,50 @@ const primaryNode = computed(() => hub.nodes.find((n) => n.is_primary && n.enabl
 const strategyLoading = ref(false)
 
 /**
+ * 切换开仓方式（Tab）→ 重新解析分组 / 策略实例，并按该方式的预设回填固定参数。
+ *
+ * 三个方式各有一份预设（市价 / 限价 / 网格），切 Tab 必须换一份，
+ * 否则会把市价的「以损定量 / 盈亏比」带进网格。
+ *
+ * **切 Tab 必须重新解析分组 / 策略实例**：三个开仓方式各有**独立**的分组与策略实例
+ * （分组名带 strategy_type 前缀）。不重新解析就会拿着上一路的策略实例去保存新规则 ——
+ * 后端按「模版-规则一致性」拒收（如「策略模版 tpl_3 不允许规则类型 3」）。
+ */
+watch(strategyRef, async () => {
+  if (isPresetMode.value) {
+    await loadPresets()
+    applyPresetToForm()
+    return
+  }
+  if (!props.modelValue) return
+  // 等父级把新的 groupName 传下来（groupName 由 strategyType 派生，
+  // 父级重渲染后 props 才会更新），否则会拿着上一路的分组名去查。
+  await nextTick()
+  // 切 Tab → 换分组 / 策略实例。先清掉上一路的缓存，避免请求返回前误用旧实例。
+  currentGroup.value = null
+  currentStrategy.value = null
+  await loadGroupAndStrategy()
+  await loadPresets()
+  applyPresetToForm()
+})
+
+/**
+ * 拉取我的开仓参数预设。
+ *
+ * 服务端读取时会顺带做一次老用户种子回填（从已有策略实例推导预设），
+ * 所以这里拿到的列表可能比「用户手动配过的」更多。
+ *
+ * 拉不到不报错 —— 没有预设时按「走现有 group→strategy→rule 兜底」处理。
+ */
+async function loadPresets(): Promise<void> {
+  try {
+    await hub.fetchPresets()
+  } catch {
+    /* 拉不到预设不影响主流程：固定参数回落到策略实例 / 模版默认值 */
+  }
+}
+
+/**
  * 弹窗打开时加载分组详情（含 strategy_id）+ 策略模版列表。
  * 如果该分组已有绑定的策略，从 hub.strategies 里取当前值填入 riskParams。
  *
@@ -546,10 +747,20 @@ async function loadGroupAndStrategy(): Promise<void> {
     }
     // 拉分组列表并找当前分组（含 strategy_id）
     const groups = await hub.listGroups()
-    let grp = groups.find((g) => g.group_id === props.groupId) ?? null
-    // 兜底：按 groupName 找（市价/限价各自独立命名），可能 listGroups 缓存里没这个 groupId
-    if (!grp && props.groupName) {
+    let grp: GroupOut | null = null
+    // **优先按 groupName 找**：三个开仓方式各有独立分组（分组名带 strategy_type 前缀），
+    // groupName 由父级按当前 Tab 响应式算出，切换 Tab 时会跟着变。
+    // props.groupId 是父级在「打开弹窗那一刻」解析的，Tab 切换后就是上一路的陈旧值，
+    // 所以它只能当作兜底，且必须校验名字对得上，否则会拿错分组 → 拿错策略实例。
+    if (props.groupName) {
       grp = groups.find((g) => g.name === props.groupName) ?? null
+    }
+    if (!grp && props.groupId) {
+      const byId = groups.find((g) => g.group_id === props.groupId) ?? null
+      // 名字对得上才认（说明这个 id 恰好就是当前 Tab 的分组）
+      if (byId && (!props.groupName || byId.name === props.groupName)) {
+        grp = byId
+      }
     }
     // 首次开仓：按 props.groupName 自动建分组（市价/限价各自独立）。
     // 注意：limit_watch_enabled 必须等 strategy_id 绑上之后才能开（否则后端
@@ -602,6 +813,17 @@ async function loadGroupAndStrategy(): Promise<void> {
         const found = hub.strategies.find((s) => s.strategy_id === sid)
         strat = found ?? null
       }
+      // **模版一致性守卫**：分组上绑的策略实例必须属于当前开仓方式对应的模版。
+      // 拿错模版（比如市价开仓却绑到了网格策略 tpl_3）时，
+      // 后端 validate_rules_for_template 会拒收（如「策略模版 tpl_3 不允许规则类型 3」）。
+      // 这里直接视为「没有可复用策略」→ 后面走新建流程。
+      let templateMismatch = false
+      if (strat && !strategyTemplateMatches(strat)) {
+        lastStrategyError.value =
+          `分组绑定的策略模版（${strat.template_id}）与当前开仓方式不匹配，已按新策略处理`
+        strat = null
+        templateMismatch = true
+      }
       currentStrategy.value = strat
       // 填入 riskParams（从以损定量规则取第一个启用的）
       if (strat) {
@@ -639,41 +861,57 @@ async function loadGroupAndStrategy(): Promise<void> {
           gridParams.trailing_max = gridRule.trailing_max ?? 0
           gridParams.max_allow_loss = gridRule.assist_max_loss ?? 0
         }
+      } else {
+        // 没有可复用策略（首次开仓 / 模版错配）：回落到模版默认值。
+        // 模版错配时也必须回落 —— 否则表单里还留着上一轮（别的模版）的参数。
+        if (!templateMismatch) currentStrategy.value = null
+        applyTemplateDefaults()
       }
     } else {
       currentStrategy.value = null
       // 没有已有策略时，市价/限价用模版2（以损定量）第一条规则的默认值
-      const tpl2 = templates.value.find((t) => t.template_id === 'tpl_2')
-      const rule = (tpl2?.rules || []).find((r) => r.type === 3)
-      if (rule) {
-        riskParams.risk_amount = rule.risk_amount ?? 100
-        riskParams.rr_ratio = rule.rr_ratio ?? 2.5
-        riskParams.base_ratio = rule.base_ratio ?? 30
-        riskParams.breakeven_times = rule.breakeven_times ?? 0
-      }
-      // 网格用模版3第一条规则的默认值
-      if (isGrid.value) {
-        const tpl3 = templates.value.find((t) => t.template_id === 'tpl_3')
-        const gRule = (tpl3?.rules || []).find((r) => r.type === 4)
-        if (gRule) {
-          gridParams.price_lower = gRule.price_lower ?? 0
-          gridParams.price_upper = gRule.price_upper ?? 0
-          gridParams.grid_count = gRule.grid_count ?? 10
-          gridParams.grid_mode = gRule.grid_mode ?? 'arithmetic'
-          gridParams.lot_per_grid = gRule.lot_per_grid ?? 0.01
-          gridParams.trigger_price = gRule.trigger_price ?? 0
-          gridParams.stop_price =
-            gRule.grid_side === 'short' ? gRule.stop_upper ?? 0 : gRule.stop_lower ?? 0
-          gridParams.take_profit =
-            gRule.grid_side === 'short' ? gRule.stop_lower ?? 0 : gRule.stop_upper ?? 0
-          gridParams.trailing_up = gRule.trailing_up ?? false
-          gridParams.trailing_max = gRule.trailing_max ?? 0
-          gridParams.max_allow_loss = gRule.assist_max_loss ?? 0
-        }
-      }
+      applyTemplateDefaults()
     }
   } finally {
     strategyLoading.value = false
+  }
+}
+
+/**
+ * 用模版默认值回填固定参数。
+ *
+ * 没有可复用策略实例时（首次开仓 / 分组绑的策略模版错配）调用：
+ * 市价/限价 → 模版2（以损定量）的第一条规则；网格 → 模版3（网格）的第一条规则。
+ */
+function applyTemplateDefaults(): void {
+  // 市价/限价用模版2（以损定量）第一条规则的默认值
+  const tpl2 = templates.value.find((t) => t.template_id === 'tpl_2')
+  const rule = (tpl2?.rules || []).find((r) => r.type === 3)
+  if (rule) {
+    riskParams.risk_amount = rule.risk_amount ?? 100
+    riskParams.rr_ratio = rule.rr_ratio ?? 2.5
+    riskParams.base_ratio = rule.base_ratio ?? 30
+    riskParams.breakeven_times = rule.breakeven_times ?? 0
+  }
+  // 网格用模版3第一条规则的默认值
+  if (isGrid.value) {
+    const tpl3 = templates.value.find((t) => t.template_id === 'tpl_3')
+    const gRule = (tpl3?.rules || []).find((r) => r.type === 4)
+    if (gRule) {
+      gridParams.price_lower = gRule.price_lower ?? 0
+      gridParams.price_upper = gRule.price_upper ?? 0
+      gridParams.grid_count = gRule.grid_count ?? 10
+      gridParams.grid_mode = gRule.grid_mode ?? 'arithmetic'
+      gridParams.lot_per_grid = gRule.lot_per_grid ?? 0.01
+      gridParams.trigger_price = gRule.trigger_price ?? 0
+      gridParams.stop_price =
+        gRule.grid_side === 'short' ? gRule.stop_upper ?? 0 : gRule.stop_lower ?? 0
+      gridParams.take_profit =
+        gRule.grid_side === 'short' ? gRule.stop_lower ?? 0 : gRule.stop_upper ?? 0
+      gridParams.trailing_up = gRule.trailing_up ?? false
+      gridParams.trailing_max = gRule.trailing_max ?? 0
+      gridParams.max_allow_loss = gRule.assist_max_loss ?? 0
+    }
   }
 }
 
@@ -962,6 +1200,71 @@ async function saveStrategyOnly(): Promise<void> {
   }
 }
 
+/**
+ * 「保存预设」时的品种维度：
+ *   - 'symbol'：只对当前品种生效（存具体 symbol）
+ *   - 'wildcard'：通用模板，所有品种共用一套（存 '*'）
+ *
+ * 只在「保存预设」模式下有意义。
+ */
+const presetScope = ref<'symbol' | 'wildcard'>('symbol')
+
+/**
+ * 「保存预设」：只写开仓参数预设。
+ *
+ * 与保存策略的两点根本区别：
+ *   1. **不碰分组 / 策略实例** —— 预设是纯前端的「我下单时的默认值」，
+ *      建组建策略有副作用（热推、快照冻结），不该在这里发生；
+ *   2. **只存固定参数** —— 止损价 / 止盈价 / 挂单价（网格：区间上下限 / 止损价）
+ *      每次现填，不进预设。
+ *
+ * 保存的品种维度：
+ *   - 「保存预设」模式下，symbol 为 '*' 时存通用模板；否则存当前品种。
+ */
+async function savePresetOnly(): Promise<void> {
+  const st = strategyRef.value as OrderPresetStrategyType
+  const sym = (localForm.symbol || '').trim().toUpperCase()
+  if (isGrid.value) {
+    if (!(gridParams.max_allow_loss > 0)) {
+      lastStrategyError.value = '以损定量需大于 0'
+      return
+    }
+    if (!GRID_MODE_OPTIONS.some((o) => o.value === gridParams.grid_mode)) {
+      lastStrategyError.value = '网格模式非法'
+      return
+    }
+  } else {
+    const rpErr = validateRiskParams()
+    if (rpErr) { lastStrategyError.value = rpErr; return }
+  }
+  strategySubmitting.value = true
+  lastStrategyError.value = ''
+  try {
+    const payload: Parameters<typeof hub.savePreset>[0] = {
+      symbol: presetScope.value === 'wildcard' ? '*' : sym,
+      strategy_type: st,
+    }
+    if (isGrid.value) {
+      payload.grid_mode = gridParams.grid_mode
+      payload.max_allow_loss = gridParams.max_allow_loss
+      payload.trailing_up = gridParams.trailing_up
+    } else {
+      payload.risk_amount = riskParams.risk_amount
+      payload.rr_ratio = riskParams.rr_ratio
+      payload.base_ratio = riskParams.base_ratio
+      payload.breakeven_times = riskParams.breakeven_times
+    }
+    await hub.savePreset(payload)
+    strategySubmitting.value = false
+    emit('update:modelValue', false)
+    ElMessage.success('预设已保存，下次开仓将自动填入')
+  } catch (e) {
+    strategySubmitting.value = false
+    const err = e as { response?: { data?: { detail?: string } }; message?: string }
+    lastStrategyError.value = err?.response?.data?.detail || err?.message || '保存预设失败'
+  }
+}
+
 /** 市价/限价：只保存策略，不发信号 */
 async function saveRiskStrategyOnly(): Promise<void> {
   const rpErr = validateRiskParams()
@@ -975,7 +1278,13 @@ async function saveRiskStrategyOnly(): Promise<void> {
   strategySubmitting.value = true
   lastStrategyError.value = ''
   try {
-    let strategyId = currentStrategy.value?.strategy_id
+    // **模版一致性守卫**：只有模版与当前开仓方式一致的策略实例才允许被 PATCH。
+    // 模版对不上（如市价开仓却拿到了网格策略 tpl_3）时，后端
+    // validate_rules_for_template 会拒收（如「策略模版 tpl_3 不允许规则类型 3」），
+    // 所以这里视作「没有可复用策略」→ 走新建分支。
+    let strategyId = strategyTemplateMatches(currentStrategy.value)
+      ? currentStrategy.value!.strategy_id
+      : null
     if (strategyId) {
       await hub.updateStrategy(strategyId, {
         name: currentStrategy.value!.name,
@@ -990,7 +1299,11 @@ async function saveRiskStrategyOnly(): Promise<void> {
       try {
         await hub.fetchStrategies({ q: newName })
         existed = (hub.strategies || []).find(
-          (s) => s.name === newName && s.owner_user_id === currentGroup.value?.owner_user_id,
+          (s) =>
+            s.name === newName &&
+            s.owner_user_id === currentGroup.value?.owner_user_id &&
+            // 模版必须与当前开仓方式一致，否则 PATCH 会被后端拒收
+            s.template_id === expectedTemplateId.value,
         )
       } finally {
         hub.strategies = before
@@ -1005,7 +1318,7 @@ async function saveRiskStrategyOnly(): Promise<void> {
         await hub.updateGroup(currentGroup.value.group_id, { strategy_id: existed.strategy_id })
       } else {
         const created = await hub.createStrategy({
-          template_id: tpl2?.template_id ?? '',
+          template_id: tpl2?.template_id || expectedTemplateId.value,
           name: newName,
           symbol: (localForm.symbol || '').trim().toUpperCase(),
           rules,
@@ -1041,7 +1354,13 @@ async function saveGridStrategyOnly(): Promise<void> {
   strategySubmitting.value = true
   lastStrategyError.value = ''
   try {
-    let strategyId = currentStrategy.value?.strategy_id
+    // **模版一致性守卫**：只有模版与当前开仓方式一致的策略实例才允许被 PATCH。
+    // 模版对不上（如市价开仓却拿到了网格策略 tpl_3）时，后端
+    // validate_rules_for_template 会拒收（如「策略模版 tpl_3 不允许规则类型 3」），
+    // 所以这里视作「没有可复用策略」→ 走新建分支。
+    let strategyId = strategyTemplateMatches(currentStrategy.value)
+      ? currentStrategy.value!.strategy_id
+      : null
     if (strategyId) {
       await hub.updateStrategy(strategyId, {
         name: currentStrategy.value!.name,
@@ -1056,7 +1375,11 @@ async function saveGridStrategyOnly(): Promise<void> {
       try {
         await hub.fetchStrategies({ q: gridName })
         existed = (hub.strategies || []).find(
-          (s) => s.name === gridName && s.owner_user_id === currentGroup.value?.owner_user_id,
+          (s) =>
+            s.name === gridName &&
+            s.owner_user_id === currentGroup.value?.owner_user_id &&
+            // 模版必须与当前开仓方式一致（网格 = tpl_3），否则 PATCH 会被后端拒收
+            s.template_id === expectedTemplateId.value,
         )
       } finally {
         hub.strategies = before
@@ -1071,7 +1394,7 @@ async function saveGridStrategyOnly(): Promise<void> {
         await hub.updateGroup(currentGroup.value.group_id, { strategy_id: existed.strategy_id })
       } else {
         const created = await hub.createStrategy({
-          template_id: tpl3?.template_id ?? '',
+          template_id: tpl3?.template_id || expectedTemplateId.value,
           name: gridName,
           symbol: (localForm.symbol || '').trim().toUpperCase(),
           rules,
@@ -1143,7 +1466,13 @@ async function triggerMarketStrategy(): Promise<void> {
   strategySubmitting.value = true
   lastStrategyError.value = ''
   try {
-    let strategyId = currentStrategy.value?.strategy_id
+    // **模版一致性守卫**：只有模版与当前开仓方式一致的策略实例才允许被 PATCH。
+    // 模版对不上（如市价开仓却拿到了网格策略 tpl_3）时，后端
+    // validate_rules_for_template 会拒收（如「策略模版 tpl_3 不允许规则类型 3」），
+    // 所以这里视作「没有可复用策略」→ 走新建分支。
+    let strategyId = strategyTemplateMatches(currentStrategy.value)
+      ? currentStrategy.value!.strategy_id
+      : null
     if (strategyId) {
       // 已存在策略：PATCH 更新（限价/市价各用各的 groupName，绑定的 strategy 不会互相污染）
       await hub.updateStrategy(strategyId, {
@@ -1161,7 +1490,11 @@ async function triggerMarketStrategy(): Promise<void> {
       try {
         await hub.fetchStrategies({ q: newName })
         existed = (hub.strategies || []).find(
-          (s) => s.name === newName && s.owner_user_id === currentGroup.value?.owner_user_id,
+          (s) =>
+            s.name === newName &&
+            s.owner_user_id === currentGroup.value?.owner_user_id &&
+            // 模版必须与当前开仓方式一致，否则 PATCH 会被后端拒收
+            s.template_id === expectedTemplateId.value,
         )
       } finally {
         hub.strategies = before
@@ -1176,7 +1509,7 @@ async function triggerMarketStrategy(): Promise<void> {
         await hub.updateGroup(currentGroup.value.group_id, { strategy_id: existed.strategy_id })
       } else {
         const created = await hub.createStrategy({
-          template_id: tpl2?.template_id ?? '',
+          template_id: tpl2?.template_id || expectedTemplateId.value,
           name: newName,
           symbol: (localForm.symbol || '').trim().toUpperCase(),
           rules,
@@ -1282,7 +1615,13 @@ async function triggerGridStrategy(): Promise<void> {
   strategySubmitting.value = true
   lastStrategyError.value = ''
   try {
-    let strategyId = currentStrategy.value?.strategy_id
+    // **模版一致性守卫**：只有模版与当前开仓方式一致的策略实例才允许被 PATCH。
+    // 模版对不上（如市价开仓却拿到了网格策略 tpl_3）时，后端
+    // validate_rules_for_template 会拒收（如「策略模版 tpl_3 不允许规则类型 3」），
+    // 所以这里视作「没有可复用策略」→ 走新建分支。
+    let strategyId = strategyTemplateMatches(currentStrategy.value)
+      ? currentStrategy.value!.strategy_id
+      : null
     if (strategyId) {
       await hub.updateStrategy(strategyId, {
         name: currentStrategy.value!.name,
@@ -1299,7 +1638,11 @@ async function triggerGridStrategy(): Promise<void> {
       try {
         await hub.fetchStrategies({ q: gridName })
         existed = (hub.strategies || []).find(
-          (s) => s.name === gridName && s.owner_user_id === currentGroup.value?.owner_user_id,
+          (s) =>
+            s.name === gridName &&
+            s.owner_user_id === currentGroup.value?.owner_user_id &&
+            // 模版必须与当前开仓方式一致（网格 = tpl_3），否则 PATCH 会被后端拒收
+            s.template_id === expectedTemplateId.value,
         )
       } finally {
         hub.strategies = before
@@ -1314,7 +1657,7 @@ async function triggerGridStrategy(): Promise<void> {
         await hub.updateGroup(currentGroup.value.group_id, { strategy_id: existed.strategy_id })
       } else {
         const created = await hub.createStrategy({
-          template_id: tpl3?.template_id ?? '',
+          template_id: tpl3?.template_id || expectedTemplateId.value,
           name: gridName,
           symbol: (localForm.symbol || '').trim().toUpperCase(),
           rules,
@@ -1431,11 +1774,13 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
       <div class="od-header">
         <div class="od-title">
           <span class="od-title-main">
-            创建交易
+            {{ isPresetMode ? '开仓参数预设' : '创建交易' }}
             <span class="od-title-dot">·</span>
             <span class="od-title-sym">{{ (localForm.symbol || '').toUpperCase() }}</span>
           </span>
-          <span class="od-title-sub">开仓参数配置</span>
+          <span class="od-title-sub">
+            {{ isPresetMode ? '这里配的是你下单时的默认参数，开仓弹窗会自动带入' : '开仓参数配置' }}
+          </span>
         </div>
         <button class="od-close" aria-label="关闭" @click="close" title="关闭">×</button>
       </div>
@@ -1573,6 +1918,9 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
             <span class="od-affix">倍</span>
           </div>
         </div>
+        <!-- 「保存预设」模式：动态价（止盈 / 挂单 / 止损）不展示也不入预设 ——
+             这些随行情变化，每次开仓现填。 -->
+        <template v-if="!isPresetMode">
         <div class="od-row">
           <div class="od-row-text">
             <div class="od-row-label">止盈价格</div>
@@ -1600,6 +1948,7 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
             <input v-model.number="localForm.sl" class="od-input" type="number" step="0.0001" min="0" placeholder="如 4140.00" />
           </div>
         </div>
+        </template>
 
         <!-- 止盈价提示：填了止盈价后，实际盈亏比已被止盈价「重新定义」，
              这里明确告诉客户当前用的是哪一个，以及不一致时可一键改用。 -->
@@ -1618,7 +1967,54 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
 
       <!-- 网格策略参数 -->
       <template v-if="isGrid">
-        <div class="od-section" style="border-left-color: #22C55E">智能吸筹参数</div>
+        <div class="od-section" style="border-left-color: #22C55E">
+          {{ isPresetMode ? '智能吸筹预设参数' : '智能吸筹参数' }}
+        </div>
+
+        <!-- 「保存预设」模式：只暴露 3 个固定项（网格模式 / 以损定量 / 向上追踪）。
+             区间上下限与止损价随行情变化，每次开仓现填，不进预设。 -->
+        <template v-if="isPresetMode">
+          <div class="od-row">
+            <div class="od-row-text">
+              <div class="od-row-label">网格模式</div>
+              <div class="od-row-sub">等差为每格等距，等比为每格等比例</div>
+            </div>
+            <div class="od-row-control">
+              <select v-model="gridParams.grid_mode" class="od-select">
+                <option v-for="o in GRID_MODE_OPTIONS" :key="o.value" :value="o.value">{{ o.label }}</option>
+              </select>
+            </div>
+          </div>
+          <div class="od-row">
+            <div class="od-row-text">
+              <div class="od-row-label">以损定量</div>
+              <div class="od-row-sub">网格整体的最大可接受亏损，超出会缩减每格手数</div>
+            </div>
+            <div class="od-row-control od-input-affix">
+              <input v-model.number="gridParams.max_allow_loss" class="od-input" type="number" step="10" min="0" placeholder="如 100" />
+              <span class="od-affix">USD</span>
+            </div>
+          </div>
+          <div class="od-row">
+            <div class="od-row-text">
+              <div class="od-row-label">向上追踪</div>
+              <div class="od-row-sub">行情上涨时网格整体上移，不追跌</div>
+            </div>
+            <div class="od-row-control">
+              <button
+                type="button"
+                class="pf-switch"
+                :class="{ on: gridParams.trailing_up }"
+                role="switch"
+                :aria-checked="gridParams.trailing_up"
+                aria-label="向上追踪"
+                @click="gridParams.trailing_up = !gridParams.trailing_up"
+              ></button>
+            </div>
+          </div>
+        </template>
+
+        <template v-else>
         <!-- 网格方向：由「止损价 vs 价格区间」自动判定，只读展示，客户不需要选 -->
         <div class="od-row">
           <div class="od-row-text">
@@ -1690,6 +2086,7 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
         <div v-if="gridSizing.error" class="od-error">
           {{ gridSizing.error }}
         </div>
+        </template>
       </template>
 
       <!-- 策略参数（市价/限价均走 strategy 模型，按 riskParams 实时计算手数）
@@ -1698,7 +2095,7 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
            没开就只展示参数，不影响原 quickTrigger 路径。
            「策略复用」开关决定提交时是 save 策略 + 触发 strategy 信号，
            还是仅用参数走 quickTrigger。-->
-      <div v-if="(isMarket || isLimit) && strategyLoading" class="od-loading">
+      <div v-if="(isMarket || isLimit) && strategyLoading && !isPresetMode" class="od-loading">
         <span class="od-loading-dot"></span>
         <span class="od-loading-dot"></span>
         <span class="od-loading-dot"></span>
@@ -1730,6 +2127,31 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
           <input v-model="localForm.remark" class="od-input" maxlength="64" placeholder="可选" />
         </div>
       </div> -->
+
+      <!-- 「保存预设」模式：适用范围 + 恢复预设 -->
+      <template v-if="isPresetMode">
+        <div class="od-section" style="border-left-color: #64748B">适用范围</div>
+        <div class="od-row">
+          <div class="od-row-text">
+            <div class="od-row-label">应用到</div>
+            <div class="od-row-sub">通用模板对所有品种生效；当前品种只对这一品种生效</div>
+          </div>
+          <div class="od-row-control">
+            <select v-model="presetScope" class="od-select">
+              <option value="symbol">当前品种 {{ (localForm.symbol || '').toUpperCase() }}</option>
+              <option value="wildcard">通用模板（所有品种）</option>
+            </select>
+          </div>
+        </div>
+      </template>
+
+      <!-- 恢复预设：会话里改乱了固定参数，一键回滚到预设值 -->
+      <div v-if="!isPresetMode && canRestorePreset" class="od-notice is-info">
+        <span class="od-notice-text">
+          当前参数已与预设不一致。预设只作为开仓时的初始值，本次改动不会写回预设。
+        </span>
+        <button type="button" class="od-notice-btn" @click="restorePreset">恢复预设</button>
+      </div>
 
       <div v-if="lastError || lastStrategyError" class="od-error">
         {{ lastError || lastStrategyError }}
@@ -1765,8 +2187,17 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
           你已暂停{{ pausedInMarket }}，本次信号仍只下发主节点。
         </div>
         <div class="od-actions">
+          <!-- 「保存预设」模式：只写预设，不发信号、不建分组/策略 -->
+          <button
+            v-if="isPresetMode"
+            class="od-btn-primary"
+            :disabled="strategySubmitting"
+            @click="savePresetOnly"
+          >
+            <span class="od-btn-primary-main">{{ strategySubmitting ? '保存中…' : '保存预设' }}</span>
+          </button>
           <!-- 市价 / 限价：统一走 triggerStrategy（strategy 模型），前端推导 BUY/SEL方向并展示 -->
-          <template v-if="isMarket || isLimit">
+          <template v-else-if="isMarket || isLimit">
             <!-- 仅保存模式 -->
             <button
               v-if="isSaveMode"

@@ -291,3 +291,73 @@ def test_quick_trigger_different_symbol_creates_separate_strategy_and_group(
     b_strat = next(s for s in strats if s["strategy_id"] == b["strategy_id"])
     assert a_strat["symbol"] == "XAUUSD", a_strat
     assert b_strat["symbol"] == "EURUSD", b_strat
+
+
+# ---------------------------------------------------------------------------
+# 模版一致性守卫（回归：曾报「策略模版 tpl_3 不允许规则类型 3」）
+# ---------------------------------------------------------------------------
+
+def test_expected_template_id_mapping():
+    """开仓方式 → 模版 ID：市价/限价 = tpl_2，网格 = tpl_3。"""
+    from app.trading_api import _expected_template_id
+
+    assert _expected_template_id("trend_market") == "tpl_2"
+    assert _expected_template_id("trend_limit") == "tpl_2"
+    assert _expected_template_id("grid") == "tpl_3"
+
+
+def test_quick_trigger_rejects_strategy_bound_to_wrong_template(
+    client, monkeypatch,
+):
+    """策略名对得上、但模版与开仓方式不符时，触发应被拦下并给出可读原因。
+
+    回归场景：市价开仓（tpl_2 / 规则 type=3）名义上的策略被绑成了网格策略（tpl_3），
+    旧实现会走到 PATCH 才被后端 validate_rules_for_template 拒收，
+    报「策略模版 tpl_3 不允许规则类型 3」。现在提前拦截。
+    """
+    admin_token = _admin_token(client)
+    _make_primary_node(client, name="mismatch-node", mt5_login=70666)
+
+    h = _admin_headers(client)
+    listing = client.get("/api/nodes", headers=h).json()
+    primary = next(n for n in listing if n["is_primary"] and n["mt5_login"] == 70666)
+
+    # 造一条「名叫市价开仓、模版却是网格(tpl_3)」的策略 —— 历史误绑留下的脏数据
+    market_name = "trend_market-admin-70666-XAUUSD"
+    created = client.post(
+        "/api/strategies",
+        json={
+            "template_id": "tpl_3",
+            "name": market_name,
+            "symbol": "XAUUSD",
+            "enabled": True,
+            "rules": [{
+                "type": 4,
+                "status": 1,
+                "action": "all",
+                "grid_mode": "arithmetic",
+                "grid_side": "long",
+                "price_lower": 1900.0,
+                "price_upper": 2000.0,
+                "grid_count": 10,
+                "lot_per_grid": 0.01,
+            }],
+        },
+        headers=h,
+    )
+    assert created.status_code in (200, 201), created.text
+    assert created.json()["template_id"] == "tpl_3"
+
+    # 走市价开仓：应被守卫拦下（而不是走到 PATCH 才报规则类型错配）
+    market_body = {
+        "node_id": primary["node_id"],
+        "strategy_type": "trend_market",
+        "symbol": "XAUUSD",
+        "volume": 0.01,
+        "sl": 1900.0,
+    }
+    r = _post_quick_trigger(client, monkeypatch, admin_token, market_body)
+    assert r.status_code == 400, r.text
+    detail = r.json()["detail"]
+    assert "不匹配" in detail, detail
+    assert "tpl_3" in detail and "tpl_2" in detail, detail

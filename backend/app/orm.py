@@ -247,6 +247,71 @@ class UserNewsSettings(Base):
     )
 
 
+class UserOrderPreset(Base):
+    """用户的**开仓参数预设**（我的下单默认值）。
+
+    语义：用户在【我的 → 策略配置】里预设好固定参数，之后每次去【交易】页
+    真实开仓时，弹窗自动把这些参数填好，用户只填随行情变化的实时价格
+    （止损价 / 止盈价 / 挂单价；网格是区间上下限 + 止损价）即可。
+
+    与「策略实例」（`trading_strategies`）的分工 —— 两者刻意分开存：
+      - 策略实例 = **给节点执行的策略配置**，随信号下发到节点，改动有副作用
+        （热推、快照冻结）。
+      - 本表 = **我下单时的初始值**，纯前端体验，不下发节点、不产生副作用。
+
+    为什么单独建表而不是塞进策略规则：
+      1. 价格类参数（止损 / 止盈 / 挂单）本质是**每次下单的实时输入**，随行情
+         变化，存进策略规则会污染节点侧的执行配置；
+      2. 策略规则的 `entry_mode` 一旦定死不能改，而市价 / 限价 / 网格三套
+         参数各自独立，用 (symbol, strategy_type) 维度存更贴切。
+
+    **手数不在这里**：手数由节点按「风险金额 ÷ 止损距离」反推（以损定量），
+    或由网格试算按「最大亏损预算」反推 —— 用户不填手数，存了也没意义。
+
+    维度：
+      - `symbol`：`'*'` 表示**通用模板**（所有品种共用一套）；否则是具体品种
+        （统一大写）。用哨兵值 `'*'` 而不是 NULL —— SQL 唯一索引里 NULL 不参与
+        去重，哨兵值才能让「一人一份通用模板」的约束真正生效。
+      - `strategy_type`：trend_market / trend_limit / grid，三份互不污染
+        （市价与限价的盈亏比往往不同）。
+
+    解析优先级（前端）：精确 symbol 的预设 > `'*'` 通用预设 > 策略实例里的规则
+    > 模版默认值。
+
+    **没有行 = 用默认值**：存量用户零配置即生效，不需要回填。
+    """
+    __tablename__ = "user_order_presets"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "symbol", "strategy_type", name="uq_user_order_preset",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(AutoPK, primary_key=True, autoincrement=True)
+    # 归属用户（users.id）
+    user_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    # '*' = 通用模板；否则具体品种（大写）
+    symbol: Mapped[str] = mapped_column(String(16), nullable=False, default="*")
+    # trend_market / trend_limit / grid
+    strategy_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    # —— 市价 / 限价：固定参数（4 项）——
+    risk_amount: Mapped[float] = mapped_column(Float, nullable=False, default=100.0, server_default="100")
+    rr_ratio: Mapped[float] = mapped_column(Float, nullable=False, default=2.5, server_default="2.5")
+    base_ratio: Mapped[float] = mapped_column(Float, nullable=False, default=30.0, server_default="30")
+    # 保本触发倍数；0 = 不启用（与前端 riskParams.breakeven_times 口径一致）
+    breakeven_times: Mapped[float] = mapped_column(Float, nullable=False, default=0.0, server_default="0")
+    # —— 网格：固定参数（3 项）——
+    # arithmetic（等差） / geometric（等比）
+    grid_mode: Mapped[str] = mapped_column(String(16), nullable=False, default="arithmetic", server_default="arithmetic")
+    # 网格的以损定量（最大可接受亏损）：网格试算的预算输入
+    max_allow_loss: Mapped[float] = mapped_column(Float, nullable=False, default=100.0, server_default="100")
+    trailing_up: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+
 class UserReview(Base):
     """注册用户的一次 KYC 实名审核单。
 

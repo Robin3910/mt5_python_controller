@@ -33,6 +33,7 @@ from . import (
     node_service,
     node_dashboard_api,
     nodes,
+    order_presets_api,
     pending_api,
     phone_auth,
     phone_rebind,
@@ -192,6 +193,7 @@ for r in (
     deals_api.router,
     news_api.router,
     news_api.admin_router,
+    order_presets_api.router,
 ):
     app.include_router(r)
 

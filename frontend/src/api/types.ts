@@ -866,6 +866,40 @@ export interface StrategyTemplateOut {
   rules: StrategyRule[]
 }
 
+/**
+ * 开仓参数预设（我的下单默认值）。
+ *
+ * 在【我的 → 策略配置】里预设好固定参数，之后每次去【交易】页真实开仓时，
+ * 弹窗自动把这些参数填好；用户只填随行情变化的实时价格
+ * （市价/限价：止损价 + 可选止盈价；网格：区间上下限 + 止损价）。
+ *
+ * **手数不在这里** —— 手数由节点按「风险金额 ÷ 止损距离」反推，或由网格试算
+ * 按「最大亏损预算」反推，用户不填手数。
+ */
+export type OrderPresetStrategyType = 'trend_market' | 'trend_limit' | 'grid'
+
+export interface OrderPreset {
+  /** '*' = 通用模板（所有品种共用一套）；否则是具体品种（大写） */
+  symbol: string
+  strategy_type: OrderPresetStrategyType
+  // —— 市价 / 限价：固定参数（4 项）——
+  /** 以损定量（账户货币，USD） */
+  risk_amount: number
+  /** 盈亏比：止盈距离 = 止损距离 × 该值 */
+  rr_ratio: number
+  /** 底仓占总手数的百分比 */
+  base_ratio: number
+  /** 保本触发倍数；0 = 不启用 */
+  breakeven_times: number
+  // —— 网格：固定参数（3 项）——
+  /** 网格模式：arithmetic 等差 / geometric 等比 */
+  grid_mode: GridMode
+  /** 网格的以损定量（最大可接受亏损）：网格试算的预算输入 */
+  max_allow_loss: number
+  /** 向上追踪开关 */
+  trailing_up: boolean
+}
+
 export interface StrategyOut {
   strategy_id: string
   name: string

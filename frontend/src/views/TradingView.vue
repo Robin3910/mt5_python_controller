@@ -825,6 +825,13 @@ async function openDialog(type: TradingStrategyType): Promise<void> {
   form.remark = ''
   lastError.value = ''
   dialogGroupId.value = null
+  // 预拉一次开仓参数预设：OrderDialog 打开时会按 (品种, 开仓方式) 回填固定参数
+  // （精确品种优先，其次 '*' 通用模板）。拉不到不报错 —— 没有预设时按默认值走。
+  try {
+    await hub.fetchPresets()
+  } catch {
+    /* 忽略，沿用旧缓存 */
+  }
   // 预拉一次分组列表：
   // 必须拿到真实 group_id 才能调 POST /api/console/manual-signal 的 strategy 模型（市价开仓）。
   // 拉不到或没匹配上时，市价开仓弹窗会拒绝触发；限价 / 网格不受影响（仍走原 submit 路径）。

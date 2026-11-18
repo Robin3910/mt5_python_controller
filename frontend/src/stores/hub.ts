@@ -28,6 +28,8 @@ import type {
   NodePerformance,
   NodeTokenInfo,
   NodeUpdatePayload,
+  OrderPreset,
+  OrderPresetStrategyType,
   RiskFeedItem,
   SmsConfig,
   GroupTaskEventRecord,
@@ -123,6 +125,8 @@ interface HubState {
   dealVersions: Record<string, number>
   // 策略列表当前的检索词：WS 触发的自动刷新要沿用它
   strategyQuery: string
+  // 开仓参数预设（我的下单默认值）：【策略配置】页预设，【交易】页开仓时回填
+  presets: OrderPreset[]
 }
 
 export const useHubStore = defineStore('hub', {
@@ -141,6 +145,7 @@ export const useHubStore = defineStore('hub', {
     routeRules: [],
     dealVersions: {},
     strategyQuery: '',
+    presets: [],
   }),
   getters: {
     // 在线节点数（优先用实时状态，其次用 REST 字段）
@@ -631,6 +636,60 @@ export const useHubStore = defineStore('hub', {
     async deleteStrategy(id: string, options?: { q?: string }): Promise<void> {
       await api.delete(`/api/strategies/${id}`)
       await this.fetchStrategies(options)
+    },
+    // ---- 开仓参数预设（我的下单默认值）----
+    /**
+     * 拉取我的开仓参数预设。
+     *
+     * 服务端在读取时会顺带做一次老用户种子回填（从已有策略实例推导预设），
+     * 所以这里拿到的列表可能比「用户手动配过的」更多。
+     */
+    async fetchPresets(): Promise<void> {
+      this.presets = (await api.get<{ presets: OrderPreset[] }>('/api/me/order-presets')).data.presets
+    },
+    /** 保存一条预设（upsert），并同步到本地缓存 */
+    async savePreset(payload: {
+      symbol: string
+      strategy_type: OrderPresetStrategyType
+      risk_amount?: number
+      rr_ratio?: number
+      base_ratio?: number
+      breakeven_times?: number
+      grid_mode?: 'arithmetic' | 'geometric'
+      max_allow_loss?: number
+      trailing_up?: boolean
+    }): Promise<OrderPreset> {
+      const { data } = await api.put<{ preset: OrderPreset }>('/api/me/order-presets', payload)
+      const saved = data.preset
+      const idx = this.presets.findIndex(
+        (p) => p.symbol === saved.symbol && p.strategy_type === saved.strategy_type,
+      )
+      if (idx >= 0) this.presets.splice(idx, 1, saved)
+      else this.presets.push(saved)
+      return saved
+    },
+    /** 删除一条预设，并同步到本地缓存 */
+    async removePreset(symbol: string, strategyType: OrderPresetStrategyType): Promise<void> {
+      await api.delete(`/api/me/order-presets/${encodeURIComponent(symbol)}/${encodeURIComponent(strategyType)}`)
+      this.presets = this.presets.filter(
+        (p) => !(p.symbol === symbol && p.strategy_type === strategyType),
+      )
+    },
+    /**
+     * 解析一条预设：精确品种优先，其次 '*' 通用模板。
+     *
+     * 与后端 `order_presets.resolve_preset` 同口径。
+     */
+    resolvePreset(symbol: string, strategyType: OrderPresetStrategyType): OrderPreset | null {
+      const sym = (symbol || '').trim().toUpperCase()
+      if (!sym) return null
+      const exact = this.presets.find(
+        (p) => p.symbol === sym && p.strategy_type === strategyType,
+      )
+      if (exact) return exact
+      return (
+        this.presets.find((p) => p.symbol === '*' && p.strategy_type === strategyType) ?? null
+      )
     },
     // 分组已处理的信号明细（主任务 + 各节点处理过程）
     async fetchGroupSignals(

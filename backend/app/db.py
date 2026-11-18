@@ -713,6 +713,66 @@ def _migrate_news_blackout_tables(sync_conn) -> None:
                 sync_conn.execute(text(f"ALTER TABLE user_news_settings ADD COLUMN {name} {ddl}")            )
 
 
+def _migrate_user_order_presets(sync_conn) -> None:
+    """开仓参数预设表 `user_order_presets` 的幂等补列。
+
+    这是**新表**，`create_all` 会直接建好；这里只做「幂等补列」的兜底，
+    防止出现「先上线了旧版本、后补这几列」的库结构不完整情况。
+
+    - 唯一键 (user_id, symbol, strategy_type)：ORM 里用 UniqueConstraint 建，
+      MySQL 下会生成唯一索引。这里按**列**判断是否已有等价约束，而不是按
+      约束名 —— 约束名在不同方言下表现不一致，按列判断更稳。
+    """
+    inspector = inspect(sync_conn)
+    tables = set(inspector.get_table_names())
+    if "user_order_presets" not in tables:
+        return
+    dialect = sync_conn.engine.dialect.name
+    cols = {c["name"] for c in inspector.get_columns("user_order_presets")}
+    bool_type = "TINYINT(1) NOT NULL DEFAULT 0" if dialect == "mysql" else "BOOLEAN NOT NULL DEFAULT 0"
+    additions = {
+        "symbol": "VARCHAR(16) NOT NULL DEFAULT '*'",
+        "strategy_type": "VARCHAR(16) NOT NULL DEFAULT 'trend_market'",
+        "risk_amount": "FLOAT NOT NULL DEFAULT 100",
+        "rr_ratio": "FLOAT NOT NULL DEFAULT 2.5",
+        "base_ratio": "FLOAT NOT NULL DEFAULT 30",
+        "breakeven_times": "FLOAT NOT NULL DEFAULT 0",
+        "grid_mode": "VARCHAR(16) NOT NULL DEFAULT 'arithmetic'",
+        "max_allow_loss": "FLOAT NOT NULL DEFAULT 100",
+        "trailing_up": bool_type,
+    }
+    for name, ddl in additions.items():
+        if name not in cols:
+            sync_conn.execute(text(f"ALTER TABLE user_order_presets ADD COLUMN {name} {ddl}"))
+
+    # 唯一约束兜底：按列集合判断是否已有等价约束（不按约束名）
+    unique_cols: set[tuple[str, ...]] = set()
+    for uc in inspector.get_unique_constraints("user_order_presets"):
+        names = tuple(uc.get("column_names") or ())
+        if names:
+            unique_cols.add(names)
+    for idx in inspector.get_indexes("user_order_presets"):
+        if idx.get("unique"):
+            names = tuple(idx.get("column_names") or ())
+            if names:
+                unique_cols.add(names)
+    target = ("user_id", "symbol", "strategy_type")
+    if target not in unique_cols:
+        # 用**唯一索引**而不是 ALTER TABLE ADD CONSTRAINT：
+        # SQLite 不支持「加约束」这条 ALTER 语法（会直接报语法错），
+        # 而 CREATE UNIQUE INDEX 两个方言都支持，语义等价。
+        try:
+            sync_conn.execute(
+                text(
+                    "CREATE UNIQUE INDEX uq_user_order_preset "
+                    "ON user_order_presets (user_id, symbol, strategy_type)"
+                )
+            )
+        except Exception:  # noqa: BLE001
+            # 重复建索引失败不影响启动（可能已由 create_all 建好）
+            pass
+
+
 def _migrate_signal_meta_columns(sync_conn) -> None:
     """信号元信息与路由状态的新增列（全部可空 / 有默认值，不影响交易逻辑）。
 
@@ -821,6 +881,7 @@ async def init_db() -> None:
         await conn.run_sync(_migrate_mt5_deal_columns)
         await conn.run_sync(_migrate_user_reviews)
         await conn.run_sync(_migrate_news_blackout_tables)
+        await conn.run_sync(_migrate_user_order_presets)
     logger.info("Database initialized (%s)", engine.url.render_as_string(hide_password=True))
 
 
