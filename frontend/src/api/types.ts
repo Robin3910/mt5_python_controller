@@ -2780,6 +2780,8 @@ export interface FollowNodeBrief {
   status: string | null
   enabled: boolean
   is_primary?: boolean
+  /** 建节点时间（Unix 秒）；详情页算「已运行 N 天」用 */
+  created_at?: number
   /** 主节点 / 机器人在场时附带；不带则表示未接入或离线聚合展示 */
   online?: boolean
   balance?: number | null
