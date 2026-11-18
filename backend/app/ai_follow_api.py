@@ -30,6 +30,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from . import (
     ai_application_store,
+    ai_follow_first_open,
     ai_follow_nodes,
     ai_robot_detail,
     deal_stats,
@@ -518,6 +519,10 @@ async def list_my_ai_followings(
             applications=await ai_application_store.list_mine(p.user_id),
         )
 
+    owned_node_ids = {node["node_id"] for node in all_nodes if permissions.same_owner(node.get("owner_user_id"), owner)}
+    followed_pairs = {(f["group_id"], f["node_id"]) for items in by_leader.values() for f in items
+                      if f["node_id"] in owned_node_ids and not f.get("review_status")}
+    first_opens = await ai_follow_first_open.list_first_opens(p.user_id, followed_pairs)
     following_out: list[dict] = []
     for lid, items in sorted(by_leader.items()):
         user = await user_service.get_user_by_id(lid)
@@ -587,6 +592,9 @@ async def list_my_ai_followings(
                     "marketable": has_cap,
                 },
                 "groups": [group_out],
+                "investment_amount": ai_follow_first_open.total_balance(
+                    first_opens.get((gid, f["node_id"])) for f in fs if (gid, f["node_id"]) in followed_pairs
+                ),
                 "review_status": next((f["review_status"] for f in fs if f.get("review_status")), None),
             })
     return AiMeResponse(

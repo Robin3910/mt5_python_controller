@@ -3077,6 +3077,7 @@ export interface AiMyRobot {
   is_owner: boolean
   robot: AiRobotSummary
   groups: AiMyGroup[]
+  investment_amount: number | null
 }
 
 export interface AiMeResponse {

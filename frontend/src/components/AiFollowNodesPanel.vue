@@ -67,7 +67,7 @@ function money(value: number | null | undefined, signed = false): string {
       <div class="an-summary">
         <div><span>跟单节点</span><strong>{{ data.summary.node_count }} 个</strong></div>
         <div><span>持仓手数</span><strong>{{ money(data.summary.volume) }} 手</strong></div>
-        <div><span>总投资额</span><strong>{{ money(data.summary.investment_amount) }}<template v-if="data.summary.investment_amount != null"> U</template></strong></div>
+        <div><span>首单账户余额</span><strong>{{ money(data.summary.investment_amount) }}<template v-if="data.summary.investment_amount != null"> U</template></strong></div>
         <div><span>总浮动盈亏</span><strong :class="{ up: data.summary.floating_profit != null && data.summary.floating_profit >= 0, down: data.summary.floating_profit != null && data.summary.floating_profit < 0 }">{{ money(data.summary.floating_profit, true) }}</strong></div>
       </div>
       <p class="an-note">盈利节点 <b class="up">{{ data.summary.profitable_node_count ?? '—' }}</b> / {{ data.summary.active_node_count }} · 共持仓 <b>{{ data.summary.position_count ?? '—' }}</b> 笔 · 汇总数据仅统计运行中与已暂停节点</p>

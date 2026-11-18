@@ -9,6 +9,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     DateTime,
+    Double,
     Float,
     Integer,
     String,
@@ -701,6 +702,16 @@ class AiFollowApplicationNode(Base):
     status: Mapped[str] = mapped_column(String(16), default="pending")
     original_follow_state: Mapped[str] = mapped_column(String(16), default="running")
     joined_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class AiFollowFirstOpen(Base):
+    __tablename__ = "ai_follow_first_open"
+
+    follower_user_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    group_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    node_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    deal_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    balance: Mapped[float | None] = mapped_column(Double, nullable=True)
 
 
 class DeletedNode(Base):

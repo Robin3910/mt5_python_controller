@@ -130,6 +130,7 @@ interface MyRobotEntry {
   robot: AiRobotSummary
   marketable: boolean
   groups: AiMyGroup[]
+  investment_amount: number | null
   /** 聚合后每个节点的详情（去重），用于「我的 AI 跟单」区 */
   nodes: MyFollowedNode[]
 }
@@ -174,6 +175,7 @@ const myFollowing = computed<MyRobotEntry[]>(() =>
       robot: r.robot,
       marketable: r.robot.marketable,
       groups,
+      investment_amount: r.investment_amount,
       nodes: [...nodesById.values()].sort((a, b) => a.node_id.localeCompare(b.node_id)),
     }
   }),
@@ -911,7 +913,7 @@ onMounted(() => { void hub.fetchNodes(); trackAiUi('page_view', { value: 'ai-tra
             <div><span>总浮动盈亏</span><strong :class="bookStats(robotPositions(entry)).profit >= 0 ? 'up' : 'down'">{{ fmtU(bookStats(robotPositions(entry)).profit) }} U</strong></div>
             <div><span>持仓笔数</span><strong>{{ bookStats(robotPositions(entry)).count }} 笔</strong></div>
             <div><span>合计手数</span><strong>{{ bookStats(robotPositions(entry)).volume.toFixed(2) }} 手</strong></div>
-            <div><span>投资额</span><strong>—</strong></div>
+            <div><span>首单账户余额</span><strong>{{ entry.investment_amount == null ? '—' : entry.investment_amount.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' U' }}</strong></div>
             <div><span>总利润</span><strong :class="hasPerf(entry.robot) ? (perfOf(entry.robot).total_profit >= 0 ? 'up' : 'down') : ''">{{ hasPerf(entry.robot) ? fmtU(perfOf(entry.robot).total_profit) : '—' }}</strong></div>
             <div><span>月化收益</span><strong>—</strong></div>
           </div>

@@ -116,7 +116,7 @@ onUnmounted(() => {
         </div>
         <div class="rd-metrics">
           <div><span>跟单节点</span><strong>{{ detail.metrics.follow_node_count }} 个</strong></div>
-          <div><span>总投资额</span><strong>{{ money(detail.metrics.investment_amount) }}<small v-if="detail.metrics.investment_amount != null"> U</small></strong></div>
+          <div><span>首单账户余额</span><strong>{{ money(detail.metrics.investment_amount) }}<small v-if="detail.metrics.investment_amount != null"> U</small></strong></div>
           <div><span>总浮动盈亏</span><strong :class="{ up: detail.metrics.floating_profit != null && detail.metrics.floating_profit >= 0, down: detail.metrics.floating_profit != null && detail.metrics.floating_profit < 0 }">{{ money(detail.metrics.floating_profit, true) }}</strong></div>
           <div><span>持仓手数</span><strong>{{ money(detail.metrics.volume) }} 手</strong></div>
         </div>

@@ -80,6 +80,7 @@ async def build_detail(store: RedisStore, principal: Principal, entry: AiMyRobot
         "position_count": position_count if live_available else None,
         "volume": round(volume, 2) if live_available else None,
         "profitable_node_count": sum(profit > 0 for profit in profits) if live_available else None,
+        "investment_amount": entry.investment_amount,
     }
     performance = await deal_stats.leader_batch(node_ids, node_magics=node_magics)
     daily_profit = await deal_stats.daily_net_profit(node_ids, days=7, node_magics=node_magics)

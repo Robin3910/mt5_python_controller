@@ -6,7 +6,7 @@ import asyncio
 from fastapi import HTTPException
 from sqlalchemy import select
 
-from . import ai_application_store, ai_robot_detail, follow_rules, follow_service, permissions, persist
+from . import ai_application_store, ai_follow_first_open, ai_robot_detail, follow_rules, follow_service, permissions, persist
 from .db import SessionLocal
 from .follow_channel_api import close_follow_channel
 from .models import FollowChannelCloseRequest
@@ -39,11 +39,19 @@ async def node_stats(store, principal) -> dict:
     node_ids = list(by_node)
     group_ids = list({relation["group_id"] for relations in by_node.values() for relation in relations})
     scopes = await ai_robot_detail.group_node_magics(node_ids, group_ids)
+    active_pairs = {(relation["group_id"], node_id) for node_id, relations in by_node.items() for relation in relations
+                    if relation["follow_state"] != "stopped" and not relation.get("review_status")}
+    first_opens = await ai_follow_first_open.list_first_opens(principal.user_id, active_pairs)
     accounts = await asyncio.gather(*(store.get_account(node_id) for node_id in node_ids))
     cards = []
+    account_opens = []
     for node_id, account in zip(node_ids, accounts):
         node = owned_nodes[node_id]
         relations = by_node[node_id]
+        opens = [first_opens.get((relation["group_id"], node_id)) for relation in relations
+                 if (relation["group_id"], node_id) in active_pairs]
+        if opens:
+            account_opens.append(min(opens, key=lambda opening: (opening.deal_id or 0) if opening else 0))
         states = {"paused" if relation.get("leader_paused") and relation["follow_state"] != "stopped" else relation["follow_state"] for relation in relations}
         follow_state = "running" if "running" in states else "paused" if "paused" in states else "stopped"
         magics = set().union(*(scopes[relation["group_id"]][node_id] for relation in relations))
@@ -83,7 +91,7 @@ async def node_stats(store, principal) -> dict:
             "volume": round(sum(card["volume"] for card in active), 2) if available else None,
             "floating_profit": round(sum(card["floating_profit"] for card in active), 2) if available else None,
             "profitable_node_count": sum(card["floating_profit"] > 0 for card in active) if available else None,
-            "investment_amount": None,
+            "investment_amount": ai_follow_first_open.total_balance(account_opens),
         },
     }
 

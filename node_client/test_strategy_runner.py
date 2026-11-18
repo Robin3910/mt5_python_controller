@@ -510,6 +510,18 @@ def _tpl1_runner(sent: list, *, mt5=None, template_id: str = "tpl_1"):
     )
 
 
+async def test_ai_first_order_reports_requested_balance_snapshot():
+    sent = []
+    mt5 = MockMT5Client()
+    mt5.balance = 1200.25
+    runner, _ = _tpl1_runner(sent, mt5=mt5)
+    runner.entry["capture_balance_before_open"] = True
+    assert await runner._open_first()
+    report, = _of_type(sent, "trade_result")
+    assert report["balance_before_open"] == 1200.25
+    assert report["deal"] == mt5.history_deals_since(0)[0]["deal_id"]
+
+
 async def test_tpl1_subscribes_with_finish_on_empty():
     """只有 tpl_1 才让 hub 在「从未见过持仓」时也派发 GONE。"""
     sent: list = []
