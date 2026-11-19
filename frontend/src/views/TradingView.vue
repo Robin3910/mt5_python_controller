@@ -1344,7 +1344,7 @@ onBeforeUnmount(() => {
               <strong :class="book.profit >= 0 ? 'up' : 'down'">{{ fmtSigned(book.profit) }}</strong>
             </header>
             <div class="tr-grid tr-pos-grid tr-head">
-              <span>#</span><span>魔术号</span><span>方向</span><span>手数</span><span>开仓价</span><span>止盈/止损</span><span>浮动盈亏</span><span>操作</span>
+              <span>#</span><span>方向</span><span>手数</span><span>开仓价</span><span>止盈/止损</span><span>浮动盈亏</span><span>操作</span>
                         </div>
             <template v-for="group in book.groups" :key="group.magic">
               <div class="tr-magic-head">
@@ -1356,7 +1356,7 @@ onBeforeUnmount(() => {
               </div>
               <div v-for="(p, i) in group.rows" :key="p.ticket" class="tr-grid tr-pos-grid tr-line">
                 <span class="dim">{{ i + 1 }}</span>
-                <span class="tr-magic-col">{{ p.magic || '—' }}</span>
+                <!-- <span class="tr-magic-col">{{ p.magic || '—' }}</span> -->
                 <span><i class="dir" :class="isBuySide(p.type) ? 'buy' : 'sell'">{{ fmtPosType(p.type) }}</i></span>
                 <span class="num">{{ (p.volume || 0).toFixed(2) }}</span>
                 <span class="num">{{ fmtPx(p.price_open, p.symbol) }}</span>
@@ -1518,7 +1518,7 @@ onBeforeUnmount(() => {
               <strong :class="book.profit >= 0 ? 'up' : 'down'">{{ fmtSigned(book.profit) }}</strong>
             </header>
             <div class="tr-grid tr-hist-grid tr-head">
-              <span>#</span><span>魔术号</span><span>时间</span><span>方向</span><span>手数</span><span>开仓价</span><span>平仓价</span><span>盈亏</span>
+              <span>#</span><span>时间</span><span>方向</span><span>手数</span><span>开仓价</span><span>平仓价</span><span>盈亏</span>
             </div>
             <template v-for="group in book.groups" :key="group.magic">
               <div class="tr-magic-head">
@@ -1531,7 +1531,7 @@ onBeforeUnmount(() => {
               </div>
               <div v-for="(row, i) in group.rows" :key="row.key" class="tr-grid tr-hist-grid tr-line">
                 <span class="dim">{{ i + 1 }}</span>
-                <span class="tr-magic-col">{{ row.magic || '—' }}</span>
+                <!-- <span class="tr-magic-col">{{ row.magic || '—' }}</span> -->
                 <span class="dim">{{ fmtPosTime(row.time) }}</span>
                 <span><i class="dir" :class="isBuySide(row.direction) ? 'buy' : 'sell'">{{ fmtPosType(row.direction) }}</i></span>
                 <span class="num">{{ row.volume.toFixed(2) }}</span>
