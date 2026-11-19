@@ -198,13 +198,6 @@ function isAiStrategyRow(row: { ai_template?: string } | null | undefined): bool
 const allPositions = computed<Position[]>(() => {
   return (account.value?.positions || []).filter((p) => !isAiStrategyRow(p))
 })
-/** 被隐藏的 AI 策略仓位 / 挂单笔数（仅用于给一句提示，不参与任何汇总口径） */
-const aiHiddenPositionCount = computed(
-  () => (account.value?.positions || []).filter((p) => isAiStrategyRow(p)).length,
-)
-const aiHiddenPendingCount = computed(
-  () => (account.value?.orders || []).filter((o) => isAiStrategyRow(o)).length,
-)
 const totalPosCount = computed(() => allPositions.value.length)
 const totalPosVolume = computed(() =>
   allPositions.value.reduce((a, p) => a + (p.volume || 0), 0),
@@ -1398,9 +1391,6 @@ onBeforeUnmount(() => {
           <p v-if="positionBooks.length" class="tr-foot-note">
             当前持仓 {{ totalPosCount }} 笔 · 合计手数 {{ totalPosVolume.toFixed(2) }} · 浮动盈亏 {{ fmtSigned(totalPosPnl) }}
           </p>
-          <p v-if="aiHiddenPositionCount > 0" class="tr-foot-note">
-            AI 智能加仓策略另有 {{ aiHiddenPositionCount }} 笔持仓，不在本页展示（见【AI 交易】）
-          </p>
 
           <!-- ── 未成交挂单 ──
                与持仓分开一块：限价开仓成交前账户里没有任何持仓，
@@ -1414,9 +1404,6 @@ onBeforeUnmount(() => {
             该节点客户端未上报挂单（版本过低），无法展示未成交挂单
           </p>
           <p v-if="!pendingBooks.length" class="tr-empty-line">暂无挂单</p>
-          <p v-if="aiHiddenPendingCount > 0" class="tr-foot-note">
-            AI 智能加仓策略另有 {{ aiHiddenPendingCount }} 张挂单，不在本页展示（见【AI 交易】）
-          </p>
           <section v-for="book in pendingBooks" :key="`pend-${book.symbol}`" class="tr-book tr-pend-book">
             <header class="tr-book-head">
               <div>
