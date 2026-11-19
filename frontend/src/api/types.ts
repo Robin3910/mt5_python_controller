@@ -229,6 +229,11 @@ export interface Position {
   magic: number
   comment: string
   time: number
+  /**
+   * 所属策略子任务的模版 ID（后端按魔术号反查后补上；对不上 / 老节点无此字段）。
+   * 前端据此识别 AI 智能加仓（`tpl_1`）的仓位。
+   */
+  ai_template?: string
 }
 
 export interface QuoteInfo {
@@ -255,6 +260,8 @@ export interface PendingOrder {
   pending_kind?: 'limit' | 'stop' | string
   /** 挂单当前市场价；老版本节点不上报 */
   price_current?: number
+  /** 所属策略子任务的模版 ID（后端按魔术号反查后补上；对不上 / 老节点无此字段） */
+  ai_template?: string
 }
 
 export interface AccountSnapshot {
