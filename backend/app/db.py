@@ -351,6 +351,52 @@ def _migrate_node_group_member_limit_watch(sync_conn) -> None:
     )
 
 
+def _migrate_group_task_stop_source(sync_conn) -> None:
+    """group_task_dispatch.stop_source：这次终止是谁发起的。
+
+    - self            自己停自己（自己节点上的手动终止）
+    - leader_cascade  被带单员在主节点上的终止连带
+    - account_close   账户级全平
+    - leave_follow    跟单员移出跟单
+    - close_signal    Webhook CLOSE 信号
+
+    列可空且**没有默认值**：存量行为 NULL（来源未知），前端按「未知来源」展示，
+    零行为变化。
+    """
+    inspector = inspect(sync_conn)
+    if "group_task_dispatch" not in set(inspector.get_table_names()):
+        return
+    cols = {c["name"] for c in inspector.get_columns("group_task_dispatch")}
+    if "stop_source" in cols:
+        return
+    sync_conn.execute(
+        text("ALTER TABLE group_task_dispatch ADD COLUMN stop_source VARCHAR(24)")
+    )
+    # 统计 / 筛选常按来源聚合，补一个普通索引
+    index = "ix_group_task_dispatch_stop_source"
+    if index not in {i.get("name") for i in inspector.get_indexes("group_task_dispatch")}:
+        sync_conn.execute(text(f"CREATE INDEX {index} ON group_task_dispatch (stop_source)"))
+
+
+def _migrate_node_group_stop_cascade(sync_conn) -> None:
+    """node_group.stop_cascade_enabled：终止时是否连带终止跟单节点（默认开）。
+
+    布尔列给 NOT NULL DEFAULT 1：存量分组一律视为「连带」，
+    这正是本次改造想要的默认行为，零行为变化。
+    """
+    inspector = inspect(sync_conn)
+    if "node_group" not in set(inspector.get_table_names()):
+        return
+    cols = {c["name"] for c in inspector.get_columns("node_group")}
+    if "stop_cascade_enabled" in cols:
+        return
+    dialect = sync_conn.engine.dialect.name
+    bool_type = "TINYINT(1) NOT NULL DEFAULT 1" if dialect == "mysql" else "BOOLEAN NOT NULL DEFAULT 1"
+    sync_conn.execute(
+        text(f"ALTER TABLE node_group ADD COLUMN stop_cascade_enabled {bool_type}")
+    )
+
+
 def _migrate_group_task_strategy_columns(sync_conn) -> None:
     """为已存在的分组任务表补充策略托管所需列（create_all 不会改已存在的表）。"""
     inspector = inspect(sync_conn)
@@ -865,6 +911,8 @@ async def init_db() -> None:
         await conn.run_sync(_migrate_node_group_accept_ai_follow)
         await conn.run_sync(_migrate_node_group_member_limit_watch)
         await conn.run_sync(_migrate_group_task_strategy_columns)
+        await conn.run_sync(_migrate_group_task_stop_source)
+        await conn.run_sync(_migrate_node_group_stop_cascade)
         await conn.run_sync(_migrate_node_risk_json)
         await conn.run_sync(_migrate_node_trend_json)
         await conn.run_sync(_migrate_node_client_version)

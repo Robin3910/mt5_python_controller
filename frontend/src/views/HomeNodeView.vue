@@ -301,7 +301,7 @@ async function closeChannel(mode: 'all' | 'profit' | 'ticket', ticket?: number):
   } else {
     if (!holding.value.length) { ElMessage.info('本频道没有持仓'); return }
     const ok = await confirmAction(
-      `确认平掉${label}频道的全部持仓？\n将终止本频道仍在运行的策略任务。另一个频道不受影响。`,
+      `确认平掉${label}频道的全部持仓？\n将终止本频道仍在运行的策略任务。另一个频道不受影响。\n若这是带单方自有节点，跟单节点的同频道任务会一起被连带终止。`,
       '确认平仓',
     )
     if (!ok) return
@@ -314,7 +314,14 @@ async function closeChannel(mode: 'all' | 'profit' | 'ticket', ticket?: number):
       ticket: ticket ?? null,
     })
     if (data.status === 'partial') ElMessage.warning(`已提交，有 ${data.failed?.length || 0} 笔未确认`)
-    else ElMessage.success('已提交平仓')
+    else {
+      const cascaded = data.cascade?.total ?? 0
+      ElMessage.success(
+        cascaded
+          ? `已提交平仓，并连带终止 ${cascaded} 个跟单节点子任务`
+          : '已提交平仓',
+      )
+    }
     await loadChannels()
   } catch (e) {
     ElMessage.error(errText(e, '平仓失败'))

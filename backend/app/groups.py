@@ -179,6 +179,7 @@ async def _to_group_out(
         limit_watch_enabled=bool(d.get("limit_watch_enabled", False)),
         limit_watch_keyword=normalize_keyword(d.get("limit_watch_keyword")),
         accept_ai_follow=bool(d.get("accept_ai_follow", False)),
+        stop_cascade_enabled=bool(d.get("stop_cascade_enabled", True)),
         signal_source=normalize_signal_source(d.get("signal_source")),
         strategy_id=strategy_id,
         strategy_name=strategy_name,
