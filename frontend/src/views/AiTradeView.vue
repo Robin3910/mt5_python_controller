@@ -115,6 +115,8 @@ interface MyFollowedNode {
   node_id: string
   name: string | null
   mt5_login: number | null
+  /** 我名下该节点是否是主节点（「当前交易」只展示主节点口径） */
+  is_primary: boolean
   joined_at: number | null
   active_task_count: number
   batch_limit: number
@@ -161,6 +163,7 @@ const myFollowing = computed<MyRobotEntry[]>(() =>
             node_id: n.node_id,
             name: n.name ?? null,
             mt5_login: n.mt5_login ?? null,
+            is_primary: !!n.is_primary,
             joined_at: n.joined_at ?? null,
             active_task_count: g.active_task_count,
             batch_limit: batchLimit,
@@ -685,6 +688,7 @@ async function loadAiBooks(nodeIds: string[]) {
   }))
 }
 
+/** 该机器人名下我涉及的全部节点（跟单节点 + 主人视角下的主节点）。 */
 function robotNodeIds(entry: MyRobotEntry): string[] {
   const ids = entry.nodes.map((node) => node.node_id)
   const primaryId = entry.robot.primary_node?.node_id
@@ -692,12 +696,60 @@ function robotNodeIds(entry: MyRobotEntry): string[] {
   return [...new Set(ids)]
 }
 
+/**
+ * 「当前交易」的口径节点 = **我自己的主节点**。
+ *
+ * 之前把所有跟单节点的持仓混在一起展示，数字对不上任何一个具体账户，
+ * 用户也看不出这些仓位到底跑在哪个节点上。现在统一只看主节点：
+ *   - 主人视角：机器人主节点（自己的主节点）；
+ *   - 跟单员视角：我名下 is_primary 的那个节点（我用主节点跟的那部分）。
+ *
+ * 跟单员若没用主节点跟这个机器人，这里取不到主节点 —— 持仓区留空，
+ * 而不是把别的节点的仓位顶上来（顶上来等于口径又乱了）。
+ */
+function primaryNodeIdOf(entry: MyRobotEntry): string | null {
+  const mine = entry.nodes.find((node) => node.is_primary)
+  if (mine) return mine.node_id
+  if (entry.is_owner) return entry.robot.primary_node?.node_id ?? null
+  return null
+}
+
+/** 主节点展示名（口径说明用）。 */
+function primaryNodeLabel(entry: MyRobotEntry): string {
+  const id = primaryNodeIdOf(entry)
+  if (!id) return '主节点'
+  const own = entry.nodes.find((node) => node.node_id === id)
+  const primary = entry.robot.primary_node
+  const name = own?.name ?? (primary?.node_id === id ? primary.name : null)
+  return name || id
+}
+
 watch(myFollowing, (list) => {
   const ids = [...new Set(list.flatMap(robotNodeIds))]
   if (ids.length) void loadAiBooks(ids)
 }, { immediate: true })
 
+/** 展示用持仓：只取主节点口径。 */
 function robotPositions(entry: MyRobotEntry): Array<Position & { nodeId: string }> {
+  const groups = new Set(entry.groups.map((g) => g.group_id))
+  const rows: Array<Position & { nodeId: string }> = []
+  const nodeId = primaryNodeIdOf(entry)
+  if (!nodeId) return rows
+  const hits = (aiMagics.value[nodeId] || []).filter((m) => !groups.size || groups.has(m.group_id))
+  const magics = new Set(hits.map((m) => m.magic))
+  for (const position of hub.accounts[nodeId]?.positions || []) {
+    if (magics.has(position.magic)) rows.push({ ...position, nodeId })
+  }
+  return rows
+}
+
+/**
+ * 一键平仓口径：**全部**涉及节点（不止主节点）。
+ *
+ * 平仓是操作行为，不是展示行为 —— 跟单员的仓位散在自己的多个节点上，
+ * 只平主节点会留下「界面看不到了但还挂着」的仓位，所以这里保持全量。
+ */
+function allRobotPositions(entry: MyRobotEntry): Array<Position & { nodeId: string }> {
   const groups = new Set(entry.groups.map((g) => g.group_id))
   const rows: Array<Position & { nodeId: string }> = []
   for (const nodeId of robotNodeIds(entry)) {
@@ -869,7 +921,7 @@ async function closeRobotTicket(nodeId: string, ticket: number) {
   } finally { closeBusy.value = false }
 }
 async function closeRobotAll(entry: MyRobotEntry) {
-  const rows = robotPositions(entry)
+  const rows = allRobotPositions(entry)
   if (!rows.length) { ElMessage.info('没有可平的持仓'); return }
   try {
     await ElMessageBox.confirm(`确认平掉「${robotTitle(entry.robot)}」在你节点上的 ${rows.length} 笔 AI 持仓？`, '一键平仓', {
@@ -987,7 +1039,7 @@ onMounted(() => { void hub.fetchNodes(); trackAiUi('page_view', { value: 'ai-tra
           <svg viewBox="0 0 24 24"><path fill="currentColor" d="M13 3a9 9 0 1 0 9 9h-2a7 7 0 1 1-2.05-4.95L16 9h5V4l-1.64 1.64A8.96 8.96 0 0 0 13 3zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8z"/></svg>
           历史机器人<span>{{ historyMine.length }}</span>
         </button>
-        <button type="button" :class="{ on: mineTab === 'pending' }" @click="mineTab = 'pending'">⌛ 待审核<span>{{ pendingApplications.length }}</span></button>
+        <!-- <button type="button" :class="{ on: mineTab === 'pending' }" @click="mineTab = 'pending'">⌛ 待审核<span>{{ pendingApplications.length }}</span></button> -->
         <button type="button" class="push" :class="{ on: mineTab === 'nodes' }" @click="mineTab = 'nodes'">
           <svg viewBox="0 0 24 24"><path fill="currentColor" d="M22 11V3h-7v3H9V3H2v8h7V8h2v10h4v3h7v-8h-7v3h-2V8h2v3z"/></svg>
           子节点跟单统计<span>{{ followNodeCount }}</span>
@@ -1027,7 +1079,7 @@ onMounted(() => { void hub.fetchNodes(); trackAiUi('page_view', { value: 'ai-tra
             </div>
           </div>
           <div v-if="robotPositions(entry).length" class="ai-pos-table">
-            <div class="ai-trade-label"><p><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M6.99 11 3 15l3.99 4v-3H14v-2H6.99v-3zM21 9l-3.99-4v3H10v2h7.01v3L21 9z"/></svg>当前交易</p><span>{{ bookStats(robotPositions(entry)).count }} 笔 · {{ bookStats(robotPositions(entry)).volume.toFixed(2) }} 手</span></div>
+            <div class="ai-trade-label"><p><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M6.99 11 3 15l3.99 4v-3H14v-2H6.99v-3zM21 9l-3.99-4v3H10v2h7.01v3L21 9z"/></svg>当前交易</p><span>{{ primaryNodeLabel(entry) }} · {{ bookStats(robotPositions(entry)).count }} 笔 · {{ bookStats(robotPositions(entry)).volume.toFixed(2) }} 手</span></div>
             <!-- H5 适配：按「品种 → 魔术号」分块，每张表包在 .ai-scroll 里横向滑动，
                  窄屏下列宽不再被压缩，「操作」列不会被挤出屏幕（与 TradingView 一致）。 -->
             <section v-for="book in symbolBooks(robotPositions(entry))" :key="`${entry.robot.group_id}-${book.symbol}`" class="ai-book">
