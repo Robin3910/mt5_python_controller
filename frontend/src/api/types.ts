@@ -2979,6 +2979,8 @@ export interface AiRobotSummary {
   ai_group_count: number
   /** 当前分组绑定的策略名称；无策略时为 null */
   strategy_name: string | null
+  symbol?: string | null
+  started_at?: number | null
   /** 当前分组的策略名，保留数组格式 */
   strategy_names: string[]
   editable_strategy_id: string | null

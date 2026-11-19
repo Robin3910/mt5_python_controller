@@ -1523,6 +1523,8 @@ class AiRobotSummary(BaseModel):
     ai_group_count: int = 0
     # 当前分组绑定的策略名称（列表页标题用）。
     strategy_name: Optional[str] = None
+    symbol: Optional[str] = None
+    started_at: Optional[float] = None  # 分组创建时间（Unix 秒）
     # 当前分组策略名；保留数组格式供已有调用方使用。
     strategy_names: list[str] = Field(default_factory=list)
     editable_strategy_id: Optional[str] = None

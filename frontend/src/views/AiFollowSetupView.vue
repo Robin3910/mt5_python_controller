@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import RobotIcon from '@/components/RobotIcon.vue'
@@ -8,6 +8,7 @@ import type { AiRobotDetailResponse } from '@/api/types'
 import { useAuthStore } from '@/stores/auth'
 import { useAiFollowDraftStore } from '@/stores/aiFollowDraft'
 import { trackAiUi } from '@/utils/aiAudit'
+import { pageChrome } from '@/utils/pageChrome'
 
 const route = useRoute()
 const router = useRouter()
@@ -33,9 +34,22 @@ function errorText(cause: unknown): string {
   return '加载或提交失败，请重试'
 }
 
+function returnToPicker(): void {
+  if (submitting.value) return
+  const query = { pick_group: groupId, leader: String(leaderId), rank: route.query.rank }
+  const back = router.options.history.state.back
+  const previous = query.rank && typeof back === 'string' ? router.resolve(back) : null
+  if (previous?.name === 'ai-trade' && previous.query.rank === query.rank
+    && previous.query.pick_group === groupId && previous.query.leader === query.leader) {
+    router.back()
+  } else {
+    void router.push({ name: 'ai-trade', query })
+  }
+}
+
 function changeNodes(): void {
   trackAiUi('open_picker', { group_id: groupId, value: 'change_nodes' })
-  void router.push({ name: 'ai-trade', query: { pick_group: groupId, leader: leaderId } })
+  returnToPicker()
 }
 
 function chooseRisk(mode: 'leader' | 'custom'): void {
@@ -79,10 +93,14 @@ async function submit(): Promise<void> {
 }
 
 onMounted(async () => {
+  pageChrome.value = { title: '跟单设置', back: returnToPicker }
   trackAiUi('page_view', { group_id: groupId, value: 'ai-follow-setup' })
   try { detail.value = await fetchAiRobotDetail(leaderId, '30d', groupId) }
   catch (cause) { error.value = errorText(cause) }
   finally { loading.value = false }
+})
+onUnmounted(() => {
+  if (pageChrome.value?.back === returnToPicker) pageChrome.value = null
 })
 </script>
 

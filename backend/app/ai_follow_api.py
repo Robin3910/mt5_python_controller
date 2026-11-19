@@ -201,6 +201,8 @@ def _group_robot_summary(user, primary: Optional[dict], group: dict, strategy: O
         "primary_node": _node_brief(primary),
         "ai_group_count": 1,
         "strategy_name": name,
+        "symbol": strategy.get("symbol") or group.get("strategy_symbol"),
+        "started_at": group.get("created_at") or None,
         "strategy_names": [name] if name else [],
         "editable_strategy_id": (
             strategy.get("strategy_id")
