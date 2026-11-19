@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from . import group_persist, permissions
 from .connections import manager
 from .deps import get_principal, get_store, owned_node_or_404
+from .node_lifecycle import locked, node_key
 from .permissions import Principal
 from .redis_store import RedisStore
 
@@ -14,12 +15,17 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["accounts"])
 
 
-async def _annotate_strategy_template(node_id: str, acct: dict) -> dict:
+async def annotate_strategy_templates(
+    node_id: str, acct: dict, templates: dict[int, str | None] | None = None,
+) -> dict:
     """给快照里的持仓 / 挂单补 `ai_template`（所属子任务的策略模版 ID）。
 
     节点只上报裸的 MT5 订单，不知道它属于哪条策略；按魔术号回子任务快照反查，
     前端据此把「AI 智能加仓（tpl_1）」的仓位从普通交易列表里摘出去。
     反查失败不报错：标不上模版，前端按普通持仓展示。
+
+    快照入库链路（`ws_gateway`）与查询接口共用本函数，保证 REST / WS 两份数据一致。
+    `templates` 可由调用方预先查好传入；传 None 时按快照里的魔术号现查。
     """
     if not isinstance(acct, dict):
         return acct
@@ -36,11 +42,12 @@ async def _annotate_strategy_template(node_id: str, acct: dict) -> dict:
                 magics.add(magic)
     if not magics:
         return acct
-    try:
-        templates = await group_persist.templates_by_magic(node_id, magics)
-    except Exception:  # noqa: BLE001
-        logger.warning("annotate strategy template failed for node %s", node_id, exc_info=True)
-        return acct
+    if templates is None:
+        try:
+            templates = await group_persist.templates_by_magic(node_id, magics)
+        except Exception:  # noqa: BLE001
+            logger.warning("annotate strategy template failed for node %s", node_id, exc_info=True)
+            return acct
     if not templates:
         return acct
     for key in ("positions", "orders"):
@@ -59,6 +66,22 @@ async def _annotate_strategy_template(node_id: str, acct: dict) -> dict:
     return acct
 
 
+async def snapshot_with_templates(node_id: str) -> dict | None:
+    """读取 Redis 里的最新账户快照并完成 `ai_template` 标注。
+
+    与节点快照入库共用 `node:<id>` 锁：避免读到「DB 里子任务还没落好、
+    快照已经更新」的中间态，也避免同一快照被并发标两次。
+    快照不存在时返回 None。
+    """
+    from .state import state
+    async with locked(node_key(node_id)):
+        acct = await state.store.get_account(node_id)
+        if acct is None:
+            return None
+        return await annotate_strategy_templates(node_id, acct)
+
+
+@router.get("/accounts")
 @router.get("/accounts")
 async def all_accounts(
     store: RedisStore = Depends(get_store), p: Principal = Depends(get_principal),
@@ -66,8 +89,7 @@ async def all_accounts(
     """汇总可见节点的账户快照（含在线状态）。"""
     out = []
     for n in permissions.visible(p, await store.all_nodes_with_db_fallback()):
-        acct = await store.get_account(n["node_id"]) or {}
-        await _annotate_strategy_template(n["node_id"], acct)
+        acct = await snapshot_with_templates(n["node_id"]) or {}
         out.append(
             {
                 "node_id": n["node_id"],
@@ -85,7 +107,7 @@ async def node_account(
 ):
     """查询单个节点的账户快照；尚无上报时返回 404。"""
     await owned_node_or_404(store, p, node_id)
-    acct = await store.get_account(node_id)
+    acct = await snapshot_with_templates(node_id)
     if acct is None:
         raise HTTPException(status_code=404, detail="no account snapshot yet")
-    return await _annotate_strategy_template(node_id, acct)
+    return acct

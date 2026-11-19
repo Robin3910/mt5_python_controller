@@ -389,16 +389,18 @@ async def templates_by_magic(node_id: str, magics: set[int]) -> dict[int, Option
     AI 智能加仓（tpl_1）之类的策略持仓。取该 magic 下**最近一次**子任务
     （`id` 最大）的快照 `template_id`，存量数据没有快照时值为 None。
     查询失败按空结果处理：调用方只会在标不上模版，不会因此看不到持仓。
+
+    分两步查（先子任务行、再主任务快照）：不 JOIN 可以走 `(node_id, magic)` 索引，
+    账户快照每条消息都会调一次，走短查询比联表更省。
     """
     wanted = {int(m) for m in magics if m}
     if not node_id or not wanted:
         return {}
     try:
         async with SessionLocal() as s:
-            rows = (
+            dispatch_rows = (
                 await s.execute(
-                    select(GroupTaskDispatch.magic, GroupSignalTask.strategy_snapshot_json)
-                    .join(GroupSignalTask, GroupSignalTask.task_id == GroupTaskDispatch.task_id)
+                    select(GroupTaskDispatch.id, GroupTaskDispatch.magic, GroupTaskDispatch.task_id)
                     .where(
                         GroupTaskDispatch.node_id == node_id,
                         GroupTaskDispatch.magic.in_(sorted(wanted)),
@@ -406,19 +408,33 @@ async def templates_by_magic(node_id: str, magics: set[int]) -> dict[int, Option
                     .order_by(GroupTaskDispatch.id.asc())
                 )
             ).all()
+            if not dispatch_rows:
+                return {}
+            # asc 遍历，后到的覆盖前面的 → 留下最近一次子任务的快照
+            latest: dict[int, int] = {}
+            for _id, magic, task_id in dispatch_rows:
+                try:
+                    latest[int(magic)] = int(task_id)
+                except (TypeError, ValueError):
+                    continue
+            if not latest:
+                return {}
+            snapshots = dict(
+                (
+                    await s.execute(
+                        select(GroupSignalTask.task_id, GroupSignalTask.strategy_snapshot_json)
+                        .where(GroupSignalTask.task_id.in_(sorted(set(latest.values()))))
+                    )
+                ).all()
+            )
     except Exception as e:  # noqa: BLE001
         logger.warning("templates_by_magic failed: %s", e)
         return {}
     out: dict[int, Optional[str]] = {}
-    for magic, snapshot in rows:
-        try:
-            key = int(magic)
-        except (TypeError, ValueError):
-            continue
+    for magic, task_id in latest.items():
+        snapshot = snapshots.get(task_id)
         tpl = snapshot.get("template_id") if isinstance(snapshot, dict) else None
-        tpl = str(tpl).strip() if tpl else None
-        # asc 遍历，后到的覆盖前面的 → 留下最近一次子任务的模版
-        out[key] = tpl or out.get(key)
+        out[magic] = str(tpl).strip() if tpl else None
     return out
 
 

@@ -365,6 +365,16 @@ async def _save_account_active(node_id: str, ws: WebSocket, data: dict) -> None:
         "mt5_link": mt5_link_state(data),
         "mt5_link_at": data.get("mt5_link_at"),
     }
+    # 给持仓 / 挂单标上所属策略模版（如 tpl_1 = AI 智能加仓），后台据此把
+    # AI 策略仓位从普通交易列表里摘出去。必须放在快照入库之前：WS 广播的
+    # `account` 事件直接搬运这份快照，前端不经过 REST 接口。
+    from .accounts import annotate_strategy_templates
+    try:
+        await annotate_strategy_templates(node_id, snapshot)
+    except Exception:  # noqa: BLE001
+        # 标注失败只影响后台展示（AI 策略仓位会混进普通列表），绝不能
+        # 因此丢掉整份快照 / 打断对账。
+        logger.warning("annotate strategy templates failed for node %s", node_id, exc_info=True)
     await store.save_account(node_id, snapshot)
     if books_ok:
         # 主节点平仓同步必须在「子任务收口」**之前**执行：否则跟单节点可能先

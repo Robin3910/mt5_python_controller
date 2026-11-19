@@ -29,10 +29,11 @@ async def admin_ws(ws: WebSocket, token: str = Query(default="")):
     manager.add_admin(ws, principal)
     try:
         # 连接建立后先推一份可见节点的全量快照，前端即可立即渲染
+        from .accounts import snapshot_with_templates
         nodes = permissions.visible(principal, await store.all_nodes()) if store else []
         snapshot = []
         for n in nodes:
-            acct = await store.get_account(n["node_id"]) or {}
+            acct = await snapshot_with_templates(n["node_id"]) or {}
             snapshot.append(
                 {
                     "node_id": n["node_id"],
