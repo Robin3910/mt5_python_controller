@@ -1401,7 +1401,7 @@ onBeforeUnmount(() => {
               </div>
             </header>
             <div class="tr-grid tr-pend-grid tr-head">
-              <span>#</span><span>类型</span><span>方向</span><span>手数</span><span>挂单价</span><span>止盈/止损</span><span>挂单时间</span><span>操作</span>
+              <span>#</span><span>方向</span><span>手数</span><span>挂单价</span><span>止盈/止损</span><span>挂单时间</span><span>操作</span>
             </div>
             <template v-for="group in book.groups" :key="`pend-${book.symbol}-${group.magic}`">
               <div class="tr-magic-head">
@@ -1412,7 +1412,7 @@ onBeforeUnmount(() => {
               </div>
               <div v-for="(o, i) in pendRows(group, book.symbol)" :key="o.ticket" class="tr-grid tr-pend-grid tr-line">
                 <span class="dim">{{ i + 1 }}</span>
-                <span><i class="dir">{{ pendingKindLabel(o) }}</i></span>
+                <!-- <span><i class="dir">{{ pendingKindLabel(o) }}</i></span> -->
                 <span><i class="dir" :class="isBuySide(o.type) ? 'buy' : 'sell'">{{ fmtPosType(o.type) }}</i></span>
                 <span class="num">{{ (o.volume || 0).toFixed(2) }}</span>
                 <span class="num">{{ fmtPx(o.price_open, o.symbol) }}</span>
@@ -1640,8 +1640,8 @@ onBeforeUnmount(() => {
 .tr-book-head strong, .tr-line strong, .num { font-variant-numeric: tabular-nums; }
 .tr-grid { display: grid; align-items: center; gap: 6px; padding: 4px 12px; font-size: 11px; }
 .tr-pos-grid { grid-template-columns: 14px minmax(78px,.9fr) 28px 40px minmax(56px,1fr) minmax(58px,1fr) minmax(64px,1fr) 48px; }
-.tr-grid-grid { grid-template-columns: 36px minmax(60px,1.2fr) 40px 40px minmax(64px,1fr) 48px; }
-.tr-hist-grid { grid-template-columns: 14px minmax(78px,.9fr) 72px 28px 40px minmax(56px,1fr) minmax(56px,1fr) minmax(64px,1fr); }
+.tr-grid-grid { grid-template-columns: 22px minmax(60px,1.2fr) 40px 40px minmax(64px,1fr) 48px; }
+.tr-hist-grid { grid-template-columns: 14px minmax(78px,.9fr) minmax(44px,.7fr) 28px 40px minmax(56px,1fr) minmax(56px,1fr) minmax(64px,1fr); }
 .tr-head { color: #5B6B85; background: #0A1120; border-bottom: 1px solid #16213A; font-size: 10px; }
 .tr-line { border-bottom: 1px dashed #1B2A48; }
 .tr-line:last-of-type { border-bottom: 0; }
@@ -1649,7 +1649,7 @@ onBeforeUnmount(() => {
 .tr-pos-grid span:nth-child(3), .tr-hist-grid span:nth-child(4) { text-align: center; }
 .tr-magic-col { text-align: right; font-variant-numeric: tabular-nums; color: #93C5FD; }
 .dim { color: #8B96A8; }
-.dir { display: inline-flex; min-width: 20px; height: 15px; align-items: center; justify-content: center; border-radius: 3px; font-style: normal; font-size: 10px; font-weight: 700; }
+.dir { display: inline-flex; min-width: 14px; height: 15px; align-items: center; justify-content: center; border-radius: 3px; font-style: normal; font-size: 10px; font-weight: 700; white-space: nowrap; }
 .dir.buy, .dir.green { color: #22C55E; background: rgba(34,197,94,.15); }
 .dir.sell, .dir.red { color: #F6465D; background: rgba(246,70,93,.15); }
 .sltp { text-align: right; line-height: 1.2; }
