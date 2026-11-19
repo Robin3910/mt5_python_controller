@@ -13,7 +13,7 @@
 //   4. 移出默认不停止在跑任务（决策 = 与带单一致，由 node_client 跑完）
 //
 // 跟单员收不到实时 WS 事件（M3）—— 用 45s 轮询替代。
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAiFollowDraftStore } from '@/stores/aiFollowDraft'
 import StrategyFormModal from '@/components/StrategyFormModal.vue'
@@ -22,6 +22,8 @@ import { deleteNodeWithConfirmation } from '@/composables/useNodeDeletion'
 import { trackAiUi } from '@/utils/aiAudit'
 import type { AiApplication } from '@/api/aiChannel'
 import AiFollowNodesPanel from '@/components/AiFollowNodesPanel.vue'
+import AiRobotLeaderboard from '@/components/AiRobotLeaderboard.vue'
+import { pageChrome } from '@/utils/pageChrome'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
 import 'element-plus/es/components/message-box/style/css'
@@ -53,7 +55,7 @@ import type { FollowChannelsOut, Position } from '@/api/types'
 const robots = ref<AiRobotSummary[]>([])
 const loading = ref(false)
 const robotsError = ref('')
-const keyword = ref('')
+const robotsUpdatedAt = ref<number | null>(null)
 
 const auth = useAuthStore()
 const hub = useHubStore()
@@ -61,17 +63,14 @@ const router = useRouter()
 const route = useRoute()
 const followDraft = useAiFollowDraftStore()
 
-/** 绩效统计窗口（四档，与后端 deal_stats.WINDOWS 对齐） */
-const WINDOW_OPTIONS = [
-  { value: '7d', label: '近 7 天' },
-  { value: '30d', label: '近 30 天' },
-  { value: '90d', label: '近 90 天' },
-  { value: 'all', label: '全部' },
-] as const
-const perfWindow = ref<string>('30d')
+const rankTab = computed(() => {
+  const tab = route.query.rank
+  return route.name === 'ai-trade' && (tab === 'profit' || tab === 'heat') ? tab : null
+})
+const rankButton = ref<HTMLButtonElement | null>(null)
 
 const detail = ref<AiRobotDetailResponse | null>(null)
-const detailLoading = ref(false)
+const loadingGroup = ref<string | null>(null)
 
 const mine = ref({ following: [], summary: {}, applications: [] } as {
   following: AiMyRobot[]
@@ -289,14 +288,16 @@ function canPickNode(nodeId: string): boolean {
 
 // ---------- 加载 ----------
 async function loadRobots() {
+  if (loading.value) return
   loading.value = true
   robotsError.value = ''
   try {
-    const res = await fetchAiRobots(keyword.value.trim(), perfWindow.value)
+    const res = await fetchAiRobots()
     robots.value = res.robots
+    robotsUpdatedAt.value = Date.now()
   } catch (e) {
     robotsError.value = errText(e, '加载机器人信息失败')
-    ElMessage.error(robotsError.value)
+    if (!rankTab.value) ElMessage.error(robotsError.value)
   } finally {
     loading.value = false
   }
@@ -314,17 +315,17 @@ async function loadMine() {
 }
 
 async function openRobot(r: Pick<AiRobotSummary, 'leader_user_id' | 'group_id'>) {
-  detailLoading.value = true
+  loadingGroup.value = r.group_id
   selectedGroupIds.value = []
   selectedNodeIds.value = []
   try {
-    detail.value = await fetchAiRobotDetail(r.leader_user_id, perfWindow.value, r.group_id)
+    detail.value = await fetchAiRobotDetail(r.leader_user_id, '30d', r.group_id)
     selectedGroupIds.value = allSelectableGroupIds.value
   } catch (e) {
     detail.value = null
     ElMessage.error(errText(e, '加载机器人详情失败'))
   } finally {
-    detailLoading.value = false
+    loadingGroup.value = null
   }
 }
 
@@ -453,15 +454,6 @@ async function refreshAll() {
   await Promise.all([loadRobots(), loadMine(), loadNodeStats()])
 }
 
-// 统计窗口切换：重拉列表 + 当前详情（绩效是纯读缓存，切换零延迟）。
-// 「我的机器人」固定显示累计净利润，广场窗口切换时无需重拉。
-watch(perfWindow, () => {
-  void loadRobots()
-  if (detail.value) {
-    void openRobot(detail.value.robot)
-  }
-})
-
 onMounted(() => {
   void refreshAll()
   // M3 跟单员收不到 WS 事件 —— 用 45s 轮询替代
@@ -485,10 +477,26 @@ async function submitJoin() {
     return
   }
   const robot = detail.value.robot
+  const rank = rankTab.value
   followDraft.select(auth.me!.user_id, robot.leader_user_id, robot.group_id, nodeIds)
   trackAiUi('follow_step', { group_id: robot.group_id, node_ids: nodeIds, value: 'risk' })
-  pickerOpen.value = false
-  await router.push({ name: 'ai-follow-setup', params: { leaderUserId: robot.leader_user_id, groupId: robot.group_id } })
+  submitting.value = true
+  try {
+    if (rank && route.query.pick_group !== robot.group_id) {
+      const failure = await router.replace({
+        name: 'ai-trade', query: { ...route.query, pick_group: robot.group_id, leader: robot.leader_user_id },
+      })
+      if (failure || !pickerOpen.value) return
+    }
+    pickerOpen.value = false
+    await router.push({
+      name: 'ai-follow-setup',
+      params: { leaderUserId: robot.leader_user_id, groupId: robot.group_id },
+      query: { rank: rank || undefined },
+    })
+  } finally {
+    submitting.value = false
+  }
 }
 
 async function changeNodeFollowState(nodeIds: string[], state: AiFollowNodeState, groupId?: string): Promise<void> {
@@ -530,12 +538,13 @@ async function closeNodeFollowPositions(nodeIds: string[]): Promise<void> {
   } finally { closeBusy.value = false }
 }
 
-const rankOn = ref(false)
 const onlineRobotCount = computed(() =>
   robots.value.filter((r) => r.primary_node?.online || r.primary_node?.status === 'online').length,
 )
 const mineTab = ref<'run' | 'hist' | 'nodes' | 'pending'>(route.query.tab === 'pending' ? 'pending' : 'run')
 const pickerOpen = ref(false)
+const pickerPanel = ref<HTMLElement | null>(null)
+let pickerTrigger: HTMLElement | null = null
 const pickerMode = ref<'join' | 'settings'>('join')
 const pickerSearch = ref('')
 const pendingApplications = computed(() => (mine.value.applications || []).filter((item) => item.status === 'pending'))
@@ -552,6 +561,29 @@ let pickerSearchTimer: number | undefined
 function closePicker(): void {
   pickerOpen.value = false
   trackAiUi('cancel_dialog', { group_id: detail.value?.robot.group_id, value: 'node_picker' })
+  pickerTrigger?.focus()
+  clearRankPickerQuery()
+}
+
+function clearRankPickerQuery(): void {
+  if (rankTab.value && route.query.pick_group) {
+    void router.replace({ name: 'ai-trade', query: { rank: rankTab.value, tab: route.query.tab } })
+  }
+}
+
+function trapPickerFocus(event: KeyboardEvent): void {
+  const controls = pickerPanel.value?.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled)')
+  if (!controls?.length) return
+  const first = controls[0]
+  const last = controls[controls.length - 1]
+  const active = document.activeElement
+  if (event.shiftKey && (active === first || active === pickerPanel.value)) {
+    event.preventDefault()
+    last.focus()
+  } else if (!event.shiftKey && active === last) {
+    event.preventDefault()
+    first.focus()
+  }
 }
 async function removePickerNode(nodeId: string): Promise<void> {
   if (pickerBusy.value) return
@@ -580,13 +612,45 @@ watch(pickerSearch, (value) => {
   pickerSearchTimer = window.setTimeout(() => trackAiUi('search', { group_id: detail.value?.robot.group_id, value }), 350)
 })
 watch(mineTab, (value) => trackAiUi('filter', { value }))
-watch(rankOn, (value) => trackAiUi('filter', { value: value ? 'rank' : 'default_order' }))
 onUnmounted(() => window.clearTimeout(pickerSearchTimer))
 
-const shownRobots = computed(() => {
-  const list = [...robots.value]
-  if (!rankOn.value) return list
-  return list.sort((a, b) => (b.performance?.total_profit || 0) - (a.performance?.total_profit || 0))
+const rankItems = computed(() => robots.value.map((robot) => ({
+  robot, title: robotTitle(robot), followers: followerCountOf(robot),
+})))
+
+function showRank(tab: 'profit' | 'heat'): void {
+  if (rankTab.value === tab) return
+  const target = { name: 'ai-trade', query: { rank: tab, tab: route.query.tab } }
+  void (rankTab.value ? router.replace(target) : router.push(target))
+}
+
+function closeRank(): void {
+  const back = router.options.history.state.back
+  const previous = typeof back === 'string' ? router.resolve(back) : null
+  if (previous?.name === 'ai-trade' && !previous.query.rank && !previous.query.pick_group) {
+    router.back()
+  } else {
+    void router.replace({ name: 'ai-trade', query: { tab: route.query.tab } })
+  }
+}
+
+watch(rankTab, (tab, previous) => {
+  if (previous && pickerOpen.value) closePicker()
+  if (tab) {
+    pageChrome.value = { title: '机器人榜单', back: closeRank }
+    trackAiUi(previous ? 'filter' : 'page_view', { value: `ai-rank-${tab}` })
+    if (!previous) document.getElementById('app')?.scrollTo(0, 0)
+  } else if (previous) {
+    if (pageChrome.value?.back === closeRank) pageChrome.value = null
+    if (route.name === 'ai-trade') {
+      trackAiUi('filter', { value: 'default_order' })
+      void nextTick(() => rankButton.value?.focus({ preventScroll: true }))
+    }
+  }
+}, { immediate: true })
+
+onUnmounted(() => {
+  if (pageChrome.value?.back === closeRank) pageChrome.value = null
 })
 const runningMine = computed(() =>
   myFollowing.value.filter((entry) => !entry.review_status && !followFinished(entry) && (entry.is_owner || entry.marketable || entry.nodes.some((node) => node.active_task_count > 0))),
@@ -692,15 +756,20 @@ function fmtPx(n: number | null | undefined): string {
 
 
 async function openPicker(robot: Pick<AiRobotSummary, 'leader_user_id' | 'group_id'>, mode: 'join' | 'settings') {
+  if (loadingGroup.value || pickerOpen.value) return
+  const source = route.fullPath
+  pickerTrigger = document.activeElement instanceof HTMLElement ? document.activeElement : null
   pickerMode.value = mode
+  trackAiUi('open_picker', { group_id: robot.group_id })
   await openRobot(robot)
-  if (!detail.value) return
+  if (!detail.value || route.fullPath !== source) return
   selectedNodeIds.value = mode === 'settings' ? [...alreadyFollowingNodeIds.value] : []
   const ids = (detail.value.my_nodes || []).map((n) => n.node_id)
   void loadAiBooks(ids)
   pickerOpen.value = true
   pickerSearch.value = ''
-  trackAiUi('open_picker', { group_id: robot.group_id })
+  await nextTick()
+  pickerPanel.value?.focus({ preventScroll: true })
 }
 function togglePick(nodeId: string) {
   if (!canPickNode(nodeId)) return
@@ -794,8 +863,13 @@ async function closeRobotAll(entry: MyRobotEntry) {
 watch(() => route.query.pick_group, async (groupId) => {
   const leaderId = Number(route.query.leader)
   if (typeof groupId !== 'string' || !Number.isFinite(leaderId) || leaderId < 1) return
+  const resume = followDraft.userId === auth.me?.user_id && followDraft.leaderId === leaderId && followDraft.groupId === groupId
+  if (rankTab.value && !resume) {
+    clearRankPickerQuery()
+    return
+  }
   await openPicker({ leader_user_id: leaderId, group_id: groupId }, 'join')
-  if (followDraft.userId === auth.me?.user_id && followDraft.leaderId === leaderId && followDraft.groupId === groupId) {
+  if (resume && pickerOpen.value && route.query.pick_group === groupId) {
     selectedNodeIds.value = followDraft.nodeIds.filter(isNodeSelectable)
   }
 }, { immediate: true })
@@ -804,8 +878,14 @@ onMounted(() => { void hub.fetchNodes(); trackAiUi('page_view', { value: 'ai-tra
 </script>
 
 <template>
-  <div class="ai">
-    <section class="ai-hero">
+  <div class="ai" :class="{ 'ai--ranking': rankTab }">
+    <AiRobotLeaderboard
+      v-if="rankTab" :items="rankItems" :tab="rankTab" :loading="loading" :error="robotsError"
+      :updated-at="robotsUpdatedAt" :opening-group="loadingGroup" :show-back="auth.isAdmin"
+      @switch="showRank" @back="closeRank" @retry="trackAiUi('refresh', { value: 'ai-rank' }); loadRobots()"
+      @follow="openPicker($event, 'join')"
+    />
+    <section v-else class="ai-hero">
       <div class="ai-hero-top">
         <span class="ai-mark" aria-hidden="true">
           <svg viewBox="0 0 24 24"><path fill="currentColor" d="M20 9V7a2 2 0 0 0-2-2h-3a3 3 0 0 0-6 0H6a2 2 0 0 0-2 2v2a3 3 0 0 0 0 6v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4a3 3 0 0 0 0-6zM9 13a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm7 4H8v-2h8v2zm-1-4a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3z"/></svg>
@@ -816,7 +896,7 @@ onMounted(() => { void hub.fetchNodes(); trackAiUi('page_view', { value: 'ai-tra
         </div>
         <div class="ai-hero-side">
           <span class="ai-online"><i></i>在线 {{ onlineRobotCount }} 台</span>
-          <button type="button" class="ai-rank" :class="{ on: rankOn }" @click="rankOn = !rankOn">
+          <button ref="rankButton" type="button" class="ai-rank" @click="showRank('profit')">
             <svg viewBox="0 0 24 24"><path fill="currentColor" d="M7.5 21H2V9h5.5v12zm7.25-18h-5.5v18h5.5V3zM22 11h-5.5v10H22V11z"/></svg>
             榜单
           </button>
@@ -824,22 +904,18 @@ onMounted(() => { void hub.fetchNodes(); trackAiUi('page_view', { value: 'ai-tra
       </div>
 
       <div class="ai-sec">
-        <p class="ai-kicker">机器人信息<span>{{ shownRobots.length }}</span></p>
-        <div v-if="rankOn || keyword || perfWindow !== '30d'" class="ai-tools">
-          <input v-model="keyword" placeholder="搜索名称" @keyup.enter="loadRobots" />
-          <button v-for="opt in WINDOW_OPTIONS" :key="opt.value" type="button" :class="{ on: perfWindow === opt.value }" @click="perfWindow = opt.value">{{ opt.label }}</button>
-        </div>
+        <p class="ai-kicker">机器人信息<span>{{ robots.length }}</span></p>
         <p v-if="loading && !robots.length" class="ai-empty">加载中…</p>
         <div v-else-if="robotsError" class="ai-empty" role="alert">
           <p>{{ robotsError }}</p>
           <button type="button" class="ai-refresh" @click="loadRobots">重试</button>
         </div>
-        <div v-else-if="!shownRobots.length" class="ai-empty">
-          <p>{{ keyword.trim() ? '未找到匹配的 AI 机器人' : '暂无开放的 AI 机器人' }}</p>
-          <p v-if="!keyword.trim()" class="ai-empty-hint">机器人主人需在策略分组中开启「开放 AI 跟单」，机器人才能在这里展示。</p>
+        <div v-else-if="!robots.length" class="ai-empty">
+          <p>暂无开放的 AI 机器人</p>
+          <p class="ai-empty-hint">机器人主人需在策略分组中开启「开放 AI 跟单」，机器人才能在这里展示。</p>
         </div>
         <div v-else class="ai-list">
-          <div v-for="r in shownRobots" :key="r.group_id" class="ai-row">
+          <div v-for="r in robots" :key="r.group_id" class="ai-row">
             <span class="ai-ico" aria-hidden="true">
               <svg viewBox="0 0 24 24"><path fill="currentColor" d="M20 9V7a2 2 0 0 0-2-2h-3a3 3 0 0 0-6 0H6a2 2 0 0 0-2 2v2a3 3 0 0 0 0 6v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4a3 3 0 0 0 0-6zM9 13a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm7 4H8v-2h8v2zm-1-4a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3z"/></svg>
             </span>
@@ -866,7 +942,7 @@ onMounted(() => { void hub.fetchNodes(); trackAiUi('page_view', { value: 'ai-tra
       </div>
     </section>
 
-    <section class="ai-mine-wrap">
+    <section v-if="!rankTab" class="ai-mine-wrap">
       <div class="ai-mine-head">
         <p class="ai-kicker">我的机器人<span>{{ mineTab === 'nodes' ? followNodeCount : myFollowing.length }}</span></p>
         <button type="button" class="ai-refresh" @click="trackAiUi('refresh'); refreshAll()">
@@ -990,8 +1066,9 @@ onMounted(() => { void hub.fetchNodes(); trackAiUi('page_view', { value: 'ai-tra
       @saved="refreshAll"
     />
 
-    <div v-if="pickerOpen && detail" class="ai-mask" @click.self="closePicker" @keydown.esc="closePicker">
-      <section class="ai-dialog ai-picker-dialog" role="dialog" aria-modal="true" aria-label="选择跟单节点">
+    <div v-if="pickerOpen && detail" class="ai-mask" @click.self="closePicker">
+      <section ref="pickerPanel" class="ai-dialog ai-picker-dialog" role="dialog" aria-modal="true" aria-label="选择跟单节点"
+        tabindex="-1" @keydown.esc.prevent="closePicker" @keydown.tab="trapPickerFocus">
         <header><span class="ai-picker-icon">⇄</span><div><strong>选择跟单节点</strong><p>跟单对象：{{ robotTitle(detail.robot) }} · {{ detail.robot.strategy_name }}</p></div><button type="button" class="ai-x" aria-label="关闭" @click="closePicker">×</button></header>
         <div class="ai-picker-body">
           <div class="ai-picker-robot"><RobotIcon :size="32" variant="iconfont" boxed /><div><strong>{{ robotTitle(detail.robot) }}</strong><p>{{ detail.robot.description || '策略自动运行，同步机器人信号' }} · {{ detail.groups.map((group) => group.symbol).filter(Boolean).join('、') }}</p></div></div>
@@ -1041,16 +1118,12 @@ onMounted(() => { void hub.fetchNodes(); trackAiUi('page_view', { value: 'ai-tra
 .ai-rank, .ai-follow, .ai-set, .ai-refresh, .ai-tabs button, .ai-card-actions button, .ai-grid button, .ai-dialog button, .ai-node-line button { cursor: pointer; }
 .ai-rank { display: flex; align-items: center; gap: 4px; border: 1px solid rgba(245,158,11,.3); background: rgba(245,158,11,.1); color: #F59E0B; border-radius: 8px; padding: 6px 10px; font-size: 11px; font-weight: 700; }
 .ai-rank svg { width: 14px; height: 14px; }
-.ai-rank.on { background: rgba(245,158,11,.22); }
+.ai-rank:hover { background: rgba(245,158,11,.22); }
 .ai-sec { margin-top: 14px; }
 .ai-sec > .ai-kicker { padding: 0 2px; }
 .ai-kicker { gap: 6px; margin: 0; font-size: 12px; font-weight: 600; line-height: 16px; }
 .ai-kicker::before { content: ''; width: 2px; height: 12px; border-radius: 2px; background: #2563EB; }
 .ai-kicker span { border: 1px solid #22304A; background: #0C1220; color: #5B6B85; border-radius: 999px; padding: 1px 6px; font-size: 10px; font-weight: 500; line-height: 16px; }
-.ai-tools { display: flex; gap: 4px; flex-wrap: wrap; margin: 8px 0; }
-.ai-tools input, .ai-tools button { height: 26px; border-radius: 8px; border: 1px solid #22304A; background: #0C1220; color: #8B96A8; font-size: 11px; }
-.ai-tools input { width: 120px; padding: 0 8px; color: #E6EBF4; }
-.ai-tools button.on { color: #fff; background: #2563EB; border-color: #2563EB; }
 .ai-list { display: flex; flex-direction: column; gap: 6px; }
 .ai-sec > .ai-list { margin-top: 8px; }
 .ai-row { gap: 10px; border: 1px solid #22304A; background: #0C1220; border-radius: 8px; padding: 8px 10px; }
@@ -1196,6 +1269,15 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .ai-picker-dialog > footer button.primary { flex: 2; border: 0; background: linear-gradient(90deg,#7c3aed,#2563eb); color: #fff; font-weight: 700; }
 .ai-picker-dialog > footer button:disabled { opacity: .4; cursor: not-allowed; }
 .ai-picker-dialog > footer p { text-align: center; font-size: 9px; color: #5b6b85; margin: 8px 0 0; }
+.ai--ranking .ai-mask { z-index: 1250; padding: max(12px, var(--sat)) max(12px, var(--pad-r)) max(12px, var(--pad-b)) max(12px, var(--pad-x)); background: #0009; }
+.ai--ranking .ai-picker-dialog { width: min(480px, 100%); border-color: #22304a; background: #0c1220; box-shadow: 0 25px 50px -12px #0008; animation: rank-picker-enter .28s ease-out; }
+@keyframes rank-picker-enter { from { opacity: 0; } to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .ai--ranking .ai-picker-dialog { animation: none; } }
+.ai--ranking .ai-picker-dialog > header { gap: 10px; padding: 12px 16px; }
+.ai--ranking .ai-picker-body { padding: 12px 16px; }
+.ai--ranking .ai-picker-list { max-height: 240px; overflow-y: auto; }
+.ai--ranking .ai-picker-dialog > footer { padding: 12px 16px; background: transparent; }
+:global(.app-shell.is-customer:has(.ai-leaderboard) .brand-back-ai) { justify-content: center; }
 .ai-application > p { font-size: 11px; color: #8b96a8; margin: 8px 0 0; }
 .ai-application .ai-application-note { color: #fbbf24; font-size: 10px; }
 :global(.app-shell.is-customer:has(.ai)) { color: #E6EBF4; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif; font-size: 16px; line-height: 1.5; }

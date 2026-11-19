@@ -44,6 +44,9 @@ def test_two_strategies_are_two_public_and_owned_robots(client):
         assert robot["strategy_id"] == robot["editable_strategy_id"]
         assert robot["ai_group_count"] == 1
         assert robot["strategy_names"] == [robot["strategy_name"]]
+        group = client.portal.call(state.store.get_group, robot["group_id"])
+        assert robot["symbol"] == "XAUUSD"
+        assert robot["started_at"] == group["created_at"]
         detail = client.get(
             f"/api/ai-follow/robots/{setup['host']['id']}",
             params={"group_id": robot["group_id"]}, headers=setup["host_h"],
