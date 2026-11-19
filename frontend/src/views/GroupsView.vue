@@ -377,7 +377,7 @@ async function save(): Promise<void> {
       (formIsAiStrategy.value
         ? `开放 AI 跟单：${form.accept_ai_follow ? '开启（会进入【AI 交易】广场）' : '关闭'}\n`
         : '') +
-      `终止连带：${form.stop_cascade_enabled ? '开启（终止任务会连带终止跟单节点）' : '关闭'}\n` +
+      `同步平仓：${form.stop_cascade_enabled ? '开启（主节点平仓，跟单节点对应仓位一起平）' : '关闭'}\n` +
       `信号来源：${SIGNAL_SOURCE_SUMMARY[form.signal_source] ?? '直连'}\n` +
       `绑定策略：${styName}\n` +
       `成员节点：${form.node_ids.length} 个`
@@ -445,9 +445,9 @@ async function toggleAcceptAiFollow(g: GroupOut): Promise<void> {
 async function toggleStopCascade(g: GroupOut): Promise<void> {
   const next = g.stop_cascade_enabled ? '关闭' : '开启'
   const effect = g.stop_cascade_enabled
-    ? '带单员在主节点终止任务时，不再连带终止跟单节点的同一任务；跟单节点会继续跑完'
-    : '带单员在主节点终止任务时，跟单节点的同一任务会一起平仓终止（单向生效，跟单员自己平仓不影响带单员）'
-  if (!(await confirmAction(`确认${next}分组「${g.name}」的终止连带？\n\n${next}后：${effect}。`))) return
+    ? '带单员在主节点上平仓时，不再把平仓动作同步到跟单节点；跟单节点按自己的策略继续运行'
+    : '带单员在主节点上平仓时，跟单节点的对应仓位会一起平掉（单向生效，跟单员自己平仓不影响带单员）'
+  if (!(await confirmAction(`确认${next}分组「${g.name}」的同步平仓？\n\n${next}后：${effect}。`))) return
   await hub.updateGroup(
     g.group_id,
     { stop_cascade_enabled: !g.stop_cascade_enabled },
@@ -911,10 +911,10 @@ async function onStrategyFormSaved(): Promise<void> {
           <button
             class="mini-toggle"
             :class="g.stop_cascade_enabled ? 'on' : 'off'"
-            :title="g.stop_cascade_enabled ? '已开启：终止任务会连带终止跟单节点' : '已关闭：跟单节点不会跟着终止'"
+            :title="g.stop_cascade_enabled ? '已开启：主节点平仓，跟单节点对应仓位一起平' : '已关闭：主节点平仓不会同步到跟单节点'"
             @click="toggleStopCascade(g)"
           >
-            连带{{ g.stop_cascade_enabled ? '开' : '关' }}
+            同步平仓{{ g.stop_cascade_enabled ? '开' : '关' }}
           </button>
         </div>
 
@@ -1523,14 +1523,14 @@ async function onStrategyFormSaved(): Promise<void> {
             <div>
               <FormLabel
                 field-id="group-stop-cascade"
-                text="终止连带"
-                help="开启后，带单员在主节点上终止任务时，跟单节点的同一任务会一起平仓终止（单向：跟单员自己平仓不会影响带单员）。关闭后跟单节点会继续跑到自然结束。"
+                text="同步平仓"
+                help="开启后，带单员在主节点上平掉仓位时，跟单节点上对应的仓位会一起平掉；仓位全部平完，任务按空仓自然结束（单向：跟单员自己平仓不会影响带单员）。网格策略只同步平仓、不停任务。关闭后主节点的平仓不会同步到跟单节点。"
               />
               <TagSelect
                 id="group-stop-cascade"
                 v-model="form.stop_cascade_enabled"
                 :options="SWITCH_TAGS"
-                aria-label="终止连带"
+                aria-label="同步平仓"
               />
             </div>
             <div class="span-full">

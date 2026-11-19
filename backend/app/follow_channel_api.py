@@ -155,9 +155,6 @@ async def close_follow_channel(
 
     closed = len(targets) - len(failed)
     status = "partial" if failed else "ok"
-    # 连带终止的跟单节点子任务统计（带单方主节点上终止时才有值）
-    cascade = strategies.get("cascade") if isinstance(strategies, dict) else None
-    cascade = cascade if isinstance(cascade, dict) else {}
     await persist.audit(
         p.username,
         "close_follow_channel",
@@ -174,7 +171,6 @@ async def close_follow_channel(
             "ticket_sent": sent,
             "failed": failed,
             "strategies": strategies,
-            "cascade": cascade,
         },
     )
     if failed and sent == 0 and not strategies.get("total"):
@@ -187,5 +183,4 @@ async def close_follow_channel(
         "closed": closed,
         "failed": failed,
         "strategies": strategies,
-        "cascade": cascade,
     }

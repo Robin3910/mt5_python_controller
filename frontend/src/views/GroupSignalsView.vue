@@ -810,7 +810,9 @@ function isDispatchCloseable(status: string): boolean {
 function stopSourceTag(source?: string | null): { cls: string; text: string; title: string } {
   switch (source) {
     case 'leader_cascade':
-      return { cls: 'amber', text: '被带单员终止', title: '带单员在主节点上终止了本任务，跟单节点被连带终止' }
+      // 上一版「强制连带终止」的存量标记；新版只同步平仓、不写这个值。
+      // 保留标签是为了让历史记录仍能被正确解释。
+      return { cls: 'amber', text: '被带单员平仓', title: '带单员在主节点上平仓，该子任务已结束' }
     case 'leave_follow':
       return { cls: '', text: '移出跟单', title: '跟单员移出跟单时终止' }
     case 'account_close':
@@ -830,11 +832,11 @@ async function closeDispatch(d: GroupTaskDispatchRecord): Promise<void> {
   if (!group.value || !isDispatchCloseable(d.status)) return
   const name = d.node_name || d.node_id
   const magic = d.magic != null ? ` · 魔术号 ${d.magic}` : ''
-  // 连带提示：只有当触发节点是带单方自有节点时，跟单节点才会被连带终止。
-  // 这里只提示「可能连带」，具体是否连带以后端返回的 cascade 为准。
+  // 同步平仓提示：主节点平掉仓位时，跟单节点的对应仓位会跟着平掉；
+  // 全部平完任务即结束。跟单员自己的平仓不会影响带单方。
   const followerCount = group.value.followers?.length ?? 0
   const cascadeHint = followerCount
-    ? `\n若该节点是带单方自有节点，跟单节点的同一任务会一起终止（${followerCount} 个跟单节点）。`
+    ? `\n若该节点是带单方自有节点，跟单节点上的对应仓位会自动同步平掉（${followerCount} 个跟单节点），全部平完任务即结束。`
     : ''
   if (
     !(await confirmAction(
@@ -848,19 +850,11 @@ async function closeDispatch(d: GroupTaskDispatchRecord): Promise<void> {
   closingDispatchIds.value = { ...closingDispatchIds.value, [key]: true }
   try {
     const res = await hub.closeGroupDispatch(group.value.group_id, d.id)
-    const cascaded = res.cascade?.total ?? 0
     if (res.status === 'closing') {
-      ElMessage.success(
-        cascaded
-          ? `已向 ${name} 下发平仓终止，并连带终止 ${cascaded} 个跟单节点子任务`
-          : `已向 ${name} 下发平仓终止`,
-      )
+      ElMessage.success(`已向 ${name} 下发平仓终止`)
     } else {
       ElMessage.warning(
-        res.reason ||
-          `节点 ${name} 离线，已强制结束子任务，待重连后补发平仓${
-            cascaded ? `（另连带终止 ${cascaded} 个跟单节点子任务）` : ''
-          }`,
+        res.reason || `节点 ${name} 离线，已强制结束子任务，待重连后补发平仓`,
       )
     }
     await refreshLiveData()

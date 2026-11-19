@@ -38,6 +38,10 @@ K_GROUP_ROTATION = "group:poll:rotation:{}"  # 分组内轮询轮转顺序（JSO
 K_GROUP_NODE_BUSY = "group:node:busy:{}:{}"
 # 节点离线期间攒下的策略终止指令（List[JSON]），重连鉴权后补发
 K_NODE_PENDING_STOP = "node:pending_stop:{}"
+# 主节点上一轮持仓基线（JSON list）：用于检出「被平掉的那一笔」。
+# 带 TTL：节点长期不在线时基线自然过期，重连后按「首见只建基线、不对比」处理。
+K_LEADER_SNAPSHOT = "follow:leader_snapshot:{}"
+LEADER_SNAPSHOT_TTL = 6 * 3600
 # 自动路由规则的命中统计：{rule_id} -> JSON {count, last_hit_ts, last_signal_id}
 # 用途：规则卡上要显示「命中 N 条 / 最近命中时间」——
 # 「配了但一条都没命中」是最容易发生的问题（条件写窄了），必须一眼可见。
@@ -388,6 +392,35 @@ class RedisStore:
         ]
         if keys:
             await self.r.delete(*keys)
+
+    # ---- 主节点持仓基线（同步平仓用） ----
+    async def get_leader_snapshot(self, node_id: str) -> Optional[list[dict]]:
+        """主节点上一轮 strategy 持仓基线；没有基线（首见 / 已过期）返回 None。
+
+        **返回 None 与返回空列表必须区分**：前者表示「不知道上一轮是什么」，
+        此时只能建基线不能对比（否则服务重启后会把当前所有持仓误判成新开的）。
+        后者表示「上一轮确实空仓」，是有效的对比起点。
+        """
+        raw = await self.r.get(K_LEADER_SNAPSHOT.format(node_id))
+        if raw is None:
+            return None
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if isinstance(value, list) else None
+
+    async def set_leader_snapshot(
+        self, node_id: str, rows: list[dict], ttl: int = LEADER_SNAPSHOT_TTL,
+    ) -> None:
+        """覆写主节点持仓基线（整体替换，不做增量合并）。"""
+        await self.r.set(
+            K_LEADER_SNAPSHOT.format(node_id), json.dumps(rows), ex=ttl,
+        )
+
+    async def clear_leader_snapshot(self, node_id: str) -> None:
+        """清掉基线（节点被移除 / 不再担任带单节点时）。"""
+        await self.r.delete(K_LEADER_SNAPSHOT.format(node_id))
 
     # ---- 离线节点的待补发终止指令 ----
     async def push_pending_stop(self, node_id: str, command: dict, ttl: int) -> None:

@@ -352,6 +352,65 @@ async def active_subtasks_for_node(node_id: str) -> list[dict]:
         return []
 
 
+async def active_subtasks_for_magic(
+    group_id: str, node_id: str, magic: int,
+) -> list[dict]:
+    """某分组某节点某魔术号下仍未收口的子任务（同步平仓按 magic 定位子任务）。
+
+    正常情况下一个 (节点, magic) 至多一条活动子任务；返回列表是为了与其它
+    `active_subtasks_for_*` 保持一致的调用形态。
+    """
+    if not group_id or not node_id:
+        return []
+    try:
+        async with SessionLocal() as s:
+            rows = (
+                await s.execute(
+                    select(GroupTaskDispatch)
+                    .where(
+                        GroupTaskDispatch.group_id == group_id,
+                        GroupTaskDispatch.node_id == node_id,
+                        GroupTaskDispatch.magic == int(magic),
+                        GroupTaskDispatch.status.notin_(tuple(_TERMINAL)),
+                    )
+                    .order_by(GroupTaskDispatch.id.asc())
+                )
+            ).scalars().all()
+            return [_subtask_dict(r) for r in rows]
+    except Exception as e:  # noqa: BLE001
+        logger.warning("active_subtasks_for_magic failed: %s", e)
+        return []
+
+
+async def active_follower_subtasks_for_task(
+    task_id: int, follower_nodes: set[str],
+) -> list[dict]:
+    """某主任务下、指定跟单节点仍收口的子任务（同步平仓的连带目标）。
+
+    只取 `node_id ∈ follower_nodes` 的 —— 主节点自己的子任务不在其中，
+    同组的其它 owner 成员也不在内（连带只从带单方流向跟单方）。
+    """
+    if not task_id or not follower_nodes:
+        return []
+    try:
+        async with SessionLocal() as s:
+            rows = (
+                await s.execute(
+                    select(GroupTaskDispatch)
+                    .where(
+                        GroupTaskDispatch.task_id == int(task_id),
+                        GroupTaskDispatch.node_id.in_(list(follower_nodes)),
+                        GroupTaskDispatch.status.notin_(tuple(_TERMINAL)),
+                    )
+                    .order_by(GroupTaskDispatch.id.asc())
+                )
+            ).scalars().all()
+            return [_subtask_dict(r) for r in rows]
+    except Exception as e:  # noqa: BLE001
+        logger.warning("active_follower_subtasks_for_task failed: %s", e)
+        return []
+
+
 async def active_subtasks_for_task(
     group_id: str, task_id: Optional[int] = None,
 ) -> list[dict]:

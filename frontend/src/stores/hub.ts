@@ -749,7 +749,7 @@ export const useHubStore = defineStore('hub', {
       status: string
       node_id?: string
       reason?: string
-      /** 连带终止的跟单节点子任务统计：{stopped, forced, total, nodes} */
+      /** @deprecated 上一版「强制连带终止」字段；新版后端不再返回，保留仅为类型兼容 */
       cascade?: { stopped?: number; forced?: number; total?: number; nodes?: string[] }
     }> {
       return (await api.post(`/api/groups/${groupId}/dispatches/${dispatchId}/close`)).data

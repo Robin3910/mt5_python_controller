@@ -1,8 +1,18 @@
 # 带单任务连带终止设计（Follower Cascade Stop）
 
+> **⚠️ 已废弃（2026-11-19）**：本方案的「服务器下发 `strategy_stop` 强制连带终止」已被
+> [`2026-11-19-leader-close-position-sync-design.md`](./2026-11-19-leader-close-position-sync-design.md) 取代。
+>
+> 废弃原因：非网格策略在节点侧本来就是「空仓即收口」，服务器再补一刀 `strategy_stop`
+> 是多余的双重终止；而且 `strategy_stop` 是「按 magic 全平 + 停监控」，做不出
+> 「主节点只平一笔、跟单节点也平一笔，任务继续跑」这个核心场景。
+>
+> 现行做法：**只同步平仓动作**（按 ticket 下发 `close`），任务是否结束交给节点侧按空仓自然收口。
+> 本文保留仅作历史参考；文中描述的 `_cascade_stop_followers` 等代码已全部移除。
+
 日期：2026-11-18
 范围：strategy 链路（分组 / 带单市场 tpl_2、tpl_3）
-状态：已实施
+状态：**已废弃**（被 2026-11-19-leader-close-position-sync-design 取代）
 
 ---
 

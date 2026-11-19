@@ -367,10 +367,30 @@ async def _save_account_active(node_id: str, ws: WebSocket, data: dict) -> None:
     }
     await store.save_account(node_id, snapshot)
     if books_ok:
+        # 主节点平仓同步必须在「子任务收口」**之前**执行：否则跟单节点可能先
+        # 自己读到空仓收口，之后再发 close 就没人认领了。
+        await _sync_leader_close(node_id, positions or [], orders or [])
         await _reconcile_strategy_tasks(node_id, positions or [], orders or [])
     await manager.broadcast_admin({"type": "account", "data": snapshot})
     if books_ok:
         asyncio.create_task(_run_limit_watch(node_id, orders or []))
+
+
+async def _sync_leader_close(node_id: str, positions: list, orders: list) -> None:
+    """主节点平仓 -> 跟单节点同步平仓；失败不打断账户快照入库。"""
+    try:
+        from . import leader_close_sync
+        result = await leader_close_sync.on_snapshot(
+            state.store, node_id, positions, orders,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("leader_close_sync failed for node %s", node_id)
+        return
+    if result.get("released"):
+        try:
+            await _release_node_busy({"released": result["released"]})
+        except Exception:  # noqa: BLE001
+            logger.exception("release after leader_close_sync failed for node %s", node_id)
 
 
 async def _run_limit_watch(node_id: str, orders: list) -> None:

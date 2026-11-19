@@ -801,9 +801,9 @@ class GroupDispatcher:
     ) -> dict:
         """手动终止单个节点子任务：下发 strategy_stop，在线标 closing，离线强制收口并排队补发。
 
-        **连带终止**：触发节点是带单方（owner 成员）时，同一主任务下跟单节点的子任务
-        一起终止（见 `_cascade_stop_followers`）。跟单员自己移出跟单时触发节点是跟单节点，
-        因此**不会**连带停掉带单员的任务 —— 连带是单向的。
+        这里只管**本节点**这一条子任务。主节点平仓后跟单节点的同步不由这里负责：
+        见 `leader_close_sync` —— 那条链路只同步平仓动作，任务结束交给节点侧按空仓
+        自然收口（非网格策略空仓即收口），因此不在这里强制终止跟单任务。
         """
         sub = await group_persist.get_subtask(group_id, dispatch_id)
         if not sub:
@@ -811,133 +811,15 @@ class GroupDispatcher:
         if sub["status"] in group_rules.SUBTASK_TERMINAL:
             raise ValueError(f"子任务已结束（{sub['status']}），无需平仓")
         signal_id = sub.get("signal_id") or f"mclose_{dispatch_id}"
-        group = await self.store.get_group(group_id)
-        # 先连带停跟随侧，再停自己：跟随侧策略可能在我们终止期间又开新仓，
-        # 先把它摁住暴露窗口更小。
-        cascade = await self._cascade_stop_followers(
-            group, trigger_node_id=sub["node_id"],
-            task_id=sub.get("task_id"), signal_id=signal_id,
-        )
         outcome = await self._stop_subtask(sub, signal_id=signal_id, reason=reason)
         await group_persist.mark_dispatches_stop_source(
             [int(sub["dispatch_id"])], _stop_source_of_reason(reason),
         )
-        outcome["cascade"] = cascade
         logger.info(
-            "group %s dispatch #%s manual close -> %s (node %s) cascade=%s",
+            "group %s dispatch #%s manual close -> %s (node %s)",
             group_id, dispatch_id, outcome["status"], sub["node_id"],
-            cascade.get("total"),
         )
         return outcome
-
-    # ------------------------------------------------------------------
-    # 终止连带（带单方 -> 跟单节点）
-    # ------------------------------------------------------------------
-    async def _cascade_stop_followers(
-        self, group: Optional[dict], *, trigger_node_id: str,
-        task_id: Optional[int], signal_id: str,
-    ) -> dict:
-        """带单方终止任务时，连带终止同分组内跟单节点的对应子任务。
-
-        判定（两条都必须满足才连带）：
-        1. 分组开启了 `stop_cascade_enabled`（分组级逃生口，默认开）；
-        2. **触发节点是带单方自己的节点**（owner 成员）。
-
-        第 2 条是连带的**方向性**：跟单员自己移出跟单 / 在自己节点上平仓时，
-        触发节点是跟单节点，此时**不连带** —— 否则跟单员的一次操作就能停掉带单员的任务。
-        连带是带单方向跟单方的单向动作。
-
-        范围：同 group_id、节点在 `group.followers` 里的未收口子任务；
-        给了 task_id 则只限同一主任务（任务级连带），否则是分组内全部任务（频道 / 账户级连带）。
-
-        连带目标走的是**同一个** `_stop_subtask`：在线下发 strategy_stop 标 closing，
-        离线强制收口并把平仓入队等重连补发 —— 与手动终止口径完全一致，
-        不另写一套强平逻辑。
-        """
-        empty = {"stopped": 0, "forced": 0, "total": 0, "nodes": []}
-        if not group:
-            return empty
-        group_id = str(group.get("group_id") or "")
-        if not group_id:
-            return empty
-        if not group.get("stop_cascade_enabled", True):
-            return empty
-
-        trigger = str(trigger_node_id or "").strip()
-        # 触发节点必须是带单方的自有成员；跟单节点触发 → 不连带
-        owner_nodes = {
-            str(m.get("node_id") or "").strip()
-            for m in (group.get("members") or [])
-            if isinstance(m, dict)
-        }
-        if not trigger or trigger not in owner_nodes:
-            return empty
-
-        follower_nodes = {
-            str(f.get("node_id") or "").strip()
-            for f in (group.get("followers") or [])
-            if isinstance(f, dict) and f.get("node_id")
-        }
-        if not follower_nodes:
-            return empty
-
-        subs = await group_persist.active_subtasks_for_task(group_id, task_id)
-        targets = [
-            s for s in subs
-            if str(s.get("node_id") or "").strip() in follower_nodes
-            # 触发节点自身不在 follower_nodes 里，但显式排除更稳
-            and str(s.get("node_id") or "").strip() != trigger
-        ]
-        if not targets:
-            return empty
-
-        stopped = 0
-        forced = 0
-        nodes: list[str] = []
-        for sub in targets:
-            outcome = await self._stop_subtask(
-                sub, signal_id=signal_id, reason="leader_cascade_stop",
-            )
-            if outcome["status"] == "closing":
-                stopped += 1
-                nodes.append(str(sub.get("node_id") or ""))
-            elif outcome["status"] == "forced":
-                forced += 1
-                nodes.append(str(sub.get("node_id") or ""))
-            await group_persist.mark_dispatches_stop_source(
-                [int(sub["dispatch_id"])], "leader_cascade",
-            )
-            await group_persist.record_leader_stop_event(
-                task_id=int(sub.get("task_id") or 0),
-                node_id=str(sub.get("node_id") or ""),
-                magic=sub.get("magic"),
-                message="带单员在主节点上终止了本任务，已连带终止",
-                detail={
-                    "source_node_id": trigger,
-                    "dispatch_id": int(sub.get("dispatch_id") or 0),
-                    "task_id": int(sub.get("task_id") or 0),
-                    "status": outcome["status"],
-                },
-            )
-
-        if stopped or forced:
-            logger.info(
-                "group %s leader cascade stop -> %d closing, %d forced (trigger %s)",
-                group_id, stopped, forced, trigger,
-            )
-            await persist.audit(
-                "system", "leader_cascade_stop", group_id,
-                {"trigger_node_id": trigger, "task_id": task_id,
-                 "group_id": group_id},
-                "ok", None, category="follow", before=None,
-                after={"stopped": stopped, "forced": forced, "nodes": nodes},
-            )
-        return {
-            "stopped": stopped,
-            "forced": forced,
-            "total": stopped + forced,
-            "nodes": nodes,
-        }
 
     async def stop_all_on_node(
         self, node_id: str, *, signal_id: str, reason: str = "manual_close_all",
@@ -947,15 +829,12 @@ class GroupDispatcher:
         总览/节点全平是账户级清仓，不停监控的话网格会重新挂格、限价单会被补挂。
         在线：下发 strategy_stop 并标 closing；离线：强制收口并排队等重连补发。
 
-        **连带终止**：账户级全平发生在**带单方主节点**上时，该分组内跟单节点的任务
-        也一起终止（见 `_cascade_stop_followers`）。连带**按分组收敛** —— 该节点可能
-        同时跑多个分组的任务，跟单员在**其它**分组的仓位不动（避免越权清掉无关持仓）。
+        跟单侧不在这里处理：主节点平仓后由 `leader_close_sync` 按 ticket 同步平仓，
+        任务结束交给跟单节点侧按空仓自然收口。
         """
         subs = await group_persist.active_subtasks_for_node(node_id)
         closing = 0
         forced = 0
-        # 按分组归集：连带是分组级的，账户级全平不跨分组扩散
-        groups_hit: dict[str, list[dict]] = {}
         for sub in subs:
             if sub.get("status") in group_rules.SUBTASK_TERMINAL:
                 continue
@@ -964,16 +843,10 @@ class GroupDispatcher:
                 closing += 1
             elif outcome["status"] == "forced":
                 forced += 1
-            gid = str(sub.get("group_id") or "")
-            if gid:
-                groups_hit.setdefault(gid, []).append(sub)
         await group_persist.mark_dispatches_stop_source(
             [int(s["dispatch_id"]) for s in subs], "account_close",
         )
 
-        cascade = await self._cascade_stop_groups(
-            list(groups_hit.keys()), trigger_node_id=node_id, signal_id=signal_id,
-        )
         if subs:
             logger.info(
                 "node %s close-all -> %d strategy task(s) closing, %d forced",
@@ -983,7 +856,6 @@ class GroupDispatcher:
             "stopped": closing,
             "forced": forced,
             "total": closing + forced,
-            "cascade": cascade,
         }
 
     async def stop_magics_on_node(
@@ -994,19 +866,16 @@ class GroupDispatcher:
 
         频道平仓 / 频道删挂单用它：同一节点上另一个频道的任务保持运行。
 
-        **连带终止**：频道平仓发生在**带单方主节点**上时，该分组内跟单节点的同频道
-        任务一起终止 —— 否则「停掉这个频道」在跟单侧完全没有生效，跟随节点的网格
-        会继续挂格、继续开仓。一个分组只绑一个策略（= 一个频道），所以连带范围
-        就是该分组的全部未收口子任务。
+        跟单侧不在这里处理：主节点平仓后由 `leader_close_sync` 同步平仓；
+        网格策略只平仓、不停任务，因此不存在「停掉频道」在跟单侧不生效的问题。
         """
         want = {int(m) for m in magics}
         empty = {"stopped": 0, "forced": 0, "total": 0}
         if not node_id or not want:
-            return {**empty, "cascade": {"stopped": 0, "forced": 0, "total": 0, "nodes": []}}
+            return dict(empty)
         subs = await group_persist.active_subtasks_for_node(node_id)
         closing = 0
         forced = 0
-        groups_hit: set[str] = set()
         stopped_ids: list[int] = []
         for sub in subs:
             if sub.get("status") in group_rules.SUBTASK_TERMINAL:
@@ -1023,15 +892,9 @@ class GroupDispatcher:
                 closing += 1
             elif outcome["status"] == "forced":
                 forced += 1
-            gid = str(sub.get("group_id") or "")
-            if gid:
-                groups_hit.add(gid)
             stopped_ids.append(int(sub["dispatch_id"]))
         await group_persist.mark_dispatches_stop_source(stopped_ids, "account_close")
 
-        cascade = await self._cascade_stop_groups(
-            list(groups_hit), trigger_node_id=node_id, signal_id=signal_id,
-        )
         if closing or forced:
             logger.info(
                 "node %s channel close -> %d strategy task(s) closing, %d forced",
@@ -1041,31 +904,7 @@ class GroupDispatcher:
             "stopped": closing,
             "forced": forced,
             "total": closing + forced,
-            "cascade": cascade,
         }
-
-    async def _cascade_stop_groups(
-        self, group_ids: list[str], *, trigger_node_id: str, signal_id: str,
-    ) -> dict:
-        """对若干分组分别执行连带终止，并汇总结果。
-
-        用于频道级 / 账户级连带：范围是「该分组的全部未收口子任务」
-        （task_id=None），而不是某个具体任务。
-        """
-        total = {"stopped": 0, "forced": 0, "total": 0, "nodes": []}
-        for gid in group_ids:
-            group = await self.store.get_group(gid)
-            out = await self._cascade_stop_followers(
-                group, trigger_node_id=trigger_node_id,
-                task_id=None, signal_id=signal_id,
-            )
-            total["stopped"] += out["stopped"]
-            total["forced"] += out["forced"]
-            total["total"] += out["total"]
-            for nid in out["nodes"]:
-                if nid not in total["nodes"]:
-                    total["nodes"].append(nid)
-        return total
 
     async def _stop_subtask(
         self, sub: dict, *, signal_id: str, reason: str,

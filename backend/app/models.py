@@ -1007,8 +1007,6 @@ class FollowChannelCloseResult(BaseModel):
     closed: int = 0
     failed: list[int] = Field(default_factory=list)
     strategies: dict = Field(default_factory=dict)
-    # 连带终止的跟单节点子任务统计：{stopped, forced, total, nodes}
-    cascade: dict = Field(default_factory=dict)
 
 
 # ----------------------- 中控台手动触发 -----------------------

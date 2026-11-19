@@ -660,9 +660,9 @@ export interface GroupCloseResult {
   status: string
   reason?: string | null
   /**
-   * 连带终止的跟单节点子任务统计（仅任务级 / 频道级 / 账户级终止命中时才有值）：
-   * - stopped 已下发 strategy_stop
-   * - forced  离线强制收口，待重连补发
+   * @deprecated 上一版「强制连带终止」的返回字段。新版改为「同步平仓」：
+   * 主节点平仓时只同步平仓动作，任务结束由节点侧按空仓自然收口，
+   * 因此后端不再返回这个字段。保留类型定义仅为兼容旧缓存响应。
    */
   cascade?: { stopped?: number; forced?: number; total?: number; nodes?: string[] }
 }
@@ -1077,7 +1077,8 @@ export interface GroupTaskDispatchRecord {
   /**
    * 这次终止是谁发起的：
    * - `self` 自己停自己
-   * - `leader_cascade` 被带单员在主节点上的终止连带
+   * - `leader_cascade` 被带单员在主节点上的平仓连带（仅上一版存量数据；
+   *   新版只同步平仓，任务按空仓自然结束，不再写这个值）
    * - `account_close` 账户级全平
    * - `leave_follow` 跟单员移出跟单
    * - `close_signal` Webhook CLOSE 信号

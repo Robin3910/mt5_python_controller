@@ -338,10 +338,11 @@ async function stopGridTask(task: GroupSignalTaskRecord): Promise<void> {
   )
   const dispatchCount = activeDispatches.length
   if (dispatchCount === 0) return
-  // 连带提示：带单方节点上停止任务时，跟单节点的同一任务会一起被连带终止
+  // 同步平仓提示：主节点平掉仓位时，跟单节点上对应仓位会自动跟着平掉；
+  // 是否全部平完决定任务是否结束，由节点侧按「空仓」自然收口
   const followerCount = hub.groups.find((g) => g.group_id === task.group_id)?.followers?.length ?? 0
   const cascadeHint = followerCount
-    ? `\n（若包含带单方自有节点，跟单节点的同一任务会一起被连带终止，共 ${followerCount} 个跟单节点）`
+    ? `\n（主节点平仓后，跟单节点上的对应仓位会自动同步平掉，共 ${followerCount} 个跟单节点；全部平完任务即结束）`
     : ''
   try {
     await ElMessageBox.confirm(
@@ -363,7 +364,6 @@ async function stopGridTask(task: GroupSignalTaskRecord): Promise<void> {
   let targetsCount = 0
   let forcedCount = 0
   let failCount = 0
-  let cascadeCount = 0
   try {
     // 并发下发所有 dispatch 的停止命令，避免顺序等待拖慢交互
     const results = await Promise.allSettled(
@@ -372,10 +372,9 @@ async function stopGridTask(task: GroupSignalTaskRecord): Promise<void> {
     for (let i = 0; i < results.length; i++) {
       const r = results[i]
       if (r.status === 'fulfilled') {
-        const v = r.value as { status?: string; cascade?: { total?: number } }
+        const v = r.value as { status?: string }
         if (v?.status === 'closing') targetsCount += 1
         else forcedCount += 1
-        cascadeCount += v?.cascade?.total ?? 0
       } else {
         failCount += 1
       }
@@ -383,7 +382,6 @@ async function stopGridTask(task: GroupSignalTaskRecord): Promise<void> {
     const parts: string[] = []
     if (targetsCount > 0) parts.push(`已下发停止 ${sym} · 成功 ${targetsCount}`)
     if (forcedCount > 0) parts.push(`离线 ${forcedCount}`)
-    if (cascadeCount > 0) parts.push(`连带终止跟单节点 ${cascadeCount}`)
     if (parts.length > 0) {
       // 成功 / 离线 都视为本次操作完成
       ElMessage.success(parts.join(' · '))

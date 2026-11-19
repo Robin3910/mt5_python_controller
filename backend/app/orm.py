@@ -899,9 +899,10 @@ class GroupTaskDispatch(Base):
     runtime_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # 终止意图落库时刻：跨服务重启也不会把 closing 的子任务又恢复成继续跑
     stop_requested_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    # 这次终止是谁发起的：self（自己停自己）/ leader_cascade（被带单员在主节点
-    # 上的终止连带）/ account_close（账户级全平）/ leave_follow（跟单员移出跟单）
-    # / close_signal（Webhook CLOSE）。
+    # 这次终止是谁发起的：self（自己停自己）/ account_close（账户级全平）
+    # / leave_follow（跟单员移出跟单）/ close_signal（Webhook CLOSE）。
+    # leader_cascade 仅保留给上一版存量数据（旧「强制连带终止」写下的值），
+    # 新版只同步平仓、不再写它。
     # 存量行为 NULL（来源未知），前端按「未知来源」展示，零行为变化。
     stop_source: Mapped[str | None] = mapped_column(String(24), nullable=True, index=True)
     dispatched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

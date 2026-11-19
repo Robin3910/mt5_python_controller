@@ -355,7 +355,8 @@ def _migrate_group_task_stop_source(sync_conn) -> None:
     """group_task_dispatch.stop_source：这次终止是谁发起的。
 
     - self            自己停自己（自己节点上的手动终止）
-    - leader_cascade  被带单员在主节点上的终止连带
+    - leader_cascade  仅上一版存量数据（旧「强制连带终止」写下的值）；
+                      新版只同步平仓、不再写这个值，保留仅为兼容历史记录
     - account_close   账户级全平
     - leave_follow    跟单员移出跟单
     - close_signal    Webhook CLOSE 信号

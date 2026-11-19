@@ -314,14 +314,7 @@ async function closeChannel(mode: 'all' | 'profit' | 'ticket', ticket?: number):
       ticket: ticket ?? null,
     })
     if (data.status === 'partial') ElMessage.warning(`已提交，有 ${data.failed?.length || 0} 笔未确认`)
-    else {
-      const cascaded = data.cascade?.total ?? 0
-      ElMessage.success(
-        cascaded
-          ? `已提交平仓，并连带终止 ${cascaded} 个跟单节点子任务`
-          : '已提交平仓',
-      )
-    }
+    else ElMessage.success('已提交平仓')
     await loadChannels()
   } catch (e) {
     ElMessage.error(errText(e, '平仓失败'))
