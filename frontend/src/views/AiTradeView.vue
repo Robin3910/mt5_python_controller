@@ -744,13 +744,41 @@ function bookStats(rows: Array<Position & { nodeId: string }>) {
   }
   return { buy, sell, volume, profit, count: rows.length }
 }
+/**
+ * 按「品种 → 魔术号」两层分块。
+ *
+ * 一个机器人的持仓可能跨多个品种（多品种分组），混在一张表里列宽不够分，
+ * 所以先按 symbol 分块；块内再按 magic 分组（AI 分组里可能混入手工单）。
+ */
+function symbolBooks(rows: Array<Position & { nodeId: string }>) {
+  const bySymbol = new Map<string, Array<Position & { nodeId: string }>>()
+  for (const row of rows) {
+    const symbol = row.symbol || '—'
+    const bucket = bySymbol.get(symbol) || []
+    bucket.push(row)
+    bySymbol.set(symbol, bucket)
+  }
+  return [...bySymbol.entries()].map(([symbol, bucket]) => {
+    const stats = bookStats(bucket)
+    return { symbol, rows: bucket, groups: magicBooks(bucket), ...stats }
+  }).sort((a, b) => a.symbol.localeCompare(b.symbol))
+}
+
+function fmtSide(type: string | null | undefined): string {
+  const v = (type || '').toLowerCase()
+  if (v === 'buy') return '多'
+  if (v === 'sell') return '空'
+  return type || '—'
+}
+
 function fmtU(n: number): string {
   const abs = Math.abs(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
   return n >= 0 ? `+${abs}` : `-${abs}`
 }
-function fmtPx(n: number | null | undefined): string {
+/** 价格精度按品种推断：JPY 类 3 位，其余 5 位（与 TradingView 口径一致） */
+function fmtPx(n: number | null | undefined, symbol?: string | null): string {
   if (n == null || !Number.isFinite(n) || n === 0) return '—'
-  const digits = Math.abs(n) >= 50 ? 2 : 5
+  const digits = /JPY/i.test(symbol || '') ? 3 : Math.abs(n) >= 1000 ? 2 : 5
   return n.toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits })
 }
 
@@ -998,28 +1026,42 @@ onMounted(() => { void hub.fetchNodes(); trackAiUi('page_view', { value: 'ai-tra
               <button type="button" class="solid" :disabled="closeBusy" @click="closeRobotAll(entry)"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="m11 21 1-7H7L13 3l-1 7h5l-6 11z"/></svg>一键平仓</button>
             </div>
           </div>
-          <div v-if="robotPositions(entry).length" class="ai-table">
+          <div v-if="robotPositions(entry).length" class="ai-pos-table">
             <div class="ai-trade-label"><p><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M6.99 11 3 15l3.99 4v-3H14v-2H6.99v-3zM21 9l-3.99-4v3H10v2h7.01v3L21 9z"/></svg>当前交易</p><span>{{ bookStats(robotPositions(entry)).count }} 笔 · {{ bookStats(robotPositions(entry)).volume.toFixed(2) }} 手</span></div>
-            <div class="ai-grid head"><span>#</span><span>方向</span><span>手数</span><span class="c-px">开仓价</span><span class="c-sltp">止盈/止损</span><span class="c-pl">浮动盈亏</span><span>操作</span></div>
-            <template v-for="group in magicBooks(robotPositions(entry))" :key="group.magic">
-              <div class="ai-magic-head">
+            <!-- H5 适配：按「品种 → 魔术号」分块，每张表包在 .ai-scroll 里横向滑动，
+                 窄屏下列宽不再被压缩，「操作」列不会被挤出屏幕（与 TradingView 一致）。 -->
+            <section v-for="book in symbolBooks(robotPositions(entry))" :key="`${entry.robot.group_id}-${book.symbol}`" class="ai-book">
+              <header class="ai-book-head">
                 <div>
-                  <b>{{ magicLabel(group.magic) }}</b>
-                  <span>{{ group.rows.length }} 笔 · {{ group.volume.toFixed(2) }} 手</span>
+                  <b>{{ book.symbol }}</b>
+                  <span>{{ book.rows.length }} 笔 · {{ book.volume.toFixed(2) }} 手</span>
+                  <span>多 {{ book.buy }} / 空 {{ book.sell }}</span>
                 </div>
-                <strong :class="group.profit >= 0 ? 'up' : 'down'">{{ fmtU(group.profit) }}</strong>
+                <strong :class="book.profit >= 0 ? 'up' : 'down'">{{ fmtU(book.profit) }}</strong>
+              </header>
+              <div class="ai-scroll">
+                <div class="ai-grid ai-pos-grid head"><span>#</span><span>方向</span><span>手数</span><span>开仓价</span><span>止盈/止损</span><span>浮动盈亏</span><span>操作</span></div>
+                <template v-for="group in book.groups" :key="group.magic">
+                  <div class="ai-magic-head">
+                    <div>
+                      <b>{{ magicLabel(group.magic) }}</b>
+                      <span>{{ group.rows.length }} 笔 · {{ group.volume.toFixed(2) }} 手</span>
+                    </div>
+                    <strong :class="group.profit >= 0 ? 'up' : 'down'">{{ fmtU(group.profit) }}</strong>
+                  </div>
+                  <div v-for="(p, i) in group.rows" :key="p.nodeId + '-' + p.ticket" class="ai-grid ai-pos-grid">
+                    <span class="dim">{{ i + 1 }}</span>
+                    <span><i class="dir" :class="(p.type || '').toLowerCase() === 'buy' ? 'buy' : 'sell'">{{ fmtSide(p.type) }}</i></span>
+                    <span class="num">{{ (p.volume || 0).toFixed(2) }}</span>
+                    <span class="num">{{ fmtPx(p.price_open, p.symbol) }}</span>
+                    <span class="sltp"><em class="up">{{ fmtPx(p.tp, p.symbol) }}</em><em class="down">{{ fmtPx(p.sl, p.symbol) }}</em></span>
+                    <strong :class="(p.profit || 0) >= 0 ? 'up' : 'down'">{{ fmtU(p.profit || 0) }}</strong>
+                    <button type="button" class="ai-x" :disabled="closeBusy" @click="closeRobotTicket(p.nodeId, p.ticket)">平仓</button>
+                  </div>
+                </template>
               </div>
-              <div v-for="(p, i) in group.rows" :key="p.nodeId + '-' + p.ticket" class="ai-grid">
-                <span class="dim">{{ i + 1 }}</span>
-                <span><i :class="(p.type || '').toLowerCase() === 'buy' ? 'buy' : 'sell'">{{ (p.type || '').toLowerCase() === 'buy' ? '多' : '空' }}</i></span>
-                <span>{{ (p.volume || 0).toFixed(2) }}</span>
-                <span class="c-px">{{ fmtPx(p.price_open) }}</span>
-                <span class="sltp c-sltp"><em class="up">{{ fmtPx(p.tp) }}</em><em class="down">{{ fmtPx(p.sl) }}</em></span>
-                <strong class="c-pl" :class="(p.profit || 0) >= 0 ? 'up' : 'down'">{{ fmtU(p.profit || 0) }}</strong>
-                <button type="button" :disabled="closeBusy" @click="closeRobotTicket(p.nodeId, p.ticket)">平仓</button>
-              </div>
-            </template>
-            <footer><span>多 {{ bookStats(robotPositions(entry)).buy }} / 空 {{ bookStats(robotPositions(entry)).sell }}</span><b :class="bookStats(robotPositions(entry)).profit >= 0 ? 'up' : 'down'">合计 {{ fmtU(bookStats(robotPositions(entry)).profit) }}</b></footer>
+            </section>
+            <p class="ai-foot-note">当前持仓 {{ bookStats(robotPositions(entry)).count }} 笔 · 合计手数 {{ bookStats(robotPositions(entry)).volume.toFixed(2) }} · 浮动盈亏 {{ fmtU(bookStats(robotPositions(entry)).profit) }}</p>
           </div>
         </article>
       </div>
@@ -1149,8 +1191,8 @@ onMounted(() => { void hub.fetchNodes(); trackAiUi('page_view', { value: 'ai-tra
 .ai-tabs button span { border-radius: 999px; background: rgba(0,0,0,.2); padding: 0 6px; font-size: 9px; }
 .ai-tabs button.on { border: 0; color: #fff; background: linear-gradient(90deg, #2563EB, #1D4ED8); box-shadow: 0 2px 8px rgba(37,99,235,.35); }
 .ai-tabs .push { margin-left: auto; }
-.ai-cards { margin-top: 8px; display: grid; gap: 10px; align-items: start; }
-.ai-card { min-width: 0; text-align: left; border: 1px solid #1C2740; background: #101828; border-radius: 12px; padding: 12px; box-shadow: 0 2px 12px rgba(0,0,0,.35); }
+.ai-cards { margin-top: 8px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; align-items: start; min-width: 0; max-width: 100%; }
+.ai-card { min-width: 0; max-width: 100%; text-align: left; border: 1px solid #1C2740; background: #101828; border-radius: 12px; padding: 12px; box-shadow: 0 2px 12px rgba(0,0,0,.35); }
 .ai-card:hover { border-color: rgba(37,99,235,.5); }
 .ai-card-top { justify-content: space-between; }
 .ai-card-heading { display: flex; align-items: center; gap: 8px; min-width: 0; }
@@ -1175,25 +1217,36 @@ onMounted(() => { void hub.fetchNodes(); trackAiUi('page_view', { value: 'ai-tra
 .ai-card-actions .amber { border: 1px solid rgba(245,158,11,.4); background: rgba(245,158,11,.1); color: #F59E0B; border-radius: 8px; padding: 6px 12px; font-size: 11px; font-weight: 600; }
 .ai-card-actions .solid, .ai-grid button { border: 0; background: #F6465D; color: #fff; border-radius: 8px; padding: 6px 12px; font-size: 11px; font-weight: 600; box-shadow: 0 2px 8px rgba(246,70,93,.35); }
 .ai-grid button { background: rgba(246,70,93,.1); color: #F6465D; box-shadow: none; border: 1px solid rgba(246,70,93,.4); border-radius: 4px; padding: 2px 8px; font-size: 10px; font-weight: 500; }
-.ai-table { margin-top: 10px; overflow: hidden; border: 1px solid #1E2B47; border-radius: 8px; background: #0A1120; }
-.ai-trade-label { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 10px; border-bottom: 1px solid #16213A; }
+/* 注意：不能叫 .ai-table —— styles.css 里有同名通用表格类（min-width:860px），
+   会把卡片里的这块撑出容器。 */
+.ai-pos-table { margin-top: 10px; min-width: 0; overflow: hidden; border: 1px solid #1E2B47; border-radius: 8px; background: #0A1120; }
+.ai-trade-label { display: flex; align-items: center; justify-content: space-between; padding: 6px 10px; border-bottom: 1px solid #16213A; }
 .ai-trade-label p { display: flex; align-items: center; gap: 4px; margin: 0; font-size: 11px; font-weight: 600; }
 .ai-trade-label svg { width: 13px; height: 13px; color: #3B82F6; }
-.ai-trade-label span { color: #5B6B85; font-size: 10px; text-align: right; }
-/* 移动端：持仓行改为「标签 + 值」两列卡片式布局，避免横向溢出；>=640px 用表格 */
-.ai-grid { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 4px 10px; align-items: center; padding: 8px 10px; font-size: 11px; font-variant-numeric: tabular-nums; border-bottom: 1px dashed #1B2A48; }
-.ai-grid > span, .ai-grid > strong { min-width: 0; overflow-wrap: anywhere; }
-.ai-grid > .c-px::before { content: '开仓价'; }
-.ai-grid > .c-sltp::before { content: '止盈/止损'; }
-.ai-grid > .c-pl::before { content: '浮动盈亏'; }
-.ai-grid > .c-px::before, .ai-grid > .c-sltp::before, .ai-grid > .c-pl::before { display: block; color: #5B6B85; font-size: 9px; line-height: 14px; font-weight: 400; }
-.ai-grid > strong { text-align: right; }
-.ai-grid > button { grid-column: 3; grid-row: 1 / span 3; align-self: center; }
-.ai-grid.head { display: none; }
-.ai-grid > span:nth-child(1), .ai-grid > span:nth-child(2), .ai-grid > span:nth-child(3) { justify-self: start; white-space: nowrap; }
-.ai-grid > span:nth-child(1) { color: #4A5568; font-size: 10px; }
-.ai-grid > .c-px, .ai-grid > .c-sltp { grid-column: 1 / 3; }
-.ai-grid > .c-pl { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 8px; padding-right: 66px; }
+.ai-trade-label span { color: #5B6B85; font-size: 10px; }
+/* 每个品种一块：块头 + 横向滑动表格（与 TradingView 的 .tr-book/.tr-scroll 同结构） */
+.ai-book { border-top: 1px solid #16213A; }
+.ai-book:first-of-type { border-top: 0; }
+.ai-book-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 10px; background: #0C1424; border-bottom: 1px solid #16213A; }
+.ai-book-head div { display: flex; align-items: center; gap: 8px; min-width: 0; flex-wrap: wrap; }
+.ai-book-head b { color: #3B82F6; background: rgba(37,99,235,.15); border-radius: 6px; padding: 1px 6px; font-size: 12px; }
+.ai-book-head span { color: #5B6B85; font-size: 10px; }
+.ai-book-head strong { flex-shrink: 0; font-size: 11px; font-variant-numeric: tabular-nums; }
+.ai-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; overscroll-behavior-x: contain; }
+.ai-scroll > * { min-width: 100%; box-sizing: border-box; }
+.ai-scroll::-webkit-scrollbar { height: 4px; }
+.ai-scroll::-webkit-scrollbar-thumb { background: #22304A; border-radius: 2px; }
+.ai-scroll::-webkit-scrollbar-track { background: transparent; }
+.ai-grid { display: grid; grid-template-columns: 14px 22px 34px minmax(56px,1fr) minmax(58px,1fr) minmax(64px,1fr) 48px; min-width: 352px; gap: 6px; align-items: center; padding: 4px 10px; font-size: 11px; font-variant-numeric: tabular-nums; text-align: right; border-bottom: 1px dashed #1B2A48; }
+.ai-grid > :first-child { text-align: left; font-size: 10px; }
+.ai-grid > :nth-child(2) { text-align: center; }
+.ai-grid > :nth-child(3) { text-align: center; font-size: 10px; }
+.ai-grid > button { justify-self: end; }
+.ai-grid.head { color: #5B6B85; font-size: 10px; font-weight: 500; background: #0C1424; border-bottom: 1px solid #16213A; }
+.ai-pos-grid { min-width: 340px; }
+@media (min-width: 720px) {
+  .ai-pos-grid { min-width: 0; }
+}
 .ai-magic-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 10px; background: #10192C; border-bottom: 1px solid #16213A; }
 .ai-magic-head div { display: flex; align-items: center; gap: 8px; min-width: 0; flex-wrap: wrap; }
 .ai-magic-head b { color: #93C5FD; font-size: 11px; font-weight: 650; }
@@ -1201,13 +1254,14 @@ onMounted(() => { void hub.fetchNodes(); trackAiUi('page_view', { value: 'ai-tra
 .ai-magic-head strong { font-size: 11px; font-variant-numeric: tabular-nums; }
 .ai-grid:last-of-type { border-bottom: 0; }
 .ai-grid strong { font-weight: 600; }
-.ai-grid i { display: inline-flex; align-items: center; justify-content: center; height: 15px; min-width: 20px; font-style: normal; font-size: 10px; font-weight: 700; line-height: 1; border-radius: 3px; padding: 0 2px; }
-.ai-grid i.buy { color: #22C55E; background: rgba(34,197,94,.15); }
-.ai-grid i.sell { color: #F6465D; background: rgba(246,70,93,.15); }
-.sltp em { display: block; font-style: normal; line-height: 1.25; }
-.ai-table footer { display: flex; justify-content: space-between; padding: 6px 10px; border-top: 1px solid #16213A; background: #0C1424; font-size: 10px; font-variant-numeric: tabular-nums; }
-.ai-table footer > span { color: #5B6B85; }
-.ai-table footer b { font-weight: 600; }
+.ai-grid .num, .ai-book-head strong { font-variant-numeric: tabular-nums; }
+.ai-grid i.dir { display: inline-flex; align-items: center; justify-content: center; height: 15px; min-width: 20px; font-style: normal; font-size: 10px; font-weight: 700; line-height: 1; border-radius: 3px; padding: 0 2px; white-space: nowrap; }
+.ai-grid i.dir.buy { color: #22C55E; background: rgba(34,197,94,.15); }
+.ai-grid i.dir.sell { color: #F6465D; background: rgba(246,70,93,.15); }
+.ai-grid button.ai-x { border: 1px solid rgba(246,70,93,.4); background: rgba(246,70,93,.1); color: #F6465D; box-shadow: none; border-radius: 6px; padding: 1px 8px; font-size: 10px; font-weight: 500; }
+.sltp { text-align: right; line-height: 1.2; }
+.sltp em { display: block; font-style: normal; font-size: 11px; }
+.ai-foot-note { margin: 8px 0 0; padding: 0 10px 8px; color: #8B96A8; font-size: 10px; text-align: center; font-variant-numeric: tabular-nums; }
 .ai-node-card { border: 1px solid #22304A; background: #0C1220; border-radius: 8px; padding: 10px; }
 .ai-node-card > p { margin: 0 0 6px; font-size: 12px; font-weight: 700; }
 .ai-node-line { justify-content: space-between; gap: 8px; padding: 6px 0; border-top: 1px dashed #1B2A48; font-size: 12px; }
@@ -1235,21 +1289,6 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 @media (min-width: 640px) {
   :global(.app-shell.is-customer:has(.ai) .nav-customer a) { padding: 0 10px; font-size: 12px; }
   .ai-online { display: flex; }
-  .ai-grid { grid-template-columns: 14px 34px 44px minmax(60px,1fr) minmax(64px,1fr) minmax(64px,1fr) auto; gap: 6px; padding: 4px 10px; text-align: right; }
-  .ai-grid > span, .ai-grid > strong { overflow-wrap: normal; }
-  .ai-grid > button { grid-column: auto; grid-row: auto; justify-self: end; }
-  .ai-grid > .c-px::before, .ai-grid > .c-sltp::before, .ai-grid > .c-pl::before { display: none; }
-  .ai-grid > span:nth-child(1) { text-align: left; }
-  .ai-grid > span:nth-child(2) { justify-self: center; text-align: center; }
-  .ai-grid > span:nth-child(3) { justify-self: end; }
-  .ai-grid > .c-px, .ai-grid > .c-sltp, .ai-grid > .c-pl { grid-column: auto; }
-  .ai-grid > .c-pl { display: block; padding-right: 0; text-align: right; }
-  .ai-grid.head { display: grid; color: #5B6B85; font-size: 10px; font-weight: 500; background: #0C1424; border-bottom: 1px solid #16213A; }
-  .ai-grid.head > span { justify-self: auto; white-space: normal; }
-  .ai-grid.head > span:nth-child(1) { text-align: left; }
-  .ai-grid.head > span:nth-child(2) { text-align: center; }
-  .ai-grid.head > span:nth-child(3) { text-align: right; }
-  .ai-grid.head > .c-px::before, .ai-grid.head > .c-sltp::before, .ai-grid.head > .c-pl::before { content: none; }
 }
 @media (min-width: 1024px) {
   :global(.app-shell.is-customer .content:has(> .ai)) { padding-top: 12px; }

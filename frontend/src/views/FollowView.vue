@@ -1147,14 +1147,6 @@ function selfModeLabel(name: string | null | undefined): string {
 function selfItemTitle(g: { name: string | null; strategy_name?: string | null; strategy_template?: string | null }): string {
   return selfModeLabel(g.name) || selfModeLabel(g.strategy_name) || g.strategy_template || g.strategy_name || g.name || '跟单分组'
 }
-function selfMagicLabel(groupId: string): string {
-  const id = myLeader.value?.primary_node?.node_id
-  if (!id) return ''
-  const fromPos = selfPositions(groupId).map((p) => p.magic).find((m) => m)
-  const fromBook = (followMagics.value[id] || []).find((m) => m.group_id === groupId && m.magic)?.magic
-  const magic = fromPos || fromBook
-  return magic ? `MF ${magic}` : ''
-}
 function selfSyncLabel(groupId: string): string {
   const latest = selfPositions(groupId).reduce((max, p) => Math.max(max, p.time || 0), 0)
   return latest ? `同步 ${fmtTime(latest)}` : ''
@@ -1305,7 +1297,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
                 <p>
                   <svg viewBox="0 0 24 24"><path fill="currentColor" d="M7 2v11h3v9l7-12h-4l4-8z"/></svg>
                   <b>{{ selfItemTitle(g) }}</b>
-                  <em v-if="selfMagicLabel(g.group_id)" class="fd-mf">{{ selfMagicLabel(g.group_id) }}</em>
+                  <!-- <em v-if="selfMagicLabel(g.group_id)" class="fd-mf">{{ selfMagicLabel(g.group_id) }}</em> -->
                   <em v-if="selfNodeLabel()" class="fd-node"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M20 13H4c-.55 0-1 .45-1 1v6c0 .55.45 1 1 1h16c.55 0 1-.45 1-1v-6c0-.55-.45-1-1-1zM7 19c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zM20 3H4c-.55 0-1 .45-1 1v6c0 .55.45 1 1 1h16c.55 0 1-.45 1-1V4c0-.55-.45-1-1-1zM7 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2z"/></svg>{{ selfNodeLabel() }}</em>
                   <span v-if="selfSyncLabel(g.group_id)">{{ selfSyncLabel(g.group_id) }}</span>
                 </p>
@@ -1702,7 +1694,9 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 .fd-kicker span, .fd-sec header em { border: 1px solid #22304A; background: #0C1220; color: #5B6B85; border-radius: 999px; padding: 0 6px; font-size: 10px; font-style: normal; font-weight: 500; }
 .fd-ghost, .fd-follow, .fd-close, .fd-leave, .fd-link, .fd-back, .fd-tabs button, .fd-filters button, .fd-dialog button, .fd-pick { cursor: pointer; }
 .fd-ghost { display: flex; align-items: center; gap: 4px; border: 1px solid #22304A; background: #0C1220; color: #8B96A8; border-radius: 8px; padding: 4px 8px; font-size: 10px; }
-.fd-grid { margin-top: 8px; display: grid; gap: 10px; }
+/* 列宽用 minmax(0,1fr)：默认 auto 列会被卡片内容的 min-content 撑开，
+   窄屏下卡片就会顶出屏幕；子项 + min-width:0 才能配合收缩。 */
+.fd-grid { margin-top: 8px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; min-width: 0; max-width: 100%; }
 .fd-leader, .fd-card, .fd-node-card { padding: 12px; }
 .fd-leader { display: flex; align-items: center; gap: 8px; }
 .fd-leader:hover, .fd-card:hover, .fd-preview:hover { border-color: rgba(124,58,237,.5); }
@@ -1740,7 +1734,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 .fd-chips strong, .fd-stat3 b, .fd-stats b, .fd-sum4 b { display: block; margin-top: 2px; font-size: 11px; }
 .fd-chips small, .fd-stats span, .fd-sum4 span, .fd-stat3 span { display: flex; align-items: center; gap: 4px; color: #5B6B85; font-size: 9px; }
 .fd-preview-empty { display: block; margin-top: 8px; color: #5B6B85; font-size: 11px; }
-.fd-card { margin-top: 8px; }
+.fd-card { margin-top: 8px; min-width: 0; max-width: 100%; overflow: hidden; }
 .fd-sec header em.fd-sec-note { border: 0; background: transparent; padding: 0; color: #5B6B85; font-size: 10px; font-weight: 400; }
 .fd-self-top, .fd-self-row, .fd-self-pos > div, .fd-self .fd-book-head > span, .fd-book-meta, .fd-book-meta b, .fd-self-link, .fd-self-run { display: flex; align-items: center; }
 .fd-self-grid { margin-top: 8px; display: grid; gap: 10px; }
@@ -1803,25 +1797,32 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 @keyframes fd-pulse { 0% { box-shadow: 0 0 0 0 rgba(34,197,94,.55); } 100% { box-shadow: 0 0 0 5px rgba(34,197,94,0); } }
 .fd-card-side { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
 .fd-link { border: 0; background: transparent; color: #3B82F6; font-size: 10px; }
-.fd-item { margin-top: 10px; border: 1px solid #22304A; background: #0C1220; border-radius: 8px; padding: 10px; }
+.fd-item { margin-top: 10px; min-width: 0; max-width: 100%; border: 1px solid #22304A; background: #0C1220; border-radius: 8px; padding: 10px; }
 .fd-item-top { justify-content: space-between; }
-.fd-item-top p { display: flex; align-items: center; gap: 6px; min-width: 0; margin: 0; }
+.fd-item-top p { display: flex; align-items: center; gap: 6px; min-width: 0; margin: 0; flex: 1; }
+.fd-item-top p b { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fd-item-top > em { flex: 0 0 auto; }
 .fd-item-top svg { color: #A78BFA; }
 .fd-item-top b { font-size: 11px; }
 .fd-item-top em { border-radius: 4px; }
 .fd-item-top span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #5B6B85; font-size: 9px; }
-.fd-book { margin-top: 8px; overflow: hidden; border: 1px solid #1E2B47; border-radius: 6px; background: #0A101E; }
-.fd-book-head { justify-content: space-between; padding: 6px 8px; background: #0C1220; border-bottom: 1px solid #1E2B47; color: #8B96A8; font-size: 9px; }
+.fd-book { margin-top: 8px; min-width: 0; max-width: 100%; overflow: hidden; border: 1px solid #1E2B47; border-radius: 6px; background: #0A101E; }
+.fd-book-head { justify-content: space-between; gap: 8px; padding: 6px 8px; background: #0C1220; border-bottom: 1px solid #1E2B47; color: #8B96A8; font-size: 9px; }
+.fd-book-head > span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; }
 .fd-book .fd-empty { padding: 8px; }
-.fd-pos { justify-content: space-between; gap: 8px; padding: 6px 8px; border-bottom: 1px solid #161F30; }
+/* 持仓行：左侧「BUY XAUUSD + 开仓详情」可能很长，必须能收缩省略，
+   否则窄屏下会把右侧盈亏挤出卡片。 */
+.fd-pos { justify-content: space-between; gap: 8px; padding: 6px 8px; border-bottom: 1px solid #161F30; min-width: 0; }
 .fd-pos:last-child { border-bottom: 0; }
-.fd-pos p { display: flex; align-items: center; gap: 6px; margin: 0; font-size: 11px; }
+.fd-pos > div:first-child { min-width: 0; flex: 1; }
+.fd-pos p { display: flex; align-items: center; gap: 6px; margin: 0; font-size: 11px; min-width: 0; }
+.fd-pos small { display: block; color: #5B6B85; font-size: 9px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fd-pos em { font-style: normal; font-size: 9px; font-weight: 700; border-radius: 4px; padding: 1px 4px; }
 .fd-pos em.buy { color: #22C55E; background: rgba(34,197,94,.15); }
 .fd-pos em.sell { color: #F6465D; background: rgba(246,70,93,.15); }
-.fd-pos small { color: #5B6B85; font-size: 9px; }
 .fd-pos-side { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
-.fd-pos-side .dot { color: #60A5FA; font-size: 10px; }
+.fd-pos-side .dot { color: #60A5FA; font-size: 10px; white-space: nowrap; }
+.fd-pos-side strong { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .fd-pos-side .dot::before { content: ''; display: inline-block; width: 6px; height: 6px; margin-right: 4px; border-radius: 99px; background: #3B82F6; }
 .up { color: #22C55E; } .down { color: #F6465D; }
 .fd-stats, .fd-sum4 { margin-top: 8px; display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 6px; }
@@ -1850,7 +1851,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 .fd-pnl { display: flex; justify-content: space-between; margin-top: 8px; border-radius: 8px; padding: 8px 10px; font-size: 12px; }
 .fd-pnl.up { background: rgba(22,163,74,.16); }
 .fd-pnl.down { background: rgba(246,70,93,.12); }
-.fd-mask { position: fixed; inset: 0; z-index: 40; display: flex; align-items: center; justify-content: center; padding: 16px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-bottom: max(16px, env(safe-area-inset-bottom, 0px)); }
+.fd-mask { position: fixed; inset: 0; z-index: 40; background: rgba(0, 0, 0, 0.32); display: flex; align-items: center; justify-content: center; padding: 16px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-bottom: max(16px, env(safe-area-inset-bottom, 0px)); }
 /* dvh + 安全区：底部按钮要让开 iOS Home Indicator */
 .fd-dialog { width: min(480px, 100%); max-height: calc(100dvh - 32px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)); display: flex; flex-direction: column; padding: 0; background: #0D1220; border-radius: 16px; box-shadow: 0 24px 80px #0008; outline: none; }
 .fd-dialog header, .fd-dialog footer { justify-content: space-between; }
