@@ -591,6 +591,17 @@ class NodeGroup(Base):
     )
     # 一对一绑定 TradingStrategy；unique 保证同一策略不能挂到多个分组
     strategy_id: Mapped[str | None] = mapped_column(String(32), nullable=True, unique=True, index=True)
+    # 终止连带：带单员在主节点上终止任务时，是否连带终止该分组内**跟单节点**的
+    # 同任务子任务（默认开）。
+    #
+    # 为什么默认开：跟单的本质就是跟随主节点的动作 —— 主节点停了而跟单节点还在跑，
+    # 仓位还在，与「跟单」的语义相悖，也���带单员无法通过主节点一个动作收回整组风险。
+    # 关掉它 = 带单员只要「只停我自己」，作为逃生口。
+    #
+    # 只作用于带单市场（tpl_2 / tpl_3）；AI 市场（tpl_1）另有一套跟单语义。
+    stop_cascade_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default="1",
+    )
     remark: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # 数据归属：创建者；空 = 管理员名下。成员节点与绑定策略必须同一所有者
     owner_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
@@ -877,6 +888,11 @@ class GroupTaskDispatch(Base):
     runtime_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # 终止意图落库时刻：跨服务重启也不会把 closing 的子任务又恢复成继续跑
     stop_requested_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # 这次终止是谁发起的：self（自己停自己）/ leader_cascade（被带单员在主节点
+    # 上的终止连带）/ account_close（账户级全平）/ leave_follow（跟单员移出跟单）
+    # / close_signal（Webhook CLOSE）。
+    # 存量行为 NULL（来源未知），前端按「未知来源」展示，零行为变化。
+    stop_source: Mapped[str | None] = mapped_column(String(24), nullable=True, index=True)
     dispatched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     # 毫秒精度：sent_at → opened_at 是「策略命令往返时延」的两端（节点首次回报开仓）
     opened_at: Mapped[datetime | None] = mapped_column(MsDateTime, nullable=True)

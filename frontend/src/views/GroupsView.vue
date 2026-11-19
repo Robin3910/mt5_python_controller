@@ -117,6 +117,7 @@ const form = reactive({
   limit_watch_keyword: 'limit',
   limit_watch_node_ids: [] as string[],
   accept_ai_follow: false,
+  stop_cascade_enabled: true,
   signal_source: 'direct' as GroupSignalSource,
   strategy_id: '' as string,
   remark: '',
@@ -291,6 +292,7 @@ function openCreate(): void {
     limit_watch_keyword: 'limit',
     limit_watch_node_ids: [],
     accept_ai_follow: false,
+    stop_cascade_enabled: true,
     signal_source: 'direct' as GroupSignalSource,
     strategy_id: '',
     remark: '',
@@ -315,6 +317,7 @@ function openEdit(g: GroupOut): void {
     limit_watch_keyword: g.limit_watch_keyword ?? '',
     limit_watch_node_ids: g.nodes.filter((n) => n.limit_watch_report).map((n) => n.node_id),
     accept_ai_follow: Boolean(g.accept_ai_follow),
+    stop_cascade_enabled: g.stop_cascade_enabled !== false,
     signal_source: (g.signal_source ?? 'direct') as GroupSignalSource,
     strategy_id: g.strategy_id || '',
     remark: g.remark || '',
@@ -350,6 +353,7 @@ async function save(): Promise<void> {
       limit_watch_enabled: formIsTrendStrategy.value ? form.limit_watch_enabled : false,
       limit_watch_keyword: (form.limit_watch_keyword || '').trim(),
       accept_ai_follow: formIsAiStrategy.value ? form.accept_ai_follow : false,
+      stop_cascade_enabled: form.stop_cascade_enabled,
       signal_source: form.signal_source,
       strategy_id: strategyId,
       remark: form.remark.trim() || null,
@@ -373,6 +377,7 @@ async function save(): Promise<void> {
       (formIsAiStrategy.value
         ? `开放 AI 跟单：${form.accept_ai_follow ? '开启（会进入【AI 交易】广场）' : '关闭'}\n`
         : '') +
+      `终止连带：${form.stop_cascade_enabled ? '开启（终止任务会连带终止跟单节点）' : '关闭'}\n` +
       `信号来源：${SIGNAL_SOURCE_SUMMARY[form.signal_source] ?? '直连'}\n` +
       `绑定策略：${styName}\n` +
       `成员节点：${form.node_ids.length} 个`
@@ -433,6 +438,19 @@ async function toggleAcceptAiFollow(g: GroupOut): Promise<void> {
   await hub.updateGroup(
     g.group_id,
     { accept_ai_follow: !g.accept_ai_follow },
+    currentSearchOptions(),
+  )
+}
+
+async function toggleStopCascade(g: GroupOut): Promise<void> {
+  const next = g.stop_cascade_enabled ? '关闭' : '开启'
+  const effect = g.stop_cascade_enabled
+    ? '带单员在主节点终止任务时，不再连带终止跟单节点的同一任务；跟单节点会继续跑完'
+    : '带单员在主节点终止任务时，跟单节点的同一任务会一起平仓终止（单向生效，跟单员自己平仓不影响带单员）'
+  if (!(await confirmAction(`确认${next}分组「${g.name}」的终止连带？\n\n${next}后：${effect}。`))) return
+  await hub.updateGroup(
+    g.group_id,
+    { stop_cascade_enabled: !g.stop_cascade_enabled },
     currentSearchOptions(),
   )
 }
@@ -889,6 +907,14 @@ async function onStrategyFormSaved(): Promise<void> {
             @click="toggleAcceptAiFollow(g)"
           >
             AI{{ g.accept_ai_follow ? '开' : '关' }}
+          </button>
+          <button
+            class="mini-toggle"
+            :class="g.stop_cascade_enabled ? 'on' : 'off'"
+            :title="g.stop_cascade_enabled ? '已开启：终止任务会连带终止跟单节点' : '已关闭：跟单节点不会跟着终止'"
+            @click="toggleStopCascade(g)"
+          >
+            连带{{ g.stop_cascade_enabled ? '开' : '关' }}
           </button>
         </div>
 
@@ -1492,6 +1518,19 @@ async function onStrategyFormSaved(): Promise<void> {
                 v-model="form.accept_ai_follow"
                 :options="SWITCH_TAGS"
                 aria-label="开放 AI 跟单"
+              />
+            </div>
+            <div>
+              <FormLabel
+                field-id="group-stop-cascade"
+                text="终止连带"
+                help="开启后，带单员在主节点上终止任务时，跟单节点的同一任务会一起平仓终止（单向：跟单员自己平仓不会影响带单员）。关闭后跟单节点会继续跑到自然结束。"
+              />
+              <TagSelect
+                id="group-stop-cascade"
+                v-model="form.stop_cascade_enabled"
+                :options="SWITCH_TAGS"
+                aria-label="终止连带"
               />
             </div>
             <div class="span-full">

@@ -334,6 +334,8 @@ class GroupCreate(BaseModel):
     limit_watch_keyword: Optional[str] = Field(default=None, max_length=32)
     # 是否开放【AI 交易】广场的跟单（默认关）；只对绑定 tpl_1 的分组有意义
     accept_ai_follow: bool = False
+    # 终止连带：带单员在主节点上终止任务时，是否连带终止跟单节点的同任务（默认开）
+    stop_cascade_enabled: bool = True
     # 信号来源模式：direct（TV / 手动信号直连触发，默认）/ auto（自动触发，
     # 但只接收命中自动路由规则的信号）。
     # auto 模式下该分组会被自动触发，但信号必须命中【信号中心】里配置的
@@ -360,6 +362,8 @@ class GroupUpdate(BaseModel):
     limit_watch_keyword: Optional[str] = Field(default=None, max_length=32)
     # 是否开放【AI 交易】广场的跟单（默认关）；只对绑定 tpl_1 的分组有意义
     accept_ai_follow: Optional[bool] = None
+    # 终止连带：带单员终止任务时是否连带终止跟单节点；省略则不改
+    stop_cascade_enabled: Optional[bool] = None
     # 信号来源模式：direct / auto；省略则不改
     signal_source: Optional[str] = None
     remark: Optional[str] = None
@@ -441,6 +445,8 @@ class GroupOut(BaseModel):
     limit_watch_keyword: str = "limit"
     # 是否开放【AI 交易】广场的跟单（只对绑定 tpl_1 的分组有意义）
     accept_ai_follow: bool = False
+    # 终止连带：带单员在主节点终止任务时，是否连带终止跟单节点的同任务
+    stop_cascade_enabled: bool = True
     # 信号来源模式：direct（默认，TV / 手动信号直连触发）/ auto（只接收命中
     # 自动路由规则的信号）。遗留的 center（只接受信号中心下发）已下线，
     # 存量分组仍会原样返回，由管理员显式改成 direct 或 auto。
@@ -491,6 +497,8 @@ class GroupTaskDispatchRecord(BaseModel):
     total_volume: float = 0.0
     realized_profit: float = 0.0
     finish_reason: Optional[str] = None
+    # 这次终止是谁发起的：self / leader_cascade / account_close / leave_follow / close_signal
+    stop_source: Optional[str] = None
     dispatched_at: Optional[float] = None
     opened_at: Optional[float] = None
     last_report_at: Optional[float] = None
@@ -980,6 +988,8 @@ class FollowChannelCloseResult(BaseModel):
     closed: int = 0
     failed: list[int] = Field(default_factory=list)
     strategies: dict = Field(default_factory=dict)
+    # 连带终止的跟单节点子任务统计：{stopped, forced, total, nodes}
+    cascade: dict = Field(default_factory=dict)
 
 
 # ----------------------- 中控台手动触发 -----------------------

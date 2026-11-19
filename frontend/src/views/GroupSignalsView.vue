@@ -806,15 +806,39 @@ function isDispatchCloseable(status: string): boolean {
   return !['done', 'failed', 'skipped', 'offline'].includes(status)
 }
 
+/** 这次终止是谁发起的（后端 stop_source）。跟单员最关心「是主人停的」。 */
+function stopSourceTag(source?: string | null): { cls: string; text: string; title: string } {
+  switch (source) {
+    case 'leader_cascade':
+      return { cls: 'amber', text: '被带单员终止', title: '带单员在主节点上终止了本任务，跟单节点被连带终止' }
+    case 'leave_follow':
+      return { cls: '', text: '移出跟单', title: '跟单员移出跟单时终止' }
+    case 'account_close':
+      return { cls: 'red', text: '账户全平', title: '账户级全平触发' }
+    case 'close_signal':
+      return { cls: 'blue', text: '信号平仓', title: 'Webhook CLOSE 信号触发' }
+    case 'self':
+      return { cls: '', text: '自行终止', title: '在该节点上自行终止' }
+    default:
+      return { cls: '', text: '', title: '' }
+  }
+}
+
 const closingDispatchIds = ref<Record<string, boolean>>({})
 
 async function closeDispatch(d: GroupTaskDispatchRecord): Promise<void> {
   if (!group.value || !isDispatchCloseable(d.status)) return
   const name = d.node_name || d.node_id
   const magic = d.magic != null ? ` · 魔术号 ${d.magic}` : ''
+  // 连带提示：只有当触发节点是带单方自有节点时，跟单节点才会被连带终止。
+  // 这里只提示「可能连带」，具体是否连带以后端返回的 cascade 为准。
+  const followerCount = group.value.followers?.length ?? 0
+  const cascadeHint = followerCount
+    ? `\n若该节点是带单方自有节点，跟单节点的同一任务会一起终止（${followerCount} 个跟单节点）。`
+    : ''
   if (
     !(await confirmAction(
-      `确认对节点「${name}」下发平仓终止？\n将平掉该子任务对应魔术号的持仓并结束策略监控${magic}。`,
+      `确认对节点「${name}」下发平仓终止？\n将平掉该子任务对应魔术号的持仓并结束策略监控${magic}。${cascadeHint}`,
       '确认平仓',
     ))
   ) {
@@ -824,10 +848,20 @@ async function closeDispatch(d: GroupTaskDispatchRecord): Promise<void> {
   closingDispatchIds.value = { ...closingDispatchIds.value, [key]: true }
   try {
     const res = await hub.closeGroupDispatch(group.value.group_id, d.id)
+    const cascaded = res.cascade?.total ?? 0
     if (res.status === 'closing') {
-      ElMessage.success(`已向 ${name} 下发平仓终止`)
+      ElMessage.success(
+        cascaded
+          ? `已向 ${name} 下发平仓终止，并连带终止 ${cascaded} 个跟单节点子任务`
+          : `已向 ${name} 下发平仓终止`,
+      )
     } else {
-      ElMessage.warning(res.reason || `节点 ${name} 离线，已强制结束子任务，待重连后补发平仓`)
+      ElMessage.warning(
+        res.reason ||
+          `节点 ${name} 离线，已强制结束子任务，待重连后补发平仓${
+            cascaded ? `（另连带终止 ${cascaded} 个跟单节点子任务）` : ''
+          }`,
+      )
     }
     await refreshLiveData()
   } catch (e: unknown) {
@@ -1094,7 +1128,15 @@ onUnmounted(stopAutoRefresh)
                             <td class="right">{{ d.add_count }}</td>
                             <td class="right">{{ d.total_volume }}</td>
                             <td class="right">{{ d.realized_profit }}</td>
-                            <td class="muted group-break">{{ d.finish_reason || d.skip_reason || '—' }}</td>
+                            <td class="muted group-break">
+                              {{ d.finish_reason || d.skip_reason || '—' }}
+                              <span
+                                v-if="stopSourceTag(d.stop_source)"
+                                class="tag"
+                                :class="stopSourceTag(d.stop_source).cls"
+                                :title="stopSourceTag(d.stop_source).title"
+                              >{{ stopSourceTag(d.stop_source).text }}</span>
+                            </td>
                             <td>{{ d.order ?? '—' }}</td>
                             <td class="right">{{ d.price ?? '—' }}</td>
                             <td class="muted group-break">{{ d.error || '—' }}</td>

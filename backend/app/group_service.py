@@ -57,6 +57,10 @@ def group_row_to_dict(
             getattr(row, "limit_watch_keyword", None),
         ),
         "accept_ai_follow": bool(getattr(row, "accept_ai_follow", False)),
+        # 终止连带开关：缺省视为开（存量分组零行为变化）
+        "stop_cascade_enabled": bool(
+            getattr(row, "stop_cascade_enabled", None) is not False
+        ),
         # 信号来源模式：direct（默认）/ auto。存量分组没有这列时按 direct 处理。
         # 遗留的 center 原样保留（不回落 direct），由管理员显式改成 direct / auto。
         "signal_source": normalize_signal_source(
@@ -337,6 +341,7 @@ async def _create_group(
                 limit_watch_enabled=watch_enabled,
                 limit_watch_keyword=watch_keyword,
                 accept_ai_follow=bool(payload.accept_ai_follow),
+                stop_cascade_enabled=bool(payload.stop_cascade_enabled),
                 signal_source=normalize_signal_source(payload.signal_source),
                 strategy_id=strategy_id,
                 remark=(payload.remark or "").strip() or None,
@@ -403,6 +408,8 @@ async def _update_group(store: RedisStore, group_id: str, patch: GroupUpdate) ->
             row.trend_risk_enabled = bool(patch.trend_risk_enabled)
         if patch.accept_ai_follow is not None:
             row.accept_ai_follow = bool(patch.accept_ai_follow)
+        if patch.stop_cascade_enabled is not None:
+            row.stop_cascade_enabled = bool(patch.stop_cascade_enabled)
         if patch.signal_source is not None:
             # 非法值回落 direct，绝不抛异常（这个开关只影响路由，不影响交易）
             row.signal_source = normalize_signal_source(patch.signal_source)

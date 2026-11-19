@@ -743,7 +743,13 @@ export const useHubStore = defineStore('hub', {
     async closeGroupDispatch(
       groupId: string,
       dispatchId: number,
-    ): Promise<{ status: string; node_id?: string; reason?: string }> {
+    ): Promise<{
+      status: string
+      node_id?: string
+      reason?: string
+      /** 连带终止的跟单节点子任务统计：{stopped, forced, total, nodes} */
+      cascade?: { stopped?: number; forced?: number; total?: number; nodes?: string[] }
+    }> {
       return (await api.post(`/api/groups/${groupId}/dispatches/${dispatchId}/close`)).data
     },
     /** 分组一键平仓：终止该分组全部未收口子任务并按魔术号平仓 */

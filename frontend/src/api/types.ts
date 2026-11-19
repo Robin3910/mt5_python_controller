@@ -537,6 +537,11 @@ export interface GroupOut {
   /** 是否开放【AI 交易】广场的跟单（默认关）；只对绑定 AI 智能加仓策略(tpl_1)的分组有意义 */
   accept_ai_follow: boolean
   /**
+   * 终止连带（默认开）：带单员在主节点上终止任务时，跟单节点的同任务一起终止。
+   * 关闭后跟单节点会继续跑，直到自己结束或被单独终止。
+   */
+  stop_cascade_enabled: boolean
+  /**
    * 信号来源模式：
    * - `direct`（默认）：TV 告警 / 手动信号直接触发该分组开仓；
    * - `auto`：该分组**会**被自动触发，但信号必须命中【信号中心】里配置的
@@ -618,6 +623,12 @@ export interface GroupCloseResult {
   /** closing=已下发；skipped=无任务；failed=目标均离线 */
   status: string
   reason?: string | null
+  /**
+   * 连带终止的跟单节点子任务统计（仅任务级 / 频道级 / 账户级终止命中时才有值）：
+   * - stopped 已下发 strategy_stop
+   * - forced  离线强制收口，待重连补发
+   */
+  cascade?: { stopped?: number; forced?: number; total?: number; nodes?: string[] }
 }
 
 export interface GroupCreatePayload {
@@ -630,6 +641,8 @@ export interface GroupCreatePayload {
   limit_watch_keyword?: string
   /** 是否开放【AI 交易】广场的跟单（默认关）；前端只对 tpl_1 分组展示。 */
   accept_ai_follow?: boolean
+  /** 终止连带（默认开）：带单方终止任务时连带终止跟单节点的同任务 */
+  stop_cascade_enabled?: boolean
   /** 信号来源模式：direct（默认）/ auto；center 已下线 */
   signal_source?: GroupSignalSource
   remark?: string | null
@@ -663,6 +676,8 @@ export interface GroupUpdatePayload {
   limit_watch_keyword?: string
   /** 是否开放【AI 交易】广场的跟单（默认关） */
   accept_ai_follow?: boolean
+  /** 终止连带（默认开）：带单方终止任务时连带终止跟单节点的同任务；省略则不改 */
+  stop_cascade_enabled?: boolean
   /** 信号来源模式：direct（默认）/ auto；center 已下线；省略则不改 */
   signal_source?: GroupSignalSource
   remark?: string | null
@@ -1023,6 +1038,17 @@ export interface GroupTaskDispatchRecord {
   total_volume: number
   realized_profit: number
   finish_reason: string | null
+  /**
+   * 这次终止是谁发起的：
+   * - `self` 自己停自己
+   * - `leader_cascade` 被带单员在主节点上的终止连带
+   * - `account_close` 账户级全平
+   * - `leave_follow` 跟单员移出跟单
+   * - `close_signal` Webhook CLOSE 信号
+   *
+   * 存量数据为 null（来源未知）。
+   */
+  stop_source: string | null
   dispatched_at: number | null
   opened_at: number | null
   last_report_at: number | null

@@ -289,6 +289,7 @@ def _subtask_dict(r: GroupTaskDispatch) -> dict:
         "symbol": r.symbol,
         "magic": r.magic,
         "status": r.status,
+        "stop_source": r.stop_source,
         "follow_settings": r.follow_settings_json,
     }
 
@@ -348,6 +349,35 @@ async def active_subtasks_for_node(node_id: str) -> list[dict]:
             return [_subtask_dict(r) for r in rows]
     except Exception as e:  # noqa: BLE001
         logger.warning("active_subtasks_for_node failed: %s", e)
+        return []
+
+
+async def active_subtasks_for_task(
+    group_id: str, task_id: Optional[int] = None,
+) -> list[dict]:
+    """某分组下（可选限定某主任务）仍未收口的节点子任务。
+
+    task_id 给出时只取该主任务的子任务 —— 这是「连带终止同一任务」的公共键：
+    主节点与所有跟随节点的子任务本就同属一个主任务（见 group_dispatcher 的下发流程）。
+
+    task_id 为 None 时取该分组的全部未收口子任务 —— 用于频道级 / 账户级的连带。
+    """
+    if not group_id:
+        return []
+    try:
+        async with SessionLocal() as s:
+            stmt = select(GroupTaskDispatch).where(
+                GroupTaskDispatch.group_id == group_id,
+                GroupTaskDispatch.status.notin_(tuple(_TERMINAL)),
+            )
+            if task_id is not None:
+                stmt = stmt.where(GroupTaskDispatch.task_id == int(task_id))
+            rows = (
+                await s.execute(stmt.order_by(GroupTaskDispatch.id.asc()))
+            ).scalars().all()
+            return [_subtask_dict(r) for r in rows]
+    except Exception as e:  # noqa: BLE001
+        logger.warning("active_subtasks_for_task failed: %s", e)
         return []
 
 
@@ -976,6 +1006,54 @@ async def mark_dispatches_closing(dispatch_ids: list[int]) -> None:
             await s.commit()
     except Exception as e:  # noqa: BLE001
         logger.warning("mark_dispatches_closing failed: %s", e)
+
+
+async def mark_dispatches_stop_source(
+    dispatch_ids: list[int], source: str,
+) -> None:
+    """记录「这次终止是谁发起的」；只覆盖还没写过来源的子任务。
+
+    只在首次写入时赋值（`stop_source` 仍是 NULL 才写）：一个子任务只会被终止一次，
+    先到先得 —— 后续的兜底路径（快照对账、强制收口）不该改写已有的来源标记。
+    """
+    if not dispatch_ids:
+        return
+    try:
+        async with SessionLocal() as s:
+            await s.execute(
+                update(GroupTaskDispatch).where(
+                    GroupTaskDispatch.id.in_(dispatch_ids),
+                    GroupTaskDispatch.stop_source.is_(None),
+                ).values(stop_source=str(source or "")[:24])
+            )
+            await s.commit()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("mark_dispatches_stop_source failed: %s", e)
+
+
+async def record_leader_stop_event(
+    *, task_id: int, node_id: str, magic: Optional[int],
+    message: str, detail: Optional[dict] = None,
+) -> None:
+    """落一条「被带单员连带终止」的事件流记录。
+
+    与普通 close_all 事件分开：跟单员需要一眼看出「不是我平掉的，是主人停的」。
+    """
+    try:
+        async with SessionLocal() as s:
+            s.add(
+                GroupTaskEvent(
+                    task_id=task_id,
+                    node_id=node_id,
+                    magic=magic,
+                    event_type="leader_stop",
+                    message=str(message or "")[:255],
+                    detail_json=detail if isinstance(detail, dict) else None,
+                )
+            )
+            await s.commit()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("record_leader_stop_event failed: %s", e)
 
 
 async def _locate_dispatch(
@@ -1808,6 +1886,7 @@ def _dispatch_row(d: GroupTaskDispatch, node_name: Optional[str]) -> dict:
         "total_volume": d.total_volume,
         "realized_profit": d.realized_profit,
         "finish_reason": d.finish_reason,
+        "stop_source": d.stop_source,
         "dispatched_at": d.dispatched_at.timestamp() if d.dispatched_at else None,
         "opened_at": d.opened_at.timestamp() if d.opened_at else None,
         "last_report_at": d.last_report_at.timestamp() if d.last_report_at else None,
