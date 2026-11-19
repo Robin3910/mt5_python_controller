@@ -896,9 +896,10 @@ const previewChips = computed(() => {
       const known = entry.nodes.some((n) => followMagics.value[n.node_id])
       chips.push({
         key: g.group_id,
-        title: groupTitle(g.group_name, g.strategy_name),
+        // chip 只有一格宽，塞不下「模式 + 品种」，这里只给开仓方式
+        title: groupDisplayTitle(g.group_name, g.strategy_name),
         profit: bookStats(rows).profit,
-        hint: `汇总 ${entry.nodes.filter((n) => n.groups.some((x) => x.group_id === g.group_id)).length} 个节点`,
+        hint: `${g.symbol ? g.symbol + ' · ' : ''}汇总 ${entry.nodes.filter((n) => n.groups.some((x) => x.group_id === g.group_id)).length} 个节点`,
         known,
       })
       if (chips.length >= 3) return chips
@@ -1105,12 +1106,40 @@ const SELF_MODE_LABEL: Record<string, string> = {
   grid: '智能吸筹',
 }
 const SHOWCASE_MODES = ['trend_market', 'trend_limit', 'grid'] as const
-function showcaseGroupMode(g: { name: string | null; strategy_name?: string | null }): string {
-  for (const raw of [g.name, g.strategy_name]) {
+
+/**
+ * 从分组名 / 策略名解析「开仓方式」key。
+ *
+ * 分组名是机器生成的：`{strategy_type}-{用户名}-{MT5号}-{品种}`
+ * （如 `grid-alice123-9527-XAUUSD`），策略名还会再拼一段 `-grid-策略`。
+ * 前缀就是策略类型，据此才能翻成人话。
+ */
+function groupModeKey(name: string | null | undefined, strategy?: string | null): string {
+  for (const raw of [name, strategy]) {
     const key = (raw || '').split('-')[0]
     if (key in SELF_MODE_LABEL) return key
   }
   return ''
+}
+
+/**
+ * 分组的展示标题。
+ *
+ * 直接显示机器名（`grid-alice123-9527-XAUUSD-grid-策略`）对用户毫无意义，
+ * 所以优先翻成「市价开仓 / 限价开仓 / 智能吸筹」；
+ * 认不出来（非标准命名）时才回落原名 —— 不能显示成空白。
+ *
+ * `symbol` 传了就拼在后面：同一个开仓方式可能有多个品种分组，
+ * 光说「智能吸筹」用户分不清是哪一个。
+ */
+function groupDisplayTitle(name: string | null, strategy: string | null, symbol?: string | null): string {
+  const key = groupModeKey(name, strategy)
+  const label = (key && SELF_MODE_LABEL[key]) || groupTitle(name, strategy)
+  return symbol ? `${label} · ${symbol}` : label
+}
+
+function showcaseGroupMode(g: { name: string | null; strategy_name?: string | null }): string {
+  return groupModeKey(g.name, g.strategy_name)
 }
 const showcaseCounts = computed(() => {
   const counts: Record<string, number> = { trend_market: 0, trend_limit: 0, grid: 0 }
@@ -1448,7 +1477,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
               <div class="fd-item-top">
                 <p>
                   <svg viewBox="0 0 24 24"><path fill="currentColor" d="M7 2v11h3v9l7-12h-4l4-8z"/></svg>
-                  <b>{{ groupTitle(g.group_name, g.strategy_name) }}</b>
+                  <b>{{ groupDisplayTitle(g.group_name, g.strategy_name) }}</b>
                   <em v-if="g.symbol">{{ g.symbol }}</em>
                   <span>进行中 {{ g.active_task_count }}</span>
                 </p>
@@ -1471,8 +1500,8 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
                 <div><span>浮动盈亏</span><b :class="bookStats(entryGroupPositions(entry, g.group_id)).profit >= 0 ? 'up' : 'down'">{{ fmtU(bookStats(entryGroupPositions(entry, g.group_id)).profit) }} U</b></div>
               </div>
               <footer>
-                <button type="button" class="fd-leave" @click="leaveOneGroup(entry, g.group_id, groupTitle(g.group_name, g.strategy_name))">移出</button>
-                <button type="button" class="fd-close" :disabled="closeBusy" @click="closeGroup(entry, g.group_id, groupTitle(g.group_name, g.strategy_name))"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M7 2v11h3v9l7-12h-4l4-8z"/></svg>一键平仓</button>
+                <button type="button" class="fd-leave" @click="leaveOneGroup(entry, g.group_id, groupDisplayTitle(g.group_name, g.strategy_name, g.symbol))">移出</button>
+                <button type="button" class="fd-close" :disabled="closeBusy" @click="closeGroup(entry, g.group_id, groupDisplayTitle(g.group_name, g.strategy_name, g.symbol))"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M7 2v11h3v9l7-12h-4l4-8z"/></svg>一键平仓</button>
               </footer>
             </div>
           </article>
