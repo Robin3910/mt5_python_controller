@@ -1363,7 +1363,8 @@ onBeforeUnmount(() => {
             </div>
               <strong :class="book.profit >= 0 ? 'up' : 'down'">{{ fmtSigned(book.profit) }}</strong>
             </header>
-            <div class="tr-grid tr-pos-grid tr-head">
+            <div class="tr-scroll">
+              <div class="tr-grid tr-pos-grid tr-head">
               <span>#</span><span>方向</span><span>手数</span><span>开仓价</span><span>止盈/止损</span><span>浮动盈亏</span><span>操作</span>
                         </div>
             <template v-for="group in book.groups" :key="group.magic">
@@ -1389,6 +1390,7 @@ onBeforeUnmount(() => {
                 </span>
                       </div>
             </template>
+            </div>
             <footer class="tr-book-actions">
               <button type="button" class="chip green" :disabled="!!actionBusy || !book.rows.some((p) => (p.profit || 0) > 0)" @click="closeSymbolProfit(book.symbol)">平盈</button>
               <button type="button" class="chip amber" :disabled="!!actionBusy || !pendingOf(book.symbol).length" @click="cancelSymbolPending(book.symbol)">删挂单</button>
@@ -1425,7 +1427,8 @@ onBeforeUnmount(() => {
                 <span>{{ book.rows.length }} 张 · {{ book.volume.toFixed(2) }} 手</span>
               </div>
             </header>
-            <div class="tr-grid tr-pend-grid tr-head">
+            <div class="tr-scroll">
+              <div class="tr-grid tr-pend-grid tr-head">
               <span>#</span><span>方向</span><span>手数</span><span>挂单价</span><span>止盈/止损</span><span>挂单时间</span><span>操作</span>
             </div>
             <template v-for="group in book.groups" :key="`pend-${book.symbol}-${group.magic}`">
@@ -1461,6 +1464,7 @@ onBeforeUnmount(() => {
                 </button>
               </div>
             </template>
+            </div>
             <footer class="tr-book-actions">
               <button type="button" class="chip amber" :disabled="!!actionBusy || !isOnline" @click="cancelSymbolPending(book.symbol)">
                 删本品种挂单（{{ book.rows.length }}）
@@ -1469,7 +1473,8 @@ onBeforeUnmount(() => {
           </section>
           <p v-if="pendingReported && totalPendingCount" class="tr-foot-note">
             未成交挂单 {{ totalPendingCount }} 张 · 合计手数 {{ totalPendingVolume.toFixed(2) }}
-          </p>          </div>
+          </p>
+        </div>
 
         <div v-else-if="detailTab === 'grid'" class="tr-body">
           <p v-if="gridLoading && !gridTasks.length" class="tr-empty-line">加载中…</p>
@@ -1483,7 +1488,8 @@ onBeforeUnmount(() => {
                 </div>
               <strong :class="book.profit >= 0 ? 'up' : 'down'">{{ fmtSigned(book.profit) }}</strong>
             </header>
-            <div class="tr-grid tr-grid-grid tr-head">
+            <div class="tr-scroll">
+              <div class="tr-grid tr-grid-grid tr-head">
               <span>方向</span><span>节点</span><span>持仓</span><span>挂单</span><span>盈亏</span><span>操作</span>
               </div>
             <div v-for="t in book.tasks" :key="t.task_id" class="tr-grid tr-grid-grid tr-line">
@@ -1501,6 +1507,7 @@ onBeforeUnmount(() => {
                 >{{ isClosingGridTask(t.task_id) ? '…' : '停止' }}</button>
                       </span>
                     </div>
+            </div>
           </section>
                     </div>
 
@@ -1542,7 +1549,8 @@ onBeforeUnmount(() => {
       </div>
               <strong :class="book.profit >= 0 ? 'up' : 'down'">{{ fmtSigned(book.profit) }}</strong>
             </header>
-            <div class="tr-grid tr-hist-grid tr-head">
+            <div class="tr-scroll">
+              <div class="tr-grid tr-hist-grid tr-head">
               <span>#</span><span>时间</span><span>方向</span><span>手数</span><span>开仓价</span><span>平仓价</span><span>盈亏</span>
             </div>
             <template v-for="group in book.groups" :key="group.magic">
@@ -1565,6 +1573,7 @@ onBeforeUnmount(() => {
                 <strong :class="row.profit >= 0 ? 'up' : 'down'">{{ fmtSigned(row.profit) }}</strong>
               </div>
             </template>
+            </div>
           </section>
         </div>
       </section>
@@ -1652,6 +1661,18 @@ onBeforeUnmount(() => {
 .tr-tabs button span { margin-left: 4px; color: #4A5568; font-size: 10px; font-weight: 550; }
 .tr-tabs button.on { color: #E6EBF4; }
 .tr-tabs button.on::after { content: ''; position: absolute; left: 8px; right: 8px; bottom: -1px; height: 2px; border-radius: 2px; background: #2563EB; }
+/* 成交 / 挂单 / 策略 / 历史 四张表统一包在 .tr-scroll 里横向滑动。
+   窄屏下列宽被压缩会把「操作」列挤出屏幕，所以让表格保持最小宽度、超出部分滑动查看。
+   每行都带自己的背景色，滑动时不会露出卡片底色断片。 */
+.tr-scroll {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-x: contain;
+}
+.tr-scroll > * { min-width: 100%; box-sizing: border-box; }
+.tr-scroll::-webkit-scrollbar { height: 4px; }
+.tr-scroll::-webkit-scrollbar-thumb { background: #22304A; border-radius: 2px; }
+.tr-scroll::-webkit-scrollbar-track { background: transparent; }
 .tr-book { margin-top: 12px; overflow: hidden; border: 1px solid #1C2740; border-radius: 12px; background: #101828; }
 .tr-book-head { justify-content: space-between; gap: 8px; padding: 8px 12px; background: #0C1424; border-bottom: 1px solid #16213A; }
 .tr-book-head div { display: flex; align-items: center; gap: 8px; min-width: 0; flex-wrap: wrap; }
@@ -1699,6 +1720,15 @@ onBeforeUnmount(() => {
 .tr-pend-more { padding: 4px 12px 8px; }
 .tr-pend-more button { border: 0; background: transparent; color: #3B82F6; font-size: 10px; cursor: pointer; padding: 0; }
 .tr-pend-more button:hover { text-decoration: underline; }
+/* 窄屏下表格各行给一个最小宽度，让 .tr-scroll 有可滑动的空间。
+   阈值取各 grid 的列宽下限之和（≈310–370px），720px 以上列宽本来就够，不再加限制。 */
+.tr-pos-grid { min-width: 360px; }
+.tr-pend-grid { min-width: 380px; }
+.tr-grid-grid { min-width: 300px; }
+.tr-hist-grid { min-width: 420px; }
+@media (min-width: 720px) {
+  .tr-pos-grid, .tr-pend-grid, .tr-grid-grid, .tr-hist-grid { min-width: 0; }
+}
 /* 挂单量大时（网格单品种可挂几十张）限高滚动，避免撑爆整页 */
 .tr-pend-book .tr-grid { max-height: none; }
 .tr-assets { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 8px; }
