@@ -29,7 +29,11 @@ from .deps import (
 from .group_dispatcher import GroupDispatcher
 from .group_persist import active_subtasks_for_node
 from .limit_watch import node_has_watch
-from .models import CancelPendingRequest, build_cancel_all_command
+from .models import (
+    CancelPendingRequest,
+    CancelPendingTicketsRequest,
+    build_cancel_all_command,
+)
 from .permissions import MENU_DASHBOARD, MENU_HOME, MENU_NODES, Principal
 from .redis_store import RedisStore
 
@@ -98,6 +102,194 @@ async def _cancel_once(node_id: str, scope: str, magics: list[int] | None) -> di
         offline_error="节点当前离线，无法撤销挂单",
         timeout_error="节点未在超时时间内确认（可能客户端版本过低，不支持批量撤挂单）",
     )
+
+
+async def _cancel_ticket(node_id: str, ticket: int) -> dict:
+    """按订单号撤掉**一张**挂单。
+
+    走节点已有的单张撤单命令 `cancel_pending`（与限价监听用的是同一条命令），
+    不动持仓、不停策略。
+    """
+    return await node_rpc.request(
+        node_id,
+        {"cmd": "cancel_pending", "ticket": int(ticket)},
+        timeout=NODE_TIMEOUT_SEC,
+        offline_error="节点当前离线，无法撤销挂单",
+        timeout_error="节点未在超时时间内确认撤单",
+    )
+
+
+@router.post("/nodes/{node_id}/pending-orders/cancel")
+async def cancel_pending_orders_route(
+    node_id: str,
+    body: CancelPendingTicketsRequest,
+    request: Request,
+    store: RedisStore = Depends(get_store),
+    p: Principal = Depends(require_menu(MENU_HOME, MENU_NODES, MENU_DASHBOARD)),
+):
+    """按订单号精确撤销挂单（交易页「逐张撤」用）。
+
+    与 `/cancel-pending` 的区别有两条，都很关键：
+
+    1. **范围精确到张**：`/cancel-pending` 按**魔术号**圈定范围，同一魔术号在
+       别的品种上挂的单会被一起撤掉（越界误撤）；这里只撤点名的这几张。
+    2. **不停策略**：这里只撤单，不停策略任务、不动持仓。
+
+       为什么不停：`strategy_stop` 在节点侧会 `close_by_magic` 把该魔术号的
+       持仓一起平掉 —— 「撤一张挂单」绝不能顺带把仓位平了。要「停策略 +
+       撤全部挂单」请用 `/cancel-pending`。
+
+    代价：属于策略的挂单，策略下一轮可能把它重新挂出来。所以结果里带回
+    `strategy_owned`（所属魔术号），调用方据此提示用户「可能被重新挂出」。
+    """
+    await owned_node_or_404(store, p, node_id)
+    admin = p.username
+    ip = client_ip(request)
+
+    if node_id not in manager.nodes:
+        raise HTTPException(status_code=409, detail="node offline")
+
+    tickets: list[int] = []
+    for raw in body.tickets or []:
+        try:
+            t = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if t > 0 and t not in tickets:
+            tickets.append(t)
+    if not tickets:
+        raise HTTPException(status_code=400, detail="缺少订单号")
+
+    prev = await store.get_account(node_id) or {}
+    snapshot_orders = [o for o in (prev.get("orders") or []) if isinstance(o, dict)]
+    by_ticket = {int(o.get("ticket") or 0): o for o in snapshot_orders}
+    # 快照里没有的 ticket 也要撤：快照有延迟，单可能已不在快照里但仍在盘上。
+    known = [t for t in tickets if t in by_ticket]
+    magics = sorted({
+        int(by_ticket[t].get("magic") or 0) for t in known if int(by_ticket[t].get("magic") or 0)
+    })
+
+    results: list[dict] = []
+    failed: list[dict] = []
+    cancelled = 0
+    # 撤单期间打开「人工撤单」窗口：限价监听看到快照里的单会先去撤它，
+    # 两边同时动同一张单会打出 cancel_failed 误报。
+    await store.mark_cancel_pending_busy(node_id)
+    try:
+        for ticket in tickets:
+            payload = await _cancel_ticket(node_id, ticket)
+            ok = bool(payload.get("success"))
+            error = payload.get("error")
+            symbol = str((by_ticket.get(ticket) or {}).get("symbol") or "")
+            if ok:
+                cancelled += 1
+                # 记账：限价监听的撤单失败若命中这张表，说明单是人工撤的，不该误报
+                await store.note_manual_cancelled_ticket(node_id, ticket)
+            else:
+                failed.append({
+                    "ticket": ticket,
+                    "symbol": symbol,
+                    "error": str(error or "撤单失败"),
+                })
+            results.append({
+                "ticket": ticket,
+                "symbol": symbol,
+                "success": ok,
+                "error": str(error) if error else None,
+            })
+    finally:
+        await store.clear_cancel_pending_busy(node_id)
+
+    if failed and cancelled:
+        status = "partial"
+    elif failed:
+        status = "error"
+    else:
+        status = "ok"
+
+    result = {
+        "status": status,
+        "node_id": node_id,
+        "cancelled": cancelled,
+        "failed": failed,
+        "results": results,
+        # 属于策略的挂单：这里没停策略，这些单可能在下一轮被重新挂出
+        "strategy_owned": magics,
+    }
+    await persist.audit(
+        admin, "cancel_pending_orders", node_id,
+        {"tickets": tickets}, status, ip,
+        category="node",
+        before={"orders": [by_ticket[t] for t in known]},
+        after=result,
+    )
+    return result
+
+
+@router.post("/nodes/{node_id}/pending-orders/{ticket}/cancel")
+async def cancel_pending_order_route(
+    node_id: str,
+    ticket: int,
+    request: Request,
+    store: RedisStore = Depends(get_store),
+    p: Principal = Depends(require_menu(MENU_HOME, MENU_NODES, MENU_DASHBOARD)),
+):
+    """撤掉**一张**挂单（不动持仓、不停策略）。
+
+    交易页行内「撤单」走这条：范围精确到一张，不会误伤同魔术号其它品种的单。
+    撤不掉的常见原因是单已经成交或已被撤掉（快照有延迟），此时回 404 并给出
+    可读文案，前端据此提示「该单已不在盘上」而不是笼统的「撤单失败」。
+    """
+    await owned_node_or_404(store, p, node_id)
+    admin = p.username
+    ip = client_ip(request)
+
+    if node_id not in manager.nodes:
+        raise HTTPException(status_code=409, detail="node offline")
+
+    if int(ticket) <= 0:
+        raise HTTPException(status_code=400, detail="缺少订单号")
+
+    prev = await store.get_account(node_id) or {}
+    snapshot_orders = [o for o in (prev.get("orders") or []) if isinstance(o, dict)]
+    by_ticket = {int(o.get("ticket") or 0): o for o in snapshot_orders}
+    order = by_ticket.get(int(ticket)) or {}
+    symbol = str(order.get("symbol") or "")
+    magic = int(order.get("magic") or 0)
+
+    await store.mark_cancel_pending_busy(node_id)
+    try:
+        payload = await _cancel_ticket(node_id, int(ticket))
+    finally:
+        await store.clear_cancel_pending_busy(node_id)
+
+    ok = bool(payload.get("success"))
+    error = payload.get("error")
+    if ok:
+        # 记账：限价监听的撤单失败若命中这张表，说明单是人工撤的，不该误报
+        await store.note_manual_cancelled_ticket(node_id, int(ticket))
+
+    result = {
+        "status": "ok" if ok else "error",
+        "node_id": node_id,
+        "ticket": int(ticket),
+        "symbol": symbol,
+        "cancelled": ok,
+        "error": None if ok else str(error or "撤单失败"),
+        # 属于策略的挂单：这里没停策略，这张单可能在下一轮被重新挂出
+        "strategy_owned": magic,
+    }
+    await persist.audit(
+        admin, "cancel_pending_order", node_id,
+        {"ticket": int(ticket)}, result["status"], ip,
+        category="node",
+        before={"order": order or None},
+        after=result,
+    )
+    if not ok:
+        # 单已经不在盘上（已成交或已被撤）：这不是服务端故障，回 404 更准确
+        raise HTTPException(status_code=404, detail=result["error"])
+    return result
 
 
 @router.post("/nodes/{node_id}/cancel-pending")

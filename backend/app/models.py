@@ -942,6 +942,25 @@ class CancelPendingRequest(BaseModel):
     magics: Optional[list[int]] = None
 
 
+class CancelPendingTicketsRequest(BaseModel):
+    """按订单号批量撤挂单（交易页「按张撤」用）。
+
+    与 `CancelPendingRequest` 的区别：批量撤单按**魔术号**圈定范围，
+    同一魔术号在别的品种上的单会被一起撤掉；而这里按订单号精确到张。
+    """
+    tickets: list[int] = Field(min_length=1, max_length=200)
+
+
+class CancelPendingTicketResult(BaseModel):
+    """单张挂单撤销的结果。"""
+    status: str = "ok"          # ok / error
+    node_id: str
+    ticket: int
+    symbol: Optional[str] = None
+    cancelled: bool = False
+    error: Optional[str] = None
+
+
 class FollowMagicChannel(BaseModel):
     """一个策略魔术号属于哪个频道，以及它的子任务是否还在跑。"""
     magic: int

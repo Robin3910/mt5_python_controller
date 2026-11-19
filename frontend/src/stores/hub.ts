@@ -10,6 +10,8 @@ import type {
   CloseBatchResult,
   CancelPendingRequest,
   CancelPendingResult,
+  CancelPendingOrdersResult,
+  CancelPendingOrderResult,
   FilterRulesConfig,
   GridSizingData,
   GroupCreatePayload,
@@ -814,6 +816,19 @@ export const useHubStore = defineStore('hub', {
       body: CancelPendingRequest = { scope: 'all' }
     ): Promise<CancelPendingResult> {
       return (await api.post(`/api/nodes/${id}/cancel-pending`, body)).data
+    },
+    // ---- 按订单号精确撤挂单（不动持仓、不越界到别的品种） ----
+    async cancelPendingOrders(
+      id: string,
+      tickets: number[]
+    ): Promise<CancelPendingOrdersResult> {
+      return (
+        await api.post(`/api/nodes/${id}/pending-orders/cancel`, { tickets })
+      ).data
+    },
+    // ---- 撤单张（行内操作） ----
+    async cancelPendingOrder(id: string, ticket: number): Promise<CancelPendingOrderResult> {
+      return (await api.post(`/api/nodes/${id}/pending-orders/${ticket}/cancel`)).data
     },
     // ---- 事件流 ----
     pushEvent(text: string, kind: HubEvent['kind'] = 'info'): void {

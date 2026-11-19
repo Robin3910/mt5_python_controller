@@ -251,6 +251,10 @@ export interface PendingOrder {
   magic: number
   comment: string
   time: number
+  /** 挂单类型：limit=限价（等回调成交）/ stop=突破（等突破成交）。老版本节点不上报 */
+  pending_kind?: 'limit' | 'stop' | string
+  /** 挂单当前市场价；老版本节点不上报 */
+  price_current?: number
 }
 
 export interface AccountSnapshot {
@@ -434,6 +438,38 @@ export interface CancelPendingResult {
   /** status=regenerated 时的再生单数 */
   regenerated?: number
   error?: string
+}
+
+/** 按订单号精确撤挂单的结果（交易页「按品种批量撤」用） */
+export interface CancelPendingOrdersResult {
+  status: 'ok' | 'partial' | 'error' | string
+  node_id: string
+  /** 实际撤掉的挂单笔数 */
+  cancelled: number
+  failed: Array<{ ticket: number; symbol: string; error: string }>
+  results: Array<{
+    ticket: number
+    symbol: string
+    success: boolean
+    error: string | null
+  }>
+  /**
+   * 被撤的挂单里属于策略单的魔术号。
+   * 撤单没有停策略，这些单可能在下一轮被策略重新挂出来。
+   */
+  strategy_owned?: number[]
+}
+
+/** 撤单张的结果（交易页行内「撤单」用） */
+export interface CancelPendingOrderResult {
+  status: 'ok' | 'error' | string
+  node_id: string
+  ticket: number
+  symbol: string
+  cancelled: boolean
+  error: string | null
+  /** 所属魔术号；非 0 表示这是策略单，策略下一轮可能把它重新挂出 */
+  strategy_owned?: number
 }
 
 /** 手动触发的信号方向；CLOSE 仅 strategy 模型开放（终止分组内进行中的策略任务） */

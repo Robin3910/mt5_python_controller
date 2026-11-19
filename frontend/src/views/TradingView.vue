@@ -202,6 +202,28 @@ const accountEquity = computed(() => account.value?.equity ?? 0)
 const accountMargin = computed(() => account.value?.margin ?? 0)
 const accountFreeMargin = computed(() => account.value?.free_margin ?? 0)
 
+// ── 未成交挂单（主节点账户快照里的 orders） ──
+// 限价开仓是「先挂单、后成交」：成交前账户里没有任何持仓，只看持仓会误判成
+// 「单没发出去」。所以挂单必须单独展示，且**不并入持仓口径**。
+const allPending = computed<PendingOrder[]>(() => account.value?.orders || [])
+const totalPendingCount = computed(() => allPending.value.length)
+const totalPendingVolume = computed(() =>
+  allPending.value.reduce((a, o) => a + (o.volume || 0), 0),
+)
+/**
+ * 节点是否上报了挂单字段。老版本节点客户端的快照里没有 `orders`（undefined）。
+ *
+ * 三种状态必须区分开，混成一个「暂无挂单」会误导：
+ * - 快照还没来（account 为 null）→ 还没数据
+ * - 快照来了但没有 orders 字段 → 客户端版本过低，不支持
+ * - orders 是空数组 → 确实没有挂单
+ */
+const pendingReported = computed(() => Array.isArray(account.value?.orders))
+/** 快照已到但客户端不上报挂单（版本过低） */
+const pendingUnsupported = computed(
+  () => !!account.value && !Array.isArray(account.value.orders),
+)
+
 // 持仓 / 资产 / 历史订单 / 吸筹策略 tab
 type DetailTab = 'positions' | 'assets' | 'history' | 'grid'
 const detailTab = ref<DetailTab>('positions')
@@ -499,6 +521,89 @@ const positionBooks = computed<SymbolBook[]>(() => {
 function pendingOf(symbol: string): PendingOrder[] {
   return (account.value?.orders || []).filter((o) => o.symbol === symbol)
 }
+
+// ── 挂单按品种 / 魔术号分组 ──
+// 与 positionBooks 对称，但更简单：挂单没有盈亏，只有手数。
+// 手工单（magic=0）单独归组，避免和策略单混在一起看不清归属。
+interface PendingMagicGroup {
+  magic: number
+  rows: PendingOrder[]
+  volume: number
+}
+interface PendingBook {
+  symbol: string
+  rows: PendingOrder[]
+  groups: PendingMagicGroup[]
+  volume: number
+}
+const pendingBooks = computed<PendingBook[]>(() => {
+  const map = new Map<string, PendingOrder[]>()
+  for (const o of allPending.value) {
+    const sym = o.symbol || '—'
+    const bucket = map.get(sym) || []
+    bucket.push(o)
+    map.set(sym, bucket)
+  }
+  return [...map.entries()].map(([symbol, rows]) => {
+    const sorted = [...rows].sort((a, b) => (a.ticket || 0) - (b.ticket || 0))
+    const byMagic = new Map<number, PendingOrder[]>()
+    for (const row of sorted) {
+      const magic = row.magic || 0
+      const bucket = byMagic.get(magic) || []
+      bucket.push(row)
+      byMagic.set(magic, bucket)
+    }
+    const groups = [...byMagic.entries()]
+      .map(([magic, groupRows]) => ({
+        magic,
+        rows: groupRows,
+        volume: groupRows.reduce((sum, row) => sum + (row.volume || 0), 0),
+      }))
+      .sort((a, b) => {
+        if (!a.magic && b.magic) return 1
+        if (a.magic && !b.magic) return -1
+        return a.magic - b.magic
+      })
+    return {
+      symbol,
+      rows: sorted,
+      groups,
+      volume: sorted.reduce((sum, row) => sum + (row.volume || 0), 0),
+    }
+  }).sort((a, b) => a.symbol.localeCompare(b.symbol))
+})
+
+/** 挂单类型标签：limit=限价（等回调）/ stop=突破（等突破）。老节点没这个字段。 */
+function pendingKindLabel(o: PendingOrder): string {
+  const kind = (o.pending_kind || '').toLowerCase()
+  if (kind === 'stop') return '突破'
+  if (kind === 'limit') return '限价'
+  return '挂单'
+}
+
+// 挂单多的品种（网格单品种可挂几十张）默认只显示前 N 行，其余折叠。
+// 不做滚动容器是因为每个品种是一个独立的卡片，滚动条会跟品种分组打架。
+const PEND_ROW_LIMIT = 20
+const pendExpanded = ref<Set<string>>(new Set())
+function isPendExpanded(symbol: string): boolean {
+  return pendExpanded.value.has(symbol)
+}
+function togglePendExpanded(symbol: string): void {
+  const next = new Set(pendExpanded.value)
+  if (next.has(symbol)) next.delete(symbol)
+  else next.add(symbol)
+  pendExpanded.value = next
+}
+/** 该品种这一组实际要渲染的行（折叠时截断）。 */
+function pendRows(group: PendingMagicGroup, symbol: string): PendingOrder[] {
+  if (isPendExpanded(symbol)) return group.rows
+  return group.rows.slice(0, PEND_ROW_LIMIT)
+}
+function pendHiddenCount(group: PendingMagicGroup, symbol: string): number {
+  if (isPendExpanded(symbol)) return 0
+  return Math.max(0, group.rows.length - PEND_ROW_LIMIT)
+}
+
 const actionBusy = ref('')
 
 async function closeSymbolAll(symbol: string): Promise<void> {
@@ -552,27 +657,82 @@ async function cancelSymbolPending(symbol: string): Promise<void> {
   if (!primaryNode.value || actionBusy.value) return
   const orders = pendingOf(symbol)
   if (!orders.length) { ElMessage.info('该品种没有挂单'); return }
-  const magics = [...new Set(orders.map((o) => o.magic).filter((m) => m))]
+  const tickets = orders.map((o) => o.ticket).filter((t) => t > 0)
+  if (!tickets.length) { ElMessage.info('该品种挂单缺少订单号，无法撤销'); return }
   const manuals = orders.filter((o) => !o.magic)
-  if (!magics.length) {
-    ElMessage.warning('该品种只有手工挂单，请到节点主页删除全部挂单')
-    return
-  }
   const lines = orders.slice(0, 12).map((o) => `• ${o.type}  ${o.volume}手  @${o.price_open}`).join('\n')
-  const manualNote = manuals.length ? `\n其中 ${manuals.length} 张手工挂单不会在这里删除。` : ''
+  const manualNote = manuals.length
+    ? `\n其中 ${manuals.length} 张是手工挂单，会一并撤销。`
+    : ''
   if (!(await confirmAction(
-    `确认删除 ${symbol} 的策略挂单？\n只删除这些魔术号上的挂单，持仓不动，其他品种的策略不受影响。${manualNote}\n\n${lines}`,
+    `确认删除 ${symbol} 的全部挂单（${orders.length} 张）？\n只撤这些挂单，持仓不动，其他品种不受影响。${manualNote}\n策略仍在运行的挂单可能重新挂出。\n\n${lines}`,
     '删挂单',
   ))) return
   actionBusy.value = `pend:${symbol}`
   try {
-    await hub.cancelPendingAll(primaryNode.value.node_id, { scope: 'strategy', magics })
-    ElMessage.success(`已提交删除 ${symbol} 挂单`)
+    // 按**订单号**精确撤销：不按魔术号圈定范围，否则同魔术号其它品种的挂单
+    // 会被一起撤掉（越界误撤）。
+    const res = await hub.cancelPendingOrders(primaryNode.value.node_id, tickets)
+    if (res.status === 'ok') {
+      ElMessage.success(`已撤销 ${symbol} 的 ${res.cancelled} 张挂单`)
+    } else if (res.cancelled > 0) {
+      ElMessage.warning(`已撤销 ${res.cancelled} 张，${res.failed.length} 张失败`)
+    } else {
+      ElMessage.error(res.failed[0]?.error || '删挂单失败')
+    }
+    hub.fetchNodeAccount(primaryNode.value.node_id).catch(() => {})
   } catch (e) {
     const err = e as { response?: { data?: { detail?: string } } }
     ElMessage.error(err?.response?.data?.detail || '删挂单失败')
   } finally {
     actionBusy.value = ''
+  }
+}
+
+// ── 行内撤单（单张） ──
+// 逐张撤**不停策略、不动持仓**。属于策略的挂单，策略下一轮可能把它重新挂出，
+// 所以成功后要提示这一点，不能让用户以为「撤掉就没了」。
+const cancellingTickets = ref<Set<number>>(new Set())
+function isCancellingPending(ticket: number): boolean {
+  return cancellingTickets.value.has(ticket)
+}
+async function cancelPendingRow(o: PendingOrder): Promise<void> {
+  if (!primaryNode.value || !o.ticket) return
+  if (actionBusy.value || isCancellingPending(o.ticket)) return
+  const dirLabel = isBuySide(o.type) ? '多' : '空'
+  const kindLabel = pendingKindLabel(o)
+  try {
+    await ElMessageBox.confirm(
+      `确认撤销挂单 #${o.ticket}？\n${o.symbol} ${kindLabel}${dirLabel} ${(o.volume || 0).toFixed(2)} 手 @${o.price_open}\n挂单时间 ${fmtPosTime(o.time)}\n只撤这一张，持仓不动。`,
+      '撤单确认',
+      {
+        type: 'warning',
+        confirmButtonText: '确认撤单',
+        cancelButtonText: '取消',
+      },
+    )
+  } catch {
+    return
+  }
+  cancellingTickets.value = new Set([...cancellingTickets.value, o.ticket])
+  try {
+    const res = await hub.cancelPendingOrder(primaryNode.value.node_id, o.ticket)
+    if (res.strategy_owned) {
+      ElMessage.warning(`已撤销 #${o.ticket}，但它是策略挂单，策略可能在下一轮重新挂出`)
+    } else {
+      ElMessage.success(`已撤销挂单 #${o.ticket}`)
+    }
+    hub.fetchNodeAccount(primaryNode.value.node_id).catch(() => {})
+  } catch (e) {
+    const err = e as { response?: { data?: { detail?: string } }; message?: string }
+    // 404 = 该单已不在盘上（已成交或已被撤），不是服务端故障
+    const msg = err?.response?.data?.detail || err?.message || `撤单失败 #${o.ticket}`
+    ElMessage.error(msg)
+    hub.fetchNodeAccount(primaryNode.value.node_id).catch(() => {})
+  } finally {
+    const next = new Set(cancellingTickets.value)
+    next.delete(o.ticket)
+    cancellingTickets.value = next
   }
 }
 
@@ -1162,7 +1322,7 @@ onBeforeUnmount(() => {
       <section class="tr-card tr-panel">
         <div class="tr-tabs" role="tablist">
           <button type="button" :class="{ on: detailTab === 'positions' }" @click="detailTab = 'positions'">
-            当前交易<span>{{ totalPosCount }}</span>
+            当前交易<span>{{ totalPosCount }}<template v-if="pendingReported && totalPendingCount"> · {{ totalPendingCount }}</template></span>
           </button>
           <button type="button" :class="{ on: detailTab === 'grid' }" @click="detailTab = 'grid'">
             智能吸筹<span>{{ gridTasks.length }}</span>
@@ -1220,7 +1380,73 @@ onBeforeUnmount(() => {
           <p v-if="positionBooks.length" class="tr-foot-note">
             当前持仓 {{ totalPosCount }} 笔 · 合计手数 {{ totalPosVolume.toFixed(2) }} · 浮动盈亏 {{ fmtSigned(totalPosPnl) }}
           </p>
+
+          <!-- ── 未成交挂单 ──
+               与持仓分开一块：限价开仓成交前账户里没有任何持仓，
+               混在一起会让人误判成「单没发出去」。挂单**不并入**持仓口径。 -->
+          <div class="tr-pend-head">
+            <b>未成交挂单</b>
+            <span v-if="pendingReported">{{ totalPendingCount }} 张 · {{ totalPendingVolume.toFixed(2) }} 手</span>
+            <span v-if="!isOnline && pendingReported" class="warn">节点离线，数据可能已过期</span>
           </div>
+          <p v-if="!account" class="tr-empty-line">等待主节点上报账户数据…</p>
+          <p v-else-if="pendingUnsupported" class="tr-empty-line">
+            该节点客户端未上报挂单（版本过低），无法展示未成交挂单
+          </p>
+          <p v-else-if="!pendingBooks.length" class="tr-empty-line">暂无挂单</p>
+          <section v-for="book in pendingBooks" :key="`pend-${book.symbol}`" class="tr-book tr-pend-book">
+            <header class="tr-book-head">
+              <div>
+                <b>{{ book.symbol }}</b>
+                <em v-if="symbolAlias(book.symbol)">{{ symbolAlias(book.symbol) }}</em>
+                <span>{{ book.rows.length }} 张 · {{ book.volume.toFixed(2) }} 手</span>
+              </div>
+            </header>
+            <div class="tr-grid tr-pend-grid tr-head">
+              <span>#</span><span>类型</span><span>方向</span><span>手数</span><span>挂单价</span><span>止盈/止损</span><span>挂单时间</span><span>操作</span>
+            </div>
+            <template v-for="group in book.groups" :key="`pend-${book.symbol}-${group.magic}`">
+              <div class="tr-magic-head">
+                <div>
+                  <b>{{ magicLabel(group.magic) }}</b>
+                  <span>{{ group.rows.length }} 张 · {{ group.volume.toFixed(2) }} 手</span>
+                </div>
+              </div>
+              <div v-for="(o, i) in pendRows(group, book.symbol)" :key="o.ticket" class="tr-grid tr-pend-grid tr-line">
+                <span class="dim">{{ i + 1 }}</span>
+                <span><i class="dir">{{ pendingKindLabel(o) }}</i></span>
+                <span><i class="dir" :class="isBuySide(o.type) ? 'buy' : 'sell'">{{ fmtPosType(o.type) }}</i></span>
+                <span class="num">{{ (o.volume || 0).toFixed(2) }}</span>
+                <span class="num">{{ fmtPx(o.price_open, o.symbol) }}</span>
+                <span class="sltp"><em class="up">{{ fmtPx(o.tp, o.symbol) }}</em><em class="down">{{ fmtPx(o.sl, o.symbol) }}</em></span>
+                <span class="dim">{{ fmtPosTime(o.time) }}</span>
+                <span>
+                  <button
+                    type="button"
+                    class="tr-x"
+                    :disabled="isCancellingPending(o.ticket) || !!actionBusy || !isOnline"
+                    :title="isOnline ? '撤销这一张挂单' : '节点离线，无法撤单'"
+                    @click="cancelPendingRow(o)"
+                  >
+                    {{ isCancellingPending(o.ticket) ? '…' : '撤单' }}
+                  </button>
+                </span>
+              </div>
+              <div v-if="pendHiddenCount(group, book.symbol)" class="tr-pend-more">
+                <button type="button" @click="togglePendExpanded(book.symbol)">
+                  展开其余 {{ pendHiddenCount(group, book.symbol) }} 张…
+                </button>
+              </div>
+            </template>
+            <footer class="tr-book-actions">
+              <button type="button" class="chip amber" :disabled="!!actionBusy || !isOnline" @click="cancelSymbolPending(book.symbol)">
+                删本品种挂单（{{ book.rows.length }}）
+              </button>
+            </footer>
+          </section>
+          <p v-if="pendingReported && totalPendingCount" class="tr-foot-note">
+            未成交挂单 {{ totalPendingCount }} 张 · 合计手数 {{ totalPendingVolume.toFixed(2) }}
+          </p>          </div>
 
         <div v-else-if="detailTab === 'grid'" class="tr-body">
           <p v-if="gridLoading && !gridTasks.length" class="tr-empty-line">加载中…</p>
@@ -1438,6 +1664,20 @@ onBeforeUnmount(() => {
 .chip.amber { color: #F59E0B; border: 1px solid rgba(245,158,11,.4); background: rgba(245,158,11,.1); }
 .chip.solid { color: #fff; border: 0; background: #F6465D; box-shadow: 0 2px 8px rgba(246,70,93,.35); }
 .tr-foot-note, .tr-empty-line { margin: 8px 0 0; font-size: 10px; text-align: center; }
+/* ── 未成交挂单区 ── */
+.tr-pend-head { display: flex; align-items: baseline; gap: 8px; margin: 18px 0 0; padding-top: 12px; border-top: 1px solid #1C2740; }
+.tr-pend-head b { color: #E6EBF4; font-size: 12px; font-weight: 650; }
+.tr-pend-head span { color: #8B96A8; font-size: 10px; }
+.tr-pend-head span.warn { color: #F59E0B; }
+.tr-pend-book { margin-top: 10px; }
+.tr-pend-grid { grid-template-columns: 14px 34px 28px 40px minmax(56px,1fr) minmax(58px,1fr) 72px 48px; }
+.tr-pend-grid span:nth-child(3) { text-align: center; }
+.tr-pend-grid span:nth-child(7) { text-align: right; }
+.tr-pend-more { padding: 4px 12px 8px; }
+.tr-pend-more button { border: 0; background: transparent; color: #3B82F6; font-size: 10px; cursor: pointer; padding: 0; }
+.tr-pend-more button:hover { text-decoration: underline; }
+/* 挂单量大时（网格单品种可挂几十张）限高滚动，避免撑爆整页 */
+.tr-pend-book .tr-grid { max-height: none; }
 .tr-assets { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 8px; }
 .tr-assets div { border: 1px solid #22304A; background: #0C1220; border-radius: 10px; padding: 10px; }
 .tr-assets span, .tr-dist-title { color: #5B6B85; font-size: 10px; }
