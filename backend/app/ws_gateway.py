@@ -15,6 +15,7 @@ from fastapi import APIRouter, WebSocket
 from starlette.websockets import WebSocketDisconnect
 
 from . import (
+    ai_follow_first_open,
     deal_store,
     group_dispatcher,
     group_persist,
@@ -446,6 +447,7 @@ async def _on_trade_result(node_id: str, data: dict) -> None:
     其次按 task_id / signal_id 回退，兼容尚未上报魔术号的旧版节点客户端。
     """
     store = state.store
+    balance_before_open = data.pop("balance_before_open", None)
     signal_id = data.get("signal_id", "")
     symbol = data.get("symbol", "")
     # 轮询模式正等待该回报，唤醒对应 future
@@ -469,6 +471,8 @@ async def _on_trade_result(node_id: str, data: dict) -> None:
     else:
         # 首单失败会让子任务直接收口，此时要放开该节点该品种的占位
         await _release_node_busy(handled)
+        if dispatch_id is not None:
+            await ai_follow_first_open.record(node_id, dispatch_id, data, balance_before_open)
     await manager.broadcast_admin(
         {"type": "trade_result", "data": {"node_id": node_id, **data}}
     )
@@ -636,9 +640,10 @@ async def _on_deals_report(node_id: str, data: dict) -> None:
     if inserted:
         logger.info("node %s saved %s deals", node_id, inserted)
         # 回填来源：节点不知道这单属于哪个信号/策略/手工操作
-        await deal_store.backfill_sources(
-            node_id, [int(r.get("deal_id") or 0) for r in rows if r.get("deal_id")]
-        )
+        deal_ids = [int(r.get("deal_id") or 0) for r in rows if r.get("deal_id")]
+        await deal_store.backfill_sources(node_id, deal_ids)
+        if any(type(row.get("magic")) is int and group_rules.subtask_id_from_magic(row["magic"]) is not None for row in rows):
+            await ai_follow_first_open.record_unreported_opens(node_id, deal_ids)
     await manager.broadcast_admin(
         {"type": "deals", "data": {"node_id": node_id, "inserted": inserted}}
     )

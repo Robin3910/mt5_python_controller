@@ -546,6 +546,62 @@ def test_leader_detail_404_for_unknown(client):
     assert r.status_code == 404, r.text
 
 
+def test_leader_detail_still_visible_after_capability_revoked(client):
+    """能力被撤销（已结束）后：详情仍返回 200，但全部标为不可跟单。
+
+    详情是**只读展示**：带单广场的卡片是公开的，跟单员点开看一眼他过去
+    做了什么属于合理诉求。没理由因为对方下架就把页面变成 404 ——
+    404 还会让人以为是自己权限出了问题。写侧（join）仍然是权威拦截点。
+    """
+    admin_h = _login(client, "admin")
+    alice, bob, a_primary, a_extra, b_primary, b_follow, a_group = _setup_leader_and_follower(
+        client, admin_h,
+    )
+    bob_h = _login(client, "bob")
+
+    # 撤销 alice 的带单能力 = 已结束带单
+    roles = client.get("/api/roles", headers=admin_h).json()
+    leader_role = next(r for r in roles if r["code"] == "leader")
+    client.put(
+        f"/api/roles/{leader_role['id']}/capabilities",
+        json={"capabilities": []}, headers=admin_h,
+    )
+
+    r = client.get(f"/api/follow/leaders/{alice['id']}", headers=bob_h)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["leader"]["marketable"] is False, "已结束的带单员应标为不可跟单"
+    grp = next(g for g in data["groups"] if g["group_id"] == a_group)
+    assert grp["selectable"] is False
+    assert grp["unselectable_reason"], "不可跟单必须给人读原因"
+    # 历史数据仍可见（绩效字段照常返回，只是可能暂无数据）
+    assert "performance" in data["leader"]
+    assert "daily_profit" in data
+
+    # 但**不能**再加入跟单 —— 写侧是权威拦截点
+    j = client.post(
+        "/api/follow/join",
+        json={"leader_user_id": alice["id"], "group_ids": [a_group], "node_ids": [b_follow]},
+        headers=bob_h,
+    )
+    assert j.status_code in (400, 404), j.text
+    assert "带单" in j.json()["detail"]
+
+
+def test_leader_detail_primary_node_carries_created_at(client):
+    """主节点摘要要带 created_at：详情页算「已运行 N 天」用。
+
+    别人的主节点不在我的节点列表里，前端查不到，只能由后端带出来。
+    """
+    admin_h = _login(client, "admin")
+    alice, bob, *_ = _setup_leader_and_follower(client, admin_h)
+    bob_h = _login(client, "bob")
+    r = client.get(f"/api/follow/leaders/{alice['id']}", headers=bob_h)
+    assert r.status_code == 200, r.text
+    primary = r.json()["leader"]["primary_node"]
+    assert primary and primary.get("created_at"), "主节点摘要应带 created_at"
+
+
 # ---------------------------------------------------------------------------
 # 跟单关系不被 owner 编辑成员误删
 # ---------------------------------------------------------------------------

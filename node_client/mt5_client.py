@@ -15,6 +15,7 @@
 order_send，不靠多线程并行发单。
 """
 import logging
+import math
 import os
 import time
 from typing import Optional
@@ -892,7 +893,7 @@ class MT5Client:
     def place_market_order(self, symbol: str, action: str, volume: float,
                            sl: Optional[float] = None, tp: Optional[float] = None,
                            comment: str = "", magic: Optional[int] = None,
-                           max_retry: int = 3) -> dict:
+                           max_retry: int = 3, *, capture_balance_before_open: bool = False) -> dict:
         """下市价单。内部循环处理：填充模式切换(10030) + 瞬时错误重试(刷新价格)。
 
         返回值额外带两个内部时刻（`_order_at` / `_filled_at`）：下单前与返回后的
@@ -938,6 +939,14 @@ class MT5Client:
             if tp:
                 request["tp"] = float(tp)
 
+            balance = None
+            if capture_balance_before_open:
+                try:
+                    reading = getattr(mt5.account_info(), "balance", None)
+                    if type(reading) in (int, float) and math.isfinite(reading):
+                        balance = reading
+                except Exception:  # noqa: BLE001
+                    logger.debug("读取首单余额失败", exc_info=True)
             order_at = time.time()
             result = mt5.order_send(request)
             filled_at = time.time()
@@ -950,7 +959,7 @@ class MT5Client:
             rc = result.retcode
             if rc in (RET_DONE, RET_DONE_PARTIAL):
                 # 成交
-                return {
+                report = {
                     "success": True,
                     "symbol": symbol,
                     "retcode": rc,
@@ -961,6 +970,9 @@ class MT5Client:
                     "_order_at": order_at,
                     "_filled_at": filled_at,
                 }
+                if balance is not None:
+                    report["balance_before_open"] = balance
+                return report
             if rc == RET_INVALID_FILL:
                 fill_idx += 1  # 换下一种填充模式（不消耗重试次数）
                 continue

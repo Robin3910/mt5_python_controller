@@ -24,12 +24,14 @@
 """
 from __future__ import annotations
 
+from time import time
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from . import (
     ai_application_store,
+    ai_follow_first_open,
     ai_follow_nodes,
     ai_robot_detail,
     deal_stats,
@@ -518,6 +520,14 @@ async def list_my_ai_followings(
             applications=await ai_application_store.list_mine(p.user_id),
         )
 
+    owned_node_ids = {node["node_id"] for node in all_nodes if permissions.same_owner(node.get("owner_user_id"), owner)}
+    followed_pairs = {(f["group_id"], f["node_id"]) for items in by_leader.values() for f in items
+                      if f["node_id"] in owned_node_ids and not f.get("review_status")}
+    first_opens = await ai_follow_first_open.list_first_opens(p.user_id, followed_pairs)
+    profit_pairs = followed_pairs | {
+        (gid, own_primary["node_id"]) for gid in owned_group_ids if own_primary
+    }
+    net_profits = await ai_robot_detail.net_profits_by_group(profit_pairs, now=time())
     following_out: list[dict] = []
     for lid, items in sorted(by_leader.items()):
         user = await user_service.get_user_by_id(lid)
@@ -578,6 +588,9 @@ async def list_my_ai_followings(
             my_group_count, my_node_count = follow_rules.my_follow_counts_in_market(
                 fs, all_groups, follow_rules.AI_MARKET_TEMPLATE_IDS, tmpl_map,
             )
+            group_pairs = [(gid, f["node_id"]) for f in fs if (gid, f["node_id"]) in followed_pairs]
+            investment_amount = ai_follow_first_open.total_balance(first_opens.get(pair) for pair in group_pairs)
+            total_profit, recent_net_profit = net_profits.get(gid, (None, None))
             following_out.append({
                 "is_owner": lid == p.user_id and gid in owned_group_ids,
                 "robot": {
@@ -587,6 +600,9 @@ async def list_my_ai_followings(
                     "marketable": has_cap,
                 },
                 "groups": [group_out],
+                "investment_amount": investment_amount,
+                "total_profit": total_profit,
+                "monthly_profit_rate": ai_robot_detail.monthly_profit_rate(recent_net_profit, investment_amount),
                 "review_status": next((f["review_status"] for f in fs if f.get("review_status")), None),
             })
     return AiMeResponse(

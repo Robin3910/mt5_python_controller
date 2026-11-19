@@ -63,6 +63,9 @@ def _node_brief(node: Optional[dict]) -> Optional[dict]:
         "status": node.get("status"),
         "enabled": bool(node.get("enabled", True)),
         "is_primary": bool(node.get("is_primary")),
+        # 建节点时间：详情页算「已运行 N 天」用。
+        # 前端自己的节点列表里查不到**别人**的主节点，这个时间只能由后端带出来。
+        "created_at": node.get("created_at") or 0,
     }
 
 
@@ -250,13 +253,21 @@ async def get_leader_detail(
     store: RedisStore = Depends(get_store),
     p: Principal = Depends(require_menu(MENU_FOLLOW)),
 ) -> FollowDetailOut:
-    """带单员详情：可跟单分组（含我的已跟标记）+ 我可用于跟单的节点 + 绩效。"""
+    """带单员详情：可跟单分组（含我的已跟标记）+ 我可用于跟单的节点 + 绩效。
+
+    **已结束（能力被撤销）的带单员也返回 200**，只是全部内容置为只读：
+    带单广场的卡片是公开的，跟单员点开看一眼他过去做了什么属于合理诉求，
+    没理由因为对方下架就把页面变成 404（404 还会让人以为是自己权限出问题）。
+    写侧（join）仍然是权威拦截点 —— 详情只负责「看得见」，不负责「能加入」。
+    """
     user = await user_service.get_user_by_id(leader_user_id)
     if not user or not user.is_active:
         raise HTTPException(status_code=404, detail="带单员不存在或已停用")
     principal = await rbac_service.load_principal(store, user.username)
-    if not principal or not permissions.can_be_leader(principal):
+    if not principal:
         raise HTTPException(status_code=404, detail="该用户暂未开放带单")
+    # 能力被撤销 = 已结束：仍可查看历史数据，但不可再跟单
+    leader_has_capability = permissions.can_be_leader(principal)
 
     all_nodes = await store.all_nodes()
     primary = _primary_of(all_nodes, leader_user_id)
@@ -313,6 +324,9 @@ async def get_leader_detail(
         reason = None if g.get("enabled", True) else "分组已禁用"
         if (strategy is None or not strategy.get("enabled", True)) and g.get("strategy_id"):
             reason = "已停止接收新信号（策略已停用）"
+        # 已结束（能力被撤销）优先于暂停 —— 能力撤销是更强的下架信号
+        if reason is None and not leader_has_capability:
+            reason = follow_rules.CAPABILITY_REVOKED_REASON
         if reason is None and leader_paused:
             reason = follow_rules.PAUSED_FOLLOW_REASON
         detail_groups.append({
@@ -407,7 +421,8 @@ async def get_leader_detail(
             }),
             "my_follow_group_count": my_group_count,
             "my_follow_node_count": my_node_count,
-            "marketable": True,
+            # 已结束（能力被撤销）= 不可再跟单，但详情仍可查看
+            "marketable": leader_has_capability,
             "performance": {k: v for k, v in perf.items() if k != "follower_count"},
             "perf_window": win,
             "follower_count": follower_count,

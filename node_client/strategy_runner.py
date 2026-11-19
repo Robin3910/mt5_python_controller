@@ -29,6 +29,7 @@ import asyncio
 import copy
 import logging
 import time
+from functools import partial
 from typing import Callable, Optional
 
 import grid_trading
@@ -2145,8 +2146,11 @@ class StrategyRunner:
         order_sl, order_tp = self._merge_entry_stops(
             await self._stops_on_open(self.direction, self.base_volume, []),
         )
+        place_order = self._mt5.place_market_order
+        if self.is_ai_add_on and self.entry.get("capture_balance_before_open") is True:
+            place_order = partial(place_order, capture_balance_before_open=True)
         res = await self._exec(
-            self._mt5.place_market_order,
+            place_order,
             self.symbol, self.direction, self.base_volume,
             order_sl, order_tp,
             self._open_comment(), self.magic,

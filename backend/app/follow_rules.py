@@ -93,6 +93,11 @@ def market_for_template(template_id: object | None) -> frozenset[str]:
 PAUSED_FOLLOW_REASON = "该带单员已暂停带单，不再接收新的跟单"
 PAUSED_AI_REASON = "该机器人主人已暂停 AI 跟单，不再接收新的跟单"
 
+# 带单员能力被撤销（管理员收走 follow_leader）= 已结束带单。
+# 跟「暂停」的区别：暂停是主人自己收口、随时能恢复；能力撤销是管理员收权，
+# 分组不再对外接新单。存量跟单关系保留，跟单员仍可自行移出。
+CAPABILITY_REVOKED_REASON = "该带单员已结束带单，不再接收新的跟单"
+
 
 def pause_flags_for_template(template_id: object | None) -> tuple[bool, bool]:
     """该模版所属市场应取用哪个暂停标志。

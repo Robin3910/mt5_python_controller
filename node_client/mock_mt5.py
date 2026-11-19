@@ -362,10 +362,11 @@ class MockMT5Client:
         return symbol.upper()
 
     def place_market_order(self, symbol, action, volume, sl=None, tp=None,
-                           comment="", magic=None, max_retry=3) -> dict:
+                           comment="", magic=None, max_retry=3, *, capture_balance_before_open=False) -> dict:
         blocked = self._link_block(symbol)
         if blocked is not None:
             return blocked
+        balance = self.balance
         # 模拟“立即成交”，新增一笔持仓
         tk = next(self._tickets)
         price = self.prices_map.get(symbol.upper(), 1.0)
@@ -386,7 +387,7 @@ class MockMT5Client:
             }
         )
         logger.info("MOCK open %s %s %.2f @ %.5f -> ticket %s", action, symbol, volume, price, tk)
-        self._record_deal(
+        deal = self._record_deal(
             entry="IN",
             reason=0,  # DEAL_REASON_CLIENT
             position_id=tk,
@@ -398,8 +399,11 @@ class MockMT5Client:
             magic=int(magic or self.magic),
             comment=comment,
         )
-        return {"success": True, "symbol": symbol, "retcode": 10009,
-                "order": tk, "deal": tk, "volume": float(volume), "price": price}
+        report = {"success": True, "symbol": symbol, "retcode": 10009,
+                  "order": tk, "deal": deal, "volume": float(volume), "price": price}
+        if capture_balance_before_open:
+            report["balance_before_open"] = balance
+        return report
 
     # ----------------------- 挂单 -----------------------
     def _market_price(self, symbol: str, action: str) -> float:
@@ -631,7 +635,7 @@ class MockMT5Client:
     def _record_deal(self, *, entry: str, reason: int, position_id: int,
                      symbol: str, direction: str, volume: float, price: float,
                      profit: float, magic: int, comment: str = "",
-                     deal_type: int | None = None) -> None:
+                     deal_type: int | None = None) -> int:
         """记一笔成交到成交流水（与真 MT5 的字段口径一致）。
 
         deal_id 用自增票号，模拟 MT5 单账户内成交号单调递增的语义 ——
@@ -663,6 +667,7 @@ class MockMT5Client:
             "comment": str(comment or "")[:128],
             "time": time.time(),
         })
+        return tk
 
     def history_deals_since(self, since_ts: float, after_deal_id: int = 0) -> list[dict]:
         """与真 MT5Client 同口径：取增量成交流水。

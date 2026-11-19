@@ -1628,6 +1628,9 @@ class AiMyRobot(BaseModel):
     is_owner: bool = False
     robot: AiRobotSummary
     groups: list[AiMyGroup]
+    investment_amount: Optional[float] = None
+    total_profit: Optional[float] = None
+    monthly_profit_rate: Optional[float] = None
 
 
 class AiMeResponse(BaseModel):

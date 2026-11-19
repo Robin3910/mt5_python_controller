@@ -2806,6 +2806,8 @@ export interface FollowNodeBrief {
   status: string | null
   enabled: boolean
   is_primary?: boolean
+  /** 建节点时间（Unix 秒）；详情页算「已运行 N 天」用 */
+  created_at?: number
   /** 主节点 / 机器人在场时附带；不带则表示未接入或离线聚合展示 */
   online?: boolean
   balance?: number | null
@@ -3101,6 +3103,9 @@ export interface AiMyRobot {
   is_owner: boolean
   robot: AiRobotSummary
   groups: AiMyGroup[]
+  investment_amount: number | null
+  total_profit: number | null
+  monthly_profit_rate: number | null
 }
 
 export interface AiMeResponse {

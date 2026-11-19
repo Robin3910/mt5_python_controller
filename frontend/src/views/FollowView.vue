@@ -681,8 +681,15 @@ onMounted(() => {
 
 const pageMode = ref<'home' | 'mine' | 'showcase'>('home')
 const showcaseMode = ref<'trend_market' | 'trend_limit' | 'grid'>('trend_market')
+/**
+ * 详情页的返回目标。
+ *
+ * 详情页有两个入口（带单广场 / 我的跟单），返回时必须回**来处**，
+ * 否则从「我的跟单」点进来会被扔回广场，白跑一趟。
+ */
+const showcaseReturn = ref<'home' | 'mine'>('home')
 function closeShowcase(): void {
-  pageMode.value = 'home'
+  pageMode.value = showcaseReturn.value
 }
 watch(pageMode, (mode) => {
   if (mode === 'showcase') {
@@ -783,12 +790,16 @@ async function pauseMine() {
   await openLeader(myLeader.value)
   await togglePause()
 }
-async function openShowcase(): Promise<void> {
-  if (!myLeader.value || detailLoading.value) return
-  await openLeader(myLeader.value)
+async function openShowcase(leader?: FollowLeaderSummary, from: 'home' | 'mine' = 'home'): Promise<void> {
+  // 带单员详情：广场里任何人（包括已暂停 / 已结束的）都能点开看数据。
+  // 「查看带单员」按钮走的是自己（myLeader），广场卡片走的是参数里的那位。
+  const target = leader || myLeader.value
+  if (!target || detailLoading.value) return
+  await openLeader(target)
   if (!detail.value) return
   const first = SHOWCASE_MODES.find((key) => (detail.value?.groups || []).some((g) => showcaseGroupMode(g) === key))
   showcaseMode.value = first || 'trend_market'
+  showcaseReturn.value = from
   pageMode.value = 'showcase'
   trackFollowUi('page_view', { value: 'leader-showcase' })
 }
@@ -1084,26 +1095,60 @@ const showcaseCards = computed(() =>
   (detail.value?.groups || []).filter((g) => showcaseGroupMode(g) === showcaseMode.value),
 )
 const showcaseDays = computed(() => {
-  const id = detail.value?.leader.primary_node?.node_id
-  const created = id ? hub.nodes.find((n) => n.node_id === id)?.created_at : 0
+  // 主节点的建节点时间：别人的主节点不在我的节点列表里，只能读后端带出来的 created_at。
+  const created = detail.value?.leader.primary_node?.created_at
+    || (() => {
+      const id = detail.value?.leader.primary_node?.node_id
+      return id ? hub.nodes.find((n) => n.node_id === id)?.created_at : 0
+    })()
   if (!created) return null
   return Math.max(0, Math.floor((Date.now() / 1000 - created) / 86400))
 })
 const showcaseIntro = computed(() => {
   const leader = detail.value?.leader
-  if (!leader || !isMyLeader(leader)) return '跟单申请经审核后生效，策略开平仓自动同步。'
-  return auth.me?.leader_intro?.trim() || '跟单申请经审核后生效，策略开平仓自动同步。'
+  // 他自己写的简介优先；没写就用统一说明。
+  // 注意：**不能**只认自己（`isMyLeader`）—— 详情页现在对所有人开放，
+  // 别人的简介也要显示出来，否则点进来看到的永远是同一句模板文案。
+  return leader?.intro?.trim() || '跟单申请经审核后生效，策略开平仓自动同步。'
 })
 const showcaseNodeCount = computed(() => detail.value?.leader.follower_node_count || 0)
 function pickShowcaseMode(key: 'trend_market' | 'trend_limit' | 'grid'): void {
   showcaseMode.value = key
   trackFollowUi('filter', { value: `showcase:${key}` })
 }
+/**
+ * 带单员绩效（主节点口径）。
+ *
+ * 绩效**拆不到单个分组**（后端只聚合主节点），所以它属于「带单员」这一层，
+ * 不属于「某个分组」这一层 —— 早期版本把它塞进分组卡，还用「只有一个分组
+ * 才显示」来掩盖口径错位，结果多方单员全是「暂无数据」。现在单独成块展示。
+ */
 const showcasePerf = computed(() => {
-  // 绩效是主节点口径，拆不到单个分组；只有一个分组时才能放到这张卡上。
-  if ((detail.value?.groups.length || 0) !== 1) return null
   const perf = detail.value?.leader.performance
   return perf?.data_available ? perf : null
+})
+/** 近 7 日已实现收益（柱状图）。后端按 UTC+8 自然日分好，前端直接显示。 */
+const showcaseDaily = computed(() => detail.value?.daily_profit || [])
+const showcaseDailyMax = computed(() =>
+  Math.max(1, ...showcaseDaily.value.map((point) => Math.abs(point.profit))),
+)
+const showcaseDailyHasDeals = computed(() => showcaseDaily.value.some((point) => point.deals > 0))
+/** 该带单员当前还能不能跟单（已暂停 / 已结束都不行）。 */
+const showcaseCanFollow = computed<boolean>(() => {
+  const leader = detail.value?.leader
+  if (!leader) return false
+  if (!leader.marketable) return false
+  if (leader.follow_paused) return false
+  return selectableGroups.value.length > 0
+})
+/** 不可跟单时给一句人话原因（别让人猜为什么按钮是灰的）。 */
+const showcaseFollowHint = computed(() => {
+  const leader = detail.value?.leader
+  if (!leader) return ''
+  if (!leader.marketable) return '该带单员已结束带单，不再接收新的跟单'
+  if (leader.follow_paused) return PAUSED_FOLLOW_HINT
+  if (!selectableGroups.value.length) return '该带单员当前没有可跟单的分组'
+  return ''
 })
 function selfModeLabel(name: string | null | undefined): string {
   return SELF_MODE_LABEL[(name || '').split('-')[0]] || ''
@@ -1187,7 +1232,17 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
         <p v-if="loading" class="fd-empty">加载中…</p>
         <p v-else-if="!leaders.length" class="fd-empty">暂无开放的带单员</p>
         <div v-else class="fd-grid">
-          <article v-for="l in leaders" :key="l.leader_user_id" class="fd-leader">
+          <article
+            v-for="l in leaders"
+            :key="l.leader_user_id"
+            class="fd-leader fd-leader-link"
+            role="button"
+            tabindex="0"
+            :aria-label="`查看 ${leaderName(l)} 的带单详情`"
+            @click="openShowcase(l)"
+            @keydown.enter.prevent="openShowcase(l)"
+            @keydown.space.prevent="openShowcase(l)"
+          >
             <span class="fd-avatar"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 12a5 5 0 1 0-5-5 5 5 0 0 0 5 5zm0 2c-3.33 0-10 1.67-10 5v3h20v-3c0-3.33-6.67-5-10-5z"/></svg></span>
             <div class="fd-leader-text">
               <p>
@@ -1199,7 +1254,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
               </p>
               <p class="fd-blurb">{{ leaderBlurb(l) }}</p>
             </div>
-            <button type="button" class="fd-follow" :disabled="!l.marketable || l.follow_paused" @click="openFollowPicker(l)">跟单<svg viewBox="0 0 24 24"><path fill="currentColor" d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg></button>
+            <button type="button" class="fd-follow" :disabled="!l.marketable || l.follow_paused" @click.stop="openFollowPicker(l)">跟单<svg viewBox="0 0 24 24"><path fill="currentColor" d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg></button>
           </article>
         </div>
       </section>
@@ -1249,7 +1304,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
             </div>
             <div class="fd-self-side">
               <em class="fd-self-run"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46A7.93 7.93 0 0 0 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74A7.93 7.93 0 0 0 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z"/></svg>{{ selfRunLabel }}</em>
-              <button type="button" class="fd-self-link" @click="openShowcase">查看带单员<svg viewBox="0 0 24 24"><path fill="currentColor" d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg></button>
+              <button type="button" class="fd-self-link" @click="openShowcase()">查看带单员<svg viewBox="0 0 24 24"><path fill="currentColor" d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg></button>
             </div>
           </header>
           <p v-if="!selfGroups.length" class="fd-empty">主节点上还没有可展示的带单分组。</p>
@@ -1357,6 +1412,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
               </div>
               <div class="fd-card-side">
                 <em :class="entry.marketable ? 'on' : 'off'"><i></i>{{ entry.nodes.length }} 个节点</em>
+                <button type="button" class="fd-link" @click="openShowcase(entry.leader, 'mine')">查看详情</button>
                 <button type="button" class="fd-link" @click="openLeaveDialog(entry.leader)">移出节点</button>
               </div>
             </header>
@@ -1463,7 +1519,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
                 <small>{{ showcaseDays == null ? '已运行 —' : `已运行 ${showcaseDays} 天` }}</small>
               </div>
             </div>
-            <em :class="detail.leader.marketable ? 'fd-show-cert' : 'pause'">{{ detail.leader.marketable ? '已认证' : '已结束' }}</em>
+            <em :class="detail.leader.marketable ? (detail.leader.follow_paused ? 'pause' : 'fd-show-cert') : 'pause'">{{ detail.leader.marketable ? (detail.leader.follow_paused ? '已暂停' : '已认证') : '已结束' }}</em>
           </div>
           <div class="fd-show-nodes">
             <span class="fd-show-mark"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M22 11V3h-7v3H9V3H2v8h7V8h2v10h4v3h7v-8h-7v3h-2V8h2v3z"/></svg></span>
@@ -1475,10 +1531,47 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
           </div>
           <p class="fd-show-bio">{{ showcaseIntro }}</p>
           <div class="fd-show-actions">
-            <button type="button" class="fd-show-apply" :disabled="detailLoading" @click="applyShowcase"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M15 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zM6 10V7H4v3H1v2h3v3h2v-3h3v-2H6zm9 4c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>跟单申请</button>
-            <button type="button" class="fd-show-back" @click="closeShowcase">返回带单广场</button>
+            <button type="button" class="fd-show-apply" :disabled="detailLoading || !showcaseCanFollow" @click="applyShowcase"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M15 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zM6 10V7H4v3H1v2h3v3h2v-3h3v-2H6zm9 4c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>跟单申请</button>
+            <button type="button" class="fd-show-back" @click="closeShowcase">{{ showcaseReturn === 'mine' ? '返回我的跟单' : '返回带单广场' }}</button>
+          </div>
+          <p v-if="showcaseFollowHint" class="fd-show-warn">{{ showcaseFollowHint }}</p>
+        </div>
+      </section>
+
+      <!-- 带单员整体绩效：主节点口径，拆不到单个分组，所以单独成块 -->
+      <section class="fd-sec">
+        <header>
+          <p class="fd-kicker">绩效概览<span>{{ detail.leader.perf_window }}</span></p>
+          <span class="fd-show-hint">统计口径：带单员主节点</span>
+        </header>
+        <div class="fd-show-stats fd-show-perf">
+          <div><span>累计收益</span><b :class="showcasePerf ? (showcasePerf.total_profit >= 0 ? 'up' : 'down') : 'muted'">{{ showcasePerf ? fmtU(showcasePerf.total_profit) + ' U' : '暂无数据' }}</b></div>
+          <div><span>收益率</span><b :class="showcasePerf?.profit_rate_valid ? (showcasePerf.profit_rate >= 0 ? 'up' : 'down') : 'muted'">{{ showcasePerf?.profit_rate_valid ? `${showcasePerf.profit_rate >= 0 ? '+' : ''}${showcasePerf.profit_rate.toFixed(2)}%` : '暂无数据' }}</b></div>
+          <div><span>胜率</span><b :class="showcasePerf ? '' : 'muted'">{{ showcasePerf ? `${showcasePerf.win_rate.toFixed(1)}%` : '暂无数据' }}</b></div>
+          <div><span>跟单人数</span><b>{{ (detail.leader.follower_count || 0).toLocaleString() }}</b></div>
+        </div>
+        <div class="fd-show-stats fd-show-perf">
+          <div><span>交易笔数</span><b :class="showcasePerf ? '' : 'muted'">{{ showcasePerf ? showcasePerf.total_trades.toLocaleString() : '暂无数据' }}</b></div>
+          <div><span>盈利 / 亏损</span><b :class="showcasePerf ? '' : 'muted'">{{ showcasePerf ? `${showcasePerf.win_trades} / ${showcasePerf.lose_trades}` : '暂无数据' }}</b></div>
+          <div><span>成交手数</span><b :class="showcasePerf ? '' : 'muted'">{{ showcasePerf ? showcasePerf.gross_volume.toFixed(2) : '暂无数据' }}</b></div>
+          <div><span>手续费 + 库存费</span><b :class="showcasePerf ? 'down' : 'muted'">{{ showcasePerf ? fmtU(-(showcasePerf.commission_total + showcasePerf.swap_total)) + ' U' : '暂无数据' }}</b></div>
+        </div>
+      </section>
+
+      <!-- 近 7 日已实现收益：与上面的 7d 窗口同口径，柱子之和 === 该窗口累计收益 -->
+      <section class="fd-sec">
+        <header>
+          <p class="fd-kicker green">近 7 日收益<span>U</span></p>
+          <span class="fd-show-hint">按北京时间自然日统计已平仓成交净收益</span>
+        </header>
+        <div v-if="showcaseDaily.length" class="fd-chart" role="img" :aria-label="showcaseDaily.map((point) => `${point.date}：${fmtU(point.profit)} U`).join('；')">
+          <div v-for="point in showcaseDaily" :key="point.ts" class="fd-column">
+            <div class="fd-bar-space"><div class="fd-bar" :class="{ negative: point.profit < 0, zero: point.profit === 0 }" :style="{ height: `${Math.max(1, Math.abs(point.profit) / showcaseDailyMax * 100)}%` }"><span>{{ fmtU(point.profit) }}</span></div></div>
+            <span class="fd-date">{{ point.date }}</span>
           </div>
         </div>
+        <p v-else class="fd-empty">收益数据暂不可用</p>
+        <p class="fd-sub">{{ showcaseDailyHasDeals ? '近 7 日已平仓成交的净收益' : '近 7 日暂无已平仓成交' }}</p>
       </section>
       <section class="fd-sec">
         <header>
@@ -1508,18 +1601,15 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
                   {{ SELF_MODE_LABEL[showcaseGroupMode(g)] || '带单' }}
                 </p>
               </div>
-              <em :class="detail.leader.follow_paused || !g.enabled ? 'off' : 'on'"><i></i>{{ detail.leader.follow_paused || !g.enabled ? '已暂停' : '带单中' }}</em>
+              <em :class="g.selectable ? 'on' : 'off'"><i></i>{{ g.selectable ? '带单中' : '已暂停' }}</em>
             </header>
             <div class="fd-show-stats">
               <div><span>跟单人数</span><b>{{ g.follower_count.toLocaleString() }}</b></div>
-              <div><span>累计收益</span><b :class="showcasePerf ? (showcasePerf.total_profit >= 0 ? 'up' : 'down') : 'muted'">{{ showcasePerf ? fmtU(showcasePerf.total_profit) + ' U' : '暂无数据' }}</b></div>
-              <div><span>收益率</span><b :class="showcasePerf?.profit_rate_valid ? (showcasePerf.profit_rate >= 0 ? 'up' : 'down') : 'muted'">{{ showcasePerf?.profit_rate_valid ? `${showcasePerf.profit_rate >= 0 ? '+' : ''}${showcasePerf.profit_rate.toFixed(1)}%` : '暂无数据' }}</b></div>
-              <div><span>胜率</span><b :class="showcasePerf ? '' : 'muted'">{{ showcasePerf ? `${showcasePerf.win_rate.toFixed(1)}%` : '暂无数据' }}</b></div>
+              <div><span>在线节点</span><b>{{ g.online_count.toLocaleString() }}</b></div>
+              <div><span>进行中任务</span><b>{{ g.active_task_count.toLocaleString() }}</b></div>
+              <div><span>累计信号</span><b>{{ g.signal_count.toLocaleString() }}</b></div>
             </div>
-            <div class="fd-show-pair">
-              <div><span>跟单比例</span><b class="muted">暂无数据</b></div>
-              <div><span>最低跟单</span><b class="muted">暂无数据</b></div>
-            </div>
+            <p v-if="!g.selectable" class="fd-show-warn">{{ g.unselectable_reason || '当前不可跟单' }}</p>
           </article>
         </div>
       </section>
@@ -1632,6 +1722,10 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 .fd-leader, .fd-card, .fd-node-card { padding: 12px; }
 .fd-leader { display: flex; align-items: center; gap: 8px; }
 .fd-leader:hover, .fd-card:hover, .fd-preview:hover { border-color: rgba(124,58,237,.5); }
+/* 广场卡片整张可点：进带单员详情页。键盘也要能进（tabindex + enter/space）。 */
+.fd-leader-link { cursor: pointer; }
+.fd-leader-link:focus-visible { outline: 2px solid rgba(124,58,237,.7); outline-offset: 2px; }
+.fd-leader-link .fd-follow { position: relative; z-index: 1; }
 .fd-avatar { width: 32px; height: 32px; border-radius: 8px; color: #A78BFA; background: rgba(124,58,237,.15); }
 .fd-avatar.lg { width: 36px; height: 36px; }
 .fd-avatar svg { width: 16px; height: 16px; }
@@ -1862,6 +1956,22 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 .fd-show-stats b.up, .fd-show-pair b.up { color: #22C55E; }
 .fd-show-stats b.down, .fd-show-pair b.down { color: #F6465D; }
 .fd-show-stats b.muted, .fd-show-pair b.muted { color: #8B96A8; font-weight: 650; }
+/* 绩效概览块：两组各 4 个指标，视觉上比分组卡更「数据」 */
+.fd-show-perf { margin-top: 8px; }
+.fd-show-perf + .fd-show-perf { margin-top: 6px; }
+.fd-show-perf > div { padding: 8px 10px; }
+.fd-show-perf b { font-size: 13px; }
+/* 不可跟单时的原因提示：置灰按钮必须说清楚理由 */
+.fd-show-warn { margin: 8px 0 0; border: 1px solid rgba(245,158,11,.35); border-radius: 8px; background: rgba(245,158,11,.08); color: #F5B041; padding: 8px 10px; font-size: 10px; line-height: 1.6; }
+/* 近 7 日收益柱状图 */
+.fd-chart { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 6px; padding-top: 22px; }
+.fd-column { display: flex; min-width: 0; flex-direction: column; gap: 5px; text-align: center; }
+.fd-bar-space { display: flex; height: 62px; align-items: flex-end; border-bottom: 1px solid #22304A; }
+.fd-bar { position: relative; width: 100%; border-radius: 4px 4px 0 0; background: #22C55E; }
+.fd-bar.negative { background: #F6465D; }
+.fd-bar.zero { background: #334155; }
+.fd-bar span { position: absolute; bottom: calc(100% + 4px); left: 50%; transform: translateX(-50%); color: #8B96A8; font-size: 9px; white-space: nowrap; }
+.fd-date { color: #5B6B85; font-size: 9px; }
 .fd-show-mark svg { width: 18px; height: 18px; }
 @media (min-width: 640px) {
   .fd-show-banner { height: 80px; }

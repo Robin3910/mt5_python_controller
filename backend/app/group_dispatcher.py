@@ -1535,7 +1535,10 @@ class GroupDispatcher:
                 group_id, node_id, str(dispatch_id), Config.NODE_BUSY_TTL,
             )
         cmd = for_node(command, dispatch_id=dispatch_id, magic=magic)
-        cmd["strategy"] = ai_follow_settings.apply_settings(cmd.get("strategy") or {}, created.get("follow_settings"))
+        follow_settings = created.get("follow_settings")
+        cmd["strategy"] = ai_follow_settings.apply_settings(cmd.get("strategy") or {}, follow_settings)
+        if (follow_settings or {}).get("application_id"):
+            cmd["entry"] = {**cmd["entry"], "capture_balance_before_open": True}
         # 发包时刻：逐节点各记一次（同步模式下各节点的命令是分别发出的，
         # 记同一个时间会掩盖节点间的先后差）。跨节点唯一可比的时间轴。
         sent_at = time.time()

@@ -130,6 +130,9 @@ interface MyRobotEntry {
   robot: AiRobotSummary
   marketable: boolean
   groups: AiMyGroup[]
+  investment_amount: number | null
+  total_profit: number | null
+  monthly_profit_rate: number | null
   /** 聚合后每个节点的详情（去重），用于「我的 AI 跟单」区 */
   nodes: MyFollowedNode[]
 }
@@ -174,6 +177,9 @@ const myFollowing = computed<MyRobotEntry[]>(() =>
       robot: r.robot,
       marketable: r.robot.marketable,
       groups,
+      investment_amount: r.investment_amount,
+      total_profit: r.total_profit,
+      monthly_profit_rate: r.monthly_profit_rate,
       nodes: [...nodesById.values()].sort((a, b) => a.node_id.localeCompare(b.node_id)),
     }
   }),
@@ -248,15 +254,6 @@ function primaryText(robot: AiRobotSummary): string {
   const n = robot.primary_node
   if (!n) return '无主节点'
   return `${n.name ?? n.node_id} · MT5 ${n.mt5_login ?? '?'}`
-}
-
-// ---------- 绩效（与 FollowView 同一套口径与展示）----------
-/** 绩效是否有真实成交数据（false = 节点没上线/同步未开，不是「赚 0」） */
-function perfOf(robot: AiRobotSummary): AiRobotSummary['performance'] {
-  return robot.performance
-}
-function hasPerf(robot: AiRobotSummary): boolean {
-  return !!robot.performance?.data_available
 }
 
 /** 跟单人数：优先后端算好的，回落到全量关系数 */
@@ -457,7 +454,7 @@ async function refreshAll() {
 }
 
 // 统计窗口切换：重拉列表 + 当前详情（绩效是纯读缓存，切换零延迟）。
-// 不重拉「我的 AI 跟单」—— 它不含绩效，没必要跟着抖一下。
+// 「我的机器人」固定显示累计净利润，广场窗口切换时无需重拉。
 watch(perfWindow, () => {
   void loadRobots()
   if (detail.value) {
@@ -911,9 +908,9 @@ onMounted(() => { void hub.fetchNodes(); trackAiUi('page_view', { value: 'ai-tra
             <div><span>总浮动盈亏</span><strong :class="bookStats(robotPositions(entry)).profit >= 0 ? 'up' : 'down'">{{ fmtU(bookStats(robotPositions(entry)).profit) }} U</strong></div>
             <div><span>持仓笔数</span><strong>{{ bookStats(robotPositions(entry)).count }} 笔</strong></div>
             <div><span>合计手数</span><strong>{{ bookStats(robotPositions(entry)).volume.toFixed(2) }} 手</strong></div>
-            <div><span>投资额</span><strong>—</strong></div>
-            <div><span>总利润</span><strong :class="hasPerf(entry.robot) ? (perfOf(entry.robot).total_profit >= 0 ? 'up' : 'down') : ''">{{ hasPerf(entry.robot) ? fmtU(perfOf(entry.robot).total_profit) : '—' }}</strong></div>
-            <div><span>月化收益</span><strong>—</strong></div>
+            <div><span>首单账户余额</span><strong>{{ entry.investment_amount == null ? '—' : entry.investment_amount.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' U' }}</strong></div>
+            <div><span>总利润</span><strong :class="entry.total_profit == null ? '' : entry.total_profit >= 0 ? 'up' : 'down'">{{ entry.total_profit == null ? '—' : `${fmtU(entry.total_profit)} U` }}</strong></div>
+            <div><span>月化收益</span><strong :class="entry.monthly_profit_rate == null ? '' : entry.monthly_profit_rate >= 0 ? 'up' : 'down'">{{ entry.monthly_profit_rate == null ? '—' : `${fmtU(entry.monthly_profit_rate)}%` }}</strong></div>
           </div>
           <div class="ai-card-actions">
             <button type="button" class="link" @click="router.push({ name: 'ai-robot-detail', params: { leaderUserId: entry.robot.leader_user_id, groupId: entry.robot.group_id } })">查看详情<svg viewBox="0 0 24 24"><path fill="currentColor" d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg></button>

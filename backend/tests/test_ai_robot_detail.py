@@ -37,6 +37,7 @@ def test_private_owned_robot_detail_without_snapshot(client):
     assert body["metrics"]["position_count"] is None
     assert body["metrics"]["investment_amount"] is None
     assert body["metrics"]["profit_rate"] is None
+    assert body["total_profit"] is None
     assert body["performance"]["data_available"] is False
     assert len(body["daily_profit"]) == 7
     assert all(point["profit"] == 0 for point in body["daily_profit"])
@@ -130,6 +131,8 @@ def test_followed_robot_detail_scopes_nodes_groups_and_template_snapshots(client
     assert body["metrics"]["volume"] == pytest.approx(0.2)
     assert body["updated_at"] == 123456.0
     assert body["performance"]["total_profit"] == pytest.approx(8.5)
+    mine = client.get("/api/ai-follow/me", headers=bob_headers).json()["following"]
+    assert mine[0]["total_profit"] == pytest.approx(8.5)
     assert len(body["daily_profit"]) == 7
     assert sum(point["profit"] for point in body["daily_profit"]) == pytest.approx(8.5)
     assert sum(point["deals"] for point in body["daily_profit"]) == 1
@@ -144,3 +147,4 @@ def test_followed_robot_detail_scopes_nodes_groups_and_template_snapshots(client
     assert owned["metrics"]["follow_node_count"] == 0
     assert owned["metrics"]["floating_profit"] == pytest.approx(100.0)
     assert owned["performance"]["total_profit"] == pytest.approx(997.5)
+    assert owned["total_profit"] == pytest.approx(997.5)
