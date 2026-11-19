@@ -1,6 +1,8 @@
+import time
+
 import pytest
 
-from app import deal_store, group_persist, persist, ws_gateway
+from app import ai_follow_api, ai_robot_detail, deal_store, group_persist, persist, ws_gateway
 from app.connections import manager
 from app.state import state
 from tests.test_ai_channel_review import apply, approve, setup
@@ -125,3 +127,73 @@ def test_summary_counts_shared_account_once_even_when_reports_are_out_of_order(c
     client.portal.call(make_trades)
     assert amounts(client, data) == (1000, 1000, 1000)
     assert amounts(client, second) == (1500, 1500, 1000)
+
+
+def test_robot_card_monthly_profit_uses_rolling_30_days_and_all_account_balances(client, monkeypatch):
+    data = setup(client)
+    accounts = [data["b_follow"], data["b_primary"]]
+    approve(client, data, apply(client, data, accounts)["pending"][0]["request_id"])
+    now = int(time.time()) + 40 * 86400
+    window_start = now - 30 * 86400
+    monkeypatch.setattr(ai_follow_api, "time", lambda: now)
+
+    async def send(*args):
+        return True
+
+    monkeypatch.setattr(manager, "send_to_node", send)
+
+    async def open_account(node_id, deal_id, balance):
+        dispatch = await open_round({**data, "b_follow": node_id}, f"monthly-{deal_id}")
+        await report(node_id, dispatch, deal_id, balance)
+        return dispatch["magic"]
+
+    def robot_card():
+        response = client.get("/api/ai-follow/me", headers=data["bob_h"])
+        assert response.status_code == 200, response.text
+        return response.json()["following"][0]
+
+    first_magic = client.portal.call(open_account, accounts[0], 101, 1000)
+    second_magic = client.portal.call(open_account, accounts[1], 201, 500)
+    assert robot_card()["monthly_profit_rate"] is None
+
+    client.portal.call(deal_store.save_deals, accounts[0], [
+        {"deal_id": 102, "entry_type": "OUT", "magic": first_magic,
+         "volume": 0.1, "time": window_start - 1 + 10800, "server_time_offset": 10800, "profit": 300},
+    ])
+    card = robot_card()
+    assert card["total_profit"] == 300
+    assert card["monthly_profit_rate"] == 0.0
+
+    client.portal.call(deal_store.save_deals, accounts[0], [
+        {"deal_id": 103, "entry_type": "OUT", "magic": first_magic, "volume": 0.1,
+         "time": window_start + 10800, "server_time_offset": 10800, "profit": 115, "swap": -5, "commission": -10},
+        {"deal_id": 104, "entry_type": "IN", "magic": first_magic,
+         "volume": 0.1, "time": now - 86400, "commission": -99},
+    ])
+
+    client.portal.call(deal_store.save_deals, accounts[1], [
+        {"deal_id": 202, "entry_type": "OUT_BY", "magic": second_magic,
+         "volume": 0.1, "time": now - 7200, "server_time_offset": -7200, "profit": 50},
+    ])
+    card = robot_card()
+    assert card["investment_amount"] == 1500
+    assert card["total_profit"] == 450
+    assert card["monthly_profit_rate"] == 10.0
+
+    client.portal.call(deal_store.save_deals, accounts[1], [
+        {"deal_id": 203, "entry_type": "OUT", "magic": second_magic,
+         "volume": 0.1, "time": now + 1 - 7200, "server_time_offset": -7200, "profit": 900},
+    ])
+    assert robot_card()["monthly_profit_rate"] == 10.0
+
+
+@pytest.mark.parametrize(("profit", "balance", "expected"), [
+    (0, 100, 0.0),
+    (-5, 100, -5.0),
+    (None, 100, None),
+    (5, None, None),
+    (5, 0, None),
+    (5, -100, None),
+])
+def test_monthly_profit_rate_boundaries(profit, balance, expected):
+    assert ai_robot_detail.monthly_profit_rate(profit, balance) == expected

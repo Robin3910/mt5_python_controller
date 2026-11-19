@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import time
+from math import isfinite
 from typing import Optional
 
 from sqlalchemy import and_, case, false, func, or_, select
@@ -424,6 +425,45 @@ def _magic_scope(node_magics: Optional[dict[str, set[int]]]) -> list:
         and_(Deal.node_id == node_id, Deal.magic.in_(magics))
         for node_id, magics in node_magics.items() if magics
     ])]
+
+
+async def net_profits_by_group(
+    scopes: dict[str, dict[str, set[int]]], *, now: float,
+) -> dict[str, tuple[float | None, float | None]]:
+    """按分组汇总累计和近 30 天的已实现净利润。"""
+    node_magics: dict[str, set[int]] = {}
+    for scope in scopes.values():
+        for node_id, magics in scope.items():
+            node_magics.setdefault(node_id, set()).update(magics)
+    if not any(node_magics.values()):
+        return {}
+
+    end = int(now)
+    deal_time_utc = Deal.deal_time - Deal.server_time_offset
+    net_profit = _out_profit()
+    recent_profit = case((deal_time_utc.between(end - 30 * _DAY_SECONDS, end), net_profit), else_=0.0)
+    try:
+        async with SessionLocal() as session:
+            rows = (await session.execute(
+                select(Deal.node_id, Deal.magic, func.sum(net_profit), func.sum(recent_profit))
+                .where(*_magic_scope(node_magics))
+                .group_by(Deal.node_id, Deal.magic)
+            )).all()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("net_profits_by_group failed: %s", e)
+        return {}
+
+    profits = {(node_id, magic): (float(total or 0.0), float(recent or 0.0))
+               for node_id, magic, total, recent in rows}
+    totals = {}
+    for group_id, scope in scopes.items():
+        amounts = [profits[node_id, magic] for node_id, magics in scope.items() for magic in magics
+                   if (node_id, magic) in profits]
+        if amounts:
+            total = sum(lifetime for lifetime, _ in amounts)
+            recent = sum(in_window for _, in_window in amounts)
+            totals[group_id] = (round(total, 2) if isfinite(total) else None, recent if isfinite(recent) else None)
+    return totals
 
 
 async def daily_net_profit(

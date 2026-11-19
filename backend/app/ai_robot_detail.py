@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from math import isfinite
 
 from sqlalchemy import select
 
@@ -37,6 +38,27 @@ async def group_node_magics(node_ids: list[str], group_ids: list[str]) -> dict[s
         if follow_rules.template_in_market(template_id, follow_rules.AI_MARKET_TEMPLATE_IDS):
             scopes[group_id][node_id].add(int(magic))
     return scopes
+
+
+async def net_profits_by_group(
+    pairs: set[tuple[str, str]], *, now: float,
+) -> dict[str, tuple[float | None, float | None]]:
+    if not pairs:
+        return {}
+    scopes = await group_node_magics(
+        sorted({node_id for _, node_id in pairs}), sorted({group_id for group_id, _ in pairs}),
+    )
+    return await deal_stats.net_profits_by_group({
+        group_id: {node_id: magics for node_id, magics in nodes.items() if (group_id, node_id) in pairs}
+        for group_id, nodes in scopes.items()
+    }, now=now)
+
+
+def monthly_profit_rate(recent_net_profit: float | None, balance: float | None) -> float | None:
+    if recent_net_profit is None or balance is None or balance <= 0:
+        return None
+    rate = (recent_net_profit / balance) * 100
+    return round(rate, 2) if isfinite(rate) else None
 
 
 async def build_detail(store: RedisStore, principal: Principal, entry: AiMyRobot) -> dict:

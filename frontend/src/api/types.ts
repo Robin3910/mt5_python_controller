@@ -3078,6 +3078,8 @@ export interface AiMyRobot {
   robot: AiRobotSummary
   groups: AiMyGroup[]
   investment_amount: number | null
+  total_profit: number | null
+  monthly_profit_rate: number | null
 }
 
 export interface AiMeResponse {
