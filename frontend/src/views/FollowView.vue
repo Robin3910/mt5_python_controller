@@ -1615,8 +1615,8 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
         </header>
         <div class="fd-picker-body">
           <div class="fd-picker-leader"><span class="fd-avatar">✦</span><div><b>{{ leaderName(detail.leader) }}</b><p>交易品种 {{ pickerSymbols.join(' / ') || '暂无绑定品种' }}</p></div><span v-if="pickerSymbols.length" class="fd-picker-symbol">{{ pickerSymbols.join(' / ') }}</span></div>
-          <p v-if="selectableGroups.length" class="fd-picker-label"><span>跟单分组</span><em>{{ selectableGroups.length }} 个</em><small>已全部包含</small></p>
-          <p v-if="selectableGroups.length > 1" class="fd-picker-groups">{{ selectableGroups.map(g => groupTitle(g.name, g.strategy_name ?? null)).join(' · ') }}</p>
+          <!-- <p v-if="selectableGroups.length" class="fd-picker-label"><span>跟单分组</span><em>{{ selectableGroups.length }} 个</em><small>已全部包含</small></p> -->
+          <!-- <p v-if="selectableGroups.length > 1" class="fd-picker-groups">{{ selectableGroups.map(g => groupTitle(g.name, g.strategy_name ?? null)).join(' · ') }}</p> -->
           <p class="fd-picker-label"><span>▣ 选择跟单节点</span><em>{{ detail.my_nodes.length }} 个</em><small>可多选</small></p>
           <label class="fd-picker-search"><svg viewBox="0 0 24 24"><circle cx="10" cy="10" r="6" fill="none" stroke="currentColor" stroke-width="2"/><path d="m15 15 5 5" fill="none" stroke="currentColor" stroke-width="2"/></svg><input v-model="pickerQuery" aria-label="搜索跟单节点" placeholder="搜索节点名称 / 账号" :disabled="submitting" @input="searchPicker"></label>
           <p v-if="detailPaused" class="fd-warn">{{ PAUSED_FOLLOW_HINT }}</p>
