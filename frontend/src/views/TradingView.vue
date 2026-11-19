@@ -183,10 +183,28 @@ function fmtPosTime(ts: number): string {
   return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
-// 节点全量持仓汇总（用于顶部状态条）
+// ── AI 智能加仓（逆势加仓）策略仓位 ──
+// 后端在账户快照的持仓 / 挂单上补了 `ai_template`（所属子任务的策略模版）。
+// 【当前交易】tab 只面向市价 / 限价 / 网格等普通交易；AI 逆势加仓的仓位由
+// 【AI 交易】页独立管理，这里既不展示、也不并入汇总口径，避免一键平仓 /
+// 平盈 / 删挂单误伤策略仓位。
+const AI_STRATEGY_TEMPLATE = 'tpl_1'
+
+function isAiStrategyRow(row: { ai_template?: string } | null | undefined): boolean {
+  return (row?.ai_template || '').toLowerCase() === AI_STRATEGY_TEMPLATE
+}
+
+// 节点全量持仓汇总（用于顶部状态条；已排除 AI 逆势加仓策略的仓位）
 const allPositions = computed<Position[]>(() => {
-  return account.value?.positions || []
+  return (account.value?.positions || []).filter((p) => !isAiStrategyRow(p))
 })
+/** 被隐藏的 AI 策略仓位 / 挂单笔数（仅用于给一句提示，不参与任何汇总口径） */
+const aiHiddenPositionCount = computed(
+  () => (account.value?.positions || []).filter((p) => isAiStrategyRow(p)).length,
+)
+const aiHiddenPendingCount = computed(
+  () => (account.value?.orders || []).filter((o) => isAiStrategyRow(o)).length,
+)
 const totalPosCount = computed(() => allPositions.value.length)
 const totalPosVolume = computed(() =>
   allPositions.value.reduce((a, p) => a + (p.volume || 0), 0),
@@ -205,7 +223,9 @@ const accountFreeMargin = computed(() => account.value?.free_margin ?? 0)
 // ── 未成交挂单（主节点账户快照里的 orders） ──
 // 限价开仓是「先挂单、后成交」：成交前账户里没有任何持仓，只看持仓会误判成
 // 「单没发出去」。所以挂单必须单独展示，且**不并入持仓口径**。
-const allPending = computed<PendingOrder[]>(() => account.value?.orders || [])
+const allPending = computed<PendingOrder[]>(() =>
+  (account.value?.orders || []).filter((o) => !isAiStrategyRow(o)),
+)
 const totalPendingCount = computed(() => allPending.value.length)
 const totalPendingVolume = computed(() =>
   allPending.value.reduce((a, o) => a + (o.volume || 0), 0),
@@ -517,7 +537,7 @@ const positionBooks = computed<SymbolBook[]>(() => {
   }).sort((a, b) => a.symbol.localeCompare(b.symbol))
 })
 function pendingOf(symbol: string): PendingOrder[] {
-  return (account.value?.orders || []).filter((o) => o.symbol === symbol)
+  return allPending.value.filter((o) => o.symbol === symbol)
 }
 
 // ── 挂单按品种 / 魔术号分组 ──
@@ -1378,11 +1398,13 @@ onBeforeUnmount(() => {
           <p v-if="positionBooks.length" class="tr-foot-note">
             当前持仓 {{ totalPosCount }} 笔 · 合计手数 {{ totalPosVolume.toFixed(2) }} · 浮动盈亏 {{ fmtSigned(totalPosPnl) }}
           </p>
+          <p v-if="aiHiddenPositionCount > 0" class="tr-foot-note">
+            AI 智能加仓策略另有 {{ aiHiddenPositionCount }} 笔持仓，不在本页展示（见【AI 交易】）
+          </p>
 
           <!-- ── 未成交挂单 ──
                与持仓分开一块：限价开仓成交前账户里没有任何持仓，
-               混在一起会让人误判成「单没发出去」。挂单**不并入**持仓口径。 -->
-          <div class="tr-pend-head">
+               混在一起会让人误判成「单没发出去」。挂单**不并入**持仓口径。 -->          <div class="tr-pend-head">
             <b>未成交挂单</b>
             <span v-if="pendingReported">{{ totalPendingCount }} 张 · {{ totalPendingVolume.toFixed(2) }} 手</span>
             <span v-if="!isOnline && pendingReported" class="warn">节点离线，数据可能已过期</span>
@@ -1391,7 +1413,10 @@ onBeforeUnmount(() => {
           <p v-else-if="pendingUnsupported" class="tr-empty-line">
             该节点客户端未上报挂单（版本过低），无法展示未成交挂单
           </p>
-          <p v-else-if="!pendingBooks.length" class="tr-empty-line">暂无挂单</p>
+          <p v-if="!pendingBooks.length" class="tr-empty-line">暂无挂单</p>
+          <p v-if="aiHiddenPendingCount > 0" class="tr-foot-note">
+            AI 智能加仓策略另有 {{ aiHiddenPendingCount }} 张挂单，不在本页展示（见【AI 交易】）
+          </p>
           <section v-for="book in pendingBooks" :key="`pend-${book.symbol}`" class="tr-book tr-pend-book">
             <header class="tr-book-head">
               <div>
@@ -1401,7 +1426,7 @@ onBeforeUnmount(() => {
               </div>
             </header>
             <div class="tr-grid tr-pend-grid tr-head">
-              <span>#</span><span>类型</span><span>方向</span><span>手数</span><span>挂单价</span><span>止盈/止损</span><span>挂单时间</span><span>操作</span>
+              <span>#</span><span>方向</span><span>手数</span><span>挂单价</span><span>止盈/止损</span><span>挂单时间</span><span>操作</span>
             </div>
             <template v-for="group in book.groups" :key="`pend-${book.symbol}-${group.magic}`">
               <div class="tr-magic-head">
@@ -1412,7 +1437,7 @@ onBeforeUnmount(() => {
               </div>
               <div v-for="(o, i) in pendRows(group, book.symbol)" :key="o.ticket" class="tr-grid tr-pend-grid tr-line">
                 <span class="dim">{{ i + 1 }}</span>
-                <span><i class="dir">{{ pendingKindLabel(o) }}</i></span>
+                <!-- <span><i class="dir">{{ pendingKindLabel(o) }}</i></span> -->
                 <span><i class="dir" :class="isBuySide(o.type) ? 'buy' : 'sell'">{{ fmtPosType(o.type) }}</i></span>
                 <span class="num">{{ (o.volume || 0).toFixed(2) }}</span>
                 <span class="num">{{ fmtPx(o.price_open, o.symbol) }}</span>
@@ -1640,8 +1665,8 @@ onBeforeUnmount(() => {
 .tr-book-head strong, .tr-line strong, .num { font-variant-numeric: tabular-nums; }
 .tr-grid { display: grid; align-items: center; gap: 6px; padding: 4px 12px; font-size: 11px; }
 .tr-pos-grid { grid-template-columns: 14px minmax(78px,.9fr) 28px 40px minmax(56px,1fr) minmax(58px,1fr) minmax(64px,1fr) 48px; }
-.tr-grid-grid { grid-template-columns: 36px minmax(60px,1.2fr) 40px 40px minmax(64px,1fr) 48px; }
-.tr-hist-grid { grid-template-columns: 14px minmax(78px,.9fr) 72px 28px 40px minmax(56px,1fr) minmax(56px,1fr) minmax(64px,1fr); }
+.tr-grid-grid { grid-template-columns: 22px minmax(60px,1.2fr) 40px 40px minmax(64px,1fr) 48px; }
+.tr-hist-grid { grid-template-columns: 14px minmax(78px,.9fr) minmax(44px,.7fr) 28px 40px minmax(56px,1fr) minmax(56px,1fr) minmax(64px,1fr); }
 .tr-head { color: #5B6B85; background: #0A1120; border-bottom: 1px solid #16213A; font-size: 10px; }
 .tr-line { border-bottom: 1px dashed #1B2A48; }
 .tr-line:last-of-type { border-bottom: 0; }
@@ -1649,7 +1674,7 @@ onBeforeUnmount(() => {
 .tr-pos-grid span:nth-child(3), .tr-hist-grid span:nth-child(4) { text-align: center; }
 .tr-magic-col { text-align: right; font-variant-numeric: tabular-nums; color: #93C5FD; }
 .dim { color: #8B96A8; }
-.dir { display: inline-flex; min-width: 20px; height: 15px; align-items: center; justify-content: center; border-radius: 3px; font-style: normal; font-size: 10px; font-weight: 700; }
+.dir { display: inline-flex; min-width: 14px; height: 15px; align-items: center; justify-content: center; border-radius: 3px; font-style: normal; font-size: 10px; font-weight: 700; white-space: nowrap; }
 .dir.buy, .dir.green { color: #22C55E; background: rgba(34,197,94,.15); }
 .dir.sell, .dir.red { color: #F6465D; background: rgba(246,70,93,.15); }
 .sltp { text-align: right; line-height: 1.2; }
