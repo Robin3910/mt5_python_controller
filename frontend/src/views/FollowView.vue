@@ -54,7 +54,6 @@ const keyword = ref('')
 const detail = ref<FollowDetailResponse | null>(null)
 const detailLoading = ref(false)
 const selectedNodes = ref<string[]>([])
-const selectedGroupIds = ref<string[]>([])
 const submitting = ref(false)
 const pickerOpen = ref(false)
 const pickerQuery = ref('')
@@ -218,7 +217,6 @@ function refreshFollow(): void {
 async function openLeader(l: FollowLeaderSummary) {
   detailLoading.value = true
   selectedNodes.value = []
-  selectedGroupIds.value = []
   try {
     detail.value = await fetchLeaderDetail(l.leader_user_id, perfWindow.value)
   } catch (e) {
@@ -232,17 +230,13 @@ async function openLeader(l: FollowLeaderSummary) {
 const selectableGroups = computed(() =>
   (detail.value?.groups ?? []).filter((g) => g.selectable),
 )
-/** 多个分组必须手选，不预勾全部；只有一个可跟分组时直接用它。 */
-const targetGroupIds = computed(() => {
-  if (selectableGroups.value.length <= 1) return selectableGroups.value.map((g) => g.group_id)
-  return selectedGroupIds.value.filter((id) => selectableGroups.value.some((g) => g.group_id === id))
-})
-
-function toggleGroup(id: string): void {
-  const next = new Set(selectedGroupIds.value)
-  next.has(id) ? next.delete(id) : next.add(id)
-  selectedGroupIds.value = [...next]
-}
+/**
+ * 目标分组 = 全部可跟分组。
+ *
+ * 早期让客户在弹窗里手选分组，学习成本高且容易漏选（跟了一半才发现少了一组）。
+ * 「跟单」是节点级语义：勾了节点就是这几组全跟，所以直接默认全选，不再暴露分组勾选。
+ */
+const targetGroupIds = computed(() => selectableGroups.value.map((g) => g.group_id))
 
 /** 跟自己的带单时，主节点已是带单源成员，不能再作为跟单节点加入同一分组。 */
 function isOwnSourceNode(id: string): boolean {
@@ -475,9 +469,6 @@ async function retryApplication(row: FollowApplication): Promise<void> {
   const leader = leaders.value.find(item => item.leader_user_id === row.leader_user_id)
   if (!leader) { ElMessage.warning('该带单员目前未开放跟单'); return }
   await openFollowPicker(leader)
-  if (selectableGroups.value.length > 1 && selectableGroups.value.some((g) => g.group_id === row.group_id)) {
-    selectedGroupIds.value = [row.group_id]
-  }
   if (isNodeSelectable(row.node_id)) selectedNodes.value = [row.node_id]
 }
 function groupIsRunning(entry: MyFollowingEntry, groupId: string): boolean {
@@ -1624,15 +1615,8 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
         </header>
         <div class="fd-picker-body">
           <div class="fd-picker-leader"><span class="fd-avatar">✦</span><div><b>{{ leaderName(detail.leader) }}</b><p>交易品种 {{ pickerSymbols.join(' / ') || '暂无绑定品种' }}</p></div><span v-if="pickerSymbols.length" class="fd-picker-symbol">{{ pickerSymbols.join(' / ') }}</span></div>
-          <template v-if="selectableGroups.length > 1">
-            <p class="fd-picker-label"><span>选择跟单分组</span><em>{{ selectableGroups.length }} 个</em><small>可多选</small></p>
-            <div class="fd-picker-list fd-group-list">
-              <label v-for="g in selectableGroups" :key="g.group_id" class="fd-pick" :class="{ on: selectedGroupIds.includes(g.group_id) }">
-                <input type="checkbox" :checked="selectedGroupIds.includes(g.group_id)" :disabled="submitting" :aria-label="`选择分组 ${groupTitle(g.name, g.strategy_name ?? null)}`" @change="toggleGroup(g.group_id)">
-                <span class="fd-pick-info"><b>{{ groupTitle(g.name, g.strategy_name ?? null) }}</b><small>{{ g.symbol || '未绑定品种' }} · {{ g.follower_count }} 个节点跟随</small></span>
-              </label>
-            </div>
-          </template>
+          <p v-if="selectableGroups.length" class="fd-picker-label"><span>跟单分组</span><em>{{ selectableGroups.length }} 个</em><small>已全部包含</small></p>
+          <p v-if="selectableGroups.length > 1" class="fd-picker-groups">{{ selectableGroups.map(g => groupTitle(g.name, g.strategy_name ?? null)).join(' · ') }}</p>
           <p class="fd-picker-label"><span>▣ 选择跟单节点</span><em>{{ detail.my_nodes.length }} 个</em><small>可多选</small></p>
           <label class="fd-picker-search"><svg viewBox="0 0 24 24"><circle cx="10" cy="10" r="6" fill="none" stroke="currentColor" stroke-width="2"/><path d="m15 15 5 5" fill="none" stroke="currentColor" stroke-width="2"/></svg><input v-model="pickerQuery" aria-label="搜索跟单节点" placeholder="搜索节点名称 / 账号" :disabled="submitting" @input="searchPicker"></label>
           <p v-if="detailPaused" class="fd-warn">{{ PAUSED_FOLLOW_HINT }}</p>
@@ -1647,8 +1631,8 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
           </div>
         </div>
         <footer>
-          <div class="fd-picker-buttons"><button type="button" class="fd-picker-cancel" :disabled="submitting" @click="closePicker">取消</button><button type="button" class="primary" :disabled="submitting || detailPaused || !targetGroupIds.length || !selectedNodes.some(isNodeSelectable)" @click="submitJoin">{{ submitting ? '提交中…' : selectableGroups.length > 1 ? `⇄ 申请 ${targetGroupIds.length} 个分组` : `⇄ 使用 ${selectedNodes.length} 个节点跟单` }}</button></div>
-          <p>{{ selectableGroups.length > 1 ? '先勾选分组，再勾选节点。只为勾选的分组提交申请。' : '可同时勾选多个节点，审核通过后同步所选分组的策略信号' }}</p>
+          <div class="fd-picker-buttons"><button type="button" class="fd-picker-cancel" :disabled="submitting" @click="closePicker">取消</button><button type="button" class="primary" :disabled="submitting || detailPaused || !targetGroupIds.length || !selectedNodes.some(isNodeSelectable)" @click="submitJoin">{{ submitting ? '提交中…' : `⇄ 使用 ${selectedNodes.length} 个节点跟单` }}</button></div>
+          <p>{{ selectableGroups.length > 1 ? `可同时勾选多个节点，所选节点将跟随该带单员的全部 ${selectableGroups.length} 个分组` : '可同时勾选多个节点，审核通过后同步所选分组的策略信号' }}</p>
         </footer>
       </section>
     </div>
@@ -1892,7 +1876,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 .fd-picker-label>span { color: #cbd5e1; }.fd-picker-label>em { color: #7f8da5; font-style: normal; border: 1px solid #263047; border-radius: 12px; padding: 1px 6px; font-size: 10px; }.fd-picker-label>small { color: #22d3ee; font-size: 10px; }
 .fd-picker-search { display: flex; gap: 8px; align-items: center; border: 1px solid #263047; border-radius: 7px; padding: 8px 10px; background: #090f19; }.fd-picker-search svg { width: 14px; height: 14px; color: #64748b; }.fd-picker-search input { width: 100%; min-width: 0; border: 0; outline: none; background: transparent; color: #e2e8f0; font: inherit; font-size: 12px; }
 .fd-picker-list { max-height: 224px; overflow-y: auto; margin-top: 8px; padding-right: 5px; scrollbar-width: thin; scrollbar-color: #4b347c #141c2a; }
-.fd-group-list { max-height: 132px; }
+.fd-picker-groups { margin: 0 0 2px; padding: 7px 10px; border: 1px dashed #263047; border-radius: 8px; background: #111a2a; color: #a5b4c9; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
 .fd-picker-list .fd-pick { min-height: 56px; margin: 0 0 6px; padding: 9px 10px; cursor: pointer; gap: 7px; }.fd-picker-list .fd-pick.on { background: #23173d; box-shadow: inset 0 0 0 1px #7c3aed55; }.fd-picker-list input { width: 16px; height: 16px; margin: 0; accent-color: #7c3aed; flex-shrink: 0; }.fd-pick-info { min-width: 0; }.fd-pick-info>b { font-size: 13px; }.fd-pick-info em { display: inline-block; border: 1px solid #785b1e; border-radius: 4px; background: #4b3819; color: #fbbf24; font-size: 9px; padding: 1px 4px; font-style: normal; vertical-align: middle; }.fd-pick-info small { font-size: 10px; margin-top: 3px; overflow-wrap: anywhere; }.fd-pick-info .fd-pick-hint { color: #fbbf24; }.fd-online-dot { width: 7px; height: 7px; flex-shrink: 0; background: #64748b; border-radius: 50%; }.fd-online-dot.online { background: #22c55e; box-shadow: 0 0 5px #22c55e55; }
 .fd-dialog>footer { display: block; padding: 12px 16px; border-top: 1px solid #263047; flex-shrink: 0; }.fd-picker-buttons { display: flex; gap: 8px; }.fd-picker-cancel { flex: 1; border: 1px solid #263047; background: #111a2a; color: #a0aec0; border-radius: 10px; padding: 11px; }.fd-picker-buttons .primary { flex: 2; padding: 11px; background: linear-gradient(100deg,#7c3aed,#2563eb); font-weight: 600; box-shadow: 0 4px 12px #7c3aed33; }.fd-dialog button:disabled { opacity: .45; cursor: not-allowed; }.fd-dialog>footer>p { text-align: center; font-size: 10px; margin-top: 9px; line-height: 1.5; }.fd-picker-list .fd-pick.off { cursor: not-allowed; }.fd-pending { color: #fbbf24!important; background: #78350f33; border: 1px solid #92400e55; }.fd-application-node { font-size: 11px; color: #a5b4c9; margin-bottom: 4px; }.fd-application-node span { color: #fbbf24; font-size: 10px; }.fd-application-note { color: #94a3b8; font-size: 11px; margin: 8px 0; }.fd-applications .fd-item>button { padding: 2px 0; }
 .fd-picker-search input { height: 16px; padding: 0; line-height: 16px; box-shadow: none; }
