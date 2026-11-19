@@ -37,8 +37,6 @@ interface MyFollowedNode {
 interface MyFollowingEntry {
   leader: FollowLeaderSummary
   marketable: boolean
-  /** 不可跟单的人读原因（带单员已撤销 / 切换主节点 / 不在本市场等） */
-  unmarketable_reason?: string | null
   nodes: MyFollowedNode[]
   /** 我在该 leader 下跟的分组（分组级活跃任务数只此一份，不能按节点重复累加） */
   groups: { group_id: string; group_name: string | null; active_task_count: number; symbol: string | null; strategy_name: string | null }[]
@@ -347,14 +345,23 @@ async function doLeave(
  * 关键：同一节点可能在同一 leader 的**多个分组**下被跟随，
  * 所以聚合时必须记全该节点所属的全部分组 —— 移出时要一次性全清，
  * 只清一个分组会残留「半个跟单」状态（仍在其它分组收信号）。
+ *
+ * 两类分组**不进【带单】列表**：
+ *   ① **AI 市场（tpl_1）** —— 两个市场共用同一张关系表，AI 跟单归
+ *      【AI 交易】页管，在这里展示会让客户以为在带单市场里跟。
+ *      按后端给的 `market === 'ai'` 判定（后端已把模版解析好，前端不认模版白名单）。
+ *   ② **已失效 / 已移出** —— 后端 `my_following` 返回的是关系表里的**存量关系**，
+ *      分组被禁用、换主节点、带单员下架后关系仍保留（便于清理），但已不再对外接单。
+ *
+ * 「暂停」不属于失效：暂停保留关系与在跑任务，只是这个带单员不再接新单，
+ * 所以**仍然展示**（标「已暂停」），由后端的 `paused` 字段区分。
  */
 const myFollowing = computed<MyFollowingEntry[]>(() =>
-  mine.value.following.map((f) => {
+  mine.value.following.flatMap((f) => {
+    const liveGroups = f.groups.filter((g) => g.market !== 'ai' && (g.marketable || g.paused))
+    if (!liveGroups.length) return []
     const nodesById = new Map<string, MyFollowedNode>()
-    // 取任一分组的不可跟单原因（同一 leader 多分组时原因通常一致）
-    let unmarketableReason: string | null = null
-    for (const g of f.groups) {
-      if (!g.marketable && g.unmarketable_reason) unmarketableReason = g.unmarketable_reason
+    for (const g of liveGroups) {
       for (const n of g.my_nodes) {
         const prev = nodesById.get(n.node_id)
         if (prev) {
@@ -391,9 +398,8 @@ const myFollowing = computed<MyFollowingEntry[]>(() =>
     return {
       leader: f.leader,
       marketable: f.leader.marketable,
-      unmarketable_reason: unmarketableReason,
       nodes: [...nodesById.values()].sort((a, b) => a.node_id.localeCompare(b.node_id)),
-      groups: f.groups.map((g) => ({
+      groups: liveGroups.map((g) => ({
         group_id: g.group_id,
         group_name: g.group_name ?? null,
         active_task_count: g.active_task_count,
@@ -404,12 +410,29 @@ const myFollowing = computed<MyFollowingEntry[]>(() =>
   }),
 )
 
+/**
+ * AI 智能加仓策略模版 ID（与后端 strategy_templates.TEMPLATE_1_ID 对齐）。
+ * AI 市场（tpl_1）的跟单归【AI 交易】页管，带单列表里一律不展示。
+ */
+const AI_TEMPLATE_ID = 'tpl_1'
+function isAiApplication(row: FollowApplication): boolean {
+  return (row.template_id || '').toLowerCase() === AI_TEMPLATE_ID
+}
+
 const occupiedPairs = computed(() => {
   const pairs = new Set<string>()
   for (const leader of mine.value.following) {
-    for (const group of leader.groups) for (const node of group.my_nodes) pairs.add(`${group.group_id}:${node.node_id}`)
+    // AI 市场（tpl_1）的关系归【AI 交易】页管，不参与带单侧的「已跟随」判定
+    for (const group of leader.groups) {
+      if (group.market === 'ai') continue
+      for (const node of group.my_nodes) pairs.add(`${group.group_id}:${node.node_id}`)
+    }
   }
-  for (const row of mine.value.applications || []) if (row.status === 'pending') pairs.add(`${row.group_id}:${row.node_id}`)
+  for (const row of mine.value.applications || []) {
+    if (row.status !== 'pending') continue
+    if (isAiApplication(row)) continue
+    pairs.add(`${row.group_id}:${row.node_id}`)
+  }
   return pairs
 })
 const pickerNodes = computed(() => {
@@ -418,10 +441,25 @@ const pickerNodes = computed(() => {
     !needle || [node.name, node.node_id, node.mt5_login].some(value => String(value ?? '').toLowerCase().includes(needle)))
 })
 const pickerSymbols = computed(() => [...new Set((detail.value?.groups || []).filter(group => group.selectable).map(group => group.symbol).filter(Boolean))])
+/**
+ * 跟单申请按带单员聚合。
+ *
+ * 「已移出 / 失效」的申请（status = cancelled，或后端标了 available=false，或
+ * 理由写明分组/机器人已失效）与跟单列表口径一致 —— 不再展示，避免客户误以为
+ * 还有一个在跑的跟单。
+ */
+function isDeadApplication(row: FollowApplication): boolean {
+  if (row.status === 'pending') return false
+  if (row.status === 'cancelled' || row.available === false) return true
+  return /已移出|已失效/.test(row.reason || '')
+}
+/** AI 市场（tpl_1）的跟单申请归【AI 交易】页管，带单列表里不展示。 */
 const applicationGroups = computed(() => {
   const grouped = new Map<number, { leader_user_id: number; leader_name: string; nodes: FollowApplication[] }>()
   for (const row of mine.value.applications || []) {
     if (row.status === 'approved') continue
+    if (isDeadApplication(row)) continue
+    if (isAiApplication(row)) continue
     if (!grouped.has(row.leader_user_id)) grouped.set(row.leader_user_id, { leader_user_id: row.leader_user_id, leader_name: row.leader_name, nodes: [] })
     grouped.get(row.leader_user_id)!.nodes.push(row)
   }
@@ -1387,19 +1425,19 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
               <div>
                 <p>
                   <b>{{ leaderName(entry.leader) }}</b>
-                  <svg v-if="entry.marketable" class="fd-verified" viewBox="0 0 24 24"><path fill="currentColor" d="m12 2 2.4 2.2 3.2-.6.8 3.1 2.9 1.5-1.1 3 1.1 3-2.9 1.5-.8 3.1-3.2-.6L12 22l-2.4-2.2-3.2.6-.8-3.1L2.7 15.8l1.1-3-1.1-3 2.9-1.5.8-3.1 3.2.6z"/></svg>
-                  <em v-if="entry.marketable" class="ok">已认证</em>
-                  <em v-else class="pause">已结束</em>
+                  <svg class="fd-verified" viewBox="0 0 24 24"><path fill="currentColor" d="m12 2 2.4 2.2 3.2-.6.8 3.1 2.9 1.5-1.1 3 1.1 3-2.9 1.5-.8 3.1-3.2-.6L12 22l-2.4-2.2-3.2.6-.8-3.1L2.7 15.8l1.1-3-1.1-3 2.9-1.5.8-3.1 3.2.6z"/></svg>
+                  <em v-if="entry.leader.follow_paused" class="pause">已暂停</em>
+                  <em v-else class="ok">已认证</em>
                 </p>
                 <small>{{ entry.groups.map((g) => g.symbol || g.strategy_name || g.group_name).filter(Boolean).join(' · ') || '跟随分组' }}</small>
               </div>
               <div class="fd-card-side">
-                <em :class="entry.marketable ? 'on' : 'off'"><i></i>{{ entry.nodes.length }} 个节点</em>
+                <em class="on"><i></i>{{ entry.nodes.length }} 个节点</em>
                 <button type="button" class="fd-link" @click="openShowcase(entry.leader, 'mine')">查看详情</button>
                 <button type="button" class="fd-link" @click="openLeaveDialog(entry.leader)">移出节点</button>
               </div>
             </header>
-            <p v-if="entry.unmarketable_reason" class="fd-empty">{{ entry.unmarketable_reason }}</p>
+            <p v-if="entry.leader.follow_paused" class="fd-warn">{{ PAUSED_FOLLOW_HINT }}</p>
             <div v-for="node in applicationRows(entry.leader.leader_user_id)" :key="'request-' + node.request_id" class="fd-item">
               <div class="fd-item-top"><p><b>{{ node.strategy_name || node.group_name || '跟单申请' }}</b><em v-if="node.symbol">{{ node.symbol }}</em></p><em :class="node.status === 'pending' ? 'fd-pending' : 'off'">{{ node.status === 'pending' ? '待通过' : node.status === 'rejected' ? '已拒绝' : '已移出 / 失效' }}</em></div>
               <p class="fd-application-node">{{ node.name || node.node_id }} <span v-if="node.is_primary">主节点</span> · {{ node.mt5_login || node.node_id }}</p>

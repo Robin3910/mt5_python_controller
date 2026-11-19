@@ -1251,6 +1251,80 @@ def test_my_following_marks_ai_group_unmarketable(client):
     assert "AI" in groups[0]["unmarketable_reason"]
 
 
+def test_my_following_marks_ai_group_market_key(client):
+    """存量 AI 关系在响应里带 market='ai' —— 前端据此把它从【跟单列表】摘掉。
+
+    两个市场共用同一张跟单关系表，前端没有模版白名单知识，
+    必须由后端把「这个分组属于哪个市场」判好再下发。
+    """
+    admin_h = _login(client, "admin")
+    alice, bob, a_primary, b_follow, ai_group, grid_group = _setup_ai_leader(client, admin_h)
+
+    bob_h = _login(client, "bob")
+    assert client.post(
+        "/api/ai-follow/join",
+        json={"leader_user_id": alice["id"], "group_ids": [ai_group],
+              "node_ids": [b_follow]},
+        headers=bob_h,
+    ).status_code == 200
+    _approve_pending(client, _login(client, "alice"))
+
+    # 再跟一个带单市场（tpl_3）的分组，验证两个市场键是分开的
+    assert client.post(
+        "/api/follow/join",
+        json={"leader_user_id": alice["id"], "group_ids": [grid_group],
+              "node_ids": [b_follow]},
+        headers=bob_h,
+    ).status_code == 200
+    approve_follow_requests(client)
+
+    r = client.get("/api/follow/me", headers=bob_h)
+    assert r.status_code == 200, r.text
+    groups = {g["group_id"]: g for f in r.json()["following"] for g in f["groups"]}
+
+    assert groups[ai_group]["market"] == "ai", "AI 分组必须标 ai"
+    assert groups[ai_group]["strategy_template"] == "tpl_1"
+    assert groups[grid_group]["market"] == "follow", "带单市场分组标 follow"
+    assert groups[grid_group]["strategy_template"] == "tpl_3"
+    assert groups[grid_group]["marketable"] is True
+
+
+def test_my_following_paused_group_stays_visible(client):
+    """带单员暂停带单 -> 分组 paused=true 且仍可在【跟单列表】看到。
+
+    暂停只表示「不接新单」，存量关系与在跑任务都还在 ——
+    与「已失效」（能力撤销 / 换主节点 / 分组禁用）必须区分开。
+    """
+    admin_h = _login(client, "admin")
+    alice, bob, a_primary, b_follow, ai_group, grid_group = _setup_ai_leader(client, admin_h)
+
+    bob_h = _login(client, "bob")
+    assert client.post(
+        "/api/follow/join",
+        json={"leader_user_id": alice["id"], "group_ids": [grid_group],
+              "node_ids": [b_follow]},
+        headers=bob_h,
+    ).status_code == 200
+    approve_follow_requests(client)
+
+    # alice 暂停带单
+    alice_h = _login(client, "alice")
+    p = client.post(
+        "/api/follow/pause",
+        json={"leader_user_id": alice["id"], "paused": True},
+        headers=alice_h,
+    )
+    assert p.status_code == 200, p.text
+
+    r = client.get("/api/follow/me", headers=bob_h)
+    assert r.status_code == 200, r.text
+    groups = {g["group_id"]: g for f in r.json()["following"] for g in f["groups"]}
+    g = groups[grid_group]
+    assert g["paused"] is True, "暂停的分组要标 paused"
+    assert g["marketable"] is False
+    assert g["unmarketable_reason"] == "该带单员已暂停带单，不再接收新的跟单"
+
+
 # ---------------------------------------------------------------------------
 # 「已跟」计数必须按市场隔离（本市场内我已跟的分组/节点数）
 # ---------------------------------------------------------------------------

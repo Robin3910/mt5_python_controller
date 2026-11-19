@@ -77,6 +77,20 @@ def market_for_template(template_id: object | None) -> frozenset[str]:
     return frozenset()
 
 
+def market_key_of(template_id: object | None) -> str:
+    """分组所属市场的人读键：follow / ai / unknown。
+
+    与 market_for_template 同源，只是把 frozenset 压成一个字符串，便于
+    直接写进接口响应给前端判断（前端不需要知道模版白名单的细节）。
+    """
+    tid = str(template_id or "").strip().lower()
+    if tid == strategy_templates.TEMPLATE_1_ID:
+        return "ai"
+    if tid in (strategy_templates.TEMPLATE_2_ID, strategy_templates.TEMPLATE_3_ID):
+        return "follow"
+    return "unknown"
+
+
 # ---------------------------------------------------------------------------
 # 暂停接单（两个市场各一个开关）
 # ---------------------------------------------------------------------------

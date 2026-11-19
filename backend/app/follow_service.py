@@ -19,7 +19,7 @@ from sqlalchemy import delete, func, select
 
 from .db import SessionLocal
 from .group_service import _load_group
-from .orm import GroupFollowerNode, Node
+from .orm import GroupFollowerNode, Node, TradingStrategy
 from .redis_store import RedisStore
 
 logger = logging.getLogger(__name__)
@@ -53,6 +53,28 @@ def _template_ids_of(strategies: dict[str, dict]) -> dict[str, str]:
     缺失的策略（已删除）不会出现在入参里，调用方据此把分组判为不可跟（保守）。
     """
     return {sid: str(st.get("template_id") or "") for sid, st in strategies.items()}
+
+
+async def template_ids_from_db(strategy_ids: set[str]) -> dict[str, str]:
+    """回源查库补齐 Redis 策略缓存里缺失的模版 ID。
+
+    模版 ID 决定分组属于哪个跟单市场（tpl_1 -> AI 交易，tpl_2/tpl_3 -> 带单），
+    缓存缺失时若不补齐，AI 分组会被误判成普通带单分组而混进【跟单列表】。
+    只补缺失的那几个，不整表扫。
+    """
+    missing = {str(sid) for sid in strategy_ids if sid}
+    if not missing:
+        return {}
+    try:
+        async with SessionLocal() as s:
+            rows = (await s.execute(
+                select(TradingStrategy.strategy_id, TradingStrategy.template_id)
+                .where(TradingStrategy.strategy_id.in_(missing))
+            )).all()
+        return {str(sid): str(tid or "") for sid, tid in rows}
+    except Exception as e:  # noqa: BLE001
+        logger.warning("template_ids_from_db failed: %s", e)
+        return {}
 
 
 def _row_to_dict(row: GroupFollowerNode) -> dict:

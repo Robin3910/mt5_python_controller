@@ -2948,6 +2948,15 @@ export interface FollowMyGroup {
   group_name: string | null
   symbol: string | null
   strategy_name: string | null
+  /** 分组绑定的策略模版（tpl_1 / tpl_2 / tpl_3）；未绑策略或策略已删为 null */
+  strategy_template?: string | null
+  /**
+   * 该分组属于哪个跟单市场：`follow`（带单）/ `ai`（AI 交易）/ `unknown`。
+   * `ai` 的跟单归【AI 交易】页管，【带单】列表里不展示。
+   */
+  market?: string
+  /** 带单员暂停带单（关系仍有效，只是不再收新信号）—— 与「已失效」区分 */
+  paused?: boolean
   marketable: boolean
   unmarketable_reason: string | null
   active_task_count: number
@@ -2979,6 +2988,8 @@ export interface FollowApplication {
   group_name: string | null
   strategy_name: string | null
   symbol: string | null
+  /** 申请快照里记录的策略模版（tpl_1 / tpl_2 / tpl_3）；用于区分市场 */
+  template_id?: string | null
   status: 'pending' | 'approved' | 'rejected' | 'cancelled'
   source: 'join' | 'inherit' | 'legacy'
   reason: string | null

@@ -26,6 +26,7 @@ from . import (
     permissions,
     persist,
     rbac_service,
+    strategy_templates,
     user_service,
 )
 from .deps import client_ip, get_store, require_menu
@@ -462,6 +463,12 @@ async def list_my_followings(
     # 跟单市场判定所需的模版快照（存量 AI 分组的关系仍在，只是标不可跟）
     strategies = await _strategies_of(list(all_groups.values()), store)
     tmpl_map = _template_ids_of(strategies)
+    # Redis 策略缓存缺项时回源补齐：模版 ID 决定分组属于哪个市场
+    # （tpl_1 -> AI 交易，tpl_2/tpl_3 -> 带单），补不齐会把 AI 分组
+    # 误当成普通带单分组混进【跟单列表】。
+    tmpl_map.update(await follow_service.template_ids_from_db({
+        str(g.get("strategy_id") or "") for g in all_groups.values() if g.get("strategy_id")
+    } - set(tmpl_map.keys())))
 
     by_leader: dict[int, list[dict]] = {}
     for f in followings:
@@ -487,19 +494,34 @@ async def list_my_followings(
             g = all_groups.get(gid)
             if not g:
                 continue  # 分组已被删除（理论上 delete_group 已级联），跳过
-            reason = follow_rules.marketable_reason(
+            # 分组是否**已死**（能力撤销 / 换主节点 / 模版不在本市场 / 分组禁用）。
+            # 先不带 paused 判一次：暂停只是「不接新单」，关系与在跑任务都还在，
+            # 与「已死」必须区分 —— 前端据此决定是暂停展示还是直接隐藏。
+            dead_reason = follow_rules.marketable_reason(
                 g, has_cap, primary.get("node_id") if primary else None,
                 template_id=tmpl_map.get(str(g.get("strategy_id") or "")),
                 market=follow_rules.FOLLOW_MARKET_TEMPLATE_IDS,
-                # 带单员暂停带单 -> 存量关系保留但标不可再收新信号
-                paused=bool(getattr(user, "follow_paused", False)),
+                paused=False,
             )
+            leader_paused = bool(getattr(user, "follow_paused", False))
+            if dead_reason is not None:
+                reason, paused = dead_reason, False
+            elif leader_paused:
+                reason, paused = follow_rules.PAUSED_FOLLOW_REASON, True
+            else:
+                reason, paused = None, False
             node_ids = {f["node_id"] for f in fs}
+            template_id = tmpl_map.get(str(g.get("strategy_id") or ""))
             groups_out.append({
                 "group_id": gid,
                 "group_name": g.get("name"),
                 "symbol": (strategies.get(g.get("strategy_id")) or {}).get("symbol") or g.get("strategy_symbol"),
                 "strategy_name": (strategies.get(g.get("strategy_id")) or {}).get("name") or g.get("strategy_name"),
+                # 模版 / 市场：前端据此把 AI 市场（tpl_1）的关系从【带单】列表里摘掉
+                "strategy_template": template_id or None,
+                "market": follow_rules.market_key_of(template_id),
+                # 暂停 = 关系仍有效，只是这个带单员不再对外接单（与「已失效」不同）
+                "paused": paused,
                 "marketable": reason is None,
                 "unmarketable_reason": reason,
                 "active_task_count": active_counts.get(gid, 0),
@@ -545,7 +567,12 @@ async def list_my_followings(
             "following_count": len(by_leader),
             # 计数也只算带单市场的关系（与 leader 上的口径一致）
             "follow_node_count": market_node_total,
-            "pending_node_count": len({r["node_id"] for r in applications if r["status"] == "pending"}),
+            # 待审核节点数同样只算带单市场 —— AI 市场（tpl_1）的申请归【AI 交易】页
+            "pending_node_count": len({
+                r["node_id"] for r in applications
+                if r["status"] == "pending"
+                and str(r.get("template_id") or "") != strategy_templates.TEMPLATE_1_ID
+            }),
         },
     )
 

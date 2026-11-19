@@ -1516,6 +1516,15 @@ class FollowMyGroup(BaseModel):
     symbol: Optional[str] = None
     strategy_id: Optional[str] = None
     strategy_name: Optional[str] = None
+    # 分组绑定的策略模版（tpl_1 / tpl_2 / tpl_3）；未绑策略或策略已删为 None。
+    # 前端据此把 **AI 市场（tpl_1）** 的跟单从【带单】列表里摘掉 ——
+    # 那是【AI 交易】页的职责，两个市场共用同一张关系表。
+    strategy_template: Optional[str] = None
+    # 该分组属于哪个跟单市场：follow（带单）/ ai（AI 交易）/ unknown（未绑策略）。
+    market: str = "unknown"
+    # 带单员**暂停**带单（关系仍有效，只是不再收新信号）—— 与「已失效」区分开，
+    # 前端据此决定是暂停展示还是直接隐藏。
+    paused: bool = False
     marketable: bool = True
     unmarketable_reason: Optional[str] = None
     active_task_count: int = 0

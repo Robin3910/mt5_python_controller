@@ -4,6 +4,38 @@ import pathlib
 
 _TEST_DB = pathlib.Path(__file__).resolve().parent / "_test_api.db"
 
+
+def _acquire_test_db_lock(db_path: pathlib.Path):
+    """给共享测试库加一把进程锁，挡住并发跑的 pytest。
+
+    全部 API 用例共用这一个 sqlite 文件，所以**并发跑两批 pytest 会互相清库**：
+    两个进程各自 reset/drop 同一个文件，被清空的那批用例会读到别人的数据，
+    表现为「随机一批用例莫名其妙失败」，很容易被误判成代码回归。
+    拿不到锁就明确报错，而不是让人去猜。
+    """
+    lock_path = db_path.with_suffix(".lock")
+    handle = open(lock_path, "w")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        handle.close()
+        # 英文报错：Windows 控制台默认 codepage 装不下中文，CI 日志里会是乱码，
+        # 反而看不出在说什么。中文解释留在 docstring 里。
+        raise RuntimeError(
+            f"Another pytest process is already using test DB {db_path.name}. "
+            "Wait for it to finish before starting a new run "
+            "(all API tests share one sqlite file; concurrent runs wipe each other's data)."
+        ) from e
+    return handle
+
+
+_lock_fd = _acquire_test_db_lock(_TEST_DB)
+
 os.environ.setdefault("MYSQL_DSN", f"sqlite+aiosqlite:///{_TEST_DB.as_posix()}")
 os.environ.setdefault("JWT_SECRET", "test_secret")
 os.environ.setdefault("ADMIN_USER", "admin")
