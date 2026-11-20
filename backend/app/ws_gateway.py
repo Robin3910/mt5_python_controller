@@ -490,7 +490,7 @@ async def _on_trade_result(node_id: str, data: dict) -> None:
 
     handled = await group_persist.update_dispatch_result(
         node_id=node_id, result=data, dispatch_id=dispatch_id,
-        task_id=data.get("task_id"), signal_id=signal_id,
+        task_id=data.get("task_id"), signal_id=signal_id, opening_balance=balance_before_open,
     )
     if handled is None:
         status = "done" if data.get("success") else "failed"

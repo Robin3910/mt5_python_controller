@@ -1199,9 +1199,13 @@ class GroupDispatcher:
             if blocked is not None:
                 return blocked
 
+        follower_id = None
+        if (command.get("strategy") or {}).get("template_id") in follow_rules.FOLLOW_MARKET_TEMPLATE_IDS:
+            follower_id = next((f.get("follower_user_id") for f in group.get("followers") or []
+                                if f.get("node_id") == node_id), None)
         try:
             return await self._dispatch_locked_node(
-                base, command, hold_busy=not concurrent,
+                base, command, hold_busy=not concurrent, follower_id=follower_id,
             )
         except Exception as e:  # noqa: BLE001
             # 抢到占位后中途出错：立刻放开，否则要等 TTL 才能再下发
@@ -1328,17 +1332,17 @@ class GroupDispatcher:
             "volume": volume, "reason": reason,
         }
 
-    async def _dispatch_locked_node(self, base: dict, command: dict, *, hold_busy: bool = True) -> dict:
+    async def _dispatch_locked_node(self, base: dict, command: dict, *, hold_busy: bool = True, follower_id: int | None = None) -> dict:
         async with node_lifecycle.locked(node_lifecycle.node_key(base["node_id"])):
             if await self.store.get_node(base["node_id"]) is None:
                 if hold_busy:
                     await self.store.release_group_node_busy(base["group_id"], base["node_id"])
                 return {"node_id": base["node_id"], "status": "skipped", "magic": None,
                         "volume": base["decided_vol"], "reason": "节点已删除"}
-            return await self._dispatch_locked_node_active(base, command, hold_busy=hold_busy)
+            return await self._dispatch_locked_node_active(base, command, hold_busy=hold_busy, follower_id=follower_id)
 
     async def _dispatch_locked_node_active(
-        self, base: dict, command: dict, *, hold_busy: bool = True,
+        self, base: dict, command: dict, *, hold_busy: bool = True, follower_id: int | None = None,
     ) -> dict:
         """下发已通过互斥门禁的节点：建子任务拿魔术号 -> 发命令。
 
@@ -1352,7 +1356,7 @@ class GroupDispatcher:
             strategy_snap.get("rules"),
         ) is not None
         created = await group_persist.create_dispatch(
-            **base, hold_when_empty=hold_when_empty,
+            **base, hold_when_empty=hold_when_empty, follower_id=follower_id,
         )
         if created is None:
             if hold_busy:
@@ -1376,7 +1380,7 @@ class GroupDispatcher:
         cmd = for_node(command, dispatch_id=dispatch_id, magic=magic)
         follow_settings = created.get("follow_settings")
         cmd["strategy"] = ai_follow_settings.apply_settings(cmd.get("strategy") or {}, follow_settings)
-        if (follow_settings or {}).get("application_id"):
+        if follower_id is not None or (follow_settings or {}).get("application_id"):
             cmd["entry"] = {**cmd["entry"], "capture_balance_before_open": True}
         # 发包时刻：逐节点各记一次（同步模式下各节点的命令是分别发出的，
         # 记同一个时间会掩盖节点间的先后差）。跨节点唯一可比的时间轴。

@@ -875,6 +875,7 @@ class GroupTaskDispatch(Base):
     deal: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     price: Mapped[float | None] = mapped_column(Float, nullable=True)
     error: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    opening_balance: Mapped[float | None] = mapped_column(Float, nullable=True)
     # —— 策略运行期实时快照 ——
     position_count: Mapped[int] = mapped_column(Integer, default=0)   # 当前 magic 持仓笔数
     # 当前 magic 未成交挂单笔数；限价开仓在成交前只有它，是「在途但未持仓」的唯一凭据

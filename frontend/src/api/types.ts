@@ -2945,7 +2945,23 @@ export interface FollowDetailResponse {
   daily_profit?: FollowDailyProfitPoint[]
 }
 
+export interface FollowExit {
+  node_id: string
+  deal_id: number
+  symbol: string
+  direction: string
+  volume: number
+  price: number
+  closed_at: number
+  profit: number
+  status: string
+}
+
 export interface FollowMyGroup {
+  mode?: string | null
+  magics?: Record<string, number[]>
+  history?: FollowExit[]
+  last_sync?: number | null
   group_id: string
   group_name: string | null
   symbol: string | null
@@ -2962,7 +2978,15 @@ export interface FollowMyGroup {
   marketable: boolean
   unmarketable_reason: string | null
   active_task_count: number
-  my_nodes: (FollowNodeBrief & { joined_at: number | null; follow_state?: string; leader_paused?: boolean })[]
+  my_nodes: (FollowNodeBrief & {
+    joined_at: number | null
+    follow_state?: string
+    leader_paused?: boolean
+    leverage?: number | null
+    balance?: number | null
+    server?: string | null
+    positions?: Position[]
+  })[]
 }
 
 export interface FollowMyLeader {
@@ -2973,7 +2997,7 @@ export interface FollowMyLeader {
 export interface FollowMeResponse {
   following: FollowMyLeader[]
   applications: FollowApplication[]
-  summary: { following_count: number; follow_node_count: number; pending_node_count?: number }
+  summary: { following_count: number; follow_node_count: number; pending_node_count?: number; net_profit?: number | null; average_rate?: number | null; first_balance?: number | null }
 }
 
 export interface FollowApplication {

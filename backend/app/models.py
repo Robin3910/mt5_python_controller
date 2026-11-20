@@ -994,6 +994,7 @@ class FollowChannelsOut(BaseModel):
 
 class FollowChannelCloseRequest(BaseModel):
     """按频道平仓。all 停该频道子任务；profit / ticket 只平仓、不停策略。"""
+    group_id: Optional[str] = None
     market: str
     mode: str = "all"
     ticket: Optional[int] = None
@@ -1510,8 +1511,34 @@ class FollowLeaveResponse(BaseModel):
     skipped: list[dict] = Field(default_factory=list)
 
 
+class FollowRelationKey(BaseModel):
+    group_id: str
+    node_id: str
+
+
+class FollowStateRequest(BaseModel):
+    relations: list[FollowRelationKey] = Field(min_length=1)
+    paused: bool
+
+
+class FollowExit(BaseModel):
+    node_id: str
+    deal_id: int
+    symbol: str
+    direction: str
+    volume: float
+    price: float
+    closed_at: int
+    status: str
+    profit: float
+
+
 class FollowMyGroup(BaseModel):
     """我的跟单里一项（按分组维度）。"""
+    mode: Optional[str] = None
+    last_sync: Optional[float] = None
+    history: list[FollowExit] = Field(default_factory=list)
+    magics: dict[str, list[int]] = Field(default_factory=dict)
     group_id: str
     group_name: Optional[str] = None
     symbol: Optional[str] = None

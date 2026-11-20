@@ -510,11 +510,12 @@ def _tpl1_runner(sent: list, *, mt5=None, template_id: str = "tpl_1"):
     )
 
 
-async def test_ai_first_order_reports_requested_balance_snapshot():
+@pytest.mark.parametrize("template_id", ["tpl_1", "tpl_2"])
+async def test_first_order_reports_requested_balance_snapshot(template_id):
     sent = []
     mt5 = MockMT5Client()
     mt5.balance = 1200.25
-    runner, _ = _tpl1_runner(sent, mt5=mt5)
+    runner, _ = _tpl1_runner(sent, mt5=mt5, template_id=template_id)
     runner.entry["capture_balance_before_open"] = True
     assert await runner._open_first()
     report, = _of_type(sent, "trade_result")

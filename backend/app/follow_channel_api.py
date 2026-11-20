@@ -22,7 +22,7 @@ from .models import (
     FollowChannelsOut,
     build_close_command,
 )
-from .permissions import MENU_AI_TRADE, MENU_HOME, MENU_NODES, Principal, can_menu
+from .permissions import MENU_AI_TRADE, MENU_FOLLOW, MENU_HOME, MENU_NODES, Principal, can_menu
 from .redis_store import RedisStore
 
 router = APIRouter(prefix="/api/nodes", tags=["follow-channels"])
@@ -75,7 +75,7 @@ async def close_follow_channel(
     request: Request,
     store: RedisStore = Depends(get_store),
     group_dispatcher: GroupDispatcher = Depends(get_group_dispatcher),
-    p: Principal = Depends(require_menu(MENU_HOME, MENU_NODES, MENU_AI_TRADE)),
+    p: Principal = Depends(require_menu(MENU_HOME, MENU_NODES, MENU_AI_TRADE, MENU_FOLLOW)),
 ):
     """平掉该节点某一个频道的持仓。
 
@@ -84,7 +84,8 @@ async def close_follow_channel(
     """
     await owned_node_or_404(store, p, node_id)
     market = (body.market or "").strip().lower()
-    if market != CHANNEL_AI and not can_menu(p, MENU_HOME, MENU_NODES):
+    scoped = bool(body.group_id and market == CHANNEL_FOLLOW and body.mode == "ticket" and can_menu(p, MENU_FOLLOW))
+    if not scoped and not can_menu(p, MENU_HOME, MENU_NODES) and not (market == CHANNEL_AI and can_menu(p, MENU_AI_TRADE)):
         raise HTTPException(status_code=403, detail="无权操作该频道")
     mode = (body.mode or "all").strip().lower()
     if market not in _MARKETS:
@@ -99,6 +100,12 @@ async def close_follow_channel(
     account = await store.get_account(node_id) or {}
     loaded = await follow_channel_store.load_follow_channels(node_id, _live_magics(account))
     rows = [item for item in loaded["magics"] if item["market"] == market]
+    if body.group_id:
+        if not scoped:
+            raise HTTPException(403, "无权操作该跟单分组")
+        from .my_follow import own_dispatches
+        ids = await own_dispatches(p.user_id, node_id, body.group_id, [r["dispatch_id"] for r in rows])
+        rows = [r for r in rows if r["dispatch_id"] in ids]
     magic_set = {int(item["magic"]) for item in rows}
     targets = select_channel_positions(
         account.get("positions") or [],
@@ -159,7 +166,7 @@ async def close_follow_channel(
         p.username,
         "close_follow_channel",
         node_id,
-        {"market": market, "mode": mode, "ticket": body.ticket},
+        {"market": market, "mode": mode, "ticket": body.ticket, "group_id": body.group_id},
         status,
         client_ip(request),
         category="node",

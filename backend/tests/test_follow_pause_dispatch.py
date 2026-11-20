@@ -381,6 +381,9 @@ async def test_not_paused_follower_still_receives_signal(store, monkeypatch):
         "sig_not_paused",
     )
 
+    commands = dict(sent)
+    assert commands["nd_f"]["entry"]["capture_balance_before_open"] is True
+    assert "capture_balance_before_open" not in commands["nd_leader"]["entry"]
     targets = {s[0] for s in sent}
     assert "nd_f" in targets, "未暂停时跟单节点应收信号"
     assert "nd_leader" in targets

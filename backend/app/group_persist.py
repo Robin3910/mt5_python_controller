@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+from math import isfinite
 from datetime import datetime
 from typing import Optional
 
@@ -24,6 +25,7 @@ from . import group_rules, latency_marks, signal_codes, signal_meta, strategy_te
 from . import ai_follow_runtime
 from .db import SessionLocal
 from .orm import (
+    GroupFollowerNode,
     GroupSignalTask,
     GroupTaskDispatch,
     GroupTaskEvent,
@@ -234,6 +236,7 @@ async def create_dispatch(
     decided_vol: Optional[float],
     hold_when_empty: bool = False,
     action: Optional[str] = None,
+    follower_id: int | None = None,
 ) -> Optional[dict]:
     """创建一条节点子任务并分配魔术号，返回 {dispatch_id, magic}。
 
@@ -248,6 +251,12 @@ async def create_dispatch(
     """
     try:
         async with SessionLocal() as s:
+            # 候选节点选出后用户仍可能暂停或移出，在分配魔术号前复核已批准关系。
+            if follower_id is not None and not await s.scalar(select(GroupFollowerNode.id).where(
+                GroupFollowerNode.group_id == group_id, GroupFollowerNode.node_id == node_id,
+                GroupFollowerNode.follower_user_id == follower_id, GroupFollowerNode.follow_state == "running",
+                GroupFollowerNode.leader_paused.is_(False)).with_for_update()):
+                return {"skip_reason": "跟单已暂停或移出"}
             relation, settings, reason = await ai_follow_runtime.prepare_dispatch(s, task_id, group_id, node_id)
             if reason:
                 return {"skip_reason": reason}
@@ -1020,7 +1029,7 @@ async def set_dispatch_status(
 
 async def update_dispatch_result(
     *, node_id: str, result: dict, dispatch_id: Optional[int] = None,
-    task_id: Optional[int] = None, signal_id: Optional[str] = None,
+    task_id: Optional[int] = None, signal_id: Optional[str] = None, opening_balance=None,
 ) -> Optional[dict]:
     """按节点回报更新子任务；未命中返回 None，命中返回 {released, task_ids}。
 
@@ -1055,6 +1064,13 @@ async def update_dispatch_result(
                     continue
                 row.retcode = result.get("retcode")
                 row.order_ticket = result.get("order") or result.get("ticket")
+                if row.deal and row.deal != result.get("deal"):
+                    row.opening_balance = None
+                if (row.opening_balance is None and not (row.follow_settings_json or {}).get("application_id")
+                        and success and not result.get("pending")
+                        and result.get("deal") and result.get("retcode") in (10009, 10010)
+                        and type(opening_balance) in (int, float) and isfinite(opening_balance)):
+                    row.opening_balance = opening_balance
                 row.deal = result.get("deal")
                 row.price = result.get("price")
                 row.error = result.get("error")
