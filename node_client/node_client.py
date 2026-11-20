@@ -928,6 +928,8 @@ class NodeClient:
             await self._do_strategy_start(ws, msg, resume=True, recv_at=recv_at)
         elif cmd == "strategy_stop":
             await self._do_strategy_stop(ws, msg)
+        elif cmd == "strategy_cancel_pending":
+            await self._do_strategy_cancel_pending(ws, msg)
         elif cmd == "strategy_update":
             await self._do_strategy_update(msg)
         elif cmd == "strategy_smc":
@@ -1215,6 +1217,73 @@ class NodeClient:
         # 本地没有监控：节点重启过，或服务端补发了离线期间的终止指令。
         # 此时按魔术号直接平掉残留持仓，否则这批仓位再也没人负责收口。
         await self._close_orphan_strategy(ws, task_id, msg)
+
+    async def _do_strategy_cancel_pending(self, ws, msg: dict) -> None:
+        """撤单并收口：撤掉该任务魔术号下的挂单，**不平仓**，按 done 收口。
+
+        主节点撤掉了 tpl_2 限价开仓的挂单，服务端把它同步到本节点。
+        与 strategy_stop 的区别：已成交的持仓保留，只撤剩余挂单。
+        """
+        try:
+            task_id = int(msg.get("task_id"))
+        except (TypeError, ValueError):
+            logger.warning("strategy_cancel_pending with invalid task_id: %s", msg)
+            return
+        runner = self.runners.get(task_id)
+        if runner and not runner.done:
+            runner.request_cancel_pending(
+                reason=str(msg.get("reason") or "leader_cancelled"),
+            )
+            logger.info("strategy task %s cancel-pending requested", task_id)
+            return
+        # 本地没有监控（节点重启过 / 离线补发）：直接按魔术号撤挂单并回报收口
+        await self._cancel_orphan_pending(ws, task_id, msg)
+
+    async def _cancel_orphan_pending(self, ws, task_id: int, msg: dict) -> None:
+        """无本地监控时按魔术号撤掉挂单并回报收口（不平仓）。"""
+        try:
+            magic = int(msg.get("magic"))
+        except (TypeError, ValueError):
+            logger.info(
+                "strategy_cancel_pending for unknown task %s without magic, ignored",
+                task_id,
+            )
+            return
+        canceller = getattr(self.mt5, "cancel_pending_all", None)
+        if canceller is None:
+            logger.warning("strategy_cancel_pending: mt5 has no cancel_pending_all")
+            return
+        try:
+            res = dict(
+                await self._exec(canceller, "strategy", magics={magic}) or {},
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "strategy_cancel_pending for orphan task %s failed: %s", task_id, e,
+            )
+            return
+        remaining = int(res.get("remaining") or 0)
+        success = bool(res.get("success")) and remaining == 0
+        logger.warning(
+            "strategy task %s has no local runner, cancelled %d order(s) by magic %s "
+            "(remaining=%d)",
+            task_id, int(res.get("cancelled") or 0), magic, remaining,
+        )
+        payload = {
+            "task_id": task_id,
+            "magic": magic,
+            "group_id": msg.get("group_id") or "",
+            "signal_id": msg.get("signal_id") or "",
+            "symbol": msg.get("symbol"),
+            "status": "done" if success else "stop_failed",
+            "reason": msg.get("reason") or "leader_cancelled",
+            # 剩余持仓是部分成交后保留下来的，不是「该平的没平掉」
+            "residual_positions": 0 if success else remaining,
+        }
+        await ws.send(json.dumps({
+            "type": "strategy_finished",
+            "data": payload,
+        }))
 
     async def _do_strategy_update(self, msg: dict) -> None:
         """热推进行中任务的策略快照（模版1 手动分散仓 / 加仓规则）。"""

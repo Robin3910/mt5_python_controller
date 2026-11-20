@@ -303,6 +303,26 @@ def _subtask_dict(r: GroupTaskDispatch) -> dict:
     }
 
 
+async def _task_snapshots(task_ids: set[int]) -> dict[int, Optional[dict]]:
+    """批量取主任务的策略快照 {task_id: snapshot}；查不到时值为 None。"""
+    if not task_ids:
+        return {}
+    try:
+        async with SessionLocal() as s:
+            rows = (
+                await s.execute(
+                    select(
+                        GroupSignalTask.task_id,
+                        GroupSignalTask.strategy_snapshot_json,
+                    ).where(GroupSignalTask.task_id.in_(sorted(task_ids)))
+                )
+            ).all()
+        return {int(tid): snap for tid, snap in rows}
+    except Exception as e:  # noqa: BLE001
+        logger.warning("_task_snapshots failed: %s", e)
+        return {}
+
+
 async def get_subtask(group_id: str, dispatch_id: int) -> Optional[dict]:
     """按分组 + 子任务号读取一条节点子任务；不存在或不属于该分组时返回 None。"""
     try:
@@ -385,10 +405,15 @@ async def active_subtasks_for_magic(
                     .order_by(GroupTaskDispatch.id.asc())
                 )
             ).scalars().all()
-            return [_subtask_dict(r) for r in rows]
+            out = [_subtask_dict(r) for r in rows]
     except Exception as e:  # noqa: BLE001
         logger.warning("active_subtasks_for_magic failed: %s", e)
         return []
+    # 带上主任务的策略快照：调用方据此判断是否 tpl_2 限价开仓（撤单同步只对它生效）
+    snaps = await _task_snapshots({int(r["task_id"]) for r in out})
+    for r in out:
+        r["strategy_snapshot"] = snaps.get(int(r["task_id"]))
+    return out
 
 
 async def templates_by_magic(node_id: str, magics: set[int]) -> dict[int, Optional[str]]:
@@ -470,10 +495,14 @@ async def active_follower_subtasks_for_task(
                     .order_by(GroupTaskDispatch.id.asc())
                 )
             ).scalars().all()
-            return [_subtask_dict(r) for r in rows]
+            out = [_subtask_dict(r) for r in rows]
     except Exception as e:  # noqa: BLE001
         logger.warning("active_follower_subtasks_for_task failed: %s", e)
         return []
+    snaps = await _task_snapshots({int(task_id)})
+    for r in out:
+        r["strategy_snapshot"] = snaps.get(int(task_id))
+    return out
 
 
 async def active_subtasks_for_task(
@@ -901,6 +930,34 @@ async def active_subtasks_with_snapshot() -> list[dict]:
         return []
 
 
+async def cancel_pending_orphans(node_id: str) -> list[dict]:
+    """该节点上「主节点撤单同步」相关、且可能仍有残留挂单的子任务。
+
+    来源为 leader_cancel 的子任务在下发撤单指令时就被收口，正常流程下这里
+    通常是空的；重连补发是对 `pending_stop` 队列丢失的兜底：节点重启后本地
+    runner 可能不认识这个 task，按魔术号再撤一次挂单（幂等，不平仓）。
+    """
+    try:
+        async with SessionLocal() as s:
+            rows = (
+                await s.execute(
+                    _active_snapshot_query().where(
+                        GroupTaskDispatch.node_id == node_id,
+                        GroupTaskDispatch.stop_source == "leader_cancel",
+                    ).order_by(GroupTaskDispatch.id.asc())
+                )
+            ).all()
+            return [_snapshot_subtask(d, t) for d, t in rows]
+    except Exception as e:  # noqa: BLE001
+        logger.warning("cancel_pending_orphans failed: %s", e)
+        return []
+
+
+async def mark_dispatches_cancel_source(dispatch_ids: list[int]) -> None:
+    """把子任务标成「主节点撤单同步」，节点重连时据此补发撤单（不平仓）。"""
+    await mark_dispatches_stop_source(dispatch_ids, "leader_cancel", force=True)
+
+
 async def mark_task_dispatched(
     task_id: int, *, payload: dict, node_ids: list[str], status: str = "dispatching",
 ) -> None:
@@ -1140,22 +1197,25 @@ async def mark_dispatches_closing(dispatch_ids: list[int]) -> None:
 
 
 async def mark_dispatches_stop_source(
-    dispatch_ids: list[int], source: str,
+    dispatch_ids: list[int], source: str, *, force: bool = False,
 ) -> None:
     """记录「这次终止是谁发起的」；只覆盖还没写过来源的子任务。
 
     只在首次写入时赋值（`stop_source` 仍是 NULL 才写）：一个子任务只会被终止一次，
     先到先得 —— 后续的兜底路径（快照对账、强制收口）不该改写已有的来源标记。
+    `force=True` 时不看旧值（系统内部收口要保证来源一定是这一类）。
     """
     if not dispatch_ids:
         return
     try:
         async with SessionLocal() as s:
+            stmt = update(GroupTaskDispatch).where(
+                GroupTaskDispatch.id.in_(dispatch_ids),
+            )
+            if not force:
+                stmt = stmt.where(GroupTaskDispatch.stop_source.is_(None))
             await s.execute(
-                update(GroupTaskDispatch).where(
-                    GroupTaskDispatch.id.in_(dispatch_ids),
-                    GroupTaskDispatch.stop_source.is_(None),
-                ).values(stop_source=str(source or "")[:24])
+                stmt.values(stop_source=str(source or "")[:24])
             )
             await s.commit()
     except Exception as e:  # noqa: BLE001
@@ -1165,10 +1225,12 @@ async def mark_dispatches_stop_source(
 async def record_leader_stop_event(
     *, task_id: int, node_id: str, magic: Optional[int],
     message: str, detail: Optional[dict] = None,
+    event_type: str = "leader_stop",
 ) -> None:
     """落一条「被带单员连带终止」的事件流记录。
 
     与普通 close_all 事件分开：跟单员需要一眼看出「不是我平掉的，是主人停的」。
+    `event_type="leader_cancel"`：主节点撤掉限价挂单、跟单节点同步撤单（不平仓）。
     """
     try:
         async with SessionLocal() as s:
@@ -1177,7 +1239,7 @@ async def record_leader_stop_event(
                     task_id=task_id,
                     node_id=node_id,
                     magic=magic,
-                    event_type="leader_stop",
+                    event_type=event_type,
                     message=str(message or "")[:255],
                     detail_json=detail if isinstance(detail, dict) else None,
                 )
@@ -1811,14 +1873,24 @@ async def reconcile_node_positions(
 
 
 async def force_finish_subtasks(
-    dispatch_ids: list[int], *, reason: str,
+    dispatch_ids: list[int], *, reason: str, status: str = "failed",
+    residual_positions: Optional[int] = None,
 ) -> Optional[dict]:
     """强制收口指定子任务（目标节点离线、无人平仓 / 人工终止）。
 
+    status：终态。默认 `failed`（强制收口意味着「该做的没做到」）；
+    「主节点撤单 -> 跟单节点撤单收口」这类正常结束传 `done`。
+    residual_positions：done 收口时保留下来的持仓笔数（撤单同步 Case B：部分成交
+    后撤剩余挂单，持仓仍在账户上）。为 None 时不动现有持仓数。
     返回 {released, task_ids}；released 是需要释放的节点占位。
     """
     if not dispatch_ids:
         return {"released": [], "task_ids": []}
+    status = str(status or "failed").strip().lower()
+    if status not in _TERMINAL:
+        status = "failed"
+    # 撤单收口时在途挂单已撤干净，挂单数归零；持仓数按实际保留的笔数记，
+    # 不能清零 —— 账户上还留着这几笔，对账要按它继续盯着（Case B）。
     try:
         async with SessionLocal() as s:
             now = datetime.now()
@@ -1833,10 +1905,14 @@ async def force_finish_subtasks(
             released: list[tuple[str, str]] = []
             for row in rows:
                 released.extend(_released(row))
-                row.status = "failed"
+                row.status = status
                 row.finish_reason = reason[:255]
                 row.finished_at = now
-                row.position_count = 0
+                row.pending_orders = 0
+                if status == "failed":
+                    row.position_count = 0
+                elif residual_positions is not None:
+                    row.position_count = max(int(residual_positions or 0), 0)
             await s.flush()
             task_ids = {row.task_id for row in rows}
             for tid in task_ids:

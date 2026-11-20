@@ -45,7 +45,7 @@ import secrets
 import time
 from typing import Optional
 
-from . import group_persist, group_rules
+from . import group_persist, group_rules, strategy_templates
 from .connections import manager
 from .models import build_close_command
 from .redis_store import RedisStore
@@ -57,6 +57,8 @@ _PENDING_CLOSE_TTL = 24 * 3600
 
 # 同步平仓的 source 标记（审计 / 日志用，不进 stop_source —— 这不是「终止」）
 PENDING_REASON = "leader_close_sync"
+# 同步撤单写进子任务的 stop_source（前端据此展示「主节点撤单同步」）
+PENDING_SOURCE = "leader_cancel"
 
 
 def _cmd_id() -> str:
@@ -99,6 +101,14 @@ def _positions_by_magic(positions: list) -> dict[int, list[dict]]:
     return out
 
 
+KIND_POSITION = "position"
+KIND_ORDER = "order"
+
+# 限价开仓撤单确认轮数：连续 N 轮快照都判定「挂单净减少」才同步撤单。
+# 单轮读数可能抖（快照在成交瞬间到达），3 轮（约 15 秒）足以滤掉瞬时假象。
+PENDING_CANCEL_CONFIRM = 3
+
+
 def _snapshot_rows(positions: list) -> list[dict]:
     """把持仓精简成基线需要的字段（全量持仓太大，且我们只关心这几列）。"""
     out: list[dict] = []
@@ -115,12 +125,43 @@ def _snapshot_rows(positions: list) -> list[dict]:
             "type": row.get("type"),
             "volume": row.get("volume"),
             "time": row.get("time"),
+            "kind": KIND_POSITION,
+        })
+    return out
+
+
+def _order_rows(orders: list) -> list[dict]:
+    """把在途挂单精简成基线需要的字段，`kind="order"`。
+
+    挂单与持仓合并进同一条基线：撤单同步需要「上一轮挂了多少张」，而挂单
+    消失既可能是成交（变成持仓）也可能是被撤 —— 需要两类行一起算净变化。
+    """
+    out: list[dict] = []
+    for row in orders or []:
+        if not isinstance(row, dict):
+            continue
+        magic = row.get("magic")
+        if group_rules.subtask_id_from_magic(magic) is None:
+            continue
+        out.append({
+            "ticket": row.get("ticket"),
+            "magic": magic,
+            "symbol": row.get("symbol"),
+            "type": row.get("type"),
+            "volume": row.get("volume"),
+            "time": row.get("time"),
+            "kind": KIND_ORDER,
         })
     return out
 
 
 def _lost_tickets(baseline: list[dict], current: list[dict]) -> set[int]:
-    """上一轮有、本轮没有的 ticket（即被平掉的那些）。"""
+    """上一轮有、本轮没有的**持仓** ticket（即被平掉的那些）。
+
+    只认 `kind == "position"`：挂单从账本里消失不代表仓位被平（限价单撤回
+    或被成交都不是平仓），把它算成平仓会把撤单误当成平仓下发给跟单节点。
+    没有 kind 字段的旧基线行按持仓处理（兼容升级前的存量基线）。
+    """
     alive = set()
     for row in current:
         try:
@@ -129,6 +170,8 @@ def _lost_tickets(baseline: list[dict], current: list[dict]) -> set[int]:
             continue
     lost: set[int] = set()
     for row in baseline:
+        if str(row.get("kind") or KIND_POSITION) != KIND_POSITION:
+            continue
         try:
             ticket = int(row.get("ticket") or 0)
         except (TypeError, ValueError):
@@ -136,6 +179,64 @@ def _lost_tickets(baseline: list[dict], current: list[dict]) -> set[int]:
         if ticket and ticket not in alive:
             lost.add(ticket)
     return lost
+
+
+def _count_by_magic(rows: list[dict], kind: str) -> dict[int, int]:
+    out: dict[int, int] = {}
+    for row in rows or []:
+        if str(row.get("kind") or KIND_POSITION) != kind:
+            continue
+        magic = _int(row.get("magic"))
+        if magic is None:
+            continue
+        out[magic] = out.get(magic, 0) + 1
+    return out
+
+
+def _pending_cancelled(
+    baseline: list[dict], current: list[dict],
+) -> dict[int, int]:
+    """本轮「疑似被撤掉」的挂单笔数（按 magic）：`挂单净减 - 本轮新增持仓笔数`。
+
+    单轮无法区分「撤单」和「成交」：一张挂单消失时，成交会让持仓 +1，撤单不会。
+    所以这里先给出**疑似值**，由 `note_pending_cancel_hits` 跨轮区分：
+
+    - 挂单消失后「持仓恰好 +1，且之后一直不再变化」= 成交；
+    - 一旦该 magic 再无新变化（下一轮持仓没再涨），上一轮的 (+1, -1) 就只可能
+      是撤单了 —— 这时才把疑似值算作撤单，延续连续确认计数。
+    """
+    base_orders = _count_by_magic(baseline, KIND_ORDER)
+    cur_orders = _count_by_magic(current, KIND_ORDER)
+    gained_pos = _gained_positions(baseline, current)
+    out: dict[int, int] = {}
+    for magic, base in base_orders.items():
+        cur = cur_orders.get(magic, 0)
+        lost_orders = base - cur
+        cancelled = lost_orders - max(gained_pos.get(magic, 0), 0)
+        if cancelled > 0:
+            out[magic] = cancelled
+    return out
+
+
+def _gained_positions(baseline: list[dict], current: list[dict]) -> dict[int, int]:
+    """各 magic 本轮新增的持仓笔数（max(当前笔数 - 基线笔数, 0)）。"""
+    base_pos = _count_by_magic(baseline, KIND_POSITION)
+    cur_pos = _count_by_magic(current, KIND_POSITION)
+    return {
+        magic: max(cnt - base_pos.get(magic, 0), 0)
+        for magic, cnt in cur_pos.items()
+    }
+
+
+def _order_lost(baseline: list[dict], current: list[dict]) -> dict[int, int]:
+    """各 magic 本轮「挂单减少」的笔数（不看持仓）。"""
+    base_orders = _count_by_magic(baseline, KIND_ORDER)
+    cur_orders = _count_by_magic(current, KIND_ORDER)
+    return {
+        magic: base - cur_orders.get(magic, 0)
+        for magic, base in base_orders.items()
+        if base - cur_orders.get(magic, 0) > 0
+    }
 
 
 async def _leader_groups_of(store: RedisStore, node_id: str) -> list[dict]:
@@ -177,6 +278,181 @@ async def _send_close_to_node(store: RedisStore, node_id: str, ticket: int,
     # 节点离线：入队等重连补发（与手动终止共用同一条队列）
     await store.push_pending_stop(node_id, cmd, _PENDING_CLOSE_TTL)
     return "queued"
+
+
+def _is_limit_risk_sized(snapshot: object) -> bool:
+    """该子任务的策略快照是否为 tpl_2「以损定量 + 限价开仓」。
+
+    只有这种任务会在信号时把整批单一次性挂成限价等成交；撤单同步只对它有意义。
+    """
+    if not isinstance(snapshot, dict):
+        return False
+    rule = strategy_templates.pick_risk_sized_rule(snapshot.get("rules"))
+    return bool(rule) and strategy_templates.is_limit_entry(rule)
+
+
+def _active_order_magics(baseline: list[dict], current: list[dict]) -> dict[int, int]:
+    """本轮仍存在挂单的 magic（`{magic: 挂单笔数}`），用于给静默轮续期。
+
+    只对「上一轮有挂单、本轮还有」的 magic 计数 —— 挂单全没了就不再续期，
+    确认计数会随时间自然过期，不会影响之后新一轮的撤单检出。
+    """
+    cur_orders = _count_by_magic(current, KIND_ORDER)
+    return {
+        magic: cur_orders.get(magic, 0)
+        for magic in _count_by_magic(baseline, KIND_ORDER)
+        if cur_orders.get(magic, 0) > 0
+    }
+
+
+async def _confirm_pending_cancelled(
+    store: RedisStore, node_id: str, hits: dict[int, int],
+    *, order_lost: Optional[dict[int, int]] = None,
+    gained: Optional[dict[int, int]] = None,
+    live_orders: Optional[dict[int, int]] = None,
+) -> set[int]:
+    """按本轮检出的疑似撤单 magic 推进连续计数，返回已确认（连续 N 轮）的 magic。
+
+    `hits`: 本轮疑似撤单 {magic: 笔数}（`_pending_cancelled` 的结果）。
+    `order_lost`: 本轮各 magic 挂单减少笔数（不看持仓）。
+    `gained`: 本轮各 magic 新增持仓笔数。
+    `live_orders`: 本轮仍有挂单的 magic（给等待中的疑似撤单续期）。
+
+    单轮「挂单 -1、持仓 +1」无法区分成交与撤单；连续 `PENDING_CANCEL_CONFIRM`
+    轮（约 15 秒）挂单都没有回来，才确认是撤单。
+    跨轮状态记在 Redis 里（服务多进程 / 重启后连续确认不失效），带上一轮的
+    (挂单减少, 持仓增加)，用来把成交那一段扣掉。
+    """
+    return await store.note_pending_cancel_hits(
+        node_id, hits, confirm=PENDING_CANCEL_CONFIRM,
+        order_lost=order_lost, gained=gained,
+        live_orders=live_orders,
+    )
+
+
+async def _send_cancel_pending_to_node(
+    store: RedisStore, sub: dict, reason: str,
+) -> str:
+    """给跟单子任务下发「撤挂单 + 收口」；返回 sent / queued。"""
+    from .group_dispatcher import build_strategy_cancel_pending_command
+
+    cmd = build_strategy_cancel_pending_command(
+        signal_id=sub.get("signal_id") or _cmd_id(),
+        task_id=int(sub["task_id"]),
+        dispatch_id=int(sub["dispatch_id"]),
+        magic=_int(sub.get("magic")),
+        group_id=str(sub.get("group_id") or ""),
+        symbol=sub.get("symbol"),
+        reason=reason,
+    )
+    node_id = str(sub.get("node_id") or "")
+    if await manager.send_to_node(node_id, cmd):
+        return "sent"
+    # 节点离线：入「待补发策略指令」队列，重连后只重发 strategy_* 指令
+    await store.push_pending_stop(node_id, cmd, _PENDING_CLOSE_TTL)
+    return "queued"
+
+
+def _is_limit_risk_sized(snapshot: object) -> bool:
+    """该子任务的策略快照是否为 tpl_2「以损定量 + 限价开仓」。
+
+    只有这种任务会在信号时把整批单一次性挂成限价等成交；撤单同步只对它有意义。
+    """
+    if not isinstance(snapshot, dict):
+        return False
+    rule = strategy_templates.pick_risk_sized_rule(snapshot.get("rules"))
+    return bool(rule) and strategy_templates.is_limit_entry(rule)
+
+
+async def _sync_cancel_pending(
+    store: RedisStore, group: dict, leader_node_id: str,
+    leader_magic: int,
+) -> dict:
+    """主节点撤掉了 tpl_2 限价挂单 -> 跟单节点撤掉自己名下同任务的全部挂单并收口。
+
+    与同步平仓不同，这里**同时**要「撤单」和「收口」：限价单在成交前只有挂单
+    没有持仓，节点侧「空仓即收口」的语义走不到（`_opened` 从未置位）。
+    所以每个跟单子任务都下发一条 `strategy_cancel_pending`，由节点侧撤单
+    干净后回报 `strategy_finished(done)`；节点离线时入队，并直接按 done 收口
+    子任务（避免僵尸任务占住节点占位，重连后补发的指令只负责撤孤儿单）。
+
+    主节点自己的子任务同样要收口（它也不会被空仓收口兜住）。
+
+    返回 {sent, queued, finished, reason}。
+    """
+    out = {"sent": 0, "queued": 0, "finished": 0, "released": [], "reason": None}
+    leader_subs = await group_persist.active_subtasks_for_magic(
+        group["group_id"], leader_node_id, leader_magic,
+    )
+    if not leader_subs:
+        return out
+    leader_sub = leader_subs[0]
+    if not _is_limit_risk_sized(leader_sub.get("strategy_snapshot")):
+        out["reason"] = "not_limit_entry"
+        return out
+    task_id = int(leader_sub["task_id"])
+
+    follower_nodes = {
+        str(f.get("node_id") or "").strip()
+        for f in (group.get("followers") or [])
+        if isinstance(f, dict) and f.get("node_id")
+    }
+    subs = await group_persist.active_follower_subtasks_for_task(
+        task_id, follower_nodes,
+    )
+
+    for sub in subs:
+        # 跟单子任务如果已经吃进过部分成交（有持仓），撤单只撤剩余挂单，
+        # 持仓保留、由用户自己管理 —— 状态依然是 done（不是失败）。
+        state = await _send_cancel_pending_to_node(store, sub, PENDING_REASON)
+        if state == "sent":
+            out["sent"] += 1
+        else:
+            out["queued"] += 1
+        # 无论在线与否都按 done 收口：在线节点的撤单已下达（节点侧撤完会回报
+        # strategy_finished，命中终态即忽略），离线时的指令已入队。
+        # 不等节点回报，避免节点侧撤单卡住时子任务一直挂着。
+        f_magic = _int(sub.get("magic"))
+        f_acct = await store.get_account(str(sub.get("node_id") or "")) or {}
+        f_held = (
+            len(_positions_by_magic(f_acct.get("positions") or []).get(f_magic, []))
+            if f_magic is not None else 0
+        )
+        res = await group_persist.force_finish_subtasks(
+            [int(sub["dispatch_id"])],
+            reason=PENDING_REASON,
+            status="done",
+            residual_positions=f_held,
+        )
+        if res:
+            out["finished"] += 1
+            out["released"].extend(res.get("released") or [])
+        await group_persist.mark_dispatches_cancel_source(
+            [int(sub["dispatch_id"])],
+        )
+        await group_persist.record_leader_stop_event(
+            task_id=task_id, node_id=str(sub.get("node_id") or ""),
+            magic=_int(sub.get("magic")),
+            message="带单员撤消了限价挂单，已同步撤单并结束任务"
+            if state == "sent" else
+            "带单员撤消了限价挂单，节点离线：已结束任务，待重连后补发撤单",
+            event_type="leader_cancel",
+        )
+
+    # 主节点自己：挂单已撤，不会再成交，子任务按 done 收口
+    res = await group_persist.force_finish_subtasks(
+        [int(leader_sub["dispatch_id"])],
+        reason=PENDING_REASON,
+        status="done",
+        residual_positions=0,
+    )
+    if res:
+        out["finished"] += 1
+        out["released"].extend(res.get("released") or [])
+    await group_persist.mark_dispatches_cancel_source(
+        [int(leader_sub["dispatch_id"])],
+    )
+    return out
 
 
 async def _sync_task_group(
@@ -371,19 +647,19 @@ def _int(value: object) -> Optional[int]:
 
 async def on_snapshot(store: RedisStore, node_id: str, positions: list,
                       orders: list | None = None) -> dict:
-    """账户快照到达时调用：对比主节点持仓基线，把被平掉的笔同步到跟单节点。
+    """账户快照到达时调用：对比主节点持仓/挂单基线，同步平仓与撤单到跟单节点。
 
     **必须在子任务收口（`_reconcile_strategy_tasks`）之前调用** —— 否则跟单节点
     可能先自己读到空仓收口，之后再发 close 就没人认领了。
 
-    `orders` 只用于兜底判断「主节点侧任务是否还活着」（限价开仓在成交前只有挂单），
-    不参与平仓检出 —— 挂单消失不等于持仓被平。
+    `orders` 用于两件事：撤单检出（tpl_2 限价开仓主节点撤掉挂单）与兜底判断
+    「主节点侧任务是否还活着」。挂单消失**不会**被当成持仓被平（`kind` 区分）。
 
     返回统计 dict（供日志 / 测试断言）。
     """
     result = {
         "triggered": False, "sent": 0, "queued": 0, "skipped": 0, "orphans": 0,
-        "released": [],
+        "released": [], "pending_sent": 0, "pending_queued": 0, "pending_finished": 0,
     }
     groups = await _leader_groups_of(store, node_id)
     if not groups:
@@ -391,7 +667,8 @@ async def on_snapshot(store: RedisStore, node_id: str, positions: list,
         # 但为避免空跑，这里直接返回并不写基线 —— 首次成为带单方时再建。
         return result
 
-    current = _snapshot_rows(positions)
+    order_rows = _order_rows(orders or [])
+    current = _snapshot_rows(positions) + order_rows
     baseline = await store.get_leader_snapshot(node_id)
     if baseline is None:
         # 首见 / 基线过期：只建基线，不对比。
@@ -409,6 +686,8 @@ async def on_snapshot(store: RedisStore, node_id: str, positions: list,
         # 被平掉的笔按 magic 归集，逐个 task 处理（一个 magic 对应一个子任务）
         lost_by_magic: dict[int, list[dict]] = {}
         for row in baseline:
+            if str(row.get("kind") or KIND_POSITION) != KIND_POSITION:
+                continue
             ticket = _int(row.get("ticket"))
             if ticket is None or ticket not in lost:
                 continue
@@ -435,6 +714,28 @@ async def on_snapshot(store: RedisStore, node_id: str, positions: list,
             logger.info(
                 "leader-close-sync node %s -> sent %d, queued %d, skipped %d",
                 node_id, result["sent"], result["queued"], result["skipped"],
+            )
+
+    # 撤单检出：tpl_2 限价开仓挂单减少 -> 跨轮确认（区分成交与撤单）
+    cancelled = await _confirm_pending_cancelled(
+        store, node_id, _pending_cancelled(baseline, current),
+        order_lost=_order_lost(baseline, current),
+        gained=_gained_positions(baseline, current),
+        live_orders=_active_order_magics(baseline, current),
+    )
+    if cancelled:
+        for group in groups:
+            for magic in cancelled:
+                out = await _sync_cancel_pending(store, group, node_id, magic)
+                result["pending_sent"] += out["sent"]
+                result["pending_queued"] += out["queued"]
+                result["pending_finished"] += out["finished"]
+        if result["pending_sent"] or result["pending_queued"]:
+            result["triggered"] = True
+            logger.info(
+                "leader-cancel-pending node %s magics %s -> sent %d, queued %d, finished %d",
+                node_id, sorted(cancelled), result["pending_sent"],
+                result["pending_queued"], result["pending_finished"],
             )
 
     # 基线更新放在同步之后：即使上面某笔失败，下一轮基线已是「当前持仓」，

@@ -183,6 +183,28 @@ def build_strategy_stop_command(
     }
 
 
+def build_strategy_cancel_pending_command(
+    *, signal_id: str, task_id: int, dispatch_id: int, magic: Optional[int],
+    group_id: str, symbol: Optional[str], reason: str = "leader_cancelled",
+) -> dict:
+    """撤挂单并收口命令：撤掉该魔术号下全部挂单，**不平仓**，然后按 done 收口。
+
+    主节点撤掉 tpl_2 限价开仓的挂单时下发给跟单节点：已成交的持仓保留，
+    剩余挂单撤掉，任务正常结束。与 `strategy_stop` 的区别是后者会把持仓也平掉。
+    """
+    return {
+        "cmd": "strategy_cancel_pending",
+        "signal_id": signal_id,
+        "task_id": task_id,
+        "dispatch_id": dispatch_id,
+        "magic": magic,
+        "group_id": group_id,
+        "symbol": symbol,
+        "model": SIGNAL_MODEL_STRATEGY,
+        "reason": reason,
+    }
+
+
 def build_strategy_resume_command(subtask: dict, smc: Optional[dict] = None) -> dict:
     """策略恢复命令：节点重连后据此重建监控（不重复下首单）。
 

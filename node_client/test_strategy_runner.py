@@ -1984,6 +1984,71 @@ async def test_market_mode_places_no_pending_orders():
     assert mt5.pending_orders_by_magic(MAGIC) == []
     assert len(mt5.positions_by_magic(MAGIC)) == 3
     assert runner.limit_entry is False
+
+
+async def test_limit_cancel_pending_done_keeps_positions_when_filled():
+    """主节点撤单同步：撤剩余挂单、保留已成交持仓，按 done 收口。
+
+    用「只成交了底仓」的场景：mock 撮合一部分限价单后，剩下的挂单由
+    `request_cancel_pending` 撤掉，持仓原样保留，收口状态必须是 done 且
+    residual=0（残留持仓是「部分成交保留下来的」，不是「该平的没平掉」）。
+    """
+    sent: list = []
+    runner, hub, mt5 = _limit_runner(sent)
+    runner.start()
+    await _settle()
+    mt5.auto_fill_pending = False
+    assert len(mt5.pending_orders_by_magic(MAGIC)) == 3
+
+    # 只让底仓成交（其余挂单保留），模拟「部分成交」后主节点撤单
+    base_ticket = min(
+        mt5.pending_orders_by_magic(MAGIC), key=lambda o: o["ticket"],
+    )["ticket"]
+    assert mt5.fill_pending_order(base_ticket) is True
+    assert mt5.positions_by_magic(MAGIC), "前置：底仓已成交"
+    runner.request_cancel_pending(reason="leader_cancelled")
+    await _settle(10)
+
+    assert runner.done is True
+    assert mt5.pending_orders_by_magic(MAGIC) == [], "剩余挂单必须撤掉"
+    assert mt5.positions_by_magic(MAGIC), "已成交的持仓必须保留，不能平掉"
+    finished = _of_type(sent, "strategy_finished")
+    assert finished and finished[0]["status"] == "done"
+    assert finished[0]["residual_positions"] == 0
+    assert finished[0]["reason"] == "leader_cancelled"
+    assert hub.unsubscribed is True
+
+
+async def test_limit_cancel_pending_without_fill_finishes_done():
+    """一笔都没成交时撤单：撤掉全部挂单，空仓按 done 收口。"""
+    sent: list = []
+    runner, hub, mt5 = _limit_runner(sent)
+    runner.start()
+    await _settle()
+
+    runner.request_cancel_pending()
+    await _settle(10)
+
+    assert runner.done is True
+    assert mt5.pending_orders_by_magic(MAGIC) == []
+    finished = _of_type(sent, "strategy_finished")
+    assert finished and finished[0]["status"] == "done"
+
+
+async def test_cancel_pending_ignored_after_finished():
+    """已收口的任务再收到撤单指令：不重复上报收口。"""
+    sent: list = []
+    runner, hub, mt5 = _limit_runner(sent)
+    runner.start()
+    await _settle()
+
+    runner.request_cancel_pending()
+    await _settle(10)
+    count = len(_of_type(sent, "strategy_finished"))
+
+    runner.request_cancel_pending()
+    await _settle(10)
+    assert len(_of_type(sent, "strategy_finished")) == count
     runner.cancel()
 
 
