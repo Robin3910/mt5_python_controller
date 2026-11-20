@@ -232,6 +232,7 @@ async def node_ws(ws: WebSocket):
         await manager.broadcast_admin({"type": "node_status", "data": {"node_id": node_id, "status": "online"}})
     await _flush_pending_stops(node_id, ws)
     await _resume_strategy_tasks(node_id, ws)
+    await _resend_cancel_pending_orphans(node_id, ws)
 
     try:
         await _session(node_id, ws)
@@ -286,6 +287,7 @@ async def _session(node_id: str, ws: WebSocket) -> None:
         elif mtype == "strategy_finished":
             # 策略托管结束：该魔术号的持仓已全部平掉
             await _on_strategy_finished(node_id, data)
+
 
         elif mtype == "strategy_update_ack":
             # 热推配置的逐字段回执
@@ -567,11 +569,47 @@ async def _flush_pending_stops(node_id: str, ws: WebSocket) -> None:
         try:
             await ws.send_json(cmd)
             logger.info(
-                "node %s pending strategy_stop resent (task=%s magic=%s)",
-                node_id, cmd.get("task_id"), cmd.get("magic"),
+                "node %s pending command resent (cmd=%s task=%s magic=%s)",
+                node_id, cmd.get("cmd"), cmd.get("task_id"), cmd.get("magic"),
             )
         except Exception:  # noqa: BLE001
             logger.warning("resend pending stop to %s failed", node_id)
+            return
+
+
+async def _resend_cancel_pending_orphans(node_id: str, ws: WebSocket) -> None:
+    """节点重连时补发「主节点撤单同步」。
+
+    子任务在下发撤单指令时就已按 done 收口，所以这里通常查不到东西；
+    这是 `pending_stop` 队列丢失时的兜底：节点上若还有来源为 leader_cancel
+    的未收口子任务，按魔术号再撤一次挂单（幂等，不平仓）。
+    """
+    try:
+        subtasks = await group_persist.cancel_pending_orphans(node_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("load cancel-pending orphans failed for %s", node_id)
+        return
+    for subtask in subtasks:
+        try:
+            cmd = group_dispatcher.build_strategy_cancel_pending_command(
+                signal_id=subtask.get("signal_id") or "",
+                task_id=int(subtask.get("task_id") or 0),
+                dispatch_id=int(subtask.get("dispatch_id") or 0),
+                magic=subtask.get("magic"),
+                group_id=subtask.get("group_id") or "",
+                symbol=subtask.get("symbol"),
+                reason="leader_cancelled",
+            )
+            await ws.send_json(cmd)
+            logger.info(
+                "node %s cancel-pending resent on resume (dispatch=%s magic=%s)",
+                node_id, subtask.get("dispatch_id"), subtask.get("magic"),
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "resend cancel-pending for %s to %s failed",
+                subtask.get("dispatch_id"), node_id,
+            )
             return
 
 

@@ -582,6 +582,8 @@ class MockMT5Client:
 
     def cancel_order(self, ticket: int, max_retry: int = 3) -> dict:
         target = int(ticket)
+        # 撤单前先撮合：mock 的真实账户里，「挂单被撤」与「挂单成交」都要先结算
+        self._settle_pending()
         before = len(self._pending)
         self._pending = [o for o in self._pending if int(o["ticket"]) != target]
         if len(self._pending) == before:

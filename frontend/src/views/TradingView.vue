@@ -322,11 +322,11 @@ async function stopGridTask(task: GroupSignalTaskRecord): Promise<void> {
   )
   const dispatchCount = activeDispatches.length
   if (dispatchCount === 0) return
-  // 同步平仓提示：主节点平掉仓位时，跟单节点上对应仓位会自动跟着平掉；
+  // 同步平仓提示：主节点平掉仓位或撤掉限价挂单时，跟单节点上对应仓位/挂单会自动跟着处理；
   // 是否全部平完决定任务是否结束，由节点侧按「空仓」自然收口
   const followerCount = hub.groups.find((g) => g.group_id === task.group_id)?.followers?.length ?? 0
   const cascadeHint = followerCount
-    ? `\n（主节点平仓后，跟单节点上的对应仓位会自动同步平掉，共 ${followerCount} 个跟单节点；全部平完任务即结束）`
+    ? `\n（主节点平仓/撤挂单后，跟单节点上的对应仓位/挂单会自动同步处理，共 ${followerCount} 个跟单节点；全部处理完任务即结束）`
     : ''
   try {
     await ElMessageBox.confirm(

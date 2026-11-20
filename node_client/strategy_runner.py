@@ -115,6 +115,12 @@ _EMPTY_GRACE_SEC = 10.0
 _TERMINAL_STATUSES = ("done", "failed")
 # 一次停止流程内的「读持仓 -> 平仓」轮次；平仓本身在 mt5_client 层已有瞬时错误重试
 _CLOSE_ALL_ATTEMPTS = 3
+
+# 撤单收口（服务端同步「主节点撤单」）的等待节奏与轮次：
+# 首次立即撤，撤不干净时隔多久重试、最多重试几次（1 + 5 = 6 轮）。
+# 撤不干净不报终态：带着挂单收口，那几张单随时可能成交成没人管的孤儿仓。
+_CANCEL_ONLY_RETRY_SEC = 5.0
+_CANCEL_ONLY_RETRIES = 5
 # 网格这一格被券商止损平掉时的原因文案（与 `_grid_exit_reason` 的返回值对应）。
 # 网格终止价写在挂单的止损上，所以价格击穿终止价时是**券商**平的仓，
 # 节点只是事后观察到「这一格没了」。
@@ -300,6 +306,10 @@ class StrategyRunner:
         self.total_volume = 0.0
         self._opened = False
         self._stopping = False
+        # 只撤挂单并收口（服务端策略撤单同步）：不做平仓，持仓原样保留
+        self._cancel_only = False
+        self._cancel_only_tries = 0
+        self._cancel_task: Optional[asyncio.Task] = None
         self._stop_reason = "positions_cleared"
         self._stop_detail: Optional[dict] = None
         # 被动全平的出场构成：是否为止盈出场（阶梯止盈先到的判定依据）
@@ -576,6 +586,78 @@ class StrategyRunner:
         if self._sub is not None:
             self._sub.wake()
 
+    def request_cancel_pending(self, *, reason: str = "leader_cancelled") -> None:
+        """请求「只撤挂单 + 收口」（不平仓）。
+
+        主节点撤掉了限价开仓的挂单，服务端把撤单同步到本节点：撤掉本任务魔术号下
+        全部在途挂单，已成交的持仓保留，任务按 done 收口。
+        与 `request_stop` 的区别：后者会平掉全部持仓。
+        """
+        if self._finished:
+            return
+        self._cancel_only = True
+        self._cancel_only_tries = 0
+        if reason:
+            self._stop_reason = reason
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None:
+            # 收口不依赖行情事件，所以直接起一个独立任务立刻去撤：只靠唤醒的话，
+            # `next_event` 又拿到一个合并过的空事件回到顶部，仍然会落进退避里
+            # 白等一个周期（挂单等成交时本就没有新 tick，不能指望事件流推进）。
+            self._cancel_task = loop.create_task(self._cancel_once_cancel_pending())
+            sub = self._sub
+            waker = getattr(sub, "wake", None)
+            if waker is not None:
+                waker()
+            return
+        # 没有运行中的循环（非异步调用方）：只置标志，由监控循环下一拍处理
+        sub = self._sub
+        if sub is not None:
+            sub.wake()
+
+    async def _cancel_once_cancel_pending(self) -> None:
+        """独立协程执行一次撤单收口；撤不干净就退避重试，直到成功或任务结束。"""
+        try:
+            while not await self._cancel_pending_and_finish():
+                if self._finished or self._task is None or self._task.done():
+                    return
+                await asyncio.sleep(_CANCEL_ONLY_RETRY_SEC)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("task %s cancel-pending failed", self.task_id)
+        finally:
+            # 收口完成（或放弃）后唤醒监控循环，让它回到顶部执行收尾
+            sub = self._sub
+            waker = getattr(sub, "wake", None)
+            if waker is not None:
+                waker()
+
+    async def _drain_monitor(self) -> None:
+        """挂单收口完成后的收尾：等撤单任务结束，再把监控循环退掉。
+
+        为什么不能直接 `return`：`_run` 的 `finally` 会取消监控任务；撤单任务如果
+        挂在同一个循环里会被一起取消，撤到一半的单就留在盘上了。撤单任务独立
+        （`self._cancel_task`），这里等它结束再退出。
+        """
+        task = self._cancel_task
+        if task is not None and not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # 监控循环自己被取消（节点断线）：撤单任务继续跑，重连后恢复
+                raise
+            except Exception:  # noqa: BLE001
+                logger.debug("task %s cancel task failed", self.task_id, exc_info=True)
+        # 停止流程兜底：撤单成功后 _finished 已置位，这里只处理「还在平仓」的情况
+        while self._stopping and not self._finished:
+            if await self._close_all():
+                return
+            await asyncio.sleep(_CANCEL_ONLY_RETRY_SEC)
+
     def cancel(self) -> None:
         """连接断开时只取消本地循环，不上报结束——持仓还在，等重连后恢复。"""
         if self._task and not self._task.done():
@@ -824,6 +906,8 @@ class StrategyRunner:
             while True:
                 if self._stopping and await self._close_all():
                     return
+                if self._cancel_only or self._cancel_task is not None:
+                    break
                 event = await sub.next_event()
                 if event is None:
                     logger.info("task %s subscription closed, monitor exits", self.task_id)
@@ -831,8 +915,11 @@ class StrategyRunner:
                 if self._stopping:
                     # 停止流程还没平干净：回到开头重试，期间不再交易
                     continue
+                if self._cancel_only or self._cancel_task is not None:
+                    break
                 if await self._on_event(event):
                     return
+            await self._drain_monitor()
         except asyncio.CancelledError:
             logger.info("task %s monitor cancelled (will resume on reconnect)", self.task_id)
             raise
@@ -852,6 +939,9 @@ class StrategyRunner:
 
     async def _on_event(self, event: MarketEvent) -> bool:
         """处理一个事件；返回 True 表示任务已收口。"""
+        if self._cancel_only:
+            # 撤单收口等待期间（撤不干净在重试）不处理行情，避免又挂出新的单
+            return False
         if event.kind == WAKE:
             # SMC 推送重放上一口价，顺势和逆势一起再判。
             # 规则热推只改逆势限价，不重放顺势，避免同一口价连加。
@@ -5453,6 +5543,63 @@ class StrategyRunner:
             )
             return False
         return True
+
+    async def _cancel_manual_pending_for_cancel_only(self) -> None:
+        """撤单收口时把已有持仓的手动分散仓在途挂单作废（只标内存状态）。
+
+        手动单由 `_sync_manual_pending` 按规则状态重挂：不同步作废的话，即使盘上
+        的单被撤掉，任务收口前的那一拍还可能把它重新挂回去。
+        """
+        if not self._manual_pending:
+            return
+        reason = (
+            manual_scatter.OFF_LADDER_TP
+            if self._passive_exit_tp
+            else manual_scatter.OFF_CLOSED
+        )
+        try:
+            await self._void_manual_pending(reason, positions=[])
+        except Exception:  # noqa: BLE001
+            logger.debug("task %s cancel-only void manual pending failed", self.task_id)
+
+    async def _cancel_pending_and_finish(self) -> bool:
+        """撤单收口：撤掉本魔术号全部在途挂单，持仓保留，按 done 收口。
+
+        返回 True 表示已收口；False 表示没撤干净，调用方隔几拍再试。
+
+        为什么不能直接复用 `_close_all`：那是「平仓 + 撤单」，会把已成交的持仓
+        也平掉；主节点撤单同步的语义是「没成交的那部分不做了」，已成交的仓位
+        应当原样保留。
+        """
+        if self._finished:
+            return True
+        tries = self._cancel_only_tries
+        self._cancel_only_tries += 1
+        await self._cancel_manual_pending_for_cancel_only()
+        if await self._cancel_remaining_pending_orders():
+            held = len(await self._magic_positions() or [])
+            logger.info(
+                "task %s cancel-only done (reason=%s, positions kept=%d)",
+                self.task_id, self._stop_reason, held,
+            )
+            # residual 必须报 0：剩余持仓是「部分成交后保留下来的」，
+            # 不是「该平的没平掉」。报非 0 会被服务端降级成 stop_failed。
+            await self._finish("done", self._stop_reason, residual=0)
+            return True
+        if tries >= _CANCEL_ONLY_RETRIES:
+            logger.error(
+                "task %s cancel-only gave up after %d tries, pending orders left",
+                self.task_id, tries + 1,
+            )
+            # 挂单撤不干净不能报终态（带着挂单收口，那几张单随时可能成交成
+            # 没人管的孤儿仓），也不适合永久放弃 —— 重置计数，继续按间隔重试，
+            # 直到撤干净为止。任务期间不再处理行情，不会再挂出新单。
+            self._cancel_only_tries = 0
+            logger.warning(
+                "task %s cancel-only: pending orders left, retry in %.0fs",
+                self.task_id, _CANCEL_ONLY_RETRY_SEC,
+            )
+        return False
 
     async def _close_all(self) -> bool:
         """终止指令：平掉该魔术号的全部持仓并撤掉挂单。返回是否已确认干净并收口。

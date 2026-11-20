@@ -133,7 +133,8 @@ async def online(store, *nodes):
 _strategy_seq = iter(range(1, 10_000))
 
 
-async def mk_strategy(store, *, symbol="XAUUSD", owner_user_id=None):
+async def mk_strategy(store, *, symbol="XAUUSD", owner_user_id=None,
+                      entry_mode=None):
     sid = f"sty_lcs{next(_strategy_seq)}"
     rule = {
         "type": RULE_TYPE_RISK_SIZED, "status": 1, "action": "all",
@@ -141,6 +142,8 @@ async def mk_strategy(store, *, symbol="XAUUSD", owner_user_id=None):
         "add_batches": 2, "max_total_lot": 0.0,
         "breakeven_enabled": False, "breakeven_times": 1.0,
     }
+    if entry_mode:
+        rule["entry_mode"] = entry_mode
     row = {
         "strategy_id": sid,
         "name": f"趋势策略{sid}",
@@ -226,12 +229,13 @@ def capture_sender(sent, *, online_nodes=None):
     return fake_send
 
 
-async def setup_pair(store, *, stop_cascade_enabled=True, name="同步平仓组"):
+async def setup_pair(store, *, stop_cascade_enabled=True, name="同步平仓组",
+                     entry_mode=None):
     """建一个带单组 + 一个跟单节点，跑一次分发；返回 (group, leader_sub, follower_sub)。"""
     leader_id = await mk_leader(store)
     await online(store, mk_node("nd_leader", owner_user_id=leader_id, is_primary=True))
     await online(store, mk_node("nd_f"))
-    strategy = await mk_strategy(store, owner_user_id=leader_id)
+    strategy = await mk_strategy(store, owner_user_id=leader_id, entry_mode=entry_mode)
     group = await mk_group(
         store, name, ["nd_leader"], strategy=strategy,
         owner_user_id=leader_id, stop_cascade_enabled=stop_cascade_enabled,
@@ -244,7 +248,8 @@ async def setup_pair(store, *, stop_cascade_enabled=True, name="同步平仓组"
     manager.send_to_node = capture_sender(sent)
     try:
         await GroupDispatcher(store).dispatch(
-            TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1, stop_loss=2397.0),
+            TradingSignal(action="BUY", symbol="XAUUSD", volume=0.1, stop_loss=2397.0,
+                          entry_price=2400.0),
             f"sig_lcs_{name}",
         )
     finally:
@@ -286,9 +291,12 @@ def pos(ticket: int, magic: int, *, time: float, symbol="XAUUSD", volume=0.1,
 
 
 async def seed_account(store, node_id: str, positions: list, orders: list | None = None):
+    prev = await store.get_account(node_id) or {}
     await store.save_account(node_id, {
         "node_id": node_id, "login": 1, "positions": positions,
-        "orders": orders or [], "prices": {}, "quotes": {},
+        # 不传 orders 时沿用上一份快照：fixture 只关心持仓时不会把挂单意外清掉
+        "orders": list(orders) if orders is not None else list(prev.get("orders") or []),
+        "prices": {}, "quotes": {},
     })
 
 
@@ -695,3 +703,184 @@ def test_position_pairing_sorts_by_time_then_ticket():
     ])
     order = [r["ticket"] for r in rows[BASE + 1]]
     assert order == [9, 11, 10]
+
+
+# ---------------------------------------------------------------------------
+# ⑪ tpl_2 限价开仓：主节点撤挂单 -> 跟单节点同步撤单并收口
+# ---------------------------------------------------------------------------
+def order(ticket: int, magic: int, *, time: float = 100.0) -> dict:
+    return {
+        "ticket": ticket, "magic": magic, "symbol": "XAUUSD",
+        "type": "BUY", "volume": 0.1, "time": time,
+    }
+
+
+async def _seed_pending_baseline(store, leader_magic: int, ticket: int = 101) -> None:
+    """主节点 tpl_2 限价挂单：先空仓基线，再挂单（挂单进基线，不算平仓）。"""
+    await seed_account(store, "nd_leader", [], orders=[])
+    await leader_close_sync.on_snapshot(store, "nd_leader", [], orders=[])
+    orders = [order(ticket, leader_magic)]
+    await seed_account(store, "nd_leader", [], orders=orders)
+    await leader_close_sync.on_snapshot(store, "nd_leader", [], orders=orders)
+
+
+async def _wait_cancel_confirmed(store, monkeypatch, *, orders: list,
+                                 sent: list, rounds: int = 3) -> dict:
+    out: dict = {}
+    for _ in range(rounds):
+        await seed_account(store, "nd_leader", [], orders=orders)
+        out = await leader_close_sync.on_snapshot(
+            store, "nd_leader", [], orders=orders,
+        )
+    return out
+
+
+async def test_leader_cancel_pending_syncs_follower(store, monkeypatch):
+    """Case A：主节点未成交先撤单 -> 跟单节点收到 strategy_cancel_pending，
+    跟单子任务与主节点子任务都按 done 收口。"""
+    group, leader, follower = await setup_pair(
+        store, entry_mode="limit", name="限价撤单组",
+    )
+    m_lead = leader["magic"]
+    await _seed_pending_baseline(store, m_lead)
+
+    sent: list = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    # 连续 3 轮快照都看不到挂单 -> 确认撤单
+    out = await _wait_cancel_confirmed(store, monkeypatch, orders=[], sent=sent)
+    assert out["pending_sent"] == 1, f"应下发 1 条撤单，实际 {out}"
+    cmds = [m for n, m in sent if m.get("cmd") == "strategy_cancel_pending"]
+    assert len(cmds) == 1 and cmds[0]["magic"] == follower["magic"]
+
+    rows = await subtask_rows(group["group_id"])
+    for r in rows:
+        assert r["status"] == "done", f"{r['node_id']} 子任务应以 done 收口"
+    assert all(r["stop_source"] == "leader_cancel" for r in rows)
+
+
+async def test_single_round_missing_order_is_not_confirmed(store, monkeypatch):
+    """单轮读数抖动不算撤单：挂单下一轮就回来了 -> 继续静默也不会立刻确认。"""
+    group, leader, follower = await setup_pair(
+        store, entry_mode="limit", name="单轮抖动组",
+    )
+    m_lead = leader["magic"]
+    await _seed_pending_baseline(store, m_lead)
+    sent: list = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    # 第 1 轮快照抖动：挂单不见了（疑似撤单 count=1）
+    await seed_account(store, "nd_leader", [], orders=[])
+    out = await leader_close_sync.on_snapshot(store, "nd_leader", [], orders=[])
+    assert out["pending_sent"] == 0
+    # 第 2 轮挂单又回来了（没被撤）-> 嫌疑清零
+    back = [order(101, m_lead)]
+    await seed_account(store, "nd_leader", [], orders=back)
+    out = await leader_close_sync.on_snapshot(store, "nd_leader", [], orders=back)
+    assert out["pending_sent"] == 0
+    row = next(r for r in await subtask_rows(group["group_id"])
+               if r["node_id"] == "nd_f")
+    assert row["status"] not in ("done", "failed"), "抖动的挂单不得把子任务收口"
+
+
+async def test_pending_fill_is_not_treated_as_cancel(store, monkeypatch):
+    """挂单减少但持仓同步增加 = 成交，不是撤单 -> 不同步撤单。"""
+    group, leader, follower = await setup_pair(
+        store, entry_mode="limit", name="成交非撤单组",
+    )
+    m_lead = leader["magic"]
+    await _seed_pending_baseline(store, m_lead)
+    sent: list = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    filled = [pos(501, m_lead, time=100.0)]
+    for _ in range(4):
+        await seed_account(store, "nd_leader", filled, orders=[])
+        out = await leader_close_sync.on_snapshot(
+            store, "nd_leader", filled, orders=[],
+        )
+    assert out["pending_sent"] == 0
+    assert not [m for n, m in sent if m.get("cmd") == "strategy_cancel_pending"]
+
+
+async def test_market_entry_ignores_pending_cancel(store, monkeypatch):
+    """市价开仓（tpl_2 非 limit）不参与撤单同步。"""
+    group, leader, follower = await setup_pair(store, name="市价不开撤单组")
+    m_lead = leader["magic"]
+    await _seed_pending_baseline(store, m_lead)
+    sent: list = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    out = await _wait_cancel_confirmed(store, monkeypatch, orders=[], sent=sent, rounds=4)
+    assert out["pending_sent"] == 0
+
+
+async def test_partial_fill_then_cancel_keeps_position(store, monkeypatch):
+    """Case B：部分成交后撤剩余挂单 -> 撤单同步，跟单子任务 done 但保留持仓数。"""
+    group, leader, follower = await setup_pair(
+        store, entry_mode="limit", name="部分成交撤单组",
+    )
+    m_lead, m_f = leader["magic"], follower["magic"]
+    # 主节点 2 张挂单 -> 成交 1 张（变持仓）+ 撤 1 张
+    await seed_account(store, "nd_leader", [], orders=[
+        order(101, m_lead), order(102, m_lead, time=101.0),
+    ])
+    await leader_close_sync.on_snapshot(
+        store, "nd_leader", [],
+        orders=[order(101, m_lead), order(102, m_lead, time=101.0)],
+    )
+    filled = [pos(501, m_lead, time=100.0)]
+    await seed_account(store, "nd_f", [pos(601, m_f, time=100.0)],
+                       orders=[order(701, m_f)])
+    sent: list = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    out = await _wait_cancel_confirmed(
+        store, monkeypatch, orders=[order(101, m_lead)], sent=sent,
+    )
+    # 只有成交那笔变成持仓后挂单净减 1，不该判成撤单
+    assert out["pending_sent"] == 0
+    # 再把成交的那笔也撤掉（持仓 0，挂单 0）—— 净减 1，持仓未增 -> 撤单
+    out = await _wait_cancel_confirmed(store, monkeypatch, orders=[], sent=sent)
+    assert out["pending_sent"] == 1
+    f_row = next(r for r in await subtask_rows(group["group_id"])
+                 if r["node_id"] == "nd_f")
+    assert f_row["status"] == "done"
+
+
+async def test_offline_follower_queues_cancel_pending(store, monkeypatch):
+    """跟单节点离线：撤单指令入 pending_stop，子任务按 done 收口。"""
+    group, leader, follower = await setup_pair(
+        store, entry_mode="limit", name="撤单离线组",
+    )
+    m_lead = leader["magic"]
+    await _seed_pending_baseline(store, m_lead)
+    monkeypatch.setattr(manager, "send_to_node", capture_sender([], online_nodes=set()))
+    out = await _wait_cancel_confirmed(store, monkeypatch, orders=[], sent=[])
+    assert out["pending_queued"] == 1
+    pending = await store.pop_pending_stops("nd_f")
+    assert pending and pending[0]["cmd"] == "strategy_cancel_pending"
+    f_row = next(r for r in await subtask_rows(group["group_id"])
+                 if r["node_id"] == "nd_f")
+    assert f_row["status"] == "done"
+
+
+def test_snapshot_kind_distinguishes_orders():
+    """挂单进基线带 kind=order，_lost_tickets 只认 position。"""
+    base = (
+        leader_close_sync._snapshot_rows([pos(1, BASE + 1, time=1.0)])
+        + leader_close_sync._order_rows([order(2, BASE + 1)])
+    )
+    assert [r["kind"] for r in base] == ["position", "order"]
+    lost = leader_close_sync._lost_tickets(base, [])
+    assert lost == {1}, "挂单消失不得被当成持仓被平"
+
+
+def test_pending_cancelled_formula():
+    base = (
+        leader_close_sync._snapshot_rows([])
+        + leader_close_sync._order_rows([order(1, BASE + 7), order(2, BASE + 7)])
+    )
+    # 1 张成交成持仓、1 张被撤：挂单净减 1，持仓 +1 -> 撤单 0
+    cur = (
+        leader_close_sync._snapshot_rows([pos(1, BASE + 7, time=1.0)])
+        + leader_close_sync._order_rows([order(2, BASE + 7)])
+    )
+    assert leader_close_sync._pending_cancelled(base, cur) == {}
+    # 两张都被撤：净减 2、持仓 +0 -> 撤单 2
+    assert leader_close_sync._pending_cancelled(base, []) == {BASE + 7: 2}
