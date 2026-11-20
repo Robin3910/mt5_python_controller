@@ -18,7 +18,6 @@ import { useRoute, useRouter } from 'vue-router'
 import { useAiFollowDraftStore } from '@/stores/aiFollowDraft'
 import StrategyFormModal from '@/components/StrategyFormModal.vue'
 import RobotIcon from '@/components/RobotIcon.vue'
-import { deleteNodeWithConfirmation } from '@/composables/useNodeDeletion'
 import { trackAiUi } from '@/utils/aiAudit'
 import type { AiApplication } from '@/api/aiChannel'
 import AiFollowNodesPanel from '@/components/AiFollowNodesPanel.vue'
@@ -559,7 +558,6 @@ const pendingNodeIds = computed(() => new Set(pendingApplications.value
 const pickerNodes = computed(() => (detail.value?.my_nodes || []).filter((node) =>
   `${node.name || ''} ${node.mt5_login || ''} ${node.node_id}`.toLowerCase().includes(pickerSearch.value.toLowerCase()),
 ))
-const pickerBusy = ref(false)
 let pickerSearchTimer: number | undefined
 function closePicker(): void {
   pickerOpen.value = false
@@ -587,20 +585,6 @@ function trapPickerFocus(event: KeyboardEvent): void {
     event.preventDefault()
     first.focus()
   }
-}
-async function removePickerNode(nodeId: string): Promise<void> {
-  if (pickerBusy.value) return
-  pickerBusy.value = true
-  trackAiUi('open_delete', { node_ids: [nodeId] })
-  try {
-    if (await deleteNodeWithConfirmation(nodeId)) {
-      selectedNodeIds.value = selectedNodeIds.value.filter((id) => id !== nodeId)
-      await refreshAll()
-      if (detail.value) await openRobot(detail.value.robot)
-      ElMessage.success('系统节点已删除')
-    } else trackAiUi('cancel_dialog', { node_ids: [nodeId], value: 'node_deletion' })
-  } catch (cause) { ElMessage.error(errText(cause, '删除节点失败')) }
-  finally { pickerBusy.value = false }
 }
 function entryForApplication(application: AiApplication): MyRobotEntry | undefined {
   return myFollowing.value.find((entry) => entry.robot.group_id === application.group_id)
@@ -1174,11 +1158,10 @@ onMounted(() => { void hub.fetchNodes(); trackAiUi('page_view', { value: 'ai-tra
             <p v-if="!pickerNodes.length" class="ai-empty">{{ pickerSearch ? '没有匹配的节点' : '暂无已开通的自有节点' }}</p>
             <div v-for="node in pickerNodes" :key="node.node_id" class="ai-pick" :class="{ on: selectedNodeIds.includes(node.node_id), off: !canPickNode(node.node_id) }">
               <label><input type="checkbox" :checked="selectedNodeIds.includes(node.node_id) || (pickerMode === 'join' && (alreadyFollowingNodeIds.has(node.node_id) || pendingNodeIds.has(node.node_id)))" :disabled="submitting || !canPickNode(node.node_id)" @change="togglePick(node.node_id)"><i class="node-dot" :class="{ online: node.online }"></i><span><b>{{ node.name || node.node_id }} <em v-if="node.is_primary">♛ 主节点</em></b><small>{{ node.mt5_login || node.node_id }} · {{ node.owner_name || auth.me?.username }} · 余额 {{ node.balance == null ? '暂无数据' : node.balance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' U' }}</small><small v-if="pendingNodeIds.has(node.node_id)" class="ai-pending-hint">审核中</small><small v-else-if="alreadyFollowingNodeIds.has(node.node_id)">已跟随该机器人</small><small v-else-if="node.unselectable_reason">{{ node.unselectable_reason }}</small></span></label>
-              <button type="button" class="ai-picker-delete" :aria-label="`删除节点 ${node.name || node.node_id}`" :disabled="submitting || pickerBusy" @click.stop="removePickerNode(node.node_id)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7"/></svg></button>
             </div>
           </div>
         </div>
-        <footer><div><button type="button" @click="closePicker">取消</button><button type="button" class="primary" :disabled="submitting || pickerBusy || (!selectedNodeIds.length && pickerMode === 'join') || (detailPaused && pickerMode === 'join')" @click="submitPicker">{{ submitting ? '提交中…' : pickerMode === 'settings' ? '保存设置' : `⇄ 使用 ${selectedNodeIds.length} 个节点跟单` }}</button></div><p>可同时勾选多个节点，审核通过后同步所选机器人的新信号</p></footer>
+        <footer><div><button type="button" @click="closePicker">取消</button><button type="button" class="primary" :disabled="submitting || (!selectedNodeIds.length && pickerMode === 'join') || (detailPaused && pickerMode === 'join')" @click="submitPicker">{{ submitting ? '提交中…' : pickerMode === 'settings' ? '保存设置' : `⇄ 使用 ${selectedNodeIds.length} 个节点跟单` }}</button></div><p>可同时勾选多个节点，审核通过后同步所选机器人的新信号</p></footer>
       </section>
     </div>
   </div>
@@ -1374,9 +1357,6 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .ai-pick small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 3px; }
 .ai-pick b em { color: #fbbf24; border: 1px solid #f59e0b50; background: #f59e0b15; border-radius: 4px; padding: 1px 4px; font-size: 9px; }
 .ai-pending-hint { color: #fbbf24!important; }
-.ai-picker-delete { display: grid; place-items: center; width: 32px; height: 32px; flex-shrink: 0; margin-right: 7px; color: #64748b; background: none; border: 0; border-radius: 6px; cursor: pointer; }
-.ai-picker-delete:hover { color: #f87171; background: #f6465d15; }
-.ai-picker-delete svg { width: 14px; height: 14px; }
 .ai-picker-dialog > footer { display: block; flex-shrink: 0; border-top: 1px solid #1c2740; padding: 10px 16px 12px; margin: 0; background: #101828; }
 .ai-picker-dialog > footer > div { display: flex; gap: 8px; }
 .ai-picker-dialog > footer button { flex: 1; padding: 10px; border: 1px solid #22304a; border-radius: 10px; background: #0c1220; color: #8b96a8; font-size: 11px; cursor: pointer; }

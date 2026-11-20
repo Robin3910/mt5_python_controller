@@ -420,18 +420,19 @@ function isAiApplication(row: FollowApplication): boolean {
 }
 
 const occupiedPairs = computed(() => {
-  const pairs = new Set<string>()
+  const pairs = new Map<string, 'following' | 'pending'>()
+  for (const row of mine.value.applications || []) {
+    if (row.status !== 'pending') continue
+    if (isAiApplication(row)) continue
+    pairs.set(`${row.group_id}:${row.node_id}`, 'pending')
+  }
+  // 申请和关系分别读取，已生效的关系覆盖同一组节点的旧待审状态。
   for (const leader of mine.value.following) {
     // AI 市场（tpl_1）的关系归【AI 交易】页管，不参与带单侧的「已跟随」判定
     for (const group of leader.groups) {
       if (group.market === 'ai') continue
-      for (const node of group.my_nodes) pairs.add(`${group.group_id}:${node.node_id}`)
+      for (const node of group.my_nodes) pairs.set(`${group.group_id}:${node.node_id}`, 'following')
     }
-  }
-  for (const row of mine.value.applications || []) {
-    if (row.status !== 'pending') continue
-    if (isAiApplication(row)) continue
-    pairs.add(`${row.group_id}:${row.node_id}`)
   }
   return pairs
 })
@@ -474,13 +475,21 @@ function applicationRows(leaderId: number): FollowApplication[] {
 
 function nodeFollowHint(id: string): string {
   if (isOwnSourceNode(id)) return '主节点已在带单分组内'
-  const groups = targetGroupIds.value.length
-    ? targetGroupIds.value
-    : selectableGroups.value.map((g) => g.group_id)
+  const groups = targetGroupIds.value
   if (!groups.length) return '暂无可申请分组'
-  const occupied = groups.filter(gid => occupiedPairs.value.has(`${gid}:${id}`)).length
-  if (!occupied) return ''
-  return occupied === groups.length ? '已跟随 / 待审核' : '部分已跟随 / 待审核'
+  let following = 0
+  let pending = 0
+  for (const gid of groups) {
+    const status = occupiedPairs.value.get(`${gid}:${id}`)
+    if (status === 'following') following++
+    else if (status === 'pending') pending++
+  }
+  if (following === groups.length) return '已跟随'
+  if (pending === groups.length) return '待审核'
+  return [
+    following ? `已跟随 ${following} 组` : '',
+    pending ? `待审核 ${pending} 组` : '',
+  ].filter(Boolean).join(' · ')
 }
 function searchPicker(): void {
   window.clearTimeout(pickerSearchTimer)
