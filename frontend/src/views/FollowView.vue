@@ -1462,7 +1462,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
                     <p><em :class="(p.type || '').toLowerCase() === 'buy' ? 'buy' : 'sell'">{{ (p.type || '').toLowerCase() === 'buy' ? 'BUY' : 'SELL' }}</em>{{ p.symbol }}</p>
                     <small>开仓 {{ fmtTime(p.time) }} · {{ (p.volume || 0).toFixed(2) }} 手 @ {{ fmtPx(p.price_open) }} · SL {{ fmtPx(p.sl) }} / TP {{ fmtPx(p.tp) }}</small>
                   </div>
-                  <div class="fd-pos-side"><span class="dot">正在持仓</span><strong :class="(p.profit || 0) >= 0 ? 'up' : 'down'">{{ fmtU(p.profit || 0) }} U</strong></div>
+                  <!-- <div class="fd-pos-side"><span class="dot">正在持仓</span><strong :class="(p.profit || 0) >= 0 ? 'up' : 'down'">{{ fmtU(p.profit || 0) }} U</strong></div> -->
                 </div>
               </div>
               <div class="fd-stats">
