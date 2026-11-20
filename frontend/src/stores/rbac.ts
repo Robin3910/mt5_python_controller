@@ -27,6 +27,7 @@ export const CAPABILITIES = [
 export const useRbacStore = defineStore('rbac', {
   state: (): RbacState => ({ users: [], roles: [], menus: [] }),
   getters: {
+    activeAdmins: (s): UserOut[] => s.users.filter(u => u.is_admin && u.is_active).sort((a, b) => a.id - b.id),
     /** 可分配给角色的菜单（仅管理员菜单不出现在勾选项里） */
     assignableMenus: (s): MenuDef[] => s.menus.filter((m) => m.assignable),
     menuName: (s) => (code: string): string => s.menus.find((m) => m.code === code)?.name || code,
@@ -62,9 +63,10 @@ export const useRbacStore = defineStore('rbac', {
       await this.fetchUsers()
     },
     /** 整体替换用户名下节点；409 由调用方按 detail.reason 提示并决定是否带 confirm 重发 */
-    async assignNodes(id: number, nodeIds: string[], confirm = false): Promise<UserNodesResult> {
+    async assignNodes(id: number, nodeIds: string[], confirm = false, reclaimAdminId?: number): Promise<UserNodesResult> {
       const { data } = await api.put<UserNodesResult>(`/api/users/${id}/nodes`, {
         node_ids: nodeIds,
+        reclaim_admin_id: reclaimAdminId,
         confirm,
       })
       await this.fetchUsers()

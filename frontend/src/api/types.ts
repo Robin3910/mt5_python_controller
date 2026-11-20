@@ -345,6 +345,7 @@ export interface FeatureSwitchInfo {
 }
 
 export interface NodeCreatePayload {
+  admin_owner_id?: number
   // 留空时后端会自动生成 "{序号}-{mt5_login}"（序号从 1 起按节点位置递增）
   name?: string
   mt5_login: number
@@ -492,6 +493,7 @@ export interface ManualSmcLevel {
 
 // 后台手动触发的信号（复用 Webhook 分发流程）
 export interface ManualSignalPayload {
+  trading_primary_id?: string
   symbol: string
   /** 交易信号必填；type=smc-data 时不需要 */
   action?: ManualSignalAction

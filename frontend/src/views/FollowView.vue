@@ -957,7 +957,7 @@ const nodeCards = computed<NodeCard[]>(() => {
           node_id: node.node_id,
           name: node.name || node.node_id,
           login: node.mt5_login,
-          online: hub.statuses[node.node_id] === 'online' || node.status === 'online',
+          online: hub.isNodeOnline(node),
           symbols: '',
           leaders: '',
           count: 0,

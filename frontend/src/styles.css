@@ -3460,11 +3460,14 @@ body:has(.app-shell.is-customer) {
   font-weight: 600;
   color: #E6EBF4;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .brand-back {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  min-width: 0;
   margin: 0;
   padding: 0;
   border: none;
@@ -3476,10 +3479,12 @@ body:has(.app-shell.is-customer) {
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
 }
-.brand-back svg { width: 18px; height: 18px; }
+.brand-back svg { width: 18px; height: 18px; flex-shrink: 0; }
+.brand-back span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .brand-back:hover { background: transparent; color: #fff; }
 .topbar-customer .nav {
-  flex: 0 1 auto;
+  flex: 0 0 auto;
+  max-width: 100%;
   min-width: 0;
   justify-content: flex-start;
   gap: 2px;
@@ -3548,7 +3553,6 @@ body:has(.app-shell.is-customer) {
   }
   .topbar-customer .brand { display: flex; }
   .topbar-customer .nav {
-    flex: 0 1 auto;
     justify-content: flex-start;
     gap: 2px;
   }
@@ -3570,6 +3574,11 @@ body:has(.app-shell.is-customer) {
 }
 @media (max-width: 429px) {
   .brand-page { display: none; }
+}
+@media (max-width: 360px) {
+  .topbar-customer-inner { gap: 6px; }
+  .topbar-customer .nav a { padding: 0 3px; }
+  .brand-customer .brand-back span { display: none; }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════

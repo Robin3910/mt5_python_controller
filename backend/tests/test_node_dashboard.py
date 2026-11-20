@@ -65,7 +65,7 @@ def test_enrollment_requires_assignment_and_admin_intent(client, enable_first):
     uid, h = user(client, admin)
     n = enrolled(client, h)
     nid = n["node_id"]
-    assert n["owner_user_id"] is None and n["requested_by_user_id"] == uid
+    assert n["owner_user_id"] == client.get("/api/me", headers=admin).json()["user_id"] and n["requested_by_user_id"] == uid
     assert n["approval_status"] == "pending" and n["enabled"] is False and n["legacy_allowed"] is False
     assert enrolled(client, h)["node_id"] == nid
     assert client.get(f"{PREFIX}/enrollments", headers=h).json()["items"][0]["node_id"] == nid
@@ -86,7 +86,7 @@ def test_admin_application_can_approve_without_assignment(client):
     admin = auth_headers(client)
     n = enrolled(client, admin)
     data = enable(client, admin, n["node_id"])
-    assert data["owner_user_id"] is None and data["enabled"] and data["approval_status"] == "approved"
+    assert data["owner_user_id"] == client.get("/api/me", headers=admin).json()["user_id"] and data["enabled"] and data["approval_status"] == "approved"
 
 
 def test_other_user_cannot_claim_or_view_application(client):
@@ -325,7 +325,7 @@ def test_approval_and_assignment_roll_back_when_audit_fails(client, monkeypatch)
     monkeypatch.setattr(dashboard_audit, "begin_operation", fail)
     assert client.put(f"/api/users/{uid}/nodes", headers=admin, json={"node_ids": [nid]}).status_code == 503
     data = client.get(f"/api/nodes/{nid}", headers=admin).json()
-    assert data["owner_user_id"] is None and data["approval_status"] == "pending" and not data["enabled"]
+    assert data["owner_user_id"] == client.get("/api/me", headers=admin).json()["user_id"] and data["approval_status"] == "pending" and not data["enabled"]
 
 
 def test_daemon_history_replay_after_transfer_keeps_original_actor(client):

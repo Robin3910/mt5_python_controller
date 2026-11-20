@@ -271,11 +271,7 @@ async def write_following(
     node = await s.get(Node, node_id)
     if node is None:
         return False
-    if node.owner_user_id is None:
-        from .node_credentials import is_admin_user
-        if not await is_admin_user(s, follower_user_id):
-            return False
-    elif node.owner_user_id != int(follower_user_id):
+    if node.owner_user_id != int(follower_user_id):
         return False
     exists = await s.scalar(select(GroupFollowerNode).where(
         GroupFollowerNode.group_id == group_id, GroupFollowerNode.node_id == node_id,

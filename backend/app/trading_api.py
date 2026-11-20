@@ -230,7 +230,7 @@ async def quick_trigger(
     node = await store.get_node(body.node_id)
     if not node or not node.get("is_primary") or not node.get("enabled", True):
         raise HTTPException(status_code=400, detail=_PRIMARY_NOT_FOUND)
-    if not permissions.owns(p, node.get("owner_user_id")):
+    if not permissions.same_owner(p.user_id, node.get("owner_user_id")):
         raise HTTPException(status_code=403, detail=_PRIMARY_NOT_OWNED)
     if not manager.is_node_online(body.node_id):
         raise HTTPException(status_code=400, detail=_PRIMARY_OFFLINE)

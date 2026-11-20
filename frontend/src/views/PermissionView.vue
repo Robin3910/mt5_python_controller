@@ -66,6 +66,7 @@ const showNodes = ref(false)
 const nodeTarget = ref<UserOut | null>(null)
 const selectedNodeIds = ref<string[]>([])
 const nodeQuery = ref('')
+const reclaimAdminId = ref<number>()
 type NodeFilter = 'all' | 'unassigned' | 'mine' | 'others'
 const nodeFilter = ref<NodeFilter>('all')
 const NODE_FILTER_TAGS: TagOption<NodeFilter>[] = [
@@ -123,10 +124,11 @@ const enabledRoles = computed(() => rbac.roles.filter((r) => r.enabled))
 const filteredAssignNodes = computed(() => {
   const q = nodeQuery.value.trim().toLowerCase()
   return hub.nodes.filter((n) => {
-    if (nodeFilter.value === 'unassigned' && n.owner_user_id != null) return false
+    const adminOwned = rbac.users.some(u => u.is_admin && u.id === n.owner_user_id)
+    if (nodeFilter.value === 'unassigned' && !adminOwned) return false
     if (nodeFilter.value === 'mine' && n.owner_user_id !== nodeTarget.value?.id) return false
     if (nodeFilter.value === 'others') {
-      if (n.owner_user_id == null || n.owner_user_id === nodeTarget.value?.id) return false
+      if (adminOwned || n.owner_user_id === nodeTarget.value?.id) return false
     }
     if (!q) return true
     return [n.name, n.node_id, String(n.mt5_login || ''), n.owner_username || '']
@@ -181,7 +183,7 @@ function capabilityLabel(code: string): string {
 }
 
 function nodeOwnerLabel(n: NodeOut): string {
-  if (n.owner_user_id == null) return '管理员'
+  if (n.owner_user_id == null) return '历史未归属'
   return n.owner_username || `用户 #${n.owner_user_id}`
 }
 
@@ -402,6 +404,7 @@ async function removeUser(user: UserOut): Promise<void> {
 
 async function openNodes(user: UserOut): Promise<void> {
   nodeTarget.value = user
+  reclaimAdminId.value = rbac.activeAdmins.find(u => u.id !== user.id)?.id
   selectedNodeIds.value = [...user.node_ids]
   nodeQuery.value = ''
   nodeFilter.value = 'all'
@@ -451,7 +454,7 @@ async function saveNodes(confirm = false): Promise<void> {
   nodeHint.value = ''
   nodeSaving.value = true
   try {
-    const result = await rbac.assignNodes(nodeTarget.value.id, selectedNodeIds.value, confirm)
+    const result = await rbac.assignNodes(nodeTarget.value.id, selectedNodeIds.value, confirm, reclaimAdminId.value)
     await hub.fetchNodes()
     const parts: string[] = []
     if (result.added.length) parts.push(`划入 ${result.added.length} 个`)
@@ -973,18 +976,16 @@ async function removeRole(role: RoleOut): Promise<void> {
             分配节点 · {{ nodeTarget.is_admin ? '自分配' : nodeTarget.username }}
           </div>
           <p class="muted" style="font-size: 12px; margin: 4px 0 0">
-            <template v-if="nodeTarget.is_admin">
-              把「管理员名下」的节点勾给自己后，这些节点会转入你个人名下，
-              并按同一套「自己名下」口径出现在你的首页与交易页；去掉的则退回管理员名下。
-              节点上还有进行中的策略任务时不能改；仍在分组里时需确认后移出。
-            </template>
-            <template v-else>
-              整体替换该用户名下节点：勾上的划给他，去掉的回到管理员名下。
-              节点上还有进行中的策略任务时不能改；仍在分组里时需确认后移出。
-            </template>
+            勾上的节点划给该账号，去掉的节点回收到所选管理员名下。有在跑任务时不能变更；移出分组或解除跟单须二次确认。
           </p>
         </div>
         <div class="modal-body">
+          <label v-if="nodeTarget.node_ids.some(id => !selectedNodeIds.includes(id))">回收到管理员
+            <select v-model="reclaimAdminId" class="pf-input">
+              <option v-for="u in rbac.activeAdmins.filter(u => u.id !== nodeTarget?.id)" :key="u.id" :value="u.id">{{ u.username }}</option>
+            </select>
+            <span v-if="!reclaimAdminId">无其他管理员，请在节点授权中选择接收用户。</span>
+          </label>
           <div class="row perm-node-tools">
             <input
               v-model="nodeQuery"

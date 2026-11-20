@@ -24,7 +24,6 @@ import type {
   ManualSignalPayload,
   ManualSignalResult,
   DealRecord,
-  NodeOut,
   PendingOrder,
   Position,
   QuoteInfo,
@@ -36,42 +35,14 @@ const hub = useHubStore()
 const auth = useAuthStore()
 const router = useRouter()
 
-// 头部状态信息：MT5 登录号、服务器、在线/离线
-/**
- * 主节点选取规则（仅管理员一侧改变）：
- *
- * - 管理员：只允许 `owner_user_id === 当前管理员 user_id` 区间内的 `is_primary && enabled`
- *   节点；这是后端 owner_user_id 维度的真实语义（参见 backend/node_service.py 中
- *   `_clear_primary_for_owner` / `set_primary`）。如果该范围内没有主节点，回退到
- *   模板的「尚未设置主节点」空态，不静默拿别人的主节点顶替——这条规则把
- *   「管理员的【交易】页不能拿普通用户的主节点来展示」这一点固化下来。
- * - 普通用户：保持原有 `is_primary && enabled` 行为不变。后端 `/api/nodes` 接口已
- *   经按 owner 过滤，普通用户能看到的列表里 `is_primary=true` 的节点本来就是
- *   他自己的主节点，无需在客户端再收紧。
- */
-const primaryNode = computed<NodeOut | undefined>(() => {
-  if (auth.isAdmin && auth.me?.user_id != null) {
-    const myId = auth.me.user_id
-    const owned = hub.nodes.find(
-      (n) => n.is_primary && n.enabled && (n.owner_user_id ?? null) === myId,
-    ) as NodeOut | undefined
-    if (owned) return owned
-    // 管理员名下没有主节点 → 让模板显示「尚未设置主节点」空态，
-    // 不再去找"第一个 is_primary" 顶替。
-    return undefined
-  }
-  return hub.nodes.find((n) => n.is_primary && n.enabled) as NodeOut | undefined
-})
+const primaryNode = computed(() => hub.nodes.find(n => n.is_primary && n.enabled && n.owner_user_id != null && n.owner_user_id === auth.me?.user_id))
 
 const account = computed<AccountSnapshot | null>(() => {
   if (!primaryNode.value) return null
   return hub.accounts[primaryNode.value.node_id] || null
 })
 
-function nodeOnline(n: NodeOut): boolean {
-  return hub.statuses[n.node_id] === 'online' || n.status === 'online'
-}
-const isOnline = computed(() => !!primaryNode.value && nodeOnline(primaryNode.value))
+const isOnline = computed(() => !!primaryNode.value && hub.isNodeOnline(primaryNode.value))
 
 // ── 多品种报价 ──
 // 不再限制白名单，动态从账户数据中获取所有有报价或持仓的品种
@@ -282,7 +253,7 @@ async function refreshGridTasks(initial = false): Promise<void> {
       }
     }
     const gridGroups = (hub.groups || []).filter(
-      (g: GroupOut) => typeof g.name === 'string' && g.name.startsWith('grid-'),
+      (g: GroupOut) => g.owner_user_id === auth.me?.user_id && typeof g.name === 'string' && g.name.startsWith('grid-'),
     )
     if (gridGroups.length === 0) {
       gridTasks.value = []
@@ -617,19 +588,27 @@ function pendHiddenCount(group: PendingMagicGroup, symbol: string): number {
 
 const actionBusy = ref('')
 
+function samePrimary(nodeId: string): boolean {
+  if (primaryNode.value?.node_id === nodeId) return true
+  ElMessage.warning('主节点已变更，请重新确认操作')
+  return false
+}
+
 async function closeSymbolAll(symbol: string): Promise<void> {
   if (!primaryNode.value || actionBusy.value) return
+  const nodeId = primaryNode.value.node_id
   const n = allPositions.value.filter((p) => p.symbol === symbol).length
   if (!n) { ElMessage.info('该品种没有持仓'); return }
   if (!(await confirmAction(
     `确认平掉 ${symbol} 的全部 ${n} 笔持仓？\n同品种策略仍在运行时可能再次开仓。`,
     '一键平仓',
   ))) return
+  if (!samePrimary(nodeId)) return
   actionBusy.value = `all:${symbol}`
   try {
-    await hub.closeNode(primaryNode.value.node_id, { target: 'symbol', symbol })
+    await hub.closeNode(nodeId, { target: 'symbol', symbol })
     ElMessage.success(`已提交平掉 ${symbol}`)
-    hub.fetchNodeAccount(primaryNode.value.node_id).catch(() => {})
+    hub.fetchNodeAccount(nodeId).catch(() => {})
   } catch (e) {
     const err = e as { response?: { data?: { detail?: string } } }
     ElMessage.error(err?.response?.data?.detail || '平仓失败')
@@ -640,18 +619,20 @@ async function closeSymbolAll(symbol: string): Promise<void> {
 
 async function closeSymbolProfit(symbol: string): Promise<void> {
   if (!primaryNode.value || actionBusy.value) return
+  const nodeId = primaryNode.value.node_id
   const winners = allPositions.value.filter((p) => p.symbol === symbol && (p.profit || 0) > 0 && p.ticket)
   if (!winners.length) { ElMessage.info('该品种没有盈利持仓'); return }
   if (!(await confirmAction(
     `确认平掉 ${symbol} 当前浮动盈利的 ${winners.length} 笔持仓？\n不会终止策略，策略仍在运行时可能再次开仓。`,
     '平盈',
   ))) return
+  if (!samePrimary(nodeId)) return
   actionBusy.value = `profit:${symbol}`
   let sent = 0
   let failed = 0
   for (const p of winners) {
     try {
-      await hub.closeNode(primaryNode.value.node_id, { target: 'ticket', ticket: p.ticket })
+      await hub.closeNode(nodeId, { target: 'ticket', ticket: p.ticket })
       sent += 1
     } catch {
       failed += 1
@@ -661,11 +642,12 @@ async function closeSymbolProfit(symbol: string): Promise<void> {
   if (failed && !sent) ElMessage.error('平盈失败')
   else if (failed) ElMessage.warning(`已提交 ${sent} 笔，${failed} 笔失败`)
   else ElMessage.success(`已提交平掉 ${sent} 笔盈利持仓`)
-  hub.fetchNodeAccount(primaryNode.value.node_id).catch(() => {})
+  hub.fetchNodeAccount(nodeId).catch(() => {})
 }
 
 async function cancelSymbolPending(symbol: string): Promise<void> {
   if (!primaryNode.value || actionBusy.value) return
+  const nodeId = primaryNode.value.node_id
   const orders = pendingOf(symbol)
   if (!orders.length) { ElMessage.info('该品种没有挂单'); return }
   const tickets = orders.map((o) => o.ticket).filter((t) => t > 0)
@@ -679,11 +661,12 @@ async function cancelSymbolPending(symbol: string): Promise<void> {
     `确认删除 ${symbol} 的全部挂单（${orders.length} 张）？\n只撤这些挂单，持仓不动，其他品种不受影响。${manualNote}\n策略仍在运行的挂单可能重新挂出。\n\n${lines}`,
     '删挂单',
   ))) return
+  if (!samePrimary(nodeId)) return
   actionBusy.value = `pend:${symbol}`
   try {
     // 按**订单号**精确撤销：不按魔术号圈定范围，否则同魔术号其它品种的挂单
     // 会被一起撤掉（越界误撤）。
-    const res = await hub.cancelPendingOrders(primaryNode.value.node_id, tickets)
+    const res = await hub.cancelPendingOrders(nodeId, tickets)
     if (res.status === 'ok') {
       ElMessage.success(`已撤销 ${symbol} 的 ${res.cancelled} 张挂单`)
     } else if (res.cancelled > 0) {
@@ -691,7 +674,7 @@ async function cancelSymbolPending(symbol: string): Promise<void> {
     } else {
       ElMessage.error(res.failed[0]?.error || '删挂单失败')
     }
-    hub.fetchNodeAccount(primaryNode.value.node_id).catch(() => {})
+    hub.fetchNodeAccount(nodeId).catch(() => {})
   } catch (e) {
     const err = e as { response?: { data?: { detail?: string } } }
     ElMessage.error(err?.response?.data?.detail || '删挂单失败')
@@ -710,6 +693,7 @@ function isCancellingPending(ticket: number): boolean {
 async function cancelPendingRow(o: PendingOrder): Promise<void> {
   if (!primaryNode.value || !o.ticket) return
   if (actionBusy.value || isCancellingPending(o.ticket)) return
+  const nodeId = primaryNode.value.node_id
   const dirLabel = isBuySide(o.type) ? '多' : '空'
   const kindLabel = pendingKindLabel(o)
   try {
@@ -725,21 +709,22 @@ async function cancelPendingRow(o: PendingOrder): Promise<void> {
   } catch {
     return
   }
+  if (!samePrimary(nodeId)) return
   cancellingTickets.value = new Set([...cancellingTickets.value, o.ticket])
   try {
-    const res = await hub.cancelPendingOrder(primaryNode.value.node_id, o.ticket)
+    const res = await hub.cancelPendingOrder(nodeId, o.ticket)
     if (res.strategy_owned) {
       ElMessage.warning(`已撤销 #${o.ticket}，但它是策略挂单，策略可能在下一轮重新挂出`)
     } else {
       ElMessage.success(`已撤销挂单 #${o.ticket}`)
     }
-    hub.fetchNodeAccount(primaryNode.value.node_id).catch(() => {})
+    hub.fetchNodeAccount(nodeId).catch(() => {})
   } catch (e) {
     const err = e as { response?: { data?: { detail?: string } }; message?: string }
     // 404 = 该单已不在盘上（已成交或已被撤），不是服务端故障
     const msg = err?.response?.data?.detail || err?.message || `撤单失败 #${o.ticket}`
     ElMessage.error(msg)
-    hub.fetchNodeAccount(primaryNode.value.node_id).catch(() => {})
+    hub.fetchNodeAccount(nodeId).catch(() => {})
   } finally {
     const next = new Set(cancellingTickets.value)
     next.delete(o.ticket)
@@ -962,6 +947,7 @@ const STRATEGY_LABEL: Record<TradingStrategyType, string> = {
 }
 
 const dialogVisible = ref(false)
+watch(() => primaryNode.value?.node_id, () => { dialogVisible.value = false })
 const submitting = ref(false)
 const lastError = ref('')
 const defaultVolume = ref(0.01)
@@ -994,6 +980,7 @@ async function openDialog(type: TradingStrategyType): Promise<void> {
     ElMessage.warning('主节点不在线，无法触发')
     return
   }
+  const nodeId = primaryNode.value.node_id
   strategyType.value = type
   form.symbol = currentSymbol.value
   form.volume = defaultVolume.value
@@ -1020,7 +1007,7 @@ async function openDialog(type: TradingStrategyType): Promise<void> {
   } catch {
     dialogGroupId.value = null
   }
-  dialogVisible.value = true
+  if (samePrimary(nodeId)) dialogVisible.value = true
 }
 
 const canSubmit = computed(() => {
@@ -1052,7 +1039,7 @@ const dialogGroupName = computed(() => {
 function resolveDialogGroupId(groups: GroupOut[]): string | null {
   const target = dialogGroupName.value
   if (!target) return null
-  const hit = groups.find((g) => g.name === target)
+  const hit = groups.find((g) => g.owner_user_id === auth.me?.user_id && g.name === target)
   return hit?.group_id ?? null
 }
 
@@ -1114,7 +1101,8 @@ async function triggerStrategyFromDialog(
   payload: ManualSignalPayload,
 ): Promise<void> {
   try {
-    const res: ManualSignalResult = await hub.triggerManualSignal(payload)
+    if (!primaryNode.value) throw new Error('请先设置自己的主节点')
+    const res: ManualSignalResult = await hub.triggerManualSignal({ ...payload, trading_primary_id: primaryNode.value.node_id })
     if (res.status === 'accepted' || res.status === 'duplicate') {
       // 成功 / 重复都关掉弹窗（重复是幂等保护，无副作用）
       dialogVisible.value = false
@@ -1144,6 +1132,7 @@ async function closePosition(p: Position): Promise<void> {
     return
   }
   if (closingTickets.value.has(p.ticket)) return
+  const nodeId = primaryNode.value.node_id
   const type = (p.type || '').toLowerCase()
   const dirLabel = type === 'buy' ? '多' : type === 'sell' ? '空' : ''
   const sym = p.symbol
@@ -1161,13 +1150,14 @@ async function closePosition(p: Position): Promise<void> {
   } catch {
     return
   }
+  if (!samePrimary(nodeId)) return
   const body: CloseRequest = { target: 'ticket', ticket: p.ticket }
   closingTickets.value = new Set([...closingTickets.value, p.ticket])
   try {
-    await hub.closeNode(primaryNode.value.node_id, body)
+    await hub.closeNode(nodeId, body)
     ElMessage.success(`已请求平仓 #${p.ticket} ${sym}`)
     // 立即拉一次快照，避免等 5s 轮询
-    hub.fetchNodeAccount(primaryNode.value.node_id).catch(() => {})
+    hub.fetchNodeAccount(nodeId).catch(() => {})
   } catch (e) {
     const err = e as { response?: { data?: { detail?: string } }; message?: string }
     const msg = err?.response?.data?.detail || err?.message || `平仓失败 #${p.ticket}`
@@ -1261,7 +1251,7 @@ onBeforeUnmount(() => {
   <div class="tr">
     <div v-if="!primaryNode" class="tr-card tr-empty">
       <p class="tr-empty-title">尚未设置主节点</p>
-      <p>请先在首页把一个节点设为主节点，再回来开仓。</p>
+      <p>请先在首页将自己名下的节点设为主节点，再回来开仓。</p>
       <button type="button" class="tr-go" @click="router.push('/home')">返回首页</button>
     </div>
 
@@ -1567,6 +1557,7 @@ onBeforeUnmount(() => {
     </template>
 
     <OrderDialog
+      :primary-node="primaryNode"
       ref="orderDialogRef"
       v-model="dialogVisible"
       v-model:strategy="strategyType"

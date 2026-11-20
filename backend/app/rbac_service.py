@@ -454,22 +454,25 @@ async def default_role_id() -> Optional[int]:
         ).scalar_one_or_none()
 
 
+def active_admin_query():
+    return (select(User.id).join(UserRole, UserRole.user_id == User.id)
+            .join(Role, Role.id == UserRole.role_id)
+            .where(Role.code == ADMIN_ROLE_CODE, Role.enabled.is_(True), User.is_active.is_(True)))
+
+
 async def active_admin_ids() -> set[int]:
-    """当前启用中的超级管理员用户 ID（最后一个管理员保护用）。"""
-    async with SessionLocal() as s:
-        rows = (
-            await s.execute(
-                select(User.id)
-                .join(UserRole, UserRole.user_id == User.id)
-                .join(Role, Role.id == UserRole.role_id)
-                .where(
-                    Role.code == ADMIN_ROLE_CODE,
-                    Role.enabled.is_(True),
-                    User.is_active.is_(True),
-                )
-            )
-        ).scalars().all()
-    return set(rows)
+    async with SessionLocal() as session:
+        return set(await session.scalars(active_admin_query()))
+
+
+async def admin_owner_id(session, selected: int | None = None) -> int:
+    query = active_admin_query()
+    if selected is not None:
+        query = query.where(User.id == selected)
+    owner = await session.scalar(query.order_by(User.id).limit(1))
+    if owner is None:
+        raise ValueError("未找到有效的归属管理员")
+    return owner
 
 
 async def admin_role_id() -> Optional[int]:

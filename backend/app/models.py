@@ -11,6 +11,7 @@ from .ai_follow_settings import FollowSettings
 # ----------------------------- 节点 -----------------------------
 class NodeCreate(BaseModel):
     """创建节点的入参。"""
+    admin_owner_id: Optional[int] = Field(default=None, gt=0)
     name: Optional[str] = None  # 留空则自动生成 "{序号}-{mt5_login}"（序号从 1 起按节点位置递增）
     mt5_login: int = Field(gt=0, description="绑定的 MT5 账户登录号（全局唯一）")
     filters: Optional[dict] = None  # 节点级按币种配置（分发参与、手数策略、轮询顺序）
@@ -45,7 +46,7 @@ class NodeOut(BaseModel):
     client_version_at: Optional[float] = None
     created_at: float = 0
     last_seen: Optional[float] = None
-    # 数据归属：空 = 管理员名下
+    # 数据归属：实际用户 ID，旧资产修复前可能为空
     owner_user_id: Optional[int] = None
     owner_username: Optional[str] = None
     approval_status: str = "approved"
@@ -55,8 +56,7 @@ class NodeOut(BaseModel):
     credential_generation: int = 0
     legacy_allowed: bool = True
     has_credential: bool = False
-    # 主节点：每个 owner 维度下唯一；归管理员名下的节点（owner_user_id 为空）共享
-    # 同一个「管理员」槽位，最多也只能有一个主节点。
+    # 主节点：每个实际所有者最多一个主节点。
     is_primary: bool = False
 
 
@@ -468,7 +468,7 @@ class GroupOut(BaseModel):
     active_task_count: int = 0   # 进行中主任务数（pending/dispatching/running）
     # 已开监听时附带最近若干条；未开启为空列表
     limit_watch_logs: list[LimitWatchLogRecord] = Field(default_factory=list)
-    # 数据归属：空 = 管理员名下
+    # 数据归属：实际用户 ID，旧资产修复前可能为空
     owner_user_id: Optional[int] = None
     owner_username: Optional[str] = None
 
@@ -819,7 +819,7 @@ class StrategyOut(BaseModel):
     config_version: int = 0
     # 运行态提示：在跑任务数、各规则已开笔数、手动仓是否已开
     runtime_hints: Optional[dict] = None
-    # 数据归属：空 = 管理员名下
+    # 数据归属：实际用户 ID，旧资产修复前可能为空
     owner_user_id: Optional[int] = None
     owner_username: Optional[str] = None
 
@@ -1020,6 +1020,7 @@ class ManualSignalRequest(BaseModel):
     type=smc-data 时不走开仓分发，改为推送 SMC 价位：此时 action 可空，
     用 tf + data，分组定向仍用 group_ids。
     """
+    trading_primary_id: Optional[str] = Field(default=None, min_length=1, max_length=32)
     symbol: str = Field(min_length=1)
     action: str = ""  # BUY / SELL / CLOSE；SMC 价位推送可空
     type: Optional[str] = None  # smc-data：TradingView 价位推送
@@ -1906,6 +1907,7 @@ class UserPasswordReset(BaseModel):
 class UserNodesUpdate(BaseModel):
     """整体替换用户名下节点。节点仍在分组里时需 confirm=True 才会把它移出分组。"""
     node_ids: list[str] = Field(default_factory=list)
+    reclaim_admin_id: Optional[int] = Field(default=None, gt=0)
     confirm: bool = False
 
 

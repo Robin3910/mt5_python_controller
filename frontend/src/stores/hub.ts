@@ -150,9 +150,11 @@ export const useHubStore = defineStore('hub', {
     presets: [],
   }),
   getters: {
-    // 在线节点数（优先用实时状态，其次用 REST 字段）
-    onlineCount: (s): number =>
-      s.nodes.filter((n) => s.statuses[n.node_id] === 'online' || n.status === 'online').length,
+    isNodeOnline: (s) => (node: { node_id: string; status: string | null }) =>
+      (s.statuses[node.node_id] ?? node.status) === 'online',
+    onlineCount(): number {
+      return this.nodes.filter(this.isNodeOnline).length
+    },
     // 所有节点净值合计
     totalEquity: (s): number =>
       Object.values(s.accounts).reduce((acc, a) => acc + (a?.equity || 0), 0),
@@ -163,9 +165,6 @@ export const useHubStore = defineStore('hub', {
       const q = options?.q?.trim()
       const params = q ? { q } : undefined
       this.nodes = (await api.get('/api/nodes', { params })).data
-      for (const n of this.nodes) {
-        if (!(n.node_id in this.statuses)) this.statuses[n.node_id] = n.status
-      }
     },
     async fetchConfig(): Promise<void> {
       this.filters = (await api.get('/api/config/filters')).data
@@ -294,10 +293,12 @@ export const useHubStore = defineStore('hub', {
       id: string,
       symbol: string,
       params: Record<string, string | number | boolean>,
+      signal?: AbortSignal,
     ): Promise<GridSizingData> {
       return (
         await api.get(`/api/nodes/${id}/grid_sizing`, {
           params: { symbol, ...params },
+          signal,
         })
       ).data
     },

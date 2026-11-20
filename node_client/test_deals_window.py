@@ -22,6 +22,29 @@ import time
 import pytest
 
 import mt5_client as mc
+from mock_mt5 import MockMT5Client
+
+
+@pytest.mark.parametrize('scope', ['symbol', 'positions', 'all'])
+def test_mock_bulk_close_reports_exit_deals(scope):
+    mt5 = MockMT5Client()
+    mt5.connect()
+    eur = mt5.place_market_order('EURUSD', 'BUY', 0.01)
+    gold = mt5.place_market_order('XAUUSD', 'SELL', 0.02)
+
+    if scope == 'symbol':
+        result = mt5.close_symbol('EURUSD')
+    elif scope == 'positions':
+        result = mt5.close_positions([{'ticket': eur['order']}])
+    else:
+        result = mt5.close_all()
+
+    expected = {eur['order'], gold['order']} if scope == 'all' else {eur['order']}
+    exits = mt5.history_deals_since(0, after_deal_id=gold['deal'])
+    assert result['closed'] == len(expected) == len(exits)
+    assert {d['position_id'] for d in exits} == expected
+    assert all(d['entry_type'] == 'OUT' and d['reason'] == 3 for d in exits)
+    assert {p['ticket'] for p in mt5.positions()} == {eur['order'], gold['order']} - expected
 
 # —— 假 MT5：按 MT5 的真实语义筛窗口 ——
 

@@ -969,6 +969,7 @@ class MockMT5Client:
                 closed += 1
                 mag = int(p.get("magic") or self.magic)
                 pl = float(p.get("profit") or 0.0)
+                self._record_exit(p, reason=3, profit=pl)
                 profit += pl
                 self._realized_by_magic[mag] = self._realized_by_magic.get(mag, 0.0) + pl
             else:
@@ -987,6 +988,7 @@ class MockMT5Client:
         for p in self._positions:
             mag = int(p.get("magic") or self.magic)
             pl = float(p.get("profit") or 0.0)
+            self._record_exit(p, reason=3, profit=pl)
             profit += pl
             self._realized_by_magic[mag] = self._realized_by_magic.get(mag, 0.0) + pl
         self.balance += profit
@@ -1005,6 +1007,7 @@ class MockMT5Client:
                 closed_sym = p.get("symbol")
                 mag = int(p.get("magic") or self.magic)
                 pl = float(p.get("profit") or 0.0)
+                self._record_exit(p, reason=3, profit=pl)
                 profit += pl
                 self._realized_by_magic[mag] = self._realized_by_magic.get(mag, 0.0) + pl
             else:

@@ -961,8 +961,8 @@ onMounted(() => { void hub.fetchNodes(); trackAiUi('page_view', { value: 'ai-tra
   <div class="ai" :class="{ 'ai--ranking': rankTab }">
     <AiRobotLeaderboard
       v-if="rankTab" :items="rankItems" :tab="rankTab" :loading="loading" :error="robotsError"
-      :updated-at="robotsUpdatedAt" :opening-group="loadingGroup" :show-back="auth.isAdmin"
-      @switch="showRank" @back="closeRank" @retry="trackAiUi('refresh', { value: 'ai-rank' }); loadRobots()"
+      :updated-at="robotsUpdatedAt" :opening-group="loadingGroup"
+      @switch="showRank" @retry="trackAiUi('refresh', { value: 'ai-rank' }); loadRobots()"
       @follow="openPicker($event, 'join')"
     />
     <section v-else class="ai-hero">

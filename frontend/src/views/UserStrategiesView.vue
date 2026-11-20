@@ -17,7 +17,6 @@ import type {
   AccountSnapshot,
   GroupOut,
   GroupSignalTaskRecord,
-  NodeOut,
   OrderPreset,
   OrderPresetStrategyType,
   QuoteInfo,
@@ -31,42 +30,14 @@ const hub = useHubStore()
 const auth = useAuthStore()
 const router = useRouter()
 
-// 头部状态信息：MT5 登录号、服务器、在线/离线
-/**
- * 主节点选取规则（仅管理员一侧改变）：
- *
- * - 管理员：只允许 `owner_user_id === 当前管理员 user_id` 区间内的 `is_primary && enabled`
- *   节点；这是后端 owner_user_id 维度的真实语义（参见 backend/node_service.py 中
- *   `_clear_primary_for_owner` / `set_primary`）。如果该范围内没有主节点，回退到
- *   模板的「尚未设置主节点」空态，不静默拿别人的主节点顶替——这条规则把
- *   「管理员的【交易】页不能拿普通用户的主节点来展示」这一点固化下来。
- * - 普通用户：保持原有 `is_primary && enabled` 行为不变。后端 `/api/nodes` 接口已
- *   经按 owner 过滤，普通用户能看到的列表里 `is_primary=true` 的节点本来就是
- *   他自己的主节点，无需在客户端再收紧。
- */
-const primaryNode = computed<NodeOut | undefined>(() => {
-  if (auth.isAdmin && auth.me?.user_id != null) {
-    const myId = auth.me.user_id
-    const owned = hub.nodes.find(
-      (n) => n.is_primary && n.enabled && (n.owner_user_id ?? null) === myId,
-    ) as NodeOut | undefined
-    if (owned) return owned
-    // 管理员名下没有主节点 → 让模板显示「尚未设置主节点」空态，
-    // 不再去找"第一个 is_primary" 顶替。
-    return undefined
-  }
-  return hub.nodes.find((n) => n.is_primary && n.enabled) as NodeOut | undefined
-})
+const primaryNode = computed(() => hub.nodes.find(n => n.is_primary && n.enabled && n.owner_user_id != null && n.owner_user_id === auth.me?.user_id))
 
 const account = computed<AccountSnapshot | null>(() => {
   if (!primaryNode.value) return null
   return hub.accounts[primaryNode.value.node_id] || null
 })
 
-function nodeOnline(n: NodeOut): boolean {
-  return hub.statuses[n.node_id] === 'online' || n.status === 'online'
-}
-const isOnline = computed(() => !!primaryNode.value && nodeOnline(primaryNode.value))
+const isOnline = computed(() => !!primaryNode.value && hub.isNodeOnline(primaryNode.value))
 
 // ── 多品种报价 ──
 // 不再限制白名单，动态从账户数据中获取所有有报价或持仓的品种
@@ -169,7 +140,7 @@ async function refreshGridTasks(initial = false): Promise<void> {
       }
     }
     const gridGroups = (hub.groups || []).filter(
-      (g: GroupOut) => typeof g.name === 'string' && g.name.startsWith('grid-'),
+      (g: GroupOut) => g.owner_user_id === auth.me?.user_id && typeof g.name === 'string' && g.name.startsWith('grid-'),
     )
     if (gridGroups.length === 0) {
       gridTasks.value = []
@@ -353,7 +324,7 @@ const dialogGroupName = computed(() => {
 function resolveDialogGroupId(groups: GroupOut[]): string | null {
   const target = dialogGroupName.value
   if (!target) return null
-  const hit = groups.find((g) => g.name === target)
+  const hit = groups.find((g) => g.owner_user_id === auth.me?.user_id && g.name === target)
   return hit?.group_id ?? null
 }
 
@@ -545,7 +516,7 @@ async function onAiStrategySaved(
       ElMessage.warning('主节点未就绪，策略已保存但未能自动创建分组')
       return
     }
-    let group = groups.find((g) => g.name === groupName) ?? null
+    let group = groups.find((g) => g.owner_user_id === auth.me?.user_id && g.name === groupName) ?? null
     if (!group) {
       group = await hub.createGroup({
         name: groupName,
@@ -876,6 +847,7 @@ onBeforeUnmount(() => {
 
     <!-- 触发弹窗：开仓参数（新 UI） -->
     <OrderDialog
+      :primary-node="primaryNode"
       v-model="dialogVisible"
       v-model:strategy="strategyType"
       :form="form"
