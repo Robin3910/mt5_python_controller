@@ -133,11 +133,9 @@ async def set_paused(store, principal, group_id, follower_user_id, paused, ip=No
         nodes = {node.node_id: node for node in (await session.scalars(select(Node).where(
             Node.node_id.in_([row.node_id for row in rows]),
         ).order_by(Node.node_id).with_for_update())).all()}
-        from .node_credentials import is_admin_user
         for row in rows:
             node = nodes.get(row.node_id)
-            if not node or (node.owner_user_id != row.follower_user_id
-                            and not (node.owner_user_id is None and await is_admin_user(session, row.follower_user_id))):
+            if not node or node.owner_user_id != row.follower_user_id:
                 raise HTTPException(409, "跟单节点归属已变更，请刷新频道")
         before = {str(row.id): row.leader_paused for row in rows}
         for row in rows:

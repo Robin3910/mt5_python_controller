@@ -66,7 +66,7 @@ def test_owns_and_visible():
 
 
 def test_owner_for_new():
-    assert perm.owner_for_new(ADMIN) is None
+    assert perm.owner_for_new(ADMIN) == ADMIN.user_id
     assert perm.owner_for_new(ALICE) == 7
 
 

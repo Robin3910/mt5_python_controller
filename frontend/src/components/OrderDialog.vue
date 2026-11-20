@@ -14,7 +14,7 @@
  *    与 StrategyFormModal.triggerBoundGroup 行为一致，但**不持久化**模版参数，
  *    仅用弹窗里手填的 volume/sl/tp/entry_price/remark 作为本次信号值。
  */
-import { computed, nextTick, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { ElDialog, ElMessage } from 'element-plus'
 import 'element-plus/es/components/dialog/style/css'
 import { useHubStore } from '@/stores/hub'
@@ -27,6 +27,7 @@ import type {
   ManualSignalPayload,
   ManualSignalResult,
   GroupOut,
+  NodeOut,
   OrderPreset,
   OrderPresetStrategyType,
   StrategyOut as StrategyOutType,
@@ -56,6 +57,7 @@ const props = defineProps<{
   strategy: OrderStrategy
   /** 父级表单（reactive 对象）。组件内通过 localForm 持有副本并双向同步 */
   form: OrderForm & { grid_step?: number | null; grid_layers?: number | null }
+  primaryNode?: NodeOut
   groupName: string
   /** 「策略复用」开关需要的 group_id：父级按 dialogGroupName 在 hub.groups 里查到的真实 ID */
   groupId?: string | null
@@ -158,10 +160,6 @@ watch(
     if (open) {
       carry.value = false
       lastStrategyError.value = ''
-      // 每次打开清空试算结果，避免上一笔的旧数据混入
-      gridSizing.data = null
-      gridSizing.error = ''
-      gridSizing.loading = false
       // 止盈价 → 盈亏比联动：重置手动标记与市价入场价快照
       rrManualEdited.value = false
       marketEntrySnapshot.value =
@@ -198,28 +196,17 @@ watch(
 /** 「带单」开关：默认关闭（每笔新单都只发主节点），需要时手动打开 */
 const carry = defineModel<boolean>('carry', { default: false })
 
-/**
- * 市价开仓的方向由前端根据「止损价 vs 当前 mid」自动判定：
- *   sl < mid → BUY（多）
- *   sl > mid → SELL（空）
- * 没有 mid 报价时返回 null（按钮置灰，提示"等待报价"）。
- */
+const directionPrice = computed(() => isLimit.value ? localForm.entry_price : isMarket.value ? props.currentMid : null)
+const stopEqualsEntry = computed(() => {
+  const price = directionPrice.value
+  return price != null && price > 0 && price === localForm.sl
+})
 const derivedAction = computed<ManualAction | null>(() => {
-  // 限价：按入场价 vs 止损价判断方向
-  if (isLimit.value) {
-    const ep = localForm.entry_price
-    const sl = localForm.sl
-    if (ep == null || !isFinite(ep) || ep <= 0) return null
-    if (sl == null || !isFinite(sl) || sl <= 0) return null
-    return ep > sl ? 'BUY' : 'SELL'
-  }
-  // 市价：按当前中间价 vs 止损价判断方向
-  if (!isMarket.value) return null
-  const mid = props.currentMid
+  const price = directionPrice.value
   const sl = localForm.sl
-  if (mid == null || !mid || !isFinite(mid)) return null
-  if (sl == null || !sl || !isFinite(sl) || sl <= 0) return null
-  return sl < mid ? 'BUY' : 'SELL'
+  if (price == null || price <= 0 || !Number.isFinite(price)) return null
+  if (sl == null || sl <= 0 || !Number.isFinite(sl) || stopEqualsEntry.value) return null
+  return sl < price ? 'BUY' : 'SELL'
 })
 
 /** 策略复用执行中的内部 loading（与 props.submitting 区分） */
@@ -399,6 +386,7 @@ const isMarket = computed(() => strategyRef.value === 'trend_market')
 const canTriggerStrategy = computed(
   () =>
     !!currentGroup.value &&
+    (isSaveMode.value || props.canSubmit) &&
     !props.submitting &&
     !strategySubmitting.value &&
     !strategyLoading.value &&
@@ -410,8 +398,10 @@ const canTriggerStrategy = computed(
 const canTriggerGridStrategy = computed(
   () =>
     !!currentGroup.value &&
+    (isSaveMode.value || props.canSubmit) &&
     !strategySubmitting.value &&
     !strategyLoading.value &&
+    !!readyGridSizing.value &&
     !validateGridParams(),
 )
 
@@ -606,9 +596,7 @@ const rrNotice = computed<RrNotice | null>(() => {
 const gridParams = reactive({
   price_lower: 0 as number | null,      // 区间下限
   price_upper: 0 as number | null,      // 区间上限
-  grid_count: 10,                        // 网格数量（自动试算回写）
   grid_mode: 'arithmetic' as GridMode,  // 网格模式
-  lot_per_grid: 0.01,                  // 每格手数（自动试算回写）
   trigger_price: 0 as number | null,    // 触发价（默认 0 = 立即启动）
   stop_price: 0 as number | null,       // 止损价（客户填写；方向由此推导）
   take_profit: 0 as number | null,      // 止盈价（界面上不展示，沿用存量规则的值）
@@ -658,7 +646,7 @@ const gridStopUpper = computed(() =>
     : Number(gridParams.take_profit) || 0,
 )
 
-/** 网格试算结果（自动反算 grid_count / lot_per_grid） */
+/** 网格数量和手数仅来自当前参数的试算结果。 */
 const gridSizing = reactive<{
   data: GridSizingData | null
   loading: boolean
@@ -668,6 +656,10 @@ const gridSizing = reactive<{
   loading: false,
   error: '',
 })
+const readyGridSizing = computed(() => {
+  const result = gridSizing.data
+  return result?.ready && result.lot_per_grid > 0 ? result : null
+})
 
 /** 试算 debounce 计时器 */
 let gridSizingTimer: ReturnType<typeof setTimeout> | null = null
@@ -675,7 +667,7 @@ let gridSizingTimer: ReturnType<typeof setTimeout> | null = null
 let gridSizingAbort: AbortController | null = null
 
 /** 行情源节点：主节点（用户已选过的 is_primary && enabled） */
-const primaryNode = computed(() => hub.nodes.find((n) => n.is_primary && n.enabled) || null)
+const primaryNode = computed(() => props.primaryNode || null)
 
 /** 策略参数加载中 */
 const strategyLoading = ref(false)
@@ -746,7 +738,7 @@ async function loadGroupAndStrategy(): Promise<void> {
       }
     }
     // 拉分组列表并找当前分组（含 strategy_id）
-    const groups = await hub.listGroups()
+    const groups = (await hub.listGroups()).filter(g => g.owner_user_id === auth.me?.user_id)
     let grp: GroupOut | null = null
     // **优先按 groupName 找**：三个开仓方式各有独立分组（分组名带 strategy_type 前缀），
     // groupName 由父级按当前 Tab 响应式算出，切换 Tab 时会跟着变。
@@ -762,40 +754,14 @@ async function loadGroupAndStrategy(): Promise<void> {
         grp = byId
       }
     }
-    // 首次开仓：按 props.groupName 自动建分组（市价/限价各自独立）。
-    // 注意：limit_watch_enabled 必须等 strategy_id 绑上之后才能开（否则后端
-    // _require_trend_strategy 会拒），所以这里只建空策略分组；监听开关放到
-    // triggerMarketStrategy 里"建/绑策略成功之后"再 PATCH 上去。
-    if (!grp && (isMarket.value || isLimit.value) && props.groupName) {
-      // 主节点自动加入分组
-      const primaryNode = hub.nodes.find((n) => n.is_primary && n.enabled)
-      const node_ids = primaryNode ? [primaryNode.node_id] : []
+    if (!grp && props.groupName && (isMarket.value || isLimit.value || isGrid.value)) {
       try {
-        grp = await hub.createGroup({
-          name: props.groupName,
-          enabled: true,
-          node_ids,
-        })
+        if (!primaryNode.value) throw new Error('请先设置自己的主节点')
+        grp = await hub.createGroup({ name: props.groupName, enabled: true, node_ids: [primaryNode.value.node_id] })
         lastStrategyError.value = ''
       } catch (e) {
         const err = e as { response?: { data?: { detail?: string } }; message?: string }
-        lastStrategyError.value =
-          err?.response?.data?.detail || err?.message || '自动创建分组失败'
-        grp = null
-      }
-    }
-    // 网格首次开仓：同样按 props.groupName 自动建分组（主节点加入，限价监听关闭）
-    if (!grp && isGrid.value && props.groupName) {
-      const primaryNode = hub.nodes.find((n) => n.is_primary && n.enabled)
-      const node_ids = primaryNode ? [primaryNode.node_id] : []
-      try {
-        grp = await hub.createGroup({ name: props.groupName, enabled: true, node_ids })
-        lastStrategyError.value = ''
-      } catch (e) {
-        const err = e as { response?: { data?: { detail?: string } }; message?: string }
-        lastStrategyError.value =
-          err?.response?.data?.detail || err?.message || '自动创建分组失败'
-        grp = null
+        lastStrategyError.value = err?.response?.data?.detail || err?.message || '自动创建分组失败'
       }
     }
     currentGroup.value = grp
@@ -843,9 +809,7 @@ async function loadGroupAndStrategy(): Promise<void> {
         if (gridRule) {
           gridParams.price_lower = gridRule.price_lower ?? 0
           gridParams.price_upper = gridRule.price_upper ?? 0
-          gridParams.grid_count = gridRule.grid_count ?? 10
           gridParams.grid_mode = gridRule.grid_mode ?? 'arithmetic'
-          gridParams.lot_per_grid = gridRule.lot_per_grid ?? 0.01
           gridParams.trigger_price = gridRule.trigger_price ?? 0
           // 存量规则的 stop_lower / stop_upper 按方向还原成「止损价 + 止盈价」：
           // 只做多 → stop_lower 是止损、stop_upper 是止盈；只做空 → 反之。
@@ -900,9 +864,7 @@ function applyTemplateDefaults(): void {
     if (gRule) {
       gridParams.price_lower = gRule.price_lower ?? 0
       gridParams.price_upper = gRule.price_upper ?? 0
-      gridParams.grid_count = gRule.grid_count ?? 10
       gridParams.grid_mode = gRule.grid_mode ?? 'arithmetic'
-      gridParams.lot_per_grid = gRule.lot_per_grid ?? 0.01
       gridParams.trigger_price = gRule.trigger_price ?? 0
       gridParams.stop_price =
         gRule.grid_side === 'short' ? gRule.stop_upper ?? 0 : gRule.stop_lower ?? 0
@@ -919,7 +881,7 @@ function applyTemplateDefaults(): void {
 //
 // 用法：
 //   1. 监听 gridParams 关键字段 + symbol，debounce 500ms 自动调 triggerGridSizing
-//   2. 试算成功 → gridSizing.data.ready 时把 grid_count / lot_per_grid 写回 gridParams
+//   2. 仅当当前试算同时给出格数和手数时，允许提交网格规则
 //   3. 试算过程与结果**不对客户展示**（UI 已隐藏），只用于算出网格数量与每格手数
 //
 // 写死的入参（不暴露在弹窗里）：
@@ -944,37 +906,35 @@ const canRunGridSizing = computed(() => {
   return true
 })
 
-/** 自动试算（debounce 后调用）：带 8s 超时。返回 Promise 以便保存前等待结果。 */
-function triggerGridSizing(withDebounce: boolean): Promise<void> {
-  if (!isGrid.value) return Promise.resolve()
-  if (!canRunGridSizing.value) return Promise.resolve()
-  if (withDebounce) {
-    if (gridSizingTimer) clearTimeout(gridSizingTimer)
-    return new Promise<void>((resolve) => {
-      gridSizingTimer = setTimeout(() => {
-        void triggerGridSizing(false).finally(() => resolve())
-      }, 500)
-    })
-  }
+function resetGridSizing(): void {
+  if (gridSizingTimer !== null) clearTimeout(gridSizingTimer)
+  gridSizingTimer = null
+  gridSizingAbort?.abort()
+  gridSizingAbort = null
+  gridSizing.data = null
+  gridSizing.error = ''
+  gridSizing.loading = false
+}
+
+/** 自动试算带 8 秒超时，旧请求的结果不能更新当前表单。 */
+async function triggerGridSizing(): Promise<void> {
+  resetGridSizing()
+  if (!props.modelValue || !canRunGridSizing.value) return
   const node = primaryNode.value
   if (!node) {
     gridSizing.error = '未找到主节点，无法试算；请在「节点」页设置主节点'
-    return Promise.resolve()
+    return
   }
-  // 取消上一笔未完成的请求
-  if (gridSizingAbort) gridSizingAbort.abort()
   const ctrl = new AbortController()
   gridSizingAbort = ctrl
   const timer = setTimeout(() => ctrl.abort(), 8000)
   gridSizing.loading = true
-  gridSizing.error = ''
   const symbol = (localForm.symbol || '').trim().toUpperCase()
-  return hub
-    .fetchGridSizing(node.node_id, symbol, {
+  try {
+    const data = await hub.fetchGridSizing(node.node_id, symbol, {
       timeframe: 'M1',
       atr_mult: 0.6,
       spacing: 0,
-      // 全部转 Number：防止 Vue v-model.number 清空后产生空字符串导致后端报错
       price_lower: Number(gridParams.price_lower) || 0,
       price_upper: Number(gridParams.price_upper) || 0,
       grid_mode: gridParams.grid_mode,
@@ -985,64 +945,49 @@ function triggerGridSizing(withDebounce: boolean): Promise<void> {
       close_on_stop: true,
       trailing_up: gridParams.trailing_up,
       total_lot_limit: 0,
-    })
-    .then((data) => {
-      if (ctrl.signal.aborted) return
-      gridSizing.data = data
-      // 试算结果：覆盖 grid_count / lot_per_grid
-      if (data.ready) {
-        if (data.grid_count >= 2) gridParams.grid_count = data.grid_count
-        if (data.lot_per_grid > 0) {
-          gridParams.lot_per_grid = data.lot_per_grid
-        } else {
-          // 手数算不出来时**不要沿用上一轮的值**（可能是按更大的亏损预算算的），
-          // 落到最小手数，保证保存下来的策略不会超出用户给的亏损上限。
-          gridParams.lot_per_grid = 0.01
-        }
-      }
-      if (!data.ready || data.lot_per_grid === 0) {
-        const msgs = (data.warnings || [])
-          .filter((w) => w.level === 'warn')
-          .map((w) => w.message)
-        gridSizing.error = msgs[0] || '该品种试算失败，请检查区间与止损价后重试'
-      } else {
-        gridSizing.error = ''
-      }
-    })
-    .catch((e: unknown) => {
-      if (ctrl.signal.aborted) return
-      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
-      gridSizing.error = detail || (e as Error).message || '试算失败'
-    })
-    .finally(() => {
-      clearTimeout(timer)
-      if (gridSizingAbort === ctrl) gridSizingAbort = null
+    }, ctrl.signal)
+    if (gridSizingAbort !== ctrl) return
+    gridSizing.data = data
+    if (!readyGridSizing.value) {
+      gridSizing.error = data.warnings.find(w => w.level === 'warn')?.message || '试算失败，请检查参数后重试'
+    }
+  } catch (e: unknown) {
+    if (gridSizingAbort !== ctrl) return
+    const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+    gridSizing.error = ctrl.signal.aborted ? '试算超时，请重试' : detail || '试算失败，请重试'
+  } finally {
+    clearTimeout(timer)
+    if (gridSizingAbort === ctrl) {
+      gridSizingAbort = null
       gridSizing.loading = false
-    })
+    }
+  }
 }
 
 /** 监听 gridParams 关键字段变化，自动 debounce 试算 */
 watch(
-  () => [
-    gridParams.price_lower,
-    gridParams.price_upper,
-    gridParams.grid_mode,
-    gridParams.trailing_up,
-    gridParams.max_allow_loss,
-    gridParams.stop_price,
-    (localForm.symbol || '').trim().toUpperCase(),
+  [
+    () => props.modelValue,
+    isPresetMode,
+    isGrid,
+    () => primaryNode.value?.node_id,
+    () => gridParams.price_lower,
+    () => gridParams.price_upper,
+    () => gridParams.grid_mode,
+    () => gridParams.trailing_up,
+    () => gridParams.max_allow_loss,
+    gridStopLower,
+    gridStopUpper,
+    () => (localForm.symbol || '').trim().toUpperCase(),
   ],
   () => {
-    if (!isGrid.value) return
-    if (!canRunGridSizing.value) {
-      // 条件不满足时静默清空结果，不报错
-      gridSizing.data = null
-      gridSizing.error = ''
-      return
-    }
-    void triggerGridSizing(true)
+    resetGridSizing()
+    if (!props.modelValue || isPresetMode.value || !canRunGridSizing.value) return
+    gridSizing.loading = true
+    gridSizingTimer = setTimeout(() => void triggerGridSizing(), 500)
   },
 )
+onBeforeUnmount(resetGridSizing)
 
 /** 校验策略参数（市价/限价均走 strategy 模型，均需校验 riskParams） */
 function validateRiskParams(): string | null {
@@ -1097,7 +1042,6 @@ function validateGridParams(): string | null {
   const pu = gridParams.price_upper ?? 0
   if (!(pl > 0)) return '区间下限需大于 0'
   if (!(pu > pl)) return '区间上限须大于下限'
-  if (gridParams.grid_count < 2 || gridParams.grid_count > 200) return '网格数量需在 2 ~ 200'
   if (!GRID_MODE_OPTIONS.some((o) => o.value === gridParams.grid_mode)) return '网格模式非法'
   // 止损价决定方向：落在区间下方=只做多，落在区间上方=只做空
   if (!derivedGridSide.value) {
@@ -1107,7 +1051,6 @@ function validateGridParams(): string | null {
   }
   // 每格手数由自动试算按最大亏损反推，所以最大亏损必须填
   if (!(gridParams.max_allow_loss > 0)) return '以损定量需大于 0'
-  if (!(gridParams.lot_per_grid > 0)) return '每格手数需大于 0'
   return null
 }
 
@@ -1115,6 +1058,8 @@ function validateGridParams(): string | null {
  * 用 gridParams 构建网格规则（type=4），构造 strategy patch payload。
  */
 function buildGridStrategyPayload(): StrategyRule[] | null {
+  const sizing = readyGridSizing.value
+  if (!sizing) return null
   const tpl3 = templates.value.find((t) => t.template_id === 'tpl_3')
   if (!tpl3?.rules?.length) {
     lastStrategyError.value = '未找到网格交易模版规则，请确认模版配置'
@@ -1131,10 +1076,10 @@ function buildGridStrategyPayload(): StrategyRule[] | null {
       action: side === 'short' ? 'SELL' : 'BUY',
       price_lower: gridParams.price_lower ?? 0,
       price_upper: gridParams.price_upper ?? 0,
-      grid_count: gridParams.grid_count,
+      grid_count: sizing.grid_count,
       grid_mode: gridParams.grid_mode,
       grid_side: side,
-      lot_per_grid: gridParams.lot_per_grid,
+      lot_per_grid: sizing.lot_per_grid,
       trigger_price: gridParams.trigger_price ?? 0,
       stop_lower: gridStopLower.value,
       stop_upper: gridStopUpper.value,
@@ -1343,8 +1288,6 @@ async function saveRiskStrategyOnly(): Promise<void> {
 async function saveGridStrategyOnly(): Promise<void> {
   const gpErr = validateGridParams()
   if (gpErr) { lastStrategyError.value = gpErr; return }
-  // 保存前等一次试算落定，保证写入的 grid_count / lot_per_grid 是按当前参数算出来的
-  await triggerGridSizing(false)
   const rules = buildGridStrategyPayload()
   if (!rules) return
   if (!currentGroup.value) {
@@ -1581,8 +1524,8 @@ async function triggerMarketStrategy(): Promise<void> {
       payload.entry_price = localForm.entry_price
     }
     // 带单关闭时，信号只推给主节点（不发给分组的其它成员，包括跟单节点）。
-    // 没有主节点就不带「node_ids」——按分组参与者处理，让用户报警，而不是悄悄不给主节点。
-    if (!carry.value && primaryNode.value) {
+    if (!primaryNode.value) throw new Error('请先设置自己的主节点')
+    if (!carry.value) {
       payload.node_ids = [primaryNode.value.node_id]
     }
     const remark = (localForm.remark || '').trim()
@@ -1604,8 +1547,6 @@ async function triggerMarketStrategy(): Promise<void> {
 async function triggerGridStrategy(): Promise<void> {
   const gpErr = validateGridParams()
   if (gpErr) { lastStrategyError.value = gpErr; return }
-  // 保存前等一次试算落定，保证写入的 grid_count / lot_per_grid 是按当前参数算出来的
-  await triggerGridSizing(false)
   const rules = buildGridStrategyPayload()
   if (!rules) return
   if (!currentGroup.value) {
@@ -1697,7 +1638,8 @@ async function triggerGridStrategy(): Promise<void> {
       volume: 0.01,
     }
     // 带单关闭时，网格信号也只推给主节点
-    if (!carry.value && primaryNode.value) {
+    if (!primaryNode.value) throw new Error('请先设置自己的主节点')
+    if (!carry.value) {
       payload.node_ids = [primaryNode.value.node_id]
     }
     const remark = (localForm.remark || '').trim()
@@ -2077,14 +2019,10 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
           </div>
         </div>
 
-        <!--
-          自动试算（后台执行，结果回写 grid_count / lot_per_grid）：
-          按需求不对客户展示 —— 网格数量 / 网格模式 / 每格手数 / 初始建仓 /
-          触发价 / 止盈价 / 向上追踪 全部隐藏，参数由试算与默认值给出。
-          试算失败时给一行提示，避免客户以为手数是按「以损定量」算出来的。
-        -->
-        <div v-if="gridSizing.error" class="od-error">
+        <p v-if="gridSizing.loading" role="status" class="od-footnote">正在试算网格…</p>
+        <div v-else-if="gridSizing.error" class="od-error" role="alert">
           {{ gridSizing.error }}
+          <button type="button" class="btn-ghost btn-sm" @click="triggerGridSizing">重试试算</button>
         </div>
         </template>
       </template>
@@ -2144,6 +2082,10 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
           </div>
         </div>
       </template>
+
+      <p v-if="!isPresetMode && stopEqualsEntry" class="od-error" role="alert">
+        止损价不能等于{{ isLimit ? '挂单价' : '当前报价' }}
+      </p>
 
       <!-- 恢复预设：会话里改乱了固定参数，一键回滚到预设值 -->
       <div v-if="!isPresetMode && canRestorePreset" class="od-notice is-info">

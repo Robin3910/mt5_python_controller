@@ -14,7 +14,7 @@ from sqlalchemy import func, select, text
 
 from . import follow_service, group_persist, group_service
 from .db import SessionLocal
-from . import risk_control
+from . import risk_control, rbac_service
 from .models import NodeCreate, NodeUpdate
 from .orm import DeletedNode, Node, NodeGroupMember, NodeCredential
 from .redis_store import RedisStore
@@ -279,12 +279,14 @@ async def create_node(
     explicit_name = (payload.name or "").strip()
     node_id = make_node_id()
     async with SessionLocal() as s:
+        owner = await rbac_service.admin_owner_id(s, payload.admin_owner_id)
         name = explicit_name or _default_name(
             await _next_node_seq(s), payload.mt5_login,
         )
         row = Node(
             node_id=node_id,
             name=name,
+            owner_user_id=owner,
             enabled=enabled,
             lot_mode=AUTO_NODE_DEFAULTS["lot_mode"],
             lot=AUTO_NODE_DEFAULTS["lot"],
@@ -294,7 +296,7 @@ async def create_node(
         )
         s.add(row)
         if await s.get(DeletedNode, payload.mt5_login):
-            s.add(NodeCredential(node_id=node_id, legacy_allowed=False, owner_user_id=None))
+            s.add(NodeCredential(node_id=node_id, legacy_allowed=False, owner_user_id=owner))
         await s.commit()
         await s.refresh(row)
         d = node_row_to_dict(row)
@@ -397,7 +399,7 @@ async def _update_node(store: RedisStore, node_id: str, patch: NodeUpdate, *, ad
     return d
 
 
-async def set_owner(store: RedisStore, node_id: str, owner_user_id: Optional[int], *,
+async def set_owner(store: RedisStore, node_id: str, owner_user_id: int, *,
                     audit_principal=None, audit_ip: str | None = None) -> Optional[dict]:
     from .node_lifecycle import locked, node_key
     async with locked(node_key(node_id)):
@@ -406,10 +408,10 @@ async def set_owner(store: RedisStore, node_id: str, owner_user_id: Optional[int
 
 
 async def _set_owner(
-    store: RedisStore, node_id: str, owner_user_id: Optional[int], *, audit_principal=None,
+    store: RedisStore, node_id: str, owner_user_id: int, *, audit_principal=None,
     audit_ip: str | None = None,
 ) -> Optional[dict]:
-    """改节点归属（None = 回到管理员名下）；前置校验（活动子任务、分组成员）由调用方完成。"""
+    """改节点实际归属；前置校验（活动子任务、分组成员）由调用方完成。"""
     async with SessionLocal() as s:
         row = await _locked_node(s, node_id)
         if not row:
@@ -417,7 +419,7 @@ async def _set_owner(
         owner_changed = row.owner_user_id != owner_user_id
         previous_owner = row.owner_user_id
         if owner_changed:
-            from .node_credentials import activate_if_ready, revoke_on_transfer
+            from .node_credentials import activate_if_ready, is_admin_user, revoke_on_transfer
             credential = await s.get(NodeCredential, node_id)
             needs_strict_audit = row.approval_status == "pending" or bool(
                 credential and (credential.token_sha256 or not credential.legacy_allowed))
@@ -433,13 +435,9 @@ async def _set_owner(
             # 改主人后老标记对新主人没有意义也违反唯一约束。
             if row.is_primary:
                 row.is_primary = False
-            # 「账号第一个节点自动升级为主节点」：当节点被分配给一个具体用户，
-            # 且该用户此前名下没有任何主节点时，把这个新分配的节点自动升为主。
-            # 仅在 owner_user_id 变到非空（真正的"分配给用户"，而非回收回管理员）
-            # 且该用户维度下无现存主节点时触发；这样既不会顶替已有主节点，
-            # 也避免了"从管理员名下转管理员名下"（owner_user_id=None）的边界情况。
+            # 管理员必须自己设主；普通用户保留首次分配自动升主的行为。
             if (
-                owner_user_id is not None
+                not await is_admin_user(s, owner_user_id)
                 and not await _owner_has_primary(s, owner_user_id, exclude_node_id=node_id)
             ):
                 row.is_primary = True

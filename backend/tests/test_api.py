@@ -789,4 +789,4 @@ def test_assign_node_promotes_primary_for_first_node(client):
     assert a3.status_code == 200, a3.text
     listing = {n["node_id"]: n for n in client.get("/api/nodes", headers=h).json()}
     assert listing[n2]["is_primary"] is False, "回收回管理员名下不应升主"
-    assert listing[n2]["owner_user_id"] is None
+    assert listing[n2]["owner_user_id"] == client.get("/api/me", headers=h).json()["user_id"]

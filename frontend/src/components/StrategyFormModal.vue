@@ -1617,7 +1617,7 @@ function resetSizing(): void {
 
 /** 可作行情源的节点：只有在线节点能回 K 线与合约规格 */
 const onlineNodes = computed(() =>
-  hub.nodes.filter((n) => hub.statuses[n.node_id] === 'online' || n.status === 'online'),
+  hub.nodes.filter(hub.isNodeOnline),
 )
 
 function nodeLabel(n: NodeOut): string {

@@ -81,7 +81,7 @@ const ALL_MODULES: ProfileHubModule[] = [
   },
   {
     code: 'strategies',
-    label: '策略配置',
+    label: auth.isAdmin ? '策略管理' : '策略配置',
     description: '市价开仓 · 限价开仓 · 智能吸筹',
     path: auth.isAdmin ? '/strategies' : '/user-strategies',
     icon: '<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3"/><path d="M1 14h6M9 8h6M17 16h6"/>',
@@ -220,7 +220,8 @@ function go(path: string): void {
 
 async function copyWebhook(): Promise<void> {
   const ok = await copyToClipboard(WEBHOOK_URL)
-  ElMessage.success(ok ? 'webhook 地址已复制' : '复制失败')
+  if (ok) ElMessage.success('webhook 地址已复制')
+  else ElMessage.error('复制失败')
 }
 
 /** 退出登录：断开后台 WS 后清空登录态并回到登录页 */

@@ -21,6 +21,7 @@ from . import (
     rbac_service,
     user_service,
 )
+from .db import SessionLocal
 from .deps import client_ip, get_store, require_admin
 from .models import (
     RoleRef,
@@ -327,7 +328,7 @@ async def assign_nodes(
     审核通过时复用 `assign_nodes_core` —— 保证两条路径的校验口径完全一致。
     """
     return await assign_nodes_core(
-        user_id, body.node_ids, confirm=body.confirm,
+        user_id, body.node_ids, confirm=body.confirm, reclaim_admin_id=body.reclaim_admin_id,
         p=p, ip=client_ip(request), store=store,
     )
 
@@ -336,27 +337,13 @@ async def assign_nodes_core(
     user_id: int,
     node_ids: list[str],
     *,
-    confirm: bool = False,
+    confirm: bool = False, reclaim_admin_id: int | None = None,
     p: Principal,
     ip: str | None,
     store: RedisStore,
 ) -> dict:
-    """整体替换用户名下节点：新增的从原所有者转来，移除的回到管理员名下。
-
-    目标可以是超级管理员本人：超管同样可以把自己名下的节点（owner_user_id=admin.id）
-    与「管理员名下」（owner_user_id=NULL）之间互相转移。超管自分配后，节点会出现在
-    其首页 / 交易页的「自己名下」视图里，与普通用户的行为完全一致。
-
-    1. 变动节点上有未收口的策略子任务 → 409 active_tasks（先在分组页平仓 / 终止）；
-    2. 变动节点仍在分组里 → 409 confirm_required，confirm=True 后移出这些分组；
-    3. 写库刷新缓存，并让原所有者与新所有者的后台连接重新拉取权限。
-    """
+    """整体替换用户名下节点；回收给实际管理员，不清空归属。"""
     user = await _user_or_404(user_id)
-    # 目标可以是超级管理员本人：超管同样能在自己名下（owner_user_id=admin.id）
-    # 与「管理员名下」（owner_user_id=NULL）之间转移节点，语义与普通用户完全一致。
-    # 原先的「超管可见全部节点，无需分配」硬挡已移除；下面的 active_tasks /
-    # confirm_required 校验与审计对所有目标一视同仁。
-
     target = _dedup(node_ids)
     nodemap = {n["node_id"]: n for n in await store.all_nodes()}
     missing = [nid for nid in target if nid not in nodemap]
@@ -368,6 +355,14 @@ async def assign_nodes_core(
     ]
     added = [nid for nid in target if nid not in current]
     removed = [nid for nid in current if nid not in target]
+    if removed:
+        async with SessionLocal() as session:
+            try:
+                reclaim_admin_id = await rbac_service.admin_owner_id(session, reclaim_admin_id)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+        if reclaim_admin_id == user.id:
+            raise HTTPException(409, "不能收回给原所有者，请在节点授权中选择另一位用户")
     changed = added + removed
 
     busy = []
@@ -428,18 +423,21 @@ async def assign_nodes_core(
         for nid in added:
             await node_service.set_owner(store, nid, user.id, audit_principal=p, audit_ip=ip)
         for nid in removed:
-            await node_service.set_owner(store, nid, None, audit_principal=p, audit_ip=ip)
+            await node_service.set_owner(store, nid, reclaim_admin_id, audit_principal=p, audit_ip=ip)
     except SQLAlchemyError as exc:
         raise HTTPException(status_code=503, detail="audit or database unavailable") from exc
 
     names = await rbac_service.username_map()
     affected = {user.username} | {names[o] for o in previous_owners if o in names}
+    if removed and reclaim_admin_id in names:
+        affected.add(names[reclaim_admin_id])
     if changed:
         await rbac_service.refresh_sessions(store, affected)
     result = {
         "node_ids": target,
         "added": added,
         "removed": removed,
+        "reclaim_admin_id": reclaim_admin_id,
         "removed_memberships": memberships,
     }
     await persist.audit(

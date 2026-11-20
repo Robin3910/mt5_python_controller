@@ -60,7 +60,7 @@ class Node(Base):
     # 节点鉴权首包上报的客户端版本；旧版本节点不带该字段，留空表示未知
     client_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
     client_version_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    # 数据归属：管理员分配给哪个用户；空 = 管理员名下（含自动注册的新节点）
+    # 数据归属：实际用户 ID；仅历史未迁移数据可能为空
     owner_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     approval_status: Mapped[str] = mapped_column(String(16), default="approved", server_default="approved")
     requested_by_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
@@ -604,7 +604,7 @@ class NodeGroup(Base):
         Boolean, default=True, server_default="1",
     )
     remark: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    # 数据归属：创建者；空 = 管理员名下。成员节点与绑定策略必须同一所有者
+    # 数据归属：实际创建者；成员节点与绑定策略必须同一所有者
     owner_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -1002,7 +1002,7 @@ class TradingStrategy(Base):
     # 配置版本：每次保存 +1。热推时随快照下发，节点用它做版本门，
     # 迟到的旧版本包直接丢弃，避免乱序热推把新配置覆盖回旧的。
     config_version: Mapped[int] = mapped_column(Integer, default=0)
-    # 数据归属：创建者；空 = 管理员名下
+    # 数据归属：实际创建者；仅历史未迁移数据可能为空
     owner_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(

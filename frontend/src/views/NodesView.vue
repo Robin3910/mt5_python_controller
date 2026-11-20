@@ -78,6 +78,7 @@ const createError = ref('')
 const form = reactive({
   name: '',
   mt5_login: null as number | null,
+  admin_owner_id: null as number | null,
   enabled: true,
   filters: {} as NodeDispatchFiltersConfig,
 })
@@ -167,7 +168,7 @@ const filteredNodes = computed<NodeOut[]>(() => {
 const groupedNodes = computed(() => {
   const map = new Map<string, NodeOut[]>()
   for (const n of filteredNodes.value) {
-    const key = n.owner_username || '管理员'
+    const key = n.owner_username || '历史未归属'
     const list = map.get(key)
     if (list) list.push(n)
     else map.set(key, [n])
@@ -274,13 +275,18 @@ async function ensureGlobalFiltersLoaded(): Promise<void> {
   }
 }
 
-function openCreate(): void {
+async function openCreate(): Promise<void> {
   formMode.value = 'create'
   editingId.value = ''
   createError.value = ''
+  form.admin_owner_id = null
   Object.assign(form, { name: '', mt5_login: null, enabled: true, filters: {} })
   showForm.value = true
   void ensureGlobalFiltersLoaded()
+  try {
+    await rbac.fetchUsers()
+    form.admin_owner_id = rbac.activeAdmins[0]?.id ?? null
+  } catch { createError.value = '归属管理员加载失败，请重新打开' }
 }
 
 function openEdit(n: NodeOut): void {
@@ -342,11 +348,11 @@ async function save(): Promise<void> {
       filters: Object.keys(filtersPayload).length ? filtersPayload : null,
     }
     if (formMode.value === 'create') {
-      if (!form.mt5_login) return
+      if (!form.mt5_login || !form.admin_owner_id) return
       const login = form.mt5_login
       if (!(await confirmAction(`确认创建节点？\n\nMT5 登录号：${login}`))) return
       try {
-        await hub.createNode({ ...payload, mt5_login: form.mt5_login }, currentSearchOptions())
+        await hub.createNode({ ...payload, mt5_login: form.mt5_login, admin_owner_id: form.admin_owner_id }, currentSearchOptions())
       } catch (e: unknown) {
         const err = e as { response?: { status?: number; data?: { detail?: string } } }
         if (err?.response?.status === 409) {
@@ -424,9 +430,7 @@ async function togglePrimary(n: NodeOut): Promise<void> {
 /* ── 管理员授权：把节点划给某个用户 / 收回管理员名下 ── */
 const showAssign = ref(false)
 const assignTarget = ref<NodeOut | null>(null)
-/** 选中值：正数 = 用户 id；-1 = 收回至管理员名下 */
 const assignUserId = ref<number | null>(null)
-const RECLAIM_TO_ADMIN = -1
 const assignSaving = ref(false)
 const assignError = ref('')
 /** 节点仍在分组里时的二次确认（后端 409 confirm_required）*/
@@ -440,6 +444,7 @@ async function openAssign(n: NodeOut): Promise<void> {
   showAssign.value = true
   try {
     await rbac.fetchUsers()
+    assignUserId.value = rbac.activeAdmins[0]?.id ?? null
   } catch {
     assignError.value = '用户列表加载失败，请稍后重试'
   }
@@ -468,24 +473,10 @@ async function submitAssign(confirm = false): Promise<void> {
   try {
     // 用户权限接口是「整体替换该用户名下的节点」语义，所以这里必须带上
     // 该用户现有的全部 node_ids，不能只传这一个节点。
-    let targetUserId: number
-    let nextIds: string[]
-    if (assignUserId.value === RECLAIM_TO_ADMIN) {
-      // 收回管理员名下：从当前所有者的 node_ids 里去掉本节点，
-      // 后端会把 removed 的节点 owner 置空（回到「管理员名下」）。
-      const prevOwnerId = target.owner_user_id
-      if (prevOwnerId == null) {
-        assignError.value = '该节点已在管理员名下，无需收回'
-        return
-      }
-      const prevOwner = rbac.users.find((u) => u.id === prevOwnerId)
-      targetUserId = prevOwnerId
-      nextIds = (prevOwner?.node_ids || []).filter((id) => id !== target.node_id)
-    } else {
-      targetUserId = assignUserId.value
-      const user = rbac.users.find((u) => u.id === targetUserId)
-      nextIds = Array.from(new Set([...(user?.node_ids || []), target.node_id]))
-    }
+    const targetUserId = assignUserId.value
+    const user = rbac.users.find(u => u.id === targetUserId)
+    if (!user) return
+    const nextIds = Array.from(new Set([...user.node_ids, target.node_id]))
     const result = await rbac.assignNodes(targetUserId, nextIds, confirm)
     await hub.fetchNodes(currentSearchOptions())
     const parts: string[] = []
@@ -759,6 +750,12 @@ async function submitAssign(confirm = false): Promise<void> {
             <input id="node-mt5-login-readonly" :value="form.mt5_login ?? ''" type="number" disabled />
             <p class="muted" style="font-size: 12px; margin: 6px 0 0">创建后不可修改</p>
           </div>
+          <div v-if="formMode === 'create'">
+            <FormLabel field-id="node-admin-owner" text="归属管理员" help="默认选中 ID 最小的有效管理员，可改选。" />
+            <select id="node-admin-owner" v-model="form.admin_owner_id" class="pf-input">
+              <option v-for="u in rbac.activeAdmins" :key="u.id" :value="u.id">{{ u.username }}</option>
+            </select>
+          </div>
           <div v-if="formMode === 'edit'">
             <FormLabel field-id="node-enabled" text="启用状态" :help="NODE_FORM_FIELD_HELP.enabled" />
             <TagSelect v-if="!editingNode || !isPendingNode(editingNode) || auth.isAdmin" id="node-enabled" v-model="form.enabled" :options="ENABLED_TAGS" aria-label="启用状态" />
@@ -777,7 +774,7 @@ async function submitAssign(confirm = false): Promise<void> {
         <button class="btn-ghost" @click="showForm = false">取消</button>
         <button
           class="btn-primary"
-          :disabled="saving || (formMode === 'create' && !form.mt5_login)"
+          :disabled="saving || (formMode === 'create' && (!form.mt5_login || !form.admin_owner_id))"
           @click="save"
         >{{ saving ? '保存中…' : '保存' }}</button>
       </div>
@@ -794,12 +791,9 @@ async function submitAssign(confirm = false): Promise<void> {
         </p>
       </div>
       <div class="modal-body">
-        <FormLabel text="授权给" :help="'节点当前归属：' + (assignTarget.owner_username || '管理员名下')" />
+        <FormLabel text="授权给" :help="'节点当前归属：' + (assignTarget.owner_username || '尚未修复归属')" />
         <select v-model.number="assignUserId" class="pf-input nodes-assign-select">
           <option :value="null" disabled>请选择授权方式</option>
-          <option v-if="assignTarget.owner_user_id != null" :value="-1">
-            收回至管理员名下
-          </option>
           <option v-for="u in assignCandidates" :key="u.id" :value="u.id">
             {{ u.display_name || u.username }}（{{ u.username }}）· {{ u.node_ids.length }} 个节点
           </option>

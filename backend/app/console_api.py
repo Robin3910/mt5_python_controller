@@ -114,7 +114,22 @@ async def _scope_groups(
 async def _scope_to_own_groups(
     store: RedisStore, p: Principal, body: ManualSignalRequest,
 ) -> ManualSignalRequest:
-    """普通用户：交易信号只能发 strategy；SMC 价位同样只作用于本人分组。管理员原样放行。"""
+    """个人交易校验本人主节点与分组；管理台保留原权限。"""
+    if body.trading_primary_id is not None:
+        nid = body.trading_primary_id
+        if (body.model != SIGNAL_MODEL_STRATEGY or len(body.group_ids) != 1
+                or body.node_ids not in ([], [nid]) or _is_smc_request(body)):
+            raise HTTPException(400, "个人交易必须定向到本人的策略分组")
+        node = await store.get_node(nid)
+        group = await store.get_group(body.group_ids[0])
+        if (not node or not group or not permissions.same_owner(node.get("owner_user_id"), p.user_id)
+                or not permissions.same_owner(group.get("owner_user_id"), p.user_id)):
+            raise HTTPException(403, "交易节点或分组不属于当前账号")
+        if not node.get("is_primary") or not node.get("enabled") or not manager.is_node_online(nid):
+            raise HTTPException(409, "主节点已变更或离线，请刷新交易页")
+        if not any(member.get("node_id") == nid for member in group.get("members", [])):
+            raise HTTPException(409, "主节点已不在该分组，请刷新交易页")
+        return body
     if p.is_admin:
         return body
     if not _is_smc_request(body) and (

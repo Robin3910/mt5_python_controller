@@ -4,34 +4,23 @@ from __future__ import annotations
 import secrets
 
 from fastapi import HTTPException
-from sqlalchemy import select
 
 from . import permissions
 from .db import SessionLocal
-from .orm import DeletedNode, Node, NodeCredential, Role, User, UserRole
+from .orm import DeletedNode, Node, NodeCredential, User
 from .security import compare_secret, hash_token
 
 
 async def is_admin_user(session, user_id: int | None) -> bool:
-    if user_id is None:
-        return False
-    role = await session.scalar(
-        select(Role.id).join(UserRole, UserRole.role_id == Role.id)
-        .join(User, User.id == UserRole.user_id)
-        .where(User.id == user_id, User.is_active.is_(True), Role.code == permissions.ADMIN_ROLE_CODE,
-               Role.enabled.is_(True))
-    )
-    return role is not None
+    from .rbac_service import active_admin_query
+    return user_id is not None and await session.scalar(active_admin_query().where(User.id == user_id)) is not None
 
 
 async def activate_if_ready(session, node: Node) -> None:
     if node.approval_status != "pending" or not node.admin_enable_requested:
         return
     applicant = node.requested_by_user_id
-    owner_matches = applicant is not None and node.owner_user_id == applicant
-    if applicant is not None and node.owner_user_id is None:
-        owner_matches = await is_admin_user(session, applicant)
-    if owner_matches:
+    if applicant is not None and node.owner_user_id == applicant:
         node.approval_status = "approved"
         node.enabled = True
 

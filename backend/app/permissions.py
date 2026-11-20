@@ -5,7 +5,7 @@
 - 菜单是代码注册表：页面与接口写死在代码里，库（sys_role_menu）只存「角色勾了哪些菜单」；
 - 能力是代码注册表：菜单管「能进哪个页面」，能力管「页面里能做什么」，两者独立。
   例如 AI 智能加仓策略（tpl_1）走 ai_strategy 能力，不额外开菜单；
-- 数据归属靠 owner_user_id：空 = 管理员名下；普通用户只能看 / 改自己名下的数据；
+- 数据归属靠 owner_user_id：个人资产使用实际账号 ID；普通用户只能看 / 改自己名下的数据；
 - 超级管理员（内置角色 admin）拥有全部菜单与能力、看全部数据。
 """
 from __future__ import annotations
@@ -223,7 +223,7 @@ def can_write_strategy(p: Principal, strategy: dict | None) -> bool:
 # 数据归属
 # ---------------------------------------------------------------------------
 def normalize_owner(value: object) -> Optional[int]:
-    """owner_user_id 规范化：空 / 非法 / 非正数 → None（管理员名下）。"""
+    """owner_user_id 规范化：空 / 非法 / 非正数 → None（无明确归属）。"""
     if value is None or isinstance(value, bool):
         return None
     try:
@@ -234,7 +234,7 @@ def normalize_owner(value: object) -> Optional[int]:
 
 
 def same_owner(a: object, b: object) -> bool:
-    """两条数据是否同一所有者（都为空也算同一所有者：都在管理员名下）。"""
+    """两条数据是否同一所有者（历史空归属之间仍视为相同）。"""
     return normalize_owner(a) == normalize_owner(b)
 
 
@@ -251,9 +251,9 @@ def visible(p: Principal, items: Iterable[dict]) -> list[dict]:
     return [d for d in items if owns(p, (d or {}).get("owner_user_id"))]
 
 
-def owner_for_new(p: Principal) -> Optional[int]:
-    """新建分组 / 策略的所有者：管理员建的归管理员名下（空），普通用户归自己。"""
-    return None if p.is_admin else p.user_id
+def owner_for_new(p: Principal) -> int:
+    """个人业务均使用实际账号，管理权限由 owns 单独判断。"""
+    return p.user_id
 
 
 def foreign_node_ids(nodes: Iterable[dict], owner_user_id: object) -> list[str]:

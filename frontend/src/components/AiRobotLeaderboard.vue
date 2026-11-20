@@ -13,13 +13,11 @@ const props = defineProps<{
   error: string
   updatedAt: number | null
   openingGroup: string | null
-  showBack: boolean
 }>()
 const emit = defineEmits<{
   switch: [tab: 'profit' | 'heat']
   follow: [robot: AiRobotSummary]
   retry: []
-  back: []
 }>()
 
 const percent = new Intl.NumberFormat('zh-CN', {
@@ -53,10 +51,6 @@ function closeDetail(): void {
 
 <template>
   <div class="ai-leaderboard">
-    <div v-if="showBack" class="rank-heading">
-      <button type="button" aria-label="返回 AI 交易" @click="emit('back')">‹</button>
-      <h1>机器人榜单</h1>
-    </div>
     <section class="rank-panel" aria-label="机器人榜单" :aria-busy="loading">
       <div class="rank-tabs" role="group" aria-label="榜单类型">
         <button type="button" :aria-pressed="byProfit" @click="emit('switch', 'profit')">收益率榜</button>
@@ -124,9 +118,6 @@ function closeDetail(): void {
 <style scoped>
 .ai-leaderboard { animation: rank-enter .28s ease-out; }
 @keyframes rank-enter { from { opacity: 0; } to { opacity: 1; } }
-.rank-heading { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
-.rank-heading h1 { margin: 0; font-size: 14px; }
-.rank-heading button { padding: 0 8px; }
 .rank-panel { padding: 12px; border: 1px solid #1c2740; border-radius: 12px; background: #101828; box-shadow: 0 2px 12px #00000059; }
 .rank-panel button { border: 0; padding: 0; background: none; color: inherit; backdrop-filter: none; transition: color .15s, background-color .15s; }
 .rank-panel button:active { transform: none; }

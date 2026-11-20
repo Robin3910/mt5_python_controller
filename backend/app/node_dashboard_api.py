@@ -217,10 +217,14 @@ async def enroll(body: Enrollment, request: Request, store: RedisStore = Depends
                     raise HTTPException(409, "MT5 account already registered; contact administrator")
                 node = existing
             else:
+                try:
+                    owner = await rbac_service.admin_owner_id(session, p.user_id if p.is_admin else None)
+                except ValueError as exc:
+                    raise HTTPException(409, str(exc)) from exc
                 node = Node(node_id=make_node_id(), name=(body.name or "").strip() or str(body.mt5_login),
                             mt5_login=body.mt5_login, mt5_server=body.mt5_server,
                             enabled=False, approval_status="pending", requested_by_user_id=p.user_id,
-                            owner_user_id=None, admin_enable_requested=False,
+                            owner_user_id=owner, admin_enable_requested=False,
                             lot_mode=node_service.AUTO_NODE_DEFAULTS["lot_mode"],
                             lot=node_service.AUTO_NODE_DEFAULTS["lot"],
                             poll_order=node_service.AUTO_NODE_DEFAULTS["poll_order"])
