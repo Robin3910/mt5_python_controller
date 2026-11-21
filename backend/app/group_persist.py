@@ -416,6 +416,49 @@ async def active_subtasks_for_magic(
     return out
 
 
+async def subtasks_for_magic(
+    group_id: str, node_id: str, magic: int, *, latest: bool = True,
+) -> list[dict]:
+    """某分组某节点某魔术号下的子任务，**不区分是否已收口**。
+
+    与 `active_subtasks_for_magic` 的区别：不按终态过滤。
+
+    撤单同步必须用它：主节点撤掉限价挂单后，它自己的子任务往往已经被
+    账户对账收口成 `done`（挂单消失 → 「该魔术号没有痕迹」→ 自动收口）。
+    若这里只查非终态子任务，就永远查不到主节点子任务 → 撤单指令发不出去
+    → 跟单节点的挂单留在盘上没人管。
+
+    `latest=True` 时只返回最近一条（id 最大）：同一 (节点, magic) 可能有多条
+    历史子任务（重试 / 复用魔术号），只有最近那条才是当前这次执行。
+    """
+    if not group_id or not node_id:
+        return []
+    try:
+        async with SessionLocal() as s:
+            rows = (
+                await s.execute(
+                    select(GroupTaskDispatch)
+                    .where(
+                        GroupTaskDispatch.group_id == group_id,
+                        GroupTaskDispatch.node_id == node_id,
+                        GroupTaskDispatch.magic == int(magic),
+                    )
+                    .order_by(GroupTaskDispatch.id.desc())
+                )
+            ).scalars().all()
+            if latest and rows:
+                rows = rows[:1]
+            out = [_subtask_dict(r) for r in rows]
+    except Exception as e:  # noqa: BLE001
+        logger.warning("subtasks_for_magic failed: %s", e)
+        return []
+    # 带上主任务的策略快照：调用方据此判断是否 tpl_2 限价开仓（撤单同步只对它生效）
+    snaps = await _task_snapshots({int(r["task_id"]) for r in out})
+    for r in out:
+        r["strategy_snapshot"] = snaps.get(int(r["task_id"]))
+    return out
+
+
 async def templates_by_magic(node_id: str, magics: set[int]) -> dict[int, Optional[str]]:
     """某节点上若干魔术号各自所属子任务的策略模版 ID（`{magic: template_id}`）。
 

@@ -42,8 +42,11 @@ K_NODE_PENDING_STOP = "node:pending_stop:{}"
 # 带 TTL：节点长期不在线时基线自然过期，重连后按「首见只建基线、不对比」处理。
 K_LEADER_SNAPSHOT = "follow:leader_snapshot:{}"
 LEADER_SNAPSHOT_TTL = 6 * 3600
-K_LEADER_PENDING_CANCEL = "follow:leader_pending_cancel:{}"
-LEADER_PENDING_CANCEL_TTL = 6 * 3600
+# 主节点各魔术号的挂单基线（撤单检出用）：记住「曾经挂过多少张」，
+# 与持仓基线分开存 —— 持仓基线每轮整体覆写，挂单消失后就没法判断
+# 「是被撤了」还是「本来就没有」。
+K_LEADER_ORDER_BOOK = "follow:leader_order_book:{}"
+LEADER_ORDER_BOOK_TTL = 6 * 3600
 # 自动路由规则的命中统计：{rule_id} -> JSON {count, last_hit_ts, last_signal_id}
 # 用途：规则卡上要显示「命中 N 条 / 最近命中时间」——
 # 「配了但一条都没命中」是最容易发生的问题（条件写窄了），必须一眼可见。
@@ -424,81 +427,41 @@ class RedisStore:
         """清掉基线（节点被移除 / 不再担任带单节点时）。"""
         await self.r.delete(K_LEADER_SNAPSHOT.format(node_id))
 
-    # ---- 主节点限价撤单的连续确认计数 ----
-    async def note_pending_cancel_hits(
-        self, node_id: str, hits: dict[int, int], *, confirm: int = 3,
-        order_lost: Optional[dict[int, int]] = None,
-        gained: Optional[dict[int, int]] = None,
-        live_orders: Optional[dict[int, int]] = None,
-    ) -> set[int]:
-        """按本轮疑似撤单推进连续计数，返回已确认的 magic。
+    # ---- 主节点限价撤单：挂单基线（撤单检出用） ----
+    async def get_leader_order_book(
+        self, node_id: str,
+    ) -> dict[str, dict]:
+        """主节点各魔术号的挂单基线 `{magic: {"count": n, "tickets": [...]}}`。
 
-        hits: 本轮疑似撤单 {magic: 笔数}。
-        order_lost / gained: 本轮各 magic 挂单减少笔数、新增持仓笔数。
-        live_orders: 本轮仍有挂单的 magic（给等待中的疑似撤单续期）。
+        与持仓基线分开存：持仓基线每轮整体覆写（只关心「哪几笔没了」），
+        而挂单基线必须**记住曾经挂过多少张**，才能在挂单全部消失时判定
+        「被撤了」而不是「本来就没有」。
 
-        单轮「挂单 -1、持仓 +1」既可能是成交也可能是撤单，所以要跨轮判断：
-        - 疑似撤单那轮记 `count=1`，并把本轮 +1 的持仓记进 carried；
-        - 之后每有一个静默轮（挂单没回来）`count+1`，攒满 `confirm` 轮确认；
-        - 只要该 magic 又出现挂单（旧单没撤 / 新单挂上了 / 快照抖动后回来了），
-          嫌疑一律清零 —— 不能凭「挂单曾经消失过」确认撤单，必须等它真的不再
-          回来重新攒够 N 轮；
-        - carried>0 的 magic 一旦静默（挂单没回来），说明那 +1 是撤单前就有的
-          持仓、而不是成交 —— 直接确认。
-        已确认 batch 记在 `confirmed` 里：基线更新后同一批撤单不会再检出，
-        但 hazard 计数过期不作为已确认的依据。
-        所有 magic 都没有在途计数时删除 key，确认结果不会阴魂不散。
-
-        计数落在 Redis 里：服务多进程 / 重启后连续确认不会失效。
-        确认后该 magic 从计数里移除，避免同一批撤单重复下发。
+        为什么必须独立于持仓基线：挂单消失的那一轮，持仓基线里挂单行也
+        一起被覆盖成空，下一轮再对比就看不出「曾经有过挂单」—— 撤单
+        检出必须靠这份记忆。
         """
-        key = K_LEADER_PENDING_CANCEL.format(node_id)
-        confirm = max(1, int(confirm or 1))
+        raw = await self.r.get(K_LEADER_ORDER_BOOK.format(node_id))
+        if not raw:
+            return {}
         try:
-            raw = await self.r.get(key)
-            state = json.loads(raw) if raw else {}
+            value = json.loads(raw)
         except (TypeError, ValueError):
-            state = {}
-        if not isinstance(state, dict):
-            state = {}
-        lost_map = order_lost or {}
-        gain_map = gained or {}
-        live_map = live_orders or {}
-        confirmed: set[int] = set()
-        next_state: dict[str, dict] = {}
-        # 在途 magic ∪ 本轮疑似撤单：后者也要能推进（静默轮靠它续期）
-        tracked = {int(m) for m in state} | {int(m) for m in hits or {}}
-        for magic in sorted(tracked):
-            prev = state.get(str(magic)) or {}
-            carried = int(prev.get("carried") or 0)
-            lost = int(lost_map.get(magic, 0) or 0)
-            gain = int(gain_map.get(magic, 0) or 0)
-            if int(live_map.get(magic, 0) or 0) > 0:
-                # 该 magic 还有挂单：抖动的挂单回来了 -> 嫌疑清零，不确认
-                continue
-            # 本轮真正无法被持仓变化解释的挂单减少
-            unexplained = lost - gain
-            if unexplained > 0:
-                streak = int(prev.get("count") or 0) + 1
-                carried = max(gain, 0)
-            elif carried > 0:
-                # 上轮 (+1, -1) 本轮毫无动静 -> 那批挂单是被撤的，确认
-                confirmed.add(int(magic))
-                continue
-            else:
-                # 静默轮：挂单消失后没再回来，延续连续计数
-                streak = int(prev.get("count") or 0) + 1
-                carried = 0
-            if streak >= confirm:
-                confirmed.add(int(magic))
-                continue
-            next_state[str(magic)] = {"count": streak, "carried": carried}
-        if not next_state:
-            # 没有任何在途的确认计数：删掉，避免旧状态干扰之后的检出
-            await self.r.delete(key)
-            return confirmed
-        await self.r.set(key, json.dumps(next_state), ex=LEADER_PENDING_CANCEL_TTL)
-        return confirmed
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    async def set_leader_order_book(
+        self, node_id: str, book: dict[str, dict],
+        ttl: int = LEADER_ORDER_BOOK_TTL,
+    ) -> None:
+        """覆写主节点挂单基线（整体替换）。"""
+        await self.r.set(
+            K_LEADER_ORDER_BOOK.format(node_id), json.dumps(book), ex=ttl,
+        )
+
+    async def clear_leader_order_book(self, node_id: str) -> None:
+        """清掉挂单基线。"""
+        await self.r.delete(K_LEADER_ORDER_BOOK.format(node_id))
 
     # ---- 离线节点的待补发终止指令 ----
     async def push_pending_stop(self, node_id: str, command: dict, ttl: int) -> None:

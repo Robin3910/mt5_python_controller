@@ -521,6 +521,8 @@ class NodeClient:
             asyncio.create_task(self._heartbeat(ws)),
             asyncio.create_task(self._receiver(ws)),
             asyncio.create_task(self._link_monitor()),
+            # 秒级盯账本变化：主节点撤单后尽快让服务端知道，缩短跟单撤单延迟
+            asyncio.create_task(self._books_watch(ws)),
         ]
         if settings.deals_sync_enabled:
             tasks.append(asyncio.create_task(self._deals_reporter(ws)))
@@ -724,6 +726,60 @@ class NodeClient:
                 # 也会让「净值下限」这类规则在空仓下误判。等账本能读了再判断。
                 await self._check_account_risk(ws, snap)
             await asyncio.sleep(clamp_account_report_interval(settings.account_report_interval))
+
+    async def _books_watch(self, ws) -> None:
+        """秒级盯账本（挂单）变化，变了就**立刻**补报一份账户快照。
+
+        为什么需要它：主节点在 MT5 里手动撤掉限价挂单后，服务端要靠这份
+        快照才发现「挂单没了」并把撤单同步给跟单节点。只靠常规上报间隔
+        （默认 5 秒）意味着跟单节点的挂单最多要在盘上多留 5 秒 —— 用户
+        期望的是「主节点一撤，跟单马上撤」。
+
+        这里用更短的间隔（默认 1 秒）只读挂单集合（比读全量快照便宜得多），
+        一旦发现变化就补发一份完整快照，让服务端的撤单检出提前触发。
+
+        注意：
+        - 只在**集合变化**时补报，不做高频全量上报，避免带宽与 MT5 调用翻倍。
+        - 读失败一律按「没变化」处理：读不到不等于变了，绝不能因此补发
+          空账本快照（服务端会把空账本当成「已平光」而错误收口任务）。
+        - 与 `_reporter` 并行跑，两条路径都可能发快照；服务端按快照幂等处理。
+        """
+        interval = max(0.2, float(settings.books_watch_interval))
+        last: Optional[tuple] = None
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                rows = await self._pending_orders()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                logger.debug("books watch failed: %s", e)
+                continue
+            try:
+                signature = tuple(sorted(
+                    (int(r.get("ticket") or 0), int(r.get("magic") or 0))
+                    for r in rows
+                ))
+            except (TypeError, ValueError):
+                continue
+            if signature == last:
+                continue
+            first = last is None
+            last = signature
+            if first:
+                # 首轮只建立基线，不补报：常规上报马上就会发一份完整快照。
+                continue
+            try:
+                snap = await self._snapshot()
+                if snap is None:
+                    continue
+                self._check_login(snap.get("account") or {})
+                await ws.send(json.dumps({"type": "account", "data": snap}))
+                logger.info("books changed, account snapshot resent early")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                logger.warning("books watch resend failed: %s", e)
 
     async def _sample_terminal_status(self) -> None:
         """采样终端链路状态与算法交易开关（一次 terminal_info() 读三个字段）。

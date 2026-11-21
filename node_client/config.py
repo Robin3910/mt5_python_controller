@@ -30,6 +30,10 @@ class NodeSettings(BaseSettings):
     # 各类时间间隔（秒）
     heartbeat_interval: int = 15        # 心跳间隔
     account_report_interval: float = 5.0  # 账户上报间隔（支持小数，下限见 clamp）
+    # 账本变化探测间隔（秒）：盯挂单集合，变了就立刻补报一份账户快照。
+    # 主节点在 MT5 里撤单后，跟单节点要尽快收到撤单指令 —— 靠常规上报间隔
+    # （5 秒）感知太慢，这里用秒级探测把延迟压到 1 秒内。
+    books_watch_interval: float = 1.0
     reconnect_min: int = 2              # 重连退避下限
     reconnect_max: int = 30             # 重连退避上限
     auth_timeout: int = 10             # 等待 auth_ok 的超时
