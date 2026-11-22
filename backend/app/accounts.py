@@ -15,17 +15,14 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["accounts"])
 
 
-async def annotate_strategy_templates(
-    node_id: str, acct: dict, templates: dict[int, str | None] | None = None,
-) -> dict:
-    """给快照里的持仓 / 挂单补 `ai_template`（所属子任务的策略模版 ID）。
+async def annotate_strategy_templates(node_id: str, acct: dict) -> dict:
+    """由子任务快照为持仓和挂单补充策略模版与开仓方式。
 
     节点只上报裸的 MT5 订单，不知道它属于哪条策略；按魔术号回子任务快照反查，
     前端据此把「AI 智能加仓（tpl_1）」的仓位从普通交易列表里摘出去。
     反查失败不报错：标不上模版，前端按普通持仓展示。
 
     快照入库链路（`ws_gateway`）与查询接口共用本函数，保证 REST / WS 两份数据一致。
-    `templates` 可由调用方预先查好传入；传 None 时按快照里的魔术号现查。
     """
     if not isinstance(acct, dict):
         return acct
@@ -42,13 +39,12 @@ async def annotate_strategy_templates(
                 magics.add(magic)
     if not magics:
         return acct
-    if templates is None:
-        try:
-            templates = await group_persist.templates_by_magic(node_id, magics)
-        except Exception:  # noqa: BLE001
-            logger.warning("annotate strategy template failed for node %s", node_id, exc_info=True)
-            return acct
-    if not templates:
+    try:
+        metadata = await group_persist.strategy_metadata_by_magic(node_id, magics)
+    except Exception:  # noqa: BLE001
+        logger.warning("annotate strategy metadata failed for node %s", node_id, exc_info=True)
+        return acct
+    if not metadata:
         return acct
     for key in ("positions", "orders"):
         rows = acct.get(key)
@@ -58,16 +54,18 @@ async def annotate_strategy_templates(
             if not isinstance(row, dict):
                 continue
             try:
-                tpl = templates.get(int(row.get("magic") or 0))
+                tpl, opening_method = metadata.get(int(row.get("magic") or 0), (None, None))
             except (TypeError, ValueError):
                 continue
             if tpl:
                 row["ai_template"] = tpl
+            if opening_method:
+                row["opening_method"] = opening_method
     return acct
 
 
 async def snapshot_with_templates(node_id: str) -> dict | None:
-    """读取 Redis 里的最新账户快照并完成 `ai_template` 标注。
+    """读取 Redis 里的最新账户快照并补齐策略模版和开仓方式。
 
     与节点快照入库共用 `node:<id>` 锁：避免读到「DB 里子任务还没落好、
     快照已经更新」的中间态，也避免同一快照被并发标两次。

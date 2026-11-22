@@ -459,13 +459,12 @@ async def subtasks_for_magic(
     return out
 
 
-async def templates_by_magic(node_id: str, magics: set[int]) -> dict[int, Optional[str]]:
-    """某节点上若干魔术号各自所属子任务的策略模版 ID（`{magic: template_id}`）。
+async def strategy_metadata_by_magic(
+    node_id: str, magics: set[int],
+) -> dict[int, tuple[Optional[str], Optional[strategy_templates.StrategyOpeningMethod]]]:
+    """返回某节点上各魔术号最近一次子任务的模版 ID 和开仓方式。
 
-    用于账户快照按魔术号反查「这单是哪条策略下的」：前端据此隐藏 / 区分
-    AI 智能加仓（tpl_1）之类的策略持仓。取该 magic 下**最近一次**子任务
-    （`id` 最大）的快照 `template_id`，存量数据没有快照时值为 None。
-    查询失败按空结果处理：调用方只会在标不上模版，不会因此看不到持仓。
+    账户快照使用最近一次子任务的快照（`id` 最大）。没有快照时两个字段均为 None。
 
     分两步查（先子任务行、再主任务快照）：不 JOIN 可以走 `(node_id, magic)` 索引，
     账户快照每条消息都会调一次，走短查询比联表更省。
@@ -505,13 +504,16 @@ async def templates_by_magic(node_id: str, magics: set[int]) -> dict[int, Option
                 ).all()
             )
     except Exception as e:  # noqa: BLE001
-        logger.warning("templates_by_magic failed: %s", e)
+        logger.warning("strategy_metadata_by_magic failed: %s", e)
         return {}
-    out: dict[int, Optional[str]] = {}
+    out = {}
     for magic, task_id in latest.items():
         snapshot = snapshots.get(task_id)
         tpl = snapshot.get("template_id") if isinstance(snapshot, dict) else None
-        out[magic] = str(tpl).strip() if tpl else None
+        out[magic] = (
+            str(tpl).strip() if tpl else None,
+            strategy_templates.opening_method_from_snapshot(snapshot),
+        )
     return out
 
 

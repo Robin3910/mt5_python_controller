@@ -27,6 +27,7 @@ import type {
   PendingOrder,
   Position,
   QuoteInfo,
+  StrategyOpeningMethod,
   TrendPanelData,
   TrendVerdict,
 } from '@/api/types'
@@ -448,8 +449,19 @@ interface SymbolBook {
   volume: number
   profit: number
 }
-function magicLabel(magic: number): string {
-  return magic ? `魔术号 ${magic}` : '手工单'
+const STRATEGY_LABEL: Record<StrategyOpeningMethod, string> = {
+  trend_market: '市价开仓',
+  trend_limit: '限价开仓',
+  grid: '智能吸筹',
+  ai: 'AI 智能加仓',
+}
+
+function openingGroupLabel(magic: number, rows: { opening_method?: StrategyOpeningMethod | null }[]): string {
+  const labels = new Set(rows.map(({ opening_method }) => {
+    const label = opening_method && STRATEGY_LABEL[opening_method]
+    return label || (magic ? '开仓方式未知' : '手工单')
+  }))
+  return [...labels].join(' / ')
 }
 const positionBooks = computed<SymbolBook[]>(() => {
   const map = new Map<string, Position[]>()
@@ -753,7 +765,7 @@ interface HistRow {
   key: string
   symbol: string
   magic: number
-  openingMethod: DealRecord['opening_method']
+  opening_method: DealRecord['opening_method']
   direction: string
   volume: number
   open: number
@@ -763,7 +775,6 @@ interface HistRow {
 }
 interface HistMagicGroup {
   magic: number
-  openingLabel: string
   rows: HistRow[]
   volume: number
   profit: number
@@ -796,7 +807,7 @@ function buildHistoryRows(deals: DealRecord[]): HistRow[] {
       key,
       symbol: last.symbol || ins[0]?.symbol || '—',
       magic: last.magic || ins[0]?.magic || 0,
-      openingMethod: ins[0]?.opening_method ?? last.opening_method,
+      opening_method: ins[0]?.opening_method ?? last.opening_method,
       direction,
       volume: outs.reduce((sum, deal) => sum + (deal.volume || 0), 0),
       open: ins[0]?.price || 0,
@@ -826,13 +837,8 @@ const historyBooks = computed(() => {
     }
     const groups: HistMagicGroup[] = [...byMagic.entries()].map(([magic, groupRows]) => {
       const wins = groupRows.filter((row) => row.profit >= 0).length
-      const openingLabels = new Set(groupRows.map((row) => {
-        const label = row.openingMethod && STRATEGY_LABEL[row.openingMethod]
-        return label || (magic ? '开仓方式未知' : '手工单')
-      }))
       return {
         magic,
-        openingLabel: [...openingLabels].join(' / '),
         rows: groupRows,
         volume: groupRows.reduce((sum, row) => sum + row.volume, 0),
         profit: groupRows.reduce((sum, row) => sum + row.profit, 0),
@@ -917,13 +923,6 @@ watch(
 )
 
 // ── 弹窗（开仓参数）──
-const STRATEGY_LABEL: Record<NonNullable<DealRecord['opening_method']>, string> = {
-  trend_market: '市价开仓',
-  trend_limit: '限价开仓',
-  grid: '智能吸筹',
-  ai: 'AI 智能加仓',
-}
-
 const dialogVisible = ref(false)
 watch(() => primaryNode.value?.node_id, () => { dialogVisible.value = false })
 const submitting = ref(false)
@@ -1330,7 +1329,7 @@ onBeforeUnmount(() => {
             <template v-for="group in book.groups" :key="group.magic">
               <div class="tr-magic-head">
                 <div>
-                  <b>{{ magicLabel(group.magic) }}</b>
+                  <b>{{ openingGroupLabel(group.magic, group.rows) }}</b>
                   <span>{{ group.rows.length }} 笔 · {{ group.volume.toFixed(2) }} 手</span>
                 </div>
                 <strong :class="group.profit >= 0 ? 'up' : 'down'">{{ fmtSigned(group.profit) }}</strong>
@@ -1388,7 +1387,7 @@ onBeforeUnmount(() => {
             <template v-for="group in book.groups" :key="`pend-${book.symbol}-${group.magic}`">
               <div class="tr-magic-head">
                 <div>
-                  <b>{{ magicLabel(group.magic) }}</b>
+                  <b>{{ openingGroupLabel(group.magic, group.rows) }}</b>
                   <span>{{ group.rows.length }} 张 · {{ group.volume.toFixed(2) }} 手</span>
                 </div>
               </div>
@@ -1490,7 +1489,7 @@ onBeforeUnmount(() => {
             <template v-for="group in book.groups" :key="group.magic">
               <div class="tr-magic-head">
                 <div>
-                  <b>{{ group.openingLabel }}</b>
+                  <b>{{ openingGroupLabel(group.magic, group.rows) }}</b>
                   <span>{{ group.rows.length }} 笔 · {{ group.volume.toFixed(2) }} 手</span>
                   <span class="wide">平盈 {{ group.wins }} / 平损 {{ group.losses }}</span>
                 </div>

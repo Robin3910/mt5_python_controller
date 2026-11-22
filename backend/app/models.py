@@ -6,6 +6,7 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 from .ai_follow_settings import FollowSettings
+from .strategy_templates import StrategyOpeningMethod
 
 
 # ----------------------------- 节点 -----------------------------
@@ -163,9 +164,6 @@ class PaginatedNodeDispatches(BaseModel):
     page_size: int
 
 
-DealOpeningMethod = Literal["trend_market", "trend_limit", "grid", "ai"]
-
-
 class DealRecord(BaseModel):
     """单笔 MT5 成交明细。"""
     id: int
@@ -194,7 +192,7 @@ class DealRecord(BaseModel):
     signal_id: Optional[str] = None
     task_id: Optional[int] = None
     group_id: Optional[str] = None
-    opening_method: Optional[DealOpeningMethod] = None
+    opening_method: Optional[StrategyOpeningMethod] = None
     deal_time: int = 0
 
 

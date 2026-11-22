@@ -19,10 +19,9 @@ from typing import Optional
 from sqlalchemy import String, cast, func, or_, select, tuple_
 from sqlalchemy.exc import IntegrityError
 
-from . import strategy_templates
 from .db import SessionLocal
-from .models import DealOpeningMethod
 from .orm import Deal, GroupSignalTask, GroupTaskDispatch, SignalDispatch
+from .strategy_templates import StrategyOpeningMethod, opening_method_from_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +61,7 @@ def source_label(source: str) -> str:
 def _deal_dict(
     row: Deal,
     position_direction: Optional[str] = None,
-    opening_method: Optional[DealOpeningMethod] = None,
+    opening_method: Optional[StrategyOpeningMethod] = None,
 ) -> dict:
     """ORM 行 -> 对外 dict（成交时间统一给 Unix 秒）。
 
@@ -473,22 +472,7 @@ async def _position_entries(s, rows: list[Deal]) -> dict[tuple[str, int], tuple[
         return {}
 
 
-def _opening_method(snapshot: object) -> Optional[DealOpeningMethod]:
-    if not isinstance(snapshot, dict):
-        return None
-    template = snapshot.get("template_id")
-    if template == strategy_templates.TEMPLATE_3_ID:
-        return "grid"
-    if template == strategy_templates.TEMPLATE_1_ID:
-        return "ai"
-    if template == strategy_templates.TEMPLATE_2_ID:
-        rule = strategy_templates.pick_risk_sized_rule(snapshot.get("rules"))
-        if rule:
-            return "trend_limit" if strategy_templates.is_limit_entry(rule) else "trend_market"
-    return None
-
-
-async def _opening_methods(s, keys: set[tuple[str, int]]) -> dict[tuple[str, int], Optional[DealOpeningMethod]]:
+async def _opening_methods(s, keys: set[tuple[str, int]]) -> dict[tuple[str, int], Optional[StrategyOpeningMethod]]:
     if not keys:
         return {}
     try:
@@ -501,9 +485,9 @@ async def _opening_methods(s, keys: set[tuple[str, int]]) -> dict[tuple[str, int
         logger.warning("opening method lookup failed: %s", e)
         return {}
 
-    modes: dict[tuple[str, int], set[Optional[DealOpeningMethod]]] = {}
+    modes: dict[tuple[str, int], set[Optional[StrategyOpeningMethod]]] = {}
     for node_id, magic, snapshot in rows:
-        modes.setdefault((node_id, magic), set()).add(_opening_method(snapshot))
+        modes.setdefault((node_id, magic), set()).add(opening_method_from_snapshot(snapshot))
     # 历史任务复用过魔术号时，只有快照口径一致才标注。
     return {key: next(iter(values)) for key, values in modes.items() if len(values) == 1}
 

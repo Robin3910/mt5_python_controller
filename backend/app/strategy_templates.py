@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Optional, Protocol
+from typing import Any, Callable, Literal, Optional, Protocol
 
 # 规则 type
 RULE_TYPE_COUNTER = 1      # 逆势加仓（模版1）
@@ -710,6 +710,24 @@ def is_limit_entry(rule: object) -> bool:
     if not isinstance(rule, dict):
         return False
     return str(rule.get("entry_mode") or "").strip().lower() == ENTRY_MODE_LIMIT
+
+
+StrategyOpeningMethod = Literal["trend_market", "trend_limit", "grid", "ai"]
+
+
+def opening_method_from_snapshot(snapshot: object) -> Optional[StrategyOpeningMethod]:
+    if not isinstance(snapshot, dict):
+        return None
+    template = snapshot.get("template_id")
+    if template == TEMPLATE_3_ID:
+        return "grid"
+    if template == TEMPLATE_1_ID:
+        return "ai"
+    if template == TEMPLATE_2_ID:
+        rule = pick_risk_sized_rule(snapshot.get("rules"))
+        if rule:
+            return "trend_limit" if is_limit_entry(rule) else "trend_market"
+    return None
 
 
 def is_grid_rule(rule: object) -> bool:

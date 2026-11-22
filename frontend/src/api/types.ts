@@ -216,6 +216,8 @@ export interface NodeOut {
   is_primary?: boolean
 }
 
+export type StrategyOpeningMethod = 'trend_market' | 'trend_limit' | 'grid' | 'ai'
+
 export interface Position {
   ticket: number
   symbol: string
@@ -234,6 +236,7 @@ export interface Position {
    * 前端据此识别 AI 智能加仓（`tpl_1`）的仓位。
    */
   ai_template?: string
+  opening_method?: StrategyOpeningMethod | null
 }
 
 export interface QuoteInfo {
@@ -262,6 +265,7 @@ export interface PendingOrder {
   price_current?: number
   /** 所属策略子任务的模版 ID（后端按魔术号反查后补上；对不上 / 老节点无此字段） */
   ai_template?: string
+  opening_method?: StrategyOpeningMethod | null
 }
 
 export interface AccountSnapshot {
@@ -1576,7 +1580,7 @@ export interface DealRecord {
   signal_id: string | null
   task_id: number | null
   group_id: string | null
-  opening_method?: 'trend_market' | 'trend_limit' | 'grid' | 'ai' | null
+  opening_method?: StrategyOpeningMethod | null
   /** 成交时间（Unix 秒） */
   deal_time: number
 }
