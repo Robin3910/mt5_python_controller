@@ -4,9 +4,10 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
 import 'element-plus/es/components/message-box/style/css'
-import { fetchMyAiRobotDetail, setAiFollowPaused } from '@/api/aiFollow'
-import type { AiMyRobotDetailResponse } from '@/api/types'
+import { fetchMyAiRobotDetail, setAiFollowNodeState, setAiFollowPaused } from '@/api/aiFollow'
+import type { AiFollowNodeState, AiMyRobotDetailResponse } from '@/api/types'
 import StrategyFormModal from '@/components/StrategyFormModal.vue'
+import { confirmAction } from '@/utils/confirm'
 
 const route = useRoute()
 const router = useRouter()
@@ -25,6 +26,12 @@ const symbols = computed(() => [...new Set((detail.value?.groups || []).map((gro
 const elapsedDays = computed(() => detail.value?.started_at == null ? null : Math.max(0, Math.floor((Date.now() / 1000 - detail.value.started_at) / 86400)))
 const chartMax = computed(() => Math.max(1, ...(detail.value?.daily_profit || []).map((point) => Math.abs(point.profit))))
 const hasDailyDeals = computed(() => detail.value?.daily_profit.some((point) => point.deals > 0))
+const followerNodes = computed(() => {
+  const current = detail.value
+  if (!current?.robot.group_id || current.review_status) return []
+  return current.groups.find((group) => group.group_id === current.robot.group_id)?.my_nodes ?? []
+})
+const followerStateLabels = { running: '跟单中', paused: '已暂停', stopped: '已停止' }
 
 function money(value: number | null | undefined, signed = false): string {
   if (value == null) return '—'
@@ -77,6 +84,32 @@ async function changePaused(paused: boolean, stopping = false): Promise<void> {
     await setAiFollowPaused({ leader_user_id: robot.leader_user_id, paused })
     ElMessage.success(paused ? '已停止接收新开仓信号' : '已恢复接收新开仓信号')
     await loadDetail()
+  } catch (cause) {
+    ElMessage.error(errorText(cause))
+  } finally { busy.value = false }
+}
+
+async function changeFollowerState(nodeId: string, state: AiFollowNodeState): Promise<void> {
+  const currentGroupId = detail.value?.robot.group_id
+  const node = followerNodes.value.find((item) => item.node_id === nodeId)
+  if (busy.value || !currentGroupId || !node || node.follow_state === 'stopped') return
+  if (state === 'running' && node.leader_paused) return
+
+  const action = { running: '恢复跟单', paused: '暂停跟单', stopped: '停止跟单' }[state]
+  const version = loadVersion
+  const outcome = state === 'running'
+    ? '恢复后接收后续新开仓信号。'
+    : '停止接收新开仓信号，已有任务和持仓继续运行。'
+  busy.value = true
+  try {
+    const confirmed = await confirmAction(
+      `确认${action}「${node.name || node.node_id}」？\n\n仅作用于该节点在当前机器人分组中的跟单关系。${outcome}${state === 'stopped' ? '\n停止后可重新申请跟单。' : ''}`,
+      action,
+    )
+    if (!confirmed || version !== loadVersion) return
+    await setAiFollowNodeState([nodeId], state, currentGroupId)
+    ElMessage.success(`已${action}`)
+    if (version === loadVersion) await loadDetail()
   } catch (cause) {
     ElMessage.error(errorText(cause))
   } finally { busy.value = false }
@@ -147,8 +180,26 @@ onUnmounted(() => {
           <button type="button" class="rd-stop" :disabled="busy || detail.robot.ai_follow_paused" @click="changePaused(true, true)"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm4 14H8V8h8v8z"/></svg>停止机器人</button>
         </div>
         <button v-else-if="detail.robot.editable_strategy_id" type="button" class="rd-adjust" @click="editorOpen = true">调整参数</button>
-        <p v-else class="rd-readonly">仅机器人主人可调整参数与控制运行，当前为只读详情。</p>
-        <p v-if="detail.can_control" class="rd-note">暂停与停止均只停止新开仓，已有任务和持仓继续按原规则运行。</p>
+        <p v-else-if="!followerNodes.length" class="rd-readonly">当前分组暂无可管理的跟单节点。</p>
+        <ul v-if="followerNodes.length" class="rd-follower-nodes" aria-label="我的跟单节点">
+          <li v-for="node in followerNodes" :key="node.node_id" class="rd-follower-node">
+            <div class="rd-follower-info">
+              <strong>{{ node.name || node.node_id }}</strong>
+              <span v-if="node.mt5_login">MT5 {{ node.mt5_login }}</span>
+            </div>
+            <span class="rd-status" :class="{ paused: node.follow_state === 'paused' || node.leader_paused, stopped: node.follow_state === 'stopped' }">
+              <i></i>{{ node.leader_paused && node.follow_state !== 'stopped' ? '频道已暂停' : followerStateLabels[node.follow_state] }}
+            </span>
+            <div v-if="node.follow_state !== 'stopped'" class="rd-follower-actions">
+              <button type="button" :class="node.follow_state === 'paused' ? 'rd-adjust' : 'rd-pause'"
+                :disabled="busy || loading || (node.follow_state === 'paused' && node.leader_paused)"
+                @click="changeFollowerState(node.node_id, node.follow_state === 'paused' ? 'running' : 'paused')"
+              >{{ node.follow_state === 'paused' ? '恢复跟单' : '暂停跟单' }}</button>
+              <button type="button" class="rd-stop" :disabled="busy || loading" @click="changeFollowerState(node.node_id, 'stopped')">停止跟单</button>
+            </div>
+          </li>
+        </ul>
+        <p v-if="detail.can_control || followerNodes.length" class="rd-note">暂停与停止均只停止新开仓，已有任务和持仓继续按原规则运行。</p>
         <div class="rd-results">
           <div><span>累计收益</span><strong :class="{ up: detail.performance.data_available && detail.performance.total_profit >= 0, down: detail.performance.data_available && detail.performance.total_profit < 0 }">{{ detail.performance.data_available ? `${money(detail.performance.total_profit, true)} U` : '—' }}</strong></div>
           <div><span>收益率</span><strong>{{ detail.metrics.profit_rate == null ? '—' : `${money(detail.metrics.profit_rate, true)}%` }}</strong></div>
@@ -171,6 +222,7 @@ onUnmounted(() => {
 .rd-status { display: flex; align-items: center; gap: 5px; padding: 4px 10px; border-radius: 99px; color: #16c784; background: #12362d; font-size: 11px; white-space: nowrap; }
 .rd-status i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .rd-status.paused { color: #f0b90b; background: #352e19; }
+.rd-status.stopped { color: #94a3b8; background: #1e293b; }
 .rd-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
 .rd-metrics > div { padding: 10px; border: 1px solid #23314b; border-radius: 9px; background: #0b1220; }
 .rd-metrics span { display: block; margin-bottom: 6px; color: #64748b; font-size: 11px; }
@@ -199,6 +251,12 @@ onUnmounted(() => {
 .rd-adjust { color: #94a3b8; background: #0b1220; }
 .rd-adjust svg { width: 15px; height: 15px; }
 .rd-stop { color: #f6465d; border-color: #632a3c !important; background: #291d2e; }
+.rd-follower-nodes { display: grid; gap: 8px; margin: 8px 0 0; padding: 0; list-style: none; }
+.rd-follower-node { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px; border: 1px solid #23314b; border-radius: 9px; background: #0b1220; }
+.rd-follower-info { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 3px; overflow-wrap: anywhere; }
+.rd-follower-info span { color: #64748b; font-size: 11px; }
+.rd-follower-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.rd-follower-actions button { width: auto; min-height: 36px; padding: 6px 10px; white-space: nowrap; }
 .rd-results { margin-top: 8px; padding: 9px; border: 1px solid #1e293b; border-radius: 8px; background: #0b1220; }
 .rd-results > div { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; font-size: 11px; }
 .rd-results span { color: #64748b; }
@@ -213,5 +271,7 @@ onUnmounted(() => {
   .rd-status { padding: 4px 7px; }
   .rd-chart { gap: 4px; }
   .rd-bar span { font-size: 9px; }
+  .rd-follower-actions { width: 100%; }
+  .rd-follower-actions button { flex: 1; }
 }
 </style>
