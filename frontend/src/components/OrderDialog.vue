@@ -1378,7 +1378,11 @@ async function syncFollowersIntoGroup(): Promise<void> {
   try {
     const r = await hub.adoptFollowers(groupId)
     if (r.adopted?.length) {
-      ElMessage.info(`已生成 ${r.adopted.length} 条跟单申请，审核通过后生效`)
+      if (r.adopted[0].status === 'approved') {
+        ElMessage.success(`已自动批准 ${r.adopted.length} 个跟单节点`)
+      } else {
+        ElMessage.info(`已生成 ${r.adopted.length} 条跟单申请，审核通过后生效`)
+      }
       const refreshed = (await hub.listGroups()).find((g) => g.group_id === groupId)
       if (refreshed) currentGroup.value = refreshed
     }

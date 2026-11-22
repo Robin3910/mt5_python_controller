@@ -700,11 +700,10 @@ export interface GroupCreatePayload {
 
 /**
  * 认领跟单节点的结果（POST /api/groups/{id}/adopt-followers）。
- * 带单员新建分组时，为既有跟单节点生成待审申请。
+ * 普通带单分组自动批准继承申请，AI 分组仍需人工审核。
  */
 export interface AdoptFollowersResult {
-  /** 审核通过后才进入生效分组。 */
-  adopted: { node_id: string; follower_user_id: number; from_group_id?: string | null; request_id: number; status: 'pending' }[]
+  adopted: { node_id: string; follower_user_id: number; from_group_id?: string | null; request_id: number; status: 'pending' | 'approved' }[]
   /** 因已存在或源信息缺失而未写入的条目 */
   skipped: { node_id: string; reason?: string }[]
   /** 参与扫描的来源分组数（不含目标分组自身） */

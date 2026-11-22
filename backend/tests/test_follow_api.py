@@ -1483,7 +1483,8 @@ def test_adopt_followers_still_works_within_same_market(client):
         client, alice_h, [a_primary], "alice-网格组2", grid_sid2,
     )
     data = _adopt(client, another, alice_h).json()
-    approve_follow_requests(client)
+    assert [a["status"] for a in data["adopted"]] == ["approved"]
+    assert _followers_of(client, another, alice_h) == [b_follow]
     assert [a["node_id"] for a in data["adopted"]] == [b_follow], "同市场应继续继承"
 
 
