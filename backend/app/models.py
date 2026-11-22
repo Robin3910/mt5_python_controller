@@ -163,6 +163,9 @@ class PaginatedNodeDispatches(BaseModel):
     page_size: int
 
 
+DealOpeningMethod = Literal["trend_market", "trend_limit", "grid", "ai"]
+
+
 class DealRecord(BaseModel):
     """单笔 MT5 成交明细。"""
     id: int
@@ -191,6 +194,7 @@ class DealRecord(BaseModel):
     signal_id: Optional[str] = None
     task_id: Optional[int] = None
     group_id: Optional[str] = None
+    opening_method: Optional[DealOpeningMethod] = None
     deal_time: int = 0
 
 

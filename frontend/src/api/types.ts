@@ -1576,6 +1576,7 @@ export interface DealRecord {
   signal_id: string | null
   task_id: number | null
   group_id: string | null
+  opening_method?: 'trend_market' | 'trend_limit' | 'grid' | 'ai' | null
   /** 成交时间（Unix 秒） */
   deal_time: number
 }

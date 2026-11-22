@@ -177,13 +177,6 @@ const totalPosPnl = computed(() =>
   allPositions.value.reduce((a, p) => a + (p.profit || 0), 0),
 )
 
-// 资产数据（从 AccountSnapshot）
-const accountProfit = computed(() => totalPosPnl.value) // 浮动盈亏 = 持仓 profit 之和
-const accountBalance = computed(() => account.value?.balance ?? 0)
-const accountEquity = computed(() => account.value?.equity ?? 0)
-const accountMargin = computed(() => account.value?.margin ?? 0)
-const accountFreeMargin = computed(() => account.value?.free_margin ?? 0)
-
 // ── 未成交挂单（主节点账户快照里的 orders） ──
 // 限价开仓是「先挂单、后成交」：成交前账户里没有任何持仓，只看持仓会误判成
 // 「单没发出去」。所以挂单必须单独展示，且**不并入持仓口径**。
@@ -208,8 +201,8 @@ const pendingUnsupported = computed(
   () => !!account.value && !Array.isArray(account.value.orders),
 )
 
-// 持仓 / 资产 / 历史订单 / 吸筹策略 tab
-type DetailTab = 'positions' | 'assets' | 'history' | 'grid'
+// 当前交易 / 智能吸筹 / 历史交易
+type DetailTab = 'positions' | 'grid' | 'history'
 const detailTab = ref<DetailTab>('positions')
 
 // ── 吸筹策略（运行中的网格任务） ──
@@ -760,6 +753,7 @@ interface HistRow {
   key: string
   symbol: string
   magic: number
+  openingMethod: DealRecord['opening_method']
   direction: string
   volume: number
   open: number
@@ -769,6 +763,7 @@ interface HistRow {
 }
 interface HistMagicGroup {
   magic: number
+  openingLabel: string
   rows: HistRow[]
   volume: number
   profit: number
@@ -801,6 +796,7 @@ function buildHistoryRows(deals: DealRecord[]): HistRow[] {
       key,
       symbol: last.symbol || ins[0]?.symbol || '—',
       magic: last.magic || ins[0]?.magic || 0,
+      openingMethod: ins[0]?.opening_method ?? last.opening_method,
       direction,
       volume: outs.reduce((sum, deal) => sum + (deal.volume || 0), 0),
       open: ins[0]?.price || 0,
@@ -830,8 +826,13 @@ const historyBooks = computed(() => {
     }
     const groups: HistMagicGroup[] = [...byMagic.entries()].map(([magic, groupRows]) => {
       const wins = groupRows.filter((row) => row.profit >= 0).length
+      const openingLabels = new Set(groupRows.map((row) => {
+        const label = row.openingMethod && STRATEGY_LABEL[row.openingMethod]
+        return label || (magic ? '开仓方式未知' : '手工单')
+      }))
       return {
         magic,
+        openingLabel: [...openingLabels].join(' / '),
         rows: groupRows,
         volume: groupRows.reduce((sum, row) => sum + row.volume, 0),
         profit: groupRows.reduce((sum, row) => sum + row.profit, 0),
@@ -854,30 +855,6 @@ const historyBooks = computed(() => {
       losses: rows.length - wins,
     }
   })
-})
-const todayPnl = computed(() => {
-  const start = new Date()
-  start.setHours(0, 0, 0, 0)
-  const sec = start.getTime() / 1000
-  return historyDeals.value
-    .filter((deal) => {
-      const entry = (deal.entry_type || '').toUpperCase()
-      return (entry === 'OUT' || entry === 'OUT_BY' || entry === 'INOUT') && deal.deal_time >= sec
-    })
-    .reduce((sum, deal) => sum + (deal.net_profit || 0), 0)
-})
-const assetDist = computed(() => {
-  const volumes = new Map<string, number>()
-  for (const sym of availableSymbols.value) volumes.set(sym, 0)
-  for (const book of positionBooks.value) volumes.set(book.symbol, book.volume)
-  const total = [...volumes.values()].reduce((sum, n) => sum + n, 0)
-  return [...volumes.entries()]
-    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-    .map(([symbol, volume]) => ({
-      symbol,
-      volume,
-      pct: total > 0 ? Math.round((volume / total) * 100) : 0,
-    }))
 })
 
 const HISTORY_TAB_REFRESH_MS = 5000
@@ -940,10 +917,11 @@ watch(
 )
 
 // ── 弹窗（开仓参数）──
-const STRATEGY_LABEL: Record<TradingStrategyType, string> = {
+const STRATEGY_LABEL: Record<NonNullable<DealRecord['opening_method']>, string> = {
   trend_market: '市价开仓',
   trend_limit: '限价开仓',
   grid: '智能吸筹',
+  ai: 'AI 智能加仓',
 }
 
 const dialogVisible = ref(false)
@@ -1310,7 +1288,7 @@ onBeforeUnmount(() => {
               <span>智能吸筹</span>
         </button>
       </div>
-          <p class="tr-hint">配置完成后，下方将展示对应的订单配置与当前交易、资产、历史交易。</p>
+          <p class="tr-hint">配置完成后，下方将展示对应的订单配置与当前交易、智能吸筹、历史交易。</p>
           <p v-if="!isOnline" class="tr-hint">主节点离线，无法触发</p>
           </div>
         <div class="tr-sum">
@@ -1328,7 +1306,6 @@ onBeforeUnmount(() => {
           <button type="button" :class="{ on: detailTab === 'grid' }" @click="detailTab = 'grid'">
             智能吸筹<span>{{ gridTasks.length }}</span>
           </button>
-          <button type="button" :class="{ on: detailTab === 'assets' }" @click="detailTab = 'assets'">资产</button>
           <button type="button" :class="{ on: detailTab === 'history' }" @click="detailTab = 'history'">
             历史交易<span>{{ dealsTotal }}</span>
           </button>
@@ -1387,7 +1364,7 @@ onBeforeUnmount(() => {
           <!-- ── 未成交挂单 ──
                与持仓分开一块：限价开仓成交前账户里没有任何持仓，
                混在一起会让人误判成「单没发出去」。挂单**不并入**持仓口径。 -->          <div class="tr-pend-head">
-            <b>未成交挂单</b>
+            <b>限价单</b>
             <span v-if="pendingReported">{{ totalPendingCount }} 张 · {{ totalPendingVolume.toFixed(2) }} 手</span>
             <span v-if="!isOnline && pendingReported" class="warn">节点离线，数据可能已过期</span>
           </div>
@@ -1488,26 +1465,6 @@ onBeforeUnmount(() => {
           </section>
                     </div>
 
-        <div v-else-if="detailTab === 'assets'" class="tr-body">
-          <div class="tr-assets">
-            <div><span>账户余额</span><strong>{{ accountBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) }}</strong></div>
-            <div><span>净值</span><strong>{{ accountEquity.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) }}</strong></div>
-            <div><span>占用保证金</span><strong>{{ accountMargin.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) }}</strong></div>
-            <div><span>可用保证金</span><strong>{{ accountFreeMargin.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) }}</strong></div>
-            <div><span>浮动盈亏</span><strong :class="accountProfit >= 0 ? 'up' : 'down'">{{ fmtSigned(accountProfit) }}</strong></div>
-            <div><span>今日盈亏</span><strong :class="todayPnl >= 0 ? 'up' : 'down'">{{ historyDeals.length || historyWinRate != null ? fmtSigned(todayPnl) : '—' }}</strong></div>
-                  </div>
-          <p class="tr-dist-title">持仓品种分布</p>
-          <div v-for="item in assetDist" :key="item.symbol" class="tr-dist">
-            <div class="tr-dist-top">
-              <span>{{ item.symbol }}</span>
-              <span>{{ item.volume > 0 ? `${item.volume.toFixed(2)} 手 · ${item.pct}%` : `空仓 · ${item.pct}%` }}</span>
-                  </div>
-            <div class="tr-bar"><i :style="{ width: `${item.pct}%` }"></i></div>
-                </div>
-          <p v-if="!assetDist.length" class="tr-empty-line">暂无品种</p>
-          </div>
-
         <div v-else class="tr-body">
           <div class="tr-hist-pills">
             <span>近 7 日 {{ dealsTotal }} 笔</span>
@@ -1533,7 +1490,7 @@ onBeforeUnmount(() => {
             <template v-for="group in book.groups" :key="group.magic">
               <div class="tr-magic-head">
                 <div>
-                  <b>{{ magicLabel(group.magic) }}</b>
+                  <b>{{ group.openingLabel }}</b>
                   <span>{{ group.rows.length }} 笔 · {{ group.volume.toFixed(2) }} 手</span>
                   <span class="wide">平盈 {{ group.wins }} / 平损 {{ group.losses }}</span>
                 </div>
@@ -1709,21 +1666,11 @@ onBeforeUnmount(() => {
 }
 /* 挂单量大时（网格单品种可挂几十张）限高滚动，避免撑爆整页 */
 .tr-pend-book .tr-grid { max-height: none; }
-.tr-assets { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 8px; }
-.tr-assets div { border: 1px solid #22304A; background: #0C1220; border-radius: 10px; padding: 10px; }
-.tr-assets span, .tr-dist-title { color: #5B6B85; font-size: 10px; }
-.tr-assets strong { display: block; margin-top: 4px; font-size: 16px; font-variant-numeric: tabular-nums; }
-.tr-dist-title { margin: 14px 0 8px; }
-.tr-dist { margin-bottom: 8px; }
-.tr-dist-top { display: flex; justify-content: space-between; color: #8B96A8; font-size: 11px; }
-.tr-bar { height: 4px; margin-top: 4px; border-radius: 99px; background: #16213A; overflow: hidden; }
-.tr-bar i { display: block; height: 100%; background: #2563EB; }
 .tr-hist-pills { flex-wrap: wrap; margin-bottom: 4px; }
 .tr-hist-pills .up, .tr-hist-pills .down { border-color: transparent; }
 .wide { display: none; }
 @media (min-width: 720px) {
   .wide { display: inline; }
-  .tr-assets { grid-template-columns: repeat(3, minmax(0,1fr)); }
   .tr-quote, .tr-body { padding: 16px; }
 }
 @media (min-width: 1024px) {

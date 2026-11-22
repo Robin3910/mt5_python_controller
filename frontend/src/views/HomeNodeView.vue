@@ -2,7 +2,7 @@
 // 首页节点主页：账户概览 + AI 交易 / 带单两个频道的持仓与历史。
 // 归类由后端按策略魔术号完成；实时持仓仍读账户快照。
 import { computed, onMounted, ref, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
 import 'element-plus/es/components/message-box/style/css'
@@ -23,7 +23,6 @@ import { confirmAction } from '@/utils/confirm'
 import { setNodePrimary } from '@/utils/nodePrimary'
 
 const route = useRoute()
-const router = useRouter()
 const hub = useHubStore()
 const auth = useAuthStore()
 
@@ -326,11 +325,6 @@ async function closeChannel(mode: 'all' | 'profit' | 'ticket', ticket?: number):
 
 <template>
   <div class="hn">
-    <button v-if="auth.isAdmin" type="button" class="hn-admin-back" @click="router.push({ name: 'home' })">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg>
-      返回首页
-    </button>
-
     <p v-if="loadedNodes && !node" class="hn-missing">找不到这个节点，或它不属于当前账号。</p>
 
     <template v-else-if="node">
@@ -548,11 +542,6 @@ async function closeChannel(mode: 'all' | 'profit' | 'ticket', ticket?: number):
 
 <style scoped>
 .hn { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
-.hn-admin-back {
-  display: inline-flex; align-items: center; gap: 4px; align-self: flex-start;
-  border: 0; background: transparent; color: #E6EBF4; font-size: 14px; font-weight: 600; padding: 0;
-}
-.hn-admin-back svg { width: 18px; height: 18px; }
 .hn-missing, .hn-empty, .hn-note { margin: 0; color: #5B6B85; font-size: 12px; }
 .hn-note { text-align: center; color: #4A5568; font-size: 10px; }
 .hn-empty { padding: 16px 12px; text-align: center; }
@@ -598,7 +587,7 @@ async function closeChannel(mode: 'all' | 'profit' | 'ticket', ticket?: number):
 }
 .hn-badge, .hn-btn { padding: 6px 12px; font-size: 12px; }
 .hn-badge { color: #FBBF24; border: 1px solid rgba(180, 83, 9, 0.6); background: rgba(59, 42, 16, 0.5); }
-.hn-btn, .hn-chip, .hn-close, .hn-admin-back { cursor: pointer; }
+.hn-btn, .hn-chip, .hn-close { cursor: pointer; }
 .hn-btn:disabled, .hn-chip:disabled, .hn-close:disabled { opacity: 0.4; cursor: not-allowed; }
 .hn-btn svg, .hn-badge svg { width: 14px; height: 14px; }
 .hn-btn-primary { color: #93C5FD; border: 1px solid rgba(37, 99, 235, 0.6); background: rgba(22, 38, 74, 0.5); }

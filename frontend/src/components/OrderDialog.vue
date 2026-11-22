@@ -6,7 +6,7 @@
  *  - 参数区：单列卡片列表，每行 label + 副说明 + 右侧输入（带单位/占位）
  *  - 节标题（左侧蓝色竖线）
  *  - 底部：左下「带单 / 策略复用」模式选择 + 右下主操作按钮
- *  - 移动端：撑满全屏（无圆角、贴顶贴底），大屏保持居中卡片
+ *  - 创建交易：居中圆角卡片，参数区可滚动
  *
  *  - 「带单」默认关闭：点提交走原 quickTrigger（normal 模型，按币种分发），且只投递主节点；
  *    需要下发到分组全部节点（含跟单员）时手动打开。
@@ -1714,7 +1714,7 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
     :show-close="false"
     align-center
     class="order-dialog"
-    :style="{ '--order-radius': '16px' }"
+    :class="{ 'order-dialog--trade': !isPresetMode }"
   >
     <template #header>
       <div class="od-header">
@@ -2219,12 +2219,14 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
   border-top: 1px solid var(--el-border-color-lighter);
   background: transparent;
 }
-.order-dialog .el-dialog {
-  width: min(760px, calc(100vw - 32px)) !important;
+.order-dialog--trade.el-dialog {
+  display: flex;
+  flex-direction: column;
+  max-width: calc(100% - 32px);
+  max-height: calc(100vh - 32px);
+  max-height: calc(100dvh - 32px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
   border-radius: 16px;
   overflow: hidden;
-  max-height: 88vh;
-  margin: 6vh auto;
   background: #0d1626;
   border: 1px solid #1e2b47;
   box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
@@ -2239,30 +2241,15 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
   backdrop-filter: blur(2px);
 }
 
-/* ── 手机端：撑满全屏、贴顶贴底、无圆角 ── */
 @media (max-width: 600px) {
-  /* .order-dialog {
-    margin: 0 !important;
-  } */
-  .order-dialog .el-dialog {
-    width: 100vw !important;
-    max-width: 100vw !important;
-    /* dvh：standalone 下 100vh 会多出一截空白或压住底部手势条。
-       顶部/底部各留出安全区，body 高度同步减去这两个值。 */
-    height: 100vh !important;
-    height: 100dvh !important;
-    max-height: 100vh !important;
-    max-height: 100dvh !important;
-    border-radius: 0 !important;
-    margin: 0 !important;
-    padding-top: env(safe-area-inset-top, 0px);
-    padding-bottom: env(safe-area-inset-bottom, 0px);
-  }
   .order-dialog .el-dialog__body {
     max-height: calc(100vh - 168px);
     max-height: calc(100dvh - 168px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
   }
 }
+.order-dialog--trade > .el-dialog__header,
+.order-dialog--trade > .el-dialog__footer { flex-shrink: 0; }
+.order-dialog--trade > .el-dialog__body { min-height: 0; max-height: none; }
 </style>
 
 <style scoped>

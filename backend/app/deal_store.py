@@ -16,11 +16,13 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from sqlalchemy import String, cast, func, or_, select
+from sqlalchemy import String, cast, func, or_, select, tuple_
 from sqlalchemy.exc import IntegrityError
 
+from . import strategy_templates
 from .db import SessionLocal
-from .orm import Deal, GroupTaskDispatch, SignalDispatch
+from .models import DealOpeningMethod
+from .orm import Deal, GroupSignalTask, GroupTaskDispatch, SignalDispatch
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +59,11 @@ def source_label(source: str) -> str:
     }.get(str(source or "").lower(), "终端")
 
 
-def _deal_dict(row: Deal, position_direction: Optional[str] = None) -> dict:
+def _deal_dict(
+    row: Deal,
+    position_direction: Optional[str] = None,
+    opening_method: Optional[DealOpeningMethod] = None,
+) -> dict:
     """ORM 行 -> 对外 dict（成交时间统一给 Unix 秒）。
 
     position_direction = 该持仓**开仓时**的方向。出场成交的 direction 是
@@ -89,6 +95,7 @@ def _deal_dict(row: Deal, position_direction: Optional[str] = None) -> dict:
         "signal_id": row.signal_id,
         "task_id": row.task_id,
         "group_id": row.group_id,
+        "opening_method": opening_method,
         "deal_time": row.deal_time,
     }
 
@@ -407,12 +414,20 @@ async def list_deals(
                 )
             ).scalars().all()
 
-            # 出场行的方向色要按「被平掉的那个持仓的方向」取：
-            # 平多单在 MT5 里是 SELL，直接展示会让人误以为又开了空仓。
-            pos_dirs = await _position_directions(s, rows)
+            # 出场成交的方向与开仓方式沿用该持仓的入场记录。
+            position_entries = await _position_entries(s, rows)
+            openings = [
+                position_entries.get((row.node_id, row.position_id), (row.direction, row.magic))
+                for row in rows
+            ]
+            methods = await _opening_methods(s, {
+                (row.node_id, opening_magic)
+                for row, (_, opening_magic) in zip(rows, openings)
+                if opening_magic
+            })
             items = [
-                _deal_dict(r, pos_dirs.get((r.node_id, r.position_id)))
-                for r in rows
+                _deal_dict(row, direction, methods.get((row.node_id, opening_magic)))
+                for row, (direction, opening_magic) in zip(rows, openings)
             ]
     except Exception as e:  # noqa: BLE001
         logger.warning("list_deals failed: %s", e)
@@ -434,28 +449,63 @@ async def list_deals(
     }
 
 
-async def _position_directions(s, rows: list[Deal]) -> dict:
-    """查这些持仓的**开仓方向** {(node_id, position_id): 'BUY'/'SELL'}。"""
+async def _position_entries(s, rows: list[Deal]) -> dict[tuple[str, int], tuple[str, Optional[int]]]:
+    """按节点和持仓票号查询入场方向与魔术号。"""
     keys = {(r.node_id, r.position_id) for r in rows if r.position_id}
     if not keys:
         return {}
     node_ids = {n for n, _ in keys}
     pids = {p for _, p in keys}
     try:
-        out: dict = {}
+        out: dict[tuple[str, int], tuple[str, Optional[int]]] = {}
         for row in (
             await s.execute(
-                select(Deal.node_id, Deal.position_id, Deal.direction).where(
+                select(Deal.node_id, Deal.position_id, Deal.direction, Deal.magic).where(
                     Deal.node_id.in_(list(node_ids)),
                     Deal.position_id.in_(list(pids)),
                     Deal.entry_type == "IN",
-                )
+                ).order_by(Deal.deal_time, Deal.deal_id)
             )
         ).all():
-            out[(row[0], row[1])] = row[2]
+            out.setdefault((row[0], row[1]), (row[2], row[3]))
         return out
     except Exception:  # noqa: BLE001
         return {}
+
+
+def _opening_method(snapshot: object) -> Optional[DealOpeningMethod]:
+    if not isinstance(snapshot, dict):
+        return None
+    template = snapshot.get("template_id")
+    if template == strategy_templates.TEMPLATE_3_ID:
+        return "grid"
+    if template == strategy_templates.TEMPLATE_1_ID:
+        return "ai"
+    if template == strategy_templates.TEMPLATE_2_ID:
+        rule = strategy_templates.pick_risk_sized_rule(snapshot.get("rules"))
+        if rule:
+            return "trend_limit" if strategy_templates.is_limit_entry(rule) else "trend_market"
+    return None
+
+
+async def _opening_methods(s, keys: set[tuple[str, int]]) -> dict[tuple[str, int], Optional[DealOpeningMethod]]:
+    if not keys:
+        return {}
+    try:
+        rows = (await s.execute(
+            select(GroupTaskDispatch.node_id, GroupTaskDispatch.magic, GroupSignalTask.strategy_snapshot_json)
+            .outerjoin(GroupSignalTask, GroupSignalTask.task_id == GroupTaskDispatch.task_id)
+            .where(tuple_(GroupTaskDispatch.node_id, GroupTaskDispatch.magic).in_(sorted(keys)))
+        )).all()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("opening method lookup failed: %s", e)
+        return {}
+
+    modes: dict[tuple[str, int], set[Optional[DealOpeningMethod]]] = {}
+    for node_id, magic, snapshot in rows:
+        modes.setdefault((node_id, magic), set()).add(_opening_method(snapshot))
+    # 历史任务复用过魔术号时，只有快照口径一致才标注。
+    return {key: next(iter(values)) for key, values in modes.items() if len(values) == 1}
 
 
 def _empty_summary() -> dict:
