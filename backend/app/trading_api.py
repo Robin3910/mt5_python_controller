@@ -13,6 +13,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from . import (
+    group_persist,
     group_service,
     permissions,
     persist,
@@ -32,6 +33,7 @@ from .dispatcher import Dispatcher
 from .group_dispatcher import GroupDispatcher
 from .models import (
     GroupCreate,
+    GroupSignalTaskRecord,
     GroupUpdate,
     QuickTriggerRequest,
     QuickTriggerResult,
@@ -214,6 +216,33 @@ async def _ensure_member(store: RedisStore, group: dict, node_id: str) -> None:
         store, group["group_id"],
         GroupUpdate(node_ids=new_ids),
     )
+
+
+@router.get("/pending-task", response_model=GroupSignalTaskRecord)
+async def pending_task(
+    node_id: str, ticket: int,
+    store: RedisStore = Depends(get_store),
+    p: Principal = Depends(require_menu(MENU_TRADING)),
+):
+    node = await store.get_node(node_id)
+    if not node or not node.get("is_primary") or not permissions.same_owner(p.user_id, node.get("owner_user_id")):
+        raise HTTPException(404, detail=_PRIMARY_NOT_FOUND)
+    account = await store.get_account(node_id) or {}
+    order = next((o for o in account.get("orders") or [] if o.get("ticket") == ticket), None)
+    if not order or not order.get("magic"):
+        raise HTTPException(404, detail="该挂单已离场或没有策略魔术号")
+    matches = [s for s in await group_persist.active_subtasks_for_node(node_id) if s["magic"] == order["magic"]]
+    if len(matches) != 1 or matches[0]["symbol"] != order.get("symbol"):
+        raise HTTPException(409, detail="无法唯一匹配该挂单的运行中策略任务")
+    sub = matches[0]
+    group = await store.get_group(sub["group_id"])
+    if not group or not permissions.same_owner(p.user_id, group.get("owner_user_id")):
+        raise HTTPException(404, detail="没有可停止的本人策略任务")
+    page = await group_persist.recent_group_signals(sub["group_id"], signal_id=sub["signal_id"], status="active")
+    task = next((row for row in page["items"] if row["task_id"] == sub["task_id"]), None)
+    if not task:
+        raise HTTPException(409, detail="策略任务已结束，请刷新挂单")
+    return task
 
 
 @router.post("/quick-trigger", response_model=QuickTriggerResult)

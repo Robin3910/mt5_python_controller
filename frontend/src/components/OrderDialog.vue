@@ -1265,6 +1265,7 @@ async function saveRiskStrategyOnly(): Promise<void> {
         const created = await hub.createStrategy({
           template_id: tpl2?.template_id || expectedTemplateId.value,
           name: newName,
+          remark: `交易页自动创建（${strategyRef.value}）`,
           symbol: (localForm.symbol || '').trim().toUpperCase(),
           rules,
         })
@@ -1339,6 +1340,7 @@ async function saveGridStrategyOnly(): Promise<void> {
         const created = await hub.createStrategy({
           template_id: tpl3?.template_id || expectedTemplateId.value,
           name: gridName,
+          remark: `交易页自动创建（${strategyRef.value}）`,
           symbol: (localForm.symbol || '').trim().toUpperCase(),
           rules,
         })
@@ -1458,6 +1460,7 @@ async function triggerMarketStrategy(): Promise<void> {
         const created = await hub.createStrategy({
           template_id: tpl2?.template_id || expectedTemplateId.value,
           name: newName,
+          remark: `交易页自动创建（${strategyRef.value}）`,
           symbol: (localForm.symbol || '').trim().toUpperCase(),
           rules,
         })
@@ -1604,6 +1607,7 @@ async function triggerGridStrategy(): Promise<void> {
         const created = await hub.createStrategy({
           template_id: tpl3?.template_id || expectedTemplateId.value,
           name: gridName,
+          remark: `交易页自动创建（${strategyRef.value}）`,
           symbol: (localForm.symbol || '').trim().toUpperCase(),
           rules,
         })

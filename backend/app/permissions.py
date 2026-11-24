@@ -51,7 +51,7 @@ MENU_REGISTRY: tuple[MenuDef, ...] = (
     MenuDef(MENU_AI_TRADE, "AI 交易", "/ai-trade", True),
     MenuDef(MENU_DASHBOARD, "总览", "/", True),
     MenuDef(MENU_NODES, "节点", "/nodes", True),
-    MenuDef(MENU_TREND, "趋势面板", "/trend", True),
+    MenuDef(MENU_TREND, "趋势面板", "/trend", False),
     MenuDef(MENU_GROUPS, "分组管理", "/groups", True),
     MenuDef(MENU_STRATEGIES, "策略管理", "/strategies", True),
     MenuDef(MENU_AUDITS, "操作审计", "/audits", True),

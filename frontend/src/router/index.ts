@@ -93,7 +93,7 @@ const router = createRouter({
       path: '/trend',
       name: 'trend',
       component: () => import('@/views/TrendView.vue'),
-      meta: { menu: 'trend' },
+      meta: { menu: 'trend', adminOnly: true },
     },
     {
       path: '/groups',

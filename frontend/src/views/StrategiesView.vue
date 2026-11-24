@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // 策略管理页：基于模版新建策略、绑定品种，选模版后可自定义规则参数
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import StrategyFormModal from '@/components/StrategyFormModal.vue'
 import { useAuthStore } from '@/stores/auth'
@@ -32,6 +32,17 @@ const router = useRouter()
 const searchQuery = ref('')
 const appliedQuery = ref('')
 const loading = ref(false)
+const showAutoGroups = ref(false)
+
+function isAutoGroupStrategy(strategy: StrategyOut): boolean {
+  if (/^交易页自动创建（(?:trend_market|trend_limit|grid)）$/.test(strategy.remark ?? '')) return true
+  // 旧版下单弹窗未写来源备注，使用完整的自动命名格式识别。
+  return /^(trend_market|trend_limit|grid)-.+-\d+-.+-\1-策略$/.test(strategy.name)
+}
+
+const visibleStrategies = computed(() => showAutoGroups.value
+  ? hub.strategies
+  : hub.strategies.filter(strategy => !isAutoGroupStrategy(strategy)))
 
 function currentSearchOptions(): { q?: string } {
   return appliedQuery.value ? { q: appliedQuery.value } : {}
@@ -356,7 +367,7 @@ function fmtTime(sec: number | null | undefined): string {
             <p class="pf-card-title">
               策略配置
               <span class="pf-count ok" style="background: rgba(34, 197, 94, 0.15); border-color: rgba(34, 197, 94, 0.3); color: #22c55e">
-                {{ hub.strategies.length }} 个策略
+                {{ visibleStrategies.length }} 个策略
               </span>
             </p>
             <p class="pf-card-sub">
@@ -372,7 +383,7 @@ function fmtTime(sec: number | null | undefined): string {
     </section>
 
     <div class="pf-card" style="margin-bottom: 12px">
-      <div class="row" style="gap: 8px">
+      <div class="row" style="gap: 8px; flex-wrap: wrap">
         <input
           v-model="searchQuery"
           type="search"
@@ -386,16 +397,21 @@ function fmtTime(sec: number | null | undefined): string {
         <button class="pf-btn pf-btn-primary" :disabled="loading" @click="runSearch">
           {{ loading ? '搜索中…' : '搜索' }}
         </button>
+        <label class="pf-switch-row">
+          <button type="button" class="pf-switch" role="switch" aria-label="显示自动创建的分组"
+            :class="{ on: showAutoGroups }" :aria-checked="showAutoGroups" @click="showAutoGroups = !showAutoGroups" />
+          <span>显示自动创建的分组</span>
+        </label>
       </div>
       <p v-if="appliedQuery" class="pf-hint">
-        {{ hub.strategies.length ? `找到 ${hub.strategies.length} 个策略` : '无匹配策略' }}
+        {{ visibleStrategies.length ? `找到 ${visibleStrategies.length} 个策略` : '无匹配策略' }}
       </p>
     </div>
 
     <!-- 移动端卡片 -->
     <div class="list-cards mobile-only">
       <div
-        v-for="s in hub.strategies"
+        v-for="s in visibleStrategies"
         :key="s.strategy_id"
         class="list-card card clickable"
         @click="toggleExpand(s.strategy_id)"
@@ -479,7 +495,7 @@ function fmtTime(sec: number | null | undefined): string {
           <button class="pf-btn pf-btn-mini pf-btn-danger" :disabled="isAiStrategyLocked(s)" @click="remove(s)">删除</button>
         </div>
       </div>
-      <div v-if="!hub.strategies.length && !loading" class="pf-card pf-empty">
+      <div v-if="!visibleStrategies.length && !loading" class="pf-card pf-empty">
         {{ appliedQuery ? '无匹配策略' : '暂无策略' }}
       </div>
     </div>
@@ -499,7 +515,7 @@ function fmtTime(sec: number | null | undefined): string {
             <span class="st-col-actions">操作</span>
           </div>
 
-          <template v-for="s in hub.strategies" :key="s.strategy_id">
+          <template v-for="s in visibleStrategies" :key="s.strategy_id">
             <div class="pf-row st-row" :class="{ admin: auth.isAdmin }" @click="toggleExpand(s.strategy_id)">
               <span class="c-strong" :title="s.name">{{ s.name }}</span>
               <span v-if="auth.isAdmin" class="c-muted">{{ s.owner_username || '管理员' }}</span>
@@ -580,7 +596,7 @@ function fmtTime(sec: number | null | undefined): string {
             </div>
           </template>
 
-          <div v-if="!hub.strategies.length && !loading" class="pf-empty">
+          <div v-if="!visibleStrategies.length && !loading" class="pf-empty">
             {{ appliedQuery ? '无匹配策略' : '暂无策略，点击右上角「新增策略」开始配置' }}
           </div>
         </div>

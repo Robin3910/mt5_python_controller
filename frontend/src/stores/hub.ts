@@ -182,11 +182,14 @@ export const useHubStore = defineStore('hub', {
       return saved
     },
     // 拉取单节点最新账户快照（详情页兜底；之后由 WS 实时刷新）
-    async fetchNodeAccount(id: string): Promise<void> {
+    async fetchNodeAccount(id: string): Promise<boolean> {
       try {
-        this.accounts[id] = (await api.get(`/api/nodes/${id}/account`)).data
+        const { data } = await api.get<AccountSnapshot>(`/api/nodes/${id}/account`)
+        // HTTP 请求期间可能已收到更新时间更晚的 WS 快照。
+        if ((data.updated_at ?? 0) >= (this.accounts[id]?.updated_at ?? 0)) this.accounts[id] = data
+        return true
       } catch {
-        /* 404 = 该节点尚未上报过快照，忽略 */
+        return false
       }
     },
     // 拉取单节点的分发/成交历史（持久化）

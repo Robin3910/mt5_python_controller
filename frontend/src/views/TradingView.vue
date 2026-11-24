@@ -15,7 +15,8 @@ import { useHubStore } from '@/stores/hub'
 import { useAuthStore } from '@/stores/auth'
 import { confirmAction } from '@/utils/confirm'
 import { trendLabel, trendTagClass } from '@/utils/trendConfig'
-import { quickTrigger, type TradingStrategyType, type QuickTriggerResult } from '@/api/trading'
+import { fetchPendingTask, quickTrigger, type TradingStrategyType, type QuickTriggerResult } from '@/api/trading'
+import { extractApiError } from '@/api/client'
 import type {
   AccountSnapshot,
   CloseRequest,
@@ -221,12 +222,13 @@ function isClosingGridTask(taskId: number): boolean {
   return closingGridTaskIds.value.has(taskId)
 }
 
-/** 主任务是否仍有可停止的子任务（终态都跳过）。 */
+function canStopDispatch(d: GroupSignalTaskRecord['dispatches'][number]): boolean {
+  return !['done', 'failed', 'skipped', 'offline', 'closing'].includes(d.status)
+}
+
 function isGridTaskStoppable(task: GroupSignalTaskRecord): boolean {
   if (['done', 'failed', 'skipped'].includes(task.status)) return false
-  return task.dispatches.some(
-    (d) => !['done', 'failed', 'skipped'].includes(d.status),
-  )
+  return task.dispatches.some(canStopDispatch)
 }
 
 async function refreshGridTasks(initial = false): Promise<void> {
@@ -305,15 +307,13 @@ function gridDirTagClass(action: string | null): string {
   return ''
 }
 
-async function stopGridTask(task: GroupSignalTaskRecord): Promise<void> {
+async function stopStrategyTask(task: GroupSignalTaskRecord, stillCurrent = () => true): Promise<void> {
   if (!isGridTaskStoppable(task) || isClosingGridTask(task.task_id)) return
   const sym = task.symbol || '?'
-  const nodeSummary = gridTaskNodeNames(task)
   // 只对该 task 下的活跃 dispatch 下发 strategy_stop，不影响同组其他 task。
   // 终态的 dispatch 跳过（已经收口，没必要再发一次）。
-  const activeDispatches = task.dispatches.filter(
-    (d) => !['done', 'failed', 'skipped'].includes(d.status),
-  )
+  const activeDispatches = task.dispatches.filter(canStopDispatch)
+  const nodeSummary = activeDispatches.map(d => d.node_name || d.node_id).join('、')
   const dispatchCount = activeDispatches.length
   if (dispatchCount === 0) return
   // 同步平仓提示：主节点平掉仓位或撤掉限价挂单时，跟单节点上对应仓位/挂单会自动跟着处理；
@@ -324,8 +324,8 @@ async function stopGridTask(task: GroupSignalTaskRecord): Promise<void> {
     : ''
   try {
     await ElMessageBox.confirm(
-      `确认停止 ${sym} 网格任务（${nodeSummary}）？\n将向 ${dispatchCount} 个节点按魔术号平掉该网格的全部持仓并结束策略监控。\n（同分组内的其它任务不受影响）${cascadeHint}`,
-      '停止吸筹策略',
+      `确认停止 ${sym} 策略任务 #${task.task_id}？\n将在 ${dispatchCount} 个节点（${nodeSummary}）撤销该任务的挂单、平掉该任务的全部持仓，并结束策略监控。${cascadeHint}`,
+      '停止策略任务',
       {
         type: 'warning',
         confirmButtonText: '确认停止',
@@ -335,6 +335,11 @@ async function stopGridTask(task: GroupSignalTaskRecord): Promise<void> {
   } catch {
     return
   }
+  if (!stillCurrent()) {
+    ElMessage.warning('主节点或挂单已变化，请重新选择任务')
+    return
+  }
+  if (isClosingGridTask(task.task_id)) return
   // 按 task 粒度停止：只对该 task 下未收口的 dispatch 逐个下发 strategy_stop，
   // 不调 closeGroup（整组一键平仓会同时干掉同分组内的其它 task，与"只停一个"的需求冲突）。
   const groupId = task.group_id
@@ -360,15 +365,16 @@ async function stopGridTask(task: GroupSignalTaskRecord): Promise<void> {
     const parts: string[] = []
     if (targetsCount > 0) parts.push(`已下发停止 ${sym} · 成功 ${targetsCount}`)
     if (forcedCount > 0) parts.push(`离线 ${forcedCount}`)
-    if (parts.length > 0) {
-      // 成功 / 离线 都视为本次操作完成
+    if (failCount > 0) {
+      parts.push(`${failCount} 个节点下发失败`)
+      ElMessage.error(parts.join(' · '))
+    } else if (parts.length > 0) {
       ElMessage.success(parts.join(' · '))
-    } else if (failCount > 0) {
-      ElMessage.error(`下发停止失败（${failCount} 个节点）`)
     } else {
       ElMessage.warning('已下发停止，结果待刷新确认')
     }
-    await refreshGridTasks()
+    if (detailTab.value === 'grid') await refreshGridTasks()
+    if (primaryNode.value) await hub.fetchNodeAccount(primaryNode.value.node_id)
   } finally {
     const next = new Set(closingGridTaskIds.value)
     next.delete(task.task_id)
@@ -648,6 +654,28 @@ async function closeSymbolProfit(symbol: string): Promise<void> {
   else if (failed) ElMessage.warning(`已提交 ${sent} 笔，${failed} 笔失败`)
   else ElMessage.success(`已提交平掉 ${sent} 笔盈利持仓`)
   hub.fetchNodeAccount(nodeId).catch(() => {})
+}
+
+async function stopPendingTask(symbol: string, group: PendingMagicGroup): Promise<void> {
+  const nodeId = primaryNode.value?.node_id
+  const ticket = group.rows[0]?.ticket
+  if (!nodeId || !ticket || !group.magic || !isOnline.value || actionBusy.value) return
+  const stillCurrent = () => samePrimary(nodeId) && isOnline.value && allPending.value.some(
+    order => order.ticket === ticket && order.symbol === symbol && order.magic === group.magic,
+  )
+  actionBusy.value = `stop:${ticket}`
+  try {
+    const task = await fetchPendingTask(nodeId, ticket)
+    if (!stillCurrent() || !task.dispatches.some(d => d.node_id === nodeId && d.magic === group.magic && d.symbol === symbol && canStopDispatch(d))) {
+      ElMessage.warning('挂单或任务状态已变化，请刷新后重试')
+      return
+    }
+    await stopStrategyTask(task, stillCurrent)
+  } catch (error) {
+    ElMessage.error(extractApiError(error, '查询挂单策略任务失败'))
+  } finally {
+    actionBusy.value = ''
+  }
 }
 
 async function cancelSymbolPending(symbol: string): Promise<void> {
@@ -1385,11 +1413,13 @@ onBeforeUnmount(() => {
               <span>#</span><span>方向</span><span>手数</span><span>挂单价</span><span>止盈/止损</span><span>挂单时间</span><span>操作</span>
             </div>
             <template v-for="group in book.groups" :key="`pend-${book.symbol}-${group.magic}`">
-              <div class="tr-magic-head">
+              <div class="tr-magic-head tr-grid tr-pend-grid">
                 <div>
                   <b>{{ openingGroupLabel(group.magic, group.rows) }}</b>
                   <span>{{ group.rows.length }} 张 · {{ group.volume.toFixed(2) }} 手</span>
                 </div>
+                <button v-if="group.magic && (auth.isAdmin || auth.hasMenu('groups'))" type="button" class="tr-x"
+                        :disabled="!!actionBusy || !isOnline" @click="stopPendingTask(book.symbol, group)">停止</button>
               </div>
               <div v-for="(o, i) in pendRows(group, book.symbol)" :key="o.ticket" class="tr-grid tr-pend-grid tr-line">
                 <span class="dim">{{ i + 1 }}</span>
@@ -1456,7 +1486,7 @@ onBeforeUnmount(() => {
                   type="button"
                   class="tr-x"
                           :disabled="isClosingGridTask(t.task_id) || !isGridTaskStoppable(t)"
-                          @click="stopGridTask(t)"
+                          @click="stopStrategyTask(t)"
                 >{{ isClosingGridTask(t.task_id) ? '…' : '停止' }}</button>
                       </span>
                     </div>
@@ -1648,7 +1678,9 @@ onBeforeUnmount(() => {
 .tr-pend-head span { color: #8B96A8; font-size: 10px; }
 .tr-pend-head span.warn { color: #F59E0B; }
 .tr-pend-book { margin-top: 10px; }
-.tr-pend-grid { grid-template-columns: 14px 34px 28px 40px minmax(56px,1fr) minmax(58px,1fr) 72px 48px; }
+.tr-pend-grid { grid-template-columns: 14px 34px 28px minmax(56px,1fr) minmax(58px,1fr) 72px 48px; }
+.tr-pend-grid.tr-magic-head > div { grid-column: 1 / -2; }
+.tr-pend-grid.tr-magic-head > button { justify-self: end; }
 .tr-pend-grid span:nth-child(3) { text-align: center; }
 .tr-pend-grid span:nth-child(7) { text-align: right; }
 .tr-pend-more { padding: 4px 12px 8px; }

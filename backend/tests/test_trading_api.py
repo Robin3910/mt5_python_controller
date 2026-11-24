@@ -108,6 +108,47 @@ def _post_quick_trigger(
 # 测试用例
 # ---------------------------------------------------------------------------
 
+def test_pending_order_resolves_only_its_own_active_task(client):
+    from app import group_persist
+    from app.parser import TradingSignal
+    from app.state import state
+
+    node_id = _make_primary_node(client, name="挂单测试", mt5_login=12001)
+    headers = _admin_headers(client)
+    owner = client.get("/api/me", headers=headers).json()["user_id"]
+
+    async def seed():
+        group = {"group_id": "g1", "name": "同品种策略", "owner_user_id": owner}
+        await state.store.cache_group(group)
+        orders = []
+        task_ids = []
+        for ticket in (1001, 1002):
+            signal_id = f"signal_{ticket}"
+            task_id = await group_persist.create_task(
+                signal_id=signal_id, group=group, dispatch_mode="sync",
+                signal=TradingSignal(action="BUY", symbol="XAUUSD", volume=0.01),
+            )
+            sub = await group_persist.create_dispatch(
+                task_id=task_id, signal_id=signal_id, group_id="g1",
+                node_id=node_id, symbol="XAUUSD", decided_vol=0.01,
+            )
+            orders.append({"ticket": ticket, "symbol": "XAUUSD", "magic": sub["magic"]})
+            task_ids.append(task_id)
+        await state.store.save_account(node_id, {"orders": orders + [{"ticket": 1003, "magic": 0}]})
+        return group, task_ids
+
+    group, task_ids = client.portal.call(seed)
+
+    def lookup(ticket):
+        return client.get("/api/trading/pending-task", params={"node_id": node_id, "ticket": ticket}, headers=headers)
+
+    assert [lookup(t).json()["task_id"] for t in (1001, 1002)] == task_ids
+    assert lookup(1003).status_code == 404
+    assert lookup(9999).status_code == 404
+    client.portal.call(state.store.cache_group, {**group, "owner_user_id": owner + 1})
+    assert lookup(1001).status_code == 404
+
+
 def test_quick_trigger_rejects_non_primary(client):
     """非主节点（不存在的 node_id）应被拒绝 → 400 + '主节点不存在或未启用'。"""
     admin_token = _admin_token(client)

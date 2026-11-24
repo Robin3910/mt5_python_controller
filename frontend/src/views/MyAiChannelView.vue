@@ -174,7 +174,20 @@ onUnmounted(() => { window.clearInterval(timer); window.clearTimeout(searchTimer
       <header class="robot-header">
         <span class="robot-avatar">{{ group.robot_name.slice(0, 1) }}</span>
         <div class="robot-heading"><h3>{{ group.robot_name }} <span>成员 {{ group.member_count }} 人</span><em v-if="status === 'pending'">{{ group.pending_count }} 个待审</em></h3><p>ID：{{ group.group_id }}<template v-if="status === 'reviewed'"> · 通过 {{ group.approved_count }} · 拒绝 {{ group.rejected_count }}</template></p></div>
-        <div class="group-actions"><button v-if="status === 'pending'" type="button" class="approve" :disabled="busy || !group.pending_request_ids.length" @click="approve([...group.pending_request_ids], group.pending_node_count)">✓ 本组通过</button><template v-else><button type="button" class="icon-button" :aria-label="group.leader_paused ? '恢复全部跟单' : '暂停全部跟单'" :disabled="busy" @click="pause(group)">{{ group.leader_paused ? '▷' : 'Ⅱ' }}</button><button type="button" class="icon-button danger" aria-label="删除整组" :disabled="busy" @click="remove(group)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7"/></svg></button></template><button type="button" class="icon-button" :aria-label="collapsed.has(group.group_id) ? '展开该机器人分组' : '折叠该机器人分组'" @click="collapse(group.group_id)">{{ collapsed.has(group.group_id) ? '⌄' : '⌃' }}</button></div>
+        <div class="group-actions">
+          <button v-if="status === 'pending'" type="button" class="approve" :disabled="busy || !group.pending_request_ids.length" @click="approve([...group.pending_request_ids], group.pending_node_count)">✓ 本组通过</button>
+          <template v-else>
+            <button type="button" class="icon-button" :aria-label="group.leader_paused ? '恢复全部跟单' : '暂停全部跟单'" :disabled="busy" @click="pause(group)">
+              <svg viewBox="0 0 24 24" aria-hidden="true" fill="currentColor"><path :d="group.leader_paused ? 'M8 5v14l11-7z' : 'M6 5h4v14H6zm8 0h4v14h-4z'"/></svg>
+            </button>
+            <button type="button" class="icon-button danger" aria-label="删除整组" :disabled="busy" @click="remove(group)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7"/></svg>
+            </button>
+          </template>
+          <button type="button" class="icon-button" :aria-expanded="!collapsed.has(group.group_id)" :aria-label="collapsed.has(group.group_id) ? '展开该机器人分组' : '折叠该机器人分组'" @click="collapse(group.group_id)">
+            <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2"><path :d="collapsed.has(group.group_id) ? 'M6 9l6 6 6-6' : 'M6 15l6-6 6 6'"/></svg>
+          </button>
+        </div>
       </header>
       <div v-if="!collapsed.has(group.group_id)">
         <article v-for="application in group.requests" :key="application.request_id" class="applicant-row">
@@ -237,12 +250,12 @@ h2 small{color:#22c55e}
 .robot-heading em{font-size:9px;font-style:normal;color:#fbbf24;background:#f59e0b15;border-radius:99px;padding:2px 5px}
 .robot-heading p,.applicant-main p{margin-top:4px;font-size:9px;color:#5b6b85;overflow-wrap:anywhere}
 .group-actions,.applicant-actions{display:flex;align-items:center;gap:6px;flex-shrink:0}
-.icon-button{border:1px solid #22304a;background:#0c1220;color:#8b96a8;width:28px;height:28px;border-radius:7px;font-size:16px!important}
+.icon-button{border:1px solid #22304a;background:#0c1220;color:#8b96a8;width:28px;height:28px;border-radius:7px;display:inline-grid;place-items:center;padding:0}
 .danger{color:#f87171}
 .applicant-row{display:flex;align-items:center;gap:9px;padding:10px;border-bottom:1px solid #1c2740}
 .applicant-row:last-child{border:0}
 .applicant-avatar{width:32px;height:32px;font-size:13px}
-.applicant-main h4{font-size:12px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.applicant-main h4{font-size:12px;overflow-wrap:anywhere;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .applicant-main h4 span{font-size:9px;color:#4ade80;background:#22c55e18;padding:2px 5px;border-radius:99px}
 .reason{color:#f87171!important}
 .status{font-size:9px;border-radius:99px;padding:3px 6px;white-space:nowrap}
@@ -259,8 +272,8 @@ h2 small{color:#22c55e}
 .channel-pagination{display:flex;align-items:center;justify-content:center;gap:12px;margin:16px 0}
 .channel-page input:focus-visible,.channel-page button:focus-visible{outline:2px solid #3b82f6;outline-offset:2px}
 @media(max-width:520px){.channel-hero{padding:10px}
-.applicant-row{display:grid;grid-template-columns:32px minmax(0,1fr);align-items:start}
-.applicant-actions{grid-column:2;justify-self:end}
+.applicant-row:has(.status.pending){display:grid;grid-template-columns:32px minmax(0,1fr);align-items:start}
+.applicant-row:has(.status.pending) .applicant-actions{grid-column:2;justify-self:end}
 .group-actions{gap:4px}
 .robot-header{gap:6px}
 .robot-heading h3{font-size:11px}
@@ -273,7 +286,7 @@ h2 small{color:#22c55e}
 }
 
 .channel-icon :deep(.robot-icon) { color: #fff; }
-.icon-button svg { width: 14px; height: 14px; display: block; margin: auto; }
+.icon-button svg { width: 14px; height: 14px; display: block; }
 .channel-tabs button.reviewed-active { background: #22304a; color: #e6ebf4; }
 .applicant-meta{display:flex;align-items:center;gap:7px;flex-wrap:wrap;color:#5b6b85;font-size:10px;margin-top:5px}
 .node-details-toggle{padding:0;border:0;background:none;color:#8b96a8;font-size:10px}

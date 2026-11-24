@@ -652,7 +652,6 @@ async function submitAssign(confirm = false): Promise<void> {
               </label>
               <span class="nodes-status-dot" :class="isOnline(n) ? 'is-on' : 'is-off'"></span>
               <a class="nodes-item-name" @click="goDetail(n)">{{ n.name }}</a>
-              <span class="nodes-item-id">{{ n.node_id }}</span>
               <span v-if="n.is_primary" class="nodes-item-primary">
                 <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
                   <path d="M12 2 9.2 8.6 2 9.2l5.2 4.6L5.8 21 12 17.3 18.2 21l-1.4-7.2L22 9.2l-7.2-.6L12 2z" />
@@ -902,13 +901,13 @@ async function submitAssign(confirm = false): Promise<void> {
   50% { opacity: 0.5; }
 }
 .nodes-metrics {
-  margin-top: 10px;
+  margin-top: 6px;
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 64px), 1fr));
+  gap: 4px;
 }
-@media (min-width: 640px) {
-  .nodes-metrics { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+.nodes-metrics .pf-metric {
+  padding: 4px 6px;
 }
 .nodes-metric-sub {
   font-size: 10px;
@@ -1092,14 +1091,6 @@ async function submitAssign(confirm = false): Promise<void> {
   text-overflow: ellipsis;
 }
 .nodes-item-name:hover { color: #60a5fa; }
-.nodes-item-id {
-  font-size: 10px;
-  color: var(--pf-dim);
-  font-family: var(--mono);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
 .nodes-item-primary {
   display: inline-flex;
   align-items: center;

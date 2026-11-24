@@ -182,7 +182,7 @@ const UNRESTRICTED_MODULES = new Set(['news_calendar'])
 
 const visibleModules = computed<ProfileHubModule[]>(() => {
   let base = ALL_MODULES.filter((m) => {
-    if (m.code === 'strategy_management') return auth.isAdmin
+    if (m.code === 'strategy_management' || m.code === 'trend') return auth.isAdmin
     if (UNRESTRICTED_MODULES.has(m.code)) return true
     if (m.code === 'ai_channel') {
       return auth.hasMenu('ai_trade') && auth.canUseAiStrategy && auth.canBeFollowLeader

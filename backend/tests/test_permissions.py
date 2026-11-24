@@ -9,7 +9,7 @@ ALICE = Principal(user_id=7, username="alice", is_admin=False, menus=frozenset({
 def test_registry_codes_unique_and_admin_only_not_assignable():
     codes = [m.code for m in perm.MENU_REGISTRY]
     assert len(codes) == len(set(codes))
-    for code in ("console", "client_versions", "events", "permissions"):
+    for code in ("trend", "console", "client_versions", "events", "permissions"):
         assert code not in perm.ASSIGNABLE_MENU_CODES
     assert set(perm.DEFAULT_USER_MENUS) == set(perm.ASSIGNABLE_MENU_CODES)
 
@@ -28,7 +28,7 @@ def test_invalid_menu_codes_rejects_unknown_and_admin_only():
 def test_resolve_menus_admin_gets_all_user_gets_assignable_union():
     assert perm.resolve_menus(True, []) == frozenset(perm.ALL_MENU_CODES)
     # 库里残留的仅管理员菜单 / 已下线菜单不会放大普通用户权限
-    assert perm.resolve_menus(False, ["groups", "console", "gone", "nodes"]) == frozenset(
+    assert perm.resolve_menus(False, ["groups", "trend", "console", "gone", "nodes"]) == frozenset(
         {"groups", "nodes"}
     )
 

@@ -1,4 +1,10 @@
 import api from './client'
+import type { GroupSignalTaskRecord } from './types'
+
+export async function fetchPendingTask(nodeId: string, ticket: number): Promise<GroupSignalTaskRecord> {
+  const { data } = await api.get<GroupSignalTaskRecord>('/api/trading/pending-task', { params: { node_id: nodeId, ticket } })
+  return data
+}
 
 export type TradingStrategyType = 'trend_market' | 'trend_limit' | 'grid'
 

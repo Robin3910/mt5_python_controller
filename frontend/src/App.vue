@@ -19,7 +19,7 @@ const PAGE_TITLES: Record<string, string> = {
   'home-node': '节点主页',
   trading: '交易',
   'ai-trade': 'AI 交易',
-  'my-ai-channel': 'AI交易机器人频道',
+  'my-ai-channel': 'AI 频道',
   'my-follow-channel': '我的带单频道',
   'ai-follow-setup': '跟单设置',
   'ai-robot-detail': '机器人详情',

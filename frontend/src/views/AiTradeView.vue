@@ -77,6 +77,7 @@ const mine = ref({ following: [], summary: {}, applications: [] } as {
   applications: AiApplication[]
 })
 const mineLoading = ref(false)
+let mineVersion = 0
 const nodeStats = ref<AiFollowNodesResponse | null>(null)
 const nodeStatsLoading = ref(false)
 const nodeStatsError = ref('')
@@ -306,13 +307,17 @@ async function loadRobots() {
 }
 
 async function loadMine() {
+  const version = ++mineVersion
   mineLoading.value = true
   try {
-    mine.value = await fetchMyAiFollowings()
+    const data = await fetchMyAiFollowings()
+    if (version !== mineVersion) return
+    mine.value = data
+    await loadAiBooks([...new Set(myFollowing.value.flatMap(robotNodeIds))], version)
   } catch (e) {
-    ElMessage.error(errText(e, '加载我的 AI 跟单失败'))
+    if (version === mineVersion) ElMessage.error(errText(e, '加载我的 AI 跟单失败'))
   } finally {
-    mineLoading.value = false
+    if (version === mineVersion) mineLoading.value = false
   }
 }
 
@@ -657,18 +662,19 @@ function singleFinished(entry: MyRobotEntry): boolean {
 interface MagicHit { magic: number; group_id: string }
 const aiMagics = ref<Record<string, MagicHit[]>>({})
 
-async function loadAiBooks(nodeIds: string[]) {
+async function loadAiBooks(nodeIds: string[], version: number) {
   await Promise.all(nodeIds.map(async (id) => {
-    if (!hub.accounts[id]) {
-      try { await hub.fetchNodeAccount(id) } catch { /* 快照没有时持仓区留空 */ }
-    }
     try {
-      const { data } = await api.get<FollowChannelsOut>(`/api/nodes/${id}/follow-channels`)
-      aiMagics.value = {
-        ...aiMagics.value,
-        [id]: data.magics.filter((m) => m.market === 'ai').map((m) => ({ magic: m.magic, group_id: m.group_id })),
-      }
-    } catch { /* 频道接口失败时这台节点不展示持仓 */ }
+      const [hasAccount, { data }] = await Promise.all([
+        hub.fetchNodeAccount(id),
+        api.get<FollowChannelsOut>(`/api/nodes/${id}/follow-channels`),
+      ])
+      if (version !== mineVersion) return
+      if (hasAccount) aiMagics.value[id] = data.magics.filter((m) => m.market === 'ai')
+      else delete aiMagics.value[id]
+    } catch {
+      if (version === mineVersion) delete aiMagics.value[id]
+    }
   }))
 }
 
@@ -708,11 +714,6 @@ function primaryNodeLabel(entry: MyRobotEntry): string {
   return name || id
 }
 
-watch(myFollowing, (list) => {
-  const ids = [...new Set(list.flatMap(robotNodeIds))]
-  if (ids.length) void loadAiBooks(ids)
-}, { immediate: true })
-
 /** 展示用持仓：只取主节点口径。 */
 function robotPositions(entry: MyRobotEntry): Array<Position & { nodeId: string }> {
   const groups = new Set(entry.groups.map((g) => g.group_id))
@@ -727,12 +728,7 @@ function robotPositions(entry: MyRobotEntry): Array<Position & { nodeId: string 
   return rows
 }
 
-/**
- * 一键平仓口径：**全部**涉及节点（不止主节点）。
- *
- * 平仓是操作行为，不是展示行为 —— 跟单员的仓位散在自己的多个节点上，
- * 只平主节点会留下「界面看不到了但还挂着」的仓位，所以这里保持全量。
- */
+/** 卡片汇总与一键平仓均覆盖当前机器人在本人关联节点上的持仓。 */
 function allRobotPositions(entry: MyRobotEntry): Array<Position & { nodeId: string }> {
   const groups = new Set(entry.groups.map((g) => g.group_id))
   const rows: Array<Position & { nodeId: string }> = []
@@ -780,6 +776,12 @@ function bookStats(rows: Array<Position & { nodeId: string }>) {
   }
   return { buy, sell, volume, profit, count: rows.length }
 }
+
+const runningCards = computed(() => runningMine.value.map(entry => {
+  const ids = robotNodeIds(entry)
+  const ready = ids.length > 0 && ids.every(id => aiMagics.value[id] && Array.isArray(hub.accounts[id]?.positions))
+  return { entry, stats: ready ? bookStats(allRobotPositions(entry)) : null }
+}))
 /**
  * 按「品种 → 魔术号」两层分块。
  *
@@ -828,8 +830,6 @@ async function openPicker(robot: Pick<AiRobotSummary, 'leader_user_id' | 'group_
   await openRobot(robot)
   if (!detail.value || route.fullPath !== source) return
   selectedNodeIds.value = mode === 'settings' ? [...alreadyFollowingNodeIds.value] : []
-  const ids = (detail.value.my_nodes || []).map((n) => n.node_id)
-  void loadAiBooks(ids)
   pickerOpen.value = true
   pickerSearch.value = ''
   await nextTick()
@@ -1033,7 +1033,7 @@ onMounted(() => { void hub.fetchNodes(); trackAiUi('page_view', { value: 'ai-tra
       <div v-if="mineTab === 'run'" class="ai-cards">
         <p v-if="mineLoading && !runningMine.length" class="ai-empty">加载中…</p>
         <p v-else-if="!runningMine.length" class="ai-empty">还没有正在跟随的机器人</p>
-        <article v-for="entry in runningMine" :key="entry.robot.group_id" class="ai-card">
+        <article v-for="{ entry, stats } in runningCards" :key="entry.robot.group_id" class="ai-card">
           <div class="ai-card-top">
             <div class="ai-card-heading">
               <span class="ai-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M20 9V7a2 2 0 0 0-2-2h-3a3 3 0 0 0-6 0H6a2 2 0 0 0-2 2v2a3 3 0 0 0 0 6v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4a3 3 0 0 0 0-6zM9 13a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm7 4H8v-2h8v2zm-1-4a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3z"/></svg></span>
@@ -1045,9 +1045,9 @@ onMounted(() => { void hub.fetchNodes(); trackAiUi('page_view', { value: 'ai-tra
             <em :class="entry.robot.ai_follow_paused || robotControlPaused(entry) ? 'off' : 'on'"><i></i>{{ entry.robot.ai_follow_paused || robotControlPaused(entry) ? '已暂停' : '运行中' }}</em>
           </div>
           <div class="ai-stats">
-            <div><span>总浮动盈亏</span><strong :class="bookStats(robotPositions(entry)).profit >= 0 ? 'up' : 'down'">{{ fmtU(bookStats(robotPositions(entry)).profit) }} U</strong></div>
-            <div><span>持仓笔数</span><strong>{{ bookStats(robotPositions(entry)).count }} 笔</strong></div>
-            <div><span>合计手数</span><strong>{{ bookStats(robotPositions(entry)).volume.toFixed(2) }} 手</strong></div>
+            <div><span>总浮动盈亏</span><strong :class="stats && (stats.profit >= 0 ? 'up' : 'down')">{{ stats ? fmtU(stats.profit) + ' U' : '—' }}</strong></div>
+            <div><span>持仓笔数</span><strong>{{ stats ? stats.count + ' 笔' : '—' }}</strong></div>
+            <div><span>合计手数</span><strong>{{ stats ? stats.volume.toFixed(2) + ' 手' : '—' }}</strong></div>
             <div><span>首单账户余额</span><strong>{{ entry.investment_amount == null ? '—' : entry.investment_amount.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' U' }}</strong></div>
             <div><span>总利润</span><strong :class="entry.total_profit == null ? '' : entry.total_profit >= 0 ? 'up' : 'down'">{{ entry.total_profit == null ? '—' : `${fmtU(entry.total_profit)} U` }}</strong></div>
             <div><span>月化收益</span><strong :class="entry.monthly_profit_rate == null ? '' : entry.monthly_profit_rate >= 0 ? 'up' : 'down'">{{ entry.monthly_profit_rate == null ? '—' : `${fmtU(entry.monthly_profit_rate)}%` }}</strong></div>
