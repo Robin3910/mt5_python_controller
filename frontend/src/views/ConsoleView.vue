@@ -140,6 +140,8 @@ async function onManualTrigger(payload: {
     <section class="pf-card">
       <p class="pf-hint cv-console-desc">
         按品种配置操作中控台：信号到达后按判定结果执行分发，命中拦截时不下发到节点。
+        <br />
+        「AI 策略（tpl_1）开仓准入」只作用于 AI 智能加仓分组的<strong>首仓信号</strong>；平仓与已在跑的任务不受影响。
       </p>
 
       <div class="cv-console-body">

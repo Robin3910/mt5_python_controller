@@ -174,11 +174,13 @@ normalize_ai_entry(raw: object) -> dict
     # 缺省 → {"enabled": False, ...}（不启用）
 
 # —— 完整准入判定（纯函数，无 IO）——
-evaluate(action, symbol, price, ai_entry_cfg) -> (allowed: bool, reason: str|None, code: str|None)
-    # 返回 (是否放行, 人读拦截原因, skip_code)
+evaluate(action, symbol, price, ai_entry_cfg) -> (allowed: bool, reason: str|None)
+    # 放行 → (True, None)；拦截 → (False, 人读原因)
+    # 注：skip_code 不在判定层返回 —— 拒收编码由调用方按场景决定
+    #     （分组级被拦 -> REJECT_AI_ENTRY；节点级明细 -> SKIP_AI_ENTRY，二期启用）
 
 # —— 取参考价（编排层，唯一有 IO 的部分）——
-resolve_price(signal, group, nodemap, accounts) -> (price: float|None, source_desc: str)
+resolve_price(signal, group, nodemap, accounts, online_ids) -> (price: float|None, source_desc: str)
     # 返回 (价格, 来源说明)；取不到 → (None, "无可用价格")
 ```
 

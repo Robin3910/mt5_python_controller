@@ -295,6 +295,26 @@ export interface FilterInterval {
   allow: FilterDirection[]
 }
 
+/**
+ * AI 策略（tpl_1，AI 智能加仓）的开仓准入。
+ *
+ * 与普通区间过滤（`SymbolFilterRule.intervals`）**互不影响**：
+ * 普通区间只作用 normal 链路；这一块只作用 tpl_1 分组的首仓开仓信号。
+ * 平仓与已在跑的任务不受影响。
+ */
+export interface AiEntryRule {
+  /** 总开关，默认 false（存量配置零行为变化） */
+  enabled: boolean
+  /** 是否允许接收做多 (BUY) 信号，默认 true */
+  allow_buy: boolean
+  /** 是否允许接收做空 (SELL) 信号，默认 true */
+  allow_sell: boolean
+  /** 价格不在任何区间时的默认处理，默认 block */
+  default_action: DefaultFilterAction
+  /** 允许开仓的价格区间 */
+  intervals: FilterInterval[]
+}
+
 /** 单个品种的区间过滤与分发规则（键为品种代码，如 XAUUSD，全局 filters） */
 export interface SymbolFilterRule {
   /** false：拒收该品种全部信号（含 Webhook 平仓；后台手动平仓除外） */
@@ -313,6 +333,8 @@ export interface SymbolFilterRule {
   /** 该品种全局手数 */
   lot: number
   intervals: FilterInterval[]
+  /** AI 策略（tpl_1）开仓准入（可选；缺失视为未启用） */
+  ai_entry?: AiEntryRule
 }
 
 export type FilterRulesConfig = Record<string, SymbolFilterRule>

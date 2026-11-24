@@ -500,6 +500,101 @@ def test_disable_console_global_lot_blocked_when_node_follows(client):
     assert "follow-lot" in detail
 
 
+# =====================================================================
+# 中控台 AI 开仓准入（tpl_1）配置校验
+# =====================================================================
+def _symbol_filter(**extra) -> dict:
+    base = {
+        "enabled": True,
+        "allow_buy": True,
+        "allow_sell": True,
+        "dispatch_mode": "sync",
+        "position_scope": "symbol",
+        "default_action": "pass",
+        "lot_enabled": False,
+        "lot": 0.01,
+        "intervals": [],
+    }
+    base.update(extra)
+    return base
+
+
+def test_save_ai_entry_config_roundtrip(client):
+    """含 ai_entry 的 filters 保存后能原样读回（不被归一化吞掉）。"""
+    h = _auth(client)
+    payload = {
+        "XAUUSD": _symbol_filter(
+            ai_entry={
+                "enabled": True,
+                "allow_buy": True,
+                "allow_sell": False,
+                "default_action": "block",
+                "intervals": [{"low": 4000, "high": 4200, "allow": ["BUY"]}],
+            }
+        )
+    }
+    r = client.put("/api/config/filters", json=payload, headers=h)
+    assert r.status_code == 200, r.text
+
+    got = client.get("/api/config/filters", headers=h).json()
+    ai = got["XAUUSD"]["ai_entry"]
+    assert ai["enabled"] is True
+    assert ai["allow_buy"] is True
+    assert ai["allow_sell"] is False
+    assert ai["default_action"] == "block"
+    assert ai["intervals"] == [{"low": 4000, "high": 4200, "allow": ["BUY"]}]
+
+
+def test_save_filters_accepts_missing_ai_entry(client):
+    """存量配置（无 ai_entry）照常保存，不报错。"""
+    h = _auth(client)
+    r = client.put("/api/config/filters", json={"XAUUSD": _symbol_filter()}, headers=h)
+    assert r.status_code == 200, r.text
+
+
+def test_save_filters_rejects_ai_entry_bad_interval(client):
+    h = _auth(client)
+    r = client.put(
+        "/api/config/filters",
+        json={"XAUUSD": _symbol_filter(ai_entry={
+            "enabled": True,
+            "intervals": [{"low": 4200, "high": 4000, "allow": ["BUY"]}],
+        })},
+        headers=h,
+    )
+    assert r.status_code == 400
+    detail = r.json()["detail"]
+    assert "XAUUSD" in detail
+    assert "下限必须小于上限" in detail
+
+
+def test_save_filters_rejects_ai_entry_empty_allow(client):
+    h = _auth(client)
+    r = client.put(
+        "/api/config/filters",
+        json={"XAUUSD": _symbol_filter(ai_entry={
+            "enabled": True,
+            "intervals": [{"low": 4000, "high": 4200, "allow": []}],
+        })},
+        headers=h,
+    )
+    assert r.status_code == 400
+    assert "至少勾选一个允许方向" in r.json()["detail"]
+
+
+def test_save_filters_rejects_ai_entry_bad_default_action(client):
+    h = _auth(client)
+    r = client.put(
+        "/api/config/filters",
+        json={"XAUUSD": _symbol_filter(ai_entry={
+            "enabled": True, "default_action": "nope", "intervals": [],
+        })},
+        headers=h,
+    )
+    assert r.status_code == 400
+    assert "默认动作非法" in r.json()["detail"]
+
+
 def test_webhook_auth_requires_admin(client):
     assert client.get("/api/config/webhook-auth").status_code == 401
 

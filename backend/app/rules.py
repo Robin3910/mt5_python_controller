@@ -123,6 +123,15 @@ def position_gate(
     return False, f"持仓过滤：账户已有持仓({len(held)}笔)，按账户过滤跳过"
 
 
+def lookup_symbol_config(filters_cfg: Optional[dict], symbol: str) -> Optional[dict]:
+    """按品种取中控台 filters 里该品种的条目（兼容券商后缀）。
+
+    `_lookup_symbol_config` 的公开别名 —— AI 开仓准入需要**同一份**品种匹配
+    口径（XAUUSD / XAUUSD.m 视为同一品种），不能另写一套。
+    """
+    return _lookup_symbol_config(filters_cfg or {}, symbol)
+
+
 def _lookup_symbol_config(filters_cfg: dict, symbol: str) -> Optional[dict]:
     """按品种 / base_symbol / 券商后缀兼容查找配置项。"""
     if not filters_cfg or not symbol:
@@ -238,6 +247,56 @@ def _fmt_num(x: object) -> str:
     return s or "0"
 
 
+def interval_decision(
+    action: str,
+    price: Optional[float],
+    intervals: list,
+    default_action: str = "block",
+    *,
+    reason_prefix: str = "区间方向过滤",
+    outside_prefix: Optional[str] = None,
+) -> tuple[bool, Optional[str]]:
+    """9.2 的**区间裁决**部分：命中哪个区间 / 该区间允不允许这个方向 / 区间外怎么办。
+
+    这是 normal 链路与 AI 开仓准入（tpl_1）**共用**的纯函数 —— 两条链路对
+    「命中哪个区间、边界是否闭合、区间外默认动作」的口径必须永远是同一份实现，
+    否则日后各改各的必然漂移。
+
+    语义（与改造前的 `interval_filter` 逐字节一致）：
+    - 区间是**闭区间**：`low <= price <= high` 两端都算命中；
+    - 多区间重叠：按数组顺序**首个命中即定**；
+    - 命中但方向不在该区间 allow 列表 → 拦截（文案写明命中区间与允许方向）；
+    - 不在任何区间 → `default_action` = `pass` 放行 / `block` 拦截。
+
+    `reason_prefix` / `outside_prefix` 只影响拦截文案的前缀，**不改判定语义**。
+    调用方需自行处理「方向总开关」与「缺价」—— 这两件事与配置块语义相关，
+    不属于区间裁决本身。
+    """
+    for iv in intervals or []:
+        try:
+            low = float(iv["low"])
+            high = float(iv["high"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if low <= price <= high:
+            allow = [str(a).upper() for a in (iv.get("allow") or [])]
+            if action in allow:
+                return True, None
+            allowed_txt = "/".join(allow) if allow else "无"
+            return False, (
+                f"{reason_prefix}：价格{_fmt_num(price)}命中区间"
+                f"[{_fmt_num(low)},{_fmt_num(high)}]，"
+                f"该区间仅允许{allowed_txt}，{action}被拦截"
+            )
+    # 落在所有配置区间之外
+    if default_action == "pass":
+        return True, None
+    out_prefix = outside_prefix if outside_prefix is not None else reason_prefix
+    return False, (
+        f"{out_prefix}：价格{_fmt_num(price)}不在任何配置区间内，默认动作拦截(block)"
+    )
+
+
 def interval_filter(
     action: str,
     symbol: str,
@@ -272,21 +331,10 @@ def interval_filter(
             f"区间方向过滤：{sym}无可用价格（节点未上报报价且无持仓价），"
             f"无法判定区间，{action}被拦截"
         )
-    for iv in sf.get("intervals", []):
-        if float(iv["low"]) <= price <= float(iv["high"]):
-            allow = [a.upper() for a in iv.get("allow", [])]
-            if action in allow:
-                return True, None
-            allowed_txt = "/".join(allow) if allow else "无"
-            return False, (
-                f"区间方向过滤：价格{_fmt_num(price)}命中区间"
-                f"[{_fmt_num(iv['low'])},{_fmt_num(iv['high'])}]，"
-                f"该区间仅允许{allowed_txt}，{action}被拦截"
-            )
-    # 落在所有配置区间之外
-    if sf.get("default_action", "block") == "pass":
-        return True, None
-    return False, f"区间默认过滤：价格{_fmt_num(price)}不在任何配置区间内，默认动作拦截(block)"
+    return interval_decision(
+        action, price, sf.get("intervals", []), sf.get("default_action", "block"),
+        outside_prefix="区间默认过滤",
+    )
 
 
 def validate_node_global_lot_mode(node_filters: dict, global_filters: dict) -> Optional[str]:
