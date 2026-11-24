@@ -6,6 +6,7 @@
 所有写操作都遵循“先写库、再刷新缓存”的顺序，保证重启后能从库里恢复全部状态。
 """
 import logging
+import re
 import time
 from datetime import datetime
 from typing import Optional
@@ -16,7 +17,7 @@ from . import follow_service, group_persist, group_service
 from .db import SessionLocal
 from . import risk_control, rbac_service
 from .models import NodeCreate, NodeUpdate
-from .orm import DeletedNode, Node, NodeGroupMember, NodeCredential
+from .orm import DeletedNode, Node, NodeGroupMember, NodeCredential, SystemSetting
 from .redis_store import RedisStore
 from .rules import validate_node_global_lot_mode
 from .security import make_node_id
@@ -243,15 +244,60 @@ def default_node_filters_from_global(global_filters: dict) -> dict:
     return out
 
 
-def _default_name(seq: int, mt5_login: int) -> str:
-    """默认显示名：`{序号}-{mt5_login}`，序号按节点位置从 1 起递增。"""
+def default_node_name(seq: int, mt5_login: int) -> str:
+    """默认显示名：`{序号}-{mt5_login}`，序号按节点位置从 1 起递增。
+
+    建节点的**所有**入口都要走这里（管理端手动建、面板导入申请），
+    否则同一个后端会出现两套命名规则，节点名看起来就像重复了。
+    """
     return f"{seq}-{mt5_login}"
 
 
-async def _next_node_seq(session) -> int:
-    """下一节点序号 = 当前节点数 + 1（列表按创建顺序，新节点位于末尾）。"""
-    count = (await session.execute(select(func.count()).select_from(Node))).scalar_one()
-    return int(count) + 1
+# 节点名形如「序号-账号ID」，序号取名字开头的那段数字。
+_NAME_SEQ_RE = re.compile(r"^(\d+)-")
+
+# 已分配出去的最大序号，落在 system_setting 里。
+# 不能靠「数一数有几个节点」推序号：删掉节点后计数会回退，新节点就会拿到
+# 一个已经用过的序号，于是出现两个同序号的名字（`nodes.name` 不唯一，
+# 库里不会报错，但后台看着像同一个节点出现了两次）。
+_SEQ_SETTING_KEY = "node_name_seq"
+
+
+async def next_node_seq(session) -> int:
+    """下一个节点序号。
+
+    取三个来源的较大值再加一：
+      - **节点数**：序号跟着节点在列表里的位置走（手工命名的节点也占位置），
+        这样「1-8101 / 2-8102 / custom / 4-8104」这种序列是连续的；
+      - **计数器**（`system_setting.node_name_seq`）：删过节点后不会重用序号 ——
+        只数节点的话，删一个就会让下一个节点拿到已用过的序号，出现两个同序号
+        的名字（`nodes.name` 不唯一，库里不会报错，但后台看着像同一个节点
+        出现了两次）；
+      - **现存节点名里的最大序号**：老版本建的节点没有计数器记录，
+        照着它们的名字续号，避免跟存量名字撞。
+    """
+    setting = await session.get(SystemSetting, _SEQ_SETTING_KEY)
+    counter = 0
+    if setting is not None:
+        try:
+            counter = int(str(setting.value or "0"))
+        except ValueError:
+            counter = 0
+    count = int(
+        (await session.execute(select(func.count()).select_from(Node))).scalar_one()
+    )
+    names = (await session.execute(select(Node.name))).scalars().all()
+    for name in names:
+        matched = _NAME_SEQ_RE.match(str(name or ""))
+        if matched:
+            counter = max(counter, int(matched.group(1)))
+    counter = max(counter, count)
+    nxt = counter + 1
+    if setting is None:
+        session.add(SystemSetting(key=_SEQ_SETTING_KEY, value=str(nxt)))
+    else:
+        setting.value = str(nxt)
+    return nxt
 
 
 async def find_by_mt5_login(mt5_login: int) -> Optional[dict]:
@@ -280,8 +326,8 @@ async def create_node(
     node_id = make_node_id()
     async with SessionLocal() as s:
         owner = await rbac_service.admin_owner_id(s, payload.admin_owner_id)
-        name = explicit_name or _default_name(
-            await _next_node_seq(s), payload.mt5_login,
+        name = explicit_name or default_node_name(
+            await next_node_seq(s), payload.mt5_login,
         )
         row = Node(
             node_id=node_id,

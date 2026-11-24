@@ -900,6 +900,15 @@ class IntervalRule(BaseModel):
     allow: list[str] = Field(default_factory=list)  # BUY / SELL 的子集
 
 
+class AiEntryRule(BaseModel):
+    """AI 策略（tpl_1）的开仓准入：独立于普通区间过滤，只作用 AI 分组的首仓信号。"""
+    enabled: bool = False  # 默认关闭 → 存量配置零行为变化
+    allow_buy: bool = True
+    allow_sell: bool = True
+    default_action: str = "block"  # 不在任何区间时：block 拦截 / pass 放行
+    intervals: list[IntervalRule] = Field(default_factory=list)
+
+
 class SymbolFilter(BaseModel):
     """某品种的多区间过滤与分发配置（全局 filters 键值）。"""
     enabled: bool = True  # False：拒收该品种全部信号（含 Webhook CLOSE；手动平仓除外）
@@ -911,6 +920,7 @@ class SymbolFilter(BaseModel):
     lot_enabled: bool = False  # 是否启用该品种的全局手数
     lot: float = 0.01  # 该品种全局手数（lot_enabled 时生效）
     intervals: list[IntervalRule] = Field(default_factory=list)
+    ai_entry: Optional[AiEntryRule] = None  # AI 开仓准入（缺失视为未启用）
 
 
 class NodeSymbolDispatchRule(BaseModel):

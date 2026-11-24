@@ -283,6 +283,7 @@ class DashboardAuthUI:
                 raise DashboardAuthError("该目录已登记为其他实例，不能重复使用", status=403)
 
     def _enroll_instance(self, cfg, login: int, server: str = ""):
-        node = self.session.enrolled(login, cfg.name, server)
+        # 名字留空：服务器按「序号-账号ID」自己生成节点名。
+        node = self.session.enrolled(login, "", server)
         self.session.apply_node(cfg, node)
         return cfg

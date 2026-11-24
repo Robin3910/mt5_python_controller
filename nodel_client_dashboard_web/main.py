@@ -156,7 +156,6 @@ def _run_import_probe() -> int:
 
     req = svc.ImportRequest(
         directory=str(terminal_dir),
-        name="probe",
         version="1.0.0",
         account_raw="50231488",
         write_env=True,

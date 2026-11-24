@@ -5,6 +5,7 @@ import { computed, ref } from 'vue'
 import { ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/message-box/style/css'
 import type {
+  AiEntryRule,
   FilterDirection,
   FilterRulesConfig,
   NodeDispatchFiltersConfig,
@@ -12,6 +13,7 @@ import type {
   SymbolFilterRule,
 } from '@/api/types'
 import {
+  createEmptyAiEntryRule,
   createEmptyInterval,
   createEmptyNodeSymbolRule,
   createEmptySymbolRule,
@@ -184,6 +186,62 @@ async function loadExample(): Promise<void> {
   )
     return
   model.value = exampleFilterRules()
+}
+
+// ── AI 策略（tpl_1）开仓准入 ──
+// 与普通区间过滤互不影响：普通区间只作用 normal 链路，这一块只作用
+// tpl_1 分组的首仓开仓信号（平仓与已在跑的任务不受影响）。
+function updateAiEntry(symbol: string, patch: Partial<AiEntryRule>): void {
+  const cfg = model.value as FilterRulesConfig
+  const cur = cfg[symbol]
+  if (!cur) return
+  const ai = cur.ai_entry ?? createEmptyAiEntryRule()
+  model.value = { ...cfg, [symbol]: { ...cur, ai_entry: { ...ai, ...patch } } }
+}
+
+function addAiInterval(symbol: string): void {
+  const rule = (model.value as FilterRulesConfig)[symbol]
+  if (!rule) return
+  const ai = rule.ai_entry ?? createEmptyAiEntryRule()
+  updateAiEntry(symbol, { intervals: [...ai.intervals, createEmptyInterval()] })
+}
+
+function updateAiInterval(
+  symbol: string,
+  index: number,
+  patch: Partial<{ low: number; high: number; allow: FilterDirection[] }>,
+): void {
+  const rule = (model.value as FilterRulesConfig)[symbol]
+  if (!rule) return
+  const ai = rule.ai_entry ?? createEmptyAiEntryRule()
+  const intervals = ai.intervals.map((iv, i) => (i === index ? { ...iv, ...patch } : iv))
+  updateAiEntry(symbol, { intervals })
+}
+
+function toggleAiDirection(symbol: string, index: number, dir: FilterDirection, checked: boolean): void {
+  const rule = (model.value as FilterRulesConfig)[symbol]
+  if (!rule) return
+  const ai = rule.ai_entry ?? createEmptyAiEntryRule()
+  const iv = ai.intervals[index]
+  if (!iv) return
+  const allow = new Set(iv.allow)
+  if (checked) allow.add(dir)
+  else allow.delete(dir)
+  updateAiInterval(symbol, index, { allow: [...allow] })
+}
+
+async function removeAiInterval(symbol: string, index: number): Promise<void> {
+  const rule = (model.value as FilterRulesConfig)[symbol]
+  if (!rule) return
+  const ai = rule.ai_entry ?? createEmptyAiEntryRule()
+  if (
+    !(await confirmAction(
+      `确认删除品种 ${symbol} 的 AI 开仓准入第 ${index + 1} 条区间？`,
+      '确认删除',
+    ))
+  )
+    return
+  updateAiEntry(symbol, { intervals: ai.intervals.filter((_, i) => i !== index) })
 }
 
 function setAllowBuy(symbol: string, value: boolean): void {
@@ -530,6 +588,137 @@ defineExpose({ loadExample })
                   class="pf-switch"
                   :class="{ on: iv.allow.includes('SELL') }"
                   @click="toggleDirection(symbol, idx, 'SELL', !iv.allow.includes('SELL'))"
+                ></button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- AI 策略（tpl_1）开仓准入 -->
+        <div class="filter-section">
+          <div class="pf-section-head">
+            <p class="pf-section-title"><span class="pf-bar"></span>AI 策略（tpl_1）开仓准入</p>
+            <button type="button" class="pf-btn pf-btn-mini" @click="addAiInterval(symbol)">添加区间</button>
+          </div>
+
+          <div class="filter-switch-grid">
+            <div class="pf-switch-row">
+              <span class="pf-switch-label">启用准入</span>
+              <button
+                type="button"
+                role="switch"
+                :aria-checked="!!rule.ai_entry?.enabled"
+                class="pf-switch"
+                :class="{ on: !!rule.ai_entry?.enabled }"
+                @click="updateAiEntry(symbol, { enabled: !rule.ai_entry?.enabled })"
+              ></button>
+            </div>
+            <div class="pf-switch-row">
+              <span class="pf-switch-label">允许做多 (BUY)</span>
+              <button
+                type="button"
+                role="switch"
+                :aria-checked="rule.ai_entry?.allow_buy !== false"
+                class="pf-switch"
+                :class="{ on: rule.ai_entry?.allow_buy !== false }"
+                @click="updateAiEntry(symbol, { allow_buy: rule.ai_entry?.allow_buy === false })"
+              ></button>
+            </div>
+            <div class="pf-switch-row">
+              <span class="pf-switch-label">允许做空 (SELL)</span>
+              <button
+                type="button"
+                role="switch"
+                :aria-checked="rule.ai_entry?.allow_sell !== false"
+                class="pf-switch"
+                :class="{ on: rule.ai_entry?.allow_sell !== false }"
+                @click="updateAiEntry(symbol, { allow_sell: rule.ai_entry?.allow_sell === false })"
+              ></button>
+            </div>
+          </div>
+
+          <div class="filter-field">
+            <span class="pf-label">默认动作（价格不在任何区间内）</span>
+            <div class="pf-seg">
+              <button
+                v-for="opt in DEFAULT_ACTION_OPTIONS"
+                :key="opt.key"
+                type="button"
+                class="pf-seg-item"
+                :class="{ active: (rule.ai_entry?.default_action ?? 'block') === opt.key, danger: opt.key === 'block', success: opt.key === 'pass' }"
+                @click="updateAiEntry(symbol, { default_action: opt.key })"
+              >
+                {{ opt.label }}
+              </button>
+            </div>
+          </div>
+
+          <p class="pf-hint filter-empty-line">
+            仅作用于 AI 智能加仓（tpl_1）分组的<strong>首仓开仓信号</strong>；方向不符、价格不在区间内、或取不到价格时一律丢弃。
+            平仓与已在跑的任务不受影响。
+          </p>
+
+          <div v-for="(iv, idx) in rule.ai_entry?.intervals ?? []" :key="idx" class="filter-range">
+            <div class="filter-range-head">
+              <p class="filter-range-title">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                  <path d="m7 8 4 4-4 4M13 16h4" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+                AI 区间 {{ idx + 1 }}
+                <span class="filter-range-desc">· 价格落入区间时按方向规则执行</span>
+              </p>
+              <button type="button" class="filter-range-del" @click="removeAiInterval(symbol, idx)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                  <path d="M18 6 6 18M6 6l12 12" stroke-linecap="round" />
+                </svg>
+                移除区间
+              </button>
+            </div>
+
+            <div class="filter-range-grid">
+              <label class="filter-range-field">
+                <span class="pf-label">价格下限</span>
+                <input
+                  :value="iv.low"
+                  type="number"
+                  step="any"
+                  class="pf-input filter-num-input"
+                  @input="updateAiInterval(symbol, idx, { low: Number(($event.target as HTMLInputElement).value) })"
+                />
+              </label>
+              <label class="filter-range-field">
+                <span class="pf-label">价格上限</span>
+                <input
+                  :value="iv.high"
+                  type="number"
+                  step="any"
+                  class="pf-input filter-num-input"
+                  @input="updateAiInterval(symbol, idx, { high: Number(($event.target as HTMLInputElement).value) })"
+                />
+              </label>
+            </div>
+
+            <div class="filter-range-switches">
+              <div class="pf-switch-row">
+                <span class="pf-switch-label">做多 (BUY)</span>
+                <button
+                  type="button"
+                  role="switch"
+                  :aria-checked="iv.allow.includes('BUY')"
+                  class="pf-switch"
+                  :class="{ on: iv.allow.includes('BUY') }"
+                  @click="toggleAiDirection(symbol, idx, 'BUY', !iv.allow.includes('BUY'))"
+                ></button>
+              </div>
+              <div class="pf-switch-row">
+                <span class="pf-switch-label">做空 (SELL)</span>
+                <button
+                  type="button"
+                  role="switch"
+                  :aria-checked="iv.allow.includes('SELL')"
+                  class="pf-switch"
+                  :class="{ on: iv.allow.includes('SELL') }"
+                  @click="toggleAiDirection(symbol, idx, 'SELL', !iv.allow.includes('SELL'))"
                 ></button>
               </div>
             </div>

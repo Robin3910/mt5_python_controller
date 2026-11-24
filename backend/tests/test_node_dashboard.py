@@ -89,6 +89,50 @@ def test_admin_application_can_approve_without_assignment(client):
     assert data["owner_user_id"] == client.get("/api/me", headers=admin).json()["user_id"] and data["enabled"] and data["approval_status"] == "approved"
 
 
+def test_enrollment_name_defaults_to_seq_and_login(client):
+    """名字留空时按「序号-mt5_login」生成，与管理端手动建节点同一套规则。
+
+    面板导入只提交账号、不提交名字，节点名完全由服务器生成。
+    """
+    admin = auth_headers(client)
+    n1 = enrolled(client, admin, login=8801)
+    assert n1["name"] == "1-8801", n1["name"]
+    n2 = enrolled(client, admin, login=8802)
+    assert n2["name"] == "2-8802", n2["name"]
+
+
+def test_enrollment_explicit_name_wins(client):
+    """显式给了名字就照用，不走自动命名。"""
+    admin = auth_headers(client)
+    response = client.post(
+        f"{PREFIX}/enrollments", headers=admin, json={"mt5_login": 8811, "name": "我的节点"},
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["name"] == "我的节点"
+
+
+def test_node_seq_does_not_reuse_after_delete(client):
+    """删过节点后，新节点的序号不能跟已有节点撞号。
+
+    用「节点数 + 1」当序号时，删一个就会让下一个节点拿到已用过的序号，
+    出现两个同序号的名字。
+
+    直接删库里的行：走 API 删除会被「节点从未连接」的规则挡下，
+    跟序号逻辑无关。
+    """
+    admin = auth_headers(client)
+    n1 = enrolled(client, admin, login=8801)
+    assert n1["name"] == "1-8801", n1["name"]
+
+    sync_engine = create_engine(f"sqlite:///{_DB.as_posix()}")
+    with sync_engine.begin() as conn:
+        conn.execute(text("DELETE FROM nodes WHERE node_id = :node_id"), {"node_id": n1["node_id"]})
+    sync_engine.dispose()
+
+    n2 = enrolled(client, admin, login=8802)
+    assert n2["name"] == "2-8802", n2["name"]
+
+
 def test_other_user_cannot_claim_or_view_application(client):
     admin = auth_headers(client)
     _, alice = user(client, admin)

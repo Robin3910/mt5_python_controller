@@ -133,6 +133,11 @@ class DashboardSession:
     def apply_node(self, cfg, node: dict) -> None:
         cfg.node_id = str(node["node_id"])
         cfg.mt5_login = int(node.get("mt5_login") or 0)
+        # 服务器上的节点名（后台管理里显示的那个，导入时由服务器按
+        # 「序号-账号ID」生成）。后端没给名字时不覆盖 —— 别把已有名字冲掉。
+        server_name = str(node.get("name") or "").strip()
+        if server_name:
+            cfg.name = server_name
         # 后端记着的券商服务器名（节点鉴权首包上报，落库后一直可查）。
         # 后端没给时不覆盖：可能只是这一版后端还没这个字段，本机终端探测
         # 读到的实时服务器名更准，不能被空值冲掉。

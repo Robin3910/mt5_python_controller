@@ -41,6 +41,7 @@ SKIP_ADMISSION_PARAM = "admission_param"    # 参数缺失（缺 sl / 缺入场�
 SKIP_MISMATCH_SCOPE = "mismatch_scope"      # 定向不匹配（品种 / 模版 / 分组）
 SKIP_LINK_OFFLINE = "link_offline"          # 终端与券商断联，发单前拦下
 SKIP_NEWS_BLACKOUT = "news_blackout"        # 财经日历黑名单（高影响数据公布前后）
+SKIP_AI_ENTRY = "ai_entry"                  # AI 开仓准入（tpl_1 首仓准入闸门）
 SKIP_ERROR_MT5 = "error_mt5"                # 执行失败（MT5 retcode / error）
 SKIP_UNKNOWN = "unknown"                    # 兜底
 
@@ -57,6 +58,7 @@ SKIP_CODES: tuple[str, ...] = (
     SKIP_MISMATCH_SCOPE,
     SKIP_LINK_OFFLINE,
     SKIP_NEWS_BLACKOUT,
+    SKIP_AI_ENTRY,
     SKIP_ERROR_MT5,
     SKIP_UNKNOWN,
 )
@@ -75,6 +77,7 @@ SKIP_CODE_LABELS: dict[str, str] = {
     SKIP_MISMATCH_SCOPE: "定向不匹配",
     SKIP_LINK_OFFLINE: "链路断连",
     SKIP_NEWS_BLACKOUT: "新闻黑名单",
+    SKIP_AI_ENTRY: "AI 开仓准入",
     SKIP_ERROR_MT5: "执行失败",
     SKIP_UNKNOWN: "其它",
 }
@@ -88,6 +91,7 @@ REJECT_SYMBOL_NOT_CONFIGURED = "symbol_not_configured"  # 品种未在节点配�
 REJECT_SYMBOL_DISABLED = "symbol_disabled"  # 品种在中控台被禁用
 REJECT_DUPLICATE = "duplicate"              # 5 秒幂等去重（本期不采集，仅占位）
 REJECT_INVALID_PAYLOAD = "invalid_payload"  # 解析失败 / 字段非法
+REJECT_AI_ENTRY = "ai_entry_admission"      # AI 开仓准入不通过（tpl_1 首仓准入闸门）
 REJECT_UNKNOWN = "unknown"
 
 REJECT_CODES: tuple[str, ...] = (
@@ -97,6 +101,7 @@ REJECT_CODES: tuple[str, ...] = (
     REJECT_SYMBOL_DISABLED,
     REJECT_DUPLICATE,
     REJECT_INVALID_PAYLOAD,
+    REJECT_AI_ENTRY,
     REJECT_UNKNOWN,
 )
 
@@ -107,6 +112,7 @@ REJECT_CODE_LABELS: dict[str, str] = {
     REJECT_SYMBOL_DISABLED: "品种已禁用",
     REJECT_DUPLICATE: "重复抑制",
     REJECT_INVALID_PAYLOAD: "参数非法",
+    REJECT_AI_ENTRY: "AI 开仓准入",
     REJECT_UNKNOWN: "其它",
 }
 
@@ -143,6 +149,7 @@ _BACKFILL_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # 若被后面那条先匹配到，就会被归成「目标不可用」。
     (SKIP_LINK_OFFLINE, ("断连", "链路离线", "与券商断连")),
     (SKIP_NEWS_BLACKOUT, ("新闻黑名单", "财经", "黑名单")),
+    (SKIP_AI_ENTRY, ("AI 开仓准入", "ai_entry")),
     (SKIP_RISK_TREND, ("趋势风控",)),
     (SKIP_RISK_POSITION, ("持仓过滤",)),
     (SKIP_RISK_INTERVAL, ("区间", "方向")),
@@ -208,6 +215,8 @@ def classify_reject_reason(reason: Optional[str]) -> str:
         return REJECT_SYMBOL_NOT_CONFIGURED
     if "重复" in text or "duplicate" in low:
         return REJECT_DUPLICATE
+    if "AI 开仓准入" in text or "ai_entry" in low:
+        return REJECT_AI_ENTRY
     if "cannot parse" in low or "invalid signal" in low:
         return REJECT_INVALID_PAYLOAD
     return REJECT_UNKNOWN

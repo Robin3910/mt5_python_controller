@@ -1186,7 +1186,7 @@ onBeforeUnmount(() => {
   font-size: 18px;
   line-height: 1;
   font-weight: 650;
-  color: #FF0000;
+  color: #fff;
   font-variant-numeric: tabular-nums;
   letter-spacing: -0.03em;
   white-space: nowrap;

@@ -22,7 +22,7 @@ import version_service as vs
 from busy_status import BusyStatus, ThrottledProgress, format_bytes
 from client_deploy import apply_package, extract_package, read_version_near
 from dialog_window import hide_while_building, show_centered
-from models import InstanceConfig, default_label_from_path
+from models import InstanceConfig, default_label_from_path, local_label
 from process_manager import ProcessManager
 from store import canonical_dir, load_panel_config, same_instance
 from session_ui import SessionDialog
@@ -141,14 +141,17 @@ class ImportNodeDialog(SessionDialog):
             row=3, column=2, padx=(4, 16), pady=8
         )
 
-        ctk.CTkLabel(card, text="实例标签", text_color=TEXT_MUTED, font=font(12)).grid(
+        ctk.CTkLabel(card, text="本机标签", text_color=TEXT_MUTED, font=font(12)).grid(
             row=4, column=0, padx=16, pady=8, sticky="w"
         )
-        ctk.CTkEntry(
+        # 只读：标签自动取「目录名-账号ID」，账号在下一步才问，
+        # 所以这里先显示目录名那一段，导入完成后卡片上是完整标签。
+        self.name_entry = ctk.CTkEntry(
             card, textvariable=self.name_var, fg_color=BG_ELEVATED,
-            border_color=GLASS_BORDER, text_color=TEXT, height=34, corner_radius=6,
-            placeholder_text="留空则取目录名",
-        ).grid(row=4, column=1, columnspan=2, padx=(8, 16), pady=8, sticky="ew")
+            border_color=GLASS_BORDER, text_color=TEXT_DIM, height=34, corner_radius=6,
+            state="readonly",
+        )
+        self.name_entry.grid(row=4, column=1, columnspan=2, padx=(8, 16), pady=8, sticky="ew")
 
         ctk.CTkLabel(card, text="客户端版本", text_color=TEXT_MUTED, font=font(12)).grid(
             row=5, column=0, padx=16, pady=8, sticky="w"
@@ -237,8 +240,7 @@ class ImportNodeDialog(SessionDialog):
         if not path:
             return
         self.dir_var.set(path)
-        if not self.name_var.get().strip():
-            self.name_var.set(Path(path).name)
+        self.name_var.set(Path(path).name)
         self._check_dir()
 
     def _check_dir(self) -> bool:
@@ -268,6 +270,8 @@ class ImportNodeDialog(SessionDialog):
         if ef.env_path(directory).is_file():
             note += "　已有 .env（勾选自动写入时将覆盖）"
         self.status.configure(text=note, text_color=TEXT_MUTED)
+        # 目录变了，本机标签的前缀（目录名）跟着变。
+        self.name_var.set(directory.name)
         return True
 
     def _detect_versions(self) -> None:
@@ -384,7 +388,7 @@ class ImportNodeDialog(SessionDialog):
             )
             return
 
-        name = self.name_var.get().strip() or directory.name
+        folder = directory.name
         write_env = self.write_env_var.get()
         env_exists = ef.env_path(directory).is_file()
         ws_url = ef.ws_url_from_backend_base(target.base)
@@ -393,8 +397,10 @@ class ImportNodeDialog(SessionDialog):
             f"将把客户端 v{version} 部署到：",
             f"  {directory}",
             "",
-            f"实例标签：{name}",
+            f"本机标签：{folder}-<MT5账号>",
             f"MT5 终端：{(ef.find_terminal(directory) or Path('?')).name}",
+            "",
+            "服务器节点名：由服务器按「序号-账号ID」自动生成",
         ]
         if write_env and env_exists:
             lines += [
@@ -425,13 +431,22 @@ class ImportNodeDialog(SessionDialog):
         except TerminalAccountError as exc:
             messagebox.showerror("申请节点", str(exc), parent=self)
             return
-        cfg = InstanceConfig.create(name=name, exe_path=str(exe_path), cwd=str(directory))
+        # 本机标签在账号确定后才算得出来（目录名-账号ID），
+        # 账号可能是留空后从终端读的，所以等 enroll 解析出登录号再补。
+        # 服务器节点名留给服务器生成 —— 申请节点时名字留空。
+        cfg = InstanceConfig.create(
+            name="", exe_path=str(exe_path), cwd=str(directory),
+        )
         self._pending_cfg = cfg
+        typed = typed_login(raw)
+        if typed:
+            # 手填了账号：标签这时就定下来了。
+            self.name_var.set(local_label(str(directory), typed))
 
         sha = str(item.get("sha256") or "")
         self._run_async(
             "导入",
-            lambda: self._deploy(target, version, sha, directory, name, write_env, ws_url, raw),
+            lambda: self._deploy(target, version, sha, directory, write_env, ws_url, raw),
         )
 
     def _deploy(
@@ -440,7 +455,6 @@ class ImportNodeDialog(SessionDialog):
         version: str,
         sha256: str,
         directory: Path,
-        name: str,
         write_env: bool,
         ws_url: str,
         account_raw: str,
@@ -451,6 +465,9 @@ class ImportNodeDialog(SessionDialog):
             self.after(0, lambda: self._start_busy_status("正在读取 MT5 当前登录号", TEXT_MUTED))
 
         def enroll(login: int, server: str) -> None:
+            # 本机标签 = 目录名-账号ID（只存在本机）；服务器节点名由服务器生成。
+            self._pending_cfg.display_name = local_label(str(directory), login)
+            self.name_var.set(self._pending_cfg.display_name)
             self.dashboard._enroll_instance(self._pending_cfg, login, server)
 
         enroll_import_login(account_raw, lambda: read_terminal_account(directory), enroll)
@@ -515,7 +532,7 @@ class ImportNodeDialog(SessionDialog):
         self.after(
             0,
             lambda: self._register_instance(
-                directory, name, version, env_written, env_overwritten
+                directory, version, env_written, env_overwritten
             ),
         )
 
@@ -524,7 +541,6 @@ class ImportNodeDialog(SessionDialog):
     def _register_instance(
         self,
         directory: Path,
-        name: str,
         version: str,
         env_written: bool,
         env_overwritten: bool = False,

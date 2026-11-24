@@ -29,7 +29,7 @@ import env_file as ef
 import version_service as vs
 from client_binding import require_binding
 from client_deploy import apply_package, extract_package, read_version_near
-from models import InstanceConfig
+from models import InstanceConfig, local_label
 from terminal_account import (
     TerminalAccountError,
     enroll_import_login,
@@ -51,10 +51,14 @@ class ImportError_(RuntimeError):
 
 @dataclass
 class ImportRequest:
-    """一次导入请求的参数。"""
+    """一次导入请求的参数。
+
+    刻意**没有** name 字段：节点名由服务器按「序号-账号ID」生成，
+    本机只管自己的显示标签（目录名-账号ID）。要加名字得先想清楚
+    「本机标签」和「服务器节点名」谁是权威 —— 两者不能混成一个字段。
+    """
 
     directory: str
-    name: str = ""
     version: str = ""
     sha256: str = ""
     account_raw: str = ""
@@ -175,9 +179,11 @@ def summarize(request: ImportRequest, *, login: int) -> dict[str, Any]:
         f"将把客户端 v{request.version} 部署到：",
         f"  {directory}",
         "",
-        f"实例标签：{request.name or directory.name}",
+        f"本机标签：{local_label(request.directory, login)}",
         f"MT5 终端：{terminal.name if terminal else '?'}",
         f"MT5 账号：{login}",
+        "",
+        "服务器节点名：由服务器按「序号-账号ID」自动生成",
     ]
     if request.write_env and env_exists:
         lines += [
@@ -267,9 +273,10 @@ def run_import(
 
     # —— ② 解析账号 ——
     login, server = resolve_account(request.directory, request.account_raw)
-    name = request.name.strip() or directory.name
+    # 本机标签 = 目录名-账号ID；服务器节点名留给服务器生成（申请时名字留空）。
     cfg = InstanceConfig.create(
-        name=name, exe_path=str(exe_path), cwd=str(directory)
+        name="", exe_path=str(exe_path), cwd=str(directory),
+        display_name=local_label(request.directory, login),
     )
 
     # —— ③ 申请节点 ——
