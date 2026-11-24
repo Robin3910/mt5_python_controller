@@ -189,7 +189,7 @@ onBeforeUnmount(() => {
         </div>
 
         <!-- 窗口与币种 -->
-        <div class="pf-grid-3">
+        <div class="news-fields">
           <div>
             <label class="pf-label" for="news-before">事件前（分钟）</label>
             <input
@@ -281,7 +281,7 @@ onBeforeUnmount(() => {
           <li v-for="ev in group.list" :key="ev.event_id" class="news-event">
             <div class="news-event-main">
               <p class="news-event-title">
-                {{ ev.title }}
+                <span :title="ev.original_title">{{ ev.title }}</span>
                 <span class="news-impact" :class="ev.impact">{{ impactLabel(ev.impact) }}</span>
                 <span v-if="ev.in_blackout" class="news-flag">黑名单</span>
               </p>
@@ -326,6 +326,13 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+
+.news-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr)) minmax(7rem, 1fr);
+  align-items: end;
+  gap: 8px;
 }
 
 /* ── 状态条：正常 / 手动暂停 / 新闻黑名单 ── */
@@ -540,5 +547,6 @@ onBeforeUnmount(() => {
 
 @media (max-width: 640px) {
   .news-page { gap: 10px; }
+  .news-fields select { padding-inline: 6px; }
 }
 </style>

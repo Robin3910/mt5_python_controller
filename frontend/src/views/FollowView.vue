@@ -655,23 +655,6 @@ function nodeBalance(id: string): string {
 
 const myLeader = computed(() => leaders.value.find((l) => isMyLeader(l)) || null)
 
-interface MagicHit { magic: number; group_id: string }
-const followMagics = ref<Record<string, MagicHit[]>>({})
-async function loadFollowBooks(nodeIds: string[]) {
-  await Promise.all(nodeIds.map(async (id) => {
-    if (!hub.accounts[id]) {
-      try { await hub.fetchNodeAccount(id) } catch { /* 没有快照就先不展示持仓 */ }
-    }
-    if (followMagics.value[id]) return
-    try {
-      const { data } = await api.get<FollowChannelsOut>(`/api/nodes/${id}/follow-channels`)
-      followMagics.value = {
-        ...followMagics.value,
-        [id]: data.magics.filter((m) => m.market === 'follow').map((m) => ({ magic: m.magic, group_id: m.group_id })),
-      }
-    } catch { /* 频道读取失败时跳过该节点 */ }
-  }))
-}
 function entryPositions(entry: MyFollowingEntry) {
   return entry.groups.flatMap(g => groupPositions(g))
 }
@@ -766,11 +749,6 @@ function fmtTime(ts: number | null | undefined): string {
 }
 function groupTitle(name: string | null, strategy: string | null): string {
   return strategy || name || '跟单分组'
-}
-function posRows(nodeId: string, groupId: string): Array<Position & { nodeId: string }> {
-  const hits = (followMagics.value[nodeId] || []).filter((m) => m.group_id === groupId)
-  const magics = new Set(hits.map((m) => m.magic))
-  return (hub.accounts[nodeId]?.positions || []).filter((p) => magics.has(p.magic)).map((p) => ({ ...p, nodeId }))
 }
 function entryGroupPositions(entry: MyFollowingEntry, groupId: string) {
   const group = entry.groups.find(g => g.group_id === groupId)
@@ -970,10 +948,41 @@ const stopPositions = computed(() => myFollowing.value.flatMap(entryPositions).f
   selectedStops.value.some(t => t.node_id === p.nodeId && t.group_id === p.groupId)).length)
 
 const selfGroups = computed(() => selfDetail.value?.groups || [])
-function selfPositions(groupId: string) {
-  const id = myLeader.value?.primary_node?.node_id
-  return id ? posRows(id, groupId) : []
-}
+const selfNodeId = computed(() => auth.canBeFollowLeader ? myLeader.value?.primary_node?.node_id : undefined)
+const selfPositions = computed(() => selfNodeId.value ? hub.accounts[selfNodeId.value]?.positions || [] : [])
+const selfMagicKey = computed(() => [...new Set(selfPositions.value.map(p => p.magic))].sort().join(','))
+const selfChannels = ref<FollowChannelsOut['magics']>([])
+watch([selfNodeId, selfMagicKey], async ([nodeId, magics], [previousId], onCleanup) => {
+  if (nodeId !== previousId || !magics) selfChannels.value = []
+  if (!nodeId || !magics) return
+  let current = true
+  onCleanup(() => { current = false })
+  try {
+    const { data } = await api.get<FollowChannelsOut>(`/api/nodes/${nodeId}/follow-channels`)
+    if (current) selfChannels.value = data.magics.filter(channel => channel.market === 'follow')
+  } catch { /* 保留最近一次成功读取的频道归属 */ }
+})
+const selfOrders = computed(() => {
+  const nodeId = selfNodeId.value
+  if (!nodeId) return []
+  const groups = new Map(selfGroups.value.map(group => [group.group_id, group]))
+  const byMagic = new Map(selfChannels.value.map(channel => [channel.magic, groups.get(channel.group_id)]))
+  return selfPositions.value.flatMap(position => {
+    const group = byMagic.get(position.magic)
+    return group ? [{ ...position, nodeId, title: selfItemTitle(group) }] : []
+  }).sort((a, b) => b.time - a.time || b.ticket - a.ticket)
+})
+const selfMagicBooks = computed(() => {
+  const ordersByMagic = new Map<number, typeof selfOrders.value>()
+  for (const order of selfOrders.value) {
+    const orders = ordersByMagic.get(order.magic)
+    if (orders) orders.push(order)
+    else ordersByMagic.set(order.magic, [order])
+  }
+  return Array.from(ordersByMagic, ([magic, orders]) => ({
+    magic, orders, title: orders[0].title, nodeId: orders[0].nodeId, ...bookStats(orders),
+  }))
+})
 const selfMeta = computed(() => {
   const leader = myLeader.value
   const parts: string[] = []
@@ -987,13 +996,6 @@ const selfMeta = computed(() => {
   if (parts.length) return parts.join(' · ')
   const node = leader?.primary_node
   return node ? (node.name || node.node_id) : '无主节点'
-})
-const selfRunLabel = computed(() => {
-  const total = selfGroups.value.length
-  if (!total) return '0 个带单中'
-  if (myLeader.value?.follow_paused) return '已暂停'
-  const running = selfGroups.value.filter((g) => g.active_task_count > 0).length
-  return `${running}/${total} 个带单中`
 })
 const SELF_MODE_LABEL: Record<string, string> = {
   trend_market: '市价开仓',
@@ -1031,6 +1033,12 @@ function groupDisplayTitle(name: string | null, strategy: string | null, symbol?
   const key = groupModeKey(name, strategy)
   const label = (key && SELF_MODE_LABEL[key]) || groupTitle(name, strategy)
   return symbol ? `${label} · ${symbol}` : label
+}
+
+function applicationTitle(row: FollowApplication): string {
+  const name = row.group_name || ''
+  const symbol = row.symbol || (groupModeKey(name) && name.match(/-\d+-([^-]+)$/)?.[1])
+  return groupDisplayTitle(name || '跟单申请', row.strategy_name, symbol)
 }
 
 function showcaseGroupMode(g: { name: string | null; strategy_name?: string | null }): string {
@@ -1109,22 +1117,6 @@ function selfModeLabel(name: string | null | undefined): string {
 function selfItemTitle(g: { name: string | null; strategy_name?: string | null; strategy_template?: string | null }): string {
   return selfModeLabel(g.name) || selfModeLabel(g.strategy_name) || g.strategy_template || g.strategy_name || g.name || '跟单分组'
 }
-function selfSyncLabel(groupId: string): string {
-  const latest = selfPositions(groupId).reduce((max, p) => Math.max(max, p.time || 0), 0)
-  return latest ? `同步 ${fmtTime(latest)}` : ''
-}
-function selfItemState(active: number): { cls: string; text: string } {
-  if (myLeader.value?.follow_paused) return { cls: 'pause', text: '已暂停' }
-  if (active > 0) return { cls: 'live', text: '跟单中' }
-  return { cls: 'idle', text: '空闲' }
-}
-function selfNodeLabel(): string {
-  const node = myLeader.value?.primary_node
-  return node ? (node.name || node.node_id) : ''
-}
-function closeSelfGroup(groupId: string, title: string) {
-  return closeRows(selfPositions(groupId), `「${title}」`)
-}
 async function loadSelfDetail() {
   const leader = myLeader.value
   if (!leader || !auth.canBeFollowLeader) { selfDetail.value = null; return }
@@ -1134,11 +1126,7 @@ async function loadSelfDetail() {
     selfDetail.value = null
   }
   const id = leader.primary_node?.node_id
-  if (!id) return
-  if (!hub.accounts[id]) {
-    try { await hub.fetchNodeAccount(id) } catch { /* 主节点没有快照时分组卡片仍可展示 */ }
-  }
-  void loadFollowBooks([id])
+  if (id && !hub.accounts[id]) await hub.fetchNodeAccount(id)
 }
 watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 </script>
@@ -1231,7 +1219,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 
       <section v-if="auth.canBeFollowLeader" class="fd-sec">
         <header>
-          <p class="fd-kicker blue">我的带单<span>{{ selfGroups.length || (myLeader ? 1 : 0) }}</span></p>
+          <p class="fd-kicker blue">我的带单<span>{{ selfOrders.length }}</span></p>
           <em class="fd-sec-note">仅带单员可见</em>
         </header>
         <p v-if="!myLeader" class="fd-empty">你有带单能力，但还没有可被跟随的主节点分组。</p>
@@ -1248,55 +1236,54 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
               <small>{{ selfMeta }}</small>
             </div>
             <div class="fd-self-side">
-              <em class="fd-self-run"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46A7.93 7.93 0 0 0 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74A7.93 7.93 0 0 0 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z"/></svg>{{ selfRunLabel }}</em>
+              <em class="fd-self-run"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46A7.93 7.93 0 0 0 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74A7.93 7.93 0 0 0 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z"/></svg>{{ myLeader.follow_paused ? '带单已暂停' : selfOrders.length + ' 笔持仓' }}</em>
+              <button type="button" class="fd-self-hold" :class="{ on: myLeader.follow_paused }" :disabled="pauseBusy" @click="pauseMine">
+                <svg v-if="myLeader.follow_paused" viewBox="0 0 24 24"><path fill="currentColor" d="M8 5v14l11-7z"/></svg>
+                <svg v-else viewBox="0 0 24 24"><path fill="currentColor" d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+                {{ myLeader.follow_paused ? '恢复带单' : '暂停带单' }}
+              </button>
               <button type="button" class="fd-self-link" @click="openShowcase()">查看带单员<svg viewBox="0 0 24 24"><path fill="currentColor" d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg></button>
             </div>
           </header>
-          <p v-if="!selfGroups.length" class="fd-empty">主节点上还没有可展示的带单分组。</p>
+          <p v-if="!selfOrders.length" class="fd-empty">暂无带单持仓。</p>
           <div v-else class="fd-self-list">
-            <div v-for="g in selfGroups" :key="g.group_id" class="fd-self-item">
+            <div v-for="book in selfMagicBooks" :key="`${book.nodeId}:${book.magic}`" class="fd-self-item">
               <div class="fd-self-row">
                 <p>
                   <svg viewBox="0 0 24 24"><path fill="currentColor" d="M7 2v11h3v9l7-12h-4l4-8z"/></svg>
-                  <b>{{ selfItemTitle(g) }}</b>
-                  <!-- <em v-if="selfMagicLabel(g.group_id)" class="fd-mf">{{ selfMagicLabel(g.group_id) }}</em> -->
-                  <em v-if="selfNodeLabel()" class="fd-node"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M20 13H4c-.55 0-1 .45-1 1v6c0 .55.45 1 1 1h16c.55 0 1-.45 1-1v-6c0-.55-.45-1-1-1zM7 19c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zM20 3H4c-.55 0-1 .45-1 1v6c0 .55.45 1 1 1h16c.55 0 1-.45 1-1V4c0-.55-.45-1-1-1zM7 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2z"/></svg>{{ selfNodeLabel() }}</em>
-                  <span v-if="selfSyncLabel(g.group_id)">{{ selfSyncLabel(g.group_id) }}</span>
+                  <b>{{ book.title }}</b>
                 </p>
                 <div class="fd-self-actions">
-                  <em :class="selfItemState(g.active_task_count).cls"><i></i>{{ selfItemState(g.active_task_count).text }}</em>
-                  <button type="button" class="fd-self-hold" :class="{ on: myLeader.follow_paused }" :disabled="pauseBusy" @click="pauseMine">
-                    <svg v-if="myLeader.follow_paused" viewBox="0 0 24 24"><path fill="currentColor" d="M8 5v14l11-7z"/></svg>
-                    <svg v-else viewBox="0 0 24 24"><path fill="currentColor" d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
-                    {{ myLeader.follow_paused ? '恢复跟单' : '暂停跟单' }}
-                  </button>
+                  <em class="live"><i></i>持仓中</em>
                 </div>
               </div>
               <div class="fd-book">
                 <div class="fd-book-head">
                   <span><svg viewBox="0 0 24 24"><path fill="currentColor" d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-2 10H7v-2h10v2zm0-4H7V7h10v2z"/></svg>订单列表</span>
-                  <span class="fd-book-meta"><b><svg viewBox="0 0 24 24"><path fill="currentColor" d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zM3 9h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7z"/></svg>{{ g.symbol || '—' }}</b><i>{{ bookStats(selfPositions(g.group_id)).count }} 笔持仓 · 浮动 {{ fmtU(bookStats(selfPositions(g.group_id)).profit) }} U</i></span>
+                  <span class="fd-book-meta"><b><svg viewBox="0 0 24 24"><path fill="currentColor" d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zM3 9h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7z"/></svg>{{ book.count }} 笔持仓</b><i>浮动 {{ fmtU(book.profit) }} U</i></span>
                 </div>
-                <p v-if="!selfPositions(g.group_id).length" class="fd-empty">暂无持仓</p>
-                <div v-else class="fd-self-orders">
-                  <div v-for="p in selfPositions(g.group_id)" :key="p.ticket" class="fd-self-pos">
+                <div class="fd-self-orders">
+                  <div v-for="p in book.orders" :key="p.ticket" class="fd-self-pos">
                     <div>
                       <em :class="(p.type || '').toLowerCase() === 'buy' ? 'buy' : 'sell'">{{ (p.type || '').toLowerCase() === 'buy' ? 'BUY' : 'SELL' }}</em>
                       <span>{{ p.symbol }}</span>
-                      <span class="hold"><i></i>正在持仓</span>
+                      <span>#{{ p.ticket }}</span>
                       <strong :class="(p.profit || 0) >= 0 ? 'up' : 'down'">{{ fmtU(p.profit || 0) }} U</strong>
+                      <button type="button" class="fd-close" :disabled="closeBusy" @click="closeRows([p], `订单 #${p.ticket}`)"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M7 2v11h3v9l7-12h-4l4-8z"/></svg>平此单</button>
                     </div>
                     <p>开仓 {{ fmtTime(p.time) }} · {{ (p.volume || 0).toFixed(2) }} 手 @ {{ fmtPx(p.price_open) }} · SL {{ fmtPx(p.sl) }} / TP {{ fmtPx(p.tp) }}</p>
                   </div>
                 </div>
               </div>
               <div class="fd-stats">
-                <div><span>持仓笔数</span><b>{{ bookStats(selfPositions(g.group_id)).count }} 笔</b></div>
-                <div><span>合计手数</span><b>{{ bookStats(selfPositions(g.group_id)).volume.toFixed(2) }} 手</b></div>
-                <div><span>浮动盈亏</span><b :class="bookStats(selfPositions(g.group_id)).profit >= 0 ? 'up' : 'down'">{{ fmtU(bookStats(selfPositions(g.group_id)).profit) }} U</b></div>
+                <div><span>持仓笔数</span><b>{{ book.count }} 笔</b></div>
+                <div><span>持仓手数</span><b>{{ book.volume.toFixed(2) }} 手</b></div>
+                <div><span>浮动盈亏</span><b :class="book.profit >= 0 ? 'up' : 'down'">{{ fmtU(book.profit) }} U</b></div>
               </div>
               <footer>
-                <button type="button" class="fd-close" :disabled="closeBusy || !selfPositions(g.group_id).length" @click="closeSelfGroup(g.group_id, selfItemTitle(g))"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M7 2v11h3v9l7-12h-4l4-8z"/></svg>一键平仓</button>
+                <button type="button" class="fd-close" :disabled="closeBusy" @click="closeRows(book.orders, `魔术号 ${book.magic}`)">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M7 2v11h3v9l7-12h-4l4-8z"/></svg>一键平仓
+                </button>
               </footer>
             </div>
           </div>
@@ -1333,7 +1320,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
           <article v-for="group in applicationOnlyGroups" :key="'application-' + group.leader_user_id" class="fd-card fd-applications">
             <header class="fd-card-top"><span class="fd-avatar lg">{{ group.leader_name.slice(0, 1) }}</span><div><b>{{ group.leader_name }}</b><small>跟单申请 · {{ group.nodes.filter(node => node.status === 'pending').length }} 条待通过</small></div></header>
             <div v-for="node in group.nodes" :key="node.request_id" class="fd-item">
-              <div class="fd-item-top"><p><b>{{ node.strategy_name || node.group_name || '跟单申请' }}</b><em v-if="node.symbol">{{ node.symbol }}</em></p><em :class="node.status === 'pending' ? 'fd-pending' : 'off'">{{ node.status === 'pending' ? '待通过' : node.status === 'rejected' ? '已拒绝' : '已移出 / 失效' }}</em></div>
+              <div class="fd-item-top"><p><b>{{ applicationTitle(node) }}</b></p><em :class="node.status === 'pending' ? 'fd-pending' : 'off'">{{ node.status === 'pending' ? '待通过' : node.status === 'rejected' ? '已拒绝' : '已移出 / 失效' }}</em></div>
               <p class="fd-application-node">{{ node.name || node.node_id }} <span v-if="node.is_primary">主节点</span> · {{ node.mt5_login || node.node_id }}</p>
               <p class="fd-application-note">{{ node.status === 'pending' ? '⌛ 等待带单员通过申请' : node.reason || '可重新选择节点申请跟单' }}</p>
               <button v-if="node.status !== 'pending' && node.available" type="button" class="fd-link" @click="retryApplication(node)">重新申请 ›</button>
@@ -1364,7 +1351,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
             </header>
             <p v-if="entry.leader.follow_paused" class="fd-warn">{{ PAUSED_FOLLOW_HINT }}</p>
             <div v-for="node in applicationRows(entry.leader.leader_user_id)" :key="'request-' + node.request_id" class="fd-item">
-              <div class="fd-item-top"><p><b>{{ node.strategy_name || node.group_name || '跟单申请' }}</b><em v-if="node.symbol">{{ node.symbol }}</em></p><em :class="node.status === 'pending' ? 'fd-pending' : 'off'">{{ node.status === 'pending' ? '待通过' : node.status === 'rejected' ? '已拒绝' : '已移出 / 失效' }}</em></div>
+              <div class="fd-item-top"><p><b>{{ applicationTitle(node) }}</b></p><em :class="node.status === 'pending' ? 'fd-pending' : 'off'">{{ node.status === 'pending' ? '待通过' : node.status === 'rejected' ? '已拒绝' : '已移出 / 失效' }}</em></div>
               <p class="fd-application-node">{{ node.name || node.node_id }} <span v-if="node.is_primary">主节点</span> · {{ node.mt5_login || node.node_id }}</p>
               <p class="fd-application-note">{{ node.status === 'pending' ? '⌛ 等待带单员通过申请' : node.reason || '可重新选择节点申请跟单' }}</p>
               <button v-if="node.status !== 'pending' && node.available" type="button" class="fd-link" @click="retryApplication(node)">重新申请 ›</button>
@@ -1643,7 +1630,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 .fd-intro-top::before, .fd-intro-top::after { content: ''; position: absolute; border-radius: 99px; pointer-events: none; }
 .fd-intro-top::before { right: -24px; top: -32px; width: 96px; height: 96px; background: rgba(124,58,237,.2); filter: blur(16px); }
 .fd-intro-top::after { right: 40px; bottom: -36px; width: 80px; height: 80px; background: rgba(37,99,235,.15); filter: blur(16px); }
-.fd-intro-head, .fd-sec header, .fd-card-top, .fd-item-top, .fd-book-head, .fd-node-card header, .fd-node-card footer, .fd-item footer, .fd-dialog header, .fd-dialog footer, .fd-pick, .fd-preview-top, .fd-mine-title, .fd-tabs, .fd-filters {
+.fd-intro-head, .fd-sec header, .fd-card-top, .fd-item-top, .fd-book-head, .fd-node-card header, .fd-node-card footer, .fd-item footer, .fd-self-item footer, .fd-dialog header, .fd-dialog footer, .fd-pick, .fd-preview-top, .fd-mine-title, .fd-tabs, .fd-filters {
   display: flex; align-items: center; gap: 8px;
 }
 .fd-intro-head { position: relative; padding: 0; }
@@ -1710,7 +1697,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 .fd-swap { width: 36px; height: 36px; border-radius: 12px; color: #22C55E; background: rgba(34,197,94,.15); }
 .fd-swap svg { width: 18px; height: 18px; }
 .fd-preview-top b { display: block; font-size: 12px; }
-.fd-chev { color: #4A5568; }
+.fd-chev { margin-inline-start: auto; flex-shrink: 0; color: #4A5568; }
 .fd-chips { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 6px; width: 100%; margin-top: 10px; padding-top: 10px; border-top: 1px solid #1E2B47; }
 .fd-chips > span, .fd-stats > div, .fd-sum4 > div, .fd-stat3 > div { min-width: 0; border: 1px solid #22304A; background: #0C1220; border-radius: 8px; padding: 6px 8px; }
 .fd-chips b { display: flex; align-items: center; gap: 4px; font-size: 9px; }
@@ -1776,7 +1763,8 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 .fd-self .fd-stats b { color: #E6EBF4; }
 .fd-self .fd-stats b.up { color: #22C55E; }
 .fd-self .fd-stats b.down { color: #F6465D; }
-.fd-self-item footer { display: flex; justify-content: flex-end; margin-top: 8px; padding-top: 8px; border-top: 1px solid #1E2B47; }
+.fd-self-item .fd-self-pos > div { flex-wrap: wrap; }
+.fd-self-item .fd-self-pos strong { margin-left: auto; }
 .fd-self .fd-close:hover:not(:disabled) { background: #E03A50; }
 @keyframes fd-pulse { 0% { box-shadow: 0 0 0 0 rgba(34,197,94,.55); } 100% { box-shadow: 0 0 0 5px rgba(34,197,94,0); } }
 .fd-link { border: 0; background: transparent; color: #3B82F6; font-size: 10px; }
@@ -1799,7 +1787,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 .fd-stats, .fd-sum4 { margin-top: 8px; display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 6px; }
 .fd-sum4 { grid-template-columns: 1fr 1fr; }
 .fd-stats > div, .fd-sum4 > div { background: #0A101E; border-color: #1E2B47; }
-.fd-item footer, .fd-node-card footer { justify-content: flex-end; margin-top: 8px; padding-top: 8px; border-top: 1px solid #1E2B47; }
+.fd-self-item footer, .fd-item footer, .fd-node-card footer { justify-content: flex-end; margin-top: 8px; padding-top: 8px; border-top: 1px solid #1E2B47; }
 .fd-close { display: inline-flex; align-items: center; gap: 4px; border: 0; border-radius: 8px; background: #F6465D; color: #fff; font-size: 11px; font-weight: 650; padding: 6px 12px; box-shadow: 0 2px 8px rgba(246,70,93,.35); }
 .fd-leave { border: 1px solid rgba(246,70,93,.7); background: transparent; color: #F6465D; border-radius: 8px; padding: 6px 12px; font-size: 11px; font-weight: 650; }
 .fd-mine-hero { padding: 12px; background: linear-gradient(135deg, #101828, #101C38); }

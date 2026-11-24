@@ -73,6 +73,7 @@ class Settings(BaseSettings):
     # 只是没有新数据进来）。**测试环境必须关掉**：抓取走外网，
     # 会拖慢用例并可能被对方限流（429）。
     economic_calendar_enabled: bool = True
+    deepseek_api_key: str = ""
     # 抓取周期（秒）。默认 30 分钟。
     economic_calendar_interval: int = 1800
 

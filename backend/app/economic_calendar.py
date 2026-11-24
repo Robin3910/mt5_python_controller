@@ -28,7 +28,8 @@ import httpx
 from sqlalchemy import select
 
 from .db import SessionLocal
-from .orm import EconomicEvent
+from .news_translation import translate_recent_events, translation_join
+from .orm import EconomicEvent, EconomicEventTranslation
 
 logger = logging.getLogger(__name__)
 
@@ -270,18 +271,21 @@ async def list_events(
 ) -> list[dict]:
     """取时间窗内的事件（按时间升序）。impacts 为空表示不限等级。"""
     async with SessionLocal() as session:
-        stmt = select(EconomicEvent).where(
+        stmt = select(EconomicEvent, EconomicEventTranslation.title_zh).outerjoin(
+            EconomicEventTranslation, translation_join(),
+        ).where(
             EconomicEvent.event_time >= int(start_ts),
             EconomicEvent.event_time <= int(end_ts),
         )
         if impacts:
             stmt = stmt.where(EconomicEvent.impact.in_(list(impacts)))
-        rows = (await session.execute(stmt.order_by(EconomicEvent.event_time))).scalars().all()
+        rows = (await session.execute(stmt.order_by(EconomicEvent.event_time))).all()
         return [
             {
                 "event_id": r.event_id,
                 "event_time": r.event_time,
-                "title": r.title,
+                "title": title_zh or r.title,
+                "original_title": r.title,
                 "country": r.country,
                 "impact": r.impact,
                 "forecast": r.forecast,
@@ -289,7 +293,7 @@ async def list_events(
                 "source": r.source,
                 "fetched_at": r.fetched_at.timestamp() if r.fetched_at else 0.0,
             }
-            for r in rows
+            for r, title_zh in rows
         ]
 
 
@@ -354,6 +358,7 @@ class EconomicCalendarWorker:
                     self.last_error = ""
                 else:
                     self.last_error = "抓取失败，保留上次数据"
+                await translate_recent_events()
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
