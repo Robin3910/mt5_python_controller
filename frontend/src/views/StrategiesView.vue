@@ -383,7 +383,7 @@ function fmtTime(sec: number | null | undefined): string {
     </section>
 
     <div class="pf-card" style="margin-bottom: 12px">
-      <div class="row" style="gap: 8px; flex-wrap: wrap">
+      <div class="row st-filters" style="gap: 8px; flex-wrap: wrap">
         <input
           v-model="searchQuery"
           type="search"
@@ -391,7 +391,6 @@ function fmtTime(sec: number | null | undefined): string {
           placeholder="搜索策略名称 / 品种…"
           aria-label="搜索策略"
           :disabled="loading"
-          style="width: 25%"
           @keydown.enter="runSearch"
         />
         <button class="pf-btn pf-btn-primary" :disabled="loading" @click="runSearch">
@@ -413,26 +412,26 @@ function fmtTime(sec: number | null | undefined): string {
       <div
         v-for="s in visibleStrategies"
         :key="s.strategy_id"
-        class="list-card card clickable"
-        @click="toggleExpand(s.strategy_id)"
+        class="list-card card"
       >
-        <div class="list-card-head row between">
-          <strong>
-            <span class="muted" style="margin-right: 6px">{{ isExpanded(s.strategy_id) ? '▾' : '▸' }}</span>
-            {{ s.name }}
-          </strong>
-          <span class="pf-pill" :class="s.enabled ? 'green' : 'grey'">
-            <span class="pf-pill-dot" :style="{ background: s.enabled ? '#22c55e' : '#8b96a8' }"></span>
-            {{ s.enabled ? '已启用' : '已禁用' }}
+        <button type="button" class="st-summary" :aria-expanded="isExpanded(s.strategy_id)"
+          @click="toggleExpand(s.strategy_id)">
+          <span class="st-heading">
+            <strong>{{ s.name }}</strong>
+            <span class="pf-pill" :class="s.enabled ? 'green' : 'grey'">
+              <span class="pf-pill-dot" aria-hidden="true"></span>{{ s.enabled ? '已启用' : '已禁用' }}
+            </span>
           </span>
-        </div>
-        <div class="list-field"><span class="k">策略 ID</span><span class="v muted" style="font-size: 12px">{{ s.strategy_id }}</span></div>
-        <div v-if="auth.isAdmin" class="list-field"><span class="k">所有者</span><span class="v">{{ s.owner_username || '管理员' }}</span></div>
-        <div class="list-field"><span class="k">模版</span><span class="v">{{ s.template_name }}</span></div>
-        <div class="list-field"><span class="k">绑定品种</span><span class="v"><code>{{ s.symbol }}</code></span></div>
-        <div class="list-field"><span class="k">规则</span><span class="v">{{ ruleSummary(s.rules) }}</span></div>
-        <div class="list-field"><span class="k">创建时间</span><span class="v muted" style="font-size: 12px">{{ fmtTime(s.created_at) }}</span></div>
-        <div v-if="isExpanded(s.strategy_id)" class="strategy-detail" @click.stop>
+          <span class="st-meta">
+            <code>{{ s.symbol }}</code><span>{{ s.template_name }}</span>
+            <span v-if="auth.isAdmin">所有者 · {{ s.owner_username || '管理员' }}</span>
+          </span>
+          <span class="st-rule-summary">{{ ruleSummary(s.rules) }}</span>
+          <span class="st-disclosure">{{ isExpanded(s.strategy_id) ? '收起详情' : '查看详情' }}<i aria-hidden="true"></i></span>
+        </button>
+        <div v-if="isExpanded(s.strategy_id)" class="strategy-detail">
+          <div class="list-field"><span class="k">策略 ID</span><span class="v">{{ s.strategy_id }}</span></div>
+          <div class="list-field"><span class="k">创建时间</span><span class="v">{{ fmtTime(s.created_at) }}</span></div>
           <div v-if="s.remark" class="muted" style="font-size: 12px; margin-bottom: 8px">备注：{{ s.remark }}</div>
           <div v-if="!s.rules.length" class="muted" style="font-size: 12px">暂无规则</div>
           <div v-for="(r, ri) in displayRules(s.rules)" :key="ri" class="strategy-rule-block">
@@ -460,34 +459,21 @@ function fmtTime(sec: number | null | undefined): string {
                 分批加仓 · 方向 {{ actionLabel(r.batch_action) }} ·
                 {{ r.batch_count ?? 0 }} 批 · 加仓笔数上限 {{ r.total_lot_limit ?? 0 }}
               </div>
-              <div v-if="r.batch_levels?.length" class="table-scroll">
-                <table class="strategy-levels-table">
-                  <thead>
-                    <tr>
-                      <th>加仓次数</th>
-                      <th>计算</th>
-                      <th>间距</th>
-                      <th class="right">倍数</th>
-                      <th class="right">额外手数</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr v-for="(lv, li) in r.batch_levels" :key="li">
-                      <td>{{ lv.pos_from }}–{{ lv.pos_to }}</td>
-                      <td>{{ calcTypeLabel(lv.calc_type) }}</td>
-                      <td class="muted" style="font-size: 12px">{{ levelSpacingText(lv) }}</td>
-                      <td class="right">{{ lv.lot_times }}</td>
-                      <td class="right">{{ lv.extra_lot }}</td>
-                    </tr>
-                  </tbody>
-                </table>
+              <div v-if="r.batch_levels?.length">
+                <dl v-for="(lv, li) in r.batch_levels" :key="li" class="st-level">
+                  <div><dt>加仓次数</dt><dd>{{ lv.pos_from }}–{{ lv.pos_to }}</dd></div>
+                  <div><dt>计算</dt><dd>{{ calcTypeLabel(lv.calc_type) }}</dd></div>
+                  <div class="st-spacing"><dt>间距</dt><dd>{{ levelSpacingText(lv) }}</dd></div>
+                  <div><dt>倍数</dt><dd>{{ lv.lot_times }}</dd></div>
+                  <div><dt>额外手数</dt><dd>{{ lv.extra_lot }}</dd></div>
+                </dl>
               </div>
               <div v-else class="muted" style="font-size: 12px">暂无分批档位</div>
             </template>
             <div v-else class="muted" style="font-size: 12px">分批加仓：未启用</div>
           </div>
         </div>
-        <div class="list-card-actions" @click.stop>
+        <div class="list-card-actions">
           <button class="pf-btn pf-btn-mini" :disabled="isAiStrategyLocked(s)" @click="openEdit(s)">编辑</button>
           <button class="pf-btn pf-btn-mini" :disabled="isAiStrategyLocked(s)" @click="toggleEnabled(s)">
             {{ s.enabled ? '禁用' : '启用' }}
@@ -675,9 +661,56 @@ function fmtTime(sec: number | null | undefined): string {
   font-size: 12px;
 }
 
+.st-summary {
+  display: grid;
+  gap: 8px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+.st-heading { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 8px; }
+.st-heading strong { font-size: 15px; line-height: 1.4; }
+.st-heading .pf-pill-dot { background: currentColor; }
+.st-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; color: var(--pf-muted); font-size: 12px; }
+.st-meta code { color: var(--pf-text); font-weight: 600; }
+.st-rule-summary { font-size: 13px; line-height: 1.5; }
+.st-disclosure { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--pf-muted); }
+.st-disclosure i { width: 6px; height: 6px; border: solid currentColor; border-width: 0 1px 1px 0; transform: rotate(45deg); }
+.st-summary[aria-expanded="true"] .st-disclosure i { transform: rotate(225deg); }
 .list-card .strategy-detail {
   margin: 10px 0;
   padding-top: 8px;
   border-top: 1px dashed var(--glass-border);
+}
+.st-filters .pf-input { width: 25%; }
+
+@media (max-width: 768px) {
+  .strategies-header .pf-card-head { display: grid; gap: 12px; }
+  .strategies-header .pf-card-head-main { align-items: flex-start; }
+  .strategies-header .pf-card-title { font-size: 16px; }
+  .strategies-header .pf-card-sub { margin-top: 4px; font-size: 12px; line-height: 1.5; color: var(--pf-muted); }
+  .strategies-header .row > button { flex: 1; }
+  .st-filters { display: grid; grid-template-columns: minmax(0, 1fr) auto; }
+  .st-filters .pf-input { width: 100%; min-width: 0; font-size: 16px; }
+  .st-filters .pf-switch-row { grid-column: 1 / -1; justify-content: flex-start; min-height: 44px; cursor: pointer; }
+  .strategies-page :is(.pf-btn, .st-filters .pf-input) { min-height: 44px; }
+  .list-card { min-width: 0; padding: 14px; }
+  .st-summary { grid-template-columns: minmax(0, 1fr); }
+  .st-meta > * { max-width: 100%; }
+  .st-meta code { padding: 2px 6px; border-radius: 4px; background: var(--pf-soft); }
+  .st-disclosure { color: var(--pf-blue); }
+  .list-card-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin-top: 10px; }
+  .list-card-actions .pf-btn { font-size: 13px; }
+  .strategy-detail { overflow-wrap: anywhere; }
+  .st-level { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 8px 0 0; padding-top: 8px; border-top: 1px solid var(--glass-border); }
+  .st-spacing { grid-column: 1 / -1; }
+  .st-level dt { color: var(--pf-muted); font-size: 12px; }
+  .st-level dd { margin: 2px 0 0; font-size: 13px; }
 }
 </style>
