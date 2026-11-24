@@ -199,6 +199,79 @@ def test_event_id_is_stable():
     assert a != c
 
 
+def test_deepseek_calendar_translation(client, monkeypatch):
+    import time
+    import httpx
+    from app import news_api, news_translation
+
+    monkeypatch.setattr(news_translation.settings, "deepseek_api_key", "")
+    now = int(time.time())
+    title = "Prelim GDP q/q"
+    events = economic_calendar.parse_events([
+        {"title": title, "country": country, "date": _iso_with_offset(now + offset), "impact": "High"}
+        for country, offset in [("USD", 60), ("GBP", 120), ("USD", 180)]
+    ], now=now)
+    client.portal.call(economic_calendar.save_events, events)
+    headers = auth_headers(client)
+    requests = []
+    labels = {"USD": "美国实际 GDP 年化季率（第二次估算）", "GBP": "英国 GDP 季率初值"}
+
+    async def mock_post(self, url, *, headers, json):
+        from json import loads, dumps
+        assert url == "https://api.deepseek.com/chat/completions"
+        assert headers["Authorization"] == "Bearer test-only"
+        assert json["model"] == "deepseek-flash"
+        items = loads(json["messages"][-1]["content"])
+        requests.append(items)
+        assert list(items.values()) == [{"currency": c, "title": title} for c in ("GBP", "USD")]
+        if len(requests) == 1:
+            return httpx.Response(429, request=httpx.Request("POST", url))
+        content = dumps({i: labels[item["currency"]] for i, item in items.items()})
+        return httpx.Response(200, request=httpx.Request("POST", url), json={
+            "choices": [{"finish_reason": "stop", "message": {"content": content}}],
+        })
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+    client.portal.call(news_translation.translate_recent_events)
+    assert not requests
+    monkeypatch.setattr(news_translation.settings, "deepseek_api_key", "test-only")
+    client.portal.call(news_translation.translate_recent_events)
+    data = client.get("/api/me/news", headers=headers).json()
+    assert [ev["title"] for ev in data["events"]] == [title] * 3
+    assert data["status"]["blocked"]
+
+    async def fetch_events():
+        return events
+
+    monkeypatch.setattr(economic_calendar, "fetch_events", fetch_events)
+    monkeypatch.setattr(news_api, "_last_manual_refresh", 0)
+    refreshed = client.post("/api/me/news/refresh", headers=headers)
+    assert refreshed.status_code == 200 and refreshed.json()["ok"]
+    client.portal.call(news_translation.translate_recent_events)
+    assert len(requests) == 2
+    data = client.get("/api/me/news", headers=headers).json()
+    assert [ev["event_id"] for ev in data["events"]] == [ev["event_id"] for ev in events]
+    assert all(ev["original_title"] == title and ev["title"] == labels[ev["country"]] for ev in data["events"])
+    assert data["status"]["blocked"] and labels["USD"] in data["status"]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_translation_only_accepts_chinese_titles_for_requested_ids():
+    import httpx
+    from app.news_translation import _translate_batch
+
+    def respond(request):
+        return httpx.Response(200, json={"choices": [{
+            "finish_reason": "stop",
+            "message": {"content": '{"2":"失业率","1":"GDP","8":"额外标题"}'},
+        }]})
+
+    batch = [("USD", "CPI"), ("USD", "GDP"), ("GBP", "Unemployment Rate")]
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        rows = await _translate_batch(client, batch)
+    assert [(r.country, r.title, r.title_zh) for r in rows] == [("GBP", "Unemployment Rate", "失业率")]
+
+
 # =====================================================================
 # 判定层：币种推导
 # =====================================================================

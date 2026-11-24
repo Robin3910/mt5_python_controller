@@ -20,7 +20,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 
 from . import economic_calendar, news_guard, persist
 from .deps import client_ip, get_principal, require_admin
@@ -92,6 +92,7 @@ async def get_my_news(
             "event_time": ev["event_time"],
             "event_time_text": _fmt_beijing(ev["event_time"]),
             "title": ev["title"],
+            "original_title": ev.get("original_title", ev["title"]),
             "country": ev["country"],
             "impact": ev["impact"],
             "forecast": ev.get("forecast"),
@@ -201,6 +202,7 @@ async def put_my_news_settings(
 @router.post("/refresh")
 async def refresh_my_news(
     request: Request,
+    background_tasks: BackgroundTasks,
     p: Principal = Depends(get_principal),
 ):
     """手动强制刷新一次财经日历（排障用，限频 60 秒一次）。"""
@@ -219,6 +221,7 @@ async def refresh_my_news(
     else:
         result = await economic_calendar.refresh_events()
 
+    background_tasks.add_task(economic_calendar.translate_recent_events)
     await persist.audit(
         p.username, "refresh_news_calendar", p.username,
         {"ok": bool(result.get("ok"))}, "ok" if result.get("ok") else "failed",

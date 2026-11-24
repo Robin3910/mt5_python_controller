@@ -207,6 +207,14 @@ class EconomicEvent(Base):
     )
 
 
+class EconomicEventTranslation(Base):
+    __tablename__ = "economic_event_translation"
+
+    country: Mapped[str] = mapped_column(String(8), primary_key=True)
+    title: Mapped[str] = mapped_column(String(160), primary_key=True)
+    title_zh: Mapped[str] = mapped_column(String(160))
+
+
 class UserNewsSettings(Base):
     """用户的财经日历黑名单设置（每人一行）。
 

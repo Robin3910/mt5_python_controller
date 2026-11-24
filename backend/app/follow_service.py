@@ -17,6 +17,7 @@ from typing import Optional
 
 from sqlalchemy import delete, func, select
 
+from . import follow_rules
 from .db import SessionLocal
 from .group_service import _load_group
 from .orm import GroupFollowerNode, Node, TradingStrategy
@@ -265,7 +266,7 @@ async def _add_following(
 async def write_following(
     s, *, group_id: str, node_id: str, follower_user_id: int, leader_user_id: int,
     leader_primary_node_id: Optional[str], follow_state: str = "running",
-    restart_stopped: bool = True,
+    restart_stopped: bool = True, leader_paused: bool = False,
 ) -> bool:
     """在调用方事务中写入关系，使审批与审计能一起提交。"""
     node = await s.get(Node, node_id)
@@ -280,17 +281,38 @@ async def write_following(
         if not restart_stopped or exists.follow_state != "stopped" or exists.follower_user_id != int(follower_user_id):
             return False
         exists.follow_state = follow_state
-        exists.leader_paused = False
+        exists.leader_paused = leader_paused
         exists.joined_at = datetime.now()
         exists.leader_user_id = int(leader_user_id)
         exists.leader_primary_node_id = leader_primary_node_id
     else:
         s.add(GroupFollowerNode(
             group_id=group_id, node_id=node_id, follower_user_id=int(follower_user_id),
-            follow_state=follow_state, leader_user_id=int(leader_user_id),
+            follow_state=follow_state, leader_paused=leader_paused, leader_user_id=int(leader_user_id),
             leader_primary_node_id=leader_primary_node_id, sort_order=0,
         ))
     return True
+
+
+async def inheritance_sources(
+    target_group: dict, groups: list[dict], primary_node_id: str,
+) -> tuple[str | None, list[str]]:
+    """查找同一带单员、同市场的来源分组，保留停用分组中的跟单关系。"""
+    group_id = target_group["group_id"]
+    owner = target_group.get("owner_user_id")
+    sources = [
+        g for g in groups if isinstance(g, dict) and g.get("group_id") != group_id
+        and follow_rules.is_leader_source_group(g, owner, primary_node_id)
+    ]
+    strategy_ids = {g["strategy_id"] for g in [target_group, *sources] if g.get("strategy_id")}
+    templates = await template_ids_from_db(strategy_ids)
+    target_template_id = templates.get(str(target_group.get("strategy_id") or ""))
+    market = follow_rules.market_for_template(target_template_id)
+    if market:
+        sources = [
+            g for g in sources if follow_rules.template_in_market(templates.get(g.get("strategy_id")), market)
+        ]
+    return target_template_id, [g["group_id"] for g in sources]
 
 
 async def adopt_followers_for_group(
@@ -298,10 +320,12 @@ async def adopt_followers_for_group(
     *,
     target_group: dict,
     source_group_ids: list[str],
+    target_template_id: str | None = None,
+    limit_watch_node_id: str | None = None,
     actor=None,
     ip: str | None = None,
 ) -> tuple[list[dict], list[dict]]:
-    """将来源已生效节点转为目标分组待审申请，按节点去重并保留运行状态。"""
+    """普通带单继承自动批准，AI 和未绑定策略的分组沿用待审流程。"""
     target_gid = str((target_group or {}).get("group_id") or "").strip()
     src_ids = [
         str(g).strip() for g in (source_group_ids or [])
@@ -319,8 +343,18 @@ async def adopt_followers_for_group(
 
     adopted: list[dict] = []
     skipped: list[dict] = []
-    strategy = await store.get_strategy(target_group.get("strategy_id")) if target_group.get("strategy_id") else None
-    if strategy and strategy.get("template_id") == "tpl_1":
+    if target_template_id is None and target_group.get("strategy_id"):
+        sid = target_group["strategy_id"]
+        target_template_id = (await template_ids_from_db({sid})).get(sid)
+        if not target_template_id:
+            return [], [{"node_id": nid, "reason": "无法核实目标策略的带单市场"} for nid in seen]
+    if follow_rules.template_in_market(target_template_id, follow_rules.FOLLOW_MARKET_TEMPLATE_IDS):
+        from .follow_inheritance import approve_inherited
+        return await approve_inherited(
+            store, target_group, src_ids, list(seen), actor, ip,
+            limit_watch_node_id=limit_watch_node_id,
+        )
+    if target_template_id == "tpl_1":
         from . import ai_application_store, rbac_service, user_service
         by_user: dict[int, list[str]] = {}
         async with SessionLocal() as session:

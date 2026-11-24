@@ -216,6 +216,8 @@ export interface NodeOut {
   is_primary?: boolean
 }
 
+export type StrategyOpeningMethod = 'trend_market' | 'trend_limit' | 'grid' | 'ai'
+
 export interface Position {
   ticket: number
   symbol: string
@@ -234,6 +236,7 @@ export interface Position {
    * 前端据此识别 AI 智能加仓（`tpl_1`）的仓位。
    */
   ai_template?: string
+  opening_method?: StrategyOpeningMethod | null
 }
 
 export interface QuoteInfo {
@@ -262,6 +265,7 @@ export interface PendingOrder {
   price_current?: number
   /** 所属策略子任务的模版 ID（后端按魔术号反查后补上；对不上 / 老节点无此字段） */
   ai_template?: string
+  opening_method?: StrategyOpeningMethod | null
 }
 
 export interface AccountSnapshot {
@@ -722,11 +726,10 @@ export interface GroupCreatePayload {
 
 /**
  * 认领跟单节点的结果（POST /api/groups/{id}/adopt-followers）。
- * 带单员新建分组时，为既有跟单节点生成待审申请。
+ * 普通带单分组自动批准继承申请，AI 分组仍需人工审核。
  */
 export interface AdoptFollowersResult {
-  /** 审核通过后才进入生效分组。 */
-  adopted: { node_id: string; follower_user_id: number; from_group_id?: string | null; request_id: number; status: 'pending' }[]
+  adopted: { node_id: string; follower_user_id: number; from_group_id?: string | null; request_id: number; status: 'pending' | 'approved' }[]
   /** 因已存在或源信息缺失而未写入的条目 */
   skipped: { node_id: string; reason?: string }[]
   /** 参与扫描的来源分组数（不含目标分组自身） */
@@ -1599,6 +1602,7 @@ export interface DealRecord {
   signal_id: string | null
   task_id: number | null
   group_id: string | null
+  opening_method?: StrategyOpeningMethod | null
   /** 成交时间（Unix 秒） */
   deal_time: number
 }

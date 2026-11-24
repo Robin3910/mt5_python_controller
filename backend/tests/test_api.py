@@ -278,6 +278,82 @@ def test_account_login_mismatch_disconnects(client):
         assert msg["data"]["reason"] == "mt5_login_mismatch"
 
 
+def test_account_snapshots_include_strategy_opening_methods(client, monkeypatch):
+    from app.connections import manager
+    from app.db import SessionLocal
+    from app.orm import GroupSignalTask, GroupTaskDispatch
+    from app.state import state
+
+    headers = _auth(client)
+    token = _node_token(client, headers)
+    login = 6103
+    r = client.post("/api/nodes", json={"name": "开仓方式节点", "mt5_login": login}, headers=headers)
+    assert r.status_code == 201, r.text
+    node_id = r.json()["node_id"]
+    market = {"template_id": "tpl_2", "rules": [{"type": 3, "status": 1}]}
+    limit = {"template_id": "tpl_2", "rules": [{"type": 3, "status": 1, "entry_mode": "limit"}]}
+    grid = {"template_id": "tpl_3"}
+    snapshots = [
+        (node_id, 801, market), (node_id, 802, market), (node_id, 802, limit),
+        (node_id, 803, grid), (node_id, 804, {"template_id": "tpl_1"}), ("nd_other", 802, grid),
+    ]
+
+    async def seed_tasks():
+        async with SessionLocal() as s:
+            tasks = [
+                GroupSignalTask(signal_id=f"sig_{i}", group_id=f"grp_{i}", strategy_snapshot_json=snapshot)
+                for i, (_, _, snapshot) in enumerate(snapshots)
+            ]
+            s.add_all(tasks)
+            await s.flush()
+            s.add_all([
+                GroupTaskDispatch(
+                    task_id=task.task_id, signal_id=task.signal_id, group_id=task.group_id,
+                    node_id=owner_node, magic=magic, status="done",
+                )
+                for task, (owner_node, magic, _) in zip(tasks, snapshots)
+            ])
+            await s.commit()
+
+    client.portal.call(seed_tasks)
+    positions = [
+        {"magic": magic, "ticket": i, "symbol": "XAUUSD", "volume": 0.1}
+        for i, magic in enumerate([801, 802, 803, 804, 899, 0], start=1)
+    ]
+    orders = [{"magic": 802, "ticket": 100, "symbol": "XAUUSD", "volume": 0.2}]
+    broadcasts = []
+
+    async def capture(message):
+        if message["type"] == "account":
+            broadcasts.append(message["data"])
+
+    monkeypatch.setattr(manager, "broadcast_admin", capture)
+    with client.websocket_connect("/ws/node") as ws:
+        ws.send_json({"type": "auth", "data": {"token": token, "mt5_login": login}})
+        assert ws.receive_json()["type"] == "auth_ok"
+        ws.send_json({"type": "account", "data": {
+            "account": {"login": login}, "positions": positions, "orders": orders, "books_ok": True,
+        }})
+        ws.send_json({"type": "heartbeat", "data": {}})
+        for _ in range(3):
+            if ws.receive_json()["type"] == "pong":
+                break
+        else:
+            pytest.fail("node did not acknowledge the heartbeat")
+
+    assert len(broadcasts) == 1
+    client.portal.call(state.store.save_account, node_id, {"positions": positions, "orders": orders})
+    r = client.get(f"/api/nodes/{node_id}/account", headers=headers)
+    assert r.status_code == 200, r.text
+
+    for snapshot in [broadcasts[0], r.json()]:
+        assert {row["magic"]: row.get("opening_method") for row in snapshot["positions"]} == {
+            801: "trend_market", 802: "trend_limit", 803: "grid", 804: "ai", 899: None, 0: None,
+        }
+        assert snapshot["positions"][3]["ai_template"] == "tpl_1"
+        assert snapshot["orders"][0]["opening_method"] == "trend_limit"
+
+
 def test_invalid_global_token_rejected(client):
     """非法全局令牌：直接拒绝，不暴露节点是否存在。"""
     with client.websocket_connect("/ws/node") as ws:
