@@ -16,6 +16,7 @@ from fastapi import HTTPException
 from . import group_rules, node_rpc, persist, strategy_templates
 from .connections import manager
 from .models import SIGNAL_MODEL_STRATEGY
+from .redis_store import RedisStore
 from .state import state
 
 logger = logging.getLogger(__name__)
@@ -430,6 +431,7 @@ async def _handle_one(
             await store.release_limit_watch_lock(node_id, ticket)
             return
 
+        follow_sync_failed = await _sync_limit_followers(store, node_id, ticket, passing, groups, strategies)
         payload = build_signal_payload(order, group_ids)
         raw = json.dumps({"order": snap, "node_id": node_id, "group_ids": group_ids}, ensure_ascii=False)
         result = await _dispatch(payload, raw_payload=raw, dedup_key=f"{node_id}:{ticket}")
@@ -455,6 +457,7 @@ async def _handle_one(
                 "cancel": {"success": True, "ticket": ticket},
                 "group_ids": group_ids,
                 "group_names": group_names,
+                "follow_sync_failed_group_ids": follow_sync_failed,
             },
         )
         await _emit_group_logs(
@@ -469,6 +472,33 @@ async def _handle_one(
     except Exception:  # noqa: BLE001
         await store.release_limit_watch_lock(node_id, ticket)
         raise
+
+
+async def _sync_limit_followers(
+    store: RedisStore, node_id: str, ticket: int, passing: list[dict], groups: list[dict], strategies: dict[str, dict],
+) -> list[str]:
+    from . import follow_service
+
+    failed = []
+    for group in passing:
+        strategy = strategies.get(str(group.get("strategy_id") or "").strip(), {})
+        rule = strategy_templates.pick_risk_sized_rule(strategy.get("rules"))
+        if not group.get("owner_user_id") or not strategy_templates.is_limit_entry(rule):
+            continue
+        group_id = group["group_id"]
+        try:
+            template_id, source_ids = await follow_service.inheritance_sources(group, groups, node_id)
+            if not template_id:
+                raise RuntimeError("无法核实目标策略的带单市场")
+            if template_id == strategy_templates.TEMPLATE_2_ID and source_ids:
+                await follow_service.adopt_followers_for_group(
+                    store, target_group=group, target_template_id=template_id, source_group_ids=source_ids,
+                    limit_watch_node_id=node_id,
+                )
+        except Exception:  # noqa: BLE001
+            failed.append(group_id)
+            logger.exception("limit_watch follower sync failed node %s ticket %s group %s", node_id, ticket, group_id)
+    return failed
 
 
 async def _dispatch(payload: dict, *, raw_payload: str, dedup_key: str) -> dict:

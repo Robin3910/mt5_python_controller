@@ -104,10 +104,6 @@ def _positions_by_magic(positions: list) -> dict[int, list[dict]]:
 KIND_POSITION = "position"
 KIND_ORDER = "order"
 
-# 限价开仓撤单确认轮数：连续 N 轮快照都判定「挂单净减少」才同步撤单。
-# 单轮读数可能抖（快照在成交瞬间到达），3 轮（约 15 秒）足以滤掉瞬时假象。
-PENDING_CANCEL_CONFIRM = 3
-
 
 def _snapshot_rows(positions: list) -> list[dict]:
     """把持仓精简成基线需要的字段（全量持仓太大，且我们只关心这几列）。"""
@@ -193,50 +189,30 @@ def _count_by_magic(rows: list[dict], kind: str) -> dict[int, int]:
     return out
 
 
-def _pending_cancelled(
-    baseline: list[dict], current: list[dict],
-) -> dict[int, int]:
-    """本轮「疑似被撤掉」的挂单笔数（按 magic）：`挂单净减 - 本轮新增持仓笔数`。
+def _order_book(rows: list[dict]) -> dict[str, dict]:
+    """把挂单行压成 `{magic: {"count": n, "tickets": [...]}}` 形式的挂单基线。
 
-    单轮无法区分「撤单」和「成交」：一张挂单消失时，成交会让持仓 +1，撤单不会。
-    所以这里先给出**疑似值**，由 `note_pending_cancel_hits` 跨轮区分：
-
-    - 挂单消失后「持仓恰好 +1，且之后一直不再变化」= 成交；
-    - 一旦该 magic 再无新变化（下一轮持仓没再涨），上一轮的 (+1, -1) 就只可能
-      是撤单了 —— 这时才把疑似值算作撤单，延续连续确认计数。
+    与持仓基线分开存的原因见 `RedisStore.get_leader_order_book`。
     """
-    base_orders = _count_by_magic(baseline, KIND_ORDER)
-    cur_orders = _count_by_magic(current, KIND_ORDER)
-    gained_pos = _gained_positions(baseline, current)
-    out: dict[int, int] = {}
-    for magic, base in base_orders.items():
-        cur = cur_orders.get(magic, 0)
-        lost_orders = base - cur
-        cancelled = lost_orders - max(gained_pos.get(magic, 0), 0)
-        if cancelled > 0:
-            out[magic] = cancelled
+    out: dict[str, dict] = {}
+    for row in rows or []:
+        if str(row.get("kind") or KIND_POSITION) != KIND_ORDER:
+            continue
+        magic = _int(row.get("magic"))
+        if magic is None:
+            continue
+        key = str(magic)
+        item = out.setdefault(key, {"count": 0, "tickets": []})
+        item["count"] = int(item["count"]) + 1
+        ticket = _int(row.get("ticket"))
+        if ticket is not None:
+            item["tickets"].append(ticket)
     return out
 
 
-def _gained_positions(baseline: list[dict], current: list[dict]) -> dict[int, int]:
-    """各 magic 本轮新增的持仓笔数（max(当前笔数 - 基线笔数, 0)）。"""
-    base_pos = _count_by_magic(baseline, KIND_POSITION)
-    cur_pos = _count_by_magic(current, KIND_POSITION)
-    return {
-        magic: max(cnt - base_pos.get(magic, 0), 0)
-        for magic, cnt in cur_pos.items()
-    }
-
-
-def _order_lost(baseline: list[dict], current: list[dict]) -> dict[int, int]:
-    """各 magic 本轮「挂单减少」的笔数（不看持仓）。"""
-    base_orders = _count_by_magic(baseline, KIND_ORDER)
-    cur_orders = _count_by_magic(current, KIND_ORDER)
-    return {
-        magic: base - cur_orders.get(magic, 0)
-        for magic, base in base_orders.items()
-        if base - cur_orders.get(magic, 0) > 0
-    }
+def _order_book_counts(rows: list[dict]) -> dict[int, int]:
+    """本轮挂单行按 magic 归集（只取 kind=order）。"""
+    return _count_by_magic(rows, KIND_ORDER)
 
 
 async def _leader_groups_of(store: RedisStore, node_id: str) -> list[dict]:
@@ -291,43 +267,92 @@ def _is_limit_risk_sized(snapshot: object) -> bool:
     return bool(rule) and strategy_templates.is_limit_entry(rule)
 
 
-def _active_order_magics(baseline: list[dict], current: list[dict]) -> dict[int, int]:
-    """本轮仍存在挂单的 magic（`{magic: 挂单笔数}`），用于给静默轮续期。
-
-    只对「上一轮有挂单、本轮还有」的 magic 计数 —— 挂单全没了就不再续期，
-    确认计数会随时间自然过期，不会影响之后新一轮的撤单检出。
-    """
-    cur_orders = _count_by_magic(current, KIND_ORDER)
-    return {
-        magic: cur_orders.get(magic, 0)
-        for magic in _count_by_magic(baseline, KIND_ORDER)
-        if cur_orders.get(magic, 0) > 0
-    }
-
-
-async def _confirm_pending_cancelled(
-    store: RedisStore, node_id: str, hits: dict[int, int],
-    *, order_lost: Optional[dict[int, int]] = None,
-    gained: Optional[dict[int, int]] = None,
-    live_orders: Optional[dict[int, int]] = None,
+async def _detect_pending_cancelled(
+    store: RedisStore, node_id: str, current: list[dict],
+    *, positions: list[dict],
 ) -> set[int]:
-    """按本轮检出的疑似撤单 magic 推进连续计数，返回已确认（连续 N 轮）的 magic。
+    """基于**挂单基线记忆**检出「主节点的限价挂单被撤光」。
 
-    `hits`: 本轮疑似撤单 {magic: 笔数}（`_pending_cancelled` 的结果）。
-    `order_lost`: 本轮各 magic 挂单减少笔数（不看持仓）。
-    `gained`: 本轮各 magic 新增持仓笔数。
-    `live_orders`: 本轮仍有挂单的 magic（给等待中的疑似撤单续期）。
+    为什么不用「本轮净减少」：挂单消失的那一轮，持仓基线里的挂单行也一起
+    被覆盖成空 —— 下一轮再对比就看不出「曾经挂过单」。用户手动撤单恰好
+    撞在这个窗口里，撤单检出就永远不触发（跟单节点的挂单留在盘上）。
 
-    单轮「挂单 -1、持仓 +1」无法区分成交与撤单；连续 `PENDING_CANCEL_CONFIRM`
-    轮（约 15 秒）挂单都没有回来，才确认是撤单。
-    跨轮状态记在 Redis 里（服务多进程 / 重启后连续确认不失效），带上一轮的
-    (挂单减少, 持仓增加)，用来把成交那一段扣掉。
+    这里用一份**独立的挂单基线**（`leader_order_book`）记住每个魔术号
+    曾经挂过多少张：
+    - 基线里记着 N 张，本轮一张都没有 -> 挂单被撤光 -> 撤单；
+    - 本轮还剩几张 -> 只是部分撤单，继续等（但要记住撤过，等它归零时才算）。
+
+    成交不会被误判：成交会让持仓 +1、挂单等量减少，本轮仍有挂单时
+    继续等；只有「挂单归零 **且** 持仓没有相应增加」才判撤单。
+
+    返回已确认撤单的 magic 集合。
     """
-    return await store.note_pending_cancel_hits(
-        node_id, hits, confirm=PENDING_CANCEL_CONFIRM,
-        order_lost=order_lost, gained=gained,
-        live_orders=live_orders,
-    )
+    book = await store.get_leader_order_book(node_id)
+    cur_counts = _order_book_counts(current)
+    cur_pos = _count_by_magic(positions, KIND_POSITION)
+    confirmed: set[int] = set()
+    next_book: dict[str, dict] = {}
+    prev_book = book or {}
+
+    for key, prev in prev_book.items():
+        try:
+            magic = int(key)
+        except (TypeError, ValueError):
+            continue
+        prev_count = int((prev or {}).get("count") or 0)
+        if prev_count <= 0:
+            continue
+        cur = int(cur_counts.get(magic, 0))
+        pos_now = int(cur_pos.get(magic, 0))
+        pos_prev = int((prev or {}).get("position_count") or 0)
+        if cur >= prev_count:
+            # 挂单还在（数量没少）：不是撤单，继续记住基线。
+            next_book[key] = {
+                "count": cur,
+                "tickets": list((prev or {}).get("tickets") or []),
+                "position_count": pos_now,
+            }
+            continue
+        # 挂单比基线少了：可能是撤单，也可能是成交（成交 → 持仓 +1）。
+        filled = max(pos_now - pos_prev, 0)
+        lost = prev_count - cur
+        cancelled = lost - filled
+        if cancelled <= 0:
+            # 减少量能被持仓增长解释 -> 是成交，不是撤单。继续等。
+            next_book[key] = {
+                "count": cur,
+                "tickets": list((prev or {}).get("tickets") or []),
+                "position_count": pos_now,
+            }
+            continue
+        if cur > 0:
+            # 部分撤单：还剩几张挂单在盘上。等它们也归零再确认 ——
+            # 但要把「撤过几张」记下来，避免下一轮基线被覆盖后忘了。
+            next_book[key] = {
+                "count": cur,
+                "tickets": list((prev or {}).get("tickets") or []),
+                "position_count": pos_now,
+                "cancelled": int((prev or {}).get("cancelled") or 0) + cancelled,
+            }
+            continue
+        # 挂单归零，且减少量无法用成交解释 -> 撤单。
+        # 不写进 next_book：这一批挂单已经结束，下一轮不该再检出同一批。
+        confirmed.add(magic)
+
+    # 本轮仍挂着的单：记进基线。已经确认撤单的魔术号若又挂上了新的单
+    # （策略重新挂单），也要能重新跟踪 —— 否则新挂的单被撤掉时检不出来。
+    for magic, cnt in cur_counts.items():
+        key = str(magic)
+        if key in next_book:
+            continue
+        next_book[key] = {
+            "count": cnt,
+            "tickets": [],
+            "position_count": int(cur_pos.get(magic, 0)),
+        }
+
+    await store.set_leader_order_book(node_id, next_book)
+    return confirmed
 
 
 async def _send_cancel_pending_to_node(
@@ -381,7 +406,10 @@ async def _sync_cancel_pending(
     返回 {sent, queued, finished, reason}。
     """
     out = {"sent": 0, "queued": 0, "finished": 0, "released": [], "reason": None}
-    leader_subs = await group_persist.active_subtasks_for_magic(
+    # 主节点子任务**不能**只查非终态：主节点撤掉挂单后，它自己的子任务通常
+    # 已经被账户对账收口成 done（挂单消失 → 该魔术号没痕迹 → 自动收口）。
+    # 只查活动子任务会查不到 → 撤单指令永远发不出去 → 跟单节点的挂单成孤儿。
+    leader_subs = await group_persist.subtasks_for_magic(
         group["group_id"], leader_node_id, leader_magic,
     )
     if not leader_subs:
@@ -675,6 +703,10 @@ async def on_snapshot(store: RedisStore, node_id: str, positions: list,
         # 服务重启后基线为空，若直接对比会把「当前所有持仓」判成「新开的」，
         # 反过来还会把「空基线」当成「上一轮空仓」而漏掉所有平仓。
         await store.set_leader_snapshot(node_id, current)
+        # 挂单基线也要建：撤单检出靠它记住「曾经挂过多少张」。
+        await store.set_leader_order_book(
+            node_id, _order_book(current),
+        )
         return result
 
     lost = _lost_tickets(baseline, current)
@@ -716,12 +748,10 @@ async def on_snapshot(store: RedisStore, node_id: str, positions: list,
                 node_id, result["sent"], result["queued"], result["skipped"],
             )
 
-    # 撤单检出：tpl_2 限价开仓挂单减少 -> 跨轮确认（区分成交与撤单）
-    cancelled = await _confirm_pending_cancelled(
-        store, node_id, _pending_cancelled(baseline, current),
-        order_lost=_order_lost(baseline, current),
-        gained=_gained_positions(baseline, current),
-        live_orders=_active_order_magics(baseline, current),
+    # 撤单检出：tpl_2 限价开仓挂单被撤光 -> 同步撤单到跟单节点。
+    # 用独立的「挂单基线记忆」判定，不依赖本轮净减少（净减少会被基线覆写抹平）。
+    cancelled = await _detect_pending_cancelled(
+        store, node_id, current, positions=_snapshot_rows(positions),
     )
     if cancelled:
         for group in groups:

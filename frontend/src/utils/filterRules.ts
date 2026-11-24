@@ -1,4 +1,5 @@
 import type {
+  AiEntryRule,
   DefaultFilterAction,
   FilterDirection,
   FilterInterval,
@@ -12,6 +13,17 @@ export function createEmptyInterval(): FilterInterval {
   return { low: 0, high: 0, allow: ['BUY'] }
 }
 
+/** AI 开仓准入的默认结构：默认**不启用**（存量配置零行为变化）。 */
+export function createEmptyAiEntryRule(): AiEntryRule {
+  return {
+    enabled: false,
+    allow_buy: true,
+    allow_sell: true,
+    default_action: 'block',
+    intervals: [],
+  }
+}
+
 export function createEmptySymbolRule(): SymbolFilterRule {
   return {
     enabled: true,
@@ -23,6 +35,7 @@ export function createEmptySymbolRule(): SymbolFilterRule {
     lot_enabled: false,
     lot: 0.01,
     intervals: [],
+    ai_entry: createEmptyAiEntryRule(),
   }
 }
 
@@ -72,6 +85,29 @@ function normalizeInterval(raw: unknown): FilterInterval | null {
   return { low, high, allow }
 }
 
+/**
+ * 归一化 AI 开仓准入子块。
+ *
+ * 与服务端 `ai_entry_guard.normalize_ai_entry` 同口径：
+ * 缺失 / 非对象 → 未启用；非法区间整条丢弃（不影响其它区间）。
+ */
+function normalizeAiEntry(raw: unknown): AiEntryRule {
+  const base = createEmptyAiEntryRule()
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return base
+  const o = raw as Record<string, unknown>
+  const intervalsRaw = Array.isArray(o.intervals) ? o.intervals : []
+  const intervals = intervalsRaw
+    .map(normalizeInterval)
+    .filter((iv): iv is FilterInterval => iv !== null)
+  return {
+    enabled: o.enabled === true,
+    allow_buy: o.allow_buy !== false,
+    allow_sell: o.allow_sell !== false,
+    default_action: o.default_action === 'pass' ? 'pass' : 'block',
+    intervals,
+  }
+}
+
 function normalizeDispatchMode(raw: unknown): 'sync' | 'poll' {
   return raw === 'poll' ? 'poll' : 'sync'
 }
@@ -103,6 +139,7 @@ function normalizeSymbolRule(raw: unknown): SymbolFilterRule {
     lot_enabled: o.lot_enabled === true,
     lot: Number.isFinite(lot) && lot > 0 ? lot : 0.01,
     intervals,
+    ai_entry: normalizeAiEntry(o.ai_entry),
   }
 }
 
@@ -159,6 +196,7 @@ export function serializeFilterRules(rules: FilterRulesConfig): FilterRulesConfi
   for (const [symbol, rule] of Object.entries(rules)) {
     const key = symbol.trim().toUpperCase()
     if (!key) continue
+    const ai = rule.ai_entry
     out[key] = {
       enabled: rule.enabled !== false,
       allow_buy: rule.allow_buy !== false,
@@ -175,6 +213,21 @@ export function serializeFilterRules(rules: FilterRulesConfig): FilterRulesConfi
           .map((d) => String(d).toUpperCase())
           .filter((d): d is FilterDirection => d === 'BUY' || d === 'SELL'),
       })),
+      ai_entry: ai
+        ? {
+            enabled: ai.enabled === true,
+            allow_buy: ai.allow_buy !== false,
+            allow_sell: ai.allow_sell !== false,
+            default_action: ai.default_action === 'pass' ? 'pass' : 'block',
+            intervals: (ai.intervals ?? []).map((iv) => ({
+              low: Number(iv.low),
+              high: Number(iv.high),
+              allow: (iv.allow ?? [])
+                .map((d) => String(d).toUpperCase())
+                .filter((d): d is FilterDirection => d === 'BUY' || d === 'SELL'),
+            })),
+          }
+        : undefined,
     }
   }
   return out
@@ -229,6 +282,24 @@ export function validateFilterRules(rules: FilterRulesConfig): string[] {
         errors.push(`${label}：请至少勾选一个允许方向（做多/做空）`)
       }
     })
+
+    // AI 开仓准入（tpl_1）：只有启用时才校验区间
+    const ai = rule.ai_entry
+    if (ai?.enabled) {
+      ai.intervals.forEach((iv, idx) => {
+        const label = `${key} AI 开仓准入 第 ${idx + 1} 条区间`
+        if (!Number.isFinite(iv.low) || !Number.isFinite(iv.high)) {
+          errors.push(`${label}：价格上下限必须为有效数字`)
+          return
+        }
+        if (iv.low >= iv.high) {
+          errors.push(`${label}：价格下限必须小于上限`)
+        }
+        if (!iv.allow?.length) {
+          errors.push(`${label}：请至少勾选一个允许方向（做多/做空）`)
+        }
+      })
+    }
   }
 
   return errors

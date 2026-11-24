@@ -101,7 +101,7 @@ def test_channel_pause_remove_and_cache_recovery(client):
     assert apply(client, d)["pending"]
 
 
-def test_new_group_inheritance_requires_review(client):
+def test_unbound_group_inheritance_requires_review(client):
     d = setup(client)
     approve(client, d, apply(client, d)["pending"][0]["request_id"])
     target = _group_with_primary(client, d["leader"], [d["primary"]], "新带单分组")

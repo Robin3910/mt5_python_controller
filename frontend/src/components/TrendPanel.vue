@@ -619,25 +619,25 @@ onBeforeUnmount(() => {
           <i></i>{{ homeRunLabel }}
         </span>
       </div>
-      <div v-if="symbolOptions?.length" class="home-symbols">
-        <button
-          v-for="s in symbolOptions"
-          :key="s"
-          type="button"
-          class="home-sym"
-          :class="{ active: s === symbol }"
-          @click="pickSymbol(s)"
-        >{{ s }}</button>
+      <div class="home-quote-row">
+        <div v-if="symbolOptions?.length" class="home-symbols">
+          <button
+            v-for="s in symbolOptions"
+            :key="s"
+            type="button"
+            class="home-sym"
+            :class="{ active: s === symbol }"
+            @click="pickSymbol(s)"
+          >{{ s }}</button>
+        </div>
+        <p v-else class="home-hint">该节点暂无报价与持仓品种。</p>
+        <div class="home-price">{{ fmtPrice(data?.price) }}</div>
       </div>
-      <p v-else class="home-hint">该节点暂无报价与持仓品种。</p>
 
-      <div class="home-price-row">
-        <div>
-          <div class="home-price">{{ fmtPrice(data?.price) }}</div>
-          <div v-if="homeDelta" class="home-delta" :class="homeDelta.delta >= 0 ? 'is-up' : 'is-down'">
-            <span>{{ fmtHomeMove(homeDelta.delta, homeMoveDigits) }}</span>
-            <span class="home-delta-pct">{{ fmtHomeMove(homeDelta.pct, 2) }}%</span>
-          </div>
+      <div class="home-delta-row">
+        <div v-if="homeDelta" class="home-delta" :class="homeDelta.delta >= 0 ? 'is-up' : 'is-down'">
+          <span>{{ fmtHomeMove(homeDelta.delta, homeMoveDigits) }}</span>
+          <span class="home-delta-pct">{{ fmtHomeMove(homeDelta.pct, 2) }}%</span>
         </div>
         <button type="button" class="home-config-hint" @click="openHomeConfig">
           权重 / 阈值 / 更新时间<br>请在配置页查看
@@ -1145,10 +1145,12 @@ onBeforeUnmount(() => {
 .home-run.bearish i { background: #ef4444; }
 .home-run.bullish { color: #34d399; }
 .home-run.bullish i { background: #22c55e; }
+.home-quote-row { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
+.home-quote-row > .home-hint { margin: 0; }
 .home-symbols {
   display: flex;
   gap: 6px;
-  margin-top: 10px;
+  min-width: 0;
   overflow-x: auto;
   scrollbar-width: none;
 }
@@ -1172,27 +1174,29 @@ onBeforeUnmount(() => {
   color: #fff;
   box-shadow: 0 2px 8px rgba(37, 99, 235, 0.4);
 }
-.home-price-row {
+.home-delta-row {
   display: flex;
   align-items: flex-end;
-  justify-content: space-between;
   gap: 12px;
   margin-top: 14px;
 }
 .home-price {
-  font-size: 36px;
+  flex-shrink: 0;
+  margin-left: auto;
+  font-size: 18px;
   line-height: 1;
   font-weight: 650;
-  color: #E6EBF4;
+  color: #fff;
   font-variant-numeric: tabular-nums;
   letter-spacing: -0.03em;
+  white-space: nowrap;
 }
-.home-delta { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.home-delta { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .home-delta.is-up { color: #34d399; }
 .home-delta.is-down { color: #f87171; }
 .home-delta-pct { border-radius: 6px; padding: 1px 6px; background: rgba(255, 255, 255, 0.06); }
 .home-config-hint {
-  margin: 0;
+  margin: 0 0 0 auto;
   max-width: 150px;
   padding: 0;
   border: none;
@@ -1254,7 +1258,7 @@ onBeforeUnmount(() => {
 @media (max-width: 1023px) {
   .home-trend { gap: 12px; }
   .home-card { padding: 12px; }
-  .home-price { font-size: 32px; }
+  .home-price { font-size: 16px; }
   .home-chart { height: 300px; }
 }
 

@@ -21,6 +21,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from . import (
     deal_stats,
     follow_rules,
+    my_follow,
+    node_lifecycle,
     follow_service,
     group_persist,
     permissions,
@@ -40,6 +42,7 @@ from .models import (
     FollowMeResponse,
     FollowPauseRequest,
     FollowPauseResponse,
+    FollowStateRequest,
 )
 from .permissions import MENU_FOLLOW, Principal
 from .redis_store import RedisStore
@@ -476,6 +479,7 @@ async def list_my_followings(
 
     following_out: list[dict] = []
     # 「我已跟」节点总数（只算带单市场）—— 与 leader 上的口径一致
+    owned_by_id = {n["node_id"]: n for n in _owned_nodes(all_nodes, p.user_id)}
     market_node_total = 0
     for lid, items in sorted(by_leader.items()):
         user = await user_service.get_user_by_id(lid)
@@ -510,13 +514,23 @@ async def list_my_followings(
                 reason, paused = follow_rules.PAUSED_FOLLOW_REASON, True
             else:
                 reason, paused = None, False
-            node_ids = {f["node_id"] for f in fs}
+            fs = [f for f in fs if f["node_id"] in owned_by_id]
+            if not fs:
+                continue
             template_id = tmpl_map.get(str(g.get("strategy_id") or ""))
+            strategy = strategies.get(g.get("strategy_id")) or {}
+            mode = None
+            if template_id == strategy_templates.TEMPLATE_3_ID:
+                mode = "grid"
+            elif template_id == strategy_templates.TEMPLATE_2_ID and strategy:
+                rule = strategy_templates.pick_risk_sized_rule(strategy.get("rules"))
+                mode = "trend_limit" if strategy_templates.is_limit_entry(rule) else "trend_market"
             groups_out.append({
+                "mode": mode,
                 "group_id": gid,
                 "group_name": g.get("name"),
-                "symbol": (strategies.get(g.get("strategy_id")) or {}).get("symbol") or g.get("strategy_symbol"),
-                "strategy_name": (strategies.get(g.get("strategy_id")) or {}).get("name") or g.get("strategy_name"),
+                "symbol": strategy.get("symbol") or g.get("strategy_symbol"),
+                "strategy_name": strategy.get("name") or g.get("strategy_name"),
                 # 模版 / 市场：前端据此把 AI 市场（tpl_1）的关系从【带单】列表里摘掉
                 "strategy_template": template_id or None,
                 "market": follow_rules.market_key_of(template_id),
@@ -527,15 +541,12 @@ async def list_my_followings(
                 "active_task_count": active_counts.get(gid, 0),
                 "my_nodes": [
                     {
-                        **_node_brief(next(
-                            (n for n in all_nodes if n.get("node_id") == f["node_id"]), None
-                        )),
+                        **_node_brief(owned_by_id[f["node_id"]]),
                         "joined_at": f.get("joined_at"),
                         "follow_state": f.get("follow_state", "running"),
                         "leader_paused": f.get("leader_paused", False),
                     }
                     for f in sorted(fs, key=lambda x: x.get("joined_at") or 0)
-                    if f["node_id"] in node_ids
                 ],
             })
         my_group_count, my_node_count = follow_rules.my_follow_counts_in_market(
@@ -560,10 +571,25 @@ async def list_my_followings(
             },
             "groups": groups_out,
         })
+    books = {g["group_id"]: g for item in following_out for g in item["groups"]
+             if g["market"] == "follow" and (g["marketable"] or g["paused"])}
+    node_ids = sorted({n["node_id"] for g in books.values() for n in g["my_nodes"]})
+    snapshots = await asyncio.gather(*(store.get_account(nid) for nid in node_ids))
+    accounts = {nid: account or {} for nid, account in zip(node_ids, snapshots)}
+    metrics = await my_follow.read_books(p.user_id, books, accounts)
+    for group in books.values():
+        for node in group["my_nodes"]:
+            account = accounts[node["node_id"]]
+            magics = set(group.get("magics", {}).get(node["node_id"], []))
+            node.update(
+                leverage=account.get("leverage"), balance=account.get("balance"), server=account.get("server"),
+                positions=[pos for pos in account.get("positions") or [] if pos.get("magic") in magics],
+            )
     return FollowMeResponse(
         following=following_out,
         applications=applications,
         summary={
+            **metrics,
             "following_count": len(by_leader),
             # 计数也只算带单市场的关系（与 leader 上的口径一致）
             "follow_node_count": market_node_total,
@@ -580,6 +606,18 @@ async def list_my_followings(
 # ---------------------------------------------------------------------------
 # 加入跟单
 # ---------------------------------------------------------------------------
+@router.post("/me/state")
+async def set_my_follow_state(body: FollowStateRequest, request: Request, store=Depends(get_store),
+                              p: Principal = Depends(require_menu(MENU_FOLLOW))):
+    try:
+        return await my_follow.set_state(store, p, body, client_ip(request))
+    except HTTPException as exc:
+        await persist.audit(p.username, "follow_pause_mine" if body.paused else "follow_resume_mine",
+                            params=body.model_dump(), result="failed", ip=client_ip(request),
+                            category="follow", after={"reason": exc.detail})
+        raise
+
+
 @router.post("/join", response_model=FollowJoinResponse)
 async def join_follow(
     body: FollowJoinRequest,
@@ -701,49 +739,44 @@ async def leave_follow(
     skipped: list[dict] = []
     stopped = 0
 
-    # 一次取全部分组 + 模版快照，循环内不逐个回源查 Redis
-    all_groups = {g["group_id"]: g for g in await store.all_groups()}
-    strategies = await _strategies_of(list(all_groups.values()), store)
-    tmpl_map = _template_ids_of(strategies)
-
-    for gid in body.group_ids:
-        gid = str(gid or "").strip()
+    keys = [node_lifecycle.node_key(nid) for nid in body.node_ids]
+    for gid in dict.fromkeys(body.group_ids):
+        gid = gid.strip()
         if not gid:
             continue
-        group = all_groups.get(gid) or await store.get_group(gid)
-        if not group:
-            continue
-        # 市场校验：AI 分组不在带单市场 -> 跳过，关系保持不变
-        skip_reason = follow_rules.leave_market_skip_reason(
-            tmpl_map.get(str(group.get("strategy_id") or "")),
-            follow_rules.FOLLOW_MARKET_TEMPLATE_IDS,
-        )
-        if skip_reason:
-            skipped.append({
-                "group_id": gid,
-                "group_name": group.get("name"),
-                "reason": skip_reason,
-            })
-            continue
-        node_ids = [
-            nid for nid in (body.node_ids or [])
-            if follow_service.follows_node(group, nid, p.user_id)
-        ]
-        if not node_ids:
-            continue
-        if body.close_tasks:
-            for nid in node_ids:
-                outcome = await _stop_following_subtasks(store, gid, nid)
-                if outcome["status"] == "closing":
-                    closing.append(outcome)
-                elif outcome["status"] == "forced":
-                    forced.append(outcome)
-                if outcome["status"] != "none":
-                    stopped += 1
-        await follow_service.remove_following(
-            store, group_id=gid, node_ids=node_ids, follower_user_id=p.user_id,
-        )
-        removed.append({"group_id": gid, "node_ids": node_ids})
+        async with node_lifecycle.locked(node_lifecycle.group_key(gid), *keys):
+            group = await store.get_group(gid)
+            if not group:
+                continue
+            strategy_id = str(group.get("strategy_id") or "")
+            templates = _template_ids_of(await _strategies_of([group], store))
+            if strategy_id and strategy_id not in templates:
+                templates.update(await follow_service.template_ids_from_db({strategy_id}))
+            reason = follow_rules.leave_market_skip_reason(templates.get(strategy_id), follow_rules.FOLLOW_MARKET_TEMPLATE_IDS)
+            if not permissions.same_owner(group.get("owner_user_id"), body.leader_user_id):
+                reason = "分组带单员已变更，请刷新"
+            if reason:
+                skipped.append({"group_id": gid, "group_name": group.get("name"), "reason": reason})
+                continue
+            node_ids = [
+                nid for nid in (body.node_ids or [])
+                if follow_service.follows_node(group, nid, p.user_id)
+            ]
+            if not node_ids:
+                continue
+            if body.close_tasks:
+                for nid in node_ids:
+                    outcome = await _stop_following_subtasks(store, gid, nid, follower_user_id=p.user_id)
+                    if outcome["status"] == "closing":
+                        closing.append(outcome)
+                    elif outcome["status"] == "forced":
+                        forced.append(outcome)
+                    if outcome["status"] != "none":
+                        stopped += 1
+            await follow_service.remove_following(
+                store, group_id=gid, node_ids=node_ids, follower_user_id=p.user_id,
+            )
+            removed.append({"group_id": gid, "node_ids": node_ids})
 
     warning = None
     if stopped and body.close_tasks is False:
@@ -777,14 +810,16 @@ class _Stub:
         self.username = f"user#{user_id}"
 
 
-async def _stop_following_subtasks(store: RedisStore, group_id: str, node_id: str) -> dict:
+async def _stop_following_subtasks(store: RedisStore, group_id: str, node_id: str, *, follower_user_id: int | None = None) -> dict:
     """终止某节点在某分组的在跑子任务；返回 closing / forced / none 三态之一。
 
     复用 group_dispatcher.close_subtask（在线下发 strategy_stop 标 closing，
     离线强制收口并把平仓入队等重连补发），不另写一套强平逻辑 —— 平仓口径
     必须与手动 CLOSE 完全一致，否则会出现「移出跟单平不掉仓」的口径分裂。
     """
-    from .group_dispatcher import group_dispatcher
+    from .group_dispatcher import GroupDispatcher
+
+    dispatcher = GroupDispatcher(store)
 
     outcome: dict = {
         "node_id": node_id, "group_id": group_id, "status": "none",
@@ -794,9 +829,12 @@ async def _stop_following_subtasks(store: RedisStore, group_id: str, node_id: st
         s for s in await group_persist.active_subtasks(group_id)
         if s.get("node_id") == node_id
     ]
+    if subs and follower_user_id is not None:
+        current = await my_follow.own_dispatches(follower_user_id, node_id, group_id, [s["dispatch_id"] for s in subs])
+        subs = [s for s in subs if s["dispatch_id"] in current]
     for sub in subs:
         try:
-            r = await group_dispatcher(store).close_subtask(
+            r = await dispatcher.close_subtask(
                 group_id, int(sub["dispatch_id"]), reason="leave_follow",
             )
         except ValueError:

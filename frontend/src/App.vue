@@ -88,8 +88,8 @@ watch(() => auth.token, setupWs)
     <header v-if="authed" class="topbar topbar-customer">
       <div class="topbar-customer-inner">
         <div class="brand brand-customer">
-          <template v-if="route.name === 'ai-trade' || route.name === 'ai-robot-detail'">
-            <button type="button" class="brand-back brand-back-ai" :aria-label="pageChrome || route.name === 'ai-robot-detail' ? '返回 AI 交易' : '返回首页'" @click="onCustomerBack">
+          <template v-if="route.name === 'ai-trade' || route.name === 'ai-robot-detail' || (route.name === 'follow' && pageChrome)">
+            <button type="button" class="brand-back brand-back-ai" :aria-label="route.name === 'follow' ? (pageChrome?.title === '我的跟单' ? '返回带单广场' : '返回上一页') : pageChrome || route.name === 'ai-robot-detail' ? '返回 AI 交易' : '返回首页'" @click="onCustomerBack">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg>
             </button>
             <p class="brand-page">{{ customerBackTitle }}</p>

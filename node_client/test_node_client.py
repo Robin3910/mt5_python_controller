@@ -357,6 +357,79 @@ async def test_reporter_sends_degraded_snapshot_when_books_unreadable(monkeypatc
     assert data["orders"] == []
 
 
+async def test_books_watch_resends_snapshot_when_orders_change(monkeypatch):
+    """挂单集合一变就立刻补报快照 —— 缩短「主节点撤单 -> 跟单撤单」的延迟。
+
+    常规上报间隔默认 5 秒；只靠它，主节点撤单后跟单节点的挂单最多要在盘上
+    多留 5 秒。books_watch 用 1 秒粒度盯挂单集合，变了就补发一份完整快照。
+    """
+    n = _node()
+    await n._exec(n.mt5.connect)
+    ws = FakeWS()
+    n._check_login = lambda acct: None  # type: ignore[method-assign]
+
+    state = {"orders": [{"ticket": 11, "magic": 5}]}
+    reads = {"n": 0}
+
+    def pending_orders():
+        """首轮读到 1 张挂单，之后读到 0 张（模拟用户撤单）。"""
+        reads["n"] += 1
+        return list(state["orders"]) if reads["n"] == 1 else []
+
+    n.mt5.pending_orders = pending_orders
+
+    async def fake_snap():
+        return {
+            "account": {"login": 90000001}, "positions": [], "orders": [],
+            "quotes": {}, "prices": {}, "books_ok": True, "mt5_link": "online",
+        }
+
+    n._snapshot = fake_snap  # type: ignore[method-assign]
+
+    calls = {"n": 0}
+    real_sleep = asyncio.sleep
+
+    async def sleep_and_count(delay):
+        calls["n"] += 1
+        if calls["n"] > 3:
+            raise asyncio.CancelledError
+        await real_sleep(0)
+
+    monkeypatch.setattr(nc.asyncio, "sleep", sleep_and_count)
+    monkeypatch.setattr(nc.settings, "books_watch_interval", 0.2)
+    with pytest.raises(asyncio.CancelledError):
+        await n._books_watch(ws)
+
+    accounts = [m for m in ws.sent if m["type"] == "account"]
+    # 首轮只建基线（不补报），第二轮检测到变化才补报
+    assert len(accounts) == 1, f"应补报 1 份快照，实际 {len(accounts)}"
+
+
+async def test_books_watch_does_not_resend_when_read_fails(monkeypatch):
+    """读挂单失败时不得补报：读不到不等于变了。
+
+    补发空账本快照会让服务端把「没读到」当成「已平光」而错误收口任务。
+    """
+    n = _node()
+    await n._exec(n.mt5.connect)
+    ws = FakeWS()
+    n._check_login = lambda acct: None  # type: ignore[method-assign]
+
+    def boom():
+        raise RuntimeError("orders_get failed")
+
+    n.mt5.pending_orders = boom
+
+    async def stop(_delay):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(nc.asyncio, "sleep", stop)
+    with pytest.raises(asyncio.CancelledError):
+        await n._books_watch(ws)
+
+    assert [m for m in ws.sent if m["type"] == "account"] == []
+
+
 async def test_check_login_allows_match_and_empty():
     n = _node()
     n._check_login({"login": 90000001})

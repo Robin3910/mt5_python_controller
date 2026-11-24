@@ -8,7 +8,7 @@
 """
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from . import persist, rules, sms_config, system_settings
+from . import ai_entry_guard, persist, rules, sms_config, system_settings
 from .connections import manager
 from .deps import client_ip, get_current_admin, get_store, require_admin
 from .models import (
@@ -52,11 +52,17 @@ async def set_filters(
     """设置多区间方向过滤（以品种为键的对象，结构见前端配置页说明）。
 
     关闭某品种「启用全局手数」时，若仍有节点将该品种手数策略设为「跟随中控台」，则拒收。
+
+    另外校验每个品种下的 `ai_entry` 子块（AI 策略 tpl_1 的开仓准入）：
+    这份配置直接决定真实交易，不能只靠前端兜底 —— 服务端必须拒收非法值。
     """
     nodes = await store.all_nodes()
     err = rules.validate_disable_global_lot(body or {}, nodes)
     if err:
         raise HTTPException(status_code=400, detail=err)
+    ai_err = ai_entry_guard.validate_ai_entry_config(body or {})
+    if ai_err:
+        raise HTTPException(status_code=400, detail=ai_err)
     before = await store.get_filters()
     await store.set_filters(body)
     await push_watch_symbols_to_nodes(body)

@@ -726,12 +726,24 @@ async def _seed_pending_baseline(store, leader_magic: int, ticket: int = 101) ->
 
 async def _wait_cancel_confirmed(store, monkeypatch, *, orders: list,
                                  sent: list, rounds: int = 3) -> dict:
+    """连续喂几轮相同快照，返回各轮统计的**累计**结果。
+
+    现在撤单检出是**单轮**的（挂单归零 + 持仓没相应增加 -> 立即撤单），
+    不再需要等 3 轮确认。所以 `rounds=1` 就应该能触发。
+
+    注意返回的是累计值：撤单一旦确认，这一批挂单就不会再被检出，
+    后续轮次的结果是空的，只看最后一轮会漏掉触发的那一轮。
+    """
     out: dict = {}
+    total = {"pending_sent": 0, "pending_queued": 0, "pending_finished": 0}
     for _ in range(rounds):
         await seed_account(store, "nd_leader", [], orders=orders)
         out = await leader_close_sync.on_snapshot(
             store, "nd_leader", [], orders=orders,
         )
+        for k in total:
+            total[k] += int(out.get(k) or 0)
+    out.update(total)
     return out
 
 
@@ -746,8 +758,8 @@ async def test_leader_cancel_pending_syncs_follower(store, monkeypatch):
 
     sent: list = []
     monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
-    # 连续 3 轮快照都看不到挂单 -> 确认撤单
-    out = await _wait_cancel_confirmed(store, monkeypatch, orders=[], sent=sent)
+    # 撤单检出是单轮的：挂单归零 + 持仓没增加 -> 立即下发
+    out = await _wait_cancel_confirmed(store, monkeypatch, orders=[], sent=sent, rounds=1)
     assert out["pending_sent"] == 1, f"应下发 1 条撤单，实际 {out}"
     cmds = [m for n, m in sent if m.get("cmd") == "strategy_cancel_pending"]
     assert len(cmds) == 1 and cmds[0]["magic"] == follower["magic"]
@@ -759,7 +771,11 @@ async def test_leader_cancel_pending_syncs_follower(store, monkeypatch):
 
 
 async def test_single_round_missing_order_is_not_confirmed(store, monkeypatch):
-    """单轮读数抖动不算撤单：挂单下一轮就回来了 -> 继续静默也不会立刻确认。"""
+    """挂单还在盘上时不得判撤单：数量没变 -> 不动。
+
+    旧的实现靠「本轮净减少」判定，单轮读数抖动会误判。现在基于
+    「挂单基线记忆」判定：只要挂单还在（数量没少），就不是撤单。
+    """
     group, leader, follower = await setup_pair(
         store, entry_mode="limit", name="单轮抖动组",
     )
@@ -767,18 +783,15 @@ async def test_single_round_missing_order_is_not_confirmed(store, monkeypatch):
     await _seed_pending_baseline(store, m_lead)
     sent: list = []
     monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
-    # 第 1 轮快照抖动：挂单不见了（疑似撤单 count=1）
-    await seed_account(store, "nd_leader", [], orders=[])
-    out = await leader_close_sync.on_snapshot(store, "nd_leader", [], orders=[])
-    assert out["pending_sent"] == 0
-    # 第 2 轮挂单又回来了（没被撤）-> 嫌疑清零
-    back = [order(101, m_lead)]
-    await seed_account(store, "nd_leader", [], orders=back)
-    out = await leader_close_sync.on_snapshot(store, "nd_leader", [], orders=back)
-    assert out["pending_sent"] == 0
+    # 挂单原样还在 -> 不是撤单
+    still = [order(101, m_lead)]
+    for _ in range(3):
+        await seed_account(store, "nd_leader", [], orders=still)
+        out = await leader_close_sync.on_snapshot(store, "nd_leader", [], orders=still)
+        assert out["pending_sent"] == 0
     row = next(r for r in await subtask_rows(group["group_id"])
                if r["node_id"] == "nd_f")
-    assert row["status"] not in ("done", "failed"), "抖动的挂单不得把子任务收口"
+    assert row["status"] not in ("done", "failed"), "挂单还在不得把子任务收口"
 
 
 async def test_pending_fill_is_not_treated_as_cancel(store, monkeypatch):
@@ -851,13 +864,51 @@ async def test_offline_follower_queues_cancel_pending(store, monkeypatch):
     m_lead = leader["magic"]
     await _seed_pending_baseline(store, m_lead)
     monkeypatch.setattr(manager, "send_to_node", capture_sender([], online_nodes=set()))
-    out = await _wait_cancel_confirmed(store, monkeypatch, orders=[], sent=[])
+    out = await _wait_cancel_confirmed(store, monkeypatch, orders=[], sent=[], rounds=1)
     assert out["pending_queued"] == 1
     pending = await store.pop_pending_stops("nd_f")
     assert pending and pending[0]["cmd"] == "strategy_cancel_pending"
     f_row = next(r for r in await subtask_rows(group["group_id"])
                  if r["node_id"] == "nd_f")
     assert f_row["status"] == "done"
+
+
+async def test_cancel_pending_still_syncs_when_leader_task_already_done(
+    store, monkeypatch,
+):
+    """回归：主节点子任务已被对账收口成 done 时，跟单节点仍要收到撤单。
+
+    真实故障：主节点撤掉限价挂单后，账户对账先一步把主节点子任务收口成
+    `status="done"`（挂单消失 -> 该魔术号没痕迹 -> 自动收口）。此时旧实现
+    用「活动子任务」查主节点的派发记录 —— 终态记录被过滤掉，查不到 ->
+    撤单指令根本不发 -> 跟单节点的挂单留在盘上成了孤儿单。
+
+    这里显式把主节点子任务置为 done，再验证撤单同步依然发生。
+    """
+    group, leader, follower = await setup_pair(
+        store, entry_mode="limit", name="主节点已收口组",
+    )
+    m_lead, m_f = leader["magic"], follower["magic"]
+    await _seed_pending_baseline(store, m_lead)
+
+    # 模拟对账已经把主节点子任务收口成终态
+    async with SessionLocal() as s:
+        row = await s.get(GroupTaskDispatch, leader["id"])
+        assert row is not None
+        row.status = "done"
+        row.finish_reason = "reconciled_no_position"
+        await s.commit()
+
+    sent: list = []
+    monkeypatch.setattr(manager, "send_to_node", capture_sender(sent))
+    out = await _wait_cancel_confirmed(store, monkeypatch, orders=[], sent=sent, rounds=1)
+    assert out["pending_sent"] == 1, f"主节点已 done 也必须下发撤单，实际 {out}"
+    cmds = [m for n, m in sent if m.get("cmd") == "strategy_cancel_pending"]
+    assert len(cmds) == 1 and cmds[0]["magic"] == m_f
+
+    rows = await subtask_rows(group["group_id"])
+    for r in rows:
+        assert r["status"] == "done", f"{r['node_id']} 子任务应以 done 收口"
 
 
 def test_snapshot_kind_distinguishes_orders():
@@ -871,16 +922,13 @@ def test_snapshot_kind_distinguishes_orders():
     assert lost == {1}, "挂单消失不得被当成持仓被平"
 
 
-def test_pending_cancelled_formula():
-    base = (
-        leader_close_sync._snapshot_rows([])
-        + leader_close_sync._order_rows([order(1, BASE + 7), order(2, BASE + 7)])
-    )
-    # 1 张成交成持仓、1 张被撤：挂单净减 1，持仓 +1 -> 撤单 0
-    cur = (
+def test_order_book_counts_pending_only():
+    """挂单基线只统计 kind=order，持仓不得混进去。"""
+    rows = (
         leader_close_sync._snapshot_rows([pos(1, BASE + 7, time=1.0)])
-        + leader_close_sync._order_rows([order(2, BASE + 7)])
+        + leader_close_sync._order_rows([order(2, BASE + 7), order(3, BASE + 7)])
     )
-    assert leader_close_sync._pending_cancelled(base, cur) == {}
-    # 两张都被撤：净减 2、持仓 +0 -> 撤单 2
-    assert leader_close_sync._pending_cancelled(base, []) == {BASE + 7: 2}
+    assert leader_close_sync._order_book_counts(rows) == {BASE + 7: 2}
+    book = leader_close_sync._order_book(rows)
+    assert book[str(BASE + 7)]["count"] == 2
+    assert sorted(book[str(BASE + 7)]["tickets"]) == [2, 3]

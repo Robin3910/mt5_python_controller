@@ -27,6 +27,14 @@ onMounted(() => {
 
 // ── 枢纽模块定义 ────────────────────────────────────────────────
 // icon: inline SVG path，accent: 图标色 / 底色（15% 透明度）
+const strategyConfig: ProfileHubModule = {
+  code: 'strategies',
+  label: '策略配置',
+  description: '市价开仓 · 限价开仓 · 智能吸筹',
+  path: '/user-strategies',
+  icon: '<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3"/><path d="M1 14h6M9 8h6M17 16h6"/>',
+  accent: '#22C55E',
+}
 const ALL_MODULES: ProfileHubModule[] = [
   {
     code: 'follow_channel',
@@ -79,14 +87,8 @@ const ALL_MODULES: ProfileHubModule[] = [
     icon: '<path d="M3 17l6-6 4 4 8-8"/><path d="M14 7h7v7"/>',
     accent: '#22C55E',
   },
-  {
-    code: 'strategies',
-    label: auth.isAdmin ? '策略管理' : '策略配置',
-    description: '市价开仓 · 限价开仓 · 智能吸筹',
-    path: auth.isAdmin ? '/strategies' : '/user-strategies',
-    icon: '<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3"/><path d="M1 14h6M9 8h6M17 16h6"/>',
-    accent: '#22C55E',
-  },
+  { ...strategyConfig, code: 'strategy_management', label: '策略管理', description: '查看和管理全站策略', path: '/strategies' },
+  strategyConfig,
   {
     code: 'follow',
     label: '带单',
@@ -180,6 +182,7 @@ const UNRESTRICTED_MODULES = new Set(['news_calendar'])
 
 const visibleModules = computed<ProfileHubModule[]>(() => {
   let base = ALL_MODULES.filter((m) => {
+    if (m.code === 'strategy_management') return auth.isAdmin
     if (UNRESTRICTED_MODULES.has(m.code)) return true
     if (m.code === 'ai_channel') {
       return auth.hasMenu('ai_trade') && auth.canUseAiStrategy && auth.canBeFollowLeader

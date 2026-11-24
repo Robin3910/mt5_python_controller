@@ -207,6 +207,14 @@ class EconomicEvent(Base):
     )
 
 
+class EconomicEventTranslation(Base):
+    __tablename__ = "economic_event_translation"
+
+    country: Mapped[str] = mapped_column(String(8), primary_key=True)
+    title: Mapped[str] = mapped_column(String(160), primary_key=True)
+    title_zh: Mapped[str] = mapped_column(String(160))
+
+
 class UserNewsSettings(Base):
     """用户的财经日历黑名单设置（每人一行）。
 
@@ -875,6 +883,7 @@ class GroupTaskDispatch(Base):
     deal: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     price: Mapped[float | None] = mapped_column(Float, nullable=True)
     error: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    opening_balance: Mapped[float | None] = mapped_column(Float, nullable=True)
     # —— 策略运行期实时快照 ——
     position_count: Mapped[int] = mapped_column(Integer, default=0)   # 当前 magic 持仓笔数
     # 当前 magic 未成交挂单笔数；限价开仓在成交前只有它，是「在途但未持仓」的唯一凭据

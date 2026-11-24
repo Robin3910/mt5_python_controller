@@ -6,11 +6,12 @@ import { ElDialog, ElMessage, ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/dialog/style/css'
 import 'element-plus/es/components/message/style/css'
 import 'element-plus/es/components/message-box/style/css'
-import { fetchLeaders, fetchLeaderDetail, fetchMyFollowings, joinFollow, leaveFollow, setFollowPaused } from '@/api/follow'
+import { fetchLeaders, fetchLeaderDetail, fetchMyFollowings, joinFollow, leaveFollow, setFollowPaused, setMyFollowState } from '@/api/follow'
 import type {
   FollowDetailResponse,
   FollowLeaderSummary,
   FollowMeResponse,
+  FollowMyGroup,
 } from '@/api/types'
 import { useAuthStore } from '@/stores/auth'
 import { useHubStore } from '@/stores/hub'
@@ -27,8 +28,6 @@ interface MyFollowedNode {
   mt5_login: number | null
   status: string | null
   joined_at: number | null
-  /** 该节点在该 leader 下所有相关分组的活跃任务合计 */
-  active_task_count: number
   /** 该节点被跟随的**全部分组**（同一 leader 下可能同时跟多个分组，移出时必须一次性清掉） */
   groups: { group_id: string; group_name: string | null }[]
 }
@@ -36,10 +35,9 @@ interface MyFollowedNode {
 /** 「我的跟单」聚合后的单条 leader 卡片数据 */
 interface MyFollowingEntry {
   leader: FollowLeaderSummary
-  marketable: boolean
   nodes: MyFollowedNode[]
   /** 我在该 leader 下跟的分组（分组级活跃任务数只此一份，不能按节点重复累加） */
-  groups: { group_id: string; group_name: string | null; active_task_count: number; symbol: string | null; strategy_name: string | null }[]
+  groups: FollowMyGroup[]
 }
 
 const auth = useAuthStore()
@@ -62,6 +60,7 @@ let pickerSearchTimer: number | undefined
 
 const mine = ref<FollowMeResponse>({ following: [], applications: [], summary: { following_count: 0, follow_node_count: 0 } })
 const mineLoading = ref(false)
+let mineRequest = 0
 
 // ---------------------------------------------------------------------------
 // 带单员绩效（来自历史成交聚合，与订单历史页同一套口径）
@@ -197,13 +196,15 @@ async function loadLeaders() {
 }
 
 async function loadMine() {
+  const request = ++mineRequest
   mineLoading.value = true
   try {
-    mine.value = await fetchMyFollowings()
+    const result = await fetchMyFollowings()
+    if (request === mineRequest) mine.value = result
   } catch (e) {
     ElMessage.error(errText(e, '加载我的跟单失败'))
   } finally {
-    mineLoading.value = false
+    if (request === mineRequest) mineLoading.value = false
   }
 }
 
@@ -301,43 +302,6 @@ async function submitJoin() {
   }
 }
 
-async function doLeave(
-  leader: FollowLeaderSummary,
-  groupIds: string[],
-  nodeIds: string[],
-  closeTasks: boolean,
-) {
-  if (!groupIds.length || !nodeIds.length) return
-  try {
-    const res = await leaveFollow({
-      leader_user_id: leader.leader_user_id,
-      group_ids: groupIds,
-      node_ids: nodeIds,
-      close_tasks: closeTasks,
-    })
-    // 后端返回的是「节点 × 分组」对，同一节点被跟多个分组会被计多次 ——
-    // 提示语按去重后的节点数算，否则「已移出 3 个节点」实际只移了 2 个。
-    const removedNodeCount = new Set(
-      res.removed.flatMap((r) => r.node_ids),
-    ).size
-    let msg = `已移出 ${removedNodeCount} 个节点`
-    if (res.closing.length) msg += `，${res.closing.length} 个任务正在平仓`
-    if (res.forced.length) msg += `，${res.forced.length} 个离线节点已排队补发平仓`
-    if (res.warning) ElMessage.warning(res.warning)
-    // 跨市场分组：关系**未**被删除，单独提示（不能混进「已移出」的计数里）
-    if (res.skipped.length) {
-      ElMessage.warning(`有 ${res.skipped.length} 个分组属于【AI 交易】市场，未在本次移出：${res.skipped[0].reason}`)
-    }
-    ElMessage.success(msg)
-    await Promise.all([loadLeaders(), loadMine()])
-    if (detail.value?.leader.leader_user_id === leader.leader_user_id) {
-      detail.value = await fetchLeaderDetail(leader.leader_user_id)
-    }
-  } catch (e) {
-    ElMessage.error(errText(e, '移出跟单失败'))
-  }
-}
-
 /**
  * 「我的跟单」按 leader 聚合、按 node_id 去重，分组不再展示。
  * 后端响应里仍嵌套 `groups`，此处扁平化为 leader → nodes。
@@ -380,32 +344,15 @@ const myFollowing = computed<MyFollowingEntry[]>(() =>
             mt5_login: n.mt5_login ?? null,
             status: n.status ?? null,
             joined_at: n.joined_at ?? null,
-            active_task_count: g.active_task_count,
             groups: [{ group_id: g.group_id, group_name: g.group_name ?? null }],
           })
         }
       }
     }
-    // 运行中任务数：按**去重后的分组**求和，避免同一分组被重复计数
-    for (const node of nodesById.values()) {
-      const ids = new Set(node.groups.map((x) => x.group_id))
-      let sum = 0
-      for (const g of f.groups) {
-        if (ids.has(g.group_id)) sum += g.active_task_count
-      }
-      node.active_task_count = sum
-    }
     return {
       leader: f.leader,
-      marketable: f.leader.marketable,
       nodes: [...nodesById.values()].sort((a, b) => a.node_id.localeCompare(b.node_id)),
-      groups: liveGroups.map((g) => ({
-        group_id: g.group_id,
-        group_name: g.group_name ?? null,
-        active_task_count: g.active_task_count,
-        symbol: g.symbol ?? null,
-        strategy_name: g.strategy_name ?? null,
-      })),
+      groups: liveGroups,
     }
   }),
 )
@@ -518,151 +465,91 @@ async function retryApplication(row: FollowApplication): Promise<void> {
   await openFollowPicker(leader)
   if (isNodeSelectable(row.node_id)) selectedNodes.value = [row.node_id]
 }
-function groupIsRunning(entry: MyFollowingEntry, groupId: string): boolean {
-  if (entry.leader.follow_paused) return false
-  const group = mine.value.following.find(row => row.leader.leader_user_id === entry.leader.leader_user_id)?.groups.find(row => row.group_id === groupId)
-  return !!group?.marketable && group.my_nodes.some(node => (node.follow_state || 'running') === 'running' && !node.leader_paused)
+function groupIsRunning(group: FollowMyGroup): boolean {
+  return group.marketable && !group.paused && group.my_nodes.some(n => (n.follow_state || 'running') === 'running' && !n.leader_paused)
 }
 
-// ---------------------------------------------------------------------------
-// 移出跟单（多选）
-// ---------------------------------------------------------------------------
-//
-// 交互：点「移出」弹出选择框 → 勾选要移出的节点 → 确认。
-// 语义：勾选的节点会从**它被跟随的全部分组**中一次性移出，
-// 因为「跟不跟某个带单员」是节点级语义，不是分组级语义 ——
-// 只从其中一组移出会让节点继续在其它分组收信号，用户以为已经退干净了。
-interface LeaveDialogState {
-  leader: FollowLeaderSummary
-  entry: MyFollowingEntry
-  /** 待移出的节点 id */
-  selected: string[]
+interface Target {
+  leader_id: number
+  group_id: string
+  node_id: string
+  paused: boolean
+  locked: boolean
+  label: string
 }
-
-const leaveDialog = ref<LeaveDialogState | null>(null)
-const leaveSubmitting = ref(false)
-
-/**
- * 弹窗的 v-model 桥接：开 = leaveDialog 非空，关 = 置空。
- * 用 v-model 而不是静态 :model-value，ESC / 右上角 X 才能正常关闭。
- */
-const leaveDialogVisible = computed<boolean>({
-  get: () => leaveDialog.value !== null,
-  set: (v) => {
-    if (!v) closeLeaveDialog()
-  },
-})
-
-/** 打开移出选择框；presetNodeId 非空时预勾选该节点 */
-function openLeaveDialog(leader: FollowLeaderSummary, presetNodeId?: string) {
-  const entry = myFollowing.value.find((x) => x.leader.leader_user_id === leader.leader_user_id)
-  if (!entry || !entry.nodes.length) return
-  leaveDialog.value = {
-    leader,
-    entry,
-    selected: presetNodeId ? [presetNodeId] : [],
+const relations = computed<Target[]>(() => myFollowing.value.flatMap(entry =>
+  entry.groups.flatMap(g => g.my_nodes.map(n => ({
+    group_id: g.group_id, node_id: n.node_id, leader_id: entry.leader.leader_user_id,
+    paused: n.follow_state === 'paused', locked: !!g.paused || !!n.leader_paused || g.market !== 'follow',
+    label: [leaderName(entry.leader), g.group_name || g.group_id, n.name || n.node_id].join(' / '),
+  }))),
+))
+const mutationBusy = ref(false)
+const stopTargets = ref<Target[]>([])
+const stopWithClose = ref(false)
+const selectedStops = ref<Target[]>([])
+function canPause(targets: Target[]) { return targets.some(t => !t.locked && !t.paused) }
+async function toggleRelations(targets: Target[], batch = false) {
+  if (mutationBusy.value) return
+  const paused = canPause(targets)
+  const changes = targets.filter(t => !t.locked && t.paused !== paused)
+  if (!changes.length) return
+  if (batch) {
+    try {
+      await ElMessageBox.confirm(`涉及全部 ${new Set(changes.map(t => t.node_id)).size} 个节点、${changes.length} 条关系（含筛选外）。\n${changes.map(t => t.label).join('\n')}`,
+        paused ? '一键暂停' : '一键启动', { confirmButtonText: '确认', cancelButtonText: '取消' })
+    } catch { trackFollowUi('cancel_dialog', { value: 'follow-state' }); return }
   }
-  trackFollowUi('open_picker', { value: 'leave-picker' })
-}
-
-function closeLeaveDialog() {
-  if (leaveSubmitting.value) return
-  trackFollowUi('cancel_dialog', { value: 'leave-picker' })
-  leaveDialog.value = null
-}
-
-function toggleLeaveNode(nodeId: string) {
-  const d = leaveDialog.value
-  if (!d) return
-  const s = new Set(d.selected)
-  s.has(nodeId) ? s.delete(nodeId) : s.add(nodeId)
-  d.selected = [...s]
-  trackFollowUi('select_nodes', { node_ids: d.selected, value: 'leave-picker' })
-}
-
-function toggleAllLeaveNodes() {
-  const d = leaveDialog.value
-  if (!d) return
-  d.selected = d.selected.length === d.entry.nodes.length ? [] : d.entry.nodes.map((n) => n.node_id)
-  trackFollowUi('select_nodes', { node_ids: d.selected, value: 'leave-picker' })
-}
-
-/** 全选框的勾选态（空列表时不能显示为已全选） */
-const leaveAllSelected = computed<boolean>(() => {
-  const d = leaveDialog.value
-  if (!d || !d.entry.nodes.length) return false
-  return d.selected.length === d.entry.nodes.length
-})
-
-/** 选中的节点涉及的分组并集（移出时要覆盖全部） */
-const leaveTargetGroupIds = computed<string[]>(() => {
-  const d = leaveDialog.value
-  if (!d) return []
-  const ids = new Set<string>()
-  for (const n of d.entry.nodes) {
-    if (!d.selected.includes(n.node_id)) continue
-    for (const g of n.groups) ids.add(g.group_id)
-  }
-  return [...ids]
-})
-
-/**
- * 选中的节点涉及的运行中任务数。
- *
- * 按**分组去重**求和，而不是按节点累加 —— 多个被选节点可能同属一个分组，
- * 那个分组的活跃任务数只有一份，按节点累加会把同一个任务算好几次，
- * 导致「平仓关闭」提示的数量虚高。
- */
-const leaveActiveTaskCount = computed<number>(() => {
-  const d = leaveDialog.value
-  if (!d) return 0
-  const ids = new Set(leaveTargetGroupIds.value)
-  let sum = 0
-  for (const g of d.entry.groups) {
-    if (ids.has(g.group_id)) sum += g.active_task_count
-  }
-  return sum
-})
-
-async function confirmLeave() {
-  const d = leaveDialog.value
-  if (!d || !d.selected.length) return
-  const nodeIds = [...d.selected]
-  const groupIds = leaveTargetGroupIds.value
-  const active = leaveActiveTaskCount.value
-
-  // 无进行中任务：直接移出
-  if (!active) {
-    leaveSubmitting.value = true
-    await doLeave(d.leader, groupIds, nodeIds, false)
-    leaveSubmitting.value = false
-    leaveDialog.value = null
-    return
-  }
-
-  // 有进行中的任务：让用户在「平仓后移出」和「保留任务」之间二选一
+  mutationBusy.value = true
   try {
-    const choice = await ElMessageBox({
-      title: '移出跟单',
-      type: 'warning',
-      dangerouslyUseHTMLString: true,
-      message:
-        `选中的 ${nodeIds.length} 个节点在带单员「${d.leader.display_name || d.leader.username}」下还有 ${active} 个进行中的任务。<br/>` +
-        '移出后该带单员不再向它们下发新信号，现有任务如何处理？',
-      distinguishCancelAndClose: true,
-      confirmButtonText: '平仓并关闭任务后移出',
-      cancelButtonText: '保留任务，仅停止接收新信号',
-    })
-      .then((r) => r.value)
-      .catch((r) => (r === 'cancel' ? 'keep' : 'close'))
-    if (choice === 'close') return
-    leaveSubmitting.value = true
-    await doLeave(d.leader, groupIds, nodeIds, choice === 'confirm')
-    leaveSubmitting.value = false
-    leaveDialog.value = null
-  } catch {
-    // 关闭弹窗：不处理
+    const changed = await setMyFollowState(changes.map(({ group_id, node_id }) => ({ group_id, node_id })), paused)
+    ElMessage.success(`${changed} 条跟单关系已${paused ? '暂停' : '恢复'}`)
+  } catch (e) { ElMessage.error(errText(e, '跟单状态更新失败')) }
+  finally { await loadMine(); mutationBusy.value = false }
+}
+function cancelStop() {
+  if (!mutationBusy.value && stopTargets.value.length) {
+    stopTargets.value = []
+    trackFollowUi('cancel_dialog', { value: 'stop-follow' })
   }
+}
+function askStop(targets: Target[]) {
+  stopWithClose.value = false
+  stopTargets.value = [...targets]
+  selectedStops.value = [...targets]
+  trackFollowUi('open_picker', { value: 'stop-follow' })
+}
+async function stopSelected() {
+  if (mutationBusy.value || !selectedStops.value.length) return
+  mutationBusy.value = true
+  const failed: string[] = []
+  let removed = 0, closing = 0, queued = 0
+  const groups = new Map<string, Target[]>()
+  for (const t of selectedStops.value) {
+    if (!groups.has(t.group_id)) groups.set(t.group_id, [])
+    groups.get(t.group_id)!.push(t)
+  }
+  try {
+    for (const [gid, members] of groups) {
+      // 移出接口每次最多接受 50 个节点。
+      for (let start = 0; start < members.length; start += 50) {
+        const targets = members.slice(start, start + 50)
+        try {
+          const res = await leaveFollow({ leader_user_id: targets[0].leader_id, group_ids: [gid],
+            node_ids: targets.map(t => t.node_id), close_tasks: stopWithClose.value })
+          const done = new Set(res.removed.flatMap(r => r.node_ids))
+          removed += done.size
+          closing += res.closing.length
+          queued += res.forced.length
+          failed.push(...targets.filter(t => !done.has(t.node_id)).map(t => t.label))
+        } catch (e) { failed.push(...targets.map(t => t.label + '：' + errText(e, '操作失败'))) }
+      }
+    }
+    const result = `已停止 ${removed} 条关系，平仓处理中 ${closing} 项，离线排队 ${queued} 项`
+    if (failed.length) ElMessage.warning(result + '。未完成：' + failed.join('、'))
+    else ElMessage.success(result)
+    stopTargets.value = []
+  } finally { await Promise.all([loadLeaders(), loadMine()]); mutationBusy.value = false }
 }
 
 // 统计窗口切换：重拉列表 + 当前详情（窗口是纯读缓存，切换零延迟）
@@ -697,7 +584,7 @@ onBeforeUnmount(() => {
   document.body.style.overflow = ''
   window.clearInterval(followTimer)
   window.clearTimeout(pickerSearchTimer)
-  if (pageChrome.value?.title === '带单员展示') pageChrome.value = null
+  if (['带单员展示', '我的跟单'].includes(pageChrome.value?.title || '')) pageChrome.value = null
 })
 
 // 跟单成功后：手机端收起详情页并切到「我的跟单」，让结果立刻可见。
@@ -713,7 +600,7 @@ onMounted(() => {
   void loadMine()
   void hub.fetchNodes()
   followTimer = window.setInterval(() => {
-    if (document.visibilityState === 'visible' && !submitting.value && !leaveSubmitting.value) void loadMine()
+    if (document.visibilityState === 'visible' && !submitting.value && !mutationBusy.value) void loadMine()
   }, 45_000)
 })
 
@@ -729,13 +616,14 @@ const showcaseReturn = ref<'home' | 'mine'>('home')
 function closeShowcase(): void {
   pageMode.value = showcaseReturn.value
 }
-watch(pageMode, (mode) => {
-  if (mode === 'showcase') {
-    pageChrome.value = { title: '带单员展示', back: closeShowcase }
-    window.scrollTo(0, 0)
-  } else if (pageChrome.value?.title === '带单员展示') {
-    pageChrome.value = null
-  }
+let mineScroll = 0
+watch(pageMode, async (mode, previous) => {
+  if (previous === 'mine') mineScroll = window.scrollY
+  if (previous === 'showcase' || mode === 'home') trackFollowUi('page_view', { value: mode })
+  pageChrome.value = mode === 'showcase' ? { title: '带单员展示', back: closeShowcase }
+    : mode === 'mine' ? { title: '我的跟单', back: () => { pageMode.value = 'home' } } : null
+  await nextTick()
+  window.scrollTo(0, mode === 'mine' && previous === 'showcase' ? mineScroll : 0)
 })
 const mineTab = ref<'list' | 'nodes'>('list')
 const nodeQuery = ref('')
@@ -767,39 +655,15 @@ function nodeBalance(id: string): string {
 
 const myLeader = computed(() => leaders.value.find((l) => isMyLeader(l)) || null)
 
-interface MagicHit { magic: number; group_id: string }
-const followMagics = ref<Record<string, MagicHit[]>>({})
-async function loadFollowBooks(nodeIds: string[]) {
-  await Promise.all(nodeIds.map(async (id) => {
-    if (!hub.accounts[id]) {
-      try { await hub.fetchNodeAccount(id) } catch { /* 没有快照就先不展示持仓 */ }
-    }
-    if (followMagics.value[id]) return
-    try {
-      const { data } = await api.get<FollowChannelsOut>(`/api/nodes/${id}/follow-channels`)
-      followMagics.value = {
-        ...followMagics.value,
-        [id]: data.magics.filter((m) => m.market === 'follow').map((m) => ({ magic: m.magic, group_id: m.group_id })),
-      }
-    } catch { /* 频道读取失败时跳过该节点 */ }
-  }))
+function entryPositions(entry: MyFollowingEntry) {
+  return entry.groups.flatMap(g => groupPositions(g))
 }
-watch(myFollowing, (list) => {
-  const ids = [...new Set(list.flatMap((e) => e.nodes.map((n) => n.node_id)))]
-  if (ids.length) void loadFollowBooks(ids)
-}, { immediate: true })
-
-function entryPositions(entry: MyFollowingEntry): Array<Position & { nodeId: string }> {
-  const groups = new Set(entry.groups.map((g) => g.group_id))
-  const rows: Array<Position & { nodeId: string }> = []
-  for (const node of entry.nodes) {
-    const hits = (followMagics.value[node.node_id] || []).filter((m) => !groups.size || groups.has(m.group_id))
-    const magics = new Set(hits.map((m) => m.magic))
-    for (const p of hub.accounts[node.node_id]?.positions || []) {
-      if (magics.has(p.magic)) rows.push({ ...p, nodeId: node.node_id })
-    }
-  }
-  return rows
+function groupPositions(g: FollowMyGroup): Array<Position & { nodeId: string; groupId: string }> {
+  return g.my_nodes.flatMap(n => {
+    const magics = new Set(g.magics?.[n.node_id] || [])
+    const positions = hub.accounts[n.node_id]?.positions || n.positions || []
+    return positions.filter(p => magics.has(p.magic)).map(p => ({ ...p, nodeId: n.node_id, groupId: g.group_id }))
+  })
 }
 function bookStats(rows: Array<Position & { nodeId: string }>) {
   let volume = 0
@@ -846,21 +710,30 @@ function applyShowcase(): void {
   void openFollowPicker(detail.value.leader)
 }
 const closeBusy = ref(false)
-async function closeRows(rows: Array<Position & { nodeId: string }>, title: string) {
+async function closeRows(rows: Array<Position & { nodeId: string; groupId?: string }>, title: string) {
+  if (closeBusy.value) return
   if (!rows.length) { ElMessage.info('没有可平的持仓'); return }
   try {
-    await ElMessageBox.confirm(`确认平掉${title}的 ${rows.length} 笔持仓？`, '一键平仓', {
+    await ElMessageBox.confirm(`确认平掉${title}的 ${rows.length} 笔持仓？涉及 ${new Set(rows.map(r => r.nodeId)).size} 个节点，品种 ${[...new Set(rows.map(r => r.symbol))].join("、")}，浮动盈亏 ${fmtU(bookStats(rows).profit)} U。`, '一键平仓', {
       type: 'warning', confirmButtonText: '确认平仓', cancelButtonText: '取消',
     })
-  } catch { return }
+  } catch { trackFollowUi('cancel_dialog', { value: 'close-follow' }); return }
   closeBusy.value = true
   try {
     const nodeIds = [...new Set(rows.map((r) => r.nodeId))]
+    const failures: string[] = []
     for (const row of rows) {
-      await api.post(`/api/nodes/${row.nodeId}/follow-channels/close`, { market: 'follow', mode: 'ticket', ticket: row.ticket })
+      try {
+        const { data } = await api.post(`/api/nodes/${row.nodeId}/follow-channels/close`, {
+          market: 'follow', mode: 'ticket', ticket: row.ticket, group_id: row.groupId,
+        })
+        if (data.closed !== 1 || data.failed?.length) failures.push(String(row.ticket))
+      } catch (e) { failures.push(`${row.nodeId} #${row.ticket}：${errText(e, '未提交')}`) }
     }
-    ElMessage.success('已提交平仓')
-    await Promise.all(nodeIds.map((id) => hub.fetchNodeAccount(id).catch(() => {})))
+    const msg = `已提交 ${rows.length - failures.length} 笔平仓`
+    if (failures.length) ElMessage.warning(msg + '，失败 ' + failures.join('、'))
+    else ElMessage.success(msg)
+    await Promise.all([loadMine(), ...nodeIds.map(id => hub.fetchNodeAccount(id).catch(() => {}))])
   } catch (e) {
     ElMessage.error(errText(e, '平仓失败'))
   } finally { closeBusy.value = false }
@@ -877,19 +750,27 @@ function fmtTime(ts: number | null | undefined): string {
 function groupTitle(name: string | null, strategy: string | null): string {
   return strategy || name || '跟单分组'
 }
-function posRows(nodeId: string, groupId: string): Array<Position & { nodeId: string }> {
-  const hits = (followMagics.value[nodeId] || []).filter((m) => m.group_id === groupId)
-  const magics = new Set(hits.map((m) => m.magic))
-  return (hub.accounts[nodeId]?.positions || []).filter((p) => magics.has(p.magic)).map((p) => ({ ...p, nodeId }))
-}
 function entryGroupPositions(entry: MyFollowingEntry, groupId: string) {
-  const rows: Array<Position & { nodeId: string }> = []
-  for (const node of entry.nodes) {
-    if (!node.groups.some((g) => g.group_id === groupId)) continue
-    rows.push(...posRows(node.node_id, groupId))
-  }
-  return rows
+  const group = entry.groups.find(g => g.group_id === groupId)
+  return group ? groupPositions(group) : []
 }
+function magicLabel(g: FollowMyGroup) {
+  return 'MF ' + [...new Set(Object.values(g.magics || {}).flat())].join(' / ')
+}
+const books = computed(() => Object.fromEntries(myFollowing.value.flatMap(entry => entry.groups.map(g => {
+  const live = groupPositions(g)
+  const open = live.map(p => ({
+    key: `p:${p.nodeId}:${p.ticket}`, direction: p.type.toUpperCase(), symbol: p.symbol, time: p.time,
+    profit: p.profit, status: '正在持仓',
+    description: `开仓 ${fmtTime(p.time)} · ${p.volume.toFixed(2)} 手 @ ${fmtPx(p.price_open)} · SL ${fmtPx(p.sl)} / TP ${fmtPx(p.tp)}`,
+  }))
+  const history = (g.history || []).map(p => ({
+    key: `d:${p.node_id}:${p.deal_id}`, direction: p.direction, symbol: p.symbol, time: p.closed_at,
+    profit: p.profit, status: p.status,
+    description: `平仓 ${fmtTime(p.closed_at)} · ${p.volume.toFixed(2)} 手 @ ${fmtPx(p.price)}`,
+  }))
+  return [g.group_id, { ...bookStats(live), orders: [...open, ...history].sort((a, b) => b.time - a.time) }]
+}))))
 function openMine() {
   pageMode.value = 'mine'
   mineTab.value = 'list'
@@ -902,7 +783,7 @@ const previewChips = computed(() => {
   for (const entry of myFollowing.value) {
     for (const g of entry.groups) {
       const rows = entryGroupPositions(entry, g.group_id)
-      const known = entry.nodes.some((n) => followMagics.value[n.node_id])
+      const known = g.my_nodes.some(n => n.balance != null || hub.accounts[n.node_id]?.balance != null || n.positions?.length)
       chips.push({
         key: g.group_id,
         // chip 只有一格宽，塞不下「模式 + 品种」，这里只给开仓方式
@@ -918,29 +799,17 @@ const previewChips = computed(() => {
 })
 
 const followStats = computed(() => {
-  const running = myFollowing.value.filter((e) => e.marketable).length
-  const perfs = myFollowing.value.map((e) => e.leader.performance).filter((p) => p?.data_available)
-  const rates = perfs.filter((p) => p.profit_rate_valid)
-  let floatProfit = 0
-  let volume = 0
-  let count = 0
-  for (const entry of myFollowing.value) {
-    const st = bookStats(entryPositions(entry))
-    floatProfit += st.profit
-    volume += st.volume
-    count += st.count
-  }
-  return {
-    running,
-    profitKnown: perfs.length > 0,
-    profit: perfs.reduce((s, p) => s + (p.total_profit || 0), 0),
-    rateKnown: rates.length > 0,
-    rate: rates.length ? rates.reduce((s, p) => s + p.profit_rate, 0) / rates.length : 0,
-    floatProfit,
-    volume,
-    count,
-  }
+  const { net_profit: profit, average_rate: rate } = mine.value.summary
+  return { profitKnown: profit != null, profit: profit ?? 0, rateKnown: rate != null, rate: rate ?? 0,
+    running: myFollowing.value.reduce((sum, e) => sum + e.groups.filter(groupIsRunning).length, 0) }
 })
+const latestSync = computed(() => Math.max(0, ...myFollowing.value.flatMap(e => e.groups.map(g => g.last_sync || 0))))
+function entryMeta(entry: MyFollowingEntry) {
+  const symbols = [...new Set(entry.groups.map(g => g.symbol).filter(Boolean))]
+  const since = entry.nodes.flatMap(n => n.joined_at ? [n.joined_at] : [])
+  const leverages = [...new Set(entry.groups.flatMap(g => g.my_nodes.map(n => hub.accounts[n.node_id]?.leverage || n.leverage)).filter(Boolean))]
+  return [...symbols, since.length && '开始于 ' + fmtTime(Math.min(...since)), leverages.length && leverages.join(' / ') + 'X 杠杆'].filter(Boolean).join(' · ')
+}
 
 interface NodeCard {
   node_id: string
@@ -953,7 +822,8 @@ interface NodeCard {
   volume: number
   profit: number
   balance: string
-  balanceNum: number | null
+  server: string
+  state: '跟单中' | '已暂停' | '待审核' | '已停止'
 }
 const nodeCards = computed<NodeCard[]>(() => {
   const map = new Map<string, NodeCard & { syms: Set<string>; leadersSet: Set<string> }>()
@@ -961,7 +831,9 @@ const nodeCards = computed<NodeCard[]>(() => {
     for (const node of entry.nodes) {
       let card = map.get(node.node_id)
       if (!card) {
-        const raw = hub.accounts[node.node_id]?.balance
+        const snapshot = entry.groups.flatMap(g => g.my_nodes).find(n => n.node_id === node.node_id)
+        const account = hub.accounts[node.node_id]
+        const raw = account?.balance ?? snapshot?.balance
         card = {
           node_id: node.node_id,
           name: node.name || node.node_id,
@@ -972,8 +844,9 @@ const nodeCards = computed<NodeCard[]>(() => {
           count: 0,
           volume: 0,
           profit: 0,
-          balance: nodeBalance(node.node_id),
-          balanceNum: raw == null ? null : raw,
+          balance: raw == null ? '—' : raw.toFixed(2),
+          server: account?.server || snapshot?.server || hub.nodes.find(n => n.node_id === node.node_id)?.mt5_server || '',
+          state: '已暂停',
           syms: new Set<string>(),
           leadersSet: new Set<string>(),
         }
@@ -984,7 +857,9 @@ const nodeCards = computed<NodeCard[]>(() => {
         const meta = entry.groups.find((x) => x.group_id === g.group_id)
         if (meta?.symbol) card.syms.add(meta.symbol)
       }
-      const rows = node.groups.flatMap((g) => posRows(node.node_id, g.group_id))
+      if (entry.groups.some(g => g.marketable && !g.paused && g.my_nodes.some(n =>
+        n.node_id === node.node_id && !n.leader_paused && (n.follow_state ?? 'running') === 'running'))) card.state = '跟单中'
+      const rows = entryPositions(entry).filter(p => p.nodeId === node.node_id)
       const seen = new Set<number>()
       for (const row of rows) {
         if (seen.has(row.ticket)) continue
@@ -995,6 +870,21 @@ const nodeCards = computed<NodeCard[]>(() => {
         if (row.symbol) card.syms.add(row.symbol)
       }
     }
+  }
+  for (const row of mine.value.applications || []) {
+    if (!row.available || isAiApplication(row)) continue
+    const pending = row.status === 'pending'
+    if (!pending && !(row.status === 'cancelled' && row.reason === '跟单已移出')) continue
+    const existing = map.get(row.node_id)
+    if (existing) {
+      if (pending && existing.state === '已停止') existing.state = '待审核'
+      continue
+    }
+    const node = hub.nodes.find(n => n.node_id === row.node_id)
+    map.set(row.node_id, { node_id: row.node_id, name: row.name || row.node_id, login: row.mt5_login,
+      server: node?.mt5_server || '', online: !!node && hub.isNodeOnline(node), state: pending ? '待审核' : '已停止',
+      count: 0, volume: 0, profit: 0, balance: nodeBalance(row.node_id), leaders: '', symbols: '',
+      syms: new Set(row.symbol ? [row.symbol] : []), leadersSet: new Set([row.leader_name]) })
   }
   return [...map.values()].map((card) => ({
     ...card,
@@ -1022,19 +912,17 @@ const shownNodes = computed(() => {
     if (nodeFilter.value === 'win' && !(n.profit > 0)) return false
     if (nodeFilter.value === 'loss' && !(n.profit < 0)) return false
     if (!q) return true
-    return `${n.name} ${n.login ?? ''} ${n.symbols} ${n.leaders}`.toLowerCase().includes(q)
+    return `${n.name} ${n.login ?? ''} ${n.symbols} ${n.leaders} ${n.server} ${n.online ? '在线' : '离线'} ${n.state} ${n.state === '跟单中' ? '运行中' : ''}`.toLowerCase().includes(q)
   })
 })
 const nodeSummary = computed(() => {
-  const cards = nodeCards.value
+  const cards = nodeCards.value.filter(n => n.state === '跟单中' || n.state === '已暂停')
   const wins = cards.filter((n) => n.profit > 0).length
   const volume = cards.reduce((s, n) => s + n.volume, 0)
   const profit = cards.reduce((s, n) => s + n.profit, 0)
   const count = cards.reduce((s, n) => s + n.count, 0)
-  const balances = cards.map((n) => n.balanceNum)
-  const balanceKnown = balances.length > 0 && balances.every((n) => n != null)
-  const balance = balanceKnown ? balances.reduce((s, n) => s + (n || 0), 0) : null
-  return { wins, volume, profit, count, balance }
+  const balance = mine.value.summary.first_balance
+  return { wins, volume, profit, count, balance, active: cards.length }
 })
 
 function closeGroup(entry: MyFollowingEntry, groupId: string, title: string) {
@@ -1054,40 +942,47 @@ function closeAllMine() {
   ).values()]
   return closeRows(rows, '全部跟单')
 }
-async function leaveOneGroup(entry: MyFollowingEntry, groupId: string, title: string) {
-  const nodeIds = entry.nodes.filter((n) => n.groups.some((g) => g.group_id === groupId)).map((n) => n.node_id)
-  if (!nodeIds.length) return
-  try {
-    await ElMessageBox.confirm(
-      `将 ${nodeIds.length} 个节点从「${title}」移出。移出后不再接收该分组的新信号。`,
-      '移出跟单',
-      { type: 'warning', confirmButtonText: '确认移出', cancelButtonText: '取消' },
-    )
-  } catch { return }
-  await doLeave(entry.leader, [groupId], nodeIds, false)
-}
-async function stopNode(card: NodeCard) {
-  const hits = myFollowing.value.filter((entry) => entry.nodes.some((n) => n.node_id === card.node_id))
-  if (!hits.length) return
-  try {
-    await ElMessageBox.confirm(
-      `将节点「${card.name}」从 ${hits.length} 个带单关系中移出。进行中的任务保留，不再接收新信号。`,
-      '移出跟单',
-      { type: 'warning', confirmButtonText: '确认移出', cancelButtonText: '取消' },
-    )
-  } catch { return }
-  for (const entry of hits) {
-    const node = entry.nodes.find((n) => n.node_id === card.node_id)
-    const groupIds = (node?.groups || []).map((g) => g.group_id)
-    if (groupIds.length) await doLeave(entry.leader, groupIds, [card.node_id], false)
-  }
-}
+const groupTargets = (gid: string) => relations.value.filter(t => t.group_id === gid)
+const nodeTargets = (nid: string) => relations.value.filter(t => t.node_id === nid)
+const stopPositions = computed(() => myFollowing.value.flatMap(entryPositions).filter(p =>
+  selectedStops.value.some(t => t.node_id === p.nodeId && t.group_id === p.groupId)).length)
 
 const selfGroups = computed(() => selfDetail.value?.groups || [])
-function selfPositions(groupId: string) {
-  const id = myLeader.value?.primary_node?.node_id
-  return id ? posRows(id, groupId) : []
-}
+const selfNodeId = computed(() => auth.canBeFollowLeader ? myLeader.value?.primary_node?.node_id : undefined)
+const selfPositions = computed(() => selfNodeId.value ? hub.accounts[selfNodeId.value]?.positions || [] : [])
+const selfMagicKey = computed(() => [...new Set(selfPositions.value.map(p => p.magic))].sort().join(','))
+const selfChannels = ref<FollowChannelsOut['magics']>([])
+watch([selfNodeId, selfMagicKey], async ([nodeId, magics], [previousId], onCleanup) => {
+  if (nodeId !== previousId || !magics) selfChannels.value = []
+  if (!nodeId || !magics) return
+  let current = true
+  onCleanup(() => { current = false })
+  try {
+    const { data } = await api.get<FollowChannelsOut>(`/api/nodes/${nodeId}/follow-channels`)
+    if (current) selfChannels.value = data.magics.filter(channel => channel.market === 'follow')
+  } catch { /* 保留最近一次成功读取的频道归属 */ }
+})
+const selfOrders = computed(() => {
+  const nodeId = selfNodeId.value
+  if (!nodeId) return []
+  const groups = new Map(selfGroups.value.map(group => [group.group_id, group]))
+  const byMagic = new Map(selfChannels.value.map(channel => [channel.magic, groups.get(channel.group_id)]))
+  return selfPositions.value.flatMap(position => {
+    const group = byMagic.get(position.magic)
+    return group ? [{ ...position, nodeId, title: selfItemTitle(group) }] : []
+  }).sort((a, b) => b.time - a.time || b.ticket - a.ticket)
+})
+const selfMagicBooks = computed(() => {
+  const ordersByMagic = new Map<number, typeof selfOrders.value>()
+  for (const order of selfOrders.value) {
+    const orders = ordersByMagic.get(order.magic)
+    if (orders) orders.push(order)
+    else ordersByMagic.set(order.magic, [order])
+  }
+  return Array.from(ordersByMagic, ([magic, orders]) => ({
+    magic, orders, title: orders[0].title, nodeId: orders[0].nodeId, ...bookStats(orders),
+  }))
+})
 const selfMeta = computed(() => {
   const leader = myLeader.value
   const parts: string[] = []
@@ -1101,13 +996,6 @@ const selfMeta = computed(() => {
   if (parts.length) return parts.join(' · ')
   const node = leader?.primary_node
   return node ? (node.name || node.node_id) : '无主节点'
-})
-const selfRunLabel = computed(() => {
-  const total = selfGroups.value.length
-  if (!total) return '0 个带单中'
-  if (myLeader.value?.follow_paused) return '已暂停'
-  const running = selfGroups.value.filter((g) => g.active_task_count > 0).length
-  return `${running}/${total} 个带单中`
 })
 const SELF_MODE_LABEL: Record<string, string> = {
   trend_market: '市价开仓',
@@ -1145,6 +1033,12 @@ function groupDisplayTitle(name: string | null, strategy: string | null, symbol?
   const key = groupModeKey(name, strategy)
   const label = (key && SELF_MODE_LABEL[key]) || groupTitle(name, strategy)
   return symbol ? `${label} · ${symbol}` : label
+}
+
+function applicationTitle(row: FollowApplication): string {
+  const name = row.group_name || ''
+  const symbol = row.symbol || (groupModeKey(name) && name.match(/-\d+-([^-]+)$/)?.[1])
+  return groupDisplayTitle(name || '跟单申请', row.strategy_name, symbol)
 }
 
 function showcaseGroupMode(g: { name: string | null; strategy_name?: string | null }): string {
@@ -1223,22 +1117,6 @@ function selfModeLabel(name: string | null | undefined): string {
 function selfItemTitle(g: { name: string | null; strategy_name?: string | null; strategy_template?: string | null }): string {
   return selfModeLabel(g.name) || selfModeLabel(g.strategy_name) || g.strategy_template || g.strategy_name || g.name || '跟单分组'
 }
-function selfSyncLabel(groupId: string): string {
-  const latest = selfPositions(groupId).reduce((max, p) => Math.max(max, p.time || 0), 0)
-  return latest ? `同步 ${fmtTime(latest)}` : ''
-}
-function selfItemState(active: number): { cls: string; text: string } {
-  if (myLeader.value?.follow_paused) return { cls: 'pause', text: '已暂停' }
-  if (active > 0) return { cls: 'live', text: '跟单中' }
-  return { cls: 'idle', text: '空闲' }
-}
-function selfNodeLabel(): string {
-  const node = myLeader.value?.primary_node
-  return node ? (node.name || node.node_id) : ''
-}
-function closeSelfGroup(groupId: string, title: string) {
-  return closeRows(selfPositions(groupId), `「${title}」`)
-}
 async function loadSelfDetail() {
   const leader = myLeader.value
   if (!leader || !auth.canBeFollowLeader) { selfDetail.value = null; return }
@@ -1248,17 +1126,13 @@ async function loadSelfDetail() {
     selfDetail.value = null
   }
   const id = leader.primary_node?.node_id
-  if (!id) return
-  if (!hub.accounts[id]) {
-    try { await hub.fetchNodeAccount(id) } catch { /* 主节点没有快照时分组卡片仍可展示 */ }
-  }
-  void loadFollowBooks([id])
+  if (id && !hub.accounts[id]) await hub.fetchNodeAccount(id)
 }
 watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 </script>
 
 <template>
-  <div class="fd">
+  <div class="fd" :class="{ 'fd-mine': pageMode === 'mine' }">
     <template v-if="pageMode === 'home'">
       <section class="fd-intro">
         <div class="fd-intro-top">
@@ -1345,7 +1219,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 
       <section v-if="auth.canBeFollowLeader" class="fd-sec">
         <header>
-          <p class="fd-kicker blue">我的带单<span>{{ selfGroups.length || (myLeader ? 1 : 0) }}</span></p>
+          <p class="fd-kicker blue">我的带单<span>{{ selfOrders.length }}</span></p>
           <em class="fd-sec-note">仅带单员可见</em>
         </header>
         <p v-if="!myLeader" class="fd-empty">你有带单能力，但还没有可被跟随的主节点分组。</p>
@@ -1362,55 +1236,54 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
               <small>{{ selfMeta }}</small>
             </div>
             <div class="fd-self-side">
-              <em class="fd-self-run"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46A7.93 7.93 0 0 0 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74A7.93 7.93 0 0 0 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z"/></svg>{{ selfRunLabel }}</em>
+              <em class="fd-self-run"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46A7.93 7.93 0 0 0 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74A7.93 7.93 0 0 0 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z"/></svg>{{ myLeader.follow_paused ? '带单已暂停' : selfOrders.length + ' 笔持仓' }}</em>
+              <button type="button" class="fd-self-hold" :class="{ on: myLeader.follow_paused }" :disabled="pauseBusy" @click="pauseMine">
+                <svg v-if="myLeader.follow_paused" viewBox="0 0 24 24"><path fill="currentColor" d="M8 5v14l11-7z"/></svg>
+                <svg v-else viewBox="0 0 24 24"><path fill="currentColor" d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+                {{ myLeader.follow_paused ? '恢复带单' : '暂停带单' }}
+              </button>
               <button type="button" class="fd-self-link" @click="openShowcase()">查看带单员<svg viewBox="0 0 24 24"><path fill="currentColor" d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg></button>
             </div>
           </header>
-          <p v-if="!selfGroups.length" class="fd-empty">主节点上还没有可展示的带单分组。</p>
+          <p v-if="!selfOrders.length" class="fd-empty">暂无带单持仓。</p>
           <div v-else class="fd-self-list">
-            <div v-for="g in selfGroups" :key="g.group_id" class="fd-self-item">
+            <div v-for="book in selfMagicBooks" :key="`${book.nodeId}:${book.magic}`" class="fd-self-item">
               <div class="fd-self-row">
                 <p>
                   <svg viewBox="0 0 24 24"><path fill="currentColor" d="M7 2v11h3v9l7-12h-4l4-8z"/></svg>
-                  <b>{{ selfItemTitle(g) }}</b>
-                  <!-- <em v-if="selfMagicLabel(g.group_id)" class="fd-mf">{{ selfMagicLabel(g.group_id) }}</em> -->
-                  <em v-if="selfNodeLabel()" class="fd-node"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M20 13H4c-.55 0-1 .45-1 1v6c0 .55.45 1 1 1h16c.55 0 1-.45 1-1v-6c0-.55-.45-1-1-1zM7 19c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zM20 3H4c-.55 0-1 .45-1 1v6c0 .55.45 1 1 1h16c.55 0 1-.45 1-1V4c0-.55-.45-1-1-1zM7 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2z"/></svg>{{ selfNodeLabel() }}</em>
-                  <span v-if="selfSyncLabel(g.group_id)">{{ selfSyncLabel(g.group_id) }}</span>
+                  <b>{{ book.title }}</b>
                 </p>
                 <div class="fd-self-actions">
-                  <em :class="selfItemState(g.active_task_count).cls"><i></i>{{ selfItemState(g.active_task_count).text }}</em>
-                  <button type="button" class="fd-self-hold" :class="{ on: myLeader.follow_paused }" :disabled="pauseBusy" @click="pauseMine">
-                    <svg v-if="myLeader.follow_paused" viewBox="0 0 24 24"><path fill="currentColor" d="M8 5v14l11-7z"/></svg>
-                    <svg v-else viewBox="0 0 24 24"><path fill="currentColor" d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
-                    {{ myLeader.follow_paused ? '恢复跟单' : '暂停跟单' }}
-                  </button>
+                  <em class="live"><i></i>持仓中</em>
                 </div>
               </div>
               <div class="fd-book">
                 <div class="fd-book-head">
                   <span><svg viewBox="0 0 24 24"><path fill="currentColor" d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-2 10H7v-2h10v2zm0-4H7V7h10v2z"/></svg>订单列表</span>
-                  <span class="fd-book-meta"><b><svg viewBox="0 0 24 24"><path fill="currentColor" d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zM3 9h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7z"/></svg>{{ g.symbol || '—' }}</b><i>{{ bookStats(selfPositions(g.group_id)).count }} 笔持仓 · 浮动 {{ fmtU(bookStats(selfPositions(g.group_id)).profit) }} U</i></span>
+                  <span class="fd-book-meta"><b><svg viewBox="0 0 24 24"><path fill="currentColor" d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zM3 9h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7z"/></svg>{{ book.count }} 笔持仓</b><i>浮动 {{ fmtU(book.profit) }} U</i></span>
                 </div>
-                <p v-if="!selfPositions(g.group_id).length" class="fd-empty">暂无持仓</p>
-                <div v-else class="fd-self-orders">
-                  <div v-for="p in selfPositions(g.group_id)" :key="p.ticket" class="fd-self-pos">
+                <div class="fd-self-orders">
+                  <div v-for="p in book.orders" :key="p.ticket" class="fd-self-pos">
                     <div>
                       <em :class="(p.type || '').toLowerCase() === 'buy' ? 'buy' : 'sell'">{{ (p.type || '').toLowerCase() === 'buy' ? 'BUY' : 'SELL' }}</em>
                       <span>{{ p.symbol }}</span>
-                      <span class="hold"><i></i>正在持仓</span>
+                      <span>#{{ p.ticket }}</span>
                       <strong :class="(p.profit || 0) >= 0 ? 'up' : 'down'">{{ fmtU(p.profit || 0) }} U</strong>
+                      <button type="button" class="fd-close" :disabled="closeBusy" @click="closeRows([p], `订单 #${p.ticket}`)"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M7 2v11h3v9l7-12h-4l4-8z"/></svg>平此单</button>
                     </div>
                     <p>开仓 {{ fmtTime(p.time) }} · {{ (p.volume || 0).toFixed(2) }} 手 @ {{ fmtPx(p.price_open) }} · SL {{ fmtPx(p.sl) }} / TP {{ fmtPx(p.tp) }}</p>
                   </div>
                 </div>
               </div>
               <div class="fd-stats">
-                <div><span>持仓笔数</span><b>{{ bookStats(selfPositions(g.group_id)).count }} 笔</b></div>
-                <div><span>合计手数</span><b>{{ bookStats(selfPositions(g.group_id)).volume.toFixed(2) }} 手</b></div>
-                <div><span>浮动盈亏</span><b :class="bookStats(selfPositions(g.group_id)).profit >= 0 ? 'up' : 'down'">{{ fmtU(bookStats(selfPositions(g.group_id)).profit) }} U</b></div>
+                <div><span>持仓笔数</span><b>{{ book.count }} 笔</b></div>
+                <div><span>持仓手数</span><b>{{ book.volume.toFixed(2) }} 手</b></div>
+                <div><span>浮动盈亏</span><b :class="book.profit >= 0 ? 'up' : 'down'">{{ fmtU(book.profit) }} U</b></div>
               </div>
               <footer>
-                <button type="button" class="fd-close" :disabled="closeBusy || !selfPositions(g.group_id).length" @click="closeSelfGroup(g.group_id, selfItemTitle(g))"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M7 2v11h3v9l7-12h-4l4-8z"/></svg>一键平仓</button>
+                <button type="button" class="fd-close" :disabled="closeBusy" @click="closeRows(book.orders, `魔术号 ${book.magic}`)">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M7 2v11h3v9l7-12h-4l4-8z"/></svg>一键平仓
+                </button>
               </footer>
             </div>
           </div>
@@ -1420,18 +1293,17 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
     </template>
 
     <template v-else-if="pageMode === 'mine'">
-      <button type="button" class="fd-back" @click="pageMode = 'home'">返回带单广场</button>
       <section class="fd-mine-hero">
         <div class="fd-mine-title">
           <span class="fd-mark"><svg viewBox="0 0 24 24"><path fill="currentColor" d="m6.99 11 2.51-2.5L8.09 7 3 12.09 8.09 17.2l1.41-1.41L6.99 13.2H14v-2.2zM21 6.91 15.91 1.8 14.5 3.21l2.51 2.5H10v2.2h7.01l-2.51 2.5 1.41 1.41z"/></svg></span>
           <div><p>我的跟单</p><small>我跟随的带单员 · 策略同步与收益一览</small></div>
         </div>
         <div class="fd-stat3">
-          <div><span><svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46A7.93 7.93 0 0 0 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74A7.93 7.93 0 0 0 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z"/></svg>跟单中</span><b class="up">{{ myFollowing.filter(entry => entry.groups.some(group => groupIsRunning(entry, group.group_id))).length }} 个</b></div>
+          <div><span><svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46A7.93 7.93 0 0 0 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74A7.93 7.93 0 0 0 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z"/></svg>跟单中</span><b class="up">{{ followStats.running }} 个</b></div>
           <div><span><svg viewBox="0 0 24 24"><path fill="currentColor" d="M16 6l2.29 2.29-4.88 4.88-4-4L2 16.59 3.41 18l6-6 4 4 6.3-6.29L22 12V6z"/></svg>累计收益</span><b :class="followStats.profitKnown ? (followStats.profit >= 0 ? 'up' : 'down') : ''">{{ followStats.profitKnown ? fmtU(followStats.profit) : '暂无数据' }}</b></div>
-          <div><span><svg viewBox="0 0 24 24"><path fill="currentColor" d="M7 11h2v2H7zm4 0h2v2h-2zm4 0h2v2h-2zM5 5h2v2H5zm0 4h2v2H5zm0 4h2v2H5zM19 5h-8v2h8zm0 4h-8v2h8zm0 4h-8v2h8zM5 17h2v2H5zm4 0h10v2H9z"/></svg>平均收益率</span><b :class="followStats.rateKnown ? (followStats.rate >= 0 ? 'up' : 'down') : ''">{{ followStats.rateKnown ? (followStats.rate >= 0 ? '+' : '') + followStats.rate.toFixed(2) + '%' : '暂无数据' }}</b></div>
+          <div><span><svg viewBox="0 0 24 24"><path fill="currentColor" d="m5 19 14-14-1.5-1.5-14 14zM7 3a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm0 2a2 2 0 1 1 0 4 2 2 0 0 1 0-4zm10 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm0 2a2 2 0 1 1 0 4 2 2 0 0 1 0-4z"/></svg>平均收益率</span><b :class="followStats.rateKnown ? (followStats.rate >= 0 ? 'up' : 'down') : ''">{{ followStats.rateKnown ? (followStats.rate >= 0 ? '+' : '') + followStats.rate.toFixed(2) + '%' : '暂无数据' }}</b></div>
         </div>
-        <p class="fd-note"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M11 17h2v-6h-2zm0-8h2V7h-2zm1-7C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z"/></svg>跟单申请经带单员审核后，按分组同步后续开仓和平仓。待审核的节点暂不接收信号。</p>
+        <p class="fd-note"><svg viewBox="0 0 24 24"><path fill="currentColor" fill-rule="evenodd" d="M12 2a10 10 0 1 1 0 20 10 10 0 0 1 0-20zm-1 5v2h2V7zm0 4v6h2v-6z"/></svg>每位带单员可提供市价开仓、限价开仓和智能吸筹。跟单申请通过后，按分组同步后续信号。</p>
       </section>
 
       <div class="fd-tabs">
@@ -1442,12 +1314,13 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
       <section v-if="mineTab === 'list'" class="fd-sec">
         <header>
           <p class="fd-kicker blue">跟单列表<span>{{ recordLeaderCount }} 位带单员</span></p>
+          <small v-if="latestSync" class="fd-sync">最近同步 {{ fmtTime(latestSync) }}</small>
         </header>
         <div v-if="applicationOnlyGroups.length" class="fd-grid">
           <article v-for="group in applicationOnlyGroups" :key="'application-' + group.leader_user_id" class="fd-card fd-applications">
             <header class="fd-card-top"><span class="fd-avatar lg">{{ group.leader_name.slice(0, 1) }}</span><div><b>{{ group.leader_name }}</b><small>跟单申请 · {{ group.nodes.filter(node => node.status === 'pending').length }} 条待通过</small></div></header>
             <div v-for="node in group.nodes" :key="node.request_id" class="fd-item">
-              <div class="fd-item-top"><p><b>{{ node.strategy_name || node.group_name || '跟单申请' }}</b><em v-if="node.symbol">{{ node.symbol }}</em></p><em :class="node.status === 'pending' ? 'fd-pending' : 'off'">{{ node.status === 'pending' ? '待通过' : node.status === 'rejected' ? '已拒绝' : '已移出 / 失效' }}</em></div>
+              <div class="fd-item-top"><p><b>{{ applicationTitle(node) }}</b></p><em :class="node.status === 'pending' ? 'fd-pending' : 'off'">{{ node.status === 'pending' ? '待通过' : node.status === 'rejected' ? '已拒绝' : '已移出 / 失效' }}</em></div>
               <p class="fd-application-node">{{ node.name || node.node_id }} <span v-if="node.is_primary">主节点</span> · {{ node.mt5_login || node.node_id }}</p>
               <p class="fd-application-note">{{ node.status === 'pending' ? '⌛ 等待带单员通过申请' : node.reason || '可重新选择节点申请跟单' }}</p>
               <button v-if="node.status !== 'pending' && node.available" type="button" class="fd-link" @click="retryApplication(node)">重新申请 ›</button>
@@ -1455,111 +1328,133 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
           </article>
         </div>
         <p v-if="mineLoading && !myFollowing.length" class="fd-empty">加载中…</p>
-        <p v-else-if="!myFollowing.length && !applicationGroups.length" class="fd-empty">还没有跟随的带单员</p>
+        <div v-else-if="!myFollowing.length && !applicationGroups.length" class="fd-mine-empty">
+          <b>还没有跟单</b><p>前往带单广场选择带单员，申请加入跟单。</p><button class="fd-link" @click="pageMode = 'home'">去带单广场 ›</button>
+        </div>
         <div v-else class="fd-grid">
           <article v-for="entry in myFollowing" :key="entry.leader.leader_user_id" class="fd-card">
-            <header class="fd-card-top">
+            <header class="fd-self-top">
               <span class="fd-avatar lg"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 12a5 5 0 1 0-5-5 5 5 0 0 0 5 5zm0 2c-3.33 0-10 1.67-10 5v3h20v-3c0-3.33-6.67-5-10-5z"/></svg></span>
-              <div>
+              <div class="fd-self-id">
                 <p>
                   <b>{{ leaderName(entry.leader) }}</b>
                   <svg class="fd-verified" viewBox="0 0 24 24"><path fill="currentColor" d="m12 2 2.4 2.2 3.2-.6.8 3.1 2.9 1.5-1.1 3 1.1 3-2.9 1.5-.8 3.1-3.2-.6L12 22l-2.4-2.2-3.2.6-.8-3.1L2.7 15.8l1.1-3-1.1-3 2.9-1.5.8-3.1 3.2.6z"/></svg>
                   <em v-if="entry.leader.follow_paused" class="pause">已暂停</em>
                   <em v-else class="ok">已认证</em>
                 </p>
-                <small>{{ entry.groups.map((g) => g.symbol || g.strategy_name || g.group_name).filter(Boolean).join(' · ') || '跟随分组' }}</small>
+                <small>{{ entryMeta(entry) }}</small>
               </div>
-              <div class="fd-card-side">
-                <em class="on"><i></i>{{ entry.nodes.length }} 个节点</em>
-                <button type="button" class="fd-link" @click="openShowcase(entry.leader, 'mine')">查看详情</button>
-                <button type="button" class="fd-link" @click="openLeaveDialog(entry.leader)">移出节点</button>
+              <div class="fd-self-side">
+                <em class="fd-self-run"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 4V1L8 5l4 4V6a6 6 0 0 1 5.5 8.4l1.5 1.5A8 8 0 0 0 12 4zm0 16v3l4-4-4-4v3a6 6 0 0 1-5.5-8.4L5 8.1A8 8 0 0 0 12 20z"/></svg>{{ entry.groups.filter(groupIsRunning).length }}/{{ entry.groups.length }} 个跟单中</em>
+                <button type="button" class="fd-self-link" @click="openShowcase(entry.leader, 'mine')">查看带单员 ›</button>
               </div>
             </header>
             <p v-if="entry.leader.follow_paused" class="fd-warn">{{ PAUSED_FOLLOW_HINT }}</p>
             <div v-for="node in applicationRows(entry.leader.leader_user_id)" :key="'request-' + node.request_id" class="fd-item">
-              <div class="fd-item-top"><p><b>{{ node.strategy_name || node.group_name || '跟单申请' }}</b><em v-if="node.symbol">{{ node.symbol }}</em></p><em :class="node.status === 'pending' ? 'fd-pending' : 'off'">{{ node.status === 'pending' ? '待通过' : node.status === 'rejected' ? '已拒绝' : '已移出 / 失效' }}</em></div>
+              <div class="fd-item-top"><p><b>{{ applicationTitle(node) }}</b></p><em :class="node.status === 'pending' ? 'fd-pending' : 'off'">{{ node.status === 'pending' ? '待通过' : node.status === 'rejected' ? '已拒绝' : '已移出 / 失效' }}</em></div>
               <p class="fd-application-node">{{ node.name || node.node_id }} <span v-if="node.is_primary">主节点</span> · {{ node.mt5_login || node.node_id }}</p>
               <p class="fd-application-note">{{ node.status === 'pending' ? '⌛ 等待带单员通过申请' : node.reason || '可重新选择节点申请跟单' }}</p>
               <button v-if="node.status !== 'pending' && node.available" type="button" class="fd-link" @click="retryApplication(node)">重新申请 ›</button>
             </div>
             <div v-for="g in entry.groups" :key="g.group_id" class="fd-item">
-              <div class="fd-item-top">
+              <div class="fd-self-row">
                 <p>
-                  <svg viewBox="0 0 24 24"><path fill="currentColor" d="M7 2v11h3v9l7-12h-4l4-8z"/></svg>
-                  <b>{{ groupDisplayTitle(g.group_name, g.strategy_name) }}</b>
-                  <em v-if="g.symbol">{{ g.symbol }}</em>
-                  <span>进行中 {{ g.active_task_count }}</span>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" :d="(g.mode || groupModeKey(g.group_name, g.strategy_name)) === 'trend_limit' ? 'M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm0 2a8 8 0 1 1 0 16 8 8 0 1 1 0-16zm-1 2v7l5 3 1-2-4-2V6z' : 'M7 2v11h3v9l7-12h-4l4-8z'"/></svg>
+                  <b>{{ SELF_MODE_LABEL[g.mode || ''] || groupDisplayTitle(g.group_name, g.strategy_name) }}</b>
+                  <em v-if="Object.values(g.magics || {}).flat().length" class="fd-mf" :title="magicLabel(g)">{{ magicLabel(g) }}</em>
+                  <em v-if="g.group_name" class="fd-node" :title="g.group_name"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M3 3h18v8H3zm0 10h18v8H3zm3-8v3h3V5zm0 10v3h3v-3z"/></svg>{{ g.group_name }}</em>
+                  <span v-if="g.last_sync">同步 {{ fmtTime(g.last_sync) }}</span>
                 </p>
-                <em :class="groupIsRunning(entry, g.group_id) ? 'on' : 'off'"><i></i>{{ groupIsRunning(entry, g.group_id) ? '跟单中' : '已暂停' }}</em>
+                <div class="fd-self-actions">
+                  <em :class="groupIsRunning(g) ? 'live' : 'pause'"><i></i>{{ groupIsRunning(g) ? '跟单中' : '已暂停' }}</em>
+                  <button class="fd-self-hold" :class="{ on: !canPause(groupTargets(g.group_id)) }"
+                    :disabled="mutationBusy || groupTargets(g.group_id).every(t => t.locked)" @click="toggleRelations(groupTargets(g.group_id))">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" :d="canPause(groupTargets(g.group_id)) ? 'M6 19h4V5H6v14zm8-14v14h4V5h-4z' : 'M8 5v14l11-7z'"/></svg>
+                    {{ canPause(groupTargets(g.group_id)) ? '暂停跟单' : '恢复跟单' }}
+                  </button>
+                </div>
               </div>
               <div class="fd-book">
-                <div class="fd-book-head"><span>订单列表</span><span>{{ g.symbol || '—' }} · {{ bookStats(entryGroupPositions(entry, g.group_id)).count }} 笔持仓 · 浮动 {{ fmtU(bookStats(entryGroupPositions(entry, g.group_id)).profit) }} U</span></div>
-                <p v-if="!entryGroupPositions(entry, g.group_id).length" class="fd-empty">暂无持仓</p>
-                <div v-for="p in entryGroupPositions(entry, g.group_id)" :key="p.nodeId + p.ticket" class="fd-pos">
-                  <div>
-                    <p><em :class="(p.type || '').toLowerCase() === 'buy' ? 'buy' : 'sell'">{{ (p.type || '').toLowerCase() === 'buy' ? 'BUY' : 'SELL' }}</em>{{ p.symbol }}</p>
-                    <small>开仓 {{ fmtTime(p.time) }} · {{ (p.volume || 0).toFixed(2) }} 手 @ {{ fmtPx(p.price_open) }} · SL {{ fmtPx(p.sl) }} / TP {{ fmtPx(p.tp) }}</small>
+                <div class="fd-book-head"><span><b aria-hidden="true">▤</b> 订单列表</span>
+                  <span class="fd-book-meta"><b>♢ {{ g.symbol || '—' }}</b><i>{{ books[g.group_id].count }} 笔持仓 · 浮动 {{ fmtU(books[g.group_id].profit) }} U</i></span>
+                </div>
+                <p v-if="!books[g.group_id].orders.length" class="fd-empty">暂无同步订单</p>
+                <div v-else class="fd-self-orders" tabindex="0" :aria-label="(g.group_name || '跟单') + '订单列表'">
+                  <div v-for="p in books[g.group_id].orders" :key="p.key" class="fd-self-pos">
+                    <div><em :class="p.direction.toLowerCase()">{{ p.direction }}</em><span>{{ p.symbol }}</span>
+                      <span class="hold" :class="{ tp: p.status === '已止盈', sl: p.status === '已止损', closed: p.status === '已平仓' }"><i></i>{{ p.status }}</span>
+                      <strong :class="p.profit >= 0 ? 'up' : 'down'">{{ fmtU(p.profit) }} U</strong>
+                    </div>
+                    <p>{{ p.description }}</p>
                   </div>
-                  <!-- <div class="fd-pos-side"><span class="dot">正在持仓</span><strong :class="(p.profit || 0) >= 0 ? 'up' : 'down'">{{ fmtU(p.profit || 0) }} U</strong></div> -->
                 </div>
               </div>
               <div class="fd-stats">
-                <div><span>持仓笔数</span><b>{{ bookStats(entryGroupPositions(entry, g.group_id)).count }} 笔</b></div>
-                <div><span>合计手数</span><b>{{ bookStats(entryGroupPositions(entry, g.group_id)).volume.toFixed(2) }} 手</b></div>
-                <div><span>浮动盈亏</span><b :class="bookStats(entryGroupPositions(entry, g.group_id)).profit >= 0 ? 'up' : 'down'">{{ fmtU(bookStats(entryGroupPositions(entry, g.group_id)).profit) }} U</b></div>
+                <div><span>持仓笔数</span><b>{{ books[g.group_id].count }} 笔</b></div>
+                <div><span>合计手数</span><b>{{ books[g.group_id].volume.toFixed(2) }} 手</b></div>
+                <div><span>浮动盈亏</span><b :class="books[g.group_id].profit >= 0 ? 'up' : 'down'">{{ fmtU(books[g.group_id].profit) }} U</b></div>
               </div>
               <footer>
-                <button type="button" class="fd-leave" @click="leaveOneGroup(entry, g.group_id, groupDisplayTitle(g.group_name, g.strategy_name, g.symbol))">移出</button>
-                <button type="button" class="fd-close" :disabled="closeBusy" @click="closeGroup(entry, g.group_id, groupDisplayTitle(g.group_name, g.strategy_name, g.symbol))"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M7 2v11h3v9l7-12h-4l4-8z"/></svg>一键平仓</button>
+                <button type="button" class="fd-close" :disabled="closeBusy || !books[g.group_id].count" @click="closeGroup(entry, g.group_id, groupDisplayTitle(g.group_name, g.strategy_name, g.symbol))"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M7 2v11h3v9l7-12h-4l4-8z"/></svg>一键平仓</button>
               </footer>
             </div>
           </article>
         </div>
       </section>
 
-      <section v-else class="fd-sec">
+      <section v-else class="fd-sec fd-nodes">
         <header>
-          <p class="fd-kicker blue">子节点跟单统计<span>{{ nodeCards.length }} 个节点</span></p>
-          <button type="button" class="fd-close" :disabled="closeBusy || !followStats.count" @click="closeAllMine"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M7 2v11h3v9l7-12h-4l4-8z"/></svg>一键平仓</button>
+          <p class="fd-kicker blue">子节点跟单统计<span>{{ shownNodes.length === nodeCards.length ? nodeCards.length : shownNodes.length + '/' + nodeCards.length }} 个节点</span></p>
+          <div class="fd-batch">
+            <button class="fd-self-hold" :class="{ resume: !canPause(relations) }" :disabled="mutationBusy || relations.every(t => t.locked)" @click="toggleRelations(relations, true)"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" fill-rule="evenodd" :d="canPause(relations) ? 'M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zM11 16H9V8h2zM15 16h-2V8h2z' : 'M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zM9.5 16.5v-9l7 4.5z'"/></svg>{{ canPause(relations) ? '一键暂停' : '一键启动' }}</button>
+            <button type="button" class="fd-close" :disabled="closeBusy || !nodeSummary.count" @click="closeAllMine"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M22 3.41l-5.29 5.29L20 12h-8V4l3.29 3.29L20.59 2 22 3.41zM3.41 22l5.29-5.29L12 20v-8H4l3.29 3.29L2 20.59 3.41 22z"/></svg>一键平仓</button>
+            <button class="fd-leave" :disabled="mutationBusy || !relations.length" @click="askStop(relations)"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" fill-rule="evenodd" d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zM16 16H8V8h8z"/></svg>一键停止</button>
+          </div>
         </header>
-        <p class="fd-sub">每个子节点独立统计持仓、手数和浮动盈亏。平仓只平该节点上属于带单频道的持仓。</p>
+
+        <p class="fd-sub">每个子节点独立统计，通过审核后按分组同步带单信号。</p>
         <div class="fd-filters">
-          <button type="button" :class="{ on: nodeFilter === 'all' }" @click="nodeFilter = 'all'">全部 {{ nodeFilterCounts.all }}</button>
-          <button type="button" :class="{ on: nodeFilter === 'online' }" @click="nodeFilter = 'online'">在线 {{ nodeFilterCounts.online }}</button>
-          <button type="button" :class="{ on: nodeFilter === 'pos' }" @click="nodeFilter = 'pos'">持仓 {{ nodeFilterCounts.pos }}</button>
-          <button type="button" :class="{ on: nodeFilter === 'win' }" @click="nodeFilter = 'win'">浮盈 {{ nodeFilterCounts.win }}</button>
-          <button type="button" :class="{ on: nodeFilter === 'loss' }" @click="nodeFilter = 'loss'">浮亏 {{ nodeFilterCounts.loss }}</button>
-          <button type="button" :class="{ on: nodeFilter === 'off' }" @click="nodeFilter = 'off'">离线 {{ nodeFilterCounts.off }}</button>
+          <button type="button" :class="{ on: nodeFilter === 'all' }" @click="nodeFilter = 'all'">全部 <span>{{ nodeFilterCounts.all }}</span></button>
+          <button type="button" :class="{ on: nodeFilter === 'online' }" @click="nodeFilter = 'online'">在线 <span>{{ nodeFilterCounts.online }}</span></button>
+          <button type="button" :class="{ on: nodeFilter === 'pos' }" @click="nodeFilter = 'pos'">持仓 <span>{{ nodeFilterCounts.pos }}</span></button>
+          <button type="button" :class="{ on: nodeFilter === 'win' }" @click="nodeFilter = 'win'">浮盈 <span>{{ nodeFilterCounts.win }}</span></button>
+          <button type="button" :class="{ on: nodeFilter === 'loss' }" @click="nodeFilter = 'loss'">浮亏 <span>{{ nodeFilterCounts.loss }}</span></button>
+          <button type="button" :class="{ on: nodeFilter === 'off' }" @click="nodeFilter = 'off'">离线 <span>{{ nodeFilterCounts.off }}</span></button>
         </div>
-        <label class="fd-search"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg><input v-model="nodeQuery" placeholder="搜索子节点：名称 / 账户 / 品种 / 带单员" /></label>
+        <label class="fd-search"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg><input v-model="nodeQuery" placeholder="搜索子节点：名称 / 账户 / 服务器 / 品种 / 状态" /><button v-if="nodeQuery" aria-label="清空搜索" @click="nodeQuery = ''">×</button></label>
         <div class="fd-sum4">
           <div><span>跟单节点</span><b>{{ nodeCards.length }} 个</b></div>
           <div><span>持仓手数</span><b>{{ nodeSummary.volume.toFixed(2) }} 手</b></div>
-          <div><span>账户余额</span><b>{{ nodeSummary.balance == null ? '—' : nodeSummary.balance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) }}</b></div>
+          <div><span>首单账户余额</span><b>{{ nodeSummary.balance == null ? '暂无数据' : nodeSummary.balance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) }}</b></div>
           <div><span>总浮动盈亏</span><b :class="nodeSummary.profit >= 0 ? 'up' : 'down'">{{ fmtU(nodeSummary.profit) }}</b></div>
         </div>
-        <p class="fd-sub">盈利节点 {{ nodeSummary.wins }} / {{ nodeCards.length }} · 共持仓 {{ nodeSummary.count }} 笔</p>
+        <p class="fd-sub">盈利节点 {{ nodeSummary.wins }} / {{ nodeSummary.active }} · 共持仓 {{ nodeSummary.count }} 笔 · 汇总数据仅统计运行中与已暂停节点</p>
         <p v-if="!shownNodes.length" class="fd-empty">没有符合条件的节点</p>
-        <article v-for="card in shownNodes" :key="card.node_id" class="fd-node-card">
+        <div class="fd-grid"><article v-for="card in shownNodes" :key="card.node_id" class="fd-node-card">
           <header>
-            <span class="fd-avatar"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M4 6h16v2H4zm2 4h12v8H6z"/></svg></span>
+            <span class="fd-avatar"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M22 11V3h-7v3H9V3H2v8h7V8h2v10h4v3h7v-8h-7v3h-2V8h2v3z"/></svg></span>
             <div>
               <b>{{ card.name }}</b>
-              <small>{{ card.login ?? '—' }} · {{ card.symbols }} · {{ card.leaders }}</small>
+              <small>{{ [card.login, card.server, card.symbols].filter(Boolean).join(' · ') }}</small>
             </div>
-            <em :class="card.online ? 'on' : 'off'"><i></i>{{ card.online ? '在线' : '离线' }}</em>
+            <em :class="card.state === '跟单中' ? 'on' : 'off'"><i></i>{{ card.state }}</em>
           </header>
-          <div class="fd-pnl" :class="card.profit >= 0 ? 'up' : 'down'"><span>浮动盈亏</span><b>{{ fmtU(card.profit) }}</b></div>
+          <div class="fd-pnl" :class="card.profit >= 0 ? 'up' : 'down'"><span><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" :d="card.state === '已停止' ? 'M19 13H5v-2h14z' : 'M16 6l2.29 2.29-4.88 4.88-4-4L2 16.59 3.41 18l6-6 4 4 6.3-6.29L22 12V6z'"/></svg>浮动盈亏</span><b>{{ fmtU(card.profit) }}</b></div>
           <div class="fd-stats">
             <div><span>持仓笔数</span><b>{{ card.count }} 笔</b></div>
             <div><span>手数</span><b>{{ card.volume.toFixed(2) }}</b></div>
             <div><span>账户余额</span><b>{{ card.balance }}</b></div>
           </div>
           <footer>
-            <button type="button" class="fd-leave" @click="stopNode(card)">移出</button>
-            <button type="button" class="fd-close" :disabled="closeBusy || !card.count" @click="closeNodeCard(card)">{{ card.count ? '一键平仓' : '已平仓' }}</button>
+            <span class="fd-symbol">{{ card.symbols }}</span>
+            <small v-if="card.state === '待审核' || card.state === '已停止'">{{ card.state === '待审核' ? '等待带单员通过申请' : '已停止跟单' }}</small>
+            <template v-else>
+            <button type="button" class="fd-self-hold" :aria-label="canPause(nodeTargets(card.node_id)) ? '暂停跟单' : '恢复跟单'" :title="canPause(nodeTargets(card.node_id)) ? '暂停跟单' : '恢复跟单'" :disabled="mutationBusy || nodeTargets(card.node_id).every(t => t.locked)" @click="toggleRelations(nodeTargets(card.node_id))"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" :d="canPause(nodeTargets(card.node_id)) ? 'M6 19h4V5H6zm8-14v14h4V5z' : 'M8 5v14l11-7z'"/></svg></button>
+            <button type="button" class="fd-close" :disabled="closeBusy || !card.count" @click="closeNodeCard(card)" :aria-label="card.count ? '一键平仓' : '已平仓'" :title="card.count ? '一键平仓' : '已平仓'"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M22 3.41l-5.29 5.29L20 12h-8V4l3.29 3.29L20.59 2 22 3.41zM3.41 22l5.29-5.29L12 20v-8H4l3.29 3.29L2 20.59 3.41 22z"/></svg></button>
+            <button type="button" class="fd-leave" :disabled="mutationBusy" @click="askStop(nodeTargets(card.node_id))" aria-label="停止跟单" title="停止跟单"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" fill-rule="evenodd" d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zM16 16H8V8h8z"/></svg></button>
+            </template>
           </footer>
-        </article>
+        </article></div>
       </section>
     </template>
 
@@ -1705,19 +1600,19 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
       </section>
     </div>
 
-    <ElDialog v-model="leaveDialogVisible" title="移出跟单" width="420px">
-      <p v-if="leaveDialog" class="fd-empty">从「{{ leaderName(leaveDialog.leader) }}」移出选中的节点。节点会退出它跟随的全部分组。</p>
-      <label v-if="leaveDialog" class="fd-pick">
-        <input type="checkbox" :checked="leaveAllSelected" @change="toggleAllLeaveNodes" />
-        全选
-      </label>
-      <label v-for="n in leaveDialog?.entry.nodes || []" :key="n.node_id" class="fd-pick">
-        <input type="checkbox" :checked="leaveDialog?.selected.includes(n.node_id)" @change="toggleLeaveNode(n.node_id)" />
-        {{ n.name || n.node_id }}
-      </label>
+    <ElDialog :model-value="!!stopTargets.length" title="确认停止跟单" width="min(420px, 92vw)"
+      :close-on-click-modal="false" :close-on-press-escape="!mutationBusy" :show-close="!mutationBusy"
+      @close="cancelStop">
+      <p>将停止选中的 {{ selectedStops.length }} 条跟单关系，当前快照可见 {{ stopPositions }} 笔持仓。</p>
+      <div class="fd-stop-list"><label v-for="t in stopTargets" :key="t.group_id + ':' + t.node_id">
+        <input v-model="selectedStops" type="checkbox" :value="t" :disabled="mutationBusy"
+          @change="trackFollowUi('select_nodes', { value: 'stop-follow', node_ids: [t.node_id] })" /> {{ t.label }}
+      </label></div>
+      <label><input v-model="stopWithClose" type="checkbox" @change="trackFollowUi('filter', { value: stopWithClose ? 'stop-and-close' : 'stop-and-keep' })" :disabled="mutationBusy" /> 同时平仓并关闭相关任务</label>
+      <p>默认保留持仓，进行中的任务继续按策略执行。</p>
       <template #footer>
-        <button type="button" :disabled="leaveSubmitting" @click="closeLeaveDialog">取消</button>
-        <button type="button" class="primary" :disabled="leaveSubmitting || !leaveDialog?.selected.length" @click="confirmLeave">确认移出</button>
+        <button type="button" :disabled="mutationBusy" @click="cancelStop">取消</button>
+        <button type="button" class="fd-close" :disabled="mutationBusy || !selectedStops.length" @click="stopSelected">确认停止</button>
       </template>
     </ElDialog>
   </div>
@@ -1735,7 +1630,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 .fd-intro-top::before, .fd-intro-top::after { content: ''; position: absolute; border-radius: 99px; pointer-events: none; }
 .fd-intro-top::before { right: -24px; top: -32px; width: 96px; height: 96px; background: rgba(124,58,237,.2); filter: blur(16px); }
 .fd-intro-top::after { right: 40px; bottom: -36px; width: 80px; height: 80px; background: rgba(37,99,235,.15); filter: blur(16px); }
-.fd-intro-head, .fd-sec header, .fd-card-top, .fd-item-top, .fd-book-head, .fd-pos, .fd-node-card header, .fd-node-card footer, .fd-item footer, .fd-dialog header, .fd-dialog footer, .fd-pick, .fd-preview-top, .fd-mine-title, .fd-tabs, .fd-filters {
+.fd-intro-head, .fd-sec header, .fd-card-top, .fd-item-top, .fd-book-head, .fd-node-card header, .fd-node-card footer, .fd-item footer, .fd-self-item footer, .fd-dialog header, .fd-dialog footer, .fd-pick, .fd-preview-top, .fd-mine-title, .fd-tabs, .fd-filters {
   display: flex; align-items: center; gap: 8px;
 }
 .fd-intro-head { position: relative; padding: 0; }
@@ -1768,7 +1663,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 .fd-kicker.green::before { background: #22C55E; }
 .fd-kicker.blue::before { background: #2563EB; }
 .fd-kicker span, .fd-sec header em { border: 1px solid #22304A; background: #0C1220; color: #5B6B85; border-radius: 999px; padding: 0 6px; font-size: 10px; font-style: normal; font-weight: 500; }
-.fd-ghost, .fd-follow, .fd-close, .fd-leave, .fd-link, .fd-back, .fd-tabs button, .fd-filters button, .fd-dialog button, .fd-pick { cursor: pointer; }
+.fd-ghost, .fd-follow, .fd-close, .fd-leave, .fd-link, .fd-tabs button, .fd-filters button, .fd-dialog button, .fd-pick { cursor: pointer; }
 .fd-ghost { display: flex; align-items: center; gap: 4px; border: 1px solid #22304A; background: #0C1220; color: #8B96A8; border-radius: 8px; padding: 4px 8px; font-size: 10px; }
 /* 列宽用 minmax(0,1fr)：默认 auto 列会被卡片内容的 min-content 撑开，
    窄屏下卡片就会顶出屏幕；子项 + min-width:0 才能配合收缩。 */
@@ -1802,7 +1697,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 .fd-swap { width: 36px; height: 36px; border-radius: 12px; color: #22C55E; background: rgba(34,197,94,.15); }
 .fd-swap svg { width: 18px; height: 18px; }
 .fd-preview-top b { display: block; font-size: 12px; }
-.fd-chev { color: #4A5568; }
+.fd-chev { margin-inline-start: auto; flex-shrink: 0; color: #4A5568; }
 .fd-chips { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 6px; width: 100%; margin-top: 10px; padding-top: 10px; border-top: 1px solid #1E2B47; }
 .fd-chips > span, .fd-stats > div, .fd-sum4 > div, .fd-stat3 > div { min-width: 0; border: 1px solid #22304A; background: #0C1220; border-radius: 8px; padding: 6px 8px; }
 .fd-chips b { display: flex; align-items: center; gap: 4px; font-size: 9px; }
@@ -1868,10 +1763,10 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 .fd-self .fd-stats b { color: #E6EBF4; }
 .fd-self .fd-stats b.up { color: #22C55E; }
 .fd-self .fd-stats b.down { color: #F6465D; }
-.fd-self-item footer { display: flex; justify-content: flex-end; margin-top: 8px; padding-top: 8px; border-top: 1px solid #1E2B47; }
+.fd-self-item .fd-self-pos > div { flex-wrap: wrap; }
+.fd-self-item .fd-self-pos strong { margin-left: auto; }
 .fd-self .fd-close:hover:not(:disabled) { background: #E03A50; }
 @keyframes fd-pulse { 0% { box-shadow: 0 0 0 0 rgba(34,197,94,.55); } 100% { box-shadow: 0 0 0 5px rgba(34,197,94,0); } }
-.fd-card-side { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
 .fd-link { border: 0; background: transparent; color: #3B82F6; font-size: 10px; }
 .fd-item { margin-top: 10px; min-width: 0; max-width: 100%; border: 1px solid #22304A; background: #0C1220; border-radius: 8px; padding: 10px; }
 .fd-item-top { justify-content: space-between; }
@@ -1888,26 +1783,13 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 .fd-book .fd-empty { padding: 8px; }
 /* 持仓行：左侧「BUY XAUUSD + 开仓详情」可能很长，必须能收缩省略，
    否则窄屏下会把右侧盈亏挤出卡片。 */
-.fd-pos { justify-content: space-between; gap: 8px; padding: 6px 8px; border-bottom: 1px solid #161F30; min-width: 0; }
-.fd-pos:last-child { border-bottom: 0; }
-.fd-pos > div:first-child { min-width: 0; flex: 1; }
-.fd-pos p { display: flex; align-items: center; gap: 6px; margin: 0; font-size: 11px; min-width: 0; }
-.fd-pos small { display: block; color: #5B6B85; font-size: 9px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.fd-pos em { font-style: normal; font-size: 9px; font-weight: 700; border-radius: 4px; padding: 1px 4px; }
-.fd-pos em.buy { color: #22C55E; background: rgba(34,197,94,.15); }
-.fd-pos em.sell { color: #F6465D; background: rgba(246,70,93,.15); }
-.fd-pos-side { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
-.fd-pos-side .dot { color: #60A5FA; font-size: 10px; white-space: nowrap; }
-.fd-pos-side strong { white-space: nowrap; font-variant-numeric: tabular-nums; }
-.fd-pos-side .dot::before { content: ''; display: inline-block; width: 6px; height: 6px; margin-right: 4px; border-radius: 99px; background: #3B82F6; }
 .up { color: #22C55E; } .down { color: #F6465D; }
 .fd-stats, .fd-sum4 { margin-top: 8px; display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 6px; }
 .fd-sum4 { grid-template-columns: 1fr 1fr; }
 .fd-stats > div, .fd-sum4 > div { background: #0A101E; border-color: #1E2B47; }
-.fd-item footer, .fd-node-card footer { justify-content: flex-end; margin-top: 8px; padding-top: 8px; border-top: 1px solid #1E2B47; }
+.fd-self-item footer, .fd-item footer, .fd-node-card footer { justify-content: flex-end; margin-top: 8px; padding-top: 8px; border-top: 1px solid #1E2B47; }
 .fd-close { display: inline-flex; align-items: center; gap: 4px; border: 0; border-radius: 8px; background: #F6465D; color: #fff; font-size: 11px; font-weight: 650; padding: 6px 12px; box-shadow: 0 2px 8px rgba(246,70,93,.35); }
 .fd-leave { border: 1px solid rgba(246,70,93,.7); background: transparent; color: #F6465D; border-radius: 8px; padding: 6px 12px; font-size: 11px; font-weight: 650; }
-.fd-back { align-self: flex-start; border: 0; background: transparent; color: #8B96A8; font-size: 12px; }
 .fd-mine-hero { padding: 12px; background: linear-gradient(135deg, #101828, #101C38); }
 .fd-stat3 { margin-top: 12px; display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 8px; }
 .fd-stat3 > div { background: #101828; }
@@ -2054,5 +1936,102 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
   .fd-book-meta { min-width: 0; overflow: hidden; }
   .fd-book-meta i { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .fd-stats > div, .fd-stat3 > div, .fd-chips > span { padding: 6px 4px; }
+}
+
+.fd-mine .fd-mark { width: 36px; height: 36px; border-radius: 12px; background: linear-gradient(135deg,#2563eb,#7c3aed); }
+:global(.app-shell.is-customer:has(.fd-mine)) { background: #0b111c; }
+:global(.app-shell.is-customer:has(.fd-mine) .brand-back) { width: 28px; height: 28px; justify-content: center; margin-right: 4px; color: #8b96a8; }
+.fd-mine .fd-self-link { padding: 0; line-height: 15px; }
+.fd-mine .fd-self-id em.ok { padding: 3px 6px; }
+.fd-mine .fd-self-id p { line-height: 18px; }
+.fd-mine .fd-self-pos > div { line-height: 16px; }
+.fd-mine .fd-self-pos > p { line-height: 14px; }
+.fd-mine .fd-self-row p > b { flex: none; max-width: 110px; }
+.fd-mine .fd-book-meta b { flex: none; }
+.fd-mine .fd-stats > div { padding: 6px 8px; }
+.fd-mine .fd-stats span { line-height: 14px; }
+.fd-mine .fd-stats b { line-height: 17px; }
+.fd-mine .fd-mine-title { gap: 10px; }
+.fd-mine .fd-mine-title p { font-size: 14px; line-height: 20px; }
+.fd-mine .fd-mine-title small { display: block; margin-top: 2px; line-height: 15px; }
+.fd-mine .fd-sec > header { min-height: 21px; }
+.fd-mine .fd-sec > .fd-grid { margin-top: 10px; }
+.fd-mine .fd-mine-hero .fd-note { line-height: 15px; }
+.fd-mine .fd-node-card .fd-avatar { width: 36px; height: 36px; background: #2563eb28; color: #60a5fa; }
+.fd-mine .fd-nodes .fd-pnl { margin-top: 10px; padding: 10px 12px; }
+.fd-mine .fd-nodes .fd-pnl span { color: #8b96a8; font-size: 10px; }
+.fd-mine .fd-nodes .fd-pnl b { font-size: 16px; }
+.fd-mine .fd-batch button { padding: 6px 10px; font-size: 11px; line-height: 16px; border-radius: 8px; }
+.fd-mine .fd-nodes .fd-self-hold { color: #f59e0b; background: #f59e0b19; border-color: #f59e0b66; }
+.fd-mine .fd-nodes .fd-close, .fd-mine .fd-nodes .fd-leave { color: #f6465d; background: #f6465d19; border: 1px solid #f6465d66; box-shadow: none; }
+.fd-mine .fd-nodes .fd-filters { gap: 6px; flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; padding-bottom: 2px; margin-top: 10px; }
+.fd-mine .fd-filters button { flex: none; font-size: 10px; font-weight: 600; }
+.fd-mine .fd-filters button.on { color: #60a5fa; background: #2563eb26; border-color: #2563eb99; }
+.fd-mine .fd-filters button span { border-radius: 8px; padding: 0 4px; background: #1a2438; }
+.fd-mine .fd-nodes .fd-sum4 > div { padding: 8px; border-radius: 8px; }
+.fd-mine .fd-nodes .fd-sum4 b { font-size: 14px; margin-top: 4px; }
+.fd-nodes .fd-symbol { margin-right: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border: 1px solid #22304a; padding: 2px 5px; border-radius: 5px; font: 9px/1.5 ui-monospace,monospace; color: #8b96a8; }
+.fd-mine .fd-stat3 > div { padding: 12px; border-radius: 12px; border-color: #1c2740; box-shadow: 0 2px 12px #0005; }
+.fd-mine .fd-stat3 span { font-size: 10px; line-height: 15px; }
+.fd-mine .fd-stat3 b, .fd-mine .fd-sum4 b { overflow-wrap: anywhere; }
+.fd-mine .fd-stat3 b { font-size: 16px; margin-top: 4px; line-height: 24px; }
+.fd-mine .fd-note { background: #0c1220; color: #5b6b85; border: 1px solid #22304a; border-radius: 8px; padding: 8px 12px; font-size: 10px; }
+.fd-mine .fd-note svg { color: #8b96a8; }
+.fd-mine .fd-tabs, .fd-mine .fd-sec > header { padding-inline: 2px; }
+.fd-mine .fd-card, .fd-mine .fd-node-card { margin-top: 0; }
+.fd-mine .fd-self-id p { display: flex; align-items: center; gap: 4px; margin: 0; }
+.fd-mine .fd-self-id b, .fd-mine .fd-self-id small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fd-mine .fd-self-id small { display: block; margin-top: 3px; color: #5b6b85; }
+.fd-mine .fd-self-run { gap: 4px; border: 1px solid #22304a; border-radius: 999px; background: #0c1220; color: #8b96a8; padding: 2px 8px; font-size: 10px; }
+.fd-mine .fd-mf, .fd-mine .fd-node { display: inline-block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100px; border-radius: 4px; font: 9px/16px ui-monospace,monospace; padding: 0 4px; }
+.fd-mine .fd-node svg { width: 10px; height: 10px; vertical-align: middle; }
+.fd-sync { color: #5b6b85; font-size: 10px; }
+.fd-mine .fd-book-head > span:first-child { flex-shrink: 0; }
+.fd-mine .fd-book-head > span:first-child b { color: #38bdf8; }
+.fd-mine .fd-self-pos .hold { color: #38bdf8; }
+.fd-mine .fd-self-pos .tp { color: #22c55e; }
+.fd-mine .fd-self-pos .sl { color: #f6465d; }
+.fd-mine .fd-self-pos .closed { color: #8b96a8; }
+.fd-mine .fd-self-pos .hold i { background: currentColor; }
+.fd-mine .fd-item + .fd-item { margin-top: 6px; }
+.fd-mine-empty { border: 1px dashed #22304a; background: #0c1220; border-radius: 12px; text-align: center; padding: 32px 16px; color: #8b96a8; margin-top: 8px; font-size: 12px; }
+.fd-batch, .fd-nodes > header { display: flex; flex-wrap: wrap; gap: 4px; }
+.fd-batch button { padding: 4px 8px; font-size: 10px; }
+.fd-mine button:disabled { cursor: not-allowed; opacity: .45; }
+.fd-mine .fd-search input { min-width: 0; }
+.fd-mine .fd-search button { border: 0; background: transparent; color: #8b96a8; }
+.fd-mine .fd-node-card { border-radius: 8px; border-color: #22304a; background: #0c1220; }
+.fd-node-card header small, .fd-node-card header b { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fd-nodes .fd-node-card .fd-pnl { border: 1px solid #22c55e40; background: #22c55e12; }
+.fd-nodes .fd-node-card .fd-pnl.down { border-color: #f6465d40; background: #f6465d12; }
+.fd-nodes .fd-node-card .fd-stats { gap: 0; border-radius: 8px; border: 1px solid #1a2438; overflow: hidden; }
+.fd-nodes .fd-node-card .fd-stats > div { text-align: center; border: 0; border-radius: 0; }
+.fd-nodes .fd-node-card .fd-stats span { justify-content: center; }
+.fd-nodes .fd-node-card footer { gap: 6px; margin-top: 10px; border-color: #1a2438; }
+.fd-nodes .fd-node-card footer button { display: inline-flex; flex: none; width: 32px; height: 32px; padding: 0; align-items: center; justify-content: center; }
+.fd-nodes .fd-node-card footer svg { width: 15px; height: 15px; }
+.fd-nodes .fd-batch button, .fd-nodes .fd-pnl > span { display: inline-flex; align-items: center; gap: 4px; }
+.fd-nodes .fd-batch svg { width: 13px; height: 13px; }
+.fd-nodes .fd-pnl svg { color: #22c55e; }
+.fd-nodes .fd-pnl.down svg { color: #f6465d; transform: scaleY(-1); }
+.fd-nodes .fd-avatar svg { width: 16px; height: 16px; }
+.fd-mine .fd-nodes .fd-batch .resume { color: #22c55e; border-color: #22c55e66; background: #22c55e1a; }
+.fd-mine .fd-nodes .fd-self-hold:hover:enabled { background: #f59e0b33; }
+.fd-mine .fd-nodes .fd-batch .resume:hover:enabled { background: #22c55e33; }
+.fd-mine .fd-nodes :is(.fd-close, .fd-leave):hover:enabled { background: #f6465d33; }
+.fd-mine .fd-nodes :is(.fd-close, .fd-leave, .fd-self-hold):disabled { opacity: 1; color: #4a5568; border-color: #22304a; background: #0a101e; }
+.fd-stop-list { display: grid; gap: 6px; max-height: 30vh; overflow: auto; padding: 8px 0; overflow-wrap: anywhere; }
+@media (min-width: 640px) { .fd-mine .fd-sum4 { grid-template-columns: repeat(4,minmax(0,1fr)); } }
+@media (min-width: 1024px) {
+  .fd-mine { margin-top: -4px; }
+  .fd-mine .fd-mine-hero { padding: 16px; }
+}
+@media (max-width: 639px) {
+  .fd-mine .fd-sum4 { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .fd-mine .fd-self-row { flex-wrap: wrap; gap: 4px; }
+  .fd-mine .fd-self-row p { flex: 1 1 100%; flex-wrap: wrap; }
+  .fd-mine .fd-self-actions { margin-left: auto; }
+  .fd-mine .fd-mf, .fd-mine .fd-node { max-width: 110px; }
+  .fd-mine .fd-stat3 > div { padding: 12px; }
 }
 </style>

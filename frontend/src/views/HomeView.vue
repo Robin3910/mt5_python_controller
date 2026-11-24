@@ -194,6 +194,10 @@ const statusCounts = computed(() => {
   return { all: homeVisibleNodes.value.length, online, offline }
 })
 
+function primaryFirst(a: NodeOut, b: NodeOut): number {
+  return (a.is_primary ? 0 : 1) - (b.is_primary ? 0 : 1)
+}
+
 const filteredNodes = computed(() => {
   const query = q.value.trim().toLowerCase()
   let list = homeVisibleNodes.value.filter((n) => {
@@ -224,11 +228,7 @@ const filteredNodes = computed(() => {
   const equityOf = (n: NodeOut) => acct(n.node_id)?.equity ?? 0
   // 是否有持仓（无快照的节点按无仓位处理）
   const hasPositions = (n: NodeOut) => (acct(n.node_id)?.positions?.length || 0) > 0
-  // 主节点始终置顶；主键之后再按用户选定的次级规则排序。
-  const primaryFirst = (a: NodeOut, b: NodeOut) =>
-    (a.is_primary ? 0 : 1) - (b.is_primary ? 0 : 1)
   list = [...list].sort((a, b) => {
-    // 有仓位优先：避免个别节点异常未同步时落到列表末尾（始终生效）
     const posCmp = (hasPositions(b) ? 0 : 1) - (hasPositions(a) ? 0 : 1)
     if (posCmp !== 0) return posCmp
     const primaryCmp = primaryFirst(a, b)
@@ -252,7 +252,8 @@ const groupedNodes = computed(() => {
     key: name,
     name,
     initial: name.slice(0, 1),
-    nodes,
+    // 分组后稳定排序，保留组间顺序与同类节点的相对顺序。
+    nodes: [...nodes].sort(primaryFirst),
     online: nodes.filter((n) => statusOf(n) === 'online').length,
     balance: nodes.reduce((sum, n) => sum + (acct(n.node_id)?.balance || 0), 0),
     profit: nodes.reduce((sum, n) => sum + nodeProfit(acct(n.node_id)?.positions), 0),

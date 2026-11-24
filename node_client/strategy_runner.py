@@ -2237,7 +2237,7 @@ class StrategyRunner:
             await self._stops_on_open(self.direction, self.base_volume, []),
         )
         place_order = self._mt5.place_market_order
-        if self.is_ai_add_on and self.entry.get("capture_balance_before_open") is True:
+        if self.entry.get("capture_balance_before_open") is True:
             place_order = partial(place_order, capture_balance_before_open=True)
         res = await self._exec(
             place_order,
@@ -4174,7 +4174,7 @@ class StrategyRunner:
         base = plan.batches[0]
         # 底仓：止损跟信号，止盈为 0（留给保本与趋势）
         res = dict(await self._risk_send_order(
-            base, plan.stop_loss, None, self._open_comment(),
+            base, plan.stop_loss, None, self._open_comment(), first=True,
         ) or {})
         res["signal_id"] = self.signal_id
         res["task_id"] = self.task_id
@@ -4220,7 +4220,7 @@ class StrategyRunner:
         return True
 
     async def _risk_send_order(self, batch, stop_loss: float,
-                               take_profit: Optional[float], comment: str) -> dict:
+                               take_profit: Optional[float], comment: str, *, first: bool = False) -> dict:
         """按计划里这一档的开仓方式下单：有挂单价就挂限价，否则市价。"""
         if batch.is_pending:
             return dict(await self._exec(
@@ -4228,8 +4228,11 @@ class StrategyRunner:
                 self.symbol, self.direction, batch.volume, batch.price,
                 stop_loss, take_profit, comment, self.magic,
             ) or {})
+        place_order = self._mt5.place_market_order
+        if first and self.entry.get("capture_balance_before_open") is True:
+            place_order = partial(place_order, capture_balance_before_open=True)
         return dict(await self._exec(
-            self._mt5.place_market_order,
+            place_order,
             self.symbol, self.direction, batch.volume,
             stop_loss, take_profit, comment, self.magic,
         ) or {})

@@ -31,6 +31,7 @@ const auth = useAuthStore()
 const router = useRouter()
 
 const primaryNode = computed(() => hub.nodes.find(n => n.is_primary && n.enabled && n.owner_user_id != null && n.owner_user_id === auth.me?.user_id))
+const myStrategies = computed(() => hub.strategies.filter(s => s.owner_user_id != null && s.owner_user_id === auth.me?.user_id))
 
 const account = computed<AccountSnapshot | null>(() => {
   if (!primaryNode.value) return null
@@ -381,7 +382,7 @@ function editAiForm(strategyId: string): void {
 async function fetchAiStrategies(): Promise<void> {
   try {
     await hub.fetchStrategies()
-    aiStrategies.value = (hub.strategies || []).filter((s) => s.template_id === TEMPLATE_1_ID)
+    aiStrategies.value = myStrategies.value.filter(s => s.template_id === TEMPLATE_1_ID)
   } catch {
     aiStrategies.value = []
   }
@@ -423,7 +424,7 @@ async function fetchSymbolStrategies(): Promise<void> {
   try {
     await hub.fetchStrategies()
     const sym = (currentSymbol.value || '').toUpperCase()
-    symbolStrategies.value = (hub.strategies || []).filter(
+    symbolStrategies.value = myStrategies.value.filter(
       (s) => (s.symbol || '').toUpperCase() === sym,
     )
   } catch {
@@ -509,14 +510,14 @@ async function onAiStrategySaved(
   await fetchAiStrategies()
   try {
     const nodeId = primaryNode.value?.node_id ?? ''
-    const groups = await hub.listGroups()
-    // 取一个不会和现有分组名冲突的名称（若基础名已存在则追加 -2 / -3 …）
+    const groups = (await hub.listGroups()).filter(g => g.owner_user_id === auth.me?.user_id)
+    // 分组名称在本人账号内去重。
     const groupName = aiUniqueGroupName(info.symbol, groups)
     if (!nodeId || !groupName) {
       ElMessage.warning('主节点未就绪，策略已保存但未能自动创建分组')
       return
     }
-    let group = groups.find((g) => g.owner_user_id === auth.me?.user_id && g.name === groupName) ?? null
+    let group = groups.find(g => g.name === groupName) ?? null
     if (!group) {
       group = await hub.createGroup({
         name: groupName,

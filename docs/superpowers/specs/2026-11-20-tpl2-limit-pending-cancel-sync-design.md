@@ -98,13 +98,22 @@ cancelled   = lost_orders − max(gained_pos, 0)
 ### 2.3 必须堵死的误判
 
 **① 首单还没挂出 / 采样间隙**
-用**连续确认 3 轮**（快照间隔 5 秒 → 15 秒）挡住。
+改用**独立的挂单基线记忆**（`leader_order_book`）判定：只有「基线里记着 N 张，
+本轮一张都没有，且持仓没有相应增加」才判撤单。
+
+挂单基线与持仓基线**分开存**：持仓基线每轮整体覆写，挂单消失后就没法判断
+「是被撤了」还是「本来就没有」。有了独立基线，撤单检出**单轮即可**（不再需要
+跨轮确认），延迟从 15 秒降到 1 个快照周期。
 
 **② 主节点任务本来就已经结束**
-查 `active_subtasks_for_magic(group_id, leader_node_id, magic)` 必须仍在跑。
+查 `group_persist.subtasks_for_magic(group_id, leader_node_id, magic)` —— **不能**
+用 `active_subtasks_for_magic`：主节点撤掉挂单后，它自己的子任务通常已被
+账户对账收口成 `status="done"`（挂单消失 → 该魔术号没痕迹 → 自动收口）。
+只查活动子任务会查不到 → 撤单指令永远发不出去 → 跟单节点的挂单成孤儿单。
 
 **③ 账本读不到（断联）**
 `books_ok=False` 时 `on_snapshot` 不会被调用（`ws_gateway.py:379`），已有保障。
+节点侧另有 `_books_watch`：读挂单失败时**不补报**快照（读不到 ≠ 变了）。
 
 **④ 不是 tpl_2 限价任务**
 判定前查主节点子任务的策略快照：`template_id == "tpl_2"` 且规则 `entry_mode` 是限价。
@@ -116,7 +125,7 @@ cancelled   = lost_orders − max(gained_pos, 0)
 只需找到「同一个 task 下的跟单子任务」，不用逐 ticket 配对：
 
 ```python
-leader_subs = await group_persist.active_subtasks_for_magic(
+leader_subs = await group_persist.subtasks_for_magic(
     group_id, leader_node_id, leader_magic,
 )
 task_id = leader_subs[0]["task_id"]

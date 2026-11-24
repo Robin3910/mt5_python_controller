@@ -45,6 +45,7 @@ export interface NewsEvent {
   /** 北京时间展示串（服务端已格式化） */
   event_time_text: string
   title: string
+  original_title?: string
   country: string
   impact: string
   forecast: string | null

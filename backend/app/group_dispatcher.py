@@ -35,6 +35,7 @@ from datetime import datetime
 from typing import Optional
 
 from . import (
+    ai_entry_guard,
     ai_follow_settings,
     node_lifecycle,
     follow_rules,
@@ -569,14 +570,10 @@ class GroupDispatcher:
             else signal_meta.ROUTE_MODE_DIRECT
         )
 
-        await persist.record_signal(
-            signal_id, signal, source_ip, True, SIGNAL_DISPATCH_MODE,
-            raw_payload=raw_payload, source=source, model=SIGNAL_MODEL_STRATEGY,
-            route_state=route_state,
-            route_mode=route_mode,
-        )
-
         # 命中统计：规则卡上要显示「命中 N 条 / 最近命中时间」。
+        #
+        # 刻意放在 AI 开仓准入闸门**之前**：即使这条信号随后被准入拦下，
+        # 规则确实命中了这件事也要如实记录 —— 否则管理员会以为规则没配好。
         for rule_id in set(auto_rule_owner.values()):
             if not rule_id:
                 continue
@@ -590,6 +587,59 @@ class GroupDispatcher:
         nodes = await self.store.all_nodes()
         nodemap = {n["node_id"]: n for n in nodes}
         online_ids = set(manager.online_node_ids())
+
+        # ★ L1：AI 开仓准入闸门（tpl_1 专有）
+        #
+        # 位置说明（顺序不可颠倒）：
+        #   1. 在**自动路由规则匹配之后** —— 否则 auto 规则的「命中 N 条 / 最近命中时间」
+        #      会失真，管理员会以为规则没配好；
+        #   2. 在**建主任务之前** —— 被拦的分组不产生 group_signal_task 记录，
+        #      避免信号中心任务列表被一堆「skipped」污染。
+        #
+        # 判定粒度是**分组**：同一分组内所有节点结论一致（不会出现主节点放行、
+        # 跟单节点被拦的分歧）。不同分组可结论不同（各自用自己的报价源）。
+        allowed_groups, filtered_groups = await self._ai_entry_admission(
+            direct_groups, signal, nodemap, online_ids,
+        )
+        if filtered_groups:
+            for item in filtered_groups:
+                reasons.append(
+                    f"{item.get('group_name') or item.get('group_id')}：{item.get('reason')}"
+                )
+        direct_groups = allowed_groups
+
+        # 全部候选分组都被准入拦下 —— 信号本身是好的，只是没有分组要它。
+        # 与「无匹配分组」同构：入库、reject_code 标出真实原因，targets=0。
+        if not direct_groups:
+            detail = "；".join(reasons) if reasons else "AI 开仓准入不通过"
+            reason = f"AI 开仓准入不通过：{detail}"
+            logger.info("strategy signal blocked by ai entry admission: %s", reason)
+            await persist.record_signal(
+                signal_id, signal, source_ip, True, None, status="rejected",
+                raw_payload=raw_payload, source=source, model=SIGNAL_MODEL_STRATEGY,
+                reject_code=signal_codes.REJECT_AI_ENTRY,
+                route_state=signal_meta.ROUTE_DROPPED,
+                route_mode=route_mode,
+            )
+            return {
+                "mode": "rejected", "targets": 0, "groups": 0,
+                "reason": reason, "tasks": [],
+                "route_state": route_state,
+                "route_mode": route_mode,
+                "pending_groups": [],
+                "auto_groups": [g.get("group_id") for g, _ in auto_hit],
+                "auto_rule_hits": auto_rule_owner,
+                "filtered_groups": filtered_groups,
+            }
+
+        # 通过准入闸门 → 正常入库并下发。
+        # 放在闸门**之后**：被拦的那条信号走上面的 rejected 分支，不会重复入库。
+        await persist.record_signal(
+            signal_id, signal, source_ip, True, SIGNAL_DISPATCH_MODE,
+            raw_payload=raw_payload, source=source, model=SIGNAL_MODEL_STRATEGY,
+            route_state=route_state,
+            route_mode=route_mode,
+        )
 
         tasks = []
         for group, strategy in direct_groups:
@@ -616,7 +666,106 @@ class GroupDispatcher:
             "pending_groups": [],
             "auto_groups": [g.get("group_id") for g, _ in auto_hit],
             "auto_rule_hits": auto_rule_owner,
+            "filtered_groups": filtered_groups,
         }
+
+    async def _ai_entry_admission(
+        self, groups: list[tuple[dict, dict]], signal: TradingSignal,
+        nodemap: dict, online_ids: set[str],
+    ) -> tuple[list[tuple[dict, dict]], list[dict]]:
+        """L1：AI 开仓准入闸门。返回 (放行的分组列表, 被拦分组的明细)。
+
+        只处理绑定 **tpl_1**（AI 智能加仓）的分组；其它模版原样放行。
+
+        判定内容（方向总开关 / 区间裁决 / 缺价拦截）见 `ai_entry_guard.evaluate`。
+        区间裁决与 normal 链路共用 `rules.interval_decision` —— 口径永不漂移。
+
+        **判定层异常一律 fail-open（放行）**：与财经日历一致 ——
+        判定层故障不能静默变成「永不开单」。
+        """
+        if not groups:
+            return groups, []
+
+        # 只有存在 tpl_1 分组时才去读配置 / 取价（绝大多数信号走不到这里）
+        targets = [
+            (g, s) for g, s in groups
+            if str((s or {}).get("template_id") or "").strip().lower()
+            == ai_entry_guard.AI_TEMPLATE_ID
+        ]
+        if not targets:
+            return groups, []
+
+        try:
+            filters_cfg = await self.store.get_filters()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("ai entry admission: load filters failed, fail-open: %s", e)
+            return groups, []
+
+        # 逐分组取「该品种的 ai_entry 配置」—— 只有配置了且启用的品种才需要判定
+        pending: list[tuple[dict, dict, dict]] = []
+        for group, strategy in targets:
+            cfg = ai_entry_guard.lookup_ai_entry(filters_cfg, signal.symbol)
+            if not cfg.get("enabled"):
+                continue
+            pending.append((group, strategy, cfg))
+        if not pending:
+            return groups, []
+
+        # 批量取账户快照（避免 N 次 IO）
+        accounts: dict = {}
+        needed: set[str] = set()
+        for group, _strategy, _cfg in pending:
+            for node_id, _desc in ai_entry_guard.reference_node_ids(group, nodemap, online_ids):
+                needed.add(node_id)
+        for node_id in needed:
+            try:
+                snapshot = await self.store.get_account(node_id)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("ai entry admission: get_account %s failed: %s", node_id, e)
+                continue
+            if snapshot:
+                accounts[node_id] = snapshot
+
+        allowed: list[tuple[dict, dict]] = []
+        filtered: list[dict] = []
+        for group, strategy, cfg in pending:
+            try:
+                price, price_src = ai_entry_guard.resolve_price(
+                    signal, group, nodemap, accounts, online_ids,
+                )
+                ok, reason = ai_entry_guard.evaluate(
+                    signal.action, signal.symbol, price, cfg,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "ai entry admission: evaluate failed for group %s, fail-open: %s",
+                    group.get("group_id"), e,
+                )
+                allowed.append((group, strategy))
+                continue
+            if ok:
+                allowed.append((group, strategy))
+                continue
+            filtered.append({
+                "group_id": group.get("group_id"),
+                "group_name": group.get("name") or group.get("group_id"),
+                "reason": reason,
+                "code": signal_codes.REJECT_AI_ENTRY,
+                "price": price,
+                "price_source": price_src,
+            })
+            logger.info(
+                "group %s blocked by ai entry admission: %s",
+                group.get("group_id"), reason,
+            )
+
+        # 保持原顺序：被拦的剔除，其余原位保留
+        blocked_ids = {str(f.get("group_id") or "") for f in filtered}
+        kept = [
+            (g, s) for g, s in groups
+            if str(g.get("group_id") or "") not in blocked_ids
+        ]
+        return kept, filtered
 
     async def _match_auto_groups(
         self, auto_groups: list[tuple[dict, dict]], signal: TradingSignal,
@@ -1221,9 +1370,13 @@ class GroupDispatcher:
             if blocked is not None:
                 return blocked
 
+        follower_id = None
+        if (command.get("strategy") or {}).get("template_id") in follow_rules.FOLLOW_MARKET_TEMPLATE_IDS:
+            follower_id = next((f.get("follower_user_id") for f in group.get("followers") or []
+                                if f.get("node_id") == node_id), None)
         try:
             return await self._dispatch_locked_node(
-                base, command, hold_busy=not concurrent,
+                base, command, hold_busy=not concurrent, follower_id=follower_id,
             )
         except Exception as e:  # noqa: BLE001
             # 抢到占位后中途出错：立刻放开，否则要等 TTL 才能再下发
@@ -1350,17 +1503,17 @@ class GroupDispatcher:
             "volume": volume, "reason": reason,
         }
 
-    async def _dispatch_locked_node(self, base: dict, command: dict, *, hold_busy: bool = True) -> dict:
+    async def _dispatch_locked_node(self, base: dict, command: dict, *, hold_busy: bool = True, follower_id: int | None = None) -> dict:
         async with node_lifecycle.locked(node_lifecycle.node_key(base["node_id"])):
             if await self.store.get_node(base["node_id"]) is None:
                 if hold_busy:
                     await self.store.release_group_node_busy(base["group_id"], base["node_id"])
                 return {"node_id": base["node_id"], "status": "skipped", "magic": None,
                         "volume": base["decided_vol"], "reason": "节点已删除"}
-            return await self._dispatch_locked_node_active(base, command, hold_busy=hold_busy)
+            return await self._dispatch_locked_node_active(base, command, hold_busy=hold_busy, follower_id=follower_id)
 
     async def _dispatch_locked_node_active(
-        self, base: dict, command: dict, *, hold_busy: bool = True,
+        self, base: dict, command: dict, *, hold_busy: bool = True, follower_id: int | None = None,
     ) -> dict:
         """下发已通过互斥门禁的节点：建子任务拿魔术号 -> 发命令。
 
@@ -1374,7 +1527,7 @@ class GroupDispatcher:
             strategy_snap.get("rules"),
         ) is not None
         created = await group_persist.create_dispatch(
-            **base, hold_when_empty=hold_when_empty,
+            **base, hold_when_empty=hold_when_empty, follower_id=follower_id,
         )
         if created is None:
             if hold_busy:
@@ -1398,7 +1551,7 @@ class GroupDispatcher:
         cmd = for_node(command, dispatch_id=dispatch_id, magic=magic)
         follow_settings = created.get("follow_settings")
         cmd["strategy"] = ai_follow_settings.apply_settings(cmd.get("strategy") or {}, follow_settings)
-        if (follow_settings or {}).get("application_id"):
+        if follower_id is not None or (follow_settings or {}).get("application_id"):
             cmd["entry"] = {**cmd["entry"], "capture_balance_before_open": True}
         # 发包时刻：逐节点各记一次（同步模式下各节点的命令是分别发出的，
         # 记同一个时间会掩盖节点间的先后差）。跨节点唯一可比的时间轴。

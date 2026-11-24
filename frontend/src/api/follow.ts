@@ -37,6 +37,11 @@ export async function fetchMyFollowings(): Promise<FollowMeResponse> {
   return data
 }
 
+export async function setMyFollowState(relations: { group_id: string; node_id: string }[], paused: boolean) {
+  const { data } = await api.post<{ changed: number }>('/api/follow/me/state', { relations, paused })
+  return data.changed
+}
+
 /** 提交跟单申请；需要带单员审核后生效。 */
 export async function joinFollow(payload: FollowJoinPayload): Promise<FollowJoinResponse> {
   const { data } = await api.post<FollowJoinResponse>('/api/follow/join', payload)

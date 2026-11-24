@@ -216,6 +216,8 @@ export interface NodeOut {
   is_primary?: boolean
 }
 
+export type StrategyOpeningMethod = 'trend_market' | 'trend_limit' | 'grid' | 'ai'
+
 export interface Position {
   ticket: number
   symbol: string
@@ -234,6 +236,7 @@ export interface Position {
    * 前端据此识别 AI 智能加仓（`tpl_1`）的仓位。
    */
   ai_template?: string
+  opening_method?: StrategyOpeningMethod | null
 }
 
 export interface QuoteInfo {
@@ -262,6 +265,7 @@ export interface PendingOrder {
   price_current?: number
   /** 所属策略子任务的模版 ID（后端按魔术号反查后补上；对不上 / 老节点无此字段） */
   ai_template?: string
+  opening_method?: StrategyOpeningMethod | null
 }
 
 export interface AccountSnapshot {
@@ -295,6 +299,26 @@ export interface FilterInterval {
   allow: FilterDirection[]
 }
 
+/**
+ * AI 策略（tpl_1，AI 智能加仓）的开仓准入。
+ *
+ * 与普通区间过滤（`SymbolFilterRule.intervals`）**互不影响**：
+ * 普通区间只作用 normal 链路；这一块只作用 tpl_1 分组的首仓开仓信号。
+ * 平仓与已在跑的任务不受影响。
+ */
+export interface AiEntryRule {
+  /** 总开关，默认 false（存量配置零行为变化） */
+  enabled: boolean
+  /** 是否允许接收做多 (BUY) 信号，默认 true */
+  allow_buy: boolean
+  /** 是否允许接收做空 (SELL) 信号，默认 true */
+  allow_sell: boolean
+  /** 价格不在任何区间时的默认处理，默认 block */
+  default_action: DefaultFilterAction
+  /** 允许开仓的价格区间 */
+  intervals: FilterInterval[]
+}
+
 /** 单个品种的区间过滤与分发规则（键为品种代码，如 XAUUSD，全局 filters） */
 export interface SymbolFilterRule {
   /** false：拒收该品种全部信号（含 Webhook 平仓；后台手动平仓除外） */
@@ -313,6 +337,8 @@ export interface SymbolFilterRule {
   /** 该品种全局手数 */
   lot: number
   intervals: FilterInterval[]
+  /** AI 策略（tpl_1）开仓准入（可选；缺失视为未启用） */
+  ai_entry?: AiEntryRule
 }
 
 export type FilterRulesConfig = Record<string, SymbolFilterRule>
@@ -700,11 +726,10 @@ export interface GroupCreatePayload {
 
 /**
  * 认领跟单节点的结果（POST /api/groups/{id}/adopt-followers）。
- * 带单员新建分组时，为既有跟单节点生成待审申请。
+ * 普通带单分组自动批准继承申请，AI 分组仍需人工审核。
  */
 export interface AdoptFollowersResult {
-  /** 审核通过后才进入生效分组。 */
-  adopted: { node_id: string; follower_user_id: number; from_group_id?: string | null; request_id: number; status: 'pending' }[]
+  adopted: { node_id: string; follower_user_id: number; from_group_id?: string | null; request_id: number; status: 'pending' | 'approved' }[]
   /** 因已存在或源信息缺失而未写入的条目 */
   skipped: { node_id: string; reason?: string }[]
   /** 参与扫描的来源分组数（不含目标分组自身） */
@@ -1577,6 +1602,7 @@ export interface DealRecord {
   signal_id: string | null
   task_id: number | null
   group_id: string | null
+  opening_method?: StrategyOpeningMethod | null
   /** 成交时间（Unix 秒） */
   deal_time: number
 }
@@ -2945,7 +2971,23 @@ export interface FollowDetailResponse {
   daily_profit?: FollowDailyProfitPoint[]
 }
 
+export interface FollowExit {
+  node_id: string
+  deal_id: number
+  symbol: string
+  direction: string
+  volume: number
+  price: number
+  closed_at: number
+  profit: number
+  status: string
+}
+
 export interface FollowMyGroup {
+  mode?: string | null
+  magics?: Record<string, number[]>
+  history?: FollowExit[]
+  last_sync?: number | null
   group_id: string
   group_name: string | null
   symbol: string | null
@@ -2962,7 +3004,15 @@ export interface FollowMyGroup {
   marketable: boolean
   unmarketable_reason: string | null
   active_task_count: number
-  my_nodes: (FollowNodeBrief & { joined_at: number | null; follow_state?: string; leader_paused?: boolean })[]
+  my_nodes: (FollowNodeBrief & {
+    joined_at: number | null
+    follow_state?: string
+    leader_paused?: boolean
+    leverage?: number | null
+    balance?: number | null
+    server?: string | null
+    positions?: Position[]
+  })[]
 }
 
 export interface FollowMyLeader {
@@ -2973,7 +3023,7 @@ export interface FollowMyLeader {
 export interface FollowMeResponse {
   following: FollowMyLeader[]
   applications: FollowApplication[]
-  summary: { following_count: number; follow_node_count: number; pending_node_count?: number }
+  summary: { following_count: number; follow_node_count: number; pending_node_count?: number; net_profit?: number | null; average_rate?: number | null; first_balance?: number | null }
 }
 
 export interface FollowApplication {

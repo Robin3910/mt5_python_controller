@@ -1293,7 +1293,7 @@ onMounted(() => { void hub.fetchNodes(); trackAiUi('page_view', { value: 'ai-tra
 .ai-grid i.dir { display: inline-flex; align-items: center; justify-content: center; height: 15px; min-width: 20px; font-style: normal; font-size: 10px; font-weight: 700; line-height: 1; border-radius: 3px; padding: 0 2px; white-space: nowrap; }
 .ai-grid i.dir.buy { color: #22C55E; background: rgba(34,197,94,.15); }
 .ai-grid i.dir.sell { color: #F6465D; background: rgba(246,70,93,.15); }
-.ai-grid button.ai-x { border: 1px solid rgba(246,70,93,.4); background: rgba(246,70,93,.1); color: #F6465D; box-shadow: none; border-radius: 6px; padding: 1px 8px; font-size: 10px; font-weight: 500; }
+.ai-grid button.ai-x { width: auto; border: 1px solid rgba(246,70,93,.4); background: rgba(246,70,93,.1); color: #F6465D; box-shadow: none; border-radius: 6px; padding: 1px 8px; font-size: 10px; font-weight: 500; white-space: nowrap; }
 .sltp { text-align: right; line-height: 1.2; }
 .sltp em { display: block; font-style: normal; font-size: 11px; }
 .ai-foot-note { margin: 8px 0 0; padding: 0 10px 8px; color: #8B96A8; font-size: 10px; text-align: center; font-variant-numeric: tabular-nums; }

@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+from math import isfinite
 from datetime import datetime
 from typing import Optional
 
@@ -24,6 +25,7 @@ from . import group_rules, latency_marks, signal_codes, signal_meta, strategy_te
 from . import ai_follow_runtime
 from .db import SessionLocal
 from .orm import (
+    GroupFollowerNode,
     GroupSignalTask,
     GroupTaskDispatch,
     GroupTaskEvent,
@@ -234,6 +236,7 @@ async def create_dispatch(
     decided_vol: Optional[float],
     hold_when_empty: bool = False,
     action: Optional[str] = None,
+    follower_id: int | None = None,
 ) -> Optional[dict]:
     """创建一条节点子任务并分配魔术号，返回 {dispatch_id, magic}。
 
@@ -248,6 +251,12 @@ async def create_dispatch(
     """
     try:
         async with SessionLocal() as s:
+            # 候选节点选出后用户仍可能暂停或移出，在分配魔术号前复核已批准关系。
+            if follower_id is not None and not await s.scalar(select(GroupFollowerNode.id).where(
+                GroupFollowerNode.group_id == group_id, GroupFollowerNode.node_id == node_id,
+                GroupFollowerNode.follower_user_id == follower_id, GroupFollowerNode.follow_state == "running",
+                GroupFollowerNode.leader_paused.is_(False)).with_for_update()):
+                return {"skip_reason": "跟单已暂停或移出"}
             relation, settings, reason = await ai_follow_runtime.prepare_dispatch(s, task_id, group_id, node_id)
             if reason:
                 return {"skip_reason": reason}
@@ -407,13 +416,55 @@ async def active_subtasks_for_magic(
     return out
 
 
-async def templates_by_magic(node_id: str, magics: set[int]) -> dict[int, Optional[str]]:
-    """某节点上若干魔术号各自所属子任务的策略模版 ID（`{magic: template_id}`）。
+async def subtasks_for_magic(
+    group_id: str, node_id: str, magic: int, *, latest: bool = True,
+) -> list[dict]:
+    """某分组某节点某魔术号下的子任务，**不区分是否已收口**。
 
-    用于账户快照按魔术号反查「这单是哪条策略下的」：前端据此隐藏 / 区分
-    AI 智能加仓（tpl_1）之类的策略持仓。取该 magic 下**最近一次**子任务
-    （`id` 最大）的快照 `template_id`，存量数据没有快照时值为 None。
-    查询失败按空结果处理：调用方只会在标不上模版，不会因此看不到持仓。
+    与 `active_subtasks_for_magic` 的区别：不按终态过滤。
+
+    撤单同步必须用它：主节点撤掉限价挂单后，它自己的子任务往往已经被
+    账户对账收口成 `done`（挂单消失 → 「该魔术号没有痕迹」→ 自动收口）。
+    若这里只查非终态子任务，就永远查不到主节点子任务 → 撤单指令发不出去
+    → 跟单节点的挂单留在盘上没人管。
+
+    `latest=True` 时只返回最近一条（id 最大）：同一 (节点, magic) 可能有多条
+    历史子任务（重试 / 复用魔术号），只有最近那条才是当前这次执行。
+    """
+    if not group_id or not node_id:
+        return []
+    try:
+        async with SessionLocal() as s:
+            rows = (
+                await s.execute(
+                    select(GroupTaskDispatch)
+                    .where(
+                        GroupTaskDispatch.group_id == group_id,
+                        GroupTaskDispatch.node_id == node_id,
+                        GroupTaskDispatch.magic == int(magic),
+                    )
+                    .order_by(GroupTaskDispatch.id.desc())
+                )
+            ).scalars().all()
+            if latest and rows:
+                rows = rows[:1]
+            out = [_subtask_dict(r) for r in rows]
+    except Exception as e:  # noqa: BLE001
+        logger.warning("subtasks_for_magic failed: %s", e)
+        return []
+    # 带上主任务的策略快照：调用方据此判断是否 tpl_2 限价开仓（撤单同步只对它生效）
+    snaps = await _task_snapshots({int(r["task_id"]) for r in out})
+    for r in out:
+        r["strategy_snapshot"] = snaps.get(int(r["task_id"]))
+    return out
+
+
+async def strategy_metadata_by_magic(
+    node_id: str, magics: set[int],
+) -> dict[int, tuple[Optional[str], Optional[strategy_templates.StrategyOpeningMethod]]]:
+    """返回某节点上各魔术号最近一次子任务的模版 ID 和开仓方式。
+
+    账户快照使用最近一次子任务的快照（`id` 最大）。没有快照时两个字段均为 None。
 
     分两步查（先子任务行、再主任务快照）：不 JOIN 可以走 `(node_id, magic)` 索引，
     账户快照每条消息都会调一次，走短查询比联表更省。
@@ -453,13 +504,16 @@ async def templates_by_magic(node_id: str, magics: set[int]) -> dict[int, Option
                 ).all()
             )
     except Exception as e:  # noqa: BLE001
-        logger.warning("templates_by_magic failed: %s", e)
+        logger.warning("strategy_metadata_by_magic failed: %s", e)
         return {}
-    out: dict[int, Optional[str]] = {}
+    out = {}
     for magic, task_id in latest.items():
         snapshot = snapshots.get(task_id)
         tpl = snapshot.get("template_id") if isinstance(snapshot, dict) else None
-        out[magic] = str(tpl).strip() if tpl else None
+        out[magic] = (
+            str(tpl).strip() if tpl else None,
+            strategy_templates.opening_method_from_snapshot(snapshot),
+        )
     return out
 
 
@@ -1077,7 +1131,7 @@ async def set_dispatch_status(
 
 async def update_dispatch_result(
     *, node_id: str, result: dict, dispatch_id: Optional[int] = None,
-    task_id: Optional[int] = None, signal_id: Optional[str] = None,
+    task_id: Optional[int] = None, signal_id: Optional[str] = None, opening_balance=None,
 ) -> Optional[dict]:
     """按节点回报更新子任务；未命中返回 None，命中返回 {released, task_ids}。
 
@@ -1112,6 +1166,13 @@ async def update_dispatch_result(
                     continue
                 row.retcode = result.get("retcode")
                 row.order_ticket = result.get("order") or result.get("ticket")
+                if row.deal and row.deal != result.get("deal"):
+                    row.opening_balance = None
+                if (row.opening_balance is None and not (row.follow_settings_json or {}).get("application_id")
+                        and success and not result.get("pending")
+                        and result.get("deal") and result.get("retcode") in (10009, 10010)
+                        and type(opening_balance) in (int, float) and isfinite(opening_balance)):
+                    row.opening_balance = opening_balance
                 row.deal = result.get("deal")
                 row.price = result.get("price")
                 row.error = result.get("error")
