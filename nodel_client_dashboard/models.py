@@ -17,6 +17,16 @@ def default_label_from_path(exe_path: str) -> str:
     return stem or "node_client"
 
 
+def local_label(directory: str, login: int) -> str:
+    """本机实例标签：`目录名-账号ID`（如 `MetaTrader 5-8101`）。
+
+    这是**只存在本机**的显示名，跟服务器上的节点名（`序号-账号ID`）是两回事：
+    面板卡片显示这个，后台节点管理显示服务器生成的那个。
+    """
+    folder = Path(str(directory or "").strip()).name or "MT5"
+    return f"{folder}-{int(login)}"
+
+
 def shorten_path(path: str, max_len: int = 42) -> str:
     """列表展示用短路径：过长时保留头尾。"""
     text = (path or "").strip()
@@ -74,6 +84,7 @@ class InstanceConfig:
         status_port: int = 0,
         daemon: bool = False,
         restart_delay_s: float = 5.0,
+        display_name: str = "",
     ) -> "InstanceConfig":
         exe = str(exe_path or "").strip()
         label = (name or "").strip() or default_label_from_path(exe)
@@ -86,6 +97,7 @@ class InstanceConfig:
             status_port=status_port,
             daemon=daemon,
             restart_delay_s=restart_delay_s,
+            display_name=(display_name or "").strip(),
         )
 
     def to_dict(self) -> dict[str, Any]:

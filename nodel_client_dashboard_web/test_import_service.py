@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -168,7 +169,6 @@ def test_run_import_write_env_does_not_unpack_none(tmp_path: Path, monkeypatch) 
 
     req = svc.ImportRequest(
         directory=str(tmp_path),
-        name="demo",
         version="1.0.0",
         account_raw="12345",
         write_env=True,
@@ -224,7 +224,6 @@ def test_run_import_edit_env_returning_none_is_tolerated(
 
     req = svc.ImportRequest(
         directory=str(tmp_path),
-        name="demo",
         version="1.0.0",
         account_raw="12345",
         write_env=True,
@@ -336,3 +335,144 @@ def test_import_controller_active_task_guard() -> None:
 def test_import_controller_progress_missing_task() -> None:
     ctrl = ImportController(_FakeBridge())
     assert ctrl.task("nope") is None
+
+
+# ─────────────────────────────────────────────── 本机标签 vs 服务端节点名
+
+def test_local_label_is_dirname_plus_login() -> None:
+    """本机标签 = 目录名-账号ID。"""
+    assert svc.local_label(r"C:\Program Files\MetaTrader 5", 8101) == "MetaTrader 5-8101"
+    assert svc.local_label("/home/user/mt5-live", 42) == "mt5-live-42"
+
+
+def test_local_label_falls_back_when_no_dir() -> None:
+    assert svc.local_label("", 42) == "MT5-42"
+
+
+def test_summarize_shows_local_label_and_server_side_name(tmp_path: Path) -> None:
+    """摘要里两套名字都要说清楚：本机标签 + 服务器自动生成的节点名。"""
+    (tmp_path / "terminal64.exe").write_bytes(b"MZ")
+    req = svc.ImportRequest(directory=str(tmp_path), version="1.0.0")
+    out = svc.summarize(req, login=8101)
+    assert f"本机标签：{tmp_path.name}-8101" in out["text"]
+    assert "服务器节点名" in out["text"]
+    assert "序号-账号ID" in out["text"]
+
+
+def test_run_import_sets_local_label_and_leaves_server_name_alone(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """导入后：本机标签 = 目录名-账号ID；申请节点时名字留空。
+
+    名字留空，服务器才会按「序号-账号ID」自己生成节点名。
+    """
+    (tmp_path / "terminal64.exe").write_bytes(b"MZ")
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "node_client.exe").write_bytes(b"MZ")
+
+    monkeypatch.setattr(svc.vs, "download_package", lambda *a, **k: None)
+    monkeypatch.setattr(svc.vs, "verify_sha256", lambda *a, **k: True)
+    monkeypatch.setattr(svc, "require_binding", lambda _p: None)
+    monkeypatch.setattr(svc, "read_algo_trading_allowed", lambda _d: True)
+    monkeypatch.setattr(svc, "apply_package", lambda *a, **k: (True, "ok"))
+
+    def fake_extract(_zip, dest):
+        dest = Path(dest)
+        dest.mkdir(parents=True, exist_ok=True)
+        for src in pkg.iterdir():
+            (dest / src.name).write_bytes(src.read_bytes())
+        return True, "ok"
+
+    monkeypatch.setattr(svc, "extract_package", fake_extract)
+
+    enrolled: list = []
+
+    def enroll(cfg, login, server):
+        enrolled.append((cfg.name, login, server))
+
+    req = svc.ImportRequest(
+        directory=str(tmp_path), version="1.0.0",
+        account_raw="8101", write_env=False,
+    )
+    result = svc.run_import(
+        req,
+        target=object(),
+        perform=lambda action, cfg, fn, **kwargs: fn(),
+        enroll=enroll,
+        stop_for_install=lambda *a, **k: None,
+        register=lambda *a, **k: None,
+    )
+    assert result.ok is True
+    assert enrolled[0][1] == 8101
+    # 本机标签写进了 display_name
+    assert result.config.display_name == f"{tmp_path.name}-8101"
+    assert result.config.label == f"{tmp_path.name}-8101"
+
+
+def test_import_controller_enrolls_with_empty_name(tmp_path: Path, monkeypatch) -> None:
+    """申请节点时**不提交名字** —— 服务器才会按「序号-账号ID」自己生成。
+
+    这是本次改动的关键：名字由服务器生成，本机不参与。
+    """
+    (tmp_path / "terminal64.exe").write_bytes(b"MZ")
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "node_client.exe").write_bytes(b"MZ")
+
+    monkeypatch.setattr(svc.vs, "download_package", lambda *a, **k: None)
+    monkeypatch.setattr(svc.vs, "verify_sha256", lambda *a, **k: True)
+    monkeypatch.setattr(svc, "require_binding", lambda _p: None)
+    monkeypatch.setattr(svc, "read_algo_trading_allowed", lambda _d: True)
+    monkeypatch.setattr(svc, "apply_package", lambda *a, **k: (True, "ok"))
+
+    def fake_extract(_zip, dest):
+        dest = Path(dest)
+        dest.mkdir(parents=True, exist_ok=True)
+        for src in pkg.iterdir():
+            (dest / src.name).write_bytes(src.read_bytes())
+        return True, "ok"
+
+    monkeypatch.setattr(svc, "extract_package", fake_extract)
+
+    calls: list = []
+
+    class _Session:
+        def check(self):
+            return None
+
+        def enrolled(self, login, name, server=""):
+            calls.append((login, name, server))
+            return {"node_id": "nd_x", "mt5_login": login, "name": "1-8101"}
+
+        def apply_node(self, cfg, node):
+            cfg.node_id = node["node_id"]
+            cfg.mt5_login = node["mt5_login"]
+            cfg.name = node["name"]
+
+        def perform(self, action, cfg, fn, **kwargs):
+            return fn()
+
+    class _Bridge(_FakeBridge):
+        def __init__(self):
+            super().__init__()
+            self.session = _Session()
+
+    ctrl = ImportController(_Bridge())
+    out = ctrl.start({
+        "directory": str(tmp_path),
+        "name": "",  # 前端恒传空
+        "version": "1.0.0",
+        "account": "8101",
+        "write_env": False,
+    })
+    assert out["ok"] is True, out
+    for _ in range(200):
+        snap = ctrl.task(out["task_id"]).snapshot()
+        if snap["done"]:
+            break
+        time.sleep(0.01)
+    assert calls, "没有调用申请节点"
+    login, name, _server = calls[0]
+    assert login == 8101
+    assert name == "", f"申请节点不该带名字，实际传了 {name!r}"

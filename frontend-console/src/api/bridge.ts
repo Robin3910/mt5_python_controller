@@ -454,7 +454,6 @@ export const api = {
 
   prepareImport: (payload: {
     directory: string
-    name: string
     version: string
     sha256: string
     account: string
@@ -467,7 +466,6 @@ export const api = {
 
   startImport: (payload: {
     directory: string
-    name: string
     version: string
     sha256: string
     account: string

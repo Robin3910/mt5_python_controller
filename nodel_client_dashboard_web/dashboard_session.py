@@ -172,6 +172,11 @@ class DashboardSession:
     def apply_node(self, cfg, node: dict) -> None:
         cfg.node_id = str(node["node_id"])
         cfg.mt5_login = int(node.get("mt5_login") or 0)
+        # 服务器上的节点名（后台管理里显示的那个，导入时由服务器按
+        # 「序号-账号ID」生成）。后端没给名字时不覆盖 —— 别把已有名字冲掉。
+        server_name = str(node.get("name") or "").strip()
+        if server_name:
+            cfg.name = server_name
         cfg.owner_user_id = node.get("owner_user_id")
         cfg.requested_by_user_id = node.get("requested_by_user_id")
         cfg.approval_status = str(node.get("approval_status") or ("approved" if node.get("enabled") else "pending"))

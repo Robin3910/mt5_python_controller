@@ -13,7 +13,6 @@ const emit = defineEmits<{ (e: 'close'): void; (e: 'done'): void }>()
 
 // ── 表单 ──
 const directory = ref('')
-const name = ref('')
 const account = ref('')
 const writeEnv = ref(true)
 const versions = ref<ImportVersionItem[]>([])
@@ -27,12 +26,50 @@ const error = ref('')
 const confirmText = ref('')
 const progress = ref<ImportProgress | null>(null)
 const busy = ref(false)
+// prepare 返回的账号（留空时是后端从终端读到的登录号）。
+// 本机标签 = 目录名-账号ID，所以标签得等账号定了才知道。
+const resolvedLogin = ref(0)
 
 let pollTimer: number | null = null
 
 const selectedItem = computed(
   () => versions.value.find((v) => v.version === selectedVersion.value) ?? null,
 )
+
+/** 目录名（标签的前缀）。 */
+const dirName = computed(() => {
+  const raw = directory.value.trim().replace(/[\\/]+$/, '')
+  if (!raw) return ''
+  const parts = raw.split(/[\\/]/)
+  return parts[parts.length - 1] ?? ''
+})
+
+/** 当前生效的账号：手填的优先，否则用 prepare 读到的。 */
+const effectiveAccount = computed(() => {
+  const typed = account.value.trim()
+  if (typed) return /^\d+$/.test(typed) && Number(typed) > 0 ? Number(typed) : 0
+  return resolvedLogin.value
+})
+
+/** 手填的账号是否合法（留空合法 —— 那时读终端登录号）。 */
+const accountInvalid = computed(() => {
+  const typed = account.value.trim()
+  if (!typed) return false
+  return !/^\d+$/.test(typed) || Number(typed) <= 0
+})
+
+/**
+ * 本机标签：目录名-账号ID。
+ *
+ * 只在本机生效（存 instances.json 的 display_name），面板卡片显示它；
+ * 服务器上的节点名是另一套（序号-账号ID），由服务器自己生成。
+ */
+const localLabel = computed(() => {
+  const folder = dirName.value
+  const id = effectiveAccount.value
+  if (!folder) return ''
+  return id ? `${folder}-${id}` : `${folder}-<账号>`
+})
 
 const overallPct = computed(() => {
   const steps = progress.value?.steps ?? []
@@ -71,9 +108,6 @@ async function recheck() {
   }
   try {
     check.value = await api.checkDir(directory.value.trim())
-    if (check.value.ok && !name.value) {
-      name.value = check.value.suggested_name ?? ''
-    }
   } catch (exc) {
     error.value = exc instanceof Error ? exc.message : String(exc)
   }
@@ -128,11 +162,14 @@ async function start() {
     error.value = '请先选择客户端版本'
     return
   }
+  if (accountInvalid.value) {
+    error.value = 'MT5 账号必须是正整数'
+    return
+  }
   busy.value = true
   try {
     const payload = {
       directory: directory.value.trim(),
-      name: name.value.trim(),
       version: selectedVersion.value,
       sha256: selectedItem.value?.sha256 ?? '',
       account: account.value.trim(),
@@ -143,6 +180,7 @@ async function start() {
       error.value = prepared.error || '无法开始导入'
       return
     }
+    resolvedLogin.value = prepared.login ?? 0
     confirmText.value = prepared.summary
   } catch (exc) {
     error.value = exc instanceof Error ? exc.message : String(exc)
@@ -158,7 +196,6 @@ async function confirmAndRun() {
   try {
     const res = await api.startImport({
       directory: directory.value.trim(),
-      name: name.value.trim(),
       version: selectedVersion.value,
       sha256: selectedItem.value?.sha256 ?? '',
       account: account.value.trim(),
@@ -222,6 +259,7 @@ watch(
     confirmText.value = ''
     progress.value = null
     check.value = null
+    resolvedLogin.value = 0
     void loadVersions()
     if (directory.value.trim()) void recheck()
   },
@@ -261,8 +299,17 @@ function close() {
       <p v-else-if="check && !check.ok" class="modal-error">{{ check.message }}</p>
 
       <div class="form-field">
-        <label>实例标签</label>
-        <input v-model="name" class="input-field" placeholder="留空则取目录名" />
+        <label>本机标签</label>
+        <input
+          :value="localLabel"
+          class="input-field"
+          readonly
+          placeholder="选目录后自动取「目录名-账号ID」"
+        />
+        <p class="hint-line">
+          只在本机生效，导入后可在本面板重命名。服务器上的节点名由服务器按
+          「序号-账号ID」自动生成。
+        </p>
       </div>
 
       <div class="form-field">
@@ -293,6 +340,7 @@ function close() {
           class="input-field"
           placeholder="留空则读取终端当前登录号"
         />
+        <p v-if="accountInvalid" class="modal-error">账号必须是正整数</p>
       </div>
 
       <div class="check-list">
@@ -322,7 +370,7 @@ function close() {
         <button
           v-if="!confirmText"
           class="btn-md primary"
-          :disabled="busy || !check?.ok || !selectedVersion"
+          :disabled="busy || !check?.ok || !selectedVersion || accountInvalid"
           @click="start"
         >
           开始导入

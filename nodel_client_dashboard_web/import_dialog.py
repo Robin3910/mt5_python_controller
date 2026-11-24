@@ -141,7 +141,6 @@ class ImportController:
 
         request = ImportRequest(
             directory=directory,
-            name=str(body.get("name") or "").strip(),
             version=str(body.get("version") or "").strip(),
             sha256=str(body.get("sha256") or "").strip(),
             account_raw=account_raw,
@@ -193,7 +192,6 @@ class ImportController:
         target = self._bridge.version_target()
         return ImportRequest(
             directory=directory,
-            name=str(body.get("name") or "").strip(),
             version=str(body.get("version") or "").strip(),
             sha256=str(body.get("sha256") or "").strip(),
             account_raw=str(body.get("account") or "").strip(),
@@ -217,7 +215,8 @@ class ImportController:
                 raise ImportError_("尚未配置后端地址或节点令牌")
 
             def enroll(cfg: InstanceConfig, login: int, server: str) -> None:
-                node = session.enrolled(login, cfg.name, server)
+                # 名字留空：服务器按「序号-账号ID」自己生成节点名。
+                node = session.enrolled(login, "", server)
                 session.apply_node(cfg, node)
 
             def register(cfg: InstanceConfig) -> None:
