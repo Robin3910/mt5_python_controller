@@ -108,8 +108,16 @@ class RedisStore:
 
     @classmethod
     def from_url(cls, url: Optional[str] = None) -> "RedisStore":
-        # decode_responses=True：直接拿到 str，省去手动 decode
-        return cls(aioredis.from_url(url or settings.redis_url, decode_responses=True))
+        # decode_responses=True：直接拿到 str，省去手动 decode。
+        # 显式放大连接池（redis-py 默认 100，单进程并发一高就打满 → MaxConnectionsError 500）；
+        # health_check_interval 让空闲连接定期 ping，避免死连接长期占用配额。
+        return cls(aioredis.from_url(
+            url or settings.redis_url,
+            decode_responses=True,
+            max_connections=settings.redis_max_connections,
+            socket_timeout=5,
+            health_check_interval=settings.redis_health_check_interval,
+        ))
 
     async def close(self) -> None:
         try:
@@ -132,13 +140,13 @@ class RedisStore:
         return json.loads(raw) if raw else None
 
     async def all_nodes(self) -> list[dict]:
-        ids = await self.r.smembers(K_NODES)
-        out: list[dict] = []
-        for nid in ids:
-            n = await self.get_node(nid)
-            if n:
-                out.append(n)
-        return out
+        # 一次 MGET 取回全部节点 JSON：逐个 GET 会随节点数线性增加 Redis 往返，
+        # 节点一多，任何「列表页」都得排队等这一串 RTT。
+        ids = list(await self.r.smembers(K_NODES))
+        if not ids:
+            return []
+        raws = await self.r.mget([K_NODE.format(nid) for nid in ids])
+        return [json.loads(raw) for raw in raws if raw]
 
     async def all_nodes_with_db_fallback(self) -> list[dict]:
         """读节点列表；Redis 缓存为空时回落到 MySQL 并顺手把缓存补回来。
@@ -349,13 +357,12 @@ class RedisStore:
         return json.loads(raw) if raw else None
 
     async def all_groups(self) -> list[dict]:
-        ids = await self.r.smembers(K_GROUPS)
-        out: list[dict] = []
-        for gid in ids:
-            g = await self.get_group(gid)
-            if g:
-                out.append(g)
-        return out
+        # MGET 批量读（原因同 all_nodes：避免逐个 GET 的线性 RTT）
+        ids = list(await self.r.smembers(K_GROUPS))
+        if not ids:
+            return []
+        raws = await self.r.mget([K_GROUP.format(gid) for gid in ids])
+        return [json.loads(raw) for raw in raws if raw]
 
     async def delete_group(self, group_id: str) -> None:
         """删除分组时连带清理其轮转顺序与组内各节点的互斥占位。"""
@@ -664,14 +671,29 @@ class RedisStore:
         raw = await self.r.get(K_STRATEGY.format(strategy_id))
         return json.loads(raw) if raw else None
 
-    async def all_strategies(self) -> list[dict]:
-        ids = await self.r.smembers(K_STRATEGIES)
-        out: list[dict] = []
-        for sid in ids:
-            s = await self.get_strategy(sid)
-            if s:
-                out.append(s)
+    async def get_strategies(self, strategy_ids: list[str]) -> dict[str, dict]:
+        """批量读策略快照 {strategy_id: strategy}，缺失的键不出现在结果里。
+
+        一次 MGET 取代「逐个 get_strategy」的线性 RTT —— 列表页常见「取这些
+        分组用到的全部策略」，逐个读要 N 次往返。
+        """
+        ids = [str(sid) for sid in (strategy_ids or []) if sid]
+        if not ids:
+            return {}
+        raws = await self.r.mget([K_STRATEGY.format(sid) for sid in ids])
+        out: dict[str, dict] = {}
+        for sid, raw in zip(ids, raws):
+            if raw:
+                out[sid] = json.loads(raw)
         return out
+
+    async def all_strategies(self) -> list[dict]:
+        # MGET 批量读（原因同 all_nodes：避免逐个 GET 的线性 RTT）
+        ids = list(await self.r.smembers(K_STRATEGIES))
+        if not ids:
+            return []
+        raws = await self.r.mget([K_STRATEGY.format(sid) for sid in ids])
+        return [json.loads(raw) for raw in raws if raw]
 
     async def delete_strategy(self, strategy_id: str) -> None:
         await self.r.delete(K_STRATEGY.format(strategy_id))

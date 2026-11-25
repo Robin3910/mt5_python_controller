@@ -126,7 +126,16 @@ async def list_nodes(
     names = await rbac_service.owner_names_for(p)
     # 凭证与账户快照都批量取：逐节点串行查库时，35 个节点会把接口拖到数秒。
     creds = await _credentials_by_node([n["node_id"] for n in nodes])
-    accounts = await asyncio.gather(*(store.get_account(n["node_id"]) for n in nodes))
+    # return_exceptions=True：单个节点的 Redis 取账户失败（如瞬时连接池打满）
+    # 只让该节点的账户快照降级为空，不应把整个节点列表打成 500。
+    raw_accounts = await asyncio.gather(
+        *(store.get_account(n["node_id"]) for n in nodes), return_exceptions=True,
+    )
+    # 失败降级为 {}（而非 None）：None 会让 _to_node_out 再次回查 Redis 并可能二次失败。
+    accounts = [
+        {} if isinstance(a, BaseException) or a is None else a
+        for a in raw_accounts
+    ]
     return [
         await _to_node_out(store, n, names, creds.get(n["node_id"]), acct=acct)
         for n, acct in zip(nodes, accounts)

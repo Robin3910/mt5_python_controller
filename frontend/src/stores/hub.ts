@@ -131,8 +131,28 @@ interface HubState {
   presets: OrderPreset[]
 }
 
-export const useHubStore = defineStore('hub', {
-  state: (): HubState => ({
+// 列表类接口的去重：多处（页面自身 + 内嵌组件）会在同一时刻拉同一份数据。
+// - 进行中的同 key 请求直接复用同一个 Promise，不再发第二条；
+// - 刚完成（500ms 内）的同 key 请求不再重发，覆盖「组件先后挂载」的场景。
+// 刻意不做长时间结果缓存：WS 事件、增删改之后必须能拿到最新数据。
+const inflight = new Map<string, Promise<unknown>>()
+const recent = new Map<string, number>()
+const RECENT_MS = 500
+
+function dedupe<T>(key: string, run: () => Promise<T>): Promise<T> {
+  const pending = inflight.get(key)
+  if (pending) return pending as Promise<T>
+  const doneAt = recent.get(key)
+  if (doneAt !== undefined && Date.now() - doneAt < RECENT_MS) return Promise.resolve(undefined as T)
+  const p = run().finally(() => {
+    inflight.delete(key)
+    recent.set(key, Date.now())
+  })
+  inflight.set(key, p)
+  return p
+}
+
+export const useHubStore = defineStore('hub', {  state: (): HubState => ({
     nodes: [],
     groups: [],
     strategies: [],
@@ -164,7 +184,11 @@ export const useHubStore = defineStore('hub', {
     async fetchNodes(options?: { q?: string }): Promise<void> {
       const q = options?.q?.trim()
       const params = q ? { q } : undefined
-      this.nodes = (await api.get('/api/nodes', { params })).data
+      const data = await dedupe(`nodes:${q || ''}`, async () =>
+        (await api.get('/api/nodes', { params })).data,
+      ) as NodeOut[] | undefined
+      // 去重短路（undefined）时不覆盖当前数据
+      if (data) this.nodes = data
     },
     async fetchConfig(): Promise<void> {
       this.filters = (await api.get('/api/config/filters')).data
@@ -560,7 +584,11 @@ export const useHubStore = defineStore('hub', {
     async fetchGroups(options?: { q?: string }): Promise<void> {
       const q = options?.q?.trim()
       const params = q ? { q } : undefined
-      this.groups = (await api.get('/api/groups', { params })).data
+      const data = await dedupe(`groups:${q || ''}`, async () =>
+        (await api.get('/api/groups', { params })).data,
+      ) as GroupOut[] | undefined
+      if (!data) return
+      this.groups = data
       this.mergeLimitWatchLogsFromGroups(this.groups)
     },
     async createGroup(payload: GroupCreatePayload, options?: { q?: string }): Promise<GroupOut> {
@@ -601,9 +629,13 @@ export const useHubStore = defineStore('hub', {
     async fetchStrategies(options?: { q?: string }): Promise<void> {
       const q = options?.q?.trim()
       const params = q ? { q } : undefined
+      const data = await dedupe(`strategies:${q || ''}`, async () =>
+        (await api.get('/api/strategies', { params })).data,
+      ) as StrategyOut[] | undefined
+      if (!data) return
       // 记下当前检索词：WS 触发的自动刷新要沿用它，否则列表页会突然显示全量
       this.strategyQuery = q || ''
-      this.strategies = (await api.get('/api/strategies', { params })).data
+      this.strategies = data
     },
     /**
      * 取单个策略详情：带 runtime_hints（在跑任务的已开笔数等）。

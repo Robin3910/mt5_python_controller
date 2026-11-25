@@ -268,16 +268,22 @@ async def list_ai_robots(
         [primary["node_id"] for user, primary, group, strategy in candidates],
         [group["group_id"] for user, primary, group, strategy in candidates],
     )
+    # 绩效：**一次查询**算完全部分组（按分组 magic 隔离，口径与 leader_batch 一致）。
+    # 不能逐 candidate 调 leader_batch —— 那是 N+1（每个机器人 3 条 SQL + 新建
+    # session），分组一多列表就卡到秒级。也不能直接读 robot_stats 预聚合：
+    # 那是「主节点全部成交」口径，会把同节点多个 AI 分组混在一起（用户会看到
+    # 两个机器人收益相等且各自不等于自己的真实收益）。
+    perfs = await deal_stats.group_summaries_batch(
+        {group["group_id"]: scopes.get(group["group_id"], {}) for _, _, group, _ in candidates},
+        None if win == "all" else deal_stats.window_start(win),
+    )
     out: list[dict] = []
     for user, primary, group, strategy in candidates:
         gid = group["group_id"]
         my_group_count, my_node_count = follow_rules.my_follow_counts_in_market(
             mine_by_group.get(gid, []), groups_by_id, follow_rules.AI_MARKET_TEMPLATE_IDS, tmpl_map,
         )
-        perf = await deal_stats.leader_batch(
-            [primary["node_id"]], None if win == "all" else deal_stats.window_start(win),
-            node_magics=scopes[gid],
-        )
+        perf = perfs.get(gid) or deal_stats._empty_summary()
         follower_count = len(followers_by_group.get(gid, set()))
         out.append({
             **_group_robot_summary(user, primary, group, strategy, p),

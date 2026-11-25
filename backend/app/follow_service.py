@@ -38,14 +38,21 @@ async def _strategies_of(groups: list[dict], store: RedisStore) -> dict[str, dic
     不为一次列表请求去逐个回源查库。
     """
     out: dict[str, dict] = {}
-    for sid in {g.get("strategy_id") for g in groups if g.get("strategy_id")}:
-        try:
-            s = await store.get_strategy(str(sid))
-        except Exception:  # noqa: BLE001
-            s = None
-        if s:
-            out[str(sid)] = s
-    return out
+    ids = {str(g["strategy_id"]) for g in groups if g.get("strategy_id")}
+    if not ids:
+        return out
+    try:
+        return await store.get_strategies(sorted(ids))
+    except Exception:  # noqa: BLE001
+        # 缓存不可用时逐个兜底（保持旧行为：单条失败不影响其它）
+        for sid in ids:
+            try:
+                s = await store.get_strategy(sid)
+            except Exception:  # noqa: BLE001
+                s = None
+            if s:
+                out[sid] = s
+        return out
 
 
 def _template_ids_of(strategies: dict[str, dict]) -> dict[str, str]:
