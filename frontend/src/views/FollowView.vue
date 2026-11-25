@@ -389,37 +389,6 @@ const pickerNodes = computed(() => {
     !needle || [node.name, node.node_id, node.mt5_login].some(value => String(value ?? '').toLowerCase().includes(needle)))
 })
 const pickerSymbols = computed(() => [...new Set((detail.value?.groups || []).filter(group => group.selectable).map(group => group.symbol).filter(Boolean))])
-/**
- * 跟单申请按带单员聚合。
- *
- * 「已移出 / 失效」的申请（status = cancelled，或后端标了 available=false，或
- * 理由写明分组/机器人已失效）与跟单列表口径一致 —— 不再展示，避免客户误以为
- * 还有一个在跑的跟单。
- */
-function isDeadApplication(row: FollowApplication): boolean {
-  if (row.status === 'pending') return false
-  if (row.status === 'cancelled' || row.available === false) return true
-  return /已移出|已失效/.test(row.reason || '')
-}
-/** AI 市场（tpl_1）的跟单申请归【AI 交易】页管，带单列表里不展示。 */
-const applicationGroups = computed(() => {
-  const grouped = new Map<number, { leader_user_id: number; leader_name: string; nodes: FollowApplication[] }>()
-  for (const row of mine.value.applications || []) {
-    if (row.status === 'approved') continue
-    if (isDeadApplication(row)) continue
-    if (isAiApplication(row)) continue
-    if (!grouped.has(row.leader_user_id)) grouped.set(row.leader_user_id, { leader_user_id: row.leader_user_id, leader_name: row.leader_name, nodes: [] })
-    grouped.get(row.leader_user_id)!.nodes.push(row)
-  }
-  return [...grouped.values()]
-})
-const recordLeaderCount = computed(() => new Set([...myFollowing.value.map(row => row.leader.leader_user_id), ...applicationGroups.value.map(row => row.leader_user_id)]).size)
-const applicationOnlyGroups = computed(() => applicationGroups.value.filter(group => !myFollowing.value.some(entry => entry.leader.leader_user_id === group.leader_user_id)))
-
-function applicationRows(leaderId: number): FollowApplication[] {
-  return applicationGroups.value.find(group => group.leader_user_id === leaderId)?.nodes || []
-}
-
 function nodeFollowHint(id: string): string {
   if (isOwnSourceNode(id)) return '主节点已在带单分组内'
   const groups = targetGroupIds.value
@@ -458,12 +427,6 @@ function trapPickerFocus(event: KeyboardEvent): void {
   } else if (!event.shiftKey && document.activeElement === last) {
     event.preventDefault(); first.focus()
   }
-}
-async function retryApplication(row: FollowApplication): Promise<void> {
-  const leader = leaders.value.find(item => item.leader_user_id === row.leader_user_id)
-  if (!leader) { ElMessage.warning('该带单员目前未开放跟单'); return }
-  await openFollowPicker(leader)
-  if (isNodeSelectable(row.node_id)) selectedNodes.value = [row.node_id]
 }
 function groupIsRunning(group: FollowMyGroup): boolean {
   return group.marketable && !group.paused && group.my_nodes.some(n => (n.follow_state || 'running') === 'running' && !n.leader_paused)
@@ -823,7 +786,7 @@ interface NodeCard {
   profit: number
   balance: string
   server: string
-  state: '跟单中' | '已暂停' | '待审核' | '已停止'
+  state: '跟单中' | '已暂停'
 }
 const nodeCards = computed<NodeCard[]>(() => {
   const map = new Map<string, NodeCard & { syms: Set<string>; leadersSet: Set<string> }>()
@@ -871,21 +834,6 @@ const nodeCards = computed<NodeCard[]>(() => {
       }
     }
   }
-  for (const row of mine.value.applications || []) {
-    if (!row.available || isAiApplication(row)) continue
-    const pending = row.status === 'pending'
-    if (!pending && !(row.status === 'cancelled' && row.reason === '跟单已移出')) continue
-    const existing = map.get(row.node_id)
-    if (existing) {
-      if (pending && existing.state === '已停止') existing.state = '待审核'
-      continue
-    }
-    const node = hub.nodes.find(n => n.node_id === row.node_id)
-    map.set(row.node_id, { node_id: row.node_id, name: row.name || row.node_id, login: row.mt5_login,
-      server: node?.mt5_server || '', online: !!node && hub.isNodeOnline(node), state: pending ? '待审核' : '已停止',
-      count: 0, volume: 0, profit: 0, balance: nodeBalance(row.node_id), leaders: '', symbols: '',
-      syms: new Set(row.symbol ? [row.symbol] : []), leadersSet: new Set([row.leader_name]) })
-  }
   return [...map.values()].map((card) => ({
     ...card,
     symbols: [...card.syms].join(' · ') || '—',
@@ -916,7 +864,7 @@ const shownNodes = computed(() => {
   })
 })
 const nodeSummary = computed(() => {
-  const cards = nodeCards.value.filter(n => n.state === '跟单中' || n.state === '已暂停')
+  const cards = nodeCards.value
   const wins = cards.filter((n) => n.profit > 0).length
   const volume = cards.reduce((s, n) => s + n.volume, 0)
   const profit = cards.reduce((s, n) => s + n.profit, 0)
@@ -1033,12 +981,6 @@ function groupDisplayTitle(name: string | null, strategy: string | null, symbol?
   const key = groupModeKey(name, strategy)
   const label = (key && SELF_MODE_LABEL[key]) || groupTitle(name, strategy)
   return symbol ? `${label} · ${symbol}` : label
-}
-
-function applicationTitle(row: FollowApplication): string {
-  const name = row.group_name || ''
-  const symbol = row.symbol || (groupModeKey(name) && name.match(/-\d+-([^-]+)$/)?.[1])
-  return groupDisplayTitle(name || '跟单申请', row.strategy_name, symbol)
 }
 
 function showcaseGroupMode(g: { name: string | null; strategy_name?: string | null }): string {
@@ -1194,7 +1136,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 
       <section class="fd-sec">
         <header>
-          <p class="fd-kicker green">我的跟单<span>{{ recordLeaderCount }}</span></p>
+          <p class="fd-kicker green">我的跟单<span>{{ myFollowing.length }}</span></p>
           <button type="button" class="fd-ghost" @click="openMine">查看全部<svg viewBox="0 0 24 24"><path fill="currentColor" d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg></button>
         </header>
         <button type="button" class="fd-preview" @click="openMine">
@@ -1202,7 +1144,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
             <span class="fd-swap"><svg viewBox="0 0 24 24"><path fill="currentColor" d="m6.99 11 2.51-2.5L8.09 7 3 12.09 8.09 17.2l1.41-1.41L6.99 13.2H14v-2.2zM21 6.91 15.91 1.8 14.5 3.21l2.51 2.5H10v2.2h7.01l-2.51 2.5 1.41 1.41z"/></svg></span>
             <span>
               <b>我跟随的带单员</b>
-              <small>{{ recordLeaderCount }} 位带单员 · {{ mine.summary.pending_node_count || 0 }} 个节点待审核 · 点击查看运行状态</small>
+              <small>{{ myFollowing.length }} 位带单员 · 点击查看运行状态</small>
             </span>
             <svg class="fd-chev" viewBox="0 0 24 24"><path fill="currentColor" d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg>
           </span>
@@ -1213,7 +1155,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
               <small>{{ chip.hint }}</small>
             </span>
           </span>
-          <span v-else class="fd-preview-empty">{{ applicationGroups.length ? '跟单申请与审核状态 · 点击查看' : '还没有跟随的带单员' }}</span>
+          <span v-else class="fd-preview-empty">还没有跟随的带单员</span>
         </button>
       </section>
 
@@ -1307,29 +1249,18 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
       </section>
 
       <div class="fd-tabs">
-        <button type="button" :class="{ on: mineTab === 'list' }" @click="mineTab = 'list'; trackFollowUi('filter', { value: 'list' })"><svg viewBox="0 0 24 24"><path fill="currentColor" d="m6.99 11 2.51-2.5L8.09 7 3 12.09 8.09 17.2l1.41-1.41L6.99 13.2H14v-2.2zM21 6.91 15.91 1.8 14.5 3.21l2.51 2.5H10v2.2h7.01l-2.51 2.5 1.41 1.41z"/></svg>跟单列表<span>{{ recordLeaderCount }}</span></button>
+        <button type="button" :class="{ on: mineTab === 'list' }" @click="mineTab = 'list'; trackFollowUi('filter', { value: 'list' })"><svg viewBox="0 0 24 24"><path fill="currentColor" d="m6.99 11 2.51-2.5L8.09 7 3 12.09 8.09 17.2l1.41-1.41L6.99 13.2H14v-2.2zM21 6.91 15.91 1.8 14.5 3.21l2.51 2.5H10v2.2h7.01l-2.51 2.5 1.41 1.41z"/></svg>跟单列表<span>{{ myFollowing.length }}</span></button>
         <button type="button" :class="{ on: mineTab === 'nodes' }" @click="mineTab = 'nodes'; trackFollowUi('filter', { value: 'nodes' })"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M22 11V3h-7v3H9V3H2v8h7V8h2v10h4v3h7v-8h-7v3h-2V8h2v3z"/></svg>子节点跟单统计<span>{{ nodeCards.length }}</span></button>
       </div>
 
       <section v-if="mineTab === 'list'" class="fd-sec">
         <header>
-          <p class="fd-kicker blue">跟单列表<span>{{ recordLeaderCount }} 位带单员</span></p>
+          <p class="fd-kicker blue">跟单列表<span>{{ myFollowing.length }} 位带单员</span></p>
           <small v-if="latestSync" class="fd-sync">最近同步 {{ fmtTime(latestSync) }}</small>
         </header>
-        <div v-if="applicationOnlyGroups.length" class="fd-grid">
-          <article v-for="group in applicationOnlyGroups" :key="'application-' + group.leader_user_id" class="fd-card fd-applications">
-            <header class="fd-card-top"><span class="fd-avatar lg">{{ group.leader_name.slice(0, 1) }}</span><div><b>{{ group.leader_name }}</b><small>跟单申请 · {{ group.nodes.filter(node => node.status === 'pending').length }} 条待通过</small></div></header>
-            <div v-for="node in group.nodes" :key="node.request_id" class="fd-item">
-              <div class="fd-item-top"><p><b>{{ applicationTitle(node) }}</b></p><em :class="node.status === 'pending' ? 'fd-pending' : 'off'">{{ node.status === 'pending' ? '待通过' : node.status === 'rejected' ? '已拒绝' : '已移出 / 失效' }}</em></div>
-              <p class="fd-application-node">{{ node.name || node.node_id }} <span v-if="node.is_primary">主节点</span> · {{ node.mt5_login || node.node_id }}</p>
-              <p class="fd-application-note">{{ node.status === 'pending' ? '⌛ 等待带单员通过申请' : node.reason || '可重新选择节点申请跟单' }}</p>
-              <button v-if="node.status !== 'pending' && node.available" type="button" class="fd-link" @click="retryApplication(node)">重新申请 ›</button>
-            </div>
-          </article>
-        </div>
         <p v-if="mineLoading && !myFollowing.length" class="fd-empty">加载中…</p>
-        <div v-else-if="!myFollowing.length && !applicationGroups.length" class="fd-mine-empty">
-          <b>还没有跟单</b><p>前往带单广场选择带单员，申请加入跟单。</p><button class="fd-link" @click="pageMode = 'home'">去带单广场 ›</button>
+        <div v-else-if="!myFollowing.length" class="fd-mine-empty">
+          <b>还没有跟单</b><p>跟单申请通过后会在这里显示。</p><button class="fd-link" @click="pageMode = 'home'">去带单广场 ›</button>
         </div>
         <div v-else class="fd-grid">
           <article v-for="entry in myFollowing" :key="entry.leader.leader_user_id" class="fd-card">
@@ -1350,12 +1281,6 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
               </div>
             </header>
             <p v-if="entry.leader.follow_paused" class="fd-warn">{{ PAUSED_FOLLOW_HINT }}</p>
-            <div v-for="node in applicationRows(entry.leader.leader_user_id)" :key="'request-' + node.request_id" class="fd-item">
-              <div class="fd-item-top"><p><b>{{ applicationTitle(node) }}</b></p><em :class="node.status === 'pending' ? 'fd-pending' : 'off'">{{ node.status === 'pending' ? '待通过' : node.status === 'rejected' ? '已拒绝' : '已移出 / 失效' }}</em></div>
-              <p class="fd-application-node">{{ node.name || node.node_id }} <span v-if="node.is_primary">主节点</span> · {{ node.mt5_login || node.node_id }}</p>
-              <p class="fd-application-note">{{ node.status === 'pending' ? '⌛ 等待带单员通过申请' : node.reason || '可重新选择节点申请跟单' }}</p>
-              <button v-if="node.status !== 'pending' && node.available" type="button" class="fd-link" @click="retryApplication(node)">重新申请 ›</button>
-            </div>
             <div v-for="g in entry.groups" :key="g.group_id" class="fd-item">
               <div class="fd-self-row">
                 <p>
@@ -1428,7 +1353,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
           <div><span>首单账户余额</span><b>{{ nodeSummary.balance == null ? '暂无数据' : nodeSummary.balance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) }}</b></div>
           <div><span>总浮动盈亏</span><b :class="nodeSummary.profit >= 0 ? 'up' : 'down'">{{ fmtU(nodeSummary.profit) }}</b></div>
         </div>
-        <p class="fd-sub">盈利节点 {{ nodeSummary.wins }} / {{ nodeSummary.active }} · 共持仓 {{ nodeSummary.count }} 笔 · 汇总数据仅统计运行中与已暂停节点</p>
+        <p class="fd-sub">盈利节点 {{ nodeSummary.wins }} / {{ nodeSummary.active }} · 共持仓 {{ nodeSummary.count }} 笔</p>
         <p v-if="!shownNodes.length" class="fd-empty">没有符合条件的节点</p>
         <div class="fd-grid"><article v-for="card in shownNodes" :key="card.node_id" class="fd-node-card">
           <header>
@@ -1439,7 +1364,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
             </div>
             <em :class="card.state === '跟单中' ? 'on' : 'off'"><i></i>{{ card.state }}</em>
           </header>
-          <div class="fd-pnl" :class="card.profit >= 0 ? 'up' : 'down'"><span><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" :d="card.state === '已停止' ? 'M19 13H5v-2h14z' : 'M16 6l2.29 2.29-4.88 4.88-4-4L2 16.59 3.41 18l6-6 4 4 6.3-6.29L22 12V6z'"/></svg>浮动盈亏</span><b>{{ fmtU(card.profit) }}</b></div>
+          <div class="fd-pnl" :class="card.profit >= 0 ? 'up' : 'down'"><span><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M16 6l2.29 2.29-4.88 4.88-4-4L2 16.59 3.41 18l6-6 4 4 6.3-6.29L22 12V6z"/></svg>浮动盈亏</span><b>{{ fmtU(card.profit) }}</b></div>
           <div class="fd-stats">
             <div><span>持仓笔数</span><b>{{ card.count }} 笔</b></div>
             <div><span>手数</span><b>{{ card.volume.toFixed(2) }}</b></div>
@@ -1447,12 +1372,9 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
           </div>
           <footer>
             <span class="fd-symbol">{{ card.symbols }}</span>
-            <small v-if="card.state === '待审核' || card.state === '已停止'">{{ card.state === '待审核' ? '等待带单员通过申请' : '已停止跟单' }}</small>
-            <template v-else>
             <button type="button" class="fd-self-hold" :aria-label="canPause(nodeTargets(card.node_id)) ? '暂停跟单' : '恢复跟单'" :title="canPause(nodeTargets(card.node_id)) ? '暂停跟单' : '恢复跟单'" :disabled="mutationBusy || nodeTargets(card.node_id).every(t => t.locked)" @click="toggleRelations(nodeTargets(card.node_id))"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" :d="canPause(nodeTargets(card.node_id)) ? 'M6 19h4V5H6zm8-14v14h4V5z' : 'M8 5v14l11-7z'"/></svg></button>
             <button type="button" class="fd-close" :disabled="closeBusy || !card.count" @click="closeNodeCard(card)" :aria-label="card.count ? '一键平仓' : '已平仓'" :title="card.count ? '一键平仓' : '已平仓'"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M22 3.41l-5.29 5.29L20 12h-8V4l3.29 3.29L20.59 2 22 3.41zM3.41 22l5.29-5.29L12 20v-8H4l3.29 3.29L2 20.59 3.41 22z"/></svg></button>
             <button type="button" class="fd-leave" :disabled="mutationBusy" @click="askStop(nodeTargets(card.node_id))" aria-label="停止跟单" title="停止跟单"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" fill-rule="evenodd" d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zM16 16H8V8h8z"/></svg></button>
-            </template>
           </footer>
         </article></div>
       </section>
@@ -1837,7 +1759,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 .fd-picker-list { max-height: 224px; overflow-y: auto; margin-top: 8px; padding-right: 5px; scrollbar-width: thin; scrollbar-color: #4b347c #141c2a; }
 .fd-picker-groups { margin: 0 0 2px; padding: 7px 10px; border: 1px dashed #263047; border-radius: 8px; background: #111a2a; color: #a5b4c9; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
 .fd-picker-list .fd-pick { min-height: 56px; margin: 0 0 6px; padding: 9px 10px; cursor: pointer; gap: 7px; }.fd-picker-list .fd-pick.on { background: #23173d; box-shadow: inset 0 0 0 1px #7c3aed55; }.fd-picker-list input { width: 16px; height: 16px; margin: 0; accent-color: #7c3aed; flex-shrink: 0; }.fd-pick-info { min-width: 0; }.fd-pick-info>b { font-size: 13px; }.fd-pick-info em { display: inline-block; border: 1px solid #785b1e; border-radius: 4px; background: #4b3819; color: #fbbf24; font-size: 9px; padding: 1px 4px; font-style: normal; vertical-align: middle; }.fd-pick-info small { font-size: 10px; margin-top: 3px; overflow-wrap: anywhere; }.fd-pick-info .fd-pick-hint { color: #fbbf24; }.fd-online-dot { width: 7px; height: 7px; flex-shrink: 0; background: #64748b; border-radius: 50%; }.fd-online-dot.online { background: #22c55e; box-shadow: 0 0 5px #22c55e55; }
-.fd-dialog>footer { display: block; padding: 12px 16px; border-top: 1px solid #263047; flex-shrink: 0; }.fd-picker-buttons { display: flex; gap: 8px; }.fd-picker-cancel { flex: 1; border: 1px solid #263047; background: #111a2a; color: #a0aec0; border-radius: 10px; padding: 11px; }.fd-picker-buttons .primary { flex: 2; padding: 11px; background: linear-gradient(100deg,#7c3aed,#2563eb); font-weight: 600; box-shadow: 0 4px 12px #7c3aed33; }.fd-dialog button:disabled { opacity: .45; cursor: not-allowed; }.fd-dialog>footer>p { text-align: center; font-size: 10px; margin-top: 9px; line-height: 1.5; }.fd-picker-list .fd-pick.off { cursor: not-allowed; }.fd-pending { color: #fbbf24!important; background: #78350f33; border: 1px solid #92400e55; }.fd-application-node { font-size: 11px; color: #a5b4c9; margin-bottom: 4px; }.fd-application-node span { color: #fbbf24; font-size: 10px; }.fd-application-note { color: #94a3b8; font-size: 11px; margin: 8px 0; }.fd-applications .fd-item>button { padding: 2px 0; }
+.fd-dialog>footer { display: block; padding: 12px 16px; border-top: 1px solid #263047; flex-shrink: 0; }.fd-picker-buttons { display: flex; gap: 8px; }.fd-picker-cancel { flex: 1; border: 1px solid #263047; background: #111a2a; color: #a0aec0; border-radius: 10px; padding: 11px; }.fd-picker-buttons .primary { flex: 2; padding: 11px; background: linear-gradient(100deg,#7c3aed,#2563eb); font-weight: 600; box-shadow: 0 4px 12px #7c3aed33; }.fd-dialog button:disabled { opacity: .45; cursor: not-allowed; }.fd-dialog>footer>p { text-align: center; font-size: 10px; margin-top: 9px; line-height: 1.5; }.fd-picker-list .fd-pick.off { cursor: not-allowed; }
 .fd-picker-search input { height: 16px; padding: 0; line-height: 16px; box-shadow: none; }
 .fd-picker-list .fd-pick { text-transform: none; letter-spacing: normal; color-scheme: dark; }
 .fd-warn { color: #FBBF24; font-size: 12px; }

@@ -90,22 +90,6 @@ const ALL_MODULES: ProfileHubModule[] = [
   { ...strategyConfig, code: 'strategy_management', label: '策略管理', description: '查看和管理全站策略', path: '/strategies' },
   strategyConfig,
   {
-    code: 'follow',
-    label: '带单',
-    description: '把节点加入带单员的分组，接收他的信号',
-    path: '/follow',
-    icon: '<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/>',
-    accent: '#A78BFA',
-  },
-  {
-    code: 'ai_trade',
-    label: 'AI 交易',
-    description: '跟随 AI 加仓机器人的加仓节奏（手数不缩放）',
-    path: '/ai-trade',
-    icon: '<rect x="4" y="8" width="16" height="12" rx="2"/><path d="M12 8V4"/><circle cx="12" cy="3" r="1.5"/><path d="M9 14h.01M15 14h.01M9.5 17h5"/>',
-    accent: '#22C55E',
-  },
-  {
     code: 'console',
     label: '中控台',
     description: '远程执行命令与信号下发',
