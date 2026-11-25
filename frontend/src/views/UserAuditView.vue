@@ -419,15 +419,9 @@ async function bulkApprove(): Promise<void> {
   --ua-amber-l: #fbbf24;
   --ua-red: #f6465d;
 
-  max-width: 760px;
-  margin: 0 auto;
-  padding: 12px 12px 24px;
   display: flex;
   flex-direction: column;
   gap: 12px;
-}
-@media (min-width: 1024px) {
-  .ua-page { padding: 16px 16px 32px; }
 }
 
 /* ── 页头 ── */
