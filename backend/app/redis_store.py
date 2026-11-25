@@ -5,6 +5,7 @@ Redis 在本系统中承担“实时态”职责（在线状态、账户快照�
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from typing import Optional
@@ -32,6 +33,11 @@ K_POLL_ROTATION = "signal:poll:rotation:{}"  # 按品种的轮转顺序（JSON l
 # ---- strategy 分组链路（与上面按币种的 key 命名空间完全分离）----
 K_GROUP = "group:{}"                    # 分组元数据缓存（JSON，含成员 node_id 列表）
 K_GROUPS = "groups"                     # 所有 group_id 的集合
+# 带单节点反向索引：node_id -> 该节点作为带单方成员的分组 ID 集合。
+# 账户快照每 5 秒一次，逐节点遍历全部分组会产生「节点数 × 分组数」次 Redis 往返；
+# 有索引时一次 smembers 即可。
+K_GROUP_LEADER = "group:leader:{}"
+K_GROUP_LEADER_GROUPS = "group:leader:groups"   # 带索引的 node_id 集合（用于清理）
 K_GROUP_ROTATION = "group:poll:rotation:{}"  # 分组内轮询轮转顺序（JSON list[node_id]）
 # 节点级互斥：(分组, 节点) -> 进行中的子任务号。同一分组内一个节点只允许一个策略
 # 任务；不同分组各自独立，同一节点可以同时承接多个分组的任务。
@@ -297,6 +303,46 @@ class RedisStore:
         gid = group["group_id"]
         await self.r.set(K_GROUP.format(gid), json.dumps(group))
         await self.r.sadd(K_GROUPS, gid)
+        await self._index_group_leaders(group)
+
+    async def _index_group_leaders(self, group: dict) -> None:
+        """维护「带单节点 -> 分组」反向索引。
+
+        索引严格跟随分组缓存重建（不只看新增成员），成员被摘掉时也能清掉旧引用。
+        索引缺失时 `groups_led_by` 会回落到全量扫描，所以这里失败不影响正确性。
+        """
+        gid = group["group_id"]
+        members = {str(m.get("node_id") or "").strip() for m in (group.get("members") or []) if isinstance(m, dict)}
+        members.discard("")
+        try:
+            tracked = await self.r.smembers(K_GROUP_LEADER_GROUPS)
+            stale = [nid for nid in tracked if nid not in members]
+            for nid in stale:
+                await self.r.srem(K_GROUP_LEADER.format(nid), gid)
+            if members:
+                await self.r.sadd(K_GROUP_LEADER_GROUPS, *members)
+                for nid in members:
+                    await self.r.sadd(K_GROUP_LEADER.format(nid), gid)
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def groups_led_by(self, node_id: str) -> Optional[list[dict]]:
+        """某节点作为带单方成员参与的分组（按反向索引取，一次 Redis 读）。
+
+        返回 None 表示索引不可用（如存量数据尚未重建），调用方应回落到全量扫描。
+        索引存在但为空是有效结果：该节点不是任何分组的带单方。
+        """
+        try:
+            ids = await self.r.smembers(K_GROUP_LEADER.format(node_id))
+            indexed = bool(await self.r.smembers(K_GROUP_LEADER_GROUPS))
+        except Exception:  # noqa: BLE001
+            return None
+        if not indexed:
+            return None
+        if not ids:
+            return []
+        rows = await asyncio.gather(*(self.get_group(gid) for gid in ids))
+        return [g for g in rows if isinstance(g, dict)]
 
     async def get_group(self, group_id: str) -> Optional[dict]:
         raw = await self.r.get(K_GROUP.format(group_id))
@@ -317,6 +363,9 @@ class RedisStore:
         await self.r.delete(K_GROUP_ROTATION.format(group_id))
         await self.clear_group_node_busy(group_id)
         await self.r.srem(K_GROUPS, group_id)
+        # 反向索引可能残留该分组（缓存覆盖时会重建，这里顺手清掉更干净）
+        for key in await self.r.smembers(K_GROUP_LEADER_GROUPS):
+            await self.r.srem(K_GROUP_LEADER.format(key), group_id)
 
     # ----------------- 自动路由规则的命中统计 -----------------
     async def record_route_rule_hit(
