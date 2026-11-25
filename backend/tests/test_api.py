@@ -6,6 +6,7 @@ without external services.
 import pathlib
 import fakeredis
 import pytest
+import redis
 from fastapi.testclient import TestClient
 
 from app.redis_store import RedisStore
@@ -486,6 +487,46 @@ def test_list_nodes_search_by_name_and_mt5_login(client):
     assert empty.status_code == 200
     assert empty.json() == []
 
+
+def test_list_nodes_survives_redis_account_failure(client, monkeypatch):
+    """单个节点取账户快照失败（Redis 连接池打满）时，列表不能整个 500。
+
+    生产事故：`GET /api/nodes` 偶发 500，堆栈是
+    `redis.exceptions.MaxConnectionsError: Too many connections`
+    抛在 `nodes.py` 的 `asyncio.gather(store.get_account(...))` 上。
+    这里复现「部分节点取账户失败」，断言接口仍返回 200 且节点不丢失。
+    """
+    h = _auth(client)
+    client.post("/api/nodes", json={"name": "Alpha VPS", "mt5_login": 60108484}, headers=h)
+    client.post("/api/nodes", json={"name": "Beta Server", "mt5_login": 70001234}, headers=h)
+
+    original_get_account = RedisStore.get_account
+    calls = {"n": 0}
+
+    async def flaky_get_account(self, node_id):
+        calls["n"] += 1
+        # 第一个节点取账户时抛连接池耗尽异常，模拟生产事故
+        if calls["n"] == 1:
+            raise redis.exceptions.MaxConnectionsError("Too many connections")
+        return await original_get_account(self, node_id)
+
+    monkeypatch.setattr(RedisStore, "get_account", flaky_get_account)
+
+    r = client.get("/api/nodes", headers=h)
+    assert r.status_code == 200, r.text
+    names = {n["name"] for n in r.json()}
+    assert names == {"Alpha VPS", "Beta Server"}
+    # 账户快照取不到的节点降级为空：mt5_server 无来源、last_seen 为空
+    assert all(n.get("mt5_login") for n in r.json())
+
+
+def test_redis_pool_size_is_configurable():
+    """连接池上限必须显式放大：redis-py 默认 100，单进程并发一高就会打满。"""
+    from app.settings import settings
+
+    assert settings.redis_max_connections >= 200
+    # Redis 服务端 maxclients 远大于客户端池上限，瓶颈在客户端侧
+    assert settings.redis_max_connections > 100
 
 def test_create_node_global_lot_requires_console_lot_enabled(client):
     h = _auth(client)

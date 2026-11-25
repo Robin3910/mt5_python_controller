@@ -95,8 +95,16 @@ def _base_conds(
     """
     conds = [Deal.node_id.in_(node_ids)]
     if from_ts is not None:
+        # 精确条件按真实 UTC 比较；但 `deal_time - offset` 是表达式，用不上
+        # `deal_time` 索引，窗口过滤在库侧等于失效 —— 每次都把节点全部历史成交
+        # 拉出来算，数据只增不减，接口会越来越慢。
+        # 下面补一条**索引友好**的粗筛：offset 局限在 ±2 天（券商时区最多
+        # -12h~+14h），命中行必然满足 `deal_time >= from_ts - 2天`。粗筛只缩小
+        # 扫描范围、不改变结果集，精确判定仍由上面那条表达式负责。
+        conds.append(Deal.deal_time >= int(from_ts) - 2 * _DAY_SECONDS)
         conds.append(Deal.deal_time - Deal.server_time_offset >= int(from_ts))
     if to_ts is not None:
+        conds.append(Deal.deal_time <= int(to_ts) + 2 * _DAY_SECONDS)
         conds.append(Deal.deal_time - Deal.server_time_offset <= int(to_ts))
     if symbol:
         conds.append(Deal.symbol == symbol.upper())
@@ -425,6 +433,156 @@ def _magic_scope(node_magics: Optional[dict[str, set[int]]]) -> list:
         and_(Deal.node_id == node_id, Deal.magic.in_(magics))
         for node_id, magics in node_magics.items() if magics
     ])]
+
+
+async def group_summaries_batch(
+    scopes: dict[str, dict[str, set[int]]],
+    from_ts: Optional[float] = None,
+    to_ts: Optional[float] = None,
+) -> dict[str, dict]:
+    """按「分组 + 魔术号」批量汇总（AI 机器人广场一次要展示 N 个分组）。
+
+    入参与 `net_profits_by_group` 同形：`{group_id: {node_id: {magic, ...}}}`。
+    列表接口对每个机器人逐个调 `leader_batch` 就是 N+1（每个机器人 3 条 SQL、
+    各自新建 session），分组一多必然慢 —— 这里**一次查询**算完全部分组：
+
+    1. 用一条 `(node_id, magic)` 范围内的成交，按住仓+魔术号聚合持仓级盈亏；
+    2. 汇总总量按 (node_id, magic) 聚合；
+    3. 期初权益按 (node_id, magic) 取窗口内最早一笔；
+    4. 再把 (node_id, magic) 归并到各自的分组。
+
+    **口径与 `leader_batch(node_magics=...)` 完全一致**（同一批出场类成交、
+    同一个 net_profit、同一套 `_build_summary`），保证「同一分组在广场与详情
+    的收益 / 胜率永远相同」。同一 (node_id, magic) 若同时属于多个分组，
+    会被各自计入 —— 与逐个 `leader_batch` 的行为一致（magic 本身是任务级，
+    一任务一分组，正常不会共享）。
+    """
+    # (node_id, magic) -> [group_id, ...]：反向映射，用于把聚合结果归集到分组
+    pair_groups: dict[tuple[str, int], list[str]] = {}
+    node_magics: dict[str, set[int]] = {}
+    for group_id, nodes in (scopes or {}).items():
+        for node_id, magics in (nodes or {}).items():
+            if not magics:
+                continue
+            node_magics.setdefault(str(node_id), set()).update(int(m) for m in magics)
+            for magic in magics:
+                pair_groups.setdefault((str(node_id), int(magic)), []).append(group_id)
+    if not pair_groups:
+        return {}
+
+    conds = _base_conds(list(node_magics.keys()), from_ts, to_ts)
+    conds.extend(_magic_scope(node_magics))
+    try:
+        async with SessionLocal() as s:
+            # 1) 持仓级盈亏（按 node_id + magic + position_id）
+            pos_rows = (
+                await s.execute(
+                    select(
+                        Deal.node_id,
+                        Deal.magic,
+                        Deal.position_id,
+                        func.sum(_out_profit()),
+                    )
+                    .where(*conds, Deal.position_id.is_not(None), Deal.position_id > 0)
+                    .group_by(Deal.node_id, Deal.magic, Deal.position_id)
+                )
+            ).all()
+            # 2) 汇总量（按 node_id + magic）
+            total_rows = (
+                await s.execute(
+                    select(
+                        Deal.node_id,
+                        Deal.magic,
+                        func.sum(_out_profit()),
+                        func.sum(Deal.volume),
+                        func.sum(Deal.commission),
+                        func.sum(Deal.swap),
+                        func.count(Deal.id),
+                        func.max(Deal.deal_time),
+                    ).where(*conds)
+                    .group_by(Deal.node_id, Deal.magic)
+                )
+            ).all()
+            # 3) 期初权益：每个 (node_id, magic) 在窗口内最早一笔的 equity
+            rn = func.row_number().over(
+                partition_by=(Deal.node_id, Deal.magic),
+                order_by=(Deal.deal_time.asc(), Deal.id.asc()),
+            )
+            base_sub = (
+                select(
+                    Deal.node_id.label("node_id"),
+                    Deal.magic.label("magic"),
+                    Deal.equity.label("equity"),
+                    Deal.deal_time.label("deal_time"),
+                    rn.label("rn"),
+                )
+                .where(*conds, Deal.equity > 0)
+                .subquery()
+            )
+            base_rows = (
+                await s.execute(
+                    select(
+                        base_sub.c.node_id,
+                        base_sub.c.magic,
+                        base_sub.c.equity,
+                        base_sub.c.deal_time,
+                    ).where(base_sub.c.rn == 1)
+                )
+            ).all()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("group_summaries_batch failed: %s", e)
+        return {}
+
+    # (node_id, magic) -> 持仓级盈亏列表
+    pos_by_pair: dict[tuple[str, int], list[float]] = {}
+    for node_id, magic, _pid, pl in pos_rows:
+        pos_by_pair.setdefault((node_id, magic), []).append(float(pl or 0.0))
+    tot_by_pair = {(r[0], r[1]): r for r in total_rows}
+    # (node_id, magic) -> (最早成交时间, 该笔的 equity)
+    base_by_pair = {(r[0], r[1]): (int(r[3] or 0), float(r[2] or 0.0)) for r in base_rows}
+
+    # 归集到分组：每组维护持仓列表、总量与「窗口内最早一笔」的期初权益
+    agg: dict[str, dict] = {}
+    for pair, group_ids in pair_groups.items():
+        pos = pos_by_pair.get(pair, [])
+        t = tot_by_pair.get(pair)
+        base = base_by_pair.get(pair)
+        for gid in group_ids:
+            cur = agg.setdefault(
+                gid,
+                {"positions": [], "net": 0.0, "vol": 0.0, "comm": 0.0, "swap": 0.0,
+                 "count": 0, "base": None, "updated_at": 0},
+            )
+            cur["positions"].extend(pos)
+            if t:
+                cur["net"] += float(t[2] or 0.0)
+                cur["vol"] += float(t[3] or 0.0)
+                cur["comm"] += float(t[4] or 0.0)
+                cur["swap"] += float(t[5] or 0.0)
+                cur["count"] += int(t[6] or 0)
+                cur["updated_at"] = max(cur["updated_at"], int(t[7] or 0))
+            # 期初权益：同分组内取**窗口内最早那一笔**（与 leader_batch 口径一致）
+            if base and (cur["base"] is None or base[0] < cur["base"][0]):
+                cur["base"] = base
+
+    out: dict[str, dict] = {}
+    for gid in (scopes or {}).keys():
+        cur = agg.get(gid)
+        if not cur:
+            out[gid] = _empty_summary()
+            continue
+        b = cur["base"]
+        out[gid] = _build_summary(
+            position_profits=cur["positions"],
+            net_profit=cur["net"],
+            gross_volume=cur["vol"],
+            commission_total=cur["comm"],
+            swap_total=cur["swap"],
+            deal_count=cur["count"],
+            base_equity=b[1] if b else 0.0,
+            updated_at=cur["updated_at"],
+        )
+    return out
 
 
 async def net_profits_by_group(

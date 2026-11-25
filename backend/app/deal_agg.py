@@ -114,35 +114,37 @@ class LeaderStatsAggregator:
             principal = await rbac_service.load_principal(store, u.username)
             if principal and permissions.can_be_leader(principal):
                 leader_ids.add(u.id)
-        if not leader_ids:
-            return 0
+        # 注意：不能因为 leader_ids 为空就整体 return —— AI 机器人统计（robot_stats）
+        # 只依赖主节点、与「是否有带单员」无关。早期版本在此提前返回，导致系统里
+        # 暂时没有合格带单员时机器人缓存永远不刷新。所以正常往下走。
 
         all_nodes = await store.all_nodes()
         # user_id -> [主节点 node_id]（主节点口径；没有主节点的用户不在 map 里）
         primary_nodes = primary_nodes_of(all_nodes)
 
-        # 跟单人数：跟了该带单员任一分组的去重节点数（跟单关系表，非订单数据）
-        followers_by_leader: dict[int, set[str]] = {}
-        for f in await follow_service.list_for_leaders(leader_ids):
-            followers_by_leader.setdefault(int(f["leader_user_id"]), set()).add(
-                str(f.get("node_id"))
-            )
-
         written = 0
-        for window in deal_stats.WINDOWS:
-            from_ts = deal_stats.window_start(window)
-            # 一次查询算完全部带单员（不是逐个 leader_batch）
-            summaries = await deal_stats.leader_batch_multi(primary_nodes, from_ts, None)
-            for uid in leader_ids:
-                # 缓存结构：{window: {**summary, follower_count}}
-                # summary 的字段与 DealSummary 一致，follower_count 附加在后。
-                perf = dict(summaries.get(uid) or {})
-                perf["follower_count"] = len(followers_by_leader.get(uid, set()))
-                cached = await store.get_leader_stats(uid) or {}
-                cached[window] = perf
-                await store.set_leader_stats(uid, cached, AGG_TTL)
-            written = len(leader_ids)
-        logger.info("leader stats refreshed: %d leader(s) (primary node only)", written)
+        if leader_ids:
+            # 跟单人数：跟了该带单员任一分组的去重节点数（跟单关系表，非订单数据）
+            followers_by_leader: dict[int, set[str]] = {}
+            for f in await follow_service.list_for_leaders(leader_ids):
+                followers_by_leader.setdefault(int(f["leader_user_id"]), set()).add(
+                    str(f.get("node_id"))
+                )
+
+            for window in deal_stats.WINDOWS:
+                from_ts = deal_stats.window_start(window)
+                # 一次查询算完全部带单员（不是逐个 leader_batch）
+                summaries = await deal_stats.leader_batch_multi(primary_nodes, from_ts, None)
+                for uid in leader_ids:
+                    # 缓存结构：{window: {**summary, follower_count}}
+                    # summary 的字段与 DealSummary 一致，follower_count 附加在后。
+                    perf = dict(summaries.get(uid) or {})
+                    perf["follower_count"] = len(followers_by_leader.get(uid, set()))
+                    cached = await store.get_leader_stats(uid) or {}
+                    cached[window] = perf
+                    await store.set_leader_stats(uid, cached, AGG_TTL)
+                written = len(leader_ids)
+            logger.info("leader stats refreshed: %d leader(s) (primary node only)", written)
         written += await self._refresh_robot_stats(store, primary_nodes)
         return written
 

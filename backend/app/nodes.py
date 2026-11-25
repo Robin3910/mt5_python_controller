@@ -3,7 +3,10 @@
 普通用户只能看到 / 修改管理员分配给自己的节点（改名、启停、账户风控）；
 节点入库、删除、批量手数与按币种配置（normal 链路）只有管理员能做。
 """
+import asyncio
+
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from . import node_deletion, node_service, permissions, persist, rbac_service, risk_control
@@ -55,14 +58,33 @@ def _node_matches_search(node: dict, term: str) -> bool:
     return mt5 is not None and term in str(mt5)
 
 
+async def _credentials_by_node(node_ids: list[str]) -> dict[str, NodeCredential]:
+    """一次取回多个节点的凭证行：列表接口必须批量查，逐节点查会变成 N+1。"""
+    if not node_ids:
+        return {}
+    async with SessionLocal() as session:
+        rows = await session.scalars(
+            select(NodeCredential).where(NodeCredential.node_id.in_(node_ids))
+        )
+        return {row.node_id: row for row in rows.all()}
+
+
 async def _to_node_out(
     store: RedisStore, d: dict, owner_names: dict[int, str] | None = None,
+    credential: NodeCredential | None = None,
+    acct: dict | None = None,
 ) -> NodeOut:
-    """把缓存里的节点 dict 组装成对外的 NodeOut（合并在线状态与账户登录信息）。"""
-    acct = await store.get_account(d["node_id"]) or {}
+    """把缓存里的节点 dict 组装成对外的 NodeOut（合并在线状态与账户登录信息）。
+
+    `credential` / `acct` 可由调用方预先批量查好（Redis 并发）传入；
+    不传则按单节点回落查询，保持单节点接口的用法不变。
+    """
+    if acct is None:
+        acct = await store.get_account(d["node_id"]) or {}
     owner = permissions.normalize_owner(d.get("owner_user_id"))
-    async with SessionLocal() as session:
-        credential = await session.get(NodeCredential, d["node_id"])
+    if credential is None:
+        async with SessionLocal() as session:
+            credential = await session.get(NodeCredential, d["node_id"])
     return NodeOut(
         node_id=d["node_id"],
         name=d["name"],
@@ -102,7 +124,22 @@ async def list_nodes(
         nodes = [n for n in nodes if _node_matches_search(n, term)]
     nodes.sort(key=lambda n: n.get("created_at", 0))
     names = await rbac_service.owner_names_for(p)
-    return [await _to_node_out(store, n, names) for n in nodes]
+    # 凭证与账户快照都批量取：逐节点串行查库时，35 个节点会把接口拖到数秒。
+    creds = await _credentials_by_node([n["node_id"] for n in nodes])
+    # return_exceptions=True：单个节点的 Redis 取账户失败（如瞬时连接池打满）
+    # 只让该节点的账户快照降级为空，不应把整个节点列表打成 500。
+    raw_accounts = await asyncio.gather(
+        *(store.get_account(n["node_id"]) for n in nodes), return_exceptions=True,
+    )
+    # 失败降级为 {}（而非 None）：None 会让 _to_node_out 再次回查 Redis 并可能二次失败。
+    accounts = [
+        {} if isinstance(a, BaseException) or a is None else a
+        for a in raw_accounts
+    ]
+    return [
+        await _to_node_out(store, n, names, creds.get(n["node_id"]), acct=acct)
+        for n, acct in zip(nodes, accounts)
+    ]
 
 
 @router.post("", response_model=NodeOut, status_code=201)

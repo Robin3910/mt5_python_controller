@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from math import isfinite
 from datetime import datetime
 from typing import Optional
@@ -1822,6 +1823,47 @@ async def finish_subtask(
         return None
 
 
+# 对账「有没有待对账的子任务」的短缓存：{node_id: (到期时刻, 是否存在)}。
+# 账户快照 5 秒一份，同一节点两次快照之间几乎没有状态变化，重复查库纯属浪费。
+_RECONCILE_PRESENCE_TTL = 2.0
+_reconcile_presence: dict[str, tuple[float, bool]] = {}
+
+
+def _watched_clause():
+    """「需要对账的子任务」条件：运行中/卡住、开过仓、且不是空仓即收口的网格任务。
+
+    预检与正式查询共用同一条件，预检为假时正式查询必然查不到行，语义不变。
+    """
+    return (
+        GroupTaskDispatch.status.in_(group_rules.SUBTASK_RUNNING + group_rules.SUBTASK_STUCK),
+        GroupTaskDispatch.opened_at.is_not(None),
+        or_(
+            GroupTaskDispatch.hold_when_empty.is_(False),
+            GroupTaskDispatch.status.in_(group_rules.SUBTASK_STUCK),
+        ),
+    )
+
+
+async def node_has_pending_subtasks(node_id: str) -> bool:
+    """节点上是否还有待对账的子任务（与正式查询同条件，带 2 秒进程内缓存）。"""
+    now = time.monotonic()
+    cached = _reconcile_presence.get(node_id)
+    if cached is not None and cached[0] > now:
+        return cached[1]
+    try:
+        async with SessionLocal() as s:
+            found = await s.scalar(
+                select(GroupTaskDispatch.id).where(
+                    GroupTaskDispatch.node_id == node_id, *_watched_clause(),
+                ).limit(1)
+            )
+    except Exception:  # noqa: BLE001
+        return True  # 查不了就当有，让正式查询按原逻辑处理
+    exists = found is not None
+    _reconcile_presence[node_id] = (now + _RECONCILE_PRESENCE_TTL, exists)
+    return exists
+
+
 async def reconcile_node_positions(
     node_id: str, magics: set[int],
     *, hits: dict[int, int] | None = None,
@@ -1843,6 +1885,8 @@ async def reconcile_node_positions(
     不传则本轮单独计数，confirm>1 时这一轮不会收口。
     返回 [{task_id, task_status, released}]，供调用方释放节点占位。
     """
+    if not await node_has_pending_subtasks(node_id):
+        return []
     finished: list[dict] = []
     try:
         async with SessionLocal() as s:
@@ -1850,14 +1894,7 @@ async def reconcile_node_positions(
                 await s.execute(
                     select(GroupTaskDispatch).where(
                         GroupTaskDispatch.node_id == node_id,
-                        GroupTaskDispatch.status.in_(
-                            group_rules.SUBTASK_RUNNING + group_rules.SUBTASK_STUCK
-                        ),
-                        GroupTaskDispatch.opened_at.is_not(None),
-                        or_(
-                            GroupTaskDispatch.hold_when_empty.is_(False),
-                            GroupTaskDispatch.status.in_(group_rules.SUBTASK_STUCK),
-                        ),
+                        *_watched_clause(),
                     )
                 )
             ).scalars().all()
@@ -1911,6 +1948,7 @@ async def reconcile_node_positions(
                 {"task_id": tid, "task_status": st, "released": touched.get(tid, [])}
                 for tid, st, _sid in task_rows
             ]
+            _reconcile_presence.pop(node_id, None)  # 有子任务收口，预检缓存作废
     except Exception as e:  # noqa: BLE001
         logger.warning("reconcile_node_positions failed: %s", e)
         return []

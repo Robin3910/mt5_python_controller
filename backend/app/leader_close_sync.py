@@ -221,9 +221,16 @@ async def _leader_groups_of(store: RedisStore, node_id: str) -> list[dict]:
     只返回 `stop_cascade_enabled` 为真、且节点在 `members` 里的分组。
     节点可能是某个分组的跟单成员（在 `followers` 里），那种分组必须排除 ——
     跟单员的持仓变化不触发任何同步动作。
+
+    账户快照每 5 秒一份、每个在线节点都会走这里，所以优先走「节点 -> 分组」
+    反向索引；索引未命中时回落到全量扫描（存量缓存要等分组下次写入才建索引，
+    这个回退是上线过渡期和索引异常时的正确性兜底）。
     """
+    candidates = await store.groups_led_by(node_id)
+    if not candidates:
+        candidates = await store.all_groups()
     out: list[dict] = []
-    for group in await store.all_groups():
+    for group in candidates:
         if not isinstance(group, dict):
             continue
         if not group.get("stop_cascade_enabled", True):

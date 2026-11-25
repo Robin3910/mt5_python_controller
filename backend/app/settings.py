@@ -14,6 +14,13 @@ class Settings(BaseSettings):
 
     # —— 基础设施 ——
     redis_url: str = "redis://localhost:6379/0"
+    # Redis 连接池上限。redis-py 默认只有 100，单进程 uvicorn 下并发一高
+    # （如 /api/nodes 用 asyncio.gather 一次性为每个节点取账户快照）就会被打满，
+    # 抛 MaxConnectionsError 变成 500。这里显式放大并允许用环境变量调整。
+    redis_max_connections: int = 500
+    # 空闲连接健康探测间隔（秒）：定期 ping，及时回收被服务端断开的死连接，
+    # 避免连接长期挂在池里占用配额。0 表示关闭。
+    redis_health_check_interval: int = 30
     # 本地开发默认用 SQLite，免装 MySQL 即可运行；
     # 生产通过环境变量设置 MYSQL_DSN=mysql+asyncmy://user:pwd@host:3306/db（见 docker .env）。
     mysql_dsn: str = "sqlite+aiosqlite:///./mt5hub.db"
