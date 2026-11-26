@@ -100,13 +100,6 @@ const currentMid = computed<number | null>(
   () => currentQuote()?.mid ?? null,
 )
 
-function fmtPrice(n: number | undefined, sym: string): string {
-  if (!n || !isFinite(n)) return '—'
-  // JPY 类 3 位，其它 5 位
-  const digits = /JPY$/.test(sym) ? 3 : 5
-  return n.toFixed(digits)
-}
-
 // fmtPips / fmtPosType / fmtPosTime 暂未在模板里使用，等接上 UI 再恢复。
 
 // 持仓 / 资产 / 历史订单 / 吸筹策略 tab
@@ -661,14 +654,9 @@ onBeforeUnmount(() => {
         </p>
       </section>
 
-      <!-- 单品种报价 -->
+      <!-- 品种切换 -->
       <div class="quote-board card card-pad">
         <div class="quote-col">
-          <div class="quote-head">
-            <span class="quote-sym">{{ currentSymbol }}</span>
-            <!-- <span class="quote-pct" v-if="currentQuote()">100.00%</span> -->
-          </div>
-          <div class="quote-mid">{{ fmtPrice(currentQuote()?.mid, currentSymbol) }}</div>
           <!-- <div class="quote-bidask">
             <div class="ba-row bid">
               <span class="ba-k">买价</span>
@@ -992,7 +980,7 @@ onBeforeUnmount(() => {
 .status-muted { font-size: 12px; color: var(--muted); font-family: var(--mono); }
 .status-sep { color: rgba(255, 255, 255, 0.18); }
 
-/* ── Quote board (双柱) ── */
+/* ── 品种切换 ── */
 .quote-board {
   display: flex;
   align-items: stretch;
@@ -1006,31 +994,6 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: 8px;
-}
-.quote-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 8px;
-}
-.quote-sym {
-  font-size: 18px;
-  font-weight: 700;
-  letter-spacing: 0.02em;
-}
-.quote-pct {
-  font-size: 11px;
-  color: var(--muted);
-  font-family: var(--mono);
-}
-.quote-mid {
-  font-size: 32px;
-  font-weight: 700;
-  line-height: 1.1;
-  font-family: var(--mono);
-  letter-spacing: -0.01em;
-  color: var(--text);
-  margin: 2px 0 6px;
 }
 .quote-bidask {
   display: flex;
@@ -1076,7 +1039,6 @@ onBeforeUnmount(() => {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  margin-top: 8px;
 }
 .sym-chip {
   padding: 9px 16px;
@@ -1553,7 +1515,6 @@ onBeforeUnmount(() => {
 
 /* ── Responsive ── */
 @media (max-width: 640px) {
-  .quote-mid { font-size: 26px; }
   .quote-col { padding: 14px 10px 12px; }
   /* 手机端：隐藏表格，展示卡片 */
   .pos-table-wrap { display: none; }
@@ -1565,7 +1526,6 @@ onBeforeUnmount(() => {
   .pager-total { width: 100%; margin-left: 0; text-align: right; }
 }
 @media (max-width: 420px) {
-  .quote-mid { font-size: 24px; }
   .pos-card-row2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   /* 资产单列 */
   .asset-grid { grid-template-columns: 1fr; }

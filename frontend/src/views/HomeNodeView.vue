@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 首页节点主页：账户概览 + AI 交易 / 带单两个频道的持仓与历史。
+// 首页节点主页：账户概览、频道跟单与节点详情。
 // 归类由后端按策略魔术号完成；实时持仓仍读账户快照。
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
@@ -7,6 +7,9 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
 import 'element-plus/es/components/message-box/style/css'
 import api from '@/api/client'
+import DealsTable from '@/components/DealsTable.vue'
+import NodeOverviewPanel from '@/components/NodeOverviewPanel.vue'
+import NodePositionsPanel from '@/components/NodePositionsPanel.vue'
 import type {
   AccountSnapshot,
   CancelPendingResult,
@@ -39,6 +42,14 @@ const loadedNodes = ref(false)
 const channels = ref<FollowChannelsOut | null>(null)
 const channelError = ref('')
 const busy = ref('')
+const detailTabs = [
+  { key: 'positions', label: '持仓' },
+  { key: 'overview', label: '概览' },
+  { key: 'deals', label: '成交明细' },
+] as const
+const detailTab = ref<(typeof detailTabs)[number]['key']>('positions')
+const canViewNodeConfig = computed(() => auth.hasMenu('nodes'))
+const canViewDeals = computed(() => canViewNodeConfig.value || auth.hasMenu('trading'))
 
 type Market = 'ai' | 'follow'
 type SubTab = 'holding' | 'history'
@@ -144,6 +155,7 @@ async function boot(): Promise<void> {
     try { await hub.fetchNodes() } catch { /* 列表失败时下面给出空态 */ }
   }
   loadedNodes.value = true
+  if (node.value && !account.value) void hub.fetchNodeAccount(id.value)
   await loadChannels()
 }
 
@@ -402,6 +414,42 @@ async function closeChannel(mode: 'all' | 'profit' | 'ticket', ticket?: number):
         </div>
       </section>
 
+      <section class="hn-channel" aria-labelledby="hn-details-title">
+        <header class="hn-channel-head">
+          <p id="hn-details-title">节点详情</p>
+        </header>
+        <div class="hn-channel-body">
+          <div class="hn-tabs hn-detail-tabs" role="group" aria-label="节点详情视图">
+            <button
+              v-for="item in detailTabs"
+              :key="item.key"
+              type="button"
+              :class="{ on: detailTab === item.key }"
+              :aria-pressed="detailTab === item.key"
+              @click="detailTab = item.key"
+            >{{ item.label }}</button>
+          </div>
+
+          <div :key="id">
+            <div v-show="detailTab === 'positions'">
+              <NodePositionsPanel v-if="account" :positions="positions" />
+              <p v-else class="hn-empty">暂无账户快照</p>
+            </div>
+            <NodeOverviewPanel
+              v-if="detailTab === 'overview'"
+              :node="node"
+              :acct="account"
+              :show-performance="canViewDeals"
+              :show-config="canViewNodeConfig"
+            />
+            <template v-else-if="detailTab === 'deals'">
+              <DealsTable v-if="canViewDeals" :node-id="id" />
+              <p v-else class="hn-empty">当前角色没有成交明细查看权限</p>
+            </template>
+          </div>
+        </div>
+      </section>
+
       <section class="hn-channel">
         <header class="hn-channel-head">
           <p>
@@ -535,7 +583,7 @@ async function closeChannel(mode: 'all' | 'profit' | 'ticket', ticket?: number):
         </div>
       </section>
 
-      <p class="hn-note">频道列表只含 AI 交易与带单策略单。手工单和普通信号单计入上方账户合计，不在此列出。</p>
+      <p class="hn-note">频道列表只含 AI 交易与带单策略单。全部持仓可在上方「节点详情」查看。</p>
     </template>
   </div>
 </template>
@@ -618,6 +666,7 @@ async function closeChannel(mode: 'all' | 'profit' | 'ticket', ticket?: number):
 .hn-channel-head span, .hn-hint { color: #5B6B85; font-size: 10px; }
 .hn-channel-body { padding: 12px; }
 .hn-tabs { display: flex; border: 1px solid #22304A; background: #0C1220; border-radius: 12px; padding: 4px; gap: 4px; }
+.hn-detail-tabs { margin-bottom: 12px; }
 .hn-tabs button {
   flex: 1; min-width: 0; justify-content: center; border: 0; background: transparent; color: #8B96A8;
   border-radius: 8px; padding: 8px; font-size: 12px; font-weight: 650;

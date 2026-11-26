@@ -2,7 +2,8 @@
 // 用户权限：超级管理员在此建用户/角色、勾选菜单、把节点划给用户。
 // 菜单与拦截以后端为准；本页只做配置与展示。
 import { computed, onMounted, ref } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElDropdown, ElDropdownItem, ElDropdownMenu, ElMessage } from 'element-plus'
+import 'element-plus/es/components/dropdown/style/css'
 import 'element-plus/es/components/message/style/css'
 import FormLabel from '@/components/FormLabel.vue'
 import TagSelect from '@/components/TagSelect.vue'
@@ -622,48 +623,77 @@ async function removeRole(role: RoleOut): Promise<void> {
         </div>
 
         <div class="list-cards mobile-only">
-          <div v-for="u in filteredUsers" :key="u.id" class="list-card card">
-            <div class="list-card-head row between">
-              <strong>{{ u.display_name || u.username }}</strong>
-              <span class="tag" :class="u.is_active ? 'green' : ''">{{ u.is_active ? '启用' : '禁用' }}</span>
-            </div>
-            <div class="list-field"><span class="k">用户名</span><span class="v">{{ u.username }}</span></div>
-            <div class="list-field">
-              <span class="k">手机号</span>
-              <span class="v">
-                <span v-if="u.phone">{{ u.phone }}</span>
-                <span v-else class="muted">未绑定</span>
-                <span v-if="u.phone && !u.phone_verified" class="tag amber">未验证</span>
-              </span>
-            </div>
-            <div class="list-field"><span class="k">角色</span><span class="v">{{ roleNames(u) }}</span></div>
-            <div class="list-field"><span class="k">2FA</span><span class="v">{{ u.totp_enabled ? '已绑定' : '未绑定' }}</span></div>
-            <div class="list-field">
-              <span class="k">能力</span>
-              <span class="v">
-                <span v-if="u.is_admin" class="tag amber">全部能力</span>
-                <span v-else-if="!u.capabilities?.length" class="muted">—</span>
-                <span v-else class="cap-tags">
-                  <span v-for="code in u.capabilities" :key="code" class="tag blue">
-                    {{ capabilityLabel(code) }}
-                  </span>
+          <article v-for="u in filteredUsers" :key="u.id" class="perm-card">
+            <div class="perm-card-summary">
+              <header class="perm-card-head">
+                <span class="perm-card-avatar" :class="{ inactive: !u.is_active }" aria-hidden="true">
+                  {{ Array.from(u.display_name || u.username)[0]?.toUpperCase() }}
                 </span>
-              </span>
+                <div class="perm-card-identity">
+                  <strong class="perm-card-name" :title="u.display_name || u.username">{{ u.display_name || u.username }}</strong>
+                  <span v-if="u.display_name && u.display_name !== u.username" class="perm-card-handle" :title="u.username">{{ u.username }}</span>
+                </div>
+                <span class="tag perm-card-status" :class="{ green: u.is_active }">{{ u.is_active ? '启用' : '已禁用' }}</span>
+                <div class="perm-card-meta">
+                  <span>{{ roleNames(u) }}</span>
+                  <span v-if="u.is_admin" class="tag amber">全部能力</span>
+                  <template v-else>
+                    <span v-for="code in u.capabilities" :key="code" class="tag blue">{{ capabilityLabel(code) }}</span>
+                  </template>
+                </div>
+              </header>
+
+              <dl class="perm-user-counts">
+                <div><dt>节点</dt><dd>{{ u.node_ids.length }}</dd></div>
+                <div><dt>分组</dt><dd>{{ u.group_count }}</dd></div>
+                <div><dt>策略</dt><dd>{{ u.strategy_count }}</dd></div>
+              </dl>
+
+              <div class="perm-user-security">
+                <span :class="{ muted: !u.phone }">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="2.5" width="12" height="19" rx="2"/><path d="M11 18h2"/></svg>
+                  {{ u.phone || '手机未绑定' }}
+                  <span v-if="u.phone && !u.phone_verified" class="tag amber">未验证</span>
+                </span>
+                <span :class="u.totp_enabled ? 'perm-user-verified' : 'muted'">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22s8-4 8-11V6l-8-4-8 4v5c0 7 8 11 8 11Z"/><path v-if="u.totp_enabled" d="m9 12 2 2 4-4"/></svg>
+                  2FA {{ u.totp_enabled ? '已开启' : '未绑定' }}
+                </span>
+              </div>
             </div>
-            <div class="list-field"><span class="k">节点</span><span class="v">{{ u.node_ids.length }}</span></div>
-            <div class="list-field"><span class="k">分组 / 策略</span><span class="v">{{ u.group_count }} / {{ u.strategy_count }}</span></div>
-            <div class="list-card-actions">
-              <button class="btn-sm btn-ghost" @click="openEditUser(u)">编辑</button>
-              <button class="btn-sm btn-ghost" @click="openRoles(u)">角色</button>
-              <button class="btn-sm btn-ghost" @click="openNodes(u)">分配节点</button>
-              <button class="btn-sm btn-ghost" @click="openPwd(u)">重置密码</button>
-              <button v-if="u.totp_enabled" class="btn-sm btn-ghost" @click="reset2fa(u)">重置 2FA</button>
-              <button class="btn-sm btn-ghost" :disabled="isSelf(u)" @click="toggleActive(u)">
-                {{ u.is_active ? '禁用' : '启用' }}
+
+            <div class="perm-card-actions">
+              <button type="button" class="btn-ghost" @click="openEditUser(u)">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 4H5a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h13a2 2 0 0 0 2-2v-6M8 16l1-4L19 2l3 3L12 15l-4 1Z"/></svg>
+                编辑
               </button>
-              <button class="btn-sm btn-danger" :disabled="isSelf(u)" @click="removeUser(u)">删除</button>
+              <button type="button" class="btn-ghost" @click="openNodes(u)">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/></svg>
+                分配节点
+              </button>
+              <ElDropdown
+                trigger="click"
+                placement="bottom-end"
+                popper-class="perm-user-menu"
+                :popper-options="{ modifiers: [{ name: 'flip', options: { fallbackPlacements: ['top-end'] } }] }"
+                :persistent="false"
+                :show-arrow="false"
+              >
+                <button type="button" class="btn-ghost perm-user-more" :aria-label="`${u.username} 的更多操作`">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="4" cy="12" r="2.3"/><circle cx="12" cy="12" r="2.3"/><circle cx="20" cy="12" r="2.3"/></svg>
+                </button>
+                <template #dropdown>
+                  <ElDropdownMenu>
+                    <ElDropdownItem @click="openRoles(u)">分配角色</ElDropdownItem>
+                    <ElDropdownItem @click="openPwd(u)">重置密码</ElDropdownItem>
+                    <ElDropdownItem v-if="u.totp_enabled" @click="reset2fa(u)">重置 2FA</ElDropdownItem>
+                    <ElDropdownItem :disabled="isSelf(u)" @click="toggleActive(u)">{{ u.is_active ? '禁用' : '启用' }}</ElDropdownItem>
+                    <ElDropdownItem class="perm-user-delete" :disabled="isSelf(u)" @click="removeUser(u)">删除</ElDropdownItem>
+                  </ElDropdownMenu>
+                </template>
+              </ElDropdown>
             </div>
-          </div>
+          </article>
           <div v-if="!filteredUsers.length" class="muted" style="padding: 12px 0">
             {{ loading ? '加载中…' : '没有匹配的用户' }}
           </div>
@@ -756,23 +786,42 @@ async function removeRole(role: RoleOut): Promise<void> {
         </div>
 
         <div class="list-cards mobile-only">
-          <div v-for="r in filteredRoles" :key="r.id" class="list-card card">
-            <div class="list-card-head row between">
-              <strong>{{ r.name }}</strong>
-              <span class="tag" :class="r.enabled ? 'green' : ''">{{ r.enabled ? '启用' : '停用' }}</span>
+          <article v-for="r in filteredRoles" :key="r.id" class="perm-card perm-role-card">
+            <div class="perm-card-summary">
+              <header class="perm-card-head">
+                <span class="perm-card-avatar perm-role-avatar" :class="{ inactive: !r.enabled }" aria-hidden="true">
+                  <svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-11V6l-8-4-8 4v5c0 7 8 11 8 11Z"/><path d="m9 12 2 2 4-4"/></svg>
+                </span>
+                <div class="perm-card-identity">
+                  <strong class="perm-card-name" :title="r.name">{{ r.name }}</strong>
+                  <span class="perm-card-handle" :title="r.code">{{ r.code }}</span>
+                </div>
+                <span class="tag perm-card-status" :class="{ green: r.enabled }">{{ r.enabled ? '启用' : '已停用' }}</span>
+                <div class="perm-card-meta">
+                  <span class="tag" :class="{ blue: r.is_builtin }">{{ r.is_builtin ? '内置' : '自定义' }}</span>
+                  <span>{{ r.user_count }} 位用户</span>
+                </div>
+              </header>
+
+              <div v-if="isAdminRole(r) || !r.menus.length" class="perm-role-menus perm-role-menu-row">
+                <span>菜单权限</span>
+                <strong>{{ isAdminRole(r) ? '全部菜单' : '未分配' }}</strong>
+              </div>
+              <details v-else class="perm-role-menus">
+                <summary class="perm-role-menu-row">
+                  <span>菜单权限</span>
+                  <strong>{{ r.menus.length }} 项</strong>
+                </summary>
+                <div class="cap-tags perm-role-menu-tags">
+                  <span v-for="code in r.menus" :key="code" class="tag blue">{{ rbac.menuName(code) }}</span>
+                </div>
+              </details>
             </div>
-            <div class="list-field"><span class="k">编码</span><span class="v">{{ r.code }}</span></div>
-            <div class="list-field"><span class="k">类型</span><span class="v">{{ r.is_builtin ? '内置' : '自定义' }}</span></div>
-            <div class="list-field"><span class="k">用户数</span><span class="v">{{ r.user_count }}</span></div>
-            <div class="list-field list-field-block">
-              <span class="k">菜单</span>
-              <span class="v">{{ isAdminRole(r) ? '全部' : menuNames(r.menus) }}</span>
+            <div class="perm-card-actions perm-role-actions">
+              <button type="button" class="btn-ghost" @click="openEditRole(r)">{{ isAdminRole(r) ? '查看' : '编辑' }}</button>
+              <button v-if="!r.is_builtin" type="button" class="btn-ghost perm-role-remove" @click="removeRole(r)">删除</button>
             </div>
-            <div class="list-card-actions">
-              <button class="btn-sm btn-ghost" @click="openEditRole(r)">{{ isAdminRole(r) ? '查看' : '编辑' }}</button>
-              <button class="btn-sm btn-danger" :disabled="r.is_builtin" @click="removeRole(r)">删除</button>
-            </div>
-          </div>
+          </article>
           <div v-if="!filteredRoles.length" class="muted" style="padding: 12px 0">
             {{ loading ? '加载中…' : '没有匹配的角色' }}
           </div>
@@ -1192,6 +1241,169 @@ async function removeRole(role: RoleOut): Promise<void> {
   justify-content: flex-end;
   gap: 6px;
 }
+.perm-card {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--glass-border);
+  border-radius: 16px;
+  background: linear-gradient(155deg, #151c2d, #101726);
+}
+.perm-card-summary { padding: 14px; }
+.perm-card-head {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 4px 10px;
+}
+.perm-card-avatar {
+  display: grid;
+  place-items: center;
+  grid-row: span 2;
+  height: 38px;
+  border: 1px solid var(--glass-highlight);
+  border-radius: 11px;
+  background: linear-gradient(135deg, var(--primary), #4f46e5);
+  color: #fff;
+  font-size: 17px;
+  font-weight: 700;
+}
+.perm-card-avatar.inactive { background: #273344; color: #a1afc3; }
+.perm-card-identity { min-width: 0; }
+.perm-card-name, .perm-card-handle {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.perm-card-name { font-size: 16px; line-height: 1.3; }
+.perm-card-handle { color: var(--muted); font-size: 12px; }
+.perm-card-meta {
+  display: flex;
+  grid-column: 2 / -1;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+  color: #9eacc2;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.perm-card-meta .tag { padding: 1px 6px; white-space: normal; word-break: normal; }
+.perm-card-status { border-radius: 999px; padding: 3px 7px; }
+.perm-card-status::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  vertical-align: 1px;
+}
+.perm-user-counts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin: 12px 0 0;
+  padding: 9px 0;
+  border: 1px solid var(--glass-border);
+  border-radius: 11px;
+  background: var(--glass);
+  text-align: center;
+}
+.perm-user-counts div { display: flex; flex-direction: column-reverse; gap: 2px; }
+.perm-user-counts div + div { border-left: 1px solid var(--glass-border); }
+.perm-user-counts dd { margin: 0; font-size: 18px; font-weight: 700; line-height: 1.2; }
+.perm-user-counts dt { color: var(--muted); font-size: 11px; }
+.perm-user-security {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  margin-top: 10px;
+  font-size: 12px;
+}
+.perm-user-security > span { display: inline-flex; align-items: center; gap: 5px; }
+.perm-user-security svg, .perm-card-actions svg {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.perm-user-verified { color: #34d399; }
+.perm-card-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr)) 44px;
+  gap: 8px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--glass-border);
+  background: rgba(6, 10, 18, 0.22);
+}
+.perm-card-actions button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  width: 100%;
+  min-height: 44px;
+  padding: 5px;
+  font-size: 13px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+.perm-card-actions svg { color: #97a6bb; }
+.perm-card-actions .perm-user-more svg { width: 24px; height: 24px; fill: currentColor; stroke: none; }
+.perm-card-actions button:focus-visible, .perm-role-menu-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.perm-role-avatar svg {
+  width: 19px;
+  height: 19px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.perm-role-menus {
+  margin-top: 12px;
+  border: 1px solid var(--glass-border);
+  border-radius: 11px;
+  background: var(--glass);
+  color: #9eacc2;
+  font-size: 12px;
+}
+.perm-role-menu-row { display: flex; align-items: center; gap: 8px; min-height: 42px; padding: 6px 10px; }
+.perm-role-menu-row strong { margin-left: auto; color: var(--text); }
+summary.perm-role-menu-row { border-radius: 10px; cursor: pointer; list-style: none; }
+summary.perm-role-menu-row::-webkit-details-marker { display: none; }
+summary.perm-role-menu-row::after {
+  content: '';
+  width: 6px;
+  height: 6px;
+  margin: -3px 2px 0 0;
+  border-right: 1px solid currentColor;
+  border-bottom: 1px solid currentColor;
+  transform: rotate(45deg);
+}
+.perm-role-menus[open] summary::after { transform: translateY(3px) rotate(225deg); }
+.perm-role-menu-tags { padding: 0 10px 10px; }
+.perm-role-menu-tags .tag { white-space: normal; word-break: normal; overflow-wrap: anywhere; }
+.perm-role-actions { display: flex; }
+.perm-role-actions .perm-role-remove { flex: 0 0 80px; color: #f87171; }
+:global(.perm-user-menu.el-popper) {
+  --el-bg-color-overlay: #151e2e;
+  --el-border-color-light: var(--glass-highlight);
+  --el-text-color-regular: #d5ddeb;
+  --el-text-color-disabled: #7b8ba8;
+  --el-dropdown-menuItem-hover-fill: #203250;
+  --el-dropdown-menuItem-hover-color: var(--text);
+  --el-dropdown-menu-box-shadow: var(--shadow);
+  min-width: 144px;
+}
+:global(.perm-user-menu .el-dropdown-menu__item) { min-height: 44px; }
+:global(.perm-user-menu .perm-user-delete:not(.is-disabled)) { color: #f87171; }
 .check-list {
   display: flex;
   flex-direction: column;
