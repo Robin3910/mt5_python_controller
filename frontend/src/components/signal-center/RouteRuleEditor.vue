@@ -28,34 +28,15 @@ const emit = defineEmits<{
 const hub = useHubStore()
 
 /**
- * 信号类型选项：**业务分类**在前，**具体类型码**在后。
+ * 具体类型码的中文名（与后端 `signal_meta.SIGNAL_TYPE_LABELS` 一致）。
  *
- * 分类（结构分析 / 突破信号 / …）是用户脑子里的概念 ——
- * 「我要收结构类的信号」比「我要收 ob 和 fvg 和 pdz」自然得多。
- * 后端在匹配时会把分类展开成它包含的类型码集合
- * （见 `signal_meta.types_in_group`），所以选分类 = 收该分类下**全部**类型。
- *
- * 分类与类型码的对应关系与后端 `signal_meta.SIGNAL_TYPE_GROUPS` 一致。
+ * 只保留常用的基础类型码；分类选项已从前端移除，直接选类型码即可。
  */
-const TYPE_GROUPS: { label: string; codes: string[] }[] = [
-  { label: '结构分析', codes: ['ob', 'fvg', 'pdz'] },
-  { label: '斐波那契回踩', codes: ['fibo'] },
-  { label: '突破信号', codes: ['bos'] },
-  { label: '趋势跟踪', codes: ['swing'] },
-  { label: '反转信号', codes: ['choch'] },
-  { label: '量价背离', codes: ['mm'] },
-]
-
-/** 具体类型码的中文名（与后端 `signal_meta.SIGNAL_TYPE_LABELS` 一致） */
 const TYPE_CODES: { code: string; label: string }[] = [
   { code: 'ob', label: '订单块 OB' },
   { code: 'fvg', label: '公允价值缺口 FVG' },
   { code: 'pdz', label: '溢价折让区 PDZ' },
   { code: 'fibo', label: '斐波那契' },
-  { code: 'bos', label: '突破 BOS' },
-  { code: 'swing', label: '趋势跟踪 Swing' },
-  { code: 'choch', label: '反转 CHoCH' },
-  { code: 'mm', label: '量价背离 MM' },
 ]
 
 /** 周期选项（与后端 `signal_meta.TIMEFRAMES` 同源，只列常用的） */
@@ -208,40 +189,19 @@ async function save(): Promise<void> {
         <!-- 信号类型 -->
         <div class="rr-field">
           <span class="pf-label">信号类型</span>
-          <p class="pf-hint" style="margin: 0 0 6px">
-            不选 = 所有类型都收。选分类（如「结构分析」）= 收该分类下的全部类型。
-          </p>
-          <div class="rr-group">
-            <span class="rr-group-label">按分类</span>
-            <div class="rr-chips">
-              <button
-                v-for="g in TYPE_GROUPS"
-                :key="g.label"
-                type="button"
-                class="rr-chip"
-                :class="{ on: isOn(form.signal_types, g.label) }"
-                :title="g.codes.join(' / ')"
-                @click="toggle(form.signal_types, g.label)"
-              >
-                {{ g.label }}
-              </button>
-            </div>
-          </div>
-          <div class="rr-group">
-            <span class="rr-group-label">按类型</span>
-            <div class="rr-chips">
-              <button
-                v-for="t in TYPE_CODES"
-                :key="t.code"
-                type="button"
-                class="rr-chip rr-chip-code"
-                :class="{ on: isOn(form.signal_types, t.code) }"
-                @click="toggle(form.signal_types, t.code)"
-              >
-                {{ t.code }}
-                <span class="rr-chip-hint">{{ t.label }}</span>
-              </button>
-            </div>
+          <p class="pf-hint" style="margin: 0 0 6px">不选 = 所有类型都收。</p>
+          <div class="rr-chips">
+            <button
+              v-for="t in TYPE_CODES"
+              :key="t.code"
+              type="button"
+              class="rr-chip rr-chip-code"
+              :class="{ on: isOn(form.signal_types, t.code) }"
+              @click="toggle(form.signal_types, t.code)"
+            >
+              {{ t.code }}
+              <span class="rr-chip-hint">{{ t.label }}</span>
+            </button>
           </div>
         </div>
 
@@ -379,20 +339,6 @@ async function save(): Promise<void> {
   font-size: 10px;
   color: var(--pf-amber, #f59e0b);
   margin-left: 4px;
-}
-
-.rr-group {
-  display: flex;
-  gap: 8px;
-  align-items: flex-start;
-  margin-top: 6px;
-}
-.rr-group-label {
-  flex-shrink: 0;
-  width: 44px;
-  padding-top: 6px;
-  font-size: 11px;
-  color: var(--pf-faint, #5b6b85);
 }
 
 .rr-chips {
