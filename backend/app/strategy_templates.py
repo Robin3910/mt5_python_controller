@@ -89,16 +89,12 @@ GRID_SIDE_SHORT = "short"
 GRID_SIDE_FOLLOW = "follow"
 GRID_SIDES = (GRID_SIDE_LONG, GRID_SIDE_SHORT)
 GRID_COUNT_MIN = 2
-GRID_COUNT_MAX = 200
+GRID_COUNT_MAX = 58
 # 向上追踪的平移次数上限；0 表示不限，此处只防止配置写出天文数字
 GRID_TRAILING_MAX = 10000
-# 试算助手：只在配置期把「ATR × 倍数」折成格距、再按最大亏损反推每格手数，
+# 试算助手：只在配置期按「最大可接受亏损」反推格数与每格手数，
 # 结果落到 grid_count / lot_per_grid 两个既有字段，网格执行不读这组参数。
-# 周期复用分批档位那套（BATCH_TIMEFRAMES），默认比加仓档位大一档：网格格距要反映的
-# 是区间级别的波动结构。
-GRID_ASSIST_TIMEFRAME = "H1"
-GRID_ASSIST_MULT_MIN = 0.05
-GRID_ASSIST_MULT_MAX = 50.0
+# 口径完全由预算与合约规格决定，不依赖 K 线 / ATR。
 
 TEMPLATE_1_ID = "tpl_1"
 TEMPLATE_1_NAME = "AI智能加仓策略"
@@ -467,8 +463,8 @@ class GridTradingRule:
     一格，继续在新区间运行。多头网格追涨（突破上限上移），空头网格追跌（跌破下限
     下移）。
 
-    assist_* 是配置期的试算参数（默认关闭）：把 ATR × 倍数折成格距推出格数，再按
-    最大可接受亏损反推每格手数。它们只是「这组格数与手数是怎么算出来的」的留痕，
+    assist_* 是配置期的试算参数（默认关闭）：按最大可接受亏损与合约规格反推格数与
+    每格手数。它们只是「这组格数与手数是怎么算出来的」的留痕，
     执行层（node_client/grid_trading）不读，因此改动它们不会影响已在跑的网格。
     """
     status: int = 1
@@ -488,9 +484,6 @@ class GridTradingRule:
     trailing_max: int = 0                       # 最大平移格数，0=不限
     # --- 试算助手（仅配置期，执行层不读）---
     assist_enabled: bool = False                # 是否展开试算，默认关闭
-    assist_timeframe: str = GRID_ASSIST_TIMEFRAME   # 算 ATR 用的 K 线周期
-    assist_atr_mult: float = 1.0                # 格距 = ATR × 该倍数
-    assist_spacing: float = 0.0                 # 手改后的格距，0=用 ATR×倍数的结果
     assist_max_loss: float = 0.0                # 最大可接受亏损（账户货币）
 
     @property
@@ -516,9 +509,6 @@ class GridTradingRule:
             "trailing_up": self.trailing_up,
             "trailing_max": self.trailing_max,
             "assist_enabled": self.assist_enabled,
-            "assist_timeframe": self.assist_timeframe,
-            "assist_atr_mult": self.assist_atr_mult,
-            "assist_spacing": self.assist_spacing,
             "assist_max_loss": self.assist_max_loss,
         }
 
@@ -622,9 +612,6 @@ def default_grid_rule() -> GridTradingRule:
         trailing_up=False,
         trailing_max=0,
         assist_enabled=False,
-        assist_timeframe=GRID_ASSIST_TIMEFRAME,
-        assist_atr_mult=1.0,
-        assist_spacing=0.0,
         assist_max_loss=0.0,
     )
 
@@ -971,20 +958,6 @@ def _normalize_grid_rule(rule_type: int, raw: dict) -> dict[str, Any]:
     if stop_upper > 0 and price_upper > 0 and stop_upper <= price_upper:
         stop_upper = 0.0
 
-    assist_timeframe = str(
-        raw.get("assist_timeframe") or defaults["assist_timeframe"],
-    ).strip().upper()
-    if assist_timeframe not in BATCH_TIMEFRAMES:
-        assist_timeframe = defaults["assist_timeframe"]
-    assist_atr_mult = _as_float(
-        raw.get("assist_atr_mult", defaults["assist_atr_mult"]), defaults["assist_atr_mult"],
-    )
-    assist_atr_mult = (
-        min(GRID_ASSIST_MULT_MAX, max(GRID_ASSIST_MULT_MIN, assist_atr_mult))
-        if assist_atr_mult > 0
-        else defaults["assist_atr_mult"]
-    )
-
     return {
         "type": rule_type,
         "status": _normalize_status(raw, defaults["status"]),
@@ -1012,11 +985,6 @@ def _normalize_grid_rule(rule_type: int, raw: dict) -> dict[str, Any]:
             max(0, _as_int(raw.get("trailing_max", defaults["trailing_max"]), defaults["trailing_max"])),
         ),
         "assist_enabled": bool(raw.get("assist_enabled", defaults["assist_enabled"])),
-        "assist_timeframe": assist_timeframe,
-        "assist_atr_mult": assist_atr_mult,
-        "assist_spacing": max(
-            0.0, _as_float(raw.get("assist_spacing", defaults["assist_spacing"]), defaults["assist_spacing"]),
-        ),
         "assist_max_loss": max(
             0.0, _as_float(raw.get("assist_max_loss", defaults["assist_max_loss"]), defaults["assist_max_loss"]),
         ),

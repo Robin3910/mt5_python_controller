@@ -1,20 +1,26 @@
 """网格试算（纯计算，无 I/O，可单独单元测试）。
 
-模版3 的配置助手：把「ATR × 倍数」折成格距推出网格数量，再按「满仓打止损」的
-最坏亏损反推每格手数。**只在配置期生成建议值**——用户确认后写进 `grid_count` /
-`lot_per_grid` 两个既有字段，网格运行时不读这里的任何参数。
+模版3 的配置助手：**套利优先**——目标是在预算内把格子切得尽量密、每格手数尽量小，
+因为网格吃的就是「挂单价 → 出场价」这一小段差价，格子越密、穿越越频繁，套利越快。
 
-格数与每格手数是两个未知数，而风险约束只有一条，所以必须先由格距定下格数：
+算法只用**预算**和**合约规格**，不依赖 ATR / K 线：
 
-    格距 S = ATR × 倍数（可手改覆盖）
-    格数 N = round((上限 - 下限) / S)，夹到 [2, 200]
-    每格手数 q = 最大可接受亏损 / Σ_i（第 i 格成本价到止损价的距离折成的每手金额）
+    1. 均价到止损距离 D = 区间半宽 + 止损价离区间边界的距离
+       （满仓后成本大致围绕区间分布，中点是这一组成本的稳健代表；逐格求和会把
+       「每一格都亏到止损」的不可能场景当成约束，预算稍小就反推出配不出来的手数）
+    2. 每格一手打止损的亏损 = D × 每手每美金价值
+       每手每美金价值 = tick_value / tick_size，与节点侧 `risk_sizing` 同一口径
+       （这是唯一能跨品种通用的换算，不必自己处理合约大小与计价货币）
+    3. 预算能开多少格 N = floor(预算 ÷ 每格一手的亏损)，夹到 [2, 58]
+       —— 格数由预算直接决定：预算越大格子越多，套利越频繁
+    4. 每格手数 q = floor(预算 ÷ (每格一手的亏损 × N))，向下取到品种手数步长
+       —— 先把格子开满，剩下的预算才补到每格手数上；格数被 58 上限卡住时，
+       每格手数才会往上走（例如预算 10000 能开到每格 0.02 手）
 
-价格距离折成金额用 `tick_value / tick_size`，与节点侧 `risk_sizing` 同一口径
-（这是唯一能跨品种通用的换算，不必自己处理合约大小与计价货币）；规格由行情探针
-从节点带回，拿不到就只给格数、不给手数。
+规格由行情探针从节点带回，拿不到就只给格数、不给手数。手数一律**向下取整**：
+预算是硬约束，宁可少用一点预算也绝不超出，超出的可能只出现在「每格手数已被
+最小手数占满、格数却仍嫌多」的场景里，那种情况降级为最小手数并明确提示超出金额。
 
-ATR 的口径与 `node_client/bar_metrics` 一致（14 根已收盘 K 线、真实波幅含跳空），
 网格线切法与 `node_client/grid_trading.build_levels` 一致，否则同一份配置在助手里
 与真实执行时会算出两套数字。
 """
@@ -25,8 +31,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .strategy_templates import (
-    BATCH_BAR_PERIOD,
-    BATCH_TIMEFRAMES,
     GRID_COUNT_MAX,
     GRID_COUNT_MIN,
     GRID_MODE_ARITHMETIC,
@@ -36,22 +40,6 @@ from .strategy_templates import (
     GRID_SIDE_SHORT,
     GRID_SIDES,
 )
-
-# 试算默认周期。网格格距要反映的是区间级别的波动结构，比加仓档位的 M5 更大一档
-DEFAULT_TIMEFRAME = "H1"
-# ATR 倍数的合理区间：倍数过小会切出上百格、过大则只剩两三格，两头都无意义
-ATR_MULT_MIN = 0.05
-ATR_MULT_MAX = 50.0
-
-
-def bars_needed() -> int:
-    """算 ATR 需要取多少根已收盘 K 线：真实波幅要用到前一根收盘价，故多取一根。"""
-    return BATCH_BAR_PERIOD + 1
-
-
-def normalize_timeframe(value: object) -> str:
-    tf = str(value or "").strip().upper()
-    return tf if tf in BATCH_TIMEFRAMES else DEFAULT_TIMEFRAME
 
 
 def _as_float(value: object, fallback: float = 0.0) -> float:
@@ -65,34 +53,6 @@ def _as_float(value: object, fallback: float = 0.0) -> float:
 def _trim(value: float, digits: int) -> str:
     text = f"{float(value):.{max(0, digits)}f}"
     return text.rstrip("0").rstrip(".") if "." in text else text
-
-
-# ---------------------------------------------------------------------------
-# ATR（与 node_client/bar_metrics 同口径）
-# ---------------------------------------------------------------------------
-
-def true_range(bar: dict, prev_close: float) -> float:
-    """单根 K 线的真实波幅：本根高低差、以及高/低相对前收的跳空，取最大。"""
-    high = _as_float((bar or {}).get("high"))
-    low = _as_float((bar or {}).get("low"))
-    if high <= 0 or low <= 0:
-        return 0.0
-    if prev_close <= 0:
-        return high - low
-    return max(high - low, abs(high - prev_close), abs(low - prev_close))
-
-
-def average_true_range(bars: list[dict]) -> float:
-    """ATR：真实波幅的算术平均。K 线不足（少于 2 根）时返回 0。"""
-    if not bars or len(bars) < 2:
-        return 0.0
-    ranges = [
-        true_range(bar, _as_float((bars[i - 1] or {}).get("close")))
-        for i, bar in enumerate(bars)
-        if i > 0
-    ]
-    ranges = [r for r in ranges if r > 0]
-    return sum(ranges) / len(ranges) if ranges else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -155,8 +115,6 @@ class SizingInput:
     grid_side: str = GRID_SIDE_LONG
     stop_lower: float = 0.0
     stop_upper: float = 0.0
-    atr_mult: float = 1.0
-    spacing: float = 0.0          # >0 表示手改覆盖，不再用 ATR×倍数
     max_loss: float = 0.0
     close_on_stop: bool = True
     trailing_up: bool = False
@@ -167,7 +125,6 @@ class SizingInput:
         src = raw if isinstance(raw, dict) else {}
         mode = str(src.get("grid_mode") or GRID_MODE_ARITHMETIC).strip().lower()
         side = str(src.get("grid_side") or GRID_SIDE_LONG).strip().lower()
-        mult = _as_float(src.get("atr_mult"), 1.0)
         return cls(
             price_lower=max(0.0, _as_float(src.get("price_lower"))),
             price_upper=max(0.0, _as_float(src.get("price_upper"))),
@@ -175,8 +132,6 @@ class SizingInput:
             grid_side=side if side in GRID_SIDES else GRID_SIDE_LONG,
             stop_lower=max(0.0, _as_float(src.get("stop_lower"))),
             stop_upper=max(0.0, _as_float(src.get("stop_upper"))),
-            atr_mult=min(ATR_MULT_MAX, max(ATR_MULT_MIN, mult)) if mult > 0 else 1.0,
-            spacing=max(0.0, _as_float(src.get("spacing"))),
             max_loss=max(0.0, _as_float(src.get("max_loss"))),
             close_on_stop=bool(src.get("close_on_stop", True)),
             trailing_up=bool(src.get("trailing_up", False)),
@@ -192,19 +147,43 @@ class SizingInput:
         """本方向的止损价：多头在区间下沿、空头在区间上沿。"""
         return self.stop_lower if self.is_long else self.stop_upper
 
+    @property
+    def stop_distance(self) -> float:
+        """止损价离本侧区间边界的距离（多头看下限、空头看上限）；未设止损为 0。"""
+        stop = self.stop_price
+        if stop <= 0:
+            return 0.0
+        edge = self.price_lower if self.is_long else self.price_upper
+        return max(0.0, abs(edge - stop))
+
+    @property
+    def avg_stop_distance(self) -> float:
+        """区间中点到止损价的距离：预算反推手数用的代表距离。
+
+        满仓后各格成本大致铺满区间，用它当「均价到止损」比逐格求和对小预算友好，
+        也不会像「取已有格线」那样随格数抖动。
+        """
+        if self.price_upper <= self.price_lower:
+            return 0.0
+        return (self.price_upper - self.price_lower) / 2.0 + self.stop_distance
+
 
 @dataclass
 class SizingResult:
     """试算结果。`ready` 只表示格数算出来了，手数另看 `lot_per_grid`。"""
     ready: bool = False
-    atr: float = 0.0
-    spacing: float = 0.0
-    spacing_source: str = "atr"          # atr=按倍数算 / manual=手改覆盖
     grid_count: int = 0
     lot_per_grid: float = 0.0
-    worst_loss: float = 0.0              # 满仓打止损的估算亏损（按建议手数）
+    worst_loss: float = 0.0              # 满仓打止损的真实亏损（按建议手数）
     worst_lot: float = 0.0               # 满仓总手数
     levels: list[float] = field(default_factory=list)
+    # ---- 口径信息（只用于展示，不参与运行期）----
+    avg_stop_distance: float = 0.0       # 区间中点到止损价的距离
+    risk_per_lot: float = 0.0            # 每手满仓打止损的亏损金额
+    risk_per_grid: float = 0.0           # 每格一手打止损的亏损金额
+    budget_grid_count: int = 0           # 预算能开的最多格（按每格一手最小手数）
+    over_budget: bool = False            # 是否超出预算
+    budget_excess: float = 0.0           # 超预算金额
     warnings: list[dict[str, str]] = field(default_factory=list)
 
     def warn(self, code: str, message: str, level: str = "warn") -> None:
@@ -213,14 +192,17 @@ class SizingResult:
     def to_dict(self) -> dict[str, Any]:
         return {
             "ready": self.ready,
-            "atr": self.atr,
-            "spacing": self.spacing,
-            "spacing_source": self.spacing_source,
             "grid_count": self.grid_count,
             "lot_per_grid": self.lot_per_grid,
             "worst_loss": self.worst_loss,
             "worst_lot": self.worst_lot,
             "levels": list(self.levels),
+            "avg_stop_distance": self.avg_stop_distance,
+            "risk_per_lot": self.risk_per_lot,
+            "risk_per_grid": self.risk_per_grid,
+            "budget_grid_count": self.budget_grid_count,
+            "over_budget": self.over_budget,
+            "budget_excess": self.budget_excess,
             "warnings": list(self.warnings),
         }
 
@@ -248,79 +230,113 @@ def build_levels(lower: float, upper: float, count: int, mode: str,
     return levels
 
 
-def grid_count_for_spacing(lower: float, upper: float, spacing: float) -> int:
-    """按格距推网格数量并夹到规则允许的范围。
-
-    等比模式下格距本身不均匀，这里用平均间距近似定格数；真正的风险数字仍按切出来
-    的等比网格线逐格算，所以只有「格数怎么来的」是近似。
-    """
-    if spacing <= 0 or upper <= lower:
-        return 0
-    raw = int(round((upper - lower) / spacing))
-    return max(GRID_COUNT_MIN, min(GRID_COUNT_MAX, raw))
-
-
 def entry_costs(levels: list[float], *, is_long: bool) -> list[float]:
     """满仓时每一格的成本价。
 
     网格全程用挂单：每一格都在自己的网格线上成交，多头买 `levels[i]`、
-    空头开空 `levels[i+1]`。成本就是格线价，没有市价建仓那一条路径，
-    所以不必再按现价调整。
+    空头开空 `levels[i+1]`。成本就是格线价，没有市价建仓那一条路径。
+    试算的风险口径用区间中点（见 `SizingInput.avg_stop_distance`），这里保留
+    作为逐格核对的工具。
     """
     count = max(0, len(levels) - 1)
     return [levels[i] if is_long else levels[i + 1] for i in range(count)]
 
 
-def loss_per_lot(costs: list[float], stop: float, *, is_long: bool,
-                 spec: SymbolSpec) -> float:
-    """满仓打到止损时「每手」的总亏损金额（账户货币）。
-
-    单格已经在盈利侧（成本比止损更有利）时不计负数，避免用浮盈去抵扣风险预算。
-    """
-    if stop <= 0 or not spec.usable():
+def risk_per_lot(stop_distance: float, *, spec: SymbolSpec) -> float:
+    """均价到止损距离折成的每手亏损金额（账户货币）。"""
+    if stop_distance <= 0 or not spec.usable():
         return 0.0
-    per_price = spec.tick_value / spec.tick_size
-    total = 0.0
-    for cost in costs:
-        distance = (cost - stop) if is_long else (stop - cost)
-        if distance > 0:
-            total += distance * per_price
-    return total
+    return stop_distance * (spec.tick_value / spec.tick_size)
 
 
-def suggest_lot(max_loss: float, per_lot: float, spec: SymbolSpec) -> float:
-    """按最大可接受亏损反推每格手数，并向下取整到品种步长。"""
+def grid_count_for_budget(max_loss: float, risk_per_grid: float) -> int:
+    """预算能开多少格：每格按一手最小手数算，格数夹到 [2, 58]。
+
+    格数直接由预算决定——预算越大格子越多，套利越频繁；上限 58 是系统硬限制，
+    再多也存不进规则。
+    """
+    if max_loss <= 0 or risk_per_grid <= 0:
+        return 0
+    raw = int(math.floor(max_loss / risk_per_grid + 1e-9))
+    return max(GRID_COUNT_MIN, min(GRID_COUNT_MAX, raw))
+
+
+def budget_total_lot(max_loss: float, per_lot: float, spec: SymbolSpec) -> float:
+    """预算允许的满仓总手数，向下取整到品种步长。"""
     if max_loss <= 0 or per_lot <= 0 or not spec.usable():
         return 0.0
     return spec.floor_lot(max_loss / per_lot)
 
 
-def evaluate(bars: list[dict], spec_raw: object, params: dict | None,
-             *, price: float = 0.0) -> dict[str, Any]:
-    """完整试算：ATR → 格距 → 格数 → 每格手数 → 最坏亏损，并给出提示。"""
+def evaluate(spec_raw: object, params: dict | None, *, price: float = 0.0) -> dict[str, Any]:
+    """完整试算：均价到止损 → 每格亏损 → 格数 → 每格手数 → 最坏亏损，并给出提示。"""
     cfg = SizingInput.from_params(params)
     spec = SymbolSpec.from_probe(spec_raw)
-    out = SizingResult(spacing_source="manual" if cfg.spacing > 0 else "atr")
+    out = SizingResult()
 
     if cfg.price_lower <= 0 or cfg.price_upper <= cfg.price_lower:
         out.warn("range_invalid", "请先填写合法的价格区间（上限须大于下限）")
         return out.to_dict()
 
-    out.atr = round(average_true_range(list(bars or [])), max(spec.digits, 2))
-    if cfg.spacing > 0:
-        out.spacing = cfg.spacing
-    elif out.atr > 0:
-        out.spacing = round(out.atr * cfg.atr_mult, max(spec.digits, 2))
+    if price > 0 and not (cfg.price_lower <= price <= cfg.price_upper):
+        out.warn(
+            "price_outside_range",
+            f"当前价 {_trim(price, spec.digits)} 不在区间内，网格只会在价格回到区间内后成交",
+            level="info",
+        )
+
+    out.avg_stop_distance = round(cfg.avg_stop_distance, max(spec.digits, 2))
+    stop = cfg.stop_price
+    stop_name = "止损价（区间下沿）" if cfg.is_long else "止损价（区间上沿）"
+    if stop <= 0:
+        out.warn("stop_missing", f"未设置{stop_name}，无法按最大亏损反推每格手数")
+        return out.to_dict()
+    if cfg.max_loss <= 0:
+        out.warn("max_loss_missing", "请填写最大可接受亏损金额")
+        return out.to_dict()
+    if not spec.usable():
+        out.warn(
+            "spec_unavailable",
+            "节点未回传该品种的合约规格，只能给出网格数量；每格手数请手动填写",
+        )
+        return out.to_dict()
+
+    out.risk_per_lot = round(risk_per_lot(cfg.avg_stop_distance, spec=spec), 2)
+    if out.risk_per_lot <= 0:
+        out.warn("stop_unreachable", f"{stop_name}相对区间的位置算不出亏损距离")
+        return out.to_dict()
+
+    min_lot = spec.volume_min if spec.volume_min > 0 else spec.volume_step
+    
+    # 步骤1：计算预算允许的总手数（不考虑格数）
+    total_lot_budget = budget_total_lot(cfg.max_loss, out.risk_per_lot, spec)
+    if total_lot_budget <= 0:
+        out.warn(
+            "lot_below_min",
+            f"预算按一手 {_trim(min_lot, spec.volume_digits)} 手、止损距离 {_trim(cfg.avg_stop_distance, 2)} 算，"
+            f"每手打止损要亏 {_trim(out.risk_per_lot, 2)}，"
+            f"连一手都开不出来；请提高可接受亏损或缩小止损距离",
+        )
+        return out.to_dict()
+    
+    # 步骤2：套利优先 - 在格数上限内尽量多格，格数不足时才增加每格手数
+    max_grids_at_min_lot = int(math.floor(total_lot_budget / min_lot + 1e-9))
+    max_grids_at_min_lot = max(GRID_COUNT_MIN, min(GRID_COUNT_MAX, max_grids_at_min_lot))
+    
+    if max_grids_at_min_lot < GRID_COUNT_MAX:
+        # 预算切不满 200 格：每格就用最小手数
+        out.grid_count = max_grids_at_min_lot
+        lot_per_grid = min_lot
     else:
-        out.warn("atr_unavailable", "K 线不足，算不出 ATR；可手动填写格距后再试算")
-        return out.to_dict()
-
-    width = cfg.price_upper - cfg.price_lower
-    if out.spacing >= width:
-        out.warn("spacing_too_wide", "格距不小于区间宽度，至少要能切出 2 格")
-        return out.to_dict()
-
-    out.grid_count = grid_count_for_spacing(cfg.price_lower, cfg.price_upper, out.spacing)
+        # 预算够 200+ 格：用 200 格，每格手数向上调整
+        out.grid_count = GRID_COUNT_MAX
+        lot_per_grid = spec.floor_lot(total_lot_budget / GRID_COUNT_MAX)
+        if lot_per_grid < min_lot:
+            lot_per_grid = min_lot
+    
+    # 验算：预报风险指标
+    out.risk_per_grid = round(out.risk_per_lot * min_lot, 2)
+    
     out.levels = build_levels(
         cfg.price_lower, cfg.price_upper, out.grid_count, cfg.grid_mode, digits=spec.digits,
     )
@@ -329,67 +345,62 @@ def evaluate(bars: list[dict], spec_raw: object, params: dict | None,
         out.warn("levels_unavailable", "无法按当前区间切出网格线")
         return out.to_dict()
 
-    actual = round(width / out.grid_count, max(spec.digits, 2))
-    if abs(actual - out.spacing) > 10 ** -max(spec.digits, 2):
-        out.warn(
-            "spacing_rounded",
-            f"格数取整后实际格距为 {_trim(actual, spec.digits)}"
-            f"（输入 {_trim(out.spacing, spec.digits)}）",
-            level="info",
-        )
-    if out.grid_count in (GRID_COUNT_MIN, GRID_COUNT_MAX):
+    if out.grid_count == GRID_COUNT_MAX and lot_per_grid > min_lot:
         out.warn(
             "grid_count_clamped",
-            f"网格数量已夹到允许范围的 {out.grid_count} 格，实际格距与输入不同",
+            f"预算能开更多格，但网格数量上限是 {out.grid_count} 格；"
+            f"每格手数已增至 {_trim(lot_per_grid, spec.volume_digits)} 手",
+            level="info",
         )
     if cfg.grid_mode == GRID_MODE_GEOMETRIC:
         out.warn(
             "geometric_spacing",
-            "等比网格每格间距不等，格距在此只用于估算格数；手数按真实格线逐格计算",
+            "等比网格每格间距不等，格数按均价口径计算；每格手数一致",
             level="info",
         )
 
-    _size_lots(out, cfg, spec, price=price)
+    _size_lots(out, cfg, spec, lot_per_grid)
     _collect_risk_warnings(out, cfg, spec)
     return out.to_dict()
 
 
-def _size_lots(out: SizingResult, cfg: SizingInput, spec: SymbolSpec,
-               *, price: float) -> None:
-    """反推每格手数并回算最坏亏损；缺规格 / 缺止损时只给格数。"""
-    if not spec.usable():
+def _size_lots(out: SizingResult, cfg: SizingInput, spec: SymbolSpec, lot_per_grid: float) -> None:
+    """验证每格手数不超预算；允许微调但不改变格数。"""
+    # 验证手数不超预算（已在上一步计算，此处为防守性校验）
+    actual_loss = out.risk_per_lot * lot_per_grid * out.grid_count
+    
+    out.lot_per_grid = lot_per_grid
+    out.worst_lot = round(lot_per_grid * out.grid_count, spec.volume_digits)
+    out.worst_loss = round(actual_loss, 2)
+    
+    if actual_loss > cfg.max_loss + 1e-9:
+        out.over_budget = True
+        out.budget_excess = round(actual_loss - cfg.max_loss, 2)
         out.warn(
-            "spec_unavailable",
-            "节点未回传该品种的合约规格，只能给出网格数量；每格手数请手动填写",
+            "over_budget",
+            f"每格手数 {_trim(lot_per_grid, spec.volume_digits)} × {out.grid_count} 格 = "
+            f"{_trim(out.worst_lot, spec.volume_digits)} 手，"
+            f"满仓最坏亏损约 {_trim(out.worst_loss, 2)}，"
+            f"超出预算 {_trim(out.budget_excess, 2)}",
         )
-        return
-    stop = cfg.stop_price
-    stop_name = "止损价（区间下沿）" if cfg.is_long else "止损价（区间上沿）"
-    if stop <= 0:
-        out.warn("stop_missing", f"未设置{stop_name}，无法按最大亏损反推每格手数")
-        return
-    if cfg.max_loss <= 0:
-        out.warn("max_loss_missing", "请填写最大可接受亏损金额")
-        return
-
-    costs = entry_costs(out.levels, is_long=cfg.is_long)
-    per_lot = loss_per_lot(costs, stop, is_long=cfg.is_long, spec=spec)
-    if per_lot <= 0:
-        out.warn("stop_unreachable", f"{stop_name}相对区间的位置算不出亏损距离")
-        return
-
-    lot = suggest_lot(cfg.max_loss, per_lot, spec)
-    if lot <= 0 or (spec.volume_min > 0 and lot < spec.volume_min):
+    elif lot_per_grid < spec.volume_min > 0:
+        # 每格手数不足最小手数时报提示（已在上一步处理，此处为防守）
         out.warn(
             "lot_below_min",
-            f"按该预算反推的每格手数低于最小手数 {_trim(spec.volume_min, spec.volume_digits)}；"
-            "可减少网格数量、收窄区间或提高可接受亏损",
+            f"每格手数 {_trim(lot_per_grid, spec.volume_digits)} 不足最小手数 "
+            f"{_trim(spec.volume_min, spec.volume_digits)}",
         )
-        return
 
-    out.lot_per_grid = lot
-    out.worst_lot = round(lot * out.grid_count, spec.volume_digits)
-    out.worst_loss = round(per_lot * lot, 2)
+
+    if not out.over_budget and cfg.total_lot_limit > 0:
+        # 总手数上限是另一道约束：它会截断满仓格数，实际风险低于上面的估算
+        if out.worst_lot > cfg.total_lot_limit:
+            out.warn(
+                "total_lot_limit_caps",
+                f"总手数上限 {_trim(cfg.total_lot_limit, spec.volume_digits)} 会截断满仓手数"
+                f"（满仓 {_trim(out.worst_lot, spec.volume_digits)} 手），实际风险低于上面的估算",
+                level="info",
+            )
 
 
 def _collect_risk_warnings(out: SizingResult, cfg: SizingInput, spec: SymbolSpec) -> None:
@@ -399,18 +410,12 @@ def _collect_risk_warnings(out: SizingResult, cfg: SizingInput, spec: SymbolSpec
     if cfg.stop_upper > 0 and cfg.stop_upper <= cfg.price_upper:
         out.warn("stop_inside_range", "上沿终止价须高于区间上限，否则保存时会被视为未设")
 
-    lot = out.lot_per_grid
-    if lot > 0 and cfg.total_lot_limit > 0:
-        if cfg.total_lot_limit < lot:
+    if not out.over_budget and out.lot_per_grid > 0 and cfg.max_loss > 0:
+        if out.worst_loss < cfg.max_loss - 1e-9:
             out.warn(
-                "total_lot_limit_low",
-                f"总手数上限 {_trim(cfg.total_lot_limit, spec.volume_digits)} "
-                f"小于建议的每格手数，策略将无法保存",
-            )
-        elif cfg.total_lot_limit < out.worst_lot:
-            out.warn(
-                "total_lot_limit_caps",
-                "总手数上限会截断满仓格数，实际风险低于上面的估算",
+                "budget_underused",
+                f"满仓最坏亏损约 {_trim(out.worst_loss, 2)}，未用满预算 "
+                f"{_trim(cfg.max_loss, 2)}；每格手数已向下取整到品种手数步长",
                 level="info",
             )
     if not cfg.close_on_stop:
