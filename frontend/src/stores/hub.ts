@@ -313,7 +313,7 @@ export const useHubStore = defineStore('hub', {  state: (): HubState => ({
       ).data
     },
     /**
-     * 网格试算：借某节点的 K 线与合约规格，算出建议的网格数量与每格手数。
+     * 网格试算：借某节点的合约规格，算出建议的网格数量与每格手数。
      * 节点只是行情源，不会写进策略配置；错误向上抛，由表单提示具体原因。
      */
     async fetchGridSizing(

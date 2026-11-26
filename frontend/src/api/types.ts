@@ -901,12 +901,6 @@ export interface StrategyRule {
   // --- type=4 的配置期试算助手：只记录建议值怎么算出来的，执行层不读 ---
   /** 是否启用试算，默认关闭 */
   assist_enabled?: boolean
-  /** 试算 ATR 所用的 K 线周期 */
-  assist_timeframe?: BatchTimeframe
-  /** 格距 = ATR × 该倍数 */
-  assist_atr_mult?: number
-  /** 手改后的格距，0=沿用 ATR × 倍数的结果 */
-  assist_spacing?: number
   /** 试算用的最大可接受亏损（账户货币） */
   assist_max_loss?: number
 }
@@ -922,25 +916,32 @@ export interface GridSizingWarning {
 export interface GridSizingData {
   node_id: string
   symbol: string
-  timeframe: BatchTimeframe
   quote: Record<string, number>
   cached: boolean
   fetched_at: number
   updated_at: number
-  /** false 表示连网格数量都算不出（区间非法 / K 线不足），原因看 warnings */
+  /** false 表示连网格数量都算不出（区间非法 / 缺止损 / 缺预算），原因看 warnings */
   ready: boolean
-  atr: number
-  spacing: number
-  /** 格距来源：atr=按倍数算 / manual=手改覆盖 */
-  spacing_source: 'atr' | 'manual'
   grid_count: number
-  /** 0 表示手数算不出（缺合约规格 / 缺止损 / 低于最小手数），原因看 warnings */
+  /** 0 表示手数算不出（缺合约规格 / 缺止损），原因看 warnings */
   lot_per_grid: number
-  /** 满仓打止损的估算亏损 */
+  /** 满仓打止损的真实亏损（按建议手数） */
   worst_loss: number
   /** 满仓总手数 */
   worst_lot: number
   levels: number[]
+  /** 区间中点到止损价的距离：预算反推手数用的代表距离 */
+  avg_stop_distance: number
+  /** 每手满仓打止损的亏损金额 */
+  risk_per_lot: number
+  /** 每格一手打止损的亏损金额 */
+  risk_per_grid: number
+  /** 当前预算最多能拆几格（每格至少一手最小手数） */
+  budget_grid_count: number
+  /** 是否因每格手数降到最小手数而超预算 */
+  over_budget: boolean
+  /** 超出预算的金额 */
+  budget_excess: number
   warnings: GridSizingWarning[]
 }
 

@@ -1274,7 +1274,13 @@ async def test_subscription_close_exits_monitor_quietly():
 ENTRY_PRICE = 2400.0
 STOP_LOSS = 2397.0
 TOTAL_LOT = 1.02
-# 重锚到成交价 2400 后：止损距 2.88，满档 = 2400 + 2.88 × 2.5，两单阶梯等分
+# 成交后（底仓按 mid 2400 成交）精确重算的止损与阶梯止盈：
+#   总手数 1.02 → 止损距 = 300×0.01/(1.02×1) = 2.941 → 止损价 2400−2.94 = 2397.06
+#   满档加权系数 = 0.3 + 0.36×1.5 = 0.84 → 止盈跨度 = 300×2.5×0.01/0.84 = 8.929
+#   两档等分 → 2404.46 / 2408.93；满档「已平 + 浮盈」= 750 = 300×2.5
+PRECISE_SL = 2397.06
+PRECISE_LADDER = [2404.46, 2408.93]
+# 旧口径（止损距 × 盈亏比）留下的阶梯，只在「未触发精确改单」时才会看到
 LADDER = [2403.6, 2407.2]
 
 
@@ -1434,16 +1440,95 @@ async def test_risk_sized_opens_all_distribute_immediately():
 
 
 async def test_risk_sized_distribute_shares_the_same_stop():
-    """分散仓沿用同一止损，总风险因此保持不变。"""
+    """分散仓沿用同一止损，总风险因此保持不变。
+
+    精确改单在「全部成交后的下一拍行情」触发，所以先喂一拍行情再断言。
+    """
     sent: list = []
     runner, hub, mt5 = _risk_runner(sent)
     runner.start()
     await _settle()
 
-    for pos, tp in zip(mt5.positions_by_magic(MAGIC)[1:], LADDER):
-        assert pos["sl"] == STOP_LOSS
+    held = mt5.positions_by_magic(MAGIC)
+    _tick(hub, held, ENTRY_PRICE)
+    await _settle()
+
+    for pos, tp in zip(mt5.positions_by_magic(MAGIC)[1:], PRECISE_LADDER):
+        assert pos["sl"] == PRECISE_SL
         assert pos["tp"] == tp
         assert pos["comment"].startswith("R3B")
+    runner.cancel()
+
+
+async def test_risk_sized_market_rewrites_sl_tp_after_all_fills():
+    """市价开仓：全部成交后改一次单，止损与阶梯止盈都落到精确值。
+
+    回归点：改单调用曾写成 `self._mt5.modify_position`，而 MT5 客户端只有
+    `modify_position_sl`。属性查找直接抛 AttributeError，分散仓止盈一条都
+    没改成——盘上留的还是「止损距 × 盈亏比」的旧阶梯，满档总盈利远达不到
+    risk_amount × rr_ratio。这里断言改单真的落到了每一笔分散仓上。
+    """
+    sent: list = []
+    runner, hub, mt5 = _risk_runner(sent)
+    runner.start()
+    await _settle()
+
+    held = mt5.positions_by_magic(MAGIC)
+    assert len(held) == 3, "底仓 + 2 分散仓应全部成交"
+
+    # 精确改单在「全部成交后的下一拍行情」触发
+    _tick(hub, held, ENTRY_PRICE)
+    await _settle()
+
+    held = mt5.positions_by_magic(MAGIC)
+    # 精确改单后：止损按总手数反推，阶梯止盈按满档加权系数铺开
+    assert [p["sl"] for p in held] == [PRECISE_SL] * 3
+    assert [p["tp"] for p in held[1:]] == PRECISE_LADDER
+    assert not held[0].get("tp"), "底仓不设止盈"
+
+    # 满档「分散仓已平 + 底仓浮盈」= risk_amount × rr_ratio
+    # 阶梯止盈价按品种最小价位取整，尾数会有分级舍入误差（这里 ≤ 0.1U）
+    base_lot = held[0]["volume"]
+    dist_lots = [p["volume"] for p in held[1:]]
+    levels = len(dist_lots)
+    profit = base_lot * (PRECISE_LADDER[-1] - ENTRY_PRICE) / 0.01 * 1.0
+    for i, lot in enumerate(dist_lots, start=1):
+        profit += lot * (PRECISE_LADDER[i - 1] - ENTRY_PRICE) / 0.01 * 1.0
+    assert abs(profit - 300 * 2.5) < 0.1
+
+    # 满损 = risk_amount（止损价按最小价位取整，尾数有分级舍入误差）
+    total_lot = sum(p["volume"] for p in held)
+    loss = total_lot * (ENTRY_PRICE - PRECISE_SL) / 0.01 * 1.0
+    assert abs(loss - 300) < 0.5
+    runner.cancel()
+
+
+async def test_risk_sized_market_modify_survives_single_ticket_failure():
+    """单笔改单失败不能带崩整个 runner，也不能影响其它档的止盈。"""
+    class FlakyMT5(MockMT5Client):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.failed = False
+
+        def modify_position_sl(self, ticket, sl, tp=None):
+            if not self.failed:
+                self.failed = True
+                raise RuntimeError("broker hiccup")
+            return super().modify_position_sl(ticket, sl, tp)
+
+    sent: list = []
+    runner, hub, mt5 = _risk_runner(sent, mt5=FlakyMT5())
+    runner.start()
+    await _settle()
+
+    held = mt5.positions_by_magic(MAGIC)
+    assert len(held) == 3
+    _tick(hub, held, ENTRY_PRICE)
+    await _settle()
+
+    held = mt5.positions_by_magic(MAGIC)
+    # 第一笔改单抛异常，第二笔仍要改成功
+    assert held[2]["tp"] == PRECISE_LADDER[1]
     runner.cancel()
 
 
@@ -1474,7 +1559,7 @@ async def test_risk_sized_breakeven_moves_stop_to_average_price():
     assert moved and "保本触发" in moved[0]["message"]
     assert mt5.positions_by_magic(MAGIC)[0]["sl"] == ENTRY_PRICE
     # 保本改单不能顺手抹掉已挂的止盈（分散仓）
-    assert mt5.positions_by_magic(MAGIC)[1]["tp"] == LADDER[0]
+    assert mt5.positions_by_magic(MAGIC)[1]["tp"] == PRECISE_LADDER[0]
     runner.cancel()
 
 
@@ -1598,7 +1683,8 @@ async def test_risk_sized_breakeven_waits_for_threshold():
     await _settle()
 
     assert not _progress(sent, "breakeven")
-    assert mt5.positions_by_magic(MAGIC)[0]["sl"] == STOP_LOSS
+    # 止损已被精确改单重算过（按总手数反推），不是信号给的原始止损
+    assert mt5.positions_by_magic(MAGIC)[0]["sl"] == PRECISE_SL
     runner.cancel()
 
 
@@ -1612,7 +1698,7 @@ async def test_risk_sized_breakeven_disabled_never_moves_stop():
     await _settle()
 
     assert not _progress(sent, "breakeven")
-    assert mt5.positions_by_magic(MAGIC)[0]["sl"] == STOP_LOSS
+    assert mt5.positions_by_magic(MAGIC)[0]["sl"] == PRECISE_SL
     runner.cancel()
 
 
@@ -1809,14 +1895,18 @@ async def test_limit_orders_stack_at_entry_price():
 
 
 async def test_limit_orders_share_signal_stop_and_ladder_tp():
+    """限价挂单带精确止损与阶梯止盈：止损按总手数重算，止盈按满档加权系数铺开。"""
     sent: list = []
     runner, hub, mt5 = _limit_runner(sent)
     runner.start()
     await _settle()
 
     orders = mt5.pending_orders_by_magic(MAGIC)
-    assert all(o["sl"] == LIMIT_STOP for o in orders)
+    # 止损按总手数精确重算：300×0.01/(0.29×1) = 10.345 → 2390−10.34 = 2379.66
+    assert all(o["sl"] == 2379.66 for o in orders)
     assert not orders[0]["tp"]                   # 底仓不设止盈
+    # 止盈跨度 = 300×2.5×0.01/(0.09+0.1×1.5) = 19.65，两档等分
+    assert [o["tp"] for o in orders[1:]] == [2405.62, 2421.25]
     assert all(o["tp"] > LIMIT_PRICE for o in orders[1:])
     runner.cancel()
 

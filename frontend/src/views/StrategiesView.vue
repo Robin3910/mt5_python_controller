@@ -294,10 +294,7 @@ function ruleDetailRows(r: StrategyRule): Array<{ k: string; v: string }> {
       ? [
           {
             k: '试算来源',
-            v:
-              `配置期 · ATR(${r.assist_timeframe || 'H1'}) × ${r.assist_atr_mult ?? 0}` +
-              `${r.assist_spacing ? ` · 格距 ${r.assist_spacing}` : ''}` +
-              `${r.assist_max_loss ? ` · 预算 ${r.assist_max_loss}` : ''}`,
+            v: `配置期 · 按预算反推${r.assist_max_loss ? ` · 预算 ${r.assist_max_loss}` : ''}`,
           },
         ]
       : []

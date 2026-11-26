@@ -39,13 +39,16 @@ class ProbeError(RuntimeError):
 
 
 def build_command(req_id: str, symbol: str, timeframe: str, count: int) -> dict:
-    return {
+    cmd = {
         "cmd": "market_probe",
         "req_id": req_id,
         "symbol": symbol,
         "timeframe": timeframe,
-        "count": count,
     }
+    # count=0 表示只要报价与合约规格，不要 K 线（网格试算不依赖 ATR）
+    if count > 0:
+        cmd["count"] = count
+    return cmd
 
 
 def resolve(req_id: object, payload: dict) -> None:
@@ -84,12 +87,15 @@ async def _request(node_id: str, symbol: str, timeframe: str, count: int) -> dic
     if payload.get("error"):
         raise ProbeError(str(payload["error"]))
     bars = payload.get("bars")
-    if not isinstance(bars, list) or not bars:
+    if count <= 0:
+        # 只要报价与规格，不要 K 线：没 bars 属正常
+        bars = []
+    elif not isinstance(bars, list) or not bars:
         raise ProbeError(f"{symbol} {timeframe} 无可用 K 线")
     return {
         "symbol": symbol,
         "timeframe": timeframe,
-        "bars": bars,
+        "bars": bars or [],
         "quote": payload.get("quote") if isinstance(payload.get("quote"), dict) else {},
         # 合约规格是附加项：老节点或读不到规格时为空，调用方据此降级（只是算不了金额）
         "spec": payload.get("spec") if isinstance(payload.get("spec"), dict) else {},

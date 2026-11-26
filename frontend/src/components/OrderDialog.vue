@@ -236,48 +236,6 @@ const activePreset = computed<OrderPreset | null>(() => {
 })
 
 /**
- * 「恢复预设」按钮是否可用：当前值与预设值不一致才有意义。
- *
- * 这是「预设是初始值」的心智补齐：会话里改乱了固定参数，一键回滚到预设值。
- */
-const canRestorePreset = computed(() => {
-  const p = activePreset.value
-  if (!p) return false
-  if (isGrid.value) {
-    return (
-      gridParams.grid_mode !== p.grid_mode ||
-      Number(gridParams.max_allow_loss) !== p.max_allow_loss ||
-      gridParams.trailing_up !== p.trailing_up
-    )
-  }
-  return (
-    Number(riskParams.risk_amount) !== p.risk_amount ||
-    Number(riskParams.rr_ratio) !== p.rr_ratio ||
-    Number(riskParams.base_ratio) !== p.base_ratio ||
-    Number(riskParams.breakeven_times) !== p.breakeven_times
-  )
-})
-
-/** 把固定参数恢复到预设值 */
-function restorePreset(): void {
-  const p = activePreset.value
-  if (!p) return
-  if (isGrid.value) {
-    gridParams.grid_mode = p.grid_mode
-    gridParams.max_allow_loss = p.max_allow_loss
-    gridParams.trailing_up = p.trailing_up
-  } else {
-    riskParams.risk_amount = p.risk_amount
-    riskParams.rr_ratio = p.rr_ratio
-    riskParams.base_ratio = p.base_ratio
-    riskParams.breakeven_times = p.breakeven_times
-    // 恢复预设 = 重新采用预设的盈亏比，止盈价反算的联动重新生效
-    rrManualEdited.value = false
-  }
-  ElMessage.success('已恢复为预设参数')
-}
-
-/**
  * 预设回填：把预设的固定参数写进表单。
  *
  * **只回填固定参数**，动态价一律留空（止损价 / 止盈价 / 挂单价；网格的区间与止损价）
@@ -619,14 +577,6 @@ const derivedGridSide = computed<GridSide | null>(() => {
   return null
 })
 
-/** 推导方向的中文标签（只读展示用，客户不再选择） */
-const derivedGridSideLabel = computed(() => {
-  const side = derivedGridSide.value
-  if (side === 'long') return '多头'
-  if (side === 'short') return '空头'
-  return '待判定'
-})
-
 /**
  * 映射到后端规则的终止价：
  *   只做多 → stop_lower = 止损价（区间下方），stop_upper = 止盈价
@@ -885,8 +835,8 @@ function applyTemplateDefaults(): void {
 //   3. 试算过程与结果**不对客户展示**（UI 已隐藏），只用于算出网格数量与每格手数
 //
 // 写死的入参（不暴露在弹窗里）：
-//   - timeframe = 'M1'
-//   - atr_mult  = 0.6
+//   - timeframe = 'H1'（网格格距要反映区间级波动，M1 太碎）
+//   - atr_mult  = 0.6（ATR 倍数只是「格距上限」，实际格距由算出的格数决定）
 //   - spacing   = 0（让后端按 ATR×倍数算）
 //   - total_lot_limit = 0（不限）
 //
@@ -932,9 +882,6 @@ async function triggerGridSizing(): Promise<void> {
   const symbol = (localForm.symbol || '').trim().toUpperCase()
   try {
     const data = await hub.fetchGridSizing(node.node_id, symbol, {
-      timeframe: 'M1',
-      atr_mult: 0.6,
-      spacing: 0,
       price_lower: Number(gridParams.price_lower) || 0,
       price_upper: Number(gridParams.price_upper) || 0,
       grid_mode: gridParams.grid_mode,
@@ -1965,39 +1912,40 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
         </template>
 
         <template v-else>
-        <!-- 网格方向：由「止损价 vs 价格区间」自动判定，只读展示，客户不需要选 -->
+        <!-- 以损定量 -->
         <div class="od-row">
           <div class="od-row-text">
-            <div class="od-row-label">网格方向</div>
-            <div class="od-row-sub">由止损价位置自动判定</div>
+            <div class="od-row-label">以损定量<span class="od-req">必选</span></div>
+            <div class="od-row-sub">满仓打到止损的最多亏损，据此算格子数量与每格手数</div>
           </div>
-          <div class="od-row-control readonly" :class="{ muted: !derivedGridSide }">
-            {{ derivedGridSideLabel }}
-          </div>
-        </div>
-        <!-- 区间下限 -->
-        <div class="od-row">
-          <div class="od-row-text">
-            <div class="od-row-label">价格下限<span class="od-req">必选</span></div>
-            <div class="od-row-sub">
-              {{ derivedGridSide === 'short' ? '网格的最低价位（跌到此处平空兑现）' : '网格的最低价位（跌到此处开始买入）' }}
-            </div>
-          </div>
-          <div class="od-row-control od-input-affix">
-            <input v-model.number="gridParams.price_lower" class="od-input" type="number" step="0.0001" min="0" placeholder="如 3000.00" />
+          <div class="od-row-control od-input-affix" :class="{ need: !(Number(gridParams.max_allow_loss) > 0) }">
+            <input v-model.number="gridParams.max_allow_loss" class="od-input" type="number" step="10" min="0" placeholder="如 100" />
             <span class="od-affix">USD</span>
           </div>
         </div>
         <!-- 区间上限 -->
         <div class="od-row">
           <div class="od-row-text">
-            <div class="od-row-label">价格上限<span class="od-req">必选</span></div>
+            <div class="od-row-label">上限<span class="od-req">必选</span></div>
             <div class="od-row-sub">
               {{ derivedGridSide === 'short' ? '网格的最高价位（涨到此处开空）' : '网格的最高价位（涨到此处卖出兑现）' }}
             </div>
           </div>
-          <div class="od-row-control od-input-affix">
+          <div class="od-row-control od-input-affix" :class="{ need: !(Number(gridParams.price_upper) > 0) }">
             <input v-model.number="gridParams.price_upper" class="od-input" type="number" step="0.0001" min="0" placeholder="如 3300.00" />
+            <span class="od-affix">USD</span>
+          </div>
+        </div>
+        <!-- 区间下限 -->
+        <div class="od-row">
+          <div class="od-row-text">
+            <div class="od-row-label">下限<span class="od-req">必选</span></div>
+            <div class="od-row-sub">
+              {{ derivedGridSide === 'short' ? '网格的最低价位（跌到此处平空兑现）' : '网格的最低价位（跌到此处开始买入）' }}
+            </div>
+          </div>
+          <div class="od-row-control od-input-affix" :class="{ need: !(Number(gridParams.price_lower) > 0) }">
+            <input v-model.number="gridParams.price_lower" class="od-input" type="number" step="0.0001" min="0" placeholder="如 3000.00" />
             <span class="od-affix">USD</span>
           </div>
         </div>
@@ -2009,20 +1957,8 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
               填在价格区间下方 → 只做多；填在价格区间上方 → 只做空
             </div>
           </div>
-          <div class="od-row-control od-input-affix">
+          <div class="od-row-control od-input-affix" :class="{ need: !(Number(gridParams.stop_price) > 0) }">
             <input v-model.number="gridParams.stop_price" class="od-input" type="number" step="0.0001" min="0" placeholder="如 2950.00" />
-            <span class="od-affix">USD</span>
-          </div>
-        </div>
-
-        <!-- 最大可接受亏损 -->
-        <div class="od-row">
-          <div class="od-row-text">
-            <div class="od-row-label">以损定量</div>
-            <div class="od-row-sub">按单笔最大亏损额计算手数</div>
-          </div>
-          <div class="od-row-control od-input-affix">
-            <input v-model.number="gridParams.max_allow_loss" class="od-input" type="number" step="10" min="0" placeholder="如 100" />
             <span class="od-affix">USD</span>
           </div>
         </div>
@@ -2094,14 +2030,6 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
       <p v-if="!isPresetMode && stopEqualsEntry" class="od-error" role="alert">
         止损价不能等于{{ isLimit ? '挂单价' : '当前报价' }}
       </p>
-
-      <!-- 恢复预设：会话里改乱了固定参数，一键回滚到预设值 -->
-      <div v-if="!isPresetMode && canRestorePreset" class="od-notice is-info">
-        <span class="od-notice-text">
-          当前参数已与预设不一致。预设只作为开仓时的初始值，本次改动不会写回预设。
-        </span>
-        <button type="button" class="od-notice-btn" @click="restorePreset">恢复预设</button>
-      </div>
 
       <div v-if="lastError || lastStrategyError" class="od-error">
         {{ lastError || lastStrategyError }}

@@ -1607,30 +1607,39 @@ class NodeClient:
         req_id = str(msg.get("req_id") or "")
         symbol = str(msg.get("symbol") or "").strip().upper()
         timeframe = str(msg.get("timeframe") or "M15").strip().upper()
-        count = probe_bar_limit(timeframe, msg.get("count"))
+        try:
+            want_bars = int(msg.get("count") or 0) > 0
+        except (TypeError, ValueError):
+            want_bars = True
+        count = probe_bar_limit(timeframe, msg.get("count")) if want_bars else 0
 
         data: dict = {"req_id": req_id, "symbol": symbol, "timeframe": timeframe}
         if not symbol:
             data["error"] = "缺少品种"
         else:
             try:
-                bars = await self._exec(self.mt5.closed_bars, symbol, timeframe, count)
+                bars = await self._exec(self.mt5.closed_bars, symbol, timeframe, count) \
+                    if want_bars else []
                 quotes = await self._exec(self.mt5.quotes, [symbol])
             except Exception as e:  # noqa: BLE001
                 logger.warning("market probe failed for %s %s: %s", symbol, timeframe, e)
                 data["error"] = f"读取行情失败：{e}"
             else:
                 bars = list(bars or [])
-                if not bars:
+                if want_bars and not bars:
                     data["error"] = (
                         f"{symbol} {timeframe} 无可用 K 线（品种不存在、周期无效或历史未下载）"
                     )
                 else:
-                    data["bars"] = bars
+                    if want_bars:
+                        data["bars"] = bars
                     data["quote"] = (quotes or {}).get(symbol) or {}
-                    spec = await self._probe_symbol_spec(symbol)
-                    if spec:
-                        data["spec"] = spec
+                # 合约规格与 K 线无关：只要品种读得到就带上。
+                # 网格试算只要规格与报价，不看 K 线（不依赖 ATR），
+                # 所以「不要 K 线」或「无 K 线」都不能把它一起拖掉。
+                spec = await self._probe_symbol_spec(symbol)
+                if spec:
+                    data["spec"] = spec
         await ws.send(json.dumps({"type": "market_probe_result", "data": data}))
 
     async def _probe_symbol_spec(self, symbol: str) -> dict:

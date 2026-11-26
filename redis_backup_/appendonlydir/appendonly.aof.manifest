@@ -1,0 +1,2 @@
+file appendonly.aof.19.base.rdb seq 19 type b
+file appendonly.aof.19.incr.aof seq 19 type i startoffset 270925702

@@ -856,3 +856,255 @@ def filled_orders_from_positions(positions: list[dict]) -> int:
     if not saw_distribute:
         return len(positions)
     return max(max_idx, 0) + 1
+
+
+# 精确止损止盈调整（真实开仓后重新计算）
+# ---------------------------------------------------------------------------
+
+def _ladder_profit_weight(base_lot: float, per_lot: float, count: int) -> float:
+    """满档时的「手数 × 落点」加权系数。
+
+    语义：价格走到最后一档时，分散仓已全部止盈，底仓还在持有。此时累计利润为
+
+        base_lot × span                          （底仓吃到满档）
+      + Σ per_lot × span × i/count (i=1..count)  （分散仓分档兑现）
+
+    把 span 提出来就是 span × [base_lot + per_lot × (count+1)/2]。
+
+    风险侧用「总手数」（满损时所有仓都在），利润侧用这个系数——两者口径不同，
+    混用会让满档时的总盈利达不到 risk_amount × rr_ratio。
+    """
+    if count <= 0:
+        return base_lot
+    return base_lot + per_lot * (count + 1) / 2.0
+
+
+def recalc_sl_tp_market(
+    positions: list[dict],
+    cfg: RiskSizedConfig,
+    spec: SymbolSpec,
+    direction: str,
+) -> dict:
+    """市价开仓，所有持仓成交后重新计算精确的止损和止盈。
+
+    参数：
+        positions: 所有持仓列表（底仓1笔 + 分散仓N笔）
+        cfg: 以损定量配置
+        spec: 品种规格
+        direction: 交易方向 (BUY/SELL)
+
+    返回：{
+        'new_sl_distance': float,     # 新的止损距离（价格单位）
+        'new_sl_price': float,        # 新的止损价
+        'new_tp_span': float,         # 新的止盈跨度（价格单位）
+        'ladder': [tp_0, tp_1, ...],  # 各档止盈价 (tp_0=0 for base)
+        'error': str or None,         # 错误信息
+    }
+
+    核心逻辑：
+    - 风险侧：risk_amount 由整个头寸（底仓 + 分散仓）共同承担
+      止损距离 = risk_amount × tick_size / (总手数 × tick_value)
+    - 利润侧：满档时分散仓已全平、只剩底仓在手，要求「已平 + 浮盈」= risk_amount × rr_ratio
+      止盈跨度 = risk_amount × rr_ratio × tick_size / (tick_value × 满档加权系数)
+    - 阶梯止盈以底仓成交价为锚，等分铺开
+    """
+    if not positions:
+        return {'error': '没有持仓'}
+
+    if spec.tick_size <= 0 or spec.tick_value <= 0:
+        return {'error': '品种规格不完整'}
+
+    # 总手数：整个头寸共同承担风险
+    total_lot = sum(_as_float(pos.get('volume')) for pos in positions)
+    if total_lot <= 0:
+        return {'error': '总手数为零'}
+
+    # 底仓识别：备注里没有 R3B 前缀的就是底仓（分散仓备注恒为 R3B{n}）。
+    # 不用「最早成交的那笔」当底仓——市价连发时同一秒成交的票号顺序不保证，
+    # 认错底仓会让锚定价和底仓手数一起偏。
+    base_candidates = [
+        p for p in positions if parse_batch_comment(p.get('comment')) is None
+    ]
+    if base_candidates:
+        base = min(
+            base_candidates, key=lambda p: (p.get('time') or 0, p.get('ticket') or 0),
+        )
+    else:
+        # 备注全被券商截断/改写时退回「最早成交」
+        base = min(
+            positions, key=lambda p: (p.get('time') or 0, p.get('ticket') or 0),
+        )
+    base_fill_price = _as_float(base.get('price_open'))
+    base_lot = _as_float(base.get('volume'))
+    if base_fill_price <= 0:
+        return {'error': '无法获取底仓成交价'}
+    if base_lot <= 0:
+        return {'error': '底仓手数为零'}
+    
+    # 分散仓：按备注取批次号与实际手数。
+    # 不假设「等手数」——部分成交或券商改过手数时，按实际手数算权重才准。
+    distribute = []
+    max_idx = 0
+    for p in positions:
+        if p is base:
+            continue
+        idx = parse_batch_comment(p.get('comment'))
+        lot = _as_float(p.get('volume'))
+        if lot <= 0:
+            continue
+        distribute.append((idx, lot))
+        if idx is not None:
+            max_idx = max(max_idx, idx)
+    # 阶梯层数：配置档数与实际批次号取大者。
+    # 批次号 1..N 对应 ladder[1..N]（ladder[0] 是底仓），所以层数就是 N，不是 N+1。
+    levels = cfg.add_batches if cfg.add_batches > 0 else len(distribute)
+    if max_idx > levels:
+        levels = max_idx
+    if levels <= 0:
+        return {'error': '没有分散仓'}
+    
+    # 满档加权系数：底仓吃满档，分散仓各自在自己的档位兑现
+    #   权重 = 底仓手数 + Σ(各档手数 × 档位/层数)
+    weight = base_lot
+    for idx, lot in distribute:
+        level = idx if idx is not None else levels
+        weight += lot * (level / levels)
+    if weight <= 0:
+        return {'error': '止盈加权系数为 0，无法铺阶梯'}
+
+    if cfg.risk_amount <= 0:
+        return {'error': '风险金额无效'}
+
+    # 重新计算止损距离：整个头寸打到止损的亏损 = risk_amount
+    # 每手亏损 = 距离 / tick_size × tick_value  →  距离 = risk × tick_size / (手数 × tick_value)
+    new_sl_distance = (
+        cfg.risk_amount * spec.tick_size / (total_lot * spec.tick_value)
+    )
+    if new_sl_distance <= 0:
+        return {'error': '止损距离计算失败'}
+
+    # 新的止盈跨度：满档时「已平 + 浮盈」= risk_amount × rr_ratio
+    new_tp_span = (
+        cfg.risk_amount * cfg.rr_ratio * spec.tick_size / (spec.tick_value * weight)
+    )
+    if new_tp_span <= 0:
+        return {'error': '止盈跨度计算失败'}
+
+    # 新的止损价
+    sign = _favorable_sign(direction)
+    new_sl_price = round(base_fill_price - sign * new_sl_distance, spec.digits)
+
+    # 计算各档阶梯止盈
+    ladder = [0.0]  # 底仓TP=0
+
+    for i in range(1, levels + 1):
+        tp = round(base_fill_price + sign * new_tp_span * i / levels, spec.digits)
+        ladder.append(tp)
+
+    return {
+        'new_sl_distance': round(new_sl_distance, 8),
+        'new_sl_price': new_sl_price,
+        'new_tp_span': round(new_tp_span, 8),
+        'ladder': ladder,
+        'error': None,
+    }
+
+
+def recalc_sl_tp_limit(
+    entry_price: float,
+    total_lot: float,
+    cfg: RiskSizedConfig,
+    spec: SymbolSpec,
+    direction: str,
+    base_lot: float = 0.0,
+    per_lot: float = 0.0,
+    count: int = 0,
+) -> dict:
+    """限价开仓，挂单前精确计算止损和止盈。
+
+    参数：
+        entry_price: 挂单价（固定）
+        total_lot: 总手数
+        cfg: 以损定量配置
+        spec: 品种规格
+        direction: 交易方向 (BUY/SELL)
+        base_lot: 底仓手数（0 = 按 base_ratio 从 total_lot 推）
+        per_lot: 单档分散仓手数（0 = 按总量均分推）
+        count: 分散仓单数（0 = 按配置推）
+
+    返回：{
+        'new_sl_distance': float,
+        'new_sl_price': float,
+        'new_tp_span': float,
+        'ladder': [tp_0, tp_1, ...],
+        'error': str or None,
+    }
+
+    核心逻辑（与市价同口径）：
+    - 风险侧：risk_amount 由整个头寸（底仓 + 分散仓）共同承担
+      止损距离 = risk_amount × tick_size / (总手数 × tick_value)
+    - 利润侧：满档时分散仓已全平、只剩底仓在手，要求「已平 + 浮盈」= risk_amount × rr_ratio
+      止盈跨度 = risk_amount × rr_ratio × tick_size / (tick_value × 满档加权系数)
+    - 分散仓按阶梯均分这个止盈距离
+    """
+    if entry_price <= 0:
+        return {'error': '挂单价无效'}
+
+    if total_lot <= 0:
+        return {'error': '总手数为零'}
+
+    if spec.tick_size <= 0 or spec.tick_value <= 0:
+        return {'error': '品种规格不完整'}
+
+    if cfg.risk_amount <= 0:
+        return {'error': '风险金额无效'}
+
+    # 缺省时复用 _split_lots 切分，保证与实际下单的手数分布一致
+    if count <= 0 or base_lot <= 0 or per_lot <= 0:
+        lots = _split_lots(total_lot, cfg, spec)
+        if lots:
+            base_lot = lots[0]
+            if len(lots) > 1:
+                per_lot = lots[1]
+                count = len(lots) - 1
+    if base_lot <= 0:
+        base_lot = spec.volume_min if spec.volume_min > 0 else 0.1
+    if count <= 0:
+        count = cfg.add_batches if cfg.add_batches > 0 else 10
+
+    # 重新计算止损距离：整个头寸打到止损的亏损 = risk_amount
+    # 每手亏损 = 距离 / tick_size × tick_value  →  距离 = risk × tick_size / (手数 × tick_value)
+    new_sl_distance = (
+        cfg.risk_amount * spec.tick_size / (total_lot * spec.tick_value)
+    )
+    if new_sl_distance <= 0:
+        return {'error': '止损距离计算失败'}
+
+    # 新的止盈跨度：满档时「已平 + 浮盈」= risk_amount × rr_ratio
+    weight = _ladder_profit_weight(base_lot, per_lot, count)
+    if weight <= 0:
+        return {'error': '止盈加权系数为 0，无法铺阶梯'}
+    new_tp_span = (
+        cfg.risk_amount * cfg.rr_ratio * spec.tick_size / (spec.tick_value * weight)
+    )
+    if new_tp_span <= 0:
+        return {'error': '止盈跨度计算失败'}
+
+    # 新的止损价
+    sign = _favorable_sign(direction)
+    new_sl_price = round(entry_price - sign * new_sl_distance, spec.digits)
+
+    # 计算各档阶梯止盈
+    ladder = [0.0]  # 底仓TP=0
+
+    for i in range(1, count + 1):
+        tp = round(entry_price + sign * new_tp_span * i / count, spec.digits)
+        ladder.append(tp)
+
+    return {
+        'new_sl_distance': round(new_sl_distance, 8),
+        'new_sl_price': new_sl_price,
+        'new_tp_span': round(new_tp_span, 8),
+        'ladder': ladder,
+        'error': None,
+    }

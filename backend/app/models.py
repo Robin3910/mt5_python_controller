@@ -764,15 +764,6 @@ class StrategyRule(BaseModel):
     assist_enabled: bool = Field(
         default=False, description="是否启用网格试算助手（仅配置期，默认关闭）",
     )
-    assist_timeframe: str = Field(
-        default="H1", description="试算 ATR 所用的 K 线周期",
-    )
-    assist_atr_mult: float = Field(
-        default=1.0, ge=0, description="格距 = ATR × 该倍数",
-    )
-    assist_spacing: float = Field(
-        default=0.0, ge=0, description="手改后的格距，0=沿用 ATR × 倍数的结果",
-    )
     assist_max_loss: float = Field(
         default=0.0, ge=0, description="试算用的最大可接受亏损（账户货币）",
     )

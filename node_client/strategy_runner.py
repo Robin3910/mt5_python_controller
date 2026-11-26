@@ -369,6 +369,10 @@ class StrategyRunner:
         self._risk_plan: Optional[EntryPlan] = None
         self._risk_spec: Optional[SymbolSpec] = None
         self._breakeven_done = False
+        # 市价模式：是否已改单（所有持仓都成交后改一次）
+        self._risk_sl_tp_modified = False
+        # 限价模式：精确参数（挂单前计算好）
+        self._risk_limit_precise_params: dict = {}
         # 限价开仓：本轮采样看到的在途挂单笔数，供上报与残留判定
         self._pending_orders = 0
 
@@ -4171,8 +4175,48 @@ class StrategyRunner:
 
         self._risk_plan = plan
         self.base_volume = plan.base_volume
+        
+        # 限价模式：挂单前精确计算止损和止盈参数
+        if cfg.is_limit_entry:
+            # 取整后的实际手数：止盈加权系数必须用真实手数，不能用配置推算值
+            actual_base = plan.batches[0].volume if plan.batches else 0.0
+            actual_per = (
+                plan.batches[1].volume if len(plan.batches) > 1 else 0.0
+            )
+            actual_count = max(0, len(plan.batches) - 1)
+            precise_params = risk_sizing.recalc_sl_tp_limit(
+                entry_price=plan.entry_price,
+                total_lot=plan.total_lot,
+                cfg=cfg,
+                spec=spec,
+                direction=self.direction,
+                base_lot=actual_base,
+                per_lot=actual_per,
+                count=actual_count,
+            )
+            if precise_params.get('error'):
+                logger.warning(
+                    "task %s limit precise params failed: %s",
+                    self.task_id, precise_params['error'],
+                )
+            else:
+                self._risk_limit_precise_params = precise_params
+                
+                # 用精确参数更新所有批次
+                new_sl_price = precise_params.get('new_sl_price', plan.stop_loss)
+                ladder = precise_params.get('ladder', [])
+                
+                # 更新底仓和分散仓的参数
+                for batch in plan.batches:
+                    if batch.index < len(ladder):
+                        batch.take_profit = ladder[batch.index]
+                
+                # 更新计划的止损
+                plan.stop_loss = new_sl_price
+        
         base = plan.batches[0]
         # 底仓：止损跟信号，止盈为 0（留给保本与趋势）
+        # 限价模式下会用精确的止损价
         res = dict(await self._risk_send_order(
             base, plan.stop_loss, None, self._open_comment(), first=True,
         ) or {})
@@ -4221,7 +4265,20 @@ class StrategyRunner:
 
     async def _risk_send_order(self, batch, stop_loss: float,
                                take_profit: Optional[float], comment: str, *, first: bool = False) -> dict:
-        """按计划里这一档的开仓方式下单：有挂单价就挂限价，否则市价。"""
+        """按计划里这一档的开仓方式下单：有挂单价就挂限价，否则市价。
+        
+        限价模式下使用精确计算的TP；市价模式下使用原始计划的TP。
+        """
+        # 限价模式：使用精确计算的参数
+        if batch.is_pending and self._risk_limit_precise_params:
+            precise = self._risk_limit_precise_params
+            if precise.get('error') is None:
+                # 从阶梯中获取这一档的TP（跳过底仓，底仓不设止盈）
+                if batch.index > 0 and batch.index < len(precise.get('ladder', [])):
+                    take_profit = precise['ladder'][batch.index]
+                # 使用精确的止损价
+                stop_loss = precise.get('new_sl_price', stop_loss)
+        
         if batch.is_pending:
             return dict(await self._exec(
                 self._mt5.place_pending_order,
@@ -4254,6 +4311,111 @@ class StrategyRunner:
                 "price": price,
                 "position_count": len(positions),
                 "waited_seconds": waited,
+            },
+        )
+
+    async def _risk_modify_sl_tp_market(self, positions: list[dict], cfg: RiskSizedConfig, 
+                                        plan: EntryPlan) -> None:
+        """市价开仓，所有持仓成交后改一次SL和TP。"""
+        spec = self._risk_spec
+        if spec is None:
+            logger.warning("task %s cannot modify SL/TP: no spec", self.task_id)
+            return
+        
+        # 计算新的精确参数
+        precise = risk_sizing.recalc_sl_tp_market(
+            positions=positions,
+            cfg=cfg,
+            spec=spec,
+            direction=self.direction,
+        )
+        
+        if precise.get('error'):
+            logger.warning("task %s modify SL/TP failed: %s", self.task_id, precise['error'])
+            return
+        
+        new_sl_price = precise['new_sl_price']
+        ladder = precise['ladder']
+        
+        # 1. 改所有单的止损
+        logger.info(
+            "task %s modifying SL to %s for all positions (count=%s)",
+            self.task_id, new_sl_price, len(positions),
+        )
+        
+        # 改单异常不能带崩 runner：改单失败只影响这一轮精确化，
+        # 异常要吞掉并记账，否则会一路抛到 _run 的「runner crashed」。
+        try:
+            res_sl = await self._exec(
+                self._mt5.modify_sl_by_magic,
+                self.magic, new_sl_price,
+            ) or {}
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "task %s modify SL raised: %s", self.task_id, e,
+            )
+            res_sl = {"success": False, "error": str(e)}
+        
+        if not res_sl.get('success'):
+            logger.warning("task %s modify SL failed: %s", self.task_id, res_sl.get('error'))
+            # 记录但继续处理TP
+        else:
+            logger.info("task %s SL modified successfully to %s", self.task_id, new_sl_price)
+        
+        # 2. 改分散仓的止盈
+        modified_count = 0
+        for pos in positions:
+            # 从备注识别批次号
+            batch_idx = risk_sizing.parse_batch_comment(pos.get('comment'))
+            if batch_idx is None:
+                # 底仓，跳过（TP保持为0）
+                continue
+            
+            # 分散仓，改TP
+            if 0 <= batch_idx < len(ladder):
+                new_tp = ladder[batch_idx]
+                ticket = pos.get('ticket')
+                
+                # 单笔改单失败不能带崩整个 runner：一笔失败只少改这一档，
+                # 剩下的照常改。异常要吞掉并记账，否则会一路抛到 _run 的
+                # 「runner crashed」，把整批持仓判成 faulted。
+                try:
+                    res_tp = await self._exec(
+                        self._mt5.modify_position_sl,
+                        ticket, new_sl_price, new_tp,
+                    ) or {}
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "task %s distribute B%d ticket=%s TP modify raised: %s",
+                        self.task_id, batch_idx, ticket, e,
+                    )
+                    continue
+                
+                if res_tp.get('success'):
+                    modified_count += 1
+                    logger.info(
+                        "task %s distribute B%d ticket=%d TP modified to %s",
+                        self.task_id, batch_idx, ticket, new_tp,
+                    )
+                else:
+                    logger.warning(
+                        "task %s distribute B%d ticket=%d TP modify failed: %s",
+                        self.task_id, batch_idx, ticket, res_tp.get('error'),
+                    )
+        
+        self._risk_sl_tp_modified = True
+        
+        await self._emit_progress(
+            "open", phase="running",
+            message=(
+                f"精确止损止盈已调整：止损改为 {round(new_sl_price, spec.digits)}，"
+                f"{modified_count} 个分散仓止盈已更新"
+            ),
+            detail={
+                "kind": "risk_sized_sl_tp_adjusted",
+                "new_sl_price": new_sl_price,
+                "new_sl_distance": precise['new_sl_distance'],
+                "modified_tp_count": modified_count,
             },
         )
 
@@ -4324,10 +4486,21 @@ class StrategyRunner:
         )
 
     async def _risk_advance(self, event: MarketEvent, positions: list[dict]) -> bool:
-        """推进以损定量任务：先补齐未开的分散仓，再看保本。返回 True 表示本轮已有动作。"""
+        """推进以损定量任务：先补齐未开的分散仓，再改单（市价模式），再看保本。返回 True 表示本轮已有动作。"""
         cfg, plan = self._risk_cfg, self._risk_plan
         if cfg is None or plan is None or not plan.ok:
             return False
+        
+        # 市价模式：所有单都成交后改一次SL/TP
+        if not cfg.is_limit_entry and not self._risk_sl_tp_modified:
+            # 检查是否所有11笔单都成交（1个底仓 + 10个分散仓）
+            if self.total_orders >= plan.order_count and positions:
+                # 确认持仓笔数是否达到预期
+                position_count = len(positions)
+                if position_count >= plan.order_count - 1:  # 允许一点误差
+                    await self._risk_modify_sl_tp_market(positions, cfg, plan)
+                    # 改单完成后继续处理其他逻辑
+        
         pending = risk_sizing.pending_batches(plan, filled=self.total_orders)
         if pending:
             opened = await self._risk_open_pending_distribute(

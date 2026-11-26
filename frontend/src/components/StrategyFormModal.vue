@@ -611,23 +611,17 @@ const FIELD_HELP = {
     '多头网格追涨（突破上限上移），空头网格追跌（跌破下限下移）。\n' +
     '注意止盈价也会同步上移，所以开启追踪后止盈基本不会触发，两者通常只用其一。',
   assist_enabled:
-    '按 ATR 与风险预算试算网格数量与每格手数。\n' +
+    '按风险预算试算网格数量与每格手数（套利优先：格子尽量密、每格手数尽量小）。\n' +
     '只在配置时算一次，结果需点「应用建议」才写入上方字段；网格运行时不读这组参数。\n' +
     '关闭后已填的试算参数会保留，只是不再校验与试算。',
   assist_node:
-    'ATR 与合约规格从哪台节点的 MT5 终端读取。节点只作行情源，不会写进策略配置；\n' +
-    '换节点可能因券商后缀、历史深度与计价货币不同而算出略有差异的建议值。',
-  assist_timeframe:
-    `试算 ATR 用的 K 线周期，固定取最近 ${BATCH_BAR_PERIOD} 根**已收盘** K 线。\n` +
-    '网格格距要反映区间级别的波动，通常比加仓档位取更大的周期。',
-  assist_atr_mult:
-    '格距 = ATR × 该倍数。倍数越小格子越密、单格利润越薄，满仓手数也越大。\n' +
-    '改动倍数会清空下面的「格距」，让 ATR 重新决定。',
-  assist_spacing:
-    '实际用于推算格数的格距。取行情后会自动填入 ATR × 倍数的结果，可手改；\n' +
-    '非 0 时以此处为准（不再看 ATR 倍数），改完重新试算即按改后的值算格数与手数。',
+    '合约规格从哪台节点的 MT5 终端读取（点值、手数步长等）。节点只作行情源，不会写进策略配置；\n' +
+    '换节点可能因券商后缀、计价货币不同而算出略有差异的建议值。',
   assist_max_loss:
-    '满仓被打到止损时最多可接受的亏损金额（账户货币），用于反推每格手数。\n' +
+    '满仓被打到止损时最多可接受的亏损金额（账户货币），用于反推格数与每格手数。\n' +
+    '算法：先用「区间中点到止损价的距离」算出每格一手的亏损金额，\n' +
+    '再用预算除以它得到能开的最多格数（上限 200 格），\n' +
+    '剩余预算再补到每格手数上——所以预算够时会开到每格 0.02 手甚至更高。\n' +
     '必须先设好本方向的止损价：多头看区间下沿、空头看区间上沿。',
   trailing_max:
     '最多允许平移多少格，0 表示不限。\n' +
@@ -667,9 +661,6 @@ const GRID_SIDE_OPTIONS: Array<{ value: GridSide; label: string }> = [
   { value: 'long', label: '只做多' },
   { value: 'short', label: '只做空' },
 ]
-
-/** 网格试算默认周期，与后端 GRID_ASSIST_TIMEFRAME 一致 */
-const GRID_ASSIST_TIMEFRAME: BatchTimeframe = 'H1'
 
 /**
  * 表单内规则：所有字段都已填充，便于直接 v-model 绑定。
@@ -769,9 +760,6 @@ function cloneRules(rules: StrategyRule[]): EditableRule[] {
       trailing_up: r.trailing_up ?? false,
       trailing_max: r.trailing_max ?? 0,
       assist_enabled: r.assist_enabled ?? false,
-      assist_timeframe: r.assist_timeframe ?? GRID_ASSIST_TIMEFRAME,
-      assist_atr_mult: r.assist_atr_mult ?? 1,
-      assist_spacing: r.assist_spacing ?? 0,
       assist_max_loss: r.assist_max_loss ?? 0,
     }
     return cloned
@@ -1524,17 +1512,8 @@ function validateGrid(r: EditableRule, label: string): string | null {
  * 其中止损价是硬前提：没有止损就无从反推手数，此时给出的任何手数都是假的。
  */
 function validateGridAssist(r: EditableRule, label: string): string | null {
-  if (r.assist_atr_mult < 0) return `${label}：ATR 倍数不能为负`
-  if (r.assist_spacing < 0) return `${label}：格距不能为负`
   if (r.assist_max_loss < 0) return `${label}：最大可接受亏损不能为负`
   if (!r.assist_enabled) return null
-  if (!TIMEFRAME_OPTIONS.includes(r.assist_timeframe)) return `${label}：试算周期非法`
-  if (!(r.assist_atr_mult > 0) && !(r.assist_spacing > 0)) {
-    return `${label}：试算需要 ATR 倍数或手填格距`
-  }
-  if (r.assist_spacing > 0 && r.assist_spacing >= r.price_upper - r.price_lower) {
-    return `${label}：格距需小于区间宽度，否则切不出 2 格`
-  }
   if (!(r.assist_max_loss > 0)) {
     return `${label}：试算需要最大可接受亏损金额（或关闭试算开关）`
   }
@@ -1655,9 +1634,6 @@ function sizingSignature(r: EditableRule): string {
     r.close_on_stop,
     r.trailing_up,
     r.total_lot_limit,
-    r.assist_timeframe,
-    r.assist_atr_mult,
-    r.assist_spacing,
     r.assist_max_loss,
   ].join('|')
 }
@@ -1691,9 +1667,6 @@ async function runSizing(idx: number, r: EditableRule): Promise<void> {
   state.error = ''
   try {
     const data = await hub.fetchGridSizing(state.nodeId, symbol, {
-      timeframe: r.assist_timeframe,
-      atr_mult: r.assist_atr_mult,
-      spacing: r.assist_spacing,
       max_loss: r.assist_max_loss,
       price_lower: r.price_lower,
       price_upper: r.price_upper,
@@ -1706,9 +1679,6 @@ async function runSizing(idx: number, r: EditableRule): Promise<void> {
       total_lot_limit: r.total_lot_limit,
     })
     state.data = data
-    // 把算出的格距回填成可编辑值，用户可直接微调后重算；改 ATR 倍数会把它清回 0，
-    // 否则回填值会一直盖住新的倍数
-    if (data.spacing > 0) r.assist_spacing = data.spacing
     state.signature = sizingSignature(r)
   } catch (e: unknown) {
     const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
@@ -1727,21 +1697,30 @@ function applySizing(idx: number, r: EditableRule): void {
   ElMessage.success('已应用建议值，可继续手动微调')
 }
 
-/** 试算结果概览：一行说清算出了什么 */
+/**
+ * 试算结果概览：两行讲清算出了什么。
+ * 第一行是「算的依据」（均价到止损），第二行是「算出来的网格」。
+ */
 function sizingSummary(data: GridSizingData): string {
-  const parts = [
-    `ATR(${data.timeframe},${BATCH_BAR_PERIOD}) = ${trimNum(data.atr)}`,
-    `格距 ${trimNum(data.spacing)}${data.spacing_source === 'manual' ? '（手改）' : ''}`,
-    `${data.grid_count} 格`,
-  ]
+  const basis = []
+  if (data.avg_stop_distance > 0) basis.push(`均价距止损 ${trimNum(data.avg_stop_distance)}`)
+
+  const grid = [`${data.grid_count} 格`]
+  if (data.grid_count > 0 && data.levels.length > 1) {
+    const actual = (data.levels[data.levels.length - 1] - data.levels[0]) / data.grid_count
+    grid.push(`实际格距 ${trimNum(actual)}`)
+  }
   if (data.lot_per_grid > 0) {
-    parts.push(
+    grid.push(
       `每格 ${trimNum(data.lot_per_grid, 4)} 手`,
       `满仓 ${trimNum(data.worst_lot, 4)} 手`,
       `最坏亏损 ≈ ${trimNum(data.worst_loss, 2)}`,
     )
   }
-  return parts.join(' · ')
+  if (data.budget_grid_count > 0) {
+    grid.push(`按预算最多 ${data.budget_grid_count} 格`)
+  }
+  return [basis.join(' · '), grid.join(' · ')].join('\n')
 }
 
 function validateRules(rules: EditableRule[]): string | null {
@@ -2818,48 +2797,6 @@ function resetRuleToTemplate(idx: number): void {
                     </div>
                     <div class="field">
                       <FormLabel
-                        :field-id="`rule-${idx}-assist-tf`"
-                        text="K线周期"
-                        :help="FIELD_HELP.assist_timeframe"
-                      />
-                      <TagSelect
-                        :id="`rule-${idx}-assist-tf`"
-                        v-model="r.assist_timeframe"
-                        :options="TIMEFRAME_TAGS"
-                        aria-label="K线周期"
-                      />
-                    </div>
-                    <div class="field">
-                      <FormLabel
-                        :field-id="`rule-${idx}-assist-mult`"
-                        text="ATR 倍数"
-                        :help="FIELD_HELP.assist_atr_mult"
-                      />
-                      <input
-                        :id="`rule-${idx}-assist-mult`"
-                        v-model.number="r.assist_atr_mult"
-                        type="number"
-                        min="0"
-                        step="0.1"
-                        @change="r.assist_spacing = 0"
-                      />
-                    </div>
-                    <div class="field">
-                      <FormLabel
-                        :field-id="`rule-${idx}-assist-spacing`"
-                        text="格距"
-                        :help="FIELD_HELP.assist_spacing"
-                      />
-                      <input
-                        :id="`rule-${idx}-assist-spacing`"
-                        v-model.number="r.assist_spacing"
-                        type="number"
-                        min="0"
-                        step="any"
-                      />
-                    </div>
-                    <div class="field">
-                      <FormLabel
                         :field-id="`rule-${idx}-assist-loss`"
                         text="最大可接受亏损"
                         :help="FIELD_HELP.assist_max_loss"
@@ -2897,8 +2834,15 @@ function resetRuleToTemplate(idx: number): void {
                     {{ sizingState(idx).error }}
                   </p>
                   <template v-else-if="sizingState(idx).data">
-                    <p class="rule-hint">
+                    <p class="rule-hint sizing-summary">
                       {{ sizingSummary(sizingState(idx).data!) }}
+                    </p>
+                    <p
+                      v-if="sizingState(idx).data!.over_budget"
+                      class="rule-hint warn"
+                    >
+                      满仓最坏亏损超出预算 {{ trimNum(sizingState(idx).data!.budget_excess, 2) }}；
+                      可减少格数、放宽格距上限或提高可接受亏损
                     </p>
                     <p v-if="sizingStale(idx, r)" class="rule-hint warn">
                       参数已改动，请重新试算后再应用
@@ -3700,6 +3644,12 @@ function resetRuleToTemplate(idx: number): void {
   margin: 10px 0 0;
   font-size: 11px;
   color: var(--muted);
+}
+
+/* 试算概览是两行（依据 + 结果），需要保留换行 */
+.sizing-summary {
+  white-space: pre-line;
+  line-height: 1.7;
 }
 
 .rule-hint.warn {

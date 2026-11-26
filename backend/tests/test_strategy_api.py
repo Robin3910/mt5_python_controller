@@ -842,39 +842,22 @@ def test_normalize_grid_assist_defaults_off():
 
     out = tpl.normalize_rule(_grid_rule())
     assert out["assist_enabled"] is False
-    assert out["assist_timeframe"] == tpl.GRID_ASSIST_TIMEFRAME
-    assert out["assist_atr_mult"] == 1.0
-    assert out["assist_spacing"] == 0.0
     assert out["assist_max_loss"] == 0.0
 
 
-def test_normalize_grid_assist_clamps_and_keeps_values():
+def test_normalize_grid_assist_keeps_max_loss():
     from app import strategy_templates as tpl
 
     out = tpl.normalize_rule(_grid_rule(
-        assist_enabled=1,
-        assist_timeframe="h4",
-        assist_atr_mult=10**6,
-        assist_spacing=-3,
+        assist_enabled=True,
         assist_max_loss=500,
     ))
     assert out["assist_enabled"] is True
-    assert out["assist_timeframe"] == "H4"
-    assert out["assist_atr_mult"] == tpl.GRID_ASSIST_MULT_MAX
-    assert out["assist_spacing"] == 0.0
     assert out["assist_max_loss"] == 500.0
 
-    # 非法周期回落默认；倍数为 0 视为未配
-    out = tpl.normalize_rule(_grid_rule(assist_timeframe="X9", assist_atr_mult=0))
-    assert out["assist_timeframe"] == tpl.GRID_ASSIST_TIMEFRAME
-    assert out["assist_atr_mult"] == 1.0
-
-    # 开关关闭时仍保留已填参数（与 trailing_max 的处理一致，避免误关就丢数据）
-    out = tpl.normalize_rule(_grid_rule(
-        assist_enabled=False, assist_spacing=12.5, assist_max_loss=800,
-    ))
+    # ATR、timeframe、spacing 字段已移除，这里只保留 max_loss 测试
+    out = tpl.normalize_rule(_grid_rule(assist_enabled=False, assist_max_loss=800.0))
     assert out["assist_enabled"] is False
-    assert out["assist_spacing"] == 12.5
     assert out["assist_max_loss"] == 800.0
 
 
@@ -887,8 +870,7 @@ def test_create_strategy_keeps_grid_assist(client):
             "name": "试算网格",
             "symbol": "XAUUSD",
             "rules": [_grid_rule(
-                assist_enabled=True, assist_timeframe="H4",
-                assist_atr_mult=1.5, assist_spacing=8.0, assist_max_loss=600.0,
+                assist_enabled=True, assist_max_loss=600.0,
             )],
         },
         headers=h,
@@ -896,9 +878,6 @@ def test_create_strategy_keeps_grid_assist(client):
     assert r.status_code == 201, r.text
     rule = r.json()["rules"][0]
     assert rule["assist_enabled"] is True
-    assert rule["assist_timeframe"] == "H4"
-    assert rule["assist_atr_mult"] == 1.5
-    assert rule["assist_spacing"] == 8.0
     assert rule["assist_max_loss"] == 600.0
 
 
