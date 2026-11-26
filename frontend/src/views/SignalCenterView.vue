@@ -6,7 +6,11 @@
 //   类型质量对比 + 质量 TOP5）→ 周期质量总览 → 马丁止盈分布 → 信号明细表
 //
 // 旧版的【概览 / 信号流 / 节点命中 / 策略任务 / 时延】**已移除**（原型没有、用户不要）；
-// 旧版的【绩效 / 路由】**保留在 `SignalCenterLegacyView.vue`**，暂时不挂路由，未来可恢复。
+// 旧版的【绩效】**保留在 `SignalCenterLegacyView.vue`**（暂时不挂路由，未来可恢复）。
+//
+// 旧版的【路由】tab（自动路由规则）**已迁到这里**：页头内加一级视图切换
+// （看板 / 路由规则）。路由规则是**配置**，不看时间窗口，所以独立成一个视图，
+// 不与看板的联动筛选混用。
 //
 // 设计与口径：`docs/superpowers/specs/2026-11-13-ai-signal-center-prototype-design.md`
 import { computed, onMounted, ref, watch } from 'vue'
@@ -16,6 +20,7 @@ import AiSignalTable from '@/components/signal-center/ai/AiSignalTable.vue'
 import MartingaleTpDistribution from '@/components/signal-center/ai/MartingaleTpDistribution.vue'
 import QualityOverview from '@/components/signal-center/ai/QualityOverview.vue'
 import TimeframeQuality from '@/components/signal-center/ai/TimeframeQuality.vue'
+import RouteRulePanel from '@/components/signal-center/RouteRulePanel.vue'
 import { useHubStore } from '@/stores/hub'
 import type {
   AiSignalList,
@@ -25,6 +30,10 @@ import type {
 } from '@/api/types'
 
 const hub = useHubStore()
+
+/** 页头内的一级视图切换：看板（统计） / 路由规则（配置） */
+type ViewKey = 'board' | 'routing'
+const view = ref<ViewKey>('board')
 
 /** 顶部窗口选择（原型「当前档位」） */
 const windowKey = ref('30d')
@@ -131,89 +140,137 @@ function onPageSize(size: number): void {
 }
 
 async function refreshAll(): Promise<void> {
+  // 路由规则视图：刷的是规则列表（不是看板数据）
+  if (view.value === 'routing') {
+    await hub.fetchRouteRules()
+    return
+  }
   await loadOverview()
   await loadList()
 }
 
-onMounted(refreshAll)
+onMounted(async () => {
+  // 路由规则面板要靠 hub.groups 回显目标分组名 / 在编辑器里选分组，先把分组拉回来
+  if (!hub.groups.length) await hub.fetchGroups()
+  await refreshAll()
+})
 </script>
 
 <template>
   <div class="pf-page sc-page">
-    <!-- 页头 -->
+    <!-- 页头（含视图切换条） -->
     <AiPageHeader
       :scope-label="scopeLabel"
       :updated-at="updatedAt"
       :loading="loading"
-      :scope="overview?.scope"
+      :scope="view === 'board' ? overview?.scope : undefined"
       @refresh="refreshAll"
-    />
+    >
+      <template #nav>
+        <div class="pf-tabs" style="margin-top: 10px">
+          <button
+            type="button"
+            class="pf-tab"
+            :class="{ active: view === 'board' }"
+            @click="view = 'board'"
+          >
+            看板
+          </button>
+          <button
+            type="button"
+            class="pf-tab"
+            :class="{ active: view === 'routing' }"
+            @click="view = 'routing'"
+          >
+            路由规则
+          </button>
+        </div>
+      </template>
+    </AiPageHeader>
 
-    <!-- 窗口档位 -->
-    <div class="pf-seg" style="margin-top: 12px">
-      <button
-        v-for="w in WINDOWS"
-        :key="w.key"
-        type="button"
-        class="pf-seg-item"
-        :class="{ active: windowKey === w.key }"
-        @click="windowKey = w.key"
-      >
-        {{ w.label }}
-      </button>
+    <!-- 看板视图（统计） -->
+    <div v-if="view === 'board'" class="sc-view">
+      <!-- 窗口档位 -->
+      <div class="pf-seg">
+        <button
+          v-for="w in WINDOWS"
+          :key="w.key"
+          type="button"
+          class="pf-seg-item"
+          :class="{ active: windowKey === w.key }"
+          @click="windowKey = w.key"
+        >
+          {{ w.label }}
+        </button>
+      </div>
+
+      <!-- 四个指标卡 -->
+      <AiKpiRow :kpi="overview?.kpi ?? null" />
+
+      <!-- 信号质量总览（原型复刻：等级环形图 + 区间堆叠条 + 类型对比 + 质量 TOP5） -->
+      <QualityOverview
+        :reliability="overview?.reliability ?? []"
+        :score-buckets="overview?.score_buckets ?? []"
+        :by-type="overview?.by_type ?? []"
+        :top-signals="overview?.top_signals ?? []"
+        :avg-quality="overview?.kpi?.avg_quality ?? 0"
+        :selected-group="linkedGroup"
+        :loading="loading"
+        @select="onTypeSelect"
+      />
+
+      <!-- 周期质量总览 -->
+      <TimeframeQuality
+        :rows="overview?.by_timeframe ?? []"
+        :selected="linkedTimeframe"
+        :loading="loading"
+        @select="onTimeframeSelect"
+      />
+
+      <!-- 马丁止盈分布 -->
+      <MartingaleTpDistribution
+        :dist="tpDist"
+        :selected-level="linkedLevel"
+        :loading="loading"
+        @select="onLevelSelect"
+      />
+
+      <!-- 信号明细 -->
+      <AiSignalTable
+        :list="list"
+        :loading="loadingList"
+        :selected-timeframe="linkedTimeframe"
+        :selected-group="linkedGroup"
+        :selected-level="linkedLevel"
+        :page-size="pageSize"
+        @page="(p) => { page = p; void loadList() }"
+        @page-size="onPageSize"
+        @clear-filter="clearFilters"
+      />
+
+      <!-- 页脚口径 -->
+      <p v-if="list?.scope" class="ai-footer">{{ list.scope }}</p>
     </div>
 
-    <!-- 四个指标卡 -->
-    <AiKpiRow :kpi="overview?.kpi ?? null" />
-
-    <!-- 信号质量总览（原型复刻：等级环形图 + 区间堆叠条 + 类型对比 + 质量 TOP5） -->
-    <QualityOverview
-      :reliability="overview?.reliability ?? []"
-      :score-buckets="overview?.score_buckets ?? []"
-      :by-type="overview?.by_type ?? []"
-      :top-signals="overview?.top_signals ?? []"
-      :avg-quality="overview?.kpi?.avg_quality ?? 0"
-      :selected-group="linkedGroup"
-      :loading="loading"
-      @select="onTypeSelect"
-    />
-
-    <!-- 周期质量总览 -->
-    <TimeframeQuality
-      :rows="overview?.by_timeframe ?? []"
-      :selected="linkedTimeframe"
-      :loading="loading"
-      @select="onTimeframeSelect"
-    />
-
-    <!-- 马丁止盈分布 -->
-    <MartingaleTpDistribution
-      :dist="tpDist"
-      :selected-level="linkedLevel"
-      :loading="loading"
-      @select="onLevelSelect"
-    />
-
-    <!-- 信号明细 -->
-    <AiSignalTable
-      :list="list"
-      :loading="loadingList"
-      :selected-timeframe="linkedTimeframe"
-      :selected-group="linkedGroup"
-      :selected-level="linkedLevel"
-      :page-size="pageSize"
-      @page="(p) => { page = p; void loadList() }"
-      @page-size="onPageSize"
-      @clear-filter="clearFilters"
-    />
-
-    <!-- 页脚口径 -->
-    <p v-if="list?.scope" class="ai-footer">{{ list.scope }}</p>
+    <!-- 路由规则视图（配置）：原样复用旧页【路由】tab 的面板 -->
+    <div v-if="view === 'routing'" class="sc-view">
+      <RouteRulePanel />
+    </div>
   </div>
 </template>
 
 <style scoped>
 .sc-page {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/**
+ * 视图容器：看板 / 路由规则各自成一块。
+ * 必须是 flex + gap —— 否则各张 pf-card 之间会贴在一起（gap 只作用在直接子级上）。
+ */
+.sc-view {
   display: flex;
   flex-direction: column;
   gap: 12px;

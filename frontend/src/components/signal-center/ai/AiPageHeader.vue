@@ -3,6 +3,9 @@
 //
 // 说明条**必须显眼** —— 这个页面的数字口径多（质量分 / 等级 / 止盈档位），
 // 不讲清楚用户会把它们混着读。
+//
+// **具名插槽 `nav`**：给页头内嵌二级导航用（当前是「看板 / 路由规则」视图切换）。
+// 插槽内容由调用方决定显不显示（例如路由规则视图没有质量分口径，就不该显示口径说明条）。
 defineProps<{
   /** 当前档位（窗口） */
   scopeLabel?: string
@@ -48,6 +51,9 @@ function fmtUpdated(ts: number | null | undefined): string {
         刷新
       </button>
     </div>
+
+    <!-- 插槽：页头内的二级导航（视图切换） -->
+    <slot name="nav"></slot>
 
     <!-- 口径说明条：口径多，必须显眼 -->
     <div v-if="scope" class="pf-scope-note info" style="margin-top: 10px">

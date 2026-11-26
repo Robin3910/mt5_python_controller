@@ -2375,9 +2375,10 @@ export interface AiSignalList {
 /**
  * 自动路由规则的过滤条件取值。
  *
- * `signal_types` 既可以是**类型码**（ob / fvg / pdz / …），
- * 也可以是**业务分类**（结构分析 / 突破信号 / …）——
- * 后端在匹配时会展开成它包含的类型码集合（见 `signal_meta.types_in_group`）。
+ * `signal_types` 为**类型码**（ob / fvg / pdz / fibo / …）。
+ * 后端在匹配时仍兼容**业务分类**（结构分析 / 突破信号 / …），
+ * 会展开成它包含的类型码集合（见 `signal_meta.types_in_group`），
+ * 但前端已不再提供分类选项。
  */
 export type SignalRouteRuleType = string
 
