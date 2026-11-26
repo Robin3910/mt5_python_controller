@@ -50,6 +50,8 @@ class NodeOut(BaseModel):
     # 数据归属：实际用户 ID，旧资产修复前可能为空
     owner_user_id: Optional[int] = None
     owner_username: Optional[str] = None
+    # 归属用户最新 KYC 姓名。只在管理员查看节点时填写。
+    owner_real_name: Optional[str] = None
     approval_status: str = "approved"
     requested_by_user_id: Optional[int] = None
     requested_by_username: Optional[str] = None

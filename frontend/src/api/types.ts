@@ -204,7 +204,9 @@ export interface NodeOut {
   /** 数据归属：null = 管理员名下 */
   owner_user_id?: number | null
   owner_username?: string | null
-  /** 面板申请需管理员确认启用并分配给申请人才会开通 */
+  /** 归属用户的 KYC 真实姓名。只有管理员的节点接口会带。 */
+  owner_real_name?: string | null
+  /** 面板申请默认待开通。普通用户申请时归属即为申请人，管理员确认启用后才开通 */
   approval_status?: 'approved' | 'pending'
   requested_by_user_id?: number | null
   requested_by_username?: string | null

@@ -149,6 +149,50 @@ def test_pending_order_resolves_only_its_own_active_task(client):
     assert lookup(1001).status_code == 404
 
 
+def test_pending_order_matches_broker_symbol_suffix(client):
+    """券商把 XAUUSD 报成 XAUUSDm 时，停止挂单仍应命中那一条运行中的子任务。"""
+    from app import group_persist
+    from app.parser import TradingSignal
+    from app.state import state
+
+    node_id = _make_primary_node(client, name="后缀挂单", mt5_login=12002)
+    headers = _admin_headers(client)
+    owner = client.get("/api/me", headers=headers).json()["user_id"]
+
+    async def seed():
+        group = {"group_id": "g_suffix", "name": "后缀策略", "owner_user_id": owner}
+        await state.store.cache_group(group)
+        task_id = await group_persist.create_task(
+            signal_id="signal_suffix", group=group, dispatch_mode="sync",
+            signal=TradingSignal(action="BUY", symbol="XAUUSD", volume=0.01),
+        )
+        sub = await group_persist.create_dispatch(
+            task_id=task_id, signal_id="signal_suffix", group_id="g_suffix",
+            node_id=node_id, symbol="XAUUSD", decided_vol=0.01,
+        )
+        await state.store.save_account(node_id, {"orders": [
+            {"ticket": 2001, "symbol": "XAUUSDm", "magic": sub["magic"]},
+            {"ticket": 2002, "symbol": "XAUUSDm", "magic": str(sub["magic"])},
+            {"ticket": 2003, "symbol": "EURUSD", "magic": sub["magic"]},
+        ]})
+        return task_id
+
+    task_id = client.portal.call(seed)
+
+    def lookup(ticket):
+        return client.get(
+            "/api/trading/pending-task",
+            params={"node_id": node_id, "ticket": ticket},
+            headers=headers,
+        )
+
+    assert lookup(2001).json()["task_id"] == task_id
+    assert lookup(2002).json()["task_id"] == task_id
+    mismatch = lookup(2003)
+    assert mismatch.status_code == 409
+    assert mismatch.json()["detail"] == "无法唯一匹配该挂单的运行中策略任务"
+
+
 def test_quick_trigger_rejects_non_primary(client):
     """非主节点（不存在的 node_id）应被拒绝 → 400 + '主节点不存在或未启用'。"""
     admin_token = _admin_token(client)

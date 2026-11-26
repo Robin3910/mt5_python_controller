@@ -12,7 +12,7 @@ for (const width of [390, 1440]) {
     await page.addInitScript(() => localStorage.setItem('token', 'test-fixture'))
     let socket
     await page.routeWebSocket('**/ws/admin*', ws => { socket = ws })
-    const order = { symbol: 'XAUUSD', type: 'BUY_LIMIT', volume: 0.01, price_open: 3600 }
+    const order = { symbol: 'XAUUSDm', type: 'BUY_LIMIT', volume: 0.01, price_open: 3600 }
     const orders = [
       { ...order, ticket: 10, magic: 81, opening_method: 'grid' },
       { ...order, ticket: 11, magic: 81, opening_method: 'grid' },

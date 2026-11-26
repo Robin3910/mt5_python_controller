@@ -32,9 +32,8 @@ const verified = ref(false)
 const resubmitMode = ref(false)
 /** 驳回原因（提示用） */
 const rejectReason = ref('')
-/** 注册结果：待审核 / 已直接登录 */
+/** 免审核注册已成功，正在跳进控制台 */
 const done = ref(false)
-const pendingApproval = ref(false)
 /** 短信服务未配置（前端直接隐藏注册入口） */
 const unavailable = ref(false)
 /** 阿里云验证码配置（自适应：有风险时才弹滑块） */
@@ -245,12 +244,16 @@ async function submitRegister(): Promise<void> {
       real_name: realName.value.trim(),
       email: email.value.trim(),
     })
-    done.value = true
-    pendingApproval.value = result.pending_approval
-    if (!result.pending_approval) {
-      // 免审核：后端已签发 token，直接进首页
-      router.push({ name: 'home' })
+    if (result.pending_approval) {
+      // 待审核不签发 token，直接回登录页；成功提示由登录页展示
+      registerStore.setSuccessNotice(
+        '注册成功！请等待管理员审核，审核通过后即可用手机号登录。',
+      )
+      await router.push({ name: 'login' })
+      return
     }
+    done.value = true
+    await router.push({ name: 'home' })
   } catch (e: unknown) {
     error.value = mapError(detailOf(e))
   } finally {
@@ -305,11 +308,7 @@ function backToPhone(): void {
 
       <!-- 注册完成 -->
       <div v-else-if="done" class="form-grid">
-        <div v-if="pendingApproval" class="alert alert-ok">
-          注册成功！请等待管理员审核，审核通过后即可用手机号登录。
-        </div>
-        <div v-else class="alert alert-ok">注册成功，正在进入控制台…</div>
-        <RouterLink v-if="pendingApproval" to="/login" class="btn-primary btn-block">返回登录</RouterLink>
+        <div class="alert alert-ok">注册成功，正在进入控制台…</div>
       </div>
       <!-- 第一步：手机号 + 验证码 -->
       <form v-else-if="!verified" class="form-grid" @submit.prevent="verifyCode">

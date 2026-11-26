@@ -35,6 +35,8 @@ const captchaEncrypted = ref('')
 const auth = useAuthStore()
 const registerStore = useRegisterStore()
 const router = useRouter()
+/** 从注册页带回的一次性成功提示 */
+const successNotice = ref(registerStore.takeSuccessNotice())
 
 let cooldownTimer: number | undefined
 
@@ -290,6 +292,8 @@ function switchTab(next: 'password' | 'sms'): void {
           </p>
         </div>
       </div>
+
+      <div v-if="successNotice" class="alert alert-ok login-success-notice">{{ successNotice }}</div>
 
       <!-- 登录方式 Tab（短信未配置时只显示账号密码） -->
       <div v-if="step === 'credentials' && smsEnabled" class="login-tabs" role="tablist">

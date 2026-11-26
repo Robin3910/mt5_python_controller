@@ -59,34 +59,89 @@ def opened(client):
     return admin, uid, h, n["node_id"]
 
 
-@pytest.mark.parametrize("enable_first", [True, False])
-def test_enrollment_requires_assignment_and_admin_intent(client, enable_first):
+def test_customer_enrollment_belongs_to_applicant_until_admin_enables(client):
     admin = auth_headers(client)
     uid, h = user(client, admin)
     n = enrolled(client, h)
     nid = n["node_id"]
-    assert n["owner_user_id"] == client.get("/api/me", headers=admin).json()["user_id"] and n["requested_by_user_id"] == uid
+    assert n["owner_user_id"] == uid and n["requested_by_user_id"] == uid and n["is_primary"] is True
     assert n["approval_status"] == "pending" and n["enabled"] is False and n["legacy_allowed"] is False
     assert enrolled(client, h)["node_id"] == nid
+    second = enrolled(client, h, login=8802)
+    assert second["owner_user_id"] == uid and second["is_primary"] is False and second["enabled"] is False
     assert client.get(f"{PREFIX}/enrollments", headers=h).json()["items"][0]["node_id"] == nid
-    if enable_first:
-        data = enable(client, admin, nid)
-        assert data["admin_enable_requested"] and not data["enabled"] and data["approval_status"] == "pending"
-        assign(client, admin, uid, nid)
-    else:
-        assign(client, admin, uid, nid)
-        assert client.patch(f"/api/nodes/{nid}", headers=h, json={"enabled": True}).status_code == 403
-        assert client.post(f"{PREFIX}/credentials/issue", headers=h, json={"node_id": nid}).status_code == 403
-        enable(client, admin, nid)
-    data = client.get(f"/api/nodes/{nid}", headers=h).json()
-    assert data["enabled"] and data["approval_status"] == "approved"
+    assert client.patch(f"/api/nodes/{nid}", headers=h, json={"enabled": True}).status_code == 403
+    assert client.post(f"{PREFIX}/credentials/issue", headers=h, json={"node_id": nid}).status_code == 403
+    data = enable(client, admin, nid)
+    assert data["enabled"] and data["approval_status"] == "approved" and data["is_primary"] is True
+    still = client.get(f"/api/nodes/{second['node_id']}", headers=h).json()
+    assert still["approval_status"] == "pending" and still["enabled"] is False
 
 
 def test_admin_application_can_approve_without_assignment(client):
     admin = auth_headers(client)
     n = enrolled(client, admin)
+    assert n["is_primary"] is False
     data = enable(client, admin, n["node_id"])
     assert data["owner_user_id"] == client.get("/api/me", headers=admin).json()["user_id"] and data["enabled"] and data["approval_status"] == "approved"
+    assert data["is_primary"] is False
+
+
+def test_startup_moves_admin_held_pending_nodes_to_applicant(client):
+    from app.db import _migrate_pending_node_owners
+
+    admin = auth_headers(client)
+    admin_id = client.get("/api/me", headers=admin).json()["user_id"]
+    uid, h = user(client, admin)
+    bob_id, _ = user(client, admin, "bob")
+    first = enrolled(client, h)
+    enable(client, admin, first["node_id"])
+    pending = enrolled(client, h, login=8802)
+    held = enrolled(client, h, login=8803)
+    approved = client.post("/api/nodes", headers=admin, json={"mt5_login": 8804}).json()
+    sync_engine = create_engine(f"sqlite:///{_DB.as_posix()}")
+    with sync_engine.begin() as conn:
+        conn.execute(text(
+            "UPDATE nodes SET owner_user_id = :admin, is_primary = 0 WHERE node_id = :nid"
+        ), {"admin": admin_id, "nid": pending["node_id"]})
+        conn.execute(text(
+            "UPDATE node_credentials SET owner_user_id = :admin WHERE node_id = :nid"
+        ), {"admin": admin_id, "nid": pending["node_id"]})
+        conn.execute(text(
+            "UPDATE nodes SET owner_user_id = :bob, requested_by_user_id = :alice WHERE node_id = :nid"
+        ), {"bob": bob_id, "alice": uid, "nid": held["node_id"]})
+        conn.execute(text(
+            "UPDATE nodes SET owner_user_id = :admin, requested_by_user_id = :alice WHERE node_id = :nid"
+        ), {"admin": admin_id, "alice": uid, "nid": approved["node_id"]})
+    with sync_engine.begin() as conn:
+        _migrate_pending_node_owners(conn)
+        _migrate_pending_node_owners(conn)
+    with sync_engine.connect() as conn:
+        moved = conn.execute(text(
+            "SELECT owner_user_id, is_primary FROM nodes WHERE node_id = :nid"
+        ), {"nid": pending["node_id"]}).one()
+        cred = conn.execute(text(
+            "SELECT owner_user_id FROM node_credentials WHERE node_id = :nid"
+        ), {"nid": pending["node_id"]}).one()
+        kept = conn.execute(text(
+            "SELECT owner_user_id FROM nodes WHERE node_id = :nid"
+        ), {"nid": held["node_id"]}).one()
+        live = conn.execute(text(
+            "SELECT owner_user_id, approval_status FROM nodes WHERE node_id = :nid"
+        ), {"nid": approved["node_id"]}).one()
+        primary = conn.execute(text(
+            "SELECT is_primary FROM nodes WHERE node_id = :nid"
+        ), {"nid": first["node_id"]}).one()
+        audits = conn.execute(text(
+            "SELECT COUNT(*) FROM audit_log WHERE action = 'assign_pending_node_owner'"
+        )).scalar()
+    sync_engine.dispose()
+    assert int(moved.owner_user_id) == uid and int(moved.is_primary) == 0
+    assert int(cred.owner_user_id) == uid
+    assert int(kept.owner_user_id) == bob_id
+    assert int(live.owner_user_id) == admin_id and live.approval_status == "approved"
+    assert int(primary.is_primary) == 1
+    assert audits == 1
 
 
 def test_enrollment_name_defaults_to_seq_and_login(client):
@@ -256,7 +311,7 @@ def test_pending_prepare_allowed_but_start_and_guard_denied(client):
             "request_id": f"prepare-{action}", "action": action, "node_id": nid}).status_code == 200
     for action in ["start", "restart", "daemon_on"]:
         assert client.post(f"{PREFIX}/actions", headers=h, json={
-            "request_id": f"deny-{action}", "action": action, "node_id": nid}).status_code == 404
+            "request_id": f"deny-{action}", "action": action, "node_id": nid}).status_code == 403
     assert client.post(f"{PREFIX}/daemon-grants", headers=h, json={"node_id": nid}).status_code in (403, 404)
 
 
@@ -363,13 +418,15 @@ def test_approval_and_assignment_roll_back_when_audit_fails(client, monkeypatch)
     monkeypatch.setattr(dashboard_audit, "begin_operation", fail)
     assert client.patch(f"/api/nodes/{nid}", headers=admin, json={"enabled": True}).status_code == 503
     data = client.get(f"/api/nodes/{nid}", headers=admin).json()
-    assert not data["admin_enable_requested"] and not data["enabled"]
+    assert data["owner_user_id"] == uid and not data["admin_enable_requested"] and not data["enabled"]
     monkeypatch.setattr(dashboard_audit, "begin_operation", original)
-    enable(client, admin, nid)
+    assert enable(client, admin, nid)["approval_status"] == "approved"
+    pending = enrolled(client, admin, login=8802)
     monkeypatch.setattr(dashboard_audit, "begin_operation", fail)
-    assert client.put(f"/api/users/{uid}/nodes", headers=admin, json={"node_ids": [nid]}).status_code == 503
-    data = client.get(f"/api/nodes/{nid}", headers=admin).json()
-    assert data["owner_user_id"] == client.get("/api/me", headers=admin).json()["user_id"] and data["approval_status"] == "pending" and not data["enabled"]
+    assert client.put(f"/api/users/{uid}/nodes", headers=admin, json={"node_ids": [pending["node_id"]]}).status_code == 503
+    data = client.get(f"/api/nodes/{pending['node_id']}", headers=admin).json()
+    admin_id = client.get("/api/me", headers=admin).json()["user_id"]
+    assert data["owner_user_id"] == admin_id and data["approval_status"] == "pending" and not data["enabled"]
 
 
 def test_daemon_history_replay_after_transfer_keeps_original_actor(client):

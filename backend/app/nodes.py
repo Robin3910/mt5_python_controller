@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
-from . import node_deletion, node_service, permissions, persist, rbac_service, risk_control
+from . import node_deletion, node_service, permissions, persist, rbac_service, risk_control, user_review_service
 from .ai_channel_models import NodeDeleteRequest
 from .connections import manager
 from .deps import (
@@ -27,6 +27,17 @@ from .permissions import MENU_HOME, MENU_NODES, Principal
 from .redis_store import RedisStore
 
 router = APIRouter(prefix="/api/nodes", tags=["nodes"])
+
+
+async def _admin_real_names(p: Principal, nodes: list[dict]) -> dict[int, str]:
+    """管理员看节点时带上归属用户的 KYC 姓名；普通用户不查、不返回。"""
+    if not p.is_admin:
+        return {}
+    ids = {
+        owner for n in nodes
+        if (owner := permissions.normalize_owner(n.get("owner_user_id"))) is not None
+    }
+    return await user_review_service.latest_real_names(ids)
 
 
 def _node_audit_snapshot(d: dict | None) -> dict | None:
@@ -73,6 +84,7 @@ async def _to_node_out(
     store: RedisStore, d: dict, owner_names: dict[int, str] | None = None,
     credential: NodeCredential | None = None,
     acct: dict | None = None,
+    real_names: dict[int, str] | None = None,
 ) -> NodeOut:
     """把缓存里的节点 dict 组装成对外的 NodeOut（合并在线状态与账户登录信息）。
 
@@ -101,6 +113,7 @@ async def _to_node_out(
         last_seen=acct.get("updated_at"),
         owner_user_id=owner,
         owner_username=(owner_names or {}).get(owner) if owner is not None else None,
+        owner_real_name=(real_names or {}).get(owner) if owner is not None else None,
         approval_status=d.get("approval_status", "approved"),
         requested_by_user_id=d.get("requested_by_user_id"),
         requested_by_username=(owner_names or {}).get(d.get("requested_by_user_id")),
@@ -124,6 +137,7 @@ async def list_nodes(
         nodes = [n for n in nodes if _node_matches_search(n, term)]
     nodes.sort(key=lambda n: n.get("created_at", 0))
     names = await rbac_service.owner_names_for(p)
+    real_names = await _admin_real_names(p, nodes)
     # 凭证与账户快照都批量取：逐节点串行查库时，35 个节点会把接口拖到数秒。
     creds = await _credentials_by_node([n["node_id"] for n in nodes])
     # return_exceptions=True：单个节点的 Redis 取账户失败（如瞬时连接池打满）
@@ -137,7 +151,7 @@ async def list_nodes(
         for a in raw_accounts
     ]
     return [
-        await _to_node_out(store, n, names, creds.get(n["node_id"]), acct=acct)
+        await _to_node_out(store, n, names, creds.get(n["node_id"]), acct=acct, real_names=real_names)
         for n, acct in zip(nodes, accounts)
     ]
 
@@ -176,7 +190,10 @@ async def get_node(
     p: Principal = Depends(get_principal),
 ):
     d = await owned_node_or_404(store, p, node_id)
-    return await _to_node_out(store, d, await rbac_service.owner_names_for(p))
+    return await _to_node_out(
+        store, d, await rbac_service.owner_names_for(p),
+        real_names=await _admin_real_names(p, [d]),
+    )
 
 
 @router.get("/{node_id}/dispatches", response_model=PaginatedNodeDispatches)
@@ -224,7 +241,10 @@ async def update_node(
         client_ip(request),
         category="node", before=before, after=_node_audit_snapshot(d),
     )
-    return await _to_node_out(store, d, await rbac_service.owner_names_for(p))
+    return await _to_node_out(
+        store, d, await rbac_service.owner_names_for(p),
+        real_names=await _admin_real_names(p, [d]),
+    )
 
 
 @router.get("/{node_id}/deletion-preview")
@@ -303,7 +323,10 @@ async def set_primary_node(
         )
     if not d:
         raise HTTPException(status_code=404, detail="node not found")
-    return await _to_node_out(store, d, await rbac_service.owner_names_for(p))
+    return await _to_node_out(
+        store, d, await rbac_service.owner_names_for(p),
+        real_names=await _admin_real_names(p, [d]),
+    )
 
 
 @router.get("/{node_id}/followings")

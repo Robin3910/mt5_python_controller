@@ -142,6 +142,30 @@ async def get_review(review_id: int) -> Optional[UserReview]:
         return await s.get(UserReview, int(review_id))
 
 
+async def latest_real_names(user_ids: set[int]) -> dict[int, str]:
+    """这些用户各自最新一张带姓名的审核单。id 升序覆盖，留下最后一次姓名。"""
+    ids = {int(uid) for uid in user_ids if uid}
+    if not ids:
+        return {}
+    async with SessionLocal() as s:
+        rows = (
+            await s.execute(
+                select(UserReview.user_id, UserReview.real_name)
+                .where(
+                    UserReview.user_id.in_(sorted(ids)),
+                    UserReview.real_name.is_not(None),
+                )
+                .order_by(UserReview.id.asc())
+            )
+        ).all()
+    out: dict[int, str] = {}
+    for uid, name in rows:
+        text = str(name or "").strip()
+        if text:
+            out[int(uid)] = text
+    return out
+
+
 async def latest_review(user_id: int) -> Optional[UserReview]:
     """该用户最新的一张审核单。
 

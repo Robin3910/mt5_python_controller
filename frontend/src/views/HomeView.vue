@@ -241,23 +241,29 @@ const filteredNodes = computed(() => {
 })
 
 const groupedNodes = computed(() => {
-  const map = new Map<string, NodeOut[]>()
+  const map = new Map<string, { name: string; nodes: NodeOut[] }>()
   for (const n of filteredNodes.value) {
-    const name = (n.owner_username || '').trim() || '未分配'
-    const bucket = map.get(name)
-    if (bucket) bucket.push(n)
-    else map.set(name, [n])
+    const key = n.owner_user_id == null ? 'none' : String(n.owner_user_id)
+    // 普通用户不显示登录名。管理员显示 KYC 姓名，没有姓名时仍用登录名区分归属。
+    const name = auth.isAdmin
+      ? ((n.owner_real_name || '').trim() || (n.owner_username || '').trim() || '未分配')
+      : ''
+    const bucket = map.get(key)
+    if (bucket) bucket.nodes.push(n)
+    else map.set(key, { name, nodes: [n] })
   }
-  return [...map.entries()].map(([name, nodes]) => ({
-    key: name,
-    name,
-    initial: name.slice(0, 1),
-    // 分组后稳定排序，保留组间顺序与同类节点的相对顺序。
-    nodes: [...nodes].sort(primaryFirst),
-    online: nodes.filter((n) => statusOf(n) === 'online').length,
-    balance: nodes.reduce((sum, n) => sum + (acct(n.node_id)?.balance || 0), 0),
-    profit: nodes.reduce((sum, n) => sum + nodeProfit(acct(n.node_id)?.positions), 0),
-  }))
+  return [...map.entries()].map(([key, group]) => {
+    const nodes = [...group.nodes].sort(primaryFirst)
+    return {
+      key,
+      name: group.name,
+      initial: group.name.slice(0, 1),
+      nodes,
+      online: nodes.filter((n) => statusOf(n) === 'online').length,
+      balance: nodes.reduce((sum, n) => sum + (acct(n.node_id)?.balance || 0), 0),
+      profit: nodes.reduce((sum, n) => sum + nodeProfit(acct(n.node_id)?.positions), 0),
+    }
+  })
 })
 
 
@@ -444,9 +450,9 @@ function reportCancelPending(res: CancelPendingResult): void {
         <div v-if="groupedNodes.length" class="home-groups">
           <section v-for="g in groupedNodes" :key="g.key" class="home-group">
             <header class="home-group-head">
-              <span class="home-avatar" aria-hidden="true">{{ g.initial }}</span>
+              <span v-if="g.name" class="home-avatar" aria-hidden="true">{{ g.initial }}</span>
               <div class="home-group-text">
-                <strong>{{ g.name }}</strong>
+                <strong v-if="g.name">{{ g.name }}</strong>
                 <p>{{ g.nodes.length }} 个节点 · {{ g.online }}/{{ g.nodes.length }} 在线 · 余额 {{ fmtMoney(g.balance) }}</p>
               </div>
               <span class="home-group-pnl" :class="g.profit >= 0 ? 'is-up' : 'is-down'">{{ fmtSigned(g.profit) }}</span>

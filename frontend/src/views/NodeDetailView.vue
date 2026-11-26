@@ -28,7 +28,7 @@ import type {
 } from '@/api/types'
 import { parseNodeDispatchFilters } from '@/utils/filterRules'
 import { confirmAction } from '@/utils/confirm'
-import { isPendingNode, nodeApprovalHint, nodeEnableIntent, nodeEnableLabel } from '@/utils/nodeApproval'
+import { isPendingNode, nodeApprovalHint, nodeEnableConfirmHint, nodeEnableIntent, nodeEnableLabel } from '@/utils/nodeApproval'
 
 const MONITOR_MODE_TAGS: TagOption<RiskMonitorMode>[] = [
   { value: 'loop', label: '循环' },
@@ -619,7 +619,7 @@ async function toggleEnabled(): Promise<void> {
   if (isPendingNode(node.value) && !auth.isAdmin) return
   const current = nodeEnableIntent(node.value)
   const next = current ? '禁用' : '启用'
-  const hint = isPendingNode(node.value) ? '\n\n确认启用与分配给申请人两项齐全后才会开通；操作顺序不限。' : ''
+  const hint = isPendingNode(node.value) ? `\n\n${nodeEnableConfirmHint(node.value)}` : ''
   if (!(await confirmAction(`确认${next}节点「${node.value.name}」？${hint}`, `确认${next}`))) return
   await hub.updateNode(id.value, { enabled: !current })
 }

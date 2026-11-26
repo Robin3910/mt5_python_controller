@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from . import (
     group_persist,
+    group_rules,
     group_service,
     permissions,
     persist,
@@ -206,6 +207,15 @@ def _quote_mid(account: dict, symbol: str) -> float:
     return 0.0
 
 
+def _as_magic(value: object) -> Optional[int]:
+    """魔术号统一成 int。快照里偶发字符串，和子任务行的 int 直接 == 会对不上。"""
+    try:
+        magic = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return magic or None
+
+
 async def _ensure_member(store: RedisStore, group: dict, node_id: str) -> None:
     """保证主节点是分组成员；缺则补。"""
     members = group.get("members") or []
@@ -229,10 +239,15 @@ async def pending_task(
         raise HTTPException(404, detail=_PRIMARY_NOT_FOUND)
     account = await store.get_account(node_id) or {}
     order = next((o for o in account.get("orders") or [] if o.get("ticket") == ticket), None)
-    if not order or not order.get("magic"):
+    order_magic = _as_magic(order.get("magic") if order else None)
+    if not order or order_magic is None:
         raise HTTPException(404, detail="该挂单已离场或没有策略魔术号")
-    matches = [s for s in await group_persist.active_subtasks_for_node(node_id) if s["magic"] == order["magic"]]
-    if len(matches) != 1 or matches[0]["symbol"] != order.get("symbol"):
+    matches = [
+        s for s in await group_persist.active_subtasks_for_node(node_id)
+        if _as_magic(s.get("magic")) == order_magic
+    ]
+    # 节点下单会把 XAUUSD 解析成券商名 XAUUSDm，子任务仍记信号品种。
+    if len(matches) != 1 or not group_rules.symbol_match(matches[0].get("symbol"), order.get("symbol")):
         raise HTTPException(409, detail="无法唯一匹配该挂单的运行中策略任务")
     sub = matches[0]
     group = await store.get_group(sub["group_id"])

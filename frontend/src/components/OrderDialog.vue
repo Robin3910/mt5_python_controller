@@ -249,7 +249,7 @@ function applyPresetToForm(): void {
   if (!p) return
   if (isGrid.value) {
     gridParams.grid_mode = p.grid_mode
-    gridParams.max_allow_loss = p.max_allow_loss
+    gridParams.max_allow_loss = blankNum(p.max_allow_loss)
     gridParams.trailing_up = p.trailing_up
   } else {
     riskParams.risk_amount = p.risk_amount
@@ -550,17 +550,24 @@ const rrNotice = computed<RrNotice | null>(() => {
  *
  * 因此这里只保留一个 stop_price（客户填的止损价），后端需要的
  * stop_lower / stop_upper 由 derivedGridSide 映射得到。
+ *
+ * 价格与以损定量的输入初值是空字符串。0 和未填都显示成空，已保存的正数照常回填。
  */
+function blankNum(v: number | null | undefined): number | "" {
+  const n = Number(v)
+  return n > 0 ? n : ""
+}
+
 const gridParams = reactive({
-  price_lower: 0 as number | null,      // 区间下限
-  price_upper: 0 as number | null,      // 区间上限
+  price_lower: "" as number | "",       // 区间下限
+  price_upper: "" as number | "",       // 区间上限
   grid_mode: 'arithmetic' as GridMode,  // 网格模式
   trigger_price: 0 as number | null,    // 触发价（默认 0 = 立即启动）
-  stop_price: 0 as number | null,       // 止损价（客户填写；方向由此推导）
+  stop_price: "" as number | "",        // 止损价（客户填写；方向由此推导）
   take_profit: 0 as number | null,      // 止盈价（界面上不展示，沿用存量规则的值）
   trailing_up: false,                  // 向上追踪（默认关闭）
   trailing_max: 0,                      // 最大平移格数（0=不限）
-  max_allow_loss: 0,                     // 最大可接受亏损
+  max_allow_loss: "" as number | "",    // 最大可接受亏损
 })
 
 /**
@@ -757,23 +764,22 @@ async function loadGroupAndStrategy(): Promise<void> {
           (r: StrategyRule) => r.type === 4 && r.status === 1,
         )
         if (gridRule) {
-          gridParams.price_lower = gridRule.price_lower ?? 0
-          gridParams.price_upper = gridRule.price_upper ?? 0
+          gridParams.price_lower = blankNum(gridRule.price_lower)
+          gridParams.price_upper = blankNum(gridRule.price_upper)
           gridParams.grid_mode = gridRule.grid_mode ?? 'arithmetic'
           gridParams.trigger_price = gridRule.trigger_price ?? 0
           // 存量规则的 stop_lower / stop_upper 按方向还原成「止损价 + 止盈价」：
           // 只做多 → stop_lower 是止损、stop_upper 是止盈；只做空 → 反之。
-          gridParams.stop_price =
-            gridRule.grid_side === 'short'
-              ? gridRule.stop_upper ?? 0
-              : gridRule.stop_lower ?? 0
+          gridParams.stop_price = blankNum(
+            gridRule.grid_side === 'short' ? gridRule.stop_upper : gridRule.stop_lower,
+          )
           gridParams.take_profit =
             gridRule.grid_side === 'short'
               ? gridRule.stop_lower ?? 0
               : gridRule.stop_upper ?? 0
           gridParams.trailing_up = gridRule.trailing_up ?? false
           gridParams.trailing_max = gridRule.trailing_max ?? 0
-          gridParams.max_allow_loss = gridRule.assist_max_loss ?? 0
+          gridParams.max_allow_loss = blankNum(gridRule.assist_max_loss)
         }
       } else {
         // 没有可复用策略（首次开仓 / 模版错配）：回落到模版默认值。
@@ -812,17 +818,18 @@ function applyTemplateDefaults(): void {
     const tpl3 = templates.value.find((t) => t.template_id === 'tpl_3')
     const gRule = (tpl3?.rules || []).find((r) => r.type === 4)
     if (gRule) {
-      gridParams.price_lower = gRule.price_lower ?? 0
-      gridParams.price_upper = gRule.price_upper ?? 0
+      gridParams.price_lower = blankNum(gRule.price_lower)
+      gridParams.price_upper = blankNum(gRule.price_upper)
       gridParams.grid_mode = gRule.grid_mode ?? 'arithmetic'
       gridParams.trigger_price = gRule.trigger_price ?? 0
-      gridParams.stop_price =
-        gRule.grid_side === 'short' ? gRule.stop_upper ?? 0 : gRule.stop_lower ?? 0
+      gridParams.stop_price = blankNum(
+        gRule.grid_side === 'short' ? gRule.stop_upper : gRule.stop_lower,
+      )
       gridParams.take_profit =
         gRule.grid_side === 'short' ? gRule.stop_lower ?? 0 : gRule.stop_upper ?? 0
       gridParams.trailing_up = gRule.trailing_up ?? false
       gridParams.trailing_max = gRule.trailing_max ?? 0
-      gridParams.max_allow_loss = gRule.assist_max_loss ?? 0
+      gridParams.max_allow_loss = blankNum(gRule.assist_max_loss)
     }
   }
 }
@@ -985,8 +992,8 @@ function buildRiskStrategyPayload(): StrategyRule[] | null {
 
 /** 网格策略参数校验 */
 function validateGridParams(): string | null {
-  const pl = gridParams.price_lower ?? 0
-  const pu = gridParams.price_upper ?? 0
+  const pl = Number(gridParams.price_lower) || 0
+  const pu = Number(gridParams.price_upper) || 0
   if (!(pl > 0)) return '区间下限需大于 0'
   if (!(pu > pl)) return '区间上限须大于下限'
   if (!GRID_MODE_OPTIONS.some((o) => o.value === gridParams.grid_mode)) return '网格模式非法'
@@ -997,7 +1004,7 @@ function validateGridParams(): string | null {
     return '止损价须在价格区间之外：低于区间下限为只做多，高于区间上限为只做空'
   }
   // 每格手数由自动试算按最大亏损反推，所以最大亏损必须填
-  if (!(gridParams.max_allow_loss > 0)) return '以损定量需大于 0'
+  if (!(Number(gridParams.max_allow_loss) > 0)) return '以损定量需大于 0'
   return null
 }
 
@@ -1021,8 +1028,8 @@ function buildGridStrategyPayload(): StrategyRule[] | null {
       type: 4,
       status: 1,
       action: side === 'short' ? 'SELL' : 'BUY',
-      price_lower: gridParams.price_lower ?? 0,
-      price_upper: gridParams.price_upper ?? 0,
+      price_lower: Number(gridParams.price_lower) || 0,
+      price_upper: Number(gridParams.price_upper) || 0,
       grid_count: sizing.grid_count,
       grid_mode: gridParams.grid_mode,
       grid_side: side,
@@ -1034,7 +1041,7 @@ function buildGridStrategyPayload(): StrategyRule[] | null {
       trailing_up: gridParams.trailing_up,
       trailing_max: gridParams.trailing_max,
       assist_enabled: false,
-      assist_max_loss: gridParams.max_allow_loss > 0 ? gridParams.max_allow_loss : 0,
+      assist_max_loss: Number(gridParams.max_allow_loss) || 0,
     },
   ]
 }
@@ -1117,7 +1124,7 @@ async function savePresetOnly(): Promise<void> {
   const st = strategyRef.value as OrderPresetStrategyType
   const sym = (localForm.symbol || '').trim().toUpperCase()
   if (isGrid.value) {
-    if (!(gridParams.max_allow_loss > 0)) {
+    if (!(Number(gridParams.max_allow_loss) > 0)) {
       lastStrategyError.value = '以损定量需大于 0'
       return
     }
@@ -1138,7 +1145,7 @@ async function savePresetOnly(): Promise<void> {
     }
     if (isGrid.value) {
       payload.grid_mode = gridParams.grid_mode
-      payload.max_allow_loss = gridParams.max_allow_loss
+      payload.max_allow_loss = Number(gridParams.max_allow_loss)
       payload.trailing_up = gridParams.trailing_up
     } else {
       payload.risk_amount = riskParams.risk_amount
@@ -1832,7 +1839,7 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
             <div class="od-row-label">挂单价格<span class="od-req">必选</span></div>
             <div class="od-row-sub">限价单触发开仓的委托价格</div>
           </div>
-          <div class="od-row-control od-input-affix" :class="{ need: !localForm.entry_price }">
+          <div class="od-row-control od-input-affix req" :class="{ need: !localForm.entry_price }">
             <input v-model.number="localForm.entry_price" class="od-input" type="number" step="0.0001" min="0" placeholder="如 4150.00" />
           </div>
         </div>
@@ -1841,7 +1848,7 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
             <div class="od-row-label">止损价格<span class="od-req">必选</span></div>
             <div class="od-row-sub">开仓后挂出的止损价格</div>
           </div>
-          <div class="od-row-control od-input-affix" :class="{ need: !localForm.sl }">
+          <div class="od-row-control od-input-affix req" :class="{ need: !localForm.sl }">
             <input v-model.number="localForm.sl" class="od-input" type="number" step="0.0001" min="0" placeholder="如 4140.00" />
           </div>
         </div>
@@ -1918,7 +1925,7 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
             <div class="od-row-label">以损定量<span class="od-req">必选</span></div>
             <div class="od-row-sub">满仓打到止损的最多亏损，据此算格子数量与每格手数</div>
           </div>
-          <div class="od-row-control od-input-affix" :class="{ need: !(Number(gridParams.max_allow_loss) > 0) }">
+          <div class="od-row-control od-input-affix req" :class="{ need: !(Number(gridParams.max_allow_loss) > 0) }">
             <input v-model.number="gridParams.max_allow_loss" class="od-input" type="number" step="10" min="0" placeholder="如 100" />
             <span class="od-affix">USD</span>
           </div>
@@ -1931,7 +1938,7 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
               {{ derivedGridSide === 'short' ? '网格的最高价位（涨到此处开空）' : '网格的最高价位（涨到此处卖出兑现）' }}
             </div>
           </div>
-          <div class="od-row-control od-input-affix" :class="{ need: !(Number(gridParams.price_upper) > 0) }">
+          <div class="od-row-control od-input-affix req" :class="{ need: !(Number(gridParams.price_upper) > 0) }">
             <input v-model.number="gridParams.price_upper" class="od-input" type="number" step="0.0001" min="0" placeholder="如 3300.00" />
             <span class="od-affix">USD</span>
           </div>
@@ -1944,7 +1951,7 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
               {{ derivedGridSide === 'short' ? '网格的最低价位（跌到此处平空兑现）' : '网格的最低价位（跌到此处开始买入）' }}
             </div>
           </div>
-          <div class="od-row-control od-input-affix" :class="{ need: !(Number(gridParams.price_lower) > 0) }">
+          <div class="od-row-control od-input-affix req" :class="{ need: !(Number(gridParams.price_lower) > 0) }">
             <input v-model.number="gridParams.price_lower" class="od-input" type="number" step="0.0001" min="0" placeholder="如 3000.00" />
             <span class="od-affix">USD</span>
           </div>
@@ -1957,7 +1964,7 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
               填在价格区间下方 → 只做多；填在价格区间上方 → 只做空
             </div>
           </div>
-          <div class="od-row-control od-input-affix" :class="{ need: !(Number(gridParams.stop_price) > 0) }">
+          <div class="od-row-control od-input-affix req" :class="{ need: !(Number(gridParams.stop_price) > 0) }">
             <input v-model.number="gridParams.stop_price" class="od-input" type="number" step="0.0001" min="0" placeholder="如 2950.00" />
             <span class="od-affix">USD</span>
           </div>
@@ -2472,6 +2479,8 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
   transition: border-color 0.15s;
 }
 .od-input-affix:focus-within { border-color: #2563EB; }
+.od-input-affix.req { border-color: #F59E0B; }
+.od-input-affix.req:focus-within { border-color: #FBBF24; }
 .od-input-affix.need {
   border-color: #F59E0B;
   background: #1A1505;
