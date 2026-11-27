@@ -17,6 +17,22 @@
 | `directions` | 所有方向都收 | BUY / SELL |
 | `group_ids` | **无效规则** | 没有目标分组的规则没有意义，保存时直接拒 |
 
+## 两种条件形态
+
+扁平的 `signal_types` × `timeframes` 是**笛卡尔积** —— 两个条件各自独立成立，
+表达不了「M1 只收 OB，M5 只收 FVG」。所以另有一张**映射形态**：
+
+    `type_by_timeframe` = `{周期码: [类型码, ...]}`（非空时扁平条件不参与匹配）
+
+| map | 含义 |
+|---|---|
+| `{}` | 走扁平形态（存量规则） |
+| `{"M1": ["ob"]}` | 只收 M1 的 OB，其它周期一律不收（**白名单**） |
+| `{"M1": ["ob"], "M5": []}` | M1 只收 OB；M5 不限类型；其它周期不收 |
+
+**空数组 ≠ 没有这个 key**：map 里**没有**某周期 = 该周期不收；
+map 里**有**某周期但值是 `[]` = 该周期**不限类型**。
+
 ## 命中即占位
 
 多条规则可能命中同一个分组（例如 R1「类型=ob → g1,g2」与 R2「周期=M15 → g1」，
@@ -130,6 +146,30 @@ def normalize_timeframes(value: Any) -> list[str]:
     return out
 
 
+def normalize_type_by_timeframe(value: Any) -> dict[str, list[str]]:
+    """周期 → 类型 白名单映射归一。
+
+    返回 `{周期码: [类型码, ...]}`：
+    - key：走 `normalize_timeframe`，认不出（None）→ **整个 key 丢弃**
+      （留着一个永远匹配不上的周期，用户会以为配好了但一条都没命中）；
+    - value：类型码小写去重保序；非列表按单元素列表处理；
+    - 非 dict 入参 → 空 dict（= 走旧的扁平条件）。
+
+    **空数组是有意义的**：它表示「该周期不限类型」（收该周期全部类型），
+    与「map 里没有这个周期」（该周期不收）是两回事，不能混为一谈。
+    """
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, list[str]] = {}
+    for raw_tf, raw_types in value.items():
+        tf = signal_meta.normalize_timeframe(raw_tf)
+        if not tf:
+            continue
+        types = normalize_signal_types(raw_types)
+        out[tf] = types
+    return out
+
+
 def normalize_directions(value: Any) -> list[str]:
     """方向条件归一：统一大写，只保留 BUY / SELL。"""
     out: list[str] = []
@@ -180,6 +220,12 @@ def validate_rule_payload(payload: dict) -> dict:
     if not group_ids:
         raise RuleInputError("请至少选择一个目标分组")
 
+    # 周期 → 类型 映射（新形态）。非空时**扁平的类型 / 周期条件不再参与匹配**，
+    # 这里主动清空 —— 两个语义同时存在会让用户困惑「为什么 M5 还是收 OB」。
+    type_map = normalize_type_by_timeframe(payload.get("type_by_timeframe"))
+    signal_types = [] if type_map else normalize_signal_types(payload.get("signal_types"))
+    timeframes = [] if type_map else normalize_timeframes(payload.get("timeframes"))
+
     priority = payload.get("priority")
     try:
         priority = int(priority) if priority is not None else 100
@@ -189,8 +235,9 @@ def validate_rule_payload(payload: dict) -> dict:
     return {
         "name": name,
         "enabled": bool(payload.get("enabled", True)),
-        "signal_types": normalize_signal_types(payload.get("signal_types")),
-        "timeframes": normalize_timeframes(payload.get("timeframes")),
+        "signal_types": signal_types,
+        "timeframes": timeframes,
+        "type_by_timeframe": type_map,
         "directions": normalize_directions(payload.get("directions")),
         "group_ids": group_ids,
         # 参数覆盖：当前未启用，但结构预留（见 ORM 的注释）
@@ -216,6 +263,7 @@ def rule_row_to_dict(row: SignalRouteRule) -> dict:
         "enabled": bool(row.enabled),
         "signal_types": _lst(row.signal_types),
         "timeframes": _lst(row.timeframes),
+        "type_by_timeframe": dict(row.type_by_timeframe or {}),
         "directions": _lst(row.directions),
         "group_ids": _lst(row.group_ids),
         "volume": row.volume,
@@ -282,6 +330,7 @@ async def create_rule(payload: dict, *, owner_user_id: Optional[int] = None) -> 
             enabled=data["enabled"],
             signal_types=data["signal_types"] or None,
             timeframes=data["timeframes"] or None,
+            type_by_timeframe=data["type_by_timeframe"] or None,
             directions=data["directions"] or None,
             group_ids=data["group_ids"],
             volume=data["volume"],
@@ -317,6 +366,7 @@ async def update_rule(rule_id: str, payload: dict) -> Optional[dict]:
         row.enabled = data["enabled"]
         row.signal_types = data["signal_types"] or None
         row.timeframes = data["timeframes"] or None
+        row.type_by_timeframe = data["type_by_timeframe"] or None
         row.directions = data["directions"] or None
         row.group_ids = data["group_ids"]
         row.volume = data["volume"]
@@ -366,6 +416,30 @@ def _expand_types(codes: list[str]) -> set[str]:
     return out
 
 
+def _match_type_map(type_map: dict[str, list[str]], signal: dict) -> bool:
+    """周期 → 类型 白名单映射的匹配。
+
+    **白名单语义**：
+    - map 里**没有**这个周期 → 该周期**不收**（不是「不限类型」）；
+    - map 里**有**这个周期但值是空数组 → 该周期**不限类型**（收该周期的全部类型）；
+    - 值非空 → 信号类型必须落在其中（类型缺失 = 不命中）。
+
+    这两种「没有类型限制」的区别是白名单的核心，混淆会让用户配出反直觉的规则。
+    """
+    tf = signal_meta.normalize_timeframe(signal.get("timeframe"))
+    if not tf or tf not in type_map:
+        # 周期不在白名单里 → 不命中（含信号周期缺失的情况）
+        return False
+    allowed = type_map.get(tf) or []
+    if not allowed:
+        # 该周期不限类型 → 类型条件不再收窄
+        return True
+    st = signal_meta.normalize_signal_type(signal.get("signal_type"))
+    # 信号类型缺失（未标注）→ 不命中：规则明确限定了类型，
+    # 而这条信号的类型是「没有」而不是「匹配」。
+    return bool(st) and st in _expand_types(allowed)
+
+
 def rule_matches(rule: dict, signal: dict) -> bool:
     """规则是否命中这条信号。
 
@@ -373,20 +447,29 @@ def rule_matches(rule: dict, signal: dict) -> bool:
     `{"signal_type": ..., "timeframe": ..., "action": ...}`。
 
     空条件 = 不限制（与 template_ids / group_ids 的语义一致）。
-    """
-    types = rule.get("signal_types") or []
-    if types:
-        st = signal_meta.normalize_signal_type(signal.get("signal_type"))
-        # 信号类型缺失（未标注）→ 不命中：规则明确限定了类型，
-        # 而这条信号的类型是「没有」而不是「匹配」。
-        if not st or st not in _expand_types(types):
-            return False
 
-    tfs = rule.get("timeframes") or []
-    if tfs:
-        tf = signal_meta.normalize_timeframe(signal.get("timeframe"))
-        if not tf or tf not in tfs:
+    **两种条件形态**：`type_by_timeframe` 非空时走映射形态
+    （周期 → 类型白名单），此时扁平的 `signal_types` / `timeframes`
+    不再参与匹配；否则走旧的扁平形态。
+    """
+    type_map = rule.get("type_by_timeframe") or {}
+    if type_map:
+        if not _match_type_map(type_map, signal):
             return False
+    else:
+        types = rule.get("signal_types") or []
+        if types:
+            st = signal_meta.normalize_signal_type(signal.get("signal_type"))
+            # 信号类型缺失（未标注）→ 不命中：规则明确限定了类型，
+            # 而这条信号的类型是「没有」而不是「匹配」。
+            if not st or st not in _expand_types(types):
+                return False
+
+        tfs = rule.get("timeframes") or []
+        if tfs:
+            tf = signal_meta.normalize_timeframe(signal.get("timeframe"))
+            if not tf or tf not in tfs:
+                return False
 
     dirs = rule.get("directions") or []
     if dirs:

@@ -2384,6 +2384,20 @@ export interface AiSignalList {
  */
 export type SignalRouteRuleType = string
 
+/**
+ * 周期 → 类型 **白名单映射**（新形态）。
+ *
+ * - key：周期码（M1 / M5 / H1 / …）
+ * - value：该周期允许的类型码数组
+ *
+ * **两种「没有类型限制」的区别是白名单的核心**：
+ * - map 里**没有**某个周期 → 该周期**不收**
+ * - map 里**有**某个周期但值是 `[]` → 该周期**不限类型**（收该周期全部类型）
+ *
+ * map 为空对象时走旧的扁平条件（`signal_types` / `timeframes`）。
+ */
+export type SignalRouteRuleTypeMap = Record<string, SignalRouteRuleType[]>
+
 /** 自动路由规则的命中统计 */
 export interface SignalRouteRuleHit {
   count: number
@@ -2400,6 +2414,8 @@ export interface SignalRouteRule {
   signal_types: SignalRouteRuleType[]
   /** 周期条件（M15 / H1 / …）；空数组 = 不限制 */
   timeframes: string[]
+  /** 周期 → 类型白名单映射；空对象 = 走上面的扁平条件 */
+  type_by_timeframe?: SignalRouteRuleTypeMap
   /** 方向条件（BUY / SELL）；空数组 = 不限制 */
   directions: string[]
   /** 目标分组（必填） */
@@ -2422,6 +2438,7 @@ export interface SignalRouteRuleInput {
   enabled?: boolean
   signal_types?: SignalRouteRuleType[]
   timeframes?: string[]
+  type_by_timeframe?: SignalRouteRuleTypeMap
   directions?: string[]
   group_ids: string[]
   priority?: number

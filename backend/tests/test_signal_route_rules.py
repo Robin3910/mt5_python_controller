@@ -54,6 +54,7 @@ def _rule(**over) -> dict:
     base = {
         "rule_id": "r1", "name": "测试规则", "enabled": True,
         "signal_types": [], "timeframes": [], "directions": [],
+        "type_by_timeframe": {},
         "group_ids": ["g1"], "priority": 100,
     }
     base.update(over)
@@ -116,6 +117,146 @@ def test_direction_condition():
     rule = _rule(directions=["BUY"])
     assert rule_matches(rule, _sig(action="BUY")) is True
     assert rule_matches(rule, _sig(action="SELL")) is False
+
+
+# ---------------------------------------------------------------------------
+# 周期 → 类型 白名单映射（映射形态）
+# ---------------------------------------------------------------------------
+def test_type_map_is_a_timeframe_whitelist():
+    """map 里没有的周期一律**不收**（白名单），而不是「不限类型」。"""
+    from app.signal_route_rules import rule_matches
+
+    rule = _rule(type_by_timeframe={"M1": ["ob"]})
+    assert rule_matches(rule, _sig(timeframe="M1", signal_type="ob")) is True
+    # 同周期但类型不符
+    assert rule_matches(rule, _sig(timeframe="M1", signal_type="fvg")) is False
+    # 白名单外的周期
+    assert rule_matches(rule, _sig(timeframe="M5", signal_type="ob")) is False
+
+
+def test_type_map_empty_array_means_unlimited_types_for_that_timeframe():
+    """**空数组 = 该周期不限类型**，与「map 里没有这个周期」是两回事。"""
+    from app.signal_route_rules import rule_matches
+
+    rule = _rule(type_by_timeframe={"M1": [], "M5": ["fvg"]})
+    # M1 不限类型 → 任意类型都收
+    assert rule_matches(rule, _sig(timeframe="M1", signal_type="ob")) is True
+    assert rule_matches(rule, _sig(timeframe="M1", signal_type="fibo")) is True
+    # M5 限 fvg
+    assert rule_matches(rule, _sig(timeframe="M5", signal_type="fvg")) is True
+    assert rule_matches(rule, _sig(timeframe="M5", signal_type="ob")) is False
+
+
+def test_type_map_supports_different_types_per_timeframe():
+    """核心诉求：M1 只收 OB，M5 只收 FVG。"""
+    from app.signal_route_rules import rule_matches
+
+    rule = _rule(type_by_timeframe={"M1": ["ob"], "M5": ["fvg"]})
+    assert rule_matches(rule, _sig(timeframe="M1", signal_type="ob")) is True
+    assert rule_matches(rule, _sig(timeframe="M1", signal_type="fvg")) is False
+    assert rule_matches(rule, _sig(timeframe="M5", signal_type="fvg")) is True
+    assert rule_matches(rule, _sig(timeframe="M5", signal_type="ob")) is False
+
+
+def test_type_map_ignores_flat_conditions():
+    """映射形态非空时，扁平的类型 / 周期条件**不参与匹配**。"""
+    from app.signal_route_rules import rule_matches
+
+    rule = _rule(
+        type_by_timeframe={"M1": ["ob"]},
+        signal_types=["fvg"],   # 与 map 冲突 → 应被忽略
+        timeframes=["H1"],
+    )
+    assert rule_matches(rule, _sig(timeframe="M1", signal_type="ob")) is True
+    assert rule_matches(rule, _sig(timeframe="H1", signal_type="fvg")) is False
+
+
+def test_type_map_still_respects_direction():
+    """方向是全局条件，与映射形态正交。"""
+    from app.signal_route_rules import rule_matches
+
+    rule = _rule(type_by_timeframe={"M1": ["ob"]}, directions=["BUY"])
+    assert rule_matches(rule, _sig(timeframe="M1", signal_type="ob", action="BUY")) is True
+    assert rule_matches(rule, _sig(timeframe="M1", signal_type="ob", action="SELL")) is False
+
+
+def test_type_map_unlabeled_signal_does_not_match():
+    """周期 / 类型缺失 → 不命中（白名单里没有这个周期 / 类型不是「匹配」）。"""
+    from app.signal_route_rules import rule_matches
+
+    rule = _rule(type_by_timeframe={"M1": ["ob"]})
+    assert rule_matches(rule, _sig(timeframe=None, signal_type="ob")) is False
+    assert rule_matches(rule, _sig(timeframe="M1", signal_type=None)) is False
+    # 该周期不限类型时，周期缺失仍然不命中（周期白名单是第一道门）
+    rule2 = _rule(type_by_timeframe={"M1": []})
+    assert rule_matches(rule2, _sig(timeframe=None, signal_type="ob")) is False
+
+
+def test_type_map_expands_business_groups():
+    """映射形态下的类型条件同样支持业务分类（结构分析 = ob + fvg + pdz）。"""
+    from app.signal_route_rules import rule_matches
+
+    rule = _rule(type_by_timeframe={"M1": ["结构分析"]})
+    assert rule_matches(rule, _sig(timeframe="M1", signal_type="ob")) is True
+    assert rule_matches(rule, _sig(timeframe="M1", signal_type="pdz")) is True
+    assert rule_matches(rule, _sig(timeframe="M1", signal_type="fibo")) is False
+
+
+def test_flat_conditions_still_work_when_map_is_empty():
+    """存量规则（map 为空）走扁平语义，行为不变。"""
+    from app.signal_route_rules import rule_matches
+
+    rule = _rule(signal_types=["ob"], timeframes=["M15"])
+    assert rule_matches(rule, _sig(timeframe="M15", signal_type="ob")) is True
+    assert rule_matches(rule, _sig(timeframe="M5", signal_type="ob")) is False
+    assert rule_matches(rule, _sig(timeframe="M15", signal_type="fvg")) is False
+
+
+def test_normalize_type_by_timeframe():
+    """归一：周期大小写收敛、认不出的周期丢弃、类型码小写去重。"""
+    from app.signal_route_rules import normalize_type_by_timeframe
+
+    out = normalize_type_by_timeframe({
+        "m1": ["OB", "ob", "FVG"],
+        "M7": ["ob"],          # 认不出的周期 → 整个 key 丢弃
+        "H1": [],
+    })
+    assert out == {"M1": ["ob", "fvg"], "H1": []}
+    # 非 dict 入参 → 空 dict（= 走扁平形态）
+    assert normalize_type_by_timeframe(None) == {}
+    assert normalize_type_by_timeframe(["M1"]) == {}
+
+
+def test_validate_clears_flat_conditions_when_map_present():
+    """映射形态非空时，扁平的类型 / 周期条件被清空（两个语义不能并存）。"""
+    from app.signal_route_rules import validate_rule_payload
+
+    out = validate_rule_payload({
+        "name": "映射规则",
+        "group_ids": ["g1"],
+        "signal_types": ["ob"],
+        "timeframes": ["M15"],
+        "type_by_timeframe": {"M1": ["ob"]},
+    })
+    assert out["type_by_timeframe"] == {"M1": ["ob"]}
+    assert out["signal_types"] == []
+    assert out["timeframes"] == []
+
+
+def test_validate_keeps_flat_conditions_when_map_empty():
+    """map 为空 → 保留扁平条件（存量规则不受影响）。"""
+    from app.signal_route_rules import validate_rule_payload
+
+    out = validate_rule_payload({
+        "name": "扁平规则",
+        "group_ids": ["g1"],
+        "signal_types": ["ob"],
+        "timeframes": ["M15"],
+        "type_by_timeframe": {},
+    })
+    assert out["type_by_timeframe"] == {}
+    assert out["signal_types"] == ["ob"]
+    assert out["timeframes"] == ["M15"]
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +430,74 @@ def test_route_rule_rejects_empty_group_list(client):
         headers=h,
     )
     assert r.status_code == 400
+
+
+def test_route_rule_type_map_crud(client):
+    """周期 → 类型映射：创建 → 回显 → 更新。"""
+    h = auth_headers(client)
+    g = _mk_group(client, h, name="映射组")
+
+    r = client.post(
+        "/api/signal-center/route-rules",
+        json={
+            "name": "按周期收",
+            "type_by_timeframe": {"M1": ["ob"], "M5": ["fvg", "pdz"]},
+            "group_ids": [g["group_id"]],
+        },
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    rule = r.json()
+    assert rule["type_by_timeframe"] == {"M1": ["ob"], "M5": ["fvg", "pdz"]}
+    # 映射形态下扁平的信号类型 / 周期不参与匹配 → 被清空
+    assert rule["signal_types"] == []
+    assert rule["timeframes"] == []
+
+    # 周期大小写归一
+    r = client.put(
+        f"/api/signal-center/route-rules/{rule['rule_id']}",
+        json={
+            "name": "按周期收",
+            "type_by_timeframe": {"m1": ["OB"], "H1": []},
+            "group_ids": [g["group_id"]],
+        },
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["type_by_timeframe"] == {"M1": ["ob"], "H1": []}
+
+
+def test_auto_group_routes_per_timeframe_types(client):
+    """端到端：M1 的 OB 进组，M1 的 FVG 与 M5 的 OB 都不进。"""
+    h = auth_headers(client)
+    seed_default_filters(client)
+    g = _mk_group(client, h, name="仅 M1 的 OB")
+    client.patch(f"/api/groups/{g['group_id']}", json={"signal_source": "auto"}, headers=h)
+
+    client.post(
+        "/api/signal-center/route-rules",
+        json={
+            "name": "M1 只收 OB",
+            "type_by_timeframe": {"M1": ["ob"]},
+            "group_ids": [g["group_id"]],
+        },
+        headers=h,
+    )
+
+    # 命中：M1 + ob
+    r = client.post("/webhook", json=_tv_signal(tf="M1", signal_type="ob"))
+    assert r.status_code == 200, r.text
+    assert r.json().get("auto_groups") == [g["group_id"]]
+
+    # 不命中：M1 + fvg
+    r = client.post("/webhook", json=_tv_signal(tf="M1", signal_type="fvg"))
+    assert r.status_code == 200, r.text
+    assert r.json().get("auto_groups", []) == []
+
+    # 不命中：M5 + ob（白名单外）
+    r = client.post("/webhook", json=_tv_signal(tf="M5", signal_type="ob"))
+    assert r.status_code == 200, r.text
+    assert r.json().get("auto_groups", []) == []
 
 
 def test_group_can_switch_to_auto_mode(client):

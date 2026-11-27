@@ -40,28 +40,44 @@ const groupNames = computed(() => {
   return m
 })
 
-/** 条件摘要：类型 / 周期 / 方向，空的显示「全部」 */
+/** 类型码的人读标签（没登记的码原样显示） */
+const TYPE_LABELS: Record<string, string> = {
+  ob: '订单块 OB',
+  fvg: 'FVG',
+  pdz: 'PDZ',
+  fibo: '斐波那契',
+  bos: 'BOS',
+  swing: 'Swing',
+  choch: 'CHoCH',
+  mm: 'MM',
+}
+
+/**
+ * 条件摘要：类型 / 周期 / 方向，空的显示「全部」。
+ *
+ * **映射形态**（周期 → 类型白名单）单独渲染成「M1:ob · M5:fvg」——
+ * 摊平成「类型: ob,fvg 周期: M1,M5」会丢掉「哪个周期收哪个类型」这层信息，
+ * 而那正是这条规则存在的意义。
+ */
 function typeSummary(rule: SignalRouteRule): string {
+  const map = rule.type_by_timeframe ?? {}
+  if (Object.keys(map).length) {
+    return Object.entries(map)
+      .map(([tf, types]) => {
+        // 空数组 = 该周期不限类型
+        if (!types.length) return `${tf}:不限`
+        return `${tf}:${types.map((t) => TYPE_LABELS[t] ?? t).join('/')}`
+      })
+      .join(' · ')
+  }
   if (!rule.signal_types.length) return '全部类型'
-  return rule.signal_types
-    .map((t) => {
-      // 分类原样显示；类型码显示成「ob（订单块 OB）」更好认
-      const known: Record<string, string> = {
-        ob: '订单块 OB',
-        fvg: 'FVG',
-        pdz: 'PDZ',
-        fibo: '斐波那契',
-        bos: 'BOS',
-        swing: 'Swing',
-        choch: 'CHoCH',
-        mm: 'MM',
-      }
-      return known[t] ?? t
-    })
-    .join('、')
+  // 分类原样显示；类型码显示成「订单块 OB」更好认
+  return rule.signal_types.map((t) => TYPE_LABELS[t] ?? t).join('、')
 }
 
 function tfSummary(rule: SignalRouteRule): string {
+  // 映射形态的周期已经写在类型摘要里了，这里不重复
+  if (Object.keys(rule.type_by_timeframe ?? {}).length) return '见类型'
   if (!rule.timeframes.length) return '全部周期'
   return rule.timeframes.join('、')
 }
@@ -102,6 +118,8 @@ async function toggleEnabled(rule: SignalRouteRule): Promise<void> {
     enabled: !rule.enabled,
     signal_types: rule.signal_types,
     timeframes: rule.timeframes,
+    // 必须带上：后端是**全量覆盖**语义，漏传会把这条规则的映射清空
+    type_by_timeframe: { ...(rule.type_by_timeframe ?? {}) },
     directions: rule.directions,
     group_ids: rule.group_ids,
     priority: rule.priority,
@@ -160,8 +178,13 @@ async function remove(rule: SignalRouteRule): Promise<void> {
         </div>
 
         <div class="rr-conds">
-          <span class="rr-cond"><i>类型</i>{{ typeSummary(rule) }}</span>
-          <span class="rr-cond"><i>周期</i>{{ tfSummary(rule) }}</span>
+          <template v-if="Object.keys(rule.type_by_timeframe ?? {}).length">
+            <span class="rr-cond"><i>按周期收</i>{{ typeSummary(rule) }}</span>
+          </template>
+          <template v-else>
+            <span class="rr-cond"><i>类型</i>{{ typeSummary(rule) }}</span>
+            <span class="rr-cond"><i>周期</i>{{ tfSummary(rule) }}</span>
+          </template>
           <span class="rr-cond"><i>方向</i>{{ dirSummary(rule) }}</span>
         </div>
 
