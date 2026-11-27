@@ -18,7 +18,7 @@ import { useRbacStore } from '@/stores/rbac'
 import type { NodeAssignConflict, NodeDispatchFiltersConfig, NodeOut } from '@/api/types'
 import { parseFilterRules, parseNodeDispatchFilters, serializeNodeDispatchFilters, validateNodeDispatchFilters, validateNodeGlobalLotMode } from '@/utils/filterRules'
 import { confirmAction } from '@/utils/confirm'
-import { isPendingNode, nodeApprovalHint, nodeEnableIntent, nodeEnableLabel } from '@/utils/nodeApproval'
+import { isPendingNode, nodeApprovalHint, nodeEnableConfirmHint, nodeEnableIntent, nodeEnableLabel } from '@/utils/nodeApproval'
 import { setNodePrimary } from '@/utils/nodePrimary'
 
 const hub = useHubStore()
@@ -411,7 +411,7 @@ async function toggleEnabled(n: NodeOut): Promise<void> {
   const current = nodeEnableIntent(n)
   const next = current ? '禁用' : '启用'
   const hint = isPendingNode(n)
-    ? '确认启用与分配给申请人两项齐全后才会开通；操作顺序不限。'
+    ? nodeEnableConfirmHint(n)
     : `${next}后将${current ? '无法接入且不参与分发' : '恢复正常跟单'}。`
   if (!(await confirmAction(`确认${next}节点「${n.name}」？\n\n${hint}`))) return
   await hub.updateNode(n.node_id, { enabled: !current }, currentSearchOptions())

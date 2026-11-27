@@ -16,10 +16,12 @@ export interface RegisterHandoff {
 
 interface RegisterState {
   handoff: RegisterHandoff | null
+  /** 待审核注册成功后，带回登录页的一次性提示（刷新即丢） */
+  successNotice: string
 }
 
 export const useRegisterStore = defineStore('register', {
-  state: (): RegisterState => ({ handoff: null }),
+  state: (): RegisterState => ({ handoff: null, successNotice: '' }),
   actions: {
     /** 登录页校验通过后，发现该号码未注册 → 交给注册页 */
     setHandoff(handoff: RegisterHandoff): void {
@@ -31,8 +33,19 @@ export const useRegisterStore = defineStore('register', {
       this.handoff = null
       return value
     },
+    /** 注册成功且待审核：跳回登录页前记下提示 */
+    setSuccessNotice(message: string): void {
+      this.successNotice = message
+    },
+    /** 登录页取走提示（一次性） */
+    takeSuccessNotice(): string {
+      const value = this.successNotice
+      this.successNotice = ''
+      return value
+    },
     clear(): void {
       this.handoff = null
+      this.successNotice = ''
     },
   },
 })

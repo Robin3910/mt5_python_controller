@@ -1,10 +1,10 @@
 """异步数据库引擎 / 会话（SQLAlchemy 2.0）。"""
 import logging
 
-from sqlalchemy import event, inspect, text
+from sqlalchemy import event, insert, inspect, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from .orm import Base, UserReview
+from .orm import AuditLog, Base, UserReview
 from .settings import settings
 
 logger = logging.getLogger(__name__)
@@ -952,6 +952,7 @@ async def init_db() -> None:
         await conn.run_sync(_migrate_news_blackout_tables)
         await conn.run_sync(_migrate_user_order_presets)
         await conn.run_sync(_migrate_route_rule_type_map)
+        await conn.run_sync(_migrate_pending_node_owners)
     logger.info("Database initialized (%s)", engine.url.render_as_string(hide_password=True))
 
 
@@ -1123,3 +1124,82 @@ def _migrate_user_reviews(sync_conn) -> None:
     # 3. 补上手机号快照列
     if "phone" not in cols:
         sync_conn.execute(text("ALTER TABLE user_reviews ADD COLUMN phone VARCHAR(20) NULL"))
+
+
+def _migrate_pending_node_owners(sync_conn) -> None:
+    """待开通且仍挂在有效管理员名下的申请，改归申请人。已开通节点不动。"""
+    inspector = inspect(sync_conn)
+    tables = set(inspector.get_table_names())
+    if "nodes" not in tables or "users" not in tables:
+        return
+    cols = {c["name"] for c in inspector.get_columns("nodes")}
+    if not {"approval_status", "requested_by_user_id", "owner_user_id", "is_primary"} <= cols:
+        return
+    admin_ids: set[int] = set()
+    if "sys_user_role" in tables and "sys_role" in tables:
+        admin_ids = {
+            row[0] for row in sync_conn.execute(text(
+                "SELECT ur.user_id FROM sys_user_role ur "
+                "JOIN sys_role r ON r.id = ur.role_id "
+                "JOIN users u ON u.id = ur.user_id "
+                "WHERE r.code = 'admin' AND r.enabled <> 0 AND u.is_active <> 0"
+            )).all()
+        }
+    pending = sync_conn.execute(text(
+        "SELECT node_id, owner_user_id, requested_by_user_id FROM nodes "
+        "WHERE approval_status = 'pending' AND requested_by_user_id IS NOT NULL "
+        "AND (owner_user_id IS NULL OR owner_user_id != requested_by_user_id) "
+        "ORDER BY created_at, node_id"
+    )).all()
+    moved = []
+    has_credentials = "node_credentials" in tables
+    for node_id, owner, applicant in pending:
+        if owner is not None and owner not in admin_ids:
+            continue
+        if sync_conn.execute(text("SELECT id FROM users WHERE id = :id"), {"id": applicant}).first() is None:
+            continue
+        make_primary = False
+        if applicant not in admin_ids:
+            taken = sync_conn.execute(text(
+                "SELECT node_id FROM nodes WHERE owner_user_id = :uid AND is_primary <> 0 "
+                "AND node_id != :nid LIMIT 1"
+            ), {"uid": applicant, "nid": node_id}).first()
+            make_primary = taken is None
+        sync_conn.execute(text(
+            "UPDATE nodes SET owner_user_id = :owner, is_primary = :primary WHERE node_id = :nid"
+        ), {"owner": applicant, "primary": 1 if make_primary else 0, "nid": node_id})
+        if has_credentials:
+            cred = sync_conn.execute(text(
+                "SELECT token_sha256, generation FROM node_credentials WHERE node_id = :nid"
+            ), {"nid": node_id}).first()
+            if cred is not None and cred[0]:
+                sync_conn.execute(text(
+                    "UPDATE node_credentials SET owner_user_id = :owner, token_sha256 = NULL, "
+                    "generation = :generation WHERE node_id = :nid"
+                ), {"owner": applicant, "generation": int(cred[1] or 1) + 1, "nid": node_id})
+            elif cred is not None:
+                sync_conn.execute(text(
+                    "UPDATE node_credentials SET owner_user_id = :owner WHERE node_id = :nid"
+                ), {"owner": applicant, "nid": node_id})
+        moved.append({
+            "node_id": node_id,
+            "from_owner": owner,
+            "owner_user_id": applicant,
+            "is_primary": make_primary,
+        })
+    if not moved:
+        return
+    sync_conn.execute(insert(AuditLog).values(
+        operator="system",
+        action="assign_pending_node_owner",
+        result="ok",
+        category="system",
+        before_json={"nodes": [
+            {"node_id": item["node_id"], "owner_user_id": item["from_owner"]} for item in moved
+        ]},
+        after_json={"nodes": [
+            {"node_id": item["node_id"], "owner_user_id": item["owner_user_id"], "is_primary": item["is_primary"]}
+            for item in moved
+        ]},
+    ))
+    logger.info("moved %d pending node(s) onto their applicant", len(moved))

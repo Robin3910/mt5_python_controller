@@ -860,6 +860,11 @@ td:first-child, th:first-child { font-family: var(--font); }
   margin-bottom: 24px;
 }
 
+.login-success-notice {
+  margin-top: -8px;
+  margin-bottom: 16px;
+}
+
 .login-shield {
   width: 44px; height: 44px;
   border-radius: 12px;

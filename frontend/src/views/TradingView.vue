@@ -16,6 +16,7 @@ import { useAuthStore } from '@/stores/auth'
 import { confirmAction } from '@/utils/confirm'
 import { trendLabel, trendTagClass } from '@/utils/trendConfig'
 import { fetchPendingTask, quickTrigger, type TradingStrategyType, type QuickTriggerResult } from '@/api/trading'
+import { signalSymbolMatches } from '@/components/strategySignal'
 import { extractApiError } from '@/api/client'
 import type {
   AccountSnapshot,
@@ -666,7 +667,7 @@ async function stopPendingTask(symbol: string, group: PendingMagicGroup): Promis
   actionBusy.value = `stop:${ticket}`
   try {
     const task = await fetchPendingTask(nodeId, ticket)
-    if (!stillCurrent() || !task.dispatches.some(d => d.node_id === nodeId && d.magic === group.magic && d.symbol === symbol && canStopDispatch(d))) {
+    if (!stillCurrent() || !task.dispatches.some(d => d.node_id === nodeId && d.magic === group.magic && signalSymbolMatches(d.symbol || '', symbol) && canStopDispatch(d))) {
       ElMessage.warning('挂单或任务状态已变化，请刷新后重试')
       return
     }

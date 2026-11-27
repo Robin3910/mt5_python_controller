@@ -217,10 +217,20 @@ async def enroll(body: Enrollment, request: Request, store: RedisStore = Depends
                     raise HTTPException(409, "MT5 account already registered; contact administrator")
                 node = existing
             else:
-                try:
-                    owner = await rbac_service.admin_owner_id(session, p.user_id if p.is_admin else None)
-                except ValueError as exc:
-                    raise HTTPException(409, str(exc)) from exc
+                # 普通用户的待开通节点直接归申请人；真正开通仍等管理员确认启用。
+                if p.is_admin:
+                    try:
+                        owner = await rbac_service.admin_owner_id(session, p.user_id)
+                    except ValueError as exc:
+                        raise HTTPException(409, str(exc)) from exc
+                    make_primary = False
+                else:
+                    owner = p.user_id
+                    make_primary = await session.scalar(
+                        select(Node.node_id).where(
+                            Node.owner_user_id == owner, Node.is_primary.is_(True),
+                        ).limit(1)
+                    ) is None
                 # 名字留空 → 与管理端手动建节点同一套规则：「序号-mt5_login」。
                 # 面板导入只提交账号，不提交名字，节点名完全由服务器生成。
                 name = (body.name or "").strip() or node_service.default_node_name(
@@ -229,7 +239,7 @@ async def enroll(body: Enrollment, request: Request, store: RedisStore = Depends
                 node = Node(node_id=make_node_id(), name=name,
                             mt5_login=body.mt5_login, mt5_server=body.mt5_server,
                             enabled=False, approval_status="pending", requested_by_user_id=p.user_id,
-                            owner_user_id=owner, admin_enable_requested=False,
+                            owner_user_id=owner, admin_enable_requested=False, is_primary=make_primary,
                             lot_mode=node_service.AUTO_NODE_DEFAULTS["lot_mode"],
                             lot=node_service.AUTO_NODE_DEFAULTS["lot"],
                             poll_order=node_service.AUTO_NODE_DEFAULTS["poll_order"])

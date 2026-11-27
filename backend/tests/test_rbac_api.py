@@ -235,8 +235,18 @@ def test_node_scope(client):
     assert client.get(f"/api/nodes/{n1}/deletion-preview", headers=ah).status_code == 200
     assert client.delete(f"/api/nodes/{n1}", headers=ah).status_code == 422
 
+    async def seed_kyc():
+        from app import user_review_service
+        await user_review_service.create_review(alice["id"], real_name="张三", status="approved")
+        await user_review_service.create_review(alice["id"], real_name="李四", status="approved")
+
+    client.portal.call(seed_kyc)
+    own = client.get("/api/nodes", headers=ah).json()
+    assert own[0]["owner_real_name"] is None
+
     admin_view = {n["node_id"]: n for n in client.get("/api/nodes", headers=h).json()}
     assert admin_view[n1]["owner_user_id"] == alice["id"]
+    assert admin_view[n1]["owner_real_name"] == "李四"
     assert admin_view[n1]["owner_username"] == "alice"
     assert admin_view[n2]["owner_username"] == "admin"
 
