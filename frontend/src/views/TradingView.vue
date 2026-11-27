@@ -4,7 +4,7 @@
 //   - 市价 / 限价：SL 必填，方向由后端根据 (入场价|现价) vs SL 自动判断
 //   - 限价：再加一个 entry_price 必填
 //   - 网格：方向必选（all / buy / sell）
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onActivated, onDeactivated, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
 import 'element-plus/es/components/message-box/style/css'
@@ -37,6 +37,8 @@ import type {
 const hub = useHubStore()
 const auth = useAuthStore()
 const router = useRouter()
+let pageActive = false
+let activationVersion = 0
 
 const primaryNode = computed(() => hub.nodes.find(n => n.is_primary && n.enabled && n.owner_user_id != null && n.owner_user_id === auth.me?.user_id))
 
@@ -204,20 +206,11 @@ const pendingUnsupported = computed(
   () => !!account.value && !Array.isArray(account.value.orders),
 )
 
-// 当前交易 / 智能吸筹 / 历史交易
-type DetailTab = 'positions' | 'grid' | 'history'
+// 当前交易 / 历史交易
+type DetailTab = 'positions' | 'history'
 const detailTab = ref<DetailTab>('positions')
 
-// ── 吸筹策略（运行中的网格任务） ──
-// 数据来源：遍历当前用户名下所有"网格分组"（按命名规则 grid-<user>-<login>-<sym>），
-// 调 GET /api/groups/{id}/signals?status=active 拉运行中的主任务，合并展示。
-// 停止 = 与 GroupSignalsView 的"平仓"按钮同一接口：POST /api/groups/{id}/dispatches/{id}/close。
-const gridTasks = ref<GroupSignalTaskRecord[]>([])
-const gridLoading = ref(false)
-const gridRefreshing = ref(false) // 轮询时为 true，避免 loading 闪烁
 const closingGridTaskIds = ref<Set<number>>(new Set())
-const GRID_TAB_REFRESH_MS = 5000
-let gridTimer: number | null = null
 
 function isClosingGridTask(taskId: number): boolean {
   return closingGridTaskIds.value.has(taskId)
@@ -230,82 +223,6 @@ function canStopDispatch(d: GroupSignalTaskRecord['dispatches'][number]): boolea
 function isGridTaskStoppable(task: GroupSignalTaskRecord): boolean {
   if (['done', 'failed', 'skipped'].includes(task.status)) return false
   return task.dispatches.some(canStopDispatch)
-}
-
-async function refreshGridTasks(initial = false): Promise<void> {
-  if (!auth.me) {
-    gridTasks.value = []
-    return
-  }
-  // 进入 tab 第一次拉 → 全屏 loading；轮询 → 静默刷新
-  if (initial) gridLoading.value = true
-  else gridRefreshing.value = true
-  try {
-    // 确保 groups 是新的：用户刚在分组页新建了网格分组时也认得出来
-    if (!hub.groups || hub.groups.length === 0) {
-      try {
-        await hub.listGroups()
-      } catch {
-        /* 忽略，沿用旧缓存 */
-      }
-    }
-    const gridGroups = (hub.groups || []).filter(
-      (g: GroupOut) => g.owner_user_id === auth.me?.user_id && typeof g.name === 'string' && g.name.startsWith('grid-'),
-    )
-    if (gridGroups.length === 0) {
-      gridTasks.value = []
-      return
-    }
-    const all: GroupSignalTaskRecord[] = []
-    for (const g of gridGroups) {
-      try {
-        const res = await hub.fetchGroupSignals(g.group_id, 1, 50, 'active')
-        for (const t of res.items || []) {
-          // 同一 signal_id 可能下发给多节点 → 多个 dispatches，但本质是 1 个网格任务。
-          // fetchGroupSignals 已经按 task 去重，这里直接收。
-          all.push(t)
-        }
-      } catch {
-        /* 单个分组拉失败不影响其它分组 */
-      }
-    }
-    all.sort((a, b) =>
-      (b.opened_at || b.created_at || 0) - (a.opened_at || a.created_at || 0),
-    )
-    gridTasks.value = all
-  } finally {
-    gridLoading.value = false
-    gridRefreshing.value = false
-  }
-}
-
-/** 合并展示时把同一 task 下所有 dispatch 的 position_count / profit 等求和。 */
-function gridTaskPositionCount(task: GroupSignalTaskRecord): number {
-  return task.dispatches.reduce((a, d) => a + (d.position_count || 0), 0)
-}
-function gridTaskPendingCount(task: GroupSignalTaskRecord): number {
-  return task.dispatches.reduce((a, d) => a + (d.pending_orders || 0), 0)
-}
-function gridTaskProfit(task: GroupSignalTaskRecord): number {
-  return task.dispatches.reduce((a, d) => a + (d.realized_profit || 0), 0)
-}
-
-/** 网格任务的运行节点摘要（多节点用「 / 」连接）。 */
-function gridTaskNodeNames(task: GroupSignalTaskRecord): string {
-  const names = task.dispatches
-    .map((d) => d.node_name || d.node_id)
-    .filter(Boolean)
-  if (names.length === 0) return '—'
-  if (names.length <= 2) return names.join(' / ')
-  return `${names[0]} / ${names[1]} 等 ${names.length} 节点`
-}
-
-/** 网格 action → dir-tag 配色（all 也按"多"色展示）。 */
-function gridDirTagClass(action: string | null): string {
-  const v = (action || '').toLowerCase()
-  if (v === 'buy' || v === 'long' || v === 'all') return 'buy'
-  if (v === 'sell' || v === 'short') return 'sell'
-  return ''
 }
 
 async function stopStrategyTask(task: GroupSignalTaskRecord, stillCurrent = () => true): Promise<void> {
@@ -374,7 +291,6 @@ async function stopStrategyTask(task: GroupSignalTaskRecord, stillCurrent = () =
     } else {
       ElMessage.warning('已下发停止，结果待刷新确认')
     }
-    if (detailTab.value === 'grid') await refreshGridTasks()
     if (primaryNode.value) await hub.fetchNodeAccount(primaryNode.value.node_id)
   } finally {
     const next = new Set(closingGridTaskIds.value)
@@ -385,26 +301,6 @@ async function stopStrategyTask(task: GroupSignalTaskRecord, stillCurrent = () =
 
 // 历史交易角标：近 7 日成交条数，由 loadTradeHistory 写入。
 const dealsTotal = ref(0)
-
-/** 吸筹策略 tab：切到时拉一次 + 启轮询；切走关轮询；分组数据变化时强制重拉 */
-watch(
-  [detailTab, () => hub.groups.length],
-  ([tab, groupLen]) => {
-    if (tab === 'grid') {
-      // 首次进入 或 分组数量变化（新建了网格分组） → 重新拉
-      void refreshGridTasks(gridTasks.value.length === 0 || groupLen === 0)
-      if (gridTimer === null) {
-        gridTimer = window.setInterval(() => {
-          void refreshGridTasks(false)
-        }, GRID_TAB_REFRESH_MS)
-      }
-    } else if (gridTimer !== null) {
-      window.clearInterval(gridTimer)
-      gridTimer = null
-    }
-  },
-  { immediate: true },
-)
 
 const SYMBOL_NAMES: Record<string, string> = {
   XAUUSD: '黄金',
@@ -601,6 +497,7 @@ function pendHiddenCount(group: PendingMagicGroup, symbol: string): number {
 const actionBusy = ref('')
 
 function samePrimary(nodeId: string): boolean {
+  if (router.currentRoute.value.name !== 'trading') return false
   if (primaryNode.value?.node_id === nodeId) return true
   ElMessage.warning('主节点已变更，请重新确认操作')
   return false
@@ -766,30 +663,6 @@ async function cancelPendingRow(o: PendingOrder): Promise<void> {
   }
 }
 
-interface GridBook {
-  symbol: string
-  tasks: GroupSignalTaskRecord[]
-  profit: number
-  positions: number
-  volumeLabel: string
-}
-const gridBooks = computed<GridBook[]>(() => {
-  const map = new Map<string, GroupSignalTaskRecord[]>()
-  for (const task of gridTasks.value) {
-    const sym = task.symbol || '—'
-    const bucket = map.get(sym) || []
-    bucket.push(task)
-    map.set(sym, bucket)
-  }
-  return [...map.entries()].map(([symbol, tasks]) => ({
-    symbol,
-    tasks,
-    profit: tasks.reduce((sum, task) => sum + gridTaskProfit(task), 0),
-    positions: tasks.reduce((sum, task) => sum + gridTaskPositionCount(task), 0),
-    volumeLabel: `${tasks.length} 个任务`,
-  })).sort((a, b) => a.symbol.localeCompare(b.symbol))
-})
-
 interface HistRow {
   key: string
   symbol: string
@@ -905,7 +778,7 @@ function stopHistoryPoll(): void {
 
 async function loadTradeHistory(): Promise<void> {
   const nodeId = primaryNode.value?.node_id
-  if (!nodeId) return
+  if (!pageActive || !nodeId) return
   const seq = ++historySeq
   const blank = historyDeals.value.length === 0
   if (blank) historyLoading.value = true
@@ -927,18 +800,25 @@ async function loadTradeHistory(): Promise<void> {
     if (seq === historySeq) historyLoading.value = false
   }
 }
-watch(
-  () => primaryNode.value?.node_id,
-  () => { void loadTradeHistory() },
-  { immediate: true },
-)
+watch(() => primaryNode.value?.node_id, () => {
+  historyDeals.value = []
+  historyWinRate.value = null
+  historyProfit.value = 0
+  dealsTotal.value = 0
+  void loadTradeHistory()
+})
+
+function startHistoryPoll(): void {
+  if (historyTimer === null && detailTab.value === 'history') {
+    historyTimer = window.setInterval(() => { void loadTradeHistory() }, HISTORY_TAB_REFRESH_MS)
+  }
+}
+
 // 成交是平仓后异步入库的。停在历史页或持仓笔数变化时再拉，避免一直显示进页那一刻的空列表。
 watch(detailTab, (tab) => {
-  if (tab === 'history' && primaryNode.value) {
+  if (tab === 'history' && pageActive) {
     void loadTradeHistory()
-    if (historyTimer === null) {
-      historyTimer = window.setInterval(() => { void loadTradeHistory() }, HISTORY_TAB_REFRESH_MS)
-    }
+    startHistoryPoll()
   } else {
     stopHistoryPoll()
   }
@@ -972,9 +852,9 @@ const strategyType = ref<TradingStrategyType>('trend_market')
 const form = reactive<OrderForm & { grid_step?: number | null; grid_layers?: number | null }>({
   symbol: 'EURUSD' as string,
   volume: 0.01,
-  sl: 0 as number | null,
-  tp: 0 as number | null,
-  entry_price: 0 as number | null,
+  sl: null,
+  tp: null,
+  entry_price: null,
   /** 网格模式：all（多头）/ sell（空头） */
   direction: 'all' as 'all' | 'buy' | 'sell',
   remark: '',
@@ -987,12 +867,13 @@ async function openDialog(type: TradingStrategyType): Promise<void> {
     return
   }
   const nodeId = primaryNode.value.node_id
+  const activation = activationVersion
   strategyType.value = type
   form.symbol = currentSymbol.value
   form.volume = defaultVolume.value
-  form.sl = 0
-  form.tp = 0
-  form.entry_price = 0
+  form.sl = null
+  form.tp = null
+  form.entry_price = null
   form.direction = 'all'
   form.remark = ''
   lastError.value = ''
@@ -1013,7 +894,7 @@ async function openDialog(type: TradingStrategyType): Promise<void> {
   } catch {
     dialogGroupId.value = null
   }
-  if (samePrimary(nodeId)) dialogVisible.value = true
+  if (activation === activationVersion && samePrimary(nodeId)) dialogVisible.value = true
 }
 
 const canSubmit = computed(() => {
@@ -1181,52 +1062,44 @@ async function closePosition(p: Position): Promise<void> {
 // 节点离线 / 品种无 K 线时后端会报错，这里静默降级成「暂无结论」，不打断报价展示。
 const TREND_POLL_MS = 15000
 const trendData = ref<TrendPanelData | null>(null)
+let trendSeq = 0
 const trendVerdict = computed<TrendVerdict>(
   () => trendData.value?.trend ?? 'unknown',
 )
 const trendReady = computed(() => !!trendData.value?.ready)
 
 async function loadTrend(): Promise<void> {
-  if (!primaryNode.value || !currentSymbol.value) {
-    trendData.value = null
-    return
-  }
-  const nodeId = primaryNode.value.node_id
+  const nodeId = primaryNode.value?.node_id
   const sym = currentSymbol.value
-  try {
-    const res = await hub.fetchNodeTrend(nodeId, sym)
-    // 响应回来时用户可能已切走品种 / 节点，丢弃过期结论
-    if (
-      primaryNode.value?.node_id !== nodeId ||
-      currentSymbol.value !== sym
-    ) {
-      return
-    }
+  if (!pageActive || !nodeId || !sym) return
+  const seq = ++trendSeq
+  const res = await hub.fetchNodeTrend(nodeId, sym).catch(() => null)
+  if (seq === trendSeq && primaryNode.value?.node_id === nodeId && currentSymbol.value === sym) {
     trendData.value = res
-  } catch {
-    // 离线、无 K 线等一律降级：不显示结论，不打断页面其它数据
-    trendData.value = null
   }
 }
 
 // 切换主节点 / 品种后立刻对齐结论，避免停留在上一个品种的多空方向
-watch([primaryNode, currentSymbol], () => {
+watch([() => primaryNode.value?.node_id, currentSymbol], () => {
+  trendData.value = null
   void loadTrend()
 })
 
 // 简单轮询拉取快照（保持行情新鲜）
 let pollTimer: number | null = null
 let trendTimer: number | null = null
-onMounted(async () => {
-  await hub.fetchNodes()
-  if (primaryNode.value && !hub.accounts[primaryNode.value.node_id]) {
-    try {
-      await hub.fetchNodeAccount(primaryNode.value.node_id)
-    } catch {
-      /* 节点尚未上报快照，忽略 */
-    }
-  }
+onActivated(async () => {
+  const activation = ++activationVersion
+  await hub.fetchNodes().catch(() => {})
+  if (activation !== activationVersion) return
+  const nodeId = primaryNode.value?.node_id
+  if (nodeId) await hub.fetchNodeAccount(nodeId)
+  if (activation !== activationVersion) return
+
+  pageActive = true
+  void loadTradeHistory()
   void loadTrend()
+  startHistoryPoll()
   pollTimer = window.setInterval(() => {
     if (primaryNode.value) {
       hub.fetchNodeAccount(primaryNode.value.node_id).catch(() => {})
@@ -1236,7 +1109,13 @@ onMounted(async () => {
     void loadTrend()
   }, TREND_POLL_MS)
 })
-onBeforeUnmount(() => {
+onDeactivated(() => {
+  activationVersion += 1
+  pageActive = false
+  historySeq += 1
+  trendSeq += 1
+  historyLoading.value = false
+  closeDialog()
   if (pollTimer !== null) {
     window.clearInterval(pollTimer)
     pollTimer = null
@@ -1244,10 +1123,6 @@ onBeforeUnmount(() => {
   if (trendTimer !== null) {
     window.clearInterval(trendTimer)
     trendTimer = null
-  }
-  if (gridTimer !== null) {
-    window.clearInterval(gridTimer)
-    gridTimer = null
   }
   stopHistoryPoll()
 })
@@ -1316,7 +1191,7 @@ onBeforeUnmount(() => {
               <span>智能吸筹</span>
         </button>
       </div>
-          <p class="tr-hint">配置完成后，下方将展示对应的订单配置与当前交易、智能吸筹、历史交易。</p>
+          <p class="tr-hint">配置完成后，可在下方查看当前交易和历史交易。</p>
           <p v-if="!isOnline" class="tr-hint">主节点离线，无法触发</p>
           </div>
         <div class="tr-sum">
@@ -1330,9 +1205,6 @@ onBeforeUnmount(() => {
         <div class="tr-tabs" role="tablist">
           <button type="button" :class="{ on: detailTab === 'positions' }" @click="detailTab = 'positions'">
             当前交易<span>{{ totalPosCount }}<template v-if="pendingReported && totalPendingCount"> · {{ totalPendingCount }}</template></span>
-          </button>
-          <button type="button" :class="{ on: detailTab === 'grid' }" @click="detailTab = 'grid'">
-            智能吸筹<span>{{ gridTasks.length }}</span>
           </button>
           <button type="button" :class="{ on: detailTab === 'history' }" @click="detailTab = 'history'">
             历史交易<span>{{ dealsTotal }}</span>
@@ -1392,7 +1264,7 @@ onBeforeUnmount(() => {
           <!-- ── 未成交挂单 ──
                与持仓分开一块：限价开仓成交前账户里没有任何持仓，
                混在一起会让人误判成「单没发出去」。挂单**不并入**持仓口径。 -->          <div class="tr-pend-head">
-            <b>限价单</b>
+            <b>限价挂单</b>
             <span v-if="pendingReported">{{ totalPendingCount }} 张 · {{ totalPendingVolume.toFixed(2) }} 手</span>
             <span v-if="!isOnline && pendingReported" class="warn">节点离线，数据可能已过期</span>
           </div>
@@ -1459,41 +1331,6 @@ onBeforeUnmount(() => {
             未成交挂单 {{ totalPendingCount }} 张 · 合计手数 {{ totalPendingVolume.toFixed(2) }}
           </p>
         </div>
-
-        <div v-else-if="detailTab === 'grid'" class="tr-body">
-          <p v-if="gridLoading && !gridTasks.length" class="tr-empty-line">加载中…</p>
-          <p v-else-if="!gridBooks.length" class="tr-empty-line">暂无运行中的智能吸筹</p>
-          <section v-for="book in gridBooks" :key="book.symbol" class="tr-book">
-            <header class="tr-book-head">
-              <div>
-                <b>{{ book.symbol }}</b>
-                <em v-if="symbolAlias(book.symbol)">{{ symbolAlias(book.symbol) }}</em>
-                <span>{{ book.positions }} 笔持仓 · {{ book.volumeLabel }}</span>
-                </div>
-              <strong :class="book.profit >= 0 ? 'up' : 'down'">{{ fmtSigned(book.profit) }}</strong>
-            </header>
-            <div class="tr-scroll">
-              <div class="tr-grid tr-grid-grid tr-head">
-              <span>方向</span><span>节点</span><span>持仓</span><span>挂单</span><span>盈亏</span><span>操作</span>
-              </div>
-            <div v-for="t in book.tasks" :key="t.task_id" class="tr-grid tr-grid-grid tr-line">
-              <span><i class="dir" :class="gridDirTagClass(t.action)">{{ fmtPosType(t.action) }}</i></span>
-              <span class="num dim" :title="gridTaskNodeNames(t)">{{ gridTaskNodeNames(t) }}</span>
-              <span class="num">{{ gridTaskPositionCount(t) }}</span>
-              <span class="num dim">{{ gridTaskPendingCount(t) || '—' }}</span>
-              <strong :class="gridTaskProfit(t) >= 0 ? 'up' : 'down'">{{ fmtSigned(gridTaskProfit(t)) }}</strong>
-              <span>
-                        <button
-                  type="button"
-                  class="tr-x"
-                          :disabled="isClosingGridTask(t.task_id) || !isGridTaskStoppable(t)"
-                          @click="stopStrategyTask(t)"
-                >{{ isClosingGridTask(t.task_id) ? '…' : '停止' }}</button>
-                      </span>
-                    </div>
-            </div>
-          </section>
-                    </div>
 
         <div v-else class="tr-body">
           <div class="tr-hist-pills">
@@ -1651,7 +1488,6 @@ onBeforeUnmount(() => {
 .tr-book-head strong, .tr-line strong, .num { font-variant-numeric: tabular-nums; }
 .tr-grid { display: grid; align-items: center; gap: 6px; padding: 4px 12px; font-size: 11px; }
 .tr-pos-grid { grid-template-columns: 14px minmax(78px,.9fr) 28px 40px minmax(56px,1fr) minmax(58px,1fr) minmax(64px,1fr) 48px; }
-.tr-grid-grid { grid-template-columns: 22px minmax(60px,1.2fr) 40px 40px minmax(64px,1fr) 48px; }
 .tr-hist-grid { grid-template-columns: 14px minmax(78px,.9fr) minmax(44px,.7fr) 28px 40px minmax(56px,1fr) minmax(56px,1fr) minmax(64px,1fr); }
 .tr-head { color: #5B6B85; background: #0A1120; border-bottom: 1px solid #16213A; font-size: 10px; }
 .tr-line { border-bottom: 1px dashed #1B2A48; }
@@ -1691,10 +1527,9 @@ onBeforeUnmount(() => {
    阈值取各 grid 的列宽下限之和（≈310–370px），720px 以上列宽本来就够，不再加限制。 */
 .tr-pos-grid { min-width: 360px; }
 .tr-pend-grid { min-width: 380px; }
-.tr-grid-grid { min-width: 300px; }
 .tr-hist-grid { min-width: 420px; }
 @media (min-width: 720px) {
-  .tr-pos-grid, .tr-pend-grid, .tr-grid-grid, .tr-hist-grid { min-width: 0; }
+  .tr-pos-grid, .tr-pend-grid, .tr-hist-grid { min-width: 0; }
 }
 /* 挂单量大时（网格单品种可挂几十张）限高滚动，避免撑爆整页 */
 .tr-pend-book .tr-grid { max-height: none; }

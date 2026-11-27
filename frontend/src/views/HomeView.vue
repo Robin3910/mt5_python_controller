@@ -263,7 +263,7 @@ const groupedNodes = computed(() => {
       balance: nodes.reduce((sum, n) => sum + (acct(n.node_id)?.balance || 0), 0),
       profit: nodes.reduce((sum, n) => sum + nodeProfit(acct(n.node_id)?.positions), 0),
     }
-  })
+  }).sort((a, b) => a.name.localeCompare(b.name, 'zh', { sensitivity: 'base' }))
 })
 
 
@@ -453,7 +453,7 @@ function reportCancelPending(res: CancelPendingResult): void {
               <span v-if="g.name" class="home-avatar" aria-hidden="true">{{ g.initial }}</span>
               <div class="home-group-text">
                 <strong v-if="g.name">{{ g.name }}</strong>
-                <p>{{ g.nodes.length }} 个节点 · {{ g.online }}/{{ g.nodes.length }} 在线 · 余额 {{ fmtMoney(g.balance) }}</p>
+                <p v-if="auth.isAdmin">{{ g.nodes.length }} 个节点 · {{ g.online }}/{{ g.nodes.length }} 在线 · 余额 {{ fmtMoney(g.balance) }}</p>
               </div>
               <span class="home-group-pnl" :class="g.profit >= 0 ? 'is-up' : 'is-down'">{{ fmtSigned(g.profit) }}</span>
             </header>

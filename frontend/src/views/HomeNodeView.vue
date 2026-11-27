@@ -9,7 +9,6 @@ import 'element-plus/es/components/message-box/style/css'
 import api from '@/api/client'
 import DealsTable from '@/components/DealsTable.vue'
 import NodeOverviewPanel from '@/components/NodeOverviewPanel.vue'
-import NodePositionsPanel from '@/components/NodePositionsPanel.vue'
 import type {
   AccountSnapshot,
   CancelPendingResult,
@@ -43,11 +42,10 @@ const channels = ref<FollowChannelsOut | null>(null)
 const channelError = ref('')
 const busy = ref('')
 const detailTabs = [
-  { key: 'positions', label: '持仓' },
   { key: 'overview', label: '概览' },
   { key: 'deals', label: '成交明细' },
 ] as const
-const detailTab = ref<(typeof detailTabs)[number]['key']>('positions')
+const detailTab = ref<(typeof detailTabs)[number]['key']>('overview')
 const canViewNodeConfig = computed(() => auth.hasMenu('nodes'))
 const canViewDeals = computed(() => canViewNodeConfig.value || auth.hasMenu('trading'))
 
@@ -414,42 +412,6 @@ async function closeChannel(mode: 'all' | 'profit' | 'ticket', ticket?: number):
         </div>
       </section>
 
-      <section class="hn-channel" aria-labelledby="hn-details-title">
-        <header class="hn-channel-head">
-          <p id="hn-details-title">节点详情</p>
-        </header>
-        <div class="hn-channel-body">
-          <div class="hn-tabs hn-detail-tabs" role="group" aria-label="节点详情视图">
-            <button
-              v-for="item in detailTabs"
-              :key="item.key"
-              type="button"
-              :class="{ on: detailTab === item.key }"
-              :aria-pressed="detailTab === item.key"
-              @click="detailTab = item.key"
-            >{{ item.label }}</button>
-          </div>
-
-          <div :key="id">
-            <div v-show="detailTab === 'positions'">
-              <NodePositionsPanel v-if="account" :positions="positions" />
-              <p v-else class="hn-empty">暂无账户快照</p>
-            </div>
-            <NodeOverviewPanel
-              v-if="detailTab === 'overview'"
-              :node="node"
-              :acct="account"
-              :show-performance="canViewDeals"
-              :show-config="canViewNodeConfig"
-            />
-            <template v-else-if="detailTab === 'deals'">
-              <DealsTable v-if="canViewDeals" :node-id="id" />
-              <p v-else class="hn-empty">当前角色没有成交明细查看权限</p>
-            </template>
-          </div>
-        </div>
-      </section>
-
       <section class="hn-channel">
         <header class="hn-channel-head">
           <p>
@@ -583,7 +545,39 @@ async function closeChannel(mode: 'all' | 'profit' | 'ticket', ticket?: number):
         </div>
       </section>
 
-      <p class="hn-note">频道列表只含 AI 交易与带单策略单。全部持仓可在上方「节点详情」查看。</p>
+      <p class="hn-note">频道列表只含 AI 交易与带单策略单。</p>
+
+      <section class="hn-channel" aria-labelledby="hn-details-title">
+        <header class="hn-channel-head">
+          <p id="hn-details-title">节点详情</p>
+        </header>
+        <div class="hn-channel-body">
+          <div class="hn-tabs hn-detail-tabs" role="group" aria-label="节点详情视图">
+            <button
+              v-for="item in detailTabs"
+              :key="item.key"
+              type="button"
+              :class="{ on: detailTab === item.key }"
+              :aria-pressed="detailTab === item.key"
+              @click="detailTab = item.key"
+            >{{ item.label }}</button>
+          </div>
+
+          <div :key="id">
+            <NodeOverviewPanel
+              v-if="detailTab === 'overview'"
+              :node="node"
+              :acct="account"
+              :show-performance="canViewDeals"
+              :show-config="canViewNodeConfig"
+            />
+            <template v-else-if="detailTab === 'deals'">
+              <DealsTable v-if="canViewDeals" :node-id="id" />
+              <p v-else class="hn-empty">当前角色没有成交明细查看权限</p>
+            </template>
+          </div>
+        </div>
+      </section>
     </template>
   </div>
 </template>

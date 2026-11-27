@@ -1021,12 +1021,12 @@ onMounted(() => { void hub.fetchNodes(); trackAiUi('page_view', { value: 'ai-tra
         </button>
         <button type="button" :class="{ on: mineTab === 'hist' }" @click="mineTab = 'hist'">
           <svg viewBox="0 0 24 24"><path fill="currentColor" d="M13 3a9 9 0 1 0 9 9h-2a7 7 0 1 1-2.05-4.95L16 9h5V4l-1.64 1.64A8.96 8.96 0 0 0 13 3zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8z"/></svg>
-          历史机器人<span>{{ historyMine.length }}</span>
+          历史<span>{{ historyMine.length }}</span>
         </button>
         <!-- <button type="button" :class="{ on: mineTab === 'pending' }" @click="mineTab = 'pending'">⌛ 待审核<span>{{ pendingApplications.length }}</span></button> -->
         <button type="button" class="push" :class="{ on: mineTab === 'nodes' }" @click="mineTab = 'nodes'">
           <svg viewBox="0 0 24 24"><path fill="currentColor" d="M22 11V3h-7v3H9V3H2v8h7V8h2v10h4v3h7v-8h-7v3h-2V8h2v3z"/></svg>
-          子节点跟单统计<span>{{ followNodeCount }}</span>
+          子节点跟单<span>{{ followNodeCount }}</span>
         </button>
       </div>
 

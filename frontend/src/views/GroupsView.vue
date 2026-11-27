@@ -3,10 +3,11 @@
 // 新建/编辑/删除分组、启停、维护成员节点、设置分组级分发模式；信号明细见 GroupSignalsView
 import { computed, defineAsyncComponent, onMounted, ref, reactive, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage, ElMessageBox, ElTable, ElTableColumn } from 'element-plus'
+import { ElMessage, ElMessageBox, ElSwitch, ElTable, ElTableColumn } from 'element-plus'
 import { vLoading } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
 import 'element-plus/es/components/message-box/style/css'
+import 'element-plus/es/components/switch/style/css'
 import 'element-plus/es/components/table/style/css'
 import 'element-plus/es/components/loading/style/css'
 import 'element-plus/es/components/tooltip/style/css'
@@ -36,6 +37,14 @@ const router = useRouter()
 const searchQuery = ref('')
 const appliedQuery = ref('')
 const loading = ref(false)
+const showAutoGroups = ref(false)
+
+function isAutoGroup(group: GroupOut): boolean {
+  return /^交易页自动创建（(?:trend_market|trend_limit|grid)）$/.test(group.remark ?? '')
+    || /^(?:trend_market|trend_limit|grid|AI-Augmentation)-.+-(?:\d+|unknown)-\S+$/.test(group.name)
+}
+
+const visibleGroups = computed(() => showAutoGroups.value ? hub.groups : hub.groups.filter(group => !isAutoGroup(group)))
 
 function currentSearchOptions(): { q?: string } {
   return appliedQuery.value ? { q: appliedQuery.value } : {}
@@ -470,7 +479,7 @@ function limitWatchButtonTitle(g: GroupOut): string {
   return `已开启 · ${watchKeywordLabel(g.limit_watch_keyword)}`
 }
 
-const showWatchLogColumn = computed(() => hub.groups.some((g) => g.limit_watch_enabled))
+const showWatchLogColumn = computed(() => visibleGroups.value.some((g) => g.limit_watch_enabled))
 
 // 手机端分组卡片：点标题行展开/收起明细
 const groupDetailOpen = reactive<Record<string, boolean>>({})
@@ -842,15 +851,16 @@ async function onStrategyFormSaved(): Promise<void> {
         <button class="btn-primary btn-sm" :disabled="loading" @click="runSearch">
           {{ loading ? '搜索中…' : '搜索' }}
         </button>
+        <ElSwitch v-model="showAutoGroups" active-text="显示自动创建的分组" aria-label="显示自动创建的分组" />
       </div>
       <p v-if="appliedQuery" class="muted" style="font-size: 12px; margin: 8px 0 0">
-        {{ hub.groups.length ? `找到 ${hub.groups.length} 个分组` : '无匹配分组' }}
+        {{ visibleGroups.length ? `找到 ${visibleGroups.length} 个分组` : '无匹配分组' }}
       </p>
     </div>
 
     <!-- 移动端卡片：默认只显示「标题 + 关键统计 + 常用开关」，点击展开明细 -->
     <div class="group-cards mobile-only">
-      <div v-for="g in hub.groups" :key="g.group_id" class="group-card card">
+      <div v-for="g in visibleGroups" :key="g.group_id" class="group-card card">
         <div class="group-head" @click="toggleGroupDetail(g.group_id)">
           <div class="group-head-main">
             <strong class="group-name">{{ g.name }}</strong>
@@ -999,7 +1009,7 @@ async function onStrategyFormSaved(): Promise<void> {
           </div>
         </div>
       </div>
-      <div v-if="!hub.groups.length && !loading" class="card card-pad muted">
+      <div v-if="!visibleGroups.length && !loading" class="card card-pad muted">
         {{ appliedQuery ? '无匹配分组' : '暂无分组' }}
       </div>
     </div>
@@ -1008,7 +1018,7 @@ async function onStrategyFormSaved(): Promise<void> {
     <div class="card groups-table-card desktop-only">
       <el-table
         :key="showWatchLogColumn ? 'watch' : 'plain'"
-        :data="hub.groups"
+        :data="visibleGroups"
         row-key="group_id"
         size="small"
         class="groups-table"

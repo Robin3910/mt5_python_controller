@@ -717,9 +717,6 @@ function entryGroupPositions(entry: MyFollowingEntry, groupId: string) {
   const group = entry.groups.find(g => g.group_id === groupId)
   return group ? groupPositions(group) : []
 }
-function magicLabel(g: FollowMyGroup) {
-  return 'MF ' + [...new Set(Object.values(g.magics || {}).flat())].join(' / ')
-}
 const books = computed(() => Object.fromEntries(myFollowing.value.flatMap(entry => entry.groups.map(g => {
   const live = groupPositions(g)
   const open = live.map(p => ({
@@ -1178,12 +1175,14 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
               <small>{{ selfMeta }}</small>
             </div>
             <div class="fd-self-side">
-              <em class="fd-self-run"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46A7.93 7.93 0 0 0 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74A7.93 7.93 0 0 0 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z"/></svg>{{ myLeader.follow_paused ? '带单已暂停' : selfOrders.length + ' 笔持仓' }}</em>
-              <button type="button" class="fd-self-hold" :class="{ on: myLeader.follow_paused }" :disabled="pauseBusy" @click="pauseMine">
-                <svg v-if="myLeader.follow_paused" viewBox="0 0 24 24"><path fill="currentColor" d="M8 5v14l11-7z"/></svg>
-                <svg v-else viewBox="0 0 24 24"><path fill="currentColor" d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
-                {{ myLeader.follow_paused ? '恢复带单' : '暂停带单' }}
-              </button>
+              <div class="fd-self-controls">
+                <em class="fd-self-run"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46A7.93 7.93 0 0 0 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74A7.93 7.93 0 0 0 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z"/></svg>{{ myLeader.follow_paused ? '带单已暂停' : selfOrders.length + ' 笔持仓' }}</em>
+                <button type="button" class="fd-self-hold" :class="{ on: myLeader.follow_paused }" :disabled="pauseBusy" @click="pauseMine">
+                  <svg v-if="myLeader.follow_paused" viewBox="0 0 24 24"><path fill="currentColor" d="M8 5v14l11-7z"/></svg>
+                  <svg v-else viewBox="0 0 24 24"><path fill="currentColor" d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+                  {{ myLeader.follow_paused ? '恢复带单' : '暂停带单' }}
+                </button>
+              </div>
               <button type="button" class="fd-self-link" @click="openShowcase()">查看带单员<svg viewBox="0 0 24 24"><path fill="currentColor" d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg></button>
             </div>
           </header>
@@ -1286,8 +1285,6 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
                 <p>
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" :d="(g.mode || groupModeKey(g.group_name, g.strategy_name)) === 'trend_limit' ? 'M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm0 2a8 8 0 1 1 0 16 8 8 0 1 1 0-16zm-1 2v7l5 3 1-2-4-2V6z' : 'M7 2v11h3v9l7-12h-4l4-8z'"/></svg>
                   <b>{{ SELF_MODE_LABEL[g.mode || ''] || groupDisplayTitle(g.group_name, g.strategy_name) }}</b>
-                  <em v-if="Object.values(g.magics || {}).flat().length" class="fd-mf" :title="magicLabel(g)">{{ magicLabel(g) }}</em>
-                  <em v-if="g.group_name" class="fd-node" :title="g.group_name"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M3 3h18v8H3zm0 10h18v8H3zm3-8v3h3V5zm0 10v3h3v-3z"/></svg>{{ g.group_name }}</em>
                   <span v-if="g.last_sync">同步 {{ fmtTime(g.last_sync) }}</span>
                 </p>
                 <div class="fd-self-actions">
@@ -1637,6 +1634,7 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 .fd-self-id { min-width: 0; flex: 1; }
 .fd-self-id b { font-size: 14px; font-weight: 700; }
 .fd-self-side { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex: 0 0 auto; }
+.fd-self-controls { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
 .fd-self .fd-self-run { gap: 4px; border: 1px solid #22304A; background: #0C1220; color: #8B96A8; border-radius: 999px; padding: 2px 8px; font-size: 10px; font-weight: 650; font-style: normal; }
 .fd-self-run svg { width: 11px; height: 11px; color: #22C55E; }
 .fd-self-link { gap: 2px; border: 0; background: transparent; color: #3B82F6; font-size: 10px; font-weight: 500; cursor: pointer; }
@@ -1648,10 +1646,6 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 .fd-self-row p { display: flex; align-items: center; gap: 6px; min-width: 0; margin: 0; flex: 1; overflow: hidden; }
 .fd-self-row p > svg { width: 13px; height: 13px; color: #A78BFA; }
 .fd-self-row b { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
-.fd-self .fd-mf, .fd-self .fd-node { border-radius: 4px; padding: 1px 4px; font-size: 9px; font-weight: 500; font-style: normal; flex: 0 0 auto; }
-.fd-mf { border: 1px solid #22304A; background: #0A101E; color: #5B6B85; font-family: ui-monospace, monospace; }
-.fd-node { display: inline-flex; align-items: center; gap: 2px; border: 1px solid rgba(124,58,237,.4); background: rgba(124,58,237,.1); color: #C4B5FD; }
-.fd-node svg { width: 10px; height: 10px; }
 .fd-self-row > p > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #5B6B85; font-size: 9px; }
 .fd-self-actions { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
 .fd-self-actions > em { display: inline-flex; align-items: center; gap: 4px; border: 0; border-radius: 999px; padding: 2px 8px; font-size: 10px; font-weight: 650; font-style: normal; }
@@ -1853,7 +1847,6 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
   .fd-leader-text b, .fd-card-top b, .fd-item-top b, .fd-self-id b, .fd-self-id small { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .fd-item-top p { flex: 1; }
   .fd-self-id small { display: block; }
-  .fd-self .fd-node { min-width: 0; max-width: 88px; flex: 0 1 auto; overflow: hidden; }
   .fd-self-row > p > span { max-width: 92px; }
   .fd-book-meta { min-width: 0; overflow: hidden; }
   .fd-book-meta i { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1905,8 +1898,6 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
 .fd-mine .fd-self-id b, .fd-mine .fd-self-id small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fd-mine .fd-self-id small { display: block; margin-top: 3px; color: #5b6b85; }
 .fd-mine .fd-self-run { gap: 4px; border: 1px solid #22304a; border-radius: 999px; background: #0c1220; color: #8b96a8; padding: 2px 8px; font-size: 10px; }
-.fd-mine .fd-mf, .fd-mine .fd-node { display: inline-block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100px; border-radius: 4px; font: 9px/16px ui-monospace,monospace; padding: 0 4px; }
-.fd-mine .fd-node svg { width: 10px; height: 10px; vertical-align: middle; }
 .fd-sync { color: #5b6b85; font-size: 10px; }
 .fd-mine .fd-book-head > span:first-child { flex-shrink: 0; }
 .fd-mine .fd-book-head > span:first-child b { color: #38bdf8; }
@@ -1953,7 +1944,6 @@ watch([myLeader, () => auth.canBeFollowLeader], () => { void loadSelfDetail() })
   .fd-mine .fd-self-row { flex-wrap: wrap; gap: 4px; }
   .fd-mine .fd-self-row p { flex: 1 1 100%; flex-wrap: wrap; }
   .fd-mine .fd-self-actions { margin-left: auto; }
-  .fd-mine .fd-mf, .fd-mine .fd-node { max-width: 110px; }
   .fd-mine .fd-stat3 > div { padding: 12px; }
 }
 </style>

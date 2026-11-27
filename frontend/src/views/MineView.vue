@@ -2,11 +2,8 @@
 // 「我的」枢纽页：账号卡片 + 模块入口网格（样式 1:1 复刻 UI/H5.html 的「我的」tab）
 import { computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
-import 'element-plus/es/components/message/style/css'
 import { useAuthStore } from '@/stores/auth'
 import { useHubStore } from '@/stores/hub'
-import { copyToClipboard } from '@/utils/clipboard'
 import { disconnectAdminWs } from '@/services/ws'
 import type { ProfileHubModule } from '@/api/types'
 
@@ -15,11 +12,6 @@ const hub = useHubStore()
 const router = useRouter()
 const userLabel = computed(() => auth.me?.display_name || auth.me?.username || '')
 const roleNames = computed(() => (auth.me?.roles || []).map((r) => r.name).join('、'))
-
-const WEBHOOK_URL = (() => {
-  if (typeof window === 'undefined') return '/webhook'
-  return new URL('/webhook', window.location.origin).href
-})()
 
 onMounted(() => {
   if (!hub.nodes.length) hub.fetchNodes().catch(() => {})
@@ -38,7 +30,7 @@ const strategyConfig: ProfileHubModule = {
 const ALL_MODULES: ProfileHubModule[] = [
   {
     code: 'follow_channel',
-    label: '我的带单频道',
+    label: '我的带单',
     description: '带单员信息 · 跟单节点审核',
     path: '/my-follow-channel',
     icon: '<circle cx="9" cy="8" r="3"/><path d="M3 21v-3a6 6 0 0 1 12 0v3M16 5a3 3 0 0 1 0 6M17 15a5 5 0 0 1 4 5"/>',
@@ -57,7 +49,7 @@ const ALL_MODULES: ProfileHubModule[] = [
   },
   {
     code: 'ai_channel',
-    label: 'AI交易机器人频道',
+    label: 'AI机器人',
     description: '机器人申请审核 · 频道管理',
     path: '/my-ai-channel',
     icon: '<rect x="4" y="8" width="16" height="12" rx="2"/><path d="M12 8V4M8 14h1M15 14h1M9 17h6"/>',
@@ -205,12 +197,6 @@ function go(path: string): void {
   router.push(path)
 }
 
-async function copyWebhook(): Promise<void> {
-  const ok = await copyToClipboard(WEBHOOK_URL)
-  if (ok) ElMessage.success('webhook 地址已复制')
-  else ElMessage.error('复制失败')
-}
-
 /** 退出登录：断开后台 WS 后清空登录态并回到登录页 */
 function logout(): void {
   disconnectAdminWs()
@@ -248,7 +234,6 @@ function logout(): void {
         <div class="mine-actions">
           <RouterLink to="/profile" class="pf-btn">个人中心</RouterLink>
           <button v-if="auth.isAdmin" type="button" class="pf-btn" @click="go('/config')">系统配置</button>
-          <button type="button" class="pf-btn" @click="copyWebhook">复制 webhook</button>
           <button type="button" class="pf-btn pf-btn-danger" @click="logout">退出登录</button>
         </div>
       </div>

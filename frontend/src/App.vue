@@ -133,7 +133,12 @@ watch(() => auth.token, setupWs)
     <NewsTopBanner v-if="authed" />
 
     <main :class="authed ? 'content' : 'content-full'">
-      <RouterView />
+      <RouterView v-slot="{ Component, route: viewRoute }">
+        <KeepAlive v-if="authed && auth.hasMenu('trading')" :key="auth.token">
+          <component :is="Component" v-if="viewRoute.name === 'trading'" />
+        </KeepAlive>
+        <component :is="Component" v-if="viewRoute.name !== 'trading'" />
+      </RouterView>
     </main>
   </div>
 </template>

@@ -1925,7 +1925,7 @@ function reportStrategyResult(res: ManualSignalResult, action: string, symbol: s
             <div class="od-row-label">以损定量<span class="od-req">必选</span></div>
             <div class="od-row-sub">满仓打到止损的最多亏损，据此算格子数量与每格手数</div>
           </div>
-          <div class="od-row-control od-input-affix req" :class="{ need: !(Number(gridParams.max_allow_loss) > 0) }">
+          <div class="od-row-control od-input-affix">
             <input v-model.number="gridParams.max_allow_loss" class="od-input" type="number" step="10" min="0" placeholder="如 100" />
             <span class="od-affix">USD</span>
           </div>
