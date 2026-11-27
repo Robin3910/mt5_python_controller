@@ -823,11 +823,15 @@ class RouteRuleIn(BaseModel):
     - `directions` 空 → 所有方向都收
 
     `group_ids` 是**唯一必填**的：没有目标分组的规则没有意义，服务端直接拒收。
+
+    **`type_by_timeframe`（周期 → 类型白名单）非空时**，扁平的 `signal_types` /
+    `timeframes` 不再参与匹配 —— 服务端会清空它们，避免两个语义并存造成困惑。
     """
     name: str = Field(min_length=1, max_length=64)
     enabled: bool = True
     signal_types: list[str] = Field(default_factory=list)
     timeframes: list[str] = Field(default_factory=list)
+    type_by_timeframe: dict[str, list[str]] = Field(default_factory=dict)
     directions: list[str] = Field(default_factory=list)
     group_ids: list[str] = Field(default_factory=list)
     priority: int = 100
@@ -851,6 +855,7 @@ class RouteRuleOut(BaseModel):
     enabled: bool = True
     signal_types: list[str] = Field(default_factory=list)
     timeframes: list[str] = Field(default_factory=list)
+    type_by_timeframe: dict[str, list[str]] = Field(default_factory=dict)
     directions: list[str] = Field(default_factory=list)
     group_ids: list[str] = Field(default_factory=list)
     volume: Optional[float] = None
@@ -874,6 +879,7 @@ def _rule_payload(body: RouteRuleIn) -> dict:
         "enabled": body.enabled,
         "signal_types": body.signal_types,
         "timeframes": body.timeframes,
+        "type_by_timeframe": body.type_by_timeframe,
         "directions": body.directions,
         "group_ids": body.group_ids,
         "priority": body.priority,

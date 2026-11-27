@@ -1035,6 +1035,11 @@ class SignalRouteRule(Base):
     `signal_types` 空 = 所有类型都收；`timeframes` 空 = 所有周期都收。
     唯一的例外是 `group_ids`：它为空时整条规则没有意义，保存时直接拒收。
 
+    **两种条件形态**（`type_by_timeframe` 非空时走新形态）：
+    - 扁平形态：`signal_types` × `timeframes` 各自独立匹配（笛卡尔积）；
+    - 映射形态：`type_by_timeframe` = 周期 → 类型白名单，一次性表达
+      「M1 只收 OB，M5 只收 FVG」这种**按周期区分类型**的诉求。
+
     **用 JSON 列存数组而不是关联表**：过滤条件是「集合匹配」，没有多对多的实体
     语义；规则数量级是几十条（不是几千条）；JSON 列在 MySQL / SQLite 都够用，
     且省掉 3 张关联表的 join。
@@ -1061,6 +1066,17 @@ class SignalRouteRule(Base):
     timeframes: Mapped[list | None] = mapped_column(JSON, nullable=True)
     # 方向（BUY / SELL）
     directions: Mapped[list | None] = mapped_column(JSON, nullable=True)
+
+    # —— 周期 → 类型 的**白名单映射**（新形态，空 dict / NULL = 走上面的扁平条件）——
+    # {"M1": ["ob"], "M5": ["fvg", "pdz"], "H1": []}
+    #
+    # key = 归一后的周期码；value = 该周期允许的类型码数组。
+    # **空数组 = 该周期不限类型**（收该周期全部类型），
+    # 而「map 里没有这个周期」= 该周期**不收**（白名单语义）。
+    #
+    # 为什么需要它：扁平的 signal_types × timeframes 是**笛卡尔积**，
+    # 表达不了「M1 只收 OB，M5 只收 FVG」。这个映射把两个维度合成一个条件。
+    type_by_timeframe: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     # —— 目标分组（必填，空 = 无效规则）——
     group_ids: Mapped[list] = mapped_column(JSON)

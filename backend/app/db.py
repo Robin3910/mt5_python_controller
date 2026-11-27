@@ -890,6 +890,25 @@ def _migrate_signal_meta_columns(sync_conn) -> None:
             )
 
 
+def _migrate_route_rule_type_map(sync_conn) -> None:
+    """signal_route_rule.type_by_timeframe：周期 → 类型 白名单映射列。
+
+    这是**新列**，存量行为零变化（NULL = 走旧的扁平条件）。
+    `create_all` 不会改已存在的表，所以必须显式 ALTER 补上。
+    """
+    inspector = inspect(sync_conn)
+    if "signal_route_rule" not in inspector.get_table_names():
+        return
+    cols = {c["name"] for c in inspector.get_columns("signal_route_rule")}
+    if "type_by_timeframe" in cols:
+        return
+    dialect = sync_conn.dialect.name
+    json_type = "JSON" if dialect == "mysql" else "TEXT"
+    sync_conn.execute(
+        text(f"ALTER TABLE signal_route_rule ADD COLUMN type_by_timeframe {json_type}")
+    )
+
+
 async def init_db() -> None:
     """不存在则建表。生产环境建议改用 Alembic 迁移而非 create_all。"""
     async with engine.begin() as conn:
@@ -932,6 +951,7 @@ async def init_db() -> None:
         await conn.run_sync(_migrate_user_reviews)
         await conn.run_sync(_migrate_news_blackout_tables)
         await conn.run_sync(_migrate_user_order_presets)
+        await conn.run_sync(_migrate_route_rule_type_map)
     logger.info("Database initialized (%s)", engine.url.render_as_string(hide_password=True))
 
 
