@@ -162,6 +162,19 @@ def test_rollback_release_swaps_pointer_and_stops_at_origin():
     assert cv.rollback_release(None) is None
 
 
+def test_force_directive_targets_caller_and_expires_when_release_changes():
+    directive = cv.build_force_directive("1.2.0", [2, 2, 0, "x"], "admin", "fid", now=10)
+    assert directive["user_ids"] == [2]
+    assert cv.force_for_caller(directive, "1.2.0", 2) == {"id": "fid", "version": "1.2.0"}
+    assert cv.force_for_caller(directive, "1.2.0", 9) is None
+    assert cv.force_for_caller(directive, "1.2.0", None) is None
+    assert cv.force_for_caller(directive, "1.3.0", 2) is None
+
+    everyone = cv.build_force_directive("1.2.0", [], "admin", "all", now=10)
+    assert cv.force_for_caller(everyone, "1.2.0", 9) == {"id": "all", "version": "1.2.0"}
+    assert cv.force_for_caller(everyone, "1.2.0", None) is None
+
+
 # ----------------------------- 接口 -----------------------------
 
 def test_client_versions_require_auth(client):
@@ -169,6 +182,7 @@ def test_client_versions_require_auth(client):
     assert client.post("/api/client-versions/1.0.0/release").status_code == 401
     assert client.delete("/api/client-versions/1.0.0").status_code == 401
     assert client.post("/api/client-versions/rollback").status_code == 401
+    assert client.post("/api/client-versions/force-push").status_code == 401
 
 
 def test_upload_reads_version_from_package(client):
@@ -364,6 +378,7 @@ def test_node_token_cannot_perform_admin_writes(client):
     assert client.post("/api/client-versions/1.1.0/release", headers=nh).status_code == 401
     assert client.delete("/api/client-versions/1.1.0", headers=nh).status_code == 401
     assert client.post("/api/client-versions/rollback", headers=nh).status_code == 401
+    assert client.post("/api/client-versions/force-push", headers=nh).status_code == 401
     assert client.get("/api/client-versions", headers=nh).status_code == 401
 
 
@@ -385,3 +400,63 @@ def test_version_list_reports_node_distribution(client):
     # 节点尚未上线上报版本，应计入 unknown 而不是挂到某个版本上
     assert listed["unknown_node_count"] == 1
     assert listed["items"][0]["node_count"] == 0
+
+
+def _user(client, headers, username: str) -> dict:
+    r = client.post(
+        "/api/users",
+        json={"username": username, "password": "pass1234"},
+        headers=headers,
+    )
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def test_force_push_reaches_targeted_user_and_clears_on_release_change(client):
+    h = _auth(client)
+    _upload(client, h, "1.0.0")
+    _upload(client, h, "1.1.0")
+    assert client.post("/api/client-versions/force-push", headers=h).status_code == 409
+
+    client.post("/api/client-versions/1.1.0/release", headers=h)
+    assert client.post(
+        "/api/client-versions/force-push", json={"user_ids": [99999]}, headers=h
+    ).status_code == 400
+
+    alice = _user(client, h, "alice")
+    bob = _user(client, h, "bob")
+    r = client.post(
+        "/api/client-versions/force-push",
+        json={"user_ids": [alice["id"]]},
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["version"] == "1.1.0"
+    assert r.json()["user_ids"] == [alice["id"]]
+
+    listed = client.get("/api/client-versions", headers=h).json()
+    assert listed["force"]["id"] == r.json()["id"]
+
+    alice_h = {
+        "Authorization": "Bearer "
+        + client.post("/api/login", json={"username": "alice", "password": "pass1234"}).json()["token"]
+    }
+    bob_h = {
+        "Authorization": "Bearer "
+        + client.post("/api/login", json={"username": "bob", "password": "pass1234"}).json()["token"]
+    }
+    alice_current = client.get("/api/client-versions/current", headers=alice_h)
+    assert alice_current.status_code == 200, alice_current.text
+    assert alice_current.json()["force"]["id"] == r.json()["id"]
+    bob_current = client.get("/api/client-versions/current", headers=bob_h).json()
+    assert "force" not in bob_current
+
+    nh = {"X-Node-Token": _node_token(client, h)}
+    assert "force" not in client.get("/api/client-versions/current", headers=nh).json()
+
+    audits = client.get("/api/audits", headers=h, params={"category": "system"}).json()
+    assert any(item["action"] == "force_push_client_version" for item in audits["items"])
+
+    client.post("/api/client-versions/1.0.0/release", json={"confirm_downgrade": True}, headers=h)
+    assert client.get("/api/client-versions", headers=h).json()["force"] is None
+    assert "force" not in client.get("/api/client-versions/current", headers=alice_h).json()

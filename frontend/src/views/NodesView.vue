@@ -400,7 +400,9 @@ function errText(e: unknown, fallback: string): string {
 
 async function remove(n: NodeOut): Promise<void> {
   try {
-    await deleteNodeWithConfirmation(n.node_id, currentSearchOptions())
+    const status = await deleteNodeWithConfirmation(n.node_id, currentSearchOptions())
+    if (status === 'pending') ElMessage.success('已提交，系统将在账户清空后自动删除')
+    if (status === 'deleted') ElMessage.success('节点已删除')
   } catch (e: unknown) {
     ElMessage.error(errText(e, '删除失败，请稍后重试'))
   }
@@ -706,9 +708,10 @@ async function submitAssign(confirm = false): Promise<void> {
                 v-if="auth.isAdmin || n.owner_user_id === auth.me?.user_id"
                 type="button"
                 class="pf-btn pf-btn-mini pf-btn-danger"
+                :disabled="n.deletion_pending"
                 @click="remove(n)"
               >
-                删除
+                {{ n.deletion_pending ? '等待删除' : '删除' }}
               </button>
             </div>
 

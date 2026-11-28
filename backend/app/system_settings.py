@@ -8,6 +8,7 @@
   覆盖 CONSUME_PRICE_LEVEL_ENABLED；关掉后指定价档位不再自动摘除；
 - 趋势面板参数 trend_config —— 全后台共享一份（JSON 落库，不分节点/币种）；
 - 客户端发布指针 client_release —— 当前发布的客户端版本及回滚落点。
+- 客户端强制更新令 client_force_update —— 控制端轮询时领取的一条待执行更新。
 """
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ from typing import Optional
 from sqlalchemy import select
 
 from . import trend_indicators
+from .client_version import FORCE_KEY as KEY_CLIENT_FORCE
 from .client_version import RELEASE_KEY as KEY_CLIENT_RELEASE
 from .db import SessionLocal
 from .orm import Node, SystemSetting
@@ -226,6 +228,29 @@ async def set_client_release(release: dict | None) -> dict:
     payload = release or {}
     await _upsert_setting(
         KEY_CLIENT_RELEASE,
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+    )
+    return payload
+
+
+async def get_client_force() -> dict:
+    """读取当前强制更新令；没有或损坏时返回空字典。"""
+    row = await _get_setting(KEY_CLIENT_FORCE)
+    if not row or not row.value:
+        return {}
+    try:
+        parsed = json.loads(row.value)
+    except json.JSONDecodeError:
+        logger.warning("client_force_update JSON 损坏，按「无更新令」处理")
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+async def set_client_force(directive: dict | None) -> dict:
+    """写入强制更新令；传空表示作废。"""
+    payload = directive or {}
+    await _upsert_setting(
+        KEY_CLIENT_FORCE,
         json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
     )
     return payload

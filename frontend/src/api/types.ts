@@ -192,6 +192,7 @@ export interface NodeOut {
   name: string
   enabled: boolean
   status: 'online' | 'offline'
+  deletion_pending?: boolean
   filters?: NodeDispatchFiltersConfig | null
   risk?: NodeRiskConfig | null
   mt5_login: number | null
@@ -2506,11 +2507,21 @@ export interface ClientReleaseOut {
   updated_at: number
 }
 
+/** 已下发的强制更新令；user_ids 为空表示全部已登录控制端 */
+export interface ClientForceOut {
+  id: string
+  version: string
+  user_ids: number[]
+  created_at: number
+  created_by: string
+}
+
 export interface ClientVersionListOut {
   items: ClientVersionOut[]
   release: ClientReleaseOut
   /** 未上报版本的节点数（旧客户端或从未上线） */
   unknown_node_count: number
+  force?: ClientForceOut | null
 }
 
 // ----------------------------- 用户与权限 -----------------------------

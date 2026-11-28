@@ -9,13 +9,13 @@ from datetime import datetime
 from fastapi import HTTPException
 from sqlalchemy import delete, func, select
 
-from . import ai_application_store as applications, follow_service, group_rules, node_lifecycle, permissions
+from . import ai_application_store as applications, follow_service, group_rules, mt5_identity, node_lifecycle, permissions
 from .connections import manager
 from .db import SessionLocal
 from .node_deletion_rules import deletion_blockers
 from .orm import (
     AiFollowApplication, AiFollowApplicationNode, DeletedNode, GroupFollowerNode,
-    GroupTaskDispatch, Node, NodeCredential, NodeGroupMember, SignalDispatch,
+    GroupTaskDispatch, Node, NodeCredential, NodeGroupMember, PendingNodeDeletion, SignalDispatch,
 )
 
 
@@ -56,7 +56,7 @@ async def _targets(session, store, principal, *, node_id=None, group_id=None, fo
     return nodes, entries
 
 
-async def _preview(session, store, principal, **scope):
+async def _preview(session, store, principal, *, settled=False, **scope):
     nodes, entries = await _targets(session, store, principal, **scope)
     ids = [node.node_id for node in nodes]
     members = (await session.scalars(select(NodeGroupMember).where(NodeGroupMember.node_id.in_(ids)))).all()
@@ -79,28 +79,38 @@ async def _preview(session, store, principal, **scope):
     blocked = []
     for node in nodes:
         account = await store.get_account(node.node_id)
+        online = manager.is_node_online(node.node_id)
+        if online and account and scope.get("node_id"):
+            connected_at = getattr(manager.nodes.get(node.node_id), "scope", {}).get("node_connected_at")
+            if connected_at and (float(account.get("updated_at") or 0) < connected_at
+                                 or mt5_identity.parse_login(account.get("login")) != node.mt5_login):
+                account = None
         active = await session.scalar(select(GroupTaskDispatch.id).where(
             GroupTaskDispatch.node_id == node.node_id,
             GroupTaskDispatch.status.notin_(group_rules.SUBTASK_TERMINAL),
-        ).limit(1))
-        pending = await session.scalar(select(SignalDispatch.id).where(
-            SignalDispatch.node_id == node.node_id, SignalDispatch.status.in_(["pending", "sent"]),
         ).limit(1))
         recent = []
         for model in (SignalDispatch, GroupTaskDispatch):
             values = (await session.execute(select(func.max(model.sent_at), func.max(model.finished_at))
                                            .where(model.node_id == node.node_id))).one()
             recent.extend(value.timestamp() for value in values if value is not None)
+        pending = None
         occupied = False
-        for pattern in (f"lock:exec:{node.node_id}:*", f"group:node:busy:*:{node.node_id}",
-                        f"cancel_pending:lock:{node.node_id}", f"cancel_pending:busy:{node.node_id}",
-                        f"limit_watch:lock:{node.node_id}:*"):
-            if any([key async for key in store.r.scan_iter(match=pattern, count=100)]):
-                occupied = True
-                break
-        reasons = deletion_blockers(account, online=manager.is_node_online(node.node_id), now=time.time(),
+        if not settled:
+            pending = await session.scalar(select(SignalDispatch.id).where(
+                SignalDispatch.node_id == node.node_id, SignalDispatch.status.in_(["pending", "sent"]),
+            ).limit(1))
+            for pattern in (f"lock:exec:{node.node_id}:*", f"group:node:busy:*:{node.node_id}",
+                            f"cancel_pending:lock:{node.node_id}", f"cancel_pending:busy:{node.node_id}",
+                            f"limit_watch:lock:{node.node_id}:*"):
+                if any([key async for key in store.r.scan_iter(match=pattern, count=100)]):
+                    occupied = True
+                    break
+        reasons = deletion_blockers(account, online=online, now=time.time(),
                                     active=active is not None, pending=pending is not None, occupied=occupied,
                                     last_trade_at=max(recent) if recent else None)
+        if scope.get("node_id") and account and account.get("mt5_link") == "offline":
+            reasons.append("MT5 与券商断开")
         if reasons:
             blocked.append({"node_id": node.node_id, "name": node.name, "reasons": reasons})
     groups = {r.group_id for r in members + followers}
@@ -124,7 +134,8 @@ async def preview(store, principal, *, record=False, ip=None, **scope):
         if record:
             applications.audit(session, principal, "preview_ai_channel_deletion" if scope.get("group_id") else "preview_node_deletion",
                 scope.get("group_id") or scope.get("node_id"), after=result, ip=ip,
-                result="failed" if result["blocked"] else "ok", category="ai_follow" if scope.get("group_id") else "node")
+                result="failed" if scope.get("group_id") and result["blocked"] else "ok",
+                category="ai_follow" if scope.get("group_id") else "node")
             await session.commit()
         return result
 
@@ -138,43 +149,56 @@ async def execute(store, principal, version, expected_ids, *, ip=None, **scope):
         current = await _preview(session, store, principal, **scope)
         if current["version"] != version or set(current["node_ids"]) != set(expected_ids):
             raise HTTPException(409, "删除范围已变化，请重新预览并确认")
+        node_id = scope.get("node_id")
+        if node_id and (current["blocked"] or node_id in node_lifecycle.pending_deletions):
+            from .node_deletion_jobs import enqueue
+            return await enqueue(session, principal, current, ip)
         if current["blocked"]:
             raise HTTPException(409, {"message": "存在交易或状态不明的节点，整次删除已阻止", "blocked": current["blocked"]})
-        ids = current["node_ids"]
-        await session.execute(select(Node).where(Node.node_id.in_(ids)).with_for_update())
-        groups = set((await session.scalars(select(NodeGroupMember.group_id).where(NodeGroupMember.node_id.in_(ids)))).all())
-        groups.update((await session.scalars(select(GroupFollowerNode.group_id).where(GroupFollowerNode.node_id.in_(ids)))).all())
-        for node in current["nodes"]:
-            tombstone = await session.get(DeletedNode, node["mt5_login"])
-            if tombstone is None:
-                session.add(DeletedNode(mt5_login=node["mt5_login"], node_id=node["node_id"], deleted_by_user_id=principal.user_id))
-            else:
-                tombstone.node_id = node["node_id"]
-                tombstone.deleted_by_user_id = principal.user_id
-                tombstone.deleted_at = datetime.now()
-        await applications.cancel_nodes(session, ids, "系统节点已删除")
-        from .follow_requests import cancel
-        await cancel(session, "系统节点已删除", node_ids=ids, pending_only=False)
-        await cancel(session, "带单源节点已删除", primary_ids=ids)
-        source_groups = (await session.scalars(select(AiFollowApplication.group_id).where(
-            AiFollowApplication.leader_primary_node_id.in_(ids), AiFollowApplication.status == "pending",
-        ))).all()
-        await applications.cancel_applications(session, "机器人主节点已删除", group_ids=source_groups, pending_only=True)
-        for model in (NodeCredential, NodeGroupMember, GroupFollowerNode, Node):
-            await session.execute(delete(model).where(model.node_id.in_(ids)))
-        applications.audit(session, principal, "delete_ai_channel_nodes" if scope.get("group_id") else "delete_node", scope.get("group_id") or scope.get("node_id"),
-            before=current, after={"deleted_node_ids": ids}, ip=ip, category="ai_follow" if scope.get("group_id") else "node")
-        await session.commit()
-        for nid in ids:
-            ws = manager.nodes.pop(nid, None)
-            if ws:
-                try:
-                    await ws.close(code=4401)
-                except (RuntimeError, ConnectionError):
-                    pass
-        for nid in ids:
-            await store.delete_node(nid)
-        await follow_service._refresh_groups(store, groups)
+        return await _delete_current(session, store, principal, current, ip=ip, **scope)
+
+
+async def notify_deletion(node_id, status):
+    await manager.broadcast_admin({"type": "node_deletion", "data": {"node_id": node_id, "status": status}})
+
+
+async def _delete_current(session, store, principal, current, *, ip=None, **scope):
+    ids = current["node_ids"]
+    await session.execute(select(Node).where(Node.node_id.in_(ids)).with_for_update())
+    groups = set((await session.scalars(select(NodeGroupMember.group_id).where(NodeGroupMember.node_id.in_(ids)))).all())
+    groups.update((await session.scalars(select(GroupFollowerNode.group_id).where(GroupFollowerNode.node_id.in_(ids)))).all())
+    for node in current["nodes"]:
+        tombstone = await session.get(DeletedNode, node["mt5_login"])
+        if tombstone is None:
+            session.add(DeletedNode(mt5_login=node["mt5_login"], node_id=node["node_id"], deleted_by_user_id=principal.user_id))
+        else:
+            tombstone.node_id = node["node_id"]
+            tombstone.deleted_by_user_id = principal.user_id
+            tombstone.deleted_at = datetime.now()
+    await applications.cancel_nodes(session, ids, "系统节点已删除")
+    from .follow_requests import cancel
+    await cancel(session, "系统节点已删除", node_ids=ids, pending_only=False)
+    await cancel(session, "带单源节点已删除", primary_ids=ids)
+    source_groups = (await session.scalars(select(AiFollowApplication.group_id).where(
+        AiFollowApplication.leader_primary_node_id.in_(ids), AiFollowApplication.status == "pending",
+    ))).all()
+    await applications.cancel_applications(session, "机器人主节点已删除", group_ids=source_groups, pending_only=True)
+    for model in (PendingNodeDeletion, NodeCredential, NodeGroupMember, GroupFollowerNode, Node):
+        await session.execute(delete(model).where(model.node_id.in_(ids)))
+    applications.audit(session, principal, "delete_ai_channel_nodes" if scope.get("group_id") else "delete_node", scope.get("group_id") or scope.get("node_id"),
+        before=current, after={"deleted_node_ids": ids}, ip=ip, category="ai_follow" if scope.get("group_id") else "node")
+    await session.commit()
+    for nid in ids:
+        ws = manager.nodes.pop(nid, None)
+        if ws:
+            try:
+                await ws.close(code=4401)
+            except (RuntimeError, ConnectionError):
+                pass
+        await notify_deletion(nid, "deleted")
+        await store.delete_node(nid)
+        node_lifecycle.pending_deletions.discard(nid)
+    await follow_service._refresh_groups(store, groups)
     await manager.broadcast_admin({"type": "nodes_changed", "data": {"deleted_node_ids": ids}})
     return {"status": "deleted", "node_ids": ids}
 

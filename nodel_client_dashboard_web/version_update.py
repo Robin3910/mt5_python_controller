@@ -16,6 +16,8 @@
 """
 from __future__ import annotations
 
+import json
+import logging
 import tempfile
 import threading
 import time
@@ -27,6 +29,7 @@ from typing import Any
 import version_service as vs
 from client_deploy import (
     DOWNGRADE,
+    UPGRADE,
     classify_update,
     count_pending_upgrades,
     extract_package,
@@ -34,6 +37,8 @@ from client_deploy import (
     read_version_near,
     update_label,
 )
+
+logger = logging.getLogger(__name__)
 
 # 进度步骤标识
 STEP_DOWNLOAD = "download"
@@ -106,6 +111,14 @@ class VersionUpdateController:
         self._pending_cache_at = 0.0
         # 顶栏徽标的缓存值：快照读它，保证零阻塞
         self._badge: dict[str, Any] = {"published": "", "pending": 0}
+        # 最近一次成功拉到的当前版本正文；只有刚拉到的才用于领取强制更新令
+        self._fresh_current: dict[str, Any] = {}
+        self._force_applied = ""
+        self._force_inflight = ""
+        self._force_pending_task = ""
+        self._force_pending_id = ""
+        self._force_retry_at = 0.0
+        self._load_applied_force()
 
     # ── 进度表 ──
 
@@ -157,12 +170,14 @@ class VersionUpdateController:
             target = self._bridge.version_target()
             data = vs.fetch_current_version(target)
             version = str((data or {}).get("version") or "")
+            payload = data if isinstance(data, dict) else {}
         except Exception:  # noqa: BLE001 - 取不到就沿用旧值，不打扰用户
             with self._lock:
                 return self._published
         with self._lock:
             self._published = version
             self._published_at = time.monotonic()
+            self._fresh_current = payload
         return version
 
     def pending_count(self, published: str = "") -> int:
@@ -202,12 +217,23 @@ class VersionUpdateController:
 
     def refresh_badge(self) -> dict[str, Any]:
         """重新算一遍徽标并写进缓存（后台线程调用，可阻塞）。"""
+        fresh: dict[str, Any] | None = None
         try:
+            with self._lock:
+                seen = self._published_at
             published = self.published()
+            with self._lock:
+                if self._published_at != seen:
+                    fresh = dict(self._fresh_current)
             pending = self.pending_count(published)
         except Exception:  # noqa: BLE001 - 未登录 / 后端不可达时沿用旧值
             with self._lock:
                 return dict(self._badge)
+        if fresh is not None:
+            try:
+                self.apply_force(fresh)
+            except Exception:  # noqa: BLE001 - 领取失败留到下一轮
+                logger.warning("force client update skipped", exc_info=True)
         with self._lock:
             self._badge = {"published": published, "pending": pending}
             return dict(self._badge)
@@ -225,6 +251,99 @@ class VersionUpdateController:
         threading.Thread(
             target=self.refresh_badge, name="badge-refresh-now", daemon=True
         ).start()
+
+    # ── 服务器强制更新令 ──
+
+    def _applied_path(self) -> Path:
+        from paths import data_dir
+
+        return data_dir() / "force_update.json"
+
+    def _load_applied_force(self) -> None:
+        try:
+            data = json.loads(self._applied_path().read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            return
+        if isinstance(data, dict):
+            self._force_applied = str(data.get("id") or "")
+
+    def _write_force_id(self, force_id: str) -> None:
+        """调用方须已持有 self._lock。"""
+        self._force_applied = force_id
+        self._force_inflight = ""
+        self._force_retry_at = 0.0
+        try:
+            self._applied_path().write_text(
+                json.dumps({"id": force_id}, ensure_ascii=False), encoding="utf-8"
+            )
+        except OSError:
+            logger.warning("failed to persist force update id %s", force_id)
+
+    def _behind_ids(self, version: str) -> list[str]:
+        ids: list[str] = []
+        for cfg in self._bridge.manager.configs():
+            current = read_version_near(cfg.exe_path)
+            if classify_update(current, version) == UPGRADE:
+                ids.append(cfg.id)
+        return ids
+
+    def apply_force(self, data: dict[str, Any] | None) -> None:
+        """领取强制更新令：只升级落后实例，同一条令成功后不再执行。"""
+        if not isinstance(data, dict):
+            return
+        force = data.get("force")
+        if not isinstance(force, dict):
+            return
+        force_id = str(force.get("id") or "").strip()
+        version = str(force.get("version") or data.get("version") or "").strip()
+        sha = str(data.get("sha256") or "").strip()
+        if not force_id or not version:
+            return
+        with self._lock:
+            if time.monotonic() < self._force_retry_at:
+                return
+            if force_id in (self._force_applied, self._force_inflight) or self._force_pending_id == force_id:
+                return
+            self._force_inflight = force_id
+        ids = self._behind_ids(version)
+        if not ids:
+            self._remember_force(force_id)
+            return
+        try:
+            result = self.start_update(
+                {"version": version, "sha256": sha, "ids": ids},
+                force_id=force_id,
+            )
+        except Exception:
+            self._clear_inflight(force_id)
+            raise
+        if not result.get("ok"):
+            self._clear_inflight(force_id)
+
+    def _remember_force(self, force_id: str) -> None:
+        with self._lock:
+            self._write_force_id(force_id)
+
+    def _clear_inflight(self, force_id: str) -> None:
+        with self._lock:
+            if self._force_inflight == force_id and self._force_pending_id != force_id:
+                self._force_inflight = ""
+                self._force_retry_at = time.monotonic() + RELEASE_TTL_S
+
+    def _settle_force_locked(self, task_id: str, *, error: str, results: list | None) -> None:
+        """调用方须已持有 self._lock。成功才记为已执行，失败留到下一轮再试。"""
+        if self._force_pending_task != task_id:
+            return
+        force_id = self._force_pending_id
+        self._force_pending_task = ""
+        self._force_pending_id = ""
+        failed = bool(error) or any(not getattr(item, "ok", False) for item in (results or []))
+        if failed or not force_id:
+            if self._force_inflight == force_id:
+                self._force_inflight = ""
+            self._force_retry_at = time.monotonic() + RELEASE_TTL_S
+            return
+        self._write_force_id(force_id)
 
     def detect(self) -> dict[str, Any]:
         """检测后端发布版本与可下载版本清单（强制刷新缓存）。"""
@@ -338,7 +457,7 @@ class VersionUpdateController:
 
     # ── 异步执行 ──
 
-    def start_update(self, body: dict[str, Any]) -> dict[str, Any]:
+    def start_update(self, body: dict[str, Any], force_id: str = "") -> dict[str, Any]:
         """启动「更新到指定版本」任务，立即返回 task_id。"""
         self._bridge.session.check()
         version = str(body.get("version") or "").strip()
@@ -348,7 +467,7 @@ class VersionUpdateController:
             return {"ok": False, "error": "目标版本为空", "task_id": ""}
         if not ids:
             return {"ok": False, "error": "请先勾选要更新的实例", "task_id": ""}
-        return self._start("update", version, sha256, ids)
+        return self._start("update", version, sha256, ids, force_id=force_id)
 
     def start_rollback(self, body: dict[str, Any]) -> dict[str, Any]:
         """启动「回滚到本机备份」任务，立即返回 task_id。"""
@@ -376,13 +495,18 @@ class VersionUpdateController:
             }
         return self._start("rollback", version, "", usable)
 
-    def _start(self, kind: str, version: str, sha256: str, ids: list[str]) -> dict[str, Any]:
+    def _start(
+        self, kind: str, version: str, sha256: str, ids: list[str], force_id: str = ""
+    ) -> dict[str, Any]:
         with self._lock:
             if self._active:
                 return {"ok": False, "error": "上一个版本操作还在进行中", "task_id": self._active}
             task_id = uuid.uuid4().hex[:12]
             self._tasks[task_id] = UpdateTask(task_id=task_id, kind=kind)
             self._active = task_id
+            if force_id:
+                self._force_pending_task = task_id
+                self._force_pending_id = force_id
 
         thread = threading.Thread(
             target=self._run,
@@ -540,3 +664,4 @@ class VersionUpdateController:
                 self.invalidate_badge()
             if self._active == task_id:
                 self._active = ""
+            self._settle_force_locked(task_id, error=error, results=results)

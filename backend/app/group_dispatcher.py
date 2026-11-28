@@ -1504,12 +1504,14 @@ class GroupDispatcher:
         }
 
     async def _dispatch_locked_node(self, base: dict, command: dict, *, hold_busy: bool = True, follower_id: int | None = None) -> dict:
-        async with node_lifecycle.locked(node_lifecycle.node_key(base["node_id"])):
-            if await self.store.get_node(base["node_id"]) is None:
+        node_id = base["node_id"]
+        async with node_lifecycle.locked(node_lifecycle.node_key(node_id)):
+            pending_deletion = node_id in node_lifecycle.pending_deletions
+            if pending_deletion or await self.store.get_node(node_id) is None:
                 if hold_busy:
-                    await self.store.release_group_node_busy(base["group_id"], base["node_id"])
-                return {"node_id": base["node_id"], "status": "skipped", "magic": None,
-                        "volume": base["decided_vol"], "reason": "节点已删除"}
+                    await self.store.release_group_node_busy(base["group_id"], node_id)
+                return {"node_id": node_id, "status": "skipped", "magic": None, "volume": base["decided_vol"],
+                        "reason": "节点等待删除" if pending_deletion else "节点已删除"}
             return await self._dispatch_locked_node_active(base, command, hold_busy=hold_busy, follower_id=follower_id)
 
     async def _dispatch_locked_node_active(

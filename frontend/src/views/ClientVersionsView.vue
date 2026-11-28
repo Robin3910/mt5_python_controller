@@ -5,16 +5,18 @@ import { computed, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
 import 'element-plus/es/components/message-box/style/css'
+import api from '@/api/client'
 import { useClientVersionStore } from '@/stores/clientVersion'
 import { useHubStore } from '@/stores/hub'
 import { confirmAction } from '@/utils/confirm'
-import type { ClientVersionOut } from '@/api/types'
+import type { ClientVersionOut, UserOut } from '@/api/types'
 
 const store = useClientVersionStore()
 const hub = useHubStore()
 
 const DOWNGRADE_CONFIRM_TEXT = '确认降级'
 const ROLLBACK_CONFIRM_TEXT = '确认回滚'
+const FORCE_CONFIRM_TEXT = '确认推送'
 
 const fileInput = ref<HTMLInputElement | null>(null)
 const picked = ref<File | null>(null)
@@ -22,6 +24,12 @@ const formVersion = ref('')
 const formNotes = ref('')
 const uploading = ref(false)
 const uploadError = ref('')
+const forceOpen = ref(false)
+const forcing = ref(false)
+const forceConfirm = ref('')
+const forceUserIds = ref<number[]>([])
+const forceUsers = ref<UserOut[]>([])
+const forceUsersLoaded = ref(false)
 
 const uploadPct = computed(() => store.uploadProgress)
 
@@ -187,6 +195,48 @@ async function rollback(): Promise<void> {
   }
 }
 
+function userLabel(user: UserOut): string {
+  const name = user.display_name || user.username
+  return name === user.username ? name : `${name}（${user.username}）`
+}
+
+function forceStatus(): string {
+  const force = store.force
+  if (!force?.id) return ''
+  const who = force.user_ids.length ? `${force.user_ids.length} 个用户` : '全部用户'
+  return `已下发 v${force.version}，目标 ${who}，${fmtTime(force.created_at)}`
+}
+
+async function openForce(): Promise<void> {
+  if (!store.release.version) return
+  forceOpen.value = true
+  forceConfirm.value = ''
+  forceUserIds.value = []
+  if (forceUsersLoaded.value) return
+  try {
+    const rows = (await api.get<UserOut[]>('/api/users')).data || []
+    forceUsers.value = rows.filter((user) => user.is_active)
+    forceUsersLoaded.value = true
+  } catch (e: unknown) {
+    ElMessage.error(errText(e, '用户列表加载失败'))
+  }
+}
+
+async function submitForce(): Promise<void> {
+  if (forceConfirm.value !== FORCE_CONFIRM_TEXT || forcing.value) return
+  forcing.value = true
+  try {
+    const picked = forceUserIds.value.slice()
+    await store.forcePush(picked)
+    ElMessage.success(picked.length ? '已向指定用户的控制端下发更新' : '已向全部控制端下发更新')
+    forceOpen.value = false
+  } catch (e: unknown) {
+    ElMessage.error(errText(e, '强制推送失败，请稍后重试'))
+  } finally {
+    forcing.value = false
+  }
+}
+
 async function remove(v: ClientVersionOut): Promise<void> {
   const ok = await confirmAction(
     `确认删除版本 v${v.version}？\n\n安装包文件会一并删除，该操作不可恢复。`,
@@ -255,6 +305,51 @@ onMounted(async () => {
         <div class="pf-metric">
           <p class="pf-metric-k">发布状态</p>
           <p class="pf-metric-v">{{ store.release.version ? '分发中' : '未发布' }}</p>
+        </div>
+      </div>
+
+      <div class="cv-force">
+        <button
+          type="button"
+          class="pf-btn cv-force-btn"
+          :disabled="!store.release.version || forcing"
+          @click="openForce"
+        >
+          强制推送更新
+        </button>
+        <p v-if="forceStatus()" class="pf-hint">{{ forceStatus() }}</p>
+      </div>
+
+      <div v-if="forceOpen" class="cv-force-panel">
+        <p class="pf-hint">
+          在线控制端约 1 分钟内会领到这条指令，对版本低于
+          v{{ store.release.version }} 的实例直接停止、备份、覆盖并重启，本机不再确认。
+          .env 不会被覆盖。版本更高的实例不会被降级。不勾选用户则推送给全部控制端。
+          正在启停而被跳过的实例，控制端下一轮查询会再试。
+        </p>
+        <div class="cv-force-users">
+          <label v-for="user in forceUsers" :key="user.id" class="cv-force-user">
+            <input v-model="forceUserIds" type="checkbox" :value="user.id" :disabled="forcing" />
+            <span>{{ userLabel(user) }}</span>
+          </label>
+          <span v-if="forceUsersLoaded && !forceUsers.length" class="pf-hint">暂无可用用户，将推送给全部控制端</span>
+        </div>
+        <input
+          v-model="forceConfirm"
+          class="pf-input"
+          :placeholder="`输入「${FORCE_CONFIRM_TEXT}」`"
+          :disabled="forcing"
+        />
+        <div class="cv-force-actions">
+          <button
+            type="button"
+            class="pf-btn pf-btn-primary"
+            :disabled="forcing || forceConfirm !== FORCE_CONFIRM_TEXT"
+            @click="submitForce"
+          >
+            {{ forcing ? '下发中…' : '确认推送' }}
+          </button>
+          <button type="button" class="pf-btn" :disabled="forcing" @click="forceOpen = false">取消</button>
         </div>
       </div>
     </section>
@@ -470,6 +565,55 @@ onMounted(async () => {
 
 .cv-metrics {
   margin-top: 12px;
+}
+
+.cv-force {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.cv-force-btn {
+  color: #fbbf24;
+  border-color: rgba(245, 158, 11, 0.4);
+  background: rgba(245, 158, 11, 0.1);
+}
+.cv-force-btn:hover:not(:disabled) {
+  color: #fbbf24;
+  border-color: rgba(245, 158, 11, 0.55);
+  background: rgba(245, 158, 11, 0.2);
+}
+
+.cv-force-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.cv-force-users {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  max-height: 160px;
+  overflow: auto;
+}
+
+.cv-force-user {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--pf-text);
+}
+
+.cv-force-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 /* ── 上一版本 ── */

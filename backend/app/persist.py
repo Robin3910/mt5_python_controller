@@ -219,36 +219,28 @@ async def update_dispatch_result(signal_id, node_id, status, result: Optional[di
         logger.warning("update_dispatch_result failed: %s", e)
 
 
-async def record_manual_close(signal_id: str, node_id: str, target: str,
-                              symbol: Optional[str] = None, ticket: Optional[int] = None) -> None:
-    """落库一条手动平仓记录，供详情页成交回报展示。"""
+def add_manual_close(session, signal_id: str, node_id: str, target: str,
+                     symbol: Optional[str] = None, ticket: Optional[int] = None) -> None:
     labels = {
         "all": "手动全平",
         "symbol": f"手动平品种 {symbol or ''}".strip(),
         "ticket": f"手动平订单 #{ticket}" if ticket else "手动平仓",
     }
+    session.add(SignalHistory(
+        signal_id=signal_id, action="CLOSE", symbol=symbol, parsed_ok=True,
+        dispatch_mode="manual", status="dispatching", comment=labels.get(target, "手动平仓"),
+    ))
+    session.add(SignalDispatch(
+        signal_id=signal_id, node_id=node_id, gate_result="passed", status="sent", dispatched_at=datetime.now(),
+    ))
+
+
+async def record_manual_close(signal_id: str, node_id: str, target: str,
+                              symbol: Optional[str] = None, ticket: Optional[int] = None) -> None:
+    """落库一条手动平仓记录，供详情页成交回报展示。"""
     try:
         async with SessionLocal() as s:
-            s.add(
-                SignalHistory(
-                    signal_id=signal_id,
-                    action="CLOSE",
-                    symbol=symbol,
-                    parsed_ok=True,
-                    dispatch_mode="manual",
-                    status="dispatching",
-                    comment=labels.get(target, "手动平仓"),
-                )
-            )
-            s.add(
-                SignalDispatch(
-                    signal_id=signal_id,
-                    node_id=node_id,
-                    gate_result="passed",
-                    status="sent",
-                    dispatched_at=datetime.now(),
-                )
-            )
+            add_manual_close(s, signal_id, node_id, target, symbol, ticket)
             await s.commit()
     except Exception as e:  # noqa: BLE001
         logger.warning("record_manual_close failed: %s", e)

@@ -25,6 +25,7 @@ from . import (
     mt5_link,
     node_service,
     node_credentials,
+    node_deletion_jobs,
     node_lifecycle,
     persist,
     results,
@@ -215,6 +216,7 @@ async def node_ws(ws: WebSocket):
         await node_service.report_client_version(store, node_id, data.get("client_version") or "")
         # 删除与最终登记互斥，避免已通过首轮鉴权的旧连接在删除后重新登记。
         ws.scope["node_credential_kind"] = "scoped" if scoped else "legacy"
+        ws.scope["node_connected_at"] = time.time()
         await manager.register_node(node_id, ws)
         await store.touch_online(node_id)
         watch_symbols = rules.filter_watch_symbols(await store.get_filters())
@@ -231,7 +233,11 @@ async def node_ws(ws: WebSocket):
         )
         await manager.broadcast_admin({"type": "node_status", "data": {"node_id": node_id, "status": "online"}})
     await _flush_pending_stops(node_id, ws)
-    await _resume_strategy_tasks(node_id, ws)
+    async with node_lifecycle.locked(node_lifecycle.node_key(node_id)):
+        if node_id in node_lifecycle.pending_deletions:
+            ws.scope["node_resume_deferred"] = True
+        else:
+            await _resume_strategy_tasks(node_id, ws)
     await _resend_cancel_pending_orphans(node_id, ws)
 
     try:
@@ -264,13 +270,15 @@ async def _session(node_id: str, ws: WebSocket) -> None:
             # 心跳：续期在线 TTL；若心跳里捎带了账户快照也一并保存
             await store.touch_online(node_id)
             if data.get("account") or data.get("positions"):
-                await _save_account(node_id, ws, data)
+                if await _save_account(node_id, ws, data):
+                    return
             await ws.send_json({"type": "pong", "data": {"ts": time.time()}})
 
         elif mtype == "account":
             # 账户快照上报
             await store.touch_online(node_id)
-            await _save_account(node_id, ws, data)
+            if await _save_account(node_id, ws, data):
+                return
 
         elif mtype == "trade_result":
             # 成交回报
@@ -314,16 +322,16 @@ async def _session(node_id: str, ws: WebSocket) -> None:
             logger.debug("node %s unknown msg type=%s", node_id, mtype)
 
 
-async def _save_account(node_id, ws, data):
+async def _save_account(node_id, ws, data) -> bool:
     from .node_lifecycle import locked, node_key
     async with locked(node_key(node_id)):
         if await state.store.get_node(node_id) is None:
             await ws.close(code=4401)
-            return
-        await _save_account_active(node_id, ws, data)
+            return True
+        return await _save_account_active(node_id, ws, data)
 
 
-async def _save_account_active(node_id: str, ws: WebSocket, data: dict) -> None:
+async def _save_account_active(node_id: str, ws: WebSocket, data: dict) -> bool:
     """把节点上报的账户/持仓/报价整理成标准快照，存 Redis 并推送后台。
 
     若上报 login 与节点绑定不符，拒绝入库并断开连接。
@@ -384,8 +392,17 @@ async def _save_account_active(node_id: str, ws: WebSocket, data: dict) -> None:
         await _sync_leader_close(node_id, positions or [], orders or [])
         await _reconcile_strategy_tasks(node_id, positions or [], orders or [])
     await manager.broadcast_admin({"type": "account", "data": snapshot})
-    if books_ok:
+    if node_id in node_lifecycle.pending_deletions and manager.nodes.get(node_id) is ws:
+        try:
+            if await node_deletion_jobs.advance_deletion(store, state.group_dispatcher, snapshot):
+                return True
+        except Exception:  # noqa: BLE001
+            logger.exception("advance node deletion failed for %s", node_id)
+        if node_id not in node_lifecycle.pending_deletions and ws.scope.pop("node_resume_deferred", False):
+            await _resume_strategy_tasks(node_id, ws)
+    if books_ok and node_id not in node_lifecycle.pending_deletions:
         asyncio.create_task(_run_limit_watch(node_id, orders or []))
+    return False
 
 
 async def _sync_leader_close(node_id: str, positions: list, orders: list) -> None:

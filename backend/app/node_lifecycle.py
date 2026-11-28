@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from weakref import WeakValueDictionary
 
 _locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+pending_deletions: set[str] = set()
 
 
 @asynccontextmanager

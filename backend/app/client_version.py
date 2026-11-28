@@ -17,6 +17,8 @@ PROTECTED_NAMES = frozenset({".env"})
 
 # 发布指针在 system_setting 表里的 key
 RELEASE_KEY = "client_release"
+# 强制更新令：控制端轮询当前版本时领取，发布指针一变就作废
+FORCE_KEY = "client_force_update"
 
 # 版本号既是主键也是磁盘文件名的一部分，收窄字符集以杜绝路径穿越
 _VERSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,31}$")
@@ -137,3 +139,65 @@ def rollback_release(current: dict | None) -> dict | None:
     if not prev:
         return None
     return {"version": prev, "previous": cur.get("version") or "", "updated_at": time.time()}
+
+
+def normalize_user_ids(raw) -> list[int]:
+    """去重并保留正整数用户 ID；非法项直接丢掉。"""
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: list[int] = []
+    seen: set[int] = set()
+    for item in raw:
+        try:
+            n = int(item)
+        except (TypeError, ValueError):
+            continue
+        if n > 0 and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def build_force_directive(
+    version: str,
+    user_ids: list[int],
+    created_by: str,
+    force_id: str,
+    now: float | None = None,
+) -> dict:
+    """生成一条强制更新令。user_ids 为空表示全部已登录控制端。"""
+    return {
+        "id": force_id,
+        "version": version,
+        "user_ids": normalize_user_ids(user_ids),
+        "created_at": time.time() if now is None else now,
+        "created_by": created_by or "",
+    }
+
+
+def active_force(directive: dict | None, release_version: str) -> dict | None:
+    """发布版本已经换过时，旧的强制更新令作废。"""
+    if not isinstance(directive, dict):
+        return None
+    version = str(directive.get("version") or "")
+    if not version or not str(directive.get("id") or ""):
+        return None
+    if version != (release_version or ""):
+        return None
+    return directive
+
+
+def force_for_caller(
+    directive: dict | None, release_version: str, user_id: int | None
+) -> dict | None:
+    """当前调用方是否该领取这条令。
+
+    节点令牌没有用户身份，不领取。user_ids 为空时，任意已登录用户都领取。
+    """
+    active = active_force(directive, release_version)
+    if active is None or user_id is None:
+        return None
+    allowed = normalize_user_ids(active.get("user_ids"))
+    if allowed and int(user_id) not in allowed:
+        return None
+    return {"id": str(active.get("id") or ""), "version": str(active.get("version") or "")}

@@ -19,6 +19,7 @@ from math import isfinite
 from typing import Optional
 
 from sqlalchemy import and_, case, false, func, or_, select
+from sqlalchemy.sql.elements import ColumnElement
 
 from .db import SessionLocal
 from .orm import Deal
@@ -131,6 +132,7 @@ async def leader_batch(
     *,
     symbol: Optional[str] = None,
     node_magics: Optional[dict[str, set[int]]] = None,
+    deal_filter: ColumnElement[bool] | None = None,
 ) -> dict:
     """若干节点的合并汇总（带单员绩效 = 其**主节点**传入单个 node_id）。
 
@@ -146,6 +148,8 @@ async def leader_batch(
 
     conds = _base_conds(ids, from_ts, to_ts, symbol)
     conds.extend(_magic_scope(node_magics))
+    if deal_filter is not None:
+        conds.append(deal_filter)
     try:
         async with SessionLocal() as s:
             # —— 持仓级聚合（胜率的分子与分母）——

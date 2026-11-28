@@ -62,6 +62,7 @@ async def node_deals(
     magic: Optional[int] = None,
     from_time: Optional[int] = None,
     to_time: Optional[int] = None,
+    exclude_ai: bool = False,
     store: RedisStore = Depends(get_store),
     p: Principal = Depends(get_principal_deals),
 ):
@@ -80,6 +81,7 @@ async def node_deals(
         magic=magic,
         from_ts=from_time,
         to_ts=to_time,
+        exclude_ai=exclude_ai,
         page=page,
         page_size=page_size,
     )

@@ -16,24 +16,30 @@ import hashlib
 import logging
 import os
 import time
+import uuid
 import zipfile
 from pathlib import Path
+from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy import delete, func, select
 
 from . import client_version as cv
 from . import persist, system_settings
 from .db import SessionLocal
-from .deps import client_ip, get_admin_username, get_client_download_auth
+from .deps import client_ip, get_admin_username, get_client_download_auth, get_store
 from .models import (
+    ClientForceOut,
+    ClientForcePayload,
     ClientReleaseOut,
     ClientReleasePayload,
     ClientVersionListOut,
     ClientVersionOut,
 )
-from .orm import ClientVersion, Node
+from .orm import ClientVersion, Node, User
+from .rbac_service import principal_from_token
+from .redis_store import RedisStore
 from .settings import settings
 
 logger = logging.getLogger(__name__)
@@ -93,6 +99,26 @@ def _release_out(release: dict) -> ClientReleaseOut:
     )
 
 
+def _force_out(directive: dict | None, release_version: str) -> ClientForceOut | None:
+    active = cv.active_force(directive, release_version)
+    if active is None:
+        return None
+    return ClientForceOut(
+        id=str(active.get("id") or ""),
+        version=str(active.get("version") or ""),
+        user_ids=cv.normalize_user_ids(active.get("user_ids")),
+        created_at=float(active.get("created_at") or 0),
+        created_by=str(active.get("created_by") or ""),
+    )
+
+
+async def _drop_force_if_release_changed(before: dict, after: dict) -> None:
+    """发布指针换了版本，未执行的旧更新令不再下发。"""
+    if str((before or {}).get("version") or "") == str((after or {}).get("version") or ""):
+        return
+    await system_settings.set_client_force(None)
+
+
 @router.get("", response_model=ClientVersionListOut)
 async def list_versions(_: str = Depends(get_admin_username)):
     """版本清单（新版在前）+ 当前发布指针 + 各版本的节点数分布。"""
@@ -119,8 +145,12 @@ async def list_versions(_: str = Depends(get_admin_username)):
     ]
     # 语义版本序，新版在前；同版本号不会出现（version 是主键）
     items.sort(key=lambda i: cv.parse_version(i.version) or (0,), reverse=True)
+    directive = await system_settings.get_client_force()
     return ClientVersionListOut(
-        items=items, release=_release_out(release), unknown_node_count=unknown
+        items=items,
+        release=_release_out(release),
+        unknown_node_count=unknown,
+        force=_force_out(directive, current),
     )
 
 
@@ -236,6 +266,7 @@ async def rollback_release(
             )
 
     await system_settings.set_client_release(nxt)
+    await _drop_force_if_release_changed(current, nxt)
     await persist.audit(
         admin, "rollback_client_release", nxt["version"], None, "ok",
         client_ip(request), category="system", before=current, after=nxt,
@@ -270,6 +301,7 @@ async def release_version(
 
     nxt = cv.build_release(norm, current)
     await system_settings.set_client_release(nxt)
+    await _drop_force_if_release_changed(current, nxt)
     await persist.audit(
         admin, "release_client_version", norm, {"kind": kind}, "ok",
         client_ip(request), category="system", before=current, after=nxt,
@@ -345,9 +377,73 @@ async def available_versions(_: str = Depends(get_client_download_auth)):
     return {"items": items, "current": current}
 
 
+@router.post("/force-push", response_model=ClientForceOut)
+async def force_push(
+    request: Request,
+    body: ClientForcePayload | None = None,
+    admin: str = Depends(get_admin_username),
+):
+    """向控制端下发强制更新令。控制端下次查询当前版本时领取并直接更新落后实例。"""
+    release = await system_settings.get_client_release()
+    version = str(release.get("version") or "")
+    if not version:
+        raise HTTPException(status_code=409, detail="尚未发布客户端版本，无法强制推送")
+
+    async with SessionLocal() as s:
+        row = await s.get(ClientVersion, version)
+        if row is None:
+            raise HTTPException(status_code=409, detail="当前发布版本的安装包不存在")
+        user_ids = cv.normalize_user_ids((body.user_ids if body else None) or [])
+        if user_ids:
+            found = {
+                int(uid)
+                for uid in (
+                    await s.execute(
+                        select(User.id).where(User.id.in_(user_ids), User.is_active.is_(True))
+                    )
+                ).scalars().all()
+            }
+            missing = [uid for uid in user_ids if uid not in found]
+            if missing:
+                raise HTTPException(
+                    status_code=400,
+                    detail="用户不存在或已停用：" + ", ".join(str(uid) for uid in missing),
+                )
+
+    directive = cv.build_force_directive(version, user_ids, admin, uuid.uuid4().hex)
+    await system_settings.set_client_force(directive)
+    await persist.audit(
+        admin, "force_push_client_version", version,
+        {"user_ids": directive["user_ids"], "id": directive["id"]},
+        "ok", client_ip(request), category="system", before=None, after=directive,
+    )
+    logger.warning(
+        "client force update %s issued for %s by %s",
+        version,
+        directive["user_ids"] or "all users",
+        admin,
+    )
+    return _force_out(directive, version)
+
+
 @router.get("/current")
-async def current_version(_: str = Depends(get_client_download_auth)):
-    """节点/面板查询当前应当安装的版本；尚未发布任何版本时返回 204。"""
+async def current_version(
+    x_node_token: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    store: RedisStore = Depends(get_store),
+):
+    """节点/面板查询当前应当安装的版本；尚未发布任何版本时返回 204。
+
+    已登录用户若在强制更新令的目标里，响应额外带 `force`，控制端据此直接更新。
+    """
+    await get_client_download_auth(x_node_token, authorization, store)
+    user_id = None
+    if not x_node_token and authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+        principal = await principal_from_token(store, token)
+        if principal is not None:
+            user_id = principal.user_id
+
     release = await system_settings.get_client_release()
     version = str(release.get("version") or "")
     if not version:
@@ -360,7 +456,7 @@ async def current_version(_: str = Depends(get_client_download_auth)):
         logger.warning("client release points to missing package: %s", version)
         return Response(status_code=204)
 
-    return {
+    body = {
         "version": row.version,
         "filename": row.filename,
         "size": int(row.size or 0),
@@ -369,6 +465,10 @@ async def current_version(_: str = Depends(get_client_download_auth)):
         "updated_at": float(release.get("updated_at") or 0),
         "download_url": f"/api/client-versions/{row.version}/download",
     }
+    force = cv.force_for_caller(await system_settings.get_client_force(), version, user_id)
+    if force:
+        body["force"] = force
+    return body
 
 
 @router.get("/{version}/download")

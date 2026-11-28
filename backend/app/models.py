@@ -38,6 +38,7 @@ class NodeOut(BaseModel):
     name: str
     enabled: bool = True
     status: str = "offline"  # online / offline
+    deletion_pending: bool = False
     filters: Optional[dict] = None
     risk: Optional[dict] = None
     mt5_login: Optional[int] = None
@@ -110,16 +111,31 @@ class ClientReleaseOut(BaseModel):
     updated_at: float = 0
 
 
+class ClientForceOut(BaseModel):
+    """当前有效的强制更新令；user_ids 为空表示全部已登录控制端。"""
+    id: str = ""
+    version: str = ""
+    user_ids: list[int] = Field(default_factory=list)
+    created_at: float = 0
+    created_by: str = ""
+
+
 class ClientVersionListOut(BaseModel):
     """版本清单 + 发布指针 + 节点版本分布。"""
     items: list[ClientVersionOut] = Field(default_factory=list)
     release: ClientReleaseOut = Field(default_factory=ClientReleaseOut)
     unknown_node_count: int = 0    # 未上报版本的节点数（旧客户端或从未上线）
+    force: Optional[ClientForceOut] = None
 
 
 class ClientReleasePayload(BaseModel):
     """发布某个版本；降级为高危动作，必须显式确认。"""
     confirm_downgrade: bool = False
+
+
+class ClientForcePayload(BaseModel):
+    """下发强制更新令。user_ids 为空表示全部已登录控制端。"""
+    user_ids: list[int] = Field(default_factory=list)
 
 
 class LotBatch(BaseModel):

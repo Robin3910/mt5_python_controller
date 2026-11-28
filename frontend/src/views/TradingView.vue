@@ -784,7 +784,7 @@ async function loadTradeHistory(): Promise<void> {
   if (blank) historyLoading.value = true
   try {
     const from = Math.floor(Date.now() / 1000) - 7 * 24 * 3600
-    const page = await fetchNodeDeals(nodeId, 1, 200, { from_time: from })
+    const page = await fetchNodeDeals(nodeId, 1, 200, { from_time: from, exclude_ai: true })
     if (seq !== historySeq || primaryNode.value?.node_id !== nodeId) return
     historyDeals.value = page.items || []
     dealsTotal.value = page.total
@@ -1223,7 +1223,7 @@ onDeactivated(() => {
             </div>
               <strong :class="book.profit >= 0 ? 'up' : 'down'">{{ fmtSigned(book.profit) }}</strong>
             </header>
-            <div class="tr-scroll">
+            <div class="tr-scroll tr-pos-scroll">
               <div class="tr-grid tr-pos-grid tr-head">
               <span>#</span><span>方向</span><span>手数</span><span>开仓价</span><span>止盈/止损</span><span>浮动盈亏</span><span>操作</span>
                         </div>
@@ -1487,13 +1487,19 @@ onDeactivated(() => {
 .tr-book-head em, .tr-book-head span { font-style: normal; color: #5B6B85; font-size: 10px; }
 .tr-book-head strong, .tr-line strong, .num { font-variant-numeric: tabular-nums; }
 .tr-grid { display: grid; align-items: center; gap: 6px; padding: 4px 12px; font-size: 11px; }
-.tr-pos-grid { grid-template-columns: 14px minmax(78px,.9fr) 28px 40px minmax(56px,1fr) minmax(58px,1fr) minmax(64px,1fr) 48px; }
+.tr-pos-grid {
+  grid-template-columns: 16px minmax(24px,.45fr) minmax(28px,.55fr) minmax(66px,1fr) minmax(63px,1fr) minmax(59px,.9fr) 38px;
+  column-gap: 4px;
+  padding-inline: 10px;
+}
 .tr-hist-grid { grid-template-columns: 14px minmax(78px,.9fr) minmax(44px,.7fr) 28px 40px minmax(56px,1fr) minmax(56px,1fr) minmax(64px,1fr); }
 .tr-head { color: #5B6B85; background: #0A1120; border-bottom: 1px solid #16213A; font-size: 10px; }
 .tr-line { border-bottom: 1px dashed #1B2A48; }
 .tr-line:last-of-type { border-bottom: 0; }
 .tr-head span:nth-child(n+2), .tr-line span:nth-child(n+3), .tr-line strong { text-align: right; }
-.tr-pos-grid span:nth-child(3), .tr-hist-grid span:nth-child(4) { text-align: center; }
+.tr-pos-grid > span:nth-child(2), .tr-hist-grid span:nth-child(4) { text-align: center; }
+.tr-pos-grid > .num, .tr-pos-grid > .sltp, .tr-pos-grid > strong { overflow-wrap: anywhere; }
+.tr-pos-grid .tr-x { white-space: nowrap; }
 .tr-magic-col { text-align: right; font-variant-numeric: tabular-nums; color: #93C5FD; }
 .dim { color: #8B96A8; }
 .dir { display: inline-flex; min-width: 14px; height: 15px; align-items: center; justify-content: center; border-radius: 3px; font-style: normal; font-size: 10px; font-weight: 700; white-space: nowrap; }
@@ -1525,11 +1531,12 @@ onDeactivated(() => {
 .tr-pend-more button:hover { text-decoration: underline; }
 /* 窄屏下表格各行给一个最小宽度，让 .tr-scroll 有可滑动的空间。
    阈值取各 grid 的列宽下限之和（≈310–370px），720px 以上列宽本来就够，不再加限制。 */
-.tr-pos-grid { min-width: 360px; }
+.tr-pos-scroll > * { min-width: max(100%, 338px); }
+.tr-pos-scroll > .tr-magic-head { padding-inline: 10px; }
 .tr-pend-grid { min-width: 380px; }
 .tr-hist-grid { min-width: 420px; }
 @media (min-width: 720px) {
-  .tr-pos-grid, .tr-pend-grid, .tr-hist-grid { min-width: 0; }
+  .tr-pend-grid, .tr-hist-grid { min-width: 0; }
 }
 /* 挂单量大时（网格单品种可挂几十张）限高滚动，避免撑爆整页 */
 .tr-pend-book .tr-grid { max-height: none; }

@@ -16,12 +16,13 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from sqlalchemy import String, cast, func, or_, select, tuple_
+from sqlalchemy import String, case, cast, func, or_, select, tuple_
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import aliased
 
 from .db import SessionLocal
 from .orm import Deal, GroupSignalTask, GroupTaskDispatch, SignalDispatch
-from .strategy_templates import StrategyOpeningMethod, opening_method_from_snapshot
+from .strategy_templates import TEMPLATE_1_ID, StrategyOpeningMethod, opening_method_from_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -334,6 +335,32 @@ async def backfill_sources(node_id: str, deal_ids: Optional[list[int]] = None) -
         return 0
 
 
+def _non_ai_deal():
+    opening = aliased(Deal)
+    opening_magic = (
+        select(func.coalesce(opening.magic, 0))
+        .where(opening.node_id == Deal.node_id, opening.position_id == Deal.position_id,
+               Deal.position_id != 0, opening.entry_type == "IN")
+        .order_by(opening.deal_time, opening.deal_id)
+        .limit(1)
+        .correlate(Deal)
+        .scalar_subquery()
+    )
+    template = GroupSignalTask.strategy_snapshot_json["template_id"].as_string()
+    ai_count = func.sum(case((template == TEMPLATE_1_ID, 1), else_=0))
+    # 魔术号复用时，所有关联快照都能确认为 AI 才隐藏。
+    return ~(
+        select(GroupTaskDispatch.magic)
+        .outerjoin(GroupSignalTask, GroupSignalTask.task_id == GroupTaskDispatch.task_id)
+        .where(GroupTaskDispatch.node_id == Deal.node_id, GroupTaskDispatch.magic != 0,
+               GroupTaskDispatch.magic == func.coalesce(opening_magic, Deal.magic))
+        .group_by(GroupTaskDispatch.magic)
+        .having(ai_count == func.count())
+        .correlate(Deal)
+        .exists()
+    )
+
+
 async def list_deals(
     *,
     node_id: Optional[str] = None,
@@ -346,6 +373,7 @@ async def list_deals(
     magic: Optional[int] = None,
     from_ts: Optional[int] = None,
     to_ts: Optional[int] = None,
+    exclude_ai: bool = False,
     page: int = 1,
     page_size: int = 50,
 ) -> dict:
@@ -394,6 +422,10 @@ async def list_deals(
             )
         )
 
+    deal_filter = _non_ai_deal() if exclude_ai else None
+    if deal_filter is not None:
+        conds.append(deal_filter)
+
     try:
         async with SessionLocal() as s:
             total = 0
@@ -437,7 +469,7 @@ async def list_deals(
     from . import deal_stats
     summary = await deal_stats.leader_batch(
         [node_id] if node_id else (node_ids or []),
-        from_ts, to_ts, symbol=symbol,
+        from_ts, to_ts, symbol=symbol, deal_filter=deal_filter,
     )
     return {
         "items": items,

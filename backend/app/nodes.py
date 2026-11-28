@@ -1,7 +1,7 @@
 """节点管理 API。
 
 普通用户只能看到 / 修改管理员分配给自己的节点（改名、启停、账户风控）；
-节点入库、删除、批量手数与按币种配置（normal 链路）只有管理员能做。
+节点入库、批量手数与按币种配置（normal 链路）只有管理员能做。
 """
 import asyncio
 
@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
-from . import node_deletion, node_service, permissions, persist, rbac_service, risk_control, user_review_service
+from . import node_deletion, node_lifecycle, node_service, permissions, persist, rbac_service, risk_control, user_review_service
 from .ai_channel_models import NodeDeleteRequest
 from .connections import manager
 from .deps import (
@@ -103,6 +103,7 @@ async def _to_node_out(
         enabled=d.get("enabled", True),
         # 在线状态以“当前进程内是否有活动连接”为准（单实例下最实时）
         status="online" if manager.is_node_online(d["node_id"]) else "offline",
+        deletion_pending=d["node_id"] in node_lifecycle.pending_deletions,
         filters=d.get("filters"),
         risk=risk_control.normalize_risk(d.get("risk")),
         mt5_login=d.get("mt5_login"),
@@ -258,13 +259,16 @@ async def preview_node_deletion(node_id: str, request: Request, store: RedisStor
 
 
 @router.delete("/{node_id}")
-async def delete_node(node_id: str, body: NodeDeleteRequest, request: Request,
+async def delete_node(node_id: str, body: NodeDeleteRequest, request: Request, response: Response,
                       store: RedisStore = Depends(get_store), p: Principal = Depends(get_principal)):
     try:
-        return await node_deletion.execute(store, p, body.version, [node_id], ip=client_ip(request), node_id=node_id)
+        result = await node_deletion.execute(store, p, body.version, [node_id], ip=client_ip(request), node_id=node_id)
     except HTTPException as exc:
         await node_deletion.failed(p, "delete_node", node_id, exc, client_ip(request))
         raise
+    if result["status"] == "pending":
+        response.status_code = 202
+    return result
 
 
 @router.post("/lot")

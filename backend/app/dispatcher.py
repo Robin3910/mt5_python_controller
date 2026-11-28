@@ -163,12 +163,14 @@ class Dispatcher:
 
     async def try_open(self, node: dict, signal: TradingSignal, signal_id: str,
                        scope: str, filters: dict, wait: bool = False, timeout: int = 15) -> dict:
-        async with node_lifecycle.locked(node_lifecycle.node_key(node["node_id"])):
-            if await self.store.get_node(node["node_id"]) is None:
+        node_id = node["node_id"]
+        async with node_lifecycle.locked(node_lifecycle.node_key(node_id)):
+            if node_id in node_lifecycle.pending_deletions:
+                return {"status": "skipped", "reason": "节点等待删除"}
+            if await self.store.get_node(node_id) is None:
                 return {"status": "skipped", "reason": "节点已删除"}
             outcome = await self._try_open_active(node, signal, signal_id, scope, filters, wait, timeout)
         fut = outcome.pop("_future", None)
-        node_id = node["node_id"]
         if wait and fut is not None:
             # 轮询模式：等待节点回报或超时
             try:

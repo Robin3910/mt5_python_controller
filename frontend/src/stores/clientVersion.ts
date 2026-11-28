@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import api from '@/api/client'
-import type { ClientReleaseOut, ClientVersionListOut, ClientVersionOut } from '@/api/types'
+import type { ClientForceOut, ClientReleaseOut, ClientVersionListOut, ClientVersionOut } from '@/api/types'
 
 const EMPTY_RELEASE: ClientReleaseOut = { version: '', previous: '', updated_at: 0 }
 
@@ -8,6 +8,7 @@ const EMPTY_RELEASE: ClientReleaseOut = { version: '', previous: '', updated_at:
 interface ClientVersionState {
   items: ClientVersionOut[]
   release: ClientReleaseOut
+  force: ClientForceOut | null
   unknownNodeCount: number
   loading: boolean
   /** 上传进度百分比，0 表示当前没有上传任务 */
@@ -18,6 +19,7 @@ export const useClientVersionStore = defineStore('clientVersion', {
   state: (): ClientVersionState => ({
     items: [],
     release: { ...EMPTY_RELEASE },
+    force: null,
     unknownNodeCount: 0,
     loading: false,
     uploadProgress: 0,
@@ -37,6 +39,7 @@ export const useClientVersionStore = defineStore('clientVersion', {
         const data: ClientVersionListOut = (await api.get('/api/client-versions')).data
         this.items = data.items || []
         this.release = data.release || { ...EMPTY_RELEASE }
+        this.force = data.force || null
         this.unknownNodeCount = data.unknown_node_count || 0
       } finally {
         this.loading = false
@@ -78,6 +81,12 @@ export const useClientVersionStore = defineStore('clientVersion', {
 
     async remove(version: string): Promise<void> {
       await api.delete(`/api/client-versions/${encodeURIComponent(version)}`)
+      await this.fetch()
+    },
+
+    /** 下发强制更新令。userIds 为空表示全部已登录控制端。 */
+    async forcePush(userIds: number[]): Promise<void> {
+      await api.post('/api/client-versions/force-push', { user_ids: userIds })
       await this.fetch()
     },
   },

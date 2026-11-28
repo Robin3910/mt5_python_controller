@@ -12,6 +12,7 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -255,6 +256,85 @@ def test_badge_pending_counts_outdated_instances(tmp_path) -> None:
     print("[ok] 待更新数能统计出落后于发布版本的实例")
 
 
+def test_force_update_upgrades_outdated_once(tmp_path: Path) -> None:
+    """强制更新令只带动落后实例，成功后同一条令不再执行。"""
+    import paths
+
+    original = paths.data_dir
+    paths.data_dir = lambda: tmp_path
+    bridge = None
+    try:
+        bridge, old = _fake_bridge(tmp_path)
+        newer_dir = tmp_path / "prod-02"
+        newer_dir.mkdir()
+        (newer_dir / "node_client.exe").write_bytes(b"stub")
+        (newer_dir / "version.txt").write_text("9.0.0-20260102000000\n", encoding="utf-8")
+        newer = InstanceConfig.create(
+            name="mt5-prod-02",
+            exe_path=str(newer_dir / "node_client.exe"),
+            cwd=str(newer_dir),
+        )
+        bridge.manager.add(newer)
+
+        vu = bridge._version_update
+        started: list[list[str]] = []
+
+        def fake_start(body, force_id=""):
+            started.append(list(body["ids"]))
+            vu._force_pending_task = "task-1"
+            vu._force_pending_id = force_id
+            return {"ok": True, "error": "", "task_id": "task-1"}
+
+        vu.start_update = fake_start
+        payload = {
+            "version": "2.0.0-20260102000000",
+            "sha256": "abc",
+            "force": {"id": "force-1", "version": "2.0.0-20260102000000"},
+        }
+        vu.apply_force(payload)
+        assert started == [[old.id]], started
+        vu.apply_force(payload)
+        assert len(started) == 1
+
+        with vu._lock:
+            vu._settle_force_locked(
+                "task-1", error="", results=[SimpleNamespace(ok=True)]
+            )
+        assert json.loads((tmp_path / "force_update.json").read_text(encoding="utf-8"))["id"] == "force-1"
+        vu.apply_force(payload)
+        assert len(started) == 1
+
+        downgrade = {
+            "version": "0.5.0",
+            "sha256": "abc",
+            "force": {"id": "force-2", "version": "0.5.0"},
+        }
+        vu.apply_force(downgrade)
+        assert len(started) == 1
+        assert json.loads((tmp_path / "force_update.json").read_text(encoding="utf-8"))["id"] == "force-2"
+
+        vu._force_retry_at = 0
+        retry = {
+            "version": "2.0.0-20260102000000",
+            "sha256": "abc",
+            "force": {"id": "force-3", "version": "2.0.0-20260102000000"},
+        }
+        vu.apply_force(retry)
+        assert len(started) == 2
+        with vu._lock:
+            vu._settle_force_locked("task-1", error="boom", results=None)
+        vu.apply_force(retry)
+        assert len(started) == 2
+        vu._force_retry_at = 0
+        vu.apply_force(retry)
+        assert len(started) == 3
+    finally:
+        paths.data_dir = original
+        if bridge is not None:
+            bridge.stop()
+    print("[ok] 强制更新令只升级落后实例，并且同一条令只成功执行一次")
+
+
 # ── 前端源码静态检查 ──
 
 
@@ -298,6 +378,7 @@ if __name__ == "__main__":
         test_rollback_start_requires_login,
         test_badge_is_zero_blocking,
         test_badge_pending_counts_outdated_instances,
+        test_force_update_upgrades_outdated_once,
         test_modal_mode_switch_buttons_are_clickable,
     ]
     failures = 0

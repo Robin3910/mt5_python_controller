@@ -1083,6 +1083,11 @@ class DashboardApp(DashboardAuthUI, ctk.CTk):
                 return
             version = str((data or {}).get("version") or "")
             self.after(0, lambda: self._on_remote_version(version) if generation == self.session.generation and self.session.active else None)
+            if generation != self.session.generation or not self.session.active:
+                return
+            from force_update import apply_if_needed
+
+            apply_if_needed(self.manager, target, data if isinstance(data, dict) else {})
 
         threading.Thread(target=worker, name="version-check", daemon=True).start()
 

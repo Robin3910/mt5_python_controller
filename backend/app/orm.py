@@ -742,6 +742,19 @@ class DeletedNode(Base):
     deleted_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
+class PendingNodeDeletion(Base):
+    __tablename__ = "pending_node_deletion"
+
+    node_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    mt5_login: Mapped[int] = mapped_column(BigInteger)
+    owner_user_id: Mapped[int | None] = mapped_column(Integer)
+    actor_user_id: Mapped[int] = mapped_column(Integer)
+    operator: Mapped[str] = mapped_column(String(64))
+    ip: Mapped[str | None] = mapped_column(String(45))
+    close_signal_id: Mapped[str | None] = mapped_column(String(32))
+    last_attempt_at: Mapped[float] = mapped_column(Double, default=0)
+
+
 class GroupSignalTask(Base):
     """分组信号主任务：一条 strategy 信号在一个分组内的**分发记录**。
 

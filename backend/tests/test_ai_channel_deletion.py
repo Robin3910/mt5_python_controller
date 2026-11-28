@@ -105,13 +105,15 @@ def test_foreign_node_and_stale_confirmation_are_rejected(client):
 @pytest.mark.parametrize("account", [
     {"orders": [{"ticket": 8}]}, {"books_readable": False}, {"updated_at": time.time() - 120},
 ])
-def test_unknown_or_nonempty_books_block_deletion(client, account):
+def test_unknown_or_nonempty_books_queue_node_deletion(client, account):
     data = setup(client)
     online(client, data["b_follow"], **account)
     preview = client.get(f"/api/nodes/{data['b_follow']}/deletion-preview", headers=data["bob_h"]).json()
     assert preview["blocked"]
     response = client.request("DELETE", f"/api/nodes/{data['b_follow']}", headers=data["bob_h"], json={"version": preview["version"]})
-    assert response.status_code == 409
+    assert response.status_code == 202
+    assert response.json() == {"status": "pending", "node_ids": [data["b_follow"]]}
+    assert client.get(f"/api/nodes/{data['b_follow']}", headers=data["bob_h"]).json()["deletion_pending"] is True
 
 
 def test_queued_open_cannot_pass_a_committed_deletion(client, monkeypatch):

@@ -101,6 +101,8 @@ function resultTag(result: string): { cls: string; text: string } {
   if (result === 'offline') return { cls: 'warn', text: '离线' }
   if (result === 'skipped') return { cls: 'skip', text: '跳过' }
   if (result === 'pending') return { cls: 'warn', text: '待完成' }
+  if (result === 'sent') return { cls: 'ok', text: '已下发' }
+  if (result === 'cancelled') return { cls: 'skip', text: '已取消' }
   if (result === 'rejected') return { cls: 'warn', text: '拒绝' }
   if (result === 'cancel_failed') return { cls: 'fail', text: '撤单失败' }
   if (result === 'fail' || result === 'failed') return { cls: 'fail', text: '失败' }
@@ -114,6 +116,8 @@ function actionLabel(action: string): string {
     limit_watch_signal: '限价监听触发',
     create_node: '创建节点',
     update_node: '更新节点',
+    request_node_deletion: '提交节点删除',
+    close_for_node_deletion: '删除前全平撤单',
     delete_node: '删除节点',
     batch_lot: '批量设置手数',
     close_node: '单节点平仓',

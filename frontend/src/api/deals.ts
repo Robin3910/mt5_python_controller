@@ -6,7 +6,7 @@ export async function fetchNodeDeals(
   nodeId: string,
   page = 1,
   pageSize = 50,
-  params: Record<string, string | number> = {},
+  params: Record<string, string | number | boolean> = {},
 ): Promise<PaginatedDeals> {
   const { data } = await api.get<PaginatedDeals>(`/api/deals/nodes/${nodeId}/deals`, {
     params: { page, page_size: pageSize, ...params },

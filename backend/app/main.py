@@ -30,6 +30,7 @@ from . import (
     group_service,
     groups,
     news_api,
+    node_deletion_jobs,
     node_service,
     node_dashboard_api,
     nodes,
@@ -75,6 +76,7 @@ logger = logging.getLogger("mt5hub")
 async def lifespan(app: FastAPI):
     """应用启动/关闭钩子：在此装配并回收所有共享资源。"""
     await init_db()
+    await node_deletion_jobs.restore_pending_deletions()
     from .ai_application_store import migrate_legacy
     await migrate_legacy()
     from .follow_requests import migrate_legacy as migrate_follow_legacy

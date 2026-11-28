@@ -448,7 +448,7 @@ def test_deals_api_unknown_node_404(client):
     assert r.status_code == 404, r.text
 
 
-def test_deals_api_reports_opening_method_from_task_snapshot(client):
+def test_deals_api_uses_task_snapshot_for_opening_method_and_ai_exclusion(client):
     from app import deal_store
     from app.orm import GroupSignalTask, GroupTaskDispatch
 
@@ -459,10 +459,11 @@ def test_deals_api_reports_opening_method_from_task_snapshot(client):
     market = {"template_id": "tpl_2", "rules": [{"type": 3, "status": 1}]}
     limit = {"template_id": "tpl_2", "rules": [{"type": 3, "status": 1, "entry_mode": "limit"}]}
     grid = {"template_id": "tpl_3"}
+    ai = {"template_id": "tpl_1"}
     snapshots = [
         (node, 901, market), (other_node, 901, limit), (node, 902, limit),
-        (node, 903, grid), (node, 904, {"template_id": "tpl_1"}),
-        (other_node, 905, grid), (node, 906, market), (node, 906, limit),
+        (node, 903, grid), (node, 904, ai), (other_node, 905, ai),
+        (node, 906, market), (node, 906, limit), (node, 906, ai),
     ]
 
     async def seed_history():
@@ -482,22 +483,41 @@ def test_deals_api_reports_opening_method_from_task_snapshot(client):
             ])
             await s.commit()
         await deal_store.save_deals(node, [
-            mk_deal(1, position_id=101, magic=901),
+            mk_deal(1, position_id=101, magic=901, profit=7),
             mk_deal(2, position_id=102, magic=902, entry_type="IN", deal_time=now - 7200),
             mk_deal(3, position_id=102, magic=0),
-            mk_deal(4, position_id=103, magic=903),
-            mk_deal(5, position_id=104, magic=904),
+            mk_deal(4, position_id=103, magic=903, profit=-2),
+            mk_deal(5, position_id=104, magic=904, profit=100),
             mk_deal(6, position_id=105, magic=905),
             mk_deal(7, position_id=106, magic=906),
-            mk_deal(8, position_id=102, magic=903, entry_type="IN", deal_time=now - 5400),
+            mk_deal(8, position_id=102, magic=904, entry_type="IN", deal_time=now - 5400),
+            mk_deal(9, position_id=104, magic=904, entry_type="IN", deal_time=now - 7200),
+            mk_deal(10, position_id=104, magic=0, profit=50),
+            mk_deal(11, position_id=111, magic=904, profit=200),
+            mk_deal(12, position_id=112),
         ])
 
     client.portal.call(seed_history)
-    r = client.get(f"/api/deals/nodes/{node}/deals", params={"from_time": now - 3600}, headers=headers)
+    url = f"/api/deals/nodes/{node}/deals"
+    params = {"from_time": now - 3600}
+    r = client.get(url, params=params, headers=headers)
 
     assert r.status_code == 200, r.text
     deals = {deal["deal_id"]: deal for deal in r.json()["items"]}
     assert {deal_id: deal["opening_method"] for deal_id, deal in deals.items()} == {
         1: "trend_market", 3: "trend_limit", 4: "grid", 5: "ai", 6: None, 7: None,
+        10: "ai", 11: "ai", 12: None,
     }
     assert deals[3]["position_direction"] == "BUY"
+    assert r.json()["summary"]["total_profit"] == 355
+
+    visible_ids = [deal_id for deal_id in deals if deal_id not in {5, 10, 11}]
+    for page in (1, 2):
+        filtered = client.get(url, params={**params, "exclude_ai": True, "page": page, "page_size": 5}, headers=headers)
+        assert filtered.status_code == 200, filtered.text
+        history = filtered.json()
+        assert [deal["deal_id"] for deal in history["items"]] == visible_ids[(page - 1) * 5:page * 5]
+        assert history["total"] == 6
+        assert history["summary"]["total_profit"] == 5
+        assert history["summary"]["total_trades"] == 6
+        assert history["summary"]["win_rate"] == 16.67

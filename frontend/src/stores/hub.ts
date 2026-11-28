@@ -560,9 +560,11 @@ export const useHubStore = defineStore('hub', {  state: (): HubState => ({
       await api.patch(`/api/nodes/${id}`, patch)
       await this.fetchNodes(options)
     },
-    async deleteNode(id: string, options: { q?: string } | undefined, version: string): Promise<void> {
-      await api.delete(`/api/nodes/${id}`, { data: { version } })
-      await this.fetchNodes(options)
+    async deleteNode(id: string, options: { q?: string } | undefined, version: string): Promise<'pending' | 'deleted'> {
+      const { data } = await api.delete<{ status: 'pending' | 'deleted' }>(`/api/nodes/${id}`, { data: { version } })
+      this.applyWs({ type: 'node_deletion', data: { node_id: id, status: data.status } })
+      await this.fetchNodes(options).catch(() => {})
+      return data.status
     },
     /**
      * 设置 / 取消某节点的主节点标记。后端已确保同 owner 维度下唯一：
@@ -924,6 +926,16 @@ export const useHubStore = defineStore('hub', {  state: (): HubState => ({
           const id = n.node_id as string
           this.statuses[id] = n.status as string
           if (n.account) this.accounts[id] = n.account as AccountSnapshot
+        }
+      } else if (t === 'node_deletion') {
+        const id = d.node_id as string
+        if (d.status === 'deleted') {
+          this.nodes = this.nodes.filter((node) => node.node_id !== id)
+          delete this.accounts[id]
+          delete this.statuses[id]
+        } else {
+          const node = this.nodes.find((item) => item.node_id === id)
+          if (node) node.deletion_pending = d.status === 'pending'
         }
       } else if (t === 'node_status') {
         // 节点上下线
